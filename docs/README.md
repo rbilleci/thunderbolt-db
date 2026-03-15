@@ -23,12 +23,16 @@ This project uses a layered documentation model so implementation can proceed qu
 6. **Operational expectations**
    - `docs/architecture/06-observability-slos.md`
 
-7. **Interfaces and implementation contracts**
+7. **Security and resilience operations**
+   - `docs/architecture/07-security-and-compliance.md`
+   - `docs/architecture/08-backup-pitr-dr.md`
+
+8. **Interfaces and implementation contracts**
    - `docs/interfaces/replication-interfaces.md`
    - `docs/interfaces/execution-interfaces.md`
    - `docs/interfaces/transaction-interfaces.md`
 
-8. **Decision history (ADRs)**
+9. **Decision history (ADRs)**
    - `docs/adr/README.md`
    - `docs/adr/ADR-001-log-boundary-is-wal.md`
    - `docs/adr/ADR-002-deterministic-batch-ordering.md`
@@ -36,10 +40,10 @@ This project uses a layered documentation model so implementation can proceed qu
    - `docs/adr/ADR-004-replicator-interface.md`
    - `docs/adr/ADR-005-snapshot-install-snapshot-strategy.md`
 
-9. **Delivery scope and sequencing**
+10. **Delivery scope and sequencing**
    - `docs/roadmap/v0-v1.md`
 
-10. **Process guardrails**
+11. **Process guardrails**
    - `docs/GPU_GUARDRAILS.md`
    - `.github/pull_request_template.md`
 
