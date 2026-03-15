@@ -34,8 +34,20 @@ impl LocalReplicator {
         }
     }
 
+    pub fn become_follower(&mut self, term: Term) {
+        self.term = self.term.max(term);
+        self.role = Role::Follower;
+    }
+
+    pub fn become_leader(&mut self, term: Term) {
+        self.term = self.term.max(term);
+        self.role = Role::Leader;
+    }
+
     pub fn drain_committed_from(&self, start_exclusive: Index) -> impl Iterator<Item = &LogEntry> {
-        self.entries.iter().filter(move |e| e.index > start_exclusive && e.index <= self.commit_index)
+        self.entries
+            .iter()
+            .filter(move |e| e.index > start_exclusive && e.index <= self.commit_index)
     }
 
     pub fn mark_applied(&mut self, idx: Index) {
@@ -58,7 +70,6 @@ impl LogReplicator for LocalReplicator {
             payload,
         };
 
-        // Local durable-commit simulation: append then immediately commit.
         self.entries.push(entry);
         self.commit_index = idx;
 
@@ -95,5 +106,24 @@ mod tests {
         assert!(b.index > a.index);
         assert_eq!(r.commit_index(), b.index);
         assert!(r.applied_index() <= r.commit_index());
+    }
+
+    #[test]
+    fn follower_rejects_writes() {
+        let mut r = LocalReplicator::leader();
+        r.become_follower(2);
+        let err = r.propose(vec![1]).unwrap_err();
+        assert!(matches!(err, EngineError::NotLeader));
+        assert_eq!(r.current_term(), 2);
+    }
+
+    #[test]
+    fn leader_accepts_after_promotion() {
+        let mut r = LocalReplicator::leader();
+        r.become_follower(2);
+        r.become_leader(3);
+        let tok = r.propose(vec![42]).unwrap();
+        assert_eq!(tok.index, 1);
+        assert_eq!(r.current_term(), 3);
     }
 }
