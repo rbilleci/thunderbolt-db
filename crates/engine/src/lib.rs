@@ -67,6 +67,10 @@ impl Engine {
         s
     }
 
+    pub fn simulate_next_wal_flush_failure(&mut self) {
+        self.wal.fail_next_flush();
+    }
+
     pub fn commit_mutation(
         &mut self,
         txn_id: u64,
@@ -78,7 +82,7 @@ impl Engine {
         });
 
         let token = self.repl.propose(payload)?;
-        self.wal.flush_all();
+        self.wal.flush_all()?;
 
         let to_apply: Vec<LogEntry> = self
             .repl
@@ -235,5 +239,14 @@ mod tests {
         e.tick_batching(t0 + Duration::from_millis(3)).unwrap();
         assert_eq!(e.get("a"), Some("7"));
         assert_eq!(e.metrics().batch_flush_count, 1);
+    }
+
+    #[test]
+    fn wal_flush_failure_prevents_visibility_advance() {
+        let mut e = Engine::new_local();
+        e.simulate_next_wal_flush_failure();
+        let res = e.commit_mutation(1, b"SET a=1".to_vec());
+        assert!(matches!(res, Err(EngineError::Durability(_))));
+        assert_eq!(e.visible_up_to(), 0);
     }
 }
