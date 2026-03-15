@@ -5,6 +5,9 @@ members = [
   "crates/wal",
   "crates/txn",
   "crates/execution",
+  "crates/batching",
+  "crates/metrics",
+  "crates/protocol",
   "crates/engine",
 ]
 resolver = "2"

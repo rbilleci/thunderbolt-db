@@ -5,9 +5,12 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+thiserror.workspace = true
 gpu_db_types = { path = "../types" }
 gpu_db_replication = { path = "../replication" }
 gpu_db_wal = { path = "../wal" }
 gpu_db_txn = { path = "../txn" }
+gpu_db_metrics = { path = "../metrics" }
+gpu_db_protocol = { path = "../protocol" }
 
 [dev-dependencies]
