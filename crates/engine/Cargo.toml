@@ -1,0 +1,13 @@
+[package]
+name = "gpu_db_engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gpu_db_types = { path = "../types" }
+gpu_db_replication = { path = "../replication" }
+gpu_db_wal = { path = "../wal" }
+gpu_db_txn = { path = "../txn" }
+
+[dev-dependencies]
