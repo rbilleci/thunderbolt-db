@@ -42,6 +42,7 @@ This project uses a layered documentation model so implementation can proceed qu
 
 10. **Delivery scope and sequencing**
    - `docs/roadmap/v0-v1.md`
+   - `docs/roadmap/no-nvidia-bootstrap-plan.md`
 
 11. **Process guardrails**
    - `docs/GPU_GUARDRAILS.md`
