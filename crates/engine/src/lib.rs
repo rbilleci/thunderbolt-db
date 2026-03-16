@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use gpu_db_batching::{DualTriggerBatcher, FlushReason};
-use gpu_db_metrics::{FallbackReason, RuntimeMetrics};
+use gpu_db_metrics::{BatchFlushReason, FallbackReason, RuntimeMetrics};
 use gpu_db_protocol::{parse_command, Command, ParseError};
 use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine};
 use gpu_db_types::{CommitToken, EngineError, Index, LogEntry};
@@ -145,11 +145,16 @@ impl Engine {
         Ok(())
     }
 
-    fn apply_batch<I>(&mut self, _reason: FlushReason, items: I) -> Result<(), EngineError>
+    fn apply_batch<I>(&mut self, reason: FlushReason, items: I) -> Result<(), EngineError>
     where
         I: Iterator<Item = PendingMutation>,
     {
-        self.metrics.inc_batch_flush();
+        let metric_reason = match reason {
+            FlushReason::Count => BatchFlushReason::Count,
+            FlushReason::Time => BatchFlushReason::Time,
+            FlushReason::Admin => BatchFlushReason::Admin,
+        };
+        self.metrics.inc_batch_flush(metric_reason);
         for p in items {
             self.commit_mutation(p.txn_id, p.payload)?;
         }
@@ -231,6 +236,7 @@ mod tests {
         assert_eq!(e.get("a"), Some("1"));
         assert_eq!(e.get("b"), Some("2"));
         assert_eq!(e.metrics().batch_flush_count, 1);
+        assert_eq!(e.metrics().batch_flushes_for(BatchFlushReason::Count), 1);
         assert_eq!(e.metrics().commits_total, 2);
     }
 
@@ -242,6 +248,18 @@ mod tests {
         e.tick_batching(t0 + Duration::from_millis(3)).unwrap();
         assert_eq!(e.get("a"), Some("7"));
         assert_eq!(e.metrics().batch_flush_count, 1);
+        assert_eq!(e.metrics().batch_flushes_for(BatchFlushReason::Time), 1);
+    }
+
+    #[test]
+    fn admin_flush_tracks_reason() {
+        let mut e = Engine::with_batching(10, Duration::from_secs(60));
+        let t0 = Instant::now();
+        e.enqueue_set_text(1, "SET a=9", t0).unwrap();
+        e.flush_admin().unwrap();
+
+        assert_eq!(e.get("a"), Some("9"));
+        assert_eq!(e.metrics().batch_flushes_for(BatchFlushReason::Admin), 1);
     }
 
     #[test]
