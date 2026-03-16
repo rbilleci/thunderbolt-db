@@ -59,6 +59,12 @@ mod tests {
     #[test]
     fn parses_set() {
         let cmd = parse_command("SET a = 42").unwrap();
-        assert_eq!(cmd, Command::SetKv { key: "a".into(), value: "42".into() });
+        assert_eq!(
+            cmd,
+            Command::SetKv {
+                key: "a".into(),
+                value: "42".into()
+            }
+        );
     }
 }
