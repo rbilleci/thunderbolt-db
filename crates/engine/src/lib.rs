@@ -124,6 +124,9 @@ impl Engine {
                     self.apply_batch(batch.reason, batch.items.into_iter().map(|i| i.item))?;
                 }
             }
+            Command::Flush => {
+                self.flush_admin()?;
+            }
             Command::Begin | Command::Commit | Command::Rollback => {
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
@@ -167,6 +170,9 @@ impl Engine {
         match cmd {
             Command::SetKv { .. } => {
                 self.commit_mutation(txn_id, text.as_bytes().to_vec())?;
+            }
+            Command::Flush => {
+                self.flush_admin()?;
             }
             Command::Begin | Command::Commit | Command::Rollback => {
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
@@ -259,6 +265,17 @@ mod tests {
         e.flush_admin().unwrap();
 
         assert_eq!(e.get("a"), Some("9"));
+        assert_eq!(e.metrics().batch_flushes_for(BatchFlushReason::Admin), 1);
+    }
+
+    #[test]
+    fn flush_command_drains_pending_batch() {
+        let mut e = Engine::with_batching(10, Duration::from_secs(60));
+        let t0 = Instant::now();
+        e.enqueue_set_text(1, "SET a=5", t0).unwrap();
+        e.execute_text(2, "FLUSH").unwrap();
+
+        assert_eq!(e.get("a"), Some("5"));
         assert_eq!(e.metrics().batch_flushes_for(BatchFlushReason::Admin), 1);
     }
 

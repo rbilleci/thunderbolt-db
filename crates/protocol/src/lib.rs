@@ -3,6 +3,7 @@ pub enum Command {
     Begin,
     Commit,
     Rollback,
+    Flush,
     SetKv { key: String, value: String },
 }
 
@@ -31,6 +32,9 @@ pub fn parse_command(input: &str) -> Result<Command, ParseError> {
     }
     if upper == "ROLLBACK" {
         return Ok(Command::Rollback);
+    }
+    if upper == "FLUSH" {
+        return Ok(Command::Flush);
     }
 
     if upper.starts_with("SET ") {
@@ -66,5 +70,11 @@ mod tests {
                 value: "42".into()
             }
         );
+    }
+
+    #[test]
+    fn parses_flush() {
+        let cmd = parse_command("FLUSH").unwrap();
+        assert_eq!(cmd, Command::Flush);
     }
 }
