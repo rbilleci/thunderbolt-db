@@ -53,6 +53,20 @@ impl LocalReplicator {
     pub fn mark_applied(&mut self, idx: Index) {
         self.applied_index = self.applied_index.max(idx);
     }
+
+    pub fn rollback_unapplied_from(&mut self, index_inclusive: Index) {
+        if index_inclusive <= self.applied_index {
+            return;
+        }
+
+        self.entries.retain(|e| e.index < index_inclusive);
+        self.commit_index = self
+            .entries
+            .last()
+            .map(|e| e.index)
+            .unwrap_or(self.applied_index);
+        self.next_index = self.commit_index + 1;
+    }
 }
 
 impl LogReplicator for LocalReplicator {
@@ -125,5 +139,19 @@ mod tests {
         let tok = r.propose(vec![42]).unwrap();
         assert_eq!(tok.index, 1);
         assert_eq!(r.current_term(), 3);
+    }
+
+    #[test]
+    fn rollback_unapplied_removes_tail_and_resets_indices() {
+        let mut r = LocalReplicator::leader();
+        let _ = r.propose(vec![1]).unwrap();
+        let t2 = r.propose(vec![2]).unwrap();
+        assert_eq!(r.commit_index(), t2.index);
+
+        r.rollback_unapplied_from(t2.index);
+
+        assert_eq!(r.commit_index(), 1);
+        let t3 = r.propose(vec![3]).unwrap();
+        assert_eq!(t3.index, 2);
     }
 }

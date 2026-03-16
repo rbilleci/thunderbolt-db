@@ -82,7 +82,10 @@ impl Engine {
         });
 
         let token = self.repl.propose(payload)?;
-        self.wal.flush_all()?;
+        if let Err(err) = self.wal.flush_all() {
+            self.repl.rollback_unapplied_from(token.index);
+            return Err(err);
+        }
 
         let to_apply: Vec<LogEntry> = self
             .repl
@@ -248,5 +251,18 @@ mod tests {
         let res = e.commit_mutation(1, b"SET a=1".to_vec());
         assert!(matches!(res, Err(EngineError::Durability(_))));
         assert_eq!(e.visible_up_to(), 0);
+    }
+
+    #[test]
+    fn wal_flush_failure_does_not_leak_into_later_successful_commit() {
+        let mut e = Engine::new_local();
+        e.simulate_next_wal_flush_failure();
+        let _ = e.commit_mutation(1, b"SET a=1".to_vec());
+
+        e.commit_mutation(2, b"SET b=2".to_vec()).unwrap();
+
+        assert_eq!(e.get("a"), None);
+        assert_eq!(e.get("b"), Some("2"));
+        assert_eq!(e.applied_len(), 1);
     }
 }
