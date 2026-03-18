@@ -306,6 +306,10 @@ mod tests {
         assert_eq!(e.get("b"), Some("2"));
         assert_eq!(e.metrics().batch_flush_count, 1);
         assert_eq!(e.metrics().batch_flushes_for(BatchFlushReason::Count), 1);
+        assert_eq!(
+            e.metrics().last_batch_flush_reason(),
+            Some(BatchFlushReason::Count)
+        );
         assert_eq!(e.metrics().commits_total, 2);
     }
 
@@ -438,6 +442,10 @@ mod tests {
 
         assert_eq!(e.metrics().fallback_total, 3);
         assert_eq!(e.metrics().fallback_for(FallbackReason::NotGpuEligible), 3);
+        assert_eq!(
+            e.metrics().last_fallback_reason(),
+            Some(FallbackReason::NotGpuEligible)
+        );
         assert_eq!(e.metrics().commits_total, 0);
     }
 

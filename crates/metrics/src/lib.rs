@@ -22,6 +22,8 @@ pub struct RuntimeMetrics {
     pub fallback_total: u64,
     fallback_by_reason: BTreeMap<FallbackReason, u64>,
     batch_flush_by_reason: BTreeMap<BatchFlushReason, u64>,
+    last_fallback_reason: Option<FallbackReason>,
+    last_batch_flush_reason: Option<BatchFlushReason>,
 }
 
 impl RuntimeMetrics {
@@ -32,11 +34,13 @@ impl RuntimeMetrics {
     pub fn inc_batch_flush(&mut self, reason: BatchFlushReason) {
         self.batch_flush_count += 1;
         *self.batch_flush_by_reason.entry(reason).or_insert(0) += 1;
+        self.last_batch_flush_reason = Some(reason);
     }
 
     pub fn inc_fallback(&mut self, reason: FallbackReason) {
         self.fallback_total += 1;
         *self.fallback_by_reason.entry(reason).or_insert(0) += 1;
+        self.last_fallback_reason = Some(reason);
     }
 
     pub fn fallback_for(&self, reason: FallbackReason) -> u64 {
@@ -49,6 +53,14 @@ impl RuntimeMetrics {
             .copied()
             .unwrap_or(0)
     }
+
+    pub fn last_fallback_reason(&self) -> Option<FallbackReason> {
+        self.last_fallback_reason
+    }
+
+    pub fn last_batch_flush_reason(&self) -> Option<BatchFlushReason> {
+        self.last_batch_flush_reason
+    }
 }
 
 #[cfg(test)]
@@ -58,17 +70,26 @@ mod tests {
     #[test]
     fn fallback_reason_counts() {
         let mut m = RuntimeMetrics::default();
+        assert_eq!(m.last_fallback_reason(), None);
+
         m.inc_fallback(FallbackReason::GpuUnavailable);
         m.inc_fallback(FallbackReason::GpuUnavailable);
         m.inc_fallback(FallbackReason::NotGpuEligible);
+
         assert_eq!(m.fallback_total, 3);
         assert_eq!(m.fallback_for(FallbackReason::GpuUnavailable), 2);
         assert_eq!(m.fallback_for(FallbackReason::NotGpuEligible), 1);
+        assert_eq!(
+            m.last_fallback_reason(),
+            Some(FallbackReason::NotGpuEligible)
+        );
     }
 
     #[test]
     fn batch_flush_reason_counts() {
         let mut m = RuntimeMetrics::default();
+        assert_eq!(m.last_batch_flush_reason(), None);
+
         m.inc_batch_flush(BatchFlushReason::Count);
         m.inc_batch_flush(BatchFlushReason::Time);
         m.inc_batch_flush(BatchFlushReason::Time);
@@ -77,5 +98,6 @@ mod tests {
         assert_eq!(m.batch_flushes_for(BatchFlushReason::Count), 1);
         assert_eq!(m.batch_flushes_for(BatchFlushReason::Time), 2);
         assert_eq!(m.batch_flushes_for(BatchFlushReason::Admin), 0);
+        assert_eq!(m.last_batch_flush_reason(), Some(BatchFlushReason::Time));
     }
 }
