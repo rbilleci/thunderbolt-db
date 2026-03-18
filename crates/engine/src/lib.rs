@@ -221,6 +221,14 @@ impl Engine {
     pub fn metrics(&self) -> &RuntimeMetrics {
         &self.metrics
     }
+
+    pub fn pending_batch_len(&self) -> usize {
+        self.batcher.len()
+    }
+
+    pub fn has_pending_batch(&self) -> bool {
+        !self.batcher.is_empty()
+    }
 }
 
 #[cfg(test)]
@@ -281,8 +289,12 @@ mod tests {
         let mut e = Engine::with_batching(10, Duration::from_millis(2));
         let t0 = Instant::now();
         e.enqueue_set_text(1, "SET a=7", t0).unwrap();
+        assert!(e.has_pending_batch());
+        assert_eq!(e.pending_batch_len(), 1);
         e.tick_batching(t0 + Duration::from_millis(3)).unwrap();
         assert_eq!(e.get("a"), Some("7"));
+        assert!(!e.has_pending_batch());
+        assert_eq!(e.pending_batch_len(), 0);
         assert_eq!(e.metrics().batch_flush_count, 1);
         assert_eq!(e.metrics().batch_flushes_for(BatchFlushReason::Time), 1);
     }
@@ -292,9 +304,11 @@ mod tests {
         let mut e = Engine::with_batching(10, Duration::from_secs(60));
         let t0 = Instant::now();
         e.enqueue_set_text(1, "SET a=9", t0).unwrap();
+        assert_eq!(e.pending_batch_len(), 1);
         e.flush_admin().unwrap();
 
         assert_eq!(e.get("a"), Some("9"));
+        assert_eq!(e.pending_batch_len(), 0);
         assert_eq!(e.metrics().batch_flushes_for(BatchFlushReason::Admin), 1);
     }
 
