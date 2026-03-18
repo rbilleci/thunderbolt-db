@@ -169,10 +169,10 @@ impl Engine {
             FlushReason::Time => BatchFlushReason::Time,
             FlushReason::Admin => BatchFlushReason::Admin,
         };
-        self.metrics.inc_batch_flush(metric_reason);
         for p in items {
             self.commit_mutation(p.txn_id, p.payload)?;
         }
+        self.metrics.inc_batch_flush(metric_reason);
         Ok(())
     }
 
@@ -324,5 +324,20 @@ mod tests {
         assert_eq!(e.visible_up_to(), 0);
         assert_eq!(e.wal_flushed_count(), 0);
         assert_eq!(e.applied_len(), 0);
+    }
+
+    #[test]
+    fn failed_batch_flush_does_not_increment_flush_metrics() {
+        let mut e = Engine::with_batching(2, Duration::from_secs(999));
+        e.become_follower(2);
+
+        let t0 = Instant::now();
+        e.enqueue_set_text(1, "SET a=1", t0).unwrap();
+        let err = e.enqueue_set_text(2, "SET b=2", t0).unwrap_err();
+
+        assert!(matches!(err, ExecuteError::Engine(EngineError::NotLeader)));
+        assert_eq!(e.metrics().batch_flush_count, 0);
+        assert_eq!(e.metrics().batch_flushes_for(BatchFlushReason::Count), 0);
+        assert_eq!(e.metrics().commits_total, 0);
     }
 }
