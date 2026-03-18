@@ -37,3 +37,42 @@ impl WalBuffer {
         self.fail_next_flush = true;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flush_commits_all_appended_records() {
+        let mut wal = WalBuffer::default();
+        wal.append(WalRecord {
+            txn_id: 1,
+            payload: b"SET a=1".to_vec(),
+        });
+        wal.append(WalRecord {
+            txn_id: 2,
+            payload: b"SET b=2".to_vec(),
+        });
+
+        wal.flush_all().unwrap();
+
+        assert_eq!(wal.flushed_count(), 2);
+    }
+
+    #[test]
+    fn fail_next_flush_is_one_shot() {
+        let mut wal = WalBuffer::default();
+        wal.append(WalRecord {
+            txn_id: 1,
+            payload: b"SET a=1".to_vec(),
+        });
+
+        wal.fail_next_flush();
+        let err = wal.flush_all().unwrap_err();
+        assert!(matches!(err, EngineError::Durability(_)));
+        assert_eq!(wal.flushed_count(), 0);
+
+        wal.flush_all().unwrap();
+        assert_eq!(wal.flushed_count(), 1);
+    }
+}
