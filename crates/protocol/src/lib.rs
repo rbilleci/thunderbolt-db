@@ -37,20 +37,25 @@ pub fn parse_command(input: &str) -> Result<Command, ParseError> {
         return Ok(Command::Flush);
     }
 
-    if upper.starts_with("SET ") {
-        let rest = &s[4..];
-        let Some((k, v)) = rest.split_once('=') else {
-            return Err(ParseError::InvalidSet);
-        };
-        let key = k.trim();
-        let value = v.trim();
-        if key.is_empty() {
-            return Err(ParseError::InvalidSet);
+    let mut parts = s.splitn(2, char::is_whitespace);
+    if let Some(cmd) = parts.next() {
+        if cmd.eq_ignore_ascii_case("SET") {
+            let Some(rest) = parts.next() else {
+                return Err(ParseError::InvalidSet);
+            };
+            let Some((k, v)) = rest.split_once('=') else {
+                return Err(ParseError::InvalidSet);
+            };
+            let key = k.trim();
+            let value = v.trim();
+            if key.is_empty() {
+                return Err(ParseError::InvalidSet);
+            }
+            return Ok(Command::SetKv {
+                key: key.to_string(),
+                value: value.to_string(),
+            });
         }
-        return Ok(Command::SetKv {
-            key: key.to_string(),
-            value: value.to_string(),
-        });
     }
 
     Err(ParseError::Unsupported(s.to_string()))
@@ -63,6 +68,18 @@ mod tests {
     #[test]
     fn parses_set() {
         let cmd = parse_command("SET a = 42").unwrap();
+        assert_eq!(
+            cmd,
+            Command::SetKv {
+                key: "a".into(),
+                value: "42".into()
+            }
+        );
+    }
+
+    #[test]
+    fn parses_set_with_non_space_whitespace_separator() {
+        let cmd = parse_command("SET\ta = 42").unwrap();
         assert_eq!(
             cmd,
             Command::SetKv {
