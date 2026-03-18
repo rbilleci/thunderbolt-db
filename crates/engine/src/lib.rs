@@ -48,6 +48,15 @@ struct PendingMutation {
     payload: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplicationWatermarks {
+    pub term: Term,
+    pub commit_index: Index,
+    pub applied_index: Index,
+    pub visible_index: Index,
+    pub wal_flushed_count: usize,
+}
+
 pub struct Engine {
     repl: LocalReplicator,
     wal: WalBuffer,
@@ -216,6 +225,16 @@ impl Engine {
 
     pub fn get(&self, key: &str) -> Option<&str> {
         self.sm.kv.get(key).map(|s| s.as_str())
+    }
+
+    pub fn replication_watermarks(&self) -> ReplicationWatermarks {
+        ReplicationWatermarks {
+            term: self.repl.current_term(),
+            commit_index: self.repl.commit_index(),
+            applied_index: self.repl.applied_index(),
+            visible_index: self.visible_up_to,
+            wal_flushed_count: self.wal.flushed_count(),
+        }
     }
 
     pub fn metrics(&self) -> &RuntimeMetrics {
@@ -411,5 +430,41 @@ mod tests {
         assert_eq!(e.metrics().fallback_for(FallbackReason::NotGpuEligible), 3);
         assert_eq!(e.pending_batch_len(), 0);
         assert_eq!(e.metrics().commits_total, 0);
+    }
+
+    #[test]
+    fn replication_watermarks_track_commit_apply_visibility_and_durability() {
+        let mut e = Engine::new_local();
+
+        let before = e.replication_watermarks();
+        assert_eq!(before.commit_index, 0);
+        assert_eq!(before.applied_index, 0);
+        assert_eq!(before.visible_index, 0);
+        assert_eq!(before.wal_flushed_count, 0);
+
+        let token = e.commit_mutation(1, b"SET a=1".to_vec()).unwrap();
+        let after = e.replication_watermarks();
+
+        assert!(after.term >= before.term);
+        assert_eq!(after.commit_index, token.index);
+        assert_eq!(after.applied_index, token.index);
+        assert_eq!(after.visible_index, token.index);
+        assert!(after.wal_flushed_count >= 1);
+    }
+
+    #[test]
+    fn replication_watermarks_do_not_advance_on_rejected_follower_commit() {
+        let mut e = Engine::new_local();
+        e.become_follower(2);
+
+        let err = e.commit_mutation(1, b"SET a=1".to_vec()).unwrap_err();
+        assert!(matches!(err, EngineError::NotLeader));
+
+        let marks = e.replication_watermarks();
+        assert_eq!(marks.term, 2);
+        assert_eq!(marks.commit_index, 0);
+        assert_eq!(marks.applied_index, 0);
+        assert_eq!(marks.visible_index, 0);
+        assert_eq!(marks.wal_flushed_count, 0);
     }
 }
