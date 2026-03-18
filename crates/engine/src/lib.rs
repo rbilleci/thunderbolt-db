@@ -5,7 +5,7 @@ use gpu_db_batching::{DualTriggerBatcher, FlushReason};
 use gpu_db_metrics::{BatchFlushReason, FallbackReason, RuntimeMetrics};
 use gpu_db_protocol::{parse_command, Command, ParseError};
 use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine};
-use gpu_db_types::{CommitToken, EngineError, Index, LogEntry};
+use gpu_db_types::{CommitToken, EngineError, Index, LogEntry, Role, Term};
 use gpu_db_wal::{WalBuffer, WalRecord};
 
 #[derive(Debug, Default)]
@@ -71,11 +71,23 @@ impl Engine {
         self.wal.fail_next_flush();
     }
 
+    pub fn become_follower(&mut self, term: Term) {
+        self.repl.become_follower(term);
+    }
+
+    pub fn become_leader(&mut self, term: Term) {
+        self.repl.become_leader(term);
+    }
+
     pub fn commit_mutation(
         &mut self,
         txn_id: u64,
         payload: Vec<u8>,
     ) -> Result<CommitToken, EngineError> {
+        if self.repl.role() != Role::Leader {
+            return Err(EngineError::NotLeader);
+        }
+
         self.wal.append(WalRecord {
             txn_id,
             payload: payload.clone(),
@@ -299,5 +311,18 @@ mod tests {
         assert_eq!(e.get("a"), None);
         assert_eq!(e.get("b"), Some("2"));
         assert_eq!(e.applied_len(), 1);
+    }
+
+    #[test]
+    fn follower_rejects_commit_without_visibility_or_wal_flush() {
+        let mut e = Engine::new_local();
+        e.become_follower(2);
+
+        let err = e.commit_mutation(1, b"SET a=1".to_vec()).unwrap_err();
+
+        assert!(matches!(err, EngineError::NotLeader));
+        assert_eq!(e.visible_up_to(), 0);
+        assert_eq!(e.wal_flushed_count(), 0);
+        assert_eq!(e.applied_len(), 0);
     }
 }
