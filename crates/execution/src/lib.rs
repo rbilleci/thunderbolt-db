@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -12,6 +14,106 @@ pub struct PlannedOp {
     pub target: DeviceTarget,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum GpuFallbackReason {
+    Unavailable,
+    QueueSaturated,
+    MemoryPressure,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RouteDecision {
+    Cpu,
+    Gpu(u16),
+    CpuFallback {
+        requested_gpu: u16,
+        reason: GpuFallbackReason,
+    },
+}
+
+pub trait GpuRuntime {
+    fn can_run(&self, gpu_id: u16, op: &PlannedOp) -> Result<(), GpuFallbackReason>;
+}
+
+pub struct DeviceRouter<R> {
+    runtime: R,
+}
+
+impl<R> DeviceRouter<R>
+where
+    R: GpuRuntime,
+{
+    pub fn new(runtime: R) -> Self {
+        Self { runtime }
+    }
+
+    pub fn route(&self, op: &PlannedOp) -> RouteDecision {
+        match op.target {
+            DeviceTarget::Cpu => RouteDecision::Cpu,
+            DeviceTarget::Gpu(gpu_id) => match self.runtime.can_run(gpu_id, op) {
+                Ok(()) => RouteDecision::Gpu(gpu_id),
+                Err(reason) => RouteDecision::CpuFallback {
+                    requested_gpu: gpu_id,
+                    reason,
+                },
+            },
+        }
+    }
+
+    pub fn runtime(&self) -> &R {
+        &self.runtime
+    }
+
+    pub fn runtime_mut(&mut self) -> &mut R {
+        &mut self.runtime
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct MockGpuRuntime {
+    unavailable: BTreeSet<u16>,
+    memory_pressured: BTreeSet<u16>,
+    saturated: bool,
+}
+
+impl MockGpuRuntime {
+    pub fn mark_unavailable(&mut self, gpu_id: u16) {
+        self.unavailable.insert(gpu_id);
+    }
+
+    pub fn clear_unavailable(&mut self, gpu_id: u16) {
+        self.unavailable.remove(&gpu_id);
+    }
+
+    pub fn mark_memory_pressured(&mut self, gpu_id: u16) {
+        self.memory_pressured.insert(gpu_id);
+    }
+
+    pub fn clear_memory_pressured(&mut self, gpu_id: u16) {
+        self.memory_pressured.remove(&gpu_id);
+    }
+
+    pub fn set_saturated(&mut self, saturated: bool) {
+        self.saturated = saturated;
+    }
+}
+
+impl GpuRuntime for MockGpuRuntime {
+    fn can_run(&self, gpu_id: u16, _op: &PlannedOp) -> Result<(), GpuFallbackReason> {
+        if self.unavailable.contains(&gpu_id) {
+            return Err(GpuFallbackReason::Unavailable);
+        }
+        if self.memory_pressured.contains(&gpu_id) {
+            return Err(GpuFallbackReason::MemoryPressure);
+        }
+        if self.saturated {
+            return Err(GpuFallbackReason::QueueSaturated);
+        }
+
+        Ok(())
+    }
+}
+
 pub trait Operator {
     fn open(&mut self) {}
     fn next(&mut self) -> Option<Vec<u8>>;
@@ -24,5 +126,80 @@ pub struct CpuNoop;
 impl Operator for CpuNoop {
     fn next(&mut self) -> Option<Vec<u8>> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gpu_op(id: u16) -> PlannedOp {
+        PlannedOp {
+            name: "scan".to_string(),
+            target: DeviceTarget::Gpu(id),
+        }
+    }
+
+    #[test]
+    fn cpu_target_routes_to_cpu_without_runtime_check() {
+        let router = DeviceRouter::new(MockGpuRuntime::default());
+        let op = PlannedOp {
+            name: "filter".to_string(),
+            target: DeviceTarget::Cpu,
+        };
+
+        assert_eq!(router.route(&op), RouteDecision::Cpu);
+    }
+
+    #[test]
+    fn gpu_target_routes_to_gpu_when_available() {
+        let router = DeviceRouter::new(MockGpuRuntime::default());
+
+        assert_eq!(router.route(&gpu_op(0)), RouteDecision::Gpu(0));
+    }
+
+    #[test]
+    fn gpu_target_falls_back_when_unavailable() {
+        let mut runtime = MockGpuRuntime::default();
+        runtime.mark_unavailable(2);
+        let router = DeviceRouter::new(runtime);
+
+        assert_eq!(
+            router.route(&gpu_op(2)),
+            RouteDecision::CpuFallback {
+                requested_gpu: 2,
+                reason: GpuFallbackReason::Unavailable,
+            }
+        );
+    }
+
+    #[test]
+    fn gpu_target_falls_back_when_memory_pressured() {
+        let mut runtime = MockGpuRuntime::default();
+        runtime.mark_memory_pressured(3);
+        let router = DeviceRouter::new(runtime);
+
+        assert_eq!(
+            router.route(&gpu_op(3)),
+            RouteDecision::CpuFallback {
+                requested_gpu: 3,
+                reason: GpuFallbackReason::MemoryPressure,
+            }
+        );
+    }
+
+    #[test]
+    fn gpu_target_falls_back_when_queue_is_saturated() {
+        let mut runtime = MockGpuRuntime::default();
+        runtime.set_saturated(true);
+        let router = DeviceRouter::new(runtime);
+
+        assert_eq!(
+            router.route(&gpu_op(1)),
+            RouteDecision::CpuFallback {
+                requested_gpu: 1,
+                reason: GpuFallbackReason::QueueSaturated,
+            }
+        );
     }
 }
