@@ -54,7 +54,8 @@ impl LocalReplicator {
     }
 
     pub fn mark_applied(&mut self, idx: Index) {
-        self.applied_index = self.applied_index.max(idx);
+        let bounded = idx.min(self.commit_index);
+        self.applied_index = self.applied_index.max(bounded);
     }
 
     pub fn rollback_unapplied_from(&mut self, index_inclusive: Index) {
@@ -212,5 +213,15 @@ mod tests {
 
         let t3 = r.propose(vec![3]).unwrap();
         assert_eq!(t3.index, t2.index + 1);
+    }
+
+    #[test]
+    fn mark_applied_does_not_exceed_commit_index() {
+        let mut r = LocalReplicator::leader();
+        let t1 = r.propose(vec![1]).unwrap();
+
+        r.mark_applied(t1.index + 10);
+
+        assert_eq!(r.applied_index(), t1.index);
     }
 }
