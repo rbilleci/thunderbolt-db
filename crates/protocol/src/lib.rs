@@ -5,6 +5,7 @@ pub enum Command {
     Rollback,
     Flush,
     SetKv { key: String, value: String },
+    DeleteKv { key: String },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -15,6 +16,8 @@ pub enum ParseError {
     Unsupported(String),
     #[error("invalid SET syntax; expected: SET key=value")]
     InvalidSet,
+    #[error("invalid DEL syntax; expected: DEL key")]
+    InvalidDel,
 }
 
 pub fn parse_command(input: &str) -> Result<Command, ParseError> {
@@ -56,6 +59,19 @@ pub fn parse_command(input: &str) -> Result<Command, ParseError> {
                 value: value.to_string(),
             });
         }
+
+        if cmd.eq_ignore_ascii_case("DEL") {
+            let Some(rest) = parts.next() else {
+                return Err(ParseError::InvalidDel);
+            };
+            let key = rest.trim();
+            if key.is_empty() || key.chars().any(char::is_whitespace) {
+                return Err(ParseError::InvalidDel);
+            }
+            return Ok(Command::DeleteKv {
+                key: key.to_string(),
+            });
+        }
     }
 
     Err(ParseError::Unsupported(s.to_string()))
@@ -93,5 +109,25 @@ mod tests {
     fn parses_flush() {
         let cmd = parse_command("FLUSH").unwrap();
         assert_eq!(cmd, Command::Flush);
+    }
+
+    #[test]
+    fn parses_del() {
+        let cmd = parse_command("DEL balance").unwrap();
+        assert_eq!(
+            cmd,
+            Command::DeleteKv {
+                key: "balance".into()
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_del_with_missing_or_extra_tokens() {
+        assert!(matches!(parse_command("DEL"), Err(ParseError::InvalidDel)));
+        assert!(matches!(
+            parse_command("DEL too many"),
+            Err(ParseError::InvalidDel)
+        ));
     }
 }

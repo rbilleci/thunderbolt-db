@@ -18,8 +18,16 @@ impl ReplicatedStateMachine for KvStateMachine {
     fn apply(&mut self, entry: &LogEntry) -> Result<(), EngineError> {
         self.applied.push(entry.payload.clone());
         if let Ok(s) = std::str::from_utf8(&entry.payload) {
-            if let Ok(Command::SetKv { key, value }) = parse_command(s) {
-                self.kv.insert(key, value);
+            if let Ok(cmd) = parse_command(s) {
+                match cmd {
+                    Command::SetKv { key, value } => {
+                        self.kv.insert(key, value);
+                    }
+                    Command::DeleteKv { key } => {
+                        self.kv.remove(&key);
+                    }
+                    Command::Begin | Command::Commit | Command::Rollback | Command::Flush => {}
+                }
             }
         }
         Ok(())
@@ -124,7 +132,7 @@ impl Engine {
     ) -> Result<(), ExecuteError> {
         let cmd = parse_command(text)?;
         match cmd {
-            Command::SetKv { .. } => {
+            Command::SetKv { .. } | Command::DeleteKv { .. } => {
                 let maybe_batch = self.batcher.enqueue(
                     PendingMutation {
                         txn_id,
@@ -180,7 +188,7 @@ impl Engine {
         let cmd = parse_command(text)?;
 
         match cmd {
-            Command::SetKv { .. } => {
+            Command::SetKv { .. } | Command::DeleteKv { .. } => {
                 self.commit_mutation(txn_id, text.as_bytes().to_vec())?;
             }
             Command::Flush => {
@@ -246,6 +254,16 @@ mod tests {
     }
 
     #[test]
+    fn execute_del_removes_existing_key() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET balance=100").unwrap();
+        e.execute_text(2, "DEL balance").unwrap();
+
+        assert_eq!(e.get("balance"), None);
+        assert_eq!(e.metrics().commits_total, 2);
+    }
+
+    #[test]
     fn batching_flushes_on_count_and_updates_metric() {
         let mut e = Engine::with_batching(2, Duration::from_secs(999));
         let t0 = Instant::now();
@@ -278,6 +296,18 @@ mod tests {
 
         assert_eq!(e.get("a"), Some("9"));
         assert_eq!(e.metrics().batch_flushes_for(BatchFlushReason::Admin), 1);
+    }
+
+    #[test]
+    fn batching_can_apply_set_then_del_in_order() {
+        let mut e = Engine::with_batching(2, Duration::from_secs(999));
+        let t0 = Instant::now();
+        e.enqueue_set_text(1, "SET a=1", t0).unwrap();
+        e.enqueue_set_text(2, "DEL a", t0).unwrap();
+
+        assert_eq!(e.get("a"), None);
+        assert_eq!(e.metrics().batch_flushes_for(BatchFlushReason::Count), 1);
+        assert_eq!(e.metrics().commits_total, 2);
     }
 
     #[test]
