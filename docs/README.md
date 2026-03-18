@@ -44,7 +44,11 @@ This project uses a layered documentation model so implementation can proceed qu
    - `docs/roadmap/v0-v1.md`
    - `docs/roadmap/no-nvidia-bootstrap-plan.md`
 
-11. **Process guardrails**
+11. **Compatibility and validation gates**
+   - `docs/compatibility/matrix.md`
+   - `docs/testing/parity-and-jepsen-plan.md`
+
+12. **Process guardrails**
    - `docs/GPU_GUARDRAILS.md`
    - `.github/pull_request_template.md`
 
