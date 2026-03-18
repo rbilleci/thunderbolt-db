@@ -384,4 +384,32 @@ mod tests {
         assert_eq!(e.metrics().batch_flushes_for(BatchFlushReason::Count), 0);
         assert_eq!(e.metrics().commits_total, 0);
     }
+
+    #[test]
+    fn execute_text_transaction_controls_count_as_not_gpu_eligible_fallbacks() {
+        let mut e = Engine::new_local();
+
+        e.execute_text(1, "BEGIN").unwrap();
+        e.execute_text(1, "COMMIT").unwrap();
+        e.execute_text(1, "ROLLBACK").unwrap();
+
+        assert_eq!(e.metrics().fallback_total, 3);
+        assert_eq!(e.metrics().fallback_for(FallbackReason::NotGpuEligible), 3);
+        assert_eq!(e.metrics().commits_total, 0);
+    }
+
+    #[test]
+    fn enqueue_transaction_controls_count_as_not_gpu_eligible_fallbacks() {
+        let mut e = Engine::with_batching(2, Duration::from_secs(60));
+        let t0 = Instant::now();
+
+        e.enqueue_set_text(1, "BEGIN", t0).unwrap();
+        e.enqueue_set_text(1, "COMMIT", t0).unwrap();
+        e.enqueue_set_text(1, "ROLLBACK", t0).unwrap();
+
+        assert_eq!(e.metrics().fallback_total, 3);
+        assert_eq!(e.metrics().fallback_for(FallbackReason::NotGpuEligible), 3);
+        assert_eq!(e.pending_batch_len(), 0);
+        assert_eq!(e.metrics().commits_total, 0);
+    }
 }
