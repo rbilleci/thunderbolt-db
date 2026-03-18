@@ -112,6 +112,13 @@ mod tests {
     }
 
     #[test]
+    fn parses_transaction_control_commands_case_insensitively() {
+        assert_eq!(parse_command("begin").unwrap(), Command::Begin);
+        assert_eq!(parse_command("COMMIT").unwrap(), Command::Commit);
+        assert_eq!(parse_command("rOlLbAcK").unwrap(), Command::Rollback);
+    }
+
+    #[test]
     fn parses_del() {
         let cmd = parse_command("DEL balance").unwrap();
         assert_eq!(
