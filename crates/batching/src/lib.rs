@@ -82,6 +82,10 @@ impl<T> DualTriggerBatcher<T> {
     pub fn is_empty(&self) -> bool {
         self.queue.is_empty()
     }
+
+    pub fn first_enqueued_at(&self) -> Option<Instant> {
+        self.first_enqueued_at
+    }
 }
 
 #[cfg(test)]
@@ -107,5 +111,19 @@ mod tests {
         let batch = b.maybe_flush_due_to_time(t1).expect("must flush on time");
         assert_eq!(batch.items.len(), 1);
         assert_eq!(batch.reason, FlushReason::Time);
+    }
+
+    #[test]
+    fn first_enqueued_at_tracks_head_and_resets_after_flush() {
+        let mut b = DualTriggerBatcher::new(2, Duration::from_millis(100));
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(1);
+
+        assert_eq!(b.first_enqueued_at(), None);
+        assert!(b.enqueue(1u8, t0).is_none());
+        assert_eq!(b.first_enqueued_at(), Some(t0));
+
+        let _ = b.enqueue(2u8, t1).expect("must flush on count");
+        assert_eq!(b.first_enqueued_at(), None);
     }
 }

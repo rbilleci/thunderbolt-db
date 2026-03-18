@@ -248,6 +248,12 @@ impl Engine {
     pub fn has_pending_batch(&self) -> bool {
         !self.batcher.is_empty()
     }
+
+    pub fn pending_batch_oldest_age(&self, now: Instant) -> Option<Duration> {
+        self.batcher
+            .first_enqueued_at()
+            .map(|head| now.saturating_duration_since(head))
+    }
 }
 
 #[cfg(test)]
@@ -329,6 +335,24 @@ mod tests {
         assert_eq!(e.get("a"), Some("9"));
         assert_eq!(e.pending_batch_len(), 0);
         assert_eq!(e.metrics().batch_flushes_for(BatchFlushReason::Admin), 1);
+    }
+
+    #[test]
+    fn pending_batch_oldest_age_tracks_then_clears_after_flush() {
+        let mut e = Engine::with_batching(10, Duration::from_secs(60));
+        let t0 = Instant::now();
+        e.enqueue_set_text(1, "SET a=9", t0).unwrap();
+
+        let age = e
+            .pending_batch_oldest_age(t0 + Duration::from_millis(5))
+            .expect("pending batch age should exist");
+        assert!(age >= Duration::from_millis(5));
+
+        e.flush_admin().unwrap();
+        assert_eq!(
+            e.pending_batch_oldest_age(t0 + Duration::from_millis(6)),
+            None
+        );
     }
 
     #[test]
