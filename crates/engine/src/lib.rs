@@ -26,7 +26,11 @@ impl ReplicatedStateMachine for KvStateMachine {
                     Command::DeleteKv { key } => {
                         self.kv.remove(&key);
                     }
-                    Command::Begin | Command::Commit | Command::Rollback | Command::Flush => {}
+                    Command::Begin
+                    | Command::Commit
+                    | Command::Rollback
+                    | Command::Flush
+                    | Command::GetKv { .. } => {}
                 }
             }
         }
@@ -156,7 +160,7 @@ impl Engine {
             Command::Flush => {
                 self.flush_admin()?;
             }
-            Command::Begin | Command::Commit | Command::Rollback => {
+            Command::Begin | Command::Commit | Command::Rollback | Command::GetKv { .. } => {
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
         }
@@ -212,12 +216,21 @@ impl Engine {
             Command::Flush => {
                 self.flush_admin()?;
             }
-            Command::Begin | Command::Commit | Command::Rollback => {
+            Command::Begin | Command::Commit | Command::Rollback | Command::GetKv { .. } => {
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
         }
 
         Ok(())
+    }
+
+    pub fn execute_read_text(&self, text: &str) -> Result<Option<&str>, ExecuteError> {
+        let cmd = parse_command(text)?;
+
+        match cmd {
+            Command::GetKv { key } => Ok(self.get(&key)),
+            _ => Ok(None),
+        }
     }
 
     pub fn visible_up_to(&self) -> Index {
@@ -303,6 +316,16 @@ mod tests {
 
         assert_eq!(e.get("balance"), None);
         assert_eq!(e.metrics().commits_total, 2);
+    }
+
+    #[test]
+    fn execute_read_text_get_returns_current_value_without_committing() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET balance=100").unwrap();
+
+        let value = e.execute_read_text("GET balance").unwrap();
+        assert_eq!(value, Some("100"));
+        assert_eq!(e.metrics().commits_total, 1);
     }
 
     #[test]
@@ -466,15 +489,16 @@ mod tests {
     }
 
     #[test]
-    fn execute_text_transaction_controls_count_as_not_gpu_eligible_fallbacks() {
+    fn execute_text_non_mutations_count_as_not_gpu_eligible_fallbacks() {
         let mut e = Engine::new_local();
 
         e.execute_text(1, "BEGIN").unwrap();
         e.execute_text(1, "COMMIT").unwrap();
         e.execute_text(1, "ROLLBACK").unwrap();
+        e.execute_text(1, "GET missing").unwrap();
 
-        assert_eq!(e.metrics().fallback_total, 3);
-        assert_eq!(e.metrics().fallback_for(FallbackReason::NotGpuEligible), 3);
+        assert_eq!(e.metrics().fallback_total, 4);
+        assert_eq!(e.metrics().fallback_for(FallbackReason::NotGpuEligible), 4);
         assert_eq!(
             e.metrics().last_fallback_reason(),
             Some(FallbackReason::NotGpuEligible)
@@ -483,16 +507,17 @@ mod tests {
     }
 
     #[test]
-    fn enqueue_transaction_controls_count_as_not_gpu_eligible_fallbacks() {
+    fn enqueue_non_mutations_count_as_not_gpu_eligible_fallbacks() {
         let mut e = Engine::with_batching(2, Duration::from_secs(60));
         let t0 = Instant::now();
 
         e.enqueue_set_text(1, "BEGIN", t0).unwrap();
         e.enqueue_set_text(1, "COMMIT", t0).unwrap();
         e.enqueue_set_text(1, "ROLLBACK", t0).unwrap();
+        e.enqueue_set_text(1, "GET missing", t0).unwrap();
 
-        assert_eq!(e.metrics().fallback_total, 3);
-        assert_eq!(e.metrics().fallback_for(FallbackReason::NotGpuEligible), 3);
+        assert_eq!(e.metrics().fallback_total, 4);
+        assert_eq!(e.metrics().fallback_for(FallbackReason::NotGpuEligible), 4);
         assert_eq!(e.pending_batch_len(), 0);
         assert_eq!(e.metrics().commits_total, 0);
     }

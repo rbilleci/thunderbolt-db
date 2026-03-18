@@ -6,6 +6,7 @@ pub enum Command {
     Flush,
     SetKv { key: String, value: String },
     DeleteKv { key: String },
+    GetKv { key: String },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -18,6 +19,8 @@ pub enum ParseError {
     InvalidSet,
     #[error("invalid DEL syntax; expected: DEL key")]
     InvalidDel,
+    #[error("invalid GET syntax; expected: GET key")]
+    InvalidGet,
 }
 
 pub fn parse_command(input: &str) -> Result<Command, ParseError> {
@@ -69,6 +72,19 @@ pub fn parse_command(input: &str) -> Result<Command, ParseError> {
                 return Err(ParseError::InvalidDel);
             }
             return Ok(Command::DeleteKv {
+                key: key.to_string(),
+            });
+        }
+
+        if cmd.eq_ignore_ascii_case("GET") {
+            let Some(rest) = parts.next() else {
+                return Err(ParseError::InvalidGet);
+            };
+            let key = rest.trim();
+            if key.is_empty() || key.chars().any(char::is_whitespace) {
+                return Err(ParseError::InvalidGet);
+            }
+            return Ok(Command::GetKv {
                 key: key.to_string(),
             });
         }
@@ -135,6 +151,26 @@ mod tests {
         assert!(matches!(
             parse_command("DEL too many"),
             Err(ParseError::InvalidDel)
+        ));
+    }
+
+    #[test]
+    fn parses_get() {
+        let cmd = parse_command("GET balance").unwrap();
+        assert_eq!(
+            cmd,
+            Command::GetKv {
+                key: "balance".into()
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_get_with_missing_or_extra_tokens() {
+        assert!(matches!(parse_command("GET"), Err(ParseError::InvalidGet)));
+        assert!(matches!(
+            parse_command("GET too many"),
+            Err(ParseError::InvalidGet)
         ));
     }
 }
