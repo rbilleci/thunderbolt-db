@@ -157,7 +157,7 @@ impl RaftReplicator {
     }
 
     pub fn register_follower_ack(&mut self, index: Index) {
-        if index == 0 || index >= self.next_index {
+        if self.role != Role::Leader || index == 0 || index >= self.next_index {
             return;
         }
 
@@ -423,5 +423,28 @@ mod tests {
         let mut r = RaftReplicator::single_node_leader();
         let tok = r.propose(vec![7]).unwrap();
         assert_eq!(r.commit_index(), tok.index);
+    }
+
+    #[test]
+    fn raft_follower_acks_are_ignored_when_not_leader() {
+        let mut r = RaftReplicator::new(3);
+        r.become_leader(1);
+        let t1 = r.propose(vec![1]).unwrap();
+
+        r.become_follower(2);
+        r.register_follower_ack(t1.index);
+
+        assert_eq!(r.commit_index(), 0);
+    }
+
+    #[test]
+    fn raft_rejects_ack_for_unknown_index() {
+        let mut r = RaftReplicator::new(3);
+        r.become_leader(1);
+        let _ = r.propose(vec![1]).unwrap();
+
+        r.register_follower_ack(2);
+
+        assert_eq!(r.commit_index(), 0);
     }
 }
