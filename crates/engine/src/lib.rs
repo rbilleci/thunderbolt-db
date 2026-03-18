@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use gpu_db_batching::{DualTriggerBatcher, FlushReason};
+use gpu_db_batching::{BatchItem, DualTriggerBatcher, FlushReason};
 use gpu_db_metrics::{BatchFlushReason, FallbackReason, RuntimeMetrics};
 use gpu_db_protocol::{parse_command, Command, ParseError};
 use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine};
@@ -150,7 +150,7 @@ impl Engine {
                     now,
                 );
                 if let Some(batch) = maybe_batch {
-                    self.apply_batch(batch.reason, batch.items.into_iter().map(|i| i.item))?;
+                    self.apply_batch(batch.reason, batch.items.into_iter(), now)?;
                 }
             }
             Command::Flush => {
@@ -165,21 +165,26 @@ impl Engine {
 
     pub fn tick_batching(&mut self, now: Instant) -> Result<(), EngineError> {
         if let Some(batch) = self.batcher.maybe_flush_due_to_time(now) {
-            self.apply_batch(batch.reason, batch.items.into_iter().map(|i| i.item))?;
+            self.apply_batch(batch.reason, batch.items.into_iter(), now)?;
         }
         Ok(())
     }
 
     pub fn flush_admin(&mut self) -> Result<(), EngineError> {
         if let Some(batch) = self.batcher.flush_admin() {
-            self.apply_batch(batch.reason, batch.items.into_iter().map(|i| i.item))?;
+            self.apply_batch(batch.reason, batch.items.into_iter(), Instant::now())?;
         }
         Ok(())
     }
 
-    fn apply_batch<I>(&mut self, reason: FlushReason, items: I) -> Result<(), EngineError>
+    fn apply_batch<I>(
+        &mut self,
+        reason: FlushReason,
+        items: I,
+        flushed_at: Instant,
+    ) -> Result<(), EngineError>
     where
-        I: Iterator<Item = PendingMutation>,
+        I: Iterator<Item = BatchItem<PendingMutation>>,
     {
         let metric_reason = match reason {
             FlushReason::Count => BatchFlushReason::Count,
@@ -187,7 +192,11 @@ impl Engine {
             FlushReason::Admin => BatchFlushReason::Admin,
         };
         for p in items {
-            self.commit_mutation(p.txn_id, p.payload)?;
+            let wait = flushed_at
+                .saturating_duration_since(p.enqueued_at)
+                .as_millis() as u64;
+            self.metrics.observe_batch_wait_ms(wait);
+            self.commit_mutation(p.item.txn_id, p.item.payload)?;
         }
         self.metrics.inc_batch_flush(metric_reason);
         Ok(())
@@ -310,6 +319,9 @@ mod tests {
             e.metrics().last_batch_flush_reason(),
             Some(BatchFlushReason::Count)
         );
+        assert_eq!(e.metrics().batch_wait_samples, 2);
+        assert_eq!(e.metrics().batch_wait_total_ms, 0);
+        assert_eq!(e.metrics().last_batch_wait_ms(), Some(0));
         assert_eq!(e.metrics().commits_total, 2);
     }
 
@@ -326,6 +338,9 @@ mod tests {
         assert_eq!(e.pending_batch_len(), 0);
         assert_eq!(e.metrics().batch_flush_count, 1);
         assert_eq!(e.metrics().batch_flushes_for(BatchFlushReason::Time), 1);
+        assert_eq!(e.metrics().batch_wait_samples, 1);
+        assert_eq!(e.metrics().batch_wait_total_ms, 3);
+        assert_eq!(e.metrics().last_batch_wait_ms(), Some(3));
     }
 
     #[test]

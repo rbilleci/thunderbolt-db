@@ -20,15 +20,24 @@ pub struct RuntimeMetrics {
     pub commits_total: u64,
     pub batch_flush_count: u64,
     pub fallback_total: u64,
+    pub batch_wait_samples: u64,
+    pub batch_wait_total_ms: u64,
     fallback_by_reason: BTreeMap<FallbackReason, u64>,
     batch_flush_by_reason: BTreeMap<BatchFlushReason, u64>,
     last_fallback_reason: Option<FallbackReason>,
     last_batch_flush_reason: Option<BatchFlushReason>,
+    last_batch_wait_ms: Option<u64>,
 }
 
 impl RuntimeMetrics {
     pub fn inc_commit(&mut self) {
         self.commits_total += 1;
+    }
+
+    pub fn observe_batch_wait_ms(&mut self, wait_ms: u64) {
+        self.batch_wait_samples += 1;
+        self.batch_wait_total_ms = self.batch_wait_total_ms.saturating_add(wait_ms);
+        self.last_batch_wait_ms = Some(wait_ms);
     }
 
     pub fn inc_batch_flush(&mut self, reason: BatchFlushReason) {
@@ -60,6 +69,10 @@ impl RuntimeMetrics {
 
     pub fn last_batch_flush_reason(&self) -> Option<BatchFlushReason> {
         self.last_batch_flush_reason
+    }
+
+    pub fn last_batch_wait_ms(&self) -> Option<u64> {
+        self.last_batch_wait_ms
     }
 }
 
@@ -99,5 +112,18 @@ mod tests {
         assert_eq!(m.batch_flushes_for(BatchFlushReason::Time), 2);
         assert_eq!(m.batch_flushes_for(BatchFlushReason::Admin), 0);
         assert_eq!(m.last_batch_flush_reason(), Some(BatchFlushReason::Time));
+    }
+
+    #[test]
+    fn batch_wait_observations_track_totals_and_latest() {
+        let mut m = RuntimeMetrics::default();
+        assert_eq!(m.last_batch_wait_ms(), None);
+
+        m.observe_batch_wait_ms(4);
+        m.observe_batch_wait_ms(7);
+
+        assert_eq!(m.batch_wait_samples, 2);
+        assert_eq!(m.batch_wait_total_ms, 11);
+        assert_eq!(m.last_batch_wait_ms(), Some(7));
     }
 }
