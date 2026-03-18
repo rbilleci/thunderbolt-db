@@ -56,7 +56,7 @@ impl<T> DualTriggerBatcher<T> {
 
     pub fn maybe_flush_due_to_time(&mut self, now: Instant) -> Option<Batch<T>> {
         let first = self.first_enqueued_at?;
-        if now.duration_since(first) >= self.max_wait && !self.queue.is_empty() {
+        if now.saturating_duration_since(first) >= self.max_wait && !self.queue.is_empty() {
             return self.flush(FlushReason::Time);
         }
         None
@@ -125,5 +125,17 @@ mod tests {
 
         let _ = b.enqueue(2u8, t1).expect("must flush on count");
         assert_eq!(b.first_enqueued_at(), None);
+    }
+
+    #[test]
+    fn maybe_flush_due_to_time_does_not_panic_when_clock_moves_backwards() {
+        let mut b = DualTriggerBatcher::new(10, Duration::from_millis(10));
+        let t0 = Instant::now();
+        assert!(b.enqueue(1u8, t0).is_none());
+
+        // Use an earlier instant to simulate non-monotonic caller-provided timing.
+        let earlier = t0.checked_sub(Duration::from_millis(1)).unwrap_or(t0);
+        assert!(b.maybe_flush_due_to_time(earlier).is_none());
+        assert_eq!(b.len(), 1);
     }
 }
