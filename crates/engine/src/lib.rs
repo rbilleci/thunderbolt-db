@@ -429,7 +429,25 @@ mod tests {
         assert!(matches!(err, ExecuteError::Engine(EngineError::NotLeader)));
         assert_eq!(e.metrics().batch_flush_count, 0);
         assert_eq!(e.metrics().batch_flushes_for(BatchFlushReason::Count), 0);
+        assert_eq!(e.metrics().last_batch_flush_reason(), None);
         assert_eq!(e.metrics().commits_total, 0);
+    }
+
+    #[test]
+    fn failed_admin_flush_does_not_increment_flush_metrics() {
+        let mut e = Engine::with_batching(10, Duration::from_secs(60));
+        let t0 = Instant::now();
+        e.enqueue_set_text(1, "SET a=1", t0).unwrap();
+        e.become_follower(2);
+
+        let err = e.flush_admin().unwrap_err();
+
+        assert!(matches!(err, EngineError::NotLeader));
+        assert_eq!(e.metrics().batch_flush_count, 0);
+        assert_eq!(e.metrics().batch_flushes_for(BatchFlushReason::Admin), 0);
+        assert_eq!(e.metrics().last_batch_flush_reason(), None);
+        assert_eq!(e.metrics().commits_total, 0);
+        assert_eq!(e.pending_batch_len(), 0);
     }
 
     #[test]
