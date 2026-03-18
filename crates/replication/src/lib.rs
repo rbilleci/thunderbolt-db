@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use gpu_db_types::{CommitToken, EngineError, Index, LogEntry, Role, SnapshotMeta, Term};
 
 pub trait LogReplicator {
@@ -87,6 +89,111 @@ impl LocalReplicator {
     }
 }
 
+#[derive(Debug)]
+pub struct RaftReplicator {
+    term: Term,
+    next_index: Index,
+    commit_index: Index,
+    applied_index: Index,
+    role: Role,
+    entries: Vec<LogEntry>,
+    snapshot_id: u64,
+    voters: usize,
+    quorum: usize,
+    ack_counts: BTreeMap<Index, usize>,
+}
+
+impl RaftReplicator {
+    pub fn new(voters: usize) -> Self {
+        assert!(voters >= 1, "raft requires at least one voter");
+        let quorum = (voters / 2) + 1;
+        Self {
+            term: 1,
+            next_index: 1,
+            commit_index: 0,
+            applied_index: 0,
+            role: Role::Follower,
+            entries: Vec::new(),
+            snapshot_id: 0,
+            voters,
+            quorum,
+            ack_counts: BTreeMap::new(),
+        }
+    }
+
+    pub fn single_node_leader() -> Self {
+        let mut s = Self::new(1);
+        s.role = Role::Leader;
+        s
+    }
+
+    pub fn become_follower(&mut self, term: Term) {
+        self.term = self.term.max(term);
+        self.role = Role::Follower;
+    }
+
+    pub fn become_leader(&mut self, term: Term) {
+        self.term = self.term.max(term);
+        self.role = Role::Leader;
+    }
+
+    pub fn voter_count(&self) -> usize {
+        self.voters
+    }
+
+    pub fn quorum_size(&self) -> usize {
+        self.quorum
+    }
+
+    pub fn drain_committed_from(&self, start_exclusive: Index) -> impl Iterator<Item = &LogEntry> {
+        self.entries
+            .iter()
+            .filter(move |e| e.index > start_exclusive && e.index <= self.commit_index)
+    }
+
+    pub fn mark_applied(&mut self, idx: Index) {
+        let bounded = idx.min(self.commit_index);
+        self.applied_index = self.applied_index.max(bounded);
+    }
+
+    pub fn register_follower_ack(&mut self, index: Index) {
+        if index == 0 || index >= self.next_index {
+            return;
+        }
+
+        let count = self.ack_counts.entry(index).or_insert(1);
+        *count = (*count + 1).min(self.voters);
+
+        while self.commit_index + 1 < self.next_index {
+            let next = self.commit_index + 1;
+            let Some(acks) = self.ack_counts.get(&next) else {
+                break;
+            };
+            if *acks >= self.quorum {
+                self.commit_index = next;
+            } else {
+                break;
+            }
+        }
+    }
+
+    pub fn export_snapshot_meta(&mut self) -> SnapshotMeta {
+        self.snapshot_id += 1;
+        self.snapshot_meta()
+    }
+
+    pub fn install_snapshot(&mut self, meta: SnapshotMeta) {
+        self.term = self.term.max(meta.last_included_term);
+        self.commit_index = self.commit_index.max(meta.last_included_index);
+        self.applied_index = self.applied_index.max(meta.last_included_index);
+        self.next_index = self.commit_index + 1;
+        self.snapshot_id = self.snapshot_id.max(meta.snapshot_id);
+        self.entries.retain(|e| e.index > meta.last_included_index);
+        self.ack_counts
+            .retain(|idx, _| *idx > meta.last_included_index);
+    }
+}
+
 impl LogReplicator for LocalReplicator {
     fn propose(&mut self, payload: Vec<u8>) -> Result<CommitToken, EngineError> {
         if self.role != Role::Leader {
@@ -104,6 +211,55 @@ impl LogReplicator for LocalReplicator {
 
         self.entries.push(entry);
         self.commit_index = idx;
+
+        Ok(CommitToken { index: idx })
+    }
+
+    fn role(&self) -> Role {
+        self.role
+    }
+
+    fn current_term(&self) -> Term {
+        self.term
+    }
+
+    fn commit_index(&self) -> Index {
+        self.commit_index
+    }
+
+    fn applied_index(&self) -> Index {
+        self.applied_index
+    }
+
+    fn snapshot_meta(&self) -> SnapshotMeta {
+        SnapshotMeta {
+            last_included_index: self.applied_index,
+            last_included_term: self.term,
+            snapshot_id: self.snapshot_id,
+        }
+    }
+}
+
+impl LogReplicator for RaftReplicator {
+    fn propose(&mut self, payload: Vec<u8>) -> Result<CommitToken, EngineError> {
+        if self.role != Role::Leader {
+            return Err(EngineError::NotLeader);
+        }
+
+        let idx = self.next_index;
+        self.next_index += 1;
+
+        self.entries.push(LogEntry {
+            term: self.term,
+            index: idx,
+            payload,
+        });
+
+        // Leader has an implicit self-ack.
+        self.ack_counts.insert(idx, 1);
+        if self.quorum == 1 {
+            self.commit_index = idx;
+        }
 
         Ok(CommitToken { index: idx })
     }
@@ -223,5 +379,49 @@ mod tests {
         r.mark_applied(t1.index + 10);
 
         assert_eq!(r.applied_index(), t1.index);
+    }
+
+    #[test]
+    fn raft_replicator_rejects_proposal_when_not_leader() {
+        let mut r = RaftReplicator::new(3);
+        let err = r.propose(vec![1]).unwrap_err();
+        assert!(matches!(err, EngineError::NotLeader));
+    }
+
+    #[test]
+    fn raft_replicator_commits_after_quorum_acks() {
+        let mut r = RaftReplicator::new(3);
+        r.become_leader(2);
+
+        let t1 = r.propose(vec![1]).unwrap();
+        assert_eq!(r.commit_index(), 0, "self-ack is not quorum for 3 voters");
+
+        r.register_follower_ack(t1.index);
+
+        assert_eq!(r.commit_index(), t1.index);
+        assert_eq!(r.quorum_size(), 2);
+        assert_eq!(r.voter_count(), 3);
+    }
+
+    #[test]
+    fn raft_replicator_commit_index_advances_in_order() {
+        let mut r = RaftReplicator::new(3);
+        r.become_leader(3);
+
+        let t1 = r.propose(vec![10]).unwrap();
+        let t2 = r.propose(vec![20]).unwrap();
+
+        r.register_follower_ack(t2.index);
+        assert_eq!(r.commit_index(), 0, "cannot skip index 1");
+
+        r.register_follower_ack(t1.index);
+        assert_eq!(r.commit_index(), t2.index);
+    }
+
+    #[test]
+    fn raft_single_node_leader_commits_immediately() {
+        let mut r = RaftReplicator::single_node_leader();
+        let tok = r.propose(vec![7]).unwrap();
+        assert_eq!(r.commit_index(), tok.index);
     }
 }
