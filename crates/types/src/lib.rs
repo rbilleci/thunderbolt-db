@@ -23,6 +23,13 @@ pub struct CommitToken {
     pub index: Index,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotMeta {
+    pub last_included_index: Index,
+    pub last_included_term: Term,
+    pub snapshot_id: u64,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
     #[error("not leader")]

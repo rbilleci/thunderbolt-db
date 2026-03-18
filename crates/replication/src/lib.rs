@@ -1,4 +1,4 @@
-use gpu_db_types::{CommitToken, EngineError, Index, LogEntry, Role, Term};
+use gpu_db_types::{CommitToken, EngineError, Index, LogEntry, Role, SnapshotMeta, Term};
 
 pub trait LogReplicator {
     fn propose(&mut self, payload: Vec<u8>) -> Result<CommitToken, EngineError>;
@@ -6,6 +6,7 @@ pub trait LogReplicator {
     fn current_term(&self) -> Term;
     fn commit_index(&self) -> Index;
     fn applied_index(&self) -> Index;
+    fn snapshot_meta(&self) -> SnapshotMeta;
 }
 
 pub trait ReplicatedStateMachine {
@@ -20,6 +21,7 @@ pub struct LocalReplicator {
     applied_index: Index,
     role: Role,
     entries: Vec<LogEntry>,
+    snapshot_id: u64,
 }
 
 impl LocalReplicator {
@@ -31,6 +33,7 @@ impl LocalReplicator {
             applied_index: 0,
             role: Role::Leader,
             entries: Vec::new(),
+            snapshot_id: 0,
         }
     }
 
@@ -66,6 +69,20 @@ impl LocalReplicator {
             .map(|e| e.index)
             .unwrap_or(self.applied_index);
         self.next_index = self.commit_index + 1;
+    }
+
+    pub fn export_snapshot_meta(&mut self) -> SnapshotMeta {
+        self.snapshot_id += 1;
+        self.snapshot_meta()
+    }
+
+    pub fn install_snapshot(&mut self, meta: SnapshotMeta) {
+        self.term = self.term.max(meta.last_included_term);
+        self.commit_index = self.commit_index.max(meta.last_included_index);
+        self.applied_index = self.applied_index.max(meta.last_included_index);
+        self.next_index = self.commit_index + 1;
+        self.snapshot_id = self.snapshot_id.max(meta.snapshot_id);
+        self.entries.retain(|e| e.index > meta.last_included_index);
     }
 }
 
@@ -104,6 +121,14 @@ impl LogReplicator for LocalReplicator {
 
     fn applied_index(&self) -> Index {
         self.applied_index
+    }
+
+    fn snapshot_meta(&self) -> SnapshotMeta {
+        SnapshotMeta {
+            last_included_index: self.applied_index,
+            last_included_term: self.term,
+            snapshot_id: self.snapshot_id,
+        }
     }
 }
 
@@ -153,5 +178,39 @@ mod tests {
         assert_eq!(r.commit_index(), 1);
         let t3 = r.propose(vec![3]).unwrap();
         assert_eq!(t3.index, 2);
+    }
+
+    #[test]
+    fn snapshot_meta_tracks_applied_index() {
+        let mut r = LocalReplicator::leader();
+        let t1 = r.propose(vec![1]).unwrap();
+        r.mark_applied(t1.index);
+
+        let meta = r.export_snapshot_meta();
+
+        assert_eq!(meta.last_included_index, t1.index);
+        assert_eq!(meta.last_included_term, r.current_term());
+        assert_eq!(meta.snapshot_id, 1);
+    }
+
+    #[test]
+    fn install_snapshot_advances_log_watermarks() {
+        let mut r = LocalReplicator::leader();
+        let _ = r.propose(vec![1]).unwrap();
+        let t2 = r.propose(vec![2]).unwrap();
+
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: t2.index,
+            last_included_term: 2,
+            snapshot_id: 9,
+        });
+
+        assert_eq!(r.commit_index(), t2.index);
+        assert_eq!(r.applied_index(), t2.index);
+        assert_eq!(r.current_term(), 2);
+        assert_eq!(r.snapshot_meta().snapshot_id, 9);
+
+        let t3 = r.propose(vec![3]).unwrap();
+        assert_eq!(t3.index, t2.index + 1);
     }
 }
