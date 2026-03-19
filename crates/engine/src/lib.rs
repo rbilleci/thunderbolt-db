@@ -109,14 +109,22 @@ impl Engine {
             return Err(EngineError::NotLeader);
         }
 
+        let wal_len_before = self.wal.len();
         self.wal.append(WalRecord {
             txn_id,
             payload: payload.clone(),
         });
 
-        let token = self.repl.propose(payload)?;
+        let token = match self.repl.propose(payload) {
+            Ok(token) => token,
+            Err(err) => {
+                self.wal.truncate(wal_len_before);
+                return Err(err);
+            }
+        };
         if let Err(err) = self.wal.flush_all() {
             self.repl.rollback_unapplied_from(token.index);
+            self.wal.truncate(wal_len_before);
             return Err(err);
         }
 
@@ -243,6 +251,10 @@ impl Engine {
 
     pub fn wal_flushed_count(&self) -> usize {
         self.wal.flushed_count()
+    }
+
+    pub fn wal_buffered_count(&self) -> usize {
+        self.wal.len()
     }
 
     pub fn get(&self, key: &str) -> Option<&str> {
@@ -440,6 +452,18 @@ mod tests {
         assert_eq!(e.get("a"), None);
         assert_eq!(e.get("b"), Some("2"));
         assert_eq!(e.applied_len(), 1);
+    }
+
+    #[test]
+    fn wal_flush_failure_discards_unflushed_record_from_buffer() {
+        let mut e = Engine::new_local();
+        e.simulate_next_wal_flush_failure();
+
+        let err = e.commit_mutation(1, b"SET a=1".to_vec()).unwrap_err();
+
+        assert!(matches!(err, EngineError::Durability(_)));
+        assert_eq!(e.wal_flushed_count(), 0);
+        assert_eq!(e.wal_buffered_count(), 0);
     }
 
     #[test]

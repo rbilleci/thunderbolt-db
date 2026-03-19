@@ -18,6 +18,21 @@ impl WalBuffer {
         self.records.push(rec);
     }
 
+    pub fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
+    pub fn truncate(&mut self, len: usize) {
+        self.records.truncate(len);
+        if self.flushed > self.records.len() {
+            self.flushed = self.records.len();
+        }
+    }
+
     pub fn flush_all(&mut self) -> Result<(), EngineError> {
         if self.fail_next_flush {
             self.fail_next_flush = false;
@@ -73,6 +88,26 @@ mod tests {
         assert_eq!(wal.flushed_count(), 0);
 
         wal.flush_all().unwrap();
+        assert_eq!(wal.flushed_count(), 1);
+    }
+
+    #[test]
+    fn truncate_shrinks_records_and_adjusts_flushed_count() {
+        let mut wal = WalBuffer::default();
+        wal.append(WalRecord {
+            txn_id: 1,
+            payload: b"SET a=1".to_vec(),
+        });
+        wal.append(WalRecord {
+            txn_id: 2,
+            payload: b"SET b=2".to_vec(),
+        });
+
+        wal.flush_all().unwrap();
+        assert_eq!(wal.flushed_count(), 2);
+
+        wal.truncate(1);
+        assert_eq!(wal.len(), 1);
         assert_eq!(wal.flushed_count(), 1);
     }
 }
