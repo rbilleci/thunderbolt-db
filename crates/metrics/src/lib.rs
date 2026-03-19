@@ -8,6 +8,36 @@ pub enum FallbackReason {
     GpuMemoryPressure,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GpuParityIssue {
+    pub id: &'static str,
+    pub owner: &'static str,
+    pub milestone: &'static str,
+}
+
+impl FallbackReason {
+    pub fn gpu_parity_issue(self) -> Option<GpuParityIssue> {
+        match self {
+            Self::NotGpuEligible => None,
+            Self::GpuUnavailable => Some(GpuParityIssue {
+                id: "GPU-120",
+                owner: "runtime",
+                milestone: "m0-bootstrap",
+            }),
+            Self::GpuQueueSaturated => Some(GpuParityIssue {
+                id: "GPU-121",
+                owner: "runtime",
+                milestone: "m0-bootstrap",
+            }),
+            Self::GpuMemoryPressure => Some(GpuParityIssue {
+                id: "GPU-122",
+                owner: "runtime",
+                milestone: "m0-bootstrap",
+            }),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BatchFlushReason {
     Count,
@@ -196,5 +226,27 @@ mod tests {
         assert_eq!(m.kernel_exec_total_ms, 12);
         assert_eq!(m.last_kernel_exec_ms(), Some(3));
         assert_eq!(m.avg_kernel_exec_ms(), Some(6.0));
+    }
+
+    #[test]
+    fn gpu_fallback_reasons_have_tracked_parity_issues() {
+        assert_eq!(FallbackReason::NotGpuEligible.gpu_parity_issue(), None);
+
+        let unavailable = FallbackReason::GpuUnavailable
+            .gpu_parity_issue()
+            .expect("gpu unavailable should map to a parity issue");
+        assert_eq!(unavailable.id, "GPU-120");
+        assert_eq!(unavailable.owner, "runtime");
+        assert_eq!(unavailable.milestone, "m0-bootstrap");
+
+        let queue = FallbackReason::GpuQueueSaturated
+            .gpu_parity_issue()
+            .expect("gpu queue saturation should map to a parity issue");
+        assert_eq!(queue.id, "GPU-121");
+
+        let memory = FallbackReason::GpuMemoryPressure
+            .gpu_parity_issue()
+            .expect("gpu memory pressure should map to a parity issue");
+        assert_eq!(memory.id, "GPU-122");
     }
 }
