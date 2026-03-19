@@ -473,6 +473,19 @@ mod tests {
     }
 
     #[test]
+    fn admin_flush_without_pending_queue_is_noop() {
+        let mut e = Engine::with_batching(10, Duration::from_secs(60));
+
+        e.flush_admin().unwrap();
+
+        assert_eq!(e.pending_batch_len(), 0);
+        assert_eq!(e.metrics().batch_flush_count, 0);
+        assert_eq!(e.metrics().batch_flushes_for(BatchFlushReason::Admin), 0);
+        assert_eq!(e.metrics().last_batch_flush_reason(), None);
+        assert_eq!(e.metrics().commits_total, 0);
+    }
+
+    #[test]
     fn batching_config_reflects_engine_settings() {
         let e = Engine::with_batching(7, Duration::from_millis(42));
         assert_eq!(e.batching_config(), (7, Duration::from_millis(42)));
