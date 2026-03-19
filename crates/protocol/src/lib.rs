@@ -17,7 +17,7 @@ pub enum ParseError {
     Unsupported(String),
     #[error("invalid SET syntax; expected: SET key=value")]
     InvalidSet,
-    #[error("invalid DEL/DELETE syntax; expected: DEL key")]
+    #[error("invalid DEL/DELETE syntax; expected: DEL|DELETE key")]
     InvalidDel,
     #[error("invalid GET syntax; expected: GET key")]
     InvalidGet,
