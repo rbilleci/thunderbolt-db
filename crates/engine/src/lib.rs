@@ -219,19 +219,21 @@ impl Engine {
             FlushReason::Admin => BatchFlushReason::Admin,
         };
 
-        let mut remaining: Vec<BatchItem<PendingMutation>> = items.collect();
-        while let Some(p) = remaining.first().cloned() {
+        let mut remaining = items.peekable();
+        while let Some(p) = remaining.next() {
             let wait = flushed_at
                 .saturating_duration_since(p.enqueued_at)
                 .as_millis() as u64;
+            let txn_id = p.item.txn_id;
+            let payload = p.item.payload.clone();
 
-            if let Err(err) = self.commit_mutation(p.item.txn_id, p.item.payload) {
-                self.batcher.requeue_front(remaining);
+            if let Err(err) = self.commit_mutation(txn_id, payload) {
+                let tail: Vec<_> = std::iter::once(p).chain(remaining).collect();
+                self.batcher.requeue_front(tail);
                 return Err(err);
             }
 
             self.metrics.observe_batch_wait_ms(wait);
-            remaining.remove(0);
         }
 
         self.metrics.inc_batch_flush(metric_reason);
