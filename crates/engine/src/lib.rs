@@ -54,6 +54,7 @@ struct PendingMutation {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReplicationWatermarks {
+    pub role: Role,
     pub term: Term,
     pub commit_index: Index,
     pub applied_index: Index,
@@ -289,6 +290,7 @@ impl Engine {
 
     pub fn replication_watermarks(&self) -> ReplicationWatermarks {
         ReplicationWatermarks {
+            role: self.repl.role(),
             term: self.repl.current_term(),
             commit_index: self.repl.commit_index(),
             applied_index: self.repl.applied_index(),
@@ -654,6 +656,7 @@ mod tests {
         let mut e = Engine::new_local();
 
         let before = e.replication_watermarks();
+        assert_eq!(before.role, Role::Leader);
         assert_eq!(before.commit_index, 0);
         assert_eq!(before.applied_index, 0);
         assert_eq!(before.visible_index, 0);
@@ -662,6 +665,7 @@ mod tests {
         let token = e.commit_mutation(1, b"SET a=1".to_vec()).unwrap();
         let after = e.replication_watermarks();
 
+        assert_eq!(after.role, Role::Leader);
         assert!(after.term >= before.term);
         assert_eq!(after.commit_index, token.index);
         assert_eq!(after.applied_index, token.index);
@@ -678,6 +682,7 @@ mod tests {
         assert!(matches!(err, EngineError::NotLeader));
 
         let marks = e.replication_watermarks();
+        assert_eq!(marks.role, Role::Follower);
         assert_eq!(marks.term, 2);
         assert_eq!(marks.commit_index, 0);
         assert_eq!(marks.applied_index, 0);
