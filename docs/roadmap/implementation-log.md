@@ -3,6 +3,8 @@
 ## 2026-03-19
 
 ### Completed
+- Extended text-protocol transaction compatibility so `BEGIN READ ONLY` and `BEGIN READ WRITE` are accepted directly (without requiring `WORK`/`TRANSACTION`), with negative coverage for unsupported partial/isolation-style suffixes.
+- Added raft regression coverage proving `install_snapshot` prunes ack-tracking and compacted entries at/under the installed snapshot boundary while preserving newer pending entries.
 - Added role-aware read gating in `Engine::execute_read_text`: `GET` now returns `EngineError::NotLeader` when node role is follower/candidate, with regression coverage ensuring read fallback/transfer metrics are not emitted on rejected reads.
 - Tightened engine read-path contracts: `execute_read_text` now returns an explicit `NonReadCommand` error for non-`GET` commands instead of silently returning `None`, with regression coverage to prevent accidental mutation/control usage through read-only entry points.
 - Clarified text-protocol delete diagnostics so malformed `DEL`/`DELETE` commands now report `expected: DEL|DELETE key`, matching accepted aliases.
