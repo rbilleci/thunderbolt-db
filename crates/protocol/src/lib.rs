@@ -23,6 +23,27 @@ pub enum ParseError {
     InvalidGet,
 }
 
+fn is_transaction_control(input: &str, keyword: &str) -> bool {
+    let mut tokens = input.split_whitespace();
+    let Some(first) = tokens.next() else {
+        return false;
+    };
+    if !first.eq_ignore_ascii_case(keyword) {
+        return false;
+    }
+
+    match tokens.next() {
+        None => true,
+        Some(second)
+            if second.eq_ignore_ascii_case("TRANSACTION")
+                || second.eq_ignore_ascii_case("WORK") =>
+        {
+            tokens.next().is_none()
+        }
+        Some(_) => false,
+    }
+}
+
 pub fn parse_command(input: &str) -> Result<Command, ParseError> {
     let s = input.trim();
     if s.is_empty() {
@@ -33,17 +54,16 @@ pub fn parse_command(input: &str) -> Result<Command, ParseError> {
         return Err(ParseError::Empty);
     }
 
-    let upper = s.to_ascii_uppercase();
-    if upper == "BEGIN" {
+    if is_transaction_control(s, "BEGIN") {
         return Ok(Command::Begin);
     }
-    if upper == "COMMIT" {
+    if is_transaction_control(s, "COMMIT") {
         return Ok(Command::Commit);
     }
-    if upper == "ROLLBACK" {
+    if is_transaction_control(s, "ROLLBACK") {
         return Ok(Command::Rollback);
     }
-    if upper == "FLUSH" {
+    if s.eq_ignore_ascii_case("FLUSH") {
         return Ok(Command::Flush);
     }
 
@@ -144,6 +164,38 @@ mod tests {
         assert_eq!(parse_command("begin").unwrap(), Command::Begin);
         assert_eq!(parse_command("COMMIT").unwrap(), Command::Commit);
         assert_eq!(parse_command("rOlLbAcK").unwrap(), Command::Rollback);
+    }
+
+    #[test]
+    fn parses_transaction_control_work_and_transaction_aliases() {
+        assert_eq!(parse_command("BEGIN WORK").unwrap(), Command::Begin);
+        assert_eq!(parse_command("BEGIN TRANSACTION").unwrap(), Command::Begin);
+        assert_eq!(parse_command("COMMIT WORK").unwrap(), Command::Commit);
+        assert_eq!(
+            parse_command("COMMIT TRANSACTION").unwrap(),
+            Command::Commit
+        );
+        assert_eq!(parse_command("ROLLBACK WORK").unwrap(), Command::Rollback);
+        assert_eq!(
+            parse_command("ROLLBACK TRANSACTION").unwrap(),
+            Command::Rollback
+        );
+    }
+
+    #[test]
+    fn rejects_transaction_control_commands_with_extra_tokens() {
+        assert!(matches!(
+            parse_command("BEGIN TRANSACTION NOW"),
+            Err(ParseError::Unsupported(_))
+        ));
+        assert!(matches!(
+            parse_command("COMMIT WORK PLEASE"),
+            Err(ParseError::Unsupported(_))
+        ));
+        assert!(matches!(
+            parse_command("ROLLBACK TRANSACTION AGAIN"),
+            Err(ParseError::Unsupported(_))
+        ));
     }
 
     #[test]

@@ -21,6 +21,7 @@ cargo test --all-features
 ## Command notes
 
 - `DEL key` and `DELETE key` are equivalent.
+- `BEGIN|COMMIT|ROLLBACK` also accept `WORK` and `TRANSACTION` aliases.
 
 ## Safety invariant
 
