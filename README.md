@@ -23,6 +23,7 @@ cargo test --all-features
 - `DEL key` and `DELETE key` are equivalent.
 - `BEGIN|COMMIT|ROLLBACK` also accept `WORK` and `TRANSACTION` aliases.
 - `END` maps to `COMMIT`; `ABORT` maps to `ROLLBACK`.
+- `START TRANSACTION` maps to `BEGIN` (without transaction mode modifiers).
 
 ## Safety invariant
 

@@ -44,6 +44,15 @@ fn is_transaction_control(input: &str, keyword: &str) -> bool {
     }
 }
 
+fn is_start_transaction(input: &str) -> bool {
+    let mut tokens = input.split_whitespace();
+    matches!(
+        (tokens.next(), tokens.next(), tokens.next()),
+        (Some(first), Some(second), None)
+            if first.eq_ignore_ascii_case("START") && second.eq_ignore_ascii_case("TRANSACTION")
+    )
+}
+
 pub fn parse_command(input: &str) -> Result<Command, ParseError> {
     let s = input.trim();
     if s.is_empty() {
@@ -54,7 +63,7 @@ pub fn parse_command(input: &str) -> Result<Command, ParseError> {
         return Err(ParseError::Empty);
     }
 
-    if is_transaction_control(s, "BEGIN") {
+    if is_transaction_control(s, "BEGIN") || is_start_transaction(s) {
         return Ok(Command::Begin);
     }
     if is_transaction_control(s, "COMMIT") || is_transaction_control(s, "END") {
@@ -172,6 +181,7 @@ mod tests {
     fn parses_transaction_control_work_and_transaction_aliases() {
         assert_eq!(parse_command("BEGIN WORK").unwrap(), Command::Begin);
         assert_eq!(parse_command("BEGIN TRANSACTION").unwrap(), Command::Begin);
+        assert_eq!(parse_command("START TRANSACTION").unwrap(), Command::Begin);
         assert_eq!(parse_command("COMMIT WORK").unwrap(), Command::Commit);
         assert_eq!(
             parse_command("COMMIT TRANSACTION").unwrap(),
@@ -195,6 +205,10 @@ mod tests {
     fn rejects_transaction_control_commands_with_extra_tokens() {
         assert!(matches!(
             parse_command("BEGIN TRANSACTION NOW"),
+            Err(ParseError::Unsupported(_))
+        ));
+        assert!(matches!(
+            parse_command("START TRANSACTION READ ONLY"),
             Err(ParseError::Unsupported(_))
         ));
         assert!(matches!(
