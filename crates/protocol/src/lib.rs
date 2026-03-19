@@ -179,6 +179,13 @@ fn is_begin_mode_list(tokens: &[String]) -> bool {
     true
 }
 
+fn strip_single_leading_comma(tokens: &[String]) -> Option<&[String]> {
+    match tokens {
+        [first, rest @ ..] if first == "," && !rest.is_empty() => Some(rest),
+        _ => None,
+    }
+}
+
 fn is_begin_with_optional_mode(input: &str) -> bool {
     let tokens = normalize_begin_tokens(input);
     let Some((first, rest)) = tokens.split_first() else {
@@ -195,7 +202,11 @@ fn is_begin_with_optional_mode(input: &str) -> bool {
                 if second.eq_ignore_ascii_case("TRANSACTION")
                     || second.eq_ignore_ascii_case("WORK") =>
             {
-                is_begin_mode_list(mode)
+                if is_begin_mode_list(mode) {
+                    true
+                } else {
+                    strip_single_leading_comma(mode).is_some_and(is_begin_mode_list)
+                }
             }
             _ => false,
         };
@@ -209,7 +220,11 @@ fn is_begin_with_optional_mode(input: &str) -> bool {
                 if second.eq_ignore_ascii_case("TRANSACTION")
                     || second.eq_ignore_ascii_case("WORK") =>
             {
-                is_begin_mode_list(mode)
+                if is_begin_mode_list(mode) {
+                    true
+                } else {
+                    strip_single_leading_comma(mode).is_some_and(is_begin_mode_list)
+                }
             }
             _ => false,
         };
@@ -404,7 +419,19 @@ mod tests {
         );
         assert_eq!(parse_command("START TRANSACTION").unwrap(), Command::Begin);
         assert_eq!(
+            parse_command("BEGIN TRANSACTION, READ ONLY").unwrap(),
+            Command::Begin
+        );
+        assert_eq!(
+            parse_command("BEGIN WORK, READ WRITE").unwrap(),
+            Command::Begin
+        );
+        assert_eq!(
             parse_command("START TRANSACTION READ ONLY").unwrap(),
+            Command::Begin
+        );
+        assert_eq!(
+            parse_command("START TRANSACTION, READ ONLY").unwrap(),
             Command::Begin
         );
         assert_eq!(
@@ -412,6 +439,10 @@ mod tests {
             Command::Begin
         );
         assert_eq!(parse_command("START WORK").unwrap(), Command::Begin);
+        assert_eq!(
+            parse_command("START WORK, READ WRITE, DEFERRABLE").unwrap(),
+            Command::Begin
+        );
         assert_eq!(
             parse_command("START TRANSACTION DEFERRABLE").unwrap(),
             Command::Begin
@@ -535,6 +566,14 @@ mod tests {
         ));
         assert!(matches!(
             parse_command("START TRANSACTION READ"),
+            Err(ParseError::Unsupported(_))
+        ));
+        assert!(matches!(
+            parse_command("BEGIN TRANSACTION,"),
+            Err(ParseError::Unsupported(_))
+        ));
+        assert!(matches!(
+            parse_command("START WORK, "),
             Err(ParseError::Unsupported(_))
         ));
         assert!(matches!(
