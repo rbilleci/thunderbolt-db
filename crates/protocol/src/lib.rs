@@ -55,11 +55,16 @@ fn is_start_begin_alias(input: &str) -> bool {
 }
 
 pub fn parse_command(input: &str) -> Result<Command, ParseError> {
-    let s = input.trim();
+    let mut s = input.trim_end();
     if s.is_empty() {
         return Err(ParseError::Empty);
     }
-    let s = s.strip_suffix(';').unwrap_or(s).trim_end();
+
+    while let Some(without_semicolon) = s.strip_suffix(';') {
+        s = without_semicolon.trim_end();
+    }
+
+    let s = s.trim_start();
     if s.is_empty() {
         return Err(ParseError::Empty);
     }
@@ -252,6 +257,23 @@ mod tests {
                 key: "balance".into()
             }
         );
+    }
+
+    #[test]
+    fn accepts_repeated_statement_terminators() {
+        assert_eq!(parse_command("BEGIN;;").unwrap(), Command::Begin);
+        assert_eq!(
+            parse_command("SET balance = 42; ; \n").unwrap(),
+            Command::SetKv {
+                key: "balance".into(),
+                value: "42".into()
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_input_that_is_only_terminators() {
+        assert!(matches!(parse_command(";;;"), Err(ParseError::Empty)));
     }
 
     #[test]
