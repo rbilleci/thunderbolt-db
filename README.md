@@ -12,5 +12,11 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
 ## Quickstart
 
 ```bash
-cargo test
+cargo fmt --all
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-features
 ```
+
+## Safety invariant
+
+The engine preserves **WAL-before-visibility**: a state transition is never visible to readers before its corresponding WAL record is durably flushed.
