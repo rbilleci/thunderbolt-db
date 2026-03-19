@@ -197,12 +197,18 @@ impl Engine {
                 self.txn_manager.begin_with_id(txn_id)?;
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
-            Command::Commit { .. } => {
+            Command::Commit { chain } => {
                 self.txn_manager.commit(txn_id)?;
+                if chain {
+                    let _ = self.txn_manager.begin();
+                }
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
-            Command::Rollback { .. } => {
+            Command::Rollback { chain } => {
                 self.txn_manager.rollback(txn_id)?;
+                if chain {
+                    let _ = self.txn_manager.begin();
+                }
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
             Command::GetKv { .. } => {
@@ -303,12 +309,18 @@ impl Engine {
                 self.txn_manager.begin_with_id(txn_id)?;
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
-            Command::Commit { .. } => {
+            Command::Commit { chain } => {
                 self.txn_manager.commit(txn_id)?;
+                if chain {
+                    let _ = self.txn_manager.begin();
+                }
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
-            Command::Rollback { .. } => {
+            Command::Rollback { chain } => {
                 self.txn_manager.rollback(txn_id)?;
+                if chain {
+                    let _ = self.txn_manager.begin();
+                }
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
             Command::GetKv { .. } => {
@@ -997,15 +1009,19 @@ mod tests {
     }
 
     #[test]
-    fn and_chain_forms_currently_follow_plain_commit_and_rollback_behavior() {
+    fn and_chain_forms_reopen_transaction_context() {
         let mut e = Engine::new_local();
 
         e.execute_text(21, "BEGIN").unwrap();
         e.execute_text(21, "COMMIT AND CHAIN").unwrap();
+        assert_eq!(e.active_txn_count(), 1);
+        e.execute_text(22, "COMMIT").unwrap();
         assert_eq!(e.active_txn_count(), 0);
 
-        e.execute_text(22, "BEGIN").unwrap();
-        e.execute_text(22, "ROLLBACK AND CHAIN").unwrap();
+        e.execute_text(31, "BEGIN").unwrap();
+        e.execute_text(31, "ROLLBACK AND CHAIN").unwrap();
+        assert_eq!(e.active_txn_count(), 1);
+        e.execute_text(32, "ROLLBACK").unwrap();
         assert_eq!(e.active_txn_count(), 0);
     }
 
