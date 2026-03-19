@@ -57,6 +57,37 @@ fn is_transaction_control(input: &str, keyword: &str) -> bool {
     }
 }
 
+fn is_isolation_level_suffix(tokens: &[&str]) -> bool {
+    matches!(
+        tokens,
+        [isolation, level, serializable]
+            if isolation.eq_ignore_ascii_case("ISOLATION")
+                && level.eq_ignore_ascii_case("LEVEL")
+                && serializable.eq_ignore_ascii_case("SERIALIZABLE")
+    ) || matches!(
+        tokens,
+        [isolation, level, repeatable, read]
+            if isolation.eq_ignore_ascii_case("ISOLATION")
+                && level.eq_ignore_ascii_case("LEVEL")
+                && repeatable.eq_ignore_ascii_case("REPEATABLE")
+                && read.eq_ignore_ascii_case("READ")
+    ) || matches!(
+        tokens,
+        [isolation, level, read, committed]
+            if isolation.eq_ignore_ascii_case("ISOLATION")
+                && level.eq_ignore_ascii_case("LEVEL")
+                && read.eq_ignore_ascii_case("READ")
+                && committed.eq_ignore_ascii_case("COMMITTED")
+    ) || matches!(
+        tokens,
+        [isolation, level, read, uncommitted]
+            if isolation.eq_ignore_ascii_case("ISOLATION")
+                && level.eq_ignore_ascii_case("LEVEL")
+                && read.eq_ignore_ascii_case("READ")
+                && uncommitted.eq_ignore_ascii_case("UNCOMMITTED")
+    )
+}
+
 fn is_begin_mode_suffix(tokens: &[&str]) -> bool {
     matches!(
         tokens,
@@ -66,7 +97,7 @@ fn is_begin_mode_suffix(tokens: &[&str]) -> bool {
         tokens,
         [read, write]
             if read.eq_ignore_ascii_case("READ") && write.eq_ignore_ascii_case("WRITE")
-    )
+    ) || is_isolation_level_suffix(tokens)
 }
 
 fn is_begin_with_optional_mode(input: &str) -> bool {
@@ -244,6 +275,22 @@ mod tests {
         assert_eq!(parse_command("BEGIN READ ONLY").unwrap(), Command::Begin);
         assert_eq!(parse_command("BEGIN READ WRITE").unwrap(), Command::Begin);
         assert_eq!(
+            parse_command("BEGIN ISOLATION LEVEL SERIALIZABLE").unwrap(),
+            Command::Begin
+        );
+        assert_eq!(
+            parse_command("BEGIN ISOLATION LEVEL REPEATABLE READ").unwrap(),
+            Command::Begin
+        );
+        assert_eq!(
+            parse_command("BEGIN ISOLATION LEVEL READ COMMITTED").unwrap(),
+            Command::Begin
+        );
+        assert_eq!(
+            parse_command("BEGIN ISOLATION LEVEL READ UNCOMMITTED").unwrap(),
+            Command::Begin
+        );
+        assert_eq!(
             parse_command("BEGIN TRANSACTION READ ONLY").unwrap(),
             Command::Begin
         );
@@ -251,9 +298,17 @@ mod tests {
             parse_command("BEGIN WORK READ WRITE").unwrap(),
             Command::Begin
         );
+        assert_eq!(
+            parse_command("BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE").unwrap(),
+            Command::Begin
+        );
         assert_eq!(parse_command("START TRANSACTION").unwrap(), Command::Begin);
         assert_eq!(
             parse_command("START TRANSACTION READ ONLY").unwrap(),
+            Command::Begin
+        );
+        assert_eq!(
+            parse_command("START TRANSACTION ISOLATION LEVEL REPEATABLE READ").unwrap(),
             Command::Begin
         );
         assert_eq!(parse_command("START WORK").unwrap(), Command::Begin);
@@ -305,6 +360,14 @@ mod tests {
         ));
         assert!(matches!(
             parse_command("BEGIN READ COMMITTED"),
+            Err(ParseError::Unsupported(_))
+        ));
+        assert!(matches!(
+            parse_command("BEGIN ISOLATION LEVEL"),
+            Err(ParseError::Unsupported(_))
+        ));
+        assert!(matches!(
+            parse_command("BEGIN ISOLATION LEVEL SNAPSHOT"),
             Err(ParseError::Unsupported(_))
         ));
         assert!(matches!(
