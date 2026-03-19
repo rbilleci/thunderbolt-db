@@ -19,6 +19,7 @@ pub struct Txn {
 pub enum TxnError {
     NotFound(TxnId),
     NotActive(TxnId),
+    AlreadyExists(TxnId),
 }
 
 impl std::fmt::Display for TxnError {
@@ -26,6 +27,7 @@ impl std::fmt::Display for TxnError {
         match self {
             Self::NotFound(id) => write!(f, "transaction {id} not found"),
             Self::NotActive(id) => write!(f, "transaction {id} is not active"),
+            Self::AlreadyExists(id) => write!(f, "transaction {id} already exists"),
         }
     }
 }
@@ -50,8 +52,8 @@ impl TxnManager {
     }
 
     pub fn begin_with_id(&mut self, id: TxnId) -> Result<Txn, TxnError> {
-        if matches!(self.states.get(&id), Some(TxnState::Active)) {
-            return Err(TxnError::NotActive(id));
+        if self.states.contains_key(&id) {
+            return Err(TxnError::AlreadyExists(id));
         }
         self.next_id = self.next_id.max(id);
         self.states.insert(id, TxnState::Active);
@@ -163,6 +165,16 @@ mod tests {
         let mut tm = TxnManager::default();
 
         tm.begin_with_id(7).unwrap();
-        assert_eq!(tm.begin_with_id(7), Err(TxnError::NotActive(7)));
+        assert_eq!(tm.begin_with_id(7), Err(TxnError::AlreadyExists(7)));
+    }
+
+    #[test]
+    fn begin_with_id_rejects_duplicate_terminal_id() {
+        let mut tm = TxnManager::default();
+
+        tm.begin_with_id(9).unwrap();
+        tm.commit(9).unwrap();
+
+        assert_eq!(tm.begin_with_id(9), Err(TxnError::AlreadyExists(9)));
     }
 }

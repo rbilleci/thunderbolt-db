@@ -989,7 +989,7 @@ mod tests {
         let duplicate_begin_err = e.execute_text(12, "BEGIN").unwrap_err();
         assert!(matches!(
             duplicate_begin_err,
-            ExecuteError::Txn(TxnError::NotActive(12))
+            ExecuteError::Txn(TxnError::AlreadyExists(12))
         ));
 
         assert_eq!(e.metrics().fallback_total, 1);
