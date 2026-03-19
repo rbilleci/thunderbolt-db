@@ -166,12 +166,12 @@ fn is_begin_mode_list(tokens: &[String]) -> bool {
         if idx == tokens.len() {
             return true;
         }
-        if tokens[idx] != "," {
-            return false;
-        }
-        idx += 1;
-        if idx == tokens.len() {
-            return false;
+
+        if tokens[idx] == "," {
+            idx += 1;
+            if idx == tokens.len() || tokens[idx] == "," {
+                return false;
+            }
         }
     }
 
@@ -393,6 +393,14 @@ mod tests {
             parse_command("BEGIN READ ONLY , DEFERRABLE").unwrap(),
             Command::Begin
         );
+        assert_eq!(
+            parse_command("BEGIN READ ONLY DEFERRABLE").unwrap(),
+            Command::Begin
+        );
+        assert_eq!(
+            parse_command("BEGIN READ WRITE ISOLATION LEVEL SERIALIZABLE").unwrap(),
+            Command::Begin
+        );
         assert_eq!(parse_command("START TRANSACTION").unwrap(), Command::Begin);
         assert_eq!(
             parse_command("START TRANSACTION READ ONLY").unwrap(),
@@ -405,6 +413,10 @@ mod tests {
         assert_eq!(parse_command("START WORK").unwrap(), Command::Begin);
         assert_eq!(
             parse_command("START TRANSACTION DEFERRABLE").unwrap(),
+            Command::Begin
+        );
+        assert_eq!(
+            parse_command("START TRANSACTION READ ONLY DEFERRABLE").unwrap(),
             Command::Begin
         );
         assert_eq!(
@@ -504,6 +516,10 @@ mod tests {
         ));
         assert!(matches!(
             parse_command("BEGIN , READ ONLY"),
+            Err(ParseError::Unsupported(_))
+        ));
+        assert!(matches!(
+            parse_command("BEGIN READ ONLY,, DEFERRABLE"),
             Err(ParseError::Unsupported(_))
         ));
         assert!(matches!(
