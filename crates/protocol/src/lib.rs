@@ -67,7 +67,7 @@ pub fn parse_command(input: &str) -> Result<Command, ParseError> {
             });
         }
 
-        if cmd.eq_ignore_ascii_case("DEL") {
+        if cmd.eq_ignore_ascii_case("DEL") || cmd.eq_ignore_ascii_case("DELETE") {
             let Some(rest) = parts.next() else {
                 return Err(ParseError::InvalidDel);
             };
@@ -167,6 +167,17 @@ mod tests {
     #[test]
     fn parses_del() {
         let cmd = parse_command("DEL balance").unwrap();
+        assert_eq!(
+            cmd,
+            Command::DeleteKv {
+                key: "balance".into()
+            }
+        );
+    }
+
+    #[test]
+    fn parses_delete_alias() {
+        let cmd = parse_command("DELETE balance").unwrap();
         assert_eq!(
             cmd,
             Command::DeleteKv {
