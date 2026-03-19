@@ -214,6 +214,10 @@ mod tests {
             Err(ParseError::Unsupported(_))
         ));
         assert!(matches!(
+            parse_command("START WORK NOW"),
+            Err(ParseError::Unsupported(_))
+        ));
+        assert!(matches!(
             parse_command("COMMIT WORK PLEASE"),
             Err(ParseError::Unsupported(_))
         ));
@@ -234,6 +238,7 @@ mod tests {
     #[test]
     fn accepts_optional_statement_terminator() {
         assert_eq!(parse_command("BEGIN;").unwrap(), Command::Begin);
+        assert_eq!(parse_command("START WORK;").unwrap(), Command::Begin);
         assert_eq!(
             parse_command("SET balance = 42;").unwrap(),
             Command::SetKv {
