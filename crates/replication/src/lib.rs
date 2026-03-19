@@ -4,6 +4,11 @@ use gpu_db_types::{CommitToken, EngineError, Index, LogEntry, Role, SnapshotMeta
 
 pub trait LogReplicator {
     fn propose(&mut self, payload: Vec<u8>) -> Result<CommitToken, EngineError>;
+    fn wait_committed(
+        &self,
+        token: CommitToken,
+        timeout: std::time::Duration,
+    ) -> Result<Index, EngineError>;
     fn role(&self) -> Role;
     fn current_term(&self) -> Term;
     fn commit_index(&self) -> Index;
@@ -225,6 +230,21 @@ impl LogReplicator for LocalReplicator {
         Ok(CommitToken { index: idx })
     }
 
+    fn wait_committed(
+        &self,
+        token: CommitToken,
+        _timeout: std::time::Duration,
+    ) -> Result<Index, EngineError> {
+        if self.commit_index >= token.index {
+            Ok(token.index)
+        } else {
+            Err(EngineError::ProposalFailed(format!(
+                "token {} is not committed yet (commit_index={})",
+                token.index, self.commit_index
+            )))
+        }
+    }
+
     fn role(&self) -> Role {
         self.role
     }
@@ -274,6 +294,21 @@ impl LogReplicator for RaftReplicator {
         }
 
         Ok(CommitToken { index: idx })
+    }
+
+    fn wait_committed(
+        &self,
+        token: CommitToken,
+        _timeout: std::time::Duration,
+    ) -> Result<Index, EngineError> {
+        if self.commit_index >= token.index {
+            Ok(token.index)
+        } else {
+            Err(EngineError::ProposalFailed(format!(
+                "token {} is not committed yet (commit_index={})",
+                token.index, self.commit_index
+            )))
+        }
     }
 
     fn role(&self) -> Role {
@@ -525,5 +560,33 @@ mod tests {
 
         r.register_follower_ack(t2_new_epoch.index, 1);
         assert_eq!(r.commit_index(), t2_new_epoch.index);
+    }
+
+    #[test]
+    fn local_wait_committed_rejects_uncommitted_token() {
+        let mut r = LocalReplicator::leader();
+        let token = r.propose(vec![1]).unwrap();
+        r.rollback_unapplied_from(token.index);
+
+        let err = r
+            .wait_committed(token, std::time::Duration::from_millis(1))
+            .unwrap_err();
+        assert!(matches!(err, EngineError::ProposalFailed(_)));
+    }
+
+    #[test]
+    fn raft_wait_committed_resolves_after_quorum_commit() {
+        let mut r = RaftReplicator::new(3);
+        r.become_leader(2);
+
+        let token = r.propose(vec![1]).unwrap();
+        let pending = r.wait_committed(token, std::time::Duration::from_millis(1));
+        assert!(matches!(pending, Err(EngineError::ProposalFailed(_))));
+
+        r.register_follower_ack(token.index, 1);
+        let committed = r
+            .wait_committed(token, std::time::Duration::from_millis(1))
+            .unwrap();
+        assert_eq!(committed, token.index);
     }
 }
