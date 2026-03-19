@@ -13,6 +13,7 @@
 - Hardened batched mutation leadership gates so follower mode rejects mutation enqueue/flush before draining batch buffers, preserving queued work and preventing silent drop-on-flush during role changes.
 - Refined batching tick semantics so follower background ticks are a no-op when the queue is empty, while still surfacing `NotLeader` if queued mutations would have flushed.
 - Added Raft ack-map pruning after commit advancement so committed indices are dropped from in-memory quorum tracking, plus regression tests proving committed entries are evicted while pending entries remain.
+- Added engine-level snapshot hooks (`export_snapshot_meta`, `install_snapshot`, `snapshot_meta`) and regression coverage proving snapshot install advances commit/apply/visibility watermarks without breaking WAL-before-visibility behavior for subsequent commits.
 
 ## 2026-03-18
 

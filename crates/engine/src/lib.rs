@@ -5,7 +5,7 @@ use gpu_db_batching::{BatchItem, DualTriggerBatcher, FlushReason};
 use gpu_db_metrics::{BatchFlushReason, FallbackReason, RuntimeMetrics};
 use gpu_db_protocol::{parse_command, Command, ParseError};
 use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine};
-use gpu_db_types::{CommitToken, EngineError, Index, LogEntry, Role, Term};
+use gpu_db_types::{CommitToken, EngineError, Index, LogEntry, Role, SnapshotMeta, Term};
 use gpu_db_wal::{WalBuffer, WalRecord};
 
 #[derive(Debug, Default)]
@@ -306,6 +306,20 @@ impl Engine {
             visible_index: self.visible_up_to,
             wal_flushed_count: self.wal.flushed_count(),
         }
+    }
+
+    pub fn export_snapshot_meta(&mut self) -> SnapshotMeta {
+        self.repl.export_snapshot_meta()
+    }
+
+    pub fn install_snapshot(&mut self, meta: SnapshotMeta) {
+        let last_included_index = meta.last_included_index;
+        self.repl.install_snapshot(meta);
+        self.visible_up_to = self.visible_up_to.max(last_included_index);
+    }
+
+    pub fn snapshot_meta(&self) -> SnapshotMeta {
+        self.repl.snapshot_meta()
     }
 
     pub fn metrics(&self) -> &RuntimeMetrics {
@@ -742,5 +756,39 @@ mod tests {
         assert_eq!(marks.applied_index, 0);
         assert_eq!(marks.visible_index, 0);
         assert_eq!(marks.wal_flushed_count, 0);
+    }
+
+    #[test]
+    fn snapshot_export_tracks_last_applied_index() {
+        let mut e = Engine::new_local();
+        let token = e.commit_mutation(1, b"SET a=1".to_vec()).unwrap();
+
+        let exported = e.export_snapshot_meta();
+        let current = e.snapshot_meta();
+
+        assert_eq!(exported.last_included_index, token.index);
+        assert_eq!(current.last_included_index, token.index);
+        assert_eq!(exported.snapshot_id, 1);
+        assert_eq!(current.snapshot_id, 1);
+    }
+
+    #[test]
+    fn install_snapshot_advances_visible_and_replication_watermarks() {
+        let mut e = Engine::new_local();
+        e.install_snapshot(SnapshotMeta {
+            last_included_index: 7,
+            last_included_term: 3,
+            snapshot_id: 11,
+        });
+
+        let marks = e.replication_watermarks();
+        assert_eq!(marks.term, 3);
+        assert_eq!(marks.commit_index, 7);
+        assert_eq!(marks.applied_index, 7);
+        assert_eq!(marks.visible_index, 7);
+
+        let next = e.commit_mutation(2, b"SET b=2".to_vec()).unwrap();
+        assert_eq!(next.index, 8);
+        assert_eq!(e.get("b"), Some("2"));
     }
 }
