@@ -441,6 +441,16 @@ mod tests {
     }
 
     #[test]
+    fn execute_delete_alias_removes_existing_key() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET balance=100").unwrap();
+        e.execute_text(2, "DELETE balance").unwrap();
+
+        assert_eq!(e.get("balance"), None);
+        assert_eq!(e.metrics().commits_total, 2);
+    }
+
+    #[test]
     fn execute_read_text_get_returns_current_value_without_committing() {
         let mut e = Engine::new_local();
         e.execute_text(1, "SET balance=100").unwrap();
