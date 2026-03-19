@@ -54,6 +54,11 @@ impl LocalReplicator {
         self.role = Role::Leader;
     }
 
+    pub fn become_candidate(&mut self, term: Term) {
+        self.term = self.term.max(term);
+        self.role = Role::Candidate;
+    }
+
     pub fn drain_committed_from(&self, start_exclusive: Index) -> impl Iterator<Item = &LogEntry> {
         self.entries
             .iter()
@@ -143,6 +148,14 @@ impl RaftReplicator {
     pub fn become_leader(&mut self, term: Term) {
         self.term = self.term.max(term);
         self.role = Role::Leader;
+        self.entries.retain(|e| e.index <= self.commit_index);
+        self.next_index = self.commit_index + 1;
+        self.ack_counts.clear();
+    }
+
+    pub fn become_candidate(&mut self, term: Term) {
+        self.term = self.term.max(term);
+        self.role = Role::Candidate;
         self.entries.retain(|e| e.index <= self.commit_index);
         self.next_index = self.commit_index + 1;
         self.ack_counts.clear();
@@ -371,6 +384,18 @@ mod tests {
     }
 
     #[test]
+    fn candidate_rejects_writes() {
+        let mut r = LocalReplicator::leader();
+        r.become_candidate(2);
+
+        let err = r.propose(vec![1]).unwrap_err();
+
+        assert!(matches!(err, EngineError::NotLeader));
+        assert_eq!(r.current_term(), 2);
+        assert_eq!(r.role(), Role::Candidate);
+    }
+
+    #[test]
     fn rollback_unapplied_removes_tail_and_resets_indices() {
         let mut r = LocalReplicator::leader();
         let _ = r.propose(vec![1]).unwrap();
@@ -433,6 +458,24 @@ mod tests {
         let mut r = RaftReplicator::new(3);
         let err = r.propose(vec![1]).unwrap_err();
         assert!(matches!(err, EngineError::NotLeader));
+    }
+
+    #[test]
+    fn raft_candidate_rejects_proposal_and_drops_uncommitted_tail() {
+        let mut r = RaftReplicator::new(3);
+        r.become_leader(1);
+
+        let t1 = r.propose(vec![1]).unwrap();
+        r.register_follower_ack(t1.index, 1);
+        let _uncommitted = r.propose(vec![2]).unwrap();
+
+        r.become_candidate(2);
+        let err = r.propose(vec![3]).unwrap_err();
+        assert!(matches!(err, EngineError::NotLeader));
+
+        r.become_leader(3);
+        let tok = r.propose(vec![4]).unwrap();
+        assert_eq!(tok.index, t1.index + 1);
     }
 
     #[test]
