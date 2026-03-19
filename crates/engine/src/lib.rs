@@ -28,8 +28,8 @@ impl ReplicatedStateMachine for KvStateMachine {
                         self.kv.remove(&key);
                     }
                     Command::Begin
-                    | Command::Commit
-                    | Command::Rollback
+                    | Command::Commit { .. }
+                    | Command::Rollback { .. }
                     | Command::Flush
                     | Command::GetKv { .. } => {}
                 }
@@ -197,11 +197,11 @@ impl Engine {
                 self.txn_manager.begin_with_id(txn_id)?;
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
-            Command::Commit => {
+            Command::Commit { .. } => {
                 self.txn_manager.commit(txn_id)?;
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
-            Command::Rollback => {
+            Command::Rollback { .. } => {
                 self.txn_manager.rollback(txn_id)?;
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
@@ -303,11 +303,11 @@ impl Engine {
                 self.txn_manager.begin_with_id(txn_id)?;
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
-            Command::Commit => {
+            Command::Commit { .. } => {
                 self.txn_manager.commit(txn_id)?;
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
-            Command::Rollback => {
+            Command::Rollback { .. } => {
                 self.txn_manager.rollback(txn_id)?;
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
@@ -338,8 +338,8 @@ impl Engine {
                 Ok(self.get(&key))
             }
             Command::Begin => Err(ExecuteError::NonReadCommand("BEGIN")),
-            Command::Commit => Err(ExecuteError::NonReadCommand("COMMIT")),
-            Command::Rollback => Err(ExecuteError::NonReadCommand("ROLLBACK")),
+            Command::Commit { .. } => Err(ExecuteError::NonReadCommand("COMMIT")),
+            Command::Rollback { .. } => Err(ExecuteError::NonReadCommand("ROLLBACK")),
             Command::Flush => Err(ExecuteError::NonReadCommand("FLUSH")),
             Command::SetKv { .. } => Err(ExecuteError::NonReadCommand("SET")),
             Command::DeleteKv { .. } => Err(ExecuteError::NonReadCommand("DEL/DELETE")),
@@ -994,6 +994,19 @@ mod tests {
 
         assert_eq!(e.metrics().fallback_total, 1);
         assert_eq!(e.active_txn_count(), 1);
+    }
+
+    #[test]
+    fn and_chain_forms_currently_follow_plain_commit_and_rollback_behavior() {
+        let mut e = Engine::new_local();
+
+        e.execute_text(21, "BEGIN").unwrap();
+        e.execute_text(21, "COMMIT AND CHAIN").unwrap();
+        assert_eq!(e.active_txn_count(), 0);
+
+        e.execute_text(22, "BEGIN").unwrap();
+        e.execute_text(22, "ROLLBACK AND CHAIN").unwrap();
+        assert_eq!(e.active_txn_count(), 0);
     }
 
     #[test]

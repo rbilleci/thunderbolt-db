@@ -22,7 +22,7 @@ cargo test --all-features
 
 - `DEL key` and `DELETE key` are equivalent.
 - `BEGIN|COMMIT|ROLLBACK` also accept `WORK` and `TRANSACTION` aliases.
-- `COMMIT AND [NO] CHAIN`, `ROLLBACK AND [NO] CHAIN`, and `END AND [NO] CHAIN` are accepted and currently map to plain `COMMIT`/`ROLLBACK` behavior.
+- `COMMIT|ROLLBACK|END ... AND [NO] CHAIN` forms are accepted; parser now preserves the chain intent, while the current engine execution path still follows plain `COMMIT`/`ROLLBACK` close behavior.
 - `END` maps to `COMMIT`; `ABORT` maps to `ROLLBACK`.
 - `START TRANSACTION` and `START WORK` map to `BEGIN`; optional `READ ONLY` / `READ WRITE`, `[NOT] DEFERRABLE`, and `ISOLATION LEVEL {SERIALIZABLE|REPEATABLE READ|READ COMMITTED|READ UNCOMMITTED}` suffixes are accepted on `BEGIN`/`START` aliases (including comma-separated mode lists) and currently map to plain `BEGIN` behavior.
 - `FLUSH` is an admin/coordination command and is tracked as a CPU fallback metric event.

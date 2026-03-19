@@ -1,8 +1,8 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Begin,
-    Commit,
-    Rollback,
+    Commit { chain: bool },
+    Rollback { chain: bool },
     Flush,
     SetKv { key: String, value: String },
     DeleteKv { key: String },
@@ -23,49 +23,46 @@ pub enum ParseError {
     InvalidGet,
 }
 
-fn is_transaction_chain_suffix(tokens: &[&str]) -> bool {
-    matches!(
+fn parse_transaction_chain_suffix(tokens: &[&str]) -> Option<bool> {
+    if tokens.is_empty() {
+        return Some(false);
+    }
+
+    if matches!(
         tokens,
         [and, chain]
             if and.eq_ignore_ascii_case("AND") && chain.eq_ignore_ascii_case("CHAIN")
-    ) || matches!(
+    ) {
+        return Some(true);
+    }
+
+    if matches!(
         tokens,
         [and, no, chain]
             if and.eq_ignore_ascii_case("AND")
                 && no.eq_ignore_ascii_case("NO")
                 && chain.eq_ignore_ascii_case("CHAIN")
-    )
+    ) {
+        return Some(false);
+    }
+
+    None
 }
 
-fn is_transaction_control(input: &str, keyword: &str) -> bool {
+fn parse_transaction_control_chain(input: &str, keyword: &str) -> Option<bool> {
     let tokens: Vec<_> = input.split_whitespace().collect();
-    let Some((first, mut rest)) = tokens.split_first() else {
-        return false;
-    };
+    let (first, mut rest) = tokens.split_first()?;
     if !first.eq_ignore_ascii_case(keyword) {
-        return false;
+        return None;
     }
 
-    if let [second] = rest {
-        if second.eq_ignore_ascii_case("TRANSACTION") || second.eq_ignore_ascii_case("WORK") {
-            return true;
+    if let Some((scope, tail)) = rest.split_first() {
+        if scope.eq_ignore_ascii_case("TRANSACTION") || scope.eq_ignore_ascii_case("WORK") {
+            rest = tail;
         }
     }
 
-    if keyword.eq_ignore_ascii_case("COMMIT")
-        || keyword.eq_ignore_ascii_case("ROLLBACK")
-        || keyword.eq_ignore_ascii_case("ABORT")
-        || keyword.eq_ignore_ascii_case("END")
-    {
-        if let Some((scope, tail)) = rest.split_first() {
-            if scope.eq_ignore_ascii_case("TRANSACTION") || scope.eq_ignore_ascii_case("WORK") {
-                rest = tail;
-            }
-        }
-        return rest.is_empty() || is_transaction_chain_suffix(rest);
-    }
-
-    rest.is_empty()
+    parse_transaction_chain_suffix(rest)
 }
 
 fn is_isolation_level_suffix(tokens: &[&str]) -> bool {
@@ -288,11 +285,15 @@ pub fn parse_command(input: &str) -> Result<Command, ParseError> {
     if is_begin_with_optional_mode(s) {
         return Ok(Command::Begin);
     }
-    if is_transaction_control(s, "COMMIT") || is_transaction_control(s, "END") {
-        return Ok(Command::Commit);
+    if let Some(chain) = parse_transaction_control_chain(s, "COMMIT")
+        .or_else(|| parse_transaction_control_chain(s, "END"))
+    {
+        return Ok(Command::Commit { chain });
     }
-    if is_transaction_control(s, "ROLLBACK") || is_transaction_control(s, "ABORT") {
-        return Ok(Command::Rollback);
+    if let Some(chain) = parse_transaction_control_chain(s, "ROLLBACK")
+        .or_else(|| parse_transaction_control_chain(s, "ABORT"))
+    {
+        return Ok(Command::Rollback { chain });
     }
     if s.eq_ignore_ascii_case("FLUSH") {
         return Ok(Command::Flush);
@@ -393,10 +394,22 @@ mod tests {
     #[test]
     fn parses_transaction_control_commands_case_insensitively() {
         assert_eq!(parse_command("begin").unwrap(), Command::Begin);
-        assert_eq!(parse_command("COMMIT").unwrap(), Command::Commit);
-        assert_eq!(parse_command("END").unwrap(), Command::Commit);
-        assert_eq!(parse_command("rOlLbAcK").unwrap(), Command::Rollback);
-        assert_eq!(parse_command("abort").unwrap(), Command::Rollback);
+        assert_eq!(
+            parse_command("COMMIT").unwrap(),
+            Command::Commit { chain: false }
+        );
+        assert_eq!(
+            parse_command("END").unwrap(),
+            Command::Commit { chain: false }
+        );
+        assert_eq!(
+            parse_command("rOlLbAcK").unwrap(),
+            Command::Rollback { chain: false }
+        );
+        assert_eq!(
+            parse_command("abort").unwrap(),
+            Command::Rollback { chain: false }
+        );
     }
 
     #[test]
@@ -492,74 +505,101 @@ mod tests {
             parse_command("START WORK READ WRITE").unwrap(),
             Command::Begin
         );
-        assert_eq!(parse_command("COMMIT WORK").unwrap(), Command::Commit);
+        assert_eq!(
+            parse_command("COMMIT WORK").unwrap(),
+            Command::Commit { chain: false }
+        );
         assert_eq!(
             parse_command("COMMIT TRANSACTION").unwrap(),
-            Command::Commit
+            Command::Commit { chain: false }
         );
-        assert_eq!(parse_command("COMMIT AND CHAIN").unwrap(), Command::Commit);
+        assert_eq!(
+            parse_command("COMMIT AND CHAIN").unwrap(),
+            Command::Commit { chain: true }
+        );
         assert_eq!(
             parse_command("COMMIT AND NO CHAIN").unwrap(),
-            Command::Commit
+            Command::Commit { chain: false }
         );
         assert_eq!(
             parse_command("COMMIT TRANSACTION AND CHAIN").unwrap(),
-            Command::Commit
+            Command::Commit { chain: true }
         );
         assert_eq!(
             parse_command("COMMIT WORK AND NO CHAIN").unwrap(),
-            Command::Commit
+            Command::Commit { chain: false }
         );
-        assert_eq!(parse_command("END WORK").unwrap(), Command::Commit);
-        assert_eq!(parse_command("END TRANSACTION").unwrap(), Command::Commit);
-        assert_eq!(parse_command("END AND CHAIN").unwrap(), Command::Commit);
-        assert_eq!(parse_command("END AND NO CHAIN").unwrap(), Command::Commit);
+        assert_eq!(
+            parse_command("END WORK").unwrap(),
+            Command::Commit { chain: false }
+        );
+        assert_eq!(
+            parse_command("END TRANSACTION").unwrap(),
+            Command::Commit { chain: false }
+        );
+        assert_eq!(
+            parse_command("END AND CHAIN").unwrap(),
+            Command::Commit { chain: true }
+        );
+        assert_eq!(
+            parse_command("END AND NO CHAIN").unwrap(),
+            Command::Commit { chain: false }
+        );
         assert_eq!(
             parse_command("END TRANSACTION AND CHAIN").unwrap(),
-            Command::Commit
+            Command::Commit { chain: true }
         );
         assert_eq!(
             parse_command("END WORK AND NO CHAIN").unwrap(),
-            Command::Commit
+            Command::Commit { chain: false }
         );
-        assert_eq!(parse_command("ROLLBACK WORK").unwrap(), Command::Rollback);
+        assert_eq!(
+            parse_command("ROLLBACK WORK").unwrap(),
+            Command::Rollback { chain: false }
+        );
         assert_eq!(
             parse_command("ROLLBACK TRANSACTION").unwrap(),
-            Command::Rollback
+            Command::Rollback { chain: false }
         );
         assert_eq!(
             parse_command("ROLLBACK AND CHAIN").unwrap(),
-            Command::Rollback
+            Command::Rollback { chain: true }
         );
         assert_eq!(
             parse_command("ROLLBACK AND NO CHAIN").unwrap(),
-            Command::Rollback
+            Command::Rollback { chain: false }
         );
         assert_eq!(
             parse_command("ROLLBACK TRANSACTION AND CHAIN").unwrap(),
-            Command::Rollback
+            Command::Rollback { chain: true }
         );
         assert_eq!(
             parse_command("ROLLBACK WORK AND NO CHAIN").unwrap(),
-            Command::Rollback
+            Command::Rollback { chain: false }
         );
-        assert_eq!(parse_command("ABORT WORK").unwrap(), Command::Rollback);
+        assert_eq!(
+            parse_command("ABORT WORK").unwrap(),
+            Command::Rollback { chain: false }
+        );
         assert_eq!(
             parse_command("ABORT TRANSACTION").unwrap(),
-            Command::Rollback
+            Command::Rollback { chain: false }
         );
-        assert_eq!(parse_command("ABORT AND CHAIN").unwrap(), Command::Rollback);
+        assert_eq!(
+            parse_command("ABORT AND CHAIN").unwrap(),
+            Command::Rollback { chain: true }
+        );
         assert_eq!(
             parse_command("ABORT AND NO CHAIN").unwrap(),
-            Command::Rollback
+            Command::Rollback { chain: false }
         );
         assert_eq!(
             parse_command("ABORT TRANSACTION AND CHAIN").unwrap(),
-            Command::Rollback
+            Command::Rollback { chain: true }
         );
         assert_eq!(
             parse_command("ABORT WORK AND NO CHAIN").unwrap(),
-            Command::Rollback
+            Command::Rollback { chain: false }
         );
     }
 
