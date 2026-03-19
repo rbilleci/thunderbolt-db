@@ -754,6 +754,14 @@ mod tests {
         assert_eq!(parse_command("BEGIN;").unwrap(), Command::Begin);
         assert_eq!(parse_command("START WORK;").unwrap(), Command::Begin);
         assert_eq!(
+            parse_command("END AND CHAIN;").unwrap(),
+            Command::Commit { chain: true }
+        );
+        assert_eq!(
+            parse_command("ABORT AND NO CHAIN;\n").unwrap(),
+            Command::Rollback { chain: false }
+        );
+        assert_eq!(
             parse_command("SET balance = 42;").unwrap(),
             Command::SetKv {
                 key: "balance".into(),
