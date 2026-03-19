@@ -88,6 +88,17 @@ fn is_isolation_level_suffix(tokens: &[&str]) -> bool {
     )
 }
 
+fn is_deferrable_suffix(tokens: &[&str]) -> bool {
+    matches!(
+        tokens,
+        [deferrable] if deferrable.eq_ignore_ascii_case("DEFERRABLE")
+    ) || matches!(
+        tokens,
+        [not, deferrable]
+            if not.eq_ignore_ascii_case("NOT") && deferrable.eq_ignore_ascii_case("DEFERRABLE")
+    )
+}
+
 fn is_begin_mode_suffix(tokens: &[&str]) -> bool {
     matches!(
         tokens,
@@ -98,6 +109,7 @@ fn is_begin_mode_suffix(tokens: &[&str]) -> bool {
         [read, write]
             if read.eq_ignore_ascii_case("READ") && write.eq_ignore_ascii_case("WRITE")
     ) || is_isolation_level_suffix(tokens)
+        || is_deferrable_suffix(tokens)
 }
 
 fn is_begin_with_optional_mode(input: &str) -> bool {
@@ -290,6 +302,11 @@ mod tests {
             parse_command("BEGIN ISOLATION LEVEL READ UNCOMMITTED").unwrap(),
             Command::Begin
         );
+        assert_eq!(parse_command("BEGIN DEFERRABLE").unwrap(), Command::Begin);
+        assert_eq!(
+            parse_command("BEGIN NOT DEFERRABLE").unwrap(),
+            Command::Begin
+        );
         assert_eq!(
             parse_command("BEGIN TRANSACTION READ ONLY").unwrap(),
             Command::Begin
@@ -312,6 +329,10 @@ mod tests {
             Command::Begin
         );
         assert_eq!(parse_command("START WORK").unwrap(), Command::Begin);
+        assert_eq!(
+            parse_command("START TRANSACTION DEFERRABLE").unwrap(),
+            Command::Begin
+        );
         assert_eq!(
             parse_command("START WORK READ WRITE").unwrap(),
             Command::Begin
@@ -368,6 +389,10 @@ mod tests {
         ));
         assert!(matches!(
             parse_command("BEGIN ISOLATION LEVEL SNAPSHOT"),
+            Err(ParseError::Unsupported(_))
+        ));
+        assert!(matches!(
+            parse_command("BEGIN NOT"),
             Err(ParseError::Unsupported(_))
         ));
         assert!(matches!(
