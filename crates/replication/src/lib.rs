@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use gpu_db_types::{CommitToken, EngineError, Index, LogEntry, Role, SnapshotMeta, Term};
 
@@ -100,7 +100,7 @@ pub struct RaftReplicator {
     snapshot_id: u64,
     voters: usize,
     quorum: usize,
-    ack_counts: BTreeMap<Index, usize>,
+    ack_counts: BTreeMap<Index, BTreeSet<u64>>,
 }
 
 impl RaftReplicator {
@@ -162,20 +162,22 @@ impl RaftReplicator {
         self.applied_index = self.applied_index.max(bounded);
     }
 
-    pub fn register_follower_ack(&mut self, index: Index) {
-        if self.role != Role::Leader || index == 0 || index >= self.next_index {
+    pub fn register_follower_ack(&mut self, index: Index, follower_id: u64) {
+        if self.role != Role::Leader || index == 0 || index >= self.next_index || follower_id == 0 {
             return;
         }
 
-        let count = self.ack_counts.entry(index).or_insert(1);
-        *count = (*count + 1).min(self.voters);
+        let Some(acks) = self.ack_counts.get_mut(&index) else {
+            return;
+        };
+        acks.insert(follower_id);
 
         while self.commit_index + 1 < self.next_index {
             let next = self.commit_index + 1;
             let Some(acks) = self.ack_counts.get(&next) else {
                 break;
             };
-            if *acks >= self.quorum {
+            if acks.len() >= self.quorum {
                 self.commit_index = next;
             } else {
                 break;
@@ -261,8 +263,10 @@ impl LogReplicator for RaftReplicator {
             payload,
         });
 
-        // Leader has an implicit self-ack.
-        self.ack_counts.insert(idx, 1);
+        // Leader has an implicit self-ack represented by voter id 0.
+        let mut acks = BTreeSet::new();
+        acks.insert(0);
+        self.ack_counts.insert(idx, acks);
         if self.quorum == 1 {
             self.commit_index = idx;
         }
@@ -402,7 +406,7 @@ mod tests {
         let t1 = r.propose(vec![1]).unwrap();
         assert_eq!(r.commit_index(), 0, "self-ack is not quorum for 3 voters");
 
-        r.register_follower_ack(t1.index);
+        r.register_follower_ack(t1.index, 1);
 
         assert_eq!(r.commit_index(), t1.index);
         assert_eq!(r.quorum_size(), 2);
@@ -417,10 +421,10 @@ mod tests {
         let t1 = r.propose(vec![10]).unwrap();
         let t2 = r.propose(vec![20]).unwrap();
 
-        r.register_follower_ack(t2.index);
+        r.register_follower_ack(t2.index, 2);
         assert_eq!(r.commit_index(), 0, "cannot skip index 1");
 
-        r.register_follower_ack(t1.index);
+        r.register_follower_ack(t1.index, 1);
         assert_eq!(r.commit_index(), t2.index);
     }
 
@@ -438,7 +442,7 @@ mod tests {
         let t1 = r.propose(vec![1]).unwrap();
 
         r.become_follower(2);
-        r.register_follower_ack(t1.index);
+        r.register_follower_ack(t1.index, 1);
 
         assert_eq!(r.commit_index(), 0);
     }
@@ -449,9 +453,33 @@ mod tests {
         r.become_leader(1);
         let _ = r.propose(vec![1]).unwrap();
 
-        r.register_follower_ack(2);
+        r.register_follower_ack(2, 1);
 
         assert_eq!(r.commit_index(), 0);
+    }
+
+    #[test]
+    fn raft_duplicate_follower_ack_does_not_count_twice() {
+        let mut r = RaftReplicator::new(5);
+        r.become_leader(1);
+
+        let t1 = r.propose(vec![1]).unwrap();
+        r.register_follower_ack(t1.index, 1);
+        r.register_follower_ack(t1.index, 2);
+        assert_eq!(r.commit_index(), t1.index);
+
+        let t2 = r.propose(vec![2]).unwrap();
+        r.register_follower_ack(t2.index, 1);
+        r.register_follower_ack(t2.index, 1);
+
+        assert_eq!(
+            r.commit_index(),
+            t1.index,
+            "same follower should not be able to satisfy quorum twice"
+        );
+
+        r.register_follower_ack(t2.index, 2);
+        assert_eq!(r.commit_index(), t2.index);
     }
 
     #[test]
@@ -460,7 +488,7 @@ mod tests {
         r.become_leader(1);
 
         let t1 = r.propose(vec![1]).unwrap();
-        r.register_follower_ack(t1.index);
+        r.register_follower_ack(t1.index, 1);
         assert_eq!(r.commit_index(), t1.index);
 
         let _t2_uncommitted = r.propose(vec![2]).unwrap();
@@ -472,7 +500,7 @@ mod tests {
         let t2_new_epoch = r.propose(vec![3]).unwrap();
         assert_eq!(t2_new_epoch.index, t1.index + 1);
 
-        r.register_follower_ack(t2_new_epoch.index);
+        r.register_follower_ack(t2_new_epoch.index, 1);
         assert_eq!(r.commit_index(), t2_new_epoch.index);
     }
 }
