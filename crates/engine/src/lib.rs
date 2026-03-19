@@ -228,6 +228,13 @@ impl Engine {
             let txn_id = p.item.txn_id;
             let payload = p.item.payload.clone();
 
+            // In no-GPU bootstrap mode, batched mutations represent the simulated
+            // GPU-eligible write path. Track transfer and kernel timing envelopes
+            // so telemetry contracts are stable before CUDA is wired in.
+            self.metrics.observe_h2d_bytes(payload.len() as u64);
+            let simulated_kernel_ms = ((payload.len() as u64) / 1024).max(1);
+            self.metrics.observe_kernel_exec_ms(simulated_kernel_ms);
+
             if let Err(err) = self.commit_mutation(txn_id, payload) {
                 let tail: Vec<_> = std::iter::once(p).chain(remaining).collect();
                 self.batcher.requeue_front(tail);
@@ -393,6 +400,13 @@ mod tests {
         assert_eq!(e.metrics().batch_wait_samples, 2);
         assert_eq!(e.metrics().batch_wait_total_ms, 0);
         assert_eq!(e.metrics().last_batch_wait_ms(), Some(0));
+        assert_eq!(
+            e.metrics().h2d_bytes_total,
+            "SET a=1".len() as u64 + "SET b=2".len() as u64
+        );
+        assert_eq!(e.metrics().kernel_exec_samples, 2);
+        assert_eq!(e.metrics().kernel_exec_total_ms, 2);
+        assert_eq!(e.metrics().last_kernel_exec_ms(), Some(1));
         assert_eq!(e.metrics().commits_total, 2);
     }
 
