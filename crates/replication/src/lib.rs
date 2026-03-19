@@ -444,6 +444,23 @@ mod tests {
     }
 
     #[test]
+    fn install_older_snapshot_is_ignored_for_commit_and_apply_indices() {
+        let mut r = LocalReplicator::leader();
+        let t1 = r.propose(vec![1]).unwrap();
+        r.mark_applied(t1.index);
+
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: t1.index.saturating_sub(1),
+            last_included_term: 1,
+            snapshot_id: 10,
+        });
+
+        assert_eq!(r.commit_index(), t1.index);
+        assert_eq!(r.applied_index(), t1.index);
+        assert_eq!(r.snapshot_meta().snapshot_id, 10);
+    }
+
+    #[test]
     fn mark_applied_does_not_exceed_commit_index() {
         let mut r = LocalReplicator::leader();
         let t1 = r.propose(vec![1]).unwrap();

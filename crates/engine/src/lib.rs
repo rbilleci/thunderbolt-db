@@ -816,4 +816,23 @@ mod tests {
         assert_eq!(next.index, 8);
         assert_eq!(e.get("b"), Some("2"));
     }
+
+    #[test]
+    fn installing_older_snapshot_does_not_rewind_visibility_or_watermarks() {
+        let mut e = Engine::new_local();
+        let committed = e.commit_mutation(1, b"SET a=1".to_vec()).unwrap();
+
+        e.install_snapshot(SnapshotMeta {
+            last_included_index: committed.index.saturating_sub(1),
+            last_included_term: 1,
+            snapshot_id: 99,
+        });
+
+        let marks = e.replication_watermarks();
+        assert_eq!(marks.commit_index, committed.index);
+        assert_eq!(marks.applied_index, committed.index);
+        assert_eq!(marks.visible_index, committed.index);
+        assert_eq!(e.visible_up_to(), committed.index);
+        assert_eq!(e.get("a"), Some("1"));
+    }
 }
