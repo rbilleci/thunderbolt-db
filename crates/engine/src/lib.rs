@@ -323,11 +323,14 @@ impl Engine {
                 }
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
-            Command::GetKv { .. } => {
+            Command::GetKv { key } => {
                 if self.repl.role() != Role::Leader {
                     return Err(ExecuteError::Engine(EngineError::NotLeader));
                 }
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
+                if let Some(len) = self.sm.kv.get(&key).map(|v| v.len()) {
+                    self.metrics.observe_d2h_bytes(len as u64);
+                }
             }
         }
 
@@ -568,6 +571,18 @@ mod tests {
         assert!(matches!(err, ExecuteError::Engine(EngineError::NotLeader)));
         assert_eq!(e.metrics().fallback_total, 0);
         assert_eq!(e.metrics().commits_total, 0);
+    }
+
+    #[test]
+    fn execute_text_get_tracks_d2h_bytes_for_hits_only() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET balance=100").unwrap();
+
+        e.execute_text(2, "GET balance").unwrap();
+        assert_eq!(e.metrics().d2h_bytes_total, "100".len() as u64);
+
+        e.execute_text(3, "GET missing").unwrap();
+        assert_eq!(e.metrics().d2h_bytes_total, "100".len() as u64);
     }
 
     #[test]

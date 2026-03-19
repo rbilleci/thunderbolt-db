@@ -3,6 +3,7 @@
 ## 2026-03-19
 
 ### Completed
+- Added read-transfer telemetry parity for immediate text execution: `Engine::execute_text` now records D2H bytes for successful `GET` hits (matching `execute_read_text` semantics) while leaving misses unchanged, with regression coverage proving hit-only accounting.
 - Tightened transaction-begin mode parsing so conflicting or duplicate mode classes are rejected (e.g. `READ ONLY` + `READ WRITE`, repeated isolation clauses, mixed `DEFERRABLE`/`NOT DEFERRABLE`), with regression coverage proving unsupported combinations fail fast instead of being silently accepted.
 - Wired placeholder kernel-occupancy telemetry into batched mutation flushes: `Engine::apply_batch` now records simulated occupancy per payload (capped at 100% permyriad), with regression coverage proving occupancy sample/total/latest metrics advance alongside existing H2D + kernel-exec counters.
 - Added saturation-path occupancy coverage so large batched payloads pin simulated occupancy at exactly 10_000 permyriad (100%), preventing telemetry overflow and making the placeholder signal bounded until real CUDA counters land.
