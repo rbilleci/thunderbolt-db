@@ -269,6 +269,9 @@ impl Engine {
             self.metrics.observe_h2d_bytes(payload.len() as u64);
             let simulated_kernel_ms = ((payload.len() as u64) / 1024).max(1);
             self.metrics.observe_kernel_exec_ms(simulated_kernel_ms);
+            let simulated_occupancy = Self::simulate_kernel_occupancy_permyriad(payload.len());
+            self.metrics
+                .observe_kernel_occupancy_permyriad(simulated_occupancy);
 
             if let Err(err) = self.commit_mutation(txn_id, payload) {
                 let tail: Vec<_> = std::iter::once(p).chain(remaining).collect();
@@ -423,6 +426,13 @@ impl Engine {
 
     pub fn batching_config(&self) -> (usize, Duration) {
         (self.batcher.max_items(), self.batcher.max_wait())
+    }
+
+    fn simulate_kernel_occupancy_permyriad(payload_len: usize) -> u16 {
+        // Bootstrap heuristic for no-GPU mode: scale occupancy with payload size
+        // while capping at 100% to keep telemetry realistic.
+        let permyriad = 2_500u64.saturating_add((payload_len as u64).saturating_mul(100));
+        permyriad.min(10_000) as u16
     }
 }
 
@@ -585,6 +595,9 @@ mod tests {
         assert_eq!(e.metrics().kernel_exec_samples, 2);
         assert_eq!(e.metrics().kernel_exec_total_ms, 2);
         assert_eq!(e.metrics().last_kernel_exec_ms(), Some(1));
+        assert_eq!(e.metrics().kernel_occupancy_samples, 2);
+        assert_eq!(e.metrics().kernel_occupancy_total_permyriad, 6400);
+        assert_eq!(e.metrics().last_kernel_occupancy_permyriad(), Some(3200));
         assert_eq!(e.metrics().pending_batch_peak, 2);
         assert_eq!(e.metrics().last_pending_batch_len(), Some(0));
         assert_eq!(e.metrics().commits_total, 2);
