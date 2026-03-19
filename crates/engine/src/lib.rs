@@ -154,6 +154,10 @@ impl Engine {
         let cmd = parse_command(text)?;
         match cmd {
             Command::SetKv { .. } | Command::DeleteKv { .. } => {
+                if self.repl.role() != Role::Leader {
+                    return Err(ExecuteError::Engine(EngineError::NotLeader));
+                }
+
                 let maybe_batch = self.batcher.enqueue(
                     PendingMutation {
                         txn_id,
@@ -176,6 +180,10 @@ impl Engine {
     }
 
     pub fn tick_batching(&mut self, now: Instant) -> Result<(), EngineError> {
+        if self.repl.role() != Role::Leader {
+            return Err(EngineError::NotLeader);
+        }
+
         if let Some(batch) = self.batcher.maybe_flush_due_to_time(now) {
             self.apply_batch(batch.reason, batch.items.into_iter(), now)?;
         }
@@ -183,6 +191,10 @@ impl Engine {
     }
 
     pub fn flush_admin(&mut self) -> Result<(), EngineError> {
+        if self.repl.role() != Role::Leader {
+            return Err(EngineError::NotLeader);
+        }
+
         if let Some(batch) = self.batcher.flush_admin() {
             self.apply_batch(batch.reason, batch.items.into_iter(), Instant::now())?;
         }
@@ -480,15 +492,15 @@ mod tests {
     }
 
     #[test]
-    fn failed_batch_flush_does_not_increment_flush_metrics() {
+    fn follower_rejects_batched_enqueue_without_mutating_queue_or_metrics() {
         let mut e = Engine::with_batching(2, Duration::from_secs(999));
         e.become_follower(2);
 
         let t0 = Instant::now();
-        e.enqueue_set_text(1, "SET a=1", t0).unwrap();
-        let err = e.enqueue_set_text(2, "SET b=2", t0).unwrap_err();
+        let err = e.enqueue_set_text(1, "SET a=1", t0).unwrap_err();
 
         assert!(matches!(err, ExecuteError::Engine(EngineError::NotLeader)));
+        assert_eq!(e.pending_batch_len(), 0);
         assert_eq!(e.metrics().batch_flush_count, 0);
         assert_eq!(e.metrics().batch_flushes_for(BatchFlushReason::Count), 0);
         assert_eq!(e.metrics().last_batch_flush_reason(), None);
@@ -496,7 +508,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_admin_flush_does_not_increment_flush_metrics() {
+    fn failed_admin_flush_does_not_increment_flush_metrics_or_drop_pending_queue() {
         let mut e = Engine::with_batching(10, Duration::from_secs(60));
         let t0 = Instant::now();
         e.enqueue_set_text(1, "SET a=1", t0).unwrap();
@@ -509,7 +521,22 @@ mod tests {
         assert_eq!(e.metrics().batch_flushes_for(BatchFlushReason::Admin), 0);
         assert_eq!(e.metrics().last_batch_flush_reason(), None);
         assert_eq!(e.metrics().commits_total, 0);
-        assert_eq!(e.pending_batch_len(), 0);
+        assert_eq!(e.pending_batch_len(), 1);
+    }
+
+    #[test]
+    fn failed_time_flush_does_not_drop_pending_queue() {
+        let mut e = Engine::with_batching(10, Duration::from_millis(2));
+        let t0 = Instant::now();
+        e.enqueue_set_text(1, "SET a=1", t0).unwrap();
+        e.become_follower(2);
+
+        let err = e.tick_batching(t0 + Duration::from_millis(3)).unwrap_err();
+
+        assert!(matches!(err, EngineError::NotLeader));
+        assert_eq!(e.pending_batch_len(), 1);
+        assert_eq!(e.metrics().batch_flush_count, 0);
+        assert_eq!(e.metrics().commits_total, 0);
     }
 
     #[test]
