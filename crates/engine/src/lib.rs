@@ -273,11 +273,14 @@ impl Engine {
         Ok(())
     }
 
-    pub fn execute_read_text(&self, text: &str) -> Result<Option<&str>, ExecuteError> {
+    pub fn execute_read_text(&mut self, text: &str) -> Result<Option<&str>, ExecuteError> {
         let cmd = parse_command(text)?;
 
         match cmd {
-            Command::GetKv { key } => Ok(self.get(&key)),
+            Command::GetKv { key } => {
+                self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
+                Ok(self.get(&key))
+            }
             _ => Ok(None),
         }
     }
@@ -403,6 +406,12 @@ mod tests {
         let value = e.execute_read_text("GET balance").unwrap();
         assert_eq!(value, Some("100"));
         assert_eq!(e.metrics().commits_total, 1);
+        assert_eq!(e.metrics().fallback_total, 1);
+        assert_eq!(e.metrics().fallback_for(FallbackReason::NotGpuEligible), 1);
+        assert_eq!(
+            e.metrics().last_fallback_reason(),
+            Some(FallbackReason::NotGpuEligible)
+        );
     }
 
     #[test]
