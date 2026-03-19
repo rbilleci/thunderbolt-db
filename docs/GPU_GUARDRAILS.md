@@ -28,6 +28,7 @@ These guardrails ensure we optimize for GPU execution from day one while preserv
 5. **Fallback is a correctness tool, not product direction**
    - CPU fallback is required for safety.
    - Every fallback path must have a tracked GPU parity issue with owner and milestone.
+   - Bootstrap mapping currently lives in `gpu_db_metrics::FallbackReason::gpu_parity_issue`.
 
 6. **Performance budgets include GPU metrics immediately**
    - CI must record at minimum:
