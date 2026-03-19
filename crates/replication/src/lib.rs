@@ -649,4 +649,34 @@ mod tests {
             .unwrap();
         assert_eq!(committed, token.index);
     }
+
+    #[test]
+    fn raft_install_snapshot_prunes_ack_tracking_and_uncompacted_entries() {
+        let mut r = RaftReplicator::new(3);
+        r.become_leader(4);
+
+        let t1 = r.propose(vec![1]).unwrap();
+        let t2 = r.propose(vec![2]).unwrap();
+        let t3 = r.propose(vec![3]).unwrap();
+
+        r.register_follower_ack(t1.index, 1);
+        r.register_follower_ack(t2.index, 1);
+        assert_eq!(r.commit_index(), t2.index);
+        assert!(r.ack_counts.contains_key(&t3.index));
+
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: t2.index,
+            last_included_term: 5,
+            snapshot_id: 42,
+        });
+
+        assert_eq!(r.current_term(), 5);
+        assert_eq!(r.commit_index(), t2.index);
+        assert_eq!(r.applied_index(), t2.index);
+        assert_eq!(r.snapshot_meta().snapshot_id, 42);
+        assert!(!r.ack_counts.contains_key(&t1.index));
+        assert!(!r.ack_counts.contains_key(&t2.index));
+        assert!(r.ack_counts.contains_key(&t3.index));
+        assert!(r.entries.iter().all(|entry| entry.index > t2.index));
+    }
 }
