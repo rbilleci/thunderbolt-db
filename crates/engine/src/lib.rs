@@ -181,7 +181,10 @@ impl Engine {
 
     pub fn tick_batching(&mut self, now: Instant) -> Result<(), EngineError> {
         if self.repl.role() != Role::Leader {
-            return Err(EngineError::NotLeader);
+            if self.has_pending_batch() {
+                return Err(EngineError::NotLeader);
+            }
+            return Ok(());
         }
 
         if let Some(batch) = self.batcher.maybe_flush_due_to_time(now) {
@@ -535,6 +538,18 @@ mod tests {
 
         assert!(matches!(err, EngineError::NotLeader));
         assert_eq!(e.pending_batch_len(), 1);
+        assert_eq!(e.metrics().batch_flush_count, 0);
+        assert_eq!(e.metrics().commits_total, 0);
+    }
+
+    #[test]
+    fn follower_tick_without_pending_batch_is_noop() {
+        let mut e = Engine::with_batching(10, Duration::from_millis(2));
+        e.become_follower(2);
+
+        e.tick_batching(Instant::now()).unwrap();
+
+        assert_eq!(e.pending_batch_len(), 0);
         assert_eq!(e.metrics().batch_flush_count, 0);
         assert_eq!(e.metrics().commits_total, 0);
     }
