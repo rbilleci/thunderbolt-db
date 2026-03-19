@@ -48,6 +48,10 @@ impl WalBuffer {
         self.flushed
     }
 
+    pub fn unflushed_count(&self) -> usize {
+        self.records.len().saturating_sub(self.flushed)
+    }
+
     pub fn fail_next_flush(&mut self) {
         self.fail_next_flush = true;
     }
@@ -109,5 +113,29 @@ mod tests {
         wal.truncate(1);
         assert_eq!(wal.len(), 1);
         assert_eq!(wal.flushed_count(), 1);
+    }
+
+    #[test]
+    fn unflushed_count_tracks_unpersisted_tail() {
+        let mut wal = WalBuffer::default();
+        wal.append(WalRecord {
+            txn_id: 1,
+            payload: b"SET a=1".to_vec(),
+        });
+        wal.append(WalRecord {
+            txn_id: 2,
+            payload: b"SET b=2".to_vec(),
+        });
+
+        assert_eq!(wal.unflushed_count(), 2);
+
+        wal.flush_all().unwrap();
+        assert_eq!(wal.unflushed_count(), 0);
+
+        wal.append(WalRecord {
+            txn_id: 3,
+            payload: b"SET c=3".to_vec(),
+        });
+        assert_eq!(wal.unflushed_count(), 1);
     }
 }
