@@ -3,6 +3,7 @@
 ## 2026-03-19
 
 ### Completed
+- Optimized `Engine::apply_batch` flush draining to avoid `Vec::remove(0)` quadratic behavior by streaming items via iterator + replay-safe tail requeue on commit failures.
 - Hardened `RaftReplicator` leadership transitions by dropping uncommitted log tail + clearing in-flight follower ack maps on `become_follower`/`become_leader`, preventing stale quorum evidence from leaking across term/role changes.
 - Switched Raft ack tracking to per-index voter-id sets so duplicate follower acks cannot satisfy quorum counts incorrectly.
 - Added regression coverage proving post-transition leadership starts from the last committed index and re-proposes new work in a clean epoch, and that duplicate ack events from one follower are ignored.
