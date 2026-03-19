@@ -183,6 +183,8 @@ impl RaftReplicator {
                 break;
             }
         }
+
+        self.ack_counts.retain(|idx, _| *idx > self.commit_index);
     }
 
     pub fn export_snapshot_meta(&mut self) -> SnapshotMeta {
@@ -480,6 +482,27 @@ mod tests {
 
         r.register_follower_ack(t2.index, 2);
         assert_eq!(r.commit_index(), t2.index);
+    }
+
+    #[test]
+    fn raft_prunes_ack_tracking_for_committed_entries() {
+        let mut r = RaftReplicator::new(3);
+        r.become_leader(1);
+
+        let t1 = r.propose(vec![1]).unwrap();
+        let t2 = r.propose(vec![2]).unwrap();
+
+        assert!(r.ack_counts.contains_key(&t1.index));
+        assert!(r.ack_counts.contains_key(&t2.index));
+
+        r.register_follower_ack(t1.index, 1);
+        assert_eq!(r.commit_index(), t1.index);
+        assert!(!r.ack_counts.contains_key(&t1.index));
+        assert!(r.ack_counts.contains_key(&t2.index));
+
+        r.register_follower_ack(t2.index, 1);
+        assert_eq!(r.commit_index(), t2.index);
+        assert!(r.ack_counts.is_empty());
     }
 
     #[test]
