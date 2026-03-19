@@ -3,6 +3,7 @@
 ## 2026-03-19
 
 ### Completed
+- Wired placeholder kernel-occupancy telemetry into batched mutation flushes: `Engine::apply_batch` now records simulated occupancy per payload (capped at 100% permyriad), with regression coverage proving occupancy sample/total/latest metrics advance alongside existing H2D + kernel-exec counters.
 - Hardened role-aware read command handling across mixed execution entry points: `execute_text` and `enqueue_set_text` now reject `GET` when role is follower/candidate (matching `execute_read_text` leadership gates), with regression coverage confirming no fallback/queue side effects on rejected reads.
 - Extended text-protocol transaction compatibility so `BEGIN READ ONLY` and `BEGIN READ WRITE` are accepted directly (without requiring `WORK`/`TRANSACTION`), with negative coverage for unsupported partial/isolation-style suffixes.
 - Added raft regression coverage proving `install_snapshot` prunes ack-tracking and compacted entries at/under the installed snapshot boundary while preserving newer pending entries.
