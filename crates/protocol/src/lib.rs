@@ -110,17 +110,52 @@ fn is_deferrable_suffix(tokens: &[&str]) -> bool {
     )
 }
 
-fn is_begin_mode_suffix(tokens: &[&str]) -> bool {
-    matches!(
-        tokens,
-        [read, only]
-            if read.eq_ignore_ascii_case("READ") && only.eq_ignore_ascii_case("ONLY")
-    ) || matches!(
-        tokens,
-        [read, write]
-            if read.eq_ignore_ascii_case("READ") && write.eq_ignore_ascii_case("WRITE")
-    ) || is_isolation_level_suffix(tokens)
-        || is_deferrable_suffix(tokens)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BeginModeKind {
+    AccessMode,
+    IsolationLevel,
+    Deferrable,
+}
+
+fn parse_begin_mode(tokens: &[String]) -> Option<(usize, BeginModeKind)> {
+    let refs: Vec<_> = tokens.iter().map(String::as_str).collect();
+
+    if refs.len() >= 4 && is_isolation_level_suffix(&refs[..4]) {
+        return Some((4, BeginModeKind::IsolationLevel));
+    }
+
+    if refs.len() >= 3 && is_isolation_level_suffix(&refs[..3]) {
+        return Some((3, BeginModeKind::IsolationLevel));
+    }
+
+    if refs.len() >= 2 {
+        let two = &refs[..2];
+        if matches!(
+            two,
+            [read, only]
+                if read.eq_ignore_ascii_case("READ") && only.eq_ignore_ascii_case("ONLY")
+        ) || matches!(
+            two,
+            [read, write]
+                if read.eq_ignore_ascii_case("READ") && write.eq_ignore_ascii_case("WRITE")
+        ) {
+            return Some((2, BeginModeKind::AccessMode));
+        }
+
+        if matches!(
+            two,
+            [not, deferrable]
+                if not.eq_ignore_ascii_case("NOT") && deferrable.eq_ignore_ascii_case("DEFERRABLE")
+        ) {
+            return Some((2, BeginModeKind::Deferrable));
+        }
+    }
+
+    if !refs.is_empty() && is_deferrable_suffix(&refs[..1]) {
+        return Some((1, BeginModeKind::Deferrable));
+    }
+
+    None
 }
 
 fn normalize_begin_tokens(input: &str) -> Vec<String> {
@@ -143,25 +178,27 @@ fn is_begin_mode_list(tokens: &[String]) -> bool {
     }
 
     let mut idx = 0;
+    let mut seen_access_mode = false;
+    let mut seen_isolation_level = false;
+    let mut seen_deferrable = false;
+
     while idx < tokens.len() {
         if tokens[idx] == "," {
             return false;
         }
 
-        let remaining = &tokens[idx..];
-        let remaining_refs: Vec<_> = remaining.iter().map(String::as_str).collect();
-        let consumed =
-            if remaining_refs.len() >= 4 && is_isolation_level_suffix(&remaining_refs[..4]) {
-                4
-            } else if remaining_refs.len() >= 3 && is_isolation_level_suffix(&remaining_refs[..3]) {
-                3
-            } else if remaining_refs.len() >= 2 && is_begin_mode_suffix(&remaining_refs[..2]) {
-                2
-            } else if is_begin_mode_suffix(&remaining_refs[..1]) {
-                1
-            } else {
-                return false;
-            };
+        let Some((consumed, kind)) = parse_begin_mode(&tokens[idx..]) else {
+            return false;
+        };
+
+        match kind {
+            BeginModeKind::AccessMode if seen_access_mode => return false,
+            BeginModeKind::IsolationLevel if seen_isolation_level => return false,
+            BeginModeKind::Deferrable if seen_deferrable => return false,
+            BeginModeKind::AccessMode => seen_access_mode = true,
+            BeginModeKind::IsolationLevel => seen_isolation_level = true,
+            BeginModeKind::Deferrable => seen_deferrable = true,
+        }
 
         idx += consumed;
         if idx == tokens.len() {
@@ -582,6 +619,26 @@ mod tests {
         ));
         assert!(matches!(
             parse_command("START WORK NOW"),
+            Err(ParseError::Unsupported(_))
+        ));
+        assert!(matches!(
+            parse_command("BEGIN READ ONLY READ WRITE"),
+            Err(ParseError::Unsupported(_))
+        ));
+        assert!(matches!(
+            parse_command("BEGIN READ ONLY, READ WRITE"),
+            Err(ParseError::Unsupported(_))
+        ));
+        assert!(matches!(
+            parse_command("START TRANSACTION READ ONLY, READ ONLY"),
+            Err(ParseError::Unsupported(_))
+        ));
+        assert!(matches!(
+            parse_command("BEGIN DEFERRABLE NOT DEFERRABLE"),
+            Err(ParseError::Unsupported(_))
+        ));
+        assert!(matches!(
+            parse_command("BEGIN ISOLATION LEVEL SERIALIZABLE, ISOLATION LEVEL READ COMMITTED"),
             Err(ParseError::Unsupported(_))
         ));
         assert!(matches!(
