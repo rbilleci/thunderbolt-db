@@ -60,6 +60,7 @@ pub struct ReplicationWatermarks {
     pub applied_index: Index,
     pub visible_index: Index,
     pub wal_flushed_count: usize,
+    pub wal_buffered_count: usize,
 }
 
 pub struct Engine {
@@ -309,6 +310,7 @@ impl Engine {
             applied_index: self.repl.applied_index(),
             visible_index: self.visible_up_to,
             wal_flushed_count: self.wal.flushed_count(),
+            wal_buffered_count: self.wal.len(),
         }
     }
 
@@ -754,6 +756,7 @@ mod tests {
         assert_eq!(before.applied_index, 0);
         assert_eq!(before.visible_index, 0);
         assert_eq!(before.wal_flushed_count, 0);
+        assert_eq!(before.wal_buffered_count, 0);
 
         let token = e.commit_mutation(1, b"SET a=1".to_vec()).unwrap();
         let after = e.replication_watermarks();
@@ -764,6 +767,7 @@ mod tests {
         assert_eq!(after.applied_index, token.index);
         assert_eq!(after.visible_index, token.index);
         assert!(after.wal_flushed_count >= 1);
+        assert_eq!(after.wal_buffered_count, e.wal_buffered_count());
     }
 
     #[test]
@@ -781,6 +785,19 @@ mod tests {
         assert_eq!(marks.applied_index, 0);
         assert_eq!(marks.visible_index, 0);
         assert_eq!(marks.wal_flushed_count, 0);
+        assert_eq!(marks.wal_buffered_count, 0);
+    }
+
+    #[test]
+    fn replication_watermarks_include_buffered_wal_records() {
+        let mut e = Engine::new_local();
+
+        e.commit_mutation(1, b"SET a=1".to_vec()).unwrap();
+        e.commit_mutation(2, b"SET b=2".to_vec()).unwrap();
+
+        let marks = e.replication_watermarks();
+        assert_eq!(marks.wal_buffered_count, 2);
+        assert_eq!(marks.wal_flushed_count, 2);
     }
 
     #[test]
