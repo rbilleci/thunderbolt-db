@@ -23,24 +23,37 @@ pub enum ParseError {
     InvalidGet,
 }
 
+fn is_transaction_chain_suffix(tokens: &[&str]) -> bool {
+    matches!(
+        tokens,
+        [and, chain]
+            if and.eq_ignore_ascii_case("AND") && chain.eq_ignore_ascii_case("CHAIN")
+    ) || matches!(
+        tokens,
+        [and, no, chain]
+            if and.eq_ignore_ascii_case("AND")
+                && no.eq_ignore_ascii_case("NO")
+                && chain.eq_ignore_ascii_case("CHAIN")
+    )
+}
+
 fn is_transaction_control(input: &str, keyword: &str) -> bool {
-    let mut tokens = input.split_whitespace();
-    let Some(first) = tokens.next() else {
+    let tokens: Vec<_> = input.split_whitespace().collect();
+    let Some((first, rest)) = tokens.split_first() else {
         return false;
     };
     if !first.eq_ignore_ascii_case(keyword) {
         return false;
     }
 
-    match tokens.next() {
-        None => true,
-        Some(second)
-            if second.eq_ignore_ascii_case("TRANSACTION")
-                || second.eq_ignore_ascii_case("WORK") =>
-        {
-            tokens.next().is_none()
+    match rest {
+        [] => true,
+        [second] if second.eq_ignore_ascii_case("TRANSACTION") => true,
+        [second] if second.eq_ignore_ascii_case("WORK") => true,
+        _ if keyword.eq_ignore_ascii_case("COMMIT") || keyword.eq_ignore_ascii_case("ROLLBACK") => {
+            is_transaction_chain_suffix(rest)
         }
-        Some(_) => false,
+        _ => false,
     }
 }
 
@@ -194,11 +207,24 @@ mod tests {
             parse_command("COMMIT TRANSACTION").unwrap(),
             Command::Commit
         );
+        assert_eq!(parse_command("COMMIT AND CHAIN").unwrap(), Command::Commit);
+        assert_eq!(
+            parse_command("COMMIT AND NO CHAIN").unwrap(),
+            Command::Commit
+        );
         assert_eq!(parse_command("END WORK").unwrap(), Command::Commit);
         assert_eq!(parse_command("END TRANSACTION").unwrap(), Command::Commit);
         assert_eq!(parse_command("ROLLBACK WORK").unwrap(), Command::Rollback);
         assert_eq!(
             parse_command("ROLLBACK TRANSACTION").unwrap(),
+            Command::Rollback
+        );
+        assert_eq!(
+            parse_command("ROLLBACK AND CHAIN").unwrap(),
+            Command::Rollback
+        );
+        assert_eq!(
+            parse_command("ROLLBACK AND NO CHAIN").unwrap(),
             Command::Rollback
         );
         assert_eq!(parse_command("ABORT WORK").unwrap(), Command::Rollback);
@@ -227,11 +253,23 @@ mod tests {
             Err(ParseError::Unsupported(_))
         ));
         assert!(matches!(
+            parse_command("COMMIT AND"),
+            Err(ParseError::Unsupported(_))
+        ));
+        assert!(matches!(
+            parse_command("COMMIT AND MAYBE CHAIN"),
+            Err(ParseError::Unsupported(_))
+        ));
+        assert!(matches!(
             parse_command("END WORK PLEASE"),
             Err(ParseError::Unsupported(_))
         ));
         assert!(matches!(
             parse_command("ROLLBACK TRANSACTION AGAIN"),
+            Err(ParseError::Unsupported(_))
+        ));
+        assert!(matches!(
+            parse_command("ROLLBACK AND"),
             Err(ParseError::Unsupported(_))
         ));
         assert!(matches!(
