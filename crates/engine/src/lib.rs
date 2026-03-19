@@ -129,6 +129,8 @@ impl Engine {
             return Err(err);
         }
 
+        self.repl.wait_committed(token, Duration::from_millis(0))?;
+
         let to_apply: Vec<LogEntry> = self
             .repl
             .drain_committed_from(self.repl.applied_index())
