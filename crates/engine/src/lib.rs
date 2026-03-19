@@ -622,6 +622,19 @@ mod tests {
     }
 
     #[test]
+    fn batching_kernel_occupancy_caps_at_full_utilization() {
+        let mut e = Engine::with_batching(1, Duration::from_secs(999));
+        let t0 = Instant::now();
+        let payload = format!("SET a={}", "x".repeat(512));
+
+        e.enqueue_set_text(1, &payload, t0).unwrap();
+
+        assert_eq!(e.metrics().kernel_occupancy_samples, 1);
+        assert_eq!(e.metrics().last_kernel_occupancy_permyriad(), Some(10_000));
+        assert_eq!(e.metrics().kernel_occupancy_total_permyriad, 10_000);
+    }
+
+    #[test]
     fn admin_flush_tracks_reason() {
         let mut e = Engine::with_batching(10, Duration::from_secs(60));
         let t0 = Instant::now();
