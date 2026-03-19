@@ -74,6 +74,13 @@ impl RuntimeMetrics {
     pub fn last_batch_wait_ms(&self) -> Option<u64> {
         self.last_batch_wait_ms
     }
+
+    pub fn avg_batch_wait_ms(&self) -> Option<f64> {
+        if self.batch_wait_samples == 0 {
+            return None;
+        }
+        Some(self.batch_wait_total_ms as f64 / self.batch_wait_samples as f64)
+    }
 }
 
 #[cfg(test)]
@@ -118,6 +125,7 @@ mod tests {
     fn batch_wait_observations_track_totals_and_latest() {
         let mut m = RuntimeMetrics::default();
         assert_eq!(m.last_batch_wait_ms(), None);
+        assert_eq!(m.avg_batch_wait_ms(), None);
 
         m.observe_batch_wait_ms(4);
         m.observe_batch_wait_ms(7);
@@ -125,5 +133,6 @@ mod tests {
         assert_eq!(m.batch_wait_samples, 2);
         assert_eq!(m.batch_wait_total_ms, 11);
         assert_eq!(m.last_batch_wait_ms(), Some(7));
+        assert_eq!(m.avg_batch_wait_ms(), Some(5.5));
     }
 }
