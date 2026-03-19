@@ -22,11 +22,16 @@ pub struct RuntimeMetrics {
     pub fallback_total: u64,
     pub batch_wait_samples: u64,
     pub batch_wait_total_ms: u64,
+    pub h2d_bytes_total: u64,
+    pub d2h_bytes_total: u64,
+    pub kernel_exec_samples: u64,
+    pub kernel_exec_total_ms: u64,
     fallback_by_reason: BTreeMap<FallbackReason, u64>,
     batch_flush_by_reason: BTreeMap<BatchFlushReason, u64>,
     last_fallback_reason: Option<FallbackReason>,
     last_batch_flush_reason: Option<BatchFlushReason>,
     last_batch_wait_ms: Option<u64>,
+    last_kernel_exec_ms: Option<u64>,
 }
 
 impl RuntimeMetrics {
@@ -52,6 +57,20 @@ impl RuntimeMetrics {
         self.last_fallback_reason = Some(reason);
     }
 
+    pub fn observe_h2d_bytes(&mut self, bytes: u64) {
+        self.h2d_bytes_total = self.h2d_bytes_total.saturating_add(bytes);
+    }
+
+    pub fn observe_d2h_bytes(&mut self, bytes: u64) {
+        self.d2h_bytes_total = self.d2h_bytes_total.saturating_add(bytes);
+    }
+
+    pub fn observe_kernel_exec_ms(&mut self, exec_ms: u64) {
+        self.kernel_exec_samples += 1;
+        self.kernel_exec_total_ms = self.kernel_exec_total_ms.saturating_add(exec_ms);
+        self.last_kernel_exec_ms = Some(exec_ms);
+    }
+
     pub fn fallback_for(&self, reason: FallbackReason) -> u64 {
         self.fallback_by_reason.get(&reason).copied().unwrap_or(0)
     }
@@ -75,11 +94,22 @@ impl RuntimeMetrics {
         self.last_batch_wait_ms
     }
 
+    pub fn last_kernel_exec_ms(&self) -> Option<u64> {
+        self.last_kernel_exec_ms
+    }
+
     pub fn avg_batch_wait_ms(&self) -> Option<f64> {
         if self.batch_wait_samples == 0 {
             return None;
         }
         Some(self.batch_wait_total_ms as f64 / self.batch_wait_samples as f64)
+    }
+
+    pub fn avg_kernel_exec_ms(&self) -> Option<f64> {
+        if self.kernel_exec_samples == 0 {
+            return None;
+        }
+        Some(self.kernel_exec_total_ms as f64 / self.kernel_exec_samples as f64)
     }
 }
 
@@ -134,5 +164,37 @@ mod tests {
         assert_eq!(m.batch_wait_total_ms, 11);
         assert_eq!(m.last_batch_wait_ms(), Some(7));
         assert_eq!(m.avg_batch_wait_ms(), Some(5.5));
+    }
+
+    #[test]
+    fn transfer_byte_counters_accumulate_with_saturation() {
+        let mut m = RuntimeMetrics::default();
+
+        m.observe_h2d_bytes(128);
+        m.observe_d2h_bytes(64);
+
+        assert_eq!(m.h2d_bytes_total, 128);
+        assert_eq!(m.d2h_bytes_total, 64);
+
+        m.observe_h2d_bytes(u64::MAX);
+        m.observe_d2h_bytes(u64::MAX);
+
+        assert_eq!(m.h2d_bytes_total, u64::MAX);
+        assert_eq!(m.d2h_bytes_total, u64::MAX);
+    }
+
+    #[test]
+    fn kernel_exec_observations_track_totals_latest_and_average() {
+        let mut m = RuntimeMetrics::default();
+        assert_eq!(m.last_kernel_exec_ms(), None);
+        assert_eq!(m.avg_kernel_exec_ms(), None);
+
+        m.observe_kernel_exec_ms(9);
+        m.observe_kernel_exec_ms(3);
+
+        assert_eq!(m.kernel_exec_samples, 2);
+        assert_eq!(m.kernel_exec_total_ms, 12);
+        assert_eq!(m.last_kernel_exec_ms(), Some(3));
+        assert_eq!(m.avg_kernel_exec_ms(), Some(6.0));
     }
 }
