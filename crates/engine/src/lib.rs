@@ -964,6 +964,19 @@ mod tests {
     }
 
     #[test]
+    fn export_snapshot_meta_is_reflected_in_replication_watermarks() {
+        let mut e = Engine::new_local();
+
+        assert_eq!(e.replication_watermarks().snapshot_id, 0);
+
+        e.export_snapshot_meta();
+        assert_eq!(e.replication_watermarks().snapshot_id, 1);
+
+        e.export_snapshot_meta();
+        assert_eq!(e.replication_watermarks().snapshot_id, 2);
+    }
+
+    #[test]
     fn installing_older_snapshot_does_not_rewind_visibility_or_watermarks() {
         let mut e = Engine::new_local();
         let committed = e.commit_mutation(1, b"SET a=1".to_vec()).unwrap();
