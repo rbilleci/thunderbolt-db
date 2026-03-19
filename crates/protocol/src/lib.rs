@@ -80,6 +80,7 @@ fn is_begin_with_optional_mode(input: &str) -> bool {
             [] => true,
             [second] if second.eq_ignore_ascii_case("TRANSACTION") => true,
             [second] if second.eq_ignore_ascii_case("WORK") => true,
+            mode if is_begin_mode_suffix(mode) => true,
             [second, mode @ ..]
                 if second.eq_ignore_ascii_case("TRANSACTION")
                     || second.eq_ignore_ascii_case("WORK") =>
@@ -240,6 +241,8 @@ mod tests {
     fn parses_transaction_control_work_and_transaction_aliases() {
         assert_eq!(parse_command("BEGIN WORK").unwrap(), Command::Begin);
         assert_eq!(parse_command("BEGIN TRANSACTION").unwrap(), Command::Begin);
+        assert_eq!(parse_command("BEGIN READ ONLY").unwrap(), Command::Begin);
+        assert_eq!(parse_command("BEGIN READ WRITE").unwrap(), Command::Begin);
         assert_eq!(
             parse_command("BEGIN TRANSACTION READ ONLY").unwrap(),
             Command::Begin
@@ -294,6 +297,14 @@ mod tests {
     fn rejects_transaction_control_commands_with_extra_tokens() {
         assert!(matches!(
             parse_command("BEGIN TRANSACTION NOW"),
+            Err(ParseError::Unsupported(_))
+        ));
+        assert!(matches!(
+            parse_command("BEGIN READ"),
+            Err(ParseError::Unsupported(_))
+        ));
+        assert!(matches!(
+            parse_command("BEGIN READ COMMITTED"),
             Err(ParseError::Unsupported(_))
         ));
         assert!(matches!(
