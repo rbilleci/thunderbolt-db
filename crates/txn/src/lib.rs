@@ -49,6 +49,18 @@ impl TxnManager {
         }
     }
 
+    pub fn begin_with_id(&mut self, id: TxnId) -> Result<Txn, TxnError> {
+        if matches!(self.states.get(&id), Some(TxnState::Active)) {
+            return Err(TxnError::NotActive(id));
+        }
+        self.next_id = self.next_id.max(id);
+        self.states.insert(id, TxnState::Active);
+        Ok(Txn {
+            id,
+            state: TxnState::Active,
+        })
+    }
+
     pub fn state(&self, id: TxnId) -> Option<TxnState> {
         self.states.get(&id).copied()
     }
@@ -132,5 +144,25 @@ mod tests {
 
         assert_eq!(tm.commit(t.id), Err(TxnError::NotActive(t.id)));
         assert_eq!(tm.rollback(t.id), Err(TxnError::NotActive(t.id)));
+    }
+
+    #[test]
+    fn begin_with_id_uses_caller_id_and_advances_allocator_floor() {
+        let mut tm = TxnManager::default();
+
+        let opened = tm.begin_with_id(42).unwrap();
+        assert_eq!(opened.id, 42);
+        assert_eq!(tm.state(42), Some(TxnState::Active));
+
+        let next = tm.begin();
+        assert_eq!(next.id, 43);
+    }
+
+    #[test]
+    fn begin_with_id_rejects_duplicate_active_id() {
+        let mut tm = TxnManager::default();
+
+        tm.begin_with_id(7).unwrap();
+        assert_eq!(tm.begin_with_id(7), Err(TxnError::NotActive(7)));
     }
 }

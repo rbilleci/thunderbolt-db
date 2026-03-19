@@ -5,6 +5,7 @@ use gpu_db_batching::{BatchItem, DualTriggerBatcher, FlushReason};
 use gpu_db_metrics::{BatchFlushReason, FallbackReason, RuntimeMetrics};
 use gpu_db_protocol::{parse_command, Command, ParseError};
 use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine};
+use gpu_db_txn::{TxnError, TxnManager};
 use gpu_db_types::{CommitToken, EngineError, Index, LogEntry, Role, SnapshotMeta, Term};
 use gpu_db_wal::{WalBuffer, WalRecord};
 
@@ -44,6 +45,8 @@ pub enum ExecuteError {
     Parse(#[from] ParseError),
     #[error(transparent)]
     Engine(#[from] EngineError),
+    #[error(transparent)]
+    Txn(#[from] TxnError),
 }
 
 #[derive(Debug, Clone)]
@@ -68,6 +71,7 @@ pub struct Engine {
     repl: LocalReplicator,
     wal: WalBuffer,
     sm: KvStateMachine,
+    txn_manager: TxnManager,
     visible_up_to: Index,
     metrics: RuntimeMetrics,
     batcher: DualTriggerBatcher<PendingMutation>,
@@ -79,6 +83,7 @@ impl Engine {
             repl: LocalReplicator::leader(),
             wal: WalBuffer::default(),
             sm: KvStateMachine::default(),
+            txn_manager: TxnManager::default(),
             visible_up_to: 0,
             metrics: RuntimeMetrics::default(),
             batcher: DualTriggerBatcher::new(64, Duration::from_millis(1)),
@@ -181,7 +186,19 @@ impl Engine {
             Command::Flush => {
                 self.flush_admin()?;
             }
-            Command::Begin | Command::Commit | Command::Rollback | Command::GetKv { .. } => {
+            Command::Begin => {
+                self.txn_manager.begin_with_id(txn_id)?;
+                self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
+            }
+            Command::Commit => {
+                self.txn_manager.commit(txn_id)?;
+                self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
+            }
+            Command::Rollback => {
+                self.txn_manager.rollback(txn_id)?;
+                self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
+            }
+            Command::GetKv { .. } => {
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
         }
@@ -266,7 +283,19 @@ impl Engine {
             Command::Flush => {
                 self.flush_admin()?;
             }
-            Command::Begin | Command::Commit | Command::Rollback | Command::GetKv { .. } => {
+            Command::Begin => {
+                self.txn_manager.begin_with_id(txn_id)?;
+                self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
+            }
+            Command::Commit => {
+                self.txn_manager.commit(txn_id)?;
+                self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
+            }
+            Command::Rollback => {
+                self.txn_manager.rollback(txn_id)?;
+                self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
+            }
+            Command::GetKv { .. } => {
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
         }
@@ -308,6 +337,10 @@ impl Engine {
 
     pub fn get(&self, key: &str) -> Option<&str> {
         self.sm.kv.get(key).map(|s| s.as_str())
+    }
+
+    pub fn active_txn_count(&self) -> usize {
+        self.txn_manager.active_count()
     }
 
     pub fn replication_watermarks(&self) -> ReplicationWatermarks {
@@ -750,11 +783,13 @@ mod tests {
 
         e.execute_text(1, "BEGIN").unwrap();
         e.execute_text(1, "COMMIT").unwrap();
-        e.execute_text(1, "ROLLBACK").unwrap();
-        e.execute_text(1, "GET missing").unwrap();
+        e.execute_text(2, "BEGIN").unwrap();
+        e.execute_text(2, "ROLLBACK").unwrap();
+        e.execute_text(3, "GET missing").unwrap();
 
-        assert_eq!(e.metrics().fallback_total, 4);
-        assert_eq!(e.metrics().fallback_for(FallbackReason::NotGpuEligible), 4);
+        assert_eq!(e.active_txn_count(), 0);
+        assert_eq!(e.metrics().fallback_total, 5);
+        assert_eq!(e.metrics().fallback_for(FallbackReason::NotGpuEligible), 5);
         assert_eq!(
             e.metrics().last_fallback_reason(),
             Some(FallbackReason::NotGpuEligible)
@@ -769,13 +804,42 @@ mod tests {
 
         e.enqueue_set_text(1, "BEGIN", t0).unwrap();
         e.enqueue_set_text(1, "COMMIT", t0).unwrap();
-        e.enqueue_set_text(1, "ROLLBACK", t0).unwrap();
-        e.enqueue_set_text(1, "GET missing", t0).unwrap();
+        e.enqueue_set_text(2, "BEGIN", t0).unwrap();
+        e.enqueue_set_text(2, "ROLLBACK", t0).unwrap();
+        e.enqueue_set_text(3, "GET missing", t0).unwrap();
 
-        assert_eq!(e.metrics().fallback_total, 4);
-        assert_eq!(e.metrics().fallback_for(FallbackReason::NotGpuEligible), 4);
+        assert_eq!(e.active_txn_count(), 0);
+        assert_eq!(e.metrics().fallback_total, 5);
+        assert_eq!(e.metrics().fallback_for(FallbackReason::NotGpuEligible), 5);
         assert_eq!(e.pending_batch_len(), 0);
         assert_eq!(e.metrics().commits_total, 0);
+    }
+
+    #[test]
+    fn commit_and_rollback_require_active_transaction_context() {
+        let mut e = Engine::new_local();
+
+        let commit_err = e.execute_text(10, "COMMIT").unwrap_err();
+        assert!(matches!(
+            commit_err,
+            ExecuteError::Txn(TxnError::NotFound(10))
+        ));
+
+        let rollback_err = e.execute_text(11, "ROLLBACK").unwrap_err();
+        assert!(matches!(
+            rollback_err,
+            ExecuteError::Txn(TxnError::NotFound(11))
+        ));
+
+        e.execute_text(12, "BEGIN").unwrap();
+        let duplicate_begin_err = e.execute_text(12, "BEGIN").unwrap_err();
+        assert!(matches!(
+            duplicate_begin_err,
+            ExecuteError::Txn(TxnError::NotActive(12))
+        ));
+
+        assert_eq!(e.metrics().fallback_total, 1);
+        assert_eq!(e.active_txn_count(), 1);
     }
 
     #[test]
