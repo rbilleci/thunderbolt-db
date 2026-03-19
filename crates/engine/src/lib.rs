@@ -206,6 +206,9 @@ impl Engine {
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
             Command::GetKv { .. } => {
+                if self.repl.role() != Role::Leader {
+                    return Err(ExecuteError::Engine(EngineError::NotLeader));
+                }
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
         }
@@ -306,6 +309,9 @@ impl Engine {
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
             Command::GetKv { .. } => {
+                if self.repl.role() != Role::Leader {
+                    return Err(ExecuteError::Engine(EngineError::NotLeader));
+                }
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
         }
@@ -531,6 +537,18 @@ mod tests {
     }
 
     #[test]
+    fn execute_text_get_rejects_when_not_leader() {
+        let mut e = Engine::new_local();
+        e.become_follower(2);
+
+        let err = e.execute_text(1, "GET balance").unwrap_err();
+
+        assert!(matches!(err, ExecuteError::Engine(EngineError::NotLeader)));
+        assert_eq!(e.metrics().fallback_total, 0);
+        assert_eq!(e.metrics().commits_total, 0);
+    }
+
+    #[test]
     fn execute_read_text_rejects_get_when_candidate() {
         let mut e = Engine::new_local();
         e.execute_text(1, "SET balance=100").unwrap();
@@ -751,6 +769,20 @@ mod tests {
         assert_eq!(e.metrics().batch_flush_count, 0);
         assert_eq!(e.metrics().batch_flushes_for(BatchFlushReason::Count), 0);
         assert_eq!(e.metrics().last_batch_flush_reason(), None);
+        assert_eq!(e.metrics().commits_total, 0);
+    }
+
+    #[test]
+    fn enqueue_get_rejects_when_not_leader_without_queue_side_effects() {
+        let mut e = Engine::with_batching(2, Duration::from_secs(999));
+        e.become_follower(2);
+
+        let t0 = Instant::now();
+        let err = e.enqueue_set_text(1, "GET a", t0).unwrap_err();
+
+        assert!(matches!(err, ExecuteError::Engine(EngineError::NotLeader)));
+        assert_eq!(e.pending_batch_len(), 0);
+        assert_eq!(e.metrics().fallback_total, 0);
         assert_eq!(e.metrics().commits_total, 0);
     }
 
