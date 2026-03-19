@@ -28,6 +28,10 @@ pub fn parse_command(input: &str) -> Result<Command, ParseError> {
     if s.is_empty() {
         return Err(ParseError::Empty);
     }
+    let s = s.strip_suffix(';').unwrap_or(s).trim_end();
+    if s.is_empty() {
+        return Err(ParseError::Empty);
+    }
 
     let upper = s.to_ascii_uppercase();
     if upper == "BEGIN" {
@@ -140,6 +144,24 @@ mod tests {
         assert_eq!(parse_command("begin").unwrap(), Command::Begin);
         assert_eq!(parse_command("COMMIT").unwrap(), Command::Commit);
         assert_eq!(parse_command("rOlLbAcK").unwrap(), Command::Rollback);
+    }
+
+    #[test]
+    fn accepts_optional_statement_terminator() {
+        assert_eq!(parse_command("BEGIN;").unwrap(), Command::Begin);
+        assert_eq!(
+            parse_command("SET balance = 42;").unwrap(),
+            Command::SetKv {
+                key: "balance".into(),
+                value: "42".into()
+            }
+        );
+        assert_eq!(
+            parse_command("GET balance;\n").unwrap(),
+            Command::GetKv {
+                key: "balance".into()
+            }
+        );
     }
 
     #[test]
