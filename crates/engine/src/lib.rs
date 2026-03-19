@@ -47,6 +47,8 @@ pub enum ExecuteError {
     Engine(#[from] EngineError),
     #[error(transparent)]
     Txn(#[from] TxnError),
+    #[error("command is not readable via execute_read_text: {0}")]
+    NonReadCommand(&'static str),
 }
 
 #[derive(Debug, Clone)]
@@ -315,7 +317,12 @@ impl Engine {
                 }
                 Ok(self.get(&key))
             }
-            _ => Ok(None),
+            Command::Begin => Err(ExecuteError::NonReadCommand("BEGIN")),
+            Command::Commit => Err(ExecuteError::NonReadCommand("COMMIT")),
+            Command::Rollback => Err(ExecuteError::NonReadCommand("ROLLBACK")),
+            Command::Flush => Err(ExecuteError::NonReadCommand("FLUSH")),
+            Command::SetKv { .. } => Err(ExecuteError::NonReadCommand("SET")),
+            Command::DeleteKv { .. } => Err(ExecuteError::NonReadCommand("DEL/DELETE")),
         }
     }
 
@@ -477,6 +484,26 @@ mod tests {
         assert_eq!(value, None);
         assert_eq!(e.metrics().fallback_total, 1);
         assert_eq!(e.metrics().d2h_bytes_total, 0);
+    }
+
+    #[test]
+    fn execute_read_text_rejects_non_read_commands() {
+        let mut e = Engine::new_local();
+
+        let begin_err = e.execute_read_text("BEGIN").unwrap_err();
+        assert!(matches!(begin_err, ExecuteError::NonReadCommand("BEGIN")));
+
+        let set_err = e.execute_read_text("SET balance=100").unwrap_err();
+        assert!(matches!(set_err, ExecuteError::NonReadCommand("SET")));
+
+        let del_err = e.execute_read_text("DELETE balance").unwrap_err();
+        assert!(matches!(
+            del_err,
+            ExecuteError::NonReadCommand("DEL/DELETE")
+        ));
+
+        assert_eq!(e.metrics().fallback_total, 0);
+        assert_eq!(e.metrics().commits_total, 0);
     }
 
     #[test]
