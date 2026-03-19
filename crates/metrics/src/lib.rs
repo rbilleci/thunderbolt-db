@@ -56,12 +56,14 @@ pub struct RuntimeMetrics {
     pub d2h_bytes_total: u64,
     pub kernel_exec_samples: u64,
     pub kernel_exec_total_ms: u64,
+    pub pending_batch_peak: usize,
     fallback_by_reason: BTreeMap<FallbackReason, u64>,
     batch_flush_by_reason: BTreeMap<BatchFlushReason, u64>,
     last_fallback_reason: Option<FallbackReason>,
     last_batch_flush_reason: Option<BatchFlushReason>,
     last_batch_wait_ms: Option<u64>,
     last_kernel_exec_ms: Option<u64>,
+    last_pending_batch_len: Option<usize>,
 }
 
 impl RuntimeMetrics {
@@ -101,6 +103,11 @@ impl RuntimeMetrics {
         self.last_kernel_exec_ms = Some(exec_ms);
     }
 
+    pub fn observe_pending_batch_len(&mut self, len: usize) {
+        self.pending_batch_peak = self.pending_batch_peak.max(len);
+        self.last_pending_batch_len = Some(len);
+    }
+
     pub fn fallback_for(&self, reason: FallbackReason) -> u64 {
         self.fallback_by_reason.get(&reason).copied().unwrap_or(0)
     }
@@ -136,6 +143,10 @@ impl RuntimeMetrics {
 
     pub fn last_kernel_exec_ms(&self) -> Option<u64> {
         self.last_kernel_exec_ms
+    }
+
+    pub fn last_pending_batch_len(&self) -> Option<usize> {
+        self.last_pending_batch_len
     }
 
     pub fn avg_batch_wait_ms(&self) -> Option<f64> {
@@ -236,6 +247,21 @@ mod tests {
         assert_eq!(m.kernel_exec_total_ms, 12);
         assert_eq!(m.last_kernel_exec_ms(), Some(3));
         assert_eq!(m.avg_kernel_exec_ms(), Some(6.0));
+    }
+
+    #[test]
+    fn pending_batch_depth_tracks_latest_and_peak() {
+        let mut m = RuntimeMetrics::default();
+        assert_eq!(m.last_pending_batch_len(), None);
+        assert_eq!(m.pending_batch_peak, 0);
+
+        m.observe_pending_batch_len(1);
+        m.observe_pending_batch_len(3);
+        m.observe_pending_batch_len(2);
+        m.observe_pending_batch_len(0);
+
+        assert_eq!(m.pending_batch_peak, 3);
+        assert_eq!(m.last_pending_batch_len(), Some(0));
     }
 
     #[test]

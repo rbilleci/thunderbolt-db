@@ -183,7 +183,10 @@ impl Engine {
                     now,
                 );
                 if let Some(batch) = maybe_batch {
+                    self.metrics.observe_pending_batch_len(batch.items.len());
                     self.apply_batch(batch.reason, batch.items.into_iter(), now)?;
+                } else {
+                    self.metrics.observe_pending_batch_len(self.batcher.len());
                 }
             }
             Command::Flush => {
@@ -267,12 +270,14 @@ impl Engine {
             if let Err(err) = self.commit_mutation(txn_id, payload) {
                 let tail: Vec<_> = std::iter::once(p).chain(remaining).collect();
                 self.batcher.requeue_front(tail);
+                self.metrics.observe_pending_batch_len(self.batcher.len());
                 return Err(err);
             }
 
             self.metrics.observe_batch_wait_ms(wait);
         }
 
+        self.metrics.observe_pending_batch_len(self.batcher.len());
         self.metrics.inc_batch_flush(metric_reason);
         Ok(())
     }
@@ -562,6 +567,8 @@ mod tests {
         assert_eq!(e.metrics().kernel_exec_samples, 2);
         assert_eq!(e.metrics().kernel_exec_total_ms, 2);
         assert_eq!(e.metrics().last_kernel_exec_ms(), Some(1));
+        assert_eq!(e.metrics().pending_batch_peak, 2);
+        assert_eq!(e.metrics().last_pending_batch_len(), Some(0));
         assert_eq!(e.metrics().commits_total, 2);
     }
 
@@ -803,6 +810,8 @@ mod tests {
         assert_eq!(e.pending_batch_len(), 2);
         assert_eq!(e.metrics().batch_flush_count, 0);
         assert_eq!(e.metrics().batch_wait_samples, 0);
+        assert_eq!(e.metrics().pending_batch_peak, 2);
+        assert_eq!(e.metrics().last_pending_batch_len(), Some(2));
         assert_eq!(e.metrics().commits_total, 0);
 
         e.flush_admin().unwrap();
