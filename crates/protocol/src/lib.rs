@@ -494,6 +494,14 @@ mod tests {
             Command::Begin
         );
         assert_eq!(
+            parse_command("START WORK ISOLATION LEVEL READ COMMITTED").unwrap(),
+            Command::Begin
+        );
+        assert_eq!(
+            parse_command("START WORK, ISOLATION LEVEL REPEATABLE READ, NOT DEFERRABLE").unwrap(),
+            Command::Begin
+        );
+        assert_eq!(
             parse_command("START TRANSACTION DEFERRABLE").unwrap(),
             Command::Begin
         );
@@ -671,6 +679,12 @@ mod tests {
         ));
         assert!(matches!(
             parse_command("START TRANSACTION READ ONLY, READ ONLY"),
+            Err(ParseError::Unsupported(_))
+        ));
+        assert!(matches!(
+            parse_command(
+                "START WORK ISOLATION LEVEL READ COMMITTED, ISOLATION LEVEL SERIALIZABLE"
+            ),
             Err(ParseError::Unsupported(_))
         ));
         assert!(matches!(
