@@ -1026,6 +1026,24 @@ mod tests {
     }
 
     #[test]
+    fn enqueue_non_mutation_chain_forms_reopen_transaction_context() {
+        let mut e = Engine::new_local();
+        let t0 = Instant::now();
+
+        e.enqueue_set_text(41, "BEGIN", t0).unwrap();
+        e.enqueue_set_text(41, "COMMIT AND CHAIN", t0).unwrap();
+        assert_eq!(e.active_txn_count(), 1);
+        e.enqueue_set_text(42, "COMMIT", t0).unwrap();
+        assert_eq!(e.active_txn_count(), 0);
+
+        e.enqueue_set_text(51, "BEGIN", t0).unwrap();
+        e.enqueue_set_text(51, "ROLLBACK AND CHAIN", t0).unwrap();
+        assert_eq!(e.active_txn_count(), 1);
+        e.enqueue_set_text(52, "ROLLBACK", t0).unwrap();
+        assert_eq!(e.active_txn_count(), 0);
+    }
+
+    #[test]
     fn replication_watermarks_track_commit_apply_visibility_and_durability() {
         let mut e = Engine::new_local();
 
