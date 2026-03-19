@@ -188,6 +188,7 @@ impl Engine {
             }
             Command::Flush => {
                 self.flush_admin()?;
+                self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
             Command::Begin => {
                 self.txn_manager.begin_with_id(txn_id)?;
@@ -285,6 +286,7 @@ impl Engine {
             }
             Command::Flush => {
                 self.flush_admin()?;
+                self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
             Command::Begin => {
                 self.txn_manager.begin_with_id(txn_id)?;
@@ -869,10 +871,11 @@ mod tests {
         e.execute_text(2, "BEGIN").unwrap();
         e.execute_text(2, "ROLLBACK").unwrap();
         e.execute_text(3, "GET missing").unwrap();
+        e.execute_text(4, "FLUSH").unwrap();
 
         assert_eq!(e.active_txn_count(), 0);
-        assert_eq!(e.metrics().fallback_total, 5);
-        assert_eq!(e.metrics().fallback_for(FallbackReason::NotGpuEligible), 5);
+        assert_eq!(e.metrics().fallback_total, 6);
+        assert_eq!(e.metrics().fallback_for(FallbackReason::NotGpuEligible), 6);
         assert_eq!(
             e.metrics().last_fallback_reason(),
             Some(FallbackReason::NotGpuEligible)
@@ -890,10 +893,11 @@ mod tests {
         e.enqueue_set_text(2, "BEGIN", t0).unwrap();
         e.enqueue_set_text(2, "ROLLBACK", t0).unwrap();
         e.enqueue_set_text(3, "GET missing", t0).unwrap();
+        e.enqueue_set_text(4, "FLUSH", t0).unwrap();
 
         assert_eq!(e.active_txn_count(), 0);
-        assert_eq!(e.metrics().fallback_total, 5);
-        assert_eq!(e.metrics().fallback_for(FallbackReason::NotGpuEligible), 5);
+        assert_eq!(e.metrics().fallback_total, 6);
+        assert_eq!(e.metrics().fallback_for(FallbackReason::NotGpuEligible), 6);
         assert_eq!(e.pending_batch_len(), 0);
         assert_eq!(e.metrics().commits_total, 0);
     }
