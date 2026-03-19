@@ -24,6 +24,7 @@ cargo test --all-features
 - `BEGIN|COMMIT|ROLLBACK` also accept `WORK` and `TRANSACTION` aliases.
 - `END` maps to `COMMIT`; `ABORT` maps to `ROLLBACK`.
 - `START TRANSACTION` and `START WORK` map to `BEGIN` (without transaction mode modifiers).
+- `FLUSH` is an admin/coordination command and is tracked as a CPU fallback metric event.
 
 ## Safety invariant
 
