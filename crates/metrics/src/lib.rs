@@ -8,7 +8,7 @@ pub enum FallbackReason {
     GpuMemoryPressure,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct GpuParityIssue {
     pub id: &'static str,
     pub owner: &'static str,
@@ -110,6 +110,16 @@ impl RuntimeMetrics {
             .get(&reason)
             .copied()
             .unwrap_or(0)
+    }
+
+    pub fn fallback_counts_by_gpu_parity_issue(&self) -> BTreeMap<GpuParityIssue, u64> {
+        let mut counts = BTreeMap::new();
+        for (reason, count) in &self.fallback_by_reason {
+            if let Some(issue) = reason.gpu_parity_issue() {
+                *counts.entry(issue).or_insert(0) += *count;
+            }
+        }
+        counts
     }
 
     pub fn last_fallback_reason(&self) -> Option<FallbackReason> {
@@ -248,5 +258,34 @@ mod tests {
             .gpu_parity_issue()
             .expect("gpu memory pressure should map to a parity issue");
         assert_eq!(memory.id, "GPU-122");
+    }
+
+    #[test]
+    fn fallback_counts_can_be_aggregated_by_parity_issue() {
+        let mut m = RuntimeMetrics::default();
+        m.inc_fallback(FallbackReason::NotGpuEligible);
+        m.inc_fallback(FallbackReason::GpuUnavailable);
+        m.inc_fallback(FallbackReason::GpuUnavailable);
+        m.inc_fallback(FallbackReason::GpuQueueSaturated);
+
+        let by_issue = m.fallback_counts_by_gpu_parity_issue();
+        assert_eq!(by_issue.len(), 2);
+
+        assert_eq!(
+            by_issue.get(&GpuParityIssue {
+                id: "GPU-120",
+                owner: "runtime",
+                milestone: "m0-bootstrap"
+            }),
+            Some(&2)
+        );
+        assert_eq!(
+            by_issue.get(&GpuParityIssue {
+                id: "GPU-121",
+                owner: "runtime",
+                milestone: "m0-bootstrap"
+            }),
+            Some(&1)
+        );
     }
 }
