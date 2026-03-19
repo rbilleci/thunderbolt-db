@@ -54,7 +54,7 @@ pub fn parse_command(input: &str) -> Result<Command, ParseError> {
             };
             let key = k.trim();
             let value = v.trim();
-            if key.is_empty() {
+            if key.is_empty() || key.chars().any(char::is_whitespace) {
                 return Err(ParseError::InvalidSet);
             }
             return Ok(Command::SetKv {
@@ -119,6 +119,14 @@ mod tests {
                 value: "42".into()
             }
         );
+    }
+
+    #[test]
+    fn rejects_set_with_whitespace_in_key() {
+        assert!(matches!(
+            parse_command("SET two words=42"),
+            Err(ParseError::InvalidSet)
+        ));
     }
 
     #[test]
