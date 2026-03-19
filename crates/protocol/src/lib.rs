@@ -112,8 +112,64 @@ fn is_begin_mode_suffix(tokens: &[&str]) -> bool {
         || is_deferrable_suffix(tokens)
 }
 
+fn normalize_begin_tokens(input: &str) -> Vec<String> {
+    let mut normalized = String::with_capacity(input.len() + 8);
+    for ch in input.chars() {
+        if ch == ',' {
+            normalized.push(' ');
+            normalized.push(',');
+            normalized.push(' ');
+        } else {
+            normalized.push(ch);
+        }
+    }
+    normalized.split_whitespace().map(str::to_owned).collect()
+}
+
+fn is_begin_mode_list(tokens: &[String]) -> bool {
+    if tokens.is_empty() {
+        return false;
+    }
+
+    let mut idx = 0;
+    while idx < tokens.len() {
+        if tokens[idx] == "," {
+            return false;
+        }
+
+        let remaining = &tokens[idx..];
+        let remaining_refs: Vec<_> = remaining.iter().map(String::as_str).collect();
+        let consumed =
+            if remaining_refs.len() >= 4 && is_isolation_level_suffix(&remaining_refs[..4]) {
+                4
+            } else if remaining_refs.len() >= 3 && is_isolation_level_suffix(&remaining_refs[..3]) {
+                3
+            } else if remaining_refs.len() >= 2 && is_begin_mode_suffix(&remaining_refs[..2]) {
+                2
+            } else if is_begin_mode_suffix(&remaining_refs[..1]) {
+                1
+            } else {
+                return false;
+            };
+
+        idx += consumed;
+        if idx == tokens.len() {
+            return true;
+        }
+        if tokens[idx] != "," {
+            return false;
+        }
+        idx += 1;
+        if idx == tokens.len() {
+            return false;
+        }
+    }
+
+    true
+}
+
 fn is_begin_with_optional_mode(input: &str) -> bool {
-    let tokens: Vec<_> = input.split_whitespace().collect();
+    let tokens = normalize_begin_tokens(input);
     let Some((first, rest)) = tokens.split_first() else {
         return false;
     };
@@ -123,12 +179,12 @@ fn is_begin_with_optional_mode(input: &str) -> bool {
             [] => true,
             [second] if second.eq_ignore_ascii_case("TRANSACTION") => true,
             [second] if second.eq_ignore_ascii_case("WORK") => true,
-            mode if is_begin_mode_suffix(mode) => true,
+            mode if is_begin_mode_list(mode) => true,
             [second, mode @ ..]
                 if second.eq_ignore_ascii_case("TRANSACTION")
                     || second.eq_ignore_ascii_case("WORK") =>
             {
-                is_begin_mode_suffix(mode)
+                is_begin_mode_list(mode)
             }
             _ => false,
         };
@@ -142,7 +198,7 @@ fn is_begin_with_optional_mode(input: &str) -> bool {
                 if second.eq_ignore_ascii_case("TRANSACTION")
                     || second.eq_ignore_ascii_case("WORK") =>
             {
-                is_begin_mode_suffix(mode)
+                is_begin_mode_list(mode)
             }
             _ => false,
         };
@@ -319,6 +375,14 @@ mod tests {
             parse_command("BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE").unwrap(),
             Command::Begin
         );
+        assert_eq!(
+            parse_command("BEGIN READ WRITE, ISOLATION LEVEL SERIALIZABLE").unwrap(),
+            Command::Begin
+        );
+        assert_eq!(
+            parse_command("BEGIN READ ONLY , DEFERRABLE").unwrap(),
+            Command::Begin
+        );
         assert_eq!(parse_command("START TRANSACTION").unwrap(), Command::Begin);
         assert_eq!(
             parse_command("START TRANSACTION READ ONLY").unwrap(),
@@ -393,6 +457,14 @@ mod tests {
         ));
         assert!(matches!(
             parse_command("BEGIN NOT"),
+            Err(ParseError::Unsupported(_))
+        ));
+        assert!(matches!(
+            parse_command("BEGIN READ ONLY, "),
+            Err(ParseError::Unsupported(_))
+        ));
+        assert!(matches!(
+            parse_command("BEGIN , READ ONLY"),
             Err(ParseError::Unsupported(_))
         ));
         assert!(matches!(
