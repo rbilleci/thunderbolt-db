@@ -14,6 +14,7 @@
 - Refined batching tick semantics so follower background ticks are a no-op when the queue is empty, while still surfacing `NotLeader` if queued mutations would have flushed.
 - Added Raft ack-map pruning after commit advancement so committed indices are dropped from in-memory quorum tracking, plus regression tests proving committed entries are evicted while pending entries remain.
 - Added engine-level snapshot hooks (`export_snapshot_meta`, `install_snapshot`, `snapshot_meta`) and regression coverage proving snapshot install advances commit/apply/visibility watermarks without breaking WAL-before-visibility behavior for subsequent commits.
+- Added engine candidate-role transition surface plus regression tests confirming candidate mode rejects direct and batched mutations with no WAL/visibility/queue side effects.
 
 ## 2026-03-18
 

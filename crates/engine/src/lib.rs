@@ -101,6 +101,10 @@ impl Engine {
         self.repl.become_leader(term);
     }
 
+    pub fn become_candidate(&mut self, term: Term) {
+        self.repl.become_candidate(term);
+    }
+
     pub fn commit_mutation(
         &mut self,
         txn_id: u64,
@@ -589,6 +593,27 @@ mod tests {
         assert_eq!(e.metrics().batch_flushes_for(BatchFlushReason::Count), 0);
         assert_eq!(e.metrics().last_batch_flush_reason(), None);
         assert_eq!(e.metrics().commits_total, 0);
+    }
+
+    #[test]
+    fn candidate_rejects_commit_and_batched_enqueue() {
+        let mut e = Engine::with_batching(2, Duration::from_secs(999));
+        e.become_candidate(2);
+
+        let commit_err = e.commit_mutation(1, b"SET a=1".to_vec()).unwrap_err();
+        assert!(matches!(commit_err, EngineError::NotLeader));
+
+        let enqueue_err = e
+            .enqueue_set_text(1, "SET a=1", Instant::now())
+            .unwrap_err();
+        assert!(matches!(
+            enqueue_err,
+            ExecuteError::Engine(EngineError::NotLeader)
+        ));
+
+        assert_eq!(e.pending_batch_len(), 0);
+        assert_eq!(e.metrics().commits_total, 0);
+        assert_eq!(e.visible_up_to(), 0);
     }
 
     #[test]
