@@ -57,10 +57,10 @@ pub fn parse_command(input: &str) -> Result<Command, ParseError> {
     if is_transaction_control(s, "BEGIN") {
         return Ok(Command::Begin);
     }
-    if is_transaction_control(s, "COMMIT") {
+    if is_transaction_control(s, "COMMIT") || is_transaction_control(s, "END") {
         return Ok(Command::Commit);
     }
-    if is_transaction_control(s, "ROLLBACK") {
+    if is_transaction_control(s, "ROLLBACK") || is_transaction_control(s, "ABORT") {
         return Ok(Command::Rollback);
     }
     if s.eq_ignore_ascii_case("FLUSH") {
@@ -163,7 +163,9 @@ mod tests {
     fn parses_transaction_control_commands_case_insensitively() {
         assert_eq!(parse_command("begin").unwrap(), Command::Begin);
         assert_eq!(parse_command("COMMIT").unwrap(), Command::Commit);
+        assert_eq!(parse_command("END").unwrap(), Command::Commit);
         assert_eq!(parse_command("rOlLbAcK").unwrap(), Command::Rollback);
+        assert_eq!(parse_command("abort").unwrap(), Command::Rollback);
     }
 
     #[test]
@@ -175,9 +177,16 @@ mod tests {
             parse_command("COMMIT TRANSACTION").unwrap(),
             Command::Commit
         );
+        assert_eq!(parse_command("END WORK").unwrap(), Command::Commit);
+        assert_eq!(parse_command("END TRANSACTION").unwrap(), Command::Commit);
         assert_eq!(parse_command("ROLLBACK WORK").unwrap(), Command::Rollback);
         assert_eq!(
             parse_command("ROLLBACK TRANSACTION").unwrap(),
+            Command::Rollback
+        );
+        assert_eq!(parse_command("ABORT WORK").unwrap(), Command::Rollback);
+        assert_eq!(
+            parse_command("ABORT TRANSACTION").unwrap(),
             Command::Rollback
         );
     }
@@ -193,7 +202,15 @@ mod tests {
             Err(ParseError::Unsupported(_))
         ));
         assert!(matches!(
+            parse_command("END WORK PLEASE"),
+            Err(ParseError::Unsupported(_))
+        ));
+        assert!(matches!(
             parse_command("ROLLBACK TRANSACTION AGAIN"),
+            Err(ParseError::Unsupported(_))
+        ));
+        assert!(matches!(
+            parse_command("ABORT TRANSACTION AGAIN"),
             Err(ParseError::Unsupported(_))
         ));
     }
