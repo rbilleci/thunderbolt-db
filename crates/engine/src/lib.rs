@@ -309,6 +309,9 @@ impl Engine {
         match cmd {
             Command::GetKv { key } => {
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
+                if let Some(len) = self.sm.kv.get(&key).map(|v| v.len()) {
+                    self.metrics.observe_d2h_bytes(len as u64);
+                }
                 Ok(self.get(&key))
             }
             _ => Ok(None),
@@ -447,10 +450,21 @@ mod tests {
         assert_eq!(e.metrics().commits_total, 1);
         assert_eq!(e.metrics().fallback_total, 1);
         assert_eq!(e.metrics().fallback_for(FallbackReason::NotGpuEligible), 1);
+        assert_eq!(e.metrics().d2h_bytes_total, "100".len() as u64);
         assert_eq!(
             e.metrics().last_fallback_reason(),
             Some(FallbackReason::NotGpuEligible)
         );
+    }
+
+    #[test]
+    fn execute_read_text_get_missing_key_does_not_track_d2h_bytes() {
+        let mut e = Engine::new_local();
+        let value = e.execute_read_text("GET absent").unwrap();
+
+        assert_eq!(value, None);
+        assert_eq!(e.metrics().fallback_total, 1);
+        assert_eq!(e.metrics().d2h_bytes_total, 0);
     }
 
     #[test]
