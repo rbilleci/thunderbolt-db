@@ -311,6 +311,10 @@ impl Engine {
 
         match cmd {
             Command::GetKv { key } => {
+                if self.repl.role() != Role::Leader {
+                    return Err(ExecuteError::Engine(EngineError::NotLeader));
+                }
+
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
                 if let Some(len) = self.sm.kv.get(&key).map(|v| v.len()) {
                     self.metrics.observe_d2h_bytes(len as u64);
@@ -504,6 +508,32 @@ mod tests {
 
         assert_eq!(e.metrics().fallback_total, 0);
         assert_eq!(e.metrics().commits_total, 0);
+    }
+
+    #[test]
+    fn execute_read_text_rejects_get_when_not_leader() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET balance=100").unwrap();
+        e.become_follower(2);
+
+        let err = e.execute_read_text("GET balance").unwrap_err();
+
+        assert!(matches!(err, ExecuteError::Engine(EngineError::NotLeader)));
+        assert_eq!(e.metrics().fallback_total, 0);
+        assert_eq!(e.metrics().d2h_bytes_total, 0);
+    }
+
+    #[test]
+    fn execute_read_text_rejects_get_when_candidate() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET balance=100").unwrap();
+        e.become_candidate(2);
+
+        let err = e.execute_read_text("GET balance").unwrap_err();
+
+        assert!(matches!(err, ExecuteError::Engine(EngineError::NotLeader)));
+        assert_eq!(e.metrics().fallback_total, 0);
+        assert_eq!(e.metrics().d2h_bytes_total, 0);
     }
 
     #[test]

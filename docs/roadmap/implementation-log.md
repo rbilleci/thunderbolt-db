@@ -3,6 +3,7 @@
 ## 2026-03-19
 
 ### Completed
+- Added role-aware read gating in `Engine::execute_read_text`: `GET` now returns `EngineError::NotLeader` when node role is follower/candidate, with regression coverage ensuring read fallback/transfer metrics are not emitted on rejected reads.
 - Tightened engine read-path contracts: `execute_read_text` now returns an explicit `NonReadCommand` error for non-`GET` commands instead of silently returning `None`, with regression coverage to prevent accidental mutation/control usage through read-only entry points.
 - Clarified text-protocol delete diagnostics so malformed `DEL`/`DELETE` commands now report `expected: DEL|DELETE key`, matching accepted aliases.
 - Extended SQL transaction-control compatibility by accepting `START WORK` as a `BEGIN` alias in the text protocol parser.
