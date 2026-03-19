@@ -3,6 +3,8 @@
 ## 2026-03-19
 
 ### Completed
+- Hardened `RaftReplicator` leadership transitions by dropping uncommitted log tail + clearing in-flight follower ack maps on `become_follower`/`become_leader`, preventing stale quorum evidence from leaking across term/role changes.
+- Added regression coverage proving post-transition leadership starts from the last committed index and re-proposes new work in a clean epoch.
 - Extended text protocol command coverage with `GET key` parsing/validation (`InvalidGet` on malformed forms) plus regression tests.
 - Added `Engine::execute_read_text` for deterministic read command execution without mutating WAL/visibility state.
 - Added engine regression coverage proving `GET` returns current values and that non-mutation command handling (`BEGIN`/`COMMIT`/`ROLLBACK`/`GET`) increments explicit `NotGpuEligible` fallback metrics consistently for immediate and batched paths.

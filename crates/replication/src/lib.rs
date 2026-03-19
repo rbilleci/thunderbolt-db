@@ -130,11 +130,17 @@ impl RaftReplicator {
     pub fn become_follower(&mut self, term: Term) {
         self.term = self.term.max(term);
         self.role = Role::Follower;
+        self.entries.retain(|e| e.index <= self.commit_index);
+        self.next_index = self.commit_index + 1;
+        self.ack_counts.clear();
     }
 
     pub fn become_leader(&mut self, term: Term) {
         self.term = self.term.max(term);
         self.role = Role::Leader;
+        self.entries.retain(|e| e.index <= self.commit_index);
+        self.next_index = self.commit_index + 1;
+        self.ack_counts.clear();
     }
 
     pub fn voter_count(&self) -> usize {
@@ -446,5 +452,27 @@ mod tests {
         r.register_follower_ack(2);
 
         assert_eq!(r.commit_index(), 0);
+    }
+
+    #[test]
+    fn raft_role_change_discards_uncommitted_tail() {
+        let mut r = RaftReplicator::new(3);
+        r.become_leader(1);
+
+        let t1 = r.propose(vec![1]).unwrap();
+        r.register_follower_ack(t1.index);
+        assert_eq!(r.commit_index(), t1.index);
+
+        let _t2_uncommitted = r.propose(vec![2]).unwrap();
+        assert_eq!(r.commit_index(), t1.index);
+
+        r.become_follower(2);
+        r.become_leader(3);
+
+        let t2_new_epoch = r.propose(vec![3]).unwrap();
+        assert_eq!(t2_new_epoch.index, t1.index + 1);
+
+        r.register_follower_ack(t2_new_epoch.index);
+        assert_eq!(r.commit_index(), t2_new_epoch.index);
     }
 }
