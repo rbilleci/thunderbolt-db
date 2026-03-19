@@ -55,6 +55,7 @@ fn is_transaction_control(input: &str, keyword: &str) -> bool {
     if keyword.eq_ignore_ascii_case("COMMIT")
         || keyword.eq_ignore_ascii_case("ROLLBACK")
         || keyword.eq_ignore_ascii_case("ABORT")
+        || keyword.eq_ignore_ascii_case("END")
     {
         if let Some((scope, tail)) = rest.split_first() {
             if scope.eq_ignore_ascii_case("TRANSACTION") || scope.eq_ignore_ascii_case("WORK") {
@@ -443,6 +444,16 @@ mod tests {
         );
         assert_eq!(parse_command("END WORK").unwrap(), Command::Commit);
         assert_eq!(parse_command("END TRANSACTION").unwrap(), Command::Commit);
+        assert_eq!(parse_command("END AND CHAIN").unwrap(), Command::Commit);
+        assert_eq!(parse_command("END AND NO CHAIN").unwrap(), Command::Commit);
+        assert_eq!(
+            parse_command("END TRANSACTION AND CHAIN").unwrap(),
+            Command::Commit
+        );
+        assert_eq!(
+            parse_command("END WORK AND NO CHAIN").unwrap(),
+            Command::Commit
+        );
         assert_eq!(parse_command("ROLLBACK WORK").unwrap(), Command::Rollback);
         assert_eq!(
             parse_command("ROLLBACK TRANSACTION").unwrap(),
@@ -552,6 +563,14 @@ mod tests {
         ));
         assert!(matches!(
             parse_command("END WORK PLEASE"),
+            Err(ParseError::Unsupported(_))
+        ));
+        assert!(matches!(
+            parse_command("END AND"),
+            Err(ParseError::Unsupported(_))
+        ));
+        assert!(matches!(
+            parse_command("END WORK AND"),
             Err(ParseError::Unsupported(_))
         ));
         assert!(matches!(
