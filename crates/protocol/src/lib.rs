@@ -57,14 +57,54 @@ fn is_transaction_control(input: &str, keyword: &str) -> bool {
     }
 }
 
-fn is_start_begin_alias(input: &str) -> bool {
-    let mut tokens = input.split_whitespace();
+fn is_begin_mode_suffix(tokens: &[&str]) -> bool {
     matches!(
-        (tokens.next(), tokens.next(), tokens.next()),
-        (Some(first), Some(second), None)
-            if first.eq_ignore_ascii_case("START")
-                && (second.eq_ignore_ascii_case("TRANSACTION") || second.eq_ignore_ascii_case("WORK"))
+        tokens,
+        [read, only]
+            if read.eq_ignore_ascii_case("READ") && only.eq_ignore_ascii_case("ONLY")
+    ) || matches!(
+        tokens,
+        [read, write]
+            if read.eq_ignore_ascii_case("READ") && write.eq_ignore_ascii_case("WRITE")
     )
+}
+
+fn is_begin_with_optional_mode(input: &str) -> bool {
+    let tokens: Vec<_> = input.split_whitespace().collect();
+    let Some((first, rest)) = tokens.split_first() else {
+        return false;
+    };
+
+    if first.eq_ignore_ascii_case("BEGIN") {
+        return match rest {
+            [] => true,
+            [second] if second.eq_ignore_ascii_case("TRANSACTION") => true,
+            [second] if second.eq_ignore_ascii_case("WORK") => true,
+            [second, mode @ ..]
+                if second.eq_ignore_ascii_case("TRANSACTION")
+                    || second.eq_ignore_ascii_case("WORK") =>
+            {
+                is_begin_mode_suffix(mode)
+            }
+            _ => false,
+        };
+    }
+
+    if first.eq_ignore_ascii_case("START") {
+        return match rest {
+            [second] if second.eq_ignore_ascii_case("TRANSACTION") => true,
+            [second] if second.eq_ignore_ascii_case("WORK") => true,
+            [second, mode @ ..]
+                if second.eq_ignore_ascii_case("TRANSACTION")
+                    || second.eq_ignore_ascii_case("WORK") =>
+            {
+                is_begin_mode_suffix(mode)
+            }
+            _ => false,
+        };
+    }
+
+    false
 }
 
 pub fn parse_command(input: &str) -> Result<Command, ParseError> {
@@ -82,7 +122,7 @@ pub fn parse_command(input: &str) -> Result<Command, ParseError> {
         return Err(ParseError::Empty);
     }
 
-    if is_transaction_control(s, "BEGIN") || is_start_begin_alias(s) {
+    if is_begin_with_optional_mode(s) {
         return Ok(Command::Begin);
     }
     if is_transaction_control(s, "COMMIT") || is_transaction_control(s, "END") {
@@ -200,8 +240,24 @@ mod tests {
     fn parses_transaction_control_work_and_transaction_aliases() {
         assert_eq!(parse_command("BEGIN WORK").unwrap(), Command::Begin);
         assert_eq!(parse_command("BEGIN TRANSACTION").unwrap(), Command::Begin);
+        assert_eq!(
+            parse_command("BEGIN TRANSACTION READ ONLY").unwrap(),
+            Command::Begin
+        );
+        assert_eq!(
+            parse_command("BEGIN WORK READ WRITE").unwrap(),
+            Command::Begin
+        );
         assert_eq!(parse_command("START TRANSACTION").unwrap(), Command::Begin);
+        assert_eq!(
+            parse_command("START TRANSACTION READ ONLY").unwrap(),
+            Command::Begin
+        );
         assert_eq!(parse_command("START WORK").unwrap(), Command::Begin);
+        assert_eq!(
+            parse_command("START WORK READ WRITE").unwrap(),
+            Command::Begin
+        );
         assert_eq!(parse_command("COMMIT WORK").unwrap(), Command::Commit);
         assert_eq!(
             parse_command("COMMIT TRANSACTION").unwrap(),
@@ -241,7 +297,11 @@ mod tests {
             Err(ParseError::Unsupported(_))
         ));
         assert!(matches!(
-            parse_command("START TRANSACTION READ ONLY"),
+            parse_command("START TRANSACTION READ"),
+            Err(ParseError::Unsupported(_))
+        ));
+        assert!(matches!(
+            parse_command("START TRANSACTION READ COMMITTED"),
             Err(ParseError::Unsupported(_))
         ));
         assert!(matches!(
