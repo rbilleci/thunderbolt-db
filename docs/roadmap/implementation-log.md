@@ -3,6 +3,7 @@
 ## 2026-03-19
 
 ### Completed
+- Added engine regression coverage for transaction-control aliases `END`/`ABORT` with `AND CHAIN` in both immediate and enqueue paths, proving alias parity reopens transaction context identically to `COMMIT`/`ROLLBACK`.
 - Added read-transfer telemetry parity for immediate text execution: `Engine::execute_text` now records D2H bytes for successful `GET` hits (matching `execute_read_text` semantics) while leaving misses unchanged, with regression coverage proving hit-only accounting.
 - Expanded `START WORK` transaction-mode regression coverage to include isolation/deferrable mode lists and duplicate-isolation rejection, guarding parser parity for PostgreSQL-style aliases.
 - Tightened transaction-begin mode parsing so conflicting or duplicate mode classes are rejected (e.g. `READ ONLY` + `READ WRITE`, repeated isolation clauses, mixed `DEFERRABLE`/`NOT DEFERRABLE`), with regression coverage proving unsupported combinations fail fast instead of being silently accepted.
