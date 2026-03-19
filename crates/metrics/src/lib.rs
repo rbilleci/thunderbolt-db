@@ -56,6 +56,8 @@ pub struct RuntimeMetrics {
     pub d2h_bytes_total: u64,
     pub kernel_exec_samples: u64,
     pub kernel_exec_total_ms: u64,
+    pub kernel_occupancy_samples: u64,
+    pub kernel_occupancy_total_permyriad: u64,
     pub pending_batch_peak: usize,
     fallback_by_reason: BTreeMap<FallbackReason, u64>,
     batch_flush_by_reason: BTreeMap<BatchFlushReason, u64>,
@@ -63,6 +65,7 @@ pub struct RuntimeMetrics {
     last_batch_flush_reason: Option<BatchFlushReason>,
     last_batch_wait_ms: Option<u64>,
     last_kernel_exec_ms: Option<u64>,
+    last_kernel_occupancy_permyriad: Option<u16>,
     last_pending_batch_len: Option<usize>,
 }
 
@@ -101,6 +104,14 @@ impl RuntimeMetrics {
         self.kernel_exec_samples += 1;
         self.kernel_exec_total_ms = self.kernel_exec_total_ms.saturating_add(exec_ms);
         self.last_kernel_exec_ms = Some(exec_ms);
+    }
+
+    pub fn observe_kernel_occupancy_permyriad(&mut self, occupancy_permyriad: u16) {
+        self.kernel_occupancy_samples += 1;
+        self.kernel_occupancy_total_permyriad = self
+            .kernel_occupancy_total_permyriad
+            .saturating_add(u64::from(occupancy_permyriad));
+        self.last_kernel_occupancy_permyriad = Some(occupancy_permyriad);
     }
 
     pub fn observe_pending_batch_len(&mut self, len: usize) {
@@ -145,6 +156,10 @@ impl RuntimeMetrics {
         self.last_kernel_exec_ms
     }
 
+    pub fn last_kernel_occupancy_permyriad(&self) -> Option<u16> {
+        self.last_kernel_occupancy_permyriad
+    }
+
     pub fn last_pending_batch_len(&self) -> Option<usize> {
         self.last_pending_batch_len
     }
@@ -161,6 +176,13 @@ impl RuntimeMetrics {
             return None;
         }
         Some(self.kernel_exec_total_ms as f64 / self.kernel_exec_samples as f64)
+    }
+
+    pub fn avg_kernel_occupancy_permyriad(&self) -> Option<f64> {
+        if self.kernel_occupancy_samples == 0 {
+            return None;
+        }
+        Some(self.kernel_occupancy_total_permyriad as f64 / self.kernel_occupancy_samples as f64)
     }
 }
 
@@ -262,6 +284,21 @@ mod tests {
 
         assert_eq!(m.pending_batch_peak, 3);
         assert_eq!(m.last_pending_batch_len(), Some(0));
+    }
+
+    #[test]
+    fn kernel_occupancy_observations_track_totals_latest_and_average() {
+        let mut m = RuntimeMetrics::default();
+        assert_eq!(m.last_kernel_occupancy_permyriad(), None);
+        assert_eq!(m.avg_kernel_occupancy_permyriad(), None);
+
+        m.observe_kernel_occupancy_permyriad(6_250);
+        m.observe_kernel_occupancy_permyriad(7_500);
+
+        assert_eq!(m.kernel_occupancy_samples, 2);
+        assert_eq!(m.kernel_occupancy_total_permyriad, 13_750);
+        assert_eq!(m.last_kernel_occupancy_permyriad(), Some(7_500));
+        assert_eq!(m.avg_kernel_occupancy_permyriad(), Some(6_875.0));
     }
 
     #[test]
