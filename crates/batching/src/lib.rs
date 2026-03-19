@@ -97,6 +97,12 @@ impl<T> DualTriggerBatcher<T> {
     pub fn first_enqueued_at(&self) -> Option<Instant> {
         self.first_enqueued_at
     }
+
+    pub fn time_until_flush_deadline(&self, now: Instant) -> Option<Duration> {
+        let first = self.first_enqueued_at?;
+        let elapsed = now.saturating_duration_since(first);
+        Some(self.max_wait.saturating_sub(elapsed))
+    }
 }
 
 #[cfg(test)]
@@ -161,6 +167,27 @@ mod tests {
         let batch = b.flush_admin().expect("batch should flush");
         let items: Vec<u8> = batch.items.into_iter().map(|it| it.item).collect();
         assert_eq!(items, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn time_until_flush_deadline_counts_down_and_saturates_at_zero() {
+        let mut b = DualTriggerBatcher::new(10, Duration::from_millis(10));
+        let t0 = Instant::now();
+        assert_eq!(b.time_until_flush_deadline(t0), None);
+
+        assert!(b.enqueue(1u8, t0).is_none());
+        assert_eq!(
+            b.time_until_flush_deadline(t0),
+            Some(Duration::from_millis(10))
+        );
+        assert_eq!(
+            b.time_until_flush_deadline(t0 + Duration::from_millis(4)),
+            Some(Duration::from_millis(6))
+        );
+        assert_eq!(
+            b.time_until_flush_deadline(t0 + Duration::from_millis(12)),
+            Some(Duration::ZERO)
+        );
     }
 
     #[test]

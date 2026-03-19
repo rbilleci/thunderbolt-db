@@ -316,6 +316,10 @@ impl Engine {
             .first_enqueued_at()
             .map(|head| now.saturating_duration_since(head))
     }
+
+    pub fn pending_batch_time_until_deadline(&self, now: Instant) -> Option<Duration> {
+        self.batcher.time_until_flush_deadline(now)
+    }
 }
 
 #[cfg(test)]
@@ -417,6 +421,30 @@ mod tests {
         assert_eq!(e.get("a"), Some("9"));
         assert_eq!(e.pending_batch_len(), 0);
         assert_eq!(e.metrics().batch_flushes_for(BatchFlushReason::Admin), 1);
+    }
+
+    #[test]
+    fn pending_batch_deadline_counts_down_and_clears_after_flush() {
+        let mut e = Engine::with_batching(10, Duration::from_millis(10));
+        let t0 = Instant::now();
+
+        assert_eq!(e.pending_batch_time_until_deadline(t0), None);
+
+        e.enqueue_set_text(1, "SET a=9", t0).unwrap();
+        assert_eq!(
+            e.pending_batch_time_until_deadline(t0 + Duration::from_millis(4)),
+            Some(Duration::from_millis(6))
+        );
+        assert_eq!(
+            e.pending_batch_time_until_deadline(t0 + Duration::from_millis(12)),
+            Some(Duration::ZERO)
+        );
+
+        e.flush_admin().unwrap();
+        assert_eq!(
+            e.pending_batch_time_until_deadline(t0 + Duration::from_millis(13)),
+            None
+        );
     }
 
     #[test]
