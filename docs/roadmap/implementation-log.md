@@ -3,6 +3,8 @@
 ## 2026-03-19
 
 ### Completed
+- Extended SQL transaction-control compatibility by accepting `START WORK` as a `BEGIN` alias in the text protocol parser.
+- Hardened protocol regression coverage for `START WORK` with optional statement terminator handling and explicit rejection of unsupported extra-token forms.
 - Exposed snapshot progression in engine replication watermarks by adding `snapshot_id` to `ReplicationWatermarks`, with regression assertions for pre-snapshot, post-commit, and installed-snapshot paths to improve observability around compaction/snapshot boundaries.
 - Added read-path transfer telemetry for `GET`: `Engine::execute_read_text` now records `d2h_bytes_total` from returned values, with regression coverage for hit/miss cases to keep simulated GPU transfer accounting stable before CUDA integration.
 - Optimized `Engine::apply_batch` flush draining to avoid `Vec::remove(0)` quadratic behavior by streaming items via iterator + replay-safe tail requeue on commit failures.
