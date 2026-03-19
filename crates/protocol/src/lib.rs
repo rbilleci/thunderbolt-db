@@ -44,12 +44,13 @@ fn is_transaction_control(input: &str, keyword: &str) -> bool {
     }
 }
 
-fn is_start_transaction(input: &str) -> bool {
+fn is_start_begin_alias(input: &str) -> bool {
     let mut tokens = input.split_whitespace();
     matches!(
         (tokens.next(), tokens.next(), tokens.next()),
         (Some(first), Some(second), None)
-            if first.eq_ignore_ascii_case("START") && second.eq_ignore_ascii_case("TRANSACTION")
+            if first.eq_ignore_ascii_case("START")
+                && (second.eq_ignore_ascii_case("TRANSACTION") || second.eq_ignore_ascii_case("WORK"))
     )
 }
 
@@ -63,7 +64,7 @@ pub fn parse_command(input: &str) -> Result<Command, ParseError> {
         return Err(ParseError::Empty);
     }
 
-    if is_transaction_control(s, "BEGIN") || is_start_transaction(s) {
+    if is_transaction_control(s, "BEGIN") || is_start_begin_alias(s) {
         return Ok(Command::Begin);
     }
     if is_transaction_control(s, "COMMIT") || is_transaction_control(s, "END") {
@@ -182,6 +183,7 @@ mod tests {
         assert_eq!(parse_command("BEGIN WORK").unwrap(), Command::Begin);
         assert_eq!(parse_command("BEGIN TRANSACTION").unwrap(), Command::Begin);
         assert_eq!(parse_command("START TRANSACTION").unwrap(), Command::Begin);
+        assert_eq!(parse_command("START WORK").unwrap(), Command::Begin);
         assert_eq!(parse_command("COMMIT WORK").unwrap(), Command::Commit);
         assert_eq!(
             parse_command("COMMIT TRANSACTION").unwrap(),
