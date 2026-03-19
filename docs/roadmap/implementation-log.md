@@ -3,6 +3,7 @@
 ## 2026-03-19
 
 ### Completed
+- Hardened role-aware read command handling across mixed execution entry points: `execute_text` and `enqueue_set_text` now reject `GET` when role is follower/candidate (matching `execute_read_text` leadership gates), with regression coverage confirming no fallback/queue side effects on rejected reads.
 - Extended text-protocol transaction compatibility so `BEGIN READ ONLY` and `BEGIN READ WRITE` are accepted directly (without requiring `WORK`/`TRANSACTION`), with negative coverage for unsupported partial/isolation-style suffixes.
 - Added raft regression coverage proving `install_snapshot` prunes ack-tracking and compacted entries at/under the installed snapshot boundary while preserving newer pending entries.
 - Added role-aware read gating in `Engine::execute_read_text`: `GET` now returns `EngineError::NotLeader` when node role is follower/candidate, with regression coverage ensuring read fallback/transfer metrics are not emitted on rejected reads.
