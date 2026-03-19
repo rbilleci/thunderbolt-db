@@ -594,6 +594,28 @@ mod tests {
     }
 
     #[test]
+    fn pending_batch_can_be_flushed_after_follower_is_promoted_back_to_leader() {
+        let mut e = Engine::with_batching(10, Duration::from_secs(60));
+        let t0 = Instant::now();
+
+        e.enqueue_set_text(1, "SET a=1", t0).unwrap();
+        e.become_follower(2);
+
+        let tick_err = e.tick_batching(t0 + Duration::from_secs(1)).unwrap_err();
+        assert!(matches!(tick_err, EngineError::NotLeader));
+        assert_eq!(e.pending_batch_len(), 1);
+        assert_eq!(e.get("a"), None);
+
+        e.become_leader(3);
+        e.flush_admin().unwrap();
+
+        assert_eq!(e.pending_batch_len(), 0);
+        assert_eq!(e.get("a"), Some("1"));
+        assert_eq!(e.metrics().batch_flushes_for(BatchFlushReason::Admin), 1);
+        assert_eq!(e.metrics().commits_total, 1);
+    }
+
+    #[test]
     fn execute_text_non_mutations_count_as_not_gpu_eligible_fallbacks() {
         let mut e = Engine::new_local();
 
