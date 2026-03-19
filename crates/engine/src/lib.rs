@@ -475,10 +475,13 @@ mod tests {
     #[test]
     fn admin_flush_without_pending_queue_is_noop() {
         let mut e = Engine::with_batching(10, Duration::from_secs(60));
+        let t0 = Instant::now();
 
         e.flush_admin().unwrap();
 
         assert_eq!(e.pending_batch_len(), 0);
+        assert_eq!(e.pending_batch_oldest_age(t0), None);
+        assert_eq!(e.pending_batch_time_until_deadline(t0), None);
         assert_eq!(e.metrics().batch_flush_count, 0);
         assert_eq!(e.metrics().batch_flushes_for(BatchFlushReason::Admin), 0);
         assert_eq!(e.metrics().last_batch_flush_reason(), None);
