@@ -218,13 +218,22 @@ impl Engine {
             FlushReason::Time => BatchFlushReason::Time,
             FlushReason::Admin => BatchFlushReason::Admin,
         };
-        for p in items {
+
+        let mut remaining: Vec<BatchItem<PendingMutation>> = items.collect();
+        while let Some(p) = remaining.first().cloned() {
             let wait = flushed_at
                 .saturating_duration_since(p.enqueued_at)
                 .as_millis() as u64;
+
+            if let Err(err) = self.commit_mutation(p.item.txn_id, p.item.payload) {
+                self.batcher.requeue_front(remaining);
+                return Err(err);
+            }
+
             self.metrics.observe_batch_wait_ms(wait);
-            self.commit_mutation(p.item.txn_id, p.item.payload)?;
+            remaining.remove(0);
         }
+
         self.metrics.inc_batch_flush(metric_reason);
         Ok(())
     }
@@ -525,6 +534,34 @@ mod tests {
         assert_eq!(e.metrics().last_batch_flush_reason(), None);
         assert_eq!(e.metrics().commits_total, 0);
         assert_eq!(e.pending_batch_len(), 1);
+    }
+
+    #[test]
+    fn batch_flush_wal_failure_requeues_items_for_retry() {
+        let mut e = Engine::with_batching(2, Duration::from_secs(60));
+        let t0 = Instant::now();
+
+        e.enqueue_set_text(1, "SET a=1", t0).unwrap();
+        e.simulate_next_wal_flush_failure();
+        let err = e
+            .enqueue_set_text(2, "SET b=2", t0 + Duration::from_millis(1))
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ExecuteError::Engine(EngineError::Durability(_))
+        ));
+        assert_eq!(e.pending_batch_len(), 2);
+        assert_eq!(e.metrics().batch_flush_count, 0);
+        assert_eq!(e.metrics().batch_wait_samples, 0);
+        assert_eq!(e.metrics().commits_total, 0);
+
+        e.flush_admin().unwrap();
+        assert_eq!(e.pending_batch_len(), 0);
+        assert_eq!(e.get("a"), Some("1"));
+        assert_eq!(e.get("b"), Some("2"));
+        assert_eq!(e.metrics().batch_flushes_for(BatchFlushReason::Admin), 1);
+        assert_eq!(e.metrics().commits_total, 2);
     }
 
     #[test]

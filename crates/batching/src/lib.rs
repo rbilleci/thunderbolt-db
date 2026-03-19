@@ -66,6 +66,17 @@ impl<T> DualTriggerBatcher<T> {
         self.flush(FlushReason::Admin)
     }
 
+    pub fn requeue_front(&mut self, mut items: Vec<BatchItem<T>>) {
+        if items.is_empty() {
+            return;
+        }
+
+        let existing = std::mem::take(&mut self.queue);
+        items.extend(existing);
+        self.first_enqueued_at = items.first().map(|i| i.enqueued_at);
+        self.queue = items;
+    }
+
     fn flush(&mut self, reason: FlushReason) -> Option<Batch<T>> {
         if self.queue.is_empty() {
             return None;
@@ -125,6 +136,31 @@ mod tests {
 
         let _ = b.enqueue(2u8, t1).expect("must flush on count");
         assert_eq!(b.first_enqueued_at(), None);
+    }
+
+    #[test]
+    fn requeue_front_prepends_items_and_tracks_oldest_enqueue_time() {
+        let mut b = DualTriggerBatcher::new(10, Duration::from_secs(1));
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(1);
+        let t2 = t0 + Duration::from_millis(2);
+
+        assert!(b.enqueue(3u8, t2).is_none());
+        b.requeue_front(vec![
+            BatchItem {
+                item: 1u8,
+                enqueued_at: t0,
+            },
+            BatchItem {
+                item: 2u8,
+                enqueued_at: t1,
+            },
+        ]);
+
+        assert_eq!(b.first_enqueued_at(), Some(t0));
+        let batch = b.flush_admin().expect("batch should flush");
+        let items: Vec<u8> = batch.items.into_iter().map(|it| it.item).collect();
+        assert_eq!(items, vec![1, 2, 3]);
     }
 
     #[test]
