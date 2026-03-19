@@ -1059,6 +1059,41 @@ mod tests {
     }
 
     #[test]
+    fn transaction_control_alias_chain_forms_reopen_transaction_context() {
+        let mut e = Engine::new_local();
+
+        e.execute_text(61, "BEGIN").unwrap();
+        e.execute_text(61, "END AND CHAIN").unwrap();
+        assert_eq!(e.active_txn_count(), 1);
+        e.execute_text(62, "END").unwrap();
+        assert_eq!(e.active_txn_count(), 0);
+
+        e.execute_text(71, "BEGIN").unwrap();
+        e.execute_text(71, "ABORT AND CHAIN").unwrap();
+        assert_eq!(e.active_txn_count(), 1);
+        e.execute_text(72, "ABORT").unwrap();
+        assert_eq!(e.active_txn_count(), 0);
+    }
+
+    #[test]
+    fn enqueue_transaction_control_alias_chain_forms_reopen_transaction_context() {
+        let mut e = Engine::new_local();
+        let t0 = Instant::now();
+
+        e.enqueue_set_text(81, "BEGIN", t0).unwrap();
+        e.enqueue_set_text(81, "END AND CHAIN", t0).unwrap();
+        assert_eq!(e.active_txn_count(), 1);
+        e.enqueue_set_text(82, "END", t0).unwrap();
+        assert_eq!(e.active_txn_count(), 0);
+
+        e.enqueue_set_text(91, "BEGIN", t0).unwrap();
+        e.enqueue_set_text(91, "ABORT AND CHAIN", t0).unwrap();
+        assert_eq!(e.active_txn_count(), 1);
+        e.enqueue_set_text(92, "ABORT", t0).unwrap();
+        assert_eq!(e.active_txn_count(), 0);
+    }
+
+    #[test]
     fn commit_and_chain_propagates_txn_id_exhaustion() {
         let mut e = Engine::new_local();
 
