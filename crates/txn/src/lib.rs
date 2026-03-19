@@ -20,6 +20,7 @@ pub enum TxnError {
     NotFound(TxnId),
     NotActive(TxnId),
     AlreadyExists(TxnId),
+    IdExhausted,
 }
 
 impl std::fmt::Display for TxnError {
@@ -28,6 +29,7 @@ impl std::fmt::Display for TxnError {
             Self::NotFound(id) => write!(f, "transaction {id} not found"),
             Self::NotActive(id) => write!(f, "transaction {id} is not active"),
             Self::AlreadyExists(id) => write!(f, "transaction {id} already exists"),
+            Self::IdExhausted => write!(f, "transaction id space exhausted"),
         }
     }
 }
@@ -41,14 +43,16 @@ pub struct TxnManager {
 }
 
 impl TxnManager {
-    pub fn begin(&mut self) -> Txn {
-        self.next_id += 1;
-        let id = self.next_id;
+    pub fn begin(&mut self) -> Result<Txn, TxnError> {
+        let Some(id) = self.next_id.checked_add(1) else {
+            return Err(TxnError::IdExhausted);
+        };
+        self.next_id = id;
         self.states.insert(id, TxnState::Active);
-        Txn {
+        Ok(Txn {
             id,
             state: TxnState::Active,
-        }
+        })
     }
 
     pub fn begin_with_id(&mut self, id: TxnId) -> Result<Txn, TxnError> {
@@ -102,8 +106,8 @@ mod tests {
     fn begin_assigns_monotonic_ids_and_tracks_active() {
         let mut tm = TxnManager::default();
 
-        let a = tm.begin();
-        let b = tm.begin();
+        let a = tm.begin().unwrap();
+        let b = tm.begin().unwrap();
 
         assert_eq!(a.id, 1);
         assert_eq!(b.id, 2);
@@ -115,7 +119,7 @@ mod tests {
     #[test]
     fn commit_transitions_to_terminal_and_decrements_active() {
         let mut tm = TxnManager::default();
-        let t = tm.begin();
+        let t = tm.begin().unwrap();
 
         let committed = tm.commit(t.id).unwrap();
 
@@ -127,7 +131,7 @@ mod tests {
     #[test]
     fn rollback_transitions_to_terminal_and_decrements_active() {
         let mut tm = TxnManager::default();
-        let t = tm.begin();
+        let t = tm.begin().unwrap();
 
         let rolled_back = tm.rollback(t.id).unwrap();
 
@@ -141,7 +145,7 @@ mod tests {
         let mut tm = TxnManager::default();
         assert_eq!(tm.commit(99), Err(TxnError::NotFound(99)));
 
-        let t = tm.begin();
+        let t = tm.begin().unwrap();
         tm.commit(t.id).unwrap();
 
         assert_eq!(tm.commit(t.id), Err(TxnError::NotActive(t.id)));
@@ -156,7 +160,7 @@ mod tests {
         assert_eq!(opened.id, 42);
         assert_eq!(tm.state(42), Some(TxnState::Active));
 
-        let next = tm.begin();
+        let next = tm.begin().unwrap();
         assert_eq!(next.id, 43);
     }
 
@@ -176,5 +180,14 @@ mod tests {
         tm.commit(9).unwrap();
 
         assert_eq!(tm.begin_with_id(9), Err(TxnError::AlreadyExists(9)));
+    }
+
+    #[test]
+    fn begin_reports_exhaustion_after_u64_max_floor() {
+        let mut tm = TxnManager::default();
+        tm.begin_with_id(u64::MAX).unwrap();
+        tm.commit(u64::MAX).unwrap();
+
+        assert_eq!(tm.begin(), Err(TxnError::IdExhausted));
     }
 }

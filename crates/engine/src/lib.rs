@@ -200,14 +200,14 @@ impl Engine {
             Command::Commit { chain } => {
                 self.txn_manager.commit(txn_id)?;
                 if chain {
-                    let _ = self.txn_manager.begin();
+                    self.txn_manager.begin()?;
                 }
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
             Command::Rollback { chain } => {
                 self.txn_manager.rollback(txn_id)?;
                 if chain {
-                    let _ = self.txn_manager.begin();
+                    self.txn_manager.begin()?;
                 }
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
@@ -312,14 +312,14 @@ impl Engine {
             Command::Commit { chain } => {
                 self.txn_manager.commit(txn_id)?;
                 if chain {
-                    let _ = self.txn_manager.begin();
+                    self.txn_manager.begin()?;
                 }
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
             Command::Rollback { chain } => {
                 self.txn_manager.rollback(txn_id)?;
                 if chain {
-                    let _ = self.txn_manager.begin();
+                    self.txn_manager.begin()?;
                 }
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
@@ -1041,6 +1041,18 @@ mod tests {
         assert_eq!(e.active_txn_count(), 1);
         e.enqueue_set_text(52, "ROLLBACK", t0).unwrap();
         assert_eq!(e.active_txn_count(), 0);
+    }
+
+    #[test]
+    fn commit_and_chain_propagates_txn_id_exhaustion() {
+        let mut e = Engine::new_local();
+
+        e.execute_text(u64::MAX, "BEGIN").unwrap();
+        let err = e.execute_text(u64::MAX, "COMMIT AND CHAIN").unwrap_err();
+
+        assert!(matches!(err, ExecuteError::Txn(TxnError::IdExhausted)));
+        assert_eq!(e.active_txn_count(), 0);
+        assert_eq!(e.metrics().fallback_total, 1);
     }
 
     #[test]
