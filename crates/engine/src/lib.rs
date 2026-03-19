@@ -320,6 +320,10 @@ impl Engine {
     pub fn pending_batch_time_until_deadline(&self, now: Instant) -> Option<Duration> {
         self.batcher.time_until_flush_deadline(now)
     }
+
+    pub fn batching_config(&self) -> (usize, Duration) {
+        (self.batcher.max_items(), self.batcher.max_wait())
+    }
 }
 
 #[cfg(test)]
@@ -421,6 +425,12 @@ mod tests {
         assert_eq!(e.get("a"), Some("9"));
         assert_eq!(e.pending_batch_len(), 0);
         assert_eq!(e.metrics().batch_flushes_for(BatchFlushReason::Admin), 1);
+    }
+
+    #[test]
+    fn batching_config_reflects_engine_settings() {
+        let e = Engine::with_batching(7, Duration::from_millis(42));
+        assert_eq!(e.batching_config(), (7, Duration::from_millis(42)));
     }
 
     #[test]

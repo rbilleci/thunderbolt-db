@@ -98,6 +98,14 @@ impl<T> DualTriggerBatcher<T> {
         self.first_enqueued_at
     }
 
+    pub fn max_items(&self) -> usize {
+        self.max_items
+    }
+
+    pub fn max_wait(&self) -> Duration {
+        self.max_wait
+    }
+
     pub fn time_until_flush_deadline(&self, now: Instant) -> Option<Duration> {
         let first = self.first_enqueued_at?;
         let elapsed = now.saturating_duration_since(first);
@@ -167,6 +175,13 @@ mod tests {
         let batch = b.flush_admin().expect("batch should flush");
         let items: Vec<u8> = batch.items.into_iter().map(|it| it.item).collect();
         assert_eq!(items, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn config_accessors_report_dual_trigger_thresholds() {
+        let b = DualTriggerBatcher::<u8>::new(7, Duration::from_millis(42));
+        assert_eq!(b.max_items(), 7);
+        assert_eq!(b.max_wait(), Duration::from_millis(42));
     }
 
     #[test]
