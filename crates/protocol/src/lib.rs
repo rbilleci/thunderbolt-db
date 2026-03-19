@@ -52,7 +52,10 @@ fn is_transaction_control(input: &str, keyword: &str) -> bool {
         }
     }
 
-    if keyword.eq_ignore_ascii_case("COMMIT") || keyword.eq_ignore_ascii_case("ROLLBACK") {
+    if keyword.eq_ignore_ascii_case("COMMIT")
+        || keyword.eq_ignore_ascii_case("ROLLBACK")
+        || keyword.eq_ignore_ascii_case("ABORT")
+    {
         if let Some((scope, tail)) = rest.split_first() {
             if scope.eq_ignore_ascii_case("TRANSACTION") || scope.eq_ignore_ascii_case("WORK") {
                 rest = tail;
@@ -454,6 +457,19 @@ mod tests {
             parse_command("ABORT TRANSACTION").unwrap(),
             Command::Rollback
         );
+        assert_eq!(parse_command("ABORT AND CHAIN").unwrap(), Command::Rollback);
+        assert_eq!(
+            parse_command("ABORT AND NO CHAIN").unwrap(),
+            Command::Rollback
+        );
+        assert_eq!(
+            parse_command("ABORT TRANSACTION AND CHAIN").unwrap(),
+            Command::Rollback
+        );
+        assert_eq!(
+            parse_command("ABORT WORK AND NO CHAIN").unwrap(),
+            Command::Rollback
+        );
     }
 
     #[test]
@@ -536,6 +552,14 @@ mod tests {
         ));
         assert!(matches!(
             parse_command("ABORT TRANSACTION AGAIN"),
+            Err(ParseError::Unsupported(_))
+        ));
+        assert!(matches!(
+            parse_command("ABORT AND"),
+            Err(ParseError::Unsupported(_))
+        ));
+        assert!(matches!(
+            parse_command("ABORT WORK AND"),
             Err(ParseError::Unsupported(_))
         ));
     }
