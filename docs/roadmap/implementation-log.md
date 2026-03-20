@@ -1,5 +1,11 @@
 # Implementation Log (Pre-NVIDIA Phase)
 
+## 2026-03-20
+
+### Completed
+- Added `RaftReplicator::truncate_uncommitted_from(index_inclusive)` to model follower catch-up conflict repair by dropping only uncommitted tail entries at/after a conflicting index, pruning matching ack-tracking state, and resetting `next_index` to the surviving log tail.
+- Added regression coverage proving truncation drops uncommitted tails safely, preserves committed boundaries, and allows replacement proposals to reuse the truncated index without violating monotonic commit progression.
+
 ## 2026-03-19
 
 ### Completed
