@@ -3,6 +3,8 @@
 ## 2026-03-20
 
 ### Completed
+- Added `RaftReplicator::append_entries_from_leader(prev_log_index, prev_log_term, entries, leader_commit)` to model follower-side append handling with prev-log validation, conflict truncation of uncommitted tails, and safe commit-index advancement bounded by local log availability.
+- Added raft regression coverage for follower append conflict repair, prev-log term mismatch rejection, and committed-entry overwrite protection to preserve monotonic durability/visibility boundaries during catch-up flows.
 - Fixed snapshot metadata term reporting in both `LocalReplicator` and `RaftReplicator` so `snapshot_meta().last_included_term` now stays tied to the last applied index (instead of drifting to the node's current term after leadership/term changes).
 - Added regression coverage proving snapshot metadata preserves the applied-entry term across later term bumps for both local and raft replicators.
 - Added `RaftReplicator::truncate_uncommitted_from(index_inclusive)` to model follower catch-up conflict repair by dropping only uncommitted tail entries at/after a conflicting index, pruning matching ack-tracking state, and resetting `next_index` to the surviving log tail.
