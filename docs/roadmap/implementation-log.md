@@ -3,6 +3,8 @@
 ## 2026-03-20
 
 ### Completed
+- Fixed snapshot metadata term reporting in both `LocalReplicator` and `RaftReplicator` so `snapshot_meta().last_included_term` now stays tied to the last applied index (instead of drifting to the node's current term after leadership/term changes).
+- Added regression coverage proving snapshot metadata preserves the applied-entry term across later term bumps for both local and raft replicators.
 - Added `RaftReplicator::truncate_uncommitted_from(index_inclusive)` to model follower catch-up conflict repair by dropping only uncommitted tail entries at/after a conflicting index, pruning matching ack-tracking state, and resetting `next_index` to the surviving log tail.
 - Added regression coverage proving truncation drops uncommitted tails safely, preserves committed boundaries, and allows replacement proposals to reuse the truncated index without violating monotonic commit progression.
 
