@@ -211,11 +211,14 @@ impl Engine {
                 }
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
-            Command::GetKv { .. } => {
+            Command::GetKv { key } => {
                 if self.repl.role() != Role::Leader {
                     return Err(ExecuteError::Engine(EngineError::NotLeader));
                 }
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
+                if let Some(len) = self.sm.kv.get(&key).map(|v| v.len()) {
+                    self.metrics.observe_d2h_bytes(len as u64);
+                }
             }
         }
         Ok(())
@@ -837,6 +840,21 @@ mod tests {
         assert_eq!(e.pending_batch_len(), 0);
         assert_eq!(e.metrics().fallback_total, 0);
         assert_eq!(e.metrics().commits_total, 0);
+    }
+
+    #[test]
+    fn enqueue_get_tracks_d2h_bytes_for_hits_only() {
+        let mut e = Engine::with_batching(2, Duration::from_secs(999));
+        let t0 = Instant::now();
+
+        e.enqueue_set_text(1, "SET balance=100", t0).unwrap();
+        e.flush_admin().unwrap();
+
+        e.enqueue_set_text(2, "GET balance", t0).unwrap();
+        assert_eq!(e.metrics().d2h_bytes_total, "100".len() as u64);
+
+        e.enqueue_set_text(3, "GET missing", t0).unwrap();
+        assert_eq!(e.metrics().d2h_bytes_total, "100".len() as u64);
     }
 
     #[test]
