@@ -276,6 +276,18 @@ impl RaftReplicator {
             }
         }
 
+        let mut expected_index = prev_log_index + 1;
+        for entry in &entries {
+            if entry.index != expected_index {
+                return Err(EngineError::ProposalFailed(format!(
+                    "append entries must be contiguous from {} but saw {}",
+                    prev_log_index + 1,
+                    entry.index
+                )));
+            }
+            expected_index += 1;
+        }
+
         for incoming in entries {
             if let Some(existing) = self.entries.iter().find(|e| e.index == incoming.index) {
                 if existing.term == incoming.term {
@@ -931,6 +943,66 @@ mod tests {
 
         assert!(matches!(err, EngineError::ProposalFailed(_)));
         assert_eq!(r.commit_index(), t1.index);
+    }
+
+    #[test]
+    fn raft_follower_append_entries_rejects_non_contiguous_batches() {
+        let mut r = RaftReplicator::new(3);
+        r.become_leader(1);
+        let t1 = r.propose(vec![1]).unwrap();
+        r.register_follower_ack(t1.index, 1);
+        r.become_follower(2);
+
+        let err = r
+            .append_entries_from_leader(
+                t1.index,
+                1,
+                vec![
+                    LogEntry {
+                        term: 2,
+                        index: t1.index + 1,
+                        payload: vec![2],
+                    },
+                    LogEntry {
+                        term: 2,
+                        index: t1.index + 3,
+                        payload: vec![3],
+                    },
+                ],
+                t1.index + 3,
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, EngineError::ProposalFailed(_)));
+        assert_eq!(r.commit_index(), t1.index);
+        assert_eq!(r.next_index, t1.index + 1);
+        assert!(r.entries.iter().all(|entry| entry.index <= t1.index));
+    }
+
+    #[test]
+    fn raft_follower_append_entries_rejects_first_entry_that_skips_prev_index() {
+        let mut r = RaftReplicator::new(3);
+        r.become_leader(1);
+        let t1 = r.propose(vec![1]).unwrap();
+        r.register_follower_ack(t1.index, 1);
+        r.become_follower(2);
+
+        let err = r
+            .append_entries_from_leader(
+                t1.index,
+                1,
+                vec![LogEntry {
+                    term: 2,
+                    index: t1.index + 2,
+                    payload: vec![2],
+                }],
+                t1.index + 2,
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, EngineError::ProposalFailed(_)));
+        assert_eq!(r.commit_index(), t1.index);
+        assert_eq!(r.next_index, t1.index + 1);
     }
 
     #[test]
