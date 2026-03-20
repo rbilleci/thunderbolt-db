@@ -3,6 +3,7 @@
 ## 2026-03-20
 
 ### Completed
+- Added `RaftReplicator::append_entries_from_leader(leader_term, prev_log_index, prev_log_term, entries, leader_commit)` term handling so follower append processing now rejects stale leaders and always updates local term/role to follower on accepted append RPCs, with regression tests for term bump + stale-term rejection.
 - Added `RaftReplicator::append_entries_from_leader(prev_log_index, prev_log_term, entries, leader_commit)` to model follower-side append handling with prev-log validation, conflict truncation of uncommitted tails, and safe commit-index advancement bounded by local log availability.
 - Hardened follower append ingestion to reject non-contiguous entry batches (including first-entry index skips), preserving deterministic log continuity instead of silently accepting sparse append payloads.
 - Added raft regression coverage proving empty AppendEntries heartbeats (no new entries) can still advance follower commit index when a previously replicated entry becomes committed by leader progress.
