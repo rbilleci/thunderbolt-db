@@ -247,6 +247,76 @@ impl RaftReplicator {
         self.snapshot_meta()
     }
 
+    pub fn append_entries_from_leader(
+        &mut self,
+        prev_log_index: Index,
+        prev_log_term: Term,
+        entries: Vec<LogEntry>,
+        leader_commit: Index,
+    ) -> Result<(), EngineError> {
+        if self.role == Role::Leader {
+            return Err(EngineError::ProposalFailed(
+                "leader cannot accept follower append path".to_string(),
+            ));
+        }
+
+        if prev_log_index > 0 {
+            let Some(local_prev_term) = self.term_at(prev_log_index) else {
+                return Err(EngineError::ProposalFailed(format!(
+                    "missing prev_log_index={} for append",
+                    prev_log_index
+                )));
+            };
+
+            if local_prev_term != prev_log_term {
+                return Err(EngineError::ProposalFailed(format!(
+                    "prev_log_term mismatch at index {}: local={}, remote={}",
+                    prev_log_index, local_prev_term, prev_log_term
+                )));
+            }
+        }
+
+        for incoming in entries {
+            if let Some(existing) = self.entries.iter().find(|e| e.index == incoming.index) {
+                if existing.term == incoming.term {
+                    continue;
+                }
+
+                if incoming.index <= self.commit_index {
+                    return Err(EngineError::ProposalFailed(format!(
+                        "refusing to overwrite committed index {}",
+                        incoming.index
+                    )));
+                }
+
+                self.truncate_uncommitted_from(incoming.index);
+            }
+
+            if self
+                .entries
+                .iter()
+                .all(|entry| entry.index != incoming.index)
+            {
+                self.entries.push(incoming);
+            }
+        }
+
+        self.entries.sort_by_key(|entry| entry.index);
+
+        let last_local_index = self
+            .entries
+            .last()
+            .map(|entry| entry.index)
+            .unwrap_or(self.commit_index);
+        let target_commit = leader_commit.min(last_local_index);
+        if target_commit > self.commit_index {
+            self.commit_index = target_commit;
+        }
+        self.next_index = last_local_index + 1;
+
+        Ok(())
+    }
+
     pub fn install_snapshot(&mut self, meta: SnapshotMeta) {
         self.term = self.term.max(meta.last_included_term);
         self.commit_index = self.commit_index.max(meta.last_included_index);
@@ -259,6 +329,22 @@ impl RaftReplicator {
         self.entries.retain(|e| e.index > meta.last_included_index);
         self.ack_counts
             .retain(|idx, _| *idx > meta.last_included_index);
+    }
+
+    fn term_at(&self, index: Index) -> Option<Term> {
+        if index == 0 {
+            return Some(0);
+        }
+
+        if let Some(entry) = self.entries.iter().find(|entry| entry.index == index) {
+            return Some(entry.term);
+        }
+
+        if index == self.applied_index {
+            return Some(self.applied_term);
+        }
+
+        None
     }
 }
 
@@ -788,5 +874,93 @@ mod tests {
         assert_eq!(r.current_term(), 7);
         assert_eq!(meta.last_included_index, t1.index);
         assert_eq!(meta.last_included_term, 2);
+    }
+
+    #[test]
+    fn raft_follower_append_entries_truncates_conflicting_uncommitted_tail() {
+        let mut r = RaftReplicator::new(3);
+        r.become_leader(1);
+
+        let t1 = r.propose(vec![1]).unwrap();
+        r.register_follower_ack(t1.index, 1);
+        assert_eq!(r.commit_index(), t1.index);
+
+        let _t2_old = r.propose(vec![2]).unwrap();
+        r.become_follower(2);
+
+        r.append_entries_from_leader(
+            t1.index,
+            1,
+            vec![LogEntry {
+                term: 2,
+                index: t1.index + 1,
+                payload: vec![9],
+            }],
+            t1.index + 1,
+        )
+        .unwrap();
+
+        assert_eq!(r.commit_index(), t1.index + 1);
+        assert_eq!(r.next_index, t1.index + 2);
+        assert!(r
+            .entries
+            .iter()
+            .any(|entry| entry.index == t1.index + 1 && entry.term == 2));
+    }
+
+    #[test]
+    fn raft_follower_append_entries_rejects_prev_term_mismatch() {
+        let mut r = RaftReplicator::new(3);
+        r.become_leader(1);
+        let t1 = r.propose(vec![1]).unwrap();
+        r.register_follower_ack(t1.index, 1);
+        r.become_follower(2);
+
+        let err = r
+            .append_entries_from_leader(
+                t1.index,
+                999,
+                vec![LogEntry {
+                    term: 2,
+                    index: t1.index + 1,
+                    payload: vec![2],
+                }],
+                t1.index + 1,
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, EngineError::ProposalFailed(_)));
+        assert_eq!(r.commit_index(), t1.index);
+    }
+
+    #[test]
+    fn raft_follower_append_entries_does_not_overwrite_committed_entries() {
+        let mut r = RaftReplicator::new(3);
+        r.become_leader(1);
+        let t1 = r.propose(vec![1]).unwrap();
+        r.register_follower_ack(t1.index, 1);
+        r.become_follower(2);
+
+        let err = r
+            .append_entries_from_leader(
+                0,
+                0,
+                vec![LogEntry {
+                    term: 2,
+                    index: t1.index,
+                    payload: vec![9],
+                }],
+                t1.index,
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, EngineError::ProposalFailed(_)));
+        let committed = r
+            .entries
+            .iter()
+            .find(|entry| entry.index == t1.index)
+            .unwrap();
+        assert_eq!(committed.term, 1);
+        assert_eq!(committed.payload, vec![1]);
     }
 }
