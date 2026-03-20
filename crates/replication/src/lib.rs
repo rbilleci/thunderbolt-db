@@ -180,6 +180,22 @@ impl RaftReplicator {
         self.applied_index = self.applied_index.max(bounded);
     }
 
+    pub fn truncate_uncommitted_from(&mut self, index_inclusive: Index) {
+        if index_inclusive <= self.commit_index {
+            return;
+        }
+
+        self.entries.retain(|e| e.index < index_inclusive);
+        self.ack_counts.retain(|idx, _| *idx < index_inclusive);
+
+        let tail_index = self
+            .entries
+            .last()
+            .map(|e| e.index)
+            .unwrap_or(self.commit_index);
+        self.next_index = tail_index + 1;
+    }
+
     pub fn register_follower_ack(&mut self, index: Index, follower_id: u64) {
         if self.role != Role::Leader || index == 0 || index >= self.next_index || follower_id == 0 {
             return;
@@ -620,6 +636,45 @@ mod tests {
 
         r.register_follower_ack(t2_new_epoch.index, 1);
         assert_eq!(r.commit_index(), t2_new_epoch.index);
+    }
+
+    #[test]
+    fn raft_truncate_uncommitted_from_drops_tail_and_resets_next_index() {
+        let mut r = RaftReplicator::new(3);
+        r.become_leader(1);
+
+        let t1 = r.propose(vec![1]).unwrap();
+        r.register_follower_ack(t1.index, 1);
+        assert_eq!(r.commit_index(), t1.index);
+
+        let t2 = r.propose(vec![2]).unwrap();
+        let t3 = r.propose(vec![3]).unwrap();
+        assert!(r.ack_counts.contains_key(&t2.index));
+        assert!(r.ack_counts.contains_key(&t3.index));
+
+        r.truncate_uncommitted_from(t2.index);
+
+        assert_eq!(r.commit_index(), t1.index);
+        assert!(r.entries.iter().all(|entry| entry.index <= t1.index));
+        assert!(r.ack_counts.is_empty());
+
+        let replacement = r.propose(vec![9]).unwrap();
+        assert_eq!(replacement.index, t1.index + 1);
+    }
+
+    #[test]
+    fn raft_truncate_uncommitted_from_ignores_committed_boundary() {
+        let mut r = RaftReplicator::new(3);
+        r.become_leader(1);
+
+        let t1 = r.propose(vec![1]).unwrap();
+        r.register_follower_ack(t1.index, 1);
+        assert_eq!(r.commit_index(), t1.index);
+
+        r.truncate_uncommitted_from(t1.index);
+
+        assert_eq!(r.commit_index(), t1.index);
+        assert_eq!(r.next_index, t1.index + 1);
     }
 
     #[test]
