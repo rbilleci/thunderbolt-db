@@ -249,6 +249,7 @@ impl RaftReplicator {
 
     pub fn append_entries_from_leader(
         &mut self,
+        leader_term: Term,
         prev_log_index: Index,
         prev_log_term: Term,
         entries: Vec<LogEntry>,
@@ -259,6 +260,16 @@ impl RaftReplicator {
                 "leader cannot accept follower append path".to_string(),
             ));
         }
+
+        if leader_term < self.term {
+            return Err(EngineError::ProposalFailed(format!(
+                "stale leader term {} (local term {})",
+                leader_term, self.term
+            )));
+        }
+
+        self.term = leader_term;
+        self.role = Role::Follower;
 
         if prev_log_index > 0 {
             let Some(local_prev_term) = self.term_at(prev_log_index) else {
@@ -901,6 +912,7 @@ mod tests {
         r.become_follower(2);
 
         r.append_entries_from_leader(
+            2,
             t1.index,
             1,
             vec![LogEntry {
@@ -932,6 +944,7 @@ mod tests {
         r.become_follower(2);
         let t2_index = t1.index + 1;
         r.append_entries_from_leader(
+            2,
             t1.index,
             1,
             vec![LogEntry {
@@ -944,11 +957,35 @@ mod tests {
         .unwrap();
         assert_eq!(r.commit_index(), t1.index);
 
-        r.append_entries_from_leader(t2_index, 2, vec![], t2_index)
+        r.append_entries_from_leader(2, t2_index, 2, vec![], t2_index)
             .unwrap();
 
         assert_eq!(r.commit_index(), t2_index);
         assert_eq!(r.next_index, t2_index + 1);
+    }
+
+    #[test]
+    fn raft_follower_append_entries_bumps_local_term_from_leader_term() {
+        let mut r = RaftReplicator::new(3);
+        r.become_candidate(3);
+
+        r.append_entries_from_leader(4, 0, 0, vec![], 0).unwrap();
+
+        assert_eq!(r.current_term(), 4);
+        assert_eq!(r.role(), Role::Follower);
+    }
+
+    #[test]
+    fn raft_follower_append_entries_rejects_stale_leader_term() {
+        let mut r = RaftReplicator::new(3);
+        r.become_follower(5);
+
+        let err = r
+            .append_entries_from_leader(4, 0, 0, vec![], 0)
+            .unwrap_err();
+
+        assert!(matches!(err, EngineError::ProposalFailed(_)));
+        assert_eq!(r.current_term(), 5);
     }
 
     #[test]
@@ -961,6 +998,7 @@ mod tests {
 
         let err = r
             .append_entries_from_leader(
+                2,
                 t1.index,
                 999,
                 vec![LogEntry {
@@ -986,6 +1024,7 @@ mod tests {
 
         let err = r
             .append_entries_from_leader(
+                2,
                 t1.index,
                 1,
                 vec![
@@ -1020,6 +1059,7 @@ mod tests {
 
         let err = r
             .append_entries_from_leader(
+                2,
                 t1.index,
                 1,
                 vec![LogEntry {
@@ -1046,6 +1086,7 @@ mod tests {
 
         let err = r
             .append_entries_from_leader(
+                2,
                 0,
                 0,
                 vec![LogEntry {
