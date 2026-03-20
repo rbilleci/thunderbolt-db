@@ -26,6 +26,7 @@ pub struct LocalReplicator {
     next_index: Index,
     commit_index: Index,
     applied_index: Index,
+    applied_term: Term,
     role: Role,
     entries: Vec<LogEntry>,
     snapshot_id: u64,
@@ -38,6 +39,7 @@ impl LocalReplicator {
             next_index: 1,
             commit_index: 0,
             applied_index: 0,
+            applied_term: 0,
             role: Role::Leader,
             entries: Vec::new(),
             snapshot_id: 0,
@@ -67,7 +69,14 @@ impl LocalReplicator {
 
     pub fn mark_applied(&mut self, idx: Index) {
         let bounded = idx.min(self.commit_index);
-        self.applied_index = self.applied_index.max(bounded);
+        if bounded <= self.applied_index {
+            return;
+        }
+
+        self.applied_index = bounded;
+        if let Some(entry) = self.entries.iter().find(|entry| entry.index == bounded) {
+            self.applied_term = entry.term;
+        }
     }
 
     pub fn rollback_unapplied_from(&mut self, index_inclusive: Index) {
@@ -92,7 +101,10 @@ impl LocalReplicator {
     pub fn install_snapshot(&mut self, meta: SnapshotMeta) {
         self.term = self.term.max(meta.last_included_term);
         self.commit_index = self.commit_index.max(meta.last_included_index);
-        self.applied_index = self.applied_index.max(meta.last_included_index);
+        if meta.last_included_index > self.applied_index {
+            self.applied_index = meta.last_included_index;
+            self.applied_term = meta.last_included_term;
+        }
         self.next_index = self.commit_index + 1;
         self.snapshot_id = self.snapshot_id.max(meta.snapshot_id);
         self.entries.retain(|e| e.index > meta.last_included_index);
@@ -105,6 +117,7 @@ pub struct RaftReplicator {
     next_index: Index,
     commit_index: Index,
     applied_index: Index,
+    applied_term: Term,
     role: Role,
     entries: Vec<LogEntry>,
     snapshot_id: u64,
@@ -122,6 +135,7 @@ impl RaftReplicator {
             next_index: 1,
             commit_index: 0,
             applied_index: 0,
+            applied_term: 0,
             role: Role::Follower,
             entries: Vec::new(),
             snapshot_id: 0,
@@ -177,7 +191,14 @@ impl RaftReplicator {
 
     pub fn mark_applied(&mut self, idx: Index) {
         let bounded = idx.min(self.commit_index);
-        self.applied_index = self.applied_index.max(bounded);
+        if bounded <= self.applied_index {
+            return;
+        }
+
+        self.applied_index = bounded;
+        if let Some(entry) = self.entries.iter().find(|entry| entry.index == bounded) {
+            self.applied_term = entry.term;
+        }
     }
 
     pub fn truncate_uncommitted_from(&mut self, index_inclusive: Index) {
@@ -229,7 +250,10 @@ impl RaftReplicator {
     pub fn install_snapshot(&mut self, meta: SnapshotMeta) {
         self.term = self.term.max(meta.last_included_term);
         self.commit_index = self.commit_index.max(meta.last_included_index);
-        self.applied_index = self.applied_index.max(meta.last_included_index);
+        if meta.last_included_index > self.applied_index {
+            self.applied_index = meta.last_included_index;
+            self.applied_term = meta.last_included_term;
+        }
         self.next_index = self.commit_index + 1;
         self.snapshot_id = self.snapshot_id.max(meta.snapshot_id);
         self.entries.retain(|e| e.index > meta.last_included_index);
@@ -293,7 +317,7 @@ impl LogReplicator for LocalReplicator {
     fn snapshot_meta(&self) -> SnapshotMeta {
         SnapshotMeta {
             last_included_index: self.applied_index,
-            last_included_term: self.term,
+            last_included_term: self.applied_term,
             snapshot_id: self.snapshot_id,
         }
     }
@@ -359,7 +383,7 @@ impl LogReplicator for RaftReplicator {
     fn snapshot_meta(&self) -> SnapshotMeta {
         SnapshotMeta {
             last_included_index: self.applied_index,
-            last_included_term: self.term,
+            last_included_term: self.applied_term,
             snapshot_id: self.snapshot_id,
         }
     }
@@ -436,6 +460,20 @@ mod tests {
         assert_eq!(meta.last_included_index, t1.index);
         assert_eq!(meta.last_included_term, r.current_term());
         assert_eq!(meta.snapshot_id, 1);
+    }
+
+    #[test]
+    fn snapshot_meta_preserves_last_applied_term_across_term_bumps() {
+        let mut r = LocalReplicator::leader();
+        let t1 = r.propose(vec![1]).unwrap();
+        r.mark_applied(t1.index);
+
+        r.become_follower(5);
+        let meta = r.snapshot_meta();
+
+        assert_eq!(r.current_term(), 5);
+        assert_eq!(meta.last_included_index, t1.index);
+        assert_eq!(meta.last_included_term, 1);
     }
 
     #[test]
@@ -733,5 +771,22 @@ mod tests {
         assert!(!r.ack_counts.contains_key(&t2.index));
         assert!(r.ack_counts.contains_key(&t3.index));
         assert!(r.entries.iter().all(|entry| entry.index > t2.index));
+    }
+
+    #[test]
+    fn raft_snapshot_meta_preserves_last_applied_term_across_term_bumps() {
+        let mut r = RaftReplicator::new(3);
+        r.become_leader(2);
+
+        let t1 = r.propose(vec![1]).unwrap();
+        r.register_follower_ack(t1.index, 1);
+        r.mark_applied(t1.index);
+
+        r.become_follower(7);
+        let meta = r.snapshot_meta();
+
+        assert_eq!(r.current_term(), 7);
+        assert_eq!(meta.last_included_index, t1.index);
+        assert_eq!(meta.last_included_term, 2);
     }
 }
