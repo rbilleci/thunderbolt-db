@@ -921,6 +921,37 @@ mod tests {
     }
 
     #[test]
+    fn raft_follower_append_entries_empty_heartbeat_can_advance_commit_index() {
+        let mut r = RaftReplicator::new(3);
+        r.become_leader(1);
+
+        let t1 = r.propose(vec![1]).unwrap();
+        r.register_follower_ack(t1.index, 1);
+        assert_eq!(r.commit_index(), t1.index);
+
+        r.become_follower(2);
+        let t2_index = t1.index + 1;
+        r.append_entries_from_leader(
+            t1.index,
+            1,
+            vec![LogEntry {
+                term: 2,
+                index: t2_index,
+                payload: vec![2],
+            }],
+            t1.index,
+        )
+        .unwrap();
+        assert_eq!(r.commit_index(), t1.index);
+
+        r.append_entries_from_leader(t2_index, 2, vec![], t2_index)
+            .unwrap();
+
+        assert_eq!(r.commit_index(), t2_index);
+        assert_eq!(r.next_index, t2_index + 1);
+    }
+
+    #[test]
     fn raft_follower_append_entries_rejects_prev_term_mismatch() {
         let mut r = RaftReplicator::new(3);
         r.become_leader(1);
