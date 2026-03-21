@@ -1296,6 +1296,33 @@ mod tests {
     }
 
     #[test]
+    fn raft_candidate_append_rejection_still_updates_term_and_role_for_newer_leader() {
+        let mut r = RaftReplicator::new(3);
+        r.become_candidate(5);
+
+        let err = r
+            .append_entries_from_leader(
+                6,
+                10,
+                5,
+                vec![LogEntry {
+                    term: 6,
+                    index: 11,
+                    payload: vec![7],
+                }],
+                11,
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, EngineError::ProposalFailed(_)));
+        assert_eq!(r.role(), Role::Follower);
+        assert_eq!(r.current_term(), 6);
+        assert_eq!(r.commit_index(), 0);
+        assert_eq!(r.next_index, 1);
+        assert!(r.entries.is_empty());
+    }
+
+    #[test]
     fn raft_follower_append_entries_accepts_prev_index_at_snapshot_boundary_after_apply_advances() {
         let mut r = RaftReplicator::new(3);
         r.become_follower(3);
