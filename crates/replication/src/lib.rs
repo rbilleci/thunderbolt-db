@@ -289,6 +289,13 @@ impl RaftReplicator {
 
         let mut expected_index = prev_log_index + 1;
         for entry in &entries {
+            if entry.term > leader_term {
+                return Err(EngineError::ProposalFailed(format!(
+                    "entry term {} exceeds leader term {} at index {}",
+                    entry.term, leader_term, entry.index
+                )));
+            }
+
             if entry.index != expected_index {
                 return Err(EngineError::ProposalFailed(format!(
                     "append entries must be contiguous from {} but saw {}",
@@ -992,6 +999,32 @@ mod tests {
 
         assert!(matches!(err, EngineError::ProposalFailed(_)));
         assert_eq!(r.current_term(), 5);
+    }
+
+    #[test]
+    fn raft_follower_append_entries_rejects_entries_with_term_ahead_of_leader() {
+        let mut r = RaftReplicator::new(3);
+        r.become_follower(5);
+
+        let err = r
+            .append_entries_from_leader(
+                5,
+                0,
+                0,
+                vec![LogEntry {
+                    term: 6,
+                    index: 1,
+                    payload: vec![1],
+                }],
+                1,
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, EngineError::ProposalFailed(_)));
+        assert_eq!(r.current_term(), 5);
+        assert_eq!(r.commit_index(), 0);
+        assert_eq!(r.next_index, 1);
+        assert!(r.entries.is_empty());
     }
 
     #[test]
