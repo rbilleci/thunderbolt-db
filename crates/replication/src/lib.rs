@@ -121,6 +121,8 @@ pub struct RaftReplicator {
     role: Role,
     entries: Vec<LogEntry>,
     snapshot_id: u64,
+    compacted_index: Index,
+    compacted_term: Term,
     voters: usize,
     quorum: usize,
     ack_counts: BTreeMap<Index, BTreeSet<u64>>,
@@ -139,6 +141,8 @@ impl RaftReplicator {
             role: Role::Follower,
             entries: Vec::new(),
             snapshot_id: 0,
+            compacted_index: 0,
+            compacted_term: 0,
             voters,
             quorum,
             ack_counts: BTreeMap::new(),
@@ -356,6 +360,10 @@ impl RaftReplicator {
     pub fn install_snapshot(&mut self, meta: SnapshotMeta) {
         self.term = self.term.max(meta.last_included_term);
         self.commit_index = self.commit_index.max(meta.last_included_index);
+        if meta.last_included_index >= self.compacted_index {
+            self.compacted_index = meta.last_included_index;
+            self.compacted_term = meta.last_included_term;
+        }
         if meta.last_included_index > self.applied_index {
             self.applied_index = meta.last_included_index;
             self.applied_term = meta.last_included_term;
@@ -370,6 +378,14 @@ impl RaftReplicator {
     fn term_at(&self, index: Index) -> Option<Term> {
         if index == 0 {
             return Some(0);
+        }
+
+        if index == self.compacted_index {
+            return Some(self.compacted_term);
+        }
+
+        if index < self.compacted_index {
+            return None;
         }
 
         if let Some(entry) = self.entries.iter().find(|entry| entry.index == index) {
@@ -1277,5 +1293,47 @@ mod tests {
         assert_eq!(r.commit_index(), commit_before);
         assert_eq!(r.next_index, next_before);
         assert!(r.entries.is_empty());
+    }
+
+    #[test]
+    fn raft_follower_append_entries_accepts_prev_index_at_snapshot_boundary_after_apply_advances() {
+        let mut r = RaftReplicator::new(3);
+        r.become_follower(3);
+
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 5,
+            last_included_term: 2,
+            snapshot_id: 1,
+        });
+
+        r.append_entries_from_leader(
+            3,
+            5,
+            2,
+            vec![LogEntry {
+                term: 3,
+                index: 6,
+                payload: vec![6],
+            }],
+            6,
+        )
+        .unwrap();
+        r.mark_applied(6);
+
+        r.append_entries_from_leader(
+            3,
+            5,
+            2,
+            vec![LogEntry {
+                term: 3,
+                index: 6,
+                payload: vec![6],
+            }],
+            6,
+        )
+        .unwrap();
+
+        assert_eq!(r.commit_index(), 6);
+        assert_eq!(r.next_index, 7);
     }
 }
