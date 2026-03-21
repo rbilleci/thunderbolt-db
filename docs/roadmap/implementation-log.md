@@ -7,6 +7,7 @@
 - Hardened follower append conflict checks to reject payload divergence when index+term already exist locally; identical index+term entries must now also carry identical payload bytes, with regression coverage proving mismatch rejection preserves local log/commit/next-index state.
 - Added raft regression coverage proving follower append processing never commits past the local log tail even when leader commit is far ahead, and that missing `prev_log_index` append attempts fail without mutating follower role/term/index state.
 - Added raft regression coverage proving `RaftReplicator::append_entries_from_leader` rejects leader-role callers without mutating term/role/commit/next-index state, preventing accidental use of follower append ingestion on leader paths.
+- Added raft regression coverage proving candidate nodes still step down to follower and adopt a newer leader term even when append RPC validation later rejects the payload (`missing prev_log_index`), preserving Raft term/role monotonicity under rejection paths.
 
 ## 2026-03-20
 
