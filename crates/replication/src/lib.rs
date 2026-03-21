@@ -360,7 +360,7 @@ impl RaftReplicator {
     pub fn install_snapshot(&mut self, meta: SnapshotMeta) {
         self.term = self.term.max(meta.last_included_term);
         self.commit_index = self.commit_index.max(meta.last_included_index);
-        if meta.last_included_index >= self.compacted_index {
+        if meta.last_included_index > self.compacted_index {
             self.compacted_index = meta.last_included_index;
             self.compacted_term = meta.last_included_term;
         }
@@ -1328,6 +1328,39 @@ mod tests {
                 term: 3,
                 index: 6,
                 payload: vec![6],
+            }],
+            6,
+        )
+        .unwrap();
+
+        assert_eq!(r.commit_index(), 6);
+        assert_eq!(r.next_index, 7);
+    }
+
+    #[test]
+    fn raft_install_snapshot_does_not_rewrite_compacted_term_for_same_index() {
+        let mut r = RaftReplicator::new(3);
+        r.become_follower(4);
+
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 5,
+            last_included_term: 4,
+            snapshot_id: 2,
+        });
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 5,
+            last_included_term: 2,
+            snapshot_id: 3,
+        });
+
+        r.append_entries_from_leader(
+            4,
+            5,
+            4,
+            vec![LogEntry {
+                term: 4,
+                index: 6,
+                payload: vec![9],
             }],
             6,
         )
