@@ -3,6 +3,7 @@
 ## 2026-03-21
 
 ### Completed
+- Added raft regression coverage proving follower append processing never commits past the local log tail even when leader commit is far ahead, and that missing `prev_log_index` append attempts fail without mutating follower role/term/index state.
 - Added raft regression coverage proving `RaftReplicator::append_entries_from_leader` rejects leader-role callers without mutating term/role/commit/next-index state, preventing accidental use of follower append ingestion on leader paths.
 
 ## 2026-03-20
