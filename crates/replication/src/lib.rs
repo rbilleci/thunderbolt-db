@@ -302,6 +302,12 @@ impl RaftReplicator {
         for incoming in entries {
             if let Some(existing) = self.entries.iter().find(|e| e.index == incoming.index) {
                 if existing.term == incoming.term {
+                    if existing.payload != incoming.payload {
+                        return Err(EngineError::ProposalFailed(format!(
+                            "payload mismatch at index {} term {}",
+                            incoming.index, incoming.term
+                        )));
+                    }
                     continue;
                 }
 
@@ -1141,6 +1147,49 @@ mod tests {
             .unwrap();
         assert_eq!(committed.term, 1);
         assert_eq!(committed.payload, vec![1]);
+    }
+
+    #[test]
+    fn raft_follower_append_entries_rejects_payload_mismatch_for_same_index_and_term() {
+        let mut r = RaftReplicator::new(3);
+        r.become_follower(3);
+
+        r.append_entries_from_leader(
+            3,
+            0,
+            0,
+            vec![LogEntry {
+                term: 3,
+                index: 1,
+                payload: vec![1],
+            }],
+            1,
+        )
+        .unwrap();
+
+        let commit_before = r.commit_index();
+        let next_before = r.next_index;
+
+        let err = r
+            .append_entries_from_leader(
+                3,
+                0,
+                0,
+                vec![LogEntry {
+                    term: 3,
+                    index: 1,
+                    payload: vec![9],
+                }],
+                1,
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, EngineError::ProposalFailed(_)));
+        assert_eq!(r.commit_index(), commit_before);
+        assert_eq!(r.next_index, next_before);
+        let preserved = r.entries.iter().find(|entry| entry.index == 1).unwrap();
+        assert_eq!(preserved.term, 3);
+        assert_eq!(preserved.payload, vec![1]);
     }
 
     #[test]
