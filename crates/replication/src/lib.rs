@@ -989,6 +989,41 @@ mod tests {
     }
 
     #[test]
+    fn raft_leader_rejects_follower_append_path_without_state_mutation() {
+        let mut r = RaftReplicator::new(3);
+        r.become_leader(6);
+
+        let committed = r.propose(vec![1]).unwrap();
+        r.register_follower_ack(committed.index, 1);
+
+        let role_before = r.role();
+        let term_before = r.current_term();
+        let commit_before = r.commit_index();
+        let next_before = r.next_index;
+
+        let err = r
+            .append_entries_from_leader(
+                7,
+                committed.index,
+                term_before,
+                vec![LogEntry {
+                    term: 7,
+                    index: committed.index + 1,
+                    payload: vec![9],
+                }],
+                committed.index + 1,
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, EngineError::ProposalFailed(_)));
+        assert_eq!(r.role(), role_before);
+        assert_eq!(r.current_term(), term_before);
+        assert_eq!(r.commit_index(), commit_before);
+        assert_eq!(r.next_index, next_before);
+        assert!(r.entries.iter().all(|entry| entry.term != 7));
+    }
+
+    #[test]
     fn raft_follower_append_entries_rejects_prev_term_mismatch() {
         let mut r = RaftReplicator::new(3);
         r.become_leader(1);
