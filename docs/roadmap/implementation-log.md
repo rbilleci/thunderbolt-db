@@ -1,5 +1,10 @@
 # Implementation Log (Pre-NVIDIA Phase)
 
+## 2026-03-21
+
+### Completed
+- Added raft regression coverage proving `RaftReplicator::append_entries_from_leader` rejects leader-role callers without mutating term/role/commit/next-index state, preventing accidental use of follower append ingestion on leader paths.
+
 ## 2026-03-20
 
 ### Completed
