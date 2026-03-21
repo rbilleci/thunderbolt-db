@@ -1142,4 +1142,58 @@ mod tests {
         assert_eq!(committed.term, 1);
         assert_eq!(committed.payload, vec![1]);
     }
+
+    #[test]
+    fn raft_follower_append_entries_caps_commit_index_to_local_log_tail() {
+        let mut r = RaftReplicator::new(3);
+        r.become_follower(2);
+
+        r.append_entries_from_leader(
+            2,
+            0,
+            0,
+            vec![LogEntry {
+                term: 2,
+                index: 1,
+                payload: vec![1],
+            }],
+            99,
+        )
+        .unwrap();
+
+        assert_eq!(r.commit_index(), 1);
+        assert_eq!(r.next_index, 2);
+    }
+
+    #[test]
+    fn raft_follower_append_entries_missing_prev_index_is_rejected_without_state_mutation() {
+        let mut r = RaftReplicator::new(3);
+        r.become_follower(5);
+
+        let role_before = r.role();
+        let term_before = r.current_term();
+        let commit_before = r.commit_index();
+        let next_before = r.next_index;
+
+        let err = r
+            .append_entries_from_leader(
+                5,
+                10,
+                5,
+                vec![LogEntry {
+                    term: 5,
+                    index: 11,
+                    payload: vec![7],
+                }],
+                11,
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, EngineError::ProposalFailed(_)));
+        assert_eq!(r.role(), role_before);
+        assert_eq!(r.current_term(), term_before);
+        assert_eq!(r.commit_index(), commit_before);
+        assert_eq!(r.next_index, next_before);
+        assert!(r.entries.is_empty());
+    }
 }
