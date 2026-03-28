@@ -105,9 +105,15 @@ impl LocalReplicator {
             self.applied_index = meta.last_included_index;
             self.applied_term = meta.last_included_term;
         }
-        self.next_index = self.commit_index + 1;
         self.snapshot_id = self.snapshot_id.max(meta.snapshot_id);
         self.entries.retain(|e| e.index > meta.last_included_index);
+
+        let tail_index = self
+            .entries
+            .last()
+            .map(|entry| entry.index)
+            .unwrap_or(self.commit_index);
+        self.next_index = tail_index + 1;
     }
 }
 
@@ -375,11 +381,17 @@ impl RaftReplicator {
             self.applied_index = meta.last_included_index;
             self.applied_term = meta.last_included_term;
         }
-        self.next_index = self.commit_index + 1;
         self.snapshot_id = self.snapshot_id.max(meta.snapshot_id);
         self.entries.retain(|e| e.index > meta.last_included_index);
         self.ack_counts
             .retain(|idx, _| *idx > meta.last_included_index);
+
+        let tail_index = self
+            .entries
+            .last()
+            .map(|entry| entry.index)
+            .unwrap_or(self.commit_index);
+        self.next_index = tail_index + 1;
     }
 
     fn term_at(&self, index: Index) -> Option<Term> {
@@ -660,6 +672,22 @@ mod tests {
     }
 
     #[test]
+    fn local_install_snapshot_preserves_next_index_from_uncompacted_tail() {
+        let mut r = LocalReplicator::leader();
+        let _t1 = r.propose(vec![1]).unwrap();
+        let t2 = r.propose(vec![2]).unwrap();
+
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: t2.index - 1,
+            last_included_term: 1,
+            snapshot_id: 11,
+        });
+
+        let next = r.propose(vec![3]).unwrap();
+        assert_eq!(next.index, t2.index + 1);
+    }
+
+    #[test]
     fn mark_applied_does_not_exceed_commit_index() {
         let mut r = LocalReplicator::leader();
         let t1 = r.propose(vec![1]).unwrap();
@@ -916,6 +944,27 @@ mod tests {
         assert!(!r.ack_counts.contains_key(&t2.index));
         assert!(r.ack_counts.contains_key(&t3.index));
         assert!(r.entries.iter().all(|entry| entry.index > t2.index));
+    }
+
+    #[test]
+    fn raft_install_snapshot_preserves_next_index_from_uncompacted_tail() {
+        let mut r = RaftReplicator::new(3);
+        r.become_leader(3);
+
+        let t1 = r.propose(vec![1]).unwrap();
+        let _t2 = r.propose(vec![2]).unwrap();
+
+        r.register_follower_ack(t1.index, 1);
+        assert_eq!(r.commit_index(), t1.index);
+
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: t1.index,
+            last_included_term: 3,
+            snapshot_id: 7,
+        });
+
+        let replacement = r.propose(vec![9]).unwrap();
+        assert_eq!(replacement.index, 3);
     }
 
     #[test]

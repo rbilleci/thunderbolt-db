@@ -5,6 +5,8 @@
 ### Completed
 - Hardened `RaftReplicator::append_entries_from_leader` to reject append RPCs whose `prev_log_index` is behind the local snapshot-compaction boundary, preventing invalid reintroduction of pre-snapshot log entries.
 - Added regression coverage proving behind-boundary append attempts fail without mutating follower commit/apply/next-index watermarks or in-memory entry state.
+- Fixed snapshot install next-index tracking in both `LocalReplicator` and `RaftReplicator` so retained uncompacted tail entries keep log indexing monotonic after snapshot ingestion.
+- Added regression coverage proving snapshot installs preserve `next_index` continuity when uncommitted post-snapshot tail entries remain in memory.
 
 ## 2026-03-21
 
