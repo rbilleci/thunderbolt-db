@@ -1,5 +1,11 @@
 # Implementation Log (Pre-NVIDIA Phase)
 
+## 2026-03-28
+
+### Completed
+- Hardened `RaftReplicator::append_entries_from_leader` to reject append RPCs whose `prev_log_index` is behind the local snapshot-compaction boundary, preventing invalid reintroduction of pre-snapshot log entries.
+- Added regression coverage proving behind-boundary append attempts fail without mutating follower commit/apply/next-index watermarks or in-memory entry state.
+
 ## 2026-03-21
 
 ### Completed

@@ -275,6 +275,13 @@ impl RaftReplicator {
         self.term = leader_term;
         self.role = Role::Follower;
 
+        if prev_log_index < self.compacted_index {
+            return Err(EngineError::ProposalFailed(format!(
+                "prev_log_index={} is behind compacted boundary {}",
+                prev_log_index, self.compacted_index
+            )));
+        }
+
         if prev_log_index > 0 {
             let Some(local_prev_term) = self.term_at(prev_log_index) else {
                 return Err(EngineError::ProposalFailed(format!(
@@ -1362,6 +1369,38 @@ mod tests {
 
         assert_eq!(r.commit_index(), 6);
         assert_eq!(r.next_index, 7);
+    }
+
+    #[test]
+    fn raft_follower_append_entries_rejects_prev_index_behind_snapshot_boundary() {
+        let mut r = RaftReplicator::new(3);
+        r.become_follower(4);
+
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 5,
+            last_included_term: 3,
+            snapshot_id: 1,
+        });
+
+        let err = r
+            .append_entries_from_leader(
+                4,
+                0,
+                0,
+                vec![LogEntry {
+                    term: 4,
+                    index: 1,
+                    payload: vec![1],
+                }],
+                1,
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, EngineError::ProposalFailed(_)));
+        assert_eq!(r.commit_index(), 5);
+        assert_eq!(r.applied_index(), 5);
+        assert_eq!(r.next_index, 6);
+        assert!(r.entries.is_empty());
     }
 
     #[test]
