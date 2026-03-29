@@ -3,6 +3,7 @@
 ## 2026-03-29
 
 ### Completed
+- Added replication watermark coverage for queued-but-not-yet-flushed mutations: `ReplicationWatermarks` now reports `pending_batch_len` so role/commit/apply visibility telemetry includes current batch backlog depth (alongside WAL counters), with regression coverage for both empty and non-empty queue states.
 - Added a new `gpu_db_planner` crate with a minimal device-aware planning surface (`Planner`, `ExecutionPlan`, `PlanNode`) so every planned command now has an explicit `DeviceTarget` annotation (`Cpu` or `Gpu(id)`) instead of relying on implicit routing assumptions.
 - Added `Engine::with_planner_config` so engine instances can override the planner's default GPU id at construction time (instead of always assuming GPU 0), with regression coverage proving `plan_text` emits `DeviceTarget::Gpu(custom_id)` for mutation commands.
 - Added `Engine::with_batching_and_planner_config` so custom batching thresholds and non-default planner GPU targets can be configured together in one constructor, with regression coverage proving both settings are honored simultaneously.
