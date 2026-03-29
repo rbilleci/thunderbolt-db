@@ -40,4 +40,6 @@ pub enum EngineError {
     ApplyFailed(String),
     #[error("durability failure: {0}")]
     Durability(String),
+    #[error("pending mutation queue overloaded: pending={pending} cap={cap}")]
+    MutationQueueOverloaded { pending: usize, cap: usize },
 }

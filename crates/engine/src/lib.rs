@@ -190,6 +190,16 @@ impl Engine {
                     return Err(ExecuteError::Engine(EngineError::NotLeader));
                 }
 
+                let queue_cap = self.batcher.max_items();
+                let pending = self.batcher.len();
+                if pending >= queue_cap {
+                    self.metrics.inc_fallback(FallbackReason::GpuQueueSaturated);
+                    return Err(ExecuteError::Engine(EngineError::MutationQueueOverloaded {
+                        pending,
+                        cap: queue_cap,
+                    }));
+                }
+
                 let maybe_batch = self.batcher.enqueue(
                     PendingMutation {
                         txn_id,
@@ -984,6 +994,37 @@ mod tests {
         assert_eq!(e.get("b"), Some("2"));
         assert_eq!(e.metrics().batch_flushes_for(BatchFlushReason::Admin), 1);
         assert_eq!(e.metrics().commits_total, 2);
+    }
+
+    #[test]
+    fn enqueue_rejects_new_mutation_when_retry_queue_is_saturated() {
+        let mut e = Engine::with_batching(2, Duration::from_secs(60));
+        let t0 = Instant::now();
+
+        e.enqueue_set_text(1, "SET a=1", t0).unwrap();
+        e.simulate_next_wal_flush_failure();
+        let flush_err = e
+            .enqueue_set_text(2, "SET b=2", t0 + Duration::from_millis(1))
+            .unwrap_err();
+        assert!(matches!(
+            flush_err,
+            ExecuteError::Engine(EngineError::Durability(_))
+        ));
+        assert_eq!(e.pending_batch_len(), 2);
+
+        let saturated_err = e
+            .enqueue_set_text(3, "SET c=3", t0 + Duration::from_millis(2))
+            .unwrap_err();
+        assert!(matches!(
+            saturated_err,
+            ExecuteError::Engine(EngineError::MutationQueueOverloaded { pending: 2, cap: 2 })
+        ));
+        assert_eq!(e.pending_batch_len(), 2);
+        assert_eq!(
+            e.metrics().fallback_for(FallbackReason::GpuQueueSaturated),
+            1
+        );
+        assert_eq!(e.metrics().commits_total, 0);
     }
 
     #[test]
