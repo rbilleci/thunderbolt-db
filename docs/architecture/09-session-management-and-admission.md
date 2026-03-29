@@ -35,7 +35,7 @@ These values are intentionally conservative until real GPU runtime and multi-nod
 ## Rejection/Backpressure Semantics
 
 - If node is not leader for mutation requests: reject with `NotLeader`.
-- If pending mutation queue exceeds cap: reject new mutation enqueue with explicit overload error (future wiring).
+- If pending mutation queue reaches cap while retry backlog is pending: reject new mutation enqueue with explicit `MutationQueueOverloaded { pending, cap }` error.
 - If session budget exhausted: reject new session with admission error; do not evict active transaction sessions abruptly.
 
 ## Operational Checks

@@ -12,6 +12,8 @@
 - Added `docs/operations/runbooks.md` with deterministic pre-deploy, WAL durability incident, role-transition, snapshot safety, and fallback-monitoring procedures to operationalize DR/security controls without weakening WAL-before-visibility invariants.
 - Updated documentation index/traceability docs so operations runbooks are first-class references and prior traceability hardening tasks are explicitly recorded as complete.
 - Added `docs/architecture/09-session-management-and-admission.md` with bootstrap session model, admission limits, overload rejection semantics, and forward v1 adaptive-control path; linked it into docs navigation and traceability mapping.
+- Implemented pending-mutation enqueue saturation handling during retry backlogs: when the batched queue is already at cap, new mutation enqueues now fail fast with `EngineError::MutationQueueOverloaded { pending, cap }` and emit `GpuQueueSaturated` fallback telemetry instead of allowing unbounded queue growth after flush failures.
+- Added engine regression coverage proving failed WAL-triggered retry backlogs keep queued items intact while rejecting additional enqueues with explicit overload errors.
 
 ## 2026-03-28
 
