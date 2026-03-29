@@ -69,6 +69,7 @@ pub struct ReplicationWatermarks {
     pub wal_flushed_count: usize,
     pub wal_buffered_count: usize,
     pub wal_unflushed_count: usize,
+    pub pending_batch_len: usize,
 }
 
 pub struct Engine {
@@ -433,6 +434,7 @@ impl Engine {
             wal_flushed_count: self.wal.flushed_count(),
             wal_buffered_count: self.wal.len(),
             wal_unflushed_count: self.wal.unflushed_count(),
+            pending_batch_len: self.batcher.len(),
         }
     }
 
@@ -1272,6 +1274,7 @@ mod tests {
         assert_eq!(before.wal_flushed_count, 0);
         assert_eq!(before.wal_buffered_count, 0);
         assert_eq!(before.wal_unflushed_count, 0);
+        assert_eq!(before.pending_batch_len, 0);
 
         let token = e.commit_mutation(1, b"SET a=1".to_vec()).unwrap();
         let after = e.replication_watermarks();
@@ -1285,6 +1288,7 @@ mod tests {
         assert!(after.wal_flushed_count >= 1);
         assert_eq!(after.wal_buffered_count, e.wal_buffered_count());
         assert_eq!(after.wal_unflushed_count, e.wal_unflushed_count());
+        assert_eq!(after.pending_batch_len, 0);
     }
 
     #[test]
@@ -1304,6 +1308,7 @@ mod tests {
         assert_eq!(marks.wal_flushed_count, 0);
         assert_eq!(marks.wal_buffered_count, 0);
         assert_eq!(marks.wal_unflushed_count, 0);
+        assert_eq!(marks.pending_batch_len, 0);
     }
 
     #[test]
@@ -1316,6 +1321,20 @@ mod tests {
         let marks = e.replication_watermarks();
         assert_eq!(marks.wal_buffered_count, 2);
         assert_eq!(marks.wal_flushed_count, 2);
+        assert_eq!(marks.wal_unflushed_count, 0);
+        assert_eq!(marks.pending_batch_len, 0);
+    }
+
+    #[test]
+    fn replication_watermarks_include_pending_batch_depth() {
+        let mut e = Engine::with_batching(2, Duration::from_secs(999));
+        let t0 = Instant::now();
+
+        e.enqueue_set_text(1, "SET a=1", t0).unwrap();
+
+        let marks = e.replication_watermarks();
+        assert_eq!(marks.pending_batch_len, 1);
+        assert_eq!(marks.wal_buffered_count, 0);
         assert_eq!(marks.wal_unflushed_count, 0);
     }
 
