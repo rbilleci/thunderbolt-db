@@ -783,6 +783,21 @@ mod tests {
     }
 
     #[test]
+    fn raft_ignores_reserved_self_ack_follower_id() {
+        let mut r = RaftReplicator::new(3);
+        r.become_leader(1);
+
+        let t1 = r.propose(vec![1]).unwrap();
+        r.register_follower_ack(t1.index, 0);
+
+        assert_eq!(
+            r.commit_index(),
+            0,
+            "follower id 0 is reserved for the leader self-ack"
+        );
+    }
+
+    #[test]
     fn raft_duplicate_follower_ack_does_not_count_twice() {
         let mut r = RaftReplicator::new(5);
         r.become_leader(1);
@@ -1071,6 +1086,42 @@ mod tests {
 
         assert!(matches!(err, EngineError::ProposalFailed(_)));
         assert_eq!(r.current_term(), 5);
+    }
+
+    #[test]
+    fn raft_follower_append_entries_rejects_stale_term_without_state_mutation() {
+        let mut r = RaftReplicator::new(3);
+        r.become_leader(5);
+        let t1 = r.propose(vec![1]).unwrap();
+        r.register_follower_ack(t1.index, 1);
+        r.become_follower(5);
+
+        let role_before = r.role();
+        let term_before = r.current_term();
+        let commit_before = r.commit_index();
+        let next_before = r.next_index;
+        let entries_before = r.entries.clone();
+
+        let err = r
+            .append_entries_from_leader(
+                4,
+                t1.index,
+                5,
+                vec![LogEntry {
+                    term: 4,
+                    index: t1.index + 1,
+                    payload: vec![9],
+                }],
+                t1.index + 1,
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, EngineError::ProposalFailed(_)));
+        assert_eq!(r.role(), role_before);
+        assert_eq!(r.current_term(), term_before);
+        assert_eq!(r.commit_index(), commit_before);
+        assert_eq!(r.next_index, next_before);
+        assert_eq!(r.entries, entries_before);
     }
 
     #[test]
