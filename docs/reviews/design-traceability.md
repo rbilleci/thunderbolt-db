@@ -14,7 +14,7 @@ This matrix maps major design intents from the original design document to imple
 | 1.2 Technology choices | Rust + CUDA path, parser strategy | `docs/interfaces/*`, `docs/architecture/04-execution-model-cpu-gpu.md` | Covered |
 | 1.3 Layered architecture | Clear subsystem boundaries | `docs/architecture/01-system-invariants.md`, `docs/interfaces/*` | Covered |
 | 2. Protocol & SQL compatibility | PG wire semantics and compatibility discipline | `docs/architecture/01-system-invariants.md`, `docs/roadmap/v0-v1.md` | Covered (phased depth) |
-| 2.2 Session management | Connection/session model and limits | `docs/architecture/06-observability-slos.md`, future runtime docs | Partially covered |
+| 2.2 Session management | Connection/session model and limits | `docs/architecture/06-observability-slos.md`, `docs/architecture/09-session-management-and-admission.md` | Covered (bootstrap limits; adaptive controls deferred) |
 | 2.3 SQL dialect/features | Broad SQL + transactional semantics | `docs/roadmap/v0-v1.md`, `docs/interfaces/transaction-interfaces.md` | Covered (phased) |
 | 2.4 System catalog compatibility | Tooling compatibility posture | `docs/architecture/01-system-invariants.md` | Covered (policy-level) |
 | 2.5 Error taxonomy | Structured failure propagation | `docs/architecture/02-commit-path.md`, `docs/architecture/06-observability-slos.md` | Covered (to be expanded) |
