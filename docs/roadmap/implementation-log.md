@@ -9,6 +9,8 @@
 - Wired bootstrap planning policy to preserve GPU-first intent: mutation commands (`SET`/`DEL`/`DELETE`) are emitted as GPU-targeted plan nodes, while control/read/admin commands currently declare explicit CPU targets as the safe fallback path.
 - Added planner regression tests proving write commands are GPU-targeted, read commands are explicitly CPU-targeted fallback, and the planner never emits device-agnostic nodes.
 - Integrated planner scaffolding into `gpu_db_engine` via a new `Engine::plan_text` entrypoint so protocol commands can be translated into explicit device-annotated plans before execution, with engine-level regression coverage for mutation/read routing.
+- Added `docs/operations/runbooks.md` with deterministic pre-deploy, WAL durability incident, role-transition, snapshot safety, and fallback-monitoring procedures to operationalize DR/security controls without weakening WAL-before-visibility invariants.
+- Updated documentation index/traceability docs so operations runbooks are first-class references and prior traceability hardening tasks are explicitly recorded as complete.
 
 ## 2026-03-28
 

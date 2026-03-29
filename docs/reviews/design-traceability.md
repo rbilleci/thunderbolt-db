@@ -37,6 +37,8 @@ This matrix maps major design intents from the original design document to imple
 
 ## Next traceability hardening steps
 
-1. Add `docs/compatibility/matrix.md` for explicit PostgreSQL feature status by phase.
-2. Add `docs/testing/parity-and-jepsen-plan.md` for deterministic replay and consistency validation criteria.
-3. Add `docs/operations/runbooks.md` to link DR/security controls to exact procedures.
+1. ✅ Added `docs/compatibility/matrix.md` for explicit PostgreSQL feature status by phase.
+2. ✅ Added `docs/testing/parity-and-jepsen-plan.md` for deterministic replay and consistency validation criteria.
+3. ✅ Added `docs/operations/runbooks.md` to link DR/security controls to exact procedures.
+4. Expand 2.2 session-management traceability with concrete runtime limits/admission-control docs.
+5. Expand error-taxonomy mapping with crate-level error contracts and operator response playbooks.

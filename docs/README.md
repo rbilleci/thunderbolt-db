@@ -48,7 +48,10 @@ This project uses a layered documentation model so implementation can proceed qu
    - `docs/compatibility/matrix.md`
    - `docs/testing/parity-and-jepsen-plan.md`
 
-12. **Process guardrails**
+12. **Operations runbooks**
+   - `docs/operations/runbooks.md`
+
+13. **Process guardrails**
    - `docs/GPU_GUARDRAILS.md`
    - `.github/pull_request_template.md`
 
