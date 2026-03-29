@@ -1,5 +1,12 @@
 # Implementation Log (Pre-NVIDIA Phase)
 
+## 2026-03-30
+
+### Completed
+- Extended `ReplicationWatermarks` with `active_txn_count` so replication/durability telemetry now exposes live transaction depth alongside role, index, WAL, and pending-batch signals.
+- Added engine regression coverage proving watermark snapshots report active transaction depth after `BEGIN`, and remain zero across follower rejection, buffered WAL, and pending-batch-only scenarios.
+- Updated README scope notes to reflect that replication watermark reporting now includes active transaction depth.
+
 ## 2026-03-29
 
 ### Completed
