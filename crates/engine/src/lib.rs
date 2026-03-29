@@ -101,7 +101,15 @@ impl Engine {
     }
 
     pub fn with_batching(max_items: usize, max_wait: Duration) -> Self {
-        let mut s = Self::new_local();
+        Self::with_batching_and_planner_config(max_items, max_wait, PlannerConfig::default())
+    }
+
+    pub fn with_batching_and_planner_config(
+        max_items: usize,
+        max_wait: Duration,
+        planner_cfg: PlannerConfig,
+    ) -> Self {
+        let mut s = Self::with_planner_config(planner_cfg);
         s.batcher = DualTriggerBatcher::new(max_items, max_wait);
         s
     }
@@ -737,6 +745,19 @@ mod tests {
     fn batching_config_reflects_engine_settings() {
         let e = Engine::with_batching(7, Duration::from_millis(42));
         assert_eq!(e.batching_config(), (7, Duration::from_millis(42)));
+    }
+
+    #[test]
+    fn batching_and_planner_config_can_be_combined() {
+        let e = Engine::with_batching_and_planner_config(
+            3,
+            Duration::from_millis(9),
+            PlannerConfig { default_gpu_id: 5 },
+        );
+
+        assert_eq!(e.batching_config(), (3, Duration::from_millis(9)));
+        let plan = e.plan_text("SET a=1").unwrap();
+        assert_eq!(plan.nodes()[0].op.target, DeviceTarget::Gpu(5));
     }
 
     #[test]
