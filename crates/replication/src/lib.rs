@@ -1472,6 +1472,38 @@ mod tests {
     }
 
     #[test]
+    fn raft_follower_append_entries_rejects_snapshot_boundary_term_mismatch() {
+        let mut r = RaftReplicator::new(3);
+        r.become_follower(4);
+
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 5,
+            last_included_term: 3,
+            snapshot_id: 1,
+        });
+
+        let err = r
+            .append_entries_from_leader(
+                4,
+                5,
+                2,
+                vec![LogEntry {
+                    term: 4,
+                    index: 6,
+                    payload: vec![6],
+                }],
+                6,
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, EngineError::ProposalFailed(_)));
+        assert_eq!(r.commit_index(), 5);
+        assert_eq!(r.applied_index(), 5);
+        assert_eq!(r.next_index, 6);
+        assert!(r.entries.is_empty());
+    }
+
+    #[test]
     fn raft_follower_append_entries_rejects_prev_index_behind_snapshot_boundary() {
         let mut r = RaftReplicator::new(3);
         r.become_follower(4);
