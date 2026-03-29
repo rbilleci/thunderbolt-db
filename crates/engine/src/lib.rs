@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use gpu_db_batching::{BatchItem, DualTriggerBatcher, FlushReason};
 use gpu_db_metrics::{BatchFlushReason, FallbackReason, RuntimeMetrics};
-use gpu_db_planner::{ExecutionPlan, Planner};
+use gpu_db_planner::{ExecutionPlan, Planner, PlannerConfig};
 use gpu_db_protocol::{parse_command, Command, ParseError};
 use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine};
 use gpu_db_txn::{TxnError, TxnManager};
@@ -84,6 +84,10 @@ pub struct Engine {
 
 impl Engine {
     pub fn new_local() -> Self {
+        Self::with_planner_config(PlannerConfig::default())
+    }
+
+    pub fn with_planner_config(planner_cfg: PlannerConfig) -> Self {
         Self {
             repl: LocalReplicator::leader(),
             wal: WalBuffer::default(),
@@ -92,7 +96,7 @@ impl Engine {
             visible_up_to: 0,
             metrics: RuntimeMetrics::default(),
             batcher: DualTriggerBatcher::new(64, Duration::from_millis(1)),
-            planner: Planner::default(),
+            planner: Planner::new(planner_cfg),
         }
     }
 
@@ -483,6 +487,15 @@ mod tests {
 
         assert_eq!(plan.nodes().len(), 1);
         assert_eq!(plan.nodes()[0].op.target, DeviceTarget::Cpu);
+    }
+
+    #[test]
+    fn planner_config_can_override_default_gpu_target() {
+        let e = Engine::with_planner_config(PlannerConfig { default_gpu_id: 3 });
+        let plan = e.plan_text("SET a=1").unwrap();
+
+        assert_eq!(plan.nodes().len(), 1);
+        assert_eq!(plan.nodes()[0].op.target, DeviceTarget::Gpu(3));
     }
 
     #[test]
