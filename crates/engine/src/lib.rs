@@ -1155,6 +1155,22 @@ mod tests {
     }
 
     #[test]
+    fn start_alias_and_work_aliases_drive_transaction_state_transitions() {
+        let mut e = Engine::new_local();
+
+        e.execute_text(73, "START TRANSACTION READ ONLY").unwrap();
+        assert_eq!(e.active_txn_count(), 1);
+        e.execute_text(73, "COMMIT WORK").unwrap();
+        assert_eq!(e.active_txn_count(), 0);
+
+        e.execute_text(74, "START WORK, READ WRITE, DEFERRABLE")
+            .unwrap();
+        assert_eq!(e.active_txn_count(), 1);
+        e.execute_text(74, "ROLLBACK TRANSACTION").unwrap();
+        assert_eq!(e.active_txn_count(), 0);
+    }
+
+    #[test]
     fn enqueue_transaction_control_alias_chain_forms_reopen_transaction_context() {
         let mut e = Engine::new_local();
         let t0 = Instant::now();
@@ -1169,6 +1185,24 @@ mod tests {
         e.enqueue_set_text(91, "ABORT AND CHAIN", t0).unwrap();
         assert_eq!(e.active_txn_count(), 1);
         e.enqueue_set_text(92, "ABORT", t0).unwrap();
+        assert_eq!(e.active_txn_count(), 0);
+    }
+
+    #[test]
+    fn enqueue_start_alias_and_work_aliases_drive_transaction_state_transitions() {
+        let mut e = Engine::new_local();
+        let t0 = Instant::now();
+
+        e.enqueue_set_text(93, "START TRANSACTION READ ONLY", t0)
+            .unwrap();
+        assert_eq!(e.active_txn_count(), 1);
+        e.enqueue_set_text(93, "COMMIT WORK", t0).unwrap();
+        assert_eq!(e.active_txn_count(), 0);
+
+        e.enqueue_set_text(94, "START WORK, READ WRITE, DEFERRABLE", t0)
+            .unwrap();
+        assert_eq!(e.active_txn_count(), 1);
+        e.enqueue_set_text(94, "ROLLBACK TRANSACTION", t0).unwrap();
         assert_eq!(e.active_txn_count(), 0);
     }
 
