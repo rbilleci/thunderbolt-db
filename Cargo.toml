@@ -5,6 +5,7 @@ members = [
   "crates/wal",
   "crates/txn",
   "crates/execution",
+  "crates/planner",
   "crates/batching",
   "crates/metrics",
   "crates/protocol",

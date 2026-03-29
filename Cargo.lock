@@ -35,6 +35,14 @@ name = "gpu_db_metrics"
 version = "0.1.0"
 
 [[package]]
+name = "gpu_db_planner"
+version = "0.1.0"
+dependencies = [
+ "gpu_db_execution",
+ "gpu_db_protocol",
+]
+
+[[package]]
 name = "gpu_db_protocol"
 version = "0.1.0"
 dependencies = [

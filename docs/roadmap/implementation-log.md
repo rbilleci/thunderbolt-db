@@ -1,5 +1,12 @@
 # Implementation Log (Pre-NVIDIA Phase)
 
+## 2026-03-29
+
+### Completed
+- Added a new `gpu_db_planner` crate with a minimal device-aware planning surface (`Planner`, `ExecutionPlan`, `PlanNode`) so every planned command now has an explicit `DeviceTarget` annotation (`Cpu` or `Gpu(id)`) instead of relying on implicit routing assumptions.
+- Wired bootstrap planning policy to preserve GPU-first intent: mutation commands (`SET`/`DEL`/`DELETE`) are emitted as GPU-targeted plan nodes, while control/read/admin commands currently declare explicit CPU targets as the safe fallback path.
+- Added planner regression tests proving write commands are GPU-targeted, read commands are explicitly CPU-targeted fallback, and the planner never emits device-agnostic nodes.
+
 ## 2026-03-28
 
 ### Completed
