@@ -612,6 +612,44 @@ mod tests {
     }
 
     #[test]
+    fn parses_begin_mode_lists_with_mixed_order_and_delimiters() {
+        assert_eq!(
+            parse_command(
+                "BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE, READ ONLY, NOT DEFERRABLE"
+            )
+            .unwrap(),
+            Command::Begin
+        );
+        assert_eq!(
+            parse_command("BEGIN READ WRITE ISOLATION LEVEL READ COMMITTED DEFERRABLE").unwrap(),
+            Command::Begin
+        );
+        assert_eq!(
+            parse_command("START WORK, NOT DEFERRABLE, ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+                .unwrap(),
+            Command::Begin
+        );
+    }
+
+    #[test]
+    fn rejects_begin_mode_lists_with_duplicate_mode_kinds_even_when_comma_delimited() {
+        assert!(matches!(
+            parse_command("BEGIN READ ONLY, READ WRITE"),
+            Err(ParseError::Unsupported(_))
+        ));
+        assert!(matches!(
+            parse_command("BEGIN DEFERRABLE, NOT DEFERRABLE"),
+            Err(ParseError::Unsupported(_))
+        ));
+        assert!(matches!(
+            parse_command(
+                "START TRANSACTION ISOLATION LEVEL READ COMMITTED, ISOLATION LEVEL SERIALIZABLE"
+            ),
+            Err(ParseError::Unsupported(_))
+        ));
+    }
+
+    #[test]
     fn rejects_transaction_control_commands_with_extra_tokens() {
         assert!(matches!(
             parse_command("BEGIN TRANSACTION NOW"),
