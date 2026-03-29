@@ -13,5 +13,7 @@ gpu_db_txn = { path = "../txn" }
 gpu_db_metrics = { path = "../metrics" }
 gpu_db_protocol = { path = "../protocol" }
 gpu_db_batching = { path = "../batching" }
+gpu_db_planner = { path = "../planner" }
 
 [dev-dependencies]
+gpu_db_execution = { path = "../execution" }

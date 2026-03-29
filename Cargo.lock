@@ -14,7 +14,9 @@ name = "gpu_db_engine"
 version = "0.1.0"
 dependencies = [
  "gpu_db_batching",
+ "gpu_db_execution",
  "gpu_db_metrics",
+ "gpu_db_planner",
  "gpu_db_protocol",
  "gpu_db_replication",
  "gpu_db_txn",

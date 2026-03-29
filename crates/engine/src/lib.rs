@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 
 use gpu_db_batching::{BatchItem, DualTriggerBatcher, FlushReason};
 use gpu_db_metrics::{BatchFlushReason, FallbackReason, RuntimeMetrics};
+use gpu_db_planner::{ExecutionPlan, Planner};
 use gpu_db_protocol::{parse_command, Command, ParseError};
 use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine};
 use gpu_db_txn::{TxnError, TxnManager};
@@ -78,6 +79,7 @@ pub struct Engine {
     visible_up_to: Index,
     metrics: RuntimeMetrics,
     batcher: DualTriggerBatcher<PendingMutation>,
+    planner: Planner,
 }
 
 impl Engine {
@@ -90,6 +92,7 @@ impl Engine {
             visible_up_to: 0,
             metrics: RuntimeMetrics::default(),
             batcher: DualTriggerBatcher::new(64, Duration::from_millis(1)),
+            planner: Planner::default(),
         }
     }
 
@@ -297,6 +300,11 @@ impl Engine {
         Ok(())
     }
 
+    pub fn plan_text(&self, text: &str) -> Result<ExecutionPlan, ParseError> {
+        let cmd = parse_command(text)?;
+        Ok(self.planner.plan_command(&cmd))
+    }
+
     pub fn execute_text(&mut self, txn_id: u64, text: &str) -> Result<(), ExecuteError> {
         let cmd = parse_command(text)?;
 
@@ -457,6 +465,25 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpu_db_execution::DeviceTarget;
+
+    #[test]
+    fn planner_targets_mutations_to_gpu() {
+        let e = Engine::new_local();
+        let plan = e.plan_text("SET a=1").unwrap();
+
+        assert_eq!(plan.nodes().len(), 1);
+        assert_eq!(plan.nodes()[0].op.target, DeviceTarget::Gpu(0));
+    }
+
+    #[test]
+    fn planner_targets_get_to_cpu_fallback_path() {
+        let e = Engine::new_local();
+        let plan = e.plan_text("GET a").unwrap();
+
+        assert_eq!(plan.nodes().len(), 1);
+        assert_eq!(plan.nodes()[0].op.target, DeviceTarget::Cpu);
+    }
 
     #[test]
     fn wal_before_visibility_holds() {
