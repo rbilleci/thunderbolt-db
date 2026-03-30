@@ -852,6 +852,36 @@ mod tests {
     }
 
     #[test]
+    fn deterministic_replay_matches_between_immediate_and_batched_mutation_paths() {
+        let trace = [
+            (1, "SET acct_a=10"),
+            (2, "SET acct_b=25"),
+            (3, "DEL acct_a"),
+            (4, "SET acct_c=77"),
+            (5, "DELETE acct_b"),
+            (6, "SET acct_a=99"),
+        ];
+
+        let mut immediate = Engine::new_local();
+        for (txn_id, cmd) in trace {
+            immediate.execute_text(txn_id, cmd).unwrap();
+        }
+
+        let mut batched = Engine::with_batching(64, Duration::from_secs(999));
+        let t0 = Instant::now();
+        for (txn_id, cmd) in trace {
+            batched.enqueue_set_text(txn_id, cmd, t0).unwrap();
+        }
+        batched.flush_admin().unwrap();
+
+        assert_eq!(immediate.sm.applied, batched.sm.applied);
+        assert_eq!(immediate.sm.kv, batched.sm.kv);
+        assert_eq!(immediate.visible_up_to(), batched.visible_up_to());
+        assert_eq!(immediate.wal_flushed_count(), trace.len());
+        assert_eq!(batched.wal_flushed_count(), trace.len());
+    }
+
+    #[test]
     fn flush_command_drains_pending_batch() {
         let mut e = Engine::with_batching(10, Duration::from_secs(60));
         let t0 = Instant::now();
