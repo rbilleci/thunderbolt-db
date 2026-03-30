@@ -1576,6 +1576,18 @@ mod tests {
     }
 
     #[test]
+    fn replication_watermarks_follower_promotion_ready_requires_zero_active_txns() {
+        let mut e = Engine::new_local();
+        e.become_follower(5);
+        e.execute_text(9, "BEGIN").unwrap();
+
+        let marks = e.replication_watermarks();
+        assert_eq!(marks.role, Role::Follower);
+        assert_eq!(marks.active_txn_count, 1);
+        assert!(!marks.follower_promotion_ready);
+    }
+
+    #[test]
     fn replication_watermarks_include_active_transaction_count() {
         let mut e = Engine::new_local();
 
