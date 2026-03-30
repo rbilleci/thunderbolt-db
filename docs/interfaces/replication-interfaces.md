@@ -20,6 +20,7 @@
 
 - `role`, `term`
 - `commit_index`, `applied_index`, `visible_index`
+- Lag gauges: `commit_apply_gap`, `apply_visible_gap`
 - `snapshot_id`
 - WAL durability counters: `wal_flushed_count`, `wal_buffered_count`, `wal_unflushed_count`
 - Pending queue counters: `pending_batch_len`, `pending_batch_cap`

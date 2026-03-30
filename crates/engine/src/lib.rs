@@ -65,6 +65,8 @@ pub struct ReplicationWatermarks {
     pub commit_index: Index,
     pub applied_index: Index,
     pub visible_index: Index,
+    pub commit_apply_gap: Index,
+    pub apply_visible_gap: Index,
     pub snapshot_id: u64,
     pub wal_flushed_count: usize,
     pub wal_buffered_count: usize,
@@ -459,12 +461,18 @@ impl Engine {
         let active_txn_count = self.txn_manager.active_count();
         let role = self.repl.role();
 
+        let commit_index = self.repl.commit_index();
+        let applied_index = self.repl.applied_index();
+        let visible_index = self.visible_up_to;
+
         ReplicationWatermarks {
             role,
             term: self.repl.current_term(),
-            commit_index: self.repl.commit_index(),
-            applied_index: self.repl.applied_index(),
-            visible_index: self.visible_up_to,
+            commit_index,
+            applied_index,
+            visible_index,
+            commit_apply_gap: commit_index.saturating_sub(applied_index),
+            apply_visible_gap: applied_index.saturating_sub(visible_index),
             snapshot_id: self.repl.snapshot_meta().snapshot_id,
             wal_flushed_count: self.wal.flushed_count(),
             wal_buffered_count: self.wal.len(),
@@ -1393,6 +1401,8 @@ mod tests {
         assert_eq!(before.commit_index, 0);
         assert_eq!(before.applied_index, 0);
         assert_eq!(before.visible_index, 0);
+        assert_eq!(before.commit_apply_gap, 0);
+        assert_eq!(before.apply_visible_gap, 0);
         assert_eq!(before.snapshot_id, 0);
         assert_eq!(before.wal_flushed_count, 0);
         assert_eq!(before.wal_buffered_count, 0);
@@ -1413,6 +1423,8 @@ mod tests {
         assert_eq!(after.commit_index, token.index);
         assert_eq!(after.applied_index, token.index);
         assert_eq!(after.visible_index, token.index);
+        assert_eq!(after.commit_apply_gap, 0);
+        assert_eq!(after.apply_visible_gap, 0);
         assert_eq!(after.snapshot_id, 0);
         assert!(after.wal_flushed_count >= 1);
         assert_eq!(after.wal_buffered_count, e.wal_buffered_count());
@@ -1440,6 +1452,8 @@ mod tests {
         assert_eq!(marks.commit_index, 0);
         assert_eq!(marks.applied_index, 0);
         assert_eq!(marks.visible_index, 0);
+        assert_eq!(marks.commit_apply_gap, 0);
+        assert_eq!(marks.apply_visible_gap, 0);
         assert_eq!(marks.wal_flushed_count, 0);
         assert_eq!(marks.wal_buffered_count, 0);
         assert_eq!(marks.wal_unflushed_count, 0);
@@ -1576,6 +1590,8 @@ mod tests {
         assert_eq!(marks.commit_index, 7);
         assert_eq!(marks.applied_index, 7);
         assert_eq!(marks.visible_index, 7);
+        assert_eq!(marks.commit_apply_gap, 0);
+        assert_eq!(marks.apply_visible_gap, 0);
         assert_eq!(marks.snapshot_id, 11);
 
         let next = e.commit_mutation(2, b"SET b=2".to_vec()).unwrap();
