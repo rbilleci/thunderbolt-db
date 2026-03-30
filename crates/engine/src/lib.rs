@@ -78,6 +78,7 @@ pub struct ReplicationWatermarks {
     pub active_txn_count: usize,
     pub mutation_admission_saturated: bool,
     pub quiescent_for_failover: bool,
+    pub follower_promotion_ready: bool,
 }
 
 pub struct Engine {
@@ -465,14 +466,17 @@ impl Engine {
         let applied_index = self.repl.applied_index();
         let visible_index = self.visible_up_to;
 
+        let commit_apply_gap = commit_index.saturating_sub(applied_index);
+        let apply_visible_gap = applied_index.saturating_sub(visible_index);
+
         ReplicationWatermarks {
             role,
             term: self.repl.current_term(),
             commit_index,
             applied_index,
             visible_index,
-            commit_apply_gap: commit_index.saturating_sub(applied_index),
-            apply_visible_gap: applied_index.saturating_sub(visible_index),
+            commit_apply_gap,
+            apply_visible_gap,
             snapshot_id: self.repl.snapshot_meta().snapshot_id,
             wal_flushed_count: self.wal.flushed_count(),
             wal_buffered_count: self.wal.len(),
@@ -488,6 +492,12 @@ impl Engine {
             active_txn_count,
             mutation_admission_saturated: pending_batch_len >= pending_batch_cap,
             quiescent_for_failover: role == Role::Leader
+                && wal_unflushed_count == 0
+                && pending_batch_len == 0
+                && active_txn_count == 0,
+            follower_promotion_ready: role == Role::Follower
+                && commit_apply_gap == 0
+                && apply_visible_gap == 0
                 && wal_unflushed_count == 0
                 && pending_batch_len == 0
                 && active_txn_count == 0,
@@ -1414,6 +1424,7 @@ mod tests {
         assert_eq!(before.active_txn_count, 0);
         assert!(!before.mutation_admission_saturated);
         assert!(before.quiescent_for_failover);
+        assert!(!before.follower_promotion_ready);
 
         let token = e.commit_mutation(1, b"SET a=1".to_vec()).unwrap();
         let after = e.replication_watermarks();
@@ -1436,6 +1447,7 @@ mod tests {
         assert_eq!(after.active_txn_count, 0);
         assert!(!after.mutation_admission_saturated);
         assert!(after.quiescent_for_failover);
+        assert!(!after.follower_promotion_ready);
     }
 
     #[test]
@@ -1464,6 +1476,7 @@ mod tests {
         assert_eq!(marks.active_txn_count, 0);
         assert!(!marks.mutation_admission_saturated);
         assert!(!marks.quiescent_for_failover);
+        assert!(marks.follower_promotion_ready);
     }
 
     #[test]
@@ -1544,6 +1557,22 @@ mod tests {
         assert_eq!(marks.pending_batch_cap, 2);
         assert!(marks.mutation_admission_saturated);
         assert!(!marks.quiescent_for_failover);
+        assert!(!marks.follower_promotion_ready);
+    }
+
+    #[test]
+    fn replication_watermarks_follower_promotion_ready_requires_no_backlog() {
+        let mut e = Engine::with_batching(8, Duration::from_secs(999));
+        let t0 = Instant::now();
+
+        e.enqueue_set_text(1, "SET a=1", t0).unwrap();
+        e.become_follower(3);
+
+        let marks = e.replication_watermarks();
+        assert_eq!(marks.role, Role::Follower);
+        assert_eq!(marks.pending_batch_len, 1);
+        assert!(!marks.quiescent_for_failover);
+        assert!(!marks.follower_promotion_ready);
     }
 
     #[test]
