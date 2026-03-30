@@ -3,6 +3,7 @@
 ## 2026-03-30
 
 ### Completed
+- Added deterministic replay parity regression coverage for GPU-eligible mutation traces, proving immediate and batched mutation paths produce identical applied-entry ordering, visible index progression, WAL flush counts, and final key/value state.
 - Added engine regression coverage proving `GET` rejects candidate role consistently across both immediate (`execute_text`) and queued (`enqueue_set_text`) paths, with no queue/fallback/D2H side effects when leadership gates fail.
 - Extended `ReplicationWatermarks` with pending-queue timing telemetry (`pending_batch_oldest_age_ms`, `pending_batch_time_until_deadline_ms`) so replication snapshots expose queue staleness/deadline pressure in addition to depth.
 - Added `pending_batch_cap` to `ReplicationWatermarks` so queue depth is reported with explicit admission capacity context for overload diagnostics.
