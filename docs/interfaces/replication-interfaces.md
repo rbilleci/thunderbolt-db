@@ -25,6 +25,7 @@
 - Pending queue counters: `pending_batch_len`, `pending_batch_cap`
 - Pending queue timing: `pending_batch_oldest_age_ms`, `pending_batch_time_until_deadline_ms`
 - Transaction depth: `active_txn_count`
+- Admission pressure + readiness gates: `mutation_admission_saturated`, `quiescent_for_failover`
 
 ## Guarantees
 

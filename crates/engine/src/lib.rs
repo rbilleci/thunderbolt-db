@@ -74,6 +74,8 @@ pub struct ReplicationWatermarks {
     pub pending_batch_oldest_age_ms: Option<u64>,
     pub pending_batch_time_until_deadline_ms: Option<u64>,
     pub active_txn_count: usize,
+    pub mutation_admission_saturated: bool,
+    pub quiescent_for_failover: bool,
 }
 
 pub struct Engine {
@@ -451,8 +453,14 @@ impl Engine {
 
     pub fn replication_watermarks(&self) -> ReplicationWatermarks {
         let now = Instant::now();
+        let pending_batch_len = self.batcher.len();
+        let pending_batch_cap = self.batcher.max_items();
+        let wal_unflushed_count = self.wal.unflushed_count();
+        let active_txn_count = self.txn_manager.active_count();
+        let role = self.repl.role();
+
         ReplicationWatermarks {
-            role: self.repl.role(),
+            role,
             term: self.repl.current_term(),
             commit_index: self.repl.commit_index(),
             applied_index: self.repl.applied_index(),
@@ -460,16 +468,21 @@ impl Engine {
             snapshot_id: self.repl.snapshot_meta().snapshot_id,
             wal_flushed_count: self.wal.flushed_count(),
             wal_buffered_count: self.wal.len(),
-            wal_unflushed_count: self.wal.unflushed_count(),
-            pending_batch_len: self.batcher.len(),
-            pending_batch_cap: self.batcher.max_items(),
+            wal_unflushed_count,
+            pending_batch_len,
+            pending_batch_cap,
             pending_batch_oldest_age_ms: self
                 .pending_batch_oldest_age(now)
                 .map(|age| age.as_millis() as u64),
             pending_batch_time_until_deadline_ms: self
                 .pending_batch_time_until_deadline(now)
                 .map(|remaining| remaining.as_millis() as u64),
-            active_txn_count: self.txn_manager.active_count(),
+            active_txn_count,
+            mutation_admission_saturated: pending_batch_len >= pending_batch_cap,
+            quiescent_for_failover: role == Role::Leader
+                && wal_unflushed_count == 0
+                && pending_batch_len == 0
+                && active_txn_count == 0,
         }
     }
 
@@ -1389,6 +1402,8 @@ mod tests {
         assert_eq!(before.pending_batch_oldest_age_ms, None);
         assert_eq!(before.pending_batch_time_until_deadline_ms, None);
         assert_eq!(before.active_txn_count, 0);
+        assert!(!before.mutation_admission_saturated);
+        assert!(before.quiescent_for_failover);
 
         let token = e.commit_mutation(1, b"SET a=1".to_vec()).unwrap();
         let after = e.replication_watermarks();
@@ -1407,6 +1422,8 @@ mod tests {
         assert_eq!(after.pending_batch_oldest_age_ms, None);
         assert_eq!(after.pending_batch_time_until_deadline_ms, None);
         assert_eq!(after.active_txn_count, 0);
+        assert!(!after.mutation_admission_saturated);
+        assert!(after.quiescent_for_failover);
     }
 
     #[test]
@@ -1431,6 +1448,8 @@ mod tests {
         assert_eq!(marks.pending_batch_oldest_age_ms, None);
         assert_eq!(marks.pending_batch_time_until_deadline_ms, None);
         assert_eq!(marks.active_txn_count, 0);
+        assert!(!marks.mutation_admission_saturated);
+        assert!(!marks.quiescent_for_failover);
     }
 
     #[test]
@@ -1449,6 +1468,8 @@ mod tests {
         assert_eq!(marks.pending_batch_oldest_age_ms, None);
         assert_eq!(marks.pending_batch_time_until_deadline_ms, None);
         assert_eq!(marks.active_txn_count, 0);
+        assert!(!marks.mutation_admission_saturated);
+        assert!(marks.quiescent_for_failover);
     }
 
     #[test]
@@ -1486,6 +1507,29 @@ mod tests {
         assert_eq!(marks.wal_buffered_count, 0);
         assert_eq!(marks.wal_unflushed_count, 0);
         assert_eq!(marks.active_txn_count, 0);
+        assert!(!marks.quiescent_for_failover);
+    }
+
+    #[test]
+    fn replication_watermarks_flag_mutation_admission_saturation() {
+        let mut e = Engine::with_batching(2, Duration::from_secs(999));
+        let t0 = Instant::now();
+
+        e.enqueue_set_text(1, "SET a=1", t0).unwrap();
+        e.simulate_next_wal_flush_failure();
+        let err = e
+            .enqueue_set_text(2, "SET b=2", t0 + Duration::from_millis(1))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ExecuteError::Engine(EngineError::Durability(_))
+        ));
+
+        let marks = e.replication_watermarks();
+        assert_eq!(marks.pending_batch_len, 2);
+        assert_eq!(marks.pending_batch_cap, 2);
+        assert!(marks.mutation_admission_saturated);
+        assert!(!marks.quiescent_for_failover);
     }
 
     #[test]
@@ -1500,6 +1544,8 @@ mod tests {
         assert_eq!(marks.pending_batch_oldest_age_ms, None);
         assert_eq!(marks.pending_batch_time_until_deadline_ms, None);
         assert_eq!(marks.wal_buffered_count, 0);
+        assert!(!marks.mutation_admission_saturated);
+        assert!(!marks.quiescent_for_failover);
     }
 
     #[test]

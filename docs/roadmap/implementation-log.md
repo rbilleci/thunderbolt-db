@@ -3,6 +3,7 @@
 ## 2026-03-30
 
 ### Completed
+- Extended `ReplicationWatermarks` with two operational readiness flags: `mutation_admission_saturated` (pending queue at cap) and `quiescent_for_failover` (leader with zero WAL backlog, zero pending batch depth, and zero active transactions), plus regression coverage for follower state, pending-queue pressure, and active-transaction non-quiescent windows.
 - Added deterministic replay parity regression coverage for GPU-eligible mutation traces, proving immediate and batched mutation paths produce identical applied-entry ordering, visible index progression, WAL flush counts, and final key/value state.
 - Added `Engine::visible_state_fingerprint()` (deterministic FNV-1a over visible KV state) plus regression coverage so parity/fault harnesses can assert replay convergence via stable state digests.
 - Added engine regression coverage proving `GET` rejects candidate role consistently across both immediate (`execute_text`) and queued (`enqueue_set_text`) paths, with no queue/fallback/D2H side effects when leadership gates fail.
