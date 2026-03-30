@@ -423,6 +423,28 @@ impl Engine {
         self.sm.kv.get(key).map(|s| s.as_str())
     }
 
+    pub fn visible_state_fingerprint(&self) -> u64 {
+        const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+        const FNV_PRIME: u64 = 0x00000100000001B3;
+
+        fn hash_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
+            for b in bytes {
+                hash ^= *b as u64;
+                hash = hash.wrapping_mul(FNV_PRIME);
+            }
+            hash
+        }
+
+        let mut hash = FNV_OFFSET_BASIS;
+        for (k, v) in &self.sm.kv {
+            hash = hash_bytes(hash, k.as_bytes());
+            hash = hash_bytes(hash, &[0xFF]);
+            hash = hash_bytes(hash, v.as_bytes());
+            hash = hash_bytes(hash, &[0x00]);
+        }
+        hash
+    }
+
     pub fn active_txn_count(&self) -> usize {
         self.txn_manager.active_count()
     }
@@ -877,8 +899,26 @@ mod tests {
         assert_eq!(immediate.sm.applied, batched.sm.applied);
         assert_eq!(immediate.sm.kv, batched.sm.kv);
         assert_eq!(immediate.visible_up_to(), batched.visible_up_to());
+        assert_eq!(
+            immediate.visible_state_fingerprint(),
+            batched.visible_state_fingerprint()
+        );
         assert_eq!(immediate.wal_flushed_count(), trace.len());
         assert_eq!(batched.wal_flushed_count(), trace.len());
+    }
+
+    #[test]
+    fn visible_state_fingerprint_changes_with_visible_kv_state() {
+        let mut e = Engine::new_local();
+        let empty = e.visible_state_fingerprint();
+
+        e.execute_text(1, "SET a=1").unwrap();
+        let after_set = e.visible_state_fingerprint();
+        assert_ne!(after_set, empty);
+
+        e.execute_text(2, "DELETE a").unwrap();
+        let after_delete = e.visible_state_fingerprint();
+        assert_eq!(after_delete, empty);
     }
 
     #[test]
