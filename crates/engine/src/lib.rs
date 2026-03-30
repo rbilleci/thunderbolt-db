@@ -70,6 +70,7 @@ pub struct ReplicationWatermarks {
     pub wal_buffered_count: usize,
     pub wal_unflushed_count: usize,
     pub pending_batch_len: usize,
+    pub pending_batch_cap: usize,
     pub pending_batch_oldest_age_ms: Option<u64>,
     pub pending_batch_time_until_deadline_ms: Option<u64>,
     pub active_txn_count: usize,
@@ -439,6 +440,7 @@ impl Engine {
             wal_buffered_count: self.wal.len(),
             wal_unflushed_count: self.wal.unflushed_count(),
             pending_batch_len: self.batcher.len(),
+            pending_batch_cap: self.batcher.max_items(),
             pending_batch_oldest_age_ms: self
                 .pending_batch_oldest_age(now)
                 .map(|age| age.as_millis() as u64),
@@ -1286,6 +1288,7 @@ mod tests {
         assert_eq!(before.wal_buffered_count, 0);
         assert_eq!(before.wal_unflushed_count, 0);
         assert_eq!(before.pending_batch_len, 0);
+        assert_eq!(before.pending_batch_cap, 64);
         assert_eq!(before.pending_batch_oldest_age_ms, None);
         assert_eq!(before.pending_batch_time_until_deadline_ms, None);
         assert_eq!(before.active_txn_count, 0);
@@ -1303,6 +1306,7 @@ mod tests {
         assert_eq!(after.wal_buffered_count, e.wal_buffered_count());
         assert_eq!(after.wal_unflushed_count, e.wal_unflushed_count());
         assert_eq!(after.pending_batch_len, 0);
+        assert_eq!(after.pending_batch_cap, 64);
         assert_eq!(after.pending_batch_oldest_age_ms, None);
         assert_eq!(after.pending_batch_time_until_deadline_ms, None);
         assert_eq!(after.active_txn_count, 0);
@@ -1326,6 +1330,7 @@ mod tests {
         assert_eq!(marks.wal_buffered_count, 0);
         assert_eq!(marks.wal_unflushed_count, 0);
         assert_eq!(marks.pending_batch_len, 0);
+        assert_eq!(marks.pending_batch_cap, 64);
         assert_eq!(marks.pending_batch_oldest_age_ms, None);
         assert_eq!(marks.pending_batch_time_until_deadline_ms, None);
         assert_eq!(marks.active_txn_count, 0);
@@ -1343,6 +1348,7 @@ mod tests {
         assert_eq!(marks.wal_flushed_count, 2);
         assert_eq!(marks.wal_unflushed_count, 0);
         assert_eq!(marks.pending_batch_len, 0);
+        assert_eq!(marks.pending_batch_cap, 64);
         assert_eq!(marks.pending_batch_oldest_age_ms, None);
         assert_eq!(marks.pending_batch_time_until_deadline_ms, None);
         assert_eq!(marks.active_txn_count, 0);
@@ -1356,12 +1362,14 @@ mod tests {
         e.enqueue_set_text(1, "SET a=1", t0).unwrap();
         let before_flush = e.replication_watermarks();
         assert_eq!(before_flush.pending_batch_len, 1);
+        assert_eq!(before_flush.pending_batch_cap, 3);
         assert!(before_flush.pending_batch_oldest_age_ms.is_some());
         assert!(before_flush.pending_batch_time_until_deadline_ms.is_some());
 
         e.flush_admin().unwrap();
         let after_flush = e.replication_watermarks();
         assert_eq!(after_flush.pending_batch_len, 0);
+        assert_eq!(after_flush.pending_batch_cap, 3);
         assert_eq!(after_flush.pending_batch_oldest_age_ms, None);
         assert_eq!(after_flush.pending_batch_time_until_deadline_ms, None);
     }
@@ -1375,6 +1383,7 @@ mod tests {
 
         let marks = e.replication_watermarks();
         assert_eq!(marks.pending_batch_len, 1);
+        assert_eq!(marks.pending_batch_cap, 2);
         assert!(marks.pending_batch_oldest_age_ms.is_some());
         assert!(marks.pending_batch_time_until_deadline_ms.is_some());
         assert_eq!(marks.wal_buffered_count, 0);

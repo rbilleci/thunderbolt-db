@@ -4,6 +4,7 @@
 
 ### Completed
 - Extended `ReplicationWatermarks` with pending-queue timing telemetry (`pending_batch_oldest_age_ms`, `pending_batch_time_until_deadline_ms`) so replication snapshots expose queue staleness/deadline pressure in addition to depth.
+- Added `pending_batch_cap` to `ReplicationWatermarks` so queue depth is reported with explicit admission capacity context for overload diagnostics.
 - Added engine regression coverage proving pending-batch timing watermarks appear while queue items are buffered and clear immediately after admin flush drains the queue.
 - Extended `ReplicationWatermarks` with `active_txn_count` so replication/durability telemetry now exposes live transaction depth alongside role, index, WAL, and pending-batch signals.
 - Added engine regression coverage proving watermark snapshots report active transaction depth after `BEGIN`, and remain zero across follower rejection, buffered WAL, and pending-batch-only scenarios.
