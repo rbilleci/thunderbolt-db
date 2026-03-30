@@ -6,7 +6,7 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
 
 - Replication-shaped local commit path
 - WAL-before-visibility invariant tests
-- WAL durability watermarks (flushed, buffered, unflushed) plus active transaction depth
+- WAL durability + queue watermarks (flushed, buffered, unflushed, pending depth, pending age/deadline) plus active transaction depth
 - CPU-first reference engine skeleton
 - Device-aware execution abstractions
 
