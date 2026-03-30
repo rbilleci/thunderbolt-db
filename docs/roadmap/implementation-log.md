@@ -3,6 +3,7 @@
 ## 2026-03-30
 
 ### Completed
+- Added regression coverage proving `follower_promotion_ready` stays false while any active transaction context remains on follower nodes, hardening the promotion gate against in-flight session state.
 - Added `follower_promotion_ready` to `ReplicationWatermarks` so follower telemetry now exposes a promotion gate (no commit/apply or apply/visibility lag, no WAL unflushed backlog, no pending batch backlog, no active transactions), with regression coverage for both clean follower state and backlog-blocked state.
 - Extended `ReplicationWatermarks` with commit/apply/visibility lag gauges (`commit_apply_gap`, `apply_visible_gap`) so telemetry snapshots expose index drift directly alongside role and durability counters, with regression assertions covering baseline, follower-rejection, and snapshot-install paths.
 - Extended `ReplicationWatermarks` with two operational readiness flags: `mutation_admission_saturated` (pending queue at cap) and `quiescent_for_failover` (leader with zero WAL backlog, zero pending batch depth, and zero active transactions), plus regression coverage for follower state, pending-queue pressure, and active-transaction non-quiescent windows.
