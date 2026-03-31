@@ -27,13 +27,13 @@ This matrix maps major design intents from the original design document to imple
 | 7. Fault tolerance/replication/recovery | HA, replication, failover, recovery | `docs/architecture/03-replication-model.md`, `docs/architecture/08-backup-pitr-dr.md` | Covered |
 | 8. Security & compliance | Banking-grade security/control posture | `docs/architecture/07-security-and-compliance.md` | Covered |
 | 9. Observability | Metrics/logging/admin visibility | `docs/architecture/06-observability-slos.md` | Covered |
-| 10. Testing strategy | Correctness, parity, chaos, regressions | `docs/GPU_GUARDRAILS.md`, `docs/reviews/design-alignment-check.md`, future testing plan doc | Partially covered |
+| 10. Testing strategy | Correctness, parity, chaos, regressions | `docs/GPU_GUARDRAILS.md`, `docs/reviews/design-alignment-check.md`, `docs/testing/parity-and-jepsen-plan.md` | Covered (phased execution) |
 | 11. Implementation plan | Phased delivery and risk reduction | `docs/roadmap/v0-v1.md`, ADR set | Covered |
 
 ## Notes on Intentional Compression
 
 - The current docs intentionally compress execution scope while preserving architectural intent.
-- Areas marked *Partially covered* are primarily execution-detail depth gaps, not directional contradictions.
+- Execution remains phased, but the test-strategy mapping now points to explicit parity/fault-validation artifacts.
 
 ## Next traceability hardening steps
 
