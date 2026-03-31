@@ -48,6 +48,10 @@ impl WalBuffer {
         self.flushed
     }
 
+    pub fn flushed_records(&self) -> &[WalRecord] {
+        &self.records[..self.flushed]
+    }
+
     pub fn unflushed_count(&self) -> usize {
         self.records.len().saturating_sub(self.flushed)
     }
@@ -136,6 +140,47 @@ mod tests {
             txn_id: 3,
             payload: b"SET c=3".to_vec(),
         });
+        assert_eq!(wal.unflushed_count(), 1);
+    }
+
+    #[test]
+    fn flushed_records_expose_only_durable_prefix() {
+        let mut wal = WalBuffer::default();
+        wal.append(WalRecord {
+            txn_id: 1,
+            payload: b"SET a=1".to_vec(),
+        });
+        wal.append(WalRecord {
+            txn_id: 2,
+            payload: b"SET b=2".to_vec(),
+        });
+
+        assert!(wal.flushed_records().is_empty());
+
+        wal.flush_all().unwrap();
+        wal.append(WalRecord {
+            txn_id: 3,
+            payload: b"SET c=3".to_vec(),
+        });
+
+        let durable = wal.flushed_records();
+        assert_eq!(durable.len(), 2);
+        assert_eq!(durable[0].txn_id, 1);
+        assert_eq!(durable[1].txn_id, 2);
+    }
+
+    #[test]
+    fn flush_failure_does_not_advance_flushed_records() {
+        let mut wal = WalBuffer::default();
+        wal.append(WalRecord {
+            txn_id: 1,
+            payload: b"SET a=1".to_vec(),
+        });
+
+        wal.fail_next_flush();
+        let _ = wal.flush_all();
+
+        assert!(wal.flushed_records().is_empty());
         assert_eq!(wal.unflushed_count(), 1);
     }
 }
