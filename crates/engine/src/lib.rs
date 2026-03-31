@@ -76,6 +76,11 @@ pub struct ReplicationWatermarks {
     pub pending_batch_oldest_age_ms: Option<u64>,
     pub pending_batch_time_until_deadline_ms: Option<u64>,
     pub active_txn_count: usize,
+    pub has_wal_backlog: bool,
+    pub has_pending_batch_backlog: bool,
+    pub has_active_txn_backlog: bool,
+    pub has_commit_apply_gap: bool,
+    pub has_apply_visible_gap: bool,
     pub mutation_admission_saturated: bool,
     pub quiescent_for_failover: bool,
     pub follower_promotion_ready: bool,
@@ -473,6 +478,12 @@ impl Engine {
         let commit_apply_gap = commit_index.saturating_sub(applied_index);
         let apply_visible_gap = applied_index.saturating_sub(visible_index);
 
+        let has_wal_backlog = wal_unflushed_count > 0;
+        let has_pending_batch_backlog = pending_batch_len > 0;
+        let has_active_txn_backlog = active_txn_count > 0;
+        let has_commit_apply_gap = commit_apply_gap > 0;
+        let has_apply_visible_gap = apply_visible_gap > 0;
+
         ReplicationWatermarks {
             role,
             term: self.repl.current_term(),
@@ -494,17 +505,22 @@ impl Engine {
                 .pending_batch_time_until_deadline(now)
                 .map(|remaining| remaining.as_millis() as u64),
             active_txn_count,
+            has_wal_backlog,
+            has_pending_batch_backlog,
+            has_active_txn_backlog,
+            has_commit_apply_gap,
+            has_apply_visible_gap,
             mutation_admission_saturated: pending_batch_len >= pending_batch_cap,
             quiescent_for_failover: role == Role::Leader
-                && wal_unflushed_count == 0
-                && pending_batch_len == 0
-                && active_txn_count == 0,
+                && !has_wal_backlog
+                && !has_pending_batch_backlog
+                && !has_active_txn_backlog,
             follower_promotion_ready: role == Role::Follower
-                && commit_apply_gap == 0
-                && apply_visible_gap == 0
-                && wal_unflushed_count == 0
-                && pending_batch_len == 0
-                && active_txn_count == 0,
+                && !has_commit_apply_gap
+                && !has_apply_visible_gap
+                && !has_wal_backlog
+                && !has_pending_batch_backlog
+                && !has_active_txn_backlog,
         }
     }
 
@@ -1440,6 +1456,11 @@ mod tests {
         assert_eq!(before.pending_batch_oldest_age_ms, None);
         assert_eq!(before.pending_batch_time_until_deadline_ms, None);
         assert_eq!(before.active_txn_count, 0);
+        assert!(!before.has_wal_backlog);
+        assert!(!before.has_pending_batch_backlog);
+        assert!(!before.has_active_txn_backlog);
+        assert!(!before.has_commit_apply_gap);
+        assert!(!before.has_apply_visible_gap);
         assert!(!before.mutation_admission_saturated);
         assert!(before.quiescent_for_failover);
         assert!(!before.follower_promotion_ready);
@@ -1463,6 +1484,11 @@ mod tests {
         assert_eq!(after.pending_batch_oldest_age_ms, None);
         assert_eq!(after.pending_batch_time_until_deadline_ms, None);
         assert_eq!(after.active_txn_count, 0);
+        assert!(!after.has_wal_backlog);
+        assert!(!after.has_pending_batch_backlog);
+        assert!(!after.has_active_txn_backlog);
+        assert!(!after.has_commit_apply_gap);
+        assert!(!after.has_apply_visible_gap);
         assert!(!after.mutation_admission_saturated);
         assert!(after.quiescent_for_failover);
         assert!(!after.follower_promotion_ready);
@@ -1492,6 +1518,11 @@ mod tests {
         assert_eq!(marks.pending_batch_oldest_age_ms, None);
         assert_eq!(marks.pending_batch_time_until_deadline_ms, None);
         assert_eq!(marks.active_txn_count, 0);
+        assert!(!marks.has_wal_backlog);
+        assert!(!marks.has_pending_batch_backlog);
+        assert!(!marks.has_active_txn_backlog);
+        assert!(!marks.has_commit_apply_gap);
+        assert!(!marks.has_apply_visible_gap);
         assert!(!marks.mutation_admission_saturated);
         assert!(!marks.quiescent_for_failover);
         assert!(marks.follower_promotion_ready);
@@ -1549,6 +1580,11 @@ mod tests {
         assert_eq!(marks.pending_batch_cap, 2);
         assert!(marks.pending_batch_oldest_age_ms.is_some());
         assert!(marks.pending_batch_time_until_deadline_ms.is_some());
+        assert!(marks.has_pending_batch_backlog);
+        assert!(!marks.has_wal_backlog);
+        assert!(!marks.has_active_txn_backlog);
+        assert!(!marks.has_commit_apply_gap);
+        assert!(!marks.has_apply_visible_gap);
         assert_eq!(marks.wal_buffered_count, 0);
         assert_eq!(marks.wal_unflushed_count, 0);
         assert_eq!(marks.active_txn_count, 0);
@@ -1573,6 +1609,9 @@ mod tests {
         let marks = e.replication_watermarks();
         assert_eq!(marks.pending_batch_len, 2);
         assert_eq!(marks.pending_batch_cap, 2);
+        assert!(marks.has_pending_batch_backlog);
+        assert!(!marks.has_wal_backlog);
+        assert!(!marks.has_active_txn_backlog);
         assert!(marks.mutation_admission_saturated);
         assert!(!marks.quiescent_for_failover);
         assert!(!marks.follower_promotion_ready);
@@ -1616,6 +1655,9 @@ mod tests {
         assert_eq!(marks.pending_batch_len, 0);
         assert_eq!(marks.pending_batch_oldest_age_ms, None);
         assert_eq!(marks.pending_batch_time_until_deadline_ms, None);
+        assert!(marks.has_active_txn_backlog);
+        assert!(!marks.has_pending_batch_backlog);
+        assert!(!marks.has_wal_backlog);
         assert_eq!(marks.wal_buffered_count, 0);
         assert!(!marks.mutation_admission_saturated);
         assert!(!marks.quiescent_for_failover);

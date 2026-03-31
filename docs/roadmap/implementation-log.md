@@ -1,5 +1,13 @@
 # Implementation Log (Pre-NVIDIA Phase)
 
+## 2026-03-31
+
+### Completed
+- Extended `ReplicationWatermarks` with explicit backlog/gap blocker booleans (`has_wal_backlog`, `has_pending_batch_backlog`, `has_active_txn_backlog`, `has_commit_apply_gap`, `has_apply_visible_gap`) so automation can explain *why* readiness gates are false without recomputing conditions externally.
+- Refactored failover readiness calculations (`quiescent_for_failover`, `follower_promotion_ready`) to derive from the new blocker fields, keeping gate logic centralized and auditable.
+- Added/expanded engine regression assertions so baseline, follower-rejection, pending-queue backlog, and active-transaction backlog paths validate blocker flag behavior.
+- Updated replication interface docs to document the new blocker fields in telemetry snapshots.
+
 ## 2026-03-30
 
 ### Completed
