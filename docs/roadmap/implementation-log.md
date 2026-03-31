@@ -3,6 +3,7 @@
 ## 2026-03-31
 
 ### Completed
+- Expanded `docs/architecture/09-session-management-and-admission.md` with an explicit runtime admission-state contract (`active_sessions`, queue saturation, role, active txn depth) and deterministic signal-to-action mapping so session admission and failover-readiness decisions stay aligned.
 - Added `docs/interfaces/error-interfaces.md` to document crate-level error taxonomy (`ParseError`, `TxnError`, `EngineError`, `ExecuteError`), side-effect expectations, and operator-response mapping so WAL-before-visibility and role/admission rejection semantics are explicit and auditable.
 - Updated docs index and design traceability mappings to include the new error-interface contract and mark error-taxonomy hardening as complete.
 - Extended `ReplicationWatermarks` with explicit backlog/gap blocker booleans (`has_wal_backlog`, `has_pending_batch_backlog`, `has_active_txn_backlog`, `has_commit_apply_gap`, `has_apply_visible_gap`) so automation can explain *why* readiness gates are false without recomputing conditions externally.

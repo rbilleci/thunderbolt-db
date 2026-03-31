@@ -32,6 +32,31 @@ Define deterministic session and admission-control behavior so connection pressu
 
 These values are intentionally conservative until real GPU runtime and multi-node soak data are available.
 
+## Runtime Admission State Contract
+
+Each node should expose a minimal admission snapshot that operators can reason about without reconstructing hidden state:
+
+- `active_sessions`
+- `idle_sessions`
+- `pending_batch_len`
+- `pending_batch_cap`
+- `mutation_admission_saturated`
+- `active_txn_count`
+- `role`
+
+This aligns session pressure and mutation-queue pressure with existing replication watermarks so failover-readiness checks and admission checks are not divergent control loops.
+
+## Admission Actions by Signal
+
+- `active_sessions >= max_active_sessions`:
+  - reject new session establishment (do not drop existing active transaction sessions).
+- `pending_batch_len == pending_batch_cap` OR `mutation_admission_saturated`:
+  - reject new mutation enqueue with overload error.
+- `role != Leader` for mutation command:
+  - reject with `NotLeader`; never enqueue for deferred replay on followers/candidates.
+- `active_txn_count` non-zero during failover-prep:
+  - hold promotion readiness until transactions drain/resolve.
+
 ## Rejection/Backpressure Semantics
 
 - If node is not leader for mutation requests: reject with `NotLeader`.

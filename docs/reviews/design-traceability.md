@@ -40,5 +40,5 @@ This matrix maps major design intents from the original design document to imple
 1. ✅ Added `docs/compatibility/matrix.md` for explicit PostgreSQL feature status by phase.
 2. ✅ Added `docs/testing/parity-and-jepsen-plan.md` for deterministic replay and consistency validation criteria.
 3. ✅ Added `docs/operations/runbooks.md` to link DR/security controls to exact procedures.
-4. Expand 2.2 session-management traceability with concrete runtime limits/admission-control docs.
+4. ✅ Expanded 2.2 session-management traceability with concrete runtime admission-state contracts and signal-to-action mapping in `docs/architecture/09-session-management-and-admission.md`.
 5. ✅ Added `docs/interfaces/error-interfaces.md` with crate-level error contracts, composition boundaries, and operator response mapping.
