@@ -4,6 +4,7 @@
 
 ### Completed
 - Added `ReplicationWatermarks::backlog_blocker_count` so telemetry now includes an aggregate count of active backlog/gap blockers (`wal`, pending batch, active txn, commit/apply lag, apply/visibility lag) for simpler failover-readiness diagnostics without recomputing booleans downstream.
+- Added engine regression coverage proving `backlog_blocker_count` increments across combined blocker states (e.g., pending-batch backlog + active transaction backlog).
 - Optimized `TxnManager::active_count()` to O(1) by caching active transaction depth instead of rescanning all transaction states on every query, while preserving WAL-before-visibility and role-gating behavior through explicit regression coverage across `NotFound`, `NotActive`, and duplicate-id error paths.
 - Extended `ReplicationWatermarks` with `pending_batch_utilization_permyriad` (0..10_000) so telemetry exposes queue pressure as a normalized saturation gauge in addition to raw depth/cap counters; added regression assertions for empty, partial (1/3 and 1/2), and saturated (2/2) queue states.
 - Updated design traceability testing coverage to point at the concrete parity/fault-validation plan (`docs/testing/parity-and-jepsen-plan.md`) and marked the testing-strategy row as covered under phased execution.
