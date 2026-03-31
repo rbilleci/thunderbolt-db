@@ -3,6 +3,7 @@
 ## 2026-03-31
 
 ### Completed
+- Extended `ReplicationWatermarks` with `pending_batch_utilization_permyriad` (0..10_000) so telemetry exposes queue pressure as a normalized saturation gauge in addition to raw depth/cap counters; added regression assertions for empty, partial (1/3 and 1/2), and saturated (2/2) queue states.
 - Updated design traceability testing coverage to point at the concrete parity/fault-validation plan (`docs/testing/parity-and-jepsen-plan.md`) and marked the testing-strategy row as covered under phased execution.
 - Expanded `docs/architecture/09-session-management-and-admission.md` with an explicit runtime admission-state contract (`active_sessions`, queue saturation, role, active txn depth) and deterministic signal-to-action mapping so session admission and failover-readiness decisions stay aligned.
 - Added `docs/interfaces/error-interfaces.md` to document crate-level error taxonomy (`ParseError`, `TxnError`, `EngineError`, `ExecuteError`), side-effect expectations, and operator-response mapping so WAL-before-visibility and role/admission rejection semantics are explicit and auditable.
