@@ -1,11 +1,23 @@
 use std::collections::BTreeMap;
 
+use gpu_db_execution::GpuFallbackReason;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum FallbackReason {
     NotGpuEligible,
     GpuUnavailable,
     GpuQueueSaturated,
     GpuMemoryPressure,
+}
+
+impl From<GpuFallbackReason> for FallbackReason {
+    fn from(value: GpuFallbackReason) -> Self {
+        match value {
+            GpuFallbackReason::Unavailable => Self::GpuUnavailable,
+            GpuFallbackReason::QueueSaturated => Self::GpuQueueSaturated,
+            GpuFallbackReason::MemoryPressure => Self::GpuMemoryPressure,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -90,6 +102,10 @@ impl RuntimeMetrics {
         self.fallback_total += 1;
         *self.fallback_by_reason.entry(reason).or_insert(0) += 1;
         self.last_fallback_reason = Some(reason);
+    }
+
+    pub fn inc_gpu_fallback(&mut self, reason: GpuFallbackReason) {
+        self.inc_fallback(reason.into());
     }
 
     pub fn observe_h2d_bytes(&mut self, bytes: u64) {
@@ -205,6 +221,24 @@ mod tests {
         assert_eq!(
             m.last_fallback_reason(),
             Some(FallbackReason::NotGpuEligible)
+        );
+    }
+
+    #[test]
+    fn gpu_fallback_runtime_reasons_map_into_metric_fallback_reasons() {
+        let mut m = RuntimeMetrics::default();
+
+        m.inc_gpu_fallback(GpuFallbackReason::Unavailable);
+        m.inc_gpu_fallback(GpuFallbackReason::QueueSaturated);
+        m.inc_gpu_fallback(GpuFallbackReason::MemoryPressure);
+
+        assert_eq!(m.fallback_total, 3);
+        assert_eq!(m.fallback_for(FallbackReason::GpuUnavailable), 1);
+        assert_eq!(m.fallback_for(FallbackReason::GpuQueueSaturated), 1);
+        assert_eq!(m.fallback_for(FallbackReason::GpuMemoryPressure), 1);
+        assert_eq!(
+            m.last_fallback_reason(),
+            Some(FallbackReason::GpuMemoryPressure)
         );
     }
 
