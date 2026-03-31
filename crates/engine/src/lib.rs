@@ -1697,6 +1697,22 @@ mod tests {
     }
 
     #[test]
+    fn replication_watermarks_aggregate_multiple_backlog_blockers() {
+        let mut e = Engine::with_batching(8, Duration::from_secs(999));
+        let t0 = Instant::now();
+
+        e.enqueue_set_text(7, "SET a=1", t0).unwrap();
+        e.execute_text(8, "BEGIN").unwrap();
+
+        let marks = e.replication_watermarks();
+        assert!(marks.has_pending_batch_backlog);
+        assert!(marks.has_active_txn_backlog);
+        assert_eq!(marks.backlog_blocker_count, 2);
+        assert!(!marks.quiescent_for_failover);
+        assert!(!marks.follower_promotion_ready);
+    }
+
+    #[test]
     fn snapshot_export_tracks_last_applied_index() {
         let mut e = Engine::new_local();
         let token = e.commit_mutation(1, b"SET a=1".to_vec()).unwrap();
