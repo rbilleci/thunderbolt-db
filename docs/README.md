@@ -34,6 +34,7 @@ This project uses a layered documentation model so implementation can proceed qu
    - `docs/interfaces/replication-interfaces.md`
    - `docs/interfaces/execution-interfaces.md`
    - `docs/interfaces/transaction-interfaces.md`
+   - `docs/interfaces/error-interfaces.md`
 
 10. **Decision history (ADRs)**
    - `docs/adr/README.md`

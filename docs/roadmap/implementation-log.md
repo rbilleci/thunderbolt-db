@@ -3,6 +3,8 @@
 ## 2026-03-31
 
 ### Completed
+- Added `docs/interfaces/error-interfaces.md` to document crate-level error taxonomy (`ParseError`, `TxnError`, `EngineError`, `ExecuteError`), side-effect expectations, and operator-response mapping so WAL-before-visibility and role/admission rejection semantics are explicit and auditable.
+- Updated docs index and design traceability mappings to include the new error-interface contract and mark error-taxonomy hardening as complete.
 - Extended `ReplicationWatermarks` with explicit backlog/gap blocker booleans (`has_wal_backlog`, `has_pending_batch_backlog`, `has_active_txn_backlog`, `has_commit_apply_gap`, `has_apply_visible_gap`) so automation can explain *why* readiness gates are false without recomputing conditions externally.
 - Refactored failover readiness calculations (`quiescent_for_failover`, `follower_promotion_ready`) to derive from the new blocker fields, keeping gate logic centralized and auditable.
 - Added/expanded engine regression assertions so baseline, follower-rejection, pending-queue backlog, and active-transaction backlog paths validate blocker flag behavior.

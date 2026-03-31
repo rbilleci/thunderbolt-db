@@ -17,7 +17,7 @@ This matrix maps major design intents from the original design document to imple
 | 2.2 Session management | Connection/session model and limits | `docs/architecture/06-observability-slos.md`, `docs/architecture/09-session-management-and-admission.md` | Covered (bootstrap limits; adaptive controls deferred) |
 | 2.3 SQL dialect/features | Broad SQL + transactional semantics | `docs/roadmap/v0-v1.md`, `docs/interfaces/transaction-interfaces.md` | Covered (phased) |
 | 2.4 System catalog compatibility | Tooling compatibility posture | `docs/architecture/01-system-invariants.md` | Covered (policy-level) |
-| 2.5 Error taxonomy | Structured failure propagation | `docs/architecture/02-commit-path.md`, `docs/architecture/06-observability-slos.md` | Covered (to be expanded) |
+| 2.5 Error taxonomy | Structured failure propagation | `docs/architecture/02-commit-path.md`, `docs/architecture/06-observability-slos.md`, `docs/interfaces/error-interfaces.md` | Covered |
 | 3. Storage layout & buffering | Hybrid storage and memory management | `docs/architecture/05-storage-and-recovery.md`, `docs/architecture/04-execution-model-cpu-gpu.md` | Covered (high-level) |
 | 3.7 WAL/checkpoints | Durability model and recovery boundaries | `docs/architecture/02-commit-path.md`, `docs/architecture/05-storage-and-recovery.md` | Covered |
 | 4. GPU integration | Batched GPU execution, error handling, abstractions | `docs/architecture/04-execution-model-cpu-gpu.md`, `docs/interfaces/execution-interfaces.md` | Covered |
@@ -41,4 +41,4 @@ This matrix maps major design intents from the original design document to imple
 2. ✅ Added `docs/testing/parity-and-jepsen-plan.md` for deterministic replay and consistency validation criteria.
 3. ✅ Added `docs/operations/runbooks.md` to link DR/security controls to exact procedures.
 4. Expand 2.2 session-management traceability with concrete runtime limits/admission-control docs.
-5. Expand error-taxonomy mapping with crate-level error contracts and operator response playbooks.
+5. ✅ Added `docs/interfaces/error-interfaces.md` with crate-level error contracts, composition boundaries, and operator response mapping.
