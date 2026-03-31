@@ -3,6 +3,7 @@
 ## 2026-03-31
 
 ### Completed
+- Added `ReplicationWatermarks::pending_batch_remaining_capacity` so queue telemetry now exposes free enqueue headroom directly (`cap - len`) alongside saturation/utilization fields, with regression coverage for empty, partially filled, and saturated queue states.
 - Added `ReplicationWatermarks::backlog_blocker_count` so telemetry now includes an aggregate count of active backlog/gap blockers (`wal`, pending batch, active txn, commit/apply lag, apply/visibility lag) for simpler failover-readiness diagnostics without recomputing booleans downstream.
 - Added engine regression coverage proving `backlog_blocker_count` increments across combined blocker states (e.g., pending-batch backlog + active transaction backlog).
 - Optimized `TxnManager::active_count()` to O(1) by caching active transaction depth instead of rescanning all transaction states on every query, while preserving WAL-before-visibility and role-gating behavior through explicit regression coverage across `NotFound`, `NotActive`, and duplicate-id error paths.

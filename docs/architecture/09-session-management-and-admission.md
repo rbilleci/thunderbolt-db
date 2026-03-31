@@ -40,6 +40,7 @@ Each node should expose a minimal admission snapshot that operators can reason a
 - `idle_sessions`
 - `pending_batch_len`
 - `pending_batch_cap`
+- `pending_batch_remaining_capacity`
 - `mutation_admission_saturated`
 - `active_txn_count`
 - `role`

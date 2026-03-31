@@ -73,6 +73,7 @@ pub struct ReplicationWatermarks {
     pub wal_unflushed_count: usize,
     pub pending_batch_len: usize,
     pub pending_batch_cap: usize,
+    pub pending_batch_remaining_capacity: usize,
     pub pending_batch_utilization_permyriad: u16,
     pub pending_batch_oldest_age_ms: Option<u64>,
     pub pending_batch_time_until_deadline_ms: Option<u64>,
@@ -472,6 +473,7 @@ impl Engine {
         let wal_unflushed_count = self.wal.unflushed_count();
         let active_txn_count = self.txn_manager.active_count();
         let role = self.repl.role();
+        let pending_batch_remaining_capacity = pending_batch_cap.saturating_sub(pending_batch_len);
         let pending_batch_utilization_permyriad = if pending_batch_cap == 0 {
             0
         } else {
@@ -517,6 +519,7 @@ impl Engine {
             wal_unflushed_count,
             pending_batch_len,
             pending_batch_cap,
+            pending_batch_remaining_capacity,
             pending_batch_utilization_permyriad,
             pending_batch_oldest_age_ms: self
                 .pending_batch_oldest_age(now)
@@ -1474,6 +1477,7 @@ mod tests {
         assert_eq!(before.wal_unflushed_count, 0);
         assert_eq!(before.pending_batch_len, 0);
         assert_eq!(before.pending_batch_cap, 64);
+        assert_eq!(before.pending_batch_remaining_capacity, 64);
         assert_eq!(before.pending_batch_utilization_permyriad, 0);
         assert_eq!(before.pending_batch_oldest_age_ms, None);
         assert_eq!(before.pending_batch_time_until_deadline_ms, None);
@@ -1504,6 +1508,7 @@ mod tests {
         assert_eq!(after.wal_unflushed_count, e.wal_unflushed_count());
         assert_eq!(after.pending_batch_len, 0);
         assert_eq!(after.pending_batch_cap, 64);
+        assert_eq!(after.pending_batch_remaining_capacity, 64);
         assert_eq!(after.pending_batch_utilization_permyriad, 0);
         assert_eq!(after.pending_batch_oldest_age_ms, None);
         assert_eq!(after.pending_batch_time_until_deadline_ms, None);
@@ -1540,6 +1545,7 @@ mod tests {
         assert_eq!(marks.wal_unflushed_count, 0);
         assert_eq!(marks.pending_batch_len, 0);
         assert_eq!(marks.pending_batch_cap, 64);
+        assert_eq!(marks.pending_batch_remaining_capacity, 64);
         assert_eq!(marks.pending_batch_utilization_permyriad, 0);
         assert_eq!(marks.pending_batch_oldest_age_ms, None);
         assert_eq!(marks.pending_batch_time_until_deadline_ms, None);
@@ -1567,6 +1573,7 @@ mod tests {
         assert_eq!(marks.wal_unflushed_count, 0);
         assert_eq!(marks.pending_batch_len, 0);
         assert_eq!(marks.pending_batch_cap, 64);
+        assert_eq!(marks.pending_batch_remaining_capacity, 64);
         assert_eq!(marks.pending_batch_utilization_permyriad, 0);
         assert_eq!(marks.pending_batch_oldest_age_ms, None);
         assert_eq!(marks.pending_batch_time_until_deadline_ms, None);
@@ -1584,6 +1591,7 @@ mod tests {
         let before_flush = e.replication_watermarks();
         assert_eq!(before_flush.pending_batch_len, 1);
         assert_eq!(before_flush.pending_batch_cap, 3);
+        assert_eq!(before_flush.pending_batch_remaining_capacity, 2);
         assert_eq!(before_flush.pending_batch_utilization_permyriad, 3_333);
         assert!(before_flush.pending_batch_oldest_age_ms.is_some());
         assert!(before_flush.pending_batch_time_until_deadline_ms.is_some());
@@ -1592,6 +1600,7 @@ mod tests {
         let after_flush = e.replication_watermarks();
         assert_eq!(after_flush.pending_batch_len, 0);
         assert_eq!(after_flush.pending_batch_cap, 3);
+        assert_eq!(after_flush.pending_batch_remaining_capacity, 3);
         assert_eq!(after_flush.pending_batch_utilization_permyriad, 0);
         assert_eq!(after_flush.pending_batch_oldest_age_ms, None);
         assert_eq!(after_flush.pending_batch_time_until_deadline_ms, None);
@@ -1607,6 +1616,7 @@ mod tests {
         let marks = e.replication_watermarks();
         assert_eq!(marks.pending_batch_len, 1);
         assert_eq!(marks.pending_batch_cap, 2);
+        assert_eq!(marks.pending_batch_remaining_capacity, 1);
         assert_eq!(marks.pending_batch_utilization_permyriad, 5_000);
         assert!(marks.pending_batch_oldest_age_ms.is_some());
         assert!(marks.pending_batch_time_until_deadline_ms.is_some());
@@ -1640,6 +1650,7 @@ mod tests {
         let marks = e.replication_watermarks();
         assert_eq!(marks.pending_batch_len, 2);
         assert_eq!(marks.pending_batch_cap, 2);
+        assert_eq!(marks.pending_batch_remaining_capacity, 0);
         assert_eq!(marks.pending_batch_utilization_permyriad, 10_000);
         assert!(marks.has_pending_batch_backlog);
         assert!(!marks.has_wal_backlog);
