@@ -40,6 +40,7 @@ impl std::error::Error for TxnError {}
 pub struct TxnManager {
     next_id: TxnId,
     states: BTreeMap<TxnId, TxnState>,
+    active_count: usize,
 }
 
 impl TxnManager {
@@ -49,6 +50,7 @@ impl TxnManager {
         };
         self.next_id = id;
         self.states.insert(id, TxnState::Active);
+        self.active_count = self.active_count.saturating_add(1);
         Ok(Txn {
             id,
             state: TxnState::Active,
@@ -61,6 +63,7 @@ impl TxnManager {
         }
         self.next_id = self.next_id.max(id);
         self.states.insert(id, TxnState::Active);
+        self.active_count = self.active_count.saturating_add(1);
         Ok(Txn {
             id,
             state: TxnState::Active,
@@ -80,10 +83,7 @@ impl TxnManager {
     }
 
     pub fn active_count(&self) -> usize {
-        self.states
-            .values()
-            .filter(|state| matches!(state, TxnState::Active))
-            .count()
+        self.active_count
     }
 
     fn transition_terminal(&mut self, id: TxnId, to: TxnState) -> Result<Txn, TxnError> {
@@ -94,6 +94,7 @@ impl TxnManager {
             return Err(TxnError::NotActive(id));
         }
         *state = to;
+        self.active_count = self.active_count.saturating_sub(1);
         Ok(Txn { id, state: to })
     }
 }
@@ -189,5 +190,24 @@ mod tests {
         tm.commit(u64::MAX).unwrap();
 
         assert_eq!(tm.begin(), Err(TxnError::IdExhausted));
+    }
+
+    #[test]
+    fn active_count_stays_consistent_across_error_paths() {
+        let mut tm = TxnManager::default();
+        let t = tm.begin().unwrap();
+        assert_eq!(tm.active_count(), 1);
+
+        assert_eq!(tm.commit(999), Err(TxnError::NotFound(999)));
+        assert_eq!(tm.active_count(), 1);
+
+        tm.commit(t.id).unwrap();
+        assert_eq!(tm.active_count(), 0);
+
+        assert_eq!(tm.rollback(t.id), Err(TxnError::NotActive(t.id)));
+        assert_eq!(tm.active_count(), 0);
+
+        assert_eq!(tm.begin_with_id(t.id), Err(TxnError::AlreadyExists(t.id)));
+        assert_eq!(tm.active_count(), 0);
     }
 }
