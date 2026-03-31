@@ -424,6 +424,10 @@ impl Engine {
         self.wal.unflushed_count()
     }
 
+    pub fn durable_wal_records(&self) -> &[WalRecord] {
+        self.wal.flushed_records()
+    }
+
     pub fn get(&self, key: &str) -> Option<&str> {
         self.sm.kv.get(key).map(|s| s.as_str())
     }
@@ -996,6 +1000,20 @@ mod tests {
         assert_eq!(e.wal_flushed_count(), 0);
         assert_eq!(e.wal_buffered_count(), 0);
         assert_eq!(e.wal_unflushed_count(), 0);
+    }
+
+    #[test]
+    fn durable_wal_records_exclude_failed_commit_attempts() {
+        let mut e = Engine::new_local();
+
+        e.commit_mutation(1, b"SET a=1".to_vec()).unwrap();
+        e.simulate_next_wal_flush_failure();
+        let _ = e.commit_mutation(2, b"SET b=2".to_vec());
+
+        let durable = e.durable_wal_records();
+        assert_eq!(durable.len(), 1);
+        assert_eq!(durable[0].txn_id, 1);
+        assert_eq!(durable[0].payload, b"SET a=1".to_vec());
     }
 
     #[test]
