@@ -23,7 +23,7 @@
 - Lag gauges: `commit_apply_gap`, `apply_visible_gap`
 - `snapshot_id`
 - WAL durability counters: `wal_flushed_count`, `wal_buffered_count`, `wal_unflushed_count`
-- Pending queue counters: `pending_batch_len`, `pending_batch_cap`, `pending_batch_remaining_capacity`, `pending_batch_utilization_permyriad`
+- Pending queue counters: `pending_batch_len`, `pending_batch_cap`, `pending_batch_remaining_capacity`, `pending_batch_utilization_permyriad`, `pending_batch_remaining_capacity_permyriad`
 - Pending queue timing: `pending_batch_oldest_age_ms`, `pending_batch_time_until_deadline_ms`
 - Transaction depth: `active_txn_count`
 - Backlog/gap blocker flags: `has_wal_backlog`, `has_pending_batch_backlog`, `has_active_txn_backlog`, `has_commit_apply_gap`, `has_apply_visible_gap`

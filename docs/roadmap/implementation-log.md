@@ -1,5 +1,12 @@
 # Implementation Log (Pre-NVIDIA Phase)
 
+## 2026-04-01
+
+### Completed
+- Extended `ReplicationWatermarks` with `pending_batch_remaining_capacity_permyriad` (inverse of queue utilization) so operators can read normalized enqueue headroom directly without recomputing from depth/cap values.
+- Added engine regression assertions covering empty, partial, and saturated queue states for the new headroom metric to keep admission telemetry deterministic.
+- Updated replication and admission-control interface docs so the normalized pending-queue headroom field is part of the documented runtime contract.
+
 ## 2026-03-31
 
 ### Completed

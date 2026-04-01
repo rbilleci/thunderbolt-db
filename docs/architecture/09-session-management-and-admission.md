@@ -41,6 +41,7 @@ Each node should expose a minimal admission snapshot that operators can reason a
 - `pending_batch_len`
 - `pending_batch_cap`
 - `pending_batch_remaining_capacity`
+- `pending_batch_remaining_capacity_permyriad`
 - `mutation_admission_saturated`
 - `active_txn_count`
 - `role`
