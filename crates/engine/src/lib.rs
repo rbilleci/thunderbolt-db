@@ -75,6 +75,7 @@ pub struct ReplicationWatermarks {
     pub pending_batch_cap: usize,
     pub pending_batch_remaining_capacity: usize,
     pub pending_batch_utilization_permyriad: u16,
+    pub pending_batch_remaining_capacity_permyriad: u16,
     pub pending_batch_oldest_age_ms: Option<u64>,
     pub pending_batch_time_until_deadline_ms: Option<u64>,
     pub active_txn_count: usize,
@@ -481,6 +482,8 @@ impl Engine {
                 (pending_batch_len as u128).saturating_mul(10_000) / (pending_batch_cap as u128);
             utilization.min(10_000) as u16
         };
+        let pending_batch_remaining_capacity_permyriad =
+            10_000u16.saturating_sub(pending_batch_utilization_permyriad);
 
         let commit_index = self.repl.commit_index();
         let applied_index = self.repl.applied_index();
@@ -521,6 +524,7 @@ impl Engine {
             pending_batch_cap,
             pending_batch_remaining_capacity,
             pending_batch_utilization_permyriad,
+            pending_batch_remaining_capacity_permyriad,
             pending_batch_oldest_age_ms: self
                 .pending_batch_oldest_age(now)
                 .map(|age| age.as_millis() as u64),
@@ -1479,6 +1483,7 @@ mod tests {
         assert_eq!(before.pending_batch_cap, 64);
         assert_eq!(before.pending_batch_remaining_capacity, 64);
         assert_eq!(before.pending_batch_utilization_permyriad, 0);
+        assert_eq!(before.pending_batch_remaining_capacity_permyriad, 10_000);
         assert_eq!(before.pending_batch_oldest_age_ms, None);
         assert_eq!(before.pending_batch_time_until_deadline_ms, None);
         assert_eq!(before.active_txn_count, 0);
@@ -1510,6 +1515,7 @@ mod tests {
         assert_eq!(after.pending_batch_cap, 64);
         assert_eq!(after.pending_batch_remaining_capacity, 64);
         assert_eq!(after.pending_batch_utilization_permyriad, 0);
+        assert_eq!(after.pending_batch_remaining_capacity_permyriad, 10_000);
         assert_eq!(after.pending_batch_oldest_age_ms, None);
         assert_eq!(after.pending_batch_time_until_deadline_ms, None);
         assert_eq!(after.active_txn_count, 0);
@@ -1547,6 +1553,7 @@ mod tests {
         assert_eq!(marks.pending_batch_cap, 64);
         assert_eq!(marks.pending_batch_remaining_capacity, 64);
         assert_eq!(marks.pending_batch_utilization_permyriad, 0);
+        assert_eq!(marks.pending_batch_remaining_capacity_permyriad, 10_000);
         assert_eq!(marks.pending_batch_oldest_age_ms, None);
         assert_eq!(marks.pending_batch_time_until_deadline_ms, None);
         assert_eq!(marks.active_txn_count, 0);
@@ -1575,6 +1582,7 @@ mod tests {
         assert_eq!(marks.pending_batch_cap, 64);
         assert_eq!(marks.pending_batch_remaining_capacity, 64);
         assert_eq!(marks.pending_batch_utilization_permyriad, 0);
+        assert_eq!(marks.pending_batch_remaining_capacity_permyriad, 10_000);
         assert_eq!(marks.pending_batch_oldest_age_ms, None);
         assert_eq!(marks.pending_batch_time_until_deadline_ms, None);
         assert_eq!(marks.active_txn_count, 0);
@@ -1593,6 +1601,10 @@ mod tests {
         assert_eq!(before_flush.pending_batch_cap, 3);
         assert_eq!(before_flush.pending_batch_remaining_capacity, 2);
         assert_eq!(before_flush.pending_batch_utilization_permyriad, 3_333);
+        assert_eq!(
+            before_flush.pending_batch_remaining_capacity_permyriad,
+            6_667
+        );
         assert!(before_flush.pending_batch_oldest_age_ms.is_some());
         assert!(before_flush.pending_batch_time_until_deadline_ms.is_some());
 
@@ -1602,6 +1614,10 @@ mod tests {
         assert_eq!(after_flush.pending_batch_cap, 3);
         assert_eq!(after_flush.pending_batch_remaining_capacity, 3);
         assert_eq!(after_flush.pending_batch_utilization_permyriad, 0);
+        assert_eq!(
+            after_flush.pending_batch_remaining_capacity_permyriad,
+            10_000
+        );
         assert_eq!(after_flush.pending_batch_oldest_age_ms, None);
         assert_eq!(after_flush.pending_batch_time_until_deadline_ms, None);
     }
@@ -1618,6 +1634,7 @@ mod tests {
         assert_eq!(marks.pending_batch_cap, 2);
         assert_eq!(marks.pending_batch_remaining_capacity, 1);
         assert_eq!(marks.pending_batch_utilization_permyriad, 5_000);
+        assert_eq!(marks.pending_batch_remaining_capacity_permyriad, 5_000);
         assert!(marks.pending_batch_oldest_age_ms.is_some());
         assert!(marks.pending_batch_time_until_deadline_ms.is_some());
         assert!(marks.has_pending_batch_backlog);
@@ -1652,6 +1669,7 @@ mod tests {
         assert_eq!(marks.pending_batch_cap, 2);
         assert_eq!(marks.pending_batch_remaining_capacity, 0);
         assert_eq!(marks.pending_batch_utilization_permyriad, 10_000);
+        assert_eq!(marks.pending_batch_remaining_capacity_permyriad, 0);
         assert!(marks.has_pending_batch_backlog);
         assert!(!marks.has_wal_backlog);
         assert!(!marks.has_active_txn_backlog);
