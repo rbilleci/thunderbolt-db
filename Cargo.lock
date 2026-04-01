@@ -35,6 +35,9 @@ dependencies = [
 [[package]]
 name = "gpu_db_metrics"
 version = "0.1.0"
+dependencies = [
+ "gpu_db_execution",
+]
 
 [[package]]
 name = "gpu_db_planner"
