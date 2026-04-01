@@ -84,6 +84,7 @@ pub struct ReplicationWatermarks {
     pub has_active_txn_backlog: bool,
     pub has_commit_apply_gap: bool,
     pub has_apply_visible_gap: bool,
+    pub has_backlog_blockers: bool,
     pub backlog_blocker_count: u8,
     pub mutation_admission_saturated: bool,
     pub quiescent_for_failover: bool,
@@ -507,6 +508,7 @@ impl Engine {
         .into_iter()
         .filter(|blocked| *blocked)
         .count() as u8;
+        let has_backlog_blockers = backlog_blocker_count > 0;
 
         ReplicationWatermarks {
             role,
@@ -537,6 +539,7 @@ impl Engine {
             has_active_txn_backlog,
             has_commit_apply_gap,
             has_apply_visible_gap,
+            has_backlog_blockers,
             backlog_blocker_count,
             mutation_admission_saturated: pending_batch_len >= pending_batch_cap,
             quiescent_for_failover: role == Role::Leader
@@ -1492,6 +1495,7 @@ mod tests {
         assert!(!before.has_active_txn_backlog);
         assert!(!before.has_commit_apply_gap);
         assert!(!before.has_apply_visible_gap);
+        assert!(!before.has_backlog_blockers);
         assert_eq!(before.backlog_blocker_count, 0);
         assert!(!before.mutation_admission_saturated);
         assert!(before.quiescent_for_failover);
@@ -1524,6 +1528,7 @@ mod tests {
         assert!(!after.has_active_txn_backlog);
         assert!(!after.has_commit_apply_gap);
         assert!(!after.has_apply_visible_gap);
+        assert!(!after.has_backlog_blockers);
         assert_eq!(after.backlog_blocker_count, 0);
         assert!(!after.mutation_admission_saturated);
         assert!(after.quiescent_for_failover);
@@ -1562,6 +1567,7 @@ mod tests {
         assert!(!marks.has_active_txn_backlog);
         assert!(!marks.has_commit_apply_gap);
         assert!(!marks.has_apply_visible_gap);
+        assert!(!marks.has_backlog_blockers);
         assert!(!marks.mutation_admission_saturated);
         assert!(!marks.quiescent_for_failover);
         assert!(marks.follower_promotion_ready);
@@ -1638,6 +1644,7 @@ mod tests {
         assert!(marks.pending_batch_oldest_age_ms.is_some());
         assert!(marks.pending_batch_time_until_deadline_ms.is_some());
         assert!(marks.has_pending_batch_backlog);
+        assert!(marks.has_backlog_blockers);
         assert_eq!(marks.backlog_blocker_count, 1);
         assert!(!marks.has_wal_backlog);
         assert!(!marks.has_active_txn_backlog);
@@ -1717,6 +1724,7 @@ mod tests {
         assert_eq!(marks.pending_batch_oldest_age_ms, None);
         assert_eq!(marks.pending_batch_time_until_deadline_ms, None);
         assert!(marks.has_active_txn_backlog);
+        assert!(marks.has_backlog_blockers);
         assert_eq!(marks.backlog_blocker_count, 1);
         assert!(!marks.has_pending_batch_backlog);
         assert!(!marks.has_wal_backlog);
@@ -1736,6 +1744,7 @@ mod tests {
         let marks = e.replication_watermarks();
         assert!(marks.has_pending_batch_backlog);
         assert!(marks.has_active_txn_backlog);
+        assert!(marks.has_backlog_blockers);
         assert_eq!(marks.backlog_blocker_count, 2);
         assert!(!marks.quiescent_for_failover);
         assert!(!marks.follower_promotion_ready);

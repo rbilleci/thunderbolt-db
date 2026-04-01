@@ -3,6 +3,9 @@
 ## 2026-04-01
 
 ### Completed
+- Added `ReplicationWatermarks::has_backlog_blockers` as a boolean aggregate over backlog/gap blocker signals so automation can short-circuit readiness checks without recomputing from individual flags or counts.
+- Added engine regression assertions proving `has_backlog_blockers` stays false in clean snapshots and flips true for single- and multi-blocker states.
+- Updated replication interface docs so the aggregate blocker boolean is part of the published telemetry contract.
 - Extended `ReplicationWatermarks` with `pending_batch_remaining_capacity_permyriad` (inverse of queue utilization) so operators can read normalized enqueue headroom directly without recomputing from depth/cap values.
 - Added engine regression assertions covering empty, partial, and saturated queue states for the new headroom metric to keep admission telemetry deterministic.
 - Updated replication and admission-control interface docs so the normalized pending-queue headroom field is part of the documented runtime contract.
