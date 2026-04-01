@@ -58,6 +58,12 @@ struct PendingMutation {
     payload: Vec<u8>,
 }
 
+const BACKLOG_BLOCKER_WAL_BIT: u8 = 1 << 0;
+const BACKLOG_BLOCKER_PENDING_BATCH_BIT: u8 = 1 << 1;
+const BACKLOG_BLOCKER_ACTIVE_TXN_BIT: u8 = 1 << 2;
+const BACKLOG_BLOCKER_COMMIT_APPLY_GAP_BIT: u8 = 1 << 3;
+const BACKLOG_BLOCKER_APPLY_VISIBLE_GAP_BIT: u8 = 1 << 4;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReplicationWatermarks {
     pub role: Role,
@@ -86,6 +92,7 @@ pub struct ReplicationWatermarks {
     pub has_apply_visible_gap: bool,
     pub has_backlog_blockers: bool,
     pub backlog_blocker_count: u8,
+    pub backlog_blocker_mask: u8,
     pub mutation_admission_saturated: bool,
     pub quiescent_for_failover: bool,
     pub follower_promotion_ready: bool,
@@ -508,6 +515,11 @@ impl Engine {
         .into_iter()
         .filter(|blocked| *blocked)
         .count() as u8;
+        let backlog_blocker_mask = (u8::from(has_wal_backlog) * BACKLOG_BLOCKER_WAL_BIT)
+            | (u8::from(has_pending_batch_backlog) * BACKLOG_BLOCKER_PENDING_BATCH_BIT)
+            | (u8::from(has_active_txn_backlog) * BACKLOG_BLOCKER_ACTIVE_TXN_BIT)
+            | (u8::from(has_commit_apply_gap) * BACKLOG_BLOCKER_COMMIT_APPLY_GAP_BIT)
+            | (u8::from(has_apply_visible_gap) * BACKLOG_BLOCKER_APPLY_VISIBLE_GAP_BIT);
         let has_backlog_blockers = backlog_blocker_count > 0;
 
         ReplicationWatermarks {
@@ -541,6 +553,7 @@ impl Engine {
             has_apply_visible_gap,
             has_backlog_blockers,
             backlog_blocker_count,
+            backlog_blocker_mask,
             mutation_admission_saturated: pending_batch_len >= pending_batch_cap,
             quiescent_for_failover: role == Role::Leader
                 && !has_wal_backlog
@@ -1497,6 +1510,7 @@ mod tests {
         assert!(!before.has_apply_visible_gap);
         assert!(!before.has_backlog_blockers);
         assert_eq!(before.backlog_blocker_count, 0);
+        assert_eq!(before.backlog_blocker_mask, 0);
         assert!(!before.mutation_admission_saturated);
         assert!(before.quiescent_for_failover);
         assert!(!before.follower_promotion_ready);
@@ -1530,6 +1544,7 @@ mod tests {
         assert!(!after.has_apply_visible_gap);
         assert!(!after.has_backlog_blockers);
         assert_eq!(after.backlog_blocker_count, 0);
+        assert_eq!(after.backlog_blocker_mask, 0);
         assert!(!after.mutation_admission_saturated);
         assert!(after.quiescent_for_failover);
         assert!(!after.follower_promotion_ready);
@@ -1568,6 +1583,7 @@ mod tests {
         assert!(!marks.has_commit_apply_gap);
         assert!(!marks.has_apply_visible_gap);
         assert!(!marks.has_backlog_blockers);
+        assert_eq!(marks.backlog_blocker_mask, 0);
         assert!(!marks.mutation_admission_saturated);
         assert!(!marks.quiescent_for_failover);
         assert!(marks.follower_promotion_ready);
@@ -1646,6 +1662,10 @@ mod tests {
         assert!(marks.has_pending_batch_backlog);
         assert!(marks.has_backlog_blockers);
         assert_eq!(marks.backlog_blocker_count, 1);
+        assert_eq!(
+            marks.backlog_blocker_mask,
+            BACKLOG_BLOCKER_PENDING_BATCH_BIT
+        );
         assert!(!marks.has_wal_backlog);
         assert!(!marks.has_active_txn_backlog);
         assert!(!marks.has_commit_apply_gap);
@@ -1726,6 +1746,7 @@ mod tests {
         assert!(marks.has_active_txn_backlog);
         assert!(marks.has_backlog_blockers);
         assert_eq!(marks.backlog_blocker_count, 1);
+        assert_eq!(marks.backlog_blocker_mask, BACKLOG_BLOCKER_ACTIVE_TXN_BIT);
         assert!(!marks.has_pending_batch_backlog);
         assert!(!marks.has_wal_backlog);
         assert_eq!(marks.wal_buffered_count, 0);
@@ -1746,6 +1767,10 @@ mod tests {
         assert!(marks.has_active_txn_backlog);
         assert!(marks.has_backlog_blockers);
         assert_eq!(marks.backlog_blocker_count, 2);
+        assert_eq!(
+            marks.backlog_blocker_mask,
+            BACKLOG_BLOCKER_PENDING_BATCH_BIT | BACKLOG_BLOCKER_ACTIVE_TXN_BIT
+        );
         assert!(!marks.quiescent_for_failover);
         assert!(!marks.follower_promotion_ready);
     }

@@ -9,6 +9,8 @@
 - Extended `ReplicationWatermarks` with `pending_batch_remaining_capacity_permyriad` (inverse of queue utilization) so operators can read normalized enqueue headroom directly without recomputing from depth/cap values.
 - Added engine regression assertions covering empty, partial, and saturated queue states for the new headroom metric to keep admission telemetry deterministic.
 - Updated replication and admission-control interface docs so the normalized pending-queue headroom field is part of the documented runtime contract.
+- Extended `ReplicationWatermarks` with `backlog_blocker_mask` (bitset for wal/pending-batch/active-txn/commit-apply/apply-visible blockers) so automation can branch on active blocker classes without recomputing booleans.
+- Added engine regression coverage proving blocker-mask values stay zero in clean snapshots and encode pending-batch and active-transaction backlog combinations deterministically.
 
 ## 2026-03-31
 
