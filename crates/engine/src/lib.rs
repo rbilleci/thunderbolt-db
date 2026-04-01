@@ -58,12 +58,6 @@ struct PendingMutation {
     payload: Vec<u8>,
 }
 
-const BACKLOG_BLOCKER_WAL_BIT: u8 = 1 << 0;
-const BACKLOG_BLOCKER_PENDING_BATCH_BIT: u8 = 1 << 1;
-const BACKLOG_BLOCKER_ACTIVE_TXN_BIT: u8 = 1 << 2;
-const BACKLOG_BLOCKER_COMMIT_APPLY_GAP_BIT: u8 = 1 << 3;
-const BACKLOG_BLOCKER_APPLY_VISIBLE_GAP_BIT: u8 = 1 << 4;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReplicationWatermarks {
     pub role: Role,
@@ -96,6 +90,14 @@ pub struct ReplicationWatermarks {
     pub mutation_admission_saturated: bool,
     pub quiescent_for_failover: bool,
     pub follower_promotion_ready: bool,
+}
+
+impl ReplicationWatermarks {
+    pub const BACKLOG_BLOCKER_WAL: u8 = 1 << 0;
+    pub const BACKLOG_BLOCKER_PENDING_BATCH: u8 = 1 << 1;
+    pub const BACKLOG_BLOCKER_ACTIVE_TXN: u8 = 1 << 2;
+    pub const BACKLOG_BLOCKER_COMMIT_APPLY_GAP: u8 = 1 << 3;
+    pub const BACKLOG_BLOCKER_APPLY_VISIBLE_GAP: u8 = 1 << 4;
 }
 
 pub struct Engine {
@@ -515,11 +517,16 @@ impl Engine {
         .into_iter()
         .filter(|blocked| *blocked)
         .count() as u8;
-        let backlog_blocker_mask = (u8::from(has_wal_backlog) * BACKLOG_BLOCKER_WAL_BIT)
-            | (u8::from(has_pending_batch_backlog) * BACKLOG_BLOCKER_PENDING_BATCH_BIT)
-            | (u8::from(has_active_txn_backlog) * BACKLOG_BLOCKER_ACTIVE_TXN_BIT)
-            | (u8::from(has_commit_apply_gap) * BACKLOG_BLOCKER_COMMIT_APPLY_GAP_BIT)
-            | (u8::from(has_apply_visible_gap) * BACKLOG_BLOCKER_APPLY_VISIBLE_GAP_BIT);
+        let backlog_blocker_mask = (u8::from(has_wal_backlog)
+            * ReplicationWatermarks::BACKLOG_BLOCKER_WAL)
+            | (u8::from(has_pending_batch_backlog)
+                * ReplicationWatermarks::BACKLOG_BLOCKER_PENDING_BATCH)
+            | (u8::from(has_active_txn_backlog)
+                * ReplicationWatermarks::BACKLOG_BLOCKER_ACTIVE_TXN)
+            | (u8::from(has_commit_apply_gap)
+                * ReplicationWatermarks::BACKLOG_BLOCKER_COMMIT_APPLY_GAP)
+            | (u8::from(has_apply_visible_gap)
+                * ReplicationWatermarks::BACKLOG_BLOCKER_APPLY_VISIBLE_GAP);
         let has_backlog_blockers = backlog_blocker_count > 0;
 
         ReplicationWatermarks {
@@ -1664,7 +1671,7 @@ mod tests {
         assert_eq!(marks.backlog_blocker_count, 1);
         assert_eq!(
             marks.backlog_blocker_mask,
-            BACKLOG_BLOCKER_PENDING_BATCH_BIT
+            ReplicationWatermarks::BACKLOG_BLOCKER_PENDING_BATCH
         );
         assert!(!marks.has_wal_backlog);
         assert!(!marks.has_active_txn_backlog);
@@ -1746,7 +1753,10 @@ mod tests {
         assert!(marks.has_active_txn_backlog);
         assert!(marks.has_backlog_blockers);
         assert_eq!(marks.backlog_blocker_count, 1);
-        assert_eq!(marks.backlog_blocker_mask, BACKLOG_BLOCKER_ACTIVE_TXN_BIT);
+        assert_eq!(
+            marks.backlog_blocker_mask,
+            ReplicationWatermarks::BACKLOG_BLOCKER_ACTIVE_TXN
+        );
         assert!(!marks.has_pending_batch_backlog);
         assert!(!marks.has_wal_backlog);
         assert_eq!(marks.wal_buffered_count, 0);
@@ -1769,7 +1779,8 @@ mod tests {
         assert_eq!(marks.backlog_blocker_count, 2);
         assert_eq!(
             marks.backlog_blocker_mask,
-            BACKLOG_BLOCKER_PENDING_BATCH_BIT | BACKLOG_BLOCKER_ACTIVE_TXN_BIT
+            ReplicationWatermarks::BACKLOG_BLOCKER_PENDING_BATCH
+                | ReplicationWatermarks::BACKLOG_BLOCKER_ACTIVE_TXN
         );
         assert!(!marks.quiescent_for_failover);
         assert!(!marks.follower_promotion_ready);
