@@ -20,7 +20,7 @@ cargo test --all-features
 
 ## Command notes
 
-- `DEL key` and `DELETE key` are equivalent.
+- `DEL key`, `DELETE key`, and `DELETE FROM key` are equivalent.
 - `BEGIN|COMMIT|ROLLBACK` also accept `WORK` and `TRANSACTION` aliases.
 - `COMMIT|ROLLBACK|END ... AND [NO] CHAIN` forms are accepted; `AND CHAIN` reopens transaction context by allocating a fresh transaction id after the terminal transition.
 - `END` maps to `COMMIT`; `ABORT` maps to `ROLLBACK`.
