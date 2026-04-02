@@ -98,6 +98,11 @@ impl ReplicationWatermarks {
     pub const BACKLOG_BLOCKER_ACTIVE_TXN: u8 = 1 << 2;
     pub const BACKLOG_BLOCKER_COMMIT_APPLY_GAP: u8 = 1 << 3;
     pub const BACKLOG_BLOCKER_APPLY_VISIBLE_GAP: u8 = 1 << 4;
+
+    pub fn has_backlog_blocker(&self, blocker_bit: u8) -> bool {
+        debug_assert!(blocker_bit.is_power_of_two());
+        self.backlog_blocker_mask & blocker_bit != 0
+    }
 }
 
 pub struct Engine {
@@ -1748,6 +1753,8 @@ mod tests {
             marks.backlog_blocker_mask,
             ReplicationWatermarks::BACKLOG_BLOCKER_ACTIVE_TXN
         );
+        assert!(marks.has_backlog_blocker(ReplicationWatermarks::BACKLOG_BLOCKER_ACTIVE_TXN));
+        assert!(!marks.has_backlog_blocker(ReplicationWatermarks::BACKLOG_BLOCKER_WAL));
         assert!(!marks.has_pending_batch_backlog);
         assert!(!marks.has_wal_backlog);
         assert_eq!(marks.wal_buffered_count, 0);
@@ -1777,6 +1784,9 @@ mod tests {
             marks.backlog_blocker_count,
             marks.backlog_blocker_mask.count_ones() as u8
         );
+        assert!(marks.has_backlog_blocker(ReplicationWatermarks::BACKLOG_BLOCKER_PENDING_BATCH));
+        assert!(marks.has_backlog_blocker(ReplicationWatermarks::BACKLOG_BLOCKER_ACTIVE_TXN));
+        assert!(!marks.has_backlog_blocker(ReplicationWatermarks::BACKLOG_BLOCKER_WAL));
         assert!(!marks.quiescent_for_failover);
         assert!(!marks.follower_promotion_ready);
     }
