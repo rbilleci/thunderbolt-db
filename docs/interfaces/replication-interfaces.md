@@ -28,6 +28,7 @@
 - Transaction depth: `active_txn_count`
 - Backlog/gap blocker flags: `has_wal_backlog`, `has_pending_batch_backlog`, `has_active_txn_backlog`, `has_commit_apply_gap`, `has_apply_visible_gap`
 - Blocker aggregation: `has_backlog_blockers` (boolean aggregate), `backlog_blocker_count` (count of active backlog/gap blockers), and `backlog_blocker_mask` (bitset of active blockers: wal=1, pending_batch=2, active_txn=4, commit_apply_gap=8, apply_visible_gap=16)
+- Helper API: `ReplicationWatermarks::has_backlog_blocker(bit)` checks membership against `backlog_blocker_mask` for downstream readiness/admission automation.
 - Admission pressure + readiness gates: `mutation_admission_saturated`, `quiescent_for_failover`, `follower_promotion_ready`
 
 ## Guarantees
