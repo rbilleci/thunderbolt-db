@@ -152,6 +152,10 @@ impl ReplicationWatermarks {
             .into_iter()
             .filter(|blocker| self.has_blocker_kind(*blocker))
     }
+
+    pub fn backlog_blocker_labels(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.backlog_blockers().map(|blocker| blocker.as_str())
+    }
 }
 
 pub struct Engine {
@@ -1821,6 +1825,10 @@ mod tests {
             marks.backlog_blocker_mask = blocker.bit();
             assert!(marks.has_blocker_kind(blocker));
             assert_eq!(marks.backlog_blockers().collect::<Vec<_>>(), vec![blocker]);
+            assert_eq!(
+                marks.backlog_blocker_labels().collect::<Vec<_>>(),
+                vec![blocker.as_str()]
+            );
         }
     }
 
@@ -1852,6 +1860,10 @@ mod tests {
         assert_eq!(
             marks.backlog_blockers().collect::<Vec<_>>(),
             vec![BacklogBlocker::PendingBatch, BacklogBlocker::ActiveTxn]
+        );
+        assert_eq!(
+            marks.backlog_blocker_labels().collect::<Vec<_>>(),
+            vec!["pending_batch", "active_txn"]
         );
         assert!(!marks.quiescent_for_failover);
         assert!(!marks.follower_promotion_ready);

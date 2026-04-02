@@ -6,6 +6,8 @@
 - Added typed backlog blocker APIs via `BacklogBlocker` (`bit()`, `as_str()`, `ReplicationWatermarks::has_blocker_kind`, `ReplicationWatermarks::backlog_blockers`) plus regression coverage, so downstream automation can enumerate blocker classes without open-coded bitmask logic.
 - Refactored replication backlog aggregate derivation so `backlog_blocker_count` is computed directly from `backlog_blocker_mask.count_ones()`, preventing drift between per-flag booleans and aggregate telemetry fields.
 - Added `ReplicationWatermarks::has_backlog_blocker(bit)` helper plus regression assertions, so downstream automation can query blocker classes by bit without manual mask arithmetic.
+- Added `ReplicationWatermarks::backlog_blocker_labels()` so automation consumers can read stable string labels (`wal`, `pending_batch`, etc.) directly from watermark snapshots instead of re-mapping enum variants externally.
+- Extended engine regression coverage to assert blocker-label output for both single- and multi-blocker watermark states.
 
 ## 2026-04-01
 
