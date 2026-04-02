@@ -17,7 +17,7 @@ pub enum ParseError {
     Unsupported(String),
     #[error("invalid SET syntax; expected: SET key=value")]
     InvalidSet,
-    #[error("invalid DEL/DELETE syntax; expected: DEL|DELETE key")]
+    #[error("invalid DEL/DELETE syntax; expected: DEL key or DELETE [FROM] key")]
     InvalidDel,
     #[error("invalid GET syntax; expected: GET key")]
     InvalidGet,
@@ -319,7 +319,7 @@ pub fn parse_command(input: &str) -> Result<Command, ParseError> {
             });
         }
 
-        if cmd.eq_ignore_ascii_case("DEL") || cmd.eq_ignore_ascii_case("DELETE") {
+        if cmd.eq_ignore_ascii_case("DEL") {
             let Some(rest) = parts.next() else {
                 return Err(ParseError::InvalidDel);
             };
@@ -327,6 +327,36 @@ pub fn parse_command(input: &str) -> Result<Command, ParseError> {
             if key.is_empty() || key.chars().any(char::is_whitespace) {
                 return Err(ParseError::InvalidDel);
             }
+            return Ok(Command::DeleteKv {
+                key: key.to_string(),
+            });
+        }
+
+        if cmd.eq_ignore_ascii_case("DELETE") {
+            let Some(rest) = parts.next() else {
+                return Err(ParseError::InvalidDel);
+            };
+            let rest = rest.trim();
+            let key = if let Some((prefix, remainder)) = rest.split_once(char::is_whitespace) {
+                if prefix.eq_ignore_ascii_case("FROM") {
+                    let candidate = remainder.trim();
+                    if candidate.is_empty() || candidate.chars().any(char::is_whitespace) {
+                        return Err(ParseError::InvalidDel);
+                    }
+                    candidate
+                } else {
+                    return Err(ParseError::InvalidDel);
+                }
+            } else if rest.eq_ignore_ascii_case("FROM") {
+                return Err(ParseError::InvalidDel);
+            } else {
+                rest
+            };
+
+            if key.is_empty() || key.chars().any(char::is_whitespace) {
+                return Err(ParseError::InvalidDel);
+            }
+
             return Ok(Command::DeleteKv {
                 key: key.to_string(),
             });
@@ -854,10 +884,33 @@ mod tests {
     }
 
     #[test]
+    fn parses_delete_from_alias() {
+        let cmd = parse_command("DELETE FROM balance").unwrap();
+        assert_eq!(
+            cmd,
+            Command::DeleteKv {
+                key: "balance".into()
+            }
+        );
+    }
+
+    #[test]
     fn rejects_del_with_missing_or_extra_tokens() {
         assert!(matches!(parse_command("DEL"), Err(ParseError::InvalidDel)));
         assert!(matches!(
             parse_command("DEL too many"),
+            Err(ParseError::InvalidDel)
+        ));
+        assert!(matches!(
+            parse_command("DELETE FROM"),
+            Err(ParseError::InvalidDel)
+        ));
+        assert!(matches!(
+            parse_command("DELETE FROM too many"),
+            Err(ParseError::InvalidDel)
+        ));
+        assert!(matches!(
+            parse_command("DELETE TABLE balance"),
             Err(ParseError::InvalidDel)
         ));
     }
