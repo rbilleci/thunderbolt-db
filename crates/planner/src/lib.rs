@@ -75,6 +75,13 @@ impl Planner {
                 },
                 kind: PlanKind::Admin,
             },
+            Command::ResetAll => PlanNode {
+                op: PlannedOp {
+                    name: "session_reset_all".to_string(),
+                    target: DeviceTarget::Cpu,
+                },
+                kind: PlanKind::TxnControl,
+            },
         };
 
         ExecutionPlan::new(vec![node])
@@ -134,6 +141,7 @@ mod tests {
             Command::Commit { chain: false },
             Command::Rollback { chain: false },
             Command::Flush,
+            Command::ResetAll,
         ];
 
         for command in commands {

@@ -26,6 +26,7 @@ cargo test --all-features
 - `END` maps to `COMMIT`; `ABORT` maps to `ROLLBACK`.
 - `START TRANSACTION` and `START WORK` map to `BEGIN`; optional `READ ONLY` / `READ WRITE`, `[NOT] DEFERRABLE`, and `ISOLATION LEVEL {SERIALIZABLE|REPEATABLE READ|READ COMMITTED|READ UNCOMMITTED}` suffixes are accepted on `BEGIN`/`START` aliases (including comma-separated mode lists) and currently map to plain `BEGIN` behavior.
 - `FLUSH`, `FLUSH WAL`, and `FLUSH LOG` are equivalent admin/coordination commands and are tracked as CPU fallback metric events.
+- `RESET ALL` is accepted as a CPU-routed session-control no-op in the bootstrap engine so PostgreSQL-style client reset probes do not fail parser validation.
 
 ## Safety invariant
 

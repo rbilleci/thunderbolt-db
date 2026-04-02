@@ -4,6 +4,7 @@ pub enum Command {
     Commit { chain: bool },
     Rollback { chain: bool },
     Flush,
+    ResetAll,
     SetKv { key: String, value: String },
     DeleteKv { key: String },
     GetKv { key: String },
@@ -21,6 +22,8 @@ pub enum ParseError {
     InvalidDel,
     #[error("invalid GET syntax; expected: GET key")]
     InvalidGet,
+    #[error("invalid RESET syntax; expected: RESET ALL")]
+    InvalidReset,
 }
 
 fn parse_transaction_chain_suffix(tokens: &[&str]) -> Option<bool> {
@@ -79,6 +82,19 @@ fn parse_flush_command(input: &str) -> Option<Command> {
         }
         _ => None,
     }
+}
+
+fn parse_reset_command(input: &str) -> Option<Result<Command, ParseError>> {
+    let tokens: Vec<_> = input.split_whitespace().collect();
+    let (first, rest) = tokens.split_first()?;
+    if !first.eq_ignore_ascii_case("RESET") {
+        return None;
+    }
+
+    Some(match rest {
+        [target] if target.eq_ignore_ascii_case("ALL") => Ok(Command::ResetAll),
+        _ => Err(ParseError::InvalidReset),
+    })
 }
 
 fn is_isolation_level_suffix(tokens: &[&str]) -> bool {
@@ -314,6 +330,9 @@ pub fn parse_command(input: &str) -> Result<Command, ParseError> {
     if let Some(flush) = parse_flush_command(s) {
         return Ok(flush);
     }
+    if let Some(reset) = parse_reset_command(s) {
+        return reset;
+    }
 
     let mut parts = s.splitn(2, char::is_whitespace);
     if let Some(cmd) = parts.next() {
@@ -441,6 +460,12 @@ mod tests {
 
         let cmd = parse_command("FLUSH LOG").unwrap();
         assert_eq!(cmd, Command::Flush);
+    }
+
+    #[test]
+    fn parses_reset_all() {
+        let cmd = parse_command("RESET ALL").unwrap();
+        assert_eq!(cmd, Command::ResetAll);
     }
 
     #[test]
@@ -845,6 +870,18 @@ mod tests {
             parse_command("FLUSH WAL NOW"),
             Err(ParseError::Unsupported(_))
         ));
+        assert!(matches!(
+            parse_command("RESET"),
+            Err(ParseError::InvalidReset)
+        ));
+        assert!(matches!(
+            parse_command("RESET ROLE"),
+            Err(ParseError::InvalidReset)
+        ));
+        assert!(matches!(
+            parse_command("RESET ALL NOW"),
+            Err(ParseError::InvalidReset)
+        ));
     }
 
     #[test]
@@ -872,6 +909,7 @@ mod tests {
                 key: "balance".into()
             }
         );
+        assert_eq!(parse_command("RESET ALL;").unwrap(), Command::ResetAll);
     }
 
     #[test]

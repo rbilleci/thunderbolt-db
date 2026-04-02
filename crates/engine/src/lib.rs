@@ -32,6 +32,7 @@ impl ReplicatedStateMachine for KvStateMachine {
                     | Command::Commit { .. }
                     | Command::Rollback { .. }
                     | Command::Flush
+                    | Command::ResetAll
                     | Command::GetKv { .. } => {}
                 }
             }
@@ -305,6 +306,9 @@ impl Engine {
                 self.flush_admin()?;
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
+            Command::ResetAll => {
+                self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
+            }
             Command::Begin => {
                 self.txn_manager.begin_with_id(txn_id)?;
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
@@ -425,6 +429,9 @@ impl Engine {
                 self.flush_admin()?;
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
+            Command::ResetAll => {
+                self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
+            }
             Command::Begin => {
                 self.txn_manager.begin_with_id(txn_id)?;
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
@@ -476,6 +483,7 @@ impl Engine {
             Command::Commit { .. } => Err(ExecuteError::NonReadCommand("COMMIT")),
             Command::Rollback { .. } => Err(ExecuteError::NonReadCommand("ROLLBACK")),
             Command::Flush => Err(ExecuteError::NonReadCommand("FLUSH")),
+            Command::ResetAll => Err(ExecuteError::NonReadCommand("RESET ALL")),
             Command::SetKv { .. } => Err(ExecuteError::NonReadCommand("SET")),
             Command::DeleteKv { .. } => Err(ExecuteError::NonReadCommand("DEL/DELETE")),
         }
@@ -786,6 +794,12 @@ mod tests {
 
         let set_err = e.execute_read_text("SET balance=100").unwrap_err();
         assert!(matches!(set_err, ExecuteError::NonReadCommand("SET")));
+
+        let reset_err = e.execute_read_text("RESET ALL").unwrap_err();
+        assert!(matches!(
+            reset_err,
+            ExecuteError::NonReadCommand("RESET ALL")
+        ));
 
         let del_err = e.execute_read_text("DELETE balance").unwrap_err();
         assert!(matches!(
@@ -1379,10 +1393,11 @@ mod tests {
         e.execute_text(2, "ROLLBACK").unwrap();
         e.execute_text(3, "GET missing").unwrap();
         e.execute_text(4, "FLUSH").unwrap();
+        e.execute_text(5, "RESET ALL").unwrap();
 
         assert_eq!(e.active_txn_count(), 0);
-        assert_eq!(e.metrics().fallback_total, 6);
-        assert_eq!(e.metrics().fallback_for(FallbackReason::NotGpuEligible), 6);
+        assert_eq!(e.metrics().fallback_total, 7);
+        assert_eq!(e.metrics().fallback_for(FallbackReason::NotGpuEligible), 7);
         assert_eq!(
             e.metrics().last_fallback_reason(),
             Some(FallbackReason::NotGpuEligible)
@@ -1401,10 +1416,11 @@ mod tests {
         e.enqueue_set_text(2, "ROLLBACK", t0).unwrap();
         e.enqueue_set_text(3, "GET missing", t0).unwrap();
         e.enqueue_set_text(4, "FLUSH", t0).unwrap();
+        e.enqueue_set_text(5, "RESET ALL", t0).unwrap();
 
         assert_eq!(e.active_txn_count(), 0);
-        assert_eq!(e.metrics().fallback_total, 6);
-        assert_eq!(e.metrics().fallback_for(FallbackReason::NotGpuEligible), 6);
+        assert_eq!(e.metrics().fallback_total, 7);
+        assert_eq!(e.metrics().fallback_for(FallbackReason::NotGpuEligible), 7);
         assert_eq!(e.pending_batch_len(), 0);
         assert_eq!(e.metrics().commits_total, 0);
     }
