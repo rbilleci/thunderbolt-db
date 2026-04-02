@@ -1084,6 +1084,22 @@ mod tests {
     }
 
     #[test]
+    fn flush_aliases_drain_pending_batch() {
+        let mut e = Engine::with_batching(10, Duration::from_secs(60));
+        let t0 = Instant::now();
+
+        e.enqueue_set_text(1, "SET a=5", t0).unwrap();
+        e.execute_text(2, "FLUSH WAL").unwrap();
+
+        e.enqueue_set_text(3, "SET b=7", t0).unwrap();
+        e.execute_text(4, "FLUSH LOG").unwrap();
+
+        assert_eq!(e.get("a"), Some("5"));
+        assert_eq!(e.get("b"), Some("7"));
+        assert_eq!(e.metrics().batch_flushes_for(BatchFlushReason::Admin), 2);
+    }
+
+    #[test]
     fn wal_flush_failure_prevents_visibility_advance() {
         let mut e = Engine::new_local();
         e.simulate_next_wal_flush_failure();
