@@ -59,6 +59,45 @@ struct PendingMutation {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BacklogBlocker {
+    Wal,
+    PendingBatch,
+    ActiveTxn,
+    CommitApplyGap,
+    ApplyVisibleGap,
+}
+
+impl BacklogBlocker {
+    pub const ALL: [Self; 5] = [
+        Self::Wal,
+        Self::PendingBatch,
+        Self::ActiveTxn,
+        Self::CommitApplyGap,
+        Self::ApplyVisibleGap,
+    ];
+
+    pub const fn bit(self) -> u8 {
+        match self {
+            Self::Wal => ReplicationWatermarks::BACKLOG_BLOCKER_WAL,
+            Self::PendingBatch => ReplicationWatermarks::BACKLOG_BLOCKER_PENDING_BATCH,
+            Self::ActiveTxn => ReplicationWatermarks::BACKLOG_BLOCKER_ACTIVE_TXN,
+            Self::CommitApplyGap => ReplicationWatermarks::BACKLOG_BLOCKER_COMMIT_APPLY_GAP,
+            Self::ApplyVisibleGap => ReplicationWatermarks::BACKLOG_BLOCKER_APPLY_VISIBLE_GAP,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Wal => "wal",
+            Self::PendingBatch => "pending_batch",
+            Self::ActiveTxn => "active_txn",
+            Self::CommitApplyGap => "commit_apply_gap",
+            Self::ApplyVisibleGap => "apply_visible_gap",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReplicationWatermarks {
     pub role: Role,
     pub term: Term,
@@ -102,6 +141,16 @@ impl ReplicationWatermarks {
     pub fn has_backlog_blocker(&self, blocker_bit: u8) -> bool {
         debug_assert!(blocker_bit.is_power_of_two());
         self.backlog_blocker_mask & blocker_bit != 0
+    }
+
+    pub fn has_blocker_kind(&self, blocker: BacklogBlocker) -> bool {
+        self.has_backlog_blocker(blocker.bit())
+    }
+
+    pub fn backlog_blockers(&self) -> impl Iterator<Item = BacklogBlocker> + '_ {
+        BacklogBlocker::ALL
+            .into_iter()
+            .filter(|blocker| self.has_blocker_kind(*blocker))
     }
 }
 
@@ -1763,6 +1812,19 @@ mod tests {
     }
 
     #[test]
+    fn backlog_blocker_enum_roundtrips_through_bits_and_labels() {
+        for blocker in BacklogBlocker::ALL {
+            assert!(blocker.bit().is_power_of_two());
+            assert!(!blocker.as_str().is_empty());
+
+            let mut marks = Engine::new_local().replication_watermarks();
+            marks.backlog_blocker_mask = blocker.bit();
+            assert!(marks.has_blocker_kind(blocker));
+            assert_eq!(marks.backlog_blockers().collect::<Vec<_>>(), vec![blocker]);
+        }
+    }
+
+    #[test]
     fn replication_watermarks_aggregate_multiple_backlog_blockers() {
         let mut e = Engine::with_batching(8, Duration::from_secs(999));
         let t0 = Instant::now();
@@ -1787,6 +1849,10 @@ mod tests {
         assert!(marks.has_backlog_blocker(ReplicationWatermarks::BACKLOG_BLOCKER_PENDING_BATCH));
         assert!(marks.has_backlog_blocker(ReplicationWatermarks::BACKLOG_BLOCKER_ACTIVE_TXN));
         assert!(!marks.has_backlog_blocker(ReplicationWatermarks::BACKLOG_BLOCKER_WAL));
+        assert_eq!(
+            marks.backlog_blockers().collect::<Vec<_>>(),
+            vec![BacklogBlocker::PendingBatch, BacklogBlocker::ActiveTxn]
+        );
         assert!(!marks.quiescent_for_failover);
         assert!(!marks.follower_promotion_ready);
     }
