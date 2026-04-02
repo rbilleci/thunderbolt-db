@@ -87,6 +87,17 @@ impl BacklogBlocker {
         }
     }
 
+    pub const fn from_bit(bit: u8) -> Option<Self> {
+        match bit {
+            ReplicationWatermarks::BACKLOG_BLOCKER_WAL => Some(Self::Wal),
+            ReplicationWatermarks::BACKLOG_BLOCKER_PENDING_BATCH => Some(Self::PendingBatch),
+            ReplicationWatermarks::BACKLOG_BLOCKER_ACTIVE_TXN => Some(Self::ActiveTxn),
+            ReplicationWatermarks::BACKLOG_BLOCKER_COMMIT_APPLY_GAP => Some(Self::CommitApplyGap),
+            ReplicationWatermarks::BACKLOG_BLOCKER_APPLY_VISIBLE_GAP => Some(Self::ApplyVisibleGap),
+            _ => None,
+        }
+    }
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Wal => "wal",
@@ -156,6 +167,12 @@ impl ReplicationWatermarks {
 
     pub fn backlog_blocker_labels(&self) -> impl Iterator<Item = &'static str> + '_ {
         self.backlog_blockers().map(|blocker| blocker.as_str())
+    }
+
+    pub fn backlog_blockers_from_mask(mask: u8) -> impl Iterator<Item = BacklogBlocker> {
+        BacklogBlocker::ALL
+            .into_iter()
+            .filter(move |blocker| mask & blocker.bit() != 0)
     }
 }
 
@@ -1852,6 +1869,7 @@ mod tests {
         for blocker in BacklogBlocker::ALL {
             assert!(blocker.bit().is_power_of_two());
             assert!(!blocker.as_str().is_empty());
+            assert_eq!(BacklogBlocker::from_bit(blocker.bit()), Some(blocker));
 
             let mut marks = Engine::new_local().replication_watermarks();
             marks.backlog_blocker_mask = blocker.bit();
@@ -1861,7 +1879,26 @@ mod tests {
                 marks.backlog_blocker_labels().collect::<Vec<_>>(),
                 vec![blocker.as_str()]
             );
+            assert_eq!(
+                ReplicationWatermarks::backlog_blockers_from_mask(marks.backlog_blocker_mask)
+                    .collect::<Vec<_>>(),
+                vec![blocker]
+            );
         }
+    }
+
+    #[test]
+    fn replication_watermarks_backlog_blockers_from_mask_ignores_unknown_bits() {
+        let known_mask = ReplicationWatermarks::BACKLOG_BLOCKER_WAL
+            | ReplicationWatermarks::BACKLOG_BLOCKER_ACTIVE_TXN;
+        let unknown_mask = 1 << 7;
+
+        assert_eq!(BacklogBlocker::from_bit(unknown_mask), None);
+        assert_eq!(
+            ReplicationWatermarks::backlog_blockers_from_mask(known_mask | unknown_mask)
+                .collect::<Vec<_>>(),
+            vec![BacklogBlocker::Wal, BacklogBlocker::ActiveTxn]
+        );
     }
 
     #[test]
