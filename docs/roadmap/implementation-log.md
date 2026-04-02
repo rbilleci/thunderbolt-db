@@ -1,5 +1,11 @@
 # Implementation Log (Pre-NVIDIA Phase)
 
+## 2026-04-02
+
+### Completed
+- Refactored replication backlog aggregate derivation so `backlog_blocker_count` is computed directly from `backlog_blocker_mask.count_ones()`, preventing drift between per-flag booleans and aggregate telemetry fields.
+- Added `ReplicationWatermarks::has_backlog_blocker(bit)` helper plus regression assertions, so downstream automation can query blocker classes by bit without manual mask arithmetic.
+
 ## 2026-04-01
 
 ### Completed
