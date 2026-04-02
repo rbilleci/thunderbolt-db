@@ -3,6 +3,7 @@
 ## 2026-04-02
 
 ### Completed
+- Added typed backlog blocker decode helpers (`BacklogBlocker::from_bit`, `ReplicationWatermarks::backlog_blockers_from_mask`) plus regression coverage for unknown-bit masking, so automation can safely decode watermark bitsets without re-implementing mapping logic.
 - Added typed backlog blocker APIs via `BacklogBlocker` (`bit()`, `as_str()`, `ReplicationWatermarks::has_blocker_kind`, `ReplicationWatermarks::backlog_blockers`) plus regression coverage, so downstream automation can enumerate blocker classes without open-coded bitmask logic.
 - Refactored replication backlog aggregate derivation so `backlog_blocker_count` is computed directly from `backlog_blocker_mask.count_ones()`, preventing drift between per-flag booleans and aggregate telemetry fields.
 - Added `ReplicationWatermarks::has_backlog_blocker(bit)` helper plus regression assertions, so downstream automation can query blocker classes by bit without manual mask arithmetic.
