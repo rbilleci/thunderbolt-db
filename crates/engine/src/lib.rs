@@ -169,6 +169,10 @@ impl ReplicationWatermarks {
         self.backlog_blockers().map(|blocker| blocker.as_str())
     }
 
+    pub fn backlog_blocker_bits(&self) -> impl Iterator<Item = u8> + '_ {
+        self.backlog_blockers().map(|blocker| blocker.bit())
+    }
+
     pub fn backlog_blockers_from_mask(mask: u8) -> impl Iterator<Item = BacklogBlocker> {
         BacklogBlocker::ALL
             .into_iter()
@@ -1880,6 +1884,10 @@ mod tests {
                 vec![blocker.as_str()]
             );
             assert_eq!(
+                marks.backlog_blocker_bits().collect::<Vec<_>>(),
+                vec![blocker.bit()]
+            );
+            assert_eq!(
                 ReplicationWatermarks::backlog_blockers_from_mask(marks.backlog_blocker_mask)
                     .collect::<Vec<_>>(),
                 vec![blocker]
@@ -1933,6 +1941,13 @@ mod tests {
         assert_eq!(
             marks.backlog_blocker_labels().collect::<Vec<_>>(),
             vec!["pending_batch", "active_txn"]
+        );
+        assert_eq!(
+            marks.backlog_blocker_bits().collect::<Vec<_>>(),
+            vec![
+                ReplicationWatermarks::BACKLOG_BLOCKER_PENDING_BATCH,
+                ReplicationWatermarks::BACKLOG_BLOCKER_ACTIVE_TXN
+            ]
         );
         assert!(!marks.quiescent_for_failover);
         assert!(!marks.follower_promotion_ready);
