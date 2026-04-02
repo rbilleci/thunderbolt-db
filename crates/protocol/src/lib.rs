@@ -65,6 +65,22 @@ fn parse_transaction_control_chain(input: &str, keyword: &str) -> Option<bool> {
     parse_transaction_chain_suffix(rest)
 }
 
+fn parse_flush_command(input: &str) -> Option<Command> {
+    let tokens: Vec<_> = input.split_whitespace().collect();
+    let (first, rest) = tokens.split_first()?;
+    if !first.eq_ignore_ascii_case("FLUSH") {
+        return None;
+    }
+
+    match rest {
+        [] => Some(Command::Flush),
+        [target] if target.eq_ignore_ascii_case("WAL") || target.eq_ignore_ascii_case("LOG") => {
+            Some(Command::Flush)
+        }
+        _ => None,
+    }
+}
+
 fn is_isolation_level_suffix(tokens: &[&str]) -> bool {
     matches!(
         tokens,
@@ -295,8 +311,8 @@ pub fn parse_command(input: &str) -> Result<Command, ParseError> {
     {
         return Ok(Command::Rollback { chain });
     }
-    if s.eq_ignore_ascii_case("FLUSH") {
-        return Ok(Command::Flush);
+    if let Some(flush) = parse_flush_command(s) {
+        return Ok(flush);
     }
 
     let mut parts = s.splitn(2, char::is_whitespace);
@@ -418,6 +434,12 @@ mod tests {
     #[test]
     fn parses_flush() {
         let cmd = parse_command("FLUSH").unwrap();
+        assert_eq!(cmd, Command::Flush);
+
+        let cmd = parse_command("FLUSH WAL").unwrap();
+        assert_eq!(cmd, Command::Flush);
+
+        let cmd = parse_command("FLUSH LOG").unwrap();
         assert_eq!(cmd, Command::Flush);
     }
 
@@ -813,6 +835,14 @@ mod tests {
         ));
         assert!(matches!(
             parse_command("ABORT WORK AND"),
+            Err(ParseError::Unsupported(_))
+        ));
+        assert!(matches!(
+            parse_command("FLUSH NOW"),
+            Err(ParseError::Unsupported(_))
+        ));
+        assert!(matches!(
+            parse_command("FLUSH WAL NOW"),
             Err(ParseError::Unsupported(_))
         ));
     }

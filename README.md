@@ -25,7 +25,7 @@ cargo test --all-features
 - `COMMIT|ROLLBACK|END ... AND [NO] CHAIN` forms are accepted; `AND CHAIN` reopens transaction context by allocating a fresh transaction id after the terminal transition.
 - `END` maps to `COMMIT`; `ABORT` maps to `ROLLBACK`.
 - `START TRANSACTION` and `START WORK` map to `BEGIN`; optional `READ ONLY` / `READ WRITE`, `[NOT] DEFERRABLE`, and `ISOLATION LEVEL {SERIALIZABLE|REPEATABLE READ|READ COMMITTED|READ UNCOMMITTED}` suffixes are accepted on `BEGIN`/`START` aliases (including comma-separated mode lists) and currently map to plain `BEGIN` behavior.
-- `FLUSH` is an admin/coordination command and is tracked as a CPU fallback metric event.
+- `FLUSH`, `FLUSH WAL`, and `FLUSH LOG` are equivalent admin/coordination commands and are tracked as CPU fallback metric events.
 
 ## Safety invariant
 
