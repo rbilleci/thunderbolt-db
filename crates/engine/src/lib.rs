@@ -507,16 +507,6 @@ impl Engine {
         let has_active_txn_backlog = active_txn_count > 0;
         let has_commit_apply_gap = commit_apply_gap > 0;
         let has_apply_visible_gap = apply_visible_gap > 0;
-        let backlog_blocker_count = [
-            has_wal_backlog,
-            has_pending_batch_backlog,
-            has_active_txn_backlog,
-            has_commit_apply_gap,
-            has_apply_visible_gap,
-        ]
-        .into_iter()
-        .filter(|blocked| *blocked)
-        .count() as u8;
         let backlog_blocker_mask = (u8::from(has_wal_backlog)
             * ReplicationWatermarks::BACKLOG_BLOCKER_WAL)
             | (u8::from(has_pending_batch_backlog)
@@ -527,7 +517,8 @@ impl Engine {
                 * ReplicationWatermarks::BACKLOG_BLOCKER_COMMIT_APPLY_GAP)
             | (u8::from(has_apply_visible_gap)
                 * ReplicationWatermarks::BACKLOG_BLOCKER_APPLY_VISIBLE_GAP);
-        let has_backlog_blockers = backlog_blocker_count > 0;
+        let backlog_blocker_count = backlog_blocker_mask.count_ones() as u8;
+        let has_backlog_blockers = backlog_blocker_mask != 0;
 
         ReplicationWatermarks {
             role,
@@ -1781,6 +1772,10 @@ mod tests {
             marks.backlog_blocker_mask,
             ReplicationWatermarks::BACKLOG_BLOCKER_PENDING_BATCH
                 | ReplicationWatermarks::BACKLOG_BLOCKER_ACTIVE_TXN
+        );
+        assert_eq!(
+            marks.backlog_blocker_count,
+            marks.backlog_blocker_mask.count_ones() as u8
         );
         assert!(!marks.quiescent_for_failover);
         assert!(!marks.follower_promotion_ready);
