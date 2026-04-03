@@ -3,6 +3,9 @@
 ## 2026-04-03
 
 ### Completed
+- Added `ReplicationWatermarks::backlog_blocker_mask_from_delimited_labels` so telemetry consumers can decode comma/semicolon/pipe-delimited blocker label streams directly into canonical blocker masks while ignoring unknown/empty segments safely.
+- Added regression coverage for delimited-label decoding (`wal, pending-batch; ACTIVE TXN | ...`) to keep blocker-mask derivation deterministic for CSV-like automation inputs.
+- Updated replication interface docs to include the new delimited-label helper in the published watermark API contract.
 - Normalized backlog blocker label decoding in `BacklogBlocker::from_label`: surrounding whitespace is trimmed, labels are case-insensitive, and hyphen/space separators map to underscores so telemetry/admission automation can ingest mixed-format labels safely.
 - Added regression coverage for mixed-format label decoding via `ReplicationWatermarks::backlog_blocker_mask_from_labels` (`" WAL "`, `"pending-batch"`, `"ACTIVE TXN"`, etc.) to keep round-trip blocker semantics deterministic.
 - Added reverse label decode support for backlog blockers via `BacklogBlocker::from_label`, enabling typed parsing of string-form blocker classes (`wal`, `pending_batch`, etc.) emitted in telemetry.

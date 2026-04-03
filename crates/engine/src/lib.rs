@@ -215,6 +215,13 @@ impl ReplicationWatermarks {
             .fold(0_u8, |mask, blocker| mask | blocker.bit())
     }
 
+    pub fn backlog_blocker_mask_from_delimited_labels(labels: &str) -> u8 {
+        labels
+            .split([',', ';', '|'])
+            .filter_map(BacklogBlocker::from_label)
+            .fold(0_u8, |mask, blocker| mask | blocker.bit())
+    }
+
     pub fn backlog_blocker_labels_from_mask(mask: u8) -> impl Iterator<Item = &'static str> {
         Self::backlog_blockers_from_mask(mask).map(BacklogBlocker::as_str)
     }
@@ -2000,6 +2007,34 @@ mod tests {
                 | ReplicationWatermarks::BACKLOG_BLOCKER_ACTIVE_TXN
                 | ReplicationWatermarks::BACKLOG_BLOCKER_COMMIT_APPLY_GAP
                 | ReplicationWatermarks::BACKLOG_BLOCKER_APPLY_VISIBLE_GAP
+        );
+    }
+
+    #[test]
+    fn backlog_blocker_mask_from_delimited_labels_decodes_csv_like_streams() {
+        let mask = ReplicationWatermarks::backlog_blocker_mask_from_delimited_labels(
+            "wal, pending-batch; ACTIVE TXN | unknown | apply visible gap",
+        );
+
+        assert_eq!(
+            mask,
+            ReplicationWatermarks::BACKLOG_BLOCKER_WAL
+                | ReplicationWatermarks::BACKLOG_BLOCKER_PENDING_BATCH
+                | ReplicationWatermarks::BACKLOG_BLOCKER_ACTIVE_TXN
+                | ReplicationWatermarks::BACKLOG_BLOCKER_APPLY_VISIBLE_GAP
+        );
+    }
+
+    #[test]
+    fn backlog_blocker_mask_from_delimited_labels_ignores_empty_segments() {
+        let mask = ReplicationWatermarks::backlog_blocker_mask_from_delimited_labels(
+            " , ; | pending_batch || wal ,, ",
+        );
+
+        assert_eq!(
+            mask,
+            ReplicationWatermarks::BACKLOG_BLOCKER_PENDING_BATCH
+                | ReplicationWatermarks::BACKLOG_BLOCKER_WAL
         );
     }
 
