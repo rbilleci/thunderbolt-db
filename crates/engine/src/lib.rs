@@ -178,6 +178,23 @@ impl ReplicationWatermarks {
     pub const BACKLOG_BLOCKER_ACTIVE_TXN: u8 = 1 << 2;
     pub const BACKLOG_BLOCKER_COMMIT_APPLY_GAP: u8 = 1 << 3;
     pub const BACKLOG_BLOCKER_APPLY_VISIBLE_GAP: u8 = 1 << 4;
+    pub const KNOWN_BACKLOG_BLOCKER_MASK: u8 = Self::BACKLOG_BLOCKER_WAL
+        | Self::BACKLOG_BLOCKER_PENDING_BATCH
+        | Self::BACKLOG_BLOCKER_ACTIVE_TXN
+        | Self::BACKLOG_BLOCKER_COMMIT_APPLY_GAP
+        | Self::BACKLOG_BLOCKER_APPLY_VISIBLE_GAP;
+
+    pub const fn known_backlog_blocker_mask() -> u8 {
+        Self::KNOWN_BACKLOG_BLOCKER_MASK
+    }
+
+    pub const fn unknown_backlog_blocker_mask(mask: u8) -> u8 {
+        mask & !Self::KNOWN_BACKLOG_BLOCKER_MASK
+    }
+
+    pub const fn sanitize_backlog_blocker_mask(mask: u8) -> u8 {
+        mask & Self::KNOWN_BACKLOG_BLOCKER_MASK
+    }
 
     pub fn has_backlog_blocker(&self, blocker_bit: u8) -> bool {
         debug_assert!(blocker_bit.is_power_of_two());
@@ -203,9 +220,10 @@ impl ReplicationWatermarks {
     }
 
     pub fn backlog_blockers_from_mask(mask: u8) -> impl Iterator<Item = BacklogBlocker> {
+        let known_mask = Self::sanitize_backlog_blocker_mask(mask);
         BacklogBlocker::ALL
             .into_iter()
-            .filter(move |blocker| mask & blocker.bit() != 0)
+            .filter(move |blocker| known_mask & blocker.bit() != 0)
     }
 
     pub fn backlog_blocker_mask_from_labels<'a>(labels: impl IntoIterator<Item = &'a str>) -> u8 {
@@ -1960,6 +1978,32 @@ mod tests {
             ReplicationWatermarks::backlog_blockers_from_mask(known_mask | unknown_mask)
                 .collect::<Vec<_>>(),
             vec![BacklogBlocker::Wal, BacklogBlocker::ActiveTxn]
+        );
+    }
+
+    #[test]
+    fn backlog_blocker_mask_helpers_strip_unknown_bits() {
+        let unknown_mask = (1 << 5) | (1 << 7);
+        let mixed_mask = ReplicationWatermarks::BACKLOG_BLOCKER_WAL
+            | ReplicationWatermarks::BACKLOG_BLOCKER_COMMIT_APPLY_GAP
+            | unknown_mask;
+
+        assert_eq!(
+            ReplicationWatermarks::known_backlog_blocker_mask(),
+            ReplicationWatermarks::BACKLOG_BLOCKER_WAL
+                | ReplicationWatermarks::BACKLOG_BLOCKER_PENDING_BATCH
+                | ReplicationWatermarks::BACKLOG_BLOCKER_ACTIVE_TXN
+                | ReplicationWatermarks::BACKLOG_BLOCKER_COMMIT_APPLY_GAP
+                | ReplicationWatermarks::BACKLOG_BLOCKER_APPLY_VISIBLE_GAP
+        );
+        assert_eq!(
+            ReplicationWatermarks::unknown_backlog_blocker_mask(mixed_mask),
+            unknown_mask
+        );
+        assert_eq!(
+            ReplicationWatermarks::sanitize_backlog_blocker_mask(mixed_mask),
+            ReplicationWatermarks::BACKLOG_BLOCKER_WAL
+                | ReplicationWatermarks::BACKLOG_BLOCKER_COMMIT_APPLY_GAP
         );
     }
 

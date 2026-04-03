@@ -3,6 +3,8 @@
 ## 2026-04-03
 
 ### Completed
+- Added backlog-blocker mask hygiene helpers (`known_backlog_blocker_mask`, `unknown_backlog_blocker_mask`, `sanitize_backlog_blocker_mask`) so automation can separate forward-compatible unknown bits from canonical blocker classes without open-coded bit arithmetic.
+- Updated `ReplicationWatermarks::backlog_blockers_from_mask` to sanitize unknown bits up front and added regression coverage for mixed known/unknown masks.
 - Added `ReplicationWatermarks::backlog_blocker_delimited_labels_from_mask(mask, delimiter)` so canonical blocker label sets can be emitted directly as delimited strings for metrics/export surfaces without reimplementing ordering logic.
 - Added regression coverage for delimited label encoding and encode/decode round-trip stability to keep blocker mask <-> string transforms deterministic.
 - Added `ReplicationWatermarks::backlog_blocker_mask_from_delimited_labels` so telemetry consumers can decode comma/semicolon/pipe-delimited blocker label streams directly into canonical blocker masks while ignoring unknown/empty segments safely.
