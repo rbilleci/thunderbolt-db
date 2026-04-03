@@ -278,7 +278,7 @@ impl ReplicationWatermarks {
 
     pub fn backlog_blocker_mask_from_delimited_labels(labels: &str) -> u8 {
         labels
-            .split([',', ';', '|', '/'])
+            .split([',', ';', '|', '/', '\n', '\r', '\t'])
             .filter_map(BacklogBlocker::from_label)
             .fold(0_u8, |mask, blocker| mask | blocker.bit())
     }
@@ -2162,6 +2162,21 @@ mod tests {
             mask,
             ReplicationWatermarks::BACKLOG_BLOCKER_PENDING_BATCH
                 | ReplicationWatermarks::BACKLOG_BLOCKER_WAL
+        );
+    }
+
+    #[test]
+    fn backlog_blocker_mask_from_delimited_labels_accepts_multiline_streams() {
+        let mask = ReplicationWatermarks::backlog_blocker_mask_from_delimited_labels(
+            "wal\n pending_batch\r\nACTIVE TXN\t| commit apply gap",
+        );
+
+        assert_eq!(
+            mask,
+            ReplicationWatermarks::BACKLOG_BLOCKER_WAL
+                | ReplicationWatermarks::BACKLOG_BLOCKER_PENDING_BATCH
+                | ReplicationWatermarks::BACKLOG_BLOCKER_ACTIVE_TXN
+                | ReplicationWatermarks::BACKLOG_BLOCKER_COMMIT_APPLY_GAP
         );
     }
 

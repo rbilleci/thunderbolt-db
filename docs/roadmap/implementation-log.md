@@ -3,6 +3,8 @@
 ## 2026-04-03
 
 ### Completed
+- Extended `ReplicationWatermarks::backlog_blocker_mask_from_delimited_labels` to also split on newline/carriage-return/tab delimiters, allowing multiline telemetry streams to decode blocker labels without pre-flattening.
+- Added regression coverage for multiline delimited-label decoding and updated replication interface docs to reflect newline/tab delimiter support.
 - Added backlog-mask aggregate helpers (`ReplicationWatermarks::backlog_blocker_count_from_mask`, `ReplicationWatermarks::has_backlog_blockers_in_mask`) and wired `Engine::replication_watermarks` to derive aggregate blocker count/boolean through those helpers, preventing drift when mixed known/unknown blocker bits appear in automation inputs.
 - Extended regression coverage for mixed-mask helper behavior to assert sanitized count/boolean semantics while unknown-only masks remain non-blocking.
 - Updated replication interface docs to include the new backlog-mask aggregate helper APIs.
