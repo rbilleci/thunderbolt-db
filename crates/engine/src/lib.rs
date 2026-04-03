@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+use std::fmt;
+use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use gpu_db_batching::{BatchItem, DualTriggerBatcher, FlushReason};
@@ -135,6 +137,34 @@ impl BacklogBlocker {
             b"apply_visible_gap" => Some(Self::ApplyVisibleGap),
             _ => None,
         }
+    }
+}
+
+impl fmt::Display for BacklogBlocker {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unknown backlog blocker label: {label}")]
+pub struct ParseBacklogBlockerError {
+    label: String,
+}
+
+impl ParseBacklogBlockerError {
+    fn unknown(label: &str) -> Self {
+        Self {
+            label: label.trim().to_owned(),
+        }
+    }
+}
+
+impl FromStr for BacklogBlocker {
+    type Err = ParseBacklogBlockerError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::from_label(s).ok_or_else(|| ParseBacklogBlockerError::unknown(s))
     }
 }
 
@@ -1976,6 +2006,27 @@ mod tests {
                 vec![blocker]
             );
         }
+    }
+
+    #[test]
+    fn backlog_blocker_display_and_from_str_roundtrip() {
+        for blocker in BacklogBlocker::ALL {
+            let label = blocker.to_string();
+            assert_eq!(label, blocker.as_str());
+            assert_eq!(label.parse::<BacklogBlocker>(), Ok(blocker));
+        }
+    }
+
+    #[test]
+    fn backlog_blocker_from_str_reports_unknown_label() {
+        let err = "  not-a-real-blocker  "
+            .parse::<BacklogBlocker>()
+            .expect_err("unknown blocker labels should fail to parse");
+
+        assert_eq!(
+            err.to_string(),
+            "unknown backlog blocker label: not-a-real-blocker"
+        );
     }
 
     #[test]
