@@ -3,6 +3,8 @@
 ## 2026-04-03
 
 ### Completed
+- Normalized backlog blocker label decoding in `BacklogBlocker::from_label`: surrounding whitespace is trimmed, labels are case-insensitive, and hyphen/space separators map to underscores so telemetry/admission automation can ingest mixed-format labels safely.
+- Added regression coverage for mixed-format label decoding via `ReplicationWatermarks::backlog_blocker_mask_from_labels` (`" WAL "`, `"pending-batch"`, `"ACTIVE TXN"`, etc.) to keep round-trip blocker semantics deterministic.
 - Added reverse label decode support for backlog blockers via `BacklogBlocker::from_label`, enabling typed parsing of string-form blocker classes (`wal`, `pending_batch`, etc.) emitted in telemetry.
 - Added `ReplicationWatermarks::backlog_blocker_mask_from_labels` to fold blocker label streams back into the canonical bitmask, ignoring unknown labels safely while preserving deterministic blocker semantics.
 - Added `ReplicationWatermarks::backlog_blocker_labels_from_mask` to project blocker masks back to stable label sequences in canonical blocker order, closing the loop for label/mask round-trip automation.
