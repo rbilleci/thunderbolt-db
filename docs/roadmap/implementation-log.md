@@ -1,5 +1,12 @@
 # Implementation Log (Pre-NVIDIA Phase)
 
+## 2026-04-03
+
+### Completed
+- Added reverse label decode support for backlog blockers via `BacklogBlocker::from_label`, enabling typed parsing of string-form blocker classes (`wal`, `pending_batch`, etc.) emitted in telemetry.
+- Added `ReplicationWatermarks::backlog_blocker_mask_from_labels` to fold blocker label streams back into the canonical bitmask, ignoring unknown labels safely while preserving deterministic blocker semantics.
+- Extended engine regression coverage for label round-trips and label-to-mask decoding (including duplicate + unknown labels), and updated replication interface docs with the new helper APIs.
+
 ## 2026-04-02
 
 ### Completed

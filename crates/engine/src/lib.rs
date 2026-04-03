@@ -107,6 +107,17 @@ impl BacklogBlocker {
             Self::ApplyVisibleGap => "apply_visible_gap",
         }
     }
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "wal" => Some(Self::Wal),
+            "pending_batch" => Some(Self::PendingBatch),
+            "active_txn" => Some(Self::ActiveTxn),
+            "commit_apply_gap" => Some(Self::CommitApplyGap),
+            "apply_visible_gap" => Some(Self::ApplyVisibleGap),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,6 +188,13 @@ impl ReplicationWatermarks {
         BacklogBlocker::ALL
             .into_iter()
             .filter(move |blocker| mask & blocker.bit() != 0)
+    }
+
+    pub fn backlog_blocker_mask_from_labels<'a>(labels: impl IntoIterator<Item = &'a str>) -> u8 {
+        labels
+            .into_iter()
+            .filter_map(BacklogBlocker::from_label)
+            .fold(0_u8, |mask, blocker| mask | blocker.bit())
     }
 }
 
@@ -1874,6 +1892,7 @@ mod tests {
             assert!(blocker.bit().is_power_of_two());
             assert!(!blocker.as_str().is_empty());
             assert_eq!(BacklogBlocker::from_bit(blocker.bit()), Some(blocker));
+            assert_eq!(BacklogBlocker::from_label(blocker.as_str()), Some(blocker));
 
             let mut marks = Engine::new_local().replication_watermarks();
             marks.backlog_blocker_mask = blocker.bit();
@@ -1906,6 +1925,27 @@ mod tests {
             ReplicationWatermarks::backlog_blockers_from_mask(known_mask | unknown_mask)
                 .collect::<Vec<_>>(),
             vec![BacklogBlocker::Wal, BacklogBlocker::ActiveTxn]
+        );
+    }
+
+    #[test]
+    fn replication_watermarks_backlog_blocker_mask_from_labels_ignores_unknowns() {
+        let mask = ReplicationWatermarks::backlog_blocker_mask_from_labels([
+            "pending_batch",
+            "unknown",
+            "active_txn",
+            "pending_batch",
+        ]);
+
+        assert_eq!(BacklogBlocker::from_label("unknown"), None);
+        assert_eq!(
+            mask,
+            ReplicationWatermarks::BACKLOG_BLOCKER_PENDING_BATCH
+                | ReplicationWatermarks::BACKLOG_BLOCKER_ACTIVE_TXN
+        );
+        assert_eq!(
+            ReplicationWatermarks::backlog_blockers_from_mask(mask).collect::<Vec<_>>(),
+            vec![BacklogBlocker::PendingBatch, BacklogBlocker::ActiveTxn]
         );
     }
 
