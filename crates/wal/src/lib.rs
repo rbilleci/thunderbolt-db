@@ -6,6 +6,12 @@ pub struct WalRecord {
     pub payload: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalCheckpointMeta {
+    pub durable_record_count: usize,
+    pub last_durable_txn_id: Option<TxnId>,
+}
+
 #[derive(Debug, Default)]
 pub struct WalBuffer {
     records: Vec<WalRecord>,
@@ -54,6 +60,13 @@ impl WalBuffer {
 
     pub fn unflushed_count(&self) -> usize {
         self.records.len().saturating_sub(self.flushed)
+    }
+
+    pub fn checkpoint_meta(&self) -> WalCheckpointMeta {
+        WalCheckpointMeta {
+            durable_record_count: self.flushed,
+            last_durable_txn_id: self.flushed_records().last().map(|record| record.txn_id),
+        }
     }
 
     pub fn fail_next_flush(&mut self) {
@@ -182,5 +195,80 @@ mod tests {
 
         assert!(wal.flushed_records().is_empty());
         assert_eq!(wal.unflushed_count(), 1);
+    }
+
+    #[test]
+    fn checkpoint_meta_tracks_durable_prefix_and_last_txn_id() {
+        let mut wal = WalBuffer::default();
+        assert_eq!(
+            wal.checkpoint_meta(),
+            WalCheckpointMeta {
+                durable_record_count: 0,
+                last_durable_txn_id: None,
+            }
+        );
+
+        wal.append(WalRecord {
+            txn_id: 7,
+            payload: b"SET a=1".to_vec(),
+        });
+        wal.append(WalRecord {
+            txn_id: 8,
+            payload: b"SET b=2".to_vec(),
+        });
+
+        assert_eq!(
+            wal.checkpoint_meta(),
+            WalCheckpointMeta {
+                durable_record_count: 0,
+                last_durable_txn_id: None,
+            }
+        );
+
+        wal.flush_all().unwrap();
+        assert_eq!(
+            wal.checkpoint_meta(),
+            WalCheckpointMeta {
+                durable_record_count: 2,
+                last_durable_txn_id: Some(8),
+            }
+        );
+
+        wal.append(WalRecord {
+            txn_id: 9,
+            payload: b"SET c=3".to_vec(),
+        });
+        assert_eq!(
+            wal.checkpoint_meta(),
+            WalCheckpointMeta {
+                durable_record_count: 2,
+                last_durable_txn_id: Some(8),
+            }
+        );
+    }
+
+    #[test]
+    fn checkpoint_meta_does_not_advance_on_failed_flush() {
+        let mut wal = WalBuffer::default();
+        wal.append(WalRecord {
+            txn_id: 11,
+            payload: b"SET a=1".to_vec(),
+        });
+        wal.flush_all().unwrap();
+
+        wal.append(WalRecord {
+            txn_id: 12,
+            payload: b"SET b=2".to_vec(),
+        });
+        wal.fail_next_flush();
+        assert!(wal.flush_all().is_err());
+
+        assert_eq!(
+            wal.checkpoint_meta(),
+            WalCheckpointMeta {
+                durable_record_count: 1,
+                last_durable_txn_id: Some(11),
+            }
+        );
     }
 }
