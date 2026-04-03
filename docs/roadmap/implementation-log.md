@@ -3,6 +3,9 @@
 ## 2026-04-03
 
 ### Completed
+- Added backlog-mask aggregate helpers (`ReplicationWatermarks::backlog_blocker_count_from_mask`, `ReplicationWatermarks::has_backlog_blockers_in_mask`) and wired `Engine::replication_watermarks` to derive aggregate blocker count/boolean through those helpers, preventing drift when mixed known/unknown blocker bits appear in automation inputs.
+- Extended regression coverage for mixed-mask helper behavior to assert sanitized count/boolean semantics while unknown-only masks remain non-blocking.
+- Updated replication interface docs to include the new backlog-mask aggregate helper APIs.
 - Extended `ReplicationWatermarks::backlog_blocker_mask_from_delimited_labels` to also split on slash (`/`) delimiters so telemetry streams like `wal/active_txn` decode without pre-normalization.
 - Added backlog-blocker mask hygiene helpers (`known_backlog_blocker_mask`, `unknown_backlog_blocker_mask`, `sanitize_backlog_blocker_mask`) so automation can separate forward-compatible unknown bits from canonical blocker classes without open-coded bit arithmetic.
 - Updated `ReplicationWatermarks::backlog_blockers_from_mask` to sanitize unknown bits up front and added regression coverage for mixed known/unknown masks.

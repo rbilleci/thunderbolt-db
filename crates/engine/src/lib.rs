@@ -196,6 +196,14 @@ impl ReplicationWatermarks {
         mask & Self::KNOWN_BACKLOG_BLOCKER_MASK
     }
 
+    pub fn backlog_blocker_count_from_mask(mask: u8) -> u8 {
+        Self::sanitize_backlog_blocker_mask(mask).count_ones() as u8
+    }
+
+    pub const fn has_backlog_blockers_in_mask(mask: u8) -> bool {
+        Self::sanitize_backlog_blocker_mask(mask) != 0
+    }
+
     pub fn has_backlog_blocker(&self, blocker_bit: u8) -> bool {
         debug_assert!(blocker_bit.is_power_of_two());
         self.backlog_blocker_mask & blocker_bit != 0
@@ -675,8 +683,10 @@ impl Engine {
                 * ReplicationWatermarks::BACKLOG_BLOCKER_COMMIT_APPLY_GAP)
             | (u8::from(has_apply_visible_gap)
                 * ReplicationWatermarks::BACKLOG_BLOCKER_APPLY_VISIBLE_GAP);
-        let backlog_blocker_count = backlog_blocker_mask.count_ones() as u8;
-        let has_backlog_blockers = backlog_blocker_mask != 0;
+        let backlog_blocker_count =
+            ReplicationWatermarks::backlog_blocker_count_from_mask(backlog_blocker_mask);
+        let has_backlog_blockers =
+            ReplicationWatermarks::has_backlog_blockers_in_mask(backlog_blocker_mask);
 
         ReplicationWatermarks {
             role,
@@ -2005,6 +2015,16 @@ mod tests {
             ReplicationWatermarks::BACKLOG_BLOCKER_WAL
                 | ReplicationWatermarks::BACKLOG_BLOCKER_COMMIT_APPLY_GAP
         );
+        assert_eq!(
+            ReplicationWatermarks::backlog_blocker_count_from_mask(mixed_mask),
+            2
+        );
+        assert!(ReplicationWatermarks::has_backlog_blockers_in_mask(
+            mixed_mask
+        ));
+        assert!(!ReplicationWatermarks::has_backlog_blockers_in_mask(
+            unknown_mask
+        ));
     }
 
     #[test]
