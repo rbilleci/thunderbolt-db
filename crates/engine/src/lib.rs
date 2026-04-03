@@ -196,6 +196,10 @@ impl ReplicationWatermarks {
             .filter_map(BacklogBlocker::from_label)
             .fold(0_u8, |mask, blocker| mask | blocker.bit())
     }
+
+    pub fn backlog_blocker_labels_from_mask(mask: u8) -> impl Iterator<Item = &'static str> {
+        Self::backlog_blockers_from_mask(mask).map(BacklogBlocker::as_str)
+    }
 }
 
 pub struct Engine {
@@ -1946,6 +1950,10 @@ mod tests {
         assert_eq!(
             ReplicationWatermarks::backlog_blockers_from_mask(mask).collect::<Vec<_>>(),
             vec![BacklogBlocker::PendingBatch, BacklogBlocker::ActiveTxn]
+        );
+        assert_eq!(
+            ReplicationWatermarks::backlog_blocker_labels_from_mask(mask).collect::<Vec<_>>(),
+            vec!["pending_batch", "active_txn"]
         );
     }
 
