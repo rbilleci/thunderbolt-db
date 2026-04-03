@@ -153,6 +153,10 @@ pub struct ParseBacklogBlockerError {
 }
 
 impl ParseBacklogBlockerError {
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
     fn unknown(label: &str) -> Self {
         Self {
             label: label.trim().to_owned(),
@@ -2023,6 +2027,7 @@ mod tests {
             .parse::<BacklogBlocker>()
             .expect_err("unknown blocker labels should fail to parse");
 
+        assert_eq!(err.label(), "not-a-real-blocker");
         assert_eq!(
             err.to_string(),
             "unknown backlog blocker label: not-a-real-blocker"
