@@ -225,6 +225,12 @@ impl ReplicationWatermarks {
     pub fn backlog_blocker_labels_from_mask(mask: u8) -> impl Iterator<Item = &'static str> {
         Self::backlog_blockers_from_mask(mask).map(BacklogBlocker::as_str)
     }
+
+    pub fn backlog_blocker_delimited_labels_from_mask(mask: u8, delimiter: &str) -> String {
+        Self::backlog_blocker_labels_from_mask(mask)
+            .collect::<Vec<_>>()
+            .join(delimiter)
+    }
 }
 
 pub struct Engine {
@@ -2035,6 +2041,34 @@ mod tests {
             mask,
             ReplicationWatermarks::BACKLOG_BLOCKER_PENDING_BATCH
                 | ReplicationWatermarks::BACKLOG_BLOCKER_WAL
+        );
+    }
+
+    #[test]
+    fn backlog_blocker_delimited_labels_from_mask_emits_canonical_order() {
+        let mask = ReplicationWatermarks::BACKLOG_BLOCKER_ACTIVE_TXN
+            | ReplicationWatermarks::BACKLOG_BLOCKER_WAL
+            | ReplicationWatermarks::BACKLOG_BLOCKER_APPLY_VISIBLE_GAP;
+
+        assert_eq!(
+            ReplicationWatermarks::backlog_blocker_delimited_labels_from_mask(mask, ","),
+            "wal,active_txn,apply_visible_gap"
+        );
+        assert_eq!(
+            ReplicationWatermarks::backlog_blocker_delimited_labels_from_mask(mask, " | "),
+            "wal | active_txn | apply_visible_gap"
+        );
+    }
+
+    #[test]
+    fn backlog_blocker_delimited_mask_roundtrip_is_stable() {
+        let mask = ReplicationWatermarks::BACKLOG_BLOCKER_PENDING_BATCH
+            | ReplicationWatermarks::BACKLOG_BLOCKER_COMMIT_APPLY_GAP;
+        let labels = ReplicationWatermarks::backlog_blocker_delimited_labels_from_mask(mask, ";");
+
+        assert_eq!(
+            ReplicationWatermarks::backlog_blocker_mask_from_delimited_labels(&labels),
+            mask
         );
     }
 

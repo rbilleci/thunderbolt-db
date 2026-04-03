@@ -3,6 +3,8 @@
 ## 2026-04-03
 
 ### Completed
+- Added `ReplicationWatermarks::backlog_blocker_delimited_labels_from_mask(mask, delimiter)` so canonical blocker label sets can be emitted directly as delimited strings for metrics/export surfaces without reimplementing ordering logic.
+- Added regression coverage for delimited label encoding and encode/decode round-trip stability to keep blocker mask <-> string transforms deterministic.
 - Added `ReplicationWatermarks::backlog_blocker_mask_from_delimited_labels` so telemetry consumers can decode comma/semicolon/pipe-delimited blocker label streams directly into canonical blocker masks while ignoring unknown/empty segments safely.
 - Added regression coverage for delimited-label decoding (`wal, pending-batch; ACTIVE TXN | ...`) to keep blocker-mask derivation deterministic for CSV-like automation inputs.
 - Updated replication interface docs to include the new delimited-label helper in the published watermark API contract.
