@@ -235,7 +235,7 @@ impl ReplicationWatermarks {
 
     pub fn backlog_blocker_mask_from_delimited_labels(labels: &str) -> u8 {
         labels
-            .split([',', ';', '|'])
+            .split([',', ';', '|', '/'])
             .filter_map(BacklogBlocker::from_label)
             .fold(0_u8, |mask, blocker| mask | blocker.bit())
     }
@@ -2063,7 +2063,7 @@ mod tests {
     #[test]
     fn backlog_blocker_mask_from_delimited_labels_decodes_csv_like_streams() {
         let mask = ReplicationWatermarks::backlog_blocker_mask_from_delimited_labels(
-            "wal, pending-batch; ACTIVE TXN | unknown | apply visible gap",
+            "wal, pending-batch; ACTIVE TXN | unknown / apply visible gap",
         );
 
         assert_eq!(
