@@ -206,7 +206,8 @@ impl ReplicationWatermarks {
 
     pub fn has_backlog_blocker(&self, blocker_bit: u8) -> bool {
         debug_assert!(blocker_bit.is_power_of_two());
-        self.backlog_blocker_mask & blocker_bit != 0
+        let known_bit = Self::sanitize_backlog_blocker_mask(blocker_bit);
+        known_bit != 0 && (self.backlog_blocker_mask & known_bit != 0)
     }
 
     pub fn has_blocker_kind(&self, blocker: BacklogBlocker) -> bool {
@@ -2161,6 +2162,7 @@ mod tests {
         assert!(marks.has_backlog_blocker(ReplicationWatermarks::BACKLOG_BLOCKER_PENDING_BATCH));
         assert!(marks.has_backlog_blocker(ReplicationWatermarks::BACKLOG_BLOCKER_ACTIVE_TXN));
         assert!(!marks.has_backlog_blocker(ReplicationWatermarks::BACKLOG_BLOCKER_WAL));
+        assert!(!marks.has_backlog_blocker(1 << 7));
         assert_eq!(
             marks.backlog_blockers().collect::<Vec<_>>(),
             vec![BacklogBlocker::PendingBatch, BacklogBlocker::ActiveTxn]
