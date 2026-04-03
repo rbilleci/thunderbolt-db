@@ -109,12 +109,30 @@ impl BacklogBlocker {
     }
 
     pub fn from_label(label: &str) -> Option<Self> {
-        match label {
-            "wal" => Some(Self::Wal),
-            "pending_batch" => Some(Self::PendingBatch),
-            "active_txn" => Some(Self::ActiveTxn),
-            "commit_apply_gap" => Some(Self::CommitApplyGap),
-            "apply_visible_gap" => Some(Self::ApplyVisibleGap),
+        let mut normalized = [0_u8; 32];
+        let mut len = 0usize;
+
+        for b in label.trim().bytes() {
+            let folded = match b {
+                b'A'..=b'Z' => b + 32,
+                b'-' | b' ' => b'_',
+                _ => b,
+            };
+
+            if len == normalized.len() {
+                return None;
+            }
+
+            normalized[len] = folded;
+            len += 1;
+        }
+
+        match &normalized[..len] {
+            b"wal" => Some(Self::Wal),
+            b"pending_batch" => Some(Self::PendingBatch),
+            b"active_txn" => Some(Self::ActiveTxn),
+            b"commit_apply_gap" => Some(Self::CommitApplyGap),
+            b"apply_visible_gap" => Some(Self::ApplyVisibleGap),
             _ => None,
         }
     }
@@ -1954,6 +1972,34 @@ mod tests {
         assert_eq!(
             ReplicationWatermarks::backlog_blocker_labels_from_mask(mask).collect::<Vec<_>>(),
             vec!["pending_batch", "active_txn"]
+        );
+    }
+
+    #[test]
+    fn backlog_blocker_label_decode_normalizes_case_spacing_and_hyphenation() {
+        let mask = ReplicationWatermarks::backlog_blocker_mask_from_labels([
+            " WAL ",
+            "pending-batch",
+            "ACTIVE TXN",
+            "commit-apply-gap",
+            "apply visible gap",
+        ]);
+
+        assert_eq!(
+            BacklogBlocker::from_label("PENDING-BATCH"),
+            Some(BacklogBlocker::PendingBatch)
+        );
+        assert_eq!(
+            BacklogBlocker::from_label("apply visible gap"),
+            Some(BacklogBlocker::ApplyVisibleGap)
+        );
+        assert_eq!(
+            mask,
+            ReplicationWatermarks::BACKLOG_BLOCKER_WAL
+                | ReplicationWatermarks::BACKLOG_BLOCKER_PENDING_BATCH
+                | ReplicationWatermarks::BACKLOG_BLOCKER_ACTIVE_TXN
+                | ReplicationWatermarks::BACKLOG_BLOCKER_COMMIT_APPLY_GAP
+                | ReplicationWatermarks::BACKLOG_BLOCKER_APPLY_VISIBLE_GAP
         );
     }
 
