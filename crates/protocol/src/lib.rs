@@ -22,7 +22,7 @@ pub enum ParseError {
     InvalidDel,
     #[error("invalid GET syntax; expected: GET key")]
     InvalidGet,
-    #[error("invalid RESET syntax; expected: RESET ALL")]
+    #[error("invalid RESET/DISCARD syntax; expected: RESET ALL or DISCARD ALL")]
     InvalidReset,
 }
 
@@ -87,14 +87,22 @@ fn parse_flush_command(input: &str) -> Option<Command> {
 fn parse_reset_command(input: &str) -> Option<Result<Command, ParseError>> {
     let tokens: Vec<_> = input.split_whitespace().collect();
     let (first, rest) = tokens.split_first()?;
-    if !first.eq_ignore_ascii_case("RESET") {
-        return None;
+
+    if first.eq_ignore_ascii_case("RESET") {
+        return Some(match rest {
+            [target] if target.eq_ignore_ascii_case("ALL") => Ok(Command::ResetAll),
+            _ => Err(ParseError::InvalidReset),
+        });
     }
 
-    Some(match rest {
-        [target] if target.eq_ignore_ascii_case("ALL") => Ok(Command::ResetAll),
-        _ => Err(ParseError::InvalidReset),
-    })
+    if first.eq_ignore_ascii_case("DISCARD") {
+        return Some(match rest {
+            [target] if target.eq_ignore_ascii_case("ALL") => Ok(Command::ResetAll),
+            _ => Err(ParseError::InvalidReset),
+        });
+    }
+
+    None
 }
 
 fn is_isolation_level_suffix(tokens: &[&str]) -> bool {
@@ -465,6 +473,9 @@ mod tests {
     #[test]
     fn parses_reset_all() {
         let cmd = parse_command("RESET ALL").unwrap();
+        assert_eq!(cmd, Command::ResetAll);
+
+        let cmd = parse_command("DISCARD ALL").unwrap();
         assert_eq!(cmd, Command::ResetAll);
     }
 
@@ -882,6 +893,18 @@ mod tests {
             parse_command("RESET ALL NOW"),
             Err(ParseError::InvalidReset)
         ));
+        assert!(matches!(
+            parse_command("DISCARD"),
+            Err(ParseError::InvalidReset)
+        ));
+        assert!(matches!(
+            parse_command("DISCARD TEMP"),
+            Err(ParseError::InvalidReset)
+        ));
+        assert!(matches!(
+            parse_command("DISCARD ALL NOW"),
+            Err(ParseError::InvalidReset)
+        ));
     }
 
     #[test]
@@ -910,6 +933,7 @@ mod tests {
             }
         );
         assert_eq!(parse_command("RESET ALL;").unwrap(), Command::ResetAll);
+        assert_eq!(parse_command("DISCARD ALL;\n").unwrap(), Command::ResetAll);
     }
 
     #[test]
