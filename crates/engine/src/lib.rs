@@ -133,7 +133,17 @@ impl BacklogBlocker {
             len += 1;
         }
 
-        match &normalized[..len] {
+        let mut start = 0usize;
+        while start < len && normalized[start] == b'_' {
+            start += 1;
+        }
+
+        let mut end = len;
+        while end > start && normalized[end - 1] == b'_' {
+            end -= 1;
+        }
+
+        match &normalized[start..end] {
             b"wal" => Some(Self::Wal),
             b"pending_batch" => Some(Self::PendingBatch),
             b"active_txn" => Some(Self::ActiveTxn),
@@ -2157,6 +2167,14 @@ mod tests {
         assert_eq!(
             BacklogBlocker::from_label("commit--apply  gap"),
             Some(BacklogBlocker::CommitApplyGap)
+        );
+        assert_eq!(
+            BacklogBlocker::from_label("__wal__"),
+            Some(BacklogBlocker::Wal)
+        );
+        assert_eq!(
+            BacklogBlocker::from_label("___active.txn___"),
+            Some(BacklogBlocker::ActiveTxn)
         );
         assert_eq!(
             mask,
