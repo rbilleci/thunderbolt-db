@@ -4,6 +4,7 @@
 
 ### Completed
 - Extended `ReplicationWatermarks::backlog_blocker_mask_from_delimited_labels` to accept colon (`:`) delimiters in addition to existing comma/semicolon/pipe/slash/newline/tab separators, so telemetry streams like `wal:active_txn` decode without pre-normalization.
+- Extended `ReplicationWatermarks::backlog_blocker_mask_from_delimited_labels` to also split parenthesized/angle-bracket wrappers (`()`, `<>`), so streams like `<(wal|active_txn|apply visible gap)>` decode without pre-stripping envelope characters.
 - Expanded regression coverage for CSV-like delimited decoding to assert colon-separated blocker labels are folded into the canonical backlog mask deterministically.
 - Added colon-delimiter round-trip regression coverage (`mask -> labels -> mask`) so canonical blocker-order encoding remains stable for colon-separated exports.
 - Updated replication interface docs to document colon-delimited blocker stream support.
