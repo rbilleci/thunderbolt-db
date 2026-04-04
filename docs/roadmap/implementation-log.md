@@ -1,5 +1,12 @@
 # Implementation Log (Pre-NVIDIA Phase)
 
+## 2026-04-04
+
+### Completed
+- Extended `ReplicationWatermarks::backlog_blocker_mask_from_delimited_labels` to accept colon (`:`) delimiters in addition to existing comma/semicolon/pipe/slash/newline/tab separators, so telemetry streams like `wal:active_txn` decode without pre-normalization.
+- Expanded regression coverage for CSV-like delimited decoding to assert colon-separated blocker labels are folded into the canonical backlog mask deterministically.
+- Updated replication interface docs to document colon-delimited blocker stream support.
+
 ## 2026-04-03
 
 ### Completed
