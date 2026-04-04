@@ -3,6 +3,7 @@
 ## 2026-04-04
 
 ### Completed
+- Hardened `BacklogBlocker::from_label` normalization to ignore leading/trailing underscore wrappers after separator folding, so noisy labels like `__wal__` and `___active.txn___` decode to canonical blocker kinds without pre-cleaning.
 - Extended backlog blocker label normalization in `BacklogBlocker::from_label` to treat dot separators (`.`) like hyphen/space (`_`), so telemetry labels like `pending.batch` decode to canonical blocker kinds without pre-normalization.
 - Extended `ReplicationWatermarks::backlog_blocker_mask_from_delimited_labels` to strip backtick wrappers in addition to single/double quotes, so streams like `` `wal`,`active_txn` `` decode without preprocessing.
 - Hardened `BacklogBlocker::from_label` normalization to collapse repeated separator runs into a single underscore, so labels like `commit--apply  gap` decode to canonical blocker kinds without pre-cleaning.
