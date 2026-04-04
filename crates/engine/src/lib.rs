@@ -121,6 +121,10 @@ impl BacklogBlocker {
                 _ => b,
             };
 
+            if folded == b'_' && len > 0 && normalized[len - 1] == b'_' {
+                continue;
+            }
+
             if len == normalized.len() {
                 return None;
             }
@@ -2127,6 +2131,7 @@ mod tests {
             "commit-apply-gap",
             "apply visible gap",
             "pending.batch",
+            "commit--apply  gap",
         ]);
 
         assert_eq!(
@@ -2140,6 +2145,10 @@ mod tests {
         assert_eq!(
             BacklogBlocker::from_label("pending.batch"),
             Some(BacklogBlocker::PendingBatch)
+        );
+        assert_eq!(
+            BacklogBlocker::from_label("commit--apply  gap"),
+            Some(BacklogBlocker::CommitApplyGap)
         );
         assert_eq!(
             mask,
