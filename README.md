@@ -27,7 +27,7 @@ cargo test --all-features
 - `START TRANSACTION` and `START WORK` map to `BEGIN`; optional `READ ONLY` / `READ WRITE`, `[NOT] DEFERRABLE`, and `ISOLATION LEVEL {SERIALIZABLE|REPEATABLE READ|READ COMMITTED|READ UNCOMMITTED}` suffixes are accepted on `BEGIN`/`START` aliases (including comma-separated mode lists) and currently map to plain `BEGIN` behavior.
 - `FLUSH`, `FLUSH WAL`, and `FLUSH LOG` are equivalent admin/coordination commands and are tracked as CPU fallback metric events.
 - Replication backlog blocker labels can be decoded from delimited text streams (CSV-like, multiline, and JSON-like arrays with quoted labels).
-- `RESET ALL` and `DISCARD ALL` are accepted as CPU-routed session-control no-ops in the bootstrap engine so PostgreSQL-style client reset probes do not fail parser validation.
+- `RESET ALL` and `DISCARD {ALL|TEMP|TEMPORARY|PLANS|SEQUENCES}` are accepted as CPU-routed session-control no-ops in the bootstrap engine so PostgreSQL-style client reset probes do not fail parser validation.
 
 ## Safety invariant
 

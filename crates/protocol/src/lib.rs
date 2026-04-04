@@ -22,7 +22,7 @@ pub enum ParseError {
     InvalidDel,
     #[error("invalid GET syntax; expected: GET key")]
     InvalidGet,
-    #[error("invalid RESET/DISCARD syntax; expected: RESET ALL or DISCARD ALL")]
+    #[error("invalid RESET/DISCARD syntax; expected: RESET ALL or DISCARD {{ALL|TEMP|TEMPORARY|PLANS|SEQUENCES}}")]
     InvalidReset,
 }
 
@@ -97,7 +97,15 @@ fn parse_reset_command(input: &str) -> Option<Result<Command, ParseError>> {
 
     if first.eq_ignore_ascii_case("DISCARD") {
         return Some(match rest {
-            [target] if target.eq_ignore_ascii_case("ALL") => Ok(Command::ResetAll),
+            [target]
+                if target.eq_ignore_ascii_case("ALL")
+                    || target.eq_ignore_ascii_case("TEMP")
+                    || target.eq_ignore_ascii_case("TEMPORARY")
+                    || target.eq_ignore_ascii_case("PLANS")
+                    || target.eq_ignore_ascii_case("SEQUENCES") =>
+            {
+                Ok(Command::ResetAll)
+            }
             _ => Err(ParseError::InvalidReset),
         });
     }
@@ -476,6 +484,18 @@ mod tests {
         assert_eq!(cmd, Command::ResetAll);
 
         let cmd = parse_command("DISCARD ALL").unwrap();
+        assert_eq!(cmd, Command::ResetAll);
+
+        let cmd = parse_command("DISCARD TEMP").unwrap();
+        assert_eq!(cmd, Command::ResetAll);
+
+        let cmd = parse_command("DISCARD TEMPORARY").unwrap();
+        assert_eq!(cmd, Command::ResetAll);
+
+        let cmd = parse_command("DISCARD PLANS").unwrap();
+        assert_eq!(cmd, Command::ResetAll);
+
+        let cmd = parse_command("DISCARD SEQUENCES").unwrap();
         assert_eq!(cmd, Command::ResetAll);
     }
 
@@ -898,7 +918,7 @@ mod tests {
             Err(ParseError::InvalidReset)
         ));
         assert!(matches!(
-            parse_command("DISCARD TEMP"),
+            parse_command("DISCARD TEMP NOW"),
             Err(ParseError::InvalidReset)
         ));
         assert!(matches!(
@@ -934,6 +954,7 @@ mod tests {
         );
         assert_eq!(parse_command("RESET ALL;").unwrap(), Command::ResetAll);
         assert_eq!(parse_command("DISCARD ALL;\n").unwrap(), Command::ResetAll);
+        assert_eq!(parse_command("DISCARD TEMP;\n").unwrap(), Command::ResetAll);
     }
 
     #[test]
