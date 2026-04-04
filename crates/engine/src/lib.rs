@@ -949,6 +949,12 @@ mod tests {
             ExecuteError::NonReadCommand("RESET ALL")
         ));
 
+        let discard_err = e.execute_read_text("DISCARD TEMP").unwrap_err();
+        assert!(matches!(
+            discard_err,
+            ExecuteError::NonReadCommand("RESET ALL")
+        ));
+
         let del_err = e.execute_read_text("DELETE balance").unwrap_err();
         assert!(matches!(
             del_err,
@@ -1542,10 +1548,11 @@ mod tests {
         e.execute_text(3, "GET missing").unwrap();
         e.execute_text(4, "FLUSH").unwrap();
         e.execute_text(5, "RESET ALL").unwrap();
+        e.execute_text(6, "DISCARD TEMP").unwrap();
 
         assert_eq!(e.active_txn_count(), 0);
-        assert_eq!(e.metrics().fallback_total, 7);
-        assert_eq!(e.metrics().fallback_for(FallbackReason::NotGpuEligible), 7);
+        assert_eq!(e.metrics().fallback_total, 8);
+        assert_eq!(e.metrics().fallback_for(FallbackReason::NotGpuEligible), 8);
         assert_eq!(
             e.metrics().last_fallback_reason(),
             Some(FallbackReason::NotGpuEligible)
@@ -1565,10 +1572,11 @@ mod tests {
         e.enqueue_set_text(3, "GET missing", t0).unwrap();
         e.enqueue_set_text(4, "FLUSH", t0).unwrap();
         e.enqueue_set_text(5, "RESET ALL", t0).unwrap();
+        e.enqueue_set_text(6, "DISCARD TEMP", t0).unwrap();
 
         assert_eq!(e.active_txn_count(), 0);
-        assert_eq!(e.metrics().fallback_total, 7);
-        assert_eq!(e.metrics().fallback_for(FallbackReason::NotGpuEligible), 7);
+        assert_eq!(e.metrics().fallback_total, 8);
+        assert_eq!(e.metrics().fallback_for(FallbackReason::NotGpuEligible), 8);
         assert_eq!(e.pending_batch_len(), 0);
         assert_eq!(e.metrics().commits_total, 0);
     }
