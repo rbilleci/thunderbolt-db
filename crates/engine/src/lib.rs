@@ -9,7 +9,7 @@ use gpu_db_planner::{ExecutionPlan, Planner, PlannerConfig};
 use gpu_db_protocol::{parse_command, Command, ParseError};
 use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine};
 use gpu_db_txn::{TxnError, TxnManager};
-use gpu_db_types::{CommitToken, EngineError, Index, LogEntry, Role, SnapshotMeta, Term};
+use gpu_db_types::{CommitToken, EngineError, Index, LogEntry, Role, SnapshotMeta, Term, TxnId};
 use gpu_db_wal::{WalBuffer, WalRecord};
 
 #[derive(Debug, Default)]
@@ -183,6 +183,7 @@ pub struct ReplicationWatermarks {
     pub apply_visible_gap: Index,
     pub snapshot_id: u64,
     pub wal_flushed_count: usize,
+    pub wal_last_durable_txn_id: Option<TxnId>,
     pub wal_buffered_count: usize,
     pub wal_unflushed_count: usize,
     pub pending_batch_len: usize,
@@ -723,6 +724,8 @@ impl Engine {
         let has_backlog_blockers =
             ReplicationWatermarks::has_backlog_blockers_in_mask(backlog_blocker_mask);
 
+        let wal_checkpoint = self.wal.checkpoint_meta();
+
         ReplicationWatermarks {
             role,
             term: self.repl.current_term(),
@@ -732,7 +735,8 @@ impl Engine {
             commit_apply_gap,
             apply_visible_gap,
             snapshot_id: self.repl.snapshot_meta().snapshot_id,
-            wal_flushed_count: self.wal.flushed_count(),
+            wal_flushed_count: wal_checkpoint.durable_record_count,
+            wal_last_durable_txn_id: wal_checkpoint.last_durable_txn_id,
             wal_buffered_count: self.wal.len(),
             wal_unflushed_count,
             pending_batch_len,
@@ -1792,6 +1796,7 @@ mod tests {
         assert_eq!(marks.commit_apply_gap, 0);
         assert_eq!(marks.apply_visible_gap, 0);
         assert_eq!(marks.wal_flushed_count, 0);
+        assert_eq!(marks.wal_last_durable_txn_id, None);
         assert_eq!(marks.wal_buffered_count, 0);
         assert_eq!(marks.wal_unflushed_count, 0);
         assert_eq!(marks.pending_batch_len, 0);
@@ -1824,6 +1829,7 @@ mod tests {
         let marks = e.replication_watermarks();
         assert_eq!(marks.wal_buffered_count, 2);
         assert_eq!(marks.wal_flushed_count, 2);
+        assert_eq!(marks.wal_last_durable_txn_id, Some(2));
         assert_eq!(marks.wal_unflushed_count, 0);
         assert_eq!(marks.pending_batch_len, 0);
         assert_eq!(marks.pending_batch_cap, 64);

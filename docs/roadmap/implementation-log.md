@@ -4,6 +4,7 @@
 
 ### Completed
 - Added `WalBuffer::checkpoint_meta()` and `WalCheckpointMeta` so recovery/bootstrap paths can query durable-prefix checkpoint state (`durable_record_count`, `last_durable_txn_id`) without recomputing from raw WAL slices.
+- Extended `ReplicationWatermarks` with `wal_last_durable_txn_id` sourced from WAL checkpoint metadata so replication/admission telemetry exposes the durable transaction frontier directly alongside WAL depth counters.
 - Added WAL regression coverage proving checkpoint metadata only advances after successful flushes and remains pinned on flush failure paths, preserving WAL-before-visibility durability semantics.
 - Extended `ReplicationWatermarks::backlog_blocker_mask_from_delimited_labels` to also split on newline/carriage-return/tab delimiters, allowing multiline telemetry streams to decode blocker labels without pre-flattening.
 - Added regression coverage for multiline delimited-label decoding and updated replication interface docs to reflect newline/tab delimiter support.
