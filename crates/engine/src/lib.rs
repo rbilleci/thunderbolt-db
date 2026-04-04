@@ -2245,6 +2245,20 @@ mod tests {
     }
 
     #[test]
+    fn backlog_blocker_mask_from_delimited_labels_accepts_braced_streams() {
+        let mask = ReplicationWatermarks::backlog_blocker_mask_from_delimited_labels(
+            "{'wal';'active_txn';'apply visible gap'}",
+        );
+
+        assert_eq!(
+            mask,
+            ReplicationWatermarks::BACKLOG_BLOCKER_WAL
+                | ReplicationWatermarks::BACKLOG_BLOCKER_ACTIVE_TXN
+                | ReplicationWatermarks::BACKLOG_BLOCKER_APPLY_VISIBLE_GAP
+        );
+    }
+
+    #[test]
     fn backlog_blocker_mask_from_delimited_labels_accepts_parenthesized_and_angle_bracket_streams()
     {
         let mask = ReplicationWatermarks::backlog_blocker_mask_from_delimited_labels(
