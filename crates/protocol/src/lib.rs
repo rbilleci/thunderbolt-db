@@ -16,7 +16,7 @@ pub enum ParseError {
     Empty,
     #[error("unsupported command: {0}")]
     Unsupported(String),
-    #[error("invalid SET syntax; expected: SET key=value")]
+    #[error("invalid SET syntax; expected: SET key=value or SET key TO value")]
     InvalidSet,
     #[error("invalid DEL/DELETE syntax; expected: DEL key or DELETE [FROM] key")]
     InvalidDel,
@@ -118,6 +118,30 @@ fn parse_reset_command(input: &str) -> Option<Result<Command, ParseError>> {
     }
 
     None
+}
+
+fn split_set_key_value(rest: &str) -> Option<(&str, &str)> {
+    if let Some((k, v)) = rest.split_once('=') {
+        return Some((k, v));
+    }
+
+    let trimmed = rest.trim();
+    let (key, tail) = trimmed.split_once(char::is_whitespace)?;
+    let tail = tail.trim_start();
+    if tail.len() < 2 {
+        return None;
+    }
+
+    let (keyword, remainder) = tail.split_at(2);
+    if !keyword.eq_ignore_ascii_case("TO") {
+        return None;
+    }
+
+    if remainder.is_empty() || !remainder.starts_with(char::is_whitespace) {
+        return None;
+    }
+
+    Some((key, remainder.trim_start()))
 }
 
 fn is_isolation_level_suffix(tokens: &[&str]) -> bool {
@@ -363,7 +387,7 @@ pub fn parse_command(input: &str) -> Result<Command, ParseError> {
             let Some(rest) = parts.next() else {
                 return Err(ParseError::InvalidSet);
             };
-            let Some((k, v)) = rest.split_once('=') else {
+            let Some((k, v)) = split_set_key_value(rest) else {
                 return Err(ParseError::InvalidSet);
             };
             let key = k.trim();
@@ -466,9 +490,38 @@ mod tests {
     }
 
     #[test]
+    fn parses_set_with_to_assignment_alias() {
+        let cmd = parse_command("SET a TO 42").unwrap();
+        assert_eq!(
+            cmd,
+            Command::SetKv {
+                key: "a".into(),
+                value: "42".into()
+            }
+        );
+
+        let cmd = parse_command("SET alpha to value words").unwrap();
+        assert_eq!(
+            cmd,
+            Command::SetKv {
+                key: "alpha".into(),
+                value: "value words".into()
+            }
+        );
+    }
+
+    #[test]
     fn rejects_set_with_whitespace_in_key() {
         assert!(matches!(
             parse_command("SET two words=42"),
+            Err(ParseError::InvalidSet)
+        ));
+        assert!(matches!(
+            parse_command("SET a TO"),
+            Err(ParseError::InvalidSet)
+        ));
+        assert!(matches!(
+            parse_command("SET a TO42"),
             Err(ParseError::InvalidSet)
         ));
     }

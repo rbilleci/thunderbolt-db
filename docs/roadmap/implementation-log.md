@@ -3,6 +3,8 @@
 ## 2026-04-05
 
 ### Completed
+- Added `SET key TO value` parsing support alongside `SET key=value` so PostgreSQL-style assignment probes map to the same key/value command path without requiring pre-rewrites.
+- Added regression coverage for `SET ... TO ...` acceptance (including multi-word values) and invalid `TO` forms to keep parser behavior deterministic.
 - Extended text-protocol reset compatibility so `DISCARD TEMP TABLES` and `DISCARD TEMPORARY TABLES` are accepted as `ResetAll` no-op session-control commands, reducing bootstrap parser friction with PostgreSQL-style reset probes.
 - Added regression coverage for the new `DISCARD ... TABLES` aliases (including statement terminators) and updated command-reference docs to keep parser contract text aligned.
 
