@@ -117,7 +117,7 @@ impl BacklogBlocker {
         for b in label.trim().bytes() {
             let folded = match b {
                 b'A'..=b'Z' => b + 32,
-                b'-' | b' ' => b'_',
+                b'-' | b' ' | b'.' => b'_',
                 _ => b,
             };
 
@@ -2126,6 +2126,7 @@ mod tests {
             "ACTIVE TXN",
             "commit-apply-gap",
             "apply visible gap",
+            "pending.batch",
         ]);
 
         assert_eq!(
@@ -2135,6 +2136,10 @@ mod tests {
         assert_eq!(
             BacklogBlocker::from_label("apply visible gap"),
             Some(BacklogBlocker::ApplyVisibleGap)
+        );
+        assert_eq!(
+            BacklogBlocker::from_label("pending.batch"),
+            Some(BacklogBlocker::PendingBatch)
         );
         assert_eq!(
             mask,
