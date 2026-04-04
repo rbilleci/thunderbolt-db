@@ -22,7 +22,7 @@ pub enum ParseError {
     InvalidDel,
     #[error("invalid GET syntax; expected: GET key")]
     InvalidGet,
-    #[error("invalid RESET/DISCARD syntax; expected: RESET ALL or DISCARD {{ALL|TEMP|TEMPORARY|PLANS|SEQUENCES}}")]
+    #[error("invalid RESET/DISCARD syntax; expected: RESET ALL or DISCARD {{ALL|TEMP|TEMPORARY|TEMP TABLES|TEMPORARY TABLES|PLANS|SEQUENCES}}")]
     InvalidReset,
 }
 
@@ -103,6 +103,13 @@ fn parse_reset_command(input: &str) -> Option<Result<Command, ParseError>> {
                     || target.eq_ignore_ascii_case("TEMPORARY")
                     || target.eq_ignore_ascii_case("PLANS")
                     || target.eq_ignore_ascii_case("SEQUENCES") =>
+            {
+                Ok(Command::ResetAll)
+            }
+            [scope, kind]
+                if (scope.eq_ignore_ascii_case("TEMP")
+                    || scope.eq_ignore_ascii_case("TEMPORARY"))
+                    && kind.eq_ignore_ascii_case("TABLES") =>
             {
                 Ok(Command::ResetAll)
             }
@@ -490,6 +497,12 @@ mod tests {
         assert_eq!(cmd, Command::ResetAll);
 
         let cmd = parse_command("DISCARD TEMPORARY").unwrap();
+        assert_eq!(cmd, Command::ResetAll);
+
+        let cmd = parse_command("DISCARD TEMP TABLES").unwrap();
+        assert_eq!(cmd, Command::ResetAll);
+
+        let cmd = parse_command("DISCARD TEMPORARY TABLES").unwrap();
         assert_eq!(cmd, Command::ResetAll);
 
         let cmd = parse_command("DISCARD PLANS").unwrap();
@@ -955,6 +968,10 @@ mod tests {
         assert_eq!(parse_command("RESET ALL;").unwrap(), Command::ResetAll);
         assert_eq!(parse_command("DISCARD ALL;\n").unwrap(), Command::ResetAll);
         assert_eq!(parse_command("DISCARD TEMP;\n").unwrap(), Command::ResetAll);
+        assert_eq!(
+            parse_command("DISCARD TEMP TABLES;\n").unwrap(),
+            Command::ResetAll
+        );
     }
 
     #[test]

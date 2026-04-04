@@ -1,5 +1,11 @@
 # Implementation Log (Pre-NVIDIA Phase)
 
+## 2026-04-05
+
+### Completed
+- Extended text-protocol reset compatibility so `DISCARD TEMP TABLES` and `DISCARD TEMPORARY TABLES` are accepted as `ResetAll` no-op session-control commands, reducing bootstrap parser friction with PostgreSQL-style reset probes.
+- Added regression coverage for the new `DISCARD ... TABLES` aliases (including statement terminators) and updated command-reference docs to keep parser contract text aligned.
+
 ## 2026-04-04
 
 ### Completed
