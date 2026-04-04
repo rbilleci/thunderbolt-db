@@ -2216,6 +2216,19 @@ mod tests {
     }
 
     #[test]
+    fn backlog_blocker_delimited_mask_roundtrip_is_stable_with_colon_delimiter() {
+        let mask = ReplicationWatermarks::BACKLOG_BLOCKER_WAL
+            | ReplicationWatermarks::BACKLOG_BLOCKER_ACTIVE_TXN
+            | ReplicationWatermarks::BACKLOG_BLOCKER_APPLY_VISIBLE_GAP;
+        let labels = ReplicationWatermarks::backlog_blocker_delimited_labels_from_mask(mask, ":");
+
+        assert_eq!(
+            ReplicationWatermarks::backlog_blocker_mask_from_delimited_labels(&labels),
+            mask
+        );
+    }
+
+    #[test]
     fn replication_watermarks_aggregate_multiple_backlog_blockers() {
         let mut e = Engine::with_batching(8, Duration::from_secs(999));
         let t0 = Instant::now();
