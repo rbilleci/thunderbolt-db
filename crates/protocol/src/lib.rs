@@ -80,10 +80,21 @@ fn parse_flush_command(input: &str) -> Option<Command> {
         [target] if target.eq_ignore_ascii_case("WAL") || target.eq_ignore_ascii_case("LOG") => {
             Some(Command::Flush)
         }
+        [write_ahead]
+            if write_ahead.eq_ignore_ascii_case("WRITE-AHEAD")
+                || write_ahead.eq_ignore_ascii_case("WRITEAHEAD") =>
+        {
+            Some(Command::Flush)
+        }
         [write_ahead, target]
             if (write_ahead.eq_ignore_ascii_case("WRITE-AHEAD")
                 || write_ahead.eq_ignore_ascii_case("WRITEAHEAD"))
                 && (target.eq_ignore_ascii_case("LOG") || target.eq_ignore_ascii_case("WAL")) =>
+        {
+            Some(Command::Flush)
+        }
+        [write, ahead]
+            if write.eq_ignore_ascii_case("WRITE") && ahead.eq_ignore_ascii_case("AHEAD") =>
         {
             Some(Command::Flush)
         }
@@ -569,16 +580,25 @@ mod tests {
         let cmd = parse_command("FLUSH LOG").unwrap();
         assert_eq!(cmd, Command::Flush);
 
+        let cmd = parse_command("FLUSH WRITE AHEAD").unwrap();
+        assert_eq!(cmd, Command::Flush);
+
         let cmd = parse_command("FLUSH WRITE AHEAD LOG").unwrap();
         assert_eq!(cmd, Command::Flush);
 
         let cmd = parse_command("FLUSH WRITE AHEAD WAL").unwrap();
         assert_eq!(cmd, Command::Flush);
 
+        let cmd = parse_command("FLUSH WRITE-AHEAD").unwrap();
+        assert_eq!(cmd, Command::Flush);
+
         let cmd = parse_command("FLUSH WRITE-AHEAD LOG").unwrap();
         assert_eq!(cmd, Command::Flush);
 
         let cmd = parse_command("FLUSH WRITE-AHEAD WAL").unwrap();
+        assert_eq!(cmd, Command::Flush);
+
+        let cmd = parse_command("FLUSH WRITEAHEAD").unwrap();
         assert_eq!(cmd, Command::Flush);
 
         let cmd = parse_command("FLUSH WRITEAHEAD LOG").unwrap();
