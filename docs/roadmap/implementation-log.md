@@ -3,7 +3,7 @@
 ## 2026-04-05
 
 ### Completed
-- Extended flush-command compatibility to accept `FLUSH WRITE AHEAD LOG` as a `Flush` alias (with statement-terminator regression coverage) so PostgreSQL-style wording maps to the same bootstrap admin flush path without client-side rewrites.
+- Extended flush-command compatibility to accept both `FLUSH WRITE AHEAD LOG` and `FLUSH WRITE-AHEAD LOG` as `Flush` aliases (with statement-terminator regression coverage) so PostgreSQL-style wording variants map to the same bootstrap admin flush path without client-side rewrites.
 - Extended session-reset compatibility to accept `DEALLOCATE ALL` as a `ResetAll` no-op alias (with invalid-form and terminator regression coverage) so PostgreSQL cleanup probes pass parser validation without client-side rewrites.
 - Added `SET key TO value` parsing support alongside `SET key=value` so PostgreSQL-style assignment probes map to the same key/value command path without requiring pre-rewrites.
 - Added regression coverage for `SET ... TO ...` acceptance (including multi-word values) and invalid `TO` forms to keep parser behavior deterministic.
