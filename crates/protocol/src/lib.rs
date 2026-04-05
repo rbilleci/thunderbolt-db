@@ -133,7 +133,8 @@ fn parse_reset_command(input: &str) -> Option<Result<Command, ParseError>> {
             [scope, kind]
                 if (scope.eq_ignore_ascii_case("TEMP")
                     || scope.eq_ignore_ascii_case("TEMPORARY"))
-                    && kind.eq_ignore_ascii_case("TABLES") =>
+                    && (kind.eq_ignore_ascii_case("TABLE")
+                        || kind.eq_ignore_ascii_case("TABLES")) =>
             {
                 Ok(Command::ResetAll)
             }
@@ -607,7 +608,13 @@ mod tests {
         let cmd = parse_command("DISCARD TEMPORARY").unwrap();
         assert_eq!(cmd, Command::ResetAll);
 
+        let cmd = parse_command("DISCARD TEMP TABLE").unwrap();
+        assert_eq!(cmd, Command::ResetAll);
+
         let cmd = parse_command("DISCARD TEMP TABLES").unwrap();
+        assert_eq!(cmd, Command::ResetAll);
+
+        let cmd = parse_command("DISCARD TEMPORARY TABLE").unwrap();
         assert_eq!(cmd, Command::ResetAll);
 
         let cmd = parse_command("DISCARD TEMPORARY TABLES").unwrap();
