@@ -3,6 +3,7 @@
 ## 2026-04-05
 
 ### Completed
+- Extended session-reset compatibility to accept `DEALLOCATE ALL` as a `ResetAll` no-op alias (with invalid-form and terminator regression coverage) so PostgreSQL cleanup probes pass parser validation without client-side rewrites.
 - Added `SET key TO value` parsing support alongside `SET key=value` so PostgreSQL-style assignment probes map to the same key/value command path without requiring pre-rewrites.
 - Added regression coverage for `SET ... TO ...` acceptance (including multi-word values) and invalid `TO` forms to keep parser behavior deterministic.
 - Extended text-protocol reset compatibility so `DISCARD TEMP TABLES` and `DISCARD TEMPORARY TABLES` are accepted as `ResetAll` no-op session-control commands, reducing bootstrap parser friction with PostgreSQL-style reset probes.

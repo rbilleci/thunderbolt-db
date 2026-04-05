@@ -22,7 +22,7 @@ pub enum ParseError {
     InvalidDel,
     #[error("invalid GET syntax; expected: GET key")]
     InvalidGet,
-    #[error("invalid RESET/DISCARD syntax; expected: RESET ALL or DISCARD {{ALL|TEMP|TEMPORARY|TEMP TABLES|TEMPORARY TABLES|PLANS|SEQUENCES}}")]
+    #[error("invalid RESET/DISCARD/DEALLOCATE syntax; expected: RESET ALL, DISCARD {{ALL|TEMP|TEMPORARY|TEMP TABLES|TEMPORARY TABLES|PLANS|SEQUENCES}}, or DEALLOCATE ALL")]
     InvalidReset,
 }
 
@@ -113,6 +113,13 @@ fn parse_reset_command(input: &str) -> Option<Result<Command, ParseError>> {
             {
                 Ok(Command::ResetAll)
             }
+            _ => Err(ParseError::InvalidReset),
+        });
+    }
+
+    if first.eq_ignore_ascii_case("DEALLOCATE") {
+        return Some(match rest {
+            [target] if target.eq_ignore_ascii_case("ALL") => Ok(Command::ResetAll),
             _ => Err(ParseError::InvalidReset),
         });
     }
@@ -563,6 +570,9 @@ mod tests {
 
         let cmd = parse_command("DISCARD SEQUENCES").unwrap();
         assert_eq!(cmd, Command::ResetAll);
+
+        let cmd = parse_command("DEALLOCATE ALL").unwrap();
+        assert_eq!(cmd, Command::ResetAll);
     }
 
     #[test]
@@ -991,6 +1001,14 @@ mod tests {
             parse_command("DISCARD ALL NOW"),
             Err(ParseError::InvalidReset)
         ));
+        assert!(matches!(
+            parse_command("DEALLOCATE"),
+            Err(ParseError::InvalidReset)
+        ));
+        assert!(matches!(
+            parse_command("DEALLOCATE PREPARE x"),
+            Err(ParseError::InvalidReset)
+        ));
     }
 
     #[test]
@@ -1023,6 +1041,10 @@ mod tests {
         assert_eq!(parse_command("DISCARD TEMP;\n").unwrap(), Command::ResetAll);
         assert_eq!(
             parse_command("DISCARD TEMP TABLES;\n").unwrap(),
+            Command::ResetAll
+        );
+        assert_eq!(
+            parse_command("DEALLOCATE ALL;\n").unwrap(),
             Command::ResetAll
         );
     }
