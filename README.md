@@ -26,7 +26,7 @@ cargo test --all-features
 - `COMMIT|ROLLBACK|END ... AND [NO] CHAIN` forms are accepted; `AND CHAIN` reopens transaction context by allocating a fresh transaction id after the terminal transition.
 - `END` maps to `COMMIT`; `ABORT` maps to `ROLLBACK`.
 - `START TRANSACTION` and `START WORK` map to `BEGIN`; optional `READ ONLY` / `READ WRITE`, `[NOT] DEFERRABLE`, and `ISOLATION LEVEL {SERIALIZABLE|REPEATABLE READ|READ COMMITTED|READ UNCOMMITTED}` suffixes are accepted on `BEGIN`/`START` aliases (including comma-separated mode lists) and currently map to plain `BEGIN` behavior.
-- `FLUSH`, `FLUSH WAL`, `FLUSH LOG`, `FLUSH WRITE AHEAD {LOG|WAL}`, and `FLUSH WRITE-AHEAD {LOG|WAL}` are equivalent admin/coordination commands and are tracked as CPU fallback metric events.
+- `FLUSH`, `FLUSH WAL`, `FLUSH LOG`, `FLUSH WRITE AHEAD {LOG|WAL}`, `FLUSH WRITE-AHEAD {LOG|WAL}`, and `FLUSH WRITEAHEAD {LOG|WAL}` are equivalent admin/coordination commands and are tracked as CPU fallback metric events.
 - Replication backlog blocker labels can be decoded from delimited text streams (CSV-like, multiline, and JSON-like arrays with quoted labels).
 - `RESET {ALL|ROLE|SESSION AUTHORIZATION}`, `DISCARD {ALL|TEMP|TEMPORARY|TEMP TABLES|TEMPORARY TABLES|PLANS|SEQUENCES}`, and `DEALLOCATE ALL` are accepted as CPU-routed session-control no-ops in the bootstrap engine so PostgreSQL-style client reset probes do not fail parser validation.
 

@@ -81,7 +81,8 @@ fn parse_flush_command(input: &str) -> Option<Command> {
             Some(Command::Flush)
         }
         [write_ahead, target]
-            if write_ahead.eq_ignore_ascii_case("WRITE-AHEAD")
+            if (write_ahead.eq_ignore_ascii_case("WRITE-AHEAD")
+                || write_ahead.eq_ignore_ascii_case("WRITEAHEAD"))
                 && (target.eq_ignore_ascii_case("LOG") || target.eq_ignore_ascii_case("WAL")) =>
         {
             Some(Command::Flush)
@@ -577,6 +578,12 @@ mod tests {
         assert_eq!(cmd, Command::Flush);
 
         let cmd = parse_command("FLUSH WRITE-AHEAD WAL").unwrap();
+        assert_eq!(cmd, Command::Flush);
+
+        let cmd = parse_command("FLUSH WRITEAHEAD LOG").unwrap();
+        assert_eq!(cmd, Command::Flush);
+
+        let cmd = parse_command("FLUSH WRITEAHEAD WAL").unwrap();
         assert_eq!(cmd, Command::Flush);
     }
 
