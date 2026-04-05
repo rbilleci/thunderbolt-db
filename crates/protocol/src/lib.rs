@@ -22,7 +22,7 @@ pub enum ParseError {
     InvalidDel,
     #[error("invalid GET syntax; expected: GET key")]
     InvalidGet,
-    #[error("invalid RESET/DISCARD/DEALLOCATE syntax; expected: RESET ALL, DISCARD {{ALL|TEMP|TEMPORARY|TEMP TABLES|TEMPORARY TABLES|PLANS|SEQUENCES}}, or DEALLOCATE ALL")]
+    #[error("invalid RESET/DISCARD/DEALLOCATE syntax; expected: RESET ALL|ROLE|SESSION AUTHORIZATION, DISCARD {{ALL|TEMP|TEMPORARY|TEMP TABLES|TEMPORARY TABLES|PLANS|SEQUENCES}}, or DEALLOCATE ALL")]
     InvalidReset,
 }
 
@@ -90,7 +90,17 @@ fn parse_reset_command(input: &str) -> Option<Result<Command, ParseError>> {
 
     if first.eq_ignore_ascii_case("RESET") {
         return Some(match rest {
-            [target] if target.eq_ignore_ascii_case("ALL") => Ok(Command::ResetAll),
+            [target]
+                if target.eq_ignore_ascii_case("ALL") || target.eq_ignore_ascii_case("ROLE") =>
+            {
+                Ok(Command::ResetAll)
+            }
+            [session, authorization]
+                if session.eq_ignore_ascii_case("SESSION")
+                    && authorization.eq_ignore_ascii_case("AUTHORIZATION") =>
+            {
+                Ok(Command::ResetAll)
+            }
             _ => Err(ParseError::InvalidReset),
         });
     }
@@ -553,6 +563,12 @@ mod tests {
         let cmd = parse_command("DISCARD ALL").unwrap();
         assert_eq!(cmd, Command::ResetAll);
 
+        let cmd = parse_command("RESET ROLE").unwrap();
+        assert_eq!(cmd, Command::ResetAll);
+
+        let cmd = parse_command("RESET SESSION AUTHORIZATION").unwrap();
+        assert_eq!(cmd, Command::ResetAll);
+
         let cmd = parse_command("DISCARD TEMP").unwrap();
         assert_eq!(cmd, Command::ResetAll);
 
@@ -982,7 +998,7 @@ mod tests {
             Err(ParseError::InvalidReset)
         ));
         assert!(matches!(
-            parse_command("RESET ROLE"),
+            parse_command("RESET SESSION"),
             Err(ParseError::InvalidReset)
         ));
         assert!(matches!(
@@ -1037,6 +1053,11 @@ mod tests {
             }
         );
         assert_eq!(parse_command("RESET ALL;").unwrap(), Command::ResetAll);
+        assert_eq!(parse_command("RESET ROLE;\n").unwrap(), Command::ResetAll);
+        assert_eq!(
+            parse_command("RESET SESSION AUTHORIZATION;\n").unwrap(),
+            Command::ResetAll
+        );
         assert_eq!(parse_command("DISCARD ALL;\n").unwrap(), Command::ResetAll);
         assert_eq!(parse_command("DISCARD TEMP;\n").unwrap(), Command::ResetAll);
         assert_eq!(
