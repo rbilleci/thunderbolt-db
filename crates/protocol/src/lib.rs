@@ -22,7 +22,7 @@ pub enum ParseError {
     InvalidDel,
     #[error("invalid GET syntax; expected: GET key")]
     InvalidGet,
-    #[error("invalid RESET/DISCARD/DEALLOCATE syntax; expected: RESET ALL|ROLE|SESSION AUTHORIZATION, DISCARD {{ALL|TEMP|TEMPORARY|TEMP TABLES|TEMPORARY TABLES|PLANS|SEQUENCES}}, or DEALLOCATE ALL")]
+    #[error("invalid RESET/DISCARD/DEALLOCATE syntax; expected: RESET ALL|ROLE|SESSION AUTHORIZATION|SESSION AUTH, DISCARD {{ALL|TEMP|TEMPORARY|TEMP TABLES|TEMPORARY TABLES|PLANS|SEQUENCES}}, or DEALLOCATE ALL")]
     InvalidReset,
 }
 
@@ -122,7 +122,8 @@ fn parse_reset_command(input: &str) -> Option<Result<Command, ParseError>> {
             }
             [session, authorization]
                 if session.eq_ignore_ascii_case("SESSION")
-                    && authorization.eq_ignore_ascii_case("AUTHORIZATION") =>
+                    && (authorization.eq_ignore_ascii_case("AUTHORIZATION")
+                        || authorization.eq_ignore_ascii_case("AUTH")) =>
             {
                 Ok(Command::ResetAll)
             }
@@ -622,6 +623,9 @@ mod tests {
         let cmd = parse_command("RESET SESSION AUTHORIZATION").unwrap();
         assert_eq!(cmd, Command::ResetAll);
 
+        let cmd = parse_command("RESET SESSION AUTH").unwrap();
+        assert_eq!(cmd, Command::ResetAll);
+
         let cmd = parse_command("DISCARD TEMP").unwrap();
         assert_eq!(cmd, Command::ResetAll);
 
@@ -1115,6 +1119,10 @@ mod tests {
         assert_eq!(parse_command("RESET ROLE;\n").unwrap(), Command::ResetAll);
         assert_eq!(
             parse_command("RESET SESSION AUTHORIZATION;\n").unwrap(),
+            Command::ResetAll
+        );
+        assert_eq!(
+            parse_command("RESET SESSION AUTH;\n").unwrap(),
             Command::ResetAll
         );
         assert_eq!(parse_command("DISCARD ALL;\n").unwrap(), Command::ResetAll);

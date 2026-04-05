@@ -3,6 +3,7 @@
 ## 2026-04-05
 
 ### Completed
+- Extended reset-command compatibility to accept `RESET SESSION AUTH` as a `ResetAll` alias (with statement-terminator coverage), reducing parser friction for PostgreSQL-style session cleanup probes that use the shorthand form.
 - Extended flush-command compatibility to also accept target-less `FLUSH WRITE AHEAD`, `FLUSH WRITE-AHEAD`, and `FLUSH WRITEAHEAD` forms as `Flush` aliases, preserving the same admin flush semantics while reducing parser friction for clients that omit explicit `LOG`/`WAL` suffixes.
 - Extended flush-command compatibility to accept both `FLUSH WRITE AHEAD LOG` and `FLUSH WRITE-AHEAD LOG` as `Flush` aliases (with statement-terminator regression coverage) so PostgreSQL-style wording variants map to the same bootstrap admin flush path without client-side rewrites.
 - Extended session-reset compatibility to accept `DEALLOCATE ALL` as a `ResetAll` no-op alias (with invalid-form and terminator regression coverage) so PostgreSQL cleanup probes pass parser validation without client-side rewrites.
