@@ -4,6 +4,7 @@
 
 ### Completed
 - Extended reset-command compatibility to accept `RESET AUTHORIZATION` and shorthand `RESET AUTH` as `ResetAll` aliases (including statement-terminator regression coverage), reducing parser friction for PostgreSQL-style session cleanup probes that omit the explicit `SESSION` keyword.
+- Extended flush-command compatibility to accept underscore-separated `FLUSH WRITE_AHEAD` forms (with `{LOG|WAL}` targets and regression coverage), reducing parser friction for telemetry/control clients that emit tokenized command names with underscore separators.
 
 ## 2026-04-05
 
