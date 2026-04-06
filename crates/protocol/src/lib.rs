@@ -83,7 +83,9 @@ fn parse_flush_command(input: &str) -> Option<Command> {
         [write_ahead]
             if write_ahead.eq_ignore_ascii_case("WRITE-AHEAD")
                 || write_ahead.eq_ignore_ascii_case("WRITEAHEAD")
-                || write_ahead.eq_ignore_ascii_case("WRITE_AHEAD") =>
+                || write_ahead.eq_ignore_ascii_case("WRITE_AHEAD")
+                || write_ahead.eq_ignore_ascii_case("WRITE_AHEAD_LOG")
+                || write_ahead.eq_ignore_ascii_case("WRITE_AHEAD_WAL") =>
         {
             Some(Command::Flush)
         }
@@ -636,6 +638,12 @@ mod tests {
         assert_eq!(cmd, Command::Flush);
 
         let cmd = parse_command("FLUSH WRITE_AHEAD WAL").unwrap();
+        assert_eq!(cmd, Command::Flush);
+
+        let cmd = parse_command("FLUSH WRITE_AHEAD_LOG").unwrap();
+        assert_eq!(cmd, Command::Flush);
+
+        let cmd = parse_command("FLUSH WRITE_AHEAD_WAL").unwrap();
         assert_eq!(cmd, Command::Flush);
     }
 
@@ -1195,6 +1203,10 @@ mod tests {
         assert_eq!(parse_command("UNLISTEN *;\n").unwrap(), Command::ResetAll);
         assert_eq!(
             parse_command("FLUSH WRITE AHEAD LOG;\n").unwrap(),
+            Command::Flush
+        );
+        assert_eq!(
+            parse_command("FLUSH WRITE_AHEAD_LOG;\n").unwrap(),
             Command::Flush
         );
         assert_eq!(parse_command("DISCARD TEMP;\n").unwrap(), Command::ResetAll);
