@@ -1,5 +1,10 @@
 # Implementation Log (Pre-NVIDIA Phase)
 
+## 2026-04-06
+
+### Completed
+- Extended reset-command compatibility to accept `RESET AUTHORIZATION` and shorthand `RESET AUTH` as `ResetAll` aliases (including statement-terminator regression coverage), reducing parser friction for PostgreSQL-style session cleanup probes that omit the explicit `SESSION` keyword.
+
 ## 2026-04-05
 
 ### Completed

@@ -22,7 +22,7 @@ pub enum ParseError {
     InvalidDel,
     #[error("invalid GET syntax; expected: GET key")]
     InvalidGet,
-    #[error("invalid RESET/DISCARD/DEALLOCATE syntax; expected: RESET ALL|ROLE|SESSION AUTHORIZATION|SESSION AUTH, DISCARD {{ALL|TEMP|TEMPORARY|TEMP TABLES|TEMPORARY TABLES|PLANS|SEQUENCES}}, or DEALLOCATE ALL")]
+    #[error("invalid RESET/DISCARD/DEALLOCATE syntax; expected: RESET ALL|ROLE|AUTHORIZATION|AUTH|SESSION AUTHORIZATION|SESSION AUTH, DISCARD {{ALL|TEMP|TEMPORARY|TEMP TABLES|TEMPORARY TABLES|PLANS|SEQUENCES}}, or DEALLOCATE ALL")]
     InvalidReset,
 }
 
@@ -116,7 +116,10 @@ fn parse_reset_command(input: &str) -> Option<Result<Command, ParseError>> {
     if first.eq_ignore_ascii_case("RESET") {
         return Some(match rest {
             [target]
-                if target.eq_ignore_ascii_case("ALL") || target.eq_ignore_ascii_case("ROLE") =>
+                if target.eq_ignore_ascii_case("ALL")
+                    || target.eq_ignore_ascii_case("ROLE")
+                    || target.eq_ignore_ascii_case("AUTHORIZATION")
+                    || target.eq_ignore_ascii_case("AUTH") =>
             {
                 Ok(Command::ResetAll)
             }
@@ -620,6 +623,12 @@ mod tests {
         let cmd = parse_command("RESET ROLE").unwrap();
         assert_eq!(cmd, Command::ResetAll);
 
+        let cmd = parse_command("RESET AUTHORIZATION").unwrap();
+        assert_eq!(cmd, Command::ResetAll);
+
+        let cmd = parse_command("RESET AUTH").unwrap();
+        assert_eq!(cmd, Command::ResetAll);
+
         let cmd = parse_command("RESET SESSION AUTHORIZATION").unwrap();
         assert_eq!(cmd, Command::ResetAll);
 
@@ -1117,6 +1126,11 @@ mod tests {
         );
         assert_eq!(parse_command("RESET ALL;").unwrap(), Command::ResetAll);
         assert_eq!(parse_command("RESET ROLE;\n").unwrap(), Command::ResetAll);
+        assert_eq!(
+            parse_command("RESET AUTHORIZATION;\n").unwrap(),
+            Command::ResetAll
+        );
+        assert_eq!(parse_command("RESET AUTH;\n").unwrap(), Command::ResetAll);
         assert_eq!(
             parse_command("RESET SESSION AUTHORIZATION;\n").unwrap(),
             Command::ResetAll
