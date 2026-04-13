@@ -178,6 +178,7 @@ pub enum FrontendMessage {
     SimpleQuery(String),
     Terminate,
     Sync,
+    Flush,
 }
 
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
@@ -241,6 +242,15 @@ pub fn parse_frontend_message(frame: &[u8]) -> Result<FrontendMessage, FrontendM
                 });
             }
             Ok(FrontendMessage::Sync)
+        }
+        b'H' => {
+            if payload_len != 4 {
+                return Err(FrontendMessageError::LengthMismatch {
+                    expected: 5,
+                    actual: frame.len(),
+                });
+            }
+            Ok(FrontendMessage::Flush)
         }
         other => Err(FrontendMessageError::UnsupportedTag(other)),
     }
@@ -1731,6 +1741,12 @@ mod tests {
         assert_eq!(
             parse_frontend_message(&sync).unwrap(),
             FrontendMessage::Sync
+        );
+
+        let flush = frontend_frame(b'H', &[]);
+        assert_eq!(
+            parse_frontend_message(&flush).unwrap(),
+            FrontendMessage::Flush
         );
     }
 
