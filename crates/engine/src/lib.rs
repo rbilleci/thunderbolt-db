@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use gpu_db_batching::{BatchItem, DualTriggerBatcher, FlushReason};
 use gpu_db_metrics::{BatchFlushReason, FallbackReason, RuntimeMetrics};
+use gpu_db_observability::{EngineTelemetrySnapshot, ReplicationLagSnapshot, TelemetrySink};
 use gpu_db_planner::{ExecutionPlan, Planner, PlannerConfig};
 use gpu_db_protocol::{parse_command, Command, ParseError};
 use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine};
@@ -808,6 +809,25 @@ impl Engine {
         &self.metrics
     }
 
+    pub fn telemetry_snapshot(&self) -> EngineTelemetrySnapshot {
+        let marks = self.replication_watermarks();
+        EngineTelemetrySnapshot {
+            role: marks.role,
+            replication_lag: ReplicationLagSnapshot {
+                commit_index: marks.commit_index,
+                applied_index: marks.applied_index,
+                visible_index: marks.visible_index,
+                commit_apply_gap: marks.commit_apply_gap,
+                apply_visible_gap: marks.apply_visible_gap,
+            },
+            runtime_metrics: self.metrics.snapshot(),
+        }
+    }
+
+    pub fn publish_telemetry<S: TelemetrySink>(&self, sink: &mut S) {
+        sink.publish(&self.telemetry_snapshot());
+    }
+
     pub fn pending_batch_len(&self) -> usize {
         self.batcher.len()
     }
@@ -842,6 +862,7 @@ impl Engine {
 mod tests {
     use super::*;
     use gpu_db_execution::DeviceTarget;
+    use gpu_db_observability::InMemoryTelemetrySink;
 
     #[test]
     fn planner_targets_mutations_to_gpu() {
@@ -2462,6 +2483,45 @@ mod tests {
 
         e.export_snapshot_meta();
         assert_eq!(e.replication_watermarks().snapshot_id, 2);
+    }
+
+    #[test]
+    fn telemetry_snapshot_reflects_replication_lag_and_runtime_metrics() {
+        let mut e = Engine::with_batching(8, Duration::from_secs(60));
+        let t0 = Instant::now();
+
+        e.enqueue_set_text(1, "SET a=1", t0).unwrap();
+
+        let snapshot = e.telemetry_snapshot();
+
+        assert_eq!(snapshot.role, Role::Leader);
+        assert_eq!(snapshot.replication_lag.commit_index, 0);
+        assert_eq!(snapshot.replication_lag.applied_index, 0);
+        assert_eq!(snapshot.replication_lag.visible_index, 0);
+        assert_eq!(snapshot.replication_lag.commit_apply_gap, 0);
+        assert_eq!(snapshot.replication_lag.apply_visible_gap, 0);
+        assert_eq!(snapshot.runtime_metrics.pending_batch_peak, 1);
+        assert_eq!(snapshot.runtime_metrics.last_pending_batch_len, Some(1));
+        assert_eq!(snapshot.runtime_metrics.commits_total, 0);
+    }
+
+    #[test]
+    fn publish_telemetry_emits_snapshot_to_sink() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET a=1").unwrap();
+
+        let mut sink = InMemoryTelemetrySink::default();
+        e.publish_telemetry(&mut sink);
+
+        assert_eq!(sink.snapshots().len(), 1);
+        let snapshot = &sink.snapshots()[0];
+        assert_eq!(snapshot.role, Role::Leader);
+        assert_eq!(snapshot.replication_lag.commit_index, 1);
+        assert_eq!(snapshot.replication_lag.applied_index, 1);
+        assert_eq!(snapshot.replication_lag.visible_index, 1);
+        assert_eq!(snapshot.replication_lag.commit_apply_gap, 0);
+        assert_eq!(snapshot.replication_lag.apply_visible_gap, 0);
+        assert_eq!(snapshot.runtime_metrics.commits_total, 1);
     }
 
     #[test]
