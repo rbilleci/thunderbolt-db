@@ -177,6 +177,11 @@ pub struct SessionLifecycle {
 pub enum FrontendMessage {
     SimpleQuery(String),
     PasswordMessage(String),
+    SaslInitialResponse {
+        mechanism: String,
+        initial_response: Option<Vec<u8>>,
+    },
+    SaslResponse(Vec<u8>),
     Bind {
         portal_name: String,
         statement_name: String,
@@ -233,6 +238,8 @@ pub enum FrontendMessageError {
     UnterminatedSimpleQuery,
     #[error("password message payload is not null terminated")]
     UnterminatedPasswordMessage,
+    #[error("sasl-initial-response payload is malformed")]
+    InvalidSaslInitialResponsePayload,
     #[error("bind message portal name is not null terminated")]
     UnterminatedBindPortalName,
     #[error("bind message statement name is not null terminated")]
@@ -296,13 +303,62 @@ pub fn parse_frontend_message(frame: &[u8]) -> Result<FrontendMessage, FrontendM
             Ok(FrontendMessage::SimpleQuery(query))
         }
         b'p' => {
-            let Some(password_bytes) = payload.strip_suffix(&[0]) else {
+            if let Some(password_bytes) = payload.strip_suffix(&[0]) {
+                if !password_bytes.contains(&0) {
+                    let password = std::str::from_utf8(password_bytes)
+                        .map_err(|_| FrontendMessageError::InvalidUtf8)?
+                        .to_owned();
+                    return Ok(FrontendMessage::PasswordMessage(password));
+                }
+            }
+
+            if let Some(mechanism_end) = payload.iter().position(|&b| b == 0) {
+                let mechanism = std::str::from_utf8(&payload[..mechanism_end])
+                    .map_err(|_| FrontendMessageError::InvalidUtf8)?
+                    .to_owned();
+
+                let length_start = mechanism_end + 1;
+                let length_end = length_start + 4;
+                if payload.get(length_start..length_end).is_none() {
+                    return Err(FrontendMessageError::InvalidSaslInitialResponsePayload);
+                }
+
+                let length = i32::from_be_bytes(
+                    payload[length_start..length_end]
+                        .try_into()
+                        .map_err(|_| FrontendMessageError::InvalidSaslInitialResponsePayload)?,
+                );
+
+                let initial_response = if length == -1 {
+                    if length_end != payload.len() {
+                        return Err(FrontendMessageError::InvalidSaslInitialResponsePayload);
+                    }
+                    None
+                } else {
+                    if length < -1 {
+                        return Err(FrontendMessageError::InvalidSaslInitialResponsePayload);
+                    }
+                    let length = length as usize;
+                    let response_end = length_end
+                        .checked_add(length)
+                        .ok_or(FrontendMessageError::InvalidSaslInitialResponsePayload)?;
+                    if response_end != payload.len() {
+                        return Err(FrontendMessageError::InvalidSaslInitialResponsePayload);
+                    }
+                    Some(payload[length_end..response_end].to_vec())
+                };
+
+                return Ok(FrontendMessage::SaslInitialResponse {
+                    mechanism,
+                    initial_response,
+                });
+            }
+
+            if payload.is_empty() {
                 return Err(FrontendMessageError::UnterminatedPasswordMessage);
-            };
-            let password = std::str::from_utf8(password_bytes)
-                .map_err(|_| FrontendMessageError::InvalidUtf8)?
-                .to_owned();
-            Ok(FrontendMessage::PasswordMessage(password))
+            }
+
+            Ok(FrontendMessage::SaslResponse(payload.to_vec()))
         }
         b'B' => {
             let Some(portal_end) = payload.iter().position(|&b| b == 0) else {
@@ -2139,6 +2195,37 @@ mod tests {
             FrontendMessage::PasswordMessage("secret".to_string())
         );
 
+        let mut sasl_initial_payload = Vec::new();
+        sasl_initial_payload.extend_from_slice(b"SCRAM-SHA-256\0");
+        sasl_initial_payload.extend_from_slice(&5_i32.to_be_bytes());
+        sasl_initial_payload.extend_from_slice(b"n,,r=");
+        let sasl_initial = frontend_frame(b'p', &sasl_initial_payload);
+        assert_eq!(
+            parse_frontend_message(&sasl_initial).unwrap(),
+            FrontendMessage::SaslInitialResponse {
+                mechanism: "SCRAM-SHA-256".to_string(),
+                initial_response: Some(b"n,,r=".to_vec()),
+            }
+        );
+
+        let mut sasl_initial_without_data_payload = Vec::new();
+        sasl_initial_without_data_payload.extend_from_slice(b"SCRAM-SHA-256\0");
+        sasl_initial_without_data_payload.extend_from_slice(&(-1_i32).to_be_bytes());
+        let sasl_initial_without_data = frontend_frame(b'p', &sasl_initial_without_data_payload);
+        assert_eq!(
+            parse_frontend_message(&sasl_initial_without_data).unwrap(),
+            FrontendMessage::SaslInitialResponse {
+                mechanism: "SCRAM-SHA-256".to_string(),
+                initial_response: None,
+            }
+        );
+
+        let sasl_response = frontend_frame(b'p', b"c=biws,r=nonce,p=proof");
+        assert_eq!(
+            parse_frontend_message(&sasl_response).unwrap(),
+            FrontendMessage::SaslResponse(b"c=biws,r=nonce,p=proof".to_vec())
+        );
+
         let mut parse_payload = Vec::new();
         parse_payload.extend_from_slice(b"stmt1\0SELECT $1::int4\0");
         parse_payload.extend_from_slice(&1_i16.to_be_bytes());
@@ -2304,8 +2391,23 @@ mod tests {
 
         let unterminated_password = frontend_frame(b'p', b"secret");
         assert_eq!(
-            parse_frontend_message(&unterminated_password).unwrap_err(),
-            FrontendMessageError::UnterminatedPasswordMessage
+            parse_frontend_message(&unterminated_password).unwrap(),
+            FrontendMessage::SaslResponse(b"secret".to_vec())
+        );
+
+        let malformed_sasl_initial = frontend_frame(b'p', b"SCRAM-SHA-256\0\0\0");
+        assert_eq!(
+            parse_frontend_message(&malformed_sasl_initial).unwrap_err(),
+            FrontendMessageError::InvalidSaslInitialResponsePayload
+        );
+
+        let malformed_sasl_initial_negative_len = frontend_frame(
+            b'p',
+            &[b'S', b'C', b'R', b'A', b'M', 0, 0xFF, 0xFF, 0xFF, 0xFE],
+        );
+        assert_eq!(
+            parse_frontend_message(&malformed_sasl_initial_negative_len).unwrap_err(),
+            FrontendMessageError::InvalidSaslInitialResponsePayload
         );
 
         let malformed_parse = frontend_frame(b'P', b"stmt\0SELECT 1\0\0\x01");
