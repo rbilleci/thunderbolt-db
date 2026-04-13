@@ -4,6 +4,7 @@
 
 ### Completed
 - Extended frontend auth-message parsing to distinguish cleartext `PasswordMessage` (`p`) from SASL authentication payloads, adding explicit `SaslInitialResponse` / `SaslResponse` decoding with strict payload-length validation and malformed-frame regression coverage.
+- Hardened frontend `Bind` (`B`) and `FunctionCall` (`F`) decoding to reject non-PostgreSQL format codes (values other than text=0 or binary=1), with regression coverage for invalid parameter/result format payloads.
 - Extended `ReplicationWatermarks::backlog_blocker_mask_from_delimited_labels` to also split on backslash (`\\`) delimiters, allowing Windows-style streams like `wal\\active_txn\\apply_visible_gap` to decode without pre-normalization.
 - Extended frontend-message parsing scaffolding to decode PostgreSQL `FunctionCall` (`F`) frames (function OID, argument/result format codes, nullable argument payloads) with strict payload-length validation and regression coverage for malformed argument bodies.
 - Extended frontend-message parsing scaffolding to decode PostgreSQL copy-protocol frontend frames: `CopyData` (`d`), `CopyDone` (`c`), and `CopyFail` (`f`), with deterministic framing/null-termination validation and regression coverage for malformed payloads.

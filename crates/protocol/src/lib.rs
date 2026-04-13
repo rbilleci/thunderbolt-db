@@ -272,6 +272,10 @@ pub enum FrontendMessageError {
     InvalidUtf8,
 }
 
+fn is_valid_format_code(code: i16) -> bool {
+    matches!(code, 0 | 1)
+}
+
 pub fn parse_frontend_message(frame: &[u8]) -> Result<FrontendMessage, FrontendMessageError> {
     if frame.len() < 5 {
         return Err(FrontendMessageError::TooShort);
@@ -400,7 +404,11 @@ pub fn parse_frontend_message(frame: &[u8]) -> Result<FrontendMessage, FrontendM
             let format_count = format_count as usize;
             let mut parameter_format_codes = Vec::with_capacity(format_count);
             for _ in 0..format_count {
-                parameter_format_codes.push(read_i16(payload, &mut offset)?);
+                let format_code = read_i16(payload, &mut offset)?;
+                if !is_valid_format_code(format_code) {
+                    return Err(FrontendMessageError::InvalidBindPayload);
+                }
+                parameter_format_codes.push(format_code);
             }
 
             let parameter_count = read_i16(payload, &mut offset)?;
@@ -441,7 +449,11 @@ pub fn parse_frontend_message(frame: &[u8]) -> Result<FrontendMessage, FrontendM
             let result_format_count = result_format_count as usize;
             let mut result_format_codes = Vec::with_capacity(result_format_count);
             for _ in 0..result_format_count {
-                result_format_codes.push(read_i16(payload, &mut offset)?);
+                let format_code = read_i16(payload, &mut offset)?;
+                if !is_valid_format_code(format_code) {
+                    return Err(FrontendMessageError::InvalidBindPayload);
+                }
+                result_format_codes.push(format_code);
             }
 
             if offset != payload.len() {
@@ -610,7 +622,11 @@ pub fn parse_frontend_message(frame: &[u8]) -> Result<FrontendMessage, FrontendM
             let format_count = format_count as usize;
             let mut argument_format_codes = Vec::with_capacity(format_count);
             for _ in 0..format_count {
-                argument_format_codes.push(read_i16(payload, &mut offset)?);
+                let format_code = read_i16(payload, &mut offset)?;
+                if !is_valid_format_code(format_code) {
+                    return Err(FrontendMessageError::InvalidFunctionCallPayload);
+                }
+                argument_format_codes.push(format_code);
             }
 
             let arg_count = read_i16(payload, &mut offset)?;
@@ -645,6 +661,9 @@ pub fn parse_frontend_message(frame: &[u8]) -> Result<FrontendMessage, FrontendM
             }
 
             let result_format_code = read_i16(payload, &mut offset)?;
+            if !is_valid_format_code(result_format_code) {
+                return Err(FrontendMessageError::InvalidFunctionCallPayload);
+            }
             if offset != payload.len() {
                 return Err(FrontendMessageError::InvalidFunctionCallPayload);
             }
@@ -2440,9 +2459,34 @@ mod tests {
             FrontendMessageError::InvalidBindPayload
         );
 
+        let mut invalid_bind_format_code_payload = Vec::new();
+        invalid_bind_format_code_payload.extend_from_slice(b"portal\0stmt\0");
+        invalid_bind_format_code_payload.extend_from_slice(&1_i16.to_be_bytes());
+        invalid_bind_format_code_payload.extend_from_slice(&2_i16.to_be_bytes());
+        invalid_bind_format_code_payload.extend_from_slice(&0_i16.to_be_bytes());
+        invalid_bind_format_code_payload.extend_from_slice(&0_i16.to_be_bytes());
+        let invalid_bind_format_code = frontend_frame(b'B', &invalid_bind_format_code_payload);
+        assert_eq!(
+            parse_frontend_message(&invalid_bind_format_code).unwrap_err(),
+            FrontendMessageError::InvalidBindPayload
+        );
+
         let malformed_function_call = frontend_frame(b'F', b"\0\0\0*");
         assert_eq!(
             parse_frontend_message(&malformed_function_call).unwrap_err(),
+            FrontendMessageError::InvalidFunctionCallPayload
+        );
+
+        let mut invalid_function_call_format_code_payload = Vec::new();
+        invalid_function_call_format_code_payload.extend_from_slice(&42_u32.to_be_bytes());
+        invalid_function_call_format_code_payload.extend_from_slice(&1_i16.to_be_bytes());
+        invalid_function_call_format_code_payload.extend_from_slice(&2_i16.to_be_bytes());
+        invalid_function_call_format_code_payload.extend_from_slice(&0_i16.to_be_bytes());
+        invalid_function_call_format_code_payload.extend_from_slice(&0_i16.to_be_bytes());
+        let invalid_function_call_format_code =
+            frontend_frame(b'F', &invalid_function_call_format_code_payload);
+        assert_eq!(
+            parse_frontend_message(&invalid_function_call_format_code).unwrap_err(),
             FrontendMessageError::InvalidFunctionCallPayload
         );
 
