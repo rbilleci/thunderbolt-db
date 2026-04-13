@@ -3,6 +3,7 @@
 ## 2026-04-13
 
 ### Completed
+- Extended `ReplicationWatermarks::backlog_blocker_mask_from_delimited_labels` to percent-decode `%HH` telemetry payloads before delimiter splitting, allowing URL-encoded streams like `wal%2Cpending-batch%7CACTIVE%20TXN` to decode without pre-normalization; added regression coverage for mixed encoded delimiters and labels.
 - Extended frontend auth-message parsing to distinguish cleartext `PasswordMessage` (`p`) from SASL authentication payloads, adding explicit `SaslInitialResponse` / `SaslResponse` decoding with strict payload-length validation and malformed-frame regression coverage.
 - Hardened frontend `Bind` (`B`) and `FunctionCall` (`F`) decoding to reject non-PostgreSQL format codes (values other than text=0 or binary=1), with regression coverage for invalid parameter/result format payloads.
 - Extended `ReplicationWatermarks::backlog_blocker_mask_from_delimited_labels` to also split on backslash (`\\`) delimiters, allowing Windows-style streams like `wal\\active_txn\\apply_visible_gap` to decode without pre-normalization.

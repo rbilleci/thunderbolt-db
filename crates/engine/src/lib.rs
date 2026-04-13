@@ -293,7 +293,7 @@ impl ReplicationWatermarks {
     }
 
     pub fn backlog_blocker_mask_from_delimited_labels(labels: &str) -> u8 {
-        labels
+        percent_decode_lossy(labels)
             .split([
                 ',', ';', '|', '/', '\\', ':', '+', '&', '=', '\n', '\r', '\t', '[', ']', '{', '}',
                 '(', ')', '<', '>', '"', '\'', '`',
@@ -311,6 +311,34 @@ impl ReplicationWatermarks {
             .collect::<Vec<_>>()
             .join(delimiter)
     }
+}
+
+fn percent_decode_lossy(input: &str) -> String {
+    fn hex_value(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+
+    let bytes = input.as_bytes();
+    let mut idx = 0;
+    let mut decoded = String::with_capacity(input.len());
+    while idx < bytes.len() {
+        if bytes[idx] == b'%' && idx + 2 < bytes.len() {
+            if let (Some(high), Some(low)) = (hex_value(bytes[idx + 1]), hex_value(bytes[idx + 2]))
+            {
+                decoded.push((high << 4 | low) as char);
+                idx += 3;
+                continue;
+            }
+        }
+        decoded.push(bytes[idx] as char);
+        idx += 1;
+    }
+    decoded
 }
 
 pub struct Engine {
@@ -2358,6 +2386,21 @@ mod tests {
         assert_eq!(
             mask,
             ReplicationWatermarks::BACKLOG_BLOCKER_WAL
+                | ReplicationWatermarks::BACKLOG_BLOCKER_ACTIVE_TXN
+                | ReplicationWatermarks::BACKLOG_BLOCKER_APPLY_VISIBLE_GAP
+        );
+    }
+
+    #[test]
+    fn backlog_blocker_mask_from_delimited_labels_accepts_percent_encoded_streams() {
+        let mask = ReplicationWatermarks::backlog_blocker_mask_from_delimited_labels(
+            "wal%2Cpending-batch%7CACTIVE%20TXN%2Fapply_visible_gap",
+        );
+
+        assert_eq!(
+            mask,
+            ReplicationWatermarks::BACKLOG_BLOCKER_WAL
+                | ReplicationWatermarks::BACKLOG_BLOCKER_PENDING_BATCH
                 | ReplicationWatermarks::BACKLOG_BLOCKER_ACTIVE_TXN
                 | ReplicationWatermarks::BACKLOG_BLOCKER_APPLY_VISIBLE_GAP
         );
