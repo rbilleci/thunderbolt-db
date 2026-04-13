@@ -138,6 +138,85 @@ pub fn parse_startup_packet(frame: &[u8]) -> Result<StartupPacket, StartupPacket
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionState {
+    Startup,
+    Authenticating,
+    Ready,
+    InTransaction,
+    Terminating,
+    Closed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionEvent {
+    StartupAccepted,
+    AuthenticationSucceeded,
+    Begin,
+    Commit,
+    Rollback,
+    TerminateRequested,
+    ConnectionClosed,
+}
+
+#[derive(Debug, thiserror::Error, Clone, Copy, PartialEq, Eq)]
+pub enum SessionTransitionError {
+    #[error("invalid session transition from {from:?} using {event:?}")]
+    InvalidTransition {
+        from: SessionState,
+        event: SessionEvent,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionLifecycle {
+    state: SessionState,
+}
+
+impl Default for SessionLifecycle {
+    fn default() -> Self {
+        Self {
+            state: SessionState::Startup,
+        }
+    }
+}
+
+impl SessionLifecycle {
+    pub fn state(&self) -> SessionState {
+        self.state
+    }
+
+    pub fn apply(&mut self, event: SessionEvent) -> Result<SessionState, SessionTransitionError> {
+        let next = match (self.state, event) {
+            (SessionState::Startup, SessionEvent::StartupAccepted) => SessionState::Authenticating,
+            (SessionState::Authenticating, SessionEvent::AuthenticationSucceeded) => {
+                SessionState::Ready
+            }
+            (SessionState::Ready, SessionEvent::Begin) => SessionState::InTransaction,
+            (SessionState::InTransaction, SessionEvent::Commit)
+            | (SessionState::InTransaction, SessionEvent::Rollback) => SessionState::Ready,
+            (SessionState::Ready, SessionEvent::TerminateRequested)
+            | (SessionState::InTransaction, SessionEvent::TerminateRequested) => {
+                SessionState::Terminating
+            }
+            (SessionState::Terminating, SessionEvent::ConnectionClosed) => SessionState::Closed,
+            (SessionState::Startup, SessionEvent::ConnectionClosed)
+            | (SessionState::Authenticating, SessionEvent::ConnectionClosed)
+            | (SessionState::Ready, SessionEvent::ConnectionClosed)
+            | (SessionState::InTransaction, SessionEvent::ConnectionClosed) => SessionState::Closed,
+            _ => {
+                return Err(SessionTransitionError::InvalidTransition {
+                    from: self.state,
+                    event,
+                });
+            }
+        };
+
+        self.state = next;
+        Ok(next)
+    }
+}
+
 fn parse_transaction_chain_suffix(tokens: &[&str]) -> Option<bool> {
     if tokens.is_empty() {
         return Some(false);
@@ -1493,6 +1572,63 @@ mod tests {
         assert_eq!(
             parse_startup_packet(&bad_params).unwrap_err(),
             StartupPacketError::UnterminatedParameterPayload
+        );
+    }
+
+    #[test]
+    fn session_lifecycle_follows_startup_auth_and_transaction_flow() {
+        let mut session = SessionLifecycle::default();
+        assert_eq!(session.state(), SessionState::Startup);
+
+        assert_eq!(
+            session.apply(SessionEvent::StartupAccepted).unwrap(),
+            SessionState::Authenticating
+        );
+        assert_eq!(
+            session
+                .apply(SessionEvent::AuthenticationSucceeded)
+                .unwrap(),
+            SessionState::Ready
+        );
+        assert_eq!(
+            session.apply(SessionEvent::Begin).unwrap(),
+            SessionState::InTransaction
+        );
+        assert_eq!(
+            session.apply(SessionEvent::Commit).unwrap(),
+            SessionState::Ready
+        );
+        assert_eq!(
+            session.apply(SessionEvent::TerminateRequested).unwrap(),
+            SessionState::Terminating
+        );
+        assert_eq!(
+            session.apply(SessionEvent::ConnectionClosed).unwrap(),
+            SessionState::Closed
+        );
+    }
+
+    #[test]
+    fn session_lifecycle_rejects_invalid_transitions() {
+        let mut session = SessionLifecycle::default();
+        assert_eq!(
+            session.apply(SessionEvent::Begin).unwrap_err(),
+            SessionTransitionError::InvalidTransition {
+                from: SessionState::Startup,
+                event: SessionEvent::Begin,
+            }
+        );
+
+        session.apply(SessionEvent::StartupAccepted).unwrap();
+        session
+            .apply(SessionEvent::AuthenticationSucceeded)
+            .unwrap();
+        assert_eq!(
+            session.apply(SessionEvent::Commit).unwrap_err(),
+            SessionTransitionError::InvalidTransition {
+                from: SessionState::Ready,
+                event: SessionEvent::Commit,
+            }
         );
     }
 }
