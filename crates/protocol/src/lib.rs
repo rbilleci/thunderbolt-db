@@ -176,6 +176,13 @@ pub struct SessionLifecycle {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FrontendMessage {
     SimpleQuery(String),
+    Bind {
+        portal_name: String,
+        statement_name: String,
+        parameter_format_codes: Vec<i16>,
+        parameters: Vec<Option<Vec<u8>>>,
+        result_format_codes: Vec<i16>,
+    },
     Parse {
         statement_name: String,
         query: String,
@@ -214,6 +221,12 @@ pub enum FrontendMessageError {
     UnsupportedTag(u8),
     #[error("simple query payload is not null terminated")]
     UnterminatedSimpleQuery,
+    #[error("bind message portal name is not null terminated")]
+    UnterminatedBindPortalName,
+    #[error("bind message statement name is not null terminated")]
+    UnterminatedBindStatementName,
+    #[error("bind message payload is malformed")]
+    InvalidBindPayload,
     #[error("parse message statement name is not null terminated")]
     UnterminatedParseStatementName,
     #[error("parse message query is not null terminated")]
@@ -265,6 +278,102 @@ pub fn parse_frontend_message(frame: &[u8]) -> Result<FrontendMessage, FrontendM
                 .map_err(|_| FrontendMessageError::InvalidUtf8)?
                 .to_owned();
             Ok(FrontendMessage::SimpleQuery(query))
+        }
+        b'B' => {
+            let Some(portal_end) = payload.iter().position(|&b| b == 0) else {
+                return Err(FrontendMessageError::UnterminatedBindPortalName);
+            };
+            let portal_name = std::str::from_utf8(&payload[..portal_end])
+                .map_err(|_| FrontendMessageError::InvalidUtf8)?
+                .to_owned();
+
+            let statement_start = portal_end + 1;
+            let Some(statement_rel_end) = payload[statement_start..].iter().position(|&b| b == 0)
+            else {
+                return Err(FrontendMessageError::UnterminatedBindStatementName);
+            };
+            let statement_end = statement_start + statement_rel_end;
+            let statement_name = std::str::from_utf8(&payload[statement_start..statement_end])
+                .map_err(|_| FrontendMessageError::InvalidUtf8)?
+                .to_owned();
+
+            let mut offset = statement_end + 1;
+            let read_i16 =
+                |payload: &[u8], offset: &mut usize| -> Result<i16, FrontendMessageError> {
+                    let bytes = payload
+                        .get(*offset..*offset + 2)
+                        .ok_or(FrontendMessageError::InvalidBindPayload)?;
+                    let value = i16::from_be_bytes(
+                        bytes
+                            .try_into()
+                            .map_err(|_| FrontendMessageError::InvalidBindPayload)?,
+                    );
+                    *offset += 2;
+                    Ok(value)
+                };
+
+            let format_count = read_i16(payload, &mut offset)?;
+            if format_count < 0 {
+                return Err(FrontendMessageError::InvalidBindPayload);
+            }
+            let format_count = format_count as usize;
+            let mut parameter_format_codes = Vec::with_capacity(format_count);
+            for _ in 0..format_count {
+                parameter_format_codes.push(read_i16(payload, &mut offset)?);
+            }
+
+            let parameter_count = read_i16(payload, &mut offset)?;
+            if parameter_count < 0 {
+                return Err(FrontendMessageError::InvalidBindPayload);
+            }
+            let parameter_count = parameter_count as usize;
+            let mut parameters = Vec::with_capacity(parameter_count);
+            for _ in 0..parameter_count {
+                let len_bytes = payload
+                    .get(offset..offset + 4)
+                    .ok_or(FrontendMessageError::InvalidBindPayload)?;
+                let len = i32::from_be_bytes(
+                    len_bytes
+                        .try_into()
+                        .map_err(|_| FrontendMessageError::InvalidBindPayload)?,
+                );
+                offset += 4;
+                if len == -1 {
+                    parameters.push(None);
+                    continue;
+                }
+                if len < -1 {
+                    return Err(FrontendMessageError::InvalidBindPayload);
+                }
+                let len = len as usize;
+                let value = payload
+                    .get(offset..offset + len)
+                    .ok_or(FrontendMessageError::InvalidBindPayload)?;
+                offset += len;
+                parameters.push(Some(value.to_vec()));
+            }
+
+            let result_format_count = read_i16(payload, &mut offset)?;
+            if result_format_count < 0 {
+                return Err(FrontendMessageError::InvalidBindPayload);
+            }
+            let result_format_count = result_format_count as usize;
+            let mut result_format_codes = Vec::with_capacity(result_format_count);
+            for _ in 0..result_format_count {
+                result_format_codes.push(read_i16(payload, &mut offset)?);
+            }
+
+            if offset != payload.len() {
+                return Err(FrontendMessageError::InvalidBindPayload);
+            }
+
+            Ok(FrontendMessage::Bind {
+                portal_name,
+                statement_name,
+                parameter_format_codes,
+                parameters,
+                result_format_codes,
+            })
         }
         b'P' => {
             let Some(statement_name_end) = payload.iter().position(|&b| b == 0) else {
@@ -1907,6 +2016,28 @@ mod tests {
             }
         );
 
+        let mut bind_payload = Vec::new();
+        bind_payload.extend_from_slice(b"portal1\0stmt1\0");
+        bind_payload.extend_from_slice(&1_i16.to_be_bytes());
+        bind_payload.extend_from_slice(&1_i16.to_be_bytes());
+        bind_payload.extend_from_slice(&2_i16.to_be_bytes());
+        bind_payload.extend_from_slice(&4_i32.to_be_bytes());
+        bind_payload.extend_from_slice(&42_i32.to_be_bytes());
+        bind_payload.extend_from_slice(&(-1_i32).to_be_bytes());
+        bind_payload.extend_from_slice(&1_i16.to_be_bytes());
+        bind_payload.extend_from_slice(&0_i16.to_be_bytes());
+        let bind = frontend_frame(b'B', &bind_payload);
+        assert_eq!(
+            parse_frontend_message(&bind).unwrap(),
+            FrontendMessage::Bind {
+                portal_name: "portal1".to_string(),
+                statement_name: "stmt1".to_string(),
+                parameter_format_codes: vec![1],
+                parameters: vec![Some(42_i32.to_be_bytes().to_vec()), None],
+                result_format_codes: vec![0],
+            }
+        );
+
         let describe_stmt = frontend_frame(b'D', b"Sstmt1\0");
         assert_eq!(
             parse_frontend_message(&describe_stmt).unwrap(),
@@ -2020,10 +2151,16 @@ mod tests {
             FrontendMessageError::InvalidExecutePayload
         );
 
-        let unsupported = frontend_frame(b'B', &[]);
+        let malformed_bind = frontend_frame(b'B', b"portal\0stmt\0\0\x01");
+        assert_eq!(
+            parse_frontend_message(&malformed_bind).unwrap_err(),
+            FrontendMessageError::InvalidBindPayload
+        );
+
+        let unsupported = frontend_frame(b'F', &[]);
         assert_eq!(
             parse_frontend_message(&unsupported).unwrap_err(),
-            FrontendMessageError::UnsupportedTag(b'B')
+            FrontendMessageError::UnsupportedTag(b'F')
         );
     }
 }
