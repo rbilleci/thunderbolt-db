@@ -2351,6 +2351,30 @@ mod tests {
             FrontendMessageError::UnterminatedCopyFail
         );
 
+        let invalid_utf8_query = frontend_frame(b'Q', &[0xFF, 0]);
+        assert_eq!(
+            parse_frontend_message(&invalid_utf8_query).unwrap_err(),
+            FrontendMessageError::InvalidUtf8
+        );
+
+        let invalid_utf8_password = frontend_frame(b'p', &[0xFF, 0]);
+        assert_eq!(
+            parse_frontend_message(&invalid_utf8_password).unwrap_err(),
+            FrontendMessageError::InvalidUtf8
+        );
+
+        let invalid_utf8_parse_statement = frontend_frame(b'P', &[0xFF, 0, b'S', 0, 0, 0]);
+        assert_eq!(
+            parse_frontend_message(&invalid_utf8_parse_statement).unwrap_err(),
+            FrontendMessageError::InvalidUtf8
+        );
+
+        let invalid_utf8_describe_name = frontend_frame(b'D', &[b'S', 0xFF, 0]);
+        assert_eq!(
+            parse_frontend_message(&invalid_utf8_describe_name).unwrap_err(),
+            FrontendMessageError::InvalidUtf8
+        );
+
         let unsupported = frontend_frame(b'V', &[]);
         assert_eq!(
             parse_frontend_message(&unsupported).unwrap_err(),
