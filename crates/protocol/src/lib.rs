@@ -173,6 +173,79 @@ pub struct SessionLifecycle {
     state: SessionState,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FrontendMessage {
+    SimpleQuery(String),
+    Terminate,
+    Sync,
+}
+
+#[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
+pub enum FrontendMessageError {
+    #[error("frontend message frame too short")]
+    TooShort,
+    #[error("frontend message length mismatch; expected {expected} bytes, got {actual}")]
+    LengthMismatch { expected: usize, actual: usize },
+    #[error("unsupported frontend message tag: {0:#x}")]
+    UnsupportedTag(u8),
+    #[error("simple query payload is not null terminated")]
+    UnterminatedSimpleQuery,
+    #[error("simple query payload contains invalid UTF-8")]
+    InvalidUtf8,
+}
+
+pub fn parse_frontend_message(frame: &[u8]) -> Result<FrontendMessage, FrontendMessageError> {
+    if frame.len() < 5 {
+        return Err(FrontendMessageError::TooShort);
+    }
+
+    let tag = frame[0];
+    let payload_len = u32::from_be_bytes(
+        frame[1..5]
+            .try_into()
+            .map_err(|_| FrontendMessageError::TooShort)?,
+    ) as usize;
+    let expected = payload_len + 1;
+    if expected != frame.len() {
+        return Err(FrontendMessageError::LengthMismatch {
+            expected,
+            actual: frame.len(),
+        });
+    }
+
+    let payload = &frame[5..];
+    match tag {
+        b'Q' => {
+            let Some(query_bytes) = payload.strip_suffix(&[0]) else {
+                return Err(FrontendMessageError::UnterminatedSimpleQuery);
+            };
+            let query = std::str::from_utf8(query_bytes)
+                .map_err(|_| FrontendMessageError::InvalidUtf8)?
+                .to_owned();
+            Ok(FrontendMessage::SimpleQuery(query))
+        }
+        b'X' => {
+            if payload_len != 4 {
+                return Err(FrontendMessageError::LengthMismatch {
+                    expected: 5,
+                    actual: frame.len(),
+                });
+            }
+            Ok(FrontendMessage::Terminate)
+        }
+        b'S' => {
+            if payload_len != 4 {
+                return Err(FrontendMessageError::LengthMismatch {
+                    expected: 5,
+                    actual: frame.len(),
+                });
+            }
+            Ok(FrontendMessage::Sync)
+        }
+        other => Err(FrontendMessageError::UnsupportedTag(other)),
+    }
+}
+
 impl Default for SessionLifecycle {
     fn default() -> Self {
         Self {
@@ -1629,6 +1702,64 @@ mod tests {
                 from: SessionState::Ready,
                 event: SessionEvent::Commit,
             }
+        );
+    }
+
+    fn frontend_frame(tag: u8, payload: &[u8]) -> Vec<u8> {
+        let mut frame = Vec::with_capacity(payload.len() + 5);
+        frame.push(tag);
+        frame.extend_from_slice(&((payload.len() + 4) as u32).to_be_bytes());
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    #[test]
+    fn parses_simple_query_and_control_frontend_messages() {
+        let query = frontend_frame(b'Q', b"SELECT 1;\0");
+        assert_eq!(
+            parse_frontend_message(&query).unwrap(),
+            FrontendMessage::SimpleQuery("SELECT 1;".to_string())
+        );
+
+        let terminate = frontend_frame(b'X', &[]);
+        assert_eq!(
+            parse_frontend_message(&terminate).unwrap(),
+            FrontendMessage::Terminate
+        );
+
+        let sync = frontend_frame(b'S', &[]);
+        assert_eq!(
+            parse_frontend_message(&sync).unwrap(),
+            FrontendMessage::Sync
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_frontend_frames() {
+        assert_eq!(
+            parse_frontend_message(&[b'Q', 0, 0, 0]).unwrap_err(),
+            FrontendMessageError::TooShort
+        );
+
+        let bad_len = vec![b'Q', 0, 0, 0, 7, b';', 0];
+        assert_eq!(
+            parse_frontend_message(&bad_len).unwrap_err(),
+            FrontendMessageError::LengthMismatch {
+                expected: 8,
+                actual: 7,
+            }
+        );
+
+        let unterminated = frontend_frame(b'Q', b"SELECT 1;");
+        assert_eq!(
+            parse_frontend_message(&unterminated).unwrap_err(),
+            FrontendMessageError::UnterminatedSimpleQuery
+        );
+
+        let unsupported = frontend_frame(b'P', &[]);
+        assert_eq!(
+            parse_frontend_message(&unsupported).unwrap_err(),
+            FrontendMessageError::UnsupportedTag(b'P')
         );
     }
 }
