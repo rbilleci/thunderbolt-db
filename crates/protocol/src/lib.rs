@@ -176,6 +176,7 @@ pub struct SessionLifecycle {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FrontendMessage {
     SimpleQuery(String),
+    PasswordMessage(String),
     Bind {
         portal_name: String,
         statement_name: String,
@@ -221,6 +222,8 @@ pub enum FrontendMessageError {
     UnsupportedTag(u8),
     #[error("simple query payload is not null terminated")]
     UnterminatedSimpleQuery,
+    #[error("password message payload is not null terminated")]
+    UnterminatedPasswordMessage,
     #[error("bind message portal name is not null terminated")]
     UnterminatedBindPortalName,
     #[error("bind message statement name is not null terminated")]
@@ -278,6 +281,15 @@ pub fn parse_frontend_message(frame: &[u8]) -> Result<FrontendMessage, FrontendM
                 .map_err(|_| FrontendMessageError::InvalidUtf8)?
                 .to_owned();
             Ok(FrontendMessage::SimpleQuery(query))
+        }
+        b'p' => {
+            let Some(password_bytes) = payload.strip_suffix(&[0]) else {
+                return Err(FrontendMessageError::UnterminatedPasswordMessage);
+            };
+            let password = std::str::from_utf8(password_bytes)
+                .map_err(|_| FrontendMessageError::InvalidUtf8)?
+                .to_owned();
+            Ok(FrontendMessage::PasswordMessage(password))
         }
         b'B' => {
             let Some(portal_end) = payload.iter().position(|&b| b == 0) else {
@@ -2002,6 +2014,12 @@ mod tests {
             FrontendMessage::SimpleQuery("SELECT 1;".to_string())
         );
 
+        let password = frontend_frame(b'p', b"secret\0");
+        assert_eq!(
+            parse_frontend_message(&password).unwrap(),
+            FrontendMessage::PasswordMessage("secret".to_string())
+        );
+
         let mut parse_payload = Vec::new();
         parse_payload.extend_from_slice(b"stmt1\0SELECT $1::int4\0");
         parse_payload.extend_from_slice(&1_i16.to_be_bytes());
@@ -2125,6 +2143,12 @@ mod tests {
         assert_eq!(
             parse_frontend_message(&unterminated).unwrap_err(),
             FrontendMessageError::UnterminatedSimpleQuery
+        );
+
+        let unterminated_password = frontend_frame(b'p', b"secret");
+        assert_eq!(
+            parse_frontend_message(&unterminated_password).unwrap_err(),
+            FrontendMessageError::UnterminatedPasswordMessage
         );
 
         let malformed_parse = frontend_frame(b'P', b"stmt\0SELECT 1\0\0\x01");
