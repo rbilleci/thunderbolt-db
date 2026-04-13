@@ -295,8 +295,8 @@ impl ReplicationWatermarks {
     pub fn backlog_blocker_mask_from_delimited_labels(labels: &str) -> u8 {
         labels
             .split([
-                ',', ';', '|', '/', ':', '+', '&', '=', '\n', '\r', '\t', '[', ']', '{', '}', '(',
-                ')', '<', '>', '"', '\'', '`',
+                ',', ';', '|', '/', '\\', ':', '+', '&', '=', '\n', '\r', '\t', '[', ']', '{', '}',
+                '(', ')', '<', '>', '"', '\'', '`',
             ])
             .filter_map(BacklogBlocker::from_label)
             .fold(0_u8, |mask, blocker| mask | blocker.bit())
@@ -2325,6 +2325,20 @@ mod tests {
     fn backlog_blocker_mask_from_delimited_labels_accepts_plus_delimiter() {
         let mask = ReplicationWatermarks::backlog_blocker_mask_from_delimited_labels(
             "wal+active_txn+apply_visible_gap",
+        );
+
+        assert_eq!(
+            mask,
+            ReplicationWatermarks::BACKLOG_BLOCKER_WAL
+                | ReplicationWatermarks::BACKLOG_BLOCKER_ACTIVE_TXN
+                | ReplicationWatermarks::BACKLOG_BLOCKER_APPLY_VISIBLE_GAP
+        );
+    }
+
+    #[test]
+    fn backlog_blocker_mask_from_delimited_labels_accepts_windows_style_backslash_delimiter() {
+        let mask = ReplicationWatermarks::backlog_blocker_mask_from_delimited_labels(
+            "wal\\active_txn\\apply_visible_gap",
         );
 
         assert_eq!(
