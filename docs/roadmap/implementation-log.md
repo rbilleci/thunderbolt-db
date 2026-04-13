@@ -3,6 +3,7 @@
 ## 2026-04-13
 
 ### Completed
+- Extended `ReplicationWatermarks::backlog_blocker_mask_from_delimited_labels` to also split on backslash (`\\`) delimiters, allowing Windows-style streams like `wal\\active_txn\\apply_visible_gap` to decode without pre-normalization.
 - Extended frontend-message parsing scaffolding to decode PostgreSQL `FunctionCall` (`F`) frames (function OID, argument/result format codes, nullable argument payloads) with strict payload-length validation and regression coverage for malformed argument bodies.
 - Extended frontend-message parsing scaffolding to decode PostgreSQL copy-protocol frontend frames: `CopyData` (`d`), `CopyDone` (`c`), and `CopyFail` (`f`), with deterministic framing/null-termination validation and regression coverage for malformed payloads.
 - Added a PostgreSQL startup/auth packet parser skeleton in `gpu_db_protocol` (`parse_startup_packet`) covering protocol v3 startup parameters plus SSL and cancel request decoding, with deterministic regression coverage for framing/length and malformed parameter payloads.
