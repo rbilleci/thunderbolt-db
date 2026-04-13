@@ -1,5 +1,12 @@
 # Implementation Log (Pre-NVIDIA Phase)
 
+## 2026-04-13
+
+### Completed
+- Added a new `gpu_db_storage` crate and wired it into the workspace member list so the Phase 0 repository skeleton now includes an explicit storage boundary alongside protocol/planner/execution/wal/replication modules.
+- Introduced bootstrap storage contracts (`TupleStore`, `seq_scan_open`, `index_scan_open`, and tuple insert/update/delete/fetch operations) plus shared MVCC-oriented value types (`TupleVersion`, `Visibility`, `NewTuple`) to keep storage API shape explicit before backend implementation.
+- Added `StorageError` taxonomy and a baseline contract test to lock in visibility-scoped read behavior for no-GPU bootstrap iterations.
+
 ## 2026-04-06
 
 ### Completed

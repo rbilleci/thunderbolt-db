@@ -62,6 +62,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "gpu_db_storage"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "gpu_db_txn"
 version = "0.1.0"
 dependencies = [
