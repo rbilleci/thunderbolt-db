@@ -2050,6 +2050,14 @@ mod tests {
             parse_startup_packet(&bad_params).unwrap_err(),
             StartupPacketError::UnterminatedParameterPayload
         );
+
+        let mut invalid_utf8_params = PG_PROTOCOL_V3.to_be_bytes().to_vec();
+        invalid_utf8_params.extend_from_slice(&[0xFF, 0, b'v', 0, 0]);
+        let invalid_utf8_params = with_length_prefix(invalid_utf8_params);
+        assert_eq!(
+            parse_startup_packet(&invalid_utf8_params).unwrap_err(),
+            StartupPacketError::InvalidUtf8
+        );
     }
 
     #[test]
@@ -2349,6 +2357,12 @@ mod tests {
         assert_eq!(
             parse_frontend_message(&unterminated_copy_fail).unwrap_err(),
             FrontendMessageError::UnterminatedCopyFail
+        );
+
+        let invalid_utf8_copy_fail = frontend_frame(b'f', &[0xFF, 0]);
+        assert_eq!(
+            parse_frontend_message(&invalid_utf8_copy_fail).unwrap_err(),
+            FrontendMessageError::InvalidUtf8
         );
 
         let invalid_utf8_query = frontend_frame(b'Q', &[0xFF, 0]);
