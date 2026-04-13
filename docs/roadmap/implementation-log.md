@@ -1,5 +1,12 @@
 # Implementation Log (Pre-NVIDIA Phase)
 
+## 2026-04-14
+
+### Completed
+- Extended session-reset parser compatibility to accept PostgreSQL-style prepared-statement cleanup forms `DEALLOCATE name` and `DEALLOCATE PREPARE name` as `ResetAll` no-op aliases (in addition to `DEALLOCATE ALL`), reducing bootstrap parser friction for clients that emit explicit prepared-statement teardown probes.
+- Added regression coverage for `DEALLOCATE name` and `DEALLOCATE PREPARE name` acceptance plus malformed-form rejection (`DEALLOCATE PREPARE`, extra-token variants) and statement-terminator handling, keeping parser behavior deterministic.
+- Updated command-reference docs/error text to reflect the expanded `DEALLOCATE` compatibility contract.
+
 ## 2026-04-13
 
 ### Completed
