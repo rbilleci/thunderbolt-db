@@ -185,6 +185,10 @@ pub enum FrontendMessage {
         target: DescribeTarget,
         name: String,
     },
+    Close {
+        target: DescribeTarget,
+        name: String,
+    },
     Terminate,
     Sync,
     Flush,
@@ -216,6 +220,10 @@ pub enum FrontendMessageError {
     InvalidDescribeTarget,
     #[error("describe message name is not null terminated")]
     UnterminatedDescribeName,
+    #[error("close message target must be S (statement) or P (portal)")]
+    InvalidCloseTarget,
+    #[error("close message name is not null terminated")]
+    UnterminatedCloseName,
     #[error("simple query payload contains invalid UTF-8")]
     InvalidUtf8,
 }
@@ -326,6 +334,24 @@ pub fn parse_frontend_message(frame: &[u8]) -> Result<FrontendMessage, FrontendM
                 .map_err(|_| FrontendMessageError::InvalidUtf8)?
                 .to_owned();
             Ok(FrontendMessage::Describe { target, name })
+        }
+        b'C' => {
+            let Some((&target_byte, rest)) = payload.split_first() else {
+                return Err(FrontendMessageError::TooShort);
+            };
+            let target = match target_byte {
+                b'S' => DescribeTarget::Statement,
+                b'P' => DescribeTarget::Portal,
+                _ => return Err(FrontendMessageError::InvalidCloseTarget),
+            };
+
+            let Some(name_bytes) = rest.strip_suffix(&[0]) else {
+                return Err(FrontendMessageError::UnterminatedCloseName);
+            };
+            let name = std::str::from_utf8(name_bytes)
+                .map_err(|_| FrontendMessageError::InvalidUtf8)?
+                .to_owned();
+            Ok(FrontendMessage::Close { target, name })
         }
         b'X' => {
             if payload_len != 4 {
@@ -1865,6 +1891,24 @@ mod tests {
             }
         );
 
+        let close_stmt = frontend_frame(b'C', b"Sstmt1\0");
+        assert_eq!(
+            parse_frontend_message(&close_stmt).unwrap(),
+            FrontendMessage::Close {
+                target: DescribeTarget::Statement,
+                name: "stmt1".to_string(),
+            }
+        );
+
+        let close_portal = frontend_frame(b'C', b"Pportal1\0");
+        assert_eq!(
+            parse_frontend_message(&close_portal).unwrap(),
+            FrontendMessage::Close {
+                target: DescribeTarget::Portal,
+                name: "portal1".to_string(),
+            }
+        );
+
         let terminate = frontend_frame(b'X', &[]);
         assert_eq!(
             parse_frontend_message(&terminate).unwrap(),
@@ -1918,10 +1962,16 @@ mod tests {
             FrontendMessageError::InvalidDescribeTarget
         );
 
-        let unsupported = frontend_frame(b'B', &[]);
+        let invalid_close_target = frontend_frame(b'C', b"Xstmt\0");
+        assert_eq!(
+            parse_frontend_message(&invalid_close_target).unwrap_err(),
+            FrontendMessageError::InvalidCloseTarget
+        );
+
+        let unsupported = frontend_frame(b'E', &[]);
         assert_eq!(
             parse_frontend_message(&unsupported).unwrap_err(),
-            FrontendMessageError::UnsupportedTag(b'B')
+            FrontendMessageError::UnsupportedTag(b'E')
         );
     }
 }
