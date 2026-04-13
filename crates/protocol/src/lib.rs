@@ -181,9 +181,19 @@ pub enum FrontendMessage {
         query: String,
         parameter_type_oids: Vec<u32>,
     },
+    Describe {
+        target: DescribeTarget,
+        name: String,
+    },
     Terminate,
     Sync,
     Flush,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DescribeTarget {
+    Statement,
+    Portal,
 }
 
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
@@ -202,6 +212,10 @@ pub enum FrontendMessageError {
     UnterminatedParseQuery,
     #[error("parse message parameter type payload is malformed")]
     InvalidParseParameterPayload,
+    #[error("describe message target must be S (statement) or P (portal)")]
+    InvalidDescribeTarget,
+    #[error("describe message name is not null terminated")]
+    UnterminatedDescribeName,
     #[error("simple query payload contains invalid UTF-8")]
     InvalidUtf8,
 }
@@ -294,6 +308,24 @@ pub fn parse_frontend_message(frame: &[u8]) -> Result<FrontendMessage, FrontendM
                 query,
                 parameter_type_oids,
             })
+        }
+        b'D' => {
+            let Some((&target_byte, rest)) = payload.split_first() else {
+                return Err(FrontendMessageError::TooShort);
+            };
+            let target = match target_byte {
+                b'S' => DescribeTarget::Statement,
+                b'P' => DescribeTarget::Portal,
+                _ => return Err(FrontendMessageError::InvalidDescribeTarget),
+            };
+
+            let Some(name_bytes) = rest.strip_suffix(&[0]) else {
+                return Err(FrontendMessageError::UnterminatedDescribeName);
+            };
+            let name = std::str::from_utf8(name_bytes)
+                .map_err(|_| FrontendMessageError::InvalidUtf8)?
+                .to_owned();
+            Ok(FrontendMessage::Describe { target, name })
         }
         b'X' => {
             if payload_len != 4 {
@@ -1815,6 +1847,24 @@ mod tests {
             }
         );
 
+        let describe_stmt = frontend_frame(b'D', b"Sstmt1\0");
+        assert_eq!(
+            parse_frontend_message(&describe_stmt).unwrap(),
+            FrontendMessage::Describe {
+                target: DescribeTarget::Statement,
+                name: "stmt1".to_string(),
+            }
+        );
+
+        let describe_portal = frontend_frame(b'D', b"Pportal1\0");
+        assert_eq!(
+            parse_frontend_message(&describe_portal).unwrap(),
+            FrontendMessage::Describe {
+                target: DescribeTarget::Portal,
+                name: "portal1".to_string(),
+            }
+        );
+
         let terminate = frontend_frame(b'X', &[]);
         assert_eq!(
             parse_frontend_message(&terminate).unwrap(),
@@ -1862,10 +1912,16 @@ mod tests {
             FrontendMessageError::InvalidParseParameterPayload
         );
 
-        let unsupported = frontend_frame(b'D', &[]);
+        let invalid_describe_target = frontend_frame(b'D', b"Xstmt\0");
+        assert_eq!(
+            parse_frontend_message(&invalid_describe_target).unwrap_err(),
+            FrontendMessageError::InvalidDescribeTarget
+        );
+
+        let unsupported = frontend_frame(b'B', &[]);
         assert_eq!(
             parse_frontend_message(&unsupported).unwrap_err(),
-            FrontendMessageError::UnsupportedTag(b'D')
+            FrontendMessageError::UnsupportedTag(b'B')
         );
     }
 }
