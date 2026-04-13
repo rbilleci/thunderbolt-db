@@ -201,6 +201,12 @@ pub enum FrontendMessage {
         portal_name: String,
         max_rows: u32,
     },
+    FunctionCall {
+        function_oid: u32,
+        argument_format_codes: Vec<i16>,
+        arguments: Vec<Option<Vec<u8>>>,
+        result_format_code: i16,
+    },
     CopyData(Vec<u8>),
     CopyDone,
     CopyFail(String),
@@ -251,6 +257,8 @@ pub enum FrontendMessageError {
     UnterminatedExecutePortalName,
     #[error("execute message payload is malformed")]
     InvalidExecutePayload,
+    #[error("function-call message payload is malformed")]
+    InvalidFunctionCallPayload,
     #[error("copy fail message payload is not null terminated")]
     UnterminatedCopyFail,
     #[error("simple query payload contains invalid UTF-8")]
@@ -511,6 +519,85 @@ pub fn parse_frontend_message(frame: &[u8]) -> Result<FrontendMessage, FrontendM
             Ok(FrontendMessage::Execute {
                 portal_name,
                 max_rows,
+            })
+        }
+        b'F' => {
+            let mut offset = 0;
+
+            let function_oid = {
+                let bytes = payload
+                    .get(offset..offset + 4)
+                    .ok_or(FrontendMessageError::InvalidFunctionCallPayload)?;
+                offset += 4;
+                u32::from_be_bytes(
+                    bytes
+                        .try_into()
+                        .map_err(|_| FrontendMessageError::InvalidFunctionCallPayload)?,
+                )
+            };
+
+            let read_i16 =
+                |payload: &[u8], offset: &mut usize| -> Result<i16, FrontendMessageError> {
+                    let bytes = payload
+                        .get(*offset..*offset + 2)
+                        .ok_or(FrontendMessageError::InvalidFunctionCallPayload)?;
+                    *offset += 2;
+                    Ok(i16::from_be_bytes(bytes.try_into().map_err(|_| {
+                        FrontendMessageError::InvalidFunctionCallPayload
+                    })?))
+                };
+
+            let format_count = read_i16(payload, &mut offset)?;
+            if format_count < 0 {
+                return Err(FrontendMessageError::InvalidFunctionCallPayload);
+            }
+            let format_count = format_count as usize;
+            let mut argument_format_codes = Vec::with_capacity(format_count);
+            for _ in 0..format_count {
+                argument_format_codes.push(read_i16(payload, &mut offset)?);
+            }
+
+            let arg_count = read_i16(payload, &mut offset)?;
+            if arg_count < 0 {
+                return Err(FrontendMessageError::InvalidFunctionCallPayload);
+            }
+            let arg_count = arg_count as usize;
+            let mut arguments = Vec::with_capacity(arg_count);
+            for _ in 0..arg_count {
+                let len_bytes = payload
+                    .get(offset..offset + 4)
+                    .ok_or(FrontendMessageError::InvalidFunctionCallPayload)?;
+                let len = i32::from_be_bytes(
+                    len_bytes
+                        .try_into()
+                        .map_err(|_| FrontendMessageError::InvalidFunctionCallPayload)?,
+                );
+                offset += 4;
+                if len == -1 {
+                    arguments.push(None);
+                    continue;
+                }
+                if len < -1 {
+                    return Err(FrontendMessageError::InvalidFunctionCallPayload);
+                }
+                let len = len as usize;
+                let value = payload
+                    .get(offset..offset + len)
+                    .ok_or(FrontendMessageError::InvalidFunctionCallPayload)?;
+                offset += len;
+                arguments.push(Some(value.to_vec()));
+            }
+
+            let result_format_code = read_i16(payload, &mut offset)?;
+            if offset != payload.len() {
+                return Err(FrontendMessageError::InvalidFunctionCallPayload);
+            }
+
+            Ok(FrontendMessage::FunctionCall {
+                function_oid,
+                argument_format_codes,
+                arguments,
+                result_format_code,
             })
         }
         b'd' => Ok(FrontendMessage::CopyData(payload.to_vec())),
@@ -2128,6 +2215,26 @@ mod tests {
             }
         );
 
+        let mut function_call_payload = Vec::new();
+        function_call_payload.extend_from_slice(&42_u32.to_be_bytes());
+        function_call_payload.extend_from_slice(&1_i16.to_be_bytes());
+        function_call_payload.extend_from_slice(&1_i16.to_be_bytes());
+        function_call_payload.extend_from_slice(&2_i16.to_be_bytes());
+        function_call_payload.extend_from_slice(&4_i32.to_be_bytes());
+        function_call_payload.extend_from_slice(&7_i32.to_be_bytes());
+        function_call_payload.extend_from_slice(&(-1_i32).to_be_bytes());
+        function_call_payload.extend_from_slice(&0_i16.to_be_bytes());
+        let function_call = frontend_frame(b'F', &function_call_payload);
+        assert_eq!(
+            parse_frontend_message(&function_call).unwrap(),
+            FrontendMessage::FunctionCall {
+                function_oid: 42,
+                argument_format_codes: vec![1],
+                arguments: vec![Some(7_i32.to_be_bytes().to_vec()), None],
+                result_format_code: 0,
+            }
+        );
+
         let copy_data = frontend_frame(b'd', &[0, 1, 2, 3]);
         assert_eq!(
             parse_frontend_message(&copy_data).unwrap(),
@@ -2223,6 +2330,12 @@ mod tests {
             FrontendMessageError::InvalidBindPayload
         );
 
+        let malformed_function_call = frontend_frame(b'F', b"\0\0\0*");
+        assert_eq!(
+            parse_frontend_message(&malformed_function_call).unwrap_err(),
+            FrontendMessageError::InvalidFunctionCallPayload
+        );
+
         let malformed_copy_done = frontend_frame(b'c', &[0]);
         assert_eq!(
             parse_frontend_message(&malformed_copy_done).unwrap_err(),
@@ -2238,10 +2351,10 @@ mod tests {
             FrontendMessageError::UnterminatedCopyFail
         );
 
-        let unsupported = frontend_frame(b'F', &[]);
+        let unsupported = frontend_frame(b'V', &[]);
         assert_eq!(
             parse_frontend_message(&unsupported).unwrap_err(),
-            FrontendMessageError::UnsupportedTag(b'F')
+            FrontendMessageError::UnsupportedTag(b'V')
         );
     }
 }
