@@ -1,0 +1,9 @@
+[package]
+name = "gpu_db_observability"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+gpu_db_metrics = { path = "../metrics" }
+gpu_db_types = { path = "../types" }

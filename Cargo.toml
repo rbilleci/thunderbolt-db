@@ -8,6 +8,7 @@ members = [
   "crates/planner",
   "crates/batching",
   "crates/metrics",
+  "crates/observability",
   "crates/protocol",
   "crates/storage",
   "crates/engine",
