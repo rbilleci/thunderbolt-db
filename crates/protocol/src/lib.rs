@@ -201,6 +201,9 @@ pub enum FrontendMessage {
         portal_name: String,
         max_rows: u32,
     },
+    CopyData(Vec<u8>),
+    CopyDone,
+    CopyFail(String),
     Terminate,
     Sync,
     Flush,
@@ -248,6 +251,8 @@ pub enum FrontendMessageError {
     UnterminatedExecutePortalName,
     #[error("execute message payload is malformed")]
     InvalidExecutePayload,
+    #[error("copy fail message payload is not null terminated")]
+    UnterminatedCopyFail,
     #[error("simple query payload contains invalid UTF-8")]
     InvalidUtf8,
 }
@@ -507,6 +512,25 @@ pub fn parse_frontend_message(frame: &[u8]) -> Result<FrontendMessage, FrontendM
                 portal_name,
                 max_rows,
             })
+        }
+        b'd' => Ok(FrontendMessage::CopyData(payload.to_vec())),
+        b'c' => {
+            if payload_len != 4 {
+                return Err(FrontendMessageError::LengthMismatch {
+                    expected: 5,
+                    actual: frame.len(),
+                });
+            }
+            Ok(FrontendMessage::CopyDone)
+        }
+        b'f' => {
+            let Some(reason_bytes) = payload.strip_suffix(&[0]) else {
+                return Err(FrontendMessageError::UnterminatedCopyFail);
+            };
+            let reason = std::str::from_utf8(reason_bytes)
+                .map_err(|_| FrontendMessageError::InvalidUtf8)?
+                .to_owned();
+            Ok(FrontendMessage::CopyFail(reason))
         }
         b'X' => {
             if payload_len != 4 {
@@ -2104,6 +2128,24 @@ mod tests {
             }
         );
 
+        let copy_data = frontend_frame(b'd', &[0, 1, 2, 3]);
+        assert_eq!(
+            parse_frontend_message(&copy_data).unwrap(),
+            FrontendMessage::CopyData(vec![0, 1, 2, 3])
+        );
+
+        let copy_done = frontend_frame(b'c', &[]);
+        assert_eq!(
+            parse_frontend_message(&copy_done).unwrap(),
+            FrontendMessage::CopyDone
+        );
+
+        let copy_fail = frontend_frame(b'f', b"bad row\0");
+        assert_eq!(
+            parse_frontend_message(&copy_fail).unwrap(),
+            FrontendMessage::CopyFail("bad row".to_string())
+        );
+
         let terminate = frontend_frame(b'X', &[]);
         assert_eq!(
             parse_frontend_message(&terminate).unwrap(),
@@ -2179,6 +2221,21 @@ mod tests {
         assert_eq!(
             parse_frontend_message(&malformed_bind).unwrap_err(),
             FrontendMessageError::InvalidBindPayload
+        );
+
+        let malformed_copy_done = frontend_frame(b'c', &[0]);
+        assert_eq!(
+            parse_frontend_message(&malformed_copy_done).unwrap_err(),
+            FrontendMessageError::LengthMismatch {
+                expected: 5,
+                actual: 6,
+            }
+        );
+
+        let unterminated_copy_fail = frontend_frame(b'f', b"bad row");
+        assert_eq!(
+            parse_frontend_message(&unterminated_copy_fail).unwrap_err(),
+            FrontendMessageError::UnterminatedCopyFail
         );
 
         let unsupported = frontend_frame(b'F', &[]);
