@@ -81,7 +81,56 @@ pub struct RuntimeMetrics {
     last_pending_batch_len: Option<usize>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct RuntimeMetricsSnapshot {
+    pub commits_total: u64,
+    pub batch_flush_count: u64,
+    pub fallback_total: u64,
+    pub batch_wait_samples: u64,
+    pub batch_wait_total_ms: u64,
+    pub h2d_bytes_total: u64,
+    pub d2h_bytes_total: u64,
+    pub kernel_exec_samples: u64,
+    pub kernel_exec_total_ms: u64,
+    pub kernel_occupancy_samples: u64,
+    pub kernel_occupancy_total_permyriad: u64,
+    pub pending_batch_peak: usize,
+    pub fallback_by_reason: BTreeMap<FallbackReason, u64>,
+    pub batch_flush_by_reason: BTreeMap<BatchFlushReason, u64>,
+    pub last_fallback_reason: Option<FallbackReason>,
+    pub last_batch_flush_reason: Option<BatchFlushReason>,
+    pub last_batch_wait_ms: Option<u64>,
+    pub last_kernel_exec_ms: Option<u64>,
+    pub last_kernel_occupancy_permyriad: Option<u16>,
+    pub last_pending_batch_len: Option<usize>,
+}
+
 impl RuntimeMetrics {
+    pub fn snapshot(&self) -> RuntimeMetricsSnapshot {
+        RuntimeMetricsSnapshot {
+            commits_total: self.commits_total,
+            batch_flush_count: self.batch_flush_count,
+            fallback_total: self.fallback_total,
+            batch_wait_samples: self.batch_wait_samples,
+            batch_wait_total_ms: self.batch_wait_total_ms,
+            h2d_bytes_total: self.h2d_bytes_total,
+            d2h_bytes_total: self.d2h_bytes_total,
+            kernel_exec_samples: self.kernel_exec_samples,
+            kernel_exec_total_ms: self.kernel_exec_total_ms,
+            kernel_occupancy_samples: self.kernel_occupancy_samples,
+            kernel_occupancy_total_permyriad: self.kernel_occupancy_total_permyriad,
+            pending_batch_peak: self.pending_batch_peak,
+            fallback_by_reason: self.fallback_by_reason.clone(),
+            batch_flush_by_reason: self.batch_flush_by_reason.clone(),
+            last_fallback_reason: self.last_fallback_reason,
+            last_batch_flush_reason: self.last_batch_flush_reason,
+            last_batch_wait_ms: self.last_batch_wait_ms,
+            last_kernel_exec_ms: self.last_kernel_exec_ms,
+            last_kernel_occupancy_permyriad: self.last_kernel_occupancy_permyriad,
+            last_pending_batch_len: self.last_pending_batch_len,
+        }
+    }
+
     pub fn inc_commit(&mut self) {
         self.commits_total += 1;
     }
@@ -384,5 +433,56 @@ mod tests {
             }),
             Some(&1)
         );
+    }
+
+    #[test]
+    fn snapshot_captures_counters_and_last_observations() {
+        let mut m = RuntimeMetrics::default();
+        m.inc_commit();
+        m.inc_batch_flush(BatchFlushReason::Admin);
+        m.inc_gpu_fallback(GpuFallbackReason::QueueSaturated);
+        m.observe_batch_wait_ms(8);
+        m.observe_h2d_bytes(512);
+        m.observe_d2h_bytes(64);
+        m.observe_kernel_exec_ms(3);
+        m.observe_kernel_occupancy_permyriad(8_750);
+        m.observe_pending_batch_len(5);
+
+        let snapshot = m.snapshot();
+
+        assert_eq!(snapshot.commits_total, 1);
+        assert_eq!(snapshot.batch_flush_count, 1);
+        assert_eq!(snapshot.fallback_total, 1);
+        assert_eq!(snapshot.batch_wait_samples, 1);
+        assert_eq!(snapshot.batch_wait_total_ms, 8);
+        assert_eq!(snapshot.h2d_bytes_total, 512);
+        assert_eq!(snapshot.d2h_bytes_total, 64);
+        assert_eq!(snapshot.kernel_exec_samples, 1);
+        assert_eq!(snapshot.kernel_exec_total_ms, 3);
+        assert_eq!(snapshot.kernel_occupancy_samples, 1);
+        assert_eq!(snapshot.kernel_occupancy_total_permyriad, 8_750);
+        assert_eq!(snapshot.pending_batch_peak, 5);
+        assert_eq!(
+            snapshot
+                .fallback_by_reason
+                .get(&FallbackReason::GpuQueueSaturated),
+            Some(&1)
+        );
+        assert_eq!(
+            snapshot.batch_flush_by_reason.get(&BatchFlushReason::Admin),
+            Some(&1)
+        );
+        assert_eq!(
+            snapshot.last_fallback_reason,
+            Some(FallbackReason::GpuQueueSaturated)
+        );
+        assert_eq!(
+            snapshot.last_batch_flush_reason,
+            Some(BatchFlushReason::Admin)
+        );
+        assert_eq!(snapshot.last_batch_wait_ms, Some(8));
+        assert_eq!(snapshot.last_kernel_exec_ms, Some(3));
+        assert_eq!(snapshot.last_kernel_occupancy_permyriad, Some(8_750));
+        assert_eq!(snapshot.last_pending_batch_len, Some(5));
     }
 }

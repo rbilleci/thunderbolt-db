@@ -6,6 +6,7 @@
 - Added a new `gpu_db_storage` crate and wired it into the workspace member list so the Phase 0 repository skeleton now includes an explicit storage boundary alongside protocol/planner/execution/wal/replication modules.
 - Introduced bootstrap storage contracts (`TupleStore`, `seq_scan_open`, `index_scan_open`, and tuple insert/update/delete/fetch operations) plus shared MVCC-oriented value types (`TupleVersion`, `Visibility`, `NewTuple`) to keep storage API shape explicit before backend implementation.
 - Added `StorageError` taxonomy and a baseline contract test to lock in visibility-scoped read behavior for no-GPU bootstrap iterations.
+- Added `RuntimeMetrics::snapshot()` plus `RuntimeMetricsSnapshot` so observability/export paths can capture an immutable metrics view (including per-reason counters and latest observation fields) without reading mutable internals directly.
 
 ## 2026-04-06
 
