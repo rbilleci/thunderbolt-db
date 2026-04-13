@@ -176,6 +176,11 @@ pub struct SessionLifecycle {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FrontendMessage {
     SimpleQuery(String),
+    Parse {
+        statement_name: String,
+        query: String,
+        parameter_type_oids: Vec<u32>,
+    },
     Terminate,
     Sync,
     Flush,
@@ -191,6 +196,12 @@ pub enum FrontendMessageError {
     UnsupportedTag(u8),
     #[error("simple query payload is not null terminated")]
     UnterminatedSimpleQuery,
+    #[error("parse message statement name is not null terminated")]
+    UnterminatedParseStatementName,
+    #[error("parse message query is not null terminated")]
+    UnterminatedParseQuery,
+    #[error("parse message parameter type payload is malformed")]
+    InvalidParseParameterPayload,
     #[error("simple query payload contains invalid UTF-8")]
     InvalidUtf8,
 }
@@ -224,6 +235,65 @@ pub fn parse_frontend_message(frame: &[u8]) -> Result<FrontendMessage, FrontendM
                 .map_err(|_| FrontendMessageError::InvalidUtf8)?
                 .to_owned();
             Ok(FrontendMessage::SimpleQuery(query))
+        }
+        b'P' => {
+            let Some(statement_name_end) = payload.iter().position(|&b| b == 0) else {
+                return Err(FrontendMessageError::UnterminatedParseStatementName);
+            };
+            let statement_name = std::str::from_utf8(&payload[..statement_name_end])
+                .map_err(|_| FrontendMessageError::InvalidUtf8)?
+                .to_owned();
+
+            let query_start = statement_name_end + 1;
+            let Some(query_rel_end) = payload[query_start..].iter().position(|&b| b == 0) else {
+                return Err(FrontendMessageError::UnterminatedParseQuery);
+            };
+            let query_end = query_start + query_rel_end;
+            let query = std::str::from_utf8(&payload[query_start..query_end])
+                .map_err(|_| FrontendMessageError::InvalidUtf8)?
+                .to_owned();
+
+            let type_count_start = query_end + 1;
+            let type_count_end = type_count_start + 2;
+            let Some(type_count_bytes) = payload.get(type_count_start..type_count_end) else {
+                return Err(FrontendMessageError::InvalidParseParameterPayload);
+            };
+            let type_count = i16::from_be_bytes(
+                type_count_bytes
+                    .try_into()
+                    .map_err(|_| FrontendMessageError::InvalidParseParameterPayload)?,
+            );
+            if type_count < 0 {
+                return Err(FrontendMessageError::InvalidParseParameterPayload);
+            }
+            let type_count = type_count as usize;
+
+            let types_start = type_count_end;
+            let expected_types_len = type_count
+                .checked_mul(4)
+                .ok_or(FrontendMessageError::InvalidParseParameterPayload)?;
+            let types_end = types_start
+                .checked_add(expected_types_len)
+                .ok_or(FrontendMessageError::InvalidParseParameterPayload)?;
+            if types_end != payload.len() {
+                return Err(FrontendMessageError::InvalidParseParameterPayload);
+            }
+
+            let mut parameter_type_oids = Vec::with_capacity(type_count);
+            for chunk in payload[types_start..types_end].chunks_exact(4) {
+                let oid = u32::from_be_bytes(
+                    chunk
+                        .try_into()
+                        .map_err(|_| FrontendMessageError::InvalidParseParameterPayload)?,
+                );
+                parameter_type_oids.push(oid);
+            }
+
+            Ok(FrontendMessage::Parse {
+                statement_name,
+                query,
+                parameter_type_oids,
+            })
         }
         b'X' => {
             if payload_len != 4 {
@@ -1731,6 +1801,20 @@ mod tests {
             FrontendMessage::SimpleQuery("SELECT 1;".to_string())
         );
 
+        let mut parse_payload = Vec::new();
+        parse_payload.extend_from_slice(b"stmt1\0SELECT $1::int4\0");
+        parse_payload.extend_from_slice(&1_i16.to_be_bytes());
+        parse_payload.extend_from_slice(&23_u32.to_be_bytes());
+        let parse = frontend_frame(b'P', &parse_payload);
+        assert_eq!(
+            parse_frontend_message(&parse).unwrap(),
+            FrontendMessage::Parse {
+                statement_name: "stmt1".to_string(),
+                query: "SELECT $1::int4".to_string(),
+                parameter_type_oids: vec![23],
+            }
+        );
+
         let terminate = frontend_frame(b'X', &[]);
         assert_eq!(
             parse_frontend_message(&terminate).unwrap(),
@@ -1772,10 +1856,16 @@ mod tests {
             FrontendMessageError::UnterminatedSimpleQuery
         );
 
-        let unsupported = frontend_frame(b'P', &[]);
+        let malformed_parse = frontend_frame(b'P', b"stmt\0SELECT 1\0\0\x01");
+        assert_eq!(
+            parse_frontend_message(&malformed_parse).unwrap_err(),
+            FrontendMessageError::InvalidParseParameterPayload
+        );
+
+        let unsupported = frontend_frame(b'D', &[]);
         assert_eq!(
             parse_frontend_message(&unsupported).unwrap_err(),
-            FrontendMessageError::UnsupportedTag(b'P')
+            FrontendMessageError::UnsupportedTag(b'D')
         );
     }
 }
