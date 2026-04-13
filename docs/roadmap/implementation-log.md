@@ -3,6 +3,7 @@
 ## 2026-04-13
 
 ### Completed
+- Added a PostgreSQL startup/auth packet parser skeleton in `gpu_db_protocol` (`parse_startup_packet`) covering protocol v3 startup parameters plus SSL and cancel request decoding, with deterministic regression coverage for framing/length and malformed parameter payloads.
 - Added a new `gpu_db_storage` crate and wired it into the workspace member list so the Phase 0 repository skeleton now includes an explicit storage boundary alongside protocol/planner/execution/wal/replication modules.
 - Introduced bootstrap storage contracts (`TupleStore`, `seq_scan_open`, `index_scan_open`, and tuple insert/update/delete/fetch operations) plus shared MVCC-oriented value types (`TupleVersion`, `Visibility`, `NewTuple`) to keep storage API shape explicit before backend implementation.
 - Added `StorageError` taxonomy and a baseline contract test to lock in visibility-scoped read behavior for no-GPU bootstrap iterations.

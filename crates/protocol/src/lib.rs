@@ -26,6 +26,118 @@ pub enum ParseError {
     InvalidReset,
 }
 
+pub const PG_PROTOCOL_V3: u32 = 196_608;
+const PG_SSL_REQUEST_CODE: u32 = 80_877_103;
+const PG_CANCEL_REQUEST_CODE: u32 = 80_877_102;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartupPacket {
+    Startup {
+        protocol_version: u32,
+        params: Vec<(String, String)>,
+    },
+    SslRequest,
+    CancelRequest {
+        process_id: u32,
+        secret_key: u32,
+    },
+}
+
+#[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
+pub enum StartupPacketError {
+    #[error("startup packet too short")]
+    TooShort,
+    #[error("startup packet length mismatch; expected {expected} bytes, got {actual}")]
+    LengthMismatch { expected: usize, actual: usize },
+    #[error("unsupported startup protocol code: {0}")]
+    UnsupportedProtocolCode(u32),
+    #[error("startup parameter payload is not null terminated")]
+    UnterminatedParameterPayload,
+    #[error("startup parameter payload has odd key/value segment count")]
+    InvalidParameterPairing,
+    #[error("startup parameter contains invalid UTF-8")]
+    InvalidUtf8,
+}
+
+fn read_u32_be(bytes: &[u8]) -> Result<u32, StartupPacketError> {
+    let arr: [u8; 4] = bytes.try_into().map_err(|_| StartupPacketError::TooShort)?;
+    Ok(u32::from_be_bytes(arr))
+}
+
+fn parse_startup_params(payload: &[u8]) -> Result<Vec<(String, String)>, StartupPacketError> {
+    let Some(last) = payload.last() else {
+        return Ok(Vec::new());
+    };
+    if *last != 0 {
+        return Err(StartupPacketError::UnterminatedParameterPayload);
+    }
+
+    let segments: Vec<&[u8]> = payload[..payload.len() - 1]
+        .split(|b| *b == 0)
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    if !segments.len().is_multiple_of(2) {
+        return Err(StartupPacketError::InvalidParameterPairing);
+    }
+
+    let mut params = Vec::with_capacity(segments.len() / 2);
+    for pair in segments.chunks_exact(2) {
+        let key = std::str::from_utf8(pair[0]).map_err(|_| StartupPacketError::InvalidUtf8)?;
+        let value = std::str::from_utf8(pair[1]).map_err(|_| StartupPacketError::InvalidUtf8)?;
+        params.push((key.to_owned(), value.to_owned()));
+    }
+    Ok(params)
+}
+
+pub fn parse_startup_packet(frame: &[u8]) -> Result<StartupPacket, StartupPacketError> {
+    if frame.len() < 8 {
+        return Err(StartupPacketError::TooShort);
+    }
+
+    let frame_len = read_u32_be(&frame[..4])? as usize;
+    if frame_len != frame.len() {
+        return Err(StartupPacketError::LengthMismatch {
+            expected: frame_len,
+            actual: frame.len(),
+        });
+    }
+
+    let code = read_u32_be(&frame[4..8])?;
+    match code {
+        PG_SSL_REQUEST_CODE => {
+            if frame_len != 8 {
+                return Err(StartupPacketError::LengthMismatch {
+                    expected: 8,
+                    actual: frame_len,
+                });
+            }
+            Ok(StartupPacket::SslRequest)
+        }
+        PG_CANCEL_REQUEST_CODE => {
+            if frame_len != 16 {
+                return Err(StartupPacketError::LengthMismatch {
+                    expected: 16,
+                    actual: frame_len,
+                });
+            }
+            let process_id = read_u32_be(&frame[8..12])?;
+            let secret_key = read_u32_be(&frame[12..16])?;
+            Ok(StartupPacket::CancelRequest {
+                process_id,
+                secret_key,
+            })
+        }
+        protocol_version if protocol_version == PG_PROTOCOL_V3 => {
+            let params = parse_startup_params(&frame[8..])?;
+            Ok(StartupPacket::Startup {
+                protocol_version,
+                params,
+            })
+        }
+        other => Err(StartupPacketError::UnsupportedProtocolCode(other)),
+    }
+}
+
 fn parse_transaction_chain_suffix(tokens: &[&str]) -> Option<bool> {
     if tokens.is_empty() {
         return Some(false);
@@ -1309,5 +1421,78 @@ mod tests {
             parse_command("GET too many"),
             Err(ParseError::InvalidGet)
         ));
+    }
+
+    fn with_length_prefix(mut payload: Vec<u8>) -> Vec<u8> {
+        let len = (payload.len() + 4) as u32;
+        let mut frame = len.to_be_bytes().to_vec();
+        frame.append(&mut payload);
+        frame
+    }
+
+    #[test]
+    fn parses_pg_v3_startup_packet_with_params() {
+        let mut payload = PG_PROTOCOL_V3.to_be_bytes().to_vec();
+        payload.extend_from_slice(b"user\0postgres\0database\0gpu\0\0");
+        let frame = with_length_prefix(payload);
+
+        let packet = parse_startup_packet(&frame).unwrap();
+        assert_eq!(
+            packet,
+            StartupPacket::Startup {
+                protocol_version: PG_PROTOCOL_V3,
+                params: vec![
+                    ("user".to_string(), "postgres".to_string()),
+                    ("database".to_string(), "gpu".to_string())
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn parses_ssl_and_cancel_requests() {
+        let ssl = with_length_prefix(PG_SSL_REQUEST_CODE.to_be_bytes().to_vec());
+        assert_eq!(
+            parse_startup_packet(&ssl).unwrap(),
+            StartupPacket::SslRequest
+        );
+
+        let mut cancel_payload = PG_CANCEL_REQUEST_CODE.to_be_bytes().to_vec();
+        cancel_payload.extend_from_slice(&123u32.to_be_bytes());
+        cancel_payload.extend_from_slice(&456u32.to_be_bytes());
+        let cancel = with_length_prefix(cancel_payload);
+        assert_eq!(
+            parse_startup_packet(&cancel).unwrap(),
+            StartupPacket::CancelRequest {
+                process_id: 123,
+                secret_key: 456,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_startup_packet_with_length_or_parameter_errors() {
+        let short = vec![0, 0, 0, 8, 0, 3, 0];
+        assert_eq!(
+            parse_startup_packet(&short).unwrap_err(),
+            StartupPacketError::TooShort
+        );
+
+        let bad_len = vec![0, 0, 0, 10, 0, 3, 0, 0, 0];
+        assert_eq!(
+            parse_startup_packet(&bad_len).unwrap_err(),
+            StartupPacketError::LengthMismatch {
+                expected: 10,
+                actual: 9,
+            }
+        );
+
+        let mut bad_params = PG_PROTOCOL_V3.to_be_bytes().to_vec();
+        bad_params.extend_from_slice(b"user\0postgres");
+        let bad_params = with_length_prefix(bad_params);
+        assert_eq!(
+            parse_startup_packet(&bad_params).unwrap_err(),
+            StartupPacketError::UnterminatedParameterPayload
+        );
     }
 }
