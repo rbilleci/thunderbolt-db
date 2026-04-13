@@ -189,6 +189,10 @@ pub enum FrontendMessage {
         target: DescribeTarget,
         name: String,
     },
+    Execute {
+        portal_name: String,
+        max_rows: u32,
+    },
     Terminate,
     Sync,
     Flush,
@@ -224,6 +228,10 @@ pub enum FrontendMessageError {
     InvalidCloseTarget,
     #[error("close message name is not null terminated")]
     UnterminatedCloseName,
+    #[error("execute message portal name is not null terminated")]
+    UnterminatedExecutePortalName,
+    #[error("execute message payload is malformed")]
+    InvalidExecutePayload,
     #[error("simple query payload contains invalid UTF-8")]
     InvalidUtf8,
 }
@@ -352,6 +360,32 @@ pub fn parse_frontend_message(frame: &[u8]) -> Result<FrontendMessage, FrontendM
                 .map_err(|_| FrontendMessageError::InvalidUtf8)?
                 .to_owned();
             Ok(FrontendMessage::Close { target, name })
+        }
+        b'E' => {
+            let Some(portal_end) = payload.iter().position(|&b| b == 0) else {
+                return Err(FrontendMessageError::UnterminatedExecutePortalName);
+            };
+            let portal_name = std::str::from_utf8(&payload[..portal_end])
+                .map_err(|_| FrontendMessageError::InvalidUtf8)?
+                .to_owned();
+
+            let max_rows_start = portal_end + 1;
+            let max_rows_bytes = payload
+                .get(max_rows_start..max_rows_start + 4)
+                .ok_or(FrontendMessageError::InvalidExecutePayload)?;
+            if max_rows_start + 4 != payload.len() {
+                return Err(FrontendMessageError::InvalidExecutePayload);
+            }
+            let max_rows = u32::from_be_bytes(
+                max_rows_bytes
+                    .try_into()
+                    .map_err(|_| FrontendMessageError::InvalidExecutePayload)?,
+            );
+
+            Ok(FrontendMessage::Execute {
+                portal_name,
+                max_rows,
+            })
         }
         b'X' => {
             if payload_len != 4 {
@@ -1909,6 +1943,18 @@ mod tests {
             }
         );
 
+        let mut execute_payload = Vec::new();
+        execute_payload.extend_from_slice(b"portal1\0");
+        execute_payload.extend_from_slice(&128_u32.to_be_bytes());
+        let execute = frontend_frame(b'E', &execute_payload);
+        assert_eq!(
+            parse_frontend_message(&execute).unwrap(),
+            FrontendMessage::Execute {
+                portal_name: "portal1".to_string(),
+                max_rows: 128,
+            }
+        );
+
         let terminate = frontend_frame(b'X', &[]);
         assert_eq!(
             parse_frontend_message(&terminate).unwrap(),
@@ -1968,10 +2014,16 @@ mod tests {
             FrontendMessageError::InvalidCloseTarget
         );
 
-        let unsupported = frontend_frame(b'E', &[]);
+        let malformed_execute = frontend_frame(b'E', b"portal\0\0\0");
+        assert_eq!(
+            parse_frontend_message(&malformed_execute).unwrap_err(),
+            FrontendMessageError::InvalidExecutePayload
+        );
+
+        let unsupported = frontend_frame(b'B', &[]);
         assert_eq!(
             parse_frontend_message(&unsupported).unwrap_err(),
-            FrontendMessageError::UnsupportedTag(b'E')
+            FrontendMessageError::UnsupportedTag(b'B')
         );
     }
 }
