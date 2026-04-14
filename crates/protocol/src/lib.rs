@@ -959,6 +959,11 @@ fn parse_reset_command(input: &str) -> Option<Result<Command, ParseError>> {
             {
                 Ok(Command::ResetAll)
             }
+            [channel, comma, payload @ ..]
+                if !channel.is_empty() && *comma == "," && !payload.is_empty() =>
+            {
+                Ok(Command::ResetAll)
+            }
             _ => Err(ParseError::InvalidReset),
         });
     }
@@ -1566,6 +1571,9 @@ mod tests {
 
         let cmd = parse_command("NOTIFY updates_channel, 'hello'").unwrap();
         assert_eq!(cmd, Command::ResetAll);
+
+        let cmd = parse_command("NOTIFY updates_channel , 'hello'").unwrap();
+        assert_eq!(cmd, Command::ResetAll);
     }
 
     #[test]
@@ -2036,6 +2044,10 @@ mod tests {
         ));
         assert!(matches!(
             parse_command("NOTIFY updates_channel payload"),
+            Err(ParseError::InvalidReset)
+        ));
+        assert!(matches!(
+            parse_command("NOTIFY updates_channel ,"),
             Err(ParseError::InvalidReset)
         ));
         assert!(matches!(
