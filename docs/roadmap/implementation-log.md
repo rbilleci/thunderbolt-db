@@ -3,6 +3,9 @@
 ## 2026-04-14
 
 ### Completed
+- Extended session-reset parser compatibility to accept PostgreSQL-style `SET ROLE {NONE|DEFAULT}` and `SET SESSION AUTHORIZATION value` / `SET SESSION AUTH value` forms as `ResetAll` no-op aliases, reducing parser friction for clients that reinitialize role/auth context during connection reset flows.
+- Added regression coverage for accepted `SET ROLE`/`SET SESSION AUTH*` aliases, malformed-form rejection (`SET ROLE`, missing auth target), and statement-terminator handling to keep parser behavior deterministic.
+- Updated command-reference docs to reflect the expanded reset alias contract.
 - Extended admin flush compatibility to accept PostgreSQL `CHECKPOINT` as a `Flush` alias, so bootstrap control paths can ingest checkpoint probes without client-side command rewriting.
 - Added regression coverage for `CHECKPOINT` acceptance plus malformed-form rejection (`CHECKPOINT NOW`) and statement-terminator handling.
 - Extended session-reset parser compatibility to accept PostgreSQL-style prepared-statement cleanup forms `DEALLOCATE name` and `DEALLOCATE PREPARE name` as `ResetAll` no-op aliases (in addition to `DEALLOCATE ALL`), reducing bootstrap parser friction for clients that emit explicit prepared-statement teardown probes.

@@ -978,6 +978,47 @@ fn split_set_key_value(rest: &str) -> Option<(&str, &str)> {
     Some((key, remainder.trim_start()))
 }
 
+fn parse_set_session_command(rest: &str) -> Option<Result<Command, ParseError>> {
+    let tokens: Vec<_> = rest.split_whitespace().collect();
+
+    match tokens.as_slice() {
+        [role, target]
+            if role.eq_ignore_ascii_case("ROLE")
+                && (target.eq_ignore_ascii_case("NONE")
+                    || target.eq_ignore_ascii_case("DEFAULT")) =>
+        {
+            Some(Ok(Command::ResetAll))
+        }
+        [session, authorization, target]
+            if session.eq_ignore_ascii_case("SESSION")
+                && authorization.eq_ignore_ascii_case("AUTHORIZATION")
+                && !target.is_empty() =>
+        {
+            Some(Ok(Command::ResetAll))
+        }
+        [session, auth, target]
+            if session.eq_ignore_ascii_case("SESSION")
+                && auth.eq_ignore_ascii_case("AUTH")
+                && !target.is_empty() =>
+        {
+            Some(Ok(Command::ResetAll))
+        }
+        [role] if role.eq_ignore_ascii_case("ROLE") => Some(Err(ParseError::InvalidSet)),
+        [session, authorization]
+            if session.eq_ignore_ascii_case("SESSION")
+                && authorization.eq_ignore_ascii_case("AUTHORIZATION") =>
+        {
+            Some(Err(ParseError::InvalidSet))
+        }
+        [session, auth]
+            if session.eq_ignore_ascii_case("SESSION") && auth.eq_ignore_ascii_case("AUTH") =>
+        {
+            Some(Err(ParseError::InvalidSet))
+        }
+        _ => None,
+    }
+}
+
 fn is_isolation_level_suffix(tokens: &[&str]) -> bool {
     matches!(
         tokens,
@@ -1221,6 +1262,9 @@ pub fn parse_command(input: &str) -> Result<Command, ParseError> {
             let Some(rest) = parts.next() else {
                 return Err(ParseError::InvalidSet);
             };
+            if let Some(alias) = parse_set_session_command(rest) {
+                return alias;
+            }
             let Some((k, v)) = split_set_key_value(rest) else {
                 return Err(ParseError::InvalidSet);
             };
@@ -1341,6 +1385,23 @@ mod tests {
                 key: "alpha".into(),
                 value: "value words".into()
             }
+        );
+    }
+
+    #[test]
+    fn parses_postgres_style_set_session_reset_aliases() {
+        assert_eq!(parse_command("SET ROLE NONE").unwrap(), Command::ResetAll);
+        assert_eq!(
+            parse_command("SET ROLE DEFAULT").unwrap(),
+            Command::ResetAll
+        );
+        assert_eq!(
+            parse_command("SET SESSION AUTHORIZATION DEFAULT").unwrap(),
+            Command::ResetAll
+        );
+        assert_eq!(
+            parse_command("SET SESSION AUTH postgres").unwrap(),
+            Command::ResetAll
         );
     }
 
@@ -1951,6 +2012,18 @@ mod tests {
             parse_command("LISTEN updates_channel NOW"),
             Err(ParseError::InvalidReset)
         ));
+        assert!(matches!(
+            parse_command("SET ROLE"),
+            Err(ParseError::InvalidSet)
+        ));
+        assert!(matches!(
+            parse_command("SET SESSION AUTHORIZATION"),
+            Err(ParseError::InvalidSet)
+        ));
+        assert!(matches!(
+            parse_command("SET SESSION AUTH"),
+            Err(ParseError::InvalidSet)
+        ));
     }
 
     #[test]
@@ -1998,6 +2071,14 @@ mod tests {
         assert_eq!(parse_command("UNLISTEN *;\n").unwrap(), Command::ResetAll);
         assert_eq!(
             parse_command("LISTEN updates_channel;\n").unwrap(),
+            Command::ResetAll
+        );
+        assert_eq!(
+            parse_command("SET ROLE NONE;\n").unwrap(),
+            Command::ResetAll
+        );
+        assert_eq!(
+            parse_command("SET SESSION AUTHORIZATION DEFAULT;\n").unwrap(),
             Command::ResetAll
         );
         assert_eq!(
