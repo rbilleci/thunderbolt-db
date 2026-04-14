@@ -19,6 +19,7 @@ This matrix makes compatibility intent explicit per delivery phase while preserv
 | Text command parser for key-value mutations (`SET`, `DEL`) | ✅ | ✅ | ✅ | Current bootstrap command surface for deterministic testing |
 | Transaction control command parsing (`BEGIN`, `COMMIT`, `ROLLBACK`) | ✅ | ✅ | ✅ | Counted as non-GPU-eligible fallbacks in runtime telemetry |
 | Admin flush command (`FLUSH`) | ✅ | ✅ | ✅ | Drains pending deterministic batch |
+| Session-control parser no-op aliases (`RESET`/`DISCARD`/`DEALLOCATE`/`CLOSE ALL`/`LISTEN`/`UNLISTEN`) | ✅ | ✅ | ✅ | PostgreSQL-style client reset/setup probes accepted without mutating state |
 | Full PostgreSQL wire protocol compatibility | 🚫 | 🚫 | 🟡 | Planned as phased adapter; not required for current invariant validation |
 | Broad PostgreSQL SQL grammar coverage | 🚫 | 🚫 | 🟡 | Incremental after core replication + durability gates |
 
