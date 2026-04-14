@@ -3,6 +3,8 @@
 ## 2026-04-14
 
 ### Completed
+- Extended session-control parser compatibility to accept `UNLISTEN ALL` as a `ResetAll` no-op alias (alongside existing `UNLISTEN`/`UNLISTEN *`/`UNLISTEN channel` forms), reducing parser friction for PostgreSQL clients that emit `ALL`-style listener reset probes.
+- Added regression coverage for `UNLISTEN ALL` acceptance (including statement terminators) and updated command-reference docs/error text to reflect the expanded `UNLISTEN` alias contract.
 - Extended session-control parser compatibility to accept PostgreSQL `NOTIFY channel[, payload]` forms as `ResetAll` no-op aliases, reducing parser friction for clients that probe pub/sub notification lifecycles during bootstrap/reset flows.
 - Added regression coverage for `NOTIFY` alias acceptance (with and without payload), malformed-form rejection (`NOTIFY`, malformed payload form), and statement-terminator handling.
 - Updated command-reference docs to reflect the expanded session-control alias contract.
