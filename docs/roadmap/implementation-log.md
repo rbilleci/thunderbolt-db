@@ -3,6 +3,9 @@
 ## 2026-04-14
 
 ### Completed
+- Extended session-control parser compatibility to accept PostgreSQL `NOTIFY channel[, payload]` forms as `ResetAll` no-op aliases, reducing parser friction for clients that probe pub/sub notification lifecycles during bootstrap/reset flows.
+- Added regression coverage for `NOTIFY` alias acceptance (with and without payload), malformed-form rejection (`NOTIFY`, malformed payload form), and statement-terminator handling.
+- Updated command-reference docs to reflect the expanded session-control alias contract.
 - Extended session-reset parser compatibility to accept PostgreSQL-style `SET ROLE {NONE|DEFAULT}` and `SET SESSION AUTHORIZATION value` / `SET SESSION AUTH value` forms as `ResetAll` no-op aliases, reducing parser friction for clients that reinitialize role/auth context during connection reset flows.
 - Added regression coverage for accepted `SET ROLE`/`SET SESSION AUTH*` aliases, malformed-form rejection (`SET ROLE`, missing auth target), and statement-terminator handling to keep parser behavior deterministic.
 - Updated command-reference docs to reflect the expanded reset alias contract.

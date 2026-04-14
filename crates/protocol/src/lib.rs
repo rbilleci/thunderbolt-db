@@ -951,6 +951,18 @@ fn parse_reset_command(input: &str) -> Option<Result<Command, ParseError>> {
         });
     }
 
+    if first.eq_ignore_ascii_case("NOTIFY") {
+        return Some(match rest {
+            [channel] if !channel.is_empty() => Ok(Command::ResetAll),
+            [channel_with_comma, _payload @ ..]
+                if channel_with_comma.ends_with(',') && channel_with_comma.len() > 1 =>
+            {
+                Ok(Command::ResetAll)
+            }
+            _ => Err(ParseError::InvalidReset),
+        });
+    }
+
     None
 }
 
@@ -1548,6 +1560,12 @@ mod tests {
 
         let cmd = parse_command("LISTEN updates_channel").unwrap();
         assert_eq!(cmd, Command::ResetAll);
+
+        let cmd = parse_command("NOTIFY updates_channel").unwrap();
+        assert_eq!(cmd, Command::ResetAll);
+
+        let cmd = parse_command("NOTIFY updates_channel, 'hello'").unwrap();
+        assert_eq!(cmd, Command::ResetAll);
     }
 
     #[test]
@@ -2013,6 +2031,14 @@ mod tests {
             Err(ParseError::InvalidReset)
         ));
         assert!(matches!(
+            parse_command("NOTIFY"),
+            Err(ParseError::InvalidReset)
+        ));
+        assert!(matches!(
+            parse_command("NOTIFY updates_channel payload"),
+            Err(ParseError::InvalidReset)
+        ));
+        assert!(matches!(
             parse_command("SET ROLE"),
             Err(ParseError::InvalidSet)
         ));
@@ -2071,6 +2097,14 @@ mod tests {
         assert_eq!(parse_command("UNLISTEN *;\n").unwrap(), Command::ResetAll);
         assert_eq!(
             parse_command("LISTEN updates_channel;\n").unwrap(),
+            Command::ResetAll
+        );
+        assert_eq!(
+            parse_command("NOTIFY updates_channel;\n").unwrap(),
+            Command::ResetAll
+        );
+        assert_eq!(
+            parse_command("NOTIFY updates_channel, 'payload';\n").unwrap(),
             Command::ResetAll
         );
         assert_eq!(
