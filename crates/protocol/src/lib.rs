@@ -814,6 +814,13 @@ fn parse_transaction_control_chain(input: &str, keyword: &str) -> Option<bool> {
 fn parse_flush_command(input: &str) -> Option<Command> {
     let tokens: Vec<_> = input.split_whitespace().collect();
     let (first, rest) = tokens.split_first()?;
+    if first.eq_ignore_ascii_case("CHECKPOINT") {
+        return match rest {
+            [] => Some(Command::Flush),
+            _ => None,
+        };
+    }
+
     if !first.eq_ignore_ascii_case("FLUSH") {
         return None;
     }
@@ -1355,6 +1362,9 @@ mod tests {
 
     #[test]
     fn parses_flush() {
+        let cmd = parse_command("CHECKPOINT").unwrap();
+        assert_eq!(cmd, Command::Flush);
+
         let cmd = parse_command("FLUSH").unwrap();
         assert_eq!(cmd, Command::Flush);
 
@@ -1882,6 +1892,10 @@ mod tests {
             Err(ParseError::Unsupported(_))
         ));
         assert!(matches!(
+            parse_command("CHECKPOINT NOW"),
+            Err(ParseError::Unsupported(_))
+        ));
+        assert!(matches!(
             parse_command("RESET"),
             Err(ParseError::InvalidReset)
         ));
@@ -1990,6 +2004,7 @@ mod tests {
             parse_command("FLUSH WRITE AHEAD LOG;\n").unwrap(),
             Command::Flush
         );
+        assert_eq!(parse_command("CHECKPOINT;\n").unwrap(), Command::Flush);
         assert_eq!(
             parse_command("FLUSH WRITE_AHEAD_LOG;\n").unwrap(),
             Command::Flush

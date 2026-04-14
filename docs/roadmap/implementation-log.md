@@ -3,6 +3,8 @@
 ## 2026-04-14
 
 ### Completed
+- Extended admin flush compatibility to accept PostgreSQL `CHECKPOINT` as a `Flush` alias, so bootstrap control paths can ingest checkpoint probes without client-side command rewriting.
+- Added regression coverage for `CHECKPOINT` acceptance plus malformed-form rejection (`CHECKPOINT NOW`) and statement-terminator handling.
 - Extended session-reset parser compatibility to accept PostgreSQL-style prepared-statement cleanup forms `DEALLOCATE name` and `DEALLOCATE PREPARE name` as `ResetAll` no-op aliases (in addition to `DEALLOCATE ALL`), reducing bootstrap parser friction for clients that emit explicit prepared-statement teardown probes.
 - Added regression coverage for `DEALLOCATE name` and `DEALLOCATE PREPARE name` acceptance plus malformed-form rejection (`DEALLOCATE PREPARE`, extra-token variants) and statement-terminator handling, keeping parser behavior deterministic.
 - Extended session-control parser compatibility to accept `LISTEN channel` as a `ResetAll` no-op alias, reducing bootstrap parser friction for PostgreSQL clients that probe pub/sub lifecycle commands during connection setup/reset flows.
