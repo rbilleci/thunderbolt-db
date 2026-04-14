@@ -7,7 +7,7 @@ These guardrails ensure we optimize for GPU execution from day one while preserv
 1. **Dual-target operator contract**
    - Every new physical operator must define:
      - CPU path (reference semantics)
-     - GPU path (or explicit TODO + fallback rule)
+     - GPU path (or an explicit fallback rule linked to a tracked GPU parity issue and milestone)
    - No operator merges without a declared device strategy.
 
 2. **No CPU-only data model decisions**
