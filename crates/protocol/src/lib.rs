@@ -22,7 +22,7 @@ pub enum ParseError {
     InvalidDel,
     #[error("invalid GET syntax; expected: GET key")]
     InvalidGet,
-    #[error("invalid RESET/DISCARD/DEALLOCATE/CLOSE/UNLISTEN syntax; expected: RESET ALL|ROLE|AUTHORIZATION|AUTH|SESSION AUTHORIZATION|SESSION AUTH, DISCARD {{ALL|TEMP|TEMPORARY|TEMP TABLES|TEMPORARY TABLES|PLANS|SEQUENCES}}, DEALLOCATE {{ALL|name|PREPARE name}}, CLOSE ALL, or UNLISTEN [*|channel]")]
+    #[error("invalid RESET/DISCARD/DEALLOCATE/CLOSE/LISTEN/UNLISTEN syntax; expected: RESET ALL|ROLE|AUTHORIZATION|AUTH|SESSION AUTHORIZATION|SESSION AUTH, DISCARD {{ALL|TEMP|TEMPORARY|TEMP TABLES|TEMPORARY TABLES|PLANS|SEQUENCES}}, DEALLOCATE {{ALL|name|PREPARE name}}, CLOSE ALL, LISTEN channel, or UNLISTEN [*|channel]")]
     InvalidReset,
 }
 
@@ -937,6 +937,13 @@ fn parse_reset_command(input: &str) -> Option<Result<Command, ParseError>> {
         });
     }
 
+    if first.eq_ignore_ascii_case("LISTEN") {
+        return Some(match rest {
+            [channel] if !channel.is_empty() => Ok(Command::ResetAll),
+            _ => Err(ParseError::InvalidReset),
+        });
+    }
+
     None
 }
 
@@ -1467,6 +1474,9 @@ mod tests {
 
         let cmd = parse_command("UNLISTEN updates_channel").unwrap();
         assert_eq!(cmd, Command::ResetAll);
+
+        let cmd = parse_command("LISTEN updates_channel").unwrap();
+        assert_eq!(cmd, Command::ResetAll);
     }
 
     #[test]
@@ -1919,6 +1929,14 @@ mod tests {
             parse_command("UNLISTEN * NOW"),
             Err(ParseError::InvalidReset)
         ));
+        assert!(matches!(
+            parse_command("LISTEN"),
+            Err(ParseError::InvalidReset)
+        ));
+        assert!(matches!(
+            parse_command("LISTEN updates_channel NOW"),
+            Err(ParseError::InvalidReset)
+        ));
     }
 
     #[test]
@@ -1964,6 +1982,10 @@ mod tests {
         assert_eq!(parse_command("DISCARD ALL;\n").unwrap(), Command::ResetAll);
         assert_eq!(parse_command("CLOSE ALL;\n").unwrap(), Command::ResetAll);
         assert_eq!(parse_command("UNLISTEN *;\n").unwrap(), Command::ResetAll);
+        assert_eq!(
+            parse_command("LISTEN updates_channel;\n").unwrap(),
+            Command::ResetAll
+        );
         assert_eq!(
             parse_command("FLUSH WRITE AHEAD LOG;\n").unwrap(),
             Command::Flush
