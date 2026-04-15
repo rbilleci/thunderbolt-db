@@ -22,7 +22,7 @@ pub enum ParseError {
     InvalidDel,
     #[error("invalid GET syntax; expected: GET key")]
     InvalidGet,
-    #[error("invalid RESET/DISCARD/DEALLOCATE/CLOSE/LISTEN/NOTIFY/UNLISTEN syntax; expected: RESET ALL|ROLE|AUTHORIZATION|AUTH|SESSION AUTHORIZATION|SESSION AUTH, DISCARD {{ALL|TEMP|TEMPORARY|TEMP TABLES|TEMPORARY TABLES|PLANS|SEQUENCES}}, DEALLOCATE {{ALL|name|PREPARE name}}, CLOSE {{ALL|name}}, LISTEN channel, NOTIFY channel[, payload], or UNLISTEN [*|ALL|channel]")]
+    #[error("invalid RESET/DISCARD/DEALLOCATE/CLOSE/LISTEN/NOTIFY/UNLISTEN syntax; expected: RESET ALL|ROLE|AUTHORIZATION|AUTH|SESSION AUTHORIZATION|SESSION AUTH, DISCARD {{ALL|TEMP|TEMPORARY|TEMP TABLES|TEMPORARY TABLES|PLANS|SEQUENCES}}, DEALLOCATE {{ALL|name|PREPARE|PREPARED name}}, CLOSE {{ALL|name}}, LISTEN channel, NOTIFY channel[, payload], or UNLISTEN [*|ALL|channel]")]
     InvalidReset,
 }
 
@@ -914,11 +914,16 @@ fn parse_reset_command(input: &str) -> Option<Result<Command, ParseError>> {
     if first.eq_ignore_ascii_case("DEALLOCATE") {
         return Some(match rest {
             [target] if target.eq_ignore_ascii_case("ALL") => Ok(Command::ResetAll),
-            [name] if !name.is_empty() && !name.eq_ignore_ascii_case("PREPARE") => {
+            [name]
+                if !name.is_empty()
+                    && !name.eq_ignore_ascii_case("PREPARE")
+                    && !name.eq_ignore_ascii_case("PREPARED") =>
+            {
                 Ok(Command::ResetAll)
             }
             [prepare, name]
-                if prepare.eq_ignore_ascii_case("PREPARE")
+                if (prepare.eq_ignore_ascii_case("PREPARE")
+                    || prepare.eq_ignore_ascii_case("PREPARED"))
                     && !name.is_empty()
                     && !name.chars().any(char::is_whitespace) =>
             {
@@ -1614,6 +1619,9 @@ mod tests {
         let cmd = parse_command("DEALLOCATE PREPARE prepared_stmt").unwrap();
         assert_eq!(cmd, Command::ResetAll);
 
+        let cmd = parse_command("DEALLOCATE PREPARED prepared_stmt").unwrap();
+        assert_eq!(cmd, Command::ResetAll);
+
         let cmd = parse_command("CLOSE ALL").unwrap();
         assert_eq!(cmd, Command::ResetAll);
 
@@ -2091,6 +2099,14 @@ mod tests {
         ));
         assert!(matches!(
             parse_command("DEALLOCATE PREPARE x y"),
+            Err(ParseError::InvalidReset)
+        ));
+        assert!(matches!(
+            parse_command("DEALLOCATE PREPARED"),
+            Err(ParseError::InvalidReset)
+        ));
+        assert!(matches!(
+            parse_command("DEALLOCATE PREPARED x y"),
             Err(ParseError::InvalidReset)
         ));
         assert!(matches!(
