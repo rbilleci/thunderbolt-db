@@ -960,7 +960,9 @@ fn parse_reset_command(input: &str) -> Option<Result<Command, ParseError>> {
                 if channel_and_payload
                     .split_once(',')
                     .is_some_and(|(channel, payload)| {
-                        !channel.trim().is_empty() && notify_payload_fragment_is_non_empty(payload)
+                        !channel.trim().is_empty()
+                            && !payload.trim_start().starts_with(',')
+                            && notify_payload_fragment_is_non_empty(payload)
                     }) =>
             {
                 Ok(Command::ResetAll)
@@ -968,6 +970,9 @@ fn parse_reset_command(input: &str) -> Option<Result<Command, ParseError>> {
             [channel_with_comma, payload @ ..]
                 if channel_with_comma.ends_with(',')
                     && channel_with_comma.len() > 1
+                    && !channel_with_comma[..channel_with_comma.len() - 1]
+                        .trim_end()
+                        .ends_with(',')
                     && notify_payload_tokens_are_non_empty(payload) =>
             {
                 Ok(Command::ResetAll)
@@ -2106,6 +2111,14 @@ mod tests {
         ));
         assert!(matches!(
             parse_command("NOTIFY updates_channel, , ,"),
+            Err(ParseError::InvalidReset)
+        ));
+        assert!(matches!(
+            parse_command("NOTIFY updates_channel,,payload"),
+            Err(ParseError::InvalidReset)
+        ));
+        assert!(matches!(
+            parse_command("NOTIFY updates_channel,, payload"),
             Err(ParseError::InvalidReset)
         ));
         assert!(matches!(
