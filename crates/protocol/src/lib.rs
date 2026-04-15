@@ -912,32 +912,60 @@ fn parse_reset_command(input: &str) -> Option<Result<Command, ParseError>> {
     }
 
     if first.eq_ignore_ascii_case("DEALLOCATE") {
-        return Some(match rest {
-            [target] if target.eq_ignore_ascii_case("ALL") => Ok(Command::ResetAll),
-            [name]
-                if deallocate_target_is_valid(name)
-                    && !name.eq_ignore_ascii_case("PREPARE")
-                    && !name.eq_ignore_ascii_case("PREPARED") =>
-            {
+        let Some(rest) = strip_keyword_prefix_case_insensitive(input, "DEALLOCATE") else {
+            return Some(Err(ParseError::InvalidReset));
+        };
+        let rest = rest.trim_start();
+        if rest.eq_ignore_ascii_case("ALL") {
+            return Some(Ok(Command::ResetAll));
+        }
+
+        if let Some(after_prepared) = strip_keyword_prefix_case_insensitive(rest, "PREPARED") {
+            let tail = after_prepared.trim_start();
+            return Some(
+                if parse_reset_identifier(tail).is_some_and(|(_, tail)| tail.trim().is_empty()) {
+                    Ok(Command::ResetAll)
+                } else {
+                    Err(ParseError::InvalidReset)
+                },
+            );
+        }
+
+        if let Some(after_prepare) = strip_keyword_prefix_case_insensitive(rest, "PREPARE") {
+            let tail = after_prepare.trim_start();
+            return Some(
+                if parse_reset_identifier(tail).is_some_and(|(_, tail)| tail.trim().is_empty()) {
+                    Ok(Command::ResetAll)
+                } else {
+                    Err(ParseError::InvalidReset)
+                },
+            );
+        }
+
+        return Some(
+            if parse_reset_identifier(rest).is_some_and(|(_, tail)| tail.trim().is_empty()) {
                 Ok(Command::ResetAll)
-            }
-            [prepare, name]
-                if (prepare.eq_ignore_ascii_case("PREPARE")
-                    || prepare.eq_ignore_ascii_case("PREPARED"))
-                    && deallocate_target_is_valid(name) =>
-            {
-                Ok(Command::ResetAll)
-            }
-            _ => Err(ParseError::InvalidReset),
-        });
+            } else {
+                Err(ParseError::InvalidReset)
+            },
+        );
     }
 
     if first.eq_ignore_ascii_case("CLOSE") {
-        return Some(match rest {
-            [target] if target.eq_ignore_ascii_case("ALL") => Ok(Command::ResetAll),
-            [name] if !name.is_empty() && !name.contains(',') => Ok(Command::ResetAll),
-            _ => Err(ParseError::InvalidReset),
-        });
+        let Some(rest) = strip_keyword_prefix_case_insensitive(input, "CLOSE") else {
+            return Some(Err(ParseError::InvalidReset));
+        };
+        let rest = rest.trim_start();
+        if rest.eq_ignore_ascii_case("ALL") {
+            return Some(Ok(Command::ResetAll));
+        }
+        return Some(
+            if parse_reset_identifier(rest).is_some_and(|(_, tail)| tail.trim().is_empty()) {
+                Ok(Command::ResetAll)
+            } else {
+                Err(ParseError::InvalidReset)
+            },
+        );
     }
 
     if first.eq_ignore_ascii_case("UNLISTEN") {
@@ -1001,6 +1029,14 @@ fn strip_keyword_prefix_case_insensitive<'a>(input: &'a str, keyword: &str) -> O
     if input.len() < keyword.len() || !input[..keyword.len()].eq_ignore_ascii_case(keyword) {
         return None;
     }
+    if input.len() > keyword.len()
+        && !input[keyword.len()..]
+            .chars()
+            .next()
+            .is_some_and(char::is_whitespace)
+    {
+        return None;
+    }
     Some(&input[keyword.len()..])
 }
 
@@ -1034,10 +1070,6 @@ fn parse_reset_identifier(input: &str) -> Option<(&str, &str)> {
         return None;
     }
     Some((&s[..end], &s[end..]))
-}
-
-fn deallocate_target_is_valid(target: &str) -> bool {
-    !target.is_empty() && !target.chars().any(char::is_whitespace) && !target.contains(',')
 }
 
 fn notify_payload_fragment_is_non_empty(fragment: &str) -> bool {
@@ -1651,10 +1683,22 @@ mod tests {
         let cmd = parse_command("DEALLOCATE PREPARED prepared_stmt").unwrap();
         assert_eq!(cmd, Command::ResetAll);
 
+        let cmd = parse_command("DEALLOCATE \"prepared stmt\"").unwrap();
+        assert_eq!(cmd, Command::ResetAll);
+
+        let cmd = parse_command("DEALLOCATE PREPARE \"prepared stmt\"").unwrap();
+        assert_eq!(cmd, Command::ResetAll);
+
+        let cmd = parse_command("DEALLOCATE PREPARED \"prepared stmt\"").unwrap();
+        assert_eq!(cmd, Command::ResetAll);
+
         let cmd = parse_command("CLOSE ALL").unwrap();
         assert_eq!(cmd, Command::ResetAll);
 
         let cmd = parse_command("CLOSE cursor_name").unwrap();
+        assert_eq!(cmd, Command::ResetAll);
+
+        let cmd = parse_command("CLOSE \"cursor name\"").unwrap();
         assert_eq!(cmd, Command::ResetAll);
 
         let cmd = parse_command("UNLISTEN").unwrap();
@@ -2162,11 +2206,19 @@ mod tests {
             Err(ParseError::InvalidReset)
         ));
         assert!(matches!(
+            parse_command("DEALLOCATE \"prepared stmt"),
+            Err(ParseError::InvalidReset)
+        ));
+        assert!(matches!(
             parse_command("CLOSE"),
             Err(ParseError::InvalidReset)
         ));
         assert!(matches!(
             parse_command("CLOSE cursor_name NOW"),
+            Err(ParseError::InvalidReset)
+        ));
+        assert!(matches!(
+            parse_command("CLOSE \"cursor name"),
             Err(ParseError::InvalidReset)
         ));
         assert!(matches!(
