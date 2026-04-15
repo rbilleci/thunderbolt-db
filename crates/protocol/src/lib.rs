@@ -1109,6 +1109,25 @@ fn notify_payload_fragment_is_non_empty(fragment: &str) -> bool {
             continue;
         }
 
+        if ch == '$' {
+            if let Some((delim, after_start)) = parse_notify_dollar_quote_start(&chars, idx) {
+                let mut scan = after_start;
+                let mut found = false;
+                while scan + delim.len() <= chars.len() {
+                    if chars[scan..scan + delim.len()] == delim[..] {
+                        idx = scan + delim.len();
+                        found = true;
+                        break;
+                    }
+                    scan += 1;
+                }
+                if !found {
+                    return false;
+                }
+                continue;
+            }
+        }
+
         match ch {
             '\'' => in_single_quote = true,
             '"' => in_double_quote = true,
@@ -1119,6 +1138,24 @@ fn notify_payload_fragment_is_non_empty(fragment: &str) -> bool {
     }
 
     !(in_single_quote || in_double_quote)
+}
+
+fn parse_notify_dollar_quote_start(chars: &[char], start: usize) -> Option<(Vec<char>, usize)> {
+    if chars.get(start) != Some(&'$') {
+        return None;
+    }
+    let mut idx = start + 1;
+    while idx < chars.len() {
+        let ch = chars[idx];
+        if ch == '$' {
+            return Some((chars[start..=idx].to_vec(), idx + 1));
+        }
+        if !(ch.is_ascii_alphanumeric() || ch == '_') {
+            return None;
+        }
+        idx += 1;
+    }
+    None
 }
 
 fn split_set_key_value(rest: &str) -> Option<(&str, &str)> {
@@ -1793,6 +1830,12 @@ mod tests {
 
         let cmd = parse_command("NOTIFY updates_channel, '{\"ok\":true,\"n\":1}'").unwrap();
         assert_eq!(cmd, Command::ResetAll);
+
+        let cmd = parse_command("NOTIFY updates_channel, $$hello,world$$").unwrap();
+        assert_eq!(cmd, Command::ResetAll);
+
+        let cmd = parse_command("NOTIFY updates_channel, $tag$hello,world$tag$").unwrap();
+        assert_eq!(cmd, Command::ResetAll);
     }
 
     #[test]
@@ -2331,6 +2374,14 @@ mod tests {
         ));
         assert!(matches!(
             parse_command("NOTIFY updates_channel, 'unterminated"),
+            Err(ParseError::InvalidReset)
+        ));
+        assert!(matches!(
+            parse_command("NOTIFY updates_channel, $$unterminated"),
+            Err(ParseError::InvalidReset)
+        ));
+        assert!(matches!(
+            parse_command("NOTIFY updates_channel, $tag$unterminated"),
             Err(ParseError::InvalidReset)
         ));
         assert!(matches!(
