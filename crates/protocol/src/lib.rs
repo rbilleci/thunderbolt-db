@@ -1063,12 +1063,24 @@ fn parse_reset_identifier(input: &str) -> Option<(&str, &str)> {
         return None;
     }
 
-    let end = s
-        .find(|c: char| c.is_whitespace() || c == ',')
-        .unwrap_or(s.len());
-    if end == 0 {
+    let mut chars = s.char_indices();
+    let (_, first) = chars.next()?;
+    if !(first == '_' || first.is_ascii_alphabetic()) {
         return None;
     }
+
+    let mut end = first.len_utf8();
+    for (idx, ch) in chars {
+        if ch.is_whitespace() || ch == ',' {
+            end = idx;
+            break;
+        }
+        if !(ch == '_' || ch == '$' || ch.is_ascii_alphanumeric()) {
+            return None;
+        }
+        end = idx + ch.len_utf8();
+    }
+
     Some((&s[..end], &s[end..]))
 }
 
@@ -2382,6 +2394,18 @@ mod tests {
         ));
         assert!(matches!(
             parse_command("NOTIFY updates_channel, $tag$unterminated"),
+            Err(ParseError::InvalidReset)
+        ));
+        assert!(matches!(
+            parse_command("NOTIFY ;"),
+            Err(ParseError::InvalidReset)
+        ));
+        assert!(matches!(
+            parse_command("LISTEN ;"),
+            Err(ParseError::InvalidReset)
+        ));
+        assert!(matches!(
+            parse_command("UNLISTEN @invalid"),
             Err(ParseError::InvalidReset)
         ));
         assert!(matches!(
