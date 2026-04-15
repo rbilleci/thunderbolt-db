@@ -915,7 +915,7 @@ fn parse_reset_command(input: &str) -> Option<Result<Command, ParseError>> {
         return Some(match rest {
             [target] if target.eq_ignore_ascii_case("ALL") => Ok(Command::ResetAll),
             [name]
-                if !name.is_empty()
+                if deallocate_target_is_valid(name)
                     && !name.eq_ignore_ascii_case("PREPARE")
                     && !name.eq_ignore_ascii_case("PREPARED") =>
             {
@@ -924,8 +924,7 @@ fn parse_reset_command(input: &str) -> Option<Result<Command, ParseError>> {
             [prepare, name]
                 if (prepare.eq_ignore_ascii_case("PREPARE")
                     || prepare.eq_ignore_ascii_case("PREPARED"))
-                    && !name.is_empty()
-                    && !name.chars().any(char::is_whitespace) =>
+                    && deallocate_target_is_valid(name) =>
             {
                 Ok(Command::ResetAll)
             }
@@ -1002,6 +1001,10 @@ fn parse_reset_command(input: &str) -> Option<Result<Command, ParseError>> {
     }
 
     None
+}
+
+fn deallocate_target_is_valid(target: &str) -> bool {
+    !target.is_empty() && !target.chars().any(char::is_whitespace) && !target.contains(',')
 }
 
 fn notify_payload_tokens_are_non_empty(tokens: &[&str]) -> bool {
@@ -2107,6 +2110,14 @@ mod tests {
         ));
         assert!(matches!(
             parse_command("DEALLOCATE PREPARED x y"),
+            Err(ParseError::InvalidReset)
+        ));
+        assert!(matches!(
+            parse_command("DEALLOCATE a,b"),
+            Err(ParseError::InvalidReset)
+        ));
+        assert!(matches!(
+            parse_command("DEALLOCATE PREPARE a,b"),
             Err(ParseError::InvalidReset)
         ));
         assert!(matches!(

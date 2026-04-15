@@ -3,6 +3,8 @@
 ## 2026-04-15
 
 ### Completed
+- Hardened `DEALLOCATE` reset-alias parsing to reject comma-delimited target fragments (`DEALLOCATE a,b`, `DEALLOCATE PREPARE a,b`) so malformed multi-target probes no longer slip through as valid `ResetAll` no-ops.
+- Added regression coverage for malformed comma-delimited `DEALLOCATE` forms to keep prepared-statement cleanup alias parsing deterministic.
 - Extended session-reset parser compatibility to accept `DEALLOCATE PREPARED name` as a `ResetAll` no-op alias alongside existing `DEALLOCATE PREPARE name` handling, reducing parser friction for PostgreSQL-style clients that emit the alternate prepared-statement cleanup keyword.
 - Added regression coverage for `DEALLOCATE PREPARED name` acceptance plus malformed-form rejection (`DEALLOCATE PREPARED`, extra-token variants) and updated reset-command error text to reflect the expanded deallocate alias contract.
 - Extended session-control parser compatibility to accept `CLOSE name` cursor cleanup probes as `ResetAll` no-op aliases (in addition to `CLOSE ALL`), reducing parser friction for PostgreSQL clients that explicitly close named cursors during reset flows.
