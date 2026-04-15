@@ -22,7 +22,7 @@ pub enum ParseError {
     InvalidDel,
     #[error("invalid GET syntax; expected: GET key")]
     InvalidGet,
-    #[error("invalid RESET/DISCARD/DEALLOCATE/CLOSE/LISTEN/NOTIFY/UNLISTEN syntax; expected: RESET ALL|ROLE|AUTHORIZATION|AUTH|SESSION AUTHORIZATION|SESSION AUTH, DISCARD {{ALL|TEMP|TEMPORARY|TEMP TABLES|TEMPORARY TABLES|PLANS|SEQUENCES}}, DEALLOCATE {{ALL|name|PREPARE name}}, CLOSE ALL, LISTEN channel, NOTIFY channel[, payload], or UNLISTEN [*|ALL|channel]")]
+    #[error("invalid RESET/DISCARD/DEALLOCATE/CLOSE/LISTEN/NOTIFY/UNLISTEN syntax; expected: RESET ALL|ROLE|AUTHORIZATION|AUTH|SESSION AUTHORIZATION|SESSION AUTH, DISCARD {{ALL|TEMP|TEMPORARY|TEMP TABLES|TEMPORARY TABLES|PLANS|SEQUENCES}}, DEALLOCATE {{ALL|name|PREPARE name}}, CLOSE {{ALL|name}}, LISTEN channel, NOTIFY channel[, payload], or UNLISTEN [*|ALL|channel]")]
     InvalidReset,
 }
 
@@ -931,6 +931,7 @@ fn parse_reset_command(input: &str) -> Option<Result<Command, ParseError>> {
     if first.eq_ignore_ascii_case("CLOSE") {
         return Some(match rest {
             [target] if target.eq_ignore_ascii_case("ALL") => Ok(Command::ResetAll),
+            [name] if !name.is_empty() && !name.contains(',') => Ok(Command::ResetAll),
             _ => Err(ParseError::InvalidReset),
         });
     }
@@ -1616,6 +1617,9 @@ mod tests {
         let cmd = parse_command("CLOSE ALL").unwrap();
         assert_eq!(cmd, Command::ResetAll);
 
+        let cmd = parse_command("CLOSE cursor_name").unwrap();
+        assert_eq!(cmd, Command::ResetAll);
+
         let cmd = parse_command("UNLISTEN").unwrap();
         assert_eq!(cmd, Command::ResetAll);
 
@@ -2094,7 +2098,7 @@ mod tests {
             Err(ParseError::InvalidReset)
         ));
         assert!(matches!(
-            parse_command("CLOSE cursor_name"),
+            parse_command("CLOSE cursor_name NOW"),
             Err(ParseError::InvalidReset)
         ));
         assert!(matches!(

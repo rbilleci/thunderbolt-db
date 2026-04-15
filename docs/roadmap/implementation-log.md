@@ -3,6 +3,8 @@
 ## 2026-04-15
 
 ### Completed
+- Extended session-control parser compatibility to accept `CLOSE name` cursor cleanup probes as `ResetAll` no-op aliases (in addition to `CLOSE ALL`), reducing parser friction for PostgreSQL clients that explicitly close named cursors during reset flows.
+- Added regression coverage for `CLOSE name` acceptance (including terminator handling) and malformed multi-token rejection (`CLOSE name NOW`), keeping no-op alias parsing deterministic.
 - Extended session-reset parser compatibility to accept `SET SESSION CHARACTERISTICS AS TRANSACTION ...` forms as `ResetAll` no-op aliases, reducing parser friction for PostgreSQL clients that emit transaction-default probes during session setup.
 - Added regression coverage for accepted `SET SESSION CHARACTERISTICS AS TRANSACTION ...` aliases plus malformed-form rejection when the transaction characteristics suffix is missing.
 - Hardened PostgreSQL session-control `NOTIFY` alias parsing to reject comma-only payload fragments (for example `NOTIFY channel, ,`), preventing malformed reset probes from being accepted as valid no-op aliases.
