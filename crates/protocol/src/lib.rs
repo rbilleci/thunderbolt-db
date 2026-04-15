@@ -22,7 +22,7 @@ pub enum ParseError {
     InvalidDel,
     #[error("invalid GET syntax; expected: GET key")]
     InvalidGet,
-    #[error("invalid RESET/DISCARD/DEALLOCATE/CLOSE/LISTEN/UNLISTEN syntax; expected: RESET ALL|ROLE|AUTHORIZATION|AUTH|SESSION AUTHORIZATION|SESSION AUTH, DISCARD {{ALL|TEMP|TEMPORARY|TEMP TABLES|TEMPORARY TABLES|PLANS|SEQUENCES}}, DEALLOCATE {{ALL|name|PREPARE name}}, CLOSE ALL, LISTEN channel, or UNLISTEN [*|ALL|channel]")]
+    #[error("invalid RESET/DISCARD/DEALLOCATE/CLOSE/LISTEN/NOTIFY/UNLISTEN syntax; expected: RESET ALL|ROLE|AUTHORIZATION|AUTH|SESSION AUTHORIZATION|SESSION AUTH, DISCARD {{ALL|TEMP|TEMPORARY|TEMP TABLES|TEMPORARY TABLES|PLANS|SEQUENCES}}, DEALLOCATE {{ALL|name|PREPARE name}}, CLOSE ALL, LISTEN channel, NOTIFY channel[, payload], or UNLISTEN [*|ALL|channel]")]
     InvalidReset,
 }
 
@@ -948,15 +948,24 @@ fn parse_reset_command(input: &str) -> Option<Result<Command, ParseError>> {
 
     if first.eq_ignore_ascii_case("LISTEN") {
         return Some(match rest {
-            [channel] if !channel.is_empty() => Ok(Command::ResetAll),
+            [channel] if !channel.is_empty() && !channel.contains(',') => Ok(Command::ResetAll),
             _ => Err(ParseError::InvalidReset),
         });
     }
 
     if first.eq_ignore_ascii_case("NOTIFY") {
         return Some(match rest {
-            [channel] if !channel.is_empty() => Ok(Command::ResetAll),
-            [channel_with_comma, _payload @ ..]
+            [channel] if !channel.is_empty() && !channel.contains(',') => Ok(Command::ResetAll),
+            [channel_and_payload]
+                if channel_and_payload
+                    .split_once(',')
+                    .is_some_and(|(channel, payload)| {
+                        !channel.trim().is_empty() && !payload.trim().is_empty()
+                    }) =>
+            {
+                Ok(Command::ResetAll)
+            }
+            [channel_with_comma, _first_payload, _rest @ ..]
                 if channel_with_comma.ends_with(',') && channel_with_comma.len() > 1 =>
             {
                 Ok(Command::ResetAll)
@@ -1579,6 +1588,9 @@ mod tests {
 
         let cmd = parse_command("NOTIFY updates_channel , 'hello'").unwrap();
         assert_eq!(cmd, Command::ResetAll);
+
+        let cmd = parse_command("NOTIFY updates_channel,'hello'").unwrap();
+        assert_eq!(cmd, Command::ResetAll);
     }
 
     #[test]
@@ -2053,6 +2065,10 @@ mod tests {
         ));
         assert!(matches!(
             parse_command("NOTIFY updates_channel ,"),
+            Err(ParseError::InvalidReset)
+        ));
+        assert!(matches!(
+            parse_command("NOTIFY updates_channel,"),
             Err(ParseError::InvalidReset)
         ));
         assert!(matches!(
