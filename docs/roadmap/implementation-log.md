@@ -20,6 +20,7 @@
 - Added regression coverage for malformed comma-only and double-comma `NOTIFY` payload variants to keep parser behavior deterministic.
 - Hardened `NOTIFY channel[, payload]` alias parsing to reject unquoted multi-fragment payload streams (`NOTIFY channel, payload, extra`) so malformed comma-delimited payload probes no longer pass as valid no-op resets.
 - Added regression coverage proving quoted payloads with embedded commas (for example JSON string payloads) remain accepted while multi-fragment payload forms are rejected deterministically.
+- Hardened `NOTIFY` alias payload validation to reject unterminated quoted payload fragments (for example `NOTIFY channel, 'unterminated`), preventing malformed quote state from being accepted as reset no-ops.
 
 ## 2026-04-14
 

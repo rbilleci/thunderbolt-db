@@ -1118,7 +1118,7 @@ fn notify_payload_fragment_is_non_empty(fragment: &str) -> bool {
         idx += 1;
     }
 
-    true
+    !(in_single_quote || in_double_quote)
 }
 
 fn split_set_key_value(rest: &str) -> Option<(&str, &str)> {
@@ -2327,6 +2327,10 @@ mod tests {
         ));
         assert!(matches!(
             parse_command("NOTIFY updates_channel, payload, extra"),
+            Err(ParseError::InvalidReset)
+        ));
+        assert!(matches!(
+            parse_command("NOTIFY updates_channel, 'unterminated"),
             Err(ParseError::InvalidReset)
         ));
         assert!(matches!(
