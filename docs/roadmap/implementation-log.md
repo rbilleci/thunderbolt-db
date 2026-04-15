@@ -3,6 +3,8 @@
 ## 2026-04-15
 
 ### Completed
+- Hardened `UNLISTEN` reset-alias parsing to reject comma-delimited channel fragments (`UNLISTEN a,b`) so malformed multi-target listener cleanup probes are no longer accepted as valid no-ops.
+- Added regression coverage for malformed comma-delimited `UNLISTEN` input to keep listener reset alias parsing deterministic.
 - Hardened `DEALLOCATE` reset-alias parsing to reject comma-delimited target fragments (`DEALLOCATE a,b`, `DEALLOCATE PREPARE a,b`) so malformed multi-target probes no longer slip through as valid `ResetAll` no-ops.
 - Added regression coverage for malformed comma-delimited `DEALLOCATE` forms to keep prepared-statement cleanup alias parsing deterministic.
 - Extended session-reset parser compatibility to accept `DEALLOCATE PREPARED name` as a `ResetAll` no-op alias alongside existing `DEALLOCATE PREPARE name` handling, reducing parser friction for PostgreSQL-style clients that emit the alternate prepared-statement cleanup keyword.

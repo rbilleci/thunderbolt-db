@@ -946,7 +946,7 @@ fn parse_reset_command(input: &str) -> Option<Result<Command, ParseError>> {
             [target] if *target == "*" || target.eq_ignore_ascii_case("ALL") => {
                 Ok(Command::ResetAll)
             }
-            [channel] if !channel.is_empty() => Ok(Command::ResetAll),
+            [channel] if !channel.is_empty() && !channel.contains(',') => Ok(Command::ResetAll),
             _ => Err(ParseError::InvalidReset),
         });
     }
@@ -2130,6 +2130,10 @@ mod tests {
         ));
         assert!(matches!(
             parse_command("UNLISTEN * NOW"),
+            Err(ParseError::InvalidReset)
+        ));
+        assert!(matches!(
+            parse_command("UNLISTEN a,b"),
             Err(ParseError::InvalidReset)
         ));
         assert!(matches!(
