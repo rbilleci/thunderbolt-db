@@ -1058,6 +1058,15 @@ fn parse_set_session_command(rest: &str) -> Option<Result<Command, ParseError>> 
         {
             Some(Ok(Command::ResetAll))
         }
+        [session, characteristics, as_kw, transaction, suffix @ ..]
+            if session.eq_ignore_ascii_case("SESSION")
+                && characteristics.eq_ignore_ascii_case("CHARACTERISTICS")
+                && as_kw.eq_ignore_ascii_case("AS")
+                && transaction.eq_ignore_ascii_case("TRANSACTION")
+                && !suffix.is_empty() =>
+        {
+            Some(Ok(Command::ResetAll))
+        }
         [role] if role.eq_ignore_ascii_case("ROLE") => Some(Err(ParseError::InvalidSet)),
         [session, authorization]
             if session.eq_ignore_ascii_case("SESSION")
@@ -1067,6 +1076,14 @@ fn parse_set_session_command(rest: &str) -> Option<Result<Command, ParseError>> 
         }
         [session, auth]
             if session.eq_ignore_ascii_case("SESSION") && auth.eq_ignore_ascii_case("AUTH") =>
+        {
+            Some(Err(ParseError::InvalidSet))
+        }
+        [session, characteristics, as_kw, transaction]
+            if session.eq_ignore_ascii_case("SESSION")
+                && characteristics.eq_ignore_ascii_case("CHARACTERISTICS")
+                && as_kw.eq_ignore_ascii_case("AS")
+                && transaction.eq_ignore_ascii_case("TRANSACTION") =>
         {
             Some(Err(ParseError::InvalidSet))
         }
@@ -1456,6 +1473,13 @@ mod tests {
         );
         assert_eq!(
             parse_command("SET SESSION AUTH postgres").unwrap(),
+            Command::ResetAll
+        );
+        assert_eq!(
+            parse_command(
+                "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED"
+            )
+            .unwrap(),
             Command::ResetAll
         );
     }
@@ -2133,6 +2157,10 @@ mod tests {
             parse_command("SET SESSION AUTH"),
             Err(ParseError::InvalidSet)
         ));
+        assert!(matches!(
+            parse_command("SET SESSION CHARACTERISTICS AS TRANSACTION"),
+            Err(ParseError::InvalidSet)
+        ));
     }
 
     #[test]
@@ -2197,6 +2225,10 @@ mod tests {
         );
         assert_eq!(
             parse_command("SET SESSION AUTHORIZATION DEFAULT;\n").unwrap(),
+            Command::ResetAll
+        );
+        assert_eq!(
+            parse_command("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY;\n").unwrap(),
             Command::ResetAll
         );
         assert_eq!(
