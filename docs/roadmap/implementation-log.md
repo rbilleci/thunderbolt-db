@@ -3,6 +3,8 @@
 ## 2026-04-15
 
 ### Completed
+- Extended session-control parser compatibility to accept quoted identifier channel aliases in `LISTEN`/`UNLISTEN`/`NOTIFY` reset no-op forms (including quoted names with spaces and embedded commas), reducing parser friction for PostgreSQL clients that emit quoted pub/sub names during bootstrap/reset flows.
+- Added regression coverage for quoted channel acceptance plus unterminated-quoted identifier rejection and retained strict malformed comma validation for `NOTIFY` payload forms.
 - Hardened `UNLISTEN` reset-alias parsing to reject comma-delimited channel fragments (`UNLISTEN a,b`) so malformed multi-target listener cleanup probes are no longer accepted as valid no-ops.
 - Added regression coverage for malformed comma-delimited `UNLISTEN` input to keep listener reset alias parsing deterministic.
 - Hardened `DEALLOCATE` reset-alias parsing to reject comma-delimited target fragments (`DEALLOCATE a,b`, `DEALLOCATE PREPARE a,b`) so malformed multi-target probes no longer slip through as valid `ResetAll` no-ops.

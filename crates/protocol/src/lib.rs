@@ -941,77 +941,103 @@ fn parse_reset_command(input: &str) -> Option<Result<Command, ParseError>> {
     }
 
     if first.eq_ignore_ascii_case("UNLISTEN") {
-        return Some(match rest {
-            [] => Ok(Command::ResetAll),
-            [target] if *target == "*" || target.eq_ignore_ascii_case("ALL") => {
+        let Some(rest) = strip_keyword_prefix_case_insensitive(input, "UNLISTEN") else {
+            return Some(Err(ParseError::InvalidReset));
+        };
+        let rest = rest.trim();
+        if rest.is_empty() || rest == "*" || rest.eq_ignore_ascii_case("ALL") {
+            return Some(Ok(Command::ResetAll));
+        }
+        return Some(
+            if parse_reset_identifier(rest).is_some_and(|(_, tail)| tail.trim().is_empty()) {
                 Ok(Command::ResetAll)
-            }
-            [channel] if !channel.is_empty() && !channel.contains(',') => Ok(Command::ResetAll),
-            _ => Err(ParseError::InvalidReset),
-        });
+            } else {
+                Err(ParseError::InvalidReset)
+            },
+        );
     }
 
     if first.eq_ignore_ascii_case("LISTEN") {
-        return Some(match rest {
-            [channel] if !channel.is_empty() && !channel.contains(',') => Ok(Command::ResetAll),
-            _ => Err(ParseError::InvalidReset),
-        });
+        let Some(rest) = strip_keyword_prefix_case_insensitive(input, "LISTEN") else {
+            return Some(Err(ParseError::InvalidReset));
+        };
+        return Some(
+            if parse_reset_identifier(rest.trim()).is_some_and(|(_, tail)| tail.trim().is_empty()) {
+                Ok(Command::ResetAll)
+            } else {
+                Err(ParseError::InvalidReset)
+            },
+        );
     }
 
     if first.eq_ignore_ascii_case("NOTIFY") {
-        return Some(match rest {
-            [channel] if !channel.is_empty() && !channel.contains(',') => Ok(Command::ResetAll),
-            [channel_and_payload]
-                if channel_and_payload
-                    .split_once(',')
-                    .is_some_and(|(channel, payload)| {
-                        !channel.trim().is_empty()
-                            && !payload.trim_start().starts_with(',')
-                            && notify_payload_fragment_is_non_empty(payload)
-                    }) =>
-            {
+        let Some(raw_rest) = strip_keyword_prefix_case_insensitive(input, "NOTIFY") else {
+            return Some(Err(ParseError::InvalidReset));
+        };
+        let Some((_, tail_after_channel)) = parse_reset_identifier(raw_rest.trim_start()) else {
+            return Some(Err(ParseError::InvalidReset));
+        };
+        let tail_after_channel = tail_after_channel.trim_start();
+        if tail_after_channel.is_empty() {
+            return Some(Ok(Command::ResetAll));
+        }
+        let Some(payload) = tail_after_channel.strip_prefix(',') else {
+            return Some(Err(ParseError::InvalidReset));
+        };
+        let payload = payload.trim_start();
+        return Some(
+            if !payload.starts_with(',') && notify_payload_fragment_is_non_empty(payload) {
                 Ok(Command::ResetAll)
-            }
-            [channel_with_comma, payload @ ..]
-                if channel_with_comma.ends_with(',')
-                    && channel_with_comma.len() > 1
-                    && !channel_with_comma[..channel_with_comma.len() - 1]
-                        .trim_end()
-                        .ends_with(',')
-                    && notify_payload_tokens_are_non_empty(payload) =>
-            {
-                Ok(Command::ResetAll)
-            }
-            [channel, payload_with_leading_comma]
-                if !channel.is_empty()
-                    && payload_with_leading_comma.starts_with(',')
-                    && notify_payload_fragment_is_non_empty(&payload_with_leading_comma[1..]) =>
-            {
-                Ok(Command::ResetAll)
-            }
-            [channel, comma, payload @ ..]
-                if !channel.is_empty()
-                    && *comma == ","
-                    && notify_payload_tokens_are_non_empty(payload) =>
-            {
-                Ok(Command::ResetAll)
-            }
-            _ => Err(ParseError::InvalidReset),
-        });
+            } else {
+                Err(ParseError::InvalidReset)
+            },
+        );
     }
 
     None
 }
 
-fn deallocate_target_is_valid(target: &str) -> bool {
-    !target.is_empty() && !target.chars().any(char::is_whitespace) && !target.contains(',')
+fn strip_keyword_prefix_case_insensitive<'a>(input: &'a str, keyword: &str) -> Option<&'a str> {
+    if input.len() < keyword.len() || !input[..keyword.len()].eq_ignore_ascii_case(keyword) {
+        return None;
+    }
+    Some(&input[keyword.len()..])
 }
 
-fn notify_payload_tokens_are_non_empty(tokens: &[&str]) -> bool {
-    !tokens.is_empty()
-        && tokens
-            .iter()
-            .any(|token| notify_payload_fragment_is_non_empty(token))
+fn parse_reset_identifier(input: &str) -> Option<(&str, &str)> {
+    let s = input.trim_start();
+    if s.is_empty() {
+        return None;
+    }
+
+    if s.starts_with('"') {
+        let bytes = s.as_bytes();
+        let mut i = 1;
+        while i < bytes.len() {
+            if bytes[i] == b'"' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                    i += 2;
+                    continue;
+                }
+                let end = i + 1;
+                return Some((&s[..end], &s[end..]));
+            }
+            i += 1;
+        }
+        return None;
+    }
+
+    let end = s
+        .find(|c: char| c.is_whitespace() || c == ',')
+        .unwrap_or(s.len());
+    if end == 0 {
+        return None;
+    }
+    Some((&s[..end], &s[end..]))
+}
+
+fn deallocate_target_is_valid(target: &str) -> bool {
+    !target.is_empty() && !target.chars().any(char::is_whitespace) && !target.contains(',')
 }
 
 fn notify_payload_fragment_is_non_empty(fragment: &str) -> bool {
@@ -1643,10 +1669,25 @@ mod tests {
         let cmd = parse_command("UNLISTEN updates_channel").unwrap();
         assert_eq!(cmd, Command::ResetAll);
 
+        let cmd = parse_command("UNLISTEN \"updates channel\"").unwrap();
+        assert_eq!(cmd, Command::ResetAll);
+
+        let cmd = parse_command("UNLISTEN \"updates,channel\"").unwrap();
+        assert_eq!(cmd, Command::ResetAll);
+
         let cmd = parse_command("LISTEN updates_channel").unwrap();
         assert_eq!(cmd, Command::ResetAll);
 
+        let cmd = parse_command("LISTEN \"updates channel\"").unwrap();
+        assert_eq!(cmd, Command::ResetAll);
+
         let cmd = parse_command("NOTIFY updates_channel").unwrap();
+        assert_eq!(cmd, Command::ResetAll);
+
+        let cmd = parse_command("NOTIFY \"updates channel\"").unwrap();
+        assert_eq!(cmd, Command::ResetAll);
+
+        let cmd = parse_command("NOTIFY \"updates,channel\", 'hello'").unwrap();
         assert_eq!(cmd, Command::ResetAll);
 
         let cmd = parse_command("NOTIFY updates_channel, 'hello'").unwrap();
@@ -2137,6 +2178,10 @@ mod tests {
             Err(ParseError::InvalidReset)
         ));
         assert!(matches!(
+            parse_command("UNLISTEN \"updates channel"),
+            Err(ParseError::InvalidReset)
+        ));
+        assert!(matches!(
             parse_command("LISTEN"),
             Err(ParseError::InvalidReset)
         ));
@@ -2178,6 +2223,10 @@ mod tests {
         ));
         assert!(matches!(
             parse_command("NOTIFY updates_channel,, payload"),
+            Err(ParseError::InvalidReset)
+        ));
+        assert!(matches!(
+            parse_command("NOTIFY \"updates channel"),
             Err(ParseError::InvalidReset)
         ));
         assert!(matches!(
