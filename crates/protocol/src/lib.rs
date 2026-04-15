@@ -960,25 +960,29 @@ fn parse_reset_command(input: &str) -> Option<Result<Command, ParseError>> {
                 if channel_and_payload
                     .split_once(',')
                     .is_some_and(|(channel, payload)| {
-                        !channel.trim().is_empty() && !payload.trim().is_empty()
+                        !channel.trim().is_empty() && notify_payload_fragment_is_non_empty(payload)
                     }) =>
             {
                 Ok(Command::ResetAll)
             }
-            [channel_with_comma, _first_payload, _rest @ ..]
-                if channel_with_comma.ends_with(',') && channel_with_comma.len() > 1 =>
+            [channel_with_comma, payload @ ..]
+                if channel_with_comma.ends_with(',')
+                    && channel_with_comma.len() > 1
+                    && notify_payload_tokens_are_non_empty(payload) =>
             {
                 Ok(Command::ResetAll)
             }
             [channel, payload_with_leading_comma]
                 if !channel.is_empty()
                     && payload_with_leading_comma.starts_with(',')
-                    && !payload_with_leading_comma[1..].trim().is_empty() =>
+                    && notify_payload_fragment_is_non_empty(&payload_with_leading_comma[1..]) =>
             {
                 Ok(Command::ResetAll)
             }
             [channel, comma, payload @ ..]
-                if !channel.is_empty() && *comma == "," && !payload.is_empty() =>
+                if !channel.is_empty()
+                    && *comma == ","
+                    && notify_payload_tokens_are_non_empty(payload) =>
             {
                 Ok(Command::ResetAll)
             }
@@ -987,6 +991,17 @@ fn parse_reset_command(input: &str) -> Option<Result<Command, ParseError>> {
     }
 
     None
+}
+
+fn notify_payload_tokens_are_non_empty(tokens: &[&str]) -> bool {
+    !tokens.is_empty()
+        && tokens
+            .iter()
+            .any(|token| notify_payload_fragment_is_non_empty(token))
+}
+
+fn notify_payload_fragment_is_non_empty(fragment: &str) -> bool {
+    !fragment.trim().trim_matches(',').trim().is_empty()
 }
 
 fn split_set_key_value(rest: &str) -> Option<(&str, &str)> {
@@ -2079,6 +2094,18 @@ mod tests {
         ));
         assert!(matches!(
             parse_command("NOTIFY updates_channel,"),
+            Err(ParseError::InvalidReset)
+        ));
+        assert!(matches!(
+            parse_command("NOTIFY updates_channel, ,"),
+            Err(ParseError::InvalidReset)
+        ));
+        assert!(matches!(
+            parse_command("NOTIFY updates_channel , ,"),
+            Err(ParseError::InvalidReset)
+        ));
+        assert!(matches!(
+            parse_command("NOTIFY updates_channel, , ,"),
             Err(ParseError::InvalidReset)
         ));
         assert!(matches!(
