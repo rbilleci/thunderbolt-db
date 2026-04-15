@@ -1073,7 +1073,52 @@ fn parse_reset_identifier(input: &str) -> Option<(&str, &str)> {
 }
 
 fn notify_payload_fragment_is_non_empty(fragment: &str) -> bool {
-    !fragment.trim().trim_matches(',').trim().is_empty()
+    let trimmed = fragment.trim();
+    if trimmed.is_empty() || trimmed.trim_matches(',').trim().is_empty() {
+        return false;
+    }
+
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let chars: Vec<char> = trimmed.chars().collect();
+    let mut idx = 0;
+
+    while idx < chars.len() {
+        let ch = chars[idx];
+        if in_single_quote {
+            if ch == '\'' {
+                if idx + 1 < chars.len() && chars[idx + 1] == '\'' {
+                    idx += 2;
+                    continue;
+                }
+                in_single_quote = false;
+            }
+            idx += 1;
+            continue;
+        }
+
+        if in_double_quote {
+            if ch == '"' {
+                if idx + 1 < chars.len() && chars[idx + 1] == '"' {
+                    idx += 2;
+                    continue;
+                }
+                in_double_quote = false;
+            }
+            idx += 1;
+            continue;
+        }
+
+        match ch {
+            '\'' => in_single_quote = true,
+            '"' => in_double_quote = true,
+            ',' => return false,
+            _ => {}
+        }
+        idx += 1;
+    }
+
+    true
 }
 
 fn split_set_key_value(rest: &str) -> Option<(&str, &str)> {
@@ -1745,6 +1790,9 @@ mod tests {
 
         let cmd = parse_command("NOTIFY updates_channel ,'{\"ok\":true}'").unwrap();
         assert_eq!(cmd, Command::ResetAll);
+
+        let cmd = parse_command("NOTIFY updates_channel, '{\"ok\":true,\"n\":1}'").unwrap();
+        assert_eq!(cmd, Command::ResetAll);
     }
 
     #[test]
@@ -2275,6 +2323,10 @@ mod tests {
         ));
         assert!(matches!(
             parse_command("NOTIFY updates_channel,, payload"),
+            Err(ParseError::InvalidReset)
+        ));
+        assert!(matches!(
+            parse_command("NOTIFY updates_channel, payload, extra"),
             Err(ParseError::InvalidReset)
         ));
         assert!(matches!(
