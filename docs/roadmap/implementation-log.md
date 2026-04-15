@@ -1,5 +1,12 @@
 # Implementation Log (Pre-NVIDIA Phase)
 
+## 2026-04-15
+
+### Completed
+- Hardened PostgreSQL session-control `NOTIFY` alias parsing to reject comma-only payload fragments (for example `NOTIFY channel, ,`), preventing malformed reset probes from being accepted as valid no-op aliases.
+- Tightened compact `NOTIFY channel,payload` parsing to reject malformed double-comma forms (`NOTIFY channel,,payload` / `NOTIFY channel,, payload`) while preserving accepted single-comma payload aliases.
+- Added regression coverage for malformed comma-only and double-comma `NOTIFY` payload variants to keep parser behavior deterministic.
+
 ## 2026-04-14
 
 ### Completed
