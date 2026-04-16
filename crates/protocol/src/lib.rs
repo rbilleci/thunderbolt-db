@@ -1724,6 +1724,10 @@ mod tests {
             Command::ResetAll
         );
         assert_eq!(
+            parse_command("SET ROLE \"\"\"quoted\"\" role\"").unwrap(),
+            Command::ResetAll
+        );
+        assert_eq!(
             parse_command("SET SESSION AUTHORIZATION DEFAULT").unwrap(),
             Command::ResetAll
         );
@@ -1912,6 +1916,9 @@ mod tests {
         assert_eq!(cmd, Command::ResetAll);
 
         let cmd = parse_command("CLOSE \"cursor\"\"name\"").unwrap();
+        assert_eq!(cmd, Command::ResetAll);
+
+        let cmd = parse_command("CLOSE \"\"\"quoted\"\" cursor\"").unwrap();
         assert_eq!(cmd, Command::ResetAll);
 
         let cmd = parse_command("UNLISTEN").unwrap();
