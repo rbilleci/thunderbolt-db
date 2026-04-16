@@ -4,6 +4,8 @@
 
 ### Completed
 - Added regression coverage for escaped-double-quote quoted identifiers across session-control no-op aliases (`CLOSE`, `UNLISTEN`, `LISTEN`, `NOTIFY`), proving parser acceptance for PostgreSQL-style quoted names like `"updates""channel"` without relaxing malformed syntax checks.
+- Extended `SET` session-reset alias parsing to accept identifier and quoted-identifier role/auth targets (`SET ROLE app_role`, `SET ROLE "app role"`, `SET SESSION AUTHORIZATION "app user"`, `SET SESSION AUTH "app user"`) as `ResetAll` no-op aliases, reducing parser friction for PostgreSQL clients that emit quoted principals in reset flows.
+- Added regression coverage proving quoted role/auth targets are accepted and unterminated quoted targets are still rejected with `InvalidSet`, keeping reset alias parsing deterministic.
 
 ## 2026-04-15
 

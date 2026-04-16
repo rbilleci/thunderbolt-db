@@ -1202,61 +1202,77 @@ fn split_set_key_value(rest: &str) -> Option<(&str, &str)> {
 }
 
 fn parse_set_session_command(rest: &str) -> Option<Result<Command, ParseError>> {
-    let tokens: Vec<_> = rest.split_whitespace().collect();
-
-    match tokens.as_slice() {
-        [role, target]
-            if role.eq_ignore_ascii_case("ROLE")
-                && (target.eq_ignore_ascii_case("NONE")
-                    || target.eq_ignore_ascii_case("DEFAULT")) =>
-        {
-            Some(Ok(Command::ResetAll))
-        }
-        [session, authorization, target]
-            if session.eq_ignore_ascii_case("SESSION")
-                && authorization.eq_ignore_ascii_case("AUTHORIZATION")
-                && !target.is_empty() =>
-        {
-            Some(Ok(Command::ResetAll))
-        }
-        [session, auth, target]
-            if session.eq_ignore_ascii_case("SESSION")
-                && auth.eq_ignore_ascii_case("AUTH")
-                && !target.is_empty() =>
-        {
-            Some(Ok(Command::ResetAll))
-        }
-        [session, characteristics, as_kw, transaction, suffix @ ..]
-            if session.eq_ignore_ascii_case("SESSION")
-                && characteristics.eq_ignore_ascii_case("CHARACTERISTICS")
-                && as_kw.eq_ignore_ascii_case("AS")
-                && transaction.eq_ignore_ascii_case("TRANSACTION")
-                && !suffix.is_empty() =>
-        {
-            Some(Ok(Command::ResetAll))
-        }
-        [role] if role.eq_ignore_ascii_case("ROLE") => Some(Err(ParseError::InvalidSet)),
-        [session, authorization]
-            if session.eq_ignore_ascii_case("SESSION")
-                && authorization.eq_ignore_ascii_case("AUTHORIZATION") =>
-        {
-            Some(Err(ParseError::InvalidSet))
-        }
-        [session, auth]
-            if session.eq_ignore_ascii_case("SESSION") && auth.eq_ignore_ascii_case("AUTH") =>
-        {
-            Some(Err(ParseError::InvalidSet))
-        }
-        [session, characteristics, as_kw, transaction]
-            if session.eq_ignore_ascii_case("SESSION")
-                && characteristics.eq_ignore_ascii_case("CHARACTERISTICS")
-                && as_kw.eq_ignore_ascii_case("AS")
-                && transaction.eq_ignore_ascii_case("TRANSACTION") =>
-        {
-            Some(Err(ParseError::InvalidSet))
-        }
-        _ => None,
+    if let Some(after_role) = strip_keyword_prefix_case_insensitive(rest, "ROLE") {
+        let tail = after_role.trim_start();
+        return Some(
+            if tail.eq_ignore_ascii_case("NONE")
+                || tail.eq_ignore_ascii_case("DEFAULT")
+                || parse_reset_identifier(tail)
+                    .is_some_and(|(_, trailing)| trailing.trim().is_empty())
+            {
+                Ok(Command::ResetAll)
+            } else {
+                Err(ParseError::InvalidSet)
+            },
+        );
     }
+
+    if let Some(after_session) = strip_keyword_prefix_case_insensitive(rest, "SESSION") {
+        let after_session = after_session.trim_start();
+
+        if let Some(after_authorization) =
+            strip_keyword_prefix_case_insensitive(after_session, "AUTHORIZATION")
+        {
+            let tail = after_authorization.trim_start();
+            return Some(
+                if parse_reset_identifier(tail)
+                    .is_some_and(|(_, trailing)| trailing.trim().is_empty())
+                {
+                    Ok(Command::ResetAll)
+                } else {
+                    Err(ParseError::InvalidSet)
+                },
+            );
+        }
+
+        if let Some(after_auth) = strip_keyword_prefix_case_insensitive(after_session, "AUTH") {
+            let tail = after_auth.trim_start();
+            return Some(
+                if parse_reset_identifier(tail)
+                    .is_some_and(|(_, trailing)| trailing.trim().is_empty())
+                {
+                    Ok(Command::ResetAll)
+                } else {
+                    Err(ParseError::InvalidSet)
+                },
+            );
+        }
+
+        if let Some(after_characteristics) =
+            strip_keyword_prefix_case_insensitive(after_session, "CHARACTERISTICS")
+        {
+            let after_characteristics = after_characteristics.trim_start();
+            if let Some(after_as) =
+                strip_keyword_prefix_case_insensitive(after_characteristics, "AS")
+            {
+                let after_as = after_as.trim_start();
+                if let Some(after_transaction) =
+                    strip_keyword_prefix_case_insensitive(after_as, "TRANSACTION")
+                {
+                    return Some(if after_transaction.trim().is_empty() {
+                        Err(ParseError::InvalidSet)
+                    } else {
+                        Ok(Command::ResetAll)
+                    });
+                }
+            }
+            return Some(Err(ParseError::InvalidSet));
+        }
+
+        return Some(Err(ParseError::InvalidSet));
+    }
+
+    None
 }
 
 fn is_isolation_level_suffix(tokens: &[&str]) -> bool {
@@ -1636,11 +1652,27 @@ mod tests {
             Command::ResetAll
         );
         assert_eq!(
+            parse_command("SET ROLE app_role").unwrap(),
+            Command::ResetAll
+        );
+        assert_eq!(
+            parse_command("SET ROLE \"app role\"").unwrap(),
+            Command::ResetAll
+        );
+        assert_eq!(
             parse_command("SET SESSION AUTHORIZATION DEFAULT").unwrap(),
             Command::ResetAll
         );
         assert_eq!(
             parse_command("SET SESSION AUTH postgres").unwrap(),
+            Command::ResetAll
+        );
+        assert_eq!(
+            parse_command("SET SESSION AUTHORIZATION \"app user\"").unwrap(),
+            Command::ResetAll
+        );
+        assert_eq!(
+            parse_command("SET SESSION AUTH \"app user\"").unwrap(),
             Command::ResetAll
         );
         assert_eq!(
@@ -2445,6 +2477,14 @@ mod tests {
         ));
         assert!(matches!(
             parse_command("SET SESSION AUTH"),
+            Err(ParseError::InvalidSet)
+        ));
+        assert!(matches!(
+            parse_command("SET ROLE \"unterminated"),
+            Err(ParseError::InvalidSet)
+        ));
+        assert!(matches!(
+            parse_command("SET SESSION AUTHORIZATION \"unterminated"),
             Err(ParseError::InvalidSet)
         ));
         assert!(matches!(
