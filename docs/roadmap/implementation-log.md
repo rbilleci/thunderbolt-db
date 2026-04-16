@@ -3,6 +3,8 @@
 ## 2026-04-16
 
 ### Completed
+- Extended reset-command compatibility to accept `RESET SESSION AUTHORIZATION DEFAULT` and `RESET SESSION AUTH DEFAULT` as `ResetAll` no-op aliases, reducing parser friction for PostgreSQL-compatible clients/proxies that emit explicit default-reset variants during session bootstrap/cleanup flows.
+- Added regression coverage for the new `RESET SESSION AUTH* DEFAULT` aliases (including statement terminators) and malformed extra-token rejection, keeping reset-command parsing deterministic.
 - Added regression coverage for escaped-double-quote quoted identifiers across session-control no-op aliases (`CLOSE`, `UNLISTEN`, `LISTEN`, `NOTIFY`), proving parser acceptance for PostgreSQL-style quoted names like `"updates""channel"` without relaxing malformed syntax checks.
 - Added `NOTIFY channel, "payload"` regression coverage for double-quoted payload fragments (including embedded escaped quotes and commas) plus malformed unterminated double-quote rejection, hardening parser stability without relaxing strict malformed payload checks.
 - Hardened quoted-identifier parsing for reset/session-control aliases to reject zero-length delimited identifiers (`""`) across `DEALLOCATE`/`CLOSE`/`LISTEN`/`UNLISTEN`/`NOTIFY` and `SET ROLE`, with regression coverage proving malformed empty-quoted forms are rejected deterministically.
