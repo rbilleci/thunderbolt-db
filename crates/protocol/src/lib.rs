@@ -1217,6 +1217,17 @@ fn parse_set_session_command(rest: &str) -> Option<Result<Command, ParseError>> 
         );
     }
 
+    if let Some(after_transaction) = strip_keyword_prefix_case_insensitive(rest, "TRANSACTION") {
+        let tail = after_transaction.trim_start();
+        return Some(
+            if !tail.is_empty() && is_begin_mode_list(&normalize_begin_tokens(tail)) {
+                Ok(Command::ResetAll)
+            } else {
+                Err(ParseError::InvalidSet)
+            },
+        );
+    }
+
     if let Some(after_session) = strip_keyword_prefix_case_insensitive(rest, "SESSION") {
         let after_session = after_session.trim_start();
 
@@ -1259,11 +1270,14 @@ fn parse_set_session_command(rest: &str) -> Option<Result<Command, ParseError>> 
                 if let Some(after_transaction) =
                     strip_keyword_prefix_case_insensitive(after_as, "TRANSACTION")
                 {
-                    return Some(if after_transaction.trim().is_empty() {
-                        Err(ParseError::InvalidSet)
-                    } else {
-                        Ok(Command::ResetAll)
-                    });
+                    let tail = after_transaction.trim_start();
+                    return Some(
+                        if !tail.is_empty() && is_begin_mode_list(&normalize_begin_tokens(tail)) {
+                            Ok(Command::ResetAll)
+                        } else {
+                            Err(ParseError::InvalidSet)
+                        },
+                    );
                 }
             }
             return Some(Err(ParseError::InvalidSet));
@@ -1680,6 +1694,19 @@ mod tests {
                 "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED"
             )
             .unwrap(),
+            Command::ResetAll
+        );
+        assert_eq!(
+            parse_command("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ").unwrap(),
+            Command::ResetAll
+        );
+        assert_eq!(
+            parse_command("SET TRANSACTION READ ONLY, DEFERRABLE").unwrap(),
+            Command::ResetAll
+        );
+        assert_eq!(
+            parse_command("SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE, NOT DEFERRABLE")
+                .unwrap(),
             Command::ResetAll
         );
     }
@@ -2488,7 +2515,23 @@ mod tests {
             Err(ParseError::InvalidSet)
         ));
         assert!(matches!(
+            parse_command("SET TRANSACTION"),
+            Err(ParseError::InvalidSet)
+        ));
+        assert!(matches!(
+            parse_command("SET TRANSACTION NOW"),
+            Err(ParseError::InvalidSet)
+        ));
+        assert!(matches!(
+            parse_command("SET TRANSACTION READ ONLY, READ WRITE"),
+            Err(ParseError::InvalidSet)
+        ));
+        assert!(matches!(
             parse_command("SET SESSION CHARACTERISTICS AS TRANSACTION"),
+            Err(ParseError::InvalidSet)
+        ));
+        assert!(matches!(
+            parse_command("SET SESSION CHARACTERISTICS AS TRANSACTION NOW"),
             Err(ParseError::InvalidSet)
         ));
     }
@@ -2555,6 +2598,10 @@ mod tests {
         );
         assert_eq!(
             parse_command("SET SESSION AUTHORIZATION DEFAULT;\n").unwrap(),
+            Command::ResetAll
+        );
+        assert_eq!(
+            parse_command("SET TRANSACTION READ ONLY;\n").unwrap(),
             Command::ResetAll
         );
         assert_eq!(
