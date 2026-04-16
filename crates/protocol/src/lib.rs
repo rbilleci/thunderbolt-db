@@ -1973,6 +1973,12 @@ mod tests {
 
         let cmd = parse_command("NOTIFY updates_channel, $tag$hello,world$tag$").unwrap();
         assert_eq!(cmd, Command::ResetAll);
+
+        let cmd = parse_command("NOTIFY updates_channel, \"hello,world\"").unwrap();
+        assert_eq!(cmd, Command::ResetAll);
+
+        let cmd = parse_command("NOTIFY updates_channel, \"hello\"\"world\"").unwrap();
+        assert_eq!(cmd, Command::ResetAll);
     }
 
     #[test]
@@ -2515,6 +2521,10 @@ mod tests {
         ));
         assert!(matches!(
             parse_command("NOTIFY updates_channel, 'unterminated"),
+            Err(ParseError::InvalidReset)
+        ));
+        assert!(matches!(
+            parse_command("NOTIFY updates_channel, \"unterminated"),
             Err(ParseError::InvalidReset)
         ));
         assert!(matches!(
