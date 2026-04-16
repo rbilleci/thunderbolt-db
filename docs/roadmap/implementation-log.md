@@ -1,5 +1,10 @@
 # Implementation Log (Pre-NVIDIA Phase)
 
+## 2026-04-16
+
+### Completed
+- Added regression coverage for escaped-double-quote quoted identifiers across session-control no-op aliases (`CLOSE`, `UNLISTEN`, `LISTEN`, `NOTIFY`), proving parser acceptance for PostgreSQL-style quoted names like `"updates""channel"` without relaxing malformed syntax checks.
+
 ## 2026-04-15
 
 ### Completed
