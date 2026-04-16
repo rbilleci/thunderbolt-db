@@ -1201,6 +1201,15 @@ fn split_set_key_value(rest: &str) -> Option<(&str, &str)> {
     Some((key, remainder.trim_start()))
 }
 
+fn strip_set_scope_prefix<'a>(input: &'a str, scope: &str) -> Option<&'a str> {
+    let trimmed = input.trim_start();
+    let after_scope = strip_keyword_prefix_case_insensitive(trimmed, scope)?;
+    if after_scope.trim().is_empty() {
+        return None;
+    }
+    Some(after_scope.trim_start())
+}
+
 fn parse_set_session_command(rest: &str) -> Option<Result<Command, ParseError>> {
     if let Some(after_role) = strip_keyword_prefix_case_insensitive(rest, "ROLE") {
         let tail = after_role.trim_start();
@@ -1283,7 +1292,7 @@ fn parse_set_session_command(rest: &str) -> Option<Result<Command, ParseError>> 
             return Some(Err(ParseError::InvalidSet));
         }
 
-        return Some(Err(ParseError::InvalidSet));
+        return None;
     }
 
     None
@@ -1535,7 +1544,11 @@ pub fn parse_command(input: &str) -> Result<Command, ParseError> {
             if let Some(alias) = parse_set_session_command(rest) {
                 return alias;
             }
-            let Some((k, v)) = split_set_key_value(rest) else {
+
+            let assignment_rest = strip_set_scope_prefix(rest, "LOCAL")
+                .or_else(|| strip_set_scope_prefix(rest, "SESSION"))
+                .unwrap_or(rest);
+            let Some((k, v)) = split_set_key_value(assignment_rest) else {
                 return Err(ParseError::InvalidSet);
             };
             let key = k.trim();
@@ -1654,6 +1667,36 @@ mod tests {
             Command::SetKv {
                 key: "alpha".into(),
                 value: "value words".into()
+            }
+        );
+    }
+
+    #[test]
+    fn parses_set_with_session_or_local_scope_aliases() {
+        let cmd = parse_command("SET LOCAL a = 42").unwrap();
+        assert_eq!(
+            cmd,
+            Command::SetKv {
+                key: "a".into(),
+                value: "42".into()
+            }
+        );
+
+        let cmd = parse_command("SET SESSION a TO 42").unwrap();
+        assert_eq!(
+            cmd,
+            Command::SetKv {
+                key: "a".into(),
+                value: "42".into()
+            }
+        );
+
+        let cmd = parse_command("SET SESSION statement_timeout = 5s").unwrap();
+        assert_eq!(
+            cmd,
+            Command::SetKv {
+                key: "statement_timeout".into(),
+                value: "5s".into()
             }
         );
     }
