@@ -1226,6 +1226,42 @@ fn strip_set_scope_prefix<'a>(input: &'a str, scope: &str) -> Option<&'a str> {
 }
 
 fn parse_set_session_command(rest: &str) -> Option<Result<Command, ParseError>> {
+    if let Some(after_local) = strip_keyword_prefix_case_insensitive(rest, "LOCAL") {
+        let after_local = after_local.trim_start();
+        if let Some(after_role) = strip_keyword_prefix_case_insensitive(after_local, "ROLE") {
+            let tail = after_role.trim_start();
+            return Some(
+                if tail.eq_ignore_ascii_case("NONE")
+                    || tail.eq_ignore_ascii_case("DEFAULT")
+                    || parse_reset_identifier(tail)
+                        .is_some_and(|(_, trailing)| trailing.trim().is_empty())
+                {
+                    Ok(Command::ResetAll)
+                } else {
+                    Err(ParseError::InvalidSet)
+                },
+            );
+        }
+    }
+
+    if let Some(after_session) = strip_keyword_prefix_case_insensitive(rest, "SESSION") {
+        let after_session = after_session.trim_start();
+        if let Some(after_role) = strip_keyword_prefix_case_insensitive(after_session, "ROLE") {
+            let tail = after_role.trim_start();
+            return Some(
+                if tail.eq_ignore_ascii_case("NONE")
+                    || tail.eq_ignore_ascii_case("DEFAULT")
+                    || parse_reset_identifier(tail)
+                        .is_some_and(|(_, trailing)| trailing.trim().is_empty())
+                {
+                    Ok(Command::ResetAll)
+                } else {
+                    Err(ParseError::InvalidSet)
+                },
+            );
+        }
+    }
+
     if let Some(after_role) = strip_keyword_prefix_case_insensitive(rest, "ROLE") {
         let tail = after_role.trim_start();
         return Some(
@@ -1733,6 +1769,22 @@ mod tests {
         );
         assert_eq!(
             parse_command("SET ROLE \"\"\"quoted\"\" role\"").unwrap(),
+            Command::ResetAll
+        );
+        assert_eq!(
+            parse_command("SET SESSION ROLE DEFAULT").unwrap(),
+            Command::ResetAll
+        );
+        assert_eq!(
+            parse_command("SET SESSION ROLE \"app role\"").unwrap(),
+            Command::ResetAll
+        );
+        assert_eq!(
+            parse_command("SET LOCAL ROLE NONE").unwrap(),
+            Command::ResetAll
+        );
+        assert_eq!(
+            parse_command("SET LOCAL ROLE app_role").unwrap(),
             Command::ResetAll
         );
         assert_eq!(
@@ -2605,6 +2657,14 @@ mod tests {
         ));
         assert!(matches!(
             parse_command("SET ROLE"),
+            Err(ParseError::InvalidSet)
+        ));
+        assert!(matches!(
+            parse_command("SET SESSION ROLE"),
+            Err(ParseError::InvalidSet)
+        ));
+        assert!(matches!(
+            parse_command("SET LOCAL ROLE"),
             Err(ParseError::InvalidSet)
         ));
         assert!(matches!(
