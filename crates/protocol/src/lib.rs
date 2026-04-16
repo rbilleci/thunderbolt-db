@@ -1140,6 +1140,13 @@ fn notify_payload_fragment_is_non_empty(fragment: &str) -> bool {
             }
         }
 
+        if ch.is_whitespace() {
+            if chars[idx + 1..].iter().any(|c| !c.is_whitespace()) {
+                return false;
+            }
+            break;
+        }
+
         match ch {
             '\'' => in_single_quote = true,
             '"' => in_double_quote = true,
@@ -2394,6 +2401,10 @@ mod tests {
         ));
         assert!(matches!(
             parse_command("NOTIFY updates_channel, payload, extra"),
+            Err(ParseError::InvalidReset)
+        ));
+        assert!(matches!(
+            parse_command("NOTIFY updates_channel, payload extra"),
             Err(ParseError::InvalidReset)
         ));
         assert!(matches!(
