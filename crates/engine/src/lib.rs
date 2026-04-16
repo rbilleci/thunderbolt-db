@@ -946,6 +946,16 @@ mod tests {
     }
 
     #[test]
+    fn execute_set_accepts_session_and_local_scope_aliases() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET SESSION balance=100").unwrap();
+        e.execute_text(2, "SET LOCAL balance TO 101").unwrap();
+
+        assert_eq!(e.get("balance"), Some("101"));
+        assert_eq!(e.metrics().commits_total, 2);
+    }
+
+    #[test]
     fn execute_del_removes_existing_key() {
         let mut e = Engine::new_local();
         e.execute_text(1, "SET balance=100").unwrap();
