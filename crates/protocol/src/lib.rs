@@ -1059,6 +1059,9 @@ fn parse_reset_identifier(input: &str) -> Option<(&str, &str)> {
                     i += 2;
                     continue;
                 }
+                if i == 1 {
+                    return None;
+                }
                 let end = i + 1;
                 return Some((&s[..end], &s[end..]));
             }
@@ -2444,6 +2447,10 @@ mod tests {
             Err(ParseError::InvalidReset)
         ));
         assert!(matches!(
+            parse_command("DEALLOCATE \"\""),
+            Err(ParseError::InvalidReset)
+        ));
+        assert!(matches!(
             parse_command("CLOSE"),
             Err(ParseError::InvalidReset)
         ));
@@ -2453,6 +2460,10 @@ mod tests {
         ));
         assert!(matches!(
             parse_command("CLOSE \"cursor name"),
+            Err(ParseError::InvalidReset)
+        ));
+        assert!(matches!(
+            parse_command("CLOSE \"\""),
             Err(ParseError::InvalidReset)
         ));
         assert!(matches!(
@@ -2468,11 +2479,19 @@ mod tests {
             Err(ParseError::InvalidReset)
         ));
         assert!(matches!(
+            parse_command("UNLISTEN \"\""),
+            Err(ParseError::InvalidReset)
+        ));
+        assert!(matches!(
             parse_command("LISTEN"),
             Err(ParseError::InvalidReset)
         ));
         assert!(matches!(
             parse_command("LISTEN updates_channel NOW"),
+            Err(ParseError::InvalidReset)
+        ));
+        assert!(matches!(
+            parse_command("LISTEN \"\""),
             Err(ParseError::InvalidReset)
         ));
         assert!(matches!(
@@ -2552,6 +2571,10 @@ mod tests {
             Err(ParseError::InvalidReset)
         ));
         assert!(matches!(
+            parse_command("NOTIFY \"\""),
+            Err(ParseError::InvalidReset)
+        ));
+        assert!(matches!(
             parse_command("SET ROLE"),
             Err(ParseError::InvalidSet)
         ));
@@ -2565,6 +2588,10 @@ mod tests {
         ));
         assert!(matches!(
             parse_command("SET ROLE \"unterminated"),
+            Err(ParseError::InvalidSet)
+        ));
+        assert!(matches!(
+            parse_command("SET ROLE \"\""),
             Err(ParseError::InvalidSet)
         ));
         assert!(matches!(
