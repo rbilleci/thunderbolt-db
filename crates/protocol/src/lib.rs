@@ -72,16 +72,20 @@ fn parse_startup_params(payload: &[u8]) -> Result<Vec<(String, String)>, Startup
         return Err(StartupPacketError::UnterminatedParameterPayload);
     }
 
-    let segments: Vec<&[u8]> = payload[..payload.len() - 1]
-        .split(|b| *b == 0)
-        .filter(|segment| !segment.is_empty())
-        .collect();
+    let mut segments: Vec<&[u8]> = payload[..payload.len() - 1].split(|b| *b == 0).collect();
+    if segments.last().is_some_and(|segment| segment.is_empty()) {
+        segments.pop();
+    }
+
     if !segments.len().is_multiple_of(2) {
         return Err(StartupPacketError::InvalidParameterPairing);
     }
 
     let mut params = Vec::with_capacity(segments.len() / 2);
     for pair in segments.chunks_exact(2) {
+        if pair[0].is_empty() {
+            return Err(StartupPacketError::InvalidParameterPairing);
+        }
         let key = std::str::from_utf8(pair[0]).map_err(|_| StartupPacketError::InvalidUtf8)?;
         let value = std::str::from_utf8(pair[1]).map_err(|_| StartupPacketError::InvalidUtf8)?;
         params.push((key.to_owned(), value.to_owned()));
@@ -2776,7 +2780,7 @@ mod tests {
     #[test]
     fn parses_pg_v3_startup_packet_with_params() {
         let mut payload = PG_PROTOCOL_V3.to_be_bytes().to_vec();
-        payload.extend_from_slice(b"user\0postgres\0database\0gpu\0\0");
+        payload.extend_from_slice(b"user\0postgres\0database\0gpu\0application_name\0\0\0");
         let frame = with_length_prefix(payload);
 
         let packet = parse_startup_packet(&frame).unwrap();
@@ -2786,7 +2790,8 @@ mod tests {
                 protocol_version: PG_PROTOCOL_V3,
                 params: vec![
                     ("user".to_string(), "postgres".to_string()),
-                    ("database".to_string(), "gpu".to_string())
+                    ("database".to_string(), "gpu".to_string()),
+                    ("application_name".to_string(), "".to_string())
                 ],
             }
         );
@@ -2844,6 +2849,14 @@ mod tests {
         assert_eq!(
             parse_startup_packet(&invalid_utf8_params).unwrap_err(),
             StartupPacketError::InvalidUtf8
+        );
+
+        let mut empty_key_params = PG_PROTOCOL_V3.to_be_bytes().to_vec();
+        empty_key_params.extend_from_slice(b"\0value\0\0");
+        let empty_key_params = with_length_prefix(empty_key_params);
+        assert_eq!(
+            parse_startup_packet(&empty_key_params).unwrap_err(),
+            StartupPacketError::InvalidParameterPairing
         );
     }
 
