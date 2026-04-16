@@ -881,6 +881,13 @@ fn parse_reset_command(input: &str) -> Option<Result<Command, ParseError>> {
             {
                 Ok(Command::ResetAll)
             }
+            [scope, role]
+                if (scope.eq_ignore_ascii_case("SESSION")
+                    || scope.eq_ignore_ascii_case("LOCAL"))
+                    && role.eq_ignore_ascii_case("ROLE") =>
+            {
+                Ok(Command::ResetAll)
+            }
             [session, authorization]
                 if session.eq_ignore_ascii_case("SESSION")
                     && (authorization.eq_ignore_ascii_case("AUTHORIZATION")
@@ -1909,6 +1916,12 @@ mod tests {
         let cmd = parse_command("RESET ROLE").unwrap();
         assert_eq!(cmd, Command::ResetAll);
 
+        let cmd = parse_command("RESET SESSION ROLE").unwrap();
+        assert_eq!(cmd, Command::ResetAll);
+
+        let cmd = parse_command("RESET LOCAL ROLE").unwrap();
+        assert_eq!(cmd, Command::ResetAll);
+
         let cmd = parse_command("RESET AUTHORIZATION").unwrap();
         assert_eq!(cmd, Command::ResetAll);
 
@@ -2736,6 +2749,14 @@ mod tests {
         );
         assert_eq!(parse_command("RESET ALL;").unwrap(), Command::ResetAll);
         assert_eq!(parse_command("RESET ROLE;\n").unwrap(), Command::ResetAll);
+        assert_eq!(
+            parse_command("RESET SESSION ROLE;\n").unwrap(),
+            Command::ResetAll
+        );
+        assert_eq!(
+            parse_command("RESET LOCAL ROLE;\n").unwrap(),
+            Command::ResetAll
+        );
         assert_eq!(
             parse_command("RESET AUTHORIZATION;\n").unwrap(),
             Command::ResetAll

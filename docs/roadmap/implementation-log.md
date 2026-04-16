@@ -3,6 +3,8 @@
 ## 2026-04-16
 
 ### Completed
+- Extended reset-command parser compatibility to accept scoped role reset aliases `RESET SESSION ROLE` and `RESET LOCAL ROLE` as `ResetAll` no-op forms (matching existing `RESET ROLE` handling), reducing parser friction for PostgreSQL-compatible clients/proxies that scope role-reset probes explicitly during bootstrap/reset workflows.
+- Added regression coverage for scoped-role reset alias acceptance (including statement terminators), keeping reset-command parsing deterministic across unscoped and scoped role-reset forms.
 - Extended session-reset parser compatibility to accept `SET SESSION ROLE ...` and `SET LOCAL ROLE ...` as `ResetAll` no-op aliases (matching existing `SET ROLE ...` handling), reducing parser friction for PostgreSQL clients that scope role changes explicitly during bootstrap/reset flows.
 - Added regression coverage for scoped-role alias acceptance (`SESSION`/`LOCAL`) plus malformed missing-target rejection to keep parser behavior deterministic.
 - Extended reset-command compatibility to accept `RESET SESSION AUTHORIZATION DEFAULT` and `RESET SESSION AUTH DEFAULT` as `ResetAll` no-op aliases, reducing parser friction for PostgreSQL-compatible clients/proxies that emit explicit default-reset variants during session bootstrap/cleanup flows.
