@@ -2241,6 +2241,10 @@ mod tests {
             Command::Commit { chain: true }
         );
         assert_eq!(
+            parse_command("COMMIT WORK AND CHAIN").unwrap(),
+            Command::Commit { chain: true }
+        );
+        assert_eq!(
             parse_command("COMMIT WORK AND NO CHAIN").unwrap(),
             Command::Commit { chain: false }
         );
@@ -2262,6 +2266,10 @@ mod tests {
         );
         assert_eq!(
             parse_command("END TRANSACTION AND CHAIN").unwrap(),
+            Command::Commit { chain: true }
+        );
+        assert_eq!(
+            parse_command("END WORK AND CHAIN").unwrap(),
             Command::Commit { chain: true }
         );
         assert_eq!(
@@ -2289,6 +2297,10 @@ mod tests {
             Command::Rollback { chain: true }
         );
         assert_eq!(
+            parse_command("ROLLBACK WORK AND CHAIN").unwrap(),
+            Command::Rollback { chain: true }
+        );
+        assert_eq!(
             parse_command("ROLLBACK WORK AND NO CHAIN").unwrap(),
             Command::Rollback { chain: false }
         );
@@ -2310,6 +2322,10 @@ mod tests {
         );
         assert_eq!(
             parse_command("ABORT TRANSACTION AND CHAIN").unwrap(),
+            Command::Rollback { chain: true }
+        );
+        assert_eq!(
+            parse_command("ABORT WORK AND CHAIN").unwrap(),
             Command::Rollback { chain: true }
         );
         assert_eq!(

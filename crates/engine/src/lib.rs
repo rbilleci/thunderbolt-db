@@ -1727,6 +1727,18 @@ mod tests {
         assert_eq!(e.active_txn_count(), 1);
         e.execute_text(72, "ABORT").unwrap();
         assert_eq!(e.active_txn_count(), 0);
+
+        e.execute_text(75, "BEGIN").unwrap();
+        e.execute_text(75, "END WORK AND CHAIN").unwrap();
+        assert_eq!(e.active_txn_count(), 1);
+        e.execute_text(76, "COMMIT").unwrap();
+        assert_eq!(e.active_txn_count(), 0);
+
+        e.execute_text(77, "BEGIN").unwrap();
+        e.execute_text(77, "ABORT WORK AND CHAIN").unwrap();
+        assert_eq!(e.active_txn_count(), 1);
+        e.execute_text(78, "ROLLBACK").unwrap();
+        assert_eq!(e.active_txn_count(), 0);
     }
 
     #[test]
@@ -1760,6 +1772,18 @@ mod tests {
         e.enqueue_set_text(91, "ABORT AND CHAIN", t0).unwrap();
         assert_eq!(e.active_txn_count(), 1);
         e.enqueue_set_text(92, "ABORT", t0).unwrap();
+        assert_eq!(e.active_txn_count(), 0);
+
+        e.enqueue_set_text(95, "BEGIN", t0).unwrap();
+        e.enqueue_set_text(95, "END WORK AND CHAIN", t0).unwrap();
+        assert_eq!(e.active_txn_count(), 1);
+        e.enqueue_set_text(96, "COMMIT", t0).unwrap();
+        assert_eq!(e.active_txn_count(), 0);
+
+        e.enqueue_set_text(97, "BEGIN", t0).unwrap();
+        e.enqueue_set_text(97, "ABORT WORK AND CHAIN", t0).unwrap();
+        assert_eq!(e.active_txn_count(), 1);
+        e.enqueue_set_text(98, "ROLLBACK", t0).unwrap();
         assert_eq!(e.active_txn_count(), 0);
     }
 
