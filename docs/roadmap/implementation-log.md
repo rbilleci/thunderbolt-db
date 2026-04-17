@@ -13,6 +13,8 @@
 - Added regression coverage for empty `SaslResponse` frames so `p`-tag auth parsing remains deterministic across password, SASL-initial, and SASL-response payload classes.
 - Hardened PostgreSQL frontend `Execute` (`E`) frame parsing to reject negative `max_rows` values, preventing signed wire values from being reinterpreted as oversized unsigned limits.
 - Added malformed-frame regression coverage for negative `Execute.max_rows` payloads so extended-query parser rejection behavior stays deterministic under invalid row-limit inputs.
+- Added parser regression coverage for `COMMIT|END|ROLLBACK|ABORT WORK AND CHAIN` aliases so PostgreSQL transaction-control `WORK` scope variants remain explicitly validated for chain semantics.
+- Added engine transaction-state regression coverage (immediate + enqueue paths) proving `END WORK AND CHAIN` and `ABORT WORK AND CHAIN` reopen transaction context exactly like existing `... AND CHAIN` aliases.
 
 ### Current blockers
 - None in-repo. Core Rust/toolchain and test gates are available in this environment.
