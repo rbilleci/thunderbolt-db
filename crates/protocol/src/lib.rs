@@ -280,6 +280,19 @@ fn is_valid_format_code(code: i16) -> bool {
     matches!(code, 0 | 1)
 }
 
+fn parse_cstring_payload(
+    payload: &[u8],
+    unterminated: FrontendMessageError,
+) -> Result<&[u8], FrontendMessageError> {
+    let Some(bytes) = payload.strip_suffix(&[0]) else {
+        return Err(unterminated);
+    };
+    if bytes.contains(&0) {
+        return Err(unterminated);
+    }
+    Ok(bytes)
+}
+
 pub fn parse_frontend_message(frame: &[u8]) -> Result<FrontendMessage, FrontendMessageError> {
     if frame.len() < 5 {
         return Err(FrontendMessageError::TooShort);
@@ -302,22 +315,21 @@ pub fn parse_frontend_message(frame: &[u8]) -> Result<FrontendMessage, FrontendM
     let payload = &frame[5..];
     match tag {
         b'Q' => {
-            let Some(query_bytes) = payload.strip_suffix(&[0]) else {
-                return Err(FrontendMessageError::UnterminatedSimpleQuery);
-            };
+            let query_bytes =
+                parse_cstring_payload(payload, FrontendMessageError::UnterminatedSimpleQuery)?;
             let query = std::str::from_utf8(query_bytes)
                 .map_err(|_| FrontendMessageError::InvalidUtf8)?
                 .to_owned();
             Ok(FrontendMessage::SimpleQuery(query))
         }
         b'p' => {
-            if let Some(password_bytes) = payload.strip_suffix(&[0]) {
-                if !password_bytes.contains(&0) {
-                    let password = std::str::from_utf8(password_bytes)
-                        .map_err(|_| FrontendMessageError::InvalidUtf8)?
-                        .to_owned();
-                    return Ok(FrontendMessage::PasswordMessage(password));
-                }
+            if let Ok(password_bytes) =
+                parse_cstring_payload(payload, FrontendMessageError::UnterminatedPasswordMessage)
+            {
+                let password = std::str::from_utf8(password_bytes)
+                    .map_err(|_| FrontendMessageError::InvalidUtf8)?
+                    .to_owned();
+                return Ok(FrontendMessage::PasswordMessage(password));
             }
 
             if let Some(mechanism_end) = payload.iter().position(|&b| b == 0) {
@@ -551,9 +563,8 @@ pub fn parse_frontend_message(frame: &[u8]) -> Result<FrontendMessage, FrontendM
                 _ => return Err(FrontendMessageError::InvalidDescribeTarget),
             };
 
-            let Some(name_bytes) = rest.strip_suffix(&[0]) else {
-                return Err(FrontendMessageError::UnterminatedDescribeName);
-            };
+            let name_bytes =
+                parse_cstring_payload(rest, FrontendMessageError::UnterminatedDescribeName)?;
             let name = std::str::from_utf8(name_bytes)
                 .map_err(|_| FrontendMessageError::InvalidUtf8)?
                 .to_owned();
@@ -569,9 +580,8 @@ pub fn parse_frontend_message(frame: &[u8]) -> Result<FrontendMessage, FrontendM
                 _ => return Err(FrontendMessageError::InvalidCloseTarget),
             };
 
-            let Some(name_bytes) = rest.strip_suffix(&[0]) else {
-                return Err(FrontendMessageError::UnterminatedCloseName);
-            };
+            let name_bytes =
+                parse_cstring_payload(rest, FrontendMessageError::UnterminatedCloseName)?;
             let name = std::str::from_utf8(name_bytes)
                 .map_err(|_| FrontendMessageError::InvalidUtf8)?
                 .to_owned();
@@ -706,9 +716,8 @@ pub fn parse_frontend_message(frame: &[u8]) -> Result<FrontendMessage, FrontendM
             Ok(FrontendMessage::CopyDone)
         }
         b'f' => {
-            let Some(reason_bytes) = payload.strip_suffix(&[0]) else {
-                return Err(FrontendMessageError::UnterminatedCopyFail);
-            };
+            let reason_bytes =
+                parse_cstring_payload(payload, FrontendMessageError::UnterminatedCopyFail)?;
             let reason = std::str::from_utf8(reason_bytes)
                 .map_err(|_| FrontendMessageError::InvalidUtf8)?
                 .to_owned();
@@ -3310,6 +3319,12 @@ mod tests {
             FrontendMessageError::UnterminatedSimpleQuery
         );
 
+        let query_with_embedded_null = frontend_frame(b'Q', b"SELECT\0 1;\0");
+        assert_eq!(
+            parse_frontend_message(&query_with_embedded_null).unwrap_err(),
+            FrontendMessageError::UnterminatedSimpleQuery
+        );
+
         let unterminated_password = frontend_frame(b'p', b"secret");
         assert_eq!(
             parse_frontend_message(&unterminated_password).unwrap(),
@@ -3349,10 +3364,22 @@ mod tests {
             FrontendMessageError::InvalidDescribeTarget
         );
 
+        let describe_with_embedded_null = frontend_frame(b'D', b"Sstmt\0extra\0");
+        assert_eq!(
+            parse_frontend_message(&describe_with_embedded_null).unwrap_err(),
+            FrontendMessageError::UnterminatedDescribeName
+        );
+
         let invalid_close_target = frontend_frame(b'C', b"Xstmt\0");
         assert_eq!(
             parse_frontend_message(&invalid_close_target).unwrap_err(),
             FrontendMessageError::InvalidCloseTarget
+        );
+
+        let close_with_embedded_null = frontend_frame(b'C', b"Sstmt\0extra\0");
+        assert_eq!(
+            parse_frontend_message(&close_with_embedded_null).unwrap_err(),
+            FrontendMessageError::UnterminatedCloseName
         );
 
         let malformed_execute = frontend_frame(b'E', b"portal\0\0\0");
@@ -3439,6 +3466,12 @@ mod tests {
         let unterminated_copy_fail = frontend_frame(b'f', b"bad row");
         assert_eq!(
             parse_frontend_message(&unterminated_copy_fail).unwrap_err(),
+            FrontendMessageError::UnterminatedCopyFail
+        );
+
+        let copy_fail_with_embedded_null = frontend_frame(b'f', b"bad\0row\0");
+        assert_eq!(
+            parse_frontend_message(&copy_fail_with_embedded_null).unwrap_err(),
             FrontendMessageError::UnterminatedCopyFail
         );
 
