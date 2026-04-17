@@ -66,7 +66,7 @@ fn read_u32_be(bytes: &[u8]) -> Result<u32, StartupPacketError> {
 
 fn parse_startup_params(payload: &[u8]) -> Result<Vec<(String, String)>, StartupPacketError> {
     let Some(last) = payload.last() else {
-        return Ok(Vec::new());
+        return Err(StartupPacketError::UnterminatedParameterPayload);
     };
     if *last != 0 {
         return Err(StartupPacketError::UnterminatedParameterPayload);
@@ -2992,6 +2992,12 @@ mod tests {
                 expected: 10,
                 actual: 9,
             }
+        );
+
+        let empty_param_payload = with_length_prefix(PG_PROTOCOL_V3.to_be_bytes().to_vec());
+        assert_eq!(
+            parse_startup_packet(&empty_param_payload).unwrap_err(),
+            StartupPacketError::UnterminatedParameterPayload
         );
 
         let mut bad_params = PG_PROTOCOL_V3.to_be_bytes().to_vec();
