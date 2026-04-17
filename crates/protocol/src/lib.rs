@@ -648,6 +648,12 @@ pub fn parse_frontend_message(frame: &[u8]) -> Result<FrontendMessage, FrontendM
                 return Err(FrontendMessageError::InvalidFunctionCallPayload);
             }
             let arg_count = arg_count as usize;
+            if !argument_format_codes.is_empty()
+                && argument_format_codes.len() != 1
+                && argument_format_codes.len() != arg_count
+            {
+                return Err(FrontendMessageError::InvalidFunctionCallPayload);
+            }
             let mut arguments = Vec::with_capacity(arg_count);
             for _ in 0..arg_count {
                 let len_bytes = payload
@@ -3403,6 +3409,21 @@ mod tests {
             frontend_frame(b'F', &invalid_function_call_format_code_payload);
         assert_eq!(
             parse_frontend_message(&invalid_function_call_format_code).unwrap_err(),
+            FrontendMessageError::InvalidFunctionCallPayload
+        );
+
+        let mut invalid_function_call_format_count_payload = Vec::new();
+        invalid_function_call_format_count_payload.extend_from_slice(&42_u32.to_be_bytes());
+        invalid_function_call_format_count_payload.extend_from_slice(&2_i16.to_be_bytes());
+        invalid_function_call_format_count_payload.extend_from_slice(&0_i16.to_be_bytes());
+        invalid_function_call_format_count_payload.extend_from_slice(&1_i16.to_be_bytes());
+        invalid_function_call_format_count_payload.extend_from_slice(&1_i16.to_be_bytes());
+        invalid_function_call_format_count_payload.extend_from_slice(&(-1_i32).to_be_bytes());
+        invalid_function_call_format_count_payload.extend_from_slice(&0_i16.to_be_bytes());
+        let invalid_function_call_format_count =
+            frontend_frame(b'F', &invalid_function_call_format_count_payload);
+        assert_eq!(
+            parse_frontend_message(&invalid_function_call_format_count).unwrap_err(),
             FrontendMessageError::InvalidFunctionCallPayload
         );
 

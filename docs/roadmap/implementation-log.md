@@ -5,6 +5,8 @@
 ### Completed
 - Verified bootstrap quality gates remain green on current mainline (`cargo fmt --all`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-features`) with no pending code deltas, confirming the GPU-first/WAL-before-visibility baseline is stable before the next feature loop.
 - Added this status checkpoint so roadmap history explicitly records a clean validation pass (useful for auditing autonomous loop runs where no code changes are required).
+- Hardened PostgreSQL frontend `FunctionCall` (`F`) frame parsing to enforce format-code cardinality rules (`0`, `1`, or exact argument count), preventing malformed mixed-cardinality payloads from being accepted.
+- Added regression coverage for malformed `FunctionCall` format-code cardinality so extended-query parser rejection behavior stays deterministic under malformed inputs.
 
 ### Current blockers
 - None in-repo. Core Rust/toolchain and test gates are available in this environment.
