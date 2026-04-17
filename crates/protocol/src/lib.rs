@@ -3018,6 +3018,45 @@ mod tests {
     }
 
     #[test]
+    fn parses_pg_v3_startup_packet_with_empty_params() {
+        let mut payload = PG_PROTOCOL_V3.to_be_bytes().to_vec();
+        payload.push(0);
+        let frame = with_length_prefix(payload);
+
+        let packet = parse_startup_packet(&frame).unwrap();
+        assert_eq!(
+            packet,
+            StartupPacket::Startup {
+                protocol_version: PG_PROTOCOL_V3,
+                params: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_ssl_and_cancel_requests_with_invalid_lengths() {
+        let mut ssl_payload = PG_SSL_REQUEST_CODE.to_be_bytes().to_vec();
+        ssl_payload.push(0);
+        let ssl = with_length_prefix(ssl_payload);
+        assert_eq!(
+            parse_startup_packet(&ssl).unwrap_err(),
+            StartupPacketError::LengthMismatch {
+                expected: 8,
+                actual: 9,
+            }
+        );
+
+        let cancel = with_length_prefix(PG_CANCEL_REQUEST_CODE.to_be_bytes().to_vec());
+        assert_eq!(
+            parse_startup_packet(&cancel).unwrap_err(),
+            StartupPacketError::LengthMismatch {
+                expected: 16,
+                actual: 8,
+            }
+        );
+    }
+
+    #[test]
     fn rejects_startup_packet_with_length_or_parameter_errors() {
         let short = vec![0, 0, 0, 8, 0, 3, 0];
         assert_eq!(
