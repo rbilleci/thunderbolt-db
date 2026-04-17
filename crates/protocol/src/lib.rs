@@ -379,7 +379,7 @@ pub fn parse_frontend_message(frame: &[u8]) -> Result<FrontendMessage, FrontendM
             }
 
             if payload.is_empty() {
-                return Err(FrontendMessageError::UnterminatedPasswordMessage);
+                return Ok(FrontendMessage::SaslResponse(Vec::new()));
             }
 
             Ok(FrontendMessage::SaslResponse(payload.to_vec()))
@@ -3154,6 +3154,12 @@ mod tests {
         assert_eq!(
             parse_frontend_message(&sasl_response).unwrap(),
             FrontendMessage::SaslResponse(b"c=biws,r=nonce,p=proof".to_vec())
+        );
+
+        let empty_sasl_response = frontend_frame(b'p', b"");
+        assert_eq!(
+            parse_frontend_message(&empty_sasl_response).unwrap(),
+            FrontendMessage::SaslResponse(Vec::new())
         );
 
         let mut parse_payload = Vec::new();
