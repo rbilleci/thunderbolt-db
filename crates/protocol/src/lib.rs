@@ -473,6 +473,9 @@ pub fn parse_frontend_message(frame: &[u8]) -> Result<FrontendMessage, FrontendM
                 return Err(FrontendMessageError::InvalidBindPayload);
             }
             let result_format_count = result_format_count as usize;
+            if result_format_count > 1 {
+                return Err(FrontendMessageError::InvalidBindPayload);
+            }
             let mut result_format_codes = Vec::with_capacity(result_format_count);
             for _ in 0..result_format_count {
                 let format_code = read_i16(payload, &mut offset)?;
@@ -3490,6 +3493,20 @@ mod tests {
         let invalid_bind_format_code = frontend_frame(b'B', &invalid_bind_format_code_payload);
         assert_eq!(
             parse_frontend_message(&invalid_bind_format_code).unwrap_err(),
+            FrontendMessageError::InvalidBindPayload
+        );
+
+        let mut invalid_bind_result_format_count_payload = Vec::new();
+        invalid_bind_result_format_count_payload.extend_from_slice(b"portal\0stmt\0");
+        invalid_bind_result_format_count_payload.extend_from_slice(&0_i16.to_be_bytes());
+        invalid_bind_result_format_count_payload.extend_from_slice(&0_i16.to_be_bytes());
+        invalid_bind_result_format_count_payload.extend_from_slice(&2_i16.to_be_bytes());
+        invalid_bind_result_format_count_payload.extend_from_slice(&0_i16.to_be_bytes());
+        invalid_bind_result_format_count_payload.extend_from_slice(&1_i16.to_be_bytes());
+        let invalid_bind_result_format_count =
+            frontend_frame(b'B', &invalid_bind_result_format_count_payload);
+        assert_eq!(
+            parse_frontend_message(&invalid_bind_result_format_count).unwrap_err(),
             FrontendMessageError::InvalidBindPayload
         );
 

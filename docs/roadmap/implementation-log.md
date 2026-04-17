@@ -7,6 +7,8 @@
 - Added this status checkpoint so roadmap history explicitly records a clean validation pass (useful for auditing autonomous loop runs where no code changes are required).
 - Hardened PostgreSQL frontend `FunctionCall` (`F`) frame parsing to enforce format-code cardinality rules (`0`, `1`, or exact argument count), preventing malformed mixed-cardinality payloads from being accepted.
 - Added regression coverage for malformed `FunctionCall` format-code cardinality so extended-query parser rejection behavior stays deterministic under malformed inputs.
+- Hardened PostgreSQL frontend `Bind` (`B`) frame parsing to reject result-format sections with more than one format code, aligning with wire-level cardinality requirements and preventing malformed multi-result-format payloads from being accepted.
+- Added malformed-frame regression coverage for oversized `Bind` result-format code sections so extended-query parser rejection behavior remains deterministic for invalid result-format cardinality inputs.
 - Hardened frontend C-string parsing (`SimpleQuery`, `PasswordMessage`, `Describe`, `Close`, `CopyFail`) to reject embedded NUL bytes instead of silently accepting malformed multi-segment payloads.
 - Added malformed-frame regression coverage for embedded-NUL C-string payloads so parser rejection stays deterministic for these frontend message paths.
 - Hardened PostgreSQL frontend auth-message compatibility by accepting zero-length `SaslResponse` (`p`) frames as valid SASL continuation payloads instead of misclassifying them as unterminated password messages.
