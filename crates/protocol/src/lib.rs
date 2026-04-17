@@ -424,6 +424,12 @@ pub fn parse_frontend_message(frame: &[u8]) -> Result<FrontendMessage, FrontendM
                 return Err(FrontendMessageError::InvalidBindPayload);
             }
             let parameter_count = parameter_count as usize;
+            if !parameter_format_codes.is_empty()
+                && parameter_format_codes.len() != 1
+                && parameter_format_codes.len() != parameter_count
+            {
+                return Err(FrontendMessageError::InvalidBindPayload);
+            }
             let mut parameters = Vec::with_capacity(parameter_count);
             for _ in 0..parameter_count {
                 let len_bytes = payload
@@ -3352,6 +3358,20 @@ mod tests {
         let malformed_bind = frontend_frame(b'B', b"portal\0stmt\0\0\x01");
         assert_eq!(
             parse_frontend_message(&malformed_bind).unwrap_err(),
+            FrontendMessageError::InvalidBindPayload
+        );
+
+        let mut invalid_bind_format_count_payload = Vec::new();
+        invalid_bind_format_count_payload.extend_from_slice(b"portal\0stmt\0");
+        invalid_bind_format_count_payload.extend_from_slice(&2_i16.to_be_bytes());
+        invalid_bind_format_count_payload.extend_from_slice(&0_i16.to_be_bytes());
+        invalid_bind_format_count_payload.extend_from_slice(&1_i16.to_be_bytes());
+        invalid_bind_format_count_payload.extend_from_slice(&1_i16.to_be_bytes());
+        invalid_bind_format_count_payload.extend_from_slice(&(-1_i32).to_be_bytes());
+        invalid_bind_format_count_payload.extend_from_slice(&0_i16.to_be_bytes());
+        let invalid_bind_format_count = frontend_frame(b'B', &invalid_bind_format_count_payload);
+        assert_eq!(
+            parse_frontend_message(&invalid_bind_format_count).unwrap_err(),
             FrontendMessageError::InvalidBindPayload
         );
 
