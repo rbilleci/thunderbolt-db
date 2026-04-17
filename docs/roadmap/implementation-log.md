@@ -9,6 +9,8 @@
 - Added regression coverage for malformed `FunctionCall` format-code cardinality so extended-query parser rejection behavior stays deterministic under malformed inputs.
 - Hardened frontend C-string parsing (`SimpleQuery`, `PasswordMessage`, `Describe`, `Close`, `CopyFail`) to reject embedded NUL bytes instead of silently accepting malformed multi-segment payloads.
 - Added malformed-frame regression coverage for embedded-NUL C-string payloads so parser rejection stays deterministic for these frontend message paths.
+- Hardened PostgreSQL frontend auth-message compatibility by accepting zero-length `SaslResponse` (`p`) frames as valid SASL continuation payloads instead of misclassifying them as unterminated password messages.
+- Added regression coverage for empty `SaslResponse` frames so `p`-tag auth parsing remains deterministic across password, SASL-initial, and SASL-response payload classes.
 
 ### Current blockers
 - None in-repo. Core Rust/toolchain and test gates are available in this environment.
