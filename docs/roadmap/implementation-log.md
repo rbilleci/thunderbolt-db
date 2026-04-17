@@ -15,6 +15,8 @@
 - Added malformed-frame regression coverage for negative `Execute.max_rows` payloads so extended-query parser rejection behavior stays deterministic under invalid row-limit inputs.
 - Added parser regression coverage for `COMMIT|END|ROLLBACK|ABORT WORK AND CHAIN` aliases so PostgreSQL transaction-control `WORK` scope variants remain explicitly validated for chain semantics.
 - Added engine transaction-state regression coverage (immediate + enqueue paths) proving `END WORK AND CHAIN` and `ABORT WORK AND CHAIN` reopen transaction context exactly like existing `... AND CHAIN` aliases.
+- Added startup-packet regression coverage proving protocol-v3 startup frames with an empty parameter map (`...\0`) parse successfully instead of being treated as malformed payloads.
+- Added startup control-frame length regressions proving malformed SSL/cancel request frame sizes are rejected with deterministic `LengthMismatch` errors.
 
 ### Current blockers
 - None in-repo. Core Rust/toolchain and test gates are available in this environment.
