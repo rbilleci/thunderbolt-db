@@ -602,15 +602,18 @@ pub fn parse_frontend_message(frame: &[u8]) -> Result<FrontendMessage, FrontendM
             if max_rows_start + 4 != payload.len() {
                 return Err(FrontendMessageError::InvalidExecutePayload);
             }
-            let max_rows = u32::from_be_bytes(
+            let max_rows = i32::from_be_bytes(
                 max_rows_bytes
                     .try_into()
                     .map_err(|_| FrontendMessageError::InvalidExecutePayload)?,
             );
+            if max_rows < 0 {
+                return Err(FrontendMessageError::InvalidExecutePayload);
+            }
 
             Ok(FrontendMessage::Execute {
                 portal_name,
-                max_rows,
+                max_rows: max_rows as u32,
             })
         }
         b'F' => {
@@ -3391,6 +3394,15 @@ mod tests {
         let malformed_execute = frontend_frame(b'E', b"portal\0\0\0");
         assert_eq!(
             parse_frontend_message(&malformed_execute).unwrap_err(),
+            FrontendMessageError::InvalidExecutePayload
+        );
+
+        let mut negative_max_rows_execute_payload = Vec::new();
+        negative_max_rows_execute_payload.extend_from_slice(b"portal\0");
+        negative_max_rows_execute_payload.extend_from_slice(&(-1_i32).to_be_bytes());
+        let negative_max_rows_execute = frontend_frame(b'E', &negative_max_rows_execute_payload);
+        assert_eq!(
+            parse_frontend_message(&negative_max_rows_execute).unwrap_err(),
             FrontendMessageError::InvalidExecutePayload
         );
 
