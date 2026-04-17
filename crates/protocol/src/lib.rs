@@ -321,6 +321,10 @@ pub fn parse_frontend_message(frame: &[u8]) -> Result<FrontendMessage, FrontendM
             }
 
             if let Some(mechanism_end) = payload.iter().position(|&b| b == 0) {
+                if mechanism_end == 0 {
+                    return Err(FrontendMessageError::InvalidSaslInitialResponsePayload);
+                }
+
                 let mechanism = std::str::from_utf8(&payload[..mechanism_end])
                     .map_err(|_| FrontendMessageError::InvalidUtf8)?
                     .to_owned();
@@ -3297,6 +3301,12 @@ mod tests {
         let malformed_sasl_initial = frontend_frame(b'p', b"SCRAM-SHA-256\0\0\0");
         assert_eq!(
             parse_frontend_message(&malformed_sasl_initial).unwrap_err(),
+            FrontendMessageError::InvalidSaslInitialResponsePayload
+        );
+
+        let empty_mechanism_sasl_initial = frontend_frame(b'p', b"\0\xff\xff\xff\xff");
+        assert_eq!(
+            parse_frontend_message(&empty_mechanism_sasl_initial).unwrap_err(),
             FrontendMessageError::InvalidSaslInitialResponsePayload
         );
 
