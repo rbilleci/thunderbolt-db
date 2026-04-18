@@ -3438,6 +3438,12 @@ mod tests {
             FrontendMessageError::InvalidParseParameterPayload
         );
 
+        let empty_describe = frontend_frame(b'D', b"");
+        assert_eq!(
+            parse_frontend_message(&empty_describe).unwrap_err(),
+            FrontendMessageError::TooShort
+        );
+
         let invalid_describe_target = frontend_frame(b'D', b"Xstmt\0");
         assert_eq!(
             parse_frontend_message(&invalid_describe_target).unwrap_err(),
@@ -3448,6 +3454,12 @@ mod tests {
         assert_eq!(
             parse_frontend_message(&describe_with_embedded_null).unwrap_err(),
             FrontendMessageError::UnterminatedDescribeName
+        );
+
+        let empty_close = frontend_frame(b'C', b"");
+        assert_eq!(
+            parse_frontend_message(&empty_close).unwrap_err(),
+            FrontendMessageError::TooShort
         );
 
         let invalid_close_target = frontend_frame(b'C', b"Xstmt\0");
@@ -3523,6 +3535,29 @@ mod tests {
             FrontendMessageError::InvalidBindPayload
         );
 
+        let mut negative_bind_parameter_count_payload = Vec::new();
+        negative_bind_parameter_count_payload.extend_from_slice(b"portal\0stmt\0");
+        negative_bind_parameter_count_payload.extend_from_slice(&0_i16.to_be_bytes());
+        negative_bind_parameter_count_payload.extend_from_slice(&(-1_i16).to_be_bytes());
+        let negative_bind_parameter_count =
+            frontend_frame(b'B', &negative_bind_parameter_count_payload);
+        assert_eq!(
+            parse_frontend_message(&negative_bind_parameter_count).unwrap_err(),
+            FrontendMessageError::InvalidBindPayload
+        );
+
+        let mut negative_bind_result_format_count_payload = Vec::new();
+        negative_bind_result_format_count_payload.extend_from_slice(b"portal\0stmt\0");
+        negative_bind_result_format_count_payload.extend_from_slice(&0_i16.to_be_bytes());
+        negative_bind_result_format_count_payload.extend_from_slice(&0_i16.to_be_bytes());
+        negative_bind_result_format_count_payload.extend_from_slice(&(-1_i16).to_be_bytes());
+        let negative_bind_result_format_count =
+            frontend_frame(b'B', &negative_bind_result_format_count_payload);
+        assert_eq!(
+            parse_frontend_message(&negative_bind_result_format_count).unwrap_err(),
+            FrontendMessageError::InvalidBindPayload
+        );
+
         let malformed_function_call = frontend_frame(b'F', b"\0\0\0*");
         assert_eq!(
             parse_frontend_message(&malformed_function_call).unwrap_err(),
@@ -3554,6 +3589,17 @@ mod tests {
             frontend_frame(b'F', &invalid_function_call_format_count_payload);
         assert_eq!(
             parse_frontend_message(&invalid_function_call_format_count).unwrap_err(),
+            FrontendMessageError::InvalidFunctionCallPayload
+        );
+
+        let mut negative_function_call_arg_count_payload = Vec::new();
+        negative_function_call_arg_count_payload.extend_from_slice(&42_u32.to_be_bytes());
+        negative_function_call_arg_count_payload.extend_from_slice(&0_i16.to_be_bytes());
+        negative_function_call_arg_count_payload.extend_from_slice(&(-1_i16).to_be_bytes());
+        let negative_function_call_arg_count =
+            frontend_frame(b'F', &negative_function_call_arg_count_payload);
+        assert_eq!(
+            parse_frontend_message(&negative_function_call_arg_count).unwrap_err(),
             FrontendMessageError::InvalidFunctionCallPayload
         );
 
