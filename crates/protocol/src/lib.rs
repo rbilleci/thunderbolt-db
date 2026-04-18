@@ -3450,6 +3450,18 @@ mod tests {
             FrontendMessageError::InvalidParseParameterPayload
         );
 
+        let mut malformed_parse_with_trailing_oid_bytes_payload = Vec::new();
+        malformed_parse_with_trailing_oid_bytes_payload.extend_from_slice(b"stmt\0SELECT 1\0");
+        malformed_parse_with_trailing_oid_bytes_payload.extend_from_slice(&1_i16.to_be_bytes());
+        malformed_parse_with_trailing_oid_bytes_payload.extend_from_slice(&23_u32.to_be_bytes());
+        malformed_parse_with_trailing_oid_bytes_payload.push(0xFF);
+        let malformed_parse_with_trailing_oid_bytes =
+            frontend_frame(b'P', &malformed_parse_with_trailing_oid_bytes_payload);
+        assert_eq!(
+            parse_frontend_message(&malformed_parse_with_trailing_oid_bytes).unwrap_err(),
+            FrontendMessageError::InvalidParseParameterPayload
+        );
+
         let empty_describe = frontend_frame(b'D', b"");
         assert_eq!(
             parse_frontend_message(&empty_describe).unwrap_err(),
@@ -3498,6 +3510,17 @@ mod tests {
         let negative_max_rows_execute = frontend_frame(b'E', &negative_max_rows_execute_payload);
         assert_eq!(
             parse_frontend_message(&negative_max_rows_execute).unwrap_err(),
+            FrontendMessageError::InvalidExecutePayload
+        );
+
+        let mut malformed_execute_with_trailing_bytes_payload = Vec::new();
+        malformed_execute_with_trailing_bytes_payload.extend_from_slice(b"portal\0");
+        malformed_execute_with_trailing_bytes_payload.extend_from_slice(&5_i32.to_be_bytes());
+        malformed_execute_with_trailing_bytes_payload.push(0xAA);
+        let malformed_execute_with_trailing_bytes =
+            frontend_frame(b'E', &malformed_execute_with_trailing_bytes_payload);
+        assert_eq!(
+            parse_frontend_message(&malformed_execute_with_trailing_bytes).unwrap_err(),
             FrontendMessageError::InvalidExecutePayload
         );
 
@@ -3576,6 +3599,19 @@ mod tests {
             frontend_frame(b'B', &negative_bind_result_format_count_payload);
         assert_eq!(
             parse_frontend_message(&negative_bind_result_format_count).unwrap_err(),
+            FrontendMessageError::InvalidBindPayload
+        );
+
+        let mut malformed_bind_with_trailing_bytes_payload = Vec::new();
+        malformed_bind_with_trailing_bytes_payload.extend_from_slice(b"portal\0stmt\0");
+        malformed_bind_with_trailing_bytes_payload.extend_from_slice(&0_i16.to_be_bytes());
+        malformed_bind_with_trailing_bytes_payload.extend_from_slice(&0_i16.to_be_bytes());
+        malformed_bind_with_trailing_bytes_payload.extend_from_slice(&0_i16.to_be_bytes());
+        malformed_bind_with_trailing_bytes_payload.push(0x7F);
+        let malformed_bind_with_trailing_bytes =
+            frontend_frame(b'B', &malformed_bind_with_trailing_bytes_payload);
+        assert_eq!(
+            parse_frontend_message(&malformed_bind_with_trailing_bytes).unwrap_err(),
             FrontendMessageError::InvalidBindPayload
         );
 
