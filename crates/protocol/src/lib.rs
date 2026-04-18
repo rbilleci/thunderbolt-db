@@ -3684,6 +3684,19 @@ mod tests {
             FrontendMessageError::InvalidFunctionCallPayload
         );
 
+        let mut negative_function_call_result_format_code_payload = Vec::new();
+        negative_function_call_result_format_code_payload.extend_from_slice(&42_u32.to_be_bytes());
+        negative_function_call_result_format_code_payload.extend_from_slice(&0_i16.to_be_bytes());
+        negative_function_call_result_format_code_payload.extend_from_slice(&0_i16.to_be_bytes());
+        negative_function_call_result_format_code_payload
+            .extend_from_slice(&(-1_i16).to_be_bytes());
+        let negative_function_call_result_format_code =
+            frontend_frame(b'F', &negative_function_call_result_format_code_payload);
+        assert_eq!(
+            parse_frontend_message(&negative_function_call_result_format_code).unwrap_err(),
+            FrontendMessageError::InvalidFunctionCallPayload
+        );
+
         let malformed_copy_done = frontend_frame(b'c', &[0]);
         assert_eq!(
             parse_frontend_message(&malformed_copy_done).unwrap_err(),
