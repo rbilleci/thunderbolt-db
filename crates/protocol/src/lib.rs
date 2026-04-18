@@ -3670,6 +3670,20 @@ mod tests {
             FrontendMessageError::InvalidFunctionCallPayload
         );
 
+        let mut malformed_function_call_with_trailing_bytes_payload = Vec::new();
+        malformed_function_call_with_trailing_bytes_payload
+            .extend_from_slice(&42_u32.to_be_bytes());
+        malformed_function_call_with_trailing_bytes_payload.extend_from_slice(&0_i16.to_be_bytes());
+        malformed_function_call_with_trailing_bytes_payload.extend_from_slice(&0_i16.to_be_bytes());
+        malformed_function_call_with_trailing_bytes_payload.extend_from_slice(&0_i16.to_be_bytes());
+        malformed_function_call_with_trailing_bytes_payload.push(0xAA);
+        let malformed_function_call_with_trailing_bytes =
+            frontend_frame(b'F', &malformed_function_call_with_trailing_bytes_payload);
+        assert_eq!(
+            parse_frontend_message(&malformed_function_call_with_trailing_bytes).unwrap_err(),
+            FrontendMessageError::InvalidFunctionCallPayload
+        );
+
         let malformed_copy_done = frontend_frame(b'c', &[0]);
         assert_eq!(
             parse_frontend_message(&malformed_copy_done).unwrap_err(),
