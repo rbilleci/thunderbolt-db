@@ -3590,6 +3590,19 @@ mod tests {
             FrontendMessageError::InvalidBindPayload
         );
 
+        let mut negative_bind_parameter_length_payload = Vec::new();
+        negative_bind_parameter_length_payload.extend_from_slice(b"portal\0stmt\0");
+        negative_bind_parameter_length_payload.extend_from_slice(&0_i16.to_be_bytes());
+        negative_bind_parameter_length_payload.extend_from_slice(&1_i16.to_be_bytes());
+        negative_bind_parameter_length_payload.extend_from_slice(&(-2_i32).to_be_bytes());
+        negative_bind_parameter_length_payload.extend_from_slice(&0_i16.to_be_bytes());
+        let negative_bind_parameter_length =
+            frontend_frame(b'B', &negative_bind_parameter_length_payload);
+        assert_eq!(
+            parse_frontend_message(&negative_bind_parameter_length).unwrap_err(),
+            FrontendMessageError::InvalidBindPayload
+        );
+
         let mut negative_bind_result_format_count_payload = Vec::new();
         negative_bind_result_format_count_payload.extend_from_slice(b"portal\0stmt\0");
         negative_bind_result_format_count_payload.extend_from_slice(&0_i16.to_be_bytes());
@@ -3667,6 +3680,19 @@ mod tests {
             frontend_frame(b'F', &negative_function_call_arg_count_payload);
         assert_eq!(
             parse_frontend_message(&negative_function_call_arg_count).unwrap_err(),
+            FrontendMessageError::InvalidFunctionCallPayload
+        );
+
+        let mut negative_function_call_arg_length_payload = Vec::new();
+        negative_function_call_arg_length_payload.extend_from_slice(&42_u32.to_be_bytes());
+        negative_function_call_arg_length_payload.extend_from_slice(&0_i16.to_be_bytes());
+        negative_function_call_arg_length_payload.extend_from_slice(&1_i16.to_be_bytes());
+        negative_function_call_arg_length_payload.extend_from_slice(&(-2_i32).to_be_bytes());
+        negative_function_call_arg_length_payload.extend_from_slice(&0_i16.to_be_bytes());
+        let negative_function_call_arg_length =
+            frontend_frame(b'F', &negative_function_call_arg_length_payload);
+        assert_eq!(
+            parse_frontend_message(&negative_function_call_arg_length).unwrap_err(),
             FrontendMessageError::InvalidFunctionCallPayload
         );
 
