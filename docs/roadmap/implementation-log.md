@@ -12,6 +12,7 @@
 - Added malformed `FunctionCall` frame boundary regression proving trailing bytes after a structurally complete payload are rejected deterministically (`InvalidFunctionCallPayload`) before decode side effects.
 - Added malformed `FunctionCall` regression coverage proving negative result-format codes are rejected deterministically (`InvalidFunctionCallPayload`).
 - Added malformed extended-query boundary regressions proving `Bind` and `FunctionCall` reject wire argument/value lengths below PostgreSQL's null sentinel (`-1`) so signed underflow lengths (`-2`) are deterministically rejected as invalid payloads.
+- Hardened startup packet framing to reject declared length fields below the PostgreSQL minimum startup frame size (`len < 8`) with a dedicated `InvalidLengthField` error, plus regression coverage for underflowed startup length declarations.
 
 ### Current blockers
 - None in-repo.
