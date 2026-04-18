@@ -4,6 +4,7 @@
 
 ### Completed
 - Re-validated the current mainline with the full autonomous safety gate (`cargo fmt --all --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-features`) after lock-guarded cron bootstrap, confirming the GPU-first + WAL-before-visibility invariants remain green with no pending code deltas in this loop.
+- Added malformed extended-query boundary regressions for truncated tail sections in `Bind` and `FunctionCall` frontend frames, proving both paths deterministically reject missing result-format payload bytes (`InvalidBindPayload` / `InvalidFunctionCallPayload`) before decode side effects.
 - Extended PostgreSQL session-control compatibility so `NOTIFY channel, payload` accepts prefixed string literal forms (`E'...'`, `B'...'`, `X'...'`, `U&'...'`) as reset no-op payload fragments, reducing parser friction for clients that emit typed literal payloads.
 - Hardened `NOTIFY` payload validation for prefixed string literals by adding malformed unterminated regression cases (`E'`, `B'`, `X'`, `U&'`) to keep deterministic malformed-input rejection behavior explicit.
 - Added fixed-length frontend control frame regressions for `Terminate`, `Sync`, and `Flush` so one-byte payload drift is explicitly rejected with deterministic `LengthMismatch` behavior (matching the existing `CopyDone` contract checks).
