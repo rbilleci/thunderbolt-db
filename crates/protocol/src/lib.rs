@@ -3438,6 +3438,18 @@ mod tests {
             FrontendMessageError::InvalidParseParameterPayload
         );
 
+        let malformed_parse_negative_type_count = frontend_frame(
+            b'P',
+            &[
+                b's', b't', b'm', b't', 0, b'S', b'E', b'L', b'E', b'C', b'T', b' ', b'1', 0, 0xFF,
+                0xFF,
+            ],
+        );
+        assert_eq!(
+            parse_frontend_message(&malformed_parse_negative_type_count).unwrap_err(),
+            FrontendMessageError::InvalidParseParameterPayload
+        );
+
         let empty_describe = frontend_frame(b'D', b"");
         assert_eq!(
             parse_frontend_message(&empty_describe).unwrap_err(),
@@ -3492,6 +3504,15 @@ mod tests {
         let malformed_bind = frontend_frame(b'B', b"portal\0stmt\0\0\x01");
         assert_eq!(
             parse_frontend_message(&malformed_bind).unwrap_err(),
+            FrontendMessageError::InvalidBindPayload
+        );
+
+        let mut negative_bind_format_count_payload = Vec::new();
+        negative_bind_format_count_payload.extend_from_slice(b"portal\0stmt\0");
+        negative_bind_format_count_payload.extend_from_slice(&(-1_i16).to_be_bytes());
+        let negative_bind_format_count = frontend_frame(b'B', &negative_bind_format_count_payload);
+        assert_eq!(
+            parse_frontend_message(&negative_bind_format_count).unwrap_err(),
             FrontendMessageError::InvalidBindPayload
         );
 
@@ -3561,6 +3582,16 @@ mod tests {
         let malformed_function_call = frontend_frame(b'F', b"\0\0\0*");
         assert_eq!(
             parse_frontend_message(&malformed_function_call).unwrap_err(),
+            FrontendMessageError::InvalidFunctionCallPayload
+        );
+
+        let mut negative_function_call_format_count_payload = Vec::new();
+        negative_function_call_format_count_payload.extend_from_slice(&42_u32.to_be_bytes());
+        negative_function_call_format_count_payload.extend_from_slice(&(-1_i16).to_be_bytes());
+        let negative_function_call_format_count =
+            frontend_frame(b'F', &negative_function_call_format_count_payload);
+        assert_eq!(
+            parse_frontend_message(&negative_function_call_format_count).unwrap_err(),
             FrontendMessageError::InvalidFunctionCallPayload
         );
 
