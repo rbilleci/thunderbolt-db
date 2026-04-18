@@ -11,6 +11,7 @@
 - Added malformed extended-query boundary regressions proving `Parse`/`Bind`/`Execute` reject trailing payload bytes after structurally complete fields, keeping frame-boundary validation deterministic for lifecycle/control messages.
 - Added malformed `FunctionCall` frame boundary regression proving trailing bytes after a structurally complete payload are rejected deterministically (`InvalidFunctionCallPayload`) before decode side effects.
 - Added malformed `FunctionCall` regression coverage proving negative result-format codes are rejected deterministically (`InvalidFunctionCallPayload`).
+- Added malformed extended-query boundary regressions proving `Bind` and `FunctionCall` reject wire argument/value lengths below PostgreSQL's null sentinel (`-1`) so signed underflow lengths (`-2`) are deterministically rejected as invalid payloads.
 
 ### Current blockers
 - None in-repo.
