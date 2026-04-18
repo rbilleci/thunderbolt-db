@@ -8,6 +8,7 @@
 - Added malformed-frame regression coverage for underflowed frontend length declarations (`Q` frame length `3`) so extended-query/simple-query boundary rejection stays deterministic.
 - Added malformed extended-query boundary regressions covering empty `Describe`/`Close` payloads and negative cardinality fields in `Bind`/`FunctionCall` frames, proving deterministic rejection for truncated lifecycle/control frames before decode side effects.
 - Added malformed extended-query boundary regressions for negative cardinality fields in `Parse` parameter-type counts, `Bind` parameter-format counts, and `FunctionCall` argument-format counts, keeping deterministic rejection coverage explicit for signed underflow payloads across the full parse/bind/call lifecycle.
+- Added malformed extended-query boundary regressions proving `Parse`/`Bind`/`Execute` reject trailing payload bytes after structurally complete fields, keeping frame-boundary validation deterministic for lifecycle/control messages.
 
 ### Current blockers
 - None in-repo.
