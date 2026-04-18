@@ -234,6 +234,8 @@ pub enum DescribeTarget {
 pub enum FrontendMessageError {
     #[error("frontend message frame too short")]
     TooShort,
+    #[error("frontend message length field is invalid; minimum is 4 bytes, got {declared}")]
+    InvalidLengthField { declared: u32 },
     #[error("frontend message length mismatch; expected {expected} bytes, got {actual}")]
     LengthMismatch { expected: usize, actual: usize },
     #[error("unsupported frontend message tag: {0:#x}")]
@@ -303,8 +305,13 @@ pub fn parse_frontend_message(frame: &[u8]) -> Result<FrontendMessage, FrontendM
         frame[1..5]
             .try_into()
             .map_err(|_| FrontendMessageError::TooShort)?,
-    ) as usize;
-    let expected = payload_len + 1;
+    );
+    if payload_len < 4 {
+        return Err(FrontendMessageError::InvalidLengthField {
+            declared: payload_len,
+        });
+    }
+    let expected = payload_len as usize + 1;
     if expected != frame.len() {
         return Err(FrontendMessageError::LengthMismatch {
             expected,
@@ -3378,6 +3385,12 @@ mod tests {
                 expected: 8,
                 actual: 7,
             }
+        );
+
+        let invalid_length_field = vec![b'Q', 0, 0, 0, 3];
+        assert_eq!(
+            parse_frontend_message(&invalid_length_field).unwrap_err(),
+            FrontendMessageError::InvalidLengthField { declared: 3 }
         );
 
         let unterminated = frontend_frame(b'Q', b"SELECT 1;");

@@ -4,6 +4,8 @@
 
 ### Completed
 - Re-validated the current mainline with the full autonomous safety gate (`cargo fmt --all --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-features`) after lock-guarded cron bootstrap, confirming the GPU-first + WAL-before-visibility invariants remain green with no pending code deltas in this loop.
+- Hardened PostgreSQL frontend frame boundary validation to reject invalid message length fields below the protocol minimum (`len < 4`) with a dedicated `InvalidLengthField` error before payload decode.
+- Added malformed-frame regression coverage for underflowed frontend length declarations (`Q` frame length `3`) so extended-query/simple-query boundary rejection stays deterministic.
 
 ### Current blockers
 - None in-repo.
