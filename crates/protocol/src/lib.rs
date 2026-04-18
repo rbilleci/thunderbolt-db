@@ -47,6 +47,8 @@ pub enum StartupPacket {
 pub enum StartupPacketError {
     #[error("startup packet too short")]
     TooShort,
+    #[error("startup packet length field is invalid; minimum is 8 bytes, got {declared}")]
+    InvalidLengthField { declared: u32 },
     #[error("startup packet length mismatch; expected {expected} bytes, got {actual}")]
     LengthMismatch { expected: usize, actual: usize },
     #[error("unsupported startup protocol code: {0}")]
@@ -99,6 +101,11 @@ pub fn parse_startup_packet(frame: &[u8]) -> Result<StartupPacket, StartupPacket
     }
 
     let frame_len = read_u32_be(&frame[..4])? as usize;
+    if frame_len < 8 {
+        return Err(StartupPacketError::InvalidLengthField {
+            declared: frame_len as u32,
+        });
+    }
     if frame_len != frame.len() {
         return Err(StartupPacketError::LengthMismatch {
             expected: frame_len,
@@ -3081,6 +3088,12 @@ mod tests {
                 expected: 10,
                 actual: 9,
             }
+        );
+
+        let invalid_length_field = vec![0, 0, 0, 4, 0, 3, 0, 0];
+        assert_eq!(
+            parse_startup_packet(&invalid_length_field).unwrap_err(),
+            StartupPacketError::InvalidLengthField { declared: 4 }
         );
 
         let empty_param_payload = with_length_prefix(PG_PROTOCOL_V3.to_be_bytes().to_vec());
