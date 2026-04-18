@@ -1158,6 +1158,7 @@ fn notify_payload_fragment_is_non_empty(fragment: &str) -> bool {
     }
 
     let mut in_single_quote = false;
+    let mut single_quote_backslash_escapes = false;
     let mut in_double_quote = false;
     let chars: Vec<char> = trimmed.chars().collect();
     let mut idx = 0;
@@ -1165,12 +1166,18 @@ fn notify_payload_fragment_is_non_empty(fragment: &str) -> bool {
     while idx < chars.len() {
         let ch = chars[idx];
         if in_single_quote {
+            if single_quote_backslash_escapes && ch == '\\' && idx + 1 < chars.len() {
+                idx += 2;
+                continue;
+            }
+
             if ch == '\'' {
                 if idx + 1 < chars.len() && chars[idx + 1] == '\'' {
                     idx += 2;
                     continue;
                 }
                 in_single_quote = false;
+                single_quote_backslash_escapes = false;
             }
             idx += 1;
             continue;
@@ -1214,8 +1221,38 @@ fn notify_payload_fragment_is_non_empty(fragment: &str) -> bool {
             break;
         }
 
+        if ch == '\'' {
+            in_single_quote = true;
+            single_quote_backslash_escapes = false;
+            idx += 1;
+            continue;
+        }
+
+        if matches!(ch, 'e' | 'E') && chars.get(idx + 1) == Some(&'\'') {
+            in_single_quote = true;
+            single_quote_backslash_escapes = true;
+            idx += 2;
+            continue;
+        }
+
+        if matches!(ch, 'b' | 'B' | 'x' | 'X') && chars.get(idx + 1) == Some(&'\'') {
+            in_single_quote = true;
+            single_quote_backslash_escapes = false;
+            idx += 2;
+            continue;
+        }
+
+        if matches!(ch, 'u' | 'U')
+            && chars.get(idx + 1) == Some(&'&')
+            && chars.get(idx + 2) == Some(&'\'')
+        {
+            in_single_quote = true;
+            single_quote_backslash_escapes = false;
+            idx += 3;
+            continue;
+        }
+
         match ch {
-            '\'' => in_single_quote = true,
             '"' => in_double_quote = true,
             ',' => return false,
             _ => {}
@@ -2113,6 +2150,18 @@ mod tests {
 
         let cmd = parse_command("NOTIFY updates_channel, \"hello\"\"world\"").unwrap();
         assert_eq!(cmd, Command::ResetAll);
+
+        let cmd = parse_command("NOTIFY updates_channel, E'hello\\'world'").unwrap();
+        assert_eq!(cmd, Command::ResetAll);
+
+        let cmd = parse_command("NOTIFY updates_channel, B'101010'").unwrap();
+        assert_eq!(cmd, Command::ResetAll);
+
+        let cmd = parse_command("NOTIFY updates_channel, X'CAFE'").unwrap();
+        assert_eq!(cmd, Command::ResetAll);
+
+        let cmd = parse_command("NOTIFY updates_channel, U&'d\\0061ta'").unwrap();
+        assert_eq!(cmd, Command::ResetAll);
     }
 
     #[test]
@@ -2707,6 +2756,22 @@ mod tests {
         ));
         assert!(matches!(
             parse_command("NOTIFY updates_channel, $tag$unterminated"),
+            Err(ParseError::InvalidReset)
+        ));
+        assert!(matches!(
+            parse_command("NOTIFY updates_channel, E'unterminated"),
+            Err(ParseError::InvalidReset)
+        ));
+        assert!(matches!(
+            parse_command("NOTIFY updates_channel, B'unterminated"),
+            Err(ParseError::InvalidReset)
+        ));
+        assert!(matches!(
+            parse_command("NOTIFY updates_channel, X'unterminated"),
+            Err(ParseError::InvalidReset)
+        ));
+        assert!(matches!(
+            parse_command("NOTIFY updates_channel, U&'unterminated"),
             Err(ParseError::InvalidReset)
         ));
         assert!(matches!(
