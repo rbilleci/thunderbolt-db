@@ -3218,6 +3218,14 @@ mod tests {
             parse_startup_packet(&empty_key_params).unwrap_err(),
             StartupPacketError::InvalidParameterPairing
         );
+
+        let mut dangling_key_params = PG_PROTOCOL_V3.to_be_bytes().to_vec();
+        dangling_key_params.extend_from_slice(b"user\0postgres\0database\0\0");
+        let dangling_key_params = with_length_prefix(dangling_key_params);
+        assert_eq!(
+            parse_startup_packet(&dangling_key_params).unwrap_err(),
+            StartupPacketError::InvalidParameterPairing
+        );
     }
 
     #[test]
@@ -3556,6 +3564,14 @@ mod tests {
             frontend_frame(b'p', b"SCRAM-SHA-256\0\0\0\0\x03xy");
         assert_eq!(
             parse_frontend_message(&malformed_sasl_initial_declared_len_mismatch).unwrap_err(),
+            FrontendMessageError::InvalidSaslInitialResponsePayload
+        );
+
+        let malformed_sasl_initial_zero_len_with_trailing_payload =
+            frontend_frame(b'p', b"SCRAM-SHA-256\0\0\0\0\0x");
+        assert_eq!(
+            parse_frontend_message(&malformed_sasl_initial_zero_len_with_trailing_payload)
+                .unwrap_err(),
             FrontendMessageError::InvalidSaslInitialResponsePayload
         );
 

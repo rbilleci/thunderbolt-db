@@ -7,6 +7,7 @@
 - Added malformed auth-frame regression coverage proving SASL initial-response mechanism names with invalid UTF-8 bytes are rejected deterministically as `InvalidUtf8` before payload-length handling.
 - Added PostgreSQL extended-query malformed-frame regression coverage to assert deterministic `InvalidUtf8` rejection when non-UTF8 bytes appear in decoded text fields across lifecycle messages (`Parse` statement/query, `Bind` portal/statement, `Describe` name, `Close` name, `Execute` portal).
 - Added malformed SASL initial-response boundary regressions proving `p` auth frames reject trailing bytes after null initial-response lengths (`-1`) and reject declared initial-response length/payload mismatches deterministically as `InvalidSaslInitialResponsePayload`.
+- Added startup/auth malformed-frame regressions for dangling startup parameter key segments and zero-length SASL initial-response frames with trailing payload bytes, keeping pairing and SASL length invariants deterministic.
 - Re-validated the full safety gate after the parser regression delta (`cargo fmt --all`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-features`) with all checks green.
 
 ### Current blockers
