@@ -3544,6 +3544,24 @@ mod tests {
             FrontendMessageError::InvalidParseParameterPayload
         );
 
+        let invalid_utf8_parse_statement_name = frontend_frame(
+            b'P',
+            &[
+                0xFF, 0, b'S', b'E', b'L', b'E', b'C', b'T', b' ', b'1', 0, 0, 0,
+            ],
+        );
+        assert_eq!(
+            parse_frontend_message(&invalid_utf8_parse_statement_name).unwrap_err(),
+            FrontendMessageError::InvalidUtf8
+        );
+
+        let invalid_utf8_parse_query =
+            frontend_frame(b'P', &[b's', b't', b'm', b't', 0, 0xFF, 0, 0, 0]);
+        assert_eq!(
+            parse_frontend_message(&invalid_utf8_parse_query).unwrap_err(),
+            FrontendMessageError::InvalidUtf8
+        );
+
         let malformed_parse_negative_type_count = frontend_frame(
             b'P',
             &[
@@ -3586,6 +3604,12 @@ mod tests {
             FrontendMessageError::UnterminatedDescribeName
         );
 
+        let invalid_utf8_describe_name = frontend_frame(b'D', b"S\xFF\0");
+        assert_eq!(
+            parse_frontend_message(&invalid_utf8_describe_name).unwrap_err(),
+            FrontendMessageError::InvalidUtf8
+        );
+
         let empty_close = frontend_frame(b'C', b"");
         assert_eq!(
             parse_frontend_message(&empty_close).unwrap_err(),
@@ -3604,10 +3628,22 @@ mod tests {
             FrontendMessageError::UnterminatedCloseName
         );
 
+        let invalid_utf8_close_name = frontend_frame(b'C', b"S\xFF\0");
+        assert_eq!(
+            parse_frontend_message(&invalid_utf8_close_name).unwrap_err(),
+            FrontendMessageError::InvalidUtf8
+        );
+
         let malformed_execute = frontend_frame(b'E', b"portal\0\0\0");
         assert_eq!(
             parse_frontend_message(&malformed_execute).unwrap_err(),
             FrontendMessageError::InvalidExecutePayload
+        );
+
+        let invalid_utf8_execute_portal_name = frontend_frame(b'E', &[0xFF, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            parse_frontend_message(&invalid_utf8_execute_portal_name).unwrap_err(),
+            FrontendMessageError::InvalidUtf8
         );
 
         let mut negative_max_rows_execute_payload = Vec::new();
@@ -3634,6 +3670,22 @@ mod tests {
         assert_eq!(
             parse_frontend_message(&malformed_bind).unwrap_err(),
             FrontendMessageError::InvalidBindPayload
+        );
+
+        let invalid_utf8_bind_portal_name =
+            frontend_frame(b'B', &[0xFF, 0, b's', b't', b'm', b't', 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            parse_frontend_message(&invalid_utf8_bind_portal_name).unwrap_err(),
+            FrontendMessageError::InvalidUtf8
+        );
+
+        let invalid_utf8_bind_statement_name = frontend_frame(
+            b'B',
+            &[b'p', b'o', b'r', b't', b'a', b'l', 0, 0xFF, 0, 0, 0, 0, 0],
+        );
+        assert_eq!(
+            parse_frontend_message(&invalid_utf8_bind_statement_name).unwrap_err(),
+            FrontendMessageError::InvalidUtf8
         );
 
         let mut negative_bind_format_count_payload = Vec::new();
