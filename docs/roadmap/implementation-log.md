@@ -3,6 +3,7 @@
 ## 2026-04-19
 
 ### Completed
+- Added malformed extended-query lifecycle regression proving `Execute` (`E`) frames with embedded-NUL portal names (`portal\0extra\0...`) are rejected deterministically as `InvalidExecutePayload`, closing another decode-boundary edge case before execution state can advance.
 - Added malformed extended-query lifecycle regressions for target-only `Describe`/`Close` frontend frames (`D`/`C` with missing trailing C-string terminators), asserting deterministic `UnterminatedDescribeName` / `UnterminatedCloseName` rejection for truncated payload boundaries.
 - Added malformed auth-frame regression coverage proving SASL initial-response mechanism names with invalid UTF-8 bytes are rejected deterministically as `InvalidUtf8` before payload-length handling.
 - Added PostgreSQL extended-query malformed-frame regression coverage to assert deterministic `InvalidUtf8` rejection when non-UTF8 bytes appear in decoded text fields across lifecycle messages (`Parse` statement/query, `Bind` portal/statement, `Describe` name, `Close` name, `Execute` portal).

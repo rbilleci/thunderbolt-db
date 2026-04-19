@@ -3695,6 +3695,12 @@ mod tests {
             FrontendMessageError::InvalidUtf8
         );
 
+        let execute_with_embedded_null_portal_name = frontend_frame(b'E', b"portal\0extra\0\0\0\0");
+        assert_eq!(
+            parse_frontend_message(&execute_with_embedded_null_portal_name).unwrap_err(),
+            FrontendMessageError::InvalidExecutePayload
+        );
+
         let mut negative_max_rows_execute_payload = Vec::new();
         negative_max_rows_execute_payload.extend_from_slice(b"portal\0");
         negative_max_rows_execute_payload.extend_from_slice(&(-1_i32).to_be_bytes());
