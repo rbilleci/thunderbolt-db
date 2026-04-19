@@ -3,6 +3,7 @@
 ## 2026-04-19
 
 ### Completed
+- Added malformed extended-query lifecycle regressions for `Describe`/`Close` (`D`/`C`) payload boundaries, proving trailing bytes after a complete C-string name (`...\0\xFF`) are rejected deterministically as `UnterminatedDescribeName` / `UnterminatedCloseName` before lifecycle state can advance.
 - Added malformed extended-query lifecycle regressions for `Execute` (`E`) payload boundaries, proving short `max_rows` sections and embedded-NUL portal-name payloads (`portal\0extra\0...`) are rejected deterministically as `InvalidExecutePayload` before execution state can advance.
 - Added malformed extended-query lifecycle regressions for target-only `Describe`/`Close` frontend frames (`D`/`C` with missing trailing C-string terminators), asserting deterministic `UnterminatedDescribeName` / `UnterminatedCloseName` rejection for truncated payload boundaries.
 - Added malformed auth-frame regression coverage proving SASL initial-response mechanism names with invalid UTF-8 bytes are rejected deterministically as `InvalidUtf8` before payload-length handling.

@@ -3653,6 +3653,12 @@ mod tests {
             FrontendMessageError::InvalidUtf8
         );
 
+        let describe_with_trailing_bytes_after_name = frontend_frame(b'D', b"Sstmt\0\xFF");
+        assert_eq!(
+            parse_frontend_message(&describe_with_trailing_bytes_after_name).unwrap_err(),
+            FrontendMessageError::UnterminatedDescribeName
+        );
+
         let empty_close = frontend_frame(b'C', b"");
         assert_eq!(
             parse_frontend_message(&empty_close).unwrap_err(),
@@ -3681,6 +3687,12 @@ mod tests {
         assert_eq!(
             parse_frontend_message(&invalid_utf8_close_name).unwrap_err(),
             FrontendMessageError::InvalidUtf8
+        );
+
+        let close_with_trailing_bytes_after_name = frontend_frame(b'C', b"Pportal\0\xFF");
+        assert_eq!(
+            parse_frontend_message(&close_with_trailing_bytes_after_name).unwrap_err(),
+            FrontendMessageError::UnterminatedCloseName
         );
 
         let malformed_execute = frontend_frame(b'E', b"portal\0\0\0");
