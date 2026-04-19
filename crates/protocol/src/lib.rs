@@ -3529,6 +3529,12 @@ mod tests {
             FrontendMessageError::InvalidSaslInitialResponsePayload
         );
 
+        let invalid_utf8_mechanism_sasl_initial = frontend_frame(b'p', &[0xFF, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            parse_frontend_message(&invalid_utf8_mechanism_sasl_initial).unwrap_err(),
+            FrontendMessageError::InvalidUtf8
+        );
+
         let malformed_sasl_initial_negative_len = frontend_frame(
             b'p',
             &[b'S', b'C', b'R', b'A', b'M', 0, 0xFF, 0xFF, 0xFF, 0xFE],
