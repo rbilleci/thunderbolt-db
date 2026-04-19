@@ -3611,6 +3611,14 @@ mod tests {
             FrontendMessageError::InvalidParseParameterPayload
         );
 
+        let malformed_parse_with_zero_type_count_and_trailing_bytes =
+            frontend_frame(b'P', b"stmt\0SELECT 1\0\0\0\xFF");
+        assert_eq!(
+            parse_frontend_message(&malformed_parse_with_zero_type_count_and_trailing_bytes)
+                .unwrap_err(),
+            FrontendMessageError::InvalidParseParameterPayload
+        );
+
         let mut malformed_parse_with_trailing_oid_bytes_payload = Vec::new();
         malformed_parse_with_trailing_oid_bytes_payload.extend_from_slice(b"stmt\0SELECT 1\0");
         malformed_parse_with_trailing_oid_bytes_payload.extend_from_slice(&1_i16.to_be_bytes());
