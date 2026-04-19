@@ -1,5 +1,18 @@
 # Implementation Log (Pre-NVIDIA Phase)
 
+## 2026-04-19
+
+### Completed
+- Added PostgreSQL extended-query malformed-frame regression coverage to assert deterministic `InvalidUtf8` rejection when non-UTF8 bytes appear in decoded text fields across lifecycle messages (`Parse` statement/query, `Bind` portal/statement, `Describe` name, `Close` name, `Execute` portal).
+- Re-validated the full safety gate after the parser regression delta (`cargo fmt --all`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-features`) with all checks green.
+
+### Current blockers
+- None in-repo.
+
+### Next loops
+1. Continue extended-query wire-protocol hardening with additional malformed-frame regressions around lifecycle boundaries and decode invariants.
+2. Keep loops atomic: parser delta + full fmt/clippy/test validation + focused commit.
+
 ## 2026-04-18
 
 ### Completed
