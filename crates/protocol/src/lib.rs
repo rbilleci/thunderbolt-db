@@ -3592,6 +3592,12 @@ mod tests {
             FrontendMessageError::TooShort
         );
 
+        let truncated_describe_name = frontend_frame(b'D', b"S");
+        assert_eq!(
+            parse_frontend_message(&truncated_describe_name).unwrap_err(),
+            FrontendMessageError::UnterminatedDescribeName
+        );
+
         let invalid_describe_target = frontend_frame(b'D', b"Xstmt\0");
         assert_eq!(
             parse_frontend_message(&invalid_describe_target).unwrap_err(),
@@ -3614,6 +3620,12 @@ mod tests {
         assert_eq!(
             parse_frontend_message(&empty_close).unwrap_err(),
             FrontendMessageError::TooShort
+        );
+
+        let truncated_close_name = frontend_frame(b'C', b"P");
+        assert_eq!(
+            parse_frontend_message(&truncated_close_name).unwrap_err(),
+            FrontendMessageError::UnterminatedCloseName
         );
 
         let invalid_close_target = frontend_frame(b'C', b"Xstmt\0");
