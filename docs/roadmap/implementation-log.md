@@ -1,5 +1,19 @@
 # Implementation Log (Pre-NVIDIA Phase)
 
+## 2026-04-20
+
+### Completed
+- Hardened PostgreSQL extended-query compatibility by accepting lowercase `Describe`/`Close` targets (`s`/`p`) in addition to canonical uppercase (`S`/`P`), reducing parser friction for clients that emit lowercase target tags while preserving strict invalid-target rejection.
+- Added regression coverage proving lowercase target decoding parity for both `Describe` and `Close` lifecycle messages.
+- Re-validated the full safety gate after the parser delta (`cargo fmt --all`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-features`) with all checks green.
+
+### Current blockers
+- None in-repo.
+
+### Next loops
+1. Continue PostgreSQL extended-query lifecycle hardening with malformed-frame regressions around boundary and target/payload invariants.
+2. Keep loops atomic: protocol delta + full fmt/clippy/test validation + focused commit.
+
 ## 2026-04-19
 
 ### Completed
