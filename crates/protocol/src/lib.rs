@@ -575,8 +575,8 @@ pub fn parse_frontend_message(frame: &[u8]) -> Result<FrontendMessage, FrontendM
                 return Err(FrontendMessageError::TooShort);
             };
             let target = match target_byte {
-                b'S' => DescribeTarget::Statement,
-                b'P' => DescribeTarget::Portal,
+                b'S' | b's' => DescribeTarget::Statement,
+                b'P' | b'p' => DescribeTarget::Portal,
                 _ => return Err(FrontendMessageError::InvalidDescribeTarget),
             };
 
@@ -592,8 +592,8 @@ pub fn parse_frontend_message(frame: &[u8]) -> Result<FrontendMessage, FrontendM
                 return Err(FrontendMessageError::TooShort);
             };
             let target = match target_byte {
-                b'S' => DescribeTarget::Statement,
-                b'P' => DescribeTarget::Portal,
+                b'S' | b's' => DescribeTarget::Statement,
+                b'P' | b'p' => DescribeTarget::Portal,
                 _ => return Err(FrontendMessageError::InvalidCloseTarget),
             };
 
@@ -3398,6 +3398,24 @@ mod tests {
             }
         );
 
+        let describe_stmt_lowercase = frontend_frame(b'D', b"sstmt1\0");
+        assert_eq!(
+            parse_frontend_message(&describe_stmt_lowercase).unwrap(),
+            FrontendMessage::Describe {
+                target: DescribeTarget::Statement,
+                name: "stmt1".to_string(),
+            }
+        );
+
+        let describe_portal_lowercase = frontend_frame(b'D', b"pportal1\0");
+        assert_eq!(
+            parse_frontend_message(&describe_portal_lowercase).unwrap(),
+            FrontendMessage::Describe {
+                target: DescribeTarget::Portal,
+                name: "portal1".to_string(),
+            }
+        );
+
         let close_stmt = frontend_frame(b'C', b"Sstmt1\0");
         assert_eq!(
             parse_frontend_message(&close_stmt).unwrap(),
@@ -3410,6 +3428,24 @@ mod tests {
         let close_portal = frontend_frame(b'C', b"Pportal1\0");
         assert_eq!(
             parse_frontend_message(&close_portal).unwrap(),
+            FrontendMessage::Close {
+                target: DescribeTarget::Portal,
+                name: "portal1".to_string(),
+            }
+        );
+
+        let close_stmt_lowercase = frontend_frame(b'C', b"sstmt1\0");
+        assert_eq!(
+            parse_frontend_message(&close_stmt_lowercase).unwrap(),
+            FrontendMessage::Close {
+                target: DescribeTarget::Statement,
+                name: "stmt1".to_string(),
+            }
+        );
+
+        let close_portal_lowercase = frontend_frame(b'C', b"pportal1\0");
+        assert_eq!(
+            parse_frontend_message(&close_portal_lowercase).unwrap(),
             FrontendMessage::Close {
                 target: DescribeTarget::Portal,
                 name: "portal1".to_string(),
