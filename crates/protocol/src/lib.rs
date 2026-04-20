@@ -265,11 +265,11 @@ pub enum FrontendMessageError {
     UnterminatedParseQuery,
     #[error("parse message parameter type payload is malformed")]
     InvalidParseParameterPayload,
-    #[error("describe message target must be S (statement) or P (portal)")]
+    #[error("describe message target must be S/s (statement) or P/p (portal)")]
     InvalidDescribeTarget,
     #[error("describe message name is not null terminated")]
     UnterminatedDescribeName,
-    #[error("close message target must be S (statement) or P (portal)")]
+    #[error("close message target must be S/s (statement) or P/p (portal)")]
     InvalidCloseTarget,
     #[error("close message name is not null terminated")]
     UnterminatedCloseName,
@@ -3416,6 +3416,24 @@ mod tests {
             }
         );
 
+        let describe_unnamed_statement = frontend_frame(b'D', b"S\0");
+        assert_eq!(
+            parse_frontend_message(&describe_unnamed_statement).unwrap(),
+            FrontendMessage::Describe {
+                target: DescribeTarget::Statement,
+                name: String::new(),
+            }
+        );
+
+        let describe_unnamed_portal_lowercase = frontend_frame(b'D', b"p\0");
+        assert_eq!(
+            parse_frontend_message(&describe_unnamed_portal_lowercase).unwrap(),
+            FrontendMessage::Describe {
+                target: DescribeTarget::Portal,
+                name: String::new(),
+            }
+        );
+
         let close_stmt = frontend_frame(b'C', b"Sstmt1\0");
         assert_eq!(
             parse_frontend_message(&close_stmt).unwrap(),
@@ -3449,6 +3467,24 @@ mod tests {
             FrontendMessage::Close {
                 target: DescribeTarget::Portal,
                 name: "portal1".to_string(),
+            }
+        );
+
+        let close_unnamed_statement = frontend_frame(b'C', b"S\0");
+        assert_eq!(
+            parse_frontend_message(&close_unnamed_statement).unwrap(),
+            FrontendMessage::Close {
+                target: DescribeTarget::Statement,
+                name: String::new(),
+            }
+        );
+
+        let close_unnamed_portal_lowercase = frontend_frame(b'C', b"p\0");
+        assert_eq!(
+            parse_frontend_message(&close_unnamed_portal_lowercase).unwrap(),
+            FrontendMessage::Close {
+                target: DescribeTarget::Portal,
+                name: String::new(),
             }
         );
 
