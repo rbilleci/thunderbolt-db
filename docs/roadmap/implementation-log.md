@@ -5,6 +5,8 @@
 ### Completed
 - Hardened PostgreSQL extended-query compatibility by accepting lowercase `Describe`/`Close` targets (`s`/`p`) in addition to canonical uppercase (`S`/`P`), reducing parser friction for clients that emit lowercase target tags while preserving strict invalid-target rejection.
 - Added regression coverage proving lowercase target decoding parity for both `Describe` and `Close` lifecycle messages.
+- Added extended-query lifecycle regressions covering unnamed `Describe`/`Close` targets (`D S\0`, `D p\0`, `C S\0`, `C p\0`) so PostgreSQL unnamed statement/portal flows stay explicitly validated across uppercase/lowercase target tags.
+- Clarified frontend parser diagnostics for `Describe`/`Close` target validation to match the implemented case-insensitive target contract (`S/s`, `P/p`).
 - Re-validated the full safety gate after the parser delta (`cargo fmt --all`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-features`) with all checks green.
 
 ### Current blockers
