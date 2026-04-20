@@ -3497,6 +3497,19 @@ mod tests {
             }
         );
 
+        let mut execute_unnamed_portal_unlimited_rows_payload = Vec::new();
+        execute_unnamed_portal_unlimited_rows_payload.extend_from_slice(b"\0");
+        execute_unnamed_portal_unlimited_rows_payload.extend_from_slice(&0_u32.to_be_bytes());
+        let execute_unnamed_portal_unlimited_rows =
+            frontend_frame(b'E', &execute_unnamed_portal_unlimited_rows_payload);
+        assert_eq!(
+            parse_frontend_message(&execute_unnamed_portal_unlimited_rows).unwrap(),
+            FrontendMessage::Execute {
+                portal_name: String::new(),
+                max_rows: 0,
+            }
+        );
+
         let mut function_call_payload = Vec::new();
         function_call_payload.extend_from_slice(&42_u32.to_be_bytes());
         function_call_payload.extend_from_slice(&1_i16.to_be_bytes());
