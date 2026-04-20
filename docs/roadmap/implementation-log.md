@@ -3,6 +3,9 @@
 ## 2026-04-20
 
 ### Completed
+- Aligned PostgreSQL `Bind` (`B`) frontend parsing with protocol cardinality semantics by accepting multiple result-format codes (`R > 1`) instead of rejecting them as malformed; parser still enforces per-code validity (`0` or `1`) and full frame-boundary correctness.
+- Added regression coverage proving multi-result-format bind frames parse deterministically into `FrontendMessage::Bind { result_format_codes: vec![...] }` without weakening malformed-payload rejection paths.
+- Re-validated the full safety gate after the bind-cardinality fix (`cargo fmt --all`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-features`) with all checks green.
 - Added malformed extended-query lifecycle regressions proving unnamed lowercase and uppercase `Describe`/`Close` targets (`D p\0`, `D S\0`, `C s\0`, `C P\0`) still enforce strict frame boundaries and reject trailing bytes deterministically as `UnterminatedDescribeName` / `UnterminatedCloseName`.
 - Hardened PostgreSQL extended-query compatibility by accepting lowercase `Describe`/`Close` targets (`s`/`p`) in addition to canonical uppercase (`S`/`P`), reducing parser friction for clients that emit lowercase target tags while preserving strict invalid-target rejection.
 - Added regression coverage proving lowercase target decoding parity for both `Describe` and `Close` lifecycle messages.
