@@ -3715,6 +3715,12 @@ mod tests {
             FrontendMessageError::UnterminatedDescribeName
         );
 
+        let truncated_describe_name_lowercase_target = frontend_frame(b'D', b"pportal");
+        assert_eq!(
+            parse_frontend_message(&truncated_describe_name_lowercase_target).unwrap_err(),
+            FrontendMessageError::UnterminatedDescribeName
+        );
+
         let invalid_describe_target = frontend_frame(b'D', b"Xstmt\0");
         assert_eq!(
             parse_frontend_message(&invalid_describe_target).unwrap_err(),
@@ -3748,6 +3754,12 @@ mod tests {
         let truncated_close_name = frontend_frame(b'C', b"P");
         assert_eq!(
             parse_frontend_message(&truncated_close_name).unwrap_err(),
+            FrontendMessageError::UnterminatedCloseName
+        );
+
+        let truncated_close_name_lowercase_target = frontend_frame(b'C', b"sstmt");
+        assert_eq!(
+            parse_frontend_message(&truncated_close_name_lowercase_target).unwrap_err(),
             FrontendMessageError::UnterminatedCloseName
         );
 
