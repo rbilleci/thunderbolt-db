@@ -3517,6 +3517,37 @@ mod tests {
             }
         );
 
+        let mut function_call_with_multiple_argument_formats_payload = Vec::new();
+        function_call_with_multiple_argument_formats_payload
+            .extend_from_slice(&7_u32.to_be_bytes());
+        function_call_with_multiple_argument_formats_payload
+            .extend_from_slice(&2_i16.to_be_bytes());
+        function_call_with_multiple_argument_formats_payload
+            .extend_from_slice(&0_i16.to_be_bytes());
+        function_call_with_multiple_argument_formats_payload
+            .extend_from_slice(&1_i16.to_be_bytes());
+        function_call_with_multiple_argument_formats_payload
+            .extend_from_slice(&2_i16.to_be_bytes());
+        function_call_with_multiple_argument_formats_payload
+            .extend_from_slice(&3_i32.to_be_bytes());
+        function_call_with_multiple_argument_formats_payload.extend_from_slice(b"foo");
+        function_call_with_multiple_argument_formats_payload
+            .extend_from_slice(&2_i32.to_be_bytes());
+        function_call_with_multiple_argument_formats_payload.extend_from_slice(&[0xCA, 0xFE]);
+        function_call_with_multiple_argument_formats_payload
+            .extend_from_slice(&1_i16.to_be_bytes());
+        let function_call_with_multiple_argument_formats =
+            frontend_frame(b'F', &function_call_with_multiple_argument_formats_payload);
+        assert_eq!(
+            parse_frontend_message(&function_call_with_multiple_argument_formats).unwrap(),
+            FrontendMessage::FunctionCall {
+                function_oid: 7,
+                argument_format_codes: vec![0, 1],
+                arguments: vec![Some(b"foo".to_vec()), Some(vec![0xCA, 0xFE])],
+                result_format_code: 1,
+            }
+        );
+
         let copy_data = frontend_frame(b'd', &[0, 1, 2, 3]);
         assert_eq!(
             parse_frontend_message(&copy_data).unwrap(),
