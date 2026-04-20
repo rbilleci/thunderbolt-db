@@ -3739,6 +3739,12 @@ mod tests {
             FrontendMessageError::InvalidUtf8
         );
 
+        let invalid_utf8_describe_name_lowercase_target = frontend_frame(b'D', b"p\xFF\0");
+        assert_eq!(
+            parse_frontend_message(&invalid_utf8_describe_name_lowercase_target).unwrap_err(),
+            FrontendMessageError::InvalidUtf8
+        );
+
         let describe_with_trailing_bytes_after_name = frontend_frame(b'D', b"Sstmt\0\xFF");
         assert_eq!(
             parse_frontend_message(&describe_with_trailing_bytes_after_name).unwrap_err(),
@@ -3792,6 +3798,12 @@ mod tests {
         let invalid_utf8_close_name = frontend_frame(b'C', b"S\xFF\0");
         assert_eq!(
             parse_frontend_message(&invalid_utf8_close_name).unwrap_err(),
+            FrontendMessageError::InvalidUtf8
+        );
+
+        let invalid_utf8_close_name_lowercase_target = frontend_frame(b'C', b"s\xFF\0");
+        assert_eq!(
+            parse_frontend_message(&invalid_utf8_close_name_lowercase_target).unwrap_err(),
             FrontendMessageError::InvalidUtf8
         );
 
