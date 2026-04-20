@@ -8,6 +8,7 @@
 - Added extended-query lifecycle regressions covering unnamed `Describe`/`Close` targets (`D S\0`, `D p\0`, `C S\0`, `C p\0`) so PostgreSQL unnamed statement/portal flows stay explicitly validated across uppercase/lowercase target tags.
 - Clarified frontend parser diagnostics for `Describe`/`Close` target validation to match the implemented case-insensitive target contract (`S/s`, `P/p`).
 - Re-validated the full safety gate after the parser delta (`cargo fmt --all`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-features`) with all checks green.
+- Added malformed extended-query lifecycle regressions proving lowercase `Describe`/`Close` targets (`p`/`s`) still enforce C-string termination boundaries (`D pportal`, `C sstmt`) and reject truncated payloads deterministically as `UnterminatedDescribeName` / `UnterminatedCloseName`.
 
 ### Current blockers
 - None in-repo.
