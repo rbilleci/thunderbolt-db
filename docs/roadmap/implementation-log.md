@@ -3,6 +3,7 @@
 ## 2026-04-20
 
 ### Completed
+- Added malformed extended-query regression coverage proving PostgreSQL `FunctionCall` (`F`) frames with multi-entry argument-format sections still reject out-of-range per-argument format codes (for example `C=2` with a `2` code) deterministically as `InvalidFunctionCallPayload`.
 - Added extended-query regression coverage proving PostgreSQL `FunctionCall` (`F`) parsing accepts per-argument format-code vectors (`C` format codes matching `N` arguments) and decodes mixed text/binary argument payloads without relaxing malformed-frame rejection behavior.
 - Aligned PostgreSQL `Bind` (`B`) frontend parsing with protocol cardinality semantics by accepting multiple result-format codes (`R > 1`) instead of rejecting them as malformed; parser still enforces per-code validity (`0` or `1`) and full frame-boundary correctness.
 - Added regression coverage proving multi-result-format bind frames parse deterministically into `FrontendMessage::Bind { result_format_codes: vec![...] }` without weakening malformed-payload rejection paths.

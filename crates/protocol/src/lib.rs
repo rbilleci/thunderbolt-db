@@ -4112,6 +4112,21 @@ mod tests {
             FrontendMessageError::InvalidFunctionCallPayload
         );
 
+        let mut invalid_function_call_multi_format_code_payload = Vec::new();
+        invalid_function_call_multi_format_code_payload.extend_from_slice(&42_u32.to_be_bytes());
+        invalid_function_call_multi_format_code_payload.extend_from_slice(&2_i16.to_be_bytes());
+        invalid_function_call_multi_format_code_payload.extend_from_slice(&0_i16.to_be_bytes());
+        invalid_function_call_multi_format_code_payload.extend_from_slice(&2_i16.to_be_bytes());
+        invalid_function_call_multi_format_code_payload.extend_from_slice(&0_i16.to_be_bytes());
+        invalid_function_call_multi_format_code_payload.extend_from_slice(&0_i16.to_be_bytes());
+        invalid_function_call_multi_format_code_payload.extend_from_slice(&0_i16.to_be_bytes());
+        let invalid_function_call_multi_format_code =
+            frontend_frame(b'F', &invalid_function_call_multi_format_code_payload);
+        assert_eq!(
+            parse_frontend_message(&invalid_function_call_multi_format_code).unwrap_err(),
+            FrontendMessageError::InvalidFunctionCallPayload
+        );
+
         let mut invalid_function_call_format_count_payload = Vec::new();
         invalid_function_call_format_count_payload.extend_from_slice(&42_u32.to_be_bytes());
         invalid_function_call_format_count_payload.extend_from_slice(&2_i16.to_be_bytes());
