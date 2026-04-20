@@ -3390,6 +3390,24 @@ mod tests {
             }
         );
 
+        let mut bind_unnamed_with_default_formats_payload = Vec::new();
+        bind_unnamed_with_default_formats_payload.extend_from_slice(b"\0\0");
+        bind_unnamed_with_default_formats_payload.extend_from_slice(&0_i16.to_be_bytes());
+        bind_unnamed_with_default_formats_payload.extend_from_slice(&0_i16.to_be_bytes());
+        bind_unnamed_with_default_formats_payload.extend_from_slice(&0_i16.to_be_bytes());
+        let bind_unnamed_with_default_formats =
+            frontend_frame(b'B', &bind_unnamed_with_default_formats_payload);
+        assert_eq!(
+            parse_frontend_message(&bind_unnamed_with_default_formats).unwrap(),
+            FrontendMessage::Bind {
+                portal_name: String::new(),
+                statement_name: String::new(),
+                parameter_format_codes: vec![],
+                parameters: vec![],
+                result_format_codes: vec![],
+            }
+        );
+
         let describe_stmt = frontend_frame(b'D', b"Sstmt1\0");
         assert_eq!(
             parse_frontend_message(&describe_stmt).unwrap(),
@@ -3730,6 +3748,25 @@ mod tests {
         assert_eq!(
             parse_frontend_message(&malformed_parse).unwrap_err(),
             FrontendMessageError::InvalidParseParameterPayload
+        );
+
+        let mut malformed_bind_with_truncated_result_format_codes_payload = Vec::new();
+        malformed_bind_with_truncated_result_format_codes_payload.extend_from_slice(b"\0\0");
+        malformed_bind_with_truncated_result_format_codes_payload
+            .extend_from_slice(&0_i16.to_be_bytes());
+        malformed_bind_with_truncated_result_format_codes_payload
+            .extend_from_slice(&0_i16.to_be_bytes());
+        malformed_bind_with_truncated_result_format_codes_payload
+            .extend_from_slice(&2_i16.to_be_bytes());
+        malformed_bind_with_truncated_result_format_codes_payload
+            .extend_from_slice(&1_i16.to_be_bytes());
+        let malformed_bind_with_truncated_result_format_codes = frontend_frame(
+            b'B',
+            &malformed_bind_with_truncated_result_format_codes_payload,
+        );
+        assert_eq!(
+            parse_frontend_message(&malformed_bind_with_truncated_result_format_codes).unwrap_err(),
+            FrontendMessageError::InvalidBindPayload
         );
 
         let invalid_utf8_parse_statement_name = frontend_frame(
