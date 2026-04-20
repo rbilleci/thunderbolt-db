@@ -4142,6 +4142,21 @@ mod tests {
             FrontendMessageError::InvalidFunctionCallPayload
         );
 
+        let mut invalid_function_call_zero_arg_multi_format_payload = Vec::new();
+        invalid_function_call_zero_arg_multi_format_payload
+            .extend_from_slice(&42_u32.to_be_bytes());
+        invalid_function_call_zero_arg_multi_format_payload.extend_from_slice(&2_i16.to_be_bytes());
+        invalid_function_call_zero_arg_multi_format_payload.extend_from_slice(&0_i16.to_be_bytes());
+        invalid_function_call_zero_arg_multi_format_payload.extend_from_slice(&1_i16.to_be_bytes());
+        invalid_function_call_zero_arg_multi_format_payload.extend_from_slice(&0_i16.to_be_bytes());
+        invalid_function_call_zero_arg_multi_format_payload.extend_from_slice(&0_i16.to_be_bytes());
+        let invalid_function_call_zero_arg_multi_format =
+            frontend_frame(b'F', &invalid_function_call_zero_arg_multi_format_payload);
+        assert_eq!(
+            parse_frontend_message(&invalid_function_call_zero_arg_multi_format).unwrap_err(),
+            FrontendMessageError::InvalidFunctionCallPayload
+        );
+
         let mut negative_function_call_arg_count_payload = Vec::new();
         negative_function_call_arg_count_payload.extend_from_slice(&42_u32.to_be_bytes());
         negative_function_call_arg_count_payload.extend_from_slice(&0_i16.to_be_bytes());
