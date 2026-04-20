@@ -17,6 +17,7 @@
 - Clarified frontend parser diagnostics for `Describe`/`Close` target validation to match the implemented case-insensitive target contract (`S/s`, `P/p`).
 - Re-validated the full safety gate after the parser delta (`cargo fmt --all`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-features`) with all checks green.
 - Added malformed extended-query lifecycle regressions proving lowercase `Describe`/`Close` targets (`p`/`s`) still enforce C-string termination boundaries (`D pportal`, `C sstmt`) and reject truncated payloads deterministically as `UnterminatedDescribeName` / `UnterminatedCloseName`.
+- Added bind-cardinality regressions for zero-parameter frames: parser now has explicit coverage that `B` payloads reject multi-entry parameter format vectors when `N=0` (`C=2` -> `InvalidBindPayload`) while continuing to accept single shared format vectors (`C=1`, `N=0`) with deterministic decode.
 
 ### Current blockers
 - None in-repo.
