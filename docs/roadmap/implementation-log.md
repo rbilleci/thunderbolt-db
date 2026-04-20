@@ -3,6 +3,7 @@
 ## 2026-04-20
 
 ### Completed
+- Added extended-query parser regression coverage proving PostgreSQL `Parse` (`P`) frames accept unnamed-statement flows with zero parameter OIDs (`"\0SELECT 1\0" + nparams=0`), keeping startup/prepare compatibility explicit for clients that use the unnamed prepared statement.
 - Added malformed extended-query regression coverage proving PostgreSQL `FunctionCall` (`F`) frames still enforce cardinality when no arguments are supplied (`N=0`): multi-entry argument-format vectors (`C=2`) are now explicitly covered as deterministic `InvalidFunctionCallPayload` rejections.
 - Added malformed extended-query regression coverage proving PostgreSQL `FunctionCall` (`F`) frames with multi-entry argument-format sections still reject out-of-range per-argument format codes (for example `C=2` with a `2` code) deterministically as `InvalidFunctionCallPayload`.
 - Added extended-query regression coverage proving PostgreSQL `FunctionCall` (`F`) parsing accepts per-argument format-code vectors (`C` format codes matching `N` arguments) and decodes mixed text/binary argument payloads without relaxing malformed-frame rejection behavior.

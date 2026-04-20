@@ -3355,6 +3355,19 @@ mod tests {
             }
         );
 
+        let mut parse_unnamed_statement_payload = Vec::new();
+        parse_unnamed_statement_payload.extend_from_slice(b"\0SELECT 1\0");
+        parse_unnamed_statement_payload.extend_from_slice(&0_i16.to_be_bytes());
+        let parse_unnamed_statement = frontend_frame(b'P', &parse_unnamed_statement_payload);
+        assert_eq!(
+            parse_frontend_message(&parse_unnamed_statement).unwrap(),
+            FrontendMessage::Parse {
+                statement_name: String::new(),
+                query: "SELECT 1".to_string(),
+                parameter_type_oids: vec![],
+            }
+        );
+
         let mut bind_payload = Vec::new();
         bind_payload.extend_from_slice(b"portal1\0stmt1\0");
         bind_payload.extend_from_slice(&1_i16.to_be_bytes());
