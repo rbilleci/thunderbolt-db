@@ -3,7 +3,7 @@
 ## 2026-04-20
 
 ### Completed
-- Added malformed extended-query lifecycle regressions proving unnamed lowercase `Describe`/`Close` targets (`D p\0`, `C s\0`) still enforce strict frame boundaries and reject trailing bytes deterministically as `UnterminatedDescribeName` / `UnterminatedCloseName`.
+- Added malformed extended-query lifecycle regressions proving unnamed lowercase and uppercase `Describe`/`Close` targets (`D p\0`, `D S\0`, `C s\0`, `C P\0`) still enforce strict frame boundaries and reject trailing bytes deterministically as `UnterminatedDescribeName` / `UnterminatedCloseName`.
 - Hardened PostgreSQL extended-query compatibility by accepting lowercase `Describe`/`Close` targets (`s`/`p`) in addition to canonical uppercase (`S`/`P`), reducing parser friction for clients that emit lowercase target tags while preserving strict invalid-target rejection.
 - Added regression coverage proving lowercase target decoding parity for both `Describe` and `Close` lifecycle messages.
 - Added extended-query lifecycle regressions covering unnamed `Describe`/`Close` targets (`D S\0`, `D p\0`, `C S\0`, `C p\0`) so PostgreSQL unnamed statement/portal flows stay explicitly validated across uppercase/lowercase target tags.

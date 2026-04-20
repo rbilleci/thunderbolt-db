@@ -3751,6 +3751,14 @@ mod tests {
             FrontendMessageError::UnterminatedDescribeName
         );
 
+        let describe_unnamed_uppercase_with_trailing_bytes_after_name =
+            frontend_frame(b'D', b"S\0\xFF");
+        assert_eq!(
+            parse_frontend_message(&describe_unnamed_uppercase_with_trailing_bytes_after_name)
+                .unwrap_err(),
+            FrontendMessageError::UnterminatedDescribeName
+        );
+
         let empty_close = frontend_frame(b'C', b"");
         assert_eq!(
             parse_frontend_message(&empty_close).unwrap_err(),
@@ -3796,6 +3804,14 @@ mod tests {
         let close_unnamed_with_trailing_bytes_after_name = frontend_frame(b'C', b"s\0\xFF");
         assert_eq!(
             parse_frontend_message(&close_unnamed_with_trailing_bytes_after_name).unwrap_err(),
+            FrontendMessageError::UnterminatedCloseName
+        );
+
+        let close_unnamed_uppercase_with_trailing_bytes_after_name =
+            frontend_frame(b'C', b"P\0\xFF");
+        assert_eq!(
+            parse_frontend_message(&close_unnamed_uppercase_with_trailing_bytes_after_name)
+                .unwrap_err(),
             FrontendMessageError::UnterminatedCloseName
         );
 
