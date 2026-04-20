@@ -18,6 +18,8 @@
 - Re-validated the full safety gate after the parser delta (`cargo fmt --all`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-features`) with all checks green.
 - Added malformed extended-query lifecycle regressions proving lowercase `Describe`/`Close` targets (`p`/`s`) still enforce C-string termination boundaries (`D pportal`, `C sstmt`) and reject truncated payloads deterministically as `UnterminatedDescribeName` / `UnterminatedCloseName`.
 - Added bind-cardinality regressions for zero-parameter frames: parser now has explicit coverage that `B` payloads reject multi-entry parameter format vectors when `N=0` (`C=2` -> `InvalidBindPayload`) while continuing to accept single shared format vectors (`C=1`, `N=0`) with deterministic decode.
+- Added function-call parity regression for zero-argument frames: `F` payloads now explicitly cover acceptance of a single shared argument format code when `N=0` (while existing coverage still rejects invalid multi-code vectors for zero args).
+- Added execute-frame regression for unnamed portal/unlimited-row semantics: parser now explicitly covers `E` with empty portal name and `max_rows = 0` decoding deterministically as unlimited execution on the unnamed portal.
 
 ### Current blockers
 - None in-repo.
