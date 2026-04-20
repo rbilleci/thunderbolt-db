@@ -487,9 +487,6 @@ pub fn parse_frontend_message(frame: &[u8]) -> Result<FrontendMessage, FrontendM
                 return Err(FrontendMessageError::InvalidBindPayload);
             }
             let result_format_count = result_format_count as usize;
-            if result_format_count > 1 {
-                return Err(FrontendMessageError::InvalidBindPayload);
-            }
             let mut result_format_codes = Vec::with_capacity(result_format_count);
             for _ in 0..result_format_count {
                 let format_code = read_i16(payload, &mut offset)?;
@@ -3940,18 +3937,24 @@ mod tests {
             FrontendMessageError::InvalidBindPayload
         );
 
-        let mut invalid_bind_result_format_count_payload = Vec::new();
-        invalid_bind_result_format_count_payload.extend_from_slice(b"portal\0stmt\0");
-        invalid_bind_result_format_count_payload.extend_from_slice(&0_i16.to_be_bytes());
-        invalid_bind_result_format_count_payload.extend_from_slice(&0_i16.to_be_bytes());
-        invalid_bind_result_format_count_payload.extend_from_slice(&2_i16.to_be_bytes());
-        invalid_bind_result_format_count_payload.extend_from_slice(&0_i16.to_be_bytes());
-        invalid_bind_result_format_count_payload.extend_from_slice(&1_i16.to_be_bytes());
-        let invalid_bind_result_format_count =
-            frontend_frame(b'B', &invalid_bind_result_format_count_payload);
+        let mut bind_with_multiple_result_formats_payload = Vec::new();
+        bind_with_multiple_result_formats_payload.extend_from_slice(b"portal\0stmt\0");
+        bind_with_multiple_result_formats_payload.extend_from_slice(&0_i16.to_be_bytes());
+        bind_with_multiple_result_formats_payload.extend_from_slice(&0_i16.to_be_bytes());
+        bind_with_multiple_result_formats_payload.extend_from_slice(&2_i16.to_be_bytes());
+        bind_with_multiple_result_formats_payload.extend_from_slice(&0_i16.to_be_bytes());
+        bind_with_multiple_result_formats_payload.extend_from_slice(&1_i16.to_be_bytes());
+        let bind_with_multiple_result_formats =
+            frontend_frame(b'B', &bind_with_multiple_result_formats_payload);
         assert_eq!(
-            parse_frontend_message(&invalid_bind_result_format_count).unwrap_err(),
-            FrontendMessageError::InvalidBindPayload
+            parse_frontend_message(&bind_with_multiple_result_formats).unwrap(),
+            FrontendMessage::Bind {
+                portal_name: "portal".to_string(),
+                statement_name: "stmt".to_string(),
+                parameter_format_codes: vec![],
+                parameters: vec![],
+                result_format_codes: vec![0, 1],
+            }
         );
 
         let mut truncated_bind_result_format_payload = Vec::new();
