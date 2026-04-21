@@ -3822,6 +3822,27 @@ mod tests {
             FrontendMessageError::InvalidBindPayload
         );
 
+        let mut malformed_bind_with_zero_params_and_invalid_shared_format_payload = Vec::new();
+        malformed_bind_with_zero_params_and_invalid_shared_format_payload
+            .extend_from_slice(b"\0\0");
+        malformed_bind_with_zero_params_and_invalid_shared_format_payload
+            .extend_from_slice(&1_i16.to_be_bytes());
+        malformed_bind_with_zero_params_and_invalid_shared_format_payload
+            .extend_from_slice(&2_i16.to_be_bytes());
+        malformed_bind_with_zero_params_and_invalid_shared_format_payload
+            .extend_from_slice(&0_i16.to_be_bytes());
+        malformed_bind_with_zero_params_and_invalid_shared_format_payload
+            .extend_from_slice(&0_i16.to_be_bytes());
+        let malformed_bind_with_zero_params_and_invalid_shared_format = frontend_frame(
+            b'B',
+            &malformed_bind_with_zero_params_and_invalid_shared_format_payload,
+        );
+        assert_eq!(
+            parse_frontend_message(&malformed_bind_with_zero_params_and_invalid_shared_format)
+                .unwrap_err(),
+            FrontendMessageError::InvalidBindPayload
+        );
+
         let invalid_utf8_parse_statement_name = frontend_frame(
             b'P',
             &[
