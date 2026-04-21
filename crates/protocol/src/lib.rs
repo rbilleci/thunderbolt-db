@@ -3670,6 +3670,32 @@ mod tests {
             }
         );
 
+        let mut function_call_with_zero_args_and_single_shared_text_format_payload = Vec::new();
+        function_call_with_zero_args_and_single_shared_text_format_payload
+            .extend_from_slice(&100_u32.to_be_bytes());
+        function_call_with_zero_args_and_single_shared_text_format_payload
+            .extend_from_slice(&1_i16.to_be_bytes());
+        function_call_with_zero_args_and_single_shared_text_format_payload
+            .extend_from_slice(&0_i16.to_be_bytes());
+        function_call_with_zero_args_and_single_shared_text_format_payload
+            .extend_from_slice(&0_i16.to_be_bytes());
+        function_call_with_zero_args_and_single_shared_text_format_payload
+            .extend_from_slice(&0_i16.to_be_bytes());
+        let function_call_with_zero_args_and_single_shared_text_format = frontend_frame(
+            b'F',
+            &function_call_with_zero_args_and_single_shared_text_format_payload,
+        );
+        assert_eq!(
+            parse_frontend_message(&function_call_with_zero_args_and_single_shared_text_format)
+                .unwrap(),
+            FrontendMessage::FunctionCall {
+                function_oid: 100,
+                argument_format_codes: vec![0],
+                arguments: vec![],
+                result_format_code: 0,
+            }
+        );
+
         let copy_data = frontend_frame(b'd', &[0, 1, 2, 3]);
         assert_eq!(
             parse_frontend_message(&copy_data).unwrap(),

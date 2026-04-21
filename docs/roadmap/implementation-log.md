@@ -3,6 +3,7 @@
 ## 2026-04-21
 
 ### Completed
+- Added extended-query regression coverage proving PostgreSQL `FunctionCall` (`F`) frames with zero arguments (`N=0`) accept a single shared text format code (`C=1`, code `0`) and decode deterministically with text result format (`R=0`).
 - Added malformed `Bind` (`B`) regression coverage proving zero-parameter frames (`N=0`) still validate shared parameter-format codes (`C=1`) and deterministically reject out-of-range values (`2`) as `InvalidBindPayload`.
 - Added malformed extended-query regression coverage proving PostgreSQL `FunctionCall` (`F`) frames reject out-of-range positive result-format codes (`2`) deterministically as `InvalidFunctionCallPayload`.
 - Extended reset-command compatibility to accept `RESET SESSION AUTHORIZATION TO DEFAULT` and `RESET SESSION AUTH TO DEFAULT` as `ResetAll` no-op aliases, reducing parser friction for PostgreSQL-style reset probes that include an explicit `TO` keyword.
