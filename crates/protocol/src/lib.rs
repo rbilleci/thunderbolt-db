@@ -4197,6 +4197,19 @@ mod tests {
             FrontendMessageError::InvalidBindPayload
         );
 
+        let mut truncated_bind_parameter_value_payload = Vec::new();
+        truncated_bind_parameter_value_payload.extend_from_slice(b"portal\0stmt\0");
+        truncated_bind_parameter_value_payload.extend_from_slice(&0_i16.to_be_bytes());
+        truncated_bind_parameter_value_payload.extend_from_slice(&1_i16.to_be_bytes());
+        truncated_bind_parameter_value_payload.extend_from_slice(&3_i32.to_be_bytes());
+        truncated_bind_parameter_value_payload.extend_from_slice(b"ab");
+        let truncated_bind_parameter_value =
+            frontend_frame(b'B', &truncated_bind_parameter_value_payload);
+        assert_eq!(
+            parse_frontend_message(&truncated_bind_parameter_value).unwrap_err(),
+            FrontendMessageError::InvalidBindPayload
+        );
+
         let mut negative_bind_result_format_count_payload = Vec::new();
         negative_bind_result_format_count_payload.extend_from_slice(b"portal\0stmt\0");
         negative_bind_result_format_count_payload.extend_from_slice(&0_i16.to_be_bytes());
