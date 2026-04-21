@@ -22,7 +22,7 @@ pub enum ParseError {
     InvalidDel,
     #[error("invalid GET syntax; expected: GET key")]
     InvalidGet,
-    #[error("invalid RESET/DISCARD/DEALLOCATE/CLOSE/LISTEN/NOTIFY/UNLISTEN syntax; expected: RESET ALL|ROLE|AUTHORIZATION|AUTH|SESSION AUTHORIZATION[ DEFAULT]|SESSION AUTH[ DEFAULT], DISCARD {{ALL|TEMP|TEMPORARY|TEMP TABLES|TEMPORARY TABLES|PLANS|SEQUENCES}}, DEALLOCATE {{ALL|name|PREPARE|PREPARED name}}, CLOSE {{ALL|name}}, LISTEN channel, NOTIFY channel[, payload], or UNLISTEN [*|ALL|channel]")]
+    #[error("invalid RESET/DISCARD/DEALLOCATE/CLOSE/LISTEN/NOTIFY/UNLISTEN syntax; expected: RESET ALL|ROLE|AUTHORIZATION|AUTH|SESSION AUTHORIZATION[ [TO] DEFAULT]|SESSION AUTH[ [TO] DEFAULT], DISCARD {{ALL|TEMP|TEMPORARY|TEMP TABLES|TEMPORARY TABLES|PLANS|SEQUENCES}}, DEALLOCATE {{ALL|name|PREPARE|PREPARED name}}, CLOSE {{ALL|name}}, LISTEN channel, NOTIFY channel[, payload], or UNLISTEN [*|ALL|channel]")]
     InvalidReset,
 }
 
@@ -941,6 +941,15 @@ fn parse_reset_command(input: &str) -> Option<Result<Command, ParseError>> {
                 if session.eq_ignore_ascii_case("SESSION")
                     && (authorization.eq_ignore_ascii_case("AUTHORIZATION")
                         || authorization.eq_ignore_ascii_case("AUTH"))
+                    && default.eq_ignore_ascii_case("DEFAULT") =>
+            {
+                Ok(Command::ResetAll)
+            }
+            [session, authorization, to, default]
+                if session.eq_ignore_ascii_case("SESSION")
+                    && (authorization.eq_ignore_ascii_case("AUTHORIZATION")
+                        || authorization.eq_ignore_ascii_case("AUTH"))
+                    && to.eq_ignore_ascii_case("TO")
                     && default.eq_ignore_ascii_case("DEFAULT") =>
             {
                 Ok(Command::ResetAll)
@@ -2013,10 +2022,16 @@ mod tests {
         let cmd = parse_command("RESET SESSION AUTHORIZATION DEFAULT").unwrap();
         assert_eq!(cmd, Command::ResetAll);
 
+        let cmd = parse_command("RESET SESSION AUTHORIZATION TO DEFAULT").unwrap();
+        assert_eq!(cmd, Command::ResetAll);
+
         let cmd = parse_command("RESET SESSION AUTH").unwrap();
         assert_eq!(cmd, Command::ResetAll);
 
         let cmd = parse_command("RESET SESSION AUTH DEFAULT").unwrap();
+        assert_eq!(cmd, Command::ResetAll);
+
+        let cmd = parse_command("RESET SESSION AUTH TO DEFAULT").unwrap();
         assert_eq!(cmd, Command::ResetAll);
 
         let cmd = parse_command("DISCARD TEMP").unwrap();
@@ -2608,7 +2623,15 @@ mod tests {
             Err(ParseError::InvalidReset)
         ));
         assert!(matches!(
+            parse_command("RESET SESSION AUTHORIZATION TO DEFAULT NOW"),
+            Err(ParseError::InvalidReset)
+        ));
+        assert!(matches!(
             parse_command("RESET SESSION AUTH DEFAULT NOW"),
+            Err(ParseError::InvalidReset)
+        ));
+        assert!(matches!(
+            parse_command("RESET SESSION AUTH TO DEFAULT NOW"),
             Err(ParseError::InvalidReset)
         ));
         assert!(matches!(
@@ -2922,11 +2945,19 @@ mod tests {
             Command::ResetAll
         );
         assert_eq!(
+            parse_command("RESET SESSION AUTHORIZATION TO DEFAULT;\n").unwrap(),
+            Command::ResetAll
+        );
+        assert_eq!(
             parse_command("RESET SESSION AUTH;\n").unwrap(),
             Command::ResetAll
         );
         assert_eq!(
             parse_command("RESET SESSION AUTH DEFAULT;\n").unwrap(),
+            Command::ResetAll
+        );
+        assert_eq!(
+            parse_command("RESET SESSION AUTH TO DEFAULT;\n").unwrap(),
             Command::ResetAll
         );
         assert_eq!(parse_command("DISCARD ALL;\n").unwrap(), Command::ResetAll);
