@@ -6,6 +6,8 @@
 - Extended reset-command compatibility to accept `RESET SESSION AUTHORIZATION TO DEFAULT` and `RESET SESSION AUTH TO DEFAULT` as `ResetAll` no-op aliases, reducing parser friction for PostgreSQL-style reset probes that include an explicit `TO` keyword.
 - Added regression coverage for the new `RESET SESSION AUTH* TO DEFAULT` forms across baseline acceptance, statement-terminator handling, and malformed extra-token rejection to keep parser behavior deterministic.
 - Updated reset-command error guidance so documented accepted forms now include optional `TO DEFAULT` variants for session auth reset aliases.
+- Added malformed extended-query regression coverage proving PostgreSQL `FunctionCall` (`F`) frames reject mismatched argument-format cardinality vectors (`C=2`, `N=1`) deterministically as `InvalidFunctionCallPayload`.
+- Added malformed `FunctionCall` boundary regression coverage proving declared argument lengths that overrun payload bytes (`N=1`, length `3`, only two bytes present) are rejected deterministically as `InvalidFunctionCallPayload`.
 - Re-validated the full safety gate after the parser delta (`cargo fmt --all`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-features`) with all checks green.
 
 ### Current blockers

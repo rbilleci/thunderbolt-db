@@ -4306,6 +4306,35 @@ mod tests {
             FrontendMessageError::InvalidFunctionCallPayload
         );
 
+        let mut mismatched_function_call_format_count_payload = Vec::new();
+        mismatched_function_call_format_count_payload.extend_from_slice(&42_u32.to_be_bytes());
+        mismatched_function_call_format_count_payload.extend_from_slice(&2_i16.to_be_bytes());
+        mismatched_function_call_format_count_payload.extend_from_slice(&0_i16.to_be_bytes());
+        mismatched_function_call_format_count_payload.extend_from_slice(&1_i16.to_be_bytes());
+        mismatched_function_call_format_count_payload.extend_from_slice(&1_i16.to_be_bytes());
+        mismatched_function_call_format_count_payload.extend_from_slice(&4_i32.to_be_bytes());
+        mismatched_function_call_format_count_payload.extend_from_slice(&7_i32.to_be_bytes());
+        mismatched_function_call_format_count_payload.extend_from_slice(&0_i16.to_be_bytes());
+        let mismatched_function_call_format_count =
+            frontend_frame(b'F', &mismatched_function_call_format_count_payload);
+        assert_eq!(
+            parse_frontend_message(&mismatched_function_call_format_count).unwrap_err(),
+            FrontendMessageError::InvalidFunctionCallPayload
+        );
+
+        let mut truncated_function_call_argument_value_payload = Vec::new();
+        truncated_function_call_argument_value_payload.extend_from_slice(&42_u32.to_be_bytes());
+        truncated_function_call_argument_value_payload.extend_from_slice(&0_i16.to_be_bytes());
+        truncated_function_call_argument_value_payload.extend_from_slice(&1_i16.to_be_bytes());
+        truncated_function_call_argument_value_payload.extend_from_slice(&3_i32.to_be_bytes());
+        truncated_function_call_argument_value_payload.extend_from_slice(b"ab");
+        let truncated_function_call_argument_value =
+            frontend_frame(b'F', &truncated_function_call_argument_value_payload);
+        assert_eq!(
+            parse_frontend_message(&truncated_function_call_argument_value).unwrap_err(),
+            FrontendMessageError::InvalidFunctionCallPayload
+        );
+
         let mut invalid_function_call_multi_format_code_payload = Vec::new();
         invalid_function_call_multi_format_code_payload.extend_from_slice(&42_u32.to_be_bytes());
         invalid_function_call_multi_format_code_payload.extend_from_slice(&2_i16.to_be_bytes());
