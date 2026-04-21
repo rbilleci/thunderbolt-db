@@ -3,6 +3,7 @@
 ## 2026-04-20
 
 ### Completed
+- Added malformed `FunctionCall` regression coverage proving argument-value boundaries remain strict when declared argument lengths overrun payload bytes (`N=1`, arg length `3`, only two bytes present), with deterministic `InvalidFunctionCallPayload` rejection.
 - Added malformed `Bind` regression coverage proving parameter-value boundaries remain strict when wire lengths overrun payload bytes (`N=1`, declared length `3`, only two bytes present), with deterministic `InvalidBindPayload` rejection.
 - Added extended-query `Bind` regression coverage proving default parameter-format semantics (`C=0`) decode deterministically when parameters are present (`N>0`, including `NULL`) and still preserve explicit result-format decoding (`R=1`).
 - Added extended-query parser regression coverage proving PostgreSQL `Parse` (`P`) frames accept unnamed-statement flows with zero parameter OIDs (`"\0SELECT 1\0" + nparams=0`), keeping startup/prepare compatibility explicit for clients that use the unnamed prepared statement.

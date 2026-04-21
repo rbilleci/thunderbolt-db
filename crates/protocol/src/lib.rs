@@ -4344,6 +4344,20 @@ mod tests {
             FrontendMessageError::InvalidFunctionCallPayload
         );
 
+        let mut truncated_function_call_arg_value_payload = Vec::new();
+        truncated_function_call_arg_value_payload.extend_from_slice(&42_u32.to_be_bytes());
+        truncated_function_call_arg_value_payload.extend_from_slice(&0_i16.to_be_bytes());
+        truncated_function_call_arg_value_payload.extend_from_slice(&1_i16.to_be_bytes());
+        truncated_function_call_arg_value_payload.extend_from_slice(&3_i32.to_be_bytes());
+        truncated_function_call_arg_value_payload.extend_from_slice(b"ab");
+        truncated_function_call_arg_value_payload.extend_from_slice(&0_i16.to_be_bytes());
+        let truncated_function_call_arg_value =
+            frontend_frame(b'F', &truncated_function_call_arg_value_payload);
+        assert_eq!(
+            parse_frontend_message(&truncated_function_call_arg_value).unwrap_err(),
+            FrontendMessageError::InvalidFunctionCallPayload
+        );
+
         let mut malformed_function_call_with_trailing_bytes_payload = Vec::new();
         malformed_function_call_with_trailing_bytes_payload
             .extend_from_slice(&42_u32.to_be_bytes());
