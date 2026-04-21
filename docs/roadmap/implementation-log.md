@@ -1,5 +1,20 @@
 # Implementation Log (Pre-NVIDIA Phase)
 
+## 2026-04-21
+
+### Completed
+- Extended reset-command compatibility to accept `RESET SESSION AUTHORIZATION TO DEFAULT` and `RESET SESSION AUTH TO DEFAULT` as `ResetAll` no-op aliases, reducing parser friction for PostgreSQL-style reset probes that include an explicit `TO` keyword.
+- Added regression coverage for the new `RESET SESSION AUTH* TO DEFAULT` forms across baseline acceptance, statement-terminator handling, and malformed extra-token rejection to keep parser behavior deterministic.
+- Updated reset-command error guidance so documented accepted forms now include optional `TO DEFAULT` variants for session auth reset aliases.
+- Re-validated the full safety gate after the parser delta (`cargo fmt --all`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-features`) with all checks green.
+
+### Current blockers
+- None in-repo.
+
+### Next loops
+1. Continue PostgreSQL extended-query lifecycle hardening with malformed-frame regressions around boundary and target/payload invariants.
+2. Keep loops atomic: protocol delta + full fmt/clippy/test validation + focused commit.
+
 ## 2026-04-20
 
 ### Completed
