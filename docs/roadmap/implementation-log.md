@@ -3,6 +3,7 @@
 ## 2026-04-20
 
 ### Completed
+- Added extended-query `Bind` regression coverage proving default parameter-format semantics (`C=0`) decode deterministically when parameters are present (`N>0`, including `NULL`) and still preserve explicit result-format decoding (`R=1`).
 - Added extended-query parser regression coverage proving PostgreSQL `Parse` (`P`) frames accept unnamed-statement flows with zero parameter OIDs (`"\0SELECT 1\0" + nparams=0`), keeping startup/prepare compatibility explicit for clients that use the unnamed prepared statement.
 - Added extended-query `Bind` regression coverage proving unnamed portal + unnamed statement payloads with zero parameter formats/values (`C=0`, `N=0`) and zero result formats (`R=0`) decode deterministically, keeping default-format unnamed bind flows explicit.
 - Added malformed `Bind` regression coverage proving result-format cardinality sections still enforce full payload boundaries (`R=2` with only one provided format code now remains a deterministic `InvalidBindPayload` rejection).
