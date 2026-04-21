@@ -3439,6 +3439,34 @@ mod tests {
             }
         );
 
+        let mut bind_with_zero_params_and_single_shared_format_payload = Vec::new();
+        bind_with_zero_params_and_single_shared_format_payload
+            .extend_from_slice(b"portal3\0stmt3\0");
+        bind_with_zero_params_and_single_shared_format_payload
+            .extend_from_slice(&1_i16.to_be_bytes());
+        bind_with_zero_params_and_single_shared_format_payload
+            .extend_from_slice(&1_i16.to_be_bytes());
+        bind_with_zero_params_and_single_shared_format_payload
+            .extend_from_slice(&0_i16.to_be_bytes());
+        bind_with_zero_params_and_single_shared_format_payload
+            .extend_from_slice(&1_i16.to_be_bytes());
+        bind_with_zero_params_and_single_shared_format_payload
+            .extend_from_slice(&1_i16.to_be_bytes());
+        let bind_with_zero_params_and_single_shared_format = frontend_frame(
+            b'B',
+            &bind_with_zero_params_and_single_shared_format_payload,
+        );
+        assert_eq!(
+            parse_frontend_message(&bind_with_zero_params_and_single_shared_format).unwrap(),
+            FrontendMessage::Bind {
+                portal_name: "portal3".to_string(),
+                statement_name: "stmt3".to_string(),
+                parameter_format_codes: vec![1],
+                parameters: vec![],
+                result_format_codes: vec![1],
+            }
+        );
+
         let mut bind_with_default_parameter_formats_payload = Vec::new();
         bind_with_default_parameter_formats_payload.extend_from_slice(b"portal2\0stmt2\0");
         bind_with_default_parameter_formats_payload.extend_from_slice(&0_i16.to_be_bytes());

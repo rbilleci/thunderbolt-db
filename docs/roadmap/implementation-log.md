@@ -3,6 +3,7 @@
 ## 2026-04-21
 
 ### Completed
+- Added extended-query `Bind` regression coverage proving zero-parameter frames (`N=0`) accept a single shared binary parameter-format code (`C=1`, code `1`) and deterministic binary result-format vectors (`R=1`, code `1`).
 - Added extended-query regression coverage proving PostgreSQL `Bind` (`B`) frames with zero parameters (`N=0`) accept a single shared text parameter-format code (`C=1`, code `0`) and deterministic text result-format vectors (`R=1`, code `0`).
 - Added extended-query regression coverage proving PostgreSQL `FunctionCall` (`F`) frames with zero arguments (`N=0`) accept a single shared text format code (`C=1`, code `0`) and decode deterministically with text result format (`R=0`).
 - Added malformed `Bind` (`B`) regression coverage proving zero-parameter frames (`N=0`) still validate shared parameter-format codes (`C=1`) and deterministically reject out-of-range values (`2`) as `InvalidBindPayload`.
