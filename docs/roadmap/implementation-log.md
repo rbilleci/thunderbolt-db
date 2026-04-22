@@ -6,6 +6,8 @@
 - Re-ran the autonomous safety gate from a lock-guarded cron loop with Rust bootstrap verification (`cargo 1.94.0`, `rustc 1.94.0`).
 - Verified repository health remains green with no pending source deltas (`cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`).
 - Added this implementation-log checkpoint so autonomous loops that land in a clean/no-delta state are explicitly auditable.
+- Added extended-query `Bind` regression coverage proving shared parameter-format vectors (`C=1`) decode correctly when multiple parameters are present (`N=2`), including mixed `NULL`/non-`NULL` parameter payloads and multi-entry result-format vectors (`R=2`).
+- Re-validated the full safety gate after the parser-test delta (`cargo fmt --all`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-features`) with all checks green.
 
 ### Current blockers
 - None in-repo.
