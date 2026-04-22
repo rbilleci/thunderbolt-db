@@ -4272,6 +4272,43 @@ mod tests {
             }
         );
 
+        let mut bind_with_shared_parameter_format_for_multiple_parameters_payload = Vec::new();
+        bind_with_shared_parameter_format_for_multiple_parameters_payload
+            .extend_from_slice(b"portal_shared\0stmt_shared\0");
+        bind_with_shared_parameter_format_for_multiple_parameters_payload
+            .extend_from_slice(&1_i16.to_be_bytes());
+        bind_with_shared_parameter_format_for_multiple_parameters_payload
+            .extend_from_slice(&1_i16.to_be_bytes());
+        bind_with_shared_parameter_format_for_multiple_parameters_payload
+            .extend_from_slice(&2_i16.to_be_bytes());
+        bind_with_shared_parameter_format_for_multiple_parameters_payload
+            .extend_from_slice(&4_i32.to_be_bytes());
+        bind_with_shared_parameter_format_for_multiple_parameters_payload
+            .extend_from_slice(b"\x00\x00\x00\x2a");
+        bind_with_shared_parameter_format_for_multiple_parameters_payload
+            .extend_from_slice(&(-1_i32).to_be_bytes());
+        bind_with_shared_parameter_format_for_multiple_parameters_payload
+            .extend_from_slice(&2_i16.to_be_bytes());
+        bind_with_shared_parameter_format_for_multiple_parameters_payload
+            .extend_from_slice(&0_i16.to_be_bytes());
+        bind_with_shared_parameter_format_for_multiple_parameters_payload
+            .extend_from_slice(&1_i16.to_be_bytes());
+        let bind_with_shared_parameter_format_for_multiple_parameters = frontend_frame(
+            b'B',
+            &bind_with_shared_parameter_format_for_multiple_parameters_payload,
+        );
+        assert_eq!(
+            parse_frontend_message(&bind_with_shared_parameter_format_for_multiple_parameters)
+                .unwrap(),
+            FrontendMessage::Bind {
+                portal_name: "portal_shared".to_string(),
+                statement_name: "stmt_shared".to_string(),
+                parameter_format_codes: vec![1],
+                parameters: vec![Some(vec![0x00, 0x00, 0x00, 0x2a]), None],
+                result_format_codes: vec![0, 1],
+            }
+        );
+
         let mut bind_with_multiple_result_formats_and_invalid_code_payload = Vec::new();
         bind_with_multiple_result_formats_and_invalid_code_payload
             .extend_from_slice(b"portal\0stmt\0");
