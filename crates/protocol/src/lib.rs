@@ -4133,6 +4133,18 @@ mod tests {
             FrontendMessageError::InvalidBindPayload
         );
 
+        let mut negative_bind_result_format_count_payload = Vec::new();
+        negative_bind_result_format_count_payload.extend_from_slice(b"portal\0stmt\0");
+        negative_bind_result_format_count_payload.extend_from_slice(&0_i16.to_be_bytes());
+        negative_bind_result_format_count_payload.extend_from_slice(&0_i16.to_be_bytes());
+        negative_bind_result_format_count_payload.extend_from_slice(&(-1_i16).to_be_bytes());
+        let negative_bind_result_format_count =
+            frontend_frame(b'B', &negative_bind_result_format_count_payload);
+        assert_eq!(
+            parse_frontend_message(&negative_bind_result_format_count).unwrap_err(),
+            FrontendMessageError::InvalidBindPayload
+        );
+
         let invalid_utf8_bind_portal_name =
             frontend_frame(b'B', &[0xFF, 0, b's', b't', b'm', b't', 0, 0, 0, 0, 0, 0]);
         assert_eq!(

@@ -7,6 +7,7 @@
 - Verified repository health remains green with no pending source deltas (`cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`).
 - Added this implementation-log checkpoint so autonomous loops that land in a clean/no-delta state are explicitly auditable.
 - Added extended-query `Bind` regression coverage proving shared parameter-format vectors (`C=1`) decode correctly when multiple parameters are present (`N=2`), including mixed `NULL`/non-`NULL` parameter payloads and multi-entry result-format vectors (`R=2`).
+- Added malformed `Bind` regression coverage proving negative result-format vector cardinalities (`R=-1`) are rejected deterministically as `InvalidBindPayload`, preserving strict frontend frame-boundary/type invariants.
 - Re-validated the full safety gate after the parser-test delta (`cargo fmt --all`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-features`) with all checks green.
 
 ### Current blockers
