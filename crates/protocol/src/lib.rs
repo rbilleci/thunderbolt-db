@@ -4217,6 +4217,33 @@ mod tests {
             FrontendMessageError::InvalidBindPayload
         );
 
+        let mut invalid_bind_shared_format_with_multiple_parameters_payload = Vec::new();
+        invalid_bind_shared_format_with_multiple_parameters_payload
+            .extend_from_slice(b"portal\0stmt\0");
+        invalid_bind_shared_format_with_multiple_parameters_payload
+            .extend_from_slice(&1_i16.to_be_bytes());
+        invalid_bind_shared_format_with_multiple_parameters_payload
+            .extend_from_slice(&2_i16.to_be_bytes());
+        invalid_bind_shared_format_with_multiple_parameters_payload
+            .extend_from_slice(&2_i16.to_be_bytes());
+        invalid_bind_shared_format_with_multiple_parameters_payload
+            .extend_from_slice(&4_i32.to_be_bytes());
+        invalid_bind_shared_format_with_multiple_parameters_payload
+            .extend_from_slice(&42_i32.to_be_bytes());
+        invalid_bind_shared_format_with_multiple_parameters_payload
+            .extend_from_slice(&(-1_i32).to_be_bytes());
+        invalid_bind_shared_format_with_multiple_parameters_payload
+            .extend_from_slice(&0_i16.to_be_bytes());
+        let invalid_bind_shared_format_with_multiple_parameters = frontend_frame(
+            b'B',
+            &invalid_bind_shared_format_with_multiple_parameters_payload,
+        );
+        assert_eq!(
+            parse_frontend_message(&invalid_bind_shared_format_with_multiple_parameters)
+                .unwrap_err(),
+            FrontendMessageError::InvalidBindPayload
+        );
+
         let mut bind_with_multiple_result_formats_payload = Vec::new();
         bind_with_multiple_result_formats_payload.extend_from_slice(b"portal\0stmt\0");
         bind_with_multiple_result_formats_payload.extend_from_slice(&0_i16.to_be_bytes());
