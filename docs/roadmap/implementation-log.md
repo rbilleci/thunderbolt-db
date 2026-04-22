@@ -3,6 +3,8 @@
 ## 2026-04-22
 
 ### Completed
+- Extended PostgreSQL session-reset compatibility so `SET LOCAL TRANSACTION ...` mode lists are accepted as `ResetAll` no-op aliases (matching existing `SET TRANSACTION ...` handling), reducing parser friction for clients that scope transaction characteristics locally.
+- Added regression coverage for accepted `SET LOCAL TRANSACTION` forms (`READ ONLY`, `READ WRITE, DEFERRABLE`) plus malformed-form rejection (`SET LOCAL TRANSACTION`, `SET LOCAL TRANSACTION NOW`) to keep parser behavior deterministic.
 - Added malformed `Bind` regression coverage proving negative result-format codes (`R=1`, code `-1`) are rejected deterministically as `InvalidBindPayload`, preserving strict result-format validation for signed underflow wire values.
 - Added malformed `FunctionCall` regression coverage proving negative shared argument-format codes (`C=1`, code `-1`) are rejected deterministically as `InvalidFunctionCallPayload`, preserving strict extended-query format-code validation for signed underflow inputs.
 - Added malformed `Bind` regression coverage proving negative shared parameter-format codes (`C=1`, code `-1`) are rejected deterministically as `InvalidBindPayload`, preserving strict frontend frame/type validation even for signed underflow format-code inputs.
