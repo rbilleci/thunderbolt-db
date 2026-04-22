@@ -3,6 +3,7 @@
 ## 2026-04-22
 
 ### Completed
+- Added malformed `Bind` regression coverage proving negative result-format codes (`R=1`, code `-1`) are rejected deterministically as `InvalidBindPayload`, preserving strict result-format validation for signed underflow wire values.
 - Added malformed `FunctionCall` regression coverage proving negative shared argument-format codes (`C=1`, code `-1`) are rejected deterministically as `InvalidFunctionCallPayload`, preserving strict extended-query format-code validation for signed underflow inputs.
 - Added malformed `Bind` regression coverage proving negative shared parameter-format codes (`C=1`, code `-1`) are rejected deterministically as `InvalidBindPayload`, preserving strict frontend frame/type validation even for signed underflow format-code inputs.
 - Re-ran the autonomous safety gate from a lock-guarded cron loop with Rust bootstrap verification (`cargo 1.94.0`, `rustc 1.94.0`).
