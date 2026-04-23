@@ -3,6 +3,9 @@
 ## 2026-04-23
 
 ### Completed
+- Landed CI compatibility scorecard automation (`fcc287c`): CI now captures real `cargo test --workspace` output, generates machine-readable and Markdown scorecards, and uploads them as a `compatibility-scorecard` artifact.
+- Added `scripts/generate_compat_scorecard.py` to bucket real test outcomes into protocol/client flow, SQL/parser, transaction, durability, replication, and execution compatibility categories with explicit pass/fail totals, top failing categories, and a baseline trend hook.
+- Added scorecard docs and baseline (`docs/compatibility/scorecard.md`, `docs/compatibility/scorecard.baseline.json`) plus generated fixtures (`scorecard.latest.json`, `scorecard.latest.md`) so local and CI workflows stay aligned.
 - Added two explicit high-priority autonomous-loop queue items to `docs/roadmap/no-nvidia-bootstrap-plan.md`: (1) golden-wire `psql` compatibility suite and (2) CI compatibility scorecard, each with concrete goals and acceptance criteria so the standard autoloop can pick them up as normal roadmap work.
 - Re-ran lock-guard bootstrap checks for the autonomous loop (`cargo 1.94.0`, `rustc 1.94.0`) with stale-lock cleanup semantics before any repository work.
 - Re-validated full repository safety gates in a no-delta maintenance slice (`cargo fmt --all`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-features`) with all checks green.
