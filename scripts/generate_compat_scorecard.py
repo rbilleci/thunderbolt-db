@@ -112,11 +112,21 @@ def build_trend(summary: dict, baseline: dict | None) -> dict:
 
     current_failed = summary["totals"]["failed"]
     baseline_failed = baseline.get("totals", {}).get("failed", 0)
+
+    baseline_buckets = baseline.get("buckets", {})
+    current_buckets = summary.get("buckets", {})
+    bucket_failed_delta = {}
+    for bucket in sorted(set(baseline_buckets) | set(current_buckets)):
+        current_bucket_failed = current_buckets.get(bucket, {}).get("failed", 0)
+        baseline_bucket_failed = baseline_buckets.get(bucket, {}).get("failed", 0)
+        bucket_failed_delta[bucket] = current_bucket_failed - baseline_bucket_failed
+
     return {
         "baseline_available": True,
         "baseline_failed": baseline_failed,
         "current_failed": current_failed,
         "failed_delta": current_failed - baseline_failed,
+        "bucket_failed_delta": bucket_failed_delta,
     }
 
 
@@ -146,6 +156,13 @@ def write_markdown(path: Path, report: dict) -> None:
         lines.append("- none")
 
     lines += ["", "## Trend hook", f"- {json.dumps(report['trend_hook'])}"]
+    if report["trend_hook"].get("baseline_available") and report["trend_hook"].get(
+        "bucket_failed_delta"
+    ):
+        lines += ["", "## Bucket failed deltas vs baseline"]
+        for bucket, delta in report["trend_hook"]["bucket_failed_delta"].items():
+            lines.append(f"- {bucket}: {delta:+d}")
+
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -171,4 +188,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

@@ -17,4 +17,11 @@
 - none
 
 ## Trend hook
-- {"baseline_available": true, "baseline_failed": 0, "current_failed": 0, "failed_delta": 0}
+- {"baseline_available": true, "baseline_failed": 0, "current_failed": 0, "failed_delta": 0, "bucket_failed_delta": {"durability.invariants": 0, "execution.gpu_routing_and_batching": 0, "replication.role_and_log": 0, "sql.transaction_flows": 0, "uncategorized": 0}}
+
+## Bucket failed deltas vs baseline
+- durability.invariants: +0
+- execution.gpu_routing_and_batching: +0
+- replication.role_and_log: +0
+- sql.transaction_flows: +0
+- uncategorized: +0

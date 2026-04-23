@@ -39,5 +39,6 @@ To make new compatibility tests visible in the right bucket:
 
 ## Trend hook
 
-`docs/compatibility/scorecard.baseline.json` is the baseline placeholder used for simple failed-test deltas.
+`docs/compatibility/scorecard.baseline.json` is the baseline placeholder used for failed-test deltas,
+including both total failed-count drift and per-bucket failed-count drift.
 Later CI can replace this with previous-run or main-branch baselines without changing the scorecard schema.
