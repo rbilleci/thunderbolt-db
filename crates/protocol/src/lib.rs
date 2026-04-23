@@ -3872,6 +3872,19 @@ mod tests {
             FrontendMessageError::InvalidSaslInitialResponsePayload
         );
 
+        let malformed_sasl_initial_negative_non_null_len =
+            frontend_frame(b'p', b"SCRAM-SHA-256\0\xFF\xFF\xFF\xFE");
+        assert_eq!(
+            parse_frontend_message(&malformed_sasl_initial_negative_non_null_len).unwrap_err(),
+            FrontendMessageError::InvalidSaslInitialResponsePayload
+        );
+
+        let malformed_sasl_initial_empty_mechanism = frontend_frame(b'p', b"\0\0\0\0\0");
+        assert_eq!(
+            parse_frontend_message(&malformed_sasl_initial_empty_mechanism).unwrap_err(),
+            FrontendMessageError::InvalidSaslInitialResponsePayload
+        );
+
         let malformed_sasl_initial_zero_len_with_trailing_payload =
             frontend_frame(b'p', b"SCRAM-SHA-256\0\0\0\0\0x");
         assert_eq!(
