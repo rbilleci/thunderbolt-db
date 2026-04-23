@@ -3,6 +3,7 @@
 ## 2026-04-23
 
 ### Completed
+- Added two explicit high-priority autonomous-loop queue items to `docs/roadmap/no-nvidia-bootstrap-plan.md`: (1) golden-wire `psql` compatibility suite and (2) CI compatibility scorecard, each with concrete goals and acceptance criteria so the standard autoloop can pick them up as normal roadmap work.
 - Re-ran lock-guard bootstrap checks for the autonomous loop (`cargo 1.94.0`, `rustc 1.94.0`) with stale-lock cleanup semantics before any repository work.
 - Re-validated full repository safety gates in a no-delta maintenance slice (`cargo fmt --all`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-features`) with all checks green.
 - Added malformed PostgreSQL `FunctionCall` (`F`) regression coverage proving truncated argument-length fields are rejected deterministically as `InvalidFunctionCallPayload`.

@@ -116,6 +116,53 @@ When first NVIDIA environment becomes available:
 5. Implement deterministic batch scheduler (CPU-only).
 6. Add invariant and replay test suites.
 
+## Queue additions for autonomous loop pickup
+
+### Q1. Golden-wire `psql` compatibility suite
+Priority: high
+
+Goal:
+- Add a real-client compatibility suite that exercises the engine through the standard `psql`/libpq path rather than custom protocol fixtures only.
+
+Acceptance criteria:
+1. Add a scripted golden test harness that boots the engine and runs `psql` against it using standard libpq environment variables/flags.
+2. Cover at least these flows end-to-end:
+   - startup/auth/connect success
+   - simple query (`SELECT 1` or closest supported bootstrap equivalent)
+   - session reset/setup probes commonly emitted by `psql`/libpq
+   - transaction begin/commit/rollback flow
+   - one prepared/extended-query flow if supported, otherwise an explicit expected-failure golden case
+   - one deterministic error-path golden case with asserted SQLSTATE/message contract if available
+3. Store reproducible golden artifacts/expected outputs under a dedicated test directory.
+4. Wire the suite into the standard CI/test entrypoint or document the exact temporary gate if CI wiring must land in a follow-up commit.
+5. Document how to run/update the suite locally.
+
+Notes:
+- Prefer stable assertions over brittle byte-for-byte transcript checks where timestamps/noise vary.
+- Use real `psql`/libpq behavior as the oracle for connection lifecycle compatibility.
+
+### Q2. CI compatibility scorecard
+Priority: high
+
+Goal:
+- Produce a hard compatibility scorecard in CI so protocol/SQL compatibility progress is measured, not inferred.
+
+Acceptance criteria:
+1. Define a machine-readable scorecard format (for example JSON or Markdown generated from test results).
+2. Report, at minimum:
+   - protocol/client flow coverage bucket counts
+   - SQL/parser feature bucket counts
+   - pass/fail totals
+   - top failing compatibility categories
+   - trend hook placeholder against previous baseline if full trend wiring is not yet implemented
+3. Generate the scorecard in CI from real test outputs, not hand-written status.
+4. Publish the scorecard as a CI artifact or checked-in generated example fixture for local inspection.
+5. Document how future compatibility tests should register themselves with the scorecard.
+
+Notes:
+- Keep the first version simple and trustworthy.
+- Prefer explicit bucket definitions over a fake single percentage.
+
 ## Exit criteria for no-GPU bootstrap phase
 
 - Commit path is replication-shaped and invariant-tested.
