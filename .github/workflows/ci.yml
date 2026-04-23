@@ -17,4 +17,21 @@ jobs:
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: test
-        run: cargo test --workspace
+        run: |
+          set -euo pipefail
+          mkdir -p target/compat
+          cargo test --workspace -- --color never | tee target/compat/cargo-test.log
+      - name: compatibility scorecard
+        run: |
+          python3 scripts/generate_compat_scorecard.py \
+            --input target/compat/cargo-test.log \
+            --output docs/compatibility/scorecard.latest.json \
+            --markdown docs/compatibility/scorecard.latest.md \
+            --baseline docs/compatibility/scorecard.baseline.json
+      - name: upload compatibility scorecard artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: compatibility-scorecard
+          path: |
+            docs/compatibility/scorecard.latest.json
+            docs/compatibility/scorecard.latest.md

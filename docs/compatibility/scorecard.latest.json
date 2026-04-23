@@ -1,0 +1,47 @@
+{
+  "buckets": {
+    "durability.invariants": {
+      "failed": 0,
+      "ignored": 0,
+      "passed": 15,
+      "total": 15
+    },
+    "execution.gpu_routing_and_batching": {
+      "failed": 0,
+      "ignored": 0,
+      "passed": 37,
+      "total": 37
+    },
+    "replication.role_and_log": {
+      "failed": 0,
+      "ignored": 0,
+      "passed": 70,
+      "total": 70
+    },
+    "sql.transaction_flows": {
+      "failed": 0,
+      "ignored": 0,
+      "passed": 49,
+      "total": 49
+    },
+    "uncategorized": {
+      "failed": 0,
+      "ignored": 0,
+      "passed": 81,
+      "total": 81
+    }
+  },
+  "top_failing_categories": [],
+  "totals": {
+    "failed": 0,
+    "ignored": 0,
+    "passed": 219,
+    "total": 219
+  },
+  "trend_hook": {
+    "baseline_available": true,
+    "baseline_failed": 0,
+    "current_failed": 0,
+    "failed_delta": 0
+  }
+}
