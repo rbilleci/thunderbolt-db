@@ -4728,10 +4728,24 @@ mod tests {
             FrontendMessageError::InvalidFunctionCallPayload
         );
 
+        let mut negative_function_call_result_format_count_payload = Vec::new();
+        negative_function_call_result_format_count_payload.extend_from_slice(&42_u32.to_be_bytes());
+        negative_function_call_result_format_count_payload.extend_from_slice(&0_i16.to_be_bytes());
+        negative_function_call_result_format_count_payload.extend_from_slice(&0_i16.to_be_bytes());
+        negative_function_call_result_format_count_payload
+            .extend_from_slice(&(-1_i16).to_be_bytes());
+        let negative_function_call_result_format_count =
+            frontend_frame(b'F', &negative_function_call_result_format_count_payload);
+        assert_eq!(
+            parse_frontend_message(&negative_function_call_result_format_count).unwrap_err(),
+            FrontendMessageError::InvalidFunctionCallPayload
+        );
+
         let mut negative_function_call_result_format_code_payload = Vec::new();
         negative_function_call_result_format_code_payload.extend_from_slice(&42_u32.to_be_bytes());
         negative_function_call_result_format_code_payload.extend_from_slice(&0_i16.to_be_bytes());
         negative_function_call_result_format_code_payload.extend_from_slice(&0_i16.to_be_bytes());
+        negative_function_call_result_format_code_payload.extend_from_slice(&1_i16.to_be_bytes());
         negative_function_call_result_format_code_payload
             .extend_from_slice(&(-1_i16).to_be_bytes());
         let negative_function_call_result_format_code =
