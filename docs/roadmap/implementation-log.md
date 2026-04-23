@@ -1,5 +1,23 @@
 # Implementation Log (Pre-NVIDIA Phase)
 
+## 2026-04-24
+
+### Completed
+- Continued PostgreSQL extended-query malformed-frame hardening with two new deterministic parser regressions:
+  - `FunctionCall` (`F`) now explicitly rejects truncated argument-count fields (partial `i16` payload) as `InvalidFunctionCallPayload`.
+  - `Bind` (`B`) now explicitly rejects truncated parameter-count fields (partial `i16` payload) as `InvalidBindPayload`.
+- Re-ran full safety gates after each atomic delta (`cargo fmt --all`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all --all-features`) with all checks green.
+- Commits pushed:
+  - `65bca82` — `test(protocol): reject truncated function call arg-count field`
+  - `fbbba5e` — `test(protocol): reject truncated bind parameter-count field`
+
+### Current blockers
+- None in-repo.
+
+### Next loops
+1. Continue malformed-frame boundary hardening in extended-query lifecycle paths, prioritizing partial-field truncation cases not yet covered by deterministic error assertions.
+2. Keep loops atomic: protocol delta + full fmt/clippy/test validation + focused commit.
+
 ## 2026-04-23
 
 ### Completed
