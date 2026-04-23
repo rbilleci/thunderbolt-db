@@ -15,7 +15,7 @@
 - Added malformed PostgreSQL `FunctionCall` (`F`) regression coverage proving truncated argument-format vectors (`C > 1` with missing format entries) are rejected deterministically as `InvalidFunctionCallPayload`.
 - Re-ran full repository safety gates after each protocol hardening delta (`cargo fmt --all`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all --all-features`) with all checks green.
 - Added malformed SASL-initial-response regression coverage proving protocol parser rejects negative non-null response lengths (`-2`) and empty mechanism names as deterministic `InvalidSaslInitialResponsePayload` errors.
-- Added malformed PostgreSQL `FunctionCall` (`F`) regression coverage proving negative result-format vector cardinalities (`R=-1`) are rejected deterministically as `InvalidFunctionCallPayload`, plus an explicit `R=1` negative format-code (`-1`) payload rejection assertion.
+- Added malformed PostgreSQL `FunctionCall` (`F`) regression coverage proving negative result-format vector cardinalities (`R=-1`) are rejected deterministically as `InvalidFunctionCallPayload`, plus explicit boundary checks for a truncated result-format-count field and `R=1` negative format-code (`-1`) payload rejection.
 - Re-ran full repository safety gates after the protocol hardening delta (`cargo fmt --all`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all --all-features`) with all checks green.
 - Commits pushed:
   - `f164e88` — `test(protocol): reject truncated function call arg length field`
