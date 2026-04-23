@@ -4569,6 +4569,17 @@ mod tests {
             FrontendMessageError::InvalidFunctionCallPayload
         );
 
+        let mut truncated_function_call_arg_count_field_payload = Vec::new();
+        truncated_function_call_arg_count_field_payload.extend_from_slice(&42_u32.to_be_bytes());
+        truncated_function_call_arg_count_field_payload.extend_from_slice(&0_i16.to_be_bytes());
+        truncated_function_call_arg_count_field_payload.push(0x00);
+        let truncated_function_call_arg_count_field =
+            frontend_frame(b'F', &truncated_function_call_arg_count_field_payload);
+        assert_eq!(
+            parse_frontend_message(&truncated_function_call_arg_count_field).unwrap_err(),
+            FrontendMessageError::InvalidFunctionCallPayload
+        );
+
         let mut negative_function_call_shared_format_code_payload = Vec::new();
         negative_function_call_shared_format_code_payload.extend_from_slice(&42_u32.to_be_bytes());
         negative_function_call_shared_format_code_payload.extend_from_slice(&1_i16.to_be_bytes());
