@@ -36,10 +36,21 @@ status=0
 for scenario in "$SCENARIOS_DIR"/*.sql; do
   name=$(basename "$scenario" .sql)
   expected="$EXPECTED_DIR/$name.txt"
+  expected_rc_file="$EXPECTED_DIR/$name.rc"
   if [ ! -f "$expected" ]; then
     echo "error: missing expected artifact for scenario '$name': $expected" >&2
     status=1
     continue
+  fi
+
+  expected_rc=0
+  if [ -f "$expected_rc_file" ]; then
+    expected_rc=$(tr -d '[:space:]' <"$expected_rc_file")
+    if ! [[ "$expected_rc" =~ ^[0-9]+$ ]]; then
+      echo "error: invalid expected rc for scenario '$name': $expected_rc_file" >&2
+      status=1
+      continue
+    fi
   fi
 
   raw="$OUT_DIR/$name.raw.txt"
@@ -60,6 +71,9 @@ for scenario in "$SCENARIOS_DIR"/*.sql; do
 
   if ! diff -u "$expected" "$norm"; then
     echo "scenario '$name' mismatch (psql exit=$rc)" >&2
+    status=1
+  elif [ "$rc" -ne "$expected_rc" ]; then
+    echo "scenario '$name' exit mismatch (expected=$expected_rc actual=$rc)" >&2
     status=1
   else
     echo "scenario '$name' ok (psql exit=$rc)"

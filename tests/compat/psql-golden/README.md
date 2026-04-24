@@ -23,9 +23,10 @@ Optional:
 1. Run the suite against the target endpoint.
 2. Inspect `target/psql-golden/*.txt`.
 3. If the new output is correct and deterministic, copy it into `tests/compat/psql-golden/expected/`.
+4. Optionally add `tests/compat/psql-golden/expected/<scenario>.rc` when a scenario expects non-zero `psql` exit status (defaults to `0` when omitted).
 
 ## Notes
 
 - The harness intentionally strips volatile lines (timing/version/SSL banner noise).
 - Keep scenario assertions stable and semantic, avoid transient text where possible.
-- If an extended-query/prepared flow is intentionally unsupported, encode that as an explicit expected failure in a dedicated scenario.
+- If an extended-query/prepared flow is intentionally unsupported, encode that as an explicit expected failure in a dedicated scenario and set the expected `.rc` artifact.

@@ -3,6 +3,8 @@
 ## 2026-04-24
 
 ### Completed
+- Hardened the `psql` golden harness so scenarios can assert expected process exit codes via optional `tests/compat/psql-golden/expected/<scenario>.rc` artifacts (default remains `0`), enabling explicit expected-failure compatibility cases without brittle ad hoc checks.
+- Added baseline exit-code artifact for the existing bootstrap scenario (`01_bootstrap_and_simple_query.rc`) and updated suite docs to describe `.rc` usage for unsupported-yet-expected flows.
 - Continued PostgreSQL extended-query malformed-frame hardening with two new deterministic parser regressions:
   - `FunctionCall` (`F`) now explicitly rejects truncated argument-count fields (partial `i16` payload) as `InvalidFunctionCallPayload`.
   - `Bind` (`B`) now explicitly rejects truncated parameter-count fields (partial `i16` payload) as `InvalidBindPayload`.
