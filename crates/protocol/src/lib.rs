@@ -28,6 +28,7 @@ pub enum ParseError {
 
 pub const PG_PROTOCOL_V3: u32 = 196_608;
 const PG_SSL_REQUEST_CODE: u32 = 80_877_103;
+const PG_GSSENC_REQUEST_CODE: u32 = 80_877_104;
 const PG_CANCEL_REQUEST_CODE: u32 = 80_877_102;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +38,7 @@ pub enum StartupPacket {
         params: Vec<(String, String)>,
     },
     SslRequest,
+    GssEncRequest,
     CancelRequest {
         process_id: u32,
         secret_key: u32,
@@ -123,6 +125,15 @@ pub fn parse_startup_packet(frame: &[u8]) -> Result<StartupPacket, StartupPacket
                 });
             }
             Ok(StartupPacket::SslRequest)
+        }
+        PG_GSSENC_REQUEST_CODE => {
+            if frame_len != 8 {
+                return Err(StartupPacketError::LengthMismatch {
+                    expected: 8,
+                    actual: frame_len,
+                });
+            }
+            Ok(StartupPacket::GssEncRequest)
         }
         PG_CANCEL_REQUEST_CODE => {
             if frame_len != 16 {
@@ -3164,11 +3175,17 @@ mod tests {
     }
 
     #[test]
-    fn parses_ssl_and_cancel_requests() {
+    fn parses_ssl_gssenc_and_cancel_requests() {
         let ssl = with_length_prefix(PG_SSL_REQUEST_CODE.to_be_bytes().to_vec());
         assert_eq!(
             parse_startup_packet(&ssl).unwrap(),
             StartupPacket::SslRequest
+        );
+
+        let gssenc = with_length_prefix(PG_GSSENC_REQUEST_CODE.to_be_bytes().to_vec());
+        assert_eq!(
+            parse_startup_packet(&gssenc).unwrap(),
+            StartupPacket::GssEncRequest
         );
 
         let mut cancel_payload = PG_CANCEL_REQUEST_CODE.to_be_bytes().to_vec();
@@ -3201,12 +3218,23 @@ mod tests {
     }
 
     #[test]
-    fn rejects_ssl_and_cancel_requests_with_invalid_lengths() {
+    fn rejects_ssl_gssenc_and_cancel_requests_with_invalid_lengths() {
         let mut ssl_payload = PG_SSL_REQUEST_CODE.to_be_bytes().to_vec();
         ssl_payload.push(0);
         let ssl = with_length_prefix(ssl_payload);
         assert_eq!(
             parse_startup_packet(&ssl).unwrap_err(),
+            StartupPacketError::LengthMismatch {
+                expected: 8,
+                actual: 9,
+            }
+        );
+
+        let mut gssenc_payload = PG_GSSENC_REQUEST_CODE.to_be_bytes().to_vec();
+        gssenc_payload.push(0);
+        let gssenc = with_length_prefix(gssenc_payload);
+        assert_eq!(
+            parse_startup_packet(&gssenc).unwrap_err(),
             StartupPacketError::LengthMismatch {
                 expected: 8,
                 actual: 9,

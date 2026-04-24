@@ -3,6 +3,8 @@
 ## 2026-04-24
 
 ### Completed
+- Extended startup-packet compatibility to recognize PostgreSQL `GSSENCRequest` probes alongside existing SSL/cancel control packets, reducing pre-auth handshake friction for clients that negotiate GSSAPI encryption before normal startup.
+- Added regression coverage proving valid `GSSENCRequest` packets parse successfully and malformed-length variants are rejected with the same deterministic `LengthMismatch` behavior as SSL probes.
 - Added malformed PostgreSQL `FunctionCall` (`F`) regression coverage proving truncated function OID fields are rejected deterministically as `InvalidFunctionCallPayload` when the 4-byte object identifier is incomplete.
 - Added malformed PostgreSQL `Bind` (`B`) regression coverage proving truncated parameter-format and result-format code vectors are rejected deterministically as `InvalidBindPayload` when multi-entry format sections end mid-`i16`.
 - Added malformed PostgreSQL `Bind` (`B`) regression coverage proving truncated parameter-format-count (`C`) and result-format-count (`R`) fields are rejected deterministically as `InvalidBindPayload` when only a partial `i16` payload is present.
@@ -27,7 +29,8 @@
   - `b444b34` — `test(protocol): reject truncated function call result-format code field`
   - `175dabe` — `test(protocol): reject truncated parse parameter fields`
   - `2923868` — `test(protocol): cover unsupported startup protocol codes`
-  - `[pending]` — `test(protocol): reject unsupported frontend message tags`
+  - `a74783d` — `test(protocol): cover unterminated execute portal name`
+  - `[pending]` — `feat(protocol): parse startup gssenc request`
 
 ### Current blockers
 - None in-repo.
