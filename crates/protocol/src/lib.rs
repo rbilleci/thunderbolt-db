@@ -4172,6 +4172,12 @@ mod tests {
             FrontendMessageError::InvalidExecutePayload
         );
 
+        let unterminated_execute_portal_name = frontend_frame(b'E', b"portal");
+        assert_eq!(
+            parse_frontend_message(&unterminated_execute_portal_name).unwrap_err(),
+            FrontendMessageError::UnterminatedExecutePortalName
+        );
+
         let execute_with_short_max_rows_payload = frontend_frame(b'E', b"portal\0\0\0\x01");
         assert_eq!(
             parse_frontend_message(&execute_with_short_max_rows_payload).unwrap_err(),
