@@ -4032,6 +4032,12 @@ mod tests {
             FrontendMessage::CopyData(Vec::new())
         );
 
+        let binary_copy_data = frontend_frame(b'd', b"row\0chunk\xff");
+        assert_eq!(
+            parse_frontend_message(&binary_copy_data).unwrap(),
+            FrontendMessage::CopyData(b"row\0chunk\xff".to_vec())
+        );
+
         let copy_done = frontend_frame(b'c', &[]);
         assert_eq!(
             parse_frontend_message(&copy_done).unwrap(),
