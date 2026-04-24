@@ -3288,6 +3288,25 @@ mod tests {
     }
 
     #[test]
+    fn parses_pg_v3_startup_packet_with_multiple_params() {
+        let mut payload = PG_PROTOCOL_V3.to_be_bytes().to_vec();
+        payload.extend_from_slice(b"user\0postgres\0database\0analytics\0\0");
+        let frame = with_length_prefix(payload);
+
+        let packet = parse_startup_packet(&frame).unwrap();
+        assert_eq!(
+            packet,
+            StartupPacket::Startup {
+                protocol_version: PG_PROTOCOL_V3,
+                params: vec![
+                    ("user".to_string(), "postgres".to_string()),
+                    ("database".to_string(), "analytics".to_string()),
+                ],
+            }
+        );
+    }
+
+    #[test]
     fn parses_pg_v3_minor_version_startup_packet() {
         let protocol_version = (PG_PROTOCOL_MAJOR_V3 << 16) | 2;
         let mut payload = protocol_version.to_be_bytes().to_vec();
