@@ -3911,6 +3911,18 @@ mod tests {
             FrontendMessageError::InvalidParseParameterPayload
         );
 
+        let unterminated_parse_statement_name = frontend_frame(b'P', b"stmt");
+        assert_eq!(
+            parse_frontend_message(&unterminated_parse_statement_name).unwrap_err(),
+            FrontendMessageError::UnterminatedParseStatementName
+        );
+
+        let unterminated_parse_query = frontend_frame(b'P', b"stmt\0SELECT 1");
+        assert_eq!(
+            parse_frontend_message(&unterminated_parse_query).unwrap_err(),
+            FrontendMessageError::UnterminatedParseQuery
+        );
+
         let truncated_parse_type_count_field = frontend_frame(b'P', b"stmt\0SELECT 1\0\0");
         assert_eq!(
             parse_frontend_message(&truncated_parse_type_count_field).unwrap_err(),
@@ -4202,6 +4214,18 @@ mod tests {
         assert_eq!(
             parse_frontend_message(&malformed_bind).unwrap_err(),
             FrontendMessageError::InvalidBindPayload
+        );
+
+        let unterminated_bind_portal_name = frontend_frame(b'B', b"portal");
+        assert_eq!(
+            parse_frontend_message(&unterminated_bind_portal_name).unwrap_err(),
+            FrontendMessageError::UnterminatedBindPortalName
+        );
+
+        let unterminated_bind_statement_name = frontend_frame(b'B', b"portal\0stmt");
+        assert_eq!(
+            parse_frontend_message(&unterminated_bind_statement_name).unwrap_err(),
+            FrontendMessageError::UnterminatedBindStatementName
         );
 
         let mut negative_bind_result_format_code_payload = Vec::new();
