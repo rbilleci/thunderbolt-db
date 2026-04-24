@@ -40,6 +40,17 @@
   - `2923868` — `test(protocol): cover unsupported startup protocol codes`
   - `a74783d` — `test(protocol): cover unterminated execute portal name`
   - `cf8a2be` — `feat(protocol): parse startup gssenc request`
+  - `fffd5a4` — `feat(protocol): accept extended cancel request keys`
+  - `f6b8fc5` — `feat(protocol): accept startup protocol minor versions`
+  - `339d8c8` — `feat(protocol): bound cancel request secret keys`
+  - `d19c1be` — `test(protocol): cover max-length cancel request keys`
+  - `7b2f734` — `test(protocol): cover empty simple query frame`
+  - `d3e4875` — `test(protocol): cover empty copy fail frame`
+  - `aea498b` — `test(protocol): cover empty password message frame`
+  - `55f5c85` — `test(protocol): cover empty copy data frame`
+  - `4b75a06` — `test(protocol): cover empty sasl initial response`
+  - `d77a190` — `docs(roadmap): record pushed gssenc protocol commit`
+  - `350c0a3` — `test(protocol): cover embedded-null password payload`
 
 ### Current blockers
 - None in-repo.
