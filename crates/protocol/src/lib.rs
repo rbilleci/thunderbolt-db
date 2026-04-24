@@ -3592,6 +3592,12 @@ mod tests {
             FrontendMessage::SimpleQuery(String::new())
         );
 
+        let utf8_query = frontend_frame(b'Q', "SELECT 'héllo';\0".as_bytes());
+        assert_eq!(
+            parse_frontend_message(&utf8_query).unwrap(),
+            FrontendMessage::SimpleQuery("SELECT 'héllo';".to_string())
+        );
+
         let password = frontend_frame(b'p', b"secret\0");
         assert_eq!(
             parse_frontend_message(&password).unwrap(),
