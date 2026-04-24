@@ -3810,6 +3810,23 @@ mod tests {
             }
         );
 
+        let mut bind_utf8_names_payload = Vec::new();
+        bind_utf8_names_payload.extend_from_slice("pörtal\0stmté\0".as_bytes());
+        bind_utf8_names_payload.extend_from_slice(&0_i16.to_be_bytes());
+        bind_utf8_names_payload.extend_from_slice(&0_i16.to_be_bytes());
+        bind_utf8_names_payload.extend_from_slice(&0_i16.to_be_bytes());
+        let bind_utf8_names = frontend_frame(b'B', &bind_utf8_names_payload);
+        assert_eq!(
+            parse_frontend_message(&bind_utf8_names).unwrap(),
+            FrontendMessage::Bind {
+                portal_name: "pörtal".to_string(),
+                statement_name: "stmté".to_string(),
+                parameter_format_codes: vec![],
+                parameters: vec![],
+                result_format_codes: vec![],
+            }
+        );
+
         let describe_stmt = frontend_frame(b'D', b"Sstmt1\0");
         assert_eq!(
             parse_frontend_message(&describe_stmt).unwrap(),
