@@ -4501,6 +4501,12 @@ mod tests {
             FrontendMessage::CopyData(b"row\0chunk\xff".to_vec())
         );
 
+        let utf8_copy_data = frontend_frame(b'd', "röwΔ".as_bytes());
+        assert_eq!(
+            parse_frontend_message(&utf8_copy_data).unwrap(),
+            FrontendMessage::CopyData("röwΔ".as_bytes().to_vec())
+        );
+
         let copy_done = frontend_frame(b'c', &[]);
         assert_eq!(
             parse_frontend_message(&copy_done).unwrap(),
