@@ -2161,6 +2161,9 @@ mod tests {
         let cmd = parse_command("UNLISTEN \"updates\"\"channel\"").unwrap();
         assert_eq!(cmd, Command::ResetAll);
 
+        let cmd = parse_command("UNLISTEN \"updates\nΔetail\"").unwrap();
+        assert_eq!(cmd, Command::ResetAll);
+
         let cmd = parse_command("LISTEN updates_channel").unwrap();
         assert_eq!(cmd, Command::ResetAll);
 
@@ -2170,6 +2173,9 @@ mod tests {
         let cmd = parse_command("LISTEN \"updates\"\"channel\"").unwrap();
         assert_eq!(cmd, Command::ResetAll);
 
+        let cmd = parse_command("LISTEN \"updates\nΔetail\"").unwrap();
+        assert_eq!(cmd, Command::ResetAll);
+
         let cmd = parse_command("NOTIFY updates_channel").unwrap();
         assert_eq!(cmd, Command::ResetAll);
 
@@ -2177,6 +2183,9 @@ mod tests {
         assert_eq!(cmd, Command::ResetAll);
 
         let cmd = parse_command("NOTIFY \"updates\"\"channel\"").unwrap();
+        assert_eq!(cmd, Command::ResetAll);
+
+        let cmd = parse_command("NOTIFY \"updates\nΔetail\", 'héllo\nΔetail'").unwrap();
         assert_eq!(cmd, Command::ResetAll);
 
         let cmd = parse_command("NOTIFY \"updates,channel\", 'hello'").unwrap();
