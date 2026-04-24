@@ -3246,6 +3246,12 @@ mod tests {
             StartupPacketError::InvalidLengthField { declared: 4 }
         );
 
+        let unsupported_protocol_code = vec![0, 0, 0, 8, 0x12, 0x34, 0x56, 0x78];
+        assert_eq!(
+            parse_startup_packet(&unsupported_protocol_code).unwrap_err(),
+            StartupPacketError::UnsupportedProtocolCode(0x1234_5678)
+        );
+
         let empty_param_payload = with_length_prefix(PG_PROTOCOL_V3.to_be_bytes().to_vec());
         assert_eq!(
             parse_startup_packet(&empty_param_payload).unwrap_err(),
