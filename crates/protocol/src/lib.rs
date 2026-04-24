@@ -4090,6 +4090,13 @@ mod tests {
             FrontendMessage::SaslResponse("prøöf".as_bytes().to_vec())
         );
 
+        let multiline_utf8_sasl_response =
+            frontend_frame(b'p', "c=biws\nr=noncé\np=prøöf".as_bytes());
+        assert_eq!(
+            parse_frontend_message(&multiline_utf8_sasl_response).unwrap(),
+            FrontendMessage::SaslResponse("c=biws\nr=noncé\np=prøöf".as_bytes().to_vec())
+        );
+
         let mut parse_payload = Vec::new();
         parse_payload.extend_from_slice(b"stmt1\0SELECT $1::int4\0");
         parse_payload.extend_from_slice(&1_i16.to_be_bytes());
