@@ -3869,6 +3869,29 @@ mod tests {
             }
         );
 
+        let mut bind_with_utf8_text_parameter_payload = Vec::new();
+        bind_with_utf8_text_parameter_payload.extend_from_slice(b"portal_utf8\0stmt_utf8\0");
+        bind_with_utf8_text_parameter_payload.extend_from_slice(&1_i16.to_be_bytes());
+        bind_with_utf8_text_parameter_payload.extend_from_slice(&0_i16.to_be_bytes());
+        bind_with_utf8_text_parameter_payload.extend_from_slice(&1_i16.to_be_bytes());
+        bind_with_utf8_text_parameter_payload
+            .extend_from_slice(&("héllo".len() as i32).to_be_bytes());
+        bind_with_utf8_text_parameter_payload.extend_from_slice("héllo".as_bytes());
+        bind_with_utf8_text_parameter_payload.extend_from_slice(&1_i16.to_be_bytes());
+        bind_with_utf8_text_parameter_payload.extend_from_slice(&0_i16.to_be_bytes());
+        let bind_with_utf8_text_parameter =
+            frontend_frame(b'B', &bind_with_utf8_text_parameter_payload);
+        assert_eq!(
+            parse_frontend_message(&bind_with_utf8_text_parameter).unwrap(),
+            FrontendMessage::Bind {
+                portal_name: "portal_utf8".to_string(),
+                statement_name: "stmt_utf8".to_string(),
+                parameter_format_codes: vec![0],
+                parameters: vec![Some("héllo".as_bytes().to_vec())],
+                result_format_codes: vec![0],
+            }
+        );
+
         let describe_stmt = frontend_frame(b'D', b"Sstmt1\0");
         assert_eq!(
             parse_frontend_message(&describe_stmt).unwrap(),
