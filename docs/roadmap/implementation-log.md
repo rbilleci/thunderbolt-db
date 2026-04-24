@@ -3,6 +3,7 @@
 ## 2026-04-24
 
 ### Completed
+- Added malformed PostgreSQL `Bind` (`B`) regression coverage proving truncated parameter-format-count (`C`) and result-format-count (`R`) fields are rejected deterministically as `InvalidBindPayload` when only a partial `i16` payload is present.
 - Hardened the `psql` golden harness so scenarios can assert expected process exit codes via optional `tests/compat/psql-golden/expected/<scenario>.rc` artifacts (default remains `0`), enabling explicit expected-failure compatibility cases without brittle ad hoc checks.
 - Added baseline exit-code artifact for the existing bootstrap scenario (`01_bootstrap_and_simple_query.rc`) and updated suite docs to describe `.rc` usage for unsupported-yet-expected flows.
 - Continued PostgreSQL extended-query malformed-frame hardening with two new deterministic parser regressions:
@@ -12,6 +13,7 @@
 - Added malformed PostgreSQL `FunctionCall` (`F`) regression coverage proving truncated result-format code fields (partial `i16` payload) are rejected deterministically as `InvalidFunctionCallPayload`.
 - Scaffolded a real-client `psql` golden compatibility harness (`scripts/run_psql_golden.sh`) plus first scenario/expected artifact set under `tests/compat/psql-golden/`, including deterministic output normalization and local run/update docs.
 - Commits pushed:
+  - `71e812c` — `test(protocol): reject truncated bind format-count fields`
   - `65bca82` — `test(protocol): reject truncated function call arg-count field`
   - `fbbba5e` — `test(protocol): reject truncated bind parameter-count field`
   - `b444b34` — `test(protocol): reject truncated function call result-format code field`

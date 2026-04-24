@@ -4451,6 +4451,16 @@ mod tests {
             FrontendMessageError::InvalidBindPayload
         );
 
+        let mut truncated_bind_format_count_field_payload = Vec::new();
+        truncated_bind_format_count_field_payload.extend_from_slice(b"portal\0stmt\0");
+        truncated_bind_format_count_field_payload.push(0x00);
+        let truncated_bind_format_count_field =
+            frontend_frame(b'B', &truncated_bind_format_count_field_payload);
+        assert_eq!(
+            parse_frontend_message(&truncated_bind_format_count_field).unwrap_err(),
+            FrontendMessageError::InvalidBindPayload
+        );
+
         let mut truncated_bind_parameter_count_field_payload = Vec::new();
         truncated_bind_parameter_count_field_payload.extend_from_slice(b"portal\0stmt\0");
         truncated_bind_parameter_count_field_payload.extend_from_slice(&0_i16.to_be_bytes());
@@ -4508,6 +4518,18 @@ mod tests {
             frontend_frame(b'B', &truncated_bind_parameter_value_payload);
         assert_eq!(
             parse_frontend_message(&truncated_bind_parameter_value).unwrap_err(),
+            FrontendMessageError::InvalidBindPayload
+        );
+
+        let mut truncated_bind_result_format_count_field_payload = Vec::new();
+        truncated_bind_result_format_count_field_payload.extend_from_slice(b"portal\0stmt\0");
+        truncated_bind_result_format_count_field_payload.extend_from_slice(&0_i16.to_be_bytes());
+        truncated_bind_result_format_count_field_payload.extend_from_slice(&0_i16.to_be_bytes());
+        truncated_bind_result_format_count_field_payload.push(0x00);
+        let truncated_bind_result_format_count_field =
+            frontend_frame(b'B', &truncated_bind_result_format_count_field_payload);
+        assert_eq!(
+            parse_frontend_message(&truncated_bind_result_format_count_field).unwrap_err(),
             FrontendMessageError::InvalidBindPayload
         );
 
