@@ -4056,6 +4056,12 @@ mod tests {
             FrontendMessage::CopyFail(String::new())
         );
 
+        let utf8_copy_fail = frontend_frame(b'f', "röw mismatch\0".as_bytes());
+        assert_eq!(
+            parse_frontend_message(&utf8_copy_fail).unwrap(),
+            FrontendMessage::CopyFail("röw mismatch".to_string())
+        );
+
         let terminate = frontend_frame(b'X', &[]);
         assert_eq!(
             parse_frontend_message(&terminate).unwrap(),
