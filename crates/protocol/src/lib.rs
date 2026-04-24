@@ -3846,6 +3846,15 @@ mod tests {
             }
         );
 
+        let describe_utf8_portal = frontend_frame(b'D', "Ppörtal\0".as_bytes());
+        assert_eq!(
+            parse_frontend_message(&describe_utf8_portal).unwrap(),
+            FrontendMessage::Describe {
+                target: DescribeTarget::Portal,
+                name: "pörtal".to_string(),
+            }
+        );
+
         let describe_unnamed_statement = frontend_frame(b'D', b"S\0");
         assert_eq!(
             parse_frontend_message(&describe_unnamed_statement).unwrap(),
