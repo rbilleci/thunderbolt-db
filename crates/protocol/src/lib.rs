@@ -3385,6 +3385,15 @@ mod tests {
             StartupPacketError::UnterminatedParameterPayload
         );
 
+        let mut extra_trailing_terminator_payload = PG_PROTOCOL_V3.to_be_bytes().to_vec();
+        extra_trailing_terminator_payload.extend_from_slice(b"user\0postgres\0\0\0");
+        let extra_trailing_terminator_payload =
+            with_length_prefix(extra_trailing_terminator_payload);
+        assert_eq!(
+            parse_startup_packet(&extra_trailing_terminator_payload).unwrap_err(),
+            StartupPacketError::InvalidParameterPairing
+        );
+
         let mut invalid_utf8_params = PG_PROTOCOL_V3.to_be_bytes().to_vec();
         invalid_utf8_params.extend_from_slice(&[0xFF, 0, b'v', 0, 0]);
         let invalid_utf8_params = with_length_prefix(invalid_utf8_params);
