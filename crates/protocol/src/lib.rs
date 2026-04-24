@@ -30,6 +30,7 @@ pub const PG_PROTOCOL_V3: u32 = 196_608;
 const PG_SSL_REQUEST_CODE: u32 = 80_877_103;
 const PG_GSSENC_REQUEST_CODE: u32 = 80_877_104;
 const PG_CANCEL_REQUEST_CODE: u32 = 80_877_102;
+const PG_PROTOCOL_MAJOR_V3: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StartupPacket {
@@ -66,6 +67,10 @@ pub enum StartupPacketError {
 fn read_u32_be(bytes: &[u8]) -> Result<u32, StartupPacketError> {
     let arr: [u8; 4] = bytes.try_into().map_err(|_| StartupPacketError::TooShort)?;
     Ok(u32::from_be_bytes(arr))
+}
+
+fn protocol_major(version: u32) -> u16 {
+    (version >> 16) as u16
 }
 
 fn parse_startup_params(payload: &[u8]) -> Result<Vec<(String, String)>, StartupPacketError> {
@@ -149,7 +154,7 @@ pub fn parse_startup_packet(frame: &[u8]) -> Result<StartupPacket, StartupPacket
                 secret_key,
             })
         }
-        protocol_version if protocol_version == PG_PROTOCOL_V3 => {
+        protocol_version if protocol_major(protocol_version) == PG_PROTOCOL_MAJOR_V3 as u16 => {
             let params = parse_startup_params(&frame[8..])?;
             Ok(StartupPacket::Startup {
                 protocol_version,
@@ -3225,6 +3230,23 @@ mod tests {
             StartupPacket::Startup {
                 protocol_version: PG_PROTOCOL_V3,
                 params: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn parses_pg_v3_minor_version_startup_packet() {
+        let protocol_version = (PG_PROTOCOL_MAJOR_V3 << 16) | 2;
+        let mut payload = protocol_version.to_be_bytes().to_vec();
+        payload.extend_from_slice(b"user\0postgres\0\0");
+        let frame = with_length_prefix(payload);
+
+        let packet = parse_startup_packet(&frame).unwrap();
+        assert_eq!(
+            packet,
+            StartupPacket::Startup {
+                protocol_version,
+                params: vec![("user".to_string(), "postgres".to_string())],
             }
         );
     }
