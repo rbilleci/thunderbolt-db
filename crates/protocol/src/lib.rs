@@ -3418,6 +3418,15 @@ mod tests {
             StartupPacketError::InvalidUtf8
         );
 
+        let mut invalid_utf8_value_params = PG_PROTOCOL_V3.to_be_bytes().to_vec();
+        invalid_utf8_value_params.extend_from_slice(b"user\0");
+        invalid_utf8_value_params.extend_from_slice(&[0xFF, 0, 0]);
+        let invalid_utf8_value_params = with_length_prefix(invalid_utf8_value_params);
+        assert_eq!(
+            parse_startup_packet(&invalid_utf8_value_params).unwrap_err(),
+            StartupPacketError::InvalidUtf8
+        );
+
         let mut empty_key_params = PG_PROTOCOL_V3.to_be_bytes().to_vec();
         empty_key_params.extend_from_slice(b"\0value\0\0");
         let empty_key_params = with_length_prefix(empty_key_params);
