@@ -30,6 +30,7 @@ pub const PG_PROTOCOL_V3: u32 = 196_608;
 const PG_SSL_REQUEST_CODE: u32 = 80_877_103;
 const PG_GSSENC_REQUEST_CODE: u32 = 80_877_104;
 const PG_CANCEL_REQUEST_CODE: u32 = 80_877_102;
+const PG_CANCEL_SECRET_KEY_MAX_BYTES: usize = 256;
 const PG_PROTOCOL_MAJOR_V3: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +55,8 @@ pub enum StartupPacketError {
     InvalidLengthField { declared: u32 },
     #[error("startup packet length mismatch; expected {expected} bytes, got {actual}")]
     LengthMismatch { expected: usize, actual: usize },
+    #[error("startup cancel key exceeds protocol maximum of {max} bytes; got {actual}")]
+    InvalidCancelKeyLength { actual: usize, max: usize },
     #[error("unsupported startup protocol code: {0}")]
     UnsupportedProtocolCode(u32),
     #[error("startup parameter payload is not null terminated")]
@@ -149,6 +152,12 @@ pub fn parse_startup_packet(frame: &[u8]) -> Result<StartupPacket, StartupPacket
             }
             let process_id = read_u32_be(&frame[8..12])?;
             let secret_key = frame[12..].to_vec();
+            if secret_key.len() > PG_CANCEL_SECRET_KEY_MAX_BYTES {
+                return Err(StartupPacketError::InvalidCancelKeyLength {
+                    actual: secret_key.len(),
+                    max: PG_CANCEL_SECRET_KEY_MAX_BYTES,
+                });
+            }
             Ok(StartupPacket::CancelRequest {
                 process_id,
                 secret_key,
@@ -3281,6 +3290,18 @@ mod tests {
             StartupPacketError::LengthMismatch {
                 expected: 16,
                 actual: 8,
+            }
+        );
+
+        let mut oversized_cancel_payload = PG_CANCEL_REQUEST_CODE.to_be_bytes().to_vec();
+        oversized_cancel_payload.extend_from_slice(&123u32.to_be_bytes());
+        oversized_cancel_payload.extend_from_slice(&vec![0xAB; PG_CANCEL_SECRET_KEY_MAX_BYTES + 1]);
+        let oversized_cancel = with_length_prefix(oversized_cancel_payload);
+        assert_eq!(
+            parse_startup_packet(&oversized_cancel).unwrap_err(),
+            StartupPacketError::InvalidCancelKeyLength {
+                actual: PG_CANCEL_SECRET_KEY_MAX_BYTES + 1,
+                max: PG_CANCEL_SECRET_KEY_MAX_BYTES,
             }
         );
     }
