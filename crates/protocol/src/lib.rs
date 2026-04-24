@@ -3885,6 +3885,12 @@ mod tests {
             FrontendMessage::SimpleQuery("SELECT 'héllo';".to_string())
         );
 
+        let multiline_utf8_query = frontend_frame(b'Q', "SELECT 'héllo'\nFROM tést;\0".as_bytes());
+        assert_eq!(
+            parse_frontend_message(&multiline_utf8_query).unwrap(),
+            FrontendMessage::SimpleQuery("SELECT 'héllo'\nFROM tést;".to_string())
+        );
+
         let password = frontend_frame(b'p', b"secret\0");
         assert_eq!(
             parse_frontend_message(&password).unwrap(),
@@ -3901,6 +3907,12 @@ mod tests {
         assert_eq!(
             parse_frontend_message(&utf8_password).unwrap(),
             FrontendMessage::PasswordMessage("påsswörd".to_string())
+        );
+
+        let multiline_utf8_password = frontend_frame(b'p', "påss\nwördΔ\0".as_bytes());
+        assert_eq!(
+            parse_frontend_message(&multiline_utf8_password).unwrap(),
+            FrontendMessage::PasswordMessage("påss\nwördΔ".to_string())
         );
 
         let mut sasl_initial_payload = Vec::new();
