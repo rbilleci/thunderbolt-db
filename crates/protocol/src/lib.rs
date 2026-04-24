@@ -3225,6 +3225,18 @@ mod tests {
                 secret_key: b"longer-secret-key".to_vec(),
             }
         );
+
+        let mut max_length_cancel_payload = PG_CANCEL_REQUEST_CODE.to_be_bytes().to_vec();
+        max_length_cancel_payload.extend_from_slice(&777u32.to_be_bytes());
+        max_length_cancel_payload.extend_from_slice(&vec![0xCD; PG_CANCEL_SECRET_KEY_MAX_BYTES]);
+        let max_length_cancel = with_length_prefix(max_length_cancel_payload);
+        assert_eq!(
+            parse_startup_packet(&max_length_cancel).unwrap(),
+            StartupPacket::CancelRequest {
+                process_id: 777,
+                secret_key: vec![0xCD; PG_CANCEL_SECRET_KEY_MAX_BYTES],
+            }
+        );
     }
 
     #[test]
