@@ -3604,6 +3604,12 @@ mod tests {
             FrontendMessage::PasswordMessage(String::new())
         );
 
+        let utf8_password = frontend_frame(b'p', "påsswörd\0".as_bytes());
+        assert_eq!(
+            parse_frontend_message(&utf8_password).unwrap(),
+            FrontendMessage::PasswordMessage("påsswörd".to_string())
+        );
+
         let mut sasl_initial_payload = Vec::new();
         sasl_initial_payload.extend_from_slice(b"SCRAM-SHA-256\0");
         sasl_initial_payload.extend_from_slice(&5_i32.to_be_bytes());
