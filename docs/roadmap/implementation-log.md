@@ -4,7 +4,8 @@
 
 ### Completed
 - Extended startup-packet compatibility to recognize PostgreSQL `GSSENCRequest` probes alongside existing SSL/cancel control packets, reducing pre-auth handshake friction for clients that negotiate GSSAPI encryption before normal startup.
-- Added regression coverage proving valid `GSSENCRequest` packets parse successfully and malformed-length variants are rejected with the same deterministic `LengthMismatch` behavior as SSL probes.
+- Hardened startup cancel-request parsing to accept PostgreSQL's variable-length secret-key payloads instead of assuming the legacy fixed 4-byte key, improving compatibility with newer servers, poolers, and middleware that carry wrapped cancel tokens.
+- Added regression coverage proving valid `GSSENCRequest` packets parse successfully, extended cancel requests preserve the full secret-key payload, and malformed-length variants are rejected with the same deterministic minimum-length behavior as existing control probes.
 - Added malformed PostgreSQL `FunctionCall` (`F`) regression coverage proving truncated function OID fields are rejected deterministically as `InvalidFunctionCallPayload` when the 4-byte object identifier is incomplete.
 - Added malformed PostgreSQL `Bind` (`B`) regression coverage proving truncated parameter-format and result-format code vectors are rejected deterministically as `InvalidBindPayload` when multi-entry format sections end mid-`i16`.
 - Added malformed PostgreSQL `Bind` (`B`) regression coverage proving truncated parameter-format-count (`C`) and result-format-count (`R`) fields are rejected deterministically as `InvalidBindPayload` when only a partial `i16` payload is present.

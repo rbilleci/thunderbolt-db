@@ -41,7 +41,7 @@ pub enum StartupPacket {
     GssEncRequest,
     CancelRequest {
         process_id: u32,
-        secret_key: u32,
+        secret_key: Vec<u8>,
     },
 }
 
@@ -136,14 +136,14 @@ pub fn parse_startup_packet(frame: &[u8]) -> Result<StartupPacket, StartupPacket
             Ok(StartupPacket::GssEncRequest)
         }
         PG_CANCEL_REQUEST_CODE => {
-            if frame_len != 16 {
+            if frame_len < 16 {
                 return Err(StartupPacketError::LengthMismatch {
                     expected: 16,
                     actual: frame_len,
                 });
             }
             let process_id = read_u32_be(&frame[8..12])?;
-            let secret_key = read_u32_be(&frame[12..16])?;
+            let secret_key = frame[12..].to_vec();
             Ok(StartupPacket::CancelRequest {
                 process_id,
                 secret_key,
@@ -3196,7 +3196,19 @@ mod tests {
             parse_startup_packet(&cancel).unwrap(),
             StartupPacket::CancelRequest {
                 process_id: 123,
-                secret_key: 456,
+                secret_key: 456u32.to_be_bytes().to_vec(),
+            }
+        );
+
+        let mut extended_cancel_payload = PG_CANCEL_REQUEST_CODE.to_be_bytes().to_vec();
+        extended_cancel_payload.extend_from_slice(&321u32.to_be_bytes());
+        extended_cancel_payload.extend_from_slice(b"longer-secret-key");
+        let extended_cancel = with_length_prefix(extended_cancel_payload);
+        assert_eq!(
+            parse_startup_packet(&extended_cancel).unwrap(),
+            StartupPacket::CancelRequest {
+                process_id: 321,
+                secret_key: b"longer-secret-key".to_vec(),
             }
         );
     }
