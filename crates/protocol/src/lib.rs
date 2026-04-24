@@ -4329,6 +4329,31 @@ mod tests {
             }
         );
 
+        let mut bind_with_multiline_utf8_text_parameter_payload = Vec::new();
+        bind_with_multiline_utf8_text_parameter_payload
+            .extend_from_slice(b"portal_utf8_multi\0stmt_utf8_multi\0");
+        bind_with_multiline_utf8_text_parameter_payload.extend_from_slice(&1_i16.to_be_bytes());
+        bind_with_multiline_utf8_text_parameter_payload.extend_from_slice(&0_i16.to_be_bytes());
+        bind_with_multiline_utf8_text_parameter_payload.extend_from_slice(&1_i16.to_be_bytes());
+        bind_with_multiline_utf8_text_parameter_payload
+            .extend_from_slice(&("héllo\nΔetail".len() as i32).to_be_bytes());
+        bind_with_multiline_utf8_text_parameter_payload
+            .extend_from_slice("héllo\nΔetail".as_bytes());
+        bind_with_multiline_utf8_text_parameter_payload.extend_from_slice(&1_i16.to_be_bytes());
+        bind_with_multiline_utf8_text_parameter_payload.extend_from_slice(&0_i16.to_be_bytes());
+        let bind_with_multiline_utf8_text_parameter =
+            frontend_frame(b'B', &bind_with_multiline_utf8_text_parameter_payload);
+        assert_eq!(
+            parse_frontend_message(&bind_with_multiline_utf8_text_parameter).unwrap(),
+            FrontendMessage::Bind {
+                portal_name: "portal_utf8_multi".to_string(),
+                statement_name: "stmt_utf8_multi".to_string(),
+                parameter_format_codes: vec![0],
+                parameters: vec![Some("héllo\nΔetail".as_bytes().to_vec())],
+                result_format_codes: vec![0],
+            }
+        );
+
         let mut bind_with_empty_text_parameter_payload = Vec::new();
         bind_with_empty_text_parameter_payload
             .extend_from_slice(b"portal_empty_text\0stmt_empty_text\0");
