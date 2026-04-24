@@ -3925,6 +3925,28 @@ mod tests {
             }
         );
 
+        let mut bind_with_empty_text_parameter_payload = Vec::new();
+        bind_with_empty_text_parameter_payload
+            .extend_from_slice(b"portal_empty_text\0stmt_empty_text\0");
+        bind_with_empty_text_parameter_payload.extend_from_slice(&1_i16.to_be_bytes());
+        bind_with_empty_text_parameter_payload.extend_from_slice(&0_i16.to_be_bytes());
+        bind_with_empty_text_parameter_payload.extend_from_slice(&1_i16.to_be_bytes());
+        bind_with_empty_text_parameter_payload.extend_from_slice(&0_i32.to_be_bytes());
+        bind_with_empty_text_parameter_payload.extend_from_slice(&1_i16.to_be_bytes());
+        bind_with_empty_text_parameter_payload.extend_from_slice(&0_i16.to_be_bytes());
+        let bind_with_empty_text_parameter =
+            frontend_frame(b'B', &bind_with_empty_text_parameter_payload);
+        assert_eq!(
+            parse_frontend_message(&bind_with_empty_text_parameter).unwrap(),
+            FrontendMessage::Bind {
+                portal_name: "portal_empty_text".to_string(),
+                statement_name: "stmt_empty_text".to_string(),
+                parameter_format_codes: vec![0],
+                parameters: vec![Some(Vec::new())],
+                result_format_codes: vec![0],
+            }
+        );
+
         let mut bind_with_binary_parameter_payload = Vec::new();
         bind_with_binary_parameter_payload.extend_from_slice(b"portal_bin\0stmt_bin\0");
         bind_with_binary_parameter_payload.extend_from_slice(&1_i16.to_be_bytes());
