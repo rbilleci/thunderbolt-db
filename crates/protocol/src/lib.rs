@@ -3779,6 +3779,22 @@ mod tests {
             }
         );
 
+        let mut parse_utf8_query_with_parameter_oids_payload = Vec::new();
+        parse_utf8_query_with_parameter_oids_payload
+            .extend_from_slice("stmt_utf8\0SELECT 'héllo', $1::text\0".as_bytes());
+        parse_utf8_query_with_parameter_oids_payload.extend_from_slice(&1_i16.to_be_bytes());
+        parse_utf8_query_with_parameter_oids_payload.extend_from_slice(&25_u32.to_be_bytes());
+        let parse_utf8_query_with_parameter_oids =
+            frontend_frame(b'P', &parse_utf8_query_with_parameter_oids_payload);
+        assert_eq!(
+            parse_frontend_message(&parse_utf8_query_with_parameter_oids).unwrap(),
+            FrontendMessage::Parse {
+                statement_name: "stmt_utf8".to_string(),
+                query: "SELECT 'héllo', $1::text".to_string(),
+                parameter_type_oids: vec![25],
+            }
+        );
+
         let mut bind_payload = Vec::new();
         bind_payload.extend_from_slice(b"portal1\0stmt1\0");
         bind_payload.extend_from_slice(&1_i16.to_be_bytes());
