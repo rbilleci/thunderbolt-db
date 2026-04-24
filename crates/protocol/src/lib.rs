@@ -4788,6 +4788,12 @@ mod tests {
             FrontendMessage::CopyFail("röw mismatch".to_string())
         );
 
+        let multiline_utf8_copy_fail = frontend_frame(b'f', "röw mismatch\nΔetail\0".as_bytes());
+        assert_eq!(
+            parse_frontend_message(&multiline_utf8_copy_fail).unwrap(),
+            FrontendMessage::CopyFail("röw mismatch\nΔetail".to_string())
+        );
+
         let terminate = frontend_frame(b'X', &[]);
         assert_eq!(
             parse_frontend_message(&terminate).unwrap(),
