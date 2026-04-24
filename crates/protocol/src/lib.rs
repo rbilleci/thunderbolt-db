@@ -4180,6 +4180,21 @@ mod tests {
             }
         );
 
+        let mut parse_multiline_utf8_statement_name_payload = Vec::new();
+        parse_multiline_utf8_statement_name_payload
+            .extend_from_slice("stmté\nΔetail\0SELECT 42\0".as_bytes());
+        parse_multiline_utf8_statement_name_payload.extend_from_slice(&0_i16.to_be_bytes());
+        let parse_multiline_utf8_statement_name =
+            frontend_frame(b'P', &parse_multiline_utf8_statement_name_payload);
+        assert_eq!(
+            parse_frontend_message(&parse_multiline_utf8_statement_name).unwrap(),
+            FrontendMessage::Parse {
+                statement_name: "stmté\nΔetail".to_string(),
+                query: "SELECT 42".to_string(),
+                parameter_type_oids: vec![],
+            }
+        );
+
         let mut parse_utf8_statement_with_parameter_oids_payload = Vec::new();
         parse_utf8_statement_with_parameter_oids_payload
             .extend_from_slice("stmté\0SELECT $1::text, $2::bytea\0".as_bytes());
@@ -4314,6 +4329,24 @@ mod tests {
             FrontendMessage::Bind {
                 portal_name: "pörtal".to_string(),
                 statement_name: "stmté".to_string(),
+                parameter_format_codes: vec![],
+                parameters: vec![],
+                result_format_codes: vec![],
+            }
+        );
+
+        let mut bind_multiline_utf8_names_payload = Vec::new();
+        bind_multiline_utf8_names_payload
+            .extend_from_slice("pörtal\nΔetail\0stmté\nΔetail\0".as_bytes());
+        bind_multiline_utf8_names_payload.extend_from_slice(&0_i16.to_be_bytes());
+        bind_multiline_utf8_names_payload.extend_from_slice(&0_i16.to_be_bytes());
+        bind_multiline_utf8_names_payload.extend_from_slice(&0_i16.to_be_bytes());
+        let bind_multiline_utf8_names = frontend_frame(b'B', &bind_multiline_utf8_names_payload);
+        assert_eq!(
+            parse_frontend_message(&bind_multiline_utf8_names).unwrap(),
+            FrontendMessage::Bind {
+                portal_name: "pörtal\nΔetail".to_string(),
+                statement_name: "stmté\nΔetail".to_string(),
                 parameter_format_codes: vec![],
                 parameters: vec![],
                 result_format_codes: vec![],
