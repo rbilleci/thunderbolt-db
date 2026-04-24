@@ -4583,6 +4583,12 @@ mod tests {
             FrontendMessageError::InvalidBindPayload
         );
 
+        let truncated_function_call_oid_field = frontend_frame(b'F', &[0x00, 0x00, 0x00]);
+        assert_eq!(
+            parse_frontend_message(&truncated_function_call_oid_field).unwrap_err(),
+            FrontendMessageError::InvalidFunctionCallPayload
+        );
+
         let malformed_function_call = frontend_frame(b'F', b"\0\0\0*");
         assert_eq!(
             parse_frontend_message(&malformed_function_call).unwrap_err(),
