@@ -3471,6 +3471,12 @@ mod tests {
             FrontendMessage::PasswordMessage("secret".to_string())
         );
 
+        let empty_password = frontend_frame(b'p', b"\0");
+        assert_eq!(
+            parse_frontend_message(&empty_password).unwrap(),
+            FrontendMessage::PasswordMessage(String::new())
+        );
+
         let mut sasl_initial_payload = Vec::new();
         sasl_initial_payload.extend_from_slice(b"SCRAM-SHA-256\0");
         sasl_initial_payload.extend_from_slice(&5_i32.to_be_bytes());
