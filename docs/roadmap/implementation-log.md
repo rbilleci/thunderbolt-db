@@ -9,6 +9,7 @@
 - Added malformed PostgreSQL `Parse` (`P`) regression coverage proving truncated parameter-type-count fields (partial `i16` payload) are rejected deterministically as `InvalidParseParameterPayload`.
 - Added malformed PostgreSQL `Parse` (`P`) regression coverage proving truncated per-parameter type OID fields (partial `u32` payload) are rejected deterministically as `InvalidParseParameterPayload`.
 - Added startup-packet regression coverage proving unsupported protocol codes are rejected deterministically as `UnsupportedProtocolCode`, keeping pre-auth handshake boundary behavior explicit for non-V3/non-SSL/non-cancel startup probes.
+- Added frontend-parser regression coverage proving unsupported message tags are rejected deterministically as `UnsupportedMessageType`, keeping wire-surface behavior explicit for unknown frontend frame types.
 - Hardened the `psql` golden harness so scenarios can assert expected process exit codes via optional `tests/compat/psql-golden/expected/<scenario>.rc` artifacts (default remains `0`), enabling explicit expected-failure compatibility cases without brittle ad hoc checks.
 - Added baseline exit-code artifact for the existing bootstrap scenario (`01_bootstrap_and_simple_query.rc`) and updated suite docs to describe `.rc` usage for unsupported-yet-expected flows.
 - Continued PostgreSQL extended-query malformed-frame hardening with two new deterministic parser regressions:
@@ -25,7 +26,8 @@
   - `fbbba5e` — `test(protocol): reject truncated bind parameter-count field`
   - `b444b34` — `test(protocol): reject truncated function call result-format code field`
   - `175dabe` — `test(protocol): reject truncated parse parameter fields`
-  - `[pending]` — `test(protocol): cover unsupported startup protocol codes`
+  - `2923868` — `test(protocol): cover unsupported startup protocol codes`
+  - `[pending]` — `test(protocol): reject unsupported frontend message tags`
 
 ### Current blockers
 - None in-repo.

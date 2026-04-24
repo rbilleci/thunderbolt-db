@@ -3836,6 +3836,12 @@ mod tests {
             FrontendMessage::SaslResponse(b"secret".to_vec())
         );
 
+        let unsupported_frontend_message = frontend_frame(b'Z', b"");
+        assert_eq!(
+            parse_frontend_message(&unsupported_frontend_message).unwrap_err(),
+            FrontendMessageError::UnsupportedTag(b'Z')
+        );
+
         let malformed_sasl_initial = frontend_frame(b'p', b"SCRAM-SHA-256\0\0\0");
         assert_eq!(
             parse_frontend_message(&malformed_sasl_initial).unwrap_err(),
