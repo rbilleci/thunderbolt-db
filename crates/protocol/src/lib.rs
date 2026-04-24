@@ -3237,6 +3237,18 @@ mod tests {
                 secret_key: vec![0xCD; PG_CANCEL_SECRET_KEY_MAX_BYTES],
             }
         );
+
+        let mut zero_process_id_cancel_payload = PG_CANCEL_REQUEST_CODE.to_be_bytes().to_vec();
+        zero_process_id_cancel_payload.extend_from_slice(&0u32.to_be_bytes());
+        zero_process_id_cancel_payload.extend_from_slice(b"zero-key");
+        let zero_process_id_cancel = with_length_prefix(zero_process_id_cancel_payload);
+        assert_eq!(
+            parse_startup_packet(&zero_process_id_cancel).unwrap(),
+            StartupPacket::CancelRequest {
+                process_id: 0,
+                secret_key: b"zero-key".to_vec(),
+            }
+        );
     }
 
     #[test]
