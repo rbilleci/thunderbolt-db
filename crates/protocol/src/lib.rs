@@ -4481,6 +4481,15 @@ mod tests {
             }
         );
 
+        let describe_multiline_utf8_statement = frontend_frame(b'D', "Sstmté\nΔetail\0".as_bytes());
+        assert_eq!(
+            parse_frontend_message(&describe_multiline_utf8_statement).unwrap(),
+            FrontendMessage::Describe {
+                target: DescribeTarget::Statement,
+                name: "stmté\nΔetail".to_string(),
+            }
+        );
+
         let describe_unnamed_statement = frontend_frame(b'D', b"S\0");
         assert_eq!(
             parse_frontend_message(&describe_unnamed_statement).unwrap(),
