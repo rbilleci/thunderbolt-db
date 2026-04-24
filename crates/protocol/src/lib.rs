@@ -4153,6 +4153,20 @@ mod tests {
             }
         );
 
+        let mut parse_multiline_utf8_query_payload = Vec::new();
+        parse_multiline_utf8_query_payload
+            .extend_from_slice("stmt_utf8_multi\0SELECT 'héllo'\nFROM tést\0".as_bytes());
+        parse_multiline_utf8_query_payload.extend_from_slice(&0_i16.to_be_bytes());
+        let parse_multiline_utf8_query = frontend_frame(b'P', &parse_multiline_utf8_query_payload);
+        assert_eq!(
+            parse_frontend_message(&parse_multiline_utf8_query).unwrap(),
+            FrontendMessage::Parse {
+                statement_name: "stmt_utf8_multi".to_string(),
+                query: "SELECT 'héllo'\nFROM tést".to_string(),
+                parameter_type_oids: vec![],
+            }
+        );
+
         let mut parse_utf8_statement_name_payload = Vec::new();
         parse_utf8_statement_name_payload.extend_from_slice("stmté\0SELECT 42\0".as_bytes());
         parse_utf8_statement_name_payload.extend_from_slice(&0_i16.to_be_bytes());
