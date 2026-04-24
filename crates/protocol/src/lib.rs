@@ -3642,6 +3642,20 @@ mod tests {
             }
         );
 
+        let mut sasl_initial_with_binary_data_payload = Vec::new();
+        sasl_initial_with_binary_data_payload.extend_from_slice(b"SCRAM-SHA-256\0");
+        sasl_initial_with_binary_data_payload.extend_from_slice(&3_i32.to_be_bytes());
+        sasl_initial_with_binary_data_payload.extend_from_slice(&[0x00, 0xFF, 0x00]);
+        let sasl_initial_with_binary_data =
+            frontend_frame(b'p', &sasl_initial_with_binary_data_payload);
+        assert_eq!(
+            parse_frontend_message(&sasl_initial_with_binary_data).unwrap(),
+            FrontendMessage::SaslInitialResponse {
+                mechanism: "SCRAM-SHA-256".to_string(),
+                initial_response: Some(vec![0x00, 0xFF, 0x00]),
+            }
+        );
+
         let sasl_response = frontend_frame(b'p', b"c=biws,r=nonce,p=proof");
         assert_eq!(
             parse_frontend_message(&sasl_response).unwrap(),
