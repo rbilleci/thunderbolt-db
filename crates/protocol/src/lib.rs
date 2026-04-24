@@ -4599,6 +4599,19 @@ mod tests {
             }
         );
 
+        let mut execute_multiline_utf8_portal_payload = Vec::new();
+        execute_multiline_utf8_portal_payload.extend_from_slice("pörtal\nΔetail\0".as_bytes());
+        execute_multiline_utf8_portal_payload.extend_from_slice(&32_u32.to_be_bytes());
+        let execute_multiline_utf8_portal =
+            frontend_frame(b'E', &execute_multiline_utf8_portal_payload);
+        assert_eq!(
+            parse_frontend_message(&execute_multiline_utf8_portal).unwrap(),
+            FrontendMessage::Execute {
+                portal_name: "pörtal\nΔetail".to_string(),
+                max_rows: 32,
+            }
+        );
+
         let mut function_call_payload = Vec::new();
         function_call_payload.extend_from_slice(&42_u32.to_be_bytes());
         function_call_payload.extend_from_slice(&1_i16.to_be_bytes());
