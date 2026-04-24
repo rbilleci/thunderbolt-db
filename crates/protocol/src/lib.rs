@@ -3892,6 +3892,27 @@ mod tests {
             }
         );
 
+        let mut bind_with_binary_parameter_payload = Vec::new();
+        bind_with_binary_parameter_payload.extend_from_slice(b"portal_bin\0stmt_bin\0");
+        bind_with_binary_parameter_payload.extend_from_slice(&1_i16.to_be_bytes());
+        bind_with_binary_parameter_payload.extend_from_slice(&1_i16.to_be_bytes());
+        bind_with_binary_parameter_payload.extend_from_slice(&1_i16.to_be_bytes());
+        bind_with_binary_parameter_payload.extend_from_slice(&4_i32.to_be_bytes());
+        bind_with_binary_parameter_payload.extend_from_slice(&[0x00, 0xCA, 0x00, 0xFE]);
+        bind_with_binary_parameter_payload.extend_from_slice(&1_i16.to_be_bytes());
+        bind_with_binary_parameter_payload.extend_from_slice(&1_i16.to_be_bytes());
+        let bind_with_binary_parameter = frontend_frame(b'B', &bind_with_binary_parameter_payload);
+        assert_eq!(
+            parse_frontend_message(&bind_with_binary_parameter).unwrap(),
+            FrontendMessage::Bind {
+                portal_name: "portal_bin".to_string(),
+                statement_name: "stmt_bin".to_string(),
+                parameter_format_codes: vec![1],
+                parameters: vec![Some(vec![0x00, 0xCA, 0x00, 0xFE])],
+                result_format_codes: vec![1],
+            }
+        );
+
         let describe_stmt = frontend_frame(b'D', b"Sstmt1\0");
         assert_eq!(
             parse_frontend_message(&describe_stmt).unwrap(),
