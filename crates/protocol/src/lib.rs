@@ -3738,6 +3738,21 @@ mod tests {
             }
         );
 
+        let mut sasl_initial_with_utf8_data_payload = Vec::new();
+        sasl_initial_with_utf8_data_payload.extend_from_slice(b"SCRAM-SHA-256\0");
+        sasl_initial_with_utf8_data_payload
+            .extend_from_slice(&("n,,r=nönce".len() as i32).to_be_bytes());
+        sasl_initial_with_utf8_data_payload.extend_from_slice("n,,r=nönce".as_bytes());
+        let sasl_initial_with_utf8_data =
+            frontend_frame(b'p', &sasl_initial_with_utf8_data_payload);
+        assert_eq!(
+            parse_frontend_message(&sasl_initial_with_utf8_data).unwrap(),
+            FrontendMessage::SaslInitialResponse {
+                mechanism: "SCRAM-SHA-256".to_string(),
+                initial_response: Some("n,,r=nönce".as_bytes().to_vec()),
+            }
+        );
+
         let mut sasl_initial_with_utf8_mechanism_payload = Vec::new();
         sasl_initial_with_utf8_mechanism_payload.extend_from_slice("SCRÄM\0".as_bytes());
         sasl_initial_with_utf8_mechanism_payload.extend_from_slice(&(-1_i32).to_be_bytes());
