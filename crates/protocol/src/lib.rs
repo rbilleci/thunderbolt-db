@@ -3744,6 +3744,12 @@ mod tests {
             FrontendMessage::SaslResponse(Vec::new())
         );
 
+        let utf8_sasl_response = frontend_frame(b'p', "prøöf".as_bytes());
+        assert_eq!(
+            parse_frontend_message(&utf8_sasl_response).unwrap(),
+            FrontendMessage::SaslResponse("prøöf".as_bytes().to_vec())
+        );
+
         let mut parse_payload = Vec::new();
         parse_payload.extend_from_slice(b"stmt1\0SELECT $1::int4\0");
         parse_payload.extend_from_slice(&1_i16.to_be_bytes());
