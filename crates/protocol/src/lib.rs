@@ -4095,6 +4095,12 @@ mod tests {
             FrontendMessage::SaslResponse(b"secret".to_vec())
         );
 
+        let binary_sasl_response = frontend_frame(b'p', &[0xFF, 0xFE]);
+        assert_eq!(
+            parse_frontend_message(&binary_sasl_response).unwrap(),
+            FrontendMessage::SaslResponse(vec![0xFF, 0xFE])
+        );
+
         let unsupported_frontend_message = frontend_frame(b'Z', b"");
         assert_eq!(
             parse_frontend_message(&unsupported_frontend_message).unwrap_err(),
