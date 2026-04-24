@@ -3353,6 +3353,14 @@ mod tests {
             StartupPacketError::UnterminatedParameterPayload
         );
 
+        let mut double_null_empty_param_payload = PG_PROTOCOL_V3.to_be_bytes().to_vec();
+        double_null_empty_param_payload.extend_from_slice(b"\0\0");
+        let double_null_empty_param_payload = with_length_prefix(double_null_empty_param_payload);
+        assert_eq!(
+            parse_startup_packet(&double_null_empty_param_payload).unwrap_err(),
+            StartupPacketError::InvalidParameterPairing
+        );
+
         let mut bad_params = PG_PROTOCOL_V3.to_be_bytes().to_vec();
         bad_params.extend_from_slice(b"user\0postgres");
         let bad_params = with_length_prefix(bad_params);
