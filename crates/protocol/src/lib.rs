@@ -3962,9 +3962,9 @@ mod tests {
             FrontendMessageError::UnterminatedSimpleQuery
         );
 
-        let unterminated_password = frontend_frame(b'p', b"secret");
+        let password_like_sasl_response = frontend_frame(b'p', b"secret");
         assert_eq!(
-            parse_frontend_message(&unterminated_password).unwrap(),
+            parse_frontend_message(&password_like_sasl_response).unwrap(),
             FrontendMessage::SaslResponse(b"secret".to_vec())
         );
 
@@ -5120,6 +5120,12 @@ mod tests {
         assert_eq!(
             parse_frontend_message(&invalid_utf8_query).unwrap_err(),
             FrontendMessageError::InvalidUtf8
+        );
+
+        let password_with_embedded_null_and_terminator = frontend_frame(b'p', b"secret\0extra\0");
+        assert_eq!(
+            parse_frontend_message(&password_with_embedded_null_and_terminator).unwrap_err(),
+            FrontendMessageError::InvalidSaslInitialResponsePayload
         );
 
         let invalid_utf8_password = frontend_frame(b'p', &[0xFF, 0]);
