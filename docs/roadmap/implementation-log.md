@@ -6,6 +6,8 @@
 - Added malformed PostgreSQL `FunctionCall` (`F`) regression coverage proving truncated function OID fields are rejected deterministically as `InvalidFunctionCallPayload` when the 4-byte object identifier is incomplete.
 - Added malformed PostgreSQL `Bind` (`B`) regression coverage proving truncated parameter-format and result-format code vectors are rejected deterministically as `InvalidBindPayload` when multi-entry format sections end mid-`i16`.
 - Added malformed PostgreSQL `Bind` (`B`) regression coverage proving truncated parameter-format-count (`C`) and result-format-count (`R`) fields are rejected deterministically as `InvalidBindPayload` when only a partial `i16` payload is present.
+- Added malformed PostgreSQL `Parse` (`P`) regression coverage proving truncated parameter-type-count fields (partial `i16` payload) are rejected deterministically as `InvalidParseParameterPayload`.
+- Added malformed PostgreSQL `Parse` (`P`) regression coverage proving truncated per-parameter type OID fields (partial `u32` payload) are rejected deterministically as `InvalidParseParameterPayload`.
 - Hardened the `psql` golden harness so scenarios can assert expected process exit codes via optional `tests/compat/psql-golden/expected/<scenario>.rc` artifacts (default remains `0`), enabling explicit expected-failure compatibility cases without brittle ad hoc checks.
 - Added baseline exit-code artifact for the existing bootstrap scenario (`01_bootstrap_and_simple_query.rc`) and updated suite docs to describe `.rc` usage for unsupported-yet-expected flows.
 - Continued PostgreSQL extended-query malformed-frame hardening with two new deterministic parser regressions:
@@ -21,6 +23,7 @@
   - `65bca82` — `test(protocol): reject truncated function call arg-count field`
   - `fbbba5e` — `test(protocol): reject truncated bind parameter-count field`
   - `b444b34` — `test(protocol): reject truncated function call result-format code field`
+  - `[pending]` — `test(protocol): reject truncated parse parameter fields`
 
 ### Current blockers
 - None in-repo.

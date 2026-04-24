@@ -3899,6 +3899,23 @@ mod tests {
             FrontendMessageError::InvalidParseParameterPayload
         );
 
+        let truncated_parse_type_count_field = frontend_frame(b'P', b"stmt\0SELECT 1\0\0");
+        assert_eq!(
+            parse_frontend_message(&truncated_parse_type_count_field).unwrap_err(),
+            FrontendMessageError::InvalidParseParameterPayload
+        );
+
+        let mut truncated_parse_parameter_oid_field_payload = Vec::new();
+        truncated_parse_parameter_oid_field_payload.extend_from_slice(b"stmt\0SELECT 1\0");
+        truncated_parse_parameter_oid_field_payload.extend_from_slice(&1_i16.to_be_bytes());
+        truncated_parse_parameter_oid_field_payload.extend_from_slice(&[0x00, 0x00, 0x00]);
+        let truncated_parse_parameter_oid_field =
+            frontend_frame(b'P', &truncated_parse_parameter_oid_field_payload);
+        assert_eq!(
+            parse_frontend_message(&truncated_parse_parameter_oid_field).unwrap_err(),
+            FrontendMessageError::InvalidParseParameterPayload
+        );
+
         let mut malformed_bind_with_truncated_result_format_codes_payload = Vec::new();
         malformed_bind_with_truncated_result_format_codes_payload.extend_from_slice(b"\0\0");
         malformed_bind_with_truncated_result_format_codes_payload
