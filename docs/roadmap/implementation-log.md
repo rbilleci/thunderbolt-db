@@ -3,6 +3,7 @@
 ## 2026-04-24
 
 ### Completed
+- Added malformed PostgreSQL `FunctionCall` (`F`) regression coverage proving truncated function OID fields are rejected deterministically as `InvalidFunctionCallPayload` when the 4-byte object identifier is incomplete.
 - Added malformed PostgreSQL `Bind` (`B`) regression coverage proving truncated parameter-format and result-format code vectors are rejected deterministically as `InvalidBindPayload` when multi-entry format sections end mid-`i16`.
 - Added malformed PostgreSQL `Bind` (`B`) regression coverage proving truncated parameter-format-count (`C`) and result-format-count (`R`) fields are rejected deterministically as `InvalidBindPayload` when only a partial `i16` payload is present.
 - Hardened the `psql` golden harness so scenarios can assert expected process exit codes via optional `tests/compat/psql-golden/expected/<scenario>.rc` artifacts (default remains `0`), enabling explicit expected-failure compatibility cases without brittle ad hoc checks.
@@ -14,6 +15,7 @@
 - Added malformed PostgreSQL `FunctionCall` (`F`) regression coverage proving truncated result-format code fields (partial `i16` payload) are rejected deterministically as `InvalidFunctionCallPayload`.
 - Scaffolded a real-client `psql` golden compatibility harness (`scripts/run_psql_golden.sh`) plus first scenario/expected artifact set under `tests/compat/psql-golden/`, including deterministic output normalization and local run/update docs.
 - Commits pushed:
+  - `67ac011` — `test(protocol): reject truncated function-call oid field`
   - `a5b0f7e` — `test(protocol): reject truncated bind format-code vectors`
   - `dc4debc` — `test(protocol): reject truncated bind format-count fields`
   - `65bca82` — `test(protocol): reject truncated function call arg-count field`
