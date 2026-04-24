@@ -1,0 +1,34 @@
+=== connect and simple query ===
+ one
+-----
+   1
+(1 row)
+=== session probes ===
+ client_encoding
+-----------------
+ UTF8
+(1 row)
+
+ current_schema
+----------------
+ public
+(1 row)
+=== tx begin/commit/rollback ===
+BEGIN
+ in_tx
+-------
+     2
+(1 row)
+
+COMMIT
+BEGIN
+ rolled_back
+-------------
+           3
+(1 row)
+
+ROLLBACK
+=== deterministic error path ===
+ERROR:  relation "definitely_missing_relation_for_golden" does not exist
+LINE 1: SELECT * FROM definitely_missing_relation_for_golden;
+                      ^

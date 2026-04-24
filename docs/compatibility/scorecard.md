@@ -25,6 +25,16 @@ python3 scripts/generate_compat_scorecard.py \
   --baseline docs/compatibility/scorecard.baseline.json
 ```
 
+## Real-client psql golden suite
+
+The `psql` compatibility golden suite lives at `tests/compat/psql-golden/` and is executed with:
+
+```bash
+scripts/run_psql_golden.sh
+```
+
+This suite is intentionally libpq/`psql`-driven, not fixture-only protocol parsing, so client lifecycle behavior is validated end-to-end.
+
 ## Bucket registration for new tests
 
 The scorecard classifies tests by test id patterns (crate + test name).

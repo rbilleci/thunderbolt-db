@@ -7,6 +7,7 @@
   - `FunctionCall` (`F`) now explicitly rejects truncated argument-count fields (partial `i16` payload) as `InvalidFunctionCallPayload`.
   - `Bind` (`B`) now explicitly rejects truncated parameter-count fields (partial `i16` payload) as `InvalidBindPayload`.
 - Re-ran full safety gates after each atomic delta (`cargo fmt --all`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all --all-features`) with all checks green.
+- Scaffolded a real-client `psql` golden compatibility harness (`scripts/run_psql_golden.sh`) plus first scenario/expected artifact set under `tests/compat/psql-golden/`, including deterministic output normalization and local run/update docs.
 - Commits pushed:
   - `65bca82` — `test(protocol): reject truncated function call arg-count field`
   - `fbbba5e` — `test(protocol): reject truncated bind parameter-count field`
