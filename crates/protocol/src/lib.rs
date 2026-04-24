@@ -4132,6 +4132,25 @@ mod tests {
             }
         );
 
+        let mut function_call_with_empty_binary_arg_payload = Vec::new();
+        function_call_with_empty_binary_arg_payload.extend_from_slice(&102_u32.to_be_bytes());
+        function_call_with_empty_binary_arg_payload.extend_from_slice(&1_i16.to_be_bytes());
+        function_call_with_empty_binary_arg_payload.extend_from_slice(&1_i16.to_be_bytes());
+        function_call_with_empty_binary_arg_payload.extend_from_slice(&1_i16.to_be_bytes());
+        function_call_with_empty_binary_arg_payload.extend_from_slice(&0_i32.to_be_bytes());
+        function_call_with_empty_binary_arg_payload.extend_from_slice(&1_i16.to_be_bytes());
+        let function_call_with_empty_binary_arg =
+            frontend_frame(b'F', &function_call_with_empty_binary_arg_payload);
+        assert_eq!(
+            parse_frontend_message(&function_call_with_empty_binary_arg).unwrap(),
+            FrontendMessage::FunctionCall {
+                function_oid: 102,
+                argument_format_codes: vec![1],
+                arguments: vec![Some(Vec::new())],
+                result_format_code: 1,
+            }
+        );
+
         let copy_data = frontend_frame(b'd', &[0, 1, 2, 3]);
         assert_eq!(
             parse_frontend_message(&copy_data).unwrap(),
