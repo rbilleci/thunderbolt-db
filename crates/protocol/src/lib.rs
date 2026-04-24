@@ -4693,6 +4693,12 @@ mod tests {
             FrontendMessage::SaslResponse(vec![0xFF, 0xFE])
         );
 
+        let mixed_utf8_binary_sasl_response = frontend_frame(b'p', &[b'p', b'r', 0xC3, 0xB8, 0xFF]);
+        assert_eq!(
+            parse_frontend_message(&mixed_utf8_binary_sasl_response).unwrap(),
+            FrontendMessage::SaslResponse(vec![b'p', b'r', 0xC3, 0xB8, 0xFF])
+        );
+
         let unsupported_frontend_message = frontend_frame(b'Z', b"");
         assert_eq!(
             parse_frontend_message(&unsupported_frontend_message).unwrap_err(),
