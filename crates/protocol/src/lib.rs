@@ -3787,6 +3787,25 @@ mod tests {
             }
         );
 
+        let mut sasl_initial_with_utf8_mechanism_and_utf8_data_payload = Vec::new();
+        sasl_initial_with_utf8_mechanism_and_utf8_data_payload
+            .extend_from_slice("SCRÄM\0".as_bytes());
+        sasl_initial_with_utf8_mechanism_and_utf8_data_payload
+            .extend_from_slice(&("n,,r=nönce".len() as i32).to_be_bytes());
+        sasl_initial_with_utf8_mechanism_and_utf8_data_payload
+            .extend_from_slice("n,,r=nönce".as_bytes());
+        let sasl_initial_with_utf8_mechanism_and_utf8_data = frontend_frame(
+            b'p',
+            &sasl_initial_with_utf8_mechanism_and_utf8_data_payload,
+        );
+        assert_eq!(
+            parse_frontend_message(&sasl_initial_with_utf8_mechanism_and_utf8_data).unwrap(),
+            FrontendMessage::SaslInitialResponse {
+                mechanism: "SCRÄM".to_string(),
+                initial_response: Some("n,,r=nönce".as_bytes().to_vec()),
+            }
+        );
+
         let sasl_response = frontend_frame(b'p', b"c=biws,r=nonce,p=proof");
         assert_eq!(
             parse_frontend_message(&sasl_response).unwrap(),
