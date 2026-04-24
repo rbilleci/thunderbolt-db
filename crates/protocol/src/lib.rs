@@ -4472,6 +4472,15 @@ mod tests {
             }
         );
 
+        let describe_multiline_utf8_portal = frontend_frame(b'D', "Ppörtal\nΔetail\0".as_bytes());
+        assert_eq!(
+            parse_frontend_message(&describe_multiline_utf8_portal).unwrap(),
+            FrontendMessage::Describe {
+                target: DescribeTarget::Portal,
+                name: "pörtal\nΔetail".to_string(),
+            }
+        );
+
         let describe_unnamed_statement = frontend_frame(b'D', b"S\0");
         assert_eq!(
             parse_frontend_message(&describe_unnamed_statement).unwrap(),
