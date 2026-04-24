@@ -3944,6 +3944,15 @@ mod tests {
             }
         );
 
+        let close_utf8_statement = frontend_frame(b'C', "Sstmté\0".as_bytes());
+        assert_eq!(
+            parse_frontend_message(&close_utf8_statement).unwrap(),
+            FrontendMessage::Close {
+                target: DescribeTarget::Statement,
+                name: "stmté".to_string(),
+            }
+        );
+
         let close_unnamed_statement = frontend_frame(b'C', b"S\0");
         assert_eq!(
             parse_frontend_message(&close_unnamed_statement).unwrap(),
