@@ -38,7 +38,7 @@
   - `175dabe` — `test(protocol): reject truncated parse parameter fields`
   - `2923868` — `test(protocol): cover unsupported startup protocol codes`
   - `a74783d` — `test(protocol): cover unterminated execute portal name`
-  - `[pending]` — `feat(protocol): parse startup gssenc request`
+  - `cf8a2be` — `feat(protocol): parse startup gssenc request`
 
 ### Current blockers
 - None in-repo.
