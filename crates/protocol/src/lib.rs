@@ -4132,6 +4132,27 @@ mod tests {
             }
         );
 
+        let mut function_call_with_utf8_text_arg_payload = Vec::new();
+        function_call_with_utf8_text_arg_payload.extend_from_slice(&103_u32.to_be_bytes());
+        function_call_with_utf8_text_arg_payload.extend_from_slice(&1_i16.to_be_bytes());
+        function_call_with_utf8_text_arg_payload.extend_from_slice(&0_i16.to_be_bytes());
+        function_call_with_utf8_text_arg_payload.extend_from_slice(&1_i16.to_be_bytes());
+        function_call_with_utf8_text_arg_payload
+            .extend_from_slice(&("héllo".len() as i32).to_be_bytes());
+        function_call_with_utf8_text_arg_payload.extend_from_slice("héllo".as_bytes());
+        function_call_with_utf8_text_arg_payload.extend_from_slice(&0_i16.to_be_bytes());
+        let function_call_with_utf8_text_arg =
+            frontend_frame(b'F', &function_call_with_utf8_text_arg_payload);
+        assert_eq!(
+            parse_frontend_message(&function_call_with_utf8_text_arg).unwrap(),
+            FrontendMessage::FunctionCall {
+                function_oid: 103,
+                argument_format_codes: vec![0],
+                arguments: vec![Some("héllo".as_bytes().to_vec())],
+                result_format_code: 0,
+            }
+        );
+
         let mut function_call_with_empty_binary_arg_payload = Vec::new();
         function_call_with_empty_binary_arg_payload.extend_from_slice(&102_u32.to_be_bytes());
         function_call_with_empty_binary_arg_payload.extend_from_slice(&1_i16.to_be_bytes());
