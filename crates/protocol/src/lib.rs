@@ -3563,6 +3563,26 @@ mod tests {
     }
 
     #[test]
+    fn parses_pg_v3_startup_packet_with_interleaved_utf8_duplicate_keys() {
+        let mut payload = PG_PROTOCOL_V3.to_be_bytes().to_vec();
+        payload.extend_from_slice("möde\0påth=a\0rôle\0anályst\0möde\0påth=b\0\0".as_bytes());
+        let frame = with_length_prefix(payload);
+
+        let packet = parse_startup_packet(&frame).unwrap();
+        assert_eq!(
+            packet,
+            StartupPacket::Startup {
+                protocol_version: PG_PROTOCOL_V3,
+                params: vec![
+                    ("möde".to_string(), "påth=a".to_string()),
+                    ("rôle".to_string(), "anályst".to_string()),
+                    ("möde".to_string(), "påth=b".to_string()),
+                ],
+            }
+        );
+    }
+
+    #[test]
     fn parses_pg_v3_minor_version_startup_packet() {
         let protocol_version = (PG_PROTOCOL_MAJOR_V3 << 16) | 2;
         let mut payload = protocol_version.to_be_bytes().to_vec();
