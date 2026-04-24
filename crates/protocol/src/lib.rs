@@ -3878,6 +3878,12 @@ mod tests {
             FrontendMessage::CopyFail("bad row".to_string())
         );
 
+        let empty_copy_fail = frontend_frame(b'f', b"\0");
+        assert_eq!(
+            parse_frontend_message(&empty_copy_fail).unwrap(),
+            FrontendMessage::CopyFail(String::new())
+        );
+
         let terminate = frontend_frame(b'X', &[]);
         assert_eq!(
             parse_frontend_message(&terminate).unwrap(),
