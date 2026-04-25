@@ -1812,6 +1812,27 @@ mod tests {
     }
 
     #[test]
+    fn raft_progress_snapshot_is_stable_across_ack_tracking_pruning() {
+        let mut r = RaftReplicator::new(3);
+        r.become_leader(1);
+
+        let t1 = r.propose(vec![1]).unwrap();
+        let t2 = r.propose(vec![2]).unwrap();
+
+        r.register_follower_ack(t1.index, 1);
+        let after_first_commit = r.progress();
+        assert_eq!(after_first_commit.commit_index, t1.index);
+        assert_eq!(after_first_commit.uncommitted_entry_count, 1);
+
+        r.register_follower_ack(t2.index, 1);
+        let after_second_commit = r.progress();
+        assert_eq!(after_second_commit.commit_index, t2.index);
+        assert_eq!(after_second_commit.uncommitted_entry_count, 0);
+        assert!(r.ack_counts.is_empty());
+        after_second_commit.validate().unwrap();
+    }
+
+    #[test]
     fn raft_role_change_discards_uncommitted_tail() {
         let mut r = RaftReplicator::new(3);
         r.become_leader(1);
