@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use gpu_db_execution::GpuRuntimeSnapshot;
 use gpu_db_metrics::{GpuParityIssue, RuntimeMetricsSnapshot};
 use gpu_db_types::{Index, Role};
 
@@ -32,11 +33,20 @@ pub struct EngineTelemetrySnapshot {
     pub replication_lag: ReplicationLagSnapshot,
     pub runtime_metrics: RuntimeMetricsSnapshot,
     pub gpu_parity_fallbacks: BTreeMap<GpuParityIssue, u64>,
+    pub gpu_runtime: GpuRuntimeSnapshot,
 }
 
 impl EngineTelemetrySnapshot {
     pub fn gpu_parity_fallback_total(&self) -> u64 {
         self.gpu_parity_fallbacks.values().copied().sum()
+    }
+
+    pub fn has_gpu_runtime_pressure(&self) -> bool {
+        self.gpu_runtime.has_pressure()
+    }
+
+    pub fn blocked_gpu_ids(&self) -> Vec<u16> {
+        self.gpu_runtime.blocked_gpu_ids()
     }
 
     pub fn has_gpu_parity_fallbacks(&self) -> bool {
@@ -118,6 +128,7 @@ mod tests {
             },
             runtime_metrics: metrics,
             gpu_parity_fallbacks: BTreeMap::new(),
+            gpu_runtime: GpuRuntimeSnapshot::default(),
         }
     }
 
@@ -159,6 +170,22 @@ mod tests {
         assert_eq!(snapshot.gpu_parity_fallback_count_for(&issue_120), 2);
         assert_eq!(snapshot.gpu_parity_fallback_count_for(&issue_121), 3);
         assert_eq!(snapshot.hottest_gpu_parity_fallback(), Some((issue_121, 3)));
+    }
+
+    #[test]
+    fn gpu_runtime_helpers_report_pressure_and_blocked_ids() {
+        let mut snapshot = empty_snapshot();
+        assert!(!snapshot.has_gpu_runtime_pressure());
+        assert!(snapshot.blocked_gpu_ids().is_empty());
+
+        snapshot.gpu_runtime = GpuRuntimeSnapshot {
+            unavailable_gpu_ids: vec![0, 2],
+            memory_pressured_gpu_ids: vec![2, 4],
+            saturated: true,
+        };
+
+        assert!(snapshot.has_gpu_runtime_pressure());
+        assert_eq!(snapshot.blocked_gpu_ids(), vec![0, 2, 4]);
     }
 
     #[test]

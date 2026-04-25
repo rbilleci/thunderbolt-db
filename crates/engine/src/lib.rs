@@ -908,6 +908,7 @@ impl Engine {
             },
             runtime_metrics: self.metrics.snapshot(),
             gpu_parity_fallbacks: self.metrics.fallback_counts_by_gpu_parity_issue(),
+            gpu_runtime: self.router.runtime().snapshot(),
         }
     }
 
@@ -1541,6 +1542,8 @@ mod tests {
         let snapshot = e.telemetry_snapshot();
         assert_eq!(snapshot.gpu_parity_fallback_total(), 1);
         assert!(snapshot.has_gpu_parity_fallbacks());
+        assert!(snapshot.has_gpu_runtime_pressure());
+        assert_eq!(snapshot.blocked_gpu_ids(), vec![0]);
         assert_eq!(
             snapshot.gpu_parity_fallbacks.get(&GpuParityIssue {
                 id: "GPU-120",
@@ -1585,6 +1588,11 @@ mod tests {
             e.metrics().fallback_for(FallbackReason::GpuQueueSaturated),
             1
         );
+
+        let snapshot = e.telemetry_snapshot();
+        assert!(snapshot.has_gpu_runtime_pressure());
+        assert!(snapshot.blocked_gpu_ids().is_empty());
+        assert!(snapshot.gpu_runtime.saturated);
     }
 
     #[test]

@@ -31,6 +31,31 @@ pub enum RouteDecision {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct GpuRuntimeSnapshot {
+    pub unavailable_gpu_ids: Vec<u16>,
+    pub memory_pressured_gpu_ids: Vec<u16>,
+    pub saturated: bool,
+}
+
+impl GpuRuntimeSnapshot {
+    pub fn has_pressure(&self) -> bool {
+        self.saturated
+            || !self.unavailable_gpu_ids.is_empty()
+            || !self.memory_pressured_gpu_ids.is_empty()
+    }
+
+    pub fn blocked_gpu_ids(&self) -> Vec<u16> {
+        self.unavailable_gpu_ids
+            .iter()
+            .chain(self.memory_pressured_gpu_ids.iter())
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+}
+
 pub trait GpuRuntime {
     fn can_run(&self, gpu_id: u16, op: &PlannedOp) -> Result<(), GpuFallbackReason>;
 }
@@ -77,6 +102,14 @@ pub struct MockGpuRuntime {
 }
 
 impl MockGpuRuntime {
+    pub fn snapshot(&self) -> GpuRuntimeSnapshot {
+        GpuRuntimeSnapshot {
+            unavailable_gpu_ids: self.unavailable.iter().copied().collect(),
+            memory_pressured_gpu_ids: self.memory_pressured.iter().copied().collect(),
+            saturated: self.saturated,
+        }
+    }
+
     pub fn mark_unavailable(&mut self, gpu_id: u16) {
         self.unavailable.insert(gpu_id);
     }
@@ -240,6 +273,24 @@ mod tests {
                 reason: GpuFallbackReason::QueueSaturated,
             }
         );
+    }
+
+    #[test]
+    fn mock_gpu_runtime_snapshot_reports_blocked_ids_and_pressure() {
+        let mut runtime = MockGpuRuntime::default();
+        runtime.mark_unavailable(3);
+        runtime.mark_unavailable(1);
+        runtime.mark_memory_pressured(5);
+        runtime.mark_memory_pressured(3);
+        runtime.set_saturated(true);
+
+        let snapshot = runtime.snapshot();
+
+        assert_eq!(snapshot.unavailable_gpu_ids, vec![1, 3]);
+        assert_eq!(snapshot.memory_pressured_gpu_ids, vec![3, 5]);
+        assert!(snapshot.saturated);
+        assert!(snapshot.has_pressure());
+        assert_eq!(snapshot.blocked_gpu_ids(), vec![1, 3, 5]);
     }
 
     #[test]
