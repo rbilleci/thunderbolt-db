@@ -86,6 +86,26 @@ impl TxnManager {
         self.active_count
     }
 
+    pub fn oldest_active_txn_id(&self) -> Option<TxnId> {
+        self.states
+            .iter()
+            .find_map(|(&id, state)| matches!(state, TxnState::Active).then_some(id))
+    }
+
+    pub fn newest_active_txn_id(&self) -> Option<TxnId> {
+        self.states
+            .iter()
+            .rev()
+            .find_map(|(&id, state)| matches!(state, TxnState::Active).then_some(id))
+    }
+
+    pub fn active_txn_ids(&self) -> Vec<TxnId> {
+        self.states
+            .iter()
+            .filter_map(|(&id, state)| matches!(state, TxnState::Active).then_some(id))
+            .collect()
+    }
+
     fn transition_terminal(&mut self, id: TxnId, to: TxnState) -> Result<Txn, TxnError> {
         let Some(state) = self.states.get_mut(&id) else {
             return Err(TxnError::NotFound(id));
@@ -209,5 +229,27 @@ mod tests {
 
         assert_eq!(tm.begin_with_id(t.id), Err(TxnError::AlreadyExists(t.id)));
         assert_eq!(tm.active_count(), 0);
+    }
+
+    #[test]
+    fn active_txn_helpers_track_oldest_newest_and_ids() {
+        let mut tm = TxnManager::default();
+        assert_eq!(tm.oldest_active_txn_id(), None);
+        assert_eq!(tm.newest_active_txn_id(), None);
+        assert!(tm.active_txn_ids().is_empty());
+
+        tm.begin_with_id(7).unwrap();
+        tm.begin_with_id(3).unwrap();
+        tm.begin_with_id(11).unwrap();
+        tm.commit(7).unwrap();
+
+        assert_eq!(tm.oldest_active_txn_id(), Some(3));
+        assert_eq!(tm.newest_active_txn_id(), Some(11));
+        assert_eq!(tm.active_txn_ids(), vec![3, 11]);
+
+        tm.rollback(3).unwrap();
+        assert_eq!(tm.oldest_active_txn_id(), Some(11));
+        assert_eq!(tm.newest_active_txn_id(), Some(11));
+        assert_eq!(tm.active_txn_ids(), vec![11]);
     }
 }

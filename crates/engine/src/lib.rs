@@ -210,6 +210,8 @@ pub struct ReplicationWatermarks {
     pub pending_batch_oldest_age_ms: Option<u64>,
     pub pending_batch_time_until_deadline_ms: Option<u64>,
     pub active_txn_count: usize,
+    pub oldest_active_txn_id: Option<TxnId>,
+    pub newest_active_txn_id: Option<TxnId>,
     pub has_wal_backlog: bool,
     pub has_pending_batch_backlog: bool,
     pub has_active_txn_backlog: bool,
@@ -808,6 +810,8 @@ impl Engine {
         let commit_apply_gap = commit_index.saturating_sub(applied_index);
         let apply_visible_gap = applied_index.saturating_sub(visible_index);
 
+        let oldest_active_txn_id = self.txn_manager.oldest_active_txn_id();
+        let newest_active_txn_id = self.txn_manager.newest_active_txn_id();
         let has_wal_backlog = wal_unflushed_count > 0;
         let has_pending_batch_backlog = pending_batch_len > 0;
         let has_active_txn_backlog = active_txn_count > 0;
@@ -855,6 +859,8 @@ impl Engine {
                 .pending_batch_time_until_deadline(now)
                 .map(|remaining| remaining.as_millis() as u64),
             active_txn_count,
+            oldest_active_txn_id,
+            newest_active_txn_id,
             has_wal_backlog,
             has_pending_batch_backlog,
             has_active_txn_backlog,
@@ -1989,6 +1995,8 @@ mod tests {
         assert_eq!(before.pending_batch_oldest_age_ms, None);
         assert_eq!(before.pending_batch_time_until_deadline_ms, None);
         assert_eq!(before.active_txn_count, 0);
+        assert_eq!(before.oldest_active_txn_id, None);
+        assert_eq!(before.newest_active_txn_id, None);
         assert!(!before.has_wal_backlog);
         assert!(!before.has_pending_batch_backlog);
         assert!(!before.has_active_txn_backlog);
@@ -2023,6 +2031,8 @@ mod tests {
         assert_eq!(after.pending_batch_oldest_age_ms, None);
         assert_eq!(after.pending_batch_time_until_deadline_ms, None);
         assert_eq!(after.active_txn_count, 0);
+        assert_eq!(after.oldest_active_txn_id, None);
+        assert_eq!(after.newest_active_txn_id, None);
         assert!(!after.has_wal_backlog);
         assert!(!after.has_pending_batch_backlog);
         assert!(!after.has_active_txn_backlog);
@@ -2217,6 +2227,8 @@ mod tests {
         let marks = e.replication_watermarks();
         assert_eq!(marks.role, Role::Follower);
         assert_eq!(marks.active_txn_count, 1);
+        assert_eq!(marks.oldest_active_txn_id, Some(9));
+        assert_eq!(marks.newest_active_txn_id, Some(9));
         assert!(!marks.follower_promotion_ready);
     }
 
@@ -2228,6 +2240,8 @@ mod tests {
 
         let marks = e.replication_watermarks();
         assert_eq!(marks.active_txn_count, 1);
+        assert_eq!(marks.oldest_active_txn_id, Some(42));
+        assert_eq!(marks.newest_active_txn_id, Some(42));
         assert_eq!(marks.pending_batch_len, 0);
         assert_eq!(marks.pending_batch_oldest_age_ms, None);
         assert_eq!(marks.pending_batch_time_until_deadline_ms, None);
