@@ -849,6 +849,7 @@ impl Engine {
                 apply_visible_gap: marks.apply_visible_gap,
             },
             runtime_metrics: self.metrics.snapshot(),
+            gpu_parity_fallbacks: self.metrics.fallback_counts_by_gpu_parity_issue(),
         }
     }
 
@@ -2594,6 +2595,7 @@ mod tests {
         assert_eq!(snapshot.runtime_metrics.pending_batch_peak, 1);
         assert_eq!(snapshot.runtime_metrics.last_pending_batch_len, Some(1));
         assert_eq!(snapshot.runtime_metrics.commits_total, 0);
+        assert!(snapshot.gpu_parity_fallbacks.is_empty());
     }
 
     #[test]
@@ -2613,6 +2615,7 @@ mod tests {
         assert_eq!(snapshot.replication_lag.commit_apply_gap, 0);
         assert_eq!(snapshot.replication_lag.apply_visible_gap, 0);
         assert_eq!(snapshot.runtime_metrics.commits_total, 1);
+        assert!(snapshot.gpu_parity_fallbacks.is_empty());
     }
 
     #[test]

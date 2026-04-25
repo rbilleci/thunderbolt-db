@@ -1,4 +1,6 @@
-use gpu_db_metrics::RuntimeMetricsSnapshot;
+use std::collections::BTreeMap;
+
+use gpu_db_metrics::{GpuParityIssue, RuntimeMetricsSnapshot};
 use gpu_db_types::{Index, Role};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -15,6 +17,7 @@ pub struct EngineTelemetrySnapshot {
     pub role: Role,
     pub replication_lag: ReplicationLagSnapshot,
     pub runtime_metrics: RuntimeMetricsSnapshot,
+    pub gpu_parity_fallbacks: BTreeMap<GpuParityIssue, u64>,
 }
 
 pub trait TelemetrySink {
@@ -76,6 +79,7 @@ mod tests {
                 apply_visible_gap: 0,
             },
             runtime_metrics: metrics,
+            gpu_parity_fallbacks: BTreeMap::new(),
         };
 
         let mut sink = InMemoryTelemetrySink::default();
