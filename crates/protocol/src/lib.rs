@@ -5047,6 +5047,38 @@ mod tests {
             }
         );
 
+        let mut bind_unnamed_portal_with_named_statement_multiple_result_formats_payload =
+            Vec::new();
+        bind_unnamed_portal_with_named_statement_multiple_result_formats_payload
+            .extend_from_slice(b"\0stmt_results_named\0");
+        bind_unnamed_portal_with_named_statement_multiple_result_formats_payload
+            .extend_from_slice(&0_i16.to_be_bytes());
+        bind_unnamed_portal_with_named_statement_multiple_result_formats_payload
+            .extend_from_slice(&0_i16.to_be_bytes());
+        bind_unnamed_portal_with_named_statement_multiple_result_formats_payload
+            .extend_from_slice(&2_i16.to_be_bytes());
+        bind_unnamed_portal_with_named_statement_multiple_result_formats_payload
+            .extend_from_slice(&0_i16.to_be_bytes());
+        bind_unnamed_portal_with_named_statement_multiple_result_formats_payload
+            .extend_from_slice(&1_i16.to_be_bytes());
+        let bind_unnamed_portal_with_named_statement_multiple_result_formats = frontend_frame(
+            b'B',
+            &bind_unnamed_portal_with_named_statement_multiple_result_formats_payload,
+        );
+        assert_eq!(
+            parse_frontend_message(
+                &bind_unnamed_portal_with_named_statement_multiple_result_formats,
+            )
+            .unwrap(),
+            FrontendMessage::Bind {
+                portal_name: String::new(),
+                statement_name: "stmt_results_named".to_string(),
+                parameter_format_codes: vec![],
+                parameters: vec![],
+                result_format_codes: vec![0, 1],
+            }
+        );
+
         let mut bind_unnamed_with_default_parameter_formats_payload = Vec::new();
         bind_unnamed_with_default_parameter_formats_payload.extend_from_slice(b"\0\0");
         bind_unnamed_with_default_parameter_formats_payload.extend_from_slice(&0_i16.to_be_bytes());
