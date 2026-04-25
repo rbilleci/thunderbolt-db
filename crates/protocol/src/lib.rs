@@ -6879,6 +6879,29 @@ mod tests {
             }
         );
 
+        let mut bind_with_multiple_parameter_formats_and_invalid_code_payload = Vec::new();
+        bind_with_multiple_parameter_formats_and_invalid_code_payload
+            .extend_from_slice(b"portal\0stmt\0");
+        bind_with_multiple_parameter_formats_and_invalid_code_payload
+            .extend_from_slice(&2_i16.to_be_bytes());
+        bind_with_multiple_parameter_formats_and_invalid_code_payload
+            .extend_from_slice(&0_i16.to_be_bytes());
+        bind_with_multiple_parameter_formats_and_invalid_code_payload
+            .extend_from_slice(&2_i16.to_be_bytes());
+        bind_with_multiple_parameter_formats_and_invalid_code_payload
+            .extend_from_slice(&0_i16.to_be_bytes());
+        bind_with_multiple_parameter_formats_and_invalid_code_payload
+            .extend_from_slice(&0_i16.to_be_bytes());
+        let bind_with_multiple_parameter_formats_and_invalid_code = frontend_frame(
+            b'B',
+            &bind_with_multiple_parameter_formats_and_invalid_code_payload,
+        );
+        assert_eq!(
+            parse_frontend_message(&bind_with_multiple_parameter_formats_and_invalid_code)
+                .unwrap_err(),
+            FrontendMessageError::InvalidBindPayload
+        );
+
         let mut bind_with_negative_parameter_format_code_payload = Vec::new();
         bind_with_negative_parameter_format_code_payload.extend_from_slice(b"portal\0stmt\0");
         bind_with_negative_parameter_format_code_payload.extend_from_slice(&1_i16.to_be_bytes());
