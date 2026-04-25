@@ -26,6 +26,7 @@
 - Added local/raft regressions proving overshoot `mark_applied(...)` requests clamp at the committed boundary while leaving `ReplicationProgress` valid and explicit about any remaining uncommitted tail, tightening Q3 apply-frontier semantics.
 - Added replication regressions proving role changes discard prior-epoch uncommitted tail in `ReplicationProgress` immediately while preserving committed frontier and `next_index`, tightening Q3 term-transition semantics.
 - Added replication regressions proving contiguous quorum-ack promotion moves entries from uncommitted tail into committed-but-unapplied backlog in `ReplicationProgress` without allowing out-of-order ack arrival to skip commit boundaries, tightening Q3 commit-promotion semantics.
+- Added replication regressions proving conflict-repair truncation updates `ReplicationProgress` by dropping only uncommitted tail and rewinding `next_index` to the durable frontier, while committed-boundary truncation remains a no-op, tightening Q3 catch-up repair semantics.
 - Updated replication interface docs and runbooks to document current guarantees and explicit non-guarantees around ordering, apply progression, and restart behavior.
 
 ### Current blockers

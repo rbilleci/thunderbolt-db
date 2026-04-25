@@ -1778,6 +1778,38 @@ mod tests {
     }
 
     #[test]
+    fn raft_progress_snapshot_tracks_uncommitted_tail_truncation() {
+        let mut r = RaftReplicator::new(3);
+        r.become_leader(1);
+
+        let t1 = r.propose(vec![1]).unwrap();
+        r.register_follower_ack(t1.index, 1);
+        let t2 = r.propose(vec![2]).unwrap();
+        let t3 = r.propose(vec![3]).unwrap();
+
+        let before = r.progress();
+        assert_eq!(before.commit_index, t1.index);
+        assert_eq!(before.next_index, t3.index + 1);
+        assert_eq!(before.uncommitted_entry_count, 2);
+        assert!(before.has_uncommitted_entries);
+        assert!(!before.is_caught_up());
+
+        r.truncate_uncommitted_from(t2.index);
+
+        let after = r.progress();
+        assert_eq!(after.commit_index, t1.index);
+        assert_eq!(after.applied_index, 0);
+        assert_eq!(after.next_index, t1.index + 1);
+        assert_eq!(after.uncommitted_entry_count, 0);
+        assert!(!after.has_uncommitted_entries);
+        assert_eq!(after.committed_but_unapplied_count, t1.index as usize);
+        assert!(after.has_committed_entries_pending_apply);
+        assert_eq!(after.apply_gap(), t1.index as usize);
+        assert!(!after.is_caught_up());
+        after.validate().unwrap();
+    }
+
+    #[test]
     fn raft_truncate_uncommitted_from_ignores_committed_boundary() {
         let mut r = RaftReplicator::new(3);
         r.become_leader(1);
@@ -1790,6 +1822,21 @@ mod tests {
 
         assert_eq!(r.commit_index(), t1.index);
         assert_eq!(r.next_index, t1.index + 1);
+    }
+
+    #[test]
+    fn raft_progress_snapshot_is_stable_when_truncation_targets_committed_boundary() {
+        let mut r = RaftReplicator::new(3);
+        r.become_leader(1);
+
+        let t1 = r.propose(vec![1]).unwrap();
+        r.register_follower_ack(t1.index, 1);
+
+        let before = r.progress();
+        r.truncate_uncommitted_from(t1.index);
+        let after = r.progress();
+
+        assert_eq!(after, before);
     }
 
     #[test]
