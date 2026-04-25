@@ -1729,6 +1729,19 @@ mod tests {
     }
 
     #[test]
+    fn raft_progress_snapshot_is_stable_for_reserved_self_ack() {
+        let mut r = RaftReplicator::new(3);
+        r.become_leader(1);
+
+        let t1 = r.propose(vec![1]).unwrap();
+        let before = r.progress();
+        r.register_follower_ack(t1.index, 0);
+        let after = r.progress();
+
+        assert_eq!(after, before);
+    }
+
+    #[test]
     fn raft_duplicate_follower_ack_does_not_count_twice() {
         let mut r = RaftReplicator::new(5);
         r.become_leader(1);
@@ -1750,6 +1763,31 @@ mod tests {
 
         r.register_follower_ack(t2.index, 2);
         assert_eq!(r.commit_index(), t2.index);
+    }
+
+    #[test]
+    fn raft_progress_snapshot_is_stable_for_duplicate_follower_ack_until_quorum_changes() {
+        let mut r = RaftReplicator::new(5);
+        r.become_leader(1);
+
+        let t1 = r.propose(vec![1]).unwrap();
+        r.register_follower_ack(t1.index, 1);
+        r.register_follower_ack(t1.index, 2);
+        assert_eq!(r.commit_index(), t1.index);
+
+        let t2 = r.propose(vec![2]).unwrap();
+        r.register_follower_ack(t2.index, 1);
+        let before_duplicate = r.progress();
+
+        r.register_follower_ack(t2.index, 1);
+        let after_duplicate = r.progress();
+
+        assert_eq!(after_duplicate, before_duplicate);
+
+        r.register_follower_ack(t2.index, 2);
+        let after_quorum = r.progress();
+        assert_ne!(after_quorum, after_duplicate);
+        assert_eq!(after_quorum.commit_index, t2.index);
     }
 
     #[test]

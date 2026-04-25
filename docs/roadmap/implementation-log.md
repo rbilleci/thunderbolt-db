@@ -30,6 +30,7 @@
 - Added local replication regressions proving rollback of unapplied tail rewinds `ReplicationProgress` back to the applied frontier and clears pending-apply backlog, tightening Q3 rollback semantics.
 - Added replication regressions proving single-node leaders surface immediate commit as pending-apply backlog with no uncommitted tail in `ReplicationProgress`, tightening Q3 quorum=1 semantics.
 - Added replication regressions proving ignored ack traffic (off-leader or unknown-index acks) leaves `ReplicationProgress` unchanged, tightening Q3 ack-path observability stability.
+- Added replication regressions proving reserved self-acks and duplicate follower acks leave `ReplicationProgress` unchanged until quorum coverage really changes, tightening Q3 ack dedup semantics.
 - Updated replication interface docs and runbooks to document current guarantees and explicit non-guarantees around ordering, apply progression, and restart behavior.
 
 ### Current blockers
