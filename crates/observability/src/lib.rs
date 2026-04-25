@@ -20,6 +20,16 @@ pub struct EngineTelemetrySnapshot {
     pub gpu_parity_fallbacks: BTreeMap<GpuParityIssue, u64>,
 }
 
+impl EngineTelemetrySnapshot {
+    pub fn gpu_parity_fallback_total(&self) -> u64 {
+        self.gpu_parity_fallbacks.values().copied().sum()
+    }
+
+    pub fn has_gpu_parity_fallbacks(&self) -> bool {
+        !self.gpu_parity_fallbacks.is_empty()
+    }
+}
+
 pub trait TelemetrySink {
     fn publish(&mut self, snapshot: &EngineTelemetrySnapshot);
 }
@@ -88,5 +98,7 @@ mod tests {
 
         assert_eq!(sink.snapshots().len(), 2);
         assert_eq!(sink.snapshots()[0], sink.snapshots()[1]);
+        assert_eq!(sink.snapshots()[0].gpu_parity_fallback_total(), 0);
+        assert!(!sink.snapshots()[0].has_gpu_parity_fallbacks());
     }
 }

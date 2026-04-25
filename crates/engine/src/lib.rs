@@ -891,6 +891,7 @@ impl Engine {
 mod tests {
     use super::*;
     use gpu_db_execution::DeviceTarget;
+    use gpu_db_metrics::GpuParityIssue;
     use gpu_db_observability::InMemoryTelemetrySink;
 
     #[test]
@@ -1556,6 +1557,18 @@ mod tests {
             1
         );
         assert_eq!(e.metrics().commits_total, 0);
+
+        let snapshot = e.telemetry_snapshot();
+        assert!(snapshot.has_gpu_parity_fallbacks());
+        assert_eq!(snapshot.gpu_parity_fallback_total(), 1);
+        assert_eq!(
+            snapshot.gpu_parity_fallbacks.get(&GpuParityIssue {
+                id: "GPU-121",
+                owner: "runtime",
+                milestone: "m0-bootstrap",
+            }),
+            Some(&1)
+        );
     }
 
     #[test]
