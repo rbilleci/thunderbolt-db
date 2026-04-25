@@ -6655,6 +6655,45 @@ mod tests {
             }
         );
 
+        let mut bind_named_portal_with_named_statement_shared_parameter_format_payload = Vec::new();
+        bind_named_portal_with_named_statement_shared_parameter_format_payload
+            .extend_from_slice("pörtal_shared_pair\0stmt_shared_pair\0".as_bytes());
+        bind_named_portal_with_named_statement_shared_parameter_format_payload
+            .extend_from_slice(&1_i16.to_be_bytes());
+        bind_named_portal_with_named_statement_shared_parameter_format_payload
+            .extend_from_slice(&1_i16.to_be_bytes());
+        bind_named_portal_with_named_statement_shared_parameter_format_payload
+            .extend_from_slice(&2_i16.to_be_bytes());
+        bind_named_portal_with_named_statement_shared_parameter_format_payload
+            .extend_from_slice(&4_i32.to_be_bytes());
+        bind_named_portal_with_named_statement_shared_parameter_format_payload
+            .extend_from_slice(b"\x00\x00\x00\x2a");
+        bind_named_portal_with_named_statement_shared_parameter_format_payload
+            .extend_from_slice(&(-1_i32).to_be_bytes());
+        bind_named_portal_with_named_statement_shared_parameter_format_payload
+            .extend_from_slice(&2_i16.to_be_bytes());
+        bind_named_portal_with_named_statement_shared_parameter_format_payload
+            .extend_from_slice(&0_i16.to_be_bytes());
+        bind_named_portal_with_named_statement_shared_parameter_format_payload
+            .extend_from_slice(&1_i16.to_be_bytes());
+        let bind_named_portal_with_named_statement_shared_parameter_format = frontend_frame(
+            b'B',
+            &bind_named_portal_with_named_statement_shared_parameter_format_payload,
+        );
+        assert_eq!(
+            parse_frontend_message(
+                &bind_named_portal_with_named_statement_shared_parameter_format,
+            )
+            .unwrap(),
+            FrontendMessage::Bind {
+                portal_name: "pörtal_shared_pair".to_string(),
+                statement_name: "stmt_shared_pair".to_string(),
+                parameter_format_codes: vec![1],
+                parameters: vec![Some(vec![0x00, 0x00, 0x00, 0x2a]), None],
+                result_format_codes: vec![0, 1],
+            }
+        );
+
         let mut bind_with_shared_parameter_format_for_multiple_parameters_payload = Vec::new();
         bind_with_shared_parameter_format_for_multiple_parameters_payload
             .extend_from_slice(b"portal_shared\0stmt_shared\0");
