@@ -1700,6 +1700,39 @@ mod tests {
     }
 
     #[test]
+    fn raft_progress_snapshot_advances_consistently_after_snapshot_install() {
+        let mut r = RaftReplicator::new(3);
+        r.become_leader(4);
+
+        let t1 = r.propose(vec![1]).unwrap();
+        let t2 = r.propose(vec![2]).unwrap();
+
+        r.register_follower_ack(t1.index, 1);
+        r.register_follower_ack(t2.index, 1);
+        r.mark_applied(t1.index);
+
+        let before = r.progress();
+        assert_eq!(before.commit_index, t2.index);
+        assert_eq!(before.applied_index, t1.index);
+        assert_eq!(before.apply_gap(), 1);
+
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: t2.index,
+            last_included_term: 5,
+            snapshot_id: 42,
+        });
+
+        let after = r.progress();
+        assert_eq!(after.commit_index, t2.index);
+        assert_eq!(after.applied_index, t2.index);
+        assert_eq!(after.snapshot.snapshot_id, 42);
+        assert_eq!(after.snapshot.last_included_index, t2.index);
+        assert_eq!(after.apply_gap(), 0);
+        assert!(after.is_caught_up());
+        after.validate().unwrap();
+    }
+
+    #[test]
     fn raft_install_snapshot_preserves_next_index_from_uncompacted_tail() {
         let mut r = RaftReplicator::new(3);
         r.become_leader(3);
@@ -1718,6 +1751,33 @@ mod tests {
 
         let replacement = r.propose(vec![9]).unwrap();
         assert_eq!(replacement.index, 3);
+    }
+
+    #[test]
+    fn raft_progress_snapshot_preserves_uncommitted_tail_after_snapshot_install() {
+        let mut r = RaftReplicator::new(3);
+        r.become_leader(3);
+
+        let t1 = r.propose(vec![1]).unwrap();
+        let t2 = r.propose(vec![2]).unwrap();
+
+        r.register_follower_ack(t1.index, 1);
+        assert_eq!(r.commit_index(), t1.index);
+
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: t1.index,
+            last_included_term: 3,
+            snapshot_id: 7,
+        });
+
+        let progress = r.progress();
+        assert_eq!(progress.commit_index, t1.index);
+        assert_eq!(progress.applied_index, t1.index);
+        assert_eq!(progress.next_index, t2.index + 1);
+        assert_eq!(progress.uncommitted_entry_count, 1);
+        assert!(progress.has_uncommitted_entries);
+        assert!(!progress.is_caught_up());
+        progress.validate().unwrap();
     }
 
     #[test]
