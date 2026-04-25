@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use gpu_db_execution::GpuRuntimeSnapshot;
 use gpu_db_metrics::{GpuParityIssue, RuntimeMetricsSnapshot};
-use gpu_db_types::{Index, Role};
+use gpu_db_types::{Index, Role, TxnId};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReplicationLagSnapshot {
@@ -32,6 +32,10 @@ pub struct EngineTelemetrySnapshot {
     pub role: Role,
     pub replication_lag: ReplicationLagSnapshot,
     pub runtime_metrics: RuntimeMetricsSnapshot,
+    pub snapshot_id: u64,
+    pub wal_flushed_count: usize,
+    pub wal_last_durable_txn_id: Option<TxnId>,
+    pub wal_buffered_count: usize,
     pub wal_unflushed_count: usize,
     pub pending_batch_len: usize,
     pub pending_batch_cap: usize,
@@ -80,6 +84,10 @@ impl EngineTelemetrySnapshot {
     pub fn pending_batch_remaining_capacity(&self) -> usize {
         self.pending_batch_cap
             .saturating_sub(self.pending_batch_len)
+    }
+
+    pub fn has_buffered_wal(&self) -> bool {
+        self.wal_buffered_count > 0
     }
 
     pub fn is_write_path_quiescent(&self) -> bool {
@@ -149,6 +157,10 @@ mod tests {
                 apply_visible_gap: 0,
             },
             runtime_metrics: metrics,
+            snapshot_id: 7,
+            wal_flushed_count: 12,
+            wal_last_durable_txn_id: Some(42),
+            wal_buffered_count: 12,
             wal_unflushed_count: 0,
             pending_batch_len: 0,
             pending_batch_cap: 64,
@@ -223,11 +235,16 @@ mod tests {
     fn telemetry_helpers_report_write_path_readiness() {
         let mut snapshot = empty_snapshot();
         assert!(!snapshot.has_backlog_blockers());
+        assert_eq!(snapshot.snapshot_id, 7);
+        assert_eq!(snapshot.wal_flushed_count, 12);
+        assert_eq!(snapshot.wal_last_durable_txn_id, Some(42));
+        assert!(snapshot.has_buffered_wal());
         assert_eq!(snapshot.pending_batch_remaining_capacity(), 64);
         assert!(snapshot.is_write_path_quiescent());
         assert!(snapshot.quiescent_for_failover);
         assert!(!snapshot.follower_promotion_ready);
 
+        snapshot.wal_buffered_count = 0;
         snapshot.wal_unflushed_count = 2;
         snapshot.pending_batch_len = 5;
         snapshot.active_txn_count = 1;
@@ -236,6 +253,7 @@ mod tests {
         snapshot.quiescent_for_failover = false;
 
         assert!(snapshot.has_backlog_blockers());
+        assert!(!snapshot.has_buffered_wal());
         assert_eq!(snapshot.pending_batch_remaining_capacity(), 59);
         assert!(!snapshot.is_write_path_quiescent());
         assert!(!snapshot.quiescent_for_failover);

@@ -913,6 +913,10 @@ impl Engine {
                 apply_visible_gap: marks.apply_visible_gap,
             },
             runtime_metrics: self.metrics.snapshot(),
+            snapshot_id: marks.snapshot_id,
+            wal_flushed_count: marks.wal_flushed_count,
+            wal_last_durable_txn_id: marks.wal_last_durable_txn_id,
+            wal_buffered_count: marks.wal_buffered_count,
             wal_unflushed_count: marks.wal_unflushed_count,
             pending_batch_len: marks.pending_batch_len,
             pending_batch_cap: marks.pending_batch_cap,
@@ -2772,6 +2776,10 @@ mod tests {
         assert_eq!(snapshot.runtime_metrics.pending_batch_peak, 1);
         assert_eq!(snapshot.runtime_metrics.last_pending_batch_len, Some(1));
         assert_eq!(snapshot.runtime_metrics.commits_total, 0);
+        assert_eq!(snapshot.snapshot_id, 0);
+        assert_eq!(snapshot.wal_flushed_count, 0);
+        assert_eq!(snapshot.wal_last_durable_txn_id, None);
+        assert_eq!(snapshot.wal_buffered_count, 0);
         assert_eq!(snapshot.wal_unflushed_count, 0);
         assert_eq!(snapshot.pending_batch_len, 1);
         assert_eq!(snapshot.pending_batch_cap, 8);
@@ -2800,6 +2808,10 @@ mod tests {
         assert_eq!(snapshot.replication_lag.commit_apply_gap, 0);
         assert_eq!(snapshot.replication_lag.apply_visible_gap, 0);
         assert_eq!(snapshot.runtime_metrics.commits_total, 1);
+        assert_eq!(snapshot.snapshot_id, 0);
+        assert_eq!(snapshot.wal_flushed_count, 1);
+        assert_eq!(snapshot.wal_last_durable_txn_id, Some(1));
+        assert_eq!(snapshot.wal_buffered_count, 1);
         assert_eq!(snapshot.wal_unflushed_count, 0);
         assert_eq!(snapshot.pending_batch_len, 0);
         assert_eq!(snapshot.active_txn_count, 0);

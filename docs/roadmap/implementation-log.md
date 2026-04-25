@@ -433,6 +433,7 @@
 - Extended `EngineTelemetrySnapshot` so published observability snapshots now carry write-path readiness/backlog state (`wal_unflushed_count`, pending-batch depth/cap, active transaction depth, blocker aggregates, and failover/admission booleans) in addition to replication lag and runtime metrics.
 - Added telemetry helper coverage for backlog detection, pending-capacity math, and write-path quiescence so downstream automation can reason about failover/admission state without re-fetching raw engine watermarks.
 - Updated README + replication interface docs so the published telemetry contract now explicitly documents the richer readiness snapshot surface.
+- Followed up by exposing the durable WAL/snapshot frontier (`snapshot_id`, flushed-record count, last durable txn id, buffered WAL depth) through `EngineTelemetrySnapshot`, with helper coverage for buffered-WAL detection.
 
 ## 2026-03-30
 
