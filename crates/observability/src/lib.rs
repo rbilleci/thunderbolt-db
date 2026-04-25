@@ -54,6 +54,10 @@ impl InMemoryTelemetrySink {
     pub fn snapshots(&self) -> &[EngineTelemetrySnapshot] {
         &self.snapshots
     }
+
+    pub fn latest(&self) -> Option<&EngineTelemetrySnapshot> {
+        self.snapshots.last()
+    }
 }
 
 impl TelemetrySink for InMemoryTelemetrySink {
@@ -108,6 +112,8 @@ mod tests {
         let snapshot = empty_snapshot();
 
         let mut sink = InMemoryTelemetrySink::default();
+        assert!(sink.latest().is_none());
+
         sink.publish(&snapshot);
         sink.publish(&snapshot);
 
@@ -115,6 +121,7 @@ mod tests {
         assert_eq!(sink.snapshots()[0], sink.snapshots()[1]);
         assert_eq!(sink.snapshots()[0].gpu_parity_fallback_total(), 0);
         assert!(!sink.snapshots()[0].has_gpu_parity_fallbacks());
+        assert_eq!(sink.latest(), Some(&snapshot));
     }
 
     #[test]
