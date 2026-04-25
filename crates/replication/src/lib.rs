@@ -24,6 +24,31 @@ pub struct ReplicationProgress {
     pub has_uncommitted_entries: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryProgressGap {
+    pub commit_index_gap: usize,
+    pub applied_index_gap: usize,
+    pub next_index_gap: usize,
+    pub uncommitted_entry_gap: usize,
+}
+
+impl RecoveryProgressGap {
+    pub fn has_gap(&self) -> bool {
+        self.commit_index_gap > 0
+            || self.applied_index_gap > 0
+            || self.next_index_gap > 0
+            || self.uncommitted_entry_gap > 0
+    }
+
+    pub fn has_speculative_tail(&self) -> bool {
+        self.next_index_gap > 0 || self.uncommitted_entry_gap > 0
+    }
+
+    pub fn is_restart_equivalent(&self) -> bool {
+        !self.has_gap()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ReplicationProgressInvariantError {
     #[error("applied_index {applied_index} exceeds commit_index {commit_index}")]
@@ -611,6 +636,19 @@ impl RaftReplicator {
         self.recovery_state().progress_as_follower().expect(
             "live raft recovery state should always map to valid follower recovery progress",
         )
+    }
+
+    pub fn recovery_progress_gap(&self) -> RecoveryProgressGap {
+        let live = self.progress();
+        let durable = self.recovery_progress();
+        RecoveryProgressGap {
+            commit_index_gap: live.commit_index.saturating_sub(durable.commit_index) as usize,
+            applied_index_gap: live.applied_index.saturating_sub(durable.applied_index) as usize,
+            next_index_gap: live.next_index.saturating_sub(durable.next_index) as usize,
+            uncommitted_entry_gap: live
+                .uncommitted_entry_count
+                .saturating_sub(durable.uncommitted_entry_count),
+        }
     }
 
     pub fn progress(&self) -> ReplicationProgress {
@@ -1721,6 +1759,7 @@ mod tests {
         assert_eq!(baseline.apply_gap(), 2);
         assert!(!baseline.is_caught_up());
         assert_eq!(baseline_recovery, baseline);
+        assert!(resumed.recovery_progress_gap().is_restart_equivalent());
 
         let err = resumed
             .append_entries_from_leader(
@@ -1738,6 +1777,7 @@ mod tests {
         assert!(matches!(err, EngineError::ProposalFailed(_)));
         assert_eq!(resumed.progress(), baseline);
         assert_eq!(resumed.recovery_progress(), baseline_recovery);
+        assert!(resumed.recovery_progress_gap().is_restart_equivalent());
 
         resumed
             .append_entries_from_leader(
@@ -1769,6 +1809,15 @@ mod tests {
         assert!(!after_append_recovery.has_uncommitted_entries);
         assert_eq!(after_append_recovery.apply_gap(), 2);
         assert!(!after_append_recovery.is_caught_up());
+        assert_eq!(
+            resumed.recovery_progress_gap(),
+            RecoveryProgressGap {
+                commit_index_gap: 0,
+                applied_index_gap: 0,
+                next_index_gap: 1,
+                uncommitted_entry_gap: 1,
+            }
+        );
 
         resumed
             .append_entries_from_leader(7, 13, 7, vec![], 13)
@@ -1784,6 +1833,7 @@ mod tests {
         assert!(!after_heartbeat.is_caught_up());
         after_heartbeat.validate().unwrap();
         assert_eq!(after_heartbeat_recovery, after_heartbeat);
+        assert!(resumed.recovery_progress_gap().is_restart_equivalent());
 
         resumed.install_snapshot(SnapshotMeta {
             last_included_index: 13,
@@ -1801,6 +1851,7 @@ mod tests {
         assert!(after_snapshot.is_caught_up());
         after_snapshot.validate().unwrap();
         assert_eq!(after_snapshot_recovery, after_snapshot);
+        assert!(resumed.recovery_progress_gap().is_restart_equivalent());
 
         let err = resumed
             .append_entries_from_leader(
@@ -1818,6 +1869,7 @@ mod tests {
         assert!(matches!(err, EngineError::ProposalFailed(_)));
         assert_eq!(resumed.progress(), after_snapshot);
         assert_eq!(resumed.recovery_progress(), after_snapshot_recovery);
+        assert!(resumed.recovery_progress_gap().is_restart_equivalent());
     }
 
     #[test]
@@ -1855,7 +1907,7 @@ mod tests {
         let mut leader = RaftReplicator::new(3);
         leader.become_leader(4);
         let t1 = leader.propose(vec![1]).unwrap();
-        let t2 = leader.propose(vec![2]).unwrap();
+        let _t2 = leader.propose(vec![2]).unwrap();
         leader.register_follower_ack(t1.index, 1);
         leader.mark_applied(t1.index);
 
@@ -1874,6 +1926,20 @@ mod tests {
         assert_eq!(durable.uncommitted_entry_count, 0);
         assert!(!durable.has_uncommitted_entries);
         assert!(durable.is_caught_up());
+
+        let gap = leader.recovery_progress_gap();
+        assert_eq!(
+            gap,
+            RecoveryProgressGap {
+                commit_index_gap: 0,
+                applied_index_gap: 0,
+                next_index_gap: 1,
+                uncommitted_entry_gap: 1,
+            }
+        );
+        assert!(gap.has_gap());
+        assert!(gap.has_speculative_tail());
+        assert!(!gap.is_restart_equivalent());
     }
 
     #[test]
@@ -2131,6 +2197,10 @@ mod tests {
         assert_eq!(before.uncommitted_entry_count, 1);
         assert!(before.has_uncommitted_entries);
         assert!(!before.is_caught_up());
+        let before_gap = r.recovery_progress_gap();
+        assert_eq!(before_gap.next_index_gap, 1);
+        assert_eq!(before_gap.uncommitted_entry_gap, 1);
+        assert!(before_gap.has_speculative_tail());
 
         r.become_follower(2);
         let after_follower = r.progress();
@@ -2139,6 +2209,15 @@ mod tests {
         assert_eq!(after_follower.next_index, t1.index + 1);
         assert_eq!(after_follower.uncommitted_entry_count, 0);
         assert!(!after_follower.has_uncommitted_entries);
+        assert_eq!(
+            r.recovery_progress_gap(),
+            RecoveryProgressGap {
+                commit_index_gap: 0,
+                applied_index_gap: 0,
+                next_index_gap: 0,
+                uncommitted_entry_gap: 0,
+            }
+        );
 
         r.become_leader(3);
         let after_leader = r.progress();
@@ -2148,6 +2227,7 @@ mod tests {
         assert_eq!(after_leader.uncommitted_entry_count, 0);
         assert!(!after_leader.has_uncommitted_entries);
         after_leader.validate().unwrap();
+        assert!(r.recovery_progress_gap().is_restart_equivalent());
     }
 
     #[test]

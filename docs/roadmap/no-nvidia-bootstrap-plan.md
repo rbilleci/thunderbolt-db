@@ -167,7 +167,7 @@ Notes:
 
 ### Q3. Replication semantics hardening under stress
 Priority: highest
-Status: active highest-priority queue item. Current focus: resume/catch-up/snapshot-install stress paths and status/telemetry alignment under rejected and accepted follower transitions, including stale-snapshot no-op behavior so snapshot identity cannot drift away from the served frontier and `recovery_progress()` durable-state projection stays directly comparable to live progress.
+Status: active highest-priority queue item. Current focus: resume/catch-up/snapshot-install stress paths and status/telemetry alignment under rejected and accepted follower transitions, including stale-snapshot no-op behavior so snapshot identity cannot drift away from the served frontier and `recovery_progress()` / `recovery_progress_gap()` stay directly comparable to live progress.
 
 Goal:
 - Move from replication introspection to replication behavior that is predictable and trustworthy under skew, lag, replay, and resume conditions.
