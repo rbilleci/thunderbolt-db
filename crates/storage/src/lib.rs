@@ -235,16 +235,17 @@ impl TupleStore for InMemoryTupleStore {
             (current.key.clone(), current.tuple_id)
         };
 
-        self.versions
+        let versions = self
+            .versions
             .get_mut(&tuple_id)
-            .expect("tuple version history should exist")
-            .push(TupleVersion {
-                tuple_id,
-                key,
-                value: new_value,
-                created_by: txn_id,
-                deleted_by: None,
-            });
+            .ok_or(StorageError::NotFound)?;
+        versions.push(TupleVersion {
+            tuple_id,
+            key,
+            value: new_value,
+            created_by: txn_id,
+            deleted_by: None,
+        });
         Ok(())
     }
 
