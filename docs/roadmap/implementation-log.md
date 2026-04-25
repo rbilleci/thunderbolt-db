@@ -15,6 +15,7 @@
 - Tightened the recovery helper contract itself with `RecoveryState::validate()` and derived boundary helpers (`commit_index`, `next_index`, pending-apply count/boolean) so restart automation can reason about durable state without re-deriving commit/apply semantics out-of-band.
 - Added `ReplicationProgress` as a validated per-replicator progress snapshot so ordering/apply/resume tests now line up with a first-class helper surface instead of raw field peeking.
 - Extended `ReplicationProgress` with `apply_gap()` / `is_caught_up()` so operator logic can distinguish commit/apply lag from truly quiescent replication without re-deriving semantics from multiple fields.
+- Added `RecoveryState::progress_as_follower()` so restart bundles and live follower state now share the same validated progress vocabulary, tightening Q3 status/recovery alignment.
 - Updated replication interface docs and runbooks to document current guarantees and explicit non-guarantees around ordering, apply progression, and restart behavior.
 
 ### Current blockers

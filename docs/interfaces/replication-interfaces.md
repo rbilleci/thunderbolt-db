@@ -19,6 +19,7 @@
   - `applied_index`
 - `RaftReplicator::resume_as_follower(voters, recovery_state)` restores follower state after interruption/restart.
 - `RecoveryState` helper APIs: `commit_index()`, `next_index()`, `committed_but_unapplied_count()`, `has_committed_entries_pending_apply()`, `validate()`
+- `RecoveryState::progress_as_follower()` projects a validated durable recovery bundle into the same `ReplicationProgress` shape used by live followers.
 
 ## ReplicationProgress (validated progress snapshot)
 

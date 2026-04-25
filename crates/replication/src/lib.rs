@@ -168,6 +168,26 @@ impl RecoveryState {
         self.applied_index < self.commit_index()
     }
 
+    pub fn progress_as_follower(&self) -> Result<ReplicationProgress, RecoveryInvariantError> {
+        self.validate()?;
+        let progress = ReplicationProgress {
+            role: Role::Follower,
+            term: self.term.max(self.snapshot.last_included_term),
+            commit_index: self.commit_index(),
+            applied_index: self.applied_index,
+            next_index: self.next_index(),
+            snapshot: self.snapshot.clone(),
+            committed_but_unapplied_count: self.committed_but_unapplied_count(),
+            has_committed_entries_pending_apply: self.has_committed_entries_pending_apply(),
+            uncommitted_entry_count: 0,
+            has_uncommitted_entries: false,
+        };
+        progress.validate().expect(
+            "validated recovery state should always map to valid follower replication progress",
+        );
+        Ok(progress)
+    }
+
     pub fn validate(&self) -> Result<(), RecoveryInvariantError> {
         if self.applied_index < self.snapshot.last_included_index {
             return Err(RecoveryInvariantError::AppliedBehindSnapshot {
@@ -1328,6 +1348,15 @@ mod tests {
         assert!(state.has_committed_entries_pending_apply());
         assert_eq!(state.committed_but_unapplied_count(), 1);
         state.validate().unwrap();
+
+        let progress = state.progress_as_follower().unwrap();
+        assert_eq!(progress.role, Role::Follower);
+        assert_eq!(progress.term, 4);
+        assert_eq!(progress.commit_index, 4);
+        assert_eq!(progress.applied_index, 3);
+        assert_eq!(progress.next_index, 5);
+        assert_eq!(progress.apply_gap(), 1);
+        assert!(!progress.is_caught_up());
     }
 
     #[test]
@@ -1356,6 +1385,23 @@ mod tests {
                 commit_index: 4,
             }
         );
+    }
+
+    #[test]
+    fn resumed_follower_progress_matches_recovery_projection() {
+        let mut leader = RaftReplicator::new(3);
+        leader.become_leader(4);
+        let t1 = leader.propose(vec![1]).unwrap();
+        let t2 = leader.propose(vec![2]).unwrap();
+        leader.register_follower_ack(t1.index, 1);
+        leader.register_follower_ack(t2.index, 1);
+        leader.mark_applied(t1.index);
+
+        let recovery = leader.recovery_state();
+        let projected = recovery.progress_as_follower().unwrap();
+        let resumed = RaftReplicator::resume_as_follower(3, recovery).unwrap();
+
+        assert_eq!(resumed.progress(), projected);
     }
 
     #[test]
