@@ -26,6 +26,8 @@ Each physical plan node must include:
 - Filter layer:
   - `KeyPrefix(prefix)`
   - `ValueEquals(value)`
+  - `All([filter...])`
+  - `Any([filter...])`
 - Projection layer:
   - `KeyValue`
   - `KeyOnly`

@@ -85,6 +85,8 @@ pub enum MvccReadSource {
 pub enum MvccReadFilter {
     KeyPrefix(String),
     ValueEquals(String),
+    All(Vec<MvccReadFilter>),
+    Any(Vec<MvccReadFilter>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,6 +143,12 @@ fn mvcc_row_matches_filter(row: &TupleVersion, filter: &MvccReadFilter) -> bool 
     match filter {
         MvccReadFilter::KeyPrefix(prefix) => row.key.starts_with(prefix),
         MvccReadFilter::ValueEquals(expected) => row.value == *expected,
+        MvccReadFilter::All(filters) => filters
+            .iter()
+            .all(|filter| mvcc_row_matches_filter(row, filter)),
+        MvccReadFilter::Any(filters) => filters
+            .iter()
+            .any(|filter| mvcc_row_matches_filter(row, filter)),
     }
 }
 
@@ -3215,6 +3223,63 @@ mod tests {
                 key: Some("user:1".to_string()),
                 value: None,
             }]
+        );
+    }
+
+    #[test]
+    fn execute_mvcc_query_supports_composite_filter_shapes() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=open").unwrap();
+        e.execute_text(2, "SET acct:2=locked").unwrap();
+        e.execute_text(3, "SET user:1=active").unwrap();
+        e.execute_text(4, "SET user:2=locked").unwrap();
+
+        let all_filter = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FullScan,
+                visibility: StorageVisibility { read_txn_id: 4 },
+                filter: Some(MvccReadFilter::All(vec![
+                    MvccReadFilter::KeyPrefix("acct:".to_string()),
+                    MvccReadFilter::ValueEquals("locked".to_string()),
+                ])),
+                projection: MvccProjection::KeyValue,
+            })
+            .unwrap();
+        assert_eq!(
+            all_filter.rows,
+            vec![MvccReadRow {
+                key: Some("acct:2".to_string()),
+                value: Some("locked".to_string()),
+            }]
+        );
+
+        let any_filter = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FullScan,
+                visibility: StorageVisibility { read_txn_id: 4 },
+                filter: Some(MvccReadFilter::Any(vec![
+                    MvccReadFilter::KeyPrefix("acct:".to_string()),
+                    MvccReadFilter::ValueEquals("active".to_string()),
+                ])),
+                projection: MvccProjection::KeyOnly,
+            })
+            .unwrap();
+        assert_eq!(
+            any_filter.rows,
+            vec![
+                MvccReadRow {
+                    key: Some("acct:1".to_string()),
+                    value: None,
+                },
+                MvccReadRow {
+                    key: Some("acct:2".to_string()),
+                    value: None,
+                },
+                MvccReadRow {
+                    key: Some("user:1".to_string()),
+                    value: None,
+                },
+            ]
         );
     }
 

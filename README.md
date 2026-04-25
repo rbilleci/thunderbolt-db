@@ -24,6 +24,8 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
 - Supported filters:
   - `MvccReadFilter::KeyPrefix(prefix)`
   - `MvccReadFilter::ValueEquals(value)`
+  - `MvccReadFilter::All([...])`
+  - `MvccReadFilter::Any([...])`
 - Supported projections:
   - `MvccProjection::KeyValue`
   - `MvccProjection::KeyOnly`
@@ -35,7 +37,7 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
 - Deterministic workload fixture:
   - `tests/fixtures/mvcc-read-workload.txt`
 - Next obvious extension boundary:
-  - widen query shapes beyond single-filter scan / point-lookup while preserving the same engine-facing contract and explicit fallback accounting on the eventual GPU-backed path.
+  - add richer predicate/operator shapes (range/order/limit or join-adjacent slices) while preserving the same engine-facing contract and explicit fallback accounting on the eventual GPU-backed path.
 
 ## Quickstart
 
