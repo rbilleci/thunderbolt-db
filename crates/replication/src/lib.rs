@@ -1650,6 +1650,122 @@ mod tests {
     }
 
     #[test]
+    fn resumed_follower_progress_stays_stable_through_catch_up_and_snapshot_stress() {
+        let recovery = RecoveryState {
+            term: 7,
+            snapshot: SnapshotMeta {
+                last_included_index: 10,
+                last_included_term: 6,
+                snapshot_id: 21,
+            },
+            committed_entries: vec![
+                LogEntry {
+                    term: 7,
+                    index: 11,
+                    payload: vec![11],
+                },
+                LogEntry {
+                    term: 7,
+                    index: 12,
+                    payload: vec![12],
+                },
+            ],
+            applied_index: 10,
+        };
+
+        let mut resumed = RaftReplicator::resume_as_follower(3, recovery).unwrap();
+        let baseline = resumed.progress();
+        assert_eq!(baseline.commit_index, 12);
+        assert_eq!(baseline.applied_index, 10);
+        assert_eq!(baseline.next_index, 13);
+        assert_eq!(baseline.apply_gap(), 2);
+        assert!(!baseline.is_caught_up());
+
+        let err = resumed
+            .append_entries_from_leader(
+                7,
+                12,
+                7,
+                vec![LogEntry {
+                    term: 7,
+                    index: 14,
+                    payload: vec![14],
+                }],
+                14,
+            )
+            .unwrap_err();
+        assert!(matches!(err, EngineError::ProposalFailed(_)));
+        assert_eq!(resumed.progress(), baseline);
+
+        resumed
+            .append_entries_from_leader(
+                7,
+                12,
+                7,
+                vec![LogEntry {
+                    term: 7,
+                    index: 13,
+                    payload: vec![13],
+                }],
+                12,
+            )
+            .unwrap();
+        let after_append = resumed.progress();
+        assert_eq!(after_append.commit_index, 12);
+        assert_eq!(after_append.applied_index, 10);
+        assert_eq!(after_append.next_index, 14);
+        assert_eq!(after_append.uncommitted_entry_count, 1);
+        assert!(after_append.has_uncommitted_entries);
+        assert_eq!(after_append.apply_gap(), 2);
+        assert!(!after_append.is_caught_up());
+        after_append.validate().unwrap();
+
+        resumed
+            .append_entries_from_leader(7, 13, 7, vec![], 13)
+            .unwrap();
+        let after_heartbeat = resumed.progress();
+        assert_eq!(after_heartbeat.commit_index, 13);
+        assert_eq!(after_heartbeat.applied_index, 10);
+        assert_eq!(after_heartbeat.next_index, 14);
+        assert_eq!(after_heartbeat.uncommitted_entry_count, 0);
+        assert!(!after_heartbeat.has_uncommitted_entries);
+        assert_eq!(after_heartbeat.apply_gap(), 3);
+        assert!(!after_heartbeat.is_caught_up());
+        after_heartbeat.validate().unwrap();
+
+        resumed.install_snapshot(SnapshotMeta {
+            last_included_index: 13,
+            last_included_term: 7,
+            snapshot_id: 22,
+        });
+        let after_snapshot = resumed.progress();
+        assert_eq!(after_snapshot.snapshot.snapshot_id, 22);
+        assert_eq!(after_snapshot.snapshot.last_included_index, 13);
+        assert_eq!(after_snapshot.commit_index, 13);
+        assert_eq!(after_snapshot.applied_index, 13);
+        assert_eq!(after_snapshot.next_index, 14);
+        assert_eq!(after_snapshot.apply_gap(), 0);
+        assert!(after_snapshot.is_caught_up());
+        after_snapshot.validate().unwrap();
+
+        let err = resumed
+            .append_entries_from_leader(
+                7,
+                12,
+                7,
+                vec![LogEntry {
+                    term: 7,
+                    index: 13,
+                    payload: vec![13],
+                }],
+                13,
+            )
+            .unwrap_err();
+        assert!(matches!(err, EngineError::ProposalFailed(_)));
+        assert_eq!(resumed.progress(), after_snapshot);
+    }
+
+    #[test]
     fn replication_progress_validation_rejects_inconsistent_uncommitted_flag() {
         let err = ReplicationProgress {
             role: Role::Follower,

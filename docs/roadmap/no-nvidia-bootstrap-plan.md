@@ -120,6 +120,7 @@ When first NVIDIA environment becomes available:
 
 ### Q1. Engine truth surface for snapshots, fallback, and replication health
 Priority: highest
+Status: completed on 2026-04-25; `Engine::status_snapshot()` is now the engine truth surface. Keep docs/tests aligned if the surface evolves.
 
 Goal:
 - Turn the recent MVCC/observability/replication helper work into a single trustworthy engine-level status surface that answers what state the engine is in and whether it is healthy/correct.
@@ -141,6 +142,7 @@ Notes:
 
 ### Q2. Vertical slice: execution over MVCC storage
 Priority: highest
+Status: completed for the bootstrap slice on 2026-04-25; current supported shape is full scan/key lookup + snapshot visibility + filter/order/project/limit with explicit `GpuMvccReadParityGap` fallback tracking. Extend from here without weakening the GPU-first fallback contract.
 
 Goal:
 - Convert the new in-memory MVCC tuple store and reusable vec operator groundwork into a narrow but real end-to-end execution slice.
@@ -165,6 +167,7 @@ Notes:
 
 ### Q3. Replication semantics hardening under stress
 Priority: highest
+Status: active highest-priority queue item. Current focus: resume/catch-up/snapshot-install stress paths and status/telemetry alignment under rejected and accepted follower transitions.
 
 Goal:
 - Move from replication introspection to replication behavior that is predictable and trustworthy under skew, lag, replay, and resume conditions.
