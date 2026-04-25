@@ -68,7 +68,11 @@ pub struct EngineTelemetrySnapshot {
 }
 
 impl EngineTelemetrySnapshot {
-    fn sanitize_backlog_blocker_mask(mask: u8) -> u8 {
+    pub const fn known_backlog_blocker_mask() -> u8 {
+        KNOWN_BACKLOG_BLOCKER_MASK
+    }
+
+    pub const fn sanitize_backlog_blocker_mask(mask: u8) -> u8 {
         mask & KNOWN_BACKLOG_BLOCKER_MASK
     }
 
@@ -286,6 +290,10 @@ mod tests {
     #[test]
     fn telemetry_helpers_report_write_path_readiness() {
         let mut snapshot = empty_snapshot();
+        assert_eq!(
+            EngineTelemetrySnapshot::known_backlog_blocker_mask(),
+            KNOWN_BACKLOG_BLOCKER_MASK
+        );
         assert!(!snapshot.has_backlog_blockers());
         assert_eq!(snapshot.backlog_blocker_label_count(), 0);
         assert_eq!(
@@ -341,6 +349,10 @@ mod tests {
 
         assert!(snapshot.has_backlog_blockers());
         assert_eq!(snapshot.backlog_blocker_label_count(), 2);
+        assert_eq!(
+            EngineTelemetrySnapshot::sanitize_backlog_blocker_mask(snapshot.backlog_blocker_mask),
+            BACKLOG_BLOCKER_WAL | BACKLOG_BLOCKER_APPLY_VISIBLE_GAP
+        );
         assert_eq!(snapshot.unknown_backlog_blocker_mask(), 1 << 7);
         assert_eq!(
             snapshot.backlog_blocker_labels(),
