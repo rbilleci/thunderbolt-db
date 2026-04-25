@@ -1863,6 +1863,51 @@ mod tests {
     }
 
     #[test]
+    fn raft_progress_snapshot_tracks_heartbeat_commit_advancement() {
+        let mut r = RaftReplicator::new(3);
+        r.become_leader(1);
+
+        let t1 = r.propose(vec![1]).unwrap();
+        r.register_follower_ack(t1.index, 1);
+        r.become_follower(2);
+
+        let t2_index = t1.index + 1;
+        r.append_entries_from_leader(
+            2,
+            t1.index,
+            1,
+            vec![LogEntry {
+                term: 2,
+                index: t2_index,
+                payload: vec![2],
+            }],
+            t1.index,
+        )
+        .unwrap();
+
+        let before_heartbeat = r.progress();
+        assert_eq!(before_heartbeat.commit_index, t1.index);
+        assert_eq!(before_heartbeat.applied_index, 0);
+        assert_eq!(before_heartbeat.next_index, t2_index + 1);
+        assert_eq!(before_heartbeat.uncommitted_entry_count, 1);
+        assert!(before_heartbeat.has_uncommitted_entries);
+        assert_eq!(before_heartbeat.apply_gap(), t1.index as usize);
+
+        r.append_entries_from_leader(2, t2_index, 2, vec![], t2_index)
+            .unwrap();
+
+        let after_heartbeat = r.progress();
+        assert_eq!(after_heartbeat.commit_index, t2_index);
+        assert_eq!(after_heartbeat.applied_index, 0);
+        assert_eq!(after_heartbeat.next_index, t2_index + 1);
+        assert_eq!(after_heartbeat.uncommitted_entry_count, 0);
+        assert!(!after_heartbeat.has_uncommitted_entries);
+        assert_eq!(after_heartbeat.apply_gap(), t2_index as usize);
+        assert!(!after_heartbeat.is_caught_up());
+        after_heartbeat.validate().unwrap();
+    }
+
+    #[test]
     fn raft_follower_append_entries_bumps_local_term_from_leader_term() {
         let mut r = RaftReplicator::new(3);
         r.become_candidate(3);
