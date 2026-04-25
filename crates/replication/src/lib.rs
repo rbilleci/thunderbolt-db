@@ -10,6 +10,111 @@ pub struct RecoveryState {
     pub applied_index: Index,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicationProgress {
+    pub role: Role,
+    pub term: Term,
+    pub commit_index: Index,
+    pub applied_index: Index,
+    pub next_index: Index,
+    pub snapshot: SnapshotMeta,
+    pub committed_but_unapplied_count: usize,
+    pub has_committed_entries_pending_apply: bool,
+    pub uncommitted_entry_count: usize,
+    pub has_uncommitted_entries: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ReplicationProgressInvariantError {
+    #[error("applied_index {applied_index} exceeds commit_index {commit_index}")]
+    AppliedExceedsCommit {
+        applied_index: Index,
+        commit_index: Index,
+    },
+    #[error("next_index {next_index} is behind commit boundary {commit_index}")]
+    NextIndexBehindCommit {
+        next_index: Index,
+        commit_index: Index,
+    },
+    #[error(
+        "committed_but_unapplied_count {committed_but_unapplied_count} does not match commit/apply gap {expected}"
+    )]
+    PendingApplyCountMismatch {
+        committed_but_unapplied_count: usize,
+        expected: usize,
+    },
+    #[error(
+        "has_committed_entries_pending_apply {has_pending} does not match commit/apply gap {expected}"
+    )]
+    PendingApplyFlagMismatch { has_pending: bool, expected: bool },
+    #[error(
+        "has_uncommitted_entries {has_uncommitted} does not match uncommitted_entry_count {uncommitted_entry_count}"
+    )]
+    UncommittedFlagMismatch {
+        has_uncommitted: bool,
+        uncommitted_entry_count: usize,
+    },
+    #[error("snapshot last_included_index {snapshot_index} exceeds applied_index {applied_index}")]
+    SnapshotAheadOfApplied {
+        snapshot_index: Index,
+        applied_index: Index,
+    },
+}
+
+impl ReplicationProgress {
+    pub fn validate(&self) -> Result<(), ReplicationProgressInvariantError> {
+        if self.applied_index > self.commit_index {
+            return Err(ReplicationProgressInvariantError::AppliedExceedsCommit {
+                applied_index: self.applied_index,
+                commit_index: self.commit_index,
+            });
+        }
+        if self.next_index < self.commit_index + 1 {
+            return Err(ReplicationProgressInvariantError::NextIndexBehindCommit {
+                next_index: self.next_index,
+                commit_index: self.commit_index,
+            });
+        }
+
+        let expected_pending = self.commit_index.saturating_sub(self.applied_index) as usize;
+        if self.committed_but_unapplied_count != expected_pending {
+            return Err(
+                ReplicationProgressInvariantError::PendingApplyCountMismatch {
+                    committed_but_unapplied_count: self.committed_but_unapplied_count,
+                    expected: expected_pending,
+                },
+            );
+        }
+
+        let expected_has_pending = expected_pending > 0;
+        if self.has_committed_entries_pending_apply != expected_has_pending {
+            return Err(
+                ReplicationProgressInvariantError::PendingApplyFlagMismatch {
+                    has_pending: self.has_committed_entries_pending_apply,
+                    expected: expected_has_pending,
+                },
+            );
+        }
+
+        let expected_has_uncommitted = self.uncommitted_entry_count > 0;
+        if self.has_uncommitted_entries != expected_has_uncommitted {
+            return Err(ReplicationProgressInvariantError::UncommittedFlagMismatch {
+                has_uncommitted: self.has_uncommitted_entries,
+                uncommitted_entry_count: self.uncommitted_entry_count,
+            });
+        }
+
+        if self.snapshot.last_included_index > self.applied_index {
+            return Err(ReplicationProgressInvariantError::SnapshotAheadOfApplied {
+                snapshot_index: self.snapshot.last_included_index,
+                applied_index: self.applied_index,
+            });
+        }
+
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RecoveryInvariantError {
     #[error("applied_index {applied_index} is behind snapshot boundary {snapshot_index}")]
@@ -217,6 +322,25 @@ impl LocalReplicator {
             .map(|entry| entry.index)
             .unwrap_or(self.commit_index);
         self.next_index = tail_index + 1;
+    }
+
+    pub fn progress(&self) -> ReplicationProgress {
+        let progress = ReplicationProgress {
+            role: self.role,
+            term: self.term,
+            commit_index: self.commit_index,
+            applied_index: self.applied_index,
+            next_index: self.next_index,
+            snapshot: self.snapshot_meta(),
+            committed_but_unapplied_count: self.committed_but_unapplied_count(),
+            has_committed_entries_pending_apply: self.has_committed_entries_pending_apply(),
+            uncommitted_entry_count: 0,
+            has_uncommitted_entries: false,
+        };
+        progress
+            .validate()
+            .expect("local replication progress invariants should hold");
+        progress
     }
 }
 
@@ -437,6 +561,25 @@ impl RaftReplicator {
                 .collect(),
             applied_index: self.applied_index,
         }
+    }
+
+    pub fn progress(&self) -> ReplicationProgress {
+        let progress = ReplicationProgress {
+            role: self.role,
+            term: self.term,
+            commit_index: self.commit_index,
+            applied_index: self.applied_index,
+            next_index: self.next_index,
+            snapshot: self.snapshot_meta(),
+            committed_but_unapplied_count: self.committed_but_unapplied_count(),
+            has_committed_entries_pending_apply: self.has_committed_entries_pending_apply(),
+            uncommitted_entry_count: self.uncommitted_entry_count(),
+            has_uncommitted_entries: self.has_uncommitted_entries(),
+        };
+        progress
+            .validate()
+            .expect("raft replication progress invariants should hold");
+        progress
     }
 
     pub fn append_entries_from_leader(
@@ -899,6 +1042,26 @@ mod tests {
     }
 
     #[test]
+    fn local_progress_snapshot_matches_commit_and_apply_state() {
+        let mut r = LocalReplicator::leader();
+        let t1 = r.propose(vec![1]).unwrap();
+        let _t2 = r.propose(vec![2]).unwrap();
+        r.mark_applied(t1.index);
+
+        let progress = r.progress();
+
+        assert_eq!(progress.role, Role::Leader);
+        assert_eq!(progress.commit_index, 2);
+        assert_eq!(progress.applied_index, 1);
+        assert_eq!(progress.next_index, 3);
+        assert_eq!(progress.committed_but_unapplied_count, 1);
+        assert!(progress.has_committed_entries_pending_apply);
+        assert_eq!(progress.uncommitted_entry_count, 0);
+        assert!(!progress.has_uncommitted_entries);
+        progress.validate().unwrap();
+    }
+
+    #[test]
     fn raft_replicator_rejects_proposal_when_not_leader() {
         let mut r = RaftReplicator::new(3);
         let err = r.propose(vec![1]).unwrap_err();
@@ -1055,6 +1218,64 @@ mod tests {
     }
 
     #[test]
+    fn raft_progress_snapshot_tracks_uncommitted_and_pending_apply_work() {
+        let mut r = RaftReplicator::new(3);
+        r.become_leader(3);
+
+        let t1 = r.propose(vec![10]).unwrap();
+        let _t2 = r.propose(vec![20]).unwrap();
+        r.register_follower_ack(t1.index, 1);
+
+        let progress = r.progress();
+
+        assert_eq!(progress.role, Role::Leader);
+        assert_eq!(progress.commit_index, t1.index);
+        assert_eq!(progress.applied_index, 0);
+        assert_eq!(progress.next_index, 3);
+        assert_eq!(progress.committed_but_unapplied_count, 1);
+        assert!(progress.has_committed_entries_pending_apply);
+        assert_eq!(progress.uncommitted_entry_count, 1);
+        assert!(progress.has_uncommitted_entries);
+        progress.validate().unwrap();
+    }
+
+    #[test]
+    fn raft_progress_snapshot_stays_consistent_across_snapshot_boundary_append() {
+        let mut r = RaftReplicator::new(3);
+        r.become_follower(4);
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 5,
+            last_included_term: 3,
+            snapshot_id: 1,
+        });
+
+        r.append_entries_from_leader(
+            4,
+            5,
+            3,
+            vec![LogEntry {
+                term: 4,
+                index: 6,
+                payload: vec![6],
+            }],
+            6,
+        )
+        .unwrap();
+
+        let progress = r.progress();
+
+        assert_eq!(progress.snapshot.last_included_index, 5);
+        assert_eq!(progress.commit_index, 6);
+        assert_eq!(progress.applied_index, 5);
+        assert_eq!(progress.next_index, 7);
+        assert_eq!(progress.committed_but_unapplied_count, 1);
+        assert!(progress.has_committed_entries_pending_apply);
+        assert_eq!(progress.uncommitted_entry_count, 0);
+        assert!(!progress.has_uncommitted_entries);
+        progress.validate().unwrap();
+    }
+
+    #[test]
     fn recovery_state_helpers_report_commit_apply_boundaries() {
         let state = RecoveryState {
             term: 4,
@@ -1102,6 +1323,36 @@ mod tests {
             RecoveryInvariantError::AppliedExceedsCommit {
                 applied_index: 5,
                 commit_index: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn replication_progress_validation_rejects_inconsistent_uncommitted_flag() {
+        let err = ReplicationProgress {
+            role: Role::Follower,
+            term: 4,
+            commit_index: 5,
+            applied_index: 5,
+            next_index: 6,
+            snapshot: SnapshotMeta {
+                last_included_index: 5,
+                last_included_term: 4,
+                snapshot_id: 1,
+            },
+            committed_but_unapplied_count: 0,
+            has_committed_entries_pending_apply: false,
+            uncommitted_entry_count: 1,
+            has_uncommitted_entries: false,
+        }
+        .validate()
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            ReplicationProgressInvariantError::UncommittedFlagMismatch {
+                has_uncommitted: false,
+                uncommitted_entry_count: 1,
             }
         );
     }

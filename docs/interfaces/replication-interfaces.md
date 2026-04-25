@@ -20,6 +20,21 @@
 - `RaftReplicator::resume_as_follower(voters, recovery_state)` restores follower state after interruption/restart.
 - `RecoveryState` helper APIs: `commit_index()`, `next_index()`, `committed_but_unapplied_count()`, `has_committed_entries_pending_apply()`, `validate()`
 
+## ReplicationProgress (validated progress snapshot)
+
+- `LocalReplicator::progress()` / `RaftReplicator::progress()` expose a validated progress snapshot containing:
+  - `role`, `term`
+  - `commit_index`, `applied_index`, `next_index`
+  - `snapshot`
+  - `committed_but_unapplied_count`, `has_committed_entries_pending_apply`
+  - `uncommitted_entry_count`, `has_uncommitted_entries`
+- `ReplicationProgress::validate()` enforces:
+  - `applied_index <= commit_index`
+  - `next_index >= commit_index + 1`
+  - pending-apply count/flag consistency
+  - uncommitted count/flag consistency
+  - snapshot boundary not ahead of applied frontier
+
 Resume guarantees:
 
 - recovery entries must be contiguous from `snapshot.last_included_index + 1`
