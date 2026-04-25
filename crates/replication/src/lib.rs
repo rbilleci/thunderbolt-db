@@ -67,6 +67,18 @@ impl LocalReplicator {
             .filter(move |e| e.index > start_exclusive && e.index <= self.commit_index)
     }
 
+    pub fn retained_entry_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn committed_but_unapplied_count(&self) -> usize {
+        self.commit_index.saturating_sub(self.applied_index) as usize
+    }
+
+    pub fn has_committed_entries_pending_apply(&self) -> bool {
+        self.commit_index > self.applied_index
+    }
+
     pub fn mark_applied(&mut self, idx: Index) {
         let bounded = idx.min(self.commit_index);
         if bounded <= self.applied_index {
@@ -197,6 +209,31 @@ impl RaftReplicator {
         self.entries
             .iter()
             .filter(move |e| e.index > start_exclusive && e.index <= self.commit_index)
+    }
+
+    pub fn retained_entry_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn committed_but_unapplied_count(&self) -> usize {
+        self.commit_index.saturating_sub(self.applied_index) as usize
+    }
+
+    pub fn has_committed_entries_pending_apply(&self) -> bool {
+        self.commit_index > self.applied_index
+    }
+
+    pub fn uncommitted_entry_count(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|entry| entry.index > self.commit_index)
+            .count()
+    }
+
+    pub fn has_uncommitted_entries(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| entry.index > self.commit_index)
     }
 
     pub fn mark_applied(&mut self, idx: Index) {
@@ -698,6 +735,25 @@ mod tests {
     }
 
     #[test]
+    fn local_replicator_pending_apply_helpers_track_committed_tail() {
+        let mut r = LocalReplicator::leader();
+        let t1 = r.propose(vec![1]).unwrap();
+        let _t2 = r.propose(vec![2]).unwrap();
+
+        assert_eq!(r.retained_entry_count(), 2);
+        assert!(r.has_committed_entries_pending_apply());
+        assert_eq!(r.committed_but_unapplied_count(), 2);
+
+        r.mark_applied(t1.index);
+        assert!(r.has_committed_entries_pending_apply());
+        assert_eq!(r.committed_but_unapplied_count(), 1);
+
+        r.mark_applied(r.commit_index());
+        assert!(!r.has_committed_entries_pending_apply());
+        assert_eq!(r.committed_but_unapplied_count(), 0);
+    }
+
+    #[test]
     fn raft_replicator_rejects_proposal_when_not_leader() {
         let mut r = RaftReplicator::new(3);
         let err = r.propose(vec![1]).unwrap_err();
@@ -750,6 +806,37 @@ mod tests {
 
         r.register_follower_ack(t1.index, 1);
         assert_eq!(r.commit_index(), t2.index);
+    }
+
+    #[test]
+    fn raft_replicator_entry_state_helpers_track_committed_and_uncommitted_work() {
+        let mut r = RaftReplicator::new(3);
+        r.become_leader(3);
+
+        let t1 = r.propose(vec![10]).unwrap();
+        let t2 = r.propose(vec![20]).unwrap();
+
+        assert_eq!(r.retained_entry_count(), 2);
+        assert!(r.has_uncommitted_entries());
+        assert_eq!(r.uncommitted_entry_count(), 2);
+        assert!(!r.has_committed_entries_pending_apply());
+        assert_eq!(r.committed_but_unapplied_count(), 0);
+
+        r.register_follower_ack(t1.index, 1);
+        assert!(r.has_committed_entries_pending_apply());
+        assert_eq!(r.committed_but_unapplied_count(), 1);
+        assert!(r.has_uncommitted_entries());
+        assert_eq!(r.uncommitted_entry_count(), 1);
+
+        r.mark_applied(t1.index);
+        assert!(!r.has_committed_entries_pending_apply());
+        assert_eq!(r.committed_but_unapplied_count(), 0);
+
+        r.register_follower_ack(t2.index, 1);
+        assert!(r.has_committed_entries_pending_apply());
+        assert_eq!(r.committed_but_unapplied_count(), 1);
+        assert!(!r.has_uncommitted_entries());
+        assert_eq!(r.uncommitted_entry_count(), 0);
     }
 
     #[test]
