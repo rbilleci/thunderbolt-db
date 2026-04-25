@@ -607,6 +607,12 @@ impl RaftReplicator {
         }
     }
 
+    pub fn recovery_progress(&self) -> ReplicationProgress {
+        self.recovery_state().progress_as_follower().expect(
+            "live raft recovery state should always map to valid follower recovery progress",
+        )
+    }
+
     pub fn progress(&self) -> ReplicationProgress {
         let progress = ReplicationProgress {
             role: self.role,
@@ -1708,11 +1714,13 @@ mod tests {
 
         let mut resumed = RaftReplicator::resume_as_follower(3, recovery).unwrap();
         let baseline = resumed.progress();
+        let baseline_recovery = resumed.recovery_progress();
         assert_eq!(baseline.commit_index, 12);
         assert_eq!(baseline.applied_index, 10);
         assert_eq!(baseline.next_index, 13);
         assert_eq!(baseline.apply_gap(), 2);
         assert!(!baseline.is_caught_up());
+        assert_eq!(baseline_recovery, baseline);
 
         let err = resumed
             .append_entries_from_leader(
@@ -1729,6 +1737,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, EngineError::ProposalFailed(_)));
         assert_eq!(resumed.progress(), baseline);
+        assert_eq!(resumed.recovery_progress(), baseline_recovery);
 
         resumed
             .append_entries_from_leader(
@@ -1744,6 +1753,7 @@ mod tests {
             )
             .unwrap();
         let after_append = resumed.progress();
+        let after_append_recovery = resumed.recovery_progress();
         assert_eq!(after_append.commit_index, 12);
         assert_eq!(after_append.applied_index, 10);
         assert_eq!(after_append.next_index, 14);
@@ -1752,11 +1762,19 @@ mod tests {
         assert_eq!(after_append.apply_gap(), 2);
         assert!(!after_append.is_caught_up());
         after_append.validate().unwrap();
+        assert_eq!(after_append_recovery.commit_index, 12);
+        assert_eq!(after_append_recovery.applied_index, 10);
+        assert_eq!(after_append_recovery.next_index, 13);
+        assert_eq!(after_append_recovery.uncommitted_entry_count, 0);
+        assert!(!after_append_recovery.has_uncommitted_entries);
+        assert_eq!(after_append_recovery.apply_gap(), 2);
+        assert!(!after_append_recovery.is_caught_up());
 
         resumed
             .append_entries_from_leader(7, 13, 7, vec![], 13)
             .unwrap();
         let after_heartbeat = resumed.progress();
+        let after_heartbeat_recovery = resumed.recovery_progress();
         assert_eq!(after_heartbeat.commit_index, 13);
         assert_eq!(after_heartbeat.applied_index, 10);
         assert_eq!(after_heartbeat.next_index, 14);
@@ -1765,6 +1783,7 @@ mod tests {
         assert_eq!(after_heartbeat.apply_gap(), 3);
         assert!(!after_heartbeat.is_caught_up());
         after_heartbeat.validate().unwrap();
+        assert_eq!(after_heartbeat_recovery, after_heartbeat);
 
         resumed.install_snapshot(SnapshotMeta {
             last_included_index: 13,
@@ -1772,6 +1791,7 @@ mod tests {
             snapshot_id: 22,
         });
         let after_snapshot = resumed.progress();
+        let after_snapshot_recovery = resumed.recovery_progress();
         assert_eq!(after_snapshot.snapshot.snapshot_id, 22);
         assert_eq!(after_snapshot.snapshot.last_included_index, 13);
         assert_eq!(after_snapshot.commit_index, 13);
@@ -1780,6 +1800,7 @@ mod tests {
         assert_eq!(after_snapshot.apply_gap(), 0);
         assert!(after_snapshot.is_caught_up());
         after_snapshot.validate().unwrap();
+        assert_eq!(after_snapshot_recovery, after_snapshot);
 
         let err = resumed
             .append_entries_from_leader(
@@ -1796,6 +1817,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, EngineError::ProposalFailed(_)));
         assert_eq!(resumed.progress(), after_snapshot);
+        assert_eq!(resumed.recovery_progress(), after_snapshot_recovery);
     }
 
     #[test]
@@ -1826,6 +1848,32 @@ mod tests {
                 uncommitted_entry_count: 1,
             }
         );
+    }
+
+    #[test]
+    fn raft_recovery_progress_projects_durable_follower_state_from_live_leader() {
+        let mut leader = RaftReplicator::new(3);
+        leader.become_leader(4);
+        let t1 = leader.propose(vec![1]).unwrap();
+        let t2 = leader.propose(vec![2]).unwrap();
+        leader.register_follower_ack(t1.index, 1);
+        leader.mark_applied(t1.index);
+
+        let live = leader.progress();
+        assert_eq!(live.role, Role::Leader);
+        assert_eq!(live.uncommitted_entry_count, 1);
+        assert!(live.has_uncommitted_entries);
+
+        let durable = leader.recovery_progress();
+        assert_eq!(durable.role, Role::Follower);
+        assert_eq!(durable.term, live.term);
+        assert_eq!(durable.commit_index, t1.index);
+        assert_eq!(durable.applied_index, t1.index);
+        assert_eq!(durable.next_index, t1.index + 1);
+        assert_eq!(durable.snapshot, live.snapshot);
+        assert_eq!(durable.uncommitted_entry_count, 0);
+        assert!(!durable.has_uncommitted_entries);
+        assert!(durable.is_caught_up());
     }
 
     #[test]

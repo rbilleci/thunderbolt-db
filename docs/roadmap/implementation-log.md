@@ -41,14 +41,15 @@
 - Added replication regressions proving ack-tracking pruning for committed entries does not create extra `ReplicationProgress` transitions beyond the actual commit promotion, tightening Q3 bookkeeping-vs-observability boundaries.
 - Added replication regressions proving `wait_committed(...)` polling leaves `ReplicationProgress` unchanged both before quorum and after resolution, tightening Q3 commit-observation semantics.
 - Added local/raft/engine regressions proving stale snapshot installs are status/progress no-ops unless they advance (or exactly match) the current frontier term, preventing newer-but-stale `snapshot_id` values from drifting away from the actually served durable frontier.
-- Updated replication interface docs and runbooks to document current guarantees and explicit non-guarantees around ordering, apply progression, restart behavior, and stale-snapshot no-op semantics.
+- Added `RaftReplicator::recovery_progress()` as the live durable-state projection of `recovery_state()`, plus stress regressions proving rejected follower transitions leave it unchanged, accepted catch-up/heartbeat/snapshot advancement keep it aligned with the restart surface, and speculative leader-only tail remains excluded until committed.
+- Updated replication interface docs and runbooks to document current guarantees and explicit non-guarantees around ordering, apply progression, restart behavior, stale-snapshot no-op semantics, and the new durable-progress alignment helper.
 
 ### Current blockers
 - None in-repo.
 
 ### Next loops
 1. Extend Q2 with richer value-aware ordering or join-adjacent slices without weakening the explicit fallback contract.
-2. Continue Q3 with stale/resume semantics under richer follower catch-up and snapshot-install stress, keeping status/telemetry alignment explicit beyond the newly locked stale-snapshot no-op boundary.
+2. Continue Q3 with stale/resume semantics under richer follower catch-up and snapshot-install stress, especially around role/epoch changes and any future live-vs-durable status surfaces beyond `recovery_progress()`.
 
 ## 2026-04-24
 
