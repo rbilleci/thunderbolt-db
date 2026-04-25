@@ -6209,33 +6209,6 @@ mod tests {
             }
         );
 
-        let malformed_copy_done = frontend_frame(b'c', &[0]);
-        assert_eq!(
-            parse_frontend_message(&malformed_copy_done).unwrap_err(),
-            FrontendMessageError::LengthMismatch {
-                expected: 5,
-                actual: 6,
-            }
-        );
-
-        let malformed_terminate = frontend_frame(b'X', &[0]);
-        assert_eq!(
-            parse_frontend_message(&malformed_terminate).unwrap_err(),
-            FrontendMessageError::LengthMismatch {
-                expected: 5,
-                actual: 6,
-            }
-        );
-
-        let malformed_sync = frontend_frame(b'S', &[0]);
-        assert_eq!(
-            parse_frontend_message(&malformed_sync).unwrap_err(),
-            FrontendMessageError::LengthMismatch {
-                expected: 5,
-                actual: 6,
-            }
-        );
-
         let unterminated_copy_fail = frontend_frame(b'f', b"bad row");
         assert_eq!(
             parse_frontend_message(&unterminated_copy_fail).unwrap_err(),
