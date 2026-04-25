@@ -2333,6 +2333,68 @@ mod tests {
     }
 
     #[test]
+    fn raft_progress_snapshot_remains_consistent_across_append_at_snapshot_boundary() {
+        let mut r = RaftReplicator::new(3);
+        r.become_follower(3);
+
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 5,
+            last_included_term: 2,
+            snapshot_id: 1,
+        });
+
+        let before = r.progress();
+        assert_eq!(before.commit_index, 5);
+        assert_eq!(before.applied_index, 5);
+        assert_eq!(before.next_index, 6);
+        assert!(before.is_caught_up());
+
+        r.append_entries_from_leader(
+            3,
+            5,
+            2,
+            vec![LogEntry {
+                term: 3,
+                index: 6,
+                payload: vec![6],
+            }],
+            6,
+        )
+        .unwrap();
+
+        let after_append = r.progress();
+        assert_eq!(after_append.commit_index, 6);
+        assert_eq!(after_append.applied_index, 5);
+        assert_eq!(after_append.next_index, 7);
+        assert_eq!(after_append.apply_gap(), 1);
+        assert!(!after_append.is_caught_up());
+
+        r.mark_applied(6);
+        let after_apply = r.progress();
+        assert_eq!(after_apply.commit_index, 6);
+        assert_eq!(after_apply.applied_index, 6);
+        assert_eq!(after_apply.next_index, 7);
+        assert_eq!(after_apply.apply_gap(), 0);
+        assert!(after_apply.is_caught_up());
+
+        r.append_entries_from_leader(
+            3,
+            5,
+            2,
+            vec![LogEntry {
+                term: 3,
+                index: 6,
+                payload: vec![6],
+            }],
+            6,
+        )
+        .unwrap();
+
+        let after_repeat = r.progress();
+        assert_eq!(after_repeat, after_apply);
+    }
+
+    #[test]
     fn raft_follower_append_entries_rejects_snapshot_boundary_term_mismatch() {
         let mut r = RaftReplicator::new(3);
         r.become_follower(4);

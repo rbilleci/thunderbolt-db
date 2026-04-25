@@ -20,6 +20,7 @@
 - Added replication regressions proving stale-term and non-contiguous append rejections leave `ReplicationProgress` unchanged, tightening Q3 guarantees around rejected-path observability stability.
 - Added replication regressions proving snapshot install advances `ReplicationProgress` monotonically at the durable boundary while preserving surviving uncommitted tail accounting, tightening Q3 snapshot/catch-up semantics.
 - Added replication regressions proving snapshot-boundary append rejections (term mismatch / behind-boundary prev index) leave `ReplicationProgress` unchanged, tightening Q3 compacted-boundary observability guarantees.
+- Added replication regressions proving accepted appends at the snapshot boundary advance `ReplicationProgress` monotonically and idempotently across append/apply/replay, tightening Q3 compacted-boundary happy-path semantics.
 - Updated replication interface docs and runbooks to document current guarantees and explicit non-guarantees around ordering, apply progression, and restart behavior.
 
 ### Current blockers
