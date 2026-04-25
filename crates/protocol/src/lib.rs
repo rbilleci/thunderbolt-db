@@ -4410,6 +4410,35 @@ mod tests {
             }
         );
 
+        let mut bind_named_portal_with_unnamed_statement_text_payload = Vec::new();
+        bind_named_portal_with_unnamed_statement_text_payload
+            .extend_from_slice("pörtal_text\0\0".as_bytes());
+        bind_named_portal_with_unnamed_statement_text_payload
+            .extend_from_slice(&1_i16.to_be_bytes());
+        bind_named_portal_with_unnamed_statement_text_payload
+            .extend_from_slice(&0_i16.to_be_bytes());
+        bind_named_portal_with_unnamed_statement_text_payload
+            .extend_from_slice(&1_i16.to_be_bytes());
+        bind_named_portal_with_unnamed_statement_text_payload
+            .extend_from_slice(&("héllo".len() as i32).to_be_bytes());
+        bind_named_portal_with_unnamed_statement_text_payload.extend_from_slice("héllo".as_bytes());
+        bind_named_portal_with_unnamed_statement_text_payload
+            .extend_from_slice(&1_i16.to_be_bytes());
+        bind_named_portal_with_unnamed_statement_text_payload
+            .extend_from_slice(&0_i16.to_be_bytes());
+        let bind_named_portal_with_unnamed_statement_text =
+            frontend_frame(b'B', &bind_named_portal_with_unnamed_statement_text_payload);
+        assert_eq!(
+            parse_frontend_message(&bind_named_portal_with_unnamed_statement_text).unwrap(),
+            FrontendMessage::Bind {
+                portal_name: "pörtal_text".to_string(),
+                statement_name: String::new(),
+                parameter_format_codes: vec![0],
+                parameters: vec![Some("héllo".as_bytes().to_vec())],
+                result_format_codes: vec![0],
+            }
+        );
+
         let mut bind_unnamed_portal_with_named_statement_binary_payload = Vec::new();
         bind_unnamed_portal_with_named_statement_binary_payload
             .extend_from_slice(b"\0stmt_bin_named\0");
