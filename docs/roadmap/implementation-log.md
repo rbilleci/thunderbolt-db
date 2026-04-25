@@ -10,6 +10,7 @@
 - Started Q2 with a real engine-facing MVCC read slice: committed writes now mirror into an in-memory MVCC tuple store, and `Engine::execute_mvcc_query()` runs snapshot-bound full scans / key lookups with filtering + projection through `VecOperator`.
 - Added explicit GPU-first device declaration for the MVCC slice (`planned_target = GPU`, `executed_target = CPU`) plus tracked fallback reason `GpuMvccReadParityGap` → `GPU-123` so bootstrap reads stay parity-auditable instead of silently becoming CPU-only product direction.
 - Added deterministic regression workload fixture `tests/fixtures/mvcc-read-workload.txt` to seed future measurement/extension loops.
+- Replaced the temporary MVCC read `VecOperator` shim with explicit `ScanOperator` → `FilterOperator` → `ProjectOperator` execution stages, so the bootstrap vertical slice now flows through dedicated execution operators instead of one row-materialization helper.
 - Started Q3 replication hardening with explicit follower-resume semantics: added `RecoveryState`, `RaftReplicator::recovery_state()`, and `RaftReplicator::resume_as_follower(...)` so interruption/restart behavior is defined in code instead of implied by tests.
 - Added replication regressions covering lagging follower apply delay, restart/resume with committed-but-unapplied backlog preserved, and rejection of non-contiguous recovery tails.
 - Tightened the recovery helper contract itself with `RecoveryState::validate()` and derived boundary helpers (`commit_index`, `next_index`, pending-apply count/boolean) so restart automation can reason about durable state without re-deriving commit/apply semantics out-of-band.
@@ -39,7 +40,7 @@
 - None in-repo.
 
 ### Next loops
-1. Extend Q2 from the current VecOperator-backed slice into dedicated scan/filter/project operators and widen query shapes without weakening the explicit fallback contract.
+1. Extend Q2 by widening query shapes beyond the current single-filter scan / point-lookup slice without weakening the explicit fallback contract.
 2. Continue Q3 with stale/resume semantics under richer follower catch-up and snapshot-install stress, keeping status/telemetry alignment explicit.
 
 ## 2026-04-24

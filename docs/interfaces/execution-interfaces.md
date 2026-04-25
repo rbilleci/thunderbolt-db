@@ -34,4 +34,4 @@ Each physical plan node must include:
   - planned target = `gpu(default_gpu_id)`
   - executed target = `cpu`
   - fallback reason = `GpuMvccReadParityGap` (`GPU-123`, owner=`execution`, milestone=`m0-bootstrap`)
-  - CPU path materializes rows through `VecOperator` as the reference semantics for the slice
+  - CPU path runs an explicit `ScanOperator` → `FilterOperator` → `ProjectOperator` pipeline as the reference semantics for the slice

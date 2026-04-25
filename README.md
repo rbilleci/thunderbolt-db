@@ -30,12 +30,12 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
   - `MvccProjection::ValueOnly`
 - Current device strategy:
   - planned target: GPU default device
-  - executed target: CPU reference semantics via `VecOperator`
+  - executed target: CPU reference semantics via `ScanOperator` → `FilterOperator` → `ProjectOperator`
   - fallback reason: `FallbackReason::GpuMvccReadParityGap` (`GPU-123`)
 - Deterministic workload fixture:
   - `tests/fixtures/mvcc-read-workload.txt`
 - Next obvious extension boundary:
-  - replace the `VecOperator` row-materialization shim with real scan/filter/project operators and route eligible reads to a GPU-backed implementation while preserving the same engine-facing contract.
+  - widen query shapes beyond single-filter scan / point-lookup while preserving the same engine-facing contract and explicit fallback accounting on the eventual GPU-backed path.
 
 ## Quickstart
 

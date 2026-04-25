@@ -5,7 +5,8 @@ use std::time::{Duration, Instant};
 
 use gpu_db_batching::{BatchItem, DualTriggerBatcher, FlushReason};
 use gpu_db_execution::{
-    DeviceRouter, DeviceTarget, MockGpuRuntime, Operator, RouteDecision, VecOperator,
+    DeviceRouter, DeviceTarget, FilterOperator, MockGpuRuntime, Operator, ProjectOperator,
+    RouteDecision, ScanOperator,
 };
 use gpu_db_metrics::{BatchFlushReason, FallbackReason, RuntimeMetrics};
 use gpu_db_observability::{
@@ -16,7 +17,8 @@ use gpu_db_planner::{ExecutionPlan, Planner, PlannerConfig};
 use gpu_db_protocol::{parse_command, Command, ParseError};
 use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine};
 use gpu_db_storage::{
-    InMemoryTupleStore, NewTuple, StorageError, TupleStore, Visibility as StorageVisibility,
+    InMemoryTupleStore, NewTuple, StorageError, TupleStore, TupleVersion,
+    Visibility as StorageVisibility,
 };
 use gpu_db_txn::{TxnError, TxnManager};
 use gpu_db_types::{CommitToken, EngineError, Index, LogEntry, Role, SnapshotMeta, Term, TxnId};
@@ -132,6 +134,21 @@ fn decode_mvcc_row(bytes: &[u8], projection: MvccProjection) -> MvccReadRow {
             key: None,
             value: Some(text),
         },
+    }
+}
+
+fn mvcc_row_matches_filter(row: &TupleVersion, filter: &MvccReadFilter) -> bool {
+    match filter {
+        MvccReadFilter::KeyPrefix(prefix) => row.key.starts_with(prefix),
+        MvccReadFilter::ValueEquals(expected) => row.value == *expected,
+    }
+}
+
+fn encode_mvcc_projection(row: TupleVersion, projection: MvccProjection) -> Vec<u8> {
+    match projection {
+        MvccProjection::KeyValue => format!("{}\t{}", row.key, row.value).into_bytes(),
+        MvccProjection::KeyOnly => row.key.into_bytes(),
+        MvccProjection::ValueOnly => row.value.into_bytes(),
     }
 }
 
@@ -873,7 +890,7 @@ impl Engine {
         self.metrics
             .inc_fallback(FallbackReason::GpuMvccReadParityGap);
 
-        let mut rows = match &query.source {
+        let rows = match &query.source {
             MvccReadSource::FullScan => {
                 let mut cursor = self.mvcc_store.seq_scan_open(query.visibility)?;
                 let mut rows = Vec::new();
@@ -889,35 +906,43 @@ impl Engine {
                 .collect(),
         };
 
-        if let Some(filter) = &query.filter {
-            rows.retain(|row| match filter {
-                MvccReadFilter::KeyPrefix(prefix) => row.key.starts_with(prefix),
-                MvccReadFilter::ValueEquals(expected) => row.value == *expected,
+        let projection = query.projection;
+        let encoded_rows = if let Some(filter) = query.filter.clone() {
+            let scan = ScanOperator::new(rows);
+            let filter = FilterOperator::new(scan, move |row: &TupleVersion| {
+                mvcc_row_matches_filter(row, &filter)
             });
-        }
-
-        let encoded_rows: Vec<Vec<u8>> = rows
-            .into_iter()
-            .map(|row| match query.projection {
-                MvccProjection::KeyValue => format!("{}\t{}", row.key, row.value),
-                MvccProjection::KeyOnly => row.key,
-                MvccProjection::ValueOnly => row.value,
-            })
-            .map(String::into_bytes)
-            .collect();
+            let mut operator =
+                ProjectOperator::new(filter, move |row| encode_mvcc_projection(row, projection));
+            operator.open();
+            let mut encoded_rows = Vec::new();
+            while let Some(row) = operator.next() {
+                encoded_rows.push(row);
+            }
+            operator.close();
+            encoded_rows
+        } else {
+            let scan = ScanOperator::new(rows);
+            let mut operator =
+                ProjectOperator::new(scan, move |row| encode_mvcc_projection(row, projection));
+            operator.open();
+            let mut encoded_rows = Vec::new();
+            while let Some(row) = operator.next() {
+                encoded_rows.push(row);
+            }
+            operator.close();
+            encoded_rows
+        };
 
         let total_d2h_bytes: u64 = encoded_rows.iter().map(|row| row.len() as u64).sum();
         if total_d2h_bytes > 0 {
             self.metrics.observe_d2h_bytes(total_d2h_bytes);
         }
 
-        let mut operator = VecOperator::new(encoded_rows);
-        operator.open();
-        let mut projected = Vec::new();
-        while let Some(row) = operator.next() {
-            projected.push(decode_mvcc_row(&row, query.projection));
-        }
-        operator.close();
+        let projected = encoded_rows
+            .iter()
+            .map(|row| decode_mvcc_row(row, query.projection))
+            .collect();
 
         Ok(MvccReadResult {
             planned_target,

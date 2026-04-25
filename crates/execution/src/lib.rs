@@ -147,16 +147,16 @@ impl GpuRuntime for MockGpuRuntime {
     }
 }
 
-pub trait Operator {
+pub trait Operator<Row = Vec<u8>> {
     fn open(&mut self) {}
-    fn next(&mut self) -> Option<Vec<u8>>;
+    fn next(&mut self) -> Option<Row>;
     fn close(&mut self) {}
 }
 
 #[derive(Debug, Default)]
 pub struct CpuNoop;
 
-impl Operator for CpuNoop {
+impl Operator<Vec<u8>> for CpuNoop {
     fn next(&mut self) -> Option<Vec<u8>> {
         None
     }
@@ -185,7 +185,7 @@ impl VecOperator {
     }
 }
 
-impl Operator for VecOperator {
+impl Operator<Vec<u8>> for VecOperator {
     fn open(&mut self) {
         self.next_index = 0;
     }
@@ -198,6 +198,121 @@ impl Operator for VecOperator {
 
     fn close(&mut self) {
         self.next_index = self.rows.len();
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ScanOperator<Row> {
+    rows: Vec<Row>,
+    next_index: usize,
+}
+
+impl<Row> ScanOperator<Row> {
+    pub fn new(rows: Vec<Row>) -> Self {
+        Self {
+            rows,
+            next_index: 0,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+}
+
+impl<Row: Clone> Operator<Row> for ScanOperator<Row> {
+    fn open(&mut self) {
+        self.next_index = 0;
+    }
+
+    fn next(&mut self) -> Option<Row> {
+        let row = self.rows.get(self.next_index)?.clone();
+        self.next_index += 1;
+        Some(row)
+    }
+
+    fn close(&mut self) {
+        self.next_index = self.rows.len();
+    }
+}
+
+pub struct FilterOperator<Row, Child, Predicate> {
+    child: Child,
+    predicate: Predicate,
+    _row: std::marker::PhantomData<Row>,
+}
+
+impl<Row, Child, Predicate> FilterOperator<Row, Child, Predicate> {
+    pub fn new(child: Child, predicate: Predicate) -> Self {
+        Self {
+            child,
+            predicate,
+            _row: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<Row, Child, Predicate> Operator<Row> for FilterOperator<Row, Child, Predicate>
+where
+    Child: Operator<Row>,
+    Predicate: FnMut(&Row) -> bool,
+{
+    fn open(&mut self) {
+        self.child.open();
+    }
+
+    fn next(&mut self) -> Option<Row> {
+        while let Some(row) = self.child.next() {
+            if (self.predicate)(&row) {
+                return Some(row);
+            }
+        }
+        None
+    }
+
+    fn close(&mut self) {
+        self.child.close();
+    }
+}
+
+pub struct ProjectOperator<Input, Output, Child, Projection> {
+    child: Child,
+    projection: Projection,
+    _input: std::marker::PhantomData<Input>,
+    _output: std::marker::PhantomData<Output>,
+}
+
+impl<Input, Output, Child, Projection> ProjectOperator<Input, Output, Child, Projection> {
+    pub fn new(child: Child, projection: Projection) -> Self {
+        Self {
+            child,
+            projection,
+            _input: std::marker::PhantomData,
+            _output: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<Input, Output, Child, Projection> Operator<Output>
+    for ProjectOperator<Input, Output, Child, Projection>
+where
+    Child: Operator<Input>,
+    Projection: FnMut(Input) -> Output,
+{
+    fn open(&mut self) {
+        self.child.open();
+    }
+
+    fn next(&mut self) -> Option<Output> {
+        self.child.next().map(&mut self.projection)
+    }
+
+    fn close(&mut self) {
+        self.child.close();
     }
 }
 
@@ -316,5 +431,60 @@ mod tests {
 
         op.close();
         assert_eq!(op.next(), None);
+    }
+
+    #[test]
+    fn scan_operator_yields_rows_in_order() {
+        let mut op = ScanOperator::new(vec![1_u32, 2_u32, 3_u32]);
+
+        assert_eq!(op.len(), 3);
+        assert!(!op.is_empty());
+        assert_eq!(op.next(), Some(1));
+        assert_eq!(op.next(), Some(2));
+        assert_eq!(op.next(), Some(3));
+        assert_eq!(op.next(), None);
+
+        op.open();
+        assert_eq!(op.next(), Some(1));
+        op.close();
+        assert_eq!(op.next(), None);
+    }
+
+    #[test]
+    fn filter_operator_skips_non_matching_rows() {
+        let scan = ScanOperator::new(vec![1_i32, 2_i32, 3_i32, 4_i32]);
+        let mut op = FilterOperator::new(scan, |row: &i32| row % 2 == 0);
+
+        op.open();
+        assert_eq!(op.next(), Some(2));
+        assert_eq!(op.next(), Some(4));
+        assert_eq!(op.next(), None);
+        op.close();
+    }
+
+    #[test]
+    fn project_operator_maps_child_rows() {
+        let scan = ScanOperator::new(vec![1_i32, 2_i32, 3_i32]);
+        let mut op = ProjectOperator::new(scan, |row| format!("row-{row}"));
+
+        op.open();
+        assert_eq!(op.next(), Some("row-1".to_string()));
+        assert_eq!(op.next(), Some("row-2".to_string()));
+        assert_eq!(op.next(), Some("row-3".to_string()));
+        assert_eq!(op.next(), None);
+        op.close();
+    }
+
+    #[test]
+    fn scan_filter_project_pipeline_composes() {
+        let scan = ScanOperator::new(vec![1_i32, 2_i32, 3_i32, 4_i32]);
+        let filter = FilterOperator::new(scan, |row: &i32| row % 2 == 1);
+        let mut op = ProjectOperator::new(filter, |row| row * 10);
+
+        op.open();
+        assert_eq!(op.next(), Some(10));
+        assert_eq!(op.next(), Some(30));
+        assert_eq!(op.next(), None);
+        op.close();
     }
 }
