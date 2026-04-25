@@ -4651,6 +4651,34 @@ mod tests {
             }
         );
 
+        let mut bind_named_portal_with_unnamed_statement_zero_params_payload = Vec::new();
+        bind_named_portal_with_unnamed_statement_zero_params_payload
+            .extend_from_slice("pörtal_zero\0\0".as_bytes());
+        bind_named_portal_with_unnamed_statement_zero_params_payload
+            .extend_from_slice(&1_i16.to_be_bytes());
+        bind_named_portal_with_unnamed_statement_zero_params_payload
+            .extend_from_slice(&1_i16.to_be_bytes());
+        bind_named_portal_with_unnamed_statement_zero_params_payload
+            .extend_from_slice(&0_i16.to_be_bytes());
+        bind_named_portal_with_unnamed_statement_zero_params_payload
+            .extend_from_slice(&1_i16.to_be_bytes());
+        bind_named_portal_with_unnamed_statement_zero_params_payload
+            .extend_from_slice(&1_i16.to_be_bytes());
+        let bind_named_portal_with_unnamed_statement_zero_params = frontend_frame(
+            b'B',
+            &bind_named_portal_with_unnamed_statement_zero_params_payload,
+        );
+        assert_eq!(
+            parse_frontend_message(&bind_named_portal_with_unnamed_statement_zero_params).unwrap(),
+            FrontendMessage::Bind {
+                portal_name: "pörtal_zero".to_string(),
+                statement_name: String::new(),
+                parameter_format_codes: vec![1],
+                parameters: vec![],
+                result_format_codes: vec![1],
+            }
+        );
+
         let mut bind_with_zero_params_and_single_shared_format_payload = Vec::new();
         bind_with_zero_params_and_single_shared_format_payload
             .extend_from_slice(b"portal3\0stmt3\0");
