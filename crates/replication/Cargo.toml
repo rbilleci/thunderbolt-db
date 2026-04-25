@@ -5,4 +5,5 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+thiserror.workspace = true
 gpu_db_types = { path = "../types" }

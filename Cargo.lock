@@ -71,6 +71,7 @@ name = "gpu_db_replication"
 version = "0.1.0"
 dependencies = [
  "gpu_db_types",
+ "thiserror",
 ]
 
 [[package]]

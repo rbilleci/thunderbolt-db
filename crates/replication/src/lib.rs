@@ -10,6 +10,89 @@ pub struct RecoveryState {
     pub applied_index: Index,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RecoveryInvariantError {
+    #[error("applied_index {applied_index} is behind snapshot boundary {snapshot_index}")]
+    AppliedBehindSnapshot {
+        applied_index: Index,
+        snapshot_index: Index,
+    },
+    #[error("recovery entries must be contiguous from {expected_index} but saw {actual_index}")]
+    NonContiguousEntries {
+        expected_index: Index,
+        actual_index: Index,
+    },
+    #[error("recovery entry term {entry_term} exceeds local term {local_term} at index {index}")]
+    EntryTermExceedsLocal {
+        entry_term: Term,
+        local_term: Term,
+        index: Index,
+    },
+    #[error("applied_index {applied_index} exceeds commit boundary {commit_index}")]
+    AppliedExceedsCommit {
+        applied_index: Index,
+        commit_index: Index,
+    },
+}
+
+impl RecoveryState {
+    pub fn commit_index(&self) -> Index {
+        self.committed_entries
+            .last()
+            .map(|entry| entry.index)
+            .unwrap_or(self.snapshot.last_included_index)
+    }
+
+    pub fn next_index(&self) -> Index {
+        self.commit_index() + 1
+    }
+
+    pub fn committed_but_unapplied_count(&self) -> usize {
+        self.commit_index().saturating_sub(self.applied_index) as usize
+    }
+
+    pub fn has_committed_entries_pending_apply(&self) -> bool {
+        self.applied_index < self.commit_index()
+    }
+
+    pub fn validate(&self) -> Result<(), RecoveryInvariantError> {
+        if self.applied_index < self.snapshot.last_included_index {
+            return Err(RecoveryInvariantError::AppliedBehindSnapshot {
+                applied_index: self.applied_index,
+                snapshot_index: self.snapshot.last_included_index,
+            });
+        }
+
+        let mut expected_index = self.snapshot.last_included_index + 1;
+        for entry in &self.committed_entries {
+            if entry.index != expected_index {
+                return Err(RecoveryInvariantError::NonContiguousEntries {
+                    expected_index,
+                    actual_index: entry.index,
+                });
+            }
+            if entry.term > self.term {
+                return Err(RecoveryInvariantError::EntryTermExceedsLocal {
+                    entry_term: entry.term,
+                    local_term: self.term,
+                    index: entry.index,
+                });
+            }
+            expected_index += 1;
+        }
+
+        let commit_index = self.commit_index();
+        if self.applied_index > commit_index {
+            return Err(RecoveryInvariantError::AppliedExceedsCommit {
+                applied_index: self.applied_index,
+                commit_index,
+            });
+        }
+
+        Ok(())
+    }
+}
+
 pub trait LogReplicator {
     fn propose(&mut self, payload: Vec<u8>) -> Result<CommitToken, EngineError>;
     fn wait_committed(
@@ -182,42 +265,12 @@ impl RaftReplicator {
     }
 
     pub fn resume_as_follower(voters: usize, recovery: RecoveryState) -> Result<Self, EngineError> {
-        if recovery.applied_index < recovery.snapshot.last_included_index {
-            return Err(EngineError::ApplyFailed(format!(
-                "applied_index {} is behind snapshot boundary {}",
-                recovery.applied_index, recovery.snapshot.last_included_index
-            )));
-        }
+        recovery
+            .validate()
+            .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
 
-        let mut expected_index = recovery.snapshot.last_included_index + 1;
-        for entry in &recovery.committed_entries {
-            if entry.index != expected_index {
-                return Err(EngineError::ApplyFailed(format!(
-                    "recovery entries must be contiguous from {} but saw {}",
-                    recovery.snapshot.last_included_index + 1,
-                    entry.index
-                )));
-            }
-            if entry.term > recovery.term {
-                return Err(EngineError::ApplyFailed(format!(
-                    "recovery entry term {} exceeds local term {} at index {}",
-                    entry.term, recovery.term, entry.index
-                )));
-            }
-            expected_index += 1;
-        }
-
-        let commit_index = recovery
-            .committed_entries
-            .last()
-            .map(|entry| entry.index)
-            .unwrap_or(recovery.snapshot.last_included_index);
-        if recovery.applied_index > commit_index {
-            return Err(EngineError::ApplyFailed(format!(
-                "applied_index {} exceeds commit boundary {}",
-                recovery.applied_index, commit_index
-            )));
-        }
+        let commit_index = recovery.commit_index();
+        let next_index = recovery.next_index();
 
         let mut replicator = Self::new(voters);
         replicator.term = recovery.term.max(recovery.snapshot.last_included_term);
@@ -244,7 +297,7 @@ impl RaftReplicator {
         replicator.compacted_index = recovery.snapshot.last_included_index;
         replicator.compacted_term = recovery.snapshot.last_included_term;
         replicator.entries = recovery.committed_entries;
-        replicator.next_index = commit_index + 1;
+        replicator.next_index = next_index;
         Ok(replicator)
     }
 
@@ -999,6 +1052,58 @@ mod tests {
         assert!(resumed.has_committed_entries_pending_apply());
         assert_eq!(resumed.committed_but_unapplied_count(), 1);
         assert_eq!(resumed.next_index, t2.index + 1);
+    }
+
+    #[test]
+    fn recovery_state_helpers_report_commit_apply_boundaries() {
+        let state = RecoveryState {
+            term: 4,
+            snapshot: SnapshotMeta {
+                last_included_index: 3,
+                last_included_term: 4,
+                snapshot_id: 7,
+            },
+            committed_entries: vec![LogEntry {
+                term: 4,
+                index: 4,
+                payload: vec![1],
+            }],
+            applied_index: 3,
+        };
+
+        assert_eq!(state.commit_index(), 4);
+        assert_eq!(state.next_index(), 5);
+        assert!(state.has_committed_entries_pending_apply());
+        assert_eq!(state.committed_but_unapplied_count(), 1);
+        state.validate().unwrap();
+    }
+
+    #[test]
+    fn recovery_state_validation_rejects_applied_index_past_commit_boundary() {
+        let err = RecoveryState {
+            term: 4,
+            snapshot: SnapshotMeta {
+                last_included_index: 3,
+                last_included_term: 4,
+                snapshot_id: 7,
+            },
+            committed_entries: vec![LogEntry {
+                term: 4,
+                index: 4,
+                payload: vec![1],
+            }],
+            applied_index: 5,
+        }
+        .validate()
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            RecoveryInvariantError::AppliedExceedsCommit {
+                applied_index: 5,
+                commit_index: 4,
+            }
+        );
     }
 
     #[test]

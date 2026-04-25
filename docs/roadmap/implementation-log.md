@@ -12,6 +12,7 @@
 - Added deterministic regression workload fixture `tests/fixtures/mvcc-read-workload.txt` to seed future measurement/extension loops.
 - Started Q3 replication hardening with explicit follower-resume semantics: added `RecoveryState`, `RaftReplicator::recovery_state()`, and `RaftReplicator::resume_as_follower(...)` so interruption/restart behavior is defined in code instead of implied by tests.
 - Added replication regressions covering lagging follower apply delay, restart/resume with committed-but-unapplied backlog preserved, and rejection of non-contiguous recovery tails.
+- Tightened the recovery helper contract itself with `RecoveryState::validate()` and derived boundary helpers (`commit_index`, `next_index`, pending-apply count/boolean) so restart automation can reason about durable state without re-deriving commit/apply semantics out-of-band.
 - Updated replication interface docs and runbooks to document current guarantees and explicit non-guarantees around ordering, apply progression, and restart behavior.
 
 ### Current blockers
