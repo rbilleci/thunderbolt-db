@@ -28,6 +28,7 @@
 - Added replication regressions proving contiguous quorum-ack promotion moves entries from uncommitted tail into committed-but-unapplied backlog in `ReplicationProgress` without allowing out-of-order ack arrival to skip commit boundaries, tightening Q3 commit-promotion semantics.
 - Added replication regressions proving conflict-repair truncation updates `ReplicationProgress` by dropping only uncommitted tail and rewinding `next_index` to the durable frontier, while committed-boundary truncation remains a no-op, tightening Q3 catch-up repair semantics.
 - Added local replication regressions proving rollback of unapplied tail rewinds `ReplicationProgress` back to the applied frontier and clears pending-apply backlog, tightening Q3 rollback semantics.
+- Added replication regressions proving single-node leaders surface immediate commit as pending-apply backlog with no uncommitted tail in `ReplicationProgress`, tightening Q3 quorum=1 semantics.
 - Updated replication interface docs and runbooks to document current guarantees and explicit non-guarantees around ordering, apply progression, and restart behavior.
 
 ### Current blockers

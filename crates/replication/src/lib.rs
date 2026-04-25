@@ -1645,6 +1645,25 @@ mod tests {
     }
 
     #[test]
+    fn raft_progress_snapshot_tracks_single_node_immediate_commit() {
+        let mut r = RaftReplicator::single_node_leader();
+        let tok = r.propose(vec![7]).unwrap();
+
+        let progress = r.progress();
+        assert_eq!(progress.role, Role::Leader);
+        assert_eq!(progress.commit_index, tok.index);
+        assert_eq!(progress.applied_index, 0);
+        assert_eq!(progress.next_index, tok.index + 1);
+        assert_eq!(progress.uncommitted_entry_count, 0);
+        assert!(!progress.has_uncommitted_entries);
+        assert_eq!(progress.committed_but_unapplied_count, tok.index as usize);
+        assert!(progress.has_committed_entries_pending_apply);
+        assert_eq!(progress.apply_gap(), tok.index as usize);
+        assert!(!progress.is_caught_up());
+        progress.validate().unwrap();
+    }
+
+    #[test]
     fn raft_follower_acks_are_ignored_when_not_leader() {
         let mut r = RaftReplicator::new(3);
         r.become_leader(1);
