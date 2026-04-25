@@ -28,14 +28,22 @@ Each physical plan node must include:
   - `ValueEquals(value)`
   - `All([filter...])`
   - `Any([filter...])`
+- Order layer:
+  - `KeyAsc`
+  - `KeyDesc`
 - Projection layer:
   - `KeyValue`
   - `KeyOnly`
   - `ValueOnly`
 - Optional row cap:
-  - `limit = Some(n)` applies after visibility + filter stages
+  - `limit = Some(n)` applies after visibility + filter + ordering stages
 - Current execution/device contract:
   - planned target = `gpu(default_gpu_id)`
   - executed target = `cpu`
   - fallback reason = `GpuMvccReadParityGap` (`GPU-123`, owner=`execution`, milestone=`m0-bootstrap`)
-  - CPU path runs an explicit `ScanOperator` → `FilterOperator` → `ProjectOperator` pipeline as the reference semantics for the slice
+  - CPU path runs an explicit `ScanOperator` → `FilterOperator` → `SortOperator` → `LimitOperator` → `ProjectOperator` pipeline as the reference semantics for the slice
+
+## Current extension boundary
+
+- Supported ordering is currently key-only (`KeyAsc` / `KeyDesc`).
+- Next obvious Q2 extension is richer predicate/order shapes (for example key ranges or value-aware ordering) without weakening the explicit GPU fallback contract.

@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use gpu_db_batching::{BatchItem, DualTriggerBatcher, FlushReason};
 use gpu_db_execution::{
     DeviceRouter, DeviceTarget, FilterOperator, LimitOperator, MockGpuRuntime, Operator,
-    ProjectOperator, RouteDecision, ScanOperator,
+    ProjectOperator, RouteDecision, ScanOperator, SortOperator,
 };
 use gpu_db_metrics::{BatchFlushReason, FallbackReason, RuntimeMetrics};
 use gpu_db_observability::{
@@ -90,6 +90,12 @@ pub enum MvccReadFilter {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MvccReadOrder {
+    KeyAsc,
+    KeyDesc,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MvccProjection {
     KeyValue,
     KeyOnly,
@@ -101,6 +107,7 @@ pub struct MvccReadQuery {
     pub source: MvccReadSource,
     pub visibility: StorageVisibility,
     pub filter: Option<MvccReadFilter>,
+    pub order: Option<MvccReadOrder>,
     pub projection: MvccProjection,
     pub limit: Option<usize>,
 }
@@ -158,6 +165,17 @@ fn encode_mvcc_projection(row: TupleVersion, projection: MvccProjection) -> Vec<
         MvccProjection::KeyValue => format!("{}\t{}", row.key, row.value).into_bytes(),
         MvccProjection::KeyOnly => row.key.into_bytes(),
         MvccProjection::ValueOnly => row.value.into_bytes(),
+    }
+}
+
+fn mvcc_row_cmp(
+    left: &TupleVersion,
+    right: &TupleVersion,
+    order: MvccReadOrder,
+) -> std::cmp::Ordering {
+    match order {
+        MvccReadOrder::KeyAsc => left.key.cmp(&right.key),
+        MvccReadOrder::KeyDesc => right.key.cmp(&left.key),
     }
 }
 
@@ -929,8 +947,36 @@ impl Engine {
         };
 
         let projection = query.projection;
-        let encoded_rows = match (query.filter.clone(), query.limit) {
-            (Some(filter), Some(limit)) => collect_operator_rows(ProjectOperator::new(
+        let encoded_rows = match (query.filter.clone(), query.order, query.limit) {
+            (Some(filter), Some(order), Some(limit)) => {
+                collect_operator_rows(ProjectOperator::new(
+                    LimitOperator::new(
+                        SortOperator::new(
+                            FilterOperator::new(
+                                ScanOperator::new(rows),
+                                move |row: &TupleVersion| mvcc_row_matches_filter(row, &filter),
+                            ),
+                            move |left: &TupleVersion, right: &TupleVersion| {
+                                mvcc_row_cmp(left, right, order)
+                            },
+                        ),
+                        limit,
+                    ),
+                    move |row| encode_mvcc_projection(row, projection),
+                ))
+            }
+            (Some(filter), Some(order), None) => collect_operator_rows(ProjectOperator::new(
+                SortOperator::new(
+                    FilterOperator::new(ScanOperator::new(rows), move |row: &TupleVersion| {
+                        mvcc_row_matches_filter(row, &filter)
+                    }),
+                    move |left: &TupleVersion, right: &TupleVersion| {
+                        mvcc_row_cmp(left, right, order)
+                    },
+                ),
+                move |row| encode_mvcc_projection(row, projection),
+            )),
+            (Some(filter), None, Some(limit)) => collect_operator_rows(ProjectOperator::new(
                 LimitOperator::new(
                     FilterOperator::new(ScanOperator::new(rows), move |row: &TupleVersion| {
                         mvcc_row_matches_filter(row, &filter)
@@ -939,17 +985,38 @@ impl Engine {
                 ),
                 move |row| encode_mvcc_projection(row, projection),
             )),
-            (Some(filter), None) => collect_operator_rows(ProjectOperator::new(
+            (Some(filter), None, None) => collect_operator_rows(ProjectOperator::new(
                 FilterOperator::new(ScanOperator::new(rows), move |row: &TupleVersion| {
                     mvcc_row_matches_filter(row, &filter)
                 }),
                 move |row| encode_mvcc_projection(row, projection),
             )),
-            (None, Some(limit)) => collect_operator_rows(ProjectOperator::new(
+            (None, Some(order), Some(limit)) => collect_operator_rows(ProjectOperator::new(
+                LimitOperator::new(
+                    SortOperator::new(
+                        ScanOperator::new(rows),
+                        move |left: &TupleVersion, right: &TupleVersion| {
+                            mvcc_row_cmp(left, right, order)
+                        },
+                    ),
+                    limit,
+                ),
+                move |row| encode_mvcc_projection(row, projection),
+            )),
+            (None, Some(order), None) => collect_operator_rows(ProjectOperator::new(
+                SortOperator::new(
+                    ScanOperator::new(rows),
+                    move |left: &TupleVersion, right: &TupleVersion| {
+                        mvcc_row_cmp(left, right, order)
+                    },
+                ),
+                move |row| encode_mvcc_projection(row, projection),
+            )),
+            (None, None, Some(limit)) => collect_operator_rows(ProjectOperator::new(
                 LimitOperator::new(ScanOperator::new(rows), limit),
                 move |row| encode_mvcc_projection(row, projection),
             )),
-            (None, None) => {
+            (None, None, None) => {
                 collect_operator_rows(ProjectOperator::new(ScanOperator::new(rows), move |row| {
                     encode_mvcc_projection(row, projection)
                 }))
@@ -3161,6 +3228,7 @@ mod tests {
                 source: MvccReadSource::FullScan,
                 visibility: StorageVisibility { read_txn_id: 3 },
                 filter: Some(MvccReadFilter::KeyPrefix("acct:".to_string())),
+                order: None,
                 projection: MvccProjection::KeyValue,
                 limit: None,
             })
@@ -3209,6 +3277,7 @@ mod tests {
                 },
                 visibility: StorageVisibility { read_txn_id: 2 },
                 filter: None,
+                order: None,
                 projection: MvccProjection::ValueOnly,
                 limit: None,
             })
@@ -3229,6 +3298,7 @@ mod tests {
                 },
                 visibility: StorageVisibility { read_txn_id: 5 },
                 filter: Some(MvccReadFilter::ValueEquals("active".to_string())),
+                order: None,
                 projection: MvccProjection::KeyOnly,
                 limit: None,
             })
@@ -3259,6 +3329,7 @@ mod tests {
                     MvccReadFilter::KeyPrefix("acct:".to_string()),
                     MvccReadFilter::ValueEquals("locked".to_string()),
                 ])),
+                order: None,
                 projection: MvccProjection::KeyValue,
                 limit: None,
             })
@@ -3279,6 +3350,7 @@ mod tests {
                     MvccReadFilter::KeyPrefix("acct:".to_string()),
                     MvccReadFilter::ValueEquals("active".to_string()),
                 ])),
+                order: None,
                 projection: MvccProjection::KeyOnly,
                 limit: None,
             })
@@ -3314,6 +3386,7 @@ mod tests {
                 source: MvccReadSource::FullScan,
                 visibility: StorageVisibility { read_txn_id: 3 },
                 filter: Some(MvccReadFilter::KeyPrefix("acct:".to_string())),
+                order: None,
                 projection: MvccProjection::KeyOnly,
                 limit: Some(2),
             })
@@ -3324,6 +3397,39 @@ mod tests {
             vec![
                 MvccReadRow {
                     key: Some("acct:1".to_string()),
+                    value: None,
+                },
+                MvccReadRow {
+                    key: Some("acct:2".to_string()),
+                    value: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn execute_mvcc_query_supports_key_ordering_before_limit() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:2=locked").unwrap();
+        e.execute_text(2, "SET acct:1=open").unwrap();
+        e.execute_text(3, "SET acct:3=closed").unwrap();
+
+        let descending = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FullScan,
+                visibility: StorageVisibility { read_txn_id: 3 },
+                filter: Some(MvccReadFilter::KeyPrefix("acct:".to_string())),
+                order: Some(MvccReadOrder::KeyDesc),
+                projection: MvccProjection::KeyOnly,
+                limit: Some(2),
+            })
+            .unwrap();
+
+        assert_eq!(
+            descending.rows,
+            vec![
+                MvccReadRow {
+                    key: Some("acct:3".to_string()),
                     value: None,
                 },
                 MvccReadRow {
