@@ -32,6 +32,8 @@ Each physical plan node must include:
   - `KeyValue`
   - `KeyOnly`
   - `ValueOnly`
+- Optional row cap:
+  - `limit = Some(n)` applies after visibility + filter stages
 - Current execution/device contract:
   - planned target = `gpu(default_gpu_id)`
   - executed target = `cpu`

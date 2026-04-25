@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 
 use gpu_db_batching::{BatchItem, DualTriggerBatcher, FlushReason};
 use gpu_db_execution::{
-    DeviceRouter, DeviceTarget, FilterOperator, MockGpuRuntime, Operator, ProjectOperator,
-    RouteDecision, ScanOperator,
+    DeviceRouter, DeviceTarget, FilterOperator, LimitOperator, MockGpuRuntime, Operator,
+    ProjectOperator, RouteDecision, ScanOperator,
 };
 use gpu_db_metrics::{BatchFlushReason, FallbackReason, RuntimeMetrics};
 use gpu_db_observability::{
@@ -102,6 +102,7 @@ pub struct MvccReadQuery {
     pub visibility: StorageVisibility,
     pub filter: Option<MvccReadFilter>,
     pub projection: MvccProjection,
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,6 +159,19 @@ fn encode_mvcc_projection(row: TupleVersion, projection: MvccProjection) -> Vec<
         MvccProjection::KeyOnly => row.key.into_bytes(),
         MvccProjection::ValueOnly => row.value.into_bytes(),
     }
+}
+
+fn collect_operator_rows<Row, Op>(mut operator: Op) -> Vec<Row>
+where
+    Op: Operator<Row>,
+{
+    operator.open();
+    let mut rows = Vec::new();
+    while let Some(row) = operator.next() {
+        rows.push(row);
+    }
+    operator.close();
+    rows
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -915,31 +929,31 @@ impl Engine {
         };
 
         let projection = query.projection;
-        let encoded_rows = if let Some(filter) = query.filter.clone() {
-            let scan = ScanOperator::new(rows);
-            let filter = FilterOperator::new(scan, move |row: &TupleVersion| {
-                mvcc_row_matches_filter(row, &filter)
-            });
-            let mut operator =
-                ProjectOperator::new(filter, move |row| encode_mvcc_projection(row, projection));
-            operator.open();
-            let mut encoded_rows = Vec::new();
-            while let Some(row) = operator.next() {
-                encoded_rows.push(row);
+        let encoded_rows = match (query.filter.clone(), query.limit) {
+            (Some(filter), Some(limit)) => collect_operator_rows(ProjectOperator::new(
+                LimitOperator::new(
+                    FilterOperator::new(ScanOperator::new(rows), move |row: &TupleVersion| {
+                        mvcc_row_matches_filter(row, &filter)
+                    }),
+                    limit,
+                ),
+                move |row| encode_mvcc_projection(row, projection),
+            )),
+            (Some(filter), None) => collect_operator_rows(ProjectOperator::new(
+                FilterOperator::new(ScanOperator::new(rows), move |row: &TupleVersion| {
+                    mvcc_row_matches_filter(row, &filter)
+                }),
+                move |row| encode_mvcc_projection(row, projection),
+            )),
+            (None, Some(limit)) => collect_operator_rows(ProjectOperator::new(
+                LimitOperator::new(ScanOperator::new(rows), limit),
+                move |row| encode_mvcc_projection(row, projection),
+            )),
+            (None, None) => {
+                collect_operator_rows(ProjectOperator::new(ScanOperator::new(rows), move |row| {
+                    encode_mvcc_projection(row, projection)
+                }))
             }
-            operator.close();
-            encoded_rows
-        } else {
-            let scan = ScanOperator::new(rows);
-            let mut operator =
-                ProjectOperator::new(scan, move |row| encode_mvcc_projection(row, projection));
-            operator.open();
-            let mut encoded_rows = Vec::new();
-            while let Some(row) = operator.next() {
-                encoded_rows.push(row);
-            }
-            operator.close();
-            encoded_rows
         };
 
         let total_d2h_bytes: u64 = encoded_rows.iter().map(|row| row.len() as u64).sum();
@@ -3148,6 +3162,7 @@ mod tests {
                 visibility: StorageVisibility { read_txn_id: 3 },
                 filter: Some(MvccReadFilter::KeyPrefix("acct:".to_string())),
                 projection: MvccProjection::KeyValue,
+                limit: None,
             })
             .unwrap();
 
@@ -3195,6 +3210,7 @@ mod tests {
                 visibility: StorageVisibility { read_txn_id: 2 },
                 filter: None,
                 projection: MvccProjection::ValueOnly,
+                limit: None,
             })
             .unwrap();
 
@@ -3214,6 +3230,7 @@ mod tests {
                 visibility: StorageVisibility { read_txn_id: 5 },
                 filter: Some(MvccReadFilter::ValueEquals("active".to_string())),
                 projection: MvccProjection::KeyOnly,
+                limit: None,
             })
             .unwrap();
 
@@ -3243,6 +3260,7 @@ mod tests {
                     MvccReadFilter::ValueEquals("locked".to_string()),
                 ])),
                 projection: MvccProjection::KeyValue,
+                limit: None,
             })
             .unwrap();
         assert_eq!(
@@ -3262,6 +3280,7 @@ mod tests {
                     MvccReadFilter::ValueEquals("active".to_string()),
                 ])),
                 projection: MvccProjection::KeyOnly,
+                limit: None,
             })
             .unwrap();
         assert_eq!(
@@ -3277,6 +3296,38 @@ mod tests {
                 },
                 MvccReadRow {
                     key: Some("user:1".to_string()),
+                    value: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn execute_mvcc_query_supports_limit_after_filtering() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=open").unwrap();
+        e.execute_text(2, "SET acct:2=locked").unwrap();
+        e.execute_text(3, "SET acct:3=locked").unwrap();
+
+        let limited = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FullScan,
+                visibility: StorageVisibility { read_txn_id: 3 },
+                filter: Some(MvccReadFilter::KeyPrefix("acct:".to_string())),
+                projection: MvccProjection::KeyOnly,
+                limit: Some(2),
+            })
+            .unwrap();
+
+        assert_eq!(
+            limited.rows,
+            vec![
+                MvccReadRow {
+                    key: Some("acct:1".to_string()),
+                    value: None,
+                },
+                MvccReadRow {
+                    key: Some("acct:2".to_string()),
                     value: None,
                 },
             ]

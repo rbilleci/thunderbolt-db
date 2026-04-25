@@ -30,6 +30,8 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
   - `MvccProjection::KeyValue`
   - `MvccProjection::KeyOnly`
   - `MvccProjection::ValueOnly`
+- Optional row cap:
+  - `limit: Some(n)` applies after visibility + filter stages
 - Current device strategy:
   - planned target: GPU default device
   - executed target: CPU reference semantics via `ScanOperator` → `FilterOperator` → `ProjectOperator`
@@ -37,7 +39,7 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
 - Deterministic workload fixture:
   - `tests/fixtures/mvcc-read-workload.txt`
 - Next obvious extension boundary:
-  - add richer predicate/operator shapes (range/order/limit or join-adjacent slices) while preserving the same engine-facing contract and explicit fallback accounting on the eventual GPU-backed path.
+  - add richer predicate/operator shapes (range/order or join-adjacent slices) while preserving the same engine-facing contract and explicit fallback accounting on the eventual GPU-backed path.
 
 ## Quickstart
 

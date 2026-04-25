@@ -316,6 +316,49 @@ where
     }
 }
 
+pub struct LimitOperator<Row, Child> {
+    child: Child,
+    remaining: usize,
+    initial_limit: usize,
+    _row: std::marker::PhantomData<Row>,
+}
+
+impl<Row, Child> LimitOperator<Row, Child> {
+    pub fn new(child: Child, limit: usize) -> Self {
+        Self {
+            child,
+            remaining: limit,
+            initial_limit: limit,
+            _row: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<Row, Child> Operator<Row> for LimitOperator<Row, Child>
+where
+    Child: Operator<Row>,
+{
+    fn open(&mut self) {
+        self.remaining = self.initial_limit;
+        self.child.open();
+    }
+
+    fn next(&mut self) -> Option<Row> {
+        if self.remaining == 0 {
+            return None;
+        }
+
+        let row = self.child.next()?;
+        self.remaining -= 1;
+        Some(row)
+    }
+
+    fn close(&mut self) {
+        self.remaining = 0;
+        self.child.close();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -476,14 +519,30 @@ mod tests {
     }
 
     #[test]
+    fn limit_operator_caps_child_rows() {
+        let scan = ScanOperator::new(vec![1_i32, 2_i32, 3_i32, 4_i32]);
+        let mut op = LimitOperator::new(scan, 2);
+
+        op.open();
+        assert_eq!(op.next(), Some(1));
+        assert_eq!(op.next(), Some(2));
+        assert_eq!(op.next(), None);
+
+        op.open();
+        assert_eq!(op.next(), Some(1));
+        op.close();
+        assert_eq!(op.next(), None);
+    }
+
+    #[test]
     fn scan_filter_project_pipeline_composes() {
         let scan = ScanOperator::new(vec![1_i32, 2_i32, 3_i32, 4_i32]);
         let filter = FilterOperator::new(scan, |row: &i32| row % 2 == 1);
-        let mut op = ProjectOperator::new(filter, |row| row * 10);
+        let limit = LimitOperator::new(filter, 1);
+        let mut op = ProjectOperator::new(limit, |row| row * 10);
 
         op.open();
         assert_eq!(op.next(), Some(10));
-        assert_eq!(op.next(), Some(30));
         assert_eq!(op.next(), None);
         op.close();
     }

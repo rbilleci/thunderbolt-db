@@ -12,6 +12,7 @@
 - Added deterministic regression workload fixture `tests/fixtures/mvcc-read-workload.txt` to seed future measurement/extension loops.
 - Replaced the temporary MVCC read `VecOperator` shim with explicit `ScanOperator` → `FilterOperator` → `ProjectOperator` execution stages, so the bootstrap vertical slice now flows through dedicated execution operators instead of one row-materialization helper.
 - Widened the MVCC read shape to support composite `All([...])` / `Any([...])` filters at the engine-facing query boundary, keeping the same explicit GPU-parity fallback contract while making the thin slice meaningfully more expressive.
+- Added `LimitOperator` plus `MvccReadQuery.limit`, so the MVCC vertical slice now supports deterministic post-filter row caps through the execution layer instead of open-coded truncation.
 - Started Q3 replication hardening with explicit follower-resume semantics: added `RecoveryState`, `RaftReplicator::recovery_state()`, and `RaftReplicator::resume_as_follower(...)` so interruption/restart behavior is defined in code instead of implied by tests.
 - Added replication regressions covering lagging follower apply delay, restart/resume with committed-but-unapplied backlog preserved, and rejection of non-contiguous recovery tails.
 - Tightened the recovery helper contract itself with `RecoveryState::validate()` and derived boundary helpers (`commit_index`, `next_index`, pending-apply count/boolean) so restart automation can reason about durable state without re-deriving commit/apply semantics out-of-band.
@@ -41,7 +42,7 @@
 - None in-repo.
 
 ### Next loops
-1. Extend Q2 with richer predicate/operator shapes (range/order/limit or join-adjacent slices) without weakening the explicit fallback contract.
+1. Extend Q2 with richer predicate/operator shapes (range/order or join-adjacent slices) without weakening the explicit fallback contract.
 2. Continue Q3 with stale/resume semantics under richer follower catch-up and snapshot-install stress, keeping status/telemetry alignment explicit.
 
 ## 2026-04-24
