@@ -4591,6 +4591,36 @@ mod tests {
             }
         );
 
+        let mut bind_named_portal_with_named_statement_empty_binary_payload = Vec::new();
+        bind_named_portal_with_named_statement_empty_binary_payload
+            .extend_from_slice("pörtal_pair\0stmt_pair\0".as_bytes());
+        bind_named_portal_with_named_statement_empty_binary_payload
+            .extend_from_slice(&1_i16.to_be_bytes());
+        bind_named_portal_with_named_statement_empty_binary_payload
+            .extend_from_slice(&1_i16.to_be_bytes());
+        bind_named_portal_with_named_statement_empty_binary_payload
+            .extend_from_slice(&1_i16.to_be_bytes());
+        bind_named_portal_with_named_statement_empty_binary_payload
+            .extend_from_slice(&0_i32.to_be_bytes());
+        bind_named_portal_with_named_statement_empty_binary_payload
+            .extend_from_slice(&1_i16.to_be_bytes());
+        bind_named_portal_with_named_statement_empty_binary_payload
+            .extend_from_slice(&1_i16.to_be_bytes());
+        let bind_named_portal_with_named_statement_empty_binary = frontend_frame(
+            b'B',
+            &bind_named_portal_with_named_statement_empty_binary_payload,
+        );
+        assert_eq!(
+            parse_frontend_message(&bind_named_portal_with_named_statement_empty_binary).unwrap(),
+            FrontendMessage::Bind {
+                portal_name: "pörtal_pair".to_string(),
+                statement_name: "stmt_pair".to_string(),
+                parameter_format_codes: vec![1],
+                parameters: vec![Some(Vec::new())],
+                result_format_codes: vec![1],
+            }
+        );
+
         let mut bind_with_zero_params_and_single_shared_format_payload = Vec::new();
         bind_with_zero_params_and_single_shared_format_payload
             .extend_from_slice(b"portal3\0stmt3\0");
