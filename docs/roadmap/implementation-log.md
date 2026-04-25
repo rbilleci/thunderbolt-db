@@ -438,6 +438,7 @@
 - Added `EngineTelemetrySnapshot::backlog_blocker_delimited_labels(delimiter)` plus interface docs, so text-oriented telemetry sinks can emit canonical blocker streams without rejoining labels themselves.
 - Added `EngineTelemetrySnapshot::total_backlog_items()` and `is_fully_caught_up()` so downstream sinks can distinguish mere WAL buffering from true backlog-free replication readiness without re-deriving the aggregate from raw counters.
 - Added `EngineTelemetrySnapshot::known_backlog_blocker_mask()` / `sanitize_backlog_blocker_mask(mask)` so snapshot consumers can forward-compatible-sanitize blocker masks without reaching back into engine internals.
+- Added `EngineTelemetrySnapshot::has_unknown_backlog_blockers()` / `unknown_backlog_blocker_count()` so sinks can distinguish forward-compatible unknown blocker bits from canonical readiness blockers without open-coded bit counting.
 - Added regression coverage proving telemetry snapshots ignore unknown backlog bits while still surfacing canonical blocker labels in deterministic order.
 
 ## 2026-03-30
