@@ -1169,6 +1169,41 @@ mod tests {
     }
 
     #[test]
+    fn raft_progress_snapshot_tracks_quorum_ack_commit_promotion() {
+        let mut r = RaftReplicator::new(3);
+        r.become_leader(3);
+
+        let t1 = r.propose(vec![10]).unwrap();
+        let t2 = r.propose(vec![20]).unwrap();
+
+        let before = r.progress();
+        assert_eq!(before.commit_index, 0);
+        assert_eq!(before.applied_index, 0);
+        assert_eq!(before.uncommitted_entry_count, 2);
+        assert!(before.has_uncommitted_entries);
+        assert_eq!(before.committed_but_unapplied_count, 0);
+        assert!(!before.has_committed_entries_pending_apply);
+
+        r.register_follower_ack(t2.index, 2);
+        let still_blocked = r.progress();
+        assert_eq!(still_blocked.commit_index, 0);
+        assert_eq!(still_blocked.uncommitted_entry_count, 2);
+        assert!(still_blocked.has_uncommitted_entries);
+
+        r.register_follower_ack(t1.index, 1);
+        let after = r.progress();
+        assert_eq!(after.commit_index, t2.index);
+        assert_eq!(after.applied_index, 0);
+        assert_eq!(after.uncommitted_entry_count, 0);
+        assert!(!after.has_uncommitted_entries);
+        assert_eq!(after.committed_but_unapplied_count, t2.index as usize);
+        assert!(after.has_committed_entries_pending_apply);
+        assert_eq!(after.apply_gap(), t2.index as usize);
+        assert!(!after.is_caught_up());
+        after.validate().unwrap();
+    }
+
+    #[test]
     fn raft_replicator_entry_state_helpers_track_committed_and_uncommitted_work() {
         let mut r = RaftReplicator::new(3);
         r.become_leader(3);
