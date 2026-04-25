@@ -32,6 +32,7 @@
 - Added replication regressions proving ignored ack traffic (off-leader or unknown-index acks) leaves `ReplicationProgress` unchanged, tightening Q3 ack-path observability stability.
 - Added replication regressions proving reserved self-acks and duplicate follower acks leave `ReplicationProgress` unchanged until quorum coverage really changes, tightening Q3 ack dedup semantics.
 - Added replication regressions proving ack-tracking pruning for committed entries does not create extra `ReplicationProgress` transitions beyond the actual commit promotion, tightening Q3 bookkeeping-vs-observability boundaries.
+- Added replication regressions proving `wait_committed(...)` polling leaves `ReplicationProgress` unchanged both before quorum and after resolution, tightening Q3 commit-observation semantics.
 - Updated replication interface docs and runbooks to document current guarantees and explicit non-guarantees around ordering, apply progression, and restart behavior.
 
 ### Current blockers

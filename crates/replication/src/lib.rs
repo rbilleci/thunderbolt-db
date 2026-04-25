@@ -2002,6 +2002,28 @@ mod tests {
     }
 
     #[test]
+    fn raft_progress_snapshot_is_stable_across_wait_committed_polling() {
+        let mut r = RaftReplicator::new(3);
+        r.become_leader(2);
+
+        let token = r.propose(vec![1]).unwrap();
+        let before_pending = r.progress();
+        let pending = r.wait_committed(token, std::time::Duration::from_millis(1));
+        assert!(matches!(pending, Err(EngineError::ProposalFailed(_))));
+        let after_pending = r.progress();
+        assert_eq!(after_pending, before_pending);
+
+        r.register_follower_ack(token.index, 1);
+        let before_resolved = r.progress();
+        let committed = r
+            .wait_committed(token, std::time::Duration::from_millis(1))
+            .unwrap();
+        assert_eq!(committed, token.index);
+        let after_resolved = r.progress();
+        assert_eq!(after_resolved, before_resolved);
+    }
+
+    #[test]
     fn raft_install_snapshot_prunes_ack_tracking_and_uncompacted_entries() {
         let mut r = RaftReplicator::new(3);
         r.become_leader(4);
