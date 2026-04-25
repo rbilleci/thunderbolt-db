@@ -311,6 +311,22 @@ impl ReplicationWatermarks {
             .collect::<Vec<_>>()
             .join(delimiter)
     }
+
+    pub fn max_replication_gap(&self) -> Index {
+        self.commit_apply_gap.max(self.apply_visible_gap)
+    }
+
+    pub fn total_backlog_items(&self) -> usize {
+        self.wal_unflushed_count + self.pending_batch_len + self.active_txn_count
+    }
+
+    pub fn is_fully_caught_up(&self) -> bool {
+        !self.has_wal_backlog
+            && !self.has_pending_batch_backlog
+            && !self.has_active_txn_backlog
+            && !self.has_commit_apply_gap
+            && !self.has_apply_visible_gap
+    }
 }
 
 fn percent_decode_lossy(input: &str) -> String {
@@ -2536,6 +2552,9 @@ mod tests {
                 ReplicationWatermarks::BACKLOG_BLOCKER_ACTIVE_TXN
             ]
         );
+        assert_eq!(marks.max_replication_gap(), 0);
+        assert_eq!(marks.total_backlog_items(), 2);
+        assert!(!marks.is_fully_caught_up());
         assert!(!marks.quiescent_for_failover);
         assert!(!marks.follower_promotion_ready);
     }
@@ -2565,6 +2584,9 @@ mod tests {
 
         let marks = e.replication_watermarks();
         assert_eq!(marks.term, 3);
+        assert_eq!(marks.max_replication_gap(), 0);
+        assert_eq!(marks.total_backlog_items(), 0);
+        assert!(marks.is_fully_caught_up());
         assert_eq!(marks.commit_index, 7);
         assert_eq!(marks.applied_index, 7);
         assert_eq!(marks.visible_index, 7);
