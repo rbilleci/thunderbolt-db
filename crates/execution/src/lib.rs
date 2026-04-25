@@ -129,6 +129,45 @@ impl Operator for CpuNoop {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct VecOperator {
+    rows: Vec<Vec<u8>>,
+    next_index: usize,
+}
+
+impl VecOperator {
+    pub fn new(rows: Vec<Vec<u8>>) -> Self {
+        Self {
+            rows,
+            next_index: 0,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+}
+
+impl Operator for VecOperator {
+    fn open(&mut self) {
+        self.next_index = 0;
+    }
+
+    fn next(&mut self) -> Option<Vec<u8>> {
+        let row = self.rows.get(self.next_index)?.clone();
+        self.next_index += 1;
+        Some(row)
+    }
+
+    fn close(&mut self) {
+        self.next_index = self.rows.len();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,5 +240,30 @@ mod tests {
                 reason: GpuFallbackReason::QueueSaturated,
             }
         );
+    }
+
+    #[test]
+    fn vec_operator_yields_rows_in_order() {
+        let mut op = VecOperator::new(vec![b"row-1".to_vec(), b"row-2".to_vec()]);
+
+        assert_eq!(op.len(), 2);
+        assert!(!op.is_empty());
+        assert_eq!(op.next(), Some(b"row-1".to_vec()));
+        assert_eq!(op.next(), Some(b"row-2".to_vec()));
+        assert_eq!(op.next(), None);
+    }
+
+    #[test]
+    fn vec_operator_open_rewinds_and_close_exhausts() {
+        let mut op = VecOperator::new(vec![b"row-1".to_vec()]);
+
+        assert_eq!(op.next(), Some(b"row-1".to_vec()));
+        assert_eq!(op.next(), None);
+
+        op.open();
+        assert_eq!(op.next(), Some(b"row-1".to_vec()));
+
+        op.close();
+        assert_eq!(op.next(), None);
     }
 }
