@@ -4880,6 +4880,27 @@ mod tests {
             }
         );
 
+        let mut bind_unnamed_with_empty_text_parameter_payload = Vec::new();
+        bind_unnamed_with_empty_text_parameter_payload.extend_from_slice(b"\0\0");
+        bind_unnamed_with_empty_text_parameter_payload.extend_from_slice(&1_i16.to_be_bytes());
+        bind_unnamed_with_empty_text_parameter_payload.extend_from_slice(&0_i16.to_be_bytes());
+        bind_unnamed_with_empty_text_parameter_payload.extend_from_slice(&1_i16.to_be_bytes());
+        bind_unnamed_with_empty_text_parameter_payload.extend_from_slice(&0_i32.to_be_bytes());
+        bind_unnamed_with_empty_text_parameter_payload.extend_from_slice(&1_i16.to_be_bytes());
+        bind_unnamed_with_empty_text_parameter_payload.extend_from_slice(&0_i16.to_be_bytes());
+        let bind_unnamed_with_empty_text_parameter =
+            frontend_frame(b'B', &bind_unnamed_with_empty_text_parameter_payload);
+        assert_eq!(
+            parse_frontend_message(&bind_unnamed_with_empty_text_parameter).unwrap(),
+            FrontendMessage::Bind {
+                portal_name: String::new(),
+                statement_name: String::new(),
+                parameter_format_codes: vec![0],
+                parameters: vec![Some(Vec::new())],
+                result_format_codes: vec![0],
+            }
+        );
+
         let mut bind_with_zero_params_and_single_shared_format_payload = Vec::new();
         bind_with_zero_params_and_single_shared_format_payload
             .extend_from_slice(b"portal3\0stmt3\0");
