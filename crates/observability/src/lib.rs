@@ -140,6 +140,19 @@ impl EngineTelemetrySnapshot {
             .saturating_sub(self.pending_batch_len)
     }
 
+    pub fn pending_batch_utilization_permyriad(&self) -> u16 {
+        if self.pending_batch_cap == 0 {
+            return 0;
+        }
+        let len = self.pending_batch_len.min(self.pending_batch_cap) as u128;
+        let cap = self.pending_batch_cap as u128;
+        ((len * 10_000) / cap) as u16
+    }
+
+    pub fn pending_batch_remaining_capacity_permyriad(&self) -> u16 {
+        10_000_u16.saturating_sub(self.pending_batch_utilization_permyriad())
+    }
+
     pub fn has_buffered_wal(&self) -> bool {
         self.wal_buffered_count > 0
     }
@@ -317,6 +330,11 @@ mod tests {
         assert_eq!(snapshot.wal_last_durable_txn_id, Some(42));
         assert!(snapshot.has_buffered_wal());
         assert_eq!(snapshot.pending_batch_remaining_capacity(), 64);
+        assert_eq!(snapshot.pending_batch_utilization_permyriad(), 0);
+        assert_eq!(
+            snapshot.pending_batch_remaining_capacity_permyriad(),
+            10_000
+        );
         assert_eq!(snapshot.total_backlog_items(), 0);
         assert!(snapshot.is_write_path_quiescent());
         assert!(snapshot.is_fully_caught_up());
@@ -346,6 +364,8 @@ mod tests {
         );
         assert!(!snapshot.has_buffered_wal());
         assert_eq!(snapshot.pending_batch_remaining_capacity(), 59);
+        assert_eq!(snapshot.pending_batch_utilization_permyriad(), 781);
+        assert_eq!(snapshot.pending_batch_remaining_capacity_permyriad(), 9_219);
         assert_eq!(snapshot.total_backlog_items(), 8);
         assert!(!snapshot.is_write_path_quiescent());
         assert!(!snapshot.is_fully_caught_up());
@@ -375,6 +395,11 @@ mod tests {
         assert_eq!(
             snapshot.backlog_blocker_delimited_labels(";"),
             "wal;apply_visible_gap"
+        );
+        assert_eq!(snapshot.pending_batch_utilization_permyriad(), 0);
+        assert_eq!(
+            snapshot.pending_batch_remaining_capacity_permyriad(),
+            10_000
         );
         assert!(!snapshot.is_fully_caught_up());
     }
