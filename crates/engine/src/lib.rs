@@ -4,7 +4,9 @@ use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use gpu_db_batching::{BatchItem, DualTriggerBatcher, FlushReason};
-use gpu_db_execution::{DeviceRouter, MockGpuRuntime, RouteDecision};
+use gpu_db_execution::{
+    DeviceRouter, DeviceTarget, MockGpuRuntime, Operator, RouteDecision, VecOperator,
+};
 use gpu_db_metrics::{BatchFlushReason, FallbackReason, RuntimeMetrics};
 use gpu_db_observability::{
     ActiveFallbackReason, EngineStatusSnapshot, EngineTelemetrySnapshot, FallbackStatus,
@@ -13,6 +15,9 @@ use gpu_db_observability::{
 use gpu_db_planner::{ExecutionPlan, Planner, PlannerConfig};
 use gpu_db_protocol::{parse_command, Command, ParseError};
 use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine};
+use gpu_db_storage::{
+    InMemoryTupleStore, NewTuple, StorageError, TupleStore, Visibility as StorageVisibility,
+};
 use gpu_db_txn::{TxnError, TxnManager};
 use gpu_db_types::{CommitToken, EngineError, Index, LogEntry, Role, SnapshotMeta, Term, TxnId};
 use gpu_db_wal::{WalBuffer, WalRecord};
@@ -56,6 +61,8 @@ pub enum ExecuteError {
     Engine(#[from] EngineError),
     #[error(transparent)]
     Txn(#[from] TxnError),
+    #[error(transparent)]
+    Storage(#[from] StorageError),
     #[error("command is not readable via execute_read_text: {0}")]
     NonReadCommand(&'static str),
 }
@@ -64,6 +71,68 @@ pub enum ExecuteError {
 struct PendingMutation {
     txn_id: u64,
     payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MvccReadSource {
+    FullScan,
+    KeyLookup { key: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MvccReadFilter {
+    KeyPrefix(String),
+    ValueEquals(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MvccProjection {
+    KeyValue,
+    KeyOnly,
+    ValueOnly,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MvccReadQuery {
+    pub source: MvccReadSource,
+    pub visibility: StorageVisibility,
+    pub filter: Option<MvccReadFilter>,
+    pub projection: MvccProjection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MvccReadRow {
+    pub key: Option<String>,
+    pub value: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MvccReadResult {
+    pub planned_target: DeviceTarget,
+    pub executed_target: DeviceTarget,
+    pub fallback_reason: Option<FallbackReason>,
+    pub rows: Vec<MvccReadRow>,
+}
+
+fn decode_mvcc_row(bytes: &[u8], projection: MvccProjection) -> MvccReadRow {
+    let text = String::from_utf8_lossy(bytes).into_owned();
+    match projection {
+        MvccProjection::KeyValue => {
+            let mut parts = text.splitn(2, '\t');
+            MvccReadRow {
+                key: parts.next().map(str::to_owned),
+                value: parts.next().map(str::to_owned),
+            }
+        }
+        MvccProjection::KeyOnly => MvccReadRow {
+            key: Some(text),
+            value: None,
+        },
+        MvccProjection::ValueOnly => MvccReadRow {
+            key: None,
+            value: Some(text),
+        },
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -367,6 +436,8 @@ pub struct Engine {
     repl: LocalReplicator,
     wal: WalBuffer,
     sm: KvStateMachine,
+    mvcc_store: InMemoryTupleStore,
+    txn_ids_by_index: BTreeMap<Index, TxnId>,
     txn_manager: TxnManager,
     visible_up_to: Index,
     metrics: RuntimeMetrics,
@@ -385,6 +456,8 @@ impl Engine {
             repl: LocalReplicator::leader(),
             wal: WalBuffer::default(),
             sm: KvStateMachine::default(),
+            mvcc_store: InMemoryTupleStore::new(),
+            txn_ids_by_index: BTreeMap::new(),
             txn_manager: TxnManager::default(),
             visible_up_to: 0,
             metrics: RuntimeMetrics::default(),
@@ -473,6 +546,7 @@ impl Engine {
         }
 
         self.repl.wait_committed(token, Duration::from_millis(0))?;
+        self.txn_ids_by_index.insert(token.index, txn_id);
 
         let to_apply: Vec<LogEntry> = self
             .repl
@@ -482,6 +556,7 @@ impl Engine {
 
         for e in &to_apply {
             self.sm.apply(e)?;
+            self.apply_mvcc_entry(e)?;
             self.repl.mark_applied(e.index);
         }
 
@@ -489,6 +564,56 @@ impl Engine {
         self.metrics.inc_commit();
 
         Ok(token)
+    }
+
+    fn apply_mvcc_entry(&mut self, entry: &LogEntry) -> Result<(), EngineError> {
+        let Ok(text) = std::str::from_utf8(&entry.payload) else {
+            return Ok(());
+        };
+        let Ok(cmd) = parse_command(text) else {
+            return Ok(());
+        };
+
+        let txn_id = self
+            .txn_ids_by_index
+            .get(&entry.index)
+            .copied()
+            .unwrap_or(entry.index);
+        let visibility = StorageVisibility {
+            read_txn_id: txn_id,
+        };
+
+        match cmd {
+            Command::SetKv { key, value } => {
+                if let Some(tuple) = self
+                    .mvcc_store
+                    .tuple_fetch_by_key(&key, visibility)
+                    .map_err(|err| EngineError::ApplyFailed(err.to_string()))?
+                {
+                    self.mvcc_store
+                        .tuple_update(tuple.tuple_id, value, txn_id)
+                        .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+                } else {
+                    self.mvcc_store
+                        .tuple_insert(NewTuple { key, value }, txn_id)
+                        .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+                }
+            }
+            Command::DeleteKv { key } => {
+                if let Some(tuple) = self
+                    .mvcc_store
+                    .tuple_fetch_by_key(&key, visibility)
+                    .map_err(|err| EngineError::ApplyFailed(err.to_string()))?
+                {
+                    self.mvcc_store
+                        .tuple_delete(tuple.tuple_id, txn_id)
+                        .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+                }
+            }
+            _ => {}
+        }
+
+        Ok(())
     }
 
     pub fn enqueue_set_text(
@@ -732,6 +857,74 @@ impl Engine {
             Command::SetKv { .. } => Err(ExecuteError::NonReadCommand("SET")),
             Command::DeleteKv { .. } => Err(ExecuteError::NonReadCommand("DEL/DELETE")),
         }
+    }
+
+    pub fn execute_mvcc_query(
+        &mut self,
+        query: &MvccReadQuery,
+    ) -> Result<MvccReadResult, ExecuteError> {
+        if self.repl.role() != Role::Leader {
+            return Err(ExecuteError::Engine(EngineError::NotLeader));
+        }
+
+        let planned_target = DeviceTarget::Gpu(self.planner.default_gpu_id());
+        let executed_target = DeviceTarget::Cpu;
+        let fallback_reason = Some(FallbackReason::GpuMvccReadParityGap);
+        self.metrics
+            .inc_fallback(FallbackReason::GpuMvccReadParityGap);
+
+        let mut rows = match &query.source {
+            MvccReadSource::FullScan => {
+                let mut cursor = self.mvcc_store.seq_scan_open(query.visibility)?;
+                let mut rows = Vec::new();
+                while let Some(tuple) = cursor.next() {
+                    rows.push(tuple);
+                }
+                rows
+            }
+            MvccReadSource::KeyLookup { key } => self
+                .mvcc_store
+                .tuple_fetch_by_key(key, query.visibility)?
+                .into_iter()
+                .collect(),
+        };
+
+        if let Some(filter) = &query.filter {
+            rows.retain(|row| match filter {
+                MvccReadFilter::KeyPrefix(prefix) => row.key.starts_with(prefix),
+                MvccReadFilter::ValueEquals(expected) => row.value == *expected,
+            });
+        }
+
+        let encoded_rows: Vec<Vec<u8>> = rows
+            .into_iter()
+            .map(|row| match query.projection {
+                MvccProjection::KeyValue => format!("{}\t{}", row.key, row.value),
+                MvccProjection::KeyOnly => row.key,
+                MvccProjection::ValueOnly => row.value,
+            })
+            .map(String::into_bytes)
+            .collect();
+
+        let total_d2h_bytes: u64 = encoded_rows.iter().map(|row| row.len() as u64).sum();
+        if total_d2h_bytes > 0 {
+            self.metrics.observe_d2h_bytes(total_d2h_bytes);
+        }
+
+        let mut operator = VecOperator::new(encoded_rows);
+        operator.open();
+        let mut projected = Vec::new();
+        while let Some(row) = operator.next() {
+            projected.push(decode_mvcc_row(&row, query.projection));
+        }
+        operator.close();
+
+        Ok(MvccReadResult {
+            planned_target,
+            executed_target,
+            fallback_reason,
+            rows: projected,
+        })
     }
 
     pub fn visible_up_to(&self) -> Index {
@@ -2906,6 +3099,98 @@ mod tests {
             ]
         );
         status.validate().unwrap();
+    }
+
+    #[test]
+    fn execute_mvcc_query_runs_visibility_filtered_scan_through_execution_layer() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=open").unwrap();
+        e.execute_text(2, "SET acct:2=pending").unwrap();
+        e.execute_text(3, "SET acct:1=closed").unwrap();
+        e.execute_text(4, "DELETE acct:2").unwrap();
+
+        let result = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FullScan,
+                visibility: StorageVisibility { read_txn_id: 3 },
+                filter: Some(MvccReadFilter::KeyPrefix("acct:".to_string())),
+                projection: MvccProjection::KeyValue,
+            })
+            .unwrap();
+
+        assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.executed_target, DeviceTarget::Cpu);
+        assert_eq!(
+            result.fallback_reason,
+            Some(FallbackReason::GpuMvccReadParityGap)
+        );
+        assert_eq!(
+            result.rows,
+            vec![
+                MvccReadRow {
+                    key: Some("acct:1".to_string()),
+                    value: Some("closed".to_string()),
+                },
+                MvccReadRow {
+                    key: Some("acct:2".to_string()),
+                    value: Some("pending".to_string()),
+                },
+            ]
+        );
+        assert_eq!(
+            e.metrics()
+                .fallback_for(FallbackReason::GpuMvccReadParityGap),
+            1
+        );
+    }
+
+    #[test]
+    fn execute_mvcc_query_replays_deterministic_workload_fixture_for_point_lookup() {
+        let mut e = Engine::new_local();
+        for (txn_id, command) in include_str!("../../../tests/fixtures/mvcc-read-workload.txt")
+            .lines()
+            .enumerate()
+        {
+            e.execute_text((txn_id + 1) as u64, command).unwrap();
+        }
+
+        let historical = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::KeyLookup {
+                    key: "acct:1".to_string(),
+                },
+                visibility: StorageVisibility { read_txn_id: 2 },
+                filter: None,
+                projection: MvccProjection::ValueOnly,
+            })
+            .unwrap();
+
+        assert_eq!(
+            historical.rows,
+            vec![MvccReadRow {
+                key: None,
+                value: Some("open".to_string()),
+            }]
+        );
+
+        let current = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::KeyLookup {
+                    key: "user:1".to_string(),
+                },
+                visibility: StorageVisibility { read_txn_id: 5 },
+                filter: Some(MvccReadFilter::ValueEquals("active".to_string())),
+                projection: MvccProjection::KeyOnly,
+            })
+            .unwrap();
+
+        assert_eq!(
+            current.rows,
+            vec![MvccReadRow {
+                key: Some("user:1".to_string()),
+                value: None,
+            }]
+        );
     }
 
     #[test]

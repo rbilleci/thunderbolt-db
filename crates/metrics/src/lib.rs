@@ -5,6 +5,7 @@ use gpu_db_execution::GpuFallbackReason;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum FallbackReason {
     NotGpuEligible,
+    GpuMvccReadParityGap,
     GpuUnavailable,
     GpuQueueSaturated,
     GpuMemoryPressure,
@@ -31,6 +32,11 @@ impl FallbackReason {
     pub fn gpu_parity_issue(self) -> Option<GpuParityIssue> {
         match self {
             Self::NotGpuEligible => None,
+            Self::GpuMvccReadParityGap => Some(GpuParityIssue {
+                id: "GPU-123",
+                owner: "execution",
+                milestone: "m0-bootstrap",
+            }),
             Self::GpuUnavailable => Some(GpuParityIssue {
                 id: "GPU-120",
                 owner: "runtime",

@@ -9,8 +9,33 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
 - WAL durability + queue watermarks (flushed, buffered, unflushed, pending depth/capacity, pending age/deadline), commit/apply/visibility lag gauges, explicit backlog/gap blocker flags, active transaction depth, and failover/admission readiness flags (`quiescent_for_failover`, `follower_promotion_ready`, `mutation_admission_saturated`)
 - Engine truth surface via `Engine::status_snapshot()` for served snapshot identity/frontier, active fallback reasons + parity rollups, and replication/readiness health
 - Engine telemetry snapshot + sink publication API for replication lag, durable WAL/snapshot frontier, write-path readiness/backlog state, and runtime metrics
+- Thin MVCC execution slice via `Engine::execute_mvcc_query()` covering snapshot-bound full scan / key lookup, optional key-prefix or value-equality filtering, and key/value projection through the execution layer with explicit CPU fallback parity tracking (`GPU-123`)
 - CPU-first reference engine skeleton
 - Device-aware execution abstractions
+
+## MVCC vertical slice (current bootstrap shape)
+
+- Engine entry point: `Engine::execute_mvcc_query(&MvccReadQuery)`
+- Supported sources:
+  - `MvccReadSource::FullScan`
+  - `MvccReadSource::KeyLookup { key }`
+- Supported snapshot rule:
+  - `visibility.read_txn_id` selects the MVCC snapshot frontier
+- Supported filters:
+  - `MvccReadFilter::KeyPrefix(prefix)`
+  - `MvccReadFilter::ValueEquals(value)`
+- Supported projections:
+  - `MvccProjection::KeyValue`
+  - `MvccProjection::KeyOnly`
+  - `MvccProjection::ValueOnly`
+- Current device strategy:
+  - planned target: GPU default device
+  - executed target: CPU reference semantics via `VecOperator`
+  - fallback reason: `FallbackReason::GpuMvccReadParityGap` (`GPU-123`)
+- Deterministic workload fixture:
+  - `tests/fixtures/mvcc-read-workload.txt`
+- Next obvious extension boundary:
+  - replace the `VecOperator` row-materialization shim with real scan/filter/project operators and route eligible reads to a GPU-backed implementation while preserving the same engine-facing contract.
 
 ## Quickstart
 

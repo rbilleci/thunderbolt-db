@@ -45,6 +45,10 @@ impl Planner {
         Self { cfg }
     }
 
+    pub fn default_gpu_id(&self) -> u16 {
+        self.cfg.default_gpu_id
+    }
+
     pub fn plan_command(&self, command: &Command) -> ExecutionPlan {
         let node = match command {
             Command::SetKv { .. } | Command::DeleteKv { .. } => PlanNode {

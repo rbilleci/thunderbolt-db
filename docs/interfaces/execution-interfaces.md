@@ -14,3 +14,24 @@ Each physical plan node must include:
 - `enqueue(txn)`
 - `flush(reason=count|time|admin)`
 - `dispatch(batch) -> batch_id`
+
+## Bootstrap MVCC read slice
+
+- Engine-facing entry point: `Engine::execute_mvcc_query(&MvccReadQuery)`
+- Supported sources:
+  - `FullScan`
+  - `KeyLookup { key }`
+- Snapshot binding:
+  - `MvccReadQuery.visibility.read_txn_id` chooses the MVCC snapshot used by storage visibility checks
+- Filter layer:
+  - `KeyPrefix(prefix)`
+  - `ValueEquals(value)`
+- Projection layer:
+  - `KeyValue`
+  - `KeyOnly`
+  - `ValueOnly`
+- Current execution/device contract:
+  - planned target = `gpu(default_gpu_id)`
+  - executed target = `cpu`
+  - fallback reason = `GpuMvccReadParityGap` (`GPU-123`, owner=`execution`, milestone=`m0-bootstrap`)
+  - CPU path materializes rows through `VecOperator` as the reference semantics for the slice

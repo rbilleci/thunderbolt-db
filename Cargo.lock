@@ -20,6 +20,7 @@ dependencies = [
  "gpu_db_planner",
  "gpu_db_protocol",
  "gpu_db_replication",
+ "gpu_db_storage",
  "gpu_db_txn",
  "gpu_db_types",
  "gpu_db_wal",
