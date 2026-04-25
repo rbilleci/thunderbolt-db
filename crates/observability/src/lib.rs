@@ -28,6 +28,17 @@ impl EngineTelemetrySnapshot {
     pub fn has_gpu_parity_fallbacks(&self) -> bool {
         !self.gpu_parity_fallbacks.is_empty()
     }
+
+    pub fn gpu_parity_fallback_count_for(&self, issue: &GpuParityIssue) -> u64 {
+        self.gpu_parity_fallbacks.get(issue).copied().unwrap_or(0)
+    }
+
+    pub fn hottest_gpu_parity_fallback(&self) -> Option<(GpuParityIssue, u64)> {
+        self.gpu_parity_fallbacks
+            .iter()
+            .max_by_key(|(issue, count)| (*count, *issue))
+            .map(|(issue, count)| (*issue, *count))
+    }
 }
 
 pub trait TelemetrySink {
@@ -55,8 +66,7 @@ impl TelemetrySink for InMemoryTelemetrySink {
 mod tests {
     use super::*;
 
-    #[test]
-    fn in_memory_sink_records_snapshots_in_order() {
+    fn empty_snapshot() -> EngineTelemetrySnapshot {
         let metrics = RuntimeMetricsSnapshot {
             commits_total: 2,
             batch_flush_count: 1,
@@ -79,7 +89,7 @@ mod tests {
             last_kernel_occupancy_permyriad: Some(8_500),
             last_pending_batch_len: Some(0),
         };
-        let snapshot = EngineTelemetrySnapshot {
+        EngineTelemetrySnapshot {
             role: Role::Leader,
             replication_lag: ReplicationLagSnapshot {
                 commit_index: 12,
@@ -90,7 +100,12 @@ mod tests {
             },
             runtime_metrics: metrics,
             gpu_parity_fallbacks: BTreeMap::new(),
-        };
+        }
+    }
+
+    #[test]
+    fn in_memory_sink_records_snapshots_in_order() {
+        let snapshot = empty_snapshot();
 
         let mut sink = InMemoryTelemetrySink::default();
         sink.publish(&snapshot);
@@ -100,5 +115,28 @@ mod tests {
         assert_eq!(sink.snapshots()[0], sink.snapshots()[1]);
         assert_eq!(sink.snapshots()[0].gpu_parity_fallback_total(), 0);
         assert!(!sink.snapshots()[0].has_gpu_parity_fallbacks());
+    }
+
+    #[test]
+    fn parity_fallback_helpers_report_counts_and_hottest_issue() {
+        let mut snapshot = empty_snapshot();
+        let issue_120 = GpuParityIssue {
+            id: "GPU-120",
+            owner: "runtime",
+            milestone: "m0-bootstrap",
+        };
+        let issue_121 = GpuParityIssue {
+            id: "GPU-121",
+            owner: "runtime",
+            milestone: "m0-bootstrap",
+        };
+        snapshot.gpu_parity_fallbacks.insert(issue_120, 2);
+        snapshot.gpu_parity_fallbacks.insert(issue_121, 3);
+
+        assert!(snapshot.has_gpu_parity_fallbacks());
+        assert_eq!(snapshot.gpu_parity_fallback_total(), 5);
+        assert_eq!(snapshot.gpu_parity_fallback_count_for(&issue_120), 2);
+        assert_eq!(snapshot.gpu_parity_fallback_count_for(&issue_121), 3);
+        assert_eq!(snapshot.hottest_gpu_parity_fallback(), Some((issue_121, 3)));
     }
 }
