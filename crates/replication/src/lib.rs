@@ -1059,6 +1059,20 @@ mod tests {
     }
 
     #[test]
+    fn local_progress_snapshot_clamps_apply_frontier_to_commit_boundary() {
+        let mut r = LocalReplicator::leader();
+        let t1 = r.propose(vec![1]).unwrap();
+
+        r.mark_applied(t1.index + 10);
+
+        let progress = r.progress();
+        assert_eq!(progress.commit_index, t1.index);
+        assert_eq!(progress.applied_index, t1.index);
+        assert_eq!(progress.apply_gap(), 0);
+        assert!(progress.is_caught_up());
+    }
+
+    #[test]
     fn local_replicator_pending_apply_helpers_track_committed_tail() {
         let mut r = LocalReplicator::leader();
         let t1 = r.propose(vec![1]).unwrap();
@@ -1230,6 +1244,26 @@ mod tests {
         assert_eq!(follower.applied_index(), t2.index);
         assert!(!follower.has_committed_entries_pending_apply());
         assert_eq!(follower.committed_but_unapplied_count(), 0);
+    }
+
+    #[test]
+    fn raft_progress_snapshot_clamps_apply_frontier_to_commit_boundary() {
+        let mut r = RaftReplicator::new(3);
+        r.become_leader(3);
+        let t1 = r.propose(vec![10]).unwrap();
+        let t2 = r.propose(vec![20]).unwrap();
+        r.register_follower_ack(t1.index, 1);
+
+        r.mark_applied(t2.index + 10);
+
+        let progress = r.progress();
+        assert_eq!(progress.commit_index, t1.index);
+        assert_eq!(progress.applied_index, t1.index);
+        assert_eq!(progress.uncommitted_entry_count, 1);
+        assert!(progress.has_uncommitted_entries);
+        assert_eq!(progress.apply_gap(), 0);
+        assert!(!progress.is_caught_up());
+        progress.validate().unwrap();
     }
 
     #[test]

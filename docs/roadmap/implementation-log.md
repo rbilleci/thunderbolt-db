@@ -23,6 +23,7 @@
 - Added replication regressions proving accepted appends at the snapshot boundary advance `ReplicationProgress` monotonically and idempotently across append/apply/replay, tightening Q3 compacted-boundary happy-path semantics.
 - Added replication regressions proving empty heartbeats can advance durable commit progress while `ReplicationProgress` correctly converts uncommitted tail into commit/apply lag, tightening Q3 catch-up semantics for no-op append rounds.
 - Added recovery regressions proving snapshot-only restart bundles project to the same caught-up follower progress surface as a live resumed node, tightening Q3 resume semantics at pure snapshot boundaries.
+- Added local/raft regressions proving overshoot `mark_applied(...)` requests clamp at the committed boundary while leaving `ReplicationProgress` valid and explicit about any remaining uncommitted tail, tightening Q3 apply-frontier semantics.
 - Updated replication interface docs and runbooks to document current guarantees and explicit non-guarantees around ordering, apply progression, and restart behavior.
 
 ### Current blockers
