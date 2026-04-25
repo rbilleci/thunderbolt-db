@@ -76,6 +76,15 @@ pub trait TupleStore {
     ) -> Result<bool, StorageError> {
         Ok(self.tuple_fetch_by_key(key, visibility)?.is_some())
     }
+
+    fn visible_tuple_count(&self, visibility: Visibility) -> Result<usize, StorageError> {
+        let mut cursor = self.seq_scan_open(visibility)?;
+        let mut count = 0;
+        while cursor.next().is_some() {
+            count += 1;
+        }
+        Ok(count)
+    }
 }
 
 pub trait SeqScanCursor {
@@ -358,6 +367,7 @@ mod tests {
         assert!(!store
             .key_exists_at_visibility("missing", visibility)
             .unwrap());
+        assert_eq!(store.visible_tuple_count(visibility).unwrap(), 0);
     }
 
     #[test]
@@ -553,5 +563,17 @@ mod tests {
         assert!(!store
             .key_exists_at_visibility("acct:2", Visibility { read_txn_id: 3 })
             .unwrap());
+        assert_eq!(
+            store
+                .visible_tuple_count(Visibility { read_txn_id: 2 })
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .visible_tuple_count(Visibility { read_txn_id: 3 })
+                .unwrap(),
+            1
+        );
     }
 }
