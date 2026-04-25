@@ -34,6 +34,9 @@
   - pending-apply count/flag consistency
   - uncommitted count/flag consistency
   - snapshot boundary not ahead of applied frontier
+- Convenience helpers:
+  - `apply_gap()`
+  - `is_caught_up()`
 
 Resume guarantees:
 

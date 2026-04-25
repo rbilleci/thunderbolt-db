@@ -62,6 +62,14 @@ pub enum ReplicationProgressInvariantError {
 }
 
 impl ReplicationProgress {
+    pub fn apply_gap(&self) -> usize {
+        self.commit_index.saturating_sub(self.applied_index) as usize
+    }
+
+    pub fn is_caught_up(&self) -> bool {
+        self.apply_gap() == 0 && !self.has_uncommitted_entries
+    }
+
     pub fn validate(&self) -> Result<(), ReplicationProgressInvariantError> {
         if self.applied_index > self.commit_index {
             return Err(ReplicationProgressInvariantError::AppliedExceedsCommit {
@@ -76,7 +84,7 @@ impl ReplicationProgress {
             });
         }
 
-        let expected_pending = self.commit_index.saturating_sub(self.applied_index) as usize;
+        let expected_pending = self.apply_gap();
         if self.committed_but_unapplied_count != expected_pending {
             return Err(
                 ReplicationProgressInvariantError::PendingApplyCountMismatch {
@@ -1058,6 +1066,8 @@ mod tests {
         assert!(progress.has_committed_entries_pending_apply);
         assert_eq!(progress.uncommitted_entry_count, 0);
         assert!(!progress.has_uncommitted_entries);
+        assert_eq!(progress.apply_gap(), 1);
+        assert!(!progress.is_caught_up());
         progress.validate().unwrap();
     }
 
@@ -1236,6 +1246,8 @@ mod tests {
         assert!(progress.has_committed_entries_pending_apply);
         assert_eq!(progress.uncommitted_entry_count, 1);
         assert!(progress.has_uncommitted_entries);
+        assert_eq!(progress.apply_gap(), 1);
+        assert!(!progress.is_caught_up());
         progress.validate().unwrap();
     }
 
@@ -1272,7 +1284,26 @@ mod tests {
         assert!(progress.has_committed_entries_pending_apply);
         assert_eq!(progress.uncommitted_entry_count, 0);
         assert!(!progress.has_uncommitted_entries);
+        assert_eq!(progress.apply_gap(), 1);
+        assert!(!progress.is_caught_up());
         progress.validate().unwrap();
+    }
+
+    #[test]
+    fn replication_progress_reports_caught_up_only_when_apply_and_tail_are_clear() {
+        let mut r = RaftReplicator::new(3);
+        r.become_leader(5);
+        let t1 = r.propose(vec![1]).unwrap();
+        r.register_follower_ack(t1.index, 1);
+
+        let before_apply = r.progress();
+        assert_eq!(before_apply.apply_gap(), 1);
+        assert!(!before_apply.is_caught_up());
+
+        r.mark_applied(t1.index);
+        let after_apply = r.progress();
+        assert_eq!(after_apply.apply_gap(), 0);
+        assert!(after_apply.is_caught_up());
     }
 
     #[test]
