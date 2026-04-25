@@ -59,6 +59,23 @@ pub trait TupleStore {
         key: &str,
         visibility: Visibility,
     ) -> Result<Box<dyn IndexScanCursor + '_>, StorageError>;
+
+    fn tuple_fetch_by_key(
+        &self,
+        key: &str,
+        visibility: Visibility,
+    ) -> Result<Option<TupleVersion>, StorageError> {
+        let mut cursor = self.index_scan_open(key, visibility)?;
+        Ok(cursor.next())
+    }
+
+    fn key_exists_at_visibility(
+        &self,
+        key: &str,
+        visibility: Visibility,
+    ) -> Result<bool, StorageError> {
+        Ok(self.tuple_fetch_by_key(key, visibility)?.is_some())
+    }
 }
 
 pub trait SeqScanCursor {
@@ -333,6 +350,13 @@ mod tests {
         let store = EmptyStore;
         let visibility = Visibility { read_txn_id: 42 };
         assert_eq!(store.tuple_fetch(1, visibility).unwrap(), None);
+        assert_eq!(
+            store.tuple_fetch_by_key("missing", visibility).unwrap(),
+            None
+        );
+        assert!(!store
+            .key_exists_at_visibility("missing", visibility)
+            .unwrap());
     }
 
     #[test]
@@ -494,5 +518,39 @@ mod tests {
             store.tuple_fetch(1, Visibility { read_txn_id: 0 }),
             Err(StorageError::InvalidVisibility)
         );
+    }
+
+    #[test]
+    fn tuple_store_fetch_by_key_uses_index_visibility() {
+        let mut store = InMemoryTupleStore::new();
+        store
+            .tuple_insert(
+                NewTuple {
+                    key: "acct:1".to_string(),
+                    value: "open".to_string(),
+                },
+                3,
+            )
+            .unwrap();
+
+        assert_eq!(
+            store
+                .tuple_fetch_by_key("acct:1", Visibility { read_txn_id: 2 })
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .tuple_fetch_by_key("acct:1", Visibility { read_txn_id: 3 })
+                .unwrap()
+                .map(|tuple| tuple.value),
+            Some("open".to_string())
+        );
+        assert!(store
+            .key_exists_at_visibility("acct:1", Visibility { read_txn_id: 3 })
+            .unwrap());
+        assert!(!store
+            .key_exists_at_visibility("acct:2", Visibility { read_txn_id: 3 })
+            .unwrap());
     }
 }
