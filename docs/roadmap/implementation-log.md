@@ -434,6 +434,8 @@
 - Added telemetry helper coverage for backlog detection, pending-capacity math, and write-path quiescence so downstream automation can reason about failover/admission state without re-fetching raw engine watermarks.
 - Updated README + replication interface docs so the published telemetry contract now explicitly documents the richer readiness snapshot surface.
 - Followed up by exposing the durable WAL/snapshot frontier (`snapshot_id`, flushed-record count, last durable txn id, buffered WAL depth) through `EngineTelemetrySnapshot`, with helper coverage for buffered-WAL detection.
+- Hardened `EngineTelemetrySnapshot` backlog helpers so unknown blocker bits no longer masquerade as real readiness blockers, and added canonical blocker-label iteration/count helpers for downstream observability sinks.
+- Added regression coverage proving telemetry snapshots ignore unknown backlog bits while still surfacing canonical blocker labels in deterministic order.
 
 ## 2026-03-30
 

@@ -4,6 +4,24 @@ use gpu_db_execution::GpuRuntimeSnapshot;
 use gpu_db_metrics::{GpuParityIssue, RuntimeMetricsSnapshot};
 use gpu_db_types::{Index, Role, TxnId};
 
+const BACKLOG_BLOCKER_WAL: u8 = 1 << 0;
+const BACKLOG_BLOCKER_PENDING_BATCH: u8 = 1 << 1;
+const BACKLOG_BLOCKER_ACTIVE_TXN: u8 = 1 << 2;
+const BACKLOG_BLOCKER_COMMIT_APPLY_GAP: u8 = 1 << 3;
+const BACKLOG_BLOCKER_APPLY_VISIBLE_GAP: u8 = 1 << 4;
+const KNOWN_BACKLOG_BLOCKER_MASK: u8 = BACKLOG_BLOCKER_WAL
+    | BACKLOG_BLOCKER_PENDING_BATCH
+    | BACKLOG_BLOCKER_ACTIVE_TXN
+    | BACKLOG_BLOCKER_COMMIT_APPLY_GAP
+    | BACKLOG_BLOCKER_APPLY_VISIBLE_GAP;
+const BACKLOG_BLOCKER_LABELS: [(u8, &str); 5] = [
+    (BACKLOG_BLOCKER_WAL, "wal"),
+    (BACKLOG_BLOCKER_PENDING_BATCH, "pending_batch"),
+    (BACKLOG_BLOCKER_ACTIVE_TXN, "active_txn"),
+    (BACKLOG_BLOCKER_COMMIT_APPLY_GAP, "commit_apply_gap"),
+    (BACKLOG_BLOCKER_APPLY_VISIBLE_GAP, "apply_visible_gap"),
+];
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReplicationLagSnapshot {
     pub commit_index: Index,
@@ -50,6 +68,10 @@ pub struct EngineTelemetrySnapshot {
 }
 
 impl EngineTelemetrySnapshot {
+    fn sanitize_backlog_blocker_mask(mask: u8) -> u8 {
+        mask & KNOWN_BACKLOG_BLOCKER_MASK
+    }
+
     pub fn gpu_parity_fallback_total(&self) -> u64 {
         self.gpu_parity_fallbacks.values().copied().sum()
     }
@@ -78,7 +100,23 @@ impl EngineTelemetrySnapshot {
     }
 
     pub fn has_backlog_blockers(&self) -> bool {
-        self.backlog_blocker_mask != 0
+        Self::sanitize_backlog_blocker_mask(self.backlog_blocker_mask) != 0
+    }
+
+    pub fn backlog_blocker_labels(&self) -> Vec<&'static str> {
+        BACKLOG_BLOCKER_LABELS
+            .iter()
+            .filter(|(bit, _)| self.backlog_blocker_mask & bit != 0)
+            .map(|(_, label)| *label)
+            .collect()
+    }
+
+    pub fn backlog_blocker_label_count(&self) -> u8 {
+        Self::sanitize_backlog_blocker_mask(self.backlog_blocker_mask).count_ones() as u8
+    }
+
+    pub fn unknown_backlog_blocker_mask(&self) -> u8 {
+        self.backlog_blocker_mask & !KNOWN_BACKLOG_BLOCKER_MASK
     }
 
     pub fn pending_batch_remaining_capacity(&self) -> usize {
@@ -235,6 +273,12 @@ mod tests {
     fn telemetry_helpers_report_write_path_readiness() {
         let mut snapshot = empty_snapshot();
         assert!(!snapshot.has_backlog_blockers());
+        assert_eq!(snapshot.backlog_blocker_label_count(), 0);
+        assert_eq!(
+            snapshot.backlog_blocker_labels(),
+            Vec::<&'static str>::new()
+        );
+        assert_eq!(snapshot.unknown_backlog_blocker_mask(), 0);
         assert_eq!(snapshot.snapshot_id, 7);
         assert_eq!(snapshot.wal_flushed_count, 12);
         assert_eq!(snapshot.wal_last_durable_txn_id, Some(42));
@@ -253,10 +297,32 @@ mod tests {
         snapshot.quiescent_for_failover = false;
 
         assert!(snapshot.has_backlog_blockers());
+        assert_eq!(snapshot.backlog_blocker_label_count(), 3);
+        assert_eq!(
+            snapshot.backlog_blocker_labels(),
+            vec!["wal", "pending_batch", "active_txn"]
+        );
+        assert_eq!(snapshot.unknown_backlog_blocker_mask(), 0);
         assert!(!snapshot.has_buffered_wal());
         assert_eq!(snapshot.pending_batch_remaining_capacity(), 59);
         assert!(!snapshot.is_write_path_quiescent());
         assert!(!snapshot.quiescent_for_failover);
+    }
+
+    #[test]
+    fn telemetry_backlog_helpers_ignore_unknown_bits() {
+        let mut snapshot = empty_snapshot();
+        snapshot.backlog_blocker_mask =
+            BACKLOG_BLOCKER_WAL | BACKLOG_BLOCKER_APPLY_VISIBLE_GAP | (1 << 7);
+        snapshot.backlog_blocker_count = 3;
+
+        assert!(snapshot.has_backlog_blockers());
+        assert_eq!(snapshot.backlog_blocker_label_count(), 2);
+        assert_eq!(snapshot.unknown_backlog_blocker_mask(), 1 << 7);
+        assert_eq!(
+            snapshot.backlog_blocker_labels(),
+            vec!["wal", "apply_visible_gap"]
+        );
     }
 
     #[test]
