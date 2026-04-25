@@ -3519,9 +3519,10 @@ mod tests {
     }
 
     #[test]
-    fn installing_older_snapshot_does_not_rewind_visibility_or_watermarks() {
+    fn installing_older_snapshot_is_a_status_no_op() {
         let mut e = Engine::new_local();
         let committed = e.commit_mutation(1, b"SET a=1".to_vec()).unwrap();
+        let baseline = e.status_snapshot();
 
         e.install_snapshot(SnapshotMeta {
             last_included_index: committed.index.saturating_sub(1),
@@ -3533,6 +3534,8 @@ mod tests {
         assert_eq!(marks.commit_index, committed.index);
         assert_eq!(marks.applied_index, committed.index);
         assert_eq!(marks.visible_index, committed.index);
+        assert_eq!(marks.snapshot_id, baseline.snapshot.snapshot_id);
+        assert_eq!(e.status_snapshot(), baseline);
         assert_eq!(e.visible_up_to(), committed.index);
         assert_eq!(e.get("a"), Some("1"));
     }

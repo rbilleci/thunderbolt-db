@@ -40,14 +40,15 @@
 - Added replication regressions proving reserved self-acks and duplicate follower acks leave `ReplicationProgress` unchanged until quorum coverage really changes, tightening Q3 ack dedup semantics.
 - Added replication regressions proving ack-tracking pruning for committed entries does not create extra `ReplicationProgress` transitions beyond the actual commit promotion, tightening Q3 bookkeeping-vs-observability boundaries.
 - Added replication regressions proving `wait_committed(...)` polling leaves `ReplicationProgress` unchanged both before quorum and after resolution, tightening Q3 commit-observation semantics.
-- Updated replication interface docs and runbooks to document current guarantees and explicit non-guarantees around ordering, apply progression, and restart behavior.
+- Added local/raft/engine regressions proving stale snapshot installs are status/progress no-ops unless they advance (or exactly match) the current frontier term, preventing newer-but-stale `snapshot_id` values from drifting away from the actually served durable frontier.
+- Updated replication interface docs and runbooks to document current guarantees and explicit non-guarantees around ordering, apply progression, restart behavior, and stale-snapshot no-op semantics.
 
 ### Current blockers
 - None in-repo.
 
 ### Next loops
 1. Extend Q2 with richer value-aware ordering or join-adjacent slices without weakening the explicit fallback contract.
-2. Continue Q3 with stale/resume semantics under richer follower catch-up and snapshot-install stress, keeping status/telemetry alignment explicit.
+2. Continue Q3 with stale/resume semantics under richer follower catch-up and snapshot-install stress, keeping status/telemetry alignment explicit beyond the newly locked stale-snapshot no-op boundary.
 
 ## 2026-04-24
 

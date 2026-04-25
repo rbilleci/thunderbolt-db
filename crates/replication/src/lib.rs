@@ -343,6 +343,14 @@ impl LocalReplicator {
     }
 
     pub fn install_snapshot(&mut self, meta: SnapshotMeta) {
+        let current = self.snapshot_meta();
+        let advances_frontier = meta.last_included_index > current.last_included_index;
+        let same_frontier_same_term = meta.last_included_index == current.last_included_index
+            && meta.last_included_term == current.last_included_term;
+        if !advances_frontier && !same_frontier_same_term {
+            return;
+        }
+
         self.term = self.term.max(meta.last_included_term);
         self.commit_index = self.commit_index.max(meta.last_included_index);
         if meta.last_included_index > self.applied_index {
@@ -732,6 +740,14 @@ impl RaftReplicator {
     }
 
     pub fn install_snapshot(&mut self, meta: SnapshotMeta) {
+        let current = self.snapshot_meta();
+        let advances_frontier = meta.last_included_index > current.last_included_index;
+        let same_frontier_same_term = meta.last_included_index == current.last_included_index
+            && meta.last_included_term == current.last_included_term;
+        if !advances_frontier && !same_frontier_same_term {
+            return;
+        }
+
         self.term = self.term.max(meta.last_included_term);
         self.commit_index = self.commit_index.max(meta.last_included_index);
         if meta.last_included_index > self.compacted_index {
@@ -1045,20 +1061,20 @@ mod tests {
     }
 
     #[test]
-    fn install_older_snapshot_is_ignored_for_commit_and_apply_indices() {
+    fn install_older_snapshot_is_a_progress_no_op() {
         let mut r = LocalReplicator::leader();
         let t1 = r.propose(vec![1]).unwrap();
         r.mark_applied(t1.index);
+        let baseline = r.progress();
 
         r.install_snapshot(SnapshotMeta {
             last_included_index: t1.index.saturating_sub(1),
             last_included_term: 1,
-            snapshot_id: 10,
+            snapshot_id: baseline.snapshot.snapshot_id + 10,
         });
 
-        assert_eq!(r.commit_index(), t1.index);
-        assert_eq!(r.applied_index(), t1.index);
-        assert_eq!(r.snapshot_meta().snapshot_id, 10);
+        assert_eq!(r.progress(), baseline);
+        assert_eq!(r.snapshot_meta(), baseline.snapshot);
     }
 
     #[test]
@@ -1075,6 +1091,23 @@ mod tests {
 
         let next = r.propose(vec![3]).unwrap();
         assert_eq!(next.index, t2.index + 1);
+    }
+
+    #[test]
+    fn local_install_snapshot_updates_snapshot_id_for_same_frontier_same_term() {
+        let mut r = LocalReplicator::leader();
+        let t1 = r.propose(vec![1]).unwrap();
+        r.mark_applied(t1.index);
+
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: t1.index,
+            last_included_term: 1,
+            snapshot_id: 11,
+        });
+
+        assert_eq!(r.snapshot_meta().snapshot_id, 11);
+        assert_eq!(r.snapshot_meta().last_included_index, t1.index);
+        assert_eq!(r.progress().snapshot.snapshot_id, 11);
     }
 
     #[test]
@@ -3102,7 +3135,7 @@ mod tests {
     }
 
     #[test]
-    fn raft_install_snapshot_does_not_rewrite_compacted_term_for_same_index() {
+    fn raft_install_snapshot_with_same_index_wrong_term_is_a_progress_no_op() {
         let mut r = RaftReplicator::new(3);
         r.become_follower(4);
 
@@ -3111,11 +3144,16 @@ mod tests {
             last_included_term: 4,
             snapshot_id: 2,
         });
+        let baseline = r.progress();
+
         r.install_snapshot(SnapshotMeta {
             last_included_index: 5,
             last_included_term: 2,
             snapshot_id: 3,
         });
+
+        assert_eq!(r.progress(), baseline);
+        assert_eq!(r.snapshot_meta().snapshot_id, 2);
 
         r.append_entries_from_leader(
             4,
@@ -3132,5 +3170,25 @@ mod tests {
 
         assert_eq!(r.commit_index(), 6);
         assert_eq!(r.next_index, 7);
+    }
+
+    #[test]
+    fn raft_install_snapshot_updates_snapshot_id_for_same_frontier_same_term() {
+        let mut r = RaftReplicator::new(3);
+        r.become_follower(4);
+
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 5,
+            last_included_term: 4,
+            snapshot_id: 2,
+        });
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 5,
+            last_included_term: 4,
+            snapshot_id: 7,
+        });
+
+        assert_eq!(r.snapshot_meta().snapshot_id, 7);
+        assert_eq!(r.progress().snapshot.snapshot_id, 7);
     }
 }
