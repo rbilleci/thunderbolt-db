@@ -3301,6 +3301,54 @@ mod tests {
     }
 
     #[test]
+    fn raft_install_snapshot_gap_is_stable_for_same_frontier_wrong_term() {
+        let mut r = RaftReplicator::new(3);
+        r.become_follower(4);
+
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 5,
+            last_included_term: 4,
+            snapshot_id: 2,
+        });
+        r.append_entries_from_leader(
+            4,
+            5,
+            4,
+            vec![LogEntry {
+                term: 4,
+                index: 6,
+                payload: vec![9],
+            }],
+            5,
+        )
+        .unwrap();
+
+        let baseline = r.progress();
+        let baseline_recovery = r.recovery_progress();
+        let baseline_gap = r.recovery_progress_gap();
+        assert_eq!(
+            baseline_gap,
+            RecoveryProgressGap {
+                commit_index_gap: 0,
+                applied_index_gap: 0,
+                next_index_gap: 1,
+                uncommitted_entry_gap: 1,
+            }
+        );
+
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 5,
+            last_included_term: 2,
+            snapshot_id: 3,
+        });
+
+        assert_eq!(r.progress(), baseline);
+        assert_eq!(r.recovery_progress(), baseline_recovery);
+        assert_eq!(r.recovery_progress_gap(), baseline_gap);
+        assert_eq!(r.snapshot_meta().snapshot_id, 2);
+    }
+
+    #[test]
     fn raft_install_snapshot_updates_snapshot_id_for_same_frontier_same_term() {
         let mut r = RaftReplicator::new(3);
         r.become_follower(4);
