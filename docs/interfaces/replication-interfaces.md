@@ -10,6 +10,24 @@
 - `commit_index() -> index`
 - `snapshot_meta() -> SnapshotMeta`
 
+## RecoveryState / resume semantics
+
+- `RaftReplicator::recovery_state()` exports the durable follower-resume bundle:
+  - `term`
+  - `snapshot`
+  - `committed_entries` (contiguous retained committed tail after snapshot boundary)
+  - `applied_index`
+- `RaftReplicator::resume_as_follower(voters, recovery_state)` restores follower state after interruption/restart.
+
+Resume guarantees:
+
+- recovery entries must be contiguous from `snapshot.last_included_index + 1`
+- recovery entries may not exceed the recovered term
+- resumed `commit_index` is the durable committed tail
+- resumed `applied_index` is preserved exactly and may lag `commit_index`
+- resumed nodes come back as `Follower`
+- `next_index` resumes from the durable tail without rewinding commit progress
+
 ## ReplicatedStateMachine
 
 - `apply(entry) -> ApplyResult`
@@ -68,3 +86,10 @@ Current operator/developer question mapping:
 - mutation admission saturation matches pending queue occupancy
 - apply is deterministic for the same entry stream
 - WAL-before-visibility holds (`visible_index` never advances beyond durable commit state)
+
+## Current replication semantics (Q3 bootstrap truth)
+
+- **Ordering:** follower append batches must be contiguous and anchored to the advertised previous log boundary; stale or out-of-order batches are rejected without mutating committed state.
+- **Apply progression:** commit and apply are separate frontiers; lagging followers may have committed-but-unapplied work, and that backlog is explicit via `has_committed_entries_pending_apply()` / `committed_but_unapplied_count()`.
+- **Resume/restart:** restart currently restores follower state from snapshot metadata plus contiguous committed tail via `RecoveryState`; uncommitted tail is intentionally not recovered.
+- **Not yet guaranteed:** cross-process WAL replay integration, durable ack-tracking reconstruction beyond committed boundary, or automatic leader re-election behavior.

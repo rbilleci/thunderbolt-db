@@ -2,6 +2,14 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use gpu_db_types::{CommitToken, EngineError, Index, LogEntry, Role, SnapshotMeta, Term};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryState {
+    pub term: Term,
+    pub snapshot: SnapshotMeta,
+    pub committed_entries: Vec<LogEntry>,
+    pub applied_index: Index,
+}
+
 pub trait LogReplicator {
     fn propose(&mut self, payload: Vec<u8>) -> Result<CommitToken, EngineError>;
     fn wait_committed(
@@ -173,6 +181,73 @@ impl RaftReplicator {
         s
     }
 
+    pub fn resume_as_follower(voters: usize, recovery: RecoveryState) -> Result<Self, EngineError> {
+        if recovery.applied_index < recovery.snapshot.last_included_index {
+            return Err(EngineError::ApplyFailed(format!(
+                "applied_index {} is behind snapshot boundary {}",
+                recovery.applied_index, recovery.snapshot.last_included_index
+            )));
+        }
+
+        let mut expected_index = recovery.snapshot.last_included_index + 1;
+        for entry in &recovery.committed_entries {
+            if entry.index != expected_index {
+                return Err(EngineError::ApplyFailed(format!(
+                    "recovery entries must be contiguous from {} but saw {}",
+                    recovery.snapshot.last_included_index + 1,
+                    entry.index
+                )));
+            }
+            if entry.term > recovery.term {
+                return Err(EngineError::ApplyFailed(format!(
+                    "recovery entry term {} exceeds local term {} at index {}",
+                    entry.term, recovery.term, entry.index
+                )));
+            }
+            expected_index += 1;
+        }
+
+        let commit_index = recovery
+            .committed_entries
+            .last()
+            .map(|entry| entry.index)
+            .unwrap_or(recovery.snapshot.last_included_index);
+        if recovery.applied_index > commit_index {
+            return Err(EngineError::ApplyFailed(format!(
+                "applied_index {} exceeds commit boundary {}",
+                recovery.applied_index, commit_index
+            )));
+        }
+
+        let mut replicator = Self::new(voters);
+        replicator.term = recovery.term.max(recovery.snapshot.last_included_term);
+        replicator.role = Role::Follower;
+        replicator.commit_index = commit_index;
+        replicator.applied_index = recovery.applied_index;
+        replicator.applied_term = if recovery.applied_index == recovery.snapshot.last_included_index
+        {
+            recovery.snapshot.last_included_term
+        } else {
+            recovery
+                .committed_entries
+                .iter()
+                .find(|entry| entry.index == recovery.applied_index)
+                .map(|entry| entry.term)
+                .ok_or_else(|| {
+                    EngineError::ApplyFailed(format!(
+                        "missing applied entry {} in recovery state",
+                        recovery.applied_index
+                    ))
+                })?
+        };
+        replicator.snapshot_id = recovery.snapshot.snapshot_id;
+        replicator.compacted_index = recovery.snapshot.last_included_index;
+        replicator.compacted_term = recovery.snapshot.last_included_term;
+        replicator.entries = recovery.committed_entries;
+        replicator.next_index = commit_index + 1;
+        Ok(replicator)
+    }
+
     pub fn become_follower(&mut self, term: Term) {
         self.term = self.term.max(term);
         self.role = Role::Follower;
@@ -292,6 +367,23 @@ impl RaftReplicator {
     pub fn export_snapshot_meta(&mut self) -> SnapshotMeta {
         self.snapshot_id += 1;
         self.snapshot_meta()
+    }
+
+    pub fn recovery_state(&self) -> RecoveryState {
+        let snapshot = self.snapshot_meta();
+        RecoveryState {
+            term: self.term,
+            snapshot: snapshot.clone(),
+            committed_entries: self
+                .entries
+                .iter()
+                .filter(|entry| {
+                    entry.index > snapshot.last_included_index && entry.index <= self.commit_index
+                })
+                .cloned()
+                .collect(),
+            applied_index: self.applied_index,
+        }
     }
 
     pub fn append_entries_from_leader(
@@ -837,6 +929,100 @@ mod tests {
         assert_eq!(r.committed_but_unapplied_count(), 1);
         assert!(!r.has_uncommitted_entries());
         assert_eq!(r.uncommitted_entry_count(), 0);
+    }
+
+    #[test]
+    fn raft_follower_lagging_apply_delay_exposes_pending_apply_until_catch_up() {
+        let mut leader = RaftReplicator::new(3);
+        leader.become_leader(3);
+        let t1 = leader.propose(vec![10]).unwrap();
+        let t2 = leader.propose(vec![20]).unwrap();
+        leader.register_follower_ack(t1.index, 1);
+        leader.register_follower_ack(t2.index, 1);
+
+        let mut follower = RaftReplicator::new(3);
+        follower.become_follower(3);
+        follower
+            .append_entries_from_leader(
+                3,
+                0,
+                0,
+                vec![
+                    LogEntry {
+                        term: 3,
+                        index: t1.index,
+                        payload: vec![10],
+                    },
+                    LogEntry {
+                        term: 3,
+                        index: t2.index,
+                        payload: vec![20],
+                    },
+                ],
+                t2.index,
+            )
+            .unwrap();
+
+        assert_eq!(follower.commit_index(), t2.index);
+        assert_eq!(follower.applied_index(), 0);
+        assert!(follower.has_committed_entries_pending_apply());
+        assert_eq!(follower.committed_but_unapplied_count(), 2);
+
+        follower.mark_applied(t1.index);
+        assert_eq!(follower.committed_but_unapplied_count(), 1);
+        assert!(follower.has_committed_entries_pending_apply());
+
+        follower.mark_applied(t2.index);
+        assert_eq!(follower.applied_index(), t2.index);
+        assert!(!follower.has_committed_entries_pending_apply());
+        assert_eq!(follower.committed_but_unapplied_count(), 0);
+    }
+
+    #[test]
+    fn raft_recovery_state_resumes_pending_apply_without_rewinding_commit() {
+        let mut leader = RaftReplicator::new(3);
+        leader.become_leader(4);
+        let t1 = leader.propose(vec![1]).unwrap();
+        let t2 = leader.propose(vec![2]).unwrap();
+        leader.register_follower_ack(t1.index, 1);
+        leader.register_follower_ack(t2.index, 1);
+        leader.mark_applied(t1.index);
+        let snapshot = leader.export_snapshot_meta();
+
+        let resumed = RaftReplicator::resume_as_follower(3, leader.recovery_state()).unwrap();
+
+        assert_eq!(resumed.role(), Role::Follower);
+        assert_eq!(resumed.current_term(), 4);
+        assert_eq!(resumed.commit_index(), t2.index);
+        assert_eq!(resumed.applied_index(), t1.index);
+        assert_eq!(resumed.snapshot_meta(), snapshot);
+        assert!(resumed.has_committed_entries_pending_apply());
+        assert_eq!(resumed.committed_but_unapplied_count(), 1);
+        assert_eq!(resumed.next_index, t2.index + 1);
+    }
+
+    #[test]
+    fn raft_resume_rejects_non_contiguous_recovery_entries() {
+        let err = RaftReplicator::resume_as_follower(
+            3,
+            RecoveryState {
+                term: 5,
+                snapshot: SnapshotMeta {
+                    last_included_index: 3,
+                    last_included_term: 4,
+                    snapshot_id: 8,
+                },
+                committed_entries: vec![LogEntry {
+                    term: 5,
+                    index: 5,
+                    payload: vec![9],
+                }],
+                applied_index: 3,
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, EngineError::ApplyFailed(_)));
     }
 
     #[test]

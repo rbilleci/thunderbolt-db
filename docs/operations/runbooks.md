@@ -86,6 +86,21 @@ After install:
 - `commit_index`, `applied_index`, and `visible_index` are monotonic.
 - Next commit index continues from installed/applied frontier.
 
+## 4b) Resume / Restart Validation
+
+After interruption or restart:
+
+1. Restore follower replication state from snapshot metadata plus contiguous committed tail only.
+2. Confirm resumed node does **not** recover speculative/uncommitted entries.
+3. Confirm `commit_index` is preserved and `applied_index` may legitimately lag until replay/apply catches up.
+4. Confirm next append resumes from the durable tail (`next_index = durable_tail + 1`).
+
+Failure criteria:
+
+- resumed state invents gaps past the snapshot boundary
+- resumed state advances `applied_index` beyond durable committed boundary
+- resumed state recovers uncommitted tail as if durable
+
 ## 5) CPU Fallback Monitoring (No-GPU bootstrap)
 
 Expected behavior in bootstrap phase:
