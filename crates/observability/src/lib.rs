@@ -32,6 +32,15 @@ pub struct EngineTelemetrySnapshot {
     pub role: Role,
     pub replication_lag: ReplicationLagSnapshot,
     pub runtime_metrics: RuntimeMetricsSnapshot,
+    pub wal_unflushed_count: usize,
+    pub pending_batch_len: usize,
+    pub pending_batch_cap: usize,
+    pub active_txn_count: usize,
+    pub backlog_blocker_count: u8,
+    pub backlog_blocker_mask: u8,
+    pub mutation_admission_saturated: bool,
+    pub quiescent_for_failover: bool,
+    pub follower_promotion_ready: bool,
     pub gpu_parity_fallbacks: BTreeMap<GpuParityIssue, u64>,
     pub gpu_runtime: GpuRuntimeSnapshot,
 }
@@ -62,6 +71,19 @@ impl EngineTelemetrySnapshot {
             .iter()
             .max_by_key(|(issue, count)| (*count, *issue))
             .map(|(issue, count)| (*issue, *count))
+    }
+
+    pub fn has_backlog_blockers(&self) -> bool {
+        self.backlog_blocker_mask != 0
+    }
+
+    pub fn pending_batch_remaining_capacity(&self) -> usize {
+        self.pending_batch_cap
+            .saturating_sub(self.pending_batch_len)
+    }
+
+    pub fn is_write_path_quiescent(&self) -> bool {
+        self.wal_unflushed_count == 0 && self.pending_batch_len == 0 && self.active_txn_count == 0
     }
 }
 
@@ -127,6 +149,15 @@ mod tests {
                 apply_visible_gap: 0,
             },
             runtime_metrics: metrics,
+            wal_unflushed_count: 0,
+            pending_batch_len: 0,
+            pending_batch_cap: 64,
+            active_txn_count: 0,
+            backlog_blocker_count: 0,
+            backlog_blocker_mask: 0,
+            mutation_admission_saturated: false,
+            quiescent_for_failover: true,
+            follower_promotion_ready: false,
             gpu_parity_fallbacks: BTreeMap::new(),
             gpu_runtime: GpuRuntimeSnapshot::default(),
         }
@@ -186,6 +217,28 @@ mod tests {
 
         assert!(snapshot.has_gpu_runtime_pressure());
         assert_eq!(snapshot.blocked_gpu_ids(), vec![0, 2, 4]);
+    }
+
+    #[test]
+    fn telemetry_helpers_report_write_path_readiness() {
+        let mut snapshot = empty_snapshot();
+        assert!(!snapshot.has_backlog_blockers());
+        assert_eq!(snapshot.pending_batch_remaining_capacity(), 64);
+        assert!(snapshot.is_write_path_quiescent());
+        assert!(snapshot.quiescent_for_failover);
+        assert!(!snapshot.follower_promotion_ready);
+
+        snapshot.wal_unflushed_count = 2;
+        snapshot.pending_batch_len = 5;
+        snapshot.active_txn_count = 1;
+        snapshot.backlog_blocker_count = 3;
+        snapshot.backlog_blocker_mask = 0b0_0111;
+        snapshot.quiescent_for_failover = false;
+
+        assert!(snapshot.has_backlog_blockers());
+        assert_eq!(snapshot.pending_batch_remaining_capacity(), 59);
+        assert!(!snapshot.is_write_path_quiescent());
+        assert!(!snapshot.quiescent_for_failover);
     }
 
     #[test]

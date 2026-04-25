@@ -427,6 +427,13 @@
 - Added/expanded engine regression assertions so baseline, follower-rejection, pending-queue backlog, and active-transaction backlog paths validate blocker flag behavior.
 - Updated replication interface docs to document the new blocker fields in telemetry snapshots.
 
+## 2026-04-25
+
+### Completed
+- Extended `EngineTelemetrySnapshot` so published observability snapshots now carry write-path readiness/backlog state (`wal_unflushed_count`, pending-batch depth/cap, active transaction depth, blocker aggregates, and failover/admission booleans) in addition to replication lag and runtime metrics.
+- Added telemetry helper coverage for backlog detection, pending-capacity math, and write-path quiescence so downstream automation can reason about failover/admission state without re-fetching raw engine watermarks.
+- Updated README + replication interface docs so the published telemetry contract now explicitly documents the richer readiness snapshot surface.
+
 ## 2026-03-30
 
 ### Completed

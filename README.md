@@ -7,7 +7,7 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
 - Replication-shaped local commit path
 - WAL-before-visibility invariant tests
 - WAL durability + queue watermarks (flushed, buffered, unflushed, pending depth/capacity, pending age/deadline), commit/apply/visibility lag gauges, explicit backlog/gap blocker flags, active transaction depth, and failover/admission readiness flags (`quiescent_for_failover`, `follower_promotion_ready`, `mutation_admission_saturated`)
-- Engine telemetry snapshot + sink publication API for replication lag and runtime metrics
+- Engine telemetry snapshot + sink publication API for replication lag, write-path readiness/backlog state, and runtime metrics
 - CPU-first reference engine skeleton
 - Device-aware execution abstractions
 

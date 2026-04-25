@@ -913,6 +913,15 @@ impl Engine {
                 apply_visible_gap: marks.apply_visible_gap,
             },
             runtime_metrics: self.metrics.snapshot(),
+            wal_unflushed_count: marks.wal_unflushed_count,
+            pending_batch_len: marks.pending_batch_len,
+            pending_batch_cap: marks.pending_batch_cap,
+            active_txn_count: marks.active_txn_count,
+            backlog_blocker_count: marks.backlog_blocker_count,
+            backlog_blocker_mask: marks.backlog_blocker_mask,
+            mutation_admission_saturated: marks.mutation_admission_saturated,
+            quiescent_for_failover: marks.quiescent_for_failover,
+            follower_promotion_ready: marks.follower_promotion_ready,
             gpu_parity_fallbacks: self.metrics.fallback_counts_by_gpu_parity_issue(),
             gpu_runtime: self.router.runtime().snapshot(),
         }
@@ -2763,6 +2772,14 @@ mod tests {
         assert_eq!(snapshot.runtime_metrics.pending_batch_peak, 1);
         assert_eq!(snapshot.runtime_metrics.last_pending_batch_len, Some(1));
         assert_eq!(snapshot.runtime_metrics.commits_total, 0);
+        assert_eq!(snapshot.wal_unflushed_count, 0);
+        assert_eq!(snapshot.pending_batch_len, 1);
+        assert_eq!(snapshot.pending_batch_cap, 8);
+        assert_eq!(snapshot.active_txn_count, 0);
+        assert_eq!(snapshot.backlog_blocker_count, 1);
+        assert!(snapshot.has_backlog_blockers());
+        assert!(!snapshot.quiescent_for_failover);
+        assert!(!snapshot.mutation_admission_saturated);
         assert!(snapshot.gpu_parity_fallbacks.is_empty());
     }
 
@@ -2783,6 +2800,12 @@ mod tests {
         assert_eq!(snapshot.replication_lag.commit_apply_gap, 0);
         assert_eq!(snapshot.replication_lag.apply_visible_gap, 0);
         assert_eq!(snapshot.runtime_metrics.commits_total, 1);
+        assert_eq!(snapshot.wal_unflushed_count, 0);
+        assert_eq!(snapshot.pending_batch_len, 0);
+        assert_eq!(snapshot.active_txn_count, 0);
+        assert_eq!(snapshot.backlog_blocker_count, 0);
+        assert!(!snapshot.has_backlog_blockers());
+        assert!(snapshot.quiescent_for_failover);
         assert!(snapshot.gpu_parity_fallbacks.is_empty());
     }
 
