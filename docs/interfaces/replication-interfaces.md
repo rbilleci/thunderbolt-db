@@ -41,9 +41,30 @@
 - GPU parity/runtime mirrors: `gpu_parity_fallbacks`, `gpu_runtime`
 - Helper APIs: `known_backlog_blocker_mask()`, `sanitize_backlog_blocker_mask(mask)`, `has_backlog_blockers()`, `backlog_blocker_labels()`, `backlog_blocker_label_count()`, `backlog_blocker_delimited_labels(delimiter)`, `unknown_backlog_blocker_mask()`, `has_unknown_backlog_blockers()`, `unknown_backlog_blocker_count()`, `pending_batch_remaining_capacity()`, `pending_batch_utilization_permyriad()`, `pending_batch_remaining_capacity_permyriad()`, `has_buffered_wal()`, `total_backlog_items()`, `is_write_path_quiescent()`, `is_fully_caught_up()`
 
+## EngineStatusSnapshot (engine truth surface)
+
+- Constructed via `Engine::status_snapshot()`
+- `role`, `term`
+- `snapshot`: `snapshot_id`, `last_included_index`, `last_included_term`, `visible_index`
+- `replication_lag`: `commit_index`, `applied_index`, `visible_index`, `commit_apply_gap`, `apply_visible_gap`
+- `readiness`: `pending_batch_len`, `pending_batch_cap`, `active_txn_count`, `wal_unflushed_count`, `backlog_blocker_count`, `backlog_blocker_mask`, `mutation_admission_saturated`, `quiescent_for_failover`, `follower_promotion_ready`
+- `fallback`: `last_reason`, `gpu_parity_fallbacks`, `active_reasons`, `gpu_runtime`
+- `runtime_metrics`
+- Helper APIs: `validate()`, `served_snapshot_frontier()`, `latest_fallback_reason()`, `why_routed_to_fallback_labels()`, `backlog_blocker_labels()`, `replication_distance()`
+
+Current operator/developer question mapping:
+
+- **What snapshot served this?** → `status.snapshot.snapshot_id` + `status.served_snapshot_frontier()`
+- **Why did this route to fallback?** → `status.latest_fallback_reason()` for latest observed reason, plus `status.why_routed_to_fallback_labels()` / `status.fallback.active_reasons` for currently active degradations
+- **How far behind is replication?** → `status.replication_lag` or `status.replication_distance()`
+
 ## Guarantees
 
 - commit index is monotonic
 - applied index <= commit index
+- visible index <= applied index
+- snapshot last_included_index <= visible frontier
+- backlog blocker count matches canonical blocker mask bits
+- mutation admission saturation matches pending queue occupancy
 - apply is deterministic for the same entry stream
 - WAL-before-visibility holds (`visible_index` never advances beyond durable commit state)

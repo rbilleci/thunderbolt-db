@@ -118,7 +118,69 @@ When first NVIDIA environment becomes available:
 
 ## Queue additions for autonomous loop pickup
 
-### Q1. Golden-wire `psql` compatibility suite
+### Q1. Engine truth surface for snapshots, fallback, and replication health
+Priority: highest
+
+Goal:
+- Turn the recent MVCC/observability/replication helper work into a single trustworthy engine-level status surface that answers what state the engine is in and whether it is healthy/correct.
+
+Acceptance criteria:
+1. Expose one engine-level status/snapshot surface (API, struct, command, or metrics bundle) that includes at minimum:
+   - latest in-memory snapshot identity/frontier
+   - parity fallback rollups and active fallback reasons
+   - replication lag and watermark state
+   - blocker/readiness flags already present in telemetry where applicable
+2. Define and enforce a small set of invariants on that surface (for example monotonic watermark movement, snapshot/frontier consistency, no impossible lag values).
+3. Add focused tests that prove the surface is stable and semantically correct under normal progression plus at least one degraded/fallback case.
+4. Document how an operator or developer should answer: “what snapshot served this?”, “why did this route to fallback?”, and “how far behind is replication?”
+5. Update roadmap/docs as needed so this is treated as the truth surface for subsequent loop work.
+
+Notes:
+- Prefer one crisp trustworthy status surface over many loosely-related helper accessors.
+- This is the immediate leverage point for the helper commits already landed.
+
+### Q2. Vertical slice: execution over MVCC storage
+Priority: highest
+
+Goal:
+- Convert the new in-memory MVCC tuple store and reusable vec operator groundwork into a narrow but real end-to-end execution slice.
+
+Acceptance criteria:
+1. Implement a meaningful read path that runs against the MVCC store through execution abstractions, covering at least:
+   - scan or key lookup
+   - visibility filtering against a snapshot
+   - projection/filtering through the execution layer
+2. Keep device strategy explicit per guardrails:
+   - CPU reference semantics implemented
+   - GPU path declared or an explicit tracked fallback reason recorded
+3. Add end-to-end tests that demonstrate the slice works through engine-facing entry points rather than subsystem-only unit tests.
+4. Add at least one small benchmark or deterministic workload fixture so future loop runs can measure progress on this vertical slice.
+5. Document the exact supported query shape and the next obvious extension boundary.
+
+Notes:
+- Favor a complete thin slice over broad unfinished operator scaffolding.
+- This should make the engine visibly more capable, not just more internally prepared.
+
+### Q3. Replication semantics hardening under stress
+Priority: highest
+
+Goal:
+- Move from replication introspection to replication behavior that is predictable and trustworthy under skew, lag, replay, and resume conditions.
+
+Acceptance criteria:
+1. Define explicit semantics/tests for ordering, apply progression, watermark movement, and recovery/resume behavior.
+2. Add targeted tests for at least:
+   - lagging follower/apply delay
+   - resume after interruption or restart
+   - stale or out-of-order entry handling
+3. Ensure the exposed replication metrics/status surfaces remain consistent with actual state transitions in the hardening tests.
+4. Document what guarantees the current engine does and does not make about replication correctness/readiness.
+5. Reconcile any helper APIs that are too weak/ambiguous for these guarantees.
+
+Notes:
+- Observability without semantics is not enough; this queue item is about trust.
+
+### Q4. Golden-wire `psql` compatibility suite
 Priority: high
 
 Goal:
@@ -141,7 +203,7 @@ Notes:
 - Prefer stable assertions over brittle byte-for-byte transcript checks where timestamps/noise vary.
 - Use real `psql`/libpq behavior as the oracle for connection lifecycle compatibility.
 
-### Q2. CI compatibility scorecard
+### Q5. CI compatibility scorecard
 Priority: high
 
 Goal:

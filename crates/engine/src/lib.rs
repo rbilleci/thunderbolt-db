@@ -6,7 +6,10 @@ use std::time::{Duration, Instant};
 use gpu_db_batching::{BatchItem, DualTriggerBatcher, FlushReason};
 use gpu_db_execution::{DeviceRouter, MockGpuRuntime, RouteDecision};
 use gpu_db_metrics::{BatchFlushReason, FallbackReason, RuntimeMetrics};
-use gpu_db_observability::{EngineTelemetrySnapshot, ReplicationLagSnapshot, TelemetrySink};
+use gpu_db_observability::{
+    ActiveFallbackReason, EngineStatusSnapshot, EngineTelemetrySnapshot, FallbackStatus,
+    ReadinessStatus, ReplicationLagSnapshot, SnapshotStatus, TelemetrySink,
+};
 use gpu_db_planner::{ExecutionPlan, Planner, PlannerConfig};
 use gpu_db_protocol::{parse_command, Command, ParseError};
 use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine};
@@ -929,6 +932,65 @@ impl Engine {
             gpu_parity_fallbacks: self.metrics.fallback_counts_by_gpu_parity_issue(),
             gpu_runtime: self.router.runtime().snapshot(),
         }
+    }
+
+    pub fn status_snapshot(&self) -> EngineStatusSnapshot {
+        let marks = self.replication_watermarks();
+        let snapshot_meta = self.snapshot_meta();
+        let runtime_metrics = self.metrics.snapshot();
+        let gpu_runtime = self.router.runtime().snapshot();
+
+        let mut active_reasons = Vec::new();
+        if !gpu_runtime.unavailable_gpu_ids.is_empty() {
+            active_reasons.push(ActiveFallbackReason::GpuUnavailable {
+                gpu_ids: gpu_runtime.unavailable_gpu_ids.clone(),
+            });
+        }
+        if !gpu_runtime.memory_pressured_gpu_ids.is_empty() {
+            active_reasons.push(ActiveFallbackReason::GpuMemoryPressure {
+                gpu_ids: gpu_runtime.memory_pressured_gpu_ids.clone(),
+            });
+        }
+        if gpu_runtime.saturated {
+            active_reasons.push(ActiveFallbackReason::GpuQueueSaturated);
+        }
+
+        EngineStatusSnapshot::new(
+            marks.role,
+            marks.term,
+            SnapshotStatus {
+                snapshot_id: snapshot_meta.snapshot_id,
+                last_included_index: snapshot_meta.last_included_index,
+                last_included_term: snapshot_meta.last_included_term,
+                visible_index: marks.visible_index,
+            },
+            ReplicationLagSnapshot {
+                commit_index: marks.commit_index,
+                applied_index: marks.applied_index,
+                visible_index: marks.visible_index,
+                commit_apply_gap: marks.commit_apply_gap,
+                apply_visible_gap: marks.apply_visible_gap,
+            },
+            ReadinessStatus {
+                pending_batch_len: marks.pending_batch_len,
+                pending_batch_cap: marks.pending_batch_cap,
+                active_txn_count: marks.active_txn_count,
+                wal_unflushed_count: marks.wal_unflushed_count,
+                backlog_blocker_count: marks.backlog_blocker_count,
+                backlog_blocker_mask: marks.backlog_blocker_mask,
+                mutation_admission_saturated: marks.mutation_admission_saturated,
+                quiescent_for_failover: marks.quiescent_for_failover,
+                follower_promotion_ready: marks.follower_promotion_ready,
+            },
+            FallbackStatus {
+                last_reason: runtime_metrics.last_fallback_reason,
+                gpu_parity_fallbacks: self.metrics.fallback_counts_by_gpu_parity_issue(),
+                active_reasons,
+                gpu_runtime,
+            },
+            runtime_metrics,
+        )
+        .expect("engine status snapshot invariants should hold")
     }
 
     pub fn publish_telemetry<S: TelemetrySink>(&self, sink: &mut S) {
@@ -2789,6 +2851,61 @@ mod tests {
         assert!(!snapshot.quiescent_for_failover);
         assert!(!snapshot.mutation_admission_saturated);
         assert!(snapshot.gpu_parity_fallbacks.is_empty());
+    }
+
+    #[test]
+    fn status_snapshot_answers_snapshot_and_replication_health_questions() {
+        let mut e = Engine::new_local();
+        let token = e.commit_mutation(1, b"SET a=1".to_vec()).unwrap();
+        let exported = e.export_snapshot_meta();
+
+        let status = e.status_snapshot();
+
+        assert_eq!(status.role, Role::Leader);
+        assert_eq!(status.term, 1);
+        assert_eq!(status.snapshot.snapshot_id, exported.snapshot_id);
+        assert_eq!(status.snapshot.last_included_index, token.index);
+        assert_eq!(status.snapshot.last_included_term, 1);
+        assert_eq!(status.snapshot.visible_index, token.index);
+        assert_eq!(status.served_snapshot_frontier(), token.index);
+        assert_eq!(status.replication_lag.commit_index, token.index);
+        assert_eq!(status.replication_lag.applied_index, token.index);
+        assert_eq!(status.replication_distance(), 0);
+        assert!(status.why_routed_to_fallback_labels().is_empty());
+        assert_eq!(status.latest_fallback_reason(), None);
+        assert_eq!(status.backlog_blocker_labels(), Vec::<&'static str>::new());
+        status.validate().unwrap();
+    }
+
+    #[test]
+    fn status_snapshot_surfaces_active_fallback_reasons_and_rollups() {
+        let mut e = Engine::new_local();
+        e.mark_gpu_unavailable(0);
+        e.set_gpu_runtime_saturated(true);
+
+        e.execute_text(1, "SET a=1").unwrap();
+
+        let status = e.status_snapshot();
+
+        assert_eq!(
+            status.latest_fallback_reason(),
+            Some(FallbackReason::GpuUnavailable)
+        );
+        assert_eq!(
+            status.why_routed_to_fallback_labels(),
+            vec!["gpu_unavailable", "gpu_queue_saturated"]
+        );
+        assert!(status.fallback.is_actively_degraded());
+        assert!(status.fallback.has_gpu_parity_fallbacks());
+        assert_eq!(status.fallback.gpu_parity_fallback_total(), 1);
+        assert_eq!(
+            status.fallback.active_reasons,
+            vec![
+                ActiveFallbackReason::GpuUnavailable { gpu_ids: vec![0] },
+                ActiveFallbackReason::GpuQueueSaturated,
+            ]
+        );
+        status.validate().unwrap();
     }
 
     #[test]

@@ -96,6 +96,10 @@ Expected behavior in bootstrap phase:
 Operator checks:
 
 - Track fallback reason counters for unusual spikes.
+- Use `Engine::status_snapshot()` as the truth surface:
+  - `status.snapshot.snapshot_id` + `status.served_snapshot_frontier()` answer what snapshot/frontier served a read.
+  - `status.latest_fallback_reason()` plus `status.why_routed_to_fallback_labels()` answer why work routed to CPU fallback.
+  - `status.replication_lag` / `status.replication_distance()` answer how far replication is behind.
 - Distinguish expected `NotGpuEligible` from infrastructure-driven reasons.
 - Treat unexplained fallback pattern changes as release blockers.
 

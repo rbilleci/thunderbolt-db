@@ -1,5 +1,20 @@
 # Implementation Log (Pre-NVIDIA Phase)
 
+## 2026-04-25
+
+### Completed
+- Added `Engine::status_snapshot()` as the engine-level truth surface for Q1, unifying served snapshot identity/frontier, replication lag, readiness flags, fallback rollups, and active runtime fallback reasons in one validated status object.
+- Added `EngineStatusSnapshot`, `SnapshotStatus`, `ReadinessStatus`, and `FallbackStatus` plus invariant validation covering commit/apply/visible ordering, snapshot/frontier consistency, blocker-mask/count consistency, and mutation-admission saturation semantics.
+- Extended engine regression coverage to prove the truth surface answers the key operator questions in both healthy and degraded/fallback states.
+- Updated README, replication interface docs, and operations runbooks so `status_snapshot()` is the documented source of truth for "what snapshot served this?", "why did this route to fallback?", and "how far behind is replication?"
+
+### Current blockers
+- None in-repo.
+
+### Next loops
+1. Continue Q2 by wiring a narrow engine-facing execution slice over the MVCC tuple store.
+2. Keep Q3 semantics aligned with the new status surface as replication stress hardening lands.
+
 ## 2026-04-24
 
 ### Completed

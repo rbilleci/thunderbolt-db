@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use gpu_db_execution::GpuRuntimeSnapshot;
-use gpu_db_metrics::{GpuParityIssue, RuntimeMetricsSnapshot};
-use gpu_db_types::{Index, Role, TxnId};
+use gpu_db_metrics::{FallbackReason, GpuParityIssue, RuntimeMetricsSnapshot};
+use gpu_db_types::{Index, Role, Term, TxnId};
 
 const BACKLOG_BLOCKER_WAL: u8 = 1 << 0;
 const BACKLOG_BLOCKER_PENDING_BATCH: u8 = 1 << 1;
@@ -42,6 +42,261 @@ impl ReplicationLagSnapshot {
 
     pub fn is_caught_up(&self) -> bool {
         !self.has_gap()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotStatus {
+    pub snapshot_id: u64,
+    pub last_included_index: Index,
+    pub last_included_term: Term,
+    pub visible_index: Index,
+}
+
+impl SnapshotStatus {
+    pub fn served_frontier(&self) -> Index {
+        self.visible_index.max(self.last_included_index)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActiveFallbackReason {
+    GpuUnavailable { gpu_ids: Vec<u16> },
+    GpuMemoryPressure { gpu_ids: Vec<u16> },
+    GpuQueueSaturated,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FallbackStatus {
+    pub last_reason: Option<FallbackReason>,
+    pub gpu_parity_fallbacks: BTreeMap<GpuParityIssue, u64>,
+    pub active_reasons: Vec<ActiveFallbackReason>,
+    pub gpu_runtime: GpuRuntimeSnapshot,
+}
+
+impl FallbackStatus {
+    pub fn gpu_parity_fallback_total(&self) -> u64 {
+        self.gpu_parity_fallbacks.values().copied().sum()
+    }
+
+    pub fn has_gpu_parity_fallbacks(&self) -> bool {
+        !self.gpu_parity_fallbacks.is_empty()
+    }
+
+    pub fn is_actively_degraded(&self) -> bool {
+        !self.active_reasons.is_empty()
+    }
+
+    pub fn active_reason_labels(&self) -> Vec<&'static str> {
+        self.active_reasons
+            .iter()
+            .map(|reason| match reason {
+                ActiveFallbackReason::GpuUnavailable { .. } => "gpu_unavailable",
+                ActiveFallbackReason::GpuMemoryPressure { .. } => "gpu_memory_pressure",
+                ActiveFallbackReason::GpuQueueSaturated => "gpu_queue_saturated",
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadinessStatus {
+    pub pending_batch_len: usize,
+    pub pending_batch_cap: usize,
+    pub active_txn_count: usize,
+    pub wal_unflushed_count: usize,
+    pub backlog_blocker_count: u8,
+    pub backlog_blocker_mask: u8,
+    pub mutation_admission_saturated: bool,
+    pub quiescent_for_failover: bool,
+    pub follower_promotion_ready: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EngineStatusSnapshot {
+    pub role: Role,
+    pub term: Term,
+    pub snapshot: SnapshotStatus,
+    pub replication_lag: ReplicationLagSnapshot,
+    pub readiness: ReadinessStatus,
+    pub fallback: FallbackStatus,
+    pub runtime_metrics: RuntimeMetricsSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum EngineStatusInvariantError {
+    #[error("applied index {applied_index} exceeds commit index {commit_index}")]
+    AppliedExceedsCommit {
+        commit_index: Index,
+        applied_index: Index,
+    },
+    #[error("visible index {visible_index} exceeds applied index {applied_index}")]
+    VisibleExceedsApplied {
+        applied_index: Index,
+        visible_index: Index,
+    },
+    #[error(
+        "snapshot last_included_index {last_included_index} exceeds visible frontier {visible_index}"
+    )]
+    SnapshotExceedsVisible {
+        last_included_index: Index,
+        visible_index: Index,
+    },
+    #[error(
+        "commit/apply gap {commit_apply_gap} does not match commit {commit_index} and applied {applied_index}"
+    )]
+    CommitApplyGapMismatch {
+        commit_index: Index,
+        applied_index: Index,
+        commit_apply_gap: Index,
+    },
+    #[error(
+        "apply/visible gap {apply_visible_gap} does not match applied {applied_index} and visible {visible_index}"
+    )]
+    ApplyVisibleGapMismatch {
+        applied_index: Index,
+        visible_index: Index,
+        apply_visible_gap: Index,
+    },
+    #[error(
+        "backlog blocker count {backlog_blocker_count} does not match backlog mask {backlog_blocker_mask:#010b}"
+    )]
+    BacklogBlockerCountMismatch {
+        backlog_blocker_count: u8,
+        backlog_blocker_mask: u8,
+    },
+    #[error(
+        "mutation admission saturated={mutation_admission_saturated} is inconsistent with pending queue {pending_batch_len}/{pending_batch_cap}"
+    )]
+    MutationAdmissionMismatch {
+        pending_batch_len: usize,
+        pending_batch_cap: usize,
+        mutation_admission_saturated: bool,
+    },
+    #[error("leader-only quiescent_for_failover flag set while role is {role:?}")]
+    QuiescentRoleMismatch { role: Role },
+    #[error("follower_promotion_ready flag set while role is {role:?}")]
+    PromotionReadyRoleMismatch { role: Role },
+}
+
+impl EngineStatusSnapshot {
+    pub fn new(
+        role: Role,
+        term: Term,
+        snapshot: SnapshotStatus,
+        replication_lag: ReplicationLagSnapshot,
+        readiness: ReadinessStatus,
+        fallback: FallbackStatus,
+        runtime_metrics: RuntimeMetricsSnapshot,
+    ) -> Result<Self, EngineStatusInvariantError> {
+        let snapshot = Self {
+            role,
+            term,
+            snapshot,
+            replication_lag,
+            readiness,
+            fallback,
+            runtime_metrics,
+        };
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
+    pub fn validate(&self) -> Result<(), EngineStatusInvariantError> {
+        let lag = &self.replication_lag;
+        let readiness = &self.readiness;
+        if lag.applied_index > lag.commit_index {
+            return Err(EngineStatusInvariantError::AppliedExceedsCommit {
+                commit_index: lag.commit_index,
+                applied_index: lag.applied_index,
+            });
+        }
+        if self.snapshot.visible_index > lag.applied_index {
+            return Err(EngineStatusInvariantError::VisibleExceedsApplied {
+                applied_index: lag.applied_index,
+                visible_index: self.snapshot.visible_index,
+            });
+        }
+        if self.snapshot.last_included_index > self.snapshot.visible_index {
+            return Err(EngineStatusInvariantError::SnapshotExceedsVisible {
+                last_included_index: self.snapshot.last_included_index,
+                visible_index: self.snapshot.visible_index,
+            });
+        }
+        if lag.commit_apply_gap != lag.commit_index.saturating_sub(lag.applied_index) {
+            return Err(EngineStatusInvariantError::CommitApplyGapMismatch {
+                commit_index: lag.commit_index,
+                applied_index: lag.applied_index,
+                commit_apply_gap: lag.commit_apply_gap,
+            });
+        }
+        if lag.apply_visible_gap
+            != lag
+                .applied_index
+                .saturating_sub(self.snapshot.visible_index)
+        {
+            return Err(EngineStatusInvariantError::ApplyVisibleGapMismatch {
+                applied_index: lag.applied_index,
+                visible_index: self.snapshot.visible_index,
+                apply_visible_gap: lag.apply_visible_gap,
+            });
+        }
+
+        let sanitized_mask = Self::known_backlog_blocker_mask() & readiness.backlog_blocker_mask;
+        let expected_blocker_count = sanitized_mask.count_ones() as u8;
+        if readiness.backlog_blocker_count != expected_blocker_count {
+            return Err(EngineStatusInvariantError::BacklogBlockerCountMismatch {
+                backlog_blocker_count: readiness.backlog_blocker_count,
+                backlog_blocker_mask: readiness.backlog_blocker_mask,
+            });
+        }
+
+        let expected_mutation_admission_saturated =
+            readiness.pending_batch_len >= readiness.pending_batch_cap;
+        if readiness.mutation_admission_saturated != expected_mutation_admission_saturated {
+            return Err(EngineStatusInvariantError::MutationAdmissionMismatch {
+                pending_batch_len: readiness.pending_batch_len,
+                pending_batch_cap: readiness.pending_batch_cap,
+                mutation_admission_saturated: readiness.mutation_admission_saturated,
+            });
+        }
+
+        if readiness.quiescent_for_failover && self.role != Role::Leader {
+            return Err(EngineStatusInvariantError::QuiescentRoleMismatch { role: self.role });
+        }
+        if readiness.follower_promotion_ready && self.role != Role::Follower {
+            return Err(EngineStatusInvariantError::PromotionReadyRoleMismatch { role: self.role });
+        }
+
+        Ok(())
+    }
+
+    pub const fn known_backlog_blocker_mask() -> u8 {
+        KNOWN_BACKLOG_BLOCKER_MASK
+    }
+
+    pub fn served_snapshot_frontier(&self) -> Index {
+        self.snapshot.served_frontier()
+    }
+
+    pub fn latest_fallback_reason(&self) -> Option<FallbackReason> {
+        self.fallback.last_reason
+    }
+
+    pub fn why_routed_to_fallback_labels(&self) -> Vec<&'static str> {
+        self.fallback.active_reason_labels()
+    }
+
+    pub fn backlog_blocker_labels(&self) -> Vec<&'static str> {
+        BACKLOG_BLOCKER_LABELS
+            .iter()
+            .filter(|(bit, _)| self.readiness.backlog_blocker_mask & bit != 0)
+            .map(|(_, label)| *label)
+            .collect()
+    }
+
+    pub fn replication_distance(&self) -> Index {
+        self.replication_lag.max_gap()
     }
 }
 

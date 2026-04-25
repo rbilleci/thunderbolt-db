@@ -47,6 +47,7 @@ dependencies = [
  "gpu_db_execution",
  "gpu_db_metrics",
  "gpu_db_types",
+ "thiserror",
 ]
 
 [[package]]
