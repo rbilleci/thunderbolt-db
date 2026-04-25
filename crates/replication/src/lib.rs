@@ -168,6 +168,14 @@ impl RecoveryState {
         self.applied_index < self.commit_index()
     }
 
+    pub fn apply_gap(&self) -> usize {
+        self.commit_index().saturating_sub(self.applied_index) as usize
+    }
+
+    pub fn is_caught_up(&self) -> bool {
+        self.apply_gap() == 0
+    }
+
     pub fn progress_as_follower(&self) -> Result<ReplicationProgress, RecoveryInvariantError> {
         self.validate()?;
         let progress = ReplicationProgress {
@@ -1347,6 +1355,8 @@ mod tests {
         assert_eq!(state.next_index(), 5);
         assert!(state.has_committed_entries_pending_apply());
         assert_eq!(state.committed_but_unapplied_count(), 1);
+        assert_eq!(state.apply_gap(), 1);
+        assert!(!state.is_caught_up());
         state.validate().unwrap();
 
         let progress = state.progress_as_follower().unwrap();
@@ -1357,6 +1367,28 @@ mod tests {
         assert_eq!(progress.next_index, 5);
         assert_eq!(progress.apply_gap(), 1);
         assert!(!progress.is_caught_up());
+    }
+
+    #[test]
+    fn recovery_state_reports_caught_up_when_apply_reaches_commit_boundary() {
+        let state = RecoveryState {
+            term: 4,
+            snapshot: SnapshotMeta {
+                last_included_index: 3,
+                last_included_term: 4,
+                snapshot_id: 7,
+            },
+            committed_entries: vec![LogEntry {
+                term: 4,
+                index: 4,
+                payload: vec![1],
+            }],
+            applied_index: 4,
+        };
+
+        assert_eq!(state.apply_gap(), 0);
+        assert!(state.is_caught_up());
+        assert!(state.progress_as_follower().unwrap().is_caught_up());
     }
 
     #[test]
