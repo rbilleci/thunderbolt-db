@@ -1392,6 +1392,35 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_only_recovery_state_maps_to_caught_up_progress() {
+        let state = RecoveryState {
+            term: 6,
+            snapshot: SnapshotMeta {
+                last_included_index: 9,
+                last_included_term: 5,
+                snapshot_id: 11,
+            },
+            committed_entries: vec![],
+            applied_index: 9,
+        };
+
+        assert_eq!(state.commit_index(), 9);
+        assert_eq!(state.next_index(), 10);
+        assert_eq!(state.committed_but_unapplied_count(), 0);
+        assert_eq!(state.apply_gap(), 0);
+        assert!(state.is_caught_up());
+
+        let progress = state.progress_as_follower().unwrap();
+        assert_eq!(progress.role, Role::Follower);
+        assert_eq!(progress.term, 6);
+        assert_eq!(progress.commit_index, 9);
+        assert_eq!(progress.applied_index, 9);
+        assert_eq!(progress.next_index, 10);
+        assert_eq!(progress.uncommitted_entry_count, 0);
+        assert!(progress.is_caught_up());
+    }
+
+    #[test]
     fn recovery_state_validation_rejects_applied_index_past_commit_boundary() {
         let err = RecoveryState {
             term: 4,
@@ -1434,6 +1463,26 @@ mod tests {
         let resumed = RaftReplicator::resume_as_follower(3, recovery).unwrap();
 
         assert_eq!(resumed.progress(), projected);
+    }
+
+    #[test]
+    fn resumed_follower_from_snapshot_only_recovery_matches_projection() {
+        let recovery = RecoveryState {
+            term: 6,
+            snapshot: SnapshotMeta {
+                last_included_index: 9,
+                last_included_term: 5,
+                snapshot_id: 11,
+            },
+            committed_entries: vec![],
+            applied_index: 9,
+        };
+
+        let projected = recovery.progress_as_follower().unwrap();
+        let resumed = RaftReplicator::resume_as_follower(3, recovery).unwrap();
+
+        assert_eq!(resumed.progress(), projected);
+        assert!(resumed.progress().is_caught_up());
     }
 
     #[test]
