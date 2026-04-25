@@ -5090,6 +5090,42 @@ mod tests {
             }
         );
 
+        let mut bind_named_portal_with_named_statement_default_parameter_formats_payload =
+            Vec::new();
+        bind_named_portal_with_named_statement_default_parameter_formats_payload
+            .extend_from_slice("pörtal_default_pair\0stmt_default_pair\0".as_bytes());
+        bind_named_portal_with_named_statement_default_parameter_formats_payload
+            .extend_from_slice(&0_i16.to_be_bytes());
+        bind_named_portal_with_named_statement_default_parameter_formats_payload
+            .extend_from_slice(&2_i16.to_be_bytes());
+        bind_named_portal_with_named_statement_default_parameter_formats_payload
+            .extend_from_slice(&4_i32.to_be_bytes());
+        bind_named_portal_with_named_statement_default_parameter_formats_payload
+            .extend_from_slice(b"text");
+        bind_named_portal_with_named_statement_default_parameter_formats_payload
+            .extend_from_slice(&(-1_i32).to_be_bytes());
+        bind_named_portal_with_named_statement_default_parameter_formats_payload
+            .extend_from_slice(&1_i16.to_be_bytes());
+        bind_named_portal_with_named_statement_default_parameter_formats_payload
+            .extend_from_slice(&1_i16.to_be_bytes());
+        let bind_named_portal_with_named_statement_default_parameter_formats = frontend_frame(
+            b'B',
+            &bind_named_portal_with_named_statement_default_parameter_formats_payload,
+        );
+        assert_eq!(
+            parse_frontend_message(
+                &bind_named_portal_with_named_statement_default_parameter_formats
+            )
+            .unwrap(),
+            FrontendMessage::Bind {
+                portal_name: "pörtal_default_pair".to_string(),
+                statement_name: "stmt_default_pair".to_string(),
+                parameter_format_codes: vec![],
+                parameters: vec![Some(b"text".to_vec()), None],
+                result_format_codes: vec![1],
+            }
+        );
+
         let mut bind_with_default_parameter_formats_payload = Vec::new();
         bind_with_default_parameter_formats_payload.extend_from_slice(b"portal2\0stmt2\0");
         bind_with_default_parameter_formats_payload.extend_from_slice(&0_i16.to_be_bytes());
