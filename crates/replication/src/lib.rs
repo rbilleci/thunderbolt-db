@@ -1676,6 +1676,20 @@ mod tests {
     }
 
     #[test]
+    fn raft_progress_snapshot_is_stable_when_acks_arrive_off_leader() {
+        let mut r = RaftReplicator::new(3);
+        r.become_leader(1);
+        let t1 = r.propose(vec![1]).unwrap();
+
+        r.become_follower(2);
+        let before = r.progress();
+        r.register_follower_ack(t1.index, 1);
+        let after = r.progress();
+
+        assert_eq!(after, before);
+    }
+
+    #[test]
     fn raft_rejects_ack_for_unknown_index() {
         let mut r = RaftReplicator::new(3);
         r.become_leader(1);
@@ -1684,6 +1698,19 @@ mod tests {
         r.register_follower_ack(2, 1);
 
         assert_eq!(r.commit_index(), 0);
+    }
+
+    #[test]
+    fn raft_progress_snapshot_is_stable_when_ack_targets_unknown_index() {
+        let mut r = RaftReplicator::new(3);
+        r.become_leader(1);
+        let _ = r.propose(vec![1]).unwrap();
+
+        let before = r.progress();
+        r.register_follower_ack(2, 1);
+        let after = r.progress();
+
+        assert_eq!(after, before);
     }
 
     #[test]
