@@ -12,6 +12,20 @@ pub struct ReplicationLagSnapshot {
     pub apply_visible_gap: Index,
 }
 
+impl ReplicationLagSnapshot {
+    pub fn max_gap(&self) -> Index {
+        self.commit_apply_gap.max(self.apply_visible_gap)
+    }
+
+    pub fn has_gap(&self) -> bool {
+        self.commit_apply_gap > 0 || self.apply_visible_gap > 0
+    }
+
+    pub fn is_caught_up(&self) -> bool {
+        !self.has_gap()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct EngineTelemetrySnapshot {
     pub role: Role,
@@ -145,5 +159,30 @@ mod tests {
         assert_eq!(snapshot.gpu_parity_fallback_count_for(&issue_120), 2);
         assert_eq!(snapshot.gpu_parity_fallback_count_for(&issue_121), 3);
         assert_eq!(snapshot.hottest_gpu_parity_fallback(), Some((issue_121, 3)));
+    }
+
+    #[test]
+    fn replication_lag_helpers_report_catchup_state() {
+        let caught_up = ReplicationLagSnapshot {
+            commit_index: 9,
+            applied_index: 9,
+            visible_index: 9,
+            commit_apply_gap: 0,
+            apply_visible_gap: 0,
+        };
+        assert_eq!(caught_up.max_gap(), 0);
+        assert!(!caught_up.has_gap());
+        assert!(caught_up.is_caught_up());
+
+        let lagging = ReplicationLagSnapshot {
+            commit_index: 12,
+            applied_index: 10,
+            visible_index: 8,
+            commit_apply_gap: 2,
+            apply_visible_gap: 2,
+        };
+        assert_eq!(lagging.max_gap(), 2);
+        assert!(lagging.has_gap());
+        assert!(!lagging.is_caught_up());
     }
 }
