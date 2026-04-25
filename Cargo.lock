@@ -44,6 +44,7 @@ dependencies = [
 name = "gpu_db_observability"
 version = "0.1.0"
 dependencies = [
+ "gpu_db_execution",
  "gpu_db_metrics",
  "gpu_db_types",
 ]
