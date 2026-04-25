@@ -4,6 +4,7 @@ use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use gpu_db_batching::{BatchItem, DualTriggerBatcher, FlushReason};
+use gpu_db_execution::{DeviceRouter, MockGpuRuntime, RouteDecision};
 use gpu_db_metrics::{BatchFlushReason, FallbackReason, RuntimeMetrics};
 use gpu_db_observability::{EngineTelemetrySnapshot, ReplicationLagSnapshot, TelemetrySink};
 use gpu_db_planner::{ExecutionPlan, Planner, PlannerConfig};
@@ -366,6 +367,7 @@ pub struct Engine {
     metrics: RuntimeMetrics,
     batcher: DualTriggerBatcher<PendingMutation>,
     planner: Planner,
+    router: DeviceRouter<MockGpuRuntime>,
 }
 
 impl Engine {
@@ -383,6 +385,7 @@ impl Engine {
             metrics: RuntimeMetrics::default(),
             batcher: DualTriggerBatcher::new(64, Duration::from_millis(1)),
             planner: Planner::new(planner_cfg),
+            router: DeviceRouter::new(MockGpuRuntime::default()),
         }
     }
 
@@ -402,6 +405,26 @@ impl Engine {
 
     pub fn simulate_next_wal_flush_failure(&mut self) {
         self.wal.fail_next_flush();
+    }
+
+    pub fn mark_gpu_unavailable(&mut self, gpu_id: u16) {
+        self.router.runtime_mut().mark_unavailable(gpu_id);
+    }
+
+    pub fn clear_gpu_unavailable(&mut self, gpu_id: u16) {
+        self.router.runtime_mut().clear_unavailable(gpu_id);
+    }
+
+    pub fn mark_gpu_memory_pressured(&mut self, gpu_id: u16) {
+        self.router.runtime_mut().mark_memory_pressured(gpu_id);
+    }
+
+    pub fn clear_gpu_memory_pressured(&mut self, gpu_id: u16) {
+        self.router.runtime_mut().clear_memory_pressured(gpu_id);
+    }
+
+    pub fn set_gpu_runtime_saturated(&mut self, saturated: bool) {
+        self.router.runtime_mut().set_saturated(saturated);
     }
 
     pub fn become_follower(&mut self, term: Term) {
@@ -476,28 +499,41 @@ impl Engine {
                     return Err(ExecuteError::Engine(EngineError::NotLeader));
                 }
 
-                let queue_cap = self.batcher.max_items();
-                let pending = self.batcher.len();
-                if pending >= queue_cap {
-                    self.metrics.inc_fallback(FallbackReason::GpuQueueSaturated);
-                    return Err(ExecuteError::Engine(EngineError::MutationQueueOverloaded {
-                        pending,
-                        cap: queue_cap,
-                    }));
-                }
+                match self.route_command(&cmd) {
+                    RouteDecision::Gpu(_) => {
+                        let queue_cap = self.batcher.max_items();
+                        let pending = self.batcher.len();
+                        if pending >= queue_cap {
+                            self.metrics.inc_fallback(FallbackReason::GpuQueueSaturated);
+                            return Err(ExecuteError::Engine(
+                                EngineError::MutationQueueOverloaded {
+                                    pending,
+                                    cap: queue_cap,
+                                },
+                            ));
+                        }
 
-                let maybe_batch = self.batcher.enqueue(
-                    PendingMutation {
-                        txn_id,
-                        payload: text.as_bytes().to_vec(),
-                    },
-                    now,
-                );
-                if let Some(batch) = maybe_batch {
-                    self.metrics.observe_pending_batch_len(batch.items.len());
-                    self.apply_batch(batch.reason, batch.items.into_iter(), now)?;
-                } else {
-                    self.metrics.observe_pending_batch_len(self.batcher.len());
+                        let maybe_batch = self.batcher.enqueue(
+                            PendingMutation {
+                                txn_id,
+                                payload: text.as_bytes().to_vec(),
+                            },
+                            now,
+                        );
+                        if let Some(batch) = maybe_batch {
+                            self.metrics.observe_pending_batch_len(batch.items.len());
+                            self.apply_batch(batch.reason, batch.items.into_iter(), now)?;
+                        } else {
+                            self.metrics.observe_pending_batch_len(self.batcher.len());
+                        }
+                    }
+                    RouteDecision::CpuFallback { reason, .. } => {
+                        self.metrics.inc_gpu_fallback(reason);
+                        self.commit_mutation(txn_id, text.as_bytes().to_vec())?;
+                    }
+                    RouteDecision::Cpu => {
+                        self.commit_mutation(txn_id, text.as_bytes().to_vec())?;
+                    }
                 }
             }
             Command::Flush => {
@@ -620,9 +656,15 @@ impl Engine {
         let cmd = parse_command(text)?;
 
         match cmd {
-            Command::SetKv { .. } | Command::DeleteKv { .. } => {
-                self.commit_mutation(txn_id, text.as_bytes().to_vec())?;
-            }
+            Command::SetKv { .. } | Command::DeleteKv { .. } => match self.route_command(&cmd) {
+                RouteDecision::Gpu(_) | RouteDecision::Cpu => {
+                    self.commit_mutation(txn_id, text.as_bytes().to_vec())?;
+                }
+                RouteDecision::CpuFallback { reason, .. } => {
+                    self.metrics.inc_gpu_fallback(reason);
+                    self.commit_mutation(txn_id, text.as_bytes().to_vec())?;
+                }
+            },
             Command::Flush => {
                 self.flush_admin()?;
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
@@ -893,6 +935,14 @@ impl Engine {
 
     pub fn batching_config(&self) -> (usize, Duration) {
         (self.batcher.max_items(), self.batcher.max_wait())
+    }
+
+    fn route_command(&self, cmd: &Command) -> RouteDecision {
+        let plan = self.planner.plan_command(cmd);
+        let Some(node) = plan.nodes().first() else {
+            return RouteDecision::Cpu;
+        };
+        self.router.route(&node.op)
     }
 
     fn simulate_kernel_occupancy_permyriad(payload_len: usize) -> u16 {
@@ -1474,6 +1524,67 @@ mod tests {
 
         e.enqueue_set_text(3, "GET missing", t0).unwrap();
         assert_eq!(e.metrics().d2h_bytes_total, "100".len() as u64);
+    }
+
+    #[test]
+    fn execute_text_mutation_falls_back_to_cpu_when_gpu_is_unavailable() {
+        let mut e = Engine::new_local();
+        e.mark_gpu_unavailable(0);
+
+        e.execute_text(1, "SET balance=100").unwrap();
+
+        assert_eq!(e.get("balance"), Some("100"));
+        assert_eq!(e.metrics().commits_total, 1);
+        assert_eq!(e.metrics().fallback_total, 1);
+        assert_eq!(e.metrics().fallback_for(FallbackReason::GpuUnavailable), 1);
+
+        let snapshot = e.telemetry_snapshot();
+        assert_eq!(snapshot.gpu_parity_fallback_total(), 1);
+        assert!(snapshot.has_gpu_parity_fallbacks());
+        assert_eq!(
+            snapshot.gpu_parity_fallbacks.get(&GpuParityIssue {
+                id: "GPU-120",
+                owner: "runtime",
+                milestone: "m0-bootstrap",
+            }),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn enqueue_mutation_falls_back_to_cpu_when_gpu_is_memory_pressured() {
+        let mut e = Engine::with_batching(8, Duration::from_secs(60));
+        let t0 = Instant::now();
+        e.mark_gpu_memory_pressured(0);
+
+        e.enqueue_set_text(1, "SET balance=100", t0).unwrap();
+
+        assert_eq!(e.get("balance"), Some("100"));
+        assert_eq!(e.pending_batch_len(), 0);
+        assert_eq!(e.metrics().commits_total, 1);
+        assert_eq!(e.metrics().fallback_total, 1);
+        assert_eq!(
+            e.metrics().fallback_for(FallbackReason::GpuMemoryPressure),
+            1
+        );
+    }
+
+    #[test]
+    fn enqueue_mutation_runtime_saturation_falls_back_before_queueing() {
+        let mut e = Engine::with_batching(8, Duration::from_secs(60));
+        let t0 = Instant::now();
+        e.set_gpu_runtime_saturated(true);
+
+        e.enqueue_set_text(1, "SET balance=100", t0).unwrap();
+
+        assert_eq!(e.get("balance"), Some("100"));
+        assert_eq!(e.pending_batch_len(), 0);
+        assert_eq!(e.metrics().commits_total, 1);
+        assert_eq!(e.metrics().fallback_total, 1);
+        assert_eq!(
+            e.metrics().fallback_for(FallbackReason::GpuQueueSaturated),
+            1
+        );
     }
 
     #[test]

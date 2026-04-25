@@ -15,6 +15,4 @@ gpu_db_observability = { path = "../observability" }
 gpu_db_protocol = { path = "../protocol" }
 gpu_db_batching = { path = "../batching" }
 gpu_db_planner = { path = "../planner" }
-
-[dev-dependencies]
 gpu_db_execution = { path = "../execution" }
