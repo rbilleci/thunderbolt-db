@@ -132,8 +132,18 @@ impl EngineTelemetrySnapshot {
         self.wal_buffered_count > 0
     }
 
+    pub fn total_backlog_items(&self) -> usize {
+        self.wal_unflushed_count + self.pending_batch_len + self.active_txn_count
+    }
+
     pub fn is_write_path_quiescent(&self) -> bool {
-        self.wal_unflushed_count == 0 && self.pending_batch_len == 0 && self.active_txn_count == 0
+        self.total_backlog_items() == 0
+    }
+
+    pub fn is_fully_caught_up(&self) -> bool {
+        self.replication_lag.is_caught_up()
+            && self.total_backlog_items() == 0
+            && !self.has_backlog_blockers()
     }
 }
 
@@ -289,7 +299,9 @@ mod tests {
         assert_eq!(snapshot.wal_last_durable_txn_id, Some(42));
         assert!(snapshot.has_buffered_wal());
         assert_eq!(snapshot.pending_batch_remaining_capacity(), 64);
+        assert_eq!(snapshot.total_backlog_items(), 0);
         assert!(snapshot.is_write_path_quiescent());
+        assert!(snapshot.is_fully_caught_up());
         assert!(snapshot.quiescent_for_failover);
         assert!(!snapshot.follower_promotion_ready);
 
@@ -314,7 +326,9 @@ mod tests {
         );
         assert!(!snapshot.has_buffered_wal());
         assert_eq!(snapshot.pending_batch_remaining_capacity(), 59);
+        assert_eq!(snapshot.total_backlog_items(), 8);
         assert!(!snapshot.is_write_path_quiescent());
+        assert!(!snapshot.is_fully_caught_up());
         assert!(!snapshot.quiescent_for_failover);
     }
 
@@ -336,6 +350,7 @@ mod tests {
             snapshot.backlog_blocker_delimited_labels(";"),
             "wal;apply_visible_gap"
         );
+        assert!(!snapshot.is_fully_caught_up());
     }
 
     #[test]
