@@ -1584,6 +1584,72 @@ mod tests {
     }
 
     #[test]
+    fn recovery_progress_handles_snapshot_boundary_committed_tail() {
+        let recovery = RecoveryState {
+            term: 7,
+            snapshot: SnapshotMeta {
+                last_included_index: 10,
+                last_included_term: 6,
+                snapshot_id: 21,
+            },
+            committed_entries: vec![
+                LogEntry {
+                    term: 7,
+                    index: 11,
+                    payload: vec![11],
+                },
+                LogEntry {
+                    term: 7,
+                    index: 12,
+                    payload: vec![12],
+                },
+            ],
+            applied_index: 10,
+        };
+
+        let progress = recovery.progress_as_follower().unwrap();
+
+        assert_eq!(progress.commit_index, 12);
+        assert_eq!(progress.applied_index, 10);
+        assert_eq!(progress.next_index, 13);
+        assert_eq!(progress.apply_gap(), 2);
+        assert_eq!(progress.committed_but_unapplied_count, 2);
+        assert!(progress.has_committed_entries_pending_apply);
+        assert!(!progress.has_uncommitted_entries);
+    }
+
+    #[test]
+    fn resumed_follower_from_snapshot_boundary_tail_matches_projection() {
+        let recovery = RecoveryState {
+            term: 7,
+            snapshot: SnapshotMeta {
+                last_included_index: 10,
+                last_included_term: 6,
+                snapshot_id: 21,
+            },
+            committed_entries: vec![
+                LogEntry {
+                    term: 7,
+                    index: 11,
+                    payload: vec![11],
+                },
+                LogEntry {
+                    term: 7,
+                    index: 12,
+                    payload: vec![12],
+                },
+            ],
+            applied_index: 10,
+        };
+
+        let projected = recovery.progress_as_follower().unwrap();
+        let resumed = RaftReplicator::resume_as_follower(3, recovery).unwrap();
+
+        assert_eq!(resumed.progress(), projected);
+        assert_eq!(resumed.progress().apply_gap(), 2);
+    }
+
+    #[test]
     fn replication_progress_validation_rejects_inconsistent_uncommitted_flag() {
         let err = ReplicationProgress {
             role: Role::Follower,
