@@ -84,6 +84,10 @@ pub enum MvccReadSource {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MvccReadFilter {
     KeyPrefix(String),
+    KeyRange {
+        start_inclusive: String,
+        end_exclusive: String,
+    },
     ValueEquals(String),
     All(Vec<MvccReadFilter>),
     Any(Vec<MvccReadFilter>),
@@ -150,6 +154,13 @@ fn decode_mvcc_row(bytes: &[u8], projection: MvccProjection) -> MvccReadRow {
 fn mvcc_row_matches_filter(row: &TupleVersion, filter: &MvccReadFilter) -> bool {
     match filter {
         MvccReadFilter::KeyPrefix(prefix) => row.key.starts_with(prefix),
+        MvccReadFilter::KeyRange {
+            start_inclusive,
+            end_exclusive,
+        } => {
+            row.key.as_str() >= start_inclusive.as_str()
+                && row.key.as_str() < end_exclusive.as_str()
+        }
         MvccReadFilter::ValueEquals(expected) => row.value == *expected,
         MvccReadFilter::All(filters) => filters
             .iter()
@@ -3369,6 +3380,43 @@ mod tests {
                 MvccReadRow {
                     key: Some("user:1".to_string()),
                     value: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn execute_mvcc_query_supports_key_range_filter_shapes() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=open").unwrap();
+        e.execute_text(2, "SET acct:2=locked").unwrap();
+        e.execute_text(3, "SET acct:3=closed").unwrap();
+        e.execute_text(4, "SET acct:4=suspended").unwrap();
+
+        let ranged = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FullScan,
+                visibility: StorageVisibility { read_txn_id: 4 },
+                filter: Some(MvccReadFilter::KeyRange {
+                    start_inclusive: "acct:2".to_string(),
+                    end_exclusive: "acct:4".to_string(),
+                }),
+                order: Some(MvccReadOrder::KeyAsc),
+                projection: MvccProjection::KeyValue,
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            ranged.rows,
+            vec![
+                MvccReadRow {
+                    key: Some("acct:2".to_string()),
+                    value: Some("locked".to_string()),
+                },
+                MvccReadRow {
+                    key: Some("acct:3".to_string()),
+                    value: Some("closed".to_string()),
                 },
             ]
         );

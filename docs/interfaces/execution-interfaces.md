@@ -25,6 +25,7 @@ Each physical plan node must include:
   - `MvccReadQuery.visibility.read_txn_id` chooses the MVCC snapshot used by storage visibility checks
 - Filter layer:
   - `KeyPrefix(prefix)`
+  - `KeyRange { start_inclusive, end_exclusive }`
   - `ValueEquals(value)`
   - `All([filter...])`
   - `Any([filter...])`
@@ -46,4 +47,5 @@ Each physical plan node must include:
 ## Current extension boundary
 
 - Supported ordering is currently key-only (`KeyAsc` / `KeyDesc`).
-- Next obvious Q2 extension is richer predicate/order shapes (for example key ranges or value-aware ordering) without weakening the explicit GPU fallback contract.
+- Supported range semantics are lexicographic `KeyRange { start_inclusive, end_exclusive }` filters.
+- Next obvious Q2 extension is richer value-aware ordering or join-adjacent shapes without weakening the explicit GPU fallback contract.
