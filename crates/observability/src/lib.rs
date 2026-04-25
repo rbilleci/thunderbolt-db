@@ -115,6 +115,10 @@ impl EngineTelemetrySnapshot {
         Self::sanitize_backlog_blocker_mask(self.backlog_blocker_mask).count_ones() as u8
     }
 
+    pub fn backlog_blocker_delimited_labels(&self, delimiter: &str) -> String {
+        self.backlog_blocker_labels().join(delimiter)
+    }
+
     pub fn unknown_backlog_blocker_mask(&self) -> u8 {
         self.backlog_blocker_mask & !KNOWN_BACKLOG_BLOCKER_MASK
     }
@@ -279,6 +283,7 @@ mod tests {
             Vec::<&'static str>::new()
         );
         assert_eq!(snapshot.unknown_backlog_blocker_mask(), 0);
+        assert_eq!(snapshot.backlog_blocker_delimited_labels(","), "");
         assert_eq!(snapshot.snapshot_id, 7);
         assert_eq!(snapshot.wal_flushed_count, 12);
         assert_eq!(snapshot.wal_last_durable_txn_id, Some(42));
@@ -303,6 +308,10 @@ mod tests {
             vec!["wal", "pending_batch", "active_txn"]
         );
         assert_eq!(snapshot.unknown_backlog_blocker_mask(), 0);
+        assert_eq!(
+            snapshot.backlog_blocker_delimited_labels(" | "),
+            "wal | pending_batch | active_txn"
+        );
         assert!(!snapshot.has_buffered_wal());
         assert_eq!(snapshot.pending_batch_remaining_capacity(), 59);
         assert!(!snapshot.is_write_path_quiescent());
@@ -322,6 +331,10 @@ mod tests {
         assert_eq!(
             snapshot.backlog_blocker_labels(),
             vec!["wal", "apply_visible_gap"]
+        );
+        assert_eq!(
+            snapshot.backlog_blocker_delimited_labels(";"),
+            "wal;apply_visible_gap"
         );
     }
 

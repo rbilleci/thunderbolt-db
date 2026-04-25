@@ -39,7 +39,7 @@
 - Durable/snapshot mirrors: `snapshot_id`, `wal_flushed_count`, `wal_last_durable_txn_id`, `wal_buffered_count`
 - Write-path readiness/backlog mirrors: `wal_unflushed_count`, `pending_batch_len`, `pending_batch_cap`, `active_txn_count`, `backlog_blocker_count`, `backlog_blocker_mask`, `mutation_admission_saturated`, `quiescent_for_failover`, `follower_promotion_ready`
 - GPU parity/runtime mirrors: `gpu_parity_fallbacks`, `gpu_runtime`
-- Helper APIs: `has_backlog_blockers()`, `pending_batch_remaining_capacity()`, `has_buffered_wal()`, `is_write_path_quiescent()`
+- Helper APIs: `has_backlog_blockers()`, `backlog_blocker_labels()`, `backlog_blocker_label_count()`, `backlog_blocker_delimited_labels(delimiter)`, `unknown_backlog_blocker_mask()`, `pending_batch_remaining_capacity()`, `has_buffered_wal()`, `is_write_path_quiescent()`
 
 ## Guarantees
 
