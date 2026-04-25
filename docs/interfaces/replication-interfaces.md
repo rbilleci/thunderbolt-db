@@ -111,6 +111,7 @@ Current operator/developer question mapping:
 
 - **Ordering:** follower append batches must be contiguous and anchored to the advertised previous log boundary; stale or out-of-order batches are rejected without mutating committed state.
 - **Rejected-append stability:** stale-term and non-contiguous append rejections preserve the validated `ReplicationProgress` snapshot exactly; failures do not silently perturb commit/apply/next-index progress accounting.
+- **Snapshot-boundary rejection stability:** prev-log checks against compacted snapshot boundaries are also progress-stable; boundary-term mismatches and behind-boundary requests leave validated progress untouched.
 - **Snapshot-install stability:** snapshot installation updates `ReplicationProgress` monotonically at the durable boundary—clearing apply gap when the snapshot catches the follower up, while preserving any surviving uncommitted tail and its `next_index` accounting.
 - **Apply progression:** commit and apply are separate frontiers; lagging followers may have committed-but-unapplied work, and that backlog is explicit via `has_committed_entries_pending_apply()` / `committed_but_unapplied_count()`.
 - **Resume/restart:** restart currently restores follower state from snapshot metadata plus contiguous committed tail via `RecoveryState`; uncommitted tail is intentionally not recovered.
