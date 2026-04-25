@@ -1686,6 +1686,39 @@ mod tests {
     }
 
     #[test]
+    fn raft_progress_snapshot_discards_uncommitted_tail_across_role_change() {
+        let mut r = RaftReplicator::new(3);
+        r.become_leader(1);
+
+        let t1 = r.propose(vec![1]).unwrap();
+        r.register_follower_ack(t1.index, 1);
+        let _t2_uncommitted = r.propose(vec![2]).unwrap();
+
+        let before = r.progress();
+        assert_eq!(before.commit_index, t1.index);
+        assert_eq!(before.uncommitted_entry_count, 1);
+        assert!(before.has_uncommitted_entries);
+        assert!(!before.is_caught_up());
+
+        r.become_follower(2);
+        let after_follower = r.progress();
+        assert_eq!(after_follower.role, Role::Follower);
+        assert_eq!(after_follower.commit_index, t1.index);
+        assert_eq!(after_follower.next_index, t1.index + 1);
+        assert_eq!(after_follower.uncommitted_entry_count, 0);
+        assert!(!after_follower.has_uncommitted_entries);
+
+        r.become_leader(3);
+        let after_leader = r.progress();
+        assert_eq!(after_leader.role, Role::Leader);
+        assert_eq!(after_leader.commit_index, t1.index);
+        assert_eq!(after_leader.next_index, t1.index + 1);
+        assert_eq!(after_leader.uncommitted_entry_count, 0);
+        assert!(!after_leader.has_uncommitted_entries);
+        after_leader.validate().unwrap();
+    }
+
+    #[test]
     fn raft_truncate_uncommitted_from_drops_tail_and_resets_next_index() {
         let mut r = RaftReplicator::new(3);
         r.become_leader(1);
