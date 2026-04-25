@@ -968,6 +968,35 @@ mod tests {
     }
 
     #[test]
+    fn local_progress_snapshot_tracks_rollback_of_unapplied_tail() {
+        let mut r = LocalReplicator::leader();
+        let t1 = r.propose(vec![1]).unwrap();
+        let t2 = r.propose(vec![2]).unwrap();
+        r.mark_applied(t1.index);
+
+        let before = r.progress();
+        assert_eq!(before.commit_index, t2.index);
+        assert_eq!(before.applied_index, t1.index);
+        assert_eq!(before.next_index, t2.index + 1);
+        assert_eq!(before.committed_but_unapplied_count, 1);
+        assert_eq!(before.uncommitted_entry_count, 0);
+
+        r.rollback_unapplied_from(t2.index);
+
+        let after = r.progress();
+        assert_eq!(after.commit_index, t1.index);
+        assert_eq!(after.applied_index, t1.index);
+        assert_eq!(after.next_index, t1.index + 1);
+        assert_eq!(after.committed_but_unapplied_count, 0);
+        assert!(!after.has_committed_entries_pending_apply);
+        assert_eq!(after.uncommitted_entry_count, 0);
+        assert!(!after.has_uncommitted_entries);
+        assert_eq!(after.apply_gap(), 0);
+        assert!(after.is_caught_up());
+        after.validate().unwrap();
+    }
+
+    #[test]
     fn snapshot_meta_tracks_applied_index() {
         let mut r = LocalReplicator::leader();
         let t1 = r.propose(vec![1]).unwrap();
