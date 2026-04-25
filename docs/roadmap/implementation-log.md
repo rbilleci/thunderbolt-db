@@ -17,6 +17,7 @@
 - Extended `ReplicationProgress` with `apply_gap()` / `is_caught_up()` so operator logic can distinguish commit/apply lag from truly quiescent replication without re-deriving semantics from multiple fields.
 - Added `RecoveryState::progress_as_follower()` so restart bundles and live follower state now share the same validated progress vocabulary, tightening Q3 status/recovery alignment.
 - Extended `RecoveryState` with `apply_gap()` / `is_caught_up()` so durable restart bundles can answer the same catch-up question directly even before a live replicator is resumed.
+- Added replication regressions proving stale-term and non-contiguous append rejections leave `ReplicationProgress` unchanged, tightening Q3 guarantees around rejected-path observability stability.
 - Updated replication interface docs and runbooks to document current guarantees and explicit non-guarantees around ordering, apply progression, and restart behavior.
 
 ### Current blockers

@@ -1863,6 +1863,34 @@ mod tests {
     }
 
     #[test]
+    fn raft_progress_snapshot_is_stable_across_stale_append_rejection() {
+        let mut r = RaftReplicator::new(3);
+        r.become_leader(5);
+        let t1 = r.propose(vec![1]).unwrap();
+        r.register_follower_ack(t1.index, 1);
+        r.become_follower(5);
+
+        let before = r.progress();
+
+        let err = r
+            .append_entries_from_leader(
+                4,
+                t1.index,
+                5,
+                vec![LogEntry {
+                    term: 4,
+                    index: t1.index + 1,
+                    payload: vec![9],
+                }],
+                t1.index + 1,
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, EngineError::ProposalFailed(_)));
+        assert_eq!(r.progress(), before);
+    }
+
+    #[test]
     fn raft_follower_append_entries_rejects_entries_with_term_ahead_of_leader() {
         let mut r = RaftReplicator::new(3);
         r.become_follower(5);
@@ -1982,6 +2010,41 @@ mod tests {
         assert_eq!(r.commit_index(), t1.index);
         assert_eq!(r.next_index, t1.index + 1);
         assert!(r.entries.iter().all(|entry| entry.index <= t1.index));
+    }
+
+    #[test]
+    fn raft_progress_snapshot_is_stable_across_non_contiguous_append_rejection() {
+        let mut r = RaftReplicator::new(3);
+        r.become_leader(1);
+        let t1 = r.propose(vec![1]).unwrap();
+        r.register_follower_ack(t1.index, 1);
+        r.become_follower(2);
+
+        let before = r.progress();
+
+        let err = r
+            .append_entries_from_leader(
+                2,
+                t1.index,
+                1,
+                vec![
+                    LogEntry {
+                        term: 2,
+                        index: t1.index + 1,
+                        payload: vec![2],
+                    },
+                    LogEntry {
+                        term: 2,
+                        index: t1.index + 3,
+                        payload: vec![3],
+                    },
+                ],
+                t1.index + 3,
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, EngineError::ProposalFailed(_)));
+        assert_eq!(r.progress(), before);
     }
 
     #[test]
