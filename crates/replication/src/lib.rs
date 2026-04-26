@@ -79,6 +79,8 @@ pub enum ReplicationStatusInvariantError {
         durable_snapshot_id: u64,
         live_snapshot_id: u64,
     },
+    #[error("durable term {durable} does not match live term {live}")]
+    TermMismatch { durable: Term, live: Term },
     #[error("recovery gap {actual:?} does not match live-vs-durable delta {expected:?}")]
     RecoveryGapMismatch {
         expected: RecoveryProgressGap,
@@ -108,6 +110,13 @@ impl ReplicationStatusSnapshot {
         self.durable
             .validate()
             .map_err(ReplicationStatusInvariantError::DurableProgress)?;
+
+        if self.durable.term != self.live.term {
+            return Err(ReplicationStatusInvariantError::TermMismatch {
+                durable: self.durable.term,
+                live: self.live.term,
+            });
+        }
 
         for (field, durable, live) in [
             (
@@ -2143,6 +2152,51 @@ mod tests {
                 field: "next_index",
                 durable: 7,
                 live: 6,
+            }
+        );
+    }
+
+    #[test]
+    fn replication_status_snapshot_validation_rejects_term_mismatch() {
+        let live = ReplicationProgress {
+            role: Role::Leader,
+            term: 4,
+            commit_index: 5,
+            applied_index: 5,
+            next_index: 6,
+            snapshot: SnapshotMeta {
+                last_included_index: 5,
+                last_included_term: 4,
+                snapshot_id: 10,
+            },
+            committed_but_unapplied_count: 0,
+            has_committed_entries_pending_apply: false,
+            uncommitted_entry_count: 0,
+            has_uncommitted_entries: false,
+        };
+        let durable = ReplicationProgress {
+            role: Role::Follower,
+            term: 3,
+            ..live.clone()
+        };
+
+        let err = ReplicationStatusSnapshot::new(
+            live,
+            durable,
+            RecoveryProgressGap {
+                commit_index_gap: 0,
+                applied_index_gap: 0,
+                next_index_gap: 0,
+                uncommitted_entry_gap: 0,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            ReplicationStatusInvariantError::TermMismatch {
+                durable: 3,
+                live: 4,
             }
         );
     }
