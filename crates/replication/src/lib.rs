@@ -536,7 +536,7 @@ impl LocalReplicator {
             self.applied_index = meta.last_included_index;
             self.applied_term = meta.last_included_term;
         }
-        self.snapshot_id = self.snapshot_id.max(meta.snapshot_id);
+        self.snapshot_id = meta.snapshot_id;
         self.entries.retain(|e| e.index > meta.last_included_index);
 
         let tail_index = self
@@ -977,7 +977,7 @@ impl RaftReplicator {
             self.applied_index = meta.last_included_index;
             self.applied_term = meta.last_included_term;
         }
-        self.snapshot_id = self.snapshot_id.max(meta.snapshot_id);
+        self.snapshot_id = meta.snapshot_id;
         self.entries.retain(|e| e.index > meta.last_included_index);
         self.ack_counts
             .retain(|idx, _| *idx > meta.last_included_index);
@@ -1327,6 +1327,30 @@ mod tests {
         assert_eq!(r.snapshot_meta().snapshot_id, 11);
         assert_eq!(r.snapshot_meta().last_included_index, t1.index);
         assert_eq!(r.progress().snapshot.snapshot_id, 11);
+    }
+
+    #[test]
+    fn local_install_snapshot_advancing_frontier_replaces_snapshot_identity_exactly() {
+        let mut r = LocalReplicator::leader();
+        let t1 = r.propose(vec![1]).unwrap();
+        r.mark_applied(t1.index);
+
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: t1.index,
+            last_included_term: 1,
+            snapshot_id: 11,
+        });
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: t1.index + 1,
+            last_included_term: 2,
+            snapshot_id: 4,
+        });
+
+        let snapshot = r.snapshot_meta();
+        assert_eq!(snapshot.last_included_index, t1.index + 1);
+        assert_eq!(snapshot.last_included_term, 2);
+        assert_eq!(snapshot.snapshot_id, 4);
+        assert_eq!(r.progress().snapshot, snapshot);
     }
 
     #[test]
@@ -4061,6 +4085,31 @@ mod tests {
 
         assert_eq!(r.snapshot_meta().snapshot_id, 7);
         assert_eq!(r.progress().snapshot.snapshot_id, 7);
+    }
+
+    #[test]
+    fn raft_install_snapshot_advancing_frontier_replaces_snapshot_identity_exactly() {
+        let mut r = RaftReplicator::new(3);
+        r.become_follower(4);
+
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 5,
+            last_included_term: 4,
+            snapshot_id: 11,
+        });
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 8,
+            last_included_term: 5,
+            snapshot_id: 4,
+        });
+
+        let snapshot = r.snapshot_meta();
+        assert_eq!(snapshot.last_included_index, 8);
+        assert_eq!(snapshot.last_included_term, 5);
+        assert_eq!(snapshot.snapshot_id, 4);
+        assert_eq!(r.progress().snapshot, snapshot);
+        assert_eq!(r.status_snapshot().live.snapshot, snapshot);
+        assert_eq!(r.status_snapshot().durable.snapshot, snapshot);
     }
 
     #[test]

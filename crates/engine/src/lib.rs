@@ -3566,4 +3566,28 @@ mod tests {
         assert_eq!(e.visible_up_to(), baseline.snapshot.visible_index);
         assert_eq!(e.get("a"), Some("1"));
     }
+
+    #[test]
+    fn installing_advanced_snapshot_replaces_snapshot_identity_exactly() {
+        let mut e = Engine::new_local();
+        let committed = e.commit_mutation(1, b"SET a=1".to_vec()).unwrap();
+
+        e.install_snapshot(SnapshotMeta {
+            last_included_index: committed.index,
+            last_included_term: 1,
+            snapshot_id: 11,
+        });
+        e.install_snapshot(SnapshotMeta {
+            last_included_index: committed.index + 2,
+            last_included_term: 2,
+            snapshot_id: 4,
+        });
+
+        let marks = e.replication_watermarks();
+        let status = e.status_snapshot();
+        assert_eq!(marks.snapshot_id, 4);
+        assert_eq!(status.snapshot.snapshot_id, 4);
+        assert_eq!(status.snapshot.last_included_index, committed.index + 2);
+        assert_eq!(status.snapshot.last_included_term, 2);
+    }
 }
