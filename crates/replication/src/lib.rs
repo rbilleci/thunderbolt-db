@@ -62,6 +62,14 @@ pub enum ReplicationStatusInvariantError {
     LiveProgress(#[from] ReplicationProgressInvariantError),
     #[error("durable progress is invalid: {0}")]
     DurableProgress(ReplicationProgressInvariantError),
+    #[error(
+        "durable progress cannot be ahead of live progress for {field}: durable={durable}, live={live}"
+    )]
+    DurableAheadOfLive {
+        field: &'static str,
+        durable: u64,
+        live: u64,
+    },
     #[error("recovery gap {actual:?} does not match live-vs-durable delta {expected:?}")]
     RecoveryGapMismatch {
         expected: RecoveryProgressGap,
@@ -91,6 +99,43 @@ impl ReplicationStatusSnapshot {
         self.durable
             .validate()
             .map_err(ReplicationStatusInvariantError::DurableProgress)?;
+
+        for (field, durable, live) in [
+            (
+                "snapshot.last_included_index",
+                self.durable.snapshot.last_included_index,
+                self.live.snapshot.last_included_index,
+            ),
+            (
+                "snapshot.last_included_term",
+                self.durable.snapshot.last_included_term,
+                self.live.snapshot.last_included_term,
+            ),
+            (
+                "commit_index",
+                self.durable.commit_index,
+                self.live.commit_index,
+            ),
+            (
+                "applied_index",
+                self.durable.applied_index,
+                self.live.applied_index,
+            ),
+            ("next_index", self.durable.next_index, self.live.next_index),
+            (
+                "uncommitted_entry_count",
+                self.durable.uncommitted_entry_count as u64,
+                self.live.uncommitted_entry_count as u64,
+            ),
+        ] {
+            if durable > live {
+                return Err(ReplicationStatusInvariantError::DurableAheadOfLive {
+                    field,
+                    durable,
+                    live,
+                });
+            }
+        }
 
         let expected = Self::recovery_gap_between(&self.live, &self.durable);
         if self.recovery_gap != expected {
@@ -2011,6 +2056,51 @@ mod tests {
     }
 
     #[test]
+    fn replication_status_snapshot_validation_rejects_durable_state_ahead_of_live() {
+        let live = ReplicationProgress {
+            role: Role::Leader,
+            term: 4,
+            commit_index: 5,
+            applied_index: 5,
+            next_index: 6,
+            snapshot: SnapshotMeta {
+                last_included_index: 5,
+                last_included_term: 4,
+                snapshot_id: 10,
+            },
+            committed_but_unapplied_count: 0,
+            has_committed_entries_pending_apply: false,
+            uncommitted_entry_count: 0,
+            has_uncommitted_entries: false,
+        };
+        let durable = ReplicationProgress {
+            next_index: 7,
+            ..live.clone()
+        };
+
+        let err = ReplicationStatusSnapshot::new(
+            live,
+            durable,
+            RecoveryProgressGap {
+                commit_index_gap: 0,
+                applied_index_gap: 0,
+                next_index_gap: 0,
+                uncommitted_entry_gap: 0,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            ReplicationStatusInvariantError::DurableAheadOfLive {
+                field: "next_index",
+                durable: 7,
+                live: 6,
+            }
+        );
+    }
+
+    #[test]
     fn raft_recovery_progress_projects_durable_follower_state_from_live_leader() {
         let mut leader = RaftReplicator::new(3);
         leader.become_leader(4);
@@ -3494,5 +3584,70 @@ mod tests {
 
         assert_eq!(r.snapshot_meta().snapshot_id, 7);
         assert_eq!(r.progress().snapshot.snapshot_id, 7);
+    }
+
+    #[test]
+    fn same_frontier_same_term_snapshot_refresh_preserves_speculative_gap_semantics() {
+        let mut r = RaftReplicator::new(3);
+        r.become_follower(4);
+
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 5,
+            last_included_term: 4,
+            snapshot_id: 2,
+        });
+        r.append_entries_from_leader(
+            4,
+            5,
+            4,
+            vec![LogEntry {
+                term: 4,
+                index: 6,
+                payload: vec![9],
+            }],
+            5,
+        )
+        .unwrap();
+
+        let baseline = r.status_snapshot();
+        assert!(baseline.has_speculative_tail());
+        assert_eq!(baseline.live.snapshot.snapshot_id, 2);
+        assert_eq!(baseline.durable.snapshot.snapshot_id, 2);
+
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 5,
+            last_included_term: 4,
+            snapshot_id: 7,
+        });
+
+        let refreshed = r.status_snapshot();
+        assert!(refreshed.has_speculative_tail());
+        assert_eq!(refreshed.recovery_gap, baseline.recovery_gap);
+        assert_eq!(refreshed.live.commit_index, baseline.live.commit_index);
+        assert_eq!(refreshed.live.applied_index, baseline.live.applied_index);
+        assert_eq!(refreshed.live.next_index, baseline.live.next_index);
+        assert_eq!(
+            refreshed.live.uncommitted_entry_count,
+            baseline.live.uncommitted_entry_count
+        );
+        assert_eq!(
+            refreshed.durable.commit_index,
+            baseline.durable.commit_index
+        );
+        assert_eq!(
+            refreshed.durable.applied_index,
+            baseline.durable.applied_index
+        );
+        assert_eq!(refreshed.durable.next_index, baseline.durable.next_index);
+        assert_eq!(
+            refreshed.durable.uncommitted_entry_count,
+            baseline.durable.uncommitted_entry_count
+        );
+        assert_eq!(refreshed.live.snapshot.last_included_index, 5);
+        assert_eq!(refreshed.live.snapshot.last_included_term, 4);
+        assert_eq!(refreshed.durable.snapshot.last_included_index, 5);
+        assert_eq!(refreshed.durable.snapshot.last_included_term, 4);
+        assert_eq!(refreshed.live.snapshot.snapshot_id, 7);
+        assert_eq!(refreshed.durable.snapshot.snapshot_id, 7);
     }
 }

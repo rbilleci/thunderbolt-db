@@ -27,6 +27,7 @@
   - `durable: ReplicationProgress`
   - `recovery_gap: RecoveryProgressGap`
 - `ReplicationStatusSnapshot::validate()` enforces that both progress snapshots remain valid and that `recovery_gap` exactly matches the live-vs-durable delta.
+- `ReplicationStatusSnapshot::validate()` also rejects impossible status surfaces where the durable projection is ahead of live state on snapshot frontier, commit/apply/next-index, or uncommitted-tail counters.
 
 ## ReplicationProgress (validated progress snapshot)
 
@@ -138,7 +139,9 @@ Current operator/developer question mapping:
 - **Durable-progress alignment:** `RaftReplicator::recovery_progress()` is the live-node projection of that restart bundle; rejected follower transitions leave it unchanged, accepted catch-up/snapshot advancement move it monotonically with the durable frontier, and leader-only speculative tail stays excluded until it becomes committed.
 - **Live-vs-durable gap semantics:** `RaftReplicator::recovery_progress_gap()` stays zero when the live node is restart-equivalent, flips `next_index_gap`/`uncommitted_entry_gap` while speculative tail exists, and returns to zero after quorum commit or role/epoch transitions discard that speculative tail.
 - **Status-surface alignment:** `status_snapshot()` publishes live progress, durable progress, and their validated gap together, so rejected/accepted follower transitions can be asserted against one surface instead of re-joining helper APIs externally.
+- **Durable-never-ahead invariant:** the published durable projection is always a restart-safe subset of live state; validation rejects any status surface where durable snapshot frontier or progress counters outrun the live node.
 - **Snapshot-only resume stability:** a recovery bundle with no retained committed tail still projects to a caught-up follower state at the snapshot boundary, with `commit_index == applied_index == snapshot.last_included_index` and `next_index` advancing from there.
 - **Snapshot-tail resume stability:** a recovery bundle with a compacted snapshot plus contiguous committed tail projects to the same follower `ReplicationProgress` after resume, preserving the snapshot boundary while surfacing commit/apply lag explicitly until apply catches up.
 - **Resume catch-up + snapshot stress stability:** a resumed follower preserves `ReplicationProgress` across rejected non-contiguous catch-up, then advances monotonically through accepted catch-up, heartbeat commit promotion, and later snapshot installation without inventing gaps or regressing the compacted boundary.
+- **Same-frontier snapshot refresh stability:** when a same-frontier same-term snapshot refreshes only `snapshot_id`, both live and durable status surfaces adopt the new identity without perturbing speculative-tail gap semantics or progress counters.
 - **Not yet guaranteed:** cross-process WAL replay integration, durable ack-tracking reconstruction beyond committed boundary, or automatic leader re-election behavior.
