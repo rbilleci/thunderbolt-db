@@ -43,6 +43,7 @@
 - Added local/raft/engine regressions proving stale snapshot installs are status/progress no-ops unless they advance (or exactly match) the current frontier term, preventing newer-but-stale `snapshot_id` values from drifting away from the actually served durable frontier.
 - Added `RaftReplicator::recovery_progress()` as the live durable-state projection of `recovery_state()`, plus stress regressions proving rejected follower transitions leave it unchanged, accepted catch-up/heartbeat/snapshot advancement keep it aligned with the restart surface, and speculative leader-only tail remains excluded until committed.
 - Added `RaftReplicator::recovery_progress_gap()` plus Q3 regressions proving the live-vs-durable delta stays zero for restart-equivalent followers, surfaces only speculative `next_index`/uncommitted-tail drift while catch-up is still in flight, snaps back to zero after quorum commit, snapshot install, or role/epoch tail discard, and remains unchanged when a same-frontier wrong-term snapshot is correctly ignored.
+- Added `ReplicationStatusSnapshot` plus `LocalReplicator::status_snapshot()` / `RaftReplicator::status_snapshot()` so Q3 status checks publish live progress, durable progress, and validated live-vs-durable gap together instead of forcing callers to stitch helper surfaces back together manually.
 - Updated replication interface docs and runbooks to document current guarantees and explicit non-guarantees around ordering, apply progression, restart behavior, stale-snapshot no-op semantics, and the new durable-progress alignment helper.
 
 ### Current blockers
@@ -50,7 +51,7 @@
 
 ### Next loops
 1. Extend Q2 with richer value-aware ordering or join-adjacent slices without weakening the explicit fallback contract.
-2. Continue Q3 with stale/resume semantics under richer follower catch-up and snapshot-install stress, especially around leader/follower status surfaces that should publish `recovery_progress_gap()` cleanly without weakening the durable-vs-live contract.
+2. Continue Q3 with stale/resume semantics under richer follower catch-up and snapshot-install stress, now extending beyond the new `status_snapshot()` surface toward heavier mixed-transition stress or wider engine/telemetry publication as needed.
 
 ## 2026-04-24
 

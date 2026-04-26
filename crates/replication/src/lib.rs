@@ -49,6 +49,83 @@ impl RecoveryProgressGap {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicationStatusSnapshot {
+    pub live: ReplicationProgress,
+    pub durable: ReplicationProgress,
+    pub recovery_gap: RecoveryProgressGap,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ReplicationStatusInvariantError {
+    #[error("live progress is invalid: {0}")]
+    LiveProgress(#[from] ReplicationProgressInvariantError),
+    #[error("durable progress is invalid: {0}")]
+    DurableProgress(ReplicationProgressInvariantError),
+    #[error("recovery gap {actual:?} does not match live-vs-durable delta {expected:?}")]
+    RecoveryGapMismatch {
+        expected: RecoveryProgressGap,
+        actual: RecoveryProgressGap,
+    },
+}
+
+impl ReplicationStatusSnapshot {
+    pub fn new(
+        live: ReplicationProgress,
+        durable: ReplicationProgress,
+        recovery_gap: RecoveryProgressGap,
+    ) -> Result<Self, ReplicationStatusInvariantError> {
+        let snapshot = Self {
+            live,
+            durable,
+            recovery_gap,
+        };
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
+    pub fn validate(&self) -> Result<(), ReplicationStatusInvariantError> {
+        self.live
+            .validate()
+            .map_err(ReplicationStatusInvariantError::LiveProgress)?;
+        self.durable
+            .validate()
+            .map_err(ReplicationStatusInvariantError::DurableProgress)?;
+
+        let expected = Self::recovery_gap_between(&self.live, &self.durable);
+        if self.recovery_gap != expected {
+            return Err(ReplicationStatusInvariantError::RecoveryGapMismatch {
+                expected,
+                actual: self.recovery_gap.clone(),
+            });
+        }
+
+        Ok(())
+    }
+
+    pub fn is_restart_equivalent(&self) -> bool {
+        self.recovery_gap.is_restart_equivalent()
+    }
+
+    pub fn has_speculative_tail(&self) -> bool {
+        self.recovery_gap.has_speculative_tail()
+    }
+
+    fn recovery_gap_between(
+        live: &ReplicationProgress,
+        durable: &ReplicationProgress,
+    ) -> RecoveryProgressGap {
+        RecoveryProgressGap {
+            commit_index_gap: live.commit_index.saturating_sub(durable.commit_index) as usize,
+            applied_index_gap: live.applied_index.saturating_sub(durable.applied_index) as usize,
+            next_index_gap: live.next_index.saturating_sub(durable.next_index) as usize,
+            uncommitted_entry_gap: live
+                .uncommitted_entry_count
+                .saturating_sub(durable.uncommitted_entry_count),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ReplicationProgressInvariantError {
     #[error("applied_index {applied_index} exceeds commit_index {commit_index}")]
@@ -411,6 +488,21 @@ impl LocalReplicator {
             .expect("local replication progress invariants should hold");
         progress
     }
+
+    pub fn status_snapshot(&self) -> ReplicationStatusSnapshot {
+        let live = self.progress();
+        ReplicationStatusSnapshot::new(
+            live.clone(),
+            live,
+            RecoveryProgressGap {
+                commit_index_gap: 0,
+                applied_index_gap: 0,
+                next_index_gap: 0,
+                uncommitted_entry_gap: 0,
+            },
+        )
+        .expect("local replication status snapshot invariants should hold")
+    }
 }
 
 #[derive(Debug)]
@@ -639,16 +731,16 @@ impl RaftReplicator {
     }
 
     pub fn recovery_progress_gap(&self) -> RecoveryProgressGap {
-        let live = self.progress();
-        let durable = self.recovery_progress();
-        RecoveryProgressGap {
-            commit_index_gap: live.commit_index.saturating_sub(durable.commit_index) as usize,
-            applied_index_gap: live.applied_index.saturating_sub(durable.applied_index) as usize,
-            next_index_gap: live.next_index.saturating_sub(durable.next_index) as usize,
-            uncommitted_entry_gap: live
-                .uncommitted_entry_count
-                .saturating_sub(durable.uncommitted_entry_count),
-        }
+        ReplicationStatusSnapshot::recovery_gap_between(&self.progress(), &self.recovery_progress())
+    }
+
+    pub fn status_snapshot(&self) -> ReplicationStatusSnapshot {
+        ReplicationStatusSnapshot::new(
+            self.progress(),
+            self.recovery_progress(),
+            self.recovery_progress_gap(),
+        )
+        .expect("raft replication status snapshot invariants should hold")
     }
 
     pub fn progress(&self) -> ReplicationProgress {
@@ -1724,6 +1816,10 @@ mod tests {
 
         assert_eq!(resumed.progress(), projected);
         assert_eq!(resumed.progress().apply_gap(), 2);
+        let status = resumed.status_snapshot();
+        assert_eq!(status.live, projected);
+        assert_eq!(status.durable, projected);
+        assert!(status.is_restart_equivalent());
     }
 
     #[test]
@@ -1753,12 +1849,16 @@ mod tests {
         let mut resumed = RaftReplicator::resume_as_follower(3, recovery).unwrap();
         let baseline = resumed.progress();
         let baseline_recovery = resumed.recovery_progress();
+        let baseline_status = resumed.status_snapshot();
         assert_eq!(baseline.commit_index, 12);
         assert_eq!(baseline.applied_index, 10);
         assert_eq!(baseline.next_index, 13);
         assert_eq!(baseline.apply_gap(), 2);
         assert!(!baseline.is_caught_up());
         assert_eq!(baseline_recovery, baseline);
+        assert_eq!(baseline_status.live, baseline);
+        assert_eq!(baseline_status.durable, baseline_recovery);
+        assert!(baseline_status.is_restart_equivalent());
         assert!(resumed.recovery_progress_gap().is_restart_equivalent());
 
         let err = resumed
@@ -1777,6 +1877,7 @@ mod tests {
         assert!(matches!(err, EngineError::ProposalFailed(_)));
         assert_eq!(resumed.progress(), baseline);
         assert_eq!(resumed.recovery_progress(), baseline_recovery);
+        assert_eq!(resumed.status_snapshot(), baseline_status);
         assert!(resumed.recovery_progress_gap().is_restart_equivalent());
 
         resumed
@@ -1809,6 +1910,10 @@ mod tests {
         assert!(!after_append_recovery.has_uncommitted_entries);
         assert_eq!(after_append_recovery.apply_gap(), 2);
         assert!(!after_append_recovery.is_caught_up());
+        let after_append_status = resumed.status_snapshot();
+        assert_eq!(after_append_status.live, after_append);
+        assert_eq!(after_append_status.durable, after_append_recovery);
+        assert!(after_append_status.has_speculative_tail());
         assert_eq!(
             resumed.recovery_progress_gap(),
             RecoveryProgressGap {
@@ -1833,6 +1938,7 @@ mod tests {
         assert!(!after_heartbeat.is_caught_up());
         after_heartbeat.validate().unwrap();
         assert_eq!(after_heartbeat_recovery, after_heartbeat);
+        assert!(resumed.status_snapshot().is_restart_equivalent());
         assert!(resumed.recovery_progress_gap().is_restart_equivalent());
 
         resumed.install_snapshot(SnapshotMeta {
@@ -1851,6 +1957,7 @@ mod tests {
         assert!(after_snapshot.is_caught_up());
         after_snapshot.validate().unwrap();
         assert_eq!(after_snapshot_recovery, after_snapshot);
+        assert!(resumed.status_snapshot().is_restart_equivalent());
         assert!(resumed.recovery_progress_gap().is_restart_equivalent());
 
         let err = resumed
@@ -1869,6 +1976,7 @@ mod tests {
         assert!(matches!(err, EngineError::ProposalFailed(_)));
         assert_eq!(resumed.progress(), after_snapshot);
         assert_eq!(resumed.recovery_progress(), after_snapshot_recovery);
+        assert_eq!(resumed.status_snapshot().durable, after_snapshot_recovery);
         assert!(resumed.recovery_progress_gap().is_restart_equivalent());
     }
 
@@ -1940,6 +2048,26 @@ mod tests {
         assert!(gap.has_gap());
         assert!(gap.has_speculative_tail());
         assert!(!gap.is_restart_equivalent());
+
+        let status = leader.status_snapshot();
+        assert_eq!(status.live, live);
+        assert_eq!(status.durable, durable);
+        assert_eq!(status.recovery_gap, gap);
+        assert!(status.has_speculative_tail());
+    }
+
+    #[test]
+    fn local_status_snapshot_is_always_restart_equivalent() {
+        let mut local = LocalReplicator::leader();
+        let token = local.propose(b"set a=1".to_vec()).unwrap();
+        local.mark_applied(token.index);
+
+        let status = local.status_snapshot();
+
+        assert_eq!(status.live, local.progress());
+        assert_eq!(status.durable, local.progress());
+        assert!(status.is_restart_equivalent());
+        assert!(!status.has_speculative_tail());
     }
 
     #[test]
