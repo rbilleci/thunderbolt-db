@@ -46,6 +46,7 @@
 - Added `ReplicationStatusSnapshot` plus `LocalReplicator::status_snapshot()` / `RaftReplicator::status_snapshot()` so Q3 status checks publish live progress, durable progress, and validated live-vs-durable gap together instead of forcing callers to stitch helper surfaces back together manually.
 - Tightened `ReplicationStatusSnapshot::validate()` so impossible surfaces are rejected when durable restart state would outrun the live node's snapshot frontier, commit/apply/next-index, or uncommitted-tail counters.
 - Added a Q3 regression proving same-frontier same-term snapshot refreshes may advance `snapshot_id` while preserving speculative-tail `status_snapshot()` gap semantics and progress counters exactly.
+- Added a follow-on Q3 regression proving that refreshed same-frontier snapshot identity survives later role/term transitions while speculative tail is discarded, keeping the durable truth surface aligned across epoch changes.
 - Updated replication interface docs and runbooks to document current guarantees and explicit non-guarantees around ordering, apply progression, restart behavior, stale-snapshot no-op semantics, and the new durable-progress alignment helper.
 
 ### Current blockers
