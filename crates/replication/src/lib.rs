@@ -70,6 +70,15 @@ pub enum ReplicationStatusInvariantError {
         durable: u64,
         live: u64,
     },
+    #[error(
+        "snapshot identity drift at frontier index={last_included_index} term={last_included_term}: durable snapshot_id={durable_snapshot_id}, live snapshot_id={live_snapshot_id}"
+    )]
+    SnapshotIdentityDrift {
+        last_included_index: Index,
+        last_included_term: Term,
+        durable_snapshot_id: u64,
+        live_snapshot_id: u64,
+    },
     #[error("recovery gap {actual:?} does not match live-vs-durable delta {expected:?}")]
     RecoveryGapMismatch {
         expected: RecoveryProgressGap,
@@ -135,6 +144,18 @@ impl ReplicationStatusSnapshot {
                     live,
                 });
             }
+        }
+
+        if self.durable.snapshot.last_included_index == self.live.snapshot.last_included_index
+            && self.durable.snapshot.last_included_term == self.live.snapshot.last_included_term
+            && self.durable.snapshot.snapshot_id != self.live.snapshot.snapshot_id
+        {
+            return Err(ReplicationStatusInvariantError::SnapshotIdentityDrift {
+                last_included_index: self.live.snapshot.last_included_index,
+                last_included_term: self.live.snapshot.last_included_term,
+                durable_snapshot_id: self.durable.snapshot.snapshot_id,
+                live_snapshot_id: self.live.snapshot.snapshot_id,
+            });
         }
 
         let expected = Self::recovery_gap_between(&self.live, &self.durable);
@@ -2096,6 +2117,55 @@ mod tests {
                 field: "next_index",
                 durable: 7,
                 live: 6,
+            }
+        );
+    }
+
+    #[test]
+    fn replication_status_snapshot_validation_rejects_same_frontier_snapshot_identity_drift() {
+        let live = ReplicationProgress {
+            role: Role::Follower,
+            term: 4,
+            commit_index: 5,
+            applied_index: 5,
+            next_index: 6,
+            snapshot: SnapshotMeta {
+                last_included_index: 5,
+                last_included_term: 4,
+                snapshot_id: 10,
+            },
+            committed_but_unapplied_count: 0,
+            has_committed_entries_pending_apply: false,
+            uncommitted_entry_count: 0,
+            has_uncommitted_entries: false,
+        };
+        let durable = ReplicationProgress {
+            snapshot: SnapshotMeta {
+                snapshot_id: 9,
+                ..live.snapshot.clone()
+            },
+            ..live.clone()
+        };
+
+        let err = ReplicationStatusSnapshot::new(
+            live,
+            durable,
+            RecoveryProgressGap {
+                commit_index_gap: 0,
+                applied_index_gap: 0,
+                next_index_gap: 0,
+                uncommitted_entry_gap: 0,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            ReplicationStatusInvariantError::SnapshotIdentityDrift {
+                last_included_index: 5,
+                last_included_term: 4,
+                durable_snapshot_id: 9,
+                live_snapshot_id: 10,
             }
         );
     }
