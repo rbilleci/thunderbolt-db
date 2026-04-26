@@ -51,6 +51,8 @@
 - Added a focused regression locking that invalid same-frontier snapshot-id drift is rejected explicitly, tightening Q3 truth-surface semantics around snapshot identity.
 - Hardened `ReplicationStatusSnapshot::validate()` again so the durable restart projection must share the live node's current term; older-term durable truth surfaces are now rejected explicitly instead of relying on implicit constructor behavior.
 - Hardened local/raft snapshot installs so impossible higher-frontier snapshots with a regressed term are ignored as status/progress no-ops, and added local/raft/engine regressions locking that incoherent frontier metadata cannot outrun the served durable truth surface or perturb speculative-tail gap semantics.
+- Hardened `RaftReplicator::append_entries_from_leader(...)` so newer-leader term discovery reuses the normal follower step-down path before later prev-log rejection checks, guaranteeing prior-epoch speculative tail is discarded and `status_snapshot()` returns to a restart-equivalent durable boundary even when the append itself is rejected.
+- Added focused candidate/follower regressions locking that newer-leader append rejections cannot leak stale speculative tail across epochs.
 - Updated replication interface docs and runbooks to document current guarantees and explicit non-guarantees around ordering, apply progression, restart behavior, stale-snapshot no-op semantics, and the new durable-progress alignment helper.
 
 ### Current blockers
@@ -58,7 +60,7 @@
 
 ### Next loops
 1. Extend Q2 with richer value-aware ordering or join-adjacent slices without weakening the explicit fallback contract.
-2. Continue Q3 with stale/resume semantics under richer follower catch-up and snapshot-install stress, now that the status surface also rejects older-term or durable-ahead-of-live impossible states, ignores incoherent higher-frontier/lower-term snapshots, and preserves gap semantics across same-frontier snapshot identity refresh.
+2. Continue Q3 with stale/resume semantics under richer follower catch-up and snapshot-install stress, now that the status surface also rejects older-term or durable-ahead-of-live impossible states, ignores incoherent higher-frontier/lower-term snapshots, discards stale speculative tail on newer-leader rejection paths, and preserves gap semantics across same-frontier snapshot identity refresh.
 
 ## 2026-04-24
 

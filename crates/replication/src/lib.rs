@@ -860,8 +860,12 @@ impl RaftReplicator {
             )));
         }
 
-        self.term = leader_term;
-        self.role = Role::Follower;
+        if self.role != Role::Follower || leader_term > self.term {
+            self.become_follower(leader_term);
+        } else {
+            self.term = leader_term;
+            self.role = Role::Follower;
+        }
 
         if prev_log_index < self.compacted_index {
             return Err(EngineError::ProposalFailed(format!(
@@ -3397,6 +3401,105 @@ mod tests {
         assert_eq!(r.current_term(), 6);
         assert_eq!(r.commit_index(), 0);
         assert_eq!(r.next_index, 1);
+        assert!(r.entries.is_empty());
+    }
+
+    #[test]
+    fn raft_newer_leader_rejection_discards_candidate_speculative_tail() {
+        let mut r = RaftReplicator::new(3);
+        r.become_leader(4);
+
+        let committed = r.propose(vec![1]).unwrap();
+        r.register_follower_ack(committed.index, 1);
+        let speculative = r.propose(vec![2]).unwrap();
+        let speculative_status = r.status_snapshot();
+        assert!(speculative_status.has_speculative_tail());
+        assert_eq!(speculative_status.live.next_index, speculative.index + 1);
+        assert_eq!(speculative_status.live.uncommitted_entry_count, 1);
+
+        r.become_candidate(5);
+        let err = r
+            .append_entries_from_leader(
+                6,
+                committed.index + 9,
+                6,
+                vec![LogEntry {
+                    term: 6,
+                    index: committed.index + 10,
+                    payload: vec![9],
+                }],
+                committed.index + 10,
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, EngineError::ProposalFailed(_)));
+        let after = r.status_snapshot();
+        assert!(after.is_restart_equivalent());
+        assert_eq!(after.live.role, Role::Follower);
+        assert_eq!(after.live.term, 6);
+        assert_eq!(after.live.commit_index, committed.index);
+        assert_eq!(after.live.applied_index, 0);
+        assert_eq!(after.live.next_index, committed.index + 1);
+        assert_eq!(after.live.uncommitted_entry_count, 0);
+        assert!(!after.live.has_uncommitted_entries);
+        assert_eq!(after.live, after.durable);
+        assert_eq!(r.entries.len(), 1);
+        assert_eq!(r.entries[0].index, committed.index);
+    }
+
+    #[test]
+    fn raft_newer_leader_rejection_discards_follower_speculative_tail() {
+        let mut r = RaftReplicator::new(3);
+        r.become_follower(4);
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 5,
+            last_included_term: 4,
+            snapshot_id: 2,
+        });
+        r.append_entries_from_leader(
+            4,
+            5,
+            4,
+            vec![LogEntry {
+                term: 4,
+                index: 6,
+                payload: vec![6],
+            }],
+            5,
+        )
+        .unwrap();
+
+        let baseline = r.status_snapshot();
+        assert!(baseline.has_speculative_tail());
+        assert_eq!(baseline.live.uncommitted_entry_count, 1);
+        assert_eq!(baseline.durable.snapshot.snapshot_id, 2);
+
+        let err = r
+            .append_entries_from_leader(
+                5,
+                99,
+                5,
+                vec![LogEntry {
+                    term: 5,
+                    index: 100,
+                    payload: vec![100],
+                }],
+                100,
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, EngineError::ProposalFailed(_)));
+        let after = r.status_snapshot();
+        assert!(after.is_restart_equivalent());
+        assert_eq!(after.live.role, Role::Follower);
+        assert_eq!(after.live.term, 5);
+        assert_eq!(after.live.commit_index, 5);
+        assert_eq!(after.live.applied_index, 5);
+        assert_eq!(after.live.next_index, 6);
+        assert_eq!(after.live.snapshot.snapshot_id, 2);
+        assert_eq!(after.live.uncommitted_entry_count, 0);
+        assert!(!after.live.has_uncommitted_entries);
+        assert_eq!(after.live, after.durable);
         assert!(r.entries.is_empty());
     }
 
