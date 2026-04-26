@@ -4387,4 +4387,95 @@ mod tests {
             recovery.progress_as_follower().unwrap()
         );
     }
+
+    #[test]
+    fn same_frontier_snapshot_refresh_keeps_recovery_gap_explicit_through_newer_leader_handoff() {
+        let mut r = RaftReplicator::new(3);
+        r.become_follower(4);
+
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 5,
+            last_included_term: 4,
+            snapshot_id: 2,
+        });
+        r.append_entries_from_leader(
+            4,
+            5,
+            4,
+            vec![LogEntry {
+                term: 4,
+                index: 6,
+                payload: vec![6],
+            }],
+            5,
+        )
+        .unwrap();
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 5,
+            last_included_term: 4,
+            snapshot_id: 7,
+        });
+
+        assert_eq!(
+            r.recovery_progress_gap(),
+            RecoveryProgressGap {
+                commit_index_gap: 0,
+                applied_index_gap: 0,
+                next_index_gap: 1,
+                uncommitted_entry_gap: 1,
+            }
+        );
+
+        let err = r
+            .append_entries_from_leader(
+                5,
+                99,
+                5,
+                vec![LogEntry {
+                    term: 5,
+                    index: 100,
+                    payload: vec![100],
+                }],
+                100,
+            )
+            .unwrap_err();
+        assert!(matches!(err, EngineError::ProposalFailed(_)));
+        assert!(r.recovery_progress_gap().is_restart_equivalent());
+
+        r.append_entries_from_leader(
+            5,
+            5,
+            4,
+            vec![
+                LogEntry {
+                    term: 5,
+                    index: 6,
+                    payload: vec![60],
+                },
+                LogEntry {
+                    term: 5,
+                    index: 7,
+                    payload: vec![70],
+                },
+            ],
+            6,
+        )
+        .unwrap();
+        assert_eq!(
+            r.recovery_progress_gap(),
+            RecoveryProgressGap {
+                commit_index_gap: 0,
+                applied_index_gap: 0,
+                next_index_gap: 1,
+                uncommitted_entry_gap: 1,
+            }
+        );
+
+        r.append_entries_from_leader(5, 7, 5, vec![], 7).unwrap();
+        assert!(r.recovery_progress_gap().is_restart_equivalent());
+
+        r.mark_applied(7);
+        assert!(r.recovery_progress_gap().is_restart_equivalent());
+        assert_eq!(r.recovery_state().snapshot.snapshot_id, 7);
+    }
 }
