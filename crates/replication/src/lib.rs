@@ -515,7 +515,9 @@ impl LocalReplicator {
         let advances_frontier = meta.last_included_index > current.last_included_index;
         let same_frontier_same_term = meta.last_included_index == current.last_included_index
             && meta.last_included_term == current.last_included_term;
-        if !advances_frontier && !same_frontier_same_term {
+        let regresses_term_on_advanced_frontier =
+            advances_frontier && meta.last_included_term < current.last_included_term;
+        if regresses_term_on_advanced_frontier || (!advances_frontier && !same_frontier_same_term) {
             return;
         }
 
@@ -946,7 +948,9 @@ impl RaftReplicator {
         let advances_frontier = meta.last_included_index > current.last_included_index;
         let same_frontier_same_term = meta.last_included_index == current.last_included_index
             && meta.last_included_term == current.last_included_term;
-        if !advances_frontier && !same_frontier_same_term {
+        let regresses_term_on_advanced_frontier =
+            advances_frontier && meta.last_included_term < current.last_included_term;
+        if regresses_term_on_advanced_frontier || (!advances_frontier && !same_frontier_same_term) {
             return;
         }
 
@@ -1310,6 +1314,28 @@ mod tests {
         assert_eq!(r.snapshot_meta().snapshot_id, 11);
         assert_eq!(r.snapshot_meta().last_included_index, t1.index);
         assert_eq!(r.progress().snapshot.snapshot_id, 11);
+    }
+
+    #[test]
+    fn local_install_snapshot_with_higher_index_lower_term_is_a_progress_no_op() {
+        let mut r = LocalReplicator::leader();
+        let t1 = r.propose(vec![1]).unwrap();
+        r.mark_applied(t1.index);
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: t1.index + 1,
+            last_included_term: 3,
+            snapshot_id: 11,
+        });
+        let baseline = r.progress();
+
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: t1.index + 2,
+            last_included_term: 2,
+            snapshot_id: 19,
+        });
+
+        assert_eq!(r.progress(), baseline);
+        assert_eq!(r.snapshot_meta().snapshot_id, 11);
     }
 
     #[test]
@@ -3589,6 +3615,28 @@ mod tests {
     }
 
     #[test]
+    fn raft_install_snapshot_with_higher_index_lower_term_is_a_progress_no_op() {
+        let mut r = RaftReplicator::new(3);
+        r.become_follower(4);
+
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 5,
+            last_included_term: 4,
+            snapshot_id: 2,
+        });
+        let baseline = r.progress();
+
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 6,
+            last_included_term: 3,
+            snapshot_id: 8,
+        });
+
+        assert_eq!(r.progress(), baseline);
+        assert_eq!(r.snapshot_meta().snapshot_id, 2);
+    }
+
+    #[test]
     fn raft_install_snapshot_gap_is_stable_for_same_frontier_wrong_term() {
         let mut r = RaftReplicator::new(3);
         r.become_follower(4);
@@ -3628,6 +3676,45 @@ mod tests {
             last_included_index: 5,
             last_included_term: 2,
             snapshot_id: 3,
+        });
+
+        assert_eq!(r.progress(), baseline);
+        assert_eq!(r.recovery_progress(), baseline_recovery);
+        assert_eq!(r.recovery_progress_gap(), baseline_gap);
+        assert_eq!(r.snapshot_meta().snapshot_id, 2);
+    }
+
+    #[test]
+    fn raft_install_snapshot_gap_is_stable_for_higher_frontier_lower_term() {
+        let mut r = RaftReplicator::new(3);
+        r.become_follower(4);
+
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 5,
+            last_included_term: 4,
+            snapshot_id: 2,
+        });
+        r.append_entries_from_leader(
+            4,
+            5,
+            4,
+            vec![LogEntry {
+                term: 4,
+                index: 6,
+                payload: vec![9],
+            }],
+            5,
+        )
+        .unwrap();
+
+        let baseline = r.progress();
+        let baseline_recovery = r.recovery_progress();
+        let baseline_gap = r.recovery_progress_gap();
+
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 6,
+            last_included_term: 3,
+            snapshot_id: 8,
         });
 
         assert_eq!(r.progress(), baseline);

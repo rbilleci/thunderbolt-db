@@ -80,6 +80,7 @@ During install:
 
 - Apply snapshot metadata atomically.
 - Do not rewind indices when receiving older snapshot metadata.
+- Reject incoherent snapshot frontier jumps where `last_included_index` advances but `last_included_term` regresses.
 
 After install:
 

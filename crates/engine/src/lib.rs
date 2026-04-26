@@ -1209,9 +1209,10 @@ impl Engine {
     }
 
     pub fn install_snapshot(&mut self, meta: SnapshotMeta) {
-        let last_included_index = meta.last_included_index;
         self.repl.install_snapshot(meta);
-        self.visible_up_to = self.visible_up_to.max(last_included_index);
+        self.visible_up_to = self
+            .visible_up_to
+            .max(self.repl.snapshot_meta().last_included_index);
     }
 
     pub fn snapshot_meta(&self) -> SnapshotMeta {
@@ -3537,6 +3538,32 @@ mod tests {
         assert_eq!(marks.snapshot_id, baseline.snapshot.snapshot_id);
         assert_eq!(e.status_snapshot(), baseline);
         assert_eq!(e.visible_up_to(), committed.index);
+        assert_eq!(e.get("a"), Some("1"));
+    }
+
+    #[test]
+    fn installing_higher_index_lower_term_snapshot_is_a_status_no_op() {
+        let mut e = Engine::new_local();
+        let committed = e.commit_mutation(1, b"SET a=1".to_vec()).unwrap();
+
+        e.install_snapshot(SnapshotMeta {
+            last_included_index: committed.index + 2,
+            last_included_term: 3,
+            snapshot_id: 11,
+        });
+        let baseline = e.status_snapshot();
+        let baseline_marks = e.replication_watermarks();
+
+        e.install_snapshot(SnapshotMeta {
+            last_included_index: committed.index + 3,
+            last_included_term: 2,
+            snapshot_id: 99,
+        });
+
+        let marks = e.replication_watermarks();
+        assert_eq!(marks, baseline_marks);
+        assert_eq!(e.status_snapshot(), baseline);
+        assert_eq!(e.visible_up_to(), baseline.snapshot.visible_index);
         assert_eq!(e.get("a"), Some("1"));
     }
 }
