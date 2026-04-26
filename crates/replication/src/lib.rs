@@ -3589,6 +3589,84 @@ mod tests {
     }
 
     #[test]
+    fn raft_newer_leader_catch_up_promotes_fresh_tail_without_reintroducing_stale_gap() {
+        let mut r = RaftReplicator::new(3);
+        r.become_follower(4);
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 5,
+            last_included_term: 4,
+            snapshot_id: 2,
+        });
+        r.append_entries_from_leader(
+            4,
+            5,
+            4,
+            vec![LogEntry {
+                term: 4,
+                index: 6,
+                payload: vec![6],
+            }],
+            5,
+        )
+        .unwrap();
+        r.append_entries_from_leader(
+            5,
+            5,
+            4,
+            vec![
+                LogEntry {
+                    term: 5,
+                    index: 6,
+                    payload: vec![60],
+                },
+                LogEntry {
+                    term: 5,
+                    index: 7,
+                    payload: vec![70],
+                },
+            ],
+            6,
+        )
+        .unwrap();
+
+        let after_repair = r.status_snapshot();
+        assert_eq!(after_repair.live.commit_index, 6);
+        assert_eq!(after_repair.live.applied_index, 5);
+        assert_eq!(after_repair.live.next_index, 8);
+        assert_eq!(after_repair.live.uncommitted_entry_count, 1);
+        assert_eq!(after_repair.durable.commit_index, 6);
+        assert_eq!(after_repair.durable.next_index, 7);
+        assert!(after_repair.has_speculative_tail());
+
+        r.append_entries_from_leader(5, 7, 5, vec![], 7).unwrap();
+
+        let after_commit = r.status_snapshot();
+        assert_eq!(after_commit.live.commit_index, 7);
+        assert_eq!(after_commit.live.applied_index, 5);
+        assert_eq!(after_commit.live.next_index, 8);
+        assert_eq!(after_commit.live.uncommitted_entry_count, 0);
+        assert_eq!(after_commit.live.committed_but_unapplied_count, 2);
+        assert_eq!(after_commit.durable.commit_index, 7);
+        assert_eq!(after_commit.durable.applied_index, 5);
+        assert_eq!(after_commit.durable.next_index, 8);
+        assert_eq!(after_commit.durable.uncommitted_entry_count, 0);
+        assert!(after_commit.is_restart_equivalent());
+        assert!(!after_commit.has_speculative_tail());
+
+        r.mark_applied(7);
+
+        let after_apply = r.status_snapshot();
+        assert!(after_apply.is_restart_equivalent());
+        assert!(!after_apply.has_speculative_tail());
+        assert_eq!(after_apply.live.commit_index, 7);
+        assert_eq!(after_apply.live.applied_index, 7);
+        assert_eq!(after_apply.live.next_index, 8);
+        assert_eq!(after_apply.live.committed_but_unapplied_count, 0);
+        assert_eq!(after_apply.live, after_apply.durable);
+        assert_eq!(after_apply.live.snapshot.snapshot_id, 2);
+    }
+
+    #[test]
     fn raft_follower_append_entries_accepts_prev_index_at_snapshot_boundary_after_apply_advances() {
         let mut r = RaftReplicator::new(3);
         r.become_follower(3);
