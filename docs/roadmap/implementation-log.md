@@ -63,6 +63,7 @@
 - Hardened `RaftReplicator::install_snapshot(...)` so an accepted advanced-frontier snapshot now drops any speculative suffix that no longer attaches to the installed frontier term immediately, instead of waiting for a later epoch change to flush it; the exact installed `snapshot_id` still remains stable through subsequent handoffs.
 - Added a follow-on Q3 regression proving the same advanced-frontier install still preserves a compatible surviving suffix and its recovery-gap accounting, so snapshot hardening only discards incompatible speculative tail.
 - Added another Q3 regression proving that even a compatible surviving suffix is still discarded cleanly if a later newer-leader append rejects on prev-log validation after term discovery; the advanced snapshot identity remains the restart-equivalent truth surface across that handoff.
+- Added a follow-on Q3 regression proving that when an advanced-frontier snapshot preserves a compatible speculative suffix, restart/export truth surfaces still publish the exact advanced snapshot identity while excluding that suffix, and a later newer-leader repair reintroduces only fresh-tail delta without changing the durable snapshot identity.
 - Updated replication interface docs and runbooks to document current guarantees and explicit non-guarantees around ordering, apply progression, restart behavior, stale-snapshot no-op semantics, and the new durable-progress alignment helper.
 
 ### Current blockers

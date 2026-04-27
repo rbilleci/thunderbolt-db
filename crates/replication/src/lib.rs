@@ -4777,4 +4777,116 @@ mod tests {
         assert_eq!(status.live.applied_index, 7);
         assert_eq!(status.live.next_index, 8);
     }
+
+    #[test]
+    fn compatible_advanced_snapshot_suffix_keeps_exact_identity_across_resume_and_repair() {
+        let mut r = RaftReplicator::new(3);
+        r.become_follower(5);
+
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 5,
+            last_included_term: 4,
+            snapshot_id: 11,
+        });
+        r.append_entries_from_leader(
+            5,
+            5,
+            4,
+            vec![
+                LogEntry {
+                    term: 5,
+                    index: 6,
+                    payload: vec![6],
+                },
+                LogEntry {
+                    term: 5,
+                    index: 7,
+                    payload: vec![7],
+                },
+                LogEntry {
+                    term: 5,
+                    index: 8,
+                    payload: vec![8],
+                },
+            ],
+            7,
+        )
+        .unwrap();
+
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 7,
+            last_included_term: 5,
+            snapshot_id: 29,
+        });
+
+        let with_compatible_suffix = r.status_snapshot();
+        assert!(with_compatible_suffix.has_speculative_tail());
+        assert_eq!(with_compatible_suffix.live.snapshot.snapshot_id, 29);
+        assert_eq!(with_compatible_suffix.durable.snapshot.snapshot_id, 29);
+        assert_eq!(with_compatible_suffix.live.commit_index, 7);
+        assert_eq!(with_compatible_suffix.live.applied_index, 7);
+        assert_eq!(with_compatible_suffix.live.next_index, 9);
+        assert_eq!(with_compatible_suffix.durable.commit_index, 7);
+        assert_eq!(with_compatible_suffix.durable.applied_index, 7);
+        assert_eq!(with_compatible_suffix.durable.next_index, 8);
+
+        let recovery = r.recovery_state();
+        assert_eq!(recovery.snapshot.snapshot_id, 29);
+        let resumed = RaftReplicator::resume_as_follower(3, recovery.clone()).unwrap();
+        let resumed_status = resumed.status_snapshot();
+        assert!(resumed_status.is_restart_equivalent());
+        assert_eq!(resumed_status.live, with_compatible_suffix.durable);
+        assert_eq!(resumed_status.durable, with_compatible_suffix.durable);
+        assert_eq!(
+            recovery.progress_as_follower().unwrap(),
+            with_compatible_suffix.durable
+        );
+
+        r.append_entries_from_leader(
+            6,
+            7,
+            5,
+            vec![
+                LogEntry {
+                    term: 6,
+                    index: 8,
+                    payload: vec![80],
+                },
+                LogEntry {
+                    term: 6,
+                    index: 9,
+                    payload: vec![90],
+                },
+            ],
+            8,
+        )
+        .unwrap();
+
+        let after_repair = r.status_snapshot();
+        assert!(after_repair.has_speculative_tail());
+        assert_eq!(after_repair.live.term, 6);
+        assert_eq!(after_repair.live.snapshot.snapshot_id, 29);
+        assert_eq!(after_repair.durable.snapshot.snapshot_id, 29);
+        assert_eq!(after_repair.live.commit_index, 8);
+        assert_eq!(after_repair.live.applied_index, 7);
+        assert_eq!(after_repair.live.next_index, 10);
+        assert_eq!(after_repair.durable.commit_index, 8);
+        assert_eq!(after_repair.durable.applied_index, 7);
+        assert_eq!(after_repair.durable.next_index, 9);
+        assert_eq!(after_repair.recovery_gap.next_index_gap, 1);
+        assert_eq!(after_repair.recovery_gap.uncommitted_entry_gap, 1);
+
+        let recovery_after_repair = r.recovery_state();
+        assert_eq!(recovery_after_repair.snapshot.snapshot_id, 29);
+        let resumed_after_repair =
+            RaftReplicator::resume_as_follower(3, recovery_after_repair.clone()).unwrap();
+        assert_eq!(
+            resumed_after_repair.status_snapshot().live,
+            after_repair.durable
+        );
+        assert_eq!(
+            recovery_after_repair.progress_as_follower().unwrap(),
+            after_repair.durable
+        );
+    }
 }
