@@ -4889,4 +4889,132 @@ mod tests {
             after_repair.durable
         );
     }
+
+    #[test]
+    fn compatible_advanced_snapshot_suffix_refresh_keeps_exact_identity_across_resume_and_repair() {
+        let mut r = RaftReplicator::new(3);
+        r.become_follower(5);
+
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 5,
+            last_included_term: 4,
+            snapshot_id: 11,
+        });
+        r.append_entries_from_leader(
+            5,
+            5,
+            4,
+            vec![
+                LogEntry {
+                    term: 5,
+                    index: 6,
+                    payload: vec![6],
+                },
+                LogEntry {
+                    term: 5,
+                    index: 7,
+                    payload: vec![7],
+                },
+                LogEntry {
+                    term: 5,
+                    index: 8,
+                    payload: vec![8],
+                },
+            ],
+            7,
+        )
+        .unwrap();
+
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 7,
+            last_included_term: 5,
+            snapshot_id: 29,
+        });
+        let baseline = r.status_snapshot();
+        assert!(baseline.has_speculative_tail());
+        assert_eq!(baseline.live.snapshot.snapshot_id, 29);
+        assert_eq!(baseline.durable.snapshot.snapshot_id, 29);
+        assert_eq!(baseline.recovery_gap.next_index_gap, 1);
+        assert_eq!(baseline.recovery_gap.uncommitted_entry_gap, 1);
+
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 7,
+            last_included_term: 5,
+            snapshot_id: 31,
+        });
+
+        let refreshed = r.status_snapshot();
+        assert!(refreshed.has_speculative_tail());
+        assert_eq!(refreshed.recovery_gap, baseline.recovery_gap);
+        assert_eq!(refreshed.live.commit_index, baseline.live.commit_index);
+        assert_eq!(refreshed.live.applied_index, baseline.live.applied_index);
+        assert_eq!(refreshed.live.next_index, baseline.live.next_index);
+        assert_eq!(
+            refreshed.durable.commit_index,
+            baseline.durable.commit_index
+        );
+        assert_eq!(
+            refreshed.durable.applied_index,
+            baseline.durable.applied_index
+        );
+        assert_eq!(refreshed.durable.next_index, baseline.durable.next_index);
+        assert_eq!(refreshed.live.snapshot.snapshot_id, 31);
+        assert_eq!(refreshed.durable.snapshot.snapshot_id, 31);
+
+        let refreshed_recovery = r.recovery_state();
+        assert_eq!(refreshed_recovery.snapshot.snapshot_id, 31);
+        let resumed = RaftReplicator::resume_as_follower(3, refreshed_recovery.clone()).unwrap();
+        assert_eq!(resumed.status_snapshot().live, refreshed.durable);
+        assert_eq!(
+            refreshed_recovery.progress_as_follower().unwrap(),
+            refreshed.durable
+        );
+
+        r.append_entries_from_leader(
+            6,
+            7,
+            5,
+            vec![
+                LogEntry {
+                    term: 6,
+                    index: 8,
+                    payload: vec![80],
+                },
+                LogEntry {
+                    term: 6,
+                    index: 9,
+                    payload: vec![90],
+                },
+            ],
+            8,
+        )
+        .unwrap();
+
+        let after_repair = r.status_snapshot();
+        assert!(after_repair.has_speculative_tail());
+        assert_eq!(after_repair.live.term, 6);
+        assert_eq!(after_repair.live.snapshot.snapshot_id, 31);
+        assert_eq!(after_repair.durable.snapshot.snapshot_id, 31);
+        assert_eq!(after_repair.live.commit_index, 8);
+        assert_eq!(after_repair.live.applied_index, 7);
+        assert_eq!(after_repair.live.next_index, 10);
+        assert_eq!(after_repair.durable.commit_index, 8);
+        assert_eq!(after_repair.durable.applied_index, 7);
+        assert_eq!(after_repair.durable.next_index, 9);
+        assert_eq!(after_repair.recovery_gap.next_index_gap, 1);
+        assert_eq!(after_repair.recovery_gap.uncommitted_entry_gap, 1);
+
+        let repair_recovery = r.recovery_state();
+        assert_eq!(repair_recovery.snapshot.snapshot_id, 31);
+        let resumed_after_repair =
+            RaftReplicator::resume_as_follower(3, repair_recovery.clone()).unwrap();
+        assert_eq!(
+            resumed_after_repair.status_snapshot().live,
+            after_repair.durable
+        );
+        assert_eq!(
+            repair_recovery.progress_as_follower().unwrap(),
+            after_repair.durable
+        );
+    }
 }
