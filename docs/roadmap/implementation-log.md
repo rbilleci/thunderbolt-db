@@ -67,13 +67,14 @@
 - Updated replication interface docs and runbooks to document current guarantees and explicit non-guarantees around ordering, apply progression, restart behavior, stale-snapshot no-op semantics, and the new durable-progress alignment helper.
 
 - Added a Q3 stress regression proving that when an advanced-frontier snapshot preserves a compatible speculative suffix, a later same-frontier same-term snapshot-id refresh updates the durable identity everywhere (`status_snapshot()`, `recovery_state()`, `progress_as_follower()`, and `resume_as_follower(...)`) without perturbing the speculative-gap shape, and that a subsequent newer-leader repair still rebuilds only fresh-tail delta around the refreshed durable identity.
+- Added a follow-on Q3 regression proving that the same refreshed compatible-suffix path also survives a newer-leader rejection by collapsing straight back to restart-equivalent truth on the refreshed durable snapshot identity.
 
 ### Current blockers
 - None in-repo.
 
 ### Next loops
 1. Extend Q2 with richer value-aware ordering or join-adjacent slices without weakening the explicit fallback contract.
-2. Continue Q3 with stale/resume semantics under richer follower catch-up and snapshot-install stress, now that the status surface also rejects older-term or durable-ahead-of-live impossible states, ignores incoherent higher-frontier/lower-term snapshots, keeps accepted advanced-frontier snapshot identity exact even when ids are non-monotonic and later epoch handoffs/restart projections occur, discards incompatible speculative suffix immediately on advanced-frontier snapshot install, discards stale speculative tail on newer-leader rejection paths, preserves gap semantics across same-frontier snapshot identity refresh (including refreshes layered atop compatible advanced-frontier suffix preservation), and cleanly resets the live-vs-durable delta when a newer leader replaces stale follower tail with fresh catch-up entries that later commit/apply back to restart-equivalent state.
+2. Continue Q3 with stale/resume semantics under richer follower catch-up and snapshot-install stress, now that the status surface also rejects older-term or durable-ahead-of-live impossible states, ignores incoherent higher-frontier/lower-term snapshots, keeps accepted advanced-frontier snapshot identity exact even when ids are non-monotonic and later epoch handoffs/restart projections occur, discards incompatible speculative suffix immediately on advanced-frontier snapshot install, discards stale speculative tail on newer-leader rejection paths, preserves gap semantics across same-frontier snapshot identity refresh (including refreshes layered atop compatible advanced-frontier suffix preservation and rejection back to restart-equivalent truth), and cleanly resets the live-vs-durable delta when a newer leader replaces stale follower tail with fresh catch-up entries that later commit/apply back to restart-equivalent state.
 
 ## 2026-04-24
 

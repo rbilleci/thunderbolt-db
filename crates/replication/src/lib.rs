@@ -5017,4 +5017,78 @@ mod tests {
             after_repair.durable
         );
     }
+
+    #[test]
+    fn compatible_advanced_snapshot_suffix_refresh_survives_newer_leader_rejection() {
+        let mut r = RaftReplicator::new(3);
+        r.become_follower(5);
+
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 5,
+            last_included_term: 4,
+            snapshot_id: 11,
+        });
+        r.append_entries_from_leader(
+            5,
+            5,
+            4,
+            vec![
+                LogEntry {
+                    term: 5,
+                    index: 6,
+                    payload: vec![6],
+                },
+                LogEntry {
+                    term: 5,
+                    index: 7,
+                    payload: vec![7],
+                },
+                LogEntry {
+                    term: 5,
+                    index: 8,
+                    payload: vec![8],
+                },
+            ],
+            7,
+        )
+        .unwrap();
+
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 7,
+            last_included_term: 5,
+            snapshot_id: 29,
+        });
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 7,
+            last_included_term: 5,
+            snapshot_id: 31,
+        });
+        assert!(r.status_snapshot().has_speculative_tail());
+
+        let err = r
+            .append_entries_from_leader(
+                6,
+                99,
+                6,
+                vec![LogEntry {
+                    term: 6,
+                    index: 100,
+                    payload: vec![100],
+                }],
+                100,
+            )
+            .unwrap_err();
+        assert!(matches!(err, EngineError::ProposalFailed(_)));
+
+        let after_reject = r.status_snapshot();
+        assert!(after_reject.is_restart_equivalent());
+        assert_eq!(after_reject.live.term, 6);
+        assert_eq!(after_reject.live.snapshot.snapshot_id, 31);
+        assert_eq!(after_reject.durable.snapshot.snapshot_id, 31);
+        assert_eq!(after_reject.live.commit_index, 7);
+        assert_eq!(after_reject.live.applied_index, 7);
+        assert_eq!(after_reject.live.next_index, 8);
+        assert!(r.recovery_progress_gap().is_restart_equivalent());
+        assert_eq!(r.recovery_state().snapshot.snapshot_id, 31);
+    }
 }
