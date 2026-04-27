@@ -4122,6 +4122,47 @@ mod tests {
     }
 
     #[test]
+    fn raft_install_snapshot_advancing_frontier_preserves_compatible_suffix() {
+        let mut r = RaftReplicator::new(3);
+        r.become_leader(5);
+
+        let t1 = r.propose(vec![1]).unwrap();
+        let t2 = r.propose(vec![2]).unwrap();
+        let t3 = r.propose(vec![3]).unwrap();
+
+        r.register_follower_ack(t1.index, 1);
+        r.register_follower_ack(t2.index, 1);
+        assert_eq!(r.commit_index(), t2.index);
+        assert!(r.ack_counts.contains_key(&t3.index));
+
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: t2.index,
+            last_included_term: 5,
+            snapshot_id: 29,
+        });
+
+        let progress = r.progress();
+        assert_eq!(progress.snapshot.snapshot_id, 29);
+        assert_eq!(progress.snapshot.last_included_index, t2.index);
+        assert_eq!(progress.snapshot.last_included_term, 5);
+        assert_eq!(progress.commit_index, t2.index);
+        assert_eq!(progress.applied_index, t2.index);
+        assert_eq!(progress.next_index, t3.index + 1);
+        assert_eq!(progress.uncommitted_entry_count, 1);
+        assert!(progress.has_uncommitted_entries);
+        assert_eq!(r.entries.len(), 1);
+        assert_eq!(r.entries[0].index, t3.index);
+        assert!(r.ack_counts.contains_key(&t3.index));
+
+        let status = r.status_snapshot();
+        assert!(status.has_speculative_tail());
+        assert_eq!(status.live.snapshot.snapshot_id, 29);
+        assert_eq!(status.durable.snapshot.snapshot_id, 29);
+        assert_eq!(status.recovery_gap.next_index_gap, 1);
+        assert_eq!(status.recovery_gap.uncommitted_entry_gap, 1);
+    }
+
+    #[test]
     fn same_frontier_same_term_snapshot_refresh_preserves_speculative_gap_semantics() {
         let mut r = RaftReplicator::new(3);
         r.become_follower(4);

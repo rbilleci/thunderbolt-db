@@ -61,6 +61,7 @@
 - Hardened local/raft snapshot install identity semantics so accepted advanced-frontier snapshots now replace `snapshot_id` exactly instead of pinning to older local maxima; added local/raft/engine regressions proving truth surfaces stay aligned even when the new frontier arrives with a numerically lower snapshot id.
 - Added a Q3 stress regression proving that same exact advanced-frontier snapshot identity also survives later newer-leader rejection, accepted repair, restart/resume projection, and final commit/apply completion while speculative tail is discarded and rebuilt around it.
 - Hardened `RaftReplicator::install_snapshot(...)` so an accepted advanced-frontier snapshot now drops any speculative suffix that no longer attaches to the installed frontier term immediately, instead of waiting for a later epoch change to flush it; the exact installed `snapshot_id` still remains stable through subsequent handoffs.
+- Added a follow-on Q3 regression proving the same advanced-frontier install still preserves a compatible surviving suffix and its recovery-gap accounting, so snapshot hardening only discards incompatible speculative tail.
 - Updated replication interface docs and runbooks to document current guarantees and explicit non-guarantees around ordering, apply progression, restart behavior, stale-snapshot no-op semantics, and the new durable-progress alignment helper.
 
 ### Current blockers
