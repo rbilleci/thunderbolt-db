@@ -60,6 +60,7 @@
 - Extended that path with heartbeat/apply progression coverage so once the fresh epoch commits and applies, `status_snapshot()` returns to restart-equivalent state without reintroducing stale-gap artifacts.
 - Hardened local/raft snapshot install identity semantics so accepted advanced-frontier snapshots now replace `snapshot_id` exactly instead of pinning to older local maxima; added local/raft/engine regressions proving truth surfaces stay aligned even when the new frontier arrives with a numerically lower snapshot id.
 - Added a Q3 stress regression proving that same exact advanced-frontier snapshot identity also survives later newer-leader rejection, accepted repair, restart/resume projection, and final commit/apply completion while speculative tail is discarded and rebuilt around it.
+- Hardened `RaftReplicator::install_snapshot(...)` so an accepted advanced-frontier snapshot now drops any speculative suffix that no longer attaches to the installed frontier term immediately, instead of waiting for a later epoch change to flush it; the exact installed `snapshot_id` still remains stable through subsequent handoffs.
 - Updated replication interface docs and runbooks to document current guarantees and explicit non-guarantees around ordering, apply progression, restart behavior, stale-snapshot no-op semantics, and the new durable-progress alignment helper.
 
 ### Current blockers
@@ -67,7 +68,7 @@
 
 ### Next loops
 1. Extend Q2 with richer value-aware ordering or join-adjacent slices without weakening the explicit fallback contract.
-2. Continue Q3 with stale/resume semantics under richer follower catch-up and snapshot-install stress, now that the status surface also rejects older-term or durable-ahead-of-live impossible states, ignores incoherent higher-frontier/lower-term snapshots, keeps accepted advanced-frontier snapshot identity exact even when ids are non-monotonic and later epoch handoffs/restart projections occur, discards stale speculative tail on newer-leader rejection paths, preserves gap semantics across same-frontier snapshot identity refresh, and cleanly resets the live-vs-durable delta when a newer leader replaces stale follower tail with fresh catch-up entries that later commit/apply back to restart-equivalent state.
+2. Continue Q3 with stale/resume semantics under richer follower catch-up and snapshot-install stress, now that the status surface also rejects older-term or durable-ahead-of-live impossible states, ignores incoherent higher-frontier/lower-term snapshots, keeps accepted advanced-frontier snapshot identity exact even when ids are non-monotonic and later epoch handoffs/restart projections occur, discards incompatible speculative suffix immediately on advanced-frontier snapshot install, discards stale speculative tail on newer-leader rejection paths, preserves gap semantics across same-frontier snapshot identity refresh, and cleanly resets the live-vs-durable delta when a newer leader replaces stale follower tail with fresh catch-up entries that later commit/apply back to restart-equivalent state.
 
 ## 2026-04-24
 

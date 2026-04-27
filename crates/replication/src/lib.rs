@@ -961,6 +961,8 @@ impl RaftReplicator {
         let advances_frontier = meta.last_included_index > current.last_included_index;
         let same_frontier_same_term = meta.last_included_index == current.last_included_index
             && meta.last_included_term == current.last_included_term;
+        let retains_existing_suffix = same_frontier_same_term
+            || self.term_at(meta.last_included_index) == Some(meta.last_included_term);
         let regresses_term_on_advanced_frontier =
             advances_frontier && meta.last_included_term < current.last_included_term;
         if regresses_term_on_advanced_frontier || (!advances_frontier && !same_frontier_same_term) {
@@ -978,9 +980,16 @@ impl RaftReplicator {
             self.applied_term = meta.last_included_term;
         }
         self.snapshot_id = meta.snapshot_id;
-        self.entries.retain(|e| e.index > meta.last_included_index);
-        self.ack_counts
-            .retain(|idx, _| *idx > meta.last_included_index);
+        self.entries.retain(|entry| {
+            entry.index > meta.last_included_index
+                && (retains_existing_suffix || entry.index <= self.commit_index)
+        });
+        if retains_existing_suffix {
+            self.ack_counts
+                .retain(|idx, _| *idx > meta.last_included_index);
+        } else {
+            self.ack_counts.clear();
+        }
 
         let tail_index = self
             .entries
@@ -2788,8 +2797,8 @@ mod tests {
         assert_eq!(r.snapshot_meta().snapshot_id, 42);
         assert!(!r.ack_counts.contains_key(&t1.index));
         assert!(!r.ack_counts.contains_key(&t2.index));
-        assert!(r.ack_counts.contains_key(&t3.index));
-        assert!(r.entries.iter().all(|entry| entry.index > t2.index));
+        assert!(!r.ack_counts.contains_key(&t3.index));
+        assert!(r.entries.is_empty());
     }
 
     #[test]
@@ -4529,7 +4538,7 @@ mod tests {
     }
 
     #[test]
-    fn advanced_frontier_snapshot_identity_stays_exact_through_epoch_handoffs() {
+    fn advanced_frontier_snapshot_discards_incompatible_speculative_tail_before_epoch_handoffs() {
         let mut r = RaftReplicator::new(3);
         r.become_follower(4);
 
@@ -4575,13 +4584,16 @@ mod tests {
         });
 
         let refreshed = r.status_snapshot();
-        assert!(refreshed.has_speculative_tail());
+        assert!(refreshed.is_restart_equivalent());
         assert_eq!(refreshed.live.snapshot.snapshot_id, 4);
         assert_eq!(refreshed.durable.snapshot.snapshot_id, 4);
         assert_eq!(refreshed.live.snapshot.last_included_index, 8);
         assert_eq!(refreshed.live.snapshot.last_included_term, 5);
-        assert_eq!(refreshed.recovery_gap.next_index_gap, 1);
-        assert_eq!(refreshed.recovery_gap.uncommitted_entry_gap, 1);
+        assert_eq!(refreshed.live.commit_index, 8);
+        assert_eq!(refreshed.live.applied_index, 8);
+        assert_eq!(refreshed.live.next_index, 9);
+        assert_eq!(refreshed.recovery_gap.next_index_gap, 0);
+        assert_eq!(refreshed.recovery_gap.uncommitted_entry_gap, 0);
 
         let err = r
             .append_entries_from_leader(
