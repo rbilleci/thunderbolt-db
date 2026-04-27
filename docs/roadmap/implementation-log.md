@@ -68,6 +68,7 @@
 
 - Added a Q3 stress regression proving that when an advanced-frontier snapshot preserves a compatible speculative suffix, a later same-frontier same-term snapshot-id refresh updates the durable identity everywhere (`status_snapshot()`, `recovery_state()`, `progress_as_follower()`, and `resume_as_follower(...)`) without perturbing the speculative-gap shape, and that a subsequent newer-leader repair still rebuilds only fresh-tail delta around the refreshed durable identity.
 - Added a follow-on Q3 regression proving that the same refreshed compatible-suffix path also survives a newer-leader rejection by collapsing straight back to restart-equivalent truth on the refreshed durable snapshot identity.
+- Added another Q3 regression proving stale snapshot installs remain complete no-ops even after the richer advanced-frontier + compatible speculative suffix + same-frontier snapshot-id refresh stack is in place; refreshed durable identity and speculative-gap accounting stay unchanged.
 
 ### Current blockers
 - None in-repo.

@@ -5019,6 +5019,81 @@ mod tests {
     }
 
     #[test]
+    fn compatible_advanced_snapshot_suffix_refresh_ignores_stale_snapshots_without_perturbing_gap()
+    {
+        let mut r = RaftReplicator::new(3);
+        r.become_follower(5);
+
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 5,
+            last_included_term: 4,
+            snapshot_id: 11,
+        });
+        r.append_entries_from_leader(
+            5,
+            5,
+            4,
+            vec![
+                LogEntry {
+                    term: 5,
+                    index: 6,
+                    payload: vec![6],
+                },
+                LogEntry {
+                    term: 5,
+                    index: 7,
+                    payload: vec![7],
+                },
+                LogEntry {
+                    term: 5,
+                    index: 8,
+                    payload: vec![8],
+                },
+            ],
+            7,
+        )
+        .unwrap();
+
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 7,
+            last_included_term: 5,
+            snapshot_id: 29,
+        });
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 7,
+            last_included_term: 5,
+            snapshot_id: 31,
+        });
+
+        let baseline_status = r.status_snapshot();
+        let baseline_recovery = r.recovery_state();
+        let baseline_gap = r.recovery_progress_gap();
+        assert!(baseline_status.has_speculative_tail());
+        assert_eq!(baseline_status.live.snapshot.snapshot_id, 31);
+        assert_eq!(baseline_status.durable.snapshot.snapshot_id, 31);
+
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 7,
+            last_included_term: 4,
+            snapshot_id: 97,
+        });
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 8,
+            last_included_term: 4,
+            snapshot_id: 101,
+        });
+
+        assert_eq!(r.status_snapshot(), baseline_status);
+        assert_eq!(r.recovery_state(), baseline_recovery);
+        assert_eq!(r.recovery_progress_gap(), baseline_gap);
+        assert_eq!(r.snapshot_meta().snapshot_id, 31);
+        assert_eq!(
+            baseline_recovery.progress_as_follower().unwrap(),
+            baseline_status.durable
+        );
+    }
+
+    #[test]
     fn compatible_advanced_snapshot_suffix_refresh_survives_newer_leader_rejection() {
         let mut r = RaftReplicator::new(3);
         r.become_follower(5);
