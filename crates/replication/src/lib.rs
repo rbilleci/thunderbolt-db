@@ -4891,7 +4891,8 @@ mod tests {
     }
 
     #[test]
-    fn compatible_advanced_snapshot_suffix_refresh_keeps_exact_identity_across_resume_and_repair() {
+    fn compatible_advanced_snapshot_suffix_refresh_keeps_exact_identity_across_resume_repair_and_apply_completion(
+    ) {
         let mut r = RaftReplicator::new(3);
         r.become_follower(5);
 
@@ -5015,6 +5016,56 @@ mod tests {
         assert_eq!(
             repair_recovery.progress_as_follower().unwrap(),
             after_repair.durable
+        );
+
+        r.append_entries_from_leader(6, 9, 6, Vec::new(), 9)
+            .unwrap();
+        let after_commit = r.status_snapshot();
+        assert!(after_commit.live.has_committed_entries_pending_apply);
+        assert!(!after_commit.has_speculative_tail());
+        assert_eq!(after_commit.live.snapshot.snapshot_id, 31);
+        assert_eq!(after_commit.durable.snapshot.snapshot_id, 31);
+        assert_eq!(after_commit.live.commit_index, 9);
+        assert_eq!(after_commit.live.applied_index, 7);
+        assert_eq!(after_commit.live.next_index, 10);
+        assert_eq!(after_commit.durable.commit_index, 9);
+        assert_eq!(after_commit.durable.applied_index, 7);
+        assert_eq!(after_commit.durable.next_index, 10);
+        assert_eq!(after_commit.recovery_gap.next_index_gap, 0);
+        assert_eq!(after_commit.recovery_gap.uncommitted_entry_gap, 0);
+
+        let committed_recovery = r.recovery_state();
+        assert_eq!(committed_recovery.snapshot.snapshot_id, 31);
+        let resumed_after_commit =
+            RaftReplicator::resume_as_follower(3, committed_recovery.clone()).unwrap();
+        assert_eq!(
+            resumed_after_commit.status_snapshot().live,
+            after_commit.durable
+        );
+        assert_eq!(
+            committed_recovery.progress_as_follower().unwrap(),
+            after_commit.durable
+        );
+
+        r.mark_applied(9);
+        let after_apply = r.status_snapshot();
+        assert!(after_apply.is_restart_equivalent());
+        assert_eq!(after_apply.live.snapshot.snapshot_id, 31);
+        assert_eq!(after_apply.durable.snapshot.snapshot_id, 31);
+        assert_eq!(after_apply.live.commit_index, 9);
+        assert_eq!(after_apply.live.applied_index, 9);
+        assert_eq!(after_apply.live.next_index, 10);
+        assert_eq!(after_apply.durable, after_apply.live);
+        assert!(r.recovery_progress_gap().is_restart_equivalent());
+
+        let applied_recovery = r.recovery_state();
+        assert_eq!(applied_recovery.snapshot.snapshot_id, 31);
+        let resumed_after_apply =
+            RaftReplicator::resume_as_follower(3, applied_recovery.clone()).unwrap();
+        assert_eq!(resumed_after_apply.status_snapshot().live, after_apply.live);
+        assert_eq!(
+            applied_recovery.progress_as_follower().unwrap(),
+            after_apply.live
         );
     }
 
