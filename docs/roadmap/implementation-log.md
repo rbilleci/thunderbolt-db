@@ -3,6 +3,7 @@
 ## 2026-04-25
 
 ### Completed
+- Added a follow-on Q3 regression proving that even after a second same-frontier same-term snapshot refresh lands during newer-leader repair, later stale snapshot installs remain complete no-ops throughout repair, commit, and final apply completion; the newer refreshed durable `snapshot_id`, recovery-gap accounting, and restart/resume projection all stay pinned.
 - Added `Engine::status_snapshot()` as the engine-level truth surface for Q1, unifying served snapshot identity/frontier, replication lag, readiness flags, fallback rollups, and active runtime fallback reasons in one validated status object.
 - Added `EngineStatusSnapshot`, `SnapshotStatus`, `ReadinessStatus`, and `FallbackStatus` plus invariant validation covering commit/apply/visible ordering, snapshot/frontier consistency, blocker-mask/count consistency, and mutation-admission saturation semantics.
 - Extended engine regression coverage to prove the truth surface answers the key operator questions in both healthy and degraded/fallback states.
