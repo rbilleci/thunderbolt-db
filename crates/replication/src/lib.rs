@@ -4527,4 +4527,134 @@ mod tests {
         assert!(r.recovery_progress_gap().is_restart_equivalent());
         assert_eq!(r.recovery_state().snapshot.snapshot_id, 7);
     }
+
+    #[test]
+    fn advanced_frontier_snapshot_identity_stays_exact_through_epoch_handoffs() {
+        let mut r = RaftReplicator::new(3);
+        r.become_follower(4);
+
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 5,
+            last_included_term: 4,
+            snapshot_id: 11,
+        });
+        r.append_entries_from_leader(
+            4,
+            5,
+            4,
+            vec![
+                LogEntry {
+                    term: 4,
+                    index: 6,
+                    payload: vec![6],
+                },
+                LogEntry {
+                    term: 4,
+                    index: 7,
+                    payload: vec![7],
+                },
+                LogEntry {
+                    term: 4,
+                    index: 8,
+                    payload: vec![8],
+                },
+                LogEntry {
+                    term: 4,
+                    index: 9,
+                    payload: vec![9],
+                },
+            ],
+            5,
+        )
+        .unwrap();
+
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 8,
+            last_included_term: 5,
+            snapshot_id: 4,
+        });
+
+        let refreshed = r.status_snapshot();
+        assert!(refreshed.has_speculative_tail());
+        assert_eq!(refreshed.live.snapshot.snapshot_id, 4);
+        assert_eq!(refreshed.durable.snapshot.snapshot_id, 4);
+        assert_eq!(refreshed.live.snapshot.last_included_index, 8);
+        assert_eq!(refreshed.live.snapshot.last_included_term, 5);
+        assert_eq!(refreshed.recovery_gap.next_index_gap, 1);
+        assert_eq!(refreshed.recovery_gap.uncommitted_entry_gap, 1);
+
+        let err = r
+            .append_entries_from_leader(
+                6,
+                99,
+                6,
+                vec![LogEntry {
+                    term: 6,
+                    index: 100,
+                    payload: vec![100],
+                }],
+                100,
+            )
+            .unwrap_err();
+        assert!(matches!(err, EngineError::ProposalFailed(_)));
+
+        let after_reject = r.status_snapshot();
+        assert!(after_reject.is_restart_equivalent());
+        assert_eq!(after_reject.live.term, 6);
+        assert_eq!(after_reject.live.snapshot.snapshot_id, 4);
+        assert_eq!(after_reject.durable.snapshot.snapshot_id, 4);
+        assert_eq!(after_reject.live.commit_index, 8);
+        assert_eq!(after_reject.live.applied_index, 8);
+        assert_eq!(after_reject.live.next_index, 9);
+
+        r.append_entries_from_leader(
+            6,
+            8,
+            5,
+            vec![
+                LogEntry {
+                    term: 6,
+                    index: 9,
+                    payload: vec![90],
+                },
+                LogEntry {
+                    term: 6,
+                    index: 10,
+                    payload: vec![100],
+                },
+            ],
+            9,
+        )
+        .unwrap();
+
+        let after_append = r.status_snapshot();
+        assert!(after_append.has_speculative_tail());
+        assert_eq!(after_append.live.snapshot.snapshot_id, 4);
+        assert_eq!(after_append.durable.snapshot.snapshot_id, 4);
+        assert_eq!(after_append.live.commit_index, 9);
+        assert_eq!(after_append.live.applied_index, 8);
+        assert_eq!(after_append.live.next_index, 11);
+        assert_eq!(after_append.durable.commit_index, 9);
+        assert_eq!(after_append.durable.applied_index, 8);
+        assert_eq!(after_append.durable.next_index, 10);
+
+        let recovery = r.recovery_state();
+        assert_eq!(recovery.snapshot.snapshot_id, 4);
+        let resumed = RaftReplicator::resume_as_follower(3, recovery.clone()).unwrap();
+        assert_eq!(resumed.status_snapshot().live, after_append.durable);
+        assert_eq!(
+            recovery.progress_as_follower().unwrap(),
+            after_append.durable
+        );
+
+        r.append_entries_from_leader(6, 10, 6, vec![], 10).unwrap();
+        assert!(r.recovery_progress_gap().is_restart_equivalent());
+        assert_eq!(r.recovery_state().snapshot.snapshot_id, 4);
+
+        r.mark_applied(10);
+        let after_apply = r.status_snapshot();
+        assert!(after_apply.is_restart_equivalent());
+        assert_eq!(after_apply.live, after_apply.durable);
+        assert_eq!(after_apply.live.snapshot.snapshot_id, 4);
+    }
 }
