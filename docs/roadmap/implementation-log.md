@@ -3,6 +3,7 @@
 ## 2026-04-25
 
 ### Completed
+- Added a Q3 regression proving that if a newer-leader repair is already in flight around a refreshed compatible suffix and an even newer advanced-frontier snapshot then lands on the repaired boundary, that advanced snapshot becomes the new exact durable `snapshot_id` everywhere while any still-compatible fresh suffix survives only as live speculative tail until later commit/apply retirement.
 - Added a Q3 regression proving that a compatible advanced-frontier snapshot which preserves a speculative suffix still keeps its exact durable `snapshot_id` pinned if a later role/term handoff discards that tail; status/recovery/restart projections all collapse cleanly to the same advanced frontier.
 - Added a Q3 regression proving that if a second same-frontier same-term snapshot refresh lands during newer-leader repair and the node then changes role/term, the speculative tail is still discarded cleanly while the refreshed durable `snapshot_id` remains pinned across status/recovery/restart truth surfaces.
 - Added a follow-on Q3 regression proving that even after a second same-frontier same-term snapshot refresh lands during newer-leader repair, later stale snapshot installs remain complete no-ops throughout repair, commit, and final apply completion; the newer refreshed durable `snapshot_id`, recovery-gap accounting, and restart/resume projection all stay pinned.
