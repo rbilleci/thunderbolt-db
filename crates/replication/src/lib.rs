@@ -4710,4 +4710,71 @@ mod tests {
         assert_eq!(after_apply.live, after_apply.durable);
         assert_eq!(after_apply.live.snapshot.snapshot_id, 4);
     }
+
+    #[test]
+    fn compatible_advanced_snapshot_suffix_is_still_discarded_on_newer_leader_rejection() {
+        let mut r = RaftReplicator::new(3);
+        r.become_follower(5);
+
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 5,
+            last_included_term: 4,
+            snapshot_id: 11,
+        });
+        r.append_entries_from_leader(
+            5,
+            5,
+            4,
+            vec![
+                LogEntry {
+                    term: 5,
+                    index: 6,
+                    payload: vec![6],
+                },
+                LogEntry {
+                    term: 5,
+                    index: 7,
+                    payload: vec![7],
+                },
+                LogEntry {
+                    term: 5,
+                    index: 8,
+                    payload: vec![8],
+                },
+            ],
+            7,
+        )
+        .unwrap();
+
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 7,
+            last_included_term: 5,
+            snapshot_id: 29,
+        });
+        assert!(r.status_snapshot().has_speculative_tail());
+
+        let err = r
+            .append_entries_from_leader(
+                6,
+                99,
+                6,
+                vec![LogEntry {
+                    term: 6,
+                    index: 100,
+                    payload: vec![100],
+                }],
+                100,
+            )
+            .unwrap_err();
+        assert!(matches!(err, EngineError::ProposalFailed(_)));
+
+        let status = r.status_snapshot();
+        assert!(status.is_restart_equivalent());
+        assert_eq!(status.live.term, 6);
+        assert_eq!(status.live.snapshot.snapshot_id, 29);
+        assert_eq!(status.durable.snapshot.snapshot_id, 29);
+        assert_eq!(status.live.commit_index, 7);
+        assert_eq!(status.live.applied_index, 7);
+        assert_eq!(status.live.next_index, 8);
+    }
 }
