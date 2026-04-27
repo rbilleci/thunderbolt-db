@@ -71,6 +71,7 @@
 - Added another Q3 regression proving stale snapshot installs remain complete no-ops even after the richer advanced-frontier + compatible speculative suffix + same-frontier snapshot-id refresh stack is in place; refreshed durable identity and speculative-gap accounting stay unchanged.
 - Extended the refreshed compatible-suffix newer-leader repair stress path through heartbeat commit and final apply completion, proving the fresh-tail delta retires cleanly back to restart-equivalent truth while preserving the refreshed durable snapshot identity across status, recovery export, and resume surfaces.
 - Added a follow-on Q3 regression proving those stale snapshot installs stay complete no-ops even later in that same combined stack: during newer-leader repair while fresh tail is present, after heartbeat commit retires speculative tail, and after final apply completion returns to restart-equivalent truth.
+- Extended that same combined-stack stale-snapshot regression so `resume_as_follower(...)` and `RecoveryState::progress_as_follower()` stay aligned to the durable truth surface during repair, after commit advancement, and after final apply completion; stale metadata cannot perturb restart/resume projection either.
 
 ### Current blockers
 - None in-repo.

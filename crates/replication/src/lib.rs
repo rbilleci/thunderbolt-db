@@ -5307,6 +5307,16 @@ mod tests {
         assert_eq!(r.status_snapshot(), repair_status);
         assert_eq!(r.recovery_state(), repair_recovery);
         assert_eq!(r.recovery_progress_gap(), repair_gap);
+        let resumed_during_repair_after_stale =
+            RaftReplicator::resume_as_follower(3, repair_recovery.clone()).unwrap();
+        assert_eq!(
+            resumed_during_repair_after_stale.status_snapshot().live,
+            repair_status.durable
+        );
+        assert_eq!(
+            repair_recovery.progress_as_follower().unwrap(),
+            repair_status.durable
+        );
 
         r.append_entries_from_leader(6, 9, 6, Vec::new(), 9)
             .unwrap();
@@ -5335,6 +5345,16 @@ mod tests {
         assert_eq!(r.status_snapshot(), commit_status);
         assert_eq!(r.recovery_state(), commit_recovery);
         assert_eq!(r.recovery_progress_gap(), commit_gap);
+        let resumed_after_commit_stale =
+            RaftReplicator::resume_as_follower(3, commit_recovery.clone()).unwrap();
+        assert_eq!(
+            resumed_after_commit_stale.status_snapshot().live,
+            commit_status.durable
+        );
+        assert_eq!(
+            commit_recovery.progress_as_follower().unwrap(),
+            commit_status.durable
+        );
 
         r.mark_applied(9);
         let applied_status = r.status_snapshot();
@@ -5361,6 +5381,16 @@ mod tests {
         assert_eq!(r.status_snapshot(), applied_status);
         assert_eq!(r.recovery_state(), applied_recovery);
         assert_eq!(r.recovery_progress_gap(), applied_gap);
+        let resumed_after_apply_stale =
+            RaftReplicator::resume_as_follower(3, applied_recovery.clone()).unwrap();
+        assert_eq!(
+            resumed_after_apply_stale.status_snapshot().live,
+            applied_status.durable
+        );
+        assert_eq!(
+            applied_recovery.progress_as_follower().unwrap(),
+            applied_status.durable
+        );
         assert_eq!(r.snapshot_meta().snapshot_id, 31);
     }
 }
