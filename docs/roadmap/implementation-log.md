@@ -1,5 +1,10 @@
 # Implementation Log (Pre-NVIDIA Phase)
 
+## 2026-04-28
+
+### Completed
+- Added a Q3 regression proving that if a repair-phase advanced-frontier snapshot lands and a later role/term handoff happens before that fresh suffix is committed/applied away, the handoff still discards only the speculative fresh tail while preserving the advanced durable `snapshot_id` across `status_snapshot()`, `recovery_state()`, `progress_as_follower()`, and `resume_as_follower(...)`.
+
 ## 2026-04-25
 
 ### Completed
