@@ -7449,6 +7449,138 @@ mod tests {
     }
 
     #[test]
+    fn repair_phase_second_refresh_advanced_replacement_refresh_survives_role_change_tail_discard()
+    {
+        let mut r = RaftReplicator::new(3);
+        r.become_follower(5);
+
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 5,
+            last_included_term: 4,
+            snapshot_id: 11,
+        });
+        r.append_entries_from_leader(
+            5,
+            5,
+            4,
+            vec![
+                LogEntry {
+                    term: 5,
+                    index: 6,
+                    payload: vec![6],
+                },
+                LogEntry {
+                    term: 5,
+                    index: 7,
+                    payload: vec![7],
+                },
+                LogEntry {
+                    term: 5,
+                    index: 8,
+                    payload: vec![8],
+                },
+            ],
+            7,
+        )
+        .unwrap();
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 7,
+            last_included_term: 5,
+            snapshot_id: 29,
+        });
+        r.append_entries_from_leader(
+            6,
+            7,
+            5,
+            vec![
+                LogEntry {
+                    term: 6,
+                    index: 8,
+                    payload: vec![80],
+                },
+                LogEntry {
+                    term: 6,
+                    index: 9,
+                    payload: vec![90],
+                },
+                LogEntry {
+                    term: 6,
+                    index: 10,
+                    payload: vec![100],
+                },
+            ],
+            8,
+        )
+        .unwrap();
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 8,
+            last_included_term: 6,
+            snapshot_id: 41,
+        });
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 8,
+            last_included_term: 6,
+            snapshot_id: 17,
+        });
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 8,
+            last_included_term: 6,
+            snapshot_id: 13,
+        });
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 9,
+            last_included_term: 6,
+            snapshot_id: 53,
+        });
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 9,
+            last_included_term: 6,
+            snapshot_id: 47,
+        });
+
+        let refreshed_status = r.status_snapshot();
+        assert!(refreshed_status.has_speculative_tail());
+        assert_eq!(refreshed_status.live.snapshot.snapshot_id, 47);
+        assert_eq!(refreshed_status.durable.snapshot.snapshot_id, 47);
+        assert_eq!(refreshed_status.live.commit_index, 9);
+        assert_eq!(refreshed_status.live.applied_index, 9);
+        assert_eq!(refreshed_status.live.next_index, 11);
+        assert_eq!(refreshed_status.durable.next_index, 10);
+
+        r.become_candidate(7);
+
+        let after_role_change = r.status_snapshot();
+        assert!(after_role_change.is_restart_equivalent());
+        assert_eq!(after_role_change.live.role, Role::Candidate);
+        assert_eq!(after_role_change.live.term, 7);
+        assert_eq!(after_role_change.live.commit_index, 9);
+        assert_eq!(after_role_change.live.applied_index, 9);
+        assert_eq!(after_role_change.live.next_index, 10);
+        assert_eq!(after_role_change.live.uncommitted_entry_count, 0);
+        assert_eq!(after_role_change.live.snapshot.snapshot_id, 47);
+        assert_eq!(after_role_change.durable.role, Role::Follower);
+        assert_eq!(after_role_change.durable.term, 7);
+        assert_eq!(after_role_change.durable.commit_index, 9);
+        assert_eq!(after_role_change.durable.applied_index, 9);
+        assert_eq!(after_role_change.durable.next_index, 10);
+        assert_eq!(after_role_change.durable.uncommitted_entry_count, 0);
+        assert_eq!(after_role_change.durable.snapshot.snapshot_id, 47);
+        assert_eq!(after_role_change.recovery_gap.next_index_gap, 0);
+        assert_eq!(after_role_change.recovery_gap.uncommitted_entry_gap, 0);
+
+        let recovery = r.recovery_state();
+        assert_eq!(recovery.term, 7);
+        assert_eq!(recovery.snapshot.snapshot_id, 47);
+        let resumed = RaftReplicator::resume_as_follower(3, recovery.clone()).unwrap();
+        assert_eq!(resumed.status_snapshot().live, after_role_change.durable);
+        assert_eq!(
+            recovery.progress_as_follower().unwrap(),
+            after_role_change.durable
+        );
+        assert_eq!(r.snapshot_meta().snapshot_id, 47);
+    }
+
+    #[test]
     fn repair_phase_second_refresh_advanced_replacement_collapses_cleanly_on_newer_leader_rejection(
     ) {
         let mut r = RaftReplicator::new(3);
