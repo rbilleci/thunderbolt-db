@@ -4,6 +4,8 @@
 
 ### Completed
 - Added a Q3 regression proving that if a repair-phase advanced-frontier snapshot lands and a later role/term handoff happens before that fresh suffix is committed/applied away, the handoff still discards only the speculative fresh tail while preserving the advanced durable `snapshot_id` across `status_snapshot()`, `recovery_state()`, `progress_as_follower()`, and `resume_as_follower(...)`.
+- Added a follow-on Q3 regression proving that a same-frontier same-term snapshot refresh layered onto that repair-phase advanced-frontier stack may swap only the durable `snapshot_id`; live-vs-durable gap shape, recovery projection, and later commit/apply completion all stay pinned to the refreshed identity.
+- Added a follow-on Q3 regression proving that if a role/term handoff happens after that repair-phase advanced-frontier refresh, it still discards only the speculative fresh tail while preserving the refreshed durable `snapshot_id` across status/recovery/restart truth surfaces.
 - Added a follow-on Q3 regression proving that once that repair-phase advanced-frontier snapshot becomes the durable boundary, later stale snapshot installs remain pure no-ops during repair, after heartbeat commit retires speculative tail, and after final apply completion; advanced durable identity, recovery-gap accounting, and restart/resume projection stay pinned.
 
 ## 2026-04-25
