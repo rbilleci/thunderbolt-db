@@ -7874,6 +7874,151 @@ mod tests {
     }
 
     #[test]
+    fn repair_phase_second_refresh_advanced_replacement_refresh_keeps_stale_installs_inert_through_commit_and_apply(
+    ) {
+        let mut r = RaftReplicator::new(3);
+        r.become_follower(5);
+
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 5,
+            last_included_term: 4,
+            snapshot_id: 11,
+        });
+        r.append_entries_from_leader(
+            5,
+            5,
+            4,
+            vec![
+                LogEntry {
+                    term: 5,
+                    index: 6,
+                    payload: vec![6],
+                },
+                LogEntry {
+                    term: 5,
+                    index: 7,
+                    payload: vec![7],
+                },
+                LogEntry {
+                    term: 5,
+                    index: 8,
+                    payload: vec![8],
+                },
+            ],
+            7,
+        )
+        .unwrap();
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 7,
+            last_included_term: 5,
+            snapshot_id: 29,
+        });
+        r.append_entries_from_leader(
+            6,
+            7,
+            5,
+            vec![
+                LogEntry {
+                    term: 6,
+                    index: 8,
+                    payload: vec![80],
+                },
+                LogEntry {
+                    term: 6,
+                    index: 9,
+                    payload: vec![90],
+                },
+                LogEntry {
+                    term: 6,
+                    index: 10,
+                    payload: vec![100],
+                },
+            ],
+            8,
+        )
+        .unwrap();
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 8,
+            last_included_term: 6,
+            snapshot_id: 41,
+        });
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 8,
+            last_included_term: 6,
+            snapshot_id: 17,
+        });
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 8,
+            last_included_term: 6,
+            snapshot_id: 13,
+        });
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 9,
+            last_included_term: 6,
+            snapshot_id: 53,
+        });
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 9,
+            last_included_term: 6,
+            snapshot_id: 47,
+        });
+
+        let refreshed_status = r.status_snapshot();
+        assert!(refreshed_status.has_speculative_tail());
+        assert_eq!(refreshed_status.live.snapshot.snapshot_id, 47);
+        assert_eq!(refreshed_status.durable.snapshot.snapshot_id, 47);
+        assert_eq!(refreshed_status.live.next_index, 11);
+        assert_eq!(refreshed_status.durable.next_index, 10);
+
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 8,
+            last_included_term: 6,
+            snapshot_id: 999,
+        });
+        let after_stale_repair = r.status_snapshot();
+        assert_eq!(after_stale_repair, refreshed_status);
+
+        r.append_entries_from_leader(6, 10, 6, Vec::new(), 10)
+            .unwrap();
+        let committed_status = r.status_snapshot();
+        assert!(committed_status.live.has_committed_entries_pending_apply);
+        assert_eq!(committed_status.live.snapshot.snapshot_id, 47);
+        assert_eq!(committed_status.durable.snapshot.snapshot_id, 47);
+
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 8,
+            last_included_term: 6,
+            snapshot_id: 46,
+        });
+        let after_stale_commit = r.status_snapshot();
+        assert_eq!(after_stale_commit, committed_status);
+
+        r.mark_applied(10);
+        let applied_status = r.status_snapshot();
+        assert!(applied_status.is_restart_equivalent());
+        assert_eq!(applied_status.live.snapshot.snapshot_id, 47);
+        assert_eq!(applied_status.durable.snapshot.snapshot_id, 47);
+
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 8,
+            last_included_term: 6,
+            snapshot_id: 45,
+        });
+        let after_stale_apply = r.status_snapshot();
+        assert_eq!(after_stale_apply, applied_status);
+
+        let recovery = r.recovery_state();
+        assert_eq!(recovery.snapshot.snapshot_id, 47);
+        let resumed = RaftReplicator::resume_as_follower(3, recovery.clone()).unwrap();
+        assert_eq!(resumed.status_snapshot().live, applied_status.live);
+        assert_eq!(
+            recovery.progress_as_follower().unwrap(),
+            applied_status.durable
+        );
+        assert_eq!(r.snapshot_meta().snapshot_id, 47);
+    }
+
+    #[test]
     fn repair_phase_second_refresh_advanced_replacement_collapses_cleanly_on_newer_leader_rejection(
     ) {
         let mut r = RaftReplicator::new(3);
