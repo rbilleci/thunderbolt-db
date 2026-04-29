@@ -3,6 +3,8 @@
 ## 2026-04-29
 
 ### Completed
+- Added a Q3 regression proving that after the post-rejection refresh -> rejection -> re-repair chain, a same-frontier same-term refresh may still land during that later re-repair path and swap only the durable `snapshot_id`; the fresh-tail gap shape, `status_snapshot()`, `recovery_state()`, `recovery_progress_gap()`, and `resume_as_follower(...)` all stay pinned, and later heartbeat/apply retirement completes on the newly refreshed durable identity.
+- Reconciled replication interface and roadmap docs so the Q3 queue now explicitly includes that re-repair refresh slice.
 - Added a Q3 regression proving that after the post-rejection refresh -> rejection -> re-repair chain, later stale snapshot installs still remain pure no-ops during re-repair, after heartbeat commit, and after final apply completion; `status_snapshot()`, `recovery_state()`, `recovery_progress_gap()`, and `resume_as_follower(...)` all stay pinned to the same newest refreshed advanced durable identity.
 - Reconciled replication interface and roadmap docs so the Q3 queue now explicitly treats stale-install inertness on that later re-repair path as locked stress truth too.
 - Added a Q3 regression proving that after the post-rejection refresh -> rejection -> re-repair chain, accepted heartbeat commit and final apply completion still retire only the fresh-epoch tail back to restart-equivalent truth while preserving the same newest refreshed advanced durable identity across `status_snapshot()`, `recovery_state()`, `recovery_progress_gap()`, and `resume_as_follower(...)`.
