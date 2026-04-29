@@ -1,5 +1,11 @@
 # Implementation Log (Pre-NVIDIA Phase)
 
+## 2026-04-29
+
+### Completed
+- Added a Q3 regression proving that after a repair-phase advanced-frontier snapshot stack same-frontier-refreshes its durable `snapshot_id` again, then later newer-leader rejection collapses it back to restart-equivalent truth, and a compatible newer leader repairs fresh-epoch tail around that same refreshed durable identity, later stale snapshot installs still remain pure no-ops during repair, after heartbeat commit, and after final apply completion; `status_snapshot()`, `recovery_state()`, `recovery_progress_gap()`, and `resume_as_follower(...)` all stay pinned to the refreshed advanced durable truth surface.
+- Reconciled replication interface and roadmap docs so the Q3 queue now explicitly includes stale-install inertness on that post-rejection repair path.
+
 ## 2026-04-28
 
 ### Completed
