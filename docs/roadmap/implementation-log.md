@@ -3,6 +3,8 @@
 ## 2026-04-29
 
 ### Completed
+- Added a Q3 regression proving that after the post-rejection refresh -> rejection -> re-repair -> refresh -> rejection collapse, a later compatible repair may still reintroduce only fresh-epoch tail around that same newest refreshed durable identity; `status_snapshot()`, `recovery_state()`, `recovery_progress_gap()`, and `resume_as_follower(...)` all stay pinned to the durable truth while only the fresh live-vs-durable gap reappears.
+- Reconciled implementation notes with the already-claimed Q3 queue truth that refreshed rejection collapse does not block a later clean repair from the same durable boundary.
 - Added a Q3 regression proving that after the post-rejection refresh -> rejection -> re-repair chain, if that later re-repair path same-frontier-refreshes again and then an even newer leader rejects before heartbeat/apply retirement, the node still discards only the speculative fresh tail and collapses immediately back to restart-equivalent truth on the newly refreshed durable identity across `status_snapshot()`, `recovery_state()`, `recovery_progress_gap()`, and `resume_as_follower(...)`.
 - Reconciled replication interface and roadmap docs so the Q3 queue now explicitly includes rejection-collapse after that re-repair refresh slice.
 - Added a Q3 regression proving that after the post-rejection refresh -> rejection -> re-repair chain, a same-frontier same-term refresh may still land during that later re-repair path and swap only the durable `snapshot_id`; the fresh-tail gap shape, `status_snapshot()`, `recovery_state()`, `recovery_progress_gap()`, and `resume_as_follower(...)` all stay pinned, and later heartbeat/apply retirement completes on the newly refreshed durable identity.
