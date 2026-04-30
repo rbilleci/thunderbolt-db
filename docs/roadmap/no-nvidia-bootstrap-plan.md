@@ -259,6 +259,7 @@ Notes:
 
 ### Q4. Golden-wire `psql` compatibility suite
 Priority: high
+Status: in progress; harness scaffolding, boot-command orchestration, and multi-scenario golden coverage are landed, but CI still needs a real service endpoint before this can be marked complete.
 
 Goal:
 - Add a real-client compatibility suite that exercises the engine through the standard `psql`/libpq path rather than custom protocol fixtures only.

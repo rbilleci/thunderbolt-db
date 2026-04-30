@@ -35,7 +35,7 @@ scripts/run_psql_golden.sh
 
 This suite is intentionally libpq/`psql`-driven, not fixture-only protocol parsing, so client lifecycle behavior is validated end-to-end.
 
-Current CI gate status: temporary local/manual gate only (run via `just compat-psql-golden` or `scripts/run_psql_golden.sh`) until a dedicated CI service endpoint is wired.
+Current CI gate status: temporary local/manual gate only (run via `just compat-psql-golden` or `scripts/run_psql_golden.sh`) until a dedicated CI service endpoint is wired. The harness can now optionally boot the target service itself via `PSQL_GOLDEN_BOOT_CMD` + endpoint wait settings, so CI/service wiring can be added without changing scenario layout.
 
 ## Bucket registration for new tests
 

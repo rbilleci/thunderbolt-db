@@ -16,6 +16,11 @@
 2. Preserve the Q3 semantic envelope as a locked baseline; only reopen it for a real contradiction or a newly discovered semantic category.
 3. Keep the standard validation gate green on each follow-on milestone.
 
+### Completed
+- Hardened the `psql` golden harness so Q4 can boot a target service itself via `PSQL_GOLDEN_BOOT_CMD`, wait for a TCP endpoint before running scenarios, capture boot logs, and optionally apply per-scenario extra `psql` flags from `.psqlargs` files.
+- Added a second real-client golden scenario covering common session reset/setup probes (`RESET ALL`, `DISCARD ALL`, `DEALLOCATE ALL`, `UNLISTEN *`) plus a SQL prepare/execute/deallocate flow, expanding Q4 coverage beyond the initial simple-query + transaction + error-path slice.
+- Updated the Q4 roadmap/docs status to reflect the stronger harness truth: the suite is materially more real now, but still awaits a dedicated CI service endpoint before Q4 can be closed.
+
 ## 2026-04-29
 
 ### Completed

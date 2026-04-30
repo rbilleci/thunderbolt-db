@@ -17,6 +17,14 @@ scripts/run_psql_golden.sh
 Optional:
 - `PSQL_BIN=/path/to/psql`
 - `PSQL_GOLDEN_OUT_DIR=/tmp/psql-golden`
+- `PSQL_GOLDEN_BOOT_CMD='cargo run --bin gpu-db-server -- --listen 127.0.0.1:5432'`
+- `PSQL_GOLDEN_BOOT_CWD=/path/to/repo-or-service`
+- `PSQL_GOLDEN_STOP_CMD='pkill -f gpu-db-server'`
+- `PSQL_GOLDEN_WAIT_HOST=127.0.0.1`
+- `PSQL_GOLDEN_WAIT_PORT=5432`
+- `PSQL_GOLDEN_WAIT_TIMEOUT_SEC=30`
+
+When `PSQL_GOLDEN_BOOT_CMD` is set, the harness starts the target service itself, waits for the configured TCP endpoint to accept connections, and captures boot logs in `target/psql-golden/boot.log`.
 
 ## Update expected artifacts
 
@@ -24,9 +32,11 @@ Optional:
 2. Inspect `target/psql-golden/*.txt`.
 3. If the new output is correct and deterministic, copy it into `tests/compat/psql-golden/expected/`.
 4. Optionally add `tests/compat/psql-golden/expected/<scenario>.rc` when a scenario expects non-zero `psql` exit status (defaults to `0` when omitted).
+5. Optionally add `tests/compat/psql-golden/scenarios/<scenario>.psqlargs` with one extra `psql` CLI argument per line when a scenario needs custom flags.
 
 ## Notes
 
 - The harness intentionally strips volatile lines (timing/version/SSL banner noise).
 - Keep scenario assertions stable and semantic, avoid transient text where possible.
-- If an extended-query/prepared flow is intentionally unsupported, encode that as an explicit expected failure in a dedicated scenario and set the expected `.rc` artifact.
+- Current scenario coverage includes connect/simple-query, session reset probes, SQL prepare/execute/deallocate flow, transaction begin/commit/rollback flow, and a deterministic error path.
+- If a wire-level extended-query flow is intentionally unsupported, encode that as an explicit expected failure in a dedicated scenario and set the expected `.rc` artifact.

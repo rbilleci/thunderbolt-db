@@ -1,0 +1,13 @@
+=== session reset probes ===
+RESET
+DISCARD ALL
+DEALLOCATE ALL
+UNLISTEN
+=== sql prepare execute flow ===
+PREPARE
+ plus_ten
+----------
+       15
+(1 row)
+
+DEALLOCATE
