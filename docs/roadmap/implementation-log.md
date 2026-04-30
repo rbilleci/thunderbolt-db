@@ -3,6 +3,8 @@
 ## 2026-04-29
 
 ### Completed
+- Added a Q3 regression proving that after the refreshed re-repair path suffers another newer-leader rejection and then a compatible newer leader repairs again, heartbeat commit and final apply still retire only the fresh epoch tail back to restart-equivalent truth while preserving the same newest refreshed durable identity across `status_snapshot()`, `recovery_state()`, `recovery_progress_gap()`, and `resume_as_follower(...)`.
+- Reconciled implementation notes with the already-claimed Q3 queue truth that this repaired refreshed-tail branch also retires cleanly through commit/apply, not just through handoff or stale-install no-op coverage.
 - Added a Q3 regression proving that after the refreshed re-repair path suffers another newer-leader rejection and then a compatible newer leader repairs again, a role/term handoff before heartbeat/apply retirement still discards only the speculative fresh tail while preserving the same newest refreshed durable identity across `status_snapshot()`, `recovery_state()`, `recovery_progress_gap()`, and `resume_as_follower(...)`.
 - Reconciled replication interface and roadmap docs so the Q3 queue now explicitly treats that post-repair-after-refresh-rejection role-handoff slice as locked stress truth too.
 - Added a Q3 regression proving that after the post-rejection refresh -> rejection -> re-repair -> refresh -> rejection collapse, a later compatible repair may still change role/term before heartbeat/apply retirement and the handoff still discards only the speculative fresh tail while preserving the same newest refreshed durable identity across `status_snapshot()`, `recovery_state()`, `recovery_progress_gap()`, and `resume_as_follower(...)`.
