@@ -3,6 +3,8 @@
 ## 2026-04-29
 
 ### Completed
+- Added a Q3 regression proving that after the refreshed re-repair path suffers another newer-leader rejection, is repaired again, same-frontier-refreshes during that final repair phase, and then changes role/term before heartbeat/apply retirement, the handoff still discards only the speculative fresh tail while preserving the newly refreshed durable identity across `status_snapshot()`, `recovery_state()`, `recovery_progress_gap()`, and `resume_as_follower(...)`.
+- Reconciled replication interface and roadmap docs so the Q3 queue now explicitly includes that final repaired-branch refresh role-handoff slice.
 - Added a Q3 regression proving that after the refreshed re-repair path suffers another newer-leader rejection, is repaired again, and then same-frontier-refreshes during that final repair phase, only the durable `snapshot_id` changes; the fresh-tail gap shape, `status_snapshot()`, `recovery_state()`, `recovery_progress_gap()`, and `resume_as_follower(...)` all stay pinned, and later heartbeat/apply retirement completes on the newly refreshed durable identity.
 - Reconciled replication interface and roadmap docs so the Q3 queue now explicitly includes that final-repair refresh slice.
 - Added a focused Q3 invariant regression proving `ReplicationStatusSnapshot::new(...)` rejects mismatched `recovery_gap` projections instead of accepting status surfaces whose explicit live-vs-durable delta disagrees with the actual progress snapshots.
