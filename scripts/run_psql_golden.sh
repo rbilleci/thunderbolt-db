@@ -14,16 +14,70 @@ WAIT_HOST="${PSQL_GOLDEN_WAIT_HOST:-${PGHOST:-127.0.0.1}}"
 WAIT_PORT="${PSQL_GOLDEN_WAIT_PORT:-${PGPORT:-5432}}"
 WAIT_TIMEOUT_SEC="${PSQL_GOLDEN_WAIT_TIMEOUT_SEC:-30}"
 BOOT_LOG="$OUT_DIR/boot.log"
+REPORT_PATH="${PSQL_GOLDEN_REPORT:-$ROOT_DIR/target/compat/psql-golden-report.json}"
+REPORT_ROWS="$OUT_DIR/report.rows.tsv"
 boot_pid=""
-
-if ! command -v "$PSQL_BIN" >/dev/null 2>&1; then
-  echo "error: psql not found (set PSQL_BIN or install psql)" >&2
-  exit 2
-fi
+suite_status="passed"
+suite_error=""
 
 mkdir -p "$OUT_DIR"
 
+write_report() {
+  local output_path=$1
+  local status_value=$2
+  local error_value=$3
+
+  python3 - "$REPORT_ROWS" "$output_path" "$status_value" "$error_value" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+rows_path = Path(sys.argv[1])
+output_path = Path(sys.argv[2])
+status = sys.argv[3]
+error = sys.argv[4]
+
+scenarios = []
+if rows_path.exists():
+    for line in rows_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        name, scenario_status, expected_rc, actual_rc = line.split("\t")
+        scenarios.append(
+            {
+                "id": f"psql_golden::{name}",
+                "name": name,
+                "status": scenario_status,
+                "expected_rc": int(expected_rc),
+                "actual_rc": int(actual_rc),
+            }
+        )
+
+report = {
+    "suite": "psql_golden",
+    "status": status,
+    "error": error or None,
+    "scenarios": scenarios,
+}
+output_path.parent.mkdir(parents=True, exist_ok=True)
+output_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+}
+
+if ! command -v "$PSQL_BIN" >/dev/null 2>&1; then
+  suite_status="failed"
+  suite_error="psql not found (set PSQL_BIN or install psql)"
+  write_report "$REPORT_PATH" "$suite_status" "$suite_error"
+  echo "error: psql not found (set PSQL_BIN or install psql)" >&2
+  exit 2
+fi
+:
+>"$REPORT_ROWS"
+
 if [ -z "${PGHOST:-}" ] || [ -z "${PGPORT:-}" ] || [ -z "${PGDATABASE:-}" ] || [ -z "${PGUSER:-}" ]; then
+  suite_status="failed"
+  suite_error="missing libpq env (PGHOST, PGPORT, PGDATABASE, PGUSER)"
+  write_report "$REPORT_PATH" "$suite_status" "$suite_error"
   cat >&2 <<'MSG'
 error: missing libpq env. Set at least PGHOST, PGPORT, PGDATABASE, PGUSER (and PGPASSWORD if needed).
 MSG
@@ -74,6 +128,10 @@ PY
 
 cleanup() {
   local rc=$?
+  if [ "$rc" -ne 0 ] && [ -z "$suite_error" ]; then
+    suite_status="failed"
+  fi
+  write_report "$REPORT_PATH" "$suite_status" "$suite_error"
   if [ -n "$STOP_CMD" ]; then
     bash -lc "$STOP_CMD" >>"$BOOT_LOG" 2>&1 || true
   fi
@@ -92,7 +150,11 @@ if [ -n "$BOOT_CMD" ]; then
     exec bash -lc "$BOOT_CMD"
   ) >>"$BOOT_LOG" 2>&1 &
   boot_pid=$!
-  wait_for_endpoint
+  if ! wait_for_endpoint; then
+    suite_status="failed"
+    suite_error="timed out waiting for booted compatibility endpoint"
+    exit 1
+  fi
 fi
 
 status=0
@@ -141,16 +203,20 @@ for scenario in "$SCENARIOS_DIR"/*.sql; do
 
   if ! diff -u "$expected" "$norm"; then
     echo "scenario '$name' mismatch (psql exit=$rc)" >&2
+    printf '%s\t%s\t%s\t%s\n' "$name" "failed" "$expected_rc" "$rc" >>"$REPORT_ROWS"
     status=1
   elif [ "$rc" -ne "$expected_rc" ]; then
     echo "scenario '$name' exit mismatch (expected=$expected_rc actual=$rc)" >&2
+    printf '%s\t%s\t%s\t%s\n' "$name" "failed" "$expected_rc" "$rc" >>"$REPORT_ROWS"
     status=1
   else
+    printf '%s\t%s\t%s\t%s\n' "$name" "passed" "$expected_rc" "$rc" >>"$REPORT_ROWS"
     echo "scenario '$name' ok (psql exit=$rc)"
   fi
 done
 
 if [ "$status" -ne 0 ]; then
+  suite_status="failed"
   echo "psql golden: FAILED" >&2
   exit 1
 fi

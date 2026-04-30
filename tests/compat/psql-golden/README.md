@@ -17,14 +17,15 @@ scripts/run_psql_golden.sh
 Optional:
 - `PSQL_BIN=/path/to/psql`
 - `PSQL_GOLDEN_OUT_DIR=/tmp/psql-golden`
-- `PSQL_GOLDEN_BOOT_CMD='cargo run --bin gpu-db-server -- --listen 127.0.0.1:5432'`
+- `PSQL_GOLDEN_BOOT_CMD='cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen 127.0.0.1:5432'`
 - `PSQL_GOLDEN_BOOT_CWD=/path/to/repo-or-service`
 - `PSQL_GOLDEN_STOP_CMD='pkill -f gpu-db-server'`
 - `PSQL_GOLDEN_WAIT_HOST=127.0.0.1`
 - `PSQL_GOLDEN_WAIT_PORT=5432`
 - `PSQL_GOLDEN_WAIT_TIMEOUT_SEC=30`
+- `PSQL_GOLDEN_REPORT=target/compat/psql-golden-report.json`
 
-When `PSQL_GOLDEN_BOOT_CMD` is set, the harness starts the target service itself, waits for the configured TCP endpoint to accept connections, and captures boot logs in `target/psql-golden/boot.log`.
+When `PSQL_GOLDEN_BOOT_CMD` is set, the harness starts the target service itself, waits for the configured TCP endpoint to accept connections, captures boot logs in `target/psql-golden/boot.log`, and writes a machine-readable scenario report to `PSQL_GOLDEN_REPORT` for CI scorecards.
 
 ## Update expected artifacts
 
@@ -39,4 +40,5 @@ When `PSQL_GOLDEN_BOOT_CMD` is set, the harness starts the target service itself
 - The harness intentionally strips volatile lines (timing/version/SSL banner noise).
 - Keep scenario assertions stable and semantic, avoid transient text where possible.
 - Current scenario coverage includes connect/simple-query, session reset probes, SQL prepare/execute/deallocate flow, transaction begin/commit/rollback flow, and a deterministic error path.
+- CI now boots the repo-local compatibility endpoint with `cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen 127.0.0.1:55432` before running the suite, so Q4 has a real service endpoint instead of a manual-only placeholder.
 - If a wire-level extended-query flow is intentionally unsupported, encode that as an explicit expected failure in a dedicated scenario and set the expected `.rc` artifact.

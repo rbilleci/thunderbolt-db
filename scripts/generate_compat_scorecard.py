@@ -14,6 +14,11 @@ TEST_RE = re.compile(r"^test\s+(.+?)\s+\.\.\.\s+(ok|FAILED|ignored)\s*$")
 
 def classify(test_id: str) -> list[str]:
     buckets: list[str] = []
+    if "psql_golden::" in test_id:
+        if re.search(r"bootstrap|startup|auth|connect|simple_query|session_reset|prepare", test_id):
+            buckets.append("protocol.client_flows")
+        if re.search(r"transaction|begin|commit|rollback", test_id):
+            buckets.append("sql.transaction_flows")
     if "gpu_db_protocol::" in test_id:
         if re.search(r"startup|frontend|ssl|cancel|session_lifecycle", test_id):
             buckets.append("protocol.client_flows")
@@ -50,6 +55,30 @@ def parse_log(log_path: Path) -> tuple[list[dict], Counter]:
         test_name, status = test_match.groups()
         status_counts[status] += 1
         test_id = f"{current_crate}::{test_name}"
+        tests.append(
+            {
+                "id": test_id,
+                "status": status,
+                "buckets": classify(test_id),
+            }
+        )
+
+    return tests, status_counts
+
+
+def parse_psql_report(report_path: Path | None) -> tuple[list[dict], Counter]:
+    if report_path is None or not report_path.exists():
+        return [], Counter()
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    tests: list[dict] = []
+    status_counts: Counter = Counter()
+
+    for scenario in report.get("scenarios", []):
+        raw_status = scenario.get("status", "failed")
+        status = "ok" if raw_status == "passed" else "FAILED"
+        test_id = scenario.get("id", f"psql_golden::{scenario.get('name', 'unknown')}")
+        status_counts[status] += 1
         tests.append(
             {
                 "id": test_id,
@@ -172,9 +201,13 @@ def main() -> None:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--markdown", required=False, type=Path)
     parser.add_argument("--baseline", required=False, type=Path)
+    parser.add_argument("--psql-report", required=False, type=Path)
     args = parser.parse_args()
 
     tests, status_counts = parse_log(args.input)
+    psql_tests, psql_status_counts = parse_psql_report(args.psql_report)
+    tests.extend(psql_tests)
+    status_counts.update(psql_status_counts)
     summary = summarize(tests, status_counts)
     summary["trend_hook"] = build_trend(summary, load_baseline(args.baseline))
 

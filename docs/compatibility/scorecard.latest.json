@@ -12,6 +12,12 @@
       "passed": 37,
       "total": 37
     },
+    "protocol.client_flows": {
+      "failed": 0,
+      "ignored": 0,
+      "passed": 2,
+      "total": 2
+    },
     "replication.role_and_log": {
       "failed": 0,
       "ignored": 0,
@@ -35,8 +41,8 @@
   "totals": {
     "failed": 0,
     "ignored": 0,
-    "passed": 219,
-    "total": 219
+    "passed": 221,
+    "total": 221
   },
   "trend_hook": {
     "baseline_available": true,
@@ -44,6 +50,7 @@
     "bucket_failed_delta": {
       "durability.invariants": 0,
       "execution.gpu_routing_and_batching": 0,
+      "protocol.client_flows": 0,
       "replication.role_and_log": 0,
       "sql.transaction_flows": 0,
       "uncategorized": 0

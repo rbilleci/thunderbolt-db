@@ -17,9 +17,14 @@
 3. Keep the standard validation gate green on each follow-on milestone.
 
 ### Completed
+- Closed Q5 by teaching the compatibility scorecard generator to merge `cargo test` results with the machine-readable `psql` golden suite report, so CI bucket counts and fail summaries now include real-client coverage instead of only Rust unit/integration tests.
+- Hardened the CI flow so both the Rust test run and the `psql` golden suite can fail independently while the combined scorecard artifact still gets generated and uploaded before the job asserts the gates.
+- Extended the `psql` golden harness to emit `target/compat/psql-golden-report.json`, giving future compatibility work a stable machine-readable registration surface.
+- Closed the last Q4 gap by adding a repo-local Postgres-wire compatibility endpoint (`cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen ...`) that speaks enough startup/simple-query protocol for the golden `psql` suite to run against a real TCP service instead of a manual placeholder.
+- Wired the CI workflow to install `psql`, boot that compatibility endpoint through `PSQL_GOLDEN_BOOT_CMD`, wait for readiness, and run `scripts/run_psql_golden.sh` as a normal gate.
+- Updated compatibility and roadmap docs so Q4 is now treated as complete and the documented local/CI boot command matches the new endpoint.
 - Hardened the `psql` golden harness so Q4 can boot a target service itself via `PSQL_GOLDEN_BOOT_CMD`, wait for a TCP endpoint before running scenarios, capture boot logs, and optionally apply per-scenario extra `psql` flags from `.psqlargs` files.
 - Added a second real-client golden scenario covering common session reset/setup probes (`RESET ALL`, `DISCARD ALL`, `DEALLOCATE ALL`, `UNLISTEN *`) plus a SQL prepare/execute/deallocate flow, expanding Q4 coverage beyond the initial simple-query + transaction + error-path slice.
-- Updated the Q4 roadmap/docs status to reflect the stronger harness truth: the suite is materially more real now, but still awaits a dedicated CI service endpoint before Q4 can be closed.
 
 ## 2026-04-29
 

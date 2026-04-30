@@ -259,7 +259,7 @@ Notes:
 
 ### Q4. Golden-wire `psql` compatibility suite
 Priority: high
-Status: in progress; harness scaffolding, boot-command orchestration, and multi-scenario golden coverage are landed, but CI still needs a real service endpoint before this can be marked complete.
+Status: completed on 2026-04-30; CI now installs `psql`, boots the repo-local compatibility endpoint, and runs the golden suite end-to-end.
 
 Goal:
 - Add a real-client compatibility suite that exercises the engine through the standard `psql`/libpq path rather than custom protocol fixtures only.
@@ -283,6 +283,7 @@ Notes:
 
 ### Q5. CI compatibility scorecard
 Priority: high
+Status: completed on 2026-04-30; CI now merges Rust test output plus real-client `psql` golden results into one published compatibility scorecard artifact.
 
 Goal:
 - Produce a hard compatibility scorecard in CI so protocol/SQL compatibility progress is measured, not inferred.
