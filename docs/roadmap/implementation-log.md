@@ -3,6 +3,8 @@
 ## 2026-04-29
 
 ### Completed
+- Added a Q3 regression proving that after the post-rejection refresh -> rejection -> re-repair -> refresh -> rejection collapse, a later compatible repair may still change role/term before heartbeat/apply retirement and the handoff still discards only the speculative fresh tail while preserving the same newest refreshed durable identity across `status_snapshot()`, `recovery_state()`, `recovery_progress_gap()`, and `resume_as_follower(...)`.
+- Reconciled replication interface and roadmap docs so the Q3 queue now explicitly treats that later-repair role-handoff slice as locked stress truth too.
 - Added a Q3 regression proving that after the post-rejection refresh -> rejection -> re-repair -> refresh -> rejection collapse, a later compatible repair still keeps stale snapshot installs inert during repair, after heartbeat commit advancement, and after final apply completion; `status_snapshot()`, `recovery_state()`, `recovery_progress_gap()`, and `resume_as_follower(...)` all stay pinned to the same newest refreshed durable identity.
 - Reconciled replication interface and roadmap docs so the Q3 queue now explicitly treats stale-install inertness on that refreshed re-repair-after-rejection-repair branch as locked stress truth too.
 - Added a Q3 regression proving that after the post-rejection refresh -> rejection -> later compatible repair chain, later stale snapshot installs still remain pure no-ops during that later repair, after heartbeat commit advancement, and after final apply completion; `status_snapshot()`, `recovery_state()`, `recovery_progress_gap()`, and `resume_as_follower(...)` all stay pinned to the same newest refreshed durable identity.
