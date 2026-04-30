@@ -3,6 +3,8 @@
 ## 2026-04-29
 
 ### Completed
+- Added a Q3 regression proving that after the refreshed re-repair path suffers another newer-leader rejection, is repaired again, and then same-frontier-refreshes during that final repair phase, only the durable `snapshot_id` changes; the fresh-tail gap shape, `status_snapshot()`, `recovery_state()`, `recovery_progress_gap()`, and `resume_as_follower(...)` all stay pinned, and later heartbeat/apply retirement completes on the newly refreshed durable identity.
+- Reconciled replication interface and roadmap docs so the Q3 queue now explicitly includes that final-repair refresh slice.
 - Added a focused Q3 invariant regression proving `ReplicationStatusSnapshot::new(...)` rejects mismatched `recovery_gap` projections instead of accepting status surfaces whose explicit live-vs-durable delta disagrees with the actual progress snapshots.
 - Added a Q3 regression proving that after the refreshed re-repair path suffers another newer-leader rejection and then a compatible newer leader repairs again, later stale snapshot installs still remain pure no-ops during repair, after heartbeat commit advancement, and after final apply completion; `status_snapshot()`, `recovery_state()`, `recovery_progress_gap()`, and `resume_as_follower(...)` all stay pinned to the same newest refreshed durable identity.
 - Reconciled implementation notes with the already-claimed Q3 queue truth that this repaired refreshed-tail branch also keeps stale snapshot installs inert through repair/commit/apply, not just through handoff or retirement.

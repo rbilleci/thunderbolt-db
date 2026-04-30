@@ -11931,6 +11931,355 @@ mod tests {
     }
 
     #[test]
+    fn repair_phase_second_refresh_advanced_replacement_refresh_post_rejection_repair_rejection_repair_refresh_rejection_repair_refresh_keeps_gap_shape_and_retires_on_new_identity(
+    ) {
+        let mut r = RaftReplicator::new(3);
+        r.become_follower(5);
+
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 5,
+            last_included_term: 4,
+            snapshot_id: 11,
+        });
+        r.append_entries_from_leader(
+            5,
+            5,
+            4,
+            vec![
+                LogEntry {
+                    term: 5,
+                    index: 6,
+                    payload: vec![6],
+                },
+                LogEntry {
+                    term: 5,
+                    index: 7,
+                    payload: vec![7],
+                },
+                LogEntry {
+                    term: 5,
+                    index: 8,
+                    payload: vec![8],
+                },
+            ],
+            7,
+        )
+        .unwrap();
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 7,
+            last_included_term: 5,
+            snapshot_id: 29,
+        });
+        r.append_entries_from_leader(
+            6,
+            7,
+            5,
+            vec![
+                LogEntry {
+                    term: 6,
+                    index: 8,
+                    payload: vec![80],
+                },
+                LogEntry {
+                    term: 6,
+                    index: 9,
+                    payload: vec![90],
+                },
+                LogEntry {
+                    term: 6,
+                    index: 10,
+                    payload: vec![100],
+                },
+            ],
+            8,
+        )
+        .unwrap();
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 8,
+            last_included_term: 6,
+            snapshot_id: 41,
+        });
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 8,
+            last_included_term: 6,
+            snapshot_id: 17,
+        });
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 8,
+            last_included_term: 6,
+            snapshot_id: 13,
+        });
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 9,
+            last_included_term: 6,
+            snapshot_id: 53,
+        });
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 9,
+            last_included_term: 6,
+            snapshot_id: 47,
+        });
+
+        let err = r
+            .append_entries_from_leader(
+                7,
+                99,
+                6,
+                vec![LogEntry {
+                    term: 7,
+                    index: 100,
+                    payload: vec![100],
+                }],
+                100,
+            )
+            .unwrap_err();
+        assert!(matches!(err, EngineError::ProposalFailed(_)));
+
+        r.append_entries_from_leader(
+            7,
+            9,
+            6,
+            vec![
+                LogEntry {
+                    term: 7,
+                    index: 10,
+                    payload: vec![110],
+                },
+                LogEntry {
+                    term: 7,
+                    index: 11,
+                    payload: vec![111],
+                },
+            ],
+            10,
+        )
+        .unwrap();
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 9,
+            last_included_term: 6,
+            snapshot_id: 59,
+        });
+
+        let err = r
+            .append_entries_from_leader(
+                8,
+                99,
+                7,
+                vec![LogEntry {
+                    term: 8,
+                    index: 100,
+                    payload: vec![120],
+                }],
+                100,
+            )
+            .unwrap_err();
+        assert!(matches!(err, EngineError::ProposalFailed(_)));
+
+        r.append_entries_from_leader(
+            8,
+            10,
+            7,
+            vec![
+                LogEntry {
+                    term: 8,
+                    index: 11,
+                    payload: vec![121],
+                },
+                LogEntry {
+                    term: 8,
+                    index: 12,
+                    payload: vec![122],
+                },
+            ],
+            11,
+        )
+        .unwrap();
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 9,
+            last_included_term: 6,
+            snapshot_id: 61,
+        });
+
+        let err = r
+            .append_entries_from_leader(
+                9,
+                99,
+                8,
+                vec![LogEntry {
+                    term: 9,
+                    index: 100,
+                    payload: vec![130],
+                }],
+                100,
+            )
+            .unwrap_err();
+        assert!(matches!(err, EngineError::ProposalFailed(_)));
+
+        r.append_entries_from_leader(
+            9,
+            11,
+            8,
+            vec![
+                LogEntry {
+                    term: 9,
+                    index: 12,
+                    payload: vec![131],
+                },
+                LogEntry {
+                    term: 9,
+                    index: 13,
+                    payload: vec![132],
+                },
+            ],
+            12,
+        )
+        .unwrap();
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 9,
+            last_included_term: 6,
+            snapshot_id: 67,
+        });
+
+        let err = r
+            .append_entries_from_leader(
+                10,
+                99,
+                9,
+                vec![LogEntry {
+                    term: 10,
+                    index: 100,
+                    payload: vec![140],
+                }],
+                100,
+            )
+            .unwrap_err();
+        assert!(matches!(err, EngineError::ProposalFailed(_)));
+
+        r.append_entries_from_leader(
+            10,
+            12,
+            9,
+            vec![
+                LogEntry {
+                    term: 10,
+                    index: 13,
+                    payload: vec![141],
+                },
+                LogEntry {
+                    term: 10,
+                    index: 14,
+                    payload: vec![142],
+                },
+            ],
+            13,
+        )
+        .unwrap();
+
+        let before_refresh = r.status_snapshot();
+        assert!(before_refresh.has_speculative_tail());
+        assert_eq!(before_refresh.live.snapshot.snapshot_id, 67);
+        assert_eq!(before_refresh.durable.snapshot.snapshot_id, 67);
+        assert_eq!(before_refresh.recovery_gap.next_index_gap, 1);
+        assert_eq!(before_refresh.recovery_gap.uncommitted_entry_gap, 1);
+
+        r.install_snapshot(SnapshotMeta {
+            last_included_index: 9,
+            last_included_term: 6,
+            snapshot_id: 71,
+        });
+
+        let after_refresh = r.status_snapshot();
+        assert!(after_refresh.has_speculative_tail());
+        assert_eq!(after_refresh.live.term, 10);
+        assert_eq!(after_refresh.live.commit_index, 13);
+        assert_eq!(after_refresh.live.applied_index, 9);
+        assert_eq!(after_refresh.live.next_index, 15);
+        assert_eq!(after_refresh.live.uncommitted_entry_count, 1);
+        assert_eq!(after_refresh.live.snapshot.snapshot_id, 71);
+        assert_eq!(after_refresh.durable.term, 10);
+        assert_eq!(after_refresh.durable.commit_index, 13);
+        assert_eq!(after_refresh.durable.applied_index, 9);
+        assert_eq!(after_refresh.durable.next_index, 14);
+        assert_eq!(after_refresh.durable.uncommitted_entry_count, 0);
+        assert_eq!(after_refresh.durable.snapshot.snapshot_id, 71);
+        assert_eq!(after_refresh.recovery_gap.next_index_gap, 1);
+        assert_eq!(after_refresh.recovery_gap.uncommitted_entry_gap, 1);
+
+        let refreshed_recovery = r.recovery_state();
+        assert_eq!(refreshed_recovery.term, 10);
+        assert_eq!(refreshed_recovery.snapshot.snapshot_id, 71);
+        let resumed_during_refreshed_repair =
+            RaftReplicator::resume_as_follower(3, refreshed_recovery.clone()).unwrap();
+        assert_eq!(
+            resumed_during_refreshed_repair.status_snapshot().live,
+            after_refresh.durable
+        );
+        assert_eq!(
+            refreshed_recovery.progress_as_follower().unwrap(),
+            after_refresh.durable
+        );
+
+        r.append_entries_from_leader(10, 14, 10, Vec::new(), 14)
+            .unwrap();
+
+        let committed_status = r.status_snapshot();
+        assert!(committed_status.is_restart_equivalent());
+        assert!(committed_status.live.has_committed_entries_pending_apply);
+        assert_eq!(committed_status.live.term, 10);
+        assert_eq!(committed_status.live.commit_index, 14);
+        assert_eq!(committed_status.live.applied_index, 9);
+        assert_eq!(committed_status.live.next_index, 15);
+        assert_eq!(committed_status.live.uncommitted_entry_count, 0);
+        assert_eq!(committed_status.live.snapshot.snapshot_id, 71);
+        assert_eq!(committed_status.durable, committed_status.live);
+        assert_eq!(committed_status.recovery_gap.next_index_gap, 0);
+        assert_eq!(committed_status.recovery_gap.uncommitted_entry_gap, 0);
+
+        let committed_recovery = r.recovery_state();
+        assert_eq!(committed_recovery.term, 10);
+        assert_eq!(committed_recovery.snapshot.snapshot_id, 71);
+        let resumed_after_commit =
+            RaftReplicator::resume_as_follower(3, committed_recovery.clone()).unwrap();
+        assert_eq!(
+            resumed_after_commit.status_snapshot().live,
+            committed_status.live
+        );
+        assert_eq!(
+            committed_recovery.progress_as_follower().unwrap(),
+            committed_status.live
+        );
+
+        r.mark_applied(14);
+
+        let applied_status = r.status_snapshot();
+        assert!(applied_status.is_restart_equivalent());
+        assert_eq!(applied_status.live.term, 10);
+        assert_eq!(applied_status.live.commit_index, 14);
+        assert_eq!(applied_status.live.applied_index, 14);
+        assert_eq!(applied_status.live.next_index, 15);
+        assert_eq!(applied_status.live.uncommitted_entry_count, 0);
+        assert_eq!(applied_status.live.snapshot.snapshot_id, 71);
+        assert_eq!(applied_status.durable, applied_status.live);
+        assert_eq!(applied_status.recovery_gap.next_index_gap, 0);
+        assert_eq!(applied_status.recovery_gap.uncommitted_entry_gap, 0);
+
+        let applied_recovery = r.recovery_state();
+        assert_eq!(applied_recovery.term, 10);
+        assert_eq!(applied_recovery.snapshot.snapshot_id, 71);
+        let resumed_after_apply =
+            RaftReplicator::resume_as_follower(3, applied_recovery.clone()).unwrap();
+        assert_eq!(
+            resumed_after_apply.status_snapshot().live,
+            applied_status.live
+        );
+        assert_eq!(
+            applied_recovery.progress_as_follower().unwrap(),
+            applied_status.live
+        );
+        assert_eq!(r.snapshot_meta().snapshot_id, 71);
+    }
+
+    #[test]
     fn repair_phase_second_refresh_advanced_replacement_refresh_post_rejection_repair_rejection_repair_refresh_rejection_repair_keeps_stale_installs_inert_through_commit_and_apply(
     ) {
         let mut r = RaftReplicator::new(3);
