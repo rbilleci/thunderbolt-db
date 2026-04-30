@@ -2288,6 +2288,62 @@ mod tests {
     }
 
     #[test]
+    fn replication_status_snapshot_validation_rejects_recovery_gap_mismatch() {
+        let live = ReplicationProgress {
+            role: Role::Follower,
+            term: 4,
+            commit_index: 5,
+            applied_index: 5,
+            next_index: 7,
+            snapshot: SnapshotMeta {
+                last_included_index: 5,
+                last_included_term: 4,
+                snapshot_id: 10,
+            },
+            committed_but_unapplied_count: 0,
+            has_committed_entries_pending_apply: false,
+            uncommitted_entry_count: 1,
+            has_uncommitted_entries: true,
+        };
+        let durable = ReplicationProgress {
+            next_index: 6,
+            uncommitted_entry_count: 0,
+            has_uncommitted_entries: false,
+            ..live.clone()
+        };
+
+        let err = ReplicationStatusSnapshot::new(
+            live,
+            durable,
+            RecoveryProgressGap {
+                commit_index_gap: 0,
+                applied_index_gap: 0,
+                next_index_gap: 0,
+                uncommitted_entry_gap: 0,
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            ReplicationStatusInvariantError::RecoveryGapMismatch {
+                expected: RecoveryProgressGap {
+                    commit_index_gap: 0,
+                    applied_index_gap: 0,
+                    next_index_gap: 1,
+                    uncommitted_entry_gap: 1,
+                },
+                actual: RecoveryProgressGap {
+                    commit_index_gap: 0,
+                    applied_index_gap: 0,
+                    next_index_gap: 0,
+                    uncommitted_entry_gap: 0,
+                },
+            }
+        );
+    }
+
+    #[test]
     fn raft_recovery_progress_projects_durable_follower_state_from_live_leader() {
         let mut leader = RaftReplicator::new(3);
         leader.become_leader(4);
