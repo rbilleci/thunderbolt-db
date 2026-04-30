@@ -9,7 +9,7 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
 - WAL durability + queue watermarks (flushed, buffered, unflushed, pending depth/capacity, pending age/deadline), commit/apply/visibility lag gauges, explicit backlog/gap blocker flags, active transaction depth, and failover/admission readiness flags (`quiescent_for_failover`, `follower_promotion_ready`, `mutation_admission_saturated`)
 - Engine truth surface via `Engine::status_snapshot()` for served snapshot identity/frontier, active fallback reasons + parity rollups, and replication/readiness health
 - Engine telemetry snapshot + sink publication API for replication lag, durable WAL/snapshot frontier, write-path readiness/backlog state, and runtime metrics
-- Thin MVCC execution slice via `Engine::execute_mvcc_query()` covering snapshot-bound full scan / key lookup, optional key-prefix or value-equality filtering, and key/value projection through the execution layer with explicit CPU fallback parity tracking (`GPU-123`)
+- Thin MVCC execution slice via `Engine::execute_mvcc_query()` covering snapshot-bound full scan / key lookup / key-batch fan-in / value→key reference expansion, optional key-prefix/range or value-equality filtering, ordering, limit, and key/value projection through the execution layer with explicit CPU fallback parity tracking (`GPU-123`)
 - CPU-first reference engine skeleton
 - Device-aware execution abstractions
 
@@ -20,10 +20,12 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
   - `MvccReadSource::FullScan`
   - `MvccReadSource::KeyLookup { key }`
   - `MvccReadSource::KeyBatchLookup { keys }` (fan-in multi-source lookup; preserves request order before downstream filter/order/limit)
+  - `MvccReadSource::FollowValueKeyRefs { keys }` (join-adjacent foreign-key-style expansion from seed row values to referenced keys)
 - Supported snapshot rule:
   - `visibility.read_txn_id` selects the MVCC snapshot frontier
 - Supported filters:
   - `MvccReadFilter::KeyPrefix(prefix)`
+  - `MvccReadFilter::KeyRange { start_inclusive, end_exclusive }`
   - `MvccReadFilter::ValueEquals(value)`
   - `MvccReadFilter::All([...])`
   - `MvccReadFilter::Any([...])`
@@ -40,12 +42,12 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
   - `limit: Some(n)` applies after visibility + filter + ordering stages
 - Current device strategy:
   - planned target: GPU default device
-  - executed target: CPU reference semantics via `ScanOperator` → `FilterOperator` → `ProjectOperator`
+  - executed target: CPU reference semantics via `ScanOperator` → `FilterOperator` → `SortOperator` → `LimitOperator` → `ProjectOperator`
   - fallback reason: `FallbackReason::GpuMvccReadParityGap` (`GPU-123`)
 - Deterministic workload fixture:
   - `tests/fixtures/mvcc-read-workload.txt`
 - Next obvious extension boundary:
-  - move from key fan-in to join-adjacent relational shapes while preserving the same engine-facing contract and explicit fallback accounting on the eventual GPU-backed path.
+  - widen the new join-adjacent slice toward source-preserving joins or prefix-driven foreign-key expansion while preserving the same engine-facing contract and explicit fallback accounting on the eventual GPU-backed path.
 
 ## Quickstart
 

@@ -3,6 +3,9 @@
 ## 2026-04-30
 
 ### Completed
+- Extended the engine-facing MVCC bootstrap slice with `FollowValueKeyRefs { keys }`, a narrow join-adjacent value→key expansion shape that turns visible seed row values into second-stage MVCC key lookups while preserving request order, skipping missing seed/target rows cleanly, and reusing the existing filter/order/limit/projection execution pipeline.
+- Added end-to-end engine regression coverage proving the join-adjacent source composes through the same pipeline and preserves deterministic behavior under duplicates, filtering, ordering, and limit.
+- Reconciled README/execution/roadmap docs so the Q2 truth surface now includes its first join-adjacent relational slice and the next boundary narrows to wider source-preserving join shapes.
 - Extended the engine-facing MVCC bootstrap slice with key-batch fan-in lookups (`KeyBatchLookup { keys }`) so the same engine-facing read path now supports a first explicit multi-source shape while preserving the GPU-first fallback contract (`planned_target = GPU`, `executed_target = CPU`, `GpuMvccReadParityGap`).
 - Added end-to-end engine regression coverage proving key-batch lookup preserves request order when no explicit sort is present, skips missing keys cleanly, and still composes through the existing filter/order/limit execution pipeline.
 - Reconciled README/execution/roadmap docs so the MVCC slice truth now includes the first multi-source bootstrap shape and the next extension boundary narrows to join-adjacent relational work.

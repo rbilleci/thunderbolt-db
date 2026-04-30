@@ -80,6 +80,7 @@ pub enum MvccReadSource {
     FullScan,
     KeyLookup { key: String },
     KeyBatchLookup { keys: Vec<String> },
+    FollowValueKeyRefs { keys: Vec<String> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,6 +213,47 @@ where
     }
     operator.close();
     rows
+}
+
+fn resolve_mvcc_source(
+    store: &InMemoryTupleStore,
+    source: &MvccReadSource,
+    visibility: StorageVisibility,
+) -> Result<Vec<TupleVersion>, StorageError> {
+    match source {
+        MvccReadSource::FullScan => {
+            let mut cursor = store.seq_scan_open(visibility)?;
+            let mut rows = Vec::new();
+            while let Some(tuple) = cursor.next() {
+                rows.push(tuple);
+            }
+            Ok(rows)
+        }
+        MvccReadSource::KeyLookup { key } => Ok(store
+            .tuple_fetch_by_key(key, visibility)?
+            .into_iter()
+            .collect()),
+        MvccReadSource::KeyBatchLookup { keys } => {
+            let mut rows = Vec::new();
+            for key in keys {
+                if let Some(tuple) = store.tuple_fetch_by_key(key, visibility)? {
+                    rows.push(tuple);
+                }
+            }
+            Ok(rows)
+        }
+        MvccReadSource::FollowValueKeyRefs { keys } => {
+            let mut rows = Vec::new();
+            for key in keys {
+                if let Some(seed) = store.tuple_fetch_by_key(key, visibility)? {
+                    if let Some(target) = store.tuple_fetch_by_key(&seed.value, visibility)? {
+                        rows.push(target);
+                    }
+                }
+            }
+            Ok(rows)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -952,32 +994,7 @@ impl Engine {
         self.metrics
             .inc_fallback(FallbackReason::GpuMvccReadParityGap);
 
-        let rows = match &query.source {
-            MvccReadSource::FullScan => {
-                let mut cursor = self.mvcc_store.seq_scan_open(query.visibility)?;
-                let mut rows = Vec::new();
-                while let Some(tuple) = cursor.next() {
-                    rows.push(tuple);
-                }
-                rows
-            }
-            MvccReadSource::KeyLookup { key } => self
-                .mvcc_store
-                .tuple_fetch_by_key(key, query.visibility)?
-                .into_iter()
-                .collect(),
-            MvccReadSource::KeyBatchLookup { keys } => {
-                let mut rows = Vec::new();
-                for key in keys {
-                    if let Some(tuple) =
-                        self.mvcc_store.tuple_fetch_by_key(key, query.visibility)?
-                    {
-                        rows.push(tuple);
-                    }
-                }
-                rows
-            }
-        };
+        let rows = resolve_mvcc_source(&self.mvcc_store, &query.source, query.visibility)?;
 
         let projection = query.projection;
         let encoded_rows = match (query.filter.clone(), query.order, query.limit) {
@@ -3421,6 +3438,84 @@ mod tests {
                 MvccReadRow {
                     key: Some("user:1".to_string()),
                     value: Some("active".to_string()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn execute_mvcc_query_supports_follow_value_key_refs_join_adjacent_source() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=profile:2").unwrap();
+        e.execute_text(2, "SET acct:2=profile:1").unwrap();
+        e.execute_text(3, "SET profile:1=active").unwrap();
+        e.execute_text(4, "SET profile:2=suspended").unwrap();
+        e.execute_text(5, "SET acct:3=missing").unwrap();
+        e.execute_text(6, "SET acct:1=profile:3").unwrap();
+        e.execute_text(7, "SET profile:3=closed").unwrap();
+
+        let request_order = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FollowValueKeyRefs {
+                    keys: vec![
+                        "acct:2".to_string(),
+                        "acct:1".to_string(),
+                        "missing".to_string(),
+                        "acct:3".to_string(),
+                    ],
+                },
+                visibility: StorageVisibility { read_txn_id: 7 },
+                filter: None,
+                order: None,
+                projection: MvccProjection::KeyValue,
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            request_order.rows,
+            vec![
+                MvccReadRow {
+                    key: Some("profile:1".to_string()),
+                    value: Some("active".to_string()),
+                },
+                MvccReadRow {
+                    key: Some("profile:3".to_string()),
+                    value: Some("closed".to_string()),
+                },
+            ]
+        );
+
+        let filtered_and_sorted = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FollowValueKeyRefs {
+                    keys: vec![
+                        "acct:1".to_string(),
+                        "acct:2".to_string(),
+                        "acct:1".to_string(),
+                    ],
+                },
+                visibility: StorageVisibility { read_txn_id: 7 },
+                filter: Some(MvccReadFilter::Any(vec![
+                    MvccReadFilter::ValueEquals("closed".to_string()),
+                    MvccReadFilter::ValueEquals("active".to_string()),
+                ])),
+                order: Some(MvccReadOrder::ValueAsc),
+                projection: MvccProjection::KeyOnly,
+                limit: Some(2),
+            })
+            .unwrap();
+
+        assert_eq!(
+            filtered_and_sorted.rows,
+            vec![
+                MvccReadRow {
+                    key: Some("profile:1".to_string()),
+                    value: None,
+                },
+                MvccReadRow {
+                    key: Some("profile:3".to_string()),
+                    value: None,
                 },
             ]
         );
