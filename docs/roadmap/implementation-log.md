@@ -3,6 +3,9 @@
 ## 2026-04-30
 
 ### Completed
+- Extended the engine-facing MVCC bootstrap slice with value-aware ordering (`ValueAsc` / `ValueDesc`) while preserving the explicit GPU-first fallback contract (`planned_target = GPU`, `executed_target = CPU`, `GpuMvccReadParityGap`).
+- Added end-to-end engine regression coverage proving value ordering runs through the existing MVCC execution pipeline before `limit`, and that equal values break ties deterministically by key so future CPU↔GPU parity stays stable.
+- Reconciled README/execution/roadmap docs so the current MVCC truth surface now includes key/value ordering and the next extension boundary moves forward to join-adjacent or other multi-source shapes.
 - Ran the Q3 closeout review exactly as the roadmap now requires and found no remaining named semantic category lacking explicit proof.
 - Re-ran the full replication validation gate successfully: `cargo fmt --all`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --all --all-features`.
 - Marked Q3 complete in `docs/roadmap/no-nvidia-bootstrap-plan.md`, checked the closeout checklist, and recorded the closeout review result so future autonomous loops stop extending replication permutations by default.

@@ -97,6 +97,8 @@ pub enum MvccReadFilter {
 pub enum MvccReadOrder {
     KeyAsc,
     KeyDesc,
+    ValueAsc,
+    ValueDesc,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,6 +189,14 @@ fn mvcc_row_cmp(
     match order {
         MvccReadOrder::KeyAsc => left.key.cmp(&right.key),
         MvccReadOrder::KeyDesc => right.key.cmp(&left.key),
+        MvccReadOrder::ValueAsc => left
+            .value
+            .cmp(&right.value)
+            .then_with(|| left.key.cmp(&right.key)),
+        MvccReadOrder::ValueDesc => right
+            .value
+            .cmp(&left.value)
+            .then_with(|| left.key.cmp(&right.key)),
     }
 }
 
@@ -3479,6 +3489,69 @@ mod tests {
             vec![
                 MvccReadRow {
                     key: Some("acct:3".to_string()),
+                    value: None,
+                },
+                MvccReadRow {
+                    key: Some("acct:2".to_string()),
+                    value: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn execute_mvcc_query_supports_value_ordering_before_limit() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:2=locked").unwrap();
+        e.execute_text(2, "SET acct:1=open").unwrap();
+        e.execute_text(3, "SET acct:4=closed").unwrap();
+        e.execute_text(4, "SET acct:3=closed").unwrap();
+
+        let ascending = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FullScan,
+                visibility: StorageVisibility { read_txn_id: 4 },
+                filter: Some(MvccReadFilter::KeyPrefix("acct:".to_string())),
+                order: Some(MvccReadOrder::ValueAsc),
+                projection: MvccProjection::KeyValue,
+                limit: Some(3),
+            })
+            .unwrap();
+
+        assert_eq!(
+            ascending.rows,
+            vec![
+                MvccReadRow {
+                    key: Some("acct:3".to_string()),
+                    value: Some("closed".to_string()),
+                },
+                MvccReadRow {
+                    key: Some("acct:4".to_string()),
+                    value: Some("closed".to_string()),
+                },
+                MvccReadRow {
+                    key: Some("acct:2".to_string()),
+                    value: Some("locked".to_string()),
+                },
+            ]
+        );
+
+        let descending = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FullScan,
+                visibility: StorageVisibility { read_txn_id: 4 },
+                filter: Some(MvccReadFilter::KeyPrefix("acct:".to_string())),
+                order: Some(MvccReadOrder::ValueDesc),
+                projection: MvccProjection::KeyOnly,
+                limit: Some(2),
+            })
+            .unwrap();
+
+        assert_eq!(
+            descending.rows,
+            vec![
+                MvccReadRow {
+                    key: Some("acct:1".to_string()),
                     value: None,
                 },
                 MvccReadRow {

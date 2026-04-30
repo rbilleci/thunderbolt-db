@@ -32,6 +32,8 @@ Each physical plan node must include:
 - Order layer:
   - `KeyAsc`
   - `KeyDesc`
+  - `ValueAsc`
+  - `ValueDesc`
 - Projection layer:
   - `KeyValue`
   - `KeyOnly`
@@ -46,6 +48,6 @@ Each physical plan node must include:
 
 ## Current extension boundary
 
-- Supported ordering is currently key-only (`KeyAsc` / `KeyDesc`).
+- Supported ordering now covers key-aware and value-aware shapes (`KeyAsc` / `KeyDesc` / `ValueAsc` / `ValueDesc`), with value ordering using key order as the deterministic tie-breaker.
 - Supported range semantics are lexicographic `KeyRange { start_inclusive, end_exclusive }` filters.
-- Next obvious Q2 extension is richer value-aware ordering or join-adjacent shapes without weakening the explicit GPU fallback contract.
+- Next obvious Q2 extension is join-adjacent or other multi-source shapes without weakening the explicit GPU fallback contract.
