@@ -21,6 +21,7 @@ Each physical plan node must include:
 - Supported sources:
   - `FullScan`
   - `KeyLookup { key }`
+  - `KeyBatchLookup { keys }` (fan-in multi-source lookup; preserves request order before downstream filter/order/limit)
 - Snapshot binding:
   - `MvccReadQuery.visibility.read_txn_id` chooses the MVCC snapshot used by storage visibility checks
 - Filter layer:
@@ -50,4 +51,5 @@ Each physical plan node must include:
 
 - Supported ordering now covers key-aware and value-aware shapes (`KeyAsc` / `KeyDesc` / `ValueAsc` / `ValueDesc`), with value ordering using key order as the deterministic tie-breaker.
 - Supported range semantics are lexicographic `KeyRange { start_inclusive, end_exclusive }` filters.
-- Next obvious Q2 extension is join-adjacent or other multi-source shapes without weakening the explicit GPU fallback contract.
+- `KeyBatchLookup { keys }` is the first multi-source bootstrap shape; it fans multiple point lookups into the same execution pipeline while preserving request order until an explicit order clause overrides it.
+- Next obvious Q2 extension is join-adjacent relational shapes without weakening the explicit GPU fallback contract.

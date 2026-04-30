@@ -3,6 +3,9 @@
 ## 2026-04-30
 
 ### Completed
+- Extended the engine-facing MVCC bootstrap slice with key-batch fan-in lookups (`KeyBatchLookup { keys }`) so the same engine-facing read path now supports a first explicit multi-source shape while preserving the GPU-first fallback contract (`planned_target = GPU`, `executed_target = CPU`, `GpuMvccReadParityGap`).
+- Added end-to-end engine regression coverage proving key-batch lookup preserves request order when no explicit sort is present, skips missing keys cleanly, and still composes through the existing filter/order/limit execution pipeline.
+- Reconciled README/execution/roadmap docs so the MVCC slice truth now includes the first multi-source bootstrap shape and the next extension boundary narrows to join-adjacent relational work.
 - Extended the engine-facing MVCC bootstrap slice with value-aware ordering (`ValueAsc` / `ValueDesc`) while preserving the explicit GPU-first fallback contract (`planned_target = GPU`, `executed_target = CPU`, `GpuMvccReadParityGap`).
 - Added end-to-end engine regression coverage proving value ordering runs through the existing MVCC execution pipeline before `limit`, and that equal values break ties deterministically by key so future CPU↔GPU parity stays stable.
 - Reconciled README/execution/roadmap docs so the current MVCC truth surface now includes key/value ordering and the next extension boundary moves forward to join-adjacent or other multi-source shapes.

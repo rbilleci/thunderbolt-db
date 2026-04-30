@@ -79,6 +79,7 @@ struct PendingMutation {
 pub enum MvccReadSource {
     FullScan,
     KeyLookup { key: String },
+    KeyBatchLookup { keys: Vec<String> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -965,6 +966,17 @@ impl Engine {
                 .tuple_fetch_by_key(key, query.visibility)?
                 .into_iter()
                 .collect(),
+            MvccReadSource::KeyBatchLookup { keys } => {
+                let mut rows = Vec::new();
+                for key in keys {
+                    if let Some(tuple) =
+                        self.mvcc_store.tuple_fetch_by_key(key, query.visibility)?
+                    {
+                        rows.push(tuple);
+                    }
+                }
+                rows
+            }
         };
 
         let projection = query.projection;
@@ -3332,6 +3344,85 @@ mod tests {
                 key: Some("user:1".to_string()),
                 value: None,
             }]
+        );
+    }
+
+    #[test]
+    fn execute_mvcc_query_supports_multi_key_lookup_fan_in_source() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=open").unwrap();
+        e.execute_text(2, "SET acct:2=locked").unwrap();
+        e.execute_text(3, "SET user:1=active").unwrap();
+        e.execute_text(4, "SET acct:1=closed").unwrap();
+
+        let request_order = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::KeyBatchLookup {
+                    keys: vec![
+                        "user:1".to_string(),
+                        "acct:1".to_string(),
+                        "missing".to_string(),
+                        "acct:2".to_string(),
+                    ],
+                },
+                visibility: StorageVisibility { read_txn_id: 4 },
+                filter: None,
+                order: None,
+                projection: MvccProjection::KeyOnly,
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            request_order.rows,
+            vec![
+                MvccReadRow {
+                    key: Some("user:1".to_string()),
+                    value: None,
+                },
+                MvccReadRow {
+                    key: Some("acct:1".to_string()),
+                    value: None,
+                },
+                MvccReadRow {
+                    key: Some("acct:2".to_string()),
+                    value: None,
+                },
+            ]
+        );
+
+        let filtered_and_sorted = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::KeyBatchLookup {
+                    keys: vec![
+                        "acct:2".to_string(),
+                        "acct:1".to_string(),
+                        "user:1".to_string(),
+                    ],
+                },
+                visibility: StorageVisibility { read_txn_id: 4 },
+                filter: Some(MvccReadFilter::Any(vec![
+                    MvccReadFilter::ValueEquals("closed".to_string()),
+                    MvccReadFilter::ValueEquals("active".to_string()),
+                ])),
+                order: Some(MvccReadOrder::ValueDesc),
+                projection: MvccProjection::KeyValue,
+                limit: Some(2),
+            })
+            .unwrap();
+
+        assert_eq!(
+            filtered_and_sorted.rows,
+            vec![
+                MvccReadRow {
+                    key: Some("acct:1".to_string()),
+                    value: Some("closed".to_string()),
+                },
+                MvccReadRow {
+                    key: Some("user:1".to_string()),
+                    value: Some("active".to_string()),
+                },
+            ]
         );
     }
 

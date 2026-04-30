@@ -19,6 +19,7 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
 - Supported sources:
   - `MvccReadSource::FullScan`
   - `MvccReadSource::KeyLookup { key }`
+  - `MvccReadSource::KeyBatchLookup { keys }` (fan-in multi-source lookup; preserves request order before downstream filter/order/limit)
 - Supported snapshot rule:
   - `visibility.read_txn_id` selects the MVCC snapshot frontier
 - Supported filters:
@@ -44,7 +45,7 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
 - Deterministic workload fixture:
   - `tests/fixtures/mvcc-read-workload.txt`
 - Next obvious extension boundary:
-  - move to join-adjacent or multi-source shapes while preserving the same engine-facing contract and explicit fallback accounting on the eventual GPU-backed path.
+  - move from key fan-in to join-adjacent relational shapes while preserving the same engine-facing contract and explicit fallback accounting on the eventual GPU-backed path.
 
 ## Quickstart
 
