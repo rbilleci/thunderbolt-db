@@ -116,7 +116,9 @@ Current operator/developer question mapping:
 - apply is deterministic for the same entry stream
 - WAL-before-visibility holds (`visible_index` never advances beyond durable commit state)
 
-## Current replication semantics (Q3 bootstrap truth)
+## Current replication semantics (Q3 closeout baseline)
+
+Q3 replication hardening was closed out on 2026-04-30. Treat the semantics below as the locked bootstrap baseline for the no-GPU phase; only reopen this surface if a genuinely new semantic category or contradiction is discovered.
 
 - **Ordering:** follower append batches must be contiguous and anchored to the advertised previous log boundary; stale or out-of-order batches are rejected without mutating committed state.
 - **Rejected-append stability:** stale-term and non-contiguous append rejections preserve the validated `ReplicationProgress` snapshot exactly; failures do not silently perturb commit/apply/next-index progress accounting.

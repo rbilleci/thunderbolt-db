@@ -167,7 +167,7 @@ Notes:
 
 ### Q3. Replication semantics hardening under stress
 Priority: highest
-Status: active highest-priority queue item, now in **closeout mode**. Q3 should no longer expand by default into every conceivable branch permutation. The loop should optimize for proving the semantics are complete enough to exit, then declaring Q3 done.
+Status: completed on 2026-04-30 after closeout review + full validation gate. The replication semantics surface is now considered locked for the no-GPU bootstrap phase; only reopen Q3 if a genuinely new semantic category or contradiction is discovered.
 
 Goal:
 - Move from replication introspection to replication behavior that is predictable and trustworthy under skew, lag, replay, and resume conditions.
@@ -225,13 +225,22 @@ Operational stop rule:
 - Do not continue looping just because another permutation could be written.
 
 Q3 closeout checklist:
-- [ ] Core follower semantics locked
-- [ ] Status truth surfaces locked
-- [ ] Advanced snapshot identity semantics locked
-- [ ] Representative combined-stack coverage complete
-- [ ] Documentation closeout complete
-- [ ] Full validation gate green
-- [ ] No remaining named semantic gap
+- [x] Core follower semantics locked
+- [x] Status truth surfaces locked
+- [x] Advanced snapshot identity semantics locked
+- [x] Representative combined-stack coverage complete
+- [x] Documentation closeout complete
+- [x] Full validation gate green
+- [x] No remaining named semantic gap
+
+Closeout review recorded on 2026-04-30:
+- satisfied: core follower semantics locked
+- satisfied: status truth surfaces locked
+- satisfied: advanced snapshot identity semantics locked
+- satisfied: representative combined-stack coverage complete
+- satisfied: documentation closeout complete
+- satisfied: validation gate green (`cargo fmt --all`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all --all-features`)
+- satisfied: no remaining named semantic gap
 
 Acceptance criteria:
 1. Define explicit semantics/tests for ordering, apply progression, watermark movement, and recovery/resume behavior.

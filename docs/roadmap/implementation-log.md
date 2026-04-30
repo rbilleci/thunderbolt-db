@@ -1,5 +1,21 @@
 # Implementation Log (Pre-NVIDIA Phase)
 
+## 2026-04-30
+
+### Completed
+- Ran the Q3 closeout review exactly as the roadmap now requires and found no remaining named semantic category lacking explicit proof.
+- Re-ran the full replication validation gate successfully: `cargo fmt --all`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --all --all-features`.
+- Marked Q3 complete in `docs/roadmap/no-nvidia-bootstrap-plan.md`, checked the closeout checklist, and recorded the closeout review result so future autonomous loops stop extending replication permutations by default.
+- Declared the no-GPU bootstrap replication semantics surface locked unless a genuinely new semantic category or contradiction appears.
+
+### Current blockers
+- None in-repo.
+
+### Next loops
+1. Move to Q4 (`psql` compatibility suite) as the next highest open roadmap item now that Q1-Q3 are complete.
+2. Preserve the Q3 semantic envelope as a locked baseline; only reopen it for a real contradiction or a newly discovered semantic category.
+3. Keep the standard validation gate green on each follow-on milestone.
+
 ## 2026-04-29
 
 ### Completed
@@ -169,22 +185,6 @@
 - Added a follow-on Q3 regression proving that once a newer leader has already repaired around a refreshed compatible suffix, a second same-frontier same-term snapshot refresh during that repair phase may update the durable `snapshot_id` everywhere without changing the fresh-tail live-vs-durable gap, and that later commit/apply completion preserves the newer refreshed identity through restart/resume surfaces.
 - Added a follow-on Q3 regression proving that the same repair-phase second refresh still collapses cleanly if an even newer leader later rejects before repair can complete: speculative fresh tail is discarded, restart-equivalent truth returns immediately, and the twice-refreshed durable `snapshot_id` remains stable across `status_snapshot()`, `recovery_state()`, and `resume_as_follower(...)`.
 
-### Current blockers
-- None in-repo.
-
-### Next loops
-1. Put **Q3 in closeout mode** and treat it as the only top-priority queue until it is either completed or blocked by a clearly named missing semantic category.
-2. For each new Q3 loop, choose exactly one of these closeout actions:
-   - close a named semantic hole,
-   - tighten or simplify an invariant,
-   - consolidate duplicate/overlapping coverage,
-   - improve docs so Q3 exit is easier to justify,
-   - run the full validation gate and mark Q3 complete if no semantic category remains open.
-3. Do **not** expand Q2 or other roadmap items while Q3 closeout is active unless Q3 is blocked.
-4. Do **not** add longer combined-stack permutations by default; only add one when it proves a distinct semantic rule not already covered by the existing families.
-5. Keep loops atomic: one Q3 closeout delta + full fmt/clippy/test validation + focused commit.
-6. Before starting any new Q3 loop, explicitly ask: "What named semantic gap remains?" If there is no clear answer, do a closeout review instead of more implementation.
-7. End the Q3 loop permanently once the closeout checklist is fully satisfied and validation stays green; do not keep the loop alive for optional extra permutations.
 
 ## 2026-04-24
 
