@@ -167,10 +167,71 @@ Notes:
 
 ### Q3. Replication semantics hardening under stress
 Priority: highest
-Status: active highest-priority queue item. Current focus: richer resume/catch-up/snapshot-install stress paths now that `status_snapshot()` publishes live progress, durable progress, and recovery-gap alignment directly; keep tightening rejected/accepted follower transitions, including newer-leader rejection paths that must discard prior-epoch speculative tail and accepted newer-leader catch-up paths that must replace that tail cleanly in the live-vs-durable delta and then retire it back to restart-equivalent state as heartbeat/apply progression completes, plus durable term/alignment and durable-never-ahead status invariants, and stale/snapshot-frontier validation so snapshot identity cannot drift away from the served frontier and impossible higher-frontier/lower-term installs are ignored, including a hard same-frontier snapshot-id alignment invariant, exact accepted advanced-frontier snapshot identity (even if ids are non-monotonic), immediate discard of any incompatible speculative suffix when that advanced frontier lands, and later role/term or restart/resume handoffs that must preserve that exact advanced-frontier identity while only compatible/fresh speculative tail changes. Current locked stress truth now also covers the compatible-suffix case explicitly: restart/export surfaces must keep publishing the exact advanced-frontier snapshot identity while excluding the speculative suffix, a role/term handoff that discards that compatible tail must still preserve the same advanced-frontier durable identity across status/recovery/restart surfaces, a later same-frontier same-term refresh may only swap the durable `snapshot_id` without changing the speculative-gap shape, stale snapshot installs must remain pure no-ops even after that refreshed compatible-suffix stack exists, a later newer-leader rejection must collapse that refreshed path back to restart-equivalent truth, later newer-leader repair may only reintroduce fresh-tail delta around that durable identity, even a second same-frontier same-term refresh during that repair phase may only update durable identity without changing the fresh-tail gap shape or the later rejection-collapse semantics, an even newer advanced-frontier snapshot that lands during that repair phase may replace the durable identity only at the repaired boundary while preserving any still-compatible fresh suffix as the sole live-vs-durable gap, a later same-frontier same-term refresh on top of that repair-phase advanced snapshot stack may again swap only the durable identity while leaving the fresh-tail gap shape and later commit/apply retirement semantics unchanged, a later role/term handoff from that repair-phase advanced snapshot stack must still discard only the speculative fresh suffix while preserving the advanced durable identity across status/recovery/restart surfaces, the same guarantee must still hold if that stack was same-frontier refreshed before the role/term handoff, that same refreshed advanced-stack must also collapse cleanly if an even newer leader later rejects before repair completes, and even a second same-frontier same-term refresh on that advanced repair-phase stack must preserve that same rejection-collapse truth while keeping the newest durable identity pinned; that same second-refresh stack must still allow a later even-newer advanced-frontier replacement at the repaired boundary while preserving only compatible fresh suffix as live gap, and a later role/term handoff from that replaced stack must still discard only that fresh tail while preserving the newest advanced durable identity; a same-frontier same-term refresh on top of that replaced stack must likewise swap only durable identity without changing the fresh-gap shape or later retirement semantics, a later role/term handoff from that refreshed replaced stack must still discard only speculative fresh tail while preserving the newest refreshed advanced identity, that same refreshed replaced stack must also retire normally through heartbeat commit and final apply completion without changing that newest refreshed advanced identity, a later newer-leader rejection on that refreshed replaced stack must still collapse cleanly back to restart-equivalent truth on that newest refreshed advanced identity, a later compatible newer-leader repair after that rejection may reintroduce only fresh-epoch tail around that same refreshed durable identity before later commit/apply retirement, a same-frontier same-term refresh during that later post-rejection repair phase may again swap only the durable identity without changing the fresh-gap shape or later retirement semantics, an even newer-leader rejection after that later post-rejection repair refresh must still discard only the speculative fresh epoch tail and collapse cleanly back to restart-equivalent truth on the newest refreshed durable identity, and even a later compatible repair after that second rejection may still reintroduce only fresh-epoch tail around that same newest refreshed durable identity before later commit/apply retirement, with the later heartbeat/apply path itself now locked explicitly too, a role/term handoff on that same later-repair branch now required to discard only the speculative fresh tail while preserving that newest refreshed durable identity, and later stale snapshot installs on that same later-repair branch now required to remain inert during repair, after heartbeat commit, and after final apply completion; that later re-repair path may also receive its own same-frontier same-term refresh while keeping the fresh-gap shape and later retirement semantics pinned to the newly refreshed durable identity, a role/term handoff after that re-repair refresh must still discard only the speculative fresh epoch tail while preserving that newly refreshed durable identity across status/recovery/restart surfaces, and even an even-newer leader rejection after that re-repair refresh must still collapse cleanly back to restart-equivalent truth on that newly refreshed durable identity, that later re-repair path must also retire cleanly through heartbeat commit and final apply while preserving the same newest refreshed durable identity, stale snapshot installs on that later re-repair path must remain inert during repair, after heartbeat commit, and after final apply completion, and a role/term handoff from that later re-repair path before that extra refresh must still discard only that fresh epoch tail while preserving the same newest refreshed durable identity across status/recovery/restart surfaces, a subsequent role/term handoff from that post-rejection repair path must still discard only that fresh epoch tail while preserving the same refreshed durable identity across status/recovery/restart surfaces, and even later stale snapshot installs on that same post-rejection repair path must remain inert during repair, after heartbeat commit, and after final apply completion; later stale snapshot installs on that refreshed replaced stack must remain inert through repair/heartbeat-commit/final-apply as well; a still-later newer-leader rejection on that replaced stack must also collapse cleanly back to restart-equivalent truth on the newest advanced durable identity, stale snapshot installs must remain inert on that replaced stack as well through repair/heartbeat-commit/final-apply; the same newest durable identity must also remain pinned if that second-refresh stack retires normally through heartbeat commit and final apply completion, and even a role/term handoff after that second repair-phase refresh must still discard only the speculative tail while preserving the newest refreshed durable identity across status/recovery/restart surfaces, and if that refreshed re-repair path later suffers another newer-leader rejection plus compatible repair, a role/term handoff before heartbeat/apply retirement must still discard only the speculative fresh tail while preserving that same newest refreshed durable identity, heartbeat commit and final apply must still retire only the fresh epoch tail while preserving that same newest refreshed durable identity, stale snapshot installs on that branch must remain inert during repair, after heartbeat commit, and after final apply completion too, and even a same-frontier same-term refresh on that final repaired branch may only swap the durable `snapshot_id` while the fresh-gap shape, recovery projection, and later heartbeat/apply retirement all remain pinned to the newly refreshed durable identity; if that same final repaired branch then changes role/term before heartbeat/apply retirement, the handoff must still discard only the speculative fresh tail while preserving that newly refreshed durable identity across status/recovery/restart surfaces, and if an even newer leader rejects before heartbeat/apply retirement on that same refreshed final repaired branch, the node must still discard only the speculative fresh tail and collapse immediately back to restart-equivalent truth on that newly refreshed durable identity, while later stale snapshot installs on that same refreshed final repaired branch must remain inert during repair, after heartbeat commit, and after final apply completion, and a still-later compatible repair after that collapse may reintroduce only fresh-epoch tail around that same refreshed durable identity before later heartbeat/apply retirement, with any role/term handoff on that post-collapse repair path still required to discard only the fresh speculative tail while preserving the same refreshed durable identity, with the later heartbeat/apply path itself still required to retire only that fresh tail while preserving the same refreshed durable identity, with stale snapshot installs on that same post-collapse repair path still required to remain inert during repair, after heartbeat commit, and after final apply completion, and even a same-frontier same-term refresh on that post-collapse repair path may only swap the durable `snapshot_id` while the fresh-gap shape, recovery projection, and later heartbeat/apply retirement remain pinned to the newly refreshed durable identity, with any role/term handoff after that refresh still required to discard only the fresh speculative tail while preserving that same newly refreshed durable identity, with the later heartbeat/apply path after that refresh still required to retire only the fresh tail while preserving that same newly refreshed durable identity, and with stale snapshot installs after that refresh still required to remain inert during repair, after heartbeat commit, and after final apply completion.
+Status: active highest-priority queue item, now in **closeout mode**. Q3 should no longer expand by default into every conceivable branch permutation. The loop should optimize for proving the semantics are complete enough to exit, then declaring Q3 done.
 
 Goal:
 - Move from replication introspection to replication behavior that is predictable and trustworthy under skew, lag, replay, and resume conditions.
+
+Closeout focus:
+1. Prefer **gap-closing** work over frontier-expanding work.
+2. Only add a new regression if it closes a clearly named semantic hole, resolves a contradiction, or is required to satisfy exit criteria.
+3. Stop generating deeper combined-stack permutations unless a concrete unproven guarantee still depends on them.
+4. Favor consolidation work now: tighten invariants, collapse duplicate coverage, document the semantic envelope, and prove the status/recovery surfaces match runtime truth.
+5. If a candidate loop does not materially increase confidence that Q3 can be marked complete, do not do it.
+
+Exit criteria for Q3:
+1. **Core follower semantics locked**
+   - ordering, rejection stability, commit/apply progression, resume/restart projection, and snapshot-install behavior are all covered by explicit tests.
+2. **Status truth surfaces locked**
+   - `status_snapshot()`, `recovery_state()`, `recovery_progress_gap()`, and `resume_as_follower(...)` are mutually consistent and reject impossible live-vs-durable states.
+3. **Advanced snapshot identity semantics locked**
+   - accepted advanced-frontier snapshots preserve exact durable identity,
+   - same-frontier refreshes only change durable identity,
+   - stale or incoherent installs remain no-ops,
+   - newer-leader rejection/repair paths preserve or retire speculative tail correctly.
+4. **Representative combined-stack coverage complete**
+   - at least one explicit regression exists for each meaningful combined-stack family:
+     - refresh -> rejection
+     - refresh -> repair
+     - repair-phase advanced replacement
+     - post-rejection re-repair
+     - role/term handoff before retirement
+     - stale-install inertness during repair/commit/apply
+   - additional permutations are out of scope unless they expose a distinct semantic rule.
+5. **Documentation closeout complete**
+   - the replication interface docs state the guarantees and non-guarantees clearly enough that a new contributor can tell what is intentionally supported.
+6. **Validation gate green**
+   - full `cargo fmt --all`
+   - full `cargo clippy --all-targets --all-features -- -D warnings`
+   - full `cargo test --all --all-features`
+
+Definition of done:
+- Q3 is complete when the team can name no remaining *semantic category* that lacks explicit proof. Missing permutations alone are not enough to keep Q3 open.
+
+Clear exit strategy:
+1. At the start of each loop, name the specific remaining semantic category being addressed.
+2. If no such category can be named, do not invent a longer scenario; instead run the validation gate and perform a closeout review.
+3. During closeout review, check the Q3 exit criteria one by one and record either:
+   - satisfied,
+   - blocked by a real gap, or
+   - not yet proven by an explicit regression/doc invariant.
+4. If every exit criterion is satisfied and the full validation gate passes, mark Q3 complete immediately and stop the Q3 loop.
+5. If any item fails, the next loop must target that exact failed item and nothing broader.
+
+Operational stop rule:
+- Stop the Q3 loop when both conditions are true:
+  1. there is no unproven semantic category left to name, and
+  2. fmt + clippy + full tests are green.
+- Do not continue looping just because another permutation could be written.
+
+Q3 closeout checklist:
+- [ ] Core follower semantics locked
+- [ ] Status truth surfaces locked
+- [ ] Advanced snapshot identity semantics locked
+- [ ] Representative combined-stack coverage complete
+- [ ] Documentation closeout complete
+- [ ] Full validation gate green
+- [ ] No remaining named semantic gap
 
 Acceptance criteria:
 1. Define explicit semantics/tests for ordering, apply progression, watermark movement, and recovery/resume behavior.
@@ -181,9 +242,11 @@ Acceptance criteria:
 3. Ensure the exposed replication metrics/status surfaces remain consistent with actual state transitions in the hardening tests.
 4. Document what guarantees the current engine does and does not make about replication correctness/readiness.
 5. Reconcile any helper APIs that are too weak/ambiguous for these guarantees.
+6. Mark Q3 complete once the exit criteria above are satisfied; do not leave it open for unbounded permutation growth.
 
 Notes:
 - Observability without semantics is not enough; this queue item is about trust.
+- The burden of proof is now on finding a missing semantic category, not on inventing another longer scenario chain.
 
 ### Q4. Golden-wire `psql` compatibility suite
 Priority: high

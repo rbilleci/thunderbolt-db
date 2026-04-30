@@ -173,8 +173,18 @@
 - None in-repo.
 
 ### Next loops
-1. Extend Q2 with richer value-aware ordering or join-adjacent slices without weakening the explicit fallback contract.
-2. Continue Q3 with stale/resume semantics under richer follower catch-up and snapshot-install stress, now that the status surface also rejects older-term or durable-ahead-of-live impossible states, ignores incoherent higher-frontier/lower-term snapshots, keeps accepted advanced-frontier snapshot identity exact even when ids are non-monotonic and later epoch handoffs/restart projections occur, discards incompatible speculative suffix immediately on advanced-frontier snapshot install, discards stale speculative tail on newer-leader rejection paths, preserves gap semantics across same-frontier snapshot identity refresh (including refreshes layered atop compatible advanced-frontier suffix preservation, in-flight newer-leader repair, repair-phase second refresh, and rejection back to restart-equivalent truth), keeps stale snapshot installs inert throughout the later repair/commit/apply phases of that combined stack, and cleanly resets the live-vs-durable delta when a newer leader replaces stale follower tail with fresh catch-up entries that later commit/apply back to restart-equivalent state; the next thin slice is any remaining combined-stack stress path not yet locked by an explicit regression.
+1. Put **Q3 in closeout mode** and treat it as the only top-priority queue until it is either completed or blocked by a clearly named missing semantic category.
+2. For each new Q3 loop, choose exactly one of these closeout actions:
+   - close a named semantic hole,
+   - tighten or simplify an invariant,
+   - consolidate duplicate/overlapping coverage,
+   - improve docs so Q3 exit is easier to justify,
+   - run the full validation gate and mark Q3 complete if no semantic category remains open.
+3. Do **not** expand Q2 or other roadmap items while Q3 closeout is active unless Q3 is blocked.
+4. Do **not** add longer combined-stack permutations by default; only add one when it proves a distinct semantic rule not already covered by the existing families.
+5. Keep loops atomic: one Q3 closeout delta + full fmt/clippy/test validation + focused commit.
+6. Before starting any new Q3 loop, explicitly ask: "What named semantic gap remains?" If there is no clear answer, do a closeout review instead of more implementation.
+7. End the Q3 loop permanently once the closeout checklist is fully satisfied and validation stays green; do not keep the loop alive for optional extra permutations.
 
 ## 2026-04-24
 
