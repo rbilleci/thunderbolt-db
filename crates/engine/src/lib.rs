@@ -94,6 +94,7 @@ pub enum MvccReadSource {
     FollowValueKeyRefValueKeyRefs { keys: Vec<String> },
     FollowValueKeyRefValueKeyPrefixes { keys: Vec<String> },
     FollowValueKeyRefValueKeyRefPrefixes { keys: Vec<String> },
+    FollowValueKeyRefValueKeyRefValueKeyRefs { keys: Vec<String> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -709,6 +710,37 @@ fn resolve_mvcc_source(
                                             source_key: Some(key.clone()),
                                             source_tuple: Some(seed.clone()),
                                             tuple,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(rows)
+        }
+        MvccReadSource::FollowValueKeyRefValueKeyRefValueKeyRefs { keys } => {
+            let mut rows = Vec::new();
+            for key in keys {
+                if let Some(seed) = store.tuple_fetch_by_key(key, visibility)? {
+                    if let Some(intermediate) = store.tuple_fetch_by_key(&seed.value, visibility)? {
+                        if let Some(ref_seed) =
+                            store.tuple_fetch_by_key(&intermediate.value, visibility)?
+                        {
+                            if let Some(final_seed) =
+                                store.tuple_fetch_by_key(&ref_seed.value, visibility)?
+                            {
+                                if let Some(target_seed) =
+                                    store.tuple_fetch_by_key(&final_seed.value, visibility)?
+                                {
+                                    if let Some(target) =
+                                        store.tuple_fetch_by_key(&target_seed.value, visibility)?
+                                    {
+                                        rows.push(ResolvedMvccRow {
+                                            source_key: Some(key.clone()),
+                                            source_tuple: Some(seed.clone()),
+                                            tuple: target,
                                         });
                                     }
                                 }
@@ -4773,6 +4805,106 @@ mod tests {
                 MvccReadRow {
                     source_key: Some("acct:1".to_string()),
                     key: Some("team:alpha:v2:1".to_string()),
+                    value: Some("profile:1".to_string()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn execute_mvcc_query_supports_follow_value_key_ref_value_key_ref_value_key_refs_source() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=profile:1").unwrap();
+        e.execute_text(2, "SET acct:2=profile:2").unwrap();
+        e.execute_text(3, "SET acct:3=missing-profile").unwrap();
+        e.execute_text(4, "SET profile:1=team-root:1").unwrap();
+        e.execute_text(5, "SET profile:2=team-root:2").unwrap();
+        e.execute_text(6, "SET team-root:1=prefix:alpha:").unwrap();
+        e.execute_text(7, "SET team-root:2=prefix:beta:").unwrap();
+        e.execute_text(8, "SET prefix:alpha:=team-lead:1").unwrap();
+        e.execute_text(9, "SET prefix:beta:=team-lead:2").unwrap();
+        e.execute_text(10, "SET team-lead:1=person:1").unwrap();
+        e.execute_text(11, "SET team-lead:2=person:2").unwrap();
+        e.execute_text(12, "SET person:1=Alice").unwrap();
+        e.execute_text(13, "SET person:2=Bob").unwrap();
+        e.execute_text(14, "SET team-root:1=prefix:alpha:v2")
+            .unwrap();
+        e.execute_text(15, "SET prefix:alpha:v2=team-lead:3")
+            .unwrap();
+        e.execute_text(16, "SET team-lead:3=person:3").unwrap();
+        e.execute_text(17, "SET person:3=Astra").unwrap();
+        e.execute_text(18, "SET team-root:3=prefix:ghost:").unwrap();
+
+        let request_order = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FollowValueKeyRefValueKeyRefValueKeyRefs {
+                    keys: vec![
+                        "acct:2".to_string(),
+                        "acct:1".to_string(),
+                        "missing".to_string(),
+                        "acct:3".to_string(),
+                    ],
+                },
+                visibility: StorageVisibility { read_txn_id: 18 },
+                filter: None,
+                order: None,
+                projection: MvccProjection::KeyValue,
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            request_order.rows,
+            vec![
+                MvccReadRow {
+                    source_key: Some("acct:2".to_string()),
+                    key: Some("person:2".to_string()),
+                    value: Some("Bob".to_string()),
+                },
+                MvccReadRow {
+                    source_key: Some("acct:1".to_string()),
+                    key: Some("person:3".to_string()),
+                    value: Some("Astra".to_string()),
+                },
+            ]
+        );
+
+        let filtered_and_sorted = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FollowValueKeyRefValueKeyRefValueKeyRefs {
+                    keys: vec![
+                        "acct:1".to_string(),
+                        "acct:2".to_string(),
+                        "acct:1".to_string(),
+                    ],
+                },
+                visibility: StorageVisibility { read_txn_id: 18 },
+                filter: Some(MvccReadFilter::Any(vec![
+                    MvccReadFilter::ValueEquals("Astra".to_string()),
+                    MvccReadFilter::ValueEquals("Bob".to_string()),
+                ])),
+                order: Some(MvccReadOrder::ValueDesc),
+                projection: MvccProjection::TargetKeySourceValue,
+                limit: Some(3),
+            })
+            .unwrap();
+
+        assert_eq!(
+            filtered_and_sorted.rows,
+            vec![
+                MvccReadRow {
+                    source_key: Some("acct:2".to_string()),
+                    key: Some("person:2".to_string()),
+                    value: Some("profile:2".to_string()),
+                },
+                MvccReadRow {
+                    source_key: Some("acct:1".to_string()),
+                    key: Some("person:3".to_string()),
+                    value: Some("profile:1".to_string()),
+                },
+                MvccReadRow {
+                    source_key: Some("acct:1".to_string()),
+                    key: Some("person:3".to_string()),
                     value: Some("profile:1".to_string()),
                 },
             ]
