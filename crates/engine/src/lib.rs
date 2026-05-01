@@ -118,6 +118,8 @@ pub enum MvccProjection {
     KeyValue,
     KeyOnly,
     ValueOnly,
+    SourceKeyTargetValue,
+    SourceValueOnly,
     TargetKeySourceValue,
 }
 
@@ -174,6 +176,16 @@ fn project_mvcc_row(row: ResolvedMvccRow, projection: MvccProjection) -> MvccRea
             source_key,
             key: None,
             value: Some(tuple.value),
+        },
+        MvccProjection::SourceKeyTargetValue => MvccReadRow {
+            key: source_key.clone(),
+            source_key,
+            value: Some(tuple.value),
+        },
+        MvccProjection::SourceValueOnly => MvccReadRow {
+            source_key,
+            key: None,
+            value: source_tuple.map(|tuple| tuple.value),
         },
         MvccProjection::TargetKeySourceValue => MvccReadRow {
             source_key,
@@ -4323,6 +4335,118 @@ mod tests {
                     value: None,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn execute_mvcc_query_supports_mixed_join_side_projection_controls() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:2=profile:2").unwrap();
+        e.execute_text(2, "SET acct:1=profile:1").unwrap();
+        e.execute_text(3, "SET profile:1=team:alpha").unwrap();
+        e.execute_text(4, "SET profile:2=team:beta").unwrap();
+        e.execute_text(5, "SET team:alpha:1=Alice").unwrap();
+        e.execute_text(6, "SET team:beta:1=Bob").unwrap();
+
+        let source_key_target_value = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FollowValueKeyRefPrefixes {
+                    keys: vec!["acct:2".to_string(), "acct:1".to_string()],
+                },
+                visibility: StorageVisibility { read_txn_id: 6 },
+                filter: None,
+                order: Some(MvccReadOrder::SourceKeyAsc),
+                projection: MvccProjection::SourceKeyTargetValue,
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            source_key_target_value.rows,
+            vec![
+                MvccReadRow {
+                    source_key: Some("acct:1".to_string()),
+                    key: Some("acct:1".to_string()),
+                    value: Some("Alice".to_string()),
+                },
+                MvccReadRow {
+                    source_key: Some("acct:2".to_string()),
+                    key: Some("acct:2".to_string()),
+                    value: Some("Bob".to_string()),
+                },
+            ]
+        );
+
+        let source_value_only = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FollowValueKeyRefPrefixes {
+                    keys: vec!["acct:1".to_string(), "acct:2".to_string()],
+                },
+                visibility: StorageVisibility { read_txn_id: 6 },
+                filter: Some(MvccReadFilter::SourceKeyPrefix("acct:2".to_string())),
+                order: Some(MvccReadOrder::KeyAsc),
+                projection: MvccProjection::SourceValueOnly,
+                limit: Some(1),
+            })
+            .unwrap();
+
+        assert_eq!(
+            source_value_only.rows,
+            vec![MvccReadRow {
+                source_key: Some("acct:2".to_string()),
+                key: None,
+                value: Some("profile:2".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn execute_mvcc_query_mixed_join_projection_keeps_non_join_shapes_stable() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=open").unwrap();
+
+        let source_key_target_value = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::KeyLookup {
+                    key: "acct:1".to_string(),
+                },
+                visibility: StorageVisibility { read_txn_id: 1 },
+                filter: None,
+                order: None,
+                projection: MvccProjection::SourceKeyTargetValue,
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            source_key_target_value.rows,
+            vec![MvccReadRow {
+                source_key: None,
+                key: None,
+                value: Some("open".to_string()),
+            }]
+        );
+
+        let source_value_only = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::KeyLookup {
+                    key: "acct:1".to_string(),
+                },
+                visibility: StorageVisibility { read_txn_id: 1 },
+                filter: None,
+                order: None,
+                projection: MvccProjection::SourceValueOnly,
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            source_value_only.rows,
+            vec![MvccReadRow {
+                source_key: None,
+                key: None,
+                value: None,
+            }]
         );
     }
 

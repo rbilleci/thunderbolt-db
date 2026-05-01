@@ -39,6 +39,8 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
   - `MvccProjection::KeyValue`
   - `MvccProjection::KeyOnly`
   - `MvccProjection::ValueOnly`
+  - `MvccProjection::SourceKeyTargetValue` (join-adjacent result shape that mirrors the original seed key into `key` while projecting the resolved target row's value)
+  - `MvccProjection::SourceValueOnly` (join-adjacent result shape that projects only the original seed row's value)
   - `MvccProjection::TargetKeySourceValue` (join-adjacent result shape that keeps the target key while projecting the original seed row's value)
 - Result row shape:
   - `MvccReadRow { source_key, key, value }`
@@ -61,7 +63,7 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
 - Deterministic workload fixture:
   - `tests/fixtures/mvcc-read-workload.txt`
 - Next obvious extension boundary:
-  - widen the join-adjacent slice further from the current source-preserving multi-hop reads plus seed-side projection/filter/order controls into richer relational composition (for example additional mixed result-shape controls or more explicit join-shape composition primitives) while preserving the same engine-facing contract and explicit fallback accounting on the eventual GPU-backed path.
+  - widen the join-adjacent slice further from the current source-preserving multi-hop reads plus seed-side/target-side mixed projection, filter, and ordering controls into richer relational composition (for example more explicit join-shape composition primitives) while preserving the same engine-facing contract and explicit fallback accounting on the eventual GPU-backed path.
 
 ## Quickstart
 
