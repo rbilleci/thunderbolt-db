@@ -3,6 +3,9 @@
 ## 2026-05-01
 
 ### Completed
+- Added `MvccReadSource::FollowValueChainBranches { keys, plans }`, the first explicit branch-form nested-join helper: for each visible seed key in request order, the engine now resolves multiple linear value→key plans in branch-list order before moving to the next seed, preserving source provenance and the same explicit `GpuMvccReadParityGap` fallback contract.
+- Added engine regression coverage proving the new branch helper keeps branch results grouped per seed (unlike a plain `Concat` over multiple chains), skips missing seeds/intermediates cleanly, and still composes with downstream filter/order/projection under duplicate seeds.
+- Reconciled README/execution/roadmap docs so the Q2 truth surface now records the first generic branch-form nested join and narrows the next extension boundary toward explicit fan-in policies or richer provenance controls.
 - Added `MvccReadSource::FollowValueChain { keys, plan }` plus `MvccValueChainPlan`, a generic source-preserving linear nested-join mechanism that covers the existing value→key helper family by hop count + terminal behavior instead of requiring another one-off enum variant for every deeper chain shape.
 - Refactored the legacy deep join helpers to resolve through the shared `FollowValueChain` path, keeping the same `MvccReadRow { source_key, key, value }` contract and explicit `GpuMvccReadParityGap` fallback semantics while shrinking bespoke nested logic.
 - Added engine regression coverage proving the generic chain surface matches the existing deepest prefix and terminal helper semantics exactly, including downstream ordering and join-side projection.
