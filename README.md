@@ -9,7 +9,7 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
 - WAL durability + queue watermarks (flushed, buffered, unflushed, pending depth/capacity, pending age/deadline), commit/apply/visibility lag gauges, explicit backlog/gap blocker flags, active transaction depth, and failover/admission readiness flags (`quiescent_for_failover`, `follower_promotion_ready`, `mutation_admission_saturated`)
 - Engine truth surface via `Engine::status_snapshot()` for served snapshot identity/frontier, active fallback reasons + parity rollups, and replication/readiness health
 - Engine telemetry snapshot + sink publication API for replication lag, durable WAL/snapshot frontier, write-path readiness/backlog state, and runtime metrics
-- Thin MVCC execution slice via `Engine::execute_mvcc_query()` covering snapshot-bound full scan / key lookup / key-batch fan-in / value→key reference expansion / value→key→prefix source-preserving expansion, optional key-prefix/range or value-equality filtering, ordering, limit, and key/value projection through the execution layer with explicit CPU fallback parity tracking (`GPU-123`)
+- Thin MVCC execution slice via `Engine::execute_mvcc_query()` covering snapshot-bound full scan / key lookup / key-batch fan-in / value→key reference expansion / value→key→prefix source-preserving expansion / value→key→value→key source-preserving chaining, optional key-prefix/range or value-equality filtering, ordering, limit, and key/value projection through the execution layer with explicit CPU fallback parity tracking (`GPU-123`)
 - CPU-first reference engine skeleton
 - Device-aware execution abstractions
 
@@ -23,6 +23,7 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
   - `MvccReadSource::FollowValueKeyRefs { keys }` (join-adjacent foreign-key-style expansion from seed row values to referenced keys)
   - `MvccReadSource::FollowValueKeyPrefixes { keys }` (prefix-driven foreign-key-style expansion from seed row values to visible target-key ranges)
   - `MvccReadSource::FollowValueKeyRefPrefixes { keys }` (source-preserving two-hop expansion: seed value -> referenced row -> prefix-driven target fan-out)
+  - `MvccReadSource::FollowValueKeyRefValueKeyRefs { keys }` (source-preserving three-hop expansion: seed value -> referenced row -> referenced row value -> final referenced row)
 - Supported snapshot rule:
   - `visibility.read_txn_id` selects the MVCC snapshot frontier
 - Supported filters:
@@ -52,7 +53,7 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
 - Deterministic workload fixture:
   - `tests/fixtures/mvcc-read-workload.txt`
 - Next obvious extension boundary:
-  - widen the join-adjacent slice from this first source-preserving two-hop read into richer relational composition (for example explicit join-side projections or multi-join chaining) while preserving the same engine-facing contract and explicit fallback accounting on the eventual GPU-backed path.
+  - widen the join-adjacent slice from the current source-preserving multi-hop reads into richer relational composition (for example prefix fan-out on chained joins or explicit join-side projections) while preserving the same engine-facing contract and explicit fallback accounting on the eventual GPU-backed path.
 
 ## Quickstart
 

@@ -3,6 +3,9 @@
 ## 2026-04-30
 
 ### Completed
+- Extended the engine-facing MVCC bootstrap slice with `FollowValueKeyRefValueKeyRefs { keys }`, a source-preserving three-hop join chain: for each visible seed key, the engine now follows seed value -> visible intermediate row -> visible intermediate value -> visible final referenced row while preserving the original seed provenance and the existing GPU-first fallback contract.
+- Added end-to-end engine regression coverage proving the new three-hop source preserves request order, skips missing seed/intermediate/final rows cleanly, and still composes deterministically through downstream filter/order/limit stages under duplicate seeds.
+- Reconciled README/execution/roadmap docs so the Q2 truth surface now includes source-preserving value→key→value→key chaining and the next extension boundary narrows to chained fan-out or explicit join-side projections.
 - Extended the engine-facing MVCC bootstrap slice with `FollowValueKeyRefPrefixes { keys }`, the first source-preserving two-hop join shape: for each visible seed key, the engine now follows seed value -> visible intermediate row -> visible prefix fan-out while preserving the original seed provenance and the existing GPU-first fallback contract.
 - Added end-to-end engine regression coverage proving the new two-hop source preserves request order, skips missing seed/intermediate rows cleanly, and still composes deterministically through downstream filter/order/limit stages under duplicate seeds.
 - Reconciled README/execution/roadmap docs so the Q2 truth surface now includes source-preserving value→key→prefix expansion and the next extension boundary narrows to richer relational composition.
