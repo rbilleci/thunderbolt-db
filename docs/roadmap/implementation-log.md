@@ -1,5 +1,12 @@
 # Implementation Log (Pre-NVIDIA Phase)
 
+## 2026-05-01
+
+### Completed
+- Extended the engine-facing MVCC bootstrap slice with `FollowValueKeyRefValueKeyPrefixes { keys }`, a source-preserving chained fan-out shape: for each visible seed key, the engine now follows seed value -> visible intermediate row -> visible intermediate value -> visible prefix fan-out while preserving the original seed provenance and the existing GPU-first fallback contract.
+- Added end-to-end engine regression coverage proving the new chained fan-out source preserves request order, skips missing seed/intermediate/final-prefix rows cleanly, and still composes deterministically through downstream filter/order/limit stages under duplicate seeds.
+- Reconciled README/execution/roadmap docs so the Q2 truth surface now includes source-preserving value→key→value→prefix chaining and the next extension boundary narrows to explicit join-side projections or another richer relational shape.
+
 ## 2026-04-30
 
 ### Completed
