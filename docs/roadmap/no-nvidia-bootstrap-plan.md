@@ -163,7 +163,8 @@ Notes:
 - Favor a complete thin slice over broad unfinished operator scaffolding.
 - This should make the engine visibly more capable, not just more internally prepared.
 - Current bootstrap truth: the engine-facing MVCC slice now supports full scans + single-key lookups + key-batch fan-in lookups + explicit multi-source `Concat` / `ConcatDistinct` / `IntersectDistinct` / `IntersectAll` / `ExceptDistinct` / `ExceptAll` / `SymmetricDifferenceDistinct` / `SymmetricDifferenceAll` composition + value→key reference expansion + value→key-prefix expansion + source-preserving value→key→prefix expansion + source-preserving value→key→value→key chaining + source-preserving value→key→value→prefix chained fan-out with snapshot visibility, prefix/value/composite/range filters, source-aware key/value filters for join-adjacent rows, key/value plus source-aware ordering, mixed join-side projection controls (target-key+seed-value, source-key+target-value, source-value-only), optional source provenance on join-adjacent rows, and post-order limit under an explicit `GpuMvccReadParityGap` fallback contract.
-- Next obvious extension boundary: widen the explicit source-composition surface beyond the first multiset family now that `IntersectAll` / `ExceptAll` / `SymmetricDifferenceAll` exist (for example multiset concatenation policy controls or deeper nested join-composition helpers), without weakening the explicit fallback contract.
+- Deterministic workload fixtures now cover both point-lookup/history replay and source-composition replay (`tests/fixtures/mvcc-read-workload.txt`, `tests/fixtures/mvcc-source-composition-workload.txt`).
+- Next obvious extension boundary: widen the explicit source-composition surface beyond the first complete distinct+multiset family (for example deeper nested join-composition helpers) without weakening the explicit fallback contract.
 
 ### Q3. Replication semantics hardening under stress
 Priority: highest

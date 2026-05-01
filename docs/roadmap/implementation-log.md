@@ -3,6 +3,8 @@
 ## 2026-05-01
 
 ### Completed
+- Added deterministic source-composition workload fixture `tests/fixtures/mvcc-source-composition-workload.txt` plus an engine-facing replay test, so future Q2 loops can measure the new source-composition family against stable multiset/join-adjacent data instead of only one-off inline setups.
+- Reconciled README/execution/roadmap docs so the workload-fixture truth surface now covers both basic MVCC history replay and explicit source-composition replay.
 - Extended the engine-facing MVCC bootstrap slice with `MvccReadSource::SymmetricDifferenceAll { sources }`, an ordered multiset symmetric-difference primitive: the engine now iteratively cancels exact resolved-row identity multiplicity source-by-source, then emits the remaining imbalance in first appearance order while treating source provenance as part of identity.
 - Added end-to-end engine regression coverage proving `SymmetricDifferenceAll` preserves exact non-join multiplicity imbalance, preserves join-row imbalance only when source provenance also matches, and still composes with source-aware filters/order clauses plus join-side projection under the existing fallback contract.
 - Reconciled README/execution/roadmap docs so the Q2 truth surface now includes the first multiset symmetric-difference helper and the next extension boundary narrows toward multiset concatenation policy controls or deeper join-composition helpers beyond the current family.

@@ -76,6 +76,8 @@ Each physical plan node must include:
 
 ## Current extension boundary
 
+- Deterministic workload fixtures now include both `tests/fixtures/mvcc-read-workload.txt` for point-lookup/history replay and `tests/fixtures/mvcc-source-composition-workload.txt` for source-composition replay.
+
 - Supported ordering now covers key-aware and value-aware shapes (`KeyAsc` / `KeyDesc` / `ValueAsc` / `ValueDesc`), with value ordering using key order as the deterministic tie-breaker.
 - Supported range semantics are lexicographic `KeyRange { start_inclusive, end_exclusive }` filters.
 - `KeyBatchLookup { keys }` is the first multi-source bootstrap shape; it fans multiple point lookups into the same execution pipeline while preserving request order until an explicit order clause overrides it.
@@ -93,4 +95,4 @@ Each physical plan node must include:
 - `FollowValueKeyRefValueKeyRefs { keys }` widens that source-preserving join surface into a deterministic three-hop chain, proving the current row contract can carry deeper relational composition without losing seed provenance or changing fallback semantics.
 - `FollowValueKeyRefValueKeyPrefixes { keys }` widens the same surface into a deterministic chained fan-out shape, proving the engine-facing contract still holds when the final hop expands to multiple visible rows.
 - The row contract now carries optional `source_key` provenance, which enabled the first true source-preserving join shape to land without another result-surface rewrite.
-- Next obvious Q2 extension is widening the explicit source-composition surface beyond the current multiset pair (`IntersectAll` / `ExceptAll`) with either multiset symmetric-difference semantics or deeper nested join-composition helpers, without weakening the explicit GPU fallback contract.
+- Next obvious Q2 extension is widening the explicit source-composition surface beyond the first complete distinct+multiset family (for example deeper nested join-composition helpers) without weakening the explicit GPU fallback contract.

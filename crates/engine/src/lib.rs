@@ -3801,6 +3801,90 @@ mod tests {
     }
 
     #[test]
+    fn execute_mvcc_query_replays_deterministic_source_composition_workload_fixture() {
+        let mut e = Engine::new_local();
+        for (txn_id, command) in
+            include_str!("../../../tests/fixtures/mvcc-source-composition-workload.txt")
+                .lines()
+                .enumerate()
+        {
+            e.execute_text((txn_id + 1) as u64, command).unwrap();
+        }
+
+        let multiset_overlap = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::IntersectAll {
+                    sources: vec![
+                        MvccReadSource::KeyBatchLookup {
+                            keys: vec![
+                                "user:1".to_string(),
+                                "user:1".to_string(),
+                                "user:2".to_string(),
+                            ],
+                        },
+                        MvccReadSource::KeyBatchLookup {
+                            keys: vec!["user:1".to_string()],
+                        },
+                    ],
+                },
+                visibility: StorageVisibility { read_txn_id: 10 },
+                filter: None,
+                order: None,
+                projection: MvccProjection::KeyOnly,
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            multiset_overlap.rows,
+            vec![MvccReadRow {
+                source_key: None,
+                key: Some("user:1".to_string()),
+                value: None,
+            }]
+        );
+
+        let multiset_imbalance = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::SymmetricDifferenceAll {
+                    sources: vec![
+                        MvccReadSource::FollowValueKeyRefPrefixes {
+                            keys: vec!["acct:1".to_string(), "acct:1".to_string()],
+                        },
+                        MvccReadSource::FollowValueKeyRefPrefixes {
+                            keys: vec!["acct:1".to_string()],
+                        },
+                    ],
+                },
+                visibility: StorageVisibility { read_txn_id: 10 },
+                filter: Some(MvccReadFilter::Any(vec![
+                    MvccReadFilter::ValueEquals("Alice".to_string()),
+                    MvccReadFilter::ValueEquals("Ally".to_string()),
+                ])),
+                order: Some(MvccReadOrder::SourceKeyAsc),
+                projection: MvccProjection::TargetKeySourceValue,
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            multiset_imbalance.rows,
+            vec![
+                MvccReadRow {
+                    source_key: Some("acct:1".to_string()),
+                    key: Some("team:alpha:1".to_string()),
+                    value: Some("profile:1".to_string()),
+                },
+                MvccReadRow {
+                    source_key: Some("acct:1".to_string()),
+                    key: Some("team:alpha:2".to_string()),
+                    value: Some("profile:1".to_string()),
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn execute_mvcc_query_supports_multi_key_lookup_fan_in_source() {
         let mut e = Engine::new_local();
         e.execute_text(1, "SET acct:1=open").unwrap();

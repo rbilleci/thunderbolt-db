@@ -68,10 +68,11 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
   - planned target: GPU default device
   - executed target: CPU reference semantics via `ScanOperator` → `FilterOperator` → `SortOperator` → `LimitOperator` → `ProjectOperator`
   - fallback reason: `FallbackReason::GpuMvccReadParityGap` (`GPU-123`)
-- Deterministic workload fixture:
+- Deterministic workload fixtures:
   - `tests/fixtures/mvcc-read-workload.txt`
+  - `tests/fixtures/mvcc-source-composition-workload.txt`
 - Next obvious extension boundary:
-  - widen the explicit source-composition surface beyond the current multiset pair (`IntersectAll` / `ExceptAll`) with either multiset symmetric-difference semantics or deeper nested join composition helpers, while preserving the same engine-facing contract and explicit fallback accounting on the eventual GPU-backed path.
+  - widen the explicit source-composition surface beyond the first complete distinct+multiset family now that concatenation/intersection/subtraction/symmetric-difference all have explicit helpers (for example deeper nested join-composition helpers) while preserving the same engine-facing contract and explicit fallback accounting on the eventual GPU-backed path.
 
 ## Quickstart
 

@@ -1,0 +1,10 @@
+SET acct:1=profile:1
+SET acct:2=profile:1
+SET acct:3=profile:2
+SET profile:1=team:alpha:
+SET profile:2=team:beta:
+SET team:alpha:1=Alice
+SET team:alpha:2=Ally
+SET team:beta:1=Bob
+SET user:1=active
+SET user:2=locked
