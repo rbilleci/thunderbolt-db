@@ -9,7 +9,7 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
 - WAL durability + queue watermarks (flushed, buffered, unflushed, pending depth/capacity, pending age/deadline), commit/apply/visibility lag gauges, explicit backlog/gap blocker flags, active transaction depth, and failover/admission readiness flags (`quiescent_for_failover`, `follower_promotion_ready`, `mutation_admission_saturated`)
 - Engine truth surface via `Engine::status_snapshot()` for served snapshot identity/frontier, active fallback reasons + parity rollups, and replication/readiness health
 - Engine telemetry snapshot + sink publication API for replication lag, durable WAL/snapshot frontier, write-path readiness/backlog state, and runtime metrics
-- Thin MVCC execution slice via `Engine::execute_mvcc_query()` covering snapshot-bound full scan / key lookup / key-batch fan-in / explicit multi-source `Concat`, `ConcatDistinct`, `IntersectDistinct`, `IntersectAll`, `ExceptDistinct`, `ExceptAll`, `SymmetricDifferenceDistinct`, and `SymmetricDifferenceAll` composition / value→key reference expansion / value→key→prefix source-preserving expansion / value→key→value→key source-preserving chaining / value→key→value→prefix source-preserving chained fan-out / value→key→value→key→prefix four-hop source-preserving chaining / value→key→value→key→value→key deeper terminal chaining / value→key→value→key→value→prefix deeper fan-out chaining, optional key-prefix/range or source-aware key/value filtering, source-aware ordering, limit, and key/value or join-side source-value projection through the execution layer with explicit CPU fallback parity tracking (`GPU-123`)
+- Thin MVCC execution slice via `Engine::execute_mvcc_query()` covering snapshot-bound full scan / key lookup / key-batch fan-in / explicit multi-source `Concat`, `ConcatDistinct`, `IntersectDistinct`, `IntersectAll`, `ExceptDistinct`, `ExceptAll`, `SymmetricDifferenceDistinct`, and `SymmetricDifferenceAll` composition / value→key reference expansion / value→key→prefix source-preserving expansion / value→key→value→key source-preserving chaining / value→key→value→prefix source-preserving chained fan-out / value→key→value→key→prefix four-hop source-preserving chaining / value→key→value→key→value→key deeper terminal chaining / value→key→value→key→value→prefix deeper fan-out chaining / value→key→value→key→value→key→prefix deeper nested fan-out chaining, optional key-prefix/range or source-aware key/value filtering, source-aware ordering, limit, and key/value or join-side source-value projection through the execution layer with explicit CPU fallback parity tracking (`GPU-123`)
 - CPU-first reference engine skeleton
 - Device-aware execution abstractions
 
@@ -36,6 +36,7 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
   - `MvccReadSource::FollowValueKeyRefValueKeyRefPrefixes { keys }` (source-preserving four-hop fan-out: seed value -> referenced row -> referenced row value -> referenced row -> visible prefix-driven target expansion)
   - `MvccReadSource::FollowValueKeyRefValueKeyRefValueKeyRefs { keys }` (source-preserving deeper terminal chain: seed value -> referenced row -> referenced row value -> referenced row -> referenced row value -> referenced row -> final visible target row)
   - `MvccReadSource::FollowValueKeyRefValueKeyRefValueKeyPrefixes { keys }` (source-preserving deeper fan-out chain: seed value -> referenced row -> referenced row value -> referenced row -> referenced row value -> visible referenced row -> visible prefix-driven target expansion)
+  - `MvccReadSource::FollowValueKeyRefValueKeyRefValueKeyRefPrefixes { keys }` (source-preserving deeper nested fan-out chain: seed value -> referenced row -> referenced row value -> referenced row -> referenced row value -> visible referenced row -> visible referenced-row value -> visible prefix-driven target expansion)
 - Supported snapshot rule:
   - `visibility.read_txn_id` selects the MVCC snapshot frontier
 - Supported filters:
@@ -75,7 +76,7 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
   - `tests/fixtures/mvcc-read-workload.txt`
   - `tests/fixtures/mvcc-source-composition-workload.txt`
 - Next obvious extension boundary:
-  - widen the deeper source-preserving join-composition surface beyond the new deeper terminal/fan-out siblings (for example more composable nested join helpers) while preserving the same engine-facing contract and explicit fallback accounting on the eventual GPU-backed path.
+  - widen the deeper source-preserving join-composition surface beyond the new deeper nested fan-out helper (for example more composable nested join helpers that reduce the need for another one-off enum variant) while preserving the same engine-facing contract and explicit fallback accounting on the eventual GPU-backed path.
 
 ## Quickstart
 

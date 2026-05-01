@@ -96,6 +96,7 @@ pub enum MvccReadSource {
     FollowValueKeyRefValueKeyRefPrefixes { keys: Vec<String> },
     FollowValueKeyRefValueKeyRefValueKeyRefs { keys: Vec<String> },
     FollowValueKeyRefValueKeyRefValueKeyPrefixes { keys: Vec<String> },
+    FollowValueKeyRefValueKeyRefValueKeyRefPrefixes { keys: Vec<String> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -774,6 +775,42 @@ fn resolve_mvcc_source(
                                                 source_tuple: Some(seed.clone()),
                                                 tuple,
                                             });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(rows)
+        }
+        MvccReadSource::FollowValueKeyRefValueKeyRefValueKeyRefPrefixes { keys } => {
+            let mut rows = Vec::new();
+            for key in keys {
+                if let Some(seed) = store.tuple_fetch_by_key(key, visibility)? {
+                    if let Some(intermediate) = store.tuple_fetch_by_key(&seed.value, visibility)? {
+                        if let Some(ref_seed) =
+                            store.tuple_fetch_by_key(&intermediate.value, visibility)?
+                        {
+                            if let Some(final_seed) =
+                                store.tuple_fetch_by_key(&ref_seed.value, visibility)?
+                            {
+                                if let Some(prefix_seed) =
+                                    store.tuple_fetch_by_key(&final_seed.value, visibility)?
+                                {
+                                    if let Some(prefix_row) =
+                                        store.tuple_fetch_by_key(&prefix_seed.value, visibility)?
+                                    {
+                                        let mut cursor = store.seq_scan_open(visibility)?;
+                                        while let Some(tuple) = cursor.next() {
+                                            if tuple.key.starts_with(&prefix_row.value) {
+                                                rows.push(ResolvedMvccRow {
+                                                    source_key: Some(key.clone()),
+                                                    source_tuple: Some(seed.clone()),
+                                                    tuple,
+                                                });
+                                            }
                                         }
                                     }
                                 }
@@ -5045,6 +5082,122 @@ mod tests {
                 MvccReadRow {
                     source_key: Some("acct:1".to_string()),
                     key: Some("team:alpha:v2:1".to_string()),
+                    value: Some("profile:1".to_string()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn execute_mvcc_query_supports_follow_value_key_ref_value_key_ref_value_key_ref_prefixes_source(
+    ) {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=profile:1").unwrap();
+        e.execute_text(2, "SET acct:2=profile:2").unwrap();
+        e.execute_text(3, "SET acct:3=missing-profile").unwrap();
+        e.execute_text(4, "SET profile:1=team-root:1").unwrap();
+        e.execute_text(5, "SET profile:2=team-root:2").unwrap();
+        e.execute_text(6, "SET team-root:1=prefix:alpha:").unwrap();
+        e.execute_text(7, "SET team-root:2=prefix:beta:").unwrap();
+        e.execute_text(8, "SET prefix:alpha:=team-lead:1").unwrap();
+        e.execute_text(9, "SET prefix:beta:=team-lead:2").unwrap();
+        e.execute_text(10, "SET team-lead:1=group-prefix:alpha:")
+            .unwrap();
+        e.execute_text(11, "SET team-lead:2=group-prefix:beta:")
+            .unwrap();
+        e.execute_text(12, "SET group-prefix:alpha:=squad:alpha:")
+            .unwrap();
+        e.execute_text(13, "SET group-prefix:beta:=squad:beta:")
+            .unwrap();
+        e.execute_text(14, "SET squad:alpha:1=Alice").unwrap();
+        e.execute_text(15, "SET squad:alpha:2=Ally").unwrap();
+        e.execute_text(16, "SET squad:beta:1=Bob").unwrap();
+        e.execute_text(17, "SET squad:beta:2=Bianca").unwrap();
+        e.execute_text(18, "SET team-root:1=prefix:alpha:v2")
+            .unwrap();
+        e.execute_text(19, "SET prefix:alpha:v2=team-lead:3")
+            .unwrap();
+        e.execute_text(20, "SET team-lead:3=group-prefix:alpha:v2:")
+            .unwrap();
+        e.execute_text(21, "SET group-prefix:alpha:v2:=squad:alpha:v2:")
+            .unwrap();
+        e.execute_text(22, "SET squad:alpha:v2:1=Astra").unwrap();
+
+        let request_order = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FollowValueKeyRefValueKeyRefValueKeyRefPrefixes {
+                    keys: vec![
+                        "acct:2".to_string(),
+                        "acct:1".to_string(),
+                        "missing".to_string(),
+                        "acct:3".to_string(),
+                    ],
+                },
+                visibility: StorageVisibility { read_txn_id: 22 },
+                filter: None,
+                order: None,
+                projection: MvccProjection::KeyValue,
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            request_order.rows,
+            vec![
+                MvccReadRow {
+                    source_key: Some("acct:2".to_string()),
+                    key: Some("squad:beta:1".to_string()),
+                    value: Some("Bob".to_string()),
+                },
+                MvccReadRow {
+                    source_key: Some("acct:2".to_string()),
+                    key: Some("squad:beta:2".to_string()),
+                    value: Some("Bianca".to_string()),
+                },
+                MvccReadRow {
+                    source_key: Some("acct:1".to_string()),
+                    key: Some("squad:alpha:v2:1".to_string()),
+                    value: Some("Astra".to_string()),
+                },
+            ]
+        );
+
+        let filtered_and_sorted = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FollowValueKeyRefValueKeyRefValueKeyRefPrefixes {
+                    keys: vec![
+                        "acct:1".to_string(),
+                        "acct:2".to_string(),
+                        "acct:1".to_string(),
+                    ],
+                },
+                visibility: StorageVisibility { read_txn_id: 22 },
+                filter: Some(MvccReadFilter::Any(vec![
+                    MvccReadFilter::ValueEquals("Astra".to_string()),
+                    MvccReadFilter::ValueEquals("Bob".to_string()),
+                ])),
+                order: Some(MvccReadOrder::ValueDesc),
+                projection: MvccProjection::TargetKeySourceValue,
+                limit: Some(3),
+            })
+            .unwrap();
+
+        assert_eq!(
+            filtered_and_sorted.rows,
+            vec![
+                MvccReadRow {
+                    source_key: Some("acct:2".to_string()),
+                    key: Some("squad:beta:1".to_string()),
+                    value: Some("profile:2".to_string()),
+                },
+                MvccReadRow {
+                    source_key: Some("acct:1".to_string()),
+                    key: Some("squad:alpha:v2:1".to_string()),
+                    value: Some("profile:1".to_string()),
+                },
+                MvccReadRow {
+                    source_key: Some("acct:1".to_string()),
+                    key: Some("squad:alpha:v2:1".to_string()),
                     value: Some("profile:1".to_string()),
                 },
             ]
