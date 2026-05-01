@@ -82,6 +82,7 @@ pub enum MvccReadSource {
     KeyBatchLookup { keys: Vec<String> },
     Concat { sources: Vec<MvccReadSource> },
     ConcatDistinct { sources: Vec<MvccReadSource> },
+    IntersectDistinct { sources: Vec<MvccReadSource> },
     FollowValueKeyRefs { keys: Vec<String> },
     FollowValueKeyPrefixes { keys: Vec<String> },
     FollowValueKeyRefPrefixes { keys: Vec<String> },
@@ -391,6 +392,39 @@ fn resolve_mvcc_source(
                 }
             }
             Ok(rows)
+        }
+        MvccReadSource::IntersectDistinct { sources } => {
+            let mut sources_iter = sources.iter();
+            let Some(first_source) = sources_iter.next() else {
+                return Ok(Vec::new());
+            };
+
+            let first_rows = resolve_mvcc_source(store, first_source, visibility)?;
+            let mut intersection = Vec::new();
+            let mut emitted = BTreeSet::new();
+            let remaining_sets = sources_iter
+                .map(|source| {
+                    resolve_mvcc_source(store, source, visibility).map(|rows| {
+                        rows.into_iter()
+                            .map(|row| resolved_mvcc_row_key(&row))
+                            .collect::<BTreeSet<_>>()
+                    })
+                })
+                .collect::<Result<Vec<_>, StorageError>>()?;
+
+            'rows: for row in first_rows {
+                let key = resolved_mvcc_row_key(&row);
+                if !emitted.insert(key.clone()) {
+                    continue;
+                }
+                for other in &remaining_sets {
+                    if !other.contains(&key) {
+                        continue 'rows;
+                    }
+                }
+                intersection.push(row);
+            }
+            Ok(intersection)
         }
         MvccReadSource::FollowValueKeyRefs { keys } => {
             let mut rows = Vec::new();
@@ -3898,6 +3932,93 @@ mod tests {
                     value: Some("profile:2".to_string()),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn execute_mvcc_query_supports_intersect_distinct_source_composition() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=profile:1").unwrap();
+        e.execute_text(2, "SET acct:2=profile:2").unwrap();
+        e.execute_text(3, "SET acct:3=profile:3").unwrap();
+        e.execute_text(4, "SET profile:1=team:alpha").unwrap();
+        e.execute_text(5, "SET profile:2=team:beta").unwrap();
+        e.execute_text(6, "SET profile:3=team:alpha").unwrap();
+        e.execute_text(7, "SET team:alpha:1=Alice").unwrap();
+        e.execute_text(8, "SET team:alpha:2=Ally").unwrap();
+        e.execute_text(9, "SET team:beta:1=Bob").unwrap();
+        e.execute_text(10, "SET user:1=active").unwrap();
+
+        let exact_overlap = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::IntersectDistinct {
+                    sources: vec![
+                        MvccReadSource::Concat {
+                            sources: vec![
+                                MvccReadSource::KeyLookup {
+                                    key: "user:1".to_string(),
+                                },
+                                MvccReadSource::KeyBatchLookup {
+                                    keys: vec!["acct:2".to_string(), "user:1".to_string()],
+                                },
+                            ],
+                        },
+                        MvccReadSource::KeyBatchLookup {
+                            keys: vec!["user:1".to_string(), "acct:2".to_string()],
+                        },
+                    ],
+                },
+                visibility: StorageVisibility { read_txn_id: 10 },
+                filter: None,
+                order: None,
+                projection: MvccProjection::KeyOnly,
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            exact_overlap.rows,
+            vec![
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("user:1".to_string()),
+                    value: None,
+                },
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("acct:2".to_string()),
+                    value: None,
+                },
+            ]
+        );
+
+        let source_sensitive_overlap = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::IntersectDistinct {
+                    sources: vec![
+                        MvccReadSource::FollowValueKeyRefPrefixes {
+                            keys: vec!["acct:1".to_string(), "acct:3".to_string()],
+                        },
+                        MvccReadSource::FollowValueKeyRefPrefixes {
+                            keys: vec!["acct:3".to_string(), "acct:2".to_string()],
+                        },
+                    ],
+                },
+                visibility: StorageVisibility { read_txn_id: 10 },
+                filter: Some(MvccReadFilter::ValueEquals("Alice".to_string())),
+                order: Some(MvccReadOrder::SourceKeyAsc),
+                projection: MvccProjection::TargetKeySourceValue,
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            source_sensitive_overlap.rows,
+            vec![MvccReadRow {
+                source_key: Some("acct:3".to_string()),
+                key: Some("team:alpha:1".to_string()),
+                value: Some("profile:3".to_string()),
+            }]
         );
     }
 
