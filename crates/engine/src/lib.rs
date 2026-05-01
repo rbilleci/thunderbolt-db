@@ -184,10 +184,21 @@ pub enum MvccSourceProvenance {
     TerminalInput,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MvccProvenanceFrame {
+    Seed,
+    TerminalInput,
+    ValueHop(usize),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MvccReadFilter {
     KeyPrefix(String),
     SourceKeyPrefix(String),
+    ProvenanceKeyPrefix {
+        frame: MvccProvenanceFrame,
+        prefix: String,
+    },
     BranchLabelEquals(String),
     KeyRange {
         start_inclusive: String,
@@ -195,6 +206,10 @@ pub enum MvccReadFilter {
     },
     ValueEquals(String),
     SourceValueEquals(String),
+    ProvenanceValueEquals {
+        frame: MvccProvenanceFrame,
+        expected: String,
+    },
     All(Vec<MvccReadFilter>),
     Any(Vec<MvccReadFilter>),
 }
@@ -222,6 +237,7 @@ pub enum MvccProjection {
     SourceKeyTargetValue,
     SourceValueOnly,
     TargetKeySourceValue,
+    TargetKeyProvenanceValue { frame: MvccProvenanceFrame },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -254,6 +270,8 @@ struct ResolvedMvccRow {
     branch_label: Option<String>,
     source_key: Option<String>,
     source_tuple: Option<TupleVersion>,
+    provenance_path: Option<Vec<TupleVersion>>,
+    terminal_input_index: Option<usize>,
     tuple: TupleVersion,
 }
 
@@ -262,16 +280,52 @@ type ResolvedMvccRowIdentity = (
     Option<String>,
     Option<String>,
     Option<ResolvedTupleIdentity>,
+    Option<Vec<ResolvedTupleIdentity>>,
+    Option<usize>,
     ResolvedTupleIdentity,
 );
 
+fn resolved_tuple_identity(tuple: &TupleVersion) -> ResolvedTupleIdentity {
+    (
+        tuple.tuple_id,
+        tuple.key.clone(),
+        tuple.value.clone(),
+        tuple.created_by,
+        tuple.deleted_by,
+    )
+}
+
+fn resolved_mvcc_row_provenance_tuple(
+    row: &ResolvedMvccRow,
+    frame: MvccProvenanceFrame,
+) -> Option<&TupleVersion> {
+    let path = row.provenance_path.as_ref()?;
+    match frame {
+        MvccProvenanceFrame::Seed => path.first(),
+        MvccProvenanceFrame::TerminalInput => {
+            row.terminal_input_index.and_then(|index| path.get(index))
+        }
+        MvccProvenanceFrame::ValueHop(index) => path.get(index),
+    }
+}
+
 fn project_mvcc_row(row: ResolvedMvccRow, projection: MvccProjection) -> MvccReadRow {
+    let provenance_value = match projection {
+        MvccProjection::TargetKeyProvenanceValue { frame } => {
+            resolved_mvcc_row_provenance_tuple(&row, frame).map(|tuple| tuple.value.clone())
+        }
+        _ => None,
+    };
+
     let ResolvedMvccRow {
         branch_label,
         source_key,
         source_tuple,
+        provenance_path: _,
+        terminal_input_index: _,
         tuple,
     } = row;
+
     match projection {
         MvccProjection::KeyValue => MvccReadRow {
             source_key,
@@ -308,6 +362,11 @@ fn project_mvcc_row(row: ResolvedMvccRow, projection: MvccProjection) -> MvccRea
             key: Some(tuple.key),
             value: source_tuple.map(|tuple| tuple.value),
         },
+        MvccProjection::TargetKeyProvenanceValue { .. } => MvccReadRow {
+            source_key,
+            key: Some(tuple.key),
+            value: provenance_value,
+        },
     }
 }
 
@@ -326,6 +385,10 @@ fn mvcc_row_matches_filter(row: &ResolvedMvccRow, filter: &MvccReadFilter) -> bo
             .source_key
             .as_ref()
             .is_some_and(|source_key| source_key.starts_with(prefix)),
+        MvccReadFilter::ProvenanceKeyPrefix { frame, prefix } => {
+            resolved_mvcc_row_provenance_tuple(row, *frame)
+                .is_some_and(|tuple| tuple.key.starts_with(prefix))
+        }
         MvccReadFilter::BranchLabelEquals(expected) => row.branch_label.as_ref() == Some(expected),
         MvccReadFilter::KeyRange {
             start_inclusive,
@@ -339,6 +402,10 @@ fn mvcc_row_matches_filter(row: &ResolvedMvccRow, filter: &MvccReadFilter) -> bo
             .source_tuple
             .as_ref()
             .is_some_and(|source_tuple| source_tuple.value == *expected),
+        MvccReadFilter::ProvenanceValueEquals { frame, expected } => {
+            resolved_mvcc_row_provenance_tuple(row, *frame)
+                .is_some_and(|tuple| tuple.value == *expected)
+        }
         MvccReadFilter::All(filters) => filters
             .iter()
             .all(|filter| mvcc_row_matches_filter(row, filter)),
@@ -422,22 +489,12 @@ fn resolved_mvcc_row_key(row: &ResolvedMvccRow) -> ResolvedMvccRowIdentity {
     (
         row.branch_label.clone(),
         row.source_key.clone(),
-        row.source_tuple.as_ref().map(|tuple| {
-            (
-                tuple.tuple_id,
-                tuple.key.clone(),
-                tuple.value.clone(),
-                tuple.created_by,
-                tuple.deleted_by,
-            )
-        }),
-        (
-            row.tuple.tuple_id,
-            row.tuple.key.clone(),
-            row.tuple.value.clone(),
-            row.tuple.created_by,
-            row.tuple.deleted_by,
-        ),
+        row.source_tuple.as_ref().map(resolved_tuple_identity),
+        row.provenance_path
+            .as_ref()
+            .map(|path| path.iter().map(resolved_tuple_identity).collect()),
+        row.terminal_input_index,
+        resolved_tuple_identity(&row.tuple),
     )
 }
 
@@ -463,6 +520,7 @@ fn resolve_follow_value_chain_from_seed(
     branch_label: Option<&str>,
 ) -> Result<Vec<ResolvedMvccRow>, StorageError> {
     let mut current = seed.clone();
+    let mut provenance_path = vec![seed.clone()];
     let mut previous = None;
     for _ in 0..plan.value_key_hops {
         previous = Some(current.clone());
@@ -470,7 +528,19 @@ fn resolve_follow_value_chain_from_seed(
             return Ok(Vec::new());
         };
         current = next;
+        provenance_path.push(current.clone());
     }
+
+    let terminal_input_index = match plan.terminal {
+        MvccValueChainTerminal::CurrentRow => {
+            if plan.value_key_hops == 0 {
+                0
+            } else {
+                provenance_path.len().saturating_sub(2)
+            }
+        }
+        MvccValueChainTerminal::CurrentValuePrefixes => provenance_path.len().saturating_sub(1),
+    };
 
     let provenance_tuple = match provenance {
         MvccSourceProvenance::Seed => seed.clone(),
@@ -487,6 +557,8 @@ fn resolve_follow_value_chain_from_seed(
             branch_label: branch_label.map(ToOwned::to_owned),
             source_key: Some(source_key.clone()),
             source_tuple: Some(provenance_tuple.clone()),
+            provenance_path: Some(provenance_path.clone()),
+            terminal_input_index: Some(terminal_input_index),
             tuple: current,
         }),
         MvccValueChainTerminal::CurrentValuePrefixes => {
@@ -497,6 +569,8 @@ fn resolve_follow_value_chain_from_seed(
                         branch_label: branch_label.map(ToOwned::to_owned),
                         source_key: Some(source_key.clone()),
                         source_tuple: Some(provenance_tuple.clone()),
+                        provenance_path: Some(provenance_path.clone()),
+                        terminal_input_index: Some(terminal_input_index),
                         tuple,
                     });
                 }
@@ -623,6 +697,8 @@ fn resolve_mvcc_source(
                     branch_label: None,
                     source_key: None,
                     source_tuple: None,
+                    provenance_path: None,
+                    terminal_input_index: None,
                     tuple,
                 });
             }
@@ -635,6 +711,8 @@ fn resolve_mvcc_source(
                 branch_label: None,
                 source_key: None,
                 source_tuple: None,
+                provenance_path: None,
+                terminal_input_index: None,
                 tuple,
             })
             .collect()),
@@ -646,6 +724,8 @@ fn resolve_mvcc_source(
                         branch_label: None,
                         source_key: None,
                         source_tuple: None,
+                        provenance_path: None,
+                        terminal_input_index: None,
                         tuple,
                     });
                 }
@@ -5948,6 +6028,120 @@ mod tests {
                     source_key: Some("profile:2".to_string()),
                     key: Some("team:beta:2".to_string()),
                     value: Some("team:beta".to_string()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn execute_mvcc_query_supports_multi_frame_provenance_filters_and_projection() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=profile:1").unwrap();
+        e.execute_text(2, "SET acct:2=profile:2").unwrap();
+        e.execute_text(3, "SET profile:1=team:alpha").unwrap();
+        e.execute_text(4, "SET profile:2=team:beta").unwrap();
+        e.execute_text(5, "SET team:alpha:1=Alice").unwrap();
+        e.execute_text(6, "SET team:beta:1=Bob").unwrap();
+        e.execute_text(7, "SET team:beta:2=Bianca").unwrap();
+
+        let query = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FollowValueChain {
+                    keys: vec!["acct:2".to_string(), "acct:1".to_string()],
+                    plan: MvccValueChainPlan {
+                        value_key_hops: 1,
+                        terminal: MvccValueChainTerminal::CurrentValuePrefixes,
+                    },
+                    provenance: MvccSourceProvenance::Seed,
+                },
+                visibility: StorageVisibility { read_txn_id: 7 },
+                filter: Some(MvccReadFilter::All(vec![
+                    MvccReadFilter::ProvenanceKeyPrefix {
+                        frame: MvccProvenanceFrame::Seed,
+                        prefix: "acct:2".to_string(),
+                    },
+                    MvccReadFilter::ProvenanceValueEquals {
+                        frame: MvccProvenanceFrame::TerminalInput,
+                        expected: "team:beta".to_string(),
+                    },
+                ])),
+                order: Some(MvccReadOrder::KeyAsc),
+                projection: MvccProjection::TargetKeyProvenanceValue {
+                    frame: MvccProvenanceFrame::TerminalInput,
+                },
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            query.rows,
+            vec![
+                MvccReadRow {
+                    source_key: Some("acct:2".to_string()),
+                    key: Some("team:beta:1".to_string()),
+                    value: Some("team:beta".to_string()),
+                },
+                MvccReadRow {
+                    source_key: Some("acct:2".to_string()),
+                    key: Some("team:beta:2".to_string()),
+                    value: Some("team:beta".to_string()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn execute_mvcc_query_preserves_multi_frame_provenance_identity_under_concat_distinct() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=profile:1").unwrap();
+        e.execute_text(2, "SET profile:1=team:shared").unwrap();
+        e.execute_text(3, "SET team:shared=member:1").unwrap();
+        e.execute_text(4, "SET member:1=Alice").unwrap();
+
+        let distinct = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::ConcatDistinct {
+                    sources: vec![
+                        MvccReadSource::FollowValueChain {
+                            keys: vec!["acct:1".to_string()],
+                            plan: MvccValueChainPlan {
+                                value_key_hops: 2,
+                                terminal: MvccValueChainTerminal::CurrentRow,
+                            },
+                            provenance: MvccSourceProvenance::Seed,
+                        },
+                        MvccReadSource::FollowValueChain {
+                            keys: vec!["acct:1".to_string()],
+                            plan: MvccValueChainPlan {
+                                value_key_hops: 1,
+                                terminal: MvccValueChainTerminal::CurrentValuePrefixes,
+                            },
+                            provenance: MvccSourceProvenance::Seed,
+                        },
+                    ],
+                },
+                visibility: StorageVisibility { read_txn_id: 4 },
+                filter: Some(MvccReadFilter::KeyPrefix("team:shared".to_string())),
+                order: None,
+                projection: MvccProjection::TargetKeyProvenanceValue {
+                    frame: MvccProvenanceFrame::ValueHop(2),
+                },
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            distinct.rows,
+            vec![
+                MvccReadRow {
+                    source_key: Some("acct:1".to_string()),
+                    key: Some("team:shared".to_string()),
+                    value: Some("member:1".to_string()),
+                },
+                MvccReadRow {
+                    source_key: Some("acct:1".to_string()),
+                    key: Some("team:shared".to_string()),
+                    value: None,
                 },
             ]
         );

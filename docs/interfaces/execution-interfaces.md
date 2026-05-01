@@ -36,6 +36,7 @@ Each physical plan node must include:
     - `fan_in = FirstNonEmptyBranch` emits only the first branch that resolves at least one visible row for each seed, then stops evaluating later branches for that seed.
     - `provenance = Seed` keeps source-aware filter/order/projection semantics pinned to the original seed row.
     - `provenance = TerminalInput` retargets source-aware filter/order/projection semantics to the row that directly fed the terminal resolution step.
+    - nested-join rows now also retain the full visible provenance path internally, so explicit frame-aware filters/projection can inspect `Seed`, `TerminalInput`, or any `ValueHop(n)` without changing the external row contract.
   - `FollowValueChainLabeledBranches { keys, branches, fan_in, provenance }` (branch-labeled nested-join helper; preserves the same per-seed fan-in semantics while attaching stable branch labels to resolved rows so downstream filters/order/projections can distinguish fallback/alternative paths)
     - branch labels are treated as part of resolved-row identity for distinct/intersection/subtraction semantics, so identical target rows from different labeled branches remain distinguishable unless an explicit projection/filter collapses them.
   - `FollowValueKeyRefs { keys }` (join-adjacent foreign-key-style expansion; for each visible seed key in request order, look up the visible target row whose key matches the seed row's value)
@@ -52,13 +53,15 @@ Each physical plan node must include:
 - Filter layer:
   - `KeyPrefix(prefix)`
   - `SourceKeyPrefix(prefix)`
+  - `ProvenanceKeyPrefix { frame, prefix }`
   - `BranchLabelEquals(label)`
   - `KeyRange { start_inclusive, end_exclusive }`
   - `ValueEquals(value)`
   - `SourceValueEquals(value)`
+  - `ProvenanceValueEquals { frame, expected }`
   - `All([filter...])`
   - `Any([filter...])`
-  - source-aware filter variants only match join-adjacent rows; scan/lookup-only shapes leave them empty rather than fabricating source state
+  - source-aware and provenance-frame-aware filter variants only match join-adjacent rows; scan/lookup-only shapes leave them empty rather than fabricating source state
 - Order layer:
   - `KeyAsc`
   - `KeyDesc`
@@ -79,6 +82,7 @@ Each physical plan node must include:
   - `SourceKeyTargetValue` (join-adjacent projection that mirrors the original seed key into `key` while surfacing the resolved target row's value in `value`)
   - `SourceValueOnly` (join-adjacent projection that emits only the original seed row's value)
   - `TargetKeySourceValue` (join-adjacent projection that keeps the resolved target key in `key` while surfacing the original seed row's value in `value`)
+  - `TargetKeyProvenanceValue { frame }` (join-adjacent projection that keeps the resolved target key in `key` while surfacing the value from an explicit provenance frame such as `Seed`, `TerminalInput`, or `ValueHop(n)`)
 - Result row contract:
   - `MvccReadRow { source_key, key, value }`
   - `source_key` is `None` for scan/lookup shapes and populated for join-adjacent expansion rows so source provenance survives the current CPU reference pipeline while join-side projections still reuse the same result contract.
@@ -118,4 +122,4 @@ Each physical plan node must include:
 - `FollowValueKeyRefValueKeyRefValueKeyPrefixes { keys }` adds the matching deeper fan-out sibling, proving the same deeper chain can also terminate in visible prefix expansion without changing the contract.
 - `FollowValueKeyRefValueKeyRefValueKeyRefPrefixes { keys }` still exists as a stable named helper, but it now resolves through the generic linear chain mechanism instead of bespoke one-off nested logic.
 - The row contract now carries optional `source_key` provenance, which enabled the first true source-preserving join shape to land without another result-surface rewrite.
-- Next obvious Q2 extension is richer multi-frame provenance on top of the current single-frame provenance selector + branch-label controls, without weakening the explicit GPU fallback contract.
+- Next obvious Q2 extension is explicit frame-aware ordering on top of the new multi-frame provenance filter/projection surface, without weakening the explicit GPU fallback contract.
