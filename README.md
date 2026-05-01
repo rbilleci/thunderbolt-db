@@ -9,7 +9,7 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
 - WAL durability + queue watermarks (flushed, buffered, unflushed, pending depth/capacity, pending age/deadline), commit/apply/visibility lag gauges, explicit backlog/gap blocker flags, active transaction depth, and failover/admission readiness flags (`quiescent_for_failover`, `follower_promotion_ready`, `mutation_admission_saturated`)
 - Engine truth surface via `Engine::status_snapshot()` for served snapshot identity/frontier, active fallback reasons + parity rollups, and replication/readiness health
 - Engine telemetry snapshot + sink publication API for replication lag, durable WAL/snapshot frontier, write-path readiness/backlog state, and runtime metrics
-- Thin MVCC execution slice via `Engine::execute_mvcc_query()` covering snapshot-bound full scan / key lookup / key-batch fan-in / value→key reference expansion / value→key→prefix source-preserving expansion / value→key→value→key source-preserving chaining / value→key→value→prefix source-preserving chained fan-out, optional key-prefix/range or value-equality filtering, ordering, limit, and key/value or join-side source-value projection through the execution layer with explicit CPU fallback parity tracking (`GPU-123`)
+- Thin MVCC execution slice via `Engine::execute_mvcc_query()` covering snapshot-bound full scan / key lookup / key-batch fan-in / value→key reference expansion / value→key→prefix source-preserving expansion / value→key→value→key source-preserving chaining / value→key→value→prefix source-preserving chained fan-out, optional key-prefix/range or source-aware key/value filtering, source-aware ordering, limit, and key/value or join-side source-value projection through the execution layer with explicit CPU fallback parity tracking (`GPU-123`)
 - CPU-first reference engine skeleton
 - Device-aware execution abstractions
 
@@ -29,8 +29,10 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
   - `visibility.read_txn_id` selects the MVCC snapshot frontier
 - Supported filters:
   - `MvccReadFilter::KeyPrefix(prefix)`
+  - `MvccReadFilter::SourceKeyPrefix(prefix)`
   - `MvccReadFilter::KeyRange { start_inclusive, end_exclusive }`
   - `MvccReadFilter::ValueEquals(value)`
+  - `MvccReadFilter::SourceValueEquals(value)`
   - `MvccReadFilter::All([...])`
   - `MvccReadFilter::Any([...])`
 - Supported projections:
@@ -46,6 +48,10 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
   - `MvccReadOrder::KeyDesc`
   - `MvccReadOrder::ValueAsc`
   - `MvccReadOrder::ValueDesc`
+  - `MvccReadOrder::SourceKeyAsc`
+  - `MvccReadOrder::SourceKeyDesc`
+  - `MvccReadOrder::SourceValueAsc`
+  - `MvccReadOrder::SourceValueDesc`
 - Optional row cap:
   - `limit: Some(n)` applies after visibility + filter + ordering stages
 - Current device strategy:
@@ -55,7 +61,7 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
 - Deterministic workload fixture:
   - `tests/fixtures/mvcc-read-workload.txt`
 - Next obvious extension boundary:
-  - widen the join-adjacent slice further from the current source-preserving multi-hop reads plus seed-side value projection into richer relational composition (for example source-aware filters/order clauses or additional mixed result-shape controls) while preserving the same engine-facing contract and explicit fallback accounting on the eventual GPU-backed path.
+  - widen the join-adjacent slice further from the current source-preserving multi-hop reads plus seed-side projection/filter/order controls into richer relational composition (for example additional mixed result-shape controls or more explicit join-shape composition primitives) while preserving the same engine-facing contract and explicit fallback accounting on the eventual GPU-backed path.
 
 ## Quickstart
 

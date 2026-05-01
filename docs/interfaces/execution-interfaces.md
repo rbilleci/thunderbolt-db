@@ -31,15 +31,23 @@ Each physical plan node must include:
   - `MvccReadQuery.visibility.read_txn_id` chooses the MVCC snapshot used by storage visibility checks
 - Filter layer:
   - `KeyPrefix(prefix)`
+  - `SourceKeyPrefix(prefix)`
   - `KeyRange { start_inclusive, end_exclusive }`
   - `ValueEquals(value)`
+  - `SourceValueEquals(value)`
   - `All([filter...])`
   - `Any([filter...])`
+  - source-aware filter variants only match join-adjacent rows; scan/lookup-only shapes leave them empty rather than fabricating source state
 - Order layer:
   - `KeyAsc`
   - `KeyDesc`
   - `ValueAsc`
   - `ValueDesc`
+  - `SourceKeyAsc`
+  - `SourceKeyDesc`
+  - `SourceValueAsc`
+  - `SourceValueDesc`
+  - source-aware ordering variants sort empty/non-join rows deterministically using empty source fields and target key tie-breaks
 - Projection layer:
   - `KeyValue`
   - `KeyOnly`
@@ -67,4 +75,4 @@ Each physical plan node must include:
 - `FollowValueKeyRefValueKeyRefs { keys }` widens that source-preserving join surface into a deterministic three-hop chain, proving the current row contract can carry deeper relational composition without losing seed provenance or changing fallback semantics.
 - `FollowValueKeyRefValueKeyPrefixes { keys }` widens the same surface into a deterministic chained fan-out shape, proving the engine-facing contract still holds when the final hop expands to multiple visible rows.
 - The row contract now carries optional `source_key` provenance, which enabled the first true source-preserving join shape to land without another result-surface rewrite.
-- Next obvious Q2 extension is wider relational composition beyond the current chained fan-out + seed-side value projection surface (for example source-aware filters/order clauses or additional mixed result-shape controls) without weakening the explicit GPU fallback contract.
+- Next obvious Q2 extension is wider relational composition beyond the current chained fan-out + seed-side projection/filter/order surface (for example additional mixed result-shape controls or more explicit join-shape composition primitives) without weakening the explicit GPU fallback contract.

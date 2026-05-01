@@ -90,11 +90,13 @@ pub enum MvccReadSource {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MvccReadFilter {
     KeyPrefix(String),
+    SourceKeyPrefix(String),
     KeyRange {
         start_inclusive: String,
         end_exclusive: String,
     },
     ValueEquals(String),
+    SourceValueEquals(String),
     All(Vec<MvccReadFilter>),
     Any(Vec<MvccReadFilter>),
 }
@@ -105,6 +107,10 @@ pub enum MvccReadOrder {
     KeyDesc,
     ValueAsc,
     ValueDesc,
+    SourceKeyAsc,
+    SourceKeyDesc,
+    SourceValueAsc,
+    SourceValueDesc,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,6 +194,10 @@ fn mvcc_read_row_size(row: &MvccReadRow) -> u64 {
 fn mvcc_row_matches_filter(row: &ResolvedMvccRow, filter: &MvccReadFilter) -> bool {
     match filter {
         MvccReadFilter::KeyPrefix(prefix) => row.tuple.key.starts_with(prefix),
+        MvccReadFilter::SourceKeyPrefix(prefix) => row
+            .source_key
+            .as_ref()
+            .is_some_and(|source_key| source_key.starts_with(prefix)),
         MvccReadFilter::KeyRange {
             start_inclusive,
             end_exclusive,
@@ -196,6 +206,10 @@ fn mvcc_row_matches_filter(row: &ResolvedMvccRow, filter: &MvccReadFilter) -> bo
                 && row.tuple.key.as_str() < end_exclusive.as_str()
         }
         MvccReadFilter::ValueEquals(expected) => row.tuple.value == *expected,
+        MvccReadFilter::SourceValueEquals(expected) => row
+            .source_tuple
+            .as_ref()
+            .is_some_and(|source_tuple| source_tuple.value == *expected),
         MvccReadFilter::All(filters) => filters
             .iter()
             .all(|filter| mvcc_row_matches_filter(row, filter)),
@@ -222,6 +236,44 @@ fn mvcc_row_cmp(
             .tuple
             .value
             .cmp(&left.tuple.value)
+            .then_with(|| left.tuple.key.cmp(&right.tuple.key)),
+        MvccReadOrder::SourceKeyAsc => left
+            .source_key
+            .as_deref()
+            .unwrap_or("")
+            .cmp(right.source_key.as_deref().unwrap_or(""))
+            .then_with(|| left.tuple.key.cmp(&right.tuple.key)),
+        MvccReadOrder::SourceKeyDesc => right
+            .source_key
+            .as_deref()
+            .unwrap_or("")
+            .cmp(left.source_key.as_deref().unwrap_or(""))
+            .then_with(|| left.tuple.key.cmp(&right.tuple.key)),
+        MvccReadOrder::SourceValueAsc => left
+            .source_tuple
+            .as_ref()
+            .map(|tuple| tuple.value.as_str())
+            .unwrap_or("")
+            .cmp(
+                &right
+                    .source_tuple
+                    .as_ref()
+                    .map(|tuple| tuple.value.as_str())
+                    .unwrap_or(""),
+            )
+            .then_with(|| left.tuple.key.cmp(&right.tuple.key)),
+        MvccReadOrder::SourceValueDesc => right
+            .source_tuple
+            .as_ref()
+            .map(|tuple| tuple.value.as_str())
+            .unwrap_or("")
+            .cmp(
+                &left
+                    .source_tuple
+                    .as_ref()
+                    .map(|tuple| tuple.value.as_str())
+                    .unwrap_or(""),
+            )
             .then_with(|| left.tuple.key.cmp(&right.tuple.key)),
     }
 }
@@ -4097,6 +4149,177 @@ mod tests {
                 MvccReadRow {
                     source_key: None,
                     key: Some("acct:1".to_string()),
+                    value: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn execute_mvcc_query_supports_join_side_source_filters() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=profile:1").unwrap();
+        e.execute_text(2, "SET acct:2=profile:2").unwrap();
+        e.execute_text(3, "SET profile:1=team:alpha").unwrap();
+        e.execute_text(4, "SET profile:2=team:beta").unwrap();
+        e.execute_text(5, "SET team:alpha:1=Alice").unwrap();
+        e.execute_text(6, "SET team:alpha:2=Ally").unwrap();
+        e.execute_text(7, "SET team:beta:1=Bob").unwrap();
+        e.execute_text(8, "SET team:beta:2=Bianca").unwrap();
+
+        let result = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FollowValueKeyRefPrefixes {
+                    keys: vec!["acct:2".to_string(), "acct:1".to_string()],
+                },
+                visibility: StorageVisibility { read_txn_id: 8 },
+                filter: Some(MvccReadFilter::All(vec![
+                    MvccReadFilter::SourceKeyPrefix("acct:1".to_string()),
+                    MvccReadFilter::SourceValueEquals("profile:1".to_string()),
+                    MvccReadFilter::KeyPrefix("team:alpha".to_string()),
+                ])),
+                order: Some(MvccReadOrder::KeyDesc),
+                projection: MvccProjection::TargetKeySourceValue,
+                limit: Some(1),
+            })
+            .unwrap();
+
+        assert_eq!(
+            result.rows,
+            vec![MvccReadRow {
+                source_key: Some("acct:1".to_string()),
+                key: Some("team:alpha:2".to_string()),
+                value: Some("profile:1".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn execute_mvcc_query_source_filters_are_empty_for_non_join_shapes() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=open").unwrap();
+        e.execute_text(2, "SET acct:2=locked").unwrap();
+
+        let result = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FullScan,
+                visibility: StorageVisibility { read_txn_id: 2 },
+                filter: Some(MvccReadFilter::SourceValueEquals("open".to_string())),
+                order: Some(MvccReadOrder::KeyAsc),
+                projection: MvccProjection::KeyValue,
+                limit: None,
+            })
+            .unwrap();
+
+        assert!(result.rows.is_empty());
+    }
+
+    #[test]
+    fn execute_mvcc_query_supports_join_side_source_ordering() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:2=profile:2").unwrap();
+        e.execute_text(2, "SET acct:1=profile:1").unwrap();
+        e.execute_text(3, "SET profile:1=team:alpha").unwrap();
+        e.execute_text(4, "SET profile:2=team:beta").unwrap();
+        e.execute_text(5, "SET team:alpha:1=Alice").unwrap();
+        e.execute_text(6, "SET team:beta:1=Bob").unwrap();
+        e.execute_text(7, "SET team:alpha:2=Ally").unwrap();
+        e.execute_text(8, "SET team:beta:2=Bianca").unwrap();
+
+        let source_key_ordered = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FollowValueKeyRefPrefixes {
+                    keys: vec!["acct:2".to_string(), "acct:1".to_string()],
+                },
+                visibility: StorageVisibility { read_txn_id: 8 },
+                filter: None,
+                order: Some(MvccReadOrder::SourceKeyAsc),
+                projection: MvccProjection::TargetKeySourceValue,
+                limit: Some(3),
+            })
+            .unwrap();
+
+        assert_eq!(
+            source_key_ordered.rows,
+            vec![
+                MvccReadRow {
+                    source_key: Some("acct:1".to_string()),
+                    key: Some("team:alpha:1".to_string()),
+                    value: Some("profile:1".to_string()),
+                },
+                MvccReadRow {
+                    source_key: Some("acct:1".to_string()),
+                    key: Some("team:alpha:2".to_string()),
+                    value: Some("profile:1".to_string()),
+                },
+                MvccReadRow {
+                    source_key: Some("acct:2".to_string()),
+                    key: Some("team:beta:1".to_string()),
+                    value: Some("profile:2".to_string()),
+                },
+            ]
+        );
+
+        let source_value_ordered = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FollowValueKeyRefPrefixes {
+                    keys: vec!["acct:1".to_string(), "acct:2".to_string()],
+                },
+                visibility: StorageVisibility { read_txn_id: 8 },
+                filter: None,
+                order: Some(MvccReadOrder::SourceValueDesc),
+                projection: MvccProjection::TargetKeySourceValue,
+                limit: Some(2),
+            })
+            .unwrap();
+
+        assert_eq!(
+            source_value_ordered.rows,
+            vec![
+                MvccReadRow {
+                    source_key: Some("acct:2".to_string()),
+                    key: Some("team:beta:1".to_string()),
+                    value: Some("profile:2".to_string()),
+                },
+                MvccReadRow {
+                    source_key: Some("acct:2".to_string()),
+                    key: Some("team:beta:2".to_string()),
+                    value: Some("profile:2".to_string()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn execute_mvcc_query_source_ordering_keeps_non_join_shapes_stable() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:2=locked").unwrap();
+        e.execute_text(2, "SET acct:1=open").unwrap();
+
+        let result = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::KeyBatchLookup {
+                    keys: vec!["acct:1".to_string(), "acct:2".to_string()],
+                },
+                visibility: StorageVisibility { read_txn_id: 2 },
+                filter: None,
+                order: Some(MvccReadOrder::SourceKeyDesc),
+                projection: MvccProjection::KeyOnly,
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            result.rows,
+            vec![
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("acct:1".to_string()),
+                    value: None,
+                },
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("acct:2".to_string()),
                     value: None,
                 },
             ]

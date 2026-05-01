@@ -3,6 +3,12 @@
 ## 2026-05-01
 
 ### Completed
+- Extended the engine-facing MVCC bootstrap slice with `SourceKeyAsc` / `SourceKeyDesc` / `SourceValueAsc` / `SourceValueDesc`, so join-adjacent reads can now sort by original seed provenance/value while preserving deterministic target-key tie-breaks and the same explicit GPU-first fallback contract.
+- Added end-to-end engine regression coverage proving the new source-aware ordering composes with join-side projection and post-order limit while keeping non-join shapes deterministic under empty-source semantics.
+- Reconciled README/execution/roadmap docs so the Q2 truth surface now includes source-aware join ordering and the next extension boundary narrows to richer mixed result-shape or explicit join-composition controls.
+- Extended the engine-facing MVCC bootstrap slice with `SourceKeyPrefix` / `SourceValueEquals` filters, so join-adjacent reads can now constrain target rows using original seed provenance/value without changing the result contract or weakening the explicit GPU-first fallback accounting.
+- Added end-to-end engine regression coverage proving the new source-aware filters compose with chained fan-out, ordering, limit, and join-side projection while remaining empty on non-join shapes instead of fabricating source state.
+- Reconciled README/execution/roadmap docs so the Q2 truth surface now includes source-aware join filtering and the next extension boundary narrows to source-aware ordering or other mixed result-shape controls.
 - Extended the engine-facing MVCC bootstrap slice with `MvccProjection::TargetKeySourceValue`, so join-adjacent reads can now preserve the resolved target key while projecting the original seed row's value through the existing result contract instead of forcing target-only output shapes.
 - Added end-to-end engine regression coverage proving the new join-side projection composes deterministically with source-preserving chained fan-out, order, and limit, while keeping non-join lookup shapes stable under the same projection enum.
 - Reconciled README/execution/roadmap docs so the Q2 truth surface now includes seed-side value projection and the next extension boundary narrows to source-aware filters/order or other mixed result-shape controls.
