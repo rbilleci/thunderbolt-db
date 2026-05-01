@@ -34,6 +34,9 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
   - `MvccProjection::KeyValue`
   - `MvccProjection::KeyOnly`
   - `MvccProjection::ValueOnly`
+- Result row shape:
+  - `MvccReadRow { source_key, key, value }`
+  - `source_key` is populated for join-adjacent expansion sources so future source-preserving joins can keep seed provenance visible without changing the engine-facing result contract again.
 - Supported ordering:
   - `MvccReadOrder::KeyAsc`
   - `MvccReadOrder::KeyDesc`

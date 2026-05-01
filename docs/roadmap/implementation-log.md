@@ -3,6 +3,7 @@
 ## 2026-04-30
 
 ### Completed
+- Added optional `source_key` provenance to `MvccReadRow`, so join-adjacent expansion reads now expose which seed key produced each visible row; this is the small interface prerequisite for future source-preserving joins without another result-shape rewrite.
 - Extended the engine-facing MVCC bootstrap slice with `FollowValueKeyPrefixes { keys }`, widening the join-adjacent read surface from single target lookups to deterministic prefix-driven fan-out expansion while preserving seed request order, lexicographic target order within each seed, and the same filter/order/limit/projection pipeline.
 - Added end-to-end engine regression coverage proving the prefix-driven source skips missing seeds cleanly, preserves deterministic fan-out behavior under duplicates, and still composes through downstream filter/order/limit stages.
 - Reconciled README/execution/roadmap docs so the Q2 truth surface now includes prefix-driven foreign-key expansion and the next boundary narrows to source-preserving joins.

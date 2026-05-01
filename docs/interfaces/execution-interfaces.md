@@ -41,6 +41,9 @@ Each physical plan node must include:
   - `KeyValue`
   - `KeyOnly`
   - `ValueOnly`
+- Result row contract:
+  - `MvccReadRow { source_key, key, value }`
+  - `source_key` is `None` for scan/lookup shapes and populated for join-adjacent expansion rows so source provenance survives the current CPU reference pipeline.
 - Optional row cap:
   - `limit = Some(n)` applies after visibility + filter + ordering stages
 - Current execution/device contract:
@@ -56,4 +59,5 @@ Each physical plan node must include:
 - `KeyBatchLookup { keys }` is the first multi-source bootstrap shape; it fans multiple point lookups into the same execution pipeline while preserving request order until an explicit order clause overrides it.
 - `FollowValueKeyRefs { keys }` is the first join-adjacent bootstrap shape; it performs a deterministic two-stage value→key expansion while preserving request order, skipping missing seed/target rows, and then composes through the same filter/order/limit pipeline.
 - `FollowValueKeyPrefixes { keys }` widens that join-adjacent slice into prefix-driven fan-out expansion while still preserving seed request order, lexicographic target order within each seed, and clean skip behavior for missing seeds or empty expansions.
+- The row contract now carries optional `source_key` provenance, which is the small prerequisite needed before a true source-preserving join shape can land without another result-surface rewrite.
 - Next obvious Q2 extension is wider relational composition (for example source-preserving joins) without weakening the explicit GPU fallback contract.
