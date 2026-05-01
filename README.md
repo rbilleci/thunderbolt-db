@@ -21,6 +21,7 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
   - `MvccReadSource::KeyLookup { key }`
   - `MvccReadSource::KeyBatchLookup { keys }` (fan-in multi-source lookup; preserves request order before downstream filter/order/limit)
   - `MvccReadSource::FollowValueKeyRefs { keys }` (join-adjacent foreign-key-style expansion from seed row values to referenced keys)
+  - `MvccReadSource::FollowValueKeyPrefixes { keys }` (prefix-driven foreign-key-style expansion from seed row values to visible target-key ranges)
 - Supported snapshot rule:
   - `visibility.read_txn_id` selects the MVCC snapshot frontier
 - Supported filters:
@@ -47,7 +48,7 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
 - Deterministic workload fixture:
   - `tests/fixtures/mvcc-read-workload.txt`
 - Next obvious extension boundary:
-  - widen the new join-adjacent slice toward source-preserving joins or prefix-driven foreign-key expansion while preserving the same engine-facing contract and explicit fallback accounting on the eventual GPU-backed path.
+  - widen the new join-adjacent slice toward source-preserving joins while preserving the same engine-facing contract and explicit fallback accounting on the eventual GPU-backed path.
 
 ## Quickstart
 

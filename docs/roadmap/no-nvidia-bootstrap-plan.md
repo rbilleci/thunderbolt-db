@@ -162,8 +162,8 @@ Acceptance criteria:
 Notes:
 - Favor a complete thin slice over broad unfinished operator scaffolding.
 - This should make the engine visibly more capable, not just more internally prepared.
-- Current bootstrap truth: the engine-facing MVCC slice now supports full scans + single-key lookups + key-batch fan-in lookups + value→key reference expansion with snapshot visibility, prefix/value/composite/range filters, key/value ordering, projection, and post-order limit under an explicit `GpuMvccReadParityGap` fallback contract.
-- Next obvious extension boundary: widen the new join-adjacent slice toward source-preserving joins or prefix-driven foreign-key expansion without weakening the explicit fallback contract.
+- Current bootstrap truth: the engine-facing MVCC slice now supports full scans + single-key lookups + key-batch fan-in lookups + value→key reference expansion + value→key-prefix expansion with snapshot visibility, prefix/value/composite/range filters, key/value ordering, projection, and post-order limit under an explicit `GpuMvccReadParityGap` fallback contract.
+- Next obvious extension boundary: widen the new join-adjacent slice toward source-preserving joins without weakening the explicit fallback contract.
 
 ### Q3. Replication semantics hardening under stress
 Priority: highest

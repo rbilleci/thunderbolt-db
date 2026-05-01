@@ -23,6 +23,7 @@ Each physical plan node must include:
   - `KeyLookup { key }`
   - `KeyBatchLookup { keys }` (fan-in multi-source lookup; preserves request order before downstream filter/order/limit)
   - `FollowValueKeyRefs { keys }` (join-adjacent foreign-key-style expansion; for each visible seed key in request order, look up the visible target row whose key matches the seed row's value)
+  - `FollowValueKeyPrefixes { keys }` (prefix-driven foreign-key-style expansion; for each visible seed key in request order, expand all visible target rows whose keys share the seed row's value as a prefix)
 - Snapshot binding:
   - `MvccReadQuery.visibility.read_txn_id` chooses the MVCC snapshot used by storage visibility checks
 - Filter layer:
@@ -54,4 +55,5 @@ Each physical plan node must include:
 - Supported range semantics are lexicographic `KeyRange { start_inclusive, end_exclusive }` filters.
 - `KeyBatchLookup { keys }` is the first multi-source bootstrap shape; it fans multiple point lookups into the same execution pipeline while preserving request order until an explicit order clause overrides it.
 - `FollowValueKeyRefs { keys }` is the first join-adjacent bootstrap shape; it performs a deterministic two-stage value→key expansion while preserving request order, skipping missing seed/target rows, and then composes through the same filter/order/limit pipeline.
-- Next obvious Q2 extension is wider relational composition (for example source-preserving joins or prefix-driven foreign-key expansion) without weakening the explicit GPU fallback contract.
+- `FollowValueKeyPrefixes { keys }` widens that join-adjacent slice into prefix-driven fan-out expansion while still preserving seed request order, lexicographic target order within each seed, and clean skip behavior for missing seeds or empty expansions.
+- Next obvious Q2 extension is wider relational composition (for example source-preserving joins) without weakening the explicit GPU fallback contract.

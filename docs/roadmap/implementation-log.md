@@ -3,6 +3,9 @@
 ## 2026-04-30
 
 ### Completed
+- Extended the engine-facing MVCC bootstrap slice with `FollowValueKeyPrefixes { keys }`, widening the join-adjacent read surface from single target lookups to deterministic prefix-driven fan-out expansion while preserving seed request order, lexicographic target order within each seed, and the same filter/order/limit/projection pipeline.
+- Added end-to-end engine regression coverage proving the prefix-driven source skips missing seeds cleanly, preserves deterministic fan-out behavior under duplicates, and still composes through downstream filter/order/limit stages.
+- Reconciled README/execution/roadmap docs so the Q2 truth surface now includes prefix-driven foreign-key expansion and the next boundary narrows to source-preserving joins.
 - Extended the engine-facing MVCC bootstrap slice with `FollowValueKeyRefs { keys }`, a narrow join-adjacent value→key expansion shape that turns visible seed row values into second-stage MVCC key lookups while preserving request order, skipping missing seed/target rows cleanly, and reusing the existing filter/order/limit/projection execution pipeline.
 - Added end-to-end engine regression coverage proving the join-adjacent source composes through the same pipeline and preserves deterministic behavior under duplicates, filtering, ordering, and limit.
 - Reconciled README/execution/roadmap docs so the Q2 truth surface now includes its first join-adjacent relational slice and the next boundary narrows to wider source-preserving join shapes.
@@ -21,7 +24,7 @@
 - None in-repo.
 
 ### Next loops
-1. Move to Q4 (`psql` compatibility suite) as the next highest open roadmap item now that Q1-Q3 are complete.
+1. Continue the post-Q2 execution widening track with source-preserving joins or another clearly smaller prerequisite slice, while keeping the same explicit GPU fallback contract.
 2. Preserve the Q3 semantic envelope as a locked baseline; only reopen it for a real contradiction or a newly discovered semantic category.
 3. Keep the standard validation gate green on each follow-on milestone.
 

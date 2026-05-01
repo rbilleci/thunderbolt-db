@@ -81,6 +81,7 @@ pub enum MvccReadSource {
     KeyLookup { key: String },
     KeyBatchLookup { keys: Vec<String> },
     FollowValueKeyRefs { keys: Vec<String> },
+    FollowValueKeyPrefixes { keys: Vec<String> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -248,6 +249,20 @@ fn resolve_mvcc_source(
                 if let Some(seed) = store.tuple_fetch_by_key(key, visibility)? {
                     if let Some(target) = store.tuple_fetch_by_key(&seed.value, visibility)? {
                         rows.push(target);
+                    }
+                }
+            }
+            Ok(rows)
+        }
+        MvccReadSource::FollowValueKeyPrefixes { keys } => {
+            let mut rows = Vec::new();
+            for key in keys {
+                if let Some(seed) = store.tuple_fetch_by_key(key, visibility)? {
+                    let mut cursor = store.seq_scan_open(visibility)?;
+                    while let Some(tuple) = cursor.next() {
+                        if tuple.key.starts_with(&seed.value) {
+                            rows.push(tuple);
+                        }
                     }
                 }
             }
@@ -3515,6 +3530,91 @@ mod tests {
                 },
                 MvccReadRow {
                     key: Some("profile:3".to_string()),
+                    value: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn execute_mvcc_query_supports_follow_value_key_prefixes_source() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=order:1:").unwrap();
+        e.execute_text(2, "SET acct:2=order:2:").unwrap();
+        e.execute_text(3, "SET order:1:a=paid").unwrap();
+        e.execute_text(4, "SET order:1:b=packed").unwrap();
+        e.execute_text(5, "SET order:2:a=queued").unwrap();
+        e.execute_text(6, "SET order:3:a=orphan").unwrap();
+        e.execute_text(7, "SET acct:3=missing:").unwrap();
+        e.execute_text(8, "SET acct:1=order:1b:").unwrap();
+        e.execute_text(9, "SET order:1b:a=shipped").unwrap();
+        e.execute_text(10, "SET order:1b:b=delivered").unwrap();
+
+        let request_order = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FollowValueKeyPrefixes {
+                    keys: vec![
+                        "acct:2".to_string(),
+                        "acct:1".to_string(),
+                        "missing".to_string(),
+                        "acct:3".to_string(),
+                    ],
+                },
+                visibility: StorageVisibility { read_txn_id: 10 },
+                filter: None,
+                order: None,
+                projection: MvccProjection::KeyValue,
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            request_order.rows,
+            vec![
+                MvccReadRow {
+                    key: Some("order:2:a".to_string()),
+                    value: Some("queued".to_string()),
+                },
+                MvccReadRow {
+                    key: Some("order:1b:a".to_string()),
+                    value: Some("shipped".to_string()),
+                },
+                MvccReadRow {
+                    key: Some("order:1b:b".to_string()),
+                    value: Some("delivered".to_string()),
+                },
+            ]
+        );
+
+        let filtered_and_sorted = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FollowValueKeyPrefixes {
+                    keys: vec![
+                        "acct:1".to_string(),
+                        "acct:2".to_string(),
+                        "acct:1".to_string(),
+                    ],
+                },
+                visibility: StorageVisibility { read_txn_id: 10 },
+                filter: Some(MvccReadFilter::Any(vec![
+                    MvccReadFilter::ValueEquals("delivered".to_string()),
+                    MvccReadFilter::ValueEquals("queued".to_string()),
+                ])),
+                order: Some(MvccReadOrder::ValueAsc),
+                projection: MvccProjection::KeyOnly,
+                limit: Some(2),
+            })
+            .unwrap();
+
+        assert_eq!(
+            filtered_and_sorted.rows,
+            vec![
+                MvccReadRow {
+                    key: Some("order:1b:b".to_string()),
+                    value: None,
+                },
+                MvccReadRow {
+                    key: Some("order:1b:b".to_string()),
                     value: None,
                 },
             ]
