@@ -3,6 +3,9 @@
 ## 2026-05-01
 
 ### Completed
+- Extended `MvccReadSource::FollowValueChainBranches { keys, plans, fan_in }` with explicit per-seed branch fan-in control so the engine can now either emit every branch in seed-major order (`AllBranches`) or stop at the first branch that resolves any visible rows for a seed (`FirstNonEmptyBranch`) without changing the `MvccReadRow { source_key, key, value }` contract or the explicit `GpuMvccReadParityGap` fallback semantics.
+- Added engine regression coverage proving `FirstNonEmptyBranch` skips later branches once an earlier branch resolves rows, falls through cleanly when an earlier branch is empty, and still composes with the same downstream filter/order/projection pipeline as `AllBranches`.
+- Reconciled README/execution/roadmap docs so the Q2 truth surface now records explicit branch fan-in policies and narrows the next extension boundary toward richer source-provenance controls.
 - Added `MvccReadSource::FollowValueChainBranches { keys, plans }`, the first explicit branch-form nested-join helper: for each visible seed key in request order, the engine now resolves multiple linear value→key plans in branch-list order before moving to the next seed, preserving source provenance and the same explicit `GpuMvccReadParityGap` fallback contract.
 - Added engine regression coverage proving the new branch helper keeps branch results grouped per seed (unlike a plain `Concat` over multiple chains), skips missing seeds/intermediates cleanly, and still composes with downstream filter/order/projection under duplicate seeds.
 - Reconciled README/execution/roadmap docs so the Q2 truth surface now records the first generic branch-form nested join and narrows the next extension boundary toward explicit fan-in policies or richer provenance controls.

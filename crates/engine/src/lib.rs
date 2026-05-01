@@ -115,6 +115,7 @@ pub enum MvccReadSource {
     FollowValueChainBranches {
         keys: Vec<String>,
         plans: Vec<MvccValueChainPlan>,
+        fan_in: MvccValueChainBranchFanIn,
     },
     FollowValueKeyRefs {
         keys: Vec<String>,
@@ -155,6 +156,12 @@ pub enum MvccValueChainTerminal {
 pub struct MvccValueChainPlan {
     pub value_key_hops: usize,
     pub terminal: MvccValueChainTerminal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MvccValueChainBranchFanIn {
+    AllBranches,
+    FirstNonEmptyBranch,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -462,16 +469,31 @@ fn resolve_follow_value_chain_branches(
     keys: &[String],
     visibility: StorageVisibility,
     plans: &[MvccValueChainPlan],
+    fan_in: MvccValueChainBranchFanIn,
 ) -> Result<Vec<ResolvedMvccRow>, StorageError> {
     let mut rows = Vec::new();
     for key in keys {
         let Some(seed) = store.tuple_fetch_by_key(key, visibility)? else {
             continue;
         };
-        for plan in plans {
-            rows.extend(resolve_follow_value_chain_from_seed(
-                store, key, &seed, visibility, *plan,
-            )?);
+        match fan_in {
+            MvccValueChainBranchFanIn::AllBranches => {
+                for plan in plans {
+                    rows.extend(resolve_follow_value_chain_from_seed(
+                        store, key, &seed, visibility, *plan,
+                    )?);
+                }
+            }
+            MvccValueChainBranchFanIn::FirstNonEmptyBranch => {
+                for plan in plans {
+                    let branch_rows =
+                        resolve_follow_value_chain_from_seed(store, key, &seed, visibility, *plan)?;
+                    if !branch_rows.is_empty() {
+                        rows.extend(branch_rows);
+                        break;
+                    }
+                }
+            }
         }
     }
     Ok(rows)
@@ -735,9 +757,11 @@ fn resolve_mvcc_source(
         MvccReadSource::FollowValueChain { keys, plan } => {
             resolve_follow_value_chain(store, keys, visibility, *plan)
         }
-        MvccReadSource::FollowValueChainBranches { keys, plans } => {
-            resolve_follow_value_chain_branches(store, keys, visibility, plans)
-        }
+        MvccReadSource::FollowValueChainBranches {
+            keys,
+            plans,
+            fan_in,
+        } => resolve_follow_value_chain_branches(store, keys, visibility, plans, *fan_in),
         MvccReadSource::FollowValueKeyRefs { keys } => resolve_follow_value_chain(
             store,
             keys,
@@ -5344,6 +5368,7 @@ mod tests {
                             terminal: MvccValueChainTerminal::CurrentValuePrefixes,
                         },
                     ],
+                    fan_in: MvccValueChainBranchFanIn::AllBranches,
                 },
                 visibility: StorageVisibility { read_txn_id: 9 },
                 filter: None,
@@ -5480,6 +5505,7 @@ mod tests {
                             terminal: MvccValueChainTerminal::CurrentRow,
                         },
                     ],
+                    fan_in: MvccValueChainBranchFanIn::AllBranches,
                 },
                 visibility: StorageVisibility { read_txn_id: 9 },
                 filter: Some(MvccReadFilter::Any(vec![
@@ -5509,6 +5535,155 @@ mod tests {
                     source_key: Some("acct:1".to_string()),
                     key: Some("acct:1".to_string()),
                     value: Some("Ally".to_string()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn execute_mvcc_query_supports_follow_value_chain_branch_first_non_empty_fan_in() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=profile:1").unwrap();
+        e.execute_text(2, "SET acct:2=profile:2").unwrap();
+        e.execute_text(3, "SET acct:3=missing-profile").unwrap();
+        e.execute_text(4, "SET acct:4=profile:4").unwrap();
+        e.execute_text(5, "SET profile:1=team:alpha").unwrap();
+        e.execute_text(6, "SET profile:2=team:beta").unwrap();
+        e.execute_text(7, "SET profile:4=team:delta").unwrap();
+        e.execute_text(8, "SET team:alpha:1=Alice").unwrap();
+        e.execute_text(9, "SET team:alpha:2=Ally").unwrap();
+        e.execute_text(10, "SET team:beta:1=Bob").unwrap();
+        e.execute_text(11, "SET team:delta:1=Dora").unwrap();
+
+        let first_non_empty = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FollowValueChainBranches {
+                    keys: vec![
+                        "acct:3".to_string(),
+                        "acct:2".to_string(),
+                        "acct:1".to_string(),
+                        "acct:4".to_string(),
+                    ],
+                    plans: vec![
+                        MvccValueChainPlan {
+                            value_key_hops: 1,
+                            terminal: MvccValueChainTerminal::CurrentValuePrefixes,
+                        },
+                        MvccValueChainPlan {
+                            value_key_hops: 1,
+                            terminal: MvccValueChainTerminal::CurrentRow,
+                        },
+                    ],
+                    fan_in: MvccValueChainBranchFanIn::FirstNonEmptyBranch,
+                },
+                visibility: StorageVisibility { read_txn_id: 11 },
+                filter: None,
+                order: None,
+                projection: MvccProjection::SourceKeyTargetValue,
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            first_non_empty.rows,
+            vec![
+                MvccReadRow {
+                    source_key: Some("acct:2".to_string()),
+                    key: Some("acct:2".to_string()),
+                    value: Some("Bob".to_string()),
+                },
+                MvccReadRow {
+                    source_key: Some("acct:1".to_string()),
+                    key: Some("acct:1".to_string()),
+                    value: Some("Alice".to_string()),
+                },
+                MvccReadRow {
+                    source_key: Some("acct:1".to_string()),
+                    key: Some("acct:1".to_string()),
+                    value: Some("Ally".to_string()),
+                },
+                MvccReadRow {
+                    source_key: Some("acct:4".to_string()),
+                    key: Some("acct:4".to_string()),
+                    value: Some("Dora".to_string()),
+                },
+            ]
+        );
+
+        let all_branches = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FollowValueChainBranches {
+                    keys: vec![
+                        "acct:3".to_string(),
+                        "acct:2".to_string(),
+                        "acct:1".to_string(),
+                        "acct:4".to_string(),
+                    ],
+                    plans: vec![
+                        MvccValueChainPlan {
+                            value_key_hops: 1,
+                            terminal: MvccValueChainTerminal::CurrentValuePrefixes,
+                        },
+                        MvccValueChainPlan {
+                            value_key_hops: 1,
+                            terminal: MvccValueChainTerminal::CurrentRow,
+                        },
+                    ],
+                    fan_in: MvccValueChainBranchFanIn::AllBranches,
+                },
+                visibility: StorageVisibility { read_txn_id: 11 },
+                filter: Some(MvccReadFilter::Any(vec![
+                    MvccReadFilter::ValueEquals("team:alpha".to_string()),
+                    MvccReadFilter::ValueEquals("team:beta".to_string()),
+                    MvccReadFilter::ValueEquals("team:delta".to_string()),
+                    MvccReadFilter::ValueEquals("Alice".to_string()),
+                    MvccReadFilter::ValueEquals("Ally".to_string()),
+                    MvccReadFilter::ValueEquals("Bob".to_string()),
+                    MvccReadFilter::ValueEquals("Dora".to_string()),
+                ])),
+                order: Some(MvccReadOrder::SourceKeyAsc),
+                projection: MvccProjection::SourceKeyTargetValue,
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            all_branches.rows,
+            vec![
+                MvccReadRow {
+                    source_key: Some("acct:1".to_string()),
+                    key: Some("acct:1".to_string()),
+                    value: Some("team:alpha".to_string()),
+                },
+                MvccReadRow {
+                    source_key: Some("acct:1".to_string()),
+                    key: Some("acct:1".to_string()),
+                    value: Some("Alice".to_string()),
+                },
+                MvccReadRow {
+                    source_key: Some("acct:1".to_string()),
+                    key: Some("acct:1".to_string()),
+                    value: Some("Ally".to_string()),
+                },
+                MvccReadRow {
+                    source_key: Some("acct:2".to_string()),
+                    key: Some("acct:2".to_string()),
+                    value: Some("team:beta".to_string()),
+                },
+                MvccReadRow {
+                    source_key: Some("acct:2".to_string()),
+                    key: Some("acct:2".to_string()),
+                    value: Some("Bob".to_string()),
+                },
+                MvccReadRow {
+                    source_key: Some("acct:4".to_string()),
+                    key: Some("acct:4".to_string()),
+                    value: Some("team:delta".to_string()),
+                },
+                MvccReadRow {
+                    source_key: Some("acct:4".to_string()),
+                    key: Some("acct:4".to_string()),
+                    value: Some("Dora".to_string()),
                 },
             ]
         );
