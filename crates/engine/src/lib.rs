@@ -83,6 +83,7 @@ pub enum MvccReadSource {
     Concat { sources: Vec<MvccReadSource> },
     ConcatDistinct { sources: Vec<MvccReadSource> },
     IntersectDistinct { sources: Vec<MvccReadSource> },
+    ExceptDistinct { sources: Vec<MvccReadSource> },
     FollowValueKeyRefs { keys: Vec<String> },
     FollowValueKeyPrefixes { keys: Vec<String> },
     FollowValueKeyRefPrefixes { keys: Vec<String> },
@@ -425,6 +426,37 @@ fn resolve_mvcc_source(
                 intersection.push(row);
             }
             Ok(intersection)
+        }
+        MvccReadSource::ExceptDistinct { sources } => {
+            let mut sources_iter = sources.iter();
+            let Some(first_source) = sources_iter.next() else {
+                return Ok(Vec::new());
+            };
+
+            let first_rows = resolve_mvcc_source(store, first_source, visibility)?;
+            let exclusion_set = sources_iter
+                .map(|source| {
+                    resolve_mvcc_source(store, source, visibility).map(|rows| {
+                        rows.into_iter()
+                            .map(|row| resolved_mvcc_row_key(&row))
+                            .collect::<BTreeSet<_>>()
+                    })
+                })
+                .collect::<Result<Vec<_>, StorageError>>()?
+                .into_iter()
+                .flatten()
+                .collect::<BTreeSet<_>>();
+
+            let mut difference = Vec::new();
+            let mut emitted = BTreeSet::new();
+            for row in first_rows {
+                let key = resolved_mvcc_row_key(&row);
+                if !emitted.insert(key.clone()) || exclusion_set.contains(&key) {
+                    continue;
+                }
+                difference.push(row);
+            }
+            Ok(difference)
         }
         MvccReadSource::FollowValueKeyRefs { keys } => {
             let mut rows = Vec::new();
@@ -4019,6 +4051,101 @@ mod tests {
                 key: Some("team:alpha:1".to_string()),
                 value: Some("profile:3".to_string()),
             }]
+        );
+    }
+
+    #[test]
+    fn execute_mvcc_query_supports_except_distinct_source_composition() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=profile:1").unwrap();
+        e.execute_text(2, "SET acct:2=profile:2").unwrap();
+        e.execute_text(3, "SET acct:3=profile:3").unwrap();
+        e.execute_text(4, "SET profile:1=team:alpha").unwrap();
+        e.execute_text(5, "SET profile:2=team:beta").unwrap();
+        e.execute_text(6, "SET profile:3=team:alpha").unwrap();
+        e.execute_text(7, "SET team:alpha:1=Alice").unwrap();
+        e.execute_text(8, "SET team:alpha:2=Ally").unwrap();
+        e.execute_text(9, "SET team:beta:1=Bob").unwrap();
+        e.execute_text(10, "SET user:1=active").unwrap();
+        e.execute_text(11, "SET user:2=locked").unwrap();
+
+        let exact_difference = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::ExceptDistinct {
+                    sources: vec![
+                        MvccReadSource::Concat {
+                            sources: vec![
+                                MvccReadSource::KeyBatchLookup {
+                                    keys: vec![
+                                        "user:1".to_string(),
+                                        "user:2".to_string(),
+                                        "acct:2".to_string(),
+                                    ],
+                                },
+                                MvccReadSource::KeyLookup {
+                                    key: "user:1".to_string(),
+                                },
+                            ],
+                        },
+                        MvccReadSource::KeyBatchLookup {
+                            keys: vec!["user:1".to_string(), "acct:2".to_string()],
+                        },
+                    ],
+                },
+                visibility: StorageVisibility { read_txn_id: 11 },
+                filter: None,
+                order: None,
+                projection: MvccProjection::KeyOnly,
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            exact_difference.rows,
+            vec![MvccReadRow {
+                source_key: None,
+                key: Some("user:2".to_string()),
+                value: None,
+            }]
+        );
+
+        let source_sensitive_difference = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::ExceptDistinct {
+                    sources: vec![
+                        MvccReadSource::FollowValueKeyRefPrefixes {
+                            keys: vec!["acct:1".to_string(), "acct:3".to_string()],
+                        },
+                        MvccReadSource::FollowValueKeyRefPrefixes {
+                            keys: vec!["acct:3".to_string()],
+                        },
+                    ],
+                },
+                visibility: StorageVisibility { read_txn_id: 11 },
+                filter: Some(MvccReadFilter::Any(vec![
+                    MvccReadFilter::ValueEquals("Alice".to_string()),
+                    MvccReadFilter::ValueEquals("Ally".to_string()),
+                ])),
+                order: Some(MvccReadOrder::SourceKeyAsc),
+                projection: MvccProjection::TargetKeySourceValue,
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            source_sensitive_difference.rows,
+            vec![
+                MvccReadRow {
+                    source_key: Some("acct:1".to_string()),
+                    key: Some("team:alpha:1".to_string()),
+                    value: Some("profile:1".to_string()),
+                },
+                MvccReadRow {
+                    source_key: Some("acct:1".to_string()),
+                    key: Some("team:alpha:2".to_string()),
+                    value: Some("profile:1".to_string()),
+                },
+            ]
         );
     }
 
