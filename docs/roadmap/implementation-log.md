@@ -3,6 +3,9 @@
 ## 2026-05-01
 
 ### Completed
+- Extended the engine-facing MVCC bootstrap slice with `MvccReadSource::ExceptAll { sources }`, an ordered multiset subtraction primitive: the engine now preserves first-source order while subtracting exact resolved-row identity multiplicity contributed by the remaining subsources, with source provenance treated as part of identity.
+- Added end-to-end engine regression coverage proving `ExceptAll` subtracts exact non-join multiplicity one-for-one, preserves join-row multiplicity only when source provenance also matches, and still composes with source-aware filters/order clauses plus join-side projection under the existing fallback contract.
+- Reconciled README/execution/roadmap docs so the Q2 truth surface now includes the first multiset subtraction primitive and the next extension boundary narrows toward multiset symmetric-difference semantics or deeper join-composition helpers beyond the current distinct/multiset pairings.
 - Extended the engine-facing MVCC bootstrap slice with `MvccReadSource::IntersectAll { sources }`, the first ordered multiset helper: the engine now preserves first-source order while emitting each exact resolved-row identity up to the minimum count shared across subsources, with source provenance treated as part of identity.
 - Added end-to-end engine regression coverage proving `IntersectAll` respects multiplicity caps for exact non-join overlap, preserves multiplicity for join rows only when source provenance also matches, and still composes with source-aware filters/order clauses plus join-side projection under the existing fallback contract.
 - Reconciled README/execution/roadmap docs so the Q2 truth surface now includes the first ordered multiset helper and the next extension boundary narrows toward `ExceptAll`/symmetric-difference-all semantics beyond the current mix of distinct and multiset composition controls.

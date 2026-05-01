@@ -85,6 +85,7 @@ pub enum MvccReadSource {
     IntersectDistinct { sources: Vec<MvccReadSource> },
     IntersectAll { sources: Vec<MvccReadSource> },
     ExceptDistinct { sources: Vec<MvccReadSource> },
+    ExceptAll { sources: Vec<MvccReadSource> },
     SymmetricDifferenceDistinct { sources: Vec<MvccReadSource> },
     FollowValueKeyRefs { keys: Vec<String> },
     FollowValueKeyPrefixes { keys: Vec<String> },
@@ -488,6 +489,36 @@ fn resolve_mvcc_source(
             for row in first_rows {
                 let key = resolved_mvcc_row_key(&row);
                 if !emitted.insert(key.clone()) || exclusion_set.contains(&key) {
+                    continue;
+                }
+                difference.push(row);
+            }
+            Ok(difference)
+        }
+        MvccReadSource::ExceptAll { sources } => {
+            let mut sources_iter = sources.iter();
+            let Some(first_source) = sources_iter.next() else {
+                return Ok(Vec::new());
+            };
+
+            let first_rows = resolve_mvcc_source(store, first_source, visibility)?;
+            let mut exclusion_counts = BTreeMap::new();
+            for source in sources_iter {
+                for key in resolve_mvcc_source(store, source, visibility)?
+                    .into_iter()
+                    .map(|row| resolved_mvcc_row_key(&row))
+                {
+                    *exclusion_counts.entry(key).or_insert(0usize) += 1;
+                }
+            }
+
+            let mut consumed = BTreeMap::new();
+            let mut difference = Vec::new();
+            for row in first_rows {
+                let key = resolved_mvcc_row_key(&row);
+                let next_count = consumed.get(&key).copied().unwrap_or(0) + 1;
+                consumed.insert(key.clone(), next_count);
+                if exclusion_counts.get(&key).copied().unwrap_or(0) >= next_count {
                     continue;
                 }
                 difference.push(row);
@@ -4384,6 +4415,99 @@ mod tests {
 
         assert_eq!(
             join_overlap.rows,
+            vec![
+                MvccReadRow {
+                    source_key: Some("acct:1".to_string()),
+                    key: Some("team:alpha:1".to_string()),
+                    value: Some("profile:1".to_string()),
+                },
+                MvccReadRow {
+                    source_key: Some("acct:1".to_string()),
+                    key: Some("team:alpha:2".to_string()),
+                    value: Some("profile:1".to_string()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn execute_mvcc_query_supports_except_all_source_composition() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=profile:1").unwrap();
+        e.execute_text(2, "SET acct:2=profile:2").unwrap();
+        e.execute_text(3, "SET profile:1=team:alpha").unwrap();
+        e.execute_text(4, "SET profile:2=team:beta").unwrap();
+        e.execute_text(5, "SET team:alpha:1=Alice").unwrap();
+        e.execute_text(6, "SET team:alpha:2=Ally").unwrap();
+        e.execute_text(7, "SET team:beta:1=Bob").unwrap();
+        e.execute_text(8, "SET user:1=active").unwrap();
+        e.execute_text(9, "SET user:2=locked").unwrap();
+
+        let exact_difference = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::ExceptAll {
+                    sources: vec![
+                        MvccReadSource::KeyBatchLookup {
+                            keys: vec![
+                                "user:1".to_string(),
+                                "user:1".to_string(),
+                                "user:2".to_string(),
+                            ],
+                        },
+                        MvccReadSource::KeyBatchLookup {
+                            keys: vec!["user:1".to_string()],
+                        },
+                    ],
+                },
+                visibility: StorageVisibility { read_txn_id: 9 },
+                filter: None,
+                order: None,
+                projection: MvccProjection::KeyOnly,
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            exact_difference.rows,
+            vec![
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("user:1".to_string()),
+                    value: None,
+                },
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("user:2".to_string()),
+                    value: None,
+                },
+            ]
+        );
+
+        let join_difference = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::ExceptAll {
+                    sources: vec![
+                        MvccReadSource::FollowValueKeyRefPrefixes {
+                            keys: vec!["acct:1".to_string(), "acct:1".to_string()],
+                        },
+                        MvccReadSource::FollowValueKeyRefPrefixes {
+                            keys: vec!["acct:1".to_string()],
+                        },
+                    ],
+                },
+                visibility: StorageVisibility { read_txn_id: 9 },
+                filter: Some(MvccReadFilter::Any(vec![
+                    MvccReadFilter::ValueEquals("Alice".to_string()),
+                    MvccReadFilter::ValueEquals("Ally".to_string()),
+                ])),
+                order: Some(MvccReadOrder::SourceKeyAsc),
+                projection: MvccProjection::TargetKeySourceValue,
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            join_difference.rows,
             vec![
                 MvccReadRow {
                     source_key: Some("acct:1".to_string()),
