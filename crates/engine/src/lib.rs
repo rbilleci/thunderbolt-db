@@ -111,11 +111,13 @@ pub enum MvccReadSource {
     FollowValueChain {
         keys: Vec<String>,
         plan: MvccValueChainPlan,
+        provenance: MvccSourceProvenance,
     },
     FollowValueChainBranches {
         keys: Vec<String>,
         plans: Vec<MvccValueChainPlan>,
         fan_in: MvccValueChainBranchFanIn,
+        provenance: MvccSourceProvenance,
     },
     FollowValueKeyRefs {
         keys: Vec<String>,
@@ -162,6 +164,12 @@ pub struct MvccValueChainPlan {
 pub enum MvccValueChainBranchFanIn {
     AllBranches,
     FirstNonEmptyBranch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MvccSourceProvenance {
+    Seed,
+    TerminalInput,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -410,24 +418,35 @@ where
 
 fn resolve_follow_value_chain_from_seed(
     store: &InMemoryTupleStore,
-    source_key: &str,
     seed: &TupleVersion,
     visibility: StorageVisibility,
     plan: MvccValueChainPlan,
+    provenance: MvccSourceProvenance,
 ) -> Result<Vec<ResolvedMvccRow>, StorageError> {
     let mut current = seed.clone();
+    let mut previous = None;
     for _ in 0..plan.value_key_hops {
+        previous = Some(current.clone());
         let Some(next) = store.tuple_fetch_by_key(&current.value, visibility)? else {
             return Ok(Vec::new());
         };
         current = next;
     }
 
+    let provenance_tuple = match provenance {
+        MvccSourceProvenance::Seed => seed.clone(),
+        MvccSourceProvenance::TerminalInput => match plan.terminal {
+            MvccValueChainTerminal::CurrentRow => previous.unwrap_or_else(|| seed.clone()),
+            MvccValueChainTerminal::CurrentValuePrefixes => current.clone(),
+        },
+    };
+    let source_key = provenance_tuple.key.clone();
+
     let mut rows = Vec::new();
     match plan.terminal {
         MvccValueChainTerminal::CurrentRow => rows.push(ResolvedMvccRow {
-            source_key: Some(source_key.to_string()),
-            source_tuple: Some(seed.clone()),
+            source_key: Some(source_key.clone()),
+            source_tuple: Some(provenance_tuple.clone()),
             tuple: current,
         }),
         MvccValueChainTerminal::CurrentValuePrefixes => {
@@ -435,8 +454,8 @@ fn resolve_follow_value_chain_from_seed(
             while let Some(tuple) = cursor.next() {
                 if tuple.key.starts_with(&current.value) {
                     rows.push(ResolvedMvccRow {
-                        source_key: Some(source_key.to_string()),
-                        source_tuple: Some(seed.clone()),
+                        source_key: Some(source_key.clone()),
+                        source_tuple: Some(provenance_tuple.clone()),
                         tuple,
                     });
                 }
@@ -451,6 +470,7 @@ fn resolve_follow_value_chain(
     keys: &[String],
     visibility: StorageVisibility,
     plan: MvccValueChainPlan,
+    provenance: MvccSourceProvenance,
 ) -> Result<Vec<ResolvedMvccRow>, StorageError> {
     let mut rows = Vec::new();
     for key in keys {
@@ -458,7 +478,7 @@ fn resolve_follow_value_chain(
             continue;
         };
         rows.extend(resolve_follow_value_chain_from_seed(
-            store, key, &seed, visibility, plan,
+            store, &seed, visibility, plan, provenance,
         )?);
     }
     Ok(rows)
@@ -470,6 +490,7 @@ fn resolve_follow_value_chain_branches(
     visibility: StorageVisibility,
     plans: &[MvccValueChainPlan],
     fan_in: MvccValueChainBranchFanIn,
+    provenance: MvccSourceProvenance,
 ) -> Result<Vec<ResolvedMvccRow>, StorageError> {
     let mut rows = Vec::new();
     for key in keys {
@@ -480,14 +501,15 @@ fn resolve_follow_value_chain_branches(
             MvccValueChainBranchFanIn::AllBranches => {
                 for plan in plans {
                     rows.extend(resolve_follow_value_chain_from_seed(
-                        store, key, &seed, visibility, *plan,
+                        store, &seed, visibility, *plan, provenance,
                     )?);
                 }
             }
             MvccValueChainBranchFanIn::FirstNonEmptyBranch => {
                 for plan in plans {
-                    let branch_rows =
-                        resolve_follow_value_chain_from_seed(store, key, &seed, visibility, *plan)?;
+                    let branch_rows = resolve_follow_value_chain_from_seed(
+                        store, &seed, visibility, *plan, provenance,
+                    )?;
                     if !branch_rows.is_empty() {
                         rows.extend(branch_rows);
                         break;
@@ -754,14 +776,24 @@ fn resolve_mvcc_source(
             }
             Ok(output)
         }
-        MvccReadSource::FollowValueChain { keys, plan } => {
-            resolve_follow_value_chain(store, keys, visibility, *plan)
-        }
+        MvccReadSource::FollowValueChain {
+            keys,
+            plan,
+            provenance,
+        } => resolve_follow_value_chain(store, keys, visibility, *plan, *provenance),
         MvccReadSource::FollowValueChainBranches {
             keys,
             plans,
             fan_in,
-        } => resolve_follow_value_chain_branches(store, keys, visibility, plans, *fan_in),
+            provenance,
+        } => resolve_follow_value_chain_branches(
+            store,
+            keys,
+            visibility,
+            plans,
+            *fan_in,
+            *provenance,
+        ),
         MvccReadSource::FollowValueKeyRefs { keys } => resolve_follow_value_chain(
             store,
             keys,
@@ -770,6 +802,7 @@ fn resolve_mvcc_source(
                 value_key_hops: 1,
                 terminal: MvccValueChainTerminal::CurrentRow,
             },
+            MvccSourceProvenance::Seed,
         ),
         MvccReadSource::FollowValueKeyPrefixes { keys } => resolve_follow_value_chain(
             store,
@@ -779,6 +812,7 @@ fn resolve_mvcc_source(
                 value_key_hops: 0,
                 terminal: MvccValueChainTerminal::CurrentValuePrefixes,
             },
+            MvccSourceProvenance::Seed,
         ),
         MvccReadSource::FollowValueKeyRefPrefixes { keys } => resolve_follow_value_chain(
             store,
@@ -788,6 +822,7 @@ fn resolve_mvcc_source(
                 value_key_hops: 1,
                 terminal: MvccValueChainTerminal::CurrentValuePrefixes,
             },
+            MvccSourceProvenance::Seed,
         ),
         MvccReadSource::FollowValueKeyRefValueKeyRefs { keys } => resolve_follow_value_chain(
             store,
@@ -797,6 +832,7 @@ fn resolve_mvcc_source(
                 value_key_hops: 2,
                 terminal: MvccValueChainTerminal::CurrentRow,
             },
+            MvccSourceProvenance::Seed,
         ),
         MvccReadSource::FollowValueKeyRefValueKeyPrefixes { keys } => resolve_follow_value_chain(
             store,
@@ -806,6 +842,7 @@ fn resolve_mvcc_source(
                 value_key_hops: 2,
                 terminal: MvccValueChainTerminal::CurrentValuePrefixes,
             },
+            MvccSourceProvenance::Seed,
         ),
         MvccReadSource::FollowValueKeyRefValueKeyRefPrefixes { keys } => {
             resolve_follow_value_chain(
@@ -816,6 +853,7 @@ fn resolve_mvcc_source(
                     value_key_hops: 3,
                     terminal: MvccValueChainTerminal::CurrentValuePrefixes,
                 },
+                MvccSourceProvenance::Seed,
             )
         }
         MvccReadSource::FollowValueKeyRefValueKeyRefValueKeyRefs { keys } => {
@@ -827,6 +865,7 @@ fn resolve_mvcc_source(
                     value_key_hops: 5,
                     terminal: MvccValueChainTerminal::CurrentRow,
                 },
+                MvccSourceProvenance::Seed,
             )
         }
         MvccReadSource::FollowValueKeyRefValueKeyRefValueKeyPrefixes { keys } => {
@@ -838,6 +877,7 @@ fn resolve_mvcc_source(
                     value_key_hops: 4,
                     terminal: MvccValueChainTerminal::CurrentValuePrefixes,
                 },
+                MvccSourceProvenance::Seed,
             )
         }
         MvccReadSource::FollowValueKeyRefValueKeyRefValueKeyRefPrefixes { keys } => {
@@ -849,6 +889,7 @@ fn resolve_mvcc_source(
                     value_key_hops: 5,
                     terminal: MvccValueChainTerminal::CurrentValuePrefixes,
                 },
+                MvccSourceProvenance::Seed,
             )
         }
     }
@@ -5293,6 +5334,7 @@ mod tests {
                         value_key_hops: 5,
                         terminal: MvccValueChainTerminal::CurrentValuePrefixes,
                     },
+                    provenance: MvccSourceProvenance::Seed,
                 },
                 visibility: StorageVisibility { read_txn_id: 26 },
                 filter: None,
@@ -5325,6 +5367,7 @@ mod tests {
                         value_key_hops: 5,
                         terminal: MvccValueChainTerminal::CurrentRow,
                     },
+                    provenance: MvccSourceProvenance::Seed,
                 },
                 visibility: StorageVisibility { read_txn_id: 26 },
                 filter: None,
@@ -5369,6 +5412,7 @@ mod tests {
                         },
                     ],
                     fan_in: MvccValueChainBranchFanIn::AllBranches,
+                    provenance: MvccSourceProvenance::Seed,
                 },
                 visibility: StorageVisibility { read_txn_id: 9 },
                 filter: None,
@@ -5428,6 +5472,7 @@ mod tests {
                                 value_key_hops: 1,
                                 terminal: MvccValueChainTerminal::CurrentRow,
                             },
+                            provenance: MvccSourceProvenance::Seed,
                         },
                         MvccReadSource::FollowValueChain {
                             keys: vec![
@@ -5439,6 +5484,7 @@ mod tests {
                                 value_key_hops: 1,
                                 terminal: MvccValueChainTerminal::CurrentValuePrefixes,
                             },
+                            provenance: MvccSourceProvenance::Seed,
                         },
                     ],
                 },
@@ -5506,6 +5552,7 @@ mod tests {
                         },
                     ],
                     fan_in: MvccValueChainBranchFanIn::AllBranches,
+                    provenance: MvccSourceProvenance::Seed,
                 },
                 visibility: StorageVisibility { read_txn_id: 9 },
                 filter: Some(MvccReadFilter::Any(vec![
@@ -5575,6 +5622,7 @@ mod tests {
                         },
                     ],
                     fan_in: MvccValueChainBranchFanIn::FirstNonEmptyBranch,
+                    provenance: MvccSourceProvenance::Seed,
                 },
                 visibility: StorageVisibility { read_txn_id: 11 },
                 filter: None,
@@ -5630,6 +5678,7 @@ mod tests {
                         },
                     ],
                     fan_in: MvccValueChainBranchFanIn::AllBranches,
+                    provenance: MvccSourceProvenance::Seed,
                 },
                 visibility: StorageVisibility { read_txn_id: 11 },
                 filter: Some(MvccReadFilter::Any(vec![
@@ -5684,6 +5733,117 @@ mod tests {
                     source_key: Some("acct:4".to_string()),
                     key: Some("acct:4".to_string()),
                     value: Some("Dora".to_string()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn execute_mvcc_query_supports_follow_value_chain_terminal_input_provenance() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=profile:1").unwrap();
+        e.execute_text(2, "SET acct:2=profile:2").unwrap();
+        e.execute_text(3, "SET profile:1=team:alpha").unwrap();
+        e.execute_text(4, "SET profile:2=team:beta").unwrap();
+        e.execute_text(5, "SET team:alpha:1=Alice").unwrap();
+        e.execute_text(6, "SET team:alpha:2=Ally").unwrap();
+        e.execute_text(7, "SET team:beta:1=Bob").unwrap();
+        e.execute_text(8, "SET team:beta:2=Bianca").unwrap();
+
+        let query = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FollowValueChain {
+                    keys: vec!["acct:2".to_string(), "acct:1".to_string()],
+                    plan: MvccValueChainPlan {
+                        value_key_hops: 1,
+                        terminal: MvccValueChainTerminal::CurrentValuePrefixes,
+                    },
+                    provenance: MvccSourceProvenance::TerminalInput,
+                },
+                visibility: StorageVisibility { read_txn_id: 8 },
+                filter: Some(MvccReadFilter::SourceValueEquals("team:beta".to_string())),
+                order: Some(MvccReadOrder::KeyAsc),
+                projection: MvccProjection::TargetKeySourceValue,
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            query.rows,
+            vec![
+                MvccReadRow {
+                    source_key: Some("profile:2".to_string()),
+                    key: Some("team:beta:1".to_string()),
+                    value: Some("team:beta".to_string()),
+                },
+                MvccReadRow {
+                    source_key: Some("profile:2".to_string()),
+                    key: Some("team:beta:2".to_string()),
+                    value: Some("team:beta".to_string()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn execute_mvcc_query_supports_branch_fan_in_with_terminal_input_provenance() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=profile:1").unwrap();
+        e.execute_text(2, "SET acct:2=profile:2").unwrap();
+        e.execute_text(3, "SET acct:3=profile:3").unwrap();
+        e.execute_text(4, "SET profile:1=team:alpha").unwrap();
+        e.execute_text(5, "SET profile:2=team:beta").unwrap();
+        e.execute_text(6, "SET profile:3=team:gamma").unwrap();
+        e.execute_text(7, "SET team:alpha=Alpha Team").unwrap();
+        e.execute_text(8, "SET team:beta:1=Bob").unwrap();
+        e.execute_text(9, "SET team:beta:2=Bianca").unwrap();
+
+        let query = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FollowValueChainBranches {
+                    keys: vec![
+                        "acct:3".to_string(),
+                        "acct:2".to_string(),
+                        "acct:1".to_string(),
+                    ],
+                    plans: vec![
+                        MvccValueChainPlan {
+                            value_key_hops: 2,
+                            terminal: MvccValueChainTerminal::CurrentRow,
+                        },
+                        MvccValueChainPlan {
+                            value_key_hops: 1,
+                            terminal: MvccValueChainTerminal::CurrentValuePrefixes,
+                        },
+                    ],
+                    fan_in: MvccValueChainBranchFanIn::FirstNonEmptyBranch,
+                    provenance: MvccSourceProvenance::TerminalInput,
+                },
+                visibility: StorageVisibility { read_txn_id: 9 },
+                filter: Some(MvccReadFilter::SourceKeyPrefix("profile:".to_string())),
+                order: Some(MvccReadOrder::SourceKeyAsc),
+                projection: MvccProjection::TargetKeySourceValue,
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            query.rows,
+            vec![
+                MvccReadRow {
+                    source_key: Some("profile:1".to_string()),
+                    key: Some("team:alpha".to_string()),
+                    value: Some("team:alpha".to_string()),
+                },
+                MvccReadRow {
+                    source_key: Some("profile:2".to_string()),
+                    key: Some("team:beta:1".to_string()),
+                    value: Some("team:beta".to_string()),
+                },
+                MvccReadRow {
+                    source_key: Some("profile:2".to_string()),
+                    key: Some("team:beta:2".to_string()),
+                    value: Some("team:beta".to_string()),
                 },
             ]
         );
