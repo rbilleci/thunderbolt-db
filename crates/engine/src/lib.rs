@@ -80,6 +80,7 @@ pub enum MvccReadSource {
     FullScan,
     KeyLookup { key: String },
     KeyBatchLookup { keys: Vec<String> },
+    Concat { sources: Vec<MvccReadSource> },
     FollowValueKeyRefs { keys: Vec<String> },
     FollowValueKeyPrefixes { keys: Vec<String> },
     FollowValueKeyRefPrefixes { keys: Vec<String> },
@@ -267,7 +268,7 @@ fn mvcc_row_cmp(
             .map(|tuple| tuple.value.as_str())
             .unwrap_or("")
             .cmp(
-                &right
+                right
                     .source_tuple
                     .as_ref()
                     .map(|tuple| tuple.value.as_str())
@@ -280,8 +281,7 @@ fn mvcc_row_cmp(
             .map(|tuple| tuple.value.as_str())
             .unwrap_or("")
             .cmp(
-                &left
-                    .source_tuple
+                left.source_tuple
                     .as_ref()
                     .map(|tuple| tuple.value.as_str())
                     .unwrap_or(""),
@@ -340,6 +340,13 @@ fn resolve_mvcc_source(
                         tuple,
                     });
                 }
+            }
+            Ok(rows)
+        }
+        MvccReadSource::Concat { sources } => {
+            let mut rows = Vec::new();
+            for source in sources {
+                rows.extend(resolve_mvcc_source(store, source, visibility)?);
             }
             Ok(rows)
         }
@@ -3628,6 +3635,123 @@ mod tests {
                     source_key: None,
                     key: Some("user:1".to_string()),
                     value: Some("active".to_string()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn execute_mvcc_query_supports_concat_source_composition() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=profile:1").unwrap();
+        e.execute_text(2, "SET acct:2=profile:2").unwrap();
+        e.execute_text(3, "SET profile:1=team:alpha").unwrap();
+        e.execute_text(4, "SET profile:2=team:beta").unwrap();
+        e.execute_text(5, "SET team:alpha:1=Alice").unwrap();
+        e.execute_text(6, "SET team:alpha:2=Ally").unwrap();
+        e.execute_text(7, "SET team:beta:1=Bob").unwrap();
+        e.execute_text(8, "SET team:beta:2=Bianca").unwrap();
+        e.execute_text(9, "SET user:1=active").unwrap();
+
+        let request_order = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::Concat {
+                    sources: vec![
+                        MvccReadSource::KeyLookup {
+                            key: "user:1".to_string(),
+                        },
+                        MvccReadSource::FollowValueKeyRefPrefixes {
+                            keys: vec!["acct:2".to_string(), "acct:1".to_string()],
+                        },
+                        MvccReadSource::KeyBatchLookup {
+                            keys: vec!["acct:2".to_string(), "missing".to_string()],
+                        },
+                    ],
+                },
+                visibility: StorageVisibility { read_txn_id: 9 },
+                filter: None,
+                order: None,
+                projection: MvccProjection::KeyOnly,
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            request_order.rows,
+            vec![
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("user:1".to_string()),
+                    value: None,
+                },
+                MvccReadRow {
+                    source_key: Some("acct:2".to_string()),
+                    key: Some("team:beta:1".to_string()),
+                    value: None,
+                },
+                MvccReadRow {
+                    source_key: Some("acct:2".to_string()),
+                    key: Some("team:beta:2".to_string()),
+                    value: None,
+                },
+                MvccReadRow {
+                    source_key: Some("acct:1".to_string()),
+                    key: Some("team:alpha:1".to_string()),
+                    value: None,
+                },
+                MvccReadRow {
+                    source_key: Some("acct:1".to_string()),
+                    key: Some("team:alpha:2".to_string()),
+                    value: None,
+                },
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("acct:2".to_string()),
+                    value: None,
+                },
+            ]
+        );
+
+        let filtered_and_sorted = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::Concat {
+                    sources: vec![
+                        MvccReadSource::FollowValueKeyRefPrefixes {
+                            keys: vec!["acct:1".to_string(), "acct:2".to_string()],
+                        },
+                        MvccReadSource::KeyLookup {
+                            key: "user:1".to_string(),
+                        },
+                    ],
+                },
+                visibility: StorageVisibility { read_txn_id: 9 },
+                filter: Some(MvccReadFilter::Any(vec![
+                    MvccReadFilter::SourceKeyPrefix("acct:1".to_string()),
+                    MvccReadFilter::ValueEquals("active".to_string()),
+                ])),
+                order: Some(MvccReadOrder::SourceKeyAsc),
+                projection: MvccProjection::TargetKeySourceValue,
+                limit: Some(3),
+            })
+            .unwrap();
+
+        assert_eq!(
+            filtered_and_sorted.rows,
+            vec![
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("user:1".to_string()),
+                    value: None,
+                },
+                MvccReadRow {
+                    source_key: Some("acct:1".to_string()),
+                    key: Some("team:alpha:1".to_string()),
+                    value: Some("profile:1".to_string()),
+                },
+                MvccReadRow {
+                    source_key: Some("acct:1".to_string()),
+                    key: Some("team:alpha:2".to_string()),
+                    value: Some("profile:1".to_string()),
                 },
             ]
         );

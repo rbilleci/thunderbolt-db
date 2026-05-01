@@ -3,6 +3,9 @@
 ## 2026-05-01
 
 ### Completed
+- Extended the engine-facing MVCC bootstrap slice with `MvccReadSource::Concat { sources }`, the first explicit source-composition primitive: the engine can now concatenate heterogeneous scan/lookup/join-adjacent source shapes recursively in source-list order before the existing filter/order/limit/projection pipeline without changing the `MvccReadRow { source_key, key, value }` contract or weakening explicit GPU-first fallback accounting.
+- Added end-to-end engine regression coverage proving `Concat` preserves subsource order without an explicit sort, composes cleanly with source-aware filters/order clauses plus join-side projection, and keeps non-join rows deterministic instead of fabricating source state.
+- Reconciled README/execution/roadmap docs so the Q2 truth surface now includes explicit source composition and the next extension boundary narrows toward richer composition semantics beyond ordered concatenation.
 - Extended the engine-facing MVCC bootstrap slice with `MvccProjection::SourceKeyTargetValue` and `MvccProjection::SourceValueOnly`, so join-adjacent reads can now mix seed-side and target-side payloads more flexibly without changing the `MvccReadRow { source_key, key, value }` contract or weakening explicit GPU-first fallback accounting.
 - Added end-to-end engine regression coverage proving the new mixed projection controls compose with source-aware filters/order clauses and keep non-join shapes deterministic instead of fabricating source payload.
 - Reconciled README/execution/roadmap docs so the Q2 truth surface now includes mixed join-side projection controls and the next extension boundary narrows toward more explicit join-composition primitives.
