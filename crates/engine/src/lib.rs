@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
@@ -81,6 +81,7 @@ pub enum MvccReadSource {
     KeyLookup { key: String },
     KeyBatchLookup { keys: Vec<String> },
     Concat { sources: Vec<MvccReadSource> },
+    ConcatDistinct { sources: Vec<MvccReadSource> },
     FollowValueKeyRefs { keys: Vec<String> },
     FollowValueKeyPrefixes { keys: Vec<String> },
     FollowValueKeyRefPrefixes { keys: Vec<String> },
@@ -155,6 +156,13 @@ struct ResolvedMvccRow {
     source_tuple: Option<TupleVersion>,
     tuple: TupleVersion,
 }
+
+type ResolvedTupleIdentity = (u64, String, String, u64, Option<u64>);
+type ResolvedMvccRowIdentity = (
+    Option<String>,
+    Option<ResolvedTupleIdentity>,
+    ResolvedTupleIdentity,
+);
 
 fn project_mvcc_row(row: ResolvedMvccRow, projection: MvccProjection) -> MvccReadRow {
     let ResolvedMvccRow {
@@ -290,6 +298,28 @@ fn mvcc_row_cmp(
     }
 }
 
+fn resolved_mvcc_row_key(row: &ResolvedMvccRow) -> ResolvedMvccRowIdentity {
+    (
+        row.source_key.clone(),
+        row.source_tuple.as_ref().map(|tuple| {
+            (
+                tuple.tuple_id,
+                tuple.key.clone(),
+                tuple.value.clone(),
+                tuple.created_by,
+                tuple.deleted_by,
+            )
+        }),
+        (
+            row.tuple.tuple_id,
+            row.tuple.key.clone(),
+            row.tuple.value.clone(),
+            row.tuple.created_by,
+            row.tuple.deleted_by,
+        ),
+    )
+}
+
 fn collect_operator_rows<Row, Op>(mut operator: Op) -> Vec<Row>
 where
     Op: Operator<Row>,
@@ -347,6 +377,18 @@ fn resolve_mvcc_source(
             let mut rows = Vec::new();
             for source in sources {
                 rows.extend(resolve_mvcc_source(store, source, visibility)?);
+            }
+            Ok(rows)
+        }
+        MvccReadSource::ConcatDistinct { sources } => {
+            let mut rows = Vec::new();
+            let mut seen = BTreeSet::new();
+            for source in sources {
+                for row in resolve_mvcc_source(store, source, visibility)? {
+                    if seen.insert(resolved_mvcc_row_key(&row)) {
+                        rows.push(row);
+                    }
+                }
             }
             Ok(rows)
         }
@@ -3752,6 +3794,108 @@ mod tests {
                     source_key: Some("acct:1".to_string()),
                     key: Some("team:alpha:2".to_string()),
                     value: Some("profile:1".to_string()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn execute_mvcc_query_supports_concat_distinct_source_composition() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=profile:1").unwrap();
+        e.execute_text(2, "SET acct:2=profile:2").unwrap();
+        e.execute_text(3, "SET profile:1=team:alpha").unwrap();
+        e.execute_text(4, "SET profile:2=team:beta").unwrap();
+        e.execute_text(5, "SET team:alpha:1=Alice").unwrap();
+        e.execute_text(6, "SET team:alpha:2=Ally").unwrap();
+        e.execute_text(7, "SET team:beta:1=Bob").unwrap();
+        e.execute_text(8, "SET team:beta:2=Bianca").unwrap();
+        e.execute_text(9, "SET user:1=active").unwrap();
+
+        let deduped = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::ConcatDistinct {
+                    sources: vec![
+                        MvccReadSource::KeyLookup {
+                            key: "user:1".to_string(),
+                        },
+                        MvccReadSource::KeyBatchLookup {
+                            keys: vec!["user:1".to_string(), "acct:2".to_string()],
+                        },
+                        MvccReadSource::FollowValueKeyRefPrefixes {
+                            keys: vec!["acct:1".to_string(), "acct:1".to_string()],
+                        },
+                    ],
+                },
+                visibility: StorageVisibility { read_txn_id: 9 },
+                filter: None,
+                order: None,
+                projection: MvccProjection::KeyOnly,
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            deduped.rows,
+            vec![
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("user:1".to_string()),
+                    value: None,
+                },
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("acct:2".to_string()),
+                    value: None,
+                },
+                MvccReadRow {
+                    source_key: Some("acct:1".to_string()),
+                    key: Some("team:alpha:1".to_string()),
+                    value: None,
+                },
+                MvccReadRow {
+                    source_key: Some("acct:1".to_string()),
+                    key: Some("team:alpha:2".to_string()),
+                    value: None,
+                },
+            ]
+        );
+
+        let source_distinction = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::ConcatDistinct {
+                    sources: vec![
+                        MvccReadSource::FollowValueKeyRefPrefixes {
+                            keys: vec!["acct:1".to_string()],
+                        },
+                        MvccReadSource::FollowValueKeyRefPrefixes {
+                            keys: vec!["acct:2".to_string()],
+                        },
+                    ],
+                },
+                visibility: StorageVisibility { read_txn_id: 9 },
+                filter: Some(MvccReadFilter::Any(vec![
+                    MvccReadFilter::ValueEquals("Alice".to_string()),
+                    MvccReadFilter::ValueEquals("Bob".to_string()),
+                ])),
+                order: Some(MvccReadOrder::SourceKeyAsc),
+                projection: MvccProjection::TargetKeySourceValue,
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            source_distinction.rows,
+            vec![
+                MvccReadRow {
+                    source_key: Some("acct:1".to_string()),
+                    key: Some("team:alpha:1".to_string()),
+                    value: Some("profile:1".to_string()),
+                },
+                MvccReadRow {
+                    source_key: Some("acct:2".to_string()),
+                    key: Some("team:beta:1".to_string()),
+                    value: Some("profile:2".to_string()),
                 },
             ]
         );

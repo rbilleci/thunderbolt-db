@@ -3,6 +3,9 @@
 ## 2026-05-01
 
 ### Completed
+- Extended the engine-facing MVCC bootstrap slice with `MvccReadSource::ConcatDistinct { sources }`, an ordered deduplicating composition primitive: the engine now keeps only the first occurrence of each resolved row across heterogeneous composed sources while still preserving rows that remain semantically distinct because their source provenance differs.
+- Added end-to-end engine regression coverage proving `ConcatDistinct` removes duplicate non-join and same-provenance join rows, preserves distinct source-provenance rows, and still composes with source-aware filters/order clauses plus join-side projection under the existing fallback contract.
+- Reconciled README/execution/roadmap docs so the Q2 truth surface now includes ordered deduplicating composition and the next extension boundary narrows toward richer set-style composition semantics beyond concatenation/deduplication.
 - Extended the engine-facing MVCC bootstrap slice with `MvccReadSource::Concat { sources }`, the first explicit source-composition primitive: the engine can now concatenate heterogeneous scan/lookup/join-adjacent source shapes recursively in source-list order before the existing filter/order/limit/projection pipeline without changing the `MvccReadRow { source_key, key, value }` contract or weakening explicit GPU-first fallback accounting.
 - Added end-to-end engine regression coverage proving `Concat` preserves subsource order without an explicit sort, composes cleanly with source-aware filters/order clauses plus join-side projection, and keeps non-join rows deterministic instead of fabricating source state.
 - Reconciled README/execution/roadmap docs so the Q2 truth surface now includes explicit source composition and the next extension boundary narrows toward richer composition semantics beyond ordered concatenation.
