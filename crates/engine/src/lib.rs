@@ -119,6 +119,12 @@ pub enum MvccReadSource {
         fan_in: MvccValueChainBranchFanIn,
         provenance: MvccSourceProvenance,
     },
+    FollowValueChainLabeledBranches {
+        keys: Vec<String>,
+        branches: Vec<MvccLabeledValueChainBranch>,
+        fan_in: MvccValueChainBranchFanIn,
+        provenance: MvccSourceProvenance,
+    },
     FollowValueKeyRefs {
         keys: Vec<String>,
     },
@@ -160,6 +166,12 @@ pub struct MvccValueChainPlan {
     pub terminal: MvccValueChainTerminal,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MvccLabeledValueChainBranch {
+    pub label: String,
+    pub plan: MvccValueChainPlan,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MvccValueChainBranchFanIn {
     AllBranches,
@@ -176,6 +188,7 @@ pub enum MvccSourceProvenance {
 pub enum MvccReadFilter {
     KeyPrefix(String),
     SourceKeyPrefix(String),
+    BranchLabelEquals(String),
     KeyRange {
         start_inclusive: String,
         end_exclusive: String,
@@ -192,6 +205,8 @@ pub enum MvccReadOrder {
     KeyDesc,
     ValueAsc,
     ValueDesc,
+    BranchLabelAsc,
+    BranchLabelDesc,
     SourceKeyAsc,
     SourceKeyDesc,
     SourceValueAsc,
@@ -203,6 +218,7 @@ pub enum MvccProjection {
     KeyValue,
     KeyOnly,
     ValueOnly,
+    BranchLabelTargetValue,
     SourceKeyTargetValue,
     SourceValueOnly,
     TargetKeySourceValue,
@@ -235,6 +251,7 @@ pub struct MvccReadResult {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedMvccRow {
+    branch_label: Option<String>,
     source_key: Option<String>,
     source_tuple: Option<TupleVersion>,
     tuple: TupleVersion,
@@ -243,12 +260,14 @@ struct ResolvedMvccRow {
 type ResolvedTupleIdentity = (u64, String, String, u64, Option<u64>);
 type ResolvedMvccRowIdentity = (
     Option<String>,
+    Option<String>,
     Option<ResolvedTupleIdentity>,
     ResolvedTupleIdentity,
 );
 
 fn project_mvcc_row(row: ResolvedMvccRow, projection: MvccProjection) -> MvccReadRow {
     let ResolvedMvccRow {
+        branch_label,
         source_key,
         source_tuple,
         tuple,
@@ -267,6 +286,11 @@ fn project_mvcc_row(row: ResolvedMvccRow, projection: MvccProjection) -> MvccRea
         MvccProjection::ValueOnly => MvccReadRow {
             source_key,
             key: None,
+            value: Some(tuple.value),
+        },
+        MvccProjection::BranchLabelTargetValue => MvccReadRow {
+            key: branch_label,
+            source_key,
             value: Some(tuple.value),
         },
         MvccProjection::SourceKeyTargetValue => MvccReadRow {
@@ -302,6 +326,7 @@ fn mvcc_row_matches_filter(row: &ResolvedMvccRow, filter: &MvccReadFilter) -> bo
             .source_key
             .as_ref()
             .is_some_and(|source_key| source_key.starts_with(prefix)),
+        MvccReadFilter::BranchLabelEquals(expected) => row.branch_label.as_ref() == Some(expected),
         MvccReadFilter::KeyRange {
             start_inclusive,
             end_exclusive,
@@ -340,6 +365,18 @@ fn mvcc_row_cmp(
             .tuple
             .value
             .cmp(&left.tuple.value)
+            .then_with(|| left.tuple.key.cmp(&right.tuple.key)),
+        MvccReadOrder::BranchLabelAsc => left
+            .branch_label
+            .as_deref()
+            .unwrap_or("")
+            .cmp(right.branch_label.as_deref().unwrap_or(""))
+            .then_with(|| left.tuple.key.cmp(&right.tuple.key)),
+        MvccReadOrder::BranchLabelDesc => right
+            .branch_label
+            .as_deref()
+            .unwrap_or("")
+            .cmp(left.branch_label.as_deref().unwrap_or(""))
             .then_with(|| left.tuple.key.cmp(&right.tuple.key)),
         MvccReadOrder::SourceKeyAsc => left
             .source_key
@@ -383,6 +420,7 @@ fn mvcc_row_cmp(
 
 fn resolved_mvcc_row_key(row: &ResolvedMvccRow) -> ResolvedMvccRowIdentity {
     (
+        row.branch_label.clone(),
         row.source_key.clone(),
         row.source_tuple.as_ref().map(|tuple| {
             (
@@ -422,6 +460,7 @@ fn resolve_follow_value_chain_from_seed(
     visibility: StorageVisibility,
     plan: MvccValueChainPlan,
     provenance: MvccSourceProvenance,
+    branch_label: Option<&str>,
 ) -> Result<Vec<ResolvedMvccRow>, StorageError> {
     let mut current = seed.clone();
     let mut previous = None;
@@ -445,6 +484,7 @@ fn resolve_follow_value_chain_from_seed(
     let mut rows = Vec::new();
     match plan.terminal {
         MvccValueChainTerminal::CurrentRow => rows.push(ResolvedMvccRow {
+            branch_label: branch_label.map(ToOwned::to_owned),
             source_key: Some(source_key.clone()),
             source_tuple: Some(provenance_tuple.clone()),
             tuple: current,
@@ -454,6 +494,7 @@ fn resolve_follow_value_chain_from_seed(
             while let Some(tuple) = cursor.next() {
                 if tuple.key.starts_with(&current.value) {
                     rows.push(ResolvedMvccRow {
+                        branch_label: branch_label.map(ToOwned::to_owned),
                         source_key: Some(source_key.clone()),
                         source_tuple: Some(provenance_tuple.clone()),
                         tuple,
@@ -478,7 +519,7 @@ fn resolve_follow_value_chain(
             continue;
         };
         rows.extend(resolve_follow_value_chain_from_seed(
-            store, &seed, visibility, plan, provenance,
+            store, &seed, visibility, plan, provenance, None,
         )?);
     }
     Ok(rows)
@@ -501,14 +542,61 @@ fn resolve_follow_value_chain_branches(
             MvccValueChainBranchFanIn::AllBranches => {
                 for plan in plans {
                     rows.extend(resolve_follow_value_chain_from_seed(
-                        store, &seed, visibility, *plan, provenance,
+                        store, &seed, visibility, *plan, provenance, None,
                     )?);
                 }
             }
             MvccValueChainBranchFanIn::FirstNonEmptyBranch => {
                 for plan in plans {
                     let branch_rows = resolve_follow_value_chain_from_seed(
-                        store, &seed, visibility, *plan, provenance,
+                        store, &seed, visibility, *plan, provenance, None,
+                    )?;
+                    if !branch_rows.is_empty() {
+                        rows.extend(branch_rows);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    Ok(rows)
+}
+
+fn resolve_follow_value_chain_labeled_branches(
+    store: &InMemoryTupleStore,
+    keys: &[String],
+    visibility: StorageVisibility,
+    branches: &[MvccLabeledValueChainBranch],
+    fan_in: MvccValueChainBranchFanIn,
+    provenance: MvccSourceProvenance,
+) -> Result<Vec<ResolvedMvccRow>, StorageError> {
+    let mut rows = Vec::new();
+    for key in keys {
+        let Some(seed) = store.tuple_fetch_by_key(key, visibility)? else {
+            continue;
+        };
+        match fan_in {
+            MvccValueChainBranchFanIn::AllBranches => {
+                for branch in branches {
+                    rows.extend(resolve_follow_value_chain_from_seed(
+                        store,
+                        &seed,
+                        visibility,
+                        branch.plan,
+                        provenance,
+                        Some(branch.label.as_str()),
+                    )?);
+                }
+            }
+            MvccValueChainBranchFanIn::FirstNonEmptyBranch => {
+                for branch in branches {
+                    let branch_rows = resolve_follow_value_chain_from_seed(
+                        store,
+                        &seed,
+                        visibility,
+                        branch.plan,
+                        provenance,
+                        Some(branch.label.as_str()),
                     )?;
                     if !branch_rows.is_empty() {
                         rows.extend(branch_rows);
@@ -532,6 +620,7 @@ fn resolve_mvcc_source(
             let mut rows = Vec::new();
             while let Some(tuple) = cursor.next() {
                 rows.push(ResolvedMvccRow {
+                    branch_label: None,
                     source_key: None,
                     source_tuple: None,
                     tuple,
@@ -543,6 +632,7 @@ fn resolve_mvcc_source(
             .tuple_fetch_by_key(key, visibility)?
             .into_iter()
             .map(|tuple| ResolvedMvccRow {
+                branch_label: None,
                 source_key: None,
                 source_tuple: None,
                 tuple,
@@ -553,6 +643,7 @@ fn resolve_mvcc_source(
             for key in keys {
                 if let Some(tuple) = store.tuple_fetch_by_key(key, visibility)? {
                     rows.push(ResolvedMvccRow {
+                        branch_label: None,
                         source_key: None,
                         source_tuple: None,
                         tuple,
@@ -791,6 +882,19 @@ fn resolve_mvcc_source(
             keys,
             visibility,
             plans,
+            *fan_in,
+            *provenance,
+        ),
+        MvccReadSource::FollowValueChainLabeledBranches {
+            keys,
+            branches,
+            fan_in,
+            provenance,
+        } => resolve_follow_value_chain_labeled_branches(
+            store,
+            keys,
+            visibility,
+            branches,
             *fan_in,
             *provenance,
         ),
@@ -5843,6 +5947,198 @@ mod tests {
                 MvccReadRow {
                     source_key: Some("profile:2".to_string()),
                     key: Some("team:beta:2".to_string()),
+                    value: Some("team:beta".to_string()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn execute_mvcc_query_supports_labeled_branch_projection_and_ordering() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=profile:1").unwrap();
+        e.execute_text(2, "SET acct:2=profile:2").unwrap();
+        e.execute_text(3, "SET profile:1=team:alpha").unwrap();
+        e.execute_text(4, "SET profile:2=team:beta").unwrap();
+        e.execute_text(5, "SET team:alpha=Alpha Team").unwrap();
+        e.execute_text(6, "SET team:beta=Beta Team").unwrap();
+        e.execute_text(7, "SET team:alpha:1=Alice").unwrap();
+        e.execute_text(8, "SET team:beta:1=Bob").unwrap();
+
+        let query = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FollowValueChainLabeledBranches {
+                    keys: vec!["acct:2".to_string(), "acct:1".to_string()],
+                    branches: vec![
+                        MvccLabeledValueChainBranch {
+                            label: "members".to_string(),
+                            plan: MvccValueChainPlan {
+                                value_key_hops: 1,
+                                terminal: MvccValueChainTerminal::CurrentValuePrefixes,
+                            },
+                        },
+                        MvccLabeledValueChainBranch {
+                            label: "team".to_string(),
+                            plan: MvccValueChainPlan {
+                                value_key_hops: 2,
+                                terminal: MvccValueChainTerminal::CurrentRow,
+                            },
+                        },
+                    ],
+                    fan_in: MvccValueChainBranchFanIn::AllBranches,
+                    provenance: MvccSourceProvenance::Seed,
+                },
+                visibility: StorageVisibility { read_txn_id: 8 },
+                filter: None,
+                order: Some(MvccReadOrder::BranchLabelAsc),
+                projection: MvccProjection::BranchLabelTargetValue,
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            query.rows,
+            vec![
+                MvccReadRow {
+                    source_key: Some("acct:1".to_string()),
+                    key: Some("members".to_string()),
+                    value: Some("Alpha Team".to_string()),
+                },
+                MvccReadRow {
+                    source_key: Some("acct:1".to_string()),
+                    key: Some("members".to_string()),
+                    value: Some("Alice".to_string()),
+                },
+                MvccReadRow {
+                    source_key: Some("acct:2".to_string()),
+                    key: Some("members".to_string()),
+                    value: Some("Beta Team".to_string()),
+                },
+                MvccReadRow {
+                    source_key: Some("acct:2".to_string()),
+                    key: Some("members".to_string()),
+                    value: Some("Bob".to_string()),
+                },
+                MvccReadRow {
+                    source_key: Some("acct:1".to_string()),
+                    key: Some("team".to_string()),
+                    value: Some("Alpha Team".to_string()),
+                },
+                MvccReadRow {
+                    source_key: Some("acct:2".to_string()),
+                    key: Some("team".to_string()),
+                    value: Some("Beta Team".to_string()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn execute_mvcc_query_preserves_labeled_branch_identity_and_first_match_filtering() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=profile:1").unwrap();
+        e.execute_text(2, "SET acct:2=profile:2").unwrap();
+        e.execute_text(3, "SET profile:1=team:alpha").unwrap();
+        e.execute_text(4, "SET profile:2=team:beta").unwrap();
+        e.execute_text(5, "SET team:alpha=Shared Team").unwrap();
+        e.execute_text(6, "SET team:beta=Shared Team").unwrap();
+
+        let distinct = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::ConcatDistinct {
+                    sources: vec![
+                        MvccReadSource::FollowValueChainLabeledBranches {
+                            keys: vec!["acct:1".to_string()],
+                            branches: vec![MvccLabeledValueChainBranch {
+                                label: "primary".to_string(),
+                                plan: MvccValueChainPlan {
+                                    value_key_hops: 2,
+                                    terminal: MvccValueChainTerminal::CurrentRow,
+                                },
+                            }],
+                            fan_in: MvccValueChainBranchFanIn::AllBranches,
+                            provenance: MvccSourceProvenance::Seed,
+                        },
+                        MvccReadSource::FollowValueChainLabeledBranches {
+                            keys: vec!["acct:1".to_string()],
+                            branches: vec![MvccLabeledValueChainBranch {
+                                label: "fallback".to_string(),
+                                plan: MvccValueChainPlan {
+                                    value_key_hops: 2,
+                                    terminal: MvccValueChainTerminal::CurrentRow,
+                                },
+                            }],
+                            fan_in: MvccValueChainBranchFanIn::AllBranches,
+                            provenance: MvccSourceProvenance::Seed,
+                        },
+                    ],
+                },
+                visibility: StorageVisibility { read_txn_id: 6 },
+                filter: None,
+                order: Some(MvccReadOrder::BranchLabelAsc),
+                projection: MvccProjection::BranchLabelTargetValue,
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            distinct.rows,
+            vec![
+                MvccReadRow {
+                    source_key: Some("acct:1".to_string()),
+                    key: Some("fallback".to_string()),
+                    value: Some("Shared Team".to_string()),
+                },
+                MvccReadRow {
+                    source_key: Some("acct:1".to_string()),
+                    key: Some("primary".to_string()),
+                    value: Some("Shared Team".to_string()),
+                },
+            ]
+        );
+
+        let first_match = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FollowValueChainLabeledBranches {
+                    keys: vec!["acct:2".to_string(), "acct:1".to_string()],
+                    branches: vec![
+                        MvccLabeledValueChainBranch {
+                            label: "team".to_string(),
+                            plan: MvccValueChainPlan {
+                                value_key_hops: 2,
+                                terminal: MvccValueChainTerminal::CurrentRow,
+                            },
+                        },
+                        MvccLabeledValueChainBranch {
+                            label: "members".to_string(),
+                            plan: MvccValueChainPlan {
+                                value_key_hops: 1,
+                                terminal: MvccValueChainTerminal::CurrentValuePrefixes,
+                            },
+                        },
+                    ],
+                    fan_in: MvccValueChainBranchFanIn::FirstNonEmptyBranch,
+                    provenance: MvccSourceProvenance::TerminalInput,
+                },
+                visibility: StorageVisibility { read_txn_id: 6 },
+                filter: Some(MvccReadFilter::BranchLabelEquals("team".to_string())),
+                order: Some(MvccReadOrder::SourceKeyAsc),
+                projection: MvccProjection::TargetKeySourceValue,
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            first_match.rows,
+            vec![
+                MvccReadRow {
+                    source_key: Some("profile:1".to_string()),
+                    key: Some("team:alpha".to_string()),
+                    value: Some("team:alpha".to_string()),
+                },
+                MvccReadRow {
+                    source_key: Some("profile:2".to_string()),
+                    key: Some("team:beta".to_string()),
                     value: Some("team:beta".to_string()),
                 },
             ]
