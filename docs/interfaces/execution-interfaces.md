@@ -25,6 +25,7 @@ Each physical plan node must include:
   - `Concat { sources }` (explicit composition primitive; recursively concatenates existing source shapes in source-list order before downstream filter/order/limit)
   - `ConcatDistinct { sources }` (ordered deduplicating composition primitive; recursively keeps the first occurrence of each resolved row while preserving distinct source-provenance rows)
   - `IntersectDistinct { sources }` (ordered intersection primitive; emits first-source rows whose exact resolved-row identity appears in every subsource, with source provenance treated as part of identity)
+  - `IntersectAll { sources }` (ordered multiset intersection primitive; emits first-source rows up to the minimum exact resolved-row identity count across subsources, with source provenance treated as part of identity)
   - `ExceptDistinct { sources }` (ordered subtraction primitive; emits first-source rows whose exact resolved-row identity does not appear in any remaining subsource, with source provenance treated as part of identity)
   - `SymmetricDifferenceDistinct { sources }` (ordered unique-presence primitive; emits rows whose exact resolved-row identity appears in exactly one subsource, preserving first appearance order and treating source provenance as part of identity)
   - `FollowValueKeyRefs { keys }` (join-adjacent foreign-key-style expansion; for each visible seed key in request order, look up the visible target row whose key matches the seed row's value)
@@ -79,6 +80,7 @@ Each physical plan node must include:
 - `Concat { sources }` is the first explicit source-composition primitive; it lets the engine concatenate heterogeneous scan/lookup/join-adjacent source shapes recursively without changing the row contract or fallback semantics.
 - `ConcatDistinct { sources }` widens that surface with ordered deduplication while still preserving rows that remain semantically distinct because their source provenance differs.
 - `IntersectDistinct { sources }` adds the first set-style composition helper; it keeps the first source's order but only emits rows whose full resolved identity also appears in every remaining subsource.
+- `IntersectAll { sources }` is the first ordered multiset helper; it keeps the first source's order and multiplicity, capped by the minimum matching count across the remaining subsources.
 - `ExceptDistinct { sources }` complements that set-style surface with ordered subtraction; it keeps the first source's order while removing rows whose full resolved identity appears anywhere in the remaining subsources.
 - `SymmetricDifferenceDistinct { sources }` widens the same surface with an ordered unique-presence helper; it emits rows whose full resolved identity appears in exactly one subsource while preserving first appearance order across the source list.
 - `FollowValueKeyRefs { keys }` is the first join-adjacent bootstrap shape; it performs a deterministic two-stage value→key expansion while preserving request order, skipping missing seed/target rows, and then composes through the same filter/order/limit pipeline.
@@ -87,4 +89,4 @@ Each physical plan node must include:
 - `FollowValueKeyRefValueKeyRefs { keys }` widens that source-preserving join surface into a deterministic three-hop chain, proving the current row contract can carry deeper relational composition without losing seed provenance or changing fallback semantics.
 - `FollowValueKeyRefValueKeyPrefixes { keys }` widens the same surface into a deterministic chained fan-out shape, proving the engine-facing contract still holds when the final hop expands to multiple visible rows.
 - The row contract now carries optional `source_key` provenance, which enabled the first true source-preserving join shape to land without another result-surface rewrite.
-- Next obvious Q2 extension is widening the explicit source-composition surface beyond the current ordered distinct-policy helpers (for example multiset/all semantics or deeper nested join-composition helpers) without weakening the explicit GPU fallback contract.
+- Next obvious Q2 extension is widening the explicit source-composition surface beyond the first ordered multiset helper (for example `ExceptAll` / symmetric-difference-all semantics or deeper nested join-composition helpers) without weakening the explicit GPU fallback contract.

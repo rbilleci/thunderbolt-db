@@ -3,6 +3,9 @@
 ## 2026-05-01
 
 ### Completed
+- Extended the engine-facing MVCC bootstrap slice with `MvccReadSource::IntersectAll { sources }`, the first ordered multiset helper: the engine now preserves first-source order while emitting each exact resolved-row identity up to the minimum count shared across subsources, with source provenance treated as part of identity.
+- Added end-to-end engine regression coverage proving `IntersectAll` respects multiplicity caps for exact non-join overlap, preserves multiplicity for join rows only when source provenance also matches, and still composes with source-aware filters/order clauses plus join-side projection under the existing fallback contract.
+- Reconciled README/execution/roadmap docs so the Q2 truth surface now includes the first ordered multiset helper and the next extension boundary narrows toward `ExceptAll`/symmetric-difference-all semantics beyond the current mix of distinct and multiset composition controls.
 - Extended the engine-facing MVCC bootstrap slice with `MvccReadSource::SymmetricDifferenceDistinct { sources }`, an ordered unique-presence helper: the engine now emits rows whose exact resolved-row identity appears in exactly one subsource while preserving first appearance order across the source list and treating source provenance as part of identity.
 - Added end-to-end engine regression coverage proving `SymmetricDifferenceDistinct` collapses per-source duplicates before counting presence, preserves distinct join provenance, and still composes with source-aware filters/order clauses plus join-side projection under the existing fallback contract.
 - Reconciled README/execution/roadmap docs so the Q2 truth surface now includes ordered symmetric difference and the next extension boundary narrows toward multiset/all composition policies beyond the current distinct helpers.
