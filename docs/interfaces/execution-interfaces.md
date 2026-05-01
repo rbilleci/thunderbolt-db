@@ -35,6 +35,7 @@ Each physical plan node must include:
   - `FollowValueKeyRefPrefixes { keys }` (source-preserving two-hop expansion; for each visible seed key in request order, look up the visible intermediate row whose key matches the seed row's value, then expand all visible target rows whose keys share the intermediate row's value as a prefix)
   - `FollowValueKeyRefValueKeyRefs { keys }` (source-preserving three-hop expansion; for each visible seed key in request order, follow seed value -> visible intermediate row -> visible intermediate value -> final visible target row)
   - `FollowValueKeyRefValueKeyPrefixes { keys }` (source-preserving chained fan-out; for each visible seed key in request order, follow seed value -> visible intermediate row -> visible intermediate value -> visible prefix-driven target expansion)
+  - `FollowValueKeyRefValueKeyRefPrefixes { keys }` (source-preserving four-hop fan-out; for each visible seed key in request order, follow seed value -> visible intermediate row -> visible intermediate value -> visible referenced row -> visible prefix-driven target expansion)
 - Snapshot binding:
   - `MvccReadQuery.visibility.read_txn_id` chooses the MVCC snapshot used by storage visibility checks
 - Filter layer:
@@ -94,5 +95,6 @@ Each physical plan node must include:
 - `FollowValueKeyRefPrefixes { keys }` is the first source-preserving two-hop join shape; it preserves the original seed provenance across a value→key lookup and then a prefix fan-out from the intermediate row without changing the engine-facing row contract.
 - `FollowValueKeyRefValueKeyRefs { keys }` widens that source-preserving join surface into a deterministic three-hop chain, proving the current row contract can carry deeper relational composition without losing seed provenance or changing fallback semantics.
 - `FollowValueKeyRefValueKeyPrefixes { keys }` widens the same surface into a deterministic chained fan-out shape, proving the engine-facing contract still holds when the final hop expands to multiple visible rows.
+- `FollowValueKeyRefValueKeyRefPrefixes { keys }` pushes that same source-preserving surface one hop deeper into a value→key→value→key→prefix chain while keeping the original seed provenance and the same fallback semantics intact.
 - The row contract now carries optional `source_key` provenance, which enabled the first true source-preserving join shape to land without another result-surface rewrite.
-- Next obvious Q2 extension is widening the explicit source-composition surface beyond the first complete distinct+multiset family (for example deeper nested join-composition helpers) without weakening the explicit GPU fallback contract.
+- Next obvious Q2 extension is widening the deeper source-preserving join-composition surface beyond the new four-hop prefix chain (for example other four-hop result shapes or composable nested join helpers) without weakening the explicit GPU fallback contract.

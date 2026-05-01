@@ -3,6 +3,9 @@
 ## 2026-05-01
 
 ### Completed
+- Extended the engine-facing MVCC bootstrap slice with `MvccReadSource::FollowValueKeyRefValueKeyRefPrefixes { keys }`, a source-preserving four-hop fan-out: for each visible seed key, the engine now follows seed value -> visible referenced row -> visible referenced-row value -> visible referenced row -> visible prefix-driven target expansion while preserving original seed provenance and the same explicit `GpuMvccReadParityGap` fallback contract.
+- Added end-to-end engine regression coverage proving the new four-hop source preserves request order, skips missing seed/intermediate/reference/prefix rows cleanly, and still composes deterministically through downstream filter/order/limit stages under duplicate seeds.
+- Reconciled README/execution/roadmap docs so the Q2 truth surface now includes source-preserving value→key→value→key→prefix chaining and the next extension boundary narrows toward other deeper join-composition helpers.
 - Added deterministic source-composition workload fixture `tests/fixtures/mvcc-source-composition-workload.txt` plus an engine-facing replay test, so future Q2 loops can measure the new source-composition family against stable multiset/join-adjacent data instead of only one-off inline setups.
 - Reconciled README/execution/roadmap docs so the workload-fixture truth surface now covers both basic MVCC history replay and explicit source-composition replay.
 - Extended the engine-facing MVCC bootstrap slice with `MvccReadSource::SymmetricDifferenceAll { sources }`, an ordered multiset symmetric-difference primitive: the engine now iteratively cancels exact resolved-row identity multiplicity source-by-source, then emits the remaining imbalance in first appearance order while treating source provenance as part of identity.
