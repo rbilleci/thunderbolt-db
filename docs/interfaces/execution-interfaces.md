@@ -44,9 +44,10 @@ Each physical plan node must include:
   - `KeyValue`
   - `KeyOnly`
   - `ValueOnly`
+  - `TargetKeySourceValue` (join-adjacent projection that keeps the resolved target key in `key` while surfacing the original seed row's value in `value`)
 - Result row contract:
   - `MvccReadRow { source_key, key, value }`
-  - `source_key` is `None` for scan/lookup shapes and populated for join-adjacent expansion rows so source provenance survives the current CPU reference pipeline.
+  - `source_key` is `None` for scan/lookup shapes and populated for join-adjacent expansion rows so source provenance survives the current CPU reference pipeline while join-side projections still reuse the same result contract.
 - Optional row cap:
   - `limit = Some(n)` applies after visibility + filter + ordering stages
 - Current execution/device contract:
@@ -66,4 +67,4 @@ Each physical plan node must include:
 - `FollowValueKeyRefValueKeyRefs { keys }` widens that source-preserving join surface into a deterministic three-hop chain, proving the current row contract can carry deeper relational composition without losing seed provenance or changing fallback semantics.
 - `FollowValueKeyRefValueKeyPrefixes { keys }` widens the same surface into a deterministic chained fan-out shape, proving the engine-facing contract still holds when the final hop expands to multiple visible rows.
 - The row contract now carries optional `source_key` provenance, which enabled the first true source-preserving join shape to land without another result-surface rewrite.
-- Next obvious Q2 extension is wider relational composition beyond chained fan-out (for example explicit join-side projections) without weakening the explicit GPU fallback contract.
+- Next obvious Q2 extension is wider relational composition beyond the current chained fan-out + seed-side value projection surface (for example source-aware filters/order clauses or additional mixed result-shape controls) without weakening the explicit GPU fallback contract.

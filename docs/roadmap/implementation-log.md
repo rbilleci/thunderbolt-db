@@ -3,6 +3,9 @@
 ## 2026-05-01
 
 ### Completed
+- Extended the engine-facing MVCC bootstrap slice with `MvccProjection::TargetKeySourceValue`, so join-adjacent reads can now preserve the resolved target key while projecting the original seed row's value through the existing result contract instead of forcing target-only output shapes.
+- Added end-to-end engine regression coverage proving the new join-side projection composes deterministically with source-preserving chained fan-out, order, and limit, while keeping non-join lookup shapes stable under the same projection enum.
+- Reconciled README/execution/roadmap docs so the Q2 truth surface now includes seed-side value projection and the next extension boundary narrows to source-aware filters/order or other mixed result-shape controls.
 - Extended the engine-facing MVCC bootstrap slice with `FollowValueKeyRefValueKeyPrefixes { keys }`, a source-preserving chained fan-out shape: for each visible seed key, the engine now follows seed value -> visible intermediate row -> visible intermediate value -> visible prefix fan-out while preserving the original seed provenance and the existing GPU-first fallback contract.
 - Added end-to-end engine regression coverage proving the new chained fan-out source preserves request order, skips missing seed/intermediate/final-prefix rows cleanly, and still composes deterministically through downstream filter/order/limit stages under duplicate seeds.
 - Reconciled README/execution/roadmap docs so the Q2 truth surface now includes source-preserving value→key→value→prefix chaining and the next extension boundary narrows to explicit join-side projections or another richer relational shape.

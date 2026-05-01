@@ -9,7 +9,7 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
 - WAL durability + queue watermarks (flushed, buffered, unflushed, pending depth/capacity, pending age/deadline), commit/apply/visibility lag gauges, explicit backlog/gap blocker flags, active transaction depth, and failover/admission readiness flags (`quiescent_for_failover`, `follower_promotion_ready`, `mutation_admission_saturated`)
 - Engine truth surface via `Engine::status_snapshot()` for served snapshot identity/frontier, active fallback reasons + parity rollups, and replication/readiness health
 - Engine telemetry snapshot + sink publication API for replication lag, durable WAL/snapshot frontier, write-path readiness/backlog state, and runtime metrics
-- Thin MVCC execution slice via `Engine::execute_mvcc_query()` covering snapshot-bound full scan / key lookup / key-batch fan-in / value→key reference expansion / value→key→prefix source-preserving expansion / value→key→value→key source-preserving chaining / value→key→value→prefix source-preserving chained fan-out, optional key-prefix/range or value-equality filtering, ordering, limit, and key/value projection through the execution layer with explicit CPU fallback parity tracking (`GPU-123`)
+- Thin MVCC execution slice via `Engine::execute_mvcc_query()` covering snapshot-bound full scan / key lookup / key-batch fan-in / value→key reference expansion / value→key→prefix source-preserving expansion / value→key→value→key source-preserving chaining / value→key→value→prefix source-preserving chained fan-out, optional key-prefix/range or value-equality filtering, ordering, limit, and key/value or join-side source-value projection through the execution layer with explicit CPU fallback parity tracking (`GPU-123`)
 - CPU-first reference engine skeleton
 - Device-aware execution abstractions
 
@@ -37,9 +37,10 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
   - `MvccProjection::KeyValue`
   - `MvccProjection::KeyOnly`
   - `MvccProjection::ValueOnly`
+  - `MvccProjection::TargetKeySourceValue` (join-adjacent result shape that keeps the target key while projecting the original seed row's value)
 - Result row shape:
   - `MvccReadRow { source_key, key, value }`
-  - `source_key` is populated for join-adjacent expansion sources so future source-preserving joins can keep seed provenance visible without changing the engine-facing result contract again.
+  - `source_key` is populated for join-adjacent expansion sources so source-preserving joins can keep seed provenance visible while join-side projections reuse the same engine-facing result contract.
 - Supported ordering:
   - `MvccReadOrder::KeyAsc`
   - `MvccReadOrder::KeyDesc`
@@ -54,7 +55,7 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
 - Deterministic workload fixture:
   - `tests/fixtures/mvcc-read-workload.txt`
 - Next obvious extension boundary:
-  - widen the join-adjacent slice from the current source-preserving multi-hop reads into richer relational composition beyond chained fan-out (for example explicit join-side projections or mixed result-shape controls) while preserving the same engine-facing contract and explicit fallback accounting on the eventual GPU-backed path.
+  - widen the join-adjacent slice further from the current source-preserving multi-hop reads plus seed-side value projection into richer relational composition (for example source-aware filters/order clauses or additional mixed result-shape controls) while preserving the same engine-facing contract and explicit fallback accounting on the eventual GPU-backed path.
 
 ## Quickstart
 

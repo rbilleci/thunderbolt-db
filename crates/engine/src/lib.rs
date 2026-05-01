@@ -112,6 +112,7 @@ pub enum MvccProjection {
     KeyValue,
     KeyOnly,
     ValueOnly,
+    TargetKeySourceValue,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,11 +143,16 @@ pub struct MvccReadResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedMvccRow {
     source_key: Option<String>,
+    source_tuple: Option<TupleVersion>,
     tuple: TupleVersion,
 }
 
 fn project_mvcc_row(row: ResolvedMvccRow, projection: MvccProjection) -> MvccReadRow {
-    let ResolvedMvccRow { source_key, tuple } = row;
+    let ResolvedMvccRow {
+        source_key,
+        source_tuple,
+        tuple,
+    } = row;
     match projection {
         MvccProjection::KeyValue => MvccReadRow {
             source_key,
@@ -162,6 +168,11 @@ fn project_mvcc_row(row: ResolvedMvccRow, projection: MvccProjection) -> MvccRea
             source_key,
             key: None,
             value: Some(tuple.value),
+        },
+        MvccProjection::TargetKeySourceValue => MvccReadRow {
+            source_key,
+            key: Some(tuple.key),
+            value: source_tuple.map(|tuple| tuple.value),
         },
     }
 }
@@ -240,6 +251,7 @@ fn resolve_mvcc_source(
             while let Some(tuple) = cursor.next() {
                 rows.push(ResolvedMvccRow {
                     source_key: None,
+                    source_tuple: None,
                     tuple,
                 });
             }
@@ -250,6 +262,7 @@ fn resolve_mvcc_source(
             .into_iter()
             .map(|tuple| ResolvedMvccRow {
                 source_key: None,
+                source_tuple: None,
                 tuple,
             })
             .collect()),
@@ -259,6 +272,7 @@ fn resolve_mvcc_source(
                 if let Some(tuple) = store.tuple_fetch_by_key(key, visibility)? {
                     rows.push(ResolvedMvccRow {
                         source_key: None,
+                        source_tuple: None,
                         tuple,
                     });
                 }
@@ -272,6 +286,7 @@ fn resolve_mvcc_source(
                     if let Some(target) = store.tuple_fetch_by_key(&seed.value, visibility)? {
                         rows.push(ResolvedMvccRow {
                             source_key: Some(key.clone()),
+                            source_tuple: Some(seed),
                             tuple: target,
                         });
                     }
@@ -288,6 +303,7 @@ fn resolve_mvcc_source(
                         if tuple.key.starts_with(&seed.value) {
                             rows.push(ResolvedMvccRow {
                                 source_key: Some(key.clone()),
+                                source_tuple: Some(seed.clone()),
                                 tuple,
                             });
                         }
@@ -306,6 +322,7 @@ fn resolve_mvcc_source(
                             if tuple.key.starts_with(&intermediate.value) {
                                 rows.push(ResolvedMvccRow {
                                     source_key: Some(key.clone()),
+                                    source_tuple: Some(seed.clone()),
                                     tuple,
                                 });
                             }
@@ -325,6 +342,7 @@ fn resolve_mvcc_source(
                         {
                             rows.push(ResolvedMvccRow {
                                 source_key: Some(key.clone()),
+                                source_tuple: Some(seed),
                                 tuple: target,
                             });
                         }
@@ -346,6 +364,7 @@ fn resolve_mvcc_source(
                                 if tuple.key.starts_with(&prefix_seed.value) {
                                     rows.push(ResolvedMvccRow {
                                         source_key: Some(key.clone()),
+                                        source_tuple: Some(seed.clone()),
                                         tuple,
                                     });
                                 }
@@ -4008,6 +4027,76 @@ mod tests {
                 MvccReadRow {
                     source_key: Some("acct:1".to_string()),
                     key: Some("order:3:a".to_string()),
+                    value: None,
+                },
+            ]
+        );
+
+        let join_side_projection = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FollowValueKeyRefValueKeyPrefixes {
+                    keys: vec!["acct:2".to_string(), "acct:1".to_string()],
+                },
+                visibility: StorageVisibility { read_txn_id: 16 },
+                filter: None,
+                order: Some(MvccReadOrder::KeyAsc),
+                projection: MvccProjection::TargetKeySourceValue,
+                limit: Some(3),
+            })
+            .unwrap();
+
+        assert_eq!(
+            join_side_projection.rows,
+            vec![
+                MvccReadRow {
+                    source_key: Some("acct:2".to_string()),
+                    key: Some("order:2:a".to_string()),
+                    value: Some("profile:2".to_string()),
+                },
+                MvccReadRow {
+                    source_key: Some("acct:2".to_string()),
+                    key: Some("order:2:b".to_string()),
+                    value: Some("profile:2".to_string()),
+                },
+                MvccReadRow {
+                    source_key: Some("acct:1".to_string()),
+                    key: Some("order:3:a".to_string()),
+                    value: Some("profile:1".to_string()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn execute_mvcc_query_join_side_projection_keeps_non_join_shapes_stable() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=open").unwrap();
+        e.execute_text(2, "SET acct:2=locked").unwrap();
+
+        let result = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::KeyBatchLookup {
+                    keys: vec!["acct:2".to_string(), "acct:1".to_string()],
+                },
+                visibility: StorageVisibility { read_txn_id: 2 },
+                filter: None,
+                order: None,
+                projection: MvccProjection::TargetKeySourceValue,
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            result.rows,
+            vec![
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("acct:2".to_string()),
+                    value: None,
+                },
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("acct:1".to_string()),
                     value: None,
                 },
             ]
