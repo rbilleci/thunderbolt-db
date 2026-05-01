@@ -3,6 +3,10 @@
 ## 2026-05-01
 
 ### Completed
+- Added `MvccReadSource::FollowValueChain { keys, plan }` plus `MvccValueChainPlan`, a generic source-preserving linear nested-join mechanism that covers the existing value→key helper family by hop count + terminal behavior instead of requiring another one-off enum variant for every deeper chain shape.
+- Refactored the legacy deep join helpers to resolve through the shared `FollowValueChain` path, keeping the same `MvccReadRow { source_key, key, value }` contract and explicit `GpuMvccReadParityGap` fallback semantics while shrinking bespoke nested logic.
+- Added engine regression coverage proving the generic chain surface matches the existing deepest prefix and terminal helper semantics exactly, including downstream ordering and join-side projection.
+- Reconciled README/execution/roadmap docs so the Q2 truth surface now records the new generic linear nested-join mechanism and shifts the next extension boundary toward branch/fan-in planning instead of more linear enum growth.
 - Extended the engine-facing MVCC bootstrap slice with `MvccReadSource::FollowValueKeyRefValueKeyRefValueKeyRefPrefixes { keys }`, a deeper source-preserving nested fan-out chain: for each visible seed key, the engine now follows seed value -> visible referenced row -> visible referenced-row value -> visible referenced row -> visible referenced-row value -> visible referenced row -> visible referenced-row value -> visible prefix-driven target expansion while preserving original seed provenance and the same explicit `GpuMvccReadParityGap` fallback contract.
 - Added end-to-end engine regression coverage proving the new deeper nested fan-out source preserves request order, skips missing seed/intermediate/reference/prefix rows cleanly, and still composes deterministically through downstream filter/order/limit stages under duplicate seeds.
 - Reconciled README/execution/roadmap docs so the Q2 truth surface now includes deeper source-preserving value→key→value→key→value→key→prefix chaining, and explicitly narrowed the next extension boundary toward a more composable nested-join mechanism rather than more permutation growth.

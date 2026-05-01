@@ -9,7 +9,7 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
 - WAL durability + queue watermarks (flushed, buffered, unflushed, pending depth/capacity, pending age/deadline), commit/apply/visibility lag gauges, explicit backlog/gap blocker flags, active transaction depth, and failover/admission readiness flags (`quiescent_for_failover`, `follower_promotion_ready`, `mutation_admission_saturated`)
 - Engine truth surface via `Engine::status_snapshot()` for served snapshot identity/frontier, active fallback reasons + parity rollups, and replication/readiness health
 - Engine telemetry snapshot + sink publication API for replication lag, durable WAL/snapshot frontier, write-path readiness/backlog state, and runtime metrics
-- Thin MVCC execution slice via `Engine::execute_mvcc_query()` covering snapshot-bound full scan / key lookup / key-batch fan-in / explicit multi-source `Concat`, `ConcatDistinct`, `IntersectDistinct`, `IntersectAll`, `ExceptDistinct`, `ExceptAll`, `SymmetricDifferenceDistinct`, and `SymmetricDifferenceAll` composition / value→key reference expansion / value→key→prefix source-preserving expansion / value→key→value→key source-preserving chaining / value→key→value→prefix source-preserving chained fan-out / value→key→value→key→prefix four-hop source-preserving chaining / value→key→value→key→value→key deeper terminal chaining / value→key→value→key→value→prefix deeper fan-out chaining / value→key→value→key→value→key→prefix deeper nested fan-out chaining, optional key-prefix/range or source-aware key/value filtering, source-aware ordering, limit, and key/value or join-side source-value projection through the execution layer with explicit CPU fallback parity tracking (`GPU-123`)
+- Thin MVCC execution slice via `Engine::execute_mvcc_query()` covering snapshot-bound full scan / key lookup / key-batch fan-in / explicit multi-source `Concat`, `ConcatDistinct`, `IntersectDistinct`, `IntersectAll`, `ExceptDistinct`, `ExceptAll`, `SymmetricDifferenceDistinct`, and `SymmetricDifferenceAll` composition / generic `FollowValueChain { keys, plan }` linear nested-join expansion / legacy value→key reference helpers layered on that same chain mechanism / optional key-prefix/range or source-aware key/value filtering, source-aware ordering, limit, and key/value or join-side source-value projection through the execution layer with explicit CPU fallback parity tracking (`GPU-123`)
 - CPU-first reference engine skeleton
 - Device-aware execution abstractions
 
@@ -28,6 +28,7 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
   - `MvccReadSource::ExceptAll { sources }` (ordered multiset subtraction primitive; emits first-source rows after subtracting exact resolved-row identity multiplicity contributed by remaining subsources, with source provenance treated as part of identity)
   - `MvccReadSource::SymmetricDifferenceDistinct { sources }` (ordered unique-presence primitive; emits rows whose exact resolved-row identity appears in exactly one subsource, preserving first appearance order and treating source provenance as part of identity)
   - `MvccReadSource::SymmetricDifferenceAll { sources }` (ordered multiset symmetric-difference primitive; iteratively cancels exact resolved-row identity multiplicity source-by-source and emits the remaining imbalance in first appearance order, with source provenance treated as part of identity)
+  - `MvccReadSource::FollowValueChain { keys, plan }` (generic source-preserving linear nested-join helper; follows `plan.value_key_hops` visible value→key hops from each visible seed row, then either returns the current row or expands visible keys matching the current row's value as a prefix)
   - `MvccReadSource::FollowValueKeyRefs { keys }` (join-adjacent foreign-key-style expansion from seed row values to referenced keys)
   - `MvccReadSource::FollowValueKeyPrefixes { keys }` (prefix-driven foreign-key-style expansion from seed row values to visible target-key ranges)
   - `MvccReadSource::FollowValueKeyRefPrefixes { keys }` (source-preserving two-hop expansion: seed value -> referenced row -> prefix-driven target fan-out)
@@ -76,7 +77,7 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
   - `tests/fixtures/mvcc-read-workload.txt`
   - `tests/fixtures/mvcc-source-composition-workload.txt`
 - Next obvious extension boundary:
-  - widen the deeper source-preserving join-composition surface beyond the new deeper nested fan-out helper (for example more composable nested join helpers that reduce the need for another one-off enum variant) while preserving the same engine-facing contract and explicit fallback accounting on the eventual GPU-backed path.
+  - widen the new generic linear `FollowValueChain` surface into branch/fan-in nested joins or richer source-provenance controls without regressing the same engine-facing contract and explicit fallback accounting on the eventual GPU-backed path.
 
 ## Quickstart
 

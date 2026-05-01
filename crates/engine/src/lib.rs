@@ -78,25 +78,79 @@ struct PendingMutation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MvccReadSource {
     FullScan,
-    KeyLookup { key: String },
-    KeyBatchLookup { keys: Vec<String> },
-    Concat { sources: Vec<MvccReadSource> },
-    ConcatDistinct { sources: Vec<MvccReadSource> },
-    IntersectDistinct { sources: Vec<MvccReadSource> },
-    IntersectAll { sources: Vec<MvccReadSource> },
-    ExceptDistinct { sources: Vec<MvccReadSource> },
-    ExceptAll { sources: Vec<MvccReadSource> },
-    SymmetricDifferenceDistinct { sources: Vec<MvccReadSource> },
-    SymmetricDifferenceAll { sources: Vec<MvccReadSource> },
-    FollowValueKeyRefs { keys: Vec<String> },
-    FollowValueKeyPrefixes { keys: Vec<String> },
-    FollowValueKeyRefPrefixes { keys: Vec<String> },
-    FollowValueKeyRefValueKeyRefs { keys: Vec<String> },
-    FollowValueKeyRefValueKeyPrefixes { keys: Vec<String> },
-    FollowValueKeyRefValueKeyRefPrefixes { keys: Vec<String> },
-    FollowValueKeyRefValueKeyRefValueKeyRefs { keys: Vec<String> },
-    FollowValueKeyRefValueKeyRefValueKeyPrefixes { keys: Vec<String> },
-    FollowValueKeyRefValueKeyRefValueKeyRefPrefixes { keys: Vec<String> },
+    KeyLookup {
+        key: String,
+    },
+    KeyBatchLookup {
+        keys: Vec<String>,
+    },
+    Concat {
+        sources: Vec<MvccReadSource>,
+    },
+    ConcatDistinct {
+        sources: Vec<MvccReadSource>,
+    },
+    IntersectDistinct {
+        sources: Vec<MvccReadSource>,
+    },
+    IntersectAll {
+        sources: Vec<MvccReadSource>,
+    },
+    ExceptDistinct {
+        sources: Vec<MvccReadSource>,
+    },
+    ExceptAll {
+        sources: Vec<MvccReadSource>,
+    },
+    SymmetricDifferenceDistinct {
+        sources: Vec<MvccReadSource>,
+    },
+    SymmetricDifferenceAll {
+        sources: Vec<MvccReadSource>,
+    },
+    FollowValueChain {
+        keys: Vec<String>,
+        plan: MvccValueChainPlan,
+    },
+    FollowValueKeyRefs {
+        keys: Vec<String>,
+    },
+    FollowValueKeyPrefixes {
+        keys: Vec<String>,
+    },
+    FollowValueKeyRefPrefixes {
+        keys: Vec<String>,
+    },
+    FollowValueKeyRefValueKeyRefs {
+        keys: Vec<String>,
+    },
+    FollowValueKeyRefValueKeyPrefixes {
+        keys: Vec<String>,
+    },
+    FollowValueKeyRefValueKeyRefPrefixes {
+        keys: Vec<String>,
+    },
+    FollowValueKeyRefValueKeyRefValueKeyRefs {
+        keys: Vec<String>,
+    },
+    FollowValueKeyRefValueKeyRefValueKeyPrefixes {
+        keys: Vec<String>,
+    },
+    FollowValueKeyRefValueKeyRefValueKeyRefPrefixes {
+        keys: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MvccValueChainTerminal {
+    CurrentRow,
+    CurrentValuePrefixes,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MvccValueChainPlan {
+    pub value_key_hops: usize,
+    pub terminal: MvccValueChainTerminal,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -341,6 +395,55 @@ where
     }
     operator.close();
     rows
+}
+
+fn resolve_follow_value_chain(
+    store: &InMemoryTupleStore,
+    keys: &[String],
+    visibility: StorageVisibility,
+    plan: MvccValueChainPlan,
+) -> Result<Vec<ResolvedMvccRow>, StorageError> {
+    let mut rows = Vec::new();
+    for key in keys {
+        let Some(seed) = store.tuple_fetch_by_key(key, visibility)? else {
+            continue;
+        };
+
+        let mut current = seed.clone();
+        let mut complete = true;
+        for _ in 0..plan.value_key_hops {
+            let Some(next) = store.tuple_fetch_by_key(&current.value, visibility)? else {
+                complete = false;
+                break;
+            };
+            current = next;
+        }
+
+        if !complete {
+            continue;
+        }
+
+        match plan.terminal {
+            MvccValueChainTerminal::CurrentRow => rows.push(ResolvedMvccRow {
+                source_key: Some(key.clone()),
+                source_tuple: Some(seed),
+                tuple: current,
+            }),
+            MvccValueChainTerminal::CurrentValuePrefixes => {
+                let mut cursor = store.seq_scan_open(visibility)?;
+                while let Some(tuple) = cursor.next() {
+                    if tuple.key.starts_with(&current.value) {
+                        rows.push(ResolvedMvccRow {
+                            source_key: Some(key.clone()),
+                            source_tuple: Some(seed.clone()),
+                            tuple,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    Ok(rows)
 }
 
 fn resolve_mvcc_source(
@@ -598,228 +701,97 @@ fn resolve_mvcc_source(
             }
             Ok(output)
         }
-        MvccReadSource::FollowValueKeyRefs { keys } => {
-            let mut rows = Vec::new();
-            for key in keys {
-                if let Some(seed) = store.tuple_fetch_by_key(key, visibility)? {
-                    if let Some(target) = store.tuple_fetch_by_key(&seed.value, visibility)? {
-                        rows.push(ResolvedMvccRow {
-                            source_key: Some(key.clone()),
-                            source_tuple: Some(seed),
-                            tuple: target,
-                        });
-                    }
-                }
-            }
-            Ok(rows)
+        MvccReadSource::FollowValueChain { keys, plan } => {
+            resolve_follow_value_chain(store, keys, visibility, *plan)
         }
-        MvccReadSource::FollowValueKeyPrefixes { keys } => {
-            let mut rows = Vec::new();
-            for key in keys {
-                if let Some(seed) = store.tuple_fetch_by_key(key, visibility)? {
-                    let mut cursor = store.seq_scan_open(visibility)?;
-                    while let Some(tuple) = cursor.next() {
-                        if tuple.key.starts_with(&seed.value) {
-                            rows.push(ResolvedMvccRow {
-                                source_key: Some(key.clone()),
-                                source_tuple: Some(seed.clone()),
-                                tuple,
-                            });
-                        }
-                    }
-                }
-            }
-            Ok(rows)
-        }
-        MvccReadSource::FollowValueKeyRefPrefixes { keys } => {
-            let mut rows = Vec::new();
-            for key in keys {
-                if let Some(seed) = store.tuple_fetch_by_key(key, visibility)? {
-                    if let Some(intermediate) = store.tuple_fetch_by_key(&seed.value, visibility)? {
-                        let mut cursor = store.seq_scan_open(visibility)?;
-                        while let Some(tuple) = cursor.next() {
-                            if tuple.key.starts_with(&intermediate.value) {
-                                rows.push(ResolvedMvccRow {
-                                    source_key: Some(key.clone()),
-                                    source_tuple: Some(seed.clone()),
-                                    tuple,
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(rows)
-        }
-        MvccReadSource::FollowValueKeyRefValueKeyRefs { keys } => {
-            let mut rows = Vec::new();
-            for key in keys {
-                if let Some(seed) = store.tuple_fetch_by_key(key, visibility)? {
-                    if let Some(intermediate) = store.tuple_fetch_by_key(&seed.value, visibility)? {
-                        if let Some(target) =
-                            store.tuple_fetch_by_key(&intermediate.value, visibility)?
-                        {
-                            rows.push(ResolvedMvccRow {
-                                source_key: Some(key.clone()),
-                                source_tuple: Some(seed),
-                                tuple: target,
-                            });
-                        }
-                    }
-                }
-            }
-            Ok(rows)
-        }
-        MvccReadSource::FollowValueKeyRefValueKeyPrefixes { keys } => {
-            let mut rows = Vec::new();
-            for key in keys {
-                if let Some(seed) = store.tuple_fetch_by_key(key, visibility)? {
-                    if let Some(intermediate) = store.tuple_fetch_by_key(&seed.value, visibility)? {
-                        if let Some(prefix_seed) =
-                            store.tuple_fetch_by_key(&intermediate.value, visibility)?
-                        {
-                            let mut cursor = store.seq_scan_open(visibility)?;
-                            while let Some(tuple) = cursor.next() {
-                                if tuple.key.starts_with(&prefix_seed.value) {
-                                    rows.push(ResolvedMvccRow {
-                                        source_key: Some(key.clone()),
-                                        source_tuple: Some(seed.clone()),
-                                        tuple,
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(rows)
-        }
+        MvccReadSource::FollowValueKeyRefs { keys } => resolve_follow_value_chain(
+            store,
+            keys,
+            visibility,
+            MvccValueChainPlan {
+                value_key_hops: 1,
+                terminal: MvccValueChainTerminal::CurrentRow,
+            },
+        ),
+        MvccReadSource::FollowValueKeyPrefixes { keys } => resolve_follow_value_chain(
+            store,
+            keys,
+            visibility,
+            MvccValueChainPlan {
+                value_key_hops: 0,
+                terminal: MvccValueChainTerminal::CurrentValuePrefixes,
+            },
+        ),
+        MvccReadSource::FollowValueKeyRefPrefixes { keys } => resolve_follow_value_chain(
+            store,
+            keys,
+            visibility,
+            MvccValueChainPlan {
+                value_key_hops: 1,
+                terminal: MvccValueChainTerminal::CurrentValuePrefixes,
+            },
+        ),
+        MvccReadSource::FollowValueKeyRefValueKeyRefs { keys } => resolve_follow_value_chain(
+            store,
+            keys,
+            visibility,
+            MvccValueChainPlan {
+                value_key_hops: 2,
+                terminal: MvccValueChainTerminal::CurrentRow,
+            },
+        ),
+        MvccReadSource::FollowValueKeyRefValueKeyPrefixes { keys } => resolve_follow_value_chain(
+            store,
+            keys,
+            visibility,
+            MvccValueChainPlan {
+                value_key_hops: 2,
+                terminal: MvccValueChainTerminal::CurrentValuePrefixes,
+            },
+        ),
         MvccReadSource::FollowValueKeyRefValueKeyRefPrefixes { keys } => {
-            let mut rows = Vec::new();
-            for key in keys {
-                if let Some(seed) = store.tuple_fetch_by_key(key, visibility)? {
-                    if let Some(intermediate) = store.tuple_fetch_by_key(&seed.value, visibility)? {
-                        if let Some(ref_seed) =
-                            store.tuple_fetch_by_key(&intermediate.value, visibility)?
-                        {
-                            if let Some(prefix_seed) =
-                                store.tuple_fetch_by_key(&ref_seed.value, visibility)?
-                            {
-                                let mut cursor = store.seq_scan_open(visibility)?;
-                                while let Some(tuple) = cursor.next() {
-                                    if tuple.key.starts_with(&prefix_seed.value) {
-                                        rows.push(ResolvedMvccRow {
-                                            source_key: Some(key.clone()),
-                                            source_tuple: Some(seed.clone()),
-                                            tuple,
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(rows)
+            resolve_follow_value_chain(
+                store,
+                keys,
+                visibility,
+                MvccValueChainPlan {
+                    value_key_hops: 3,
+                    terminal: MvccValueChainTerminal::CurrentValuePrefixes,
+                },
+            )
         }
         MvccReadSource::FollowValueKeyRefValueKeyRefValueKeyRefs { keys } => {
-            let mut rows = Vec::new();
-            for key in keys {
-                if let Some(seed) = store.tuple_fetch_by_key(key, visibility)? {
-                    if let Some(intermediate) = store.tuple_fetch_by_key(&seed.value, visibility)? {
-                        if let Some(ref_seed) =
-                            store.tuple_fetch_by_key(&intermediate.value, visibility)?
-                        {
-                            if let Some(final_seed) =
-                                store.tuple_fetch_by_key(&ref_seed.value, visibility)?
-                            {
-                                if let Some(target_seed) =
-                                    store.tuple_fetch_by_key(&final_seed.value, visibility)?
-                                {
-                                    if let Some(target) =
-                                        store.tuple_fetch_by_key(&target_seed.value, visibility)?
-                                    {
-                                        rows.push(ResolvedMvccRow {
-                                            source_key: Some(key.clone()),
-                                            source_tuple: Some(seed.clone()),
-                                            tuple: target,
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(rows)
+            resolve_follow_value_chain(
+                store,
+                keys,
+                visibility,
+                MvccValueChainPlan {
+                    value_key_hops: 5,
+                    terminal: MvccValueChainTerminal::CurrentRow,
+                },
+            )
         }
         MvccReadSource::FollowValueKeyRefValueKeyRefValueKeyPrefixes { keys } => {
-            let mut rows = Vec::new();
-            for key in keys {
-                if let Some(seed) = store.tuple_fetch_by_key(key, visibility)? {
-                    if let Some(intermediate) = store.tuple_fetch_by_key(&seed.value, visibility)? {
-                        if let Some(ref_seed) =
-                            store.tuple_fetch_by_key(&intermediate.value, visibility)?
-                        {
-                            if let Some(final_seed) =
-                                store.tuple_fetch_by_key(&ref_seed.value, visibility)?
-                            {
-                                if let Some(prefix_seed) =
-                                    store.tuple_fetch_by_key(&final_seed.value, visibility)?
-                                {
-                                    let mut cursor = store.seq_scan_open(visibility)?;
-                                    while let Some(tuple) = cursor.next() {
-                                        if tuple.key.starts_with(&prefix_seed.value) {
-                                            rows.push(ResolvedMvccRow {
-                                                source_key: Some(key.clone()),
-                                                source_tuple: Some(seed.clone()),
-                                                tuple,
-                                            });
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(rows)
+            resolve_follow_value_chain(
+                store,
+                keys,
+                visibility,
+                MvccValueChainPlan {
+                    value_key_hops: 4,
+                    terminal: MvccValueChainTerminal::CurrentValuePrefixes,
+                },
+            )
         }
         MvccReadSource::FollowValueKeyRefValueKeyRefValueKeyRefPrefixes { keys } => {
-            let mut rows = Vec::new();
-            for key in keys {
-                if let Some(seed) = store.tuple_fetch_by_key(key, visibility)? {
-                    if let Some(intermediate) = store.tuple_fetch_by_key(&seed.value, visibility)? {
-                        if let Some(ref_seed) =
-                            store.tuple_fetch_by_key(&intermediate.value, visibility)?
-                        {
-                            if let Some(final_seed) =
-                                store.tuple_fetch_by_key(&ref_seed.value, visibility)?
-                            {
-                                if let Some(prefix_seed) =
-                                    store.tuple_fetch_by_key(&final_seed.value, visibility)?
-                                {
-                                    if let Some(prefix_row) =
-                                        store.tuple_fetch_by_key(&prefix_seed.value, visibility)?
-                                    {
-                                        let mut cursor = store.seq_scan_open(visibility)?;
-                                        while let Some(tuple) = cursor.next() {
-                                            if tuple.key.starts_with(&prefix_row.value) {
-                                                rows.push(ResolvedMvccRow {
-                                                    source_key: Some(key.clone()),
-                                                    source_tuple: Some(seed.clone()),
-                                                    tuple,
-                                                });
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(rows)
+            resolve_follow_value_chain(
+                store,
+                keys,
+                visibility,
+                MvccValueChainPlan {
+                    value_key_hops: 5,
+                    terminal: MvccValueChainTerminal::CurrentValuePrefixes,
+                },
+            )
         }
     }
 }
@@ -5202,6 +5174,109 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn execute_mvcc_query_supports_generic_follow_value_chain_plan() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=profile:1").unwrap();
+        e.execute_text(2, "SET acct:2=profile:2").unwrap();
+        e.execute_text(3, "SET acct:3=missing-profile").unwrap();
+        e.execute_text(4, "SET profile:1=team-root:1").unwrap();
+        e.execute_text(5, "SET profile:2=team-root:2").unwrap();
+        e.execute_text(6, "SET team-root:1=prefix:alpha:").unwrap();
+        e.execute_text(7, "SET team-root:2=prefix:beta:").unwrap();
+        e.execute_text(8, "SET prefix:alpha:=team-lead:1").unwrap();
+        e.execute_text(9, "SET prefix:beta:=team-lead:2").unwrap();
+        e.execute_text(10, "SET team-lead:1=group-prefix:alpha:")
+            .unwrap();
+        e.execute_text(11, "SET team-lead:2=group-prefix:beta:")
+            .unwrap();
+        e.execute_text(12, "SET group-prefix:alpha:=squad:alpha:")
+            .unwrap();
+        e.execute_text(13, "SET group-prefix:beta:=squad:beta:")
+            .unwrap();
+        e.execute_text(14, "SET squad:alpha:1=Alice").unwrap();
+        e.execute_text(15, "SET squad:alpha:2=Ally").unwrap();
+        e.execute_text(16, "SET squad:beta:1=Bob").unwrap();
+        e.execute_text(17, "SET squad:beta:2=Bianca").unwrap();
+        e.execute_text(18, "SET team-root:1=prefix:alpha:v2")
+            .unwrap();
+        e.execute_text(19, "SET prefix:alpha:v2=team-lead:3")
+            .unwrap();
+        e.execute_text(20, "SET team-lead:3=group-prefix:alpha:v2:")
+            .unwrap();
+        e.execute_text(21, "SET group-prefix:alpha:v2:=squad:alpha:v2:")
+            .unwrap();
+        e.execute_text(22, "SET squad:alpha:v2:1=Astra").unwrap();
+        e.execute_text(23, "SET squad:alpha:v2:1=talent:1").unwrap();
+        e.execute_text(24, "SET squad:beta:1=talent:2").unwrap();
+        e.execute_text(25, "SET talent:1=Architect").unwrap();
+        e.execute_text(26, "SET talent:2=Builder").unwrap();
+
+        let specialized_prefix = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FollowValueKeyRefValueKeyRefValueKeyRefPrefixes {
+                    keys: vec!["acct:2".to_string(), "acct:1".to_string()],
+                },
+                visibility: StorageVisibility { read_txn_id: 26 },
+                filter: None,
+                order: None,
+                projection: MvccProjection::KeyValue,
+                limit: None,
+            })
+            .unwrap();
+
+        let generic_prefix = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FollowValueChain {
+                    keys: vec!["acct:2".to_string(), "acct:1".to_string()],
+                    plan: MvccValueChainPlan {
+                        value_key_hops: 5,
+                        terminal: MvccValueChainTerminal::CurrentValuePrefixes,
+                    },
+                },
+                visibility: StorageVisibility { read_txn_id: 26 },
+                filter: None,
+                order: None,
+                projection: MvccProjection::KeyValue,
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(generic_prefix.rows, specialized_prefix.rows);
+
+        let specialized_terminal = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FollowValueKeyRefValueKeyRefValueKeyRefs {
+                    keys: vec!["acct:2".to_string(), "acct:1".to_string()],
+                },
+                visibility: StorageVisibility { read_txn_id: 26 },
+                filter: None,
+                order: Some(MvccReadOrder::ValueDesc),
+                projection: MvccProjection::TargetKeySourceValue,
+                limit: None,
+            })
+            .unwrap();
+
+        let generic_terminal = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FollowValueChain {
+                    keys: vec!["acct:2".to_string(), "acct:1".to_string()],
+                    plan: MvccValueChainPlan {
+                        value_key_hops: 5,
+                        terminal: MvccValueChainTerminal::CurrentRow,
+                    },
+                },
+                visibility: StorageVisibility { read_txn_id: 26 },
+                filter: None,
+                order: Some(MvccReadOrder::ValueDesc),
+                projection: MvccProjection::TargetKeySourceValue,
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(generic_terminal.rows, specialized_terminal.rows);
     }
 
     #[test]
