@@ -27,6 +27,7 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
   - `MvccReadSource::ExceptDistinct { sources }` (ordered subtraction primitive; emits first-source rows whose exact resolved-row identity does not appear in any remaining subsource, with source provenance treated as part of identity)
   - `MvccReadSource::ExceptAll { sources }` (ordered multiset subtraction primitive; emits first-source rows after subtracting exact resolved-row identity multiplicity contributed by remaining subsources, with source provenance treated as part of identity)
   - `MvccReadSource::SymmetricDifferenceDistinct { sources }` (ordered unique-presence primitive; emits rows whose exact resolved-row identity appears in exactly one subsource, preserving first appearance order and treating source provenance as part of identity)
+  - `MvccReadSource::SymmetricDifferenceAll { sources }` (ordered multiset symmetric-difference primitive; iteratively cancels exact resolved-row identity multiplicity source-by-source and emits the remaining imbalance in first appearance order, with source provenance treated as part of identity)
   - `MvccReadSource::FollowValueKeyRefs { keys }` (join-adjacent foreign-key-style expansion from seed row values to referenced keys)
   - `MvccReadSource::FollowValueKeyPrefixes { keys }` (prefix-driven foreign-key-style expansion from seed row values to visible target-key ranges)
   - `MvccReadSource::FollowValueKeyRefPrefixes { keys }` (source-preserving two-hop expansion: seed value -> referenced row -> prefix-driven target fan-out)
