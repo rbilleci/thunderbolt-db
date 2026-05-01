@@ -9,7 +9,7 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
 - WAL durability + queue watermarks (flushed, buffered, unflushed, pending depth/capacity, pending age/deadline), commit/apply/visibility lag gauges, explicit backlog/gap blocker flags, active transaction depth, and failover/admission readiness flags (`quiescent_for_failover`, `follower_promotion_ready`, `mutation_admission_saturated`)
 - Engine truth surface via `Engine::status_snapshot()` for served snapshot identity/frontier, active fallback reasons + parity rollups, and replication/readiness health
 - Engine telemetry snapshot + sink publication API for replication lag, durable WAL/snapshot frontier, write-path readiness/backlog state, and runtime metrics
-- Thin MVCC execution slice via `Engine::execute_mvcc_query()` covering snapshot-bound full scan / key lookup / key-batch fan-in / explicit multi-source `Concat`, `ConcatDistinct`, `IntersectDistinct`, and `ExceptDistinct` composition / value→key reference expansion / value→key→prefix source-preserving expansion / value→key→value→key source-preserving chaining / value→key→value→prefix source-preserving chained fan-out, optional key-prefix/range or source-aware key/value filtering, source-aware ordering, limit, and key/value or join-side source-value projection through the execution layer with explicit CPU fallback parity tracking (`GPU-123`)
+- Thin MVCC execution slice via `Engine::execute_mvcc_query()` covering snapshot-bound full scan / key lookup / key-batch fan-in / explicit multi-source `Concat`, `ConcatDistinct`, `IntersectDistinct`, `ExceptDistinct`, and `SymmetricDifferenceDistinct` composition / value→key reference expansion / value→key→prefix source-preserving expansion / value→key→value→key source-preserving chaining / value→key→value→prefix source-preserving chained fan-out, optional key-prefix/range or source-aware key/value filtering, source-aware ordering, limit, and key/value or join-side source-value projection through the execution layer with explicit CPU fallback parity tracking (`GPU-123`)
 - CPU-first reference engine skeleton
 - Device-aware execution abstractions
 
@@ -24,6 +24,7 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
   - `MvccReadSource::ConcatDistinct { sources }` (ordered deduplicating composition primitive; keeps the first occurrence of each resolved row while preserving distinct source-provenance rows)
   - `MvccReadSource::IntersectDistinct { sources }` (ordered intersection primitive; emits first-source rows whose exact resolved-row identity appears in every subsource, with source provenance treated as part of identity)
   - `MvccReadSource::ExceptDistinct { sources }` (ordered subtraction primitive; emits first-source rows whose exact resolved-row identity does not appear in any remaining subsource, with source provenance treated as part of identity)
+  - `MvccReadSource::SymmetricDifferenceDistinct { sources }` (ordered unique-presence primitive; emits rows whose exact resolved-row identity appears in exactly one subsource, preserving first appearance order and treating source provenance as part of identity)
   - `MvccReadSource::FollowValueKeyRefs { keys }` (join-adjacent foreign-key-style expansion from seed row values to referenced keys)
   - `MvccReadSource::FollowValueKeyPrefixes { keys }` (prefix-driven foreign-key-style expansion from seed row values to visible target-key ranges)
   - `MvccReadSource::FollowValueKeyRefPrefixes { keys }` (source-preserving two-hop expansion: seed value -> referenced row -> prefix-driven target fan-out)
@@ -67,7 +68,7 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
 - Deterministic workload fixture:
   - `tests/fixtures/mvcc-read-workload.txt`
 - Next obvious extension boundary:
-  - widen the explicit source-composition surface beyond ordered concatenation/deduplication/intersection/subtraction (for example all-vs-distinct policy controls or deeper nested join composition helpers) while preserving the same engine-facing contract and explicit fallback accounting on the eventual GPU-backed path.
+  - widen the explicit source-composition surface beyond the current ordered distinct-policy helpers (for example multiset/all semantics or deeper nested join composition helpers) while preserving the same engine-facing contract and explicit fallback accounting on the eventual GPU-backed path.
 
 ## Quickstart
 

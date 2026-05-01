@@ -3,6 +3,9 @@
 ## 2026-05-01
 
 ### Completed
+- Extended the engine-facing MVCC bootstrap slice with `MvccReadSource::SymmetricDifferenceDistinct { sources }`, an ordered unique-presence helper: the engine now emits rows whose exact resolved-row identity appears in exactly one subsource while preserving first appearance order across the source list and treating source provenance as part of identity.
+- Added end-to-end engine regression coverage proving `SymmetricDifferenceDistinct` collapses per-source duplicates before counting presence, preserves distinct join provenance, and still composes with source-aware filters/order clauses plus join-side projection under the existing fallback contract.
+- Reconciled README/execution/roadmap docs so the Q2 truth surface now includes ordered symmetric difference and the next extension boundary narrows toward multiset/all composition policies beyond the current distinct helpers.
 - Extended the engine-facing MVCC bootstrap slice with `MvccReadSource::ExceptDistinct { sources }`, an ordered subtraction primitive: the engine now keeps first-source order while removing rows whose exact resolved-row identity appears in any remaining subsource, with source provenance treated as part of identity.
 - Added end-to-end engine regression coverage proving `ExceptDistinct` subtracts exact non-join overlap, preserves join rows that only look similar when source provenance differs, and still composes with source-aware filters/order clauses plus join-side projection under the existing fallback contract.
 - Reconciled README/execution/roadmap docs so the Q2 truth surface now includes ordered subtraction and the next extension boundary narrows toward all-vs-distinct policy controls beyond the current set-style helpers.
