@@ -65,6 +65,7 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
   - `MvccReadFilter::ProvenanceBundlePathContains { bundle, summary, expected }` (ordered contiguous subpath matching over named key/value/`key=value` provenance bundles)
   - `MvccReadFilter::ProvenanceBundlePathCountAtLeast { bundle, summary, expected, min_count }` (ordered repeated-subpath counting over named key/value/`key=value` provenance bundles)
   - `MvccReadFilter::ProvenanceBundlePathPairAtDistance { bundle, summary, left, right, distance }` (relative-position matching for bundle segments separated by an exact distance)
+  - `MvccReadFilter::ProvenanceBundlePathSuffixEquals { bundle, summary, expected }` (whole-bundle suffix matching over named key/value/`key=value` provenance bundles)
   - `MvccReadFilter::ProvenanceBundlePathSegmentEquals { bundle, summary, index, expected }` (bundle-relative positional equality over named key/value/`key=value` provenance bundles)
   - `MvccReadFilter::ProvenanceBundleLenEquals { bundle, expected_len }` (exact whole-bundle cardinality checks over named provenance bundles)
   - `MvccReadFilter::All([...])`
