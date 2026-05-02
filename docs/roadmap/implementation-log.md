@@ -3,6 +3,9 @@
 ## 2026-05-02
 
 ### Completed
+- Extended the reusable MVCC provenance frame-bundle surface with `MvccReadFilter::ProvenanceBundlePathPrefixEquals { bundle, summary, expected }`, so callers can now require a named provenance bundle to begin with an exact key-path, value-path, or `key=value` prefix without re-specifying individual provenance frames or changing the public `MvccReadRow { source_key, key, value }` contract.
+- Added engine regression coverage proving whole-bundle prefix matching distinguishes looping chains from reordered prefixes, still works against `SeedThroughTerminalInput` truncation, and rejects wrong anchored prefixes cleanly.
+- Reconciled README/execution/roadmap docs so the Q2 truth surface now records whole-bundle prefix matching alongside the existing suffix/distance/cardinality predicates and narrows the next extension boundary toward richer anchored-slice or first/last-occurrence constraints.
 - Extended the reusable MVCC provenance frame-bundle surface with `MvccReadFilter::ProvenanceBundlePathSuffixEquals { bundle, summary, expected }`, so callers can now require a named provenance bundle to end with an exact key-path, value-path, or `key=value` suffix without re-specifying individual provenance frames or changing the public `MvccReadRow { source_key, key, value }` contract.
 - Added engine regression coverage proving whole-bundle suffix matching distinguishes deeper looping chains from shorter/truncated paths and rejects wrong suffixes cleanly.
 - Reconciled README/execution/roadmap docs so the Q2 truth surface now records whole-bundle suffix matching alongside the earlier repeated-subpath and distance predicates.
