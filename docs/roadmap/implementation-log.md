@@ -3,6 +3,9 @@
 ## 2026-05-02
 
 ### Completed
+- Extended the MVCC provenance surface with reusable frame bundles: `MvccReadFilter::ProvenanceBundleValueEquals`, `MvccReadOrder::ProvenanceBundleValuePathAsc` / `ProvenanceBundleValuePathDesc`, and `MvccProjection::TargetKeyProvenanceBundleSummary { bundle, summary }`, so common path segments like `SeedThroughTerminalInput` and `FullPath` can now be named once across filter/order/projection without changing the public `MvccReadRow { source_key, key, value }` contract or the explicit `GpuMvccReadParityGap` fallback semantics.
+- Added engine regression coverage proving bundle-aware ordering, filtering, and projection distinguish `SeedThroughTerminalInput` from `FullPath` deterministically on chained joins while leaving non-join shapes empty instead of fabricating provenance state.
+- Reconciled README/execution/roadmap docs so the Q2 truth surface now records reusable frame bundles and narrows the next extension boundary toward richer bundle predicates or key-path summaries.
 - Extended MVCC projection with `MvccProjection::TargetKeyProvenanceSummary { summary }`, so the same nested-join query can now emit a lightweight joined provenance path (keys, values, or `key=value` hops) without changing the public `MvccReadRow { source_key, key, value }` contract or the explicit `GpuMvccReadParityGap` fallback semantics.
 - Added engine regression coverage proving provenance-path summaries stay deterministic across multi-row fan-out and remain empty for non-join shapes instead of fabricating provenance state.
 - Reconciled README/execution/roadmap docs so the Q2 truth surface now records provenance-path summarization and narrows the next extension boundary to reusable frame bundles.

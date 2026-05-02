@@ -9,7 +9,7 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
 - WAL durability + queue watermarks (flushed, buffered, unflushed, pending depth/capacity, pending age/deadline), commit/apply/visibility lag gauges, explicit backlog/gap blocker flags, active transaction depth, and failover/admission readiness flags (`quiescent_for_failover`, `follower_promotion_ready`, `mutation_admission_saturated`)
 - Engine truth surface via `Engine::status_snapshot()` for served snapshot identity/frontier, active fallback reasons + parity rollups, and replication/readiness health
 - Engine telemetry snapshot + sink publication API for replication lag, durable WAL/snapshot frontier, write-path readiness/backlog state, and runtime metrics
-- Thin MVCC execution slice via `Engine::execute_mvcc_query()` covering snapshot-bound full scan / key lookup / key-batch fan-in / explicit multi-source `Concat`, `ConcatDistinct`, `IntersectDistinct`, `IntersectAll`, `ExceptDistinct`, `ExceptAll`, `SymmetricDifferenceDistinct`, and `SymmetricDifferenceAll` composition / generic `FollowValueChain { keys, plan, provenance }` linear nested-join expansion / `FollowValueChainBranches { keys, plans, fan_in, provenance }` plus `FollowValueChainLabeledBranches { keys, branches, fan_in, provenance }` seed-grouped or first-non-empty branch expansion / legacy value→key reference helpers layered on that same chain mechanism / optional key-prefix/range or source-aware key/value or branch-label filtering, explicit multi-frame provenance filters/projection on nested-join rows, source-aware ordering, limit, and key/value or join-side source-value/branch-label/provenance-value/provenance-path-summary projection through the execution layer with explicit CPU fallback parity tracking (`GPU-123`)
+- Thin MVCC execution slice via `Engine::execute_mvcc_query()` covering snapshot-bound full scan / key lookup / key-batch fan-in / explicit multi-source `Concat`, `ConcatDistinct`, `IntersectDistinct`, `IntersectAll`, `ExceptDistinct`, `ExceptAll`, `SymmetricDifferenceDistinct`, and `SymmetricDifferenceAll` composition / generic `FollowValueChain { keys, plan, provenance }` linear nested-join expansion / `FollowValueChainBranches { keys, plans, fan_in, provenance }` plus `FollowValueChainLabeledBranches { keys, branches, fan_in, provenance }` seed-grouped or first-non-empty branch expansion / legacy value→key reference helpers layered on that same chain mechanism / optional key-prefix/range or source-aware key/value or branch-label filtering, explicit multi-frame provenance filters/projection plus reusable frame-bundle controls on nested-join rows, source-aware ordering, limit, and key/value or join-side source-value/branch-label/provenance-value/provenance-path-summary projection through the execution layer with explicit CPU fallback parity tracking (`GPU-123`)
 - CPU-first reference engine skeleton
 - Device-aware execution abstractions
 
@@ -54,6 +54,7 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
   - `MvccReadFilter::ValueEquals(value)`
   - `MvccReadFilter::SourceValueEquals(value)`
   - `MvccReadFilter::ProvenanceValueEquals { frame, expected }`
+  - `MvccReadFilter::ProvenanceBundleValueEquals { bundle, expected }`
   - `MvccReadFilter::All([...])`
   - `MvccReadFilter::Any([...])`
 - Supported projections:
@@ -66,6 +67,7 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
   - `MvccProjection::TargetKeySourceValue` (join-adjacent result shape that keeps the target key while projecting the original seed row's value)
   - `MvccProjection::TargetKeyProvenanceValue { frame }` (join-adjacent result shape that keeps the resolved target key while projecting the value from an explicit provenance frame such as `Seed`, `TerminalInput`, or `ValueHop(n)`)
   - `MvccProjection::TargetKeyProvenanceSummary { summary }` (join-adjacent result shape that keeps the resolved target key while projecting a lightweight provenance-path summary such as joined keys, joined values, or joined `key=value` hops)
+  - `MvccProjection::TargetKeyProvenanceBundleSummary { bundle, summary }` (join-adjacent result shape that keeps the resolved target key while projecting a lightweight summary of a named provenance-frame bundle such as `SeedThroughTerminalInput` or `FullPath`)
 - Result row shape:
   - `MvccReadRow { source_key, key, value }`
   - `source_key` is populated for join-adjacent expansion sources so source-preserving joins can keep seed provenance visible while join-side projections reuse the same engine-facing result contract.
@@ -84,6 +86,8 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
   - `MvccReadOrder::ProvenanceKeyDesc { frame }`
   - `MvccReadOrder::ProvenanceValueAsc { frame }`
   - `MvccReadOrder::ProvenanceValueDesc { frame }`
+  - `MvccReadOrder::ProvenanceBundleValuePathAsc { bundle }`
+  - `MvccReadOrder::ProvenanceBundleValuePathDesc { bundle }`
 - Optional row cap:
   - `limit: Some(n)` applies after visibility + filter + ordering stages
 - Current device strategy:
@@ -94,7 +98,7 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
   - `tests/fixtures/mvcc-read-workload.txt`
   - `tests/fixtures/mvcc-source-composition-workload.txt`
 - Next obvious extension boundary:
-  - add reusable frame bundles on top of the now-expanded provenance surface so common frame groups can be named once and reused across filter/projection/ordering without regressing the same engine-facing contract and explicit fallback accounting on the eventual GPU-backed path.
+  - extend the new frame-bundle surface beyond value-path equality/summary ordering into additional reusable bundle predicates or bundle-aware key summaries without regressing the same engine-facing contract and explicit fallback accounting on the eventual GPU-backed path.
 
 ## Quickstart
 

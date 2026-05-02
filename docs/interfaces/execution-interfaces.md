@@ -59,6 +59,7 @@ Each physical plan node must include:
   - `ValueEquals(value)`
   - `SourceValueEquals(value)`
   - `ProvenanceValueEquals { frame, expected }`
+  - `ProvenanceBundleValueEquals { bundle, expected }`
   - `All([filter...])`
   - `Any([filter...])`
   - source-aware and provenance-frame-aware filter variants only match join-adjacent rows; scan/lookup-only shapes leave them empty rather than fabricating source state
@@ -77,6 +78,8 @@ Each physical plan node must include:
   - `ProvenanceKeyDesc { frame }`
   - `ProvenanceValueAsc { frame }`
   - `ProvenanceValueDesc { frame }`
+  - `ProvenanceBundleValuePathAsc { bundle }`
+  - `ProvenanceBundleValuePathDesc { bundle }`
   - source-aware and provenance-frame-aware ordering variants sort empty/non-join rows deterministically using empty source/frame fields and target key tie-breaks
 - Projection layer:
   - `KeyValue`
@@ -88,6 +91,7 @@ Each physical plan node must include:
   - `TargetKeySourceValue` (join-adjacent projection that keeps the resolved target key in `key` while surfacing the original seed row's value in `value`)
   - `TargetKeyProvenanceValue { frame }` (join-adjacent projection that keeps the resolved target key in `key` while surfacing the value from an explicit provenance frame such as `Seed`, `TerminalInput`, or `ValueHop(n)`)
   - `TargetKeyProvenanceSummary { summary }` (join-adjacent projection that keeps the resolved target key in `key` while surfacing a lightweight provenance-path summary such as joined keys, joined values, or joined `key=value` hops)
+  - `TargetKeyProvenanceBundleSummary { bundle, summary }` (join-adjacent projection that keeps the resolved target key in `key` while surfacing a lightweight summary of a reusable provenance-frame bundle such as `SeedThroughTerminalInput` or `FullPath`)
 - Result row contract:
   - `MvccReadRow { source_key, key, value }`
   - `source_key` is `None` for scan/lookup shapes and populated for join-adjacent expansion rows so source provenance survives the current CPU reference pipeline while join-side projections still reuse the same result contract.
@@ -127,4 +131,5 @@ Each physical plan node must include:
 - `FollowValueKeyRefValueKeyRefValueKeyPrefixes { keys }` adds the matching deeper fan-out sibling, proving the same deeper chain can also terminate in visible prefix expansion without changing the contract.
 - `FollowValueKeyRefValueKeyRefValueKeyRefPrefixes { keys }` still exists as a stable named helper, but it now resolves through the generic linear chain mechanism instead of bespoke one-off nested logic.
 - The row contract now carries optional `source_key` provenance, which enabled the first true source-preserving join shape to land without another result-surface rewrite.
-- Lightweight provenance-path summarization now exists through `TargetKeyProvenanceSummary { summary }`, so the next obvious Q2 extension is reusable frame bundles on top of the same multi-frame provenance surface without weakening the explicit GPU fallback contract.
+- Lightweight provenance-path summarization now exists through `TargetKeyProvenanceSummary { summary }`, and reusable frame bundles now exist through bundle-aware filter/order/projection controls such as `ProvenanceBundleValueEquals`, `ProvenanceBundleValuePathAsc`, and `TargetKeyProvenanceBundleSummary { ... }`.
+- Next obvious Q2 extension is to widen the new frame-bundle surface beyond value-path equality/summary ordering into additional reusable predicates or bundle-aware key summaries without weakening the explicit GPU fallback contract.
