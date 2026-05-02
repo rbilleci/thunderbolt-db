@@ -289,6 +289,12 @@ pub enum MvccReadFilter {
         summary: MvccProvenanceSummary,
         expected: Vec<String>,
     },
+    ProvenanceBundlePathSliceEquals {
+        bundle: MvccProvenanceFrameBundle,
+        summary: MvccProvenanceSummary,
+        start: usize,
+        expected: Vec<String>,
+    },
     ProvenanceBundlePathSegmentEquals {
         bundle: MvccProvenanceFrameBundle,
         summary: MvccProvenanceSummary,
@@ -510,6 +516,17 @@ fn mvcc_provenance_segments_have_prefix(segments: &[String], expected: &[String]
     !expected.is_empty()
         && expected.len() <= segments.len()
         && segments[..expected.len()] == *expected
+}
+
+fn mvcc_provenance_segments_have_slice_at(
+    segments: &[String],
+    start: usize,
+    expected: &[String],
+) -> bool {
+    !expected.is_empty()
+        && start
+            .checked_add(expected.len())
+            .is_some_and(|end| end <= segments.len() && segments[start..end] == *expected)
 }
 
 fn mvcc_provenance_tuple_count_at_least<'a>(
@@ -754,6 +771,14 @@ fn mvcc_row_matches_filter(row: &ResolvedMvccRow, filter: &MvccReadFilter) -> bo
             expected,
         } => resolved_mvcc_row_provenance_bundle_segments(row, *bundle, *summary)
             .is_some_and(|segments| mvcc_provenance_segments_have_prefix(&segments, expected)),
+        MvccReadFilter::ProvenanceBundlePathSliceEquals {
+            bundle,
+            summary,
+            start,
+            expected,
+        } => resolved_mvcc_row_provenance_bundle_segments(row, *bundle, *summary).is_some_and(
+            |segments| mvcc_provenance_segments_have_slice_at(&segments, *start, expected),
+        ),
         MvccReadFilter::ProvenanceBundlePathSegmentEquals {
             bundle,
             summary,
@@ -7787,6 +7812,147 @@ mod tests {
             .unwrap();
 
         assert!(mismatch_prefix_miss.rows.is_empty());
+    }
+
+    #[test]
+    fn execute_mvcc_query_supports_provenance_bundle_slice_filters() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:loop=profile:loop").unwrap();
+        e.execute_text(2, "SET profile:loop=acct:loop").unwrap();
+        e.execute_text(3, "SET acct:solo=profile:solo").unwrap();
+        e.execute_text(4, "SET profile:solo=team:solo").unwrap();
+
+        let anchored_slice_match = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::Concat {
+                    sources: vec![
+                        MvccReadSource::FollowValueChain {
+                            keys: vec!["acct:loop".to_string()],
+                            plan: MvccValueChainPlan {
+                                value_key_hops: 3,
+                                terminal: MvccValueChainTerminal::CurrentRow,
+                            },
+                            provenance: MvccSourceProvenance::Seed,
+                        },
+                        MvccReadSource::FollowValueChain {
+                            keys: vec!["acct:solo".to_string()],
+                            plan: MvccValueChainPlan {
+                                value_key_hops: 1,
+                                terminal: MvccValueChainTerminal::CurrentRow,
+                            },
+                            provenance: MvccSourceProvenance::Seed,
+                        },
+                    ],
+                },
+                visibility: StorageVisibility { read_txn_id: 4 },
+                filter: Some(MvccReadFilter::ProvenanceBundlePathSliceEquals {
+                    bundle: MvccProvenanceFrameBundle::FullPath,
+                    summary: MvccProvenanceSummary::KeyPath,
+                    start: 1,
+                    expected: vec!["profile:loop".to_string(), "acct:loop".to_string()],
+                }),
+                order: None,
+                projection: MvccProjection::TargetKeyProvenanceBundleSummary {
+                    bundle: MvccProvenanceFrameBundle::FullPath,
+                    summary: MvccProvenanceSummary::KeyPath,
+                },
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            anchored_slice_match.rows,
+            vec![MvccReadRow {
+                source_key: Some("acct:loop".to_string()),
+                key: Some("profile:loop".to_string()),
+                value: Some("acct:loop -> profile:loop -> acct:loop -> profile:loop".to_string(),),
+            }]
+        );
+
+        let truncated_slice_match = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FollowValueChain {
+                    keys: vec!["acct:loop".to_string(), "acct:solo".to_string()],
+                    plan: MvccValueChainPlan {
+                        value_key_hops: 2,
+                        terminal: MvccValueChainTerminal::CurrentRow,
+                    },
+                    provenance: MvccSourceProvenance::Seed,
+                },
+                visibility: StorageVisibility { read_txn_id: 4 },
+                filter: Some(MvccReadFilter::ProvenanceBundlePathSliceEquals {
+                    bundle: MvccProvenanceFrameBundle::SeedThroughTerminalInput,
+                    summary: MvccProvenanceSummary::KeyPath,
+                    start: 0,
+                    expected: vec!["acct:loop".to_string(), "profile:loop".to_string()],
+                }),
+                order: Some(MvccReadOrder::KeyAsc),
+                projection: MvccProjection::TargetKeyProvenanceBundleSummary {
+                    bundle: MvccProvenanceFrameBundle::SeedThroughTerminalInput,
+                    summary: MvccProvenanceSummary::KeyPath,
+                },
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            truncated_slice_match.rows,
+            vec![MvccReadRow {
+                source_key: Some("acct:loop".to_string()),
+                key: Some("acct:loop".to_string()),
+                value: Some("acct:loop -> profile:loop".to_string()),
+            }]
+        );
+
+        let wrong_anchor_miss = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FollowValueChain {
+                    keys: vec!["acct:loop".to_string()],
+                    plan: MvccValueChainPlan {
+                        value_key_hops: 3,
+                        terminal: MvccValueChainTerminal::CurrentRow,
+                    },
+                    provenance: MvccSourceProvenance::Seed,
+                },
+                visibility: StorageVisibility { read_txn_id: 4 },
+                filter: Some(MvccReadFilter::ProvenanceBundlePathSliceEquals {
+                    bundle: MvccProvenanceFrameBundle::FullPath,
+                    summary: MvccProvenanceSummary::KeyPath,
+                    start: 0,
+                    expected: vec!["profile:loop".to_string(), "acct:loop".to_string()],
+                }),
+                order: None,
+                projection: MvccProjection::KeyOnly,
+                limit: None,
+            })
+            .unwrap();
+
+        assert!(wrong_anchor_miss.rows.is_empty());
+
+        let out_of_range_slice_miss = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FollowValueChain {
+                    keys: vec!["acct:loop".to_string()],
+                    plan: MvccValueChainPlan {
+                        value_key_hops: 2,
+                        terminal: MvccValueChainTerminal::CurrentRow,
+                    },
+                    provenance: MvccSourceProvenance::Seed,
+                },
+                visibility: StorageVisibility { read_txn_id: 4 },
+                filter: Some(MvccReadFilter::ProvenanceBundlePathSliceEquals {
+                    bundle: MvccProvenanceFrameBundle::SeedThroughTerminalInput,
+                    summary: MvccProvenanceSummary::KeyPath,
+                    start: 2,
+                    expected: vec!["acct:loop".to_string()],
+                }),
+                order: None,
+                projection: MvccProjection::KeyOnly,
+                limit: None,
+            })
+            .unwrap();
+
+        assert!(out_of_range_slice_miss.rows.is_empty());
     }
 
     #[test]

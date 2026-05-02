@@ -9,7 +9,7 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
 - WAL durability + queue watermarks (flushed, buffered, unflushed, pending depth/capacity, pending age/deadline), commit/apply/visibility lag gauges, explicit backlog/gap blocker flags, active transaction depth, and failover/admission readiness flags (`quiescent_for_failover`, `follower_promotion_ready`, `mutation_admission_saturated`)
 - Engine truth surface via `Engine::status_snapshot()` for served snapshot identity/frontier, active fallback reasons + parity rollups, and replication/readiness health
 - Engine telemetry snapshot + sink publication API for replication lag, durable WAL/snapshot frontier, write-path readiness/backlog state, and runtime metrics
-- Thin MVCC execution slice via `Engine::execute_mvcc_query()` covering snapshot-bound full scan / key lookup / key-batch fan-in / explicit multi-source `Concat`, `ConcatDistinct`, `IntersectDistinct`, `IntersectAll`, `ExceptDistinct`, `ExceptAll`, `SymmetricDifferenceDistinct`, and `SymmetricDifferenceAll` composition / generic `FollowValueChain { keys, plan, provenance }` linear nested-join expansion / `FollowValueChainBranches { keys, plans, fan_in, provenance }` plus `FollowValueChainLabeledBranches { keys, branches, fan_in, provenance }` seed-grouped or first-non-empty branch expansion / legacy value→key reference helpers layered on that same chain mechanism / optional key-prefix/range or source-aware key/value or branch-label filtering, explicit multi-frame provenance filters/projection plus reusable frame-bundle controls on nested-join rows including exact ordered bundle-path equality, ordered bundle-subpath matching, counted bundle-membership thresholds, and bundle-relative positional segment equality, source-aware ordering, limit, and key/value or join-side source-value/branch-label/provenance-value/provenance-path-summary projection through the execution layer with explicit CPU fallback parity tracking (`GPU-123`)
+- Thin MVCC execution slice via `Engine::execute_mvcc_query()` covering snapshot-bound full scan / key lookup / key-batch fan-in / explicit multi-source `Concat`, `ConcatDistinct`, `IntersectDistinct`, `IntersectAll`, `ExceptDistinct`, `ExceptAll`, `SymmetricDifferenceDistinct`, and `SymmetricDifferenceAll` composition / generic `FollowValueChain { keys, plan, provenance }` linear nested-join expansion / `FollowValueChainBranches { keys, plans, fan_in, provenance }` plus `FollowValueChainLabeledBranches { keys, branches, fan_in, provenance }` seed-grouped or first-non-empty branch expansion / legacy value→key reference helpers layered on that same chain mechanism / optional key-prefix/range or source-aware key/value or branch-label filtering, explicit multi-frame provenance filters/projection plus reusable frame-bundle controls on nested-join rows including exact ordered bundle-path equality, ordered bundle-subpath matching, anchored bundle-slice matching, counted bundle-membership thresholds, and bundle-relative positional segment equality, source-aware ordering, limit, and key/value or join-side source-value/branch-label/provenance-value/provenance-path-summary projection through the execution layer with explicit CPU fallback parity tracking (`GPU-123`)
 - CPU-first reference engine skeleton
 - Device-aware execution abstractions
 
@@ -67,6 +67,7 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
   - `MvccReadFilter::ProvenanceBundlePathPairAtDistance { bundle, summary, left, right, distance }` (relative-position matching for bundle segments separated by an exact distance)
   - `MvccReadFilter::ProvenanceBundlePathSuffixEquals { bundle, summary, expected }` (whole-bundle suffix matching over named key/value/`key=value` provenance bundles)
   - `MvccReadFilter::ProvenanceBundlePathPrefixEquals { bundle, summary, expected }` (whole-bundle prefix matching over named key/value/`key=value` provenance bundles)
+  - `MvccReadFilter::ProvenanceBundlePathSliceEquals { bundle, summary, start, expected }` (anchored contiguous subpath matching at a chosen bundle-relative offset over named key/value/`key=value` provenance bundles)
   - `MvccReadFilter::ProvenanceBundlePathSegmentEquals { bundle, summary, index, expected }` (bundle-relative positional equality over named key/value/`key=value` provenance bundles)
   - `MvccReadFilter::ProvenanceBundleLenEquals { bundle, expected_len }` (exact whole-bundle cardinality checks over named provenance bundles)
   - `MvccReadFilter::All([...])`
@@ -114,7 +115,7 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
   - `tests/fixtures/mvcc-read-workload.txt`
   - `tests/fixtures/mvcc-source-composition-workload.txt`
 - Next obvious extension boundary:
-  - extend the frame-bundle surface toward richer anchored-slice or first/last-occurrence constraints without regressing the same engine-facing contract and explicit fallback accounting on the eventual GPU-backed path.
+  - extend the frame-bundle surface toward first/last-occurrence constraints without regressing the same engine-facing contract and explicit fallback accounting on the eventual GPU-backed path.
 
 ## Quickstart
 
