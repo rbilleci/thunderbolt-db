@@ -3,6 +3,9 @@
 ## 2026-05-02
 
 ### Completed
+- Extended MVCC ordering with explicit frame-aware provenance controls: `MvccReadOrder::ProvenanceKeyAsc` / `ProvenanceKeyDesc` and `MvccReadOrder::ProvenanceValueAsc` / `ProvenanceValueDesc`, so the same query can now sort by `Seed`, `TerminalInput`, or any `ValueHop(n)` frame without changing the public `MvccReadRow { source_key, key, value }` contract or the explicit `GpuMvccReadParityGap` fallback semantics.
+- Added engine regression coverage proving frame-aware provenance ordering groups nested-join rows by terminal-input values deterministically and that missing provenance frames on non-join rows still sort stably via empty-frame semantics plus target-key tie-breaks.
+- Reconciled README/execution/roadmap docs so the Q2 truth surface now records explicit provenance ordering and moves the next extension boundary past ordering into lightweight provenance-path summarization or reusable frame bundles.
 - Extended the generic nested-join surface so join-adjacent rows now retain their full visible provenance path internally instead of only one selected source frame, while still preserving the same `MvccReadRow { source_key, key, value }` contract and the explicit `GpuMvccReadParityGap` fallback semantics.
 - Added explicit multi-frame MVCC controls: `MvccReadFilter::ProvenanceKeyPrefix { frame, prefix }`, `MvccReadFilter::ProvenanceValueEquals { frame, expected }`, and `MvccProjection::TargetKeyProvenanceValue { frame }`, letting callers inspect `Seed`, `TerminalInput`, or arbitrary `ValueHop(n)` frames in the same query without rewriting the public result surface.
 - Tightened source-composition semantics again so full provenance-path identity now counts for distinct/set-like composition whenever nested-join rows would otherwise look identical through only target row + selected source provenance, preventing `ConcatDistinct` from collapsing rows that still differ at an inspectable intermediate frame.

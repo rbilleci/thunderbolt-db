@@ -73,7 +73,11 @@ Each physical plan node must include:
   - `SourceKeyDesc`
   - `SourceValueAsc`
   - `SourceValueDesc`
-  - source-aware ordering variants sort empty/non-join rows deterministically using empty source fields and target key tie-breaks
+  - `ProvenanceKeyAsc { frame }`
+  - `ProvenanceKeyDesc { frame }`
+  - `ProvenanceValueAsc { frame }`
+  - `ProvenanceValueDesc { frame }`
+  - source-aware and provenance-frame-aware ordering variants sort empty/non-join rows deterministically using empty source/frame fields and target key tie-breaks
 - Projection layer:
   - `KeyValue`
   - `KeyOnly`
@@ -122,4 +126,4 @@ Each physical plan node must include:
 - `FollowValueKeyRefValueKeyRefValueKeyPrefixes { keys }` adds the matching deeper fan-out sibling, proving the same deeper chain can also terminate in visible prefix expansion without changing the contract.
 - `FollowValueKeyRefValueKeyRefValueKeyRefPrefixes { keys }` still exists as a stable named helper, but it now resolves through the generic linear chain mechanism instead of bespoke one-off nested logic.
 - The row contract now carries optional `source_key` provenance, which enabled the first true source-preserving join shape to land without another result-surface rewrite.
-- Next obvious Q2 extension is explicit frame-aware ordering on top of the new multi-frame provenance filter/projection surface, without weakening the explicit GPU fallback contract.
+- Next obvious Q2 extension is lightweight provenance-path summarization or reusable frame bundles now that the same multi-frame provenance surface already spans filters, projection, and ordering, without weakening the explicit GPU fallback contract.

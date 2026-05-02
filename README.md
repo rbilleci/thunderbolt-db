@@ -79,6 +79,10 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
   - `MvccReadOrder::SourceKeyDesc`
   - `MvccReadOrder::SourceValueAsc`
   - `MvccReadOrder::SourceValueDesc`
+  - `MvccReadOrder::ProvenanceKeyAsc { frame }`
+  - `MvccReadOrder::ProvenanceKeyDesc { frame }`
+  - `MvccReadOrder::ProvenanceValueAsc { frame }`
+  - `MvccReadOrder::ProvenanceValueDesc { frame }`
 - Optional row cap:
   - `limit: Some(n)` applies after visibility + filter + ordering stages
 - Current device strategy:
@@ -89,7 +93,7 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
   - `tests/fixtures/mvcc-read-workload.txt`
   - `tests/fixtures/mvcc-source-composition-workload.txt`
 - Next obvious extension boundary:
-  - extend the new multi-frame provenance surface beyond filter/projection into explicit frame-aware ordering (and only then consider broader provenance-path summarization), without regressing the same engine-facing contract and explicit fallback accounting on the eventual GPU-backed path.
+  - extend the multi-frame provenance surface into lightweight provenance-path summarization or reusable frame bundles now that filter/projection/ordering can all target explicit frames, without regressing the same engine-facing contract and explicit fallback accounting on the eventual GPU-backed path.
 
 ## Quickstart
 
