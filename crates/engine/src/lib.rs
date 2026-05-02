@@ -245,6 +245,11 @@ pub enum MvccReadFilter {
         summary: MvccProvenanceSummary,
         expected: Vec<String>,
     },
+    ProvenanceBundlePathContains {
+        bundle: MvccProvenanceFrameBundle,
+        summary: MvccProvenanceSummary,
+        expected: Vec<String>,
+    },
     All(Vec<MvccReadFilter>),
     Any(Vec<MvccReadFilter>),
 }
@@ -411,6 +416,16 @@ fn summarize_mvcc_provenance_tuples<'a>(
     Some(segments.join(" -> "))
 }
 
+fn mvcc_provenance_segments_contain_ordered_subpath(
+    segments: &[String],
+    expected: &[String],
+) -> bool {
+    expected.is_empty()
+        || segments
+            .windows(expected.len())
+            .any(|window| window == expected)
+}
+
 fn collect_mvcc_provenance_segments<'a>(
     tuples: impl Iterator<Item = &'a TupleVersion>,
     summary: MvccProvenanceSummary,
@@ -568,6 +583,13 @@ fn mvcc_row_matches_filter(row: &ResolvedMvccRow, filter: &MvccReadFilter) -> bo
             expected,
         } => resolved_mvcc_row_provenance_bundle_segments(row, *bundle, *summary)
             .is_some_and(|segments| segments == *expected),
+        MvccReadFilter::ProvenanceBundlePathContains {
+            bundle,
+            summary,
+            expected,
+        } => resolved_mvcc_row_provenance_bundle_segments(row, *bundle, *summary).is_some_and(
+            |segments| mvcc_provenance_segments_contain_ordered_subpath(&segments, expected),
+        ),
         MvccReadFilter::All(filters) => filters
             .iter()
             .all(|filter| mvcc_row_matches_filter(row, filter)),
@@ -6860,6 +6882,97 @@ mod tests {
             .unwrap();
 
         assert!(ordered_path_miss.rows.is_empty());
+
+        let key_path_contains = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FollowValueChain {
+                    keys: vec!["acct:1".to_string(), "acct:2".to_string()],
+                    plan: MvccValueChainPlan {
+                        value_key_hops: 2,
+                        terminal: MvccValueChainTerminal::CurrentRow,
+                    },
+                    provenance: MvccSourceProvenance::Seed,
+                },
+                visibility: StorageVisibility { read_txn_id: 8 },
+                filter: Some(MvccReadFilter::ProvenanceBundlePathContains {
+                    bundle: MvccProvenanceFrameBundle::FullPath,
+                    summary: MvccProvenanceSummary::KeyPath,
+                    expected: vec!["profile:2".to_string(), "team:beta".to_string()],
+                }),
+                order: None,
+                projection: MvccProjection::TargetKeyProvenanceBundleSummary {
+                    bundle: MvccProvenanceFrameBundle::FullPath,
+                    summary: MvccProvenanceSummary::KeyPath,
+                },
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            key_path_contains.rows,
+            vec![MvccReadRow {
+                source_key: Some("acct:1".to_string()),
+                key: Some("team:beta".to_string()),
+                value: Some("acct:1 -> profile:2 -> team:beta".to_string()),
+            }]
+        );
+
+        let truncated_bundle_contains_miss = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FollowValueChain {
+                    keys: vec!["acct:1".to_string(), "acct:2".to_string()],
+                    plan: MvccValueChainPlan {
+                        value_key_hops: 2,
+                        terminal: MvccValueChainTerminal::CurrentRow,
+                    },
+                    provenance: MvccSourceProvenance::Seed,
+                },
+                visibility: StorageVisibility { read_txn_id: 8 },
+                filter: Some(MvccReadFilter::ProvenanceBundlePathContains {
+                    bundle: MvccProvenanceFrameBundle::SeedThroughTerminalInput,
+                    summary: MvccProvenanceSummary::ValuePath,
+                    expected: vec!["team:beta".to_string(), "member:2".to_string()],
+                }),
+                order: None,
+                projection: MvccProjection::TargetKeyProvenanceBundleSummary {
+                    bundle: MvccProvenanceFrameBundle::SeedThroughTerminalInput,
+                    summary: MvccProvenanceSummary::ValuePath,
+                },
+                limit: None,
+            })
+            .unwrap();
+
+        assert!(truncated_bundle_contains_miss.rows.is_empty());
+
+        let ordered_subpath_miss = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FollowValueChain {
+                    keys: vec!["acct:1".to_string(), "acct:2".to_string()],
+                    plan: MvccValueChainPlan {
+                        value_key_hops: 2,
+                        terminal: MvccValueChainTerminal::CurrentRow,
+                    },
+                    provenance: MvccSourceProvenance::Seed,
+                },
+                visibility: StorageVisibility { read_txn_id: 8 },
+                filter: Some(MvccReadFilter::ProvenanceBundlePathContains {
+                    bundle: MvccProvenanceFrameBundle::FullPath,
+                    summary: MvccProvenanceSummary::KeyValuePath,
+                    expected: vec![
+                        "profile:2=team:beta".to_string(),
+                        "acct:1=profile:2".to_string(),
+                    ],
+                }),
+                order: None,
+                projection: MvccProjection::TargetKeyProvenanceBundleSummary {
+                    bundle: MvccProvenanceFrameBundle::FullPath,
+                    summary: MvccProvenanceSummary::KeyValuePath,
+                },
+                limit: None,
+            })
+            .unwrap();
+
+        assert!(ordered_subpath_miss.rows.is_empty());
     }
 
     #[test]

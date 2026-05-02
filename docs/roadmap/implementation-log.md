@@ -3,6 +3,9 @@
 ## 2026-05-02
 
 ### Completed
+- Extended the reusable MVCC provenance frame-bundle surface with `MvccReadFilter::ProvenanceBundlePathContains { bundle, summary, expected }`, so callers can now require an ordered contiguous key-path, value-path, or `key=value` subpath match within a named provenance bundle without re-specifying individual frames or changing the public `MvccReadRow { source_key, key, value }` contract.
+- Added engine regression coverage proving ordered bundle-subpath matching finds interior contiguous slices, respects `SeedThroughTerminalInput` bundle truncation, and still rejects reordered path segments.
+- Reconciled README/execution/roadmap docs so the Q2 truth surface now records ordered bundle-subpath matching and narrows the next extension boundary toward quantified bundle predicates.
 - Extended the reusable MVCC provenance frame-bundle surface with `MvccReadFilter::ProvenanceBundlePathEquals { bundle, summary, expected }`, so callers can now require an exact ordered full-bundle `KeyPath`, `ValuePath`, or `KeyValuePath` match without re-specifying individual provenance frames or changing the public `MvccReadRow { source_key, key, value }` contract.
 - Added engine regression coverage proving exact ordered bundle-path equality matches the intended full path, rejects reordered paths, and works across both truncated (`SeedThroughTerminalInput`) and full (`FullPath`) bundle scopes.
 - Reconciled README/execution/roadmap docs so the Q2 truth surface now records exact full-path bundle equality and narrows the next extension boundary toward richer ordered-subpath or quantified bundle predicates.
