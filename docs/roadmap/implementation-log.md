@@ -3,6 +3,9 @@
 ## 2026-05-02
 
 ### Completed
+- Extended the reusable MVCC provenance frame-bundle surface with `MvccReadFilter::ProvenanceBundleLenEquals { bundle, expected_len }`, so callers can now require an exact whole-bundle cardinality match over named provenance bundles without re-specifying individual provenance frames or changing the public `MvccReadRow { source_key, key, value }` contract.
+- Added engine regression coverage proving exact bundle cardinality distinguishes deeper full-path chains from shorter chains, respects `SeedThroughTerminalInput` truncation, and rejects impossible bundle lengths cleanly.
+- Reconciled README/execution/roadmap docs so the Q2 truth surface now records exact whole-bundle cardinality checks and narrows the next extension boundary toward richer relative-position constraints such as ordered repeated-subpath or frame-distance predicates.
 - Extended the reusable MVCC provenance frame-bundle surface with `MvccReadFilter::ProvenanceBundlePathSegmentEquals { bundle, summary, index, expected }`, so callers can now pin an exact key-path, value-path, or `key=value` segment at a bundle-relative position without re-specifying individual provenance frames or changing the public `MvccReadRow { source_key, key, value }` contract.
 - Added engine regression coverage proving bundle-relative positional matching finds the intended interior segment, respects `SeedThroughTerminalInput` truncation, and rejects out-of-range positional checks cleanly.
 - Reconciled README/execution/roadmap docs so the Q2 truth surface now records the first positional provenance-bundle predicate and narrows the next extension boundary toward richer relative-position or whole-bundle constraints.
