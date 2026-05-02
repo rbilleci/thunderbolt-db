@@ -3,6 +3,9 @@
 ## 2026-05-02
 
 ### Completed
+- Extended the reusable MVCC provenance frame-bundle surface with `MvccReadFilter::ProvenanceBundlePathOccurrenceAt { bundle, summary, occurrence_index, start, expected }`, so callers can now pin an exact zero-based ordered contiguous key-path, value-path, or `key=value` subpath occurrence inside a named provenance bundle without re-specifying individual provenance frames or changing the public `MvccReadRow { source_key, key, value }` contract.
+- Added engine regression coverage proving exact ordinal occurrence matching can distinguish the second occurrence in looping full paths, still works alongside the first/last helpers, and rejects out-of-range ordinal requests cleanly.
+- Reconciled README/execution/roadmap docs so the Q2 truth surface now records exact ordinal occurrence matching and narrows the next extension boundary toward richer occurrence-range or relative-occurrence helpers.
 - Extended the reusable MVCC provenance frame-bundle surface with `MvccReadFilter::ProvenanceBundlePathFirstOccurrenceAt { bundle, summary, start, expected }` and `MvccReadFilter::ProvenanceBundlePathLastOccurrenceAt { bundle, summary, start, expected }`, so callers can now pin where the first or last ordered contiguous key-path, value-path, or `key=value` subpath begins inside a named provenance bundle without re-specifying individual provenance frames or changing the public `MvccReadRow { source_key, key, value }` contract.
 - Added engine regression coverage proving first/last-occurrence matching distinguishes looping full paths from truncated bundles and rejects wrong occurrence offsets cleanly.
 - Reconciled README/execution/roadmap docs so the Q2 truth surface now records first/last-occurrence bundle offsets and narrows the next extension boundary toward richer ordinal occurrence helpers.

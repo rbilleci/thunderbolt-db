@@ -70,6 +70,7 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
   - `MvccReadFilter::ProvenanceBundlePathSliceEquals { bundle, summary, start, expected }` (anchored contiguous subpath matching at a chosen bundle-relative offset over named key/value/`key=value` provenance bundles)
   - `MvccReadFilter::ProvenanceBundlePathFirstOccurrenceAt { bundle, summary, start, expected }` (require the first ordered contiguous occurrence of a key/value/`key=value` subpath to begin at an exact bundle-relative offset)
   - `MvccReadFilter::ProvenanceBundlePathLastOccurrenceAt { bundle, summary, start, expected }` (require the last ordered contiguous occurrence of a key/value/`key=value` subpath to begin at an exact bundle-relative offset)
+  - `MvccReadFilter::ProvenanceBundlePathOccurrenceAt { bundle, summary, occurrence_index, start, expected }` (require an exact zero-based ordered contiguous occurrence of a key/value/`key=value` subpath to begin at an exact bundle-relative offset)
   - `MvccReadFilter::ProvenanceBundlePathSegmentEquals { bundle, summary, index, expected }` (bundle-relative positional equality over named key/value/`key=value` provenance bundles)
   - `MvccReadFilter::ProvenanceBundleLenEquals { bundle, expected_len }` (exact whole-bundle cardinality checks over named provenance bundles)
   - `MvccReadFilter::All([...])`
@@ -117,7 +118,7 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
   - `tests/fixtures/mvcc-read-workload.txt`
   - `tests/fixtures/mvcc-source-composition-workload.txt`
 - Next obvious extension boundary:
-  - extend the frame-bundle surface beyond first/last-occurrence offsets toward richer ordinal constraints (for example nth-occurrence or bounded-occurrence helpers) without regressing the same engine-facing contract and explicit fallback accounting on the eventual GPU-backed path.
+  - extend the frame-bundle surface beyond exact ordinal occurrence offsets toward richer occurrence-range or relative-occurrence constraints without regressing the same engine-facing contract and explicit fallback accounting on the eventual GPU-backed path.
 
 ## Quickstart
 
