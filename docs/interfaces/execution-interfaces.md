@@ -63,6 +63,7 @@ Each physical plan node must include:
   - `ProvenanceValueEquals { frame, expected }`
   - `ProvenanceBundleValueEquals { bundle, expected }`
   - `ProvenanceBundleKeyValueEquals { bundle, key, value }`
+  - `ProvenanceBundlePathEquals { bundle, summary, expected }` (exact ordered bundle-path equality over `KeyPath`, `ValuePath`, or `KeyValuePath` summaries)
   - `All([filter...])`
   - `Any([filter...])`
   - source-aware and provenance-frame-aware filter variants only match join-adjacent rows; scan/lookup-only shapes leave them empty rather than fabricating source state
@@ -136,5 +137,5 @@ Each physical plan node must include:
 - `FollowValueKeyRefValueKeyRefValueKeyPrefixes { keys }` adds the matching deeper fan-out sibling, proving the same deeper chain can also terminate in visible prefix expansion without changing the contract.
 - `FollowValueKeyRefValueKeyRefValueKeyRefPrefixes { keys }` still exists as a stable named helper, but it now resolves through the generic linear chain mechanism instead of bespoke one-off nested logic.
 - The row contract now carries optional `source_key` provenance, which enabled the first true source-preserving join shape to land without another result-surface rewrite.
-- Lightweight provenance-path summarization now exists through `TargetKeyProvenanceSummary { summary }`, and reusable frame bundles now exist through bundle-aware filter/order/projection controls such as `ProvenanceBundleKeyEquals`, `ProvenanceBundleValueEquals`, `ProvenanceBundleKeyValueEquals`, `ProvenanceBundleValuePathAsc`, and `TargetKeyProvenanceBundleSummary { ... }`.
-- Next obvious Q2 extension is to widen the new frame-bundle surface beyond the current key/value exact-membership and path-summary controls into richer reusable positional or quantified predicates (for example ordered subpath matching or full-bundle equality checks) without weakening the explicit GPU fallback contract.
+- Lightweight provenance-path summarization now exists through `TargetKeyProvenanceSummary { summary }`, and reusable frame bundles now exist through bundle-aware filter/order/projection controls such as `ProvenanceBundleKeyEquals`, `ProvenanceBundleValueEquals`, `ProvenanceBundleKeyValueEquals`, `ProvenanceBundlePathEquals`, `ProvenanceBundleValuePathAsc`, and `TargetKeyProvenanceBundleSummary { ... }`.
+- Next obvious Q2 extension is to widen the new frame-bundle surface beyond the current exact-membership, exact full-path equality, and path-summary controls into richer reusable positional or quantified predicates (for example ordered subpath matching or counted bundle-membership thresholds) without weakening the explicit GPU fallback contract.
