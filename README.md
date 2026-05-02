@@ -63,6 +63,7 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
   - `MvccReadFilter::ProvenanceBundleKeyValueCountAtLeast { bundle, key, value, min_count }`
   - `MvccReadFilter::ProvenanceBundlePathEquals { bundle, summary, expected }`
   - `MvccReadFilter::ProvenanceBundlePathContains { bundle, summary, expected }` (ordered contiguous subpath matching over named key/value/`key=value` provenance bundles)
+  - `MvccReadFilter::ProvenanceBundlePathCountAtLeast { bundle, summary, expected, min_count }` (ordered repeated-subpath counting over named key/value/`key=value` provenance bundles)
   - `MvccReadFilter::ProvenanceBundlePathSegmentEquals { bundle, summary, index, expected }` (bundle-relative positional equality over named key/value/`key=value` provenance bundles)
   - `MvccReadFilter::ProvenanceBundleLenEquals { bundle, expected_len }` (exact whole-bundle cardinality checks over named provenance bundles)
   - `MvccReadFilter::All([...])`
@@ -110,7 +111,7 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
   - `tests/fixtures/mvcc-read-workload.txt`
   - `tests/fixtures/mvcc-source-composition-workload.txt`
 - Next obvious extension boundary:
-  - extend the frame-bundle surface beyond the first quantified + positional bundle predicates into richer relative-position or whole-bundle constraints (for example ordered repeated-subpath matching or relative frame-distance predicates) without regressing the same engine-facing contract and explicit fallback accounting on the eventual GPU-backed path.
+  - extend the frame-bundle surface beyond the first quantified + positional bundle predicates into richer relative-position or whole-bundle constraints (for example relative frame-distance predicates) without regressing the same engine-facing contract and explicit fallback accounting on the eventual GPU-backed path.
 
 ## Quickstart
 
