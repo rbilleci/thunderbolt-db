@@ -266,6 +266,12 @@ pub enum MvccReadFilter {
         summary: MvccProvenanceSummary,
         expected: Vec<String>,
     },
+    ProvenanceBundlePathSegmentEquals {
+        bundle: MvccProvenanceFrameBundle,
+        summary: MvccProvenanceSummary,
+        index: usize,
+        expected: String,
+    },
     All(Vec<MvccReadFilter>),
     Any(Vec<MvccReadFilter>),
 }
@@ -646,6 +652,13 @@ fn mvcc_row_matches_filter(row: &ResolvedMvccRow, filter: &MvccReadFilter) -> bo
         } => resolved_mvcc_row_provenance_bundle_segments(row, *bundle, *summary).is_some_and(
             |segments| mvcc_provenance_segments_contain_ordered_subpath(&segments, expected),
         ),
+        MvccReadFilter::ProvenanceBundlePathSegmentEquals {
+            bundle,
+            summary,
+            index,
+            expected,
+        } => resolved_mvcc_row_provenance_bundle_segments(row, *bundle, *summary)
+            .is_some_and(|segments| segments.get(*index) == Some(expected)),
         MvccReadFilter::All(filters) => filters
             .iter()
             .all(|filter| mvcc_row_matches_filter(row, filter)),
@@ -7032,7 +7045,7 @@ mod tests {
     }
 
     #[test]
-    fn execute_mvcc_query_supports_quantified_provenance_bundle_membership() {
+    fn execute_mvcc_query_supports_quantified_and_positional_provenance_bundle_filters() {
         let mut e = Engine::new_local();
         e.execute_text(1, "SET acct:loop=profile:loop").unwrap();
         e.execute_text(2, "SET profile:loop=acct:loop").unwrap();
@@ -7144,6 +7157,66 @@ mod tests {
                 ),
             }]
         );
+
+        let position_match = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FollowValueChain {
+                    keys: vec!["acct:loop".to_string(), "acct:solo".to_string()],
+                    plan: MvccValueChainPlan {
+                        value_key_hops: 2,
+                        terminal: MvccValueChainTerminal::CurrentRow,
+                    },
+                    provenance: MvccSourceProvenance::Seed,
+                },
+                visibility: StorageVisibility { read_txn_id: 4 },
+                filter: Some(MvccReadFilter::ProvenanceBundlePathSegmentEquals {
+                    bundle: MvccProvenanceFrameBundle::SeedThroughTerminalInput,
+                    summary: MvccProvenanceSummary::ValuePath,
+                    index: 1,
+                    expected: "acct:loop".to_string(),
+                }),
+                order: None,
+                projection: MvccProjection::TargetKeyProvenanceBundleSummary {
+                    bundle: MvccProvenanceFrameBundle::SeedThroughTerminalInput,
+                    summary: MvccProvenanceSummary::ValuePath,
+                },
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            position_match.rows,
+            vec![MvccReadRow {
+                source_key: Some("acct:loop".to_string()),
+                key: Some("acct:loop".to_string()),
+                value: Some("profile:loop -> acct:loop".to_string()),
+            }]
+        );
+
+        let position_miss = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FollowValueChain {
+                    keys: vec!["acct:loop".to_string(), "acct:solo".to_string()],
+                    plan: MvccValueChainPlan {
+                        value_key_hops: 2,
+                        terminal: MvccValueChainTerminal::CurrentRow,
+                    },
+                    provenance: MvccSourceProvenance::Seed,
+                },
+                visibility: StorageVisibility { read_txn_id: 4 },
+                filter: Some(MvccReadFilter::ProvenanceBundlePathSegmentEquals {
+                    bundle: MvccProvenanceFrameBundle::SeedThroughTerminalInput,
+                    summary: MvccProvenanceSummary::ValuePath,
+                    index: 2,
+                    expected: "profile:loop".to_string(),
+                }),
+                order: None,
+                projection: MvccProjection::KeyOnly,
+                limit: None,
+            })
+            .unwrap();
+
+        assert!(position_miss.rows.is_empty());
 
         let threshold_miss = e
             .execute_mvcc_query(&MvccReadQuery {
