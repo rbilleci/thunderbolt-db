@@ -49,6 +49,7 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
   - `MvccReadFilter::KeyPrefix(prefix)`
   - `MvccReadFilter::SourceKeyPrefix(prefix)`
   - `MvccReadFilter::ProvenanceKeyPrefix { frame, prefix }`
+  - `MvccReadFilter::ProvenanceBundleKeyPrefix { bundle, prefix }`
   - `MvccReadFilter::BranchLabelEquals(label)`
   - `MvccReadFilter::KeyRange { start_inclusive, end_exclusive }`
   - `MvccReadFilter::ValueEquals(value)`
@@ -86,6 +87,8 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
   - `MvccReadOrder::ProvenanceKeyDesc { frame }`
   - `MvccReadOrder::ProvenanceValueAsc { frame }`
   - `MvccReadOrder::ProvenanceValueDesc { frame }`
+  - `MvccReadOrder::ProvenanceBundleKeyPathAsc { bundle }`
+  - `MvccReadOrder::ProvenanceBundleKeyPathDesc { bundle }`
   - `MvccReadOrder::ProvenanceBundleValuePathAsc { bundle }`
   - `MvccReadOrder::ProvenanceBundleValuePathDesc { bundle }`
 - Optional row cap:
@@ -98,7 +101,7 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
   - `tests/fixtures/mvcc-read-workload.txt`
   - `tests/fixtures/mvcc-source-composition-workload.txt`
 - Next obvious extension boundary:
-  - extend the new frame-bundle surface beyond value-path equality/summary ordering into additional reusable bundle predicates or bundle-aware key summaries without regressing the same engine-facing contract and explicit fallback accounting on the eventual GPU-backed path.
+  - extend the new frame-bundle surface beyond the current key/value prefix-equality and path-summary controls into richer reusable bundle predicates (for example exact path membership or mixed key/value bundle comparisons) without regressing the same engine-facing contract and explicit fallback accounting on the eventual GPU-backed path.
 
 ## Quickstart
 

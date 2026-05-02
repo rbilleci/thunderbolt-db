@@ -3,6 +3,9 @@
 ## 2026-05-02
 
 ### Completed
+- Extended the reusable MVCC provenance frame-bundle surface with key-aware controls: `MvccReadFilter::ProvenanceBundleKeyPrefix` plus `MvccReadOrder::ProvenanceBundleKeyPathAsc` / `ProvenanceBundleKeyPathDesc`, so callers can now constrain and sort by named key-path bundles without re-specifying individual frames or changing the public `MvccReadRow { source_key, key, value }` contract.
+- Expanded regression coverage proving bundle-aware key-prefix filtering and key-path ordering work alongside the existing bundle-summary projection on chained joins.
+- Reconciled README/execution/roadmap docs so the Q2 truth surface now records both key-aware and value-aware bundle controls and narrows the next extension boundary toward richer exact-membership or mixed key/value bundle predicates.
 - Extended the MVCC provenance surface with reusable frame bundles: `MvccReadFilter::ProvenanceBundleValueEquals`, `MvccReadOrder::ProvenanceBundleValuePathAsc` / `ProvenanceBundleValuePathDesc`, and `MvccProjection::TargetKeyProvenanceBundleSummary { bundle, summary }`, so common path segments like `SeedThroughTerminalInput` and `FullPath` can now be named once across filter/order/projection without changing the public `MvccReadRow { source_key, key, value }` contract or the explicit `GpuMvccReadParityGap` fallback semantics.
 - Added engine regression coverage proving bundle-aware ordering, filtering, and projection distinguish `SeedThroughTerminalInput` from `FullPath` deterministically on chained joins while leaving non-join shapes empty instead of fabricating provenance state.
 - Reconciled README/execution/roadmap docs so the Q2 truth surface now records reusable frame bundles and narrows the next extension boundary toward richer bundle predicates or key-path summaries.

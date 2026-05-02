@@ -54,6 +54,7 @@ Each physical plan node must include:
   - `KeyPrefix(prefix)`
   - `SourceKeyPrefix(prefix)`
   - `ProvenanceKeyPrefix { frame, prefix }`
+  - `ProvenanceBundleKeyPrefix { bundle, prefix }`
   - `BranchLabelEquals(label)`
   - `KeyRange { start_inclusive, end_exclusive }`
   - `ValueEquals(value)`
@@ -78,6 +79,8 @@ Each physical plan node must include:
   - `ProvenanceKeyDesc { frame }`
   - `ProvenanceValueAsc { frame }`
   - `ProvenanceValueDesc { frame }`
+  - `ProvenanceBundleKeyPathAsc { bundle }`
+  - `ProvenanceBundleKeyPathDesc { bundle }`
   - `ProvenanceBundleValuePathAsc { bundle }`
   - `ProvenanceBundleValuePathDesc { bundle }`
   - source-aware and provenance-frame-aware ordering variants sort empty/non-join rows deterministically using empty source/frame fields and target key tie-breaks
@@ -132,4 +135,4 @@ Each physical plan node must include:
 - `FollowValueKeyRefValueKeyRefValueKeyRefPrefixes { keys }` still exists as a stable named helper, but it now resolves through the generic linear chain mechanism instead of bespoke one-off nested logic.
 - The row contract now carries optional `source_key` provenance, which enabled the first true source-preserving join shape to land without another result-surface rewrite.
 - Lightweight provenance-path summarization now exists through `TargetKeyProvenanceSummary { summary }`, and reusable frame bundles now exist through bundle-aware filter/order/projection controls such as `ProvenanceBundleValueEquals`, `ProvenanceBundleValuePathAsc`, and `TargetKeyProvenanceBundleSummary { ... }`.
-- Next obvious Q2 extension is to widen the new frame-bundle surface beyond value-path equality/summary ordering into additional reusable predicates or bundle-aware key summaries without weakening the explicit GPU fallback contract.
+- Next obvious Q2 extension is to widen the new frame-bundle surface beyond the current key/value prefix-equality and path-summary controls into richer reusable predicates (for example exact path membership or mixed key/value bundle comparisons) without weakening the explicit GPU fallback contract.
