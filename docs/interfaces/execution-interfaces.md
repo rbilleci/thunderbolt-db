@@ -70,6 +70,8 @@ Each physical plan node must include:
   - `ProvenanceBundlePathContains { bundle, summary, expected }` (ordered contiguous subpath matching over `KeyPath`, `ValuePath`, or `KeyValuePath` bundle summaries)
   - `ProvenanceBundlePathPrefixEquals { bundle, summary, expected }` (whole-bundle prefix matching over `KeyPath`, `ValuePath`, or `KeyValuePath` summaries)
   - `ProvenanceBundlePathSliceEquals { bundle, summary, start, expected }` (anchored contiguous subpath matching at a chosen bundle-relative offset over `KeyPath`, `ValuePath`, or `KeyValuePath` summaries)
+  - `ProvenanceBundlePathFirstOccurrenceAt { bundle, summary, start, expected }` (requires the first ordered contiguous `KeyPath`, `ValuePath`, or `KeyValuePath` occurrence to begin at an exact bundle-relative offset)
+  - `ProvenanceBundlePathLastOccurrenceAt { bundle, summary, start, expected }` (requires the last ordered contiguous `KeyPath`, `ValuePath`, or `KeyValuePath` occurrence to begin at an exact bundle-relative offset)
   - `ProvenanceBundlePathSegmentEquals { bundle, summary, index, expected }` (bundle-relative positional equality over `KeyPath`, `ValuePath`, or `KeyValuePath` summaries)
   - `All([filter...])`
   - `Any([filter...])`
@@ -145,4 +147,4 @@ Each physical plan node must include:
 - `FollowValueKeyRefValueKeyRefValueKeyRefPrefixes { keys }` still exists as a stable named helper, but it now resolves through the generic linear chain mechanism instead of bespoke one-off nested logic.
 - The row contract now carries optional `source_key` provenance, which enabled the first true source-preserving join shape to land without another result-surface rewrite.
 - Lightweight provenance-path summarization now exists through `TargetKeyProvenanceSummary { summary }`, and reusable frame bundles now exist through bundle-aware filter/order/projection controls such as `ProvenanceBundleKeyEquals`, `ProvenanceBundleKeyCountAtLeast`, `ProvenanceBundleValueEquals`, `ProvenanceBundleValueCountAtLeast`, `ProvenanceBundleKeyValueEquals`, `ProvenanceBundleKeyValueCountAtLeast`, `ProvenanceBundlePathEquals`, `ProvenanceBundlePathContains`, `ProvenanceBundlePathCountAtLeast`, `ProvenanceBundlePathPairAtDistance`, `ProvenanceBundlePathSuffixEquals`, `ProvenanceBundlePathPrefixEquals`, `ProvenanceBundlePathSliceEquals`, `ProvenanceBundlePathSegmentEquals`, `ProvenanceBundleLenEquals`, `ProvenanceBundleValuePathAsc`, and `TargetKeyProvenanceBundleSummary { ... }`.
-- Next obvious Q2 extension is to widen the frame-bundle surface toward first/last-occurrence constraints without weakening the explicit GPU fallback contract.
+- Next obvious Q2 extension is to widen the frame-bundle surface beyond first/last-occurrence offsets toward richer ordinal occurrence constraints without weakening the explicit GPU fallback contract.

@@ -3,6 +3,9 @@
 ## 2026-05-02
 
 ### Completed
+- Extended the reusable MVCC provenance frame-bundle surface with `MvccReadFilter::ProvenanceBundlePathFirstOccurrenceAt { bundle, summary, start, expected }` and `MvccReadFilter::ProvenanceBundlePathLastOccurrenceAt { bundle, summary, start, expected }`, so callers can now pin where the first or last ordered contiguous key-path, value-path, or `key=value` subpath begins inside a named provenance bundle without re-specifying individual provenance frames or changing the public `MvccReadRow { source_key, key, value }` contract.
+- Added engine regression coverage proving first/last-occurrence matching distinguishes looping full paths from truncated bundles and rejects wrong occurrence offsets cleanly.
+- Reconciled README/execution/roadmap docs so the Q2 truth surface now records first/last-occurrence bundle offsets and narrows the next extension boundary toward richer ordinal occurrence helpers.
 - Extended the reusable MVCC provenance frame-bundle surface with `MvccReadFilter::ProvenanceBundlePathSliceEquals { bundle, summary, start, expected }`, so callers can now require an exact key-path, value-path, or `key=value` contiguous slice at a chosen bundle-relative offset without re-specifying individual provenance frames or changing the public `MvccReadRow { source_key, key, value }` contract.
 - Added engine regression coverage proving anchored bundle-slice matching finds the intended interior slice, still works against `SeedThroughTerminalInput` truncation, and rejects wrong anchors plus out-of-range offsets cleanly.
 - Reconciled README/execution/roadmap docs so the Q2 truth surface now records anchored bundle-slice matching and narrows the next extension boundary toward first/last-occurrence constraints.

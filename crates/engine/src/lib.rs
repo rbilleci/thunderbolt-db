@@ -295,6 +295,18 @@ pub enum MvccReadFilter {
         start: usize,
         expected: Vec<String>,
     },
+    ProvenanceBundlePathFirstOccurrenceAt {
+        bundle: MvccProvenanceFrameBundle,
+        summary: MvccProvenanceSummary,
+        start: usize,
+        expected: Vec<String>,
+    },
+    ProvenanceBundlePathLastOccurrenceAt {
+        bundle: MvccProvenanceFrameBundle,
+        summary: MvccProvenanceSummary,
+        start: usize,
+        expected: Vec<String>,
+    },
     ProvenanceBundlePathSegmentEquals {
         bundle: MvccProvenanceFrameBundle,
         summary: MvccProvenanceSummary,
@@ -527,6 +539,32 @@ fn mvcc_provenance_segments_have_slice_at(
         && start
             .checked_add(expected.len())
             .is_some_and(|end| end <= segments.len() && segments[start..end] == *expected)
+}
+
+fn mvcc_provenance_segments_first_subpath_start(
+    segments: &[String],
+    expected: &[String],
+) -> Option<usize> {
+    if expected.is_empty() || expected.len() > segments.len() {
+        return None;
+    }
+
+    segments
+        .windows(expected.len())
+        .position(|window| window == expected)
+}
+
+fn mvcc_provenance_segments_last_subpath_start(
+    segments: &[String],
+    expected: &[String],
+) -> Option<usize> {
+    if expected.is_empty() || expected.len() > segments.len() {
+        return None;
+    }
+
+    segments
+        .windows(expected.len())
+        .rposition(|window| window == expected)
 }
 
 fn mvcc_provenance_tuple_count_at_least<'a>(
@@ -778,6 +816,26 @@ fn mvcc_row_matches_filter(row: &ResolvedMvccRow, filter: &MvccReadFilter) -> bo
             expected,
         } => resolved_mvcc_row_provenance_bundle_segments(row, *bundle, *summary).is_some_and(
             |segments| mvcc_provenance_segments_have_slice_at(&segments, *start, expected),
+        ),
+        MvccReadFilter::ProvenanceBundlePathFirstOccurrenceAt {
+            bundle,
+            summary,
+            start,
+            expected,
+        } => resolved_mvcc_row_provenance_bundle_segments(row, *bundle, *summary).is_some_and(
+            |segments| {
+                mvcc_provenance_segments_first_subpath_start(&segments, expected) == Some(*start)
+            },
+        ),
+        MvccReadFilter::ProvenanceBundlePathLastOccurrenceAt {
+            bundle,
+            summary,
+            start,
+            expected,
+        } => resolved_mvcc_row_provenance_bundle_segments(row, *bundle, *summary).is_some_and(
+            |segments| {
+                mvcc_provenance_segments_last_subpath_start(&segments, expected) == Some(*start)
+            },
         ),
         MvccReadFilter::ProvenanceBundlePathSegmentEquals {
             bundle,
@@ -8063,6 +8121,147 @@ mod tests {
             .unwrap();
 
         assert!(len_miss.rows.is_empty());
+    }
+
+    #[test]
+    fn execute_mvcc_query_supports_bundle_first_and_last_occurrence_filters() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:loop=profile:loop").unwrap();
+        e.execute_text(2, "SET profile:loop=acct:loop").unwrap();
+        e.execute_text(3, "SET acct:solo=profile:solo").unwrap();
+        e.execute_text(4, "SET profile:solo=team:solo").unwrap();
+
+        let first_occurrence_match = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::Concat {
+                    sources: vec![
+                        MvccReadSource::FollowValueChain {
+                            keys: vec!["acct:loop".to_string()],
+                            plan: MvccValueChainPlan {
+                                value_key_hops: 3,
+                                terminal: MvccValueChainTerminal::CurrentRow,
+                            },
+                            provenance: MvccSourceProvenance::Seed,
+                        },
+                        MvccReadSource::FollowValueChain {
+                            keys: vec!["acct:solo".to_string()],
+                            plan: MvccValueChainPlan {
+                                value_key_hops: 1,
+                                terminal: MvccValueChainTerminal::CurrentRow,
+                            },
+                            provenance: MvccSourceProvenance::Seed,
+                        },
+                    ],
+                },
+                visibility: StorageVisibility { read_txn_id: 4 },
+                filter: Some(MvccReadFilter::ProvenanceBundlePathFirstOccurrenceAt {
+                    bundle: MvccProvenanceFrameBundle::FullPath,
+                    summary: MvccProvenanceSummary::KeyPath,
+                    start: 0,
+                    expected: vec!["acct:loop".to_string(), "profile:loop".to_string()],
+                }),
+                order: None,
+                projection: MvccProjection::TargetKeyProvenanceBundleSummary {
+                    bundle: MvccProvenanceFrameBundle::FullPath,
+                    summary: MvccProvenanceSummary::KeyPath,
+                },
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            first_occurrence_match.rows,
+            vec![MvccReadRow {
+                source_key: Some("acct:loop".to_string()),
+                key: Some("profile:loop".to_string()),
+                value: Some("acct:loop -> profile:loop -> acct:loop -> profile:loop".to_string()),
+            }]
+        );
+
+        let last_occurrence_match = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FollowValueChain {
+                    keys: vec!["acct:loop".to_string(), "acct:solo".to_string()],
+                    plan: MvccValueChainPlan {
+                        value_key_hops: 2,
+                        terminal: MvccValueChainTerminal::CurrentRow,
+                    },
+                    provenance: MvccSourceProvenance::Seed,
+                },
+                visibility: StorageVisibility { read_txn_id: 4 },
+                filter: Some(MvccReadFilter::ProvenanceBundlePathLastOccurrenceAt {
+                    bundle: MvccProvenanceFrameBundle::SeedThroughTerminalInput,
+                    summary: MvccProvenanceSummary::KeyPath,
+                    start: 0,
+                    expected: vec!["acct:loop".to_string(), "profile:loop".to_string()],
+                }),
+                order: Some(MvccReadOrder::KeyAsc),
+                projection: MvccProjection::TargetKeyProvenanceBundleSummary {
+                    bundle: MvccProvenanceFrameBundle::SeedThroughTerminalInput,
+                    summary: MvccProvenanceSummary::KeyPath,
+                },
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            last_occurrence_match.rows,
+            vec![MvccReadRow {
+                source_key: Some("acct:loop".to_string()),
+                key: Some("acct:loop".to_string()),
+                value: Some("acct:loop -> profile:loop".to_string()),
+            }]
+        );
+
+        let wrong_first_occurrence_miss = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FollowValueChain {
+                    keys: vec!["acct:loop".to_string()],
+                    plan: MvccValueChainPlan {
+                        value_key_hops: 3,
+                        terminal: MvccValueChainTerminal::CurrentRow,
+                    },
+                    provenance: MvccSourceProvenance::Seed,
+                },
+                visibility: StorageVisibility { read_txn_id: 4 },
+                filter: Some(MvccReadFilter::ProvenanceBundlePathFirstOccurrenceAt {
+                    bundle: MvccProvenanceFrameBundle::FullPath,
+                    summary: MvccProvenanceSummary::KeyPath,
+                    start: 1,
+                    expected: vec!["acct:loop".to_string(), "profile:loop".to_string()],
+                }),
+                order: None,
+                projection: MvccProjection::KeyOnly,
+                limit: None,
+            })
+            .unwrap();
+
+        assert!(wrong_first_occurrence_miss.rows.is_empty());
+
+        let wrong_last_occurrence_miss = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FollowValueChain {
+                    keys: vec!["acct:loop".to_string()],
+                    plan: MvccValueChainPlan {
+                        value_key_hops: 3,
+                        terminal: MvccValueChainTerminal::CurrentRow,
+                    },
+                    provenance: MvccSourceProvenance::Seed,
+                },
+                visibility: StorageVisibility { read_txn_id: 4 },
+                filter: Some(MvccReadFilter::ProvenanceBundlePathLastOccurrenceAt {
+                    bundle: MvccProvenanceFrameBundle::FullPath,
+                    summary: MvccProvenanceSummary::KeyPath,
+                    start: 0,
+                    expected: vec!["profile:loop".to_string(), "acct:loop".to_string()],
+                }),
+                order: None,
+                projection: MvccProjection::KeyOnly,
+                limit: None,
+            })
+            .unwrap();
+
+        assert!(wrong_last_occurrence_miss.rows.is_empty());
     }
 
     #[test]
