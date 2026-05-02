@@ -3,6 +3,9 @@
 ## 2026-05-02
 
 ### Completed
+- Extended the reusable MVCC provenance frame-bundle surface with exact-membership predicates: `MvccReadFilter::ProvenanceBundleKeyEquals` and `MvccReadFilter::ProvenanceBundleKeyValueEquals`, so callers can now ask whether a named bundle contains an exact key or an exact `key=value` hop without re-specifying individual provenance frames or changing the public `MvccReadRow { source_key, key, value }` contract.
+- Added engine regression coverage proving bundle-aware exact key membership works on `SeedThroughTerminalInput`, mixed `key=value` membership matches only when both halves occur on the same provenance tuple, and cross-frame false positives stay rejected.
+- Reconciled README/execution/roadmap docs so the Q2 truth surface now records exact-membership bundle predicates and narrows the next extension boundary toward positional or quantified bundle semantics.
 - Extended the reusable MVCC provenance frame-bundle surface with key-aware controls: `MvccReadFilter::ProvenanceBundleKeyPrefix` plus `MvccReadOrder::ProvenanceBundleKeyPathAsc` / `ProvenanceBundleKeyPathDesc`, so callers can now constrain and sort by named key-path bundles without re-specifying individual frames or changing the public `MvccReadRow { source_key, key, value }` contract.
 - Expanded regression coverage proving bundle-aware key-prefix filtering and key-path ordering work alongside the existing bundle-summary projection on chained joins.
 - Reconciled README/execution/roadmap docs so the Q2 truth surface now records both key-aware and value-aware bundle controls and narrows the next extension boundary toward richer exact-membership or mixed key/value bundle predicates.
