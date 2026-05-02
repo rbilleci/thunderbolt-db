@@ -3,6 +3,9 @@
 ## 2026-05-02
 
 ### Completed
+- Extended the reusable MVCC provenance frame-bundle surface with counted membership thresholds: `MvccReadFilter::ProvenanceBundleKeyCountAtLeast`, `ProvenanceBundleValueCountAtLeast`, and `ProvenanceBundleKeyValueCountAtLeast`, so callers can now require repeated key/value/`key=value` hops within a named provenance bundle without changing the public `MvccReadRow { source_key, key, value }` contract.
+- Added engine regression coverage proving repeated provenance hops satisfy the new thresholds only when the same bundle-scoped tuple actually repeats, while higher thresholds still miss cleanly.
+- Reconciled README/execution/roadmap docs so the Q2 truth surface now records counted bundle-membership thresholds and narrows the next extension boundary toward richer quantified or positional bundle predicates.
 - Extended the reusable MVCC provenance frame-bundle surface with `MvccReadFilter::ProvenanceBundlePathContains { bundle, summary, expected }`, so callers can now require an ordered contiguous key-path, value-path, or `key=value` subpath match within a named provenance bundle without re-specifying individual frames or changing the public `MvccReadRow { source_key, key, value }` contract.
 - Added engine regression coverage proving ordered bundle-subpath matching finds interior contiguous slices, respects `SeedThroughTerminalInput` bundle truncation, and still rejects reordered path segments.
 - Reconciled README/execution/roadmap docs so the Q2 truth surface now records ordered bundle-subpath matching and narrows the next extension boundary toward quantified bundle predicates.
