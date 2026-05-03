@@ -1,5 +1,12 @@
 # Implementation Log (Pre-NVIDIA Phase)
 
+## 2026-05-03
+
+### Completed
+- Extended the reusable MVCC provenance frame-bundle surface with `MvccReadFilter::ProvenanceBundlePathOccurrenceDistance { bundle, summary, left_occurrence_index, right_occurrence_index, distance, expected }`, so callers can now require two exact zero-based ordered contiguous key-path, value-path, or `key=value` subpath occurrences inside a named provenance bundle to begin an exact distance apart without re-specifying individual provenance frames or changing the public `MvccReadRow { source_key, key, value }` contract.
+- Added engine regression coverage proving exact occurrence-distance matching accepts the looping full-path second occurrence at the expected relative offset, still rejects truncated bundles that never reach the later occurrence, and cleanly rejects both wrong and reversed occurrence pairings.
+- Reconciled README/execution/roadmap docs so the Q2 truth surface now records exact occurrence-distance matching and narrows the next extension boundary toward broader relative-occurrence helpers.
+
 ## 2026-05-02
 
 ### Completed
