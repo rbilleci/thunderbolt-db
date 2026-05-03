@@ -73,6 +73,7 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
   - `MvccReadFilter::ProvenanceBundlePathOccurrenceAt { bundle, summary, occurrence_index, start, expected }` (require an exact zero-based ordered contiguous occurrence of a key/value/`key=value` subpath to begin at an exact bundle-relative offset)
   - `MvccReadFilter::ProvenanceBundlePathOccurrenceWithin { bundle, summary, occurrence_index, start_min, start_max, expected }` (require an exact zero-based ordered contiguous occurrence of a key/value/`key=value` subpath to begin within an inclusive bundle-relative offset range)
   - `MvccReadFilter::ProvenanceBundlePathOccurrenceDistance { bundle, summary, left_occurrence_index, right_occurrence_index, distance, expected }` (require two exact zero-based ordered contiguous occurrences of the same key/value/`key=value` subpath to begin an exact distance apart)
+  - `MvccReadFilter::ProvenanceBundlePathOccurrenceDistanceWithin { bundle, summary, left_occurrence_index, right_occurrence_index, min_distance, max_distance, expected }` (require two exact zero-based ordered contiguous occurrences of the same key/value/`key=value` subpath to begin within an inclusive distance range)
   - `MvccReadFilter::ProvenanceBundlePathSegmentEquals { bundle, summary, index, expected }` (bundle-relative positional equality over named key/value/`key=value` provenance bundles)
   - `MvccReadFilter::ProvenanceBundleLenEquals { bundle, expected_len }` (exact whole-bundle cardinality checks over named provenance bundles)
   - `MvccReadFilter::All([...])`
@@ -120,7 +121,7 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
   - `tests/fixtures/mvcc-read-workload.txt`
   - `tests/fixtures/mvcc-source-composition-workload.txt`
 - Next obvious extension boundary:
-  - extend the frame-bundle surface from exact/ranged occurrence offsets into broader relative-occurrence constraints (for example ranged occurrence distances or mixed-subpath relationships) without regressing the same engine-facing contract and explicit fallback accounting on the eventual GPU-backed path.
+  - extend the frame-bundle surface from exact/ranged occurrence distances into mixed-subpath relative-occurrence constraints without regressing the same engine-facing contract and explicit fallback accounting on the eventual GPU-backed path.
 
 ## Quickstart
 
