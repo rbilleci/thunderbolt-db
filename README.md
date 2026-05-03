@@ -127,6 +127,7 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
   - `MvccProjection::TargetKeyProvenanceBundleSummary { bundle, summary }` (join-adjacent result shape that keeps the resolved target key while projecting a lightweight summary of a named provenance-frame bundle such as `SeedThroughTerminalInput` or `FullPath`)
   - `MvccProjection::TargetKeyProvenanceBundleOccurrenceOffset { bundle, summary, expected, occurrence }` (join-adjacent result shape that keeps the resolved target key while projecting the first, last, or exact zero-based occurrence offset of a named key/value/`key=value` bundle subpath)
   - `MvccProjection::TargetKeyProvenanceBundleOccurrenceDistance { bundle, summary, left_expected, left_occurrence, right_expected, right_occurrence }` (join-adjacent result shape that keeps the resolved target key while projecting the scalar distance between two selected key/value/`key=value` bundle-subpath occurrences, including mixed-subpath pairs)
+  - `MvccProjection::TargetKeyProvenanceBundleMixedOccurrenceOffsetPair { bundle, summary, left_expected, left_occurrence, right_expected, right_occurrence }` (join-adjacent result shape that keeps the resolved target key while projecting a stable `left,right` pair of mixed-subpath bundle-relative offsets)
 - Result row shape:
   - `MvccReadRow { source_key, key, value }`
   - `source_key` is populated for join-adjacent expansion sources so source-preserving joins can keep seed provenance visible while join-side projections reuse the same engine-facing result contract.
@@ -153,6 +154,8 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
   - `MvccReadOrder::ProvenanceBundlePathOccurrenceOffsetDesc { bundle, summary, expected, occurrence }`
   - `MvccReadOrder::ProvenanceBundlePathOccurrenceDistanceAsc { bundle, summary, left_expected, left_occurrence, right_expected, right_occurrence }`
   - `MvccReadOrder::ProvenanceBundlePathOccurrenceDistanceDesc { bundle, summary, left_expected, left_occurrence, right_expected, right_occurrence }`
+  - `MvccReadOrder::ProvenanceBundlePathMixedOccurrenceOffsetPairAsc { bundle, summary, left_expected, left_occurrence, right_expected, right_occurrence }`
+  - `MvccReadOrder::ProvenanceBundlePathMixedOccurrenceOffsetPairDesc { bundle, summary, left_expected, left_occurrence, right_expected, right_occurrence }`
 - Optional row cap:
   - `limit: Some(n)` applies after visibility + filter + ordering stages
 - Current device strategy:
@@ -163,7 +166,7 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
   - `tests/fixtures/mvcc-read-workload.txt`
   - `tests/fixtures/mvcc-source-composition-workload.txt`
 - Next obvious extension boundary:
-  - widen the reusable provenance projection/order surface from scalar occurrence offsets/distances into pair-oriented mixed-subpath views without regressing the same engine-facing contract and explicit fallback accounting on the eventual GPU-backed path.
+  - widen the reusable provenance projection/order surface from pair-oriented mixed-subpath offset views into reusable pair-oriented mixed-subpath distance views without regressing the same engine-facing contract and explicit fallback accounting on the eventual GPU-backed path.
 
 ## Quickstart
 
