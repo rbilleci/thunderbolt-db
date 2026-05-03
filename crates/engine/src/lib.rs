@@ -445,6 +445,26 @@ pub enum MvccReadFilter {
         last_start_max: usize,
         expected: Vec<String>,
     },
+    ProvenanceBundlePathOccurrencePairAt {
+        bundle: MvccProvenanceFrameBundle,
+        summary: MvccProvenanceSummary,
+        left_occurrence_index: usize,
+        left_start: usize,
+        right_occurrence_index: usize,
+        right_start: usize,
+        expected: Vec<String>,
+    },
+    ProvenanceBundlePathOccurrencePairWithin {
+        bundle: MvccProvenanceFrameBundle,
+        summary: MvccProvenanceSummary,
+        left_occurrence_index: usize,
+        left_start_min: usize,
+        left_start_max: usize,
+        right_occurrence_index: usize,
+        right_start_min: usize,
+        right_start_max: usize,
+        expected: Vec<String>,
+    },
     ProvenanceBundlePathMixedOccurrenceDistance {
         bundle: MvccProvenanceFrameBundle,
         summary: MvccProvenanceSummary,
@@ -1117,6 +1137,38 @@ fn mvcc_provenance_segments_occurrence_to_last_within(
         .is_some_and(|start| occurrence_start_range.contains(&start))
         && mvcc_provenance_segments_last_subpath_start(segments, expected)
             .is_some_and(|start| last_start_range.contains(&start))
+}
+
+fn mvcc_provenance_segments_occurrence_pair_at(
+    segments: &[String],
+    expected: &[String],
+    left_occurrence_index: usize,
+    left_start: usize,
+    right_occurrence_index: usize,
+    right_start: usize,
+) -> bool {
+    mvcc_provenance_segments_nth_subpath_start(segments, expected, left_occurrence_index)
+        == Some(left_start)
+        && mvcc_provenance_segments_nth_subpath_start(segments, expected, right_occurrence_index)
+            == Some(right_start)
+}
+
+fn mvcc_provenance_segments_occurrence_pair_within(
+    segments: &[String],
+    expected: &[String],
+    left_occurrence_index: usize,
+    left_start_range: std::ops::RangeInclusive<usize>,
+    right_occurrence_index: usize,
+    right_start_range: std::ops::RangeInclusive<usize>,
+) -> bool {
+    if left_start_range.is_empty() || right_start_range.is_empty() {
+        return false;
+    }
+
+    mvcc_provenance_segments_nth_subpath_start(segments, expected, left_occurrence_index)
+        .is_some_and(|start| left_start_range.contains(&start))
+        && mvcc_provenance_segments_nth_subpath_start(segments, expected, right_occurrence_index)
+            .is_some_and(|start| right_start_range.contains(&start))
 }
 
 fn mvcc_provenance_segments_mixed_occurrence_distance(
@@ -2030,6 +2082,48 @@ fn mvcc_row_matches_filter(row: &ResolvedMvccRow, filter: &MvccReadFilter) -> bo
                     *occurrence_index,
                     *occurrence_start_min..=*occurrence_start_max,
                     *last_start_min..=*last_start_max,
+                )
+            },
+        ),
+        MvccReadFilter::ProvenanceBundlePathOccurrencePairAt {
+            bundle,
+            summary,
+            left_occurrence_index,
+            left_start,
+            right_occurrence_index,
+            right_start,
+            expected,
+        } => resolved_mvcc_row_provenance_bundle_segments(row, *bundle, *summary).is_some_and(
+            |segments| {
+                mvcc_provenance_segments_occurrence_pair_at(
+                    &segments,
+                    expected,
+                    *left_occurrence_index,
+                    *left_start,
+                    *right_occurrence_index,
+                    *right_start,
+                )
+            },
+        ),
+        MvccReadFilter::ProvenanceBundlePathOccurrencePairWithin {
+            bundle,
+            summary,
+            left_occurrence_index,
+            left_start_min,
+            left_start_max,
+            right_occurrence_index,
+            right_start_min,
+            right_start_max,
+            expected,
+        } => resolved_mvcc_row_provenance_bundle_segments(row, *bundle, *summary).is_some_and(
+            |segments| {
+                mvcc_provenance_segments_occurrence_pair_within(
+                    &segments,
+                    expected,
+                    *left_occurrence_index,
+                    *left_start_min..=*left_start_max,
+                    *right_occurrence_index,
+                    *right_start_min..=*right_start_max,
                 )
             },
         ),
@@ -11229,6 +11323,205 @@ mod tests {
             .unwrap();
 
         assert!(wrong_ordinal_to_last_index_miss.rows.is_empty());
+    }
+
+    #[test]
+    fn execute_mvcc_query_supports_bundle_ordinal_pair_occurrence_offset_filters() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:loop=profile:loop").unwrap();
+        e.execute_text(2, "SET profile:loop=acct:loop").unwrap();
+        e.execute_text(3, "SET acct:solo=profile:solo").unwrap();
+        e.execute_text(4, "SET profile:solo=team:solo").unwrap();
+
+        let ordinal_pair_match = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FollowValueChain {
+                    keys: vec!["acct:loop".to_string(), "acct:solo".to_string()],
+                    plan: MvccValueChainPlan {
+                        value_key_hops: 5,
+                        terminal: MvccValueChainTerminal::CurrentRow,
+                    },
+                    provenance: MvccSourceProvenance::Seed,
+                },
+                visibility: StorageVisibility { read_txn_id: 4 },
+                filter: Some(MvccReadFilter::ProvenanceBundlePathOccurrencePairAt {
+                    bundle: MvccProvenanceFrameBundle::FullPath,
+                    summary: MvccProvenanceSummary::KeyPath,
+                    left_occurrence_index: 1,
+                    left_start: 2,
+                    right_occurrence_index: 2,
+                    right_start: 4,
+                    expected: vec!["acct:loop".to_string(), "profile:loop".to_string()],
+                }),
+                order: None,
+                projection: MvccProjection::TargetKeyProvenanceBundleSummary {
+                    bundle: MvccProvenanceFrameBundle::FullPath,
+                    summary: MvccProvenanceSummary::KeyPath,
+                },
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            ordinal_pair_match.rows,
+            vec![MvccReadRow {
+                source_key: Some("acct:loop".to_string()),
+                key: Some("profile:loop".to_string()),
+                value: Some(
+                    "acct:loop -> profile:loop -> acct:loop -> profile:loop -> acct:loop -> profile:loop"
+                        .to_string(),
+                ),
+            }]
+        );
+
+        let ordinal_pair_range_match = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FollowValueChain {
+                    keys: vec!["acct:loop".to_string()],
+                    plan: MvccValueChainPlan {
+                        value_key_hops: 5,
+                        terminal: MvccValueChainTerminal::CurrentRow,
+                    },
+                    provenance: MvccSourceProvenance::Seed,
+                },
+                visibility: StorageVisibility { read_txn_id: 4 },
+                filter: Some(MvccReadFilter::ProvenanceBundlePathOccurrencePairWithin {
+                    bundle: MvccProvenanceFrameBundle::FullPath,
+                    summary: MvccProvenanceSummary::KeyPath,
+                    left_occurrence_index: 1,
+                    left_start_min: 2,
+                    left_start_max: 2,
+                    right_occurrence_index: 2,
+                    right_start_min: 4,
+                    right_start_max: 4,
+                    expected: vec!["acct:loop".to_string(), "profile:loop".to_string()],
+                }),
+                order: None,
+                projection: MvccProjection::TargetKeyProvenanceBundleSummary {
+                    bundle: MvccProvenanceFrameBundle::FullPath,
+                    summary: MvccProvenanceSummary::KeyPath,
+                },
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(ordinal_pair_range_match.rows, ordinal_pair_match.rows);
+
+        let truncated_ordinal_pair_miss = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FollowValueChain {
+                    keys: vec!["acct:loop".to_string()],
+                    plan: MvccValueChainPlan {
+                        value_key_hops: 3,
+                        terminal: MvccValueChainTerminal::CurrentRow,
+                    },
+                    provenance: MvccSourceProvenance::Seed,
+                },
+                visibility: StorageVisibility { read_txn_id: 4 },
+                filter: Some(MvccReadFilter::ProvenanceBundlePathOccurrencePairAt {
+                    bundle: MvccProvenanceFrameBundle::SeedThroughTerminalInput,
+                    summary: MvccProvenanceSummary::KeyPath,
+                    left_occurrence_index: 1,
+                    left_start: 2,
+                    right_occurrence_index: 2,
+                    right_start: 4,
+                    expected: vec!["acct:loop".to_string(), "profile:loop".to_string()],
+                }),
+                order: None,
+                projection: MvccProjection::KeyOnly,
+                limit: None,
+            })
+            .unwrap();
+
+        assert!(truncated_ordinal_pair_miss.rows.is_empty());
+
+        let wrong_ordinal_pair_range_miss = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FollowValueChain {
+                    keys: vec!["acct:loop".to_string()],
+                    plan: MvccValueChainPlan {
+                        value_key_hops: 5,
+                        terminal: MvccValueChainTerminal::CurrentRow,
+                    },
+                    provenance: MvccSourceProvenance::Seed,
+                },
+                visibility: StorageVisibility { read_txn_id: 4 },
+                filter: Some(MvccReadFilter::ProvenanceBundlePathOccurrencePairWithin {
+                    bundle: MvccProvenanceFrameBundle::FullPath,
+                    summary: MvccProvenanceSummary::KeyPath,
+                    left_occurrence_index: 1,
+                    left_start_min: 3,
+                    left_start_max: 3,
+                    right_occurrence_index: 2,
+                    right_start_min: 5,
+                    right_start_max: 6,
+                    expected: vec!["acct:loop".to_string(), "profile:loop".to_string()],
+                }),
+                order: None,
+                projection: MvccProjection::KeyOnly,
+                limit: None,
+            })
+            .unwrap();
+
+        assert!(wrong_ordinal_pair_range_miss.rows.is_empty());
+
+        let inverted_ordinal_pair_range_miss = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FollowValueChain {
+                    keys: vec!["acct:loop".to_string()],
+                    plan: MvccValueChainPlan {
+                        value_key_hops: 5,
+                        terminal: MvccValueChainTerminal::CurrentRow,
+                    },
+                    provenance: MvccSourceProvenance::Seed,
+                },
+                visibility: StorageVisibility { read_txn_id: 4 },
+                filter: Some(MvccReadFilter::ProvenanceBundlePathOccurrencePairWithin {
+                    bundle: MvccProvenanceFrameBundle::FullPath,
+                    summary: MvccProvenanceSummary::KeyPath,
+                    left_occurrence_index: 1,
+                    left_start_min: 3,
+                    left_start_max: 2,
+                    right_occurrence_index: 2,
+                    right_start_min: 5,
+                    right_start_max: 4,
+                    expected: vec!["acct:loop".to_string(), "profile:loop".to_string()],
+                }),
+                order: None,
+                projection: MvccProjection::KeyOnly,
+                limit: None,
+            })
+            .unwrap();
+
+        assert!(inverted_ordinal_pair_range_miss.rows.is_empty());
+
+        let wrong_ordinal_pair_index_miss = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FollowValueChain {
+                    keys: vec!["acct:loop".to_string()],
+                    plan: MvccValueChainPlan {
+                        value_key_hops: 5,
+                        terminal: MvccValueChainTerminal::CurrentRow,
+                    },
+                    provenance: MvccSourceProvenance::Seed,
+                },
+                visibility: StorageVisibility { read_txn_id: 4 },
+                filter: Some(MvccReadFilter::ProvenanceBundlePathOccurrencePairAt {
+                    bundle: MvccProvenanceFrameBundle::FullPath,
+                    summary: MvccProvenanceSummary::KeyPath,
+                    left_occurrence_index: 1,
+                    left_start: 2,
+                    right_occurrence_index: 3,
+                    right_start: 4,
+                    expected: vec!["acct:loop".to_string(), "profile:loop".to_string()],
+                }),
+                order: None,
+                projection: MvccProjection::KeyOnly,
+                limit: None,
+            })
+            .unwrap();
+
+        assert!(wrong_ordinal_pair_index_miss.rows.is_empty());
     }
 
     #[test]
