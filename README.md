@@ -125,6 +125,7 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
   - `MvccProjection::TargetKeyProvenanceValue { frame }` (join-adjacent result shape that keeps the resolved target key while projecting the value from an explicit provenance frame such as `Seed`, `TerminalInput`, or `ValueHop(n)`)
   - `MvccProjection::TargetKeyProvenanceSummary { summary }` (join-adjacent result shape that keeps the resolved target key while projecting a lightweight provenance-path summary such as joined keys, joined values, or joined `key=value` hops)
   - `MvccProjection::TargetKeyProvenanceBundleSummary { bundle, summary }` (join-adjacent result shape that keeps the resolved target key while projecting a lightweight summary of a named provenance-frame bundle such as `SeedThroughTerminalInput` or `FullPath`)
+  - `MvccProjection::TargetKeyProvenanceBundleOccurrenceOffset { bundle, summary, expected, occurrence }` (join-adjacent result shape that keeps the resolved target key while projecting the first, last, or exact zero-based occurrence offset of a named key/value/`key=value` bundle subpath)
 - Result row shape:
   - `MvccReadRow { source_key, key, value }`
   - `source_key` is populated for join-adjacent expansion sources so source-preserving joins can keep seed provenance visible while join-side projections reuse the same engine-facing result contract.
@@ -147,6 +148,8 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
   - `MvccReadOrder::ProvenanceBundleKeyPathDesc { bundle }`
   - `MvccReadOrder::ProvenanceBundleValuePathAsc { bundle }`
   - `MvccReadOrder::ProvenanceBundleValuePathDesc { bundle }`
+  - `MvccReadOrder::ProvenanceBundlePathOccurrenceOffsetAsc { bundle, summary, expected, occurrence }`
+  - `MvccReadOrder::ProvenanceBundlePathOccurrenceOffsetDesc { bundle, summary, expected, occurrence }`
 - Optional row cap:
   - `limit: Some(n)` applies after visibility + filter + ordering stages
 - Current device strategy:
@@ -157,7 +160,7 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
   - `tests/fixtures/mvcc-read-workload.txt`
   - `tests/fixtures/mvcc-source-composition-workload.txt`
 - Next obvious extension boundary:
-  - widen the provenance bundle offset surface from filter predicates into reusable projection/order helpers without regressing the same engine-facing contract and explicit fallback accounting on the eventual GPU-backed path.
+  - widen the provenance bundle offset surface from same-subpath occurrence offsets into reusable mixed-subpath or distance-oriented projection/order helpers without regressing the same engine-facing contract and explicit fallback accounting on the eventual GPU-backed path.
 
 ## Quickstart
 

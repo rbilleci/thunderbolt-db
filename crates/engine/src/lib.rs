@@ -204,6 +204,13 @@ pub enum MvccProvenanceFrameBundle {
     FullPath,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MvccProvenanceOccurrence {
+    First,
+    Last,
+    Nth(usize),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MvccReadFilter {
     KeyPrefix(String),
@@ -660,7 +667,7 @@ pub enum MvccReadFilter {
     Any(Vec<MvccReadFilter>),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MvccReadOrder {
     KeyAsc,
     KeyDesc,
@@ -672,17 +679,45 @@ pub enum MvccReadOrder {
     SourceKeyDesc,
     SourceValueAsc,
     SourceValueDesc,
-    ProvenanceKeyAsc { frame: MvccProvenanceFrame },
-    ProvenanceKeyDesc { frame: MvccProvenanceFrame },
-    ProvenanceValueAsc { frame: MvccProvenanceFrame },
-    ProvenanceValueDesc { frame: MvccProvenanceFrame },
-    ProvenanceBundleKeyPathAsc { bundle: MvccProvenanceFrameBundle },
-    ProvenanceBundleKeyPathDesc { bundle: MvccProvenanceFrameBundle },
-    ProvenanceBundleValuePathAsc { bundle: MvccProvenanceFrameBundle },
-    ProvenanceBundleValuePathDesc { bundle: MvccProvenanceFrameBundle },
+    ProvenanceKeyAsc {
+        frame: MvccProvenanceFrame,
+    },
+    ProvenanceKeyDesc {
+        frame: MvccProvenanceFrame,
+    },
+    ProvenanceValueAsc {
+        frame: MvccProvenanceFrame,
+    },
+    ProvenanceValueDesc {
+        frame: MvccProvenanceFrame,
+    },
+    ProvenanceBundleKeyPathAsc {
+        bundle: MvccProvenanceFrameBundle,
+    },
+    ProvenanceBundleKeyPathDesc {
+        bundle: MvccProvenanceFrameBundle,
+    },
+    ProvenanceBundleValuePathAsc {
+        bundle: MvccProvenanceFrameBundle,
+    },
+    ProvenanceBundleValuePathDesc {
+        bundle: MvccProvenanceFrameBundle,
+    },
+    ProvenanceBundlePathOccurrenceOffsetAsc {
+        bundle: MvccProvenanceFrameBundle,
+        summary: MvccProvenanceSummary,
+        expected: Vec<String>,
+        occurrence: MvccProvenanceOccurrence,
+    },
+    ProvenanceBundlePathOccurrenceOffsetDesc {
+        bundle: MvccProvenanceFrameBundle,
+        summary: MvccProvenanceSummary,
+        expected: Vec<String>,
+        occurrence: MvccProvenanceOccurrence,
+    },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MvccProjection {
     KeyValue,
     KeyOnly,
@@ -700,6 +735,12 @@ pub enum MvccProjection {
     TargetKeyProvenanceBundleSummary {
         bundle: MvccProvenanceFrameBundle,
         summary: MvccProvenanceSummary,
+    },
+    TargetKeyProvenanceBundleOccurrenceOffset {
+        bundle: MvccProvenanceFrameBundle,
+        summary: MvccProvenanceSummary,
+        expected: Vec<String>,
+        occurrence: MvccProvenanceOccurrence,
     },
 }
 
@@ -812,6 +853,35 @@ fn resolved_mvcc_row_provenance_bundle_segments(
         tuples.into_iter(),
         summary,
     ))
+}
+
+fn mvcc_provenance_segments_occurrence_start(
+    segments: &[String],
+    expected: &[String],
+    occurrence: MvccProvenanceOccurrence,
+) -> Option<usize> {
+    match occurrence {
+        MvccProvenanceOccurrence::First => {
+            mvcc_provenance_segments_first_subpath_start(segments, expected)
+        }
+        MvccProvenanceOccurrence::Last => {
+            mvcc_provenance_segments_last_subpath_start(segments, expected)
+        }
+        MvccProvenanceOccurrence::Nth(index) => {
+            mvcc_provenance_segments_nth_subpath_start(segments, expected, index)
+        }
+    }
+}
+
+fn resolved_mvcc_row_provenance_bundle_occurrence_offset(
+    row: &ResolvedMvccRow,
+    bundle: MvccProvenanceFrameBundle,
+    summary: MvccProvenanceSummary,
+    expected: &[String],
+    occurrence: MvccProvenanceOccurrence,
+) -> Option<usize> {
+    let segments = resolved_mvcc_row_provenance_bundle_segments(row, bundle, summary)?;
+    mvcc_provenance_segments_occurrence_start(&segments, expected, occurrence)
 }
 
 fn summarize_mvcc_provenance_tuples<'a>(
@@ -1547,19 +1617,32 @@ fn collect_mvcc_provenance_segments<'a>(
         .collect()
 }
 
-fn project_mvcc_row(row: ResolvedMvccRow, projection: MvccProjection) -> MvccReadRow {
+fn project_mvcc_row(row: ResolvedMvccRow, projection: &MvccProjection) -> MvccReadRow {
     let provenance_value = match projection {
         MvccProjection::TargetKeyProvenanceValue { frame } => {
-            resolved_mvcc_row_provenance_tuple(&row, frame).map(|tuple| tuple.value.clone())
+            resolved_mvcc_row_provenance_tuple(&row, *frame).map(|tuple| tuple.value.clone())
         }
+        MvccProjection::TargetKeyProvenanceBundleOccurrenceOffset {
+            bundle,
+            summary,
+            expected,
+            occurrence,
+        } => resolved_mvcc_row_provenance_bundle_occurrence_offset(
+            &row,
+            *bundle,
+            *summary,
+            expected,
+            *occurrence,
+        )
+        .map(|offset| offset.to_string()),
         _ => None,
     };
     let provenance_summary = match projection {
         MvccProjection::TargetKeyProvenanceSummary { summary } => {
-            summarize_mvcc_row_provenance_path(&row, summary)
+            summarize_mvcc_row_provenance_path(&row, *summary)
         }
         MvccProjection::TargetKeyProvenanceBundleSummary { bundle, summary } => {
-            summarize_mvcc_row_provenance_bundle(&row, bundle, summary)
+            summarize_mvcc_row_provenance_bundle(&row, *bundle, *summary)
         }
         _ => None,
     };
@@ -1623,6 +1706,11 @@ fn project_mvcc_row(row: ResolvedMvccRow, projection: MvccProjection) -> MvccRea
             source_key,
             key: Some(tuple.key),
             value: provenance_summary,
+        },
+        MvccProjection::TargetKeyProvenanceBundleOccurrenceOffset { .. } => MvccReadRow {
+            source_key,
+            key: Some(tuple.key),
+            value: provenance_value,
         },
     }
 }
@@ -2538,7 +2626,7 @@ fn mvcc_row_matches_filter(row: &ResolvedMvccRow, filter: &MvccReadFilter) -> bo
 fn mvcc_row_cmp(
     left: &ResolvedMvccRow,
     right: &ResolvedMvccRow,
-    order: MvccReadOrder,
+    order: &MvccReadOrder,
 ) -> std::cmp::Ordering {
     match order {
         MvccReadOrder::KeyAsc => left.tuple.key.cmp(&right.tuple.key),
@@ -2603,56 +2691,56 @@ fn mvcc_row_cmp(
             )
             .then_with(|| left.tuple.key.cmp(&right.tuple.key)),
         MvccReadOrder::ProvenanceKeyAsc { frame } => {
-            resolved_mvcc_row_provenance_tuple(left, frame)
+            resolved_mvcc_row_provenance_tuple(left, *frame)
                 .map(|tuple| tuple.key.as_str())
                 .unwrap_or("")
                 .cmp(
-                    resolved_mvcc_row_provenance_tuple(right, frame)
+                    resolved_mvcc_row_provenance_tuple(right, *frame)
                         .map(|tuple| tuple.key.as_str())
                         .unwrap_or(""),
                 )
                 .then_with(|| left.tuple.key.cmp(&right.tuple.key))
         }
         MvccReadOrder::ProvenanceKeyDesc { frame } => {
-            resolved_mvcc_row_provenance_tuple(right, frame)
+            resolved_mvcc_row_provenance_tuple(right, *frame)
                 .map(|tuple| tuple.key.as_str())
                 .unwrap_or("")
                 .cmp(
-                    resolved_mvcc_row_provenance_tuple(left, frame)
+                    resolved_mvcc_row_provenance_tuple(left, *frame)
                         .map(|tuple| tuple.key.as_str())
                         .unwrap_or(""),
                 )
                 .then_with(|| left.tuple.key.cmp(&right.tuple.key))
         }
         MvccReadOrder::ProvenanceValueAsc { frame } => {
-            resolved_mvcc_row_provenance_tuple(left, frame)
+            resolved_mvcc_row_provenance_tuple(left, *frame)
                 .map(|tuple| tuple.value.as_str())
                 .unwrap_or("")
                 .cmp(
-                    resolved_mvcc_row_provenance_tuple(right, frame)
+                    resolved_mvcc_row_provenance_tuple(right, *frame)
                         .map(|tuple| tuple.value.as_str())
                         .unwrap_or(""),
                 )
                 .then_with(|| left.tuple.key.cmp(&right.tuple.key))
         }
         MvccReadOrder::ProvenanceValueDesc { frame } => {
-            resolved_mvcc_row_provenance_tuple(right, frame)
+            resolved_mvcc_row_provenance_tuple(right, *frame)
                 .map(|tuple| tuple.value.as_str())
                 .unwrap_or("")
                 .cmp(
-                    resolved_mvcc_row_provenance_tuple(left, frame)
+                    resolved_mvcc_row_provenance_tuple(left, *frame)
                         .map(|tuple| tuple.value.as_str())
                         .unwrap_or(""),
                 )
                 .then_with(|| left.tuple.key.cmp(&right.tuple.key))
         }
         MvccReadOrder::ProvenanceBundleKeyPathAsc { bundle } => {
-            summarize_mvcc_row_provenance_bundle(left, bundle, MvccProvenanceSummary::KeyPath)
+            summarize_mvcc_row_provenance_bundle(left, *bundle, MvccProvenanceSummary::KeyPath)
                 .unwrap_or_default()
                 .cmp(
                     &summarize_mvcc_row_provenance_bundle(
                         right,
-                        bundle,
+                        *bundle,
                         MvccProvenanceSummary::KeyPath,
                     )
                     .unwrap_or_default(),
@@ -2660,12 +2748,12 @@ fn mvcc_row_cmp(
                 .then_with(|| left.tuple.key.cmp(&right.tuple.key))
         }
         MvccReadOrder::ProvenanceBundleKeyPathDesc { bundle } => {
-            summarize_mvcc_row_provenance_bundle(right, bundle, MvccProvenanceSummary::KeyPath)
+            summarize_mvcc_row_provenance_bundle(right, *bundle, MvccProvenanceSummary::KeyPath)
                 .unwrap_or_default()
                 .cmp(
                     &summarize_mvcc_row_provenance_bundle(
                         left,
-                        bundle,
+                        *bundle,
                         MvccProvenanceSummary::KeyPath,
                     )
                     .unwrap_or_default(),
@@ -2673,12 +2761,12 @@ fn mvcc_row_cmp(
                 .then_with(|| left.tuple.key.cmp(&right.tuple.key))
         }
         MvccReadOrder::ProvenanceBundleValuePathAsc { bundle } => {
-            summarize_mvcc_row_provenance_bundle(left, bundle, MvccProvenanceSummary::ValuePath)
+            summarize_mvcc_row_provenance_bundle(left, *bundle, MvccProvenanceSummary::ValuePath)
                 .unwrap_or_default()
                 .cmp(
                     &summarize_mvcc_row_provenance_bundle(
                         right,
-                        bundle,
+                        *bundle,
                         MvccProvenanceSummary::ValuePath,
                     )
                     .unwrap_or_default(),
@@ -2686,18 +2774,58 @@ fn mvcc_row_cmp(
                 .then_with(|| left.tuple.key.cmp(&right.tuple.key))
         }
         MvccReadOrder::ProvenanceBundleValuePathDesc { bundle } => {
-            summarize_mvcc_row_provenance_bundle(right, bundle, MvccProvenanceSummary::ValuePath)
+            summarize_mvcc_row_provenance_bundle(right, *bundle, MvccProvenanceSummary::ValuePath)
                 .unwrap_or_default()
                 .cmp(
                     &summarize_mvcc_row_provenance_bundle(
                         left,
-                        bundle,
+                        *bundle,
                         MvccProvenanceSummary::ValuePath,
                     )
                     .unwrap_or_default(),
                 )
                 .then_with(|| left.tuple.key.cmp(&right.tuple.key))
         }
+        MvccReadOrder::ProvenanceBundlePathOccurrenceOffsetAsc {
+            bundle,
+            summary,
+            expected,
+            occurrence,
+        } => resolved_mvcc_row_provenance_bundle_occurrence_offset(
+            left,
+            *bundle,
+            *summary,
+            expected,
+            *occurrence,
+        )
+        .cmp(&resolved_mvcc_row_provenance_bundle_occurrence_offset(
+            right,
+            *bundle,
+            *summary,
+            expected,
+            *occurrence,
+        ))
+        .then_with(|| left.tuple.key.cmp(&right.tuple.key)),
+        MvccReadOrder::ProvenanceBundlePathOccurrenceOffsetDesc {
+            bundle,
+            summary,
+            expected,
+            occurrence,
+        } => resolved_mvcc_row_provenance_bundle_occurrence_offset(
+            right,
+            *bundle,
+            *summary,
+            expected,
+            *occurrence,
+        )
+        .cmp(&resolved_mvcc_row_provenance_bundle_occurrence_offset(
+            left,
+            *bundle,
+            *summary,
+            expected,
+            *occurrence,
+        ))
+        .then_with(|| left.tuple.key.cmp(&right.tuple.key)),
     }
 }
 
@@ -4035,8 +4163,8 @@ impl Engine {
 
         let rows = resolve_mvcc_source(&self.mvcc_store, &query.source, query.visibility)?;
 
-        let projection = query.projection;
-        let projected = match (query.filter.clone(), query.order, query.limit) {
+        let projection = &query.projection;
+        let projected = match (query.filter.clone(), query.order.clone(), query.limit) {
             (Some(filter), Some(order), Some(limit)) => {
                 collect_operator_rows(ProjectOperator::new(
                     LimitOperator::new(
@@ -4046,7 +4174,7 @@ impl Engine {
                                 move |row: &ResolvedMvccRow| mvcc_row_matches_filter(row, &filter),
                             ),
                             move |left: &ResolvedMvccRow, right: &ResolvedMvccRow| {
-                                mvcc_row_cmp(left, right, order)
+                                mvcc_row_cmp(left, right, &order)
                             },
                         ),
                         limit,
@@ -4060,7 +4188,7 @@ impl Engine {
                         mvcc_row_matches_filter(row, &filter)
                     }),
                     move |left: &ResolvedMvccRow, right: &ResolvedMvccRow| {
-                        mvcc_row_cmp(left, right, order)
+                        mvcc_row_cmp(left, right, &order)
                     },
                 ),
                 move |row| project_mvcc_row(row, projection),
@@ -4085,7 +4213,7 @@ impl Engine {
                     SortOperator::new(
                         ScanOperator::new(rows),
                         move |left: &ResolvedMvccRow, right: &ResolvedMvccRow| {
-                            mvcc_row_cmp(left, right, order)
+                            mvcc_row_cmp(left, right, &order)
                         },
                     ),
                     limit,
@@ -4096,7 +4224,7 @@ impl Engine {
                 SortOperator::new(
                     ScanOperator::new(rows),
                     move |left: &ResolvedMvccRow, right: &ResolvedMvccRow| {
-                        mvcc_row_cmp(left, right, order)
+                        mvcc_row_cmp(left, right, &order)
                     },
                 ),
                 move |row| project_mvcc_row(row, projection),
@@ -8916,13 +9044,13 @@ mod tests {
         let mut e = Engine::new_local();
         e.execute_text(1, "SET acct:loop=profile:loop").unwrap();
         e.execute_text(2, "SET profile:loop=acct:loop").unwrap();
-        e.execute_text(3, "SET acct:solo=profile:solo").unwrap();
-        e.execute_text(4, "SET profile:solo=team:solo").unwrap();
+        e.execute_text(3, "SET acct:noop=profile:noop").unwrap();
+        e.execute_text(4, "SET profile:noop=acct:noop").unwrap();
 
         let key_count = e
             .execute_mvcc_query(&MvccReadQuery {
                 source: MvccReadSource::FollowValueChain {
-                    keys: vec!["acct:loop".to_string(), "acct:solo".to_string()],
+                    keys: vec!["acct:loop".to_string(), "acct:noop".to_string()],
                     plan: MvccValueChainPlan {
                         value_key_hops: 2,
                         terminal: MvccValueChainTerminal::CurrentRow,
@@ -11323,6 +11451,184 @@ mod tests {
             .unwrap();
 
         assert!(wrong_ordinal_to_last_index_miss.rows.is_empty());
+    }
+
+    #[test]
+    fn execute_mvcc_query_supports_bundle_occurrence_offset_projection_and_ordering() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:loop=profile:loop").unwrap();
+        e.execute_text(2, "SET profile:loop=acct:loop").unwrap();
+        e.execute_text(3, "SET acct:noop=profile:noop").unwrap();
+        e.execute_text(4, "SET profile:noop=acct:noop").unwrap();
+
+        let source = MvccReadSource::Concat {
+            sources: vec![
+                MvccReadSource::FollowValueChain {
+                    keys: vec!["acct:loop".to_string()],
+                    plan: MvccValueChainPlan {
+                        value_key_hops: 5,
+                        terminal: MvccValueChainTerminal::CurrentRow,
+                    },
+                    provenance: MvccSourceProvenance::Seed,
+                },
+                MvccReadSource::FollowValueChain {
+                    keys: vec!["acct:noop".to_string()],
+                    plan: MvccValueChainPlan {
+                        value_key_hops: 5,
+                        terminal: MvccValueChainTerminal::CurrentRow,
+                    },
+                    provenance: MvccSourceProvenance::Seed,
+                },
+            ],
+        };
+
+        let first_offsets = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: source.clone(),
+                visibility: StorageVisibility { read_txn_id: 4 },
+                filter: None,
+                order: Some(MvccReadOrder::ProvenanceBundlePathOccurrenceOffsetAsc {
+                    bundle: MvccProvenanceFrameBundle::FullPath,
+                    summary: MvccProvenanceSummary::KeyPath,
+                    expected: vec!["acct:loop".to_string(), "profile:loop".to_string()],
+                    occurrence: MvccProvenanceOccurrence::First,
+                }),
+                projection: MvccProjection::TargetKeyProvenanceBundleOccurrenceOffset {
+                    bundle: MvccProvenanceFrameBundle::FullPath,
+                    summary: MvccProvenanceSummary::KeyPath,
+                    expected: vec!["acct:loop".to_string(), "profile:loop".to_string()],
+                    occurrence: MvccProvenanceOccurrence::First,
+                },
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            first_offsets.rows,
+            vec![
+                MvccReadRow {
+                    source_key: Some("acct:noop".to_string()),
+                    key: Some("profile:noop".to_string()),
+                    value: None,
+                },
+                MvccReadRow {
+                    source_key: Some("acct:loop".to_string()),
+                    key: Some("profile:loop".to_string()),
+                    value: Some("0".to_string()),
+                },
+            ]
+        );
+
+        let last_offsets = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: source.clone(),
+                visibility: StorageVisibility { read_txn_id: 4 },
+                filter: None,
+                order: Some(MvccReadOrder::ProvenanceBundlePathOccurrenceOffsetDesc {
+                    bundle: MvccProvenanceFrameBundle::FullPath,
+                    summary: MvccProvenanceSummary::KeyPath,
+                    expected: vec!["acct:loop".to_string(), "profile:loop".to_string()],
+                    occurrence: MvccProvenanceOccurrence::Last,
+                }),
+                projection: MvccProjection::TargetKeyProvenanceBundleOccurrenceOffset {
+                    bundle: MvccProvenanceFrameBundle::FullPath,
+                    summary: MvccProvenanceSummary::KeyPath,
+                    expected: vec!["acct:loop".to_string(), "profile:loop".to_string()],
+                    occurrence: MvccProvenanceOccurrence::Last,
+                },
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            last_offsets.rows,
+            vec![
+                MvccReadRow {
+                    source_key: Some("acct:loop".to_string()),
+                    key: Some("profile:loop".to_string()),
+                    value: Some("4".to_string()),
+                },
+                MvccReadRow {
+                    source_key: Some("acct:noop".to_string()),
+                    key: Some("profile:noop".to_string()),
+                    value: None,
+                },
+            ]
+        );
+
+        let ordinal_offsets = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: source.clone(),
+                visibility: StorageVisibility { read_txn_id: 4 },
+                filter: None,
+                order: Some(MvccReadOrder::ProvenanceBundlePathOccurrenceOffsetDesc {
+                    bundle: MvccProvenanceFrameBundle::FullPath,
+                    summary: MvccProvenanceSummary::KeyPath,
+                    expected: vec!["acct:loop".to_string(), "profile:loop".to_string()],
+                    occurrence: MvccProvenanceOccurrence::Nth(1),
+                }),
+                projection: MvccProjection::TargetKeyProvenanceBundleOccurrenceOffset {
+                    bundle: MvccProvenanceFrameBundle::FullPath,
+                    summary: MvccProvenanceSummary::KeyPath,
+                    expected: vec!["acct:loop".to_string(), "profile:loop".to_string()],
+                    occurrence: MvccProvenanceOccurrence::Nth(1),
+                },
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            ordinal_offsets.rows,
+            vec![
+                MvccReadRow {
+                    source_key: Some("acct:loop".to_string()),
+                    key: Some("profile:loop".to_string()),
+                    value: Some("2".to_string()),
+                },
+                MvccReadRow {
+                    source_key: Some("acct:noop".to_string()),
+                    key: Some("profile:noop".to_string()),
+                    value: None,
+                },
+            ]
+        );
+
+        let missing_offsets = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source,
+                visibility: StorageVisibility { read_txn_id: 4 },
+                filter: None,
+                order: Some(MvccReadOrder::ProvenanceBundlePathOccurrenceOffsetAsc {
+                    bundle: MvccProvenanceFrameBundle::FullPath,
+                    summary: MvccProvenanceSummary::KeyPath,
+                    expected: vec!["missing:key".to_string()],
+                    occurrence: MvccProvenanceOccurrence::First,
+                }),
+                projection: MvccProjection::TargetKeyProvenanceBundleOccurrenceOffset {
+                    bundle: MvccProvenanceFrameBundle::FullPath,
+                    summary: MvccProvenanceSummary::KeyPath,
+                    expected: vec!["missing:key".to_string()],
+                    occurrence: MvccProvenanceOccurrence::First,
+                },
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            missing_offsets.rows,
+            vec![
+                MvccReadRow {
+                    source_key: Some("acct:loop".to_string()),
+                    key: Some("profile:loop".to_string()),
+                    value: None,
+                },
+                MvccReadRow {
+                    source_key: Some("acct:noop".to_string()),
+                    key: Some("profile:noop".to_string()),
+                    value: None,
+                },
+            ]
+        );
     }
 
     #[test]
