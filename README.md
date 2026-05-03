@@ -166,7 +166,7 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
   - `tests/fixtures/mvcc-read-workload.txt`
   - `tests/fixtures/mvcc-source-composition-workload.txt`
 - Next obvious extension boundary:
-  - widen the reusable provenance projection/order surface from pair-oriented mixed-subpath offset views into reusable pair-oriented mixed-subpath distance views without regressing the same engine-facing contract and explicit fallback accounting on the eventual GPU-backed path.
+  - no further MVCC surface growth is required for the no-GPU bootstrap by default; the next step is bootstrap closeout / CUDA-transition prep using the existing deterministic fixtures, explicit fallback truth, and documented engine-facing contract.
 
 ## Quickstart
 

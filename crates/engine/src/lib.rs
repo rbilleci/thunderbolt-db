@@ -6709,6 +6709,25 @@ mod tests {
         );
     }
 
+    fn assert_mvcc_query_uses_tracked_cpu_fallback(
+        engine: &Engine,
+        result: &MvccReadResult,
+        expected_total_fallbacks: u64,
+    ) {
+        assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.executed_target, DeviceTarget::Cpu);
+        assert_eq!(
+            result.fallback_reason,
+            Some(FallbackReason::GpuMvccReadParityGap)
+        );
+        assert_eq!(
+            engine
+                .metrics()
+                .fallback_for(FallbackReason::GpuMvccReadParityGap),
+            expected_total_fallbacks
+        );
+    }
+
     #[test]
     fn execute_mvcc_query_replays_deterministic_workload_fixture_for_point_lookup() {
         let mut e = Engine::new_local();
@@ -6732,6 +6751,8 @@ mod tests {
             })
             .unwrap();
 
+        assert_mvcc_query_uses_tracked_cpu_fallback(&e, &historical, 1);
+
         assert_eq!(
             historical.rows,
             vec![MvccReadRow {
@@ -6753,6 +6774,8 @@ mod tests {
                 limit: None,
             })
             .unwrap();
+
+        assert_mvcc_query_uses_tracked_cpu_fallback(&e, &current, 2);
 
         assert_eq!(
             current.rows,
@@ -6799,6 +6822,8 @@ mod tests {
             })
             .unwrap();
 
+        assert_mvcc_query_uses_tracked_cpu_fallback(&e, &multiset_overlap, 1);
+
         assert_eq!(
             multiset_overlap.rows,
             vec![MvccReadRow {
@@ -6831,6 +6856,8 @@ mod tests {
             })
             .unwrap();
 
+        assert_mvcc_query_uses_tracked_cpu_fallback(&e, &multiset_imbalance, 2);
+
         assert_eq!(
             multiset_imbalance.rows,
             vec![
@@ -6845,6 +6872,13 @@ mod tests {
                     value: Some("profile:1".to_string()),
                 },
             ]
+        );
+
+        let status = e.status_snapshot();
+        assert_eq!(status.fallback.gpu_parity_fallback_total(), 2);
+        assert_eq!(
+            status.latest_fallback_reason(),
+            Some(FallbackReason::GpuMvccReadParityGap)
         );
     }
 

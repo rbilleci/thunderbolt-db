@@ -47,6 +47,7 @@ This project uses a layered documentation model so implementation can proceed qu
 11. **Delivery scope and sequencing**
    - `docs/roadmap/v0-v1.md`
    - `docs/roadmap/no-nvidia-bootstrap-plan.md`
+   - `docs/roadmap/no-gpu-bootstrap-closeout-review.md`
 
 12. **Compatibility and validation gates**
    - `docs/compatibility/matrix.md`

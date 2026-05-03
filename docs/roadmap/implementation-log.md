@@ -1,6 +1,24 @@
 # Implementation Log (Pre-NVIDIA Phase)
 
+## 2026-05-04
+
+### Completed
+- Switched the autonomous loop into explicit no-GPU closeout-consolidation mode instead of widening the MVCC surface again without a named semantic gap.
+- Tightened deterministic fixture proof so `execute_mvcc_query_replays_deterministic_workload_fixture_for_point_lookup` and `execute_mvcc_query_replays_deterministic_source_composition_workload_fixture` now assert the planned GPU target, executed CPU target, tracked `GpuMvccReadParityGap` fallback reason, and cumulative fallback accounting directly.
+- Added source-composition closeout coverage proving `status_snapshot()` rolls the same parity fallback truth up consistently after engine-facing MVCC workload replay.
+- Reconciled the engine-facing contract docs (`README.md`, `docs/interfaces/execution-interfaces.md`, `docs/roadmap/no-nvidia-bootstrap-plan.md`) so the next step is bootstrap closeout / CUDA-transition prep rather than more bootstrap-surface expansion by default.
+- Recorded the no-GPU bootstrap closeout review in `docs/roadmap/no-gpu-bootstrap-closeout-review.md` and marked the phase closed in the roadmap unless CUDA onboarding exposes a real contract gap.
+- Validation gate passed cleanly:
+  - `cargo fmt --all`
+  - `cargo clippy --all-targets --all-features -- -D warnings`
+  - `cargo test --all --all-features`
+
 ## 2026-05-03
+
+### Roadmap closeout update
+- Reframed the remaining no-GPU loop away from open-ended Q2 frontier growth and toward three allowed modes only: named semantic-gap closure, closeout consolidation, or GPU-transition preparation.
+- Added an explicit bootstrap closeout review gate covering execution-contract stability, parity/fallback truth-surface stability, deterministic replay fixture sufficiency, no-rewrite confirmation before `CudaBackend`, and the full Rust validation gate.
+- Added an explicit first-CUDA-slice checklist so the hardware transition starts with scan/visibility/filter/point-lookup parity under live fallback routing instead of broad unverified acceleration.
 
 ### Completed
 - Extended the reusable MVCC provenance frame-bundle surface with `MvccReadOrder::ProvenanceBundlePathMixedOccurrenceOffsetPairAsc { bundle, summary, left_expected, left_occurrence, right_expected, right_occurrence }` / `ProvenanceBundlePathMixedOccurrenceOffsetPairDesc { ... }` plus `MvccProjection::TargetKeyProvenanceBundleMixedOccurrenceOffsetPair { bundle, summary, left_expected, left_occurrence, right_expected, right_occurrence }`, so callers can now sort by or project pair-oriented mixed-subpath bundle-relative offsets as a stable `left,right` view without re-specifying individual provenance frames or changing the public `MvccReadRow { source_key, key, value }` contract.

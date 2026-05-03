@@ -142,7 +142,7 @@ Notes:
 
 ### Q2. Vertical slice: execution over MVCC storage
 Priority: highest
-Status: completed for the bootstrap slice on 2026-04-25; current supported shape is full scan/key lookup + snapshot visibility + filter/order/project/limit with explicit `GpuMvccReadParityGap` fallback tracking. Extend from here without weakening the GPU-first fallback contract.
+Status: completed for the bootstrap slice on 2026-04-25 and closed for the no-GPU phase on 2026-05-04 after bootstrap closeout review + full validation gate; current supported shape is full scan/key lookup + snapshot visibility + filter/order/project/limit with explicit `GpuMvccReadParityGap` fallback tracking. Reopen only if CUDA onboarding exposes a real contract gap.
 
 Goal:
 - Convert the new in-memory MVCC tuple store and reusable vec operator groundwork into a narrow but real end-to-end execution slice.
@@ -164,7 +164,7 @@ Notes:
 - This should make the engine visibly more capable, not just more internally prepared.
 - Current bootstrap truth: the engine-facing MVCC slice now supports full scans + single-key lookups + key-batch fan-in lookups + explicit multi-source `Concat` / `ConcatDistinct` / `IntersectDistinct` / `IntersectAll` / `ExceptDistinct` / `ExceptAll` / `SymmetricDifferenceDistinct` / `SymmetricDifferenceAll` composition + generic `FollowValueChain { keys, plan, provenance }` linear nested-join expansion + `FollowValueChainBranches { keys, plans, fan_in, provenance }` plus `FollowValueChainLabeledBranches { keys, branches, fan_in, provenance }` branch expansion (including the existing named value→key, value→key→prefix, value→key→value→key, and deeper fan-out/terminal helper families as stable aliases) with snapshot visibility, prefix/value/composite/range filters, source-aware key/value plus branch-label filters for join-adjacent rows, explicit multi-frame provenance filters/projection/order controls (`Seed`, `TerminalInput`, `ValueHop(n)`), reusable provenance-frame bundles (`SeedThroughTerminalInput`, `FullPath`) across bundle-aware key/value exact-membership, counted bundle-membership thresholds, exact ordered path equality, ordered contiguous subpath matching, ordered repeated-subpath counting, exact-distance pair matching, whole-bundle prefix/suffix matching, anchored bundle-slice matching, exact/ranged first/last/nth occurrence matching, exact/ranged same-subpath ordinal plus adjacent and first/last-to-ordinal occurrence-distance helpers, exact/ranged first/last-to-ordinal same-subpath offset helpers, exact/ranged ordinal-pair same-subpath offset helpers, exact/ranged ordinal mixed-subpath occurrence-distance, exact/ranged first/last-to-ordinal mixed-subpath occurrence-distance helpers, exact/ranged nth-offset matching, exact/ranged first/last-to-ordinal mixed-subpath offset helpers, first/last exact/ranged mixed-occurrence offsets, first/last mixed-subpath occurrence-distance helpers, reusable occurrence-offset and occurrence-distance projection/order helpers, bundle-relative positional segment equality, exact whole-bundle cardinality checks, prefix filters, key/value path ordering, and summary projection helpers, mixed join-side projection controls (target-key+seed-value, source-key+target-value, source-value-only, branch-label+target-value, target-key+provenance-value, target-key+provenance-summary, target-key+bundle-summary), selectable single-frame source provenance on generic nested-join rows, and post-order limit under an explicit `GpuMvccReadParityGap` fallback contract.
 - Deterministic workload fixtures now cover both point-lookup/history replay and source-composition replay (`tests/fixtures/mvcc-read-workload.txt`, `tests/fixtures/mvcc-source-composition-workload.txt`).
-- Next obvious extension boundary: widen the reusable provenance projection/order surface from pair-oriented mixed-subpath offset views into reusable pair-oriented mixed-subpath distance views without weakening the explicit fallback contract.
+- Next obvious extension boundary: the mixed-subpath offset/distance projection-order surface is now broad enough for bootstrap purposes; the remaining Q2 loop should prioritize semantic closeout, truth-surface consolidation, and proof that no interface rewrite is needed before `CudaBackend` lands.
 
 ### Q3. Replication semantics hardening under stress
 Priority: highest
@@ -312,3 +312,71 @@ Notes:
 - CPU semantics stable enough to act as truth oracle.
 - Mock GPU path runs deterministic replay tests.
 - No major interface changes required before plugging in CUDA backend.
+
+No-GPU bootstrap phase closeout recorded on 2026-05-04:
+- [x] Commit path is replication-shaped and invariant-tested.
+- [x] Planner/executor contracts are device-aware.
+- [x] CPU semantics are stable enough to act as truth oracle.
+- [x] Mock GPU path / fallback path uses deterministic replay fixtures for parity checks.
+- [x] No major interface changes are required before plugging in `CudaBackend`.
+- Evidence captured in `docs/roadmap/no-gpu-bootstrap-closeout-review.md`.
+
+## Active loop policy until GPU transition
+
+The no-GPU loop is no longer allowed to grow the execution surface just because another permutation is imaginable. From this point forward, each loop must choose one of only three justified modes:
+
+1. **Named semantic gap closure**
+   - Add or refine a read-path capability only if it closes a clearly named missing semantic category that matters for the eventual GPU executor contract.
+   - The loop must state the gap explicitly before implementation.
+2. **Closeout consolidation**
+   - Tighten docs, invariants, fixtures, parity telemetry, or engine-facing tests so the current CPU truth surface is easier to port and verify on GPU.
+   - Prefer this mode when no crisp missing semantic category can be named.
+3. **GPU-transition preparation**
+   - Strengthen the contract boundary the first CUDA slice will rely on: device routing, fallback accounting, deterministic parity fixtures, and operator-level shape stability.
+
+Operational stop rule for the remaining no-GPU loop:
+- If a proposed loop does not materially improve one of these three areas, do not do it.
+- If no remaining semantic category can be named and the contract boundary already looks stable, run the full validation gate and perform a bootstrap closeout review instead of expanding Q2 further.
+
+## Bootstrap closeout review (required before CUDA work starts)
+
+Before starting real GPU execution, perform and record a closeout review that answers each item explicitly:
+
+1. **Execution contract stability**
+   - `Engine::execute_mvcc_query()` supported source/filter/order/projection semantics are documented and covered by engine-facing tests.
+   - Remaining gaps are tracked as explicit future work, not implicit assumptions.
+2. **Parity/fallback truth surface stability**
+   - planned-vs-executed device reporting and fallback reasons are visible, deterministic, and already asserted in tests/fixtures where applicable.
+3. **Deterministic replay coverage**
+   - the existing workload fixtures remain sufficient to compare CPU and future GPU outputs for the first CUDA slice.
+   - if not sufficient, add the smallest missing fixture before GPU work begins.
+4. **No-rewrite check**
+   - no pending design concern implies a major planner/executor/result-contract rewrite before `CudaBackend` can be attached.
+5. **Validation gate green**
+   - `cargo fmt --all`
+   - `cargo clippy --all-targets --all-features -- -D warnings`
+   - `cargo test --all --all-features`
+
+If every item above is satisfied, mark the no-GPU bootstrap phase closed and move to the hardware-onboarding checklist.
+
+Closeout review recorded on 2026-05-04:
+- satisfied: execution contract stability
+- satisfied: parity/fallback truth surface stability
+- satisfied: deterministic replay coverage
+- satisfied: no-rewrite check
+- satisfied: validation gate green (`cargo fmt --all`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all --all-features`)
+
+## First CUDA transition slice (once NVIDIA hardware is available)
+
+Do not begin with broad acceleration. Land the smallest parity-checkable slice first:
+
+1. Add CUDA build targets plus at least one reproducible GPU-capable CI/dev environment.
+2. Implement `CudaBackend` behind the existing backend trait boundary without changing engine-facing contracts.
+3. Port only the first operator subset:
+   - scan
+   - snapshot visibility filtering
+   - simple filter predicates
+   - point lookup / key lookup
+4. Run CPU-vs-GPU parity checks against the existing deterministic fixtures and any minimal new fixture added during closeout.
+5. Keep fallback routing live so unsupported shapes still execute via CPU with explicit tracked reasons.
+6. Only after parity is trustworthy, widen GPU coverage to ordering, projection, multi-source composition, nested joins, and provenance-aware execution.
