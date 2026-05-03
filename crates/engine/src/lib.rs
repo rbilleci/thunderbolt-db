@@ -348,6 +348,16 @@ pub enum MvccReadFilter {
         right_expected: Vec<String>,
         distance: usize,
     },
+    ProvenanceBundlePathMixedOccurrenceDistanceWithin {
+        bundle: MvccProvenanceFrameBundle,
+        summary: MvccProvenanceSummary,
+        left_occurrence_index: usize,
+        left_expected: Vec<String>,
+        right_occurrence_index: usize,
+        right_expected: Vec<String>,
+        min_distance: usize,
+        max_distance: usize,
+    },
     ProvenanceBundlePathSegmentEquals {
         bundle: MvccProvenanceFrameBundle,
         summary: MvccProvenanceSummary,
@@ -679,14 +689,35 @@ fn mvcc_provenance_segments_occurrence_distance_within(
     min_distance: usize,
     max_distance: usize,
 ) -> bool {
+    mvcc_provenance_segments_mixed_occurrence_distance_within(
+        segments,
+        expected,
+        left_occurrence_index,
+        expected,
+        right_occurrence_index,
+        min_distance,
+        max_distance,
+    )
+}
+
+fn mvcc_provenance_segments_mixed_occurrence_distance_within(
+    segments: &[String],
+    left_expected: &[String],
+    left_occurrence_index: usize,
+    right_expected: &[String],
+    right_occurrence_index: usize,
+    min_distance: usize,
+    max_distance: usize,
+) -> bool {
     if min_distance > max_distance {
         return false;
     }
 
-    mvcc_provenance_segments_occurrence_distance(
+    mvcc_provenance_segments_mixed_occurrence_distance(
         segments,
-        expected,
+        left_expected,
         left_occurrence_index,
+        right_expected,
         right_occurrence_index,
     )
     .is_some_and(|distance| (min_distance..=max_distance).contains(&distance))
@@ -1046,6 +1077,28 @@ fn mvcc_row_matches_filter(row: &ResolvedMvccRow, filter: &MvccReadFilter) -> bo
                     right_expected,
                     *right_occurrence_index,
                 ) == Some(*distance)
+            },
+        ),
+        MvccReadFilter::ProvenanceBundlePathMixedOccurrenceDistanceWithin {
+            bundle,
+            summary,
+            left_occurrence_index,
+            left_expected,
+            right_occurrence_index,
+            right_expected,
+            min_distance,
+            max_distance,
+        } => resolved_mvcc_row_provenance_bundle_segments(row, *bundle, *summary).is_some_and(
+            |segments| {
+                mvcc_provenance_segments_mixed_occurrence_distance_within(
+                    &segments,
+                    left_expected,
+                    *left_occurrence_index,
+                    right_expected,
+                    *right_occurrence_index,
+                    *min_distance,
+                    *max_distance,
+                )
             },
         ),
         MvccReadFilter::ProvenanceBundlePathSegmentEquals {
@@ -9009,6 +9062,43 @@ mod tests {
             }]
         );
 
+        let mixed_occurrence_distance_range_match = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FollowValueChain {
+                    keys: vec!["acct:1".to_string(), "acct:2".to_string()],
+                    plan: MvccValueChainPlan {
+                        value_key_hops: 3,
+                        terminal: MvccValueChainTerminal::CurrentRow,
+                    },
+                    provenance: MvccSourceProvenance::Seed,
+                },
+                visibility: StorageVisibility { read_txn_id: 5 },
+                filter: Some(
+                    MvccReadFilter::ProvenanceBundlePathMixedOccurrenceDistanceWithin {
+                        bundle: MvccProvenanceFrameBundle::FullPath,
+                        summary: MvccProvenanceSummary::KeyPath,
+                        left_occurrence_index: 0,
+                        left_expected: vec!["acct:1".to_string(), "profile:1".to_string()],
+                        right_occurrence_index: 0,
+                        right_expected: vec!["team:alpha".to_string(), "acct:1".to_string()],
+                        min_distance: 1,
+                        max_distance: 2,
+                    },
+                ),
+                order: None,
+                projection: MvccProjection::TargetKeyProvenanceBundleSummary {
+                    bundle: MvccProvenanceFrameBundle::FullPath,
+                    summary: MvccProvenanceSummary::KeyPath,
+                },
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            mixed_occurrence_distance_range_match.rows,
+            mixed_occurrence_distance_match.rows
+        );
+
         let truncated_mixed_occurrence_distance_miss = e
             .execute_mvcc_query(&MvccReadQuery {
                 source: MvccReadSource::FollowValueChain {
@@ -9038,6 +9128,39 @@ mod tests {
             .unwrap();
 
         assert!(truncated_mixed_occurrence_distance_miss.rows.is_empty());
+
+        let truncated_mixed_occurrence_distance_range_miss = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FollowValueChain {
+                    keys: vec!["acct:1".to_string()],
+                    plan: MvccValueChainPlan {
+                        value_key_hops: 2,
+                        terminal: MvccValueChainTerminal::CurrentRow,
+                    },
+                    provenance: MvccSourceProvenance::Seed,
+                },
+                visibility: StorageVisibility { read_txn_id: 5 },
+                filter: Some(
+                    MvccReadFilter::ProvenanceBundlePathMixedOccurrenceDistanceWithin {
+                        bundle: MvccProvenanceFrameBundle::SeedThroughTerminalInput,
+                        summary: MvccProvenanceSummary::KeyPath,
+                        left_occurrence_index: 0,
+                        left_expected: vec!["acct:1".to_string(), "profile:1".to_string()],
+                        right_occurrence_index: 0,
+                        right_expected: vec!["team:alpha".to_string(), "acct:1".to_string()],
+                        min_distance: 1,
+                        max_distance: 2,
+                    },
+                ),
+                order: None,
+                projection: MvccProjection::KeyOnly,
+                limit: None,
+            })
+            .unwrap();
+
+        assert!(truncated_mixed_occurrence_distance_range_miss
+            .rows
+            .is_empty());
 
         let wrong_mixed_occurrence_distance_miss = e
             .execute_mvcc_query(&MvccReadQuery {
@@ -9069,6 +9192,70 @@ mod tests {
 
         assert!(wrong_mixed_occurrence_distance_miss.rows.is_empty());
 
+        let wrong_mixed_occurrence_distance_range_miss = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FollowValueChain {
+                    keys: vec!["acct:1".to_string()],
+                    plan: MvccValueChainPlan {
+                        value_key_hops: 3,
+                        terminal: MvccValueChainTerminal::CurrentRow,
+                    },
+                    provenance: MvccSourceProvenance::Seed,
+                },
+                visibility: StorageVisibility { read_txn_id: 5 },
+                filter: Some(
+                    MvccReadFilter::ProvenanceBundlePathMixedOccurrenceDistanceWithin {
+                        bundle: MvccProvenanceFrameBundle::FullPath,
+                        summary: MvccProvenanceSummary::KeyPath,
+                        left_occurrence_index: 0,
+                        left_expected: vec!["acct:1".to_string(), "profile:1".to_string()],
+                        right_occurrence_index: 0,
+                        right_expected: vec!["team:alpha".to_string(), "acct:1".to_string()],
+                        min_distance: 0,
+                        max_distance: 1,
+                    },
+                ),
+                order: None,
+                projection: MvccProjection::KeyOnly,
+                limit: None,
+            })
+            .unwrap();
+
+        assert!(wrong_mixed_occurrence_distance_range_miss.rows.is_empty());
+
+        let inverted_mixed_occurrence_distance_range_miss = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FollowValueChain {
+                    keys: vec!["acct:1".to_string()],
+                    plan: MvccValueChainPlan {
+                        value_key_hops: 3,
+                        terminal: MvccValueChainTerminal::CurrentRow,
+                    },
+                    provenance: MvccSourceProvenance::Seed,
+                },
+                visibility: StorageVisibility { read_txn_id: 5 },
+                filter: Some(
+                    MvccReadFilter::ProvenanceBundlePathMixedOccurrenceDistanceWithin {
+                        bundle: MvccProvenanceFrameBundle::FullPath,
+                        summary: MvccProvenanceSummary::KeyPath,
+                        left_occurrence_index: 0,
+                        left_expected: vec!["acct:1".to_string(), "profile:1".to_string()],
+                        right_occurrence_index: 0,
+                        right_expected: vec!["team:alpha".to_string(), "acct:1".to_string()],
+                        min_distance: 3,
+                        max_distance: 2,
+                    },
+                ),
+                order: None,
+                projection: MvccProjection::KeyOnly,
+                limit: None,
+            })
+            .unwrap();
+
+        assert!(inverted_mixed_occurrence_distance_range_miss
+            .rows
+            .is_empty());
+
         let reversed_mixed_occurrence_distance_miss = e
             .execute_mvcc_query(&MvccReadQuery {
                 source: MvccReadSource::FollowValueChain {
@@ -9098,6 +9285,39 @@ mod tests {
             .unwrap();
 
         assert!(reversed_mixed_occurrence_distance_miss.rows.is_empty());
+
+        let reversed_mixed_occurrence_distance_range_miss = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FollowValueChain {
+                    keys: vec!["acct:1".to_string()],
+                    plan: MvccValueChainPlan {
+                        value_key_hops: 3,
+                        terminal: MvccValueChainTerminal::CurrentRow,
+                    },
+                    provenance: MvccSourceProvenance::Seed,
+                },
+                visibility: StorageVisibility { read_txn_id: 5 },
+                filter: Some(
+                    MvccReadFilter::ProvenanceBundlePathMixedOccurrenceDistanceWithin {
+                        bundle: MvccProvenanceFrameBundle::FullPath,
+                        summary: MvccProvenanceSummary::KeyPath,
+                        left_occurrence_index: 0,
+                        left_expected: vec!["team:alpha".to_string(), "acct:1".to_string()],
+                        right_occurrence_index: 0,
+                        right_expected: vec!["acct:1".to_string(), "profile:1".to_string()],
+                        min_distance: 1,
+                        max_distance: 2,
+                    },
+                ),
+                order: None,
+                projection: MvccProjection::KeyOnly,
+                limit: None,
+            })
+            .unwrap();
+
+        assert!(reversed_mixed_occurrence_distance_range_miss
+            .rows
+            .is_empty());
     }
 
     #[test]
