@@ -715,6 +715,22 @@ pub enum MvccReadOrder {
         expected: Vec<String>,
         occurrence: MvccProvenanceOccurrence,
     },
+    ProvenanceBundlePathOccurrenceDistanceAsc {
+        bundle: MvccProvenanceFrameBundle,
+        summary: MvccProvenanceSummary,
+        left_expected: Vec<String>,
+        left_occurrence: MvccProvenanceOccurrence,
+        right_expected: Vec<String>,
+        right_occurrence: MvccProvenanceOccurrence,
+    },
+    ProvenanceBundlePathOccurrenceDistanceDesc {
+        bundle: MvccProvenanceFrameBundle,
+        summary: MvccProvenanceSummary,
+        left_expected: Vec<String>,
+        left_occurrence: MvccProvenanceOccurrence,
+        right_expected: Vec<String>,
+        right_occurrence: MvccProvenanceOccurrence,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -741,6 +757,14 @@ pub enum MvccProjection {
         summary: MvccProvenanceSummary,
         expected: Vec<String>,
         occurrence: MvccProvenanceOccurrence,
+    },
+    TargetKeyProvenanceBundleOccurrenceDistance {
+        bundle: MvccProvenanceFrameBundle,
+        summary: MvccProvenanceSummary,
+        left_expected: Vec<String>,
+        left_occurrence: MvccProvenanceOccurrence,
+        right_expected: Vec<String>,
+        right_occurrence: MvccProvenanceOccurrence,
     },
 }
 
@@ -882,6 +906,23 @@ fn resolved_mvcc_row_provenance_bundle_occurrence_offset(
 ) -> Option<usize> {
     let segments = resolved_mvcc_row_provenance_bundle_segments(row, bundle, summary)?;
     mvcc_provenance_segments_occurrence_start(&segments, expected, occurrence)
+}
+
+fn resolved_mvcc_row_provenance_bundle_occurrence_distance(
+    row: &ResolvedMvccRow,
+    bundle: MvccProvenanceFrameBundle,
+    summary: MvccProvenanceSummary,
+    left_expected: &[String],
+    left_occurrence: MvccProvenanceOccurrence,
+    right_expected: &[String],
+    right_occurrence: MvccProvenanceOccurrence,
+) -> Option<usize> {
+    let segments = resolved_mvcc_row_provenance_bundle_segments(row, bundle, summary)?;
+    let left_start =
+        mvcc_provenance_segments_occurrence_start(&segments, left_expected, left_occurrence)?;
+    let right_start =
+        mvcc_provenance_segments_occurrence_start(&segments, right_expected, right_occurrence)?;
+    right_start.checked_sub(left_start)
 }
 
 fn summarize_mvcc_provenance_tuples<'a>(
@@ -1635,6 +1676,23 @@ fn project_mvcc_row(row: ResolvedMvccRow, projection: &MvccProjection) -> MvccRe
             *occurrence,
         )
         .map(|offset| offset.to_string()),
+        MvccProjection::TargetKeyProvenanceBundleOccurrenceDistance {
+            bundle,
+            summary,
+            left_expected,
+            left_occurrence,
+            right_expected,
+            right_occurrence,
+        } => resolved_mvcc_row_provenance_bundle_occurrence_distance(
+            &row,
+            *bundle,
+            *summary,
+            left_expected,
+            *left_occurrence,
+            right_expected,
+            *right_occurrence,
+        )
+        .map(|distance| distance.to_string()),
         _ => None,
     };
     let provenance_summary = match projection {
@@ -1708,6 +1766,11 @@ fn project_mvcc_row(row: ResolvedMvccRow, projection: &MvccProjection) -> MvccRe
             value: provenance_summary,
         },
         MvccProjection::TargetKeyProvenanceBundleOccurrenceOffset { .. } => MvccReadRow {
+            source_key,
+            key: Some(tuple.key),
+            value: provenance_value,
+        },
+        MvccProjection::TargetKeyProvenanceBundleOccurrenceDistance { .. } => MvccReadRow {
             source_key,
             key: Some(tuple.key),
             value: provenance_value,
@@ -2824,6 +2887,58 @@ fn mvcc_row_cmp(
             *summary,
             expected,
             *occurrence,
+        ))
+        .then_with(|| left.tuple.key.cmp(&right.tuple.key)),
+        MvccReadOrder::ProvenanceBundlePathOccurrenceDistanceAsc {
+            bundle,
+            summary,
+            left_expected,
+            left_occurrence,
+            right_expected,
+            right_occurrence,
+        } => resolved_mvcc_row_provenance_bundle_occurrence_distance(
+            left,
+            *bundle,
+            *summary,
+            left_expected,
+            *left_occurrence,
+            right_expected,
+            *right_occurrence,
+        )
+        .cmp(&resolved_mvcc_row_provenance_bundle_occurrence_distance(
+            right,
+            *bundle,
+            *summary,
+            left_expected,
+            *left_occurrence,
+            right_expected,
+            *right_occurrence,
+        ))
+        .then_with(|| left.tuple.key.cmp(&right.tuple.key)),
+        MvccReadOrder::ProvenanceBundlePathOccurrenceDistanceDesc {
+            bundle,
+            summary,
+            left_expected,
+            left_occurrence,
+            right_expected,
+            right_occurrence,
+        } => resolved_mvcc_row_provenance_bundle_occurrence_distance(
+            right,
+            *bundle,
+            *summary,
+            left_expected,
+            *left_occurrence,
+            right_expected,
+            *right_occurrence,
+        )
+        .cmp(&resolved_mvcc_row_provenance_bundle_occurrence_distance(
+            left,
+            *bundle,
+            *summary,
+            left_expected,
+            *left_occurrence,
+            right_expected,
+            *right_occurrence,
         ))
         .then_with(|| left.tuple.key.cmp(&right.tuple.key)),
     }
@@ -11616,6 +11731,159 @@ mod tests {
 
         assert_eq!(
             missing_offsets.rows,
+            vec![
+                MvccReadRow {
+                    source_key: Some("acct:loop".to_string()),
+                    key: Some("profile:loop".to_string()),
+                    value: None,
+                },
+                MvccReadRow {
+                    source_key: Some("acct:noop".to_string()),
+                    key: Some("profile:noop".to_string()),
+                    value: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn execute_mvcc_query_supports_bundle_occurrence_distance_projection_and_ordering() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:loop=profile:loop").unwrap();
+        e.execute_text(2, "SET profile:loop=acct:loop").unwrap();
+        e.execute_text(3, "SET acct:noop=profile:noop").unwrap();
+        e.execute_text(4, "SET profile:noop=acct:noop").unwrap();
+
+        let source = MvccReadSource::Concat {
+            sources: vec![
+                MvccReadSource::FollowValueChain {
+                    keys: vec!["acct:loop".to_string()],
+                    plan: MvccValueChainPlan {
+                        value_key_hops: 5,
+                        terminal: MvccValueChainTerminal::CurrentRow,
+                    },
+                    provenance: MvccSourceProvenance::Seed,
+                },
+                MvccReadSource::FollowValueChain {
+                    keys: vec!["acct:noop".to_string()],
+                    plan: MvccValueChainPlan {
+                        value_key_hops: 5,
+                        terminal: MvccValueChainTerminal::CurrentRow,
+                    },
+                    provenance: MvccSourceProvenance::Seed,
+                },
+            ],
+        };
+
+        let same_subpath_distances = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: source.clone(),
+                visibility: StorageVisibility { read_txn_id: 4 },
+                filter: None,
+                order: Some(MvccReadOrder::ProvenanceBundlePathOccurrenceDistanceAsc {
+                    bundle: MvccProvenanceFrameBundle::FullPath,
+                    summary: MvccProvenanceSummary::KeyPath,
+                    left_expected: vec!["acct:loop".to_string(), "profile:loop".to_string()],
+                    left_occurrence: MvccProvenanceOccurrence::First,
+                    right_expected: vec!["acct:loop".to_string(), "profile:loop".to_string()],
+                    right_occurrence: MvccProvenanceOccurrence::Last,
+                }),
+                projection: MvccProjection::TargetKeyProvenanceBundleOccurrenceDistance {
+                    bundle: MvccProvenanceFrameBundle::FullPath,
+                    summary: MvccProvenanceSummary::KeyPath,
+                    left_expected: vec!["acct:loop".to_string(), "profile:loop".to_string()],
+                    left_occurrence: MvccProvenanceOccurrence::First,
+                    right_expected: vec!["acct:loop".to_string(), "profile:loop".to_string()],
+                    right_occurrence: MvccProvenanceOccurrence::Last,
+                },
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            same_subpath_distances.rows,
+            vec![
+                MvccReadRow {
+                    source_key: Some("acct:noop".to_string()),
+                    key: Some("profile:noop".to_string()),
+                    value: None,
+                },
+                MvccReadRow {
+                    source_key: Some("acct:loop".to_string()),
+                    key: Some("profile:loop".to_string()),
+                    value: Some("4".to_string()),
+                },
+            ]
+        );
+
+        let mixed_distances = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: source.clone(),
+                visibility: StorageVisibility { read_txn_id: 4 },
+                filter: None,
+                order: Some(MvccReadOrder::ProvenanceBundlePathOccurrenceDistanceDesc {
+                    bundle: MvccProvenanceFrameBundle::FullPath,
+                    summary: MvccProvenanceSummary::KeyPath,
+                    left_expected: vec!["acct:loop".to_string()],
+                    left_occurrence: MvccProvenanceOccurrence::First,
+                    right_expected: vec!["profile:loop".to_string()],
+                    right_occurrence: MvccProvenanceOccurrence::Last,
+                }),
+                projection: MvccProjection::TargetKeyProvenanceBundleOccurrenceDistance {
+                    bundle: MvccProvenanceFrameBundle::FullPath,
+                    summary: MvccProvenanceSummary::KeyPath,
+                    left_expected: vec!["acct:loop".to_string()],
+                    left_occurrence: MvccProvenanceOccurrence::First,
+                    right_expected: vec!["profile:loop".to_string()],
+                    right_occurrence: MvccProvenanceOccurrence::Last,
+                },
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            mixed_distances.rows,
+            vec![
+                MvccReadRow {
+                    source_key: Some("acct:loop".to_string()),
+                    key: Some("profile:loop".to_string()),
+                    value: Some("5".to_string()),
+                },
+                MvccReadRow {
+                    source_key: Some("acct:noop".to_string()),
+                    key: Some("profile:noop".to_string()),
+                    value: None,
+                },
+            ]
+        );
+
+        let missing_distances = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source,
+                visibility: StorageVisibility { read_txn_id: 4 },
+                filter: None,
+                order: Some(MvccReadOrder::ProvenanceBundlePathOccurrenceDistanceAsc {
+                    bundle: MvccProvenanceFrameBundle::FullPath,
+                    summary: MvccProvenanceSummary::KeyPath,
+                    left_expected: vec!["missing:left".to_string()],
+                    left_occurrence: MvccProvenanceOccurrence::First,
+                    right_expected: vec!["missing:right".to_string()],
+                    right_occurrence: MvccProvenanceOccurrence::Last,
+                }),
+                projection: MvccProjection::TargetKeyProvenanceBundleOccurrenceDistance {
+                    bundle: MvccProvenanceFrameBundle::FullPath,
+                    summary: MvccProvenanceSummary::KeyPath,
+                    left_expected: vec!["missing:left".to_string()],
+                    left_occurrence: MvccProvenanceOccurrence::First,
+                    right_expected: vec!["missing:right".to_string()],
+                    right_occurrence: MvccProvenanceOccurrence::Last,
+                },
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            missing_distances.rows,
             vec![
                 MvccReadRow {
                     source_key: Some("acct:loop".to_string()),
