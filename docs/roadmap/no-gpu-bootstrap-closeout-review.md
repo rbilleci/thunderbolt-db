@@ -42,6 +42,7 @@ The no-GPU bootstrap phase is closed. The current engine-facing MVCC contract is
   - `MvccReadRow { source_key, key, value }`
   - `status_snapshot()` fallback / replication truth surfaces
 - That backend boundary is now explicit in code: `Engine::execute_mvcc_query()` routes through `CpuMvccExecutionBackend` today, and a backend-swap regression proves the result contract stays stable when the execution path changes.
+- A follow-on first-slice parity regression now proves the intended initial CUDA envelope can execute through an alternate backend for `FullScan` / `KeyLookup` + simple-filter shapes while unsupported composition still falls back through the CPU reference backend with the same tracked `GpuMvccReadParityGap` reason.
 - Unsupported CUDA shapes can continue to route through the explicit CPU fallback path without weakening the GPU-first contract.
 
 ### 5. Validation gate

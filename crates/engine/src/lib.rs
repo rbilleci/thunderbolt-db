@@ -820,8 +820,17 @@ pub struct MvccReadResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MvccBackendExecution {
     executed_target: DeviceTarget,
-    fallback_reason: Option<FallbackReason>,
     rows: Vec<MvccReadRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+enum MvccBackendDispatch {
+    Executed(MvccBackendExecution),
+    Fallback {
+        reason: FallbackReason,
+        rows: Vec<ResolvedMvccRow>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -835,14 +844,14 @@ struct ResolvedMvccRow {
 }
 
 trait MvccExecutionBackend {
-    fn execute(&self, query: &MvccReadQuery, rows: Vec<ResolvedMvccRow>) -> MvccBackendExecution;
+    fn execute(&self, query: &MvccReadQuery, rows: Vec<ResolvedMvccRow>) -> MvccBackendDispatch;
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 struct CpuMvccExecutionBackend;
 
 impl MvccExecutionBackend for CpuMvccExecutionBackend {
-    fn execute(&self, query: &MvccReadQuery, rows: Vec<ResolvedMvccRow>) -> MvccBackendExecution {
+    fn execute(&self, query: &MvccReadQuery, rows: Vec<ResolvedMvccRow>) -> MvccBackendDispatch {
         let projection = &query.projection;
         let projected = match (query.filter.clone(), query.order.clone(), query.limit) {
             (Some(filter), Some(order), Some(limit)) => {
@@ -920,12 +929,70 @@ impl MvccExecutionBackend for CpuMvccExecutionBackend {
             }
         };
 
-        MvccBackendExecution {
+        MvccBackendDispatch::Executed(MvccBackendExecution {
             executed_target: DeviceTarget::Cpu,
-            fallback_reason: Some(FallbackReason::GpuMvccReadParityGap),
             rows: projected,
-        }
+        })
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FinalizedMvccBackendExecution {
+    executed_target: DeviceTarget,
+    fallback_reason: Option<FallbackReason>,
+    rows: Vec<MvccReadRow>,
+}
+
+fn execute_mvcc_backend_chain<B: MvccExecutionBackend, F: MvccExecutionBackend>(
+    query: &MvccReadQuery,
+    rows: Vec<ResolvedMvccRow>,
+    backend: &B,
+    cpu_fallback: &F,
+) -> FinalizedMvccBackendExecution {
+    match backend.execute(query, rows) {
+        MvccBackendDispatch::Executed(executed) => FinalizedMvccBackendExecution {
+            executed_target: executed.executed_target,
+            fallback_reason: None,
+            rows: executed.rows,
+        },
+        MvccBackendDispatch::Fallback { reason, rows } => match cpu_fallback.execute(query, rows) {
+            MvccBackendDispatch::Executed(executed) => FinalizedMvccBackendExecution {
+                executed_target: executed.executed_target,
+                fallback_reason: Some(reason),
+                rows: executed.rows,
+            },
+            MvccBackendDispatch::Fallback { .. } => {
+                unreachable!("CPU fallback backend must execute")
+            }
+        },
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn is_first_cuda_slice_filter(filter: &MvccReadFilter) -> bool {
+    match filter {
+        MvccReadFilter::KeyPrefix(_)
+        | MvccReadFilter::KeyRange { .. }
+        | MvccReadFilter::ValueEquals(_) => true,
+        MvccReadFilter::All(filters) | MvccReadFilter::Any(filters) => {
+            !filters.is_empty() && filters.iter().all(is_first_cuda_slice_filter)
+        }
+        _ => false,
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn is_first_cuda_slice_query(query: &MvccReadQuery) -> bool {
+    matches!(
+        query.source,
+        MvccReadSource::FullScan | MvccReadSource::KeyLookup { .. }
+    ) && query.order.is_none()
+        && query.limit.is_none()
+        && matches!(
+            query.projection,
+            MvccProjection::KeyValue | MvccProjection::KeyOnly | MvccProjection::ValueOnly
+        )
+        && query.filter.as_ref().is_none_or(is_first_cuda_slice_filter)
 }
 
 type ResolvedTupleIdentity = (u64, String, String, u64, Option<u64>);
@@ -4487,13 +4554,36 @@ impl Engine {
         query: &MvccReadQuery,
     ) -> Result<MvccReadResult, ExecuteError> {
         let backend = CpuMvccExecutionBackend;
-        self.execute_mvcc_query_with_backend(query, &backend)
+        self.execute_mvcc_query_with_fallback_reason(
+            query,
+            &backend,
+            Some(FallbackReason::GpuMvccReadParityGap),
+        )
     }
 
+    #[cfg(test)]
     fn execute_mvcc_query_with_backend<B: MvccExecutionBackend>(
         &mut self,
         query: &MvccReadQuery,
         backend: &B,
+    ) -> Result<MvccReadResult, ExecuteError> {
+        self.execute_mvcc_query_with_fallback_reason(query, backend, None)
+    }
+
+    #[cfg(test)]
+    fn execute_mvcc_query_with_backend_fallback<B: MvccExecutionBackend>(
+        &mut self,
+        query: &MvccReadQuery,
+        backend: &B,
+    ) -> Result<MvccReadResult, ExecuteError> {
+        self.execute_mvcc_query_with_fallback_reason(query, backend, None)
+    }
+
+    fn execute_mvcc_query_with_fallback_reason<B: MvccExecutionBackend>(
+        &mut self,
+        query: &MvccReadQuery,
+        backend: &B,
+        fallback_reason: Option<FallbackReason>,
     ) -> Result<MvccReadResult, ExecuteError> {
         if self.repl.role() != Role::Leader {
             return Err(ExecuteError::Engine(EngineError::NotLeader));
@@ -4502,11 +4592,12 @@ impl Engine {
         let planned_target = DeviceTarget::Gpu(self.planner.default_gpu_id());
         let rows = resolve_mvcc_source(&self.mvcc_store, &query.source, query.visibility)?;
 
-        let backend_result = backend.execute(query, rows);
+        let backend_result =
+            execute_mvcc_backend_chain(query, rows, backend, &CpuMvccExecutionBackend);
         let result = MvccReadResult {
             planned_target,
             executed_target: backend_result.executed_target,
-            fallback_reason: backend_result.fallback_reason,
+            fallback_reason: backend_result.fallback_reason.or(fallback_reason),
             rows: backend_result.rows,
         };
         self.observe_mvcc_read_result_metrics(&result);
@@ -6768,7 +6859,6 @@ mod tests {
     #[derive(Debug, Clone)]
     struct RecordingMvccBackend {
         executed_target: DeviceTarget,
-        fallback_reason: Option<FallbackReason>,
         rows: Vec<MvccReadRow>,
     }
 
@@ -6777,11 +6867,38 @@ mod tests {
             &self,
             _query: &MvccReadQuery,
             _rows: Vec<ResolvedMvccRow>,
-        ) -> MvccBackendExecution {
-            MvccBackendExecution {
+        ) -> MvccBackendDispatch {
+            MvccBackendDispatch::Executed(MvccBackendExecution {
                 executed_target: self.executed_target,
-                fallback_reason: self.fallback_reason,
                 rows: self.rows.clone(),
+            })
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, Default)]
+    struct FirstCudaSliceParityBackend;
+
+    impl MvccExecutionBackend for FirstCudaSliceParityBackend {
+        fn execute(
+            &self,
+            query: &MvccReadQuery,
+            rows: Vec<ResolvedMvccRow>,
+        ) -> MvccBackendDispatch {
+            if !is_first_cuda_slice_query(query) {
+                return MvccBackendDispatch::Fallback {
+                    reason: FallbackReason::GpuMvccReadParityGap,
+                    rows,
+                };
+            }
+
+            match CpuMvccExecutionBackend.execute(query, rows) {
+                MvccBackendDispatch::Executed(mut executed) => {
+                    executed.executed_target = DeviceTarget::Gpu(0);
+                    MvccBackendDispatch::Executed(executed)
+                }
+                MvccBackendDispatch::Fallback { .. } => {
+                    unreachable!("CPU reference backend must execute")
+                }
             }
         }
     }
@@ -6793,7 +6910,6 @@ mod tests {
 
         let backend = RecordingMvccBackend {
             executed_target: DeviceTarget::Gpu(0),
-            fallback_reason: None,
             rows: vec![MvccReadRow {
                 source_key: Some("seed:acct".to_string()),
                 key: Some("acct:1".to_string()),
@@ -6822,6 +6938,88 @@ mod tests {
         assert_eq!(result.fallback_reason, None);
         assert_eq!(result.rows, backend.rows);
         assert_eq!(e.metrics().fallback_total, 0);
+    }
+
+    #[test]
+    fn execute_mvcc_query_first_cuda_slice_backend_runs_supported_lookup_without_fallback() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=open").unwrap();
+
+        let result = e
+            .execute_mvcc_query_with_backend_fallback(
+                &MvccReadQuery {
+                    source: MvccReadSource::KeyLookup {
+                        key: "acct:1".to_string(),
+                    },
+                    visibility: StorageVisibility { read_txn_id: 1 },
+                    filter: Some(MvccReadFilter::ValueEquals("open".to_string())),
+                    order: None,
+                    projection: MvccProjection::ValueOnly,
+                    limit: None,
+                },
+                &FirstCudaSliceParityBackend,
+            )
+            .unwrap();
+
+        assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.fallback_reason, None);
+        assert_eq!(
+            result.rows,
+            vec![MvccReadRow {
+                source_key: None,
+                key: None,
+                value: Some("open".to_string()),
+            }]
+        );
+        assert_eq!(e.metrics().fallback_total, 0);
+    }
+
+    #[test]
+    fn execute_mvcc_query_first_cuda_slice_backend_falls_back_for_unsupported_composition() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=open").unwrap();
+        e.execute_text(2, "SET acct:2=hold").unwrap();
+
+        let result = e
+            .execute_mvcc_query_with_backend_fallback(
+                &MvccReadQuery {
+                    source: MvccReadSource::Concat {
+                        sources: vec![
+                            MvccReadSource::KeyLookup {
+                                key: "acct:1".to_string(),
+                            },
+                            MvccReadSource::KeyLookup {
+                                key: "acct:2".to_string(),
+                            },
+                        ],
+                    },
+                    visibility: StorageVisibility { read_txn_id: 2 },
+                    filter: None,
+                    order: None,
+                    projection: MvccProjection::KeyOnly,
+                    limit: None,
+                },
+                &FirstCudaSliceParityBackend,
+            )
+            .unwrap();
+
+        assert_mvcc_query_uses_tracked_cpu_fallback(&e, &result, 1);
+        assert_eq!(
+            result.rows,
+            vec![
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("acct:1".to_string()),
+                    value: None,
+                },
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("acct:2".to_string()),
+                    value: None,
+                },
+            ]
+        );
     }
 
     #[test]

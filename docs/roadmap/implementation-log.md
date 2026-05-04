@@ -3,6 +3,9 @@
 ## 2026-05-04
 
 ### Completed
+- Tightened CUDA-transition prep again by adding a regression-bounded first-slice backend handoff: supported `FullScan` / `KeyLookup` + simple-filter MVCC shapes can now execute through an alternate backend, while unsupported shapes demonstrably fall back through the CPU reference pipeline under the same tracked `GpuMvccReadParityGap` accounting.
+- Added engine regressions covering both sides of that handoff: a supported lookup executes with `executed_target = gpu(0)` and no fallback, while unsupported source composition falls back to `executed_target = cpu` without changing the `MvccReadQuery` / `MvccReadResult` / `MvccReadRow { source_key, key, value }` contract.
+- Reconciled README/execution/closeout docs so the first CUDA slice is now bounded explicitly as full scan / key lookup plus simple filter trees, with broader ordering/limit/composition/provenance semantics intentionally left on tracked CPU fallback until parity work starts.
 - Tightened CUDA-transition prep by routing `Engine::execute_mvcc_query()` through an explicit internal MVCC execution-backend hook (`CpuMvccExecutionBackend` today), so future backend swaps do not require an engine-facing contract rewrite.
 - Added a backend-swap regression proving `MvccReadQuery` / `MvccReadResult` / `MvccReadRow { source_key, key, value }` stay stable when a different execution backend is injected, while fallback metrics remain tied to the backend's reported execution outcome.
 - Switched the autonomous loop into explicit no-GPU closeout-consolidation mode instead of widening the MVCC surface again without a named semantic gap.
