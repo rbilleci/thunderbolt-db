@@ -968,31 +968,78 @@ fn execute_mvcc_backend_chain<B: MvccExecutionBackend, F: MvccExecutionBackend>(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(test), allow(dead_code))]
-fn is_first_cuda_slice_filter(filter: &MvccReadFilter) -> bool {
-    match filter {
-        MvccReadFilter::KeyPrefix(_)
-        | MvccReadFilter::KeyRange { .. }
-        | MvccReadFilter::ValueEquals(_) => true,
-        MvccReadFilter::All(filters) | MvccReadFilter::Any(filters) => {
-            !filters.is_empty() && filters.iter().all(is_first_cuda_slice_filter)
+enum FirstCudaSliceGap {
+    UnsupportedSource,
+    UnsupportedOrder,
+    UnsupportedProjection,
+    UnsupportedLimit,
+    UnsupportedFilter,
+    EmptyLogicalFilterTree,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl FirstCudaSliceGap {
+    fn label(self) -> &'static str {
+        match self {
+            Self::UnsupportedSource => "unsupported_source",
+            Self::UnsupportedOrder => "unsupported_order",
+            Self::UnsupportedProjection => "unsupported_projection",
+            Self::UnsupportedLimit => "unsupported_limit",
+            Self::UnsupportedFilter => "unsupported_filter",
+            Self::EmptyLogicalFilterTree => "empty_logical_filter_tree",
         }
-        _ => false,
     }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-fn is_first_cuda_slice_query(query: &MvccReadQuery) -> bool {
-    matches!(
+fn first_cuda_slice_filter_gap(filter: &MvccReadFilter) -> Option<FirstCudaSliceGap> {
+    match filter {
+        MvccReadFilter::KeyPrefix(_)
+        | MvccReadFilter::KeyRange { .. }
+        | MvccReadFilter::ValueEquals(_) => None,
+        MvccReadFilter::All(filters) | MvccReadFilter::Any(filters) => {
+            if filters.is_empty() {
+                Some(FirstCudaSliceGap::EmptyLogicalFilterTree)
+            } else {
+                filters.iter().find_map(first_cuda_slice_filter_gap)
+            }
+        }
+        _ => Some(FirstCudaSliceGap::UnsupportedFilter),
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn first_cuda_slice_query_gap(query: &MvccReadQuery) -> Option<FirstCudaSliceGap> {
+    if !matches!(
         query.source,
         MvccReadSource::FullScan | MvccReadSource::KeyLookup { .. }
-    ) && query.order.is_none()
-        && query.limit.is_none()
-        && matches!(
-            query.projection,
-            MvccProjection::KeyValue | MvccProjection::KeyOnly | MvccProjection::ValueOnly
-        )
-        && query.filter.as_ref().is_none_or(is_first_cuda_slice_filter)
+    ) {
+        return Some(FirstCudaSliceGap::UnsupportedSource);
+    }
+
+    if query.order.is_some() {
+        return Some(FirstCudaSliceGap::UnsupportedOrder);
+    }
+
+    if !matches!(
+        query.projection,
+        MvccProjection::KeyValue | MvccProjection::KeyOnly | MvccProjection::ValueOnly
+    ) {
+        return Some(FirstCudaSliceGap::UnsupportedProjection);
+    }
+
+    if query.limit.is_some() {
+        return Some(FirstCudaSliceGap::UnsupportedLimit);
+    }
+
+    query.filter.as_ref().and_then(first_cuda_slice_filter_gap)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn is_first_cuda_slice_query(query: &MvccReadQuery) -> bool {
+    first_cuda_slice_query_gap(query).is_none()
 }
 
 type ResolvedTupleIdentity = (u64, String, String, u64, Option<u64>);
@@ -6878,13 +6925,120 @@ mod tests {
     #[derive(Debug, Clone, Copy, Default)]
     struct FirstCudaSliceParityBackend;
 
+    fn first_cuda_slice_support_query() -> MvccReadQuery {
+        MvccReadQuery {
+            source: MvccReadSource::KeyLookup {
+                key: "acct:1".to_string(),
+            },
+            visibility: StorageVisibility { read_txn_id: 1 },
+            filter: Some(MvccReadFilter::All(vec![
+                MvccReadFilter::KeyPrefix("acct:".to_string()),
+                MvccReadFilter::ValueEquals("open".to_string()),
+            ])),
+            order: None,
+            projection: MvccProjection::KeyValue,
+            limit: None,
+        }
+    }
+
+    #[test]
+    fn first_cuda_slice_query_gap_accepts_supported_shape() {
+        let query = first_cuda_slice_support_query();
+
+        assert_eq!(first_cuda_slice_query_gap(&query), None);
+        assert!(is_first_cuda_slice_query(&query));
+    }
+
+    #[test]
+    fn first_cuda_slice_query_gap_reports_first_unsupported_boundary() {
+        let mut query = first_cuda_slice_support_query();
+        query.source = MvccReadSource::Concat {
+            sources: vec![MvccReadSource::KeyLookup {
+                key: "acct:1".to_string(),
+            }],
+        };
+        assert_eq!(
+            first_cuda_slice_query_gap(&query),
+            Some(FirstCudaSliceGap::UnsupportedSource)
+        );
+
+        query = first_cuda_slice_support_query();
+        query.order = Some(MvccReadOrder::KeyAsc);
+        assert_eq!(
+            first_cuda_slice_query_gap(&query),
+            Some(FirstCudaSliceGap::UnsupportedOrder)
+        );
+
+        query = first_cuda_slice_support_query();
+        query.projection = MvccProjection::SourceValueOnly;
+        assert_eq!(
+            first_cuda_slice_query_gap(&query),
+            Some(FirstCudaSliceGap::UnsupportedProjection)
+        );
+
+        query = first_cuda_slice_support_query();
+        query.limit = Some(1);
+        assert_eq!(
+            first_cuda_slice_query_gap(&query),
+            Some(FirstCudaSliceGap::UnsupportedLimit)
+        );
+    }
+
+    #[test]
+    fn first_cuda_slice_query_gap_reports_filter_shape_gaps() {
+        let mut query = first_cuda_slice_support_query();
+        query.filter = Some(MvccReadFilter::All(vec![]));
+        assert_eq!(
+            first_cuda_slice_query_gap(&query),
+            Some(FirstCudaSliceGap::EmptyLogicalFilterTree)
+        );
+
+        query = first_cuda_slice_support_query();
+        query.filter = Some(MvccReadFilter::Any(vec![MvccReadFilter::All(vec![
+            MvccReadFilter::KeyPrefix("acct:".to_string()),
+            MvccReadFilter::SourceKeyPrefix("seed:".to_string()),
+        ])]));
+        assert_eq!(
+            first_cuda_slice_query_gap(&query),
+            Some(FirstCudaSliceGap::UnsupportedFilter)
+        );
+    }
+
+    #[test]
+    fn first_cuda_slice_gap_labels_are_stable_for_docs_and_future_routing() {
+        assert_eq!(
+            FirstCudaSliceGap::UnsupportedSource.label(),
+            "unsupported_source"
+        );
+        assert_eq!(
+            FirstCudaSliceGap::UnsupportedOrder.label(),
+            "unsupported_order"
+        );
+        assert_eq!(
+            FirstCudaSliceGap::UnsupportedProjection.label(),
+            "unsupported_projection"
+        );
+        assert_eq!(
+            FirstCudaSliceGap::UnsupportedLimit.label(),
+            "unsupported_limit"
+        );
+        assert_eq!(
+            FirstCudaSliceGap::UnsupportedFilter.label(),
+            "unsupported_filter"
+        );
+        assert_eq!(
+            FirstCudaSliceGap::EmptyLogicalFilterTree.label(),
+            "empty_logical_filter_tree"
+        );
+    }
+
     impl MvccExecutionBackend for FirstCudaSliceParityBackend {
         fn execute(
             &self,
             query: &MvccReadQuery,
             rows: Vec<ResolvedMvccRow>,
         ) -> MvccBackendDispatch {
-            if !is_first_cuda_slice_query(query) {
+            if let Some(_gap) = first_cuda_slice_query_gap(query) {
                 return MvccBackendDispatch::Fallback {
                     reason: FallbackReason::GpuMvccReadParityGap,
                     rows,

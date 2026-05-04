@@ -3,6 +3,7 @@
 ## 2026-05-04
 
 ### Completed
+- Tightened CUDA-transition prep with an explicit first-slice query-gap classifier: the no-GPU truth surface now distinguishes `unsupported_source`, `unsupported_order`, `unsupported_projection`, `unsupported_limit`, `unsupported_filter`, and `empty_logical_filter_tree`, and engine regressions pin those labels so future `CudaBackend` routing can explain the first missed contract edge deterministically.
 - Added engine-facing backend-swap parity regressions for the supported first-CUDA deterministic fixtures: the point-lookup replay fixture and the new full-scan/simple-filter replay fixture now both assert that `FirstCudaSliceParityBackend` returns the same rows as the CPU reference path while avoiding fallback.
 - Reconciled closeout/roadmap docs so the no-GPU bootstrap explicitly records that supported deterministic fixtures already double as backend-swap parity checks for the first CUDA slice.
 - Tightened CUDA-transition prep with an explicit deterministic full-scan/simple-filter replay fixture (`tests/fixtures/mvcc-full-scan-workload.txt`) plus engine regressions that prove both historical and current snapshots stay parity-auditable through `FullScan` under the tracked `GpuMvccReadParityGap` fallback contract.

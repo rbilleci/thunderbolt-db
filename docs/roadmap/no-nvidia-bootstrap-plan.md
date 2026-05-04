@@ -355,6 +355,7 @@ Before starting real GPU execution, perform and record a closeout review that an
    - no pending design concern implies a major planner/executor/result-contract rewrite before `CudaBackend` can be attached.
    - `Engine::execute_mvcc_query()` now already routes through an internal execution-backend hook (`CpuMvccExecutionBackend` today), so backend swaps can be proven without changing `MvccReadQuery`, `MvccReadResult`, or `MvccReadRow { source_key, key, value }`.
    - the initial CUDA envelope is already regression-bounded: supported `FullScan` / `KeyLookup` + simple-filter shapes can be exercised through an alternate backend while unsupported shapes demonstrably fall back through the CPU reference path under the same tracked `GpuMvccReadParityGap` reason.
+   - that first-slice boundary is also classified explicitly now (`unsupported_source`, `unsupported_order`, `unsupported_projection`, `unsupported_limit`, `unsupported_filter`, `empty_logical_filter_tree`), so future CUDA routing can explain the first missed contract edge without another query/result rewrite.
 5. **Validation gate green**
    - `cargo fmt --all`
    - `cargo clippy --all-targets --all-features -- -D warnings`
@@ -366,7 +367,7 @@ Closeout review recorded on 2026-05-04:
 - satisfied: execution contract stability
 - satisfied: parity/fallback truth surface stability
 - satisfied: deterministic replay coverage
-- satisfied: no-rewrite check
+- satisfied: no-rewrite check (including explicit first-slice gap labels for future CUDA routing)
 - satisfied: validation gate green (`cargo fmt --all`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all --all-features`)
 
 ## First CUDA transition slice (once NVIDIA hardware is available)

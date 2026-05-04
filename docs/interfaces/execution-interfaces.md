@@ -20,6 +20,7 @@ Each physical plan node must include:
 - Engine-facing entry point: `Engine::execute_mvcc_query(&MvccReadQuery)`
 - Backend attachment boundary: the engine now delegates resolved MVCC rows through an internal execution-backend hook (`CpuMvccExecutionBackend` today), so `CudaBackend` can replace only the execution path while preserving the engine-facing query/result contract.
 - CUDA-transition proof boundary: engine regressions now also cover an alternate first-slice backend that may execute supported full-scan / key-lookup + simple-filter shapes directly while returning unsupported shapes to the CPU reference backend under the same explicit `GpuMvccReadParityGap` fallback contract.
+- First-slice shape classifier: the engine now keeps an explicit query-gap classifier for the initial CUDA envelope, so routing can explain the first unsupported boundary deterministically as one of `unsupported_source`, `unsupported_order`, `unsupported_projection`, `unsupported_limit`, `unsupported_filter`, or `empty_logical_filter_tree` before widening GPU coverage.
 - Supported sources:
   - `FullScan`
   - `KeyLookup { key }`
@@ -201,3 +202,4 @@ Each physical plan node must include:
 - No further Q2 surface expansion is required for the no-GPU bootstrap by default. The next step is closeout consolidation / CUDA-transition preparation: keep the deterministic point-lookup, full-scan/simple-filter, and source-composition fixtures authoritative, keep the planned-vs-executed device contract and `GpuMvccReadParityGap` fallback truth explicit, and prove `CudaBackend` can attach without an engine-facing contract rewrite.
 - The first CUDA slice is now bounded explicitly in code/tests as: `FullScan` or `KeyLookup`, no ordering, no limit, `KeyValue`/`KeyOnly`/`ValueOnly` projection, and only simple filter trees composed from `KeyPrefix`, `KeyRange`, and `ValueEquals`. Broader composition, ordering, limits, and provenance-aware semantics remain on the explicit CPU fallback path until GPU parity lands.
 - That same first-CUDA boundary is now parity-audited through engine-facing backend-swap regressions for the deterministic lookup and full-scan fixtures, so supported alternate backends can be compared against the CPU reference path without changing the row/result/query contract.
+- The current boundary is also explainable instead of implicit: unsupported first-slice queries now classify the exact first miss (source/order/projection/limit/filter/empty logical tree) before they take the tracked CPU fallback path.
