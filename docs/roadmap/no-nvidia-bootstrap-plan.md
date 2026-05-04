@@ -306,6 +306,11 @@ Notes:
 - Keep the first version simple and trustworthy.
 - Prefer explicit bucket definitions over a fake single percentage.
 
+Queue reconciliation note (2026-05-04):
+- Q1 through Q5 are now complete.
+- There is no remaining queued no-GPU implementation item to widen autonomously.
+- Until an NVIDIA-capable environment exists or a concrete contradiction reopens a named semantic gap, autonomous loops should treat the queue as drained and stop after validation/doc reconciliation rather than inventing new bootstrap surface area.
+
 ## Exit criteria for no-GPU bootstrap phase
 
 - Commit path is replication-shaped and invariant-tested.
@@ -338,6 +343,7 @@ The no-GPU loop is no longer allowed to grow the execution surface just because 
 Operational stop rule for the remaining no-GPU loop:
 - If a proposed loop does not materially improve one of these three areas, do not do it.
 - If no remaining semantic category can be named and the contract boundary already looks stable, run the full validation gate and perform a bootstrap closeout review instead of expanding Q2 further.
+- Once Q1-Q5 are all marked complete, treat the autonomous no-GPU queue as closed unless hardware onboarding begins or a real contradiction reopens a named gap.
 
 ## Bootstrap closeout review (required before CUDA work starts)
 
