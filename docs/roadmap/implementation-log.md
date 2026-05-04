@@ -3,6 +3,9 @@
 ## 2026-05-04
 
 ### Completed
+- Tightened CUDA-transition prep with an explicit deterministic full-scan/simple-filter replay fixture (`tests/fixtures/mvcc-full-scan-workload.txt`) plus engine regressions that prove both historical and current snapshots stay parity-auditable through `FullScan` under the tracked `GpuMvccReadParityGap` fallback contract.
+- Added a companion first-slice backend regression proving the alternate CUDA-boundary backend can execute a supported `FullScan` + nested simple-filter tree without fallback, complementing the existing supported key-lookup proof.
+- Reconciled README/execution/closeout/roadmap docs so the first CUDA slice now names three authoritative deterministic fixtures: point lookup/history replay, full scan/simple filters, and source composition.
 - Tightened CUDA-transition prep again by adding a regression-bounded first-slice backend handoff: supported `FullScan` / `KeyLookup` + simple-filter MVCC shapes can now execute through an alternate backend, while unsupported shapes demonstrably fall back through the CPU reference pipeline under the same tracked `GpuMvccReadParityGap` accounting.
 - Added engine regressions covering both sides of that handoff: a supported lookup executes with `executed_target = gpu(0)` and no fallback, while unsupported source composition falls back to `executed_target = cpu` without changing the `MvccReadQuery` / `MvccReadResult` / `MvccReadRow { source_key, key, value }` contract.
 - Reconciled README/execution/closeout docs so the first CUDA slice is now bounded explicitly as full scan / key lookup plus simple filter trees, with broader ordering/limit/composition/provenance semantics intentionally left on tracked CPU fallback until parity work starts.

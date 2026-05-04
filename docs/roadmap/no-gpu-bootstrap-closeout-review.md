@@ -24,14 +24,16 @@ The no-GPU bootstrap phase is closed. The current engine-facing MVCC contract is
   - planned target = `gpu(default_gpu_id)`
   - executed target = `cpu`
   - fallback reason = `GpuMvccReadParityGap` (`GPU-123`)
-- Deterministic fixture regressions now assert that device/fallback contract directly for both workload fixtures:
+- Deterministic fixture regressions now assert that device/fallback contract directly for all current workload fixtures:
   - `execute_mvcc_query_replays_deterministic_workload_fixture_for_point_lookup`
+  - `execute_mvcc_query_replays_deterministic_full_scan_workload_fixture`
   - `execute_mvcc_query_replays_deterministic_source_composition_workload_fixture`
 - The source-composition fixture also proves `status_snapshot()` rolls those parity fallbacks up consistently.
 
 ### 3. Deterministic replay coverage
 - Existing fixtures are sufficient for the first CUDA slice:
   - `tests/fixtures/mvcc-read-workload.txt` covers point lookup + history replay.
+  - `tests/fixtures/mvcc-full-scan-workload.txt` covers full scan + simple-filter replay across historical and current snapshots.
   - `tests/fixtures/mvcc-source-composition-workload.txt` covers source composition and join-adjacent behavior.
 - Together they provide stable CPU truth for scan/visibility/filter/point-lookup parity checks while keeping fallback accounting observable.
 
@@ -60,4 +62,4 @@ Result: all green on 2026-05-04.
    - snapshot visibility filtering
    - simple filter predicates
    - point lookup / key lookup
-4. Run CPU-vs-GPU parity against the existing deterministic fixtures before widening coverage.
+4. Run CPU-vs-GPU parity against the deterministic point-lookup, full-scan/simple-filter, and source-composition fixtures before widening coverage.

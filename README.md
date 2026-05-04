@@ -166,9 +166,10 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
   - fallback reason: `FallbackReason::GpuMvccReadParityGap` (`GPU-123`)
 - Deterministic workload fixtures:
   - `tests/fixtures/mvcc-read-workload.txt`
+  - `tests/fixtures/mvcc-full-scan-workload.txt`
   - `tests/fixtures/mvcc-source-composition-workload.txt`
 - Next obvious extension boundary:
-  - no further MVCC surface growth is required for the no-GPU bootstrap by default; the next step is bootstrap closeout / CUDA-transition prep using the existing deterministic fixtures, explicit fallback truth, and documented engine-facing contract.
+  - no further MVCC surface growth is required for the no-GPU bootstrap by default; the next step is bootstrap closeout / CUDA-transition prep using the deterministic point-lookup, full-scan/simple-filter, and source-composition fixtures, explicit fallback truth, and documented engine-facing contract.
 
 ## Quickstart
 

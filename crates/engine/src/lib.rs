@@ -6976,6 +6976,57 @@ mod tests {
     }
 
     #[test]
+    fn execute_mvcc_query_first_cuda_slice_backend_runs_supported_full_scan_without_fallback() {
+        let mut e = Engine::new_local();
+        for (txn_id, command) in include_str!("../../../tests/fixtures/mvcc-full-scan-workload.txt")
+            .lines()
+            .enumerate()
+        {
+            e.execute_text((txn_id + 1) as u64, command).unwrap();
+        }
+
+        let result = e
+            .execute_mvcc_query_with_backend_fallback(
+                &MvccReadQuery {
+                    source: MvccReadSource::FullScan,
+                    visibility: StorageVisibility { read_txn_id: 6 },
+                    filter: Some(MvccReadFilter::All(vec![
+                        MvccReadFilter::KeyPrefix("acct:".to_string()),
+                        MvccReadFilter::Any(vec![
+                            MvccReadFilter::ValueEquals("closed".to_string()),
+                            MvccReadFilter::ValueEquals("archived".to_string()),
+                        ]),
+                    ])),
+                    order: None,
+                    projection: MvccProjection::KeyValue,
+                    limit: None,
+                },
+                &FirstCudaSliceParityBackend,
+            )
+            .unwrap();
+
+        assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.fallback_reason, None);
+        assert_eq!(
+            result.rows,
+            vec![
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("acct:1".to_string()),
+                    value: Some("closed".to_string()),
+                },
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("acct:3".to_string()),
+                    value: Some("archived".to_string()),
+                },
+            ]
+        );
+        assert_eq!(e.metrics().fallback_total, 0);
+    }
+
+    #[test]
     fn execute_mvcc_query_first_cuda_slice_backend_falls_back_for_unsupported_composition() {
         let mut e = Engine::new_local();
         e.execute_text(1, "SET acct:1=open").unwrap();
@@ -7078,6 +7129,92 @@ mod tests {
                 key: Some("user:1".to_string()),
                 value: None,
             }]
+        );
+    }
+
+    #[test]
+    fn execute_mvcc_query_replays_deterministic_full_scan_workload_fixture() {
+        let mut e = Engine::new_local();
+        for (txn_id, command) in include_str!("../../../tests/fixtures/mvcc-full-scan-workload.txt")
+            .lines()
+            .enumerate()
+        {
+            e.execute_text((txn_id + 1) as u64, command).unwrap();
+        }
+
+        let historical = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FullScan,
+                visibility: StorageVisibility { read_txn_id: 2 },
+                filter: Some(MvccReadFilter::All(vec![
+                    MvccReadFilter::KeyPrefix("acct:".to_string()),
+                    MvccReadFilter::Any(vec![
+                        MvccReadFilter::ValueEquals("open".to_string()),
+                        MvccReadFilter::ValueEquals("hold".to_string()),
+                    ]),
+                ])),
+                order: None,
+                projection: MvccProjection::KeyValue,
+                limit: None,
+            })
+            .unwrap();
+
+        assert_mvcc_query_uses_tracked_cpu_fallback(&e, &historical, 1);
+        assert_eq!(
+            historical.rows,
+            vec![
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("acct:1".to_string()),
+                    value: Some("open".to_string()),
+                },
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("acct:2".to_string()),
+                    value: Some("hold".to_string()),
+                },
+            ]
+        );
+
+        let current = e
+            .execute_mvcc_query(&MvccReadQuery {
+                source: MvccReadSource::FullScan,
+                visibility: StorageVisibility { read_txn_id: 6 },
+                filter: Some(MvccReadFilter::All(vec![
+                    MvccReadFilter::KeyPrefix("acct:".to_string()),
+                    MvccReadFilter::Any(vec![
+                        MvccReadFilter::ValueEquals("closed".to_string()),
+                        MvccReadFilter::ValueEquals("archived".to_string()),
+                    ]),
+                ])),
+                order: None,
+                projection: MvccProjection::KeyValue,
+                limit: None,
+            })
+            .unwrap();
+
+        assert_mvcc_query_uses_tracked_cpu_fallback(&e, &current, 2);
+        assert_eq!(
+            current.rows,
+            vec![
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("acct:1".to_string()),
+                    value: Some("closed".to_string()),
+                },
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("acct:3".to_string()),
+                    value: Some("archived".to_string()),
+                },
+            ]
+        );
+
+        let status = e.status_snapshot();
+        assert_eq!(status.fallback.gpu_parity_fallback_total(), 2);
+        assert_eq!(
+            status.latest_fallback_reason(),
+            Some(FallbackReason::GpuMvccReadParityGap)
         );
     }
 

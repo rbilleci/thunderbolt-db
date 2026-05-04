@@ -1,0 +1,6 @@
+SET acct:1=open
+SET acct:2=hold
+SET acct:3=archived
+SET acct:1=closed
+DELETE acct:2
+SET user:1=active
