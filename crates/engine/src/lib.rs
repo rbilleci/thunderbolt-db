@@ -7027,6 +7027,80 @@ mod tests {
     }
 
     #[test]
+    fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_supported_lookup_fixture() {
+        let mut e = Engine::new_local();
+        for (txn_id, command) in include_str!("../../../tests/fixtures/mvcc-read-workload.txt")
+            .lines()
+            .enumerate()
+        {
+            e.execute_text((txn_id + 1) as u64, command).unwrap();
+        }
+
+        let query = MvccReadQuery {
+            source: MvccReadSource::KeyLookup {
+                key: "acct:1".to_string(),
+            },
+            visibility: StorageVisibility { read_txn_id: 3 },
+            filter: Some(MvccReadFilter::ValueEquals("closed".to_string())),
+            order: None,
+            projection: MvccProjection::KeyValue,
+            limit: None,
+        };
+
+        let cpu = e.execute_mvcc_query(&query).unwrap();
+        assert_mvcc_query_uses_tracked_cpu_fallback(&e, &cpu, 1);
+
+        let backend = e
+            .execute_mvcc_query_with_backend_fallback(&query, &FirstCudaSliceParityBackend)
+            .unwrap();
+
+        assert_eq!(backend.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(backend.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(backend.fallback_reason, None);
+        assert_eq!(backend.rows, cpu.rows);
+        assert_eq!(e.metrics().fallback_total, 1);
+    }
+
+    #[test]
+    fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_supported_full_scan_fixture() {
+        let mut e = Engine::new_local();
+        for (txn_id, command) in include_str!("../../../tests/fixtures/mvcc-full-scan-workload.txt")
+            .lines()
+            .enumerate()
+        {
+            e.execute_text((txn_id + 1) as u64, command).unwrap();
+        }
+
+        let query = MvccReadQuery {
+            source: MvccReadSource::FullScan,
+            visibility: StorageVisibility { read_txn_id: 6 },
+            filter: Some(MvccReadFilter::All(vec![
+                MvccReadFilter::KeyPrefix("acct:".to_string()),
+                MvccReadFilter::Any(vec![
+                    MvccReadFilter::ValueEquals("closed".to_string()),
+                    MvccReadFilter::ValueEquals("archived".to_string()),
+                ]),
+            ])),
+            order: None,
+            projection: MvccProjection::KeyValue,
+            limit: None,
+        };
+
+        let cpu = e.execute_mvcc_query(&query).unwrap();
+        assert_mvcc_query_uses_tracked_cpu_fallback(&e, &cpu, 1);
+
+        let backend = e
+            .execute_mvcc_query_with_backend_fallback(&query, &FirstCudaSliceParityBackend)
+            .unwrap();
+
+        assert_eq!(backend.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(backend.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(backend.fallback_reason, None);
+        assert_eq!(backend.rows, cpu.rows);
+        assert_eq!(e.metrics().fallback_total, 1);
+    }
+
+    #[test]
     fn execute_mvcc_query_first_cuda_slice_backend_falls_back_for_unsupported_composition() {
         let mut e = Engine::new_local();
         e.execute_text(1, "SET acct:1=open").unwrap();

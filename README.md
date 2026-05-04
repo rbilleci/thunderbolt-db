@@ -170,6 +170,7 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
   - `tests/fixtures/mvcc-source-composition-workload.txt`
 - Next obvious extension boundary:
   - no further MVCC surface growth is required for the no-GPU bootstrap by default; the next step is bootstrap closeout / CUDA-transition prep using the deterministic point-lookup, full-scan/simple-filter, and source-composition fixtures, explicit fallback truth, and documented engine-facing contract.
+  - supported point-lookup and full-scan/simple-filter fixture shapes already have explicit backend-swap parity regressions, so `CudaBackend` can be attached and judged against CPU truth without rewriting `MvccReadQuery`, `MvccReadResult`, or `MvccReadRow`.
 
 ## Quickstart
 

@@ -28,6 +28,9 @@ The no-GPU bootstrap phase is closed. The current engine-facing MVCC contract is
   - `execute_mvcc_query_replays_deterministic_workload_fixture_for_point_lookup`
   - `execute_mvcc_query_replays_deterministic_full_scan_workload_fixture`
   - `execute_mvcc_query_replays_deterministic_source_composition_workload_fixture`
+- Supported first-CUDA deterministic fixtures now also prove backend-swap parity explicitly:
+  - `execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_supported_lookup_fixture`
+  - `execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_supported_full_scan_fixture`
 - The source-composition fixture also proves `status_snapshot()` rolls those parity fallbacks up consistently.
 
 ### 3. Deterministic replay coverage
