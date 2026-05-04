@@ -818,6 +818,13 @@ pub struct MvccReadResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct MvccBackendExecution {
+    executed_target: DeviceTarget,
+    fallback_reason: Option<FallbackReason>,
+    rows: Vec<MvccReadRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedMvccRow {
     branch_label: Option<String>,
     source_key: Option<String>,
@@ -825,6 +832,100 @@ struct ResolvedMvccRow {
     provenance_path: Option<Vec<TupleVersion>>,
     terminal_input_index: Option<usize>,
     tuple: TupleVersion,
+}
+
+trait MvccExecutionBackend {
+    fn execute(&self, query: &MvccReadQuery, rows: Vec<ResolvedMvccRow>) -> MvccBackendExecution;
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct CpuMvccExecutionBackend;
+
+impl MvccExecutionBackend for CpuMvccExecutionBackend {
+    fn execute(&self, query: &MvccReadQuery, rows: Vec<ResolvedMvccRow>) -> MvccBackendExecution {
+        let projection = &query.projection;
+        let projected = match (query.filter.clone(), query.order.clone(), query.limit) {
+            (Some(filter), Some(order), Some(limit)) => {
+                collect_operator_rows(ProjectOperator::new(
+                    LimitOperator::new(
+                        SortOperator::new(
+                            FilterOperator::new(
+                                ScanOperator::new(rows),
+                                move |row: &ResolvedMvccRow| mvcc_row_matches_filter(row, &filter),
+                            ),
+                            move |left: &ResolvedMvccRow, right: &ResolvedMvccRow| {
+                                mvcc_row_cmp(left, right, &order)
+                            },
+                        ),
+                        limit,
+                    ),
+                    move |row| project_mvcc_row(row, projection),
+                ))
+            }
+            (Some(filter), Some(order), None) => collect_operator_rows(ProjectOperator::new(
+                SortOperator::new(
+                    FilterOperator::new(ScanOperator::new(rows), move |row: &ResolvedMvccRow| {
+                        mvcc_row_matches_filter(row, &filter)
+                    }),
+                    move |left: &ResolvedMvccRow, right: &ResolvedMvccRow| {
+                        mvcc_row_cmp(left, right, &order)
+                    },
+                ),
+                move |row| project_mvcc_row(row, projection),
+            )),
+            (Some(filter), None, Some(limit)) => collect_operator_rows(ProjectOperator::new(
+                LimitOperator::new(
+                    FilterOperator::new(ScanOperator::new(rows), move |row: &ResolvedMvccRow| {
+                        mvcc_row_matches_filter(row, &filter)
+                    }),
+                    limit,
+                ),
+                move |row| project_mvcc_row(row, projection),
+            )),
+            (Some(filter), None, None) => collect_operator_rows(ProjectOperator::new(
+                FilterOperator::new(ScanOperator::new(rows), move |row: &ResolvedMvccRow| {
+                    mvcc_row_matches_filter(row, &filter)
+                }),
+                move |row| project_mvcc_row(row, projection),
+            )),
+            (None, Some(order), Some(limit)) => collect_operator_rows(ProjectOperator::new(
+                LimitOperator::new(
+                    SortOperator::new(
+                        ScanOperator::new(rows),
+                        move |left: &ResolvedMvccRow, right: &ResolvedMvccRow| {
+                            mvcc_row_cmp(left, right, &order)
+                        },
+                    ),
+                    limit,
+                ),
+                move |row| project_mvcc_row(row, projection),
+            )),
+            (None, Some(order), None) => collect_operator_rows(ProjectOperator::new(
+                SortOperator::new(
+                    ScanOperator::new(rows),
+                    move |left: &ResolvedMvccRow, right: &ResolvedMvccRow| {
+                        mvcc_row_cmp(left, right, &order)
+                    },
+                ),
+                move |row| project_mvcc_row(row, projection),
+            )),
+            (None, None, Some(limit)) => collect_operator_rows(ProjectOperator::new(
+                LimitOperator::new(ScanOperator::new(rows), limit),
+                move |row| project_mvcc_row(row, projection),
+            )),
+            (None, None, None) => {
+                collect_operator_rows(ProjectOperator::new(ScanOperator::new(rows), move |row| {
+                    project_mvcc_row(row, projection)
+                }))
+            }
+        };
+
+        MvccBackendExecution {
+            executed_target: DeviceTarget::Cpu,
+            fallback_reason: Some(FallbackReason::GpuMvccReadParityGap),
+            rows: projected,
+        }
+    }
 }
 
 type ResolvedTupleIdentity = (u64, String, String, u64, Option<u64>);
@@ -4385,106 +4486,42 @@ impl Engine {
         &mut self,
         query: &MvccReadQuery,
     ) -> Result<MvccReadResult, ExecuteError> {
+        let backend = CpuMvccExecutionBackend;
+        self.execute_mvcc_query_with_backend(query, &backend)
+    }
+
+    fn execute_mvcc_query_with_backend<B: MvccExecutionBackend>(
+        &mut self,
+        query: &MvccReadQuery,
+        backend: &B,
+    ) -> Result<MvccReadResult, ExecuteError> {
         if self.repl.role() != Role::Leader {
             return Err(ExecuteError::Engine(EngineError::NotLeader));
         }
 
         let planned_target = DeviceTarget::Gpu(self.planner.default_gpu_id());
-        let executed_target = DeviceTarget::Cpu;
-        let fallback_reason = Some(FallbackReason::GpuMvccReadParityGap);
-        self.metrics
-            .inc_fallback(FallbackReason::GpuMvccReadParityGap);
-
         let rows = resolve_mvcc_source(&self.mvcc_store, &query.source, query.visibility)?;
 
-        let projection = &query.projection;
-        let projected = match (query.filter.clone(), query.order.clone(), query.limit) {
-            (Some(filter), Some(order), Some(limit)) => {
-                collect_operator_rows(ProjectOperator::new(
-                    LimitOperator::new(
-                        SortOperator::new(
-                            FilterOperator::new(
-                                ScanOperator::new(rows),
-                                move |row: &ResolvedMvccRow| mvcc_row_matches_filter(row, &filter),
-                            ),
-                            move |left: &ResolvedMvccRow, right: &ResolvedMvccRow| {
-                                mvcc_row_cmp(left, right, &order)
-                            },
-                        ),
-                        limit,
-                    ),
-                    move |row| project_mvcc_row(row, projection),
-                ))
-            }
-            (Some(filter), Some(order), None) => collect_operator_rows(ProjectOperator::new(
-                SortOperator::new(
-                    FilterOperator::new(ScanOperator::new(rows), move |row: &ResolvedMvccRow| {
-                        mvcc_row_matches_filter(row, &filter)
-                    }),
-                    move |left: &ResolvedMvccRow, right: &ResolvedMvccRow| {
-                        mvcc_row_cmp(left, right, &order)
-                    },
-                ),
-                move |row| project_mvcc_row(row, projection),
-            )),
-            (Some(filter), None, Some(limit)) => collect_operator_rows(ProjectOperator::new(
-                LimitOperator::new(
-                    FilterOperator::new(ScanOperator::new(rows), move |row: &ResolvedMvccRow| {
-                        mvcc_row_matches_filter(row, &filter)
-                    }),
-                    limit,
-                ),
-                move |row| project_mvcc_row(row, projection),
-            )),
-            (Some(filter), None, None) => collect_operator_rows(ProjectOperator::new(
-                FilterOperator::new(ScanOperator::new(rows), move |row: &ResolvedMvccRow| {
-                    mvcc_row_matches_filter(row, &filter)
-                }),
-                move |row| project_mvcc_row(row, projection),
-            )),
-            (None, Some(order), Some(limit)) => collect_operator_rows(ProjectOperator::new(
-                LimitOperator::new(
-                    SortOperator::new(
-                        ScanOperator::new(rows),
-                        move |left: &ResolvedMvccRow, right: &ResolvedMvccRow| {
-                            mvcc_row_cmp(left, right, &order)
-                        },
-                    ),
-                    limit,
-                ),
-                move |row| project_mvcc_row(row, projection),
-            )),
-            (None, Some(order), None) => collect_operator_rows(ProjectOperator::new(
-                SortOperator::new(
-                    ScanOperator::new(rows),
-                    move |left: &ResolvedMvccRow, right: &ResolvedMvccRow| {
-                        mvcc_row_cmp(left, right, &order)
-                    },
-                ),
-                move |row| project_mvcc_row(row, projection),
-            )),
-            (None, None, Some(limit)) => collect_operator_rows(ProjectOperator::new(
-                LimitOperator::new(ScanOperator::new(rows), limit),
-                move |row| project_mvcc_row(row, projection),
-            )),
-            (None, None, None) => {
-                collect_operator_rows(ProjectOperator::new(ScanOperator::new(rows), move |row| {
-                    project_mvcc_row(row, projection)
-                }))
-            }
+        let backend_result = backend.execute(query, rows);
+        let result = MvccReadResult {
+            planned_target,
+            executed_target: backend_result.executed_target,
+            fallback_reason: backend_result.fallback_reason,
+            rows: backend_result.rows,
         };
+        self.observe_mvcc_read_result_metrics(&result);
+        Ok(result)
+    }
 
-        let total_d2h_bytes: u64 = projected.iter().map(mvcc_read_row_size).sum();
+    fn observe_mvcc_read_result_metrics(&mut self, result: &MvccReadResult) {
+        if let Some(reason) = result.fallback_reason {
+            self.metrics.inc_fallback(reason);
+        }
+
+        let total_d2h_bytes: u64 = result.rows.iter().map(mvcc_read_row_size).sum();
         if total_d2h_bytes > 0 {
             self.metrics.observe_d2h_bytes(total_d2h_bytes);
         }
-
-        Ok(MvccReadResult {
-            planned_target,
-            executed_target,
-            fallback_reason,
-            rows: projected,
-        })
     }
 
     pub fn visible_up_to(&self) -> Index {
@@ -6726,6 +6763,65 @@ mod tests {
                 .fallback_for(FallbackReason::GpuMvccReadParityGap),
             expected_total_fallbacks
         );
+    }
+
+    #[derive(Debug, Clone)]
+    struct RecordingMvccBackend {
+        executed_target: DeviceTarget,
+        fallback_reason: Option<FallbackReason>,
+        rows: Vec<MvccReadRow>,
+    }
+
+    impl MvccExecutionBackend for RecordingMvccBackend {
+        fn execute(
+            &self,
+            _query: &MvccReadQuery,
+            _rows: Vec<ResolvedMvccRow>,
+        ) -> MvccBackendExecution {
+            MvccBackendExecution {
+                executed_target: self.executed_target,
+                fallback_reason: self.fallback_reason,
+                rows: self.rows.clone(),
+            }
+        }
+    }
+
+    #[test]
+    fn execute_mvcc_query_keeps_result_contract_stable_across_backend_swap() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=open").unwrap();
+
+        let backend = RecordingMvccBackend {
+            executed_target: DeviceTarget::Gpu(0),
+            fallback_reason: None,
+            rows: vec![MvccReadRow {
+                source_key: Some("seed:acct".to_string()),
+                key: Some("acct:1".to_string()),
+                value: Some("open".to_string()),
+            }],
+        };
+
+        let result = e
+            .execute_mvcc_query_with_backend(
+                &MvccReadQuery {
+                    source: MvccReadSource::KeyLookup {
+                        key: "acct:1".to_string(),
+                    },
+                    visibility: StorageVisibility { read_txn_id: 1 },
+                    filter: None,
+                    order: None,
+                    projection: MvccProjection::KeyValue,
+                    limit: None,
+                },
+                &backend,
+            )
+            .unwrap();
+
+        assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.fallback_reason, None);
+        assert_eq!(result.rows, backend.rows);
+        assert_eq!(e.metrics().fallback_total, 0);
     }
 
     #[test]

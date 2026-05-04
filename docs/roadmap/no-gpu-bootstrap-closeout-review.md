@@ -41,6 +41,7 @@ The no-GPU bootstrap phase is closed. The current engine-facing MVCC contract is
   - `MvccReadResult`
   - `MvccReadRow { source_key, key, value }`
   - `status_snapshot()` fallback / replication truth surfaces
+- That backend boundary is now explicit in code: `Engine::execute_mvcc_query()` routes through `CpuMvccExecutionBackend` today, and a backend-swap regression proves the result contract stays stable when the execution path changes.
 - Unsupported CUDA shapes can continue to route through the explicit CPU fallback path without weakening the GPU-first contract.
 
 ### 5. Validation gate

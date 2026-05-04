@@ -352,6 +352,7 @@ Before starting real GPU execution, perform and record a closeout review that an
    - if not sufficient, add the smallest missing fixture before GPU work begins.
 4. **No-rewrite check**
    - no pending design concern implies a major planner/executor/result-contract rewrite before `CudaBackend` can be attached.
+   - `Engine::execute_mvcc_query()` now already routes through an internal execution-backend hook (`CpuMvccExecutionBackend` today), so backend swaps can be proven without changing `MvccReadQuery`, `MvccReadResult`, or `MvccReadRow { source_key, key, value }`.
 5. **Validation gate green**
    - `cargo fmt --all`
    - `cargo clippy --all-targets --all-features -- -D warnings`

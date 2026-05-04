@@ -18,6 +18,7 @@ Each physical plan node must include:
 ## Bootstrap MVCC read slice
 
 - Engine-facing entry point: `Engine::execute_mvcc_query(&MvccReadQuery)`
+- Backend attachment boundary: the engine now delegates resolved MVCC rows through an internal execution-backend hook (`CpuMvccExecutionBackend` today), so `CudaBackend` can replace only the execution path while preserving the engine-facing query/result contract.
 - Supported sources:
   - `FullScan`
   - `KeyLookup { key }`

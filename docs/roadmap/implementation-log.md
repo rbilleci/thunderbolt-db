@@ -3,6 +3,8 @@
 ## 2026-05-04
 
 ### Completed
+- Tightened CUDA-transition prep by routing `Engine::execute_mvcc_query()` through an explicit internal MVCC execution-backend hook (`CpuMvccExecutionBackend` today), so future backend swaps do not require an engine-facing contract rewrite.
+- Added a backend-swap regression proving `MvccReadQuery` / `MvccReadResult` / `MvccReadRow { source_key, key, value }` stay stable when a different execution backend is injected, while fallback metrics remain tied to the backend's reported execution outcome.
 - Switched the autonomous loop into explicit no-GPU closeout-consolidation mode instead of widening the MVCC surface again without a named semantic gap.
 - Tightened deterministic fixture proof so `execute_mvcc_query_replays_deterministic_workload_fixture_for_point_lookup` and `execute_mvcc_query_replays_deterministic_source_composition_workload_fixture` now assert the planned GPU target, executed CPU target, tracked `GpuMvccReadParityGap` fallback reason, and cumulative fallback accounting directly.
 - Added source-composition closeout coverage proving `status_snapshot()` rolls the same parity fallback truth up consistently after engine-facing MVCC workload replay.
