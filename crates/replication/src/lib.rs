@@ -381,8 +381,9 @@ impl RecoveryState {
             });
         }
 
-        let mut expected_index = self.snapshot.last_included_index + 1;
-        for entry in &self.committed_entries {
+        for (expected_index, entry) in
+            (self.snapshot.last_included_index + 1..).zip(self.committed_entries.iter())
+        {
             if entry.index != expected_index {
                 return Err(RecoveryInvariantError::NonContiguousEntries {
                     expected_index,
@@ -396,7 +397,6 @@ impl RecoveryState {
                     index: entry.index,
                 });
             }
-            expected_index += 1;
         }
 
         let commit_index = self.commit_index();
@@ -890,8 +890,7 @@ impl RaftReplicator {
             }
         }
 
-        let mut expected_index = prev_log_index + 1;
-        for entry in &entries {
+        for (expected_index, entry) in (prev_log_index + 1..).zip(entries.iter()) {
             if entry.term > leader_term {
                 return Err(EngineError::ProposalFailed(format!(
                     "entry term {} exceeds leader term {} at index {}",
@@ -906,7 +905,6 @@ impl RaftReplicator {
                     entry.index
                 )));
             }
-            expected_index += 1;
         }
 
         for incoming in entries {

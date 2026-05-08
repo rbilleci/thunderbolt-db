@@ -7255,6 +7255,59 @@ mod tests {
     }
 
     #[test]
+    fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_supported_key_range_filter() {
+        let mut e = Engine::new_local();
+        for (txn_id, command) in include_str!("../../../tests/fixtures/mvcc-full-scan-workload.txt")
+            .lines()
+            .enumerate()
+        {
+            e.execute_text((txn_id + 1) as u64, command).unwrap();
+        }
+
+        let query = MvccReadQuery {
+            source: MvccReadSource::FullScan,
+            visibility: StorageVisibility { read_txn_id: 6 },
+            filter: Some(MvccReadFilter::KeyRange {
+                start_inclusive: "acct:1".to_string(),
+                end_exclusive: "acct:4".to_string(),
+            }),
+            order: None,
+            projection: MvccProjection::KeyOnly,
+            limit: None,
+        };
+
+        assert_eq!(first_cuda_slice_query_gap(&query), None);
+
+        let cpu = e.execute_mvcc_query(&query).unwrap();
+        assert_mvcc_query_uses_tracked_cpu_fallback(&e, &cpu, 1);
+
+        let backend = e
+            .execute_mvcc_query_with_backend_fallback(&query, &FirstCudaSliceParityBackend)
+            .unwrap();
+
+        assert_eq!(backend.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(backend.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(backend.fallback_reason, None);
+        assert_eq!(backend.rows, cpu.rows);
+        assert_eq!(
+            backend.rows,
+            vec![
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("acct:1".to_string()),
+                    value: None,
+                },
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("acct:3".to_string()),
+                    value: None,
+                },
+            ]
+        );
+        assert_eq!(e.metrics().fallback_total, 1);
+    }
+
+    #[test]
     fn execute_mvcc_query_first_cuda_slice_backend_falls_back_for_unsupported_composition() {
         let mut e = Engine::new_local();
         e.execute_text(1, "SET acct:1=open").unwrap();

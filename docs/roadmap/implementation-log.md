@@ -3,6 +3,7 @@
 ## 2026-05-04
 
 ### Completed
+- Tightened CUDA-transition prep with a dedicated backend-swap parity regression for the first-slice `KeyRange` predicate, so the documented initial CUDA filter subset now has explicit fixture-backed CPU-vs-backend proof for range filters as well as key-prefix/value-equality filter trees.
 - Reconciled the roadmap queue itself: with Q1-Q5 all complete and the no-GPU bootstrap closeout already recorded, autonomous no-GPU loops are now explicitly expected to stop after validation/doc truth checks unless NVIDIA hardware arrives or a concrete semantic contradiction reopens a named gap.
 - Tightened CUDA-transition prep with an explicit first-slice query-gap classifier: the no-GPU truth surface now distinguishes `unsupported_source`, `unsupported_order`, `unsupported_projection`, `unsupported_limit`, `unsupported_filter`, and `empty_logical_filter_tree`, and engine regressions pin those labels so future `CudaBackend` routing can explain the first missed contract edge deterministically.
 - Added engine-facing backend-swap parity regressions for the supported first-CUDA deterministic fixtures: the point-lookup replay fixture and the new full-scan/simple-filter replay fixture now both assert that `FirstCudaSliceParityBackend` returns the same rows as the CPU reference path while avoiding fallback.
