@@ -384,8 +384,9 @@ Status update on 2026-05-09:
 - Local NVIDIA hardware is now visible to the loop (`NVIDIA GeForce RTX 3090`, driver `590.48.01`).
 - `gpu_db_execution::CudaDriverRuntime` now probes `libcuda`, initializes the driver, records driver version, device count, device names, and device memory sizes, and plugs into the existing `GpuRuntime`/`DeviceRouter` contract.
 - `CudaDriverRuntime::launch_smoke_add_one(...)` now proves the local driver path can load PTX, allocate device memory, launch a minimal kernel, synchronize, and copy the result back to the host; this is a launch-harness prerequisite, not MVCC execution parity.
+- `CudaDriverRuntime::filter_equal_u32_mask(...)` is now the first real CUDA predicate primitive: it performs H2D input copy, device-side equality-mask generation, synchronization, and D2H mask copy for fixed-width batches with an ignored local-hardware parity test.
 - `CudaMvccExecutionBackend` is attached behind the existing MVCC backend boundary and can be reached through `Engine::execute_mvcc_query_with_cuda_driver_probe(...)`.
-- CUDA kernels are not implemented yet; supported MVCC read shapes must continue to use CPU truth/fallback until scan, visibility filtering, simple predicates, and key lookup are ported behind the existing backend boundary.
+- MVCC CUDA kernels are not integrated yet; supported MVCC read shapes must continue to use CPU truth/fallback until row encoding plus scan, visibility filtering, string/key predicates, and key lookup are ported behind the existing backend boundary.
 
 1. Add CUDA build targets plus at least one reproducible GPU-capable CI/dev environment.
    - In progress: local GPU-capable dev environment detected; driver-level runtime probing now exposes device inventory (`id`, name, total memory) and a validated minimal kernel launch/D2H smoke path for transition diagnostics.
@@ -395,6 +396,7 @@ Status update on 2026-05-09:
    - scan
    - snapshot visibility filtering
    - simple filter predicates
+     - In progress: fixed-width equality-mask CUDA predicate primitive exists; MVCC row/string predicate integration remains open.
    - point lookup / key lookup
 4. Run CPU-vs-GPU parity checks against the existing deterministic fixtures and any minimal new fixture added during closeout.
 5. Keep fallback routing live so unsupported shapes still execute via CPU with explicit tracked reasons.
