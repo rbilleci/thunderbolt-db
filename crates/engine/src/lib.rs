@@ -977,6 +977,11 @@ impl MvccExecutionBackend for CudaMvccExecutionBackend {
             };
         }
 
+        let rows = match execute_cuda_key_range(query, rows, self.router.runtime(), self.gpu_id) {
+            Ok(executed) => return MvccBackendDispatch::Executed(executed),
+            Err(rows) => rows,
+        };
+
         let rows = match execute_cuda_key_prefix(query, rows, self.router.runtime(), self.gpu_id) {
             Ok(executed) => return MvccBackendDispatch::Executed(executed),
             Err(rows) => rows,
@@ -1002,6 +1007,26 @@ impl MvccExecutionBackend for CudaMvccExecutionBackend {
     }
 }
 
+fn execute_cuda_key_range(
+    query: &MvccReadQuery,
+    rows: Vec<ResolvedMvccRow>,
+    runtime: &CudaDriverRuntime,
+    gpu_id: u16,
+) -> Result<MvccBackendExecution, Vec<ResolvedMvccRow>> {
+    let Some(MvccReadFilter::KeyRange {
+        start_inclusive,
+        end_exclusive,
+    }) = query.filter.as_ref()
+    else {
+        return Err(rows);
+    };
+    let Some(prefix) = prefix_equivalent_key_range(start_inclusive, end_exclusive) else {
+        return Err(rows);
+    };
+
+    execute_cuda_key_prefix_mask(query, rows, runtime, gpu_id, prefix.as_bytes())
+}
+
 fn execute_cuda_key_prefix(
     query: &MvccReadQuery,
     rows: Vec<ResolvedMvccRow>,
@@ -1012,6 +1037,16 @@ fn execute_cuda_key_prefix(
         return Err(rows);
     };
 
+    execute_cuda_key_prefix_mask(query, rows, runtime, gpu_id, prefix.as_bytes())
+}
+
+fn execute_cuda_key_prefix_mask(
+    query: &MvccReadQuery,
+    rows: Vec<ResolvedMvccRow>,
+    runtime: &CudaDriverRuntime,
+    gpu_id: u16,
+    prefix: &[u8],
+) -> Result<MvccBackendExecution, Vec<ResolvedMvccRow>> {
     let prefix_len = prefix.len();
     let values = rows
         .iter()
@@ -1021,7 +1056,7 @@ fn execute_cuda_key_prefix(
         })
         .collect::<Vec<_>>();
     let mask = runtime
-        .filter_equal_bytes_mask(&values, prefix.as_bytes())
+        .filter_equal_bytes_mask(&values, prefix)
         .map_err(|_| rows.clone())?;
     let projection = &query.projection;
     let rows = rows
@@ -1034,6 +1069,20 @@ fn execute_cuda_key_prefix(
         executed_target: DeviceTarget::Gpu(gpu_id),
         rows,
     })
+}
+
+fn prefix_equivalent_key_range<'a>(
+    start_inclusive: &'a str,
+    end_exclusive: &str,
+) -> Option<&'a str> {
+    let mut successor = start_inclusive.as_bytes().to_vec();
+    let last = successor.last_mut()?;
+    if *last == u8::MAX {
+        return None;
+    }
+    *last += 1;
+
+    (successor == end_exclusive.as_bytes()).then_some(start_inclusive)
 }
 
 fn execute_cuda_numeric_value_equals(
@@ -7384,7 +7433,7 @@ mod tests {
     }
 
     #[test]
-    fn cuda_mvcc_backend_keeps_key_range_gap_explicit_until_ported() {
+    fn cuda_mvcc_backend_keeps_general_key_range_gap_explicit_until_ported() {
         let mut e = Engine::new_local();
         e.execute_text(1, "SET acct:1=open").unwrap();
         let backend = CudaMvccExecutionBackend::new(CudaDriverRuntime::from_device_count(1), 0);
@@ -7398,7 +7447,7 @@ mod tests {
                     visibility: StorageVisibility { read_txn_id: 1 },
                     filter: Some(MvccReadFilter::KeyRange {
                         start_inclusive: "acct:".to_string(),
-                        end_exclusive: "acct;".to_string(),
+                        end_exclusive: "acct:9".to_string(),
                     }),
                     order: None,
                     projection: MvccProjection::KeyValue,
@@ -7427,6 +7476,49 @@ mod tests {
                 .fallback_for(FallbackReason::GpuMvccReadParityGap),
             1
         );
+    }
+
+    #[test]
+    #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
+    fn execute_mvcc_query_cuda_driver_runs_prefix_equivalent_key_range_filter_without_fallback() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=open").unwrap();
+        e.execute_text(2, "SET acct:2=hold").unwrap();
+        e.execute_text(3, "SET user:1=active").unwrap();
+
+        let result = e
+            .execute_mvcc_query_with_cuda_driver_probe(&MvccReadQuery {
+                source: MvccReadSource::FullScan,
+                visibility: StorageVisibility { read_txn_id: 3 },
+                filter: Some(MvccReadFilter::KeyRange {
+                    start_inclusive: "acct:".to_string(),
+                    end_exclusive: "acct;".to_string(),
+                }),
+                order: None,
+                projection: MvccProjection::KeyValue,
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.fallback_reason, None);
+        assert_eq!(
+            result.rows,
+            vec![
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("acct:1".to_string()),
+                    value: Some("open".to_string()),
+                },
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("acct:2".to_string()),
+                    value: Some("hold".to_string()),
+                },
+            ]
+        );
+        assert_eq!(e.metrics().fallback_total, 0);
     }
 
     #[test]
