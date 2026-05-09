@@ -376,9 +376,63 @@ Closeout review recorded on 2026-05-04:
 - satisfied: no-rewrite check (including explicit first-slice gap labels for future CUDA routing)
 - satisfied: validation gate green (`cargo fmt --all`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all --all-features`)
 
+## CUDA completion loop policy
+
+Now that local NVIDIA hardware is available, the autonomous loop must stop treating CUDA work as an open-ended "next small primitive" queue. The loop should drive the project through named completion gates, in order, with each run either advancing the active gate, tightening the parity evidence for that gate, or stopping after validation if no material progress is available.
+
+Loop rules:
+- Start every CUDA loop by naming the active completion gate and the exact contract gap being closed.
+- Do not widen API surface, query semantics, or CPU-only behavior unless it directly supports the active gate.
+- Preserve the existing `Engine::execute_mvcc_query()` result contract unless a recorded design contradiction proves it cannot carry GPU execution safely.
+- Keep CPU fallback live for unsupported shapes, but treat new fallback as temporary completion debt with an explicit `GpuMvccReadParityGap` reason and a milestone owner gate.
+- Require CPU-vs-GPU parity coverage for every newly GPU-eligible shape before it can report `executed_target = gpu(...)`.
+- Prefer milestone-sized changes over primitive-by-primitive churn: each committed slice should leave docs, tests, and telemetry pointing at the next remaining gap.
+- If a loop cannot name a gate-aligned gap, run the validation gate and update the completion checklist instead of inventing work.
+
+Validation gate for every completion-gate change:
+- `cargo fmt --all -- --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all --all-features`
+- relevant local NVIDIA ignored tests with `--include-ignored --nocapture` when the change touches CUDA runtime or CUDA MVCC routing
+
+### CUDA completion gates
+
+1. **GPU row format and transfer contract**
+   - Define the device row layout for MVCC keys, values, visibility metadata, and provenance handles.
+   - Record SoA/AoS choices, alignment/coalescing assumptions, null/empty value representation, and bounded allocation strategy.
+   - Add host-to-device and device-to-host fixtures that compare encoded rows against the CPU truth rows.
+   - Exit when supported first-slice queries can build and inspect a GPU row batch without changing `MvccReadRow`.
+2. **Native scan and snapshot visibility parity**
+   - Move full-scan row selection and snapshot visibility filtering into CUDA kernels.
+   - Keep the CPU storage contract as the truth oracle while proving visible/invisible row parity on deterministic fixtures.
+   - Exit when supported filterless full-scan shapes no longer depend on CPU row selection for visibility decisions.
+3. **Native point/key lookup parity**
+   - Add GPU-side key lookup/index probing for supported point and batch lookup shapes.
+   - Preserve request-order semantics and existing fallback accounting for unsupported lookup/source variants.
+   - Exit when supported `KeyLookup` and first supported `KeyBatchLookup` shapes execute lookup work on CUDA with CPU parity tests.
+4. **Provenance and filter expansion parity**
+   - Extend GPU predicates beyond the current filterless/value/key prefix/range mask primitives into the next provenance-aware filter categories.
+   - Port only categories that can be named, fixture-backed, and compared against CPU output.
+   - Exit when the remaining filter fallbacks are documented by unsupported semantic category rather than by missing primitive plumbing.
+5. **Ordering, projection, and composition GPU coverage**
+   - Move the first stable ordering and projection shapes behind the CUDA backend without changing external result rows.
+   - Add GPU coverage for the first multi-source composition shape only after single-source scan/lookup/filter parity is stable.
+   - Exit when at least one ordering, one projection, and one composition family has CUDA parity and unsupported families still fall back explicitly.
+6. **Benchmark, telemetry, and fallback-rate regression gates**
+   - Add benchmark fixtures that report GPU-executed workload percentage, CPU fallback rate, H2D/D2H bytes, kernel time, and batch wait time where available.
+   - Treat rising fallback rate on the benchmark mix as a regression once a gate is closed.
+   - Exit when local runs can distinguish correctness regressions from performance/fallback regressions.
+7. **GPU CI or reproducible runner**
+   - Provide either GPU-capable CI or a reproducible local runner script/profile that executes the CUDA parity suite and captures environment details.
+   - Publish driver/device/runtime evidence with test output.
+   - Exit when another developer or runner can repeat the CUDA validation gate without relying on ad hoc machine state.
+
+Completion rule:
+- The project is not "CUDA complete" until gates 1-7 are closed, the fallback-rate benchmark target is recorded, and unsupported remaining shapes are deliberately classified as post-v1 scope rather than accidental gaps.
+
 ## First CUDA transition slice (once NVIDIA hardware is available)
 
-Do not begin with broad acceleration. Land the smallest parity-checkable slice first:
+This section records the already-started first slice. Future loop runs should treat it as gate-0/bootstrap evidence for the CUDA completion loop above, not as the full roadmap.
 
 Status update on 2026-05-09:
 - Local NVIDIA hardware is now visible to the loop (`NVIDIA GeForce RTX 3090`, driver `590.48.01`).
