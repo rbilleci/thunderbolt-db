@@ -386,17 +386,18 @@ Status update on 2026-05-09:
 - `CudaDriverRuntime::launch_smoke_add_one(...)` now proves the local driver path can load PTX, allocate device memory, launch a minimal kernel, synchronize, and copy the result back to the host; this is a launch-harness prerequisite, not MVCC execution parity.
 - `CudaDriverRuntime::filter_equal_u32_mask(...)` is now the first real CUDA predicate primitive: it performs H2D input copy, device-side equality-mask generation, synchronization, and D2H mask copy for fixed-width batches with an ignored local-hardware parity test.
 - `CudaMvccExecutionBackend` is attached behind the existing MVCC backend boundary and can be reached through `Engine::execute_mvcc_query_with_cuda_driver_probe(...)`.
-- MVCC CUDA kernels are not integrated yet; supported MVCC read shapes must continue to use CPU truth/fallback until row encoding plus scan, visibility filtering, string/key predicates, and key lookup are ported behind the existing backend boundary.
+- The first MVCC CUDA integration is intentionally narrow: supported full-scan/key-lookup reads with an exact numeric `ValueEquals` filter can now use the CUDA equality-mask primitive and report `executed_target = gpu(...)` on local NVIDIA hardware. Source resolution, snapshot visibility, and projection still use the existing CPU/storage contract; non-numeric values and broader filter shapes continue to fall back under `GpuMvccReadParityGap`.
+- Remaining MVCC CUDA gaps: native row encoding, scan/visibility kernels, string/key predicates, and key lookup kernels still need to be ported behind the existing backend boundary before broader shapes may report GPU execution.
 
 1. Add CUDA build targets plus at least one reproducible GPU-capable CI/dev environment.
    - In progress: local GPU-capable dev environment detected; driver-level runtime probing now exposes device inventory (`id`, name, total memory) and a validated minimal kernel launch/D2H smoke path for transition diagnostics.
 2. Implement `CudaBackend` behind the existing backend trait boundary without changing engine-facing contracts.
-   - In progress: backend attachment exists; first-slice kernels still intentionally fall back under `GpuMvccReadParityGap`.
+   - In progress: backend attachment exists; exact numeric `ValueEquals` filters now run through the real CUDA equality-mask primitive, while unsupported shapes still intentionally fall back under `GpuMvccReadParityGap`.
 3. Port only the first operator subset:
    - scan
    - snapshot visibility filtering
    - simple filter predicates
-     - In progress: fixed-width equality-mask CUDA predicate primitive exists; MVCC row/string predicate integration remains open.
+     - In progress: fixed-width equality-mask CUDA predicate primitive is integrated for numeric MVCC `ValueEquals`; MVCC row/string/key predicate integration remains open.
    - point lookup / key lookup
 4. Run CPU-vs-GPU parity checks against the existing deterministic fixtures and any minimal new fixture added during closeout.
 5. Keep fallback routing live so unsupported shapes still execute via CPU with explicit tracked reasons.

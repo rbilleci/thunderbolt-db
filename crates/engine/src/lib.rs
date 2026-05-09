@@ -977,11 +977,48 @@ impl MvccExecutionBackend for CudaMvccExecutionBackend {
             };
         }
 
-        MvccBackendDispatch::Fallback {
-            reason: FallbackReason::GpuMvccReadParityGap,
-            rows,
+        match execute_cuda_numeric_value_equals(query, rows, self.router.runtime(), self.gpu_id) {
+            Ok(executed) => MvccBackendDispatch::Executed(executed),
+            Err(rows) => MvccBackendDispatch::Fallback {
+                reason: FallbackReason::GpuMvccReadParityGap,
+                rows,
+            },
         }
     }
+}
+
+fn execute_cuda_numeric_value_equals(
+    query: &MvccReadQuery,
+    rows: Vec<ResolvedMvccRow>,
+    runtime: &CudaDriverRuntime,
+    gpu_id: u16,
+) -> Result<MvccBackendExecution, Vec<ResolvedMvccRow>> {
+    let Some(MvccReadFilter::ValueEquals(expected)) = query.filter.as_ref() else {
+        return Err(rows);
+    };
+    let Ok(needle) = expected.parse::<u32>() else {
+        return Err(rows);
+    };
+
+    let values = rows
+        .iter()
+        .map(|row| row.tuple.value.parse::<u32>())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| rows.clone())?;
+    let mask = runtime
+        .filter_equal_u32_mask(&values, needle)
+        .map_err(|_| rows.clone())?;
+    let projection = &query.projection;
+    let rows = rows
+        .into_iter()
+        .zip(mask)
+        .filter_map(|(row, matched)| matched.then(|| project_mvcc_row(row, projection)))
+        .collect();
+
+    Ok(MvccBackendExecution {
+        executed_target: DeviceTarget::Gpu(gpu_id),
+        rows,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7308,6 +7345,84 @@ mod tests {
                 .fallback_for(FallbackReason::GpuMvccReadParityGap),
             1
         );
+    }
+
+    #[test]
+    fn cuda_mvcc_backend_keeps_non_numeric_value_filter_on_parity_fallback() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=open").unwrap();
+        let backend = CudaMvccExecutionBackend::new(CudaDriverRuntime::from_device_count(1), 0);
+
+        let result = e
+            .execute_mvcc_query_with_backend_fallback(
+                &MvccReadQuery {
+                    source: MvccReadSource::KeyLookup {
+                        key: "acct:1".to_string(),
+                    },
+                    visibility: StorageVisibility { read_txn_id: 1 },
+                    filter: Some(MvccReadFilter::ValueEquals("open".to_string())),
+                    order: None,
+                    projection: MvccProjection::ValueOnly,
+                    limit: None,
+                },
+                &backend,
+            )
+            .unwrap();
+
+        assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.executed_target, DeviceTarget::Cpu);
+        assert_eq!(
+            result.fallback_reason,
+            Some(FallbackReason::GpuMvccReadParityGap)
+        );
+        assert_eq!(
+            result.rows,
+            vec![MvccReadRow {
+                source_key: None,
+                key: None,
+                value: Some("open".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
+    fn execute_mvcc_query_cuda_driver_runs_numeric_value_equals_filter_without_fallback() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=7").unwrap();
+        e.execute_text(2, "SET acct:2=8").unwrap();
+        e.execute_text(3, "SET acct:3=7").unwrap();
+
+        let result = e
+            .execute_mvcc_query_with_cuda_driver_probe(&MvccReadQuery {
+                source: MvccReadSource::FullScan,
+                visibility: StorageVisibility { read_txn_id: 3 },
+                filter: Some(MvccReadFilter::ValueEquals("7".to_string())),
+                order: None,
+                projection: MvccProjection::KeyValue,
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.fallback_reason, None);
+        assert_eq!(
+            result.rows,
+            vec![
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("acct:1".to_string()),
+                    value: Some("7".to_string()),
+                },
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("acct:3".to_string()),
+                    value: Some("7".to_string()),
+                },
+            ]
+        );
+        assert_eq!(e.metrics().fallback_total, 0);
     }
 
     #[test]
