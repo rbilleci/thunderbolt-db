@@ -168,6 +168,14 @@ impl CudaDriverRuntime {
         launch_cuda_u32_equal_mask(input, needle)
     }
 
+    pub fn filter_all_mask(&self, row_count: usize) -> Result<Vec<bool>, CudaRuntimeProbeError> {
+        if !self.snapshot.driver_available || self.snapshot.device_count == 0 {
+            return Err(CudaRuntimeProbeError::DriverLibraryUnavailable);
+        }
+
+        launch_cuda_all_mask(row_count)
+    }
+
     pub fn filter_equal_bytes_mask(
         &self,
         input: &[&[u8]],
@@ -486,6 +494,217 @@ fn launch_cuda_smoke_add_one(input: u32) -> Result<u32, CudaRuntimeProbeError> {
     drop(context_guard);
 
     Ok(output)
+}
+
+fn launch_cuda_all_mask(row_count: usize) -> Result<Vec<bool>, CudaRuntimeProbeError> {
+    type CuInit = unsafe extern "C" fn(u32) -> i32;
+    type CuDeviceGet = unsafe extern "C" fn(*mut i32, i32) -> i32;
+    type CuCtxCreate = unsafe extern "C" fn(*mut *mut c_void, u32, i32) -> i32;
+    type CuCtxDestroy = unsafe extern "C" fn(*mut c_void) -> i32;
+    type CuMemAlloc = unsafe extern "C" fn(*mut u64, usize) -> i32;
+    type CuMemFree = unsafe extern "C" fn(u64) -> i32;
+    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+    type CuModuleLoadData = unsafe extern "C" fn(*mut *mut c_void, *const c_void) -> i32;
+    type CuModuleUnload = unsafe extern "C" fn(*mut c_void) -> i32;
+    type CuModuleGetFunction =
+        unsafe extern "C" fn(*mut *mut c_void, *mut c_void, *const i8) -> i32;
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+    type CuCtxSynchronize = unsafe extern "C" fn() -> i32;
+
+    const PTX: &[u8] = br#"
+.version 6.0
+.target sm_30
+.address_size 64
+
+.visible .entry gpu_db_cuda_all_mask(
+    .param .u64 mask_ptr,
+    .param .u32 row_count
+)
+{
+    .reg .pred %p_out;
+    .reg .u32 %r_tid;
+    .reg .u32 %r_block;
+    .reg .u32 %r_block_dim;
+    .reg .u32 %r_idx;
+    .reg .u32 %r_row_count;
+    .reg .u64 %rd_mask;
+    .reg .u64 %rd_offset;
+    .reg .u64 %rd_mask_addr;
+
+    ld.param.u64 %rd_mask, [mask_ptr];
+    ld.param.u32 %r_row_count, [row_count];
+
+    mov.u32 %r_tid, %tid.x;
+    mov.u32 %r_block, %ctaid.x;
+    mov.u32 %r_block_dim, %ntid.x;
+    mad.lo.u32 %r_idx, %r_block, %r_block_dim, %r_tid;
+
+    setp.ge.u32 %p_out, %r_idx, %r_row_count;
+    @%p_out bra DONE;
+
+    mul.wide.u32 %rd_offset, %r_idx, 4;
+    add.u64 %rd_mask_addr, %rd_mask, %rd_offset;
+    st.global.u32 [%rd_mask_addr], 1;
+
+DONE:
+    ret;
+}
+"#;
+
+    let row_count = u32::try_from(row_count)
+        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(row_count))?;
+    if row_count == 0 {
+        return Ok(Vec::new());
+    }
+
+    let lib = unsafe {
+        Library::new("libcuda.so.1")
+            .or_else(|_| Library::new("libcuda.so"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+
+    let cu_init = unsafe {
+        lib.get::<CuInit>(b"cuInit\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_device_get = unsafe {
+        lib.get::<CuDeviceGet>(b"cuDeviceGet\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_ctx_create = unsafe {
+        lib.get::<CuCtxCreate>(b"cuCtxCreate_v2\0")
+            .or_else(|_| lib.get::<CuCtxCreate>(b"cuCtxCreate\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_ctx_destroy = unsafe {
+        lib.get::<CuCtxDestroy>(b"cuCtxDestroy_v2\0")
+            .or_else(|_| lib.get::<CuCtxDestroy>(b"cuCtxDestroy\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_mem_alloc = unsafe {
+        lib.get::<CuMemAlloc>(b"cuMemAlloc_v2\0")
+            .or_else(|_| lib.get::<CuMemAlloc>(b"cuMemAlloc\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_mem_free = unsafe {
+        lib.get::<CuMemFree>(b"cuMemFree_v2\0")
+            .or_else(|_| lib.get::<CuMemFree>(b"cuMemFree\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_memcpy_dtoh = unsafe {
+        lib.get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+            .or_else(|_| lib.get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_module_load_data = unsafe {
+        lib.get::<CuModuleLoadData>(b"cuModuleLoadData\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_module_unload = unsafe {
+        lib.get::<CuModuleUnload>(b"cuModuleUnload\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_module_get_function = unsafe {
+        lib.get::<CuModuleGetFunction>(b"cuModuleGetFunction\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_launch_kernel = unsafe {
+        lib.get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_ctx_synchronize = unsafe {
+        lib.get::<CuCtxSynchronize>(b"cuCtxSynchronize\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+
+    check_cuda(unsafe { cu_init(0) })?;
+
+    let mut device = 0;
+    check_cuda(unsafe { cu_device_get(&mut device, 0) })?;
+
+    let mut context = std::ptr::null_mut();
+    check_cuda(unsafe { cu_ctx_create(&mut context, 0, device) })?;
+    let context_guard = CudaContextGuard {
+        context,
+        destroy: *cu_ctx_destroy,
+    };
+
+    let mask_len = row_count as usize;
+    let mask_bytes = mask_len * std::mem::size_of::<u32>();
+    let mut device_mask = 0_u64;
+    check_cuda(unsafe { cu_mem_alloc(&mut device_mask, mask_bytes) })?;
+    let mask_guard = CudaDeviceAllocationGuard {
+        ptr: device_mask,
+        free: *cu_mem_free,
+    };
+
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+
+    let mut module = std::ptr::null_mut();
+    check_cuda(unsafe { cu_module_load_data(&mut module, ptx.as_ptr().cast::<c_void>()) })?;
+    let module_guard = CudaModuleGuard {
+        module,
+        unload: *cu_module_unload,
+    };
+
+    let mut function = std::ptr::null_mut();
+    check_cuda(unsafe {
+        cu_module_get_function(&mut function, module, c"gpu_db_cuda_all_mask".as_ptr())
+    })?;
+
+    let mut mask_arg = mask_guard.ptr;
+    let mut row_count_arg = row_count;
+    let mut args = [
+        (&mut mask_arg as *mut u64).cast::<c_void>(),
+        (&mut row_count_arg as *mut u32).cast::<c_void>(),
+    ];
+    let threads_per_block = 128;
+    let blocks = row_count.div_ceil(threads_per_block);
+    check_cuda(unsafe {
+        cu_launch_kernel(
+            function,
+            blocks,
+            1,
+            1,
+            threads_per_block,
+            1,
+            1,
+            0,
+            std::ptr::null_mut(),
+            args.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    })?;
+    check_cuda(unsafe { cu_ctx_synchronize() })?;
+
+    let mut mask = vec![0_u32; mask_len];
+    check_cuda(unsafe {
+        cu_memcpy_dtoh(
+            mask.as_mut_ptr().cast::<c_void>(),
+            mask_guard.ptr,
+            mask_bytes,
+        )
+    })?;
+
+    drop(module_guard);
+    drop(mask_guard);
+    drop(context_guard);
+
+    Ok(mask.into_iter().map(|value| value != 0).collect())
 }
 
 fn launch_cuda_u32_equal_mask(
@@ -2086,6 +2305,10 @@ mod tests {
             runtime.filter_bytes_range_mask(&[b"acct:1".as_slice()], b"acct:", b"acct:9"),
             Err(CudaRuntimeProbeError::DriverLibraryUnavailable)
         );
+        assert_eq!(
+            runtime.filter_all_mask(3),
+            Err(CudaRuntimeProbeError::DriverLibraryUnavailable)
+        );
     }
 
     #[test]
@@ -2123,6 +2346,15 @@ mod tests {
             runtime.filter_equal_u32_mask(&[], 3).unwrap(),
             Vec::<bool>::new()
         );
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn cuda_driver_runtime_filters_all_rows_mask() {
+        let runtime = CudaDriverRuntime::probe().unwrap();
+
+        assert_eq!(runtime.filter_all_mask(4).unwrap(), vec![true; 4]);
+        assert_eq!(runtime.filter_all_mask(0).unwrap(), Vec::<bool>::new());
     }
 
     #[test]

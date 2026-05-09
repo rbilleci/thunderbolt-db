@@ -993,11 +993,14 @@ fn execute_cuda_supported_filter(
     runtime: &CudaDriverRuntime,
     gpu_id: u16,
 ) -> Result<MvccBackendExecution, Vec<ResolvedMvccRow>> {
-    let Some(filter) = query.filter.as_ref() else {
-        return Err(rows);
+    let mask = if let Some(filter) = query.filter.as_ref() {
+        cuda_filter_mask(filter, &rows, runtime).map_err(|_| rows.clone())?
+    } else {
+        runtime
+            .filter_all_mask(rows.len())
+            .map_err(|_| rows.clone())?
     };
 
-    let mask = cuda_filter_mask(filter, &rows, runtime).map_err(|_| rows.clone())?;
     let projection = &query.projection;
     let rows = rows
         .into_iter()
@@ -7617,6 +7620,45 @@ mod tests {
                     source_key: None,
                     key: Some("acct:3".to_string()),
                     value: Some("7".to_string()),
+                },
+            ]
+        );
+        assert_eq!(e.metrics().fallback_total, 0);
+    }
+
+    #[test]
+    #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
+    fn execute_mvcc_query_cuda_driver_runs_filterless_full_scan_without_fallback() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=open").unwrap();
+        e.execute_text(2, "SET acct:2=hold").unwrap();
+
+        let result = e
+            .execute_mvcc_query_with_cuda_driver_probe(&MvccReadQuery {
+                source: MvccReadSource::FullScan,
+                visibility: StorageVisibility { read_txn_id: 2 },
+                filter: None,
+                order: None,
+                projection: MvccProjection::KeyValue,
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.fallback_reason, None);
+        assert_eq!(
+            result.rows,
+            vec![
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("acct:1".to_string()),
+                    value: Some("open".to_string()),
+                },
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("acct:2".to_string()),
+                    value: Some("hold".to_string()),
                 },
             ]
         );
