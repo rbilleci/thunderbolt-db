@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::fmt;
+use std::os::raw::c_void;
 
 use libloading::Library;
 use serde::{Deserialize, Serialize};
@@ -83,6 +84,7 @@ pub enum CudaRuntimeProbeError {
     DriverInitFailed(i32),
     DeviceCountFailed(i32),
     InvalidDeviceCount(i32),
+    KernelLaunchFailed(i32),
 }
 
 impl fmt::Display for CudaRuntimeProbeError {
@@ -94,6 +96,7 @@ impl fmt::Display for CudaRuntimeProbeError {
                 write!(f, "CUDA device count query failed: {code}")
             }
             Self::InvalidDeviceCount(count) => write!(f, "invalid CUDA device count: {count}"),
+            Self::KernelLaunchFailed(code) => write!(f, "CUDA kernel launch failed: {code}"),
         }
     }
 }
@@ -141,6 +144,14 @@ impl CudaDriverRuntime {
 
     pub fn snapshot(&self) -> CudaRuntimeSnapshot {
         self.snapshot.clone()
+    }
+
+    pub fn launch_smoke_add_one(&self, input: u32) -> Result<u32, CudaRuntimeProbeError> {
+        if !self.snapshot.driver_available || self.snapshot.device_count == 0 {
+            return Err(CudaRuntimeProbeError::DriverLibraryUnavailable);
+        }
+
+        launch_cuda_smoke_add_one(input)
     }
 }
 
@@ -255,6 +266,234 @@ fn probe_cuda_runtime_snapshot() -> Result<CudaRuntimeSnapshot, CudaRuntimeProbe
         device_count,
         devices,
     })
+}
+
+fn launch_cuda_smoke_add_one(input: u32) -> Result<u32, CudaRuntimeProbeError> {
+    type CuInit = unsafe extern "C" fn(u32) -> i32;
+    type CuDeviceGet = unsafe extern "C" fn(*mut i32, i32) -> i32;
+    type CuCtxCreate = unsafe extern "C" fn(*mut *mut c_void, u32, i32) -> i32;
+    type CuCtxDestroy = unsafe extern "C" fn(*mut c_void) -> i32;
+    type CuMemAlloc = unsafe extern "C" fn(*mut u64, usize) -> i32;
+    type CuMemFree = unsafe extern "C" fn(u64) -> i32;
+    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+    type CuModuleLoadData = unsafe extern "C" fn(*mut *mut c_void, *const c_void) -> i32;
+    type CuModuleUnload = unsafe extern "C" fn(*mut c_void) -> i32;
+    type CuModuleGetFunction =
+        unsafe extern "C" fn(*mut *mut c_void, *mut c_void, *const i8) -> i32;
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+    type CuCtxSynchronize = unsafe extern "C" fn() -> i32;
+
+    const PTX: &[u8] = br#"
+.version 6.0
+.target sm_30
+.address_size 64
+
+.visible .entry gpu_db_cuda_smoke_add_one(
+    .param .u64 out_ptr,
+    .param .u32 input
+)
+{
+    .reg .u64 %out;
+    .reg .u32 %value;
+    ld.param.u64 %out, [out_ptr];
+    ld.param.u32 %value, [input];
+    add.u32 %value, %value, 1;
+    st.global.u32 [%out], %value;
+    ret;
+}
+"#;
+
+    let lib = unsafe {
+        Library::new("libcuda.so.1")
+            .or_else(|_| Library::new("libcuda.so"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+
+    let cu_init = unsafe {
+        lib.get::<CuInit>(b"cuInit\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_device_get = unsafe {
+        lib.get::<CuDeviceGet>(b"cuDeviceGet\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_ctx_create = unsafe {
+        lib.get::<CuCtxCreate>(b"cuCtxCreate_v2\0")
+            .or_else(|_| lib.get::<CuCtxCreate>(b"cuCtxCreate\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_ctx_destroy = unsafe {
+        lib.get::<CuCtxDestroy>(b"cuCtxDestroy_v2\0")
+            .or_else(|_| lib.get::<CuCtxDestroy>(b"cuCtxDestroy\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_mem_alloc = unsafe {
+        lib.get::<CuMemAlloc>(b"cuMemAlloc_v2\0")
+            .or_else(|_| lib.get::<CuMemAlloc>(b"cuMemAlloc\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_mem_free = unsafe {
+        lib.get::<CuMemFree>(b"cuMemFree_v2\0")
+            .or_else(|_| lib.get::<CuMemFree>(b"cuMemFree\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_memcpy_dtoh = unsafe {
+        lib.get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+            .or_else(|_| lib.get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_module_load_data = unsafe {
+        lib.get::<CuModuleLoadData>(b"cuModuleLoadData\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_module_unload = unsafe {
+        lib.get::<CuModuleUnload>(b"cuModuleUnload\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_module_get_function = unsafe {
+        lib.get::<CuModuleGetFunction>(b"cuModuleGetFunction\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_launch_kernel = unsafe {
+        lib.get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_ctx_synchronize = unsafe {
+        lib.get::<CuCtxSynchronize>(b"cuCtxSynchronize\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+
+    check_cuda(unsafe { cu_init(0) })?;
+
+    let mut device = 0;
+    check_cuda(unsafe { cu_device_get(&mut device, 0) })?;
+
+    let mut context = std::ptr::null_mut();
+    check_cuda(unsafe { cu_ctx_create(&mut context, 0, device) })?;
+    let context_guard = CudaContextGuard {
+        context,
+        destroy: *cu_ctx_destroy,
+    };
+
+    let mut device_output = 0_u64;
+    check_cuda(unsafe { cu_mem_alloc(&mut device_output, std::mem::size_of::<u32>()) })?;
+    let allocation_guard = CudaDeviceAllocationGuard {
+        ptr: device_output,
+        free: *cu_mem_free,
+    };
+
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+
+    let mut module = std::ptr::null_mut();
+    check_cuda(unsafe { cu_module_load_data(&mut module, ptx.as_ptr().cast::<c_void>()) })?;
+    let module_guard = CudaModuleGuard {
+        module,
+        unload: *cu_module_unload,
+    };
+
+    let mut function = std::ptr::null_mut();
+    check_cuda(unsafe {
+        cu_module_get_function(&mut function, module, c"gpu_db_cuda_smoke_add_one".as_ptr())
+    })?;
+
+    let mut output_arg = allocation_guard.ptr;
+    let mut input_arg = input;
+    let mut args = [
+        (&mut output_arg as *mut u64).cast::<c_void>(),
+        (&mut input_arg as *mut u32).cast::<c_void>(),
+    ];
+    check_cuda(unsafe {
+        cu_launch_kernel(
+            function,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            0,
+            std::ptr::null_mut(),
+            args.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    })?;
+    check_cuda(unsafe { cu_ctx_synchronize() })?;
+
+    let mut output = 0_u32;
+    check_cuda(unsafe {
+        cu_memcpy_dtoh(
+            (&mut output as *mut u32).cast::<c_void>(),
+            allocation_guard.ptr,
+            std::mem::size_of::<u32>(),
+        )
+    })?;
+
+    drop(module_guard);
+    drop(allocation_guard);
+    drop(context_guard);
+
+    Ok(output)
+}
+
+fn check_cuda(code: i32) -> Result<(), CudaRuntimeProbeError> {
+    if code == 0 {
+        Ok(())
+    } else {
+        Err(CudaRuntimeProbeError::KernelLaunchFailed(code))
+    }
+}
+
+struct CudaContextGuard {
+    context: *mut c_void,
+    destroy: unsafe extern "C" fn(*mut c_void) -> i32,
+}
+
+impl Drop for CudaContextGuard {
+    fn drop(&mut self) {
+        unsafe {
+            (self.destroy)(self.context);
+        }
+    }
+}
+
+struct CudaDeviceAllocationGuard {
+    ptr: u64,
+    free: unsafe extern "C" fn(u64) -> i32,
+}
+
+impl Drop for CudaDeviceAllocationGuard {
+    fn drop(&mut self) {
+        unsafe {
+            (self.free)(self.ptr);
+        }
+    }
+}
+
+struct CudaModuleGuard {
+    module: *mut c_void,
+    unload: unsafe extern "C" fn(*mut c_void) -> i32,
+}
+
+impl Drop for CudaModuleGuard {
+    fn drop(&mut self) {
+        unsafe {
+            (self.unload)(self.module);
+        }
+    }
 }
 
 pub struct DeviceRouter<R> {
@@ -741,6 +980,16 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_cuda_driver_runtime_rejects_smoke_launch() {
+        let runtime = CudaDriverRuntime::unavailable();
+
+        assert_eq!(
+            runtime.launch_smoke_add_one(41),
+            Err(CudaRuntimeProbeError::DriverLibraryUnavailable)
+        );
+    }
+
+    #[test]
     #[ignore = "requires a local NVIDIA driver and GPU"]
     fn cuda_driver_runtime_probe_reports_local_devices() {
         let runtime = CudaDriverRuntime::probe().unwrap();
@@ -752,6 +1001,14 @@ mod tests {
         assert!(!snapshot.devices[0].name.is_empty());
         assert!(snapshot.devices[0].total_memory_bytes > 0);
         assert_eq!(runtime.can_run(0, &gpu_op(0)), Ok(()));
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn cuda_driver_runtime_launches_smoke_kernel() {
+        let runtime = CudaDriverRuntime::probe().unwrap();
+
+        assert_eq!(runtime.launch_smoke_add_one(41).unwrap(), 42);
     }
 
     #[test]
