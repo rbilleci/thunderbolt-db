@@ -380,8 +380,16 @@ Closeout review recorded on 2026-05-04:
 
 Do not begin with broad acceleration. Land the smallest parity-checkable slice first:
 
+Status update on 2026-05-09:
+- Local NVIDIA hardware is now visible to the loop (`NVIDIA GeForce RTX 3090`, driver `590.48.01`).
+- `gpu_db_execution::CudaDriverRuntime` now probes `libcuda`, initializes the driver, records device count, and plugs into the existing `GpuRuntime`/`DeviceRouter` contract.
+- `CudaMvccExecutionBackend` is attached behind the existing MVCC backend boundary and can be reached through `Engine::execute_mvcc_query_with_cuda_driver_probe(...)`.
+- CUDA kernels are not implemented yet; supported MVCC read shapes must continue to use CPU truth/fallback until scan, visibility filtering, simple predicates, and key lookup are ported behind the existing backend boundary.
+
 1. Add CUDA build targets plus at least one reproducible GPU-capable CI/dev environment.
+   - In progress: local GPU-capable dev environment detected; driver-level runtime probing is implemented.
 2. Implement `CudaBackend` behind the existing backend trait boundary without changing engine-facing contracts.
+   - In progress: backend attachment exists; first-slice kernels still intentionally fall back under `GpuMvccReadParityGap`.
 3. Port only the first operator subset:
    - scan
    - snapshot visibility filtering

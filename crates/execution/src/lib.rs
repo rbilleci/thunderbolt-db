@@ -1,5 +1,7 @@
 use std::collections::BTreeSet;
+use std::fmt;
 
+use libloading::Library;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,6 +60,112 @@ impl GpuRuntimeSnapshot {
 
 pub trait GpuRuntime {
     fn can_run(&self, gpu_id: u16, op: &PlannedOp) -> Result<(), GpuFallbackReason>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CudaRuntimeSnapshot {
+    pub driver_available: bool,
+    pub device_count: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CudaRuntimeProbeError {
+    DriverLibraryUnavailable,
+    DriverInitFailed(i32),
+    DeviceCountFailed(i32),
+    InvalidDeviceCount(i32),
+}
+
+impl fmt::Display for CudaRuntimeProbeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DriverLibraryUnavailable => write!(f, "CUDA driver library is unavailable"),
+            Self::DriverInitFailed(code) => write!(f, "CUDA driver initialization failed: {code}"),
+            Self::DeviceCountFailed(code) => {
+                write!(f, "CUDA device count query failed: {code}")
+            }
+            Self::InvalidDeviceCount(count) => write!(f, "invalid CUDA device count: {count}"),
+        }
+    }
+}
+
+impl std::error::Error for CudaRuntimeProbeError {}
+
+#[derive(Debug, Clone)]
+pub struct CudaDriverRuntime {
+    snapshot: CudaRuntimeSnapshot,
+}
+
+impl CudaDriverRuntime {
+    pub fn probe() -> Result<Self, CudaRuntimeProbeError> {
+        let device_count = probe_cuda_device_count()?;
+        Ok(Self::from_device_count(device_count))
+    }
+
+    pub fn from_device_count(device_count: u16) -> Self {
+        Self {
+            snapshot: CudaRuntimeSnapshot {
+                driver_available: true,
+                device_count,
+            },
+        }
+    }
+
+    pub fn unavailable() -> Self {
+        Self {
+            snapshot: CudaRuntimeSnapshot {
+                driver_available: false,
+                device_count: 0,
+            },
+        }
+    }
+
+    pub fn snapshot(&self) -> CudaRuntimeSnapshot {
+        self.snapshot.clone()
+    }
+}
+
+impl GpuRuntime for CudaDriverRuntime {
+    fn can_run(&self, gpu_id: u16, _op: &PlannedOp) -> Result<(), GpuFallbackReason> {
+        if !self.snapshot.driver_available || gpu_id >= self.snapshot.device_count {
+            return Err(GpuFallbackReason::Unavailable);
+        }
+
+        Ok(())
+    }
+}
+
+fn probe_cuda_device_count() -> Result<u16, CudaRuntimeProbeError> {
+    type CuInit = unsafe extern "C" fn(u32) -> i32;
+    type CuDeviceGetCount = unsafe extern "C" fn(*mut i32) -> i32;
+
+    let lib = unsafe {
+        Library::new("libcuda.so.1")
+            .or_else(|_| Library::new("libcuda.so"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+
+    let cu_init = unsafe {
+        lib.get::<CuInit>(b"cuInit\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_device_get_count = unsafe {
+        lib.get::<CuDeviceGetCount>(b"cuDeviceGetCount\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+
+    let init_code = unsafe { cu_init(0) };
+    if init_code != 0 {
+        return Err(CudaRuntimeProbeError::DriverInitFailed(init_code));
+    }
+
+    let mut count = 0;
+    let count_code = unsafe { cu_device_get_count(&mut count) };
+    if count_code != 0 {
+        return Err(CudaRuntimeProbeError::DeviceCountFailed(count_code));
+    }
+
+    u16::try_from(count).map_err(|_| CudaRuntimeProbeError::InvalidDeviceCount(count))
 }
 
 pub struct DeviceRouter<R> {
@@ -497,6 +605,44 @@ mod tests {
         assert!(snapshot.saturated);
         assert!(snapshot.has_pressure());
         assert_eq!(snapshot.blocked_gpu_ids(), vec![1, 3, 5]);
+    }
+
+    #[test]
+    fn cuda_driver_runtime_routes_only_detected_devices() {
+        let router = DeviceRouter::new(CudaDriverRuntime::from_device_count(1));
+
+        assert_eq!(router.route(&gpu_op(0)), RouteDecision::Gpu(0));
+        assert_eq!(
+            router.route(&gpu_op(1)),
+            RouteDecision::CpuFallback {
+                requested_gpu: 1,
+                reason: GpuFallbackReason::Unavailable,
+            }
+        );
+    }
+
+    #[test]
+    fn unavailable_cuda_driver_runtime_falls_back_cleanly() {
+        let runtime = CudaDriverRuntime::unavailable();
+        let snapshot = runtime.snapshot();
+
+        assert!(!snapshot.driver_available);
+        assert_eq!(snapshot.device_count, 0);
+        assert_eq!(
+            runtime.can_run(0, &gpu_op(0)),
+            Err(GpuFallbackReason::Unavailable)
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn cuda_driver_runtime_probe_reports_local_devices() {
+        let runtime = CudaDriverRuntime::probe().unwrap();
+        let snapshot = runtime.snapshot();
+
+        assert!(snapshot.driver_available);
+        assert!(snapshot.device_count > 0);
+        assert_eq!(runtime.can_run(0, &gpu_op(0)), Ok(()));
     }
 
     #[test]

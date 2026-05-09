@@ -1,4 +1,13 @@
-# Implementation Log (Pre-NVIDIA Phase)
+# Implementation Log
+
+## 2026-05-09
+
+### CUDA hardware onboarding
+- Detected local NVIDIA hardware for the autonomous loop (`NVIDIA GeForce RTX 3090`, driver `590.48.01`) and pivoted from the closed no-GPU queue to the documented first CUDA transition slice.
+- Added a CUDA driver-backed runtime probe in `gpu_db_execution` using `libcuda` dynamic loading. `CudaDriverRuntime::probe()` now initializes the CUDA driver, queries device count, and exposes a deterministic `CudaRuntimeSnapshot`.
+- Added `CudaMvccExecutionBackend` behind the existing MVCC execution-backend boundary plus `Engine::execute_mvcc_query_with_cuda_driver_probe(...)`, preserving the engine-facing `MvccReadQuery` / `MvccReadResult` contract.
+- Kept fallback semantics conservative: the CUDA backend now distinguishes unavailable-driver fallback (`GpuUnavailable`) from present-driver-but-unported-kernel fallback (`GpuMvccReadParityGap`). MVCC read execution still relies on the existing CPU truth path until actual scan/visibility/filter/key-lookup kernels land.
+- Added deterministic execution and engine tests for CUDA routing over detected device counts, unavailable-driver fallback behavior, and explicit first-slice kernel-gap fallback.
 
 ## 2026-05-04
 

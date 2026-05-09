@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 
 use gpu_db_batching::{BatchItem, DualTriggerBatcher, FlushReason};
 use gpu_db_execution::{
-    DeviceRouter, DeviceTarget, FilterOperator, LimitOperator, MockGpuRuntime, Operator,
-    ProjectOperator, RouteDecision, ScanOperator, SortOperator,
+    CudaDriverRuntime, DeviceRouter, DeviceTarget, FilterOperator, LimitOperator, MockGpuRuntime,
+    Operator, PlannedOp, ProjectOperator, RouteDecision, ScanOperator, SortOperator,
 };
 use gpu_db_metrics::{BatchFlushReason, FallbackReason, RuntimeMetrics};
 use gpu_db_observability::{
@@ -933,6 +933,54 @@ impl MvccExecutionBackend for CpuMvccExecutionBackend {
             executed_target: DeviceTarget::Cpu,
             rows: projected,
         })
+    }
+}
+
+struct CudaMvccExecutionBackend {
+    router: DeviceRouter<CudaDriverRuntime>,
+    gpu_id: u16,
+}
+
+impl CudaMvccExecutionBackend {
+    fn new(runtime: CudaDriverRuntime, gpu_id: u16) -> Self {
+        Self {
+            router: DeviceRouter::new(runtime),
+            gpu_id,
+        }
+    }
+}
+
+impl MvccExecutionBackend for CudaMvccExecutionBackend {
+    fn execute(&self, query: &MvccReadQuery, rows: Vec<ResolvedMvccRow>) -> MvccBackendDispatch {
+        let op = PlannedOp {
+            name: "mvcc_read_first_cuda_slice".to_string(),
+            target: DeviceTarget::Gpu(self.gpu_id),
+        };
+
+        match self.router.route(&op) {
+            RouteDecision::Gpu(_) => {}
+            RouteDecision::CpuFallback { reason, .. } => {
+                return MvccBackendDispatch::Fallback {
+                    reason: FallbackReason::from(reason),
+                    rows,
+                };
+            }
+            RouteDecision::Cpu => {
+                unreachable!("CUDA MVCC backend always plans GPU execution")
+            }
+        }
+
+        if first_cuda_slice_query_gap(query).is_some() {
+            return MvccBackendDispatch::Fallback {
+                reason: FallbackReason::GpuMvccReadParityGap,
+                rows,
+            };
+        }
+
+        MvccBackendDispatch::Fallback {
+            reason: FallbackReason::GpuMvccReadParityGap,
+            rows,
+        }
     }
 }
 
@@ -4608,6 +4656,16 @@ impl Engine {
         )
     }
 
+    pub fn execute_mvcc_query_with_cuda_driver_probe(
+        &mut self,
+        query: &MvccReadQuery,
+    ) -> Result<MvccReadResult, ExecuteError> {
+        let runtime =
+            CudaDriverRuntime::probe().unwrap_or_else(|_| CudaDriverRuntime::unavailable());
+        let backend = CudaMvccExecutionBackend::new(runtime, self.planner.default_gpu_id());
+        self.execute_mvcc_query_with_fallback_reason(query, &backend, None)
+    }
+
     #[cfg(test)]
     fn execute_mvcc_query_with_backend<B: MvccExecutionBackend>(
         &mut self,
@@ -7178,6 +7236,78 @@ mod tests {
             ]
         );
         assert_eq!(e.metrics().fallback_total, 0);
+    }
+
+    #[test]
+    fn cuda_mvcc_backend_falls_back_when_driver_is_unavailable() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=open").unwrap();
+        let backend = CudaMvccExecutionBackend::new(CudaDriverRuntime::unavailable(), 0);
+
+        let result = e
+            .execute_mvcc_query_with_backend_fallback(
+                &MvccReadQuery {
+                    source: MvccReadSource::KeyLookup {
+                        key: "acct:1".to_string(),
+                    },
+                    visibility: StorageVisibility { read_txn_id: 1 },
+                    filter: None,
+                    order: None,
+                    projection: MvccProjection::KeyValue,
+                    limit: None,
+                },
+                &backend,
+            )
+            .unwrap();
+
+        assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.executed_target, DeviceTarget::Cpu);
+        assert_eq!(result.fallback_reason, Some(FallbackReason::GpuUnavailable));
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(e.metrics().fallback_for(FallbackReason::GpuUnavailable), 1);
+    }
+
+    #[test]
+    fn cuda_mvcc_backend_keeps_kernel_gap_explicit_until_first_slice_is_ported() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=open").unwrap();
+        let backend = CudaMvccExecutionBackend::new(CudaDriverRuntime::from_device_count(1), 0);
+
+        let result = e
+            .execute_mvcc_query_with_backend_fallback(
+                &MvccReadQuery {
+                    source: MvccReadSource::KeyLookup {
+                        key: "acct:1".to_string(),
+                    },
+                    visibility: StorageVisibility { read_txn_id: 1 },
+                    filter: Some(MvccReadFilter::ValueEquals("open".to_string())),
+                    order: None,
+                    projection: MvccProjection::KeyValue,
+                    limit: None,
+                },
+                &backend,
+            )
+            .unwrap();
+
+        assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.executed_target, DeviceTarget::Cpu);
+        assert_eq!(
+            result.fallback_reason,
+            Some(FallbackReason::GpuMvccReadParityGap)
+        );
+        assert_eq!(
+            result.rows,
+            vec![MvccReadRow {
+                source_key: None,
+                key: Some("acct:1".to_string()),
+                value: Some("open".to_string()),
+            }]
+        );
+        assert_eq!(
+            e.metrics()
+                .fallback_for(FallbackReason::GpuMvccReadParityGap),
+            1
+        );
     }
 
     #[test]
