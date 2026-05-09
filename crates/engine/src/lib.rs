@@ -1021,7 +1021,28 @@ fn execute_cuda_key_range(
         return Err(rows);
     };
     let Some(prefix) = prefix_equivalent_key_range(start_inclusive, end_exclusive) else {
-        return Err(rows);
+        let values = rows
+            .iter()
+            .map(|row| row.tuple.key.as_bytes())
+            .collect::<Vec<_>>();
+        let mask = runtime
+            .filter_bytes_range_mask(
+                &values,
+                start_inclusive.as_bytes(),
+                end_exclusive.as_bytes(),
+            )
+            .map_err(|_| rows.clone())?;
+        let projection = &query.projection;
+        let rows = rows
+            .into_iter()
+            .zip(mask)
+            .filter_map(|(row, matched)| matched.then(|| project_mvcc_row(row, projection)))
+            .collect();
+
+        return Ok(MvccBackendExecution {
+            executed_target: DeviceTarget::Gpu(gpu_id),
+            rows,
+        });
     };
 
     execute_cuda_key_prefix_mask(query, rows, runtime, gpu_id, prefix.as_bytes())
@@ -7433,49 +7454,48 @@ mod tests {
     }
 
     #[test]
-    fn cuda_mvcc_backend_keeps_general_key_range_gap_explicit_until_ported() {
+    #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
+    fn execute_mvcc_query_cuda_driver_runs_general_key_range_filter_without_fallback() {
         let mut e = Engine::new_local();
-        e.execute_text(1, "SET acct:1=open").unwrap();
-        let backend = CudaMvccExecutionBackend::new(CudaDriverRuntime::from_device_count(1), 0);
+        e.execute_text(1, "SET acct:0=cold").unwrap();
+        e.execute_text(2, "SET acct:1=open").unwrap();
+        e.execute_text(3, "SET acct:7=hold").unwrap();
+        e.execute_text(4, "SET acct:9=closed").unwrap();
+        e.execute_text(5, "SET user:1=active").unwrap();
 
         let result = e
-            .execute_mvcc_query_with_backend_fallback(
-                &MvccReadQuery {
-                    source: MvccReadSource::KeyLookup {
-                        key: "acct:1".to_string(),
-                    },
-                    visibility: StorageVisibility { read_txn_id: 1 },
-                    filter: Some(MvccReadFilter::KeyRange {
-                        start_inclusive: "acct:".to_string(),
-                        end_exclusive: "acct:9".to_string(),
-                    }),
-                    order: None,
-                    projection: MvccProjection::KeyValue,
-                    limit: None,
-                },
-                &backend,
-            )
+            .execute_mvcc_query_with_cuda_driver_probe(&MvccReadQuery {
+                source: MvccReadSource::FullScan,
+                visibility: StorageVisibility { read_txn_id: 5 },
+                filter: Some(MvccReadFilter::KeyRange {
+                    start_inclusive: "acct:1".to_string(),
+                    end_exclusive: "acct:9".to_string(),
+                }),
+                order: None,
+                projection: MvccProjection::KeyValue,
+                limit: None,
+            })
             .unwrap();
 
         assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
-        assert_eq!(result.executed_target, DeviceTarget::Cpu);
-        assert_eq!(
-            result.fallback_reason,
-            Some(FallbackReason::GpuMvccReadParityGap)
-        );
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.fallback_reason, None);
         assert_eq!(
             result.rows,
-            vec![MvccReadRow {
-                source_key: None,
-                key: Some("acct:1".to_string()),
-                value: Some("open".to_string()),
-            }]
+            vec![
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("acct:1".to_string()),
+                    value: Some("open".to_string()),
+                },
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("acct:7".to_string()),
+                    value: Some("hold".to_string()),
+                },
+            ]
         );
-        assert_eq!(
-            e.metrics()
-                .fallback_for(FallbackReason::GpuMvccReadParityGap),
-            1
-        );
+        assert_eq!(e.metrics().fallback_total, 0);
     }
 
     #[test]
