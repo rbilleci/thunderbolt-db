@@ -65,7 +65,16 @@ pub trait GpuRuntime {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CudaRuntimeSnapshot {
     pub driver_available: bool,
+    pub driver_version: Option<i32>,
     pub device_count: u16,
+    pub devices: Vec<CudaDeviceSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CudaDeviceSnapshot {
+    pub id: u16,
+    pub name: String,
+    pub total_memory_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,15 +107,23 @@ pub struct CudaDriverRuntime {
 
 impl CudaDriverRuntime {
     pub fn probe() -> Result<Self, CudaRuntimeProbeError> {
-        let device_count = probe_cuda_device_count()?;
-        Ok(Self::from_device_count(device_count))
+        let snapshot = probe_cuda_runtime_snapshot()?;
+        Ok(Self { snapshot })
     }
 
     pub fn from_device_count(device_count: u16) -> Self {
         Self {
             snapshot: CudaRuntimeSnapshot {
                 driver_available: true,
+                driver_version: None,
                 device_count,
+                devices: (0..device_count)
+                    .map(|id| CudaDeviceSnapshot {
+                        id,
+                        name: format!("cuda-device-{id}"),
+                        total_memory_bytes: 0,
+                    })
+                    .collect(),
             },
         }
     }
@@ -115,7 +132,9 @@ impl CudaDriverRuntime {
         Self {
             snapshot: CudaRuntimeSnapshot {
                 driver_available: false,
+                driver_version: None,
                 device_count: 0,
+                devices: Vec::new(),
             },
         }
     }
@@ -135,9 +154,13 @@ impl GpuRuntime for CudaDriverRuntime {
     }
 }
 
-fn probe_cuda_device_count() -> Result<u16, CudaRuntimeProbeError> {
+fn probe_cuda_runtime_snapshot() -> Result<CudaRuntimeSnapshot, CudaRuntimeProbeError> {
     type CuInit = unsafe extern "C" fn(u32) -> i32;
+    type CuDriverGetVersion = unsafe extern "C" fn(*mut i32) -> i32;
     type CuDeviceGetCount = unsafe extern "C" fn(*mut i32) -> i32;
+    type CuDeviceGet = unsafe extern "C" fn(*mut i32, i32) -> i32;
+    type CuDeviceGetName = unsafe extern "C" fn(*mut i8, i32, i32) -> i32;
+    type CuDeviceTotalMem = unsafe extern "C" fn(*mut usize, i32) -> i32;
 
     let lib = unsafe {
         Library::new("libcuda.so.1")
@@ -149,8 +172,25 @@ fn probe_cuda_device_count() -> Result<u16, CudaRuntimeProbeError> {
         lib.get::<CuInit>(b"cuInit\0")
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
+    let cu_driver_get_version = unsafe {
+        lib.get::<CuDriverGetVersion>(b"cuDriverGetVersion\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
     let cu_device_get_count = unsafe {
         lib.get::<CuDeviceGetCount>(b"cuDeviceGetCount\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_device_get = unsafe {
+        lib.get::<CuDeviceGet>(b"cuDeviceGet\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_device_get_name = unsafe {
+        lib.get::<CuDeviceGetName>(b"cuDeviceGetName\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_device_total_mem = unsafe {
+        lib.get::<CuDeviceTotalMem>(b"cuDeviceTotalMem_v2\0")
+            .or_else(|_| lib.get::<CuDeviceTotalMem>(b"cuDeviceTotalMem\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
 
@@ -159,13 +199,62 @@ fn probe_cuda_device_count() -> Result<u16, CudaRuntimeProbeError> {
         return Err(CudaRuntimeProbeError::DriverInitFailed(init_code));
     }
 
+    let mut driver_version = 0;
+    let driver_version_code = unsafe { cu_driver_get_version(&mut driver_version) };
+    let driver_version = if driver_version_code == 0 {
+        Some(driver_version)
+    } else {
+        None
+    };
+
     let mut count = 0;
     let count_code = unsafe { cu_device_get_count(&mut count) };
     if count_code != 0 {
         return Err(CudaRuntimeProbeError::DeviceCountFailed(count_code));
     }
 
-    u16::try_from(count).map_err(|_| CudaRuntimeProbeError::InvalidDeviceCount(count))
+    let device_count =
+        u16::try_from(count).map_err(|_| CudaRuntimeProbeError::InvalidDeviceCount(count))?;
+    let mut devices = Vec::with_capacity(device_count as usize);
+    for id in 0..device_count {
+        let mut device = 0;
+        let device_code = unsafe { cu_device_get(&mut device, i32::from(id)) };
+        if device_code != 0 {
+            return Err(CudaRuntimeProbeError::DeviceCountFailed(device_code));
+        }
+
+        let mut name = [0_i8; 256];
+        let name_code = unsafe { cu_device_get_name(name.as_mut_ptr(), name.len() as i32, device) };
+        if name_code != 0 {
+            return Err(CudaRuntimeProbeError::DeviceCountFailed(name_code));
+        }
+
+        let name = name
+            .iter()
+            .take_while(|byte| **byte != 0)
+            .map(|byte| *byte as u8)
+            .collect::<Vec<_>>();
+        let name = String::from_utf8_lossy(&name).into_owned();
+
+        let mut total_memory_bytes = 0_usize;
+        let memory_code = unsafe { cu_device_total_mem(&mut total_memory_bytes, device) };
+        if memory_code != 0 {
+            return Err(CudaRuntimeProbeError::DeviceCountFailed(memory_code));
+        }
+
+        devices.push(CudaDeviceSnapshot {
+            id,
+            name,
+            total_memory_bytes: total_memory_bytes as u64,
+        });
+    }
+
+    Ok(CudaRuntimeSnapshot {
+        driver_available: true,
+        driver_version,
+        device_count,
+        devices,
+    })
 }
 
 pub struct DeviceRouter<R> {
@@ -622,12 +711,29 @@ mod tests {
     }
 
     #[test]
+    fn cuda_driver_runtime_synthetic_snapshot_tracks_device_slots() {
+        let runtime = CudaDriverRuntime::from_device_count(2);
+        let snapshot = runtime.snapshot();
+
+        assert!(snapshot.driver_available);
+        assert_eq!(snapshot.driver_version, None);
+        assert_eq!(snapshot.device_count, 2);
+        assert_eq!(snapshot.devices.len(), 2);
+        assert_eq!(snapshot.devices[0].id, 0);
+        assert_eq!(snapshot.devices[0].name, "cuda-device-0");
+        assert_eq!(snapshot.devices[0].total_memory_bytes, 0);
+        assert_eq!(snapshot.devices[1].id, 1);
+    }
+
+    #[test]
     fn unavailable_cuda_driver_runtime_falls_back_cleanly() {
         let runtime = CudaDriverRuntime::unavailable();
         let snapshot = runtime.snapshot();
 
         assert!(!snapshot.driver_available);
+        assert_eq!(snapshot.driver_version, None);
         assert_eq!(snapshot.device_count, 0);
+        assert!(snapshot.devices.is_empty());
         assert_eq!(
             runtime.can_run(0, &gpu_op(0)),
             Err(GpuFallbackReason::Unavailable)
@@ -642,6 +748,9 @@ mod tests {
 
         assert!(snapshot.driver_available);
         assert!(snapshot.device_count > 0);
+        assert_eq!(snapshot.devices.len(), snapshot.device_count as usize);
+        assert!(!snapshot.devices[0].name.is_empty());
+        assert!(snapshot.devices[0].total_memory_bytes > 0);
         assert_eq!(runtime.can_run(0, &gpu_op(0)), Ok(()));
     }
 
