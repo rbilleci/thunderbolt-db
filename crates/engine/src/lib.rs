@@ -10989,56 +10989,105 @@ mod tests {
         assert_eq!(e.metrics().fallback_total, 0);
     }
 
+    fn seed_native_composition_rows(e: &mut Engine) {
+        e.execute_text(1, "SET acct:1=open").unwrap();
+        e.execute_text(2, "SET acct:2=hold").unwrap();
+        e.execute_text(3, "SET acct:3=closed").unwrap();
+    }
+
+    fn native_set_composition_cases() -> Vec<(&'static str, MvccReadSource, Vec<&'static str>)> {
+        let left = MvccReadSource::KeyBatchLookup {
+            keys: vec![
+                "acct:1".to_string(),
+                "acct:2".to_string(),
+                "acct:2".to_string(),
+            ],
+        };
+        let right = MvccReadSource::Concat {
+            sources: vec![
+                MvccReadSource::KeyLookup {
+                    key: "acct:2".to_string(),
+                },
+                MvccReadSource::KeyLookup {
+                    key: "acct:3".to_string(),
+                },
+            ],
+        };
+        let sources = || vec![left.clone(), right.clone()];
+
+        vec![
+            (
+                "concat_distinct",
+                MvccReadSource::ConcatDistinct { sources: sources() },
+                vec!["acct:1", "acct:2", "acct:3"],
+            ),
+            (
+                "intersect_distinct",
+                MvccReadSource::IntersectDistinct { sources: sources() },
+                vec!["acct:2"],
+            ),
+            (
+                "intersect_all",
+                MvccReadSource::IntersectAll { sources: sources() },
+                vec!["acct:2"],
+            ),
+            (
+                "except_distinct",
+                MvccReadSource::ExceptDistinct { sources: sources() },
+                vec!["acct:1"],
+            ),
+            (
+                "except_all",
+                MvccReadSource::ExceptAll { sources: sources() },
+                vec!["acct:1", "acct:2"],
+            ),
+            (
+                "symmetric_difference_distinct",
+                MvccReadSource::SymmetricDifferenceDistinct { sources: sources() },
+                vec!["acct:1", "acct:3"],
+            ),
+            (
+                "symmetric_difference_all",
+                MvccReadSource::SymmetricDifferenceAll { sources: sources() },
+                vec!["acct:1", "acct:2", "acct:3"],
+            ),
+        ]
+    }
+
+    fn key_only_rows(keys: &[&str]) -> Vec<MvccReadRow> {
+        keys.iter()
+            .map(|key| MvccReadRow {
+                source_key: None,
+                key: Some((*key).to_string()),
+                value: None,
+            })
+            .collect()
+    }
+
     #[test]
     #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
     fn execute_mvcc_query_cuda_driver_runs_native_set_composition_without_fallback() {
         let mut e = Engine::new_local();
-        e.execute_text(1, "SET acct:1=open").unwrap();
-        e.execute_text(2, "SET acct:2=hold").unwrap();
-        e.execute_text(3, "SET acct:3=closed").unwrap();
+        seed_native_composition_rows(&mut e);
 
-        let result = e
-            .execute_mvcc_query_with_cuda_driver_probe(&MvccReadQuery {
-                source: MvccReadSource::IntersectAll {
-                    sources: vec![
-                        MvccReadSource::KeyBatchLookup {
-                            keys: vec![
-                                "acct:1".to_string(),
-                                "acct:2".to_string(),
-                                "acct:2".to_string(),
-                            ],
-                        },
-                        MvccReadSource::Concat {
-                            sources: vec![
-                                MvccReadSource::KeyLookup {
-                                    key: "acct:2".to_string(),
-                                },
-                                MvccReadSource::KeyLookup {
-                                    key: "acct:3".to_string(),
-                                },
-                            ],
-                        },
-                    ],
-                },
-                visibility: StorageVisibility { read_txn_id: 3 },
-                filter: None,
-                order: Some(MvccReadOrder::KeyAsc),
-                projection: MvccProjection::KeyOnly,
-                limit: None,
-            })
-            .unwrap();
+        for (name, source, expected_keys) in native_set_composition_cases() {
+            let result = e
+                .execute_mvcc_query_with_cuda_driver_probe(&MvccReadQuery {
+                    source,
+                    visibility: StorageVisibility { read_txn_id: 3 },
+                    filter: None,
+                    order: Some(MvccReadOrder::KeyAsc),
+                    projection: MvccProjection::KeyOnly,
+                    limit: None,
+                })
+                .unwrap();
 
-        assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
-        assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
-        assert_eq!(result.fallback_reason, None);
-        assert_eq!(
-            result.rows,
-            vec![MvccReadRow {
-                source_key: None,
-                key: Some("acct:2".to_string()),
-                value: None,
-            }]
-        );
+            assert_eq!(result.planned_target, DeviceTarget::Gpu(0), "{name}");
+            assert_eq!(result.executed_target, DeviceTarget::Gpu(0), "{name}");
+            assert_eq!(result.fallback_reason, None, "{name}");
+            assert_eq!(result.rows, key_only_rows(&expected_keys), "{name}");
+        }
+
         assert_eq!(e.metrics().fallback_total, 0);
     }
 
@@ -11695,32 +11744,51 @@ mod tests {
 
     #[test]
     fn first_cuda_slice_query_gap_accepts_native_set_composition() {
-        let query = MvccReadQuery {
-            source: MvccReadSource::IntersectAll {
-                sources: vec![
-                    MvccReadSource::KeyBatchLookup {
-                        keys: vec!["acct:1".to_string(), "acct:2".to_string()],
-                    },
-                    MvccReadSource::Concat {
-                        sources: vec![
-                            MvccReadSource::KeyLookup {
-                                key: "acct:2".to_string(),
-                            },
-                            MvccReadSource::KeyLookup {
-                                key: "acct:3".to_string(),
-                            },
-                        ],
-                    },
-                ],
-            },
-            visibility: StorageVisibility { read_txn_id: 6 },
-            filter: None,
-            order: Some(MvccReadOrder::KeyAsc),
-            projection: MvccProjection::KeyOnly,
-            limit: None,
-        };
+        for (name, source, _) in native_set_composition_cases() {
+            let query = MvccReadQuery {
+                source,
+                visibility: StorageVisibility { read_txn_id: 6 },
+                filter: None,
+                order: Some(MvccReadOrder::KeyAsc),
+                projection: MvccProjection::KeyOnly,
+                limit: None,
+            };
 
-        assert_eq!(first_cuda_slice_query_gap(&query), None);
+            assert_eq!(first_cuda_slice_query_gap(&query), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_native_set_composition_variants()
+    {
+        for (name, source, expected_keys) in native_set_composition_cases() {
+            let mut cpu_engine = Engine::new_local();
+            seed_native_composition_rows(&mut cpu_engine);
+            let query = MvccReadQuery {
+                source,
+                visibility: StorageVisibility { read_txn_id: 3 },
+                filter: None,
+                order: Some(MvccReadOrder::KeyAsc),
+                projection: MvccProjection::KeyOnly,
+                limit: None,
+            };
+
+            let cpu = cpu_engine.execute_mvcc_query(&query).unwrap();
+            assert_mvcc_query_uses_tracked_cpu_fallback(&cpu_engine, &cpu, 1);
+
+            let mut backend_engine = Engine::new_local();
+            seed_native_composition_rows(&mut backend_engine);
+            let backend = backend_engine
+                .execute_mvcc_query_with_backend_fallback(&query, &FirstCudaSliceParityBackend)
+                .unwrap();
+
+            assert_eq!(backend.planned_target, DeviceTarget::Gpu(0), "{name}");
+            assert_eq!(backend.executed_target, DeviceTarget::Gpu(0), "{name}");
+            assert_eq!(backend.fallback_reason, None, "{name}");
+            assert_eq!(backend.rows, cpu.rows, "{name}");
+            assert_eq!(backend.rows, key_only_rows(&expected_keys), "{name}");
+            assert_eq!(backend_engine.metrics().fallback_total, 0, "{name}");
+        }
     }
 
     #[test]
