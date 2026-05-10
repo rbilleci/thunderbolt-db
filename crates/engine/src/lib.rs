@@ -1152,6 +1152,52 @@ fn cuda_filter_mask(
         | MvccReadFilter::ProvenanceBundlePathSuffixEquals { .. }
         | MvccReadFilter::ProvenanceBundlePathPrefixEquals { .. }
         | MvccReadFilter::ProvenanceBundlePathSliceEquals { .. }
+        | MvccReadFilter::ProvenanceBundlePathFirstOccurrenceAt { .. }
+        | MvccReadFilter::ProvenanceBundlePathFirstOccurrenceWithin { .. }
+        | MvccReadFilter::ProvenanceBundlePathLastOccurrenceAt { .. }
+        | MvccReadFilter::ProvenanceBundlePathLastOccurrenceWithin { .. }
+        | MvccReadFilter::ProvenanceBundlePathOccurrenceAt { .. }
+        | MvccReadFilter::ProvenanceBundlePathOccurrenceWithin { .. }
+        | MvccReadFilter::ProvenanceBundlePathOccurrenceDistance { .. }
+        | MvccReadFilter::ProvenanceBundlePathOccurrenceDistanceWithin { .. }
+        | MvccReadFilter::ProvenanceBundlePathFirstOccurrenceDistance { .. }
+        | MvccReadFilter::ProvenanceBundlePathFirstOccurrenceDistanceWithin { .. }
+        | MvccReadFilter::ProvenanceBundlePathLastOccurrenceDistance { .. }
+        | MvccReadFilter::ProvenanceBundlePathLastOccurrenceDistanceWithin { .. }
+        | MvccReadFilter::ProvenanceBundlePathFirstOccurrenceToOccurrenceDistance { .. }
+        | MvccReadFilter::ProvenanceBundlePathFirstOccurrenceToOccurrenceDistanceWithin {
+            ..
+        }
+        | MvccReadFilter::ProvenanceBundlePathFirstOccurrenceToOccurrenceAt { .. }
+        | MvccReadFilter::ProvenanceBundlePathFirstOccurrenceToOccurrenceWithin { .. }
+        | MvccReadFilter::ProvenanceBundlePathOccurrenceToLastDistance { .. }
+        | MvccReadFilter::ProvenanceBundlePathOccurrenceToLastDistanceWithin { .. }
+        | MvccReadFilter::ProvenanceBundlePathOccurrenceToLastAt { .. }
+        | MvccReadFilter::ProvenanceBundlePathOccurrenceToLastWithin { .. }
+        | MvccReadFilter::ProvenanceBundlePathOccurrencePairAt { .. }
+        | MvccReadFilter::ProvenanceBundlePathOccurrencePairWithin { .. }
+        | MvccReadFilter::ProvenanceBundlePathMixedOccurrenceDistance { .. }
+        | MvccReadFilter::ProvenanceBundlePathMixedOccurrenceDistanceWithin { .. }
+        | MvccReadFilter::ProvenanceBundlePathFirstMixedOccurrenceDistance { .. }
+        | MvccReadFilter::ProvenanceBundlePathFirstMixedOccurrenceDistanceWithin { .. }
+        | MvccReadFilter::ProvenanceBundlePathLastMixedOccurrenceDistance { .. }
+        | MvccReadFilter::ProvenanceBundlePathLastMixedOccurrenceDistanceWithin { .. }
+        | MvccReadFilter::ProvenanceBundlePathFirstMixedOccurrenceToOccurrenceDistance { .. }
+        | MvccReadFilter::ProvenanceBundlePathFirstMixedOccurrenceToOccurrenceDistanceWithin {
+            ..
+        }
+        | MvccReadFilter::ProvenanceBundlePathOccurrenceToLastMixedDistance { .. }
+        | MvccReadFilter::ProvenanceBundlePathOccurrenceToLastMixedDistanceWithin { .. }
+        | MvccReadFilter::ProvenanceBundlePathFirstMixedOccurrenceToOccurrenceAt { .. }
+        | MvccReadFilter::ProvenanceBundlePathFirstMixedOccurrenceToOccurrenceWithin { .. }
+        | MvccReadFilter::ProvenanceBundlePathOccurrenceToLastMixedAt { .. }
+        | MvccReadFilter::ProvenanceBundlePathOccurrenceToLastMixedWithin { .. }
+        | MvccReadFilter::ProvenanceBundlePathMixedOccurrenceAt { .. }
+        | MvccReadFilter::ProvenanceBundlePathMixedOccurrenceWithin { .. }
+        | MvccReadFilter::ProvenanceBundlePathFirstMixedOccurrenceAt { .. }
+        | MvccReadFilter::ProvenanceBundlePathFirstMixedOccurrenceWithin { .. }
+        | MvccReadFilter::ProvenanceBundlePathLastMixedOccurrenceAt { .. }
+        | MvccReadFilter::ProvenanceBundlePathLastMixedOccurrenceWithin { .. }
         | MvccReadFilter::ProvenanceBundlePathSegmentEquals { .. }
         | MvccReadFilter::ProvenanceBundleLenEquals { .. } => {
             cuda_cpu_resolved_filter_mask(rows, runtime, filter)
@@ -1634,6 +1680,52 @@ fn first_cuda_slice_filter_gap(filter: &MvccReadFilter) -> Option<FirstCudaSlice
         | MvccReadFilter::ProvenanceBundlePathSuffixEquals { .. }
         | MvccReadFilter::ProvenanceBundlePathPrefixEquals { .. }
         | MvccReadFilter::ProvenanceBundlePathSliceEquals { .. }
+        | MvccReadFilter::ProvenanceBundlePathFirstOccurrenceAt { .. }
+        | MvccReadFilter::ProvenanceBundlePathFirstOccurrenceWithin { .. }
+        | MvccReadFilter::ProvenanceBundlePathLastOccurrenceAt { .. }
+        | MvccReadFilter::ProvenanceBundlePathLastOccurrenceWithin { .. }
+        | MvccReadFilter::ProvenanceBundlePathOccurrenceAt { .. }
+        | MvccReadFilter::ProvenanceBundlePathOccurrenceWithin { .. }
+        | MvccReadFilter::ProvenanceBundlePathOccurrenceDistance { .. }
+        | MvccReadFilter::ProvenanceBundlePathOccurrenceDistanceWithin { .. }
+        | MvccReadFilter::ProvenanceBundlePathFirstOccurrenceDistance { .. }
+        | MvccReadFilter::ProvenanceBundlePathFirstOccurrenceDistanceWithin { .. }
+        | MvccReadFilter::ProvenanceBundlePathLastOccurrenceDistance { .. }
+        | MvccReadFilter::ProvenanceBundlePathLastOccurrenceDistanceWithin { .. }
+        | MvccReadFilter::ProvenanceBundlePathFirstOccurrenceToOccurrenceDistance { .. }
+        | MvccReadFilter::ProvenanceBundlePathFirstOccurrenceToOccurrenceDistanceWithin {
+            ..
+        }
+        | MvccReadFilter::ProvenanceBundlePathFirstOccurrenceToOccurrenceAt { .. }
+        | MvccReadFilter::ProvenanceBundlePathFirstOccurrenceToOccurrenceWithin { .. }
+        | MvccReadFilter::ProvenanceBundlePathOccurrenceToLastDistance { .. }
+        | MvccReadFilter::ProvenanceBundlePathOccurrenceToLastDistanceWithin { .. }
+        | MvccReadFilter::ProvenanceBundlePathOccurrenceToLastAt { .. }
+        | MvccReadFilter::ProvenanceBundlePathOccurrenceToLastWithin { .. }
+        | MvccReadFilter::ProvenanceBundlePathOccurrencePairAt { .. }
+        | MvccReadFilter::ProvenanceBundlePathOccurrencePairWithin { .. }
+        | MvccReadFilter::ProvenanceBundlePathMixedOccurrenceDistance { .. }
+        | MvccReadFilter::ProvenanceBundlePathMixedOccurrenceDistanceWithin { .. }
+        | MvccReadFilter::ProvenanceBundlePathFirstMixedOccurrenceDistance { .. }
+        | MvccReadFilter::ProvenanceBundlePathFirstMixedOccurrenceDistanceWithin { .. }
+        | MvccReadFilter::ProvenanceBundlePathLastMixedOccurrenceDistance { .. }
+        | MvccReadFilter::ProvenanceBundlePathLastMixedOccurrenceDistanceWithin { .. }
+        | MvccReadFilter::ProvenanceBundlePathFirstMixedOccurrenceToOccurrenceDistance { .. }
+        | MvccReadFilter::ProvenanceBundlePathFirstMixedOccurrenceToOccurrenceDistanceWithin {
+            ..
+        }
+        | MvccReadFilter::ProvenanceBundlePathOccurrenceToLastMixedDistance { .. }
+        | MvccReadFilter::ProvenanceBundlePathOccurrenceToLastMixedDistanceWithin { .. }
+        | MvccReadFilter::ProvenanceBundlePathFirstMixedOccurrenceToOccurrenceAt { .. }
+        | MvccReadFilter::ProvenanceBundlePathFirstMixedOccurrenceToOccurrenceWithin { .. }
+        | MvccReadFilter::ProvenanceBundlePathOccurrenceToLastMixedAt { .. }
+        | MvccReadFilter::ProvenanceBundlePathOccurrenceToLastMixedWithin { .. }
+        | MvccReadFilter::ProvenanceBundlePathMixedOccurrenceAt { .. }
+        | MvccReadFilter::ProvenanceBundlePathMixedOccurrenceWithin { .. }
+        | MvccReadFilter::ProvenanceBundlePathFirstMixedOccurrenceAt { .. }
+        | MvccReadFilter::ProvenanceBundlePathFirstMixedOccurrenceWithin { .. }
+        | MvccReadFilter::ProvenanceBundlePathLastMixedOccurrenceAt { .. }
+        | MvccReadFilter::ProvenanceBundlePathLastMixedOccurrenceWithin { .. }
         | MvccReadFilter::ProvenanceBundlePathSegmentEquals { .. }
         | MvccReadFilter::ProvenanceBundleLenEquals { .. } => None,
         MvccReadFilter::All(filters) | MvccReadFilter::Any(filters) => {
@@ -1666,6 +1758,52 @@ fn cuda_filter_contains_provenance_predicate(filter: &MvccReadFilter) -> bool {
         | MvccReadFilter::ProvenanceBundlePathSuffixEquals { .. }
         | MvccReadFilter::ProvenanceBundlePathPrefixEquals { .. }
         | MvccReadFilter::ProvenanceBundlePathSliceEquals { .. }
+        | MvccReadFilter::ProvenanceBundlePathFirstOccurrenceAt { .. }
+        | MvccReadFilter::ProvenanceBundlePathFirstOccurrenceWithin { .. }
+        | MvccReadFilter::ProvenanceBundlePathLastOccurrenceAt { .. }
+        | MvccReadFilter::ProvenanceBundlePathLastOccurrenceWithin { .. }
+        | MvccReadFilter::ProvenanceBundlePathOccurrenceAt { .. }
+        | MvccReadFilter::ProvenanceBundlePathOccurrenceWithin { .. }
+        | MvccReadFilter::ProvenanceBundlePathOccurrenceDistance { .. }
+        | MvccReadFilter::ProvenanceBundlePathOccurrenceDistanceWithin { .. }
+        | MvccReadFilter::ProvenanceBundlePathFirstOccurrenceDistance { .. }
+        | MvccReadFilter::ProvenanceBundlePathFirstOccurrenceDistanceWithin { .. }
+        | MvccReadFilter::ProvenanceBundlePathLastOccurrenceDistance { .. }
+        | MvccReadFilter::ProvenanceBundlePathLastOccurrenceDistanceWithin { .. }
+        | MvccReadFilter::ProvenanceBundlePathFirstOccurrenceToOccurrenceDistance { .. }
+        | MvccReadFilter::ProvenanceBundlePathFirstOccurrenceToOccurrenceDistanceWithin {
+            ..
+        }
+        | MvccReadFilter::ProvenanceBundlePathFirstOccurrenceToOccurrenceAt { .. }
+        | MvccReadFilter::ProvenanceBundlePathFirstOccurrenceToOccurrenceWithin { .. }
+        | MvccReadFilter::ProvenanceBundlePathOccurrenceToLastDistance { .. }
+        | MvccReadFilter::ProvenanceBundlePathOccurrenceToLastDistanceWithin { .. }
+        | MvccReadFilter::ProvenanceBundlePathOccurrenceToLastAt { .. }
+        | MvccReadFilter::ProvenanceBundlePathOccurrenceToLastWithin { .. }
+        | MvccReadFilter::ProvenanceBundlePathOccurrencePairAt { .. }
+        | MvccReadFilter::ProvenanceBundlePathOccurrencePairWithin { .. }
+        | MvccReadFilter::ProvenanceBundlePathMixedOccurrenceDistance { .. }
+        | MvccReadFilter::ProvenanceBundlePathMixedOccurrenceDistanceWithin { .. }
+        | MvccReadFilter::ProvenanceBundlePathFirstMixedOccurrenceDistance { .. }
+        | MvccReadFilter::ProvenanceBundlePathFirstMixedOccurrenceDistanceWithin { .. }
+        | MvccReadFilter::ProvenanceBundlePathLastMixedOccurrenceDistance { .. }
+        | MvccReadFilter::ProvenanceBundlePathLastMixedOccurrenceDistanceWithin { .. }
+        | MvccReadFilter::ProvenanceBundlePathFirstMixedOccurrenceToOccurrenceDistance { .. }
+        | MvccReadFilter::ProvenanceBundlePathFirstMixedOccurrenceToOccurrenceDistanceWithin {
+            ..
+        }
+        | MvccReadFilter::ProvenanceBundlePathOccurrenceToLastMixedDistance { .. }
+        | MvccReadFilter::ProvenanceBundlePathOccurrenceToLastMixedDistanceWithin { .. }
+        | MvccReadFilter::ProvenanceBundlePathFirstMixedOccurrenceToOccurrenceAt { .. }
+        | MvccReadFilter::ProvenanceBundlePathFirstMixedOccurrenceToOccurrenceWithin { .. }
+        | MvccReadFilter::ProvenanceBundlePathOccurrenceToLastMixedAt { .. }
+        | MvccReadFilter::ProvenanceBundlePathOccurrenceToLastMixedWithin { .. }
+        | MvccReadFilter::ProvenanceBundlePathMixedOccurrenceAt { .. }
+        | MvccReadFilter::ProvenanceBundlePathMixedOccurrenceWithin { .. }
+        | MvccReadFilter::ProvenanceBundlePathFirstMixedOccurrenceAt { .. }
+        | MvccReadFilter::ProvenanceBundlePathFirstMixedOccurrenceWithin { .. }
+        | MvccReadFilter::ProvenanceBundlePathLastMixedOccurrenceAt { .. }
+        | MvccReadFilter::ProvenanceBundlePathLastMixedOccurrenceWithin { .. }
         | MvccReadFilter::ProvenanceBundlePathSegmentEquals { .. }
         | MvccReadFilter::ProvenanceBundleLenEquals { .. } => true,
         MvccReadFilter::All(filters) | MvccReadFilter::Any(filters) => filters
@@ -7875,6 +8013,40 @@ mod tests {
     }
 
     #[test]
+    fn first_cuda_slice_query_gap_accepts_provenance_bundle_occurrence_path_filters() {
+        let mut query = first_cuda_slice_support_query();
+        query.source = MvccReadSource::FollowValueChain {
+            keys: vec!["acct:1".to_string()],
+            plan: MvccValueChainPlan {
+                value_key_hops: 3,
+                terminal: MvccValueChainTerminal::CurrentRow,
+            },
+            provenance: MvccSourceProvenance::Seed,
+        };
+        query.filter = Some(MvccReadFilter::All(vec![
+            MvccReadFilter::ProvenanceBundlePathOccurrenceDistance {
+                bundle: MvccProvenanceFrameBundle::FullPath,
+                summary: MvccProvenanceSummary::KeyPath,
+                left_occurrence_index: 0,
+                right_occurrence_index: 1,
+                distance: 3,
+                expected: vec!["acct:1".to_string()],
+            },
+            MvccReadFilter::ProvenanceBundlePathMixedOccurrenceDistance {
+                bundle: MvccProvenanceFrameBundle::FullPath,
+                summary: MvccProvenanceSummary::KeyPath,
+                left_occurrence_index: 0,
+                left_expected: vec!["acct:1".to_string(), "profile:1".to_string()],
+                right_occurrence_index: 0,
+                right_expected: vec!["team:alpha".to_string(), "acct:1".to_string()],
+                distance: 2,
+            },
+        ]));
+
+        assert_eq!(first_cuda_slice_query_gap(&query), None);
+    }
+
+    #[test]
     fn first_cuda_slice_gap_labels_are_stable_for_docs_and_future_routing() {
         assert_eq!(
             FirstCudaSliceGap::UnsupportedSource.label(),
@@ -8838,6 +9010,67 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
+    fn execute_mvcc_query_cuda_driver_runs_provenance_bundle_occurrence_path_filters_without_fallback(
+    ) {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=profile:1").unwrap();
+        e.execute_text(2, "SET profile:1=team:alpha").unwrap();
+        e.execute_text(3, "SET team:alpha=acct:1").unwrap();
+        e.execute_text(4, "SET acct:2=profile:2").unwrap();
+        e.execute_text(5, "SET profile:2=team:beta").unwrap();
+
+        let result = e
+            .execute_mvcc_query_with_cuda_driver_probe(&MvccReadQuery {
+                source: MvccReadSource::FollowValueChain {
+                    keys: vec!["acct:1".to_string(), "acct:2".to_string()],
+                    plan: MvccValueChainPlan {
+                        value_key_hops: 3,
+                        terminal: MvccValueChainTerminal::CurrentRow,
+                    },
+                    provenance: MvccSourceProvenance::Seed,
+                },
+                visibility: StorageVisibility { read_txn_id: 5 },
+                filter: Some(MvccReadFilter::All(vec![
+                    MvccReadFilter::ProvenanceBundlePathOccurrenceDistance {
+                        bundle: MvccProvenanceFrameBundle::FullPath,
+                        summary: MvccProvenanceSummary::KeyPath,
+                        left_occurrence_index: 0,
+                        right_occurrence_index: 1,
+                        distance: 3,
+                        expected: vec!["acct:1".to_string()],
+                    },
+                    MvccReadFilter::ProvenanceBundlePathMixedOccurrenceDistance {
+                        bundle: MvccProvenanceFrameBundle::FullPath,
+                        summary: MvccProvenanceSummary::KeyPath,
+                        left_occurrence_index: 0,
+                        left_expected: vec!["acct:1".to_string(), "profile:1".to_string()],
+                        right_occurrence_index: 0,
+                        right_expected: vec!["team:alpha".to_string(), "acct:1".to_string()],
+                        distance: 2,
+                    },
+                ])),
+                order: None,
+                projection: MvccProjection::KeyValue,
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.fallback_reason, None);
+        assert_eq!(
+            result.rows,
+            vec![MvccReadRow {
+                source_key: Some("acct:1".to_string()),
+                key: Some("acct:1".to_string()),
+                value: Some("profile:1".to_string()),
+            }]
+        );
+        assert_eq!(e.metrics().fallback_total, 0);
+    }
+
+    #[test]
     fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_supported_lookup_fixture() {
         let mut e = Engine::new_local();
         for (txn_id, command) in include_str!("../../../tests/fixtures/mvcc-read-workload.txt")
@@ -9170,6 +9403,74 @@ mod tests {
                 source_key: Some("acct:1".to_string()),
                 key: Some("team:beta".to_string()),
                 value: Some("member:2".to_string()),
+            }]
+        );
+        assert_eq!(e.metrics().fallback_total, 1);
+    }
+
+    #[test]
+    fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_provenance_bundle_occurrence_path_filters(
+    ) {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=profile:1").unwrap();
+        e.execute_text(2, "SET profile:1=team:alpha").unwrap();
+        e.execute_text(3, "SET team:alpha=acct:1").unwrap();
+        e.execute_text(4, "SET acct:2=profile:2").unwrap();
+        e.execute_text(5, "SET profile:2=team:beta").unwrap();
+
+        let query = MvccReadQuery {
+            source: MvccReadSource::FollowValueChain {
+                keys: vec!["acct:1".to_string(), "acct:2".to_string()],
+                plan: MvccValueChainPlan {
+                    value_key_hops: 3,
+                    terminal: MvccValueChainTerminal::CurrentRow,
+                },
+                provenance: MvccSourceProvenance::Seed,
+            },
+            visibility: StorageVisibility { read_txn_id: 5 },
+            filter: Some(MvccReadFilter::All(vec![
+                MvccReadFilter::ProvenanceBundlePathOccurrenceDistance {
+                    bundle: MvccProvenanceFrameBundle::FullPath,
+                    summary: MvccProvenanceSummary::KeyPath,
+                    left_occurrence_index: 0,
+                    right_occurrence_index: 1,
+                    distance: 3,
+                    expected: vec!["acct:1".to_string()],
+                },
+                MvccReadFilter::ProvenanceBundlePathMixedOccurrenceDistance {
+                    bundle: MvccProvenanceFrameBundle::FullPath,
+                    summary: MvccProvenanceSummary::KeyPath,
+                    left_occurrence_index: 0,
+                    left_expected: vec!["acct:1".to_string(), "profile:1".to_string()],
+                    right_occurrence_index: 0,
+                    right_expected: vec!["team:alpha".to_string(), "acct:1".to_string()],
+                    distance: 2,
+                },
+            ])),
+            order: None,
+            projection: MvccProjection::KeyValue,
+            limit: None,
+        };
+
+        assert_eq!(first_cuda_slice_query_gap(&query), None);
+
+        let cpu = e.execute_mvcc_query(&query).unwrap();
+        assert_mvcc_query_uses_tracked_cpu_fallback(&e, &cpu, 1);
+
+        let backend = e
+            .execute_mvcc_query_with_backend_fallback(&query, &FirstCudaSliceParityBackend)
+            .unwrap();
+
+        assert_eq!(backend.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(backend.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(backend.fallback_reason, None);
+        assert_eq!(backend.rows, cpu.rows);
+        assert_eq!(
+            backend.rows,
+            vec![MvccReadRow {
+                source_key: Some("acct:1".to_string()),
+                key: Some("acct:1".to_string()),
+                value: Some("profile:1".to_string()),
             }]
         );
         assert_eq!(e.metrics().fallback_total, 1);
