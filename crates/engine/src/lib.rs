@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::str::FromStr;
@@ -1687,7 +1688,7 @@ fn execute_cuda_native_key_batch_query(
             visibility: query.visibility,
             filter: query.filter.clone(),
             order: None,
-            projection: query.projection.clone(),
+            projection: MvccProjection::KeyValue,
             limit: None,
         };
         match backend.execute(&lookup_query, all_version_rows.clone()) {
@@ -1696,9 +1697,18 @@ fn execute_cuda_native_key_batch_query(
         }
     }
 
+    if let Some(order) = query.order.as_ref() {
+        sort_projected_key_value_rows(&mut rows, order);
+    }
+
     if let Some(limit) = query.limit {
         rows.truncate(limit);
     }
+
+    let rows = rows
+        .into_iter()
+        .map(|row| project_key_value_read_row(row, &query.projection))
+        .collect();
 
     Ok(FinalizedMvccBackendExecution {
         executed_target: DeviceTarget::Gpu(backend.gpu_id),
@@ -1720,7 +1730,7 @@ fn execute_cuda_native_concat_query(
             visibility: query.visibility,
             filter: query.filter.clone(),
             order: None,
-            projection: query.projection.clone(),
+            projection: MvccProjection::KeyValue,
             limit: None,
         };
         let execution = match source {
@@ -1739,15 +1749,51 @@ fn execute_cuda_native_concat_query(
         rows.extend(execution.rows);
     }
 
+    if let Some(order) = query.order.as_ref() {
+        sort_projected_key_value_rows(&mut rows, order);
+    }
+
     if let Some(limit) = query.limit {
         rows.truncate(limit);
     }
+
+    let rows = rows
+        .into_iter()
+        .map(|row| project_key_value_read_row(row, &query.projection))
+        .collect();
 
     Ok(FinalizedMvccBackendExecution {
         executed_target: DeviceTarget::Gpu(backend.gpu_id),
         fallback_reason: None,
         rows,
     })
+}
+
+fn sort_projected_key_value_rows(rows: &mut [MvccReadRow], order: &MvccReadOrder) {
+    rows.sort_by(|left, right| match order {
+        MvccReadOrder::KeyAsc => left.key.cmp(&right.key),
+        MvccReadOrder::KeyDesc => right.key.cmp(&left.key),
+        MvccReadOrder::ValueAsc => left.value.cmp(&right.value),
+        MvccReadOrder::ValueDesc => right.value.cmp(&left.value),
+        _ => Ordering::Equal,
+    });
+}
+
+fn project_key_value_read_row(row: MvccReadRow, projection: &MvccProjection) -> MvccReadRow {
+    match projection {
+        MvccProjection::KeyValue => row,
+        MvccProjection::KeyOnly => MvccReadRow {
+            source_key: row.source_key,
+            key: row.key,
+            value: None,
+        },
+        MvccProjection::ValueOnly => MvccReadRow {
+            source_key: row.source_key,
+            key: None,
+            value: row.value,
+        },
+        _ => row,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2023,9 +2069,22 @@ fn is_cuda_order_supported(query: &MvccReadQuery, order: &MvccReadOrder) -> bool
             | MvccReadOrder::ValueAsc
             | MvccReadOrder::ValueDesc
     ) && matches!(
-        query.source,
-        MvccReadSource::FullScan | MvccReadSource::KeyLookup { .. }
+        &query.source,
+        MvccReadSource::FullScan
+            | MvccReadSource::KeyLookup { .. }
+            | MvccReadSource::KeyBatchLookup { .. }
     ) {
+        return true;
+    }
+
+    if matches!(
+        order,
+        MvccReadOrder::KeyAsc
+            | MvccReadOrder::KeyDesc
+            | MvccReadOrder::ValueAsc
+            | MvccReadOrder::ValueDesc
+    ) && is_cuda_native_concat_source(&query.source)
+    {
         return true;
     }
 
@@ -8145,10 +8204,7 @@ mod tests {
         query.source = MvccReadSource::KeyBatchLookup {
             keys: vec!["acct:1".to_string(), "acct:2".to_string()],
         };
-        assert_eq!(
-            first_cuda_slice_query_gap(&query),
-            Some(FirstCudaSliceGap::UnsupportedOrder)
-        );
+        assert_eq!(first_cuda_slice_query_gap(&query), None);
 
         query.source = MvccReadSource::FullScan;
         query.order = Some(MvccReadOrder::ValueAsc);
@@ -9095,6 +9151,61 @@ mod tests {
                     source_key: None,
                     key: Some("acct:2".to_string()),
                     value: Some("pending".to_string()),
+                },
+            ]
+        );
+        assert_eq!(e.metrics().fallback_total, 0);
+    }
+
+    #[test]
+    #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
+    fn execute_mvcc_query_cuda_driver_runs_fan_in_order_without_fallback() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=open").unwrap();
+        e.execute_text(2, "SET acct:2=closed").unwrap();
+        e.execute_text(3, "SET acct:3=pending").unwrap();
+        e.execute_text(4, "SET acct:4=archived").unwrap();
+
+        let result = e
+            .execute_mvcc_query_with_cuda_driver_probe(&MvccReadQuery {
+                source: MvccReadSource::Concat {
+                    sources: vec![
+                        MvccReadSource::KeyBatchLookup {
+                            keys: vec!["acct:3".to_string(), "acct:1".to_string()],
+                        },
+                        MvccReadSource::KeyLookup {
+                            key: "acct:4".to_string(),
+                        },
+                    ],
+                },
+                visibility: StorageVisibility { read_txn_id: 4 },
+                filter: Some(MvccReadFilter::KeyPrefix("acct:".to_string())),
+                order: Some(MvccReadOrder::ValueAsc),
+                projection: MvccProjection::KeyOnly,
+                limit: Some(3),
+            })
+            .unwrap();
+
+        assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.fallback_reason, None);
+        assert_eq!(
+            result.rows,
+            vec![
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("acct:4".to_string()),
+                    value: None,
+                },
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("acct:1".to_string()),
+                    value: None,
+                },
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("acct:3".to_string()),
+                    value: None,
                 },
             ]
         );
@@ -10462,6 +10573,100 @@ mod tests {
                     source_key: None,
                     key: Some("acct:2".to_string()),
                     value: Some("pending".to_string()),
+                },
+            ]
+        );
+        assert_eq!(e.metrics().fallback_total, 1);
+    }
+
+    #[test]
+    fn first_cuda_slice_query_gap_accepts_fan_in_order_for_native_sources() {
+        let key_batch = MvccReadQuery {
+            source: MvccReadSource::KeyBatchLookup {
+                keys: vec!["acct:3".to_string(), "acct:1".to_string()],
+            },
+            visibility: StorageVisibility { read_txn_id: 4 },
+            filter: Some(MvccReadFilter::KeyPrefix("acct:".to_string())),
+            order: Some(MvccReadOrder::ValueAsc),
+            projection: MvccProjection::KeyOnly,
+            limit: Some(2),
+        };
+        assert_eq!(first_cuda_slice_query_gap(&key_batch), None);
+
+        let concat = MvccReadQuery {
+            source: MvccReadSource::Concat {
+                sources: vec![
+                    MvccReadSource::KeyBatchLookup {
+                        keys: vec!["acct:3".to_string(), "acct:1".to_string()],
+                    },
+                    MvccReadSource::KeyLookup {
+                        key: "acct:4".to_string(),
+                    },
+                ],
+            },
+            visibility: StorageVisibility { read_txn_id: 4 },
+            filter: Some(MvccReadFilter::KeyPrefix("acct:".to_string())),
+            order: Some(MvccReadOrder::ValueAsc),
+            projection: MvccProjection::KeyOnly,
+            limit: Some(3),
+        };
+        assert_eq!(first_cuda_slice_query_gap(&concat), None);
+    }
+
+    #[test]
+    fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_fan_in_order() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=open").unwrap();
+        e.execute_text(2, "SET acct:2=closed").unwrap();
+        e.execute_text(3, "SET acct:3=pending").unwrap();
+        e.execute_text(4, "SET acct:4=archived").unwrap();
+
+        let query = MvccReadQuery {
+            source: MvccReadSource::Concat {
+                sources: vec![
+                    MvccReadSource::KeyBatchLookup {
+                        keys: vec!["acct:3".to_string(), "acct:1".to_string()],
+                    },
+                    MvccReadSource::KeyLookup {
+                        key: "acct:4".to_string(),
+                    },
+                ],
+            },
+            visibility: StorageVisibility { read_txn_id: 4 },
+            filter: Some(MvccReadFilter::KeyPrefix("acct:".to_string())),
+            order: Some(MvccReadOrder::ValueAsc),
+            projection: MvccProjection::KeyOnly,
+            limit: Some(3),
+        };
+
+        let cpu = e.execute_mvcc_query(&query).unwrap();
+        assert_mvcc_query_uses_tracked_cpu_fallback(&e, &cpu, 1);
+
+        let backend = e
+            .execute_mvcc_query_with_backend_fallback(&query, &FirstCudaSliceParityBackend)
+            .unwrap();
+
+        assert_eq!(backend.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(backend.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(backend.fallback_reason, None);
+        assert_eq!(backend.rows, cpu.rows);
+        assert_eq!(
+            backend.rows,
+            vec![
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("acct:4".to_string()),
+                    value: None,
+                },
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("acct:1".to_string()),
+                    value: None,
+                },
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("acct:3".to_string()),
+                    value: None,
                 },
             ]
         );
