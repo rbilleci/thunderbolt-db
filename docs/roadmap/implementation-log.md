@@ -1,5 +1,10 @@
 # Implementation Log
 
+## 2026-05-11
+
+### CUDA native composition
+- Added CUDA source-resolution routing for native distinct/intersect/except/symmetric-difference MVCC sources whose children are already CUDA-resolvable. Each child now selects rows through CUDA source/visibility masks before the existing host set/multiset semantics and downstream CUDA filter/order/projection path run, leaving fully device-side set algebra as a future performance-only optimization.
+
 ## 2026-05-10
 
 ### CUDA completion gate 2

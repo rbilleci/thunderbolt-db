@@ -1135,6 +1135,9 @@ fn cuda_source_mask(
             }
             Ok(combined)
         }
+        source if is_cuda_native_composition_source(source) => {
+            runtime.filter_all_mask(rows.len()).map_err(|_| ())
+        }
         source if is_cuda_cpu_resolved_source(source) => {
             runtime.filter_all_mask(rows.len()).map_err(|_| ())
         }
@@ -1767,6 +1770,343 @@ fn execute_cuda_native_concat_query(
         fallback_reason: None,
         rows,
     })
+}
+
+fn execute_cuda_native_composition_query(
+    query: &MvccReadQuery,
+    source: &MvccReadSource,
+    all_version_rows: Vec<ResolvedMvccRow>,
+    backend: &CudaMvccExecutionBackend,
+) -> Result<FinalizedMvccBackendExecution, FallbackReason> {
+    let runtime = ensure_cuda_backend_available(backend)?;
+    let rows =
+        resolve_cuda_native_composition_rows(source, &all_version_rows, query.visibility, runtime)?;
+
+    match backend.execute(query, rows) {
+        MvccBackendDispatch::Executed(executed) => Ok(FinalizedMvccBackendExecution {
+            executed_target: executed.executed_target,
+            fallback_reason: None,
+            rows: executed.rows,
+        }),
+        MvccBackendDispatch::Fallback { reason, .. } => Err(reason),
+    }
+}
+
+fn resolve_cuda_native_source_rows(
+    source: &MvccReadSource,
+    all_version_rows: &[ResolvedMvccRow],
+    visibility: StorageVisibility,
+    runtime: &CudaDriverRuntime,
+) -> Result<Vec<ResolvedMvccRow>, FallbackReason> {
+    match source {
+        MvccReadSource::FullScan => {
+            let visibility_mask =
+                cuda_visibility_mask(all_version_rows, visibility.read_txn_id, runtime)
+                    .map_err(|_| FallbackReason::GpuMvccReadParityGap)?;
+            Ok(all_version_rows
+                .iter()
+                .zip(visibility_mask)
+                .filter(|(_, visible)| *visible)
+                .map(|(row, _)| row.clone())
+                .collect())
+        }
+        MvccReadSource::KeyLookup { key } => {
+            Ok(
+                cuda_visible_key_rows(all_version_rows, key, visibility, runtime)?
+                    .into_iter()
+                    .map(resolved_row_from_tuple)
+                    .collect(),
+            )
+        }
+        MvccReadSource::KeyBatchLookup { keys } => {
+            let mut rows = Vec::new();
+            for key in keys {
+                rows.extend(
+                    cuda_visible_key_rows(all_version_rows, key, visibility, runtime)?
+                        .into_iter()
+                        .map(resolved_row_from_tuple),
+                );
+            }
+            Ok(rows)
+        }
+        MvccReadSource::Concat { sources } => {
+            let mut rows = Vec::new();
+            for source in sources {
+                rows.extend(resolve_cuda_native_source_rows(
+                    source,
+                    all_version_rows,
+                    visibility,
+                    runtime,
+                )?);
+            }
+            Ok(rows)
+        }
+        MvccReadSource::FollowValueChain {
+            keys,
+            plan,
+            provenance,
+        } => resolve_cuda_native_follow_value_chain_rows(
+            all_version_rows,
+            keys,
+            visibility,
+            *plan,
+            *provenance,
+            runtime,
+        ),
+        MvccReadSource::FollowValueChainBranches {
+            keys,
+            plans,
+            fan_in,
+            provenance,
+        } => resolve_cuda_native_follow_value_chain_branches_rows(
+            all_version_rows,
+            keys,
+            visibility,
+            plans,
+            *fan_in,
+            *provenance,
+            runtime,
+        ),
+        MvccReadSource::FollowValueChainLabeledBranches {
+            keys,
+            branches,
+            fan_in,
+            provenance,
+        } => resolve_cuda_native_follow_value_chain_labeled_branches_rows(
+            all_version_rows,
+            keys,
+            visibility,
+            branches,
+            *fan_in,
+            *provenance,
+            runtime,
+        ),
+        source if is_cuda_native_composition_source(source) => {
+            resolve_cuda_native_composition_rows(source, all_version_rows, visibility, runtime)
+        }
+        _ => Err(FallbackReason::GpuMvccReadParityGap),
+    }
+}
+
+fn resolved_row_from_tuple(tuple: TupleVersion) -> ResolvedMvccRow {
+    ResolvedMvccRow {
+        branch_label: None,
+        source_key: None,
+        source_tuple: None,
+        provenance_path: None,
+        terminal_input_index: None,
+        tuple,
+    }
+}
+
+fn resolve_cuda_native_composition_rows(
+    source: &MvccReadSource,
+    all_version_rows: &[ResolvedMvccRow],
+    visibility: StorageVisibility,
+    runtime: &CudaDriverRuntime,
+) -> Result<Vec<ResolvedMvccRow>, FallbackReason> {
+    let sources = match source {
+        MvccReadSource::ConcatDistinct { sources }
+        | MvccReadSource::IntersectDistinct { sources }
+        | MvccReadSource::IntersectAll { sources }
+        | MvccReadSource::ExceptDistinct { sources }
+        | MvccReadSource::ExceptAll { sources }
+        | MvccReadSource::SymmetricDifferenceDistinct { sources }
+        | MvccReadSource::SymmetricDifferenceAll { sources } => sources,
+        _ => return Err(FallbackReason::GpuMvccReadParityGap),
+    };
+
+    let resolved_sources = sources
+        .iter()
+        .map(|source| {
+            resolve_cuda_native_source_rows(source, all_version_rows, visibility, runtime)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(compose_resolved_mvcc_rows(source, resolved_sources))
+}
+
+fn compose_resolved_mvcc_rows(
+    source: &MvccReadSource,
+    resolved_sources: Vec<Vec<ResolvedMvccRow>>,
+) -> Vec<ResolvedMvccRow> {
+    match source {
+        MvccReadSource::ConcatDistinct { .. } => {
+            let mut rows = Vec::new();
+            let mut seen = BTreeSet::new();
+            for source_rows in resolved_sources {
+                for row in source_rows {
+                    if seen.insert(resolved_mvcc_row_key(&row)) {
+                        rows.push(row);
+                    }
+                }
+            }
+            rows
+        }
+        MvccReadSource::IntersectDistinct { .. } => {
+            let mut sources_iter = resolved_sources.into_iter();
+            let Some(first_rows) = sources_iter.next() else {
+                return Vec::new();
+            };
+            let remaining_sets = sources_iter
+                .map(|rows| {
+                    rows.into_iter()
+                        .map(|row| resolved_mvcc_row_key(&row))
+                        .collect::<BTreeSet<_>>()
+                })
+                .collect::<Vec<_>>();
+
+            let mut intersection = Vec::new();
+            let mut emitted = BTreeSet::new();
+            'rows: for row in first_rows {
+                let key = resolved_mvcc_row_key(&row);
+                if !emitted.insert(key.clone()) {
+                    continue;
+                }
+                for other in &remaining_sets {
+                    if !other.contains(&key) {
+                        continue 'rows;
+                    }
+                }
+                intersection.push(row);
+            }
+            intersection
+        }
+        MvccReadSource::IntersectAll { .. } => {
+            let mut sources_iter = resolved_sources.into_iter();
+            let Some(first_rows) = sources_iter.next() else {
+                return Vec::new();
+            };
+            let remaining_counts = sources_iter
+                .map(|rows| {
+                    let mut counts = BTreeMap::new();
+                    for key in rows.into_iter().map(|row| resolved_mvcc_row_key(&row)) {
+                        *counts.entry(key).or_insert(0usize) += 1;
+                    }
+                    counts
+                })
+                .collect::<Vec<_>>();
+
+            let mut consumed = BTreeMap::new();
+            let mut intersection = Vec::new();
+            'rows: for row in first_rows {
+                let key = resolved_mvcc_row_key(&row);
+                let next_count = consumed.get(&key).copied().unwrap_or(0) + 1;
+                for counts in &remaining_counts {
+                    if counts.get(&key).copied().unwrap_or(0) < next_count {
+                        continue 'rows;
+                    }
+                }
+                consumed.insert(key, next_count);
+                intersection.push(row);
+            }
+            intersection
+        }
+        MvccReadSource::ExceptDistinct { .. } => {
+            let mut sources_iter = resolved_sources.into_iter();
+            let Some(first_rows) = sources_iter.next() else {
+                return Vec::new();
+            };
+            let exclusion_set = sources_iter
+                .flat_map(|rows| rows.into_iter().map(|row| resolved_mvcc_row_key(&row)))
+                .collect::<BTreeSet<_>>();
+
+            let mut difference = Vec::new();
+            let mut emitted = BTreeSet::new();
+            for row in first_rows {
+                let key = resolved_mvcc_row_key(&row);
+                if !emitted.insert(key.clone()) || exclusion_set.contains(&key) {
+                    continue;
+                }
+                difference.push(row);
+            }
+            difference
+        }
+        MvccReadSource::ExceptAll { .. } => {
+            let mut sources_iter = resolved_sources.into_iter();
+            let Some(first_rows) = sources_iter.next() else {
+                return Vec::new();
+            };
+            let mut exclusion_counts = BTreeMap::new();
+            for rows in sources_iter {
+                for key in rows.into_iter().map(|row| resolved_mvcc_row_key(&row)) {
+                    *exclusion_counts.entry(key).or_insert(0usize) += 1;
+                }
+            }
+
+            let mut consumed = BTreeMap::new();
+            let mut difference = Vec::new();
+            for row in first_rows {
+                let key = resolved_mvcc_row_key(&row);
+                let next_count = consumed.get(&key).copied().unwrap_or(0) + 1;
+                consumed.insert(key.clone(), next_count);
+                if exclusion_counts.get(&key).copied().unwrap_or(0) >= next_count {
+                    continue;
+                }
+                difference.push(row);
+            }
+            difference
+        }
+        MvccReadSource::SymmetricDifferenceDistinct { .. } => {
+            let mut presence_counts = BTreeMap::new();
+            for rows in &resolved_sources {
+                let per_source = rows
+                    .iter()
+                    .map(resolved_mvcc_row_key)
+                    .collect::<BTreeSet<_>>();
+                for key in per_source {
+                    *presence_counts.entry(key).or_insert(0usize) += 1;
+                }
+            }
+
+            let mut output = Vec::new();
+            let mut emitted = BTreeSet::new();
+            for rows in resolved_sources {
+                for row in rows {
+                    let key = resolved_mvcc_row_key(&row);
+                    if presence_counts.get(&key) == Some(&1) && emitted.insert(key) {
+                        output.push(row);
+                    }
+                }
+            }
+            output
+        }
+        MvccReadSource::SymmetricDifferenceAll { .. } => {
+            let mut remaining = BTreeMap::new();
+            for rows in &resolved_sources {
+                let mut source_counts = BTreeMap::new();
+                for key in rows.iter().map(resolved_mvcc_row_key) {
+                    *source_counts.entry(key).or_insert(0usize) += 1;
+                }
+                for (key, count) in source_counts {
+                    let current = remaining.remove(&key).unwrap_or(0);
+                    if current >= count {
+                        let next = current - count;
+                        if next > 0 {
+                            remaining.insert(key, next);
+                        }
+                    } else {
+                        remaining.insert(key, count - current);
+                    }
+                }
+            }
+
+            let mut output = Vec::new();
+            for rows in resolved_sources {
+                for row in rows {
+                    let key = resolved_mvcc_row_key(&row);
+                    if let Some(count) = remaining.get_mut(&key) {
+                        if *count > 0 {
+                            output.push(row);
+                            *count -= 1;
+                        }
+                    }
+                }
+            }
+            output
+        }
+        _ => Vec::new(),
+    }
 }
 
 fn ensure_cuda_backend_available(
@@ -2420,6 +2760,42 @@ fn is_cuda_native_follow_value_chain_source(source: &MvccReadSource) -> bool {
     )
 }
 
+fn is_cuda_native_source_resolvable(source: &MvccReadSource) -> bool {
+    match source {
+        source
+            if is_cuda_native_single_source(source)
+                || is_cuda_native_concat_source(source)
+                || is_cuda_native_follow_value_chain_source(source) =>
+        {
+            true
+        }
+        MvccReadSource::ConcatDistinct { sources }
+        | MvccReadSource::IntersectDistinct { sources }
+        | MvccReadSource::IntersectAll { sources }
+        | MvccReadSource::ExceptDistinct { sources }
+        | MvccReadSource::ExceptAll { sources }
+        | MvccReadSource::SymmetricDifferenceDistinct { sources }
+        | MvccReadSource::SymmetricDifferenceAll { sources } => {
+            sources.iter().all(is_cuda_native_source_resolvable)
+        }
+        _ => false,
+    }
+}
+
+fn is_cuda_native_composition_source(source: &MvccReadSource) -> bool {
+    matches!(
+        source,
+        MvccReadSource::ConcatDistinct { sources }
+            | MvccReadSource::IntersectDistinct { sources }
+            | MvccReadSource::IntersectAll { sources }
+            | MvccReadSource::ExceptDistinct { sources }
+            | MvccReadSource::ExceptAll { sources }
+            | MvccReadSource::SymmetricDifferenceDistinct { sources }
+            | MvccReadSource::SymmetricDifferenceAll { sources }
+            if sources.iter().all(is_cuda_native_source_resolvable)
+    )
+}
+
 fn is_cuda_order_supported(query: &MvccReadQuery, order: &MvccReadOrder) -> bool {
     if matches!(
         order,
@@ -2442,7 +2818,8 @@ fn is_cuda_order_supported(query: &MvccReadQuery, order: &MvccReadOrder) -> bool
             | MvccReadOrder::KeyDesc
             | MvccReadOrder::ValueAsc
             | MvccReadOrder::ValueDesc
-    ) && is_cuda_native_concat_source(&query.source)
+    ) && (is_cuda_native_concat_source(&query.source)
+        || is_cuda_native_composition_source(&query.source))
     {
         return true;
     }
@@ -2505,7 +2882,8 @@ fn is_cuda_projection_supported(query: &MvccReadQuery) -> bool {
 fn first_cuda_slice_query_gap(query: &MvccReadQuery) -> Option<FirstCudaSliceGap> {
     let native_source = is_cuda_native_single_source(&query.source)
         || is_cuda_native_concat_source(&query.source)
-        || is_cuda_native_follow_value_chain_source(&query.source);
+        || is_cuda_native_follow_value_chain_source(&query.source)
+        || is_cuda_native_composition_source(&query.source);
     let cpu_resolved_source = is_cuda_cpu_resolved_source(&query.source);
     if !native_source && !cpu_resolved_source {
         return Some(FirstCudaSliceGap::UnsupportedSource);
@@ -2549,7 +2927,8 @@ fn is_cuda_native_full_scan_query(query: &MvccReadQuery) -> bool {
 fn is_cuda_native_source_query(query: &MvccReadQuery) -> bool {
     (is_cuda_native_single_source(&query.source)
         || is_cuda_native_concat_source(&query.source)
-        || is_cuda_native_follow_value_chain_source(&query.source))
+        || is_cuda_native_follow_value_chain_source(&query.source)
+        || is_cuda_native_composition_source(&query.source))
         && is_first_cuda_slice_query(query)
 }
 
@@ -5043,213 +5422,18 @@ fn resolve_mvcc_source(
             }
             Ok(rows)
         }
-        MvccReadSource::ConcatDistinct { sources } => {
-            let mut rows = Vec::new();
-            let mut seen = BTreeSet::new();
-            for source in sources {
-                for row in resolve_mvcc_source(store, source, visibility)? {
-                    if seen.insert(resolved_mvcc_row_key(&row)) {
-                        rows.push(row);
-                    }
-                }
-            }
-            Ok(rows)
-        }
-        MvccReadSource::IntersectDistinct { sources } => {
-            let mut sources_iter = sources.iter();
-            let Some(first_source) = sources_iter.next() else {
-                return Ok(Vec::new());
-            };
-
-            let first_rows = resolve_mvcc_source(store, first_source, visibility)?;
-            let mut intersection = Vec::new();
-            let mut emitted = BTreeSet::new();
-            let remaining_sets = sources_iter
-                .map(|source| {
-                    resolve_mvcc_source(store, source, visibility).map(|rows| {
-                        rows.into_iter()
-                            .map(|row| resolved_mvcc_row_key(&row))
-                            .collect::<BTreeSet<_>>()
-                    })
-                })
-                .collect::<Result<Vec<_>, StorageError>>()?;
-
-            'rows: for row in first_rows {
-                let key = resolved_mvcc_row_key(&row);
-                if !emitted.insert(key.clone()) {
-                    continue;
-                }
-                for other in &remaining_sets {
-                    if !other.contains(&key) {
-                        continue 'rows;
-                    }
-                }
-                intersection.push(row);
-            }
-            Ok(intersection)
-        }
-        MvccReadSource::IntersectAll { sources } => {
-            let mut sources_iter = sources.iter();
-            let Some(first_source) = sources_iter.next() else {
-                return Ok(Vec::new());
-            };
-
-            let first_rows = resolve_mvcc_source(store, first_source, visibility)?;
-            let remaining_counts = sources_iter
-                .map(|source| {
-                    resolve_mvcc_source(store, source, visibility).map(|rows| {
-                        let mut counts = BTreeMap::new();
-                        for key in rows.into_iter().map(|row| resolved_mvcc_row_key(&row)) {
-                            *counts.entry(key).or_insert(0usize) += 1;
-                        }
-                        counts
-                    })
-                })
-                .collect::<Result<Vec<_>, StorageError>>()?;
-
-            let mut consumed = BTreeMap::new();
-            let mut intersection = Vec::new();
-            'rows: for row in first_rows {
-                let key = resolved_mvcc_row_key(&row);
-                let next_count = consumed.get(&key).copied().unwrap_or(0) + 1;
-                for counts in &remaining_counts {
-                    if counts.get(&key).copied().unwrap_or(0) < next_count {
-                        continue 'rows;
-                    }
-                }
-                consumed.insert(key, next_count);
-                intersection.push(row);
-            }
-            Ok(intersection)
-        }
-        MvccReadSource::ExceptDistinct { sources } => {
-            let mut sources_iter = sources.iter();
-            let Some(first_source) = sources_iter.next() else {
-                return Ok(Vec::new());
-            };
-
-            let first_rows = resolve_mvcc_source(store, first_source, visibility)?;
-            let exclusion_set = sources_iter
-                .map(|source| {
-                    resolve_mvcc_source(store, source, visibility).map(|rows| {
-                        rows.into_iter()
-                            .map(|row| resolved_mvcc_row_key(&row))
-                            .collect::<BTreeSet<_>>()
-                    })
-                })
-                .collect::<Result<Vec<_>, StorageError>>()?
-                .into_iter()
-                .flatten()
-                .collect::<BTreeSet<_>>();
-
-            let mut difference = Vec::new();
-            let mut emitted = BTreeSet::new();
-            for row in first_rows {
-                let key = resolved_mvcc_row_key(&row);
-                if !emitted.insert(key.clone()) || exclusion_set.contains(&key) {
-                    continue;
-                }
-                difference.push(row);
-            }
-            Ok(difference)
-        }
-        MvccReadSource::ExceptAll { sources } => {
-            let mut sources_iter = sources.iter();
-            let Some(first_source) = sources_iter.next() else {
-                return Ok(Vec::new());
-            };
-
-            let first_rows = resolve_mvcc_source(store, first_source, visibility)?;
-            let mut exclusion_counts = BTreeMap::new();
-            for source in sources_iter {
-                for key in resolve_mvcc_source(store, source, visibility)?
-                    .into_iter()
-                    .map(|row| resolved_mvcc_row_key(&row))
-                {
-                    *exclusion_counts.entry(key).or_insert(0usize) += 1;
-                }
-            }
-
-            let mut consumed = BTreeMap::new();
-            let mut difference = Vec::new();
-            for row in first_rows {
-                let key = resolved_mvcc_row_key(&row);
-                let next_count = consumed.get(&key).copied().unwrap_or(0) + 1;
-                consumed.insert(key.clone(), next_count);
-                if exclusion_counts.get(&key).copied().unwrap_or(0) >= next_count {
-                    continue;
-                }
-                difference.push(row);
-            }
-            Ok(difference)
-        }
-        MvccReadSource::SymmetricDifferenceDistinct { sources } => {
+        MvccReadSource::ConcatDistinct { sources }
+        | MvccReadSource::IntersectDistinct { sources }
+        | MvccReadSource::IntersectAll { sources }
+        | MvccReadSource::ExceptDistinct { sources }
+        | MvccReadSource::ExceptAll { sources }
+        | MvccReadSource::SymmetricDifferenceDistinct { sources }
+        | MvccReadSource::SymmetricDifferenceAll { sources } => {
             let resolved_sources = sources
                 .iter()
                 .map(|source| resolve_mvcc_source(store, source, visibility))
                 .collect::<Result<Vec<_>, StorageError>>()?;
-
-            let mut presence_counts = BTreeMap::new();
-            for rows in &resolved_sources {
-                let per_source = rows
-                    .iter()
-                    .map(resolved_mvcc_row_key)
-                    .collect::<BTreeSet<_>>();
-                for key in per_source {
-                    *presence_counts.entry(key).or_insert(0usize) += 1;
-                }
-            }
-
-            let mut output = Vec::new();
-            let mut emitted = BTreeSet::new();
-            for rows in resolved_sources {
-                for row in rows {
-                    let key = resolved_mvcc_row_key(&row);
-                    if presence_counts.get(&key) == Some(&1) && emitted.insert(key) {
-                        output.push(row);
-                    }
-                }
-            }
-            Ok(output)
-        }
-        MvccReadSource::SymmetricDifferenceAll { sources } => {
-            let resolved_sources = sources
-                .iter()
-                .map(|source| resolve_mvcc_source(store, source, visibility))
-                .collect::<Result<Vec<_>, StorageError>>()?;
-
-            let mut remaining = BTreeMap::new();
-            for rows in &resolved_sources {
-                let mut source_counts = BTreeMap::new();
-                for key in rows.iter().map(resolved_mvcc_row_key) {
-                    *source_counts.entry(key).or_insert(0usize) += 1;
-                }
-                for (key, count) in source_counts {
-                    let current = remaining.remove(&key).unwrap_or(0);
-                    if current >= count {
-                        let next = current - count;
-                        if next > 0 {
-                            remaining.insert(key, next);
-                        }
-                    } else {
-                        remaining.insert(key, count - current);
-                    }
-                }
-            }
-
-            let mut output = Vec::new();
-            for rows in resolved_sources {
-                for row in rows {
-                    let key = resolved_mvcc_row_key(&row);
-                    if let Some(count) = remaining.get_mut(&key) {
-                        if *count > 0 {
-                            output.push(row);
-                            *count -= 1;
-                        }
-                    }
-                }
-            }
-            Ok(output)
+            Ok(compose_resolved_mvcc_rows(source, resolved_sources))
         }
         MvccReadSource::FollowValueChain {
             keys,
@@ -6257,6 +6441,9 @@ impl Engine {
                 rows,
                 backend,
             ),
+            source if is_cuda_native_composition_source(source) => {
+                execute_cuda_native_composition_query(query, source, rows, backend)
+            }
             _ => execute_cuda_native_single_source_query(query, rows, backend),
         }
         .unwrap_or_else(|reason| {
@@ -8720,9 +8907,11 @@ mod tests {
     #[test]
     fn first_cuda_slice_query_gap_reports_first_unsupported_boundary() {
         let mut query = first_cuda_slice_support_query();
-        query.source = MvccReadSource::ConcatDistinct {
-            sources: vec![MvccReadSource::KeyLookup {
-                key: "acct:1".to_string(),
+        query.source = MvccReadSource::Concat {
+            sources: vec![MvccReadSource::ConcatDistinct {
+                sources: vec![MvccReadSource::KeyLookup {
+                    key: "acct:1".to_string(),
+                }],
             }],
         };
         assert_eq!(
@@ -9415,6 +9604,51 @@ mod tests {
                     value: Some("open".to_string()),
                 },
             ]
+        );
+        assert_eq!(e.metrics().fallback_for(FallbackReason::GpuUnavailable), 1);
+    }
+
+    #[test]
+    fn cuda_native_composition_fallback_re_resolves_cpu_visible_rows() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=open").unwrap();
+        e.execute_text(2, "SET acct:2=hold").unwrap();
+        e.execute_text(3, "SET acct:3=closed").unwrap();
+        e.execute_text(4, "DELETE acct:2").unwrap();
+
+        let result = e
+            .execute_cuda_native_source_query(
+                &MvccReadQuery {
+                    source: MvccReadSource::IntersectAll {
+                        sources: vec![
+                            MvccReadSource::KeyBatchLookup {
+                                keys: vec!["acct:1".to_string(), "acct:2".to_string()],
+                            },
+                            MvccReadSource::KeyBatchLookup {
+                                keys: vec!["acct:2".to_string(), "acct:3".to_string()],
+                            },
+                        ],
+                    },
+                    visibility: StorageVisibility { read_txn_id: 3 },
+                    filter: None,
+                    order: None,
+                    projection: MvccProjection::KeyOnly,
+                    limit: None,
+                },
+                &CudaMvccExecutionBackend::new(CudaDriverRuntime::unavailable(), 0),
+            )
+            .unwrap();
+
+        assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.executed_target, DeviceTarget::Cpu);
+        assert_eq!(result.fallback_reason, Some(FallbackReason::GpuUnavailable));
+        assert_eq!(
+            result.rows,
+            vec![MvccReadRow {
+                source_key: None,
+                key: Some("acct:2".to_string()),
+                value: None,
+            }]
         );
         assert_eq!(e.metrics().fallback_for(FallbackReason::GpuUnavailable), 1);
     }
@@ -10770,6 +11004,59 @@ mod tests {
 
     #[test]
     #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
+    fn execute_mvcc_query_cuda_driver_runs_native_set_composition_without_fallback() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=open").unwrap();
+        e.execute_text(2, "SET acct:2=hold").unwrap();
+        e.execute_text(3, "SET acct:3=closed").unwrap();
+
+        let result = e
+            .execute_mvcc_query_with_cuda_driver_probe(&MvccReadQuery {
+                source: MvccReadSource::IntersectAll {
+                    sources: vec![
+                        MvccReadSource::KeyBatchLookup {
+                            keys: vec![
+                                "acct:1".to_string(),
+                                "acct:2".to_string(),
+                                "acct:2".to_string(),
+                            ],
+                        },
+                        MvccReadSource::Concat {
+                            sources: vec![
+                                MvccReadSource::KeyLookup {
+                                    key: "acct:2".to_string(),
+                                },
+                                MvccReadSource::KeyLookup {
+                                    key: "acct:3".to_string(),
+                                },
+                            ],
+                        },
+                    ],
+                },
+                visibility: StorageVisibility { read_txn_id: 3 },
+                filter: None,
+                order: Some(MvccReadOrder::KeyAsc),
+                projection: MvccProjection::KeyOnly,
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.fallback_reason, None);
+        assert_eq!(
+            result.rows,
+            vec![MvccReadRow {
+                source_key: None,
+                key: Some("acct:2".to_string()),
+                value: None,
+            }]
+        );
+        assert_eq!(e.metrics().fallback_total, 0);
+    }
+
+    #[test]
+    #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
     fn execute_mvcc_query_cuda_driver_runs_provenance_bundle_filters_without_fallback() {
         let mut e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:2").unwrap();
@@ -11370,6 +11657,36 @@ mod tests {
     }
 
     #[test]
+    fn first_cuda_slice_query_gap_accepts_native_set_composition() {
+        let query = MvccReadQuery {
+            source: MvccReadSource::IntersectAll {
+                sources: vec![
+                    MvccReadSource::KeyBatchLookup {
+                        keys: vec!["acct:1".to_string(), "acct:2".to_string()],
+                    },
+                    MvccReadSource::Concat {
+                        sources: vec![
+                            MvccReadSource::KeyLookup {
+                                key: "acct:2".to_string(),
+                            },
+                            MvccReadSource::KeyLookup {
+                                key: "acct:3".to_string(),
+                            },
+                        ],
+                    },
+                ],
+            },
+            visibility: StorageVisibility { read_txn_id: 6 },
+            filter: None,
+            order: Some(MvccReadOrder::KeyAsc),
+            projection: MvccProjection::KeyOnly,
+            limit: None,
+        };
+
+        assert_eq!(first_cuda_slice_query_gap(&query), None);
+    }
+
+    #[test]
     fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_distinct_cpu_resolved_sources() {
         let mut e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:1").unwrap();
@@ -11725,16 +12042,18 @@ mod tests {
             projection: MvccProjection::ValueOnly,
             limit: None,
         };
-        let unsupported_distinct = MvccReadQuery {
-            source: MvccReadSource::ConcatDistinct {
-                sources: vec![
-                    MvccReadSource::KeyLookup {
-                        key: "acct:1".to_string(),
-                    },
-                    MvccReadSource::KeyLookup {
-                        key: "acct:1".to_string(),
-                    },
-                ],
+        let unsupported_nested_distinct = MvccReadQuery {
+            source: MvccReadSource::Concat {
+                sources: vec![MvccReadSource::ConcatDistinct {
+                    sources: vec![
+                        MvccReadSource::KeyLookup {
+                            key: "acct:1".to_string(),
+                        },
+                        MvccReadSource::KeyLookup {
+                            key: "acct:1".to_string(),
+                        },
+                    ],
+                }],
             },
             visibility: StorageVisibility { read_txn_id: 3 },
             filter: None,
@@ -11755,7 +12074,7 @@ mod tests {
             )
             .unwrap(),
             e.execute_mvcc_query_with_backend_fallback(
-                &unsupported_distinct,
+                &unsupported_nested_distinct,
                 &FirstCudaSliceParityBackend,
             )
             .unwrap(),
@@ -12298,7 +12617,7 @@ mod tests {
     }
 
     #[test]
-    fn execute_mvcc_query_first_cuda_slice_backend_falls_back_for_unsupported_composition() {
+    fn execute_mvcc_query_first_cuda_slice_backend_falls_back_for_unsupported_nested_composition() {
         let mut e = Engine::new_local();
         e.execute_text(1, "SET acct:1=open").unwrap();
         e.execute_text(2, "SET acct:2=hold").unwrap();
@@ -12306,15 +12625,17 @@ mod tests {
         let result = e
             .execute_mvcc_query_with_backend_fallback(
                 &MvccReadQuery {
-                    source: MvccReadSource::ConcatDistinct {
-                        sources: vec![
-                            MvccReadSource::KeyLookup {
-                                key: "acct:1".to_string(),
-                            },
-                            MvccReadSource::KeyLookup {
-                                key: "acct:2".to_string(),
-                            },
-                        ],
+                    source: MvccReadSource::Concat {
+                        sources: vec![MvccReadSource::ConcatDistinct {
+                            sources: vec![
+                                MvccReadSource::KeyLookup {
+                                    key: "acct:1".to_string(),
+                                },
+                                MvccReadSource::KeyLookup {
+                                    key: "acct:2".to_string(),
+                                },
+                            ],
+                        }],
                     },
                     visibility: StorageVisibility { read_txn_id: 2 },
                     filter: None,
