@@ -1976,7 +1976,16 @@ fn cuda_filter_contains_cpu_resolved_predicate(filter: &MvccReadFilter) -> bool 
 #[cfg_attr(not(test), allow(dead_code))]
 fn is_cuda_cpu_resolved_source(source: &MvccReadSource) -> bool {
     match source {
-        MvccReadSource::Concat { sources } => sources.iter().all(is_cuda_cpu_resolved_source),
+        MvccReadSource::Concat { sources }
+        | MvccReadSource::ConcatDistinct { sources }
+        | MvccReadSource::IntersectDistinct { sources }
+        | MvccReadSource::IntersectAll { sources }
+        | MvccReadSource::ExceptDistinct { sources }
+        | MvccReadSource::ExceptAll { sources }
+        | MvccReadSource::SymmetricDifferenceDistinct { sources }
+        | MvccReadSource::SymmetricDifferenceAll { sources } => {
+            sources.iter().all(is_cuda_cpu_resolved_source)
+        }
         MvccReadSource::FollowValueChain { .. }
         | MvccReadSource::FollowValueChainBranches { .. }
         | MvccReadSource::FollowValueChainLabeledBranches { .. }
@@ -9703,6 +9712,68 @@ mod tests {
 
     #[test]
     #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
+    fn execute_mvcc_query_cuda_driver_runs_distinct_cpu_resolved_sources_without_fallback() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=profile:1").unwrap();
+        e.execute_text(2, "SET acct:2=profile:2").unwrap();
+        e.execute_text(3, "SET profile:1=team:alpha").unwrap();
+        e.execute_text(4, "SET profile:2=team:beta").unwrap();
+        e.execute_text(5, "SET team:alpha=Alpha Team").unwrap();
+        e.execute_text(6, "SET team:beta=Beta Team").unwrap();
+
+        let result = e
+            .execute_mvcc_query_with_cuda_driver_probe(&MvccReadQuery {
+                source: MvccReadSource::ConcatDistinct {
+                    sources: vec![
+                        MvccReadSource::FollowValueChain {
+                            keys: vec!["acct:1".to_string()],
+                            plan: MvccValueChainPlan {
+                                value_key_hops: 2,
+                                terminal: MvccValueChainTerminal::CurrentRow,
+                            },
+                            provenance: MvccSourceProvenance::Seed,
+                        },
+                        MvccReadSource::FollowValueChain {
+                            keys: vec!["acct:1".to_string(), "acct:2".to_string()],
+                            plan: MvccValueChainPlan {
+                                value_key_hops: 2,
+                                terminal: MvccValueChainTerminal::CurrentRow,
+                            },
+                            provenance: MvccSourceProvenance::Seed,
+                        },
+                    ],
+                },
+                visibility: StorageVisibility { read_txn_id: 6 },
+                filter: Some(MvccReadFilter::SourceKeyPrefix("acct:".to_string())),
+                order: Some(MvccReadOrder::SourceKeyAsc),
+                projection: MvccProjection::TargetKeySourceValue,
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.fallback_reason, None);
+        assert_eq!(
+            result.rows,
+            vec![
+                MvccReadRow {
+                    source_key: Some("acct:1".to_string()),
+                    key: Some("team:alpha".to_string()),
+                    value: Some("profile:1".to_string()),
+                },
+                MvccReadRow {
+                    source_key: Some("acct:2".to_string()),
+                    key: Some("team:beta".to_string()),
+                    value: Some("profile:2".to_string()),
+                },
+            ]
+        );
+        assert_eq!(e.metrics().fallback_total, 0);
+    }
+
+    #[test]
+    #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
     fn execute_mvcc_query_cuda_driver_runs_provenance_bundle_filters_without_fallback() {
         let mut e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:2").unwrap();
@@ -10129,6 +10200,106 @@ mod tests {
                     source_key: None,
                     key: Some("acct:1".to_string()),
                     value: Some("open".to_string()),
+                },
+            ]
+        );
+        assert_eq!(e.metrics().fallback_total, 1);
+    }
+
+    #[test]
+    fn first_cuda_slice_query_gap_accepts_distinct_cpu_resolved_composition() {
+        let query = MvccReadQuery {
+            source: MvccReadSource::ConcatDistinct {
+                sources: vec![
+                    MvccReadSource::FollowValueChain {
+                        keys: vec!["acct:1".to_string()],
+                        plan: MvccValueChainPlan {
+                            value_key_hops: 2,
+                            terminal: MvccValueChainTerminal::CurrentRow,
+                        },
+                        provenance: MvccSourceProvenance::Seed,
+                    },
+                    MvccReadSource::FollowValueChain {
+                        keys: vec!["acct:1".to_string(), "acct:2".to_string()],
+                        plan: MvccValueChainPlan {
+                            value_key_hops: 2,
+                            terminal: MvccValueChainTerminal::CurrentRow,
+                        },
+                        provenance: MvccSourceProvenance::Seed,
+                    },
+                ],
+            },
+            visibility: StorageVisibility { read_txn_id: 6 },
+            filter: Some(MvccReadFilter::SourceKeyPrefix("acct:".to_string())),
+            order: Some(MvccReadOrder::SourceKeyAsc),
+            projection: MvccProjection::TargetKeySourceValue,
+            limit: None,
+        };
+
+        assert_eq!(first_cuda_slice_query_gap(&query), None);
+    }
+
+    #[test]
+    fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_distinct_cpu_resolved_sources() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=profile:1").unwrap();
+        e.execute_text(2, "SET acct:2=profile:2").unwrap();
+        e.execute_text(3, "SET profile:1=team:alpha").unwrap();
+        e.execute_text(4, "SET profile:2=team:beta").unwrap();
+        e.execute_text(5, "SET team:alpha=Alpha Team").unwrap();
+        e.execute_text(6, "SET team:beta=Beta Team").unwrap();
+
+        let query = MvccReadQuery {
+            source: MvccReadSource::ConcatDistinct {
+                sources: vec![
+                    MvccReadSource::FollowValueChain {
+                        keys: vec!["acct:1".to_string()],
+                        plan: MvccValueChainPlan {
+                            value_key_hops: 2,
+                            terminal: MvccValueChainTerminal::CurrentRow,
+                        },
+                        provenance: MvccSourceProvenance::Seed,
+                    },
+                    MvccReadSource::FollowValueChain {
+                        keys: vec!["acct:1".to_string(), "acct:2".to_string()],
+                        plan: MvccValueChainPlan {
+                            value_key_hops: 2,
+                            terminal: MvccValueChainTerminal::CurrentRow,
+                        },
+                        provenance: MvccSourceProvenance::Seed,
+                    },
+                ],
+            },
+            visibility: StorageVisibility { read_txn_id: 6 },
+            filter: Some(MvccReadFilter::SourceKeyPrefix("acct:".to_string())),
+            order: Some(MvccReadOrder::SourceKeyAsc),
+            projection: MvccProjection::TargetKeySourceValue,
+            limit: None,
+        };
+
+        let cpu = e.execute_mvcc_query(&query).unwrap();
+        assert_mvcc_query_uses_tracked_cpu_fallback(&e, &cpu, 1);
+
+        let backend = e
+            .execute_mvcc_query_with_backend_fallback(&query, &FirstCudaSliceParityBackend)
+            .unwrap();
+
+        assert_eq!(backend.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(backend.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(backend.fallback_reason, None);
+        assert_eq!(backend.rows, cpu.rows);
+        assert_eq!(
+            backend.rows,
+            vec![
+                MvccReadRow {
+                    source_key: Some("acct:1".to_string()),
+                    key: Some("team:alpha".to_string()),
+                    value: Some("profile:1".to_string()),
+                },
+                MvccReadRow {
+                    source_key: Some("acct:2".to_string()),
+                    key: Some("team:beta".to_string()),
+                    value: Some("profile:2".to_string()),
                 },
             ]
         );
