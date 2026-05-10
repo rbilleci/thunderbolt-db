@@ -4,6 +4,8 @@
 
 ### CUDA native composition
 - Added CUDA source-resolution routing for native distinct/intersect/except/symmetric-difference MVCC sources whose children are already CUDA-resolvable. Each child now selects rows through CUDA source/visibility masks before the existing host set/multiset semantics and downstream CUDA filter/order/projection path run, leaving fully device-side set algebra as a future performance-only optimization.
+- Extended native `Concat` so it now accepts any CUDA-resolvable child, including nested distinct/intersect/except/symmetric-difference composition. The mixed MVCC CUDA benchmark fixture now expects 100% GPU execution and 0% CPU fallback for its current scan/concat/nested-composition mix.
+- Added closeout coverage for every current native set/multiset variant through classifier, backend-swap CPU parity, and local CUDA regression paths. This locks the current correctness-routing proof surface while keeping fully device-side set algebra scoped to future performance work only.
 
 ## 2026-05-10
 
