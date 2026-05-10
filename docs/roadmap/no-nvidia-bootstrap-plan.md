@@ -402,6 +402,7 @@ Validation gate for every completion-gate change:
    - Record SoA/AoS choices, alignment/coalescing assumptions, null/empty value representation, and bounded allocation strategy.
    - Add host-to-device and device-to-host fixtures that compare encoded rows against the CPU truth rows.
    - Exit when supported first-slice queries can build and inspect a GPU row batch without changing `MvccReadRow`.
+   - Progress on 2026-05-10: `CudaMvccRowBatch` defines the first SoA transfer contract: `u32` key/value offset arrays, flattened key/value byte buffers, `u64` begin/end transaction visibility bounds, and `u32` provenance handles. Empty keys/values are represented by equal adjacent offsets, transfer sizing is explicit, offsets are validated before launch, and `CudaDriverRuntime::mvcc_row_batch_lengths(...)` proves H2D -> CUDA kernel -> D2H inspection of row lengths without changing `MvccReadRow`.
 2. **Native scan and snapshot visibility parity**
    - Move full-scan row selection and snapshot visibility filtering into CUDA kernels.
    - Keep the CPU storage contract as the truth oracle while proving visible/invisible row parity on deterministic fixtures.
@@ -439,9 +440,10 @@ Status update on 2026-05-09:
 - `gpu_db_execution::CudaDriverRuntime` now probes `libcuda`, initializes the driver, records driver version, device count, device names, and device memory sizes, and plugs into the existing `GpuRuntime`/`DeviceRouter` contract.
 - `CudaDriverRuntime::launch_smoke_add_one(...)` now proves the local driver path can load PTX, allocate device memory, launch a minimal kernel, synchronize, and copy the result back to the host; this is a launch-harness prerequisite, not MVCC execution parity.
 - `CudaDriverRuntime::filter_all_mask(...)`, `filter_equal_u32_mask(...)`, `filter_equal_bytes_mask(...)`, and `filter_bytes_range_mask(...)` are now the first real CUDA mask primitives: they perform device-side unconditional mask generation or H2D input copy plus predicate mask generation, synchronization, and D2H mask copy for filterless reads, fixed-width equality, byte/string equality, and bytewise range batches with ignored local-hardware parity tests.
+- `CudaMvccRowBatch` now establishes the first GPU row format/transfer contract for MVCC rows, including key/value SoA buffers, visibility metadata, and provenance handles; `CudaDriverRuntime::mvcc_row_batch_lengths(...)` validates device-side inspection of that batch shape on local hardware.
 - `CudaMvccExecutionBackend` is attached behind the existing MVCC backend boundary and can be reached through `Engine::execute_mvcc_query_with_cuda_driver_probe(...)`.
 - The first MVCC CUDA integration is intentionally narrow: supported filterless full-scan/key-lookup reads and reads with exact numeric or byte/string `ValueEquals` filters, key-prefix filters, general bytewise key ranges, and nested `All`/`Any` combinations of those predicates can now use CUDA mask primitives and report `executed_target = gpu(...)` on local NVIDIA hardware. Source resolution, snapshot visibility, and projection still use the existing CPU/storage contract; broader filter/source/order/projection/limit shapes continue to fall back under `GpuMvccReadParityGap`.
-- Remaining MVCC CUDA gaps: native row encoding, scan/visibility kernels, key lookup kernels, and broader provenance-aware predicates still need to be ported behind the existing backend boundary before broader shapes may report GPU execution.
+- Remaining MVCC CUDA gaps: connecting `CudaMvccRowBatch` to engine-resolved rows, native scan/visibility kernels, key lookup kernels, and broader provenance-aware predicates still need to be ported behind the existing backend boundary before broader shapes may report GPU execution.
 
 1. Add CUDA build targets plus at least one reproducible GPU-capable CI/dev environment.
    - In progress: local GPU-capable dev environment detected; driver-level runtime probing now exposes device inventory (`id`, name, total memory) and a validated minimal kernel launch/D2H smoke path for transition diagnostics.
@@ -451,7 +453,7 @@ Status update on 2026-05-09:
    - scan
    - snapshot visibility filtering
    - simple filter predicates
-     - In progress: unconditional mask generation, fixed-width equality, byte/string equality, and bytewise range CUDA predicate primitives are integrated for filterless reads, MVCC `ValueEquals`, key-prefix filters, key ranges, and logical mask composition over those predicates; native MVCC row integration and broader provenance-aware predicate shapes remain open.
+     - In progress: unconditional mask generation, fixed-width equality, byte/string equality, bytewise range CUDA predicate primitives, and the first `CudaMvccRowBatch` inspection kernel are integrated for filterless reads, MVCC `ValueEquals`, key-prefix filters, key ranges, and logical mask composition over those predicates; connecting row batches to engine-resolved rows plus native visibility and broader provenance-aware predicate shapes remain open.
    - point lookup / key lookup
 4. Run CPU-vs-GPU parity checks against the existing deterministic fixtures and any minimal new fixture added during closeout.
 5. Keep fallback routing live so unsupported shapes still execute via CPU with explicit tracked reasons.

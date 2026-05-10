@@ -78,6 +78,153 @@ pub struct CudaDeviceSnapshot {
     pub total_memory_bytes: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CudaMvccRowBatch {
+    pub row_count: u32,
+    pub key_offsets: Vec<u32>,
+    pub key_bytes: Vec<u8>,
+    pub value_offsets: Vec<u32>,
+    pub value_bytes: Vec<u8>,
+    pub begin_txn_ids: Vec<u64>,
+    pub end_txn_ids: Vec<u64>,
+    pub provenance_handles: Vec<u32>,
+}
+
+impl CudaMvccRowBatch {
+    pub fn from_key_values<I, K, V>(rows: I) -> Result<Self, CudaRuntimeProbeError>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
+        Self::from_key_values_with_metadata(
+            rows.into_iter()
+                .map(|(key, value)| (key, value, 0_u64, u64::MAX, None)),
+        )
+    }
+
+    pub fn from_key_values_with_metadata<I, K, V>(rows: I) -> Result<Self, CudaRuntimeProbeError>
+    where
+        I: IntoIterator<Item = (K, V, u64, u64, Option<u32>)>,
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
+        let mut row_count = 0_u32;
+        let mut key_offsets = vec![0_u32];
+        let mut key_bytes = Vec::new();
+        let mut value_offsets = vec![0_u32];
+        let mut value_bytes = Vec::new();
+        let mut begin_txn_ids = Vec::new();
+        let mut end_txn_ids = Vec::new();
+        let mut provenance_handles = Vec::new();
+
+        for (key, value, begin_txn_id, end_txn_id, provenance_handle) in rows {
+            let provenance_handle = provenance_handle.unwrap_or(row_count);
+            row_count = row_count
+                .checked_add(1)
+                .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+
+            key_bytes.extend_from_slice(key.as_ref());
+            key_offsets.push(
+                u32::try_from(key_bytes.len())
+                    .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(key_bytes.len()))?,
+            );
+
+            value_bytes.extend_from_slice(value.as_ref());
+            value_offsets.push(
+                u32::try_from(value_bytes.len())
+                    .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(value_bytes.len()))?,
+            );
+            begin_txn_ids.push(begin_txn_id);
+            end_txn_ids.push(end_txn_id);
+            provenance_handles.push(provenance_handle);
+        }
+
+        Ok(Self {
+            row_count,
+            key_offsets,
+            key_bytes,
+            value_offsets,
+            value_bytes,
+            begin_txn_ids,
+            end_txn_ids,
+            provenance_handles,
+        })
+    }
+
+    pub fn transfer_bytes(&self) -> usize {
+        (self.key_offsets.len() + self.value_offsets.len()) * std::mem::size_of::<u32>()
+            + self.key_bytes.len()
+            + self.value_bytes.len()
+            + self.begin_txn_ids.len() * std::mem::size_of::<u64>()
+            + self.end_txn_ids.len() * std::mem::size_of::<u64>()
+            + self.provenance_handles.len() * std::mem::size_of::<u32>()
+    }
+
+    pub fn key_len(&self, row_index: usize) -> Option<u32> {
+        row_segment_len(&self.key_offsets, row_index)
+    }
+
+    pub fn value_len(&self, row_index: usize) -> Option<u32> {
+        row_segment_len(&self.value_offsets, row_index)
+    }
+
+    pub fn validate(&self) -> Result<(), CudaRuntimeProbeError> {
+        let row_count = self.row_count as usize;
+        if self.key_offsets.len() != row_count + 1 {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(
+                self.key_offsets.len(),
+            ));
+        }
+        if self.value_offsets.len() != row_count + 1 {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(
+                self.value_offsets.len(),
+            ));
+        }
+        if self.begin_txn_ids.len() != row_count {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(
+                self.begin_txn_ids.len(),
+            ));
+        }
+        if self.end_txn_ids.len() != row_count {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(
+                self.end_txn_ids.len(),
+            ));
+        }
+        if self.provenance_handles.len() != row_count {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(
+                self.provenance_handles.len(),
+            ));
+        }
+        validate_offsets(&self.key_offsets, self.key_bytes.len())?;
+        validate_offsets(&self.value_offsets, self.value_bytes.len())?;
+        Ok(())
+    }
+}
+
+fn row_segment_len(offsets: &[u32], row_index: usize) -> Option<u32> {
+    let start = *offsets.get(row_index)?;
+    let end = *offsets.get(row_index + 1)?;
+    end.checked_sub(start)
+}
+
+fn validate_offsets(offsets: &[u32], bytes_len: usize) -> Result<(), CudaRuntimeProbeError> {
+    if offsets.first().copied() != Some(0) {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(bytes_len));
+    }
+    let mut previous = 0_u32;
+    for offset in offsets.iter().copied().skip(1) {
+        if offset < previous {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(offset as usize));
+        }
+        previous = offset;
+    }
+    if previous as usize != bytes_len {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(bytes_len));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CudaRuntimeProbeError {
     DriverLibraryUnavailable,
@@ -199,6 +346,17 @@ impl CudaDriverRuntime {
         }
 
         launch_cuda_bytes_range_mask(input, start_inclusive, end_exclusive)
+    }
+
+    pub fn mvcc_row_batch_lengths(
+        &self,
+        batch: &CudaMvccRowBatch,
+    ) -> Result<Vec<(u32, u32)>, CudaRuntimeProbeError> {
+        if !self.snapshot.driver_available || self.snapshot.device_count == 0 {
+            return Err(CudaRuntimeProbeError::DriverLibraryUnavailable);
+        }
+
+        launch_cuda_mvcc_row_batch_lengths(batch)
     }
 }
 
@@ -1749,6 +1907,297 @@ DONE:
     Ok(mask.into_iter().map(|value| value != 0).collect())
 }
 
+fn launch_cuda_mvcc_row_batch_lengths(
+    batch: &CudaMvccRowBatch,
+) -> Result<Vec<(u32, u32)>, CudaRuntimeProbeError> {
+    type CuInit = unsafe extern "C" fn(u32) -> i32;
+    type CuDeviceGet = unsafe extern "C" fn(*mut i32, i32) -> i32;
+    type CuCtxCreate = unsafe extern "C" fn(*mut *mut c_void, u32, i32) -> i32;
+    type CuCtxDestroy = unsafe extern "C" fn(*mut c_void) -> i32;
+    type CuMemAlloc = unsafe extern "C" fn(*mut u64, usize) -> i32;
+    type CuMemFree = unsafe extern "C" fn(u64) -> i32;
+    type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
+    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+    type CuModuleLoadData = unsafe extern "C" fn(*mut *mut c_void, *const c_void) -> i32;
+    type CuModuleUnload = unsafe extern "C" fn(*mut c_void) -> i32;
+    type CuModuleGetFunction =
+        unsafe extern "C" fn(*mut *mut c_void, *mut c_void, *const i8) -> i32;
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+    type CuCtxSynchronize = unsafe extern "C" fn() -> i32;
+
+    const PTX: &[u8] = br#"
+.version 6.0
+.target sm_30
+.address_size 64
+
+.visible .entry gpu_db_cuda_mvcc_row_batch_lengths(
+    .param .u64 key_offsets_ptr,
+    .param .u64 value_offsets_ptr,
+    .param .u64 output_ptr,
+    .param .u32 row_count
+)
+{
+    .reg .pred %p_out;
+    .reg .u32 %r_tid;
+    .reg .u32 %r_block;
+    .reg .u32 %r_block_dim;
+    .reg .u32 %r_idx;
+    .reg .u32 %r_row_count;
+    .reg .u32 %r_key_start;
+    .reg .u32 %r_key_end;
+    .reg .u32 %r_value_start;
+    .reg .u32 %r_value_end;
+    .reg .u32 %r_key_len;
+    .reg .u32 %r_value_len;
+    .reg .u64 %rd_key_offsets;
+    .reg .u64 %rd_value_offsets;
+    .reg .u64 %rd_output;
+    .reg .u64 %rd_offset;
+    .reg .u64 %rd_next_offset;
+    .reg .u64 %rd_output_offset;
+    .reg .u64 %rd_addr;
+
+    ld.param.u64 %rd_key_offsets, [key_offsets_ptr];
+    ld.param.u64 %rd_value_offsets, [value_offsets_ptr];
+    ld.param.u64 %rd_output, [output_ptr];
+    ld.param.u32 %r_row_count, [row_count];
+
+    mov.u32 %r_tid, %tid.x;
+    mov.u32 %r_block, %ctaid.x;
+    mov.u32 %r_block_dim, %ntid.x;
+    mad.lo.u32 %r_idx, %r_block, %r_block_dim, %r_tid;
+
+    setp.ge.u32 %p_out, %r_idx, %r_row_count;
+    @%p_out bra DONE;
+
+    mul.wide.u32 %rd_offset, %r_idx, 4;
+    add.u64 %rd_addr, %rd_key_offsets, %rd_offset;
+    add.u64 %rd_next_offset, %rd_addr, 4;
+    ld.global.u32 %r_key_start, [%rd_addr];
+    ld.global.u32 %r_key_end, [%rd_next_offset];
+    sub.u32 %r_key_len, %r_key_end, %r_key_start;
+
+    add.u64 %rd_addr, %rd_value_offsets, %rd_offset;
+    add.u64 %rd_next_offset, %rd_addr, 4;
+    ld.global.u32 %r_value_start, [%rd_addr];
+    ld.global.u32 %r_value_end, [%rd_next_offset];
+    sub.u32 %r_value_len, %r_value_end, %r_value_start;
+
+    mul.wide.u32 %rd_output_offset, %r_idx, 8;
+    add.u64 %rd_addr, %rd_output, %rd_output_offset;
+    st.global.u32 [%rd_addr], %r_key_len;
+    add.u64 %rd_addr, %rd_addr, 4;
+    st.global.u32 [%rd_addr], %r_value_len;
+
+DONE:
+    ret;
+}
+"#;
+
+    batch.validate()?;
+    if batch.row_count == 0 {
+        return Ok(Vec::new());
+    }
+
+    let lib = unsafe {
+        Library::new("libcuda.so.1")
+            .or_else(|_| Library::new("libcuda.so"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+
+    let cu_init = unsafe {
+        lib.get::<CuInit>(b"cuInit\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_device_get = unsafe {
+        lib.get::<CuDeviceGet>(b"cuDeviceGet\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_ctx_create = unsafe {
+        lib.get::<CuCtxCreate>(b"cuCtxCreate_v2\0")
+            .or_else(|_| lib.get::<CuCtxCreate>(b"cuCtxCreate\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_ctx_destroy = unsafe {
+        lib.get::<CuCtxDestroy>(b"cuCtxDestroy_v2\0")
+            .or_else(|_| lib.get::<CuCtxDestroy>(b"cuCtxDestroy\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_mem_alloc = unsafe {
+        lib.get::<CuMemAlloc>(b"cuMemAlloc_v2\0")
+            .or_else(|_| lib.get::<CuMemAlloc>(b"cuMemAlloc\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_mem_free = unsafe {
+        lib.get::<CuMemFree>(b"cuMemFree_v2\0")
+            .or_else(|_| lib.get::<CuMemFree>(b"cuMemFree\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_memcpy_htod = unsafe {
+        lib.get::<CuMemcpyHtoD>(b"cuMemcpyHtoD_v2\0")
+            .or_else(|_| lib.get::<CuMemcpyHtoD>(b"cuMemcpyHtoD\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_memcpy_dtoh = unsafe {
+        lib.get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+            .or_else(|_| lib.get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_module_load_data = unsafe {
+        lib.get::<CuModuleLoadData>(b"cuModuleLoadData\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_module_unload = unsafe {
+        lib.get::<CuModuleUnload>(b"cuModuleUnload\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_module_get_function = unsafe {
+        lib.get::<CuModuleGetFunction>(b"cuModuleGetFunction\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_launch_kernel = unsafe {
+        lib.get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_ctx_synchronize = unsafe {
+        lib.get::<CuCtxSynchronize>(b"cuCtxSynchronize\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+
+    check_cuda(unsafe { cu_init(0) })?;
+
+    let mut device = 0;
+    check_cuda(unsafe { cu_device_get(&mut device, 0) })?;
+
+    let mut context = std::ptr::null_mut();
+    check_cuda(unsafe { cu_ctx_create(&mut context, 0, device) })?;
+    let context_guard = CudaContextGuard {
+        context,
+        destroy: *cu_ctx_destroy,
+    };
+
+    let key_offsets_bytes = std::mem::size_of_val(batch.key_offsets.as_slice());
+    let mut device_key_offsets = 0_u64;
+    check_cuda(unsafe { cu_mem_alloc(&mut device_key_offsets, key_offsets_bytes) })?;
+    let key_offsets_guard = CudaDeviceAllocationGuard {
+        ptr: device_key_offsets,
+        free: *cu_mem_free,
+    };
+
+    let value_offsets_bytes = std::mem::size_of_val(batch.value_offsets.as_slice());
+    let mut device_value_offsets = 0_u64;
+    check_cuda(unsafe { cu_mem_alloc(&mut device_value_offsets, value_offsets_bytes) })?;
+    let value_offsets_guard = CudaDeviceAllocationGuard {
+        ptr: device_value_offsets,
+        free: *cu_mem_free,
+    };
+
+    let output_words = batch.row_count as usize * 2;
+    let output_bytes = output_words * std::mem::size_of::<u32>();
+    let mut device_output = 0_u64;
+    check_cuda(unsafe { cu_mem_alloc(&mut device_output, output_bytes) })?;
+    let output_guard = CudaDeviceAllocationGuard {
+        ptr: device_output,
+        free: *cu_mem_free,
+    };
+
+    check_cuda(unsafe {
+        cu_memcpy_htod(
+            key_offsets_guard.ptr,
+            batch.key_offsets.as_ptr().cast::<c_void>(),
+            key_offsets_bytes,
+        )
+    })?;
+    check_cuda(unsafe {
+        cu_memcpy_htod(
+            value_offsets_guard.ptr,
+            batch.value_offsets.as_ptr().cast::<c_void>(),
+            value_offsets_bytes,
+        )
+    })?;
+
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+
+    let mut module = std::ptr::null_mut();
+    check_cuda(unsafe { cu_module_load_data(&mut module, ptx.as_ptr().cast::<c_void>()) })?;
+    let module_guard = CudaModuleGuard {
+        module,
+        unload: *cu_module_unload,
+    };
+
+    let mut function = std::ptr::null_mut();
+    check_cuda(unsafe {
+        cu_module_get_function(
+            &mut function,
+            module,
+            c"gpu_db_cuda_mvcc_row_batch_lengths".as_ptr(),
+        )
+    })?;
+
+    let mut key_offsets_arg = key_offsets_guard.ptr;
+    let mut value_offsets_arg = value_offsets_guard.ptr;
+    let mut output_arg = output_guard.ptr;
+    let mut row_count_arg = batch.row_count;
+    let mut args = [
+        (&mut key_offsets_arg as *mut u64).cast::<c_void>(),
+        (&mut value_offsets_arg as *mut u64).cast::<c_void>(),
+        (&mut output_arg as *mut u64).cast::<c_void>(),
+        (&mut row_count_arg as *mut u32).cast::<c_void>(),
+    ];
+    let threads_per_block = 128;
+    let blocks = batch.row_count.div_ceil(threads_per_block);
+    check_cuda(unsafe {
+        cu_launch_kernel(
+            function,
+            blocks,
+            1,
+            1,
+            threads_per_block,
+            1,
+            1,
+            0,
+            std::ptr::null_mut(),
+            args.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    })?;
+    check_cuda(unsafe { cu_ctx_synchronize() })?;
+
+    let mut output = vec![0_u32; output_words];
+    check_cuda(unsafe {
+        cu_memcpy_dtoh(
+            output.as_mut_ptr().cast::<c_void>(),
+            output_guard.ptr,
+            output_bytes,
+        )
+    })?;
+
+    drop(module_guard);
+    drop(output_guard);
+    drop(value_offsets_guard);
+    drop(key_offsets_guard);
+    drop(context_guard);
+
+    Ok(output
+        .chunks_exact(2)
+        .map(|lengths| (lengths[0], lengths[1]))
+        .collect())
+}
+
 fn check_cuda(code: i32) -> Result<(), CudaRuntimeProbeError> {
     if code == 0 {
         Ok(())
@@ -2309,6 +2758,60 @@ mod tests {
             runtime.filter_all_mask(3),
             Err(CudaRuntimeProbeError::DriverLibraryUnavailable)
         );
+        let batch =
+            CudaMvccRowBatch::from_key_values([(b"k".as_slice(), b"v".as_slice())]).unwrap();
+        assert_eq!(
+            runtime.mvcc_row_batch_lengths(&batch),
+            Err(CudaRuntimeProbeError::DriverLibraryUnavailable)
+        );
+    }
+
+    #[test]
+    fn cuda_mvcc_row_batch_encodes_offsets_metadata_and_transfer_size() {
+        let batch = CudaMvccRowBatch::from_key_values_with_metadata([
+            (b"acct:1".as_slice(), b"open".as_slice(), 3, 9, Some(11)),
+            (b"acct:22".as_slice(), b"".as_slice(), 4, u64::MAX, Some(12)),
+            (b"".as_slice(), b"closed".as_slice(), 5, 8, Some(13)),
+        ])
+        .unwrap();
+
+        assert_eq!(batch.row_count, 3);
+        assert_eq!(batch.key_offsets, vec![0, 6, 13, 13]);
+        assert_eq!(batch.key_bytes, b"acct:1acct:22");
+        assert_eq!(batch.value_offsets, vec![0, 4, 4, 10]);
+        assert_eq!(batch.value_bytes, b"openclosed");
+        assert_eq!(batch.begin_txn_ids, vec![3, 4, 5]);
+        assert_eq!(batch.end_txn_ids, vec![9, u64::MAX, 8]);
+        assert_eq!(batch.provenance_handles, vec![11, 12, 13]);
+        assert_eq!(batch.key_len(0), Some(6));
+        assert_eq!(batch.key_len(2), Some(0));
+        assert_eq!(batch.value_len(1), Some(0));
+        assert_eq!(batch.value_len(3), None);
+        assert_eq!(
+            batch.transfer_bytes(),
+            (batch.key_offsets.len() + batch.value_offsets.len()) * std::mem::size_of::<u32>()
+                + batch.key_bytes.len()
+                + batch.value_bytes.len()
+                + batch.begin_txn_ids.len() * std::mem::size_of::<u64>()
+                + batch.end_txn_ids.len() * std::mem::size_of::<u64>()
+                + batch.provenance_handles.len() * std::mem::size_of::<u32>()
+        );
+        assert_eq!(batch.validate(), Ok(()));
+    }
+
+    #[test]
+    fn cuda_mvcc_row_batch_rejects_incoherent_offsets() {
+        let mut batch =
+            CudaMvccRowBatch::from_key_values([(b"acct:1".as_slice(), b"open".as_slice())])
+                .unwrap();
+        batch.key_offsets[1] = 99;
+
+        assert_eq!(
+            batch.validate(),
+            Err(CudaRuntimeProbeError::InvalidInputLength(
+                batch.key_bytes.len()
+            ))
+        );
     }
 
     #[test]
@@ -2413,6 +2916,34 @@ mod tests {
                 .filter_bytes_range_mask(&[], b"acct:1", b"acct:9")
                 .unwrap(),
             Vec::<bool>::new()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a local NVIDIA driver and GPU"]
+    fn cuda_driver_runtime_inspects_mvcc_row_batch_lengths() {
+        let runtime = CudaDriverRuntime::probe().unwrap();
+        let batch = CudaMvccRowBatch::from_key_values_with_metadata([
+            (b"acct:1".as_slice(), b"open".as_slice(), 3, 9, Some(100)),
+            (
+                b"acct:22".as_slice(),
+                b"".as_slice(),
+                4,
+                u64::MAX,
+                Some(101),
+            ),
+            (b"".as_slice(), b"closed".as_slice(), 5, 8, Some(102)),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            runtime.mvcc_row_batch_lengths(&batch).unwrap(),
+            vec![(6, 4), (7, 0), (0, 6)]
+        );
+        let empty = CudaMvccRowBatch::from_key_values(Vec::<(&[u8], &[u8])>::new()).unwrap();
+        assert_eq!(
+            runtime.mvcc_row_batch_lengths(&empty).unwrap(),
+            Vec::<(u32, u32)>::new()
         );
     }
 
