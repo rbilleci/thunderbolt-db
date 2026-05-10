@@ -436,9 +436,21 @@ Validation gate for every completion-gate change:
    - Publish driver/device/runtime evidence with test output.
    - Exit when another developer or runner can repeat the CUDA validation gate without relying on ad hoc machine state.
    - Progress on 2026-05-10: `scripts/run_cuda_parity.sh` now records timestamp/host/kernel/Rust toolchain and `nvidia-smi` GPU inventory to `target/cuda-parity/environment.txt`, then runs the CUDA runtime and MVCC ignored hardware parity suites with `--include-ignored --nocapture`, teeing output to `target/cuda-parity/cuda-parity.log`.
+   - Closeout on 2026-05-10: gate 7 is closed for a reproducible local runner. The runner passed on local hardware (`NVIDIA GeForce RTX 3090`, driver `595.58.03`) and captured repeatable environment/test evidence under `target/cuda-parity/`.
 
 Completion rule:
 - The project is not "CUDA complete" until gates 1-7 are closed, the fallback-rate benchmark target is recorded, and unsupported remaining shapes are deliberately classified as post-v1 scope rather than accidental gaps.
+
+CUDA completion closeout recorded on 2026-05-10:
+- [x] Gate 1: GPU row format and transfer contract
+- [x] Gate 2: Native scan and snapshot visibility parity
+- [x] Gate 3: Native point/key lookup parity
+- [x] Gate 4: Provenance and filter expansion parity
+- [x] Gate 5: Ordering, projection, and composition GPU coverage
+- [x] Gate 6: Benchmark, telemetry, and fallback-rate regression gates
+- [x] Gate 7: GPU CI or reproducible runner
+- [x] Fallback-rate benchmark target recorded for the current mixed MVCC CUDA fixture
+- [x] Unsupported remaining shapes classified as explicit post-milestone `GpuMvccReadParityGap` work
 
 ## First CUDA transition slice (once NVIDIA hardware is available)
 
