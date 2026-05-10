@@ -430,6 +430,7 @@ Validation gate for every completion-gate change:
    - Treat rising fallback rate on the benchmark mix as a regression once a gate is closed.
    - Exit when local runs can distinguish correctness regressions from performance/fallback regressions.
    - Progress on 2026-05-10: `MvccBenchmarkReport::from_results(...)` now summarizes deterministic MVCC workload results into GPU-executed percentage, CPU fallback percentage, H2D/D2H bytes, kernel execution sample/time totals, and batch wait sample/time totals. The first regression fixture mixes CUDA-eligible key-ordered scan and native-source concat reads with an intentionally unsupported distinct composition read so local runs can distinguish coverage/fallback regressions from correctness regressions.
+   - Closeout on 2026-05-10: gate 6 is closed for the first benchmark target. The mixed MVCC CUDA benchmark fixture asserts at least 66.66% GPU-executed workload coverage and at most 33.33% CPU fallback rate for the current three-query mix, while carrying H2D/D2H, kernel time, and batch wait fields forward for real CUDA runner output.
 7. **GPU CI or reproducible runner**
    - Provide either GPU-capable CI or a reproducible local runner script/profile that executes the CUDA parity suite and captures environment details.
    - Publish driver/device/runtime evidence with test output.
