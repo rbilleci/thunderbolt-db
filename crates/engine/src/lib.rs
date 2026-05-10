@@ -1838,76 +1838,196 @@ fn resolve_cuda_native_follow_value_chain_rows(
             continue;
         };
 
-        let mut current = seed.clone();
-        let mut provenance_path = vec![seed.clone()];
-        let mut previous = None;
-        let mut chain_complete = true;
-        for _ in 0..plan.value_key_hops {
-            previous = Some(current.clone());
-            let next_key = current.value.clone();
-            let Some(next) =
-                cuda_visible_key_rows(all_version_rows, &next_key, visibility, runtime)?
-                    .into_iter()
-                    .next()
-            else {
-                chain_complete = false;
-                break;
-            };
-            current = next;
-            provenance_path.push(current.clone());
-        }
+        rows.extend(resolve_cuda_native_follow_value_chain_from_seed(
+            all_version_rows,
+            &seed,
+            visibility,
+            plan,
+            provenance,
+            None,
+            runtime,
+        )?);
+    }
 
-        if !chain_complete {
+    Ok(rows)
+}
+
+fn resolve_cuda_native_follow_value_chain_from_seed(
+    all_version_rows: &[ResolvedMvccRow],
+    seed: &TupleVersion,
+    visibility: StorageVisibility,
+    plan: MvccValueChainPlan,
+    provenance: MvccSourceProvenance,
+    branch_label: Option<&str>,
+    runtime: &CudaDriverRuntime,
+) -> Result<Vec<ResolvedMvccRow>, FallbackReason> {
+    let mut current = seed.clone();
+    let mut provenance_path = vec![seed.clone()];
+    let mut previous = None;
+    for _ in 0..plan.value_key_hops {
+        previous = Some(current.clone());
+        let next_key = current.value.clone();
+        let Some(next) = cuda_visible_key_rows(all_version_rows, &next_key, visibility, runtime)?
+            .into_iter()
+            .next()
+        else {
+            return Ok(Vec::new());
+        };
+        current = next;
+        provenance_path.push(current.clone());
+    }
+
+    let terminal_input_index = match plan.terminal {
+        MvccValueChainTerminal::CurrentRow => {
+            if plan.value_key_hops == 0 {
+                0
+            } else {
+                provenance_path.len().saturating_sub(2)
+            }
+        }
+        MvccValueChainTerminal::CurrentValuePrefixes => provenance_path.len().saturating_sub(1),
+    };
+    let provenance_tuple = match provenance {
+        MvccSourceProvenance::Seed => seed.clone(),
+        MvccSourceProvenance::TerminalInput => match plan.terminal {
+            MvccValueChainTerminal::CurrentRow => previous.unwrap_or_else(|| seed.clone()),
+            MvccValueChainTerminal::CurrentValuePrefixes => current.clone(),
+        },
+    };
+
+    let mut rows = Vec::new();
+    match plan.terminal {
+        MvccValueChainTerminal::CurrentRow => rows.push(ResolvedMvccRow {
+            branch_label: branch_label.map(ToOwned::to_owned),
+            source_key: Some(provenance_tuple.key.clone()),
+            source_tuple: Some(provenance_tuple),
+            provenance_path: Some(provenance_path),
+            terminal_input_index: Some(terminal_input_index),
+            tuple: current,
+        }),
+        MvccValueChainTerminal::CurrentValuePrefixes => {
+            for tuple in
+                cuda_visible_key_prefix_rows(all_version_rows, &current.value, visibility, runtime)?
+            {
+                rows.push(ResolvedMvccRow {
+                    branch_label: branch_label.map(ToOwned::to_owned),
+                    source_key: Some(provenance_tuple.key.clone()),
+                    source_tuple: Some(provenance_tuple.clone()),
+                    provenance_path: Some(provenance_path.clone()),
+                    terminal_input_index: Some(terminal_input_index),
+                    tuple,
+                });
+            }
+        }
+    }
+    Ok(rows)
+}
+
+fn resolve_cuda_native_follow_value_chain_branches_rows(
+    all_version_rows: &[ResolvedMvccRow],
+    keys: &[String],
+    visibility: StorageVisibility,
+    plans: &[MvccValueChainPlan],
+    fan_in: MvccValueChainBranchFanIn,
+    provenance: MvccSourceProvenance,
+    runtime: &CudaDriverRuntime,
+) -> Result<Vec<ResolvedMvccRow>, FallbackReason> {
+    let mut rows = Vec::new();
+    for key in keys {
+        let Some(seed) = cuda_visible_key_rows(all_version_rows, key, visibility, runtime)?
+            .into_iter()
+            .next()
+        else {
             continue;
-        }
+        };
 
-        let terminal_input_index = if plan.value_key_hops == 0 {
-            0
-        } else {
-            match plan.terminal {
-                MvccValueChainTerminal::CurrentRow => provenance_path.len().saturating_sub(2),
-                MvccValueChainTerminal::CurrentValuePrefixes => {
-                    provenance_path.len().saturating_sub(1)
+        match fan_in {
+            MvccValueChainBranchFanIn::AllBranches => {
+                for plan in plans {
+                    rows.extend(resolve_cuda_native_follow_value_chain_from_seed(
+                        all_version_rows,
+                        &seed,
+                        visibility,
+                        *plan,
+                        provenance,
+                        None,
+                        runtime,
+                    )?);
                 }
             }
-        };
-        let provenance_tuple = match provenance {
-            MvccSourceProvenance::Seed => seed,
-            MvccSourceProvenance::TerminalInput => match plan.terminal {
-                MvccValueChainTerminal::CurrentRow => previous.unwrap_or_else(|| current.clone()),
-                MvccValueChainTerminal::CurrentValuePrefixes => current.clone(),
-            },
-        };
-
-        match plan.terminal {
-            MvccValueChainTerminal::CurrentRow => rows.push(ResolvedMvccRow {
-                branch_label: None,
-                source_key: Some(provenance_tuple.key.clone()),
-                source_tuple: Some(provenance_tuple),
-                provenance_path: Some(provenance_path),
-                terminal_input_index: Some(terminal_input_index),
-                tuple: current,
-            }),
-            MvccValueChainTerminal::CurrentValuePrefixes => {
-                for tuple in cuda_visible_key_prefix_rows(
-                    all_version_rows,
-                    &current.value,
-                    visibility,
-                    runtime,
-                )? {
-                    rows.push(ResolvedMvccRow {
-                        branch_label: None,
-                        source_key: Some(provenance_tuple.key.clone()),
-                        source_tuple: Some(provenance_tuple.clone()),
-                        provenance_path: Some(provenance_path.clone()),
-                        terminal_input_index: Some(terminal_input_index),
-                        tuple,
-                    });
+            MvccValueChainBranchFanIn::FirstNonEmptyBranch => {
+                for plan in plans {
+                    let branch_rows = resolve_cuda_native_follow_value_chain_from_seed(
+                        all_version_rows,
+                        &seed,
+                        visibility,
+                        *plan,
+                        provenance,
+                        None,
+                        runtime,
+                    )?;
+                    if !branch_rows.is_empty() {
+                        rows.extend(branch_rows);
+                        break;
+                    }
                 }
             }
         }
     }
+    Ok(rows)
+}
 
+fn resolve_cuda_native_follow_value_chain_labeled_branches_rows(
+    all_version_rows: &[ResolvedMvccRow],
+    keys: &[String],
+    visibility: StorageVisibility,
+    branches: &[MvccLabeledValueChainBranch],
+    fan_in: MvccValueChainBranchFanIn,
+    provenance: MvccSourceProvenance,
+    runtime: &CudaDriverRuntime,
+) -> Result<Vec<ResolvedMvccRow>, FallbackReason> {
+    let mut rows = Vec::new();
+    for key in keys {
+        let Some(seed) = cuda_visible_key_rows(all_version_rows, key, visibility, runtime)?
+            .into_iter()
+            .next()
+        else {
+            continue;
+        };
+
+        match fan_in {
+            MvccValueChainBranchFanIn::AllBranches => {
+                for branch in branches {
+                    rows.extend(resolve_cuda_native_follow_value_chain_from_seed(
+                        all_version_rows,
+                        &seed,
+                        visibility,
+                        branch.plan,
+                        provenance,
+                        Some(branch.label.as_str()),
+                        runtime,
+                    )?);
+                }
+            }
+            MvccValueChainBranchFanIn::FirstNonEmptyBranch => {
+                for branch in branches {
+                    let branch_rows = resolve_cuda_native_follow_value_chain_from_seed(
+                        all_version_rows,
+                        &seed,
+                        visibility,
+                        branch.plan,
+                        provenance,
+                        Some(branch.label.as_str()),
+                        runtime,
+                    )?;
+                    if !branch_rows.is_empty() {
+                        rows.extend(branch_rows);
+                        break;
+                    }
+                }
+            }
+        }
+    }
     Ok(rows)
 }
 
@@ -1925,6 +2045,66 @@ fn execute_cuda_native_follow_value_chain_query(
         keys,
         query.visibility,
         plan,
+        provenance,
+        runtime,
+    )?;
+
+    match backend.execute(query, rows) {
+        MvccBackendDispatch::Executed(executed) => Ok(FinalizedMvccBackendExecution {
+            executed_target: executed.executed_target,
+            fallback_reason: None,
+            rows: executed.rows,
+        }),
+        MvccBackendDispatch::Fallback { reason, .. } => Err(reason),
+    }
+}
+
+fn execute_cuda_native_follow_value_chain_branches_query(
+    query: &MvccReadQuery,
+    keys: &[String],
+    plans: &[MvccValueChainPlan],
+    fan_in: MvccValueChainBranchFanIn,
+    provenance: MvccSourceProvenance,
+    all_version_rows: Vec<ResolvedMvccRow>,
+    backend: &CudaMvccExecutionBackend,
+) -> Result<FinalizedMvccBackendExecution, FallbackReason> {
+    let runtime = ensure_cuda_backend_available(backend)?;
+    let rows = resolve_cuda_native_follow_value_chain_branches_rows(
+        &all_version_rows,
+        keys,
+        query.visibility,
+        plans,
+        fan_in,
+        provenance,
+        runtime,
+    )?;
+
+    match backend.execute(query, rows) {
+        MvccBackendDispatch::Executed(executed) => Ok(FinalizedMvccBackendExecution {
+            executed_target: executed.executed_target,
+            fallback_reason: None,
+            rows: executed.rows,
+        }),
+        MvccBackendDispatch::Fallback { reason, .. } => Err(reason),
+    }
+}
+
+fn execute_cuda_native_follow_value_chain_labeled_branches_query(
+    query: &MvccReadQuery,
+    keys: &[String],
+    branches: &[MvccLabeledValueChainBranch],
+    fan_in: MvccValueChainBranchFanIn,
+    provenance: MvccSourceProvenance,
+    all_version_rows: Vec<ResolvedMvccRow>,
+    backend: &CudaMvccExecutionBackend,
+) -> Result<FinalizedMvccBackendExecution, FallbackReason> {
+    let runtime = ensure_cuda_backend_available(backend)?;
+    let rows = resolve_cuda_native_follow_value_chain_labeled_branches_rows(
+        &all_version_rows,
+        keys,
+        query.visibility,
+        branches,
+        fan_in,
         provenance,
         runtime,
     )?;
@@ -2232,7 +2412,12 @@ fn is_cuda_native_concat_source(source: &MvccReadSource) -> bool {
 }
 
 fn is_cuda_native_follow_value_chain_source(source: &MvccReadSource) -> bool {
-    matches!(source, MvccReadSource::FollowValueChain { .. })
+    matches!(
+        source,
+        MvccReadSource::FollowValueChain { .. }
+            | MvccReadSource::FollowValueChainBranches { .. }
+            | MvccReadSource::FollowValueChainLabeledBranches { .. }
+    )
 }
 
 fn is_cuda_order_supported(query: &MvccReadQuery, order: &MvccReadOrder) -> bool {
@@ -6044,6 +6229,34 @@ impl Engine {
                 rows,
                 backend,
             ),
+            MvccReadSource::FollowValueChainBranches {
+                keys,
+                plans,
+                fan_in,
+                provenance,
+            } => execute_cuda_native_follow_value_chain_branches_query(
+                query,
+                keys,
+                plans,
+                *fan_in,
+                *provenance,
+                rows,
+                backend,
+            ),
+            MvccReadSource::FollowValueChainLabeledBranches {
+                keys,
+                branches,
+                fan_in,
+                provenance,
+            } => execute_cuda_native_follow_value_chain_labeled_branches_query(
+                query,
+                keys,
+                branches,
+                *fan_in,
+                *provenance,
+                rows,
+                backend,
+            ),
             _ => execute_cuda_native_single_source_query(query, rows, backend),
         }
         .unwrap_or_else(|reason| {
@@ -8466,6 +8679,42 @@ mod tests {
         };
         assert_eq!(first_cuda_slice_query_gap(&query), None);
         assert!(is_cuda_native_source_query(&query));
+
+        query.source = MvccReadSource::FollowValueChainBranches {
+            keys: vec!["acct:1".to_string(), "acct:2".to_string()],
+            plans: vec![
+                MvccValueChainPlan {
+                    value_key_hops: 1,
+                    terminal: MvccValueChainTerminal::CurrentRow,
+                },
+                MvccValueChainPlan {
+                    value_key_hops: 1,
+                    terminal: MvccValueChainTerminal::CurrentValuePrefixes,
+                },
+            ],
+            fan_in: MvccValueChainBranchFanIn::FirstNonEmptyBranch,
+            provenance: MvccSourceProvenance::Seed,
+        };
+        assert_eq!(first_cuda_slice_query_gap(&query), None);
+        assert!(is_cuda_native_source_query(&query));
+
+        query.source = MvccReadSource::FollowValueChainLabeledBranches {
+            keys: vec!["acct:1".to_string()],
+            branches: vec![MvccLabeledValueChainBranch {
+                label: "members".to_string(),
+                plan: MvccValueChainPlan {
+                    value_key_hops: 1,
+                    terminal: MvccValueChainTerminal::CurrentValuePrefixes,
+                },
+            }],
+            fan_in: MvccValueChainBranchFanIn::AllBranches,
+            provenance: MvccSourceProvenance::TerminalInput,
+        };
+        query.filter = Some(MvccReadFilter::BranchLabelEquals("members".to_string()));
+        query.order = Some(MvccReadOrder::BranchLabelAsc);
+        query.projection = MvccProjection::BranchLabelTargetValue;
+        assert_eq!(first_cuda_slice_query_gap(&query), None);
+        assert!(is_cuda_native_source_query(&query));
     }
 
     #[test]
@@ -10817,6 +11066,81 @@ mod tests {
                     source_key: Some("profile:2".to_string()),
                     key: Some("team:beta:1".to_string()),
                     value: Some("team:beta".to_string()),
+                },
+            ]
+        );
+        assert_eq!(e.metrics().fallback_total, 0);
+    }
+
+    #[test]
+    #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
+    fn execute_mvcc_query_cuda_driver_runs_labeled_branch_source_resolution_without_fallback() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=profile:1").unwrap();
+        e.execute_text(2, "SET acct:2=profile:2").unwrap();
+        e.execute_text(3, "SET profile:1=team:alpha").unwrap();
+        e.execute_text(4, "SET profile:2=team:beta").unwrap();
+        e.execute_text(5, "SET team:alpha=Alpha Team").unwrap();
+        e.execute_text(6, "SET team:beta=Beta Team").unwrap();
+        e.execute_text(7, "SET team:alpha:1=Alice").unwrap();
+        e.execute_text(8, "SET team:beta:1=Bob").unwrap();
+
+        let result = e
+            .execute_mvcc_query_with_cuda_driver_probe(&MvccReadQuery {
+                source: MvccReadSource::FollowValueChainLabeledBranches {
+                    keys: vec!["acct:2".to_string(), "acct:1".to_string()],
+                    branches: vec![
+                        MvccLabeledValueChainBranch {
+                            label: "missing".to_string(),
+                            plan: MvccValueChainPlan {
+                                value_key_hops: 3,
+                                terminal: MvccValueChainTerminal::CurrentRow,
+                            },
+                        },
+                        MvccLabeledValueChainBranch {
+                            label: "members".to_string(),
+                            plan: MvccValueChainPlan {
+                                value_key_hops: 1,
+                                terminal: MvccValueChainTerminal::CurrentValuePrefixes,
+                            },
+                        },
+                    ],
+                    fan_in: MvccValueChainBranchFanIn::FirstNonEmptyBranch,
+                    provenance: MvccSourceProvenance::TerminalInput,
+                },
+                visibility: StorageVisibility { read_txn_id: 8 },
+                filter: Some(MvccReadFilter::BranchLabelEquals("members".to_string())),
+                order: Some(MvccReadOrder::SourceKeyAsc),
+                projection: MvccProjection::BranchLabelTargetValue,
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.fallback_reason, None);
+        assert_eq!(
+            result.rows,
+            vec![
+                MvccReadRow {
+                    source_key: Some("profile:1".to_string()),
+                    key: Some("members".to_string()),
+                    value: Some("Alpha Team".to_string()),
+                },
+                MvccReadRow {
+                    source_key: Some("profile:1".to_string()),
+                    key: Some("members".to_string()),
+                    value: Some("Alice".to_string()),
+                },
+                MvccReadRow {
+                    source_key: Some("profile:2".to_string()),
+                    key: Some("members".to_string()),
+                    value: Some("Beta Team".to_string()),
+                },
+                MvccReadRow {
+                    source_key: Some("profile:2".to_string()),
+                    key: Some("members".to_string()),
+                    value: Some("Bob".to_string()),
                 },
             ]
         );
