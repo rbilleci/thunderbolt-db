@@ -1213,7 +1213,10 @@ fn cuda_filter_mask(
             value.as_bytes(),
             *min_count,
         ),
-        MvccReadFilter::ProvenanceBundlePathEquals { .. }
+        MvccReadFilter::SourceKeyPrefix(_)
+        | MvccReadFilter::BranchLabelEquals(_)
+        | MvccReadFilter::SourceValueEquals(_)
+        | MvccReadFilter::ProvenanceBundlePathEquals { .. }
         | MvccReadFilter::ProvenanceBundlePathContains { .. }
         | MvccReadFilter::ProvenanceBundlePathCountAtLeast { .. }
         | MvccReadFilter::ProvenanceBundlePathPairAtDistance { .. }
@@ -1294,7 +1297,6 @@ fn cuda_filter_mask(
             }
             Ok(combined)
         }
-        _ => Err(()),
     }
 }
 
@@ -1772,13 +1774,13 @@ impl FirstCudaSliceGap {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
+#[allow(dead_code)]
 enum FirstCudaFilterGap {
     SourceRelativeFilter,
     BranchLabelFilter,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[allow(dead_code)]
 impl FirstCudaFilterGap {
     fn label(self) -> &'static str {
         match self {
@@ -1875,10 +1877,9 @@ fn first_cuda_slice_filter_gap_detail(filter: &MvccReadFilter) -> Option<FirstCu
         | MvccReadFilter::ProvenanceBundlePathLastMixedOccurrenceWithin { .. }
         | MvccReadFilter::ProvenanceBundlePathSegmentEquals { .. }
         | MvccReadFilter::ProvenanceBundleLenEquals { .. } => None,
-        MvccReadFilter::SourceKeyPrefix(_) | MvccReadFilter::SourceValueEquals(_) => {
-            Some(FirstCudaFilterGap::SourceRelativeFilter)
-        }
-        MvccReadFilter::BranchLabelEquals(_) => Some(FirstCudaFilterGap::BranchLabelFilter),
+        MvccReadFilter::SourceKeyPrefix(_)
+        | MvccReadFilter::SourceValueEquals(_)
+        | MvccReadFilter::BranchLabelEquals(_) => None,
         MvccReadFilter::All(filters) | MvccReadFilter::Any(filters) => {
             filters.iter().find_map(first_cuda_slice_filter_gap_detail)
         }
@@ -1956,6 +1957,19 @@ fn cuda_filter_contains_provenance_predicate(filter: &MvccReadFilter) -> bool {
             .iter()
             .any(cuda_filter_contains_provenance_predicate),
         _ => false,
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn cuda_filter_contains_cpu_resolved_predicate(filter: &MvccReadFilter) -> bool {
+    match filter {
+        MvccReadFilter::SourceKeyPrefix(_)
+        | MvccReadFilter::SourceValueEquals(_)
+        | MvccReadFilter::BranchLabelEquals(_) => true,
+        MvccReadFilter::All(filters) | MvccReadFilter::Any(filters) => filters
+            .iter()
+            .any(cuda_filter_contains_cpu_resolved_predicate),
+        _ => cuda_filter_contains_provenance_predicate(filter),
     }
 }
 
@@ -2066,7 +2080,7 @@ fn first_cuda_slice_query_gap(query: &MvccReadQuery) -> Option<FirstCudaSliceGap
         && !query
             .filter
             .as_ref()
-            .is_some_and(cuda_filter_contains_provenance_predicate)
+            .is_some_and(cuda_filter_contains_cpu_resolved_predicate)
     {
         return Some(FirstCudaSliceGap::UnsupportedFilter);
     }
@@ -8199,24 +8213,18 @@ mod tests {
             MvccReadFilter::KeyPrefix("acct:".to_string()),
             MvccReadFilter::SourceKeyPrefix("seed:".to_string()),
         ])]));
-        assert_eq!(
-            first_cuda_slice_query_gap(&query),
-            Some(FirstCudaSliceGap::UnsupportedFilter)
-        );
+        assert_eq!(first_cuda_slice_query_gap(&query), None);
         assert_eq!(
             first_cuda_slice_filter_gap_detail(query.filter.as_ref().unwrap()),
-            Some(FirstCudaFilterGap::SourceRelativeFilter)
+            None
         );
 
         query = first_cuda_slice_support_query();
         query.filter = Some(MvccReadFilter::BranchLabelEquals("fallback".to_string()));
-        assert_eq!(
-            first_cuda_slice_query_gap(&query),
-            Some(FirstCudaSliceGap::UnsupportedFilter)
-        );
+        assert_eq!(first_cuda_slice_query_gap(&query), None);
         assert_eq!(
             first_cuda_slice_filter_gap_detail(query.filter.as_ref().unwrap()),
-            Some(FirstCudaFilterGap::BranchLabelFilter)
+            None
         );
     }
 
@@ -8350,6 +8358,30 @@ mod tests {
     }
 
     #[test]
+    fn first_cuda_slice_query_gap_accepts_source_relative_filters_over_resolved_source() {
+        let mut query = first_cuda_slice_support_query();
+        query.source = MvccReadSource::FollowValueChainLabeledBranches {
+            keys: vec!["acct:1".to_string()],
+            branches: vec![MvccLabeledValueChainBranch {
+                label: "team".to_string(),
+                plan: MvccValueChainPlan {
+                    value_key_hops: 2,
+                    terminal: MvccValueChainTerminal::CurrentRow,
+                },
+            }],
+            fan_in: MvccValueChainBranchFanIn::AllBranches,
+            provenance: MvccSourceProvenance::Seed,
+        };
+        query.filter = Some(MvccReadFilter::All(vec![
+            MvccReadFilter::SourceKeyPrefix("acct:".to_string()),
+            MvccReadFilter::SourceValueEquals("profile:1".to_string()),
+            MvccReadFilter::BranchLabelEquals("team".to_string()),
+        ]));
+
+        assert_eq!(first_cuda_slice_query_gap(&query), None);
+    }
+
+    #[test]
     fn first_cuda_slice_gap_labels_are_stable_for_docs_and_future_routing() {
         assert_eq!(
             FirstCudaSliceGap::UnsupportedSource.label(),
@@ -8370,14 +8402,6 @@ mod tests {
         assert_eq!(
             FirstCudaSliceGap::EmptyLogicalFilterTree.label(),
             "empty_logical_filter_tree"
-        );
-        assert_eq!(
-            FirstCudaFilterGap::SourceRelativeFilter.label(),
-            "source_relative_filter"
-        );
-        assert_eq!(
-            FirstCudaFilterGap::BranchLabelFilter.label(),
-            "branch_label_filter"
         );
     }
 
@@ -9382,6 +9406,57 @@ mod tests {
 
     #[test]
     #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
+    fn execute_mvcc_query_cuda_driver_runs_source_relative_filters_without_fallback() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=profile:1").unwrap();
+        e.execute_text(2, "SET acct:2=profile:2").unwrap();
+        e.execute_text(3, "SET profile:1=team:alpha").unwrap();
+        e.execute_text(4, "SET profile:2=team:beta").unwrap();
+        e.execute_text(5, "SET team:alpha=Alpha Team").unwrap();
+        e.execute_text(6, "SET team:beta=Beta Team").unwrap();
+
+        let result = e
+            .execute_mvcc_query_with_cuda_driver_probe(&MvccReadQuery {
+                source: MvccReadSource::FollowValueChainLabeledBranches {
+                    keys: vec!["acct:1".to_string(), "acct:2".to_string()],
+                    branches: vec![MvccLabeledValueChainBranch {
+                        label: "team".to_string(),
+                        plan: MvccValueChainPlan {
+                            value_key_hops: 2,
+                            terminal: MvccValueChainTerminal::CurrentRow,
+                        },
+                    }],
+                    fan_in: MvccValueChainBranchFanIn::AllBranches,
+                    provenance: MvccSourceProvenance::Seed,
+                },
+                visibility: StorageVisibility { read_txn_id: 6 },
+                filter: Some(MvccReadFilter::All(vec![
+                    MvccReadFilter::SourceKeyPrefix("acct:".to_string()),
+                    MvccReadFilter::SourceValueEquals("profile:1".to_string()),
+                    MvccReadFilter::BranchLabelEquals("team".to_string()),
+                ])),
+                order: None,
+                projection: MvccProjection::KeyValue,
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.fallback_reason, None);
+        assert_eq!(
+            result.rows,
+            vec![MvccReadRow {
+                source_key: Some("acct:1".to_string()),
+                key: Some("team:alpha".to_string()),
+                value: Some("Alpha Team".to_string()),
+            }]
+        );
+        assert_eq!(e.metrics().fallback_total, 0);
+    }
+
+    #[test]
+    #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
     fn execute_mvcc_query_cuda_driver_runs_provenance_bundle_filters_without_fallback() {
         let mut e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:2").unwrap();
@@ -10057,6 +10132,64 @@ mod tests {
                     value: Some("Bianca".to_string()),
                 },
             ]
+        );
+        assert_eq!(e.metrics().fallback_total, 1);
+    }
+
+    #[test]
+    fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_source_relative_filters() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=profile:1").unwrap();
+        e.execute_text(2, "SET acct:2=profile:2").unwrap();
+        e.execute_text(3, "SET profile:1=team:alpha").unwrap();
+        e.execute_text(4, "SET profile:2=team:beta").unwrap();
+        e.execute_text(5, "SET team:alpha=Alpha Team").unwrap();
+        e.execute_text(6, "SET team:beta=Beta Team").unwrap();
+
+        let query = MvccReadQuery {
+            source: MvccReadSource::FollowValueChainLabeledBranches {
+                keys: vec!["acct:1".to_string(), "acct:2".to_string()],
+                branches: vec![MvccLabeledValueChainBranch {
+                    label: "team".to_string(),
+                    plan: MvccValueChainPlan {
+                        value_key_hops: 2,
+                        terminal: MvccValueChainTerminal::CurrentRow,
+                    },
+                }],
+                fan_in: MvccValueChainBranchFanIn::AllBranches,
+                provenance: MvccSourceProvenance::Seed,
+            },
+            visibility: StorageVisibility { read_txn_id: 6 },
+            filter: Some(MvccReadFilter::All(vec![
+                MvccReadFilter::SourceKeyPrefix("acct:".to_string()),
+                MvccReadFilter::SourceValueEquals("profile:1".to_string()),
+                MvccReadFilter::BranchLabelEquals("team".to_string()),
+            ])),
+            order: None,
+            projection: MvccProjection::KeyValue,
+            limit: None,
+        };
+
+        assert_eq!(first_cuda_slice_query_gap(&query), None);
+
+        let cpu = e.execute_mvcc_query(&query).unwrap();
+        assert_mvcc_query_uses_tracked_cpu_fallback(&e, &cpu, 1);
+
+        let backend = e
+            .execute_mvcc_query_with_backend_fallback(&query, &FirstCudaSliceParityBackend)
+            .unwrap();
+
+        assert_eq!(backend.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(backend.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(backend.fallback_reason, None);
+        assert_eq!(backend.rows, cpu.rows);
+        assert_eq!(
+            backend.rows,
+            vec![MvccReadRow {
+                source_key: Some("acct:1".to_string()),
+                key: Some("team:alpha".to_string()),
+                value: Some("Alpha Team".to_string()),
+            }]
         );
         assert_eq!(e.metrics().fallback_total, 1);
     }
