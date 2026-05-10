@@ -5,8 +5,9 @@ use std::time::{Duration, Instant};
 
 use gpu_db_batching::{BatchItem, DualTriggerBatcher, FlushReason};
 use gpu_db_execution::{
-    CudaDriverRuntime, DeviceRouter, DeviceTarget, FilterOperator, LimitOperator, MockGpuRuntime,
-    Operator, PlannedOp, ProjectOperator, RouteDecision, ScanOperator, SortOperator,
+    CudaDriverRuntime, CudaMvccRowBatch, DeviceRouter, DeviceTarget, FilterOperator, LimitOperator,
+    MockGpuRuntime, Operator, PlannedOp, ProjectOperator, RouteDecision, ScanOperator,
+    SortOperator,
 };
 use gpu_db_metrics::{BatchFlushReason, FallbackReason, RuntimeMetrics};
 use gpu_db_observability::{
@@ -993,13 +994,19 @@ fn execute_cuda_supported_filter(
     runtime: &CudaDriverRuntime,
     gpu_id: u16,
 ) -> Result<MvccBackendExecution, Vec<ResolvedMvccRow>> {
-    let mask = if let Some(filter) = query.filter.as_ref() {
+    let mut mask = cuda_visibility_mask(&rows, query.visibility.read_txn_id, runtime)
+        .map_err(|_| rows.clone())?;
+    let filter_mask = if let Some(filter) = query.filter.as_ref() {
         cuda_filter_mask(filter, &rows, runtime).map_err(|_| rows.clone())?
     } else {
         runtime
             .filter_all_mask(rows.len())
             .map_err(|_| rows.clone())?
     };
+
+    for (visible, matched) in mask.iter_mut().zip(filter_mask) {
+        *visible &= matched;
+    }
 
     let projection = &query.projection;
     let rows = rows
@@ -1012,6 +1019,26 @@ fn execute_cuda_supported_filter(
         executed_target: DeviceTarget::Gpu(gpu_id),
         rows,
     })
+}
+
+fn cuda_visibility_mask(
+    rows: &[ResolvedMvccRow],
+    read_txn_id: u64,
+    runtime: &CudaDriverRuntime,
+) -> Result<Vec<bool>, ()> {
+    let batch = CudaMvccRowBatch::from_key_values_with_metadata(rows.iter().map(|row| {
+        (
+            row.tuple.key.as_bytes(),
+            row.tuple.value.as_bytes(),
+            row.tuple.created_by,
+            row.tuple.deleted_by.unwrap_or(u64::MAX),
+            None,
+        )
+    }))
+    .map_err(|_| ())?;
+    runtime
+        .mvcc_visibility_mask(&batch, read_txn_id)
+        .map_err(|_| ())
 }
 
 fn cuda_filter_mask(
@@ -7632,6 +7659,47 @@ mod tests {
         let mut e = Engine::new_local();
         e.execute_text(1, "SET acct:1=open").unwrap();
         e.execute_text(2, "SET acct:2=hold").unwrap();
+
+        let result = e
+            .execute_mvcc_query_with_cuda_driver_probe(&MvccReadQuery {
+                source: MvccReadSource::FullScan,
+                visibility: StorageVisibility { read_txn_id: 2 },
+                filter: None,
+                order: None,
+                projection: MvccProjection::KeyValue,
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.fallback_reason, None);
+        assert_eq!(
+            result.rows,
+            vec![
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("acct:1".to_string()),
+                    value: Some("open".to_string()),
+                },
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("acct:2".to_string()),
+                    value: Some("hold".to_string()),
+                },
+            ]
+        );
+        assert_eq!(e.metrics().fallback_total, 0);
+    }
+
+    #[test]
+    #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
+    fn execute_mvcc_query_cuda_driver_runs_historical_visibility_mask_without_fallback() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=open").unwrap();
+        e.execute_text(2, "SET acct:2=hold").unwrap();
+        e.execute_text(3, "SET acct:1=closed").unwrap();
+        e.execute_text(4, "DELETE acct:2").unwrap();
 
         let result = e
             .execute_mvcc_query_with_cuda_driver_probe(&MvccReadQuery {
