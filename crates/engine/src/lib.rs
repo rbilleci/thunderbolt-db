@@ -1658,8 +1658,42 @@ impl FirstCudaSliceGap {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+enum FirstCudaFilterGap {
+    SourceRelativeFilter,
+    BranchLabelFilter,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl FirstCudaFilterGap {
+    fn label(self) -> &'static str {
+        match self {
+            Self::SourceRelativeFilter => "source_relative_filter",
+            Self::BranchLabelFilter => "branch_label_filter",
+        }
+    }
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 fn first_cuda_slice_filter_gap(filter: &MvccReadFilter) -> Option<FirstCudaSliceGap> {
+    if first_cuda_slice_filter_gap_detail(filter).is_some() {
+        return Some(FirstCudaSliceGap::UnsupportedFilter);
+    }
+
+    match filter {
+        MvccReadFilter::All(filters) | MvccReadFilter::Any(filters) if filters.is_empty() => {
+            Some(FirstCudaSliceGap::EmptyLogicalFilterTree)
+        }
+        MvccReadFilter::All(filters) | MvccReadFilter::Any(filters) => {
+            filters.iter().find_map(first_cuda_slice_filter_gap)
+        }
+        _ => None,
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn first_cuda_slice_filter_gap_detail(filter: &MvccReadFilter) -> Option<FirstCudaFilterGap> {
     match filter {
         MvccReadFilter::KeyPrefix(_)
         | MvccReadFilter::ProvenanceKeyPrefix { .. }
@@ -1728,14 +1762,13 @@ fn first_cuda_slice_filter_gap(filter: &MvccReadFilter) -> Option<FirstCudaSlice
         | MvccReadFilter::ProvenanceBundlePathLastMixedOccurrenceWithin { .. }
         | MvccReadFilter::ProvenanceBundlePathSegmentEquals { .. }
         | MvccReadFilter::ProvenanceBundleLenEquals { .. } => None,
-        MvccReadFilter::All(filters) | MvccReadFilter::Any(filters) => {
-            if filters.is_empty() {
-                Some(FirstCudaSliceGap::EmptyLogicalFilterTree)
-            } else {
-                filters.iter().find_map(first_cuda_slice_filter_gap)
-            }
+        MvccReadFilter::SourceKeyPrefix(_) | MvccReadFilter::SourceValueEquals(_) => {
+            Some(FirstCudaFilterGap::SourceRelativeFilter)
         }
-        _ => Some(FirstCudaSliceGap::UnsupportedFilter),
+        MvccReadFilter::BranchLabelEquals(_) => Some(FirstCudaFilterGap::BranchLabelFilter),
+        MvccReadFilter::All(filters) | MvccReadFilter::Any(filters) => {
+            filters.iter().find_map(first_cuda_slice_filter_gap_detail)
+        }
     }
 }
 
@@ -7947,6 +7980,21 @@ mod tests {
             first_cuda_slice_query_gap(&query),
             Some(FirstCudaSliceGap::UnsupportedFilter)
         );
+        assert_eq!(
+            first_cuda_slice_filter_gap_detail(query.filter.as_ref().unwrap()),
+            Some(FirstCudaFilterGap::SourceRelativeFilter)
+        );
+
+        query = first_cuda_slice_support_query();
+        query.filter = Some(MvccReadFilter::BranchLabelEquals("fallback".to_string()));
+        assert_eq!(
+            first_cuda_slice_query_gap(&query),
+            Some(FirstCudaSliceGap::UnsupportedFilter)
+        );
+        assert_eq!(
+            first_cuda_slice_filter_gap_detail(query.filter.as_ref().unwrap()),
+            Some(FirstCudaFilterGap::BranchLabelFilter)
+        );
     }
 
     #[test]
@@ -8071,6 +8119,14 @@ mod tests {
         assert_eq!(
             FirstCudaSliceGap::EmptyLogicalFilterTree.label(),
             "empty_logical_filter_tree"
+        );
+        assert_eq!(
+            FirstCudaFilterGap::SourceRelativeFilter.label(),
+            "source_relative_filter"
+        );
+        assert_eq!(
+            FirstCudaFilterGap::BranchLabelFilter.label(),
+            "branch_label_filter"
         );
     }
 
