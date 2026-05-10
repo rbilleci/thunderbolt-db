@@ -1633,6 +1633,45 @@ fn execute_cuda_native_key_batch_query(
     })
 }
 
+fn execute_cuda_native_concat_query(
+    query: &MvccReadQuery,
+    sources: &[MvccReadSource],
+    all_version_rows: Vec<ResolvedMvccRow>,
+    backend: &CudaMvccExecutionBackend,
+) -> Result<FinalizedMvccBackendExecution, FallbackReason> {
+    let mut rows = Vec::new();
+    for source in sources {
+        let source_query = MvccReadQuery {
+            source: source.clone(),
+            visibility: query.visibility,
+            filter: query.filter.clone(),
+            order: None,
+            projection: query.projection.clone(),
+            limit: None,
+        };
+        let execution = match source {
+            MvccReadSource::KeyBatchLookup { keys } => execute_cuda_native_key_batch_query(
+                &source_query,
+                keys,
+                all_version_rows.clone(),
+                backend,
+            )?,
+            _ => execute_cuda_native_single_source_query(
+                &source_query,
+                all_version_rows.clone(),
+                backend,
+            )?,
+        };
+        rows.extend(execution.rows);
+    }
+
+    Ok(FinalizedMvccBackendExecution {
+        executed_target: DeviceTarget::Gpu(backend.gpu_id),
+        fallback_reason: None,
+        rows,
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(test), allow(dead_code))]
 enum FirstCudaSliceGap {
@@ -1865,14 +1904,23 @@ fn is_cuda_cpu_resolved_source(source: &MvccReadSource) -> bool {
     )
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-fn first_cuda_slice_query_gap(query: &MvccReadQuery) -> Option<FirstCudaSliceGap> {
-    let native_source = matches!(
-        query.source,
+fn is_cuda_native_single_source(source: &MvccReadSource) -> bool {
+    matches!(
+        source,
         MvccReadSource::FullScan
             | MvccReadSource::KeyLookup { .. }
             | MvccReadSource::KeyBatchLookup { .. }
-    );
+    )
+}
+
+fn is_cuda_native_concat_source(source: &MvccReadSource) -> bool {
+    matches!(source, MvccReadSource::Concat { sources } if sources.iter().all(is_cuda_native_single_source))
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn first_cuda_slice_query_gap(query: &MvccReadQuery) -> Option<FirstCudaSliceGap> {
+    let native_source =
+        is_cuda_native_single_source(&query.source) || is_cuda_native_concat_source(&query.source);
     let cpu_resolved_source = is_cuda_cpu_resolved_source(&query.source);
     if !native_source && !cpu_resolved_source {
         return Some(FirstCudaSliceGap::UnsupportedSource);
@@ -1916,12 +1964,8 @@ fn is_cuda_native_full_scan_query(query: &MvccReadQuery) -> bool {
 }
 
 fn is_cuda_native_source_query(query: &MvccReadQuery) -> bool {
-    matches!(
-        query.source,
-        MvccReadSource::FullScan
-            | MvccReadSource::KeyLookup { .. }
-            | MvccReadSource::KeyBatchLookup { .. }
-    ) && is_first_cuda_slice_query(query)
+    (is_cuda_native_single_source(&query.source) || is_cuda_native_concat_source(&query.source))
+        && is_first_cuda_slice_query(query)
 }
 
 type ResolvedTupleIdentity = (u64, String, String, u64, Option<u64>);
@@ -5585,6 +5629,9 @@ impl Engine {
             MvccReadSource::KeyBatchLookup { keys } => {
                 execute_cuda_native_key_batch_query(query, keys, rows, backend)
             }
+            MvccReadSource::Concat { sources } => {
+                execute_cuda_native_concat_query(query, sources, rows, backend)
+            }
             _ => execute_cuda_native_single_source_query(query, rows, backend),
         }
         .unwrap_or_else(|reason| {
@@ -7928,9 +7975,42 @@ mod tests {
     }
 
     #[test]
-    fn first_cuda_slice_query_gap_reports_first_unsupported_boundary() {
+    fn first_cuda_slice_query_gap_accepts_concat_of_native_sources() {
         let mut query = first_cuda_slice_support_query();
         query.source = MvccReadSource::Concat {
+            sources: vec![
+                MvccReadSource::KeyLookup {
+                    key: "acct:1".to_string(),
+                },
+                MvccReadSource::KeyBatchLookup {
+                    keys: vec!["acct:2".to_string(), "acct:3".to_string()],
+                },
+            ],
+        };
+
+        assert_eq!(first_cuda_slice_query_gap(&query), None);
+        assert!(is_cuda_native_source_query(&query));
+
+        query.source = MvccReadSource::Concat {
+            sources: vec![MvccReadSource::FollowValueChain {
+                keys: vec!["acct:1".to_string()],
+                plan: MvccValueChainPlan {
+                    value_key_hops: 1,
+                    terminal: MvccValueChainTerminal::CurrentRow,
+                },
+                provenance: MvccSourceProvenance::Seed,
+            }],
+        };
+        assert_eq!(
+            first_cuda_slice_query_gap(&query),
+            Some(FirstCudaSliceGap::UnsupportedSource)
+        );
+    }
+
+    #[test]
+    fn first_cuda_slice_query_gap_reports_first_unsupported_boundary() {
+        let mut query = first_cuda_slice_support_query();
+        query.source = MvccReadSource::ConcatDistinct {
             sources: vec![MvccReadSource::KeyLookup {
                 key: "acct:1".to_string(),
             }],
@@ -8528,6 +8608,61 @@ mod tests {
                 MvccReadRow {
                     source_key: None,
                     key: Some("acct:3".to_string()),
+                    value: Some("closed".to_string()),
+                },
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("acct:1".to_string()),
+                    value: Some("open".to_string()),
+                },
+            ]
+        );
+        assert_eq!(e.metrics().fallback_total, 0);
+    }
+
+    #[test]
+    #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
+    fn execute_mvcc_query_cuda_driver_runs_concat_native_sources_without_fallback() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=open").unwrap();
+        e.execute_text(2, "SET acct:2=closed").unwrap();
+        e.execute_text(3, "SET acct:3=open").unwrap();
+        e.execute_text(4, "SET acct:4=closed").unwrap();
+
+        let result = e
+            .execute_mvcc_query_with_cuda_driver_probe(&MvccReadQuery {
+                source: MvccReadSource::Concat {
+                    sources: vec![
+                        MvccReadSource::KeyLookup {
+                            key: "acct:2".to_string(),
+                        },
+                        MvccReadSource::KeyBatchLookup {
+                            keys: vec!["acct:4".to_string(), "acct:1".to_string()],
+                        },
+                    ],
+                },
+                visibility: StorageVisibility { read_txn_id: 4 },
+                filter: Some(MvccReadFilter::KeyPrefix("acct:".to_string())),
+                order: None,
+                projection: MvccProjection::KeyValue,
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.fallback_reason, None);
+        assert_eq!(
+            result.rows,
+            vec![
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("acct:2".to_string()),
+                    value: Some("closed".to_string()),
+                },
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("acct:4".to_string()),
                     value: Some("closed".to_string()),
                 },
                 MvccReadRow {
@@ -9254,6 +9389,68 @@ mod tests {
     }
 
     #[test]
+    fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_concat_native_sources() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=open").unwrap();
+        e.execute_text(2, "SET acct:2=closed").unwrap();
+        e.execute_text(3, "SET acct:3=open").unwrap();
+        e.execute_text(4, "SET acct:4=closed").unwrap();
+
+        let query = MvccReadQuery {
+            source: MvccReadSource::Concat {
+                sources: vec![
+                    MvccReadSource::KeyLookup {
+                        key: "acct:2".to_string(),
+                    },
+                    MvccReadSource::KeyBatchLookup {
+                        keys: vec!["acct:4".to_string(), "acct:1".to_string()],
+                    },
+                ],
+            },
+            visibility: StorageVisibility { read_txn_id: 4 },
+            filter: Some(MvccReadFilter::KeyPrefix("acct:".to_string())),
+            order: None,
+            projection: MvccProjection::KeyValue,
+            limit: None,
+        };
+
+        assert_eq!(first_cuda_slice_query_gap(&query), None);
+
+        let cpu = e.execute_mvcc_query(&query).unwrap();
+        assert_mvcc_query_uses_tracked_cpu_fallback(&e, &cpu, 1);
+
+        let backend = e
+            .execute_mvcc_query_with_backend_fallback(&query, &FirstCudaSliceParityBackend)
+            .unwrap();
+
+        assert_eq!(backend.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(backend.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(backend.fallback_reason, None);
+        assert_eq!(backend.rows, cpu.rows);
+        assert_eq!(
+            backend.rows,
+            vec![
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("acct:2".to_string()),
+                    value: Some("closed".to_string()),
+                },
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("acct:4".to_string()),
+                    value: Some("closed".to_string()),
+                },
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("acct:1".to_string()),
+                    value: Some("open".to_string()),
+                },
+            ]
+        );
+        assert_eq!(e.metrics().fallback_total, 1);
+    }
+
+    #[test]
     fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_provenance_filters() {
         let mut e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:1").unwrap();
@@ -9541,7 +9738,7 @@ mod tests {
         let result = e
             .execute_mvcc_query_with_backend_fallback(
                 &MvccReadQuery {
-                    source: MvccReadSource::Concat {
+                    source: MvccReadSource::ConcatDistinct {
                         sources: vec![
                             MvccReadSource::KeyLookup {
                                 key: "acct:1".to_string(),
