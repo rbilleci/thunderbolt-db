@@ -181,6 +181,7 @@ Bootstrap implementation workspace for the pre-NVIDIA phase.
 cargo fmt --all
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
+scripts/run_cuda_parity.sh
 ```
 
 ## Command notes

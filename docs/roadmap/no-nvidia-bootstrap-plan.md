@@ -435,6 +435,7 @@ Validation gate for every completion-gate change:
    - Provide either GPU-capable CI or a reproducible local runner script/profile that executes the CUDA parity suite and captures environment details.
    - Publish driver/device/runtime evidence with test output.
    - Exit when another developer or runner can repeat the CUDA validation gate without relying on ad hoc machine state.
+   - Progress on 2026-05-10: `scripts/run_cuda_parity.sh` now records timestamp/host/kernel/Rust toolchain and `nvidia-smi` GPU inventory to `target/cuda-parity/environment.txt`, then runs the CUDA runtime and MVCC ignored hardware parity suites with `--include-ignored --nocapture`, teeing output to `target/cuda-parity/cuda-parity.log`.
 
 Completion rule:
 - The project is not "CUDA complete" until gates 1-7 are closed, the fallback-rate benchmark target is recorded, and unsupported remaining shapes are deliberately classified as post-v1 scope rather than accidental gaps.
