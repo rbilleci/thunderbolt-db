@@ -1,5 +1,12 @@
 # Implementation Log
 
+## 2026-05-10
+
+### CUDA completion gate 2
+- Closed the supported native full-scan row-selection gap for CUDA gate 2: `Engine::execute_mvcc_query_with_cuda_driver_probe(...)` now feeds all stored MVCC versions into `CudaMvccExecutionBackend` for supported `FullScan` first-slice shapes, then relies on the CUDA MVCC visibility mask for snapshot row selection instead of CPU-visible preselection.
+- Preserved fallback correctness by re-resolving the CPU-visible snapshot rows before running the CPU reference backend when CUDA full-scan execution falls back because the driver is unavailable or another CUDA path fails.
+- Added regressions proving the all-version full-scan input includes historical/deleted versions for the device visibility kernel and that unavailable-driver fallback still returns exactly the CPU-visible snapshot rows.
+
 ## 2026-05-09
 
 ### CUDA hardware onboarding

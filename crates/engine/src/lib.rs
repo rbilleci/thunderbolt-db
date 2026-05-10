@@ -1268,6 +1268,10 @@ fn is_first_cuda_slice_query(query: &MvccReadQuery) -> bool {
     first_cuda_slice_query_gap(query).is_none()
 }
 
+fn is_cuda_native_full_scan_query(query: &MvccReadQuery) -> bool {
+    matches!(query.source, MvccReadSource::FullScan) && is_first_cuda_slice_query(query)
+}
+
 type ResolvedTupleIdentity = (u64, String, String, u64, Option<u64>);
 type ResolvedMvccRowIdentity = (
     Option<String>,
@@ -4098,6 +4102,28 @@ fn resolve_mvcc_source(
     }
 }
 
+fn resolve_mvcc_full_scan_all_versions(
+    store: &InMemoryTupleStore,
+    visibility: StorageVisibility,
+) -> Result<Vec<ResolvedMvccRow>, StorageError> {
+    if visibility.read_txn_id == 0 {
+        return Err(StorageError::InvalidVisibility);
+    }
+
+    Ok(store
+        .all_versions()
+        .into_iter()
+        .map(|tuple| ResolvedMvccRow {
+            branch_label: None,
+            source_key: None,
+            source_tuple: None,
+            provenance_path: None,
+            terminal_input_index: None,
+            tuple,
+        })
+        .collect())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BacklogBlocker {
     Wal,
@@ -4841,6 +4867,10 @@ impl Engine {
         let runtime =
             CudaDriverRuntime::probe().unwrap_or_else(|_| CudaDriverRuntime::unavailable());
         let backend = CudaMvccExecutionBackend::new(runtime, self.planner.default_gpu_id());
+        if is_cuda_native_full_scan_query(query) {
+            return self.execute_cuda_native_full_scan_query(query, &backend);
+        }
+
         self.execute_mvcc_query_with_fallback_reason(query, &backend, None)
     }
 
@@ -4881,6 +4911,51 @@ impl Engine {
             planned_target,
             executed_target: backend_result.executed_target,
             fallback_reason: backend_result.fallback_reason.or(fallback_reason),
+            rows: backend_result.rows,
+        };
+        self.observe_mvcc_read_result_metrics(&result);
+        Ok(result)
+    }
+
+    fn execute_cuda_native_full_scan_query(
+        &mut self,
+        query: &MvccReadQuery,
+        backend: &CudaMvccExecutionBackend,
+    ) -> Result<MvccReadResult, ExecuteError> {
+        if self.repl.role() != Role::Leader {
+            return Err(ExecuteError::Engine(EngineError::NotLeader));
+        }
+
+        let planned_target = DeviceTarget::Gpu(self.planner.default_gpu_id());
+        let rows = resolve_mvcc_full_scan_all_versions(&self.mvcc_store, query.visibility)?;
+
+        let backend_result = match backend.execute(query, rows) {
+            MvccBackendDispatch::Executed(executed) => FinalizedMvccBackendExecution {
+                executed_target: executed.executed_target,
+                fallback_reason: None,
+                rows: executed.rows,
+            },
+            MvccBackendDispatch::Fallback { reason, .. } => {
+                let visible_rows =
+                    resolve_mvcc_source(&self.mvcc_store, &query.source, query.visibility)?;
+                let cpu_execution = match CpuMvccExecutionBackend.execute(query, visible_rows) {
+                    MvccBackendDispatch::Executed(executed) => executed,
+                    MvccBackendDispatch::Fallback { .. } => {
+                        unreachable!("CPU fallback backend must execute")
+                    }
+                };
+                FinalizedMvccBackendExecution {
+                    executed_target: cpu_execution.executed_target,
+                    fallback_reason: Some(reason),
+                    rows: cpu_execution.rows,
+                }
+            }
+        };
+
+        let result = MvccReadResult {
+            planned_target,
+            executed_target: backend_result.executed_target,
+            fallback_reason: backend_result.fallback_reason,
             rows: backend_result.rows,
         };
         self.observe_mvcc_read_result_metrics(&result);
@@ -7186,6 +7261,18 @@ mod tests {
     }
 
     #[test]
+    fn cuda_native_full_scan_query_requires_full_scan_first_slice_shape() {
+        let mut query = first_cuda_slice_support_query();
+        assert!(!is_cuda_native_full_scan_query(&query));
+
+        query.source = MvccReadSource::FullScan;
+        assert!(is_cuda_native_full_scan_query(&query));
+
+        query.order = Some(MvccReadOrder::KeyAsc);
+        assert!(!is_cuda_native_full_scan_query(&query));
+    }
+
+    #[test]
     fn first_cuda_slice_query_gap_reports_first_unsupported_boundary() {
         let mut query = first_cuda_slice_support_query();
         query.source = MvccReadSource::Concat {
@@ -7328,6 +7415,84 @@ mod tests {
         assert_eq!(result.fallback_reason, None);
         assert_eq!(result.rows, backend.rows);
         assert_eq!(e.metrics().fallback_total, 0);
+    }
+
+    #[test]
+    fn cuda_native_full_scan_resolution_feeds_all_versions_to_visibility_kernel() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=open").unwrap();
+        e.execute_text(2, "SET acct:2=hold").unwrap();
+        e.execute_text(3, "SET acct:1=closed").unwrap();
+        e.execute_text(4, "DELETE acct:2").unwrap();
+
+        let rows = resolve_mvcc_full_scan_all_versions(
+            &e.mvcc_store,
+            StorageVisibility { read_txn_id: 2 },
+        )
+        .unwrap();
+        let identities = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.tuple.key.as_str(),
+                    row.tuple.value.as_str(),
+                    row.tuple.created_by,
+                    row.tuple.deleted_by,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            identities,
+            vec![
+                ("acct:1", "open", 1, Some(3)),
+                ("acct:1", "closed", 3, None),
+                ("acct:2", "hold", 2, Some(4)),
+            ]
+        );
+    }
+
+    #[test]
+    fn cuda_native_full_scan_fallback_re_resolves_cpu_visible_rows() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=open").unwrap();
+        e.execute_text(2, "SET acct:2=hold").unwrap();
+        e.execute_text(3, "SET acct:1=closed").unwrap();
+        e.execute_text(4, "DELETE acct:2").unwrap();
+
+        let result = e
+            .execute_cuda_native_full_scan_query(
+                &MvccReadQuery {
+                    source: MvccReadSource::FullScan,
+                    visibility: StorageVisibility { read_txn_id: 2 },
+                    filter: None,
+                    order: None,
+                    projection: MvccProjection::KeyValue,
+                    limit: None,
+                },
+                &CudaMvccExecutionBackend::new(CudaDriverRuntime::unavailable(), 0),
+            )
+            .unwrap();
+
+        assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.executed_target, DeviceTarget::Cpu);
+        assert_eq!(result.fallback_reason, Some(FallbackReason::GpuUnavailable));
+        assert_eq!(
+            result.rows,
+            vec![
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("acct:1".to_string()),
+                    value: Some("open".to_string()),
+                },
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("acct:2".to_string()),
+                    value: Some("hold".to_string()),
+                },
+            ]
+        );
+        assert_eq!(e.metrics().fallback_for(FallbackReason::GpuUnavailable), 1);
     }
 
     #[test]

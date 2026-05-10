@@ -109,6 +109,13 @@ impl InMemoryTupleStore {
         }
     }
 
+    pub fn all_versions(&self) -> Vec<TupleVersion> {
+        self.versions
+            .values()
+            .flat_map(|versions| versions.iter().cloned())
+            .collect()
+    }
+
     fn validate_visibility(visibility: Visibility) -> Result<(), StorageError> {
         if visibility.read_txn_id == 0 {
             return Err(StorageError::InvalidVisibility);
