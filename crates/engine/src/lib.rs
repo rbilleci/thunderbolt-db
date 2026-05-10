@@ -1083,6 +1083,23 @@ fn cuda_filter_mask(
         MvccReadFilter::ProvenanceKeyPrefix { frame, prefix } => {
             cuda_provenance_key_prefix_mask(rows, runtime, *frame, prefix.as_bytes())
         }
+        MvccReadFilter::ProvenanceBundleKeyEquals { bundle, expected } => {
+            cuda_provenance_bundle_key_count_mask(rows, runtime, *bundle, expected.as_bytes(), 1)
+        }
+        MvccReadFilter::ProvenanceBundleKeyCountAtLeast {
+            bundle,
+            expected,
+            min_count,
+        } => cuda_provenance_bundle_key_count_mask(
+            rows,
+            runtime,
+            *bundle,
+            expected.as_bytes(),
+            *min_count,
+        ),
+        MvccReadFilter::ProvenanceBundleKeyPrefix { bundle, prefix } => {
+            cuda_provenance_bundle_key_prefix_mask(rows, runtime, *bundle, prefix.as_bytes())
+        }
         MvccReadFilter::KeyRange {
             start_inclusive,
             end_exclusive,
@@ -1091,6 +1108,43 @@ fn cuda_filter_mask(
         MvccReadFilter::ProvenanceValueEquals { frame, expected } => {
             cuda_provenance_value_equals_mask(rows, runtime, *frame, expected)
         }
+        MvccReadFilter::ProvenanceBundleValueEquals { bundle, expected } => {
+            cuda_provenance_bundle_value_count_mask(rows, runtime, *bundle, expected.as_bytes(), 1)
+        }
+        MvccReadFilter::ProvenanceBundleValueCountAtLeast {
+            bundle,
+            expected,
+            min_count,
+        } => cuda_provenance_bundle_value_count_mask(
+            rows,
+            runtime,
+            *bundle,
+            expected.as_bytes(),
+            *min_count,
+        ),
+        MvccReadFilter::ProvenanceBundleKeyValueEquals { bundle, key, value } => {
+            cuda_provenance_bundle_key_value_count_mask(
+                rows,
+                runtime,
+                *bundle,
+                key.as_bytes(),
+                value.as_bytes(),
+                1,
+            )
+        }
+        MvccReadFilter::ProvenanceBundleKeyValueCountAtLeast {
+            bundle,
+            key,
+            value,
+            min_count,
+        } => cuda_provenance_bundle_key_value_count_mask(
+            rows,
+            runtime,
+            *bundle,
+            key.as_bytes(),
+            value.as_bytes(),
+            *min_count,
+        ),
         MvccReadFilter::All(filters) => {
             let mut combined = vec![true; rows.len()];
             for mask in filters
@@ -1256,6 +1310,162 @@ fn cuda_provenance_value_equals_mask(
     Ok(mask)
 }
 
+fn cuda_provenance_bundle_key_count_mask(
+    rows: &[ResolvedMvccRow],
+    runtime: &CudaDriverRuntime,
+    bundle: MvccProvenanceFrameBundle,
+    expected: &[u8],
+    min_count: usize,
+) -> Result<Vec<bool>, ()> {
+    cuda_provenance_bundle_count_mask(rows, bundle, min_count, |tuples, index| {
+        let values = tuples
+            .iter()
+            .map(|bundle| {
+                bundle
+                    .as_ref()
+                    .and_then(|tuples| tuples.get(index))
+                    .map_or(&[][..], |tuple| tuple.key.as_bytes())
+            })
+            .collect::<Vec<_>>();
+        runtime
+            .filter_equal_bytes_mask(&values, expected)
+            .map_err(|_| ())
+    })
+}
+
+fn cuda_provenance_bundle_key_prefix_mask(
+    rows: &[ResolvedMvccRow],
+    runtime: &CudaDriverRuntime,
+    bundle: MvccProvenanceFrameBundle,
+    prefix: &[u8],
+) -> Result<Vec<bool>, ()> {
+    let prefix_len = prefix.len();
+    cuda_provenance_bundle_any_mask(rows, bundle, |tuples, index| {
+        let values = tuples
+            .iter()
+            .map(|bundle| {
+                bundle
+                    .as_ref()
+                    .and_then(|tuples| tuples.get(index))
+                    .map_or(&[][..], |tuple| {
+                        let key = tuple.key.as_bytes();
+                        &key[..key.len().min(prefix_len)]
+                    })
+            })
+            .collect::<Vec<_>>();
+        runtime
+            .filter_equal_bytes_mask(&values, prefix)
+            .map_err(|_| ())
+    })
+}
+
+fn cuda_provenance_bundle_value_count_mask(
+    rows: &[ResolvedMvccRow],
+    runtime: &CudaDriverRuntime,
+    bundle: MvccProvenanceFrameBundle,
+    expected: &[u8],
+    min_count: usize,
+) -> Result<Vec<bool>, ()> {
+    cuda_provenance_bundle_count_mask(rows, bundle, min_count, |tuples, index| {
+        let values = tuples
+            .iter()
+            .map(|bundle| {
+                bundle
+                    .as_ref()
+                    .and_then(|tuples| tuples.get(index))
+                    .map_or(&[][..], |tuple| tuple.value.as_bytes())
+            })
+            .collect::<Vec<_>>();
+        runtime
+            .filter_equal_bytes_mask(&values, expected)
+            .map_err(|_| ())
+    })
+}
+
+fn cuda_provenance_bundle_key_value_count_mask(
+    rows: &[ResolvedMvccRow],
+    runtime: &CudaDriverRuntime,
+    bundle: MvccProvenanceFrameBundle,
+    expected_key: &[u8],
+    expected_value: &[u8],
+    min_count: usize,
+) -> Result<Vec<bool>, ()> {
+    cuda_provenance_bundle_count_mask(rows, bundle, min_count, |tuples, index| {
+        let keys = tuples
+            .iter()
+            .map(|bundle| {
+                bundle
+                    .as_ref()
+                    .and_then(|tuples| tuples.get(index))
+                    .map_or(&[][..], |tuple| tuple.key.as_bytes())
+            })
+            .collect::<Vec<_>>();
+        let values = tuples
+            .iter()
+            .map(|bundle| {
+                bundle
+                    .as_ref()
+                    .and_then(|tuples| tuples.get(index))
+                    .map_or(&[][..], |tuple| tuple.value.as_bytes())
+            })
+            .collect::<Vec<_>>();
+        let mut key_mask = runtime
+            .filter_equal_bytes_mask(&keys, expected_key)
+            .map_err(|_| ())?;
+        let value_mask = runtime
+            .filter_equal_bytes_mask(&values, expected_value)
+            .map_err(|_| ())?;
+        for (matched_key, matched_value) in key_mask.iter_mut().zip(value_mask) {
+            *matched_key &= matched_value;
+        }
+        Ok(key_mask)
+    })
+}
+
+fn cuda_provenance_bundle_any_mask(
+    rows: &[ResolvedMvccRow],
+    bundle: MvccProvenanceFrameBundle,
+    mut positional_mask: impl FnMut(&[Option<Vec<&TupleVersion>>], usize) -> Result<Vec<bool>, ()>,
+) -> Result<Vec<bool>, ()> {
+    cuda_provenance_bundle_count_mask(rows, bundle, 1, |tuples, index| {
+        positional_mask(tuples, index)
+    })
+}
+
+fn cuda_provenance_bundle_count_mask(
+    rows: &[ResolvedMvccRow],
+    bundle: MvccProvenanceFrameBundle,
+    min_count: usize,
+    mut positional_mask: impl FnMut(&[Option<Vec<&TupleVersion>>], usize) -> Result<Vec<bool>, ()>,
+) -> Result<Vec<bool>, ()> {
+    let bundles = rows
+        .iter()
+        .map(|row| resolved_mvcc_row_provenance_bundle(row, bundle))
+        .collect::<Vec<_>>();
+    let max_len = bundles
+        .iter()
+        .filter_map(|bundle| bundle.as_ref().map(Vec::len))
+        .max()
+        .unwrap_or(0);
+    let present = bundles.iter().map(Option::is_some).collect::<Vec<_>>();
+    let mut counts = vec![0usize; rows.len()];
+
+    for index in 0..max_len {
+        let mask = positional_mask(&bundles, index)?;
+        for (count, matched) in counts.iter_mut().zip(mask) {
+            if matched {
+                *count += 1;
+            }
+        }
+    }
+
+    Ok(present
+        .into_iter()
+        .zip(counts)
+        .map(|(present, count)| present && count >= min_count)
+        .collect())
+}
+
 fn prefix_equivalent_key_range<'a>(
     start_inclusive: &'a str,
     end_exclusive: &str,
@@ -1376,9 +1586,16 @@ fn first_cuda_slice_filter_gap(filter: &MvccReadFilter) -> Option<FirstCudaSlice
     match filter {
         MvccReadFilter::KeyPrefix(_)
         | MvccReadFilter::ProvenanceKeyPrefix { .. }
+        | MvccReadFilter::ProvenanceBundleKeyEquals { .. }
+        | MvccReadFilter::ProvenanceBundleKeyCountAtLeast { .. }
+        | MvccReadFilter::ProvenanceBundleKeyPrefix { .. }
         | MvccReadFilter::KeyRange { .. }
         | MvccReadFilter::ValueEquals(_)
-        | MvccReadFilter::ProvenanceValueEquals { .. } => None,
+        | MvccReadFilter::ProvenanceValueEquals { .. }
+        | MvccReadFilter::ProvenanceBundleValueEquals { .. }
+        | MvccReadFilter::ProvenanceBundleValueCountAtLeast { .. }
+        | MvccReadFilter::ProvenanceBundleKeyValueEquals { .. }
+        | MvccReadFilter::ProvenanceBundleKeyValueCountAtLeast { .. } => None,
         MvccReadFilter::All(filters) | MvccReadFilter::Any(filters) => {
             if filters.is_empty() {
                 Some(FirstCudaSliceGap::EmptyLogicalFilterTree)
@@ -1394,7 +1611,14 @@ fn first_cuda_slice_filter_gap(filter: &MvccReadFilter) -> Option<FirstCudaSlice
 fn cuda_filter_contains_provenance_predicate(filter: &MvccReadFilter) -> bool {
     match filter {
         MvccReadFilter::ProvenanceKeyPrefix { .. }
-        | MvccReadFilter::ProvenanceValueEquals { .. } => true,
+        | MvccReadFilter::ProvenanceBundleKeyEquals { .. }
+        | MvccReadFilter::ProvenanceBundleKeyCountAtLeast { .. }
+        | MvccReadFilter::ProvenanceBundleKeyPrefix { .. }
+        | MvccReadFilter::ProvenanceValueEquals { .. }
+        | MvccReadFilter::ProvenanceBundleValueEquals { .. }
+        | MvccReadFilter::ProvenanceBundleValueCountAtLeast { .. }
+        | MvccReadFilter::ProvenanceBundleKeyValueEquals { .. }
+        | MvccReadFilter::ProvenanceBundleKeyValueCountAtLeast { .. } => true,
         MvccReadFilter::All(filters) | MvccReadFilter::Any(filters) => filters
             .iter()
             .any(cuda_filter_contains_provenance_predicate),
@@ -8407,6 +8631,66 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
+    fn execute_mvcc_query_cuda_driver_runs_provenance_bundle_filters_without_fallback() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=profile:2").unwrap();
+        e.execute_text(2, "SET acct:2=profile:1").unwrap();
+        e.execute_text(3, "SET profile:1=team:alpha").unwrap();
+        e.execute_text(4, "SET profile:2=team:beta").unwrap();
+        e.execute_text(5, "SET team:alpha=member:1").unwrap();
+        e.execute_text(6, "SET team:beta=member:2").unwrap();
+        e.execute_text(7, "SET member:1=Alice").unwrap();
+        e.execute_text(8, "SET member:2=Bob").unwrap();
+
+        let result = e
+            .execute_mvcc_query_with_cuda_driver_probe(&MvccReadQuery {
+                source: MvccReadSource::FollowValueChain {
+                    keys: vec!["acct:1".to_string(), "acct:2".to_string()],
+                    plan: MvccValueChainPlan {
+                        value_key_hops: 2,
+                        terminal: MvccValueChainTerminal::CurrentRow,
+                    },
+                    provenance: MvccSourceProvenance::Seed,
+                },
+                visibility: StorageVisibility { read_txn_id: 8 },
+                filter: Some(MvccReadFilter::All(vec![
+                    MvccReadFilter::ProvenanceBundleKeyPrefix {
+                        bundle: MvccProvenanceFrameBundle::FullPath,
+                        prefix: "profile:".to_string(),
+                    },
+                    MvccReadFilter::ProvenanceBundleValueCountAtLeast {
+                        bundle: MvccProvenanceFrameBundle::SeedThroughTerminalInput,
+                        expected: "team:beta".to_string(),
+                        min_count: 1,
+                    },
+                    MvccReadFilter::ProvenanceBundleKeyValueEquals {
+                        bundle: MvccProvenanceFrameBundle::SeedThroughTerminalInput,
+                        key: "profile:2".to_string(),
+                        value: "team:beta".to_string(),
+                    },
+                ])),
+                order: None,
+                projection: MvccProjection::KeyValue,
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.fallback_reason, None);
+        assert_eq!(
+            result.rows,
+            vec![MvccReadRow {
+                source_key: Some("acct:1".to_string()),
+                key: Some("team:beta".to_string()),
+                value: Some("member:2".to_string()),
+            }]
+        );
+        assert_eq!(e.metrics().fallback_total, 0);
+    }
+
+    #[test]
     fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_supported_lookup_fixture() {
         let mut e = Engine::new_local();
         for (txn_id, command) in include_str!("../../../tests/fixtures/mvcc-read-workload.txt")
@@ -8596,6 +8880,77 @@ mod tests {
                     value: Some("Bianca".to_string()),
                 },
             ]
+        );
+        assert_eq!(e.metrics().fallback_total, 1);
+    }
+
+    #[test]
+    fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_provenance_bundle_filters() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=profile:2").unwrap();
+        e.execute_text(2, "SET acct:2=profile:1").unwrap();
+        e.execute_text(3, "SET profile:1=team:alpha").unwrap();
+        e.execute_text(4, "SET profile:2=team:beta").unwrap();
+        e.execute_text(5, "SET team:alpha=member:1").unwrap();
+        e.execute_text(6, "SET team:beta=member:2").unwrap();
+        e.execute_text(7, "SET member:1=Alice").unwrap();
+        e.execute_text(8, "SET member:2=Bob").unwrap();
+
+        let query = MvccReadQuery {
+            source: MvccReadSource::FollowValueChain {
+                keys: vec!["acct:1".to_string(), "acct:2".to_string()],
+                plan: MvccValueChainPlan {
+                    value_key_hops: 2,
+                    terminal: MvccValueChainTerminal::CurrentRow,
+                },
+                provenance: MvccSourceProvenance::Seed,
+            },
+            visibility: StorageVisibility { read_txn_id: 8 },
+            filter: Some(MvccReadFilter::All(vec![
+                MvccReadFilter::ProvenanceBundleKeyEquals {
+                    bundle: MvccProvenanceFrameBundle::SeedThroughTerminalInput,
+                    expected: "profile:2".to_string(),
+                },
+                MvccReadFilter::ProvenanceBundleKeyPrefix {
+                    bundle: MvccProvenanceFrameBundle::FullPath,
+                    prefix: "profile:".to_string(),
+                },
+                MvccReadFilter::ProvenanceBundleValueEquals {
+                    bundle: MvccProvenanceFrameBundle::SeedThroughTerminalInput,
+                    expected: "team:beta".to_string(),
+                },
+                MvccReadFilter::ProvenanceBundleKeyValueCountAtLeast {
+                    bundle: MvccProvenanceFrameBundle::SeedThroughTerminalInput,
+                    key: "profile:2".to_string(),
+                    value: "team:beta".to_string(),
+                    min_count: 1,
+                },
+            ])),
+            order: None,
+            projection: MvccProjection::KeyValue,
+            limit: None,
+        };
+
+        assert_eq!(first_cuda_slice_query_gap(&query), None);
+
+        let cpu = e.execute_mvcc_query(&query).unwrap();
+        assert_mvcc_query_uses_tracked_cpu_fallback(&e, &cpu, 1);
+
+        let backend = e
+            .execute_mvcc_query_with_backend_fallback(&query, &FirstCudaSliceParityBackend)
+            .unwrap();
+
+        assert_eq!(backend.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(backend.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(backend.fallback_reason, None);
+        assert_eq!(backend.rows, cpu.rows);
+        assert_eq!(
+            backend.rows,
+            vec![MvccReadRow {
+                source_key: Some("acct:1".to_string()),
+                key: Some("team:beta".to_string()),
+                value: Some("member:2".to_string()),
+            }]
         );
         assert_eq!(e.metrics().fallback_total, 1);
     }
