@@ -1981,11 +1981,53 @@ fn is_cuda_native_concat_source(source: &MvccReadSource) -> bool {
     matches!(source, MvccReadSource::Concat { sources } if sources.iter().all(is_cuda_native_single_source))
 }
 
-fn is_cuda_key_order_supported(query: &MvccReadQuery, order: &MvccReadOrder) -> bool {
-    matches!(order, MvccReadOrder::KeyAsc | MvccReadOrder::KeyDesc)
+fn is_cuda_order_supported(query: &MvccReadQuery, order: &MvccReadOrder) -> bool {
+    if matches!(order, MvccReadOrder::KeyAsc | MvccReadOrder::KeyDesc)
         && matches!(
             query.source,
             MvccReadSource::FullScan | MvccReadSource::KeyLookup { .. }
+        )
+    {
+        return true;
+    }
+
+    is_cuda_cpu_resolved_source(&query.source)
+        && matches!(
+            order,
+            MvccReadOrder::ProvenanceKeyAsc { .. }
+                | MvccReadOrder::ProvenanceKeyDesc { .. }
+                | MvccReadOrder::ProvenanceValueAsc { .. }
+                | MvccReadOrder::ProvenanceValueDesc { .. }
+                | MvccReadOrder::ProvenanceBundleKeyPathAsc { .. }
+                | MvccReadOrder::ProvenanceBundleKeyPathDesc { .. }
+                | MvccReadOrder::ProvenanceBundleValuePathAsc { .. }
+                | MvccReadOrder::ProvenanceBundleValuePathDesc { .. }
+                | MvccReadOrder::ProvenanceBundlePathOccurrenceOffsetAsc { .. }
+                | MvccReadOrder::ProvenanceBundlePathOccurrenceOffsetDesc { .. }
+                | MvccReadOrder::ProvenanceBundlePathOccurrenceDistanceAsc { .. }
+                | MvccReadOrder::ProvenanceBundlePathOccurrenceDistanceDesc { .. }
+                | MvccReadOrder::ProvenanceBundlePathMixedOccurrenceOffsetPairAsc { .. }
+                | MvccReadOrder::ProvenanceBundlePathMixedOccurrenceOffsetPairDesc { .. }
+        )
+}
+
+fn is_cuda_projection_supported(query: &MvccReadQuery) -> bool {
+    if matches!(
+        query.projection,
+        MvccProjection::KeyValue | MvccProjection::KeyOnly | MvccProjection::ValueOnly
+    ) {
+        return true;
+    }
+
+    is_cuda_cpu_resolved_source(&query.source)
+        && matches!(
+            query.projection,
+            MvccProjection::TargetKeyProvenanceValue { .. }
+                | MvccProjection::TargetKeyProvenanceSummary { .. }
+                | MvccProjection::TargetKeyProvenanceBundleSummary { .. }
+                | MvccProjection::TargetKeyProvenanceBundleOccurrenceOffset { .. }
+                | MvccProjection::TargetKeyProvenanceBundleOccurrenceDistance { .. }
+                | MvccProjection::TargetKeyProvenanceBundleMixedOccurrenceOffsetPair { .. }
         )
 }
 
@@ -2001,15 +2043,12 @@ fn first_cuda_slice_query_gap(query: &MvccReadQuery) -> Option<FirstCudaSliceGap
     if query
         .order
         .as_ref()
-        .is_some_and(|order| !is_cuda_key_order_supported(query, order))
+        .is_some_and(|order| !is_cuda_order_supported(query, order))
     {
         return Some(FirstCudaSliceGap::UnsupportedOrder);
     }
 
-    if !matches!(
-        query.projection,
-        MvccProjection::KeyValue | MvccProjection::KeyOnly | MvccProjection::ValueOnly
-    ) {
+    if !is_cuda_projection_supported(query) {
         return Some(FirstCudaSliceGap::UnsupportedProjection);
     }
 
@@ -8276,6 +8315,38 @@ mod tests {
     }
 
     #[test]
+    fn first_cuda_slice_query_gap_accepts_provenance_projection_and_order_over_resolved_source() {
+        let mut query = first_cuda_slice_support_query();
+        query.source = MvccReadSource::FollowValueChain {
+            keys: vec!["acct:1".to_string(), "acct:2".to_string()],
+            plan: MvccValueChainPlan {
+                value_key_hops: 2,
+                terminal: MvccValueChainTerminal::CurrentRow,
+            },
+            provenance: MvccSourceProvenance::Seed,
+        };
+        query.filter = Some(MvccReadFilter::ProvenanceBundleLenEquals {
+            bundle: MvccProvenanceFrameBundle::FullPath,
+            expected_len: 3,
+        });
+        query.order = Some(MvccReadOrder::ProvenanceValueDesc {
+            frame: MvccProvenanceFrame::TerminalInput,
+        });
+        query.projection = MvccProjection::TargetKeyProvenanceBundleSummary {
+            bundle: MvccProvenanceFrameBundle::FullPath,
+            summary: MvccProvenanceSummary::KeyPath,
+        };
+
+        assert_eq!(first_cuda_slice_query_gap(&query), None);
+
+        query.source = MvccReadSource::FullScan;
+        assert_eq!(
+            first_cuda_slice_query_gap(&query),
+            Some(FirstCudaSliceGap::UnsupportedOrder)
+        );
+    }
+
+    #[test]
     fn first_cuda_slice_gap_labels_are_stable_for_docs_and_future_routing() {
         assert_eq!(
             FirstCudaSliceGap::UnsupportedSource.label(),
@@ -9403,6 +9474,64 @@ mod tests {
                 key: Some("acct:1".to_string()),
                 value: Some("profile:1".to_string()),
             }]
+        );
+        assert_eq!(e.metrics().fallback_total, 0);
+    }
+
+    #[test]
+    #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
+    fn execute_mvcc_query_cuda_driver_runs_provenance_projection_order_without_fallback() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=profile:1").unwrap();
+        e.execute_text(2, "SET profile:1=team:alpha").unwrap();
+        e.execute_text(3, "SET team:alpha=member:1").unwrap();
+        e.execute_text(4, "SET acct:2=profile:2").unwrap();
+        e.execute_text(5, "SET profile:2=team:beta").unwrap();
+        e.execute_text(6, "SET team:beta=member:2").unwrap();
+
+        let result = e
+            .execute_mvcc_query_with_cuda_driver_probe(&MvccReadQuery {
+                source: MvccReadSource::FollowValueChain {
+                    keys: vec!["acct:1".to_string(), "acct:2".to_string()],
+                    plan: MvccValueChainPlan {
+                        value_key_hops: 2,
+                        terminal: MvccValueChainTerminal::CurrentRow,
+                    },
+                    provenance: MvccSourceProvenance::Seed,
+                },
+                visibility: StorageVisibility { read_txn_id: 6 },
+                filter: Some(MvccReadFilter::ProvenanceBundleLenEquals {
+                    bundle: MvccProvenanceFrameBundle::FullPath,
+                    expected_len: 3,
+                }),
+                order: Some(MvccReadOrder::ProvenanceValueDesc {
+                    frame: MvccProvenanceFrame::TerminalInput,
+                }),
+                projection: MvccProjection::TargetKeyProvenanceBundleSummary {
+                    bundle: MvccProvenanceFrameBundle::FullPath,
+                    summary: MvccProvenanceSummary::KeyPath,
+                },
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.fallback_reason, None);
+        assert_eq!(
+            result.rows,
+            vec![
+                MvccReadRow {
+                    source_key: Some("acct:2".to_string()),
+                    key: Some("team:beta".to_string()),
+                    value: Some("acct:2 -> profile:2 -> team:beta".to_string()),
+                },
+                MvccReadRow {
+                    source_key: Some("acct:1".to_string()),
+                    key: Some("team:alpha".to_string()),
+                    value: Some("acct:1 -> profile:1 -> team:alpha".to_string()),
+                },
+            ]
         );
         assert_eq!(e.metrics().fallback_total, 0);
     }
