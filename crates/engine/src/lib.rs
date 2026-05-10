@@ -2018,7 +2018,13 @@ fn is_cuda_order_supported(query: &MvccReadQuery, order: &MvccReadOrder) -> bool
     is_cuda_cpu_resolved_source(&query.source)
         && matches!(
             order,
-            MvccReadOrder::ProvenanceKeyAsc { .. }
+            MvccReadOrder::BranchLabelAsc
+                | MvccReadOrder::BranchLabelDesc
+                | MvccReadOrder::SourceKeyAsc
+                | MvccReadOrder::SourceKeyDesc
+                | MvccReadOrder::SourceValueAsc
+                | MvccReadOrder::SourceValueDesc
+                | MvccReadOrder::ProvenanceKeyAsc { .. }
                 | MvccReadOrder::ProvenanceKeyDesc { .. }
                 | MvccReadOrder::ProvenanceValueAsc { .. }
                 | MvccReadOrder::ProvenanceValueDesc { .. }
@@ -8382,6 +8388,27 @@ mod tests {
     }
 
     #[test]
+    fn first_cuda_slice_query_gap_accepts_source_relative_order_over_resolved_source() {
+        let mut query = first_cuda_slice_support_query();
+        query.source = MvccReadSource::FollowValueChainLabeledBranches {
+            keys: vec!["acct:1".to_string()],
+            branches: vec![MvccLabeledValueChainBranch {
+                label: "team".to_string(),
+                plan: MvccValueChainPlan {
+                    value_key_hops: 2,
+                    terminal: MvccValueChainTerminal::CurrentRow,
+                },
+            }],
+            fan_in: MvccValueChainBranchFanIn::AllBranches,
+            provenance: MvccSourceProvenance::Seed,
+        };
+        query.filter = Some(MvccReadFilter::SourceKeyPrefix("acct:".to_string()));
+        query.order = Some(MvccReadOrder::BranchLabelDesc);
+
+        assert_eq!(first_cuda_slice_query_gap(&query), None);
+    }
+
+    #[test]
     fn first_cuda_slice_gap_labels_are_stable_for_docs_and_future_routing() {
         assert_eq!(
             FirstCudaSliceGap::UnsupportedSource.label(),
@@ -9457,6 +9484,67 @@ mod tests {
 
     #[test]
     #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
+    fn execute_mvcc_query_cuda_driver_runs_source_relative_order_without_fallback() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=profile:1").unwrap();
+        e.execute_text(2, "SET profile:1=team:alpha").unwrap();
+        e.execute_text(3, "SET team:alpha=member:1").unwrap();
+        e.execute_text(4, "SET member:1=Alice").unwrap();
+
+        let result = e
+            .execute_mvcc_query_with_cuda_driver_probe(&MvccReadQuery {
+                source: MvccReadSource::FollowValueChainLabeledBranches {
+                    keys: vec!["acct:1".to_string()],
+                    branches: vec![
+                        MvccLabeledValueChainBranch {
+                            label: "member".to_string(),
+                            plan: MvccValueChainPlan {
+                                value_key_hops: 3,
+                                terminal: MvccValueChainTerminal::CurrentRow,
+                            },
+                        },
+                        MvccLabeledValueChainBranch {
+                            label: "team".to_string(),
+                            plan: MvccValueChainPlan {
+                                value_key_hops: 2,
+                                terminal: MvccValueChainTerminal::CurrentRow,
+                            },
+                        },
+                    ],
+                    fan_in: MvccValueChainBranchFanIn::AllBranches,
+                    provenance: MvccSourceProvenance::Seed,
+                },
+                visibility: StorageVisibility { read_txn_id: 4 },
+                filter: Some(MvccReadFilter::SourceKeyPrefix("acct:".to_string())),
+                order: Some(MvccReadOrder::BranchLabelDesc),
+                projection: MvccProjection::KeyValue,
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.fallback_reason, None);
+        assert_eq!(
+            result.rows,
+            vec![
+                MvccReadRow {
+                    source_key: Some("acct:1".to_string()),
+                    key: Some("team:alpha".to_string()),
+                    value: Some("member:1".to_string()),
+                },
+                MvccReadRow {
+                    source_key: Some("acct:1".to_string()),
+                    key: Some("member:1".to_string()),
+                    value: Some("Alice".to_string()),
+                },
+            ]
+        );
+        assert_eq!(e.metrics().fallback_total, 0);
+    }
+
+    #[test]
+    #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
     fn execute_mvcc_query_cuda_driver_runs_provenance_bundle_filters_without_fallback() {
         let mut e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:2").unwrap();
@@ -10190,6 +10278,74 @@ mod tests {
                 key: Some("team:alpha".to_string()),
                 value: Some("Alpha Team".to_string()),
             }]
+        );
+        assert_eq!(e.metrics().fallback_total, 1);
+    }
+
+    #[test]
+    fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_source_relative_order() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=profile:1").unwrap();
+        e.execute_text(2, "SET profile:1=team:alpha").unwrap();
+        e.execute_text(3, "SET team:alpha=member:1").unwrap();
+        e.execute_text(4, "SET member:1=Alice").unwrap();
+
+        let query = MvccReadQuery {
+            source: MvccReadSource::FollowValueChainLabeledBranches {
+                keys: vec!["acct:1".to_string()],
+                branches: vec![
+                    MvccLabeledValueChainBranch {
+                        label: "member".to_string(),
+                        plan: MvccValueChainPlan {
+                            value_key_hops: 3,
+                            terminal: MvccValueChainTerminal::CurrentRow,
+                        },
+                    },
+                    MvccLabeledValueChainBranch {
+                        label: "team".to_string(),
+                        plan: MvccValueChainPlan {
+                            value_key_hops: 2,
+                            terminal: MvccValueChainTerminal::CurrentRow,
+                        },
+                    },
+                ],
+                fan_in: MvccValueChainBranchFanIn::AllBranches,
+                provenance: MvccSourceProvenance::Seed,
+            },
+            visibility: StorageVisibility { read_txn_id: 4 },
+            filter: Some(MvccReadFilter::SourceKeyPrefix("acct:".to_string())),
+            order: Some(MvccReadOrder::BranchLabelDesc),
+            projection: MvccProjection::KeyValue,
+            limit: None,
+        };
+
+        assert_eq!(first_cuda_slice_query_gap(&query), None);
+
+        let cpu = e.execute_mvcc_query(&query).unwrap();
+        assert_mvcc_query_uses_tracked_cpu_fallback(&e, &cpu, 1);
+
+        let backend = e
+            .execute_mvcc_query_with_backend_fallback(&query, &FirstCudaSliceParityBackend)
+            .unwrap();
+
+        assert_eq!(backend.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(backend.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(backend.fallback_reason, None);
+        assert_eq!(backend.rows, cpu.rows);
+        assert_eq!(
+            backend.rows,
+            vec![
+                MvccReadRow {
+                    source_key: Some("acct:1".to_string()),
+                    key: Some("team:alpha".to_string()),
+                    value: Some("member:1".to_string()),
+                },
+                MvccReadRow {
+                    source_key: Some("acct:1".to_string()),
+                    key: Some("member:1".to_string()),
+                    value: Some("Alice".to_string()),
+                },
+            ]
         );
         assert_eq!(e.metrics().fallback_total, 1);
     }
