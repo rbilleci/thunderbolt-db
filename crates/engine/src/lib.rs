@@ -1726,29 +1726,21 @@ fn execute_cuda_native_concat_query(
     all_version_rows: Vec<ResolvedMvccRow>,
     backend: &CudaMvccExecutionBackend,
 ) -> Result<FinalizedMvccBackendExecution, FallbackReason> {
+    let runtime = ensure_cuda_backend_available(backend)?;
     let mut rows = Vec::new();
     for source in sources {
+        let source_rows =
+            resolve_cuda_native_source_rows(source, &all_version_rows, query.visibility, runtime)?;
         let source_query = MvccReadQuery {
-            source: source.clone(),
+            source: MvccReadSource::FullScan,
             visibility: query.visibility,
             filter: query.filter.clone(),
             order: None,
             projection: MvccProjection::KeyValue,
             limit: None,
         };
-        let execution = match source {
-            MvccReadSource::KeyBatchLookup { keys } => execute_cuda_native_key_batch_query(
-                &source_query,
-                keys,
-                all_version_rows.clone(),
-                backend,
-            )?,
-            _ => execute_cuda_native_single_source_query(
-                &source_query,
-                all_version_rows.clone(),
-                backend,
-            )?,
-        };
+        let execution =
+            execute_cuda_native_single_source_query(&source_query, source_rows, backend)?;
         rows.extend(execution.rows);
     }
 
@@ -2748,7 +2740,7 @@ fn is_cuda_native_single_source(source: &MvccReadSource) -> bool {
 }
 
 fn is_cuda_native_concat_source(source: &MvccReadSource) -> bool {
-    matches!(source, MvccReadSource::Concat { sources } if sources.iter().all(is_cuda_native_single_source))
+    matches!(source, MvccReadSource::Concat { sources } if sources.iter().all(is_cuda_native_source_resolvable))
 }
 
 fn is_cuda_native_follow_value_chain_source(source: &MvccReadSource) -> bool {
@@ -8832,10 +8824,8 @@ mod tests {
                 provenance: MvccSourceProvenance::Seed,
             }],
         };
-        assert_eq!(
-            first_cuda_slice_query_gap(&query),
-            Some(FirstCudaSliceGap::UnsupportedFilter)
-        );
+        assert_eq!(first_cuda_slice_query_gap(&query), None);
+        assert!(is_cuda_native_source_query(&query));
     }
 
     #[test]
@@ -8914,10 +8904,7 @@ mod tests {
                 }],
             }],
         };
-        assert_eq!(
-            first_cuda_slice_query_gap(&query),
-            Some(FirstCudaSliceGap::UnsupportedSource)
-        );
+        assert_eq!(first_cuda_slice_query_gap(&query), None);
 
         query = first_cuda_slice_support_query();
         query.order = Some(MvccReadOrder::BranchLabelAsc);
@@ -11057,6 +11044,56 @@ mod tests {
 
     #[test]
     #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
+    fn execute_mvcc_query_cuda_driver_runs_nested_native_composition_without_fallback() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=open").unwrap();
+        e.execute_text(2, "SET acct:2=hold").unwrap();
+
+        let result = e
+            .execute_mvcc_query_with_cuda_driver_probe(&MvccReadQuery {
+                source: MvccReadSource::Concat {
+                    sources: vec![MvccReadSource::ConcatDistinct {
+                        sources: vec![
+                            MvccReadSource::KeyLookup {
+                                key: "acct:1".to_string(),
+                            },
+                            MvccReadSource::KeyLookup {
+                                key: "acct:2".to_string(),
+                            },
+                        ],
+                    }],
+                },
+                visibility: StorageVisibility { read_txn_id: 2 },
+                filter: None,
+                order: None,
+                projection: MvccProjection::KeyOnly,
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.fallback_reason, None);
+        assert_eq!(
+            result.rows,
+            vec![
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("acct:1".to_string()),
+                    value: None,
+                },
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("acct:2".to_string()),
+                    value: None,
+                },
+            ]
+        );
+        assert_eq!(e.metrics().fallback_total, 0);
+    }
+
+    #[test]
+    #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
     fn execute_mvcc_query_cuda_driver_runs_provenance_bundle_filters_without_fallback() {
         let mut e = Engine::new_local();
         e.execute_text(1, "SET acct:1=profile:2").unwrap();
@@ -12042,7 +12079,7 @@ mod tests {
             projection: MvccProjection::ValueOnly,
             limit: None,
         };
-        let unsupported_nested_distinct = MvccReadQuery {
+        let supported_nested_distinct = MvccReadQuery {
             source: MvccReadSource::Concat {
                 sources: vec![MvccReadSource::ConcatDistinct {
                     sources: vec![
@@ -12074,7 +12111,7 @@ mod tests {
             )
             .unwrap(),
             e.execute_mvcc_query_with_backend_fallback(
-                &unsupported_nested_distinct,
+                &supported_nested_distinct,
                 &FirstCudaSliceParityBackend,
             )
             .unwrap(),
@@ -12083,10 +12120,10 @@ mod tests {
         let report = MvccBenchmarkReport::from_results(&results, &e.metrics().snapshot());
 
         assert_eq!(report.workload_count, 3);
-        assert_eq!(report.gpu_executed_count, 2);
-        assert_eq!(report.cpu_fallback_count, 1);
-        assert_eq!(report.gpu_executed_permyriad, 6666);
-        assert_eq!(report.cpu_fallback_permyriad, 3333);
+        assert_eq!(report.gpu_executed_count, 3);
+        assert_eq!(report.cpu_fallback_count, 0);
+        assert_eq!(report.gpu_executed_permyriad, 10_000);
+        assert_eq!(report.cpu_fallback_permyriad, 0);
         assert!(report.d2h_bytes_total > 0);
         assert_eq!(report.h2d_bytes_total, 0);
         assert_eq!(report.kernel_exec_samples, 0);
@@ -12617,7 +12654,7 @@ mod tests {
     }
 
     #[test]
-    fn execute_mvcc_query_first_cuda_slice_backend_falls_back_for_unsupported_nested_composition() {
+    fn execute_mvcc_query_first_cuda_slice_backend_runs_nested_native_composition() {
         let mut e = Engine::new_local();
         e.execute_text(1, "SET acct:1=open").unwrap();
         e.execute_text(2, "SET acct:2=hold").unwrap();
@@ -12647,7 +12684,9 @@ mod tests {
             )
             .unwrap();
 
-        assert_mvcc_query_uses_tracked_cpu_fallback(&e, &result, 1);
+        assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.fallback_reason, None);
         assert_eq!(
             result.rows,
             vec![
@@ -12663,6 +12702,7 @@ mod tests {
                 },
             ]
         );
+        assert_eq!(e.metrics().fallback_total, 0);
     }
 
     #[test]
