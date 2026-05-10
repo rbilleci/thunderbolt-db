@@ -1013,11 +1013,20 @@ fn execute_cuda_supported_filter(
         *visible &= matched;
     }
 
-    let projection = &query.projection;
-    let rows = rows
+    let mut matched_rows = rows
         .into_iter()
         .zip(mask)
-        .filter_map(|(row, matched)| matched.then(|| project_mvcc_row(row, projection)))
+        .filter_map(|(row, matched)| matched.then_some(row))
+        .collect::<Vec<_>>();
+
+    if let Some(order) = query.order.as_ref() {
+        matched_rows.sort_by(|left, right| mvcc_row_cmp(left, right, order));
+    }
+
+    let projection = &query.projection;
+    let rows = matched_rows
+        .into_iter()
+        .map(|row| project_mvcc_row(row, projection))
         .collect();
 
     Ok(MvccBackendExecution {
@@ -1917,6 +1926,14 @@ fn is_cuda_native_concat_source(source: &MvccReadSource) -> bool {
     matches!(source, MvccReadSource::Concat { sources } if sources.iter().all(is_cuda_native_single_source))
 }
 
+fn is_cuda_key_order_supported(query: &MvccReadQuery, order: &MvccReadOrder) -> bool {
+    matches!(order, MvccReadOrder::KeyAsc | MvccReadOrder::KeyDesc)
+        && matches!(
+            query.source,
+            MvccReadSource::FullScan | MvccReadSource::KeyLookup { .. }
+        )
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 fn first_cuda_slice_query_gap(query: &MvccReadQuery) -> Option<FirstCudaSliceGap> {
     let native_source =
@@ -1926,7 +1943,11 @@ fn first_cuda_slice_query_gap(query: &MvccReadQuery) -> Option<FirstCudaSliceGap
         return Some(FirstCudaSliceGap::UnsupportedSource);
     }
 
-    if query.order.is_some() {
+    if query
+        .order
+        .as_ref()
+        .is_some_and(|order| !is_cuda_key_order_supported(query, order))
+    {
         return Some(FirstCudaSliceGap::UnsupportedOrder);
     }
 
@@ -7969,9 +7990,34 @@ mod tests {
         assert!(is_cuda_native_source_query(&query));
         assert!(is_cuda_native_full_scan_query(&query));
 
-        query.order = Some(MvccReadOrder::KeyAsc);
+        query.order = Some(MvccReadOrder::ValueAsc);
         assert!(!is_cuda_native_source_query(&query));
         assert!(!is_cuda_native_full_scan_query(&query));
+    }
+
+    #[test]
+    fn first_cuda_slice_query_gap_accepts_key_order_for_native_single_sources() {
+        let mut query = first_cuda_slice_support_query();
+        query.source = MvccReadSource::FullScan;
+        query.order = Some(MvccReadOrder::KeyDesc);
+
+        assert_eq!(first_cuda_slice_query_gap(&query), None);
+        assert!(is_cuda_native_source_query(&query));
+
+        query.source = MvccReadSource::KeyBatchLookup {
+            keys: vec!["acct:1".to_string(), "acct:2".to_string()],
+        };
+        assert_eq!(
+            first_cuda_slice_query_gap(&query),
+            Some(FirstCudaSliceGap::UnsupportedOrder)
+        );
+
+        query.source = MvccReadSource::FullScan;
+        query.order = Some(MvccReadOrder::ValueAsc);
+        assert_eq!(
+            first_cuda_slice_query_gap(&query),
+            Some(FirstCudaSliceGap::UnsupportedOrder)
+        );
     }
 
     #[test]
@@ -8021,7 +8067,7 @@ mod tests {
         );
 
         query = first_cuda_slice_support_query();
-        query.order = Some(MvccReadOrder::KeyAsc);
+        query.order = Some(MvccReadOrder::ValueAsc);
         assert_eq!(
             first_cuda_slice_query_gap(&query),
             Some(FirstCudaSliceGap::UnsupportedOrder)
@@ -8664,6 +8710,51 @@ mod tests {
                     source_key: None,
                     key: Some("acct:4".to_string()),
                     value: Some("closed".to_string()),
+                },
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("acct:1".to_string()),
+                    value: Some("open".to_string()),
+                },
+            ]
+        );
+        assert_eq!(e.metrics().fallback_total, 0);
+    }
+
+    #[test]
+    #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
+    fn execute_mvcc_query_cuda_driver_runs_key_order_without_fallback() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=open").unwrap();
+        e.execute_text(2, "SET acct:3=closed").unwrap();
+        e.execute_text(3, "SET acct:2=pending").unwrap();
+
+        let result = e
+            .execute_mvcc_query_with_cuda_driver_probe(&MvccReadQuery {
+                source: MvccReadSource::FullScan,
+                visibility: StorageVisibility { read_txn_id: 3 },
+                filter: Some(MvccReadFilter::KeyPrefix("acct:".to_string())),
+                order: Some(MvccReadOrder::KeyDesc),
+                projection: MvccProjection::KeyValue,
+                limit: None,
+            })
+            .unwrap();
+
+        assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.fallback_reason, None);
+        assert_eq!(
+            result.rows,
+            vec![
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("acct:3".to_string()),
+                    value: Some("closed".to_string()),
+                },
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("acct:2".to_string()),
+                    value: Some("pending".to_string()),
                 },
                 MvccReadRow {
                     source_key: None,
@@ -9439,6 +9530,58 @@ mod tests {
                     source_key: None,
                     key: Some("acct:4".to_string()),
                     value: Some("closed".to_string()),
+                },
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("acct:1".to_string()),
+                    value: Some("open".to_string()),
+                },
+            ]
+        );
+        assert_eq!(e.metrics().fallback_total, 1);
+    }
+
+    #[test]
+    fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_key_order() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=open").unwrap();
+        e.execute_text(2, "SET acct:3=closed").unwrap();
+        e.execute_text(3, "SET acct:2=pending").unwrap();
+
+        let query = MvccReadQuery {
+            source: MvccReadSource::FullScan,
+            visibility: StorageVisibility { read_txn_id: 3 },
+            filter: Some(MvccReadFilter::KeyPrefix("acct:".to_string())),
+            order: Some(MvccReadOrder::KeyDesc),
+            projection: MvccProjection::KeyValue,
+            limit: None,
+        };
+
+        assert_eq!(first_cuda_slice_query_gap(&query), None);
+
+        let cpu = e.execute_mvcc_query(&query).unwrap();
+        assert_mvcc_query_uses_tracked_cpu_fallback(&e, &cpu, 1);
+
+        let backend = e
+            .execute_mvcc_query_with_backend_fallback(&query, &FirstCudaSliceParityBackend)
+            .unwrap();
+
+        assert_eq!(backend.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(backend.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(backend.fallback_reason, None);
+        assert_eq!(backend.rows, cpu.rows);
+        assert_eq!(
+            backend.rows,
+            vec![
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("acct:3".to_string()),
+                    value: Some("closed".to_string()),
+                },
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("acct:2".to_string()),
+                    value: Some("pending".to_string()),
                 },
                 MvccReadRow {
                     source_key: None,
