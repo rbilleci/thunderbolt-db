@@ -1078,6 +1078,10 @@ fn execute_cuda_supported_filter(
         matched_rows.sort_by(|left, right| mvcc_row_cmp(left, right, order));
     }
 
+    if let Some(limit) = query.limit {
+        matched_rows.truncate(limit);
+    }
+
     let projection = &query.projection;
     let rows = matched_rows
         .into_iter()
@@ -1690,6 +1694,10 @@ fn execute_cuda_native_key_batch_query(
         }
     }
 
+    if let Some(limit) = query.limit {
+        rows.truncate(limit);
+    }
+
     Ok(FinalizedMvccBackendExecution {
         executed_target: DeviceTarget::Gpu(backend.gpu_id),
         fallback_reason: None,
@@ -1729,6 +1737,10 @@ fn execute_cuda_native_concat_query(
         rows.extend(execution.rows);
     }
 
+    if let Some(limit) = query.limit {
+        rows.truncate(limit);
+    }
+
     Ok(FinalizedMvccBackendExecution {
         executed_target: DeviceTarget::Gpu(backend.gpu_id),
         fallback_reason: None,
@@ -1742,7 +1754,6 @@ enum FirstCudaSliceGap {
     UnsupportedSource,
     UnsupportedOrder,
     UnsupportedProjection,
-    UnsupportedLimit,
     UnsupportedFilter,
     EmptyLogicalFilterTree,
 }
@@ -1754,7 +1765,6 @@ impl FirstCudaSliceGap {
             Self::UnsupportedSource => "unsupported_source",
             Self::UnsupportedOrder => "unsupported_order",
             Self::UnsupportedProjection => "unsupported_projection",
-            Self::UnsupportedLimit => "unsupported_limit",
             Self::UnsupportedFilter => "unsupported_filter",
             Self::EmptyLogicalFilterTree => "empty_logical_filter_tree",
         }
@@ -2050,10 +2060,6 @@ fn first_cuda_slice_query_gap(query: &MvccReadQuery) -> Option<FirstCudaSliceGap
 
     if !is_cuda_projection_supported(query) {
         return Some(FirstCudaSliceGap::UnsupportedProjection);
-    }
-
-    if query.limit.is_some() {
-        return Some(FirstCudaSliceGap::UnsupportedLimit);
     }
 
     if cpu_resolved_source
@@ -8176,10 +8182,7 @@ mod tests {
 
         query = first_cuda_slice_support_query();
         query.limit = Some(1);
-        assert_eq!(
-            first_cuda_slice_query_gap(&query),
-            Some(FirstCudaSliceGap::UnsupportedLimit)
-        );
+        assert_eq!(first_cuda_slice_query_gap(&query), None);
     }
 
     #[test]
@@ -8359,10 +8362,6 @@ mod tests {
         assert_eq!(
             FirstCudaSliceGap::UnsupportedProjection.label(),
             "unsupported_projection"
-        );
-        assert_eq!(
-            FirstCudaSliceGap::UnsupportedLimit.label(),
-            "unsupported_limit"
         );
         assert_eq!(
             FirstCudaSliceGap::UnsupportedFilter.label(),
@@ -8849,6 +8848,56 @@ mod tests {
 
     #[test]
     #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
+    fn execute_mvcc_query_cuda_driver_runs_concat_limit_without_fallback() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=open").unwrap();
+        e.execute_text(2, "SET acct:2=closed").unwrap();
+        e.execute_text(3, "SET acct:3=open").unwrap();
+        e.execute_text(4, "SET acct:4=closed").unwrap();
+
+        let result = e
+            .execute_mvcc_query_with_cuda_driver_probe(&MvccReadQuery {
+                source: MvccReadSource::Concat {
+                    sources: vec![
+                        MvccReadSource::KeyLookup {
+                            key: "acct:2".to_string(),
+                        },
+                        MvccReadSource::KeyBatchLookup {
+                            keys: vec!["acct:4".to_string(), "acct:1".to_string()],
+                        },
+                    ],
+                },
+                visibility: StorageVisibility { read_txn_id: 4 },
+                filter: Some(MvccReadFilter::KeyPrefix("acct:".to_string())),
+                order: None,
+                projection: MvccProjection::KeyValue,
+                limit: Some(2),
+            })
+            .unwrap();
+
+        assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.fallback_reason, None);
+        assert_eq!(
+            result.rows,
+            vec![
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("acct:2".to_string()),
+                    value: Some("closed".to_string()),
+                },
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("acct:4".to_string()),
+                    value: Some("closed".to_string()),
+                },
+            ]
+        );
+        assert_eq!(e.metrics().fallback_total, 0);
+    }
+
+    #[test]
+    #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
     fn execute_mvcc_query_cuda_driver_runs_key_order_without_fallback() {
         let mut e = Engine::new_local();
         e.execute_text(1, "SET acct:1=open").unwrap();
@@ -8886,6 +8935,46 @@ mod tests {
                     source_key: None,
                     key: Some("acct:1".to_string()),
                     value: Some("open".to_string()),
+                },
+            ]
+        );
+        assert_eq!(e.metrics().fallback_total, 0);
+    }
+
+    #[test]
+    #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
+    fn execute_mvcc_query_cuda_driver_runs_ordered_limit_without_fallback() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=open").unwrap();
+        e.execute_text(2, "SET acct:3=closed").unwrap();
+        e.execute_text(3, "SET acct:2=pending").unwrap();
+
+        let result = e
+            .execute_mvcc_query_with_cuda_driver_probe(&MvccReadQuery {
+                source: MvccReadSource::FullScan,
+                visibility: StorageVisibility { read_txn_id: 3 },
+                filter: Some(MvccReadFilter::KeyPrefix("acct:".to_string())),
+                order: Some(MvccReadOrder::KeyDesc),
+                projection: MvccProjection::KeyValue,
+                limit: Some(2),
+            })
+            .unwrap();
+
+        assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.fallback_reason, None);
+        assert_eq!(
+            result.rows,
+            vec![
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("acct:3".to_string()),
+                    value: Some("closed".to_string()),
+                },
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("acct:2".to_string()),
+                    value: Some("pending".to_string()),
                 },
             ]
         );
@@ -9771,6 +9860,53 @@ mod tests {
                     source_key: None,
                     key: Some("acct:1".to_string()),
                     value: Some("open".to_string()),
+                },
+            ]
+        );
+        assert_eq!(e.metrics().fallback_total, 1);
+    }
+
+    #[test]
+    fn execute_mvcc_query_first_cuda_slice_backend_matches_cpu_on_limit_after_order() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=open").unwrap();
+        e.execute_text(2, "SET acct:3=closed").unwrap();
+        e.execute_text(3, "SET acct:2=pending").unwrap();
+
+        let query = MvccReadQuery {
+            source: MvccReadSource::FullScan,
+            visibility: StorageVisibility { read_txn_id: 3 },
+            filter: Some(MvccReadFilter::KeyPrefix("acct:".to_string())),
+            order: Some(MvccReadOrder::KeyDesc),
+            projection: MvccProjection::KeyOnly,
+            limit: Some(2),
+        };
+
+        assert_eq!(first_cuda_slice_query_gap(&query), None);
+
+        let cpu = e.execute_mvcc_query(&query).unwrap();
+        assert_mvcc_query_uses_tracked_cpu_fallback(&e, &cpu, 1);
+
+        let backend = e
+            .execute_mvcc_query_with_backend_fallback(&query, &FirstCudaSliceParityBackend)
+            .unwrap();
+
+        assert_eq!(backend.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(backend.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(backend.fallback_reason, None);
+        assert_eq!(backend.rows, cpu.rows);
+        assert_eq!(
+            backend.rows,
+            vec![
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("acct:3".to_string()),
+                    value: None,
+                },
+                MvccReadRow {
+                    source_key: None,
+                    key: Some("acct:2".to_string()),
+                    value: None,
                 },
             ]
         );
