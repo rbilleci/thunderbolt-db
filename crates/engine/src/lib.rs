@@ -9,7 +9,7 @@ use gpu_db_execution::{
     MockGpuRuntime, Operator, PlannedOp, ProjectOperator, RouteDecision, ScanOperator,
     SortOperator,
 };
-use gpu_db_metrics::{BatchFlushReason, FallbackReason, RuntimeMetrics};
+use gpu_db_metrics::{BatchFlushReason, FallbackReason, RuntimeMetrics, RuntimeMetricsSnapshot};
 use gpu_db_observability::{
     ActiveFallbackReason, EngineStatusSnapshot, EngineTelemetrySnapshot, FallbackStatus,
     ReadinessStatus, ReplicationLagSnapshot, SnapshotStatus, TelemetrySink,
@@ -816,6 +816,61 @@ pub struct MvccReadResult {
     pub executed_target: DeviceTarget,
     pub fallback_reason: Option<FallbackReason>,
     pub rows: Vec<MvccReadRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MvccBenchmarkReport {
+    pub workload_count: usize,
+    pub gpu_executed_count: usize,
+    pub cpu_fallback_count: usize,
+    pub gpu_executed_permyriad: u16,
+    pub cpu_fallback_permyriad: u16,
+    pub h2d_bytes_total: u64,
+    pub d2h_bytes_total: u64,
+    pub kernel_exec_samples: u64,
+    pub kernel_exec_total_ms: u64,
+    pub batch_wait_samples: u64,
+    pub batch_wait_total_ms: u64,
+}
+
+impl MvccBenchmarkReport {
+    pub fn from_results(
+        results: &[MvccReadResult],
+        metrics: &RuntimeMetricsSnapshot,
+    ) -> MvccBenchmarkReport {
+        let workload_count = results.len();
+        let gpu_executed_count = results
+            .iter()
+            .filter(|result| matches!(result.executed_target, DeviceTarget::Gpu(_)))
+            .count();
+        let cpu_fallback_count = results
+            .iter()
+            .filter(|result| result.fallback_reason.is_some())
+            .count();
+
+        MvccBenchmarkReport {
+            workload_count,
+            gpu_executed_count,
+            cpu_fallback_count,
+            gpu_executed_permyriad: permyriad(gpu_executed_count, workload_count),
+            cpu_fallback_permyriad: permyriad(cpu_fallback_count, workload_count),
+            h2d_bytes_total: metrics.h2d_bytes_total,
+            d2h_bytes_total: metrics.d2h_bytes_total,
+            kernel_exec_samples: metrics.kernel_exec_samples,
+            kernel_exec_total_ms: metrics.kernel_exec_total_ms,
+            batch_wait_samples: metrics.batch_wait_samples,
+            batch_wait_total_ms: metrics.batch_wait_total_ms,
+        }
+    }
+}
+
+fn permyriad(numerator: usize, denominator: usize) -> u16 {
+    if denominator == 0 {
+        return 0;
+    }
+    ((numerator as u128 * 10_000) / denominator as u128)
+        .try_into()
+        .unwrap_or(u16::MAX)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -9591,6 +9646,87 @@ mod tests {
             ]
         );
         assert_eq!(e.metrics().fallback_total, 1);
+    }
+
+    #[test]
+    fn mvcc_benchmark_report_summarizes_gpu_coverage_and_fallback_rate() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=open").unwrap();
+        e.execute_text(2, "SET acct:2=closed").unwrap();
+        e.execute_text(3, "SET acct:3=pending").unwrap();
+
+        let supported_scan = MvccReadQuery {
+            source: MvccReadSource::FullScan,
+            visibility: StorageVisibility { read_txn_id: 3 },
+            filter: Some(MvccReadFilter::KeyPrefix("acct:".to_string())),
+            order: Some(MvccReadOrder::KeyAsc),
+            projection: MvccProjection::KeyOnly,
+            limit: None,
+        };
+        let supported_concat = MvccReadQuery {
+            source: MvccReadSource::Concat {
+                sources: vec![
+                    MvccReadSource::KeyLookup {
+                        key: "acct:2".to_string(),
+                    },
+                    MvccReadSource::KeyLookup {
+                        key: "acct:1".to_string(),
+                    },
+                ],
+            },
+            visibility: StorageVisibility { read_txn_id: 3 },
+            filter: None,
+            order: None,
+            projection: MvccProjection::ValueOnly,
+            limit: None,
+        };
+        let unsupported_distinct = MvccReadQuery {
+            source: MvccReadSource::ConcatDistinct {
+                sources: vec![
+                    MvccReadSource::KeyLookup {
+                        key: "acct:1".to_string(),
+                    },
+                    MvccReadSource::KeyLookup {
+                        key: "acct:1".to_string(),
+                    },
+                ],
+            },
+            visibility: StorageVisibility { read_txn_id: 3 },
+            filter: None,
+            order: None,
+            projection: MvccProjection::KeyValue,
+            limit: None,
+        };
+
+        let results = vec![
+            e.execute_mvcc_query_with_backend_fallback(
+                &supported_scan,
+                &FirstCudaSliceParityBackend,
+            )
+            .unwrap(),
+            e.execute_mvcc_query_with_backend_fallback(
+                &supported_concat,
+                &FirstCudaSliceParityBackend,
+            )
+            .unwrap(),
+            e.execute_mvcc_query_with_backend_fallback(
+                &unsupported_distinct,
+                &FirstCudaSliceParityBackend,
+            )
+            .unwrap(),
+        ];
+
+        let report = MvccBenchmarkReport::from_results(&results, &e.metrics().snapshot());
+
+        assert_eq!(report.workload_count, 3);
+        assert_eq!(report.gpu_executed_count, 2);
+        assert_eq!(report.cpu_fallback_count, 1);
+        assert_eq!(report.gpu_executed_permyriad, 6666);
+        assert_eq!(report.cpu_fallback_permyriad, 3333);
+        assert!(report.d2h_bytes_total > 0);
+        assert_eq!(report.h2d_bytes_total, 0);
+        assert_eq!(report.kernel_exec_samples, 0);
+        assert_eq!(report.batch_wait_samples, 0);
     }
 
     #[test]

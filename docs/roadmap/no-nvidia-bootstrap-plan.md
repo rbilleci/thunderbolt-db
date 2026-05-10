@@ -429,6 +429,7 @@ Validation gate for every completion-gate change:
    - Add benchmark fixtures that report GPU-executed workload percentage, CPU fallback rate, H2D/D2H bytes, kernel time, and batch wait time where available.
    - Treat rising fallback rate on the benchmark mix as a regression once a gate is closed.
    - Exit when local runs can distinguish correctness regressions from performance/fallback regressions.
+   - Progress on 2026-05-10: `MvccBenchmarkReport::from_results(...)` now summarizes deterministic MVCC workload results into GPU-executed percentage, CPU fallback percentage, H2D/D2H bytes, kernel execution sample/time totals, and batch wait sample/time totals. The first regression fixture mixes CUDA-eligible key-ordered scan and native-source concat reads with an intentionally unsupported distinct composition read so local runs can distinguish coverage/fallback regressions from correctness regressions.
 7. **GPU CI or reproducible runner**
    - Provide either GPU-capable CI or a reproducible local runner script/profile that executes the CUDA parity suite and captures environment details.
    - Publish driver/device/runtime evidence with test output.
