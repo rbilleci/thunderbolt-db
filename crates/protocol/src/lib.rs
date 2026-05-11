@@ -72,6 +72,7 @@ pub struct Select {
     pub table: String,
     pub projection: SelectProjection,
     pub filter: Option<SelectFilter>,
+    pub filters: Vec<SelectFilter>,
     pub order_by: Option<SelectOrder>,
     pub limit: Option<usize>,
 }
@@ -116,7 +117,7 @@ pub enum ParseError {
     InvalidDel,
     #[error("invalid GET syntax; expected: GET key")]
     InvalidGet,
-    #[error("invalid relational SQL syntax; supported subset: CREATE TABLE name (...), INSERT INTO name (...) VALUES (...), SELECT columns FROM name [WHERE column (=|<|<=|>|>=) literal] [ORDER BY column [ASC|DESC]] [LIMIT n]")]
+    #[error("invalid relational SQL syntax; supported subset: CREATE TABLE name (...), INSERT INTO name (...) VALUES (...), SELECT columns FROM name [WHERE column (=|<|<=|>|>=) literal [AND ...]] [ORDER BY column [ASC|DESC]] [LIMIT n]")]
     InvalidRelationalSql,
     #[error("invalid RESET/DISCARD/DEALLOCATE/CLOSE/LISTEN/NOTIFY/UNLISTEN syntax; expected: RESET ALL|ROLE|AUTHORIZATION|AUTH|SESSION AUTHORIZATION[ [TO] DEFAULT]|SESSION AUTH[ [TO] DEFAULT], DISCARD {{ALL|TEMP|TEMPORARY|TEMP TABLES|TEMPORARY TABLES|PLANS|SEQUENCES}}, DEALLOCATE {{ALL|name|PREPARE|PREPARED name}}, CLOSE {{ALL|name}}, LISTEN channel, NOTIFY channel[, payload], or UNLISTEN [*|ALL|channel]")]
     InvalidReset,
@@ -1553,14 +1554,14 @@ fn parse_select(input: &str) -> Result<Select, ParseError> {
     let table = normalize_identifier(&tail[..table_end])?;
     tail = tail[table_end..].trim_start();
 
-    let mut filter = None;
+    let mut filters = Vec::new();
     let mut order_by = None;
     let mut limit = None;
     while !tail.is_empty() {
         if let Some(after_where) = strip_keyword_prefix_case_insensitive(tail, "WHERE") {
             let after_where = after_where.trim_start();
             let next = next_clause_pos(after_where).unwrap_or(after_where.len());
-            filter = Some(parse_select_filter(after_where[..next].trim())?);
+            filters = parse_select_filters(after_where[..next].trim())?;
             tail = after_where[next..].trim_start();
         } else if let Some(after_order) = strip_keyword_prefix_case_insensitive(tail, "ORDER") {
             let after_by = strip_keyword_prefix_case_insensitive(after_order.trim_start(), "BY")
@@ -1586,7 +1587,8 @@ fn parse_select(input: &str) -> Result<Select, ParseError> {
     Ok(Select {
         table,
         projection,
-        filter,
+        filter: filters.first().cloned(),
+        filters,
         order_by,
         limit,
     })
@@ -1613,6 +1615,17 @@ fn parse_select_filter(input: &str) -> Result<SelectFilter, ParseError> {
         op,
         value: parse_sql_value(value.trim())?,
     })
+}
+
+fn parse_select_filters(input: &str) -> Result<Vec<SelectFilter>, ParseError> {
+    let filters = split_keyword_chain_outside_quotes(input, "AND")?
+        .into_iter()
+        .map(|filter| parse_select_filter(filter.trim()))
+        .collect::<Result<Vec<_>, _>>()?;
+    if filters.is_empty() {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    Ok(filters)
 }
 
 fn split_select_filter(input: &str) -> Result<(&str, SelectFilterOp, &str), ParseError> {
@@ -1804,6 +1817,27 @@ fn next_clause_pos(input: &str) -> Option<usize> {
         .into_iter()
         .filter_map(|keyword| find_keyword_outside_quotes(input, keyword))
         .min()
+}
+
+fn split_keyword_chain_outside_quotes<'a>(
+    mut input: &'a str,
+    keyword: &str,
+) -> Result<Vec<&'a str>, ParseError> {
+    let mut parts = Vec::new();
+    while let Some(pos) = find_keyword_outside_quotes(input, keyword) {
+        let part = input[..pos].trim();
+        if part.is_empty() {
+            return Err(ParseError::InvalidRelationalSql);
+        }
+        parts.push(part);
+        input = input[pos + keyword.len()..].trim_start();
+    }
+    let tail = input.trim();
+    if tail.is_empty() {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    parts.push(tail);
+    Ok(parts)
 }
 
 fn is_identifier_char(ch: char) -> bool {
@@ -7990,6 +8024,11 @@ mod tests {
                     op: SelectFilterOp::Eq,
                     value: SqlValue::Int4(1),
                 }),
+                filters: vec![SelectFilter {
+                    column: "id".to_string(),
+                    op: SelectFilterOp::Eq,
+                    value: SqlValue::Int4(1),
+                }],
                 order_by: Some(SelectOrder {
                     column: "name".to_string(),
                     descending: true,
@@ -8008,11 +8047,43 @@ mod tests {
                     op: SelectFilterOp::Gte,
                     value: SqlValue::Int4(2),
                 }),
+                filters: vec![SelectFilter {
+                    column: "id".to_string(),
+                    op: SelectFilterOp::Gte,
+                    value: SqlValue::Int4(2),
+                }],
                 order_by: Some(SelectOrder {
                     column: "id".to_string(),
                     descending: false,
                 }),
                 limit: Some(5),
+            })
+        );
+
+        assert_eq!(
+            parse_command("SELECT name FROM people WHERE id >= 2 AND name = 'Ada'").unwrap(),
+            Command::Select(Select {
+                table: "people".to_string(),
+                projection: SelectProjection::Columns(vec!["name".to_string()]),
+                filter: Some(SelectFilter {
+                    column: "id".to_string(),
+                    op: SelectFilterOp::Gte,
+                    value: SqlValue::Int4(2),
+                }),
+                filters: vec![
+                    SelectFilter {
+                        column: "id".to_string(),
+                        op: SelectFilterOp::Gte,
+                        value: SqlValue::Int4(2),
+                    },
+                    SelectFilter {
+                        column: "name".to_string(),
+                        op: SelectFilterOp::Eq,
+                        value: SqlValue::Text("Ada".to_string()),
+                    },
+                ],
+                order_by: None,
+                limit: None,
             })
         );
     }

@@ -2,6 +2,9 @@
 
 ## 2026-05-11
 
+### PostgreSQL-compatible product loop
+- Advanced P4 SQL-to-GPU execution bridge coverage by parsing narrow `AND` conjunctions in relational `WHERE` clauses and lowering supported literal predicate conjunctions through a conjunctive/ordered key-batch bridge. SQL-level backend-swap and local CUDA regressions now prove those conjunctions execute without `GpuMvccReadParityGap` fallback, and the psql golden relational scenario plus P7 benchmark mix include the new shape.
+
 ### CUDA native composition
 - Added CUDA source-resolution routing for native distinct/intersect/except/symmetric-difference MVCC sources whose children are already CUDA-resolvable. Each child now selects rows through CUDA source/visibility masks before the existing host set/multiset semantics and downstream CUDA filter/order/projection path run, leaving fully device-side set algebra as a future performance-only optimization.
 - Extended native `Concat` so it now accepts any CUDA-resolvable child, including nested distinct/intersect/except/symmetric-difference composition. The mixed MVCC CUDA benchmark fixture now expects 100% GPU execution and 0% CPU fallback for its current scan/concat/nested-composition mix.

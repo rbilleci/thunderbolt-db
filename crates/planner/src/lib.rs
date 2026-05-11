@@ -148,6 +148,7 @@ mod tests {
             table: "people".to_string(),
             projection: gpu_db_protocol::SelectProjection::All,
             filter: None,
+            filters: Vec::new(),
             order_by: None,
             limit: None,
         }));
@@ -175,6 +176,7 @@ mod tests {
                 table: "t".to_string(),
                 projection: gpu_db_protocol::SelectProjection::All,
                 filter: None,
+                filters: Vec::new(),
                 order_by: None,
                 limit: None,
             }),

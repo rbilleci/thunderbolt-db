@@ -733,7 +733,12 @@ fn execute_statement(
                     }
                 };
                 let mut rows = table.rows.clone();
-                if let Some(filter) = &select.filter {
+                let filters = if select.filters.is_empty() {
+                    select.filter.iter().collect::<Vec<_>>()
+                } else {
+                    select.filters.iter().collect::<Vec<_>>()
+                };
+                for filter in filters {
                     let Some(idx) = table
                         .columns
                         .iter()

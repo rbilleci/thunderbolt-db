@@ -37,10 +37,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     let range_queries = vec![select(
         "SELECT id, amount FROM events WHERE amount >= 900 ORDER BY amount DESC LIMIT 25",
     )?];
+    let conjunctive_queries = vec![select(
+        "SELECT id, amount FROM events WHERE amount >= 900 AND category = 'even' ORDER BY amount DESC LIMIT 25",
+    )?];
 
     let app = run_workload("app_indexed_point_lookup", row_count, &app_queries)?;
     let analytic = run_workload("analytic_full_table_scan", row_count, &analytic_queries)?;
     let range = run_workload("analytic_range_filter", row_count, &range_queries)?;
+    let conjunctive = run_workload(
+        "analytic_conjunctive_filter",
+        row_count,
+        &conjunctive_queries,
+    )?;
 
     println!("# P7 Relational Workload Benchmark");
     println!();
@@ -54,7 +62,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!();
     print_workload(&range);
     println!();
-    print_decision(&app, &analytic, &range);
+    print_workload(&conjunctive);
+    println!();
+    print_decision(&app, &analytic, &range, &conjunctive);
 
     Ok(())
 }
@@ -88,7 +98,12 @@ fn print_workload(report: &WorkloadReport) {
     println!("- correctness_validated: {}", report.correctness_validated);
 }
 
-fn print_decision(app: &WorkloadReport, analytic: &WorkloadReport, range: &WorkloadReport) {
+fn print_decision(
+    app: &WorkloadReport,
+    analytic: &WorkloadReport,
+    range: &WorkloadReport,
+    conjunctive: &WorkloadReport,
+) {
     if analytic.bridge.gpu_executed_count > 0 && analytic.gpu_elapsed < analytic.cpu_elapsed {
         println!(
             "decision: GPU probe is faster for the analytical scan in this run; keep prioritizing SQL predicate/order/projection pushdown so more relational shapes can use the same path."
@@ -106,6 +121,7 @@ fn print_decision(app: &WorkloadReport, analytic: &WorkloadReport, range: &Workl
     if app.bridge.cpu_fallback_count > 0
         || analytic.bridge.cpu_fallback_count > 0
         || range.bridge.cpu_fallback_count > 0
+        || conjunctive.bridge.cpu_fallback_count > 0
     {
         println!(
             "decision: current relational workloads still fall back for important SQL shapes; prioritize SQL-to-GPU bridge expansion before claiming workload-level GPU advantage."

@@ -20,3 +20,9 @@ INSERT 0 3
  Grace
  Linus
 (2 rows)
+
+=== relational conjunctive filter ===
+ id
+----
+  3
+(1 row)
