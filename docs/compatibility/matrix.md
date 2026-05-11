@@ -51,6 +51,7 @@ This matrix makes compatibility intent explicit per delivery phase while preserv
 | Deterministic batch ordering | ✅ | ✅ | ✅ | ADR-002 |
 | Device routing abstraction (`DeviceRouter`) | ✅ | ✅ | ✅ | Explicit reasons for fallback |
 | Fallback reason telemetry (`Unavailable`, `QueueSaturated`, `MemoryPressure`, `NotGpuEligible`) | ✅ | ✅ | ✅ | Metrics + tests in place |
+| SQL-to-GPU bridge for relational reads | 🚫 | 🟡 | ✅ | First P4 slice can run plain relational `SELECT * FROM table` row fetches through the MVCC CUDA probe path with SQL-level parity and bridge-rate reporting; SQL predicate/order/projection/limit pushdown remains explicit `GpuMvccReadParityGap` work |
 | Production GPU execution kernels for OLTP subset | 🚫 | 🟡 | ✅ | Must preserve deterministic replay |
 | CPU/GPU parity validation harness | 🟡 | 🟡 | ✅ | Detailed plan in `docs/testing/parity-and-jepsen-plan.md` |
 

@@ -393,11 +393,11 @@ Initial target:
 - Record planned vs executed device target per SQL query.
 
 Exit criteria:
-1. At least one relational `SELECT` over table data reports GPU execution on local NVIDIA hardware.
-2. CPU-vs-GPU parity tests compare SQL-level results, not just internal MVCC rows.
-3. Unsupported SQL plan nodes fall back with explicit reason labels visible in `Engine::status_snapshot()` or equivalent telemetry.
-4. Benchmark/scorecard output includes SQL-level GPU execution rate and CPU fallback rate for the supported relational mix.
-5. Docs explain the SQL plan shapes that are GPU-eligible and the next GPU bridge boundary.
+1. At least one relational `SELECT` over table data reports GPU execution on local NVIDIA hardware. First slice landed on 2026-05-11: `execute_relational_select_with_cuda_driver_probe(...)` can report `executed_target = gpu(0)` for `SELECT * FROM table` over stored relational rows.
+2. CPU-vs-GPU parity tests compare SQL-level results, not just internal MVCC rows. First slice landed on 2026-05-11 with SQL-result parity coverage for relational table scans through an alternate GPU backend and an ignored local CUDA regression for the real driver path.
+3. Unsupported SQL plan nodes fall back with explicit reason labels visible in `Engine::status_snapshot()` or equivalent telemetry. First slice landed on 2026-05-11: SQL-side filter/order/projection/limit finalization remains host-side and records `GpuMvccReadParityGap` while still allowing the underlying MVCC row fetch to execute on GPU.
+4. Benchmark/scorecard output includes SQL-level GPU execution rate and CPU fallback rate for the supported relational mix. First slice landed on 2026-05-11 with `RelationalSqlGpuBridgeReport::from_results(...)` plus a `sql.gpu_bridge` scorecard bucket.
+5. Docs explain the SQL plan shapes that are GPU-eligible and the next GPU bridge boundary. First slice docs landed on 2026-05-11: plain `SELECT * FROM table` row fetch is GPU-eligible; SQL predicate/order/projection/limit pushdown is the next bridge boundary.
 
 ### P5. Production storage, indexing, and recovery
 

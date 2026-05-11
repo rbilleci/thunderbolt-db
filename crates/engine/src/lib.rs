@@ -5931,6 +5931,37 @@ pub struct RelationalSelectResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationalSqlGpuBridgeReport {
+    pub query_count: usize,
+    pub gpu_executed_count: usize,
+    pub cpu_fallback_count: usize,
+    pub gpu_executed_permyriad: u16,
+    pub cpu_fallback_permyriad: u16,
+}
+
+impl RelationalSqlGpuBridgeReport {
+    pub fn from_results(results: &[RelationalSelectResult]) -> Self {
+        let query_count = results.len();
+        let gpu_executed_count = results
+            .iter()
+            .filter(|result| matches!(result.executed_target, DeviceTarget::Gpu(_)))
+            .count();
+        let cpu_fallback_count = results
+            .iter()
+            .filter(|result| result.fallback_reason.is_some())
+            .count();
+
+        Self {
+            query_count,
+            gpu_executed_count,
+            cpu_fallback_count,
+            gpu_executed_permyriad: permyriad(gpu_executed_count, query_count),
+            cpu_fallback_permyriad: permyriad(cpu_fallback_count, query_count),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct BoundRelationalSelect {
     selected_columns: Vec<RelationalColumn>,
     selected_indexes: Vec<usize>,
@@ -6105,6 +6136,26 @@ fn bind_relational_select(
         filter,
         order,
     })
+}
+
+fn relational_select_mvcc_query(select: &Select, read_txn_id: TxnId) -> MvccReadQuery {
+    MvccReadQuery {
+        source: MvccReadSource::FullScan,
+        visibility: StorageVisibility { read_txn_id },
+        filter: Some(MvccReadFilter::KeyPrefix(relational_key_prefix(
+            &select.table,
+        ))),
+        order: Some(MvccReadOrder::KeyAsc),
+        projection: MvccProjection::KeyValue,
+        limit: None,
+    }
+}
+
+fn relational_select_needs_host_sql_finalization(select: &Select) -> bool {
+    !matches!(select.projection, SelectProjection::All)
+        || select.filter.is_some()
+        || select.order_by.is_some()
+        || select.limit.is_some()
 }
 
 impl Engine {
@@ -6654,6 +6705,36 @@ impl Engine {
         &mut self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
+        let query = relational_select_mvcc_query(select, self.visible_up_to);
+        let result = self.execute_mvcc_query(&query)?;
+        self.finalize_relational_select(select, result)
+    }
+
+    pub fn execute_relational_select_with_cuda_driver_probe(
+        &mut self,
+        select: &Select,
+    ) -> Result<RelationalSelectResult, ExecuteError> {
+        let query = relational_select_mvcc_query(select, self.visible_up_to);
+        let result = self.execute_mvcc_query_with_cuda_driver_probe(&query)?;
+        self.finalize_relational_select(select, result)
+    }
+
+    #[cfg(test)]
+    fn execute_relational_select_with_backend<B: MvccExecutionBackend>(
+        &mut self,
+        select: &Select,
+        backend: &B,
+    ) -> Result<RelationalSelectResult, ExecuteError> {
+        let query = relational_select_mvcc_query(select, self.visible_up_to);
+        let result = self.execute_mvcc_query_with_backend(&query, backend)?;
+        self.finalize_relational_select(select, result)
+    }
+
+    fn finalize_relational_select(
+        &mut self,
+        select: &Select,
+        mvcc_result: MvccReadResult,
+    ) -> Result<RelationalSelectResult, ExecuteError> {
         let table = self
             .relational_catalog
             .get(&select.table)
@@ -6665,22 +6746,8 @@ impl Engine {
             })?
             .clone();
         let bound = bind_relational_select(&table, select)?;
-
-        let query = MvccReadQuery {
-            source: MvccReadSource::FullScan,
-            visibility: StorageVisibility {
-                read_txn_id: u64::MAX,
-            },
-            filter: Some(MvccReadFilter::KeyPrefix(relational_key_prefix(
-                &select.table,
-            ))),
-            order: Some(MvccReadOrder::KeyAsc),
-            projection: MvccProjection::KeyValue,
-            limit: None,
-        };
-        let result = self.execute_mvcc_query(&query)?;
         let mut rows = Vec::new();
-        for row in result.rows {
+        for row in mvcc_result.rows {
             let Some(value) = row.value else {
                 continue;
             };
@@ -6714,12 +6781,19 @@ impl Engine {
             })
             .collect();
 
+        let mut fallback_reason = mvcc_result.fallback_reason;
+        if fallback_reason.is_none() && relational_select_needs_host_sql_finalization(select) {
+            fallback_reason = Some(FallbackReason::GpuMvccReadParityGap);
+            self.metrics
+                .inc_fallback(FallbackReason::GpuMvccReadParityGap);
+        }
+
         Ok(RelationalSelectResult {
             columns: bound.selected_columns,
             rows,
-            planned_target: result.planned_target,
-            executed_target: result.executed_target,
-            fallback_reason: result.fallback_reason,
+            planned_target: mvcc_result.planned_target,
+            executed_target: mvcc_result.executed_target,
+            fallback_reason,
         })
     }
 
@@ -22128,6 +22202,131 @@ mod tests {
             result.fallback_reason,
             Some(FallbackReason::GpuMvccReadParityGap)
         );
+    }
+
+    #[test]
+    fn relational_sql_select_gpu_bridge_matches_cpu_results_at_sql_level() {
+        let mut cpu = Engine::new_local();
+        cpu.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        cpu.execute_text(
+            2,
+            "INSERT INTO people (id, name) VALUES (1, 'Ada'), (2, 'Linus')",
+        )
+        .unwrap();
+        let durable = cpu.durable_wal_records().to_vec();
+        let mut gpu = Engine::recover_from_durable_wal(&durable).unwrap();
+
+        let Command::Select(select) = parse_command("SELECT * FROM people").unwrap() else {
+            panic!("expected SELECT plan");
+        };
+        let cpu_result = cpu.execute_relational_select(&select).unwrap();
+        let gpu_result = gpu
+            .execute_relational_select_with_backend(&select, &FirstCudaSliceParityBackend)
+            .unwrap();
+
+        assert_eq!(gpu_result.columns, cpu_result.columns);
+        assert_eq!(gpu_result.rows, cpu_result.rows);
+        assert_eq!(gpu_result.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(gpu_result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(gpu_result.fallback_reason, None);
+    }
+
+    #[test]
+    fn relational_sql_host_finalization_reports_gpu_parity_fallback() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO people (id, name) VALUES (1, 'Ada'), (2, 'Linus'), (3, 'Grace')",
+        )
+        .unwrap();
+
+        let Command::Select(select) =
+            parse_command("SELECT name FROM people WHERE id = 2 ORDER BY name LIMIT 1").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let result = e
+            .execute_relational_select_with_backend(&select, &FirstCudaSliceParityBackend)
+            .unwrap();
+
+        assert_eq!(result.rows, vec![vec![SqlValue::Text("Linus".to_string())]]);
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(
+            result.fallback_reason,
+            Some(FallbackReason::GpuMvccReadParityGap)
+        );
+        assert_eq!(
+            e.status_snapshot().latest_fallback_reason(),
+            Some(FallbackReason::GpuMvccReadParityGap)
+        );
+    }
+
+    #[test]
+    fn relational_sql_gpu_bridge_report_summarizes_execution_and_fallback_rates() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO people (id, name) VALUES (1, 'Ada'), (2, 'Linus')",
+        )
+        .unwrap();
+
+        let Command::Select(scan) = parse_command("SELECT * FROM people").unwrap() else {
+            panic!("expected SELECT plan");
+        };
+        let Command::Select(filtered) =
+            parse_command("SELECT name FROM people WHERE id = 2 LIMIT 1").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+
+        let results = vec![
+            e.execute_relational_select_with_backend(&scan, &FirstCudaSliceParityBackend)
+                .unwrap(),
+            e.execute_relational_select_with_backend(&filtered, &FirstCudaSliceParityBackend)
+                .unwrap(),
+        ];
+        let report = RelationalSqlGpuBridgeReport::from_results(&results);
+
+        assert_eq!(report.query_count, 2);
+        assert_eq!(report.gpu_executed_count, 2);
+        assert_eq!(report.cpu_fallback_count, 1);
+        assert_eq!(report.gpu_executed_permyriad, 10_000);
+        assert_eq!(report.cpu_fallback_permyriad, 5_000);
+    }
+
+    #[test]
+    #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
+    fn relational_sql_select_cuda_driver_reports_gpu_execution() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO people (id, name) VALUES (1, 'Ada'), (2, 'Linus')",
+        )
+        .unwrap();
+
+        let Command::Select(select) = parse_command("SELECT * FROM people").unwrap() else {
+            panic!("expected SELECT plan");
+        };
+        let result = e
+            .execute_relational_select_with_cuda_driver_probe(&select)
+            .unwrap();
+
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())],
+                vec![SqlValue::Int4(2), SqlValue::Text("Linus".to_string())],
+            ]
+        );
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.fallback_reason, None);
     }
 
     #[test]

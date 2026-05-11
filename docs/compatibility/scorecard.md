@@ -51,6 +51,7 @@ To make new compatibility tests visible in the right bucket:
    - `error`, `unsupported`, `missing`, `mismatch`, `invalid`, `rejects_`, `does_not_exist`, `not_supported`, or `sqlstate` for the protocol error-path bucket
    - `parses_`, `rejects_` for SQL/parser coverage
    - `relational`, `create_table`, `insert`, or `select` for the P1 relational SQL foundation bucket
+   - `sql_gpu`, `gpu_bridge`, `relational_sql_select_cuda`, or `relational_sql_select_gpu` for the P4 SQL-to-GPU bridge bucket
    - `relational_catalog`, `catalog_schema`, `catalog_introspection`, `pg_catalog`, `type_metadata`, `column_id`, or `relation_oid` for the P2 catalog/schema/type bucket
    - `transaction`, `commit`, `rollback` for transaction flows
 2. If a new category is needed, add or refine matching rules in `classify()` inside `scripts/generate_compat_scorecard.py`.

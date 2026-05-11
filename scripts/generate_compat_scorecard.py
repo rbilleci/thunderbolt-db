@@ -14,6 +14,7 @@ TEST_RE = re.compile(r"^test\s+(.+?)\s+\.\.\.\s+(ok|FAILED|ignored)\s*$")
 
 def classify(test_id: str) -> list[str]:
     buckets: list[str] = []
+    test_name = test_id.split("::", 1)[-1]
     if (
         "gpu_db_protocol::" in test_id
         or "gpu_db_server::" in test_id
@@ -48,6 +49,8 @@ def classify(test_id: str) -> list[str]:
         buckets.append("protocol.extended_query")
     if re.search(r"relational|create_table|insert|select", test_id):
         buckets.append("sql.relational_foundation")
+    if re.search(r"sql_gpu|gpu_bridge|relational_sql_select_cuda|relational_sql_select_gpu", test_id):
+        buckets.append("sql.gpu_bridge")
     if re.search(
         r"relational_catalog|catalog_helpers|catalog_schema|catalog_introspection|pg_catalog|type_metadata|column_id|relation_oid",
         test_id,
@@ -59,7 +62,7 @@ def classify(test_id: str) -> list[str]:
         buckets.append("durability.invariants")
     if re.search(r"replication|raft|snapshot|leader|follower", test_id):
         buckets.append("replication.role_and_log")
-    if re.search(r"gpu|fallback|batch", test_id):
+    if re.search(r"gpu|fallback|batch", test_name):
         buckets.append("execution.gpu_routing_and_batching")
     if not buckets:
         buckets.append("uncategorized")
