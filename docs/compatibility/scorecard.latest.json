@@ -39,8 +39,8 @@
     "replication.role_and_log": {
       "failed": 0,
       "ignored": 0,
-      "passed": 166,
-      "total": 166
+      "passed": 167,
+      "total": 167
     },
     "sql.catalog_schema_types": {
       "failed": 0,
@@ -57,8 +57,8 @@
     "sql.relational_foundation": {
       "failed": 0,
       "ignored": 0,
-      "passed": 27,
-      "total": 27
+      "passed": 28,
+      "total": 28
     },
     "sql.transaction_flows": {
       "failed": 0,
@@ -83,8 +83,8 @@
   "totals": {
     "failed": 0,
     "ignored": 0,
-    "passed": 584,
-    "total": 584
+    "passed": 585,
+    "total": 585
   },
   "trend_hook": {
     "baseline_available": true,

@@ -74,6 +74,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("- dataset_rows: {row_count}");
     println!("- concurrency: 1");
     println!("- device_info: {device_info}");
+    println!("- cuda_driver_probe_runtime_cache: per_engine");
     println!();
     print_workload(&app);
     println!();

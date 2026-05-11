@@ -5918,6 +5918,7 @@ pub struct Engine {
     batcher: DualTriggerBatcher<PendingMutation>,
     planner: Planner,
     router: DeviceRouter<MockGpuRuntime>,
+    cached_cuda_probe_runtime: Option<CudaDriverRuntime>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6336,6 +6337,7 @@ impl Engine {
             batcher: DualTriggerBatcher::new(64, Duration::from_millis(1)),
             planner: Planner::new(planner_cfg),
             router: DeviceRouter::new(MockGpuRuntime::default()),
+            cached_cuda_probe_runtime: None,
         }
     }
 
@@ -7329,14 +7331,21 @@ impl Engine {
         &mut self,
         query: &MvccReadQuery,
     ) -> Result<MvccReadResult, ExecuteError> {
-        let runtime =
-            CudaDriverRuntime::probe().unwrap_or_else(|_| CudaDriverRuntime::unavailable());
+        let runtime = self.cuda_driver_probe_runtime();
         let backend = CudaMvccExecutionBackend::new(runtime, self.planner.default_gpu_id());
         if is_cuda_native_source_query(query) {
             return self.execute_cuda_native_source_query(query, &backend);
         }
 
         self.execute_mvcc_query_with_fallback_reason(query, &backend, None, true)
+    }
+
+    fn cuda_driver_probe_runtime(&mut self) -> CudaDriverRuntime {
+        self.cached_cuda_probe_runtime
+            .get_or_insert_with(|| {
+                CudaDriverRuntime::probe().unwrap_or_else(|_| CudaDriverRuntime::unavailable())
+            })
+            .clone()
     }
 
     #[cfg(test)]
@@ -23288,6 +23297,36 @@ mod tests {
         assert_eq!(report.cpu_fallback_count, 0);
         assert_eq!(report.gpu_executed_permyriad, 10_000);
         assert_eq!(report.cpu_fallback_permyriad, 0);
+    }
+
+    #[test]
+    fn relational_sql_cuda_probe_reuses_cached_runtime_snapshot() {
+        let mut e = Engine::new_local();
+        e.cached_cuda_probe_runtime = Some(CudaDriverRuntime::unavailable());
+        e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(2, "INSERT INTO people (id, name) VALUES (1, 'Ada')")
+            .unwrap();
+
+        let Command::Select(select) = parse_command("SELECT * FROM people").unwrap() else {
+            panic!("expected SELECT plan");
+        };
+        let first = e
+            .execute_relational_select_with_cuda_driver_probe(&select)
+            .unwrap();
+        let second = e
+            .execute_relational_select_with_cuda_driver_probe(&select)
+            .unwrap();
+
+        assert_eq!(first.rows, second.rows);
+        assert_eq!(first.executed_target, DeviceTarget::Cpu);
+        assert_eq!(second.executed_target, DeviceTarget::Cpu);
+        assert_eq!(first.fallback_reason, Some(FallbackReason::GpuUnavailable));
+        assert_eq!(second.fallback_reason, Some(FallbackReason::GpuUnavailable));
+        assert_eq!(
+            e.cached_cuda_probe_runtime.as_ref().unwrap().snapshot(),
+            CudaDriverRuntime::unavailable().snapshot()
+        );
     }
 
     #[test]
