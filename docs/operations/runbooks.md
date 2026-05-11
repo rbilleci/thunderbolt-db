@@ -119,6 +119,12 @@ Operator checks:
 - Distinguish expected `NotGpuEligible` from infrastructure-driven reasons.
 - Treat unexplained fallback pattern changes as release blockers.
 
+## 5b) MVCC Retention Boundary
+
+Current bootstrap storage does not vacuum old MVCC tuple versions. During long-running tests or demos, monitor row/version growth and prefer bounded workloads or fresh process starts when measuring performance.
+
+Do not manually prune tuple versions, relational row keys, or equality-index entries. Until checkpoint-backed vacuum exists, recovery and historical visibility depend on replaying the durable WAL prefix and rebuilding volatile access paths from that complete committed history.
+
 ## 6) Release Evidence Bundle
 
 For each release candidate, attach:
