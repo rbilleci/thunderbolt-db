@@ -14,6 +14,16 @@ TEST_RE = re.compile(r"^test\s+(.+?)\s+\.\.\.\s+(ok|FAILED|ignored)\s*$")
 
 def classify(test_id: str) -> list[str]:
     buckets: list[str] = []
+    if (
+        "gpu_db_protocol::" in test_id
+        or "gpu_db_server::" in test_id
+        or "psql_golden::" in test_id
+        or re.search(r"extended|frontend|startup|session_lifecycle|protocol", test_id)
+    ) and re.search(
+        r"error|unsupported|missing|mismatch|invalid|rejects_|does_not_exist|not_supported|sqlstate",
+        test_id,
+    ):
+        buckets.append("protocol.error_paths")
     if "psql_golden::" in test_id:
         if re.search(r"bootstrap|startup|auth|connect|simple_query|session_reset|prepare", test_id):
             buckets.append("protocol.client_flows")

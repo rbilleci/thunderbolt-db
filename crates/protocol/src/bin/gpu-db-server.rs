@@ -88,6 +88,21 @@ impl Default for Session {
     }
 }
 
+impl Session {
+    fn close_extended_target(&mut self, target: DescribeTarget, name: &str) {
+        match target {
+            DescribeTarget::Statement => {
+                self.prepared.remove(name);
+                self.portals
+                    .retain(|_, portal| portal.statement_name != name);
+            }
+            DescribeTarget::Portal => {
+                self.portals.remove(name);
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Table {
     oid: u32,
@@ -546,17 +561,7 @@ fn handle_close(
     target: DescribeTarget,
     name: &str,
 ) -> io::Result<()> {
-    match target {
-        DescribeTarget::Statement => {
-            session.prepared.remove(name);
-            session
-                .portals
-                .retain(|_, portal| portal.statement_name != name);
-        }
-        DescribeTarget::Portal => {
-            session.portals.remove(name);
-        }
-    }
+    session.close_extended_target(target, name);
     write_close_complete(stream)
 }
 
@@ -969,7 +974,7 @@ fn catalog_table_oid_rows(session: &Session) -> Vec<Vec<Option<String>>> {
 }
 
 fn bind_query_parameters(query: &PreparedQuery, parameters: &[Option<String>]) -> Option<String> {
-    if query.parameter_type_oids.len() > parameters.len() {
+    if expected_parameter_count(query) != parameters.len() {
         return None;
     }
     let mut bound = query.query.clone();
@@ -986,6 +991,38 @@ fn bind_query_parameters(query: &PreparedQuery, parameters: &[Option<String>]) -
         return None;
     }
     Some(bound)
+}
+
+fn expected_parameter_count(query: &PreparedQuery) -> usize {
+    std::cmp::max(
+        query.parameter_type_oids.len(),
+        max_placeholder_index(&query.query),
+    )
+}
+
+fn max_placeholder_index(query: &str) -> usize {
+    let mut max_index = 0;
+    let mut chars = query.char_indices().peekable();
+    while let Some((_, ch)) = chars.next() {
+        if ch != '$' {
+            continue;
+        }
+
+        let mut value = 0usize;
+        let mut saw_digit = false;
+        while let Some((_, digit)) = chars.peek().copied() {
+            let Some(next) = digit.to_digit(10) else {
+                break;
+            };
+            saw_digit = true;
+            value = value.saturating_mul(10).saturating_add(next as usize);
+            chars.next();
+        }
+        if saw_digit {
+            max_index = max_index.max(value);
+        }
+    }
+    max_index
 }
 
 fn encode_parameter_literal(value: &str, type_oid: u32) -> Option<String> {
@@ -1435,6 +1472,73 @@ mod tests {
             bind_query_parameters(&text_query, &[Some("O'Brien".to_string())]),
             Some("SELECT id FROM people WHERE name = 'O''Brien'".to_string())
         );
+    }
+
+    #[test]
+    fn extended_error_path_binding_rejects_parameter_count_mismatch() {
+        let inferred_query = PreparedQuery {
+            query: "SELECT id FROM people WHERE id = $1".to_string(),
+            parameter_type_oids: Vec::new(),
+        };
+
+        assert_eq!(expected_parameter_count(&inferred_query), 1);
+        assert_eq!(
+            bind_query_parameters(&inferred_query, &[Some("2".to_string())]),
+            Some("SELECT id FROM people WHERE id = 2".to_string())
+        );
+        assert_eq!(bind_query_parameters(&inferred_query, &[]), None);
+        assert_eq!(
+            bind_query_parameters(
+                &inferred_query,
+                &[Some("2".to_string()), Some("extra".to_string())]
+            ),
+            None
+        );
+
+        let typed_query = PreparedQuery {
+            query: "SELECT id FROM people".to_string(),
+            parameter_type_oids: vec![23],
+        };
+        assert_eq!(expected_parameter_count(&typed_query), 1);
+        assert_eq!(bind_query_parameters(&typed_query, &[]), None);
+    }
+
+    #[test]
+    fn extended_prepared_portal_lifecycle_closes_session_local_state() {
+        let mut session = Session::default();
+        let query = PreparedQuery {
+            query: "SELECT name FROM people WHERE id = $1".to_string(),
+            parameter_type_oids: vec![23],
+        };
+        session.prepared.insert(
+            "lookup".to_string(),
+            PreparedStatement::Extended(query.clone()),
+        );
+        session.portals.insert(
+            "lookup_portal".to_string(),
+            Portal {
+                statement_name: "lookup".to_string(),
+                query: query.clone(),
+                parameters: vec![Some("1".to_string())],
+            },
+        );
+        session.portals.insert(
+            "other_portal".to_string(),
+            Portal {
+                statement_name: "other".to_string(),
+                query: query.clone(),
+                parameters: vec![Some("2".to_string())],
+            },
+        );
+
+        session.close_extended_target(DescribeTarget::Portal, "other_portal");
+        assert!(session.prepared.contains_key("lookup"));
+        assert!(session.portals.contains_key("lookup_portal"));
+        assert!(!session.portals.contains_key("other_portal"));
+
+        session.close_extended_target(DescribeTarget::Statement, "lookup");
+        assert!(!session.prepared.contains_key("lookup"));
+        assert!(!session.portals.contains_key("lookup_portal"));
     }
 
     #[test]

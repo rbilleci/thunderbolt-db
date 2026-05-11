@@ -12,11 +12,17 @@
       "passed": 54,
       "total": 54
     },
+    "protocol.error_paths": {
+      "failed": 0,
+      "ignored": 0,
+      "passed": 4,
+      "total": 4
+    },
     "protocol.extended_query": {
       "failed": 0,
       "ignored": 0,
-      "passed": 43,
-      "total": 43
+      "passed": 45,
+      "total": 45
     },
     "replication.role_and_log": {
       "failed": 0,
@@ -45,16 +51,16 @@
     "uncategorized": {
       "failed": 0,
       "ignored": 0,
-      "passed": 225,
-      "total": 225
+      "passed": 222,
+      "total": 222
     }
   },
   "top_failing_categories": [],
   "totals": {
     "failed": 0,
     "ignored": 0,
-    "passed": 542,
-    "total": 542
+    "passed": 544,
+    "total": 544
   },
   "trend_hook": {
     "baseline_available": true,
@@ -62,6 +68,7 @@
     "bucket_failed_delta": {
       "durability.invariants": 0,
       "execution.gpu_routing_and_batching": 0,
+      "protocol.error_paths": 0,
       "protocol.extended_query": 0,
       "replication.role_and_log": 0,
       "sql.catalog_schema_types": 0,

@@ -48,6 +48,7 @@ To make new compatibility tests visible in the right bucket:
 1. Use test names that include the target behavior keyword, for example:
    - `startup`, `frontend`, `session_lifecycle` for protocol/client flows
    - `extended`, `bind`, `parse`, `portal`, `prepared`, or `parameterized` for the P3 extended-query bucket
+   - `error`, `unsupported`, `missing`, `mismatch`, `invalid`, `rejects_`, `does_not_exist`, `not_supported`, or `sqlstate` for the protocol error-path bucket
    - `parses_`, `rejects_` for SQL/parser coverage
    - `relational`, `create_table`, `insert`, or `select` for the P1 relational SQL foundation bucket
    - `relational_catalog`, `catalog_schema`, `catalog_introspection`, `pg_catalog`, `type_metadata`, `column_id`, or `relation_oid` for the P2 catalog/schema/type bucket
