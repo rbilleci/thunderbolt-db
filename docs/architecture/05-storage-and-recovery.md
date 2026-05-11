@@ -8,6 +8,8 @@ Defines durable state model and restart behavior.
 - Checkpoints / snapshots
 - Control metadata
 
+The first implemented local WAL segment format stores the flushed WAL prefix in a single checksummed file. Each record carries `txn_id`, payload length, payload bytes, and a record checksum. `Engine::persist_durable_wal_to_file(...)` writes the current durable prefix, and `Engine::recover_from_durable_wal_file(...)` replays that prefix through the normal engine commit/apply path so relational catalog entries, MVCC table rows, and volatile equality indexes are rebuilt from committed records only.
+
 ## Recovery sequence
 
 1. Validate control metadata
@@ -15,6 +17,8 @@ Defines durable state model and restart behavior.
 3. Replay log to committed boundary
 4. Rebuild volatile caches (GPU) from durable state
 5. Open for traffic after readiness gates pass
+
+Current limitation: checkpoint metadata and control-file selection are not persisted yet. Operators should treat the checked-in file-backed path as a restart/replay proof for one explicit WAL segment, not as packaged PITR or automatic segment discovery.
 
 ## Compaction/snapshot boundary
 
@@ -28,5 +32,6 @@ The first production boundary is conservative: do not prune relational tuple ver
 
 ## Integrity
 
-- Checksums on data pages/log records
+- Checksums on log records are implemented for the first local WAL segment format
+- Data-page checksums remain future checkpoint/storage work
 - Corruption detection and fail-safe behavior

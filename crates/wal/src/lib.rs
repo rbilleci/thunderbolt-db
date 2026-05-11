@@ -1,4 +1,11 @@
+use std::fs::{self, File};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+
 use gpu_db_types::{EngineError, TxnId};
+
+const WAL_SEGMENT_MAGIC: &[u8; 10] = b"GPUDBWAL1\n";
+const WAL_RECORD_HEADER_LEN: usize = 24;
 
 #[derive(Debug, Clone)]
 pub struct WalRecord {
@@ -74,9 +81,179 @@ impl WalBuffer {
     }
 }
 
+pub fn write_wal_segment(path: impl AsRef<Path>, records: &[WalRecord]) -> Result<(), EngineError> {
+    let path = path.as_ref();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            EngineError::Durability(format!(
+                "failed to create WAL segment directory {}: {err}",
+                parent.display()
+            ))
+        })?;
+    }
+
+    let tmp_path = temporary_segment_path(path);
+    let write_result = (|| {
+        let mut file = File::create(&tmp_path).map_err(|err| {
+            EngineError::Durability(format!(
+                "failed to create WAL segment {}: {err}",
+                tmp_path.display()
+            ))
+        })?;
+        file.write_all(WAL_SEGMENT_MAGIC).map_err(|err| {
+            EngineError::Durability(format!(
+                "failed to write WAL segment header {}: {err}",
+                tmp_path.display()
+            ))
+        })?;
+        for record in records {
+            write_record(&mut file, record)?;
+        }
+        file.sync_all().map_err(|err| {
+            EngineError::Durability(format!(
+                "failed to sync WAL segment {}: {err}",
+                tmp_path.display()
+            ))
+        })?;
+        Ok::<_, EngineError>(())
+    })();
+
+    if let Err(err) = write_result {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+
+    fs::rename(&tmp_path, path).map_err(|err| {
+        let _ = fs::remove_file(&tmp_path);
+        EngineError::Durability(format!(
+            "failed to install WAL segment {}: {err}",
+            path.display()
+        ))
+    })
+}
+
+pub fn read_wal_segment(path: impl AsRef<Path>) -> Result<Vec<WalRecord>, EngineError> {
+    let path = path.as_ref();
+    let mut file = File::open(path).map_err(|err| {
+        EngineError::Durability(format!(
+            "failed to open WAL segment {}: {err}",
+            path.display()
+        ))
+    })?;
+    let mut magic = [0_u8; WAL_SEGMENT_MAGIC.len()];
+    file.read_exact(&mut magic).map_err(|err| {
+        EngineError::Durability(format!(
+            "failed to read WAL segment header {}: {err}",
+            path.display()
+        ))
+    })?;
+    if &magic != WAL_SEGMENT_MAGIC {
+        return Err(EngineError::Durability(format!(
+            "invalid WAL segment header {}",
+            path.display()
+        )));
+    }
+
+    let mut records = Vec::new();
+    loop {
+        let mut header = [0_u8; WAL_RECORD_HEADER_LEN];
+        match file.read(&mut header[..1]) {
+            Ok(0) => break,
+            Ok(1) => {
+                file.read_exact(&mut header[1..]).map_err(|err| {
+                    EngineError::Durability(format!(
+                        "failed to read WAL segment record header {}: {err}",
+                        path.display()
+                    ))
+                })?;
+                let txn_id = u64::from_le_bytes(header[0..8].try_into().expect("txn id bytes"));
+                let payload_len =
+                    u64::from_le_bytes(header[8..16].try_into().expect("payload len bytes"));
+                let expected_checksum =
+                    u64::from_le_bytes(header[16..24].try_into().expect("checksum bytes"));
+                let payload_len = usize::try_from(payload_len).map_err(|_| {
+                    EngineError::Durability(format!(
+                        "WAL segment {} record payload length is too large",
+                        path.display()
+                    ))
+                })?;
+                let mut payload = vec![0_u8; payload_len];
+                file.read_exact(&mut payload).map_err(|err| {
+                    EngineError::Durability(format!(
+                        "failed to read WAL segment payload {}: {err}",
+                        path.display()
+                    ))
+                })?;
+                let actual_checksum = wal_record_checksum(txn_id, payload_len as u64, &payload);
+                if actual_checksum != expected_checksum {
+                    return Err(EngineError::Durability(format!(
+                        "WAL segment {} record checksum mismatch for txn {}",
+                        path.display(),
+                        txn_id
+                    )));
+                }
+                records.push(WalRecord { txn_id, payload });
+            }
+            Ok(_) => unreachable!("one-byte read returned more than one byte"),
+            Err(err) => {
+                return Err(EngineError::Durability(format!(
+                    "failed to read WAL segment record {}: {err}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    Ok(records)
+}
+
+fn write_record(file: &mut File, record: &WalRecord) -> Result<(), EngineError> {
+    let payload_len = u64::try_from(record.payload.len()).map_err(|_| {
+        EngineError::Durability("WAL record payload length exceeds u64".to_string())
+    })?;
+    let checksum = wal_record_checksum(record.txn_id, payload_len, &record.payload);
+    file.write_all(&record.txn_id.to_le_bytes())
+        .and_then(|_| file.write_all(&payload_len.to_le_bytes()))
+        .and_then(|_| file.write_all(&checksum.to_le_bytes()))
+        .and_then(|_| file.write_all(&record.payload))
+        .map_err(|err| EngineError::Durability(format!("failed to write WAL record: {err}")))
+}
+
+fn temporary_segment_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("wal.segment");
+    path.with_file_name(format!(".{file_name}.tmp.{}", std::process::id()))
+}
+
+fn wal_record_checksum(txn_id: TxnId, payload_len: u64, payload: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in txn_id
+        .to_le_bytes()
+        .into_iter()
+        .chain(payload_len.to_le_bytes())
+        .chain(payload.iter().copied())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEST_PATH_ID: AtomicU64 = AtomicU64::new(1);
+
+    fn test_wal_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "gpu-db-wal-{name}-{}-{}.segment",
+            std::process::id(),
+            NEXT_TEST_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
 
     #[test]
     fn flush_commits_all_appended_records() {
@@ -270,5 +447,65 @@ mod tests {
                 last_durable_txn_id: Some(11),
             }
         );
+    }
+
+    #[test]
+    fn wal_segment_round_trips_durable_records() {
+        let path = test_wal_path("roundtrip");
+        let records = vec![
+            WalRecord {
+                txn_id: 1,
+                payload: b"CREATE TABLE people (id INT, name TEXT)".to_vec(),
+            },
+            WalRecord {
+                txn_id: 2,
+                payload: b"INSERT INTO people (id, name) VALUES (1, 'Ada')".to_vec(),
+            },
+        ];
+
+        write_wal_segment(&path, &records).unwrap();
+        let recovered = read_wal_segment(&path).unwrap();
+        let _ = fs::remove_file(path);
+
+        assert_eq!(recovered.len(), 2);
+        assert_eq!(recovered[0].txn_id, 1);
+        assert_eq!(recovered[0].payload, records[0].payload);
+        assert_eq!(recovered[1].txn_id, 2);
+        assert_eq!(recovered[1].payload, records[1].payload);
+    }
+
+    #[test]
+    fn wal_segment_rejects_checksum_mismatch() {
+        let path = test_wal_path("checksum");
+        let records = vec![WalRecord {
+            txn_id: 1,
+            payload: b"SET a=1".to_vec(),
+        }];
+
+        write_wal_segment(&path, &records).unwrap();
+        let mut bytes = fs::read(&path).unwrap();
+        let last = bytes.last_mut().unwrap();
+        *last ^= 0x01;
+        fs::write(&path, bytes).unwrap();
+
+        let err = read_wal_segment(&path).unwrap_err();
+        let _ = fs::remove_file(path);
+
+        assert!(err.to_string().contains("checksum mismatch"));
+    }
+
+    #[test]
+    fn wal_segment_rejects_truncated_record_header() {
+        let path = test_wal_path("truncated");
+        fs::write(
+            &path,
+            [WAL_SEGMENT_MAGIC.as_slice(), &[1_u8, 2, 3]].concat(),
+        )
+        .unwrap();
+
+        let err = read_wal_segment(&path).unwrap_err();
+        let _ = fs::remove_file(path);
+
+        assert!(err.to_string().contains("record header"));
     }
 }

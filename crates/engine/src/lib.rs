@@ -27,7 +27,7 @@ use gpu_db_storage::{
 };
 use gpu_db_txn::{TxnError, TxnManager};
 use gpu_db_types::{CommitToken, EngineError, Index, LogEntry, Role, SnapshotMeta, Term, TxnId};
-use gpu_db_wal::{WalBuffer, WalRecord};
+use gpu_db_wal::{read_wal_segment, write_wal_segment, WalBuffer, WalRecord};
 
 #[derive(Debug, Default)]
 pub struct KvStateMachine {
@@ -6301,6 +6301,13 @@ impl Engine {
         Ok(engine)
     }
 
+    pub fn recover_from_durable_wal_file(
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<Self, EngineError> {
+        let records = read_wal_segment(path)?;
+        Self::recover_from_durable_wal(&records)
+    }
+
     pub fn with_planner_config(planner_cfg: PlannerConfig) -> Self {
         Self {
             repl: LocalReplicator::leader(),
@@ -7521,6 +7528,13 @@ impl Engine {
         self.wal.flushed_records()
     }
 
+    pub fn persist_durable_wal_to_file(
+        &self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<(), EngineError> {
+        write_wal_segment(path, self.durable_wal_records())
+    }
+
     pub fn get(&self, key: &str) -> Option<&str> {
         self.sm.kv.get(key).map(|s| s.as_str())
     }
@@ -7802,9 +7816,21 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use gpu_db_execution::DeviceTarget;
     use gpu_db_metrics::GpuParityIssue;
     use gpu_db_observability::InMemoryTelemetrySink;
+
+    static NEXT_TEST_WAL_PATH_ID: AtomicU64 = AtomicU64::new(1);
+
+    fn test_wal_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "gpu-db-engine-{name}-{}-{}.segment",
+            std::process::id(),
+            NEXT_TEST_WAL_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
 
     #[test]
     fn planner_targets_mutations_to_gpu() {
@@ -23531,6 +23557,49 @@ mod tests {
                 matched_keys: 2,
             }
         );
+    }
+
+    #[test]
+    fn relational_access_path_recovers_from_durable_wal_file_after_restart() {
+        let path = test_wal_path("restart");
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO people (id, name) VALUES (1, 'Ada'), (2, 'Linus'), (3, 'Grace')",
+        )
+        .unwrap();
+
+        e.persist_durable_wal_to_file(&path).unwrap();
+        let mut recovered = Engine::recover_from_durable_wal_file(&path).unwrap();
+        let _ = std::fs::remove_file(path);
+
+        let table = recovered.relational_catalog_table("people").unwrap();
+        assert_eq!(table.oid, FIRST_USER_RELATION_OID);
+        assert_eq!(table.columns[0].attnum, 1);
+        assert_eq!(recovered.wal_unflushed_count(), 0);
+        assert_eq!(recovered.wal_flushed_count(), 2);
+
+        let Command::Select(select) =
+            parse_command("SELECT id FROM people WHERE name = 'Grace' ORDER BY id").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let result = recovered.execute_relational_select(&select).unwrap();
+
+        assert_eq!(
+            result.access_path,
+            RelationalAccessPath::OrderedKeyBatch {
+                table: "people".to_string(),
+                predicate_column: Some("name".to_string()),
+                predicate_op: Some(SelectFilterOp::Eq),
+                order_column: "id".to_string(),
+                descending: false,
+                matched_keys: 1,
+            }
+        );
+        assert_eq!(result.rows, vec![vec![SqlValue::Int4(3)]]);
     }
 
     #[test]

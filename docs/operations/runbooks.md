@@ -96,11 +96,19 @@ After interruption or restart:
 3. Confirm `commit_index` is preserved and `applied_index` may legitimately lag until replay/apply catches up.
 4. Confirm next append resumes from the durable tail (`next_index = durable_tail + 1`).
 
+For the current single-node relational WAL segment proof:
+
+1. Persist only the flushed prefix with `Engine::persist_durable_wal_to_file(...)`.
+2. Recover with `Engine::recover_from_durable_wal_file(...)`.
+3. Verify relational catalog metadata, table rows, and equality-index-backed read paths are present after replay.
+4. Treat automatic segment discovery, checkpoint/control-file recovery, and PITR selection as not yet implemented.
+
 Failure criteria:
 
 - resumed state invents gaps past the snapshot boundary
 - resumed state advances `applied_index` beyond durable committed boundary
 - resumed state recovers uncommitted tail as if durable
+- recovered relational state includes rows not present in the flushed WAL segment
 
 ## 4c) Local Operational Replication Smoke
 
