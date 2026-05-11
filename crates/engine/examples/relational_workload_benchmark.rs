@@ -33,6 +33,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .unwrap_or_else(|_| "not reported by runner".to_string());
 
     let app_queries = app_lookup_queries(row_count, lookup_count)?;
+    let app_batched_queries = vec![app_batched_lookup_query(row_count, lookup_count)?];
     let analytic_queries = vec![select("SELECT * FROM events")?];
     let range_queries = vec![select(
         "SELECT id, amount FROM events WHERE amount >= 900 ORDER BY amount DESC LIMIT 25",
@@ -45,6 +46,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?];
 
     let app = run_workload("app_indexed_point_lookup", row_count, &app_queries)?;
+    let app_batched = run_workload("app_batched_or_lookup", row_count, &app_batched_queries)?;
     let analytic = run_workload("analytic_full_table_scan", row_count, &analytic_queries)?;
     let range = run_workload("analytic_range_filter", row_count, &range_queries)?;
     let conjunctive = run_workload(
@@ -66,6 +68,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!();
     print_workload(&app);
     println!();
+    print_workload(&app_batched);
+    println!();
     print_workload(&analytic);
     println!();
     print_workload(&range);
@@ -74,7 +78,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!();
     print_workload(&disjunctive);
     println!();
-    print_decision(&app, &analytic, &range, &conjunctive, &disjunctive);
+    print_decision(
+        &app,
+        &app_batched,
+        &analytic,
+        &range,
+        &conjunctive,
+        &disjunctive,
+    );
 
     Ok(())
 }
@@ -110,6 +121,7 @@ fn print_workload(report: &WorkloadReport) {
 
 fn print_decision(
     app: &WorkloadReport,
+    app_batched: &WorkloadReport,
     analytic: &WorkloadReport,
     range: &WorkloadReport,
     conjunctive: &WorkloadReport,
@@ -122,14 +134,22 @@ fn print_decision(
         return;
     }
 
+    if app_batched.bridge.gpu_executed_count > 0 && app_batched.gpu_elapsed < app.gpu_elapsed {
+        println!(
+            "decision: batching lookup predicates into one supported OR query reduces GPU probe latency versus repeated point lookups, but analytical scans still do not beat CPU; prioritize batching plus transfer layout before making broad performance claims."
+        );
+        return;
+    }
+
     if analytic.bridge.gpu_executed_count > 0 {
         println!(
-            "decision: analytical scans reach GPU execution with SQL-level transfer and timing telemetry but do not yet beat the CPU baseline in this run; prioritize transfer layout, batching, and driver-level timing refinement before making broad performance claims."
+            "decision: analytical scans reach GPU execution with SQL-level transfer and timing telemetry but do not yet beat the CPU baseline in this run; compare batched lookup latency against repeated point lookups, then prioritize transfer layout, batching, and driver-level timing refinement before making broad performance claims."
         );
         return;
     }
 
     if app.bridge.cpu_fallback_count > 0
+        || app_batched.bridge.cpu_fallback_count > 0
         || analytic.bridge.cpu_fallback_count > 0
         || range.bridge.cpu_fallback_count > 0
         || conjunctive.bridge.cpu_fallback_count > 0
@@ -227,6 +247,21 @@ fn app_lookup_queries(
         queries.push(select(&format!("SELECT * FROM events WHERE id = {id}"))?);
     }
     Ok(queries)
+}
+
+fn app_batched_lookup_query(
+    row_count: usize,
+    lookup_count: usize,
+) -> Result<Select, Box<dyn Error>> {
+    let mut predicates = Vec::with_capacity(lookup_count);
+    for i in 0..lookup_count {
+        let id = (i * 37 % row_count) + 1;
+        predicates.push(format!("id = {id}"));
+    }
+    select(&format!(
+        "SELECT * FROM events WHERE {} ORDER BY id ASC",
+        predicates.join(" OR ")
+    ))
 }
 
 fn select(sql: &str) -> Result<Select, Box<dyn Error>> {
