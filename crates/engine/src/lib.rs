@@ -5890,6 +5890,8 @@ pub struct Engine {
     sm: KvStateMachine,
     mvcc_store: InMemoryTupleStore,
     relational_catalog: BTreeMap<String, RelationalTable>,
+    relational_next_oid: u32,
+    relational_next_column_id: u32,
     relational_next_row_id: u64,
     txn_ids_by_index: BTreeMap<Index, TxnId>,
     txn_manager: TxnManager,
@@ -5902,16 +5904,55 @@ pub struct Engine {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelationalTable {
-    pub columns: Vec<ColumnDef>,
+    pub schema: String,
+    pub name: String,
+    pub oid: u32,
+    pub columns: Vec<RelationalColumn>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationalColumn {
+    pub id: u32,
+    pub table_oid: u32,
+    pub attnum: i16,
+    pub name: String,
+    pub ty: SqlType,
+    pub type_oid: u32,
+    pub type_size: i16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelationalSelectResult {
-    pub columns: Vec<ColumnDef>,
+    pub columns: Vec<RelationalColumn>,
     pub rows: Vec<Vec<SqlValue>>,
     pub planned_target: DeviceTarget,
     pub executed_target: DeviceTarget,
     pub fallback_reason: Option<FallbackReason>,
+}
+
+const PUBLIC_SCHEMA_NAME: &str = "public";
+const FIRST_USER_RELATION_OID: u32 = 16_384;
+const FIRST_USER_COLUMN_ID: u32 = 1;
+
+impl RelationalColumn {
+    fn from_def(id: u32, table_oid: u32, attnum: i16, def: ColumnDef) -> Self {
+        Self {
+            id,
+            table_oid,
+            attnum,
+            name: def.name,
+            ty: def.ty,
+            type_oid: def.ty.postgres_oid(),
+            type_size: def.ty.type_size(),
+        }
+    }
+
+    pub fn as_column_def(&self) -> ColumnDef {
+        ColumnDef {
+            name: self.name.clone(),
+            ty: self.ty,
+        }
+    }
 }
 
 fn sql_value_matches_type(value: &SqlValue, ty: SqlType) -> bool {
@@ -5944,7 +5985,7 @@ fn encode_relational_row(values: &[SqlValue]) -> String {
 
 fn decode_relational_row(
     input: &str,
-    columns: &[ColumnDef],
+    columns: &[RelationalColumn],
 ) -> Result<Vec<SqlValue>, ExecuteError> {
     let parts = split_escaped_row(input);
     if parts.len() != columns.len() {
@@ -6019,6 +6060,8 @@ impl Engine {
             sm: KvStateMachine::default(),
             mvcc_store: InMemoryTupleStore::new(),
             relational_catalog: BTreeMap::new(),
+            relational_next_oid: FIRST_USER_RELATION_OID,
+            relational_next_column_id: FIRST_USER_COLUMN_ID,
             relational_next_row_id: 1,
             txn_ids_by_index: BTreeMap::new(),
             txn_manager: TxnManager::default(),
@@ -6197,12 +6240,34 @@ impl Engine {
                 )));
             }
         }
+        let oid = self.relational_next_oid;
+        let next_oid = self.relational_next_oid.checked_add(1).ok_or_else(|| {
+            EngineError::ApplyFailed("relational table OID allocation exhausted".to_string())
+        })?;
+        let mut columns = Vec::with_capacity(create.columns.len());
+        let mut next_column_id = self.relational_next_column_id;
+        for (idx, column) in create.columns.into_iter().enumerate() {
+            let attnum = i16::try_from(idx + 1).map_err(|_| {
+                EngineError::ApplyFailed("too many columns for bootstrap catalog".to_string())
+            })?;
+            let id = next_column_id;
+            next_column_id = next_column_id.checked_add(1).ok_or_else(|| {
+                EngineError::ApplyFailed("relational column id allocation exhausted".to_string())
+            })?;
+            columns.push(RelationalColumn::from_def(id, oid, attnum, column));
+        }
+        let name = create.table;
         self.relational_catalog.insert(
-            create.table,
+            name.clone(),
             RelationalTable {
-                columns: create.columns,
+                schema: PUBLIC_SCHEMA_NAME.to_string(),
+                name,
+                oid,
+                columns,
             },
         );
+        self.relational_next_oid = next_oid;
+        self.relational_next_column_id = next_column_id;
         Ok(())
     }
 
@@ -6636,6 +6701,10 @@ impl Engine {
             executed_target: result.executed_target,
             fallback_reason: result.fallback_reason,
         })
+    }
+
+    pub fn relational_catalog_table(&self, table: &str) -> Option<&RelationalTable> {
+        self.relational_catalog.get(table)
     }
 
     pub fn execute_mvcc_query(
@@ -22013,7 +22082,11 @@ mod tests {
         let result = e.execute_relational_select(&select).unwrap();
 
         assert_eq!(
-            result.columns,
+            result
+                .columns
+                .iter()
+                .map(RelationalColumn::as_column_def)
+                .collect::<Vec<_>>(),
             vec![
                 ColumnDef {
                     name: "name".to_string(),
@@ -22034,6 +22107,49 @@ mod tests {
         assert_eq!(
             result.fallback_reason,
             Some(FallbackReason::GpuMvccReadParityGap)
+        );
+    }
+
+    #[test]
+    fn relational_catalog_assigns_stable_public_schema_and_type_metadata() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+
+        let table = e.relational_catalog_table("people").unwrap();
+        assert_eq!(table.schema, PUBLIC_SCHEMA_NAME);
+        assert_eq!(table.name, "people");
+        assert_eq!(table.oid, FIRST_USER_RELATION_OID);
+        assert_eq!(table.columns.len(), 2);
+        assert_eq!(
+            table.columns[0],
+            RelationalColumn {
+                id: FIRST_USER_COLUMN_ID,
+                table_oid: FIRST_USER_RELATION_OID,
+                attnum: 1,
+                name: "id".to_string(),
+                ty: SqlType::Int4,
+                type_oid: SqlType::Int4.postgres_oid(),
+                type_size: SqlType::Int4.type_size(),
+            }
+        );
+        assert_eq!(
+            table.columns[1],
+            RelationalColumn {
+                id: FIRST_USER_COLUMN_ID + 1,
+                table_oid: FIRST_USER_RELATION_OID,
+                attnum: 2,
+                name: "name".to_string(),
+                ty: SqlType::Text,
+                type_oid: SqlType::Text.postgres_oid(),
+                type_size: SqlType::Text.type_size(),
+            }
+        );
+
+        e.execute_text(2, "CREATE TABLE teams (id INT)").unwrap();
+        assert_eq!(
+            e.relational_catalog_table("teams").unwrap().oid,
+            FIRST_USER_RELATION_OID + 1
         );
     }
 }

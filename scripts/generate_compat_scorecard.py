@@ -30,6 +30,8 @@ def classify(test_id: str) -> list[str]:
             buckets.append("sql.relational_foundation")
     if re.search(r"relational|create_table|insert|select", test_id):
         buckets.append("sql.relational_foundation")
+    if re.search(r"relational_catalog|catalog_schema|type_metadata|column_id|relation_oid", test_id):
+        buckets.append("sql.catalog_schema_types")
     if re.search(r"transaction|commit|rollback|begin", test_id):
         buckets.append("sql.transaction_flows")
     if re.search(r"wal|durable|visibility|checkpoint|replay", test_id):

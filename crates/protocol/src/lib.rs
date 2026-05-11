@@ -31,6 +31,29 @@ pub enum SqlType {
     Text,
 }
 
+impl SqlType {
+    pub const fn postgres_oid(self) -> u32 {
+        match self {
+            Self::Int4 => 23,
+            Self::Text => 25,
+        }
+    }
+
+    pub const fn type_size(self) -> i16 {
+        match self {
+            Self::Int4 => 4,
+            Self::Text => -1,
+        }
+    }
+
+    pub const fn catalog_name(self) -> &'static str {
+        match self {
+            Self::Int4 => "int4",
+            Self::Text => "text",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Insert {
     pub table: String,

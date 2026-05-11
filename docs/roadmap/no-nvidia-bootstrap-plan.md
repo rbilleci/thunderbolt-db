@@ -360,11 +360,11 @@ Initial target:
 - First `pg_catalog` compatibility views/functions required by common psql/libpq startup and introspection probes.
 
 Exit criteria:
-1. Created tables and columns are stored in a catalog structure used by planning/execution.
-2. Type metadata is used for row descriptions and basic coercion/validation in supported statements.
+1. Created tables and columns are stored in a catalog structure used by planning/execution. First slice landed on 2026-05-11: created tables enter an engine-owned `public` schema catalog with stable user relation OIDs starting at `16384`, and columns carry stable ids, `attnum`, and table OID references used by execution-side insert validation, row decoding, and select projection. Planner binding to those catalog descriptors remains open.
+2. Type metadata is used for row descriptions and basic coercion/validation in supported statements. First slice landed on 2026-05-11: `SqlType` exposes PostgreSQL-compatible `int4`/`text` OIDs, type widths, and catalog names; relational catalog columns store those values and the wire compatibility endpoint uses the same type metadata for row descriptions.
 3. psql can inspect the first supported tables without relying on hard-coded fake responses for those objects.
-4. Catalog state survives the same durability/recovery boundary as user data or has an explicit documented bootstrap limitation.
-5. Docs and scorecard identify supported vs unsupported catalog/introspection surfaces.
+4. Catalog state survives the same durability/recovery boundary as user data or has an explicit documented bootstrap limitation. Current limitation as of 2026-05-11: catalog descriptors are reconstructed in memory during bootstrap execution and are not yet replay-tested through restart/recovery.
+5. Docs and scorecard identify supported vs unsupported catalog/introspection surfaces. First docs/scorecard classifier update landed on 2026-05-11 with `sql.catalog_schema_types`; `pg_catalog` user-table introspection remains unsupported.
 
 ### P3. PostgreSQL wire protocol execution path
 

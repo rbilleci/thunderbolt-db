@@ -18,11 +18,17 @@
       "passed": 164,
       "total": 164
     },
+    "sql.catalog_schema_types": {
+      "failed": 0,
+      "ignored": 0,
+      "passed": 1,
+      "total": 1
+    },
     "sql.relational_foundation": {
       "failed": 0,
       "ignored": 0,
-      "passed": 3,
-      "total": 3
+      "passed": 4,
+      "total": 4
     },
     "sql.transaction_flows": {
       "failed": 0,
@@ -41,8 +47,8 @@
   "totals": {
     "failed": 0,
     "ignored": 0,
-    "passed": 535,
-    "total": 535
+    "passed": 536,
+    "total": 536
   },
   "trend_hook": {
     "baseline_available": true,
@@ -51,6 +57,7 @@
       "durability.invariants": 0,
       "execution.gpu_routing_and_batching": 0,
       "replication.role_and_log": 0,
+      "sql.catalog_schema_types": 0,
       "sql.relational_foundation": 0,
       "sql.transaction_flows": 0,
       "uncategorized": 0

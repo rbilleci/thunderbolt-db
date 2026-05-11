@@ -6,11 +6,8 @@ use std::thread;
 
 use gpu_db_protocol::{
     parse_command, parse_frontend_message, parse_startup_packet, Command, FrontendMessage,
-    SelectProjection, SqlType, SqlValue, StartupPacket,
+    SelectProjection, SqlValue, StartupPacket,
 };
-
-const INT4_OID: u32 = 23;
-const TEXT_OID: u32 = 25;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Column {
@@ -29,23 +26,24 @@ struct ErrorField {
 fn text_column(name: &str) -> Column {
     Column {
         name: name.to_string(),
-        oid: TEXT_OID,
-        type_size: -1,
+        oid: gpu_db_protocol::SqlType::Text.postgres_oid(),
+        type_size: gpu_db_protocol::SqlType::Text.type_size(),
     }
 }
 
 fn int4_column(name: &str) -> Column {
     Column {
         name: name.to_string(),
-        oid: INT4_OID,
-        type_size: 4,
+        oid: gpu_db_protocol::SqlType::Int4.postgres_oid(),
+        type_size: gpu_db_protocol::SqlType::Int4.type_size(),
     }
 }
 
-fn sql_value_matches_type(value: &SqlValue, ty: SqlType) -> bool {
+fn sql_value_matches_type(value: &SqlValue, ty: gpu_db_protocol::SqlType) -> bool {
     matches!(
         (value, ty),
-        (SqlValue::Int4(_), SqlType::Int4) | (SqlValue::Text(_), SqlType::Text)
+        (SqlValue::Int4(_), gpu_db_protocol::SqlType::Int4)
+            | (SqlValue::Text(_), gpu_db_protocol::SqlType::Text)
     )
 }
 
@@ -462,8 +460,8 @@ fn execute_statement(
                 let columns = selected_columns
                     .iter()
                     .map(|column| match column.ty {
-                        SqlType::Int4 => int4_column(&column.name),
-                        SqlType::Text => text_column(&column.name),
+                        gpu_db_protocol::SqlType::Int4 => int4_column(&column.name),
+                        gpu_db_protocol::SqlType::Text => text_column(&column.name),
                     })
                     .collect::<Vec<_>>();
                 let output_rows = rows

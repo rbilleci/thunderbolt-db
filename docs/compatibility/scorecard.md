@@ -49,6 +49,7 @@ To make new compatibility tests visible in the right bucket:
    - `startup`, `frontend`, `session_lifecycle` for protocol/client flows
    - `parses_`, `rejects_` for SQL/parser coverage
    - `relational`, `create_table`, `insert`, or `select` for the P1 relational SQL foundation bucket
+   - `relational_catalog`, `catalog_schema`, `type_metadata`, `column_id`, or `relation_oid` for the P2 catalog/schema/type bucket
    - `transaction`, `commit`, `rollback` for transaction flows
 2. If a new category is needed, add or refine matching rules in `classify()` inside `scripts/generate_compat_scorecard.py`.
 3. Regenerate scorecard outputs and include them in the same PR.
