@@ -149,6 +149,7 @@ mod tests {
             projection: gpu_db_protocol::SelectProjection::All,
             filter: None,
             filters: Vec::new(),
+            filter_groups: Vec::new(),
             order_by: None,
             limit: None,
         }));
@@ -177,6 +178,7 @@ mod tests {
                 projection: gpu_db_protocol::SelectProjection::All,
                 filter: None,
                 filters: Vec::new(),
+                filter_groups: Vec::new(),
                 order_by: None,
                 limit: None,
             }),

@@ -1,12 +1,4 @@
-# P7 Relational Workload Benchmark - 2026-05-11
-
-Command:
-
-```bash
-scripts/run_p7_relational_benchmark.sh
-```
-
-Environment:
+# P7 Relational Workload Benchmark
 
 - dataset_rows: 1000
 - concurrency: 1
@@ -15,10 +7,10 @@ Environment:
 ## app_indexed_point_lookup
 - queries: 16
 - result_rows: 16
-- cpu_total_us: 4895
-- gpu_probe_total_us: 6666146
-- cpu_qps: 3268.51
-- gpu_probe_qps: 2.40
+- cpu_total_us: 5023
+- gpu_probe_total_us: 6695393
+- cpu_qps: 3185.08
+- gpu_probe_qps: 2.39
 - gpu_executed_rate_permyriad: 10000
 - cpu_fallback_rate_permyriad: 0
 - h2d_bytes_total: 0
@@ -30,10 +22,10 @@ Environment:
 ## analytic_full_table_scan
 - queries: 1
 - result_rows: 1000
-- cpu_total_us: 2368
-- gpu_probe_total_us: 416343
-- cpu_qps: 422.24
-- gpu_probe_qps: 2.40
+- cpu_total_us: 2370
+- gpu_probe_total_us: 425174
+- cpu_qps: 421.77
+- gpu_probe_qps: 2.35
 - gpu_executed_rate_permyriad: 10000
 - cpu_fallback_rate_permyriad: 0
 - h2d_bytes_total: 0
@@ -45,9 +37,9 @@ Environment:
 ## analytic_range_filter
 - queries: 1
 - result_rows: 25
-- cpu_total_us: 58714
-- gpu_probe_total_us: 41392057
-- cpu_qps: 17.03
+- cpu_total_us: 60494
+- gpu_probe_total_us: 41430289
+- cpu_qps: 16.53
 - gpu_probe_qps: 0.02
 - gpu_executed_rate_permyriad: 10000
 - cpu_fallback_rate_permyriad: 0
@@ -60,9 +52,9 @@ Environment:
 ## analytic_conjunctive_filter
 - queries: 1
 - result_rows: 25
-- cpu_total_us: 30850
-- gpu_probe_total_us: 20893546
-- cpu_qps: 32.41
+- cpu_total_us: 31476
+- gpu_probe_total_us: 20960351
+- cpu_qps: 31.77
 - gpu_probe_qps: 0.05
 - gpu_executed_rate_permyriad: 10000
 - cpu_fallback_rate_permyriad: 0
@@ -72,10 +64,19 @@ Environment:
 - kernel_exec_total_ms: 0
 - correctness_validated: true
 
-## Decision
+## analytic_disjunctive_filter
+- queries: 1
+- result_rows: 25
+- cpu_total_us: 299460
+- gpu_probe_total_us: 208689656
+- cpu_qps: 3.34
+- gpu_probe_qps: 0.00
+- gpu_executed_rate_permyriad: 10000
+- cpu_fallback_rate_permyriad: 0
+- h2d_bytes_total: 0
+- d2h_bytes_total: 1429
+- kernel_exec_samples: 0
+- kernel_exec_total_ms: 0
+- correctness_validated: true
 
-The indexed lookup, analytical scan, analytical range-filter, and analytical conjunctive-filter workloads all reach GPU execution with no SQL fallback for the current benchmark mix after equality predicate bridge pushdown, bridge-level decoded-column ordering pushdown, range predicate key-batch bridging, and conjunction key-batch bridging, but none of the workloads beats the CPU baseline in this run.
-
-Supported performance claim: current P7 evidence proves reproducible routing and correctness measurement for four relational workload shapes, not workload-level GPU advantage.
-
-Named follow-up: prioritize transfer layout, batching, richer expression/boolean pushdown, and publishing CUDA driver timing into engine metrics before making broad performance claims. Projection-only SQL result shaping, supported decoded-column ordering, narrow range predicates, and narrow `AND` predicate conjunctions are now treated as bridge-supported result/source shaping rather than GPU fallback when the relational row fetch executes on GPU.
+decision: analytical scans reach GPU execution but do not yet beat the CPU baseline in this run; prioritize transfer layout, batching, and CUDA timing publication before making broad performance claims.

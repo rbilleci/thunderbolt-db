@@ -73,6 +73,7 @@ pub struct Select {
     pub projection: SelectProjection,
     pub filter: Option<SelectFilter>,
     pub filters: Vec<SelectFilter>,
+    pub filter_groups: Vec<Vec<SelectFilter>>,
     pub order_by: Option<SelectOrder>,
     pub limit: Option<usize>,
 }
@@ -117,7 +118,7 @@ pub enum ParseError {
     InvalidDel,
     #[error("invalid GET syntax; expected: GET key")]
     InvalidGet,
-    #[error("invalid relational SQL syntax; supported subset: CREATE TABLE name (...), INSERT INTO name (...) VALUES (...), SELECT columns FROM name [WHERE column (=|<|<=|>|>=) literal [AND ...]] [ORDER BY column [ASC|DESC]] [LIMIT n]")]
+    #[error("invalid relational SQL syntax; supported subset: CREATE TABLE name (...), INSERT INTO name (...) VALUES (...), SELECT columns FROM name [WHERE column (=|<|<=|>|>=) literal [AND ...] [OR ...]] [ORDER BY column [ASC|DESC]] [LIMIT n]")]
     InvalidRelationalSql,
     #[error("invalid RESET/DISCARD/DEALLOCATE/CLOSE/LISTEN/NOTIFY/UNLISTEN syntax; expected: RESET ALL|ROLE|AUTHORIZATION|AUTH|SESSION AUTHORIZATION[ [TO] DEFAULT]|SESSION AUTH[ [TO] DEFAULT], DISCARD {{ALL|TEMP|TEMPORARY|TEMP TABLES|TEMPORARY TABLES|PLANS|SEQUENCES}}, DEALLOCATE {{ALL|name|PREPARE|PREPARED name}}, CLOSE {{ALL|name}}, LISTEN channel, NOTIFY channel[, payload], or UNLISTEN [*|ALL|channel]")]
     InvalidReset,
@@ -1554,14 +1555,14 @@ fn parse_select(input: &str) -> Result<Select, ParseError> {
     let table = normalize_identifier(&tail[..table_end])?;
     tail = tail[table_end..].trim_start();
 
-    let mut filters = Vec::new();
+    let mut filter_groups = Vec::new();
     let mut order_by = None;
     let mut limit = None;
     while !tail.is_empty() {
         if let Some(after_where) = strip_keyword_prefix_case_insensitive(tail, "WHERE") {
             let after_where = after_where.trim_start();
             let next = next_clause_pos(after_where).unwrap_or(after_where.len());
-            filters = parse_select_filters(after_where[..next].trim())?;
+            filter_groups = parse_select_filter_groups(after_where[..next].trim())?;
             tail = after_where[next..].trim_start();
         } else if let Some(after_order) = strip_keyword_prefix_case_insensitive(tail, "ORDER") {
             let after_by = strip_keyword_prefix_case_insensitive(after_order.trim_start(), "BY")
@@ -1584,11 +1585,13 @@ fn parse_select(input: &str) -> Result<Select, ParseError> {
         }
     }
 
+    let filters = filter_groups.first().cloned().unwrap_or_default();
     Ok(Select {
         table,
         projection,
         filter: filters.first().cloned(),
         filters,
+        filter_groups,
         order_by,
         limit,
     })
@@ -1626,6 +1629,17 @@ fn parse_select_filters(input: &str) -> Result<Vec<SelectFilter>, ParseError> {
         return Err(ParseError::InvalidRelationalSql);
     }
     Ok(filters)
+}
+
+fn parse_select_filter_groups(input: &str) -> Result<Vec<Vec<SelectFilter>>, ParseError> {
+    let groups = split_keyword_chain_outside_quotes(input, "OR")?
+        .into_iter()
+        .map(|group| parse_select_filters(group.trim()))
+        .collect::<Result<Vec<_>, _>>()?;
+    if groups.is_empty() || groups.iter().any(Vec::is_empty) {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    Ok(groups)
 }
 
 fn split_select_filter(input: &str) -> Result<(&str, SelectFilterOp, &str), ParseError> {
@@ -8029,6 +8043,11 @@ mod tests {
                     op: SelectFilterOp::Eq,
                     value: SqlValue::Int4(1),
                 }],
+                filter_groups: vec![vec![SelectFilter {
+                    column: "id".to_string(),
+                    op: SelectFilterOp::Eq,
+                    value: SqlValue::Int4(1),
+                }]],
                 order_by: Some(SelectOrder {
                     column: "name".to_string(),
                     descending: true,
@@ -8052,6 +8071,11 @@ mod tests {
                     op: SelectFilterOp::Gte,
                     value: SqlValue::Int4(2),
                 }],
+                filter_groups: vec![vec![SelectFilter {
+                    column: "id".to_string(),
+                    op: SelectFilterOp::Gte,
+                    value: SqlValue::Int4(2),
+                }]],
                 order_by: Some(SelectOrder {
                     column: "id".to_string(),
                     descending: false,
@@ -8081,6 +8105,50 @@ mod tests {
                         op: SelectFilterOp::Eq,
                         value: SqlValue::Text("Ada".to_string()),
                     },
+                ],
+                filter_groups: vec![vec![
+                    SelectFilter {
+                        column: "id".to_string(),
+                        op: SelectFilterOp::Gte,
+                        value: SqlValue::Int4(2),
+                    },
+                    SelectFilter {
+                        column: "name".to_string(),
+                        op: SelectFilterOp::Eq,
+                        value: SqlValue::Text("Ada".to_string()),
+                    },
+                ]],
+                order_by: None,
+                limit: None,
+            })
+        );
+
+        assert_eq!(
+            parse_command("SELECT name FROM people WHERE id = 1 OR name = 'Ada'").unwrap(),
+            Command::Select(Select {
+                table: "people".to_string(),
+                projection: SelectProjection::Columns(vec!["name".to_string()]),
+                filter: Some(SelectFilter {
+                    column: "id".to_string(),
+                    op: SelectFilterOp::Eq,
+                    value: SqlValue::Int4(1),
+                }),
+                filters: vec![SelectFilter {
+                    column: "id".to_string(),
+                    op: SelectFilterOp::Eq,
+                    value: SqlValue::Int4(1),
+                }],
+                filter_groups: vec![
+                    vec![SelectFilter {
+                        column: "id".to_string(),
+                        op: SelectFilterOp::Eq,
+                        value: SqlValue::Int4(1),
+                    }],
+                    vec![SelectFilter {
+                        column: "name".to_string(),
+                        op: SelectFilterOp::Eq,
+                        value: SqlValue::Text("Ada".to_string()),
+                    }],
                 ],
                 order_by: None,
                 limit: None,

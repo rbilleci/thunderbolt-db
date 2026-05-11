@@ -40,6 +40,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let conjunctive_queries = vec![select(
         "SELECT id, amount FROM events WHERE amount >= 900 AND category = 'even' ORDER BY amount DESC LIMIT 25",
     )?];
+    let disjunctive_queries = vec![select(
+        "SELECT id, amount FROM events WHERE amount >= 990 OR category = 'odd' ORDER BY amount DESC LIMIT 25",
+    )?];
 
     let app = run_workload("app_indexed_point_lookup", row_count, &app_queries)?;
     let analytic = run_workload("analytic_full_table_scan", row_count, &analytic_queries)?;
@@ -48,6 +51,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         "analytic_conjunctive_filter",
         row_count,
         &conjunctive_queries,
+    )?;
+    let disjunctive = run_workload(
+        "analytic_disjunctive_filter",
+        row_count,
+        &disjunctive_queries,
     )?;
 
     println!("# P7 Relational Workload Benchmark");
@@ -64,7 +72,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!();
     print_workload(&conjunctive);
     println!();
-    print_decision(&app, &analytic, &range, &conjunctive);
+    print_workload(&disjunctive);
+    println!();
+    print_decision(&app, &analytic, &range, &conjunctive, &disjunctive);
 
     Ok(())
 }
@@ -103,6 +113,7 @@ fn print_decision(
     analytic: &WorkloadReport,
     range: &WorkloadReport,
     conjunctive: &WorkloadReport,
+    disjunctive: &WorkloadReport,
 ) {
     if analytic.bridge.gpu_executed_count > 0 && analytic.gpu_elapsed < analytic.cpu_elapsed {
         println!(
@@ -122,6 +133,7 @@ fn print_decision(
         || analytic.bridge.cpu_fallback_count > 0
         || range.bridge.cpu_fallback_count > 0
         || conjunctive.bridge.cpu_fallback_count > 0
+        || disjunctive.bridge.cpu_fallback_count > 0
     {
         println!(
             "decision: current relational workloads still fall back for important SQL shapes; prioritize SQL-to-GPU bridge expansion before claiming workload-level GPU advantage."
