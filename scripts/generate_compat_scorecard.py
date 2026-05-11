@@ -21,6 +21,8 @@ def classify(test_id: str) -> list[str]:
             buckets.append("sql.transaction_flows")
         if re.search(r"relational|create_table|insert|select", test_id):
             buckets.append("sql.relational_foundation")
+        if re.search(r"catalog|pg_catalog|introspection|schema|type", test_id):
+            buckets.append("sql.catalog_schema_types")
     if "gpu_db_protocol::" in test_id:
         if re.search(r"startup|frontend|ssl|cancel|session_lifecycle", test_id):
             buckets.append("protocol.client_flows")
@@ -30,7 +32,10 @@ def classify(test_id: str) -> list[str]:
             buckets.append("sql.relational_foundation")
     if re.search(r"relational|create_table|insert|select", test_id):
         buckets.append("sql.relational_foundation")
-    if re.search(r"relational_catalog|catalog_schema|type_metadata|column_id|relation_oid", test_id):
+    if re.search(
+        r"relational_catalog|catalog_helpers|catalog_schema|catalog_introspection|pg_catalog|type_metadata|column_id|relation_oid",
+        test_id,
+    ):
         buckets.append("sql.catalog_schema_types")
     if re.search(r"transaction|commit|rollback|begin", test_id):
         buckets.append("sql.transaction_flows")

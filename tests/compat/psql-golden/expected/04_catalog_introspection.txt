@@ -1,0 +1,16 @@
+=== catalog table introspection ===
+CREATE TABLE
+CREATE TABLE
+    relname
+----------------
+ catalog_people
+ catalog_teams
+(2 rows)
+
+=== catalog column introspection ===
+ attname | atttypid
+---------+----------
+ id      |       23
+ name    |       25
+(2 rows)
+

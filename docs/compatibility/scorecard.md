@@ -49,14 +49,14 @@ To make new compatibility tests visible in the right bucket:
    - `startup`, `frontend`, `session_lifecycle` for protocol/client flows
    - `parses_`, `rejects_` for SQL/parser coverage
    - `relational`, `create_table`, `insert`, or `select` for the P1 relational SQL foundation bucket
-   - `relational_catalog`, `catalog_schema`, `type_metadata`, `column_id`, or `relation_oid` for the P2 catalog/schema/type bucket
+   - `relational_catalog`, `catalog_schema`, `catalog_introspection`, `pg_catalog`, `type_metadata`, `column_id`, or `relation_oid` for the P2 catalog/schema/type bucket
    - `transaction`, `commit`, `rollback` for transaction flows
 2. If a new category is needed, add or refine matching rules in `classify()` inside `scripts/generate_compat_scorecard.py`.
 3. Regenerate scorecard outputs and include them in the same PR.
 
 For `psql` golden scenarios specifically:
 - use descriptive scenario filenames such as `03_extended_query_rejection.sql`;
-- keep the behavior keyword in the filename (`startup`, `session_reset`, `prepare`, `transaction`, `relational`, `create_table`, `insert`, `select`, etc.);
+- keep the behavior keyword in the filename (`startup`, `session_reset`, `prepare`, `transaction`, `relational`, `create_table`, `insert`, `select`, `catalog`, `pg_catalog`, `introspection`, etc.);
 - if the scenario belongs in a new compatibility bucket, extend `classify()` in `scripts/generate_compat_scorecard.py`.
 
 ## Trend hook

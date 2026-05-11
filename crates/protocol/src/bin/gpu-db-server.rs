@@ -63,6 +63,10 @@ fn format_sql_value(value: &SqlValue) -> String {
     }
 }
 
+fn sql_type_oid_text(ty: gpu_db_protocol::SqlType) -> String {
+    ty.postgres_oid().to_string()
+}
+
 #[derive(Default)]
 struct Session {
     in_transaction: bool,
@@ -487,6 +491,28 @@ fn execute_statement(
     }
 
     let canonical = canonical_sql(statement);
+    if canonical
+        == "select relname from pg_catalog.pg_class where relnamespace = 'public'::regnamespace and relkind = 'r' order by relname"
+    {
+        return write_single_row(stream, &[text_column("relname")], &catalog_table_rows(session));
+    }
+    if let Some(table) = catalog_attribute_query_table(&canonical) {
+        let Some(rows) = catalog_attribute_rows(session, &table) else {
+            return write_error(
+                stream,
+                &ErrorField {
+                    code: "42P01",
+                    message: "relation does not exist",
+                    position: None,
+                },
+            );
+        };
+        return write_single_row(
+            stream,
+            &[text_column("attname"), int4_column("atttypid")],
+            &rows,
+        );
+    }
     match canonical.as_str() {
         "begin" => {
             session.in_transaction = true;
@@ -577,6 +603,40 @@ fn execute_statement(
             },
         ),
     }
+}
+
+fn catalog_table_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut names = session.tables.keys().cloned().collect::<Vec<_>>();
+    names.sort();
+    names
+        .into_iter()
+        .map(|name| vec![Some(name)])
+        .collect::<Vec<_>>()
+}
+
+fn catalog_attribute_query_table(canonical: &str) -> Option<String> {
+    let prefix = "select attname, atttypid from pg_catalog.pg_attribute where attrelid = '";
+    let suffix = "'::regclass and attnum > 0 order by attnum";
+    canonical
+        .strip_prefix(prefix)?
+        .strip_suffix(suffix)
+        .map(str::to_string)
+}
+
+fn catalog_attribute_rows(session: &Session, table: &str) -> Option<Vec<Vec<Option<String>>>> {
+    let table = session.tables.get(table)?;
+    Some(
+        table
+            .columns
+            .iter()
+            .map(|column| {
+                vec![
+                    Some(column.name.clone()),
+                    Some(sql_type_oid_text(column.ty)),
+                ]
+            })
+            .collect(),
+    )
 }
 
 fn canonical_sql(input: &str) -> String {
@@ -737,6 +797,59 @@ mod tests {
             split_simple_query("SELECT 1;;  SELECT 2;"),
             vec!["SELECT 1", "SELECT 2"]
         );
+    }
+
+    #[test]
+    fn catalog_helpers_expose_session_tables_and_columns() {
+        let mut session = Session::default();
+        session.tables.insert(
+            "people".to_string(),
+            Table {
+                columns: vec![
+                    gpu_db_protocol::ColumnDef {
+                        name: "id".to_string(),
+                        ty: gpu_db_protocol::SqlType::Int4,
+                    },
+                    gpu_db_protocol::ColumnDef {
+                        name: "name".to_string(),
+                        ty: gpu_db_protocol::SqlType::Text,
+                    },
+                ],
+                rows: Vec::new(),
+            },
+        );
+        session.tables.insert(
+            "teams".to_string(),
+            Table {
+                columns: vec![gpu_db_protocol::ColumnDef {
+                    name: "id".to_string(),
+                    ty: gpu_db_protocol::SqlType::Int4,
+                }],
+                rows: Vec::new(),
+            },
+        );
+
+        assert_eq!(
+            catalog_table_rows(&session),
+            vec![
+                vec![Some("people".to_string())],
+                vec![Some("teams".to_string())],
+            ]
+        );
+        assert_eq!(
+            catalog_attribute_query_table(
+                "select attname, atttypid from pg_catalog.pg_attribute where attrelid = 'people'::regclass and attnum > 0 order by attnum"
+            ),
+            Some("people".to_string())
+        );
+        assert_eq!(
+            catalog_attribute_rows(&session, "people").unwrap(),
+            vec![
+                vec![Some("id".to_string()), Some("23".to_string())],
+                vec![Some("name".to_string()), Some("25".to_string())],
+            ]
+        );
+        assert!(catalog_attribute_rows(&session, "missing").is_none());
     }
 
     #[test]

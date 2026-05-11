@@ -21,8 +21,8 @@
     "sql.catalog_schema_types": {
       "failed": 0,
       "ignored": 0,
-      "passed": 1,
-      "total": 1
+      "passed": 2,
+      "total": 2
     },
     "sql.relational_foundation": {
       "failed": 0,
@@ -47,8 +47,8 @@
   "totals": {
     "failed": 0,
     "ignored": 0,
-    "passed": 536,
-    "total": 536
+    "passed": 537,
+    "total": 537
   },
   "trend_hook": {
     "baseline_available": true,
