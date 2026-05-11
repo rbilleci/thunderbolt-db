@@ -46,8 +46,8 @@ Environment:
 
 ## Decision
 
-The indexed lookup and analytical scan workloads both reach GPU execution with no SQL fallback for the current benchmark mix after equality predicate bridge pushdown, but neither workload beats the CPU baseline in this run.
+The indexed lookup and analytical scan workloads both reach GPU execution with no SQL fallback for the current benchmark mix after equality predicate bridge pushdown and bridge-level decoded-column ordering pushdown, but neither workload beats the CPU baseline in this run.
 
 Supported performance claim: current P7 evidence proves reproducible routing and correctness measurement for two relational workload shapes, not workload-level GPU advantage.
 
-Named follow-up: prioritize transfer layout, batching, remaining SQL `ORDER BY` pushdown, and publishing CUDA driver timing into engine metrics before making broad performance claims. Projection-only SQL result shaping is now treated as host result formatting rather than GPU fallback when the relational row fetch already executed on GPU.
+Named follow-up: prioritize transfer layout, batching, and publishing CUDA driver timing into engine metrics before making broad performance claims. Projection-only SQL result shaping and supported decoded-column ordering are now treated as bridge-level result shaping rather than GPU fallback when the relational row fetch already executed on GPU.
