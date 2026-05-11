@@ -135,7 +135,8 @@ Pass criteria:
 - Output includes `operational_replication_smoke=passed`.
 - Follower output reports `follower_caught_up=true`.
 - `follower_read_after_apply` includes the post-failover write.
-- `failover_admission_gate` reports old-leader write rejection and a `Leader` role for the promoted node.
+- `promoted_leader_commit`, `follower_commit`, and `follower_applied` are equal.
+- `failover_admission_gate` reports old-leader write rejection and `promoted_node_role=Leader`.
 
 ## 5) CPU Fallback Monitoring (No-GPU bootstrap)
 

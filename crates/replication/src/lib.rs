@@ -56,6 +56,62 @@ pub struct ReplicationStatusSnapshot {
     pub recovery_gap: RecoveryProgressGap,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationalClusterSmokeReport {
+    pub promoted_leader_term: Term,
+    pub promoted_leader_commit_index: Index,
+    pub follower_commit_index: Index,
+    pub follower_applied_index: Index,
+    pub follower_caught_up: bool,
+    pub follower_read_after_apply: Vec<String>,
+    pub old_leader_rejected_after_failover: bool,
+    pub promoted_node_role: Role,
+}
+
+impl OperationalClusterSmokeReport {
+    pub fn readiness_passed(&self) -> bool {
+        self.follower_caught_up
+            && self.old_leader_rejected_after_failover
+            && self.promoted_node_role == Role::Leader
+            && self.follower_commit_index == self.promoted_leader_commit_index
+            && self.follower_applied_index == self.follower_commit_index
+    }
+
+    pub fn to_operator_lines(&self) -> Vec<String> {
+        vec![
+            format!(
+                "operational_replication_smoke={}",
+                if self.readiness_passed() {
+                    "passed"
+                } else {
+                    "failed"
+                }
+            ),
+            format!(
+                "promoted_leader_term={} promoted_leader_commit={} follower_commit={} follower_applied={} follower_caught_up={}",
+                self.promoted_leader_term,
+                self.promoted_leader_commit_index,
+                self.follower_commit_index,
+                self.follower_applied_index,
+                self.follower_caught_up
+            ),
+            format!(
+                "follower_read_after_apply={}",
+                self.follower_read_after_apply.join(" | ")
+            ),
+            format!(
+                "failover_admission_gate=old_leader_{} promoted_node_role={:?}",
+                if self.old_leader_rejected_after_failover {
+                    "not_leader"
+                } else {
+                    "accepted_write"
+                },
+                self.promoted_node_role
+            ),
+        ]
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ReplicationStatusInvariantError {
     #[error("live progress is invalid: {0}")]
@@ -1249,10 +1305,11 @@ mod tests {
 
         leader.become_follower(2);
         follower_a.become_leader(2);
-        assert!(matches!(
+        let old_leader_rejected_after_failover = matches!(
             leader.propose(b"blocked after failover".to_vec()),
             Err(EngineError::NotLeader)
-        ));
+        );
+        assert!(old_leader_rejected_after_failover);
 
         let third = follower_a
             .propose(b"insert into t values (2)".to_vec())
@@ -1292,6 +1349,27 @@ mod tests {
         );
         assert!(follower_b.progress().is_caught_up());
         assert_eq!(follower_a.status_snapshot().live.role, Role::Leader);
+
+        let report = OperationalClusterSmokeReport {
+            promoted_leader_term: follower_a.current_term(),
+            promoted_leader_commit_index: follower_a.commit_index(),
+            follower_commit_index: follower_b.commit_index(),
+            follower_applied_index: follower_b.applied_index(),
+            follower_caught_up: follower_b.progress().is_caught_up(),
+            follower_read_after_apply: state_b.values,
+            old_leader_rejected_after_failover,
+            promoted_node_role: follower_a.role(),
+        };
+        assert!(report.readiness_passed());
+        assert_eq!(
+            report.to_operator_lines(),
+            vec![
+                "operational_replication_smoke=passed".to_string(),
+                "promoted_leader_term=2 promoted_leader_commit=3 follower_commit=3 follower_applied=3 follower_caught_up=true".to_string(),
+                "follower_read_after_apply=create table t(id int) | insert into t values (1) | insert into t values (2)".to_string(),
+                "failover_admission_gate=old_leader_not_leader promoted_node_role=Leader".to_string(),
+            ]
+        );
     }
 
     #[test]

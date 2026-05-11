@@ -1,6 +1,8 @@
 use std::time::Duration;
 
-use gpu_db_replication::{LogReplicator, RaftReplicator, ReplicatedStateMachine};
+use gpu_db_replication::{
+    LogReplicator, OperationalClusterSmokeReport, RaftReplicator, ReplicatedStateMachine,
+};
 use gpu_db_types::{EngineError, Index, LogEntry, Role, Term};
 
 #[derive(Default)]
@@ -111,10 +113,11 @@ fn main() -> Result<(), EngineError> {
 
     leader.become_follower(2);
     follower_a.become_leader(2);
-    assert!(matches!(
+    let old_leader_rejected_after_failover = matches!(
         leader.propose(b"blocked after failover".to_vec()),
         Err(EngineError::NotLeader)
-    ));
+    );
+    assert!(old_leader_rejected_after_failover);
 
     let third = follower_a.propose(b"insert into t values (2)".to_vec())?;
     let term_two = follower_a.current_term();
@@ -151,20 +154,20 @@ fn main() -> Result<(), EngineError> {
     assert!(follower_b.progress().is_caught_up());
     assert_eq!(follower_a.status_snapshot().live.role, Role::Leader);
 
-    println!("operational_replication_smoke=passed");
-    println!(
-        "leader_term={} leader_commit={} follower_commit={} follower_applied={} follower_caught_up={}",
-        follower_a.current_term(),
-        follower_a.commit_index(),
-        follower_b.commit_index(),
-        follower_b.applied_index(),
-        follower_b.progress().is_caught_up()
-    );
-    println!("follower_read_after_apply={}", state_b.values.join(" | "));
-    println!(
-        "failover_admission_gate=old_leader_not_leader new_leader_role={:?}",
-        follower_a.role()
-    );
+    let report = OperationalClusterSmokeReport {
+        promoted_leader_term: follower_a.current_term(),
+        promoted_leader_commit_index: follower_a.commit_index(),
+        follower_commit_index: follower_b.commit_index(),
+        follower_applied_index: follower_b.applied_index(),
+        follower_caught_up: follower_b.progress().is_caught_up(),
+        follower_read_after_apply: state_b.values,
+        old_leader_rejected_after_failover,
+        promoted_node_role: follower_a.role(),
+    };
+    assert!(report.readiness_passed());
+    for line in report.to_operator_lines() {
+        println!("{line}");
+    }
 
     Ok(())
 }
