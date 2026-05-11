@@ -67,23 +67,44 @@ fn sql_type_oid_text(ty: gpu_db_protocol::SqlType) -> String {
     ty.postgres_oid().to_string()
 }
 
-#[derive(Default)]
 struct Session {
     in_transaction: bool,
     prepared: HashMap<String, PreparedStatement>,
     tables: HashMap<String, Table>,
+    next_relation_oid: u32,
+}
+
+impl Default for Session {
+    fn default() -> Self {
+        Self {
+            in_transaction: false,
+            prepared: HashMap::new(),
+            tables: HashMap::new(),
+            next_relation_oid: FIRST_USER_RELATION_OID,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Table {
-    columns: Vec<gpu_db_protocol::ColumnDef>,
+    oid: u32,
+    name: String,
+    columns: Vec<CatalogColumn>,
     rows: Vec<Vec<SqlValue>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CatalogColumn {
+    attnum: i16,
+    def: gpu_db_protocol::ColumnDef,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum PreparedStatement {
     AddTen,
 }
+
+const FIRST_USER_RELATION_OID: u32 = 16_384;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listen = parse_listen_arg(env::args().skip(1))?;
@@ -305,10 +326,41 @@ fn execute_statement(
                         },
                     );
                 }
+                let oid = session.next_relation_oid;
+                session.next_relation_oid = match session.next_relation_oid.checked_add(1) {
+                    Some(next) => next,
+                    None => {
+                        return write_error(
+                            stream,
+                            &ErrorField {
+                                code: "54000",
+                                message: "relation OID allocation exhausted",
+                                position: None,
+                            },
+                        );
+                    }
+                };
+                let mut columns = Vec::with_capacity(create.columns.len());
+                for (idx, def) in create.columns.into_iter().enumerate() {
+                    let Ok(attnum) = i16::try_from(idx + 1) else {
+                        return write_error(
+                            stream,
+                            &ErrorField {
+                                code: "54000",
+                                message: "too many columns for bootstrap catalog",
+                                position: None,
+                            },
+                        );
+                    };
+                    columns.push(CatalogColumn { attnum, def });
+                }
+                let name = create.table;
                 session.tables.insert(
-                    create.table,
+                    name.clone(),
                     Table {
-                        columns: create.columns,
+                        oid,
+                        name,
+                        columns,
                         rows: Vec::new(),
                     },
                 );
@@ -330,7 +382,7 @@ fn execute_statement(
                     let Some(idx) = table
                         .columns
                         .iter()
-                        .position(|candidate| candidate.name == *column)
+                        .position(|candidate| candidate.def.name == *column)
                     else {
                         return write_error(
                             stream,
@@ -347,7 +399,10 @@ fn execute_statement(
                 for row in insert.rows {
                     let mut projected = vec![None; table.columns.len()];
                     for (source_idx, target_idx) in indexes.iter().copied().enumerate() {
-                        if !sql_value_matches_type(&row[source_idx], table.columns[target_idx].ty) {
+                        if !sql_value_matches_type(
+                            &row[source_idx],
+                            table.columns[target_idx].def.ty,
+                        ) {
                             return write_error(
                                 stream,
                                 &ErrorField {
@@ -394,7 +449,7 @@ fn execute_statement(
                             let Some(def) = table
                                 .columns
                                 .iter()
-                                .find(|candidate| candidate.name == *column)
+                                .find(|candidate| candidate.def.name == *column)
                             else {
                                 return write_error(
                                     stream,
@@ -415,7 +470,7 @@ fn execute_statement(
                     let Some(idx) = table
                         .columns
                         .iter()
-                        .position(|column| column.name == filter.column)
+                        .position(|column| column.def.name == filter.column)
                     else {
                         return write_error(
                             stream,
@@ -432,7 +487,7 @@ fn execute_statement(
                     let Some(idx) = table
                         .columns
                         .iter()
-                        .position(|column| column.name == order.column)
+                        .position(|column| column.def.name == order.column)
                     else {
                         return write_error(
                             stream,
@@ -457,15 +512,15 @@ fn execute_statement(
                         table
                             .columns
                             .iter()
-                            .position(|column| column.name == selected.name)
+                            .position(|column| column.def.name == selected.def.name)
                             .expect("selected column came from table")
                     })
                     .collect::<Vec<_>>();
                 let columns = selected_columns
                     .iter()
-                    .map(|column| match column.ty {
-                        gpu_db_protocol::SqlType::Int4 => int4_column(&column.name),
-                        gpu_db_protocol::SqlType::Text => text_column(&column.name),
+                    .map(|column| match column.def.ty {
+                        gpu_db_protocol::SqlType::Int4 => int4_column(&column.def.name),
+                        gpu_db_protocol::SqlType::Text => text_column(&column.def.name),
                     })
                     .collect::<Vec<_>>();
                 let output_rows = rows
@@ -494,7 +549,20 @@ fn execute_statement(
     if canonical
         == "select relname from pg_catalog.pg_class where relnamespace = 'public'::regnamespace and relkind = 'r' order by relname"
     {
-        return write_single_row(stream, &[text_column("relname")], &catalog_table_rows(session));
+        return write_single_row(
+            stream,
+            &[text_column("relname")],
+            &catalog_table_name_rows(session),
+        );
+    }
+    if canonical
+        == "select oid, relname from pg_catalog.pg_class where relnamespace = 'public'::regnamespace and relkind = 'r' order by oid"
+    {
+        return write_single_row(
+            stream,
+            &[int4_column("oid"), text_column("relname")],
+            &catalog_table_oid_rows(session),
+        );
     }
     if let Some(table) = catalog_attribute_query_table(&canonical) {
         let Some(rows) = catalog_attribute_rows(session, &table) else {
@@ -510,6 +578,28 @@ fn execute_statement(
         return write_single_row(
             stream,
             &[text_column("attname"), int4_column("atttypid")],
+            &rows,
+        );
+    }
+    if let Some(table) = catalog_attribute_detail_query_table(&canonical) {
+        let Some(rows) = catalog_attribute_detail_rows(session, &table) else {
+            return write_error(
+                stream,
+                &ErrorField {
+                    code: "42P01",
+                    message: "relation does not exist",
+                    position: None,
+                },
+            );
+        };
+        return write_single_row(
+            stream,
+            &[
+                int4_column("attnum"),
+                text_column("attname"),
+                int4_column("atttypid"),
+                int4_column("attlen"),
+            ],
             &rows,
         );
     }
@@ -605,17 +695,39 @@ fn execute_statement(
     }
 }
 
-fn catalog_table_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    let mut names = session.tables.keys().cloned().collect::<Vec<_>>();
-    names.sort();
-    names
+fn catalog_table_name_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut tables = session.tables.values().collect::<Vec<_>>();
+    tables.sort_by(|left, right| left.name.cmp(&right.name));
+    tables
         .into_iter()
-        .map(|name| vec![Some(name)])
+        .map(|table| vec![Some(table.name.clone())])
         .collect::<Vec<_>>()
+}
+
+fn catalog_table_oid_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut rows = session
+        .tables
+        .iter()
+        .map(|(name, table)| (table.oid, name))
+        .collect::<Vec<_>>();
+    rows.sort_by_key(|(oid, _)| *oid);
+    rows.into_iter()
+        .map(|(oid, name)| vec![Some(oid.to_string()), Some(name.clone())])
+        .collect()
 }
 
 fn catalog_attribute_query_table(canonical: &str) -> Option<String> {
     let prefix = "select attname, atttypid from pg_catalog.pg_attribute where attrelid = '";
+    let suffix = "'::regclass and attnum > 0 order by attnum";
+    canonical
+        .strip_prefix(prefix)?
+        .strip_suffix(suffix)
+        .map(str::to_string)
+}
+
+fn catalog_attribute_detail_query_table(canonical: &str) -> Option<String> {
+    let prefix =
+        "select attnum, attname, atttypid, attlen from pg_catalog.pg_attribute where attrelid = '";
     let suffix = "'::regclass and attnum > 0 order by attnum";
     canonical
         .strip_prefix(prefix)?
@@ -631,8 +743,29 @@ fn catalog_attribute_rows(session: &Session, table: &str) -> Option<Vec<Vec<Opti
             .iter()
             .map(|column| {
                 vec![
-                    Some(column.name.clone()),
-                    Some(sql_type_oid_text(column.ty)),
+                    Some(column.def.name.clone()),
+                    Some(sql_type_oid_text(column.def.ty)),
+                ]
+            })
+            .collect(),
+    )
+}
+
+fn catalog_attribute_detail_rows(
+    session: &Session,
+    table: &str,
+) -> Option<Vec<Vec<Option<String>>>> {
+    let table = session.tables.get(table)?;
+    Some(
+        table
+            .columns
+            .iter()
+            .map(|column| {
+                vec![
+                    Some(column.attnum.to_string()),
+                    Some(column.def.name.clone()),
+                    Some(sql_type_oid_text(column.def.ty)),
+                    Some(column.def.ty.type_size().to_string()),
                 ]
             })
             .collect(),
@@ -805,14 +938,22 @@ mod tests {
         session.tables.insert(
             "people".to_string(),
             Table {
+                oid: FIRST_USER_RELATION_OID,
+                name: "people".to_string(),
                 columns: vec![
-                    gpu_db_protocol::ColumnDef {
-                        name: "id".to_string(),
-                        ty: gpu_db_protocol::SqlType::Int4,
+                    CatalogColumn {
+                        attnum: 1,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "id".to_string(),
+                            ty: gpu_db_protocol::SqlType::Int4,
+                        },
                     },
-                    gpu_db_protocol::ColumnDef {
-                        name: "name".to_string(),
-                        ty: gpu_db_protocol::SqlType::Text,
+                    CatalogColumn {
+                        attnum: 2,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "name".to_string(),
+                            ty: gpu_db_protocol::SqlType::Text,
+                        },
                     },
                 ],
                 rows: Vec::new(),
@@ -821,19 +962,37 @@ mod tests {
         session.tables.insert(
             "teams".to_string(),
             Table {
-                columns: vec![gpu_db_protocol::ColumnDef {
-                    name: "id".to_string(),
-                    ty: gpu_db_protocol::SqlType::Int4,
+                oid: FIRST_USER_RELATION_OID + 1,
+                name: "teams".to_string(),
+                columns: vec![CatalogColumn {
+                    attnum: 1,
+                    def: gpu_db_protocol::ColumnDef {
+                        name: "id".to_string(),
+                        ty: gpu_db_protocol::SqlType::Int4,
+                    },
                 }],
                 rows: Vec::new(),
             },
         );
 
         assert_eq!(
-            catalog_table_rows(&session),
+            catalog_table_name_rows(&session),
             vec![
                 vec![Some("people".to_string())],
                 vec![Some("teams".to_string())],
+            ]
+        );
+        assert_eq!(
+            catalog_table_oid_rows(&session),
+            vec![
+                vec![
+                    Some(FIRST_USER_RELATION_OID.to_string()),
+                    Some("people".to_string()),
+                ],
+                vec![
+                    Some((FIRST_USER_RELATION_OID + 1).to_string()),
+                    Some("teams".to_string()),
+                ],
             ]
         );
         assert_eq!(
@@ -849,7 +1008,67 @@ mod tests {
                 vec![Some("name".to_string()), Some("25".to_string())],
             ]
         );
+        assert_eq!(
+            catalog_attribute_detail_query_table(
+                "select attnum, attname, atttypid, attlen from pg_catalog.pg_attribute where attrelid = 'people'::regclass and attnum > 0 order by attnum"
+            ),
+            Some("people".to_string())
+        );
+        assert_eq!(
+            catalog_attribute_detail_rows(&session, "people").unwrap(),
+            vec![
+                vec![
+                    Some("1".to_string()),
+                    Some("id".to_string()),
+                    Some("23".to_string()),
+                    Some("4".to_string()),
+                ],
+                vec![
+                    Some("2".to_string()),
+                    Some("name".to_string()),
+                    Some("25".to_string()),
+                    Some("-1".to_string()),
+                ],
+            ]
+        );
         assert!(catalog_attribute_rows(&session, "missing").is_none());
+    }
+
+    #[test]
+    fn catalog_introspection_helpers_expose_relation_oids_and_attribute_details() {
+        let mut session = Session::default();
+        session.tables.insert(
+            "people".to_string(),
+            Table {
+                oid: FIRST_USER_RELATION_OID,
+                name: "people".to_string(),
+                columns: vec![CatalogColumn {
+                    attnum: 1,
+                    def: gpu_db_protocol::ColumnDef {
+                        name: "id".to_string(),
+                        ty: gpu_db_protocol::SqlType::Int4,
+                    },
+                }],
+                rows: Vec::new(),
+            },
+        );
+
+        assert_eq!(
+            catalog_table_oid_rows(&session),
+            vec![vec![
+                Some(FIRST_USER_RELATION_OID.to_string()),
+                Some("people".to_string()),
+            ]]
+        );
+        assert_eq!(
+            catalog_attribute_detail_rows(&session, "people").unwrap(),
+            vec![vec![
+                Some("1".to_string()),
+                Some("id".to_string()),
+                Some("23".to_string()),
+                Some("4".to_string()),
+            ]]
+        );
     }
 
     #[test]
