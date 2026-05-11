@@ -5930,6 +5930,14 @@ pub struct RelationalSelectResult {
     pub fallback_reason: Option<FallbackReason>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BoundRelationalSelect {
+    selected_columns: Vec<RelationalColumn>,
+    selected_indexes: Vec<usize>,
+    filter: Option<(usize, SqlValue)>,
+    order: Option<(usize, bool)>,
+}
+
 const PUBLIC_SCHEMA_NAME: &str = "public";
 const FIRST_USER_RELATION_OID: u32 = 16_384;
 const FIRST_USER_COLUMN_ID: u32 = 1;
@@ -6046,6 +6054,57 @@ fn compare_sql_values(left: &SqlValue, right: &SqlValue) -> Ordering {
         (SqlValue::Int4(_), SqlValue::Text(_)) => Ordering::Less,
         (SqlValue::Text(_), SqlValue::Int4(_)) => Ordering::Greater,
     }
+}
+
+fn relational_column_index(table: &RelationalTable, name: &str) -> Result<usize, ExecuteError> {
+    table
+        .columns
+        .iter()
+        .position(|column| column.name == name)
+        .ok_or_else(|| {
+            ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "column \"{}\" does not exist",
+                name
+            )))
+        })
+}
+
+fn bind_relational_select(
+    table: &RelationalTable,
+    select: &Select,
+) -> Result<BoundRelationalSelect, ExecuteError> {
+    let selected_indexes = match &select.projection {
+        SelectProjection::All => (0..table.columns.len()).collect::<Vec<_>>(),
+        SelectProjection::Columns(columns) => columns
+            .iter()
+            .map(|name| relational_column_index(table, name))
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+    let selected_columns = selected_indexes
+        .iter()
+        .map(|idx| table.columns[*idx].clone())
+        .collect::<Vec<_>>();
+    let filter = select
+        .filter
+        .as_ref()
+        .map(|filter| {
+            relational_column_index(table, &filter.column).map(|idx| (idx, filter.value.clone()))
+        })
+        .transpose()?;
+    let order = select
+        .order_by
+        .as_ref()
+        .map(|order| {
+            relational_column_index(table, &order.column).map(|idx| (idx, order.descending))
+        })
+        .transpose()?;
+
+    Ok(BoundRelationalSelect {
+        selected_columns,
+        selected_indexes,
+        filter,
+        order,
+    })
 }
 
 impl Engine {
@@ -6597,25 +6656,7 @@ impl Engine {
                 )))
             })?
             .clone();
-        let selected_columns = match &select.projection {
-            SelectProjection::All => table.columns.clone(),
-            SelectProjection::Columns(columns) => columns
-                .iter()
-                .map(|name| {
-                    table
-                        .columns
-                        .iter()
-                        .find(|column| column.name == *name)
-                        .cloned()
-                        .ok_or_else(|| {
-                            ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                                "column \"{}\" does not exist",
-                                name
-                            )))
-                        })
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-        };
+        let bound = bind_relational_select(&table, select)?;
 
         let query = MvccReadQuery {
             source: MvccReadSource::FullScan,
@@ -6636,37 +6677,17 @@ impl Engine {
                 continue;
             };
             let decoded = decode_relational_row(&value, &table.columns)?;
-            if let Some(filter) = &select.filter {
-                let Some(idx) = table
-                    .columns
-                    .iter()
-                    .position(|column| column.name == filter.column)
-                else {
-                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                        "column \"{}\" does not exist",
-                        filter.column
-                    ))));
-                };
-                if decoded[idx] != filter.value {
+            if let Some((idx, value)) = &bound.filter {
+                if decoded[*idx] != *value {
                     continue;
                 }
             }
             rows.push(decoded);
         }
 
-        if let Some(order) = &select.order_by {
-            let Some(idx) = table
-                .columns
-                .iter()
-                .position(|column| column.name == order.column)
-            else {
-                return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                    "column \"{}\" does not exist",
-                    order.column
-                ))));
-            };
-            rows.sort_by(|left, right| compare_sql_values(&left[idx], &right[idx]));
-            if order.descending {
+        if let Some((idx, descending)) = &bound.order {
+            rows.sort_by(|left, right| compare_sql_values(&left[*idx], &right[*idx]));
+            if *descending {
                 rows.reverse();
             }
         }
@@ -6674,20 +6695,11 @@ impl Engine {
             rows.truncate(limit);
         }
 
-        let selected_indexes = selected_columns
-            .iter()
-            .map(|selected| {
-                table
-                    .columns
-                    .iter()
-                    .position(|column| column.name == selected.name)
-                    .expect("selected column came from table catalog")
-            })
-            .collect::<Vec<_>>();
         let rows = rows
             .into_iter()
             .map(|row| {
-                selected_indexes
+                bound
+                    .selected_indexes
                     .iter()
                     .map(|idx| row[*idx].clone())
                     .collect::<Vec<_>>()
@@ -6695,7 +6707,7 @@ impl Engine {
             .collect();
 
         Ok(RelationalSelectResult {
-            columns: selected_columns,
+            columns: bound.selected_columns,
             rows,
             planned_target: result.planned_target,
             executed_target: result.executed_target,
@@ -22151,5 +22163,39 @@ mod tests {
             e.relational_catalog_table("teams").unwrap().oid,
             FIRST_USER_RELATION_OID + 1
         );
+    }
+
+    #[test]
+    fn relational_catalog_select_binding_uses_catalog_descriptors() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        let table = e.relational_catalog_table("people").unwrap();
+        let Command::Select(select) =
+            parse_command("SELECT name FROM people WHERE id = 1 ORDER BY name DESC").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+
+        let bound = bind_relational_select(table, &select).unwrap();
+
+        assert_eq!(bound.selected_indexes, vec![1]);
+        assert_eq!(bound.selected_columns[0].name, "name");
+        assert_eq!(
+            bound.selected_columns[0].type_oid,
+            SqlType::Text.postgres_oid()
+        );
+        assert_eq!(bound.filter, Some((0, SqlValue::Int4(1))));
+        assert_eq!(bound.order, Some((1, true)));
+
+        let Command::Select(bad_select) =
+            parse_command("SELECT missing FROM people ORDER BY name").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        assert!(bind_relational_select(table, &bad_select)
+            .unwrap_err()
+            .to_string()
+            .contains("column \"missing\" does not exist"));
     }
 }
