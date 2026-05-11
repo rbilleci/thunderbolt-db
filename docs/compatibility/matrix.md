@@ -20,6 +20,7 @@ This matrix makes compatibility intent explicit per delivery phase while preserv
 | Transaction control command parsing (`BEGIN`, `COMMIT`, `ROLLBACK`) | ✅ | ✅ | ✅ | Counted as non-GPU-eligible fallbacks in runtime telemetry |
 | Admin flush command (`CHECKPOINT`/`FLUSH`) | ✅ | ✅ | ✅ | Drains pending deterministic batch |
 | Session-control parser no-op aliases (`RESET`/`DISCARD`/`DEALLOCATE`/`SET ROLE`/`SET SESSION AUTH*`/`SET SESSION CHARACTERISTICS AS TRANSACTION ...`/`CLOSE {ALL|name}`/`LISTEN`/`NOTIFY`/`UNLISTEN` incl. `UNLISTEN ALL`) | ✅ | ✅ | ✅ | PostgreSQL-style client reset/setup probes accepted without mutating state |
+| Minimal relational SQL (`CREATE TABLE`, `INSERT`, narrow `SELECT`) | 🟡 | 🟡 | ✅ | P1 bootstrap slice uses structured parsed plans; engine reads lower through MVCC execution with CPU reference fallback, and psql golden covers create/insert/select |
 | Full PostgreSQL wire protocol compatibility | 🚫 | 🚫 | 🟡 | Planned as phased adapter; not required for current invariant validation |
 | Broad PostgreSQL SQL grammar coverage | 🚫 | 🚫 | 🟡 | Incremental after core replication + durability gates |
 

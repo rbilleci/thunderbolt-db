@@ -8,6 +8,67 @@ pub enum Command {
     SetKv { key: String, value: String },
     DeleteKv { key: String },
     GetKv { key: String },
+    CreateTable(CreateTable),
+    Insert(Insert),
+    Select(Select),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateTable {
+    pub table: String,
+    pub columns: Vec<ColumnDef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnDef {
+    pub name: String,
+    pub ty: SqlType,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SqlType {
+    Int4,
+    Text,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Insert {
+    pub table: String,
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<SqlValue>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SqlValue {
+    Int4(i32),
+    Text(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Select {
+    pub table: String,
+    pub projection: SelectProjection,
+    pub filter: Option<SelectFilter>,
+    pub order_by: Option<SelectOrder>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelectProjection {
+    All,
+    Columns(Vec<String>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectFilter {
+    pub column: String,
+    pub value: SqlValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectOrder {
+    pub column: String,
+    pub descending: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -22,6 +83,8 @@ pub enum ParseError {
     InvalidDel,
     #[error("invalid GET syntax; expected: GET key")]
     InvalidGet,
+    #[error("invalid relational SQL syntax; supported subset: CREATE TABLE name (...), INSERT INTO name (...) VALUES (...), SELECT columns FROM name [WHERE column = literal] [ORDER BY column [ASC|DESC]] [LIMIT n]")]
+    InvalidRelationalSql,
     #[error("invalid RESET/DISCARD/DEALLOCATE/CLOSE/LISTEN/NOTIFY/UNLISTEN syntax; expected: RESET ALL|ROLE|AUTHORIZATION|AUTH|SESSION AUTHORIZATION[ [TO] DEFAULT]|SESSION AUTH[ [TO] DEFAULT], DISCARD {{ALL|TEMP|TEMPORARY|TEMP TABLES|TEMPORARY TABLES|PLANS|SEQUENCES}}, DEALLOCATE {{ALL|name|PREPARE|PREPARED name}}, CLOSE {{ALL|name}}, LISTEN channel, NOTIFY channel[, payload], or UNLISTEN [*|ALL|channel]")]
     InvalidReset,
 }
@@ -1345,6 +1408,358 @@ fn strip_set_scope_prefix<'a>(input: &'a str, scope: &str) -> Option<&'a str> {
     Some(after_scope.trim_start())
 }
 
+fn parse_relational_command(input: &str) -> Option<Result<Command, ParseError>> {
+    let first = input.split_whitespace().next()?;
+    if first.eq_ignore_ascii_case("CREATE") {
+        return Some(parse_create_table(input).map(Command::CreateTable));
+    }
+    if first.eq_ignore_ascii_case("INSERT") {
+        return Some(parse_insert(input).map(Command::Insert));
+    }
+    if first.eq_ignore_ascii_case("SELECT") {
+        return Some(parse_select(input).map(Command::Select));
+    }
+    None
+}
+
+fn parse_create_table(input: &str) -> Result<CreateTable, ParseError> {
+    let rest = strip_keyword_prefix_case_insensitive(input, "CREATE")
+        .and_then(|s| strip_keyword_prefix_case_insensitive(s.trim_start(), "TABLE"))
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    let open = rest.find('(').ok_or(ParseError::InvalidRelationalSql)?;
+    let close = rest.rfind(')').ok_or(ParseError::InvalidRelationalSql)?;
+    if close <= open || !rest[close + 1..].trim().is_empty() {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let table = normalize_identifier(rest[..open].trim())?;
+    let mut columns = Vec::new();
+    for raw_column in split_csv(&rest[open + 1..close])? {
+        let mut parts = raw_column.split_whitespace();
+        let name = parts
+            .next()
+            .ok_or(ParseError::InvalidRelationalSql)
+            .and_then(normalize_identifier)?;
+        let ty = match parts.next().ok_or(ParseError::InvalidRelationalSql)? {
+            ty if ty.eq_ignore_ascii_case("INT") || ty.eq_ignore_ascii_case("INTEGER") => {
+                SqlType::Int4
+            }
+            ty if ty.eq_ignore_ascii_case("TEXT") => SqlType::Text,
+            _ => return Err(ParseError::InvalidRelationalSql),
+        };
+        if parts.next().is_some() {
+            return Err(ParseError::InvalidRelationalSql);
+        }
+        columns.push(ColumnDef { name, ty });
+    }
+    if columns.is_empty() {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    Ok(CreateTable { table, columns })
+}
+
+fn parse_insert(input: &str) -> Result<Insert, ParseError> {
+    let rest = strip_keyword_prefix_case_insensitive(input, "INSERT")
+        .and_then(|s| strip_keyword_prefix_case_insensitive(s.trim_start(), "INTO"))
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    let open = rest.find('(').ok_or(ParseError::InvalidRelationalSql)?;
+    let table = normalize_identifier(rest[..open].trim())?;
+    let close = find_matching_paren(rest, open).ok_or(ParseError::InvalidRelationalSql)?;
+    let columns = split_csv(&rest[open + 1..close])?
+        .into_iter()
+        .map(|column| normalize_identifier(column.trim()))
+        .collect::<Result<Vec<_>, _>>()?;
+    if columns.is_empty() {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let values = strip_keyword_prefix_case_insensitive(rest[close + 1..].trim_start(), "VALUES")
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    let mut rows = Vec::new();
+    let mut tail = values;
+    loop {
+        let open = tail.find('(').ok_or(ParseError::InvalidRelationalSql)?;
+        if !tail[..open].trim().is_empty() {
+            return Err(ParseError::InvalidRelationalSql);
+        }
+        let close = find_matching_paren(tail, open).ok_or(ParseError::InvalidRelationalSql)?;
+        let row = split_csv(&tail[open + 1..close])?
+            .into_iter()
+            .map(parse_sql_value)
+            .collect::<Result<Vec<_>, _>>()?;
+        if row.len() != columns.len() {
+            return Err(ParseError::InvalidRelationalSql);
+        }
+        rows.push(row);
+        tail = tail[close + 1..].trim_start();
+        if tail.is_empty() {
+            break;
+        }
+        let Some(after_comma) = tail.strip_prefix(',') else {
+            return Err(ParseError::InvalidRelationalSql);
+        };
+        tail = after_comma.trim_start();
+    }
+    Ok(Insert {
+        table,
+        columns,
+        rows,
+    })
+}
+
+fn parse_select(input: &str) -> Result<Select, ParseError> {
+    let rest = strip_keyword_prefix_case_insensitive(input, "SELECT")
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    let from_pos =
+        find_keyword_outside_quotes(rest, "FROM").ok_or(ParseError::InvalidRelationalSql)?;
+    let projection = parse_projection(rest[..from_pos].trim())?;
+    let mut tail = rest[from_pos + "FROM".len()..].trim_start();
+    let table_end = tail.find(char::is_whitespace).unwrap_or(tail.len());
+    let table = normalize_identifier(&tail[..table_end])?;
+    tail = tail[table_end..].trim_start();
+
+    let mut filter = None;
+    let mut order_by = None;
+    let mut limit = None;
+    while !tail.is_empty() {
+        if let Some(after_where) = strip_keyword_prefix_case_insensitive(tail, "WHERE") {
+            let after_where = after_where.trim_start();
+            let next = next_clause_pos(after_where).unwrap_or(after_where.len());
+            filter = Some(parse_select_filter(after_where[..next].trim())?);
+            tail = after_where[next..].trim_start();
+        } else if let Some(after_order) = strip_keyword_prefix_case_insensitive(tail, "ORDER") {
+            let after_by = strip_keyword_prefix_case_insensitive(after_order.trim_start(), "BY")
+                .ok_or(ParseError::InvalidRelationalSql)?
+                .trim_start();
+            let next = next_clause_pos(after_by).unwrap_or(after_by.len());
+            order_by = Some(parse_select_order(after_by[..next].trim())?);
+            tail = after_by[next..].trim_start();
+        } else if let Some(after_limit) = strip_keyword_prefix_case_insensitive(tail, "LIMIT") {
+            let after_limit = after_limit.trim_start();
+            let next = next_clause_pos(after_limit).unwrap_or(after_limit.len());
+            let n = after_limit[..next]
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| ParseError::InvalidRelationalSql)?;
+            limit = Some(n);
+            tail = after_limit[next..].trim_start();
+        } else {
+            return Err(ParseError::InvalidRelationalSql);
+        }
+    }
+
+    Ok(Select {
+        table,
+        projection,
+        filter,
+        order_by,
+        limit,
+    })
+}
+
+fn parse_projection(input: &str) -> Result<SelectProjection, ParseError> {
+    if input == "*" {
+        return Ok(SelectProjection::All);
+    }
+    let columns = split_csv(input)?
+        .into_iter()
+        .map(|column| normalize_identifier(column.trim()))
+        .collect::<Result<Vec<_>, _>>()?;
+    if columns.is_empty() {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    Ok(SelectProjection::Columns(columns))
+}
+
+fn parse_select_filter(input: &str) -> Result<SelectFilter, ParseError> {
+    let (column, value) = input
+        .split_once('=')
+        .ok_or(ParseError::InvalidRelationalSql)?;
+    Ok(SelectFilter {
+        column: normalize_identifier(column.trim())?,
+        value: parse_sql_value(value.trim())?,
+    })
+}
+
+fn parse_select_order(input: &str) -> Result<SelectOrder, ParseError> {
+    let mut parts = input.split_whitespace();
+    let column = parts
+        .next()
+        .ok_or(ParseError::InvalidRelationalSql)
+        .and_then(normalize_identifier)?;
+    let descending = match parts.next() {
+        None => false,
+        Some(direction) if direction.eq_ignore_ascii_case("ASC") => false,
+        Some(direction) if direction.eq_ignore_ascii_case("DESC") => true,
+        _ => return Err(ParseError::InvalidRelationalSql),
+    };
+    if parts.next().is_some() {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    Ok(SelectOrder { column, descending })
+}
+
+fn parse_sql_value(input: &str) -> Result<SqlValue, ParseError> {
+    let s = input.trim();
+    if s.starts_with('\'') {
+        if !s.ends_with('\'') || s.len() < 2 {
+            return Err(ParseError::InvalidRelationalSql);
+        }
+        let inner = &s[1..s.len() - 1];
+        return Ok(SqlValue::Text(inner.replace("''", "'")));
+    }
+    let value = s
+        .parse::<i32>()
+        .map_err(|_| ParseError::InvalidRelationalSql)?;
+    Ok(SqlValue::Int4(value))
+}
+
+fn normalize_identifier(input: &str) -> Result<String, ParseError> {
+    let s = input.trim();
+    if s.is_empty() {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    if let Some(quoted) = s.strip_prefix('"').and_then(|v| v.strip_suffix('"')) {
+        if quoted.is_empty() {
+            return Err(ParseError::InvalidRelationalSql);
+        }
+        return Ok(quoted.replace("\"\"", "\""));
+    }
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return Err(ParseError::InvalidRelationalSql);
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    if chars.any(|ch| !(ch == '_' || ch == '$' || ch.is_ascii_alphanumeric())) {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    Ok(s.to_ascii_lowercase())
+}
+
+fn split_csv(input: &str) -> Result<Vec<&str>, ParseError> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut depth = 0usize;
+    let mut in_quote = false;
+    let bytes = input.as_bytes();
+    let mut idx = 0;
+    while idx < bytes.len() {
+        match bytes[idx] {
+            b'\'' => {
+                if in_quote && bytes.get(idx + 1) == Some(&b'\'') {
+                    idx += 1;
+                } else {
+                    in_quote = !in_quote;
+                }
+            }
+            b'(' if !in_quote => depth += 1,
+            b')' if !in_quote => {
+                depth = depth
+                    .checked_sub(1)
+                    .ok_or(ParseError::InvalidRelationalSql)?;
+            }
+            b',' if !in_quote && depth == 0 => {
+                let part = input[start..idx].trim();
+                if part.is_empty() {
+                    return Err(ParseError::InvalidRelationalSql);
+                }
+                parts.push(part);
+                start = idx + 1;
+            }
+            _ => {}
+        }
+        idx += 1;
+    }
+    if in_quote || depth != 0 {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let part = input[start..].trim();
+    if part.is_empty() {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    parts.push(part);
+    Ok(parts)
+}
+
+fn find_matching_paren(input: &str, open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut in_quote = false;
+    let bytes = input.as_bytes();
+    for idx in open..bytes.len() {
+        match bytes[idx] {
+            b'\'' => {
+                if in_quote && bytes.get(idx + 1) == Some(&b'\'') {
+                    continue;
+                }
+                in_quote = !in_quote;
+            }
+            b'(' if !in_quote => depth += 1,
+            b')' if !in_quote => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(idx);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn find_keyword_outside_quotes(input: &str, keyword: &str) -> Option<usize> {
+    let lower = input.to_ascii_lowercase();
+    let keyword = keyword.to_ascii_lowercase();
+    let bytes = input.as_bytes();
+    let mut in_quote = false;
+    let mut idx = 0;
+    while idx + keyword.len() <= bytes.len() {
+        if bytes[idx] == b'\'' {
+            if in_quote && bytes.get(idx + 1) == Some(&b'\'') {
+                idx += 2;
+                continue;
+            }
+            in_quote = !in_quote;
+            idx += 1;
+            continue;
+        }
+        if !in_quote
+            && lower[idx..].starts_with(&keyword)
+            && is_keyword_boundary(input, idx, keyword.len())
+        {
+            return Some(idx);
+        }
+        idx += 1;
+    }
+    None
+}
+
+fn is_keyword_boundary(input: &str, start: usize, len: usize) -> bool {
+    let before = input[..start]
+        .chars()
+        .next_back()
+        .is_none_or(|ch| !is_identifier_char(ch));
+    let after = input[start + len..]
+        .chars()
+        .next()
+        .is_none_or(|ch| !is_identifier_char(ch));
+    before && after
+}
+
+fn next_clause_pos(input: &str) -> Option<usize> {
+    ["WHERE", "ORDER", "LIMIT"]
+        .into_iter()
+        .filter_map(|keyword| find_keyword_outside_quotes(input, keyword))
+        .min()
+}
+
+fn is_identifier_char(ch: char) -> bool {
+    ch == '_' || ch == '$' || ch.is_ascii_alphanumeric()
+}
+
 fn parse_set_session_command(rest: &str) -> Option<Result<Command, ParseError>> {
     if let Some(after_local) = strip_keyword_prefix_case_insensitive(rest, "LOCAL") {
         let after_local = after_local.trim_start();
@@ -1717,6 +2132,9 @@ pub fn parse_command(input: &str) -> Result<Command, ParseError> {
     }
     if let Some(reset) = parse_reset_command(s) {
         return reset;
+    }
+    if let Some(relational) = parse_relational_command(s) {
+        return relational;
     }
 
     let mut parts = s.splitn(2, char::is_whitespace);
@@ -7477,6 +7895,56 @@ mod tests {
         assert_eq!(
             parse_frontend_message(&unsupported).unwrap_err(),
             FrontendMessageError::UnsupportedTag(b'V')
+        );
+    }
+
+    #[test]
+    fn parses_minimal_relational_sql_subset() {
+        assert_eq!(
+            parse_command("CREATE TABLE people (id INT, name TEXT)").unwrap(),
+            Command::CreateTable(CreateTable {
+                table: "people".to_string(),
+                columns: vec![
+                    ColumnDef {
+                        name: "id".to_string(),
+                        ty: SqlType::Int4,
+                    },
+                    ColumnDef {
+                        name: "name".to_string(),
+                        ty: SqlType::Text,
+                    },
+                ],
+            })
+        );
+
+        assert_eq!(
+            parse_command("INSERT INTO people (id, name) VALUES (1, 'Ada'), (2, 'Linus')").unwrap(),
+            Command::Insert(Insert {
+                table: "people".to_string(),
+                columns: vec!["id".to_string(), "name".to_string()],
+                rows: vec![
+                    vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())],
+                    vec![SqlValue::Int4(2), SqlValue::Text("Linus".to_string())],
+                ],
+            })
+        );
+
+        assert_eq!(
+            parse_command("SELECT id, name FROM people WHERE id = 1 ORDER BY name DESC LIMIT 5")
+                .unwrap(),
+            Command::Select(Select {
+                table: "people".to_string(),
+                projection: SelectProjection::Columns(vec!["id".to_string(), "name".to_string()]),
+                filter: Some(SelectFilter {
+                    column: "id".to_string(),
+                    value: SqlValue::Int4(1),
+                }),
+                order_by: Some(SelectOrder {
+                    column: "name".to_string(),
+                    descending: true,
+                }),
+                limit: Some(5),
+            })
         );
     }
 }

@@ -19,11 +19,17 @@ def classify(test_id: str) -> list[str]:
             buckets.append("protocol.client_flows")
         if re.search(r"transaction|begin|commit|rollback", test_id):
             buckets.append("sql.transaction_flows")
+        if re.search(r"relational|create_table|insert|select", test_id):
+            buckets.append("sql.relational_foundation")
     if "gpu_db_protocol::" in test_id:
         if re.search(r"startup|frontend|ssl|cancel|session_lifecycle", test_id):
             buckets.append("protocol.client_flows")
         if re.search(r"parses_|rejects_", test_id):
             buckets.append("sql.parser_features")
+        if re.search(r"relational|create_table|insert|select", test_id):
+            buckets.append("sql.relational_foundation")
+    if re.search(r"relational|create_table|insert|select", test_id):
+        buckets.append("sql.relational_foundation")
     if re.search(r"transaction|commit|rollback|begin", test_id):
         buckets.append("sql.transaction_flows")
     if re.search(r"wal|durable|visibility|checkpoint|replay", test_id):

@@ -342,11 +342,11 @@ Initial target:
 - Deterministic error reporting for unsupported relational syntax.
 
 Exit criteria:
-1. SQL parser/planner represents the supported relational forms as structured plans rather than string-matched server fixtures.
-2. Supported relational reads execute through engine-facing storage/execution APIs, not only the compatibility stub.
-3. At least one psql golden scenario creates a table, inserts rows, selects rows, and asserts stable output.
-4. Compatibility scorecard has explicit relational SQL buckets with passing/failing counts.
-5. Docs state the exact supported relational SQL subset and the next unsupported syntax boundary.
+1. SQL parser/planner represents the supported relational forms as structured plans rather than string-matched server fixtures. First slice landed on 2026-05-11 for `CREATE TABLE`, `INSERT`, and narrow `SELECT`.
+2. Supported relational reads execute through engine-facing storage/execution APIs, not only the compatibility stub. First slice landed on 2026-05-11 by lowering engine relational reads through `MvccReadQuery` with CPU reference execution and explicit GPU parity fallback.
+3. At least one psql golden scenario creates a table, inserts rows, selects rows, and asserts stable output. Scenario `03_relational_create_insert_select.sql` was added on 2026-05-11; local execution still requires `psql` in the run shell.
+4. Compatibility scorecard has explicit relational SQL buckets with passing/failing counts. First classifier bucket `sql.relational_foundation` landed on 2026-05-11.
+5. Docs state the exact supported relational SQL subset and the next unsupported syntax boundary. README and compatibility matrix first-slice wording landed on 2026-05-11.
 
 ### P2. Catalog, schema, and type spine
 

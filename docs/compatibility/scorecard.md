@@ -48,13 +48,14 @@ To make new compatibility tests visible in the right bucket:
 1. Use test names that include the target behavior keyword, for example:
    - `startup`, `frontend`, `session_lifecycle` for protocol/client flows
    - `parses_`, `rejects_` for SQL/parser coverage
+   - `relational`, `create_table`, `insert`, or `select` for the P1 relational SQL foundation bucket
    - `transaction`, `commit`, `rollback` for transaction flows
 2. If a new category is needed, add or refine matching rules in `classify()` inside `scripts/generate_compat_scorecard.py`.
 3. Regenerate scorecard outputs and include them in the same PR.
 
 For `psql` golden scenarios specifically:
 - use descriptive scenario filenames such as `03_extended_query_rejection.sql`;
-- keep the behavior keyword in the filename (`startup`, `session_reset`, `prepare`, `transaction`, etc.);
+- keep the behavior keyword in the filename (`startup`, `session_reset`, `prepare`, `transaction`, `relational`, `create_table`, `insert`, `select`, etc.);
 - if the scenario belongs in a new compatibility bucket, extend `classify()` in `scripts/generate_compat_scorecard.py`.
 
 ## Trend hook

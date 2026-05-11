@@ -1,0 +1,16 @@
+=== relational create insert select ===
+CREATE TABLE
+INSERT 0 3
+ id | name
+----+-------
+  1 | Ada
+  2 | Linus
+  3 | Grace
+(3 rows)
+
+=== relational filter order limit ===
+ name  | id
+-------+----
+ Linus |  2
+(1 row)
+

@@ -5,7 +5,8 @@ use std::net::{TcpListener, TcpStream};
 use std::thread;
 
 use gpu_db_protocol::{
-    parse_frontend_message, parse_startup_packet, FrontendMessage, StartupPacket,
+    parse_command, parse_frontend_message, parse_startup_packet, Command, FrontendMessage,
+    SelectProjection, SqlType, SqlValue, StartupPacket,
 };
 
 const INT4_OID: u32 = 23;
@@ -13,7 +14,7 @@ const TEXT_OID: u32 = 25;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Column {
-    name: &'static str,
+    name: String,
     oid: u32,
     type_size: i16,
 }
@@ -25,10 +26,56 @@ struct ErrorField {
     position: Option<&'static str>,
 }
 
+fn text_column(name: &str) -> Column {
+    Column {
+        name: name.to_string(),
+        oid: TEXT_OID,
+        type_size: -1,
+    }
+}
+
+fn int4_column(name: &str) -> Column {
+    Column {
+        name: name.to_string(),
+        oid: INT4_OID,
+        type_size: 4,
+    }
+}
+
+fn sql_value_matches_type(value: &SqlValue, ty: SqlType) -> bool {
+    matches!(
+        (value, ty),
+        (SqlValue::Int4(_), SqlType::Int4) | (SqlValue::Text(_), SqlType::Text)
+    )
+}
+
+fn compare_sql_values(left: &SqlValue, right: &SqlValue) -> std::cmp::Ordering {
+    match (left, right) {
+        (SqlValue::Int4(left), SqlValue::Int4(right)) => left.cmp(right),
+        (SqlValue::Text(left), SqlValue::Text(right)) => left.cmp(right),
+        (SqlValue::Int4(_), SqlValue::Text(_)) => std::cmp::Ordering::Less,
+        (SqlValue::Text(_), SqlValue::Int4(_)) => std::cmp::Ordering::Greater,
+    }
+}
+
+fn format_sql_value(value: &SqlValue) -> String {
+    match value {
+        SqlValue::Int4(value) => value.to_string(),
+        SqlValue::Text(value) => value.clone(),
+    }
+}
+
 #[derive(Default)]
 struct Session {
     in_transaction: bool,
     prepared: HashMap<String, PreparedStatement>,
+    tables: HashMap<String, Table>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Table {
+    columns: Vec<gpu_db_protocol::ColumnDef>,
+    rows: Vec<Vec<SqlValue>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -243,6 +290,204 @@ fn execute_statement(
     session: &mut Session,
     statement: &str,
 ) -> io::Result<()> {
+    if let Ok(command) = parse_command(statement) {
+        match command {
+            Command::CreateTable(create) => {
+                if session.tables.contains_key(&create.table) {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "42P07",
+                            message: "relation already exists",
+                            position: None,
+                        },
+                    );
+                }
+                session.tables.insert(
+                    create.table,
+                    Table {
+                        columns: create.columns,
+                        rows: Vec::new(),
+                    },
+                );
+                return write_command_complete(stream, "CREATE TABLE");
+            }
+            Command::Insert(insert) => {
+                let Some(table) = session.tables.get_mut(&insert.table) else {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "42P01",
+                            message: "relation does not exist",
+                            position: None,
+                        },
+                    );
+                };
+                let mut indexes = Vec::with_capacity(insert.columns.len());
+                for column in &insert.columns {
+                    let Some(idx) = table
+                        .columns
+                        .iter()
+                        .position(|candidate| candidate.name == *column)
+                    else {
+                        return write_error(
+                            stream,
+                            &ErrorField {
+                                code: "42703",
+                                message: "column does not exist",
+                                position: None,
+                            },
+                        );
+                    };
+                    indexes.push(idx);
+                }
+                let inserted_count = insert.rows.len();
+                for row in insert.rows {
+                    let mut projected = vec![None; table.columns.len()];
+                    for (source_idx, target_idx) in indexes.iter().copied().enumerate() {
+                        if !sql_value_matches_type(&row[source_idx], table.columns[target_idx].ty) {
+                            return write_error(
+                                stream,
+                                &ErrorField {
+                                    code: "42804",
+                                    message: "column type mismatch",
+                                    position: None,
+                                },
+                            );
+                        }
+                        projected[target_idx] = Some(row[source_idx].clone());
+                    }
+                    if projected.iter().any(Option::is_none) {
+                        return write_error(
+                            stream,
+                            &ErrorField {
+                                code: "0A000",
+                                message: "INSERT must provide every column",
+                                position: None,
+                            },
+                        );
+                    }
+                    table
+                        .rows
+                        .push(projected.into_iter().map(Option::unwrap).collect());
+                }
+                return write_command_complete(stream, &format!("INSERT 0 {inserted_count}"));
+            }
+            Command::Select(select) => {
+                let Some(table) = session.tables.get(&select.table) else {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "42P01",
+                            message: "relation does not exist",
+                            position: None,
+                        },
+                    );
+                };
+                let selected_columns = match &select.projection {
+                    SelectProjection::All => table.columns.clone(),
+                    SelectProjection::Columns(columns) => {
+                        let mut selected = Vec::with_capacity(columns.len());
+                        for column in columns {
+                            let Some(def) = table
+                                .columns
+                                .iter()
+                                .find(|candidate| candidate.name == *column)
+                            else {
+                                return write_error(
+                                    stream,
+                                    &ErrorField {
+                                        code: "42703",
+                                        message: "column does not exist",
+                                        position: None,
+                                    },
+                                );
+                            };
+                            selected.push(def.clone());
+                        }
+                        selected
+                    }
+                };
+                let mut rows = table.rows.clone();
+                if let Some(filter) = &select.filter {
+                    let Some(idx) = table
+                        .columns
+                        .iter()
+                        .position(|column| column.name == filter.column)
+                    else {
+                        return write_error(
+                            stream,
+                            &ErrorField {
+                                code: "42703",
+                                message: "column does not exist",
+                                position: None,
+                            },
+                        );
+                    };
+                    rows.retain(|row| row[idx] == filter.value);
+                }
+                if let Some(order) = &select.order_by {
+                    let Some(idx) = table
+                        .columns
+                        .iter()
+                        .position(|column| column.name == order.column)
+                    else {
+                        return write_error(
+                            stream,
+                            &ErrorField {
+                                code: "42703",
+                                message: "column does not exist",
+                                position: None,
+                            },
+                        );
+                    };
+                    rows.sort_by(|left, right| compare_sql_values(&left[idx], &right[idx]));
+                    if order.descending {
+                        rows.reverse();
+                    }
+                }
+                if let Some(limit) = select.limit {
+                    rows.truncate(limit);
+                }
+                let selected_indexes = selected_columns
+                    .iter()
+                    .map(|selected| {
+                        table
+                            .columns
+                            .iter()
+                            .position(|column| column.name == selected.name)
+                            .expect("selected column came from table")
+                    })
+                    .collect::<Vec<_>>();
+                let columns = selected_columns
+                    .iter()
+                    .map(|column| match column.ty {
+                        SqlType::Int4 => int4_column(&column.name),
+                        SqlType::Text => text_column(&column.name),
+                    })
+                    .collect::<Vec<_>>();
+                let output_rows = rows
+                    .iter()
+                    .map(|row| {
+                        selected_indexes
+                            .iter()
+                            .map(|idx| Some(format_sql_value(&row[*idx])))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>();
+                return write_single_row(stream, &columns, &output_rows);
+            }
+            Command::Begin
+            | Command::Commit { .. }
+            | Command::Rollback { .. }
+            | Command::Flush
+            | Command::ResetAll
+            | Command::SetKv { .. }
+            | Command::DeleteKv { .. }
+            | Command::GetKv { .. } => {}
+        }
+    }
+
     let canonical = canonical_sql(statement);
     match canonical.as_str() {
         "begin" => {
@@ -266,47 +511,27 @@ fn execute_statement(
         "unlisten *" | "unlisten all" => write_command_complete(stream, "UNLISTEN"),
         "show client_encoding" => write_single_row(
             stream,
-            &[Column {
-                name: "client_encoding",
-                oid: TEXT_OID,
-                type_size: -1,
-            }],
+            &[text_column("client_encoding")],
             &[vec![Some(String::from("UTF8"))]],
         ),
         "select current_schema()" => write_single_row(
             stream,
-            &[Column {
-                name: "current_schema",
-                oid: TEXT_OID,
-                type_size: -1,
-            }],
+            &[text_column("current_schema")],
             &[vec![Some(String::from("public"))]],
         ),
         "select 1 as one" => write_single_row(
             stream,
-            &[Column {
-                name: "one",
-                oid: INT4_OID,
-                type_size: 4,
-            }],
+            &[int4_column("one")],
             &[vec![Some(String::from("1"))]],
         ),
         "select 2 as in_tx" => write_single_row(
             stream,
-            &[Column {
-                name: "in_tx",
-                oid: INT4_OID,
-                type_size: 4,
-            }],
+            &[int4_column("in_tx")],
             &[vec![Some(String::from("2"))]],
         ),
         "select 3 as rolled_back" => write_single_row(
             stream,
-            &[Column {
-                name: "rolled_back",
-                oid: INT4_OID,
-                type_size: 4,
-            }],
+            &[int4_column("rolled_back")],
             &[vec![Some(String::from("3"))]],
         ),
         "prepare golden_stmt(int) as select $1 + 10 as plus_ten" => {
@@ -319,11 +544,7 @@ fn execute_statement(
             if session.prepared.contains_key("golden_stmt") {
                 write_single_row(
                     stream,
-                    &[Column {
-                        name: "plus_ten",
-                        oid: INT4_OID,
-                        type_size: 4,
-                    }],
+                    &[int4_column("plus_ten")],
                     &[vec![Some(String::from("15"))]],
                 )
             } else {
@@ -437,7 +658,7 @@ fn write_row_description(stream: &mut TcpStream, columns: &[Column]) -> io::Resu
     let mut payload = Vec::new();
     payload.extend_from_slice(&field_count.to_be_bytes());
     for column in columns {
-        push_cstring(&mut payload, column.name);
+        push_cstring(&mut payload, &column.name);
         payload.extend_from_slice(&0_u32.to_be_bytes());
         payload.extend_from_slice(&0_i16.to_be_bytes());
         payload.extend_from_slice(&column.oid.to_be_bytes());

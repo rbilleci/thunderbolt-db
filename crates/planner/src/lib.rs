@@ -58,9 +58,23 @@ impl Planner {
                 },
                 kind: PlanKind::Mutation,
             },
+            Command::CreateTable(_) | Command::Insert(_) => PlanNode {
+                op: PlannedOp {
+                    name: "relational_write".to_string(),
+                    target: DeviceTarget::Gpu(self.cfg.default_gpu_id),
+                },
+                kind: PlanKind::Mutation,
+            },
             Command::GetKv { .. } => PlanNode {
                 op: PlannedOp {
                     name: "kv_point_get".to_string(),
+                    target: DeviceTarget::Cpu,
+                },
+                kind: PlanKind::Read,
+            },
+            Command::Select(_) => PlanNode {
+                op: PlannedOp {
+                    name: "relational_select".to_string(),
                     target: DeviceTarget::Cpu,
                 },
                 kind: PlanKind::Read,
@@ -141,6 +155,13 @@ mod tests {
             Command::GetKv {
                 key: "a".to_string(),
             },
+            Command::Select(gpu_db_protocol::Select {
+                table: "t".to_string(),
+                projection: gpu_db_protocol::SelectProjection::All,
+                filter: None,
+                order_by: None,
+                limit: None,
+            }),
             Command::Begin,
             Command::Commit { chain: false },
             Command::Rollback { chain: false },

@@ -3,46 +3,46 @@
     "durability.invariants": {
       "failed": 0,
       "ignored": 0,
-      "passed": 15,
-      "total": 15
+      "passed": 26,
+      "total": 26
     },
     "execution.gpu_routing_and_batching": {
       "failed": 0,
       "ignored": 0,
-      "passed": 37,
-      "total": 37
-    },
-    "protocol.client_flows": {
-      "failed": 0,
-      "ignored": 0,
-      "passed": 2,
-      "total": 2
+      "passed": 54,
+      "total": 54
     },
     "replication.role_and_log": {
       "failed": 0,
       "ignored": 0,
-      "passed": 70,
-      "total": 70
+      "passed": 164,
+      "total": 164
+    },
+    "sql.relational_foundation": {
+      "failed": 0,
+      "ignored": 0,
+      "passed": 3,
+      "total": 3
     },
     "sql.transaction_flows": {
       "failed": 0,
       "ignored": 0,
-      "passed": 49,
-      "total": 49
+      "passed": 88,
+      "total": 88
     },
     "uncategorized": {
       "failed": 0,
       "ignored": 0,
-      "passed": 81,
-      "total": 81
+      "passed": 261,
+      "total": 261
     }
   },
   "top_failing_categories": [],
   "totals": {
     "failed": 0,
     "ignored": 0,
-    "passed": 221,
-    "total": 221
+    "passed": 535,
+    "total": 535
   },
   "trend_hook": {
     "baseline_available": true,
@@ -50,8 +50,8 @@
     "bucket_failed_delta": {
       "durability.invariants": 0,
       "execution.gpu_routing_and_batching": 0,
-      "protocol.client_flows": 0,
       "replication.role_and_log": 0,
+      "sql.relational_foundation": 0,
       "sql.transaction_flows": 0,
       "uncategorized": 0
     },

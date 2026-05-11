@@ -16,7 +16,10 @@ use gpu_db_observability::{
     ReadinessStatus, ReplicationLagSnapshot, SnapshotStatus, TelemetrySink,
 };
 use gpu_db_planner::{ExecutionPlan, Planner, PlannerConfig};
-use gpu_db_protocol::{parse_command, Command, ParseError};
+use gpu_db_protocol::{
+    parse_command, ColumnDef, Command, CreateTable, Insert, ParseError, Select, SelectProjection,
+    SqlType, SqlValue,
+};
 use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine};
 use gpu_db_storage::{
     InMemoryTupleStore, NewTuple, StorageError, TupleStore, TupleVersion,
@@ -49,7 +52,10 @@ impl ReplicatedStateMachine for KvStateMachine {
                     | Command::Rollback { .. }
                     | Command::Flush
                     | Command::ResetAll
-                    | Command::GetKv { .. } => {}
+                    | Command::GetKv { .. }
+                    | Command::CreateTable(_)
+                    | Command::Insert(_)
+                    | Command::Select(_) => {}
                 }
             }
         }
@@ -5883,6 +5889,8 @@ pub struct Engine {
     wal: WalBuffer,
     sm: KvStateMachine,
     mvcc_store: InMemoryTupleStore,
+    relational_catalog: BTreeMap<String, RelationalTable>,
+    relational_next_row_id: u64,
     txn_ids_by_index: BTreeMap<Index, TxnId>,
     txn_manager: TxnManager,
     visible_up_to: Index,
@@ -5890,6 +5898,113 @@ pub struct Engine {
     batcher: DualTriggerBatcher<PendingMutation>,
     planner: Planner,
     router: DeviceRouter<MockGpuRuntime>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationalTable {
+    pub columns: Vec<ColumnDef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationalSelectResult {
+    pub columns: Vec<ColumnDef>,
+    pub rows: Vec<Vec<SqlValue>>,
+    pub planned_target: DeviceTarget,
+    pub executed_target: DeviceTarget,
+    pub fallback_reason: Option<FallbackReason>,
+}
+
+fn sql_value_matches_type(value: &SqlValue, ty: SqlType) -> bool {
+    matches!(
+        (value, ty),
+        (SqlValue::Int4(_), SqlType::Int4) | (SqlValue::Text(_), SqlType::Text)
+    )
+}
+
+fn relational_row_key(table: &str, row_id: u64) -> String {
+    format!("rel/{table}/{row_id:020}")
+}
+
+fn relational_key_prefix(table: &str) -> String {
+    format!("rel/{table}/")
+}
+
+fn encode_relational_row(values: &[SqlValue]) -> String {
+    values
+        .iter()
+        .map(|value| match value {
+            SqlValue::Int4(value) => format!("i:{value}"),
+            SqlValue::Text(value) => {
+                format!("t:{}", value.replace('\\', "\\\\").replace('|', "\\|"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+fn decode_relational_row(
+    input: &str,
+    columns: &[ColumnDef],
+) -> Result<Vec<SqlValue>, ExecuteError> {
+    let parts = split_escaped_row(input);
+    if parts.len() != columns.len() {
+        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+            "stored relational row does not match catalog shape".to_string(),
+        )));
+    }
+    parts
+        .into_iter()
+        .zip(columns.iter())
+        .map(
+            |(part, column)| match (part.strip_prefix("i:"), part.strip_prefix("t:"), column.ty) {
+                (Some(value), _, SqlType::Int4) => {
+                    value.parse::<i32>().map(SqlValue::Int4).map_err(|_| {
+                        ExecuteError::Engine(EngineError::ApplyFailed(
+                            "stored INT value is invalid".to_string(),
+                        ))
+                    })
+                }
+                (_, Some(value), SqlType::Text) => Ok(SqlValue::Text(value.to_string())),
+                _ => Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "stored value for column \"{}\" has wrong type",
+                    column.name
+                )))),
+            },
+        )
+        .collect()
+}
+
+fn split_escaped_row(input: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut escaped = false;
+    for ch in input.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == '|' {
+            out.push(current);
+            current = String::new();
+        } else {
+            current.push(ch);
+        }
+    }
+    if escaped {
+        current.push('\\');
+    }
+    out.push(current);
+    out
+}
+
+fn compare_sql_values(left: &SqlValue, right: &SqlValue) -> Ordering {
+    match (left, right) {
+        (SqlValue::Int4(left), SqlValue::Int4(right)) => left.cmp(right),
+        (SqlValue::Text(left), SqlValue::Text(right)) => left.cmp(right),
+        (SqlValue::Int4(_), SqlValue::Text(_)) => Ordering::Less,
+        (SqlValue::Text(_), SqlValue::Int4(_)) => Ordering::Greater,
+    }
 }
 
 impl Engine {
@@ -5903,6 +6018,8 @@ impl Engine {
             wal: WalBuffer::default(),
             sm: KvStateMachine::default(),
             mvcc_store: InMemoryTupleStore::new(),
+            relational_catalog: BTreeMap::new(),
+            relational_next_row_id: 1,
             txn_ids_by_index: BTreeMap::new(),
             txn_manager: TxnManager::default(),
             visible_up_to: 0,
@@ -6056,9 +6173,90 @@ impl Engine {
                         .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
                 }
             }
+            Command::CreateTable(create) => self.apply_create_table(create)?,
+            Command::Insert(insert) => self.apply_insert(insert, txn_id)?,
             _ => {}
         }
 
+        Ok(())
+    }
+
+    fn apply_create_table(&mut self, create: CreateTable) -> Result<(), EngineError> {
+        if self.relational_catalog.contains_key(&create.table) {
+            return Err(EngineError::ApplyFailed(format!(
+                "relation \"{}\" already exists",
+                create.table
+            )));
+        }
+        let mut seen = BTreeSet::new();
+        for column in &create.columns {
+            if !seen.insert(column.name.clone()) {
+                return Err(EngineError::ApplyFailed(format!(
+                    "column \"{}\" specified more than once",
+                    column.name
+                )));
+            }
+        }
+        self.relational_catalog.insert(
+            create.table,
+            RelationalTable {
+                columns: create.columns,
+            },
+        );
+        Ok(())
+    }
+
+    fn apply_insert(&mut self, insert: Insert, txn_id: TxnId) -> Result<(), EngineError> {
+        let table = self
+            .relational_catalog
+            .get(&insert.table)
+            .ok_or_else(|| {
+                EngineError::ApplyFailed(format!("relation \"{}\" does not exist", insert.table))
+            })?
+            .clone();
+        let mut column_indexes = Vec::with_capacity(insert.columns.len());
+        for column in &insert.columns {
+            let idx = table
+                .columns
+                .iter()
+                .position(|candidate| candidate.name == *column)
+                .ok_or_else(|| {
+                    EngineError::ApplyFailed(format!("column \"{}\" does not exist", column))
+                })?;
+            column_indexes.push(idx);
+        }
+        for row in insert.rows {
+            let mut values = vec![None; table.columns.len()];
+            for (source_idx, target_idx) in column_indexes.iter().copied().enumerate() {
+                let value = row[source_idx].clone();
+                let expected_ty = table.columns[target_idx].ty;
+                if !sql_value_matches_type(&value, expected_ty) {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "invalid value for column \"{}\"",
+                        table.columns[target_idx].name
+                    )));
+                }
+                values[target_idx] = Some(value);
+            }
+            if values.iter().any(Option::is_none) {
+                return Err(EngineError::ApplyFailed(
+                    "INSERT must provide every column in the bootstrap relational subset"
+                        .to_string(),
+                ));
+            }
+            let values = values.into_iter().map(Option::unwrap).collect::<Vec<_>>();
+            let row_id = self.relational_next_row_id;
+            self.relational_next_row_id += 1;
+            self.mvcc_store
+                .tuple_insert(
+                    NewTuple {
+                        key: relational_row_key(&insert.table, row_id),
+                        value: encode_relational_row(&values),
+                    },
+                    txn_id,
+                )
+                .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+        }
         Ok(())
     }
 
@@ -6070,7 +6268,10 @@ impl Engine {
     ) -> Result<(), ExecuteError> {
         let cmd = parse_command(text)?;
         match cmd {
-            Command::SetKv { .. } | Command::DeleteKv { .. } => {
+            Command::SetKv { .. }
+            | Command::DeleteKv { .. }
+            | Command::CreateTable(_)
+            | Command::Insert(_) => {
                 if self.repl.role() != Role::Leader {
                     return Err(ExecuteError::Engine(EngineError::NotLeader));
                 }
@@ -6145,6 +6346,9 @@ impl Engine {
                 if let Some(len) = self.sm.kv.get(&key).map(|v| v.len()) {
                     self.metrics.observe_d2h_bytes(len as u64);
                 }
+            }
+            Command::Select(_) => {
+                self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
         }
         Ok(())
@@ -6232,7 +6436,10 @@ impl Engine {
         let cmd = parse_command(text)?;
 
         match cmd {
-            Command::SetKv { .. } | Command::DeleteKv { .. } => match self.route_command(&cmd) {
+            Command::SetKv { .. }
+            | Command::DeleteKv { .. }
+            | Command::CreateTable(_)
+            | Command::Insert(_) => match self.route_command(&cmd) {
                 RouteDecision::Gpu(_) | RouteDecision::Cpu => {
                     self.commit_mutation(txn_id, text.as_bytes().to_vec())?;
                 }
@@ -6275,6 +6482,9 @@ impl Engine {
                     self.metrics.observe_d2h_bytes(len as u64);
                 }
             }
+            Command::Select(_) => {
+                self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
+            }
         }
 
         Ok(())
@@ -6302,7 +6512,130 @@ impl Engine {
             Command::ResetAll => Err(ExecuteError::NonReadCommand("RESET ALL")),
             Command::SetKv { .. } => Err(ExecuteError::NonReadCommand("SET")),
             Command::DeleteKv { .. } => Err(ExecuteError::NonReadCommand("DEL/DELETE")),
+            Command::CreateTable(_) => Err(ExecuteError::NonReadCommand("CREATE TABLE")),
+            Command::Insert(_) => Err(ExecuteError::NonReadCommand("INSERT")),
+            Command::Select(_) => Err(ExecuteError::NonReadCommand("SELECT")),
         }
+    }
+
+    pub fn execute_relational_select(
+        &mut self,
+        select: &Select,
+    ) -> Result<RelationalSelectResult, ExecuteError> {
+        let table = self
+            .relational_catalog
+            .get(&select.table)
+            .ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "relation \"{}\" does not exist",
+                    select.table
+                )))
+            })?
+            .clone();
+        let selected_columns = match &select.projection {
+            SelectProjection::All => table.columns.clone(),
+            SelectProjection::Columns(columns) => columns
+                .iter()
+                .map(|name| {
+                    table
+                        .columns
+                        .iter()
+                        .find(|column| column.name == *name)
+                        .cloned()
+                        .ok_or_else(|| {
+                            ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                                "column \"{}\" does not exist",
+                                name
+                            )))
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+
+        let query = MvccReadQuery {
+            source: MvccReadSource::FullScan,
+            visibility: StorageVisibility {
+                read_txn_id: u64::MAX,
+            },
+            filter: Some(MvccReadFilter::KeyPrefix(relational_key_prefix(
+                &select.table,
+            ))),
+            order: Some(MvccReadOrder::KeyAsc),
+            projection: MvccProjection::KeyValue,
+            limit: None,
+        };
+        let result = self.execute_mvcc_query(&query)?;
+        let mut rows = Vec::new();
+        for row in result.rows {
+            let Some(value) = row.value else {
+                continue;
+            };
+            let decoded = decode_relational_row(&value, &table.columns)?;
+            if let Some(filter) = &select.filter {
+                let Some(idx) = table
+                    .columns
+                    .iter()
+                    .position(|column| column.name == filter.column)
+                else {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                        "column \"{}\" does not exist",
+                        filter.column
+                    ))));
+                };
+                if decoded[idx] != filter.value {
+                    continue;
+                }
+            }
+            rows.push(decoded);
+        }
+
+        if let Some(order) = &select.order_by {
+            let Some(idx) = table
+                .columns
+                .iter()
+                .position(|column| column.name == order.column)
+            else {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "column \"{}\" does not exist",
+                    order.column
+                ))));
+            };
+            rows.sort_by(|left, right| compare_sql_values(&left[idx], &right[idx]));
+            if order.descending {
+                rows.reverse();
+            }
+        }
+        if let Some(limit) = select.limit {
+            rows.truncate(limit);
+        }
+
+        let selected_indexes = selected_columns
+            .iter()
+            .map(|selected| {
+                table
+                    .columns
+                    .iter()
+                    .position(|column| column.name == selected.name)
+                    .expect("selected column came from table catalog")
+            })
+            .collect::<Vec<_>>();
+        let rows = rows
+            .into_iter()
+            .map(|row| {
+                selected_indexes
+                    .iter()
+                    .map(|idx| row[*idx].clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        Ok(RelationalSelectResult {
+            columns: selected_columns,
+            rows,
+            planned_target: result.planned_target,
+            executed_target: result.executed_target,
+            fallback_reason: result.fallback_reason,
+        })
     }
 
     pub fn execute_mvcc_query(
@@ -21658,5 +21991,49 @@ mod tests {
         assert_eq!(status.snapshot.snapshot_id, 4);
         assert_eq!(status.snapshot.last_included_index, committed.index + 2);
         assert_eq!(status.snapshot.last_included_term, 2);
+    }
+
+    #[test]
+    fn relational_sql_create_insert_select_uses_mvcc_execution_path() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO people (id, name) VALUES (1, 'Ada'), (2, 'Linus'), (3, 'Grace')",
+        )
+        .unwrap();
+
+        let Command::Select(select) =
+            parse_command("SELECT name, id FROM people WHERE id = 2 ORDER BY name ASC LIMIT 1")
+                .unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let result = e.execute_relational_select(&select).unwrap();
+
+        assert_eq!(
+            result.columns,
+            vec![
+                ColumnDef {
+                    name: "name".to_string(),
+                    ty: SqlType::Text,
+                },
+                ColumnDef {
+                    name: "id".to_string(),
+                    ty: SqlType::Int4,
+                },
+            ]
+        );
+        assert_eq!(
+            result.rows,
+            vec![vec![SqlValue::Text("Linus".to_string()), SqlValue::Int4(2)]]
+        );
+        assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.executed_target, DeviceTarget::Cpu);
+        assert_eq!(
+            result.fallback_reason,
+            Some(FallbackReason::GpuMvccReadParityGap)
+        );
     }
 }
