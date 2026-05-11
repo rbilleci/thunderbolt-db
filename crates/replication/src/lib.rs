@@ -145,9 +145,41 @@ impl OperationalTransportSmokeReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationalElectionSmokeReport {
+    pub election_scope: &'static str,
+    pub candidate_id: u64,
+    pub elected_term: Term,
+    pub votes_granted: usize,
+    pub quorum: usize,
+    pub elected: bool,
+}
+
+impl OperationalElectionSmokeReport {
+    pub fn readiness_passed(&self) -> bool {
+        !self.election_scope.is_empty()
+            && self.candidate_id > 0
+            && self.elected
+            && self.votes_granted >= self.quorum
+    }
+
+    pub fn to_operator_line(&self) -> String {
+        format!(
+            "deployment_election={} candidate_id={} elected_term={} votes_granted={} quorum={} elected={}",
+            self.election_scope,
+            self.candidate_id,
+            self.elected_term,
+            self.votes_granted,
+            self.quorum,
+            self.elected
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperationalDeploymentPreflightReport {
     pub smoke: OperationalClusterSmokeReport,
     pub transport: OperationalTransportSmokeReport,
+    pub election: OperationalElectionSmokeReport,
     pub network_transport_implemented: bool,
     pub automatic_election_implemented: bool,
     pub packaged_deployment_implemented: bool,
@@ -155,12 +187,15 @@ pub struct OperationalDeploymentPreflightReport {
 
 impl OperationalDeploymentPreflightReport {
     pub fn readiness_passed(&self) -> bool {
-        self.smoke.readiness_passed() && self.transport.readiness_passed()
+        self.smoke.readiness_passed()
+            && self.transport.readiness_passed()
+            && self.election.readiness_passed()
     }
 
     pub fn to_operator_lines(&self) -> Vec<String> {
         let mut lines = self.smoke.to_operator_lines();
         lines.push(self.transport.to_operator_line());
+        lines.push(self.election.to_operator_line());
         lines.extend([
             format!(
                 "operational_deployment_preflight={}",
@@ -198,6 +233,21 @@ impl OperationalDeploymentPreflightReport {
         ]);
         lines
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestVoteRequest {
+    pub candidate_term: Term,
+    pub candidate_id: u64,
+    pub last_log_index: Index,
+    pub last_log_term: Term,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestVoteResponse {
+    pub granted: bool,
+    pub voter_term: Term,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1001,6 +1051,7 @@ pub struct RaftReplicator {
     compacted_term: Term,
     voters: usize,
     quorum: usize,
+    voted_for: Option<u64>,
     ack_counts: BTreeMap<Index, BTreeSet<u64>>,
 }
 
@@ -1021,6 +1072,7 @@ impl RaftReplicator {
             compacted_term: 0,
             voters,
             quorum,
+            voted_for: None,
             ack_counts: BTreeMap::new(),
         }
     }
@@ -1069,27 +1121,112 @@ impl RaftReplicator {
     }
 
     pub fn become_follower(&mut self, term: Term) {
+        let previous_term = self.term;
         self.term = self.term.max(term);
         self.role = Role::Follower;
+        if self.term > previous_term {
+            self.voted_for = None;
+        }
         self.entries.retain(|e| e.index <= self.commit_index);
         self.next_index = self.commit_index + 1;
         self.ack_counts.clear();
     }
 
     pub fn become_leader(&mut self, term: Term) {
+        let previous_term = self.term;
         self.term = self.term.max(term);
         self.role = Role::Leader;
+        if self.term > previous_term {
+            self.voted_for = None;
+        }
         self.entries.retain(|e| e.index <= self.commit_index);
         self.next_index = self.commit_index + 1;
         self.ack_counts.clear();
     }
 
     pub fn become_candidate(&mut self, term: Term) {
+        let previous_term = self.term;
         self.term = self.term.max(term);
         self.role = Role::Candidate;
+        if self.term > previous_term {
+            self.voted_for = None;
+        }
         self.entries.retain(|e| e.index <= self.commit_index);
         self.next_index = self.commit_index + 1;
         self.ack_counts.clear();
+    }
+
+    pub fn start_candidate_election(&mut self, candidate_id: u64) -> RequestVoteRequest {
+        assert!(candidate_id > 0, "candidate id must be non-zero");
+        self.term += 1;
+        self.role = Role::Candidate;
+        self.voted_for = Some(candidate_id);
+        self.ack_counts.clear();
+        let (last_log_index, last_log_term) = self.last_log_position();
+        RequestVoteRequest {
+            candidate_term: self.term,
+            candidate_id,
+            last_log_index,
+            last_log_term,
+        }
+    }
+
+    pub fn request_vote_from_candidate(
+        &mut self,
+        request: &RequestVoteRequest,
+    ) -> RequestVoteResponse {
+        if request.candidate_term < self.term {
+            return RequestVoteResponse {
+                granted: false,
+                voter_term: self.term,
+                error: Some(format!(
+                    "stale candidate term {} (local term {})",
+                    request.candidate_term, self.term
+                )),
+            };
+        }
+
+        if request.candidate_term > self.term {
+            self.term = request.candidate_term;
+            self.role = Role::Follower;
+            self.voted_for = None;
+            self.ack_counts.clear();
+        }
+
+        let already_voted_elsewhere = self
+            .voted_for
+            .is_some_and(|voted_for| voted_for != request.candidate_id);
+        if already_voted_elsewhere {
+            return RequestVoteResponse {
+                granted: false,
+                voter_term: self.term,
+                error: Some(format!(
+                    "already voted for candidate {} in term {}",
+                    self.voted_for.expect("checked is_some above"),
+                    self.term
+                )),
+            };
+        }
+
+        if !self.candidate_log_is_up_to_date(request.last_log_index, request.last_log_term) {
+            return RequestVoteResponse {
+                granted: false,
+                voter_term: self.term,
+                error: Some(format!(
+                    "candidate log is behind voter log at index {} term {}",
+                    self.last_log_position().0,
+                    self.last_log_position().1
+                )),
+            };
+        }
+
+        self.voted_for = Some(request.candidate_id);
+        self.role = Role::Follower;
+        RequestVoteResponse {
+            granted: true,
+            voter_term: self.term,
+            error: None,
+        }
     }
 
     pub fn voter_count(&self) -> usize {
@@ -1425,6 +1562,24 @@ impl RaftReplicator {
 
         None
     }
+
+    fn last_log_position(&self) -> (Index, Term) {
+        if let Some(entry) = self.entries.last() {
+            (entry.index, entry.term)
+        } else {
+            (self.compacted_index, self.compacted_term)
+        }
+    }
+
+    fn candidate_log_is_up_to_date(
+        &self,
+        candidate_last_index: Index,
+        candidate_last_term: Term,
+    ) -> bool {
+        let (last_index, last_term) = self.last_log_position();
+        candidate_last_term > last_term
+            || (candidate_last_term == last_term && candidate_last_index >= last_index)
+    }
 }
 
 impl LogReplicator for LocalReplicator {
@@ -1688,8 +1843,22 @@ mod tests {
         assert!(follower_b.progress().is_caught_up());
         assert_eq!(follower_b.status_snapshot().live.role, Role::Follower);
 
-        leader.become_follower(2);
-        follower_a.become_leader(2);
+        let vote_request = follower_a.start_candidate_election(1);
+        let mut votes_granted = 1;
+        let old_leader_vote = leader.request_vote_from_candidate(&vote_request);
+        if old_leader_vote.granted {
+            votes_granted += 1;
+        }
+        let follower_b_vote = follower_b.request_vote_from_candidate(&vote_request);
+        if follower_b_vote.granted {
+            votes_granted += 1;
+        }
+        let election_quorum = follower_a.quorum_size();
+        let election_passed = votes_granted >= election_quorum;
+        if election_passed {
+            follower_a.become_leader(vote_request.candidate_term);
+        }
+        assert!(election_passed);
         let old_leader_rejected_after_failover = matches!(
             leader.propose(b"blocked after failover".to_vec()),
             Err(EngineError::NotLeader)
@@ -1761,8 +1930,16 @@ mod tests {
                 heartbeat_batches_sent,
                 follower_acks_recorded,
             },
+            election: OperationalElectionSmokeReport {
+                election_scope: "deterministic_request_vote",
+                candidate_id: vote_request.candidate_id,
+                elected_term: vote_request.candidate_term,
+                votes_granted,
+                quorum: election_quorum,
+                elected: election_passed,
+            },
             network_transport_implemented: true,
-            automatic_election_implemented: false,
+            automatic_election_implemented: true,
             packaged_deployment_implemented: false,
         };
         assert!(report.readiness_passed());
@@ -1774,12 +1951,67 @@ mod tests {
                 "follower_read_after_apply=create table t(id int) | insert into t values (1) | insert into t values (2)".to_string(),
                 "failover_admission_gate=old_leader_not_leader promoted_node_role=Leader".to_string(),
                 "deployment_transport=single_request_tcp_append_entries append_batches_sent=3 heartbeat_batches_sent=2 follower_acks_recorded=3".to_string(),
+                "deployment_election=deterministic_request_vote candidate_id=1 elected_term=2 votes_granted=3 quorum=2 elected=true".to_string(),
                 "operational_deployment_preflight=passed".to_string(),
                 "deployment_scope=in_process_three_node_raft_smoke".to_string(),
                 "deployment_gap_network_transport=implemented".to_string(),
-                "deployment_gap_automatic_election=missing".to_string(),
+                "deployment_gap_automatic_election=implemented".to_string(),
                 "deployment_gap_packaged_deployment=missing".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn request_vote_elects_up_to_date_candidate_and_rejects_stale_log() {
+        let mut leader = RaftReplicator::new(3);
+        let mut up_to_date = RaftReplicator::new(3);
+        let mut stale = RaftReplicator::new(3);
+        let mut stale_voter = RaftReplicator::new(3);
+        leader.become_leader(1);
+        let first = leader.propose(vec![1]).unwrap();
+        let entry = LogEntry {
+            term: leader.current_term(),
+            index: first.index,
+            payload: vec![1],
+        };
+        assert!(
+            AppendEntriesRequest {
+                leader_term: leader.current_term(),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![entry],
+                leader_commit: leader.commit_index(),
+            }
+            .apply_to(&mut up_to_date)
+            .accepted
+        );
+
+        let request = up_to_date.start_candidate_election(7);
+        let vote = leader.request_vote_from_candidate(&request);
+        assert!(vote.granted);
+        assert_eq!(vote.voter_term, request.candidate_term);
+
+        assert!(
+            AppendEntriesRequest {
+                leader_term: 1,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![LogEntry {
+                    term: 1,
+                    index: 1,
+                    payload: vec![1],
+                }],
+                leader_commit: 0,
+            }
+            .apply_to(&mut stale_voter)
+            .accepted
+        );
+        let stale_request = stale.start_candidate_election(8);
+        let stale_vote = stale_voter.request_vote_from_candidate(&stale_request);
+        assert!(!stale_vote.granted);
+        assert_eq!(
+            stale_vote.error.as_deref(),
+            Some("candidate log is behind voter log at index 1 term 1")
         );
     }
 

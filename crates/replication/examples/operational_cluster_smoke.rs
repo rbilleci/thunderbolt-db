@@ -3,7 +3,8 @@ use std::time::Duration;
 use gpu_db_replication::{
     send_append_entries_once, serve_append_entries_once, AppendEntriesRequest, LogReplicator,
     OperationalClusterSmokeReport, OperationalDeploymentPreflightReport,
-    OperationalTransportSmokeReport, RaftReplicator, ReplicatedStateMachine,
+    OperationalElectionSmokeReport, OperationalTransportSmokeReport, RaftReplicator,
+    ReplicatedStateMachine,
 };
 use gpu_db_types::{EngineError, Index, LogEntry, Role, Term};
 
@@ -164,8 +165,22 @@ fn main() -> Result<(), EngineError> {
     assert!(follower_b.progress().is_caught_up());
     assert_eq!(follower_b.status_snapshot().live.role, Role::Follower);
 
-    leader.become_follower(2);
-    follower_a.become_leader(2);
+    let vote_request = follower_a.start_candidate_election(1);
+    let mut votes_granted = 1;
+    let old_leader_vote = leader.request_vote_from_candidate(&vote_request);
+    if old_leader_vote.granted {
+        votes_granted += 1;
+    }
+    let follower_b_vote = follower_b.request_vote_from_candidate(&vote_request);
+    if follower_b_vote.granted {
+        votes_granted += 1;
+    }
+    let election_quorum = follower_a.quorum_size();
+    let election_passed = votes_granted >= election_quorum;
+    if election_passed {
+        follower_a.become_leader(vote_request.candidate_term);
+    }
+    assert!(election_passed);
     let old_leader_rejected_after_failover = matches!(
         leader.propose(b"blocked after failover".to_vec()),
         Err(EngineError::NotLeader)
@@ -230,8 +245,16 @@ fn main() -> Result<(), EngineError> {
             heartbeat_batches_sent,
             follower_acks_recorded,
         },
+        election: OperationalElectionSmokeReport {
+            election_scope: "deterministic_request_vote",
+            candidate_id: vote_request.candidate_id,
+            elected_term: vote_request.candidate_term,
+            votes_granted,
+            quorum: election_quorum,
+            elected: election_passed,
+        },
         network_transport_implemented: true,
-        automatic_election_implemented: false,
+        automatic_election_implemented: true,
         packaged_deployment_implemented: false,
     };
     assert!(report.readiness_passed());

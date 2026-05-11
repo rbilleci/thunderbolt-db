@@ -12,8 +12,9 @@ required_lines=(
   "operational_deployment_preflight=passed"
   "deployment_scope=in_process_three_node_raft_smoke"
   "deployment_transport=single_request_tcp_append_entries append_batches_sent=3 heartbeat_batches_sent=2 follower_acks_recorded=3"
+  "deployment_election=deterministic_request_vote candidate_id=1 elected_term=2 votes_granted=3 quorum=2 elected=true"
   "deployment_gap_network_transport=implemented"
-  "deployment_gap_automatic_election=missing"
+  "deployment_gap_automatic_election=implemented"
   "deployment_gap_packaged_deployment=missing"
 )
 

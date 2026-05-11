@@ -66,7 +66,7 @@ def classify(test_id: str) -> list[str]:
     if re.search(r"wal|durable|visibility|checkpoint|replay", test_id):
         buckets.append("durability.invariants")
     if re.search(
-        r"operational_replication|cluster_smoke|deployment_preflight|append_entries_transport|read_after_apply|failover",
+        r"operational_replication|cluster_smoke|deployment_preflight|append_entries_transport|request_vote|read_after_apply|failover",
         test_id,
     ):
         buckets.append("replication.operational_cluster")
