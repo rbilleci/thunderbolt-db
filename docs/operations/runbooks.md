@@ -116,12 +116,12 @@ Failure criteria:
 Current implemented scope:
 
 - `scripts/run_replication_cluster_smoke.sh` runs an in-process 3-node Raft smoke scenario.
-- The scenario demonstrates leader write admission, typed append-entries request/response handling with a tested binary frame codec, follower catch-up, read-after-apply, old-leader `NotLeader` rejection after failover, and continued writes on the promoted leader.
+- The scenario demonstrates leader write admission, typed append-entries request/response handling with a tested binary frame codec and localhost TCP loopback proof, follower catch-up, read-after-apply, old-leader `NotLeader` rejection after failover, and continued writes on the promoted leader.
 - The same command emits an `operational_deployment_preflight=passed` line only when the smoke proof passes and the current in-memory append-entries transport evidence plus deployment scope/gaps are explicitly reported.
 
 Current simulated/not-yet-implemented scope:
 
-- No network transport between node processes.
+- No packaged network transport between node processes; only append-entries frame encoding and localhost TCP loopback proof exist.
 - No automatic election or membership reconfiguration.
 - No packaged container/Kubernetes deployment harness.
 

@@ -1818,6 +1818,45 @@ mod tests {
     }
 
     #[test]
+    fn append_entries_transport_tcp_loopback_round_trips_frame() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut follower = RaftReplicator::new(3);
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request_frame = Vec::new();
+            std::io::Read::read_to_end(&mut socket, &mut request_frame).unwrap();
+            let request = AppendEntriesRequest::decode_frame(&request_frame).unwrap();
+            let response = request.apply_to(&mut follower);
+            std::io::Write::write_all(&mut socket, &response.encode_frame()).unwrap();
+            follower.commit_index()
+        });
+
+        let request = AppendEntriesRequest {
+            leader_term: 3,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![LogEntry {
+                term: 3,
+                index: 1,
+                payload: b"replicated over loopback".to_vec(),
+            }],
+            leader_commit: 1,
+        };
+        let mut stream = std::net::TcpStream::connect(addr).unwrap();
+        std::io::Write::write_all(&mut stream, &request.encode_frame()).unwrap();
+        stream.shutdown(std::net::Shutdown::Write).unwrap();
+
+        let mut response_frame = Vec::new();
+        std::io::Read::read_to_end(&mut stream, &mut response_frame).unwrap();
+        let response = AppendEntriesResponse::decode_frame(&response_frame).unwrap();
+        assert!(response.accepted);
+        assert_eq!(response.follower_term, 3);
+        assert_eq!(response.follower_commit_index, 1);
+        assert_eq!(server.join().unwrap(), 1);
+    }
+
+    #[test]
     fn commit_index_monotonic() {
         let mut r = LocalReplicator::leader();
         let a = r.propose(vec![1]).unwrap();

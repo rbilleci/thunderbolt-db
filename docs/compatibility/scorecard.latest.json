@@ -27,8 +27,8 @@
     "replication.operational_cluster": {
       "failed": 0,
       "ignored": 0,
-      "passed": 4,
-      "total": 4
+      "passed": 5,
+      "total": 5
     },
     "replication.role_and_log": {
       "failed": 0,
@@ -77,8 +77,8 @@
   "totals": {
     "failed": 0,
     "ignored": 0,
-    "passed": 575,
-    "total": 575
+    "passed": 576,
+    "total": 576
   },
   "trend_hook": {
     "baseline_available": true,
