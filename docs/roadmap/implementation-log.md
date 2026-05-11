@@ -3,6 +3,7 @@
 ## 2026-05-11
 
 ### PostgreSQL-compatible product loop
+- Advanced P6 operational replication/deployment by adding a binary frame codec for `AppendEntriesRequest` / `AppendEntriesResponse`, including round-trip and truncated-frame rejection coverage. This gives the future network transport a tested payload contract while keeping the current deployment proof explicitly in-process.
 - Advanced P6 operational replication/deployment by adding typed `AppendEntriesRequest` / `AppendEntriesResponse` messages and routing the local 3-node smoke through that contract. This keeps the current proof in-process while creating the first transport-shaped boundary for later networked deployment work; the scorecard classifier now maps append-entries transport regressions into the P6 operational bucket.
 - Advanced P6 operational replication/deployment by adding `OperationalTransportSmokeReport` to the local 3-node Raft smoke proof. The smoke script now validates in-memory append-entries transport evidence, including append batch, heartbeat batch, and follower-ack counts, while keeping networked transport, automatic election, and packaged deployment marked as explicit deployment gaps.
 - Advanced P6 operational replication/deployment by wrapping the existing local 3-node Raft smoke proof in `OperationalDeploymentPreflightReport`. The smoke script now validates stable operator evidence for pass/fail, read-after-apply, failover admission, current in-process deployment scope, and explicit missing network transport, automatic election, and packaged deployment gaps.
