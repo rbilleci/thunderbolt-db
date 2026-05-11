@@ -1612,6 +1612,7 @@ fn parse_projection(input: &str) -> Result<SelectProjection, ParseError> {
 }
 
 fn parse_select_filter(input: &str) -> Result<SelectFilter, ParseError> {
+    let input = trim_wrapping_parentheses(input)?;
     let (column, op, value) = split_select_filter(input)?;
     Ok(SelectFilter {
         column: normalize_identifier(column.trim())?,
@@ -1621,6 +1622,7 @@ fn parse_select_filter(input: &str) -> Result<SelectFilter, ParseError> {
 }
 
 fn parse_select_filters(input: &str) -> Result<Vec<SelectFilter>, ParseError> {
+    let input = trim_wrapping_parentheses(input)?;
     let filters = split_keyword_chain_outside_quotes(input, "AND")?
         .into_iter()
         .map(|filter| parse_select_filter(filter.trim()))
@@ -1632,6 +1634,7 @@ fn parse_select_filters(input: &str) -> Result<Vec<SelectFilter>, ParseError> {
 }
 
 fn parse_select_filter_groups(input: &str) -> Result<Vec<Vec<SelectFilter>>, ParseError> {
+    let input = trim_wrapping_parentheses(input)?;
     let groups = split_keyword_chain_outside_quotes(input, "OR")?
         .into_iter()
         .map(|group| parse_select_filters(group.trim()))
@@ -1658,6 +1661,23 @@ fn split_select_filter(input: &str) -> Result<(&str, SelectFilterOp, &str), Pars
         }
     }
     Err(ParseError::InvalidRelationalSql)
+}
+
+fn trim_wrapping_parentheses(input: &str) -> Result<&str, ParseError> {
+    let mut trimmed = input.trim();
+    loop {
+        if !trimmed.starts_with('(') {
+            return Ok(trimmed);
+        }
+        let close = find_matching_paren(trimmed, 0).ok_or(ParseError::InvalidRelationalSql)?;
+        if close != trimmed.len() - 1 {
+            return Ok(trimmed);
+        }
+        trimmed = trimmed[1..close].trim();
+        if trimmed.is_empty() {
+            return Err(ParseError::InvalidRelationalSql);
+        }
+    }
 }
 
 fn parse_select_order(input: &str) -> Result<SelectOrder, ParseError> {
@@ -1792,6 +1812,7 @@ fn find_keyword_outside_quotes(input: &str, keyword: &str) -> Option<usize> {
     let keyword = keyword.to_ascii_lowercase();
     let bytes = input.as_bytes();
     let mut in_quote = false;
+    let mut depth = 0usize;
     let mut idx = 0;
     while idx + keyword.len() <= bytes.len() {
         if bytes[idx] == b'\'' {
@@ -1803,7 +1824,21 @@ fn find_keyword_outside_quotes(input: &str, keyword: &str) -> Option<usize> {
             idx += 1;
             continue;
         }
+        match bytes[idx] {
+            b'(' if !in_quote => {
+                depth += 1;
+                idx += 1;
+                continue;
+            }
+            b')' if !in_quote => {
+                depth = depth.saturating_sub(1);
+                idx += 1;
+                continue;
+            }
+            _ => {}
+        }
         if !in_quote
+            && depth == 0
             && lower[idx..].starts_with(&keyword)
             && is_keyword_boundary(input, idx, keyword.len())
         {
@@ -8125,6 +8160,38 @@ mod tests {
 
         assert_eq!(
             parse_command("SELECT name FROM people WHERE id = 1 OR name = 'Ada'").unwrap(),
+            Command::Select(Select {
+                table: "people".to_string(),
+                projection: SelectProjection::Columns(vec!["name".to_string()]),
+                filter: Some(SelectFilter {
+                    column: "id".to_string(),
+                    op: SelectFilterOp::Eq,
+                    value: SqlValue::Int4(1),
+                }),
+                filters: vec![SelectFilter {
+                    column: "id".to_string(),
+                    op: SelectFilterOp::Eq,
+                    value: SqlValue::Int4(1),
+                }],
+                filter_groups: vec![
+                    vec![SelectFilter {
+                        column: "id".to_string(),
+                        op: SelectFilterOp::Eq,
+                        value: SqlValue::Int4(1),
+                    }],
+                    vec![SelectFilter {
+                        column: "name".to_string(),
+                        op: SelectFilterOp::Eq,
+                        value: SqlValue::Text("Ada".to_string()),
+                    }],
+                ],
+                order_by: None,
+                limit: None,
+            })
+        );
+
+        assert_eq!(
+            parse_command("SELECT name FROM people WHERE (id = 1) OR (name = 'Ada')").unwrap(),
             Command::Select(Select {
                 table: "people".to_string(),
                 projection: SelectProjection::Columns(vec!["name".to_string()]),

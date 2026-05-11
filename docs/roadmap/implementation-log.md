@@ -3,7 +3,7 @@
 ## 2026-05-11
 
 ### PostgreSQL-compatible product loop
-- Advanced P4 SQL-to-GPU execution bridge coverage by parsing top-level `OR` groups in relational `WHERE` clauses while preserving narrow `AND` conjunctions inside each group. Supported literal predicate disjunctions now lower through a deduplicated disjunctive/ordered key-batch bridge, avoid `GpuMvccReadParityGap` fallback accounting when the MVCC row fetch runs on GPU, and are covered by SQL-level backend-swap, local CUDA, psql golden, and P7 benchmark artifacts.
+- Advanced P4 SQL-to-GPU execution bridge coverage by parsing top-level `OR` groups in relational `WHERE` clauses while preserving narrow `AND` conjunctions inside each group. Supported literal predicate disjunctions, including parenthesized predicate groups, now lower through a deduplicated disjunctive/ordered key-batch bridge, avoid `GpuMvccReadParityGap` fallback accounting when the MVCC row fetch runs on GPU, and are covered by SQL-level backend-swap, local CUDA, psql golden, and P7 benchmark artifacts.
 - Advanced P4 SQL-to-GPU execution bridge coverage by parsing narrow `AND` conjunctions in relational `WHERE` clauses and lowering supported literal predicate conjunctions through a conjunctive/ordered key-batch bridge. SQL-level backend-swap and local CUDA regressions now prove those conjunctions execute without `GpuMvccReadParityGap` fallback, and the psql golden relational scenario plus P7 benchmark mix include the new shape.
 
 ### CUDA native composition
