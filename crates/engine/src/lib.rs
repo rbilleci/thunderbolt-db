@@ -6112,6 +6112,14 @@ impl Engine {
         Self::with_planner_config(PlannerConfig::default())
     }
 
+    pub fn recover_from_durable_wal(records: &[WalRecord]) -> Result<Self, EngineError> {
+        let mut engine = Self::new_local();
+        for record in records {
+            engine.commit_mutation(record.txn_id, record.payload.clone())?;
+        }
+        Ok(engine)
+    }
+
     pub fn with_planner_config(planner_cfg: PlannerConfig) -> Self {
         Self {
             repl: LocalReplicator::leader(),
@@ -22197,5 +22205,43 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("column \"missing\" does not exist"));
+    }
+
+    #[test]
+    fn relational_catalog_replays_from_durable_wal_with_table_data() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO people (id, name) VALUES (1, 'Ada'), (2, 'Linus')",
+        )
+        .unwrap();
+
+        let durable = e.durable_wal_records().to_vec();
+        let mut recovered = Engine::recover_from_durable_wal(&durable).unwrap();
+        let table = recovered.relational_catalog_table("people").unwrap();
+
+        assert_eq!(table.schema, PUBLIC_SCHEMA_NAME);
+        assert_eq!(table.oid, FIRST_USER_RELATION_OID);
+        assert_eq!(table.columns[0].table_oid, FIRST_USER_RELATION_OID);
+        assert_eq!(table.columns[0].attnum, 1);
+        assert_eq!(table.columns[1].attnum, 2);
+        assert_eq!(recovered.wal_flushed_count(), durable.len());
+
+        let Command::Select(select) =
+            parse_command("SELECT id, name FROM people ORDER BY id").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let result = recovered.execute_relational_select(&select).unwrap();
+
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())],
+                vec![SqlValue::Int4(2), SqlValue::Text("Linus".to_string())],
+            ]
+        );
     }
 }
