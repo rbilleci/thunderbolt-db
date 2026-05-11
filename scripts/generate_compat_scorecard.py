@@ -51,6 +51,8 @@ def classify(test_id: str) -> list[str]:
         buckets.append("sql.relational_foundation")
     if re.search(r"sql_gpu|gpu_bridge|relational_sql_select_cuda|relational_sql_select_gpu", test_id):
         buckets.append("sql.gpu_bridge")
+    if re.search(r"relational_index|access_path|equality_index", test_id):
+        buckets.append("storage.indexing")
     if re.search(
         r"relational_catalog|catalog_helpers|catalog_schema|catalog_introspection|pg_catalog|type_metadata|column_id|relation_oid",
         test_id,

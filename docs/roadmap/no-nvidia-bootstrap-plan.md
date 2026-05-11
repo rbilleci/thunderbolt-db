@@ -412,7 +412,7 @@ Initial target:
 Exit criteria:
 1. A relational table survives restart/recovery in an automated test.
 2. WAL replay restores catalog plus table data to the committed boundary.
-3. At least one indexed or access-path-backed predicate is used by planning/execution with a measurable fixture.
+3. At least one indexed or access-path-backed predicate is used by planning/execution with a measurable fixture. First slice landed on 2026-05-11: WAL-applied inserts maintain a table/column/value equality index that is rebuilt by durable WAL recovery, and `WHERE column = literal` relational reads use a `KeyBatchLookup` access path with `RelationalSelectResult::access_path` reporting `EqualityIndex { table, column, matched_keys }`.
 4. MVCC version retention has a tested safe boundary or a documented operational limitation.
 5. Storage/recovery docs and runbooks match the implemented behavior.
 

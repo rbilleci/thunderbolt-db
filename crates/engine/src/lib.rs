@@ -5890,6 +5890,7 @@ pub struct Engine {
     sm: KvStateMachine,
     mvcc_store: InMemoryTupleStore,
     relational_catalog: BTreeMap<String, RelationalTable>,
+    relational_value_index: BTreeMap<RelationalIndexKey, Vec<String>>,
     relational_next_oid: u32,
     relational_next_column_id: u32,
     relational_next_row_id: u64,
@@ -5928,6 +5929,17 @@ pub struct RelationalSelectResult {
     pub planned_target: DeviceTarget,
     pub executed_target: DeviceTarget,
     pub fallback_reason: Option<FallbackReason>,
+    pub access_path: RelationalAccessPath,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelationalAccessPath {
+    FullTableScan,
+    EqualityIndex {
+        table: String,
+        column: String,
+        matched_keys: usize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5969,6 +5981,13 @@ struct BoundRelationalSelect {
     order: Option<(usize, bool)>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct RelationalIndexKey {
+    table: String,
+    column: String,
+    value: String,
+}
+
 const PUBLIC_SCHEMA_NAME: &str = "public";
 const FIRST_USER_RELATION_OID: u32 = 16_384;
 const FIRST_USER_COLUMN_ID: u32 = 1;
@@ -6007,6 +6026,13 @@ fn relational_row_key(table: &str, row_id: u64) -> String {
 
 fn relational_key_prefix(table: &str) -> String {
     format!("rel/{table}/")
+}
+
+fn relational_index_value(value: &SqlValue) -> String {
+    match value {
+        SqlValue::Int4(value) => format!("i:{value}"),
+        SqlValue::Text(value) => format!("t:{value}"),
+    }
 }
 
 fn encode_relational_row(values: &[SqlValue]) -> String {
@@ -6138,19 +6164,6 @@ fn bind_relational_select(
     })
 }
 
-fn relational_select_mvcc_query(select: &Select, read_txn_id: TxnId) -> MvccReadQuery {
-    MvccReadQuery {
-        source: MvccReadSource::FullScan,
-        visibility: StorageVisibility { read_txn_id },
-        filter: Some(MvccReadFilter::KeyPrefix(relational_key_prefix(
-            &select.table,
-        ))),
-        order: Some(MvccReadOrder::KeyAsc),
-        projection: MvccProjection::KeyValue,
-        limit: None,
-    }
-}
-
 fn relational_select_needs_host_sql_finalization(select: &Select) -> bool {
     !matches!(select.projection, SelectProjection::All)
         || select.filter.is_some()
@@ -6178,6 +6191,7 @@ impl Engine {
             sm: KvStateMachine::default(),
             mvcc_store: InMemoryTupleStore::new(),
             relational_catalog: BTreeMap::new(),
+            relational_value_index: BTreeMap::new(),
             relational_next_oid: FIRST_USER_RELATION_OID,
             relational_next_column_id: FIRST_USER_COLUMN_ID,
             relational_next_row_id: 1,
@@ -6430,15 +6444,26 @@ impl Engine {
             let values = values.into_iter().map(Option::unwrap).collect::<Vec<_>>();
             let row_id = self.relational_next_row_id;
             self.relational_next_row_id += 1;
+            let row_key = relational_row_key(&insert.table, row_id);
             self.mvcc_store
                 .tuple_insert(
                     NewTuple {
-                        key: relational_row_key(&insert.table, row_id),
+                        key: row_key.clone(),
                         value: encode_relational_row(&values),
                     },
                     txn_id,
                 )
                 .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+            for (column, value) in table.columns.iter().zip(values.iter()) {
+                self.relational_value_index
+                    .entry(RelationalIndexKey {
+                        table: insert.table.clone(),
+                        column: column.name.clone(),
+                        value: relational_index_value(value),
+                    })
+                    .or_default()
+                    .push(row_key.clone());
+            }
         }
         Ok(())
     }
@@ -6705,18 +6730,20 @@ impl Engine {
         &mut self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
-        let query = relational_select_mvcc_query(select, self.visible_up_to);
+        let (table, bound) = self.bind_relational_select_for_execution(select)?;
+        let (query, access_path) = self.relational_select_mvcc_query(select, &bound);
         let result = self.execute_mvcc_query(&query)?;
-        self.finalize_relational_select(select, result)
+        self.finalize_relational_select(select, table, bound, access_path, result)
     }
 
     pub fn execute_relational_select_with_cuda_driver_probe(
         &mut self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
-        let query = relational_select_mvcc_query(select, self.visible_up_to);
+        let (table, bound) = self.bind_relational_select_for_execution(select)?;
+        let (query, access_path) = self.relational_select_mvcc_query(select, &bound);
         let result = self.execute_mvcc_query_with_cuda_driver_probe(&query)?;
-        self.finalize_relational_select(select, result)
+        self.finalize_relational_select(select, table, bound, access_path, result)
     }
 
     #[cfg(test)]
@@ -6725,16 +6752,16 @@ impl Engine {
         select: &Select,
         backend: &B,
     ) -> Result<RelationalSelectResult, ExecuteError> {
-        let query = relational_select_mvcc_query(select, self.visible_up_to);
+        let (table, bound) = self.bind_relational_select_for_execution(select)?;
+        let (query, access_path) = self.relational_select_mvcc_query(select, &bound);
         let result = self.execute_mvcc_query_with_backend(&query, backend)?;
-        self.finalize_relational_select(select, result)
+        self.finalize_relational_select(select, table, bound, access_path, result)
     }
 
-    fn finalize_relational_select(
-        &mut self,
+    fn bind_relational_select_for_execution(
+        &self,
         select: &Select,
-        mvcc_result: MvccReadResult,
-    ) -> Result<RelationalSelectResult, ExecuteError> {
+    ) -> Result<(RelationalTable, BoundRelationalSelect), ExecuteError> {
         let table = self
             .relational_catalog
             .get(&select.table)
@@ -6746,6 +6773,74 @@ impl Engine {
             })?
             .clone();
         let bound = bind_relational_select(&table, select)?;
+        Ok((table, bound))
+    }
+
+    fn relational_select_mvcc_query(
+        &self,
+        select: &Select,
+        bound: &BoundRelationalSelect,
+    ) -> (MvccReadQuery, RelationalAccessPath) {
+        let visibility = StorageVisibility {
+            read_txn_id: self.visible_up_to,
+        };
+        if let Some((column_idx, value)) = &bound.filter {
+            let table_column = self
+                .relational_catalog
+                .get(&select.table)
+                .and_then(|table| table.columns.get(*column_idx))
+                .expect("bound filter column came from table");
+            let keys = self
+                .relational_value_index
+                .get(&RelationalIndexKey {
+                    table: select.table.clone(),
+                    column: table_column.name.clone(),
+                    value: relational_index_value(value),
+                })
+                .cloned()
+                .unwrap_or_default();
+            let matched_keys = keys.len();
+            let query = MvccReadQuery {
+                source: MvccReadSource::KeyBatchLookup { keys },
+                visibility,
+                filter: None,
+                order: Some(MvccReadOrder::KeyAsc),
+                projection: MvccProjection::KeyValue,
+                limit: None,
+            };
+            return (
+                query,
+                RelationalAccessPath::EqualityIndex {
+                    table: select.table.clone(),
+                    column: table_column.name.clone(),
+                    matched_keys,
+                },
+            );
+        }
+
+        (
+            MvccReadQuery {
+                source: MvccReadSource::FullScan,
+                visibility,
+                filter: Some(MvccReadFilter::KeyPrefix(relational_key_prefix(
+                    &select.table,
+                ))),
+                order: Some(MvccReadOrder::KeyAsc),
+                projection: MvccProjection::KeyValue,
+                limit: None,
+            },
+            RelationalAccessPath::FullTableScan,
+        )
+    }
+
+    fn finalize_relational_select(
+        &mut self,
+        select: &Select,
+        table: RelationalTable,
+        bound: BoundRelationalSelect,
+        access_path: RelationalAccessPath,
+        mvcc_result: MvccReadResult,
+    ) -> Result<RelationalSelectResult, ExecuteError> {
         let mut rows = Vec::new();
         for row in mvcc_result.rows {
             let Some(value) = row.value else {
@@ -6794,6 +6889,7 @@ impl Engine {
             planned_target: mvcc_result.planned_target,
             executed_target: mvcc_result.executed_target,
             fallback_reason,
+            access_path,
         })
     }
 
@@ -22202,6 +22298,14 @@ mod tests {
             result.fallback_reason,
             Some(FallbackReason::GpuMvccReadParityGap)
         );
+        assert_eq!(
+            result.access_path,
+            RelationalAccessPath::EqualityIndex {
+                table: "people".to_string(),
+                column: "id".to_string(),
+                matched_keys: 1,
+            }
+        );
     }
 
     #[test]
@@ -22441,6 +22545,41 @@ mod tests {
                 vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())],
                 vec![SqlValue::Int4(2), SqlValue::Text("Linus".to_string())],
             ]
+        );
+        assert_eq!(result.access_path, RelationalAccessPath::FullTableScan);
+    }
+
+    #[test]
+    fn relational_index_access_path_survives_wal_recovery() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO people (id, name) VALUES (1, 'Ada'), (2, 'Linus'), (3, 'Linus')",
+        )
+        .unwrap();
+
+        let durable = e.durable_wal_records().to_vec();
+        let mut recovered = Engine::recover_from_durable_wal(&durable).unwrap();
+        let Command::Select(select) =
+            parse_command("SELECT id FROM people WHERE name = 'Linus' ORDER BY id").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let result = recovered.execute_relational_select(&select).unwrap();
+
+        assert_eq!(
+            result.access_path,
+            RelationalAccessPath::EqualityIndex {
+                table: "people".to_string(),
+                column: "name".to_string(),
+                matched_keys: 2,
+            }
+        );
+        assert_eq!(
+            result.rows,
+            vec![vec![SqlValue::Int4(2)], vec![SqlValue::Int4(3)]]
         );
     }
 }
