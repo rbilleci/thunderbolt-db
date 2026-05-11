@@ -8,7 +8,9 @@ Defines durable state model and restart behavior.
 - Checkpoints / snapshots
 - Control metadata
 
-The first implemented local WAL segment format stores the flushed WAL prefix in a single checksummed file. Each record carries `txn_id`, payload length, payload bytes, and a record checksum. `Engine::persist_durable_wal_to_file(...)` writes the current durable prefix, and `Engine::recover_from_durable_wal_file(...)` replays that prefix through the normal engine commit/apply path so relational catalog entries, MVCC table rows, and volatile equality indexes are rebuilt from committed records only.
+The first implemented local WAL segment format stores the flushed WAL prefix in a checksummed file. Each record carries `txn_id`, payload length, payload bytes, and a record checksum. `Engine::persist_durable_wal_to_file(...)` writes one explicit segment, and `Engine::recover_from_durable_wal_file(...)` replays that segment through the normal engine commit/apply path so relational catalog entries, MVCC table rows, and volatile equality indexes are rebuilt from committed records only.
+
+The first checkpoint-control slice adds a small text control file. `Engine::persist_durable_wal_checkpoint(...)` writes the durable WAL segment and then atomically installs control metadata containing the segment path, durable record count, and last durable transaction id. `Engine::recover_from_durable_wal_checkpoint(...)` reads the control file, resolves the segment path relative to that file, validates the record count and last transaction id against the checksummed segment, and only then replays the committed prefix.
 
 ## Recovery sequence
 
@@ -18,7 +20,7 @@ The first implemented local WAL segment format stores the flushed WAL prefix in 
 4. Rebuild volatile caches (GPU) from durable state
 5. Open for traffic after readiness gates pass
 
-Current limitation: checkpoint metadata and control-file selection are not persisted yet. Operators should treat the checked-in file-backed path as a restart/replay proof for one explicit WAL segment, not as packaged PITR or automatic segment discovery.
+Current limitation: checkpoint-control metadata covers one selected durable segment. Operators should treat the checked-in file-backed path as a restart/replay proof with deterministic segment discovery from one control file, not as packaged PITR, multi-segment archival replay, or automatic retention cleanup.
 
 ## Compaction/snapshot boundary
 

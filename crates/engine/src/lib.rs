@@ -27,7 +27,10 @@ use gpu_db_storage::{
 };
 use gpu_db_txn::{TxnError, TxnManager};
 use gpu_db_types::{CommitToken, EngineError, Index, LogEntry, Role, SnapshotMeta, Term, TxnId};
-use gpu_db_wal::{read_wal_segment, write_wal_segment, WalBuffer, WalRecord};
+use gpu_db_wal::{
+    read_wal_checkpoint, read_wal_segment, write_wal_control_file, write_wal_segment, WalBuffer,
+    WalControlFile, WalRecord,
+};
 
 #[derive(Debug, Default)]
 pub struct KvStateMachine {
@@ -6308,6 +6311,13 @@ impl Engine {
         Self::recover_from_durable_wal(&records)
     }
 
+    pub fn recover_from_durable_wal_checkpoint(
+        control_path: impl AsRef<std::path::Path>,
+    ) -> Result<Self, EngineError> {
+        let (_control, records) = read_wal_checkpoint(control_path)?;
+        Self::recover_from_durable_wal(&records)
+    }
+
     pub fn with_planner_config(planner_cfg: PlannerConfig) -> Self {
         Self {
             repl: LocalReplicator::leader(),
@@ -7533,6 +7543,31 @@ impl Engine {
         path: impl AsRef<std::path::Path>,
     ) -> Result<(), EngineError> {
         write_wal_segment(path, self.durable_wal_records())
+    }
+
+    pub fn persist_durable_wal_checkpoint(
+        &self,
+        control_path: impl AsRef<std::path::Path>,
+        segment_path: impl AsRef<std::path::Path>,
+    ) -> Result<(), EngineError> {
+        let control_path = control_path.as_ref();
+        let segment_path = segment_path.as_ref();
+        write_wal_segment(segment_path, self.durable_wal_records())?;
+        let control_segment_path = segment_path
+            .strip_prefix(
+                control_path
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new(".")),
+            )
+            .unwrap_or(segment_path)
+            .to_path_buf();
+        write_wal_control_file(
+            control_path,
+            &WalControlFile {
+                segment_path: control_segment_path,
+                checkpoint: self.wal.checkpoint_meta(),
+            },
+        )
     }
 
     pub fn checkpoint_vacuum_mvcc_versions(
@@ -23630,6 +23665,52 @@ mod tests {
             }
         );
         assert_eq!(result.rows, vec![vec![SqlValue::Int4(3)]]);
+    }
+
+    #[test]
+    fn relational_state_recovers_from_wal_checkpoint_control_after_restart() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpu-db-engine-wal-control-{}-{}",
+            std::process::id(),
+            NEXT_TEST_WAL_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let control_path = dir.join("CONTROL");
+        let segment_path = dir.join("segment-0001.wal");
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO people (id, name) VALUES (1, 'Ada'), (2, 'Grace')",
+        )
+        .unwrap();
+
+        e.persist_durable_wal_checkpoint(&control_path, &segment_path)
+            .unwrap();
+        let mut recovered = Engine::recover_from_durable_wal_checkpoint(&control_path).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+
+        assert_eq!(recovered.wal_unflushed_count(), 0);
+        assert_eq!(recovered.wal_flushed_count(), 2);
+        let table = recovered.relational_catalog_table("people").unwrap();
+        assert_eq!(table.oid, FIRST_USER_RELATION_OID);
+
+        let Command::Select(select) =
+            parse_command("SELECT id FROM people WHERE name = 'Grace'").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let result = recovered.execute_relational_select(&select).unwrap();
+
+        assert_eq!(
+            result.access_path,
+            RelationalAccessPath::EqualityIndex {
+                table: "people".to_string(),
+                column: "name".to_string(),
+                matched_keys: 1,
+            }
+        );
+        assert_eq!(result.rows, vec![vec![SqlValue::Int4(2)]]);
     }
 
     #[test]
