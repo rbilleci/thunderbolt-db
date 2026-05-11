@@ -311,6 +311,144 @@ Queue reconciliation note (2026-05-04):
 - There is no remaining queued no-GPU implementation item to widen autonomously.
 - Until an NVIDIA-capable environment exists or a concrete contradiction reopens a named semantic gap, autonomous loops should treat the queue as drained and stop after validation/doc reconciliation rather than inventing new bootstrap surface area.
 
+## Post-CUDA PostgreSQL-compatible product loop
+
+Status: active as of 2026-05-11. The no-GPU bootstrap queue and CUDA completion gates are closed for their defined scope. The autonomous loop now moves from internal MVCC/CUDA completion to the larger product goal: a PostgreSQL-compatible GPU-backed database engine.
+
+Loop rules:
+- Work the milestones below in priority order.
+- Start each run by naming the active milestone and the exact exit criterion being advanced.
+- Prefer real client-facing behavior over isolated parser or kernel breadth.
+- Do not widen CUDA internals unless it directly supports a PostgreSQL-facing milestone or a measured benchmark target.
+- Update `docs/compatibility/matrix.md`, scorecard docs, and roadmap wording whenever implementation truth changes.
+- If a run cannot name a product milestone gap, run validation and stop instead of inventing work.
+
+Validation gate for product-loop changes:
+- `cargo fmt --all -- --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all --all-features`
+- psql golden/compatibility scorecard generation when protocol or SQL behavior changes
+- `scripts/run_cuda_parity.sh` when a change touches CUDA runtime, CUDA MVCC routing, or GPU fallback accounting
+
+### P1. Relational SQL foundation
+
+Goal:
+- Move beyond bootstrap KV commands and hard-coded compatibility responses into a small relational SQL surface that can create, mutate, and query named tables through the engine.
+
+Initial target:
+- `CREATE TABLE` for a minimal typed table shape.
+- `INSERT` into that table.
+- `SELECT <columns> FROM <table> [WHERE ...] [ORDER BY ...] [LIMIT ...]` for a deliberately narrow predicate/order subset.
+- Deterministic error reporting for unsupported relational syntax.
+
+Exit criteria:
+1. SQL parser/planner represents the supported relational forms as structured plans rather than string-matched server fixtures.
+2. Supported relational reads execute through engine-facing storage/execution APIs, not only the compatibility stub.
+3. At least one psql golden scenario creates a table, inserts rows, selects rows, and asserts stable output.
+4. Compatibility scorecard has explicit relational SQL buckets with passing/failing counts.
+5. Docs state the exact supported relational SQL subset and the next unsupported syntax boundary.
+
+### P2. Catalog, schema, and type spine
+
+Goal:
+- Add enough catalog/schema/type machinery for relational SQL and client introspection to have stable identities instead of ad hoc row labels.
+
+Initial target:
+- Table and column descriptors with stable ids/OIDs or an explicit OID allocation strategy.
+- Basic scalar type registry for the first SQL subset.
+- Minimal namespace handling, with `public` as the first supported schema.
+- First `pg_catalog` compatibility views/functions required by common psql/libpq startup and introspection probes.
+
+Exit criteria:
+1. Created tables and columns are stored in a catalog structure used by planning/execution.
+2. Type metadata is used for row descriptions and basic coercion/validation in supported statements.
+3. psql can inspect the first supported tables without relying on hard-coded fake responses for those objects.
+4. Catalog state survives the same durability/recovery boundary as user data or has an explicit documented bootstrap limitation.
+5. Docs and scorecard identify supported vs unsupported catalog/introspection surfaces.
+
+### P3. PostgreSQL wire protocol execution path
+
+Goal:
+- Move the server from simple-query compatibility probes toward real libpq application compatibility.
+
+Initial target:
+- Implement a narrow but real extended-query path for `Parse`, `Bind`, `Describe`, `Execute`, `Sync`, and `Close`.
+- Support text parameters and text result formats for the first relational SQL subset.
+- Keep unsupported binary formats, copy, function call, and advanced portal behavior explicitly classified.
+
+Exit criteria:
+1. Extended protocol no longer returns the generic "unsupported by compatibility stub" error for the first supported prepared statement/query path.
+2. Prepared statements and portals have session-local lifecycle tests.
+3. psql golden coverage includes at least one extended-query or prepared/parameterized flow that reaches engine execution.
+4. Error responses include stable SQLSTATE/message contracts for unsupported protocol features.
+5. Compatibility scorecard separates simple-query, extended-query, auth/startup, and error-path coverage.
+
+### P4. SQL-to-GPU execution bridge
+
+Goal:
+- Lower supported relational SQL plans into the existing MVCC/CUDA execution backend where the operation is GPU-eligible, while preserving CPU truth and fallback accounting.
+
+Initial target:
+- Map simple table scans, equality/range predicates, ordering, projection, and limit into `MvccReadQuery` or a successor contract only if the current contract becomes insufficient.
+- Record planned vs executed device target per SQL query.
+
+Exit criteria:
+1. At least one relational `SELECT` over table data reports GPU execution on local NVIDIA hardware.
+2. CPU-vs-GPU parity tests compare SQL-level results, not just internal MVCC rows.
+3. Unsupported SQL plan nodes fall back with explicit reason labels visible in `Engine::status_snapshot()` or equivalent telemetry.
+4. Benchmark/scorecard output includes SQL-level GPU execution rate and CPU fallback rate for the supported relational mix.
+5. Docs explain the SQL plan shapes that are GPU-eligible and the next GPU bridge boundary.
+
+### P5. Production storage, indexing, and recovery
+
+Goal:
+- Replace bootstrap in-memory assumptions with durable relational storage behavior suitable for restart, larger datasets, and GPU transfer planning.
+
+Initial target:
+- Durable table data/checkpoint/recovery path aligned with WAL-before-visibility.
+- First index or access-path strategy for point/range predicates.
+- Compaction/vacuum or documented retention boundary for MVCC versions.
+
+Exit criteria:
+1. A relational table survives restart/recovery in an automated test.
+2. WAL replay restores catalog plus table data to the committed boundary.
+3. At least one indexed or access-path-backed predicate is used by planning/execution with a measurable fixture.
+4. MVCC version retention has a tested safe boundary or a documented operational limitation.
+5. Storage/recovery docs and runbooks match the implemented behavior.
+
+### P6. Operational replication and deployment
+
+Goal:
+- Turn replication semantics and role gates into a deployable multi-node database story.
+
+Initial target:
+- 3-node raft deployment harness or reproducible local cluster script.
+- Follower apply/catch-up and leader failover smoke path.
+- Operator-facing readiness/failover evidence.
+
+Exit criteria:
+1. A scripted multi-node run demonstrates write on leader, catch-up on follower, and read-after-apply behavior.
+2. A failover or leader-transition scenario is tested with explicit admission gates.
+3. Replication lag/readiness/failure signals appear in the engine truth surface or operational output.
+4. Backup/PITR/DR runbooks identify what is implemented, simulated, or still missing.
+5. Compatibility scorecard or testing report includes the operational replication scenario.
+
+### P7. Real workload performance proof
+
+Goal:
+- Prove the design earns GPU complexity on realistic workloads, not only fixture-level parity.
+
+Initial target:
+- Define one app-shaped workload and one analytical/TPC-ish workload that fit the supported SQL subset.
+- Measure CPU baseline, GPU path, fallback rate, H2D/D2H bytes, kernel time, and total latency/throughput.
+
+Exit criteria:
+1. Benchmarks run reproducibly from a checked-in command/script.
+2. Reports include dataset size, concurrency level, device info, fallback rate, and correctness validation.
+3. At least one benchmark demonstrates a clear GPU advantage or records why the current architecture does not yet achieve one.
+4. Performance results drive a named follow-up decision, such as device-side set/multiset algebra, indexing, batching, or transfer layout work.
+5. Docs record which performance claims are supported and which are not.
+
 ## Exit criteria for no-GPU bootstrap phase
 
 - Commit path is replication-shaped and invariant-tested.
