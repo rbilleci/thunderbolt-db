@@ -8,6 +8,7 @@ use gpu_db_protocol::{
     parse_command, parse_frontend_message, parse_startup_packet, Command, FrontendMessage,
     SelectProjection, SqlValue, StartupPacket,
 };
+use gpu_db_protocol::{DescribeTarget, SqlType};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Column {
@@ -70,6 +71,7 @@ fn sql_type_oid_text(ty: gpu_db_protocol::SqlType) -> String {
 struct Session {
     in_transaction: bool,
     prepared: HashMap<String, PreparedStatement>,
+    portals: HashMap<String, Portal>,
     tables: HashMap<String, Table>,
     next_relation_oid: u32,
 }
@@ -79,6 +81,7 @@ impl Default for Session {
         Self {
             in_transaction: false,
             prepared: HashMap::new(),
+            portals: HashMap::new(),
             tables: HashMap::new(),
             next_relation_oid: FIRST_USER_RELATION_OID,
         }
@@ -102,6 +105,20 @@ struct CatalogColumn {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum PreparedStatement {
     AddTen,
+    Extended(PreparedQuery),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PreparedQuery {
+    query: String,
+    parameter_type_oids: Vec<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Portal {
+    statement_name: String,
+    query: PreparedQuery,
+    parameters: Vec<Option<String>>,
 }
 
 const FIRST_USER_RELATION_OID: u32 = 16_384;
@@ -164,6 +181,42 @@ fn handle_client(mut stream: TcpStream) -> io::Result<()> {
             FrontendMessage::SimpleQuery(query) => {
                 run_simple_query(&mut stream, &mut session, &query)?
             }
+            FrontendMessage::Parse {
+                statement_name,
+                query,
+                parameter_type_oids,
+            } => handle_parse(
+                &mut stream,
+                &mut session,
+                statement_name,
+                query,
+                parameter_type_oids,
+            )?,
+            FrontendMessage::Bind {
+                portal_name,
+                statement_name,
+                parameter_format_codes,
+                parameters,
+                result_format_codes,
+            } => handle_bind(
+                &mut stream,
+                &mut session,
+                portal_name,
+                statement_name,
+                parameter_format_codes,
+                parameters,
+                result_format_codes,
+            )?,
+            FrontendMessage::Describe { target, name } => {
+                handle_describe(&mut stream, &session, target, &name)?
+            }
+            FrontendMessage::Execute {
+                portal_name,
+                max_rows,
+            } => handle_execute(&mut stream, &mut session, &portal_name, max_rows)?,
+            FrontendMessage::Close { target, name } => {
+                handle_close(&mut stream, &mut session, target, &name)?
+            }
             FrontendMessage::Terminate => return Ok(()),
             FrontendMessage::Sync => write_ready_for_query(&mut stream, session.in_transaction)?,
             FrontendMessage::Flush => stream.flush()?,
@@ -188,18 +241,18 @@ fn unsupported_frontend_message(message: &FrontendMessage) -> &'static str {
         FrontendMessage::SaslInitialResponse { .. } | FrontendMessage::SaslResponse(_) => {
             "SASL authentication is not supported"
         }
-        FrontendMessage::Bind { .. }
+        FrontendMessage::FunctionCall { .. }
+        | FrontendMessage::CopyData(_)
+        | FrontendMessage::CopyDone
+        | FrontendMessage::CopyFail(_) => {
+            "extended protocol feature is not supported by the compatibility stub"
+        }
+        FrontendMessage::SimpleQuery(_)
+        | FrontendMessage::Bind { .. }
         | FrontendMessage::Parse { .. }
         | FrontendMessage::Describe { .. }
         | FrontendMessage::Close { .. }
         | FrontendMessage::Execute { .. }
-        | FrontendMessage::FunctionCall { .. }
-        | FrontendMessage::CopyData(_)
-        | FrontendMessage::CopyDone
-        | FrontendMessage::CopyFail(_) => {
-            "extended protocol is not supported by the compatibility stub"
-        }
-        FrontendMessage::SimpleQuery(_)
         | FrontendMessage::Terminate
         | FrontendMessage::Sync
         | FrontendMessage::Flush => "unsupported frontend message",
@@ -306,6 +359,205 @@ fn split_simple_query(query: &str) -> Vec<&str> {
         .map(str::trim)
         .filter(|statement| !statement.is_empty())
         .collect()
+}
+
+fn handle_parse(
+    stream: &mut TcpStream,
+    session: &mut Session,
+    statement_name: String,
+    query: String,
+    parameter_type_oids: Vec<u32>,
+) -> io::Result<()> {
+    if parameter_type_oids
+        .iter()
+        .copied()
+        .any(|oid| !matches!(oid, 0 | 23 | 25))
+    {
+        return write_error(
+            stream,
+            &ErrorField {
+                code: "0A000",
+                message: "only text and int4 extended-query parameters are supported",
+                position: None,
+            },
+        );
+    }
+    session.prepared.insert(
+        statement_name,
+        PreparedStatement::Extended(PreparedQuery {
+            query,
+            parameter_type_oids,
+        }),
+    );
+    write_parse_complete(stream)
+}
+
+fn handle_bind(
+    stream: &mut TcpStream,
+    session: &mut Session,
+    portal_name: String,
+    statement_name: String,
+    parameter_format_codes: Vec<i16>,
+    parameters: Vec<Option<Vec<u8>>>,
+    result_format_codes: Vec<i16>,
+) -> io::Result<()> {
+    if parameter_format_codes.iter().any(|code| *code != 0)
+        || result_format_codes.iter().any(|code| *code != 0)
+    {
+        return write_error(
+            stream,
+            &ErrorField {
+                code: "0A000",
+                message: "only text format parameters and results are supported",
+                position: None,
+            },
+        );
+    }
+    let Some(PreparedStatement::Extended(query)) = session.prepared.get(&statement_name) else {
+        return write_error(
+            stream,
+            &ErrorField {
+                code: "26000",
+                message: "prepared statement does not exist",
+                position: None,
+            },
+        );
+    };
+    let mut decoded = Vec::with_capacity(parameters.len());
+    for parameter in parameters {
+        decoded.push(match parameter {
+            Some(bytes) => Some(String::from_utf8(bytes).map_err(|error| {
+                io::Error::new(
+                    ErrorKind::InvalidData,
+                    format!("invalid UTF-8 parameter: {error}"),
+                )
+            })?),
+            None => None,
+        });
+    }
+    session.portals.insert(
+        portal_name,
+        Portal {
+            statement_name,
+            query: query.clone(),
+            parameters: decoded,
+        },
+    );
+    write_bind_complete(stream)
+}
+
+fn handle_describe(
+    stream: &mut TcpStream,
+    session: &Session,
+    target: DescribeTarget,
+    name: &str,
+) -> io::Result<()> {
+    match target {
+        DescribeTarget::Statement => {
+            let Some(PreparedStatement::Extended(query)) = session.prepared.get(name) else {
+                return write_error(
+                    stream,
+                    &ErrorField {
+                        code: "26000",
+                        message: "prepared statement does not exist",
+                        position: None,
+                    },
+                );
+            };
+            write_parameter_description(stream, &query.parameter_type_oids)?;
+            if let Some(columns) = describe_query_columns(session, &query.query) {
+                write_row_description(stream, &columns)
+            } else {
+                write_no_data(stream)
+            }
+        }
+        DescribeTarget::Portal => {
+            let Some(portal) = session.portals.get(name) else {
+                return write_error(
+                    stream,
+                    &ErrorField {
+                        code: "34000",
+                        message: "portal does not exist",
+                        position: None,
+                    },
+                );
+            };
+            let Some(bound_query) = bind_query_parameters(&portal.query, &portal.parameters) else {
+                return write_error(
+                    stream,
+                    &ErrorField {
+                        code: "08P01",
+                        message: "bound parameter count does not match prepared statement",
+                        position: None,
+                    },
+                );
+            };
+            if let Some(columns) = describe_query_columns(session, &bound_query) {
+                write_row_description(stream, &columns)
+            } else {
+                write_no_data(stream)
+            }
+        }
+    }
+}
+
+fn handle_execute(
+    stream: &mut TcpStream,
+    session: &mut Session,
+    portal_name: &str,
+    max_rows: u32,
+) -> io::Result<()> {
+    if max_rows != 0 {
+        return write_error(
+            stream,
+            &ErrorField {
+                code: "0A000",
+                message: "limited portal execution is not supported",
+                position: None,
+            },
+        );
+    }
+    let Some(portal) = session.portals.get(portal_name).cloned() else {
+        return write_error(
+            stream,
+            &ErrorField {
+                code: "34000",
+                message: "portal does not exist",
+                position: None,
+            },
+        );
+    };
+    let Some(bound_query) = bind_query_parameters(&portal.query, &portal.parameters) else {
+        return write_error(
+            stream,
+            &ErrorField {
+                code: "08P01",
+                message: "bound parameter count does not match prepared statement",
+                position: None,
+            },
+        );
+    };
+    execute_statement(stream, session, &bound_query)
+}
+
+fn handle_close(
+    stream: &mut TcpStream,
+    session: &mut Session,
+    target: DescribeTarget,
+    name: &str,
+) -> io::Result<()> {
+    match target {
+        DescribeTarget::Statement => {
+            session.prepared.remove(name);
+            session
+                .portals
+                .retain(|_, portal| portal.statement_name != name);
+        }
+        DescribeTarget::Portal => {
+            session.portals.remove(name);
+        }
+    }
+    write_close_complete(stream)
 }
 
 fn execute_statement(
@@ -716,6 +968,71 @@ fn catalog_table_oid_rows(session: &Session) -> Vec<Vec<Option<String>>> {
         .collect()
 }
 
+fn bind_query_parameters(query: &PreparedQuery, parameters: &[Option<String>]) -> Option<String> {
+    if query.parameter_type_oids.len() > parameters.len() {
+        return None;
+    }
+    let mut bound = query.query.clone();
+    for (idx, parameter) in parameters.iter().enumerate().rev() {
+        let value = parameter.as_ref()?;
+        let placeholder = format!("${}", idx + 1);
+        let literal = encode_parameter_literal(
+            value,
+            query.parameter_type_oids.get(idx).copied().unwrap_or(0),
+        )?;
+        bound = bound.replace(&placeholder, &literal);
+    }
+    if bound.as_bytes().windows(1).any(|window| window == b"$") {
+        return None;
+    }
+    Some(bound)
+}
+
+fn encode_parameter_literal(value: &str, type_oid: u32) -> Option<String> {
+    match type_oid {
+        23 => value.parse::<i32>().ok().map(|parsed| parsed.to_string()),
+        25 => Some(sql_quote_text(value)),
+        0 if value.parse::<i32>().is_ok() => Some(value.to_string()),
+        0 => Some(sql_quote_text(value)),
+        _ => None,
+    }
+}
+
+fn sql_quote_text(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn describe_query_columns(session: &Session, query: &str) -> Option<Vec<Column>> {
+    let command = parse_command(query).ok()?;
+    let Command::Select(select) = command else {
+        return None;
+    };
+    let table = session.tables.get(&select.table)?;
+    let selected_columns = match select.projection {
+        SelectProjection::All => table.columns.clone(),
+        SelectProjection::Columns(columns) => {
+            let mut selected = Vec::with_capacity(columns.len());
+            for column in columns {
+                let column = table
+                    .columns
+                    .iter()
+                    .find(|candidate| candidate.def.name == column)?;
+                selected.push(column.clone());
+            }
+            selected
+        }
+    };
+    Some(
+        selected_columns
+            .iter()
+            .map(|column| match column.def.ty {
+                SqlType::Int4 => int4_column(&column.def.name),
+                SqlType::Text => text_column(&column.def.name),
+            })
+            .collect(),
+    )
+}
+
 fn catalog_attribute_query_table(canonical: &str) -> Option<String> {
     let prefix = "select attname, atttypid from pg_catalog.pg_attribute where attrelid = '";
     let suffix = "'::regclass and attnum > 0 order by attnum";
@@ -829,6 +1146,33 @@ fn write_command_complete(stream: &mut TcpStream, tag: &str) -> io::Result<()> {
     let mut payload = Vec::with_capacity(tag.len() + 1);
     push_cstring(&mut payload, tag);
     write_message(stream, b'C', &payload)
+}
+
+fn write_parse_complete(stream: &mut TcpStream) -> io::Result<()> {
+    write_message(stream, b'1', &[])
+}
+
+fn write_bind_complete(stream: &mut TcpStream) -> io::Result<()> {
+    write_message(stream, b'2', &[])
+}
+
+fn write_close_complete(stream: &mut TcpStream) -> io::Result<()> {
+    write_message(stream, b'3', &[])
+}
+
+fn write_no_data(stream: &mut TcpStream) -> io::Result<()> {
+    write_message(stream, b'n', &[])
+}
+
+fn write_parameter_description(stream: &mut TcpStream, type_oids: &[u32]) -> io::Result<()> {
+    let parameter_count = i16::try_from(type_oids.len())
+        .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "too many parameters"))?;
+    let mut payload = Vec::with_capacity(2 + type_oids.len() * 4);
+    payload.extend_from_slice(&parameter_count.to_be_bytes());
+    for oid in type_oids {
+        payload.extend_from_slice(&oid.to_be_bytes());
+    }
+    write_message(stream, b't', &payload)
 }
 
 fn write_single_row(
@@ -1068,6 +1412,66 @@ mod tests {
                 Some("23".to_string()),
                 Some("4".to_string()),
             ]]
+        );
+    }
+
+    #[test]
+    fn extended_parameter_binding_substitutes_text_and_int_literals() {
+        let query = PreparedQuery {
+            query: "SELECT id, name FROM people WHERE id = $1 ORDER BY name LIMIT $2".to_string(),
+            parameter_type_oids: vec![23, 23],
+        };
+
+        assert_eq!(
+            bind_query_parameters(&query, &[Some("2".to_string()), Some("1".to_string())]),
+            Some("SELECT id, name FROM people WHERE id = 2 ORDER BY name LIMIT 1".to_string())
+        );
+
+        let text_query = PreparedQuery {
+            query: "SELECT id FROM people WHERE name = $1".to_string(),
+            parameter_type_oids: vec![25],
+        };
+        assert_eq!(
+            bind_query_parameters(&text_query, &[Some("O'Brien".to_string())]),
+            Some("SELECT id FROM people WHERE name = 'O''Brien'".to_string())
+        );
+    }
+
+    #[test]
+    fn extended_describe_uses_catalog_columns_for_bound_selects() {
+        let mut session = Session::default();
+        session.tables.insert(
+            "people".to_string(),
+            Table {
+                oid: FIRST_USER_RELATION_OID,
+                name: "people".to_string(),
+                columns: vec![
+                    CatalogColumn {
+                        attnum: 1,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "id".to_string(),
+                            ty: SqlType::Int4,
+                        },
+                    },
+                    CatalogColumn {
+                        attnum: 2,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "name".to_string(),
+                            ty: SqlType::Text,
+                        },
+                    },
+                ],
+                rows: Vec::new(),
+            },
+        );
+
+        assert_eq!(
+            describe_query_columns(
+                &session,
+                "SELECT name, id FROM people WHERE id = 2 ORDER BY name LIMIT 1"
+            )
+            .unwrap(),
+            vec![text_column("name"), int4_column("id")]
         );
     }
 

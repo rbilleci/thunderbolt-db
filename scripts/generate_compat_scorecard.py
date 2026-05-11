@@ -17,6 +17,8 @@ def classify(test_id: str) -> list[str]:
     if "psql_golden::" in test_id:
         if re.search(r"bootstrap|startup|auth|connect|simple_query|session_reset|prepare", test_id):
             buckets.append("protocol.client_flows")
+        if re.search(r"extended|bind|parse|portal|prepared|parameterized", test_id):
+            buckets.append("protocol.extended_query")
         if re.search(r"transaction|begin|commit|rollback", test_id):
             buckets.append("sql.transaction_flows")
         if re.search(r"relational|create_table|insert|select", test_id):
@@ -26,10 +28,14 @@ def classify(test_id: str) -> list[str]:
     if "gpu_db_protocol::" in test_id:
         if re.search(r"startup|frontend|ssl|cancel|session_lifecycle", test_id):
             buckets.append("protocol.client_flows")
+        if re.search(r"extended|bind|parse|portal|prepared|parameterized", test_id):
+            buckets.append("protocol.extended_query")
         if re.search(r"parses_|rejects_", test_id):
             buckets.append("sql.parser_features")
         if re.search(r"relational|create_table|insert|select", test_id):
             buckets.append("sql.relational_foundation")
+    if re.search(r"extended|bind|parse|portal|prepared|parameterized", test_id):
+        buckets.append("protocol.extended_query")
     if re.search(r"relational|create_table|insert|select", test_id):
         buckets.append("sql.relational_foundation")
     if re.search(
@@ -47,7 +53,7 @@ def classify(test_id: str) -> list[str]:
         buckets.append("execution.gpu_routing_and_batching")
     if not buckets:
         buckets.append("uncategorized")
-    return buckets
+    return list(dict.fromkeys(buckets))
 
 
 def parse_log(log_path: Path) -> tuple[list[dict], Counter]:

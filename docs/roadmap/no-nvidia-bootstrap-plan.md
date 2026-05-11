@@ -377,11 +377,11 @@ Initial target:
 - Keep unsupported binary formats, copy, function call, and advanced portal behavior explicitly classified.
 
 Exit criteria:
-1. Extended protocol no longer returns the generic "unsupported by compatibility stub" error for the first supported prepared statement/query path.
-2. Prepared statements and portals have session-local lifecycle tests.
-3. psql golden coverage includes at least one extended-query or prepared/parameterized flow that reaches engine execution.
-4. Error responses include stable SQLSTATE/message contracts for unsupported protocol features.
-5. Compatibility scorecard separates simple-query, extended-query, auth/startup, and error-path coverage.
+1. Extended protocol no longer returns the generic "unsupported by compatibility stub" error for the first supported prepared statement/query path. First slice landed on 2026-05-11: the compatibility endpoint accepts `Parse`, `Bind`, `Describe`, `Execute`, `Sync`, and `Close` for text-format `int4`/`text` parameters and text-format relational `SELECT` results.
+2. Prepared statements and portals have session-local lifecycle tests. First helper-level coverage landed on 2026-05-11 for bound parameter substitution and catalog-backed row description; broader end-to-end lifecycle coverage remains open.
+3. psql golden coverage includes at least one extended-query or prepared/parameterized flow that reaches engine execution. Scenario `05_extended_query_bind.sql` was added on 2026-05-11 with `\bind`, `\parse`, and `\bind_named` paths over a relational table; local execution still requires `psql` in the run shell.
+4. Error responses include stable SQLSTATE/message contracts for unsupported protocol features. First slice landed on 2026-05-11 for unsupported parameter/result formats, missing prepared statements, missing portals, mismatched parameter counts, and limited portal fetches; copy/function-call flows remain explicitly unsupported.
+5. Compatibility scorecard separates simple-query, extended-query, auth/startup, and error-path coverage. First `protocol.extended_query` classifier landed on 2026-05-11; finer error-path bucket separation remains open.
 
 ### P4. SQL-to-GPU execution bridge
 

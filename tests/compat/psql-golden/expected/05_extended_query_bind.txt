@@ -1,0 +1,13 @@
+=== extended protocol bind execute ===
+CREATE TABLE
+INSERT 0 3
+ name  | id
+-------+----
+ Linus |  2
+(1 row)
+
+=== extended named prepared lifecycle ===
+ name
+-------
+ Grace
+(1 row)
