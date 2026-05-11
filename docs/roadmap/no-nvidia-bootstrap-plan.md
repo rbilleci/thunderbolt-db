@@ -443,11 +443,11 @@ Initial target:
 - Measure CPU baseline, GPU path, fallback rate, H2D/D2H bytes, kernel time, and total latency/throughput.
 
 Exit criteria:
-1. Benchmarks run reproducibly from a checked-in command/script.
-2. Reports include dataset size, concurrency level, device info, fallback rate, and correctness validation.
-3. At least one benchmark demonstrates a clear GPU advantage or records why the current architecture does not yet achieve one.
-4. Performance results drive a named follow-up decision, such as device-side set/multiset algebra, indexing, batching, or transfer layout work.
-5. Docs record which performance claims are supported and which are not.
+1. Benchmarks run reproducibly from a checked-in command/script. First slice landed on 2026-05-11 with `scripts/run_p7_relational_benchmark.sh`.
+2. Reports include dataset size, concurrency level, device info, fallback rate, and correctness validation. First report landed on 2026-05-11 in `docs/testing/reports/p7-relational-benchmark-2026-05-11.md` with dataset size, concurrency, NVIDIA device info, CPU/GPU-probe latency, qps, fallback rate, transfer counters, kernel-timing counters, and SQL-result correctness validation.
+3. At least one benchmark demonstrates a clear GPU advantage or records why the current architecture does not yet achieve one. First report records no workload-level GPU advantage: analytical scans reach GPU execution but remain slower than CPU, while indexed lookup shapes still record host SQL-finalization fallback.
+4. Performance results drive a named follow-up decision, such as device-side set/multiset algebra, indexing, batching, or transfer layout work. First report names transfer layout, batching, SQL predicate/order/projection pushdown, and CUDA driver timing publication into engine metrics as the next performance decisions.
+5. Docs record which performance claims are supported and which are not. First report limits the supported claim to reproducible routing/correctness measurement and explicitly rejects broad GPU advantage claims for the current relational workload mix.
 
 ## Exit criteria for no-GPU bootstrap phase
 

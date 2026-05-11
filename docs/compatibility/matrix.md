@@ -62,6 +62,7 @@ This matrix makes compatibility intent explicit per delivery phase while preserv
 |---|---:|---:|---:|---|
 | Runtime commit/fallback/flush counters | ✅ | ✅ | ✅ | Includes latest-reason signals |
 | SLO-aligned observability baseline | 🟡 | ✅ | ✅ | Expanded with replication rollout |
+| Relational workload performance proof | 🚫 | 🟡 | ✅ | First P7 report covers an indexed app-style lookup workload and analytical full scan with correctness validation, fallback rates, device info, and CPU/GPU-probe timing; it records no current workload-level GPU advantage claim |
 | Security/compliance control mapping | 🟡 | ✅ | ✅ | See architecture doc 07 |
 | Backup/PITR/DR test gates | 🟡 | 🟡 | ✅ | See architecture doc 08 |
 

@@ -1,6 +1,6 @@
 # Test Report Artifacts
 
-This directory stores reproducible artifacts for parity, durability, replication, and fault-injection runs.
+This directory stores reproducible artifacts for parity, durability, replication, benchmark, and fault-injection runs.
 
 ## Naming
 
@@ -9,6 +9,7 @@ Use UTC timestamps and stream identifiers:
 - `YYYYMMDDTHHMMSSZ-parity-<seed>.md`
 - `YYYYMMDDTHHMMSSZ-durability-<scenario>.md`
 - `YYYYMMDDTHHMMSSZ-replication-<scenario>.md`
+- `YYYY-MM-DD-<milestone>-benchmark-<scenario>.md`
 - `YYYYMMDDTHHMMSSZ-jepsen-<scenario>.md`
 
 ## Minimum report fields
@@ -17,7 +18,7 @@ Each report should include:
 
 1. **Context**
    - git commit SHA
-   - test stream (`parity`, `durability`, `replication`, `jepsen`)
+   - test stream (`parity`, `durability`, `replication`, `benchmark`, `jepsen`)
    - seed/workload profile
 2. **Topology + fault schedule**
    - node layout
