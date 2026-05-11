@@ -3952,6 +3952,20 @@ fn mvcc_read_row_size(row: &MvccReadRow) -> u64 {
         + row.value.as_ref().map_or(0, |value| value.len() as u64)
 }
 
+fn cuda_mvcc_row_batch_transfer_bytes(rows: &[ResolvedMvccRow]) -> u64 {
+    CudaMvccRowBatch::from_key_values_with_metadata(rows.iter().map(|row| {
+        (
+            row.tuple.key.as_bytes(),
+            row.tuple.value.as_bytes(),
+            row.tuple.created_by,
+            row.tuple.deleted_by.unwrap_or(u64::MAX),
+            None,
+        )
+    }))
+    .map(|batch| batch.transfer_bytes() as u64)
+    .unwrap_or(u64::MAX)
+}
+
 fn mvcc_row_matches_filter(row: &ResolvedMvccRow, filter: &MvccReadFilter) -> bool {
     match filter {
         MvccReadFilter::KeyPrefix(prefix) => row.tuple.key.starts_with(prefix),
@@ -7290,6 +7304,7 @@ impl Engine {
             query,
             &backend,
             Some(FallbackReason::GpuMvccReadParityGap),
+            false,
         )
     }
 
@@ -7304,7 +7319,7 @@ impl Engine {
             return self.execute_cuda_native_source_query(query, &backend);
         }
 
-        self.execute_mvcc_query_with_fallback_reason(query, &backend, None)
+        self.execute_mvcc_query_with_fallback_reason(query, &backend, None, true)
     }
 
     #[cfg(test)]
@@ -7313,7 +7328,7 @@ impl Engine {
         query: &MvccReadQuery,
         backend: &B,
     ) -> Result<MvccReadResult, ExecuteError> {
-        self.execute_mvcc_query_with_fallback_reason(query, backend, None)
+        self.execute_mvcc_query_with_fallback_reason(query, backend, None, false)
     }
 
     #[cfg(test)]
@@ -7322,7 +7337,7 @@ impl Engine {
         query: &MvccReadQuery,
         backend: &B,
     ) -> Result<MvccReadResult, ExecuteError> {
-        self.execute_mvcc_query_with_fallback_reason(query, backend, None)
+        self.execute_mvcc_query_with_fallback_reason(query, backend, None, false)
     }
 
     fn execute_mvcc_query_with_fallback_reason<B: MvccExecutionBackend>(
@@ -7330,6 +7345,7 @@ impl Engine {
         query: &MvccReadQuery,
         backend: &B,
         fallback_reason: Option<FallbackReason>,
+        observe_cuda_probe_metrics: bool,
     ) -> Result<MvccReadResult, ExecuteError> {
         if self.repl.role() != Role::Leader {
             return Err(ExecuteError::Engine(EngineError::NotLeader));
@@ -7337,7 +7353,13 @@ impl Engine {
 
         let planned_target = DeviceTarget::Gpu(self.planner.default_gpu_id());
         let rows = resolve_mvcc_source(&self.mvcc_store, &query.source, query.visibility)?;
+        let cuda_h2d_bytes = if observe_cuda_probe_metrics {
+            cuda_mvcc_row_batch_transfer_bytes(&rows)
+        } else {
+            0
+        };
 
+        let cuda_start = observe_cuda_probe_metrics.then(Instant::now);
         let backend_result =
             execute_mvcc_backend_chain(query, rows, backend, &CpuMvccExecutionBackend);
         let result = MvccReadResult {
@@ -7346,6 +7368,9 @@ impl Engine {
             fallback_reason: backend_result.fallback_reason.or(fallback_reason),
             rows: backend_result.rows,
         };
+        if let Some(start) = cuda_start {
+            self.observe_cuda_probe_execution_metrics(&result, cuda_h2d_bytes, start.elapsed());
+        }
         self.observe_mvcc_read_result_metrics(&result);
         Ok(result)
     }
@@ -7361,7 +7386,9 @@ impl Engine {
 
         let planned_target = DeviceTarget::Gpu(self.planner.default_gpu_id());
         let rows = resolve_mvcc_all_versions(&self.mvcc_store, query.visibility)?;
+        let cuda_h2d_bytes = cuda_mvcc_row_batch_transfer_bytes(&rows);
 
+        let cuda_start = Instant::now();
         let backend_result = match &query.source {
             MvccReadSource::KeyBatchLookup { keys } => {
                 execute_cuda_native_key_batch_query(query, keys, rows, backend)
@@ -7437,8 +7464,26 @@ impl Engine {
             fallback_reason: backend_result.fallback_reason,
             rows: backend_result.rows,
         };
+        self.observe_cuda_probe_execution_metrics(&result, cuda_h2d_bytes, cuda_start.elapsed());
         self.observe_mvcc_read_result_metrics(&result);
         Ok(result)
+    }
+
+    fn observe_cuda_probe_execution_metrics(
+        &mut self,
+        result: &MvccReadResult,
+        h2d_bytes: u64,
+        elapsed: Duration,
+    ) {
+        if !matches!(result.executed_target, DeviceTarget::Gpu(_)) {
+            return;
+        }
+
+        if h2d_bytes > 0 {
+            self.metrics.observe_h2d_bytes(h2d_bytes);
+        }
+        self.metrics
+            .observe_kernel_exec_ms(elapsed.as_millis().try_into().unwrap_or(u64::MAX).max(1));
     }
 
     fn observe_mvcc_read_result_metrics(&mut self, result: &MvccReadResult) {
@@ -23182,6 +23227,11 @@ mod tests {
         );
         assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
         assert_eq!(result.fallback_reason, None);
+        let metrics = e.metrics().snapshot();
+        assert!(metrics.h2d_bytes_total > 0);
+        assert!(metrics.d2h_bytes_total > 0);
+        assert_eq!(metrics.kernel_exec_samples, 1);
+        assert!(metrics.kernel_exec_total_ms >= 1);
     }
 
     #[test]

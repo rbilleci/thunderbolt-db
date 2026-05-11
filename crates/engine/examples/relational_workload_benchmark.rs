@@ -124,7 +124,7 @@ fn print_decision(
 
     if analytic.bridge.gpu_executed_count > 0 {
         println!(
-            "decision: analytical scans reach GPU execution but do not yet beat the CPU baseline in this run; prioritize transfer layout, batching, and CUDA timing publication before making broad performance claims."
+            "decision: analytical scans reach GPU execution with SQL-level transfer and timing telemetry but do not yet beat the CPU baseline in this run; prioritize transfer layout, batching, and driver-level timing refinement before making broad performance claims."
         );
         return;
     }

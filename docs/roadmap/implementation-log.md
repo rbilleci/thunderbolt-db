@@ -3,6 +3,7 @@
 ## 2026-05-11
 
 ### PostgreSQL-compatible product loop
+- Advanced P4 SQL-to-GPU bridge telemetry by publishing row-batch H2D bytes and GPU execution timing samples from CUDA-probed MVCC reads into engine metrics when the read actually reports GPU execution. The P7 relational benchmark report now carries non-zero transfer/timing counters for the supported SQL mix while still rejecting a workload-level GPU advantage claim.
 - Advanced P4 SQL-to-GPU execution bridge coverage by parsing top-level `OR` groups in relational `WHERE` clauses while preserving narrow `AND` conjunctions inside each group. Supported literal predicate disjunctions, including parenthesized predicate groups, now lower through a deduplicated disjunctive/ordered key-batch bridge, avoid `GpuMvccReadParityGap` fallback accounting when the MVCC row fetch runs on GPU, and are covered by SQL-level backend-swap, local CUDA, psql golden, and P7 benchmark artifacts.
 - Advanced P4 SQL-to-GPU execution bridge coverage by parsing narrow `AND` conjunctions in relational `WHERE` clauses and lowering supported literal predicate conjunctions through a conjunctive/ordered key-batch bridge. SQL-level backend-swap and local CUDA regressions now prove those conjunctions execute without `GpuMvccReadParityGap` fallback, and the psql golden relational scenario plus P7 benchmark mix include the new shape.
 
