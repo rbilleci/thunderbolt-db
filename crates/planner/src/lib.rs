@@ -75,7 +75,7 @@ impl Planner {
             Command::Select(_) => PlanNode {
                 op: PlannedOp {
                     name: "relational_select".to_string(),
-                    target: DeviceTarget::Cpu,
+                    target: DeviceTarget::Gpu(self.cfg.default_gpu_id),
                 },
                 kind: PlanKind::Read,
             },
@@ -139,6 +139,22 @@ mod tests {
         let node = &plan.nodes()[0];
         assert_eq!(node.kind, PlanKind::Read);
         assert_eq!(node.op.target, DeviceTarget::Cpu);
+    }
+
+    #[test]
+    fn planner_marks_relational_select_as_gpu_targeted() {
+        let planner = Planner::default();
+        let plan = planner.plan_command(&Command::Select(gpu_db_protocol::Select {
+            table: "people".to_string(),
+            projection: gpu_db_protocol::SelectProjection::All,
+            filter: None,
+            order_by: None,
+            limit: None,
+        }));
+
+        let node = &plan.nodes()[0];
+        assert_eq!(node.kind, PlanKind::Read);
+        assert_eq!(node.op.target, DeviceTarget::Gpu(0));
     }
 
     #[test]

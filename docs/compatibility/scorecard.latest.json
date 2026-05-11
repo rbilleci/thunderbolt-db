@@ -9,8 +9,8 @@
     "execution.gpu_routing_and_batching": {
       "failed": 0,
       "ignored": 0,
-      "passed": 57,
-      "total": 57
+      "passed": 59,
+      "total": 59
     },
     "protocol.error_paths": {
       "failed": 0,
@@ -45,14 +45,14 @@
     "sql.gpu_bridge": {
       "failed": 0,
       "ignored": 0,
-      "passed": 2,
-      "total": 2
+      "passed": 3,
+      "total": 3
     },
     "sql.relational_foundation": {
       "failed": 0,
       "ignored": 0,
-      "passed": 11,
-      "total": 11
+      "passed": 13,
+      "total": 13
     },
     "sql.transaction_flows": {
       "failed": 0,
@@ -77,8 +77,8 @@
   "totals": {
     "failed": 0,
     "ignored": 0,
-    "passed": 549,
-    "total": 549
+    "passed": 551,
+    "total": 551
   },
   "trend_hook": {
     "baseline_available": true,

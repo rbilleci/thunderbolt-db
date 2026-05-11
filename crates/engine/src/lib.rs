@@ -6164,11 +6164,19 @@ fn bind_relational_select(
     })
 }
 
-fn relational_select_needs_host_sql_finalization(select: &Select) -> bool {
+fn relational_select_pushes_limit(select: &Select) -> bool {
+    select.limit.is_some() && select.order_by.is_none()
+}
+
+fn relational_select_needs_host_sql_finalization(
+    select: &Select,
+    access_path: &RelationalAccessPath,
+) -> bool {
     !matches!(select.projection, SelectProjection::All)
-        || select.filter.is_some()
+        || (select.filter.is_some()
+            && !matches!(access_path, RelationalAccessPath::EqualityIndex { .. }))
         || select.order_by.is_some()
-        || select.limit.is_some()
+        || (select.limit.is_some() && !relational_select_pushes_limit(select))
 }
 
 impl Engine {
@@ -6806,7 +6814,9 @@ impl Engine {
                 filter: None,
                 order: Some(MvccReadOrder::KeyAsc),
                 projection: MvccProjection::KeyValue,
-                limit: None,
+                limit: relational_select_pushes_limit(select)
+                    .then_some(select.limit)
+                    .flatten(),
             };
             return (
                 query,
@@ -6827,7 +6837,9 @@ impl Engine {
                 ))),
                 order: Some(MvccReadOrder::KeyAsc),
                 projection: MvccProjection::KeyValue,
-                limit: None,
+                limit: relational_select_pushes_limit(select)
+                    .then_some(select.limit)
+                    .flatten(),
             },
             RelationalAccessPath::FullTableScan,
         )
@@ -6877,7 +6889,9 @@ impl Engine {
             .collect();
 
         let mut fallback_reason = mvcc_result.fallback_reason;
-        if fallback_reason.is_none() && relational_select_needs_host_sql_finalization(select) {
+        if fallback_reason.is_none()
+            && relational_select_needs_host_sql_finalization(select, &access_path)
+        {
             fallback_reason = Some(FallbackReason::GpuMvccReadParityGap);
             self.metrics
                 .inc_fallback(FallbackReason::GpuMvccReadParityGap);
@@ -22369,6 +22383,44 @@ mod tests {
     }
 
     #[test]
+    fn relational_sql_equality_predicate_and_limit_push_down_to_gpu_bridge() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO people (id, name) VALUES (1, 'Ada'), (2, 'Linus'), (2, 'Grace')",
+        )
+        .unwrap();
+
+        let Command::Select(select) =
+            parse_command("SELECT * FROM people WHERE id = 2 LIMIT 1").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let result = e
+            .execute_relational_select_with_backend(&select, &FirstCudaSliceParityBackend)
+            .unwrap();
+
+        assert_eq!(
+            result.rows,
+            vec![vec![SqlValue::Int4(2), SqlValue::Text("Linus".to_string())]]
+        );
+        assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.fallback_reason, None);
+        assert_eq!(
+            result.access_path,
+            RelationalAccessPath::EqualityIndex {
+                table: "people".to_string(),
+                column: "id".to_string(),
+                matched_keys: 2,
+            }
+        );
+        assert_eq!(e.status_snapshot().latest_fallback_reason(), None);
+    }
+
+    #[test]
     fn relational_sql_gpu_bridge_report_summarizes_execution_and_fallback_rates() {
         let mut e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
@@ -22428,6 +22480,35 @@ mod tests {
                 vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())],
                 vec![SqlValue::Int4(2), SqlValue::Text("Linus".to_string())],
             ]
+        );
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.fallback_reason, None);
+    }
+
+    #[test]
+    #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
+    fn execute_mvcc_query_cuda_driver_runs_relational_sql_equality_limit_without_fallback() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO people (id, name) VALUES (1, 'Ada'), (2, 'Linus'), (2, 'Grace')",
+        )
+        .unwrap();
+
+        let Command::Select(select) =
+            parse_command("SELECT * FROM people WHERE id = 2 LIMIT 1").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let result = e
+            .execute_relational_select_with_cuda_driver_probe(&select)
+            .unwrap();
+
+        assert_eq!(
+            result.rows,
+            vec![vec![SqlValue::Int4(2), SqlValue::Text("Linus".to_string())]]
         );
         assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
         assert_eq!(result.fallback_reason, None);

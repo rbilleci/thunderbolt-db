@@ -92,7 +92,7 @@ fn print_decision(app: &WorkloadReport, analytic: &WorkloadReport) {
 
     if analytic.bridge.gpu_executed_count > 0 {
         println!(
-            "decision: analytical scans reach GPU execution but do not yet beat the CPU baseline in this run; prioritize transfer layout, batching, and SQL finalization pushdown before making broad performance claims."
+            "decision: analytical scans reach GPU execution but do not yet beat the CPU baseline in this run; prioritize transfer layout, batching, remaining SQL order/projection pushdown, and CUDA timing publication before making broad performance claims."
         );
         return;
     }

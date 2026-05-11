@@ -16,12 +16,12 @@ Environment:
 
 - queries: 16
 - result_rows: 16
-- cpu_total_us: 4894
-- gpu_probe_total_us: 6656925
-- cpu_qps: 3268.81
-- gpu_probe_qps: 2.40
+- cpu_total_us: 5969
+- gpu_probe_total_us: 6716333
+- cpu_qps: 2680.51
+- gpu_probe_qps: 2.38
 - gpu_executed_rate_permyriad: 10000
-- cpu_fallback_rate_permyriad: 10000
+- cpu_fallback_rate_permyriad: 0
 - h2d_bytes_total: 0
 - d2h_bytes_total: 909
 - kernel_exec_samples: 0
@@ -32,10 +32,10 @@ Environment:
 
 - queries: 1
 - result_rows: 1000
-- cpu_total_us: 2371
-- gpu_probe_total_us: 411756
-- cpu_qps: 421.67
-- gpu_probe_qps: 2.43
+- cpu_total_us: 2380
+- gpu_probe_total_us: 434839
+- cpu_qps: 419.99
+- gpu_probe_qps: 2.30
 - gpu_executed_rate_permyriad: 10000
 - cpu_fallback_rate_permyriad: 0
 - h2d_bytes_total: 0
@@ -46,8 +46,8 @@ Environment:
 
 ## Decision
 
-The analytical scan reaches GPU execution and validates correctness, but it does not beat the CPU baseline in this run. The app-shaped indexed lookup workload still records host SQL-finalization fallback even when the underlying MVCC fetch reports GPU execution.
+The indexed lookup and analytical scan workloads both reach GPU execution with no SQL fallback for the current benchmark mix after equality predicate bridge pushdown, but neither workload beats the CPU baseline in this run.
 
 Supported performance claim: current P7 evidence proves reproducible routing and correctness measurement for two relational workload shapes, not workload-level GPU advantage.
 
-Named follow-up: prioritize transfer layout, batching, SQL predicate/order/projection pushdown, and publishing CUDA driver timing into engine metrics before making broad performance claims.
+Named follow-up: prioritize transfer layout, batching, remaining SQL order/projection pushdown, and publishing CUDA driver timing into engine metrics before making broad performance claims.

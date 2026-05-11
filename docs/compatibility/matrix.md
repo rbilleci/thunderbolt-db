@@ -52,7 +52,7 @@ This matrix makes compatibility intent explicit per delivery phase while preserv
 | Deterministic batch ordering | ✅ | ✅ | ✅ | ADR-002 |
 | Device routing abstraction (`DeviceRouter`) | ✅ | ✅ | ✅ | Explicit reasons for fallback |
 | Fallback reason telemetry (`Unavailable`, `QueueSaturated`, `MemoryPressure`, `NotGpuEligible`) | ✅ | ✅ | ✅ | Metrics + tests in place |
-| SQL-to-GPU bridge for relational reads | 🚫 | 🟡 | ✅ | First P4 slice can run plain relational `SELECT * FROM table` row fetches through the MVCC CUDA probe path with SQL-level parity and bridge-rate reporting; SQL predicate/order/projection/limit pushdown remains explicit `GpuMvccReadParityGap` work |
+| SQL-to-GPU bridge for relational reads | 🚫 | 🟡 | ✅ | P4 slices can run plain relational `SELECT * FROM table` row fetches through the MVCC CUDA probe path with SQL-level parity and bridge-rate reporting; supported equality predicates now lower through the relational equality-index `KeyBatchLookup`, and unordered `LIMIT` is pushed into MVCC/CUDA execution. SQL `ORDER BY` and column projection pushdown remain explicit `GpuMvccReadParityGap` work |
 | Production GPU execution kernels for OLTP subset | 🚫 | 🟡 | ✅ | Must preserve deterministic replay |
 | CPU/GPU parity validation harness | 🟡 | 🟡 | ✅ | Detailed plan in `docs/testing/parity-and-jepsen-plan.md` |
 
@@ -62,7 +62,7 @@ This matrix makes compatibility intent explicit per delivery phase while preserv
 |---|---:|---:|---:|---|
 | Runtime commit/fallback/flush counters | ✅ | ✅ | ✅ | Includes latest-reason signals |
 | SLO-aligned observability baseline | 🟡 | ✅ | ✅ | Expanded with replication rollout |
-| Relational workload performance proof | 🚫 | 🟡 | ✅ | First P7 report covers an indexed app-style lookup workload and analytical full scan with correctness validation, fallback rates, device info, and CPU/GPU-probe timing; it records no current workload-level GPU advantage claim |
+| Relational workload performance proof | 🚫 | 🟡 | ✅ | P7 report covers an indexed app-style lookup workload and analytical full scan with correctness validation, fallback rates, device info, and CPU/GPU-probe timing; after equality predicate bridge pushdown the current benchmark mix records 0% SQL fallback, but still no workload-level GPU advantage claim |
 | Security/compliance control mapping | 🟡 | ✅ | ✅ | See architecture doc 07 |
 | Backup/PITR/DR test gates | 🟡 | 🟡 | ✅ | See architecture doc 08 |
 
