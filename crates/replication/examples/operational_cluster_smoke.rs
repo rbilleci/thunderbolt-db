@@ -1,9 +1,9 @@
 use std::time::Duration;
 
 use gpu_db_replication::{
-    AppendEntriesRequest, LogReplicator, OperationalClusterSmokeReport,
-    OperationalDeploymentPreflightReport, OperationalTransportSmokeReport, RaftReplicator,
-    ReplicatedStateMachine,
+    send_append_entries_once, serve_append_entries_once, AppendEntriesRequest, LogReplicator,
+    OperationalClusterSmokeReport, OperationalDeploymentPreflightReport,
+    OperationalTransportSmokeReport, RaftReplicator, ReplicatedStateMachine,
 };
 use gpu_db_types::{EngineError, Index, LogEntry, Role, Term};
 
@@ -49,6 +49,39 @@ fn append_entries(
         leader_commit,
     }
     .apply_to(follower);
+    if response.accepted {
+        Ok(())
+    } else {
+        Err(EngineError::ProposalFailed(
+            response
+                .error
+                .unwrap_or_else(|| "append entries rejected".to_string()),
+        ))
+    }
+}
+
+fn append_entries_over_tcp(
+    follower: &mut RaftReplicator,
+    request: AppendEntriesRequest,
+) -> Result<(), EngineError> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")
+        .map_err(|err| EngineError::ProposalFailed(format!("append entries bind failed: {err}")))?;
+    let addr = listener
+        .local_addr()
+        .map_err(|err| EngineError::ProposalFailed(format!("append entries addr failed: {err}")))?;
+    let timeout = Duration::from_millis(250);
+    let response = std::thread::scope(|scope| {
+        let server = scope.spawn(|| serve_append_entries_once(&listener, follower, timeout));
+        let client = send_append_entries_once(addr, &request, timeout);
+        let server_response = server.join().map_err(|_| {
+            EngineError::ProposalFailed("append entries server panicked".to_string())
+        })??;
+        client.map(|client_response| {
+            assert_eq!(client_response, server_response);
+            client_response
+        })
+    })?;
+
     if response.accepted {
         Ok(())
     } else {
@@ -148,13 +181,15 @@ fn main() -> Result<(), EngineError> {
     }];
 
     append_batches_sent += 1;
-    append_entries(
+    append_entries_over_tcp(
         &mut follower_b,
-        term_two,
-        second.index,
-        term_one,
-        failover_entry,
-        follower_a.commit_index(),
+        AppendEntriesRequest {
+            leader_term: term_two,
+            prev_log_index: second.index,
+            prev_log_term: term_one,
+            entries: failover_entry,
+            leader_commit: follower_a.commit_index(),
+        },
     )?;
     follower_a.register_follower_ack(third.index, 2);
     follower_acks_recorded += 1;
@@ -190,12 +225,12 @@ fn main() -> Result<(), EngineError> {
     let report = OperationalDeploymentPreflightReport {
         smoke,
         transport: OperationalTransportSmokeReport {
-            transport_scope: "in_memory_append_entries",
+            transport_scope: "single_request_tcp_append_entries",
             append_batches_sent,
             heartbeat_batches_sent,
             follower_acks_recorded,
         },
-        network_transport_implemented: false,
+        network_transport_implemented: true,
         automatic_election_implemented: false,
         packaged_deployment_implemented: false,
     };

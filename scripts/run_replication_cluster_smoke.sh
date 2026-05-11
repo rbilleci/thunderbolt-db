@@ -11,8 +11,8 @@ required_lines=(
   "operational_replication_smoke=passed"
   "operational_deployment_preflight=passed"
   "deployment_scope=in_process_three_node_raft_smoke"
-  "deployment_transport=in_memory_append_entries append_batches_sent=3 heartbeat_batches_sent=2 follower_acks_recorded=3"
-  "deployment_gap_network_transport=missing"
+  "deployment_transport=single_request_tcp_append_entries append_batches_sent=3 heartbeat_batches_sent=2 follower_acks_recorded=3"
+  "deployment_gap_network_transport=implemented"
   "deployment_gap_automatic_election=missing"
   "deployment_gap_packaged_deployment=missing"
 )

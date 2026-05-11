@@ -1,4 +1,9 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io::{Read, Write},
+    net::{Shutdown, SocketAddr, TcpListener, TcpStream},
+    time::Duration,
+};
 
 use gpu_db_types::{CommitToken, EngineError, Index, LogEntry, Role, SnapshotMeta, Term};
 
@@ -313,6 +318,64 @@ impl AppendEntriesResponse {
             error,
         })
     }
+}
+
+pub fn send_append_entries_once(
+    addr: SocketAddr,
+    request: &AppendEntriesRequest,
+    timeout: Duration,
+) -> Result<AppendEntriesResponse, EngineError> {
+    let mut stream = TcpStream::connect(addr).map_err(|err| {
+        EngineError::ProposalFailed(format!("append entries connect failed: {err}"))
+    })?;
+    stream.set_read_timeout(Some(timeout)).map_err(|err| {
+        EngineError::ProposalFailed(format!("append entries set read timeout failed: {err}"))
+    })?;
+    stream.set_write_timeout(Some(timeout)).map_err(|err| {
+        EngineError::ProposalFailed(format!("append entries set write timeout failed: {err}"))
+    })?;
+    stream
+        .write_all(&request.encode_frame())
+        .map_err(|err| EngineError::ProposalFailed(format!("append entries send failed: {err}")))?;
+    stream.shutdown(Shutdown::Write).map_err(|err| {
+        EngineError::ProposalFailed(format!("append entries request shutdown failed: {err}"))
+    })?;
+
+    let mut response_frame = Vec::new();
+    stream.read_to_end(&mut response_frame).map_err(|err| {
+        EngineError::ProposalFailed(format!("append entries receive failed: {err}"))
+    })?;
+    AppendEntriesResponse::decode_frame(&response_frame)
+}
+
+pub fn serve_append_entries_once(
+    listener: &TcpListener,
+    follower: &mut RaftReplicator,
+    timeout: Duration,
+) -> Result<AppendEntriesResponse, EngineError> {
+    listener.set_nonblocking(false).map_err(|err| {
+        EngineError::ProposalFailed(format!("append entries listener setup failed: {err}"))
+    })?;
+    let (mut socket, _) = listener.accept().map_err(|err| {
+        EngineError::ProposalFailed(format!("append entries accept failed: {err}"))
+    })?;
+    socket.set_read_timeout(Some(timeout)).map_err(|err| {
+        EngineError::ProposalFailed(format!("append entries set read timeout failed: {err}"))
+    })?;
+    socket.set_write_timeout(Some(timeout)).map_err(|err| {
+        EngineError::ProposalFailed(format!("append entries set write timeout failed: {err}"))
+    })?;
+
+    let mut request_frame = Vec::new();
+    socket.read_to_end(&mut request_frame).map_err(|err| {
+        EngineError::ProposalFailed(format!("append entries receive failed: {err}"))
+    })?;
+    let request = AppendEntriesRequest::decode_frame(&request_frame)?;
+    let response = request.apply_to(follower);
+    socket.write_all(&response.encode_frame()).map_err(|err| {
+        EngineError::ProposalFailed(format!("append entries response send failed: {err}"))
+    })?;
+    Ok(response)
 }
 
 fn write_u64(out: &mut Vec<u8>, value: u64) {
@@ -1693,12 +1756,12 @@ mod tests {
         let report = OperationalDeploymentPreflightReport {
             smoke,
             transport: OperationalTransportSmokeReport {
-                transport_scope: "in_memory_append_entries",
+                transport_scope: "single_request_tcp_append_entries",
                 append_batches_sent,
                 heartbeat_batches_sent,
                 follower_acks_recorded,
             },
-            network_transport_implemented: false,
+            network_transport_implemented: true,
             automatic_election_implemented: false,
             packaged_deployment_implemented: false,
         };
@@ -1710,10 +1773,10 @@ mod tests {
                 "promoted_leader_term=2 promoted_leader_commit=3 follower_commit=3 follower_applied=3 follower_caught_up=true".to_string(),
                 "follower_read_after_apply=create table t(id int) | insert into t values (1) | insert into t values (2)".to_string(),
                 "failover_admission_gate=old_leader_not_leader promoted_node_role=Leader".to_string(),
-                "deployment_transport=in_memory_append_entries append_batches_sent=3 heartbeat_batches_sent=2 follower_acks_recorded=3".to_string(),
+                "deployment_transport=single_request_tcp_append_entries append_batches_sent=3 heartbeat_batches_sent=2 follower_acks_recorded=3".to_string(),
                 "operational_deployment_preflight=passed".to_string(),
                 "deployment_scope=in_process_three_node_raft_smoke".to_string(),
-                "deployment_gap_network_transport=missing".to_string(),
+                "deployment_gap_network_transport=implemented".to_string(),
                 "deployment_gap_automatic_election=missing".to_string(),
                 "deployment_gap_packaged_deployment=missing".to_string(),
             ]
@@ -1823,12 +1886,13 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             let mut follower = RaftReplicator::new(3);
-            let (mut socket, _) = listener.accept().unwrap();
-            let mut request_frame = Vec::new();
-            std::io::Read::read_to_end(&mut socket, &mut request_frame).unwrap();
-            let request = AppendEntriesRequest::decode_frame(&request_frame).unwrap();
-            let response = request.apply_to(&mut follower);
-            std::io::Write::write_all(&mut socket, &response.encode_frame()).unwrap();
+            let response = serve_append_entries_once(
+                &listener,
+                &mut follower,
+                std::time::Duration::from_millis(250),
+            )
+            .unwrap();
+            assert!(response.accepted);
             follower.commit_index()
         });
 
@@ -1843,13 +1907,9 @@ mod tests {
             }],
             leader_commit: 1,
         };
-        let mut stream = std::net::TcpStream::connect(addr).unwrap();
-        std::io::Write::write_all(&mut stream, &request.encode_frame()).unwrap();
-        stream.shutdown(std::net::Shutdown::Write).unwrap();
-
-        let mut response_frame = Vec::new();
-        std::io::Read::read_to_end(&mut stream, &mut response_frame).unwrap();
-        let response = AppendEntriesResponse::decode_frame(&response_frame).unwrap();
+        let response =
+            send_append_entries_once(addr, &request, std::time::Duration::from_millis(250))
+                .unwrap();
         assert!(response.accepted);
         assert_eq!(response.follower_term, 3);
         assert_eq!(response.follower_commit_index, 1);

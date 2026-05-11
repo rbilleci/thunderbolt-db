@@ -116,12 +116,12 @@ Failure criteria:
 Current implemented scope:
 
 - `scripts/run_replication_cluster_smoke.sh` runs an in-process 3-node Raft smoke scenario.
-- The scenario demonstrates leader write admission, typed append-entries request/response handling with a tested binary frame codec and localhost TCP loopback proof, follower catch-up, read-after-apply, old-leader `NotLeader` rejection after failover, and continued writes on the promoted leader.
-- The same command emits an `operational_deployment_preflight=passed` line only when the smoke proof passes and the current in-memory append-entries transport evidence plus deployment scope/gaps are explicitly reported.
+- The scenario demonstrates leader write admission, typed append-entries request/response handling with a tested binary frame codec and single-request TCP send/serve helper, follower catch-up, read-after-apply, old-leader `NotLeader` rejection after failover, and continued writes on the promoted leader.
+- The same command emits an `operational_deployment_preflight=passed` line only when the smoke proof passes and the current TCP append-entries transport evidence plus deployment scope/gaps are explicitly reported.
 
 Current simulated/not-yet-implemented scope:
 
-- No packaged network transport between node processes; only append-entries frame encoding and localhost TCP loopback proof exist.
+- No packaged multi-process node deployment; only the single-request append-entries TCP helper is implemented.
 - No automatic election or membership reconfiguration.
 - No packaged container/Kubernetes deployment harness.
 
@@ -136,12 +136,12 @@ Pass criteria:
 - Output includes `operational_replication_smoke=passed`.
 - Output includes `operational_deployment_preflight=passed`.
 - Output includes `deployment_scope=in_process_three_node_raft_smoke`.
-- Output includes `deployment_transport=in_memory_append_entries` with append batch, heartbeat batch, and follower-ack counts.
+- Output includes `deployment_transport=single_request_tcp_append_entries` with append batch, heartbeat batch, and follower-ack counts.
 - Follower output reports `follower_caught_up=true`.
 - `follower_read_after_apply` includes the post-failover write.
 - `promoted_leader_commit`, `follower_commit`, and `follower_applied` are equal.
 - `failover_admission_gate` reports old-leader write rejection and `promoted_node_role=Leader`.
-- `deployment_gap_network_transport`, `deployment_gap_automatic_election`, and `deployment_gap_packaged_deployment` are present and currently report `missing`.
+- `deployment_gap_network_transport` reports `implemented`; `deployment_gap_automatic_election` and `deployment_gap_packaged_deployment` are present and currently report `missing`.
 
 ## 5) CPU Fallback Monitoring (No-GPU bootstrap)
 
