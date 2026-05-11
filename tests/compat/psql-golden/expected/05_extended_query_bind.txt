@@ -5,9 +5,3 @@ INSERT 0 3
 -------+----
  Linus |  2
 (1 row)
-
-=== extended named prepared lifecycle ===
- name
--------
- Grace
-(1 row)

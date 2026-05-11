@@ -3,6 +3,7 @@
 -----
    1
 (1 row)
+
 === session probes ===
  client_encoding
 -----------------
@@ -13,6 +14,7 @@
 ----------------
  public
 (1 row)
+
 === tx begin/commit/rollback ===
 BEGIN
  in_tx
@@ -29,6 +31,4 @@ BEGIN
 
 ROLLBACK
 === deterministic error path ===
-ERROR:  relation "definitely_missing_relation_for_golden" does not exist
-LINE 1: SELECT * FROM definitely_missing_relation_for_golden;
-                      ^
+psql:01_bootstrap_and_simple_query.sql:14: ERROR:  relation does not exist

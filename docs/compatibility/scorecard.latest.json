@@ -12,6 +12,12 @@
       "passed": 68,
       "total": 68
     },
+    "protocol.client_flows": {
+      "failed": 0,
+      "ignored": 0,
+      "passed": 2,
+      "total": 2
+    },
     "protocol.error_paths": {
       "failed": 0,
       "ignored": 0,
@@ -21,8 +27,8 @@
     "protocol.extended_query": {
       "failed": 0,
       "ignored": 0,
-      "passed": 45,
-      "total": 45
+      "passed": 47,
+      "total": 47
     },
     "replication.operational_cluster": {
       "failed": 0,
@@ -39,8 +45,8 @@
     "sql.catalog_schema_types": {
       "failed": 0,
       "ignored": 0,
-      "passed": 5,
-      "total": 5
+      "passed": 6,
+      "total": 6
     },
     "sql.gpu_bridge": {
       "failed": 0,
@@ -51,8 +57,8 @@
     "sql.relational_foundation": {
       "failed": 0,
       "ignored": 0,
-      "passed": 24,
-      "total": 24
+      "passed": 27,
+      "total": 27
     },
     "sql.transaction_flows": {
       "failed": 0,
@@ -77,8 +83,8 @@
   "totals": {
     "failed": 0,
     "ignored": 0,
-    "passed": 577,
-    "total": 577
+    "passed": 584,
+    "total": 584
   },
   "trend_hook": {
     "baseline_available": true,
@@ -86,6 +92,7 @@
     "bucket_failed_delta": {
       "durability.invariants": 0,
       "execution.gpu_routing_and_batching": 0,
+      "protocol.client_flows": 0,
       "protocol.error_paths": 0,
       "protocol.extended_query": 0,
       "replication.operational_cluster": 0,

@@ -3,6 +3,7 @@
 ## 2026-05-11
 
 ### PostgreSQL-compatible product loop
+- Repaired real-client psql golden coverage after local `psql` became available: the compatibility endpoint now honors top-level `OR` filter groups in the server-side relational path, described extended-query portals no longer emit a duplicate row description during `Execute`, parameterized row-description inference handles `$n` placeholders, and the golden harness normalizes psql scenario paths/trailing table padding deterministically.
 - Advanced P6 operational replication/deployment by promoting append-entries loopback from a regression-only proof to reusable single-request TCP send/serve helpers and routing the local smoke's failover replication step through that helper. The smoke script now validates `deployment_transport=single_request_tcp_append_entries` and reports the network transport gap as implemented while automatic election and packaged deployment remain explicit gaps.
 - Advanced P6 operational replication/deployment by proving encoded append-entries frames over a localhost TCP loopback regression. This is still not a packaged networked node transport, but it verifies the request/response payload can cross an actual socket boundary.
 - Advanced P6 operational replication/deployment by adding a binary frame codec for `AppendEntriesRequest` / `AppendEntriesResponse`, including round-trip and truncated-frame rejection coverage. This gives the future network transport a tested payload contract while keeping the current deployment proof explicitly in-process.

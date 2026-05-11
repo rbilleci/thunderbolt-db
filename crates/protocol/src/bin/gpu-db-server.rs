@@ -67,6 +67,57 @@ fn select_filter_matches(left: &SqlValue, op: SelectFilterOp, right: &SqlValue) 
     }
 }
 
+fn row_matches_select_filters(
+    table: &Table,
+    row: &[SqlValue],
+    select: &gpu_db_protocol::Select,
+) -> Result<bool, ErrorField> {
+    let filter_groups = if select.filter_groups.is_empty() {
+        if select.filters.is_empty() {
+            select
+                .filter
+                .iter()
+                .cloned()
+                .map(|filter| vec![filter])
+                .collect::<Vec<_>>()
+        } else {
+            vec![select.filters.clone()]
+        }
+    } else {
+        select.filter_groups.clone()
+    };
+
+    if filter_groups.is_empty() {
+        return Ok(true);
+    }
+
+    for filters in filter_groups {
+        let mut group_matches = true;
+        for filter in filters {
+            let Some(idx) = table
+                .columns
+                .iter()
+                .position(|column| column.def.name == filter.column)
+            else {
+                return Err(ErrorField {
+                    code: "42703",
+                    message: "column does not exist",
+                    position: None,
+                });
+            };
+            if !select_filter_matches(&row[idx], filter.op, &filter.value) {
+                group_matches = false;
+                break;
+            }
+        }
+        if group_matches {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
 fn format_sql_value(value: &SqlValue) -> String {
     match value {
         SqlValue::Int4(value) => value.to_string(),
@@ -144,6 +195,7 @@ struct Portal {
     statement_name: String,
     query: PreparedQuery,
     parameters: Vec<Option<String>>,
+    described: bool,
 }
 
 const FIRST_USER_RELATION_OID: u32 = 16_384;
@@ -200,9 +252,9 @@ fn handle_client(mut stream: TcpStream) -> io::Result<()> {
             return Ok(());
         };
 
-        match parse_frontend_message(&frame)
-            .map_err(|error| io::Error::new(ErrorKind::InvalidData, error.to_string()))?
-        {
+        let message = parse_frontend_message(&frame)
+            .map_err(|error| io::Error::new(ErrorKind::InvalidData, error.to_string()))?;
+        match message {
             FrontendMessage::SimpleQuery(query) => {
                 run_simple_query(&mut stream, &mut session, &query)?
             }
@@ -233,7 +285,7 @@ fn handle_client(mut stream: TcpStream) -> io::Result<()> {
                 result_format_codes,
             )?,
             FrontendMessage::Describe { target, name } => {
-                handle_describe(&mut stream, &session, target, &name)?
+                handle_describe(&mut stream, &mut session, target, &name)?
             }
             FrontendMessage::Execute {
                 portal_name,
@@ -372,7 +424,7 @@ fn run_simple_query(stream: &mut TcpStream, session: &mut Session, query: &str) 
     }
 
     for statement in statements {
-        execute_statement(stream, session, statement)?;
+        execute_statement(stream, session, statement, true)?;
     }
 
     write_ready_for_query(stream, session.in_transaction)
@@ -466,6 +518,7 @@ fn handle_bind(
             statement_name,
             query: query.clone(),
             parameters: decoded,
+            described: false,
         },
     );
     write_bind_complete(stream)
@@ -473,7 +526,7 @@ fn handle_bind(
 
 fn handle_describe(
     stream: &mut TcpStream,
-    session: &Session,
+    session: &mut Session,
     target: DescribeTarget,
     name: &str,
 ) -> io::Result<()> {
@@ -518,7 +571,11 @@ fn handle_describe(
                 );
             };
             if let Some(columns) = describe_query_columns(session, &bound_query) {
-                write_row_description(stream, &columns)
+                write_row_description(stream, &columns)?;
+                if let Some(portal) = session.portals.get_mut(name) {
+                    portal.described = true;
+                }
+                Ok(())
             } else {
                 write_no_data(stream)
             }
@@ -552,6 +609,7 @@ fn handle_execute(
             },
         );
     };
+    let include_row_description = !portal.described;
     let Some(bound_query) = bind_query_parameters(&portal.query, &portal.parameters) else {
         return write_error(
             stream,
@@ -562,7 +620,7 @@ fn handle_execute(
             },
         );
     };
-    execute_statement(stream, session, &bound_query)
+    execute_statement(stream, session, &bound_query, include_row_description)
 }
 
 fn handle_close(
@@ -579,6 +637,7 @@ fn execute_statement(
     stream: &mut TcpStream,
     session: &mut Session,
     statement: &str,
+    include_row_description: bool,
 ) -> io::Result<()> {
     if let Ok(command) = parse_command(statement) {
         match command {
@@ -732,28 +791,13 @@ fn execute_statement(
                         selected
                     }
                 };
-                let mut rows = table.rows.clone();
-                let filters = if select.filters.is_empty() {
-                    select.filter.iter().collect::<Vec<_>>()
-                } else {
-                    select.filters.iter().collect::<Vec<_>>()
-                };
-                for filter in filters {
-                    let Some(idx) = table
-                        .columns
-                        .iter()
-                        .position(|column| column.def.name == filter.column)
-                    else {
-                        return write_error(
-                            stream,
-                            &ErrorField {
-                                code: "42703",
-                                message: "column does not exist",
-                                position: None,
-                            },
-                        );
-                    };
-                    rows.retain(|row| select_filter_matches(&row[idx], filter.op, &filter.value));
+                let mut rows = Vec::new();
+                for row in &table.rows {
+                    match row_matches_select_filters(table, row, &select) {
+                        Ok(true) => rows.push(row.clone()),
+                        Ok(false) => {}
+                        Err(error) => return write_error(stream, &error),
+                    }
                 }
                 if let Some(order) = &select.order_by {
                     let Some(idx) = table
@@ -804,7 +848,7 @@ fn execute_statement(
                             .collect::<Vec<_>>()
                     })
                     .collect::<Vec<_>>();
-                return write_single_row(stream, &columns, &output_rows);
+                return write_select_rows(stream, &columns, &output_rows, include_row_description);
             }
             Command::Begin
             | Command::Commit { .. }
@@ -1111,12 +1155,12 @@ fn sql_quote_text(value: &str) -> String {
 }
 
 fn describe_query_columns(session: &Session, query: &str) -> Option<Vec<Column>> {
-    let command = parse_command(query).ok()?;
-    let Command::Select(select) = command else {
-        return None;
+    let (table_name, projection) = match parse_command(query).ok() {
+        Some(Command::Select(select)) => (select.table, select.projection),
+        _ => describe_parameterized_select_shape(query)?,
     };
-    let table = session.tables.get(&select.table)?;
-    let selected_columns = match select.projection {
+    let table = session.tables.get(&table_name)?;
+    let selected_columns = match projection {
         SelectProjection::All => table.columns.clone(),
         SelectProjection::Columns(columns) => {
             let mut selected = Vec::with_capacity(columns.len());
@@ -1139,6 +1183,33 @@ fn describe_query_columns(session: &Session, query: &str) -> Option<Vec<Column>>
             })
             .collect(),
     )
+}
+
+fn describe_parameterized_select_shape(query: &str) -> Option<(String, SelectProjection)> {
+    let canonical = canonical_sql(query);
+    let select_rest = canonical.strip_prefix("select ")?;
+    let from_pos = select_rest.find(" from ")?;
+    let projection_sql = select_rest[..from_pos].trim();
+    let after_from = select_rest[from_pos + " from ".len()..].trim_start();
+    let table = after_from
+        .split_whitespace()
+        .next()?
+        .trim_matches('"')
+        .to_string();
+    if table.is_empty() {
+        return None;
+    }
+    if projection_sql == "*" {
+        return Some((table, SelectProjection::All));
+    }
+    let columns = projection_sql
+        .split(',')
+        .map(|column| column.trim().trim_matches('"').to_string())
+        .collect::<Vec<_>>();
+    if columns.is_empty() || columns.iter().any(String::is_empty) {
+        return None;
+    }
+    Some((table, SelectProjection::Columns(columns)))
 }
 
 fn catalog_attribute_query_table(canonical: &str) -> Option<String> {
@@ -1288,7 +1359,18 @@ fn write_single_row(
     columns: &[Column],
     rows: &[Vec<Option<String>>],
 ) -> io::Result<()> {
-    write_row_description(stream, columns)?;
+    write_select_rows(stream, columns, rows, true)
+}
+
+fn write_select_rows(
+    stream: &mut TcpStream,
+    columns: &[Column],
+    rows: &[Vec<Option<String>>],
+    include_row_description: bool,
+) -> io::Result<()> {
+    if include_row_description {
+        write_row_description(stream, columns)?;
+    }
     for row in rows {
         write_data_row(stream, row)?;
     }
@@ -1554,6 +1636,93 @@ mod tests {
     }
 
     #[test]
+    fn row_filtering_honors_disjunctive_select_groups() {
+        let table = Table {
+            oid: FIRST_USER_RELATION_OID,
+            name: "people".to_string(),
+            columns: vec![
+                CatalogColumn {
+                    attnum: 1,
+                    def: gpu_db_protocol::ColumnDef {
+                        name: "id".to_string(),
+                        ty: gpu_db_protocol::SqlType::Int4,
+                    },
+                },
+                CatalogColumn {
+                    attnum: 2,
+                    def: gpu_db_protocol::ColumnDef {
+                        name: "name".to_string(),
+                        ty: gpu_db_protocol::SqlType::Text,
+                    },
+                },
+            ],
+            rows: Vec::new(),
+        };
+        let Command::Select(select) =
+            parse_command("SELECT id, name FROM people WHERE (id = 1) OR (name = 'Grace')")
+                .unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+
+        assert!(row_matches_select_filters(
+            &table,
+            &[SqlValue::Int4(1), SqlValue::Text("Ada".to_string())],
+            &select,
+        )
+        .unwrap());
+        assert!(row_matches_select_filters(
+            &table,
+            &[SqlValue::Int4(3), SqlValue::Text("Grace".to_string())],
+            &select,
+        )
+        .unwrap());
+        assert!(!row_matches_select_filters(
+            &table,
+            &[SqlValue::Int4(2), SqlValue::Text("Linus".to_string())],
+            &select,
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn describe_query_columns_handles_parameterized_select_shapes() {
+        let mut session = Session::default();
+        session.tables.insert(
+            "people".to_string(),
+            Table {
+                oid: FIRST_USER_RELATION_OID,
+                name: "people".to_string(),
+                columns: vec![
+                    CatalogColumn {
+                        attnum: 1,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "id".to_string(),
+                            ty: gpu_db_protocol::SqlType::Int4,
+                        },
+                    },
+                    CatalogColumn {
+                        attnum: 2,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "name".to_string(),
+                            ty: gpu_db_protocol::SqlType::Text,
+                        },
+                    },
+                ],
+                rows: Vec::new(),
+            },
+        );
+
+        assert_eq!(
+            describe_query_columns(
+                &session,
+                "SELECT name, id FROM people WHERE id = $1 ORDER BY name DESC LIMIT 1",
+            ),
+            Some(vec![text_column("name"), int4_column("id")])
+        );
+    }
+
+    #[test]
     fn extended_parameter_binding_substitutes_text_and_int_literals() {
         let query = PreparedQuery {
             query: "SELECT id, name FROM people WHERE id = $1 ORDER BY name LIMIT $2".to_string(),
@@ -1621,6 +1790,7 @@ mod tests {
                 statement_name: "lookup".to_string(),
                 query: query.clone(),
                 parameters: vec![Some("1".to_string())],
+                described: false,
             },
         );
         session.portals.insert(
@@ -1629,6 +1799,7 @@ mod tests {
                 statement_name: "other".to_string(),
                 query: query.clone(),
                 parameters: vec![Some("2".to_string())],
+                described: false,
             },
         );
 

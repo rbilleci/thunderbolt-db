@@ -88,10 +88,13 @@ normalize() {
   # Keep output deterministic across environments and psql versions.
   sed -E \
     -e 's/[[:space:]]+$//' \
+    -e 's#^psql:.*/tests/compat/psql-golden/scenarios/#psql:#' \
     -e '/^$/N;/^\n$/D' \
     -e '/^Time: [0-9.]+ ms$/d' \
     -e '/^SSL connection \(.+\)$/d' \
-    -e '/^psql \([0-9.]+\).*$/d'
+    -e '/^psql \([0-9.]+\).*$/d' \
+    | perl -pe 's/[ \t\r]+$//' \
+    | awk '{ lines[NR] = $0 } END { end = NR; while (end > 0 && lines[end] == "") end--; for (i = 1; i <= end; i++) print lines[i] }'
 }
 
 wait_for_endpoint() {
