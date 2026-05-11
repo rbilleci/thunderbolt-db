@@ -43,8 +43,8 @@ This matrix makes compatibility intent explicit per delivery phase while preserv
 | `LocalReplicator` leader/follower role gates | ✅ | ✅ | ✅ | Followers reject writes |
 | Commit/applied watermark tracking | ✅ | ✅ | ✅ | Snapshot metadata hooks present |
 | Raft replicator scaffolding interface | 🟡 | ✅ | ✅ | Interface-first before full deployment |
-| 3-node Raft operation + catch-up | 🚫 | 🟡 | ✅ | First P6 slice adds a reproducible local in-process 3-node smoke harness proving leader write, follower catch-up, and read-after-apply; `OperationalClusterSmokeReport` now emits stable pass/fail plus commit/apply/caught-up evidence; networked deployment transport remains open |
-| Failover readiness basics | 🚫 | 🟡 | ✅ | First P6 smoke path covers old-leader write rejection after leader transition and new-leader continuation; the operator report requires matching promoted-leader/follower commit/apply indexes, old-leader rejection, and promoted-node `Leader` role; automatic election remains open |
+| 3-node Raft operation + catch-up | 🚫 | 🟡 | ✅ | First P6 slice adds a reproducible local in-process 3-node smoke harness proving leader write, follower catch-up, and read-after-apply; `OperationalDeploymentPreflightReport` now emits stable pass/fail, commit/apply/caught-up evidence, scope, and explicit deployment-gap lines; networked deployment transport remains open |
+| Failover readiness basics | 🚫 | 🟡 | ✅ | First P6 smoke path covers old-leader write rejection after leader transition and new-leader continuation; the operator report requires matching promoted-leader/follower commit/apply indexes, old-leader rejection, and promoted-node `Leader` role; automatic election remains open and is reported as a deployment gap |
 
 ## CPU/GPU Execution
 

@@ -1,7 +1,8 @@
 use std::time::Duration;
 
 use gpu_db_replication::{
-    LogReplicator, OperationalClusterSmokeReport, RaftReplicator, ReplicatedStateMachine,
+    LogReplicator, OperationalClusterSmokeReport, OperationalDeploymentPreflightReport,
+    RaftReplicator, ReplicatedStateMachine,
 };
 use gpu_db_types::{EngineError, Index, LogEntry, Role, Term};
 
@@ -154,7 +155,7 @@ fn main() -> Result<(), EngineError> {
     assert!(follower_b.progress().is_caught_up());
     assert_eq!(follower_a.status_snapshot().live.role, Role::Leader);
 
-    let report = OperationalClusterSmokeReport {
+    let smoke = OperationalClusterSmokeReport {
         promoted_leader_term: follower_a.current_term(),
         promoted_leader_commit_index: follower_a.commit_index(),
         follower_commit_index: follower_b.commit_index(),
@@ -163,6 +164,12 @@ fn main() -> Result<(), EngineError> {
         follower_read_after_apply: state_b.values,
         old_leader_rejected_after_failover,
         promoted_node_role: follower_a.role(),
+    };
+    let report = OperationalDeploymentPreflightReport {
+        smoke,
+        network_transport_implemented: false,
+        automatic_election_implemented: false,
+        packaged_deployment_implemented: false,
     };
     assert!(report.readiness_passed());
     for line in report.to_operator_lines() {

@@ -112,6 +112,60 @@ impl OperationalClusterSmokeReport {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationalDeploymentPreflightReport {
+    pub smoke: OperationalClusterSmokeReport,
+    pub network_transport_implemented: bool,
+    pub automatic_election_implemented: bool,
+    pub packaged_deployment_implemented: bool,
+}
+
+impl OperationalDeploymentPreflightReport {
+    pub fn readiness_passed(&self) -> bool {
+        self.smoke.readiness_passed()
+    }
+
+    pub fn to_operator_lines(&self) -> Vec<String> {
+        let mut lines = self.smoke.to_operator_lines();
+        lines.extend([
+            format!(
+                "operational_deployment_preflight={}",
+                if self.readiness_passed() {
+                    "passed"
+                } else {
+                    "failed"
+                }
+            ),
+            "deployment_scope=in_process_three_node_raft_smoke".to_string(),
+            format!(
+                "deployment_gap_network_transport={}",
+                if self.network_transport_implemented {
+                    "implemented"
+                } else {
+                    "missing"
+                }
+            ),
+            format!(
+                "deployment_gap_automatic_election={}",
+                if self.automatic_election_implemented {
+                    "implemented"
+                } else {
+                    "missing"
+                }
+            ),
+            format!(
+                "deployment_gap_packaged_deployment={}",
+                if self.packaged_deployment_implemented {
+                    "implemented"
+                } else {
+                    "missing"
+                }
+            ),
+        ]);
+        lines
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ReplicationStatusInvariantError {
     #[error("live progress is invalid: {0}")]
@@ -1350,7 +1404,7 @@ mod tests {
         assert!(follower_b.progress().is_caught_up());
         assert_eq!(follower_a.status_snapshot().live.role, Role::Leader);
 
-        let report = OperationalClusterSmokeReport {
+        let smoke = OperationalClusterSmokeReport {
             promoted_leader_term: follower_a.current_term(),
             promoted_leader_commit_index: follower_a.commit_index(),
             follower_commit_index: follower_b.commit_index(),
@@ -1360,6 +1414,13 @@ mod tests {
             old_leader_rejected_after_failover,
             promoted_node_role: follower_a.role(),
         };
+        assert!(smoke.readiness_passed());
+        let report = OperationalDeploymentPreflightReport {
+            smoke,
+            network_transport_implemented: false,
+            automatic_election_implemented: false,
+            packaged_deployment_implemented: false,
+        };
         assert!(report.readiness_passed());
         assert_eq!(
             report.to_operator_lines(),
@@ -1368,6 +1429,11 @@ mod tests {
                 "promoted_leader_term=2 promoted_leader_commit=3 follower_commit=3 follower_applied=3 follower_caught_up=true".to_string(),
                 "follower_read_after_apply=create table t(id int) | insert into t values (1) | insert into t values (2)".to_string(),
                 "failover_admission_gate=old_leader_not_leader promoted_node_role=Leader".to_string(),
+                "operational_deployment_preflight=passed".to_string(),
+                "deployment_scope=in_process_three_node_raft_smoke".to_string(),
+                "deployment_gap_network_transport=missing".to_string(),
+                "deployment_gap_automatic_election=missing".to_string(),
+                "deployment_gap_packaged_deployment=missing".to_string(),
             ]
         );
     }
