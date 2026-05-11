@@ -2,7 +2,7 @@ use std::env;
 use std::error::Error;
 use std::time::{Duration, Instant};
 
-use gpu_db_engine::{Engine, RelationalSelectResult, RelationalSqlGpuBridgeReport};
+use gpu_db_engine::{Engine, ExecuteError, RelationalSelectResult, RelationalSqlGpuBridgeReport};
 use gpu_db_protocol::{parse_command, Command, Select};
 
 #[derive(Debug)]
@@ -11,6 +11,8 @@ struct WorkloadReport {
     query_count: usize,
     cpu_elapsed: Duration,
     gpu_elapsed: Duration,
+    cpu_latency_us: LatencySummary,
+    gpu_latency_us: LatencySummary,
     result_rows: usize,
     correctness_validated: bool,
     bridge: RelationalSqlGpuBridgeReport,
@@ -18,6 +20,13 @@ struct WorkloadReport {
     d2h_bytes_total: u64,
     kernel_exec_samples: u64,
     kernel_exec_total_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LatencySummary {
+    p50_us: u128,
+    p95_us: u128,
+    max_us: u128,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -104,6 +113,25 @@ fn print_workload(report: &WorkloadReport) {
         "- gpu_probe_qps: {:.2}",
         qps(report.query_count, report.gpu_elapsed)
     );
+    println!("- cpu_latency_p50_us: {}", report.cpu_latency_us.p50_us);
+    println!("- cpu_latency_p95_us: {}", report.cpu_latency_us.p95_us);
+    println!("- cpu_latency_max_us: {}", report.cpu_latency_us.max_us);
+    println!(
+        "- gpu_probe_latency_p50_us: {}",
+        report.gpu_latency_us.p50_us
+    );
+    println!(
+        "- gpu_probe_latency_p95_us: {}",
+        report.gpu_latency_us.p95_us
+    );
+    println!(
+        "- gpu_probe_latency_max_us: {}",
+        report.gpu_latency_us.max_us
+    );
+    println!(
+        "- gpu_probe_vs_cpu_total_ratio: {:.3}",
+        elapsed_ratio(report.gpu_elapsed, report.cpu_elapsed)
+    );
     println!(
         "- gpu_executed_rate_permyriad: {}",
         report.bridge.gpu_executed_permyriad
@@ -175,17 +203,14 @@ fn run_workload(
     let mut gpu = seeded_engine(row_count)?;
 
     let cpu_start = Instant::now();
-    let cpu_results = queries
-        .iter()
-        .map(|query| cpu.execute_relational_select(query))
-        .collect::<Result<Vec<_>, _>>()?;
+    let (cpu_results, cpu_latencies) =
+        execute_timed(queries, |query| cpu.execute_relational_select(query))?;
     let cpu_elapsed = cpu_start.elapsed();
 
     let gpu_start = Instant::now();
-    let gpu_results = queries
-        .iter()
-        .map(|query| gpu.execute_relational_select_with_cuda_driver_probe(query))
-        .collect::<Result<Vec<_>, _>>()?;
+    let (gpu_results, gpu_latencies) = execute_timed(queries, |query| {
+        gpu.execute_relational_select_with_cuda_driver_probe(query)
+    })?;
     let gpu_elapsed = gpu_start.elapsed();
 
     let correctness_validated = same_sql_results(&cpu_results, &gpu_results);
@@ -202,6 +227,8 @@ fn run_workload(
         query_count: queries.len(),
         cpu_elapsed,
         gpu_elapsed,
+        cpu_latency_us: summarize_latencies(&cpu_latencies),
+        gpu_latency_us: summarize_latencies(&gpu_latencies),
         result_rows,
         correctness_validated,
         bridge,
@@ -212,11 +239,65 @@ fn run_workload(
     })
 }
 
+fn execute_timed<F>(
+    queries: &[Select],
+    mut execute: F,
+) -> Result<(Vec<RelationalSelectResult>, Vec<Duration>), Box<dyn Error>>
+where
+    F: FnMut(&Select) -> Result<RelationalSelectResult, ExecuteError>,
+{
+    let mut results = Vec::with_capacity(queries.len());
+    let mut latencies = Vec::with_capacity(queries.len());
+    for query in queries {
+        let start = Instant::now();
+        let result = execute(query)?;
+        latencies.push(start.elapsed());
+        results.push(result);
+    }
+    Ok((results, latencies))
+}
+
 fn qps(query_count: usize, elapsed: Duration) -> f64 {
     if elapsed.is_zero() {
         return 0.0;
     }
     query_count as f64 / elapsed.as_secs_f64()
+}
+
+fn elapsed_ratio(numerator: Duration, denominator: Duration) -> f64 {
+    if denominator.is_zero() {
+        return 0.0;
+    }
+    numerator.as_secs_f64() / denominator.as_secs_f64()
+}
+
+fn summarize_latencies(latencies: &[Duration]) -> LatencySummary {
+    if latencies.is_empty() {
+        return LatencySummary {
+            p50_us: 0,
+            p95_us: 0,
+            max_us: 0,
+        };
+    }
+    let mut micros = latencies
+        .iter()
+        .map(Duration::as_micros)
+        .collect::<Vec<_>>();
+    micros.sort_unstable();
+    LatencySummary {
+        p50_us: percentile_nearest_rank(&micros, 50),
+        p95_us: percentile_nearest_rank(&micros, 95),
+        max_us: *micros.last().unwrap_or(&0),
+    }
+}
+
+fn percentile_nearest_rank(sorted_values: &[u128], percentile: usize) -> u128 {
+    if sorted_values.is_empty() {
+        return 0;
+    }
+    let clamped = percentile.clamp(1, 100);
+    let rank = (clamped * sorted_values.len()).div_ceil(100);
+    sorted_values[rank.saturating_sub(1)]
 }
 
 fn seeded_engine(row_count: usize) -> Result<Engine, Box<dyn Error>> {
