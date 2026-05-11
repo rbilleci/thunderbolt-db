@@ -22,7 +22,7 @@ use gpu_db_protocol::{
 };
 use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine};
 use gpu_db_storage::{
-    InMemoryTupleStore, NewTuple, StorageError, TupleStore, TupleVersion,
+    InMemoryTupleStore, NewTuple, PruneStats, StorageError, TupleStore, TupleVersion,
     Visibility as StorageVisibility,
 };
 use gpu_db_txn::{TxnError, TxnManager};
@@ -7533,6 +7533,36 @@ impl Engine {
         path: impl AsRef<std::path::Path>,
     ) -> Result<(), EngineError> {
         write_wal_segment(path, self.durable_wal_records())
+    }
+
+    pub fn checkpoint_vacuum_mvcc_versions(
+        &mut self,
+        safe_txn_id: TxnId,
+    ) -> Result<PruneStats, EngineError> {
+        if safe_txn_id == 0 {
+            return Err(EngineError::Durability(
+                "checkpoint vacuum safe transaction id must be non-zero".to_string(),
+            ));
+        }
+        if let Some(oldest_active) = self.txn_manager.oldest_active_txn_id() {
+            if safe_txn_id >= oldest_active {
+                return Err(EngineError::Durability(format!(
+                    "checkpoint vacuum safe transaction id {safe_txn_id} crosses active transaction {oldest_active}"
+                )));
+            }
+        }
+        let checkpoint = self.wal.checkpoint_meta();
+        match checkpoint.last_durable_txn_id {
+            Some(last_durable) if safe_txn_id <= last_durable => {
+                Ok(self.mvcc_store.prune_versions_deleted_at_or_before(safe_txn_id))
+            }
+            Some(last_durable) => Err(EngineError::Durability(format!(
+                "checkpoint vacuum safe transaction id {safe_txn_id} is newer than durable WAL transaction {last_durable}"
+            ))),
+            None => Err(EngineError::Durability(
+                "checkpoint vacuum requires a durable WAL boundary".to_string(),
+            )),
+        }
     }
 
     pub fn get(&self, key: &str) -> Option<&str> {
@@ -23600,6 +23630,91 @@ mod tests {
             }
         );
         assert_eq!(result.rows, vec![vec![SqlValue::Int4(3)]]);
+    }
+
+    #[test]
+    fn checkpoint_vacuum_prunes_mvcc_versions_only_at_durable_safe_boundary() {
+        let path = test_wal_path("vacuum");
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET acct:1=open").unwrap();
+        e.execute_text(2, "SET acct:1=closed").unwrap();
+
+        assert_eq!(e.mvcc_store.version_count(), 2);
+        assert_eq!(
+            e.mvcc_store
+                .tuple_fetch_by_key("acct:1", StorageVisibility { read_txn_id: 1 })
+                .unwrap()
+                .map(|version| version.value),
+            Some("open".to_string())
+        );
+
+        let stats = e.checkpoint_vacuum_mvcc_versions(1).unwrap();
+        assert_eq!(
+            stats,
+            PruneStats {
+                removed_versions: 0,
+                removed_tuples: 0,
+                remaining_versions: 2,
+            }
+        );
+
+        let stats = e.checkpoint_vacuum_mvcc_versions(2).unwrap();
+        assert_eq!(
+            stats,
+            PruneStats {
+                removed_versions: 1,
+                removed_tuples: 0,
+                remaining_versions: 1,
+            }
+        );
+        assert_eq!(
+            e.mvcc_store
+                .tuple_fetch_by_key("acct:1", StorageVisibility { read_txn_id: 2 })
+                .unwrap()
+                .map(|version| version.value),
+            Some("closed".to_string())
+        );
+        assert_eq!(
+            e.mvcc_store
+                .tuple_fetch_by_key("acct:1", StorageVisibility { read_txn_id: 1 })
+                .unwrap(),
+            None
+        );
+
+        e.persist_durable_wal_to_file(&path).unwrap();
+        let recovered = Engine::recover_from_durable_wal_file(&path).unwrap();
+        let _ = std::fs::remove_file(path);
+        assert_eq!(
+            recovered
+                .mvcc_store
+                .tuple_fetch_by_key("acct:1", StorageVisibility { read_txn_id: 1 })
+                .unwrap()
+                .map(|version| version.value),
+            Some("open".to_string())
+        );
+    }
+
+    #[test]
+    fn checkpoint_vacuum_rejects_unsafe_boundaries() {
+        let mut e = Engine::new_local();
+        let no_wal_err = e.checkpoint_vacuum_mvcc_versions(1).unwrap_err();
+        assert!(no_wal_err
+            .to_string()
+            .contains("requires a durable WAL boundary"));
+
+        e.execute_text(1, "SET acct:1=open").unwrap();
+        e.execute_text(2, "BEGIN").unwrap();
+
+        let active_err = e.checkpoint_vacuum_mvcc_versions(2).unwrap_err();
+        assert!(active_err
+            .to_string()
+            .contains("crosses active transaction 2"));
+
+        e.execute_text(2, "COMMIT").unwrap();
+        let newer_than_durable_err = e.checkpoint_vacuum_mvcc_versions(3).unwrap_err();
+        assert!(newer_than_durable_err
+            .to_string()
+            .contains("newer than durable WAL transaction 1"));
     }
 
     #[test]

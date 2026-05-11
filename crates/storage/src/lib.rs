@@ -21,6 +21,13 @@ pub struct NewTuple {
     pub value: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PruneStats {
+    pub removed_versions: usize,
+    pub removed_tuples: usize,
+    pub remaining_versions: usize,
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum StorageError {
     #[error("tuple not found")]
@@ -114,6 +121,35 @@ impl InMemoryTupleStore {
             .values()
             .flat_map(|versions| versions.iter().cloned())
             .collect()
+    }
+
+    pub fn version_count(&self) -> usize {
+        self.versions.values().map(Vec::len).sum()
+    }
+
+    pub fn tuple_chain_count(&self) -> usize {
+        self.versions.len()
+    }
+
+    pub fn prune_versions_deleted_at_or_before(&mut self, safe_txn_id: TxnId) -> PruneStats {
+        let before_versions = self.version_count();
+        let before_tuples = self.tuple_chain_count();
+
+        self.versions.retain(|_, versions| {
+            versions.retain(|version| {
+                version
+                    .deleted_by
+                    .is_none_or(|deleted_by| deleted_by > safe_txn_id)
+            });
+            !versions.is_empty()
+        });
+
+        let remaining_versions = self.version_count();
+        PruneStats {
+            removed_versions: before_versions.saturating_sub(remaining_versions),
+            removed_tuples: before_tuples.saturating_sub(self.tuple_chain_count()),
+            remaining_versions,
+        }
     }
 
     fn validate_visibility(visibility: Visibility) -> Result<(), StorageError> {
@@ -582,5 +618,89 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn prune_versions_deleted_before_safe_boundary_keeps_current_history() {
+        let mut store = InMemoryTupleStore::new();
+        let tuple_id = store
+            .tuple_insert(
+                NewTuple {
+                    key: "acct:1".to_string(),
+                    value: "open".to_string(),
+                },
+                2,
+            )
+            .unwrap();
+        store
+            .tuple_update(tuple_id, "closed".to_string(), 5)
+            .unwrap();
+
+        assert_eq!(store.version_count(), 2);
+        let stats = store.prune_versions_deleted_at_or_before(4);
+        assert_eq!(
+            stats,
+            PruneStats {
+                removed_versions: 0,
+                removed_tuples: 0,
+                remaining_versions: 2,
+            }
+        );
+        assert_eq!(
+            store
+                .tuple_fetch(tuple_id, Visibility { read_txn_id: 4 })
+                .unwrap()
+                .map(|version| version.value),
+            Some("open".to_string())
+        );
+
+        let stats = store.prune_versions_deleted_at_or_before(5);
+        assert_eq!(
+            stats,
+            PruneStats {
+                removed_versions: 1,
+                removed_tuples: 0,
+                remaining_versions: 1,
+            }
+        );
+        assert_eq!(
+            store
+                .tuple_fetch(tuple_id, Visibility { read_txn_id: 5 })
+                .unwrap()
+                .map(|version| version.value),
+            Some("closed".to_string())
+        );
+        assert_eq!(
+            store
+                .tuple_fetch(tuple_id, Visibility { read_txn_id: 4 })
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn prune_versions_removes_fully_deleted_tuple_chains() {
+        let mut store = InMemoryTupleStore::new();
+        let tuple_id = store
+            .tuple_insert(
+                NewTuple {
+                    key: "acct:1".to_string(),
+                    value: "open".to_string(),
+                },
+                2,
+            )
+            .unwrap();
+        store.tuple_delete(tuple_id, 5).unwrap();
+
+        let stats = store.prune_versions_deleted_at_or_before(5);
+        assert_eq!(
+            stats,
+            PruneStats {
+                removed_versions: 1,
+                removed_tuples: 1,
+                remaining_versions: 0,
+            }
+        );
+        assert_eq!(store.tuple_chain_count(), 0);
     }
 }

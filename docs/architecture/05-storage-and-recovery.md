@@ -26,9 +26,9 @@ Compaction may only remove entries older than a safe snapshot boundary known to 
 
 ## MVCC Version Retention
 
-Current bootstrap storage keeps all MVCC tuple versions needed to replay the durable WAL prefix and rebuild volatile relational access paths. There is no vacuum/garbage-collection pass for tuple versions yet, so operators should treat MVCC version growth as unbounded within a process lifetime and across replayed WAL history.
+Current bootstrap storage keeps all MVCC tuple versions needed by active snapshots. `Engine::checkpoint_vacuum_mvcc_versions(...)` provides the first safe local pruning boundary: it removes tuple versions whose `deleted_by` transaction is at or before a caller-provided safe transaction id, but only when that id is non-zero, does not cross the oldest active transaction, and is no newer than the flushed WAL checkpoint metadata.
 
-The first production boundary is conservative: do not prune relational tuple versions or equality-index entries unless a future checkpoint/vacuum implementation proves the removed versions are older than every active snapshot, no longer needed for recovery, and no longer referenced by any index/access path.
+This is intentionally a tuple-version vacuum, not a packaged checkpoint/control-file system. The durable WAL prefix remains the recovery source of truth, so file-backed WAL replay can reconstruct historical versions that were pruned from a running process. Relational equality-index entries remain volatile and are rebuilt from WAL replay; do not manually prune relational row keys or index entries outside the engine-owned vacuum boundary.
 
 ## Integrity
 

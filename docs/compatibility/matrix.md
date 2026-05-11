@@ -34,6 +34,7 @@ This matrix makes compatibility intent explicit per delivery phase while preserv
 | WAL flush failure rollback of unapplied tail | ✅ | ✅ | ✅ | Ensures failed durability does not become visible |
 | Crash recovery replay runbook | 🟡 | 🟡 | ✅ | First P5 durable segment slice writes the flushed WAL prefix to a checksummed local file and replays it to recover relational catalog plus table data; broader checkpoint/control metadata and packaged restore remain open |
 | Relational equality access path | 🚫 | 🟡 | ✅ | First P5 slice maintains an in-memory equality index from WAL-applied inserts, rebuilds it during durable WAL/file replay, and uses it for supported `WHERE column = literal` reads through MVCC key-batch lookup |
+| MVCC retention/vacuum boundary | 🚫 | 🟡 | ✅ | First P5 checkpoint-vacuum slice prunes versions deleted at or before a durable safe transaction id, rejects boundaries crossing active transactions or unflushed WAL, and leaves WAL replay able to reconstruct pruned historical versions |
 
 ## Replication + Roles
 

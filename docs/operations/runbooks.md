@@ -155,9 +155,9 @@ Operator checks:
 
 ## 5b) MVCC Retention Boundary
 
-Current bootstrap storage does not vacuum old MVCC tuple versions. During long-running tests or demos, monitor row/version growth and prefer bounded workloads or fresh process starts when measuring performance.
+Current bootstrap storage can vacuum old MVCC tuple versions only through `Engine::checkpoint_vacuum_mvcc_versions(safe_txn_id)`. Choose a non-zero safe transaction id that is at or below the flushed WAL boundary and older than every active transaction. The call refuses unsafe boundaries, reports removed tuple/version counts, and keeps the durable WAL prefix as the replay source of truth.
 
-Do not manually prune tuple versions, relational row keys, or equality-index entries. Until checkpoint-backed vacuum exists, recovery and historical visibility depend on replaying the durable WAL prefix and rebuilding volatile access paths from that complete committed history.
+Do not manually prune tuple versions, relational row keys, or equality-index entries. Relational indexes remain volatile and are rebuilt from the durable WAL prefix during recovery; packaged checkpoint discovery/control metadata and PITR selection are still future storage work.
 
 ## 6) Release Evidence Bundle
 
