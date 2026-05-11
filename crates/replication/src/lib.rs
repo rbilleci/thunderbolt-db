@@ -195,6 +195,43 @@ impl OperationalDeploymentPreflightReport {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppendEntriesRequest {
+    pub leader_term: Term,
+    pub prev_log_index: Index,
+    pub prev_log_term: Term,
+    pub entries: Vec<LogEntry>,
+    pub leader_commit: Index,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppendEntriesResponse {
+    pub accepted: bool,
+    pub follower_term: Term,
+    pub follower_commit_index: Index,
+    pub follower_applied_index: Index,
+    pub error: Option<String>,
+}
+
+impl AppendEntriesRequest {
+    pub fn apply_to(&self, follower: &mut RaftReplicator) -> AppendEntriesResponse {
+        let result = follower.append_entries_from_leader(
+            self.leader_term,
+            self.prev_log_index,
+            self.prev_log_term,
+            self.entries.clone(),
+            self.leader_commit,
+        );
+        AppendEntriesResponse {
+            accepted: result.is_ok(),
+            follower_term: follower.current_term(),
+            follower_commit_index: follower.commit_index(),
+            follower_applied_index: follower.applied_index(),
+            error: result.err().map(|err| err.to_string()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ReplicationStatusInvariantError {
     #[error("live progress is invalid: {0}")]
@@ -1321,6 +1358,24 @@ mod tests {
         Ok(())
     }
 
+    fn apply_append_request(
+        follower: &mut RaftReplicator,
+        leader_term: Term,
+        prev_log_index: Index,
+        prev_log_term: Term,
+        entries: Vec<LogEntry>,
+        leader_commit: Index,
+    ) -> AppendEntriesResponse {
+        AppendEntriesRequest {
+            leader_term,
+            prev_log_index,
+            prev_log_term,
+            entries,
+            leader_commit,
+        }
+        .apply_to(follower)
+    }
+
     #[test]
     fn operational_replication_three_node_smoke_catches_up_reads_after_apply_and_gates_failover() {
         let mut leader = RaftReplicator::new(3);
@@ -1357,9 +1412,9 @@ mod tests {
         ];
 
         append_batches_sent += 1;
-        follower_a
-            .append_entries_from_leader(term_one, 0, 0, first_batch.clone(), 0)
-            .unwrap();
+        assert!(
+            apply_append_request(&mut follower_a, term_one, 0, 0, first_batch.clone(), 0).accepted
+        );
         leader.register_follower_ack(first.index, 1);
         follower_acks_recorded += 1;
         leader.register_follower_ack(second.index, 1);
@@ -1369,21 +1424,31 @@ mod tests {
             .unwrap();
 
         heartbeat_batches_sent += 1;
-        follower_a
-            .append_entries_from_leader(
+        assert!(
+            apply_append_request(
+                &mut follower_a,
                 term_one,
                 second.index,
                 term_one,
                 vec![],
                 leader.commit_index(),
             )
-            .unwrap();
+            .accepted
+        );
         apply_committed_entries(&mut follower_a, &mut state_a).unwrap();
 
         append_batches_sent += 1;
-        follower_b
-            .append_entries_from_leader(term_one, 0, 0, first_batch, leader.commit_index())
-            .unwrap();
+        assert!(
+            apply_append_request(
+                &mut follower_b,
+                term_one,
+                0,
+                0,
+                first_batch,
+                leader.commit_index(),
+            )
+            .accepted
+        );
         apply_committed_entries(&mut follower_b, &mut state_b).unwrap();
 
         assert_eq!(state_a.values, state_b.values);
@@ -1407,8 +1472,9 @@ mod tests {
             .unwrap();
         let term_two = follower_a.current_term();
         append_batches_sent += 1;
-        follower_b
-            .append_entries_from_leader(
+        assert!(
+            apply_append_request(
+                &mut follower_b,
                 term_two,
                 second.index,
                 term_one,
@@ -1419,22 +1485,25 @@ mod tests {
                 }],
                 follower_a.commit_index(),
             )
-            .unwrap();
+            .accepted
+        );
         follower_a.register_follower_ack(third.index, 2);
         follower_acks_recorded += 1;
         follower_a
             .wait_committed(third, std::time::Duration::from_millis(1))
             .unwrap();
         heartbeat_batches_sent += 1;
-        follower_b
-            .append_entries_from_leader(
+        assert!(
+            apply_append_request(
+                &mut follower_b,
                 term_two,
                 third.index,
                 term_two,
                 vec![],
                 follower_a.commit_index(),
             )
-            .unwrap();
+            .accepted
+        );
         apply_committed_entries(&mut follower_b, &mut state_b).unwrap();
 
         assert_eq!(
@@ -1482,6 +1551,47 @@ mod tests {
                 "deployment_gap_automatic_election=missing".to_string(),
                 "deployment_gap_packaged_deployment=missing".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn append_entries_transport_request_reports_follower_response() {
+        let mut follower = RaftReplicator::new(3);
+        let accepted = AppendEntriesRequest {
+            leader_term: 2,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![LogEntry {
+                term: 2,
+                index: 1,
+                payload: b"replicated".to_vec(),
+            }],
+            leader_commit: 1,
+        }
+        .apply_to(&mut follower);
+
+        assert!(accepted.accepted);
+        assert_eq!(accepted.follower_term, 2);
+        assert_eq!(accepted.follower_commit_index, 1);
+        assert_eq!(accepted.follower_applied_index, 0);
+        assert_eq!(accepted.error, None);
+
+        let rejected = AppendEntriesRequest {
+            leader_term: 1,
+            prev_log_index: 1,
+            prev_log_term: 2,
+            entries: vec![],
+            leader_commit: 1,
+        }
+        .apply_to(&mut follower);
+
+        assert!(!rejected.accepted);
+        assert_eq!(rejected.follower_term, 2);
+        assert_eq!(rejected.follower_commit_index, 1);
+        assert_eq!(rejected.follower_applied_index, 0);
+        assert_eq!(
+            rejected.error.as_deref(),
+            Some("proposal failed: stale leader term 1 (local term 2)")
         );
     }
 

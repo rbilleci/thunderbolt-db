@@ -27,14 +27,14 @@
     "replication.operational_cluster": {
       "failed": 0,
       "ignored": 0,
-      "passed": 1,
-      "total": 1
+      "passed": 2,
+      "total": 2
     },
     "replication.role_and_log": {
       "failed": 0,
       "ignored": 0,
-      "passed": 165,
-      "total": 165
+      "passed": 166,
+      "total": 166
     },
     "sql.catalog_schema_types": {
       "failed": 0,
@@ -77,8 +77,8 @@
   "totals": {
     "failed": 0,
     "ignored": 0,
-    "passed": 572,
-    "total": 572
+    "passed": 573,
+    "total": 573
   },
   "trend_hook": {
     "baseline_available": true,

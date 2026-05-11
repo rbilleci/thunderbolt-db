@@ -1,8 +1,9 @@
 use std::time::Duration;
 
 use gpu_db_replication::{
-    LogReplicator, OperationalClusterSmokeReport, OperationalDeploymentPreflightReport,
-    OperationalTransportSmokeReport, RaftReplicator, ReplicatedStateMachine,
+    AppendEntriesRequest, LogReplicator, OperationalClusterSmokeReport,
+    OperationalDeploymentPreflightReport, OperationalTransportSmokeReport, RaftReplicator,
+    ReplicatedStateMachine,
 };
 use gpu_db_types::{EngineError, Index, LogEntry, Role, Term};
 
@@ -40,13 +41,23 @@ fn append_entries(
     entries: Vec<LogEntry>,
     leader_commit: Index,
 ) -> Result<(), EngineError> {
-    follower.append_entries_from_leader(
+    let response = AppendEntriesRequest {
         leader_term,
         prev_log_index,
         prev_log_term,
         entries,
         leader_commit,
-    )
+    }
+    .apply_to(follower);
+    if response.accepted {
+        Ok(())
+    } else {
+        Err(EngineError::ProposalFailed(
+            response
+                .error
+                .unwrap_or_else(|| "append entries rejected".to_string()),
+        ))
+    }
 }
 
 fn main() -> Result<(), EngineError> {
