@@ -6,7 +6,7 @@ use std::thread;
 
 use gpu_db_protocol::{
     parse_command, parse_frontend_message, parse_startup_packet, Command, FrontendMessage,
-    SelectFilterOp, SelectProjection, SqlValue, StartupPacket,
+    SelectFilterOp, SelectProjection, SqlValue, StartupPacket, SUPPORTED_SQL_TYPES,
 };
 use gpu_db_protocol::{DescribeTarget, SqlType};
 
@@ -836,6 +836,32 @@ fn execute_statement(
             &catalog_table_oid_rows(session),
         );
     }
+    if canonical
+        == "select oid, typname, typlen from pg_catalog.pg_type where oid in (23, 25) order by oid"
+    {
+        return write_single_row(
+            stream,
+            &[
+                int4_column("oid"),
+                text_column("typname"),
+                int4_column("typlen"),
+            ],
+            &catalog_type_rows_by_oid(),
+        );
+    }
+    if canonical
+        == "select typname, oid, typlen from pg_catalog.pg_type where typname in ('int4', 'text') order by typname"
+    {
+        return write_single_row(
+            stream,
+            &[
+                text_column("typname"),
+                int4_column("oid"),
+                int4_column("typlen"),
+            ],
+            &catalog_type_rows_by_name(),
+        );
+    }
     if let Some(table) = catalog_attribute_query_table(&canonical) {
         let Some(rows) = catalog_attribute_rows(session, &table) else {
             return write_error(
@@ -985,6 +1011,36 @@ fn catalog_table_oid_rows(session: &Session) -> Vec<Vec<Option<String>>> {
     rows.sort_by_key(|(oid, _)| *oid);
     rows.into_iter()
         .map(|(oid, name)| vec![Some(oid.to_string()), Some(name.clone())])
+        .collect()
+}
+
+fn catalog_type_rows_by_oid() -> Vec<Vec<Option<String>>> {
+    let mut types = SUPPORTED_SQL_TYPES;
+    types.sort_by_key(|ty| ty.postgres_oid());
+    types
+        .into_iter()
+        .map(|ty| {
+            vec![
+                Some(ty.postgres_oid().to_string()),
+                Some(ty.catalog_name().to_string()),
+                Some(ty.type_size().to_string()),
+            ]
+        })
+        .collect()
+}
+
+fn catalog_type_rows_by_name() -> Vec<Vec<Option<String>>> {
+    let mut types = SUPPORTED_SQL_TYPES;
+    types.sort_by_key(|ty| ty.catalog_name());
+    types
+        .into_iter()
+        .map(|ty| {
+            vec![
+                Some(ty.catalog_name().to_string()),
+                Some(ty.postgres_oid().to_string()),
+                Some(ty.type_size().to_string()),
+            ]
+        })
         .collect()
 }
 
@@ -1388,6 +1444,36 @@ mod tests {
                 vec![
                     Some((FIRST_USER_RELATION_OID + 1).to_string()),
                     Some("teams".to_string()),
+                ],
+            ]
+        );
+        assert_eq!(
+            catalog_type_rows_by_oid(),
+            vec![
+                vec![
+                    Some("23".to_string()),
+                    Some("int4".to_string()),
+                    Some("4".to_string()),
+                ],
+                vec![
+                    Some("25".to_string()),
+                    Some("text".to_string()),
+                    Some("-1".to_string()),
+                ],
+            ]
+        );
+        assert_eq!(
+            catalog_type_rows_by_name(),
+            vec![
+                vec![
+                    Some("int4".to_string()),
+                    Some("23".to_string()),
+                    Some("4".to_string()),
+                ],
+                vec![
+                    Some("text".to_string()),
+                    Some("25".to_string()),
+                    Some("-1".to_string()),
                 ],
             ]
         );

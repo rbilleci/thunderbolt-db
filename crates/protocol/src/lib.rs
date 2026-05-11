@@ -31,6 +31,8 @@ pub enum SqlType {
     Text,
 }
 
+pub const SUPPORTED_SQL_TYPES: [SqlType; 2] = [SqlType::Int4, SqlType::Text];
+
 impl SqlType {
     pub const fn postgres_oid(self) -> u32 {
         match self {

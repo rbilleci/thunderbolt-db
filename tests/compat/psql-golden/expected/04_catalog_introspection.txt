@@ -25,3 +25,16 @@ CREATE TABLE
       1 | id      |       23 |      4
       2 | name    |       25 |     -1
 (2 rows)
+
+=== catalog type introspection ===
+ oid | typname | typlen
+-----+---------+--------
+  23 | int4    |      4
+  25 | text    |     -1
+(2 rows)
+
+ typname | oid | typlen
+---------+-----+--------
+ int4    |  23 |      4
+ text    |  25 |     -1
+(2 rows)
