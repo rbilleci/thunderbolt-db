@@ -142,7 +142,15 @@ fn print_workload(report: &WorkloadReport) {
         report.bridge.cpu_fallback_permyriad
     );
     println!("- h2d_bytes_total: {}", report.h2d_bytes_total);
+    println!(
+        "- h2d_bytes_per_query: {:.2}",
+        bytes_per(report.h2d_bytes_total, report.query_count)
+    );
     println!("- d2h_bytes_total: {}", report.d2h_bytes_total);
+    println!(
+        "- d2h_bytes_per_result_row: {:.2}",
+        bytes_per(report.d2h_bytes_total, report.result_rows)
+    );
     println!("- kernel_exec_samples: {}", report.kernel_exec_samples);
     println!("- kernel_exec_total_ms: {}", report.kernel_exec_total_ms);
     println!("- correctness_validated: {}", report.correctness_validated);
@@ -270,6 +278,13 @@ fn elapsed_ratio(numerator: Duration, denominator: Duration) -> f64 {
         return 0.0;
     }
     numerator.as_secs_f64() / denominator.as_secs_f64()
+}
+
+fn bytes_per(bytes: u64, count: usize) -> f64 {
+    if count == 0 {
+        return 0.0;
+    }
+    bytes as f64 / count as f64
 }
 
 fn summarize_latencies(latencies: &[Duration]) -> LatencySummary {
