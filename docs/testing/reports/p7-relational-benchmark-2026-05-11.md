@@ -16,10 +16,10 @@ Environment:
 
 - queries: 16
 - result_rows: 16
-- cpu_total_us: 5969
-- gpu_probe_total_us: 6716333
-- cpu_qps: 2680.51
-- gpu_probe_qps: 2.38
+- cpu_total_us: 5914
+- gpu_probe_total_us: 6780205
+- cpu_qps: 2705.24
+- gpu_probe_qps: 2.36
 - gpu_executed_rate_permyriad: 10000
 - cpu_fallback_rate_permyriad: 0
 - h2d_bytes_total: 0
@@ -32,10 +32,10 @@ Environment:
 
 - queries: 1
 - result_rows: 1000
-- cpu_total_us: 2380
-- gpu_probe_total_us: 434839
-- cpu_qps: 419.99
-- gpu_probe_qps: 2.30
+- cpu_total_us: 2341
+- gpu_probe_total_us: 417580
+- cpu_qps: 427.12
+- gpu_probe_qps: 2.39
 - gpu_executed_rate_permyriad: 10000
 - cpu_fallback_rate_permyriad: 0
 - h2d_bytes_total: 0
@@ -50,4 +50,4 @@ The indexed lookup and analytical scan workloads both reach GPU execution with n
 
 Supported performance claim: current P7 evidence proves reproducible routing and correctness measurement for two relational workload shapes, not workload-level GPU advantage.
 
-Named follow-up: prioritize transfer layout, batching, remaining SQL order/projection pushdown, and publishing CUDA driver timing into engine metrics before making broad performance claims.
+Named follow-up: prioritize transfer layout, batching, remaining SQL `ORDER BY` pushdown, and publishing CUDA driver timing into engine metrics before making broad performance claims. Projection-only SQL result shaping is now treated as host result formatting rather than GPU fallback when the relational row fetch already executed on GPU.

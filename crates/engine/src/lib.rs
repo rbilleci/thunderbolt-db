@@ -6172,9 +6172,7 @@ fn relational_select_needs_host_sql_finalization(
     select: &Select,
     access_path: &RelationalAccessPath,
 ) -> bool {
-    !matches!(select.projection, SelectProjection::All)
-        || (select.filter.is_some()
-            && !matches!(access_path, RelationalAccessPath::EqualityIndex { .. }))
+    (select.filter.is_some() && !matches!(access_path, RelationalAccessPath::EqualityIndex { .. }))
         || select.order_by.is_some()
         || (select.limit.is_some() && !relational_select_pushes_limit(select))
 }
@@ -22351,7 +22349,33 @@ mod tests {
     }
 
     #[test]
-    fn relational_sql_host_finalization_reports_gpu_parity_fallback() {
+    fn relational_sql_gpu_bridge_projection_result_shaping_does_not_report_gpu_fallback() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO people (id, name) VALUES (1, 'Ada'), (2, 'Linus'), (3, 'Grace')",
+        )
+        .unwrap();
+
+        let Command::Select(select) =
+            parse_command("SELECT name FROM people WHERE id = 2 LIMIT 1").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let result = e
+            .execute_relational_select_with_backend(&select, &FirstCudaSliceParityBackend)
+            .unwrap();
+
+        assert_eq!(result.rows, vec![vec![SqlValue::Text("Linus".to_string())]]);
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.fallback_reason, None);
+        assert_eq!(e.status_snapshot().latest_fallback_reason(), None);
+    }
+
+    #[test]
+    fn relational_sql_gpu_bridge_order_by_decoded_column_reports_gpu_parity_fallback() {
         let mut e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
@@ -22450,9 +22474,9 @@ mod tests {
 
         assert_eq!(report.query_count, 2);
         assert_eq!(report.gpu_executed_count, 2);
-        assert_eq!(report.cpu_fallback_count, 1);
+        assert_eq!(report.cpu_fallback_count, 0);
         assert_eq!(report.gpu_executed_permyriad, 10_000);
-        assert_eq!(report.cpu_fallback_permyriad, 5_000);
+        assert_eq!(report.cpu_fallback_permyriad, 0);
     }
 
     #[test]
@@ -22510,6 +22534,32 @@ mod tests {
             result.rows,
             vec![vec![SqlValue::Int4(2), SqlValue::Text("Linus".to_string())]]
         );
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.fallback_reason, None);
+    }
+
+    #[test]
+    #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
+    fn execute_mvcc_query_cuda_driver_runs_relational_sql_projection_without_fallback() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO people (id, name) VALUES (1, 'Ada'), (2, 'Linus'), (2, 'Grace')",
+        )
+        .unwrap();
+
+        let Command::Select(select) =
+            parse_command("SELECT name FROM people WHERE id = 2 LIMIT 1").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let result = e
+            .execute_relational_select_with_cuda_driver_probe(&select)
+            .unwrap();
+
+        assert_eq!(result.rows, vec![vec![SqlValue::Text("Linus".to_string())]]);
         assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
         assert_eq!(result.fallback_reason, None);
     }
