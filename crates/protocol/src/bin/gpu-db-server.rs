@@ -6,7 +6,7 @@ use std::thread;
 
 use gpu_db_protocol::{
     parse_command, parse_frontend_message, parse_startup_packet, Command, FrontendMessage,
-    SelectProjection, SqlValue, StartupPacket,
+    SelectFilterOp, SelectProjection, SqlValue, StartupPacket,
 };
 use gpu_db_protocol::{DescribeTarget, SqlType};
 
@@ -54,6 +54,16 @@ fn compare_sql_values(left: &SqlValue, right: &SqlValue) -> std::cmp::Ordering {
         (SqlValue::Text(left), SqlValue::Text(right)) => left.cmp(right),
         (SqlValue::Int4(_), SqlValue::Text(_)) => std::cmp::Ordering::Less,
         (SqlValue::Text(_), SqlValue::Int4(_)) => std::cmp::Ordering::Greater,
+    }
+}
+
+fn select_filter_matches(left: &SqlValue, op: SelectFilterOp, right: &SqlValue) -> bool {
+    match op {
+        SelectFilterOp::Eq => left == right,
+        SelectFilterOp::Lt => compare_sql_values(left, right).is_lt(),
+        SelectFilterOp::Lte => !compare_sql_values(left, right).is_gt(),
+        SelectFilterOp::Gt => compare_sql_values(left, right).is_gt(),
+        SelectFilterOp::Gte => !compare_sql_values(left, right).is_lt(),
     }
 }
 
@@ -738,7 +748,7 @@ fn execute_statement(
                             },
                         );
                     };
-                    rows.retain(|row| row[idx] == filter.value);
+                    rows.retain(|row| select_filter_matches(&row[idx], filter.op, &filter.value));
                 }
                 if let Some(order) = &select.order_by {
                     let Some(idx) = table

@@ -85,7 +85,17 @@ pub enum SelectProjection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectFilter {
     pub column: String,
+    pub op: SelectFilterOp,
     pub value: SqlValue,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectFilterOp {
+    Eq,
+    Lt,
+    Lte,
+    Gt,
+    Gte,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,7 +116,7 @@ pub enum ParseError {
     InvalidDel,
     #[error("invalid GET syntax; expected: GET key")]
     InvalidGet,
-    #[error("invalid relational SQL syntax; supported subset: CREATE TABLE name (...), INSERT INTO name (...) VALUES (...), SELECT columns FROM name [WHERE column = literal] [ORDER BY column [ASC|DESC]] [LIMIT n]")]
+    #[error("invalid relational SQL syntax; supported subset: CREATE TABLE name (...), INSERT INTO name (...) VALUES (...), SELECT columns FROM name [WHERE column (=|<|<=|>|>=) literal] [ORDER BY column [ASC|DESC]] [LIMIT n]")]
     InvalidRelationalSql,
     #[error("invalid RESET/DISCARD/DEALLOCATE/CLOSE/LISTEN/NOTIFY/UNLISTEN syntax; expected: RESET ALL|ROLE|AUTHORIZATION|AUTH|SESSION AUTHORIZATION[ [TO] DEFAULT]|SESSION AUTH[ [TO] DEFAULT], DISCARD {{ALL|TEMP|TEMPORARY|TEMP TABLES|TEMPORARY TABLES|PLANS|SEQUENCES}}, DEALLOCATE {{ALL|name|PREPARE|PREPARED name}}, CLOSE {{ALL|name}}, LISTEN channel, NOTIFY channel[, payload], or UNLISTEN [*|ALL|channel]")]
     InvalidReset,
@@ -1597,13 +1607,30 @@ fn parse_projection(input: &str) -> Result<SelectProjection, ParseError> {
 }
 
 fn parse_select_filter(input: &str) -> Result<SelectFilter, ParseError> {
-    let (column, value) = input
-        .split_once('=')
-        .ok_or(ParseError::InvalidRelationalSql)?;
+    let (column, op, value) = split_select_filter(input)?;
     Ok(SelectFilter {
         column: normalize_identifier(column.trim())?,
+        op,
         value: parse_sql_value(value.trim())?,
     })
+}
+
+fn split_select_filter(input: &str) -> Result<(&str, SelectFilterOp, &str), ParseError> {
+    for (token, op) in [
+        ("<=", SelectFilterOp::Lte),
+        (">=", SelectFilterOp::Gte),
+        ("=", SelectFilterOp::Eq),
+        ("<", SelectFilterOp::Lt),
+        (">", SelectFilterOp::Gt),
+    ] {
+        if let Some((column, value)) = input.split_once(token) {
+            if column.trim().is_empty() || value.trim().is_empty() {
+                return Err(ParseError::InvalidRelationalSql);
+            }
+            return Ok((column, op, value));
+        }
+    }
+    Err(ParseError::InvalidRelationalSql)
 }
 
 fn parse_select_order(input: &str) -> Result<SelectOrder, ParseError> {
@@ -7960,11 +7987,30 @@ mod tests {
                 projection: SelectProjection::Columns(vec!["id".to_string(), "name".to_string()]),
                 filter: Some(SelectFilter {
                     column: "id".to_string(),
+                    op: SelectFilterOp::Eq,
                     value: SqlValue::Int4(1),
                 }),
                 order_by: Some(SelectOrder {
                     column: "name".to_string(),
                     descending: true,
+                }),
+                limit: Some(5),
+            })
+        );
+
+        assert_eq!(
+            parse_command("SELECT name FROM people WHERE id >= 2 ORDER BY id LIMIT 5").unwrap(),
+            Command::Select(Select {
+                table: "people".to_string(),
+                projection: SelectProjection::Columns(vec!["name".to_string()]),
+                filter: Some(SelectFilter {
+                    column: "id".to_string(),
+                    op: SelectFilterOp::Gte,
+                    value: SqlValue::Int4(2),
+                }),
+                order_by: Some(SelectOrder {
+                    column: "id".to_string(),
+                    descending: false,
                 }),
                 limit: Some(5),
             })

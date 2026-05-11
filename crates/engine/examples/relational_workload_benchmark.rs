@@ -34,9 +34,13 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let app_queries = app_lookup_queries(row_count, lookup_count)?;
     let analytic_queries = vec![select("SELECT * FROM events")?];
+    let range_queries = vec![select(
+        "SELECT id, amount FROM events WHERE amount >= 900 ORDER BY amount DESC LIMIT 25",
+    )?];
 
     let app = run_workload("app_indexed_point_lookup", row_count, &app_queries)?;
     let analytic = run_workload("analytic_full_table_scan", row_count, &analytic_queries)?;
+    let range = run_workload("analytic_range_filter", row_count, &range_queries)?;
 
     println!("# P7 Relational Workload Benchmark");
     println!();
@@ -48,7 +52,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!();
     print_workload(&analytic);
     println!();
-    print_decision(&app, &analytic);
+    print_workload(&range);
+    println!();
+    print_decision(&app, &analytic, &range);
 
     Ok(())
 }
@@ -82,7 +88,7 @@ fn print_workload(report: &WorkloadReport) {
     println!("- correctness_validated: {}", report.correctness_validated);
 }
 
-fn print_decision(app: &WorkloadReport, analytic: &WorkloadReport) {
+fn print_decision(app: &WorkloadReport, analytic: &WorkloadReport, range: &WorkloadReport) {
     if analytic.bridge.gpu_executed_count > 0 && analytic.gpu_elapsed < analytic.cpu_elapsed {
         println!(
             "decision: GPU probe is faster for the analytical scan in this run; keep prioritizing SQL predicate/order/projection pushdown so more relational shapes can use the same path."
@@ -97,7 +103,10 @@ fn print_decision(app: &WorkloadReport, analytic: &WorkloadReport) {
         return;
     }
 
-    if app.bridge.cpu_fallback_count > 0 || analytic.bridge.cpu_fallback_count > 0 {
+    if app.bridge.cpu_fallback_count > 0
+        || analytic.bridge.cpu_fallback_count > 0
+        || range.bridge.cpu_fallback_count > 0
+    {
         println!(
             "decision: current relational workloads still fall back for important SQL shapes; prioritize SQL-to-GPU bridge expansion before claiming workload-level GPU advantage."
         );

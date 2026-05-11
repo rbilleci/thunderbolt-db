@@ -14,3 +14,9 @@ INSERT 0 3
  Linus |  2
 (1 row)
 
+=== relational range filter ===
+ name
+-------
+ Grace
+ Linus
+(2 rows)

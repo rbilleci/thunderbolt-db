@@ -17,8 +17,8 @@ use gpu_db_observability::{
 };
 use gpu_db_planner::{ExecutionPlan, Planner, PlannerConfig};
 use gpu_db_protocol::{
-    parse_command, ColumnDef, Command, CreateTable, Insert, ParseError, Select, SelectProjection,
-    SqlType, SqlValue,
+    parse_command, ColumnDef, Command, CreateTable, Insert, ParseError, Select, SelectFilterOp,
+    SelectProjection, SqlType, SqlValue,
 };
 use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine};
 use gpu_db_storage::{
@@ -5940,9 +5940,16 @@ pub enum RelationalAccessPath {
         column: String,
         matched_keys: usize,
     },
+    FilteredKeyBatch {
+        table: String,
+        predicate_column: String,
+        predicate_op: SelectFilterOp,
+        matched_keys: usize,
+    },
     OrderedKeyBatch {
         table: String,
         predicate_column: Option<String>,
+        predicate_op: Option<SelectFilterOp>,
         order_column: String,
         descending: bool,
         matched_keys: usize,
@@ -5984,7 +5991,7 @@ impl RelationalSqlGpuBridgeReport {
 struct BoundRelationalSelect {
     selected_columns: Vec<RelationalColumn>,
     selected_indexes: Vec<usize>,
-    filter: Option<(usize, SqlValue)>,
+    filter: Option<(usize, SelectFilterOp, SqlValue)>,
     order: Option<(usize, bool)>,
 }
 
@@ -6120,6 +6127,16 @@ fn compare_sql_values(left: &SqlValue, right: &SqlValue) -> Ordering {
     }
 }
 
+fn select_filter_matches(left: &SqlValue, op: SelectFilterOp, right: &SqlValue) -> bool {
+    match op {
+        SelectFilterOp::Eq => left == right,
+        SelectFilterOp::Lt => compare_sql_values(left, right).is_lt(),
+        SelectFilterOp::Lte => !compare_sql_values(left, right).is_gt(),
+        SelectFilterOp::Gt => compare_sql_values(left, right).is_gt(),
+        SelectFilterOp::Gte => !compare_sql_values(left, right).is_lt(),
+    }
+}
+
 fn sort_relational_keys(keyed_rows: &mut [(String, SqlValue)], descending: bool) {
     keyed_rows.sort_by(|(left_key, left_value), (right_key, right_value)| {
         let value_order = compare_sql_values(left_value, right_value);
@@ -6164,7 +6181,8 @@ fn bind_relational_select(
         .filter
         .as_ref()
         .map(|filter| {
-            relational_column_index(table, &filter.column).map(|idx| (idx, filter.value.clone()))
+            relational_column_index(table, &filter.column)
+                .map(|idx| (idx, filter.op, filter.value.clone()))
         })
         .transpose()?;
     let order = select
@@ -6204,6 +6222,7 @@ fn relational_select_needs_host_sql_finalization(
         && !matches!(
             access_path,
             RelationalAccessPath::EqualityIndex { .. }
+                | RelationalAccessPath::FilteredKeyBatch { .. }
                 | RelationalAccessPath::OrderedKeyBatch {
                     predicate_column: Some(_),
                     ..
@@ -6829,20 +6848,23 @@ impl Engine {
         let visibility = StorageVisibility {
             read_txn_id: self.visible_up_to,
         };
-        if let Some((column_idx, value)) = &bound.filter {
+        if let Some((column_idx, op, value)) = &bound.filter {
             let table_column = table
                 .columns
                 .get(*column_idx)
                 .expect("bound filter column came from table");
-            let mut keys = self
-                .relational_value_index
-                .get(&RelationalIndexKey {
-                    table: select.table.clone(),
-                    column: table_column.name.clone(),
-                    value: relational_index_value(value),
-                })
-                .cloned()
-                .unwrap_or_default();
+            let mut keys = if *op == SelectFilterOp::Eq {
+                self.relational_value_index
+                    .get(&RelationalIndexKey {
+                        table: select.table.clone(),
+                        column: table_column.name.clone(),
+                        value: relational_index_value(value),
+                    })
+                    .cloned()
+                    .unwrap_or_default()
+            } else {
+                self.relational_keys_matching_filter(table, *column_idx, *op, value)?
+            };
             let order_column = bound
                 .order
                 .as_ref()
@@ -6865,6 +6887,7 @@ impl Engine {
                 RelationalAccessPath::OrderedKeyBatch {
                     table: select.table.clone(),
                     predicate_column: Some(table_column.name.clone()),
+                    predicate_op: Some(*op),
                     order_column: order_column.name,
                     descending: bound
                         .order
@@ -6872,10 +6895,17 @@ impl Engine {
                         .unwrap_or(false),
                     matched_keys,
                 }
-            } else {
+            } else if *op == SelectFilterOp::Eq {
                 RelationalAccessPath::EqualityIndex {
                     table: select.table.clone(),
                     column: table_column.name.clone(),
+                    matched_keys,
+                }
+            } else {
+                RelationalAccessPath::FilteredKeyBatch {
+                    table: select.table.clone(),
+                    predicate_column: table_column.name.clone(),
+                    predicate_op: *op,
                     matched_keys,
                 }
             };
@@ -6898,6 +6928,7 @@ impl Engine {
                 RelationalAccessPath::OrderedKeyBatch {
                     table: select.table.clone(),
                     predicate_column: None,
+                    predicate_op: None,
                     order_column: table.columns[order_idx].name.clone(),
                     descending,
                     matched_keys,
@@ -6944,6 +6975,32 @@ impl Engine {
         Ok(keyed_rows.into_iter().map(|(key, _)| key).collect())
     }
 
+    fn relational_keys_matching_filter(
+        &self,
+        table: &RelationalTable,
+        filter_idx: usize,
+        op: SelectFilterOp,
+        value: &SqlValue,
+    ) -> Result<Vec<String>, ExecuteError> {
+        let visibility = StorageVisibility {
+            read_txn_id: self.visible_up_to,
+        };
+        let mut cursor = self.mvcc_store.seq_scan_open(visibility)?;
+        let prefix = relational_key_prefix(&table.name);
+        let mut keys = Vec::new();
+        while let Some(tuple) = cursor.next() {
+            if !tuple.key.starts_with(&prefix) {
+                continue;
+            }
+            let decoded = decode_relational_row(&tuple.value, &table.columns)?;
+            if select_filter_matches(&decoded[filter_idx], op, value) {
+                keys.push(tuple.key);
+            }
+        }
+        keys.sort();
+        Ok(keys)
+    }
+
     fn relational_ordered_table_keys(
         &self,
         table: &RelationalTable,
@@ -6979,8 +7036,8 @@ impl Engine {
                 continue;
             };
             let decoded = decode_relational_row(&value, &table.columns)?;
-            if let Some((idx, value)) = &bound.filter {
-                if decoded[*idx] != *value {
+            if let Some((idx, op, value)) = &bound.filter {
+                if !select_filter_matches(&decoded[*idx], *op, value) {
                     continue;
                 }
             }
@@ -22441,6 +22498,7 @@ mod tests {
             RelationalAccessPath::OrderedKeyBatch {
                 table: "people".to_string(),
                 predicate_column: Some("id".to_string()),
+                predicate_op: Some(SelectFilterOp::Eq),
                 order_column: "name".to_string(),
                 descending: false,
                 matched_keys: 1,
@@ -22530,6 +22588,7 @@ mod tests {
             RelationalAccessPath::OrderedKeyBatch {
                 table: "people".to_string(),
                 predicate_column: Some("id".to_string()),
+                predicate_op: Some(SelectFilterOp::Eq),
                 order_column: "name".to_string(),
                 descending: false,
                 matched_keys: 2,
@@ -22569,6 +22628,7 @@ mod tests {
             RelationalAccessPath::OrderedKeyBatch {
                 table: "people".to_string(),
                 predicate_column: None,
+                predicate_op: None,
                 order_column: "name".to_string(),
                 descending: true,
                 matched_keys: 3,
@@ -22612,6 +22672,81 @@ mod tests {
             }
         );
         assert_eq!(e.status_snapshot().latest_fallback_reason(), None);
+    }
+
+    #[test]
+    fn relational_sql_gpu_bridge_range_predicate_uses_filtered_key_batch() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO people (id, name) VALUES (1, 'Ada'), (2, 'Linus'), (3, 'Grace'), (4, 'Katherine')",
+        )
+        .unwrap();
+
+        let Command::Select(select) =
+            parse_command("SELECT name FROM people WHERE id >= 3 LIMIT 1").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let result = e
+            .execute_relational_select_with_backend(&select, &FirstCudaSliceParityBackend)
+            .unwrap();
+
+        assert_eq!(result.rows, vec![vec![SqlValue::Text("Grace".to_string())]]);
+        assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.fallback_reason, None);
+        assert_eq!(
+            result.access_path,
+            RelationalAccessPath::FilteredKeyBatch {
+                table: "people".to_string(),
+                predicate_column: "id".to_string(),
+                predicate_op: SelectFilterOp::Gte,
+                matched_keys: 2,
+            }
+        );
+        assert_eq!(e.status_snapshot().latest_fallback_reason(), None);
+    }
+
+    #[test]
+    fn relational_sql_gpu_bridge_range_predicate_with_order_uses_ordered_key_batch() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO people (id, name) VALUES (1, 'Ada'), (2, 'Linus'), (3, 'Grace'), (4, 'Katherine')",
+        )
+        .unwrap();
+
+        let Command::Select(select) =
+            parse_command("SELECT id FROM people WHERE id > 1 ORDER BY name DESC LIMIT 2").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let result = e
+            .execute_relational_select_with_backend(&select, &FirstCudaSliceParityBackend)
+            .unwrap();
+
+        assert_eq!(
+            result.rows,
+            vec![vec![SqlValue::Int4(2)], vec![SqlValue::Int4(4)]]
+        );
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.fallback_reason, None);
+        assert_eq!(
+            result.access_path,
+            RelationalAccessPath::OrderedKeyBatch {
+                table: "people".to_string(),
+                predicate_column: Some("id".to_string()),
+                predicate_op: Some(SelectFilterOp::Gt),
+                order_column: "name".to_string(),
+                descending: true,
+                matched_keys: 3,
+            }
+        );
     }
 
     #[test]
@@ -22764,6 +22899,35 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires local NVIDIA driver and CUDA-capable hardware"]
+    fn execute_mvcc_query_cuda_driver_runs_relational_sql_range_without_fallback() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO people (id, name) VALUES (1, 'Ada'), (2, 'Linus'), (3, 'Grace'), (4, 'Katherine')",
+        )
+        .unwrap();
+
+        let Command::Select(select) =
+            parse_command("SELECT id FROM people WHERE id > 1 ORDER BY name DESC LIMIT 2").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let result = e
+            .execute_relational_select_with_cuda_driver_probe(&select)
+            .unwrap();
+
+        assert_eq!(
+            result.rows,
+            vec![vec![SqlValue::Int4(2)], vec![SqlValue::Int4(4)]]
+        );
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.fallback_reason, None);
+    }
+
+    #[test]
     fn relational_catalog_assigns_stable_public_schema_and_type_metadata() {
         let mut e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
@@ -22826,7 +22990,10 @@ mod tests {
             bound.selected_columns[0].type_oid,
             SqlType::Text.postgres_oid()
         );
-        assert_eq!(bound.filter, Some((0, SqlValue::Int4(1))));
+        assert_eq!(
+            bound.filter,
+            Some((0, SelectFilterOp::Eq, SqlValue::Int4(1)))
+        );
         assert_eq!(bound.order, Some((1, true)));
 
         let Command::Select(bad_select) =
@@ -22881,6 +23048,7 @@ mod tests {
             RelationalAccessPath::OrderedKeyBatch {
                 table: "people".to_string(),
                 predicate_column: None,
+                predicate_op: None,
                 order_column: "id".to_string(),
                 descending: false,
                 matched_keys: 2,
@@ -22913,6 +23081,7 @@ mod tests {
             RelationalAccessPath::OrderedKeyBatch {
                 table: "people".to_string(),
                 predicate_column: Some("name".to_string()),
+                predicate_op: Some(SelectFilterOp::Eq),
                 order_column: "id".to_string(),
                 descending: false,
                 matched_keys: 2,
