@@ -102,6 +102,32 @@ Failure criteria:
 - resumed state advances `applied_index` beyond durable committed boundary
 - resumed state recovers uncommitted tail as if durable
 
+## 4c) Local Operational Replication Smoke
+
+Current implemented scope:
+
+- `scripts/run_replication_cluster_smoke.sh` runs an in-process 3-node Raft smoke scenario.
+- The scenario demonstrates leader write admission, follower catch-up, read-after-apply, old-leader `NotLeader` rejection after failover, and continued writes on the promoted leader.
+
+Current simulated/not-yet-implemented scope:
+
+- No network transport between node processes.
+- No automatic election or membership reconfiguration.
+- No packaged container/Kubernetes deployment harness.
+
+Run from repository root:
+
+```bash
+scripts/run_replication_cluster_smoke.sh
+```
+
+Pass criteria:
+
+- Output includes `operational_replication_smoke=passed`.
+- Follower output reports `follower_caught_up=true`.
+- `follower_read_after_apply` includes the post-failover write.
+- `failover_admission_gate` reports old-leader write rejection and a `Leader` role for the promoted node.
+
 ## 5) CPU Fallback Monitoring (No-GPU bootstrap)
 
 Expected behavior in bootstrap phase:

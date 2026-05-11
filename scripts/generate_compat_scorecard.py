@@ -62,6 +62,8 @@ def classify(test_id: str) -> list[str]:
         buckets.append("sql.transaction_flows")
     if re.search(r"wal|durable|visibility|checkpoint|replay", test_id):
         buckets.append("durability.invariants")
+    if re.search(r"operational_replication|cluster_smoke|read_after_apply|failover", test_id):
+        buckets.append("replication.operational_cluster")
     if re.search(r"replication|raft|snapshot|leader|follower", test_id):
         buckets.append("replication.role_and_log")
     if re.search(r"gpu|fallback|batch", test_name):

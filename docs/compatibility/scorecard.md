@@ -54,6 +54,7 @@ To make new compatibility tests visible in the right bucket:
    - `sql_gpu`, `gpu_bridge`, `relational_sql_select_cuda`, or `relational_sql_select_gpu` for the P4 SQL-to-GPU bridge bucket
    - `relational_index`, `access_path`, or `equality_index` for the P5 storage/indexing bucket
    - `relational_catalog`, `catalog_schema`, `catalog_introspection`, `pg_catalog`, `type_metadata`, `column_id`, or `relation_oid` for the P2 catalog/schema/type bucket
+   - `operational_replication`, `cluster_smoke`, `read_after_apply`, or `failover` for the P6 local operational replication bucket
    - `transaction`, `commit`, `rollback` for transaction flows
 2. If a new category is needed, add or refine matching rules in `classify()` inside `scripts/generate_compat_scorecard.py`.
 3. Regenerate scorecard outputs and include them in the same PR.

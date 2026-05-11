@@ -427,11 +427,11 @@ Initial target:
 - Operator-facing readiness/failover evidence.
 
 Exit criteria:
-1. A scripted multi-node run demonstrates write on leader, catch-up on follower, and read-after-apply behavior.
-2. A failover or leader-transition scenario is tested with explicit admission gates.
-3. Replication lag/readiness/failure signals appear in the engine truth surface or operational output.
-4. Backup/PITR/DR runbooks identify what is implemented, simulated, or still missing.
-5. Compatibility scorecard or testing report includes the operational replication scenario.
+1. A scripted multi-node run demonstrates write on leader, catch-up on follower, and read-after-apply behavior. First slice landed on 2026-05-11 with `scripts/run_replication_cluster_smoke.sh`, a local in-process 3-node Raft smoke harness that prints catch-up/read-after-apply evidence.
+2. A failover or leader-transition scenario is tested with explicit admission gates. First slice landed on 2026-05-11 with old-leader `NotLeader` rejection after role transition and new-leader continuation in `operational_replication_three_node_smoke_catches_up_reads_after_apply_and_gates_failover`.
+3. Replication lag/readiness/failure signals appear in the engine truth surface or operational output. First slice landed on 2026-05-11 with smoke output for leader/follower commit/apply/caught-up state plus assertions through `ReplicationProgress` and `ReplicationStatusSnapshot`.
+4. Backup/PITR/DR runbooks identify what is implemented, simulated, or still missing. First P6 runbook reconciliation landed on 2026-05-11 and labels the local smoke path as in-process, with networked transport, automatic election, and packaged deployment still missing.
+5. Compatibility scorecard or testing report includes the operational replication scenario. First slice landed on 2026-05-11 with the `replication.operational_cluster` scorecard bucket.
 
 ### P7. Real workload performance proof
 
