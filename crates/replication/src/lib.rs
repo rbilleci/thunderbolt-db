@@ -113,8 +113,36 @@ impl OperationalClusterSmokeReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationalTransportSmokeReport {
+    pub transport_scope: &'static str,
+    pub append_batches_sent: usize,
+    pub heartbeat_batches_sent: usize,
+    pub follower_acks_recorded: usize,
+}
+
+impl OperationalTransportSmokeReport {
+    pub fn readiness_passed(&self) -> bool {
+        !self.transport_scope.is_empty()
+            && self.append_batches_sent > 0
+            && self.heartbeat_batches_sent > 0
+            && self.follower_acks_recorded > 0
+    }
+
+    pub fn to_operator_line(&self) -> String {
+        format!(
+            "deployment_transport={} append_batches_sent={} heartbeat_batches_sent={} follower_acks_recorded={}",
+            self.transport_scope,
+            self.append_batches_sent,
+            self.heartbeat_batches_sent,
+            self.follower_acks_recorded
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperationalDeploymentPreflightReport {
     pub smoke: OperationalClusterSmokeReport,
+    pub transport: OperationalTransportSmokeReport,
     pub network_transport_implemented: bool,
     pub automatic_election_implemented: bool,
     pub packaged_deployment_implemented: bool,
@@ -122,11 +150,12 @@ pub struct OperationalDeploymentPreflightReport {
 
 impl OperationalDeploymentPreflightReport {
     pub fn readiness_passed(&self) -> bool {
-        self.smoke.readiness_passed()
+        self.smoke.readiness_passed() && self.transport.readiness_passed()
     }
 
     pub fn to_operator_lines(&self) -> Vec<String> {
         let mut lines = self.smoke.to_operator_lines();
+        lines.push(self.transport.to_operator_line());
         lines.extend([
             format!(
                 "operational_deployment_preflight={}",
@@ -1299,6 +1328,9 @@ mod tests {
         let mut follower_b = RaftReplicator::new(3);
         let mut state_a = AppliedLog::default();
         let mut state_b = AppliedLog::default();
+        let mut append_batches_sent = 0;
+        let mut heartbeat_batches_sent = 0;
+        let mut follower_acks_recorded = 0;
 
         leader.become_leader(1);
         assert!(matches!(
@@ -1324,15 +1356,19 @@ mod tests {
             },
         ];
 
+        append_batches_sent += 1;
         follower_a
             .append_entries_from_leader(term_one, 0, 0, first_batch.clone(), 0)
             .unwrap();
         leader.register_follower_ack(first.index, 1);
+        follower_acks_recorded += 1;
         leader.register_follower_ack(second.index, 1);
+        follower_acks_recorded += 1;
         leader
             .wait_committed(second, std::time::Duration::from_millis(1))
             .unwrap();
 
+        heartbeat_batches_sent += 1;
         follower_a
             .append_entries_from_leader(
                 term_one,
@@ -1344,6 +1380,7 @@ mod tests {
             .unwrap();
         apply_committed_entries(&mut follower_a, &mut state_a).unwrap();
 
+        append_batches_sent += 1;
         follower_b
             .append_entries_from_leader(term_one, 0, 0, first_batch, leader.commit_index())
             .unwrap();
@@ -1369,6 +1406,7 @@ mod tests {
             .propose(b"insert into t values (2)".to_vec())
             .unwrap();
         let term_two = follower_a.current_term();
+        append_batches_sent += 1;
         follower_b
             .append_entries_from_leader(
                 term_two,
@@ -1383,9 +1421,11 @@ mod tests {
             )
             .unwrap();
         follower_a.register_follower_ack(third.index, 2);
+        follower_acks_recorded += 1;
         follower_a
             .wait_committed(third, std::time::Duration::from_millis(1))
             .unwrap();
+        heartbeat_batches_sent += 1;
         follower_b
             .append_entries_from_leader(
                 term_two,
@@ -1417,6 +1457,12 @@ mod tests {
         assert!(smoke.readiness_passed());
         let report = OperationalDeploymentPreflightReport {
             smoke,
+            transport: OperationalTransportSmokeReport {
+                transport_scope: "in_memory_append_entries",
+                append_batches_sent,
+                heartbeat_batches_sent,
+                follower_acks_recorded,
+            },
             network_transport_implemented: false,
             automatic_election_implemented: false,
             packaged_deployment_implemented: false,
@@ -1429,6 +1475,7 @@ mod tests {
                 "promoted_leader_term=2 promoted_leader_commit=3 follower_commit=3 follower_applied=3 follower_caught_up=true".to_string(),
                 "follower_read_after_apply=create table t(id int) | insert into t values (1) | insert into t values (2)".to_string(),
                 "failover_admission_gate=old_leader_not_leader promoted_node_role=Leader".to_string(),
+                "deployment_transport=in_memory_append_entries append_batches_sent=3 heartbeat_batches_sent=2 follower_acks_recorded=3".to_string(),
                 "operational_deployment_preflight=passed".to_string(),
                 "deployment_scope=in_process_three_node_raft_smoke".to_string(),
                 "deployment_gap_network_transport=missing".to_string(),

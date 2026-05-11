@@ -117,7 +117,7 @@ Current implemented scope:
 
 - `scripts/run_replication_cluster_smoke.sh` runs an in-process 3-node Raft smoke scenario.
 - The scenario demonstrates leader write admission, follower catch-up, read-after-apply, old-leader `NotLeader` rejection after failover, and continued writes on the promoted leader.
-- The same command emits an `operational_deployment_preflight=passed` line only when the smoke proof passes and the current deployment scope/gaps are explicitly reported.
+- The same command emits an `operational_deployment_preflight=passed` line only when the smoke proof passes and the current in-memory append-entries transport evidence plus deployment scope/gaps are explicitly reported.
 
 Current simulated/not-yet-implemented scope:
 
@@ -136,6 +136,7 @@ Pass criteria:
 - Output includes `operational_replication_smoke=passed`.
 - Output includes `operational_deployment_preflight=passed`.
 - Output includes `deployment_scope=in_process_three_node_raft_smoke`.
+- Output includes `deployment_transport=in_memory_append_entries` with append batch, heartbeat batch, and follower-ack counts.
 - Follower output reports `follower_caught_up=true`.
 - `follower_read_after_apply` includes the post-failover write.
 - `promoted_leader_commit`, `follower_commit`, and `follower_applied` are equal.

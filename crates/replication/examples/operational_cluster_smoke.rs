@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use gpu_db_replication::{
     LogReplicator, OperationalClusterSmokeReport, OperationalDeploymentPreflightReport,
-    RaftReplicator, ReplicatedStateMachine,
+    OperationalTransportSmokeReport, RaftReplicator, ReplicatedStateMachine,
 };
 use gpu_db_types::{EngineError, Index, LogEntry, Role, Term};
 
@@ -55,6 +55,9 @@ fn main() -> Result<(), EngineError> {
     let mut follower_b = RaftReplicator::new(3);
     let mut state_a = AppliedLog::default();
     let mut state_b = AppliedLog::default();
+    let mut append_batches_sent = 0;
+    let mut heartbeat_batches_sent = 0;
+    let mut follower_acks_recorded = 0;
 
     leader.become_leader(1);
     assert_eq!(leader.role(), Role::Leader);
@@ -79,11 +82,15 @@ fn main() -> Result<(), EngineError> {
         },
     ];
 
+    append_batches_sent += 1;
     append_entries(&mut follower_a, term_one, 0, 0, first_batch.clone(), 0)?;
     leader.register_follower_ack(first.index, 1);
+    follower_acks_recorded += 1;
     leader.register_follower_ack(second.index, 1);
+    follower_acks_recorded += 1;
     leader.wait_committed(second, Duration::from_millis(1))?;
 
+    heartbeat_batches_sent += 1;
     append_entries(
         &mut follower_a,
         term_one,
@@ -94,6 +101,7 @@ fn main() -> Result<(), EngineError> {
     )?;
     apply_committed(&mut follower_a, &mut state_a)?;
 
+    append_batches_sent += 1;
     append_entries(
         &mut follower_b,
         term_one,
@@ -128,6 +136,7 @@ fn main() -> Result<(), EngineError> {
         payload: b"insert into t values (2)".to_vec(),
     }];
 
+    append_batches_sent += 1;
     append_entries(
         &mut follower_b,
         term_two,
@@ -137,7 +146,9 @@ fn main() -> Result<(), EngineError> {
         follower_a.commit_index(),
     )?;
     follower_a.register_follower_ack(third.index, 2);
+    follower_acks_recorded += 1;
     follower_a.wait_committed(third, Duration::from_millis(1))?;
+    heartbeat_batches_sent += 1;
     append_entries(
         &mut follower_b,
         term_two,
@@ -167,6 +178,12 @@ fn main() -> Result<(), EngineError> {
     };
     let report = OperationalDeploymentPreflightReport {
         smoke,
+        transport: OperationalTransportSmokeReport {
+            transport_scope: "in_memory_append_entries",
+            append_batches_sent,
+            heartbeat_batches_sent,
+            follower_acks_recorded,
+        },
         network_transport_implemented: false,
         automatic_election_implemented: false,
         packaged_deployment_implemented: false,
