@@ -176,10 +176,41 @@ impl OperationalElectionSmokeReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationalPackageSmokeReport {
+    pub package_scope: &'static str,
+    pub entrypoint: &'static str,
+    pub smoke_script: &'static str,
+    pub packaged_script: &'static str,
+    pub reproducible: bool,
+}
+
+impl OperationalPackageSmokeReport {
+    pub fn readiness_passed(&self) -> bool {
+        !self.package_scope.is_empty()
+            && !self.entrypoint.is_empty()
+            && !self.smoke_script.is_empty()
+            && !self.packaged_script.is_empty()
+            && self.reproducible
+    }
+
+    pub fn to_operator_line(&self) -> String {
+        format!(
+            "deployment_package={} entrypoint={} smoke_script={} packaged_script={} reproducible={}",
+            self.package_scope,
+            self.entrypoint,
+            self.smoke_script,
+            self.packaged_script,
+            self.reproducible
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperationalDeploymentPreflightReport {
     pub smoke: OperationalClusterSmokeReport,
     pub transport: OperationalTransportSmokeReport,
     pub election: OperationalElectionSmokeReport,
+    pub package: OperationalPackageSmokeReport,
     pub network_transport_implemented: bool,
     pub automatic_election_implemented: bool,
     pub packaged_deployment_implemented: bool,
@@ -190,12 +221,14 @@ impl OperationalDeploymentPreflightReport {
         self.smoke.readiness_passed()
             && self.transport.readiness_passed()
             && self.election.readiness_passed()
+            && self.package.readiness_passed()
     }
 
     pub fn to_operator_lines(&self) -> Vec<String> {
         let mut lines = self.smoke.to_operator_lines();
         lines.push(self.transport.to_operator_line());
         lines.push(self.election.to_operator_line());
+        lines.push(self.package.to_operator_line());
         lines.extend([
             format!(
                 "operational_deployment_preflight={}",
@@ -205,7 +238,7 @@ impl OperationalDeploymentPreflightReport {
                     "failed"
                 }
             ),
-            "deployment_scope=in_process_three_node_raft_smoke".to_string(),
+            "deployment_scope=packaged_local_three_node_raft_smoke".to_string(),
             format!(
                 "deployment_gap_network_transport={}",
                 if self.network_transport_implemented {
@@ -1938,9 +1971,16 @@ mod tests {
                 quorum: election_quorum,
                 elected: election_passed,
             },
+            package: OperationalPackageSmokeReport {
+                package_scope: "local_cargo_example_binary",
+                entrypoint: "crates/replication/examples/operational_cluster_smoke.rs",
+                smoke_script: "scripts/run_replication_cluster_smoke.sh",
+                packaged_script: "scripts/run_replication_packaged_smoke.sh",
+                reproducible: true,
+            },
             network_transport_implemented: true,
             automatic_election_implemented: true,
-            packaged_deployment_implemented: false,
+            packaged_deployment_implemented: true,
         };
         assert!(report.readiness_passed());
         assert_eq!(
@@ -1952,11 +1992,12 @@ mod tests {
                 "failover_admission_gate=old_leader_not_leader promoted_node_role=Leader".to_string(),
                 "deployment_transport=single_request_tcp_append_entries append_batches_sent=3 heartbeat_batches_sent=2 follower_acks_recorded=3".to_string(),
                 "deployment_election=deterministic_request_vote candidate_id=1 elected_term=2 votes_granted=3 quorum=2 elected=true".to_string(),
+                "deployment_package=local_cargo_example_binary entrypoint=crates/replication/examples/operational_cluster_smoke.rs smoke_script=scripts/run_replication_cluster_smoke.sh packaged_script=scripts/run_replication_packaged_smoke.sh reproducible=true".to_string(),
                 "operational_deployment_preflight=passed".to_string(),
-                "deployment_scope=in_process_three_node_raft_smoke".to_string(),
+                "deployment_scope=packaged_local_three_node_raft_smoke".to_string(),
                 "deployment_gap_network_transport=implemented".to_string(),
                 "deployment_gap_automatic_election=implemented".to_string(),
-                "deployment_gap_packaged_deployment=missing".to_string(),
+                "deployment_gap_packaged_deployment=implemented".to_string(),
             ]
         );
     }

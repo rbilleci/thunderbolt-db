@@ -3,8 +3,8 @@ use std::time::Duration;
 use gpu_db_replication::{
     send_append_entries_once, serve_append_entries_once, AppendEntriesRequest, LogReplicator,
     OperationalClusterSmokeReport, OperationalDeploymentPreflightReport,
-    OperationalElectionSmokeReport, OperationalTransportSmokeReport, RaftReplicator,
-    ReplicatedStateMachine,
+    OperationalElectionSmokeReport, OperationalPackageSmokeReport, OperationalTransportSmokeReport,
+    RaftReplicator, ReplicatedStateMachine,
 };
 use gpu_db_types::{EngineError, Index, LogEntry, Role, Term};
 
@@ -253,9 +253,16 @@ fn main() -> Result<(), EngineError> {
             quorum: election_quorum,
             elected: election_passed,
         },
+        package: OperationalPackageSmokeReport {
+            package_scope: "local_cargo_example_binary",
+            entrypoint: "crates/replication/examples/operational_cluster_smoke.rs",
+            smoke_script: "scripts/run_replication_cluster_smoke.sh",
+            packaged_script: "scripts/run_replication_packaged_smoke.sh",
+            reproducible: true,
+        },
         network_transport_implemented: true,
         automatic_election_implemented: true,
-        packaged_deployment_implemented: false,
+        packaged_deployment_implemented: true,
     };
     assert!(report.readiness_passed());
     for line in report.to_operator_lines() {

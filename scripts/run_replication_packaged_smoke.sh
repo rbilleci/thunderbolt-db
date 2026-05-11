@@ -4,7 +4,15 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-output="$(cargo run -p gpu_db_replication --example operational_cluster_smoke --quiet)"
+cargo build -p gpu_db_replication --example operational_cluster_smoke --quiet
+
+binary="$repo_root/target/debug/examples/operational_cluster_smoke"
+if [[ ! -x "$binary" ]]; then
+  printf 'packaged smoke binary is not executable: %s\n' "$binary" >&2
+  exit 1
+fi
+
+output="$("$binary")"
 printf '%s\n' "$output"
 
 required_lines=(
@@ -21,7 +29,7 @@ required_lines=(
 
 for required in "${required_lines[@]}"; do
   if ! grep -Fqx "$required" <<<"$output"; then
-    printf 'missing required operational evidence line: %s\n' "$required" >&2
+    printf 'missing required packaged operational evidence line: %s\n' "$required" >&2
     exit 1
   fi
 done
