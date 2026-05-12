@@ -1,0 +1,7 @@
+=== pg_catalog pg_attribute joined supported column types ===
+CREATE TABLE
+ attnum | attname | data_type | attnotnull
+--------+---------+-----------+------------
+      1 | id      | integer   | f
+      2 | name    | text      | f
+(2 rows)

@@ -1266,6 +1266,28 @@ fn execute_statement(
             &rows,
         );
     }
+    if let Some(table) = pg_catalog_class_attribute_type_query_table(&canonical) {
+        let Some(rows) = pg_catalog_class_attribute_type_rows(session, &table) else {
+            return write_error(
+                stream,
+                &ErrorField {
+                    code: "42P01",
+                    message: "relation does not exist",
+                    position: None,
+                },
+            );
+        };
+        return write_single_row(
+            stream,
+            &[
+                int4_column("attnum"),
+                text_column("attname"),
+                text_column("data_type"),
+                text_column("attnotnull"),
+            ],
+            &rows,
+        );
+    }
     match canonical.as_str() {
         "begin" => {
             session.in_transaction = true;
@@ -2246,6 +2268,36 @@ fn catalog_attribute_detail_rows(
     )
 }
 
+fn pg_catalog_class_attribute_type_query_table(canonical: &str) -> Option<String> {
+    let prefix = "select a.attnum, a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod) as data_type, a.attnotnull from pg_catalog.pg_attribute a join pg_catalog.pg_class c on c.oid = a.attrelid join pg_catalog.pg_namespace n on n.oid = c.relnamespace where n.nspname = 'public' and c.relname = '";
+    let suffix = "' and a.attnum > 0 and not a.attisdropped order by a.attnum";
+    canonical
+        .strip_prefix(prefix)?
+        .strip_suffix(suffix)
+        .map(str::to_string)
+}
+
+fn pg_catalog_class_attribute_type_rows(
+    session: &Session,
+    table: &str,
+) -> Option<Vec<Vec<Option<String>>>> {
+    let table = session.tables.get(table)?;
+    Some(
+        table
+            .columns
+            .iter()
+            .map(|column| {
+                vec![
+                    Some(column.attnum.to_string()),
+                    Some(column.def.name.clone()),
+                    Some(sql_type_display_name(column.def.ty).to_string()),
+                    Some("f".to_string()),
+                ]
+            })
+            .collect(),
+    )
+}
+
 fn canonical_sql(input: &str) -> String {
     let mut sql = input.trim();
     while let Some(stripped) = sql.strip_suffix(';') {
@@ -3099,6 +3151,29 @@ mod tests {
                     Some("name".to_string()),
                     Some("25".to_string()),
                     Some("-1".to_string()),
+                ],
+            ]
+        );
+        assert_eq!(
+            pg_catalog_class_attribute_type_query_table(
+                "select a.attnum, a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod) as data_type, a.attnotnull from pg_catalog.pg_attribute a join pg_catalog.pg_class c on c.oid = a.attrelid join pg_catalog.pg_namespace n on n.oid = c.relnamespace where n.nspname = 'public' and c.relname = 'people' and a.attnum > 0 and not a.attisdropped order by a.attnum"
+            ),
+            Some("people".to_string())
+        );
+        assert_eq!(
+            pg_catalog_class_attribute_type_rows(&session, "people").unwrap(),
+            vec![
+                vec![
+                    Some("1".to_string()),
+                    Some("id".to_string()),
+                    Some("integer".to_string()),
+                    Some("f".to_string()),
+                ],
+                vec![
+                    Some("2".to_string()),
+                    Some("name".to_string()),
+                    Some("text".to_string()),
+                    Some("f".to_string()),
                 ],
             ]
         );
