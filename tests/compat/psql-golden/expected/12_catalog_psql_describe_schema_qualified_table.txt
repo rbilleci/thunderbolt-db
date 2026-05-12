@@ -1,0 +1,15 @@
+=== psql d schema qualified table meta-command ===
+CREATE TABLE
+       Table "public.describe_schema_people"
+ Column |  Type   | Collation | Nullable | Default
+--------+---------+-----------+----------+---------
+ id     | integer |           |          |
+ name   | text    |           |          |
+
+=== psql d plus schema qualified table meta-command ===
+                                  Table "public.describe_schema_people"
+ Column |  Type   | Collation | Nullable | Default | Storage  | Compression | Stats target | Description
+--------+---------+-----------+----------+---------+----------+-------------+--------------+-------------
+ id     | integer |           |          |         | plain    |             |              |
+ name   | text    |           |          |         | extended |             |              |
+Access method: heap

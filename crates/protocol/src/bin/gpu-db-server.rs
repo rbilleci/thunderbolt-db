@@ -1310,12 +1310,23 @@ fn catalog_psql_describe_schema_rows() -> Vec<Vec<Option<String>>> {
 
 fn catalog_describe_relation_lookup_query_table(canonical: &str) -> Option<String> {
     let prefix = "select c.oid, n.nspname, c.relname from pg_catalog.pg_class c left join pg_catalog.pg_namespace n on n.oid = c.relnamespace where c.relname operator(pg_catalog.~) '^(";
-    let suffix =
+    let visible_suffix =
         ")$' collate pg_catalog.default and pg_catalog.pg_table_is_visible(c.oid) order by 2, 3";
-    canonical
+    if let Some(table) = canonical
+        .strip_prefix(prefix)
+        .and_then(|rest| rest.strip_suffix(visible_suffix))
+    {
+        return Some(table.to_string());
+    }
+
+    let namespace_middle =
+        ")$' collate pg_catalog.default and n.nspname operator(pg_catalog.~) '^(";
+    let namespace_suffix = ")$' collate pg_catalog.default order by 2, 3";
+    let (table, namespace) = canonical
         .strip_prefix(prefix)?
-        .strip_suffix(suffix)
-        .map(str::to_string)
+        .strip_suffix(namespace_suffix)?
+        .split_once(namespace_middle)?;
+    (namespace == "public").then(|| table.to_string())
 }
 
 fn catalog_describe_relation_lookup_rows(
@@ -2109,6 +2120,18 @@ mod tests {
                 "select c.oid, n.nspname, c.relname from pg_catalog.pg_class c left join pg_catalog.pg_namespace n on n.oid = c.relnamespace where c.relname operator(pg_catalog.~) '^(people)$' collate pg_catalog.default and pg_catalog.pg_table_is_visible(c.oid) order by 2, 3"
             ),
             Some("people".to_string())
+        );
+        assert_eq!(
+            catalog_describe_relation_lookup_query_table(
+                "select c.oid, n.nspname, c.relname from pg_catalog.pg_class c left join pg_catalog.pg_namespace n on n.oid = c.relnamespace where c.relname operator(pg_catalog.~) '^(people)$' collate pg_catalog.default and n.nspname operator(pg_catalog.~) '^(public)$' collate pg_catalog.default order by 2, 3"
+            ),
+            Some("people".to_string())
+        );
+        assert_eq!(
+            catalog_describe_relation_lookup_query_table(
+                "select c.oid, n.nspname, c.relname from pg_catalog.pg_class c left join pg_catalog.pg_namespace n on n.oid = c.relnamespace where c.relname operator(pg_catalog.~) '^(people)$' collate pg_catalog.default and n.nspname operator(pg_catalog.~) '^(private)$' collate pg_catalog.default order by 2, 3"
+            ),
+            None
         );
         assert_eq!(
             catalog_describe_relation_lookup_rows(&session, "people"),
