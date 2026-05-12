@@ -1,0 +1,10 @@
+=== psql z schema qualified privileges pattern meta-command ===
+CREATE TABLE
+CREATE TABLE
+CREATE TABLE
+                                    Access privileges
+ Schema |        Name         | Type  | Access privileges | Column privileges | Policies
+--------+---------------------+-------+-------------------+-------------------+----------
+ public | z_privileges_people | table |                   |                   |
+ public | z_privileges_teams  | table |                   |                   |
+(2 rows)
