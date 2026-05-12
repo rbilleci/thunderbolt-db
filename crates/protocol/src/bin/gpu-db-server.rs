@@ -1346,6 +1346,28 @@ fn execute_statement(
             &information_schema_extended_column_rows_for_table(session, &table),
         );
     }
+    if let Some(table) = information_schema_extended_columns_catalog_query_table(&canonical) {
+        return write_single_row(
+            stream,
+            &[
+                text_column("table_catalog"),
+                text_column("table_schema"),
+                text_column("table_name"),
+                text_column("column_name"),
+                int4_column("ordinal_position"),
+                text_column("column_default"),
+                text_column("is_nullable"),
+                text_column("data_type"),
+                int4_column("character_maximum_length"),
+                int4_column("numeric_precision"),
+                int4_column("numeric_precision_radix"),
+                int4_column("numeric_scale"),
+                text_column("udt_schema"),
+                text_column("udt_name"),
+            ],
+            &information_schema_extended_column_rows_for_table(session, &table),
+        );
+    }
     if let Some(tables) = information_schema_extended_columns_in_query_tables(&canonical) {
         return write_single_row(
             stream,
@@ -2522,6 +2544,22 @@ fn information_schema_extended_columns_query_table(canonical: &str) -> Option<St
     let suffix = "' order by ordinal_position";
     canonical
         .strip_prefix(prefix)?
+        .strip_suffix(suffix)
+        .map(str::to_string)
+}
+
+fn information_schema_extended_columns_catalog_query_table(canonical: &str) -> Option<String> {
+    let suffix = "' order by ordinal_position";
+    let current_database_prefix = "select table_catalog, table_schema, table_name, column_name, ordinal_position, column_default, is_nullable, data_type, character_maximum_length, numeric_precision, numeric_precision_radix, numeric_scale, udt_schema, udt_name from information_schema.columns where table_catalog = current_database() and table_schema = 'public' and table_name = '";
+    if let Some(table) = canonical
+        .strip_prefix(current_database_prefix)
+        .and_then(|rest| rest.strip_suffix(suffix))
+    {
+        return Some(table.to_string());
+    }
+    let literal_catalog_prefix = "select table_catalog, table_schema, table_name, column_name, ordinal_position, column_default, is_nullable, data_type, character_maximum_length, numeric_precision, numeric_precision_radix, numeric_scale, udt_schema, udt_name from information_schema.columns where table_catalog = 'postgres' and table_schema = 'public' and table_name = '";
+    canonical
+        .strip_prefix(literal_catalog_prefix)?
         .strip_suffix(suffix)
         .map(str::to_string)
 }
@@ -3948,6 +3986,18 @@ mod tests {
         assert_eq!(
             information_schema_extended_columns_query_table(
                 "select table_catalog, table_schema, table_name, column_name, ordinal_position, column_default, is_nullable, data_type, character_maximum_length, numeric_precision, numeric_precision_radix, numeric_scale, udt_schema, udt_name from information_schema.columns where table_schema = 'public' and table_name = 'people' order by ordinal_position"
+            ),
+            Some("people".to_string())
+        );
+        assert_eq!(
+            information_schema_extended_columns_catalog_query_table(
+                "select table_catalog, table_schema, table_name, column_name, ordinal_position, column_default, is_nullable, data_type, character_maximum_length, numeric_precision, numeric_precision_radix, numeric_scale, udt_schema, udt_name from information_schema.columns where table_catalog = current_database() and table_schema = 'public' and table_name = 'people' order by ordinal_position"
+            ),
+            Some("people".to_string())
+        );
+        assert_eq!(
+            information_schema_extended_columns_catalog_query_table(
+                "select table_catalog, table_schema, table_name, column_name, ordinal_position, column_default, is_nullable, data_type, character_maximum_length, numeric_precision, numeric_precision_radix, numeric_scale, udt_schema, udt_name from information_schema.columns where table_catalog = 'postgres' and table_schema = 'public' and table_name = 'people' order by ordinal_position"
             ),
             Some("people".to_string())
         );
