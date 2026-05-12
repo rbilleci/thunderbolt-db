@@ -1214,6 +1214,26 @@ fn execute_statement(
             &information_schema_rich_table_rows(session),
         );
     }
+    if let Some(table) = information_schema_rich_tables_query_table(&canonical) {
+        return write_single_row(
+            stream,
+            &[
+                text_column("table_catalog"),
+                text_column("table_schema"),
+                text_column("table_name"),
+                text_column("table_type"),
+                text_column("self_referencing_column_name"),
+                text_column("reference_generation"),
+                text_column("user_defined_type_catalog"),
+                text_column("user_defined_type_schema"),
+                text_column("user_defined_type_name"),
+                text_column("is_insertable_into"),
+                text_column("is_typed"),
+                text_column("commit_action"),
+            ],
+            &information_schema_rich_table_rows_for_table(session, &table),
+        );
+    }
     if let Some(table) = information_schema_columns_query_table(&canonical) {
         return write_single_row(
             stream,
@@ -2215,23 +2235,46 @@ fn information_schema_rich_table_rows(session: &Session) -> Vec<Vec<Option<Strin
     tables.sort_by(|left, right| left.name.cmp(&right.name));
     tables
         .into_iter()
-        .map(|table| {
-            vec![
-                Some("postgres".to_string()),
-                Some("public".to_string()),
-                Some(table.name.clone()),
-                Some("BASE TABLE".to_string()),
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some("YES".to_string()),
-                Some("NO".to_string()),
-                None,
-            ]
-        })
+        .map(information_schema_rich_table_row)
         .collect()
+}
+
+fn information_schema_rich_tables_query_table(canonical: &str) -> Option<String> {
+    let prefix = "select table_catalog, table_schema, table_name, table_type, self_referencing_column_name, reference_generation, user_defined_type_catalog, user_defined_type_schema, user_defined_type_name, is_insertable_into, is_typed, commit_action from information_schema.tables where table_schema = 'public' and table_name = '";
+    let suffix = "' order by table_name";
+    canonical
+        .strip_prefix(prefix)?
+        .strip_suffix(suffix)
+        .map(str::to_string)
+}
+
+fn information_schema_rich_table_rows_for_table(
+    session: &Session,
+    table: &str,
+) -> Vec<Vec<Option<String>>> {
+    session
+        .tables
+        .get(table)
+        .map(information_schema_rich_table_row)
+        .into_iter()
+        .collect()
+}
+
+fn information_schema_rich_table_row(table: &Table) -> Vec<Option<String>> {
+    vec![
+        Some("postgres".to_string()),
+        Some("public".to_string()),
+        Some(table.name.clone()),
+        Some("BASE TABLE".to_string()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some("YES".to_string()),
+        Some("NO".to_string()),
+        None,
+    ]
 }
 
 fn information_schema_columns_query_table(canonical: &str) -> Option<String> {
@@ -3538,6 +3581,30 @@ mod tests {
                 ],
             ]
         );
+        assert_eq!(
+            information_schema_rich_tables_query_table(
+                "select table_catalog, table_schema, table_name, table_type, self_referencing_column_name, reference_generation, user_defined_type_catalog, user_defined_type_schema, user_defined_type_name, is_insertable_into, is_typed, commit_action from information_schema.tables where table_schema = 'public' and table_name = 'people' order by table_name"
+            ),
+            Some("people".to_string())
+        );
+        assert_eq!(
+            information_schema_rich_table_rows_for_table(&session, "people"),
+            vec![vec![
+                Some("postgres".to_string()),
+                Some("public".to_string()),
+                Some("people".to_string()),
+                Some("BASE TABLE".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("YES".to_string()),
+                Some("NO".to_string()),
+                None,
+            ]]
+        );
+        assert!(information_schema_rich_table_rows_for_table(&session, "missing").is_empty());
         assert_eq!(
             information_schema_columns_query_table(
                 "select table_schema, table_name, column_name, ordinal_position, data_type from information_schema.columns where table_schema = 'public' and table_name = 'people' order by ordinal_position"
