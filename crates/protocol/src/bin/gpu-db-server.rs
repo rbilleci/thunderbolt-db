@@ -892,6 +892,116 @@ fn execute_statement(
             &catalog_psql_describe_table_rows(session),
         );
     }
+    if let Some(table) = catalog_describe_relation_lookup_query_table(&canonical) {
+        return write_single_row(
+            stream,
+            &[
+                int4_column("oid"),
+                text_column("nspname"),
+                text_column("relname"),
+            ],
+            &catalog_describe_relation_lookup_rows(session, &table),
+        );
+    }
+    if let Some(oid) = catalog_describe_relation_flags_query_oid(&canonical) {
+        return write_single_row(
+            stream,
+            &[
+                int4_column("relchecks"),
+                text_column("relkind"),
+                text_column("relhasindex"),
+                text_column("relhasrules"),
+                text_column("relhastriggers"),
+                text_column("relrowsecurity"),
+                text_column("relforcerowsecurity"),
+                text_column("relhasoids"),
+                text_column("relispartition"),
+                text_column("?column?"),
+                int4_column("reltablespace"),
+                text_column("case"),
+                text_column("relpersistence"),
+                text_column("relreplident"),
+                text_column("amname"),
+            ],
+            &catalog_describe_relation_flags_rows(session, oid),
+        );
+    }
+    if let Some(oid) = catalog_describe_attribute_query_oid(&canonical) {
+        return write_single_row(
+            stream,
+            &[
+                text_column("attname"),
+                text_column("format_type"),
+                text_column("pg_get_expr"),
+                text_column("attnotnull"),
+                text_column("attcollation"),
+                text_column("attidentity"),
+                text_column("attgenerated"),
+            ],
+            &catalog_describe_attribute_rows(session, oid),
+        );
+    }
+    if let Some(oid) = catalog_describe_policy_query_oid(&canonical) {
+        return write_single_row(
+            stream,
+            &[
+                text_column("polname"),
+                text_column("polpermissive"),
+                text_column("array_to_string"),
+                text_column("pg_get_expr"),
+                text_column("pg_get_expr"),
+                text_column("cmd"),
+            ],
+            &catalog_empty_rows_for_relation_oid(oid),
+        );
+    }
+    if let Some(oid) = catalog_describe_statistic_ext_query_oid(&canonical) {
+        return write_single_row(
+            stream,
+            &[
+                int4_column("oid"),
+                text_column("stxrelid"),
+                text_column("nsp"),
+                text_column("stxname"),
+                text_column("columns"),
+                text_column("ndist_enabled"),
+                text_column("deps_enabled"),
+                text_column("mcv_enabled"),
+                int4_column("stxstattarget"),
+            ],
+            &catalog_empty_rows_for_relation_oid(oid),
+        );
+    }
+    if let Some(oid) = catalog_describe_publication_query_oid(&canonical) {
+        return write_single_row(
+            stream,
+            &[
+                text_column("pubname"),
+                text_column("?column?"),
+                text_column("?column?"),
+            ],
+            &catalog_empty_rows_for_relation_oid(oid),
+        );
+    }
+    if let Some(oid) = catalog_describe_inherits_parent_query_oid(&canonical) {
+        return write_single_row(
+            stream,
+            &[text_column("oid")],
+            &catalog_empty_rows_for_relation_oid(oid),
+        );
+    }
+    if let Some(oid) = catalog_describe_inherits_child_query_oid(&canonical) {
+        return write_single_row(
+            stream,
+            &[
+                text_column("oid"),
+                text_column("relkind"),
+                text_column("inhdetachpending"),
+                text_column("pg_get_expr"),
+            ],
+            &catalog_empty_rows_for_relation_oid(oid),
+        );
+    }
     if canonical
         == "select oid, typname, typlen from pg_catalog.pg_type where oid in (23, 25) order by oid"
     {
@@ -1088,6 +1198,168 @@ fn catalog_psql_describe_table_rows(session: &Session) -> Vec<Vec<Option<String>
             ]
         })
         .collect()
+}
+
+fn catalog_describe_relation_lookup_query_table(canonical: &str) -> Option<String> {
+    let prefix = "select c.oid, n.nspname, c.relname from pg_catalog.pg_class c left join pg_catalog.pg_namespace n on n.oid = c.relnamespace where c.relname operator(pg_catalog.~) '^(";
+    let suffix =
+        ")$' collate pg_catalog.default and pg_catalog.pg_table_is_visible(c.oid) order by 2, 3";
+    canonical
+        .strip_prefix(prefix)?
+        .strip_suffix(suffix)
+        .map(str::to_string)
+}
+
+fn catalog_describe_relation_lookup_rows(
+    session: &Session,
+    table: &str,
+) -> Vec<Vec<Option<String>>> {
+    session
+        .tables
+        .get(table)
+        .map(|table| {
+            vec![vec![
+                Some(table.oid.to_string()),
+                Some("public".to_string()),
+                Some(table.name.clone()),
+            ]]
+        })
+        .unwrap_or_default()
+}
+
+fn catalog_describe_relation_flags_query_oid(canonical: &str) -> Option<u32> {
+    let prefix = "select c.relchecks, c.relkind, c.relhasindex, c.relhasrules, c.relhastriggers, c.relrowsecurity, c.relforcerowsecurity, false as relhasoids, c.relispartition, '', c.reltablespace, case when c.reloftype = 0 then '' else c.reloftype::pg_catalog.regtype::pg_catalog.text end, c.relpersistence, c.relreplident, am.amname from pg_catalog.pg_class c left join pg_catalog.pg_class tc on (c.reltoastrelid = tc.oid) left join pg_catalog.pg_am am on (c.relam = am.oid) where c.oid = '";
+    let suffix = "'";
+    canonical
+        .strip_prefix(prefix)?
+        .strip_suffix(suffix)?
+        .parse()
+        .ok()
+}
+
+fn catalog_describe_relation_flags_rows(session: &Session, oid: u32) -> Vec<Vec<Option<String>>> {
+    if !session.tables.values().any(|table| table.oid == oid) {
+        return Vec::new();
+    }
+
+    vec![vec![
+        Some("0".to_string()),
+        Some("r".to_string()),
+        Some("f".to_string()),
+        Some("f".to_string()),
+        Some("f".to_string()),
+        Some("f".to_string()),
+        Some("f".to_string()),
+        Some("f".to_string()),
+        Some("f".to_string()),
+        Some(String::new()),
+        Some("0".to_string()),
+        Some(String::new()),
+        Some("p".to_string()),
+        Some("d".to_string()),
+        Some("heap".to_string()),
+    ]]
+}
+
+fn catalog_describe_attribute_query_oid(canonical: &str) -> Option<u32> {
+    let prefix = "select a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod), (select pg_catalog.pg_get_expr(d.adbin, d.adrelid, true) from pg_catalog.pg_attrdef d where d.adrelid = a.attrelid and d.adnum = a.attnum and a.atthasdef), a.attnotnull, (select c.collname from pg_catalog.pg_collation c, pg_catalog.pg_type t where c.oid = a.attcollation and t.oid = a.atttypid and a.attcollation <> t.typcollation) as attcollation, a.attidentity, a.attgenerated from pg_catalog.pg_attribute a where a.attrelid = '";
+    let suffix = "' and a.attnum > 0 and not a.attisdropped order by a.attnum";
+    canonical
+        .strip_prefix(prefix)?
+        .strip_suffix(suffix)?
+        .parse()
+        .ok()
+}
+
+fn catalog_describe_attribute_rows(session: &Session, oid: u32) -> Vec<Vec<Option<String>>> {
+    let Some(table) = session.tables.values().find(|table| table.oid == oid) else {
+        return Vec::new();
+    };
+    table
+        .columns
+        .iter()
+        .map(|column| {
+            vec![
+                Some(column.def.name.clone()),
+                Some(sql_type_display_name(column.def.ty).to_string()),
+                None,
+                Some("f".to_string()),
+                None,
+                Some(String::new()),
+                Some(String::new()),
+            ]
+        })
+        .collect()
+}
+
+fn sql_type_display_name(ty: SqlType) -> &'static str {
+    match ty {
+        SqlType::Int4 => "integer",
+        SqlType::Text => "text",
+    }
+}
+
+fn catalog_describe_policy_query_oid(canonical: &str) -> Option<u32> {
+    let prefix = "select pol.polname, pol.polpermissive, case when pol.polroles = '{0}' then null else pg_catalog.array_to_string(array(select rolname from pg_catalog.pg_roles where oid = any (pol.polroles) order by 1),',') end, pg_catalog.pg_get_expr(pol.polqual, pol.polrelid), pg_catalog.pg_get_expr(pol.polwithcheck, pol.polrelid), case pol.polcmd when 'r' then 'select' when 'a' then 'insert' when 'w' then 'update' when 'd' then 'delete' end as cmd from pg_catalog.pg_policy pol where pol.polrelid = '";
+    let suffix = "' order by 1";
+    canonical
+        .strip_prefix(prefix)?
+        .strip_suffix(suffix)?
+        .parse()
+        .ok()
+}
+
+fn catalog_describe_statistic_ext_query_oid(canonical: &str) -> Option<u32> {
+    let prefix = "select oid, stxrelid::pg_catalog.regclass, stxnamespace::pg_catalog.regnamespace::pg_catalog.text as nsp, stxname, pg_catalog.pg_get_statisticsobjdef_columns(oid) as columns, 'd' = any(stxkind) as ndist_enabled, 'f' = any(stxkind) as deps_enabled, 'm' = any(stxkind) as mcv_enabled, stxstattarget from pg_catalog.pg_statistic_ext where stxrelid = '";
+    let suffix = "' order by nsp, stxname";
+    canonical
+        .strip_prefix(prefix)?
+        .strip_suffix(suffix)?
+        .parse()
+        .ok()
+}
+
+fn catalog_describe_publication_query_oid(canonical: &str) -> Option<u32> {
+    let prefix = "select pubname , null , null from pg_catalog.pg_publication p join pg_catalog.pg_publication_namespace pn on p.oid = pn.pnpubid join pg_catalog.pg_class pc on pc.relnamespace = pn.pnnspid where pc.oid ='";
+    let middle = "' and pg_catalog.pg_relation_is_publishable('";
+    let suffix = "') union select pubname , pg_get_expr(pr.prqual, c.oid) , (case when pr.prattrs is not null then (select string_agg(attname, ', ') from pg_catalog.generate_series(0, pg_catalog.array_upper(pr.prattrs::pg_catalog.int2[], 1)) s, pg_catalog.pg_attribute where attrelid = pr.prrelid and attnum = prattrs[s]) else null end) from pg_catalog.pg_publication p join pg_catalog.pg_publication_rel pr on p.oid = pr.prpubid join pg_catalog.pg_class c on c.oid = pr.prrelid where pr.prrelid = '";
+    let suffix_tail =
+        "' union select pubname , null , null from pg_catalog.pg_publication p where p.puballtables and pg_catalog.pg_relation_is_publishable('";
+    let final_suffix = "') order by 1";
+    let rest = canonical.strip_prefix(prefix)?;
+    let (first_oid, rest) = rest.split_once(middle)?;
+    let (second_oid, rest) = rest.split_once(suffix)?;
+    let (third_oid, rest) = rest.split_once(suffix_tail)?;
+    let final_oid = rest.strip_suffix(final_suffix)?;
+    if first_oid == second_oid && second_oid == third_oid && third_oid == final_oid {
+        first_oid.parse().ok()
+    } else {
+        None
+    }
+}
+
+fn catalog_describe_inherits_parent_query_oid(canonical: &str) -> Option<u32> {
+    let prefix = "select c.oid::pg_catalog.regclass from pg_catalog.pg_class c, pg_catalog.pg_inherits i where c.oid = i.inhparent and i.inhrelid = '";
+    let suffix = "' and c.relkind != 'p' and c.relkind != 'i' order by inhseqno";
+    canonical
+        .strip_prefix(prefix)?
+        .strip_suffix(suffix)?
+        .parse()
+        .ok()
+}
+
+fn catalog_describe_inherits_child_query_oid(canonical: &str) -> Option<u32> {
+    let prefix = "select c.oid::pg_catalog.regclass, c.relkind, inhdetachpending, pg_catalog.pg_get_expr(c.relpartbound, c.oid) from pg_catalog.pg_class c, pg_catalog.pg_inherits i where c.oid = i.inhrelid and i.inhparent = '";
+    let suffix = "' order by pg_catalog.pg_get_expr(c.relpartbound, c.oid) = 'default', c.oid::pg_catalog.regclass::pg_catalog.text";
+    canonical
+        .strip_prefix(prefix)?
+        .strip_suffix(suffix)?
+        .parse()
+        .ok()
+}
+
+fn catalog_empty_rows_for_relation_oid(_oid: u32) -> Vec<Vec<Option<String>>> {
+    Vec::new()
 }
 
 fn catalog_type_rows_by_oid() -> Vec<Vec<Option<String>>> {
@@ -1577,6 +1849,106 @@ mod tests {
                     Some("postgres".to_string()),
                 ],
             ]
+        );
+        assert_eq!(
+            catalog_describe_relation_lookup_query_table(
+                "select c.oid, n.nspname, c.relname from pg_catalog.pg_class c left join pg_catalog.pg_namespace n on n.oid = c.relnamespace where c.relname operator(pg_catalog.~) '^(people)$' collate pg_catalog.default and pg_catalog.pg_table_is_visible(c.oid) order by 2, 3"
+            ),
+            Some("people".to_string())
+        );
+        assert_eq!(
+            catalog_describe_relation_lookup_rows(&session, "people"),
+            vec![vec![
+                Some(FIRST_USER_RELATION_OID.to_string()),
+                Some("public".to_string()),
+                Some("people".to_string()),
+            ]]
+        );
+        assert!(catalog_describe_relation_lookup_rows(&session, "missing").is_empty());
+        assert_eq!(
+            catalog_describe_relation_flags_query_oid(
+                "select c.relchecks, c.relkind, c.relhasindex, c.relhasrules, c.relhastriggers, c.relrowsecurity, c.relforcerowsecurity, false as relhasoids, c.relispartition, '', c.reltablespace, case when c.reloftype = 0 then '' else c.reloftype::pg_catalog.regtype::pg_catalog.text end, c.relpersistence, c.relreplident, am.amname from pg_catalog.pg_class c left join pg_catalog.pg_class tc on (c.reltoastrelid = tc.oid) left join pg_catalog.pg_am am on (c.relam = am.oid) where c.oid = '16384'"
+            ),
+            Some(FIRST_USER_RELATION_OID)
+        );
+        assert_eq!(
+            catalog_describe_relation_flags_rows(&session, FIRST_USER_RELATION_OID),
+            vec![vec![
+                Some("0".to_string()),
+                Some("r".to_string()),
+                Some("f".to_string()),
+                Some("f".to_string()),
+                Some("f".to_string()),
+                Some("f".to_string()),
+                Some("f".to_string()),
+                Some("f".to_string()),
+                Some("f".to_string()),
+                Some(String::new()),
+                Some("0".to_string()),
+                Some(String::new()),
+                Some("p".to_string()),
+                Some("d".to_string()),
+                Some("heap".to_string()),
+            ]]
+        );
+        assert_eq!(
+            catalog_describe_attribute_query_oid(
+                "select a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod), (select pg_catalog.pg_get_expr(d.adbin, d.adrelid, true) from pg_catalog.pg_attrdef d where d.adrelid = a.attrelid and d.adnum = a.attnum and a.atthasdef), a.attnotnull, (select c.collname from pg_catalog.pg_collation c, pg_catalog.pg_type t where c.oid = a.attcollation and t.oid = a.atttypid and a.attcollation <> t.typcollation) as attcollation, a.attidentity, a.attgenerated from pg_catalog.pg_attribute a where a.attrelid = '16384' and a.attnum > 0 and not a.attisdropped order by a.attnum"
+            ),
+            Some(FIRST_USER_RELATION_OID)
+        );
+        assert_eq!(
+            catalog_describe_attribute_rows(&session, FIRST_USER_RELATION_OID),
+            vec![
+                vec![
+                    Some("id".to_string()),
+                    Some("integer".to_string()),
+                    None,
+                    Some("f".to_string()),
+                    None,
+                    Some(String::new()),
+                    Some(String::new()),
+                ],
+                vec![
+                    Some("name".to_string()),
+                    Some("text".to_string()),
+                    None,
+                    Some("f".to_string()),
+                    None,
+                    Some(String::new()),
+                    Some(String::new()),
+                ],
+            ]
+        );
+        assert_eq!(
+            catalog_describe_policy_query_oid(
+                "select pol.polname, pol.polpermissive, case when pol.polroles = '{0}' then null else pg_catalog.array_to_string(array(select rolname from pg_catalog.pg_roles where oid = any (pol.polroles) order by 1),',') end, pg_catalog.pg_get_expr(pol.polqual, pol.polrelid), pg_catalog.pg_get_expr(pol.polwithcheck, pol.polrelid), case pol.polcmd when 'r' then 'select' when 'a' then 'insert' when 'w' then 'update' when 'd' then 'delete' end as cmd from pg_catalog.pg_policy pol where pol.polrelid = '16384' order by 1"
+            ),
+            Some(FIRST_USER_RELATION_OID)
+        );
+        assert_eq!(
+            catalog_describe_statistic_ext_query_oid(
+                "select oid, stxrelid::pg_catalog.regclass, stxnamespace::pg_catalog.regnamespace::pg_catalog.text as nsp, stxname, pg_catalog.pg_get_statisticsobjdef_columns(oid) as columns, 'd' = any(stxkind) as ndist_enabled, 'f' = any(stxkind) as deps_enabled, 'm' = any(stxkind) as mcv_enabled, stxstattarget from pg_catalog.pg_statistic_ext where stxrelid = '16384' order by nsp, stxname"
+            ),
+            Some(FIRST_USER_RELATION_OID)
+        );
+        assert_eq!(
+            catalog_describe_publication_query_oid(
+                "select pubname , null , null from pg_catalog.pg_publication p join pg_catalog.pg_publication_namespace pn on p.oid = pn.pnpubid join pg_catalog.pg_class pc on pc.relnamespace = pn.pnnspid where pc.oid ='16384' and pg_catalog.pg_relation_is_publishable('16384') union select pubname , pg_get_expr(pr.prqual, c.oid) , (case when pr.prattrs is not null then (select string_agg(attname, ', ') from pg_catalog.generate_series(0, pg_catalog.array_upper(pr.prattrs::pg_catalog.int2[], 1)) s, pg_catalog.pg_attribute where attrelid = pr.prrelid and attnum = prattrs[s]) else null end) from pg_catalog.pg_publication p join pg_catalog.pg_publication_rel pr on p.oid = pr.prpubid join pg_catalog.pg_class c on c.oid = pr.prrelid where pr.prrelid = '16384' union select pubname , null , null from pg_catalog.pg_publication p where p.puballtables and pg_catalog.pg_relation_is_publishable('16384') order by 1"
+            ),
+            Some(FIRST_USER_RELATION_OID)
+        );
+        assert_eq!(
+            catalog_describe_inherits_parent_query_oid(
+                "select c.oid::pg_catalog.regclass from pg_catalog.pg_class c, pg_catalog.pg_inherits i where c.oid = i.inhparent and i.inhrelid = '16384' and c.relkind != 'p' and c.relkind != 'i' order by inhseqno"
+            ),
+            Some(FIRST_USER_RELATION_OID)
+        );
+        assert_eq!(
+            catalog_describe_inherits_child_query_oid(
+                "select c.oid::pg_catalog.regclass, c.relkind, inhdetachpending, pg_catalog.pg_get_expr(c.relpartbound, c.oid) from pg_catalog.pg_class c, pg_catalog.pg_inherits i where c.oid = i.inhrelid and i.inhparent = '16384' order by pg_catalog.pg_get_expr(c.relpartbound, c.oid) = 'default', c.oid::pg_catalog.regclass::pg_catalog.text"
+            ),
+            Some(FIRST_USER_RELATION_OID)
         );
         assert_eq!(
             catalog_type_rows_by_oid(),

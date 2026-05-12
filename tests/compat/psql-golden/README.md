@@ -39,6 +39,6 @@ When `PSQL_GOLDEN_BOOT_CMD` is set, the harness starts the target service itself
 
 - The harness intentionally strips volatile lines (timing/version/SSL banner noise).
 - Keep scenario assertions stable and semantic, avoid transient text where possible.
-- Current scenario coverage includes connect/simple-query, session reset probes, SQL prepare/execute/deallocate flow, transaction begin/commit/rollback flow, relational create/insert/select flows, metadata-backed catalog/type introspection, real `psql \dt` table listing, extended-query bind execution, and a deterministic error path.
+- Current scenario coverage includes connect/simple-query, session reset probes, SQL prepare/execute/deallocate flow, transaction begin/commit/rollback flow, relational create/insert/select flows, metadata-backed catalog/type introspection, real `psql \dt` table listing, real `psql \d <table>` column display, extended-query bind execution, and a deterministic error path.
 - CI now boots the repo-local compatibility endpoint with `cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen 127.0.0.1:55432` before running the suite, so Q4 has a real service endpoint instead of a manual-only placeholder.
 - If a wire-level extended-query flow is intentionally unsupported, encode that as an explicit expected failure in a dedicated scenario and set the expected `.rc` artifact.

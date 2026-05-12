@@ -1,0 +1,7 @@
+=== psql d table meta-command ===
+CREATE TABLE
+          Table "public.describe_people"
+ Column |  Type   | Collation | Nullable | Default
+--------+---------+-----------+----------+---------
+ id     | integer |           |          |
+ name   | text    |           |          |
