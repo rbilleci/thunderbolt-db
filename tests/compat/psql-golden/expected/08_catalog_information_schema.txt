@@ -1,0 +1,14 @@
+=== information schema table and column introspection ===
+CREATE TABLE
+CREATE TABLE
+ table_schema | table_name  | table_type
+--------------+-------------+------------
+ public       | info_people | BASE TABLE
+ public       | info_teams  | BASE TABLE
+(2 rows)
+
+ table_schema | table_name  | column_name | ordinal_position | data_type
+--------------+-------------+-------------+------------------+-----------
+ public       | info_people | id          |                1 | integer
+ public       | info_people | name        |                2 | text
+(2 rows)

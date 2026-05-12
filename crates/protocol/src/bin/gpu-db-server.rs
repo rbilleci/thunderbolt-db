@@ -1002,6 +1002,30 @@ fn execute_statement(
             &catalog_empty_rows_for_relation_oid(oid),
         );
     }
+    if canonical == information_schema_tables_query() {
+        return write_single_row(
+            stream,
+            &[
+                text_column("table_schema"),
+                text_column("table_name"),
+                text_column("table_type"),
+            ],
+            &information_schema_table_rows(session),
+        );
+    }
+    if let Some(table) = information_schema_columns_query_table(&canonical) {
+        return write_single_row(
+            stream,
+            &[
+                text_column("table_schema"),
+                text_column("table_name"),
+                text_column("column_name"),
+                int4_column("ordinal_position"),
+                text_column("data_type"),
+            ],
+            &information_schema_column_rows(session, &table),
+        );
+    }
     if canonical
         == "select oid, typname, typlen from pg_catalog.pg_type where oid in (23, 25) order by oid"
     {
@@ -1360,6 +1384,53 @@ fn catalog_describe_inherits_child_query_oid(canonical: &str) -> Option<u32> {
 
 fn catalog_empty_rows_for_relation_oid(_oid: u32) -> Vec<Vec<Option<String>>> {
     Vec::new()
+}
+
+fn information_schema_tables_query() -> &'static str {
+    "select table_schema, table_name, table_type from information_schema.tables where table_schema = 'public' order by table_name"
+}
+
+fn information_schema_table_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut tables = session.tables.values().collect::<Vec<_>>();
+    tables.sort_by(|left, right| left.name.cmp(&right.name));
+    tables
+        .into_iter()
+        .map(|table| {
+            vec![
+                Some("public".to_string()),
+                Some(table.name.clone()),
+                Some("BASE TABLE".to_string()),
+            ]
+        })
+        .collect()
+}
+
+fn information_schema_columns_query_table(canonical: &str) -> Option<String> {
+    let prefix = "select table_schema, table_name, column_name, ordinal_position, data_type from information_schema.columns where table_schema = 'public' and table_name = '";
+    let suffix = "' order by ordinal_position";
+    canonical
+        .strip_prefix(prefix)?
+        .strip_suffix(suffix)
+        .map(str::to_string)
+}
+
+fn information_schema_column_rows(session: &Session, table: &str) -> Vec<Vec<Option<String>>> {
+    let Some(table) = session.tables.get(table) else {
+        return Vec::new();
+    };
+    table
+        .columns
+        .iter()
+        .map(|column| {
+            vec![
+                Some("public".to_string()),
+                Some(table.name.clone()),
+                Some(column.def.name.clone()),
+                Some(column.attnum.to_string()),
+                Some(sql_type_display_name(column.def.ty).to_string()),
+            ]
+        })
+        .collect()
 }
 
 fn catalog_type_rows_by_oid() -> Vec<Vec<Option<String>>> {
@@ -1949,6 +2020,46 @@ mod tests {
                 "select c.oid::pg_catalog.regclass, c.relkind, inhdetachpending, pg_catalog.pg_get_expr(c.relpartbound, c.oid) from pg_catalog.pg_class c, pg_catalog.pg_inherits i where c.oid = i.inhrelid and i.inhparent = '16384' order by pg_catalog.pg_get_expr(c.relpartbound, c.oid) = 'default', c.oid::pg_catalog.regclass::pg_catalog.text"
             ),
             Some(FIRST_USER_RELATION_OID)
+        );
+        assert_eq!(
+            information_schema_table_rows(&session),
+            vec![
+                vec![
+                    Some("public".to_string()),
+                    Some("people".to_string()),
+                    Some("BASE TABLE".to_string()),
+                ],
+                vec![
+                    Some("public".to_string()),
+                    Some("teams".to_string()),
+                    Some("BASE TABLE".to_string()),
+                ],
+            ]
+        );
+        assert_eq!(
+            information_schema_columns_query_table(
+                "select table_schema, table_name, column_name, ordinal_position, data_type from information_schema.columns where table_schema = 'public' and table_name = 'people' order by ordinal_position"
+            ),
+            Some("people".to_string())
+        );
+        assert_eq!(
+            information_schema_column_rows(&session, "people"),
+            vec![
+                vec![
+                    Some("public".to_string()),
+                    Some("people".to_string()),
+                    Some("id".to_string()),
+                    Some("1".to_string()),
+                    Some("integer".to_string()),
+                ],
+                vec![
+                    Some("public".to_string()),
+                    Some("people".to_string()),
+                    Some("name".to_string()),
+                    Some("2".to_string()),
+                    Some("text".to_string()),
+                ],
+            ]
         );
         assert_eq!(
             catalog_type_rows_by_oid(),
