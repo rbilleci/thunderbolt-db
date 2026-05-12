@@ -1,0 +1,10 @@
+=== information_schema empty constraint metadata ===
+CREATE TABLE
+CREATE TABLE
+ table_schema | table_name | constraint_name | constraint_type
+--------------+------------+-----------------+-----------------
+(0 rows)
+
+ table_schema | table_name | column_name | constraint_name | ordinal_position
+--------------+------------+-------------+-----------------+------------------
+(0 rows)

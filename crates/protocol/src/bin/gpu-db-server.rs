@@ -1375,6 +1375,31 @@ fn execute_statement(
             &information_schema_schemata_rows(),
         );
     }
+    if canonical == information_schema_table_constraints_query() {
+        return write_single_row(
+            stream,
+            &[
+                text_column("table_schema"),
+                text_column("table_name"),
+                text_column("constraint_name"),
+                text_column("constraint_type"),
+            ],
+            &information_schema_table_constraint_rows(session),
+        );
+    }
+    if canonical == information_schema_key_column_usage_query() {
+        return write_single_row(
+            stream,
+            &[
+                text_column("table_schema"),
+                text_column("table_name"),
+                text_column("column_name"),
+                text_column("constraint_name"),
+                int4_column("ordinal_position"),
+            ],
+            &information_schema_key_column_usage_rows(session),
+        );
+    }
     if canonical
         == "select oid, typname, typlen from pg_catalog.pg_type where oid in (23, 25) order by oid"
     {
@@ -2560,6 +2585,24 @@ fn information_schema_schemata_rows() -> Vec<Vec<Option<String>>> {
         Some("public".to_string()),
         Some("postgres".to_string()),
     ]]
+}
+
+fn information_schema_table_constraints_query() -> &'static str {
+    "select table_schema, table_name, constraint_name, constraint_type from information_schema.table_constraints where table_schema = 'public' order by table_name, constraint_name"
+}
+
+fn information_schema_table_constraint_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let _supported_plain_table_count = session.tables.len();
+    Vec::new()
+}
+
+fn information_schema_key_column_usage_query() -> &'static str {
+    "select table_schema, table_name, column_name, constraint_name, ordinal_position from information_schema.key_column_usage where table_schema = 'public' order by table_name, ordinal_position"
+}
+
+fn information_schema_key_column_usage_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let _supported_plain_table_count = session.tables.len();
+    Vec::new()
 }
 
 fn catalog_type_rows_by_oid() -> Vec<Vec<Option<String>>> {
@@ -4017,6 +4060,16 @@ mod tests {
                 Some("postgres".to_string())
             ]]
         );
+        assert_eq!(
+            information_schema_table_constraints_query(),
+            "select table_schema, table_name, constraint_name, constraint_type from information_schema.table_constraints where table_schema = 'public' order by table_name, constraint_name"
+        );
+        assert!(information_schema_table_constraint_rows(&session).is_empty());
+        assert_eq!(
+            information_schema_key_column_usage_query(),
+            "select table_schema, table_name, column_name, constraint_name, ordinal_position from information_schema.key_column_usage where table_schema = 'public' order by table_name, ordinal_position"
+        );
+        assert!(information_schema_key_column_usage_rows(&session).is_empty());
         assert_eq!(
             catalog_type_rows_by_oid(),
             vec![
