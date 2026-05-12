@@ -1,0 +1,7 @@
+=== psql dt plus table meta-command ===
+CREATE TABLE
+                                        List of relations
+ Schema |       Name        | Type  |  Owner   | Persistence | Access method | Size | Description
+--------+-------------------+-------+----------+-------------+---------------+------+-------------
+ public | dt_verbose_people | table | postgres | permanent   | heap          |      |
+(1 row)

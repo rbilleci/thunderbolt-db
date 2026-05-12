@@ -904,6 +904,22 @@ fn execute_statement(
             &catalog_psql_describe_table_rows_filtered(session, &filter),
         );
     }
+    if let Some(filter) = psql_describe_tables_verbose_catalog_query_filter(&canonical) {
+        return write_single_row(
+            stream,
+            &[
+                text_column("Schema"),
+                text_column("Name"),
+                text_column("Type"),
+                text_column("Owner"),
+                text_column("Persistence"),
+                text_column("Access method"),
+                text_column("Size"),
+                text_column("Description"),
+            ],
+            &catalog_psql_describe_table_verbose_rows_filtered(session, &filter),
+        );
+    }
     if canonical == psql_describe_schemas_catalog_query() {
         return write_single_row(
             stream,
@@ -1327,6 +1343,49 @@ fn psql_describe_tables_catalog_query_filter(canonical: &str) -> Option<PsqlDesc
     })
 }
 
+fn psql_describe_tables_verbose_catalog_query_filter(
+    canonical: &str,
+) -> Option<PsqlDescribeTablesFilter> {
+    let prefix = "select n.nspname as \"schema\", c.relname as \"name\", case c.relkind when 'r' then 'table' when 'v' then 'view' when 'm' then 'materialized view' when 'i' then 'index' when 's' then 'sequence' when 't' then 'toast table' when 'f' then 'foreign table' when 'p' then 'partitioned table' when 'i' then 'partitioned index' end as \"type\", pg_catalog.pg_get_userbyid(c.relowner) as \"owner\", case c.relpersistence when 'p' then 'permanent' when 't' then 'temporary' when 'u' then 'unlogged' end as \"persistence\", am.amname as \"access method\", pg_catalog.pg_size_pretty(pg_catalog.pg_table_size(c.oid)) as \"size\", pg_catalog.obj_description(c.oid, 'pg_class') as \"description\" from pg_catalog.pg_class c left join pg_catalog.pg_namespace n on n.oid = c.relnamespace left join pg_catalog.pg_am am on am.oid = c.relam where c.relkind in ('r','p','t','s','') and ";
+    let visible_suffix = " and pg_catalog.pg_table_is_visible(c.oid) order by 1,2";
+    let namespace_prefix = "n.nspname operator(pg_catalog.~) '^(";
+    let namespace_suffix = ")$' collate pg_catalog.default order by 1,2";
+    let relname_prefix = "c.relname operator(pg_catalog.~) '^(";
+    let relname_visible_suffix =
+        ")$' collate pg_catalog.default and pg_catalog.pg_table_is_visible(c.oid) order by 1,2";
+    let relname_middle = ")$' collate pg_catalog.default and n.nspname operator(pg_catalog.~) '^(";
+    let rest = canonical.strip_prefix(prefix)?;
+
+    if let Some(namespace) = rest
+        .strip_prefix(namespace_prefix)
+        .and_then(|rest| rest.strip_suffix(namespace_suffix))
+    {
+        return Some(PsqlDescribeTablesFilter {
+            namespace: namespace.to_string(),
+            relname_pattern: None,
+        });
+    }
+
+    if let Some(relname_pattern) = rest
+        .strip_prefix(relname_prefix)
+        .and_then(|rest| rest.strip_suffix(relname_visible_suffix))
+    {
+        return Some(PsqlDescribeTablesFilter {
+            namespace: "public".to_string(),
+            relname_pattern: Some(relname_pattern.to_string()),
+        });
+    }
+
+    let (relname_pattern, namespace) = rest
+        .strip_prefix(relname_prefix)?
+        .strip_suffix(visible_suffix)?
+        .split_once(relname_middle)?;
+    Some(PsqlDescribeTablesFilter {
+        namespace: namespace.to_string(),
+        relname_pattern: Some(relname_pattern.to_string()),
+    })
+}
+
 fn psql_describe_schemas_catalog_query() -> &'static str {
     "select n.nspname as \"name\", pg_catalog.pg_get_userbyid(n.nspowner) as \"owner\" from pg_catalog.pg_namespace n where n.nspname !~ '^pg_' and n.nspname <> 'information_schema' order by 1"
 }
@@ -1394,6 +1453,24 @@ fn catalog_psql_describe_table_rows_filtered(
                 Some("table".to_string()),
                 Some("postgres".to_string()),
             ]
+        })
+        .collect()
+}
+
+fn catalog_psql_describe_table_verbose_rows_filtered(
+    session: &Session,
+    filter: &PsqlDescribeTablesFilter,
+) -> Vec<Vec<Option<String>>> {
+    catalog_psql_describe_table_rows_filtered(session, filter)
+        .into_iter()
+        .map(|mut row| {
+            row.extend([
+                Some("permanent".to_string()),
+                Some("heap".to_string()),
+                None,
+                None,
+            ]);
+            row
         })
         .collect()
 }
@@ -2249,6 +2326,15 @@ mod tests {
             })
         );
         assert_eq!(
+            psql_describe_tables_verbose_catalog_query_filter(
+                "select n.nspname as \"schema\", c.relname as \"name\", case c.relkind when 'r' then 'table' when 'v' then 'view' when 'm' then 'materialized view' when 'i' then 'index' when 's' then 'sequence' when 't' then 'toast table' when 'f' then 'foreign table' when 'p' then 'partitioned table' when 'i' then 'partitioned index' end as \"type\", pg_catalog.pg_get_userbyid(c.relowner) as \"owner\", case c.relpersistence when 'p' then 'permanent' when 't' then 'temporary' when 'u' then 'unlogged' end as \"persistence\", am.amname as \"access method\", pg_catalog.pg_size_pretty(pg_catalog.pg_table_size(c.oid)) as \"size\", pg_catalog.obj_description(c.oid, 'pg_class') as \"description\" from pg_catalog.pg_class c left join pg_catalog.pg_namespace n on n.oid = c.relnamespace left join pg_catalog.pg_am am on am.oid = c.relam where c.relkind in ('r','p','t','s','') and c.relname operator(pg_catalog.~) '^(people)$' collate pg_catalog.default and pg_catalog.pg_table_is_visible(c.oid) order by 1,2"
+            ),
+            Some(PsqlDescribeTablesFilter {
+                namespace: "public".to_string(),
+                relname_pattern: Some("people".to_string()),
+            })
+        );
+        assert_eq!(
             catalog_psql_describe_table_rows_filtered(
                 &session,
                 &PsqlDescribeTablesFilter {
@@ -2261,6 +2347,25 @@ mod tests {
                 Some("people".to_string()),
                 Some("table".to_string()),
                 Some("postgres".to_string()),
+            ]]
+        );
+        assert_eq!(
+            catalog_psql_describe_table_verbose_rows_filtered(
+                &session,
+                &PsqlDescribeTablesFilter {
+                    namespace: "public".to_string(),
+                    relname_pattern: Some("peo.*".to_string()),
+                },
+            ),
+            vec![vec![
+                Some("public".to_string()),
+                Some("people".to_string()),
+                Some("table".to_string()),
+                Some("postgres".to_string()),
+                Some("permanent".to_string()),
+                Some("heap".to_string()),
+                None,
+                None,
             ]]
         );
         assert!(catalog_psql_describe_table_rows_filtered(
