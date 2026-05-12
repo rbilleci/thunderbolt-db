@@ -1,0 +1,9 @@
+=== information_schema extended column metadata ===
+CREATE TABLE
+CREATE TABLE
+ table_catalog | table_schema |         table_name         | column_name | ordinal_position | column_default | is_nullable | data_type | character_maximum_length | numeric_precision | numeric_precision_radix | numeric_scale | udt_schema | udt_name
+---------------+--------------+----------------------------+-------------+------------------+----------------+-------------+-----------+--------------------------+-------------------+-------------------------+---------------+------------+----------
+ postgres      | public       | is_extended_columns_people | id          |                1 |                | YES         | integer   |                          |                32 |                       2 |             0 | pg_catalog | int4
+ postgres      | public       | is_extended_columns_people | name        |                2 |                | YES         | text      |                          |                   |                         |               | pg_catalog | text
+ postgres      | public       | is_extended_columns_teams  | team_id     |                1 |                | YES         | integer   |                          |                32 |                       2 |             0 | pg_catalog | int4
+(3 rows)

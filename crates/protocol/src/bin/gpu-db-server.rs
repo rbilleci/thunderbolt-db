@@ -1255,6 +1255,28 @@ fn execute_statement(
             &information_schema_rich_column_rows(session),
         );
     }
+    if canonical == information_schema_extended_columns_query() {
+        return write_single_row(
+            stream,
+            &[
+                text_column("table_catalog"),
+                text_column("table_schema"),
+                text_column("table_name"),
+                text_column("column_name"),
+                int4_column("ordinal_position"),
+                text_column("column_default"),
+                text_column("is_nullable"),
+                text_column("data_type"),
+                int4_column("character_maximum_length"),
+                int4_column("numeric_precision"),
+                int4_column("numeric_precision_radix"),
+                int4_column("numeric_scale"),
+                text_column("udt_schema"),
+                text_column("udt_name"),
+            ],
+            &information_schema_extended_column_rows(session),
+        );
+    }
     if canonical == information_schema_schemata_query() {
         return write_single_row(
             stream,
@@ -2266,6 +2288,47 @@ fn information_schema_rich_column_rows(session: &Session) -> Vec<Vec<Option<Stri
             })
         })
         .collect()
+}
+
+fn information_schema_extended_columns_query() -> &'static str {
+    "select table_catalog, table_schema, table_name, column_name, ordinal_position, column_default, is_nullable, data_type, character_maximum_length, numeric_precision, numeric_precision_radix, numeric_scale, udt_schema, udt_name from information_schema.columns where table_schema = 'public' order by table_name, ordinal_position"
+}
+
+fn information_schema_extended_column_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut tables = session.tables.values().collect::<Vec<_>>();
+    tables.sort_by(|left, right| left.name.cmp(&right.name));
+    tables
+        .into_iter()
+        .flat_map(|table| {
+            table.columns.iter().map(|column| {
+                let (numeric_precision, numeric_precision_radix, numeric_scale) =
+                    information_schema_numeric_metadata(column.def.ty);
+                vec![
+                    Some("postgres".to_string()),
+                    Some("public".to_string()),
+                    Some(table.name.clone()),
+                    Some(column.def.name.clone()),
+                    Some(column.attnum.to_string()),
+                    None,
+                    Some("YES".to_string()),
+                    Some(sql_type_display_name(column.def.ty).to_string()),
+                    None,
+                    numeric_precision.map(|value| value.to_string()),
+                    numeric_precision_radix.map(|value| value.to_string()),
+                    numeric_scale.map(|value| value.to_string()),
+                    Some("pg_catalog".to_string()),
+                    Some(column.def.ty.catalog_name().to_string()),
+                ]
+            })
+        })
+        .collect()
+}
+
+fn information_schema_numeric_metadata(ty: SqlType) -> (Option<i32>, Option<i32>, Option<i32>) {
+    match ty {
+        SqlType::Int4 => (Some(32), Some(2), Some(0)),
+        SqlType::Text => (None, None, None),
+    }
 }
 
 fn information_schema_schemata_query() -> &'static str {
@@ -3435,6 +3498,71 @@ mod tests {
                     None,
                     Some("YES".to_string()),
                     Some("integer".to_string()),
+                    Some("pg_catalog".to_string()),
+                    Some("int4".to_string()),
+                ],
+            ]
+        );
+        assert_eq!(
+            information_schema_extended_columns_query(),
+            "select table_catalog, table_schema, table_name, column_name, ordinal_position, column_default, is_nullable, data_type, character_maximum_length, numeric_precision, numeric_precision_radix, numeric_scale, udt_schema, udt_name from information_schema.columns where table_schema = 'public' order by table_name, ordinal_position"
+        );
+        assert_eq!(
+            information_schema_numeric_metadata(SqlType::Int4),
+            (Some(32), Some(2), Some(0))
+        );
+        assert_eq!(
+            information_schema_numeric_metadata(SqlType::Text),
+            (None, None, None)
+        );
+        assert_eq!(
+            information_schema_extended_column_rows(&session),
+            vec![
+                vec![
+                    Some("postgres".to_string()),
+                    Some("public".to_string()),
+                    Some("people".to_string()),
+                    Some("id".to_string()),
+                    Some("1".to_string()),
+                    None,
+                    Some("YES".to_string()),
+                    Some("integer".to_string()),
+                    None,
+                    Some("32".to_string()),
+                    Some("2".to_string()),
+                    Some("0".to_string()),
+                    Some("pg_catalog".to_string()),
+                    Some("int4".to_string()),
+                ],
+                vec![
+                    Some("postgres".to_string()),
+                    Some("public".to_string()),
+                    Some("people".to_string()),
+                    Some("name".to_string()),
+                    Some("2".to_string()),
+                    None,
+                    Some("YES".to_string()),
+                    Some("text".to_string()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("pg_catalog".to_string()),
+                    Some("text".to_string()),
+                ],
+                vec![
+                    Some("postgres".to_string()),
+                    Some("public".to_string()),
+                    Some("teams".to_string()),
+                    Some("id".to_string()),
+                    Some("1".to_string()),
+                    None,
+                    Some("YES".to_string()),
+                    Some("integer".to_string()),
+                    None,
+                    Some("32".to_string()),
+                    Some("2".to_string()),
+                    Some("0".to_string()),
                     Some("pg_catalog".to_string()),
                     Some("int4".to_string()),
                 ],

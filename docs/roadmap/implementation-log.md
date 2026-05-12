@@ -3,6 +3,7 @@
 ## 2026-05-12
 
 ### PostgreSQL-compatible product loop
+- Advanced P2 catalog/schema/type spine by backing a JDBC/ORM-style `information_schema.columns` projection for supported `public` session tables. The compatibility endpoint now returns catalog/schema/table/column identity, nullable/default/type identity, and `int4` numeric precision/radix/scale metadata from the session catalog and supported type registry, with real psql golden coverage for the client-facing query shape.
 - Advanced P2 catalog/schema/type spine by backing a common joined `pg_catalog.pg_class` / `pg_catalog.pg_namespace` relation-metadata query filtered by `c.relname IN (...)`. The compatibility endpoint now returns deduplicated, table-ordered plain-relation metadata from the session catalog for supported `public` tables, with real psql golden coverage for the client/ORM-style subset query.
 - Advanced P2 catalog/schema/type spine by backing `pg_catalog.pg_indexes` discovery for the current no-user-visible-SQL-index subset. The compatibility endpoint accepts a common client/ORM query shape and truthfully returns no SQL index rows for supported `public` tables instead of exposing the internal relational equality access path as a PostgreSQL index.
 - Advanced P2 catalog/schema/type spine by backing a common `information_schema.tables` table-name `IN (...)` subset query for supported `public` session tables. The compatibility endpoint now returns deduplicated, table-ordered base-table metadata from the session catalog, with real psql golden coverage for the client/ORM-style query shape.
