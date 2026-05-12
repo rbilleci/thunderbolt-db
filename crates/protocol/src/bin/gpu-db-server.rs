@@ -3137,6 +3137,12 @@ mod tests {
         );
         assert_eq!(
             catalog_describe_relation_lookup_query_table(
+                "select c.oid, n.nspname, c.relname from pg_catalog.pg_class c left join pg_catalog.pg_namespace n on n.oid = c.relnamespace where c.relname operator(pg_catalog.~) '^(peo.*)$' collate pg_catalog.default and n.nspname operator(pg_catalog.~) '^(public)$' collate pg_catalog.default order by 2, 3"
+            ),
+            Some("peo.*".to_string())
+        );
+        assert_eq!(
+            catalog_describe_relation_lookup_query_table(
                 "select c.oid, n.nspname, c.relname from pg_catalog.pg_class c left join pg_catalog.pg_namespace n on n.oid = c.relnamespace where c.relname operator(pg_catalog.~) '^(people)$' collate pg_catalog.default and n.nspname operator(pg_catalog.~) '^(private)$' collate pg_catalog.default order by 2, 3"
             ),
             None
