@@ -1,0 +1,8 @@
+=== pg_catalog pg_class supported public relation metadata ===
+CREATE TABLE
+CREATE TABLE
+  oid  | nspname |     relname     | relkind | relpersistence
+-------+---------+-----------------+---------+----------------
+ 16384 | public  | pg_class_people | r       | p
+ 16385 | public  | pg_class_teams  | r       | p
+(2 rows)

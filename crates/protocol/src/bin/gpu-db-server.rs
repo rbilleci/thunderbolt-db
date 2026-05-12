@@ -1107,6 +1107,19 @@ fn execute_statement(
             &pg_catalog_table_rows(session),
         );
     }
+    if canonical == pg_catalog_class_plain_tables_query() {
+        return write_single_row(
+            stream,
+            &[
+                int4_column("oid"),
+                text_column("nspname"),
+                text_column("relname"),
+                text_column("relkind"),
+                text_column("relpersistence"),
+            ],
+            &pg_catalog_class_plain_table_rows(session),
+        );
+    }
     if canonical == information_schema_tables_query() {
         return write_single_row(
             stream,
@@ -1861,6 +1874,27 @@ fn pg_catalog_table_rows(session: &Session) -> Vec<Vec<Option<String>>> {
                 Some("public".to_string()),
                 Some(table.name.clone()),
                 Some("postgres".to_string()),
+            ]
+        })
+        .collect()
+}
+
+fn pg_catalog_class_plain_tables_query() -> &'static str {
+    "select c.oid, n.nspname, c.relname, c.relkind, c.relpersistence from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace where n.nspname = 'public' and c.relkind = 'r' order by c.relname"
+}
+
+fn pg_catalog_class_plain_table_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut tables = session.tables.values().collect::<Vec<_>>();
+    tables.sort_by(|left, right| left.name.cmp(&right.name));
+    tables
+        .into_iter()
+        .map(|table| {
+            vec![
+                Some(table.oid.to_string()),
+                Some("public".to_string()),
+                Some(table.name.clone()),
+                Some("r".to_string()),
+                Some("p".to_string()),
             ]
         })
         .collect()
@@ -2816,6 +2850,29 @@ mod tests {
                     Some("public".to_string()),
                     Some("teams".to_string()),
                     Some("postgres".to_string()),
+                ],
+            ]
+        );
+        assert_eq!(
+            pg_catalog_class_plain_tables_query(),
+            "select c.oid, n.nspname, c.relname, c.relkind, c.relpersistence from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace where n.nspname = 'public' and c.relkind = 'r' order by c.relname"
+        );
+        assert_eq!(
+            pg_catalog_class_plain_table_rows(&session),
+            vec![
+                vec![
+                    Some(FIRST_USER_RELATION_OID.to_string()),
+                    Some("public".to_string()),
+                    Some("people".to_string()),
+                    Some("r".to_string()),
+                    Some("p".to_string()),
+                ],
+                vec![
+                    Some((FIRST_USER_RELATION_OID + 1).to_string()),
+                    Some("public".to_string()),
+                    Some("teams".to_string()),
+                    Some("r".to_string()),
+                    Some("p".to_string()),
                 ],
             ]
         );
