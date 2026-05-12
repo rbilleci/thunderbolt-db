@@ -3,6 +3,7 @@
 ## 2026-05-12
 
 ### PostgreSQL-compatible product loop
+- Advanced P2 catalog/schema/type spine by backing PostgreSQL 16 `psql \d+ <table>` traffic for supported plain session tables. The compatibility endpoint now accepts the verbose relation-options and verbose column-attribute query shapes emitted by psql, returning catalog-backed column/type rows plus explicit plain-table storage/access-method metadata for the current subset.
 - Advanced P2 catalog/schema/type spine by backing PostgreSQL 16 `psql \dT pg_catalog.int4` and `\dT pg_catalog.text` traffic with the supported `int4`/`text` type registry. The compatibility endpoint now handles the real `pg_catalog.pg_type`/`pg_namespace` query shape emitted by psql for supported built-in types while keeping user-defined types and broader type catalog behavior out of scope.
 - Advanced P2 catalog/schema/type spine by backing PostgreSQL 16 `psql \dn` and first-slice `information_schema.schemata` traffic with the supported `public` namespace metadata. The compatibility endpoint now exposes the bootstrap schema through real client introspection while keeping broader PostgreSQL namespace/catalog behavior explicitly out of scope.
 - Advanced P2 catalog/schema/type spine by adding first-slice `information_schema.tables` and `information_schema.columns` introspection for supported `public` session tables, backed by the same session catalog metadata as the `pg_catalog` and psql meta-command paths.

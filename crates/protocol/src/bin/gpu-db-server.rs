@@ -944,6 +944,25 @@ fn execute_statement(
             &catalog_describe_relation_flags_rows(session, oid),
         );
     }
+    if let Some(oid) = catalog_describe_verbose_attribute_query_oid(&canonical) {
+        return write_single_row(
+            stream,
+            &[
+                text_column("attname"),
+                text_column("format_type"),
+                text_column("pg_get_expr"),
+                text_column("attnotnull"),
+                text_column("attcollation"),
+                text_column("attidentity"),
+                text_column("attgenerated"),
+                text_column("attstorage"),
+                text_column("attcompression"),
+                int4_column("attstattarget"),
+                text_column("col_description"),
+            ],
+            &catalog_describe_verbose_attribute_rows(session, oid),
+        );
+    }
     if let Some(oid) = catalog_describe_attribute_query_oid(&canonical) {
         return write_single_row(
             stream,
@@ -1317,10 +1336,14 @@ fn catalog_describe_relation_lookup_rows(
 }
 
 fn catalog_describe_relation_flags_query_oid(canonical: &str) -> Option<u32> {
-    let prefix = "select c.relchecks, c.relkind, c.relhasindex, c.relhasrules, c.relhastriggers, c.relrowsecurity, c.relforcerowsecurity, false as relhasoids, c.relispartition, '', c.reltablespace, case when c.reloftype = 0 then '' else c.reloftype::pg_catalog.regtype::pg_catalog.text end, c.relpersistence, c.relreplident, am.amname from pg_catalog.pg_class c left join pg_catalog.pg_class tc on (c.reltoastrelid = tc.oid) left join pg_catalog.pg_am am on (c.relam = am.oid) where c.oid = '";
+    let plain_prefix = "select c.relchecks, c.relkind, c.relhasindex, c.relhasrules, c.relhastriggers, c.relrowsecurity, c.relforcerowsecurity, false as relhasoids, c.relispartition, '', c.reltablespace, case when c.reloftype = 0 then '' else c.reloftype::pg_catalog.regtype::pg_catalog.text end, c.relpersistence, c.relreplident, am.amname from pg_catalog.pg_class c left join pg_catalog.pg_class tc on (c.reltoastrelid = tc.oid) left join pg_catalog.pg_am am on (c.relam = am.oid) where c.oid = '";
+    let verbose_prefix = "select c.relchecks, c.relkind, c.relhasindex, c.relhasrules, c.relhastriggers, c.relrowsecurity, c.relforcerowsecurity, false as relhasoids, c.relispartition, pg_catalog.array_to_string(c.reloptions || array(select 'toast.' || x from pg_catalog.unnest(tc.reloptions) x), ', '), c.reltablespace, case when c.reloftype = 0 then '' else c.reloftype::pg_catalog.regtype::pg_catalog.text end, c.relpersistence, c.relreplident, am.amname from pg_catalog.pg_class c left join pg_catalog.pg_class tc on (c.reltoastrelid = tc.oid) left join pg_catalog.pg_am am on (c.relam = am.oid) where c.oid = '";
+    let verbose_wrapped_prefix = "select c.relchecks, c.relkind, c.relhasindex, c.relhasrules, c.relhastriggers, c.relrowsecurity, c.relforcerowsecurity, false as relhasoids, c.relispartition, pg_catalog.array_to_string(c.reloptions || array(select 'toast.' || x from pg_catalog.unnest(tc.reloptions) x), ', ') , c.reltablespace, case when c.reloftype = 0 then '' else c.reloftype::pg_catalog.regtype::pg_catalog.text end, c.relpersistence, c.relreplident, am.amname from pg_catalog.pg_class c left join pg_catalog.pg_class tc on (c.reltoastrelid = tc.oid) left join pg_catalog.pg_am am on (c.relam = am.oid) where c.oid = '";
     let suffix = "'";
     canonical
-        .strip_prefix(prefix)?
+        .strip_prefix(plain_prefix)
+        .or_else(|| canonical.strip_prefix(verbose_prefix))
+        .or_else(|| canonical.strip_prefix(verbose_wrapped_prefix))?
         .strip_suffix(suffix)?
         .parse()
         .ok()
@@ -1360,6 +1383,44 @@ fn catalog_describe_attribute_query_oid(canonical: &str) -> Option<u32> {
         .ok()
 }
 
+fn catalog_describe_verbose_attribute_query_oid(canonical: &str) -> Option<u32> {
+    let prefix = "select a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod), (select pg_catalog.pg_get_expr(d.adbin, d.adrelid, true) from pg_catalog.pg_attrdef d where d.adrelid = a.attrelid and d.adnum = a.attnum and a.atthasdef), a.attnotnull, (select c.collname from pg_catalog.pg_collation c, pg_catalog.pg_type t where c.oid = a.attcollation and t.oid = a.atttypid and a.attcollation <> t.typcollation) as attcollation, a.attidentity, a.attgenerated, a.attstorage, a.attcompression as attcompression, case when a.attstattarget=-1 then null else a.attstattarget end as attstattarget, pg_catalog.col_description(a.attrelid, a.attnum) from pg_catalog.pg_attribute a where a.attrelid = '";
+    let suffix = "' and a.attnum > 0 and not a.attisdropped order by a.attnum";
+    canonical
+        .strip_prefix(prefix)?
+        .strip_suffix(suffix)?
+        .parse()
+        .ok()
+}
+
+fn catalog_describe_verbose_attribute_rows(
+    session: &Session,
+    oid: u32,
+) -> Vec<Vec<Option<String>>> {
+    let Some(table) = session.tables.values().find(|table| table.oid == oid) else {
+        return Vec::new();
+    };
+    table
+        .columns
+        .iter()
+        .map(|column| {
+            vec![
+                Some(column.def.name.clone()),
+                Some(sql_type_display_name(column.def.ty).to_string()),
+                None,
+                Some("f".to_string()),
+                None,
+                Some(String::new()),
+                Some(String::new()),
+                Some(sql_type_storage_code(column.def.ty).to_string()),
+                Some(String::new()),
+                None,
+                None,
+            ]
+        })
+        .collect()
+}
+
 fn catalog_describe_attribute_rows(session: &Session, oid: u32) -> Vec<Vec<Option<String>>> {
     let Some(table) = session.tables.values().find(|table| table.oid == oid) else {
         return Vec::new();
@@ -1379,6 +1440,13 @@ fn catalog_describe_attribute_rows(session: &Session, oid: u32) -> Vec<Vec<Optio
             ]
         })
         .collect()
+}
+
+fn sql_type_storage_code(ty: SqlType) -> &'static str {
+    match ty {
+        SqlType::Int4 => "p",
+        SqlType::Text => "x",
+    }
 }
 
 fn sql_type_display_name(ty: SqlType) -> &'static str {
@@ -2058,6 +2126,12 @@ mod tests {
             Some(FIRST_USER_RELATION_OID)
         );
         assert_eq!(
+            catalog_describe_relation_flags_query_oid(
+                "select c.relchecks, c.relkind, c.relhasindex, c.relhasrules, c.relhastriggers, c.relrowsecurity, c.relforcerowsecurity, false as relhasoids, c.relispartition, pg_catalog.array_to_string(c.reloptions || array(select 'toast.' || x from pg_catalog.unnest(tc.reloptions) x), ', ') , c.reltablespace, case when c.reloftype = 0 then '' else c.reloftype::pg_catalog.regtype::pg_catalog.text end, c.relpersistence, c.relreplident, am.amname from pg_catalog.pg_class c left join pg_catalog.pg_class tc on (c.reltoastrelid = tc.oid) left join pg_catalog.pg_am am on (c.relam = am.oid) where c.oid = '16384'"
+            ),
+            Some(FIRST_USER_RELATION_OID)
+        );
+        assert_eq!(
             catalog_describe_relation_flags_rows(&session, FIRST_USER_RELATION_OID),
             vec![vec![
                 Some("0".to_string()),
@@ -2103,6 +2177,43 @@ mod tests {
                     None,
                     Some(String::new()),
                     Some(String::new()),
+                ],
+            ]
+        );
+        assert_eq!(
+            catalog_describe_verbose_attribute_query_oid(
+                "select a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod), (select pg_catalog.pg_get_expr(d.adbin, d.adrelid, true) from pg_catalog.pg_attrdef d where d.adrelid = a.attrelid and d.adnum = a.attnum and a.atthasdef), a.attnotnull, (select c.collname from pg_catalog.pg_collation c, pg_catalog.pg_type t where c.oid = a.attcollation and t.oid = a.atttypid and a.attcollation <> t.typcollation) as attcollation, a.attidentity, a.attgenerated, a.attstorage, a.attcompression as attcompression, case when a.attstattarget=-1 then null else a.attstattarget end as attstattarget, pg_catalog.col_description(a.attrelid, a.attnum) from pg_catalog.pg_attribute a where a.attrelid = '16384' and a.attnum > 0 and not a.attisdropped order by a.attnum"
+            ),
+            Some(FIRST_USER_RELATION_OID)
+        );
+        assert_eq!(
+            catalog_describe_verbose_attribute_rows(&session, FIRST_USER_RELATION_OID),
+            vec![
+                vec![
+                    Some("id".to_string()),
+                    Some("integer".to_string()),
+                    None,
+                    Some("f".to_string()),
+                    None,
+                    Some(String::new()),
+                    Some(String::new()),
+                    Some("p".to_string()),
+                    Some(String::new()),
+                    None,
+                    None,
+                ],
+                vec![
+                    Some("name".to_string()),
+                    Some("text".to_string()),
+                    None,
+                    Some("f".to_string()),
+                    None,
+                    Some(String::new()),
+                    Some(String::new()),
+                    Some("x".to_string()),
+                    Some(String::new()),
+                    None,
+                    None,
                 ],
             ]
         );

@@ -1,0 +1,8 @@
+=== psql d plus table meta-command ===
+CREATE TABLE
+                                   Table "public.describe_plus_people"
+ Column |  Type   | Collation | Nullable | Default | Storage  | Compression | Stats target | Description
+--------+---------+-----------+----------+---------+----------+-------------+--------------+-------------
+ id     | integer |           |          |         | plain    |             |              |
+ name   | text    |           |          |         | extended |             |              |
+Access method: heap

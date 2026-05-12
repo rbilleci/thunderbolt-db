@@ -18,7 +18,7 @@ The compatibility scorecard turns test output into a machine-readable summary so
 
 ```bash
 mkdir -p target/compat
-cargo test --workspace -- --color never | tee target/compat/cargo-test.log
+cargo test --workspace -- --color never 2>&1 | tee target/compat/cargo-test.log
 python3 scripts/generate_compat_scorecard.py \
   --input target/compat/cargo-test.log \
   --psql-report target/compat/psql-golden-report.json \

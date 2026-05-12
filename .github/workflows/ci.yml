@@ -26,7 +26,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p target/compat
-          cargo test --workspace -- --color never | tee target/compat/cargo-test.log
+          cargo test --workspace -- --color never 2>&1 | tee target/compat/cargo-test.log
       - name: psql golden compatibility suite
         id: psql_golden
         continue-on-error: true

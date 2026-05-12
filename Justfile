@@ -11,7 +11,7 @@ test:
 
 compat-scorecard:
 	mkdir -p target/compat
-	cargo test --workspace -- --color never | tee target/compat/cargo-test.log
+	cargo test --workspace -- --color never 2>&1 | tee target/compat/cargo-test.log
 	python3 scripts/generate_compat_scorecard.py \
 	  --input target/compat/cargo-test.log \
 	  --output docs/compatibility/scorecard.latest.json \
