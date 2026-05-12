@@ -3,6 +3,7 @@
 ## 2026-05-12
 
 ### PostgreSQL-compatible product loop
+- Advanced P2 catalog/schema/type spine by backing PostgreSQL 16 schema-qualified `psql \dt public.<prefix>*` table-listing traffic for supported `public` session tables. The compatibility endpoint now parses the psql-emitted relation-name regex shape, filters the session catalog rows by the simple prefix wildcard, and keeps unsupported namespace lookups empty rather than broadening schema semantics.
 - Advanced P2 catalog/schema/type spine by backing PostgreSQL 16 schema-qualified `psql \dt public.*` table-listing traffic for supported `public` session tables. The compatibility endpoint now accepts the namespace-qualified `pg_class`/`pg_namespace` query shape emitted by psql and reuses session catalog metadata for the returned table rows.
 - Advanced P2 catalog/schema/type spine by backing PostgreSQL 16 schema-qualified `psql \d public.<table>` and `\d+ public.<table>` traffic for supported `public` session tables. The compatibility endpoint now accepts the namespace-qualified relation lookup query emitted by psql and still rejects unsupported non-`public` namespace lookups instead of pretending broader schema support.
 - Advanced P2 catalog/schema/type spine by backing PostgreSQL 16 `psql \d+ <table>` traffic for supported plain session tables. The compatibility endpoint now accepts the verbose relation-options and verbose column-attribute query shapes emitted by psql, returning catalog-backed column/type rows plus explicit plain-table storage/access-method metadata for the current subset.

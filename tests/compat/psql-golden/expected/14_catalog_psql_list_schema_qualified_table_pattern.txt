@@ -1,0 +1,10 @@
+=== psql dt schema qualified table pattern meta-command ===
+CREATE TABLE
+CREATE TABLE
+CREATE TABLE
+               List of relations
+ Schema |       Name        | Type  |  Owner
+--------+-------------------+-------+----------
+ public | dt_pattern_people | table | postgres
+ public | dt_pattern_teams  | table | postgres
+(2 rows)

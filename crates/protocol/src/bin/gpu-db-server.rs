@@ -880,9 +880,7 @@ fn execute_statement(
             &catalog_table_oid_rows(session),
         );
     }
-    if canonical == psql_describe_tables_catalog_query()
-        || psql_describe_tables_catalog_query_namespace(&canonical).as_deref() == Some("public")
-    {
+    if canonical == psql_describe_tables_catalog_query() {
         return write_single_row(
             stream,
             &[
@@ -892,6 +890,18 @@ fn execute_statement(
                 text_column("Owner"),
             ],
             &catalog_psql_describe_table_rows(session),
+        );
+    }
+    if let Some(filter) = psql_describe_tables_catalog_query_filter(&canonical) {
+        return write_single_row(
+            stream,
+            &[
+                text_column("Schema"),
+                text_column("Name"),
+                text_column("Type"),
+                text_column("Owner"),
+            ],
+            &catalog_psql_describe_table_rows_filtered(session, &filter),
         );
     }
     if canonical == psql_describe_schemas_catalog_query() {
@@ -1254,13 +1264,37 @@ fn psql_describe_tables_catalog_query() -> &'static str {
     "select n.nspname as \"schema\", c.relname as \"name\", case c.relkind when 'r' then 'table' when 'v' then 'view' when 'm' then 'materialized view' when 'i' then 'index' when 's' then 'sequence' when 't' then 'toast table' when 'f' then 'foreign table' when 'p' then 'partitioned table' when 'i' then 'partitioned index' end as \"type\", pg_catalog.pg_get_userbyid(c.relowner) as \"owner\" from pg_catalog.pg_class c left join pg_catalog.pg_namespace n on n.oid = c.relnamespace left join pg_catalog.pg_am am on am.oid = c.relam where c.relkind in ('r','p','') and n.nspname <> 'pg_catalog' and n.nspname !~ '^pg_toast' and n.nspname <> 'information_schema' and pg_catalog.pg_table_is_visible(c.oid) order by 1,2"
 }
 
-fn psql_describe_tables_catalog_query_namespace(canonical: &str) -> Option<String> {
-    let prefix = "select n.nspname as \"schema\", c.relname as \"name\", case c.relkind when 'r' then 'table' when 'v' then 'view' when 'm' then 'materialized view' when 'i' then 'index' when 's' then 'sequence' when 't' then 'toast table' when 'f' then 'foreign table' when 'p' then 'partitioned table' when 'i' then 'partitioned index' end as \"type\", pg_catalog.pg_get_userbyid(c.relowner) as \"owner\" from pg_catalog.pg_class c left join pg_catalog.pg_namespace n on n.oid = c.relnamespace left join pg_catalog.pg_am am on am.oid = c.relam where c.relkind in ('r','p','t','s','') and n.nspname operator(pg_catalog.~) '^(";
-    let suffix = ")$' collate pg_catalog.default order by 1,2";
-    canonical
-        .strip_prefix(prefix)?
-        .strip_suffix(suffix)
-        .map(str::to_string)
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PsqlDescribeTablesFilter {
+    namespace: String,
+    relname_pattern: Option<String>,
+}
+
+fn psql_describe_tables_catalog_query_filter(canonical: &str) -> Option<PsqlDescribeTablesFilter> {
+    let prefix = "select n.nspname as \"schema\", c.relname as \"name\", case c.relkind when 'r' then 'table' when 'v' then 'view' when 'm' then 'materialized view' when 'i' then 'index' when 's' then 'sequence' when 't' then 'toast table' when 'f' then 'foreign table' when 'p' then 'partitioned table' when 'i' then 'partitioned index' end as \"type\", pg_catalog.pg_get_userbyid(c.relowner) as \"owner\" from pg_catalog.pg_class c left join pg_catalog.pg_namespace n on n.oid = c.relnamespace left join pg_catalog.pg_am am on am.oid = c.relam where c.relkind in ('r','p','t','s','') and ";
+    let namespace_prefix = "n.nspname operator(pg_catalog.~) '^(";
+    let namespace_suffix = ")$' collate pg_catalog.default order by 1,2";
+    let rest = canonical.strip_prefix(prefix)?;
+    if let Some(namespace) = rest
+        .strip_prefix(namespace_prefix)
+        .and_then(|rest| rest.strip_suffix(namespace_suffix))
+    {
+        return Some(PsqlDescribeTablesFilter {
+            namespace: namespace.to_string(),
+            relname_pattern: None,
+        });
+    }
+
+    let relname_prefix = "c.relname operator(pg_catalog.~) '^(";
+    let relname_middle = ")$' collate pg_catalog.default and n.nspname operator(pg_catalog.~) '^(";
+    let (relname_pattern, namespace) = rest
+        .strip_prefix(relname_prefix)?
+        .strip_suffix(namespace_suffix)?
+        .split_once(relname_middle)?;
+    Some(PsqlDescribeTablesFilter {
+        namespace: namespace.to_string(),
+        relname_pattern: Some(relname_pattern.to_string()),
+    })
 }
 
 fn psql_describe_schemas_catalog_query() -> &'static str {
@@ -1297,10 +1331,32 @@ fn catalog_psql_describe_type_rows(type_name: &str) -> Vec<Vec<Option<String>>> 
 }
 
 fn catalog_psql_describe_table_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    catalog_psql_describe_table_rows_filtered(
+        session,
+        &PsqlDescribeTablesFilter {
+            namespace: "public".to_string(),
+            relname_pattern: None,
+        },
+    )
+}
+
+fn catalog_psql_describe_table_rows_filtered(
+    session: &Session,
+    filter: &PsqlDescribeTablesFilter,
+) -> Vec<Vec<Option<String>>> {
+    if filter.namespace != "public" {
+        return Vec::new();
+    }
     let mut tables = session.tables.values().collect::<Vec<_>>();
     tables.sort_by(|left, right| left.name.cmp(&right.name));
     tables
         .into_iter()
+        .filter(|table| {
+            filter
+                .relname_pattern
+                .as_deref()
+                .is_none_or(|pattern| psql_relname_pattern_matches(pattern, &table.name))
+        })
         .map(|table| {
             vec![
                 Some("public".to_string()),
@@ -1310,6 +1366,13 @@ fn catalog_psql_describe_table_rows(session: &Session) -> Vec<Vec<Option<String>
             ]
         })
         .collect()
+}
+
+fn psql_relname_pattern_matches(pattern: &str, table_name: &str) -> bool {
+    if let Some(prefix) = pattern.strip_suffix(".*") {
+        return table_name.starts_with(prefix);
+    }
+    table_name == pattern
 }
 
 fn catalog_psql_describe_schema_rows() -> Vec<Vec<Option<String>>> {
@@ -2088,17 +2151,50 @@ mod tests {
             ]
         );
         assert_eq!(
-            psql_describe_tables_catalog_query_namespace(
+            psql_describe_tables_catalog_query_filter(
                 "select n.nspname as \"schema\", c.relname as \"name\", case c.relkind when 'r' then 'table' when 'v' then 'view' when 'm' then 'materialized view' when 'i' then 'index' when 's' then 'sequence' when 't' then 'toast table' when 'f' then 'foreign table' when 'p' then 'partitioned table' when 'i' then 'partitioned index' end as \"type\", pg_catalog.pg_get_userbyid(c.relowner) as \"owner\" from pg_catalog.pg_class c left join pg_catalog.pg_namespace n on n.oid = c.relnamespace left join pg_catalog.pg_am am on am.oid = c.relam where c.relkind in ('r','p','t','s','') and n.nspname operator(pg_catalog.~) '^(public)$' collate pg_catalog.default order by 1,2"
             ),
-            Some("public".to_string())
+            Some(PsqlDescribeTablesFilter {
+                namespace: "public".to_string(),
+                relname_pattern: None,
+            })
         );
         assert_eq!(
-            psql_describe_tables_catalog_query_namespace(
-                "select n.nspname as \"schema\", c.relname as \"name\", case c.relkind when 'r' then 'table' when 'v' then 'view' when 'm' then 'materialized view' when 'i' then 'index' when 's' then 'sequence' when 't' then 'toast table' when 'f' then 'foreign table' when 'p' then 'partitioned table' when 'i' then 'partitioned index' end as \"type\", pg_catalog.pg_get_userbyid(c.relowner) as \"owner\" from pg_catalog.pg_class c left join pg_catalog.pg_namespace n on n.oid = c.relnamespace left join pg_catalog.pg_am am on am.oid = c.relam where c.relkind in ('r','p','t','s','') and n.nspname operator(pg_catalog.~) '^(private)$' collate pg_catalog.default order by 1,2"
+            psql_describe_tables_catalog_query_filter(
+                "select n.nspname as \"schema\", c.relname as \"name\", case c.relkind when 'r' then 'table' when 'v' then 'view' when 'm' then 'materialized view' when 'i' then 'index' when 's' then 'sequence' when 't' then 'toast table' when 'f' then 'foreign table' when 'p' then 'partitioned table' when 'i' then 'partitioned index' end as \"type\", pg_catalog.pg_get_userbyid(c.relowner) as \"owner\" from pg_catalog.pg_class c left join pg_catalog.pg_namespace n on n.oid = c.relnamespace left join pg_catalog.pg_am am on am.oid = c.relam where c.relkind in ('r','p','t','s','') and c.relname operator(pg_catalog.~) '^(people_.*)$' collate pg_catalog.default and n.nspname operator(pg_catalog.~) '^(public)$' collate pg_catalog.default order by 1,2"
             ),
-            Some("private".to_string())
+            Some(PsqlDescribeTablesFilter {
+                namespace: "public".to_string(),
+                relname_pattern: Some("people_.*".to_string()),
+            })
         );
+        assert_eq!(
+            catalog_psql_describe_table_rows_filtered(
+                &session,
+                &PsqlDescribeTablesFilter {
+                    namespace: "public".to_string(),
+                    relname_pattern: Some("peo.*".to_string()),
+                },
+            ),
+            vec![vec![
+                Some("public".to_string()),
+                Some("people".to_string()),
+                Some("table".to_string()),
+                Some("postgres".to_string()),
+            ]]
+        );
+        assert!(catalog_psql_describe_table_rows_filtered(
+            &session,
+            &PsqlDescribeTablesFilter {
+                namespace: "private".to_string(),
+                relname_pattern: None,
+            },
+        )
+        .is_empty());
+        assert!(psql_relname_pattern_matches("peo.*", "people"));
+        assert!(!psql_relname_pattern_matches("tea.*", "people"));
+        assert!(psql_relname_pattern_matches("people", "people"));
+        assert!(!psql_relname_pattern_matches("people", "teams"));
         assert_eq!(
             psql_describe_schemas_catalog_query(),
             "select n.nspname as \"name\", pg_catalog.pg_get_userbyid(n.nspowner) as \"owner\" from pg_catalog.pg_namespace n where n.nspname !~ '^pg_' and n.nspname <> 'information_schema' order by 1"
