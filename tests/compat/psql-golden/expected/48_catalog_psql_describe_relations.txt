@@ -1,0 +1,9 @@
+=== psql describe relations meta-command ===
+CREATE TABLE
+CREATE TABLE
+                 List of relations
+ Schema |         Name          | Type  |  Owner
+--------+-----------------------+-------+----------
+ public | plain_describe_people | table | postgres
+ public | plain_describe_teams  | table | postgres
+(2 rows)

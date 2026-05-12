@@ -44,5 +44,6 @@ When `PSQL_GOLDEN_BOOT_CMD` is set, the harness starts the target service itself
 - Scenario 45 covers catalog-qualified `information_schema.tables` richer table metadata filters for `table_catalog = current_database()` backed by supported `public` session catalog metadata.
 - Scenario 46 covers direct `pg_catalog.pg_namespace` lookup for the supported `public` namespace OID/name metadata.
 - Scenario 47 covers real `psql \dn+ public` verbose schema introspection for the supported `public` namespace, returning owner metadata plus empty ACL/description fields for the current no-ACL/no-comment subset.
+- Scenario 48 covers real plain `psql \d` relation listing for supported `public` session tables, backed by the session catalog relation metadata.
 - CI now boots the repo-local compatibility endpoint with `cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen 127.0.0.1:55432` before running the suite, so Q4 has a real service endpoint instead of a manual-only placeholder.
 - If a wire-level extended-query flow is intentionally unsupported, encode that as an explicit expected failure in a dedicated scenario and set the expected `.rc` artifact.
