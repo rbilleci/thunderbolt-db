@@ -1,0 +1,13 @@
+=== psql describe schema wildcard ===
+CREATE TABLE
+CREATE TABLE
+          Table "public.wildcard_people"
+ Column |  Type   | Collation | Nullable | Default
+--------+---------+-----------+----------+---------
+ id     | integer |           |          |
+ name   | text    |           |          |
+
+           Table "public.wildcard_teams"
+ Column  |  Type   | Collation | Nullable | Default
+---------+---------+-----------+----------+---------
+ team_id | integer |           |          |

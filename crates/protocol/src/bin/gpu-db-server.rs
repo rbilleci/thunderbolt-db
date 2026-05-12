@@ -967,6 +967,17 @@ fn execute_statement(
             &catalog_psql_describe_type_rows(&type_name),
         );
     }
+    if catalog_describe_relation_lookup_query_public_namespace(&canonical) {
+        return write_single_row(
+            stream,
+            &[
+                int4_column("oid"),
+                text_column("nspname"),
+                text_column("relname"),
+            ],
+            &catalog_describe_relation_lookup_rows_for_public_namespace(session),
+        );
+    }
     if let Some(table) = catalog_describe_relation_lookup_query_table(&canonical) {
         return write_single_row(
             stream,
@@ -1782,6 +1793,11 @@ fn catalog_describe_relation_lookup_query_table(canonical: &str) -> Option<Strin
     (namespace == "public").then(|| table.to_string())
 }
 
+fn catalog_describe_relation_lookup_query_public_namespace(canonical: &str) -> bool {
+    canonical
+        == "select c.oid, n.nspname, c.relname from pg_catalog.pg_class c left join pg_catalog.pg_namespace n on n.oid = c.relnamespace where n.nspname operator(pg_catalog.~) '^(public)$' collate pg_catalog.default order by 2, 3"
+}
+
 fn catalog_describe_relation_lookup_rows(
     session: &Session,
     table: &str,
@@ -1797,6 +1813,23 @@ fn catalog_describe_relation_lookup_rows(
             ]]
         })
         .unwrap_or_default()
+}
+
+fn catalog_describe_relation_lookup_rows_for_public_namespace(
+    session: &Session,
+) -> Vec<Vec<Option<String>>> {
+    let mut tables = session.tables.values().collect::<Vec<_>>();
+    tables.sort_by(|left, right| left.name.cmp(&right.name));
+    tables
+        .into_iter()
+        .map(|table| {
+            vec![
+                Some(table.oid.to_string()),
+                Some("public".to_string()),
+                Some(table.name.clone()),
+            ]
+        })
+        .collect()
 }
 
 fn catalog_describe_relation_flags_query_oid(canonical: &str) -> Option<u32> {
@@ -3078,6 +3111,9 @@ mod tests {
             ),
             None
         );
+        assert!(catalog_describe_relation_lookup_query_public_namespace(
+            "select c.oid, n.nspname, c.relname from pg_catalog.pg_class c left join pg_catalog.pg_namespace n on n.oid = c.relnamespace where n.nspname operator(pg_catalog.~) '^(public)$' collate pg_catalog.default order by 2, 3"
+        ));
         assert_eq!(
             catalog_describe_relation_lookup_rows(&session, "people"),
             vec![vec![
@@ -3087,6 +3123,21 @@ mod tests {
             ]]
         );
         assert!(catalog_describe_relation_lookup_rows(&session, "missing").is_empty());
+        assert_eq!(
+            catalog_describe_relation_lookup_rows_for_public_namespace(&session),
+            vec![
+                vec![
+                    Some(FIRST_USER_RELATION_OID.to_string()),
+                    Some("public".to_string()),
+                    Some("people".to_string()),
+                ],
+                vec![
+                    Some((FIRST_USER_RELATION_OID + 1).to_string()),
+                    Some("public".to_string()),
+                    Some("teams".to_string()),
+                ],
+            ]
+        );
         assert_eq!(
             catalog_describe_relation_flags_query_oid(
                 "select c.relchecks, c.relkind, c.relhasindex, c.relhasrules, c.relhastriggers, c.relrowsecurity, c.relforcerowsecurity, false as relhasoids, c.relispartition, '', c.reltablespace, case when c.reloftype = 0 then '' else c.reloftype::pg_catalog.regtype::pg_catalog.text end, c.relpersistence, c.relreplident, am.amname from pg_catalog.pg_class c left join pg_catalog.pg_class tc on (c.reltoastrelid = tc.oid) left join pg_catalog.pg_am am on (c.relam = am.oid) where c.oid = '16384'"
