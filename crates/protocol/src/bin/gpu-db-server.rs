@@ -1234,6 +1234,26 @@ fn execute_statement(
             &information_schema_rich_table_rows_for_table(session, &table),
         );
     }
+    if let Some(table) = information_schema_rich_tables_catalog_query_table(&canonical) {
+        return write_single_row(
+            stream,
+            &[
+                text_column("table_catalog"),
+                text_column("table_schema"),
+                text_column("table_name"),
+                text_column("table_type"),
+                text_column("self_referencing_column_name"),
+                text_column("reference_generation"),
+                text_column("user_defined_type_catalog"),
+                text_column("user_defined_type_schema"),
+                text_column("user_defined_type_name"),
+                text_column("is_insertable_into"),
+                text_column("is_typed"),
+                text_column("commit_action"),
+            ],
+            &information_schema_rich_table_rows_for_table(session, &table),
+        );
+    }
     if let Some(table) = information_schema_columns_query_table(&canonical) {
         return write_single_row(
             stream,
@@ -2349,6 +2369,22 @@ fn information_schema_rich_tables_query_table(canonical: &str) -> Option<String>
     let suffix = "' order by table_name";
     canonical
         .strip_prefix(prefix)?
+        .strip_suffix(suffix)
+        .map(str::to_string)
+}
+
+fn information_schema_rich_tables_catalog_query_table(canonical: &str) -> Option<String> {
+    let suffix = "' order by table_name";
+    let current_database_prefix = "select table_catalog, table_schema, table_name, table_type, self_referencing_column_name, reference_generation, user_defined_type_catalog, user_defined_type_schema, user_defined_type_name, is_insertable_into, is_typed, commit_action from information_schema.tables where table_catalog = current_database() and table_schema = 'public' and table_name = '";
+    if let Some(table) = canonical
+        .strip_prefix(current_database_prefix)
+        .and_then(|rest| rest.strip_suffix(suffix))
+    {
+        return Some(table.to_string());
+    }
+    let literal_catalog_prefix = "select table_catalog, table_schema, table_name, table_type, self_referencing_column_name, reference_generation, user_defined_type_catalog, user_defined_type_schema, user_defined_type_name, is_insertable_into, is_typed, commit_action from information_schema.tables where table_catalog = 'postgres' and table_schema = 'public' and table_name = '";
+    canonical
+        .strip_prefix(literal_catalog_prefix)?
         .strip_suffix(suffix)
         .map(str::to_string)
 }
@@ -4544,6 +4580,21 @@ mod tests {
             )
             .unwrap(),
             vec![text_column("name"), int4_column("id")]
+        );
+    }
+
+    #[test]
+    fn catalog_helpers_parse_catalog_qualified_information_schema_table_filters() {
+        let current_database_query = "select table_catalog, table_schema, table_name, table_type, self_referencing_column_name, reference_generation, user_defined_type_catalog, user_defined_type_schema, user_defined_type_name, is_insertable_into, is_typed, commit_action from information_schema.tables where table_catalog = current_database() and table_schema = 'public' and table_name = 'people' order by table_name";
+        let literal_catalog_query = "select table_catalog, table_schema, table_name, table_type, self_referencing_column_name, reference_generation, user_defined_type_catalog, user_defined_type_schema, user_defined_type_name, is_insertable_into, is_typed, commit_action from information_schema.tables where table_catalog = 'postgres' and table_schema = 'public' and table_name = 'people' order by table_name";
+
+        assert_eq!(
+            information_schema_rich_tables_catalog_query_table(current_database_query),
+            Some("people".to_string())
+        );
+        assert_eq!(
+            information_schema_rich_tables_catalog_query_table(literal_catalog_query),
+            Some("people".to_string())
         );
     }
 
