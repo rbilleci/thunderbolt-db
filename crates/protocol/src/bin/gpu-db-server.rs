@@ -10,6 +10,8 @@ use gpu_db_protocol::{
 };
 use gpu_db_protocol::{DescribeTarget, SqlType};
 
+const PUBLIC_NAMESPACE_OID: u32 = 2200;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Column {
     name: String,
@@ -970,6 +972,13 @@ fn execute_statement(
             stream,
             &[text_column("Name"), text_column("Owner")],
             &catalog_psql_describe_schema_rows(),
+        );
+    }
+    if canonical == pg_catalog_namespace_query() {
+        return write_single_row(
+            stream,
+            &[int4_column("oid"), text_column("nspname")],
+            &pg_catalog_namespace_rows(),
         );
     }
     if let Some(type_name) = psql_describe_type_catalog_query_type(&canonical) {
@@ -1954,6 +1963,17 @@ fn catalog_psql_describe_schema_rows() -> Vec<Vec<Option<String>>> {
     vec![vec![
         Some("public".to_string()),
         Some("postgres".to_string()),
+    ]]
+}
+
+fn pg_catalog_namespace_query() -> &'static str {
+    "select oid, nspname from pg_catalog.pg_namespace where nspname = 'public' order by oid"
+}
+
+fn pg_catalog_namespace_rows() -> Vec<Vec<Option<String>>> {
+    vec![vec![
+        Some(PUBLIC_NAMESPACE_OID.to_string()),
+        Some("public".to_string()),
     ]]
 }
 
@@ -4216,6 +4236,17 @@ mod tests {
             vec![vec![
                 Some("public".to_string()),
                 Some("postgres".to_string())
+            ]]
+        );
+        assert_eq!(
+            pg_catalog_namespace_query(),
+            "select oid, nspname from pg_catalog.pg_namespace where nspname = 'public' order by oid"
+        );
+        assert_eq!(
+            pg_catalog_namespace_rows(),
+            vec![vec![
+                Some(PUBLIC_NAMESPACE_OID.to_string()),
+                Some("public".to_string())
             ]]
         );
         assert_eq!(

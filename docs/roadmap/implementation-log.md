@@ -3,6 +3,7 @@
 ## 2026-05-13
 
 ### PostgreSQL-compatible product loop
+- Advanced P2 catalog/schema/type spine by backing direct `pg_catalog.pg_namespace` lookup for the supported `public` namespace. The compatibility endpoint now returns the stable bootstrap namespace OID/name row for common client namespace probes while keeping broader PostgreSQL namespace behavior out of scope.
 - Advanced P2 catalog/schema/type spine by supporting catalog-qualified richer `information_schema.tables` filters for supported `public` session tables. The compatibility endpoint now accepts common client predicates using `table_catalog = current_database()` or the supported `postgres` catalog literal, returning table catalog/schema/name/type/insertability/typed-table metadata from the session catalog.
 - Advanced P2 catalog/schema/type spine by supporting catalog-qualified `information_schema.columns` extended metadata filters for supported `public` session tables. The compatibility endpoint now accepts common client predicates using `table_catalog = current_database()` or the supported `postgres` catalog literal, with rows still backed by session catalog column/type metadata.
 - Advanced P2 catalog/schema/type spine by backing common `pg_catalog.pg_description` discovery for the current no-comment subset. The compatibility endpoint accepts the joined `pg_description` / `pg_class` / `pg_namespace` / `pg_attribute` query for supported `public` tables and truthfully returns no rows until table or column comments exist, with real psql golden coverage.
