@@ -1075,6 +1075,19 @@ fn execute_statement(
             &information_schema_column_rows(session, &table),
         );
     }
+    if canonical == information_schema_all_columns_query() {
+        return write_single_row(
+            stream,
+            &[
+                text_column("table_schema"),
+                text_column("table_name"),
+                text_column("column_name"),
+                int4_column("ordinal_position"),
+                text_column("data_type"),
+            ],
+            &information_schema_all_column_rows(session),
+        );
+    }
     if canonical == information_schema_schemata_query() {
         return write_single_row(
             stream,
@@ -1647,6 +1660,29 @@ fn information_schema_column_rows(session: &Session, table: &str) -> Vec<Vec<Opt
                 Some(column.attnum.to_string()),
                 Some(sql_type_display_name(column.def.ty).to_string()),
             ]
+        })
+        .collect()
+}
+
+fn information_schema_all_columns_query() -> &'static str {
+    "select table_schema, table_name, column_name, ordinal_position, data_type from information_schema.columns where table_schema = 'public' order by table_name, ordinal_position"
+}
+
+fn information_schema_all_column_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut tables = session.tables.values().collect::<Vec<_>>();
+    tables.sort_by(|left, right| left.name.cmp(&right.name));
+    tables
+        .into_iter()
+        .flat_map(|table| {
+            table.columns.iter().map(|column| {
+                vec![
+                    Some("public".to_string()),
+                    Some(table.name.clone()),
+                    Some(column.def.name.clone()),
+                    Some(column.attnum.to_string()),
+                    Some(sql_type_display_name(column.def.ty).to_string()),
+                ]
+            })
         })
         .collect()
 }
@@ -2426,6 +2462,36 @@ mod tests {
                     Some("name".to_string()),
                     Some("2".to_string()),
                     Some("text".to_string()),
+                ],
+            ]
+        );
+        assert_eq!(
+            information_schema_all_columns_query(),
+            "select table_schema, table_name, column_name, ordinal_position, data_type from information_schema.columns where table_schema = 'public' order by table_name, ordinal_position"
+        );
+        assert_eq!(
+            information_schema_all_column_rows(&session),
+            vec![
+                vec![
+                    Some("public".to_string()),
+                    Some("people".to_string()),
+                    Some("id".to_string()),
+                    Some("1".to_string()),
+                    Some("integer".to_string()),
+                ],
+                vec![
+                    Some("public".to_string()),
+                    Some("people".to_string()),
+                    Some("name".to_string()),
+                    Some("2".to_string()),
+                    Some("text".to_string()),
+                ],
+                vec![
+                    Some("public".to_string()),
+                    Some("teams".to_string()),
+                    Some("id".to_string()),
+                    Some("1".to_string()),
+                    Some("integer".to_string()),
                 ],
             ]
         );

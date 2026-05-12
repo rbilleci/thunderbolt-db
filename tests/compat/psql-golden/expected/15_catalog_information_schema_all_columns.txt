@@ -1,0 +1,10 @@
+=== information schema all-column introspection ===
+CREATE TABLE
+CREATE TABLE
+ table_schema |     table_name     | column_name | ordinal_position | data_type
+--------------+--------------------+-------------+------------------+-----------
+ public       | all_columns_people | id          |                1 | integer
+ public       | all_columns_people | name        |                2 | text
+ public       | all_columns_teams  | id          |                1 | integer
+ public       | all_columns_teams  | label       |                2 | text
+(4 rows)
