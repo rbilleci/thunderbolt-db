@@ -1,0 +1,12 @@
+=== psql dn schema meta-command ===
+  List of schemas
+  Name  |  Owner
+--------+----------
+ public | postgres
+(1 row)
+
+=== information schema schemata introspection ===
+ schema_name | schema_owner
+-------------+--------------
+ public      | postgres
+(1 row)

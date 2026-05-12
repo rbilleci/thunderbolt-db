@@ -892,6 +892,13 @@ fn execute_statement(
             &catalog_psql_describe_table_rows(session),
         );
     }
+    if canonical == psql_describe_schemas_catalog_query() {
+        return write_single_row(
+            stream,
+            &[text_column("Name"), text_column("Owner")],
+            &catalog_psql_describe_schema_rows(),
+        );
+    }
     if let Some(table) = catalog_describe_relation_lookup_query_table(&canonical) {
         return write_single_row(
             stream,
@@ -1024,6 +1031,13 @@ fn execute_statement(
                 text_column("data_type"),
             ],
             &information_schema_column_rows(session, &table),
+        );
+    }
+    if canonical == information_schema_schemata_query() {
+        return write_single_row(
+            stream,
+            &[text_column("schema_name"), text_column("schema_owner")],
+            &information_schema_schemata_rows(),
         );
     }
     if canonical
@@ -1208,6 +1222,10 @@ fn psql_describe_tables_catalog_query() -> &'static str {
     "select n.nspname as \"schema\", c.relname as \"name\", case c.relkind when 'r' then 'table' when 'v' then 'view' when 'm' then 'materialized view' when 'i' then 'index' when 's' then 'sequence' when 't' then 'toast table' when 'f' then 'foreign table' when 'p' then 'partitioned table' when 'i' then 'partitioned index' end as \"type\", pg_catalog.pg_get_userbyid(c.relowner) as \"owner\" from pg_catalog.pg_class c left join pg_catalog.pg_namespace n on n.oid = c.relnamespace left join pg_catalog.pg_am am on am.oid = c.relam where c.relkind in ('r','p','') and n.nspname <> 'pg_catalog' and n.nspname !~ '^pg_toast' and n.nspname <> 'information_schema' and pg_catalog.pg_table_is_visible(c.oid) order by 1,2"
 }
 
+fn psql_describe_schemas_catalog_query() -> &'static str {
+    "select n.nspname as \"name\", pg_catalog.pg_get_userbyid(n.nspowner) as \"owner\" from pg_catalog.pg_namespace n where n.nspname !~ '^pg_' and n.nspname <> 'information_schema' order by 1"
+}
+
 fn catalog_psql_describe_table_rows(session: &Session) -> Vec<Vec<Option<String>>> {
     let mut tables = session.tables.values().collect::<Vec<_>>();
     tables.sort_by(|left, right| left.name.cmp(&right.name));
@@ -1222,6 +1240,13 @@ fn catalog_psql_describe_table_rows(session: &Session) -> Vec<Vec<Option<String>
             ]
         })
         .collect()
+}
+
+fn catalog_psql_describe_schema_rows() -> Vec<Vec<Option<String>>> {
+    vec![vec![
+        Some("public".to_string()),
+        Some("postgres".to_string()),
+    ]]
 }
 
 fn catalog_describe_relation_lookup_query_table(canonical: &str) -> Option<String> {
@@ -1431,6 +1456,17 @@ fn information_schema_column_rows(session: &Session, table: &str) -> Vec<Vec<Opt
             ]
         })
         .collect()
+}
+
+fn information_schema_schemata_query() -> &'static str {
+    "select schema_name, schema_owner from information_schema.schemata where schema_name = 'public' order by schema_name"
+}
+
+fn information_schema_schemata_rows() -> Vec<Vec<Option<String>>> {
+    vec![vec![
+        Some("public".to_string()),
+        Some("postgres".to_string()),
+    ]]
 }
 
 fn catalog_type_rows_by_oid() -> Vec<Vec<Option<String>>> {
@@ -1922,6 +1958,17 @@ mod tests {
             ]
         );
         assert_eq!(
+            psql_describe_schemas_catalog_query(),
+            "select n.nspname as \"name\", pg_catalog.pg_get_userbyid(n.nspowner) as \"owner\" from pg_catalog.pg_namespace n where n.nspname !~ '^pg_' and n.nspname <> 'information_schema' order by 1"
+        );
+        assert_eq!(
+            catalog_psql_describe_schema_rows(),
+            vec![vec![
+                Some("public".to_string()),
+                Some("postgres".to_string())
+            ]]
+        );
+        assert_eq!(
             catalog_describe_relation_lookup_query_table(
                 "select c.oid, n.nspname, c.relname from pg_catalog.pg_class c left join pg_catalog.pg_namespace n on n.oid = c.relnamespace where c.relname operator(pg_catalog.~) '^(people)$' collate pg_catalog.default and pg_catalog.pg_table_is_visible(c.oid) order by 2, 3"
             ),
@@ -2060,6 +2107,17 @@ mod tests {
                     Some("text".to_string()),
                 ],
             ]
+        );
+        assert_eq!(
+            information_schema_schemata_query(),
+            "select schema_name, schema_owner from information_schema.schemata where schema_name = 'public' order by schema_name"
+        );
+        assert_eq!(
+            information_schema_schemata_rows(),
+            vec![vec![
+                Some("public".to_string()),
+                Some("postgres".to_string())
+            ]]
         );
         assert_eq!(
             catalog_type_rows_by_oid(),
