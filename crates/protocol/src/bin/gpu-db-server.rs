@@ -1131,6 +1131,17 @@ fn execute_statement(
             &information_schema_table_rows(session),
         );
     }
+    if let Some(tables) = information_schema_tables_in_query_tables(&canonical) {
+        return write_single_row(
+            stream,
+            &[
+                text_column("table_schema"),
+                text_column("table_name"),
+                text_column("table_type"),
+            ],
+            &information_schema_table_rows_for_tables(session, &tables),
+        );
+    }
     if canonical == information_schema_rich_tables_query() {
         return write_single_row(
             stream,
@@ -1953,6 +1964,47 @@ fn information_schema_tables_query() -> &'static str {
 
 fn information_schema_table_rows(session: &Session) -> Vec<Vec<Option<String>>> {
     let mut tables = session.tables.values().collect::<Vec<_>>();
+    tables.sort_by(|left, right| left.name.cmp(&right.name));
+    tables
+        .into_iter()
+        .map(|table| {
+            vec![
+                Some("public".to_string()),
+                Some(table.name.clone()),
+                Some("BASE TABLE".to_string()),
+            ]
+        })
+        .collect()
+}
+
+fn information_schema_tables_in_query_tables(canonical: &str) -> Option<Vec<String>> {
+    let prefix = "select table_schema, table_name, table_type from information_schema.tables where table_schema = 'public' and table_name in (";
+    let suffix = ") order by table_name";
+    let list = canonical.strip_prefix(prefix)?.strip_suffix(suffix)?;
+    let mut tables = Vec::new();
+    for raw_name in list.split(',') {
+        let name = raw_name.trim().strip_prefix('\'')?.strip_suffix('\'')?;
+        if name.is_empty() {
+            return None;
+        }
+        tables.push(name.to_string());
+    }
+    if tables.is_empty() {
+        None
+    } else {
+        Some(tables)
+    }
+}
+
+fn information_schema_table_rows_for_tables(
+    session: &Session,
+    table_names: &[String],
+) -> Vec<Vec<Option<String>>> {
+    let requested_tables = table_names.iter().collect::<BTreeSet<_>>();
+    let mut tables = requested_tables
+        .iter()
+        .filter_map(|table_name| session.tables.get(table_name.as_str()))
+        .collect::<Vec<_>>();
     tables.sort_by(|left, right| left.name.cmp(&right.name));
     tables
         .into_iter()
@@ -3030,6 +3082,39 @@ mod tests {
         );
         assert_eq!(
             information_schema_table_rows(&session),
+            vec![
+                vec![
+                    Some("public".to_string()),
+                    Some("people".to_string()),
+                    Some("BASE TABLE".to_string()),
+                ],
+                vec![
+                    Some("public".to_string()),
+                    Some("teams".to_string()),
+                    Some("BASE TABLE".to_string()),
+                ],
+            ]
+        );
+        assert_eq!(
+            information_schema_tables_in_query_tables(
+                "select table_schema, table_name, table_type from information_schema.tables where table_schema = 'public' and table_name in ('people', 'missing', 'teams') order by table_name"
+            ),
+            Some(vec![
+                "people".to_string(),
+                "missing".to_string(),
+                "teams".to_string()
+            ])
+        );
+        assert_eq!(
+            information_schema_table_rows_for_tables(
+                &session,
+                &[
+                    "people".to_string(),
+                    "missing".to_string(),
+                    "people".to_string(),
+                    "teams".to_string()
+                ]
+            ),
             vec![
                 vec![
                     Some("public".to_string()),

@@ -1,0 +1,9 @@
+=== information_schema tables table-name subset ===
+CREATE TABLE
+CREATE TABLE
+CREATE TABLE
+ table_schema |    table_name    | table_type
+--------------+------------------+------------
+ public       | is_tables_people | BASE TABLE
+ public       | is_tables_teams  | BASE TABLE
+(2 rows)
