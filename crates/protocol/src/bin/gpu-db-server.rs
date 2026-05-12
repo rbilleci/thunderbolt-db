@@ -974,6 +974,21 @@ fn execute_statement(
             &catalog_psql_describe_schema_rows(),
         );
     }
+    if psql_describe_schemas_verbose_catalog_query_public_filter(&canonical) {
+        return write_single_row(
+            stream,
+            &[
+                text_column("Name"),
+                text_column("Owner"),
+                text_column("Access privileges"),
+                text_column("Description"),
+            ],
+            &catalog_psql_describe_schema_verbose_rows(),
+        );
+    }
+    if canonical == psql_describe_schema_publications_query() {
+        return write_single_row(stream, &[text_column("pubname")], &catalog_empty_rows());
+    }
     if canonical == pg_catalog_namespace_query() {
         return write_single_row(
             stream,
@@ -1827,6 +1842,15 @@ fn psql_describe_schemas_catalog_query() -> &'static str {
     "select n.nspname as \"name\", pg_catalog.pg_get_userbyid(n.nspowner) as \"owner\" from pg_catalog.pg_namespace n where n.nspname !~ '^pg_' and n.nspname <> 'information_schema' order by 1"
 }
 
+fn psql_describe_schemas_verbose_catalog_query_public_filter(canonical: &str) -> bool {
+    canonical
+        == "select n.nspname as \"name\", pg_catalog.pg_get_userbyid(n.nspowner) as \"owner\", pg_catalog.array_to_string(n.nspacl, e'\\n') as \"access privileges\", pg_catalog.obj_description(n.oid, 'pg_namespace') as \"description\" from pg_catalog.pg_namespace n where n.nspname operator(pg_catalog.~) '^(public)$' collate pg_catalog.default order by 1"
+}
+
+fn psql_describe_schema_publications_query() -> &'static str {
+    "select pubname from pg_catalog.pg_publication p join pg_catalog.pg_publication_namespace pn on p.oid = pn.pnpubid join pg_catalog.pg_namespace n on n.oid = pn.pnnspid where n.nspname = 'public' order by 1"
+}
+
 fn psql_describe_type_catalog_query_type(canonical: &str) -> Option<String> {
     let prefix = "select n.nspname as \"schema\", pg_catalog.format_type(t.oid, null) as \"name\", pg_catalog.obj_description(t.oid, 'pg_type') as \"description\" from pg_catalog.pg_type t left join pg_catalog.pg_namespace n on n.oid = t.typnamespace where (t.typrelid = 0 or (select c.relkind = 'c' from pg_catalog.pg_class c where c.oid = t.typrelid)) and not exists(select 1 from pg_catalog.pg_type el where el.oid = t.typelem and el.typarray = t.oid) and (t.typname operator(pg_catalog.~) '^(";
     let suffix = ")$' collate pg_catalog.default or pg_catalog.format_type(t.oid, null) operator(pg_catalog.~) '^(";
@@ -1963,6 +1987,15 @@ fn catalog_psql_describe_schema_rows() -> Vec<Vec<Option<String>>> {
     vec![vec![
         Some("public".to_string()),
         Some("postgres".to_string()),
+    ]]
+}
+
+fn catalog_psql_describe_schema_verbose_rows() -> Vec<Vec<Option<String>>> {
+    vec![vec![
+        Some("public".to_string()),
+        Some("postgres".to_string()),
+        None,
+        None,
     ]]
 }
 
@@ -3451,11 +3484,30 @@ mod tests {
             psql_describe_schemas_catalog_query(),
             "select n.nspname as \"name\", pg_catalog.pg_get_userbyid(n.nspowner) as \"owner\" from pg_catalog.pg_namespace n where n.nspname !~ '^pg_' and n.nspname <> 'information_schema' order by 1"
         );
+        assert!(psql_describe_schemas_verbose_catalog_query_public_filter(
+            "select n.nspname as \"name\", pg_catalog.pg_get_userbyid(n.nspowner) as \"owner\", pg_catalog.array_to_string(n.nspacl, e'\\n') as \"access privileges\", pg_catalog.obj_description(n.oid, 'pg_namespace') as \"description\" from pg_catalog.pg_namespace n where n.nspname operator(pg_catalog.~) '^(public)$' collate pg_catalog.default order by 1"
+        ));
+        assert!(!psql_describe_schemas_verbose_catalog_query_public_filter(
+            "select n.nspname as \"name\", pg_catalog.pg_get_userbyid(n.nspowner) as \"owner\", pg_catalog.array_to_string(n.nspacl, e'\\n') as \"access privileges\", pg_catalog.obj_description(n.oid, 'pg_namespace') as \"description\" from pg_catalog.pg_namespace n where n.nspname operator(pg_catalog.~) '^(private)$' collate pg_catalog.default order by 1"
+        ));
+        assert_eq!(
+            psql_describe_schema_publications_query(),
+            "select pubname from pg_catalog.pg_publication p join pg_catalog.pg_publication_namespace pn on p.oid = pn.pnpubid join pg_catalog.pg_namespace n on n.oid = pn.pnnspid where n.nspname = 'public' order by 1"
+        );
         assert_eq!(
             catalog_psql_describe_schema_rows(),
             vec![vec![
                 Some("public".to_string()),
                 Some("postgres".to_string())
+            ]]
+        );
+        assert_eq!(
+            catalog_psql_describe_schema_verbose_rows(),
+            vec![vec![
+                Some("public".to_string()),
+                Some("postgres".to_string()),
+                None,
+                None
             ]]
         );
         assert_eq!(

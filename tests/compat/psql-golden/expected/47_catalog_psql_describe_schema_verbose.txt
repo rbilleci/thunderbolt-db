@@ -1,0 +1,6 @@
+=== psql dn plus public schema meta-command ===
+                   List of schemas
+  Name  |  Owner   | Access privileges | Description
+--------+----------+-------------------+-------------
+ public | postgres |                   |
+(1 row)
