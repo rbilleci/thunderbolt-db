@@ -1277,6 +1277,28 @@ fn execute_statement(
             &information_schema_extended_column_rows(session),
         );
     }
+    if let Some(table) = information_schema_extended_columns_query_table(&canonical) {
+        return write_single_row(
+            stream,
+            &[
+                text_column("table_catalog"),
+                text_column("table_schema"),
+                text_column("table_name"),
+                text_column("column_name"),
+                int4_column("ordinal_position"),
+                text_column("column_default"),
+                text_column("is_nullable"),
+                text_column("data_type"),
+                int4_column("character_maximum_length"),
+                int4_column("numeric_precision"),
+                int4_column("numeric_precision_radix"),
+                int4_column("numeric_scale"),
+                text_column("udt_schema"),
+                text_column("udt_name"),
+            ],
+            &information_schema_extended_column_rows_for_table(session, &table),
+        );
+    }
     if canonical == information_schema_schemata_query() {
         return write_single_row(
             stream,
@@ -2294,34 +2316,57 @@ fn information_schema_extended_columns_query() -> &'static str {
     "select table_catalog, table_schema, table_name, column_name, ordinal_position, column_default, is_nullable, data_type, character_maximum_length, numeric_precision, numeric_precision_radix, numeric_scale, udt_schema, udt_name from information_schema.columns where table_schema = 'public' order by table_name, ordinal_position"
 }
 
+fn information_schema_extended_columns_query_table(canonical: &str) -> Option<String> {
+    let prefix = "select table_catalog, table_schema, table_name, column_name, ordinal_position, column_default, is_nullable, data_type, character_maximum_length, numeric_precision, numeric_precision_radix, numeric_scale, udt_schema, udt_name from information_schema.columns where table_schema = 'public' and table_name = '";
+    let suffix = "' order by ordinal_position";
+    canonical
+        .strip_prefix(prefix)?
+        .strip_suffix(suffix)
+        .map(str::to_string)
+}
+
 fn information_schema_extended_column_rows(session: &Session) -> Vec<Vec<Option<String>>> {
     let mut tables = session.tables.values().collect::<Vec<_>>();
     tables.sort_by(|left, right| left.name.cmp(&right.name));
     tables
         .into_iter()
-        .flat_map(|table| {
-            table.columns.iter().map(|column| {
-                let (numeric_precision, numeric_precision_radix, numeric_scale) =
-                    information_schema_numeric_metadata(column.def.ty);
-                vec![
-                    Some("postgres".to_string()),
-                    Some("public".to_string()),
-                    Some(table.name.clone()),
-                    Some(column.def.name.clone()),
-                    Some(column.attnum.to_string()),
-                    None,
-                    Some("YES".to_string()),
-                    Some(sql_type_display_name(column.def.ty).to_string()),
-                    None,
-                    numeric_precision.map(|value| value.to_string()),
-                    numeric_precision_radix.map(|value| value.to_string()),
-                    numeric_scale.map(|value| value.to_string()),
-                    Some("pg_catalog".to_string()),
-                    Some(column.def.ty.catalog_name().to_string()),
-                ]
-            })
-        })
+        .flat_map(information_schema_extended_column_rows_for_catalog_table)
         .collect()
+}
+
+fn information_schema_extended_column_rows_for_table(
+    session: &Session,
+    table: &str,
+) -> Vec<Vec<Option<String>>> {
+    let Some(table) = session.tables.get(table) else {
+        return Vec::new();
+    };
+    information_schema_extended_column_rows_for_catalog_table(table).collect()
+}
+
+fn information_schema_extended_column_rows_for_catalog_table(
+    table: &Table,
+) -> impl Iterator<Item = Vec<Option<String>>> + '_ {
+    table.columns.iter().map(|column| {
+        let (numeric_precision, numeric_precision_radix, numeric_scale) =
+            information_schema_numeric_metadata(column.def.ty);
+        vec![
+            Some("postgres".to_string()),
+            Some("public".to_string()),
+            Some(table.name.clone()),
+            Some(column.def.name.clone()),
+            Some(column.attnum.to_string()),
+            None,
+            Some("YES".to_string()),
+            Some(sql_type_display_name(column.def.ty).to_string()),
+            None,
+            numeric_precision.map(|value| value.to_string()),
+            numeric_precision_radix.map(|value| value.to_string()),
+            numeric_scale.map(|value| value.to_string()),
+            Some("pg_catalog".to_string()),
+            Some(column.def.ty.catalog_name().to_string()),
+        ]
+    })
 }
 
 fn information_schema_numeric_metadata(ty: SqlType) -> (Option<i32>, Option<i32>, Option<i32>) {
@@ -3508,6 +3553,12 @@ mod tests {
             "select table_catalog, table_schema, table_name, column_name, ordinal_position, column_default, is_nullable, data_type, character_maximum_length, numeric_precision, numeric_precision_radix, numeric_scale, udt_schema, udt_name from information_schema.columns where table_schema = 'public' order by table_name, ordinal_position"
         );
         assert_eq!(
+            information_schema_extended_columns_query_table(
+                "select table_catalog, table_schema, table_name, column_name, ordinal_position, column_default, is_nullable, data_type, character_maximum_length, numeric_precision, numeric_precision_radix, numeric_scale, udt_schema, udt_name from information_schema.columns where table_schema = 'public' and table_name = 'people' order by ordinal_position"
+            ),
+            Some("people".to_string())
+        );
+        assert_eq!(
             information_schema_numeric_metadata(SqlType::Int4),
             (Some(32), Some(2), Some(0))
         );
@@ -3568,6 +3619,44 @@ mod tests {
                 ],
             ]
         );
+        assert_eq!(
+            information_schema_extended_column_rows_for_table(&session, "people"),
+            vec![
+                vec![
+                    Some("postgres".to_string()),
+                    Some("public".to_string()),
+                    Some("people".to_string()),
+                    Some("id".to_string()),
+                    Some("1".to_string()),
+                    None,
+                    Some("YES".to_string()),
+                    Some("integer".to_string()),
+                    None,
+                    Some("32".to_string()),
+                    Some("2".to_string()),
+                    Some("0".to_string()),
+                    Some("pg_catalog".to_string()),
+                    Some("int4".to_string()),
+                ],
+                vec![
+                    Some("postgres".to_string()),
+                    Some("public".to_string()),
+                    Some("people".to_string()),
+                    Some("name".to_string()),
+                    Some("2".to_string()),
+                    None,
+                    Some("YES".to_string()),
+                    Some("text".to_string()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("pg_catalog".to_string()),
+                    Some("text".to_string()),
+                ],
+            ]
+        );
+        assert!(information_schema_extended_column_rows_for_table(&session, "missing").is_empty());
         assert_eq!(
             information_schema_schemata_query(),
             "select schema_name, schema_owner from information_schema.schemata where schema_name = 'public' order by schema_name"
