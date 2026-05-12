@@ -1569,7 +1569,6 @@ fn psql_describe_tables_verbose_catalog_query_filter(
     canonical: &str,
 ) -> Option<PsqlDescribeTablesFilter> {
     let prefix = "select n.nspname as \"schema\", c.relname as \"name\", case c.relkind when 'r' then 'table' when 'v' then 'view' when 'm' then 'materialized view' when 'i' then 'index' when 's' then 'sequence' when 't' then 'toast table' when 'f' then 'foreign table' when 'p' then 'partitioned table' when 'i' then 'partitioned index' end as \"type\", pg_catalog.pg_get_userbyid(c.relowner) as \"owner\", case c.relpersistence when 'p' then 'permanent' when 't' then 'temporary' when 'u' then 'unlogged' end as \"persistence\", am.amname as \"access method\", pg_catalog.pg_size_pretty(pg_catalog.pg_table_size(c.oid)) as \"size\", pg_catalog.obj_description(c.oid, 'pg_class') as \"description\" from pg_catalog.pg_class c left join pg_catalog.pg_namespace n on n.oid = c.relnamespace left join pg_catalog.pg_am am on am.oid = c.relam where c.relkind in ('r','p','t','s','') and ";
-    let visible_suffix = " and pg_catalog.pg_table_is_visible(c.oid) order by 1,2";
     let namespace_prefix = "n.nspname operator(pg_catalog.~) '^(";
     let namespace_suffix = ")$' collate pg_catalog.default order by 1,2";
     let relname_prefix = "c.relname operator(pg_catalog.~) '^(";
@@ -1600,7 +1599,7 @@ fn psql_describe_tables_verbose_catalog_query_filter(
 
     let (relname_pattern, namespace) = rest
         .strip_prefix(relname_prefix)?
-        .strip_suffix(visible_suffix)?
+        .strip_suffix(namespace_suffix)?
         .split_once(relname_middle)?;
     Some(PsqlDescribeTablesFilter {
         namespace: namespace.to_string(),
@@ -3020,6 +3019,15 @@ mod tests {
                 None,
                 None,
             ]]
+        );
+        assert_eq!(
+            psql_describe_tables_verbose_catalog_query_filter(
+                "select n.nspname as \"schema\", c.relname as \"name\", case c.relkind when 'r' then 'table' when 'v' then 'view' when 'm' then 'materialized view' when 'i' then 'index' when 's' then 'sequence' when 't' then 'toast table' when 'f' then 'foreign table' when 'p' then 'partitioned table' when 'i' then 'partitioned index' end as \"type\", pg_catalog.pg_get_userbyid(c.relowner) as \"owner\", case c.relpersistence when 'p' then 'permanent' when 't' then 'temporary' when 'u' then 'unlogged' end as \"persistence\", am.amname as \"access method\", pg_catalog.pg_size_pretty(pg_catalog.pg_table_size(c.oid)) as \"size\", pg_catalog.obj_description(c.oid, 'pg_class') as \"description\" from pg_catalog.pg_class c left join pg_catalog.pg_namespace n on n.oid = c.relnamespace left join pg_catalog.pg_am am on am.oid = c.relam where c.relkind in ('r','p','t','s','') and c.relname operator(pg_catalog.~) '^(peo.*)$' collate pg_catalog.default and n.nspname operator(pg_catalog.~) '^(public)$' collate pg_catalog.default order by 1,2"
+            ),
+            Some(PsqlDescribeTablesFilter {
+                namespace: "public".to_string(),
+                relname_pattern: Some("peo.*".to_string()),
+            })
         );
         assert_eq!(
             psql_describe_table_privileges_catalog_query_filter(

@@ -1,0 +1,16 @@
+=== psql list schema-qualified verbose prefix tables ===
+CREATE TABLE
+CREATE TABLE
+CREATE TABLE
+                                          List of relations
+ Schema |         Name          | Type  |  Owner   | Persistence | Access method | Size | Description
+--------+-----------------------+-------+----------+-------------+---------------+------+-------------
+ public | schema_verbose_people | table | postgres | permanent   | heap          |      |
+ public | schema_verbose_teams  | table | postgres | permanent   | heap          |      |
+(2 rows)
+
+                                          List of relations
+ Schema |         Name          | Type  |  Owner   | Persistence | Access method | Size | Description
+--------+-----------------------+-------+----------+-------------+---------------+------+-------------
+ public | schema_verbose_people | table | postgres | permanent   | heap          |      |
+(1 row)
