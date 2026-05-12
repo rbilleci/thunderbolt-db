@@ -45,8 +45,8 @@
     "sql.catalog_schema_types": {
       "failed": 0,
       "ignored": 0,
-      "passed": 39,
-      "total": 39
+      "passed": 40,
+      "total": 40
     },
     "sql.gpu_bridge": {
       "failed": 0,
@@ -89,8 +89,8 @@
   "totals": {
     "failed": 0,
     "ignored": 0,
-    "passed": 618,
-    "total": 618
+    "passed": 619,
+    "total": 619
   },
   "trend_hook": {
     "baseline_available": true,

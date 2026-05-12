@@ -1346,6 +1346,28 @@ fn execute_statement(
             &information_schema_extended_column_rows_for_table(session, &table),
         );
     }
+    if let Some(tables) = information_schema_extended_columns_in_query_tables(&canonical) {
+        return write_single_row(
+            stream,
+            &[
+                text_column("table_catalog"),
+                text_column("table_schema"),
+                text_column("table_name"),
+                text_column("column_name"),
+                int4_column("ordinal_position"),
+                text_column("column_default"),
+                text_column("is_nullable"),
+                text_column("data_type"),
+                int4_column("character_maximum_length"),
+                int4_column("numeric_precision"),
+                int4_column("numeric_precision_radix"),
+                int4_column("numeric_scale"),
+                text_column("udt_schema"),
+                text_column("udt_name"),
+            ],
+            &information_schema_extended_column_rows_for_tables(session, &tables),
+        );
+    }
     if canonical == information_schema_schemata_query() {
         return write_single_row(
             stream,
@@ -2443,6 +2465,25 @@ fn information_schema_extended_columns_query_table(canonical: &str) -> Option<St
         .map(str::to_string)
 }
 
+fn information_schema_extended_columns_in_query_tables(canonical: &str) -> Option<Vec<String>> {
+    let prefix = "select table_catalog, table_schema, table_name, column_name, ordinal_position, column_default, is_nullable, data_type, character_maximum_length, numeric_precision, numeric_precision_radix, numeric_scale, udt_schema, udt_name from information_schema.columns where table_schema = 'public' and table_name in (";
+    let suffix = ") order by table_name, ordinal_position";
+    let list = canonical.strip_prefix(prefix)?.strip_suffix(suffix)?;
+    let mut tables = Vec::new();
+    for raw_name in list.split(',') {
+        let name = raw_name.trim().strip_prefix('\'')?.strip_suffix('\'')?;
+        if name.is_empty() {
+            return None;
+        }
+        tables.push(name.to_string());
+    }
+    if tables.is_empty() {
+        None
+    } else {
+        Some(tables)
+    }
+}
+
 fn information_schema_extended_column_rows(session: &Session) -> Vec<Vec<Option<String>>> {
     let mut tables = session.tables.values().collect::<Vec<_>>();
     tables.sort_by(|left, right| left.name.cmp(&right.name));
@@ -2460,6 +2501,22 @@ fn information_schema_extended_column_rows_for_table(
         return Vec::new();
     };
     information_schema_extended_column_rows_for_catalog_table(table).collect()
+}
+
+fn information_schema_extended_column_rows_for_tables(
+    session: &Session,
+    table_names: &[String],
+) -> Vec<Vec<Option<String>>> {
+    let requested_tables = table_names.iter().collect::<BTreeSet<_>>();
+    let mut tables = requested_tables
+        .iter()
+        .filter_map(|table_name| session.tables.get(table_name.as_str()))
+        .collect::<Vec<_>>();
+    tables.sort_by(|left, right| left.name.cmp(&right.name));
+    tables
+        .into_iter()
+        .flat_map(information_schema_extended_column_rows_for_catalog_table)
+        .collect()
 }
 
 fn information_schema_extended_column_rows_for_catalog_table(
@@ -3780,6 +3837,16 @@ mod tests {
             Some("people".to_string())
         );
         assert_eq!(
+            information_schema_extended_columns_in_query_tables(
+                "select table_catalog, table_schema, table_name, column_name, ordinal_position, column_default, is_nullable, data_type, character_maximum_length, numeric_precision, numeric_precision_radix, numeric_scale, udt_schema, udt_name from information_schema.columns where table_schema = 'public' and table_name in ('teams', 'missing', 'people') order by table_name, ordinal_position"
+            ),
+            Some(vec![
+                "teams".to_string(),
+                "missing".to_string(),
+                "people".to_string(),
+            ])
+        );
+        assert_eq!(
             information_schema_numeric_metadata(SqlType::Int4),
             (Some(32), Some(2), Some(0))
         );
@@ -3878,6 +3945,67 @@ mod tests {
             ]
         );
         assert!(information_schema_extended_column_rows_for_table(&session, "missing").is_empty());
+        assert_eq!(
+            information_schema_extended_column_rows_for_tables(
+                &session,
+                &[
+                    "teams".to_string(),
+                    "missing".to_string(),
+                    "people".to_string(),
+                    "teams".to_string(),
+                ],
+            ),
+            vec![
+                vec![
+                    Some("postgres".to_string()),
+                    Some("public".to_string()),
+                    Some("people".to_string()),
+                    Some("id".to_string()),
+                    Some("1".to_string()),
+                    None,
+                    Some("YES".to_string()),
+                    Some("integer".to_string()),
+                    None,
+                    Some("32".to_string()),
+                    Some("2".to_string()),
+                    Some("0".to_string()),
+                    Some("pg_catalog".to_string()),
+                    Some("int4".to_string()),
+                ],
+                vec![
+                    Some("postgres".to_string()),
+                    Some("public".to_string()),
+                    Some("people".to_string()),
+                    Some("name".to_string()),
+                    Some("2".to_string()),
+                    None,
+                    Some("YES".to_string()),
+                    Some("text".to_string()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("pg_catalog".to_string()),
+                    Some("text".to_string()),
+                ],
+                vec![
+                    Some("postgres".to_string()),
+                    Some("public".to_string()),
+                    Some("teams".to_string()),
+                    Some("id".to_string()),
+                    Some("1".to_string()),
+                    None,
+                    Some("YES".to_string()),
+                    Some("integer".to_string()),
+                    None,
+                    Some("32".to_string()),
+                    Some("2".to_string()),
+                    Some("0".to_string()),
+                    Some("pg_catalog".to_string()),
+                    Some("int4".to_string()),
+                ],
+            ]
+        );
         assert_eq!(
             information_schema_schemata_query(),
             "select schema_name, schema_owner from information_schema.schemata where schema_name = 'public' order by schema_name"
