@@ -1107,6 +1107,18 @@ fn execute_statement(
             &pg_catalog_table_rows(session),
         );
     }
+    if canonical == pg_catalog_indexes_query() {
+        return write_single_row(
+            stream,
+            &[
+                text_column("schemaname"),
+                text_column("tablename"),
+                text_column("indexname"),
+                text_column("indexdef"),
+            ],
+            &pg_catalog_index_rows(session),
+        );
+    }
     if canonical == pg_catalog_class_plain_tables_query() {
         return write_single_row(
             stream,
@@ -1935,6 +1947,14 @@ fn pg_catalog_table_rows(session: &Session) -> Vec<Vec<Option<String>>> {
             ]
         })
         .collect()
+}
+
+fn pg_catalog_indexes_query() -> &'static str {
+    "select schemaname, tablename, indexname, indexdef from pg_catalog.pg_indexes where schemaname = 'public' order by tablename, indexname"
+}
+
+fn pg_catalog_index_rows(_session: &Session) -> Vec<Vec<Option<String>>> {
+    Vec::new()
 }
 
 fn pg_catalog_class_plain_tables_query() -> &'static str {
@@ -3057,6 +3077,11 @@ mod tests {
                 ],
             ]
         );
+        assert_eq!(
+            pg_catalog_indexes_query(),
+            "select schemaname, tablename, indexname, indexdef from pg_catalog.pg_indexes where schemaname = 'public' order by tablename, indexname"
+        );
+        assert!(pg_catalog_index_rows(&session).is_empty());
         assert_eq!(
             pg_catalog_class_plain_tables_query(),
             "select c.oid, n.nspname, c.relname, c.relkind, c.relpersistence from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace where n.nspname = 'public' and c.relkind = 'r' order by c.relname"

@@ -1,0 +1,5 @@
+=== pg_catalog pg_indexes empty supported subset ===
+CREATE TABLE
+ schemaname | tablename | indexname | indexdef
+------------+-----------+-----------+----------
+(0 rows)
