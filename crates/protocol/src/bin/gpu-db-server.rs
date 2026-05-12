@@ -1092,6 +1092,26 @@ fn execute_statement(
             &information_schema_table_rows(session),
         );
     }
+    if canonical == information_schema_rich_tables_query() {
+        return write_single_row(
+            stream,
+            &[
+                text_column("table_catalog"),
+                text_column("table_schema"),
+                text_column("table_name"),
+                text_column("table_type"),
+                text_column("self_referencing_column_name"),
+                text_column("reference_generation"),
+                text_column("user_defined_type_catalog"),
+                text_column("user_defined_type_schema"),
+                text_column("user_defined_type_name"),
+                text_column("is_insertable_into"),
+                text_column("is_typed"),
+                text_column("commit_action"),
+            ],
+            &information_schema_rich_table_rows(session),
+        );
+    }
     if let Some(table) = information_schema_columns_query_table(&canonical) {
         return write_single_row(
             stream,
@@ -1800,6 +1820,34 @@ fn information_schema_table_rows(session: &Session) -> Vec<Vec<Option<String>>> 
                 Some("public".to_string()),
                 Some(table.name.clone()),
                 Some("BASE TABLE".to_string()),
+            ]
+        })
+        .collect()
+}
+
+fn information_schema_rich_tables_query() -> &'static str {
+    "select table_catalog, table_schema, table_name, table_type, self_referencing_column_name, reference_generation, user_defined_type_catalog, user_defined_type_schema, user_defined_type_name, is_insertable_into, is_typed, commit_action from information_schema.tables where table_schema = 'public' order by table_name"
+}
+
+fn information_schema_rich_table_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut tables = session.tables.values().collect::<Vec<_>>();
+    tables.sort_by(|left, right| left.name.cmp(&right.name));
+    tables
+        .into_iter()
+        .map(|table| {
+            vec![
+                Some("postgres".to_string()),
+                Some("public".to_string()),
+                Some(table.name.clone()),
+                Some("BASE TABLE".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("YES".to_string()),
+                Some("NO".to_string()),
+                None,
             ]
         })
         .collect()
@@ -2687,6 +2735,43 @@ mod tests {
                     Some("public".to_string()),
                     Some("teams".to_string()),
                     Some("BASE TABLE".to_string()),
+                ],
+            ]
+        );
+        assert_eq!(
+            information_schema_rich_tables_query(),
+            "select table_catalog, table_schema, table_name, table_type, self_referencing_column_name, reference_generation, user_defined_type_catalog, user_defined_type_schema, user_defined_type_name, is_insertable_into, is_typed, commit_action from information_schema.tables where table_schema = 'public' order by table_name"
+        );
+        assert_eq!(
+            information_schema_rich_table_rows(&session),
+            vec![
+                vec![
+                    Some("postgres".to_string()),
+                    Some("public".to_string()),
+                    Some("people".to_string()),
+                    Some("BASE TABLE".to_string()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("YES".to_string()),
+                    Some("NO".to_string()),
+                    None,
+                ],
+                vec![
+                    Some("postgres".to_string()),
+                    Some("public".to_string()),
+                    Some("teams".to_string()),
+                    Some("BASE TABLE".to_string()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("YES".to_string()),
+                    Some("NO".to_string()),
+                    None,
                 ],
             ]
         );

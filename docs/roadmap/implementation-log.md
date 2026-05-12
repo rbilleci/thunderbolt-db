@@ -3,6 +3,7 @@
 ## 2026-05-12
 
 ### PostgreSQL-compatible product loop
+- Advanced P2 catalog/schema/type spine by backing a richer `information_schema.tables` query shape used by real client/ORM introspection. Supported `public` session tables now report catalog, schema, name, base-table type, insertability, typed-table flags, and null typed-table-only fields from session catalog metadata while keeping unsupported schema and advanced PostgreSQL catalog behavior out of scope.
 - Advanced P2 catalog/schema/type spine by backing PostgreSQL 16 `psql \dp <table>` access-privilege listing for supported plain `public` session tables. The compatibility endpoint now handles the psql-emitted ACL/policy catalog query shape from session catalog metadata and truthfully returns empty access privilege, column privilege, and policy fields until grant/ACL/row-policy features exist.
 - Extended the same P2 access-privilege proof to PostgreSQL 16 `psql \z public.<pattern>` so schema-qualified privilege pattern listing is covered by the real-client golden suite without pretending ACL or row-policy mutation exists.
 - Advanced P2 catalog/schema/type spine by backing PostgreSQL 16 `psql \dt+ <table>` verbose table-listing traffic for supported `public` session tables. The compatibility endpoint now handles the psql-emitted `pg_class`/`pg_namespace`/`pg_am` query shape, returns catalog-backed relation/persistence/access-method rows, and leaves PostgreSQL heap-size/description fields blank until those metadata surfaces exist.
