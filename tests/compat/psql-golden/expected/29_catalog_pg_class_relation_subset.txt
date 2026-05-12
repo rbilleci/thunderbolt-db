@@ -1,0 +1,9 @@
+=== pg_catalog pg_class relation subset metadata ===
+CREATE TABLE
+CREATE TABLE
+CREATE TABLE
+  oid  | nspname |        relname         | relkind | relpersistence
+-------+---------+------------------------+---------+----------------
+ 16384 | public  | pg_class_subset_people | r       | p
+ 16385 | public  | pg_class_subset_teams  | r       | p
+(2 rows)

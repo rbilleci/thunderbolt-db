@@ -1132,6 +1132,19 @@ fn execute_statement(
             &pg_catalog_class_plain_table_rows(session),
         );
     }
+    if let Some(tables) = pg_catalog_class_plain_tables_in_query_tables(&canonical) {
+        return write_single_row(
+            stream,
+            &[
+                int4_column("oid"),
+                text_column("nspname"),
+                text_column("relname"),
+                text_column("relkind"),
+                text_column("relpersistence"),
+            ],
+            &pg_catalog_class_plain_table_rows_for_tables(session, &tables),
+        );
+    }
     if canonical == information_schema_tables_query() {
         return write_single_row(
             stream,
@@ -1964,6 +1977,42 @@ fn pg_catalog_class_plain_tables_query() -> &'static str {
 fn pg_catalog_class_plain_table_rows(session: &Session) -> Vec<Vec<Option<String>>> {
     let mut tables = session.tables.values().collect::<Vec<_>>();
     tables.sort_by(|left, right| left.name.cmp(&right.name));
+    pg_catalog_class_plain_table_rows_from_tables(tables)
+}
+
+fn pg_catalog_class_plain_tables_in_query_tables(canonical: &str) -> Option<Vec<String>> {
+    let prefix = "select c.oid, n.nspname, c.relname, c.relkind, c.relpersistence from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace where n.nspname = 'public' and c.relname in (";
+    let suffix = ") and c.relkind = 'r' order by c.relname";
+    let list = canonical.strip_prefix(prefix)?.strip_suffix(suffix)?;
+    let mut tables = Vec::new();
+    for raw_name in list.split(',') {
+        let name = raw_name.trim().strip_prefix('\'')?.strip_suffix('\'')?;
+        if name.is_empty() {
+            return None;
+        }
+        tables.push(name.to_string());
+    }
+    if tables.is_empty() {
+        None
+    } else {
+        Some(tables)
+    }
+}
+
+fn pg_catalog_class_plain_table_rows_for_tables(
+    session: &Session,
+    table_names: &[String],
+) -> Vec<Vec<Option<String>>> {
+    let requested_tables = table_names.iter().collect::<BTreeSet<_>>();
+    let mut tables = requested_tables
+        .iter()
+        .filter_map(|table_name| session.tables.get(table_name.as_str()))
+        .collect::<Vec<_>>();
+    tables.sort_by(|left, right| left.name.cmp(&right.name));
+    pg_catalog_class_plain_table_rows_from_tables(tables)
+}
+
+fn pg_catalog_class_plain_table_rows_from_tables(tables: Vec<&Table>) -> Vec<Vec<Option<String>>> {
     tables
         .into_iter()
         .map(|table| {
@@ -3088,6 +3137,43 @@ mod tests {
         );
         assert_eq!(
             pg_catalog_class_plain_table_rows(&session),
+            vec![
+                vec![
+                    Some(FIRST_USER_RELATION_OID.to_string()),
+                    Some("public".to_string()),
+                    Some("people".to_string()),
+                    Some("r".to_string()),
+                    Some("p".to_string()),
+                ],
+                vec![
+                    Some((FIRST_USER_RELATION_OID + 1).to_string()),
+                    Some("public".to_string()),
+                    Some("teams".to_string()),
+                    Some("r".to_string()),
+                    Some("p".to_string()),
+                ],
+            ]
+        );
+        assert_eq!(
+            pg_catalog_class_plain_tables_in_query_tables(
+                "select c.oid, n.nspname, c.relname, c.relkind, c.relpersistence from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace where n.nspname = 'public' and c.relname in ('teams', 'missing', 'people') and c.relkind = 'r' order by c.relname"
+            ),
+            Some(vec![
+                "teams".to_string(),
+                "missing".to_string(),
+                "people".to_string(),
+            ])
+        );
+        assert_eq!(
+            pg_catalog_class_plain_table_rows_for_tables(
+                &session,
+                &[
+                    "teams".to_string(),
+                    "missing".to_string(),
+                    "people".to_string(),
+                    "teams".to_string(),
+                ],
+            ),
             vec![
                 vec![
                     Some(FIRST_USER_RELATION_OID.to_string()),
