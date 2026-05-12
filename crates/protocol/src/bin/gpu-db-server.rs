@@ -1800,19 +1800,21 @@ fn catalog_describe_relation_lookup_query_public_namespace(canonical: &str) -> b
 
 fn catalog_describe_relation_lookup_rows(
     session: &Session,
-    table: &str,
+    relname_pattern: &str,
 ) -> Vec<Vec<Option<String>>> {
-    session
-        .tables
-        .get(table)
+    let mut tables = session.tables.values().collect::<Vec<_>>();
+    tables.sort_by(|left, right| left.name.cmp(&right.name));
+    tables
+        .into_iter()
+        .filter(|table| psql_relname_pattern_matches(relname_pattern, &table.name))
         .map(|table| {
-            vec![vec![
+            vec![
                 Some(table.oid.to_string()),
                 Some("public".to_string()),
                 Some(table.name.clone()),
-            ]]
+            ]
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 fn catalog_describe_relation_lookup_rows_for_public_namespace(
@@ -3116,6 +3118,14 @@ mod tests {
         ));
         assert_eq!(
             catalog_describe_relation_lookup_rows(&session, "people"),
+            vec![vec![
+                Some(FIRST_USER_RELATION_OID.to_string()),
+                Some("public".to_string()),
+                Some("people".to_string()),
+            ]]
+        );
+        assert_eq!(
+            catalog_describe_relation_lookup_rows(&session, "peo.*"),
             vec![vec![
                 Some(FIRST_USER_RELATION_OID.to_string()),
                 Some("public".to_string()),

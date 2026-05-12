@@ -1,0 +1,26 @@
+=== psql describe prefix wildcard ===
+CREATE TABLE
+CREATE TABLE
+           Table "public.prefix_people"
+ Column |  Type   | Collation | Nullable | Default
+--------+---------+-----------+----------+---------
+ id     | integer |           |          |
+ name   | text    |           |          |
+
+            Table "public.prefix_teams"
+ Column  |  Type   | Collation | Nullable | Default
+---------+---------+-----------+----------+---------
+ team_id | integer |           |          |
+
+                                      Table "public.prefix_people"
+ Column |  Type   | Collation | Nullable | Default | Storage  | Compression | Stats target | Description
+--------+---------+-----------+----------+---------+----------+-------------+--------------+-------------
+ id     | integer |           |          |         | plain    |             |              |
+ name   | text    |           |          |         | extended |             |              |
+Access method: heap
+
+                                       Table "public.prefix_teams"
+ Column  |  Type   | Collation | Nullable | Default | Storage | Compression | Stats target | Description
+---------+---------+-----------+----------+---------+---------+-------------+--------------+-------------
+ team_id | integer |           |          |         | plain   |             |              |
+Access method: heap
