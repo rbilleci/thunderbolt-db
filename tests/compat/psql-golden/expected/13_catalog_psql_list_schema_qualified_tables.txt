@@ -1,0 +1,9 @@
+=== psql dt schema qualified meta-command ===
+CREATE TABLE
+CREATE TABLE
+              List of relations
+ Schema |       Name       | Type  |  Owner
+--------+------------------+-------+----------
+ public | dt_schema_people | table | postgres
+ public | dt_schema_teams  | table | postgres
+(2 rows)
