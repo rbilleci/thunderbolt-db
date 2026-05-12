@@ -3,6 +3,7 @@
 ## 2026-05-12
 
 ### PostgreSQL-compatible product loop
+- Advanced P2 catalog/schema/type spine by adding richer `information_schema.columns` metadata for common client introspection. Supported `public` table columns now report nullability, default absence, display type, `udt_schema`, and `udt_name` from the session catalog/type registry, while constraints/default expressions and unsupported schemas remain out of scope.
 - Advanced P2 catalog/schema/type spine by backing a broader `information_schema.columns` query shape that enumerates columns across all supported `public` session tables. The compatibility endpoint now answers the real-client-friendly schema-wide column listing from session catalog metadata while keeping unsupported schemas and broader PostgreSQL catalog behavior out of scope.
 - Advanced P2 catalog/schema/type spine by backing PostgreSQL 16 schema-qualified `psql \dt public.<prefix>*` table-listing traffic for supported `public` session tables. The compatibility endpoint now parses the psql-emitted relation-name regex shape, filters the session catalog rows by the simple prefix wildcard, and keeps unsupported namespace lookups empty rather than broadening schema semantics.
 - Advanced P2 catalog/schema/type spine by backing PostgreSQL 16 schema-qualified `psql \dt public.*` table-listing traffic for supported `public` session tables. The compatibility endpoint now accepts the namespace-qualified `pg_class`/`pg_namespace` query shape emitted by psql and reuses session catalog metadata for the returned table rows.

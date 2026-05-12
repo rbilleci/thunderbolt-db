@@ -1088,6 +1088,23 @@ fn execute_statement(
             &information_schema_all_column_rows(session),
         );
     }
+    if canonical == information_schema_rich_columns_query() {
+        return write_single_row(
+            stream,
+            &[
+                text_column("table_schema"),
+                text_column("table_name"),
+                text_column("column_name"),
+                int4_column("ordinal_position"),
+                text_column("column_default"),
+                text_column("is_nullable"),
+                text_column("data_type"),
+                text_column("udt_schema"),
+                text_column("udt_name"),
+            ],
+            &information_schema_rich_column_rows(session),
+        );
+    }
     if canonical == information_schema_schemata_query() {
         return write_single_row(
             stream,
@@ -1681,6 +1698,33 @@ fn information_schema_all_column_rows(session: &Session) -> Vec<Vec<Option<Strin
                     Some(column.def.name.clone()),
                     Some(column.attnum.to_string()),
                     Some(sql_type_display_name(column.def.ty).to_string()),
+                ]
+            })
+        })
+        .collect()
+}
+
+fn information_schema_rich_columns_query() -> &'static str {
+    "select table_schema, table_name, column_name, ordinal_position, column_default, is_nullable, data_type, udt_schema, udt_name from information_schema.columns where table_schema = 'public' order by table_name, ordinal_position"
+}
+
+fn information_schema_rich_column_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut tables = session.tables.values().collect::<Vec<_>>();
+    tables.sort_by(|left, right| left.name.cmp(&right.name));
+    tables
+        .into_iter()
+        .flat_map(|table| {
+            table.columns.iter().map(|column| {
+                vec![
+                    Some("public".to_string()),
+                    Some(table.name.clone()),
+                    Some(column.def.name.clone()),
+                    Some(column.attnum.to_string()),
+                    None,
+                    Some("YES".to_string()),
+                    Some(sql_type_display_name(column.def.ty).to_string()),
+                    Some("pg_catalog".to_string()),
+                    Some(column.def.ty.catalog_name().to_string()),
                 ]
             })
         })
@@ -2492,6 +2536,48 @@ mod tests {
                     Some("id".to_string()),
                     Some("1".to_string()),
                     Some("integer".to_string()),
+                ],
+            ]
+        );
+        assert_eq!(
+            information_schema_rich_columns_query(),
+            "select table_schema, table_name, column_name, ordinal_position, column_default, is_nullable, data_type, udt_schema, udt_name from information_schema.columns where table_schema = 'public' order by table_name, ordinal_position"
+        );
+        assert_eq!(
+            information_schema_rich_column_rows(&session),
+            vec![
+                vec![
+                    Some("public".to_string()),
+                    Some("people".to_string()),
+                    Some("id".to_string()),
+                    Some("1".to_string()),
+                    None,
+                    Some("YES".to_string()),
+                    Some("integer".to_string()),
+                    Some("pg_catalog".to_string()),
+                    Some("int4".to_string()),
+                ],
+                vec![
+                    Some("public".to_string()),
+                    Some("people".to_string()),
+                    Some("name".to_string()),
+                    Some("2".to_string()),
+                    None,
+                    Some("YES".to_string()),
+                    Some("text".to_string()),
+                    Some("pg_catalog".to_string()),
+                    Some("text".to_string()),
+                ],
+                vec![
+                    Some("public".to_string()),
+                    Some("teams".to_string()),
+                    Some("id".to_string()),
+                    Some("1".to_string()),
+                    None,
+                    Some("YES".to_string()),
+                    Some("integer".to_string()),
+                    Some("pg_catalog".to_string()),
+                    Some("int4".to_string()),
                 ],
             ]
         );

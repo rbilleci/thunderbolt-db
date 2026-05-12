@@ -1,0 +1,9 @@
+=== information schema rich column introspection ===
+CREATE TABLE
+CREATE TABLE
+ table_schema |     table_name      | column_name | ordinal_position | column_default | is_nullable | data_type | udt_schema | udt_name
+--------------+---------------------+-------------+------------------+----------------+-------------+-----------+------------+----------
+ public       | rich_columns_people | id          |                1 |                | YES         | integer   | pg_catalog | int4
+ public       | rich_columns_people | name        |                2 |                | YES         | text      | pg_catalog | text
+ public       | rich_columns_teams  | id          |                1 |                | YES         | integer   | pg_catalog | int4
+(3 rows)
