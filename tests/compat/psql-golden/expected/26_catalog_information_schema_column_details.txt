@@ -1,0 +1,7 @@
+=== information_schema per-table column details ===
+CREATE TABLE
+ column_name | data_type | is_nullable | column_default
+-------------+-----------+-------------+----------------
+ id          | integer   | YES         |
+ name        | text      | YES         |
+(2 rows)

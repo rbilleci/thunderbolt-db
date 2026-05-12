@@ -1190,6 +1190,18 @@ fn execute_statement(
             &information_schema_column_rows_for_tables(session, &tables),
         );
     }
+    if let Some(table) = information_schema_column_details_query_table(&canonical) {
+        return write_single_row(
+            stream,
+            &[
+                text_column("column_name"),
+                text_column("data_type"),
+                text_column("is_nullable"),
+                text_column("column_default"),
+            ],
+            &information_schema_column_detail_rows(session, &table),
+        );
+    }
     if canonical == information_schema_rich_columns_query() {
         return write_single_row(
             stream,
@@ -2074,6 +2086,36 @@ fn information_schema_column_rows_for_tables(
                     Some(sql_type_display_name(column.def.ty).to_string()),
                 ]
             })
+        })
+        .collect()
+}
+
+fn information_schema_column_details_query_table(canonical: &str) -> Option<String> {
+    let prefix = "select column_name, data_type, is_nullable, column_default from information_schema.columns where table_schema = 'public' and table_name = '";
+    let suffix = "' order by ordinal_position";
+    canonical
+        .strip_prefix(prefix)?
+        .strip_suffix(suffix)
+        .map(str::to_string)
+}
+
+fn information_schema_column_detail_rows(
+    session: &Session,
+    table: &str,
+) -> Vec<Vec<Option<String>>> {
+    let Some(table) = session.tables.get(table) else {
+        return Vec::new();
+    };
+    table
+        .columns
+        .iter()
+        .map(|column| {
+            vec![
+                Some(column.def.name.clone()),
+                Some(sql_type_display_name(column.def.ty).to_string()),
+                Some("YES".to_string()),
+                None,
+            ]
         })
         .collect()
 }
@@ -3140,6 +3182,29 @@ mod tests {
         assert_eq!(
             information_schema_rich_columns_query(),
             "select table_schema, table_name, column_name, ordinal_position, column_default, is_nullable, data_type, udt_schema, udt_name from information_schema.columns where table_schema = 'public' order by table_name, ordinal_position"
+        );
+        assert_eq!(
+            information_schema_column_details_query_table(
+                "select column_name, data_type, is_nullable, column_default from information_schema.columns where table_schema = 'public' and table_name = 'people' order by ordinal_position"
+            ),
+            Some("people".to_string())
+        );
+        assert_eq!(
+            information_schema_column_detail_rows(&session, "people"),
+            vec![
+                vec![
+                    Some("id".to_string()),
+                    Some("integer".to_string()),
+                    Some("YES".to_string()),
+                    None,
+                ],
+                vec![
+                    Some("name".to_string()),
+                    Some("text".to_string()),
+                    Some("YES".to_string()),
+                    None,
+                ],
+            ]
         );
         assert_eq!(
             information_schema_rich_column_rows(&session),
