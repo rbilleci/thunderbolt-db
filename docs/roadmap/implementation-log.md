@@ -1,5 +1,10 @@
 # Implementation Log
 
+## 2026-05-12
+
+### PostgreSQL-compatible product loop
+- Advanced P2 catalog/schema/type spine by backing PostgreSQL 16 `psql \dt` table-listing traffic with session catalog metadata. The compatibility endpoint now handles the real `pg_class`/`pg_namespace` query shape that `psql -E` emits for `\dt`, and the psql golden suite includes a real meta-command scenario while keeping full `\d <table>` and `information_schema` coverage explicit follow-ups.
+
 ## 2026-05-11
 
 ### PostgreSQL-compatible product loop

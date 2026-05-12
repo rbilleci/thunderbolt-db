@@ -880,6 +880,18 @@ fn execute_statement(
             &catalog_table_oid_rows(session),
         );
     }
+    if canonical == psql_describe_tables_catalog_query() {
+        return write_single_row(
+            stream,
+            &[
+                text_column("Schema"),
+                text_column("Name"),
+                text_column("Type"),
+                text_column("Owner"),
+            ],
+            &catalog_psql_describe_table_rows(session),
+        );
+    }
     if canonical
         == "select oid, typname, typlen from pg_catalog.pg_type where oid in (23, 25) order by oid"
     {
@@ -1055,6 +1067,26 @@ fn catalog_table_oid_rows(session: &Session) -> Vec<Vec<Option<String>>> {
     rows.sort_by_key(|(oid, _)| *oid);
     rows.into_iter()
         .map(|(oid, name)| vec![Some(oid.to_string()), Some(name.clone())])
+        .collect()
+}
+
+fn psql_describe_tables_catalog_query() -> &'static str {
+    "select n.nspname as \"schema\", c.relname as \"name\", case c.relkind when 'r' then 'table' when 'v' then 'view' when 'm' then 'materialized view' when 'i' then 'index' when 's' then 'sequence' when 't' then 'toast table' when 'f' then 'foreign table' when 'p' then 'partitioned table' when 'i' then 'partitioned index' end as \"type\", pg_catalog.pg_get_userbyid(c.relowner) as \"owner\" from pg_catalog.pg_class c left join pg_catalog.pg_namespace n on n.oid = c.relnamespace left join pg_catalog.pg_am am on am.oid = c.relam where c.relkind in ('r','p','') and n.nspname <> 'pg_catalog' and n.nspname !~ '^pg_toast' and n.nspname <> 'information_schema' and pg_catalog.pg_table_is_visible(c.oid) order by 1,2"
+}
+
+fn catalog_psql_describe_table_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut tables = session.tables.values().collect::<Vec<_>>();
+    tables.sort_by(|left, right| left.name.cmp(&right.name));
+    tables
+        .into_iter()
+        .map(|table| {
+            vec![
+                Some("public".to_string()),
+                Some(table.name.clone()),
+                Some("table".to_string()),
+                Some("postgres".to_string()),
+            ]
+        })
         .collect()
 }
 
@@ -1526,6 +1558,23 @@ mod tests {
                 vec![
                     Some((FIRST_USER_RELATION_OID + 1).to_string()),
                     Some("teams".to_string()),
+                ],
+            ]
+        );
+        assert_eq!(
+            catalog_psql_describe_table_rows(&session),
+            vec![
+                vec![
+                    Some("public".to_string()),
+                    Some("people".to_string()),
+                    Some("table".to_string()),
+                    Some("postgres".to_string()),
+                ],
+                vec![
+                    Some("public".to_string()),
+                    Some("teams".to_string()),
+                    Some("table".to_string()),
+                    Some("postgres".to_string()),
                 ],
             ]
         );
