@@ -1,0 +1,8 @@
+=== pg_catalog pg_tables supported public tables ===
+CREATE TABLE
+CREATE TABLE
+ schemaname |    tablename     | tableowner
+------------+------------------+------------
+ public     | pg_tables_people | postgres
+ public     | pg_tables_teams  | postgres
+(2 rows)

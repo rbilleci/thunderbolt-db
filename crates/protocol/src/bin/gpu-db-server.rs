@@ -1096,6 +1096,17 @@ fn execute_statement(
             &catalog_empty_rows_for_relation_oid(oid),
         );
     }
+    if canonical == pg_catalog_tables_query() {
+        return write_single_row(
+            stream,
+            &[
+                text_column("schemaname"),
+                text_column("tablename"),
+                text_column("tableowner"),
+            ],
+            &pg_catalog_table_rows(session),
+        );
+    }
     if canonical == information_schema_tables_query() {
         return write_single_row(
             stream,
@@ -1834,6 +1845,25 @@ fn catalog_empty_rows_for_relation_oid(_oid: u32) -> Vec<Vec<Option<String>>> {
 
 fn catalog_empty_rows() -> Vec<Vec<Option<String>>> {
     Vec::new()
+}
+
+fn pg_catalog_tables_query() -> &'static str {
+    "select schemaname, tablename, tableowner from pg_catalog.pg_tables where schemaname = 'public' order by tablename"
+}
+
+fn pg_catalog_table_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut tables = session.tables.values().collect::<Vec<_>>();
+    tables.sort_by(|left, right| left.name.cmp(&right.name));
+    tables
+        .into_iter()
+        .map(|table| {
+            vec![
+                Some("public".to_string()),
+                Some(table.name.clone()),
+                Some("postgres".to_string()),
+            ]
+        })
+        .collect()
 }
 
 fn information_schema_tables_query() -> &'static str {
@@ -2769,6 +2799,25 @@ mod tests {
                 "select c.oid::pg_catalog.regclass, c.relkind, inhdetachpending, pg_catalog.pg_get_expr(c.relpartbound, c.oid) from pg_catalog.pg_class c, pg_catalog.pg_inherits i where c.oid = i.inhrelid and i.inhparent = '16384' order by pg_catalog.pg_get_expr(c.relpartbound, c.oid) = 'default', c.oid::pg_catalog.regclass::pg_catalog.text"
             ),
             Some(FIRST_USER_RELATION_OID)
+        );
+        assert_eq!(
+            pg_catalog_tables_query(),
+            "select schemaname, tablename, tableowner from pg_catalog.pg_tables where schemaname = 'public' order by tablename"
+        );
+        assert_eq!(
+            pg_catalog_table_rows(&session),
+            vec![
+                vec![
+                    Some("public".to_string()),
+                    Some("people".to_string()),
+                    Some("postgres".to_string()),
+                ],
+                vec![
+                    Some("public".to_string()),
+                    Some("teams".to_string()),
+                    Some("postgres".to_string()),
+                ],
+            ]
         );
         assert_eq!(
             information_schema_table_rows(&session),
