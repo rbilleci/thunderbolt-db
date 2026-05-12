@@ -1400,6 +1400,30 @@ fn execute_statement(
             &information_schema_key_column_usage_rows(session),
         );
     }
+    if canonical == pg_catalog_constraints_query() {
+        return write_single_row(
+            stream,
+            &[
+                text_column("nspname"),
+                text_column("relname"),
+                text_column("conname"),
+                text_column("contype"),
+            ],
+            &pg_catalog_constraint_rows(session),
+        );
+    }
+    if canonical == pg_catalog_attrdefs_query() {
+        return write_single_row(
+            stream,
+            &[
+                text_column("nspname"),
+                text_column("relname"),
+                text_column("attname"),
+                text_column("default_expr"),
+            ],
+            &pg_catalog_attrdef_rows(session),
+        );
+    }
     if canonical
         == "select oid, typname, typlen from pg_catalog.pg_type where oid in (23, 25) order by oid"
     {
@@ -2601,6 +2625,24 @@ fn information_schema_key_column_usage_query() -> &'static str {
 }
 
 fn information_schema_key_column_usage_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let _supported_plain_table_count = session.tables.len();
+    Vec::new()
+}
+
+fn pg_catalog_constraints_query() -> &'static str {
+    "select n.nspname, c.relname, con.conname, con.contype from pg_catalog.pg_constraint con join pg_catalog.pg_class c on c.oid = con.conrelid join pg_catalog.pg_namespace n on n.oid = c.relnamespace where n.nspname = 'public' order by c.relname, con.conname"
+}
+
+fn pg_catalog_constraint_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let _supported_plain_table_count = session.tables.len();
+    Vec::new()
+}
+
+fn pg_catalog_attrdefs_query() -> &'static str {
+    "select n.nspname, c.relname, a.attname, pg_catalog.pg_get_expr(d.adbin, d.adrelid) as default_expr from pg_catalog.pg_attrdef d join pg_catalog.pg_class c on c.oid = d.adrelid join pg_catalog.pg_namespace n on n.oid = c.relnamespace join pg_catalog.pg_attribute a on a.attrelid = d.adrelid and a.attnum = d.adnum where n.nspname = 'public' order by c.relname, a.attnum"
+}
+
+fn pg_catalog_attrdef_rows(session: &Session) -> Vec<Vec<Option<String>>> {
     let _supported_plain_table_count = session.tables.len();
     Vec::new()
 }
@@ -4070,6 +4112,16 @@ mod tests {
             "select table_schema, table_name, column_name, constraint_name, ordinal_position from information_schema.key_column_usage where table_schema = 'public' order by table_name, ordinal_position"
         );
         assert!(information_schema_key_column_usage_rows(&session).is_empty());
+        assert_eq!(
+            pg_catalog_constraints_query(),
+            "select n.nspname, c.relname, con.conname, con.contype from pg_catalog.pg_constraint con join pg_catalog.pg_class c on c.oid = con.conrelid join pg_catalog.pg_namespace n on n.oid = c.relnamespace where n.nspname = 'public' order by c.relname, con.conname"
+        );
+        assert!(pg_catalog_constraint_rows(&session).is_empty());
+        assert_eq!(
+            pg_catalog_attrdefs_query(),
+            "select n.nspname, c.relname, a.attname, pg_catalog.pg_get_expr(d.adbin, d.adrelid) as default_expr from pg_catalog.pg_attrdef d join pg_catalog.pg_class c on c.oid = d.adrelid join pg_catalog.pg_namespace n on n.oid = c.relnamespace join pg_catalog.pg_attribute a on a.attrelid = d.adrelid and a.attnum = d.adnum where n.nspname = 'public' order by c.relname, a.attnum"
+        );
+        assert!(pg_catalog_attrdef_rows(&session).is_empty());
         assert_eq!(
             catalog_type_rows_by_oid(),
             vec![

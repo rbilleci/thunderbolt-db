@@ -1,0 +1,6 @@
+=== pg_catalog empty constraint metadata ===
+CREATE TABLE
+CREATE TABLE
+ nspname | relname | conname | contype
+---------+---------+---------+---------
+(0 rows)

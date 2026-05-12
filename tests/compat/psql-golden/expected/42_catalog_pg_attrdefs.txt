@@ -1,0 +1,6 @@
+=== pg_catalog empty column default metadata ===
+CREATE TABLE
+CREATE TABLE
+ nspname | relname | attname | default_expr
+---------+---------+---------+--------------
+(0 rows)
