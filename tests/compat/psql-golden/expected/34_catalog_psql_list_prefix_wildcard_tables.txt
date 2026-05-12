@@ -1,0 +1,17 @@
+=== psql list prefix wildcard tables ===
+CREATE TABLE
+CREATE TABLE
+CREATE TABLE
+             List of relations
+ Schema |     Name      | Type  |  Owner
+--------+---------------+-------+----------
+ public | prefix_people | table | postgres
+ public | prefix_teams  | table | postgres
+(2 rows)
+
+                                      List of relations
+ Schema |     Name      | Type  |  Owner   | Persistence | Access method | Size | Description
+--------+---------------+-------+----------+-------------+---------------+------+-------------
+ public | prefix_people | table | postgres | permanent   | heap          |      |
+ public | prefix_teams  | table | postgres | permanent   | heap          |      |
+(2 rows)
