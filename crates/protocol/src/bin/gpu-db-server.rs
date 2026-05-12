@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -1177,6 +1177,19 @@ fn execute_statement(
             &information_schema_all_column_rows(session),
         );
     }
+    if let Some(tables) = information_schema_columns_in_query_tables(&canonical) {
+        return write_single_row(
+            stream,
+            &[
+                text_column("table_schema"),
+                text_column("table_name"),
+                text_column("column_name"),
+                int4_column("ordinal_position"),
+                text_column("data_type"),
+            ],
+            &information_schema_column_rows_for_tables(session, &tables),
+        );
+    }
     if canonical == information_schema_rich_columns_query() {
         return write_single_row(
             stream,
@@ -2003,6 +2016,51 @@ fn information_schema_all_columns_query() -> &'static str {
 
 fn information_schema_all_column_rows(session: &Session) -> Vec<Vec<Option<String>>> {
     let mut tables = session.tables.values().collect::<Vec<_>>();
+    tables.sort_by(|left, right| left.name.cmp(&right.name));
+    tables
+        .into_iter()
+        .flat_map(|table| {
+            table.columns.iter().map(|column| {
+                vec![
+                    Some("public".to_string()),
+                    Some(table.name.clone()),
+                    Some(column.def.name.clone()),
+                    Some(column.attnum.to_string()),
+                    Some(sql_type_display_name(column.def.ty).to_string()),
+                ]
+            })
+        })
+        .collect()
+}
+
+fn information_schema_columns_in_query_tables(canonical: &str) -> Option<Vec<String>> {
+    let prefix = "select table_schema, table_name, column_name, ordinal_position, data_type from information_schema.columns where table_schema = 'public' and table_name in (";
+    let suffix = ") order by table_name, ordinal_position";
+    let list = canonical.strip_prefix(prefix)?.strip_suffix(suffix)?;
+    let mut tables = Vec::new();
+    for raw_name in list.split(',') {
+        let name = raw_name.trim().strip_prefix('\'')?.strip_suffix('\'')?;
+        if name.is_empty() {
+            return None;
+        }
+        tables.push(name.to_string());
+    }
+    if tables.is_empty() {
+        None
+    } else {
+        Some(tables)
+    }
+}
+
+fn information_schema_column_rows_for_tables(
+    session: &Session,
+    table_names: &[String],
+) -> Vec<Vec<Option<String>>> {
+    let requested_tables = table_names.iter().collect::<BTreeSet<_>>();
+    let mut tables = requested_tables
+        .iter()
+        .filter_map(|table_name| session.tables.get(table_name.as_str()))
+        .collect::<Vec<_>>();
     tables.sort_by(|left, right| left.name.cmp(&right.name));
     tables
         .into_iter()
@@ -3011,6 +3069,50 @@ mod tests {
         );
         assert_eq!(
             information_schema_all_column_rows(&session),
+            vec![
+                vec![
+                    Some("public".to_string()),
+                    Some("people".to_string()),
+                    Some("id".to_string()),
+                    Some("1".to_string()),
+                    Some("integer".to_string()),
+                ],
+                vec![
+                    Some("public".to_string()),
+                    Some("people".to_string()),
+                    Some("name".to_string()),
+                    Some("2".to_string()),
+                    Some("text".to_string()),
+                ],
+                vec![
+                    Some("public".to_string()),
+                    Some("teams".to_string()),
+                    Some("id".to_string()),
+                    Some("1".to_string()),
+                    Some("integer".to_string()),
+                ],
+            ]
+        );
+        assert_eq!(
+            information_schema_columns_in_query_tables(
+                "select table_schema, table_name, column_name, ordinal_position, data_type from information_schema.columns where table_schema = 'public' and table_name in ('people', 'missing', 'teams') order by table_name, ordinal_position"
+            ),
+            Some(vec![
+                "people".to_string(),
+                "missing".to_string(),
+                "teams".to_string()
+            ])
+        );
+        assert_eq!(
+            information_schema_column_rows_for_tables(
+                &session,
+                &[
+                    "people".to_string(),
+                    "missing".to_string(),
+                    "people".to_string(),
+                    "teams".to_string()
+                ]
+            ),
             vec![
                 vec![
                     Some("public".to_string()),
