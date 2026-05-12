@@ -1692,41 +1692,37 @@ fn execute_cuda_native_key_batch_query(
     keys: &[String],
     all_version_rows: Vec<ResolvedMvccRow>,
     backend: &CudaMvccExecutionBackend,
-) -> Result<FinalizedMvccBackendExecution, FallbackReason> {
-    let mut rows = Vec::new();
+) -> Result<(FinalizedMvccBackendExecution, u64), FallbackReason> {
+    let mut compact_rows = Vec::new();
     for key in keys {
-        let lookup_query = MvccReadQuery {
-            source: MvccReadSource::KeyLookup { key: key.clone() },
-            visibility: query.visibility,
-            filter: query.filter.clone(),
-            order: None,
-            projection: MvccProjection::KeyValue,
-            limit: None,
-        };
-        match backend.execute(&lookup_query, all_version_rows.clone()) {
-            MvccBackendDispatch::Executed(executed) => rows.extend(executed.rows),
-            MvccBackendDispatch::Fallback { reason, .. } => return Err(reason),
-        }
+        compact_rows.extend(
+            all_version_rows
+                .iter()
+                .filter(|row| row.tuple.key == *key)
+                .cloned(),
+        );
     }
+    let h2d_bytes = cuda_mvcc_row_batch_transfer_bytes(&compact_rows);
 
-    if let Some(order) = query.order.as_ref() {
-        sort_projected_key_value_rows(&mut rows, order);
+    let compact_query = MvccReadQuery {
+        source: MvccReadSource::FullScan,
+        visibility: query.visibility,
+        filter: query.filter.clone(),
+        order: query.order.clone(),
+        projection: query.projection.clone(),
+        limit: query.limit,
+    };
+    match backend.execute(&compact_query, compact_rows) {
+        MvccBackendDispatch::Executed(executed) => Ok((
+            FinalizedMvccBackendExecution {
+                executed_target: executed.executed_target,
+                fallback_reason: None,
+                rows: executed.rows,
+            },
+            h2d_bytes,
+        )),
+        MvccBackendDispatch::Fallback { reason, .. } => Err(reason),
     }
-
-    if let Some(limit) = query.limit {
-        rows.truncate(limit);
-    }
-
-    let rows = rows
-        .into_iter()
-        .map(|row| project_key_value_read_row(row, &query.projection))
-        .collect();
-
-    Ok(FinalizedMvccBackendExecution {
-        executed_target: DeviceTarget::Gpu(backend.gpu_id),
-        fallback_reason: None,
-        rows,
-    })
 }
 
 fn execute_cuda_native_concat_query(
@@ -7412,12 +7408,18 @@ impl Engine {
 
         let planned_target = DeviceTarget::Gpu(self.planner.default_gpu_id());
         let rows = resolve_mvcc_all_versions(&self.mvcc_store, query.visibility)?;
-        let cuda_h2d_bytes = cuda_mvcc_row_batch_transfer_bytes(&rows);
+        let mut cuda_h2d_bytes = cuda_mvcc_row_batch_transfer_bytes(&rows);
 
         let cuda_start = Instant::now();
         let backend_result = match &query.source {
             MvccReadSource::KeyBatchLookup { keys } => {
-                execute_cuda_native_key_batch_query(query, keys, rows, backend)
+                match execute_cuda_native_key_batch_query(query, keys, rows, backend) {
+                    Ok((execution, key_batch_h2d_bytes)) => {
+                        cuda_h2d_bytes = key_batch_h2d_bytes;
+                        Ok(execution)
+                    }
+                    Err(reason) => Err(reason),
+                }
             }
             MvccReadSource::Concat { sources } => {
                 execute_cuda_native_concat_query(query, sources, rows, backend)
@@ -11043,6 +11045,21 @@ mod tests {
                 },
             ]
         );
+        let all_version_rows =
+            resolve_mvcc_all_versions(&e.mvcc_store, StorageVisibility { read_txn_id: 3 }).unwrap();
+        let compact_rows = ["acct:3", "acct:1"]
+            .iter()
+            .flat_map(|key| {
+                all_version_rows
+                    .iter()
+                    .filter(move |row| row.tuple.key == *key)
+                    .cloned()
+            })
+            .collect::<Vec<_>>();
+        let compact_h2d_bytes = cuda_mvcc_row_batch_transfer_bytes(&compact_rows);
+
+        assert_eq!(e.metrics().h2d_bytes_total, compact_h2d_bytes);
+        assert!(compact_h2d_bytes < cuda_mvcc_row_batch_transfer_bytes(&all_version_rows));
         assert_eq!(e.metrics().fallback_total, 0);
     }
 

@@ -63,7 +63,7 @@ This matrix makes compatibility intent explicit per delivery phase while preserv
 |---|---:|---:|---:|---|
 | Runtime commit/fallback/flush counters | ✅ | ✅ | ✅ | Includes latest-reason signals |
 | SLO-aligned observability baseline | 🟡 | ✅ | ✅ | Expanded with replication rollout |
-| Relational workload performance proof | 🚫 | 🟡 | ✅ | P7 report covers an indexed app-style lookup workload, analytical full scan, analytical range filter, conjunctive analytical filter, and disjunctive analytical filter with correctness validation, fallback rates, device info, per-engine CUDA driver probe runtime caching, SQL-visible H2D/D2H counters plus normalized transfer pressure, CPU/GPU-probe timing, p50/p95/max latencies, and CPU-vs-GPU total ratios; after equality/range/conjunction/disjunction predicate bridge pushdown the current benchmark mix records 0% SQL fallback, but still no workload-level GPU advantage claim |
+| Relational workload performance proof | 🚫 | 🟡 | ✅ | P7 report covers an indexed app-style lookup workload, analytical full scan, analytical range filter, conjunctive analytical filter, and disjunctive analytical filter with correctness validation, fallback rates, device info, per-engine CUDA driver probe runtime caching, SQL-visible H2D/D2H counters plus normalized transfer pressure, CPU/GPU-probe timing, p50/p95/max latencies, and CPU-vs-GPU total ratios; after equality/range/conjunction/disjunction predicate bridge pushdown and compact requested-row H2D transfer for key-batch reads, the current benchmark mix records 0% SQL fallback, but still no workload-level GPU advantage claim |
 | Security/compliance control mapping | 🟡 | ✅ | ✅ | See architecture doc 07 |
 | Backup/PITR/DR test gates | 🟡 | 🟡 | ✅ | See architecture doc 08 |
 
