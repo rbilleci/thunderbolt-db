@@ -920,6 +920,20 @@ fn execute_statement(
             &catalog_psql_describe_table_verbose_rows_filtered(session, &filter),
         );
     }
+    if let Some(filter) = psql_describe_table_privileges_catalog_query_filter(&canonical) {
+        return write_single_row(
+            stream,
+            &[
+                text_column("Schema"),
+                text_column("Name"),
+                text_column("Type"),
+                text_column("Access privileges"),
+                text_column("Column privileges"),
+                text_column("Policies"),
+            ],
+            &catalog_psql_describe_table_privilege_rows_filtered(session, &filter),
+        );
+    }
     if canonical == psql_describe_schemas_catalog_query() {
         return write_single_row(
             stream,
@@ -1386,6 +1400,37 @@ fn psql_describe_tables_verbose_catalog_query_filter(
     })
 }
 
+fn psql_describe_table_privileges_catalog_query_filter(
+    canonical: &str,
+) -> Option<PsqlDescribeTablesFilter> {
+    let prefix = "select n.nspname as \"schema\", c.relname as \"name\", case c.relkind when 'r' then 'table' when 'v' then 'view' when 'm' then 'materialized view' when 's' then 'sequence' when 'f' then 'foreign table' when 'p' then 'partitioned table' end as \"type\", pg_catalog.array_to_string(c.relacl, e'\\n') as \"access privileges\", pg_catalog.array_to_string(array( select attname || e':\\n ' || pg_catalog.array_to_string(attacl, e'\\n ') from pg_catalog.pg_attribute a where attrelid = c.oid and not attisdropped and attacl is not null ), e'\\n') as \"column privileges\", pg_catalog.array_to_string(array( select polname || case when not polpermissive then e' (restrictive)' else '' end || case when polcmd != '*' then e' (' || polcmd::pg_catalog.text || e'):' else e':' end || case when polqual is not null then e'\\n (u): ' || pg_catalog.pg_get_expr(polqual, polrelid) else e'' end || case when polwithcheck is not null then e'\\n (c): ' || pg_catalog.pg_get_expr(polwithcheck, polrelid) else e'' end || case when polroles <> '{0}' then e'\\n to: ' || pg_catalog.array_to_string( array( select rolname from pg_catalog.pg_roles where oid = any (polroles) order by 1 ), e', ') else e'' end from pg_catalog.pg_policy pol where polrelid = c.oid), e'\\n') as \"policies\" from pg_catalog.pg_class c left join pg_catalog.pg_namespace n on n.oid = c.relnamespace where c.relkind in ('r','v','m','s','f','p') and ";
+    let relname_prefix = "c.relname operator(pg_catalog.~) '^(";
+    let relname_visible_suffix =
+        ")$' collate pg_catalog.default and pg_catalog.pg_table_is_visible(c.oid) order by 1, 2";
+    let relname_middle = ")$' collate pg_catalog.default and n.nspname operator(pg_catalog.~) '^(";
+    let namespace_suffix = ")$' collate pg_catalog.default order by 1, 2";
+    let rest = canonical.strip_prefix(prefix)?;
+
+    if let Some(relname_pattern) = rest
+        .strip_prefix(relname_prefix)
+        .and_then(|rest| rest.strip_suffix(relname_visible_suffix))
+    {
+        return Some(PsqlDescribeTablesFilter {
+            namespace: "public".to_string(),
+            relname_pattern: Some(relname_pattern.to_string()),
+        });
+    }
+
+    let (relname_pattern, namespace) = rest
+        .strip_prefix(relname_prefix)?
+        .strip_suffix(namespace_suffix)?
+        .split_once(relname_middle)?;
+    Some(PsqlDescribeTablesFilter {
+        namespace: namespace.to_string(),
+        relname_pattern: Some(relname_pattern.to_string()),
+    })
+}
+
 fn psql_describe_schemas_catalog_query() -> &'static str {
     "select n.nspname as \"name\", pg_catalog.pg_get_userbyid(n.nspowner) as \"owner\" from pg_catalog.pg_namespace n where n.nspname !~ '^pg_' and n.nspname <> 'information_schema' order by 1"
 }
@@ -1471,6 +1516,36 @@ fn catalog_psql_describe_table_verbose_rows_filtered(
                 None,
             ]);
             row
+        })
+        .collect()
+}
+
+fn catalog_psql_describe_table_privilege_rows_filtered(
+    session: &Session,
+    filter: &PsqlDescribeTablesFilter,
+) -> Vec<Vec<Option<String>>> {
+    if filter.namespace != "public" {
+        return Vec::new();
+    }
+    let mut tables = session.tables.values().collect::<Vec<_>>();
+    tables.sort_by(|left, right| left.name.cmp(&right.name));
+    tables
+        .into_iter()
+        .filter(|table| {
+            filter
+                .relname_pattern
+                .as_deref()
+                .is_none_or(|pattern| psql_relname_pattern_matches(pattern, &table.name))
+        })
+        .map(|table| {
+            vec![
+                Some("public".to_string()),
+                Some(table.name.clone()),
+                Some("table".to_string()),
+                None,
+                None,
+                None,
+            ]
         })
         .collect()
 }
@@ -2364,6 +2439,32 @@ mod tests {
                 Some("postgres".to_string()),
                 Some("permanent".to_string()),
                 Some("heap".to_string()),
+                None,
+                None,
+            ]]
+        );
+        assert_eq!(
+            psql_describe_table_privileges_catalog_query_filter(
+                "select n.nspname as \"schema\", c.relname as \"name\", case c.relkind when 'r' then 'table' when 'v' then 'view' when 'm' then 'materialized view' when 's' then 'sequence' when 'f' then 'foreign table' when 'p' then 'partitioned table' end as \"type\", pg_catalog.array_to_string(c.relacl, e'\\n') as \"access privileges\", pg_catalog.array_to_string(array( select attname || e':\\n ' || pg_catalog.array_to_string(attacl, e'\\n ') from pg_catalog.pg_attribute a where attrelid = c.oid and not attisdropped and attacl is not null ), e'\\n') as \"column privileges\", pg_catalog.array_to_string(array( select polname || case when not polpermissive then e' (restrictive)' else '' end || case when polcmd != '*' then e' (' || polcmd::pg_catalog.text || e'):' else e':' end || case when polqual is not null then e'\\n (u): ' || pg_catalog.pg_get_expr(polqual, polrelid) else e'' end || case when polwithcheck is not null then e'\\n (c): ' || pg_catalog.pg_get_expr(polwithcheck, polrelid) else e'' end || case when polroles <> '{0}' then e'\\n to: ' || pg_catalog.array_to_string( array( select rolname from pg_catalog.pg_roles where oid = any (polroles) order by 1 ), e', ') else e'' end from pg_catalog.pg_policy pol where polrelid = c.oid), e'\\n') as \"policies\" from pg_catalog.pg_class c left join pg_catalog.pg_namespace n on n.oid = c.relnamespace where c.relkind in ('r','v','m','s','f','p') and c.relname operator(pg_catalog.~) '^(people)$' collate pg_catalog.default and pg_catalog.pg_table_is_visible(c.oid) order by 1, 2"
+            ),
+            Some(PsqlDescribeTablesFilter {
+                namespace: "public".to_string(),
+                relname_pattern: Some("people".to_string()),
+            })
+        );
+        assert_eq!(
+            catalog_psql_describe_table_privilege_rows_filtered(
+                &session,
+                &PsqlDescribeTablesFilter {
+                    namespace: "public".to_string(),
+                    relname_pattern: Some("peo.*".to_string()),
+                },
+            ),
+            vec![vec![
+                Some("public".to_string()),
+                Some("people".to_string()),
+                Some("table".to_string()),
+                None,
                 None,
                 None,
             ]]

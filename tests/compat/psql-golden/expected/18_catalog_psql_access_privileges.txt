@@ -1,0 +1,7 @@
+=== psql dp table privileges meta-command ===
+CREATE TABLE
+                                    Access privileges
+ Schema |         Name         | Type  | Access privileges | Column privileges | Policies
+--------+----------------------+-------+-------------------+-------------------+----------
+ public | dp_privileges_people | table |                   |                   |
+(1 row)
