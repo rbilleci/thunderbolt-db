@@ -1424,6 +1424,18 @@ fn execute_statement(
             &pg_catalog_attrdef_rows(session),
         );
     }
+    if canonical == pg_catalog_descriptions_query() {
+        return write_single_row(
+            stream,
+            &[
+                text_column("nspname"),
+                text_column("relname"),
+                text_column("attname"),
+                text_column("description"),
+            ],
+            &pg_catalog_description_rows(session),
+        );
+    }
     if canonical
         == "select oid, typname, typlen from pg_catalog.pg_type where oid in (23, 25) order by oid"
     {
@@ -2647,6 +2659,19 @@ fn pg_catalog_attrdef_rows(session: &Session) -> Vec<Vec<Option<String>>> {
     Vec::new()
 }
 
+fn pg_catalog_descriptions_query() -> &'static str {
+    "select n.nspname, c.relname, a.attname, d.description from pg_catalog.pg_description d join pg_catalog.pg_class c on c.oid = d.objoid join pg_catalog.pg_namespace n on n.oid = c.relnamespace left join pg_catalog.pg_attribute a on a.attrelid = c.oid and a.attnum = d.objsubid where n.nspname = 'public' and c.relkind = 'r' order by c.relname, d.objsubid"
+}
+
+fn pg_catalog_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let _supported_plain_table_and_column_count = session
+        .tables
+        .values()
+        .map(|table| 1 + table.columns.len())
+        .sum::<usize>();
+    Vec::new()
+}
+
 fn catalog_type_rows_by_oid() -> Vec<Vec<Option<String>>> {
     let mut types = SUPPORTED_SQL_TYPES;
     types.sort_by_key(|ty| ty.postgres_oid());
@@ -3638,6 +3663,11 @@ mod tests {
                 ],
             ]
         );
+        assert_eq!(
+            pg_catalog_descriptions_query(),
+            "select n.nspname, c.relname, a.attname, d.description from pg_catalog.pg_description d join pg_catalog.pg_class c on c.oid = d.objoid join pg_catalog.pg_namespace n on n.oid = c.relnamespace left join pg_catalog.pg_attribute a on a.attrelid = c.oid and a.attnum = d.objsubid where n.nspname = 'public' and c.relkind = 'r' order by c.relname, d.objsubid"
+        );
+        assert!(pg_catalog_description_rows(&session).is_empty());
         assert_eq!(
             information_schema_table_rows(&session),
             vec![

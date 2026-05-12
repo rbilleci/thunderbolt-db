@@ -1,0 +1,6 @@
+=== pg_catalog empty description metadata ===
+CREATE TABLE
+CREATE TABLE
+ nspname | relname | attname | description
+---------+---------+---------+-------------
+(0 rows)

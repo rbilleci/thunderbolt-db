@@ -1,5 +1,10 @@
 # Implementation Log
 
+## 2026-05-13
+
+### PostgreSQL-compatible product loop
+- Advanced P2 catalog/schema/type spine by backing common `pg_catalog.pg_description` discovery for the current no-comment subset. The compatibility endpoint accepts the joined `pg_description` / `pg_class` / `pg_namespace` / `pg_attribute` query for supported `public` tables and truthfully returns no rows until table or column comments exist, with real psql golden coverage.
+
 ## 2026-05-12
 
 ### PostgreSQL-compatible product loop
