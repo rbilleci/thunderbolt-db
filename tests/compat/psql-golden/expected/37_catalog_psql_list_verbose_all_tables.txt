@@ -1,0 +1,9 @@
+=== psql verbose all-table listing ===
+CREATE TABLE
+CREATE TABLE
+                                      List of relations
+ Schema |     Name      | Type  |  Owner   | Persistence | Access method | Size | Description
+--------+---------------+-------+----------+-------------+---------------+------+-------------
+ public | dt_all_people | table | postgres | permanent   | heap          |      |
+ public | dt_all_teams  | table | postgres | permanent   | heap          |      |
+(2 rows)

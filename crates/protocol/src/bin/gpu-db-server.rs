@@ -904,6 +904,22 @@ fn execute_statement(
             &catalog_psql_describe_table_rows_filtered(session, &filter),
         );
     }
+    if canonical == psql_describe_tables_verbose_catalog_query() {
+        return write_single_row(
+            stream,
+            &[
+                text_column("Schema"),
+                text_column("Name"),
+                text_column("Type"),
+                text_column("Owner"),
+                text_column("Persistence"),
+                text_column("Access method"),
+                text_column("Size"),
+                text_column("Description"),
+            ],
+            &catalog_psql_describe_table_verbose_rows(session),
+        );
+    }
     if let Some(filter) = psql_describe_tables_verbose_catalog_query_filter(&canonical) {
         return write_single_row(
             stream,
@@ -1521,6 +1537,10 @@ fn psql_describe_tables_catalog_query() -> &'static str {
     "select n.nspname as \"schema\", c.relname as \"name\", case c.relkind when 'r' then 'table' when 'v' then 'view' when 'm' then 'materialized view' when 'i' then 'index' when 's' then 'sequence' when 't' then 'toast table' when 'f' then 'foreign table' when 'p' then 'partitioned table' when 'i' then 'partitioned index' end as \"type\", pg_catalog.pg_get_userbyid(c.relowner) as \"owner\" from pg_catalog.pg_class c left join pg_catalog.pg_namespace n on n.oid = c.relnamespace left join pg_catalog.pg_am am on am.oid = c.relam where c.relkind in ('r','p','') and n.nspname <> 'pg_catalog' and n.nspname !~ '^pg_toast' and n.nspname <> 'information_schema' and pg_catalog.pg_table_is_visible(c.oid) order by 1,2"
 }
 
+fn psql_describe_tables_verbose_catalog_query() -> &'static str {
+    "select n.nspname as \"schema\", c.relname as \"name\", case c.relkind when 'r' then 'table' when 'v' then 'view' when 'm' then 'materialized view' when 'i' then 'index' when 's' then 'sequence' when 't' then 'toast table' when 'f' then 'foreign table' when 'p' then 'partitioned table' when 'i' then 'partitioned index' end as \"type\", pg_catalog.pg_get_userbyid(c.relowner) as \"owner\", case c.relpersistence when 'p' then 'permanent' when 't' then 'temporary' when 'u' then 'unlogged' end as \"persistence\", am.amname as \"access method\", pg_catalog.pg_size_pretty(pg_catalog.pg_table_size(c.oid)) as \"size\", pg_catalog.obj_description(c.oid, 'pg_class') as \"description\" from pg_catalog.pg_class c left join pg_catalog.pg_namespace n on n.oid = c.relnamespace left join pg_catalog.pg_am am on am.oid = c.relam where c.relkind in ('r','p','') and n.nspname <> 'pg_catalog' and n.nspname !~ '^pg_toast' and n.nspname <> 'information_schema' and pg_catalog.pg_table_is_visible(c.oid) order by 1,2"
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PsqlDescribeTablesFilter {
     namespace: String,
@@ -1684,6 +1704,16 @@ fn catalog_psql_describe_type_rows(type_name: &str) -> Vec<Vec<Option<String>>> 
 
 fn catalog_psql_describe_table_rows(session: &Session) -> Vec<Vec<Option<String>>> {
     catalog_psql_describe_table_rows_filtered(
+        session,
+        &PsqlDescribeTablesFilter {
+            namespace: "public".to_string(),
+            relname_pattern: None,
+        },
+    )
+}
+
+fn catalog_psql_describe_table_verbose_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    catalog_psql_describe_table_verbose_rows_filtered(
         session,
         &PsqlDescribeTablesFilter {
             namespace: "public".to_string(),
@@ -2947,6 +2977,35 @@ mod tests {
                     Some("teams".to_string()),
                     Some("table".to_string()),
                     Some("postgres".to_string()),
+                ],
+            ]
+        );
+        assert_eq!(
+            psql_describe_tables_verbose_catalog_query(),
+            "select n.nspname as \"schema\", c.relname as \"name\", case c.relkind when 'r' then 'table' when 'v' then 'view' when 'm' then 'materialized view' when 'i' then 'index' when 's' then 'sequence' when 't' then 'toast table' when 'f' then 'foreign table' when 'p' then 'partitioned table' when 'i' then 'partitioned index' end as \"type\", pg_catalog.pg_get_userbyid(c.relowner) as \"owner\", case c.relpersistence when 'p' then 'permanent' when 't' then 'temporary' when 'u' then 'unlogged' end as \"persistence\", am.amname as \"access method\", pg_catalog.pg_size_pretty(pg_catalog.pg_table_size(c.oid)) as \"size\", pg_catalog.obj_description(c.oid, 'pg_class') as \"description\" from pg_catalog.pg_class c left join pg_catalog.pg_namespace n on n.oid = c.relnamespace left join pg_catalog.pg_am am on am.oid = c.relam where c.relkind in ('r','p','') and n.nspname <> 'pg_catalog' and n.nspname !~ '^pg_toast' and n.nspname <> 'information_schema' and pg_catalog.pg_table_is_visible(c.oid) order by 1,2"
+        );
+        assert_eq!(
+            catalog_psql_describe_table_verbose_rows(&session),
+            vec![
+                vec![
+                    Some("public".to_string()),
+                    Some("people".to_string()),
+                    Some("table".to_string()),
+                    Some("postgres".to_string()),
+                    Some("permanent".to_string()),
+                    Some("heap".to_string()),
+                    None,
+                    None,
+                ],
+                vec![
+                    Some("public".to_string()),
+                    Some("teams".to_string()),
+                    Some("table".to_string()),
+                    Some("postgres".to_string()),
+                    Some("permanent".to_string()),
+                    Some("heap".to_string()),
+                    None,
+                    None,
                 ],
             ]
         );
