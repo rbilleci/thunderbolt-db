@@ -1,0 +1,12 @@
+=== psql dT supported pg_catalog types ===
+         List of data types
+   Schema   |  Name   | Description
+------------+---------+-------------
+ pg_catalog | integer |
+(1 row)
+
+       List of data types
+   Schema   | Name | Description
+------------+------+-------------
+ pg_catalog | text |
+(1 row)

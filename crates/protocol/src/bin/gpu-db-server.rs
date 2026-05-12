@@ -899,6 +899,17 @@ fn execute_statement(
             &catalog_psql_describe_schema_rows(),
         );
     }
+    if let Some(type_name) = psql_describe_type_catalog_query_type(&canonical) {
+        return write_single_row(
+            stream,
+            &[
+                text_column("Schema"),
+                text_column("Name"),
+                text_column("Description"),
+            ],
+            &catalog_psql_describe_type_rows(&type_name),
+        );
+    }
     if let Some(table) = catalog_describe_relation_lookup_query_table(&canonical) {
         return write_single_row(
             stream,
@@ -1224,6 +1235,35 @@ fn psql_describe_tables_catalog_query() -> &'static str {
 
 fn psql_describe_schemas_catalog_query() -> &'static str {
     "select n.nspname as \"name\", pg_catalog.pg_get_userbyid(n.nspowner) as \"owner\" from pg_catalog.pg_namespace n where n.nspname !~ '^pg_' and n.nspname <> 'information_schema' order by 1"
+}
+
+fn psql_describe_type_catalog_query_type(canonical: &str) -> Option<String> {
+    let prefix = "select n.nspname as \"schema\", pg_catalog.format_type(t.oid, null) as \"name\", pg_catalog.obj_description(t.oid, 'pg_type') as \"description\" from pg_catalog.pg_type t left join pg_catalog.pg_namespace n on n.oid = t.typnamespace where (t.typrelid = 0 or (select c.relkind = 'c' from pg_catalog.pg_class c where c.oid = t.typrelid)) and not exists(select 1 from pg_catalog.pg_type el where el.oid = t.typelem and el.typarray = t.oid) and (t.typname operator(pg_catalog.~) '^(";
+    let suffix = ")$' collate pg_catalog.default or pg_catalog.format_type(t.oid, null) operator(pg_catalog.~) '^(";
+    let final_suffix = ")$' collate pg_catalog.default) and n.nspname operator(pg_catalog.~) '^(pg_catalog)$' collate pg_catalog.default order by 1, 2";
+    let rest = canonical.strip_prefix(prefix)?;
+    let (type_name, rest) = rest.split_once(suffix)?;
+    let display_name = rest.strip_suffix(final_suffix)?;
+    let matched_type = sql_type_by_catalog_or_display_name(type_name)?;
+    (sql_type_by_catalog_or_display_name(display_name) == Some(matched_type))
+        .then(|| type_name.to_string())
+}
+
+fn sql_type_by_catalog_or_display_name(name: &str) -> Option<SqlType> {
+    SUPPORTED_SQL_TYPES
+        .into_iter()
+        .find(|ty| ty.catalog_name() == name || sql_type_display_name(*ty) == name)
+}
+
+fn catalog_psql_describe_type_rows(type_name: &str) -> Vec<Vec<Option<String>>> {
+    let Some(ty) = sql_type_by_catalog_or_display_name(type_name) else {
+        return Vec::new();
+    };
+    vec![vec![
+        Some("pg_catalog".to_string()),
+        Some(sql_type_display_name(ty).to_string()),
+        None,
+    ]]
 }
 
 fn catalog_psql_describe_table_rows(session: &Session) -> Vec<Vec<Option<String>>> {
@@ -1966,6 +2006,34 @@ mod tests {
             vec![vec![
                 Some("public".to_string()),
                 Some("postgres".to_string())
+            ]]
+        );
+        assert_eq!(
+            psql_describe_type_catalog_query_type(
+                "select n.nspname as \"schema\", pg_catalog.format_type(t.oid, null) as \"name\", pg_catalog.obj_description(t.oid, 'pg_type') as \"description\" from pg_catalog.pg_type t left join pg_catalog.pg_namespace n on n.oid = t.typnamespace where (t.typrelid = 0 or (select c.relkind = 'c' from pg_catalog.pg_class c where c.oid = t.typrelid)) and not exists(select 1 from pg_catalog.pg_type el where el.oid = t.typelem and el.typarray = t.oid) and (t.typname operator(pg_catalog.~) '^(int4)$' collate pg_catalog.default or pg_catalog.format_type(t.oid, null) operator(pg_catalog.~) '^(int4)$' collate pg_catalog.default) and n.nspname operator(pg_catalog.~) '^(pg_catalog)$' collate pg_catalog.default order by 1, 2"
+            ),
+            Some("int4".to_string())
+        );
+        assert_eq!(
+            psql_describe_type_catalog_query_type(
+                "select n.nspname as \"schema\", pg_catalog.format_type(t.oid, null) as \"name\", pg_catalog.obj_description(t.oid, 'pg_type') as \"description\" from pg_catalog.pg_type t left join pg_catalog.pg_namespace n on n.oid = t.typnamespace where (t.typrelid = 0 or (select c.relkind = 'c' from pg_catalog.pg_class c where c.oid = t.typrelid)) and not exists(select 1 from pg_catalog.pg_type el where el.oid = t.typelem and el.typarray = t.oid) and (t.typname operator(pg_catalog.~) '^(text)$' collate pg_catalog.default or pg_catalog.format_type(t.oid, null) operator(pg_catalog.~) '^(text)$' collate pg_catalog.default) and n.nspname operator(pg_catalog.~) '^(pg_catalog)$' collate pg_catalog.default order by 1, 2"
+            ),
+            Some("text".to_string())
+        );
+        assert_eq!(
+            catalog_psql_describe_type_rows("int4"),
+            vec![vec![
+                Some("pg_catalog".to_string()),
+                Some("integer".to_string()),
+                None
+            ]]
+        );
+        assert_eq!(
+            catalog_psql_describe_type_rows("text"),
+            vec![vec![
+                Some("pg_catalog".to_string()),
+                Some("text".to_string()),
+                None
             ]]
         );
         assert_eq!(
