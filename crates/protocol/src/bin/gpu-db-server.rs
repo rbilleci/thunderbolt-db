@@ -686,6 +686,17 @@ fn handle_bind(
     if let Some(PreparedStatement::Extended(query)) = session.prepared.get(&statement_name) {
         let parameter_format_count = parameter_format_codes.len();
         let expected_parameter_count = expected_parameter_count(query);
+        if parameters.len() != expected_parameter_count {
+            write_error(
+                stream,
+                &ErrorField {
+                    code: "08P01",
+                    message: "bind message has wrong number of parameters",
+                    position: None,
+                },
+            )?;
+            return Ok(true);
+        }
         if !format_code_count_is_valid(parameter_format_count, expected_parameter_count) {
             write_error(
                 stream,
@@ -6760,6 +6771,44 @@ mod tests {
         .unwrap());
         assert_eq!(read_backend_tags(&mut reader, 1), vec![b'2']);
         assert!(session.portals.contains_key("per_parameter_format_portal"));
+    }
+
+    #[test]
+    fn extended_bind_rejects_parameter_count_mismatch_without_installing_portal() {
+        let mut session = Session::default();
+        let query = PreparedQuery {
+            query: "SELECT id FROM people WHERE id = $1 AND name = $2".to_string(),
+            parameter_type_oids: vec![23, 25],
+        };
+        session.replace_extended_statement("lookup".to_string(), query);
+        let (mut writer, mut reader) = tcp_pair();
+
+        assert!(handle_bind(
+            &mut writer,
+            &mut session,
+            "bad_count_portal".to_string(),
+            "lookup".to_string(),
+            Vec::new(),
+            vec![Some(b"1".to_vec())],
+            Vec::new()
+        )
+        .unwrap());
+
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'E']);
+        assert!(!session.portals.contains_key("bad_count_portal"));
+
+        assert!(!handle_bind(
+            &mut writer,
+            &mut session,
+            "good_count_portal".to_string(),
+            "lookup".to_string(),
+            Vec::new(),
+            vec![Some(b"1".to_vec()), Some(b"Ada".to_vec())],
+            Vec::new()
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'2']);
+        assert!(session.portals.contains_key("good_count_portal"));
     }
 
     #[test]

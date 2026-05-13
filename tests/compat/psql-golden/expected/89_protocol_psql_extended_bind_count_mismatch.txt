@@ -1,0 +1,8 @@
+=== psql extended bind parameter count mismatch ===
+CREATE TABLE
+INSERT 0 3
+psql:89_protocol_psql_extended_bind_count_mismatch.sql:4: ERROR:  bind message has wrong number of parameters
+ name
+-------
+ Linus
+(1 row)
