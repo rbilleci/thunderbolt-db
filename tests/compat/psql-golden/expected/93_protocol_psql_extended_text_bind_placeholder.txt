@@ -1,0 +1,11 @@
+=== psql extended text bind placeholder literal ===
+CREATE TABLE
+INSERT 0 3
+ id
+----
+  1
+(1 row)
+
+ id
+----
+(0 rows)
