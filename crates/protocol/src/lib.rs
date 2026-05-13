@@ -1725,18 +1725,76 @@ fn parse_select_order(input: &str) -> Result<SelectOrder, ParseError> {
 }
 
 fn parse_sql_value(input: &str) -> Result<SqlValue, ParseError> {
-    let s = input.trim();
+    let (s, cast) = split_supported_sql_value_cast(input.trim())?;
     if s.starts_with('\'') {
         if !s.ends_with('\'') || s.len() < 2 {
             return Err(ParseError::InvalidRelationalSql);
         }
         let inner = &s[1..s.len() - 1];
-        return Ok(SqlValue::Text(inner.replace("''", "'")));
+        let value = inner.replace("''", "'");
+        return match cast {
+            None | Some(SqlType::Text) => Ok(SqlValue::Text(value)),
+            Some(SqlType::Int4) => value
+                .parse::<i32>()
+                .map(SqlValue::Int4)
+                .map_err(|_| ParseError::InvalidRelationalSql),
+        };
     }
     let value = s
         .parse::<i32>()
         .map_err(|_| ParseError::InvalidRelationalSql)?;
-    Ok(SqlValue::Int4(value))
+    match cast {
+        None | Some(SqlType::Int4) => Ok(SqlValue::Int4(value)),
+        Some(SqlType::Text) => Ok(SqlValue::Text(value.to_string())),
+    }
+}
+
+fn split_supported_sql_value_cast(input: &str) -> Result<(&str, Option<SqlType>), ParseError> {
+    let Some(pos) = find_cast_operator_outside_quotes(input) else {
+        return Ok((input, None));
+    };
+    let value = input[..pos].trim();
+    let ty = input[pos + 2..].trim();
+    if value.is_empty() || ty.is_empty() || find_cast_operator_outside_quotes(ty).is_some() {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let ty = if ty
+        .get(.."pg_catalog.".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("pg_catalog."))
+    {
+        &ty["pg_catalog.".len()..]
+    } else {
+        ty
+    };
+    let cast = if ty.eq_ignore_ascii_case("int4") || ty.eq_ignore_ascii_case("integer") {
+        SqlType::Int4
+    } else if ty.eq_ignore_ascii_case("text") {
+        SqlType::Text
+    } else {
+        return Err(ParseError::InvalidRelationalSql);
+    };
+    Ok((value, Some(cast)))
+}
+
+fn find_cast_operator_outside_quotes(input: &str) -> Option<usize> {
+    let bytes = input.as_bytes();
+    let mut in_quote = false;
+    let mut idx = 0;
+    while idx + 1 < bytes.len() {
+        match bytes[idx] {
+            b'\'' => {
+                if in_quote && bytes.get(idx + 1) == Some(&b'\'') {
+                    idx += 1;
+                } else {
+                    in_quote = !in_quote;
+                }
+            }
+            b':' if !in_quote && bytes[idx + 1] == b':' => return Some(idx),
+            _ => {}
+        }
+        idx += 1;
+    }
+    None
 }
 
 fn normalize_identifier(input: &str) -> Result<String, ParseError> {
@@ -8209,6 +8267,44 @@ mod tests {
                     value: SqlValue::Text("O'Brien".to_string()),
                 }]],
                 order_by: None,
+                limit: None,
+            })
+        );
+
+        assert_eq!(
+            parse_command(
+                "SELECT id, name FROM people WHERE id = 2::int4 OR name = 'Ada'::text ORDER BY id"
+            )
+            .unwrap(),
+            Command::Select(Select {
+                table: "people".to_string(),
+                projection: SelectProjection::Columns(vec!["id".to_string(), "name".to_string()]),
+                filter: Some(SelectFilter {
+                    column: "id".to_string(),
+                    op: SelectFilterOp::Eq,
+                    value: SqlValue::Int4(2),
+                }),
+                filters: vec![SelectFilter {
+                    column: "id".to_string(),
+                    op: SelectFilterOp::Eq,
+                    value: SqlValue::Int4(2),
+                }],
+                filter_groups: vec![
+                    vec![SelectFilter {
+                        column: "id".to_string(),
+                        op: SelectFilterOp::Eq,
+                        value: SqlValue::Int4(2),
+                    }],
+                    vec![SelectFilter {
+                        column: "name".to_string(),
+                        op: SelectFilterOp::Eq,
+                        value: SqlValue::Text("Ada".to_string()),
+                    }],
+                ],
+                order_by: Some(SelectOrder {
+                    column: "id".to_string(),
+                    descending: false,
+                }),
                 limit: None,
             })
         );

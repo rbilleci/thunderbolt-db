@@ -1,0 +1,14 @@
+=== psql extended casted bind select ===
+CREATE TABLE
+INSERT 0 3
+ id | name
+----+-------
+  1 | Ada
+  2 | Linus
+(2 rows)
+
+psql:109_protocol_psql_extended_casted_bind.sql:5: ERROR:  invalid input syntax for parameter type oid 23: "not-an-int"
+ id | name
+----+-------
+  2 | Linus
+(1 row)

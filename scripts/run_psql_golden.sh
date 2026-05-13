@@ -90,6 +90,7 @@ normalize() {
     -e 's/[[:space:]]+$//' \
     -e 's#^psql:.*/tests/compat/psql-golden/scenarios/#psql:#' \
     -e '/^$/N;/^\n$/D' \
+    -e 's#(^|\n)psql:.*/tests/compat/psql-golden/scenarios/#\1psql:#' \
     -e '/^Time: [0-9.]+ ms$/d' \
     -e '/^SSL connection \(.+\)$/d' \
     -e '/^psql \([0-9.]+\).*$/d' \
