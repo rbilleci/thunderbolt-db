@@ -1010,6 +1010,9 @@ fn execute_statement(
     }
 
     let canonical = canonical_sql(statement);
+    if let Some(rows) = psql_describe_query_type_rows(&canonical) {
+        return write_single_row(stream, &[text_column("Column"), text_column("Type")], &rows);
+    }
     if canonical
         == "select relname from pg_catalog.pg_class where relnamespace = 'public'::regnamespace and relkind = 'r' order by relname"
     {
@@ -2896,6 +2899,39 @@ fn sql_type_display_name(ty: SqlType) -> &'static str {
         SqlType::Int4 => "integer",
         SqlType::Text => "text",
     }
+}
+
+fn sql_type_by_oid(oid: u32) -> Option<SqlType> {
+    SUPPORTED_SQL_TYPES
+        .into_iter()
+        .find(|ty| ty.postgres_oid() == oid)
+}
+
+fn psql_describe_query_type_rows(canonical: &str) -> Option<Vec<Vec<Option<String>>>> {
+    let prefix =
+        "select name as \"column\", pg_catalog.format_type(tp, tpm) as \"type\" from (values ";
+    let suffix = ") s(name, tp, tpm)";
+    let values = canonical.strip_prefix(prefix)?.strip_suffix(suffix)?;
+    let mut rows = Vec::new();
+    for raw_value in values.split("),(") {
+        let value = raw_value
+            .trim()
+            .trim_start_matches('(')
+            .trim_end_matches(')');
+        let fields = value.split(',').map(str::trim).collect::<Vec<_>>();
+        let [name, oid, _typmod] = fields.as_slice() else {
+            return None;
+        };
+        let name = name.strip_prefix('\'')?.strip_suffix('\'')?;
+        let oid = oid.strip_prefix('\'')?.strip_suffix("'::pg_catalog.oid")?;
+        let oid = oid.parse::<u32>().ok()?;
+        let ty = sql_type_by_oid(oid)?;
+        rows.push(vec![
+            Some(name.to_string()),
+            Some(sql_type_display_name(ty).to_string()),
+        ]);
+    }
+    Some(rows)
 }
 
 fn catalog_describe_policy_query_oid(canonical: &str) -> Option<u32> {
@@ -5447,6 +5483,25 @@ mod tests {
                 "SELECT name, id FROM people WHERE id = $1 ORDER BY name DESC LIMIT 1",
             ),
             Some(vec![text_column("name"), int4_column("id")])
+        );
+    }
+
+    #[test]
+    fn psql_gdesc_type_rows_formats_supported_row_description_types() {
+        assert_eq!(
+            psql_describe_query_type_rows(
+                "select name as \"column\", pg_catalog.format_type(tp, tpm) as \"type\" from (values ('name', '25'::pg_catalog.oid, -1),('id', '23'::pg_catalog.oid, -1)) s(name, tp, tpm)"
+            ),
+            Some(vec![
+                vec![Some("name".to_string()), Some("text".to_string())],
+                vec![Some("id".to_string()), Some("integer".to_string())],
+            ])
+        );
+        assert_eq!(
+            psql_describe_query_type_rows(
+                "select name as \"column\", pg_catalog.format_type(tp, tpm) as \"type\" from (values ('unsupported', '999999'::pg_catalog.oid, -1)) s(name, tp, tpm)"
+            ),
+            None
         );
     }
 

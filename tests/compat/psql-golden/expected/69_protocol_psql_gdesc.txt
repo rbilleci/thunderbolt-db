@@ -1,0 +1,11 @@
+=== psql gdesc extended describe flow ===
+CREATE TABLE
+ Column |  Type
+--------+---------
+ name   | text
+ id     | integer
+(2 rows)
+
+ name | id
+------+----
+(0 rows)
