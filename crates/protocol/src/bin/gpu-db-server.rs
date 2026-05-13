@@ -900,7 +900,12 @@ fn handle_close(
     name: &str,
 ) -> io::Result<bool> {
     match target {
-        DescribeTarget::Statement if !session.prepared.contains_key(name) => {
+        DescribeTarget::Statement
+            if !matches!(
+                session.prepared.get(name),
+                Some(PreparedStatement::Extended(_))
+            ) =>
+        {
             write_error(
                 stream,
                 &ErrorField {
@@ -6409,6 +6414,29 @@ mod tests {
         assert_eq!(read_backend_tags(&mut reader, 1), vec![b'3']);
         assert!(session.prepared.contains_key("lookup"));
         assert!(!session.portals.contains_key("lookup_portal"));
+    }
+
+    #[test]
+    fn extended_close_does_not_remove_sql_prepared_statements() {
+        let mut session = Session::default();
+        session
+            .prepared
+            .insert("golden_stmt".to_string(), PreparedStatement::AddTen);
+        let (mut writer, mut reader) = tcp_pair();
+
+        assert!(handle_close(
+            &mut writer,
+            &mut session,
+            DescribeTarget::Statement,
+            "golden_stmt"
+        )
+        .unwrap());
+
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'E']);
+        assert_eq!(
+            session.prepared.get("golden_stmt"),
+            Some(&PreparedStatement::AddTen)
+        );
     }
 
     #[test]
