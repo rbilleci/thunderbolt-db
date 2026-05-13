@@ -872,12 +872,6 @@ fn handle_execute(
             return Ok(true);
         }
     };
-    if max_rows == 0 && portal.result.is_none() {
-        let include_row_description = !portal.described;
-        execute_statement(stream, session, &bound_query, include_row_description)?;
-        return Ok(false);
-    }
-
     let Ok(Command::Select(select)) = parse_command(&bound_query) else {
         write_error(
             stream,
@@ -995,12 +989,13 @@ fn execute_portal_batch(
     for row in &result.rows[start..requested_end] {
         write_data_row(stream, row)?;
     }
+    let emitted_count = requested_end - start;
     portal.position = requested_end;
 
     if portal.position < result.rows.len() {
         write_portal_suspended(stream)
     } else {
-        write_command_complete(stream, &format!("SELECT {}", portal.position))
+        write_command_complete(stream, &format!("SELECT {emitted_count}"))
     }
 }
 
@@ -4563,8 +4558,8 @@ mod tests {
         (server, client)
     }
 
-    fn read_backend_tags(stream: &mut TcpStream, count: usize) -> Vec<u8> {
-        let mut tags = Vec::with_capacity(count);
+    fn read_backend_messages(stream: &mut TcpStream, count: usize) -> Vec<(u8, Vec<u8>)> {
+        let mut messages = Vec::with_capacity(count);
         for _ in 0..count {
             let mut tag = [0_u8; 1];
             stream.read_exact(&mut tag).unwrap();
@@ -4573,7 +4568,16 @@ mod tests {
             let payload_len = u32::from_be_bytes(len) as usize - 4;
             let mut payload = vec![0_u8; payload_len];
             stream.read_exact(&mut payload).unwrap();
-            tags.push(tag[0]);
+            messages.push((tag[0], payload));
+        }
+        messages
+    }
+
+    fn read_backend_tags(stream: &mut TcpStream, count: usize) -> Vec<u8> {
+        let messages = read_backend_messages(stream, count);
+        let mut tags = Vec::with_capacity(messages.len());
+        for (tag, _) in messages {
+            tags.push(tag);
         }
         tags
     }
@@ -6879,7 +6883,69 @@ mod tests {
         assert_eq!(portal.position, 2);
 
         execute_portal_batch(&mut writer, &mut session, "people_portal", 0).unwrap();
-        assert_eq!(read_backend_tags(&mut reader, 2), vec![b'D', b'C']);
+        let messages = read_backend_messages(&mut reader, 2);
+        assert_eq!(
+            messages.iter().map(|(tag, _)| *tag).collect::<Vec<_>>(),
+            vec![b'D', b'C']
+        );
+        assert_eq!(messages[1].1, b"SELECT 1\0".to_vec());
+        assert_eq!(session.portals.get("people_portal").unwrap().position, 3);
+    }
+
+    #[test]
+    fn extended_execute_zero_max_rows_exhausts_portal_state() {
+        let mut session = Session::default();
+        session.tables.insert(
+            "people".to_string(),
+            Table {
+                oid: FIRST_USER_RELATION_OID,
+                name: "people".to_string(),
+                columns: vec![CatalogColumn {
+                    attnum: 1,
+                    def: gpu_db_protocol::ColumnDef {
+                        name: "id".to_string(),
+                        ty: gpu_db_protocol::SqlType::Int4,
+                    },
+                }],
+                rows: vec![
+                    vec![SqlValue::Int4(1)],
+                    vec![SqlValue::Int4(2)],
+                    vec![SqlValue::Int4(3)],
+                ],
+            },
+        );
+        session.portals.insert(
+            "people_portal".to_string(),
+            Portal {
+                statement_name: "people_stmt".to_string(),
+                query: PreparedQuery {
+                    query: "SELECT id FROM people ORDER BY id".to_string(),
+                    parameter_type_oids: Vec::new(),
+                },
+                parameters: Vec::new(),
+                described: false,
+                result: None,
+                position: 0,
+            },
+        );
+        let (mut writer, mut reader) = tcp_pair();
+
+        assert!(!handle_execute(&mut writer, &mut session, "people_portal", 0).unwrap());
+        let messages = read_backend_messages(&mut reader, 5);
+        assert_eq!(
+            messages.iter().map(|(tag, _)| *tag).collect::<Vec<_>>(),
+            vec![b'T', b'D', b'D', b'D', b'C']
+        );
+        assert_eq!(messages[4].1, b"SELECT 3\0".to_vec());
+        let portal = session.portals.get("people_portal").unwrap();
+        assert!(portal.described);
+        assert!(portal.result.is_some());
+        assert_eq!(portal.position, 3);
+
+        assert!(!handle_execute(&mut writer, &mut session, "people_portal", 1).unwrap());
+        let messages = read_backend_messages(&mut reader, 1);
+        assert_eq!(messages[0].0, b'C');
+        assert_eq!(messages[0].1, b"SELECT 0\0".to_vec());
         assert_eq!(session.portals.get("people_portal").unwrap().position, 3);
     }
 
