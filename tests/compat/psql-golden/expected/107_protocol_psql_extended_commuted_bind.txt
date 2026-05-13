@@ -1,0 +1,14 @@
+=== psql extended commuted placeholder bind ===
+CREATE TABLE
+INSERT 0 3
+psql:107_protocol_psql_extended_commuted_bind.sql:4: ERROR:  invalid input syntax for parameter type oid 23: "not-an-int"
+ id | name
+----+-------
+  2 | Grace
+(1 row)
+
+ id | name
+----+-------
+  2 | Grace
+  3 | Linus
+(2 rows)

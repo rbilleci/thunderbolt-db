@@ -102,6 +102,18 @@ pub enum SelectFilterOp {
     Gte,
 }
 
+impl SelectFilterOp {
+    fn flipped(self) -> Self {
+        match self {
+            Self::Eq => Self::Eq,
+            Self::Lt => Self::Gt,
+            Self::Lte => Self::Gte,
+            Self::Gt => Self::Lt,
+            Self::Gte => Self::Lte,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectOrder {
     pub column: String,
@@ -1615,12 +1627,24 @@ fn parse_projection(input: &str) -> Result<SelectProjection, ParseError> {
 
 fn parse_select_filter(input: &str) -> Result<SelectFilter, ParseError> {
     let input = trim_wrapping_parentheses(input)?;
-    let (column, op, value) = split_select_filter(input)?;
-    Ok(SelectFilter {
-        column: normalize_identifier(column.trim())?,
-        op,
-        value: parse_sql_value(value.trim())?,
-    })
+    let (left, op, right) = split_select_filter(input)?;
+    let left = left.trim();
+    let right = right.trim();
+    if let Ok(value) = parse_sql_value(right) {
+        return Ok(SelectFilter {
+            column: normalize_identifier(left)?,
+            op,
+            value,
+        });
+    }
+    if let Ok(value) = parse_sql_value(left) {
+        return Ok(SelectFilter {
+            column: normalize_identifier(right)?,
+            op: op.flipped(),
+            value,
+        });
+    }
+    Err(ParseError::InvalidRelationalSql)
 }
 
 fn parse_select_filters(input: &str) -> Result<Vec<SelectFilter>, ParseError> {
@@ -8110,6 +8134,34 @@ mod tests {
 
         assert_eq!(
             parse_command("SELECT name FROM people WHERE id >= 2 ORDER BY id LIMIT 5").unwrap(),
+            Command::Select(Select {
+                table: "people".to_string(),
+                projection: SelectProjection::Columns(vec!["name".to_string()]),
+                filter: Some(SelectFilter {
+                    column: "id".to_string(),
+                    op: SelectFilterOp::Gte,
+                    value: SqlValue::Int4(2),
+                }),
+                filters: vec![SelectFilter {
+                    column: "id".to_string(),
+                    op: SelectFilterOp::Gte,
+                    value: SqlValue::Int4(2),
+                }],
+                filter_groups: vec![vec![SelectFilter {
+                    column: "id".to_string(),
+                    op: SelectFilterOp::Gte,
+                    value: SqlValue::Int4(2),
+                }]],
+                order_by: Some(SelectOrder {
+                    column: "id".to_string(),
+                    descending: false,
+                }),
+                limit: Some(5),
+            })
+        );
+
+        assert_eq!(
+            parse_command("SELECT name FROM people WHERE 2 <= id ORDER BY id LIMIT 5").unwrap(),
             Command::Select(Select {
                 table: "people".to_string(),
                 projection: SelectProjection::Columns(vec!["name".to_string()]),

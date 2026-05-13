@@ -4114,6 +4114,22 @@ fn infer_select_parameter_type_oids(session: &Session, query: &str) -> Option<Ve
                 }
                 rest = &rest[pos + needle.len()..];
             }
+            let suffix = format!(" {op} {}", column.def.name);
+            let mut rest = where_clause.as_str();
+            while let Some(pos) = rest.find('$') {
+                let digits = rest[pos + 1..]
+                    .chars()
+                    .take_while(|ch| ch.is_ascii_digit())
+                    .collect::<String>();
+                if !digits.is_empty() && rest[pos + 1 + digits.len()..].starts_with(&suffix) {
+                    if let Ok(idx) = digits.parse::<usize>() {
+                        if idx > 0 && idx <= oids.len() {
+                            oids[idx - 1] = column.def.ty.postgres_oid();
+                        }
+                    }
+                }
+                rest = &rest[pos + 1..];
+            }
         }
     }
 
@@ -7057,6 +7073,14 @@ mod tests {
             resolve_prepared_parameter_type_oids(
                 &session,
                 "SELECT id FROM people WHERE id > $1 AND name = $2 LIMIT $3",
+                Vec::new(),
+            ),
+            vec![23, 25, 23]
+        );
+        assert_eq!(
+            resolve_prepared_parameter_type_oids(
+                &session,
+                "SELECT id FROM people WHERE $1 <= id AND $2 = name LIMIT $3",
                 Vec::new(),
             ),
             vec![23, 25, 23]
