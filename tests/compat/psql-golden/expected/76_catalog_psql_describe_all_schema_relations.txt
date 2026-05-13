@@ -1,0 +1,14 @@
+=== psql all-schema relation describe ===
+CREATE TABLE
+CREATE TABLE
+     Table "public.all_schema_describe_people"
+ Column |  Type   | Collation | Nullable | Default
+--------+---------+-----------+----------+---------
+ id     | integer |           |          |
+ name   | text    |           |          |
+
+       Table "public.all_schema_describe_teams"
+  Column   |  Type   | Collation | Nullable | Default
+-----------+---------+-----------+----------+---------
+ team_id   | integer |           |          |
+ team_name | text    |           |          |

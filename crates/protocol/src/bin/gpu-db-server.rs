@@ -1517,7 +1517,9 @@ fn execute_statement(
             &catalog_psql_describe_type_verbose_rows_for_supported_types(),
         );
     }
-    if catalog_describe_relation_lookup_query_public_namespace(&canonical) {
+    if catalog_describe_relation_lookup_query_all_schemas(&canonical)
+        || catalog_describe_relation_lookup_query_public_namespace(&canonical)
+    {
         return write_single_row(
             stream,
             &[
@@ -2815,6 +2817,11 @@ fn catalog_describe_relation_lookup_query_table(canonical: &str) -> Option<Strin
 fn catalog_describe_relation_lookup_query_public_namespace(canonical: &str) -> bool {
     canonical
         == "select c.oid, n.nspname, c.relname from pg_catalog.pg_class c left join pg_catalog.pg_namespace n on n.oid = c.relnamespace where n.nspname operator(pg_catalog.~) '^(public)$' collate pg_catalog.default order by 2, 3"
+}
+
+fn catalog_describe_relation_lookup_query_all_schemas(canonical: &str) -> bool {
+    canonical
+        == "select c.oid, n.nspname, c.relname from pg_catalog.pg_class c left join pg_catalog.pg_namespace n on n.oid = c.relnamespace order by 2, 3"
 }
 
 fn catalog_describe_relation_lookup_rows(
@@ -4642,6 +4649,9 @@ mod tests {
         );
         assert!(catalog_describe_relation_lookup_query_public_namespace(
             "select c.oid, n.nspname, c.relname from pg_catalog.pg_class c left join pg_catalog.pg_namespace n on n.oid = c.relnamespace where n.nspname operator(pg_catalog.~) '^(public)$' collate pg_catalog.default order by 2, 3"
+        ));
+        assert!(catalog_describe_relation_lookup_query_all_schemas(
+            "select c.oid, n.nspname, c.relname from pg_catalog.pg_class c left join pg_catalog.pg_namespace n on n.oid = c.relnamespace order by 2, 3"
         ));
         assert_eq!(
             catalog_describe_relation_lookup_rows(&session, "people"),

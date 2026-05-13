@@ -72,5 +72,6 @@ When `PSQL_GOLDEN_BOOT_CMD` is set, the harness starts the target service itself
 - Scenario 73 covers a common `information_schema.tables` base-table discovery probe with system-schema exclusion, returning supported `public` session tables from catalog metadata.
 - Scenario 74 covers a common `information_schema.columns` column-discovery probe with system-schema exclusion, returning supported `public` session-table columns from catalog metadata.
 - Scenario 75 covers real PostgreSQL 16 `psql \dt *.*` and `\dt+ *.*` all-schema table-listing traffic, returning supported `public` session tables from catalog metadata while keeping unsupported schemas out of scope.
+- Scenario 76 covers real PostgreSQL 16 `psql \d *.*` all-schema relation-description traffic, returning supported `public` session-table relation rows and reusing metadata-backed per-table describe probes while keeping unsupported schemas out of scope.
 - CI now boots the repo-local compatibility endpoint with `cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen 127.0.0.1:55432` before running the suite, so Q4 has a real service endpoint instead of a manual-only placeholder.
 - If a wire-level extended-query flow is intentionally unsupported, encode that as an explicit expected failure in a dedicated scenario and set the expected `.rc` artifact.
