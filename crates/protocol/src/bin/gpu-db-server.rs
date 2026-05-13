@@ -4788,6 +4788,122 @@ mod tests {
     }
 
     #[test]
+    fn frontend_copy_done_error_skips_until_sync_and_recovers() {
+        let mut session = Session::default();
+        let mut extended_error_pending = false;
+        let (mut writer, mut reader) = tcp_pair();
+
+        assert!(handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::CopyDone
+        )
+        .unwrap());
+        let messages = read_backend_messages(&mut reader, 1);
+        assert_eq!(messages[0].0, b'E');
+        assert_eq!(
+            error_field_value(&messages[0].1, b'C'),
+            Some("0A000".to_string())
+        );
+        assert_eq!(
+            error_field_value(&messages[0].1, b'M'),
+            Some(
+                "frontend COPY data flow is not supported by the compatibility endpoint"
+                    .to_string()
+            )
+        );
+        assert!(extended_error_pending);
+
+        assert!(handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::SimpleQuery("CREATE TABLE skipped_copy_done (id INT)".to_string())
+        )
+        .unwrap());
+        assert!(!session.tables.contains_key("skipped_copy_done"));
+
+        assert!(handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::Sync
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'Z']);
+        assert!(!extended_error_pending);
+
+        assert!(handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::SimpleQuery("CREATE TABLE recovered_copy_done (id INT)".to_string())
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 2), vec![b'C', b'Z']);
+        assert!(session.tables.contains_key("recovered_copy_done"));
+    }
+
+    #[test]
+    fn frontend_copy_fail_error_skips_until_sync_and_recovers() {
+        let mut session = Session::default();
+        let mut extended_error_pending = false;
+        let (mut writer, mut reader) = tcp_pair();
+
+        assert!(handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::CopyFail("client aborted copy".to_string())
+        )
+        .unwrap());
+        let messages = read_backend_messages(&mut reader, 1);
+        assert_eq!(messages[0].0, b'E');
+        assert_eq!(
+            error_field_value(&messages[0].1, b'C'),
+            Some("0A000".to_string())
+        );
+        assert_eq!(
+            error_field_value(&messages[0].1, b'M'),
+            Some(
+                "frontend COPY data flow is not supported by the compatibility endpoint"
+                    .to_string()
+            )
+        );
+        assert!(extended_error_pending);
+
+        assert!(handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::SimpleQuery("CREATE TABLE skipped_copy_fail (id INT)".to_string())
+        )
+        .unwrap());
+        assert!(!session.tables.contains_key("skipped_copy_fail"));
+
+        assert!(handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::Sync
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'Z']);
+        assert!(!extended_error_pending);
+
+        assert!(handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::SimpleQuery("CREATE TABLE recovered_copy_fail (id INT)".to_string())
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 2), vec![b'C', b'Z']);
+        assert!(session.tables.contains_key("recovered_copy_fail"));
+    }
+
+    #[test]
     fn catalog_helpers_expose_session_tables_and_columns() {
         let mut session = Session::default();
         session.tables.insert(
