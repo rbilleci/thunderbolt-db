@@ -4263,6 +4263,7 @@ fn push_placeholder_replaced_fragment(
     target_index: &str,
     literal: &str,
 ) {
+    let target_index = target_index.parse::<usize>().ok();
     let mut token_start = 0;
     let mut chars = fragment.char_indices().peekable();
 
@@ -4286,7 +4287,8 @@ fn push_placeholder_replaced_fragment(
         }
 
         rewritten.push_str(&fragment[token_start..idx]);
-        if &fragment[digit_start..digit_end] == target_index {
+        let placeholder_index = fragment[digit_start..digit_end].parse::<usize>().ok();
+        if placeholder_index == target_index {
             rewritten.push_str(literal);
         } else {
             rewritten.push_str(&fragment[idx..digit_end]);
@@ -6741,6 +6743,33 @@ mod tests {
         assert_eq!(
             bind_query_parameters(&query, &parameters),
             Ok("SELECT id FROM people WHERE id = 1 OR id = 10 ORDER BY id LIMIT 11".to_string())
+        );
+    }
+
+    #[test]
+    fn extended_parameter_binding_matches_zero_padded_nonzero_placeholders() {
+        let query = PreparedQuery {
+            query: "SELECT id FROM people WHERE id = $01 OR id = $002 ORDER BY id LIMIT $0003"
+                .to_string(),
+            parameter_type_oids: vec![23, 23, 23],
+        };
+
+        assert_eq!(max_placeholder_index(&query.query), 3);
+        assert!(!contains_zero_placeholder(&query.query));
+        assert_eq!(
+            replace_unquoted_placeholder(&query.query, "$1", "7"),
+            "SELECT id FROM people WHERE id = 7 OR id = $002 ORDER BY id LIMIT $0003"
+        );
+        assert_eq!(
+            bind_query_parameters(
+                &query,
+                &[
+                    Some("1".to_string()),
+                    Some("2".to_string()),
+                    Some("2".to_string()),
+                ],
+            ),
+            Ok("SELECT id FROM people WHERE id = 1 OR id = 2 ORDER BY id LIMIT 2".to_string())
         );
     }
 
