@@ -7294,6 +7294,122 @@ mod tests {
     }
 
     #[test]
+    fn extended_bind_binary_format_error_skips_until_sync_and_recovers() {
+        let mut session = Session::default();
+        session.tables.insert(
+            "people".to_string(),
+            Table {
+                oid: FIRST_USER_RELATION_OID,
+                name: "people".to_string(),
+                columns: vec![
+                    CatalogColumn {
+                        attnum: 1,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "id".to_string(),
+                            ty: SqlType::Int4,
+                        },
+                    },
+                    CatalogColumn {
+                        attnum: 2,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "name".to_string(),
+                            ty: SqlType::Text,
+                        },
+                    },
+                ],
+                rows: vec![vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())]],
+            },
+        );
+        session.replace_extended_statement(
+            "lookup".to_string(),
+            PreparedQuery {
+                query: "SELECT name FROM people WHERE id = $1".to_string(),
+                parameter_type_oids: vec![23],
+            },
+        );
+        let (mut writer, mut reader) = tcp_pair();
+        let mut extended_error_pending = false;
+
+        handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::Bind {
+                portal_name: "binary_portal".to_string(),
+                statement_name: "lookup".to_string(),
+                parameter_format_codes: vec![1],
+                parameters: vec![Some(1_i32.to_be_bytes().to_vec())],
+                result_format_codes: Vec::new(),
+            },
+        )
+        .unwrap();
+        let messages = read_backend_messages(&mut reader, 1);
+        assert_eq!(messages[0].0, b'E');
+        assert_eq!(
+            error_field_value(&messages[0].1, b'C'),
+            Some("0A000".to_string())
+        );
+        assert_eq!(
+            error_field_value(&messages[0].1, b'M'),
+            Some("only text format parameters and results are supported".to_string())
+        );
+        assert!(extended_error_pending);
+        assert!(!session.portals.contains_key("binary_portal"));
+
+        handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::SimpleQuery("CREATE TABLE skipped_binary_bind (id INT)".to_string()),
+        )
+        .unwrap();
+        assert!(!session.tables.contains_key("skipped_binary_bind"));
+
+        handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::Sync,
+        )
+        .unwrap();
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'Z']);
+        assert!(!extended_error_pending);
+
+        handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::Bind {
+                portal_name: "text_portal".to_string(),
+                statement_name: "lookup".to_string(),
+                parameter_format_codes: Vec::new(),
+                parameters: vec![Some(b"1".to_vec())],
+                result_format_codes: Vec::new(),
+            },
+        )
+        .unwrap();
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'2']);
+        assert!(session.portals.contains_key("text_portal"));
+
+        handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::Execute {
+                portal_name: "text_portal".to_string(),
+                max_rows: 0,
+            },
+        )
+        .unwrap();
+        let messages = read_backend_messages(&mut reader, 3);
+        assert_eq!(
+            messages.iter().map(|(tag, _)| *tag).collect::<Vec<_>>(),
+            vec![b'T', b'D', b'C']
+        );
+        assert_eq!(messages[2].1, b"SELECT 1\0".to_vec());
+    }
+
+    #[test]
     fn extended_bind_validates_result_format_code_count_for_select_columns() {
         let mut session = Session::default();
         session.tables.insert(

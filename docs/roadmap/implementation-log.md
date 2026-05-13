@@ -1,5 +1,6 @@
 # Implementation Log
 
+- 2026-05-13: Tightened P3 unsupported binary `Bind` recovery. Raw extended `Bind` frames that request binary parameter format now return stable `0A000`, do not install the portal, skip later messages until `Sync`, and recover to text-format Bind/Execute traffic over the supported relational `SELECT` subset.
 - 2026-05-13: Tightened P3 frontend COPY terminator recovery. Raw `CopyDone` and `CopyFail` frames now have the same helper-level recovery proof as `CopyData`: stable `0A000` unsupported-feature `ErrorResponse`, skip-until-`Sync` behavior, skipped side effects, and later supported SQL recovery while COPY execution remains out of scope.
 - 2026-05-13: Tightened P3 frontend FunctionCall recovery. Raw `FunctionCall` frames now have helper-level coverage proving a stable `0A000` unsupported-feature `ErrorResponse`, skip-until-`Sync` behavior, skipped side effects, and later supported SQL recovery; frontend `CopyDone`/`CopyFail` now share the same explicit unsupported COPY data-flow message as `CopyData`.
 - 2026-05-13: Tightened P3 frontend COPY data-flow recovery. Raw `CopyData` frames now have helper-level coverage proving a stable `0A000` unsupported-feature `ErrorResponse`, skip-until-`Sync` behavior, and later supported SQL recovery; this pins the wire path that PostgreSQL 16 `psql` does not emit outside active COPY mode.
