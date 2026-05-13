@@ -1,0 +1,16 @@
+=== psql extended text bind apostrophe escaping ===
+CREATE TABLE
+INSERT 0 3
+ id
+----
+  2
+(1 row)
+
+ id
+----
+(0 rows)
+
+ name
+-------
+ Grace
+(1 row)

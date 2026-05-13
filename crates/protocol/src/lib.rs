@@ -1788,10 +1788,12 @@ fn find_matching_paren(input: &str, open: usize) -> Option<usize> {
     let mut depth = 0usize;
     let mut in_quote = false;
     let bytes = input.as_bytes();
-    for idx in open..bytes.len() {
+    let mut idx = open;
+    while idx < bytes.len() {
         match bytes[idx] {
             b'\'' => {
                 if in_quote && bytes.get(idx + 1) == Some(&b'\'') {
+                    idx += 2;
                     continue;
                 }
                 in_quote = !in_quote;
@@ -1805,6 +1807,7 @@ fn find_matching_paren(input: &str, open: usize) -> Option<usize> {
             }
             _ => {}
         }
+        idx += 1;
     }
     None
 }
@@ -8065,6 +8068,18 @@ mod tests {
         );
 
         assert_eq!(
+            parse_command("INSERT INTO people (id, name) VALUES (1, 'O''Brien')").unwrap(),
+            Command::Insert(Insert {
+                table: "people".to_string(),
+                columns: vec!["id".to_string(), "name".to_string()],
+                rows: vec![vec![
+                    SqlValue::Int4(1),
+                    SqlValue::Text("O'Brien".to_string())
+                ]],
+            })
+        );
+
+        assert_eq!(
             parse_command("SELECT id, name FROM people WHERE id = 1 ORDER BY name DESC LIMIT 5")
                 .unwrap(),
             Command::Select(Select {
@@ -8118,6 +8133,31 @@ mod tests {
                     descending: false,
                 }),
                 limit: Some(5),
+            })
+        );
+
+        assert_eq!(
+            parse_command("SELECT name FROM people WHERE name = 'O''Brien'").unwrap(),
+            Command::Select(Select {
+                table: "people".to_string(),
+                projection: SelectProjection::Columns(vec!["name".to_string()]),
+                filter: Some(SelectFilter {
+                    column: "name".to_string(),
+                    op: SelectFilterOp::Eq,
+                    value: SqlValue::Text("O'Brien".to_string()),
+                }),
+                filters: vec![SelectFilter {
+                    column: "name".to_string(),
+                    op: SelectFilterOp::Eq,
+                    value: SqlValue::Text("O'Brien".to_string()),
+                }],
+                filter_groups: vec![vec![SelectFilter {
+                    column: "name".to_string(),
+                    op: SelectFilterOp::Eq,
+                    value: SqlValue::Text("O'Brien".to_string()),
+                }]],
+                order_by: None,
+                limit: None,
             })
         );
 
