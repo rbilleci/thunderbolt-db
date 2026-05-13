@@ -263,6 +263,17 @@ impl Session {
             }
         }
     }
+
+    fn replace_extended_statement(&mut self, name: String, query: PreparedQuery) {
+        self.prepared
+            .insert(name.clone(), PreparedStatement::Extended(query));
+        self.portals
+            .retain(|_, portal| portal.statement_name != name);
+    }
+
+    fn replace_extended_portal(&mut self, name: String, portal: Portal) {
+        self.portals.insert(name, portal);
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -600,6 +611,17 @@ fn handle_parse(
     query: String,
     parameter_type_oids: Vec<u32>,
 ) -> io::Result<bool> {
+    if !statement_name.is_empty() && session.prepared.contains_key(&statement_name) {
+        write_error(
+            stream,
+            &ErrorField {
+                code: "42P05",
+                message: "prepared statement already exists",
+                position: None,
+            },
+        )?;
+        return Ok(true);
+    }
     if parameter_type_oids
         .iter()
         .copied()
@@ -617,12 +639,12 @@ fn handle_parse(
     }
     let parameter_type_oids =
         resolve_prepared_parameter_type_oids(session, &query, parameter_type_oids);
-    session.prepared.insert(
+    session.replace_extended_statement(
         statement_name,
-        PreparedStatement::Extended(PreparedQuery {
+        PreparedQuery {
             query,
             parameter_type_oids,
-        }),
+        },
     );
     write_parse_complete(stream)?;
     Ok(false)
@@ -645,6 +667,17 @@ fn handle_bind(
             &ErrorField {
                 code: "0A000",
                 message: "only text format parameters and results are supported",
+                position: None,
+            },
+        )?;
+        return Ok(true);
+    }
+    if !portal_name.is_empty() && session.portals.contains_key(&portal_name) {
+        write_error(
+            stream,
+            &ErrorField {
+                code: "42P03",
+                message: "portal already exists",
                 position: None,
             },
         )?;
@@ -673,7 +706,7 @@ fn handle_bind(
             None => None,
         });
     }
-    session.portals.insert(
+    session.replace_extended_portal(
         portal_name,
         Portal {
             statement_name,
@@ -6234,6 +6267,131 @@ mod tests {
         session.close_extended_target(DescribeTarget::Statement, "lookup");
         assert!(!session.prepared.contains_key("lookup"));
         assert!(!session.portals.contains_key("lookup_portal"));
+    }
+
+    #[test]
+    fn extended_parse_rejects_named_duplicates_and_replaces_unnamed_state() {
+        let mut session = Session::default();
+        let first = PreparedQuery {
+            query: "SELECT id FROM people".to_string(),
+            parameter_type_oids: Vec::new(),
+        };
+        session.replace_extended_statement("named".to_string(), first.clone());
+        let (mut writer, mut reader) = tcp_pair();
+
+        assert!(handle_parse(
+            &mut writer,
+            &mut session,
+            "named".to_string(),
+            "SELECT name FROM people".to_string(),
+            Vec::new()
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'E']);
+        assert_eq!(
+            session.prepared.get("named"),
+            Some(&PreparedStatement::Extended(first))
+        );
+
+        let unnamed = PreparedQuery {
+            query: "SELECT id FROM people WHERE id = $1".to_string(),
+            parameter_type_oids: vec![23],
+        };
+        session.replace_extended_statement(String::new(), unnamed);
+        session.replace_extended_portal(
+            String::new(),
+            Portal {
+                statement_name: String::new(),
+                query: PreparedQuery {
+                    query: "SELECT id FROM people WHERE id = $1".to_string(),
+                    parameter_type_oids: vec![23],
+                },
+                parameters: vec![Some("1".to_string())],
+                described: false,
+                result: None,
+                position: 0,
+            },
+        );
+
+        assert!(!handle_parse(
+            &mut writer,
+            &mut session,
+            String::new(),
+            "SELECT name FROM people WHERE name = $1".to_string(),
+            vec![25]
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'1']);
+        assert!(!session.portals.contains_key(""));
+        assert_eq!(
+            session.prepared.get(""),
+            Some(&PreparedStatement::Extended(PreparedQuery {
+                query: "SELECT name FROM people WHERE name = $1".to_string(),
+                parameter_type_oids: vec![25],
+            }))
+        );
+    }
+
+    #[test]
+    fn extended_bind_rejects_named_duplicate_portals_and_replaces_unnamed_portal() {
+        let mut session = Session::default();
+        let query = PreparedQuery {
+            query: "SELECT name FROM people WHERE id = $1".to_string(),
+            parameter_type_oids: vec![23],
+        };
+        session.replace_extended_statement("lookup".to_string(), query.clone());
+        session.replace_extended_portal(
+            "named_portal".to_string(),
+            Portal {
+                statement_name: "lookup".to_string(),
+                query: query.clone(),
+                parameters: vec![Some("1".to_string())],
+                described: false,
+                result: None,
+                position: 0,
+            },
+        );
+        let (mut writer, mut reader) = tcp_pair();
+
+        assert!(handle_bind(
+            &mut writer,
+            &mut session,
+            "named_portal".to_string(),
+            "lookup".to_string(),
+            Vec::new(),
+            vec![Some(b"2".to_vec())],
+            Vec::new()
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'E']);
+        assert_eq!(
+            session
+                .portals
+                .get("named_portal")
+                .and_then(|portal| portal.parameters.first())
+                .cloned(),
+            Some(Some("1".to_string()))
+        );
+
+        assert!(!handle_bind(
+            &mut writer,
+            &mut session,
+            String::new(),
+            "lookup".to_string(),
+            Vec::new(),
+            vec![Some(b"2".to_vec())],
+            Vec::new()
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'2']);
+        assert_eq!(
+            session
+                .portals
+                .get("")
+                .and_then(|portal| portal.parameters.first())
+                .cloned(),
+            Some(Some("2".to_string()))
+        );
     }
 
     #[test]
