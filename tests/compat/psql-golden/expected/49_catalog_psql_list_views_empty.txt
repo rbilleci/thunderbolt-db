@@ -1,0 +1,4 @@
+=== catalog psql list views empty ===
+CREATE TABLE
+psql:49_catalog_psql_list_views_empty.sql:3: error: Did not find any relations.
+psql:49_catalog_psql_list_views_empty.sql:4: error: Did not find any relations.
