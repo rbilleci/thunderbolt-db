@@ -3,6 +3,7 @@
 ## 2026-05-13
 
 ### PostgreSQL-compatible product loop
+- Advanced P2 catalog/schema/type spine by supporting a common `information_schema.columns` column-discovery probe that filters out PostgreSQL system schemas. The compatibility endpoint now returns supported `public` session-table columns from catalog metadata for client/ORM discovery without inventing broader schema or type coverage.
 - Advanced P2 catalog/schema/type spine by supporting a common `information_schema.tables` base-table discovery probe that filters out PostgreSQL system schemas. The compatibility endpoint now returns supported `public` session tables from catalog metadata for `table_type = 'BASE TABLE'` client discovery without inventing broader relation kinds.
 - Advanced P2 catalog/schema/type spine by supporting a common `pg_catalog.pg_views` client probe for the supported `public` schema. The compatibility endpoint now accepts the PostgreSQL catalog view discovery shape and truthfully returns no rows for the current no-SQL-view subset while keeping view definitions and view DDL out of scope.
 - Advanced P2 catalog/schema/type spine by supporting a common `information_schema.views` client probe for the supported `public` schema. The compatibility endpoint now accepts the view metadata projection used by common clients and truthfully returns no rows for the current no-SQL-view subset while keeping view definitions and view DDL out of scope.

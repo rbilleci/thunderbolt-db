@@ -1818,6 +1818,19 @@ fn execute_statement(
             &information_schema_all_column_rows(session),
         );
     }
+    if canonical == information_schema_column_discovery_query() {
+        return write_single_row(
+            stream,
+            &[
+                text_column("table_schema"),
+                text_column("table_name"),
+                text_column("column_name"),
+                int4_column("ordinal_position"),
+                text_column("data_type"),
+            ],
+            &information_schema_all_column_rows(session),
+        );
+    }
     if let Some(tables) = information_schema_columns_in_query_tables(&canonical) {
         return write_single_row(
             stream,
@@ -3304,6 +3317,10 @@ fn information_schema_column_rows(session: &Session, table: &str) -> Vec<Vec<Opt
 
 fn information_schema_all_columns_query() -> &'static str {
     "select table_schema, table_name, column_name, ordinal_position, data_type from information_schema.columns where table_schema = 'public' order by table_name, ordinal_position"
+}
+
+fn information_schema_column_discovery_query() -> &'static str {
+    "select table_schema, table_name, column_name, ordinal_position, data_type from information_schema.columns where table_schema not in ('pg_catalog', 'information_schema') order by table_schema, table_name, ordinal_position"
 }
 
 fn information_schema_all_column_rows(session: &Session) -> Vec<Vec<Option<String>>> {
@@ -5071,6 +5088,10 @@ mod tests {
         assert_eq!(
             information_schema_all_columns_query(),
             "select table_schema, table_name, column_name, ordinal_position, data_type from information_schema.columns where table_schema = 'public' order by table_name, ordinal_position"
+        );
+        assert_eq!(
+            information_schema_column_discovery_query(),
+            "select table_schema, table_name, column_name, ordinal_position, data_type from information_schema.columns where table_schema not in ('pg_catalog', 'information_schema') order by table_schema, table_name, ordinal_position"
         );
         assert_eq!(
             information_schema_all_column_rows(&session),

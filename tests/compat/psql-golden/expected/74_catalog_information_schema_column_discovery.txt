@@ -1,0 +1,9 @@
+=== information_schema column discovery ===
+CREATE TABLE
+CREATE TABLE
+ table_schema |         table_name         | column_name | ordinal_position | data_type
+--------------+----------------------------+-------------+------------------+-----------
+ public       | is_column_discovery_people | id          |                1 | integer
+ public       | is_column_discovery_people | name        |                2 | text
+ public       | is_column_discovery_teams  | team_id     |                1 | integer
+(3 rows)
