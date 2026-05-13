@@ -1,0 +1,5 @@
+=== psql list collations empty ===
+                                  List of collations
+ Schema | Name | Provider | Collate | Ctype | ICU Locale | ICU Rules | Deterministic?
+--------+------+----------+---------+-------+------------+-----------+----------------
+(0 rows)
