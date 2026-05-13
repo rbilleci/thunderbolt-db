@@ -693,6 +693,17 @@ fn handle_bind(
         return Ok(true);
     };
     let query = query.clone();
+    if !portal_name.is_empty() && session.portals.contains_key(&portal_name) {
+        write_error(
+            stream,
+            &ErrorField {
+                code: "42P03",
+                message: "portal already exists",
+                position: None,
+            },
+        )?;
+        return Ok(true);
+    }
     if parameter_format_codes.iter().any(|code| *code != 0)
         || result_format_codes.iter().any(|code| *code != 0)
     {
@@ -750,17 +761,6 @@ fn handle_bind(
             )?;
             return Ok(true);
         }
-    }
-    if !portal_name.is_empty() && session.portals.contains_key(&portal_name) {
-        write_error(
-            stream,
-            &ErrorField {
-                code: "42P03",
-                message: "portal already exists",
-                position: None,
-            },
-        )?;
-        return Ok(true);
     }
     let mut decoded = Vec::with_capacity(parameters.len());
     for parameter in parameters {
@@ -6881,6 +6881,66 @@ mod tests {
                 .cloned(),
             Some(Some("2".to_string()))
         );
+    }
+
+    #[test]
+    fn extended_bind_reports_duplicate_portal_before_payload_errors() {
+        let mut session = Session::default();
+        let query = PreparedQuery {
+            query: "SELECT name FROM people WHERE id = $1".to_string(),
+            parameter_type_oids: vec![23],
+        };
+        session.replace_extended_statement("lookup".to_string(), query.clone());
+        session.replace_extended_portal(
+            "lookup_portal".to_string(),
+            Portal {
+                statement_name: "lookup".to_string(),
+                query,
+                parameters: vec![Some("1".to_string())],
+                described: false,
+                result: None,
+                position: 0,
+            },
+        );
+        let (mut writer, mut reader) = tcp_pair();
+
+        assert!(handle_bind(
+            &mut writer,
+            &mut session,
+            "lookup_portal".to_string(),
+            "lookup".to_string(),
+            vec![1],
+            vec![None],
+            vec![1]
+        )
+        .unwrap());
+        let messages = read_backend_messages(&mut reader, 1);
+        assert_eq!(messages[0].0, b'E');
+        assert_eq!(
+            error_field_value(&messages[0].1, b'C'),
+            Some("42P03".to_string())
+        );
+        assert_eq!(
+            session
+                .portals
+                .get("lookup_portal")
+                .and_then(|portal| portal.parameters.first())
+                .cloned(),
+            Some(Some("1".to_string()))
+        );
+
+        assert!(!handle_bind(
+            &mut writer,
+            &mut session,
+            "fresh_portal".to_string(),
+            "lookup".to_string(),
+            Vec::new(),
+            vec![Some(b"2".to_vec())],
+            Vec::new()
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'2']);
+        assert!(session.portals.contains_key("fresh_portal"));
     }
 
     #[test]
