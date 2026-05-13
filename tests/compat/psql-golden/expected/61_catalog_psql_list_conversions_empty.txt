@@ -1,0 +1,5 @@
+=== catalog psql list conversions empty ===
+               List of conversions
+ Schema | Name | Source | Destination | Default?
+--------+------+--------+-------------+----------
+(0 rows)
