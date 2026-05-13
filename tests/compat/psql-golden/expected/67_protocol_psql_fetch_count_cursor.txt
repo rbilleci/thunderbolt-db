@@ -1,0 +1,9 @@
+=== psql fetch count cursor flow ===
+CREATE TABLE
+INSERT 0 3
+ id | name
+----+-------
+  1 | Ada
+  2 | Linus
+  3 | Grace
+(3 rows)

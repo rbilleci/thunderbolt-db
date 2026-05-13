@@ -128,6 +128,95 @@ fn row_matches_select_filters(
     Ok(false)
 }
 
+fn execute_select_result(
+    session: &Session,
+    select: &gpu_db_protocol::Select,
+) -> Result<SelectResult, ErrorField> {
+    let Some(table) = session.tables.get(&select.table) else {
+        return Err(ErrorField {
+            code: "42P01",
+            message: "relation does not exist",
+            position: None,
+        });
+    };
+    let selected_columns = match &select.projection {
+        SelectProjection::All => table.columns.clone(),
+        SelectProjection::Columns(columns) => {
+            let mut selected = Vec::with_capacity(columns.len());
+            for column in columns {
+                let Some(def) = table
+                    .columns
+                    .iter()
+                    .find(|candidate| candidate.def.name == *column)
+                else {
+                    return Err(ErrorField {
+                        code: "42703",
+                        message: "column does not exist",
+                        position: None,
+                    });
+                };
+                selected.push(def.clone());
+            }
+            selected
+        }
+    };
+    let mut rows = Vec::new();
+    for row in &table.rows {
+        match row_matches_select_filters(table, row, select) {
+            Ok(true) => rows.push(row.clone()),
+            Ok(false) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    if let Some(order) = &select.order_by {
+        let Some(idx) = table
+            .columns
+            .iter()
+            .position(|column| column.def.name == order.column)
+        else {
+            return Err(ErrorField {
+                code: "42703",
+                message: "column does not exist",
+                position: None,
+            });
+        };
+        rows.sort_by(|left, right| compare_sql_values(&left[idx], &right[idx]));
+        if order.descending {
+            rows.reverse();
+        }
+    }
+    if let Some(limit) = select.limit {
+        rows.truncate(limit);
+    }
+    let selected_indexes = selected_columns
+        .iter()
+        .map(|selected| {
+            table
+                .columns
+                .iter()
+                .position(|column| column.def.name == selected.def.name)
+                .expect("selected column came from table")
+        })
+        .collect::<Vec<_>>();
+    let columns = selected_columns
+        .iter()
+        .map(|column| match column.def.ty {
+            gpu_db_protocol::SqlType::Int4 => int4_column(&column.def.name),
+            gpu_db_protocol::SqlType::Text => text_column(&column.def.name),
+        })
+        .collect::<Vec<_>>();
+    let rows = rows
+        .iter()
+        .map(|row| {
+            selected_indexes
+                .iter()
+                .map(|idx| Some(format_sql_value(&row[*idx])))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    Ok(SelectResult { columns, rows })
+}
+
 fn format_sql_value(value: &SqlValue) -> String {
     match value {
         SqlValue::Int4(value) => value.to_string(),
@@ -143,6 +232,7 @@ struct Session {
     in_transaction: bool,
     prepared: HashMap<String, PreparedStatement>,
     portals: HashMap<String, Portal>,
+    cursors: HashMap<String, Cursor>,
     tables: HashMap<String, Table>,
     next_relation_oid: u32,
 }
@@ -153,6 +243,7 @@ impl Default for Session {
             in_transaction: false,
             prepared: HashMap::new(),
             portals: HashMap::new(),
+            cursors: HashMap::new(),
             tables: HashMap::new(),
             next_relation_oid: FIRST_USER_RELATION_OID,
         }
@@ -206,6 +297,19 @@ struct Portal {
     query: PreparedQuery,
     parameters: Vec<Option<String>>,
     described: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Cursor {
+    columns: Vec<Column>,
+    rows: Vec<Vec<Option<String>>>,
+    position: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SelectResult {
+    columns: Vec<Column>,
+    rows: Vec<Vec<Option<String>>>,
 }
 
 const FIRST_USER_RELATION_OID: u32 = 16_384;
@@ -643,12 +747,128 @@ fn handle_close(
     write_close_complete(stream)
 }
 
+fn parse_declare_cursor(statement: &str) -> Option<(String, String)> {
+    let canonical = canonical_sql(statement.trim().trim_end_matches(';').trim());
+    let rest = canonical.strip_prefix("declare ")?;
+    for marker in [" no scroll cursor for ", " cursor for "] {
+        if let Some(idx) = rest.find(marker) {
+            let name = rest[..idx].trim();
+            let query_start = "declare ".len() + idx + marker.len();
+            let query = canonical[query_start..].trim();
+            if !name.is_empty() && !query.is_empty() {
+                return Some((name.to_string(), query.to_string()));
+            }
+        }
+    }
+    None
+}
+
+fn parse_fetch_forward(statement: &str) -> Option<(String, usize)> {
+    let trimmed = statement.trim().trim_end_matches(';').trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let rest = lower.strip_prefix("fetch forward ")?;
+    let from_idx = rest.find(" from ")?;
+    let count = rest[..from_idx].trim().parse::<usize>().ok()?;
+    let name_start = "fetch forward ".len() + from_idx + " from ".len();
+    let name = trimmed[name_start..].trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some((name.to_string(), count))
+    }
+}
+
+fn parse_close_cursor(statement: &str) -> Option<String> {
+    let trimmed = statement.trim().trim_end_matches(';').trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let name = lower.strip_prefix("close ")?;
+    if name == "all" {
+        return None;
+    }
+    let original = &trimmed["close ".len()..];
+    if original.trim().is_empty() {
+        None
+    } else {
+        Some(original.trim().to_string())
+    }
+}
+
+fn execute_declare_cursor(
+    stream: &mut TcpStream,
+    session: &mut Session,
+    name: String,
+    query: &str,
+) -> io::Result<()> {
+    let Ok(Command::Select(select)) = parse_command(query) else {
+        return write_error(
+            stream,
+            &ErrorField {
+                code: "0A000",
+                message: "cursor declarations only support relational SELECT",
+                position: None,
+            },
+        );
+    };
+    let result = match execute_select_result(session, &select) {
+        Ok(result) => result,
+        Err(error) => return write_error(stream, &error),
+    };
+    session.cursors.insert(
+        name,
+        Cursor {
+            columns: result.columns,
+            rows: result.rows,
+            position: 0,
+        },
+    );
+    write_command_complete(stream, "DECLARE CURSOR")
+}
+
+fn execute_fetch_forward(
+    stream: &mut TcpStream,
+    session: &mut Session,
+    name: &str,
+    count: usize,
+) -> io::Result<()> {
+    let Some(cursor) = session.cursors.get_mut(name) else {
+        return write_error(
+            stream,
+            &ErrorField {
+                code: "34000",
+                message: "cursor does not exist",
+                position: None,
+            },
+        );
+    };
+    let start = cursor.position;
+    let end = start.saturating_add(count).min(cursor.rows.len());
+    cursor.position = end;
+    write_rows_with_tag(
+        stream,
+        &cursor.columns,
+        &cursor.rows[start..end],
+        true,
+        &format!("FETCH {}", end - start),
+    )
+}
+
 fn execute_statement(
     stream: &mut TcpStream,
     session: &mut Session,
     statement: &str,
     include_row_description: bool,
 ) -> io::Result<()> {
+    if let Some((name, query)) = parse_declare_cursor(statement) {
+        return execute_declare_cursor(stream, session, name, &query);
+    }
+    if let Some((name, count)) = parse_fetch_forward(statement) {
+        return execute_fetch_forward(stream, session, &name, count);
+    }
+    if let Some(name) = parse_close_cursor(statement) {
+        session.cursors.remove(&name);
+        return write_command_complete(stream, "CLOSE CURSOR");
+    }
+
     if let Ok(command) = parse_command(statement) {
         match command {
             Command::CreateTable(create) => {
@@ -767,98 +987,16 @@ fn execute_statement(
                 return write_command_complete(stream, &format!("INSERT 0 {inserted_count}"));
             }
             Command::Select(select) => {
-                let Some(table) = session.tables.get(&select.table) else {
-                    return write_error(
-                        stream,
-                        &ErrorField {
-                            code: "42P01",
-                            message: "relation does not exist",
-                            position: None,
-                        },
-                    );
+                let result = match execute_select_result(session, &select) {
+                    Ok(result) => result,
+                    Err(error) => return write_error(stream, &error),
                 };
-                let selected_columns = match &select.projection {
-                    SelectProjection::All => table.columns.clone(),
-                    SelectProjection::Columns(columns) => {
-                        let mut selected = Vec::with_capacity(columns.len());
-                        for column in columns {
-                            let Some(def) = table
-                                .columns
-                                .iter()
-                                .find(|candidate| candidate.def.name == *column)
-                            else {
-                                return write_error(
-                                    stream,
-                                    &ErrorField {
-                                        code: "42703",
-                                        message: "column does not exist",
-                                        position: None,
-                                    },
-                                );
-                            };
-                            selected.push(def.clone());
-                        }
-                        selected
-                    }
-                };
-                let mut rows = Vec::new();
-                for row in &table.rows {
-                    match row_matches_select_filters(table, row, &select) {
-                        Ok(true) => rows.push(row.clone()),
-                        Ok(false) => {}
-                        Err(error) => return write_error(stream, &error),
-                    }
-                }
-                if let Some(order) = &select.order_by {
-                    let Some(idx) = table
-                        .columns
-                        .iter()
-                        .position(|column| column.def.name == order.column)
-                    else {
-                        return write_error(
-                            stream,
-                            &ErrorField {
-                                code: "42703",
-                                message: "column does not exist",
-                                position: None,
-                            },
-                        );
-                    };
-                    rows.sort_by(|left, right| compare_sql_values(&left[idx], &right[idx]));
-                    if order.descending {
-                        rows.reverse();
-                    }
-                }
-                if let Some(limit) = select.limit {
-                    rows.truncate(limit);
-                }
-                let selected_indexes = selected_columns
-                    .iter()
-                    .map(|selected| {
-                        table
-                            .columns
-                            .iter()
-                            .position(|column| column.def.name == selected.def.name)
-                            .expect("selected column came from table")
-                    })
-                    .collect::<Vec<_>>();
-                let columns = selected_columns
-                    .iter()
-                    .map(|column| match column.def.ty {
-                        gpu_db_protocol::SqlType::Int4 => int4_column(&column.def.name),
-                        gpu_db_protocol::SqlType::Text => text_column(&column.def.name),
-                    })
-                    .collect::<Vec<_>>();
-                let output_rows = rows
-                    .iter()
-                    .map(|row| {
-                        selected_indexes
-                            .iter()
-                            .map(|idx| Some(format_sql_value(&row[*idx])))
-                            .collect::<Vec<_>>()
-                    })
-                    .collect::<Vec<_>>();
-                return write_select_rows(stream, &columns, &output_rows, include_row_description);
+                return write_select_rows(
+                    stream,
+                    &result.columns,
+                    &result.rows,
+                    include_row_description,
+                );
             }
             Command::Begin
             | Command::Commit { .. }
@@ -3690,13 +3828,29 @@ fn write_select_rows(
     rows: &[Vec<Option<String>>],
     include_row_description: bool,
 ) -> io::Result<()> {
+    write_rows_with_tag(
+        stream,
+        columns,
+        rows,
+        include_row_description,
+        &format!("SELECT {}", rows.len()),
+    )
+}
+
+fn write_rows_with_tag(
+    stream: &mut TcpStream,
+    columns: &[Column],
+    rows: &[Vec<Option<String>>],
+    include_row_description: bool,
+    tag: &str,
+) -> io::Result<()> {
     if include_row_description {
         write_row_description(stream, columns)?;
     }
     for row in rows {
         write_data_row(stream, row)?;
     }
-    write_command_complete(stream, &format!("SELECT {}", rows.len()))
+    write_command_complete(stream, tag)
 }
 
 fn write_row_description(stream: &mut TcpStream, columns: &[Column]) -> io::Result<()> {
@@ -5402,6 +5556,72 @@ mod tests {
             )
             .unwrap(),
             vec![text_column("name"), int4_column("id")]
+        );
+    }
+
+    #[test]
+    fn extended_cursor_fetch_count_helpers_use_supported_select_results() {
+        assert_eq!(
+            parse_declare_cursor(
+                "DECLARE _psql_cursor NO SCROLL CURSOR FOR\nSELECT id, name FROM people ORDER BY id"
+            ),
+            Some((
+                "_psql_cursor".to_string(),
+                "select id, name from people order by id".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_fetch_forward("FETCH FORWARD 2 FROM _psql_cursor"),
+            Some(("_psql_cursor".to_string(), 2))
+        );
+        assert_eq!(
+            parse_close_cursor("CLOSE _psql_cursor"),
+            Some("_psql_cursor".to_string())
+        );
+
+        let mut session = Session::default();
+        session.tables.insert(
+            "people".to_string(),
+            Table {
+                oid: FIRST_USER_RELATION_OID,
+                name: "people".to_string(),
+                columns: vec![
+                    CatalogColumn {
+                        attnum: 1,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "id".to_string(),
+                            ty: SqlType::Int4,
+                        },
+                    },
+                    CatalogColumn {
+                        attnum: 2,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "name".to_string(),
+                            ty: SqlType::Text,
+                        },
+                    },
+                ],
+                rows: vec![
+                    vec![SqlValue::Int4(2), SqlValue::Text("Linus".to_string())],
+                    vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())],
+                    vec![SqlValue::Int4(3), SqlValue::Text("Grace".to_string())],
+                ],
+            },
+        );
+        let Command::Select(select) =
+            parse_command("select id, name from people order by id").unwrap()
+        else {
+            panic!("expected supported SELECT");
+        };
+        let result = execute_select_result(&session, &select).unwrap();
+        assert_eq!(result.columns, vec![int4_column("id"), text_column("name")]);
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![Some("1".to_string()), Some("Ada".to_string())],
+                vec![Some("2".to_string()), Some("Linus".to_string())],
+                vec![Some("3".to_string()), Some("Grace".to_string())],
+            ]
         );
     }
 
