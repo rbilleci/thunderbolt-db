@@ -1,0 +1,14 @@
+=== psql extended bind quoted placeholder literals ===
+CREATE TABLE
+INSERT 0 3
+ id | name
+----+-------
+  1 | $1
+  2 | Linus
+(2 rows)
+
+ id | name
+----+-------
+  2 | Linus
+  3 | $2
+(2 rows)

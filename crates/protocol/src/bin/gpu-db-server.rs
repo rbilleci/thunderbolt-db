@@ -4029,7 +4029,7 @@ fn bind_query_parameters(
             value,
             query.parameter_type_oids.get(idx).copied().unwrap_or(0),
         )?;
-        bound = bound.replace(&placeholder, &literal);
+        bound = replace_unquoted_placeholder(&bound, &placeholder, &literal);
     }
     Ok(bound)
 }
@@ -4140,34 +4140,118 @@ fn select_limit_placeholder_index(canonical: &str) -> Option<usize> {
 
 fn max_placeholder_index(query: &str) -> usize {
     let mut max_index = 0;
-    let mut chars = query.char_indices().peekable();
-    while let Some((_, ch)) = chars.next() {
-        if ch != '$' {
-            continue;
-        }
+    for token in unquoted_sql_fragments(query) {
+        let mut chars = token.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch != '$' {
+                continue;
+            }
 
-        let mut value = 0usize;
-        let mut saw_digit = false;
-        while let Some((_, digit)) = chars.peek().copied() {
-            let Some(next) = digit.to_digit(10) else {
-                break;
-            };
-            saw_digit = true;
-            value = value.saturating_mul(10).saturating_add(next as usize);
-            chars.next();
-        }
-        if saw_digit {
-            max_index = max_index.max(value);
+            let mut value = 0usize;
+            let mut saw_digit = false;
+            while let Some(digit) = chars.peek().copied() {
+                let Some(next) = digit.to_digit(10) else {
+                    break;
+                };
+                saw_digit = true;
+                value = value.saturating_mul(10).saturating_add(next as usize);
+                chars.next();
+            }
+            if saw_digit {
+                max_index = max_index.max(value);
+            }
         }
     }
     max_index
 }
 
+fn replace_unquoted_placeholder(query: &str, placeholder: &str, literal: &str) -> String {
+    let mut rewritten = String::with_capacity(query.len());
+    let mut token_start = 0;
+    let mut chars = query.char_indices().peekable();
+    let mut in_quote = false;
+
+    while let Some((idx, ch)) = chars.next() {
+        if ch != '\'' {
+            continue;
+        }
+
+        if in_quote && matches!(chars.peek(), Some((_, '\''))) {
+            chars.next();
+            continue;
+        }
+
+        if in_quote {
+            rewritten.push_str(&query[token_start..=idx]);
+            token_start = idx + ch.len_utf8();
+            in_quote = false;
+        } else {
+            rewritten.push_str(&query[token_start..idx].replace(placeholder, literal));
+            token_start = idx;
+            in_quote = true;
+        }
+    }
+
+    if in_quote {
+        rewritten.push_str(&query[token_start..]);
+    } else {
+        rewritten.push_str(&query[token_start..].replace(placeholder, literal));
+    }
+
+    rewritten
+}
+
+fn unquoted_sql_fragments(query: &str) -> Vec<&str> {
+    let mut fragments = Vec::new();
+    let mut token_start = 0;
+    let mut chars = query.char_indices().peekable();
+    let mut in_quote = false;
+
+    while let Some((idx, ch)) = chars.next() {
+        if ch != '\'' {
+            continue;
+        }
+        if in_quote && matches!(chars.peek(), Some((_, '\''))) {
+            chars.next();
+            continue;
+        }
+
+        if in_quote {
+            token_start = idx + ch.len_utf8();
+            in_quote = false;
+        } else {
+            fragments.push(&query[token_start..idx]);
+            in_quote = true;
+        }
+    }
+
+    if !in_quote {
+        fragments.push(&query[token_start..]);
+    }
+    fragments
+}
+
 fn replace_parameter_placeholders_with_dummy_literals(query: &str) -> String {
     let mut rewritten = String::with_capacity(query.len());
     let mut chars = query.char_indices().peekable();
+    let mut in_quote = false;
     while let Some((_, ch)) = chars.next() {
+        if ch == '\'' {
+            rewritten.push(ch);
+            if in_quote && matches!(chars.peek(), Some((_, '\''))) {
+                if let Some((_, escaped)) = chars.next() {
+                    rewritten.push(escaped);
+                }
+                continue;
+            }
+            in_quote = !in_quote;
+            continue;
+        }
         if ch != '$' {
+            rewritten.push(ch);
+            continue;
+        }
+        if in_quote {
             rewritten.push(ch);
             continue;
         }
@@ -6540,6 +6624,28 @@ mod tests {
         assert_eq!(
             bind_query_parameters(&text_query, &[Some("Ada $1".to_string())]),
             Ok("SELECT id FROM people WHERE name = 'Ada $1'".to_string())
+        );
+    }
+
+    #[test]
+    fn extended_parameter_binding_ignores_quoted_placeholder_literals() {
+        let query = PreparedQuery {
+            query: "SELECT id FROM people WHERE name = '$1' OR name = 'O''$2' OR id = $1"
+                .to_string(),
+            parameter_type_oids: vec![23],
+        };
+
+        assert_eq!(max_placeholder_index(&query.query), 1);
+        assert_eq!(expected_parameter_count(&query), 1);
+        assert_eq!(
+            bind_query_parameters(&query, &[Some("2".to_string())]),
+            Ok("SELECT id FROM people WHERE name = '$1' OR name = 'O''$2' OR id = 2".to_string())
+        );
+        assert_eq!(
+            replace_parameter_placeholders_with_dummy_literals(
+                "SELECT id FROM people WHERE name = '$1' OR id = $1"
+            ),
+            "SELECT id FROM people WHERE name = '$1' OR id = 1"
         );
     }
 
