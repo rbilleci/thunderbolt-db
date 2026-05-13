@@ -7109,6 +7109,113 @@ mod tests {
     }
 
     #[test]
+    fn extended_execute_missing_portal_skips_until_sync_and_recovers() {
+        let mut session = Session::default();
+        session.tables.insert(
+            "people".to_string(),
+            Table {
+                oid: FIRST_USER_RELATION_OID,
+                name: "people".to_string(),
+                columns: vec![
+                    CatalogColumn {
+                        attnum: 1,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "id".to_string(),
+                            ty: SqlType::Int4,
+                        },
+                    },
+                    CatalogColumn {
+                        attnum: 2,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "name".to_string(),
+                            ty: SqlType::Text,
+                        },
+                    },
+                ],
+                rows: vec![vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())]],
+            },
+        );
+        session.replace_extended_statement(
+            "lookup".to_string(),
+            PreparedQuery {
+                query: "SELECT name FROM people WHERE id = $1".to_string(),
+                parameter_type_oids: vec![23],
+            },
+        );
+        let (mut writer, mut reader) = tcp_pair();
+        let mut extended_error_pending = false;
+
+        handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::Execute {
+                portal_name: "missing_portal".to_string(),
+                max_rows: 1,
+            },
+        )
+        .unwrap();
+        let messages = read_backend_messages(&mut reader, 1);
+        assert_eq!(messages[0].0, b'E');
+        assert_eq!(
+            error_field_value(&messages[0].1, b'C'),
+            Some("34000".to_string())
+        );
+        assert!(extended_error_pending);
+
+        handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::SimpleQuery("CREATE TABLE skipped_execute (id INT)".to_string()),
+        )
+        .unwrap();
+        assert!(!session.tables.contains_key("skipped_execute"));
+
+        handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::Sync,
+        )
+        .unwrap();
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'Z']);
+        assert!(!extended_error_pending);
+
+        handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::Bind {
+                portal_name: "recovered_execute_portal".to_string(),
+                statement_name: "lookup".to_string(),
+                parameter_format_codes: Vec::new(),
+                parameters: vec![Some(b"1".to_vec())],
+                result_format_codes: Vec::new(),
+            },
+        )
+        .unwrap();
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'2']);
+
+        handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::Execute {
+                portal_name: "recovered_execute_portal".to_string(),
+                max_rows: 0,
+            },
+        )
+        .unwrap();
+        let messages = read_backend_messages(&mut reader, 3);
+        assert_eq!(
+            messages.iter().map(|(tag, _)| *tag).collect::<Vec<_>>(),
+            vec![b'T', b'D', b'C']
+        );
+        assert_eq!(messages[2].1, b"SELECT 1\0".to_vec());
+    }
+
+    #[test]
     fn extended_close_does_not_remove_sql_prepared_statements() {
         let mut session = Session::default();
         session
