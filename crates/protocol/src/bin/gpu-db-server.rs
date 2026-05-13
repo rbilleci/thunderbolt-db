@@ -1098,6 +1098,20 @@ fn execute_statement(
             &catalog_empty_rows(),
         );
     }
+    if canonical == psql_list_operators_catalog_query() {
+        return write_single_row(
+            stream,
+            &[
+                text_column("Schema"),
+                text_column("Name"),
+                text_column("Left arg type"),
+                text_column("Right arg type"),
+                text_column("Result type"),
+                text_column("Description"),
+            ],
+            &catalog_empty_rows(),
+        );
+    }
     if canonical == psql_list_extensions_catalog_query() {
         return write_single_row(
             stream,
@@ -2143,6 +2157,10 @@ fn psql_list_aggregates_catalog_query() -> &'static str {
 
 fn psql_list_conversions_catalog_query() -> &'static str {
     "select n.nspname as \"schema\", c.conname as \"name\", pg_catalog.pg_encoding_to_char(c.conforencoding) as \"source\", pg_catalog.pg_encoding_to_char(c.contoencoding) as \"destination\", case when c.condefault then 'yes' else 'no' end as \"default?\" from pg_catalog.pg_conversion c join pg_catalog.pg_namespace n on n.oid = c.connamespace where true and n.nspname <> 'pg_catalog' and n.nspname <> 'information_schema' and pg_catalog.pg_conversion_is_visible(c.oid) order by 1, 2"
+}
+
+fn psql_list_operators_catalog_query() -> &'static str {
+    "select n.nspname as \"schema\", o.oprname as \"name\", case when o.oprkind='l' then null else pg_catalog.format_type(o.oprleft, null) end as \"left arg type\", case when o.oprkind='r' then null else pg_catalog.format_type(o.oprright, null) end as \"right arg type\", pg_catalog.format_type(o.oprresult, null) as \"result type\", coalesce(pg_catalog.obj_description(o.oid, 'pg_operator'), pg_catalog.obj_description(o.oprcode, 'pg_proc')) as \"description\" from pg_catalog.pg_operator o left join pg_catalog.pg_namespace n on n.oid = o.oprnamespace where n.nspname <> 'pg_catalog' and n.nspname <> 'information_schema' and pg_catalog.pg_operator_is_visible(o.oid) order by 1, 2, 3, 4"
 }
 
 fn psql_list_extensions_catalog_query() -> &'static str {
@@ -4053,6 +4071,10 @@ mod tests {
         assert_eq!(
             psql_list_conversions_catalog_query(),
             "select n.nspname as \"schema\", c.conname as \"name\", pg_catalog.pg_encoding_to_char(c.conforencoding) as \"source\", pg_catalog.pg_encoding_to_char(c.contoencoding) as \"destination\", case when c.condefault then 'yes' else 'no' end as \"default?\" from pg_catalog.pg_conversion c join pg_catalog.pg_namespace n on n.oid = c.connamespace where true and n.nspname <> 'pg_catalog' and n.nspname <> 'information_schema' and pg_catalog.pg_conversion_is_visible(c.oid) order by 1, 2"
+        );
+        assert_eq!(
+            psql_list_operators_catalog_query(),
+            "select n.nspname as \"schema\", o.oprname as \"name\", case when o.oprkind='l' then null else pg_catalog.format_type(o.oprleft, null) end as \"left arg type\", case when o.oprkind='r' then null else pg_catalog.format_type(o.oprright, null) end as \"right arg type\", pg_catalog.format_type(o.oprresult, null) as \"result type\", coalesce(pg_catalog.obj_description(o.oid, 'pg_operator'), pg_catalog.obj_description(o.oprcode, 'pg_proc')) as \"description\" from pg_catalog.pg_operator o left join pg_catalog.pg_namespace n on n.oid = o.oprnamespace where n.nspname <> 'pg_catalog' and n.nspname <> 'information_schema' and pg_catalog.pg_operator_is_visible(o.oid) order by 1, 2, 3, 4"
         );
         assert_eq!(
             catalog_psql_describe_schema_rows(),

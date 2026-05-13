@@ -1,0 +1,5 @@
+=== catalog psql list operators empty ===
+                             List of operators
+ Schema | Name | Left arg type | Right arg type | Result type | Description
+--------+------+---------------+----------------+-------------+-------------
+(0 rows)
