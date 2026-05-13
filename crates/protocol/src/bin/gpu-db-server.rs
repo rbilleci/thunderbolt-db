@@ -473,11 +473,11 @@ fn unsupported_frontend_message(message: &FrontendMessage) -> &'static str {
         FrontendMessage::SaslInitialResponse { .. } | FrontendMessage::SaslResponse(_) => {
             "SASL authentication is not supported"
         }
-        FrontendMessage::FunctionCall { .. }
-        | FrontendMessage::CopyData(_)
-        | FrontendMessage::CopyDone
-        | FrontendMessage::CopyFail(_) => {
-            "extended protocol feature is not supported by the compatibility stub"
+        FrontendMessage::FunctionCall { .. } => {
+            "FunctionCall is not supported by the compatibility endpoint"
+        }
+        FrontendMessage::CopyData(_) | FrontendMessage::CopyDone | FrontendMessage::CopyFail(_) => {
+            "frontend COPY data flow is not supported by the compatibility endpoint"
         }
         FrontendMessage::SimpleQuery(_)
         | FrontendMessage::Bind { .. }
@@ -4439,6 +4439,23 @@ mod tests {
         assert_eq!(
             split_simple_query("SELECT 1;;  SELECT 2;"),
             vec!["SELECT 1", "SELECT 2"]
+        );
+    }
+
+    #[test]
+    fn frontend_function_call_unsupported_error_is_explicit() {
+        assert_eq!(
+            unsupported_frontend_message(&FrontendMessage::FunctionCall {
+                function_oid: 42,
+                argument_format_codes: vec![],
+                arguments: vec![],
+                result_format_code: 0,
+            }),
+            "FunctionCall is not supported by the compatibility endpoint"
+        );
+        assert_eq!(
+            unsupported_frontend_message(&FrontendMessage::CopyData(Vec::new())),
+            "frontend COPY data flow is not supported by the compatibility endpoint"
         );
     }
 
