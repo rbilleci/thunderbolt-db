@@ -1,0 +1,8 @@
+=== psql extended multirow bind select ===
+CREATE TABLE
+INSERT 0 3
+ id | name
+----+-------
+  2 | Linus
+  3 | Grace
+(2 rows)

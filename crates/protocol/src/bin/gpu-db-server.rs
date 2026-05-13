@@ -297,6 +297,8 @@ struct Portal {
     query: PreparedQuery,
     parameters: Vec<Option<String>>,
     described: bool,
+    result: Option<SelectResult>,
+    position: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -633,6 +635,8 @@ fn handle_bind(
             query: query.clone(),
             parameters: decoded,
             described: false,
+            result: None,
+            position: 0,
         },
     );
     write_bind_complete(stream)
@@ -703,17 +707,7 @@ fn handle_execute(
     portal_name: &str,
     max_rows: u32,
 ) -> io::Result<()> {
-    if max_rows != 0 {
-        return write_error(
-            stream,
-            &ErrorField {
-                code: "0A000",
-                message: "limited portal execution is not supported",
-                position: None,
-            },
-        );
-    }
-    let Some(portal) = session.portals.get(portal_name).cloned() else {
+    let Some(portal) = session.portals.get(portal_name) else {
         return write_error(
             stream,
             &ErrorField {
@@ -723,7 +717,6 @@ fn handle_execute(
             },
         );
     };
-    let include_row_description = !portal.described;
     let Some(bound_query) = bind_query_parameters(&portal.query, &portal.parameters) else {
         return write_error(
             stream,
@@ -734,7 +727,37 @@ fn handle_execute(
             },
         );
     };
-    execute_statement(stream, session, &bound_query, include_row_description)
+    if max_rows == 0 && portal.result.is_none() {
+        let include_row_description = !portal.described;
+        return execute_statement(stream, session, &bound_query, include_row_description);
+    }
+
+    let Ok(Command::Select(select)) = parse_command(&bound_query) else {
+        return write_error(
+            stream,
+            &ErrorField {
+                code: "0A000",
+                message: "limited portal execution only supports relational SELECT",
+                position: None,
+            },
+        );
+    };
+    if session
+        .portals
+        .get(portal_name)
+        .and_then(|portal| portal.result.as_ref())
+        .is_none()
+    {
+        let result = match execute_select_result(session, &select) {
+            Ok(result) => result,
+            Err(error) => return write_error(stream, &error),
+        };
+        if let Some(portal) = session.portals.get_mut(portal_name) {
+            portal.result = Some(result);
+            portal.position = 0;
+        }
+    }
+    execute_portal_batch(stream, session, portal_name, max_rows)
 }
 
 fn handle_close(
@@ -745,6 +768,58 @@ fn handle_close(
 ) -> io::Result<()> {
     session.close_extended_target(target, name);
     write_close_complete(stream)
+}
+
+fn execute_portal_batch(
+    stream: &mut TcpStream,
+    session: &mut Session,
+    portal_name: &str,
+    max_rows: u32,
+) -> io::Result<()> {
+    let Some(portal) = session.portals.get_mut(portal_name) else {
+        return write_error(
+            stream,
+            &ErrorField {
+                code: "34000",
+                message: "portal does not exist",
+                position: None,
+            },
+        );
+    };
+    let Some(result) = portal.result.as_ref() else {
+        return write_error(
+            stream,
+            &ErrorField {
+                code: "34000",
+                message: "portal does not exist",
+                position: None,
+            },
+        );
+    };
+
+    if !portal.described {
+        write_row_description(stream, &result.columns)?;
+        portal.described = true;
+    }
+
+    let start = portal.position.min(result.rows.len());
+    let requested_end = if max_rows == 0 {
+        result.rows.len()
+    } else {
+        start
+            .saturating_add(max_rows as usize)
+            .min(result.rows.len())
+    };
+    for row in &result.rows[start..requested_end] {
+        write_data_row(stream, row)?;
+    }
+    portal.position = requested_end;
+
+    if portal.position < result.rows.len() {
+        write_portal_suspended(stream)
+    } else {
+        write_command_complete(stream, &format!("SELECT {}", portal.position))
+    }
 }
 
 fn parse_declare_cursor(statement: &str) -> Option<(String, String)> {
@@ -3979,6 +4054,10 @@ fn write_close_complete(stream: &mut TcpStream) -> io::Result<()> {
     write_message(stream, b'3', &[])
 }
 
+fn write_portal_suspended(stream: &mut TcpStream) -> io::Result<()> {
+    write_message(stream, b's', &[])
+}
+
 fn write_no_data(stream: &mut TcpStream) -> io::Result<()> {
     write_message(stream, b'n', &[])
 }
@@ -4105,6 +4184,33 @@ fn write_message(stream: &mut TcpStream, tag: u8, payload: &[u8]) -> io::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    fn tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        (server, client)
+    }
+
+    fn read_backend_tags(stream: &mut TcpStream, count: usize) -> Vec<u8> {
+        let mut tags = Vec::with_capacity(count);
+        for _ in 0..count {
+            let mut tag = [0_u8; 1];
+            stream.read_exact(&mut tag).unwrap();
+            let mut len = [0_u8; 4];
+            stream.read_exact(&mut len).unwrap();
+            let payload_len = u32::from_be_bytes(len) as usize - 4;
+            let mut payload = vec![0_u8; payload_len];
+            stream.read_exact(&mut payload).unwrap();
+            tags.push(tag[0]);
+        }
+        tags
+    }
 
     #[test]
     fn canonical_sql_collapses_case_whitespace_and_semicolons() {
@@ -5805,6 +5911,8 @@ mod tests {
                 query: query.clone(),
                 parameters: vec![Some("1".to_string())],
                 described: false,
+                result: None,
+                position: 0,
             },
         );
         session.portals.insert(
@@ -5814,6 +5922,8 @@ mod tests {
                 query: query.clone(),
                 parameters: vec![Some("2".to_string())],
                 described: false,
+                result: None,
+                position: 0,
             },
         );
 
@@ -5825,6 +5935,46 @@ mod tests {
         session.close_extended_target(DescribeTarget::Statement, "lookup");
         assert!(!session.prepared.contains_key("lookup"));
         assert!(!session.portals.contains_key("lookup_portal"));
+    }
+
+    #[test]
+    fn extended_portal_execute_max_rows_suspends_and_resumes_select_portal() {
+        let mut session = Session::default();
+        session.portals.insert(
+            "people_portal".to_string(),
+            Portal {
+                statement_name: "people_stmt".to_string(),
+                query: PreparedQuery {
+                    query: "SELECT id FROM people ORDER BY id".to_string(),
+                    parameter_type_oids: Vec::new(),
+                },
+                parameters: Vec::new(),
+                described: false,
+                result: Some(SelectResult {
+                    columns: vec![int4_column("id")],
+                    rows: vec![
+                        vec![Some("1".to_string())],
+                        vec![Some("2".to_string())],
+                        vec![Some("3".to_string())],
+                    ],
+                }),
+                position: 0,
+            },
+        );
+        let (mut writer, mut reader) = tcp_pair();
+
+        execute_portal_batch(&mut writer, &mut session, "people_portal", 2).unwrap();
+        assert_eq!(
+            read_backend_tags(&mut reader, 4),
+            vec![b'T', b'D', b'D', b's']
+        );
+        let portal = session.portals.get("people_portal").unwrap();
+        assert!(portal.described);
+        assert_eq!(portal.position, 2);
+
+        execute_portal_batch(&mut writer, &mut session, "people_portal", 0).unwrap();
+        assert_eq!(read_backend_tags(&mut reader, 2), vec![b'D', b'C']);
+        assert_eq!(session.portals.get("people_portal").unwrap().position, 3);
     }
 
     #[test]
