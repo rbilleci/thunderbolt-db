@@ -681,6 +681,18 @@ fn handle_bind(
     parameters: Vec<Option<Vec<u8>>>,
     result_format_codes: Vec<i16>,
 ) -> io::Result<bool> {
+    let Some(PreparedStatement::Extended(query)) = session.prepared.get(&statement_name) else {
+        write_error(
+            stream,
+            &ErrorField {
+                code: "26000",
+                message: "prepared statement does not exist",
+                position: None,
+            },
+        )?;
+        return Ok(true);
+    };
+    let query = query.clone();
     if parameter_format_codes.iter().any(|code| *code != 0)
         || result_format_codes.iter().any(|code| *code != 0)
     {
@@ -694,51 +706,49 @@ fn handle_bind(
         )?;
         return Ok(true);
     }
-    if let Some(PreparedStatement::Extended(query)) = session.prepared.get(&statement_name) {
-        let parameter_format_count = parameter_format_codes.len();
-        let expected_parameter_count = expected_parameter_count(query);
-        if parameters.len() != expected_parameter_count {
+    let parameter_format_count = parameter_format_codes.len();
+    let expected_parameter_count = expected_parameter_count(&query);
+    if parameters.len() != expected_parameter_count {
+        write_error(
+            stream,
+            &ErrorField {
+                code: "08P01",
+                message: "bind message has wrong number of parameters",
+                position: None,
+            },
+        )?;
+        return Ok(true);
+    }
+    if parameters.iter().any(Option::is_none) {
+        write_error(
+            stream,
+            &bind_parameter_error_field(BindParameterError::NullUnsupported),
+        )?;
+        return Ok(true);
+    }
+    if !format_code_count_is_valid(parameter_format_count, expected_parameter_count) {
+        write_error(
+            stream,
+            &ErrorField {
+                code: "08P01",
+                message: "bind message has wrong number of parameter format codes",
+                position: None,
+            },
+        )?;
+        return Ok(true);
+    }
+    if let Some(columns) = describe_query_columns(session, &query.query) {
+        let result_format_count = result_format_codes.len();
+        if !format_code_count_is_valid(result_format_count, columns.len()) {
             write_error(
                 stream,
                 &ErrorField {
                     code: "08P01",
-                    message: "bind message has wrong number of parameters",
+                    message: "bind message has wrong number of result format codes",
                     position: None,
                 },
             )?;
             return Ok(true);
-        }
-        if parameters.iter().any(Option::is_none) {
-            write_error(
-                stream,
-                &bind_parameter_error_field(BindParameterError::NullUnsupported),
-            )?;
-            return Ok(true);
-        }
-        if !format_code_count_is_valid(parameter_format_count, expected_parameter_count) {
-            write_error(
-                stream,
-                &ErrorField {
-                    code: "08P01",
-                    message: "bind message has wrong number of parameter format codes",
-                    position: None,
-                },
-            )?;
-            return Ok(true);
-        }
-        if let Some(columns) = describe_query_columns(session, &query.query) {
-            let result_format_count = result_format_codes.len();
-            if !format_code_count_is_valid(result_format_count, columns.len()) {
-                write_error(
-                    stream,
-                    &ErrorField {
-                        code: "08P01",
-                        message: "bind message has wrong number of result format codes",
-                        position: None,
-                    },
-                )?;
-                return Ok(true);
-            }
         }
     }
     if !portal_name.is_empty() && session.portals.contains_key(&portal_name) {
@@ -752,17 +762,6 @@ fn handle_bind(
         )?;
         return Ok(true);
     }
-    let Some(PreparedStatement::Extended(query)) = session.prepared.get(&statement_name) else {
-        write_error(
-            stream,
-            &ErrorField {
-                code: "26000",
-                message: "prepared statement does not exist",
-                position: None,
-            },
-        )?;
-        return Ok(true);
-    };
     let mut decoded = Vec::with_capacity(parameters.len());
     for parameter in parameters {
         decoded.push(match parameter {
@@ -783,7 +782,7 @@ fn handle_bind(
             None => None,
         });
     }
-    if let Err(error) = bind_query_parameters(query, &decoded) {
+    if let Err(error) = bind_query_parameters(&query, &decoded) {
         write_error(stream, &bind_parameter_error_field(error))?;
         return Ok(true);
     }
@@ -4594,6 +4593,27 @@ mod tests {
         tags
     }
 
+    fn error_field_value(payload: &[u8], field_tag: u8) -> Option<String> {
+        let mut idx = 0;
+        while idx < payload.len() {
+            let tag = payload[idx];
+            idx += 1;
+            if tag == 0 {
+                break;
+            }
+            let end = payload[idx..]
+                .iter()
+                .position(|byte| *byte == 0)
+                .map(|offset| idx + offset)?;
+            let value = std::str::from_utf8(&payload[idx..end]).ok()?;
+            if tag == field_tag {
+                return Some(value.to_string());
+            }
+            idx = end + 1;
+        }
+        None
+    }
+
     #[test]
     fn canonical_sql_collapses_case_whitespace_and_semicolons() {
         assert_eq!(
@@ -6911,6 +6931,50 @@ mod tests {
 
         assert_eq!(read_backend_tags(&mut reader, 1), vec![b'E']);
         assert!(!session.portals.contains_key("lookup_portal"));
+    }
+
+    #[test]
+    fn extended_bind_reports_missing_statement_before_format_errors() {
+        let mut session = Session::default();
+        let (mut writer, mut reader) = tcp_pair();
+
+        assert!(handle_bind(
+            &mut writer,
+            &mut session,
+            "missing_portal".to_string(),
+            "missing_stmt".to_string(),
+            vec![1],
+            vec![Some(b"1".to_vec())],
+            vec![1]
+        )
+        .unwrap());
+        let messages = read_backend_messages(&mut reader, 1);
+        assert_eq!(messages[0].0, b'E');
+        assert_eq!(
+            error_field_value(&messages[0].1, b'C'),
+            Some("26000".to_string())
+        );
+        assert!(!session.portals.contains_key("missing_portal"));
+
+        session.replace_extended_statement(
+            "lookup".to_string(),
+            PreparedQuery {
+                query: "SELECT id FROM people WHERE id = $1".to_string(),
+                parameter_type_oids: vec![23],
+            },
+        );
+        assert!(!handle_bind(
+            &mut writer,
+            &mut session,
+            "lookup_portal".to_string(),
+            "lookup".to_string(),
+            Vec::new(),
+            vec![Some(b"1".to_vec())],
+            Vec::new()
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'2']);
+        assert!(session.portals.contains_key("lookup_portal"));
     }
 
     #[test]
