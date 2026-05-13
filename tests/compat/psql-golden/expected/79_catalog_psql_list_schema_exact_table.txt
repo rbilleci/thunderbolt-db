@@ -1,0 +1,8 @@
+=== psql schema-qualified exact table listing ===
+CREATE TABLE
+CREATE TABLE
+                  List of relations
+ Schema |           Name           | Type  |  Owner
+--------+--------------------------+-------+----------
+ public | exact_schema_list_people | table | postgres
+(1 row)
