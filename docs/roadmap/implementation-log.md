@@ -1,5 +1,6 @@
 # Implementation Log
 
+- 2026-05-13: Tightened P3 frontend FunctionCall recovery. Raw `FunctionCall` frames now have helper-level coverage proving a stable `0A000` unsupported-feature `ErrorResponse`, skip-until-`Sync` behavior, skipped side effects, and later supported SQL recovery; frontend `CopyDone`/`CopyFail` now share the same explicit unsupported COPY data-flow message as `CopyData`.
 - 2026-05-13: Tightened P3 frontend COPY data-flow recovery. Raw `CopyData` frames now have helper-level coverage proving a stable `0A000` unsupported-feature `ErrorResponse`, skip-until-`Sync` behavior, and later supported SQL recovery; this pins the wire path that PostgreSQL 16 `psql` does not emit outside active COPY mode.
 - 2026-05-13: Tightened P3 extended `Bind` duplicate portal lifecycle ordering. Binding an existing named portal now returns stable `42P03` before unsupported binary formats, NULLs, or malformed payloads can mask the duplicate-object error, and helper-level coverage proves the existing portal survives plus later valid Bind traffic still works.
 

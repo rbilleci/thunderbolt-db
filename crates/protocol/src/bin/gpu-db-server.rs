@@ -4655,6 +4655,78 @@ mod tests {
             unsupported_frontend_message(&FrontendMessage::CopyData(Vec::new())),
             "frontend COPY data flow is not supported by the compatibility endpoint"
         );
+        assert_eq!(
+            unsupported_frontend_message(&FrontendMessage::CopyDone),
+            "frontend COPY data flow is not supported by the compatibility endpoint"
+        );
+        assert_eq!(
+            unsupported_frontend_message(&FrontendMessage::CopyFail(
+                "client aborted copy".to_string()
+            )),
+            "frontend COPY data flow is not supported by the compatibility endpoint"
+        );
+    }
+
+    #[test]
+    fn frontend_function_call_error_skips_until_sync_and_recovers() {
+        let mut session = Session::default();
+        let mut extended_error_pending = false;
+        let (mut writer, mut reader) = tcp_pair();
+
+        assert!(handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::FunctionCall {
+                function_oid: 42,
+                argument_format_codes: vec![],
+                arguments: vec![],
+                result_format_code: 0,
+            }
+        )
+        .unwrap());
+        let messages = read_backend_messages(&mut reader, 1);
+        assert_eq!(messages[0].0, b'E');
+        assert_eq!(
+            error_field_value(&messages[0].1, b'C'),
+            Some("0A000".to_string())
+        );
+        assert_eq!(
+            error_field_value(&messages[0].1, b'M'),
+            Some("FunctionCall is not supported by the compatibility endpoint".to_string())
+        );
+        assert!(extended_error_pending);
+
+        assert!(handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::SimpleQuery("CREATE TABLE skipped_function_call (id INT)".to_string())
+        )
+        .unwrap());
+        assert!(!session.tables.contains_key("skipped_function_call"));
+
+        assert!(handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::Sync
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'Z']);
+        assert!(!extended_error_pending);
+
+        assert!(handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::SimpleQuery(
+                "CREATE TABLE recovered_function_call (id INT)".to_string()
+            )
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 2), vec![b'C', b'Z']);
+        assert!(session.tables.contains_key("recovered_function_call"));
     }
 
     #[test]
