@@ -1323,6 +1323,18 @@ fn execute_statement(
             &catalog_empty_rows(),
         );
     }
+    if canonical == psql_list_default_access_privileges_catalog_query() {
+        return write_single_row(
+            stream,
+            &[
+                text_column("Owner"),
+                text_column("Schema"),
+                text_column("Type"),
+                text_column("Access privileges"),
+            ],
+            &catalog_empty_rows(),
+        );
+    }
     if canonical == psql_list_extensions_catalog_query() {
         return write_single_row(
             stream,
@@ -2392,6 +2404,10 @@ fn psql_list_publications_verbose_catalog_query() -> &'static str {
 
 fn psql_list_subscriptions_catalog_query() -> &'static str {
     "select subname as \"name\" , pg_catalog.pg_get_userbyid(subowner) as \"owner\" , subenabled as \"enabled\" , subpublications as \"publication\" from pg_catalog.pg_subscription where subdbid = (select oid from pg_catalog.pg_database where datname = pg_catalog.current_database())order by 1"
+}
+
+fn psql_list_default_access_privileges_catalog_query() -> &'static str {
+    "select pg_catalog.pg_get_userbyid(d.defaclrole) as \"owner\", n.nspname as \"schema\", case d.defaclobjtype when 'r' then 'table' when 's' then 'sequence' when 'f' then 'function' when 't' then 'type' when 'n' then 'schema' end as \"type\", pg_catalog.array_to_string(d.defaclacl, e'\\n') as \"access privileges\" from pg_catalog.pg_default_acl d left join pg_catalog.pg_namespace n on n.oid = d.defaclnamespace order by 1, 2, 3"
 }
 
 fn psql_list_extensions_catalog_query() -> &'static str {
@@ -4342,6 +4358,10 @@ mod tests {
         assert_eq!(
             psql_list_subscriptions_catalog_query(),
             "select subname as \"name\" , pg_catalog.pg_get_userbyid(subowner) as \"owner\" , subenabled as \"enabled\" , subpublications as \"publication\" from pg_catalog.pg_subscription where subdbid = (select oid from pg_catalog.pg_database where datname = pg_catalog.current_database())order by 1"
+        );
+        assert_eq!(
+            psql_list_default_access_privileges_catalog_query(),
+            "select pg_catalog.pg_get_userbyid(d.defaclrole) as \"owner\", n.nspname as \"schema\", case d.defaclobjtype when 'r' then 'table' when 's' then 'sequence' when 'f' then 'function' when 't' then 'type' when 'n' then 'schema' end as \"type\", pg_catalog.array_to_string(d.defaclacl, e'\\n') as \"access privileges\" from pg_catalog.pg_default_acl d left join pg_catalog.pg_namespace n on n.oid = d.defaclnamespace order by 1, 2, 3"
         );
         assert_eq!(
             catalog_psql_describe_schema_rows(),

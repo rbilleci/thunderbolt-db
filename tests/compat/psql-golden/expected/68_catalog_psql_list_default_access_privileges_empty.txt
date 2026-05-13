@@ -1,0 +1,5 @@
+=== catalog psql list default access privileges empty ===
+         Default access privileges
+ Owner | Schema | Type | Access privileges
+-------+--------+------+-------------------
+(0 rows)
