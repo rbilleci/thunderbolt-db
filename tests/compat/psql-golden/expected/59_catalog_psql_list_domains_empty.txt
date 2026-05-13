@@ -1,0 +1,11 @@
+=== catalog psql list domains empty ===
+                        List of domains
+ Schema | Name | Type | Collation | Nullable | Default | Check
+--------+------+------+-----------+----------+---------+-------
+(0 rows)
+
+=== catalog psql list domains verbose empty ===
+                                         List of domains
+ Schema | Name | Type | Collation | Nullable | Default | Check | Access privileges | Description
+--------+------+------+-----------+----------+---------+-------+-------------------+-------------
+(0 rows)
