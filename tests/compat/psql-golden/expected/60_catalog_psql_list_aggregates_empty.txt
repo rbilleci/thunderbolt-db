@@ -1,0 +1,5 @@
+=== catalog psql list aggregates empty ===
+                     List of aggregate functions
+ Schema | Name | Result data type | Argument data types | Description
+--------+------+------------------+---------------------+-------------
+(0 rows)
