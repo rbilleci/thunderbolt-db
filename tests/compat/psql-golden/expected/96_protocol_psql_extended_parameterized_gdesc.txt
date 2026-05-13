@@ -1,0 +1,12 @@
+=== psql extended parameterized gdesc ===
+CREATE TABLE
+INSERT 0 2
+ Column | Type
+--------+------
+ name   | text
+(1 row)
+
+ name
+-------
+ Linus
+(1 row)
