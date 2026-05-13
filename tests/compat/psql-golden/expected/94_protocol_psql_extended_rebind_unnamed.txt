@@ -1,0 +1,22 @@
+=== psql extended unnamed rebind execution ===
+CREATE TABLE
+INSERT 0 3
+ name
+------
+ Ada
+(1 row)
+
+ name
+-------
+ Grace
+(1 row)
+
+ Column | Type
+--------+------
+ name   | text
+(1 row)
+
+ name
+-------
+ Linus
+(1 row)
