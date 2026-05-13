@@ -1,0 +1,8 @@
+=== psql fetch count bind cursor boundary ===
+CREATE TABLE
+INSERT 0 3
+psql:83_protocol_psql_fetch_count_bind_unsupported.sql:5: ERROR:  parameterized cursor declarations are not supported
+ name
+-------
+ Linus
+(1 row)

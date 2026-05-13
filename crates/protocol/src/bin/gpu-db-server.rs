@@ -920,6 +920,16 @@ fn execute_declare_cursor(
     name: String,
     query: &str,
 ) -> io::Result<()> {
+    if max_placeholder_index(query) > 0 {
+        return write_error(
+            stream,
+            &ErrorField {
+                code: "0A000",
+                message: "parameterized cursor declarations are not supported",
+                position: None,
+            },
+        );
+    }
     let Ok(Command::Select(select)) = parse_command(query) else {
         return write_error(
             stream,
@@ -6280,6 +6290,10 @@ mod tests {
         assert_eq!(
             parse_close_cursor("CLOSE _psql_cursor"),
             Some("_psql_cursor".to_string())
+        );
+        assert_eq!(
+            max_placeholder_index("select id from people where id > $1"),
+            1
         );
 
         let mut session = Session::default();
