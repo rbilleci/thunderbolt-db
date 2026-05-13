@@ -1,0 +1,14 @@
+=== psql extended reused placeholder bind ===
+CREATE TABLE
+INSERT 0 3
+psql:106_protocol_psql_extended_reused_placeholder.sql:4: ERROR:  invalid input syntax for parameter type oid 23: "not-an-int"
+ id | name
+----+-------
+  2 | Grace
+(1 row)
+
+ id | name
+----+-------
+  2 | Grace
+  3 | Linus
+(2 rows)
