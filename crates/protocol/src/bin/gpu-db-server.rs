@@ -684,9 +684,22 @@ fn handle_bind(
         return Ok(true);
     }
     if let Some(PreparedStatement::Extended(query)) = session.prepared.get(&statement_name) {
+        let parameter_format_count = parameter_format_codes.len();
+        let expected_parameter_count = expected_parameter_count(query);
+        if !format_code_count_is_valid(parameter_format_count, expected_parameter_count) {
+            write_error(
+                stream,
+                &ErrorField {
+                    code: "08P01",
+                    message: "bind message has wrong number of parameter format codes",
+                    position: None,
+                },
+            )?;
+            return Ok(true);
+        }
         if let Some(columns) = describe_query_columns(session, &query.query) {
             let result_format_count = result_format_codes.len();
-            if result_format_count > 1 && result_format_count != columns.len() {
+            if !format_code_count_is_valid(result_format_count, columns.len()) {
                 write_error(
                     stream,
                     &ErrorField {
@@ -3947,6 +3960,10 @@ fn bind_query_parameters(
     Ok(bound)
 }
 
+fn format_code_count_is_valid(count: usize, expected: usize) -> bool {
+    matches!(count, 0 | 1) || count == expected
+}
+
 fn expected_parameter_count(query: &PreparedQuery) -> usize {
     std::cmp::max(
         query.parameter_type_oids.len(),
@@ -6588,6 +6605,43 @@ mod tests {
         .unwrap());
         assert_eq!(read_backend_tags(&mut reader, 1), vec![b'2']);
         assert!(session.portals.contains_key("per_column_format_portal"));
+    }
+
+    #[test]
+    fn extended_bind_validates_parameter_format_code_count() {
+        let mut session = Session::default();
+        let query = PreparedQuery {
+            query: "SELECT id FROM people WHERE id = $1 AND name = $2".to_string(),
+            parameter_type_oids: vec![23, 25],
+        };
+        session.replace_extended_statement("lookup".to_string(), query);
+        let (mut writer, mut reader) = tcp_pair();
+
+        assert!(handle_bind(
+            &mut writer,
+            &mut session,
+            "bad_parameter_format_portal".to_string(),
+            "lookup".to_string(),
+            vec![0, 0, 0],
+            vec![Some(b"1".to_vec()), Some(b"alice".to_vec())],
+            Vec::new()
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'E']);
+        assert!(!session.portals.contains_key("bad_parameter_format_portal"));
+
+        assert!(!handle_bind(
+            &mut writer,
+            &mut session,
+            "per_parameter_format_portal".to_string(),
+            "lookup".to_string(),
+            vec![0, 0],
+            vec![Some(b"1".to_vec()), Some(b"alice".to_vec())],
+            Vec::new()
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'2']);
+        assert!(session.portals.contains_key("per_parameter_format_portal"));
     }
 
     #[test]
