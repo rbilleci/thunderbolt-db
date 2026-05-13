@@ -1,0 +1,15 @@
+=== psql extended inferred OR bind parameter types ===
+CREATE TABLE
+INSERT 0 4
+psql:108_protocol_psql_extended_inferred_or_bind.sql:4: ERROR:  invalid input syntax for parameter type oid 23: "not-an-int"
+ id | name
+----+-------
+  1 | Ada
+  2 | Grace
+(2 rows)
+
+ id | name
+----+-------
+  3 | Linus
+  4 | Ada
+(2 rows)
