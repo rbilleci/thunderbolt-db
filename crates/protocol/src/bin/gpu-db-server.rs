@@ -1090,6 +1090,23 @@ fn execute_statement(
             &catalog_psql_describe_role_rows(),
         );
     }
+    if canonical == psql_list_databases_catalog_query() {
+        return write_single_row(
+            stream,
+            &[
+                text_column("Name"),
+                text_column("Owner"),
+                text_column("Encoding"),
+                text_column("Locale Provider"),
+                text_column("Collate"),
+                text_column("Ctype"),
+                text_column("ICU Locale"),
+                text_column("ICU Rules"),
+                text_column("Access privileges"),
+            ],
+            &catalog_psql_list_database_rows(),
+        );
+    }
     if canonical == psql_describe_schemas_catalog_query() {
         return write_single_row(
             stream,
@@ -2009,6 +2026,24 @@ fn catalog_psql_describe_role_rows() -> Vec<Vec<Option<String>>> {
         None,
         Some("t".to_string()),
         Some("t".to_string()),
+    ]]
+}
+
+fn psql_list_databases_catalog_query() -> &'static str {
+    "select d.datname as \"name\", pg_catalog.pg_get_userbyid(d.datdba) as \"owner\", pg_catalog.pg_encoding_to_char(d.encoding) as \"encoding\", case d.datlocprovider when 'c' then 'libc' when 'i' then 'icu' end as \"locale provider\", d.datcollate as \"collate\", d.datctype as \"ctype\", d.daticulocale as \"icu locale\", d.daticurules as \"icu rules\", pg_catalog.array_to_string(d.datacl, e'\\n') as \"access privileges\" from pg_catalog.pg_database d order by 1"
+}
+
+fn catalog_psql_list_database_rows() -> Vec<Vec<Option<String>>> {
+    vec![vec![
+        Some("postgres".to_string()),
+        Some("postgres".to_string()),
+        Some("UTF8".to_string()),
+        Some("libc".to_string()),
+        Some("C.UTF-8".to_string()),
+        Some("C.UTF-8".to_string()),
+        None,
+        None,
+        None,
     ]]
 }
 
@@ -3690,6 +3725,24 @@ mod tests {
                 None,
                 Some("t".to_string()),
                 Some("t".to_string()),
+            ]]
+        );
+        assert_eq!(
+            psql_list_databases_catalog_query(),
+            "select d.datname as \"name\", pg_catalog.pg_get_userbyid(d.datdba) as \"owner\", pg_catalog.pg_encoding_to_char(d.encoding) as \"encoding\", case d.datlocprovider when 'c' then 'libc' when 'i' then 'icu' end as \"locale provider\", d.datcollate as \"collate\", d.datctype as \"ctype\", d.daticulocale as \"icu locale\", d.daticurules as \"icu rules\", pg_catalog.array_to_string(d.datacl, e'\\n') as \"access privileges\" from pg_catalog.pg_database d order by 1"
+        );
+        assert_eq!(
+            catalog_psql_list_database_rows(),
+            vec![vec![
+                Some("postgres".to_string()),
+                Some("postgres".to_string()),
+                Some("UTF8".to_string()),
+                Some("libc".to_string()),
+                Some("C.UTF-8".to_string()),
+                Some("C.UTF-8".to_string()),
+                None,
+                None,
+                None,
             ]]
         );
         assert!(catalog_empty_rows().is_empty());

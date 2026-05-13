@@ -1,0 +1,6 @@
+Pager usage is off.
+                                                 List of databases
+   Name   |  Owner   | Encoding | Locale Provider | Collate |  Ctype  | ICU Locale | ICU Rules | Access privileges
+----------+----------+----------+-----------------+---------+---------+------------+-----------+-------------------
+ postgres | postgres | UTF8     | libc            | C.UTF-8 | C.UTF-8 |            |           |
+(1 row)
