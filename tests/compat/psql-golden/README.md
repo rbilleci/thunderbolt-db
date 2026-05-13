@@ -82,6 +82,7 @@ When `PSQL_GOLDEN_BOOT_CMD` is set, the harness starts the target service itself
 - Scenario 83 covers real PostgreSQL 16 `psql` `FETCH_COUNT` combined with `\bind`, explicitly rejecting the unresolved parameterized cursor declaration boundary while proving the session can still run a supported SELECT afterward.
 - Scenario 84 covers real PostgreSQL 16 `CLOSE ALL` cursor cleanup by proving a later fetch from the closed session-local cursor fails while later supported SELECT traffic still succeeds.
 - Scenario 85 covers real PostgreSQL 16 `COPY ... TO STDOUT` traffic as an explicit unsupported COPY boundary and proves later supported SELECT traffic still succeeds in the same session.
+- Raw frontend `CopyData` frames are covered by helper-level protocol tests because PostgreSQL 16 `psql` does not emit them outside an active COPY mode; that coverage pins the unsupported SQLSTATE, skip-until-`Sync`, and later recovery behavior.
 - Scenario 86 covers real PostgreSQL 16 parameterized extended `INSERT` traffic as an explicit unsupported non-SELECT boundary and proves later supported SELECT traffic still succeeds in the same session.
 - Scenario 87 covers real PostgreSQL 16 parameterized extended JOIN SELECT traffic as an explicit unsupported broader-SELECT boundary and proves later supported SELECT traffic still succeeds in the same session.
 - Scenario 88 covers real PostgreSQL 16 named cursor `CLOSE` against a missing cursor, returning a stable cursor-not-found error while proving an existing cursor and later supported SELECT traffic still work.
