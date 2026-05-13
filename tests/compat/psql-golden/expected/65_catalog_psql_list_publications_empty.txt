@@ -1,0 +1,5 @@
+=== catalog psql list publications empty ===
+                              List of publications
+ Name | Owner | All tables | Inserts | Updates | Deletes | Truncates | Via root
+------+-------+------------+---------+---------+---------+-----------+----------
+(0 rows)

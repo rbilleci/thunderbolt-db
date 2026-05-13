@@ -1140,6 +1140,39 @@ fn execute_statement(
             &catalog_empty_rows(),
         );
     }
+    if canonical == psql_list_publications_catalog_query() {
+        return write_single_row(
+            stream,
+            &[
+                text_column("Name"),
+                text_column("Owner"),
+                bool_column("All tables"),
+                bool_column("Inserts"),
+                bool_column("Updates"),
+                bool_column("Deletes"),
+                bool_column("Truncates"),
+                bool_column("Via root"),
+            ],
+            &catalog_empty_rows(),
+        );
+    }
+    if canonical == psql_list_publications_verbose_catalog_query() {
+        return write_single_row(
+            stream,
+            &[
+                int4_column("oid"),
+                text_column("pubname"),
+                text_column("owner"),
+                bool_column("puballtables"),
+                bool_column("pubinsert"),
+                bool_column("pubupdate"),
+                bool_column("pubdelete"),
+                bool_column("pubtruncate"),
+                bool_column("pubviaroot"),
+            ],
+            &catalog_empty_rows(),
+        );
+    }
     if canonical == psql_list_extensions_catalog_query() {
         return write_single_row(
             stream,
@@ -2197,6 +2230,14 @@ fn psql_list_collations_catalog_query() -> &'static str {
 
 fn psql_list_casts_catalog_query() -> &'static str {
     "select pg_catalog.format_type(castsource, null) as \"source type\", pg_catalog.format_type(casttarget, null) as \"target type\", case when c.castmethod = 'b' then '(binary coercible)' when c.castmethod = 'i' then '(with inout)' else p.proname end as \"function\", case when c.castcontext = 'e' then 'no' when c.castcontext = 'a' then 'in assignment' else 'yes' end as \"implicit?\" from pg_catalog.pg_cast c left join pg_catalog.pg_proc p on c.castfunc = p.oid left join pg_catalog.pg_type ts on c.castsource = ts.oid left join pg_catalog.pg_namespace ns on ns.oid = ts.typnamespace left join pg_catalog.pg_type tt on c.casttarget = tt.oid left join pg_catalog.pg_namespace nt on nt.oid = tt.typnamespace where ( (true and pg_catalog.pg_type_is_visible(ts.oid) ) or (true and pg_catalog.pg_type_is_visible(tt.oid) ) ) order by 1, 2"
+}
+
+fn psql_list_publications_catalog_query() -> &'static str {
+    "select pubname as \"name\", pg_catalog.pg_get_userbyid(pubowner) as \"owner\", puballtables as \"all tables\", pubinsert as \"inserts\", pubupdate as \"updates\", pubdelete as \"deletes\", pubtruncate as \"truncates\", pubviaroot as \"via root\" from pg_catalog.pg_publication order by 1"
+}
+
+fn psql_list_publications_verbose_catalog_query() -> &'static str {
+    "select oid, pubname, pg_catalog.pg_get_userbyid(pubowner) as owner, puballtables, pubinsert, pubupdate, pubdelete, pubtruncate, pubviaroot from pg_catalog.pg_publication order by 2"
 }
 
 fn psql_list_extensions_catalog_query() -> &'static str {
@@ -4119,6 +4160,14 @@ mod tests {
         assert_eq!(
             psql_list_casts_catalog_query(),
             "select pg_catalog.format_type(castsource, null) as \"source type\", pg_catalog.format_type(casttarget, null) as \"target type\", case when c.castmethod = 'b' then '(binary coercible)' when c.castmethod = 'i' then '(with inout)' else p.proname end as \"function\", case when c.castcontext = 'e' then 'no' when c.castcontext = 'a' then 'in assignment' else 'yes' end as \"implicit?\" from pg_catalog.pg_cast c left join pg_catalog.pg_proc p on c.castfunc = p.oid left join pg_catalog.pg_type ts on c.castsource = ts.oid left join pg_catalog.pg_namespace ns on ns.oid = ts.typnamespace left join pg_catalog.pg_type tt on c.casttarget = tt.oid left join pg_catalog.pg_namespace nt on nt.oid = tt.typnamespace where ( (true and pg_catalog.pg_type_is_visible(ts.oid) ) or (true and pg_catalog.pg_type_is_visible(tt.oid) ) ) order by 1, 2"
+        );
+        assert_eq!(
+            psql_list_publications_catalog_query(),
+            "select pubname as \"name\", pg_catalog.pg_get_userbyid(pubowner) as \"owner\", puballtables as \"all tables\", pubinsert as \"inserts\", pubupdate as \"updates\", pubdelete as \"deletes\", pubtruncate as \"truncates\", pubviaroot as \"via root\" from pg_catalog.pg_publication order by 1"
+        );
+        assert_eq!(
+            psql_list_publications_verbose_catalog_query(),
+            "select oid, pubname, pg_catalog.pg_get_userbyid(pubowner) as owner, puballtables, pubinsert, pubupdate, pubdelete, pubtruncate, pubviaroot from pg_catalog.pg_publication order by 2"
         );
         assert_eq!(
             catalog_psql_describe_schema_rows(),
