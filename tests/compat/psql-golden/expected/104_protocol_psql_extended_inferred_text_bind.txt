@@ -1,0 +1,12 @@
+=== psql extended inferred text bind parameter type ===
+CREATE TABLE
+INSERT 0 3
+ id | name
+----+------
+  1 | Ada
+  3 | Ada
+(2 rows)
+
+ id | name
+----+------
+(0 rows)
