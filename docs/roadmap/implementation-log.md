@@ -1,5 +1,6 @@
 # Implementation Log
 
+- 2026-05-13: Tightened P3 extended `Close` missing-target recovery. Raw `Close Statement` and `Close Portal` frames for missing names now have helper-level coverage proving stable `26000` / `34000` errors, skip-until-`Sync` behavior, skipped side effects, preserved prepared state, and later supported Bind/Execute recovery.
 - 2026-05-13: Tightened P3 extended `Describe` missing-target recovery. Raw `Describe Statement` and `Describe Portal` frames for missing names now have helper-level coverage proving stable `26000` / `34000` errors, skip-until-`Sync` behavior, skipped side effects, and later supported Bind/Execute recovery.
 - 2026-05-13: Tightened P3 unsupported binary `Bind` recovery. Raw extended `Bind` frames that request binary parameter format now return stable `0A000`, do not install the portal, skip later messages until `Sync`, and recover to text-format Bind/Execute traffic over the supported relational `SELECT` subset.
 - 2026-05-13: Tightened P3 frontend COPY terminator recovery. Raw `CopyDone` and `CopyFail` frames now have the same helper-level recovery proof as `CopyData`: stable `0A000` unsupported-feature `ErrorResponse`, skip-until-`Sync` behavior, skipped side effects, and later supported SQL recovery while COPY execution remains out of scope.
