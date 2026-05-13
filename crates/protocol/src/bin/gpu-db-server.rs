@@ -292,6 +292,13 @@ struct PreparedQuery {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+enum BindParameterError {
+    CountMismatch,
+    NullUnsupported,
+    InvalidTextRepresentation { oid: u32, value: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Portal {
     statement_name: String,
     query: PreparedQuery,
@@ -362,6 +369,7 @@ where
 fn handle_client(mut stream: TcpStream) -> io::Result<()> {
     startup_handshake(&mut stream)?;
     let mut session = Session::default();
+    let mut extended_error_pending = false;
 
     loop {
         let Some(frame) = read_tagged_frame(&mut stream)? else {
@@ -372,57 +380,82 @@ fn handle_client(mut stream: TcpStream) -> io::Result<()> {
             .map_err(|error| io::Error::new(ErrorKind::InvalidData, error.to_string()))?;
         match message {
             FrontendMessage::SimpleQuery(query) => {
-                run_simple_query(&mut stream, &mut session, &query)?
+                if !extended_error_pending {
+                    run_simple_query(&mut stream, &mut session, &query)?
+                }
             }
             FrontendMessage::Parse {
                 statement_name,
                 query,
                 parameter_type_oids,
-            } => handle_parse(
-                &mut stream,
-                &mut session,
-                statement_name,
-                query,
-                parameter_type_oids,
-            )?,
+            } => {
+                if !extended_error_pending {
+                    extended_error_pending = handle_parse(
+                        &mut stream,
+                        &mut session,
+                        statement_name,
+                        query,
+                        parameter_type_oids,
+                    )?;
+                }
+            }
             FrontendMessage::Bind {
                 portal_name,
                 statement_name,
                 parameter_format_codes,
                 parameters,
                 result_format_codes,
-            } => handle_bind(
-                &mut stream,
-                &mut session,
-                portal_name,
-                statement_name,
-                parameter_format_codes,
-                parameters,
-                result_format_codes,
-            )?,
+            } => {
+                if !extended_error_pending {
+                    extended_error_pending = handle_bind(
+                        &mut stream,
+                        &mut session,
+                        portal_name,
+                        statement_name,
+                        parameter_format_codes,
+                        parameters,
+                        result_format_codes,
+                    )?;
+                }
+            }
             FrontendMessage::Describe { target, name } => {
-                handle_describe(&mut stream, &mut session, target, &name)?
+                if !extended_error_pending {
+                    extended_error_pending =
+                        handle_describe(&mut stream, &mut session, target, &name)?;
+                }
             }
             FrontendMessage::Execute {
                 portal_name,
                 max_rows,
-            } => handle_execute(&mut stream, &mut session, &portal_name, max_rows)?,
+            } => {
+                if !extended_error_pending {
+                    extended_error_pending =
+                        handle_execute(&mut stream, &mut session, &portal_name, max_rows)?;
+                }
+            }
             FrontendMessage::Close { target, name } => {
-                handle_close(&mut stream, &mut session, target, &name)?
+                if !extended_error_pending {
+                    handle_close(&mut stream, &mut session, target, &name)?
+                }
             }
             FrontendMessage::Terminate => return Ok(()),
-            FrontendMessage::Sync => write_ready_for_query(&mut stream, session.in_transaction)?,
+            FrontendMessage::Sync => {
+                extended_error_pending = false;
+                write_ready_for_query(&mut stream, session.in_transaction)?
+            }
             FrontendMessage::Flush => stream.flush()?,
             other => {
-                write_error(
-                    &mut stream,
-                    &ErrorField {
-                        code: "0A000",
-                        message: unsupported_frontend_message(&other),
-                        position: None,
-                    },
-                )?;
-                write_ready_for_query(&mut stream, session.in_transaction)?;
+                if !extended_error_pending {
+                    write_error(
+                        &mut stream,
+                        &ErrorField {
+                            code: "0A000",
+                            message: unsupported_frontend_message(&other),
+                            position: None,
+                        },
+                    )?;
+                    extended_error_pending = true;
+                }
             }
         }
     }
@@ -560,21 +593,24 @@ fn handle_parse(
     statement_name: String,
     query: String,
     parameter_type_oids: Vec<u32>,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     if parameter_type_oids
         .iter()
         .copied()
         .any(|oid| !matches!(oid, 0 | 23 | 25))
     {
-        return write_error(
+        write_error(
             stream,
             &ErrorField {
                 code: "0A000",
                 message: "only text and int4 extended-query parameters are supported",
                 position: None,
             },
-        );
+        )?;
+        return Ok(true);
     }
+    let parameter_type_oids =
+        resolve_prepared_parameter_type_oids(session, &query, parameter_type_oids);
     session.prepared.insert(
         statement_name,
         PreparedStatement::Extended(PreparedQuery {
@@ -582,7 +618,8 @@ fn handle_parse(
             parameter_type_oids,
         }),
     );
-    write_parse_complete(stream)
+    write_parse_complete(stream)?;
+    Ok(false)
 }
 
 fn handle_bind(
@@ -593,28 +630,30 @@ fn handle_bind(
     parameter_format_codes: Vec<i16>,
     parameters: Vec<Option<Vec<u8>>>,
     result_format_codes: Vec<i16>,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     if parameter_format_codes.iter().any(|code| *code != 0)
         || result_format_codes.iter().any(|code| *code != 0)
     {
-        return write_error(
+        write_error(
             stream,
             &ErrorField {
                 code: "0A000",
                 message: "only text format parameters and results are supported",
                 position: None,
             },
-        );
+        )?;
+        return Ok(true);
     }
     let Some(PreparedStatement::Extended(query)) = session.prepared.get(&statement_name) else {
-        return write_error(
+        write_error(
             stream,
             &ErrorField {
                 code: "26000",
                 message: "prepared statement does not exist",
                 position: None,
             },
-        );
+        )?;
+        return Ok(true);
     };
     let mut decoded = Vec::with_capacity(parameters.len());
     for parameter in parameters {
@@ -639,7 +678,8 @@ fn handle_bind(
             position: 0,
         },
     );
-    write_bind_complete(stream)
+    write_bind_complete(stream)?;
+    Ok(false)
 }
 
 fn handle_describe(
@@ -647,55 +687,57 @@ fn handle_describe(
     session: &mut Session,
     target: DescribeTarget,
     name: &str,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     match target {
         DescribeTarget::Statement => {
             let Some(PreparedStatement::Extended(query)) = session.prepared.get(name) else {
-                return write_error(
+                write_error(
                     stream,
                     &ErrorField {
                         code: "26000",
                         message: "prepared statement does not exist",
                         position: None,
                     },
-                );
+                )?;
+                return Ok(true);
             };
             write_parameter_description(stream, &query.parameter_type_oids)?;
             if let Some(columns) = describe_query_columns(session, &query.query) {
-                write_row_description(stream, &columns)
+                write_row_description(stream, &columns)?;
+                Ok(false)
             } else {
-                write_no_data(stream)
+                write_no_data(stream)?;
+                Ok(false)
             }
         }
         DescribeTarget::Portal => {
             let Some(portal) = session.portals.get(name) else {
-                return write_error(
+                write_error(
                     stream,
                     &ErrorField {
                         code: "34000",
                         message: "portal does not exist",
                         position: None,
                     },
-                );
+                )?;
+                return Ok(true);
             };
-            let Some(bound_query) = bind_query_parameters(&portal.query, &portal.parameters) else {
-                return write_error(
-                    stream,
-                    &ErrorField {
-                        code: "08P01",
-                        message: "bound parameter count does not match prepared statement",
-                        position: None,
-                    },
-                );
+            let bound_query = match bind_query_parameters(&portal.query, &portal.parameters) {
+                Ok(query) => query,
+                Err(error) => {
+                    write_error(stream, &bind_parameter_error_field(error))?;
+                    return Ok(true);
+                }
             };
             if let Some(columns) = describe_query_columns(session, &bound_query) {
                 write_row_description(stream, &columns)?;
                 if let Some(portal) = session.portals.get_mut(name) {
                     portal.described = true;
                 }
-                Ok(())
+                Ok(false)
             } else {
-                write_no_data(stream)
+                write_no_data(stream)?;
+                Ok(false)
             }
         }
     }
@@ -706,41 +748,41 @@ fn handle_execute(
     session: &mut Session,
     portal_name: &str,
     max_rows: u32,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     let Some(portal) = session.portals.get(portal_name) else {
-        return write_error(
+        write_error(
             stream,
             &ErrorField {
                 code: "34000",
                 message: "portal does not exist",
                 position: None,
             },
-        );
+        )?;
+        return Ok(true);
     };
-    let Some(bound_query) = bind_query_parameters(&portal.query, &portal.parameters) else {
-        return write_error(
-            stream,
-            &ErrorField {
-                code: "08P01",
-                message: "bound parameter count does not match prepared statement",
-                position: None,
-            },
-        );
+    let bound_query = match bind_query_parameters(&portal.query, &portal.parameters) {
+        Ok(query) => query,
+        Err(error) => {
+            write_error(stream, &bind_parameter_error_field(error))?;
+            return Ok(true);
+        }
     };
     if max_rows == 0 && portal.result.is_none() {
         let include_row_description = !portal.described;
-        return execute_statement(stream, session, &bound_query, include_row_description);
+        execute_statement(stream, session, &bound_query, include_row_description)?;
+        return Ok(false);
     }
 
     let Ok(Command::Select(select)) = parse_command(&bound_query) else {
-        return write_error(
+        write_error(
             stream,
             &ErrorField {
                 code: "0A000",
                 message: "limited portal execution only supports relational SELECT",
                 position: None,
             },
-        );
+        )?;
+        return Ok(true);
     };
     if session
         .portals
@@ -750,14 +792,18 @@ fn handle_execute(
     {
         let result = match execute_select_result(session, &select) {
             Ok(result) => result,
-            Err(error) => return write_error(stream, &error),
+            Err(error) => {
+                write_error(stream, &error)?;
+                return Ok(true);
+            }
         };
         if let Some(portal) = session.portals.get_mut(portal_name) {
             portal.result = Some(result);
             portal.position = 0;
         }
     }
-    execute_portal_batch(stream, session, portal_name, max_rows)
+    execute_portal_batch(stream, session, portal_name, max_rows)?;
+    Ok(false)
 }
 
 fn handle_close(
@@ -3773,13 +3819,18 @@ fn catalog_type_rows_by_name() -> Vec<Vec<Option<String>>> {
         .collect()
 }
 
-fn bind_query_parameters(query: &PreparedQuery, parameters: &[Option<String>]) -> Option<String> {
+fn bind_query_parameters(
+    query: &PreparedQuery,
+    parameters: &[Option<String>],
+) -> Result<String, BindParameterError> {
     if expected_parameter_count(query) != parameters.len() {
-        return None;
+        return Err(BindParameterError::CountMismatch);
     }
     let mut bound = query.query.clone();
     for (idx, parameter) in parameters.iter().enumerate().rev() {
-        let value = parameter.as_ref()?;
+        let value = parameter
+            .as_ref()
+            .ok_or(BindParameterError::NullUnsupported)?;
         let placeholder = format!("${}", idx + 1);
         let literal = encode_parameter_literal(
             value,
@@ -3788,9 +3839,9 @@ fn bind_query_parameters(query: &PreparedQuery, parameters: &[Option<String>]) -
         bound = bound.replace(&placeholder, &literal);
     }
     if bound.as_bytes().windows(1).any(|window| window == b"$") {
-        return None;
+        return Err(BindParameterError::CountMismatch);
     }
-    Some(bound)
+    Ok(bound)
 }
 
 fn expected_parameter_count(query: &PreparedQuery) -> usize {
@@ -3798,6 +3849,99 @@ fn expected_parameter_count(query: &PreparedQuery) -> usize {
         query.parameter_type_oids.len(),
         max_placeholder_index(&query.query),
     )
+}
+
+fn resolve_prepared_parameter_type_oids(
+    session: &Session,
+    query: &str,
+    explicit_oids: Vec<u32>,
+) -> Vec<u32> {
+    let inferred = infer_select_parameter_type_oids(session, query);
+    let max_count = std::cmp::max(
+        explicit_oids.len(),
+        inferred
+            .as_ref()
+            .map_or_else(|| max_placeholder_index(query), Vec::len),
+    );
+    if max_count == 0 {
+        return Vec::new();
+    }
+
+    let mut resolved = vec![0; max_count];
+    if let Some(inferred) = inferred {
+        for (idx, oid) in inferred.into_iter().enumerate() {
+            resolved[idx] = oid;
+        }
+    }
+    for (idx, oid) in explicit_oids.into_iter().enumerate() {
+        if oid != 0 {
+            resolved[idx] = oid;
+        }
+    }
+    resolved
+}
+
+fn infer_select_parameter_type_oids(session: &Session, query: &str) -> Option<Vec<u32>> {
+    let canonical = canonical_sql(query);
+    let max_idx = max_placeholder_index(&canonical);
+    if max_idx == 0 {
+        return Some(Vec::new());
+    }
+    let (table_name, _) = describe_parameterized_select_shape(&canonical)?;
+    let table = session.tables.get(&table_name)?;
+    let mut oids = vec![0; max_idx];
+
+    let where_clause = select_where_clause(&canonical);
+    for column in &table.columns {
+        for op in ["=", "<=", ">=", "<", ">"] {
+            let needle = format!("{} {op} $", column.def.name);
+            let mut rest = where_clause.as_str();
+            while let Some(pos) = rest.find(&needle) {
+                let digits = rest[pos + needle.len()..]
+                    .chars()
+                    .take_while(|ch| ch.is_ascii_digit())
+                    .collect::<String>();
+                if let Ok(idx) = digits.parse::<usize>() {
+                    if idx > 0 && idx <= oids.len() {
+                        oids[idx - 1] = column.def.ty.postgres_oid();
+                    }
+                }
+                rest = &rest[pos + needle.len()..];
+            }
+        }
+    }
+
+    if let Some(idx) = select_limit_placeholder_index(&canonical) {
+        if idx > 0 && idx <= oids.len() {
+            oids[idx - 1] = SqlType::Int4.postgres_oid();
+        }
+    }
+
+    Some(oids)
+}
+
+fn select_where_clause(canonical: &str) -> String {
+    let Some(where_pos) = canonical.find(" where ") else {
+        return String::new();
+    };
+    let after_where = &canonical[where_pos + " where ".len()..];
+    let end = [" order by ", " limit "]
+        .into_iter()
+        .filter_map(|marker| after_where.find(marker))
+        .min()
+        .unwrap_or(after_where.len());
+    after_where[..end].to_string()
+}
+
+fn select_limit_placeholder_index(canonical: &str) -> Option<usize> {
+    let limit_pos = canonical.rfind(" limit ")?;
+    let after_limit = canonical[limit_pos + " limit ".len()..].trim();
+    let rest = after_limit.strip_prefix('$')?;
+    rest.chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>()
+        .parse::<usize>()
+        .ok()
 }
 
 fn max_placeholder_index(query: &str) -> usize {
@@ -3825,18 +3969,53 @@ fn max_placeholder_index(query: &str) -> usize {
     max_index
 }
 
-fn encode_parameter_literal(value: &str, type_oid: u32) -> Option<String> {
+fn encode_parameter_literal(value: &str, type_oid: u32) -> Result<String, BindParameterError> {
     match type_oid {
-        23 => value.parse::<i32>().ok().map(|parsed| parsed.to_string()),
-        25 => Some(sql_quote_text(value)),
-        0 if value.parse::<i32>().is_ok() => Some(value.to_string()),
-        0 => Some(sql_quote_text(value)),
-        _ => None,
+        23 => value
+            .parse::<i32>()
+            .map(|parsed| parsed.to_string())
+            .map_err(|_| BindParameterError::InvalidTextRepresentation {
+                oid: type_oid,
+                value: value.to_string(),
+            }),
+        25 => Ok(sql_quote_text(value)),
+        0 if value.parse::<i32>().is_ok() => Ok(value.to_string()),
+        0 => Ok(sql_quote_text(value)),
+        _ => Err(BindParameterError::InvalidTextRepresentation {
+            oid: type_oid,
+            value: value.to_string(),
+        }),
     }
 }
 
 fn sql_quote_text(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
+}
+
+fn bind_parameter_error_field(error: BindParameterError) -> ErrorField {
+    match error {
+        BindParameterError::CountMismatch => ErrorField {
+            code: "08P01",
+            message: "bound parameter count does not match prepared statement",
+            position: None,
+        },
+        BindParameterError::NullUnsupported => ErrorField {
+            code: "0A000",
+            message: "NULL extended-query parameters are not supported",
+            position: None,
+        },
+        BindParameterError::InvalidTextRepresentation { oid, value } => {
+            let message = Box::leak(
+                format!("invalid input syntax for parameter type oid {oid}: \"{value}\"")
+                    .into_boxed_str(),
+            );
+            ErrorField {
+                code: "22P02",
+                message,
+                position: None,
+            }
+        }
+    }
 }
 
 fn describe_query_columns(session: &Session, query: &str) -> Option<Vec<Column>> {
@@ -5851,7 +6030,7 @@ mod tests {
 
         assert_eq!(
             bind_query_parameters(&query, &[Some("2".to_string()), Some("1".to_string())]),
-            Some("SELECT id, name FROM people WHERE id = 2 ORDER BY name LIMIT 1".to_string())
+            Ok("SELECT id, name FROM people WHERE id = 2 ORDER BY name LIMIT 1".to_string())
         );
 
         let text_query = PreparedQuery {
@@ -5860,7 +6039,7 @@ mod tests {
         };
         assert_eq!(
             bind_query_parameters(&text_query, &[Some("O'Brien".to_string())]),
-            Some("SELECT id FROM people WHERE name = 'O''Brien'".to_string())
+            Ok("SELECT id FROM people WHERE name = 'O''Brien'".to_string())
         );
     }
 
@@ -5874,15 +6053,18 @@ mod tests {
         assert_eq!(expected_parameter_count(&inferred_query), 1);
         assert_eq!(
             bind_query_parameters(&inferred_query, &[Some("2".to_string())]),
-            Some("SELECT id FROM people WHERE id = 2".to_string())
+            Ok("SELECT id FROM people WHERE id = 2".to_string())
         );
-        assert_eq!(bind_query_parameters(&inferred_query, &[]), None);
+        assert_eq!(
+            bind_query_parameters(&inferred_query, &[]),
+            Err(BindParameterError::CountMismatch)
+        );
         assert_eq!(
             bind_query_parameters(
                 &inferred_query,
                 &[Some("2".to_string()), Some("extra".to_string())]
             ),
-            None
+            Err(BindParameterError::CountMismatch)
         );
 
         let typed_query = PreparedQuery {
@@ -5890,7 +6072,72 @@ mod tests {
             parameter_type_oids: vec![23],
         };
         assert_eq!(expected_parameter_count(&typed_query), 1);
-        assert_eq!(bind_query_parameters(&typed_query, &[]), None);
+        assert_eq!(
+            bind_query_parameters(&typed_query, &[]),
+            Err(BindParameterError::CountMismatch)
+        );
+    }
+
+    #[test]
+    fn extended_parse_infers_supported_parameter_types_from_select_shape() {
+        let mut session = Session::default();
+        session.tables.insert(
+            "people".to_string(),
+            Table {
+                oid: FIRST_USER_RELATION_OID,
+                name: "people".to_string(),
+                columns: vec![
+                    CatalogColumn {
+                        attnum: 1,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "id".to_string(),
+                            ty: SqlType::Int4,
+                        },
+                    },
+                    CatalogColumn {
+                        attnum: 2,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "name".to_string(),
+                            ty: SqlType::Text,
+                        },
+                    },
+                ],
+                rows: Vec::new(),
+            },
+        );
+
+        assert_eq!(
+            resolve_prepared_parameter_type_oids(
+                &session,
+                "SELECT id FROM people WHERE id > $1 AND name = $2 LIMIT $3",
+                Vec::new(),
+            ),
+            vec![23, 25, 23]
+        );
+        assert_eq!(
+            resolve_prepared_parameter_type_oids(
+                &session,
+                "SELECT id FROM people WHERE id = $1",
+                vec![25],
+            ),
+            vec![25]
+        );
+    }
+
+    #[test]
+    fn extended_bind_rejects_invalid_values_for_inferred_int4_parameters() {
+        let query = PreparedQuery {
+            query: "SELECT id FROM people WHERE id = $1".to_string(),
+            parameter_type_oids: vec![23],
+        };
+
+        assert_eq!(
+            bind_query_parameters(&query, &[Some("not-an-int".to_string())]),
+            Err(BindParameterError::InvalidTextRepresentation {
+                oid: 23,
+                value: "not-an-int".to_string(),
+            })
+        );
     }
 
     #[test]
