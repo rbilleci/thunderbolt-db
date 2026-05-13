@@ -1,0 +1,6 @@
+=== catalog psql list materialized views and sequences empty ===
+CREATE TABLE
+psql:50_catalog_psql_list_materialized_views_sequences_empty.sql:3: error: Did not find any relations.
+psql:50_catalog_psql_list_materialized_views_sequences_empty.sql:4: error: Did not find any relations.
+psql:50_catalog_psql_list_materialized_views_sequences_empty.sql:5: error: Did not find any relations.
+psql:50_catalog_psql_list_materialized_views_sequences_empty.sql:6: error: Did not find any relations.

@@ -3,6 +3,7 @@
 ## 2026-05-13
 
 ### PostgreSQL-compatible product loop
+- Advanced P2 catalog/schema/type spine by backing PostgreSQL 16 `psql \dm` / `\dm+` materialized-view listing and `\ds` / `\ds+` sequence listing traffic for the current unsupported relation-kind subset. The compatibility endpoint now accepts those psql-emitted `pg_class` query shapes and truthfully returns no rows until SQL materialized views or sequences exist, with real psql golden coverage.
 - Advanced P2 catalog/schema/type spine by backing PostgreSQL 16 plain `psql \d` relation listing for supported `public` session tables. The compatibility endpoint now accepts the broader no-pattern psql relation-listing query shape and returns the same session-catalog table rows used by table-listing introspection, while leaving unsupported relation kinds absent.
 - Advanced P2 catalog/schema/type spine by backing PostgreSQL 16 `psql \dn+ public` verbose schema introspection for the supported `public` namespace. The compatibility endpoint now handles the psql-emitted namespace ACL/description query plus the follow-up namespace-publication probe, returning catalog-backed owner metadata and truthful empty ACL/description/publication rows for the current no-ACL/no-comment/no-publication subset.
 - Advanced P2 catalog/schema/type spine by backing direct `pg_catalog.pg_namespace` lookup for the supported `public` namespace. The compatibility endpoint now returns the stable bootstrap namespace OID/name row for common client namespace probes while keeping broader PostgreSQL namespace behavior out of scope.
