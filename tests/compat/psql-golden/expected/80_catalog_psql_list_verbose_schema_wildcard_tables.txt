@@ -1,0 +1,9 @@
+=== psql verbose schema-wildcard table listing ===
+CREATE TABLE
+CREATE TABLE
+                                             List of relations
+ Schema |            Name            | Type  |  Owner   | Persistence | Access method | Size | Description
+--------+----------------------------+-------+----------+-------------+---------------+------+-------------
+ public | verbose_schema_list_people | table | postgres | permanent   | heap          |      |
+ public | verbose_schema_list_teams  | table | postgres | permanent   | heap          |      |
+(2 rows)
