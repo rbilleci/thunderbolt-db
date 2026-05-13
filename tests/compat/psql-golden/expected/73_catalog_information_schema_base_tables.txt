@@ -1,0 +1,8 @@
+=== information_schema base table discovery ===
+CREATE TABLE
+CREATE TABLE
+ table_schema |      table_name
+--------------+-----------------------
+ public       | is_base_tables_people
+ public       | is_base_tables_teams
+(2 rows)

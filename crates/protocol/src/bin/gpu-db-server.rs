@@ -1714,6 +1714,13 @@ fn execute_statement(
             &information_schema_table_rows(session),
         );
     }
+    if canonical == information_schema_base_table_discovery_query() {
+        return write_single_row(
+            stream,
+            &[text_column("table_schema"), text_column("table_name")],
+            &information_schema_base_table_discovery_rows(session),
+        );
+    }
     if let Some(tables) = information_schema_tables_in_query_tables(&canonical) {
         return write_single_row(
             stream,
@@ -3143,6 +3150,19 @@ fn information_schema_table_rows(session: &Session) -> Vec<Vec<Option<String>>> 
                 Some("BASE TABLE".to_string()),
             ]
         })
+        .collect()
+}
+
+fn information_schema_base_table_discovery_query() -> &'static str {
+    "select table_schema, table_name from information_schema.tables where table_type = 'base table' and table_schema not in ('pg_catalog', 'information_schema') order by table_schema, table_name"
+}
+
+fn information_schema_base_table_discovery_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut tables = session.tables.values().collect::<Vec<_>>();
+    tables.sort_by(|left, right| left.name.cmp(&right.name));
+    tables
+        .into_iter()
+        .map(|table| vec![Some("public".to_string()), Some(table.name.clone())])
         .collect()
 }
 
@@ -4949,6 +4969,17 @@ mod tests {
                     Some("teams".to_string()),
                     Some("BASE TABLE".to_string()),
                 ],
+            ]
+        );
+        assert_eq!(
+            information_schema_base_table_discovery_query(),
+            "select table_schema, table_name from information_schema.tables where table_type = 'base table' and table_schema not in ('pg_catalog', 'information_schema') order by table_schema, table_name"
+        );
+        assert_eq!(
+            information_schema_base_table_discovery_rows(&session),
+            vec![
+                vec![Some("public".to_string()), Some("people".to_string())],
+                vec![Some("public".to_string()), Some("teams".to_string())],
             ]
         );
         assert_eq!(
