@@ -1,5 +1,6 @@
 # Implementation Log
 
+- 2026-05-13: Tightened P3 extended `Close` lifecycle errors. Closing a missing prepared statement now returns stable `26000`, closing a missing portal returns stable `34000`, and successful close still cleans only the requested statement/portal scope; helper-level coverage pins this raw wire path because PostgreSQL 16 `psql` does not expose stable named extended-close metacommands.
 - 2026-05-13: Tightened P3 extended `Bind` parameter-format validation for supported relational `SELECT` portals. Text parameter formats now accept the PostgreSQL-compatible zero-code default, one-code broadcast, or one-code-per-parameter shapes; mismatched multi-code parameter-format lists return a stable protocol violation without installing the portal, while binary formats remain explicitly unsupported.
 - 2026-05-13: Tightened P3 extended `Bind` result-format validation for supported relational `SELECT` portals. Text result formats now accept the PostgreSQL-compatible zero-code default, one-code broadcast, or one-code-per-result-column shapes; mismatched multi-code result-format lists return a stable protocol violation without installing the portal, while binary formats remain explicitly unsupported.
 

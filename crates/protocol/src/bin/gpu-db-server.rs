@@ -452,7 +452,7 @@ fn handle_client(mut stream: TcpStream) -> io::Result<()> {
             }
             FrontendMessage::Close { target, name } => {
                 if !extended_error_pending {
-                    handle_close(&mut stream, &mut session, target, &name)?
+                    extended_error_pending = handle_close(&mut stream, &mut session, target, &name)?
                 }
             }
             FrontendMessage::Terminate => return Ok(()),
@@ -898,9 +898,35 @@ fn handle_close(
     session: &mut Session,
     target: DescribeTarget,
     name: &str,
-) -> io::Result<()> {
+) -> io::Result<bool> {
+    match target {
+        DescribeTarget::Statement if !session.prepared.contains_key(name) => {
+            write_error(
+                stream,
+                &ErrorField {
+                    code: "26000",
+                    message: "prepared statement does not exist",
+                    position: None,
+                },
+            )?;
+            return Ok(true);
+        }
+        DescribeTarget::Portal if !session.portals.contains_key(name) => {
+            write_error(
+                stream,
+                &ErrorField {
+                    code: "34000",
+                    message: "portal does not exist",
+                    position: None,
+                },
+            )?;
+            return Ok(true);
+        }
+        DescribeTarget::Statement | DescribeTarget::Portal => {}
+    }
     session.close_extended_target(target, name);
-    write_close_complete(stream)
+    write_close_complete(stream)?;
+    Ok(false)
 }
 
 fn execute_portal_batch(
@@ -6327,6 +6353,61 @@ mod tests {
 
         session.close_extended_target(DescribeTarget::Statement, "lookup");
         assert!(!session.prepared.contains_key("lookup"));
+        assert!(!session.portals.contains_key("lookup_portal"));
+    }
+
+    #[test]
+    fn extended_close_rejects_missing_statement_and_portal_names() {
+        let mut session = Session::default();
+        let query = PreparedQuery {
+            query: "SELECT name FROM people WHERE id = $1".to_string(),
+            parameter_type_oids: vec![23],
+        };
+        session.replace_extended_statement("lookup".to_string(), query.clone());
+        session.replace_extended_portal(
+            "lookup_portal".to_string(),
+            Portal {
+                statement_name: "lookup".to_string(),
+                query,
+                parameters: vec![Some("1".to_string())],
+                described: false,
+                result: None,
+                position: 0,
+            },
+        );
+        let (mut writer, mut reader) = tcp_pair();
+
+        assert!(handle_close(
+            &mut writer,
+            &mut session,
+            DescribeTarget::Statement,
+            "missing_statement"
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'E']);
+        assert!(session.prepared.contains_key("lookup"));
+        assert!(session.portals.contains_key("lookup_portal"));
+
+        assert!(handle_close(
+            &mut writer,
+            &mut session,
+            DescribeTarget::Portal,
+            "missing_portal"
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'E']);
+        assert!(session.prepared.contains_key("lookup"));
+        assert!(session.portals.contains_key("lookup_portal"));
+
+        assert!(!handle_close(
+            &mut writer,
+            &mut session,
+            DescribeTarget::Portal,
+            "lookup_portal"
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'3']);
+        assert!(session.prepared.contains_key("lookup"));
         assert!(!session.portals.contains_key("lookup_portal"));
     }
 
