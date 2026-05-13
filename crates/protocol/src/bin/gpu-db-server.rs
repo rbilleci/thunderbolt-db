@@ -6448,6 +6448,97 @@ mod tests {
     }
 
     #[test]
+    fn extended_close_statement_cascades_to_portals_before_execute_recovery() {
+        let mut session = Session::default();
+        session.tables.insert(
+            "people".to_string(),
+            Table {
+                oid: FIRST_USER_RELATION_OID,
+                name: "people".to_string(),
+                columns: vec![
+                    CatalogColumn {
+                        attnum: 1,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "id".to_string(),
+                            ty: SqlType::Int4,
+                        },
+                    },
+                    CatalogColumn {
+                        attnum: 2,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "name".to_string(),
+                            ty: SqlType::Text,
+                        },
+                    },
+                ],
+                rows: vec![
+                    vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())],
+                    vec![SqlValue::Int4(2), SqlValue::Text("Linus".to_string())],
+                ],
+            },
+        );
+        let query = PreparedQuery {
+            query: "SELECT name FROM people WHERE id = $1".to_string(),
+            parameter_type_oids: vec![23],
+        };
+        session.replace_extended_statement("lookup".to_string(), query.clone());
+        session.replace_extended_portal(
+            "lookup_portal".to_string(),
+            Portal {
+                statement_name: "lookup".to_string(),
+                query,
+                parameters: vec![Some("1".to_string())],
+                described: false,
+                result: None,
+                position: 0,
+            },
+        );
+        let (mut writer, mut reader) = tcp_pair();
+
+        assert!(!handle_close(
+            &mut writer,
+            &mut session,
+            DescribeTarget::Statement,
+            "lookup"
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'3']);
+        assert!(!session.prepared.contains_key("lookup"));
+        assert!(!session.portals.contains_key("lookup_portal"));
+
+        assert!(handle_execute(&mut writer, &mut session, "lookup_portal", 0).unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'E']);
+
+        assert!(!handle_parse(
+            &mut writer,
+            &mut session,
+            "lookup_again".to_string(),
+            "SELECT name FROM people WHERE id = $1".to_string(),
+            vec![23]
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'1']);
+        assert!(!handle_bind(
+            &mut writer,
+            &mut session,
+            "lookup_again_portal".to_string(),
+            "lookup_again".to_string(),
+            Vec::new(),
+            vec![Some(b"2".to_vec())],
+            Vec::new()
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'2']);
+        assert!(!handle_execute(&mut writer, &mut session, "lookup_again_portal", 0).unwrap());
+        let messages = read_backend_messages(&mut reader, 3);
+        assert_eq!(
+            messages.iter().map(|(tag, _)| *tag).collect::<Vec<_>>(),
+            vec![b'T', b'D', b'C']
+        );
+        assert_eq!(messages[2].1, b"SELECT 1\0".to_vec());
+    }
+
+    #[test]
     fn extended_close_does_not_remove_sql_prepared_statements() {
         let mut session = Session::default();
         session

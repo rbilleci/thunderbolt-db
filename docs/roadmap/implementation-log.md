@@ -1,5 +1,6 @@
 # Implementation Log
 
+- 2026-05-13: Tightened P3 extended `Close Statement` cascade execution semantics. Helper-level coverage now proves closing an extended prepared statement removes its dependent portal, a later Execute against that portal returns the stable missing-portal error path, and a freshly parsed/bound supported `SELECT` portal still executes afterward.
 - 2026-05-13: Tightened P3 extended `Execute.max_rows=0` portal lifecycle semantics for supported relational `SELECT` portals. Unlimited Execute now stores and exhausts the portal result cursor through the same path as bounded Execute batches, so a later Execute on the same portal returns an empty completion instead of replaying rows from the beginning.
 - 2026-05-13: Tightened P3 extended `Bind` NULL handling for the supported relational `SELECT` subset. NULL bind payloads are explicitly unsupported and now return a stable unsupported-feature error before installing a portal, preserving the same Bind-time recovery boundary as invalid text payloads.
 - 2026-05-13: Tightened P3 extended `Bind` parameter arity validation for supported relational `SELECT` portals. Bind now rejects the wrong number of supplied parameter values with a stable protocol violation before installing the portal, and real PostgreSQL 16 `psql \bind` scenario 89 proves Sync recovery plus later correctly-bound SELECT execution.
