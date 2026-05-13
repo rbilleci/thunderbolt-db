@@ -683,6 +683,22 @@ fn handle_bind(
         )?;
         return Ok(true);
     }
+    if let Some(PreparedStatement::Extended(query)) = session.prepared.get(&statement_name) {
+        if let Some(columns) = describe_query_columns(session, &query.query) {
+            let result_format_count = result_format_codes.len();
+            if result_format_count > 1 && result_format_count != columns.len() {
+                write_error(
+                    stream,
+                    &ErrorField {
+                        code: "08P01",
+                        message: "bind message has wrong number of result format codes",
+                        position: None,
+                    },
+                )?;
+                return Ok(true);
+            }
+        }
+    }
     if !portal_name.is_empty() && session.portals.contains_key(&portal_name) {
         write_error(
             stream,
@@ -6511,6 +6527,67 @@ mod tests {
 
         assert_eq!(read_backend_tags(&mut reader, 1), vec![b'E']);
         assert!(!session.portals.contains_key("lookup_portal"));
+    }
+
+    #[test]
+    fn extended_bind_validates_result_format_code_count_for_select_columns() {
+        let mut session = Session::default();
+        session.tables.insert(
+            "people".to_string(),
+            Table {
+                oid: FIRST_USER_RELATION_OID,
+                name: "people".to_string(),
+                columns: vec![
+                    CatalogColumn {
+                        attnum: 1,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "id".to_string(),
+                            ty: SqlType::Int4,
+                        },
+                    },
+                    CatalogColumn {
+                        attnum: 2,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "name".to_string(),
+                            ty: SqlType::Text,
+                        },
+                    },
+                ],
+                rows: Vec::new(),
+            },
+        );
+        let query = PreparedQuery {
+            query: "SELECT id, name FROM people WHERE id = $1".to_string(),
+            parameter_type_oids: vec![23],
+        };
+        session.replace_extended_statement("lookup".to_string(), query);
+        let (mut writer, mut reader) = tcp_pair();
+
+        assert!(handle_bind(
+            &mut writer,
+            &mut session,
+            "bad_format_portal".to_string(),
+            "lookup".to_string(),
+            Vec::new(),
+            vec![Some(b"1".to_vec())],
+            vec![0, 0, 0]
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'E']);
+        assert!(!session.portals.contains_key("bad_format_portal"));
+
+        assert!(!handle_bind(
+            &mut writer,
+            &mut session,
+            "per_column_format_portal".to_string(),
+            "lookup".to_string(),
+            Vec::new(),
+            vec![Some(b"1".to_vec())],
+            vec![0, 0]
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'2']);
+        assert!(session.portals.contains_key("per_column_format_portal"));
     }
 
     #[test]

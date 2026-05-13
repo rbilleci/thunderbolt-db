@@ -1,5 +1,7 @@
 # Implementation Log
 
+- 2026-05-13: Tightened P3 extended `Bind` result-format validation for supported relational `SELECT` portals. Text result formats now accept the PostgreSQL-compatible zero-code default, one-code broadcast, or one-code-per-result-column shapes; mismatched multi-code result-format lists return a stable protocol violation without installing the portal, while binary formats remain explicitly unsupported.
+
 ## 2026-05-13
 
 ### PostgreSQL-compatible product loop
