@@ -42,6 +42,14 @@ fn int4_column(name: &str) -> Column {
     }
 }
 
+fn bool_column(name: &str) -> Column {
+    Column {
+        name: name.to_string(),
+        oid: 16,
+        type_size: 1,
+    }
+}
+
 fn sql_value_matches_type(value: &SqlValue, ty: gpu_db_protocol::SqlType) -> bool {
     matches!(
         (value, ty),
@@ -1064,6 +1072,24 @@ fn execute_statement(
             &catalog_empty_rows(),
         );
     }
+    if canonical == psql_describe_roles_catalog_query() {
+        return write_single_row(
+            stream,
+            &[
+                text_column("rolname"),
+                bool_column("rolsuper"),
+                bool_column("rolinherit"),
+                bool_column("rolcreaterole"),
+                bool_column("rolcreatedb"),
+                bool_column("rolcanlogin"),
+                int4_column("rolconnlimit"),
+                text_column("rolvaliduntil"),
+                bool_column("rolreplication"),
+                bool_column("rolbypassrls"),
+            ],
+            &catalog_psql_describe_role_rows(),
+        );
+    }
     if canonical == psql_describe_schemas_catalog_query() {
         return write_single_row(
             stream,
@@ -1965,6 +1991,25 @@ fn psql_describe_sequences_verbose_catalog_query() -> &'static str {
 
 fn psql_describe_functions_catalog_query() -> &'static str {
     "select n.nspname as \"schema\", p.proname as \"name\", pg_catalog.pg_get_function_result(p.oid) as \"result data type\", pg_catalog.pg_get_function_arguments(p.oid) as \"argument data types\", case p.prokind when 'a' then 'agg' when 'w' then 'window' when 'p' then 'proc' else 'func' end as \"type\" from pg_catalog.pg_proc p left join pg_catalog.pg_namespace n on n.oid = p.pronamespace where pg_catalog.pg_function_is_visible(p.oid) and n.nspname <> 'pg_catalog' and n.nspname <> 'information_schema' order by 1, 2, 4"
+}
+
+fn psql_describe_roles_catalog_query() -> &'static str {
+    "select r.rolname, r.rolsuper, r.rolinherit, r.rolcreaterole, r.rolcreatedb, r.rolcanlogin, r.rolconnlimit, r.rolvaliduntil , r.rolreplication , r.rolbypassrls from pg_catalog.pg_roles r where r.rolname !~ '^pg_' order by 1"
+}
+
+fn catalog_psql_describe_role_rows() -> Vec<Vec<Option<String>>> {
+    vec![vec![
+        Some("postgres".to_string()),
+        Some("t".to_string()),
+        Some("t".to_string()),
+        Some("t".to_string()),
+        Some("t".to_string()),
+        Some("t".to_string()),
+        Some("-1".to_string()),
+        None,
+        Some("t".to_string()),
+        Some("t".to_string()),
+    ]]
 }
 
 fn psql_describe_schemas_catalog_query() -> &'static str {
@@ -3627,6 +3672,25 @@ mod tests {
         assert_eq!(
             psql_describe_functions_catalog_query(),
             "select n.nspname as \"schema\", p.proname as \"name\", pg_catalog.pg_get_function_result(p.oid) as \"result data type\", pg_catalog.pg_get_function_arguments(p.oid) as \"argument data types\", case p.prokind when 'a' then 'agg' when 'w' then 'window' when 'p' then 'proc' else 'func' end as \"type\" from pg_catalog.pg_proc p left join pg_catalog.pg_namespace n on n.oid = p.pronamespace where pg_catalog.pg_function_is_visible(p.oid) and n.nspname <> 'pg_catalog' and n.nspname <> 'information_schema' order by 1, 2, 4"
+        );
+        assert_eq!(
+            psql_describe_roles_catalog_query(),
+            "select r.rolname, r.rolsuper, r.rolinherit, r.rolcreaterole, r.rolcreatedb, r.rolcanlogin, r.rolconnlimit, r.rolvaliduntil , r.rolreplication , r.rolbypassrls from pg_catalog.pg_roles r where r.rolname !~ '^pg_' order by 1"
+        );
+        assert_eq!(
+            catalog_psql_describe_role_rows(),
+            vec![vec![
+                Some("postgres".to_string()),
+                Some("t".to_string()),
+                Some("t".to_string()),
+                Some("t".to_string()),
+                Some("t".to_string()),
+                Some("t".to_string()),
+                Some("-1".to_string()),
+                None,
+                Some("t".to_string()),
+                Some("t".to_string()),
+            ]]
         );
         assert!(catalog_empty_rows().is_empty());
         assert!(catalog_psql_describe_table_rows_filtered(
