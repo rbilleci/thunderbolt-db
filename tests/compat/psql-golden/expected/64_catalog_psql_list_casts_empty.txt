@@ -1,0 +1,5 @@
+=== catalog psql list casts empty ===
+                  List of casts
+ Source type | Target type | Function | Implicit?
+-------------+-------------+----------+-----------
+(0 rows)
