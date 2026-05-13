@@ -1973,6 +1973,24 @@ fn execute_statement(
             &information_schema_key_column_usage_rows(session),
         );
     }
+    if canonical == information_schema_views_query() {
+        return write_single_row(
+            stream,
+            &[
+                text_column("table_catalog"),
+                text_column("table_schema"),
+                text_column("table_name"),
+                text_column("view_definition"),
+                text_column("check_option"),
+                text_column("is_updatable"),
+                text_column("is_insertable_into"),
+                text_column("is_trigger_updatable"),
+                text_column("is_trigger_deletable"),
+                text_column("is_trigger_insertable"),
+            ],
+            &information_schema_view_rows(session),
+        );
+    }
     if canonical == pg_catalog_constraints_query() {
         return write_single_row(
             stream,
@@ -3517,6 +3535,15 @@ fn information_schema_key_column_usage_query() -> &'static str {
 }
 
 fn information_schema_key_column_usage_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let _supported_plain_table_count = session.tables.len();
+    Vec::new()
+}
+
+fn information_schema_views_query() -> &'static str {
+    "select table_catalog, table_schema, table_name, view_definition, check_option, is_updatable, is_insertable_into, is_trigger_updatable, is_trigger_deletable, is_trigger_insertable from information_schema.views where table_schema = 'public' order by table_name"
+}
+
+fn information_schema_view_rows(session: &Session) -> Vec<Vec<Option<String>>> {
     let _supported_plain_table_count = session.tables.len();
     Vec::new()
 }
@@ -5352,6 +5379,11 @@ mod tests {
             "select table_schema, table_name, column_name, constraint_name, ordinal_position from information_schema.key_column_usage where table_schema = 'public' order by table_name, ordinal_position"
         );
         assert!(information_schema_key_column_usage_rows(&session).is_empty());
+        assert_eq!(
+            information_schema_views_query(),
+            "select table_catalog, table_schema, table_name, view_definition, check_option, is_updatable, is_insertable_into, is_trigger_updatable, is_trigger_deletable, is_trigger_insertable from information_schema.views where table_schema = 'public' order by table_name"
+        );
+        assert!(information_schema_view_rows(&session).is_empty());
         assert_eq!(
             pg_catalog_constraints_query(),
             "select n.nspname, c.relname, con.conname, con.contype from pg_catalog.pg_constraint con join pg_catalog.pg_class c on c.oid = con.conrelid join pg_catalog.pg_namespace n on n.oid = c.relnamespace where n.nspname = 'public' order by c.relname, con.conname"
