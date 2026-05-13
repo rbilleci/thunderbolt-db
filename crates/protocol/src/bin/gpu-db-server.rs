@@ -637,6 +637,17 @@ fn handle_parse(
         )?;
         return Ok(true);
     }
+    if parameter_type_oids.len() > max_placeholder_index(&query) {
+        write_error(
+            stream,
+            &ErrorField {
+                code: "08P01",
+                message: "parse message has too many parameter type oids",
+                position: None,
+            },
+        )?;
+        return Ok(true);
+    }
     if describe_query_columns(session, &query).is_none() {
         write_error(
             stream,
@@ -6688,6 +6699,64 @@ mod tests {
 
         assert_eq!(read_backend_tags(&mut reader, 1), vec![b'E']);
         assert!(!session.prepared.contains_key("insert_people"));
+    }
+
+    #[test]
+    fn extended_parse_rejects_extra_parameter_type_oids_without_installing_statement() {
+        let mut session = Session::default();
+        session.tables.insert(
+            "people".to_string(),
+            Table {
+                oid: FIRST_USER_RELATION_OID,
+                name: "people".to_string(),
+                columns: vec![
+                    CatalogColumn {
+                        attnum: 1,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "id".to_string(),
+                            ty: SqlType::Int4,
+                        },
+                    },
+                    CatalogColumn {
+                        attnum: 2,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "name".to_string(),
+                            ty: SqlType::Text,
+                        },
+                    },
+                ],
+                rows: Vec::new(),
+            },
+        );
+        let (mut writer, mut reader) = tcp_pair();
+
+        assert!(handle_parse(
+            &mut writer,
+            &mut session,
+            "lookup".to_string(),
+            "SELECT name FROM people WHERE id = $1".to_string(),
+            vec![23, 25]
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'E']);
+        assert!(!session.prepared.contains_key("lookup"));
+
+        assert!(!handle_parse(
+            &mut writer,
+            &mut session,
+            "lookup".to_string(),
+            "SELECT name FROM people WHERE id = $1".to_string(),
+            vec![23]
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'1']);
+        assert_eq!(
+            session.prepared.get("lookup"),
+            Some(&PreparedStatement::Extended(PreparedQuery {
+                query: "SELECT name FROM people WHERE id = $1".to_string(),
+                parameter_type_oids: vec![23],
+            }))
+        );
     }
 
     #[test]
