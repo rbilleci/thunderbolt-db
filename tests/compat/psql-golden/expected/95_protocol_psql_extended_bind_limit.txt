@@ -1,0 +1,14 @@
+=== psql extended bind predicate and limit parameters ===
+CREATE TABLE
+INSERT 0 4
+ id | name
+----+-------
+  2 | Linus
+  3 | Grace
+(2 rows)
+
+ id |  name
+----+--------
+  3 | Grace
+  4 | Edsger
+(2 rows)
