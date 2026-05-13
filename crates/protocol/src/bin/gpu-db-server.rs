@@ -697,6 +697,13 @@ fn handle_bind(
             )?;
             return Ok(true);
         }
+        if parameters.iter().any(Option::is_none) {
+            write_error(
+                stream,
+                &bind_parameter_error_field(BindParameterError::NullUnsupported),
+            )?;
+            return Ok(true);
+        }
         if !format_code_count_is_valid(parameter_format_count, expected_parameter_count) {
             write_error(
                 stream,
@@ -6667,6 +6674,31 @@ mod tests {
             "lookup".to_string(),
             Vec::new(),
             vec![Some(vec![0xff])],
+            Vec::new()
+        )
+        .unwrap());
+
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'E']);
+        assert!(!session.portals.contains_key("lookup_portal"));
+    }
+
+    #[test]
+    fn extended_bind_rejects_null_parameters_without_installing_portal() {
+        let mut session = Session::default();
+        let query = PreparedQuery {
+            query: "SELECT name FROM people WHERE name = $1".to_string(),
+            parameter_type_oids: vec![25],
+        };
+        session.replace_extended_statement("lookup".to_string(), query);
+        let (mut writer, mut reader) = tcp_pair();
+
+        assert!(handle_bind(
+            &mut writer,
+            &mut session,
+            "lookup_portal".to_string(),
+            "lookup".to_string(),
+            Vec::new(),
+            vec![None],
             Vec::new()
         )
         .unwrap());
