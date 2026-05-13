@@ -2009,6 +2009,18 @@ fn execute_statement(
             &pg_catalog_description_rows(session),
         );
     }
+    if psql_list_object_descriptions_query(&canonical) {
+        return write_single_row(
+            stream,
+            &[
+                text_column("Schema"),
+                text_column("Name"),
+                text_column("Object"),
+                text_column("Description"),
+            ],
+            &catalog_empty_rows(),
+        );
+    }
     if canonical
         == "select oid, typname, typlen from pg_catalog.pg_type where oid in (23, 25) order by oid"
     {
@@ -3540,6 +3552,19 @@ fn pg_catalog_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
     Vec::new()
 }
 
+fn psql_list_object_descriptions_query(canonical: &str) -> bool {
+    canonical.starts_with(
+        "select distinct tt.nspname as \"schema\", tt.name as \"name\", tt.object as \"object\", d.description as \"description\" from ( select pgc.oid as oid, pgc.tableoid as tableoid",
+    ) && canonical.contains("cast('table constraint' as pg_catalog.text) as object")
+        && canonical.contains("cast('domain constraint' as pg_catalog.text) as object")
+        && canonical.contains("cast('operator class' as pg_catalog.text) as object")
+        && canonical.contains("cast('operator family' as pg_catalog.text) as object")
+        && canonical.contains("cast('rule' as pg_catalog.text) as object")
+        && canonical.contains("cast('trigger' as pg_catalog.text) as object")
+        && canonical.contains("join pg_catalog.pg_description d on (tt.oid = d.objoid and tt.tableoid = d.classoid and d.objsubid = 0)")
+        && canonical.ends_with("order by 1, 2, 3")
+}
+
 fn catalog_type_rows_by_oid() -> Vec<Vec<Option<String>>> {
     let mut types = SUPPORTED_SQL_TYPES;
     types.sort_by_key(|ty| ty.postgres_oid());
@@ -4763,6 +4788,73 @@ mod tests {
             "select n.nspname, c.relname, a.attname, d.description from pg_catalog.pg_description d join pg_catalog.pg_class c on c.oid = d.objoid join pg_catalog.pg_namespace n on n.oid = c.relnamespace left join pg_catalog.pg_attribute a on a.attrelid = c.oid and a.attnum = d.objsubid where n.nspname = 'public' and c.relkind = 'r' order by c.relname, d.objsubid"
         );
         assert!(pg_catalog_description_rows(&session).is_empty());
+        assert!(psql_list_object_descriptions_query(&canonical_sql(
+            "SELECT DISTINCT tt.nspname AS \"Schema\", tt.name AS \"Name\", tt.object AS \"Object\", d.description AS \"Description\"
+             FROM (
+               SELECT pgc.oid as oid, pgc.tableoid AS tableoid,
+               n.nspname as nspname,
+               CAST(pgc.conname AS pg_catalog.text) as name, CAST('table constraint' AS pg_catalog.text) as object
+               FROM pg_catalog.pg_constraint pgc
+               JOIN pg_catalog.pg_class c ON c.oid = pgc.conrelid
+               LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+               WHERE n.nspname <> 'pg_catalog' AND n.nspname <> 'information_schema'
+                 AND pg_catalog.pg_table_is_visible(c.oid)
+             UNION ALL
+               SELECT pgc.oid as oid, pgc.tableoid AS tableoid,
+               n.nspname as nspname,
+               CAST(pgc.conname AS pg_catalog.text) as name, CAST('domain constraint' AS pg_catalog.text) as object
+               FROM pg_catalog.pg_constraint pgc
+               JOIN pg_catalog.pg_type t ON t.oid = pgc.contypid
+               LEFT JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
+               WHERE n.nspname <> 'pg_catalog' AND n.nspname <> 'information_schema'
+                 AND pg_catalog.pg_type_is_visible(t.oid)
+             UNION ALL
+               SELECT o.oid as oid, o.tableoid as tableoid,
+               n.nspname as nspname,
+               CAST(o.opcname AS pg_catalog.text) as name,
+               CAST('operator class' AS pg_catalog.text) as object
+               FROM pg_catalog.pg_opclass o
+               JOIN pg_catalog.pg_am am ON o.opcmethod = am.oid
+               JOIN pg_catalog.pg_namespace n ON n.oid = o.opcnamespace
+                 AND n.nspname <> 'pg_catalog'
+                 AND n.nspname <> 'information_schema'
+                 AND pg_catalog.pg_opclass_is_visible(o.oid)
+             UNION ALL
+               SELECT opf.oid as oid, opf.tableoid as tableoid,
+               n.nspname as nspname,
+               CAST(opf.opfname AS pg_catalog.text) AS name,
+               CAST('operator family' AS pg_catalog.text) as object
+               FROM pg_catalog.pg_opfamily opf
+               JOIN pg_catalog.pg_am am ON opf.opfmethod = am.oid
+               JOIN pg_catalog.pg_namespace n ON opf.opfnamespace = n.oid
+                 AND n.nspname <> 'pg_catalog'
+                 AND n.nspname <> 'information_schema'
+                 AND pg_catalog.pg_opfamily_is_visible(opf.oid)
+             UNION ALL
+               SELECT r.oid as oid, r.tableoid as tableoid,
+               n.nspname as nspname,
+               CAST(r.rulename AS pg_catalog.text) as name, CAST('rule' AS pg_catalog.text) as object
+               FROM pg_catalog.pg_rewrite r
+               JOIN pg_catalog.pg_class c ON c.oid = r.ev_class
+               LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+               WHERE r.rulename != '_RETURN'
+                 AND n.nspname <> 'pg_catalog'
+                 AND n.nspname <> 'information_schema'
+                 AND pg_catalog.pg_table_is_visible(c.oid)
+             UNION ALL
+               SELECT t.oid as oid, t.tableoid as tableoid,
+               n.nspname as nspname,
+               CAST(t.tgname AS pg_catalog.text) as name, CAST('trigger' AS pg_catalog.text) as object
+               FROM pg_catalog.pg_trigger t
+               JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid
+               LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+               WHERE n.nspname <> 'pg_catalog'
+                 AND n.nspname <> 'information_schema'
+                 AND pg_catalog.pg_table_is_visible(c.oid)
+             ) AS tt
+             JOIN pg_catalog.pg_description d ON (tt.oid = d.objoid AND tt.tableoid = d.classoid AND d.objsubid = 0)
+             ORDER BY 1, 2, 3;"
+        )));
         assert_eq!(
             information_schema_table_rows(&session),
             vec![

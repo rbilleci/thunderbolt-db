@@ -1,0 +1,5 @@
+=== catalog psql list object descriptions empty ===
+         Object descriptions
+ Schema | Name | Object | Description
+--------+------+--------+-------------
+(0 rows)
