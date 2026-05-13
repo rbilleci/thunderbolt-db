@@ -989,12 +989,26 @@ fn execute_fetch_forward(
     )
 }
 
+fn is_copy_statement(statement: &str) -> bool {
+    canonical_sql(statement).starts_with("copy ")
+}
+
 fn execute_statement(
     stream: &mut TcpStream,
     session: &mut Session,
     statement: &str,
     include_row_description: bool,
 ) -> io::Result<()> {
+    if is_copy_statement(statement) {
+        return write_error(
+            stream,
+            &ErrorField {
+                code: "0A000",
+                message: "COPY is not supported by the compatibility endpoint",
+                position: None,
+            },
+        );
+    }
     if let Some((name, query)) = parse_declare_cursor(statement) {
         return execute_declare_cursor(stream, session, name, &query);
     }

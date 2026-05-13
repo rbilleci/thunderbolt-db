@@ -21,8 +21,8 @@
     "protocol.error_paths": {
       "failed": 0,
       "ignored": 0,
-      "passed": 13,
-      "total": 13
+      "passed": 14,
+      "total": 14
     },
     "protocol.extended_query": {
       "failed": 0,
@@ -89,8 +89,8 @@
   "totals": {
     "failed": 0,
     "ignored": 0,
-    "passed": 670,
-    "total": 670
+    "passed": 671,
+    "total": 671
   },
   "trend_hook": {
     "baseline_available": true,
