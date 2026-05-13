@@ -1,0 +1,15 @@
+=== psql list supported pg_catalog types ===
+         List of data types
+   Schema   |  Name   | Description
+------------+---------+-------------
+ pg_catalog | integer |
+ pg_catalog | text    |
+(2 rows)
+
+=== psql list supported pg_catalog types verbose ===
+                                         List of data types
+   Schema   |  Name   | Internal name | Size | Elements |  Owner   | Access privileges | Description
+------------+---------+---------------+------+----------+----------+-------------------+-------------
+ pg_catalog | integer | int4          | 4    |          | postgres |                   |
+ pg_catalog | text    | text          | var  |          | postgres |                   |
+(2 rows)

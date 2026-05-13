@@ -1189,6 +1189,33 @@ fn execute_statement(
             &catalog_psql_describe_type_rows(&type_name),
         );
     }
+    if canonical == psql_describe_pg_catalog_types_query() {
+        return write_single_row(
+            stream,
+            &[
+                text_column("Schema"),
+                text_column("Name"),
+                text_column("Description"),
+            ],
+            &catalog_psql_describe_type_rows_for_supported_types(),
+        );
+    }
+    if canonical == psql_describe_pg_catalog_types_verbose_query() {
+        return write_single_row(
+            stream,
+            &[
+                text_column("Schema"),
+                text_column("Name"),
+                text_column("Internal name"),
+                text_column("Size"),
+                text_column("Elements"),
+                text_column("Owner"),
+                text_column("Access privileges"),
+                text_column("Description"),
+            ],
+            &catalog_psql_describe_type_verbose_rows_for_supported_types(),
+        );
+    }
     if catalog_describe_relation_lookup_query_public_namespace(&canonical) {
         return write_single_row(
             stream,
@@ -2149,6 +2176,14 @@ fn psql_describe_type_catalog_query_type(canonical: &str) -> Option<String> {
         .then(|| type_name.to_string())
 }
 
+fn psql_describe_pg_catalog_types_query() -> &'static str {
+    "select n.nspname as \"schema\", pg_catalog.format_type(t.oid, null) as \"name\", pg_catalog.obj_description(t.oid, 'pg_type') as \"description\" from pg_catalog.pg_type t left join pg_catalog.pg_namespace n on n.oid = t.typnamespace where (t.typrelid = 0 or (select c.relkind = 'c' from pg_catalog.pg_class c where c.oid = t.typrelid)) and not exists(select 1 from pg_catalog.pg_type el where el.oid = t.typelem and el.typarray = t.oid) and n.nspname operator(pg_catalog.~) '^(pg_catalog)$' collate pg_catalog.default order by 1, 2"
+}
+
+fn psql_describe_pg_catalog_types_verbose_query() -> &'static str {
+    "select n.nspname as \"schema\", pg_catalog.format_type(t.oid, null) as \"name\", t.typname as \"internal name\", case when t.typrelid != 0 then cast('tuple' as pg_catalog.text) when t.typlen < 0 then cast('var' as pg_catalog.text) else cast(t.typlen as pg_catalog.text) end as \"size\", pg_catalog.array_to_string( array( select e.enumlabel from pg_catalog.pg_enum e where e.enumtypid = t.oid order by e.enumsortorder ), e'\\n' ) as \"elements\", pg_catalog.pg_get_userbyid(t.typowner) as \"owner\", pg_catalog.array_to_string(t.typacl, e'\\n') as \"access privileges\", pg_catalog.obj_description(t.oid, 'pg_type') as \"description\" from pg_catalog.pg_type t left join pg_catalog.pg_namespace n on n.oid = t.typnamespace where (t.typrelid = 0 or (select c.relkind = 'c' from pg_catalog.pg_class c where c.oid = t.typrelid)) and not exists(select 1 from pg_catalog.pg_type el where el.oid = t.typelem and el.typarray = t.oid) and n.nspname operator(pg_catalog.~) '^(pg_catalog)$' collate pg_catalog.default order by 1, 2"
+}
+
 fn sql_type_by_catalog_or_display_name(name: &str) -> Option<SqlType> {
     SUPPORTED_SQL_TYPES
         .into_iter()
@@ -2164,6 +2199,51 @@ fn catalog_psql_describe_type_rows(type_name: &str) -> Vec<Vec<Option<String>>> 
         Some(sql_type_display_name(ty).to_string()),
         None,
     ]]
+}
+
+fn supported_sql_types_by_display_name() -> Vec<SqlType> {
+    let mut types = SUPPORTED_SQL_TYPES.to_vec();
+    types.sort_by_key(|ty| sql_type_display_name(*ty));
+    types
+}
+
+fn catalog_psql_describe_type_rows_for_supported_types() -> Vec<Vec<Option<String>>> {
+    supported_sql_types_by_display_name()
+        .into_iter()
+        .map(|ty| {
+            vec![
+                Some("pg_catalog".to_string()),
+                Some(sql_type_display_name(ty).to_string()),
+                None,
+            ]
+        })
+        .collect()
+}
+
+fn catalog_psql_describe_type_verbose_rows_for_supported_types() -> Vec<Vec<Option<String>>> {
+    supported_sql_types_by_display_name()
+        .into_iter()
+        .map(|ty| {
+            vec![
+                Some("pg_catalog".to_string()),
+                Some(sql_type_display_name(ty).to_string()),
+                Some(ty.catalog_name().to_string()),
+                Some(sql_type_psql_size(ty).to_string()),
+                None,
+                Some("postgres".to_string()),
+                None,
+                None,
+            ]
+        })
+        .collect()
+}
+
+fn sql_type_psql_size(ty: SqlType) -> &'static str {
+    match ty.type_size() {
+        -1 => "var",
+        4 => "4",
+        _ => "",
+    }
 }
 
 fn catalog_psql_describe_table_rows(session: &Session) -> Vec<Vec<Option<String>>> {
@@ -3927,6 +4007,50 @@ mod tests {
                 Some("text".to_string()),
                 None
             ]]
+        );
+        assert_eq!(
+            psql_describe_pg_catalog_types_query(),
+            "select n.nspname as \"schema\", pg_catalog.format_type(t.oid, null) as \"name\", pg_catalog.obj_description(t.oid, 'pg_type') as \"description\" from pg_catalog.pg_type t left join pg_catalog.pg_namespace n on n.oid = t.typnamespace where (t.typrelid = 0 or (select c.relkind = 'c' from pg_catalog.pg_class c where c.oid = t.typrelid)) and not exists(select 1 from pg_catalog.pg_type el where el.oid = t.typelem and el.typarray = t.oid) and n.nspname operator(pg_catalog.~) '^(pg_catalog)$' collate pg_catalog.default order by 1, 2"
+        );
+        assert_eq!(
+            catalog_psql_describe_type_rows_for_supported_types(),
+            vec![
+                vec![
+                    Some("pg_catalog".to_string()),
+                    Some("integer".to_string()),
+                    None
+                ],
+                vec![
+                    Some("pg_catalog".to_string()),
+                    Some("text".to_string()),
+                    None
+                ],
+            ]
+        );
+        assert_eq!(
+            catalog_psql_describe_type_verbose_rows_for_supported_types(),
+            vec![
+                vec![
+                    Some("pg_catalog".to_string()),
+                    Some("integer".to_string()),
+                    Some("int4".to_string()),
+                    Some("4".to_string()),
+                    None,
+                    Some("postgres".to_string()),
+                    None,
+                    None,
+                ],
+                vec![
+                    Some("pg_catalog".to_string()),
+                    Some("text".to_string()),
+                    Some("text".to_string()),
+                    Some("var".to_string()),
+                    None,
+                    Some("postgres".to_string()),
+                    None,
+                    None,
+                ],
+            ]
         );
         assert_eq!(
             catalog_describe_relation_lookup_query_table(
