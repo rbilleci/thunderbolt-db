@@ -1,0 +1,14 @@
+=== psql close missing cursor recovery ===
+CREATE TABLE
+INSERT 0 2
+DECLARE CURSOR
+psql:88_protocol_psql_close_missing_cursor.sql:5: ERROR:  cursor does not exist
+ id | name
+----+------
+  1 | Ada
+(1 row)
+
+ name
+-------
+ Linus
+(1 row)

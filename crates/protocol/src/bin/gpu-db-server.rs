@@ -1131,7 +1131,16 @@ fn execute_statement(
         match target {
             CloseCursorTarget::All => session.cursors.clear(),
             CloseCursorTarget::Named(name) => {
-                session.cursors.remove(&name);
+                if session.cursors.remove(&name).is_none() {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "34000",
+                            message: "cursor does not exist",
+                            position: None,
+                        },
+                    );
+                }
             }
         }
         return write_command_complete(stream, "CLOSE CURSOR");
@@ -6925,6 +6934,28 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn extended_cursor_close_missing_name_errors_without_clearing_live_cursors() {
+        let mut session = Session::default();
+        session.cursors.insert(
+            "live_cursor".to_string(),
+            Cursor {
+                columns: vec![int4_column("id")],
+                rows: vec![vec![Some("1".to_string())]],
+                position: 0,
+            },
+        );
+        let (mut writer, mut reader) = tcp_pair();
+
+        execute_statement(&mut writer, &mut session, "CLOSE missing_cursor", true).unwrap();
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'E']);
+        assert!(session.cursors.contains_key("live_cursor"));
+
+        execute_statement(&mut writer, &mut session, "CLOSE live_cursor", true).unwrap();
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'C']);
+        assert!(!session.cursors.contains_key("live_cursor"));
     }
 
     #[test]
