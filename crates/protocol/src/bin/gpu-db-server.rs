@@ -1991,6 +1991,18 @@ fn execute_statement(
             &information_schema_view_rows(session),
         );
     }
+    if canonical == pg_catalog_views_query() {
+        return write_single_row(
+            stream,
+            &[
+                text_column("schemaname"),
+                text_column("viewname"),
+                text_column("viewowner"),
+                text_column("definition"),
+            ],
+            &pg_catalog_view_rows(session),
+        );
+    }
     if canonical == pg_catalog_constraints_query() {
         return write_single_row(
             stream,
@@ -3544,6 +3556,15 @@ fn information_schema_views_query() -> &'static str {
 }
 
 fn information_schema_view_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let _supported_plain_table_count = session.tables.len();
+    Vec::new()
+}
+
+fn pg_catalog_views_query() -> &'static str {
+    "select schemaname, viewname, viewowner, definition from pg_catalog.pg_views where schemaname = 'public' order by viewname"
+}
+
+fn pg_catalog_view_rows(session: &Session) -> Vec<Vec<Option<String>>> {
     let _supported_plain_table_count = session.tables.len();
     Vec::new()
 }
@@ -5384,6 +5405,11 @@ mod tests {
             "select table_catalog, table_schema, table_name, view_definition, check_option, is_updatable, is_insertable_into, is_trigger_updatable, is_trigger_deletable, is_trigger_insertable from information_schema.views where table_schema = 'public' order by table_name"
         );
         assert!(information_schema_view_rows(&session).is_empty());
+        assert_eq!(
+            pg_catalog_views_query(),
+            "select schemaname, viewname, viewowner, definition from pg_catalog.pg_views where schemaname = 'public' order by viewname"
+        );
+        assert!(pg_catalog_view_rows(&session).is_empty());
         assert_eq!(
             pg_catalog_constraints_query(),
             "select n.nspname, c.relname, con.conname, con.contype from pg_catalog.pg_constraint con join pg_catalog.pg_class c on c.oid = con.conrelid join pg_catalog.pg_namespace n on n.oid = c.relnamespace where n.nspname = 'public' order by c.relname, con.conname"

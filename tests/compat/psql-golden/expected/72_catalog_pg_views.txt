@@ -1,0 +1,5 @@
+=== pg_catalog empty view metadata ===
+CREATE TABLE
+ schemaname | viewname | viewowner | definition
+------------+----------+-----------+------------
+(0 rows)
