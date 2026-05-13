@@ -1,0 +1,6 @@
+=== catalog psql list languages empty ===
+Pager usage is off.
+          List of languages
+ Name | Owner | Trusted | Description
+------+-------+---------+-------------
+(0 rows)

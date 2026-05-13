@@ -1084,6 +1084,18 @@ fn execute_statement(
             &catalog_empty_rows(),
         );
     }
+    if canonical == psql_list_languages_catalog_query() {
+        return write_single_row(
+            stream,
+            &[
+                text_column("Name"),
+                text_column("Owner"),
+                bool_column("Trusted"),
+                text_column("Description"),
+            ],
+            &catalog_empty_rows(),
+        );
+    }
     if canonical == psql_describe_roles_catalog_query() {
         return write_single_row(
             stream,
@@ -2035,6 +2047,10 @@ fn psql_describe_functions_catalog_query() -> &'static str {
 
 fn psql_list_extensions_catalog_query() -> &'static str {
     "select e.extname as \"name\", e.extversion as \"version\", n.nspname as \"schema\", c.description as \"description\" from pg_catalog.pg_extension e left join pg_catalog.pg_namespace n on n.oid = e.extnamespace left join pg_catalog.pg_description c on c.objoid = e.oid and c.classoid = 'pg_catalog.pg_extension'::pg_catalog.regclass order by 1"
+}
+
+fn psql_list_languages_catalog_query() -> &'static str {
+    "select l.lanname as \"name\", pg_catalog.pg_get_userbyid(l.lanowner) as \"owner\", l.lanpltrusted as \"trusted\", d.description as \"description\" from pg_catalog.pg_language l left join pg_catalog.pg_description d on d.classoid = l.tableoid and d.objoid = l.oid and d.objsubid = 0 where l.lanplcallfoid != 0 order by 1"
 }
 
 fn psql_describe_roles_catalog_query() -> &'static str {
@@ -3757,6 +3773,10 @@ mod tests {
         assert_eq!(
             psql_list_extensions_catalog_query(),
             "select e.extname as \"name\", e.extversion as \"version\", n.nspname as \"schema\", c.description as \"description\" from pg_catalog.pg_extension e left join pg_catalog.pg_namespace n on n.oid = e.extnamespace left join pg_catalog.pg_description c on c.objoid = e.oid and c.classoid = 'pg_catalog.pg_extension'::pg_catalog.regclass order by 1"
+        );
+        assert_eq!(
+            psql_list_languages_catalog_query(),
+            "select l.lanname as \"name\", pg_catalog.pg_get_userbyid(l.lanowner) as \"owner\", l.lanpltrusted as \"trusted\", d.description as \"description\" from pg_catalog.pg_language l left join pg_catalog.pg_description d on d.classoid = l.tableoid and d.objoid = l.oid and d.objsubid = 0 where l.lanplcallfoid != 0 order by 1"
         );
         assert_eq!(
             psql_describe_roles_catalog_query(),
