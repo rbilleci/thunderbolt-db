@@ -621,6 +621,7 @@ fn handle_parse(
     query: String,
     parameter_type_oids: Vec<u32>,
 ) -> io::Result<bool> {
+    let query = strip_sql_comments(&query);
     if !statement_name.is_empty() && session.prepared.contains_key(&statement_name) {
         write_error(
             stream,
@@ -4329,6 +4330,72 @@ fn unquoted_sql_fragments(query: &str) -> Vec<&str> {
     fragments
 }
 
+fn strip_sql_comments(query: &str) -> String {
+    let mut stripped = String::with_capacity(query.len());
+    let mut chars = query.char_indices().peekable();
+    let mut last_pushed = 0;
+    let mut in_quote = false;
+
+    while let Some((idx, ch)) = chars.next() {
+        if ch == '\'' {
+            if in_quote && matches!(chars.peek(), Some((_, '\''))) {
+                chars.next();
+                continue;
+            }
+            in_quote = !in_quote;
+            continue;
+        }
+        if in_quote || ch != '-' && ch != '/' {
+            continue;
+        }
+
+        if ch == '-' && matches!(chars.peek(), Some((_, '-'))) {
+            stripped.push_str(&query[last_pushed..idx]);
+            chars.next();
+            let mut comment_end = query.len();
+            for (next_idx, next_ch) in chars.by_ref() {
+                if next_ch == '\n' {
+                    comment_end = next_idx + next_ch.len_utf8();
+                    stripped.push(' ');
+                    break;
+                }
+            }
+            last_pushed = comment_end;
+            continue;
+        }
+
+        if ch == '/' && matches!(chars.peek(), Some((_, '*'))) {
+            stripped.push_str(&query[last_pushed..idx]);
+            chars.next();
+            let mut comment_end = query.len();
+            let mut depth = 1usize;
+            let mut previous_char: Option<char> = None;
+            for (next_idx, next_ch) in chars.by_ref() {
+                if previous_char == Some('/') && next_ch == '*' {
+                    depth = depth.saturating_add(1);
+                    previous_char = None;
+                    continue;
+                }
+                if previous_char == Some('*') && next_ch == '/' {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        comment_end = next_idx + next_ch.len_utf8();
+                        break;
+                    }
+                    previous_char = None;
+                    continue;
+                }
+                previous_char = Some(next_ch);
+            }
+            stripped.push(' ');
+            last_pushed = comment_end;
+        }
+    }
+
+    stripped.push_str(&query[last_pushed..]);
+    stripped
+}
+
 fn replace_parameter_placeholders_with_dummy_literals(query: &str) -> String {
     let mut rewritten = String::with_capacity(query.len());
     let mut chars = query.char_indices().peekable();
@@ -6792,6 +6859,35 @@ mod tests {
                 "SELECT id FROM people WHERE name = '$1' OR id = $1"
             ),
             "SELECT id FROM people WHERE name = '$1' OR id = 1"
+        );
+    }
+
+    #[test]
+    fn extended_parameter_binding_ignores_commented_placeholder_literals() {
+        let query = strip_sql_comments(
+            "SELECT id FROM people WHERE id = $1 -- ignored $2\n\
+             ORDER BY id /* ignored $3 */ LIMIT $2",
+        );
+        let prepared = PreparedQuery {
+            query,
+            parameter_type_oids: vec![23, 23],
+        };
+
+        assert_eq!(max_placeholder_index(&prepared.query), 2);
+        assert_eq!(expected_parameter_count(&prepared), 2);
+        assert_eq!(
+            bind_query_parameters(&prepared, &[Some("2".to_string()), Some("1".to_string())]),
+            Ok("SELECT id FROM people WHERE id = 2  ORDER BY id   LIMIT 1".to_string())
+        );
+        assert_eq!(
+            strip_sql_comments("SELECT '$1 -- still text', id FROM people WHERE id = $1"),
+            "SELECT '$1 -- still text', id FROM people WHERE id = $1"
+        );
+        assert_eq!(
+            strip_sql_comments(
+                "SELECT id FROM people WHERE id = $1 /* outer $2 /* inner $3 */ done $4 */ LIMIT $2"
+            ),
+            "SELECT id FROM people WHERE id = $1   LIMIT $2"
         );
     }
 

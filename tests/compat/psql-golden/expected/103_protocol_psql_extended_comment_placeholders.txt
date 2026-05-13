@@ -1,0 +1,12 @@
+=== psql extended bind ignores commented placeholders ===
+CREATE TABLE
+INSERT 0 3
+ id | name
+----+-------
+  2 | Linus
+(1 row)
+
+ id | name
+----+------
+  1 | Ada
+(1 row)
