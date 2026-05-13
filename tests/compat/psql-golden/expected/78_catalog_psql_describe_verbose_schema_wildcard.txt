@@ -1,0 +1,16 @@
+=== psql verbose schema wildcard describe ===
+CREATE TABLE
+CREATE TABLE
+                              Table "public.verbose_schema_wildcard_people"
+ Column |  Type   | Collation | Nullable | Default | Storage  | Compression | Stats target | Description
+--------+---------+-----------+----------+---------+----------+-------------+--------------+-------------
+ id     | integer |           |          |         | plain    |             |              |
+ name   | text    |           |          |         | extended |             |              |
+Access method: heap
+
+                                Table "public.verbose_schema_wildcard_teams"
+  Column   |  Type   | Collation | Nullable | Default | Storage  | Compression | Stats target | Description
+-----------+---------+-----------+----------+---------+----------+-------------+--------------+-------------
+ team_id   | integer |           |          |         | plain    |             |              |
+ team_name | text    |           |          |         | extended |             |              |
+Access method: heap
