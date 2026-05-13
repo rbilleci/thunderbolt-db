@@ -4048,6 +4048,33 @@ fn max_placeholder_index(query: &str) -> usize {
     max_index
 }
 
+fn replace_parameter_placeholders_with_dummy_literals(query: &str) -> String {
+    let mut rewritten = String::with_capacity(query.len());
+    let mut chars = query.char_indices().peekable();
+    while let Some((_, ch)) = chars.next() {
+        if ch != '$' {
+            rewritten.push(ch);
+            continue;
+        }
+
+        let mut saw_digit = false;
+        while let Some((_, digit)) = chars.peek().copied() {
+            if !digit.is_ascii_digit() {
+                break;
+            }
+            saw_digit = true;
+            chars.next();
+        }
+
+        if saw_digit {
+            rewritten.push('1');
+        } else {
+            rewritten.push('$');
+        }
+    }
+    rewritten
+}
+
 fn encode_parameter_literal(value: &str, type_oid: u32) -> Result<String, BindParameterError> {
     match type_oid {
         23 => value
@@ -4130,29 +4157,11 @@ fn describe_query_columns(session: &Session, query: &str) -> Option<Vec<Column>>
 
 fn describe_parameterized_select_shape(query: &str) -> Option<(String, SelectProjection)> {
     let canonical = canonical_sql(query);
-    let select_rest = canonical.strip_prefix("select ")?;
-    let from_pos = select_rest.find(" from ")?;
-    let projection_sql = select_rest[..from_pos].trim();
-    let after_from = select_rest[from_pos + " from ".len()..].trim_start();
-    let table = after_from
-        .split_whitespace()
-        .next()?
-        .trim_matches('"')
-        .to_string();
-    if table.is_empty() {
+    let dummy_query = replace_parameter_placeholders_with_dummy_literals(&canonical);
+    let Command::Select(select) = parse_command(&dummy_query).ok()? else {
         return None;
-    }
-    if projection_sql == "*" {
-        return Some((table, SelectProjection::All));
-    }
-    let columns = projection_sql
-        .split(',')
-        .map(|column| column.trim().trim_matches('"').to_string())
-        .collect::<Vec<_>>();
-    if columns.is_empty() || columns.iter().any(String::is_empty) {
-        return None;
-    }
-    Some((table, SelectProjection::Columns(columns)))
+    };
+    Some((select.table, select.projection))
 }
 
 fn catalog_attribute_query_table(canonical: &str) -> Option<String> {
@@ -6576,6 +6585,12 @@ mod tests {
             max_placeholder_index("select id from people where id > $1"),
             1
         );
+        assert_eq!(
+            replace_parameter_placeholders_with_dummy_literals(
+                "select id from people where id > $1 limit $2"
+            ),
+            "select id from people where id > 1 limit 1"
+        );
 
         let mut session = Session::default();
         session.tables.insert(
@@ -6620,6 +6635,22 @@ mod tests {
                 vec![Some("2".to_string()), Some("Linus".to_string())],
                 vec![Some("3".to_string()), Some("Grace".to_string())],
             ]
+        );
+
+        assert_eq!(
+            describe_parameterized_select_shape(
+                "select id from people where id > $1 order by id limit $2"
+            ),
+            Some((
+                "people".to_string(),
+                SelectProjection::Columns(vec!["id".to_string()])
+            ))
+        );
+        assert_eq!(
+            describe_parameterized_select_shape(
+                "select people.id from people join pets on people.id = pets.owner_id where people.id = $1"
+            ),
+            None
         );
     }
 
