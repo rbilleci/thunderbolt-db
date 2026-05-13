@@ -1,0 +1,6 @@
+=== psql extended insert unsupported ===
+CREATE TABLE
+psql:86_protocol_psql_extended_insert_unsupported.sql:3: ERROR:  extended query protocol only supports relational SELECT
+ id | name
+----+------
+(0 rows)

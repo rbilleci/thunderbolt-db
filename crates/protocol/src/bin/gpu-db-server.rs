@@ -637,6 +637,17 @@ fn handle_parse(
         )?;
         return Ok(true);
     }
+    if describe_query_columns(session, &query).is_none() {
+        write_error(
+            stream,
+            &ErrorField {
+                code: "0A000",
+                message: "extended query protocol only supports relational SELECT",
+                position: None,
+            },
+        )?;
+        return Ok(true);
+    }
     let parameter_type_oids =
         resolve_prepared_parameter_type_oids(session, &query, parameter_type_oids);
     session.replace_extended_statement(
@@ -6272,6 +6283,30 @@ mod tests {
     #[test]
     fn extended_parse_rejects_named_duplicates_and_replaces_unnamed_state() {
         let mut session = Session::default();
+        session.tables.insert(
+            "people".to_string(),
+            Table {
+                oid: FIRST_USER_RELATION_OID,
+                name: "people".to_string(),
+                columns: vec![
+                    CatalogColumn {
+                        attnum: 1,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "id".to_string(),
+                            ty: SqlType::Int4,
+                        },
+                    },
+                    CatalogColumn {
+                        attnum: 2,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "name".to_string(),
+                            ty: SqlType::Text,
+                        },
+                    },
+                ],
+                rows: Vec::new(),
+            },
+        );
         let first = PreparedQuery {
             query: "SELECT id FROM people".to_string(),
             parameter_type_oids: Vec::new(),
@@ -6330,6 +6365,48 @@ mod tests {
                 parameter_type_oids: vec![25],
             }))
         );
+    }
+
+    #[test]
+    fn extended_parse_rejects_unsupported_non_select_statements() {
+        let mut session = Session::default();
+        session.tables.insert(
+            "people".to_string(),
+            Table {
+                oid: FIRST_USER_RELATION_OID,
+                name: "people".to_string(),
+                columns: vec![
+                    CatalogColumn {
+                        attnum: 1,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "id".to_string(),
+                            ty: SqlType::Int4,
+                        },
+                    },
+                    CatalogColumn {
+                        attnum: 2,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "name".to_string(),
+                            ty: SqlType::Text,
+                        },
+                    },
+                ],
+                rows: Vec::new(),
+            },
+        );
+        let (mut writer, mut reader) = tcp_pair();
+
+        assert!(handle_parse(
+            &mut writer,
+            &mut session,
+            "insert_people".to_string(),
+            "INSERT INTO people (id, name) VALUES ($1, $2)".to_string(),
+            vec![23, 25]
+        )
+        .unwrap());
+
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'E']);
+        assert!(!session.prepared.contains_key("insert_people"));
     }
 
     #[test]
