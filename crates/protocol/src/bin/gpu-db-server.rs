@@ -1119,6 +1119,17 @@ fn execute_statement(
             &catalog_psql_list_database_rows(),
         );
     }
+    if canonical == psql_list_tablespaces_catalog_query() {
+        return write_single_row(
+            stream,
+            &[
+                text_column("Name"),
+                text_column("Owner"),
+                text_column("Location"),
+            ],
+            &catalog_psql_list_tablespace_rows(),
+        );
+    }
     if canonical == psql_describe_schemas_catalog_query() {
         return write_single_row(
             stream,
@@ -2061,6 +2072,25 @@ fn catalog_psql_list_database_rows() -> Vec<Vec<Option<String>>> {
         None,
         None,
     ]]
+}
+
+fn psql_list_tablespaces_catalog_query() -> &'static str {
+    "select spcname as \"name\", pg_catalog.pg_get_userbyid(spcowner) as \"owner\", pg_catalog.pg_tablespace_location(oid) as \"location\" from pg_catalog.pg_tablespace order by 1"
+}
+
+fn catalog_psql_list_tablespace_rows() -> Vec<Vec<Option<String>>> {
+    vec![
+        vec![
+            Some("pg_default".to_string()),
+            Some("postgres".to_string()),
+            Some(String::new()),
+        ],
+        vec![
+            Some("pg_global".to_string()),
+            Some("postgres".to_string()),
+            Some(String::new()),
+        ],
+    ]
 }
 
 fn psql_describe_schemas_catalog_query() -> &'static str {
@@ -3764,6 +3794,25 @@ mod tests {
                 None,
                 None,
             ]]
+        );
+        assert_eq!(
+            psql_list_tablespaces_catalog_query(),
+            "select spcname as \"name\", pg_catalog.pg_get_userbyid(spcowner) as \"owner\", pg_catalog.pg_tablespace_location(oid) as \"location\" from pg_catalog.pg_tablespace order by 1"
+        );
+        assert_eq!(
+            catalog_psql_list_tablespace_rows(),
+            vec![
+                vec![
+                    Some("pg_default".to_string()),
+                    Some("postgres".to_string()),
+                    Some(String::new()),
+                ],
+                vec![
+                    Some("pg_global".to_string()),
+                    Some("postgres".to_string()),
+                    Some(String::new()),
+                ],
+            ]
         );
         assert!(catalog_empty_rows().is_empty());
         assert!(catalog_psql_describe_table_rows_filtered(
