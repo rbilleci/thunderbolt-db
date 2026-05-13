@@ -7559,6 +7559,150 @@ mod tests {
     }
 
     #[test]
+    fn extended_parse_errors_skip_until_sync_and_recover() {
+        for (statement_name, query, parameter_type_oids, expected_code, expected_message, suffix) in [
+            (
+                "bad_type",
+                "SELECT name FROM people WHERE id = $1",
+                vec![16],
+                "0A000",
+                "only text and int4 extended-query parameters are supported",
+                "bad_type",
+            ),
+            (
+                "too_many_oids",
+                "SELECT name FROM people WHERE id = $1",
+                vec![23, 25],
+                "08P01",
+                "parse message has too many parameter type oids",
+                "too_many_oids",
+            ),
+            (
+                "unsupported_insert",
+                "INSERT INTO people (id, name) VALUES ($1, $2)",
+                vec![23, 25],
+                "0A000",
+                "extended query protocol only supports relational SELECT",
+                "unsupported_insert",
+            ),
+        ] {
+            let mut session = Session::default();
+            session.tables.insert(
+                "people".to_string(),
+                Table {
+                    oid: FIRST_USER_RELATION_OID,
+                    name: "people".to_string(),
+                    columns: vec![
+                        CatalogColumn {
+                            attnum: 1,
+                            def: gpu_db_protocol::ColumnDef {
+                                name: "id".to_string(),
+                                ty: SqlType::Int4,
+                            },
+                        },
+                        CatalogColumn {
+                            attnum: 2,
+                            def: gpu_db_protocol::ColumnDef {
+                                name: "name".to_string(),
+                                ty: SqlType::Text,
+                            },
+                        },
+                    ],
+                    rows: vec![vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())]],
+                },
+            );
+            let (mut writer, mut reader) = tcp_pair();
+            let mut extended_error_pending = false;
+
+            handle_frontend_message(
+                &mut writer,
+                &mut session,
+                &mut extended_error_pending,
+                FrontendMessage::Parse {
+                    statement_name: statement_name.to_string(),
+                    query: query.to_string(),
+                    parameter_type_oids,
+                },
+            )
+            .unwrap();
+            let messages = read_backend_messages(&mut reader, 1);
+            assert_eq!(messages[0].0, b'E');
+            assert_eq!(
+                error_field_value(&messages[0].1, b'C'),
+                Some(expected_code.to_string())
+            );
+            assert_eq!(
+                error_field_value(&messages[0].1, b'M'),
+                Some(expected_message.to_string())
+            );
+            assert!(extended_error_pending);
+            assert!(!session.prepared.contains_key(statement_name));
+
+            handle_frontend_message(
+                &mut writer,
+                &mut session,
+                &mut extended_error_pending,
+                FrontendMessage::SimpleQuery(format!("CREATE TABLE skipped_{suffix} (id INT)")),
+            )
+            .unwrap();
+            assert!(!session.tables.contains_key(&format!("skipped_{suffix}")));
+
+            handle_frontend_message(
+                &mut writer,
+                &mut session,
+                &mut extended_error_pending,
+                FrontendMessage::Sync,
+            )
+            .unwrap();
+            assert_eq!(read_backend_tags(&mut reader, 1), vec![b'Z']);
+            assert!(!extended_error_pending);
+
+            handle_frontend_message(
+                &mut writer,
+                &mut session,
+                &mut extended_error_pending,
+                FrontendMessage::Parse {
+                    statement_name: format!("recovered_{suffix}"),
+                    query: "SELECT name FROM people WHERE id = $1".to_string(),
+                    parameter_type_oids: vec![23],
+                },
+            )
+            .unwrap();
+            assert_eq!(read_backend_tags(&mut reader, 1), vec![b'1']);
+            handle_frontend_message(
+                &mut writer,
+                &mut session,
+                &mut extended_error_pending,
+                FrontendMessage::Bind {
+                    portal_name: format!("recovered_{suffix}_portal"),
+                    statement_name: format!("recovered_{suffix}"),
+                    parameter_format_codes: Vec::new(),
+                    parameters: vec![Some(b"1".to_vec())],
+                    result_format_codes: Vec::new(),
+                },
+            )
+            .unwrap();
+            assert_eq!(read_backend_tags(&mut reader, 1), vec![b'2']);
+            handle_frontend_message(
+                &mut writer,
+                &mut session,
+                &mut extended_error_pending,
+                FrontendMessage::Execute {
+                    portal_name: format!("recovered_{suffix}_portal"),
+                    max_rows: 0,
+                },
+            )
+            .unwrap();
+            let messages = read_backend_messages(&mut reader, 3);
+            assert_eq!(
+                messages.iter().map(|(tag, _)| *tag).collect::<Vec<_>>(),
+                vec![b'T', b'D', b'C']
+            );
+            assert_eq!(messages[2].1, b"SELECT 1\0".to_vec());
+        }
+    }
+
+    #[test]
     fn extended_bind_rejects_named_duplicate_portals_and_replaces_unnamed_portal() {
         let mut session = Session::default();
         let query = PreparedQuery {
