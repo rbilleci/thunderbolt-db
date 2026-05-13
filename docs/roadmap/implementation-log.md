@@ -3,6 +3,7 @@
 ## 2026-05-13
 
 ### PostgreSQL-compatible product loop
+- Advanced P2 catalog/schema/type spine by supporting real PostgreSQL 16 `psql \dRs` subscription-listing traffic. The compatibility endpoint now accepts the `pg_catalog.pg_subscription` query shape emitted by psql and truthfully returns no rows for the current no-subscription subset while keeping subscription creation and broader subscription catalog behavior out of scope.
 - Advanced P2 catalog/schema/type spine by supporting real PostgreSQL 16 `psql \dRp` publication-listing traffic. The compatibility endpoint now accepts the `pg_catalog.pg_publication` query shape emitted by psql and truthfully returns no rows for the current no-publication subset while keeping publication creation and broader publication catalog behavior out of scope.
 - Advanced P2 catalog/schema/type spine by supporting real PostgreSQL 16 `psql \dC` cast-listing traffic. The compatibility endpoint now accepts the `pg_catalog.pg_cast` query shape emitted by psql and truthfully returns no rows for the current no-user-defined-cast subset while keeping cast creation and broader cast catalog behavior out of scope.
 - Advanced P2 catalog/schema/type spine by supporting real PostgreSQL 16 `psql \do` operator-listing traffic. The compatibility endpoint now accepts the `pg_catalog.pg_operator` / `pg_namespace` query shape emitted by psql and truthfully returns no rows for the current no-user-defined-operator subset while keeping operator creation and broader operator catalog behavior out of scope.

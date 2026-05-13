@@ -1,0 +1,5 @@
+=== catalog psql list subscriptions empty ===
+        List of subscriptions
+ Name | Owner | Enabled | Publication
+------+-------+---------+-------------
+(0 rows)

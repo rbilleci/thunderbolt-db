@@ -1173,6 +1173,18 @@ fn execute_statement(
             &catalog_empty_rows(),
         );
     }
+    if canonical == psql_list_subscriptions_catalog_query() {
+        return write_single_row(
+            stream,
+            &[
+                text_column("Name"),
+                text_column("Owner"),
+                bool_column("Enabled"),
+                text_column("Publication"),
+            ],
+            &catalog_empty_rows(),
+        );
+    }
     if canonical == psql_list_extensions_catalog_query() {
         return write_single_row(
             stream,
@@ -2238,6 +2250,10 @@ fn psql_list_publications_catalog_query() -> &'static str {
 
 fn psql_list_publications_verbose_catalog_query() -> &'static str {
     "select oid, pubname, pg_catalog.pg_get_userbyid(pubowner) as owner, puballtables, pubinsert, pubupdate, pubdelete, pubtruncate, pubviaroot from pg_catalog.pg_publication order by 2"
+}
+
+fn psql_list_subscriptions_catalog_query() -> &'static str {
+    "select subname as \"name\" , pg_catalog.pg_get_userbyid(subowner) as \"owner\" , subenabled as \"enabled\" , subpublications as \"publication\" from pg_catalog.pg_subscription where subdbid = (select oid from pg_catalog.pg_database where datname = pg_catalog.current_database())order by 1"
 }
 
 fn psql_list_extensions_catalog_query() -> &'static str {
@@ -4168,6 +4184,10 @@ mod tests {
         assert_eq!(
             psql_list_publications_verbose_catalog_query(),
             "select oid, pubname, pg_catalog.pg_get_userbyid(pubowner) as owner, puballtables, pubinsert, pubupdate, pubdelete, pubtruncate, pubviaroot from pg_catalog.pg_publication order by 2"
+        );
+        assert_eq!(
+            psql_list_subscriptions_catalog_query(),
+            "select subname as \"name\" , pg_catalog.pg_get_userbyid(subowner) as \"owner\" , subenabled as \"enabled\" , subpublications as \"publication\" from pg_catalog.pg_subscription where subdbid = (select oid from pg_catalog.pg_database where datname = pg_catalog.current_database())order by 1"
         );
         assert_eq!(
             catalog_psql_describe_schema_rows(),
