@@ -1,0 +1,11 @@
+=== psql extended text bind and empty result ===
+CREATE TABLE
+INSERT 0 3
+ id
+----
+  2
+(1 row)
+
+ id
+----
+(0 rows)
