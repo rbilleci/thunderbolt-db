@@ -1,0 +1,6 @@
+=== catalog psql list access methods ===
+List of access methods
+ Name | Type
+------+-------
+ heap | Table
+(1 row)

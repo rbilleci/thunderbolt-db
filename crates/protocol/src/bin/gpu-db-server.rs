@@ -1142,6 +1142,13 @@ fn execute_statement(
             &catalog_psql_list_tablespace_rows(),
         );
     }
+    if canonical == psql_list_access_methods_catalog_query() {
+        return write_single_row(
+            stream,
+            &[text_column("Name"), text_column("Type")],
+            &catalog_psql_list_access_method_rows(),
+        );
+    }
     if canonical == psql_describe_schemas_catalog_query() {
         return write_single_row(
             stream,
@@ -2107,6 +2114,14 @@ fn catalog_psql_list_tablespace_rows() -> Vec<Vec<Option<String>>> {
             Some(String::new()),
         ],
     ]
+}
+
+fn psql_list_access_methods_catalog_query() -> &'static str {
+    "select amname as \"name\", case amtype when 'i' then 'index' when 't' then 'table' end as \"type\" from pg_catalog.pg_am order by 1"
+}
+
+fn catalog_psql_list_access_method_rows() -> Vec<Vec<Option<String>>> {
+    vec![vec![Some("heap".to_string()), Some("Table".to_string())]]
 }
 
 fn psql_describe_schemas_catalog_query() -> &'static str {
@@ -3833,6 +3848,14 @@ mod tests {
                     Some(String::new()),
                 ],
             ]
+        );
+        assert_eq!(
+            psql_list_access_methods_catalog_query(),
+            "select amname as \"name\", case amtype when 'i' then 'index' when 't' then 'table' end as \"type\" from pg_catalog.pg_am order by 1"
+        );
+        assert_eq!(
+            catalog_psql_list_access_method_rows(),
+            vec![vec![Some("heap".to_string()), Some("Table".to_string())]]
         );
         assert!(catalog_empty_rows().is_empty());
         assert!(catalog_psql_describe_table_rows_filtered(
