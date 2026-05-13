@@ -3,6 +3,7 @@
 ## 2026-05-13
 
 ### PostgreSQL-compatible product loop
+- Advanced P2 catalog/schema/type spine by supporting real PostgreSQL 16 `psql \dx` extension-listing traffic. The compatibility endpoint now accepts the `pg_catalog.pg_extension` / `pg_namespace` / `pg_description` query shape emitted by psql and truthfully returns no rows for the current no-extension subset while keeping extension install and broader extension catalog behavior out of scope.
 - Advanced P2 catalog/schema/type spine by supporting real PostgreSQL 16 `psql \l` database-listing traffic. The compatibility endpoint now accepts the `pg_catalog.pg_database` query shape emitted by psql and returns the supported bootstrap `postgres` database metadata while keeping database creation, templates, ACL mutation, and broader database catalog behavior out of scope.
 - Advanced P2 catalog/schema/type spine by supporting real PostgreSQL 16 `psql \du` role-listing traffic. The compatibility endpoint now accepts the `pg_catalog.pg_roles` query shape emitted by psql and returns the bootstrap `postgres` role with explicit superuser/login/create-db/create-role/replication/bypass-RLS attributes while keeping role mutation and broader role catalog behavior out of scope.
 - Advanced P2 catalog/schema/type spine by supporting real PostgreSQL 16 `psql \df` function-listing traffic. The compatibility endpoint now accepts the `pg_catalog.pg_proc` / `pg_namespace` query shape emitted by psql and truthfully returns no rows for the current no-user-defined-function subset.

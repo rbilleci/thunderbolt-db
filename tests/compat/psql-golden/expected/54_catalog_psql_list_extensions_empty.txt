@@ -1,0 +1,5 @@
+Pager usage is off.
+     List of installed extensions
+ Name | Version | Schema | Description
+------+---------+--------+-------------
+(0 rows)

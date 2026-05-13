@@ -1072,6 +1072,18 @@ fn execute_statement(
             &catalog_empty_rows(),
         );
     }
+    if canonical == psql_list_extensions_catalog_query() {
+        return write_single_row(
+            stream,
+            &[
+                text_column("Name"),
+                text_column("Version"),
+                text_column("Schema"),
+                text_column("Description"),
+            ],
+            &catalog_empty_rows(),
+        );
+    }
     if canonical == psql_describe_roles_catalog_query() {
         return write_single_row(
             stream,
@@ -2008,6 +2020,10 @@ fn psql_describe_sequences_verbose_catalog_query() -> &'static str {
 
 fn psql_describe_functions_catalog_query() -> &'static str {
     "select n.nspname as \"schema\", p.proname as \"name\", pg_catalog.pg_get_function_result(p.oid) as \"result data type\", pg_catalog.pg_get_function_arguments(p.oid) as \"argument data types\", case p.prokind when 'a' then 'agg' when 'w' then 'window' when 'p' then 'proc' else 'func' end as \"type\" from pg_catalog.pg_proc p left join pg_catalog.pg_namespace n on n.oid = p.pronamespace where pg_catalog.pg_function_is_visible(p.oid) and n.nspname <> 'pg_catalog' and n.nspname <> 'information_schema' order by 1, 2, 4"
+}
+
+fn psql_list_extensions_catalog_query() -> &'static str {
+    "select e.extname as \"name\", e.extversion as \"version\", n.nspname as \"schema\", c.description as \"description\" from pg_catalog.pg_extension e left join pg_catalog.pg_namespace n on n.oid = e.extnamespace left join pg_catalog.pg_description c on c.objoid = e.oid and c.classoid = 'pg_catalog.pg_extension'::pg_catalog.regclass order by 1"
 }
 
 fn psql_describe_roles_catalog_query() -> &'static str {
@@ -3707,6 +3723,10 @@ mod tests {
         assert_eq!(
             psql_describe_functions_catalog_query(),
             "select n.nspname as \"schema\", p.proname as \"name\", pg_catalog.pg_get_function_result(p.oid) as \"result data type\", pg_catalog.pg_get_function_arguments(p.oid) as \"argument data types\", case p.prokind when 'a' then 'agg' when 'w' then 'window' when 'p' then 'proc' else 'func' end as \"type\" from pg_catalog.pg_proc p left join pg_catalog.pg_namespace n on n.oid = p.pronamespace where pg_catalog.pg_function_is_visible(p.oid) and n.nspname <> 'pg_catalog' and n.nspname <> 'information_schema' order by 1, 2, 4"
+        );
+        assert_eq!(
+            psql_list_extensions_catalog_query(),
+            "select e.extname as \"name\", e.extversion as \"version\", n.nspname as \"schema\", c.description as \"description\" from pg_catalog.pg_extension e left join pg_catalog.pg_namespace n on n.oid = e.extnamespace left join pg_catalog.pg_description c on c.objoid = e.oid and c.classoid = 'pg_catalog.pg_extension'::pg_catalog.regclass order by 1"
         );
         assert_eq!(
             psql_describe_roles_catalog_query(),
