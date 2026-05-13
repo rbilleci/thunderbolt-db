@@ -1,0 +1,8 @@
+=== psql extended zero placeholder rejection ===
+CREATE TABLE
+INSERT 0 2
+psql:99_protocol_psql_extended_invalid_zero_placeholder.sql:4: ERROR:  there is no parameter $0
+ name
+-------
+ Linus
+(1 row)

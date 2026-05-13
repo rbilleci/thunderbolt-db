@@ -632,6 +632,17 @@ fn handle_parse(
         )?;
         return Ok(true);
     }
+    if contains_zero_placeholder(&query) {
+        write_error(
+            stream,
+            &ErrorField {
+                code: "42P02",
+                message: "there is no parameter $0",
+                position: None,
+            },
+        )?;
+        return Ok(true);
+    }
     if parameter_type_oids
         .iter()
         .copied()
@@ -4165,6 +4176,29 @@ fn max_placeholder_index(query: &str) -> usize {
     max_index
 }
 
+fn contains_zero_placeholder(query: &str) -> bool {
+    unquoted_sql_fragments(query)
+        .into_iter()
+        .any(fragment_contains_zero_placeholder)
+}
+
+fn fragment_contains_zero_placeholder(fragment: &str) -> bool {
+    let mut chars = fragment.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '$' {
+            continue;
+        }
+
+        if matches!(chars.peek(), Some('0')) {
+            chars.next();
+            if !matches!(chars.peek(), Some(digit) if digit.is_ascii_digit()) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn replace_unquoted_placeholder(query: &str, placeholder: &str, literal: &str) -> String {
     let Some(target_index) = placeholder.strip_prefix('$') else {
         return query.to_string();
@@ -6721,6 +6755,99 @@ mod tests {
             ),
             "SELECT id FROM people WHERE name = '$1' OR id = 1"
         );
+    }
+
+    #[test]
+    fn extended_parse_rejects_zero_placeholder_without_installing_statement() {
+        let mut session = Session::default();
+        assert!(contains_zero_placeholder(
+            "SELECT name FROM people WHERE id = $0"
+        ));
+        assert!(!contains_zero_placeholder(
+            "SELECT '$0' AS literal, name FROM people WHERE id = $1"
+        ));
+        session.tables.insert(
+            "people".to_string(),
+            Table {
+                oid: FIRST_USER_RELATION_OID,
+                name: "people".to_string(),
+                columns: vec![
+                    CatalogColumn {
+                        attnum: 1,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "id".to_string(),
+                            ty: SqlType::Int4,
+                        },
+                    },
+                    CatalogColumn {
+                        attnum: 2,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "name".to_string(),
+                            ty: SqlType::Text,
+                        },
+                    },
+                ],
+                rows: vec![vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())]],
+            },
+        );
+        let (mut writer, mut reader) = tcp_pair();
+        let mut extended_error_pending = false;
+
+        handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::Parse {
+                statement_name: "bad_zero".to_string(),
+                query: "SELECT name FROM people WHERE id = $0".to_string(),
+                parameter_type_oids: Vec::new(),
+            },
+        )
+        .unwrap();
+        let messages = read_backend_messages(&mut reader, 1);
+        assert_eq!(messages[0].0, b'E');
+        assert_eq!(
+            error_field_value(&messages[0].1, b'C'),
+            Some("42P02".to_string())
+        );
+        assert!(!session.prepared.contains_key("bad_zero"));
+        assert!(extended_error_pending);
+
+        handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::Bind {
+                portal_name: "skipped_zero".to_string(),
+                statement_name: "bad_zero".to_string(),
+                parameter_format_codes: Vec::new(),
+                parameters: Vec::new(),
+                result_format_codes: Vec::new(),
+            },
+        )
+        .unwrap();
+        assert!(!session.portals.contains_key("skipped_zero"));
+
+        handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::Sync,
+        )
+        .unwrap();
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'Z']);
+        assert!(!extended_error_pending);
+
+        assert!(!handle_parse(
+            &mut writer,
+            &mut session,
+            "good".to_string(),
+            "SELECT name FROM people WHERE id = $1".to_string(),
+            vec![23]
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'1']);
+        assert!(session.prepared.contains_key("good"));
     }
 
     #[test]
