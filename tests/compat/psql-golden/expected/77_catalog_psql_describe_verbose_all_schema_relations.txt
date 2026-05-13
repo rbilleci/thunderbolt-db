@@ -1,0 +1,16 @@
+=== psql verbose all-schema relation describe ===
+CREATE TABLE
+CREATE TABLE
+                                Table "public.all_schema_verbose_people"
+ Column |  Type   | Collation | Nullable | Default | Storage  | Compression | Stats target | Description
+--------+---------+-----------+----------+---------+----------+-------------+--------------+-------------
+ id     | integer |           |          |         | plain    |             |              |
+ name   | text    |           |          |         | extended |             |              |
+Access method: heap
+
+                                  Table "public.all_schema_verbose_teams"
+  Column   |  Type   | Collation | Nullable | Default | Storage  | Compression | Stats target | Description
+-----------+---------+-----------+----------+---------+----------+-------------+--------------+-------------
+ team_id   | integer |           |          |         | plain    |             |              |
+ team_name | text    |           |          |         | extended |             |              |
+Access method: heap
