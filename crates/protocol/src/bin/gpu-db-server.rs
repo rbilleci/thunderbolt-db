@@ -783,6 +783,10 @@ fn handle_bind(
             None => None,
         });
     }
+    if let Err(error) = bind_query_parameters(query, &decoded) {
+        write_error(stream, &bind_parameter_error_field(error))?;
+        return Ok(true);
+    }
     session.replace_extended_portal(
         portal_name,
         Portal {
@@ -4018,9 +4022,6 @@ fn bind_query_parameters(
         )?;
         bound = bound.replace(&placeholder, &literal);
     }
-    if bound.as_bytes().windows(1).any(|window| window == b"$") {
-        return Err(BindParameterError::CountMismatch);
-    }
     Ok(bound)
 }
 
@@ -6260,6 +6261,10 @@ mod tests {
             bind_query_parameters(&text_query, &[Some("O'Brien".to_string())]),
             Ok("SELECT id FROM people WHERE name = 'O''Brien'".to_string())
         );
+        assert_eq!(
+            bind_query_parameters(&text_query, &[Some("Ada $1".to_string())]),
+            Ok("SELECT id FROM people WHERE name = 'Ada $1'".to_string())
+        );
     }
 
     #[test]
@@ -6357,6 +6362,43 @@ mod tests {
                 value: "not-an-int".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn extended_bind_rejects_invalid_int4_values_without_installing_portal() {
+        let mut session = Session::default();
+        let query = PreparedQuery {
+            query: "SELECT name FROM people WHERE id = $1".to_string(),
+            parameter_type_oids: vec![23],
+        };
+        session.replace_extended_statement("lookup".to_string(), query);
+        let (mut writer, mut reader) = tcp_pair();
+
+        assert!(handle_bind(
+            &mut writer,
+            &mut session,
+            "bad_int4_portal".to_string(),
+            "lookup".to_string(),
+            vec![0],
+            vec![Some(b"not-an-int".to_vec())],
+            Vec::new()
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'E']);
+        assert!(!session.portals.contains_key("bad_int4_portal"));
+
+        assert!(!handle_bind(
+            &mut writer,
+            &mut session,
+            "good_int4_portal".to_string(),
+            "lookup".to_string(),
+            vec![0],
+            vec![Some(b"1".to_vec())],
+            Vec::new()
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'2']);
+        assert!(session.portals.contains_key("good_int4_portal"));
     }
 
     #[test]

@@ -1,0 +1,8 @@
+=== psql extended bind invalid int4 recovery ===
+CREATE TABLE
+INSERT 0 2
+psql:90_protocol_psql_extended_bind_invalid_int4.sql:4: ERROR:  invalid input syntax for parameter type oid 23: "not-an-int"
+ name
+-------
+ Linus
+(1 row)
