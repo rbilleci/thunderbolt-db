@@ -1,0 +1,15 @@
+=== psql close all cursor lifecycle ===
+CREATE TABLE
+INSERT 0 3
+DECLARE CURSOR
+ id | name
+----+------
+  1 | Ada
+(1 row)
+
+CLOSE CURSOR
+psql:84_protocol_psql_close_all_cursors.sql:7: ERROR:  cursor does not exist
+ name
+-------
+ Grace
+(1 row)

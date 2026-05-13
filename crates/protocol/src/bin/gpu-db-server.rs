@@ -316,6 +316,12 @@ struct Cursor {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+enum CloseCursorTarget {
+    All,
+    Named(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct SelectResult {
     columns: Vec<Column>,
     rows: Vec<Vec<Option<String>>>,
@@ -899,18 +905,18 @@ fn parse_fetch_forward(statement: &str) -> Option<(String, usize)> {
     }
 }
 
-fn parse_close_cursor(statement: &str) -> Option<String> {
+fn parse_close_cursor(statement: &str) -> Option<CloseCursorTarget> {
     let trimmed = statement.trim().trim_end_matches(';').trim();
     let lower = trimmed.to_ascii_lowercase();
     let name = lower.strip_prefix("close ")?;
     if name == "all" {
-        return None;
+        return Some(CloseCursorTarget::All);
     }
     let original = &trimmed["close ".len()..];
     if original.trim().is_empty() {
         None
     } else {
-        Some(original.trim().to_string())
+        Some(CloseCursorTarget::Named(original.trim().to_string()))
     }
 }
 
@@ -995,8 +1001,13 @@ fn execute_statement(
     if let Some((name, count)) = parse_fetch_forward(statement) {
         return execute_fetch_forward(stream, session, &name, count);
     }
-    if let Some(name) = parse_close_cursor(statement) {
-        session.cursors.remove(&name);
+    if let Some(target) = parse_close_cursor(statement) {
+        match target {
+            CloseCursorTarget::All => session.cursors.clear(),
+            CloseCursorTarget::Named(name) => {
+                session.cursors.remove(&name);
+            }
+        }
         return write_command_complete(stream, "CLOSE CURSOR");
     }
 
@@ -6289,7 +6300,11 @@ mod tests {
         );
         assert_eq!(
             parse_close_cursor("CLOSE _psql_cursor"),
-            Some("_psql_cursor".to_string())
+            Some(CloseCursorTarget::Named("_psql_cursor".to_string()))
+        );
+        assert_eq!(
+            parse_close_cursor("CLOSE ALL"),
+            Some(CloseCursorTarget::All)
         );
         assert_eq!(
             max_placeholder_index("select id from people where id > $1"),
