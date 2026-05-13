@@ -4189,11 +4189,20 @@ fn fragment_contains_zero_placeholder(fragment: &str) -> bool {
             continue;
         }
 
-        if matches!(chars.peek(), Some('0')) {
-            chars.next();
-            if !matches!(chars.peek(), Some(digit) if digit.is_ascii_digit()) {
-                return true;
+        let mut saw_digit = false;
+        let mut all_zero = true;
+        while let Some(digit) = chars.peek().copied() {
+            if !digit.is_ascii_digit() {
+                break;
             }
+            saw_digit = true;
+            if digit != '0' {
+                all_zero = false;
+            }
+            chars.next();
+        }
+        if saw_digit && all_zero {
+            return true;
         }
     }
     false
@@ -6763,8 +6772,14 @@ mod tests {
         assert!(contains_zero_placeholder(
             "SELECT name FROM people WHERE id = $0"
         ));
+        assert!(contains_zero_placeholder(
+            "SELECT name FROM people WHERE id = $00"
+        ));
         assert!(!contains_zero_placeholder(
             "SELECT '$0' AS literal, name FROM people WHERE id = $1"
+        ));
+        assert!(!contains_zero_placeholder(
+            "SELECT name FROM people WHERE id = $01"
         ));
         session.tables.insert(
             "people".to_string(),
