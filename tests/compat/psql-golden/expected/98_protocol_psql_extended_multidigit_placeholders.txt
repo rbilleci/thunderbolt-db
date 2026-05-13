@@ -1,0 +1,8 @@
+=== psql extended bind multi-digit placeholders ===
+CREATE TABLE
+INSERT 0 4
+ id | name
+----+-------
+  1 | Ada
+ 10 | Grace
+(2 rows)

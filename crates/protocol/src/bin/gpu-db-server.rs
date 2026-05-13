@@ -4166,6 +4166,9 @@ fn max_placeholder_index(query: &str) -> usize {
 }
 
 fn replace_unquoted_placeholder(query: &str, placeholder: &str, literal: &str) -> String {
+    let Some(target_index) = placeholder.strip_prefix('$') else {
+        return query.to_string();
+    };
     let mut rewritten = String::with_capacity(query.len());
     let mut token_start = 0;
     let mut chars = query.char_indices().peekable();
@@ -4186,7 +4189,12 @@ fn replace_unquoted_placeholder(query: &str, placeholder: &str, literal: &str) -
             token_start = idx + ch.len_utf8();
             in_quote = false;
         } else {
-            rewritten.push_str(&query[token_start..idx].replace(placeholder, literal));
+            push_placeholder_replaced_fragment(
+                &mut rewritten,
+                &query[token_start..idx],
+                target_index,
+                literal,
+            );
             token_start = idx;
             in_quote = true;
         }
@@ -4195,10 +4203,55 @@ fn replace_unquoted_placeholder(query: &str, placeholder: &str, literal: &str) -
     if in_quote {
         rewritten.push_str(&query[token_start..]);
     } else {
-        rewritten.push_str(&query[token_start..].replace(placeholder, literal));
+        push_placeholder_replaced_fragment(
+            &mut rewritten,
+            &query[token_start..],
+            target_index,
+            literal,
+        );
     }
 
     rewritten
+}
+
+fn push_placeholder_replaced_fragment(
+    rewritten: &mut String,
+    fragment: &str,
+    target_index: &str,
+    literal: &str,
+) {
+    let mut token_start = 0;
+    let mut chars = fragment.char_indices().peekable();
+
+    while let Some((idx, ch)) = chars.next() {
+        if ch != '$' {
+            continue;
+        }
+
+        let digit_start = idx + ch.len_utf8();
+        let mut digit_end = digit_start;
+        while let Some((digit_idx, digit)) = chars.peek().copied() {
+            if !digit.is_ascii_digit() {
+                break;
+            }
+            digit_end = digit_idx + digit.len_utf8();
+            chars.next();
+        }
+
+        if digit_end == digit_start {
+            continue;
+        }
+
+        rewritten.push_str(&fragment[token_start..idx]);
+        if &fragment[digit_start..digit_end] == target_index {
+            rewritten.push_str(literal);
+        } else {
+            rewritten.push_str(&fragment[idx..digit_end]);
+        }
+        token_start = digit_end;
+    }
+
+    rewritten.push_str(&fragment[token_start..]);
 }
 
 fn unquoted_sql_fragments(query: &str) -> Vec<&str> {
@@ -6624,6 +6677,27 @@ mod tests {
         assert_eq!(
             bind_query_parameters(&text_query, &[Some("Ada $1".to_string())]),
             Ok("SELECT id FROM people WHERE name = 'Ada $1'".to_string())
+        );
+    }
+
+    #[test]
+    fn extended_parameter_binding_replaces_exact_placeholder_tokens() {
+        let query = PreparedQuery {
+            query: "SELECT id FROM people WHERE id = $1 OR id = $10 ORDER BY id LIMIT $11"
+                .to_string(),
+            parameter_type_oids: vec![23; 11],
+        };
+        let parameters = (1..=11)
+            .map(|idx| Some(idx.to_string()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            replace_unquoted_placeholder(&query.query, "$1", "7"),
+            "SELECT id FROM people WHERE id = 7 OR id = $10 ORDER BY id LIMIT $11"
+        );
+        assert_eq!(
+            bind_query_parameters(&query, &parameters),
+            Ok("SELECT id FROM people WHERE id = 1 OR id = 10 ORDER BY id LIMIT 11".to_string())
         );
     }
 
