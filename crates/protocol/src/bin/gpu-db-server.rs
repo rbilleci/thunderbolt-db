@@ -1783,7 +1783,9 @@ fn execute_statement(
             Some(PreparedStatement::Sql(query)) => {
                 let bound_query = match bind_query_parameters(&query, &parameters) {
                     Ok(query) => query,
-                    Err(error) => return write_error(stream, &bind_parameter_error_field(error)),
+                    Err(error) => {
+                        return write_error(stream, &sql_execute_parameter_error_field(error));
+                    }
                 };
                 let Ok(Command::Select(select)) = parse_command(&bound_query) else {
                     return write_error(
@@ -5170,6 +5172,17 @@ fn bind_parameter_error_field(error: BindParameterError) -> ErrorField {
                 position: None,
             }
         }
+    }
+}
+
+fn sql_execute_parameter_error_field(error: BindParameterError) -> ErrorField {
+    match error {
+        BindParameterError::NullUnsupported => ErrorField {
+            code: "0A000",
+            message: "NULL SQL EXECUTE parameters are not supported",
+            position: None,
+        },
+        error => bind_parameter_error_field(error),
     }
 }
 

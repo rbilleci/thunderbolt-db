@@ -15,14 +15,14 @@
     "protocol.client_flows": {
       "failed": 0,
       "ignored": 0,
-      "passed": 41,
-      "total": 41
+      "passed": 42,
+      "total": 42
     },
     "protocol.error_paths": {
       "failed": 0,
       "ignored": 0,
-      "passed": 49,
-      "total": 49
+      "passed": 50,
+      "total": 50
     },
     "protocol.extended_query": {
       "failed": 0,
@@ -89,8 +89,8 @@
   "totals": {
     "failed": 0,
     "ignored": 0,
-    "passed": 773,
-    "total": 773
+    "passed": 774,
+    "total": 774
   },
   "trend_hook": {
     "baseline_available": true,

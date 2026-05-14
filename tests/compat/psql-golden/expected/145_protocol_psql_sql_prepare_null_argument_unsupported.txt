@@ -1,0 +1,16 @@
+=== psql SQL prepare unsupported NULL argument ===
+CREATE TABLE
+INSERT 0 3
+PREPARE
+psql:145_protocol_psql_sql_prepare_null_argument_unsupported.sql:5: ERROR:  NULL SQL EXECUTE parameters are not supported
+ id | name
+----+-------
+  2 | Linus
+(1 row)
+
+DEALLOCATE
+psql:145_protocol_psql_sql_prepare_null_argument_unsupported.sql:8: ERROR:  prepared statement "sql_prepare_null_lookup" does not exist
+ name
+-------
+ Grace
+(1 row)
