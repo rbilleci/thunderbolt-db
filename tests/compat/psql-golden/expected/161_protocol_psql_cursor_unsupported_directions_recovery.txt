@@ -1,0 +1,22 @@
+=== psql cursor unsupported direction recovery ===
+CREATE TABLE
+INSERT 0 3
+DECLARE CURSOR
+ id | name
+----+------
+  1 | Ada
+(1 row)
+
+psql:161_protocol_psql_cursor_unsupported_directions_recovery.sql:6: ERROR:  cursor fetch direction is not supported by the compatibility endpoint
+psql:161_protocol_psql_cursor_unsupported_directions_recovery.sql:7: ERROR:  cursor move direction is not supported by the compatibility endpoint
+ id | name
+----+-------
+  2 | Linus
+(1 row)
+
+CLOSE CURSOR
+psql:161_protocol_psql_cursor_unsupported_directions_recovery.sql:10: ERROR:  cursor declaration options are not supported by the compatibility endpoint
+ name
+-------
+ Grace
+(1 row)
