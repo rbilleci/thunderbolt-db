@@ -1,0 +1,21 @@
+=== psql cursor identifier case lifecycle ===
+CREATE TABLE
+INSERT 0 4
+DECLARE CURSOR
+ id | name
+----+------
+  1 | Ada
+(1 row)
+
+MOVE 1
+ id | name
+----+-------
+  3 | Grace
+(1 row)
+
+CLOSE CURSOR
+psql:120_protocol_psql_cursor_identifier_case.sql:9: ERROR:  cursor does not exist
+  name
+--------
+ Edsger
+(1 row)

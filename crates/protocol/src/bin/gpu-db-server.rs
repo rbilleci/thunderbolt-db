@@ -1055,7 +1055,7 @@ fn parse_declare_cursor(statement: &str) -> Option<(String, String)> {
             let query_start = "declare ".len() + idx + marker.len();
             let query = canonical[query_start..].trim();
             if !name.is_empty() && !query.is_empty() {
-                return Some((name.to_string(), query.to_string()));
+                return Some((normalize_supported_cursor_name(name), query.to_string()));
             }
         }
     }
@@ -1080,7 +1080,7 @@ fn parse_fetch_forward(statement: &str) -> Option<(String, Option<usize>)> {
     if name.is_empty() {
         None
     } else {
-        Some((name.to_string(), count))
+        Some((normalize_supported_cursor_name(name), count))
     }
 }
 
@@ -1094,7 +1094,7 @@ fn parse_move_forward(statement: &str) -> Option<(String, Option<usize>)> {
     if name.is_empty() {
         None
     } else {
-        Some((name.to_string(), count))
+        Some((normalize_supported_cursor_name(name), count))
     }
 }
 
@@ -1221,8 +1221,14 @@ fn parse_close_cursor(statement: &str) -> Option<CloseCursorTarget> {
     if original.trim().is_empty() {
         None
     } else {
-        Some(CloseCursorTarget::Named(original.trim().to_string()))
+        Some(CloseCursorTarget::Named(normalize_supported_cursor_name(
+            original.trim(),
+        )))
     }
+}
+
+fn normalize_supported_cursor_name(name: &str) -> String {
+    name.to_ascii_lowercase()
 }
 
 fn execute_declare_cursor(
@@ -9309,6 +9315,13 @@ mod tests {
             ))
         );
         assert_eq!(
+            parse_declare_cursor("DECLARE Mixed_Cursor CURSOR FOR SELECT id FROM people"),
+            Some((
+                "mixed_cursor".to_string(),
+                "select id from people".to_string()
+            ))
+        );
+        assert_eq!(
             parse_declare_cursor(
                 "DECLARE _psql_cursor NO SCROLL CURSOR WITHOUT HOLD FOR SELECT id FROM people"
             ),
@@ -9381,6 +9394,10 @@ mod tests {
             Some(("_psql_cursor".to_string(), Some(2)))
         );
         assert_eq!(
+            parse_fetch_forward("FETCH FORWARD 2 FROM Mixed_Cursor"),
+            Some(("mixed_cursor".to_string(), Some(2)))
+        );
+        assert_eq!(
             parse_fetch_forward("FETCH NEXT FROM _psql_cursor"),
             Some(("_psql_cursor".to_string(), Some(1)))
         );
@@ -9419,6 +9436,10 @@ mod tests {
         assert_eq!(
             parse_move_forward("MOVE FORWARD 2 FROM _psql_cursor"),
             Some(("_psql_cursor".to_string(), Some(2)))
+        );
+        assert_eq!(
+            parse_move_forward("MOVE FORWARD 2 FROM MIXED_CURSOR"),
+            Some(("mixed_cursor".to_string(), Some(2)))
         );
         assert_eq!(
             parse_move_forward("MOVE NEXT FROM _psql_cursor"),
@@ -9467,6 +9488,10 @@ mod tests {
         assert_eq!(
             parse_close_cursor("CLOSE _psql_cursor"),
             Some(CloseCursorTarget::Named("_psql_cursor".to_string()))
+        );
+        assert_eq!(
+            parse_close_cursor("CLOSE Mixed_Cursor"),
+            Some(CloseCursorTarget::Named("mixed_cursor".to_string()))
         );
         assert_eq!(
             parse_close_cursor("CLOSE ALL"),
