@@ -1462,7 +1462,7 @@ fn sql_prepare_type_oid(ty: &str) -> Option<u32> {
 }
 
 fn decode_sql_execute_argument(arg: &str) -> Option<Option<String>> {
-    let trimmed = arg.trim();
+    let trimmed = strip_parenthesized_sql_execute_argument(arg.trim())?;
     if canonical_sql(trimmed) == "null" {
         return Some(None);
     }
@@ -1491,6 +1491,52 @@ fn decode_sql_execute_argument(arg: &str) -> Option<Option<String>> {
     } else {
         None
     }
+}
+
+fn strip_parenthesized_sql_execute_argument(mut arg: &str) -> Option<&str> {
+    loop {
+        let Some(without_open) = arg.strip_prefix('(') else {
+            return Some(arg);
+        };
+        let Some(inner) = without_open.strip_suffix(')') else {
+            return Some(arg);
+        };
+        let inner = inner.trim();
+        if inner.is_empty() || !parenthesized_list_is_balanced(inner) {
+            return None;
+        }
+        arg = inner;
+    }
+}
+
+fn parenthesized_list_is_balanced(input: &str) -> bool {
+    let mut depth = 0usize;
+    let mut in_quote = false;
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\'' {
+            if in_quote && chars.peek() == Some(&'\'') {
+                chars.next();
+                continue;
+            }
+            in_quote = !in_quote;
+            continue;
+        }
+        if in_quote {
+            continue;
+        }
+        match ch {
+            '(' => depth = depth.saturating_add(1),
+            ')' => {
+                let Some(next_depth) = depth.checked_sub(1) else {
+                    return false;
+                };
+                depth = next_depth;
+            }
+            _ => {}
+        }
+    }
+    depth == 0 && !in_quote
 }
 
 fn parse_supported_cursor_name(name: &str) -> Option<String> {
@@ -9929,6 +9975,20 @@ mod tests {
             Some((
                 "lookup".to_string(),
                 vec![Some("2".to_string()), Some("O'Brien".to_string())],
+            ))
+        );
+        assert_eq!(
+            parse_sql_execute("EXECUTE lookup((2), ('Linus'))"),
+            Some((
+                "lookup".to_string(),
+                vec![Some("2".to_string()), Some("Linus".to_string())],
+            ))
+        );
+        assert_eq!(
+            parse_sql_execute("EXECUTE lookup(((2)), (('Linus')))"),
+            Some((
+                "lookup".to_string(),
+                vec![Some("2".to_string()), Some("Linus".to_string())],
             ))
         );
         assert_eq!(
