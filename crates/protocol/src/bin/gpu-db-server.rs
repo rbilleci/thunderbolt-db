@@ -9551,6 +9551,18 @@ mod tests {
         assert!(is_unsupported_move_cursor_statement(
             "MOVE BACKWARD 1 _psql_cursor"
         ));
+        assert!(is_unsupported_move_cursor_statement(
+            "MOVE FIRST FROM _psql_cursor"
+        ));
+        assert!(is_unsupported_move_cursor_statement(
+            "MOVE LAST _psql_cursor"
+        ));
+        assert!(is_unsupported_move_cursor_statement(
+            "MOVE ABSOLUTE 3 FROM _psql_cursor"
+        ));
+        assert!(is_unsupported_move_cursor_statement(
+            "MOVE RELATIVE 2 _psql_cursor"
+        ));
         assert_eq!(
             parse_fetch_forward("FETCH BACKWARD 1 FROM _psql_cursor"),
             None
@@ -9560,6 +9572,18 @@ mod tests {
         ));
         assert!(is_unsupported_fetch_cursor_statement(
             "FETCH BACKWARD 1 _psql_cursor"
+        ));
+        assert!(is_unsupported_fetch_cursor_statement(
+            "FETCH FIRST FROM _psql_cursor"
+        ));
+        assert!(is_unsupported_fetch_cursor_statement(
+            "FETCH LAST _psql_cursor"
+        ));
+        assert!(is_unsupported_fetch_cursor_statement(
+            "FETCH ABSOLUTE 3 FROM _psql_cursor"
+        ));
+        assert!(is_unsupported_fetch_cursor_statement(
+            "FETCH RELATIVE 2 _psql_cursor"
         ));
         assert_eq!(
             parse_close_cursor("CLOSE _psql_cursor"),

@@ -1,0 +1,23 @@
+=== psql cursor non-forward variants ===
+CREATE TABLE
+INSERT 0 4
+DECLARE CURSOR
+psql:125_protocol_psql_cursor_nonforward_variants.sql:5: ERROR:  cursor fetch direction is not supported by the compatibility endpoint
+ id | name
+----+------
+  1 | Ada
+(1 row)
+
+psql:125_protocol_psql_cursor_nonforward_variants.sql:7: ERROR:  cursor move direction is not supported by the compatibility endpoint
+psql:125_protocol_psql_cursor_nonforward_variants.sql:8: ERROR:  cursor move direction is not supported by the compatibility endpoint
+psql:125_protocol_psql_cursor_nonforward_variants.sql:9: ERROR:  cursor move direction is not supported by the compatibility endpoint
+ id | name
+----+-------
+  2 | Linus
+(1 row)
+
+CLOSE CURSOR
+  name
+--------
+ Edsger
+(1 row)
