@@ -1,0 +1,19 @@
+=== psql SQL prepare escaped text arguments ===
+CREATE TABLE
+INSERT 0 3
+PREPARE
+ id |     name
+----+--------------
+  2 | O'Brien, Sr.
+(1 row)
+
+ id | name
+----+------
+(0 rows)
+
+DEALLOCATE
+psql:144_protocol_psql_sql_prepare_text_escaped_arguments.sql:8: ERROR:  prepared statement "sql_prepare_text_lookup" does not exist
+ name
+-------
+ Grace
+(1 row)
