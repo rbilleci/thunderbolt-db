@@ -752,7 +752,10 @@ fn handle_parse(
         )?;
         return Ok(true);
     }
-    if describe_query_columns(session, &query).is_none() {
+    let describe_query = parse_declare_cursor(&query)
+        .map(|(_, cursor_query)| cursor_query)
+        .unwrap_or_else(|| query.clone());
+    if describe_query_columns(session, &describe_query).is_none() {
         write_error(
             stream,
             &ErrorField {
@@ -764,7 +767,7 @@ fn handle_parse(
         return Ok(true);
     }
     let parameter_type_oids =
-        resolve_prepared_parameter_type_oids(session, &query, parameter_type_oids);
+        resolve_prepared_parameter_type_oids(session, &describe_query, parameter_type_oids);
     session.replace_extended_statement(
         statement_name,
         PreparedQuery {
@@ -990,6 +993,9 @@ fn handle_execute(
             return Ok(true);
         }
     };
+    if let Some((name, query)) = parse_declare_cursor(&bound_query) {
+        return execute_declare_cursor(stream, session, name, &query);
+    }
     let select = match parse_command(&bound_query) {
         Ok(Command::Select(select)) => select,
         Err(ParseError::NegativeLimit) => {
@@ -1854,40 +1860,46 @@ fn execute_declare_cursor(
     session: &mut Session,
     name: String,
     query: &str,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     if session.cursors.contains_key(&name) {
-        return write_error(
+        write_error(
             stream,
             &ErrorField {
                 code: "42P03",
                 message: "cursor already exists",
                 position: None,
             },
-        );
+        )?;
+        return Ok(true);
     }
     if max_placeholder_index(query) > 0 {
-        return write_error(
+        write_error(
             stream,
             &ErrorField {
                 code: "0A000",
                 message: "parameterized cursor declarations are not supported",
                 position: None,
             },
-        );
+        )?;
+        return Ok(true);
     }
     let Ok(Command::Select(select)) = parse_command(query) else {
-        return write_error(
+        write_error(
             stream,
             &ErrorField {
                 code: "0A000",
                 message: "cursor declarations only support relational SELECT",
                 position: None,
             },
-        );
+        )?;
+        return Ok(true);
     };
     let result = match execute_select_result(session, &select) {
         Ok(result) => result,
-        Err(error) => return write_error(stream, &error),
+        Err(error) => {
+            write_error(stream, &error)?;
+            return Ok(true);
+        }
     };
     session.cursors.insert(
         name,
@@ -1897,7 +1909,8 @@ fn execute_declare_cursor(
             position: 0,
         },
     );
-    write_command_complete(stream, "DECLARE CURSOR")
+    write_command_complete(stream, "DECLARE CURSOR")?;
+    Ok(false)
 }
 
 fn execute_fetch_forward(
@@ -1975,7 +1988,8 @@ fn execute_statement(
         );
     }
     if let Some((name, query)) = parse_declare_cursor(statement) {
-        return execute_declare_cursor(stream, session, name, &query);
+        execute_declare_cursor(stream, session, name, &query)?;
+        return Ok(());
     }
     if is_unsupported_declare_cursor_statement(statement) {
         return write_error(
@@ -8210,6 +8224,71 @@ mod tests {
         .unwrap());
         assert_eq!(read_backend_tags(&mut reader, 1), vec![b'2']);
         assert!(session.portals.contains_key("good_int4_portal"));
+    }
+
+    #[test]
+    fn extended_execute_supports_parameterized_cursor_declarations() {
+        let mut session = Session::default();
+        session.tables.insert(
+            "people".to_string(),
+            Table {
+                oid: FIRST_USER_RELATION_OID,
+                name: "people".to_string(),
+                columns: vec![
+                    CatalogColumn {
+                        attnum: 1,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "id".to_string(),
+                            ty: SqlType::Int4,
+                        },
+                    },
+                    CatalogColumn {
+                        attnum: 2,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "name".to_string(),
+                            ty: SqlType::Text,
+                        },
+                    },
+                ],
+                rows: vec![
+                    vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())],
+                    vec![SqlValue::Int4(2), SqlValue::Text("Linus".to_string())],
+                    vec![SqlValue::Int4(3), SqlValue::Text("Grace".to_string())],
+                ],
+            },
+        );
+        let (mut writer, mut reader) = tcp_pair();
+
+        assert!(!handle_parse(
+            &mut writer,
+            &mut session,
+            "".to_string(),
+            "DECLARE _psql_cursor NO SCROLL CURSOR FOR SELECT id, name FROM people WHERE id > $1 ORDER BY id".to_string(),
+            Vec::new(),
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'1']);
+
+        assert!(!handle_bind(
+            &mut writer,
+            &mut session,
+            "".to_string(),
+            "".to_string(),
+            Vec::new(),
+            vec![Some(b"1".to_vec())],
+            Vec::new(),
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'2']);
+
+        assert!(!handle_execute(&mut writer, &mut session, "", 0).unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'C']);
+        let cursor = session.cursors.get("_psql_cursor").unwrap();
+        assert_eq!(cursor.rows.len(), 2);
+        assert_eq!(
+            cursor.rows[0],
+            vec![Some("2".to_string()), Some("Linus".to_string())]
+        );
     }
 
     #[test]
