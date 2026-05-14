@@ -1,0 +1,24 @@
+=== psql extended sql prepared compatible reused bind ===
+CREATE TABLE
+INSERT 0 3
+PREPARE
+ Column | Type
+--------+------
+ name   | text
+(1 row)
+
+psql:182_protocol_psql_extended_sql_prepared_compatible_reused_bind.sql:6: ERROR:  invalid input syntax for parameter type oid 23: "not-an-int"
+ name
+------
+ Ada
+(1 row)
+
+ name
+------
+(0 rows)
+
+DEALLOCATE
+ name
+-------
+ Grace
+(1 row)
