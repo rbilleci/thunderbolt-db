@@ -1258,7 +1258,7 @@ fn parse_close_cursor(statement: &str) -> Option<CloseCursorTarget> {
 }
 
 fn parse_sql_prepare(statement: &str) -> Option<(String, Vec<u32>, String)> {
-    let trimmed = statement.trim().trim_end_matches(';').trim();
+    let trimmed = strip_leading_sql_comments(statement.trim().trim_end_matches(';').trim())?;
     let rest_start = sql_keyword_rest_start(trimmed, "prepare")?;
     let as_idx = find_sql_prepare_as_index(trimmed)?;
     let original_target = strip_sql_comments(trimmed[rest_start..as_idx].trim());
@@ -1291,7 +1291,7 @@ fn parse_sql_prepare(statement: &str) -> Option<(String, Vec<u32>, String)> {
 }
 
 fn parse_sql_prepare_name(statement: &str) -> Option<String> {
-    let trimmed = statement.trim().trim_end_matches(';').trim();
+    let trimmed = strip_leading_sql_comments(statement.trim().trim_end_matches(';').trim())?;
     let rest_start = sql_keyword_rest_start(trimmed, "prepare")?;
     let as_idx = find_sql_prepare_as_index(trimmed)?;
     let original_target = strip_sql_comments(trimmed[rest_start..as_idx].trim());
@@ -1312,6 +1312,52 @@ fn sql_keyword_rest_start(statement: &str, keyword: &str) -> Option<usize> {
         return None;
     }
     Some(keyword.len() + first.len_utf8())
+}
+
+fn strip_leading_sql_comments(mut statement: &str) -> Option<&str> {
+    loop {
+        let trimmed = statement.trim_start();
+        let skipped = statement.len() - trimmed.len();
+        statement = &statement[skipped..];
+
+        if let Some(comment) = statement.strip_prefix("--") {
+            if let Some(newline_idx) = comment.find('\n') {
+                statement = &comment[newline_idx + '\n'.len_utf8()..];
+                continue;
+            }
+            return Some("");
+        }
+
+        if let Some(comment) = statement.strip_prefix("/*") {
+            let comment_end = nested_block_comment_end(comment)?;
+            statement = &comment[comment_end..];
+            continue;
+        }
+
+        return Some(statement);
+    }
+}
+
+fn nested_block_comment_end(comment_body: &str) -> Option<usize> {
+    let mut depth = 1usize;
+    let mut previous_char: Option<char> = None;
+    for (idx, ch) in comment_body.char_indices() {
+        if previous_char == Some('/') && ch == '*' {
+            depth = depth.saturating_add(1);
+            previous_char = None;
+            continue;
+        }
+        if previous_char == Some('*') && ch == '/' {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                return Some(idx + ch.len_utf8());
+            }
+            previous_char = None;
+            continue;
+        }
+        previous_char = Some(ch);
+    }
+    None
 }
 
 fn find_sql_prepare_as_index(statement: &str) -> Option<usize> {
@@ -1393,7 +1439,7 @@ fn find_sql_prepare_as_index(statement: &str) -> Option<usize> {
 }
 
 fn parse_sql_execute(statement: &str) -> Option<(String, Vec<Option<String>>)> {
-    let trimmed = statement.trim().trim_end_matches(';').trim();
+    let trimmed = strip_leading_sql_comments(statement.trim().trim_end_matches(';').trim())?;
     let rest_start = sql_keyword_rest_start(trimmed, "execute")?;
     let original_rest = strip_sql_comments(&trimmed[rest_start..]);
     let (name, args) = {
@@ -1452,7 +1498,7 @@ fn parenthesized_list(target: &str) -> Option<&str> {
 }
 
 fn parse_sql_deallocate(statement: &str) -> Option<SqlDeallocateTarget> {
-    let trimmed = statement.trim().trim_end_matches(';').trim();
+    let trimmed = strip_leading_sql_comments(statement.trim().trim_end_matches(';').trim())?;
     let rest_start = sql_keyword_rest_start(trimmed, "deallocate")?;
     let original_rest = strip_sql_comments(&trimmed[rest_start..]);
     let mut target = original_rest.trim_start();
@@ -10101,6 +10147,17 @@ mod tests {
             ))
         );
         assert_eq!(
+            parse_sql_prepare(
+                "/* leading */ -- prepare follows\n\
+                 PREPARE leading_comment_lookup(int4) AS SELECT name FROM people WHERE id = $1",
+            ),
+            Some((
+                "leading_comment_lookup".to_string(),
+                vec![SqlType::Int4.postgres_oid()],
+                "SELECT name FROM people WHERE id = $1".to_string(),
+            ))
+        );
+        assert_eq!(
             parse_sql_prepare_name(
                 "PREPARE lookup(jsonb) AS INSERT INTO people (id, name) VALUES ($1, 'Ada')"
             ),
@@ -10136,6 +10193,12 @@ mod tests {
                  (jsonb) /* block AS */ AS INSERT INTO people (id, name) VALUES ($1, 'Ada')"
             ),
             Some("comment_as_lookup".to_string())
+        );
+        assert_eq!(
+            parse_sql_prepare_name(
+                "/* duplicate probe */ PREPARE leading_comment_lookup(jsonb) AS INSERT INTO people (id, name) VALUES ($1, 'Ada')"
+            ),
+            Some("leading_comment_lookup".to_string())
         );
         assert_eq!(
             parse_sql_execute("EXECUTE lookup(2, 'O''Brien')"),
@@ -10184,6 +10247,13 @@ mod tests {
             Some((
                 "whitespace_lookup".to_string(),
                 vec![Some("2".to_string()), Some("Ada".to_string())],
+            ))
+        );
+        assert_eq!(
+            parse_sql_execute("-- run prepared\nEXECUTE leading_comment_lookup(/* id */ 2)"),
+            Some((
+                "leading_comment_lookup".to_string(),
+                vec![Some("2".to_string())],
             ))
         );
         assert_eq!(
@@ -10245,6 +10315,16 @@ mod tests {
             parse_sql_deallocate("DEALLOCATE\nPREPARE\twhitespace_lookup"),
             Some(SqlDeallocateTarget::Named(name)) if name == "whitespace_lookup"
         ));
+        assert!(matches!(
+            parse_sql_deallocate("/* free */ DEALLOCATE PREPARE leading_comment_lookup"),
+            Some(SqlDeallocateTarget::Named(name)) if name == "leading_comment_lookup"
+        ));
+        assert_eq!(
+            strip_leading_sql_comments("/* outer /* inner */ done */ -- trailing\nEXECUTE lookup")
+                .unwrap(),
+            "EXECUTE lookup"
+        );
+        assert!(parse_sql_execute("/* unterminated EXECUTE lookup").is_none());
         assert!(parse_sql_prepare("PREPARE bad(jsonb) AS SELECT id FROM people").is_none());
         assert!(parse_sql_execute("EXECUTE lookup('unterminated)").is_none());
         assert!(parse_sql_deallocate("DEALLOCATE PREPARE").is_none());

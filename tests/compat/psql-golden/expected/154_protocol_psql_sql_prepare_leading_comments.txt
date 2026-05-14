@@ -1,0 +1,15 @@
+=== psql SQL prepare leading comments ===
+CREATE TABLE
+INSERT 0 3
+PREPARE
+ id | name
+----+-------
+  3 | Grace
+(1 row)
+
+DEALLOCATE
+psql:154_protocol_psql_sql_prepare_leading_comments.sql:10: ERROR:  prepared statement "leading_comment_lookup" does not exist
+ name
+------
+ Ada
+(1 row)
