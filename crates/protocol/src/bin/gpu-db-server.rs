@@ -1318,6 +1318,37 @@ fn find_sql_prepare_as_index(statement: &str) -> Option<usize> {
             }
             continue;
         }
+        if ch == '-' && chars.peek().is_some_and(|(_, next)| *next == '-') {
+            chars.next();
+            for (_, next_ch) in chars.by_ref() {
+                if next_ch == '\n' {
+                    break;
+                }
+            }
+            continue;
+        }
+        if ch == '/' && chars.peek().is_some_and(|(_, next)| *next == '*') {
+            chars.next();
+            let mut depth = 1usize;
+            let mut previous_char: Option<char> = None;
+            for (_, next_ch) in chars.by_ref() {
+                if previous_char == Some('/') && next_ch == '*' {
+                    depth = depth.saturating_add(1);
+                    previous_char = None;
+                    continue;
+                }
+                if previous_char == Some('*') && next_ch == '/' {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        break;
+                    }
+                    previous_char = None;
+                    continue;
+                }
+                previous_char = Some(next_ch);
+            }
+            continue;
+        }
         match ch {
             '"' => in_quoted_identifier = true,
             '(' => paren_depth = paren_depth.saturating_add(1),
@@ -10038,6 +10069,17 @@ mod tests {
             ))
         );
         assert_eq!(
+            parse_sql_prepare(
+                "PREPARE comment_as_lookup -- AS inside line comment\n\
+                 (int4, text) /* nested AS /* inner AS */ target */ AS SELECT id, name FROM people WHERE id = $1 AND name = $2",
+            ),
+            Some((
+                "comment_as_lookup".to_string(),
+                vec![SqlType::Int4.postgres_oid(), SqlType::Text.postgres_oid()],
+                "SELECT id, name FROM people WHERE id = $1 AND name = $2".to_string(),
+            ))
+        );
+        assert_eq!(
             parse_sql_prepare_name(
                 "PREPARE lookup(jsonb) AS INSERT INTO people (id, name) VALUES ($1, 'Ada')"
             ),
@@ -10066,6 +10108,13 @@ mod tests {
                 r#"PREPARE "lookup ""quoted"""(jsonb) AS INSERT INTO people (id, name) VALUES ($1, 'Ada')"#
             ),
             Some(r#"lookup "quoted""#.to_string())
+        );
+        assert_eq!(
+            parse_sql_prepare_name(
+                "PREPARE comment_as_lookup -- AS inside line comment\n\
+                 (jsonb) /* block AS */ AS INSERT INTO people (id, name) VALUES ($1, 'Ada')"
+            ),
+            Some("comment_as_lookup".to_string())
         );
         assert_eq!(
             parse_sql_execute("EXECUTE lookup(2, 'O''Brien')"),

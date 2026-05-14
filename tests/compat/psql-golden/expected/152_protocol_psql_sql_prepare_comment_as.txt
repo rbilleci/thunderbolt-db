@@ -1,0 +1,15 @@
+=== psql SQL prepare comment as separator ===
+CREATE TABLE
+INSERT 0 3
+PREPARE
+ id | name
+----+-------
+  2 | Linus
+(1 row)
+
+DEALLOCATE
+psql:152_protocol_psql_sql_prepare_comment_as.sql:8: ERROR:  prepared statement "comment_as_lookup" does not exist
+ name
+------
+ Ada
+(1 row)
