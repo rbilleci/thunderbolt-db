@@ -1100,8 +1100,10 @@ fn parse_forward_cursor_target(rest: &str) -> Option<(usize, Option<usize>)> {
 
 fn parse_forward_cursor_direction_with_marker(rest: &str) -> Option<(usize, usize, Option<usize>)> {
     let (cursor_marker_idx, cursor_marker_len) = rest
-        .find(" from ")
-        .map(|idx| (idx, " from ".len()))
+        .strip_prefix("from ")
+        .map(|_| (0, "from ".len()))
+        .or_else(|| rest.strip_prefix("in ").map(|_| (0, "in ".len())))
+        .or_else(|| rest.find(" from ").map(|idx| (idx, " from ".len())))
         .or_else(|| rest.find(" in ").map(|idx| (idx, " in ".len())))?;
     let direction = rest[..cursor_marker_idx].trim();
     let count = match direction {
@@ -9541,6 +9543,14 @@ mod tests {
             Some(("_psql_cursor".to_string(), Some(1)))
         );
         assert_eq!(
+            parse_fetch_forward("FETCH FROM _psql_cursor"),
+            Some(("_psql_cursor".to_string(), Some(1)))
+        );
+        assert_eq!(
+            parse_fetch_forward("FETCH IN _psql_cursor"),
+            Some(("_psql_cursor".to_string(), Some(1)))
+        );
+        assert_eq!(
             parse_fetch_forward("FETCH FORWARD ALL FROM _psql_cursor"),
             Some(("_psql_cursor".to_string(), None))
         );
@@ -9594,6 +9604,14 @@ mod tests {
         );
         assert_eq!(
             parse_move_forward("MOVE NEXT FROM _psql_cursor"),
+            Some(("_psql_cursor".to_string(), Some(1)))
+        );
+        assert_eq!(
+            parse_move_forward("MOVE FROM _psql_cursor"),
+            Some(("_psql_cursor".to_string(), Some(1)))
+        );
+        assert_eq!(
+            parse_move_forward("MOVE IN _psql_cursor"),
             Some(("_psql_cursor".to_string(), Some(1)))
         );
         assert_eq!(

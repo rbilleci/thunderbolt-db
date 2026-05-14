@@ -1,0 +1,37 @@
+=== psql cursor omitted-count marker variants ===
+CREATE TABLE
+INSERT 0 4
+DECLARE CURSOR
+ id | name
+----+------
+  1 | Ada
+(1 row)
+
+ id | name
+----+-------
+  2 | Linus
+(1 row)
+
+ id | name
+----+-------
+  3 | Grace
+(1 row)
+
+CLOSE CURSOR
+DECLARE CURSOR
+MOVE 1
+ id | name
+----+-------
+  2 | Linus
+(1 row)
+
+MOVE 1
+ id |  name
+----+--------
+  4 | Edsger
+(1 row)
+
+  name
+--------
+ Edsger
+(1 row)
