@@ -1840,7 +1840,12 @@ fn decode_sql_execute_argument(arg: &str) -> Option<Option<String>> {
     if canonical_sql(trimmed) == "null" {
         return Some(None);
     }
-    if trimmed.starts_with('\'') || trimmed.starts_with("E'") || trimmed.starts_with("e'") {
+    if trimmed.starts_with('\'')
+        || trimmed.starts_with("E'")
+        || trimmed.starts_with("e'")
+        || trimmed.starts_with("U&'")
+        || trimmed.starts_with("u&'")
+    {
         decode_sql_execute_string_literal(trimmed).map(Some)
     } else if sql_dollar_quote_tag_at(trimmed, 0).is_some() {
         decode_dollar_sql_string_literal(trimmed).map(Some)
@@ -1857,6 +1862,9 @@ fn decode_sql_execute_string_literal(arg: &str) -> Option<String> {
     }
     if arg.starts_with('$') {
         return decode_dollar_sql_string_literal(arg);
+    }
+    if let Some(unicode) = arg.strip_prefix("U&'").or_else(|| arg.strip_prefix("u&'")) {
+        return decode_unicode_sql_string_literal(unicode);
     }
     let escaped = arg.strip_prefix("E'").or_else(|| arg.strip_prefix("e'"))?;
     decode_escape_sql_string_literal(escaped)
@@ -1937,6 +1945,51 @@ fn decode_escape_sql_string_literal(quoted: &str) -> Option<String> {
     Some(decoded)
 }
 
+fn decode_unicode_sql_string_literal(quoted: &str) -> Option<String> {
+    if !quoted.ends_with('\'') {
+        return None;
+    }
+    let inner = &quoted[..quoted.len() - 1];
+    let mut decoded = String::with_capacity(inner.len());
+    let mut chars = inner.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\'' => {
+                if chars.peek() == Some(&'\'') {
+                    chars.next();
+                    decoded.push('\'');
+                } else {
+                    return None;
+                }
+            }
+            '\\' => {
+                if chars.peek() == Some(&'+') {
+                    chars.next();
+                    let codepoint = take_hex_codepoint(&mut chars, 6)?;
+                    decoded.push(char::from_u32(codepoint)?);
+                } else {
+                    let codepoint = take_hex_codepoint(&mut chars, 4)?;
+                    decoded.push(char::from_u32(codepoint)?);
+                }
+            }
+            other => decoded.push(other),
+        }
+    }
+    Some(decoded)
+}
+
+fn take_hex_codepoint<I>(chars: &mut std::iter::Peekable<I>, len: usize) -> Option<u32>
+where
+    I: Iterator<Item = char>,
+{
+    let mut codepoint = 0u32;
+    for _ in 0..len {
+        let digit = chars.next()?.to_digit(16)?;
+        codepoint = codepoint.checked_mul(16)?.checked_add(digit)?;
+    }
+    Some(codepoint)
+}
+
 fn normalize_sql_execute_argument(mut arg: &str) -> Option<&str> {
     loop {
         let parenthesized = strip_parenthesized_sql_execute_argument(arg)?;
@@ -1975,6 +2028,8 @@ fn strip_supported_sql_execute_typed_literal(arg: &str) -> Option<&str> {
     if value.starts_with('\'')
         || value.starts_with("E'")
         || value.starts_with("e'")
+        || value.starts_with("U&'")
+        || value.starts_with("u&'")
         || sql_dollar_quote_tag_at(value, 0).is_some()
     {
         Some(value)
@@ -11256,6 +11311,16 @@ mod tests {
             ))
         );
         assert_eq!(
+            parse_sql_execute(r"EXECUTE lookup(U&'Ada\0020Lovelace', u&'Grace\+000020Hopper')"),
+            Some((
+                "lookup".to_string(),
+                vec![
+                    Some("Ada Lovelace".to_string()),
+                    Some("Grace Hopper".to_string()),
+                ],
+            ))
+        );
+        assert_eq!(
             parse_sql_execute(r"EXECUTE lookup($tag$Ada, Lovelace$tag$, $$Grace (Hopper)$$)"),
             Some((
                 "lookup".to_string(),
@@ -11304,6 +11369,10 @@ mod tests {
                 "lookup".to_string(),
                 vec![Some("2".to_string()), Some("Ada".to_string())],
             ))
+        );
+        assert_eq!(
+            parse_sql_execute("EXECUTE lookup(text U&'Ada\\0020Lovelace')"),
+            Some(("lookup".to_string(), vec![Some("Ada Lovelace".to_string())],))
         );
         assert_eq!(
             parse_sql_execute("EXECUTE lookup(pg_catalog.int4 '3', pg_catalog.text $$Grace$$)"),
@@ -11420,6 +11489,8 @@ mod tests {
         assert!(parse_sql_prepare("PREPARE bad(jsonb) AS SELECT id FROM people").is_none());
         assert!(parse_sql_execute("EXECUTE lookup('unterminated)").is_none());
         assert!(parse_sql_execute("EXECUTE lookup(E'unterminated)").is_none());
+        assert!(parse_sql_execute("EXECUTE lookup(U&'unterminated)").is_none());
+        assert!(parse_sql_execute("EXECUTE lookup(U&'bad\\00xz')").is_none());
         assert!(parse_sql_execute("EXECUTE lookup($tag$unterminated)").is_none());
         assert!(parse_sql_deallocate("DEALLOCATE PREPARE").is_none());
     }
