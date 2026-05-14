@@ -1,0 +1,20 @@
+=== psql SQL prepare inferred types deallocate all ===
+CREATE TABLE
+INSERT 0 3
+PREPARE
+ id | name
+----+-------
+  2 | Linus
+(1 row)
+
+psql:138_protocol_psql_sql_prepare_inferred_relational_deallocate_all.sql:6: ERROR:  invalid input syntax for parameter type oid 23: "not-an-int"
+ id | name
+----+------
+(0 rows)
+
+DEALLOCATE ALL
+psql:138_protocol_psql_sql_prepare_inferred_relational_deallocate_all.sql:9: ERROR:  prepared statement "sql_prepare_inferred" does not exist
+ name
+------
+ Ada
+(1 row)
