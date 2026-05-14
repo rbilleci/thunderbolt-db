@@ -1,0 +1,25 @@
+=== psql extended sql prepared dollar literal bind ===
+CREATE TABLE
+INSERT 0 3
+PREPARE
+ Column |  Type
+--------+---------
+ id     | integer
+(1 row)
+
+ id
+----
+  1
+(1 row)
+
+psql:184_protocol_psql_extended_sql_prepared_dollar_literal_bind.sql:7: ERROR:  invalid input syntax for parameter type oid 23: "not-an-int"
+ id
+----
+  2
+(1 row)
+
+DEALLOCATE
+ name
+-------
+ Linus
+(1 row)

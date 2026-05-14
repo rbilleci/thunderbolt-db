@@ -1778,6 +1778,20 @@ fn split_sql_csv(input: &str) -> Option<Vec<&str>> {
     let mut in_quote = false;
     let mut in_escape_string = false;
     while let Some((idx, ch)) = chars.next() {
+        if !in_quote && ch == '$' {
+            if let Some(tag) = sql_dollar_quote_tag_at(input, idx) {
+                let body_start = idx + tag.len();
+                let close_relative = input[body_start..].find(tag)?;
+                let close_end = body_start + close_relative + tag.len();
+                while chars
+                    .peek()
+                    .is_some_and(|(next_idx, _)| *next_idx < close_end)
+                {
+                    chars.next();
+                }
+                continue;
+            }
+        }
         if ch == '\'' {
             if !in_quote {
                 in_escape_string = input[..idx]
@@ -1828,6 +1842,8 @@ fn decode_sql_execute_argument(arg: &str) -> Option<Option<String>> {
     }
     if trimmed.starts_with('\'') || trimmed.starts_with("E'") || trimmed.starts_with("e'") {
         decode_sql_execute_string_literal(trimmed).map(Some)
+    } else if sql_dollar_quote_tag_at(trimmed, 0).is_some() {
+        decode_dollar_sql_string_literal(trimmed).map(Some)
     } else if !trimmed.is_empty() && !trimmed.contains(char::is_whitespace) {
         Some(Some(trimmed.to_string()))
     } else {
@@ -1839,8 +1855,33 @@ fn decode_sql_execute_string_literal(arg: &str) -> Option<String> {
     if let Some(quoted) = arg.strip_prefix('\'') {
         return decode_standard_sql_string_literal(quoted);
     }
+    if arg.starts_with('$') {
+        return decode_dollar_sql_string_literal(arg);
+    }
     let escaped = arg.strip_prefix("E'").or_else(|| arg.strip_prefix("e'"))?;
     decode_escape_sql_string_literal(escaped)
+}
+
+fn decode_dollar_sql_string_literal(arg: &str) -> Option<String> {
+    let tag = sql_dollar_quote_tag_at(arg, 0)?;
+    let body = arg.strip_prefix(tag)?.strip_suffix(tag)?;
+    Some(body.to_string())
+}
+
+fn sql_dollar_quote_tag_at(input: &str, start: usize) -> Option<&str> {
+    let after_open = input.get(start..)?.strip_prefix('$')?;
+    let close_relative = after_open.find('$')?;
+    let tag_end = start + 1 + close_relative + 1;
+    let tag = &input[start..tag_end];
+    let tag_body = &tag[1..tag.len() - 1];
+    if tag_body
+        .chars()
+        .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+    {
+        Some(tag)
+    } else {
+        None
+    }
 }
 
 fn decode_standard_sql_string_literal(quoted: &str) -> Option<String> {
@@ -11136,6 +11177,16 @@ mod tests {
             ))
         );
         assert_eq!(
+            parse_sql_execute(r"EXECUTE lookup($tag$Ada, Lovelace$tag$, $$Grace (Hopper)$$)"),
+            Some((
+                "lookup".to_string(),
+                vec![
+                    Some("Ada, Lovelace".to_string()),
+                    Some("Grace (Hopper)".to_string()),
+                ],
+            ))
+        );
+        assert_eq!(
             parse_sql_execute("EXECUTE lookup((2), ('Linus'))"),
             Some((
                 "lookup".to_string(),
@@ -11263,6 +11314,7 @@ mod tests {
         assert!(parse_sql_prepare("PREPARE bad(jsonb) AS SELECT id FROM people").is_none());
         assert!(parse_sql_execute("EXECUTE lookup('unterminated)").is_none());
         assert!(parse_sql_execute("EXECUTE lookup(E'unterminated)").is_none());
+        assert!(parse_sql_execute("EXECUTE lookup($tag$unterminated)").is_none());
         assert!(parse_sql_deallocate("DEALLOCATE PREPARE").is_none());
     }
 
