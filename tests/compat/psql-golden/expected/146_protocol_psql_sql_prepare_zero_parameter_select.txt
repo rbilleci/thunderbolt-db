@@ -1,0 +1,22 @@
+=== psql SQL prepare zero-parameter select ===
+CREATE TABLE
+INSERT 0 3
+PREPARE
+ id | name
+----+-------
+  2 | Linus
+  3 | Grace
+(2 rows)
+
+ id | name
+----+-------
+  2 | Linus
+  3 | Grace
+(2 rows)
+
+DEALLOCATE
+psql:146_protocol_psql_sql_prepare_zero_parameter_select.sql:8: ERROR:  prepared statement "sql_prepare_noarg_lookup" does not exist
+ name
+------
+ Ada
+(1 row)

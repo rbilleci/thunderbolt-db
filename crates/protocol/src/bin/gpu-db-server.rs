@@ -9943,6 +9943,22 @@ mod tests {
             ))
         );
         assert_eq!(
+            parse_sql_prepare("PREPARE lookup_all AS SELECT id, name FROM people ORDER BY id",),
+            Some((
+                "lookup_all".to_string(),
+                Vec::new(),
+                "SELECT id, name FROM people ORDER BY id".to_string(),
+            ))
+        );
+        assert_eq!(
+            parse_sql_execute("EXECUTE lookup_all"),
+            Some(("lookup_all".to_string(), Vec::new()))
+        );
+        assert_eq!(
+            parse_sql_execute("EXECUTE lookup_all()"),
+            Some(("lookup_all".to_string(), Vec::new()))
+        );
+        assert_eq!(
             parse_sql_execute("EXECUTE lookup(NULL, 'Ada')"),
             Some(("lookup".to_string(), vec![None, Some("Ada".to_string())],))
         );
