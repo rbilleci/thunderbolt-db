@@ -1,0 +1,22 @@
+=== psql cursor escaped quoted identifier lifecycle ===
+CREATE TABLE
+INSERT 0 4
+DECLARE CURSOR
+ id | name
+----+------
+  1 | Ada
+(1 row)
+
+MOVE 1
+ id |  name
+----+--------
+  3 | Grace
+  4 | Edsger
+(2 rows)
+
+CLOSE CURSOR
+psql:136_protocol_psql_quoted_cursor_escaped_identifier.sql:9: ERROR:  cursor does not exist
+  name
+--------
+ Edsger
+(1 row)
