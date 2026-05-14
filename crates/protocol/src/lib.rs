@@ -134,6 +134,8 @@ pub enum ParseError {
     InvalidGet,
     #[error("invalid relational SQL syntax; supported subset: CREATE TABLE name (...), INSERT INTO name (...) VALUES (...), SELECT columns FROM name [WHERE column (=|<|<=|>|>=) literal [AND ...] [OR ...]] [ORDER BY column [ASC|DESC]] [LIMIT n]")]
     InvalidRelationalSql,
+    #[error("LIMIT must not be negative")]
+    NegativeLimit,
     #[error("invalid RESET/DISCARD/DEALLOCATE/CLOSE/LISTEN/NOTIFY/UNLISTEN syntax; expected: RESET ALL|ROLE|AUTHORIZATION|AUTH|SESSION AUTHORIZATION[ [TO] DEFAULT]|SESSION AUTH[ [TO] DEFAULT], DISCARD {{ALL|TEMP|TEMPORARY|TEMP TABLES|TEMPORARY TABLES|PLANS|SEQUENCES}}, DEALLOCATE {{ALL|name|PREPARE|PREPARED name}}, CLOSE {{ALL|name}}, LISTEN channel, NOTIFY channel[, payload], or UNLISTEN [*|ALL|channel]")]
     InvalidReset,
 }
@@ -1643,7 +1645,8 @@ fn parse_projection(input: &str) -> Result<SelectProjection, ParseError> {
 fn parse_select_limit(input: &str) -> Result<usize, ParseError> {
     match parse_sql_value(input)? {
         SqlValue::Int4(value) if value >= 0 => Ok(value as usize),
-        SqlValue::Int4(_) | SqlValue::Text(_) => Err(ParseError::InvalidRelationalSql),
+        SqlValue::Int4(_) => Err(ParseError::NegativeLimit),
+        SqlValue::Text(_) => Err(ParseError::InvalidRelationalSql),
     }
 }
 
@@ -8237,6 +8240,10 @@ mod tests {
                 limit: Some(1),
             })
         );
+        assert!(matches!(
+            parse_command("SELECT id FROM people ORDER BY id LIMIT -1"),
+            Err(ParseError::NegativeLimit)
+        ));
 
         assert_eq!(
             parse_command("SELECT id, name FROM people WHERE id = 1 ORDER BY name DESC LIMIT 5")

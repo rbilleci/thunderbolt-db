@@ -1,0 +1,20 @@
+=== psql SQL prepared negative limit parameter ===
+CREATE TABLE
+INSERT 0 3
+PREPARE
+psql:167_protocol_psql_sql_prepared_negative_limit.sql:5: ERROR:  LIMIT must not be negative
+ id | name
+----+------
+(0 rows)
+
+ id | name
+----+-------
+  1 | Ada
+  2 | Linus
+(2 rows)
+
+DEALLOCATE
+ name
+-------
+ Grace
+(1 row)

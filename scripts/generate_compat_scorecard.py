@@ -21,7 +21,7 @@ def classify(test_id: str) -> list[str]:
         or "psql_golden::" in test_id
         or re.search(r"extended|frontend|startup|session_lifecycle|protocol", test_id)
     ) and re.search(
-        r"error|unsupported|missing|mismatch|invalid|rejects_|does_not_exist|not_supported|sqlstate",
+        r"error|unsupported|missing|mismatch|invalid|negative|rejects_|does_not_exist|not_supported|sqlstate",
         test_id,
     ):
         buckets.append("protocol.error_paths")

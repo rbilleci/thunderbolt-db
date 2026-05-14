@@ -6,7 +6,7 @@ use std::thread;
 
 use gpu_db_protocol::{
     parse_command, parse_frontend_message, parse_startup_packet, Command, FrontendMessage,
-    SelectFilterOp, SelectProjection, SqlValue, StartupPacket, SUPPORTED_SQL_TYPES,
+    ParseError, SelectFilterOp, SelectProjection, SqlValue, StartupPacket, SUPPORTED_SQL_TYPES,
 };
 use gpu_db_protocol::{DescribeTarget, SqlType};
 
@@ -990,16 +990,23 @@ fn handle_execute(
             return Ok(true);
         }
     };
-    let Ok(Command::Select(select)) = parse_command(&bound_query) else {
-        write_error(
-            stream,
-            &ErrorField {
-                code: "0A000",
-                message: "limited portal execution only supports relational SELECT",
-                position: None,
-            },
-        )?;
-        return Ok(true);
+    let select = match parse_command(&bound_query) {
+        Ok(Command::Select(select)) => select,
+        Err(ParseError::NegativeLimit) => {
+            write_error(stream, &negative_limit_error_field())?;
+            return Ok(true);
+        }
+        Ok(_) | Err(_) => {
+            write_error(
+                stream,
+                &ErrorField {
+                    code: "0A000",
+                    message: "limited portal execution only supports relational SELECT",
+                    position: None,
+                },
+            )?;
+            return Ok(true);
+        }
     };
     if session
         .portals
@@ -2101,15 +2108,21 @@ fn execute_statement(
                         return write_error(stream, &sql_execute_parameter_error_field(error));
                     }
                 };
-                let Ok(Command::Select(select)) = parse_command(&bound_query) else {
-                    return write_error(
-                        stream,
-                        &ErrorField {
-                            code: "0A000",
-                            message: "SQL EXECUTE only supports relational SELECT",
-                            position: None,
-                        },
-                    );
+                let select = match parse_command(&bound_query) {
+                    Ok(Command::Select(select)) => select,
+                    Err(ParseError::NegativeLimit) => {
+                        return write_error(stream, &negative_limit_error_field());
+                    }
+                    Ok(_) | Err(_) => {
+                        return write_error(
+                            stream,
+                            &ErrorField {
+                                code: "0A000",
+                                message: "SQL EXECUTE only supports relational SELECT",
+                                position: None,
+                            },
+                        );
+                    }
                 };
                 let result = match execute_select_result(session, &select) {
                     Ok(result) => result,
@@ -5512,6 +5525,14 @@ fn sql_execute_parameter_error_field(error: BindParameterError) -> ErrorField {
             position: None,
         },
         error => bind_parameter_error_field(error),
+    }
+}
+
+fn negative_limit_error_field() -> ErrorField {
+    ErrorField {
+        code: "2201W",
+        message: "LIMIT must not be negative",
+        position: None,
     }
 }
 
