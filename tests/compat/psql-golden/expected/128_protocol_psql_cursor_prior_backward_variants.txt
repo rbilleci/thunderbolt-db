@@ -1,0 +1,28 @@
+=== psql cursor prior and backward variants ===
+CREATE TABLE
+INSERT 0 4
+DECLARE CURSOR
+ id | name
+----+-------
+  1 | Ada
+  2 | Linus
+(2 rows)
+
+psql:128_protocol_psql_cursor_prior_backward_variants.sql:6: ERROR:  cursor fetch direction is not supported by the compatibility endpoint
+ id | name
+----+-------
+  3 | Grace
+(1 row)
+
+psql:128_protocol_psql_cursor_prior_backward_variants.sql:8: ERROR:  cursor fetch direction is not supported by the compatibility endpoint
+psql:128_protocol_psql_cursor_prior_backward_variants.sql:9: ERROR:  cursor move direction is not supported by the compatibility endpoint
+psql:128_protocol_psql_cursor_prior_backward_variants.sql:10: ERROR:  cursor move direction is not supported by the compatibility endpoint
+ id |  name
+----+--------
+  4 | Edsger
+(1 row)
+
+  name
+--------
+ Edsger
+(1 row)
