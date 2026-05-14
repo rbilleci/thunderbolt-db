@@ -15,8 +15,8 @@
     "protocol.client_flows": {
       "failed": 0,
       "ignored": 0,
-      "passed": 35,
-      "total": 35
+      "passed": 36,
+      "total": 36
     },
     "protocol.error_paths": {
       "failed": 0,
@@ -89,8 +89,8 @@
   "totals": {
     "failed": 0,
     "ignored": 0,
-    "passed": 767,
-    "total": 767
+    "passed": 768,
+    "total": 768
   },
   "trend_hook": {
     "baseline_available": true,

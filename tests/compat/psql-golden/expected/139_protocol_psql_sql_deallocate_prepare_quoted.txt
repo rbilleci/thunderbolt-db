@@ -1,0 +1,15 @@
+=== psql SQL deallocate prepare quoted name ===
+CREATE TABLE
+INSERT 0 2
+PREPARE
+ name
+-------
+ Linus
+(1 row)
+
+DEALLOCATE
+psql:139_protocol_psql_sql_deallocate_prepare_quoted.sql:7: ERROR:  prepared statement "Sql Prep Lookup" does not exist
+ name
+------
+ Ada
+(1 row)

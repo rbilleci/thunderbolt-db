@@ -333,6 +333,11 @@ enum CloseCursorTarget {
     Named(String),
 }
 
+enum SqlDeallocateTarget {
+    All,
+    Named(String),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SelectResult {
     columns: Vec<Column>,
@@ -1310,6 +1315,33 @@ fn parse_sql_execute(statement: &str) -> Option<(String, Vec<Option<String>>)> {
     Some((name, args))
 }
 
+fn parse_sql_deallocate(statement: &str) -> Option<SqlDeallocateTarget> {
+    let trimmed = statement.trim().trim_end_matches(';').trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let rest = lower.strip_prefix("deallocate ")?;
+    let mut original = &trimmed["deallocate ".len()..];
+    let mut target = rest.trim_start();
+    original = original[rest.len() - target.len()..].trim_start();
+    if target == "prepare" || target == "prepared" {
+        return None;
+    }
+    if let Some(after_keyword) = target.strip_prefix("prepare ") {
+        original = original[target.len() - after_keyword.len()..].trim_start();
+        target = after_keyword.trim_start();
+    } else if let Some(after_keyword) = target.strip_prefix("prepared ") {
+        original = original[target.len() - after_keyword.len()..].trim_start();
+        target = after_keyword.trim_start();
+    }
+    if target == "all" {
+        return Some(SqlDeallocateTarget::All);
+    }
+    if target.is_empty() {
+        None
+    } else {
+        parse_supported_cursor_name(original).map(SqlDeallocateTarget::Named)
+    }
+}
+
 fn split_sql_csv(input: &str) -> Option<Vec<&str>> {
     let mut parts = Vec::new();
     let mut start = 0;
@@ -1702,6 +1734,37 @@ fn execute_statement(
         );
     }
 
+    if let Some(target) = parse_sql_deallocate(statement) {
+        match target {
+            SqlDeallocateTarget::All => {
+                session
+                    .prepared
+                    .retain(|_, statement| matches!(statement, PreparedStatement::Extended(_)));
+                return write_command_complete(stream, "DEALLOCATE ALL");
+            }
+            SqlDeallocateTarget::Named(name) => {
+                if matches!(
+                    session.prepared.get(&name),
+                    Some(PreparedStatement::AddTen | PreparedStatement::Sql(_))
+                ) {
+                    session.prepared.remove(&name);
+                    return write_command_complete(stream, "DEALLOCATE");
+                }
+                let message = Box::leak(
+                    format!("prepared statement \"{name}\" does not exist").into_boxed_str(),
+                );
+                return write_error(
+                    stream,
+                    &ErrorField {
+                        code: "26000",
+                        message,
+                        position: None,
+                    },
+                );
+            }
+        }
+    }
+
     if let Ok(command) = parse_command(statement) {
         match command {
             Command::CreateTable(create) => {
@@ -1854,27 +1917,6 @@ fn execute_statement(
     }
 
     let canonical = canonical_sql(statement);
-    if let Some(name) = canonical.strip_prefix("deallocate ") {
-        if name != "all" {
-            if matches!(
-                session.prepared.get(name),
-                Some(PreparedStatement::AddTen | PreparedStatement::Sql(_))
-            ) {
-                session.prepared.remove(name);
-                return write_command_complete(stream, "DEALLOCATE");
-            }
-            let message =
-                Box::leak(format!("prepared statement \"{name}\" does not exist").into_boxed_str());
-            return write_error(
-                stream,
-                &ErrorField {
-                    code: "26000",
-                    message,
-                    position: None,
-                },
-            );
-        }
-    }
     if let Some(rows) = psql_describe_query_type_rows(&canonical) {
         return write_single_row(stream, &[text_column("Column"), text_column("Type")], &rows);
     }
@@ -9734,8 +9776,25 @@ mod tests {
             parse_sql_execute("EXECUTE lookup(NULL, 'Ada')"),
             Some(("lookup".to_string(), vec![None, Some("Ada".to_string())],))
         );
+        assert!(matches!(
+            parse_sql_deallocate("DEALLOCATE ALL"),
+            Some(SqlDeallocateTarget::All)
+        ));
+        assert!(matches!(
+            parse_sql_deallocate("DEALLOCATE PREPARE ALL"),
+            Some(SqlDeallocateTarget::All)
+        ));
+        assert!(matches!(
+            parse_sql_deallocate("DEALLOCATE PREPARE lookup"),
+            Some(SqlDeallocateTarget::Named(name)) if name == "lookup"
+        ));
+        assert!(matches!(
+            parse_sql_deallocate(r#"DEALLOCATE PREPARE "Mixed Lookup""#),
+            Some(SqlDeallocateTarget::Named(name)) if name == "Mixed Lookup"
+        ));
         assert!(parse_sql_prepare("PREPARE bad(jsonb) AS SELECT id FROM people").is_none());
         assert!(parse_sql_execute("EXECUTE lookup('unterminated)").is_none());
+        assert!(parse_sql_deallocate("DEALLOCATE PREPARE").is_none());
     }
 
     #[test]
