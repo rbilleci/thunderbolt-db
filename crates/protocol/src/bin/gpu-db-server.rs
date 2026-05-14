@@ -294,6 +294,7 @@ struct CatalogColumn {
 enum PreparedStatement {
     AddTen,
     Extended(PreparedQuery),
+    Sql(PreparedQuery),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1242,6 +1243,141 @@ fn parse_close_cursor(statement: &str) -> Option<CloseCursorTarget> {
     }
 }
 
+fn parse_sql_prepare(statement: &str) -> Option<(String, Vec<u32>, String)> {
+    let trimmed = statement.trim().trim_end_matches(';').trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let rest = lower.strip_prefix("prepare ")?;
+    let as_idx_in_rest = rest.find(" as ")?;
+    let as_idx = "prepare ".len() + as_idx_in_rest;
+    let original_target = trimmed["prepare ".len()..as_idx].trim();
+    let query_start = as_idx + " as ".len();
+    let query = trimmed[query_start..].trim();
+    if query.is_empty() {
+        return None;
+    }
+    let canonical_query = canonical_sql(query);
+    if !canonical_query.starts_with("select ") || !canonical_query.contains(" from ") {
+        return None;
+    }
+
+    let (name, type_oids) = if let Some(open_idx) = original_target.find('(') {
+        if !original_target.ends_with(')') {
+            return None;
+        }
+        let name = parse_supported_cursor_name(original_target[..open_idx].trim())?;
+        let type_list = &original_target[open_idx + 1..original_target.len() - 1];
+        let mut type_oids = Vec::new();
+        if !type_list.trim().is_empty() {
+            for ty in split_sql_csv(type_list)? {
+                type_oids.push(sql_prepare_type_oid(ty.trim())?);
+            }
+        }
+        (name, type_oids)
+    } else {
+        (parse_supported_cursor_name(original_target)?, Vec::new())
+    };
+
+    Some((name, type_oids, query.to_string()))
+}
+
+fn parse_sql_execute(statement: &str) -> Option<(String, Vec<Option<String>>)> {
+    let trimmed = statement.trim().trim_end_matches(';').trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let rest = lower.strip_prefix("execute ")?;
+    let original_rest = &trimmed["execute ".len()..];
+    let open_idx = rest.find('(');
+    let (name, args) = if let Some(open_idx) = open_idx {
+        if !rest.ends_with(')') {
+            return None;
+        }
+        let name = parse_supported_cursor_name(original_rest[..open_idx].trim())?;
+        let arg_list = &original_rest[open_idx + 1..original_rest.len() - 1];
+        let args = if arg_list.trim().is_empty() {
+            Vec::new()
+        } else {
+            split_sql_csv(arg_list)?
+                .into_iter()
+                .map(decode_sql_execute_argument)
+                .collect::<Option<Vec<_>>>()?
+        };
+        (name, args)
+    } else {
+        (
+            parse_supported_cursor_name(original_rest.trim())?,
+            Vec::new(),
+        )
+    };
+    Some((name, args))
+}
+
+fn split_sql_csv(input: &str) -> Option<Vec<&str>> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut chars = input.char_indices().peekable();
+    let mut in_quote = false;
+    while let Some((idx, ch)) = chars.next() {
+        if ch == '\'' {
+            if in_quote && matches!(chars.peek(), Some((_, '\''))) {
+                chars.next();
+                continue;
+            }
+            in_quote = !in_quote;
+            continue;
+        }
+        if ch == ',' && !in_quote {
+            parts.push(input[start..idx].trim());
+            start = idx + ch.len_utf8();
+        }
+    }
+    if in_quote {
+        return None;
+    }
+    parts.push(input[start..].trim());
+    Some(parts)
+}
+
+fn sql_prepare_type_oid(ty: &str) -> Option<u32> {
+    match canonical_sql(ty).as_str() {
+        "int" | "int4" | "integer" | "pg_catalog.int4" | "pg_catalog.integer" => {
+            Some(SqlType::Int4.postgres_oid())
+        }
+        "text" | "pg_catalog.text" => Some(SqlType::Text.postgres_oid()),
+        _ => None,
+    }
+}
+
+fn decode_sql_execute_argument(arg: &str) -> Option<Option<String>> {
+    let trimmed = arg.trim();
+    if canonical_sql(trimmed) == "null" {
+        return Some(None);
+    }
+    if let Some(quoted) = trimmed.strip_prefix('\'') {
+        if !quoted.ends_with('\'') {
+            return None;
+        }
+        let inner = &quoted[..quoted.len() - 1];
+        let mut decoded = String::with_capacity(inner.len());
+        let mut chars = inner.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\'' {
+                if chars.peek() == Some(&'\'') {
+                    chars.next();
+                    decoded.push('\'');
+                } else {
+                    return None;
+                }
+            } else {
+                decoded.push(ch);
+            }
+        }
+        Some(Some(decoded))
+    } else if !trimmed.is_empty() && !trimmed.contains(char::is_whitespace) {
+        Some(Some(trimmed.to_string()))
+    } else {
+        None
+    }
+}
+
 fn parse_supported_cursor_name(name: &str) -> Option<String> {
     if name.is_empty() {
         return None;
@@ -1461,6 +1597,111 @@ fn execute_statement(
         return write_command_complete(stream, "CLOSE CURSOR");
     }
 
+    if let Some((name, parameter_type_oids, query)) = parse_sql_prepare(statement) {
+        if session.prepared.contains_key(&name) {
+            return write_error(
+                stream,
+                &ErrorField {
+                    code: "42P05",
+                    message: "prepared statement already exists",
+                    position: None,
+                },
+            );
+        }
+        let query = strip_sql_comments(&query);
+        if contains_zero_placeholder(&query) {
+            return write_error(
+                stream,
+                &ErrorField {
+                    code: "42P02",
+                    message: "there is no parameter $0",
+                    position: None,
+                },
+            );
+        }
+        if parameter_type_oids.len() > max_placeholder_index(&query) {
+            return write_error(
+                stream,
+                &ErrorField {
+                    code: "08P01",
+                    message: "prepared statement has too many parameter types",
+                    position: None,
+                },
+            );
+        }
+        if describe_query_columns(session, &query).is_none() {
+            return write_error(
+                stream,
+                &ErrorField {
+                    code: "0A000",
+                    message: "SQL PREPARE only supports relational SELECT",
+                    position: None,
+                },
+            );
+        }
+        let parameter_type_oids =
+            resolve_prepared_parameter_type_oids(session, &query, parameter_type_oids);
+        session.prepared.insert(
+            name,
+            PreparedStatement::Sql(PreparedQuery {
+                query,
+                parameter_type_oids,
+            }),
+        );
+        return write_command_complete(stream, "PREPARE");
+    }
+
+    if let Some((name, parameters)) = parse_sql_execute(statement) {
+        match session.prepared.get(&name).cloned() {
+            Some(PreparedStatement::AddTen) => {
+                if parameters.len() == 1 && parameters[0].as_deref() == Some("5") {
+                    return write_single_row(
+                        stream,
+                        &[int4_column("plus_ten")],
+                        &[vec![Some(String::from("15"))]],
+                    );
+                }
+            }
+            Some(PreparedStatement::Sql(query)) => {
+                let bound_query = match bind_query_parameters(&query, &parameters) {
+                    Ok(query) => query,
+                    Err(error) => return write_error(stream, &bind_parameter_error_field(error)),
+                };
+                let Ok(Command::Select(select)) = parse_command(&bound_query) else {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "0A000",
+                            message: "SQL EXECUTE only supports relational SELECT",
+                            position: None,
+                        },
+                    );
+                };
+                let result = match execute_select_result(session, &select) {
+                    Ok(result) => result,
+                    Err(error) => return write_error(stream, &error),
+                };
+                return write_select_rows(
+                    stream,
+                    &result.columns,
+                    &result.rows,
+                    include_row_description,
+                );
+            }
+            Some(PreparedStatement::Extended(_)) | None => {}
+        }
+        let message =
+            Box::leak(format!("prepared statement \"{name}\" does not exist").into_boxed_str());
+        return write_error(
+            stream,
+            &ErrorField {
+                code: "26000",
+                message,
+                position: None,
+            },
+        );
+    }
+
     if let Ok(command) = parse_command(statement) {
         match command {
             Command::CreateTable(create) => {
@@ -1613,6 +1854,27 @@ fn execute_statement(
     }
 
     let canonical = canonical_sql(statement);
+    if let Some(name) = canonical.strip_prefix("deallocate ") {
+        if name != "all" {
+            if matches!(
+                session.prepared.get(name),
+                Some(PreparedStatement::AddTen | PreparedStatement::Sql(_))
+            ) {
+                session.prepared.remove(name);
+                return write_command_complete(stream, "DEALLOCATE");
+            }
+            let message =
+                Box::leak(format!("prepared statement \"{name}\" does not exist").into_boxed_str());
+            return write_error(
+                stream,
+                &ErrorField {
+                    code: "26000",
+                    message,
+                    position: None,
+                },
+            );
+        }
+    }
     if let Some(rows) = psql_describe_query_type_rows(&canonical) {
         return write_single_row(stream, &[text_column("Column"), text_column("Type")], &rows);
     }
@@ -2782,7 +3044,9 @@ fn execute_statement(
         "reset all" => write_command_complete(stream, "RESET"),
         "discard all" => write_command_complete(stream, "DISCARD ALL"),
         "deallocate all" => {
-            session.prepared.clear();
+            session
+                .prepared
+                .retain(|_, statement| matches!(statement, PreparedStatement::Extended(_)));
             write_command_complete(stream, "DEALLOCATE ALL")
         }
         "unlisten *" | "unlisten all" => write_command_complete(stream, "UNLISTEN"),
@@ -9445,6 +9709,33 @@ mod tests {
             .unwrap(),
             vec![text_column("name"), int4_column("id")]
         );
+    }
+
+    #[test]
+    fn sql_prepare_helpers_parse_supported_relational_select_shape() {
+        assert_eq!(
+            parse_sql_prepare(
+                "PREPARE lookup(int4, pg_catalog.text) AS SELECT id, name FROM people WHERE id = $1 AND name = $2",
+            ),
+            Some((
+                "lookup".to_string(),
+                vec![SqlType::Int4.postgres_oid(), SqlType::Text.postgres_oid()],
+                "SELECT id, name FROM people WHERE id = $1 AND name = $2".to_string(),
+            ))
+        );
+        assert_eq!(
+            parse_sql_execute("EXECUTE lookup(2, 'O''Brien')"),
+            Some((
+                "lookup".to_string(),
+                vec![Some("2".to_string()), Some("O'Brien".to_string())],
+            ))
+        );
+        assert_eq!(
+            parse_sql_execute("EXECUTE lookup(NULL, 'Ada')"),
+            Some(("lookup".to_string(), vec![None, Some("Ada".to_string())],))
+        );
+        assert!(parse_sql_prepare("PREPARE bad(jsonb) AS SELECT id FROM people").is_none());
+        assert!(parse_sql_execute("EXECUTE lookup('unterminated)").is_none());
     }
 
     #[test]

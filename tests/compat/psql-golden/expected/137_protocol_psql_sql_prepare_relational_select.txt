@@ -1,0 +1,20 @@
+=== psql SQL prepare relational select ===
+CREATE TABLE
+INSERT 0 4
+PREPARE
+ id | name
+----+-------
+  2 | Linus
+(1 row)
+
+psql:137_protocol_psql_sql_prepare_relational_select.sql:6: ERROR:  invalid input syntax for parameter type oid 23: "not-an-int"
+ id | name
+----+------
+(0 rows)
+
+DEALLOCATE
+psql:137_protocol_psql_sql_prepare_relational_select.sql:9: ERROR:  prepared statement "sql_prepare_lookup" does not exist
+  name
+--------
+ Edsger
+(1 row)
