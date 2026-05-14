@@ -1046,13 +1046,25 @@ fn parse_declare_cursor(statement: &str) -> Option<(String, String)> {
     None
 }
 
-fn parse_fetch_forward(statement: &str) -> Option<(String, usize)> {
+fn parse_fetch_forward(statement: &str) -> Option<(String, Option<usize>)> {
     let trimmed = statement.trim().trim_end_matches(';').trim();
     let lower = trimmed.to_ascii_lowercase();
-    let rest = lower.strip_prefix("fetch forward ")?;
+    let (prefix_len, rest) = lower
+        .strip_prefix("fetch forward ")
+        .map(|rest| ("fetch forward ".len(), rest))
+        .or_else(|| {
+            lower
+                .strip_prefix("fetch ")
+                .map(|rest| ("fetch ".len(), rest))
+        })?;
     let from_idx = rest.find(" from ")?;
-    let count = rest[..from_idx].trim().parse::<usize>().ok()?;
-    let name_start = "fetch forward ".len() + from_idx + " from ".len();
+    let count_token = rest[..from_idx].trim();
+    let count = if count_token == "all" {
+        None
+    } else {
+        Some(count_token.parse::<usize>().ok()?)
+    };
+    let name_start = prefix_len + from_idx + " from ".len();
     let name = trimmed[name_start..].trim();
     if name.is_empty() {
         None
@@ -1121,7 +1133,7 @@ fn execute_fetch_forward(
     stream: &mut TcpStream,
     session: &mut Session,
     name: &str,
-    count: usize,
+    count: Option<usize>,
 ) -> io::Result<()> {
     let Some(cursor) = session.cursors.get_mut(name) else {
         return write_error(
@@ -1134,7 +1146,9 @@ fn execute_fetch_forward(
         );
     };
     let start = cursor.position;
-    let end = start.saturating_add(count).min(cursor.rows.len());
+    let end = count
+        .map(|count| start.saturating_add(count).min(cursor.rows.len()))
+        .unwrap_or(cursor.rows.len());
     cursor.position = end;
     write_rows_with_tag(
         stream,
@@ -9090,7 +9104,15 @@ mod tests {
         );
         assert_eq!(
             parse_fetch_forward("FETCH FORWARD 2 FROM _psql_cursor"),
-            Some(("_psql_cursor".to_string(), 2))
+            Some(("_psql_cursor".to_string(), Some(2)))
+        );
+        assert_eq!(
+            parse_fetch_forward("FETCH FORWARD ALL FROM _psql_cursor"),
+            Some(("_psql_cursor".to_string(), None))
+        );
+        assert_eq!(
+            parse_fetch_forward("FETCH ALL FROM _psql_cursor"),
+            Some(("_psql_cursor".to_string(), None))
         );
         assert_eq!(
             parse_close_cursor("CLOSE _psql_cursor"),
@@ -9171,6 +9193,41 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn extended_cursor_fetch_all_consumes_remaining_rows() {
+        let mut session = Session::default();
+        session.cursors.insert(
+            "live_cursor".to_string(),
+            Cursor {
+                columns: vec![int4_column("id")],
+                rows: vec![
+                    vec![Some("1".to_string())],
+                    vec![Some("2".to_string())],
+                    vec![Some("3".to_string())],
+                ],
+                position: 1,
+            },
+        );
+        let (mut writer, mut reader) = tcp_pair();
+
+        execute_fetch_forward(&mut writer, &mut session, "live_cursor", None).unwrap();
+        let messages = read_backend_messages(&mut reader, 4);
+        assert_eq!(
+            messages.iter().map(|(tag, _)| *tag).collect::<Vec<_>>(),
+            vec![b'T', b'D', b'D', b'C']
+        );
+        assert_eq!(messages[3].1, b"FETCH 2\0".to_vec());
+        assert_eq!(session.cursors.get("live_cursor").unwrap().position, 3);
+
+        execute_fetch_forward(&mut writer, &mut session, "live_cursor", None).unwrap();
+        let messages = read_backend_messages(&mut reader, 2);
+        assert_eq!(
+            messages.iter().map(|(tag, _)| *tag).collect::<Vec<_>>(),
+            vec![b'T', b'C']
+        );
+        assert_eq!(messages[1].1, b"FETCH 0\0".to_vec());
     }
 
     #[test]

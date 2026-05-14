@@ -1,0 +1,24 @@
+=== psql fetch all cursor lifecycle ===
+CREATE TABLE
+INSERT 0 3
+DECLARE CURSOR
+ id | name
+----+------
+  1 | Ada
+(1 row)
+
+ id | name
+----+-------
+  2 | Linus
+  3 | Grace
+(2 rows)
+
+ id | name
+----+------
+(0 rows)
+
+CLOSE CURSOR
+ name
+-------
+ Grace
+(1 row)
