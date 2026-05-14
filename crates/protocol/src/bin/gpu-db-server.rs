@@ -1033,7 +1033,12 @@ fn execute_portal_batch(
 fn parse_declare_cursor(statement: &str) -> Option<(String, String)> {
     let canonical = canonical_sql(statement.trim().trim_end_matches(';').trim());
     let rest = canonical.strip_prefix("declare ")?;
-    for marker in [" no scroll cursor for ", " cursor for "] {
+    for marker in [
+        " no scroll cursor without hold for ",
+        " cursor without hold for ",
+        " no scroll cursor for ",
+        " cursor for ",
+    ] {
         if let Some(idx) = rest.find(marker) {
             let name = rest[..idx].trim();
             if name.split_whitespace().count() != 1 {
@@ -1051,7 +1056,10 @@ fn parse_declare_cursor(statement: &str) -> Option<(String, String)> {
 
 fn is_unsupported_declare_cursor_statement(statement: &str) -> bool {
     let canonical = canonical_sql(statement.trim().trim_end_matches(';').trim());
-    canonical.starts_with("declare ") && canonical.contains(" cursor for ")
+    canonical.starts_with("declare ")
+        && (canonical.contains(" cursor for ")
+            || canonical.contains(" cursor with hold for ")
+            || canonical.contains(" cursor without hold for "))
 }
 
 fn parse_fetch_forward(statement: &str) -> Option<(String, Option<usize>)> {
@@ -9283,6 +9291,24 @@ mod tests {
         );
         assert_eq!(
             parse_declare_cursor(
+                "DECLARE _psql_cursor NO SCROLL CURSOR WITHOUT HOLD FOR SELECT id FROM people"
+            ),
+            Some((
+                "_psql_cursor".to_string(),
+                "select id from people".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_declare_cursor(
+                "DECLARE _psql_cursor CURSOR WITHOUT HOLD FOR SELECT id FROM people"
+            ),
+            Some((
+                "_psql_cursor".to_string(),
+                "select id from people".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_declare_cursor(
                 "DECLARE _psql_cursor CURSOR FOR\nSELECT id, name FROM people ORDER BY id"
             ),
             Some((
@@ -9303,6 +9329,15 @@ mod tests {
         );
         assert!(is_unsupported_declare_cursor_statement(
             "DECLARE _psql_cursor SCROLL CURSOR FOR SELECT id FROM people"
+        ));
+        assert_eq!(
+            parse_declare_cursor(
+                "DECLARE _psql_cursor NO SCROLL CURSOR WITH HOLD FOR SELECT id FROM people"
+            ),
+            None
+        );
+        assert!(is_unsupported_declare_cursor_statement(
+            "DECLARE _psql_cursor NO SCROLL CURSOR WITH HOLD FOR SELECT id FROM people"
         ));
         assert_eq!(
             parse_fetch_forward("FETCH FORWARD 2 FROM _psql_cursor"),
