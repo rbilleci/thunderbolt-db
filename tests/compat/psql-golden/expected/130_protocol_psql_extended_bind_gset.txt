@@ -1,0 +1,8 @@
+=== psql extended bind gset ===
+CREATE TABLE
+INSERT 0 3
+2 Linus
+ name
+-------
+ Linus
+(1 row)
