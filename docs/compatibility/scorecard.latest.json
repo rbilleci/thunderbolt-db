@@ -15,8 +15,8 @@
     "protocol.client_flows": {
       "failed": 0,
       "ignored": 0,
-      "passed": 32,
-      "total": 32
+      "passed": 33,
+      "total": 33
     },
     "protocol.error_paths": {
       "failed": 0,
@@ -81,16 +81,16 @@
     "uncategorized": {
       "failed": 0,
       "ignored": 0,
-      "passed": 185,
-      "total": 185
+      "passed": 186,
+      "total": 186
     }
   },
   "top_failing_categories": [],
   "totals": {
     "failed": 0,
     "ignored": 0,
-    "passed": 759,
-    "total": 759
+    "passed": 761,
+    "total": 761
   },
   "trend_hook": {
     "baseline_available": true,

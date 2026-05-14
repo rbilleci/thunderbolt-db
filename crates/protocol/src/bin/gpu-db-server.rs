@@ -607,11 +607,35 @@ fn run_simple_query(stream: &mut TcpStream, session: &mut Session, query: &str) 
 }
 
 fn split_simple_query(query: &str) -> Vec<&str> {
-    query
-        .split(';')
-        .map(str::trim)
-        .filter(|statement| !statement.is_empty())
-        .collect()
+    let mut statements = Vec::new();
+    let mut start = 0;
+    let mut in_string = false;
+    let mut chars = query.char_indices().peekable();
+    while let Some((idx, ch)) = chars.next() {
+        match ch {
+            '\'' if in_string => {
+                if matches!(chars.peek(), Some((_, '\''))) {
+                    chars.next();
+                } else {
+                    in_string = false;
+                }
+            }
+            '\'' => in_string = true,
+            ';' if !in_string => {
+                let statement = query[start..idx].trim();
+                if !statement.is_empty() {
+                    statements.push(statement);
+                }
+                start = idx + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    let statement = query[start..].trim();
+    if !statement.is_empty() {
+        statements.push(statement);
+    }
+    statements
 }
 
 fn handle_parse(
@@ -5155,6 +5179,19 @@ mod tests {
         assert_eq!(
             split_simple_query("SELECT 1;;  SELECT 2;"),
             vec!["SELECT 1", "SELECT 2"]
+        );
+    }
+
+    #[test]
+    fn split_simple_query_preserves_semicolons_inside_text_literals() {
+        assert_eq!(
+            split_simple_query(
+                "INSERT INTO commands VALUES ('SELECT 1;'); SELECT 'Ada'';Lovelace';"
+            ),
+            vec![
+                "INSERT INTO commands VALUES ('SELECT 1;')",
+                "SELECT 'Ada'';Lovelace'"
+            ]
         );
     }
 

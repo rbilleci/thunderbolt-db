@@ -1,0 +1,14 @@
+=== psql gexec semicolon text ===
+CREATE TABLE
+CREATE TABLE
+INSERT 0 3
+INSERT 0 2
+ name
+-------
+ Linus
+(1 row)
+
+ name
+------
+ Ada
+(1 row)
