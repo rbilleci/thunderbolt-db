@@ -1,0 +1,18 @@
+=== psql sql prepared execute gdesc ===
+CREATE TABLE
+INSERT 0 2
+PREPARE
+ Column | Type
+--------+------
+ name   | text
+(1 row)
+
+ name
+-------
+ Linus
+(1 row)
+
+ name
+------
+ Ada
+(1 row)

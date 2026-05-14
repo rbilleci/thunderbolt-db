@@ -755,7 +755,9 @@ fn handle_parse(
     let describe_query = parse_declare_cursor(&query)
         .map(|(_, cursor_query)| cursor_query)
         .unwrap_or_else(|| query.clone());
-    if describe_query_columns(session, &describe_query).is_none() {
+    if describe_query_columns(session, &describe_query).is_none()
+        && describe_extended_query_columns(session, &query).is_none()
+    {
         write_error(
             stream,
             &ErrorField {
@@ -928,7 +930,7 @@ fn handle_describe(
                 return Ok(true);
             };
             write_parameter_description(stream, &query.parameter_type_oids)?;
-            if let Some(columns) = describe_query_columns(session, &query.query) {
+            if let Some(columns) = describe_extended_query_columns(session, &query.query) {
                 write_row_description(stream, &columns)?;
                 Ok(false)
             } else {
@@ -955,7 +957,7 @@ fn handle_describe(
                     return Ok(true);
                 }
             };
-            if let Some(columns) = describe_query_columns(session, &bound_query) {
+            if let Some(columns) = describe_extended_query_columns(session, &bound_query) {
                 write_row_description(stream, &columns)?;
                 if let Some(portal) = session.portals.get_mut(name) {
                     portal.described = true;
@@ -995,6 +997,28 @@ fn handle_execute(
     };
     if let Some((name, query)) = parse_declare_cursor(&bound_query) {
         return execute_declare_cursor(stream, session, name, &query);
+    }
+    if let Some((name, parameters)) = parse_sql_execute(&bound_query) {
+        if session
+            .portals
+            .get(portal_name)
+            .and_then(|portal| portal.result.as_ref())
+            .is_none()
+        {
+            let result = match execute_sql_prepared_result(session, &name, &parameters) {
+                Ok(result) => result,
+                Err(error) => {
+                    write_error(stream, &error)?;
+                    return Ok(true);
+                }
+            };
+            if let Some(portal) = session.portals.get_mut(portal_name) {
+                portal.result = Some(result);
+                portal.position = 0;
+            }
+        }
+        execute_portal_batch(stream, session, portal_name, max_rows)?;
+        return Ok(false);
     }
     let select = match parse_command(&bound_query) {
         Ok(Command::Select(select)) => select,
@@ -1587,6 +1611,66 @@ fn parse_sql_execute(statement: &str) -> Option<(String, Vec<Option<String>>)> {
         }
     };
     Some((name, args))
+}
+
+fn describe_extended_query_columns(session: &Session, query: &str) -> Option<Vec<Column>> {
+    if let Some((name, parameters)) = parse_sql_execute(query) {
+        return match session.prepared.get(&name) {
+            Some(PreparedStatement::AddTen)
+                if parameters.len() == 1 && parameters[0].as_deref() == Some("5") =>
+            {
+                Some(vec![int4_column("plus_ten")])
+            }
+            Some(PreparedStatement::Sql(prepared)) => bind_query_parameters(prepared, &parameters)
+                .ok()
+                .and_then(|bound_query| describe_query_columns(session, &bound_query)),
+            Some(PreparedStatement::Extended(_)) | None => None,
+            _ => None,
+        };
+    }
+    describe_query_columns(session, query)
+}
+
+fn execute_sql_prepared_result(
+    session: &mut Session,
+    name: &str,
+    parameters: &[Option<String>],
+) -> Result<SelectResult, ErrorField> {
+    match session.prepared.get(name).cloned() {
+        Some(PreparedStatement::AddTen)
+            if parameters.len() == 1 && parameters[0].as_deref() == Some("5") =>
+        {
+            Ok(SelectResult {
+                columns: vec![int4_column("plus_ten")],
+                rows: vec![vec![Some(String::from("15"))]],
+            })
+        }
+        Some(PreparedStatement::Sql(query)) => {
+            let bound_query = bind_query_parameters(&query, parameters)
+                .map_err(sql_execute_parameter_error_field)?;
+            let select = match parse_command(&bound_query) {
+                Ok(Command::Select(select)) => select,
+                Err(ParseError::NegativeLimit) => return Err(negative_limit_error_field()),
+                Ok(_) | Err(_) => {
+                    return Err(ErrorField {
+                        code: "0A000",
+                        message: "SQL EXECUTE only supports relational SELECT",
+                        position: None,
+                    });
+                }
+            };
+            execute_select_result(session, &select)
+        }
+        Some(PreparedStatement::AddTen) | Some(PreparedStatement::Extended(_)) | None => {
+            let message =
+                Box::leak(format!("prepared statement \"{name}\" does not exist").into_boxed_str());
+            Err(ErrorField {
+                code: "26000",
+                message,
+                position: None,
+            })
+        }
+    }
 }
 
 fn split_sql_name_and_optional_parenthesized_list(target: &str) -> Option<(String, Option<&str>)> {
@@ -10405,6 +10489,78 @@ mod tests {
             .unwrap(),
             vec![text_column("name"), int4_column("id")]
         );
+    }
+
+    #[test]
+    fn extended_describe_sql_execute_uses_prepared_select_columns() {
+        let mut session = Session::default();
+        session.tables.insert(
+            "people".to_string(),
+            Table {
+                oid: FIRST_USER_RELATION_OID,
+                name: "people".to_string(),
+                columns: vec![
+                    CatalogColumn {
+                        attnum: 1,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "id".to_string(),
+                            ty: SqlType::Int4,
+                        },
+                    },
+                    CatalogColumn {
+                        attnum: 2,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "name".to_string(),
+                            ty: SqlType::Text,
+                        },
+                    },
+                ],
+                rows: vec![vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())]],
+            },
+        );
+        session.prepared.insert(
+            "lookup".to_string(),
+            PreparedStatement::Sql(PreparedQuery {
+                query: "SELECT name FROM people WHERE id = $1".to_string(),
+                parameter_type_oids: vec![SqlType::Int4.postgres_oid()],
+            }),
+        );
+        let (mut writer, mut reader) = tcp_pair();
+
+        assert!(!handle_parse(
+            &mut writer,
+            &mut session,
+            String::new(),
+            "EXECUTE lookup(1)".to_string(),
+            Vec::new(),
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'1']);
+
+        assert!(
+            !handle_describe(&mut writer, &mut session, DescribeTarget::Statement, "").unwrap()
+        );
+        assert_eq!(read_backend_tags(&mut reader, 2), vec![b't', b'T']);
+
+        assert!(!handle_bind(
+            &mut writer,
+            &mut session,
+            "exec_portal".to_string(),
+            String::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'2']);
+
+        assert!(!handle_execute(&mut writer, &mut session, "exec_portal", 0).unwrap());
+        let messages = read_backend_messages(&mut reader, 2);
+        assert_eq!(
+            messages.iter().map(|(tag, _)| *tag).collect::<Vec<_>>(),
+            vec![b'D', b'C']
+        );
+        assert_eq!(messages[1].1, b"SELECT 1\0".to_vec());
     }
 
     #[test]
