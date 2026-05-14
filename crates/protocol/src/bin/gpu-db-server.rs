@@ -1776,13 +1776,27 @@ fn split_sql_csv(input: &str) -> Option<Vec<&str>> {
     let mut start = 0;
     let mut chars = input.char_indices().peekable();
     let mut in_quote = false;
+    let mut in_escape_string = false;
     while let Some((idx, ch)) = chars.next() {
         if ch == '\'' {
+            if !in_quote {
+                in_escape_string = input[..idx]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|prefix| matches!(prefix, 'E' | 'e'));
+            }
             if in_quote && matches!(chars.peek(), Some((_, '\''))) {
                 chars.next();
                 continue;
             }
             in_quote = !in_quote;
+            if !in_quote {
+                in_escape_string = false;
+            }
+            continue;
+        }
+        if in_quote && in_escape_string && ch == '\\' {
+            chars.next();
             continue;
         }
         if ch == ',' && !in_quote {
@@ -1812,31 +1826,74 @@ fn decode_sql_execute_argument(arg: &str) -> Option<Option<String>> {
     if canonical_sql(trimmed) == "null" {
         return Some(None);
     }
-    if let Some(quoted) = trimmed.strip_prefix('\'') {
-        if !quoted.ends_with('\'') {
-            return None;
+    if trimmed.starts_with('\'') || trimmed.starts_with("E'") || trimmed.starts_with("e'") {
+        decode_sql_execute_string_literal(trimmed).map(Some)
+    } else if !trimmed.is_empty() && !trimmed.contains(char::is_whitespace) {
+        Some(Some(trimmed.to_string()))
+    } else {
+        None
+    }
+}
+
+fn decode_sql_execute_string_literal(arg: &str) -> Option<String> {
+    if let Some(quoted) = arg.strip_prefix('\'') {
+        return decode_standard_sql_string_literal(quoted);
+    }
+    let escaped = arg.strip_prefix("E'").or_else(|| arg.strip_prefix("e'"))?;
+    decode_escape_sql_string_literal(escaped)
+}
+
+fn decode_standard_sql_string_literal(quoted: &str) -> Option<String> {
+    if !quoted.ends_with('\'') {
+        return None;
+    }
+    let inner = &quoted[..quoted.len() - 1];
+    let mut decoded = String::with_capacity(inner.len());
+    let mut chars = inner.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\'' {
+            if chars.peek() == Some(&'\'') {
+                chars.next();
+                decoded.push('\'');
+            } else {
+                return None;
+            }
+        } else {
+            decoded.push(ch);
         }
-        let inner = &quoted[..quoted.len() - 1];
-        let mut decoded = String::with_capacity(inner.len());
-        let mut chars = inner.chars().peekable();
-        while let Some(ch) = chars.next() {
-            if ch == '\'' {
+    }
+    Some(decoded)
+}
+
+fn decode_escape_sql_string_literal(quoted: &str) -> Option<String> {
+    if !quoted.ends_with('\'') {
+        return None;
+    }
+    let inner = &quoted[..quoted.len() - 1];
+    let mut decoded = String::with_capacity(inner.len());
+    let mut chars = inner.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\'' => {
                 if chars.peek() == Some(&'\'') {
                     chars.next();
                     decoded.push('\'');
                 } else {
                     return None;
                 }
-            } else {
-                decoded.push(ch);
             }
+            '\\' => match chars.next()? {
+                '\\' => decoded.push('\\'),
+                '\'' => decoded.push('\''),
+                'n' => decoded.push('\n'),
+                'r' => decoded.push('\r'),
+                't' => decoded.push('\t'),
+                other => decoded.push(other),
+            },
+            other => decoded.push(other),
         }
-        Some(Some(decoded))
-    } else if !trimmed.is_empty() && !trimmed.contains(char::is_whitespace) {
-        Some(Some(trimmed.to_string()))
-    } else {
-        None
     }
+    Some(decoded)
 }
 
 fn normalize_sql_execute_argument(mut arg: &str) -> Option<&str> {
@@ -11072,6 +11129,13 @@ mod tests {
             ))
         );
         assert_eq!(
+            parse_sql_execute(r"EXECUTE lookup(E'O\'Brien', e'line\nfeed')"),
+            Some((
+                "lookup".to_string(),
+                vec![Some("O'Brien".to_string()), Some("line\nfeed".to_string())],
+            ))
+        );
+        assert_eq!(
             parse_sql_execute("EXECUTE lookup((2), ('Linus'))"),
             Some((
                 "lookup".to_string(),
@@ -11198,6 +11262,7 @@ mod tests {
         assert!(parse_sql_execute("/* unterminated EXECUTE lookup").is_none());
         assert!(parse_sql_prepare("PREPARE bad(jsonb) AS SELECT id FROM people").is_none());
         assert!(parse_sql_execute("EXECUTE lookup('unterminated)").is_none());
+        assert!(parse_sql_execute("EXECUTE lookup(E'unterminated)").is_none());
         assert!(parse_sql_deallocate("DEALLOCATE PREPARE").is_none());
     }
 

@@ -1,0 +1,25 @@
+=== psql extended sql prepared escape literal bind ===
+CREATE TABLE
+INSERT 0 3
+PREPARE
+ Column |  Type
+--------+---------
+ id     | integer
+(1 row)
+
+ id
+----
+  2
+(1 row)
+
+psql:183_protocol_psql_extended_sql_prepared_escape_literal_bind.sql:7: ERROR:  invalid input syntax for parameter type oid 23: "not-an-int"
+ id
+----
+  3
+(1 row)
+
+DEALLOCATE
+ name
+------
+ Ada
+(1 row)
