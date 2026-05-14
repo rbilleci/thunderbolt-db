@@ -1,0 +1,22 @@
+=== psql SQL prepared limit parameter select ===
+CREATE TABLE
+INSERT 0 4
+PREPARE
+ id | name
+----+-------
+  1 | Ada
+  2 | Linus
+(2 rows)
+
+psql:166_protocol_psql_sql_prepared_limit_select.sql:6: ERROR:  invalid input syntax for parameter type oid 23: "not-a-limit"
+ id | name
+----+-------
+  2 | Linus
+(1 row)
+
+DEALLOCATE
+psql:166_protocol_psql_sql_prepared_limit_select.sql:9: ERROR:  prepared statement "sql_prepared_limit_lookup" does not exist
+   name
+-----------
+ Katherine
+(1 row)
