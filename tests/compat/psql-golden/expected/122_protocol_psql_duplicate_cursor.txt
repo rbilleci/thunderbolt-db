@@ -1,0 +1,16 @@
+=== psql duplicate cursor preserves original ===
+CREATE TABLE
+INSERT 0 3
+DECLARE CURSOR
+psql:122_protocol_psql_duplicate_cursor.sql:5: ERROR:  cursor already exists
+ id | name
+----+-------
+  1 | Ada
+  2 | Linus
+(2 rows)
+
+CLOSE CURSOR
+ name
+-------
+ Grace
+(1 row)

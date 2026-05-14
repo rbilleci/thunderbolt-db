@@ -1257,6 +1257,16 @@ fn execute_declare_cursor(
     name: String,
     query: &str,
 ) -> io::Result<()> {
+    if session.cursors.contains_key(&name) {
+        return write_error(
+            stream,
+            &ErrorField {
+                code: "42P03",
+                message: "cursor already exists",
+                position: None,
+            },
+        );
+    }
     if max_placeholder_index(query) > 0 {
         return write_error(
             stream,
@@ -9623,6 +9633,62 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn declare_cursor_rejects_duplicate_name_without_replacing_existing_cursor() {
+        let mut session = Session::default();
+        session.tables.insert(
+            "people".to_string(),
+            Table {
+                oid: FIRST_USER_RELATION_OID,
+                name: "people".to_string(),
+                columns: vec![
+                    CatalogColumn {
+                        attnum: 1,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "id".to_string(),
+                            ty: SqlType::Int4,
+                        },
+                    },
+                    CatalogColumn {
+                        attnum: 2,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "name".to_string(),
+                            ty: SqlType::Text,
+                        },
+                    },
+                ],
+                rows: vec![
+                    vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())],
+                    vec![SqlValue::Int4(2), SqlValue::Text("Linus".to_string())],
+                ],
+            },
+        );
+        let (mut writer, mut reader) = tcp_pair();
+
+        execute_declare_cursor(
+            &mut writer,
+            &mut session,
+            "dup_cursor".to_string(),
+            "select id, name from people order by id",
+        )
+        .unwrap();
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'C']);
+        assert_eq!(session.cursors.get("dup_cursor").unwrap().rows.len(), 2);
+
+        execute_declare_cursor(
+            &mut writer,
+            &mut session,
+            "dup_cursor".to_string(),
+            "select id, name from people where id = 2",
+        )
+        .unwrap();
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'E']);
+
+        let cursor = session.cursors.get("dup_cursor").unwrap();
+        assert_eq!(cursor.rows.len(), 2);
+        assert_eq!(cursor.position, 0);
     }
 
     #[test]
