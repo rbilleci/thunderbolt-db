@@ -1,0 +1,19 @@
+=== psql cursor move all markerless ===
+CREATE TABLE
+INSERT 0 4
+DECLARE CURSOR
+ id | name
+----+------
+  1 | Ada
+(1 row)
+
+MOVE 3
+ id | name
+----+------
+(0 rows)
+
+CLOSE CURSOR
+   name
+-----------
+ Katherine
+(1 row)
