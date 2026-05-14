@@ -1,0 +1,11 @@
+=== psql extended bind gx ===
+CREATE TABLE
+INSERT 0 3
+-[ RECORD 1 ]
+id   | 2
+name | Linus
+
+ name
+-------
+ Grace
+(1 row)
