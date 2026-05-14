@@ -1,0 +1,29 @@
+=== psql signed int4 parameters ===
+CREATE TABLE
+INSERT 0 3
+ name
+-------
+ Minus
+(1 row)
+
+ name
+-------
+ Minus
+(1 row)
+
+PREPARE
+ name
+-------
+ Minus
+(1 row)
+
+ name
+------
+ Zero
+(1 row)
+
+DEALLOCATE
+ name
+------
+ Plus
+(1 row)

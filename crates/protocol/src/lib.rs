@@ -8165,6 +8165,19 @@ mod tests {
         );
 
         assert_eq!(
+            parse_command("INSERT INTO people (id, name) VALUES (-1, 'Minus'), (0, 'Zero')")
+                .unwrap(),
+            Command::Insert(Insert {
+                table: "people".to_string(),
+                columns: vec!["id".to_string(), "name".to_string()],
+                rows: vec![
+                    vec![SqlValue::Int4(-1), SqlValue::Text("Minus".to_string())],
+                    vec![SqlValue::Int4(0), SqlValue::Text("Zero".to_string())],
+                ],
+            })
+        );
+
+        assert_eq!(
             parse_command("SELECT id, name FROM people WHERE id = 1 ORDER BY name DESC LIMIT 5")
                 .unwrap(),
             Command::Select(Select {
