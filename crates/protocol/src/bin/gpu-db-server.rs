@@ -1009,11 +1009,6 @@ fn execute_portal_batch(
         );
     };
 
-    if !portal.described {
-        write_row_description(stream, &result.columns)?;
-        portal.described = true;
-    }
-
     let start = portal.position.min(result.rows.len());
     let requested_end = if max_rows == 0 {
         result.rows.len()
@@ -7330,12 +7325,12 @@ mod tests {
         .unwrap());
         assert_eq!(read_backend_tags(&mut reader, 1), vec![b'2']);
         assert!(!handle_execute(&mut writer, &mut session, "lookup_again_portal", 0).unwrap());
-        let messages = read_backend_messages(&mut reader, 3);
+        let messages = read_backend_messages(&mut reader, 2);
         assert_eq!(
             messages.iter().map(|(tag, _)| *tag).collect::<Vec<_>>(),
-            vec![b'T', b'D', b'C']
+            vec![b'D', b'C']
         );
-        assert_eq!(messages[2].1, b"SELECT 1\0".to_vec());
+        assert_eq!(messages[1].1, b"SELECT 1\0".to_vec());
     }
 
     #[test]
@@ -7463,12 +7458,12 @@ mod tests {
             },
         )
         .unwrap();
-        let messages = read_backend_messages(&mut reader, 3);
+        let messages = read_backend_messages(&mut reader, 2);
         assert_eq!(
             messages.iter().map(|(tag, _)| *tag).collect::<Vec<_>>(),
-            vec![b'T', b'D', b'C']
+            vec![b'D', b'C']
         );
-        assert_eq!(messages[2].1, b"SELECT 1\0".to_vec());
+        assert_eq!(messages[1].1, b"SELECT 1\0".to_vec());
     }
 
     #[test]
@@ -7582,12 +7577,12 @@ mod tests {
                 },
             )
             .unwrap();
-            let messages = read_backend_messages(&mut reader, 3);
+            let messages = read_backend_messages(&mut reader, 2);
             assert_eq!(
                 messages.iter().map(|(tag, _)| *tag).collect::<Vec<_>>(),
-                vec![b'T', b'D', b'C']
+                vec![b'D', b'C']
             );
-            assert_eq!(messages[2].1, b"SELECT 1\0".to_vec());
+            assert_eq!(messages[1].1, b"SELECT 1\0".to_vec());
         }
     }
 
@@ -7703,12 +7698,12 @@ mod tests {
                 },
             )
             .unwrap();
-            let messages = read_backend_messages(&mut reader, 3);
+            let messages = read_backend_messages(&mut reader, 2);
             assert_eq!(
                 messages.iter().map(|(tag, _)| *tag).collect::<Vec<_>>(),
-                vec![b'T', b'D', b'C']
+                vec![b'D', b'C']
             );
-            assert_eq!(messages[2].1, b"SELECT 1\0".to_vec());
+            assert_eq!(messages[1].1, b"SELECT 1\0".to_vec());
         }
     }
 
@@ -7811,12 +7806,12 @@ mod tests {
             },
         )
         .unwrap();
-        let messages = read_backend_messages(&mut reader, 3);
+        let messages = read_backend_messages(&mut reader, 2);
         assert_eq!(
             messages.iter().map(|(tag, _)| *tag).collect::<Vec<_>>(),
-            vec![b'T', b'D', b'C']
+            vec![b'D', b'C']
         );
-        assert_eq!(messages[2].1, b"SELECT 1\0".to_vec());
+        assert_eq!(messages[1].1, b"SELECT 1\0".to_vec());
     }
 
     #[test]
@@ -8164,12 +8159,12 @@ mod tests {
                 },
             )
             .unwrap();
-            let messages = read_backend_messages(&mut reader, 3);
+            let messages = read_backend_messages(&mut reader, 2);
             assert_eq!(
                 messages.iter().map(|(tag, _)| *tag).collect::<Vec<_>>(),
-                vec![b'T', b'D', b'C']
+                vec![b'D', b'C']
             );
-            assert_eq!(messages[2].1, b"SELECT 1\0".to_vec());
+            assert_eq!(messages[1].1, b"SELECT 1\0".to_vec());
         }
     }
 
@@ -8497,12 +8492,12 @@ mod tests {
             },
         )
         .unwrap();
-        let messages = read_backend_messages(&mut reader, 3);
+        let messages = read_backend_messages(&mut reader, 2);
         assert_eq!(
             messages.iter().map(|(tag, _)| *tag).collect::<Vec<_>>(),
-            vec![b'T', b'D', b'C']
+            vec![b'D', b'C']
         );
-        assert_eq!(messages[2].1, b"SELECT 1\0".to_vec());
+        assert_eq!(messages[1].1, b"SELECT 1\0".to_vec());
     }
 
     #[test]
@@ -8613,12 +8608,12 @@ mod tests {
             },
         )
         .unwrap();
-        let messages = read_backend_messages(&mut reader, 3);
+        let messages = read_backend_messages(&mut reader, 2);
         assert_eq!(
             messages.iter().map(|(tag, _)| *tag).collect::<Vec<_>>(),
-            vec![b'T', b'D', b'C']
+            vec![b'D', b'C']
         );
-        assert_eq!(messages[2].1, b"SELECT 1\0".to_vec());
+        assert_eq!(messages[1].1, b"SELECT 1\0".to_vec());
     }
 
     #[test]
@@ -8747,12 +8742,12 @@ mod tests {
                 },
             )
             .unwrap();
-            let messages = read_backend_messages(&mut reader, 3);
+            let messages = read_backend_messages(&mut reader, 2);
             assert_eq!(
                 messages.iter().map(|(tag, _)| *tag).collect::<Vec<_>>(),
-                vec![b'T', b'D', b'C']
+                vec![b'D', b'C']
             );
-            assert_eq!(messages[2].1, b"SELECT 1\0".to_vec());
+            assert_eq!(messages[1].1, b"SELECT 1\0".to_vec());
         }
     }
 
@@ -8919,12 +8914,9 @@ mod tests {
         let (mut writer, mut reader) = tcp_pair();
 
         execute_portal_batch(&mut writer, &mut session, "people_portal", 2).unwrap();
-        assert_eq!(
-            read_backend_tags(&mut reader, 4),
-            vec![b'T', b'D', b'D', b's']
-        );
+        assert_eq!(read_backend_tags(&mut reader, 3), vec![b'D', b'D', b's']);
         let portal = session.portals.get("people_portal").unwrap();
-        assert!(portal.described);
+        assert!(!portal.described);
         assert_eq!(portal.position, 2);
 
         execute_portal_batch(&mut writer, &mut session, "people_portal", 0).unwrap();
@@ -8976,14 +8968,14 @@ mod tests {
         let (mut writer, mut reader) = tcp_pair();
 
         assert!(!handle_execute(&mut writer, &mut session, "people_portal", 0).unwrap());
-        let messages = read_backend_messages(&mut reader, 5);
+        let messages = read_backend_messages(&mut reader, 4);
         assert_eq!(
             messages.iter().map(|(tag, _)| *tag).collect::<Vec<_>>(),
-            vec![b'T', b'D', b'D', b'D', b'C']
+            vec![b'D', b'D', b'D', b'C']
         );
-        assert_eq!(messages[4].1, b"SELECT 3\0".to_vec());
+        assert_eq!(messages[3].1, b"SELECT 3\0".to_vec());
         let portal = session.portals.get("people_portal").unwrap();
-        assert!(portal.described);
+        assert!(!portal.described);
         assert!(portal.result.is_some());
         assert_eq!(portal.position, 3);
 
@@ -8992,6 +8984,59 @@ mod tests {
         assert_eq!(messages[0].0, b'C');
         assert_eq!(messages[0].1, b"SELECT 0\0".to_vec());
         assert_eq!(session.portals.get("people_portal").unwrap().position, 3);
+    }
+
+    #[test]
+    fn extended_execute_leaves_row_description_to_explicit_describe() {
+        let mut session = Session::default();
+        session.tables.insert(
+            "people".to_string(),
+            Table {
+                oid: FIRST_USER_RELATION_OID,
+                name: "people".to_string(),
+                columns: vec![CatalogColumn {
+                    attnum: 1,
+                    def: gpu_db_protocol::ColumnDef {
+                        name: "id".to_string(),
+                        ty: SqlType::Int4,
+                    },
+                }],
+                rows: vec![vec![SqlValue::Int4(1)]],
+            },
+        );
+        session.replace_extended_portal(
+            "people_portal".to_string(),
+            Portal {
+                statement_name: "people_stmt".to_string(),
+                query: PreparedQuery {
+                    query: "SELECT id FROM people".to_string(),
+                    parameter_type_oids: Vec::new(),
+                },
+                parameters: Vec::new(),
+                described: false,
+                result: None,
+                position: 0,
+            },
+        );
+        let (mut writer, mut reader) = tcp_pair();
+
+        assert!(!handle_describe(
+            &mut writer,
+            &mut session,
+            DescribeTarget::Portal,
+            "people_portal"
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'T']);
+        assert!(session.portals.get("people_portal").unwrap().described);
+
+        assert!(!handle_execute(&mut writer, &mut session, "people_portal", 0).unwrap());
+        let messages = read_backend_messages(&mut reader, 2);
+        assert_eq!(
+            messages.iter().map(|(tag, _)| *tag).collect::<Vec<_>>(),
+            vec![b'D', b'C']
+        );
+        assert_eq!(messages[1].1, b"SELECT 1\0".to_vec());
     }
 
     #[test]
