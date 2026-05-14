@@ -1,0 +1,18 @@
+=== psql extended negative limit bind parameter ===
+CREATE TABLE
+INSERT 0 3
+psql:168_protocol_psql_extended_negative_limit_bind.sql:4: ERROR:  LIMIT must not be negative
+ id | name
+----+------
+(0 rows)
+
+ id | name
+----+-------
+  1 | Ada
+  2 | Linus
+(2 rows)
+
+ name
+-------
+ Grace
+(1 row)
