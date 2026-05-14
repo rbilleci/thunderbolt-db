@@ -1,0 +1,26 @@
+=== psql extended sql prepared casted reordered bind ===
+CREATE TABLE
+INSERT 0 3
+PREPARE
+ Column |  Type
+--------+---------
+ id     | integer
+ name   | text
+(2 rows)
+
+ id | name
+----+-------
+  2 | Linus
+(1 row)
+
+psql:178_protocol_psql_extended_sql_prepared_casted_reordered_bind.sql:7: ERROR:  invalid input syntax for parameter type oid 23: "nope"
+ id | name
+----+-------
+  3 | Grace
+(1 row)
+
+DEALLOCATE
+ name
+------
+ Ada
+(1 row)
