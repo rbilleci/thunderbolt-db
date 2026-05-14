@@ -9186,6 +9186,81 @@ mod tests {
     }
 
     #[test]
+    fn extended_describe_portal_after_max_rows_suspend_preserves_position() {
+        let mut session = Session::default();
+        session.tables.insert(
+            "people".to_string(),
+            Table {
+                oid: FIRST_USER_RELATION_OID,
+                name: "people".to_string(),
+                columns: vec![
+                    CatalogColumn {
+                        attnum: 1,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "id".to_string(),
+                            ty: SqlType::Int4,
+                        },
+                    },
+                    CatalogColumn {
+                        attnum: 2,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "name".to_string(),
+                            ty: SqlType::Text,
+                        },
+                    },
+                ],
+                rows: vec![
+                    vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())],
+                    vec![SqlValue::Int4(2), SqlValue::Text("Linus".to_string())],
+                    vec![SqlValue::Int4(3), SqlValue::Text("Grace".to_string())],
+                ],
+            },
+        );
+        session.replace_extended_portal(
+            "people_portal".to_string(),
+            Portal {
+                statement_name: "people_stmt".to_string(),
+                query: PreparedQuery {
+                    query: "SELECT id, name FROM people ORDER BY id".to_string(),
+                    parameter_type_oids: Vec::new(),
+                },
+                parameters: Vec::new(),
+                described: false,
+                result: None,
+                position: 0,
+            },
+        );
+        let (mut writer, mut reader) = tcp_pair();
+
+        assert!(!handle_execute(&mut writer, &mut session, "people_portal", 2).unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 3), vec![b'D', b'D', b's']);
+        let portal = session.portals.get("people_portal").unwrap();
+        assert!(!portal.described);
+        assert_eq!(portal.position, 2);
+
+        assert!(!handle_describe(
+            &mut writer,
+            &mut session,
+            DescribeTarget::Portal,
+            "people_portal"
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'T']);
+        let portal = session.portals.get("people_portal").unwrap();
+        assert!(portal.described);
+        assert_eq!(portal.position, 2);
+
+        assert!(!handle_execute(&mut writer, &mut session, "people_portal", 0).unwrap());
+        let messages = read_backend_messages(&mut reader, 2);
+        assert_eq!(
+            messages.iter().map(|(tag, _)| *tag).collect::<Vec<_>>(),
+            vec![b'D', b'C']
+        );
+        assert_eq!(messages[1].1, b"SELECT 1\0".to_vec());
+        assert_eq!(session.portals.get("people_portal").unwrap().position, 3);
+    }
+
+    #[test]
     fn extended_execute_zero_max_rows_exhausts_portal_state() {
         let mut session = Session::default();
         session.tables.insert(
