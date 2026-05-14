@@ -1,0 +1,30 @@
+=== psql cursor zero-count movement ===
+CREATE TABLE
+INSERT 0 3
+DECLARE CURSOR
+ id | name
+----+------
+(0 rows)
+
+ id | name
+----+------
+  1 | Ada
+(1 row)
+
+MOVE 0
+ id | name
+----+-------
+  2 | Linus
+(1 row)
+
+MOVE 0
+ id | name
+----+-------
+  3 | Grace
+(1 row)
+
+CLOSE CURSOR
+ name
+-------
+ Grace
+(1 row)
