@@ -1,0 +1,26 @@
+=== psql cursor transaction end lifecycle ===
+CREATE TABLE
+INSERT 0 3
+BEGIN
+DECLARE CURSOR
+ id | name
+----+------
+  1 | Ada
+(1 row)
+
+COMMIT
+psql:119_protocol_psql_cursor_transaction_end.sql:8: ERROR:  cursor does not exist
+BEGIN
+DECLARE CURSOR
+ id | name
+----+-------
+  1 | Ada
+  2 | Linus
+(2 rows)
+
+ROLLBACK
+psql:119_protocol_psql_cursor_transaction_end.sql:13: ERROR:  cursor does not exist
+ name
+-------
+ Grace
+(1 row)

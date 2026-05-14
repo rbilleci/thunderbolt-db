@@ -1528,10 +1528,21 @@ fn execute_statement(
                     include_row_description,
                 );
             }
-            Command::Begin
-            | Command::Commit { .. }
-            | Command::Rollback { .. }
-            | Command::Flush
+            Command::Begin => {
+                session.in_transaction = true;
+                return write_command_complete(stream, "BEGIN");
+            }
+            Command::Commit { chain } => {
+                session.cursors.clear();
+                session.in_transaction = chain;
+                return write_command_complete(stream, "COMMIT");
+            }
+            Command::Rollback { chain } => {
+                session.cursors.clear();
+                session.in_transaction = chain;
+                return write_command_complete(stream, "ROLLBACK");
+            }
+            Command::Flush
             | Command::ResetAll
             | Command::SetKv { .. }
             | Command::DeleteKv { .. }
@@ -9624,6 +9635,46 @@ mod tests {
         execute_statement(&mut writer, &mut session, "CLOSE live_cursor", true).unwrap();
         assert_eq!(read_backend_tags(&mut reader, 1), vec![b'C']);
         assert!(!session.cursors.contains_key("live_cursor"));
+    }
+
+    #[test]
+    fn transaction_end_closes_session_local_cursors() {
+        let mut session = Session::default();
+        session.cursors.insert(
+            "commit_cursor".to_string(),
+            Cursor {
+                columns: vec![int4_column("id")],
+                rows: vec![vec![Some("1".to_string())]],
+                position: 0,
+            },
+        );
+        session.cursors.insert(
+            "rollback_cursor".to_string(),
+            Cursor {
+                columns: vec![int4_column("id")],
+                rows: vec![vec![Some("2".to_string())]],
+                position: 0,
+            },
+        );
+        let (mut writer, mut reader) = tcp_pair();
+
+        execute_statement(&mut writer, &mut session, "COMMIT AND CHAIN", true).unwrap();
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'C']);
+        assert!(session.in_transaction);
+        assert!(session.cursors.is_empty());
+
+        session.cursors.insert(
+            "rollback_cursor".to_string(),
+            Cursor {
+                columns: vec![int4_column("id")],
+                rows: vec![vec![Some("2".to_string())]],
+                position: 0,
+            },
+        );
+        execute_statement(&mut writer, &mut session, "ROLLBACK", true).unwrap();
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'C']);
+        assert!(!session.in_transaction);
+        assert!(session.cursors.is_empty());
     }
 
     #[test]
