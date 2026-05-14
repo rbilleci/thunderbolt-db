@@ -5772,7 +5772,25 @@ fn strip_sql_comments(query: &str) -> String {
             in_quoted_identifier = !in_quoted_identifier;
             continue;
         }
-        if in_quote || in_quoted_identifier || ch != '-' && ch != '/' {
+        if in_quote || in_quoted_identifier {
+            continue;
+        }
+        if ch == '$' {
+            if let Some(tag) = sql_dollar_quote_tag_at(query, idx) {
+                let body_start = idx + tag.len();
+                if let Some(close_relative) = query[body_start..].find(tag) {
+                    let close_end = body_start + close_relative + tag.len();
+                    while chars
+                        .peek()
+                        .is_some_and(|(next_idx, _)| *next_idx < close_end)
+                    {
+                        chars.next();
+                    }
+                }
+            }
+            continue;
+        }
+        if ch != '-' && ch != '/' {
             continue;
         }
 
@@ -8356,6 +8374,12 @@ mod tests {
         assert_eq!(
             strip_sql_comments("SELECT '$1 -- still text', id FROM people WHERE id = $1"),
             "SELECT '$1 -- still text', id FROM people WHERE id = $1"
+        );
+        assert_eq!(
+            strip_sql_comments(
+                "SELECT $$-- still text$$, $tag$/* still text */$tag$, id FROM people WHERE id = $1"
+            ),
+            "SELECT $$-- still text$$, $tag$/* still text */$tag$, id FROM people WHERE id = $1"
         );
         assert_eq!(
             strip_sql_comments(r#"SELECT "-- still identifier", id FROM people WHERE id = $1"#),
@@ -11183,6 +11207,18 @@ mod tests {
                 vec![
                     Some("Ada, Lovelace".to_string()),
                     Some("Grace (Hopper)".to_string()),
+                ],
+            ))
+        );
+        assert_eq!(
+            parse_sql_execute(
+                "EXECUTE lookup($tag$Ada -- not comment$tag$, $$Grace /* not comment */$$)"
+            ),
+            Some((
+                "lookup".to_string(),
+                vec![
+                    Some("Ada -- not comment".to_string()),
+                    Some("Grace /* not comment */".to_string()),
                 ],
             ))
         );

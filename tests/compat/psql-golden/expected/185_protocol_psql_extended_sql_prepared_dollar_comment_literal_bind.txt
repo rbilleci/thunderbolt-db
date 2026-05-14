@@ -1,0 +1,26 @@
+=== psql extended sql prepared dollar comment literal bind ===
+CREATE TABLE
+INSERT 0 3
+PREPARE
+ Column |  Type
+--------+---------
+ id     | integer
+ name   | text
+(2 rows)
+
+ id |        name
+----+--------------------
+  1 | Ada -- not comment
+(1 row)
+
+psql:185_protocol_psql_extended_sql_prepared_dollar_comment_literal_bind.sql:7: ERROR:  invalid input syntax for parameter type oid 23: "not-an-int"
+ id |          name
+----+-------------------------
+  2 | Grace /* not comment */
+(1 row)
+
+DEALLOCATE
+ name
+-------
+ Linus
+(1 row)
