@@ -1588,11 +1588,7 @@ fn parse_select(input: &str) -> Result<Select, ParseError> {
         } else if let Some(after_limit) = strip_keyword_prefix_case_insensitive(tail, "LIMIT") {
             let after_limit = after_limit.trim_start();
             let next = next_clause_pos(after_limit).unwrap_or(after_limit.len());
-            let n = after_limit[..next]
-                .trim()
-                .parse::<usize>()
-                .map_err(|_| ParseError::InvalidRelationalSql)?;
-            limit = Some(n);
+            limit = Some(parse_select_limit(after_limit[..next].trim())?);
             tail = after_limit[next..].trim_start();
         } else {
             return Err(ParseError::InvalidRelationalSql);
@@ -1623,6 +1619,13 @@ fn parse_projection(input: &str) -> Result<SelectProjection, ParseError> {
         return Err(ParseError::InvalidRelationalSql);
     }
     Ok(SelectProjection::Columns(columns))
+}
+
+fn parse_select_limit(input: &str) -> Result<usize, ParseError> {
+    match parse_sql_value(input)? {
+        SqlValue::Int4(value) if value >= 0 => Ok(value as usize),
+        SqlValue::Int4(_) | SqlValue::Text(_) => Err(ParseError::InvalidRelationalSql),
+    }
 }
 
 fn parse_select_filter(input: &str) -> Result<SelectFilter, ParseError> {
@@ -8220,6 +8223,37 @@ mod tests {
 
         assert_eq!(
             parse_command("SELECT name FROM people WHERE 2 <= id ORDER BY id LIMIT 5").unwrap(),
+            Command::Select(Select {
+                table: "people".to_string(),
+                projection: SelectProjection::Columns(vec!["name".to_string()]),
+                filter: Some(SelectFilter {
+                    column: "id".to_string(),
+                    op: SelectFilterOp::Gte,
+                    value: SqlValue::Int4(2),
+                }),
+                filters: vec![SelectFilter {
+                    column: "id".to_string(),
+                    op: SelectFilterOp::Gte,
+                    value: SqlValue::Int4(2),
+                }],
+                filter_groups: vec![vec![SelectFilter {
+                    column: "id".to_string(),
+                    op: SelectFilterOp::Gte,
+                    value: SqlValue::Int4(2),
+                }]],
+                order_by: Some(SelectOrder {
+                    column: "id".to_string(),
+                    descending: false,
+                }),
+                limit: Some(5),
+            })
+        );
+
+        assert_eq!(
+            parse_command(
+                "SELECT name FROM people WHERE id >= 2 ORDER BY id LIMIT 5::pg_catalog.int4"
+            )
+            .unwrap(),
             Command::Select(Select {
                 table: "people".to_string(),
                 projection: SelectProjection::Columns(vec!["name".to_string()]),
