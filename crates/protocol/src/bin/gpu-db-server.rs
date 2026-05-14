@@ -1031,8 +1031,10 @@ fn execute_portal_batch(
 }
 
 fn parse_declare_cursor(statement: &str) -> Option<(String, String)> {
-    let canonical = canonical_sql(statement.trim().trim_end_matches(';').trim());
+    let trimmed = statement.trim().trim_end_matches(';').trim();
+    let canonical = canonical_sql(trimmed);
     let rest = canonical.strip_prefix("declare ")?;
+    let original_rest = &trimmed["declare ".len()..];
     for marker in [
         " asensitive no scroll cursor without hold for ",
         " insensitive no scroll cursor without hold for ",
@@ -1048,14 +1050,11 @@ fn parse_declare_cursor(statement: &str) -> Option<(String, String)> {
         " cursor for ",
     ] {
         if let Some(idx) = rest.find(marker) {
-            let name = rest[..idx].trim();
-            if name.split_whitespace().count() != 1 {
-                return None;
-            }
+            let name = parse_supported_cursor_name(original_rest[..idx].trim())?;
             let query_start = "declare ".len() + idx + marker.len();
             let query = canonical[query_start..].trim();
-            if !name.is_empty() && !query.is_empty() {
-                return Some((normalize_supported_cursor_name(name), query.to_string()));
+            if !query.is_empty() {
+                return Some((name, query.to_string()));
             }
         }
     }
@@ -1077,11 +1076,7 @@ fn parse_fetch_forward(statement: &str) -> Option<(String, Option<usize>)> {
     let (name_start_in_rest, count) = parse_forward_cursor_target(rest)?;
     let name_start = "fetch ".len() + name_start_in_rest;
     let name = trimmed[name_start..].trim();
-    if name.is_empty() {
-        None
-    } else {
-        Some((normalize_supported_cursor_name(name), count))
-    }
+    parse_supported_cursor_name(name).map(|name| (name, count))
 }
 
 fn parse_move_forward(statement: &str) -> Option<(String, Option<usize>)> {
@@ -1091,11 +1086,7 @@ fn parse_move_forward(statement: &str) -> Option<(String, Option<usize>)> {
     let (name_start_in_rest, count) = parse_forward_cursor_target(rest)?;
     let name_start = "move ".len() + name_start_in_rest;
     let name = trimmed[name_start..].trim();
-    if name.is_empty() {
-        None
-    } else {
-        Some((normalize_supported_cursor_name(name), count))
-    }
+    parse_supported_cursor_name(name).map(|name| (name, count))
 }
 
 fn parse_forward_cursor_target(rest: &str) -> Option<(usize, Option<usize>)> {
@@ -1221,14 +1212,43 @@ fn parse_close_cursor(statement: &str) -> Option<CloseCursorTarget> {
     if original.trim().is_empty() {
         None
     } else {
-        Some(CloseCursorTarget::Named(normalize_supported_cursor_name(
-            original.trim(),
-        )))
+        parse_supported_cursor_name(original.trim()).map(CloseCursorTarget::Named)
     }
 }
 
-fn normalize_supported_cursor_name(name: &str) -> String {
-    name.to_ascii_lowercase()
+fn parse_supported_cursor_name(name: &str) -> Option<String> {
+    if name.is_empty() {
+        return None;
+    }
+    if let Some(quoted) = name.strip_prefix('"') {
+        if !quoted.ends_with('"') {
+            return None;
+        }
+        let inner = &quoted[..quoted.len() - 1];
+        let mut decoded = String::with_capacity(inner.len());
+        let mut chars = inner.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '"' {
+                if chars.peek() == Some(&'"') {
+                    chars.next();
+                    decoded.push('"');
+                } else {
+                    return None;
+                }
+            } else {
+                decoded.push(ch);
+            }
+        }
+        if decoded.is_empty() {
+            None
+        } else {
+            Some(decoded)
+        }
+    } else if name.split_whitespace().count() == 1 && !name.contains('"') {
+        Some(name.to_ascii_lowercase())
+    } else {
+        None
+    }
 }
 
 fn execute_declare_cursor(
@@ -9322,6 +9342,20 @@ mod tests {
             ))
         );
         assert_eq!(
+            parse_declare_cursor(r#"DECLARE "Mixed Cursor" CURSOR FOR SELECT id FROM people"#),
+            Some((
+                "Mixed Cursor".to_string(),
+                "select id from people".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_declare_cursor(r#"DECLARE "quote""cursor" CURSOR FOR SELECT id FROM people"#),
+            Some((
+                r#"quote"cursor"#.to_string(),
+                "select id from people".to_string()
+            ))
+        );
+        assert_eq!(
             parse_declare_cursor(
                 "DECLARE _psql_cursor NO SCROLL CURSOR WITHOUT HOLD FOR SELECT id FROM people"
             ),
@@ -9398,6 +9432,14 @@ mod tests {
             Some(("mixed_cursor".to_string(), Some(2)))
         );
         assert_eq!(
+            parse_fetch_forward(r#"FETCH FORWARD 2 FROM "Mixed Cursor""#),
+            Some(("Mixed Cursor".to_string(), Some(2)))
+        );
+        assert_eq!(
+            parse_fetch_forward(r#"FETCH ALL "Mixed Cursor""#),
+            Some(("Mixed Cursor".to_string(), None))
+        );
+        assert_eq!(
             parse_fetch_forward("FETCH NEXT FROM _psql_cursor"),
             Some(("_psql_cursor".to_string(), Some(1)))
         );
@@ -9440,6 +9482,14 @@ mod tests {
         assert_eq!(
             parse_move_forward("MOVE FORWARD 2 FROM MIXED_CURSOR"),
             Some(("mixed_cursor".to_string(), Some(2)))
+        );
+        assert_eq!(
+            parse_move_forward(r#"MOVE FORWARD 2 FROM "Mixed Cursor""#),
+            Some(("Mixed Cursor".to_string(), Some(2)))
+        );
+        assert_eq!(
+            parse_move_forward(r#"MOVE "Mixed Cursor""#),
+            Some(("Mixed Cursor".to_string(), Some(1)))
         );
         assert_eq!(
             parse_move_forward("MOVE NEXT FROM _psql_cursor"),
@@ -9493,6 +9543,11 @@ mod tests {
             parse_close_cursor("CLOSE Mixed_Cursor"),
             Some(CloseCursorTarget::Named("mixed_cursor".to_string()))
         );
+        assert_eq!(
+            parse_close_cursor(r#"CLOSE "Mixed Cursor""#),
+            Some(CloseCursorTarget::Named("Mixed Cursor".to_string()))
+        );
+        assert_eq!(parse_close_cursor(r#"CLOSE "Mixed Cursor"#), None);
         assert_eq!(
             parse_close_cursor("CLOSE ALL"),
             Some(CloseCursorTarget::All)
