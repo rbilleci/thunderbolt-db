@@ -1621,14 +1621,46 @@ fn describe_extended_query_columns(session: &Session, query: &str) -> Option<Vec
             {
                 Some(vec![int4_column("plus_ten")])
             }
-            Some(PreparedStatement::Sql(prepared)) => bind_query_parameters(prepared, &parameters)
-                .ok()
-                .and_then(|bound_query| describe_query_columns(session, &bound_query)),
+            Some(PreparedStatement::Sql(prepared)) => {
+                bind_sql_execute_describe_parameters(prepared, &parameters)
+                    .and_then(|describe_parameters| {
+                        bind_query_parameters(prepared, &describe_parameters).ok()
+                    })
+                    .and_then(|bound_query| describe_query_columns(session, &bound_query))
+            }
             Some(PreparedStatement::Extended(_)) | None => None,
             _ => None,
         };
     }
     describe_query_columns(session, query)
+}
+
+fn bind_sql_execute_describe_parameters(
+    prepared: &PreparedQuery,
+    parameters: &[Option<String>],
+) -> Option<Vec<Option<String>>> {
+    if expected_parameter_count(prepared) != parameters.len() {
+        return None;
+    }
+    parameters
+        .iter()
+        .enumerate()
+        .map(|(idx, parameter)| match parameter {
+            Some(value) if sql_execute_argument_placeholder_index(value).is_some() => {
+                let oid = prepared.parameter_type_oids.get(idx).copied().unwrap_or(0);
+                Some(Some(sql_execute_describe_dummy_value(oid).to_string()))
+            }
+            parameter => Some(parameter.clone()),
+        })
+        .collect()
+}
+
+fn sql_execute_describe_dummy_value(type_oid: u32) -> &'static str {
+    match type_oid {
+        23 => "1",
+        25 => "text",
+        _ => "1",
+    }
 }
 
 fn execute_sql_prepared_result(
@@ -5158,7 +5190,7 @@ fn resolve_prepared_parameter_type_oids(
     query: &str,
     explicit_oids: Vec<u32>,
 ) -> Vec<u32> {
-    let inferred = infer_select_parameter_type_oids(session, query);
+    let inferred = infer_extended_parameter_type_oids(session, query);
     let max_count = std::cmp::max(
         explicit_oids.len(),
         inferred
@@ -5181,6 +5213,66 @@ fn resolve_prepared_parameter_type_oids(
         }
     }
     resolved
+}
+
+fn infer_extended_parameter_type_oids(session: &Session, query: &str) -> Option<Vec<u32>> {
+    if let Some((name, parameters)) = parse_sql_execute(query) {
+        return infer_sql_execute_parameter_type_oids(session, &name, &parameters);
+    }
+    infer_select_parameter_type_oids(session, query)
+}
+
+fn infer_sql_execute_parameter_type_oids(
+    session: &Session,
+    name: &str,
+    parameters: &[Option<String>],
+) -> Option<Vec<u32>> {
+    let Some(PreparedStatement::Sql(prepared)) = session.prepared.get(name) else {
+        return Some(Vec::new());
+    };
+    if expected_parameter_count(prepared) != parameters.len() {
+        return None;
+    }
+    let max_idx = parameters
+        .iter()
+        .filter_map(|parameter| {
+            parameter
+                .as_deref()
+                .and_then(sql_execute_argument_placeholder_index)
+        })
+        .max()
+        .unwrap_or(0);
+    if max_idx == 0 {
+        return Some(Vec::new());
+    }
+
+    let mut oids = vec![0; max_idx];
+    for (sql_parameter_idx, parameter) in parameters.iter().enumerate() {
+        let Some(extended_parameter_idx) = parameter
+            .as_deref()
+            .and_then(sql_execute_argument_placeholder_index)
+        else {
+            continue;
+        };
+        if extended_parameter_idx == 0 || extended_parameter_idx > oids.len() {
+            continue;
+        }
+        oids[extended_parameter_idx - 1] = prepared
+            .parameter_type_oids
+            .get(sql_parameter_idx)
+            .copied()
+            .unwrap_or(0);
+    }
+    Some(oids)
+}
+
+fn sql_execute_argument_placeholder_index(value: &str) -> Option<usize> {
+    let digits = value.strip_prefix('$')?;
+    if digits.is_empty() || !digits.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    let idx = digits.parse::<usize>().ok()?;
+    (idx > 0).then_some(idx)
 }
 
 fn infer_select_parameter_type_oids(session: &Session, query: &str) -> Option<Vec<u32>> {
@@ -10564,6 +10656,89 @@ mod tests {
     }
 
     #[test]
+    fn extended_sql_execute_bind_infers_sql_prepared_parameter_types() {
+        let mut session = Session::default();
+        session.tables.insert(
+            "people".to_string(),
+            Table {
+                oid: FIRST_USER_RELATION_OID,
+                name: "people".to_string(),
+                columns: vec![
+                    CatalogColumn {
+                        attnum: 1,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "id".to_string(),
+                            ty: SqlType::Int4,
+                        },
+                    },
+                    CatalogColumn {
+                        attnum: 2,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "name".to_string(),
+                            ty: SqlType::Text,
+                        },
+                    },
+                ],
+                rows: vec![vec![SqlValue::Int4(2), SqlValue::Text("Ada".to_string())]],
+            },
+        );
+        session.prepared.insert(
+            "lookup".to_string(),
+            PreparedStatement::Sql(PreparedQuery {
+                query: "SELECT name FROM people WHERE id = $1 AND name = $2".to_string(),
+                parameter_type_oids: vec![
+                    SqlType::Int4.postgres_oid(),
+                    SqlType::Text.postgres_oid(),
+                ],
+            }),
+        );
+        let (mut writer, mut reader) = tcp_pair();
+
+        assert!(!handle_parse(
+            &mut writer,
+            &mut session,
+            String::new(),
+            "EXECUTE lookup($1, $2)".to_string(),
+            Vec::new(),
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'1']);
+        let query = match session.prepared.get("") {
+            Some(PreparedStatement::Extended(query)) => query,
+            _ => panic!("expected unnamed extended prepared statement"),
+        };
+        assert_eq!(
+            query.parameter_type_oids,
+            vec![SqlType::Int4.postgres_oid(), SqlType::Text.postgres_oid()]
+        );
+
+        assert!(
+            !handle_describe(&mut writer, &mut session, DescribeTarget::Statement, "").unwrap()
+        );
+        assert_eq!(read_backend_tags(&mut reader, 2), vec![b't', b'T']);
+
+        assert!(!handle_bind(
+            &mut writer,
+            &mut session,
+            "exec_portal".to_string(),
+            String::new(),
+            Vec::new(),
+            vec![Some(b"2".to_vec()), Some(b"Ada".to_vec())],
+            Vec::new(),
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'2']);
+
+        assert!(!handle_execute(&mut writer, &mut session, "exec_portal", 0).unwrap());
+        let messages = read_backend_messages(&mut reader, 2);
+        assert_eq!(
+            messages.iter().map(|(tag, _)| *tag).collect::<Vec<_>>(),
+            vec![b'D', b'C']
+        );
+        assert_eq!(messages[1].1, b"SELECT 1\0".to_vec());
+    }
+
+    #[test]
     fn sql_prepare_helpers_parse_supported_relational_select_shape() {
         assert_eq!(
             parse_sql_prepare(
@@ -10719,6 +10894,13 @@ mod tests {
             Some((
                 "lookup".to_string(),
                 vec![Some("2".to_string()), Some("Ada".to_string())],
+            ))
+        );
+        assert_eq!(
+            parse_sql_execute("EXECUTE lookup($1::int4, $2::text)"),
+            Some((
+                "lookup".to_string(),
+                vec![Some("$1".to_string()), Some("$2".to_string())],
             ))
         );
         assert_eq!(
