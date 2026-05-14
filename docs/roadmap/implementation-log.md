@@ -1,5 +1,6 @@
 # Implementation Log
 
+- 2026-05-14: Extended P3 SQL-prepared real-client reused-placeholder coverage. Scenario 176 now proves PostgreSQL 16 `psql` can bind `EXECUTE <prepared>($1)` through extended protocol when the SQL prepared statement reuses `$1` across multiple supported predicates, including `\gdesc`, invalid `int4` recovery, later successful execution, deallocate, and supported SELECT recovery.
 - 2026-05-14: Pinned another P3 real-client extended-query boundary. Scenario 175 now proves PostgreSQL 16 `psql \bind ... \gexec` against a parameterized relational `SELECT` is explicitly rejected with a stable bind-arity error, while later supported SELECT traffic in the same session still succeeds.
 - 2026-05-14: Extended P3 SQL-prepared real-client crosstab coverage. Scenario 174 now proves PostgreSQL 16 `psql` can bind `EXECUTE <prepared>($1)` through extended protocol and consume the SQL-prepared result with `\crosstabview`, then deallocate and recover for later supported relational SELECT traffic.
 - 2026-05-14: Extended P3 SQL-prepared real-client consumer coverage. Scenario 173 now proves PostgreSQL 16 `psql` can bind `EXECUTE <prepared>($1, $2)` through extended protocol and consume the SQL-prepared result with `\gset` and `\gx`, then deallocate and recover for later supported relational SELECT traffic.
