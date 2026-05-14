@@ -1,0 +1,15 @@
+=== psql extended sql prepared bind crosstabview ===
+CREATE TABLE
+INSERT 0 3
+PREPARE
+ bucket | Ada | Linus | Grace
+--------+-----+-------+-------
+ east   |   1 |       |     3
+ west   |     |     2 |
+(2 rows)
+
+DEALLOCATE
+ name
+-------
+ Linus
+(1 row)
