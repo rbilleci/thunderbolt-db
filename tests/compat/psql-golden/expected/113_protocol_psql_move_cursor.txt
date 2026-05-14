@@ -1,0 +1,27 @@
+=== psql move cursor lifecycle ===
+CREATE TABLE
+INSERT 0 4
+DECLARE CURSOR
+ id | name
+----+------
+  1 | Ada
+(1 row)
+
+MOVE 2
+ id |  name
+----+--------
+  4 | Edsger
+(1 row)
+
+MOVE 0
+ id | name
+----+------
+(0 rows)
+
+CLOSE CURSOR
+DECLARE CURSOR
+psql:113_protocol_psql_move_cursor.sql:12: ERROR:  cursor move direction is not supported by the compatibility endpoint
+ name
+-------
+ Linus
+(1 row)

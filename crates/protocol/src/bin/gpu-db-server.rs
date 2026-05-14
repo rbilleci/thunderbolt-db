@@ -1050,6 +1050,31 @@ fn parse_fetch_forward(statement: &str) -> Option<(String, Option<usize>)> {
     let trimmed = statement.trim().trim_end_matches(';').trim();
     let lower = trimmed.to_ascii_lowercase();
     let rest = lower.strip_prefix("fetch ")?;
+    let (cursor_marker_idx, cursor_marker_len, count) = parse_forward_cursor_direction(rest)?;
+    let name_start = "fetch ".len() + cursor_marker_idx + cursor_marker_len;
+    let name = trimmed[name_start..].trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some((name.to_string(), count))
+    }
+}
+
+fn parse_move_forward(statement: &str) -> Option<(String, Option<usize>)> {
+    let trimmed = statement.trim().trim_end_matches(';').trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let rest = lower.strip_prefix("move ")?;
+    let (cursor_marker_idx, cursor_marker_len, count) = parse_forward_cursor_direction(rest)?;
+    let name_start = "move ".len() + cursor_marker_idx + cursor_marker_len;
+    let name = trimmed[name_start..].trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some((name.to_string(), count))
+    }
+}
+
+fn parse_forward_cursor_direction(rest: &str) -> Option<(usize, usize, Option<usize>)> {
     let (cursor_marker_idx, cursor_marker_len) = rest
         .find(" from ")
         .map(|idx| (idx, " from ".len()))
@@ -1066,19 +1091,19 @@ fn parse_fetch_forward(statement: &str) -> Option<(String, Option<usize>)> {
             }
         }
     };
-    let name_start = "fetch ".len() + cursor_marker_idx + cursor_marker_len;
-    let name = trimmed[name_start..].trim();
-    if name.is_empty() {
-        None
-    } else {
-        Some((name.to_string(), count))
-    }
+    Some((cursor_marker_idx, cursor_marker_len, count))
 }
 
 fn is_unsupported_fetch_cursor_statement(statement: &str) -> bool {
     let trimmed = statement.trim().trim_end_matches(';').trim();
     let lower = trimmed.to_ascii_lowercase();
     lower.starts_with("fetch ") && (lower.contains(" from ") || lower.contains(" in "))
+}
+
+fn is_unsupported_move_cursor_statement(statement: &str) -> bool {
+    let trimmed = statement.trim().trim_end_matches(';').trim();
+    let lower = trimmed.to_ascii_lowercase();
+    lower.starts_with("move ") && (lower.contains(" from ") || lower.contains(" in "))
 }
 
 fn parse_close_cursor(statement: &str) -> Option<CloseCursorTarget> {
@@ -1167,6 +1192,30 @@ fn execute_fetch_forward(
     )
 }
 
+fn execute_move_forward(
+    stream: &mut TcpStream,
+    session: &mut Session,
+    name: &str,
+    count: Option<usize>,
+) -> io::Result<()> {
+    let Some(cursor) = session.cursors.get_mut(name) else {
+        return write_error(
+            stream,
+            &ErrorField {
+                code: "34000",
+                message: "cursor does not exist",
+                position: None,
+            },
+        );
+    };
+    let start = cursor.position;
+    let end = count
+        .map(|count| start.saturating_add(count).min(cursor.rows.len()))
+        .unwrap_or(cursor.rows.len());
+    cursor.position = end;
+    write_command_complete(stream, &format!("MOVE {}", end - start))
+}
+
 fn is_copy_statement(statement: &str) -> bool {
     canonical_sql(statement).starts_with("copy ")
 }
@@ -1199,6 +1248,19 @@ fn execute_statement(
             &ErrorField {
                 code: "0A000",
                 message: "cursor fetch direction is not supported by the compatibility endpoint",
+                position: None,
+            },
+        );
+    }
+    if let Some((name, count)) = parse_move_forward(statement) {
+        return execute_move_forward(stream, session, &name, count);
+    }
+    if is_unsupported_move_cursor_statement(statement) {
+        return write_error(
+            stream,
+            &ErrorField {
+                code: "0A000",
+                message: "cursor move direction is not supported by the compatibility endpoint",
                 position: None,
             },
         );
@@ -9145,6 +9207,25 @@ mod tests {
             Some(("_psql_cursor".to_string(), Some(1)))
         );
         assert_eq!(
+            parse_move_forward("MOVE FORWARD 2 FROM _psql_cursor"),
+            Some(("_psql_cursor".to_string(), Some(2)))
+        );
+        assert_eq!(
+            parse_move_forward("MOVE NEXT FROM _psql_cursor"),
+            Some(("_psql_cursor".to_string(), Some(1)))
+        );
+        assert_eq!(
+            parse_move_forward("MOVE FORWARD ALL IN _psql_cursor"),
+            Some(("_psql_cursor".to_string(), None))
+        );
+        assert_eq!(
+            parse_move_forward("MOVE BACKWARD 1 FROM _psql_cursor"),
+            None
+        );
+        assert!(is_unsupported_move_cursor_statement(
+            "MOVE BACKWARD 1 FROM _psql_cursor"
+        ));
+        assert_eq!(
             parse_fetch_forward("FETCH BACKWARD 1 FROM _psql_cursor"),
             None
         );
@@ -9230,6 +9311,41 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn extended_cursor_move_forward_advances_without_rows() {
+        let mut session = Session::default();
+        session.cursors.insert(
+            "live_cursor".to_string(),
+            Cursor {
+                columns: vec![int4_column("id")],
+                rows: vec![
+                    vec![Some("1".to_string())],
+                    vec![Some("2".to_string())],
+                    vec![Some("3".to_string())],
+                ],
+                position: 0,
+            },
+        );
+        let (mut writer, mut reader) = tcp_pair();
+
+        execute_move_forward(&mut writer, &mut session, "live_cursor", Some(2)).unwrap();
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'C']);
+        assert_eq!(session.cursors.get("live_cursor").unwrap().position, 2);
+
+        execute_fetch_forward(&mut writer, &mut session, "live_cursor", Some(1)).unwrap();
+        let messages = read_backend_messages(&mut reader, 3);
+        assert_eq!(
+            messages.iter().map(|(tag, _)| *tag).collect::<Vec<_>>(),
+            vec![b'T', b'D', b'C']
+        );
+        assert_eq!(messages[2].1, b"FETCH 1\0".to_vec());
+        assert_eq!(session.cursors.get("live_cursor").unwrap().position, 3);
+
+        execute_move_forward(&mut writer, &mut session, "live_cursor", None).unwrap();
+        let messages = read_backend_messages(&mut reader, 1);
+        assert_eq!(messages[0].1, b"MOVE 0\0".to_vec());
     }
 
     #[test]
