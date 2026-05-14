@@ -1,0 +1,20 @@
+=== psql SQL prepare comments ===
+CREATE TABLE
+INSERT 0 3
+PREPARE
+ id | name
+----+-------
+  2 | Linus
+(1 row)
+
+ id | name
+----+-------
+  3 | Grace
+(1 row)
+
+DEALLOCATE
+psql:151_protocol_psql_sql_prepare_comments.sql:8: ERROR:  prepared statement "comment_lookup" does not exist
+ name
+------
+ Ada
+(1 row)

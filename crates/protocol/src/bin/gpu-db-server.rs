@@ -1262,7 +1262,7 @@ fn parse_sql_prepare(statement: &str) -> Option<(String, Vec<u32>, String)> {
     let lower = trimmed.to_ascii_lowercase();
     lower.strip_prefix("prepare ")?;
     let as_idx = find_sql_prepare_as_index(trimmed)?;
-    let original_target = trimmed["prepare ".len()..as_idx].trim();
+    let original_target = strip_sql_comments(trimmed["prepare ".len()..as_idx].trim());
     let query_start = as_idx + " as ".len();
     let query = trimmed[query_start..].trim();
     if query.is_empty() {
@@ -1274,7 +1274,7 @@ fn parse_sql_prepare(statement: &str) -> Option<(String, Vec<u32>, String)> {
     }
 
     let (name, type_oids) = {
-        let (name, type_list) = split_sql_name_and_optional_parenthesized_list(original_target)?;
+        let (name, type_list) = split_sql_name_and_optional_parenthesized_list(&original_target)?;
         if let Some(type_list) = type_list {
             let mut type_oids = Vec::new();
             if !type_list.trim().is_empty() {
@@ -1296,8 +1296,8 @@ fn parse_sql_prepare_name(statement: &str) -> Option<String> {
     let lower = trimmed.to_ascii_lowercase();
     lower.strip_prefix("prepare ")?;
     let as_idx = find_sql_prepare_as_index(trimmed)?;
-    let original_target = trimmed["prepare ".len()..as_idx].trim();
-    split_sql_name_and_optional_parenthesized_list(original_target).map(|(name, _)| name)
+    let original_target = strip_sql_comments(trimmed["prepare ".len()..as_idx].trim());
+    split_sql_name_and_optional_parenthesized_list(&original_target).map(|(name, _)| name)
 }
 
 fn find_sql_prepare_as_index(statement: &str) -> Option<usize> {
@@ -1351,9 +1351,9 @@ fn parse_sql_execute(statement: &str) -> Option<(String, Vec<Option<String>>)> {
     let trimmed = statement.trim().trim_end_matches(';').trim();
     let lower = trimmed.to_ascii_lowercase();
     lower.strip_prefix("execute ")?;
-    let original_rest = &trimmed["execute ".len()..];
+    let original_rest = strip_sql_comments(&trimmed["execute ".len()..]);
     let (name, args) = {
-        let (name, arg_list) = split_sql_name_and_optional_parenthesized_list(original_rest)?;
+        let (name, arg_list) = split_sql_name_and_optional_parenthesized_list(&original_rest)?;
         if let Some(arg_list) = arg_list {
             let args = if arg_list.trim().is_empty() {
                 Vec::new()
@@ -1409,9 +1409,11 @@ fn parenthesized_list(target: &str) -> Option<&str> {
 
 fn parse_sql_deallocate(statement: &str) -> Option<SqlDeallocateTarget> {
     let trimmed = statement.trim().trim_end_matches(';').trim();
-    let lower = trimmed.to_ascii_lowercase();
+    trimmed.to_ascii_lowercase().strip_prefix("deallocate ")?;
+    let original_rest = strip_sql_comments(&trimmed["deallocate ".len()..]);
+    let lower = format!("deallocate {}", original_rest).to_ascii_lowercase();
     let rest = lower.strip_prefix("deallocate ")?;
-    let mut original = &trimmed["deallocate ".len()..];
+    let mut original = original_rest.as_str();
     let mut target = rest.trim_start();
     original = original[rest.len() - target.len()..].trim_start();
     if target == "prepare" || target == "prepared" {
@@ -5134,9 +5136,13 @@ fn strip_sql_comments(query: &str) -> String {
     let mut chars = query.char_indices().peekable();
     let mut last_pushed = 0;
     let mut in_quote = false;
+    let mut in_quoted_identifier = false;
 
     while let Some((idx, ch)) = chars.next() {
         if ch == '\'' {
+            if in_quoted_identifier {
+                continue;
+            }
             if in_quote && matches!(chars.peek(), Some((_, '\''))) {
                 chars.next();
                 continue;
@@ -5144,7 +5150,18 @@ fn strip_sql_comments(query: &str) -> String {
             in_quote = !in_quote;
             continue;
         }
-        if in_quote || ch != '-' && ch != '/' {
+        if ch == '"' {
+            if in_quote {
+                continue;
+            }
+            if in_quoted_identifier && matches!(chars.peek(), Some((_, '"'))) {
+                chars.next();
+                continue;
+            }
+            in_quoted_identifier = !in_quoted_identifier;
+            continue;
+        }
+        if in_quote || in_quoted_identifier || ch != '-' && ch != '/' {
             continue;
         }
 
@@ -7707,6 +7724,10 @@ mod tests {
             "SELECT '$1 -- still text', id FROM people WHERE id = $1"
         );
         assert_eq!(
+            strip_sql_comments(r#"SELECT "-- still identifier", id FROM people WHERE id = $1"#),
+            r#"SELECT "-- still identifier", id FROM people WHERE id = $1"#
+        );
+        assert_eq!(
             strip_sql_comments(
                 "SELECT id FROM people WHERE id = $1 /* outer $2 /* inner $3 */ done $4 */ LIMIT $2"
             ),
@@ -10007,6 +10028,16 @@ mod tests {
             ))
         );
         assert_eq!(
+            parse_sql_prepare(
+                "PREPARE comment_lookup(/* id */ int4, /* name */ text) /* target */ AS SELECT id, name FROM people WHERE id = $1 AND name = $2",
+            ),
+            Some((
+                "comment_lookup".to_string(),
+                vec![SqlType::Int4.postgres_oid(), SqlType::Text.postgres_oid()],
+                "SELECT id, name FROM people WHERE id = $1 AND name = $2".to_string(),
+            ))
+        );
+        assert_eq!(
             parse_sql_prepare_name(
                 "PREPARE lookup(jsonb) AS INSERT INTO people (id, name) VALUES ($1, 'Ada')"
             ),
@@ -10072,6 +10103,13 @@ mod tests {
             ))
         );
         assert_eq!(
+            parse_sql_execute("EXECUTE comment_lookup(/* id */ 2, /* name */ 'Ada' /* keep */)"),
+            Some((
+                "comment_lookup".to_string(),
+                vec![Some("2".to_string()), Some("Ada".to_string())],
+            ))
+        );
+        assert_eq!(
             parse_sql_execute(r#"EXECUTE "lookup(one)"(2)"#),
             Some(("lookup(one)".to_string(), vec![Some("2".to_string())],))
         );
@@ -10121,6 +10159,10 @@ mod tests {
         assert!(matches!(
             parse_sql_deallocate(r#"DEALLOCATE PREPARE "lookup ""quoted""""#),
             Some(SqlDeallocateTarget::Named(name)) if name == r#"lookup "quoted""#
+        ));
+        assert!(matches!(
+            parse_sql_deallocate("DEALLOCATE /* scope */ PREPARE /* target */ comment_lookup"),
+            Some(SqlDeallocateTarget::Named(name)) if name == "comment_lookup"
         ));
         assert!(parse_sql_prepare("PREPARE bad(jsonb) AS SELECT id FROM people").is_none());
         assert!(parse_sql_execute("EXECUTE lookup('unterminated)").is_none());
