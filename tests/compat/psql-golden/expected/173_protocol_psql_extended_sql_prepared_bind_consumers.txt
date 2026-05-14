@@ -1,0 +1,14 @@
+=== psql extended sql prepared bind consumers ===
+CREATE TABLE
+INSERT 0 3
+PREPARE
+1 Ada
+-[ RECORD 1 ]
+id   | 3
+name | Grace
+
+DEALLOCATE
+ name
+-------
+ Linus
+(1 row)
