@@ -1,0 +1,32 @@
+=== psql extended text bind delimiter literals ===
+CREATE TABLE
+INSERT 0 5
+ id
+----
+  1
+(1 row)
+
+ id
+----
+  2
+(1 row)
+
+ id
+----
+  3
+(1 row)
+
+ id
+----
+  4
+(1 row)
+
+ id
+----
+  5
+(1 row)
+
+    name
+-------------
+ comma,value
+(1 row)
