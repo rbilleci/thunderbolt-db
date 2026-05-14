@@ -9438,6 +9438,14 @@ mod tests {
             Some(("_psql_cursor".to_string(), Some(2)))
         );
         assert_eq!(
+            parse_fetch_forward("FETCH 0 FROM _psql_cursor"),
+            Some(("_psql_cursor".to_string(), Some(0)))
+        );
+        assert_eq!(
+            parse_fetch_forward("FETCH 2 FROM _psql_cursor"),
+            Some(("_psql_cursor".to_string(), Some(2)))
+        );
+        assert_eq!(
             parse_fetch_forward("FETCH FORWARD 2 FROM Mixed_Cursor"),
             Some(("mixed_cursor".to_string(), Some(2)))
         );
@@ -9487,6 +9495,14 @@ mod tests {
         );
         assert_eq!(
             parse_move_forward("MOVE FORWARD 2 FROM _psql_cursor"),
+            Some(("_psql_cursor".to_string(), Some(2)))
+        );
+        assert_eq!(
+            parse_move_forward("MOVE 0 FROM _psql_cursor"),
+            Some(("_psql_cursor".to_string(), Some(0)))
+        );
+        assert_eq!(
+            parse_move_forward("MOVE 2 FROM _psql_cursor"),
             Some(("_psql_cursor".to_string(), Some(2)))
         );
         assert_eq!(

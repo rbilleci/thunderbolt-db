@@ -1,0 +1,25 @@
+=== psql directionless numeric cursor movement ===
+CREATE TABLE
+INSERT 0 4
+DECLARE CURSOR
+ id | name
+----+------
+(0 rows)
+
+ id | name
+----+-------
+  1 | Ada
+  2 | Linus
+(2 rows)
+
+MOVE 1
+ id |   name
+----+-----------
+  4 | Katherine
+(1 row)
+
+CLOSE CURSOR
+   name
+-----------
+ Katherine
+(1 row)
