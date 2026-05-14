@@ -1,15 +1,15 @@
 # Compatibility Scorecard
 
 ## Totals
-- total: 783
-- passed: 783
+- total: 785
+- passed: 785
 - failed: 0
 - ignored: 0
 
 ## Bucket Summary
 - durability.invariants: total=43 passed=43 failed=0 ignored=0
 - execution.gpu_routing_and_batching: total=68 passed=68 failed=0 ignored=0
-- protocol.client_flows: total=51 passed=51 failed=0 ignored=0
+- protocol.client_flows: total=60 passed=60 failed=0 ignored=0
 - protocol.error_paths: total=50 passed=50 failed=0 ignored=0
 - protocol.extended_query: total=145 passed=145 failed=0 ignored=0
 - replication.operational_cluster: total=6 passed=6 failed=0 ignored=0
@@ -20,7 +20,7 @@
 - sql.relational_foundation: total=38 passed=38 failed=0 ignored=0
 - sql.transaction_flows: total=90 passed=90 failed=0 ignored=0
 - storage.indexing: total=7 passed=7 failed=0 ignored=0
-- uncategorized: total=186 passed=186 failed=0 ignored=0
+- uncategorized: total=184 passed=184 failed=0 ignored=0
 
 ## Top failing categories
 - none

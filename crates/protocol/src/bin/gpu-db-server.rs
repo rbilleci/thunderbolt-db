@@ -617,8 +617,32 @@ fn split_simple_query(query: &str) -> Vec<&str> {
     let mut start = 0;
     let mut in_string = false;
     let mut in_quoted_identifier = false;
+    let mut in_line_comment = false;
+    let mut block_comment_depth = 0usize;
+    let mut previous_char: Option<char> = None;
     let mut chars = query.char_indices().peekable();
     while let Some((idx, ch)) = chars.next() {
+        if in_line_comment {
+            if ch == '\n' {
+                in_line_comment = false;
+            }
+            previous_char = Some(ch);
+            continue;
+        }
+        if block_comment_depth > 0 {
+            if previous_char == Some('/') && ch == '*' {
+                block_comment_depth = block_comment_depth.saturating_add(1);
+                previous_char = None;
+                continue;
+            }
+            if previous_char == Some('*') && ch == '/' {
+                block_comment_depth = block_comment_depth.saturating_sub(1);
+                previous_char = None;
+                continue;
+            }
+            previous_char = Some(ch);
+            continue;
+        }
         match ch {
             '"' if in_quoted_identifier => {
                 if matches!(chars.peek(), Some((_, '"'))) {
@@ -636,6 +660,24 @@ fn split_simple_query(query: &str) -> Vec<&str> {
                 }
             }
             '\'' if !in_quoted_identifier => in_string = true,
+            '-' if !in_string
+                && !in_quoted_identifier
+                && matches!(chars.peek(), Some((_, '-'))) =>
+            {
+                chars.next();
+                in_line_comment = true;
+                previous_char = None;
+                continue;
+            }
+            '/' if !in_string
+                && !in_quoted_identifier
+                && matches!(chars.peek(), Some((_, '*'))) =>
+            {
+                chars.next();
+                block_comment_depth = 1;
+                previous_char = None;
+                continue;
+            }
             ';' if !in_string && !in_quoted_identifier => {
                 let statement = query[start..idx].trim();
                 if !statement.is_empty() {
@@ -645,6 +687,7 @@ fn split_simple_query(query: &str) -> Vec<&str> {
             }
             _ => {}
         }
+        previous_char = Some(ch);
     }
     let statement = query[start..].trim();
     if !statement.is_empty() {
@@ -5810,6 +5853,21 @@ mod tests {
             vec![
                 "INSERT INTO commands VALUES ('SELECT 1;')",
                 r#"PREPARE "lookup;name"(int4) AS SELECT 'Ada'';Lovelace'"#
+            ]
+        );
+    }
+
+    #[test]
+    fn split_simple_query_preserves_semicolons_inside_sql_comments() {
+        assert_eq!(
+            split_simple_query(
+                "/* comment ; /* nested ; */ done */ PREPARE lookup(int4) AS SELECT id FROM people WHERE id = $1; \
+                 -- comment ; before execute\n\
+                 EXECUTE lookup(1);"
+            ),
+            vec![
+                "/* comment ; /* nested ; */ done */ PREPARE lookup(int4) AS SELECT id FROM people WHERE id = $1",
+                "-- comment ; before execute\nEXECUTE lookup(1)"
             ]
         );
     }

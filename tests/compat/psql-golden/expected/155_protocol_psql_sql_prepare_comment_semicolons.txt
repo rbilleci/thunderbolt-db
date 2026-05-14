@@ -1,0 +1,14 @@
+=== psql SQL prepare comment semicolons ===
+CREATE TABLE
+INSERT 0 3
+PREPARE
+ id | name
+----+-------
+  2 | Linus
+(1 row)
+
+DEALLOCATE
+ name
+-------
+ Grace
+(1 row)
