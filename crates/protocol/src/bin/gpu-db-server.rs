@@ -1113,42 +1113,109 @@ fn execute_portal_batch(
 }
 
 fn parse_declare_cursor(statement: &str) -> Option<(String, String)> {
-    let trimmed = statement.trim().trim_end_matches(';').trim();
-    let canonical = canonical_sql(trimmed);
-    let rest = canonical.strip_prefix("declare ")?;
-    let original_rest = &trimmed["declare ".len()..];
-    for marker in [
-        " asensitive no scroll cursor without hold for ",
-        " insensitive no scroll cursor without hold for ",
-        " asensitive cursor without hold for ",
-        " insensitive cursor without hold for ",
-        " asensitive no scroll cursor for ",
-        " insensitive no scroll cursor for ",
-        " asensitive cursor for ",
-        " insensitive cursor for ",
-        " no scroll cursor without hold for ",
-        " cursor without hold for ",
-        " no scroll cursor for ",
-        " cursor for ",
-    ] {
-        if let Some(idx) = rest.find(marker) {
-            let name = parse_supported_cursor_name(original_rest[..idx].trim())?;
-            let query_start = "declare ".len() + idx + marker.len();
-            let query = canonical[query_start..].trim();
-            if !query.is_empty() {
-                return Some((name, query.to_string()));
+    let stripped = strip_sql_comments(statement);
+    let trimmed = stripped.trim().trim_end_matches(';').trim();
+    let rest_start = sql_keyword_rest_start(trimmed, "declare")?;
+    let rest = trimmed[rest_start..].trim_start();
+    let (name, rest) = split_cursor_name_and_rest(rest)?;
+    let (token, rest) = take_sql_word(rest)?;
+    let rest = match token.as_str() {
+        "asensitive" | "insensitive" => rest,
+        "no" => {
+            let (scroll, rest) = take_sql_word(rest)?;
+            if scroll != "scroll" {
+                return None;
             }
+            rest
         }
+        "cursor" => rest,
+        _ => return None,
+    };
+    let (token, rest) = if token == "cursor" {
+        (token, rest)
+    } else {
+        take_sql_word(rest)?
+    };
+    let rest = if token == "no" {
+        let (scroll, rest) = take_sql_word(rest)?;
+        if scroll != "scroll" {
+            return None;
+        }
+        let (cursor, rest) = take_sql_word(rest)?;
+        if cursor != "cursor" {
+            return None;
+        }
+        rest
+    } else if token == "cursor" {
+        rest
+    } else {
+        return None;
+    };
+    let (token, rest) = take_sql_word(rest)?;
+    let rest = if token == "without" {
+        let (hold, rest) = take_sql_word(rest)?;
+        if hold != "hold" {
+            return None;
+        }
+        let (for_token, rest) = take_sql_word(rest)?;
+        if for_token != "for" {
+            return None;
+        }
+        rest
+    } else if token == "for" {
+        rest
+    } else {
+        return None;
+    };
+    let query = canonical_sql(rest);
+    if query.is_empty() {
+        None
+    } else {
+        Some((name, query))
     }
-    None
 }
 
 fn is_unsupported_declare_cursor_statement(statement: &str) -> bool {
-    let canonical = canonical_sql(statement.trim().trim_end_matches(';').trim());
-    canonical.starts_with("declare ")
-        && (canonical.contains(" cursor for ")
-            || canonical.contains(" cursor with hold for ")
-            || canonical.contains(" cursor without hold for "))
+    let stripped = strip_sql_comments(statement);
+    let trimmed = stripped.trim().trim_end_matches(';').trim();
+    let Some(rest_start) = sql_keyword_rest_start(trimmed, "declare") else {
+        return false;
+    };
+    trimmed[rest_start..]
+        .split_whitespace()
+        .any(|token| token.eq_ignore_ascii_case("cursor"))
+}
+
+fn split_cursor_name_and_rest(target: &str) -> Option<(String, &str)> {
+    let target = target.trim_start();
+    if let Some(quoted) = target.strip_prefix('"') {
+        let mut chars = quoted.char_indices().peekable();
+        while let Some((idx, ch)) = chars.next() {
+            if ch == '"' {
+                if chars.peek().is_some_and(|(_, next)| *next == '"') {
+                    chars.next();
+                    continue;
+                }
+                let name_end = idx + 2;
+                let name = parse_supported_cursor_name(&target[..name_end])?;
+                return Some((name, &target[name_end..]));
+            }
+        }
+        None
+    } else {
+        let name_end = target.find(char::is_whitespace)?;
+        let name = parse_supported_cursor_name(&target[..name_end])?;
+        Some((name, &target[name_end..]))
+    }
+}
+
+fn take_sql_word(input: &str) -> Option<(String, &str)> {
+    let input = input.trim_start();
+    let end = input.find(char::is_whitespace).unwrap_or(input.len());
+    if end == 0 {
+        return None;
+    }
+    Some((input[..end].to_ascii_lowercase(), &input[end..]))
 }
 
 fn parse_fetch_forward(statement: &str) -> Option<(String, Option<usize>)> {
@@ -10449,6 +10516,15 @@ mod tests {
             ),
             Some((
                 "_psql_cursor".to_string(),
+                "select id from people".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_declare_cursor(
+                r#"DECLARE /* name */ "Comment Cursor" /* sensitivity */ ASENSITIVE /* direction */ NO SCROLL /* kind */ CURSOR /* lifetime */ WITHOUT HOLD /* query */ FOR SELECT id FROM people"#
+            ),
+            Some((
+                "Comment Cursor".to_string(),
                 "select id from people".to_string()
             ))
         );
