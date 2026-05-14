@@ -616,9 +616,18 @@ fn split_simple_query(query: &str) -> Vec<&str> {
     let mut statements = Vec::new();
     let mut start = 0;
     let mut in_string = false;
+    let mut in_quoted_identifier = false;
     let mut chars = query.char_indices().peekable();
     while let Some((idx, ch)) = chars.next() {
         match ch {
+            '"' if in_quoted_identifier => {
+                if matches!(chars.peek(), Some((_, '"'))) {
+                    chars.next();
+                } else {
+                    in_quoted_identifier = false;
+                }
+            }
+            '"' if !in_string => in_quoted_identifier = true,
             '\'' if in_string => {
                 if matches!(chars.peek(), Some((_, '\''))) {
                     chars.next();
@@ -626,8 +635,8 @@ fn split_simple_query(query: &str) -> Vec<&str> {
                     in_string = false;
                 }
             }
-            '\'' => in_string = true,
-            ';' if !in_string => {
+            '\'' if !in_quoted_identifier => in_string = true,
+            ';' if !in_string && !in_quoted_identifier => {
                 let statement = query[start..idx].trim();
                 if !statement.is_empty() {
                     statements.push(statement);
@@ -5694,11 +5703,11 @@ mod tests {
     fn split_simple_query_preserves_semicolons_inside_text_literals() {
         assert_eq!(
             split_simple_query(
-                "INSERT INTO commands VALUES ('SELECT 1;'); SELECT 'Ada'';Lovelace';"
+                r#"INSERT INTO commands VALUES ('SELECT 1;'); PREPARE "lookup;name"(int4) AS SELECT 'Ada'';Lovelace';"#
             ),
             vec![
                 "INSERT INTO commands VALUES ('SELECT 1;')",
-                "SELECT 'Ada'';Lovelace'"
+                r#"PREPARE "lookup;name"(int4) AS SELECT 'Ada'';Lovelace'"#
             ]
         );
     }

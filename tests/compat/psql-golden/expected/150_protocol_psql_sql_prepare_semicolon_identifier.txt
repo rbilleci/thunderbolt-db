@@ -1,0 +1,15 @@
+Pager usage is off.
+CREATE TABLE
+INSERT 0 3
+PREPARE
+ name
+-------
+ Linus
+(1 row)
+
+DEALLOCATE
+psql:150_protocol_psql_sql_prepare_semicolon_identifier.sql:7: ERROR:  prepared statement "lookup;semi" does not exist
+ name
+-------
+ Grace
+(1 row)
