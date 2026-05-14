@@ -1863,8 +1863,8 @@ fn decode_sql_execute_string_literal(arg: &str) -> Option<String> {
     if arg.starts_with('$') {
         return decode_dollar_sql_string_literal(arg);
     }
-    if let Some(unicode) = arg.strip_prefix("U&'").or_else(|| arg.strip_prefix("u&'")) {
-        return decode_unicode_sql_string_literal(unicode);
+    if arg.starts_with("U&'") || arg.starts_with("u&'") {
+        return decode_unicode_sql_string_literal(arg);
     }
     let escaped = arg.strip_prefix("E'").or_else(|| arg.strip_prefix("e'"))?;
     decode_escape_sql_string_literal(escaped)
@@ -1945,11 +1945,52 @@ fn decode_escape_sql_string_literal(quoted: &str) -> Option<String> {
     Some(decoded)
 }
 
-fn decode_unicode_sql_string_literal(quoted: &str) -> Option<String> {
-    if !quoted.ends_with('\'') {
+fn decode_unicode_sql_string_literal(arg: &str) -> Option<String> {
+    let quoted = arg.strip_prefix("U&").or_else(|| arg.strip_prefix("u&"))?;
+    let (inner, rest) = split_standard_sql_quoted_literal(quoted)?;
+    let escape_char = unicode_sql_string_escape_char(rest.trim())?;
+    decode_unicode_sql_string_body(inner, escape_char)
+}
+
+fn split_standard_sql_quoted_literal(arg: &str) -> Option<(&str, &str)> {
+    let body = arg.strip_prefix('\'')?;
+    let mut chars = body.char_indices().peekable();
+    while let Some((idx, ch)) = chars.next() {
+        if ch == '\'' {
+            if chars.peek() == Some(&(idx + ch.len_utf8(), '\'')) {
+                chars.next();
+                continue;
+            }
+            return Some((&body[..idx], &body[idx + ch.len_utf8()..]));
+        }
+    }
+    None
+}
+
+fn unicode_sql_string_escape_char(rest: &str) -> Option<char> {
+    if rest.is_empty() {
+        return Some('\\');
+    }
+    let value_start = sql_keyword_rest_start(rest, "uescape")?;
+    let (value, value_rest) = split_standard_sql_quoted_literal(rest[value_start..].trim_start())?;
+    if !value_rest.trim().is_empty() {
         return None;
     }
-    let inner = &quoted[..quoted.len() - 1];
+    let mut chars = value.chars();
+    let escape = chars.next()?;
+    if chars.next().is_some()
+        || escape.is_whitespace()
+        || escape == '+'
+        || escape == '\''
+        || escape == '"'
+        || escape.is_ascii_hexdigit()
+    {
+        return None;
+    }
+    Some(escape)
+}
+
+fn decode_unicode_sql_string_body(inner: &str, escape_char: char) -> Option<String> {
     let mut decoded = String::with_capacity(inner.len());
     let mut chars = inner.chars().peekable();
     while let Some(ch) = chars.next() {
@@ -1962,7 +2003,7 @@ fn decode_unicode_sql_string_literal(quoted: &str) -> Option<String> {
                     return None;
                 }
             }
-            '\\' => {
+            _ if ch == escape_char => {
                 if chars.peek() == Some(&'+') {
                     chars.next();
                     let codepoint = take_hex_codepoint(&mut chars, 6)?;
@@ -11321,6 +11362,18 @@ mod tests {
             ))
         );
         assert_eq!(
+            parse_sql_execute(
+                r"EXECUTE lookup(U&'Ada!0020Lovelace' UESCAPE '!', text U&'Grace~+000020Hopper' UESCAPE '~')"
+            ),
+            Some((
+                "lookup".to_string(),
+                vec![
+                    Some("Ada Lovelace".to_string()),
+                    Some("Grace Hopper".to_string()),
+                ],
+            ))
+        );
+        assert_eq!(
             parse_sql_execute(r"EXECUTE lookup($tag$Ada, Lovelace$tag$, $$Grace (Hopper)$$)"),
             Some((
                 "lookup".to_string(),
@@ -11491,6 +11544,8 @@ mod tests {
         assert!(parse_sql_execute("EXECUTE lookup(E'unterminated)").is_none());
         assert!(parse_sql_execute("EXECUTE lookup(U&'unterminated)").is_none());
         assert!(parse_sql_execute("EXECUTE lookup(U&'bad\\00xz')").is_none());
+        assert!(parse_sql_execute("EXECUTE lookup(U&'bad!00xz' UESCAPE '!')").is_none());
+        assert!(parse_sql_execute("EXECUTE lookup(U&'bad!0020' UESCAPE '+')").is_none());
         assert!(parse_sql_execute("EXECUTE lookup($tag$unterminated)").is_none());
         assert!(parse_sql_deallocate("DEALLOCATE PREPARE").is_none());
     }
