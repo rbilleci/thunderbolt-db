@@ -1,0 +1,15 @@
+=== psql SQL prepare escaped quoted identifier ===
+CREATE TABLE
+INSERT 0 3
+PREPARE
+ name
+-------
+ Linus
+(1 row)
+
+DEALLOCATE
+psql:143_protocol_psql_sql_prepare_escaped_identifier.sql:7: ERROR:  prepared statement "lookup "quoted"" does not exist
+ name
+-------
+ Grace
+(1 row)

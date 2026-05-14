@@ -9872,6 +9872,16 @@ mod tests {
             ))
         );
         assert_eq!(
+            parse_sql_prepare(
+                r#"PREPARE "lookup ""quoted"""(int4) AS SELECT name FROM people WHERE id = $1"#,
+            ),
+            Some((
+                r#"lookup "quoted""#.to_string(),
+                vec![SqlType::Int4.postgres_oid()],
+                "SELECT name FROM people WHERE id = $1".to_string(),
+            ))
+        );
+        assert_eq!(
             parse_sql_prepare_name(
                 "PREPARE lookup(jsonb) AS INSERT INTO people (id, name) VALUES ($1, 'Ada')"
             ),
@@ -9896,6 +9906,12 @@ mod tests {
             Some("lookup as stmt".to_string())
         );
         assert_eq!(
+            parse_sql_prepare_name(
+                r#"PREPARE "lookup ""quoted"""(jsonb) AS INSERT INTO people (id, name) VALUES ($1, 'Ada')"#
+            ),
+            Some(r#"lookup "quoted""#.to_string())
+        );
+        assert_eq!(
             parse_sql_execute("EXECUTE lookup(2, 'O''Brien')"),
             Some((
                 "lookup".to_string(),
@@ -9905,6 +9921,13 @@ mod tests {
         assert_eq!(
             parse_sql_execute(r#"EXECUTE "lookup(one)"(2)"#),
             Some(("lookup(one)".to_string(), vec![Some("2".to_string())],))
+        );
+        assert_eq!(
+            parse_sql_execute(r#"EXECUTE "lookup ""quoted"""(2)"#),
+            Some((
+                r#"lookup "quoted""#.to_string(),
+                vec![Some("2".to_string())],
+            ))
         );
         assert_eq!(
             parse_sql_execute("EXECUTE lookup(NULL, 'Ada')"),
@@ -9925,6 +9948,10 @@ mod tests {
         assert!(matches!(
             parse_sql_deallocate(r#"DEALLOCATE PREPARE "Mixed Lookup""#),
             Some(SqlDeallocateTarget::Named(name)) if name == "Mixed Lookup"
+        ));
+        assert!(matches!(
+            parse_sql_deallocate(r#"DEALLOCATE PREPARE "lookup ""quoted""""#),
+            Some(SqlDeallocateTarget::Named(name)) if name == r#"lookup "quoted""#
         ));
         assert!(parse_sql_prepare("PREPARE bad(jsonb) AS SELECT id FROM people").is_none());
         assert!(parse_sql_execute("EXECUTE lookup('unterminated)").is_none());
