@@ -1,0 +1,17 @@
+=== psql SQL prepare argument count recovery ===
+CREATE TABLE
+INSERT 0 3
+PREPARE
+psql:147_protocol_psql_sql_prepare_argument_count.sql:5: ERROR:  bound parameter count does not match prepared statement
+psql:147_protocol_psql_sql_prepare_argument_count.sql:6: ERROR:  bound parameter count does not match prepared statement
+ id | name
+----+-------
+  2 | Linus
+(1 row)
+
+DEALLOCATE
+psql:147_protocol_psql_sql_prepare_argument_count.sql:9: ERROR:  prepared statement "sql_prepare_arity_lookup" does not exist
+ name
+-------
+ Grace
+(1 row)
