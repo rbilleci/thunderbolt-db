@@ -8292,6 +8292,113 @@ mod tests {
     }
 
     #[test]
+    fn extended_cursor_declare_portal_describe_and_close_keep_session_cursor() {
+        let mut session = Session::default();
+        session.tables.insert(
+            "people".to_string(),
+            Table {
+                oid: FIRST_USER_RELATION_OID,
+                name: "people".to_string(),
+                columns: vec![
+                    CatalogColumn {
+                        attnum: 1,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "id".to_string(),
+                            ty: SqlType::Int4,
+                        },
+                    },
+                    CatalogColumn {
+                        attnum: 2,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "name".to_string(),
+                            ty: SqlType::Text,
+                        },
+                    },
+                ],
+                rows: vec![
+                    vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())],
+                    vec![SqlValue::Int4(2), SqlValue::Text("Linus".to_string())],
+                    vec![SqlValue::Int4(3), SqlValue::Text("Grace".to_string())],
+                ],
+            },
+        );
+        let (mut writer, mut reader) = tcp_pair();
+
+        assert!(!handle_parse(
+            &mut writer,
+            &mut session,
+            "cursor_stmt".to_string(),
+            "DECLARE raw_cursor CURSOR FOR SELECT id, name FROM people WHERE id > $1 ORDER BY id"
+                .to_string(),
+            Vec::new(),
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'1']);
+
+        assert!(!handle_bind(
+            &mut writer,
+            &mut session,
+            "cursor_portal".to_string(),
+            "cursor_stmt".to_string(),
+            Vec::new(),
+            vec![Some(b"1".to_vec())],
+            Vec::new(),
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'2']);
+
+        assert!(!handle_describe(
+            &mut writer,
+            &mut session,
+            DescribeTarget::Portal,
+            "cursor_portal",
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'n']);
+
+        assert!(!handle_execute(&mut writer, &mut session, "cursor_portal", 1).unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'C']);
+        assert!(session.cursors.contains_key("raw_cursor"));
+
+        assert!(!handle_close(
+            &mut writer,
+            &mut session,
+            DescribeTarget::Portal,
+            "cursor_portal",
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'3']);
+        assert!(!session.portals.contains_key("cursor_portal"));
+        assert!(session.cursors.contains_key("raw_cursor"));
+
+        assert!(!handle_close(
+            &mut writer,
+            &mut session,
+            DescribeTarget::Statement,
+            "cursor_stmt",
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'3']);
+        assert!(!session.prepared.contains_key("cursor_stmt"));
+        assert!(session.cursors.contains_key("raw_cursor"));
+
+        execute_statement(
+            &mut writer,
+            &mut session,
+            "FETCH FORWARD 1 FROM raw_cursor",
+            true,
+        )
+        .unwrap();
+        let messages = read_backend_messages(&mut reader, 3);
+        assert_eq!(
+            messages.iter().map(|(tag, _)| *tag).collect::<Vec<_>>(),
+            vec![b'T', b'D', b'C']
+        );
+        assert_eq!(messages[2].1, b"FETCH 1\0".to_vec());
+        assert_eq!(session.cursors.get("raw_cursor").unwrap().position, 1);
+    }
+
+    #[test]
     fn extended_prepared_portal_lifecycle_closes_session_local_state() {
         let mut session = Session::default();
         let query = PreparedQuery {
