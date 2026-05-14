@@ -1,0 +1,10 @@
+=== psql extended bind gexec ===
+CREATE TABLE
+CREATE TABLE
+INSERT 0 3
+INSERT 0 2
+psql:175_protocol_psql_extended_bind_gexec_unsupported.sql:6: ERROR:  bind message has wrong number of parameters
+ name
+------
+ Ada
+(1 row)
