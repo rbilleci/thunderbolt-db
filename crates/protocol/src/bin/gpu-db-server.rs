@@ -1050,8 +1050,8 @@ fn parse_fetch_forward(statement: &str) -> Option<(String, Option<usize>)> {
     let trimmed = statement.trim().trim_end_matches(';').trim();
     let lower = trimmed.to_ascii_lowercase();
     let rest = lower.strip_prefix("fetch ")?;
-    let (cursor_marker_idx, cursor_marker_len, count) = parse_forward_cursor_direction(rest)?;
-    let name_start = "fetch ".len() + cursor_marker_idx + cursor_marker_len;
+    let (name_start_in_rest, count) = parse_forward_cursor_target(rest)?;
+    let name_start = "fetch ".len() + name_start_in_rest;
     let name = trimmed[name_start..].trim();
     if name.is_empty() {
         None
@@ -1064,8 +1064,8 @@ fn parse_move_forward(statement: &str) -> Option<(String, Option<usize>)> {
     let trimmed = statement.trim().trim_end_matches(';').trim();
     let lower = trimmed.to_ascii_lowercase();
     let rest = lower.strip_prefix("move ")?;
-    let (cursor_marker_idx, cursor_marker_len, count) = parse_forward_cursor_direction(rest)?;
-    let name_start = "move ".len() + cursor_marker_idx + cursor_marker_len;
+    let (name_start_in_rest, count) = parse_forward_cursor_target(rest)?;
+    let name_start = "move ".len() + name_start_in_rest;
     let name = trimmed[name_start..].trim();
     if name.is_empty() {
         None
@@ -1074,7 +1074,16 @@ fn parse_move_forward(statement: &str) -> Option<(String, Option<usize>)> {
     }
 }
 
-fn parse_forward_cursor_direction(rest: &str) -> Option<(usize, usize, Option<usize>)> {
+fn parse_forward_cursor_target(rest: &str) -> Option<(usize, Option<usize>)> {
+    if let Some((cursor_marker_idx, cursor_marker_len, count)) =
+        parse_forward_cursor_direction_with_marker(rest)
+    {
+        return Some((cursor_marker_idx + cursor_marker_len, count));
+    }
+    parse_forward_cursor_direction_without_marker(rest)
+}
+
+fn parse_forward_cursor_direction_with_marker(rest: &str) -> Option<(usize, usize, Option<usize>)> {
     let (cursor_marker_idx, cursor_marker_len) = rest
         .find(" from ")
         .map(|idx| (idx, " from ".len()))
@@ -1094,16 +1103,87 @@ fn parse_forward_cursor_direction(rest: &str) -> Option<(usize, usize, Option<us
     Some((cursor_marker_idx, cursor_marker_len, count))
 }
 
+fn parse_forward_cursor_direction_without_marker(rest: &str) -> Option<(usize, Option<usize>)> {
+    let skipped = rest.len() - rest.trim_start().len();
+    let rest = rest.trim_start();
+    if rest.is_empty() {
+        return None;
+    }
+    let first_token_end = rest.find(char::is_whitespace);
+    let first_token = first_token_end.map_or(rest, |idx| &rest[..idx]);
+    let remainder_start = first_token_end.map(|idx| idx + 1);
+    let remainder = remainder_start
+        .map(|idx| rest[idx..].trim_start())
+        .unwrap_or("");
+
+    match first_token {
+        "next" => {
+            if remainder.is_empty() {
+                None
+            } else {
+                Some((skipped + rest.len() - remainder.len(), Some(1)))
+            }
+        }
+        "all" => {
+            if remainder.is_empty() {
+                None
+            } else {
+                Some((skipped + rest.len() - remainder.len(), None))
+            }
+        }
+        "forward" => {
+            if remainder.is_empty() {
+                return None;
+            }
+            let second_token_end = remainder.find(char::is_whitespace);
+            let second_token = second_token_end.map_or(remainder, |idx| &remainder[..idx]);
+            if second_token == "all" {
+                let name = second_token_end
+                    .map(|idx| remainder[idx + 1..].trim_start())
+                    .unwrap_or("");
+                if name.is_empty() {
+                    None
+                } else {
+                    Some((skipped + rest.len() - name.len(), None))
+                }
+            } else if let Ok(count) = second_token.parse::<usize>() {
+                let name = second_token_end
+                    .map(|idx| remainder[idx + 1..].trim_start())
+                    .unwrap_or("");
+                if name.is_empty() {
+                    None
+                } else {
+                    Some((skipped + rest.len() - name.len(), Some(count)))
+                }
+            } else {
+                Some((skipped + rest.len() - remainder.len(), Some(1)))
+            }
+        }
+        "backward" | "prior" | "first" | "last" | "absolute" | "relative" => None,
+        _ => {
+            if let Ok(count) = first_token.parse::<usize>() {
+                if remainder.is_empty() {
+                    None
+                } else {
+                    Some((skipped + rest.len() - remainder.len(), Some(count)))
+                }
+            } else {
+                Some((skipped, Some(1)))
+            }
+        }
+    }
+}
+
 fn is_unsupported_fetch_cursor_statement(statement: &str) -> bool {
     let trimmed = statement.trim().trim_end_matches(';').trim();
     let lower = trimmed.to_ascii_lowercase();
-    lower.starts_with("fetch ") && (lower.contains(" from ") || lower.contains(" in "))
+    lower.starts_with("fetch ") && parse_fetch_forward(trimmed).is_none()
 }
 
 fn is_unsupported_move_cursor_statement(statement: &str) -> bool {
     let trimmed = statement.trim().trim_end_matches(';').trim();
     let lower = trimmed.to_ascii_lowercase();
-    lower.starts_with("move ") && (lower.contains(" from ") || lower.contains(" in "))
+    lower.starts_with("move ") && parse_move_forward(trimmed).is_none()
 }
 
 fn parse_close_cursor(statement: &str) -> Option<CloseCursorTarget> {
@@ -9207,6 +9287,22 @@ mod tests {
             Some(("_psql_cursor".to_string(), Some(1)))
         );
         assert_eq!(
+            parse_fetch_forward("FETCH _psql_cursor"),
+            Some(("_psql_cursor".to_string(), Some(1)))
+        );
+        assert_eq!(
+            parse_fetch_forward("FETCH FORWARD _psql_cursor"),
+            Some(("_psql_cursor".to_string(), Some(1)))
+        );
+        assert_eq!(
+            parse_fetch_forward("FETCH FORWARD 2 _psql_cursor"),
+            Some(("_psql_cursor".to_string(), Some(2)))
+        );
+        assert_eq!(
+            parse_fetch_forward("FETCH ALL _psql_cursor"),
+            Some(("_psql_cursor".to_string(), None))
+        );
+        assert_eq!(
             parse_move_forward("MOVE FORWARD 2 FROM _psql_cursor"),
             Some(("_psql_cursor".to_string(), Some(2)))
         );
@@ -9219,11 +9315,30 @@ mod tests {
             Some(("_psql_cursor".to_string(), None))
         );
         assert_eq!(
+            parse_move_forward("MOVE _psql_cursor"),
+            Some(("_psql_cursor".to_string(), Some(1)))
+        );
+        assert_eq!(
+            parse_move_forward("MOVE FORWARD _psql_cursor"),
+            Some(("_psql_cursor".to_string(), Some(1)))
+        );
+        assert_eq!(
+            parse_move_forward("MOVE FORWARD 2 _psql_cursor"),
+            Some(("_psql_cursor".to_string(), Some(2)))
+        );
+        assert_eq!(
+            parse_move_forward("MOVE ALL _psql_cursor"),
+            Some(("_psql_cursor".to_string(), None))
+        );
+        assert_eq!(
             parse_move_forward("MOVE BACKWARD 1 FROM _psql_cursor"),
             None
         );
         assert!(is_unsupported_move_cursor_statement(
             "MOVE BACKWARD 1 FROM _psql_cursor"
+        ));
+        assert!(is_unsupported_move_cursor_statement(
+            "MOVE BACKWARD 1 _psql_cursor"
         ));
         assert_eq!(
             parse_fetch_forward("FETCH BACKWARD 1 FROM _psql_cursor"),
@@ -9231,6 +9346,9 @@ mod tests {
         );
         assert!(is_unsupported_fetch_cursor_statement(
             "FETCH BACKWARD 1 FROM _psql_cursor"
+        ));
+        assert!(is_unsupported_fetch_cursor_statement(
+            "FETCH BACKWARD 1 _psql_cursor"
         ));
         assert_eq!(
             parse_close_cursor("CLOSE _psql_cursor"),
