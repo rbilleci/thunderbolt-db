@@ -1,0 +1,15 @@
+=== psql extended sql prepared conflicting reused bind ===
+CREATE TABLE
+INSERT 0 2
+PREPARE
+psql:180_protocol_psql_extended_sql_prepared_conflicting_reused_bind.sql:5: ERROR:  inconsistent parameter types for SQL EXECUTE placeholder
+ id | name
+----+-------
+  2 | Linus
+(1 row)
+
+DEALLOCATE
+ name
+------
+ Ada
+(1 row)

@@ -752,6 +752,12 @@ fn handle_parse(
         )?;
         return Ok(true);
     }
+    if let Some(error) =
+        sql_execute_parameter_type_mapping_error(session, &query, parameter_type_oids.as_slice())
+    {
+        write_error(stream, &error)?;
+        return Ok(true);
+    }
     let describe_query = parse_declare_cursor(&query)
         .map(|(_, cursor_query)| cursor_query)
         .unwrap_or_else(|| query.clone());
@@ -5257,13 +5263,83 @@ fn infer_sql_execute_parameter_type_oids(
         if extended_parameter_idx == 0 || extended_parameter_idx > oids.len() {
             continue;
         }
-        oids[extended_parameter_idx - 1] = prepared
+        let oid = prepared
             .parameter_type_oids
             .get(sql_parameter_idx)
             .copied()
             .unwrap_or(0);
+        let existing = &mut oids[extended_parameter_idx - 1];
+        if *existing != 0 && oid != 0 && *existing != oid {
+            return None;
+        }
+        *existing = oid;
     }
     Some(oids)
+}
+
+fn sql_execute_parameter_type_mapping_error(
+    session: &Session,
+    query: &str,
+    explicit_oids: &[u32],
+) -> Option<ErrorField> {
+    let (name, parameters) = parse_sql_execute(query)?;
+    let Some(PreparedStatement::Sql(prepared)) = session.prepared.get(&name) else {
+        return None;
+    };
+    if expected_parameter_count(prepared) != parameters.len() {
+        return None;
+    }
+
+    let max_idx = parameters
+        .iter()
+        .filter_map(|parameter| {
+            parameter
+                .as_deref()
+                .and_then(sql_execute_argument_placeholder_index)
+        })
+        .max()
+        .unwrap_or(0);
+    let mut inferred_oids = vec![0; max_idx];
+    for (sql_parameter_idx, parameter) in parameters.iter().enumerate() {
+        let Some(extended_parameter_idx) = parameter
+            .as_deref()
+            .and_then(sql_execute_argument_placeholder_index)
+        else {
+            continue;
+        };
+        if extended_parameter_idx == 0 || extended_parameter_idx > inferred_oids.len() {
+            continue;
+        }
+        let oid = prepared
+            .parameter_type_oids
+            .get(sql_parameter_idx)
+            .copied()
+            .unwrap_or(0);
+        let inferred = &mut inferred_oids[extended_parameter_idx - 1];
+        if *inferred != 0 && oid != 0 && *inferred != oid {
+            return Some(sql_execute_parameter_type_conflict_error());
+        }
+        *inferred = oid;
+    }
+
+    for (idx, explicit_oid) in explicit_oids.iter().copied().enumerate() {
+        if explicit_oid == 0 {
+            continue;
+        }
+        let inferred_oid = inferred_oids.get(idx).copied().unwrap_or(0);
+        if inferred_oid != 0 && inferred_oid != explicit_oid {
+            return Some(sql_execute_parameter_type_conflict_error());
+        }
+    }
+    None
+}
+
+fn sql_execute_parameter_type_conflict_error() -> ErrorField {
+    ErrorField {
+        code: "42P08",
+        message: "inconsistent parameter types for SQL EXECUTE placeholder",
+        position: None,
+    }
 }
 
 fn sql_execute_argument_placeholder_index(value: &str) -> Option<usize> {
@@ -10736,6 +10812,60 @@ mod tests {
             vec![b'D', b'C']
         );
         assert_eq!(messages[1].1, b"SELECT 1\0".to_vec());
+    }
+
+    #[test]
+    fn extended_sql_execute_rejects_conflicting_reused_placeholder_types() {
+        let mut session = Session::default();
+        session.tables.insert(
+            "people".to_string(),
+            Table {
+                oid: FIRST_USER_RELATION_OID,
+                name: "people".to_string(),
+                columns: vec![
+                    CatalogColumn {
+                        attnum: 1,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "id".to_string(),
+                            ty: SqlType::Int4,
+                        },
+                    },
+                    CatalogColumn {
+                        attnum: 2,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "name".to_string(),
+                            ty: SqlType::Text,
+                        },
+                    },
+                ],
+                rows: Vec::new(),
+            },
+        );
+        session.prepared.insert(
+            "lookup".to_string(),
+            PreparedStatement::Sql(PreparedQuery {
+                query: "SELECT name FROM people WHERE id = $1 AND name = $2".to_string(),
+                parameter_type_oids: vec![
+                    SqlType::Int4.postgres_oid(),
+                    SqlType::Text.postgres_oid(),
+                ],
+            }),
+        );
+        let (mut writer, mut reader) = tcp_pair();
+
+        assert!(handle_parse(
+            &mut writer,
+            &mut session,
+            String::new(),
+            "EXECUTE lookup($1, $1)".to_string(),
+            Vec::new(),
+        )
+        .unwrap());
+        let messages = read_backend_messages(&mut reader, 1);
+        assert_eq!(messages[0].0, b'E');
+        assert!(String::from_utf8_lossy(&messages[0].1)
+            .contains("inconsistent parameter types for SQL EXECUTE placeholder"));
+        assert!(!session.prepared.contains_key(""));
     }
 
     #[test]
