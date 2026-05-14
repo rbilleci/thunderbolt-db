@@ -1285,6 +1285,21 @@ fn parse_sql_prepare(statement: &str) -> Option<(String, Vec<u32>, String)> {
     Some((name, type_oids, query.to_string()))
 }
 
+fn parse_sql_prepare_name(statement: &str) -> Option<String> {
+    let trimmed = statement.trim().trim_end_matches(';').trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let rest = lower.strip_prefix("prepare ")?;
+    let as_idx_in_rest = rest.find(" as ")?;
+    let as_idx = "prepare ".len() + as_idx_in_rest;
+    let original_target = trimmed["prepare ".len()..as_idx].trim();
+    let name = if let Some(open_idx) = original_target.find('(') {
+        original_target[..open_idx].trim()
+    } else {
+        original_target
+    };
+    parse_supported_cursor_name(name)
+}
+
 fn parse_sql_execute(statement: &str) -> Option<(String, Vec<Option<String>>)> {
     let trimmed = statement.trim().trim_end_matches(';').trim();
     let lower = trimmed.to_ascii_lowercase();
@@ -1629,7 +1644,7 @@ fn execute_statement(
         return write_command_complete(stream, "CLOSE CURSOR");
     }
 
-    if let Some((name, parameter_type_oids, query)) = parse_sql_prepare(statement) {
+    if let Some(name) = parse_sql_prepare_name(statement) {
         if session.prepared.contains_key(&name) {
             return write_error(
                 stream,
@@ -1640,6 +1655,9 @@ fn execute_statement(
                 },
             );
         }
+    }
+
+    if let Some((name, parameter_type_oids, query)) = parse_sql_prepare(statement) {
         let query = strip_sql_comments(&query);
         if contains_zero_placeholder(&query) {
             return write_error(
@@ -9764,6 +9782,18 @@ mod tests {
                 vec![SqlType::Int4.postgres_oid(), SqlType::Text.postgres_oid()],
                 "SELECT id, name FROM people WHERE id = $1 AND name = $2".to_string(),
             ))
+        );
+        assert_eq!(
+            parse_sql_prepare_name(
+                "PREPARE lookup(jsonb) AS INSERT INTO people (id, name) VALUES ($1, 'Ada')"
+            ),
+            Some("lookup".to_string())
+        );
+        assert_eq!(
+            parse_sql_prepare_name(
+                r#"PREPARE "Mixed Lookup"(jsonb) AS INSERT INTO people (id, name) VALUES ($1, 'Ada')"#
+            ),
+            Some("Mixed Lookup".to_string())
         );
         assert_eq!(
             parse_sql_execute("EXECUTE lookup(2, 'O''Brien')"),

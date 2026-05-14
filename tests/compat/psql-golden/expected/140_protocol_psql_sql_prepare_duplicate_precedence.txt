@@ -1,0 +1,16 @@
+=== psql SQL prepare duplicate precedence ===
+CREATE TABLE
+INSERT 0 2
+PREPARE
+psql:140_protocol_psql_sql_prepare_duplicate_precedence.sql:5: ERROR:  prepared statement already exists
+ name
+-------
+ Linus
+(1 row)
+
+DEALLOCATE
+psql:140_protocol_psql_sql_prepare_duplicate_precedence.sql:8: ERROR:  prepared statement "duplicate_lookup" does not exist
+ name
+------
+ Ada
+(1 row)
