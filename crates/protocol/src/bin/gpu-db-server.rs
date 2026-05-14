@@ -1462,7 +1462,7 @@ fn sql_prepare_type_oid(ty: &str) -> Option<u32> {
 }
 
 fn decode_sql_execute_argument(arg: &str) -> Option<Option<String>> {
-    let trimmed = strip_parenthesized_sql_execute_argument(arg.trim())?;
+    let trimmed = normalize_sql_execute_argument(arg.trim())?;
     if canonical_sql(trimmed) == "null" {
         return Some(None);
     }
@@ -1493,6 +1493,21 @@ fn decode_sql_execute_argument(arg: &str) -> Option<Option<String>> {
     }
 }
 
+fn normalize_sql_execute_argument(mut arg: &str) -> Option<&str> {
+    loop {
+        let parenthesized = strip_parenthesized_sql_execute_argument(arg)?;
+        let cast_stripped = strip_supported_sql_execute_cast(parenthesized);
+        let normalized = cast_stripped.unwrap_or(parenthesized).trim();
+        if normalized == arg {
+            return Some(normalized);
+        }
+        if normalized.is_empty() {
+            return None;
+        }
+        arg = normalized;
+    }
+}
+
 fn strip_parenthesized_sql_execute_argument(mut arg: &str) -> Option<&str> {
     loop {
         let Some(without_open) = arg.strip_prefix('(') else {
@@ -1507,6 +1522,48 @@ fn strip_parenthesized_sql_execute_argument(mut arg: &str) -> Option<&str> {
         }
         arg = inner;
     }
+}
+
+fn strip_supported_sql_execute_cast(arg: &str) -> Option<&str> {
+    let cast_idx = find_top_level_sql_execute_cast(arg)?;
+    let value = arg[..cast_idx].trim();
+    let ty = arg[cast_idx + 2..].trim();
+    if value.is_empty() {
+        return None;
+    }
+    match canonical_sql(ty).as_str() {
+        "int" | "int4" | "integer" | "pg_catalog.int4" | "pg_catalog.integer" | "text"
+        | "pg_catalog.text" => Some(value),
+        _ => None,
+    }
+}
+
+fn find_top_level_sql_execute_cast(input: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut in_quote = false;
+    let mut chars = input.char_indices().peekable();
+    while let Some((idx, ch)) = chars.next() {
+        if ch == '\'' {
+            if in_quote && chars.peek() == Some(&(idx + ch.len_utf8(), '\'')) {
+                chars.next();
+                continue;
+            }
+            in_quote = !in_quote;
+            continue;
+        }
+        if in_quote {
+            continue;
+        }
+        match ch {
+            '(' => depth = depth.saturating_add(1),
+            ')' => depth = depth.saturating_sub(1),
+            ':' if depth == 0 && chars.peek().is_some_and(|(_, next)| *next == ':') => {
+                return Some(idx);
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn parenthesized_list_is_balanced(input: &str) -> bool {
@@ -9989,6 +10046,20 @@ mod tests {
             Some((
                 "lookup".to_string(),
                 vec![Some("2".to_string()), Some("Linus".to_string())],
+            ))
+        );
+        assert_eq!(
+            parse_sql_execute("EXECUTE lookup(2::int4, 'Ada'::text)"),
+            Some((
+                "lookup".to_string(),
+                vec![Some("2".to_string()), Some("Ada".to_string())],
+            ))
+        );
+        assert_eq!(
+            parse_sql_execute("EXECUTE lookup((3::pg_catalog.int4), ('Grace')::pg_catalog.text)"),
+            Some((
+                "lookup".to_string(),
+                vec![Some("3".to_string()), Some("Grace".to_string())],
             ))
         );
         assert_eq!(

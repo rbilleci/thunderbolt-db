@@ -1,0 +1,24 @@
+=== psql SQL prepare casted argument literals ===
+CREATE TABLE
+INSERT 0 3
+PREPARE
+ id | name
+----+-------
+  2 | Linus
+(1 row)
+
+ id | name
+----+-------
+  3 | Grace
+(1 row)
+
+ id | name
+----+------
+(0 rows)
+
+DEALLOCATE
+psql:149_protocol_psql_sql_prepare_casted_arguments.sql:9: ERROR:  prepared statement "sql_prepare_casted_lookup" does not exist
+ name
+------
+ Ada
+(1 row)
