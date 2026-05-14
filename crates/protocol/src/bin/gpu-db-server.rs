@@ -5167,10 +5167,14 @@ fn bind_query_parameters(
     }
     let mut bound = query.query.clone();
     for (idx, parameter) in parameters.iter().enumerate().rev() {
+        let placeholder_idx = idx + 1;
+        if !contains_unquoted_placeholder_index(&query.query, placeholder_idx) {
+            continue;
+        }
         let value = parameter
             .as_ref()
             .ok_or(BindParameterError::NullUnsupported)?;
-        let placeholder = format!("${}", idx + 1);
+        let placeholder = format!("${placeholder_idx}");
         let literal = encode_parameter_literal(
             value,
             query.parameter_type_oids.get(idx).copied().unwrap_or(0),
@@ -5461,6 +5465,36 @@ fn contains_zero_placeholder(query: &str) -> bool {
     unquoted_sql_fragments(query)
         .into_iter()
         .any(fragment_contains_zero_placeholder)
+}
+
+fn contains_unquoted_placeholder_index(query: &str, target_index: usize) -> bool {
+    unquoted_sql_fragments(query)
+        .into_iter()
+        .any(|fragment| fragment_contains_placeholder_index(fragment, target_index))
+}
+
+fn fragment_contains_placeholder_index(fragment: &str, target_index: usize) -> bool {
+    let mut chars = fragment.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '$' {
+            continue;
+        }
+
+        let mut value = 0usize;
+        let mut saw_digit = false;
+        while let Some(digit) = chars.peek().copied() {
+            let Some(next) = digit.to_digit(10) else {
+                break;
+            };
+            saw_digit = true;
+            value = value.saturating_mul(10).saturating_add(next as usize);
+            chars.next();
+        }
+        if saw_digit && value == target_index {
+            return true;
+        }
+    }
+    false
 }
 
 fn fragment_contains_zero_placeholder(fragment: &str) -> bool {
@@ -10866,6 +10900,38 @@ mod tests {
         assert!(String::from_utf8_lossy(&messages[0].1)
             .contains("inconsistent parameter types for SQL EXECUTE placeholder"));
         assert!(!session.prepared.contains_key(""));
+    }
+
+    #[test]
+    fn extended_sql_execute_sparse_outer_placeholders_skip_unused_binds() {
+        let query = PreparedQuery {
+            query: "EXECUTE lookup($2, 'Ada')".to_string(),
+            parameter_type_oids: vec![0, SqlType::Int4.postgres_oid()],
+        };
+
+        let bound = bind_query_parameters(
+            &query,
+            &[
+                Some("not-an-int-and-not-used".to_string()),
+                Some("2".to_string()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(bound, "EXECUTE lookup(2, 'Ada')");
+
+        assert_eq!(
+            bind_query_parameters(
+                &query,
+                &[
+                    Some("still-not-used".to_string()),
+                    Some("not-an-int".to_string()),
+                ],
+            ),
+            Err(BindParameterError::InvalidTextRepresentation {
+                oid: SqlType::Int4.postgres_oid(),
+                value: "not-an-int".to_string(),
+            })
+        );
     }
 
     #[test]

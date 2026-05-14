@@ -1,0 +1,25 @@
+=== psql extended sql prepared sparse outer bind ===
+CREATE TABLE
+INSERT 0 3
+PREPARE
+ Column | Type
+--------+------
+ name   | text
+(1 row)
+
+ name
+-------
+ Linus
+(1 row)
+
+psql:181_protocol_psql_extended_sql_prepared_sparse_outer_bind.sql:7: ERROR:  invalid input syntax for parameter type oid 23: "not-an-int"
+ name
+-------
+ Grace
+(1 row)
+
+DEALLOCATE
+ name
+------
+ Ada
+(1 row)
