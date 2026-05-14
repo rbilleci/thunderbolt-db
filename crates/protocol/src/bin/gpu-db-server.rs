@@ -1036,6 +1036,9 @@ fn parse_declare_cursor(statement: &str) -> Option<(String, String)> {
     for marker in [" no scroll cursor for ", " cursor for "] {
         if let Some(idx) = rest.find(marker) {
             let name = rest[..idx].trim();
+            if name.split_whitespace().count() != 1 {
+                return None;
+            }
             let query_start = "declare ".len() + idx + marker.len();
             let query = canonical[query_start..].trim();
             if !name.is_empty() && !query.is_empty() {
@@ -1044,6 +1047,11 @@ fn parse_declare_cursor(statement: &str) -> Option<(String, String)> {
         }
     }
     None
+}
+
+fn is_unsupported_declare_cursor_statement(statement: &str) -> bool {
+    let canonical = canonical_sql(statement.trim().trim_end_matches(';').trim());
+    canonical.starts_with("declare ") && canonical.contains(" cursor for ")
 }
 
 fn parse_fetch_forward(statement: &str) -> Option<(String, Option<usize>)> {
@@ -1318,6 +1326,17 @@ fn execute_statement(
     }
     if let Some((name, query)) = parse_declare_cursor(statement) {
         return execute_declare_cursor(stream, session, name, &query);
+    }
+    if is_unsupported_declare_cursor_statement(statement) {
+        return write_error(
+            stream,
+            &ErrorField {
+                code: "0A000",
+                message:
+                    "cursor declaration options are not supported by the compatibility endpoint",
+                position: None,
+            },
+        );
     }
     if let Some((name, count)) = parse_fetch_forward(statement) {
         return execute_fetch_forward(stream, session, &name, count);
@@ -9262,6 +9281,29 @@ mod tests {
                 "select id, name from people order by id".to_string()
             ))
         );
+        assert_eq!(
+            parse_declare_cursor(
+                "DECLARE _psql_cursor CURSOR FOR\nSELECT id, name FROM people ORDER BY id"
+            ),
+            Some((
+                "_psql_cursor".to_string(),
+                "select id, name from people order by id".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_declare_cursor("DECLARE _psql_cursor BINARY CURSOR FOR SELECT id FROM people"),
+            None
+        );
+        assert!(is_unsupported_declare_cursor_statement(
+            "DECLARE _psql_cursor BINARY CURSOR FOR SELECT id FROM people"
+        ));
+        assert_eq!(
+            parse_declare_cursor("DECLARE _psql_cursor SCROLL CURSOR FOR SELECT id FROM people"),
+            None
+        );
+        assert!(is_unsupported_declare_cursor_statement(
+            "DECLARE _psql_cursor SCROLL CURSOR FOR SELECT id FROM people"
+        ));
         assert_eq!(
             parse_fetch_forward("FETCH FORWARD 2 FROM _psql_cursor"),
             Some(("_psql_cursor".to_string(), Some(2)))

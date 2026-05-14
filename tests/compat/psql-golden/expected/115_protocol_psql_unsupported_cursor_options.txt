@@ -1,0 +1,19 @@
+=== psql unsupported cursor declaration options ===
+CREATE TABLE
+INSERT 0 3
+psql:115_protocol_psql_unsupported_cursor_options.sql:4: ERROR:  cursor declaration options are not supported by the compatibility endpoint
+psql:115_protocol_psql_unsupported_cursor_options.sql:5: ERROR:  cursor does not exist
+psql:115_protocol_psql_unsupported_cursor_options.sql:6: ERROR:  cursor declaration options are not supported by the compatibility endpoint
+psql:115_protocol_psql_unsupported_cursor_options.sql:7: ERROR:  cursor does not exist
+DECLARE CURSOR
+ id | name
+----+-------
+  1 | Ada
+  2 | Linus
+(2 rows)
+
+CLOSE CURSOR
+ name
+-------
+ Linus
+(1 row)
