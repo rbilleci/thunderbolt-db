@@ -1941,7 +1941,11 @@ fn normalize_sql_execute_argument(mut arg: &str) -> Option<&str> {
     loop {
         let parenthesized = strip_parenthesized_sql_execute_argument(arg)?;
         let cast_stripped = strip_supported_sql_execute_cast(parenthesized);
-        let normalized = cast_stripped.unwrap_or(parenthesized).trim();
+        let type_prefixed_stripped =
+            strip_supported_sql_execute_typed_literal(cast_stripped.unwrap_or(parenthesized));
+        let normalized = type_prefixed_stripped
+            .unwrap_or_else(|| cast_stripped.unwrap_or(parenthesized))
+            .trim();
         if normalized == arg {
             return Some(normalized);
         }
@@ -1950,6 +1954,57 @@ fn normalize_sql_execute_argument(mut arg: &str) -> Option<&str> {
         }
         arg = normalized;
     }
+}
+
+fn strip_supported_sql_execute_typed_literal(arg: &str) -> Option<&str> {
+    let arg = arg.trim();
+    let (ty, value_start) = split_leading_sql_type_name(arg)?;
+    if !matches!(
+        canonical_sql(ty).as_str(),
+        "int"
+            | "int4"
+            | "integer"
+            | "pg_catalog.int4"
+            | "pg_catalog.integer"
+            | "text"
+            | "pg_catalog.text"
+    ) {
+        return None;
+    }
+    let value = arg[value_start..].trim_start();
+    if value.starts_with('\'')
+        || value.starts_with("E'")
+        || value.starts_with("e'")
+        || sql_dollar_quote_tag_at(value, 0).is_some()
+    {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+fn split_leading_sql_type_name(arg: &str) -> Option<(&str, usize)> {
+    let mut end = 0usize;
+    let mut saw_dot = false;
+    for (idx, ch) in arg.char_indices() {
+        if ch == '.' {
+            if saw_dot || end == 0 {
+                return None;
+            }
+            saw_dot = true;
+            end = idx + ch.len_utf8();
+            continue;
+        }
+        if ch == '_' || ch.is_ascii_alphanumeric() {
+            end = idx + ch.len_utf8();
+            continue;
+        }
+        if ch.is_whitespace() && end > 0 {
+            return Some((&arg[..end], idx + ch.len_utf8()));
+        }
+        return None;
+    }
+    None
 }
 
 fn strip_parenthesized_sql_execute_argument(mut arg: &str) -> Option<&str> {
@@ -11244,12 +11299,27 @@ mod tests {
             ))
         );
         assert_eq!(
+            parse_sql_execute("EXECUTE lookup(int4 '2', text 'Ada')"),
+            Some((
+                "lookup".to_string(),
+                vec![Some("2".to_string()), Some("Ada".to_string())],
+            ))
+        );
+        assert_eq!(
+            parse_sql_execute("EXECUTE lookup(pg_catalog.int4 '3', pg_catalog.text $$Grace$$)"),
+            Some((
+                "lookup".to_string(),
+                vec![Some("3".to_string()), Some("Grace".to_string())],
+            ))
+        );
+        assert_eq!(
             parse_sql_execute("EXECUTE lookup($1::int4, $2::text)"),
             Some((
                 "lookup".to_string(),
                 vec![Some("$1".to_string()), Some("$2".to_string())],
             ))
         );
+        assert!(parse_sql_execute("EXECUTE lookup(int4 $1, text $2)").is_none());
         assert_eq!(
             parse_sql_execute("EXECUTE lookup((3::pg_catalog.int4), ('Grace')::pg_catalog.text)"),
             Some((
