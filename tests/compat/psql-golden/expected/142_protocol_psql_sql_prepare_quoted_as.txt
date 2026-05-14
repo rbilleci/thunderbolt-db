@@ -1,0 +1,15 @@
+=== psql SQL prepare quoted as keyword ===
+CREATE TABLE
+INSERT 0 3
+PREPARE
+ name
+-------
+ Linus
+(1 row)
+
+DEALLOCATE
+psql:142_protocol_psql_sql_prepare_quoted_as.sql:7: ERROR:  prepared statement "lookup as stmt" does not exist
+ name
+-------
+ Grace
+(1 row)

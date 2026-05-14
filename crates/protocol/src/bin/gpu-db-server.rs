@@ -1251,9 +1251,8 @@ fn parse_close_cursor(statement: &str) -> Option<CloseCursorTarget> {
 fn parse_sql_prepare(statement: &str) -> Option<(String, Vec<u32>, String)> {
     let trimmed = statement.trim().trim_end_matches(';').trim();
     let lower = trimmed.to_ascii_lowercase();
-    let rest = lower.strip_prefix("prepare ")?;
-    let as_idx_in_rest = rest.find(" as ")?;
-    let as_idx = "prepare ".len() + as_idx_in_rest;
+    lower.strip_prefix("prepare ")?;
+    let as_idx = find_sql_prepare_as_index(trimmed)?;
     let original_target = trimmed["prepare ".len()..as_idx].trim();
     let query_start = as_idx + " as ".len();
     let query = trimmed[query_start..].trim();
@@ -1286,11 +1285,57 @@ fn parse_sql_prepare(statement: &str) -> Option<(String, Vec<u32>, String)> {
 fn parse_sql_prepare_name(statement: &str) -> Option<String> {
     let trimmed = statement.trim().trim_end_matches(';').trim();
     let lower = trimmed.to_ascii_lowercase();
-    let rest = lower.strip_prefix("prepare ")?;
-    let as_idx_in_rest = rest.find(" as ")?;
-    let as_idx = "prepare ".len() + as_idx_in_rest;
+    lower.strip_prefix("prepare ")?;
+    let as_idx = find_sql_prepare_as_index(trimmed)?;
     let original_target = trimmed["prepare ".len()..as_idx].trim();
     split_sql_name_and_optional_parenthesized_list(original_target).map(|(name, _)| name)
+}
+
+fn find_sql_prepare_as_index(statement: &str) -> Option<usize> {
+    let mut in_quoted_identifier = false;
+    let mut paren_depth = 0usize;
+    let mut chars = statement.char_indices().peekable();
+    while let Some((idx, ch)) = chars.next() {
+        if idx < "prepare ".len() {
+            continue;
+        }
+        if in_quoted_identifier {
+            if ch == '"' {
+                if chars.peek().is_some_and(|(_, next)| *next == '"') {
+                    chars.next();
+                } else {
+                    in_quoted_identifier = false;
+                }
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_quoted_identifier = true,
+            '(' => paren_depth = paren_depth.saturating_add(1),
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            'a' | 'A'
+                if paren_depth == 0
+                    && statement[idx..]
+                        .get(..2)
+                        .is_some_and(|candidate| candidate.eq_ignore_ascii_case("as"))
+                    && statement[..idx]
+                        .chars()
+                        .next_back()
+                        .is_some_and(char::is_whitespace)
+                    && statement[idx + 2..]
+                        .chars()
+                        .next()
+                        .is_some_and(char::is_whitespace) =>
+            {
+                return statement[..idx]
+                    .char_indices()
+                    .next_back()
+                    .map(|(previous_idx, _)| previous_idx);
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn parse_sql_execute(statement: &str) -> Option<(String, Vec<Option<String>>)> {
@@ -9817,6 +9862,16 @@ mod tests {
             ))
         );
         assert_eq!(
+            parse_sql_prepare(
+                r#"PREPARE "lookup as stmt"(int4) AS SELECT name FROM people WHERE id = $1"#,
+            ),
+            Some((
+                "lookup as stmt".to_string(),
+                vec![SqlType::Int4.postgres_oid()],
+                "SELECT name FROM people WHERE id = $1".to_string(),
+            ))
+        );
+        assert_eq!(
             parse_sql_prepare_name(
                 "PREPARE lookup(jsonb) AS INSERT INTO people (id, name) VALUES ($1, 'Ada')"
             ),
@@ -9833,6 +9888,12 @@ mod tests {
                 r#"PREPARE "lookup(one)"(jsonb) AS INSERT INTO people (id, name) VALUES ($1, 'Ada')"#
             ),
             Some("lookup(one)".to_string())
+        );
+        assert_eq!(
+            parse_sql_prepare_name(
+                r#"PREPARE "lookup as stmt"(jsonb) AS INSERT INTO people (id, name) VALUES ($1, 'Ada')"#
+            ),
+            Some("lookup as stmt".to_string())
         );
         assert_eq!(
             parse_sql_execute("EXECUTE lookup(2, 'O''Brien')"),
