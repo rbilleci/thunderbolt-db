@@ -1,0 +1,28 @@
+=== psql cursor move all marker variants ===
+CREATE TABLE
+INSERT 0 5
+DECLARE CURSOR
+ id | name
+----+-------
+  1 | Ada
+  2 | Linus
+(2 rows)
+
+MOVE 3
+ id | name
+----+------
+(0 rows)
+
+CLOSE CURSOR
+DECLARE CURSOR
+MOVE 1
+MOVE 4
+ id | name
+----+------
+(0 rows)
+
+CLOSE CURSOR
+  name
+--------
+ Edsger
+(1 row)
