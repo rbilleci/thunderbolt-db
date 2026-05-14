@@ -1049,28 +1049,36 @@ fn parse_declare_cursor(statement: &str) -> Option<(String, String)> {
 fn parse_fetch_forward(statement: &str) -> Option<(String, Option<usize>)> {
     let trimmed = statement.trim().trim_end_matches(';').trim();
     let lower = trimmed.to_ascii_lowercase();
-    let (prefix_len, rest) = lower
-        .strip_prefix("fetch forward ")
-        .map(|rest| ("fetch forward ".len(), rest))
-        .or_else(|| {
-            lower
-                .strip_prefix("fetch ")
-                .map(|rest| ("fetch ".len(), rest))
-        })?;
-    let from_idx = rest.find(" from ")?;
-    let count_token = rest[..from_idx].trim();
-    let count = if count_token == "all" {
-        None
-    } else {
-        Some(count_token.parse::<usize>().ok()?)
+    let rest = lower.strip_prefix("fetch ")?;
+    let (cursor_marker_idx, cursor_marker_len) = rest
+        .find(" from ")
+        .map(|idx| (idx, " from ".len()))
+        .or_else(|| rest.find(" in ").map(|idx| (idx, " in ".len())))?;
+    let direction = rest[..cursor_marker_idx].trim();
+    let count = match direction {
+        "" | "next" | "forward" => Some(1),
+        "all" | "forward all" => None,
+        _ => {
+            if let Some(count_token) = direction.strip_prefix("forward ") {
+                Some(count_token.trim().parse::<usize>().ok()?)
+            } else {
+                Some(direction.parse::<usize>().ok()?)
+            }
+        }
     };
-    let name_start = prefix_len + from_idx + " from ".len();
+    let name_start = "fetch ".len() + cursor_marker_idx + cursor_marker_len;
     let name = trimmed[name_start..].trim();
     if name.is_empty() {
         None
     } else {
         Some((name.to_string(), count))
     }
+}
+
+fn is_unsupported_fetch_cursor_statement(statement: &str) -> bool {
+    let trimmed = statement.trim().trim_end_matches(';').trim();
+    let lower = trimmed.to_ascii_lowercase();
+    lower.starts_with("fetch ") && (lower.contains(" from ") || lower.contains(" in "))
 }
 
 fn parse_close_cursor(statement: &str) -> Option<CloseCursorTarget> {
@@ -1184,6 +1192,16 @@ fn execute_statement(
     }
     if let Some((name, count)) = parse_fetch_forward(statement) {
         return execute_fetch_forward(stream, session, &name, count);
+    }
+    if is_unsupported_fetch_cursor_statement(statement) {
+        return write_error(
+            stream,
+            &ErrorField {
+                code: "0A000",
+                message: "cursor fetch direction is not supported by the compatibility endpoint",
+                position: None,
+            },
+        );
     }
     if let Some(target) = parse_close_cursor(statement) {
         match target {
@@ -9107,6 +9125,14 @@ mod tests {
             Some(("_psql_cursor".to_string(), Some(2)))
         );
         assert_eq!(
+            parse_fetch_forward("FETCH NEXT FROM _psql_cursor"),
+            Some(("_psql_cursor".to_string(), Some(1)))
+        );
+        assert_eq!(
+            parse_fetch_forward("FETCH FORWARD FROM _psql_cursor"),
+            Some(("_psql_cursor".to_string(), Some(1)))
+        );
+        assert_eq!(
             parse_fetch_forward("FETCH FORWARD ALL FROM _psql_cursor"),
             Some(("_psql_cursor".to_string(), None))
         );
@@ -9114,6 +9140,17 @@ mod tests {
             parse_fetch_forward("FETCH ALL FROM _psql_cursor"),
             Some(("_psql_cursor".to_string(), None))
         );
+        assert_eq!(
+            parse_fetch_forward("FETCH 1 IN _psql_cursor"),
+            Some(("_psql_cursor".to_string(), Some(1)))
+        );
+        assert_eq!(
+            parse_fetch_forward("FETCH BACKWARD 1 FROM _psql_cursor"),
+            None
+        );
+        assert!(is_unsupported_fetch_cursor_statement(
+            "FETCH BACKWARD 1 FROM _psql_cursor"
+        ));
         assert_eq!(
             parse_close_cursor("CLOSE _psql_cursor"),
             Some(CloseCursorTarget::Named("_psql_cursor".to_string()))

@@ -1,0 +1,30 @@
+=== psql fetch next cursor lifecycle ===
+CREATE TABLE
+INSERT 0 3
+DECLARE CURSOR
+ id | name
+----+------
+  1 | Ada
+(1 row)
+
+ id | name
+----+-------
+  2 | Linus
+(1 row)
+
+ id | name
+----+-------
+  3 | Grace
+(1 row)
+
+ id | name
+----+------
+(0 rows)
+
+CLOSE CURSOR
+DECLARE CURSOR
+psql:112_protocol_psql_fetch_next_cursor.sql:11: ERROR:  cursor fetch direction is not supported by the compatibility endpoint
+ name
+-------
+ Linus
+(1 row)
