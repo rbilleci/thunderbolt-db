@@ -1034,6 +1034,14 @@ fn parse_declare_cursor(statement: &str) -> Option<(String, String)> {
     let canonical = canonical_sql(statement.trim().trim_end_matches(';').trim());
     let rest = canonical.strip_prefix("declare ")?;
     for marker in [
+        " asensitive no scroll cursor without hold for ",
+        " insensitive no scroll cursor without hold for ",
+        " asensitive cursor without hold for ",
+        " insensitive cursor without hold for ",
+        " asensitive no scroll cursor for ",
+        " insensitive no scroll cursor for ",
+        " asensitive cursor for ",
+        " insensitive cursor for ",
         " no scroll cursor without hold for ",
         " cursor without hold for ",
         " no scroll cursor for ",
@@ -9301,6 +9309,24 @@ mod tests {
         assert_eq!(
             parse_declare_cursor(
                 "DECLARE _psql_cursor CURSOR WITHOUT HOLD FOR SELECT id FROM people"
+            ),
+            Some((
+                "_psql_cursor".to_string(),
+                "select id from people".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_declare_cursor(
+                "DECLARE _psql_cursor ASENSITIVE NO SCROLL CURSOR FOR SELECT id FROM people"
+            ),
+            Some((
+                "_psql_cursor".to_string(),
+                "select id from people".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_declare_cursor(
+                "DECLARE _psql_cursor INSENSITIVE CURSOR WITHOUT HOLD FOR SELECT id FROM people"
             ),
             Some((
                 "_psql_cursor".to_string(),

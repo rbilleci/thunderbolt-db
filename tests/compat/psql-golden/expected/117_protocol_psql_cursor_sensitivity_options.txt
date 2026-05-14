@@ -1,0 +1,26 @@
+=== psql cursor sensitivity options ===
+CREATE TABLE
+INSERT 0 3
+DECLARE CURSOR
+ id | name
+----+-------
+  1 | Ada
+  2 | Linus
+(2 rows)
+
+CLOSE CURSOR
+DECLARE CURSOR
+ id | name
+----+-------
+  1 | Ada
+  2 | Linus
+  3 | Grace
+(3 rows)
+
+CLOSE CURSOR
+psql:117_protocol_psql_cursor_sensitivity_options.sql:10: ERROR:  cursor declaration options are not supported by the compatibility endpoint
+psql:117_protocol_psql_cursor_sensitivity_options.sql:11: ERROR:  cursor does not exist
+ name
+-------
+ Grace
+(1 row)
