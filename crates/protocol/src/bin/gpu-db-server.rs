@@ -1265,21 +1265,19 @@ fn parse_sql_prepare(statement: &str) -> Option<(String, Vec<u32>, String)> {
         return None;
     }
 
-    let (name, type_oids) = if let Some(open_idx) = original_target.find('(') {
-        if !original_target.ends_with(')') {
-            return None;
-        }
-        let name = parse_supported_cursor_name(original_target[..open_idx].trim())?;
-        let type_list = &original_target[open_idx + 1..original_target.len() - 1];
-        let mut type_oids = Vec::new();
-        if !type_list.trim().is_empty() {
-            for ty in split_sql_csv(type_list)? {
-                type_oids.push(sql_prepare_type_oid(ty.trim())?);
+    let (name, type_oids) = {
+        let (name, type_list) = split_sql_name_and_optional_parenthesized_list(original_target)?;
+        if let Some(type_list) = type_list {
+            let mut type_oids = Vec::new();
+            if !type_list.trim().is_empty() {
+                for ty in split_sql_csv(type_list)? {
+                    type_oids.push(sql_prepare_type_oid(ty.trim())?);
+                }
             }
+            (name, type_oids)
+        } else {
+            (name, Vec::new())
         }
-        (name, type_oids)
-    } else {
-        (parse_supported_cursor_name(original_target)?, Vec::new())
     };
 
     Some((name, type_oids, query.to_string()))
@@ -1292,42 +1290,67 @@ fn parse_sql_prepare_name(statement: &str) -> Option<String> {
     let as_idx_in_rest = rest.find(" as ")?;
     let as_idx = "prepare ".len() + as_idx_in_rest;
     let original_target = trimmed["prepare ".len()..as_idx].trim();
-    let name = if let Some(open_idx) = original_target.find('(') {
-        original_target[..open_idx].trim()
-    } else {
-        original_target
-    };
-    parse_supported_cursor_name(name)
+    split_sql_name_and_optional_parenthesized_list(original_target).map(|(name, _)| name)
 }
 
 fn parse_sql_execute(statement: &str) -> Option<(String, Vec<Option<String>>)> {
     let trimmed = statement.trim().trim_end_matches(';').trim();
     let lower = trimmed.to_ascii_lowercase();
-    let rest = lower.strip_prefix("execute ")?;
+    lower.strip_prefix("execute ")?;
     let original_rest = &trimmed["execute ".len()..];
-    let open_idx = rest.find('(');
-    let (name, args) = if let Some(open_idx) = open_idx {
-        if !rest.ends_with(')') {
-            return None;
-        }
-        let name = parse_supported_cursor_name(original_rest[..open_idx].trim())?;
-        let arg_list = &original_rest[open_idx + 1..original_rest.len() - 1];
-        let args = if arg_list.trim().is_empty() {
-            Vec::new()
+    let (name, args) = {
+        let (name, arg_list) = split_sql_name_and_optional_parenthesized_list(original_rest)?;
+        if let Some(arg_list) = arg_list {
+            let args = if arg_list.trim().is_empty() {
+                Vec::new()
+            } else {
+                split_sql_csv(arg_list)?
+                    .into_iter()
+                    .map(decode_sql_execute_argument)
+                    .collect::<Option<Vec<_>>>()?
+            };
+            (name, args)
         } else {
-            split_sql_csv(arg_list)?
-                .into_iter()
-                .map(decode_sql_execute_argument)
-                .collect::<Option<Vec<_>>>()?
-        };
-        (name, args)
-    } else {
-        (
-            parse_supported_cursor_name(original_rest.trim())?,
-            Vec::new(),
-        )
+            (name, Vec::new())
+        }
     };
     Some((name, args))
+}
+
+fn split_sql_name_and_optional_parenthesized_list(target: &str) -> Option<(String, Option<&str>)> {
+    let target = target.trim();
+    if let Some(quoted) = target.strip_prefix('"') {
+        let mut chars = quoted.char_indices().peekable();
+        while let Some((idx, ch)) = chars.next() {
+            if ch == '"' {
+                if chars.peek().is_some_and(|(_, next)| *next == '"') {
+                    chars.next();
+                    continue;
+                }
+                let name_end = idx + 2;
+                let name = parse_supported_cursor_name(&target[..name_end])?;
+                let rest = target[name_end..].trim();
+                return if rest.is_empty() {
+                    Some((name, None))
+                } else {
+                    parenthesized_list(rest).map(|list| (name, Some(list)))
+                };
+            }
+        }
+        None
+    } else if let Some(open_idx) = target.find('(') {
+        let name = parse_supported_cursor_name(target[..open_idx].trim())?;
+        parenthesized_list(target[open_idx..].trim()).map(|list| (name, Some(list)))
+    } else {
+        parse_supported_cursor_name(target).map(|name| (name, None))
+    }
+}
+
+fn parenthesized_list(target: &str) -> Option<&str> {
+    target
+        .strip_prefix('(')?
+        .strip_suffix(')')
+        .filter(|_| target.ends_with(')'))
 }
 
 fn parse_sql_deallocate(statement: &str) -> Option<SqlDeallocateTarget> {
@@ -9784,6 +9807,16 @@ mod tests {
             ))
         );
         assert_eq!(
+            parse_sql_prepare(
+                r#"PREPARE "lookup(one)"(int4) AS SELECT name FROM people WHERE id = $1"#,
+            ),
+            Some((
+                "lookup(one)".to_string(),
+                vec![SqlType::Int4.postgres_oid()],
+                "SELECT name FROM people WHERE id = $1".to_string(),
+            ))
+        );
+        assert_eq!(
             parse_sql_prepare_name(
                 "PREPARE lookup(jsonb) AS INSERT INTO people (id, name) VALUES ($1, 'Ada')"
             ),
@@ -9796,11 +9829,21 @@ mod tests {
             Some("Mixed Lookup".to_string())
         );
         assert_eq!(
+            parse_sql_prepare_name(
+                r#"PREPARE "lookup(one)"(jsonb) AS INSERT INTO people (id, name) VALUES ($1, 'Ada')"#
+            ),
+            Some("lookup(one)".to_string())
+        );
+        assert_eq!(
             parse_sql_execute("EXECUTE lookup(2, 'O''Brien')"),
             Some((
                 "lookup".to_string(),
                 vec![Some("2".to_string()), Some("O'Brien".to_string())],
             ))
+        );
+        assert_eq!(
+            parse_sql_execute(r#"EXECUTE "lookup(one)"(2)"#),
+            Some(("lookup(one)".to_string(), vec![Some("2".to_string())],))
         );
         assert_eq!(
             parse_sql_execute("EXECUTE lookup(NULL, 'Ada')"),

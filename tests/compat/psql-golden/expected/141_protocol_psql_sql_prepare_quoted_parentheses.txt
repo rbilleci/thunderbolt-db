@@ -1,0 +1,15 @@
+=== psql SQL prepare quoted parentheses ===
+CREATE TABLE
+INSERT 0 3
+PREPARE
+ name
+-------
+ Linus
+(1 row)
+
+DEALLOCATE
+psql:141_protocol_psql_sql_prepare_quoted_parentheses.sql:7: ERROR:  prepared statement "lookup(one)" does not exist
+ name
+-------
+ Grace
+(1 row)
