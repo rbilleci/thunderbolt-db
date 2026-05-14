@@ -1,0 +1,34 @@
+=== psql int4 ddl and plus-signed literals ===
+CREATE TABLE
+INSERT 0 3
+ name
+------
+ Plus
+(1 row)
+
+ name
+------
+ Zero
+(1 row)
+
+ name
+------
+ Plus
+(1 row)
+
+PREPARE
+ name
+------
+ Plus
+(1 row)
+
+ name
+------
+ Zero
+(1 row)
+
+DEALLOCATE
+ name
+-------
+ Minus
+(1 row)

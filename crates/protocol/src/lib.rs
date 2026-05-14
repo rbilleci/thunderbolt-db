@@ -1490,10 +1490,8 @@ fn parse_create_table(input: &str) -> Result<CreateTable, ParseError> {
             .ok_or(ParseError::InvalidRelationalSql)
             .and_then(normalize_identifier)?;
         let ty = match parts.next().ok_or(ParseError::InvalidRelationalSql)? {
-            ty if ty.eq_ignore_ascii_case("INT") || ty.eq_ignore_ascii_case("INTEGER") => {
-                SqlType::Int4
-            }
-            ty if ty.eq_ignore_ascii_case("TEXT") => SqlType::Text,
+            ty if parse_supported_sql_type_name(ty) == Some(SqlType::Int4) => SqlType::Int4,
+            ty if parse_supported_sql_type_name(ty) == Some(SqlType::Text) => SqlType::Text,
             _ => return Err(ParseError::InvalidRelationalSql),
         };
         if parts.next().is_some() {
@@ -1505,6 +1503,27 @@ fn parse_create_table(input: &str) -> Result<CreateTable, ParseError> {
         return Err(ParseError::InvalidRelationalSql);
     }
     Ok(CreateTable { table, columns })
+}
+
+fn parse_supported_sql_type_name(input: &str) -> Option<SqlType> {
+    let ty = if input
+        .get(.."pg_catalog.".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("pg_catalog."))
+    {
+        &input["pg_catalog.".len()..]
+    } else {
+        input
+    };
+    if ty.eq_ignore_ascii_case("INT")
+        || ty.eq_ignore_ascii_case("INT4")
+        || ty.eq_ignore_ascii_case("INTEGER")
+    {
+        Some(SqlType::Int4)
+    } else if ty.eq_ignore_ascii_case("TEXT") {
+        Some(SqlType::Text)
+    } else {
+        None
+    }
 }
 
 fn parse_insert(input: &str) -> Result<Insert, ParseError> {
@@ -8141,6 +8160,23 @@ mod tests {
         );
 
         assert_eq!(
+            parse_command("CREATE TABLE typed_people (id INT4, owner pg_catalog.text)").unwrap(),
+            Command::CreateTable(CreateTable {
+                table: "typed_people".to_string(),
+                columns: vec![
+                    ColumnDef {
+                        name: "id".to_string(),
+                        ty: SqlType::Int4,
+                    },
+                    ColumnDef {
+                        name: "owner".to_string(),
+                        ty: SqlType::Text,
+                    },
+                ],
+            })
+        );
+
+        assert_eq!(
             parse_command("INSERT INTO people (id, name) VALUES (1, 'Ada'), (2, 'Linus')").unwrap(),
             Command::Insert(Insert {
                 table: "people".to_string(),
@@ -8174,6 +8210,31 @@ mod tests {
                     vec![SqlValue::Int4(-1), SqlValue::Text("Minus".to_string())],
                     vec![SqlValue::Int4(0), SqlValue::Text("Zero".to_string())],
                 ],
+            })
+        );
+
+        assert_eq!(
+            parse_command("SELECT id FROM people WHERE id = +1 LIMIT +1").unwrap(),
+            Command::Select(Select {
+                table: "people".to_string(),
+                projection: SelectProjection::Columns(vec!["id".to_string()]),
+                filter: Some(SelectFilter {
+                    column: "id".to_string(),
+                    op: SelectFilterOp::Eq,
+                    value: SqlValue::Int4(1),
+                }),
+                filters: vec![SelectFilter {
+                    column: "id".to_string(),
+                    op: SelectFilterOp::Eq,
+                    value: SqlValue::Int4(1),
+                }],
+                filter_groups: vec![vec![SelectFilter {
+                    column: "id".to_string(),
+                    op: SelectFilterOp::Eq,
+                    value: SqlValue::Int4(1),
+                }]],
+                order_by: None,
+                limit: Some(1),
             })
         );
 
