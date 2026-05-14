@@ -1152,7 +1152,8 @@ fn is_unsupported_declare_cursor_statement(statement: &str) -> bool {
 }
 
 fn parse_fetch_forward(statement: &str) -> Option<(String, Option<usize>)> {
-    let trimmed = statement.trim().trim_end_matches(';').trim();
+    let stripped = strip_sql_comments(statement);
+    let trimmed = stripped.trim().trim_end_matches(';').trim();
     let lower = trimmed.to_ascii_lowercase();
     let rest = lower.strip_prefix("fetch ")?;
     let (name_start_in_rest, count) = parse_forward_cursor_target(rest)?;
@@ -1162,7 +1163,8 @@ fn parse_fetch_forward(statement: &str) -> Option<(String, Option<usize>)> {
 }
 
 fn parse_move_forward(statement: &str) -> Option<(String, Option<usize>)> {
-    let trimmed = statement.trim().trim_end_matches(';').trim();
+    let stripped = strip_sql_comments(statement);
+    let trimmed = stripped.trim().trim_end_matches(';').trim();
     let lower = trimmed.to_ascii_lowercase();
     let rest = lower.strip_prefix("move ")?;
     let (name_start_in_rest, count) = parse_forward_cursor_target(rest)?;
@@ -1274,22 +1276,25 @@ fn parse_forward_cursor_direction_without_marker(rest: &str) -> Option<(usize, O
 }
 
 fn is_unsupported_fetch_cursor_statement(statement: &str) -> bool {
-    let trimmed = statement.trim().trim_end_matches(';').trim();
+    let stripped = strip_sql_comments(statement);
+    let trimmed = stripped.trim().trim_end_matches(';').trim();
     let lower = trimmed.to_ascii_lowercase();
     lower.starts_with("fetch ") && parse_fetch_forward(trimmed).is_none()
 }
 
 fn is_unsupported_move_cursor_statement(statement: &str) -> bool {
-    let trimmed = statement.trim().trim_end_matches(';').trim();
+    let stripped = strip_sql_comments(statement);
+    let trimmed = stripped.trim().trim_end_matches(';').trim();
     let lower = trimmed.to_ascii_lowercase();
     lower.starts_with("move ") && parse_move_forward(trimmed).is_none()
 }
 
 fn parse_close_cursor(statement: &str) -> Option<CloseCursorTarget> {
-    let trimmed = statement.trim().trim_end_matches(';').trim();
+    let stripped = strip_sql_comments(statement);
+    let trimmed = stripped.trim().trim_end_matches(';').trim();
     let lower = trimmed.to_ascii_lowercase();
     let name = lower.strip_prefix("close ")?;
-    if name == "all" {
+    if name.trim() == "all" {
         return Some(CloseCursorTarget::All);
     }
     let original = &trimmed["close ".len()..];
@@ -10505,6 +10510,12 @@ mod tests {
             Some(("mixed_cursor".to_string(), Some(2)))
         );
         assert_eq!(
+            parse_fetch_forward(
+                r#"FETCH /* direction */ FORWARD 2 /* marker */ FROM /* target */ "Mixed Cursor""#
+            ),
+            Some(("Mixed Cursor".to_string(), Some(2)))
+        );
+        assert_eq!(
             parse_fetch_forward(r#"FETCH FORWARD 2 FROM "Mixed Cursor""#),
             Some(("Mixed Cursor".to_string(), Some(2)))
         );
@@ -10571,6 +10582,12 @@ mod tests {
         assert_eq!(
             parse_move_forward("MOVE FORWARD 2 FROM MIXED_CURSOR"),
             Some(("mixed_cursor".to_string(), Some(2)))
+        );
+        assert_eq!(
+            parse_move_forward(
+                r#"MOVE /* direction */ FORWARD 2 /* marker */ FROM /* target */ "Mixed Cursor""#
+            ),
+            Some(("Mixed Cursor".to_string(), Some(2)))
         );
         assert_eq!(
             parse_move_forward(r#"MOVE FORWARD 2 FROM "Mixed Cursor""#),
@@ -10666,6 +10683,10 @@ mod tests {
         );
         assert_eq!(
             parse_close_cursor(r#"CLOSE "Mixed Cursor""#),
+            Some(CloseCursorTarget::Named("Mixed Cursor".to_string()))
+        );
+        assert_eq!(
+            parse_close_cursor(r#"CLOSE /* target */ "Mixed Cursor""#),
             Some(CloseCursorTarget::Named("Mixed Cursor".to_string()))
         );
         assert_eq!(parse_close_cursor(r#"CLOSE "Mixed Cursor"#), None);

@@ -1,0 +1,21 @@
+=== psql cursor comment lifecycle ===
+CREATE TABLE
+INSERT 0 3
+DECLARE CURSOR
+ id | name
+----+------
+  1 | Ada
+(1 row)
+
+MOVE 1
+ id | name
+----+-------
+  3 | Grace
+(1 row)
+
+CLOSE CURSOR
+psql:163_protocol_psql_cursor_comment_lifecycle.sql:9: ERROR:  cursor does not exist
+ name
+-------
+ Linus
+(1 row)
