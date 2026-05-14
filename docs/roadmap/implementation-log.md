@@ -1204,3 +1204,5 @@
 1. Add an in-engine queue using `DualTriggerBatcher` and batch flush telemetry.
 2. Add `LocalReplicator` role transition simulation tests (leader/follower reject path).
 3. Introduce durability error-path tests for commit pipeline.
+
+- Advanced P3 extended wire-protocol recovery coverage with real PostgreSQL 16 `psql` scenario 169. Invalid extended bind execution now has a golden case proving the error path preserves the prepared statement so later bound-portal `\gdesc`, execution, and supported SELECT traffic recover in the same session.

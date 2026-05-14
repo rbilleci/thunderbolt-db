@@ -1,0 +1,18 @@
+=== psql extended gdesc bind error recovery ===
+CREATE TABLE
+INSERT 0 2
+psql:169_protocol_psql_extended_gdesc_bind_error_recovery.sql:4: ERROR:  invalid input syntax for parameter type oid 23: "nope"
+ Column | Type
+--------+------
+ name   | text
+(1 row)
+
+ name
+-------
+ Linus
+(1 row)
+
+ name
+------
+ Ada
+(1 row)
