@@ -1,0 +1,15 @@
+=== psql SQL prepare keyword whitespace ===
+CREATE TABLE
+INSERT 0 3
+PREPARE
+ id | name
+----+-------
+  2 | Linus
+(1 row)
+
+DEALLOCATE
+psql:153_protocol_psql_sql_prepare_keyword_whitespace.sql:14: ERROR:  prepared statement "whitespace_lookup" does not exist
+ name
+------
+ Ada
+(1 row)
