@@ -762,6 +762,7 @@ fn handle_parse(
         .map(|(_, cursor_query)| cursor_query)
         .unwrap_or_else(|| query.clone());
     if describe_query_columns(session, &describe_query).is_none()
+        && describe_extended_query_columns(session, &describe_query).is_none()
         && describe_extended_query_columns(session, &query).is_none()
     {
         write_error(
@@ -9208,6 +9209,95 @@ mod tests {
         );
         assert_eq!(messages[2].1, b"FETCH 1\0".to_vec());
         assert_eq!(session.cursors.get("raw_cursor").unwrap().position, 1);
+    }
+
+    #[test]
+    fn extended_cursor_declaration_supports_sql_prepared_execute_binds() {
+        let mut session = Session::default();
+        session.tables.insert(
+            "people".to_string(),
+            Table {
+                oid: FIRST_USER_RELATION_OID,
+                name: "people".to_string(),
+                columns: vec![
+                    CatalogColumn {
+                        attnum: 1,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "id".to_string(),
+                            ty: SqlType::Int4,
+                        },
+                    },
+                    CatalogColumn {
+                        attnum: 2,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "name".to_string(),
+                            ty: SqlType::Text,
+                        },
+                    },
+                ],
+                rows: vec![
+                    vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())],
+                    vec![SqlValue::Int4(2), SqlValue::Text("Linus".to_string())],
+                    vec![SqlValue::Int4(3), SqlValue::Text("Grace".to_string())],
+                ],
+            },
+        );
+        session.prepared.insert(
+            "lookup".to_string(),
+            PreparedStatement::Sql(PreparedQuery {
+                query: "SELECT id, name FROM people WHERE id >= $1 ORDER BY id".to_string(),
+                parameter_type_oids: vec![SqlType::Int4.postgres_oid()],
+            }),
+        );
+        let (mut writer, mut reader) = tcp_pair();
+
+        assert!(!handle_parse(
+            &mut writer,
+            &mut session,
+            "cursor_exec_stmt".to_string(),
+            "DECLARE raw_exec_cursor CURSOR FOR EXECUTE lookup($1)".to_string(),
+            Vec::new(),
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'1']);
+        let query = match session.prepared.get("cursor_exec_stmt") {
+            Some(PreparedStatement::Extended(query)) => query,
+            _ => panic!("expected extended cursor declaration statement"),
+        };
+        assert_eq!(
+            query.parameter_type_oids,
+            vec![SqlType::Int4.postgres_oid()]
+        );
+
+        assert!(!handle_bind(
+            &mut writer,
+            &mut session,
+            "cursor_exec_portal".to_string(),
+            "cursor_exec_stmt".to_string(),
+            Vec::new(),
+            vec![Some(b"2".to_vec())],
+            Vec::new(),
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'2']);
+
+        assert!(!handle_describe(
+            &mut writer,
+            &mut session,
+            DescribeTarget::Portal,
+            "cursor_exec_portal",
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'n']);
+
+        assert!(!handle_execute(&mut writer, &mut session, "cursor_exec_portal", 0).unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'C']);
+        let cursor = session.cursors.get("raw_exec_cursor").unwrap();
+        assert_eq!(cursor.rows.len(), 2);
+        assert_eq!(
+            cursor.rows[0],
+            vec![Some("2".to_string()), Some("Linus".to_string())]
+        );
     }
 
     #[test]
