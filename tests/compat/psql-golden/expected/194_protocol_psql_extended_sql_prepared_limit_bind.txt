@@ -1,0 +1,32 @@
+=== psql extended sql prepared limit bind ===
+CREATE TABLE
+INSERT 0 4
+PREPARE
+ Column |  Type
+--------+---------
+ id     | integer
+ name   | text
+(2 rows)
+
+ id | name
+----+------
+  1 | Ada
+  2 | Ada
+(2 rows)
+
+psql:194_protocol_psql_extended_sql_prepared_limit_bind.sql:7: ERROR:  invalid input syntax for parameter type oid 23: "nope"
+psql:194_protocol_psql_extended_sql_prepared_limit_bind.sql:8: ERROR:  LIMIT must not be negative
+ id | name
+----+------
+(0 rows)
+
+ id | name
+----+-------
+  4 | Grace
+(1 row)
+
+DEALLOCATE
+ name
+------
+ Ada
+(1 row)
