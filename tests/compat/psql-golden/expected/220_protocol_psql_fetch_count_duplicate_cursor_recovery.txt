@@ -1,0 +1,13 @@
+=== psql fetch count duplicate cursor recovery ===
+CREATE TABLE
+INSERT 0 3
+BEGIN
+DECLARE CURSOR
+psql:220_protocol_psql_fetch_count_duplicate_cursor_recovery.sql:7: ERROR:  cursor already exists
+psql:220_protocol_psql_fetch_count_duplicate_cursor_recovery.sql:9: ERROR:  cursor does not exist
+psql:220_protocol_psql_fetch_count_duplicate_cursor_recovery.sql:10: ERROR:  cursor does not exist
+COMMIT
+ name
+-------
+ Grace
+(1 row)
