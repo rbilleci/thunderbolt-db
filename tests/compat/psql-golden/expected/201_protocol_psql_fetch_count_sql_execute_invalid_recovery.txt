@@ -1,0 +1,16 @@
+=== psql fetch_count sql prepared execute invalid recovery ===
+CREATE TABLE
+INSERT 0 3
+PREPARE
+psql:201_protocol_psql_fetch_count_sql_execute_invalid_recovery.sql:6: ERROR:  invalid input syntax for parameter type oid 23: "bad"
+ id | name
+----+-------
+  2 | Grace
+  3 | Linus
+(2 rows)
+
+DEALLOCATE
+ name
+------
+ Ada
+(1 row)
