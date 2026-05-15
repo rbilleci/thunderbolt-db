@@ -1931,18 +1931,82 @@ fn decode_escape_sql_string_literal(quoted: &str) -> Option<String> {
                     return None;
                 }
             }
-            '\\' => match chars.next()? {
-                '\\' => decoded.push('\\'),
-                '\'' => decoded.push('\''),
-                'n' => decoded.push('\n'),
-                'r' => decoded.push('\r'),
-                't' => decoded.push('\t'),
-                other => decoded.push(other),
-            },
+            '\\' => decode_escape_sql_string_backslash(&mut chars, &mut decoded)?,
             other => decoded.push(other),
         }
     }
     Some(decoded)
+}
+
+fn decode_escape_sql_string_backslash<I>(
+    chars: &mut std::iter::Peekable<I>,
+    decoded: &mut String,
+) -> Option<()>
+where
+    I: Iterator<Item = char>,
+{
+    match chars.next()? {
+        '\\' => decoded.push('\\'),
+        '\'' => decoded.push('\''),
+        'b' => decoded.push('\u{0008}'),
+        'f' => decoded.push('\u{000c}'),
+        'n' => decoded.push('\n'),
+        'r' => decoded.push('\r'),
+        't' => decoded.push('\t'),
+        'x' => {
+            let codepoint = take_variable_hex_codepoint(chars, 2)?;
+            decoded.push(char::from_u32(codepoint)?);
+        }
+        first if first.is_ascii_digit() && first < '8' => {
+            let codepoint = take_octal_codepoint(chars, first, 3)?;
+            decoded.push(char::from_u32(codepoint)?);
+        }
+        other => decoded.push(other),
+    }
+    Some(())
+}
+
+fn take_variable_hex_codepoint<I>(chars: &mut std::iter::Peekable<I>, max_len: usize) -> Option<u32>
+where
+    I: Iterator<Item = char>,
+{
+    let mut codepoint = 0u32;
+    let mut consumed = 0usize;
+    while consumed < max_len {
+        let Some(digit) = chars.peek().copied().and_then(|ch| ch.to_digit(16)) else {
+            break;
+        };
+        chars.next();
+        codepoint = codepoint.checked_mul(16)?.checked_add(digit)?;
+        consumed += 1;
+    }
+    (consumed > 0).then_some(codepoint)
+}
+
+fn take_octal_codepoint<I>(
+    chars: &mut std::iter::Peekable<I>,
+    first: char,
+    max_len: usize,
+) -> Option<u32>
+where
+    I: Iterator<Item = char>,
+{
+    let mut codepoint = first.to_digit(8)?;
+    let mut consumed = 1usize;
+    while consumed < max_len {
+        let Some(digit) = chars
+            .peek()
+            .copied()
+            .filter(|ch| ch.is_ascii_digit() && *ch < '8')
+            .and_then(|ch| ch.to_digit(8))
+        else {
+            break;
+        };
+        chars.next();
+        codepoint = codepoint.checked_mul(8)?.checked_add(digit)?;
+        consumed += 1;
+    }
+    Some(codepoint)
 }
 
 fn decode_unicode_sql_string_literal(arg: &str) -> Option<String> {
@@ -11352,6 +11416,16 @@ mod tests {
             ))
         );
         assert_eq!(
+            parse_sql_execute(r"EXECUTE lookup(E'Ada\x20Lovelace', E'Grace\040Hopper')"),
+            Some((
+                "lookup".to_string(),
+                vec![
+                    Some("Ada Lovelace".to_string()),
+                    Some("Grace Hopper".to_string()),
+                ],
+            ))
+        );
+        assert_eq!(
             parse_sql_execute(r"EXECUTE lookup(U&'Ada\0020Lovelace', u&'Grace\+000020Hopper')"),
             Some((
                 "lookup".to_string(),
@@ -11542,6 +11616,7 @@ mod tests {
         assert!(parse_sql_prepare("PREPARE bad(jsonb) AS SELECT id FROM people").is_none());
         assert!(parse_sql_execute("EXECUTE lookup('unterminated)").is_none());
         assert!(parse_sql_execute("EXECUTE lookup(E'unterminated)").is_none());
+        assert!(parse_sql_execute(r"EXECUTE lookup(E'bad\xzz')").is_none());
         assert!(parse_sql_execute("EXECUTE lookup(U&'unterminated)").is_none());
         assert!(parse_sql_execute("EXECUTE lookup(U&'bad\\00xz')").is_none());
         assert!(parse_sql_execute("EXECUTE lookup(U&'bad!00xz' UESCAPE '!')").is_none());

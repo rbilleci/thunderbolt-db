@@ -1,0 +1,32 @@
+=== psql extended sql prepared escape hex octal literal bind ===
+CREATE TABLE
+INSERT 0 3
+PREPARE
+ Column |  Type
+--------+---------
+ id     | integer
+ name   | text
+(2 rows)
+
+ id |     name
+----+--------------
+  1 | Ada Lovelace
+(1 row)
+
+ id |     name
+----+--------------
+  2 | Grace Hopper
+(1 row)
+
+psql:190_protocol_psql_extended_sql_prepared_escape_hex_octal_literal_bind.sql:8: ERROR:  invalid input syntax for parameter type oid 23: "not-an-int"
+psql:190_protocol_psql_extended_sql_prepared_escape_hex_octal_literal_bind.sql:9: ERROR:  extended query protocol only supports relational SELECT
+ id | name
+----+-------
+  3 | Linus
+(1 row)
+
+DEALLOCATE
+     name
+--------------
+ Ada Lovelace
+(1 row)
