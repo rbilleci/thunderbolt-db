@@ -1,0 +1,16 @@
+=== psql direct cursor negative limit recovery ===
+CREATE TABLE
+INSERT 0 3
+psql:210_protocol_psql_cursor_direct_negative_limit_recovery.sql:4: ERROR:  LIMIT must not be negative
+DECLARE CURSOR
+ id | name
+----+-------
+  1 | Ada
+  2 | Linus
+(2 rows)
+
+CLOSE CURSOR
+ name
+-------
+ Grace
+(1 row)

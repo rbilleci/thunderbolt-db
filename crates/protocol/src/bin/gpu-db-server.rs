@@ -2517,16 +2517,24 @@ fn execute_declare_cursor(
             }
         }
     } else {
-        let Ok(Command::Select(select)) = parse_command(query) else {
-            write_error(
-                stream,
-                &ErrorField {
-                    code: "0A000",
-                    message: "cursor declarations only support relational SELECT or SQL EXECUTE",
-                    position: None,
-                },
-            )?;
-            return Ok(true);
+        let select = match parse_command(query) {
+            Ok(Command::Select(select)) => select,
+            Err(ParseError::NegativeLimit) => {
+                write_error(stream, &negative_limit_error_field())?;
+                return Ok(true);
+            }
+            Ok(_) | Err(_) => {
+                write_error(
+                    stream,
+                    &ErrorField {
+                        code: "0A000",
+                        message:
+                            "cursor declarations only support relational SELECT or SQL EXECUTE",
+                        position: None,
+                    },
+                )?;
+                return Ok(true);
+            }
         };
         match execute_select_result(session, &select) {
             Ok(result) => result,
