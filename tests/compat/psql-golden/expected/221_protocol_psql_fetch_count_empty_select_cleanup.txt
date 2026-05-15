@@ -1,0 +1,17 @@
+=== psql fetch count empty select cleanup ===
+CREATE TABLE
+INSERT 0 3
+ id | name
+----+------
+(0 rows)
+
+psql:221_protocol_psql_fetch_count_empty_select_cleanup.sql:6: ERROR:  cursor does not exist
+ id | name
+----+-------
+  2 | Linus
+(1 row)
+
+ name
+-------
+ Grace
+(1 row)
