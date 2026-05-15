@@ -1846,7 +1846,9 @@ fn decode_sql_execute_argument(arg: &str) -> Option<Option<String>> {
         || trimmed.starts_with("U&'")
         || trimmed.starts_with("u&'")
     {
-        decode_sql_execute_string_literal(trimmed).map(Some)
+        decode_sql_execute_string_literal(trimmed)
+            .or_else(|| decode_concatenated_standard_sql_string_literals(trimmed))
+            .map(Some)
     } else if sql_dollar_quote_tag_at(trimmed, 0).is_some() {
         decode_dollar_sql_string_literal(trimmed).map(Some)
     } else if !trimmed.is_empty() && !trimmed.contains(char::is_whitespace) {
@@ -1897,6 +1899,10 @@ fn decode_standard_sql_string_literal(quoted: &str) -> Option<String> {
         return None;
     }
     let inner = &quoted[..quoted.len() - 1];
+    decode_standard_sql_string_body(inner)
+}
+
+fn decode_standard_sql_string_body(inner: &str) -> Option<String> {
     let mut decoded = String::with_capacity(inner.len());
     let mut chars = inner.chars().peekable();
     while let Some(ch) = chars.next() {
@@ -1912,6 +1918,29 @@ fn decode_standard_sql_string_literal(quoted: &str) -> Option<String> {
         }
     }
     Some(decoded)
+}
+
+fn decode_concatenated_standard_sql_string_literals(arg: &str) -> Option<String> {
+    let mut rest = arg;
+    let mut decoded = String::new();
+    let mut pieces = 0usize;
+    loop {
+        let (inner, after_literal) = split_standard_sql_quoted_literal(rest)?;
+        decoded.push_str(&decode_standard_sql_string_body(inner)?);
+        pieces += 1;
+        if after_literal.is_empty() {
+            return (pieces > 1).then_some(decoded);
+        }
+        let separator_len = after_literal.len() - after_literal.trim_start().len();
+        let separator = &after_literal[..separator_len];
+        if !separator.contains('\n') {
+            return None;
+        }
+        rest = after_literal[separator_len..].trim_start();
+        if !rest.starts_with('\'') {
+            return None;
+        }
+    }
 }
 
 fn decode_escape_sql_string_literal(quoted: &str) -> Option<String> {
@@ -11502,6 +11531,16 @@ mod tests {
             Some(("lookup".to_string(), vec![Some("Ada Lovelace".to_string())],))
         );
         assert_eq!(
+            parse_sql_execute("EXECUTE lookup('Ada'\n' Lovelace', text 'Grace'\n' Hopper')"),
+            Some((
+                "lookup".to_string(),
+                vec![
+                    Some("Ada Lovelace".to_string()),
+                    Some("Grace Hopper".to_string()),
+                ],
+            ))
+        );
+        assert_eq!(
             parse_sql_execute("EXECUTE lookup(pg_catalog.int4 '3', pg_catalog.text $$Grace$$)"),
             Some((
                 "lookup".to_string(),
@@ -11617,6 +11656,7 @@ mod tests {
         assert!(parse_sql_execute("EXECUTE lookup('unterminated)").is_none());
         assert!(parse_sql_execute("EXECUTE lookup(E'unterminated)").is_none());
         assert!(parse_sql_execute(r"EXECUTE lookup(E'bad\xzz')").is_none());
+        assert!(parse_sql_execute("EXECUTE lookup('Ada' 'Lovelace')").is_none());
         assert!(parse_sql_execute("EXECUTE lookup(U&'unterminated)").is_none());
         assert!(parse_sql_execute("EXECUTE lookup(U&'bad\\00xz')").is_none());
         assert!(parse_sql_execute("EXECUTE lookup(U&'bad!00xz' UESCAPE '!')").is_none());
