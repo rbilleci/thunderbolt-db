@@ -1,0 +1,26 @@
+=== psql extended sql prepared comment adjacent literal bind ===
+CREATE TABLE
+INSERT 0 3
+PREPARE
+ Column |  Type
+--------+---------
+ id     | integer
+ name   | text
+(2 rows)
+
+ id |     name
+----+--------------
+  1 | Ada Lovelace
+(1 row)
+
+ id |     name
+----+--------------
+  2 | Grace Hopper
+(1 row)
+
+psql:196_protocol_psql_extended_sql_prepared_comment_adjacent_literal_bind.sql:11: ERROR:  extended query protocol only supports relational SELECT
+DEALLOCATE
+ name
+-------
+ Linus
+(1 row)

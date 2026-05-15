@@ -6171,9 +6171,12 @@ fn strip_sql_comments(query: &str) -> String {
             for (next_idx, next_ch) in chars.by_ref() {
                 if next_ch == '\n' {
                     comment_end = next_idx + next_ch.len_utf8();
-                    stripped.push(' ');
+                    stripped.push('\n');
                     break;
                 }
+            }
+            if comment_end == query.len() {
+                stripped.push(' ');
             }
             last_pushed = comment_end;
             continue;
@@ -6184,8 +6187,12 @@ fn strip_sql_comments(query: &str) -> String {
             chars.next();
             let mut comment_end = query.len();
             let mut depth = 1usize;
+            let mut saw_newline = false;
             let mut previous_char: Option<char> = None;
             for (next_idx, next_ch) in chars.by_ref() {
+                if next_ch == '\n' {
+                    saw_newline = true;
+                }
                 if previous_char == Some('/') && next_ch == '*' {
                     depth = depth.saturating_add(1);
                     previous_char = None;
@@ -6202,7 +6209,7 @@ fn strip_sql_comments(query: &str) -> String {
                 }
                 previous_char = Some(next_ch);
             }
-            stripped.push(' ');
+            stripped.push(if saw_newline { '\n' } else { ' ' });
             last_pushed = comment_end;
         }
     }
@@ -8739,7 +8746,7 @@ mod tests {
         assert_eq!(expected_parameter_count(&prepared), 2);
         assert_eq!(
             bind_query_parameters(&prepared, &[Some("2".to_string()), Some("1".to_string())]),
-            Ok("SELECT id FROM people WHERE id = 2  ORDER BY id   LIMIT 1".to_string())
+            Ok("SELECT id FROM people WHERE id = 2 \nORDER BY id   LIMIT 1".to_string())
         );
         assert_eq!(
             strip_sql_comments("SELECT '$1 -- still text', id FROM people WHERE id = $1"),
@@ -11675,6 +11682,14 @@ mod tests {
                     Some("Grace Hopper".to_string()),
                 ],
             ))
+        );
+        assert_eq!(
+            parse_sql_execute("EXECUTE lookup('Ada' /* newline\ncomment */ ' Lovelace')"),
+            Some(("lookup".to_string(), vec![Some("Ada Lovelace".to_string())],))
+        );
+        assert_eq!(
+            parse_sql_execute("EXECUTE lookup('Grace' -- newline comment\n' Hopper')"),
+            Some(("lookup".to_string(), vec![Some("Grace Hopper".to_string())],))
         );
         assert_eq!(
             parse_sql_execute("EXECUTE lookup(pg_catalog.int4 '3', pg_catalog.text $$Grace$$)"),
