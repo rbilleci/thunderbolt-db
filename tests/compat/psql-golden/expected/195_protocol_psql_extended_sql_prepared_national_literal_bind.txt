@@ -1,0 +1,26 @@
+=== psql extended sql prepared national literal bind ===
+CREATE TABLE
+INSERT 0 3
+PREPARE
+ Column |  Type
+--------+---------
+ id     | integer
+ name   | text
+(2 rows)
+
+ id |    name
+----+-------------
+  1 | Ada's notes
+(1 row)
+
+ id |     name
+----+--------------
+  2 | Grace Hopper
+(1 row)
+
+psql:195_protocol_psql_extended_sql_prepared_national_literal_bind.sql:8: ERROR:  invalid input syntax for parameter type oid 23: "nope"
+DEALLOCATE
+    name
+-------------
+ Ada's notes
+(1 row)

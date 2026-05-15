@@ -1843,6 +1843,8 @@ fn decode_sql_execute_argument(arg: &str) -> Option<Option<String>> {
     if trimmed.starts_with('\'')
         || trimmed.starts_with("E'")
         || trimmed.starts_with("e'")
+        || trimmed.starts_with("N'")
+        || trimmed.starts_with("n'")
         || trimmed.starts_with("U&'")
         || trimmed.starts_with("u&'")
     {
@@ -1860,6 +1862,9 @@ fn decode_sql_execute_argument(arg: &str) -> Option<Option<String>> {
 
 fn decode_sql_execute_string_literal(arg: &str) -> Option<String> {
     if let Some(quoted) = arg.strip_prefix('\'') {
+        return decode_standard_sql_string_literal(quoted);
+    }
+    if let Some(quoted) = arg.strip_prefix("N'").or_else(|| arg.strip_prefix("n'")) {
         return decode_standard_sql_string_literal(quoted);
     }
     if arg.starts_with('$') {
@@ -2255,6 +2260,8 @@ fn strip_supported_sql_execute_typed_literal(arg: &str) -> Option<&str> {
     if value.starts_with('\'')
         || value.starts_with("E'")
         || value.starts_with("e'")
+        || value.starts_with("N'")
+        || value.starts_with("n'")
         || value.starts_with("U&'")
         || value.starts_with("u&'")
         || sql_dollar_quote_tag_at(value, 0).is_some()
@@ -11579,6 +11586,16 @@ mod tests {
                 "lookup".to_string(),
                 vec![
                     Some("Ada Lovelace".to_string()),
+                    Some("Grace Hopper".to_string()),
+                ],
+            ))
+        );
+        assert_eq!(
+            parse_sql_execute("EXECUTE lookup(N'Ada''s notes', text n'Grace Hopper')"),
+            Some((
+                "lookup".to_string(),
+                vec![
+                    Some("Ada's notes".to_string()),
                     Some("Grace Hopper".to_string()),
                 ],
             ))
