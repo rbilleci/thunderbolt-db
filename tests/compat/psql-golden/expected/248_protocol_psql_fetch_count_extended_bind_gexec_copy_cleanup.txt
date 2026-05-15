@@ -1,0 +1,16 @@
+=== psql fetch count extended bind gexec copy cleanup ===
+CREATE TABLE
+CREATE TABLE
+INSERT 0 3
+INSERT 0 2
+psql:248_protocol_psql_fetch_count_extended_bind_gexec_copy_cleanup.sql:7: ERROR:  COPY is not supported by the compatibility endpoint
+psql:248_protocol_psql_fetch_count_extended_bind_gexec_copy_cleanup.sql:9: ERROR:  cursor does not exist
+                                command
+-----------------------------------------------------------------------
+ SELECT name FROM fetch_count_ext_bind_gexec_copy_people WHERE id = 3;
+(1 row)
+
+ name
+------
+ Ada
+(1 row)
