@@ -1,0 +1,23 @@
+=== psql fetch count zero-param sql execute crosstabview cleanup ===
+CREATE TABLE
+INSERT 0 3
+PREPARE
+ bucket | Ada | Linus | Grace
+--------+-----+-------+-------
+ east   |   1 |       |     3
+ west   |     |     2 |
+(2 rows)
+
+psql:236_protocol_psql_fetch_count_zero_param_sql_execute_crosstabview_cleanup.sql:8: ERROR:  cursor does not exist
+ bucket | name  | id
+--------+-------+----
+ east   | Ada   |  1
+ west   | Linus |  2
+ east   | Grace |  3
+(3 rows)
+
+DEALLOCATE
+ name
+------
+ Ada
+(1 row)
