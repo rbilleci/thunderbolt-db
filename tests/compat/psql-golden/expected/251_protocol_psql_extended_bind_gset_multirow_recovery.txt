@@ -1,0 +1,8 @@
+=== psql extended bind gset multirow recovery ===
+CREATE TABLE
+INSERT 0 3
+psql:251_protocol_psql_extended_bind_gset_multirow_recovery.sql:4: error: more than one row returned for \gset
+ name
+------
+ Ada
+(1 row)
