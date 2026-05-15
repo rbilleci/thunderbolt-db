@@ -1,0 +1,19 @@
+=== psql fetch count zero-param sql execute gx cleanup ===
+CREATE TABLE
+INSERT 0 3
+PREPARE
+-[ RECORD 1 ]
+id   | 2
+name | Linus
+
+psql:235_protocol_psql_fetch_count_zero_param_sql_execute_gx_cleanup.sql:8: ERROR:  cursor does not exist
+ id | name
+----+-------
+  2 | Linus
+(1 row)
+
+DEALLOCATE
+ name
+------
+ Ada
+(1 row)
