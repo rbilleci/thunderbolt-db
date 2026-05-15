@@ -1,0 +1,11 @@
+=== psql extended bind gexec invalid recovery ===
+CREATE TABLE
+CREATE TABLE
+INSERT 0 3
+INSERT 0 1
+psql:262_protocol_psql_extended_bind_gexec_invalid_recovery.sql:6: ERROR:  invalid input syntax for parameter type oid 23: "not_an_int"
+psql:262_protocol_psql_extended_bind_gexec_invalid_recovery.sql:7: ERROR:  bind message has wrong number of parameters
+ name
+-------
+ Grace
+(1 row)
