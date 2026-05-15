@@ -1,0 +1,18 @@
+=== psql cursor sql execute negative limit gdesc ===
+CREATE TABLE
+INSERT 0 3
+PREPARE
+The command has no result, or the result has no columns.
+psql:208_protocol_psql_cursor_sql_execute_negative_limit_gdesc.sql:6: ERROR:  LIMIT must not be negative
+DECLARE CURSOR
+ id | name
+----+------
+  1 | Ada
+(1 row)
+
+CLOSE CURSOR
+DEALLOCATE
+ name
+-------
+ Grace
+(1 row)
