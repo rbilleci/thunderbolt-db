@@ -1,0 +1,11 @@
+=== psql fetch count gset cleanup ===
+CREATE TABLE
+INSERT 0 3
+fetched_name=Linus
+psql:224_protocol_psql_fetch_count_gset_cleanup.sql:8: ERROR:  cursor does not exist
+ id | name
+----+-------
+  1 | Ada
+  2 | Linus
+  3 | Grace
+(3 rows)
