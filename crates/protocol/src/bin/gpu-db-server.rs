@@ -758,6 +758,17 @@ fn handle_parse(
         )?;
         return Ok(true);
     }
+    if is_copy_statement(&query) {
+        write_error(
+            stream,
+            &ErrorField {
+                code: "0A000",
+                message: "COPY is not supported by the compatibility endpoint",
+                position: None,
+            },
+        )?;
+        return Ok(true);
+    }
     let parsed_cursor_query = parse_declare_cursor(&query).map(|(_, cursor_query)| cursor_query);
     let describe_query = parsed_cursor_query
         .as_ref()
@@ -10388,6 +10399,33 @@ mod tests {
 
         assert_eq!(read_backend_tags(&mut reader, 1), vec![b'E']);
         assert!(!session.prepared.contains_key("insert_people"));
+    }
+
+    #[test]
+    fn extended_parse_rejects_copy_explicitly_without_installing_statement() {
+        let mut session = Session::default();
+        let (mut writer, mut reader) = tcp_pair();
+
+        assert!(handle_parse(
+            &mut writer,
+            &mut session,
+            "copy_people".to_string(),
+            "/* comment */ COPY people TO STDOUT".to_string(),
+            Vec::new()
+        )
+        .unwrap());
+
+        let messages = read_backend_messages(&mut reader, 1);
+        assert_eq!(messages[0].0, b'E');
+        assert_eq!(
+            error_field_value(&messages[0].1, b'C'),
+            Some("0A000".to_string())
+        );
+        assert_eq!(
+            error_field_value(&messages[0].1, b'M'),
+            Some("COPY is not supported by the compatibility endpoint".to_string())
+        );
+        assert!(!session.prepared.contains_key("copy_people"));
     }
 
     #[test]

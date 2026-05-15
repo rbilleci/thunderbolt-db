@@ -1,0 +1,8 @@
+=== psql gdesc copy unsupported recovery ===
+CREATE TABLE
+INSERT 0 2
+psql:213_protocol_psql_gdesc_copy_unsupported.sql:4: ERROR:  COPY is not supported by the compatibility endpoint
+ name
+-------
+ Linus
+(1 row)
