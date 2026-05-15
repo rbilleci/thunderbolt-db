@@ -1,0 +1,16 @@
+=== psql fetch count bind cleanup recovery ===
+CREATE TABLE
+INSERT 0 3
+psql:216_protocol_psql_fetch_count_bind_cleanup_recovery.sql:5: ERROR:  parameterized cursor declarations are not supported
+psql:216_protocol_psql_fetch_count_bind_cleanup_recovery.sql:6: ERROR:  cursor does not exist
+ id | name
+----+-------
+  1 | Ada
+  2 | Linus
+  3 | Grace
+(3 rows)
+
+ name
+-------
+ Linus
+(1 row)
