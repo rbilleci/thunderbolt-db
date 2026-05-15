@@ -2490,22 +2490,32 @@ fn execute_declare_cursor(
         )?;
         return Ok(true);
     }
-    let Ok(Command::Select(select)) = parse_command(query) else {
-        write_error(
-            stream,
-            &ErrorField {
-                code: "0A000",
-                message: "cursor declarations only support relational SELECT",
-                position: None,
-            },
-        )?;
-        return Ok(true);
-    };
-    let result = match execute_select_result(session, &select) {
-        Ok(result) => result,
-        Err(error) => {
-            write_error(stream, &error)?;
+    let result = if let Some((prepared_name, parameters)) = parse_sql_execute(query) {
+        match execute_sql_prepared_result(session, &prepared_name, &parameters) {
+            Ok(result) => result,
+            Err(error) => {
+                write_error(stream, &error)?;
+                return Ok(true);
+            }
+        }
+    } else {
+        let Ok(Command::Select(select)) = parse_command(query) else {
+            write_error(
+                stream,
+                &ErrorField {
+                    code: "0A000",
+                    message: "cursor declarations only support relational SELECT or SQL EXECUTE",
+                    position: None,
+                },
+            )?;
             return Ok(true);
+        };
+        match execute_select_result(session, &select) {
+            Ok(result) => result,
+            Err(error) => {
+                write_error(stream, &error)?;
+                return Ok(true);
+            }
         }
     };
     session.cursors.insert(
@@ -12259,6 +12269,67 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn declare_cursor_executes_sql_prepared_select_results() {
+        let mut session = Session::default();
+        session.tables.insert(
+            "people".to_string(),
+            Table {
+                oid: FIRST_USER_RELATION_OID,
+                name: "people".to_string(),
+                columns: vec![
+                    CatalogColumn {
+                        attnum: 1,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "id".to_string(),
+                            ty: SqlType::Int4,
+                        },
+                    },
+                    CatalogColumn {
+                        attnum: 2,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "name".to_string(),
+                            ty: SqlType::Text,
+                        },
+                    },
+                ],
+                rows: vec![
+                    vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())],
+                    vec![SqlValue::Int4(2), SqlValue::Text("Grace".to_string())],
+                ],
+            },
+        );
+        session.prepared.insert(
+            "lookup".to_string(),
+            PreparedStatement::Sql(PreparedQuery {
+                query: "SELECT id, name FROM people WHERE id >= $1 ORDER BY id".to_string(),
+                parameter_type_oids: vec![SqlType::Int4.postgres_oid()],
+            }),
+        );
+        let (mut writer, mut reader) = tcp_pair();
+
+        assert!(!execute_declare_cursor(
+            &mut writer,
+            &mut session,
+            "_psql_cursor".to_string(),
+            "EXECUTE lookup(1)",
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'C']);
+        let cursor = session.cursors.get("_psql_cursor").unwrap();
+        assert_eq!(cursor.columns, vec![int4_column("id"), text_column("name")]);
+        assert_eq!(cursor.rows.len(), 2);
+
+        execute_fetch_forward(&mut writer, &mut session, "_psql_cursor", Some(1)).unwrap();
+        let messages = read_backend_messages(&mut reader, 3);
+        assert_eq!(
+            messages.iter().map(|(tag, _)| *tag).collect::<Vec<_>>(),
+            vec![b'T', b'D', b'C']
+        );
+        assert_eq!(messages[2].1, b"FETCH 1\0".to_vec());
+        assert_eq!(session.cursors.get("_psql_cursor").unwrap().position, 1);
     }
 
     #[test]

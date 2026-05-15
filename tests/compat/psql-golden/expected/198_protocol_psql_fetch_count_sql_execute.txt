@@ -1,0 +1,15 @@
+=== psql fetch_count sql prepared execute ===
+CREATE TABLE
+INSERT 0 3
+PREPARE
+ id | name
+----+-------
+  2 | Grace
+  3 | Linus
+(2 rows)
+
+DEALLOCATE
+ name
+------
+ Ada
+(1 row)
