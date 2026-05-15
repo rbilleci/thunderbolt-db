@@ -1,0 +1,13 @@
+=== psql extended bind gset error gdesc recovery ===
+CREATE TABLE
+INSERT 0 2
+psql:253_protocol_psql_extended_bind_gset_error_gdesc_recovery.sql:4: error: more than one row returned for \gset
+ Column | Type
+--------+------
+ name   | text
+(1 row)
+
+ name
+-------
+ Linus
+(1 row)
