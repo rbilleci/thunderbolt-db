@@ -2127,11 +2127,13 @@ where
 fn normalize_sql_execute_argument(mut arg: &str) -> Option<&str> {
     loop {
         let parenthesized = strip_parenthesized_sql_execute_argument(arg)?;
-        let cast_stripped = strip_supported_sql_execute_cast(parenthesized);
+        let cast_function_stripped = strip_supported_sql_execute_cast_function(parenthesized);
+        let cast_target = cast_function_stripped.unwrap_or(parenthesized);
+        let cast_stripped = strip_supported_sql_execute_cast(cast_target);
         let type_prefixed_stripped =
-            strip_supported_sql_execute_typed_literal(cast_stripped.unwrap_or(parenthesized));
+            strip_supported_sql_execute_typed_literal(cast_stripped.unwrap_or(cast_target));
         let normalized = type_prefixed_stripped
-            .unwrap_or_else(|| cast_stripped.unwrap_or(parenthesized))
+            .unwrap_or_else(|| cast_stripped.unwrap_or(cast_target))
             .trim();
         if normalized == arg {
             return Some(normalized);
@@ -2141,6 +2143,97 @@ fn normalize_sql_execute_argument(mut arg: &str) -> Option<&str> {
         }
         arg = normalized;
     }
+}
+
+fn strip_supported_sql_execute_cast_function(arg: &str) -> Option<&str> {
+    let arg = arg.trim();
+    let after_keyword = arg.get(4..)?;
+    if !arg
+        .get(..4)
+        .is_some_and(|keyword| keyword.eq_ignore_ascii_case("cast"))
+    {
+        return None;
+    }
+    let after_keyword = after_keyword.trim_start();
+    let inner = parenthesized_list(after_keyword)?.trim();
+    let as_idx = find_top_level_sql_execute_cast_as(inner)?;
+    let value = inner[..as_idx].trim();
+    let ty = inner[as_idx + 2..].trim();
+    if value.is_empty() {
+        return None;
+    }
+    match canonical_sql(ty).as_str() {
+        "int" | "int4" | "integer" | "pg_catalog.int4" | "pg_catalog.integer" | "text"
+        | "pg_catalog.text" => Some(value),
+        _ => None,
+    }
+}
+
+fn find_top_level_sql_execute_cast_as(input: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut in_quote = false;
+    let mut in_quoted_identifier = false;
+    let mut chars = input.char_indices().peekable();
+    while let Some((idx, ch)) = chars.next() {
+        if in_quote {
+            if ch == '\'' {
+                if chars.peek().is_some_and(|(_, next)| *next == '\'') {
+                    chars.next();
+                } else {
+                    in_quote = false;
+                }
+            }
+            continue;
+        }
+        if in_quoted_identifier {
+            if ch == '"' {
+                if chars.peek().is_some_and(|(_, next)| *next == '"') {
+                    chars.next();
+                } else {
+                    in_quoted_identifier = false;
+                }
+            }
+            continue;
+        }
+        if ch == '$' {
+            if let Some(tag) = sql_dollar_quote_tag_at(input, idx) {
+                let body_start = idx + tag.len();
+                let close_relative = input[body_start..].find(tag)?;
+                let close_end = body_start + close_relative + tag.len();
+                while chars
+                    .peek()
+                    .is_some_and(|(next_idx, _)| *next_idx < close_end)
+                {
+                    chars.next();
+                }
+            }
+            continue;
+        }
+        match ch {
+            '\'' => in_quote = true,
+            '"' => in_quoted_identifier = true,
+            '(' => depth = depth.saturating_add(1),
+            ')' => depth = depth.saturating_sub(1),
+            'a' | 'A'
+                if depth == 0
+                    && input[idx..]
+                        .get(..2)
+                        .is_some_and(|candidate| candidate.eq_ignore_ascii_case("as"))
+                    && input[..idx]
+                        .chars()
+                        .next_back()
+                        .is_some_and(char::is_whitespace)
+                    && input[idx + 2..]
+                        .chars()
+                        .next()
+                        .is_some_and(char::is_whitespace) =>
+            {
+                return Some(idx);
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn strip_supported_sql_execute_typed_literal(arg: &str) -> Option<&str> {
@@ -11562,6 +11655,27 @@ mod tests {
                 vec![Some("3".to_string()), Some("Grace".to_string())],
             ))
         );
+        assert_eq!(
+            parse_sql_execute("EXECUTE lookup(CAST($1 AS int4), CAST('Grace' AS text))"),
+            Some((
+                "lookup".to_string(),
+                vec![Some("$1".to_string()), Some("Grace".to_string())],
+            ))
+        );
+        assert_eq!(
+            parse_sql_execute(
+                "EXECUTE lookup(CAST(('3') AS pg_catalog.int4), CAST($1 AS pg_catalog.text))"
+            ),
+            Some((
+                "lookup".to_string(),
+                vec![Some("3".to_string()), Some("$1".to_string())],
+            ))
+        );
+        assert_eq!(
+            parse_sql_execute("EXECUTE lookup(CAST($tag$Ada AS text$tag$ AS text))"),
+            Some(("lookup".to_string(), vec![Some("Ada AS text".to_string())],))
+        );
+        assert!(parse_sql_execute("EXECUTE lookup(CAST($1 AS jsonb))").is_none());
         assert_eq!(
             parse_sql_execute("EXECUTE comment_lookup(/* id */ 2, /* name */ 'Ada' /* keep */)"),
             Some((
