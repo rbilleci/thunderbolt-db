@@ -1,0 +1,8 @@
+=== psql extended bind gset empty recovery ===
+CREATE TABLE
+INSERT 0 2
+psql:252_protocol_psql_extended_bind_gset_empty_recovery.sql:4: error: no rows returned for \gset
+ name
+-------
+ Linus
+(1 row)
