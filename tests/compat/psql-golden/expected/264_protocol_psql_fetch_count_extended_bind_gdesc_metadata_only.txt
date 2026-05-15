@@ -1,0 +1,20 @@
+=== psql fetch count extended bind gdesc metadata only ===
+CREATE TABLE
+INSERT 0 3
+ Column |  Type
+--------+---------
+ id     | integer
+ name   | text
+(2 rows)
+
+psql:264_protocol_psql_fetch_count_extended_bind_gdesc_metadata_only.sql:7: ERROR:  cursor does not exist
+ Column |  Type
+--------+---------
+ id     | integer
+ name   | text
+(2 rows)
+
+ name
+-------
+ Grace
+(1 row)
