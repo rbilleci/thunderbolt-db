@@ -1,0 +1,16 @@
+=== psql fetch count sql execute gset cleanup ===
+CREATE TABLE
+INSERT 0 3
+PREPARE
+fetched_name=Linus
+psql:227_protocol_psql_fetch_count_sql_execute_gset_cleanup.sql:9: ERROR:  cursor does not exist
+ name
+-------
+ Grace
+(1 row)
+
+DEALLOCATE
+ name
+------
+ Ada
+(1 row)
