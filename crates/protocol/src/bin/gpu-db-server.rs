@@ -868,9 +868,9 @@ fn handle_bind(
         )?;
         return Ok(true);
     }
-    if let Some(columns) = describe_extended_query_columns(session, &query.query) {
+    if let Some(result_column_count) = extended_query_result_column_count(session, &query.query) {
         let result_format_count = result_format_codes.len();
-        if !format_code_count_is_valid(result_format_count, columns.len()) {
+        if !format_code_count_is_valid(result_format_count, result_column_count) {
             write_error(
                 stream,
                 &ErrorField {
@@ -1645,6 +1645,14 @@ fn describe_extended_query_columns(session: &Session, query: &str) -> Option<Vec
         };
     }
     describe_query_columns(session, query)
+}
+
+fn extended_query_result_column_count(session: &Session, query: &str) -> Option<usize> {
+    if parse_declare_cursor(query).is_some() {
+        Some(0)
+    } else {
+        describe_extended_query_columns(session, query).map(|columns| columns.len())
+    }
 }
 
 fn bind_sql_execute_describe_parameters(
@@ -9334,6 +9342,83 @@ mod tests {
             cursor.rows[0],
             vec![Some("2".to_string()), Some("Linus".to_string())]
         );
+    }
+
+    #[test]
+    fn extended_cursor_declaration_rejects_malformed_result_format_arity() {
+        let mut session = Session::default();
+        session.tables.insert(
+            "people".to_string(),
+            Table {
+                oid: FIRST_USER_RELATION_OID,
+                name: "people".to_string(),
+                columns: vec![
+                    CatalogColumn {
+                        attnum: 1,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "id".to_string(),
+                            ty: SqlType::Int4,
+                        },
+                    },
+                    CatalogColumn {
+                        attnum: 2,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "name".to_string(),
+                            ty: SqlType::Text,
+                        },
+                    },
+                ],
+                rows: vec![
+                    vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())],
+                    vec![SqlValue::Int4(2), SqlValue::Text("Linus".to_string())],
+                ],
+            },
+        );
+        let (mut writer, mut reader) = tcp_pair();
+
+        assert!(!handle_parse(
+            &mut writer,
+            &mut session,
+            "cursor_stmt".to_string(),
+            "DECLARE raw_cursor CURSOR FOR SELECT id, name FROM people ORDER BY id".to_string(),
+            Vec::new(),
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'1']);
+
+        assert!(handle_bind(
+            &mut writer,
+            &mut session,
+            "bad_cursor_portal".to_string(),
+            "cursor_stmt".to_string(),
+            Vec::new(),
+            Vec::new(),
+            vec![0, 0],
+        )
+        .unwrap());
+        let messages = read_backend_messages(&mut reader, 1);
+        assert_eq!(messages[0].0, b'E');
+        assert_eq!(
+            error_field_value(&messages[0].1, b'C'),
+            Some("08P01".to_string())
+        );
+        assert!(!session.portals.contains_key("bad_cursor_portal"));
+
+        assert!(!handle_bind(
+            &mut writer,
+            &mut session,
+            "good_cursor_portal".to_string(),
+            "cursor_stmt".to_string(),
+            Vec::new(),
+            Vec::new(),
+            vec![0],
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'2']);
+
+        assert!(!handle_execute(&mut writer, &mut session, "good_cursor_portal", 0).unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'C']);
+        assert!(session.cursors.contains_key("raw_cursor"));
     }
 
     #[test]
