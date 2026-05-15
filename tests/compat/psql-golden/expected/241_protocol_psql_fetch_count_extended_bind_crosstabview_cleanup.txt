@@ -1,0 +1,15 @@
+=== psql fetch count extended bind crosstabview cleanup ===
+CREATE TABLE
+INSERT 0 3
+ bucket | Linus | Grace
+--------+-------+-------
+ west   |     2 |
+ east   |       |     3
+(2 rows)
+
+psql:241_protocol_psql_fetch_count_extended_bind_crosstabview_cleanup.sql:7: ERROR:  cursor does not exist
+ bucket | Ada | Linus | Grace
+--------+-----+-------+-------
+ east   |   1 |       |     3
+ west   |     |     2 |
+(2 rows)
