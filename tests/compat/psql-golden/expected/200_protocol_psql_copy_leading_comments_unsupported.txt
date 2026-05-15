@@ -1,0 +1,8 @@
+=== psql copy leading comments unsupported recovery ===
+CREATE TABLE
+INSERT 0 2
+psql:200_protocol_psql_copy_leading_comments_unsupported.sql:4: ERROR:  COPY is not supported by the compatibility endpoint
+ name
+-------
+ Linus
+(1 row)

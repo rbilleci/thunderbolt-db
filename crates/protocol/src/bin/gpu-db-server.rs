@@ -2586,7 +2586,8 @@ fn execute_move_forward(
 }
 
 fn is_copy_statement(statement: &str) -> bool {
-    canonical_sql(statement).starts_with("copy ")
+    strip_leading_sql_comments(statement.trim())
+        .is_some_and(|statement| canonical_sql(statement).starts_with("copy "))
 }
 
 fn execute_statement(
@@ -6748,6 +6749,22 @@ mod tests {
             canonical_sql("  SELECT   1   AS One ; ; "),
             "select 1 as one"
         );
+    }
+
+    #[test]
+    fn copy_statement_detection_skips_leading_comments() {
+        assert!(is_copy_statement(
+            "/* copy boundary */ -- line comment\nCOPY copy_people TO STDOUT;"
+        ));
+        assert!(is_copy_statement(
+            "/* outer /* nested */ done */ COPY copy_people FROM STDIN;"
+        ));
+        assert!(!is_copy_statement(
+            "/* copy-looking comment */ SELECT 'COPY people TO STDOUT'"
+        ));
+        assert!(!is_copy_statement(
+            "/* unterminated COPY copy_people TO STDOUT"
+        ));
     }
 
     #[test]
