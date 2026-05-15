@@ -1,0 +1,8 @@
+=== psql fetch count extended bind gx unsupported cleanup ===
+CREATE TABLE
+INSERT 0 3
+psql:240_protocol_psql_fetch_count_extended_bind_gx_unsupported_cleanup.sql:5: ERROR:  parameterized cursor declarations are not supported
+psql:240_protocol_psql_fetch_count_extended_bind_gx_unsupported_cleanup.sql:7: ERROR:  cursor does not exist
+-[ RECORD 1 ]
+id   | 1
+name | Ada
