@@ -1,0 +1,17 @@
+=== psql cursor sql execute outer bind ===
+CREATE TABLE
+INSERT 0 3
+PREPARE
+The command has no result, or the result has no columns.
+DECLARE CURSOR
+ id | name
+----+-------
+  2 | Linus
+(1 row)
+
+CLOSE CURSOR
+DEALLOCATE
+ name
+------
+ Ada
+(1 row)
