@@ -1,0 +1,9 @@
+=== psql extended bind crosstabview invalid recovery ===
+CREATE TABLE
+INSERT 0 3
+psql:260_protocol_psql_extended_bind_crosstabview_invalid_recovery.sql:4: ERROR:  invalid input syntax for parameter type oid 23: "not_an_int"
+ bucket | Linus | Grace
+--------+-------+-------
+ west   |     2 |
+ east   |       |     3
+(2 rows)
