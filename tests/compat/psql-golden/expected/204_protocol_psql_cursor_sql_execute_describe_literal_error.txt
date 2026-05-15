@@ -1,0 +1,17 @@
+=== psql cursor sql execute describe literal error ===
+CREATE TABLE
+INSERT 0 2
+PREPARE
+psql:204_protocol_psql_cursor_sql_execute_describe_literal_error.sql:5: ERROR:  invalid input syntax for parameter type oid 23: "not-an-int"
+DECLARE CURSOR
+ name
+-------
+ Linus
+(1 row)
+
+CLOSE CURSOR
+DEALLOCATE
+ name
+------
+ Ada
+(1 row)

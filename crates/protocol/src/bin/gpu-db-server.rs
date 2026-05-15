@@ -758,13 +758,13 @@ fn handle_parse(
         write_error(stream, &error)?;
         return Ok(true);
     }
-    if let Some(error) = sql_execute_describe_error(session, &query) {
-        write_error(stream, &error)?;
-        return Ok(true);
-    }
     let describe_query = parse_declare_cursor(&query)
         .map(|(_, cursor_query)| cursor_query)
         .unwrap_or_else(|| query.clone());
+    if let Some(error) = sql_execute_describe_error(session, &describe_query) {
+        write_error(stream, &error)?;
+        return Ok(true);
+    }
     if describe_query_columns(session, &describe_query).is_none()
         && describe_extended_query_columns(session, &describe_query).is_none()
         && describe_extended_query_columns(session, &query).is_none()
@@ -11772,6 +11772,58 @@ mod tests {
         assert!(String::from_utf8_lossy(&messages[0].1)
             .contains("invalid input syntax for parameter type oid 23: \"not-an-int\""));
         assert!(!session.prepared.contains_key(""));
+    }
+
+    #[test]
+    fn extended_cursor_sql_execute_describe_reports_literal_parameter_errors() {
+        let mut session = Session::default();
+        session.tables.insert(
+            "people".to_string(),
+            Table {
+                oid: FIRST_USER_RELATION_OID,
+                name: "people".to_string(),
+                columns: vec![
+                    CatalogColumn {
+                        attnum: 1,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "id".to_string(),
+                            ty: SqlType::Int4,
+                        },
+                    },
+                    CatalogColumn {
+                        attnum: 2,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "name".to_string(),
+                            ty: SqlType::Text,
+                        },
+                    },
+                ],
+                rows: Vec::new(),
+            },
+        );
+        session.prepared.insert(
+            "lookup".to_string(),
+            PreparedStatement::Sql(PreparedQuery {
+                query: "SELECT name FROM people WHERE id = $1".to_string(),
+                parameter_type_oids: vec![SqlType::Int4.postgres_oid()],
+            }),
+        );
+        let (mut writer, mut reader) = tcp_pair();
+
+        assert!(handle_parse(
+            &mut writer,
+            &mut session,
+            String::new(),
+            "DECLARE lookup_cursor CURSOR FOR EXECUTE lookup('not-an-int')".to_string(),
+            Vec::new(),
+        )
+        .unwrap());
+        let messages = read_backend_messages(&mut reader, 1);
+        assert_eq!(messages[0].0, b'E');
+        assert!(String::from_utf8_lossy(&messages[0].1)
+            .contains("invalid input syntax for parameter type oid 23: \"not-an-int\""));
+        assert!(!session.prepared.contains_key(""));
+        assert!(!session.cursors.contains_key("lookup_cursor"));
     }
 
     #[test]
