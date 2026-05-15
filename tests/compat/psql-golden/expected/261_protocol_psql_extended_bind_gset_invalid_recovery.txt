@@ -1,0 +1,9 @@
+=== psql extended bind gset invalid recovery ===
+CREATE TABLE
+INSERT 0 3
+psql:261_protocol_psql_extended_bind_gset_invalid_recovery.sql:4: ERROR:  invalid input syntax for parameter type oid 23: "not_an_int"
+2 Linus
+ name
+-------
+ Linus
+(1 row)
