@@ -2383,10 +2383,27 @@ fn find_top_level_sql_execute_cast(input: &str) -> Option<usize> {
 fn parenthesized_list_is_balanced(input: &str) -> bool {
     let mut depth = 0usize;
     let mut in_quote = false;
-    let mut chars = input.chars().peekable();
-    while let Some(ch) = chars.next() {
+    let mut chars = input.char_indices().peekable();
+    while let Some((idx, ch)) = chars.next() {
+        if !in_quote && ch == '$' {
+            let Some(tag) = sql_dollar_quote_tag_at(input, idx) else {
+                continue;
+            };
+            let body_start = idx + tag.len();
+            let Some(close_relative) = input[body_start..].find(tag) else {
+                return false;
+            };
+            let close_end = body_start + close_relative + tag.len();
+            while chars
+                .peek()
+                .is_some_and(|(next_idx, _)| *next_idx < close_end)
+            {
+                chars.next();
+            }
+            continue;
+        }
         if ch == '\'' {
-            if in_quote && chars.peek() == Some(&'\'') {
+            if in_quote && chars.peek().is_some_and(|(_, next)| *next == '\'') {
                 chars.next();
                 continue;
             }
@@ -11742,6 +11759,18 @@ mod tests {
                 vec![
                     Some("Ada::literal".to_string()),
                     Some("Grace::literal".to_string()),
+                ],
+            ))
+        );
+        assert_eq!(
+            parse_sql_execute(
+                "EXECUTE lookup(($tag$Ada (literal$tag$), CAST(($$Grace ) literal$$) AS text))"
+            ),
+            Some((
+                "lookup".to_string(),
+                vec![
+                    Some("Ada (literal".to_string()),
+                    Some("Grace ) literal".to_string()),
                 ],
             ))
         );
