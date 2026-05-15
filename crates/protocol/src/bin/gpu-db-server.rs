@@ -6405,10 +6405,40 @@ fn describe_query_columns(session: &Session, query: &str) -> Option<Vec<Column>>
 fn describe_parameterized_select_shape(query: &str) -> Option<(String, SelectProjection)> {
     let canonical = canonical_sql(query);
     let dummy_query = replace_parameter_placeholders_with_dummy_literals(&canonical);
-    let Command::Select(select) = parse_command(&dummy_query).ok()? else {
-        return None;
+    let select = match parse_command(&dummy_query) {
+        Ok(Command::Select(select)) => select,
+        Err(ParseError::NegativeLimit) => {
+            let describe_query = replace_negative_limit_with_zero(&dummy_query)?;
+            let Ok(Command::Select(select)) = parse_command(&describe_query) else {
+                return None;
+            };
+            select
+        }
+        Ok(_) | Err(_) => return None,
     };
     Some((select.table, select.projection))
+}
+
+fn replace_negative_limit_with_zero(query: &str) -> Option<String> {
+    let limit_pos = query.rfind(" limit ")?;
+    let after_limit = &query[limit_pos + " limit ".len()..];
+    let trimmed = after_limit.trim_start();
+    let minus_len = trimmed.strip_prefix('-')?.len();
+    let digit_count = trimmed[1..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .count();
+    if digit_count == 0 {
+        return None;
+    }
+    let leading_ws_len = after_limit.len() - trimmed.len();
+    let start = limit_pos + " limit ".len() + leading_ws_len;
+    let end = start + (trimmed.len() - minus_len) + digit_count;
+    let mut rewritten = String::with_capacity(query.len());
+    rewritten.push_str(&query[..start]);
+    rewritten.push('0');
+    rewritten.push_str(&query[end..]);
+    Some(rewritten)
 }
 
 fn catalog_attribute_query_table(canonical: &str) -> Option<String> {
@@ -8669,6 +8699,13 @@ mod tests {
             describe_query_columns(
                 &session,
                 "SELECT name, id FROM people WHERE id = $1 ORDER BY name DESC LIMIT 1",
+            ),
+            Some(vec![text_column("name"), int4_column("id")])
+        );
+        assert_eq!(
+            describe_query_columns(
+                &session,
+                "SELECT name, id FROM people WHERE id = $1 ORDER BY name DESC LIMIT -1",
             ),
             Some(vec![text_column("name"), int4_column("id")])
         );

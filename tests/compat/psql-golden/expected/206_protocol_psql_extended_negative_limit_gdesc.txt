@@ -1,0 +1,20 @@
+=== psql extended negative limit gdesc ===
+CREATE TABLE
+INSERT 0 3
+ Column |  Type
+--------+---------
+ id     | integer
+ name   | text
+(2 rows)
+
+psql:206_protocol_psql_extended_negative_limit_gdesc.sql:5: ERROR:  LIMIT must not be negative
+ id | name
+----+-------
+  1 | Ada
+  2 | Linus
+(2 rows)
+
+ name
+-------
+ Grace
+(1 row)
