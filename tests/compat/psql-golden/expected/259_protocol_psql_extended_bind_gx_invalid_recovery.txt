@@ -1,0 +1,10 @@
+=== psql extended bind gx invalid recovery ===
+CREATE TABLE
+INSERT 0 3
+psql:259_protocol_psql_extended_bind_gx_invalid_recovery.sql:4: ERROR:  invalid input syntax for parameter type oid 23: "not_an_int"
+-[ RECORD 1 ]
+id   | 2
+name | Linus
+-[ RECORD 2 ]
+id   | 3
+name | Grace
