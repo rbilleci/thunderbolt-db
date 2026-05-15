@@ -1,0 +1,27 @@
+=== psql fetch count sql execute gexec cleanup ===
+CREATE TABLE
+CREATE TABLE
+INSERT 0 3
+INSERT 0 2
+PREPARE
+ name
+-------
+ Linus
+(1 row)
+
+ name
+-------
+ Grace
+(1 row)
+
+psql:232_protocol_psql_fetch_count_sql_execute_gexec_cleanup.sql:10: ERROR:  cursor does not exist
+                           command
+-------------------------------------------------------------
+ SELECT name FROM fetch_count_sql_gexec_people WHERE id = 3;
+(1 row)
+
+DEALLOCATE
+ name
+------
+ Ada
+(1 row)
