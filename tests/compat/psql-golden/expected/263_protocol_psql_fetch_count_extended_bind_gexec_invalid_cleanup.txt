@@ -1,0 +1,11 @@
+=== psql fetch count extended bind gexec invalid cleanup ===
+CREATE TABLE
+CREATE TABLE
+INSERT 0 3
+INSERT 0 1
+psql:263_protocol_psql_fetch_count_extended_bind_gexec_invalid_cleanup.sql:7: ERROR:  invalid input syntax for parameter type oid 23: "not_an_int"
+psql:263_protocol_psql_fetch_count_extended_bind_gexec_invalid_cleanup.sql:9: ERROR:  cursor does not exist
+ name
+-------
+ Grace
+(1 row)
