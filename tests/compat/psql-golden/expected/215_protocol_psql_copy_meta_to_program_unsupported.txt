@@ -1,0 +1,8 @@
+=== psql copy meta to program unsupported recovery ===
+CREATE TABLE
+INSERT 0 2
+psql:215_protocol_psql_copy_meta_to_program_unsupported.sql:4: ERROR:  COPY is not supported by the compatibility endpoint
+ name
+------
+ Ada
+(1 row)
