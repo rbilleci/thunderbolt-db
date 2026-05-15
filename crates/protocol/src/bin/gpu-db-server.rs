@@ -758,15 +758,17 @@ fn handle_parse(
         )?;
         return Ok(true);
     }
-    if let Some(error) =
-        sql_execute_parameter_type_mapping_error(session, &query, parameter_type_oids.as_slice())
-    {
-        write_error(stream, &error)?;
-        return Ok(true);
-    }
     let describe_query = parse_declare_cursor(&query)
         .map(|(_, cursor_query)| cursor_query)
         .unwrap_or_else(|| query.clone());
+    if let Some(error) = sql_execute_parameter_type_mapping_error(
+        session,
+        &describe_query,
+        parameter_type_oids.as_slice(),
+    ) {
+        write_error(stream, &error)?;
+        return Ok(true);
+    }
     if let Some(error) = sql_execute_describe_error(session, &describe_query) {
         write_error(stream, &error)?;
         return Ok(true);
@@ -9364,6 +9366,111 @@ mod tests {
         assert_eq!(
             cursor.rows[0],
             vec![Some("2".to_string()), Some("Linus".to_string())]
+        );
+    }
+
+    #[test]
+    fn extended_cursor_sql_execute_parse_rejects_conflicting_explicit_oid() {
+        let mut session = Session::default();
+        session.tables.insert(
+            "people".to_string(),
+            Table {
+                oid: FIRST_USER_RELATION_OID,
+                name: "people".to_string(),
+                columns: vec![
+                    CatalogColumn {
+                        attnum: 1,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "id".to_string(),
+                            ty: SqlType::Int4,
+                        },
+                    },
+                    CatalogColumn {
+                        attnum: 2,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "name".to_string(),
+                            ty: SqlType::Text,
+                        },
+                    },
+                ],
+                rows: vec![vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())]],
+            },
+        );
+        session.prepared.insert(
+            "lookup".to_string(),
+            PreparedStatement::Sql(PreparedQuery {
+                query: "SELECT id, name FROM people WHERE id >= $1 ORDER BY id".to_string(),
+                parameter_type_oids: vec![SqlType::Int4.postgres_oid()],
+            }),
+        );
+        let (mut writer, mut reader) = tcp_pair();
+        let mut extended_error_pending = false;
+
+        handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::Parse {
+                statement_name: "cursor_exec_stmt".to_string(),
+                query: "DECLARE raw_exec_cursor CURSOR FOR EXECUTE lookup($1)".to_string(),
+                parameter_type_oids: vec![SqlType::Text.postgres_oid()],
+            },
+        )
+        .unwrap();
+        let messages = read_backend_messages(&mut reader, 1);
+        assert_eq!(messages[0].0, b'E');
+        assert_eq!(
+            error_field_value(&messages[0].1, b'C'),
+            Some("42P08".to_string())
+        );
+        assert_eq!(
+            error_field_value(&messages[0].1, b'M'),
+            Some("inconsistent parameter types for SQL EXECUTE placeholder".to_string())
+        );
+        assert!(extended_error_pending);
+        assert!(!session.prepared.contains_key("cursor_exec_stmt"));
+
+        handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::Bind {
+                portal_name: "skipped_cursor_portal".to_string(),
+                statement_name: "cursor_exec_stmt".to_string(),
+                parameter_format_codes: Vec::new(),
+                parameters: vec![Some(b"1".to_vec())],
+                result_format_codes: Vec::new(),
+            },
+        )
+        .unwrap();
+        assert!(!session.portals.contains_key("skipped_cursor_portal"));
+
+        handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::Sync,
+        )
+        .unwrap();
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'Z']);
+        assert!(!extended_error_pending);
+
+        assert!(!handle_parse(
+            &mut writer,
+            &mut session,
+            "cursor_exec_stmt".to_string(),
+            "DECLARE raw_exec_cursor CURSOR FOR EXECUTE lookup($1)".to_string(),
+            Vec::new(),
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'1']);
+        let query = match session.prepared.get("cursor_exec_stmt") {
+            Some(PreparedStatement::Extended(query)) => query,
+            _ => panic!("expected recovered extended cursor declaration statement"),
+        };
+        assert_eq!(
+            query.parameter_type_oids,
+            vec![SqlType::Int4.postgres_oid()]
         );
     }
 
