@@ -2322,20 +2322,46 @@ fn strip_supported_sql_execute_cast(arg: &str) -> Option<&str> {
 fn find_top_level_sql_execute_cast(input: &str) -> Option<usize> {
     let mut depth = 0usize;
     let mut in_quote = false;
+    let mut in_quoted_identifier = false;
     let mut chars = input.char_indices().peekable();
     while let Some((idx, ch)) = chars.next() {
-        if ch == '\'' {
-            if in_quote && chars.peek() == Some(&(idx + ch.len_utf8(), '\'')) {
-                chars.next();
-                continue;
+        if in_quote {
+            if ch == '\'' {
+                if chars.peek().is_some_and(|(_, next)| *next == '\'') {
+                    chars.next();
+                } else {
+                    in_quote = false;
+                }
             }
-            in_quote = !in_quote;
             continue;
         }
-        if in_quote {
+        if in_quoted_identifier {
+            if ch == '"' {
+                if chars.peek().is_some_and(|(_, next)| *next == '"') {
+                    chars.next();
+                } else {
+                    in_quoted_identifier = false;
+                }
+            }
+            continue;
+        }
+        if ch == '$' {
+            if let Some(tag) = sql_dollar_quote_tag_at(input, idx) {
+                let body_start = idx + tag.len();
+                let close_relative = input[body_start..].find(tag)?;
+                let close_end = body_start + close_relative + tag.len();
+                while chars
+                    .peek()
+                    .is_some_and(|(next_idx, _)| *next_idx < close_end)
+                {
+                    chars.next();
+                }
+            }
             continue;
         }
         match ch {
+            '\'' => in_quote = true,
+            '"' => in_quoted_identifier = true,
             '(' => depth = depth.saturating_add(1),
             ')' => depth = depth.saturating_sub(1),
             ':' if depth == 0 && chars.peek().is_some_and(|(_, next)| *next == ':') => {
@@ -11674,6 +11700,18 @@ mod tests {
         assert_eq!(
             parse_sql_execute("EXECUTE lookup(CAST($tag$Ada AS text$tag$ AS text))"),
             Some(("lookup".to_string(), vec![Some("Ada AS text".to_string())],))
+        );
+        assert_eq!(
+            parse_sql_execute(
+                "EXECUTE lookup($tag$Ada::literal$tag$::text, $$Grace::literal$$::pg_catalog.text)"
+            ),
+            Some((
+                "lookup".to_string(),
+                vec![
+                    Some("Ada::literal".to_string()),
+                    Some("Grace::literal".to_string()),
+                ],
+            ))
         );
         assert!(parse_sql_execute("EXECUTE lookup(CAST($1 AS jsonb))").is_none());
         assert_eq!(
