@@ -1,0 +1,20 @@
+=== psql extended sql prepared describe literal error ===
+CREATE TABLE
+INSERT 0 2
+PREPARE
+psql:202_protocol_psql_extended_sql_prepared_describe_literal_error.sql:5: ERROR:  invalid input syntax for parameter type oid 23: "not-an-int"
+ Column | Type
+--------+------
+ name   | text
+(1 row)
+
+ name
+-------
+ Linus
+(1 row)
+
+DEALLOCATE
+ name
+------
+ Ada
+(1 row)

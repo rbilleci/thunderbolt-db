@@ -758,6 +758,10 @@ fn handle_parse(
         write_error(stream, &error)?;
         return Ok(true);
     }
+    if let Some(error) = sql_execute_describe_error(session, &query) {
+        write_error(stream, &error)?;
+        return Ok(true);
+    }
     let describe_query = parse_declare_cursor(&query)
         .map(|(_, cursor_query)| cursor_query)
         .unwrap_or_else(|| query.clone());
@@ -1630,6 +1634,7 @@ fn describe_extended_query_columns(session: &Session, query: &str) -> Option<Vec
             }
             Some(PreparedStatement::Sql(prepared)) => {
                 bind_sql_execute_describe_parameters(prepared, &parameters)
+                    .ok()
                     .and_then(|describe_parameters| {
                         bind_query_parameters(prepared, &describe_parameters).ok()
                     })
@@ -1645,9 +1650,9 @@ fn describe_extended_query_columns(session: &Session, query: &str) -> Option<Vec
 fn bind_sql_execute_describe_parameters(
     prepared: &PreparedQuery,
     parameters: &[Option<String>],
-) -> Option<Vec<Option<String>>> {
+) -> Result<Vec<Option<String>>, BindParameterError> {
     if expected_parameter_count(prepared) != parameters.len() {
-        return None;
+        return Err(BindParameterError::CountMismatch);
     }
     parameters
         .iter()
@@ -1655,11 +1660,25 @@ fn bind_sql_execute_describe_parameters(
         .map(|(idx, parameter)| match parameter {
             Some(value) if sql_execute_argument_placeholder_index(value).is_some() => {
                 let oid = prepared.parameter_type_oids.get(idx).copied().unwrap_or(0);
-                Some(Some(sql_execute_describe_dummy_value(oid).to_string()))
+                Ok(Some(sql_execute_describe_dummy_value(oid).to_string()))
             }
-            parameter => Some(parameter.clone()),
+            parameter => Ok(parameter.clone()),
         })
         .collect()
+}
+
+fn sql_execute_describe_error(session: &Session, query: &str) -> Option<ErrorField> {
+    let (name, parameters) = parse_sql_execute(query)?;
+    let Some(PreparedStatement::Sql(prepared)) = session.prepared.get(&name) else {
+        return None;
+    };
+    let describe_parameters = match bind_sql_execute_describe_parameters(prepared, &parameters) {
+        Ok(parameters) => parameters,
+        Err(error) => return Some(sql_execute_parameter_error_field(error)),
+    };
+    bind_query_parameters(prepared, &describe_parameters)
+        .err()
+        .map(sql_execute_parameter_error_field)
 }
 
 fn sql_execute_describe_dummy_value(type_oid: u32) -> &'static str {
@@ -11562,6 +11581,57 @@ mod tests {
             vec![b'D', b'C']
         );
         assert_eq!(messages[1].1, b"SELECT 1\0".to_vec());
+    }
+
+    #[test]
+    fn extended_sql_execute_describe_reports_literal_parameter_errors() {
+        let mut session = Session::default();
+        session.tables.insert(
+            "people".to_string(),
+            Table {
+                oid: FIRST_USER_RELATION_OID,
+                name: "people".to_string(),
+                columns: vec![
+                    CatalogColumn {
+                        attnum: 1,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "id".to_string(),
+                            ty: SqlType::Int4,
+                        },
+                    },
+                    CatalogColumn {
+                        attnum: 2,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "name".to_string(),
+                            ty: SqlType::Text,
+                        },
+                    },
+                ],
+                rows: Vec::new(),
+            },
+        );
+        session.prepared.insert(
+            "lookup".to_string(),
+            PreparedStatement::Sql(PreparedQuery {
+                query: "SELECT name FROM people WHERE id = $1".to_string(),
+                parameter_type_oids: vec![SqlType::Int4.postgres_oid()],
+            }),
+        );
+        let (mut writer, mut reader) = tcp_pair();
+
+        assert!(handle_parse(
+            &mut writer,
+            &mut session,
+            String::new(),
+            "EXECUTE lookup('not-an-int')".to_string(),
+            Vec::new(),
+        )
+        .unwrap());
+        let messages = read_backend_messages(&mut reader, 1);
+        assert_eq!(messages[0].0, b'E');
+        assert!(String::from_utf8_lossy(&messages[0].1)
+            .contains("invalid input syntax for parameter type oid 23: \"not-an-int\""));
+        assert!(!session.prepared.contains_key(""));
     }
 
     #[test]
