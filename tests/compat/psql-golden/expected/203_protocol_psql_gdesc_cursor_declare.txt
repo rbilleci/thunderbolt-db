@@ -1,0 +1,15 @@
+=== psql gdesc cursor declaration no-data ===
+CREATE TABLE
+INSERT 0 2
+The command has no result, or the result has no columns.
+DECLARE CURSOR
+ id | name
+----+------
+  1 | Ada
+(1 row)
+
+CLOSE CURSOR
+ name
+-------
+ Grace
+(1 row)

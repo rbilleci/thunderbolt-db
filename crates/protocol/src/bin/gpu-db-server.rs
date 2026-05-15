@@ -976,6 +976,9 @@ fn handle_describe(
                 Ok(false)
             } else {
                 write_no_data(stream)?;
+                if let Some(portal) = session.portals.get_mut(name) {
+                    portal.described = true;
+                }
                 Ok(false)
             }
         }
@@ -11363,6 +11366,58 @@ mod tests {
         );
         assert_eq!(messages[1].1, b"SELECT 1\0".to_vec());
         assert_eq!(session.portals.get("people_portal").unwrap().position, 3);
+    }
+
+    #[test]
+    fn extended_describe_nodata_portal_marks_portal_described() {
+        let mut session = Session::default();
+        session.tables.insert(
+            "people".to_string(),
+            Table {
+                oid: FIRST_USER_RELATION_OID,
+                name: "people".to_string(),
+                columns: vec![CatalogColumn {
+                    attnum: 1,
+                    def: gpu_db_protocol::ColumnDef {
+                        name: "id".to_string(),
+                        ty: SqlType::Int4,
+                    },
+                }],
+                rows: vec![vec![SqlValue::Int4(1)]],
+            },
+        );
+        session.replace_extended_portal(
+            "cursor_declare_portal".to_string(),
+            Portal {
+                statement_name: "cursor_declare_stmt".to_string(),
+                query: PreparedQuery {
+                    query: "DECLARE described_cursor CURSOR FOR SELECT id FROM people".to_string(),
+                    parameter_type_oids: Vec::new(),
+                },
+                parameters: Vec::new(),
+                described: false,
+                result: None,
+                position: 0,
+            },
+        );
+        let (mut writer, mut reader) = tcp_pair();
+
+        assert!(!handle_describe(
+            &mut writer,
+            &mut session,
+            DescribeTarget::Portal,
+            "cursor_declare_portal"
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'n']);
+        let portal = session.portals.get("cursor_declare_portal").unwrap();
+        assert!(portal.described);
+        assert!(portal.result.is_none());
+        assert_eq!(portal.position, 0);
+
+        assert!(!handle_execute(&mut writer, &mut session, "cursor_declare_portal", 0).unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'C']);
+        assert!(session.cursors.contains_key("described_cursor"));
     }
 
     #[test]
