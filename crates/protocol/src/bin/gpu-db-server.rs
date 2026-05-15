@@ -323,6 +323,7 @@ struct Portal {
     described: bool,
     result: Option<SelectResult>,
     position: usize,
+    completed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -920,6 +921,7 @@ fn handle_bind(
             described: false,
             result: None,
             position: 0,
+            completed: false,
         },
     );
     write_bind_complete(stream)?;
@@ -1134,7 +1136,13 @@ fn execute_portal_batch(
     if portal.position < result.rows.len() {
         write_portal_suspended(stream)
     } else {
-        write_command_complete(stream, &format!("SELECT {emitted_count}"))
+        let completion_count = if portal.completed {
+            emitted_count
+        } else {
+            portal.position
+        };
+        portal.completed = true;
+        write_command_complete(stream, &format!("SELECT {completion_count}"))
     }
 }
 
@@ -9419,6 +9427,7 @@ mod tests {
                 described: false,
                 result: None,
                 position: 0,
+                completed: false,
             },
         );
         session.portals.insert(
@@ -9430,6 +9439,7 @@ mod tests {
                 described: false,
                 result: None,
                 position: 0,
+                completed: false,
             },
         );
 
@@ -9460,6 +9470,7 @@ mod tests {
                 described: false,
                 result: None,
                 position: 0,
+                completed: false,
             },
         );
         let (mut writer, mut reader) = tcp_pair();
@@ -9542,6 +9553,7 @@ mod tests {
                 described: false,
                 result: None,
                 position: 0,
+                completed: false,
             },
         );
         let (mut writer, mut reader) = tcp_pair();
@@ -9633,6 +9645,7 @@ mod tests {
                 described: false,
                 result: None,
                 position: 0,
+                completed: false,
             },
         );
         let (mut writer, mut reader) = tcp_pair();
@@ -10144,6 +10157,7 @@ mod tests {
                 described: false,
                 result: None,
                 position: 0,
+                completed: false,
             },
         );
 
@@ -10427,6 +10441,7 @@ mod tests {
                 described: false,
                 result: None,
                 position: 0,
+                completed: false,
             },
         );
         let (mut writer, mut reader) = tcp_pair();
@@ -10489,6 +10504,7 @@ mod tests {
                 described: false,
                 result: None,
                 position: 0,
+                completed: false,
             },
         );
         let (mut writer, mut reader) = tcp_pair();
@@ -11234,6 +11250,7 @@ mod tests {
                     ],
                 }),
                 position: 0,
+                completed: false,
             },
         );
         let (mut writer, mut reader) = tcp_pair();
@@ -11250,8 +11267,15 @@ mod tests {
             messages.iter().map(|(tag, _)| *tag).collect::<Vec<_>>(),
             vec![b'D', b'C']
         );
-        assert_eq!(messages[1].1, b"SELECT 1\0".to_vec());
-        assert_eq!(session.portals.get("people_portal").unwrap().position, 3);
+        assert_eq!(messages[1].1, b"SELECT 3\0".to_vec());
+        let portal = session.portals.get("people_portal").unwrap();
+        assert_eq!(portal.position, 3);
+        assert!(portal.completed);
+
+        execute_portal_batch(&mut writer, &mut session, "people_portal", 1).unwrap();
+        let messages = read_backend_messages(&mut reader, 1);
+        assert_eq!(messages[0].0, b'C');
+        assert_eq!(messages[0].1, b"SELECT 0\0".to_vec());
     }
 
     #[test]
@@ -11297,6 +11321,7 @@ mod tests {
                 described: false,
                 result: None,
                 position: 0,
+                completed: false,
             },
         );
         let (mut writer, mut reader) = tcp_pair();
@@ -11325,8 +11350,10 @@ mod tests {
             messages.iter().map(|(tag, _)| *tag).collect::<Vec<_>>(),
             vec![b'D', b'C']
         );
-        assert_eq!(messages[1].1, b"SELECT 1\0".to_vec());
-        assert_eq!(session.portals.get("people_portal").unwrap().position, 3);
+        assert_eq!(messages[1].1, b"SELECT 3\0".to_vec());
+        let portal = session.portals.get("people_portal").unwrap();
+        assert_eq!(portal.position, 3);
+        assert!(portal.completed);
     }
 
     #[test]
@@ -11359,6 +11386,7 @@ mod tests {
                 described: false,
                 result: None,
                 position: 0,
+                completed: false,
             },
         );
         let (mut writer, mut reader) = tcp_pair();
@@ -11415,6 +11443,7 @@ mod tests {
                 described: false,
                 result: None,
                 position: 0,
+                completed: false,
             },
         );
         let (mut writer, mut reader) = tcp_pair();
@@ -11468,6 +11497,7 @@ mod tests {
                 described: false,
                 result: None,
                 position: 0,
+                completed: false,
             },
         );
         let (mut writer, mut reader) = tcp_pair();
