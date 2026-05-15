@@ -1,0 +1,26 @@
+=== psql extended sql prepared gdesc metadata only ===
+CREATE TABLE
+INSERT 0 3
+PREPARE
+ Column |  Type
+--------+---------
+ id     | integer
+ name   | text
+(2 rows)
+
+ Column |  Type
+--------+---------
+ id     | integer
+ name   | text
+(2 rows)
+
+ id | name
+----+------
+  1 | Ada
+(1 row)
+
+DEALLOCATE
+ name
+-------
+ Grace
+(1 row)

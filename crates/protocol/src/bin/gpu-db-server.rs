@@ -820,7 +820,9 @@ fn handle_bind(
         )?;
         return Ok(true);
     };
-    let query = query.clone();
+    let mut query = query.clone();
+    query.parameter_type_oids =
+        resolve_prepared_parameter_type_oids(session, &query.query, query.parameter_type_oids);
     if !portal_name.is_empty() && session.portals.contains_key(&portal_name) {
         write_error(
             stream,
@@ -11856,6 +11858,75 @@ mod tests {
             vec![b'D', b'C']
         );
         assert_eq!(messages[1].1, b"SELECT 1\0".to_vec());
+    }
+
+    #[test]
+    fn extended_sql_execute_bind_revalidates_sql_prepared_inferred_types() {
+        let mut session = Session::default();
+        session.tables.insert(
+            "people".to_string(),
+            Table {
+                oid: FIRST_USER_RELATION_OID,
+                name: "people".to_string(),
+                columns: vec![
+                    CatalogColumn {
+                        attnum: 1,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "id".to_string(),
+                            ty: SqlType::Int4,
+                        },
+                    },
+                    CatalogColumn {
+                        attnum: 2,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "name".to_string(),
+                            ty: SqlType::Text,
+                        },
+                    },
+                ],
+                rows: Vec::new(),
+            },
+        );
+        session.prepared.insert(
+            "lookup".to_string(),
+            PreparedStatement::Sql(PreparedQuery {
+                query: "SELECT id, name FROM people WHERE name = $1 LIMIT $2".to_string(),
+                parameter_type_oids: vec![
+                    SqlType::Text.postgres_oid(),
+                    SqlType::Int4.postgres_oid(),
+                ],
+            }),
+        );
+        session.replace_extended_statement(
+            "lookup_exec".to_string(),
+            PreparedQuery {
+                query: "EXECUTE lookup($1, $2)".to_string(),
+                parameter_type_oids: vec![0, 0],
+            },
+        );
+        let (mut writer, mut reader) = tcp_pair();
+
+        assert!(handle_bind(
+            &mut writer,
+            &mut session,
+            "bad_sql_execute_bind_portal".to_string(),
+            "lookup_exec".to_string(),
+            Vec::new(),
+            vec![Some(b"Ada".to_vec()), Some(b"not-an-int".to_vec())],
+            Vec::new(),
+        )
+        .unwrap());
+        let messages = read_backend_messages(&mut reader, 1);
+        assert_eq!(messages[0].0, b'E');
+        assert_eq!(
+            error_field_value(&messages[0].1, b'C'),
+            Some("22P02".to_string())
+        );
+        assert_eq!(
+            error_field_value(&messages[0].1, b'M'),
+            Some("invalid input syntax for parameter type oid 23: \"not-an-int\"".to_string())
+        );
+        assert!(!session.portals.contains_key("bad_sql_execute_bind_portal"));
     }
 
     #[test]
