@@ -1,0 +1,20 @@
+=== psql gdesc unsupported cursor declaration options ===
+CREATE TABLE
+INSERT 0 3
+psql:212_protocol_psql_gdesc_unsupported_cursor_options.sql:4: ERROR:  cursor declaration options are not supported by the compatibility endpoint
+psql:212_protocol_psql_gdesc_unsupported_cursor_options.sql:5: ERROR:  cursor does not exist
+psql:212_protocol_psql_gdesc_unsupported_cursor_options.sql:6: ERROR:  cursor declaration options are not supported by the compatibility endpoint
+psql:212_protocol_psql_gdesc_unsupported_cursor_options.sql:7: ERROR:  cursor does not exist
+The command has no result, or the result has no columns.
+DECLARE CURSOR
+ id | name
+----+-------
+  1 | Ada
+  2 | Linus
+(2 rows)
+
+CLOSE CURSOR
+ name
+-------
+ Linus
+(1 row)

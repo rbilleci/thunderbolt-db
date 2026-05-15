@@ -758,8 +758,10 @@ fn handle_parse(
         )?;
         return Ok(true);
     }
-    let describe_query = parse_declare_cursor(&query)
-        .map(|(_, cursor_query)| cursor_query)
+    let parsed_cursor_query = parse_declare_cursor(&query).map(|(_, cursor_query)| cursor_query);
+    let describe_query = parsed_cursor_query
+        .as_ref()
+        .cloned()
         .unwrap_or_else(|| query.clone());
     if let Some(error) = sql_execute_parameter_type_mapping_error(
         session,
@@ -771,6 +773,18 @@ fn handle_parse(
     }
     if let Some(error) = sql_execute_describe_error(session, &describe_query) {
         write_error(stream, &error)?;
+        return Ok(true);
+    }
+    if parsed_cursor_query.is_none() && is_unsupported_declare_cursor_statement(&query) {
+        write_error(
+            stream,
+            &ErrorField {
+                code: "0A000",
+                message:
+                    "cursor declaration options are not supported by the compatibility endpoint",
+                position: None,
+            },
+        )?;
         return Ok(true);
     }
     if describe_query_columns(session, &describe_query).is_none()
@@ -10374,6 +10388,47 @@ mod tests {
 
         assert_eq!(read_backend_tags(&mut reader, 1), vec![b'E']);
         assert!(!session.prepared.contains_key("insert_people"));
+    }
+
+    #[test]
+    fn extended_parse_rejects_unsupported_cursor_options_without_installing_statement() {
+        let mut session = Session::default();
+        session.tables.insert(
+            "people".to_string(),
+            Table {
+                oid: FIRST_USER_RELATION_OID,
+                name: "people".to_string(),
+                columns: vec![CatalogColumn {
+                    attnum: 1,
+                    def: gpu_db_protocol::ColumnDef {
+                        name: "id".to_string(),
+                        ty: SqlType::Int4,
+                    },
+                }],
+                rows: Vec::new(),
+            },
+        );
+        let (mut writer, mut reader) = tcp_pair();
+
+        assert!(handle_parse(
+            &mut writer,
+            &mut session,
+            "bad_cursor_options".to_string(),
+            "DECLARE bad_cursor BINARY CURSOR FOR SELECT id FROM people".to_string(),
+            Vec::new()
+        )
+        .unwrap());
+
+        let messages = read_backend_messages(&mut reader, 1);
+        assert_eq!(messages[0].0, b'E');
+        assert_eq!(
+            error_field_value(&messages[0].1, b'M'),
+            Some(
+                "cursor declaration options are not supported by the compatibility endpoint"
+                    .to_string()
+            )
+        );
+        assert!(!session.prepared.contains_key("bad_cursor_options"));
     }
 
     #[test]
