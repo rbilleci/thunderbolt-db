@@ -1,8 +1,8 @@
 # Compatibility Scorecard
 
 ## Totals
-- total: 886
-- passed: 886
+- total: 887
+- passed: 887
 - failed: 0
 - ignored: 0
 
@@ -10,8 +10,8 @@
 - durability.invariants: total=43 passed=43 failed=0 ignored=0
 - execution.gpu_routing_and_batching: total=68 passed=68 failed=0 ignored=0
 - protocol.client_flows: total=93 passed=93 failed=0 ignored=0
-- protocol.error_paths: total=78 passed=78 failed=0 ignored=0
-- protocol.extended_query: total=242 passed=242 failed=0 ignored=0
+- protocol.error_paths: total=79 passed=79 failed=0 ignored=0
+- protocol.extended_query: total=243 passed=243 failed=0 ignored=0
 - replication.operational_cluster: total=6 passed=6 failed=0 ignored=0
 - replication.role_and_log: total=220 passed=220 failed=0 ignored=0
 - sql.catalog_schema_types: total=84 passed=84 failed=0 ignored=0
