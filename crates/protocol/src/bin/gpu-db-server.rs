@@ -254,9 +254,14 @@ impl Session {
     fn close_extended_target(&mut self, target: DescribeTarget, name: &str) {
         match target {
             DescribeTarget::Statement => {
-                self.prepared.remove(name);
-                self.portals
-                    .retain(|_, portal| portal.statement_name != name);
+                if matches!(
+                    self.prepared.get(name),
+                    Some(PreparedStatement::Extended(_))
+                ) {
+                    self.prepared.remove(name);
+                    self.portals
+                        .retain(|_, portal| portal.statement_name != name);
+                }
             }
             DescribeTarget::Portal => {
                 self.portals.remove(name);
@@ -1080,36 +1085,6 @@ fn handle_close(
     target: DescribeTarget,
     name: &str,
 ) -> io::Result<bool> {
-    match target {
-        DescribeTarget::Statement
-            if !matches!(
-                session.prepared.get(name),
-                Some(PreparedStatement::Extended(_))
-            ) =>
-        {
-            write_error(
-                stream,
-                &ErrorField {
-                    code: "26000",
-                    message: "prepared statement does not exist",
-                    position: None,
-                },
-            )?;
-            return Ok(true);
-        }
-        DescribeTarget::Portal if !session.portals.contains_key(name) => {
-            write_error(
-                stream,
-                &ErrorField {
-                    code: "34000",
-                    message: "portal does not exist",
-                    position: None,
-                },
-            )?;
-            return Ok(true);
-        }
-        DescribeTarget::Statement | DescribeTarget::Portal => {}
-    }
     session.close_extended_target(target, name);
     write_close_complete(stream)?;
     Ok(false)
@@ -9469,7 +9444,7 @@ mod tests {
     }
 
     #[test]
-    fn extended_close_rejects_missing_statement_and_portal_names() {
+    fn extended_close_accepts_missing_statement_and_portal_names() {
         let mut session = Session::default();
         let query = PreparedQuery {
             query: "SELECT name FROM people WHERE id = $1".to_string(),
@@ -9489,25 +9464,25 @@ mod tests {
         );
         let (mut writer, mut reader) = tcp_pair();
 
-        assert!(handle_close(
+        assert!(!handle_close(
             &mut writer,
             &mut session,
             DescribeTarget::Statement,
             "missing_statement"
         )
         .unwrap());
-        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'E']);
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'3']);
         assert!(session.prepared.contains_key("lookup"));
         assert!(session.portals.contains_key("lookup_portal"));
 
-        assert!(handle_close(
+        assert!(!handle_close(
             &mut writer,
             &mut session,
             DescribeTarget::Portal,
             "missing_portal"
         )
         .unwrap());
-        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'E']);
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'3']);
         assert!(session.prepared.contains_key("lookup"));
         assert!(session.portals.contains_key("lookup_portal"));
 
@@ -9868,15 +9843,10 @@ mod tests {
     }
 
     #[test]
-    fn extended_close_missing_targets_skip_until_sync_and_recover() {
-        for (target, missing_name, expected_code, suffix) in [
-            (
-                DescribeTarget::Statement,
-                "missing_statement",
-                "26000",
-                "statement",
-            ),
-            (DescribeTarget::Portal, "missing_portal", "34000", "portal"),
+    fn extended_close_missing_targets_do_not_enter_error_recovery() {
+        for (target, missing_name, suffix) in [
+            (DescribeTarget::Statement, "missing_statement", "statement"),
+            (DescribeTarget::Portal, "missing_portal", "portal"),
         ] {
             let mut session = Session::default();
             session.tables.insert(
@@ -9924,12 +9894,8 @@ mod tests {
             )
             .unwrap();
             let messages = read_backend_messages(&mut reader, 1);
-            assert_eq!(messages[0].0, b'E');
-            assert_eq!(
-                error_field_value(&messages[0].1, b'C'),
-                Some(expected_code.to_string())
-            );
-            assert!(extended_error_pending);
+            assert_eq!(messages[0].0, b'3');
+            assert!(!extended_error_pending);
             assert!(session.prepared.contains_key("lookup"));
 
             handle_frontend_message(
@@ -9941,19 +9907,14 @@ mod tests {
                 )),
             )
             .unwrap();
-            assert!(!session
+            assert!(session
                 .tables
                 .contains_key(&format!("skipped_close_{suffix}")));
-
-            handle_frontend_message(
-                &mut writer,
-                &mut session,
-                &mut extended_error_pending,
-                FrontendMessage::Sync,
-            )
-            .unwrap();
-            assert_eq!(read_backend_tags(&mut reader, 1), vec![b'Z']);
-            assert!(!extended_error_pending);
+            assert_eq!(
+                read_backend_tags(&mut reader, 2),
+                vec![b'C', b'Z'],
+                "simple query after missing Close should not be skipped"
+            );
 
             handle_frontend_message(
                 &mut writer,
@@ -10103,7 +10064,7 @@ mod tests {
             .insert("golden_stmt".to_string(), PreparedStatement::AddTen);
         let (mut writer, mut reader) = tcp_pair();
 
-        assert!(handle_close(
+        assert!(!handle_close(
             &mut writer,
             &mut session,
             DescribeTarget::Statement,
@@ -10111,7 +10072,7 @@ mod tests {
         )
         .unwrap());
 
-        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'E']);
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'3']);
         assert_eq!(
             session.prepared.get("golden_stmt"),
             Some(&PreparedStatement::AddTen)
