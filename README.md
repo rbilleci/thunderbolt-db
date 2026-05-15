@@ -2,6 +2,8 @@
 
 Bootstrap implementation workspace for the pre-NVIDIA phase.
 
+PostgreSQL compatibility work is in the post-CUDA P1-P7 hardening loop. Current P3 coverage prioritizes real `psql` extended query, cursor, prepared statement, portal, `FETCH_COUNT`, error recovery, and explicit unsupported COPY/binary/function-call behavior for the supported relational `SELECT` plus `int4`/`text` subset. The golden suite now also pins plain `FETCH_COUNT` + extended `\bind ... \g` invalid-looking-bind cleanup as an explicit unsupported parameterized-cursor boundary before bind-value validation.
+
 ## Current scope
 
 - Replication-shaped local commit path

@@ -1,0 +1,10 @@
+=== psql fetch count extended bind g invalid cleanup ===
+CREATE TABLE
+INSERT 0 3
+psql:267_protocol_psql_fetch_count_extended_bind_g_invalid_cleanup.sql:5: ERROR:  parameterized cursor declarations are not supported
+psql:267_protocol_psql_fetch_count_extended_bind_g_invalid_cleanup.sql:7: ERROR:  cursor does not exist
+ id | name
+----+-------
+  2 | Linus
+  3 | Grace
+(2 rows)
