@@ -1,0 +1,22 @@
+=== psql fetch count zero-param sql execute gdesc cleanup ===
+CREATE TABLE
+INSERT 0 3
+PREPARE
+ Column |  Type
+--------+---------
+ id     | integer
+ name   | text
+(2 rows)
+
+psql:237_protocol_psql_fetch_count_zero_param_sql_execute_gdesc_cleanup.sql:8: ERROR:  cursor does not exist
+ id | name
+----+-------
+  2 | Linus
+  3 | Grace
+(2 rows)
+
+DEALLOCATE
+ name
+------
+ Ada
+(1 row)
