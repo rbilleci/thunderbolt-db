@@ -864,7 +864,7 @@ fn handle_bind(
         )?;
         return Ok(true);
     }
-    if let Some(columns) = describe_query_columns(session, &query.query) {
+    if let Some(columns) = describe_extended_query_columns(session, &query.query) {
         let result_format_count = result_format_codes.len();
         if !format_code_count_is_valid(result_format_count, columns.len()) {
             write_error(
@@ -10984,6 +10984,89 @@ mod tests {
         .unwrap());
         assert_eq!(read_backend_tags(&mut reader, 1), vec![b'2']);
         assert!(session.portals.contains_key("per_column_format_portal"));
+    }
+
+    #[test]
+    fn extended_bind_validates_result_format_count_for_sql_execute_columns() {
+        let mut session = Session::default();
+        session.tables.insert(
+            "people".to_string(),
+            Table {
+                oid: FIRST_USER_RELATION_OID,
+                name: "people".to_string(),
+                columns: vec![
+                    CatalogColumn {
+                        attnum: 1,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "id".to_string(),
+                            ty: SqlType::Int4,
+                        },
+                    },
+                    CatalogColumn {
+                        attnum: 2,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "name".to_string(),
+                            ty: SqlType::Text,
+                        },
+                    },
+                ],
+                rows: Vec::new(),
+            },
+        );
+        session.prepared.insert(
+            "lookup_sql".to_string(),
+            PreparedStatement::Sql(PreparedQuery {
+                query: "SELECT id, name FROM people WHERE id = $1".to_string(),
+                parameter_type_oids: vec![SqlType::Int4.postgres_oid()],
+            }),
+        );
+        session.replace_extended_statement(
+            "lookup_exec".to_string(),
+            PreparedQuery {
+                query: "EXECUTE lookup_sql($1)".to_string(),
+                parameter_type_oids: vec![SqlType::Int4.postgres_oid()],
+            },
+        );
+        let (mut writer, mut reader) = tcp_pair();
+
+        assert!(handle_bind(
+            &mut writer,
+            &mut session,
+            "bad_sql_execute_format_portal".to_string(),
+            "lookup_exec".to_string(),
+            Vec::new(),
+            vec![Some(b"1".to_vec())],
+            vec![0, 0, 0]
+        )
+        .unwrap());
+        let messages = read_backend_messages(&mut reader, 1);
+        assert_eq!(messages[0].0, b'E');
+        assert_eq!(
+            error_field_value(&messages[0].1, b'C'),
+            Some("08P01".to_string())
+        );
+        assert_eq!(
+            error_field_value(&messages[0].1, b'M'),
+            Some("bind message has wrong number of result format codes".to_string())
+        );
+        assert!(!session
+            .portals
+            .contains_key("bad_sql_execute_format_portal"));
+
+        assert!(!handle_bind(
+            &mut writer,
+            &mut session,
+            "good_sql_execute_format_portal".to_string(),
+            "lookup_exec".to_string(),
+            Vec::new(),
+            vec![Some(b"1".to_vec())],
+            vec![0, 0]
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'2']);
+        assert!(session
+            .portals
+            .contains_key("good_sql_execute_format_portal"));
     }
 
     #[test]
