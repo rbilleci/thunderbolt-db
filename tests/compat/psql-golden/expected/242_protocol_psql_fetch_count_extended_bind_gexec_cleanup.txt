@@ -1,0 +1,15 @@
+=== psql fetch count extended bind gexec unsupported cleanup ===
+CREATE TABLE
+CREATE TABLE
+INSERT 0 3
+INSERT 0 2
+ name
+-------
+ Linus
+(1 row)
+
+psql:242_protocol_psql_fetch_count_extended_bind_gexec_cleanup.sql:9: ERROR:  cursor does not exist
+ name
+-------
+ Grace
+(1 row)
