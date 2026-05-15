@@ -27,8 +27,8 @@
     "protocol.extended_query": {
       "failed": 0,
       "ignored": 0,
-      "passed": 241,
-      "total": 241
+      "passed": 242,
+      "total": 242
     },
     "replication.operational_cluster": {
       "failed": 0,
@@ -89,8 +89,8 @@
   "totals": {
     "failed": 0,
     "ignored": 0,
-    "passed": 885,
-    "total": 885
+    "passed": 886,
+    "total": 886
   },
   "trend_hook": {
     "baseline_available": true,
