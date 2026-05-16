@@ -1,0 +1,8 @@
+=== psql copy meta from stdin import recovery ===
+CREATE TABLE
+INSERT 0 2
+COPY 1
+ name
+-------
+ Grace
+(1 row)

@@ -1,0 +1,7 @@
+=== psql copy from stdin import recovery ===
+CREATE TABLE
+COPY 3
+      name
+----------------
+ Grace   Hopper
+(1 row)

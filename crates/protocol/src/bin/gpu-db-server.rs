@@ -234,6 +234,7 @@ struct Session {
     portals: HashMap<String, Portal>,
     cursors: HashMap<String, Cursor>,
     tables: HashMap<String, Table>,
+    copy_in: Option<CopyInState>,
     next_relation_oid: u32,
 }
 
@@ -245,6 +246,7 @@ impl Default for Session {
             portals: HashMap::new(),
             cursors: HashMap::new(),
             tables: HashMap::new(),
+            copy_in: None,
             next_relation_oid: FIRST_USER_RELATION_OID,
         }
     }
@@ -332,6 +334,14 @@ struct Cursor {
     columns: Vec<Column>,
     rows: Vec<Vec<Option<String>>>,
     position: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CopyInState {
+    table: String,
+    columns: Vec<String>,
+    pending_text: String,
+    pending_rows: Vec<Vec<SqlValue>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -427,7 +437,16 @@ fn handle_frontend_message(
 ) -> io::Result<bool> {
     match message {
         FrontendMessage::SimpleQuery(query) => {
-            if !*extended_error_pending {
+            if session.copy_in.is_some() {
+                write_error(
+                    stream,
+                    &ErrorField {
+                        code: "08P01",
+                        message: "simple query is not allowed during COPY FROM STDIN",
+                        position: None,
+                    },
+                )?;
+            } else if !*extended_error_pending {
                 run_simple_query(stream, session, &query)?
             }
         }
@@ -484,6 +503,70 @@ fn handle_frontend_message(
             write_ready_for_query(stream, session.in_transaction)?
         }
         FrontendMessage::Flush => stream.flush()?,
+        FrontendMessage::CopyData(bytes) => {
+            if let Some(error) = handle_copy_data(session, &bytes) {
+                session.copy_in = None;
+                write_error(stream, &error)?;
+                write_ready_for_query(stream, session.in_transaction)?;
+            } else if session.copy_in.is_none() && !*extended_error_pending {
+                write_error(
+                    stream,
+                    &ErrorField {
+                        code: "0A000",
+                        message:
+                            "frontend COPY data flow is not supported by the compatibility endpoint",
+                        position: None,
+                    },
+                )?;
+                *extended_error_pending = true;
+            }
+        }
+        FrontendMessage::CopyDone => {
+            if let Some(copy) = session.copy_in.take() {
+                let copied = copy.pending_rows.len();
+                if let Some(error) = apply_copy_in_rows(session, copy) {
+                    write_error(stream, &error)?;
+                } else {
+                    write_command_complete(stream, &format!("COPY {copied}"))?;
+                }
+                write_ready_for_query(stream, session.in_transaction)?;
+            } else if !*extended_error_pending {
+                write_error(
+                    stream,
+                    &ErrorField {
+                        code: "0A000",
+                        message:
+                            "frontend COPY data flow is not supported by the compatibility endpoint",
+                        position: None,
+                    },
+                )?;
+                *extended_error_pending = true;
+            }
+        }
+        FrontendMessage::CopyFail(_) => {
+            if session.copy_in.take().is_some() {
+                write_error(
+                    stream,
+                    &ErrorField {
+                        code: "57014",
+                        message: "COPY from stdin was aborted by the client",
+                        position: None,
+                    },
+                )?;
+                write_ready_for_query(stream, session.in_transaction)?;
+            } else if !*extended_error_pending {
+                write_error(
+                    stream,
+                    &ErrorField {
+                        code: "0A000",
+                        message:
+                            "frontend COPY data flow is not supported by the compatibility endpoint",
+                        position: None,
+                    },
+                )?;
+                *extended_error_pending = true;
+            }
+        }
         other => {
             if !*extended_error_pending {
                 write_error(
@@ -614,6 +697,9 @@ fn run_simple_query(stream: &mut TcpStream, session: &mut Session, query: &str) 
 
     for statement in statements {
         execute_statement(stream, session, statement, true)?;
+        if session.copy_in.is_some() {
+            return Ok(());
+        }
     }
 
     write_ready_for_query(stream, session.in_transaction)
@@ -2718,12 +2804,115 @@ fn parse_copy_to_stdout_table(statement: &str) -> Option<String> {
     Some(table.strip_prefix("public.").unwrap_or(table).to_string())
 }
 
+fn parse_copy_from_stdin(statement: &str) -> Option<(String, Option<Vec<String>>)> {
+    let statement = strip_leading_sql_comments(statement.trim())?;
+    let canonical = canonical_sql(statement);
+    let target = canonical
+        .strip_prefix("copy ")?
+        .strip_suffix(" from stdin")?
+        .trim();
+    let (table, columns) = if let Some(open) = target.find('(') {
+        let close = target.rfind(')')?;
+        if close <= open || !target[close + 1..].trim().is_empty() {
+            return None;
+        }
+        let table = target[..open].trim();
+        let columns = target[open + 1..close]
+            .split(',')
+            .map(str::trim)
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        if columns.is_empty()
+            || columns
+                .iter()
+                .any(|column| !is_simple_copy_identifier(column))
+        {
+            return None;
+        }
+        (table, Some(columns))
+    } else {
+        (target, None)
+    };
+    if !is_simple_copy_table_name(table) {
+        return None;
+    }
+    Some((
+        table.strip_prefix("public.").unwrap_or(table).to_string(),
+        columns,
+    ))
+}
+
+fn is_simple_copy_table_name(table: &str) -> bool {
+    !table.is_empty()
+        && table
+            .split('.')
+            .all(|part| is_simple_copy_identifier(part) && !part.is_empty())
+}
+
+fn is_simple_copy_identifier(identifier: &str) -> bool {
+    !identifier.is_empty()
+        && identifier
+            .chars()
+            .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
 fn copy_text_value(value: &SqlValue) -> String {
     format_sql_value(value)
         .replace('\\', r"\\")
         .replace('\t', r"\t")
         .replace('\n', r"\n")
         .replace('\r', r"\r")
+}
+
+fn parse_copy_text_value(input: &str, ty: SqlType) -> Result<SqlValue, ErrorField> {
+    if input == r"\N" {
+        return Err(ErrorField {
+            code: "0A000",
+            message: "COPY NULL values are not supported by the compatibility endpoint",
+            position: None,
+        });
+    }
+    let text = decode_copy_text(input)?;
+    match ty {
+        SqlType::Int4 => text
+            .parse::<i32>()
+            .map(SqlValue::Int4)
+            .map_err(|_| ErrorField {
+                code: "22P02",
+                message: "invalid input syntax for type integer",
+                position: None,
+            }),
+        SqlType::Text => Ok(SqlValue::Text(text)),
+    }
+}
+
+fn decode_copy_text(input: &str) -> Result<String, ErrorField> {
+    let mut output = String::with_capacity(input.len());
+    let mut chars = input.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            output.push(ch);
+            continue;
+        }
+        let Some(escaped) = chars.next() else {
+            return Err(ErrorField {
+                code: "22P04",
+                message: "unterminated COPY escape sequence",
+                position: None,
+            });
+        };
+        match escaped {
+            '\\' => output.push('\\'),
+            't' => output.push('\t'),
+            'n' => output.push('\n'),
+            'r' => output.push('\r'),
+            other => {
+                output.push('\\');
+                output.push(other);
+            }
+        }
+    }
+    Ok(output)
 }
 
 fn execute_copy_to_stdout(
@@ -2757,6 +2946,156 @@ fn execute_copy_to_stdout(
     write_command_complete(stream, &format!("COPY {}", table.rows.len()))
 }
 
+fn begin_copy_from_stdin(
+    stream: &mut TcpStream,
+    session: &mut Session,
+    table_name: &str,
+    requested_columns: Option<Vec<String>>,
+) -> io::Result<()> {
+    let Some(table) = session.tables.get(table_name) else {
+        return write_error(
+            stream,
+            &ErrorField {
+                code: "42P01",
+                message: "relation does not exist",
+                position: None,
+            },
+        );
+    };
+    let columns = requested_columns.unwrap_or_else(|| {
+        table
+            .columns
+            .iter()
+            .map(|column| column.def.name.clone())
+            .collect()
+    });
+    if columns.len() != table.columns.len() {
+        return write_error(
+            stream,
+            &ErrorField {
+                code: "0A000",
+                message: "COPY FROM STDIN must provide every column",
+                position: None,
+            },
+        );
+    }
+    for column in &columns {
+        if !table
+            .columns
+            .iter()
+            .any(|candidate| candidate.def.name == *column)
+        {
+            return write_error(
+                stream,
+                &ErrorField {
+                    code: "42703",
+                    message: "column does not exist",
+                    position: None,
+                },
+            );
+        }
+    }
+    session.copy_in = Some(CopyInState {
+        table: table_name.to_string(),
+        columns,
+        pending_text: String::new(),
+        pending_rows: Vec::new(),
+    });
+    write_copy_in_response(stream, table.columns.len())
+}
+
+fn handle_copy_data(session: &mut Session, bytes: &[u8]) -> Option<ErrorField> {
+    let copy = session.copy_in.as_mut()?;
+    let table = session.tables.get(&copy.table)?;
+    let text = match std::str::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(_) => {
+            return Some(ErrorField {
+                code: "22021",
+                message: "COPY data contains invalid UTF-8",
+                position: None,
+            });
+        }
+    };
+    copy.pending_text.push_str(text);
+    while let Some(newline) = copy.pending_text.find('\n') {
+        let mut line = copy.pending_text[..newline].to_string();
+        if line.ends_with('\r') {
+            line.pop();
+        }
+        copy.pending_text.drain(..=newline);
+        if line == r"\." {
+            continue;
+        }
+        if let Some(error) = parse_copy_text_row(table, &copy.columns, &line)
+            .map(|row| copy.pending_rows.push(row))
+            .err()
+        {
+            return Some(error);
+        }
+    }
+    None
+}
+
+fn apply_copy_in_rows(session: &mut Session, copy: CopyInState) -> Option<ErrorField> {
+    if !copy.pending_text.is_empty() {
+        return Some(ErrorField {
+            code: "22P04",
+            message: "COPY data ended before row terminator",
+            position: None,
+        });
+    }
+    let table = session.tables.get_mut(&copy.table)?;
+    let mut indexes = Vec::with_capacity(copy.columns.len());
+    for column in &copy.columns {
+        indexes.push(
+            table
+                .columns
+                .iter()
+                .position(|candidate| candidate.def.name == *column)?,
+        );
+    }
+    for row in copy.pending_rows {
+        let mut projected = vec![None; table.columns.len()];
+        for (source_idx, target_idx) in indexes.iter().copied().enumerate() {
+            projected[target_idx] = Some(row[source_idx].clone());
+        }
+        table
+            .rows
+            .push(projected.into_iter().map(Option::unwrap).collect());
+    }
+    None
+}
+
+fn parse_copy_text_row(
+    table: &Table,
+    columns: &[String],
+    line: &str,
+) -> Result<Vec<SqlValue>, ErrorField> {
+    let fields = line.split('\t').collect::<Vec<_>>();
+    if fields.len() != columns.len() {
+        return Err(ErrorField {
+            code: "22P04",
+            message: "COPY row has wrong number of columns",
+            position: None,
+        });
+    }
+    let mut row = Vec::with_capacity(fields.len());
+    for (field, column_name) in fields.iter().zip(columns.iter()) {
+        let column = table
+            .columns
+            .iter()
+            .find(|candidate| candidate.def.name == *column_name)
+            .ok_or(ErrorField {
+                code: "42703",
+                message: "column does not exist",
+                position: None,
+            })?;
+        row.push(parse_copy_text_value(field, column.def.ty)?);
+    }
+    Ok(row)
+}
+
 fn execute_statement(
     stream: &mut TcpStream,
     session: &mut Session,
@@ -2765,6 +3104,9 @@ fn execute_statement(
 ) -> io::Result<()> {
     if let Some(table) = parse_copy_to_stdout_table(statement) {
         return execute_copy_to_stdout(stream, session, &table);
+    }
+    if let Some((table, columns)) = parse_copy_from_stdin(statement) {
+        return begin_copy_from_stdin(stream, session, &table, columns);
     }
     if is_copy_statement(statement) {
         return write_error(
@@ -6775,6 +7117,18 @@ fn write_copy_out_response(stream: &mut TcpStream, column_count: usize) -> io::R
     write_message(stream, b'H', &payload)
 }
 
+fn write_copy_in_response(stream: &mut TcpStream, column_count: usize) -> io::Result<()> {
+    let column_count = i16::try_from(column_count)
+        .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "too many COPY columns"))?;
+    let mut payload = Vec::with_capacity(1 + 2 + column_count as usize * 2);
+    payload.push(0);
+    payload.extend_from_slice(&column_count.to_be_bytes());
+    for _ in 0..column_count {
+        payload.extend_from_slice(&0_i16.to_be_bytes());
+    }
+    write_message(stream, b'G', &payload)
+}
+
 fn write_copy_data(stream: &mut TcpStream, bytes: &[u8]) -> io::Result<()> {
     write_message(stream, b'd', bytes)
 }
@@ -7052,6 +7406,30 @@ mod tests {
     }
 
     #[test]
+    fn copy_from_stdin_table_detection_is_narrow() {
+        assert_eq!(
+            parse_copy_from_stdin("COPY public.people FROM STDIN;"),
+            Some(("people".to_string(), None))
+        );
+        assert_eq!(
+            parse_copy_from_stdin("/* comment */ COPY people (id, name) FROM STDIN"),
+            Some((
+                "people".to_string(),
+                Some(vec!["id".to_string(), "name".to_string()])
+            ))
+        );
+        assert_eq!(parse_copy_from_stdin("COPY people TO STDOUT"), None);
+        assert_eq!(
+            parse_copy_from_stdin("COPY (SELECT * FROM people) FROM STDIN"),
+            None
+        );
+        assert_eq!(
+            parse_copy_from_stdin("COPY people FROM STDIN WITH CSV"),
+            None
+        );
+    }
+
+    #[test]
     fn simple_copy_to_stdout_emits_copyout_data_done_and_recovers() {
         let mut session = Session::default();
         session.tables.insert(
@@ -7103,6 +7481,87 @@ mod tests {
         )
         .unwrap();
         assert_eq!(read_backend_tags(&mut reader, 3), vec![b'T', b'D', b'C']);
+    }
+
+    #[test]
+    fn simple_copy_from_stdin_accepts_data_done_and_recovers() {
+        let mut session = Session::default();
+        session.tables.insert(
+            "people".to_string(),
+            Table {
+                oid: FIRST_USER_RELATION_OID,
+                name: "people".to_string(),
+                columns: vec![
+                    CatalogColumn {
+                        attnum: 1,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "id".to_string(),
+                            ty: SqlType::Int4,
+                        },
+                    },
+                    CatalogColumn {
+                        attnum: 2,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "name".to_string(),
+                            ty: SqlType::Text,
+                        },
+                    },
+                ],
+                rows: Vec::new(),
+            },
+        );
+        let mut extended_error_pending = false;
+        let (mut writer, mut reader) = tcp_pair();
+
+        assert!(handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::SimpleQuery("COPY people FROM STDIN".to_string())
+        )
+        .unwrap());
+        let messages = read_backend_messages(&mut reader, 1);
+        assert_eq!(messages[0].0, b'G');
+        assert_eq!(messages[0].1, vec![0, 0, 2, 0, 0, 0, 0]);
+        assert!(session.copy_in.is_some());
+
+        assert!(handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::CopyData(b"1\tAda\n2\tGrace\\tHopper\n".to_vec())
+        )
+        .unwrap());
+        assert!(handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::CopyDone
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 2), vec![b'C', b'Z']);
+        assert_eq!(
+            session.tables["people"].rows,
+            vec![
+                vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())],
+                vec![
+                    SqlValue::Int4(2),
+                    SqlValue::Text("Grace\tHopper".to_string())
+                ],
+            ]
+        );
+
+        assert!(handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::SimpleQuery("SELECT name FROM people WHERE id = 2".to_string())
+        )
+        .unwrap());
+        assert_eq!(
+            read_backend_tags(&mut reader, 4),
+            vec![b'T', b'D', b'C', b'Z']
+        );
     }
 
     #[test]

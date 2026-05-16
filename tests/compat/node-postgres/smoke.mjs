@@ -124,9 +124,9 @@ async function main() {
     assert.deepEqual(empty.rows, []);
 
     await assert.rejects(
-      () => client.query('COPY node_people FROM STDIN'),
+      () => client.query('COPY node_people FROM STDIN WITH CSV'),
       (error) => error.code === '0A000',
-      'COPY FROM STDIN should stay explicitly unsupported',
+      'COPY FROM STDIN WITH CSV should stay explicitly unsupported',
     );
 
     const recovered = await client.query('SELECT name FROM node_people WHERE id = 3');

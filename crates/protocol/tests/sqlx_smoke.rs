@@ -88,13 +88,13 @@ async fn sqlx_supported_subset_smoke_with_unsupported_recovery(
         .await?;
     assert!(empty_rows.is_empty());
 
-    let unsupported = sqlx::raw_sql("COPY sqlx_people FROM STDIN")
+    let unsupported = sqlx::raw_sql("COPY sqlx_people FROM STDIN WITH CSV")
         .execute(&mut conn)
         .await
-        .expect_err("COPY FROM STDIN remains explicitly unsupported");
+        .expect_err("COPY FROM STDIN WITH CSV remains explicitly unsupported");
     let database_error = unsupported
         .as_database_error()
-        .expect("COPY FROM STDIN unsupported error should be a database error");
+        .expect("COPY FROM STDIN WITH CSV unsupported error should be a database error");
     assert_eq!(database_error.code().as_deref(), Some("0A000"));
 
     let recovered = sqlx::query("SELECT name FROM sqlx_people WHERE id = 3")
