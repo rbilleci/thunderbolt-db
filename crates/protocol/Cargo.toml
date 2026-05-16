@@ -8,5 +8,6 @@ license.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tokio-postgres = "0.7"

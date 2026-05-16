@@ -15,8 +15,8 @@
     "protocol.client_flows": {
       "failed": 0,
       "ignored": 0,
-      "passed": 93,
-      "total": 93
+      "passed": 95,
+      "total": 95
     },
     "protocol.error_paths": {
       "failed": 0,
@@ -27,8 +27,8 @@
     "protocol.extended_query": {
       "failed": 0,
       "ignored": 0,
-      "passed": 297,
-      "total": 297
+      "passed": 299,
+      "total": 299
     },
     "replication.operational_cluster": {
       "failed": 0,
@@ -63,8 +63,8 @@
     "sql.relational_foundation": {
       "failed": 0,
       "ignored": 0,
-      "passed": 46,
-      "total": 46
+      "passed": 48,
+      "total": 48
     },
     "sql.transaction_flows": {
       "failed": 0,
@@ -89,8 +89,8 @@
   "totals": {
     "failed": 0,
     "ignored": 0,
-    "passed": 941,
-    "total": 941
+    "passed": 943,
+    "total": 943
   },
   "trend_hook": {
     "baseline_available": true,
