@@ -1,4 +1,4 @@
-\echo === psql fetch count sql execute arg gexec copy cleanup ===
+\echo === psql fetch count sql execute arg gexec copy stdout cleanup ===
 \set FETCH_COUNT 1
 CREATE TABLE fetch_count_sql_arg_gexec_copy_people (id INT, name TEXT);
 CREATE TABLE fetch_count_sql_arg_gexec_copy_commands (id INT, command TEXT);

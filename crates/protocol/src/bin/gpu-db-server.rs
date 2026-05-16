@@ -2702,12 +2702,70 @@ fn is_copy_statement(statement: &str) -> bool {
         .is_some_and(|statement| canonical_sql(statement).starts_with("copy "))
 }
 
+fn parse_copy_to_stdout_table(statement: &str) -> Option<String> {
+    let statement = strip_leading_sql_comments(statement.trim())?;
+    let canonical = canonical_sql(statement);
+    let table = canonical
+        .strip_prefix("copy ")?
+        .strip_suffix(" to stdout")?
+        .trim();
+    if table.is_empty()
+        || table
+            .contains(|ch: char| ch.is_whitespace() || matches!(ch, '(' | ')' | ',' | '\'' | '"'))
+    {
+        return None;
+    }
+    Some(table.strip_prefix("public.").unwrap_or(table).to_string())
+}
+
+fn copy_text_value(value: &SqlValue) -> String {
+    format_sql_value(value)
+        .replace('\\', r"\\")
+        .replace('\t', r"\t")
+        .replace('\n', r"\n")
+        .replace('\r', r"\r")
+}
+
+fn execute_copy_to_stdout(
+    stream: &mut TcpStream,
+    session: &Session,
+    table_name: &str,
+) -> io::Result<()> {
+    let Some(table) = session.tables.get(table_name) else {
+        return write_error(
+            stream,
+            &ErrorField {
+                code: "42P01",
+                message: "relation does not exist",
+                position: None,
+            },
+        );
+    };
+    write_copy_out_response(stream, table.columns.len())?;
+    for row in &table.rows {
+        let mut payload = String::new();
+        for (idx, value) in row.iter().enumerate() {
+            if idx > 0 {
+                payload.push('\t');
+            }
+            payload.push_str(&copy_text_value(value));
+        }
+        payload.push('\n');
+        write_copy_data(stream, payload.as_bytes())?;
+    }
+    write_copy_done(stream)?;
+    write_command_complete(stream, &format!("COPY {}", table.rows.len()))
+}
+
 fn execute_statement(
     stream: &mut TcpStream,
     session: &mut Session,
     statement: &str,
     include_row_description: bool,
 ) -> io::Result<()> {
+    if let Some(table) = parse_copy_to_stdout_table(statement) {
+        return execute_copy_to_stdout(stream, session, &table);
+    }
     if is_copy_statement(statement) {
         return write_error(
             stream,
@@ -6705,6 +6763,26 @@ fn write_no_data(stream: &mut TcpStream) -> io::Result<()> {
     write_message(stream, b'n', &[])
 }
 
+fn write_copy_out_response(stream: &mut TcpStream, column_count: usize) -> io::Result<()> {
+    let column_count = i16::try_from(column_count)
+        .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "too many COPY columns"))?;
+    let mut payload = Vec::with_capacity(1 + 2 + column_count as usize * 2);
+    payload.push(0);
+    payload.extend_from_slice(&column_count.to_be_bytes());
+    for _ in 0..column_count {
+        payload.extend_from_slice(&0_i16.to_be_bytes());
+    }
+    write_message(stream, b'H', &payload)
+}
+
+fn write_copy_data(stream: &mut TcpStream, bytes: &[u8]) -> io::Result<()> {
+    write_message(stream, b'd', bytes)
+}
+
+fn write_copy_done(stream: &mut TcpStream) -> io::Result<()> {
+    write_message(stream, b'c', &[])
+}
+
 fn write_parameter_description(stream: &mut TcpStream, type_oids: &[u32]) -> io::Result<()> {
     let parameter_count = i16::try_from(type_oids.len())
         .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "too many parameters"))?;
@@ -6950,6 +7028,81 @@ mod tests {
         assert!(!is_copy_statement(
             "/* unterminated COPY copy_people TO STDOUT"
         ));
+    }
+
+    #[test]
+    fn copy_to_stdout_table_detection_is_narrow() {
+        assert_eq!(
+            parse_copy_to_stdout_table("COPY public.people TO STDOUT;"),
+            Some("people".to_string())
+        );
+        assert_eq!(
+            parse_copy_to_stdout_table("/* comment */ COPY people TO STDOUT"),
+            Some("people".to_string())
+        );
+        assert_eq!(parse_copy_to_stdout_table("COPY people FROM STDIN"), None);
+        assert_eq!(
+            parse_copy_to_stdout_table("COPY (SELECT * FROM people) TO STDOUT"),
+            None
+        );
+        assert_eq!(
+            parse_copy_to_stdout_table("COPY people TO STDOUT WITH CSV"),
+            None
+        );
+    }
+
+    #[test]
+    fn simple_copy_to_stdout_emits_copyout_data_done_and_recovers() {
+        let mut session = Session::default();
+        session.tables.insert(
+            "people".to_string(),
+            Table {
+                oid: FIRST_USER_RELATION_OID,
+                name: "people".to_string(),
+                columns: vec![
+                    CatalogColumn {
+                        attnum: 1,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "id".to_string(),
+                            ty: SqlType::Int4,
+                        },
+                    },
+                    CatalogColumn {
+                        attnum: 2,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "name".to_string(),
+                            ty: SqlType::Text,
+                        },
+                    },
+                ],
+                rows: vec![
+                    vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())],
+                    vec![SqlValue::Int4(2), SqlValue::Text("Tab\tName".to_string())],
+                ],
+            },
+        );
+        let (mut writer, mut reader) = tcp_pair();
+
+        execute_statement(&mut writer, &mut session, "COPY people TO STDOUT", true).unwrap();
+
+        let messages = read_backend_messages(&mut reader, 5);
+        assert_eq!(
+            messages.iter().map(|(tag, _)| *tag).collect::<Vec<_>>(),
+            vec![b'H', b'd', b'd', b'c', b'C']
+        );
+        assert_eq!(messages[0].1, vec![0, 0, 2, 0, 0, 0, 0]);
+        assert_eq!(messages[1].1, b"1\tAda\n");
+        assert_eq!(messages[2].1, b"2\tTab\\tName\n");
+        assert_eq!(messages[4].1, b"COPY 2\0");
+
+        execute_statement(
+            &mut writer,
+            &mut session,
+            "SELECT name FROM people WHERE id = 1",
+            true,
+        )
+        .unwrap();
+        assert_eq!(read_backend_tags(&mut reader, 3), vec![b'T', b'D', b'C']);
     }
 
     #[test]

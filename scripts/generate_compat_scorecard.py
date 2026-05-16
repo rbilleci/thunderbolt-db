@@ -26,7 +26,7 @@ def classify(test_id: str) -> list[str]:
     ):
         buckets.append("protocol.error_paths")
     if "psql_golden::" in test_id:
-        if re.search(r"bootstrap|startup|auth|connect|simple_query|session_reset|prepare", test_id):
+        if re.search(r"bootstrap|startup|auth|connect|simple_query|session_reset|prepare|copy", test_id):
             buckets.append("protocol.client_flows")
         if re.search(r"extended|bind|parse|portal|prepared|parameterized|cursor|fetch_count|gdesc", test_id):
             buckets.append("protocol.extended_query")

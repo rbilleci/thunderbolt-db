@@ -1,0 +1,9 @@
+=== psql copy to stdout export recovery ===
+CREATE TABLE
+INSERT 0 2
+1	Ada
+2	Linus
+ name
+-------
+ Linus
+(1 row)

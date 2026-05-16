@@ -15,14 +15,14 @@
     "protocol.client_flows": {
       "failed": 0,
       "ignored": 0,
-      "passed": 95,
-      "total": 95
+      "passed": 106,
+      "total": 106
     },
     "protocol.error_paths": {
       "failed": 0,
       "ignored": 0,
-      "passed": 112,
-      "total": 112
+      "passed": 109,
+      "total": 109
     },
     "protocol.extended_query": {
       "failed": 0,
@@ -81,16 +81,16 @@
     "uncategorized": {
       "failed": 0,
       "ignored": 0,
-      "passed": 185,
-      "total": 185
+      "passed": 187,
+      "total": 187
     }
   },
   "top_failing_categories": [],
   "totals": {
     "failed": 0,
     "ignored": 0,
-    "passed": 943,
-    "total": 943
+    "passed": 945,
+    "total": 945
   },
   "trend_hook": {
     "baseline_available": true,

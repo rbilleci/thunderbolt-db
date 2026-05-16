@@ -1,4 +1,4 @@
-\echo === psql copy meta to program unsupported recovery ===
+\echo === psql copy meta to program recovery ===
 CREATE TABLE copy_meta_to_people (id INT, name TEXT);
 INSERT INTO copy_meta_to_people (id, name) VALUES (1, 'Ada'), (2, 'Linus');
 \copy copy_meta_to_people TO PROGRAM 'cat >/dev/null'

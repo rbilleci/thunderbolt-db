@@ -1,0 +1,8 @@
+=== psql copy meta to program recovery ===
+CREATE TABLE
+INSERT 0 2
+COPY 2
+ name
+------
+ Ada
+(1 row)
