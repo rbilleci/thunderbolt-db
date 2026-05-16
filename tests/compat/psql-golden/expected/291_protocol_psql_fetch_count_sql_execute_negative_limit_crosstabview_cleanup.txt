@@ -1,0 +1,21 @@
+=== psql fetch count sql execute negative limit crosstabview cleanup ===
+CREATE TABLE
+INSERT 0 3
+PREPARE
+psql:291_protocol_psql_fetch_count_sql_execute_negative_limit_crosstabview_cleanup.sql:6: ERROR:  LIMIT must not be negative
+psql:291_protocol_psql_fetch_count_sql_execute_negative_limit_crosstabview_cleanup.sql:7: ERROR:  cursor does not exist
+ bucket | Ada | Linus
+--------+-----+-------
+ core   |   1 |     2
+(1 row)
+
+ bucket | name | id
+--------+------+----
+ core   | Ada  |  1
+(1 row)
+
+DEALLOCATE
+ name
+-------
+ Grace
+(1 row)
