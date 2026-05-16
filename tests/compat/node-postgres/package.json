@@ -1,0 +1,12 @@
+{
+  "name": "gpu-db-node-postgres-compat",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node smoke.mjs"
+  },
+  "dependencies": {
+    "pg": "8.20.0"
+  }
+}
