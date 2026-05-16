@@ -1,0 +1,24 @@
+=== psql fetch count sql execute negative limit gexec cleanup ===
+CREATE TABLE
+CREATE TABLE
+INSERT 0 3
+INSERT 0 1
+PREPARE
+psql:289_protocol_psql_fetch_count_sql_execute_negative_limit_gexec_cleanup.sql:8: ERROR:  LIMIT must not be negative
+psql:289_protocol_psql_fetch_count_sql_execute_negative_limit_gexec_cleanup.sql:9: ERROR:  cursor does not exist
+ name
+-------
+ Linus
+(1 row)
+
+psql:289_protocol_psql_fetch_count_sql_execute_negative_limit_gexec_cleanup.sql:12: ERROR:  cursor does not exist
+                             command
+------------------------------------------------------------------
+ SELECT name FROM fetch_count_negative_gexec_people WHERE id = 2;
+(1 row)
+
+DEALLOCATE
+ name
+-------
+ Grace
+(1 row)

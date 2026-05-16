@@ -1,0 +1,13 @@
+=== psql fetch count zero-param sql execute negative limit gexec cleanup ===
+CREATE TABLE
+CREATE TABLE
+INSERT 0 3
+INSERT 0 1
+PREPARE
+psql:288_protocol_psql_fetch_count_zero_param_sql_execute_negative_limit_gexec_cleanup.sql:8: ERROR:  LIMIT must not be negative
+psql:288_protocol_psql_fetch_count_zero_param_sql_execute_negative_limit_gexec_cleanup.sql:9: ERROR:  cursor does not exist
+DEALLOCATE
+ name
+-------
+ Grace
+(1 row)
