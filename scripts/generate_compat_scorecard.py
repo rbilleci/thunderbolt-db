@@ -47,6 +47,14 @@ def classify(test_id: str) -> list[str]:
             buckets.append("sql.relational_foundation")
     if "gpu_db_server::" in test_id and re.search(r"simple_query|frontend|protocol", test_id):
         buckets.append("protocol.client_flows")
+    if re.search(r"tokio_postgres|async_driver", test_id):
+        buckets.extend(
+            [
+                "protocol.client_flows",
+                "protocol.extended_query",
+                "sql.relational_foundation",
+            ]
+        )
     if re.search(r"extended|bind|parse|portal|prepared|parameterized|cursor|fetch_count|gdesc", test_id):
         buckets.append("protocol.extended_query")
     if re.search(r"relational|create_table|insert|select", test_id):

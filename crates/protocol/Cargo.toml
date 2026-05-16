@@ -6,3 +6,7 @@ license.workspace = true
 
 [dependencies]
 thiserror.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio-postgres = "0.7"

@@ -320,6 +320,7 @@ struct Portal {
     statement_name: String,
     query: PreparedQuery,
     parameters: Vec<Option<String>>,
+    result_format_codes: Vec<i16>,
     described: bool,
     result: Option<SelectResult>,
     position: usize,
@@ -859,19 +860,6 @@ fn handle_bind(
         )?;
         return Ok(true);
     }
-    if parameter_format_codes.iter().any(|code| *code != 0)
-        || result_format_codes.iter().any(|code| *code != 0)
-    {
-        write_error(
-            stream,
-            &ErrorField {
-                code: "0A000",
-                message: "only text format parameters and results are supported",
-                position: None,
-            },
-        )?;
-        return Ok(true);
-    }
     let parameter_format_count = parameter_format_codes.len();
     let expected_parameter_count = expected_parameter_count(&query);
     if parameters.len() != expected_parameter_count {
@@ -917,20 +905,19 @@ fn handle_bind(
             return Ok(true);
         }
     }
+    if let Some(error) = binary_result_format_error(session, &query.query, &result_format_codes) {
+        write_error(stream, &error)?;
+        return Ok(true);
+    }
     let mut decoded = Vec::with_capacity(parameters.len());
-    for parameter in parameters {
+    for (idx, parameter) in parameters.into_iter().enumerate() {
+        let format_code = format_code_at(&parameter_format_codes, idx);
+        let type_oid = query.parameter_type_oids.get(idx).copied().unwrap_or(0);
         decoded.push(match parameter {
-            Some(bytes) => match String::from_utf8(bytes) {
+            Some(bytes) => match decode_bind_parameter(&bytes, format_code, type_oid) {
                 Ok(value) => Some(value),
-                Err(_) => {
-                    write_error(
-                        stream,
-                        &ErrorField {
-                            code: "22021",
-                            message: "invalid byte sequence for encoding \"UTF8\"",
-                            position: None,
-                        },
-                    )?;
+                Err(error) => {
+                    write_error(stream, &error)?;
                     return Ok(true);
                 }
             },
@@ -947,6 +934,7 @@ fn handle_bind(
             statement_name,
             query: query.clone(),
             parameters: decoded,
+            result_format_codes,
             described: false,
             result: None,
             position: 0,
@@ -1005,7 +993,7 @@ fn handle_describe(
                 }
             };
             if let Some(columns) = describe_extended_query_columns(session, &bound_query) {
-                write_row_description(stream, &columns)?;
+                write_row_description_with_formats(stream, &columns, &portal.result_format_codes)?;
                 if let Some(portal) = session.portals.get_mut(name) {
                     portal.described = true;
                 }
@@ -1156,13 +1144,16 @@ fn execute_portal_batch(
             .saturating_add(max_rows as usize)
             .min(result.rows.len())
     };
-    for row in &result.rows[start..requested_end] {
-        write_data_row(stream, row)?;
-    }
+    let rows = result.rows[start..requested_end].to_vec();
+    let columns = result.columns.clone();
+    let result_format_codes = portal.result_format_codes.clone();
     let emitted_count = requested_end - start;
     portal.position = requested_end;
 
     if portal.position < result.rows.len() {
+        for row in &rows {
+            write_data_row_with_formats(stream, &columns, row, &result_format_codes)?;
+        }
         write_portal_suspended(stream)
     } else {
         let completion_count = if portal.completed {
@@ -1171,8 +1162,79 @@ fn execute_portal_batch(
             portal.position
         };
         portal.completed = true;
+        for row in &rows {
+            write_data_row_with_formats(stream, &columns, row, &result_format_codes)?;
+        }
         write_command_complete(stream, &format!("SELECT {completion_count}"))
     }
+}
+
+fn format_code_at(format_codes: &[i16], idx: usize) -> i16 {
+    match format_codes {
+        [] => 0,
+        [code] => *code,
+        codes => codes[idx],
+    }
+}
+
+fn decode_bind_parameter(
+    bytes: &[u8],
+    format_code: i16,
+    type_oid: u32,
+) -> Result<String, ErrorField> {
+    match format_code {
+        0 => String::from_utf8(bytes.to_vec()).map_err(|_| ErrorField {
+            code: "22021",
+            message: "invalid byte sequence for encoding \"UTF8\"",
+            position: None,
+        }),
+        1 => match type_oid {
+            23 => {
+                let raw: [u8; 4] = bytes.try_into().map_err(|_| ErrorField {
+                    code: "22P03",
+                    message: "invalid binary representation for int4 parameter",
+                    position: None,
+                })?;
+                Ok(i32::from_be_bytes(raw).to_string())
+            }
+            25 => String::from_utf8(bytes.to_vec()).map_err(|_| ErrorField {
+                code: "22021",
+                message: "invalid byte sequence for encoding \"UTF8\"",
+                position: None,
+            }),
+            _ => Err(ErrorField {
+                code: "0A000",
+                message: "binary parameters are only supported for int4 and text",
+                position: None,
+            }),
+        },
+        _ => Err(ErrorField {
+            code: "0A000",
+            message: "unsupported bind format code",
+            position: None,
+        }),
+    }
+}
+
+fn binary_result_format_error(
+    session: &Session,
+    query: &str,
+    result_format_codes: &[i16],
+) -> Option<ErrorField> {
+    if !result_format_codes.contains(&1) {
+        return None;
+    }
+    let columns = describe_extended_query_columns(session, query)?;
+    for (idx, column) in columns.iter().enumerate() {
+        if format_code_at(result_format_codes, idx) == 1 && !matches!(column.oid, 23 | 25) {
+            return Some(ErrorField {
+                code: "0A000",
+                message: "binary results are only supported for int4 and text columns",
+                position: None,
+            });
+        }
+    }
+    None
 }
 
 fn parse_declare_cursor(statement: &str) -> Option<(String, String)> {
@@ -6694,31 +6756,55 @@ fn write_rows_with_tag(
 }
 
 fn write_row_description(stream: &mut TcpStream, columns: &[Column]) -> io::Result<()> {
+    write_row_description_with_formats(stream, columns, &[])
+}
+
+fn write_row_description_with_formats(
+    stream: &mut TcpStream,
+    columns: &[Column],
+    result_format_codes: &[i16],
+) -> io::Result<()> {
     let field_count = i16::try_from(columns.len())
         .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "too many columns"))?;
     let mut payload = Vec::new();
     payload.extend_from_slice(&field_count.to_be_bytes());
-    for column in columns {
+    for (idx, column) in columns.iter().enumerate() {
         push_cstring(&mut payload, &column.name);
         payload.extend_from_slice(&0_u32.to_be_bytes());
         payload.extend_from_slice(&0_i16.to_be_bytes());
         payload.extend_from_slice(&column.oid.to_be_bytes());
         payload.extend_from_slice(&column.type_size.to_be_bytes());
         payload.extend_from_slice(&(-1_i32).to_be_bytes());
-        payload.extend_from_slice(&0_i16.to_be_bytes());
+        payload.extend_from_slice(&format_code_at(result_format_codes, idx).to_be_bytes());
     }
     write_message(stream, b'T', &payload)
 }
 
 fn write_data_row(stream: &mut TcpStream, values: &[Option<String>]) -> io::Result<()> {
+    let columns = values.iter().map(|_| text_column("")).collect::<Vec<_>>();
+    write_data_row_with_formats(stream, &columns, values, &[])
+}
+
+fn write_data_row_with_formats(
+    stream: &mut TcpStream,
+    columns: &[Column],
+    values: &[Option<String>],
+    result_format_codes: &[i16],
+) -> io::Result<()> {
     let value_count = i16::try_from(values.len())
         .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "too many row values"))?;
     let mut payload = Vec::new();
     payload.extend_from_slice(&value_count.to_be_bytes());
-    for value in values {
+    for (idx, value) in values.iter().enumerate() {
         match value {
             Some(value) => {
-                let bytes = value.as_bytes();
+                let encoded;
+                let bytes = if format_code_at(result_format_codes, idx) == 1 {
+                    encoded = encode_binary_result_value(value, columns[idx].oid)?;
+                    encoded.as_slice()
+                } else {
+                    value.as_bytes()
+                };
                 let len = i32::try_from(bytes.len()).map_err(|_| {
                     io::Error::new(ErrorKind::InvalidInput, "row value too large to encode")
                 })?;
@@ -6729,6 +6815,25 @@ fn write_data_row(stream: &mut TcpStream, values: &[Option<String>]) -> io::Resu
         }
     }
     write_message(stream, b'D', &payload)
+}
+
+fn encode_binary_result_value(value: &str, type_oid: u32) -> io::Result<Vec<u8>> {
+    match type_oid {
+        23 => {
+            let value = value.parse::<i32>().map_err(|_| {
+                io::Error::new(
+                    ErrorKind::InvalidInput,
+                    "int4 row value cannot be encoded as binary",
+                )
+            })?;
+            Ok(value.to_be_bytes().to_vec())
+        }
+        25 => Ok(value.as_bytes().to_vec()),
+        _ => Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "unsupported binary result type",
+        )),
+    }
 }
 
 fn write_error(stream: &mut TcpStream, error: &ErrorField) -> io::Result<()> {
@@ -9603,6 +9708,7 @@ mod tests {
                 statement_name: "lookup".to_string(),
                 query: query.clone(),
                 parameters: vec![Some("1".to_string())],
+                result_format_codes: Vec::new(),
                 described: false,
                 result: None,
                 position: 0,
@@ -9615,6 +9721,7 @@ mod tests {
                 statement_name: "other".to_string(),
                 query: query.clone(),
                 parameters: vec![Some("2".to_string())],
+                result_format_codes: Vec::new(),
                 described: false,
                 result: None,
                 position: 0,
@@ -9646,6 +9753,7 @@ mod tests {
                 statement_name: "lookup".to_string(),
                 query,
                 parameters: vec![Some("1".to_string())],
+                result_format_codes: Vec::new(),
                 described: false,
                 result: None,
                 position: 0,
@@ -9729,6 +9837,7 @@ mod tests {
                 statement_name: "lookup".to_string(),
                 query,
                 parameters: vec![Some("1".to_string())],
+                result_format_codes: Vec::new(),
                 described: false,
                 result: None,
                 position: 0,
@@ -9821,6 +9930,7 @@ mod tests {
                 statement_name: "lookup".to_string(),
                 query,
                 parameters: vec![Some("1".to_string())],
+                result_format_codes: Vec::new(),
                 described: false,
                 result: None,
                 position: 0,
@@ -10333,6 +10443,7 @@ mod tests {
                     parameter_type_oids: vec![23],
                 },
                 parameters: vec![Some("1".to_string())],
+                result_format_codes: Vec::new(),
                 described: false,
                 result: None,
                 position: 0,
@@ -10685,6 +10796,7 @@ mod tests {
                 statement_name: "lookup".to_string(),
                 query: query.clone(),
                 parameters: vec![Some("1".to_string())],
+                result_format_codes: Vec::new(),
                 described: false,
                 result: None,
                 position: 0,
@@ -10748,6 +10860,7 @@ mod tests {
                 statement_name: "lookup".to_string(),
                 query,
                 parameters: vec![Some("1".to_string())],
+                result_format_codes: Vec::new(),
                 described: false,
                 result: None,
                 position: 0,
@@ -10890,7 +11003,7 @@ mod tests {
     }
 
     #[test]
-    fn extended_bind_binary_format_error_skips_until_sync_and_recovers() {
+    fn extended_bind_accepts_binary_int4_parameters_and_recovers() {
         let mut session = Session::default();
         session.tables.insert(
             "people".to_string(),
@@ -10939,37 +11052,33 @@ mod tests {
             },
         )
         .unwrap();
-        let messages = read_backend_messages(&mut reader, 1);
-        assert_eq!(messages[0].0, b'E');
-        assert_eq!(
-            error_field_value(&messages[0].1, b'C'),
-            Some("0A000".to_string())
-        );
-        assert_eq!(
-            error_field_value(&messages[0].1, b'M'),
-            Some("only text format parameters and results are supported".to_string())
-        );
-        assert!(extended_error_pending);
-        assert!(!session.portals.contains_key("binary_portal"));
-
-        handle_frontend_message(
-            &mut writer,
-            &mut session,
-            &mut extended_error_pending,
-            FrontendMessage::SimpleQuery("CREATE TABLE skipped_binary_bind (id INT)".to_string()),
-        )
-        .unwrap();
-        assert!(!session.tables.contains_key("skipped_binary_bind"));
-
-        handle_frontend_message(
-            &mut writer,
-            &mut session,
-            &mut extended_error_pending,
-            FrontendMessage::Sync,
-        )
-        .unwrap();
-        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'Z']);
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'2']);
         assert!(!extended_error_pending);
+        assert_eq!(
+            session
+                .portals
+                .get("binary_portal")
+                .and_then(|portal| portal.parameters.first())
+                .cloned(),
+            Some(Some("1".to_string()))
+        );
+
+        handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::Execute {
+                portal_name: "binary_portal".to_string(),
+                max_rows: 0,
+            },
+        )
+        .unwrap();
+        let messages = read_backend_messages(&mut reader, 2);
+        assert_eq!(
+            messages.iter().map(|(tag, _)| *tag).collect::<Vec<_>>(),
+            vec![b'D', b'C']
+        );
+        assert_eq!(messages[1].1, b"SELECT 1\0".to_vec());
 
         handle_frontend_message(
             &mut writer,
@@ -11006,7 +11115,7 @@ mod tests {
     }
 
     #[test]
-    fn extended_bind_binary_result_format_error_skips_until_sync_and_recovers() {
+    fn extended_bind_accepts_binary_int4_and_text_result_formats() {
         let mut session = Session::default();
         session.tables.insert(
             "people".to_string(),
@@ -11035,7 +11144,7 @@ mod tests {
         session.replace_extended_statement(
             "lookup".to_string(),
             PreparedQuery {
-                query: "SELECT name FROM people WHERE id = $1".to_string(),
+                query: "SELECT id, name FROM people WHERE id = $1".to_string(),
                 parameter_type_oids: vec![23],
             },
         );
@@ -11051,41 +11160,41 @@ mod tests {
                 statement_name: "lookup".to_string(),
                 parameter_format_codes: Vec::new(),
                 parameters: vec![Some(b"1".to_vec())],
-                result_format_codes: vec![1],
+                result_format_codes: vec![1, 1],
             },
         )
         .unwrap();
-        let messages = read_backend_messages(&mut reader, 1);
-        assert_eq!(messages[0].0, b'E');
-        assert_eq!(
-            error_field_value(&messages[0].1, b'C'),
-            Some("0A000".to_string())
-        );
-        assert_eq!(
-            error_field_value(&messages[0].1, b'M'),
-            Some("only text format parameters and results are supported".to_string())
-        );
-        assert!(extended_error_pending);
-        assert!(!session.portals.contains_key("binary_result_portal"));
-
-        handle_frontend_message(
-            &mut writer,
-            &mut session,
-            &mut extended_error_pending,
-            FrontendMessage::SimpleQuery("CREATE TABLE skipped_binary_result (id INT)".to_string()),
-        )
-        .unwrap();
-        assert!(!session.tables.contains_key("skipped_binary_result"));
-
-        handle_frontend_message(
-            &mut writer,
-            &mut session,
-            &mut extended_error_pending,
-            FrontendMessage::Sync,
-        )
-        .unwrap();
-        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'Z']);
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'2']);
         assert!(!extended_error_pending);
+        assert!(session.portals.contains_key("binary_result_portal"));
+
+        handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::Execute {
+                portal_name: "binary_result_portal".to_string(),
+                max_rows: 0,
+            },
+        )
+        .unwrap();
+        let messages = read_backend_messages(&mut reader, 2);
+        assert_eq!(
+            messages.iter().map(|(tag, _)| *tag).collect::<Vec<_>>(),
+            vec![b'D', b'C']
+        );
+        assert_eq!(
+            messages[0].1,
+            [
+                2_i16.to_be_bytes().as_slice(),
+                4_i32.to_be_bytes().as_slice(),
+                1_i32.to_be_bytes().as_slice(),
+                3_i32.to_be_bytes().as_slice(),
+                b"Ada".as_slice(),
+            ]
+            .concat()
+        );
+        assert_eq!(messages[1].1, b"SELECT 1\0".to_vec());
 
         handle_frontend_message(
             &mut writer,
@@ -11487,6 +11596,7 @@ mod tests {
                     parameter_type_oids: Vec::new(),
                 },
                 parameters: Vec::new(),
+                result_format_codes: Vec::new(),
                 described: false,
                 result: Some(SelectResult {
                     columns: vec![int4_column("id")],
@@ -11565,6 +11675,7 @@ mod tests {
                     parameter_type_oids: Vec::new(),
                 },
                 parameters: Vec::new(),
+                result_format_codes: Vec::new(),
                 described: false,
                 result: None,
                 position: 0,
@@ -11630,6 +11741,7 @@ mod tests {
                     parameter_type_oids: Vec::new(),
                 },
                 parameters: Vec::new(),
+                result_format_codes: Vec::new(),
                 described: false,
                 result: None,
                 position: 0,
@@ -11687,6 +11799,7 @@ mod tests {
                     parameter_type_oids: Vec::new(),
                 },
                 parameters: Vec::new(),
+                result_format_codes: Vec::new(),
                 described: false,
                 result: None,
                 position: 0,
@@ -11741,6 +11854,7 @@ mod tests {
                     parameter_type_oids: Vec::new(),
                 },
                 parameters: Vec::new(),
+                result_format_codes: Vec::new(),
                 described: false,
                 result: None,
                 position: 0,
