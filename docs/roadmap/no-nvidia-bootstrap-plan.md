@@ -390,6 +390,16 @@ Initial target:
 - Stop condition 4: Binary formats are post-P3 unless a selected target driver/workload requires binary transfer for supported `int4`/`text` values. If that target is selected, P3 reopens specifically for binary encode/decode parity, format negotiation, and text/binary mixed-format recovery.
 - Stop condition 5: FunctionCall protocol and advanced cursor behavior are post-P3 unless a selected target client emits those messages or requires scrollable/backward/holdable cursors. If that happens, reopen only the observed behavior, not the full PostgreSQL protocol surface.
 
+P3 current-scope closeout recorded on 2026-05-16:
+- [x] `protocol.extended_query` scorecard bucket is green.
+- [x] `protocol.error_paths` scorecard bucket is green.
+- [x] Real PostgreSQL 16 psql golden coverage is green.
+- [x] Compatibility matrix explicitly lists unsupported binary format, COPY, FunctionCall, and advanced cursor/portal surfaces as post-P3 backlog rather than accidental gaps.
+- [x] Parameterized extended DML remains out of scope until the SQL layer supports the corresponding DML.
+- [x] No named target client/workload currently reopens COPY execution, binary transfer, FunctionCall, or advanced cursor/portal behavior.
+
+Operational stop rule: with those checks satisfied, do not add more P3 cleanup/error/result-consumer permutations. Reopen P3 only for one of the stop conditions above, and only for the observed surface.
+
 Exit criteria:
 1. Extended protocol no longer returns the generic "unsupported by compatibility stub" error for the first supported prepared statement/query path. First slice landed on 2026-05-11: the compatibility endpoint accepts `Parse`, `Bind`, `Describe`, `Execute`, `Sync`, and `Close` for text-format `int4`/`text` parameters and text-format relational `SELECT` results.
 2. Prepared statements and portals have session-local lifecycle tests. First helper-level coverage landed on 2026-05-11 for bound parameter substitution and catalog-backed row description. Follow-up on 2026-05-11 added session-local close lifecycle coverage proving statement close removes dependent portals while portal close leaves the prepared statement intact. Follow-up on 2026-05-13 added PostgreSQL-compatible duplicate semantics: named prepared statement and named portal duplicates are rejected before malformed payload validation can mask the duplicate-object lifecycle error, while unnamed prepared statement and portal replacement remains supported and clears dependent unnamed portal state. Later 2026-05-13 coverage tightened extended `Close` lifecycle truthfulness around successful close cleanup. Follow-up on 2026-05-15 aligned missing extended `Close` targets with PostgreSQL protocol semantics: missing prepared statements and portals return `CloseComplete` without entering skip-until-`Sync`, successful close still cleans only the requested session-local scope, extended `Close Portal` removes only the named portal while leaving its prepared statement reusable and later missing-portal `Execute` recovery intact, extended `Close Statement` does not remove SQL `PREPARE` state, and dependent portals invalidated by statement close cannot be executed before a fresh supported prepared statement/portal succeeds.
