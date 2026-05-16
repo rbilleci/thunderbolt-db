@@ -41,6 +41,13 @@ pub struct WalArchiveManifest {
     pub checkpoint: WalCheckpointMeta,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalArchiveRecoveryTarget {
+    pub target_txn_id: TxnId,
+    pub recovered_record_count: usize,
+    pub last_recovered_txn_id: TxnId,
+}
+
 #[derive(Debug, Default)]
 pub struct WalBuffer {
     records: Vec<WalRecord>,
@@ -602,6 +609,63 @@ pub fn read_wal_archive(
     }
     validate_archive_records(manifest_path, &manifest, &records)?;
     Ok((manifest, records))
+}
+
+pub fn read_wal_archive_to_txn(
+    manifest_path: impl AsRef<Path>,
+    target_txn_id: TxnId,
+) -> Result<(WalArchiveManifest, WalArchiveRecoveryTarget, Vec<WalRecord>), EngineError> {
+    let manifest_path = manifest_path.as_ref();
+    let (manifest, records) = read_wal_archive(manifest_path)?;
+    let Some(first_txn_id) = records.first().map(|record| record.txn_id) else {
+        return Err(EngineError::Durability(format!(
+            "WAL archive {} has no records for target transaction {}",
+            manifest_path.display(),
+            target_txn_id
+        )));
+    };
+    if target_txn_id < first_txn_id {
+        return Err(EngineError::Durability(format!(
+            "WAL archive {} target transaction {} is before first archived transaction {}",
+            manifest_path.display(),
+            target_txn_id,
+            first_txn_id
+        )));
+    }
+    if target_txn_id > manifest.checkpoint.last_durable_txn_id.unwrap_or(0) {
+        return Err(EngineError::Durability(format!(
+            "WAL archive {} target transaction {} is beyond last durable transaction {:?}",
+            manifest_path.display(),
+            target_txn_id,
+            manifest.checkpoint.last_durable_txn_id
+        )));
+    }
+
+    let recovered_record_count = records
+        .iter()
+        .take_while(|record| record.txn_id <= target_txn_id)
+        .count();
+    let last_recovered_txn_id = records
+        .get(recovered_record_count.saturating_sub(1))
+        .map(|record| record.txn_id);
+    if last_recovered_txn_id != Some(target_txn_id) {
+        return Err(EngineError::Durability(format!(
+            "WAL archive {} does not contain target transaction {}",
+            manifest_path.display(),
+            target_txn_id
+        )));
+    }
+
+    let target = WalArchiveRecoveryTarget {
+        target_txn_id,
+        recovered_record_count,
+        last_recovered_txn_id: target_txn_id,
+    };
+    Ok((
+        manifest,
+        target,
+        records.into_iter().take(recovered_record_count).collect(),
+    ))
 }
 
 fn validate_checkpoint_control(
@@ -1202,6 +1266,120 @@ mod tests {
         );
         assert_eq!(recovered_records.len(), 3);
         assert_eq!(recovered_records[2].payload, b"SET c=3");
+    }
+
+    #[test]
+    fn wal_archive_reads_prefix_to_transaction_target() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpu-db-wal-archive-target-{}-{}",
+            std::process::id(),
+            NEXT_TEST_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let manifest_path = dir.join("MANIFEST");
+        let segment_dir = dir.join("segments");
+        let records = vec![
+            WalRecord {
+                txn_id: 1,
+                payload: b"SET a=1".to_vec(),
+            },
+            WalRecord {
+                txn_id: 2,
+                payload: b"SET b=2".to_vec(),
+            },
+            WalRecord {
+                txn_id: 3,
+                payload: b"SET c=3".to_vec(),
+            },
+        ];
+
+        write_wal_archive(&manifest_path, &segment_dir, &records, 2).unwrap();
+        let (_manifest, target, recovered_records) =
+            read_wal_archive_to_txn(&manifest_path, 2).unwrap();
+        let _ = fs::remove_dir_all(dir);
+
+        assert_eq!(
+            target,
+            WalArchiveRecoveryTarget {
+                target_txn_id: 2,
+                recovered_record_count: 2,
+                last_recovered_txn_id: 2,
+            }
+        );
+        assert_eq!(recovered_records.len(), 2);
+        assert_eq!(recovered_records[1].payload, b"SET b=2");
+    }
+
+    #[test]
+    fn wal_archive_target_rejects_before_first_transaction() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpu-db-wal-archive-target-before-{}-{}",
+            std::process::id(),
+            NEXT_TEST_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let manifest_path = dir.join("MANIFEST");
+        let segment_dir = dir.join("segments");
+        let records = vec![WalRecord {
+            txn_id: 10,
+            payload: b"SET a=1".to_vec(),
+        }];
+
+        write_wal_archive(&manifest_path, &segment_dir, &records, 1).unwrap();
+        let err = read_wal_archive_to_txn(&manifest_path, 9).unwrap_err();
+        let _ = fs::remove_dir_all(dir);
+
+        assert!(err
+            .to_string()
+            .contains("before first archived transaction"));
+    }
+
+    #[test]
+    fn wal_archive_target_rejects_beyond_durable_archive() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpu-db-wal-archive-target-beyond-{}-{}",
+            std::process::id(),
+            NEXT_TEST_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let manifest_path = dir.join("MANIFEST");
+        let segment_dir = dir.join("segments");
+        let records = vec![WalRecord {
+            txn_id: 1,
+            payload: b"SET a=1".to_vec(),
+        }];
+
+        write_wal_archive(&manifest_path, &segment_dir, &records, 1).unwrap();
+        let err = read_wal_archive_to_txn(&manifest_path, 2).unwrap_err();
+        let _ = fs::remove_dir_all(dir);
+
+        assert!(err.to_string().contains("beyond last durable transaction"));
+    }
+
+    #[test]
+    fn wal_archive_target_rejects_missing_transaction_boundary() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpu-db-wal-archive-target-missing-{}-{}",
+            std::process::id(),
+            NEXT_TEST_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let manifest_path = dir.join("MANIFEST");
+        let segment_dir = dir.join("segments");
+        let records = vec![
+            WalRecord {
+                txn_id: 1,
+                payload: b"SET a=1".to_vec(),
+            },
+            WalRecord {
+                txn_id: 3,
+                payload: b"SET c=3".to_vec(),
+            },
+        ];
+
+        write_wal_archive(&manifest_path, &segment_dir, &records, 1).unwrap();
+        let err = read_wal_archive_to_txn(&manifest_path, 2).unwrap_err();
+        let _ = fs::remove_dir_all(dir);
+
+        assert!(err
+            .to_string()
+            .contains("does not contain target transaction"));
     }
 
     #[test]

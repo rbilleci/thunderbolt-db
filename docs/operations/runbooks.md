@@ -103,7 +103,8 @@ For the current single-node relational WAL segment proof:
 3. Verify relational catalog metadata, table rows, and equality-index-backed read paths are present after replay.
 4. For packaged checkpoint proof, persist with `Engine::persist_durable_wal_checkpoint(...)` and recover with `Engine::recover_from_durable_wal_checkpoint(...)`; the control file validates durable record count and last transaction id before replay.
 5. For multi-segment archive proof, persist with `Engine::persist_durable_wal_archive(...)` and recover with `Engine::recover_from_durable_wal_archive(...)`; the manifest validates segment paths, per-segment record counts, per-segment transaction ranges, overall durable record count, last durable transaction id, and increasing transaction order before replay.
-6. Treat PITR target selection, streaming archive ingestion, durable object-storage backup, and automatic retention cleanup as not yet implemented.
+6. For transaction-bound PITR proof, recover with `Engine::recover_from_durable_wal_archive_to_txn(...)`; the archive reader validates the whole archive, then replays only the exact requested transaction-bound prefix and rejects before-first, beyond-durable, or missing-boundary targets.
+7. Treat timestamp-based PITR target selection, streaming archive ingestion, durable object-storage backup, and automatic retention cleanup as not yet implemented.
 
 Failure criteria:
 
@@ -172,7 +173,7 @@ Operator checks:
 
 Current bootstrap storage can vacuum old MVCC tuple versions only through `Engine::checkpoint_vacuum_mvcc_versions(safe_txn_id)`. Choose a non-zero safe transaction id that is at or below the flushed WAL boundary and older than every active transaction. The call refuses unsafe boundaries, reports removed tuple/version counts, and keeps the durable WAL prefix as the replay source of truth.
 
-Do not manually prune tuple versions, relational row keys, or equality-index entries. Relational indexes remain volatile and are rebuilt from the durable WAL prefix during recovery; the current control file covers one selected durable segment, and the archive manifest covers ordered multi-segment replay, while PITR target selection and archive cleanup are still future storage work.
+Do not manually prune tuple versions, relational row keys, or equality-index entries. Relational indexes remain volatile and are rebuilt from the durable WAL prefix during recovery; the current control file covers one selected durable segment, and the archive manifest covers ordered multi-segment replay plus exact transaction-bound prefix restore, while timestamp-based PITR target selection and archive cleanup are still future storage work.
 
 ## 6) Release Evidence Bundle
 

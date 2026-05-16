@@ -28,9 +28,9 @@ use gpu_db_storage::{
 use gpu_db_txn::{TxnError, TxnManager};
 use gpu_db_types::{CommitToken, EngineError, Index, LogEntry, Role, SnapshotMeta, Term, TxnId};
 use gpu_db_wal::{
-    read_wal_archive, read_wal_checkpoint, read_wal_segment, write_wal_archive,
-    write_wal_control_file, write_wal_segment, WalArchiveManifest, WalBuffer, WalControlFile,
-    WalRecord,
+    read_wal_archive, read_wal_archive_to_txn, read_wal_checkpoint, read_wal_segment,
+    write_wal_archive, write_wal_control_file, write_wal_segment, WalArchiveManifest, WalBuffer,
+    WalControlFile, WalRecord,
 };
 
 #[derive(Debug, Default)]
@@ -6320,6 +6320,14 @@ impl Engine {
         manifest_path: impl AsRef<std::path::Path>,
     ) -> Result<Self, EngineError> {
         let (_manifest, records) = read_wal_archive(manifest_path)?;
+        Self::recover_from_durable_wal(&records)
+    }
+
+    pub fn recover_from_durable_wal_archive_to_txn(
+        manifest_path: impl AsRef<std::path::Path>,
+        target_txn_id: TxnId,
+    ) -> Result<Self, EngineError> {
+        let (_manifest, _target, records) = read_wal_archive_to_txn(manifest_path, target_txn_id)?;
         Self::recover_from_durable_wal(&records)
     }
 
@@ -23836,6 +23844,91 @@ mod tests {
             }
         );
         assert_eq!(result.rows, vec![vec![SqlValue::Int4(2)]]);
+    }
+
+    #[test]
+    fn relational_state_recovers_from_wal_archive_transaction_target() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpu-db-engine-wal-archive-target-{}-{}",
+            std::process::id(),
+            NEXT_TEST_WAL_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let manifest_path = dir.join("MANIFEST");
+        let segment_dir = dir.join("segments");
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(2, "INSERT INTO people (id, name) VALUES (1, 'Ada')")
+            .unwrap();
+        e.execute_text(3, "INSERT INTO people (id, name) VALUES (2, 'Grace')")
+            .unwrap();
+        e.execute_text(4, "INSERT INTO people (id, name) VALUES (3, 'Katherine')")
+            .unwrap();
+
+        e.persist_durable_wal_archive(&manifest_path, &segment_dir, 2)
+            .unwrap();
+        let mut recovered =
+            Engine::recover_from_durable_wal_archive_to_txn(&manifest_path, 3).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+
+        assert_eq!(recovered.wal_unflushed_count(), 0);
+        assert_eq!(recovered.wal_flushed_count(), 3);
+        let table = recovered.relational_catalog_table("people").unwrap();
+        assert_eq!(table.oid, FIRST_USER_RELATION_OID);
+
+        let Command::Select(grace_select) =
+            parse_command("SELECT id FROM people WHERE name = 'Grace'").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let grace_result = recovered.execute_relational_select(&grace_select).unwrap();
+        assert_eq!(
+            grace_result.access_path,
+            RelationalAccessPath::EqualityIndex {
+                table: "people".to_string(),
+                column: "name".to_string(),
+                matched_keys: 1,
+            }
+        );
+        assert_eq!(grace_result.rows, vec![vec![SqlValue::Int4(2)]]);
+
+        let Command::Select(katherine_select) =
+            parse_command("SELECT id FROM people WHERE name = 'Katherine'").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let katherine_result = recovered
+            .execute_relational_select(&katherine_select)
+            .unwrap();
+        assert_eq!(katherine_result.rows, Vec::<Vec<SqlValue>>::new());
+    }
+
+    #[test]
+    fn wal_archive_transaction_target_rejects_unavailable_durable_boundary() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpu-db-engine-wal-archive-target-missing-{}-{}",
+            std::process::id(),
+            NEXT_TEST_WAL_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let manifest_path = dir.join("MANIFEST");
+        let segment_dir = dir.join("segments");
+        let mut e = Engine::new_local();
+        e.execute_text(10, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(20, "INSERT INTO people (id, name) VALUES (1, 'Ada')")
+            .unwrap();
+
+        e.persist_durable_wal_archive(&manifest_path, &segment_dir, 1)
+            .unwrap();
+        let err = match Engine::recover_from_durable_wal_archive_to_txn(&manifest_path, 15) {
+            Ok(_) => panic!("expected unavailable target transaction error"),
+            Err(err) => err,
+        };
+        let _ = std::fs::remove_dir_all(dir);
+
+        assert!(err
+            .to_string()
+            .contains("does not contain target transaction"));
     }
 
     #[test]
