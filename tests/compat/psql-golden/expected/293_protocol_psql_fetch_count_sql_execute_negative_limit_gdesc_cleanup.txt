@@ -1,0 +1,28 @@
+=== psql fetch count sql execute negative limit gdesc cleanup ===
+CREATE TABLE
+INSERT 0 3
+PREPARE
+ Column |  Type
+--------+---------
+ id     | integer
+ name   | text
+(2 rows)
+
+psql:293_protocol_psql_fetch_count_sql_execute_negative_limit_gdesc_cleanup.sql:7: ERROR:  cursor does not exist
+ Column |  Type
+--------+---------
+ id     | integer
+ name   | text
+(2 rows)
+
+ id | name
+----+-------
+  1 | Ada
+  2 | Linus
+(2 rows)
+
+DEALLOCATE
+ name
+-------
+ Grace
+(1 row)
