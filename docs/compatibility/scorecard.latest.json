@@ -21,14 +21,14 @@
     "protocol.error_paths": {
       "failed": 0,
       "ignored": 0,
-      "passed": 108,
-      "total": 108
+      "passed": 109,
+      "total": 109
     },
     "protocol.extended_query": {
       "failed": 0,
       "ignored": 0,
-      "passed": 293,
-      "total": 293
+      "passed": 294,
+      "total": 294
     },
     "replication.operational_cluster": {
       "failed": 0,
@@ -89,8 +89,8 @@
   "totals": {
     "failed": 0,
     "ignored": 0,
-    "passed": 937,
-    "total": 937
+    "passed": 938,
+    "total": 938
   },
   "trend_hook": {
     "baseline_available": true,
