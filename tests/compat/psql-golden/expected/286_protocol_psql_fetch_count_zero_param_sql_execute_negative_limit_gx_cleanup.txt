@@ -1,0 +1,11 @@
+=== psql fetch count zero-param sql execute negative limit gx cleanup ===
+CREATE TABLE
+INSERT 0 3
+PREPARE
+psql:286_protocol_psql_fetch_count_zero_param_sql_execute_negative_limit_gx_cleanup.sql:6: ERROR:  LIMIT must not be negative
+psql:286_protocol_psql_fetch_count_zero_param_sql_execute_negative_limit_gx_cleanup.sql:7: ERROR:  cursor does not exist
+DEALLOCATE
+ name
+-------
+ Linus
+(1 row)
