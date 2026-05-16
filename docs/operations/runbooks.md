@@ -117,12 +117,13 @@ Current implemented scope:
 
 - `scripts/run_replication_cluster_smoke.sh` runs a packaged-local 3-node Raft smoke scenario through the checked-in Rust example entrypoint.
 - `scripts/run_replication_packaged_smoke.sh` builds `gpu_db_replication`'s `operational_cluster_smoke` example and executes the resulting local binary from `target/debug/examples/operational_cluster_smoke`.
+- `scripts/run_replication_multiprocess_smoke.sh` builds `gpu_db_replication`'s `operational_multiprocess_smoke` example and executes a bounded parent-plus-child-process deployment proof: the parent leader sends TCP AppendEntries frames to two independent follower child processes, then verifies follower catch-up and read-after-apply output.
 - The scenario demonstrates leader write admission, typed append-entries request/response handling with a tested binary frame codec and single-request TCP send/serve helper, follower catch-up, read-after-apply, deterministic request-vote election before failover, old-leader `NotLeader` rejection after failover, and continued writes on the elected leader.
 - The smoke commands emit an `operational_deployment_preflight=passed` line only when the smoke proof passes and the current TCP append-entries transport evidence, deterministic election evidence, packaged-local entrypoint evidence, deployment scope, and gap status are explicitly reported.
 
 Current simulated/not-yet-implemented scope:
 
-- No long-running packaged multi-process node deployment; the implemented packaging proof is a reproducible local binary smoke harness.
+- No long-running packaged node service deployment; the implemented packaging proofs are reproducible local binary smoke harnesses, including a bounded multi-process parent/follower proof.
 - No membership reconfiguration. The current election proof is deterministic request-vote voting inside the local smoke harness, not a timer-driven production election loop.
 - No packaged container/Kubernetes deployment harness.
 
@@ -131,6 +132,7 @@ Run from repository root:
 ```bash
 scripts/run_replication_cluster_smoke.sh
 scripts/run_replication_packaged_smoke.sh
+scripts/run_replication_multiprocess_smoke.sh
 ```
 
 Pass criteria:
@@ -146,6 +148,7 @@ Pass criteria:
 - `promoted_leader_commit`, `follower_commit`, and `follower_applied` are equal.
 - `failover_admission_gate` reports old-leader write rejection and `promoted_node_role=Leader`.
 - `deployment_gap_network_transport`, `deployment_gap_automatic_election`, and `deployment_gap_packaged_deployment` report `implemented`.
+- Multi-process smoke output includes `operational_replication_multiprocess_smoke=passed`, `multiprocess_transport=tcp_append_entries`, one `multiprocess_follower ... caught_up=true` line per child process, and explicit `deployment_gap_packaged_multiprocess_smoke=implemented` plus remaining long-running service/container gaps.
 
 ## 5) CPU Fallback Monitoring (No-GPU bootstrap)
 
