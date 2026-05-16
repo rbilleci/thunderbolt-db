@@ -1,0 +1,17 @@
+=== psql fetch count sql execute gx argument count cleanup ===
+CREATE TABLE
+INSERT 0 3
+PREPARE
+psql:274_protocol_psql_fetch_count_sql_execute_gx_argument_mismatch_cleanup.sql:6: ERROR:  bound parameter count does not match prepared statement
+psql:274_protocol_psql_fetch_count_sql_execute_gx_argument_mismatch_cleanup.sql:7: ERROR:  cursor does not exist
+psql:274_protocol_psql_fetch_count_sql_execute_gx_argument_mismatch_cleanup.sql:8: ERROR:  bound parameter count does not match prepared statement
+psql:274_protocol_psql_fetch_count_sql_execute_gx_argument_mismatch_cleanup.sql:9: ERROR:  cursor does not exist
+-[ RECORD 1 ]
+id   | 2
+name | Linus
+
+DEALLOCATE
+ name
+-------
+ Grace
+(1 row)
