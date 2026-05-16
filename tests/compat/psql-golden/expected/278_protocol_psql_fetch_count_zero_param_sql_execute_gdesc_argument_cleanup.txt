@@ -1,0 +1,25 @@
+=== psql fetch count zero-param sql execute gdesc argument cleanup ===
+CREATE TABLE
+INSERT 0 3
+PREPARE
+psql:278_protocol_psql_fetch_count_zero_param_sql_execute_gdesc_argument_cleanup.sql:6: ERROR:  bound parameter count does not match prepared statement
+psql:278_protocol_psql_fetch_count_zero_param_sql_execute_gdesc_argument_cleanup.sql:7: ERROR:  cursor does not exist
+psql:278_protocol_psql_fetch_count_zero_param_sql_execute_gdesc_argument_cleanup.sql:8: ERROR:  bound parameter count does not match prepared statement
+psql:278_protocol_psql_fetch_count_zero_param_sql_execute_gdesc_argument_cleanup.sql:9: ERROR:  cursor does not exist
+ Column |  Type
+--------+---------
+ id     | integer
+ name   | text
+(2 rows)
+
+ id | name
+----+-------
+  2 | Linus
+  3 | Grace
+(2 rows)
+
+DEALLOCATE
+ name
+------
+ Ada
+(1 row)
