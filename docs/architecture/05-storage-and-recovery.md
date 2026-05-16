@@ -12,6 +12,8 @@ The first implemented local WAL segment format stores the flushed WAL prefix in 
 
 The first checkpoint-control slice adds a small text control file. `Engine::persist_durable_wal_checkpoint(...)` writes the durable WAL segment and then atomically installs control metadata containing the segment path, durable record count, and last durable transaction id. `Engine::recover_from_durable_wal_checkpoint(...)` reads the control file, resolves the segment path relative to that file, validates the record count and last transaction id against the checksummed segment, and only then replays the committed prefix.
 
+The first multi-segment archive slice adds a local text manifest plus ordered checksummed segment files. `Engine::persist_durable_wal_archive(...)` splits the flushed WAL prefix into bounded segment files and writes a manifest containing each segment path, record count, first transaction id, last transaction id, and overall durable checkpoint metadata. `Engine::recover_from_durable_wal_archive(...)` resolves paths relative to the manifest, validates every segment and the overall transaction order, and then replays the same committed prefix recovery path used by single-segment recovery.
+
 ## Recovery sequence
 
 1. Validate control metadata
@@ -20,7 +22,7 @@ The first checkpoint-control slice adds a small text control file. `Engine::pers
 4. Rebuild volatile caches (GPU) from durable state
 5. Open for traffic after readiness gates pass
 
-Current limitation: checkpoint-control metadata covers one selected durable segment. Operators should treat the checked-in file-backed path as a restart/replay proof with deterministic segment discovery from one control file, not as packaged PITR, multi-segment archival replay, or automatic retention cleanup.
+Current limitation: checkpoint-control metadata covers one selected durable segment, and the archive manifest covers ordered replay of all durable records rather than arbitrary target-time restore. Operators should treat the checked-in file-backed paths as restart/replay proofs with deterministic segment discovery, not as packaged PITR target selection, streaming archive ingestion, durable object-storage backup, or automatic retention cleanup.
 
 ## Compaction/snapshot boundary
 

@@ -6,6 +6,7 @@ use gpu_db_types::{EngineError, TxnId};
 
 const WAL_SEGMENT_MAGIC: &[u8; 10] = b"GPUDBWAL1\n";
 const WAL_CONTROL_MAGIC: &str = "GPUDBWALCONTROL1";
+const WAL_ARCHIVE_MANIFEST_MAGIC: &str = "GPUDBWALARCHIVE1";
 const WAL_RECORD_HEADER_LEN: usize = 24;
 
 #[derive(Debug, Clone)]
@@ -23,6 +24,20 @@ pub struct WalCheckpointMeta {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalControlFile {
     pub segment_path: PathBuf,
+    pub checkpoint: WalCheckpointMeta,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalArchiveSegment {
+    pub segment_path: PathBuf,
+    pub record_count: usize,
+    pub first_txn_id: Option<TxnId>,
+    pub last_txn_id: Option<TxnId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalArchiveManifest {
+    pub segments: Vec<WalArchiveSegment>,
     pub checkpoint: WalCheckpointMeta,
 }
 
@@ -338,6 +353,257 @@ pub fn read_wal_checkpoint(
     Ok((control, records))
 }
 
+pub fn write_wal_archive(
+    manifest_path: impl AsRef<Path>,
+    segment_dir: impl AsRef<Path>,
+    records: &[WalRecord],
+    records_per_segment: usize,
+) -> Result<WalArchiveManifest, EngineError> {
+    if records_per_segment == 0 {
+        return Err(EngineError::Durability(
+            "WAL archive records_per_segment must be non-zero".to_string(),
+        ));
+    }
+
+    let manifest_path = manifest_path.as_ref();
+    let segment_dir = segment_dir.as_ref();
+    fs::create_dir_all(segment_dir).map_err(|err| {
+        EngineError::Durability(format!(
+            "failed to create WAL archive segment directory {}: {err}",
+            segment_dir.display()
+        ))
+    })?;
+
+    let mut segments = Vec::new();
+    for (index, chunk) in records.chunks(records_per_segment).enumerate() {
+        let file_name = format!("segment-{:04}.wal", index + 1);
+        let segment_path = segment_dir.join(&file_name);
+        write_wal_segment(&segment_path, chunk)?;
+        let manifest_segment_path = segment_path
+            .strip_prefix(manifest_path.parent().unwrap_or_else(|| Path::new(".")))
+            .unwrap_or(&segment_path)
+            .to_path_buf();
+        segments.push(WalArchiveSegment {
+            segment_path: manifest_segment_path,
+            record_count: chunk.len(),
+            first_txn_id: chunk.first().map(|record| record.txn_id),
+            last_txn_id: chunk.last().map(|record| record.txn_id),
+        });
+    }
+
+    let manifest = WalArchiveManifest {
+        segments,
+        checkpoint: WalCheckpointMeta {
+            durable_record_count: records.len(),
+            last_durable_txn_id: records.last().map(|record| record.txn_id),
+        },
+    };
+    write_wal_archive_manifest(manifest_path, &manifest)?;
+    Ok(manifest)
+}
+
+pub fn write_wal_archive_manifest(
+    path: impl AsRef<Path>,
+    manifest: &WalArchiveManifest,
+) -> Result<(), EngineError> {
+    let path = path.as_ref();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            EngineError::Durability(format!(
+                "failed to create WAL archive manifest directory {}: {err}",
+                parent.display()
+            ))
+        })?;
+    }
+
+    let mut body = format!(
+        "{WAL_ARCHIVE_MANIFEST_MAGIC}\ndurable_record_count={}\nlast_durable_txn_id={}\nsegments={}\n",
+        manifest.checkpoint.durable_record_count,
+        format_optional_txn(manifest.checkpoint.last_durable_txn_id),
+        manifest.segments.len()
+    );
+    for segment in &manifest.segments {
+        if segment.segment_path.to_string_lossy().contains('|') {
+            return Err(EngineError::Durability(format!(
+                "WAL archive segment path contains unsupported delimiter: {}",
+                segment.segment_path.display()
+            )));
+        }
+        body.push_str(&format!(
+            "segment={}|{}|{}|{}\n",
+            segment.segment_path.display(),
+            segment.record_count,
+            format_optional_txn(segment.first_txn_id),
+            format_optional_txn(segment.last_txn_id)
+        ));
+    }
+
+    let tmp_path = temporary_control_path(path);
+    let write_result = (|| {
+        let mut file = File::create(&tmp_path).map_err(|err| {
+            EngineError::Durability(format!(
+                "failed to create WAL archive manifest {}: {err}",
+                tmp_path.display()
+            ))
+        })?;
+        file.write_all(body.as_bytes()).map_err(|err| {
+            EngineError::Durability(format!(
+                "failed to write WAL archive manifest {}: {err}",
+                tmp_path.display()
+            ))
+        })?;
+        file.sync_all().map_err(|err| {
+            EngineError::Durability(format!(
+                "failed to sync WAL archive manifest {}: {err}",
+                tmp_path.display()
+            ))
+        })?;
+        Ok::<_, EngineError>(())
+    })();
+
+    if let Err(err) = write_result {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+
+    fs::rename(&tmp_path, path).map_err(|err| {
+        let _ = fs::remove_file(&tmp_path);
+        EngineError::Durability(format!(
+            "failed to install WAL archive manifest {}: {err}",
+            path.display()
+        ))
+    })
+}
+
+pub fn read_wal_archive_manifest(
+    path: impl AsRef<Path>,
+) -> Result<WalArchiveManifest, EngineError> {
+    let path = path.as_ref();
+    let body = fs::read_to_string(path).map_err(|err| {
+        EngineError::Durability(format!(
+            "failed to read WAL archive manifest {}: {err}",
+            path.display()
+        ))
+    })?;
+    let mut lines = body.lines();
+    if lines.next() != Some(WAL_ARCHIVE_MANIFEST_MAGIC) {
+        return Err(EngineError::Durability(format!(
+            "invalid WAL archive manifest header {}",
+            path.display()
+        )));
+    }
+
+    let durable_record_count = parse_control_value(lines.next(), "durable_record_count", path)?
+        .parse()
+        .map_err(|err| {
+            EngineError::Durability(format!(
+                "invalid WAL archive durable_record_count {}: {err}",
+                path.display()
+            ))
+        })?;
+    let last_durable_txn_id = parse_optional_txn(
+        parse_control_value(lines.next(), "last_durable_txn_id", path)?,
+        "last_durable_txn_id",
+        path,
+    )?;
+    let segment_count: usize = parse_control_value(lines.next(), "segments", path)?
+        .parse()
+        .map_err(|err| {
+            EngineError::Durability(format!(
+                "invalid WAL archive segments {}: {err}",
+                path.display()
+            ))
+        })?;
+
+    let mut segments = Vec::with_capacity(segment_count);
+    for _ in 0..segment_count {
+        let raw = parse_control_value(lines.next(), "segment", path)?;
+        let mut parts = raw.split('|');
+        let segment_path = parts.next().ok_or_else(|| {
+            EngineError::Durability(format!("invalid WAL archive segment in {}", path.display()))
+        })?;
+        let record_count = parts
+            .next()
+            .ok_or_else(|| {
+                EngineError::Durability(format!(
+                    "missing WAL archive segment record count in {}",
+                    path.display()
+                ))
+            })?
+            .parse()
+            .map_err(|err| {
+                EngineError::Durability(format!(
+                    "invalid WAL archive segment record count {}: {err}",
+                    path.display()
+                ))
+            })?;
+        let first_txn_id = parse_optional_txn(
+            parts.next().ok_or_else(|| {
+                EngineError::Durability(format!(
+                    "missing WAL archive segment first txn in {}",
+                    path.display()
+                ))
+            })?,
+            "segment first txn",
+            path,
+        )?;
+        let last_txn_id = parse_optional_txn(
+            parts.next().ok_or_else(|| {
+                EngineError::Durability(format!(
+                    "missing WAL archive segment last txn in {}",
+                    path.display()
+                ))
+            })?,
+            "segment last txn",
+            path,
+        )?;
+        if parts.next().is_some() {
+            return Err(EngineError::Durability(format!(
+                "invalid WAL archive segment field count in {}",
+                path.display()
+            )));
+        }
+        segments.push(WalArchiveSegment {
+            segment_path: PathBuf::from(segment_path),
+            record_count,
+            first_txn_id,
+            last_txn_id,
+        });
+    }
+    if lines.next().is_some() {
+        return Err(EngineError::Durability(format!(
+            "unexpected WAL archive manifest trailing content {}",
+            path.display()
+        )));
+    }
+
+    let manifest = WalArchiveManifest {
+        segments,
+        checkpoint: WalCheckpointMeta {
+            durable_record_count,
+            last_durable_txn_id,
+        },
+    };
+    validate_archive_manifest_shape(path, &manifest)?;
+    Ok(manifest)
+}
+
+pub fn read_wal_archive(
+    manifest_path: impl AsRef<Path>,
+) -> Result<(WalArchiveManifest, Vec<WalRecord>), EngineError> {
+    let manifest_path = manifest_path.as_ref();
+    let manifest = read_wal_archive_manifest(manifest_path)?;
+    let mut records = Vec::new();
+    for segment in &manifest.segments {
+        let segment_path = resolve_manifest_path(manifest_path, &segment.segment_path);
+        let segment_records = read_wal_segment(&segment_path)?;
+        validate_archive_segment(manifest_path, segment, &segment_records)?;
+        records.extend(segment_records);
+    }
+    validate_archive_records(manifest_path, &manifest, &records)?;
+    Ok((manifest, records))
+}
+
 fn validate_checkpoint_control(
     control_path: &Path,
     control: &WalControlFile,
@@ -361,6 +627,126 @@ fn validate_checkpoint_control(
         )));
     }
     Ok(())
+}
+
+fn validate_archive_manifest_shape(
+    manifest_path: &Path,
+    manifest: &WalArchiveManifest,
+) -> Result<(), EngineError> {
+    let segment_records: usize = manifest
+        .segments
+        .iter()
+        .map(|segment| segment.record_count)
+        .sum();
+    if segment_records != manifest.checkpoint.durable_record_count {
+        return Err(EngineError::Durability(format!(
+            "WAL archive {} expected {} durable records but manifest segments describe {}",
+            manifest_path.display(),
+            manifest.checkpoint.durable_record_count,
+            segment_records
+        )));
+    }
+    if manifest.segments.is_empty() && manifest.checkpoint.last_durable_txn_id.is_some() {
+        return Err(EngineError::Durability(format!(
+            "WAL archive {} has no segments but records a last durable transaction",
+            manifest_path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_archive_segment(
+    manifest_path: &Path,
+    segment: &WalArchiveSegment,
+    records: &[WalRecord],
+) -> Result<(), EngineError> {
+    if records.len() != segment.record_count {
+        return Err(EngineError::Durability(format!(
+            "WAL archive {} segment {} expected {} records but contains {}",
+            manifest_path.display(),
+            segment.segment_path.display(),
+            segment.record_count,
+            records.len()
+        )));
+    }
+    let actual_first = records.first().map(|record| record.txn_id);
+    let actual_last = records.last().map(|record| record.txn_id);
+    if actual_first != segment.first_txn_id || actual_last != segment.last_txn_id {
+        return Err(EngineError::Durability(format!(
+            "WAL archive {} segment {} expected txn range {:?}..{:?} but contains {:?}..{:?}",
+            manifest_path.display(),
+            segment.segment_path.display(),
+            segment.first_txn_id,
+            segment.last_txn_id,
+            actual_first,
+            actual_last
+        )));
+    }
+    Ok(())
+}
+
+fn validate_archive_records(
+    manifest_path: &Path,
+    manifest: &WalArchiveManifest,
+    records: &[WalRecord],
+) -> Result<(), EngineError> {
+    if records.len() != manifest.checkpoint.durable_record_count {
+        return Err(EngineError::Durability(format!(
+            "WAL archive {} expected {} durable records but read {}",
+            manifest_path.display(),
+            manifest.checkpoint.durable_record_count,
+            records.len()
+        )));
+    }
+    let actual_last = records.last().map(|record| record.txn_id);
+    if actual_last != manifest.checkpoint.last_durable_txn_id {
+        return Err(EngineError::Durability(format!(
+            "WAL archive {} expected last durable txn {:?} but read {:?}",
+            manifest_path.display(),
+            manifest.checkpoint.last_durable_txn_id,
+            actual_last
+        )));
+    }
+    for window in records.windows(2) {
+        if window[0].txn_id >= window[1].txn_id {
+            return Err(EngineError::Durability(format!(
+                "WAL archive {} has non-increasing transaction order at {} then {}",
+                manifest_path.display(),
+                window[0].txn_id,
+                window[1].txn_id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn resolve_manifest_path(manifest_path: &Path, data_path: &Path) -> PathBuf {
+    if data_path.is_absolute() {
+        data_path.to_path_buf()
+    } else {
+        manifest_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(data_path)
+    }
+}
+
+fn format_optional_txn(txn_id: Option<TxnId>) -> String {
+    txn_id
+        .map(|txn_id| txn_id.to_string())
+        .unwrap_or_else(|| "none".to_string())
+}
+
+fn parse_optional_txn(raw: &str, field: &str, path: &Path) -> Result<Option<TxnId>, EngineError> {
+    match raw {
+        "none" => Ok(None),
+        raw => raw.parse().map(Some).map_err(|err| {
+            EngineError::Durability(format!(
+                "invalid WAL archive {field} {}: {err}",
+                path.display()
+            ))
+        }),
+    }
 }
 
 fn write_record(file: &mut File, record: &WalRecord) -> Result<(), EngineError> {
@@ -775,5 +1161,163 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
 
         assert!(err.to_string().contains("expected 2 durable records"));
+    }
+
+    #[test]
+    fn wal_archive_round_trips_ordered_segments() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpu-db-wal-archive-{}-{}",
+            std::process::id(),
+            NEXT_TEST_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let manifest_path = dir.join("MANIFEST");
+        let segment_dir = dir.join("segments");
+        let records = vec![
+            WalRecord {
+                txn_id: 1,
+                payload: b"SET a=1".to_vec(),
+            },
+            WalRecord {
+                txn_id: 2,
+                payload: b"SET b=2".to_vec(),
+            },
+            WalRecord {
+                txn_id: 3,
+                payload: b"SET c=3".to_vec(),
+            },
+        ];
+
+        let manifest = write_wal_archive(&manifest_path, &segment_dir, &records, 2).unwrap();
+        let (recovered_manifest, recovered_records) = read_wal_archive(&manifest_path).unwrap();
+        let _ = fs::remove_dir_all(dir);
+
+        assert_eq!(recovered_manifest, manifest);
+        assert_eq!(recovered_manifest.segments.len(), 2);
+        assert_eq!(
+            recovered_manifest.checkpoint,
+            WalCheckpointMeta {
+                durable_record_count: 3,
+                last_durable_txn_id: Some(3),
+            }
+        );
+        assert_eq!(recovered_records.len(), 3);
+        assert_eq!(recovered_records[2].payload, b"SET c=3");
+    }
+
+    #[test]
+    fn wal_archive_rejects_missing_segment() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpu-db-wal-archive-missing-{}-{}",
+            std::process::id(),
+            NEXT_TEST_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let manifest_path = dir.join("MANIFEST");
+        let segment_dir = dir.join("segments");
+        let records = vec![WalRecord {
+            txn_id: 1,
+            payload: b"SET a=1".to_vec(),
+        }];
+
+        let manifest = write_wal_archive(&manifest_path, &segment_dir, &records, 1).unwrap();
+        fs::remove_file(resolve_manifest_path(
+            &manifest_path,
+            &manifest.segments[0].segment_path,
+        ))
+        .unwrap();
+        let err = read_wal_archive(&manifest_path).unwrap_err();
+        let _ = fs::remove_dir_all(dir);
+
+        assert!(err.to_string().contains("failed to open WAL segment"));
+    }
+
+    #[test]
+    fn wal_archive_rejects_manifest_record_count_mismatch() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpu-db-wal-archive-count-{}-{}",
+            std::process::id(),
+            NEXT_TEST_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let manifest_path = dir.join("MANIFEST");
+        let segment_path = dir.join("segment-0001.wal");
+        write_wal_segment(
+            &segment_path,
+            &[WalRecord {
+                txn_id: 1,
+                payload: b"SET a=1".to_vec(),
+            }],
+        )
+        .unwrap();
+        let manifest = WalArchiveManifest {
+            segments: vec![WalArchiveSegment {
+                segment_path: PathBuf::from("segment-0001.wal"),
+                record_count: 2,
+                first_txn_id: Some(1),
+                last_txn_id: Some(1),
+            }],
+            checkpoint: WalCheckpointMeta {
+                durable_record_count: 2,
+                last_durable_txn_id: Some(1),
+            },
+        };
+        write_wal_archive_manifest(&manifest_path, &manifest).unwrap();
+
+        let err = read_wal_archive(&manifest_path).unwrap_err();
+        let _ = fs::remove_dir_all(dir);
+
+        assert!(err.to_string().contains("expected 2 records"));
+    }
+
+    #[test]
+    fn wal_archive_rejects_non_increasing_transaction_order() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpu-db-wal-archive-order-{}-{}",
+            std::process::id(),
+            NEXT_TEST_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let manifest_path = dir.join("MANIFEST");
+        let segment_a = dir.join("segment-0001.wal");
+        let segment_b = dir.join("segment-0002.wal");
+        write_wal_segment(
+            &segment_a,
+            &[WalRecord {
+                txn_id: 2,
+                payload: b"SET b=2".to_vec(),
+            }],
+        )
+        .unwrap();
+        write_wal_segment(
+            &segment_b,
+            &[WalRecord {
+                txn_id: 1,
+                payload: b"SET a=1".to_vec(),
+            }],
+        )
+        .unwrap();
+        let manifest = WalArchiveManifest {
+            segments: vec![
+                WalArchiveSegment {
+                    segment_path: PathBuf::from("segment-0001.wal"),
+                    record_count: 1,
+                    first_txn_id: Some(2),
+                    last_txn_id: Some(2),
+                },
+                WalArchiveSegment {
+                    segment_path: PathBuf::from("segment-0002.wal"),
+                    record_count: 1,
+                    first_txn_id: Some(1),
+                    last_txn_id: Some(1),
+                },
+            ],
+            checkpoint: WalCheckpointMeta {
+                durable_record_count: 2,
+                last_durable_txn_id: Some(1),
+            },
+        };
+        write_wal_archive_manifest(&manifest_path, &manifest).unwrap();
+
+        let err = read_wal_archive(&manifest_path).unwrap_err();
+        let _ = fs::remove_dir_all(dir);
+
+        assert!(err.to_string().contains("non-increasing transaction order"));
     }
 }

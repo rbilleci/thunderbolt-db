@@ -28,8 +28,9 @@ use gpu_db_storage::{
 use gpu_db_txn::{TxnError, TxnManager};
 use gpu_db_types::{CommitToken, EngineError, Index, LogEntry, Role, SnapshotMeta, Term, TxnId};
 use gpu_db_wal::{
-    read_wal_checkpoint, read_wal_segment, write_wal_control_file, write_wal_segment, WalBuffer,
-    WalControlFile, WalRecord,
+    read_wal_archive, read_wal_checkpoint, read_wal_segment, write_wal_archive,
+    write_wal_control_file, write_wal_segment, WalArchiveManifest, WalBuffer, WalControlFile,
+    WalRecord,
 };
 
 #[derive(Debug, Default)]
@@ -6315,6 +6316,13 @@ impl Engine {
         Self::recover_from_durable_wal(&records)
     }
 
+    pub fn recover_from_durable_wal_archive(
+        manifest_path: impl AsRef<std::path::Path>,
+    ) -> Result<Self, EngineError> {
+        let (_manifest, records) = read_wal_archive(manifest_path)?;
+        Self::recover_from_durable_wal(&records)
+    }
+
     pub fn with_planner_config(planner_cfg: PlannerConfig) -> Self {
         Self {
             repl: LocalReplicator::leader(),
@@ -7578,6 +7586,20 @@ impl Engine {
                 segment_path: control_segment_path,
                 checkpoint: self.wal.checkpoint_meta(),
             },
+        )
+    }
+
+    pub fn persist_durable_wal_archive(
+        &self,
+        manifest_path: impl AsRef<std::path::Path>,
+        segment_dir: impl AsRef<std::path::Path>,
+        records_per_segment: usize,
+    ) -> Result<WalArchiveManifest, EngineError> {
+        write_wal_archive(
+            manifest_path,
+            segment_dir,
+            self.durable_wal_records(),
+            records_per_segment,
         )
     }
 
@@ -23751,6 +23773,53 @@ mod tests {
         let table = recovered.relational_catalog_table("people").unwrap();
         assert_eq!(table.oid, FIRST_USER_RELATION_OID);
 
+        let Command::Select(select) =
+            parse_command("SELECT id FROM people WHERE name = 'Grace'").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let result = recovered.execute_relational_select(&select).unwrap();
+
+        assert_eq!(
+            result.access_path,
+            RelationalAccessPath::EqualityIndex {
+                table: "people".to_string(),
+                column: "name".to_string(),
+                matched_keys: 1,
+            }
+        );
+        assert_eq!(result.rows, vec![vec![SqlValue::Int4(2)]]);
+    }
+
+    #[test]
+    fn relational_state_recovers_from_multi_segment_wal_archive() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpu-db-engine-wal-archive-{}-{}",
+            std::process::id(),
+            NEXT_TEST_WAL_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let manifest_path = dir.join("MANIFEST");
+        let segment_dir = dir.join("segments");
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(2, "INSERT INTO people (id, name) VALUES (1, 'Ada')")
+            .unwrap();
+        e.execute_text(3, "INSERT INTO people (id, name) VALUES (2, 'Grace')")
+            .unwrap();
+
+        let manifest = e
+            .persist_durable_wal_archive(&manifest_path, &segment_dir, 1)
+            .unwrap();
+        assert_eq!(manifest.segments.len(), 3);
+
+        let mut recovered = Engine::recover_from_durable_wal_archive(&manifest_path).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+
+        assert_eq!(recovered.wal_unflushed_count(), 0);
+        assert_eq!(recovered.wal_flushed_count(), 3);
+        let table = recovered.relational_catalog_table("people").unwrap();
+        assert_eq!(table.oid, FIRST_USER_RELATION_OID);
         let Command::Select(select) =
             parse_command("SELECT id FROM people WHERE name = 'Grace'").unwrap()
         else {

@@ -29,6 +29,7 @@ This document defines operational resilience strategy and implementation boundar
 - Continuous WAL archive to durable object storage.
 - Archive retention policy tied to PITR window target.
 - Archive lag is monitored and alertable.
+- Current checked-in local proof: an ordered WAL archive manifest can reference multiple checksummed segment files, validate per-segment record counts and transaction ranges, and replay the full durable prefix through engine recovery. This is a local restart/restore proof, not continuous object-storage archival or PITR target selection.
 
 ## PITR model
 
@@ -104,6 +105,7 @@ This document defines operational resilience strategy and implementation boundar
 ### v0
 - Base backup + WAL archiving + local restore
 - Crash recovery validation in CI/nightly
+- Implemented local proof: multi-segment durable WAL archive manifest + replay for the full committed prefix.
 
 ### v0.5
 - PITR target selection and timeline handling
