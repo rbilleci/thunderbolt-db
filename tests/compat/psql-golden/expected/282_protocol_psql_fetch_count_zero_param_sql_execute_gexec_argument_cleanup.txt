@@ -1,0 +1,26 @@
+=== psql fetch count zero-param sql execute gexec argument cleanup ===
+CREATE TABLE
+CREATE TABLE
+INSERT 0 3
+INSERT 0 1
+PREPARE
+psql:282_protocol_psql_fetch_count_zero_param_sql_execute_gexec_argument_cleanup.sql:8: ERROR:  bound parameter count does not match prepared statement
+psql:282_protocol_psql_fetch_count_zero_param_sql_execute_gexec_argument_cleanup.sql:9: ERROR:  cursor does not exist
+psql:282_protocol_psql_fetch_count_zero_param_sql_execute_gexec_argument_cleanup.sql:10: ERROR:  bound parameter count does not match prepared statement
+psql:282_protocol_psql_fetch_count_zero_param_sql_execute_gexec_argument_cleanup.sql:11: ERROR:  cursor does not exist
+ name
+-------
+ Linus
+(1 row)
+
+psql:282_protocol_psql_fetch_count_zero_param_sql_execute_gexec_argument_cleanup.sql:14: ERROR:  cursor does not exist
+                              command
+--------------------------------------------------------------------
+ SELECT name FROM fetch_count_zero_gexec_arity_people WHERE id = 2;
+(1 row)
+
+DEALLOCATE
+ name
+-------
+ Grace
+(1 row)
