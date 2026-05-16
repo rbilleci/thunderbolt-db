@@ -1,0 +1,17 @@
+=== psql fetch count sql execute bind invalid cleanup ===
+CREATE TABLE
+INSERT 0 3
+PREPARE
+psql:268_protocol_psql_fetch_count_sql_execute_bind_invalid_cleanup.sql:6: ERROR:  invalid input syntax for parameter type oid 23: "not_an_int"
+psql:268_protocol_psql_fetch_count_sql_execute_bind_invalid_cleanup.sql:8: ERROR:  cursor does not exist
+ id | name
+----+-------
+  2 | Linus
+  3 | Grace
+(2 rows)
+
+DEALLOCATE
+ name
+------
+ Ada
+(1 row)
