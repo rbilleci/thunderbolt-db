@@ -40,10 +40,25 @@ pub struct WalArchiveSegment {
 pub struct WalArchiveManifest {
     pub segments: Vec<WalArchiveSegment>,
     pub checkpoint: WalCheckpointMeta,
+    pub record_timestamps: Vec<WalArchiveRecordTimestamp>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WalArchiveRecoveryTarget {
+    pub target_txn_id: TxnId,
+    pub recovered_record_count: usize,
+    pub last_recovered_txn_id: TxnId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalArchiveRecordTimestamp {
+    pub txn_id: TxnId,
+    pub timestamp_micros: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalArchiveTimestampRecoveryTarget {
+    pub target_timestamp_micros: u64,
     pub target_txn_id: TxnId,
     pub recovered_record_count: usize,
     pub last_recovered_txn_id: TxnId,
@@ -376,6 +391,22 @@ pub fn write_wal_archive(
     records: &[WalRecord],
     records_per_segment: usize,
 ) -> Result<WalArchiveManifest, EngineError> {
+    write_wal_archive_with_timestamps(
+        manifest_path,
+        segment_dir,
+        records,
+        records_per_segment,
+        &[],
+    )
+}
+
+pub fn write_wal_archive_with_timestamps(
+    manifest_path: impl AsRef<Path>,
+    segment_dir: impl AsRef<Path>,
+    records: &[WalRecord],
+    records_per_segment: usize,
+    record_timestamps: &[WalArchiveRecordTimestamp],
+) -> Result<WalArchiveManifest, EngineError> {
     if records_per_segment == 0 {
         return Err(EngineError::Durability(
             "WAL archive records_per_segment must be non-zero".to_string(),
@@ -384,6 +415,7 @@ pub fn write_wal_archive(
 
     let manifest_path = manifest_path.as_ref();
     let segment_dir = segment_dir.as_ref();
+    validate_timestamp_metadata(manifest_path, records, record_timestamps)?;
     fs::create_dir_all(segment_dir).map_err(|err| {
         EngineError::Durability(format!(
             "failed to create WAL archive segment directory {}: {err}",
@@ -414,6 +446,7 @@ pub fn write_wal_archive(
             durable_record_count: records.len(),
             last_durable_txn_id: records.last().map(|record| record.txn_id),
         },
+        record_timestamps: record_timestamps.to_vec(),
     };
     write_wal_archive_manifest(manifest_path, &manifest)?;
     Ok(manifest)
@@ -452,6 +485,12 @@ pub fn write_wal_archive_manifest(
             segment.record_count,
             format_optional_txn(segment.first_txn_id),
             format_optional_txn(segment.last_txn_id)
+        ));
+    }
+    for timestamp in &manifest.record_timestamps {
+        body.push_str(&format!(
+            "record_timestamp={}|{}\n",
+            timestamp.txn_id, timestamp.timestamp_micros
         ));
     }
 
@@ -587,11 +626,50 @@ pub fn read_wal_archive_manifest(
             last_txn_id,
         });
     }
-    if lines.next().is_some() {
-        return Err(EngineError::Durability(format!(
-            "unexpected WAL archive manifest trailing content {}",
-            path.display()
-        )));
+    let mut record_timestamps = Vec::new();
+    for line in lines {
+        let raw = parse_control_value(Some(line), "record_timestamp", path)?;
+        let mut parts = raw.split('|');
+        let txn_id = parts
+            .next()
+            .ok_or_else(|| {
+                EngineError::Durability(format!(
+                    "missing WAL archive record timestamp txn in {}",
+                    path.display()
+                ))
+            })?
+            .parse()
+            .map_err(|err| {
+                EngineError::Durability(format!(
+                    "invalid WAL archive record timestamp txn {}: {err}",
+                    path.display()
+                ))
+            })?;
+        let timestamp_micros = parts
+            .next()
+            .ok_or_else(|| {
+                EngineError::Durability(format!(
+                    "missing WAL archive record timestamp value in {}",
+                    path.display()
+                ))
+            })?
+            .parse()
+            .map_err(|err| {
+                EngineError::Durability(format!(
+                    "invalid WAL archive record timestamp value {}: {err}",
+                    path.display()
+                ))
+            })?;
+        if parts.next().is_some() {
+            return Err(EngineError::Durability(format!(
+                "invalid WAL archive record timestamp field count in {}",
+                path.display()
+            )));
+        }
+        record_timestamps.push(WalArchiveRecordTimestamp {
+            txn_id,
+            timestamp_micros,
+        });
     }
 
     let manifest = WalArchiveManifest {
@@ -600,6 +678,7 @@ pub fn read_wal_archive_manifest(
             durable_record_count,
             last_durable_txn_id,
         },
+        record_timestamps,
     };
     validate_archive_manifest_shape(path, &manifest)?;
     Ok(manifest)
@@ -618,6 +697,7 @@ pub fn read_wal_archive(
         records.extend(segment_records);
     }
     validate_archive_records(manifest_path, &manifest, &records)?;
+    validate_archive_timestamps(manifest_path, &manifest, &records)?;
     Ok((manifest, records))
 }
 
@@ -678,6 +758,98 @@ pub fn read_wal_archive_to_txn(
     ))
 }
 
+pub fn read_wal_archive_to_timestamp_micros(
+    manifest_path: impl AsRef<Path>,
+    target_timestamp_micros: u64,
+) -> Result<
+    (
+        WalArchiveManifest,
+        WalArchiveTimestampRecoveryTarget,
+        Vec<WalRecord>,
+    ),
+    EngineError,
+> {
+    let manifest_path = manifest_path.as_ref();
+    let (manifest, records) = read_wal_archive(manifest_path)?;
+    if records.is_empty() {
+        return Err(EngineError::Durability(format!(
+            "WAL archive {} has no records for target timestamp {}",
+            manifest_path.display(),
+            target_timestamp_micros
+        )));
+    }
+    if manifest.record_timestamps.is_empty() {
+        return Err(EngineError::Durability(format!(
+            "WAL archive {} has no timestamp metadata for target timestamp {}",
+            manifest_path.display(),
+            target_timestamp_micros
+        )));
+    }
+
+    let first_timestamp = manifest
+        .record_timestamps
+        .first()
+        .expect("non-empty timestamp metadata")
+        .timestamp_micros;
+    let last_timestamp = manifest
+        .record_timestamps
+        .last()
+        .expect("non-empty timestamp metadata")
+        .timestamp_micros;
+    if target_timestamp_micros < first_timestamp {
+        return Err(EngineError::Durability(format!(
+            "WAL archive {} target timestamp {} is before first archived timestamp {}",
+            manifest_path.display(),
+            target_timestamp_micros,
+            first_timestamp
+        )));
+    }
+    if target_timestamp_micros > last_timestamp {
+        return Err(EngineError::Durability(format!(
+            "WAL archive {} target timestamp {} is beyond last durable timestamp {}",
+            manifest_path.display(),
+            target_timestamp_micros,
+            last_timestamp
+        )));
+    }
+
+    let matching_indexes = manifest
+        .record_timestamps
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, timestamp)| {
+            (timestamp.timestamp_micros == target_timestamp_micros).then_some(idx)
+        })
+        .collect::<Vec<_>>();
+    match matching_indexes.as_slice() {
+        [] => Err(EngineError::Durability(format!(
+            "WAL archive {} target timestamp {} falls between archived transaction boundaries",
+            manifest_path.display(),
+            target_timestamp_micros
+        ))),
+        [_first, _second, ..] => Err(EngineError::Durability(format!(
+            "WAL archive {} target timestamp {} is ambiguous across multiple transaction boundaries",
+            manifest_path.display(),
+            target_timestamp_micros
+        ))),
+        [idx] => {
+            let recovered_record_count = idx + 1;
+            let target_txn_id = records[*idx].txn_id;
+            let target = WalArchiveTimestampRecoveryTarget {
+                target_timestamp_micros,
+                target_txn_id,
+                recovered_record_count,
+                last_recovered_txn_id: target_txn_id,
+            };
+            Ok((
+                manifest,
+                target,
+                records.into_iter().take(recovered_record_count).collect(),
+            ))
+        }
+    }
+}
+
 pub fn plan_wal_archive_retention_to_txn(
     manifest_path: impl AsRef<Path>,
     target_txn_id: TxnId,
@@ -692,6 +864,9 @@ pub fn plan_wal_archive_retention_to_txn(
         &segment_dir,
         &retained_records,
         records_per_segment,
+        &manifest.record_timestamps[..target
+            .recovered_record_count
+            .min(manifest.record_timestamps.len())],
     );
     let retained_paths: HashSet<PathBuf> = retained_manifest
         .segments
@@ -728,11 +903,15 @@ pub fn apply_wal_archive_retention_to_txn(
     let segment_dir = archive_segment_dir(manifest_path, &manifest)?;
     let plan = plan_wal_archive_retention_to_txn(manifest_path, target_txn_id)?;
 
-    let retained_manifest = write_wal_archive(
+    let retained_timestamps = &manifest.record_timestamps[..plan
+        .retained_record_count
+        .min(manifest.record_timestamps.len())];
+    let retained_manifest = write_wal_archive_with_timestamps(
         manifest_path,
         &segment_dir,
         &retained_records,
         records_per_segment,
+        retained_timestamps,
     )?;
     for removed_segment in &plan.removed_segments {
         match fs::remove_file(removed_segment) {
@@ -783,6 +962,7 @@ fn build_wal_archive_manifest(
     segment_dir: &Path,
     records: &[WalRecord],
     records_per_segment: usize,
+    record_timestamps: &[WalArchiveRecordTimestamp],
 ) -> WalArchiveManifest {
     let mut segments = Vec::new();
     for (index, chunk) in records.chunks(records_per_segment).enumerate() {
@@ -805,6 +985,7 @@ fn build_wal_archive_manifest(
             durable_record_count: records.len(),
             last_durable_txn_id: records.last().map(|record| record.txn_id),
         },
+        record_timestamps: record_timestamps.to_vec(),
     }
 }
 
@@ -863,6 +1044,16 @@ fn validate_archive_manifest_shape(
         return Err(EngineError::Durability(format!(
             "WAL archive {} has no segments but records a last durable transaction",
             manifest_path.display()
+        )));
+    }
+    if !manifest.record_timestamps.is_empty()
+        && manifest.record_timestamps.len() != manifest.checkpoint.durable_record_count
+    {
+        return Err(EngineError::Durability(format!(
+            "WAL archive {} expected {} timestamp records but manifest contains {}",
+            manifest_path.display(),
+            manifest.checkpoint.durable_record_count,
+            manifest.record_timestamps.len()
         )));
     }
     Ok(())
@@ -927,6 +1118,54 @@ fn validate_archive_records(
                 manifest_path.display(),
                 window[0].txn_id,
                 window[1].txn_id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_timestamp_metadata(
+    manifest_path: &Path,
+    records: &[WalRecord],
+    record_timestamps: &[WalArchiveRecordTimestamp],
+) -> Result<(), EngineError> {
+    if record_timestamps.is_empty() {
+        return Ok(());
+    }
+    if record_timestamps.len() != records.len() {
+        return Err(EngineError::Durability(format!(
+            "WAL archive {} expected {} timestamp records but received {}",
+            manifest_path.display(),
+            records.len(),
+            record_timestamps.len()
+        )));
+    }
+    for (record, timestamp) in records.iter().zip(record_timestamps) {
+        if record.txn_id != timestamp.txn_id {
+            return Err(EngineError::Durability(format!(
+                "WAL archive {} timestamp metadata transaction {} does not match record transaction {}",
+                manifest_path.display(),
+                timestamp.txn_id,
+                record.txn_id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_archive_timestamps(
+    manifest_path: &Path,
+    manifest: &WalArchiveManifest,
+    records: &[WalRecord],
+) -> Result<(), EngineError> {
+    validate_timestamp_metadata(manifest_path, records, &manifest.record_timestamps)?;
+    for window in manifest.record_timestamps.windows(2) {
+        if window[0].timestamp_micros > window[1].timestamp_micros {
+            return Err(EngineError::Durability(format!(
+                "WAL archive {} has decreasing timestamp order at {} then {}",
+                manifest_path.display(),
+                window[0].timestamp_micros,
+                window[1].timestamp_micros
             )));
         }
     }
@@ -1532,6 +1771,168 @@ mod tests {
     }
 
     #[test]
+    fn wal_archive_reads_prefix_to_timestamp_target() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpu-db-wal-archive-timestamp-{}-{}",
+            std::process::id(),
+            NEXT_TEST_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let manifest_path = dir.join("MANIFEST");
+        let segment_dir = dir.join("segments");
+        let records = vec![
+            WalRecord {
+                txn_id: 1,
+                payload: b"SET a=1".to_vec(),
+            },
+            WalRecord {
+                txn_id: 2,
+                payload: b"SET b=2".to_vec(),
+            },
+            WalRecord {
+                txn_id: 3,
+                payload: b"SET c=3".to_vec(),
+            },
+        ];
+        let timestamps = vec![
+            WalArchiveRecordTimestamp {
+                txn_id: 1,
+                timestamp_micros: 1_000,
+            },
+            WalArchiveRecordTimestamp {
+                txn_id: 2,
+                timestamp_micros: 2_000,
+            },
+            WalArchiveRecordTimestamp {
+                txn_id: 3,
+                timestamp_micros: 3_000,
+            },
+        ];
+
+        write_wal_archive_with_timestamps(&manifest_path, &segment_dir, &records, 2, &timestamps)
+            .unwrap();
+        let (_manifest, target, recovered_records) =
+            read_wal_archive_to_timestamp_micros(&manifest_path, 2_000).unwrap();
+        let _ = fs::remove_dir_all(dir);
+
+        assert_eq!(
+            target,
+            WalArchiveTimestampRecoveryTarget {
+                target_timestamp_micros: 2_000,
+                target_txn_id: 2,
+                recovered_record_count: 2,
+                last_recovered_txn_id: 2,
+            }
+        );
+        assert_eq!(recovered_records.len(), 2);
+        assert_eq!(recovered_records[1].payload, b"SET b=2");
+    }
+
+    #[test]
+    fn wal_archive_timestamp_target_rejects_missing_metadata() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpu-db-wal-archive-timestamp-missing-meta-{}-{}",
+            std::process::id(),
+            NEXT_TEST_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let manifest_path = dir.join("MANIFEST");
+        let segment_dir = dir.join("segments");
+        let records = vec![WalRecord {
+            txn_id: 1,
+            payload: b"SET a=1".to_vec(),
+        }];
+
+        write_wal_archive(&manifest_path, &segment_dir, &records, 1).unwrap();
+        let err = read_wal_archive_to_timestamp_micros(&manifest_path, 1_000).unwrap_err();
+        let _ = fs::remove_dir_all(dir);
+
+        assert!(err.to_string().contains("no timestamp metadata"));
+    }
+
+    #[test]
+    fn wal_archive_timestamp_target_rejects_unavailable_boundaries() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpu-db-wal-archive-timestamp-unavailable-{}-{}",
+            std::process::id(),
+            NEXT_TEST_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let manifest_path = dir.join("MANIFEST");
+        let segment_dir = dir.join("segments");
+        let records = vec![
+            WalRecord {
+                txn_id: 10,
+                payload: b"SET a=1".to_vec(),
+            },
+            WalRecord {
+                txn_id: 20,
+                payload: b"SET b=2".to_vec(),
+            },
+        ];
+        let timestamps = vec![
+            WalArchiveRecordTimestamp {
+                txn_id: 10,
+                timestamp_micros: 10_000,
+            },
+            WalArchiveRecordTimestamp {
+                txn_id: 20,
+                timestamp_micros: 20_000,
+            },
+        ];
+
+        write_wal_archive_with_timestamps(&manifest_path, &segment_dir, &records, 1, &timestamps)
+            .unwrap();
+        let before = read_wal_archive_to_timestamp_micros(&manifest_path, 9_999).unwrap_err();
+        let between = read_wal_archive_to_timestamp_micros(&manifest_path, 15_000).unwrap_err();
+        let beyond = read_wal_archive_to_timestamp_micros(&manifest_path, 20_001).unwrap_err();
+        let _ = fs::remove_dir_all(dir);
+
+        assert!(before
+            .to_string()
+            .contains("before first archived timestamp"));
+        assert!(between
+            .to_string()
+            .contains("falls between archived transaction boundaries"));
+        assert!(beyond.to_string().contains("beyond last durable timestamp"));
+    }
+
+    #[test]
+    fn wal_archive_timestamp_target_rejects_ambiguous_boundary() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpu-db-wal-archive-timestamp-ambiguous-{}-{}",
+            std::process::id(),
+            NEXT_TEST_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let manifest_path = dir.join("MANIFEST");
+        let segment_dir = dir.join("segments");
+        let records = vec![
+            WalRecord {
+                txn_id: 1,
+                payload: b"SET a=1".to_vec(),
+            },
+            WalRecord {
+                txn_id: 2,
+                payload: b"SET b=2".to_vec(),
+            },
+        ];
+        let timestamps = vec![
+            WalArchiveRecordTimestamp {
+                txn_id: 1,
+                timestamp_micros: 1_000,
+            },
+            WalArchiveRecordTimestamp {
+                txn_id: 2,
+                timestamp_micros: 1_000,
+            },
+        ];
+
+        write_wal_archive_with_timestamps(&manifest_path, &segment_dir, &records, 1, &timestamps)
+            .unwrap();
+        let err = read_wal_archive_to_timestamp_micros(&manifest_path, 1_000).unwrap_err();
+        let _ = fs::remove_dir_all(dir);
+
+        assert!(err.to_string().contains("ambiguous"));
+    }
+
+    #[test]
     fn wal_archive_retention_plan_keeps_exact_transaction_prefix() {
         let dir = std::env::temp_dir().join(format!(
             "gpu-db-wal-archive-retention-plan-{}-{}",
@@ -1721,6 +2122,7 @@ mod tests {
                 durable_record_count: 2,
                 last_durable_txn_id: Some(1),
             },
+            record_timestamps: Vec::new(),
         };
         write_wal_archive_manifest(&manifest_path, &manifest).unwrap();
 
@@ -1775,6 +2177,7 @@ mod tests {
                 durable_record_count: 2,
                 last_durable_txn_id: Some(1),
             },
+            record_timestamps: Vec::new(),
         };
         write_wal_archive_manifest(&manifest_path, &manifest).unwrap();
 

@@ -104,8 +104,9 @@ For the current single-node relational WAL segment proof:
 4. For packaged checkpoint proof, persist with `Engine::persist_durable_wal_checkpoint(...)` and recover with `Engine::recover_from_durable_wal_checkpoint(...)`; the control file validates durable record count and last transaction id before replay.
 5. For multi-segment archive proof, persist with `Engine::persist_durable_wal_archive(...)` and recover with `Engine::recover_from_durable_wal_archive(...)`; the manifest validates segment paths, per-segment record counts, per-segment transaction ranges, overall durable record count, last durable transaction id, and increasing transaction order before replay.
 6. For transaction-bound PITR proof, recover with `Engine::recover_from_durable_wal_archive_to_txn(...)`; the archive reader validates the whole archive, then replays only the exact requested transaction-bound prefix and rejects before-first, beyond-durable, or missing-boundary targets.
-7. For local PITR-branch archive cleanup, inspect `Engine::plan_durable_wal_archive_retention_to_txn(...)`, then apply `Engine::apply_durable_wal_archive_retention_to_txn(...)`; cleanup validates the whole archive, rewrites the manifest and segment files to the exact retained transaction prefix, and removes only obsolete post-target segments after the replacement manifest is installed.
-8. Treat timestamp-based PITR target selection, streaming archive ingestion, durable object-storage backup, base-backup-aware retention windows, and automatic background cleanup as not yet implemented.
+7. For timestamp-bound PITR proof, recover engine-written archives with `Engine::recover_from_durable_wal_archive_to_timestamp_micros(...)`; the archive reader validates the whole archive, requires per-transaction timestamp metadata, then replays only an exact timestamp-bound prefix while rejecting missing metadata, before-first, beyond-durable, between-boundary, and ambiguous timestamp targets.
+8. For local PITR-branch archive cleanup, inspect `Engine::plan_durable_wal_archive_retention_to_txn(...)`, then apply `Engine::apply_durable_wal_archive_retention_to_txn(...)`; cleanup validates the whole archive, rewrites the manifest and segment files to the exact retained transaction prefix, and removes only obsolete post-target segments after the replacement manifest is installed.
+9. Treat streaming archive ingestion, durable object-storage backup, base-backup-aware retention windows, and automatic background cleanup as not yet implemented.
 
 Failure criteria:
 
@@ -174,7 +175,7 @@ Operator checks:
 
 Current bootstrap storage can vacuum old MVCC tuple versions only through `Engine::checkpoint_vacuum_mvcc_versions(safe_txn_id)`. Choose a non-zero safe transaction id that is at or below the flushed WAL boundary and older than every active transaction. The call refuses unsafe boundaries, reports removed tuple/version counts, and keeps the durable WAL prefix as the replay source of truth.
 
-Do not manually prune tuple versions, relational row keys, or equality-index entries. Relational indexes remain volatile and are rebuilt from the durable WAL prefix during recovery; the current control file covers one selected durable segment, and the archive manifest covers ordered multi-segment replay, exact transaction-bound prefix restore, and transaction-target suffix cleanup. Timestamp-based PITR target selection, base-backup-aware archive retention windows, and automatic background cleanup are still future storage work.
+Do not manually prune tuple versions, relational row keys, or equality-index entries. Relational indexes remain volatile and are rebuilt from the durable WAL prefix during recovery; the current control file covers one selected durable segment, and the archive manifest covers ordered multi-segment replay, exact transaction-bound prefix restore, exact timestamp-bound prefix restore for engine-written archives, and transaction-target suffix cleanup. Base-backup-aware archive retention windows and automatic background cleanup are still future storage work.
 
 ## 6) Release Evidence Bundle
 

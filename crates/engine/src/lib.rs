@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::str::FromStr;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpu_db_batching::{BatchItem, DualTriggerBatcher, FlushReason};
 use gpu_db_execution::{
@@ -29,9 +29,10 @@ use gpu_db_txn::{TxnError, TxnManager};
 use gpu_db_types::{CommitToken, EngineError, Index, LogEntry, Role, SnapshotMeta, Term, TxnId};
 use gpu_db_wal::{
     apply_wal_archive_retention_to_txn, plan_wal_archive_retention_to_txn, read_wal_archive,
-    read_wal_archive_to_txn, read_wal_checkpoint, read_wal_segment, write_wal_archive,
-    write_wal_control_file, write_wal_segment, WalArchiveManifest, WalArchiveRetentionPlan,
-    WalBuffer, WalControlFile, WalRecord,
+    read_wal_archive_to_timestamp_micros, read_wal_archive_to_txn, read_wal_checkpoint,
+    read_wal_segment, write_wal_archive_with_timestamps, write_wal_control_file, write_wal_segment,
+    WalArchiveManifest, WalArchiveRecordTimestamp, WalArchiveRetentionPlan, WalBuffer,
+    WalControlFile, WalRecord,
 };
 
 #[derive(Debug, Default)]
@@ -5910,6 +5911,7 @@ pub struct Engine {
     relational_next_column_id: u32,
     relational_next_row_id: u64,
     txn_ids_by_index: BTreeMap<Index, TxnId>,
+    wal_commit_timestamps_micros: BTreeMap<TxnId, u64>,
     txn_manager: TxnManager,
     visible_up_to: Index,
     metrics: RuntimeMetrics,
@@ -6290,6 +6292,15 @@ fn select_has_relational_filters(select: &Select) -> bool {
     select.filter.is_some() || !select.filters.is_empty() || !select.filter_groups.is_empty()
 }
 
+fn current_timestamp_micros() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_micros()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
 impl Engine {
     pub fn new_local() -> Self {
         Self::with_planner_config(PlannerConfig::default())
@@ -6332,6 +6343,15 @@ impl Engine {
         Self::recover_from_durable_wal(&records)
     }
 
+    pub fn recover_from_durable_wal_archive_to_timestamp_micros(
+        manifest_path: impl AsRef<std::path::Path>,
+        target_timestamp_micros: u64,
+    ) -> Result<Self, EngineError> {
+        let (_manifest, _target, records) =
+            read_wal_archive_to_timestamp_micros(manifest_path, target_timestamp_micros)?;
+        Self::recover_from_durable_wal(&records)
+    }
+
     pub fn with_planner_config(planner_cfg: PlannerConfig) -> Self {
         Self {
             repl: LocalReplicator::leader(),
@@ -6344,6 +6364,7 @@ impl Engine {
             relational_next_column_id: FIRST_USER_COLUMN_ID,
             relational_next_row_id: 1,
             txn_ids_by_index: BTreeMap::new(),
+            wal_commit_timestamps_micros: BTreeMap::new(),
             txn_manager: TxnManager::default(),
             visible_up_to: 0,
             metrics: RuntimeMetrics::default(),
@@ -6409,6 +6430,26 @@ impl Engine {
         txn_id: u64,
         payload: Vec<u8>,
     ) -> Result<CommitToken, EngineError> {
+        let timestamp_micros = self.next_commit_timestamp_micros();
+        self.commit_mutation_at(txn_id, payload, timestamp_micros)
+    }
+
+    fn next_commit_timestamp_micros(&self) -> u64 {
+        let wall_clock = current_timestamp_micros();
+        self.wal_commit_timestamps_micros
+            .values()
+            .copied()
+            .max()
+            .map(|last| wall_clock.max(last.saturating_add(1)))
+            .unwrap_or(wall_clock)
+    }
+
+    pub fn commit_mutation_at(
+        &mut self,
+        txn_id: u64,
+        payload: Vec<u8>,
+        timestamp_micros: u64,
+    ) -> Result<CommitToken, EngineError> {
         if self.repl.role() != Role::Leader {
             return Err(EngineError::NotLeader);
         }
@@ -6434,6 +6475,8 @@ impl Engine {
 
         self.repl.wait_committed(token, Duration::from_millis(0))?;
         self.txn_ids_by_index.insert(token.index, txn_id);
+        self.wal_commit_timestamps_micros
+            .insert(txn_id, timestamp_micros);
 
         let to_apply: Vec<LogEntry> = self
             .repl
@@ -6800,6 +6843,16 @@ impl Engine {
     }
 
     pub fn execute_text(&mut self, txn_id: u64, text: &str) -> Result<(), ExecuteError> {
+        let timestamp_micros = self.next_commit_timestamp_micros();
+        self.execute_text_at_timestamp_micros(txn_id, text, timestamp_micros)
+    }
+
+    pub fn execute_text_at_timestamp_micros(
+        &mut self,
+        txn_id: u64,
+        text: &str,
+        timestamp_micros: u64,
+    ) -> Result<(), ExecuteError> {
         let cmd = parse_command(text)?;
 
         match cmd {
@@ -6808,11 +6861,11 @@ impl Engine {
             | Command::CreateTable(_)
             | Command::Insert(_) => match self.route_command(&cmd) {
                 RouteDecision::Gpu(_) | RouteDecision::Cpu => {
-                    self.commit_mutation(txn_id, text.as_bytes().to_vec())?;
+                    self.commit_mutation_at(txn_id, text.as_bytes().to_vec(), timestamp_micros)?;
                 }
                 RouteDecision::CpuFallback { reason, .. } => {
                     self.metrics.inc_gpu_fallback(reason);
-                    self.commit_mutation(txn_id, text.as_bytes().to_vec())?;
+                    self.commit_mutation_at(txn_id, text.as_bytes().to_vec(), timestamp_micros)?;
                 }
             },
             Command::Flush => {
@@ -7576,6 +7629,20 @@ impl Engine {
         self.wal.flushed_records()
     }
 
+    pub fn durable_wal_record_timestamps(&self) -> Vec<WalArchiveRecordTimestamp> {
+        self.durable_wal_records()
+            .iter()
+            .filter_map(|record| {
+                self.wal_commit_timestamps_micros
+                    .get(&record.txn_id)
+                    .map(|timestamp_micros| WalArchiveRecordTimestamp {
+                        txn_id: record.txn_id,
+                        timestamp_micros: *timestamp_micros,
+                    })
+            })
+            .collect()
+    }
+
     pub fn persist_durable_wal_to_file(
         &self,
         path: impl AsRef<std::path::Path>,
@@ -7614,11 +7681,13 @@ impl Engine {
         segment_dir: impl AsRef<std::path::Path>,
         records_per_segment: usize,
     ) -> Result<WalArchiveManifest, EngineError> {
-        write_wal_archive(
+        let record_timestamps = self.durable_wal_record_timestamps();
+        write_wal_archive_with_timestamps(
             manifest_path,
             segment_dir,
             self.durable_wal_records(),
             records_per_segment,
+            &record_timestamps,
         )
     }
 
@@ -23926,6 +23995,90 @@ mod tests {
             .execute_relational_select(&katherine_select)
             .unwrap();
         assert_eq!(katherine_result.rows, Vec::<Vec<SqlValue>>::new());
+    }
+
+    #[test]
+    fn relational_state_recovers_from_wal_archive_timestamp_target() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpu-db-engine-wal-archive-timestamp-target-{}-{}",
+            std::process::id(),
+            NEXT_TEST_WAL_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let manifest_path = dir.join("MANIFEST");
+        let segment_dir = dir.join("segments");
+        let mut e = Engine::new_local();
+        e.execute_text_at_timestamp_micros(1, "CREATE TABLE people (id INT, name TEXT)", 1_000)
+            .unwrap();
+        e.execute_text_at_timestamp_micros(
+            2,
+            "INSERT INTO people (id, name) VALUES (1, 'Ada')",
+            2_000,
+        )
+        .unwrap();
+        e.execute_text_at_timestamp_micros(
+            3,
+            "INSERT INTO people (id, name) VALUES (2, 'Grace')",
+            3_000,
+        )
+        .unwrap();
+        e.execute_text_at_timestamp_micros(
+            4,
+            "INSERT INTO people (id, name) VALUES (3, 'Katherine')",
+            4_000,
+        )
+        .unwrap();
+
+        let manifest = e
+            .persist_durable_wal_archive(&manifest_path, &segment_dir, 2)
+            .unwrap();
+        assert_eq!(manifest.record_timestamps.len(), 4);
+        let mut recovered =
+            Engine::recover_from_durable_wal_archive_to_timestamp_micros(&manifest_path, 3_000)
+                .unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+
+        assert_eq!(recovered.wal_unflushed_count(), 0);
+        assert_eq!(recovered.wal_flushed_count(), 3);
+        let table = recovered.relational_catalog_table("people").unwrap();
+        assert_eq!(table.oid, FIRST_USER_RELATION_OID);
+
+        let Command::Select(grace_select) =
+            parse_command("SELECT id FROM people WHERE name = 'Grace'").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let grace_result = recovered.execute_relational_select(&grace_select).unwrap();
+        assert_eq!(
+            grace_result.access_path,
+            RelationalAccessPath::EqualityIndex {
+                table: "people".to_string(),
+                column: "name".to_string(),
+                matched_keys: 1,
+            }
+        );
+        assert_eq!(grace_result.rows, vec![vec![SqlValue::Int4(2)]]);
+
+        let Command::Select(katherine_select) =
+            parse_command("SELECT id FROM people WHERE name = 'Katherine'").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let katherine_result = recovered
+            .execute_relational_select(&katherine_select)
+            .unwrap();
+        assert_eq!(katherine_result.rows, Vec::<Vec<SqlValue>>::new());
+    }
+
+    #[test]
+    fn engine_written_wal_archive_timestamps_are_monotonic() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "SET a=1").unwrap();
+        e.execute_text(2, "SET b=2").unwrap();
+
+        let timestamps = e.durable_wal_record_timestamps();
+
+        assert_eq!(timestamps.len(), 2);
+        assert!(timestamps[0].timestamp_micros < timestamps[1].timestamp_micros);
     }
 
     #[test]
