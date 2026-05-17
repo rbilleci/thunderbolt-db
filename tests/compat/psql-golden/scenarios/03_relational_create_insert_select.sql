@@ -20,6 +20,12 @@ SELECT id, name FROM people WHERE id BETWEEN 2 AND 3 ORDER BY id DESC;
 SELECT id, name FROM people WHERE name LIKE 'Gra%' ORDER BY id DESC;
 \echo === relational distinct projection ===
 SELECT DISTINCT name FROM people ORDER BY name DESC LIMIT 2 OFFSET 1;
+\echo === relational count aggregation ===
+SELECT COUNT(*) FROM people WHERE name = 'Grace';
+SELECT name, COUNT(*) FROM people GROUP BY name ORDER BY name;
+\echo === relational aggregate unsupported recovery ===
+SELECT name, COUNT(*) FROM people ORDER BY name;
+SELECT COUNT(*) FROM people WHERE id >= 2;
 \echo === relational distinct unsupported recovery ===
 SELECT DISTINCT name FROM people ORDER BY id;
 SELECT DISTINCT id FROM people ORDER BY id LIMIT 1;

@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -41,6 +41,14 @@ fn int4_column(name: &str) -> Column {
         name: name.to_string(),
         oid: gpu_db_protocol::SqlType::Int4.postgres_oid(),
         type_size: gpu_db_protocol::SqlType::Int4.type_size(),
+    }
+}
+
+fn int8_column(name: &str) -> Column {
+    Column {
+        name: name.to_string(),
+        oid: 20,
+        type_size: 8,
     }
 }
 
@@ -145,6 +153,21 @@ fn execute_select_result(
             position: None,
         });
     };
+    if matches!(
+        select.projection,
+        SelectProjection::CountAll | SelectProjection::GroupedCount { .. }
+    ) {
+        return execute_aggregate_select_result(table, select);
+    }
+
+    if select.group_by.is_some() {
+        return Err(ErrorField {
+            code: "0A000",
+            message: "GROUP BY requires COUNT(*) projection",
+            position: None,
+        });
+    }
+
     let selected_columns = match &select.projection {
         SelectProjection::All => table.columns.clone(),
         SelectProjection::Columns(columns) => {
@@ -165,6 +188,7 @@ fn execute_select_result(
             }
             selected
         }
+        SelectProjection::CountAll | SelectProjection::GroupedCount { .. } => unreachable!(),
     };
     if select.distinct {
         match &select.projection {
@@ -186,6 +210,7 @@ fn execute_select_result(
                     }
                 }
             }
+            SelectProjection::CountAll | SelectProjection::GroupedCount { .. } => unreachable!(),
         }
     }
     let selected_indexes = selected_columns
@@ -299,6 +324,127 @@ fn execute_select_result(
         })
         .collect::<Vec<_>>();
     Ok(SelectResult { columns, rows })
+}
+
+fn execute_aggregate_select_result(
+    table: &Table,
+    select: &gpu_db_protocol::Select,
+) -> Result<SelectResult, ErrorField> {
+    let mut rows = Vec::new();
+    for row in &table.rows {
+        match row_matches_select_filters(table, row, select) {
+            Ok(true) => rows.push(row.clone()),
+            Ok(false) => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    match &select.projection {
+        SelectProjection::CountAll => {
+            if select.group_by.is_some() {
+                return Err(ErrorField {
+                    code: "0A000",
+                    message: "GROUP BY requires grouped COUNT(*) projection",
+                    position: None,
+                });
+            }
+            if let Some(order) = &select.order_by {
+                if !order.column.eq_ignore_ascii_case("count") {
+                    return Err(ErrorField {
+                        code: "0A000",
+                        message: "COUNT(*) ORDER BY only supports count",
+                        position: None,
+                    });
+                }
+            }
+            let mut aggregate_rows = vec![vec![Some(rows.len().to_string())]];
+            if let Some(offset) = select.offset {
+                aggregate_rows = aggregate_rows.into_iter().skip(offset).collect();
+            }
+            if let Some(limit) = select.limit {
+                aggregate_rows.truncate(limit);
+            }
+            Ok(SelectResult {
+                columns: vec![int8_column("count")],
+                rows: aggregate_rows,
+            })
+        }
+        SelectProjection::GroupedCount { column } => {
+            let Some(group_by) = &select.group_by else {
+                return Err(ErrorField {
+                    code: "0A000",
+                    message: "grouped COUNT(*) requires GROUP BY",
+                    position: None,
+                });
+            };
+            if group_by != column {
+                return Err(ErrorField {
+                    code: "0A000",
+                    message: "GROUP BY column must match grouped COUNT(*) projection",
+                    position: None,
+                });
+            }
+            let Some(group_idx) = table
+                .columns
+                .iter()
+                .position(|candidate| candidate.def.name == *column)
+            else {
+                return Err(ErrorField {
+                    code: "42703",
+                    message: "column does not exist",
+                    position: None,
+                });
+            };
+            let mut counts: BTreeMap<SqlValue, usize> = BTreeMap::new();
+            for row in rows {
+                *counts.entry(row[group_idx].clone()).or_default() += 1;
+            }
+            let mut grouped = counts.into_iter().collect::<Vec<_>>();
+            if let Some(order) = &select.order_by {
+                if order.column == *column {
+                    grouped.sort_by(|(left, _), (right, _)| compare_sql_values(left, right));
+                } else if order.column.eq_ignore_ascii_case("count") {
+                    grouped.sort_by(|(left_value, left_count), (right_value, right_count)| {
+                        left_count
+                            .cmp(right_count)
+                            .then_with(|| compare_sql_values(left_value, right_value))
+                    });
+                } else {
+                    return Err(ErrorField {
+                        code: "0A000",
+                        message: "GROUP BY ORDER BY must reference grouped column or count",
+                        position: None,
+                    });
+                }
+                if order.descending {
+                    grouped.reverse();
+                }
+            }
+            if let Some(offset) = select.offset {
+                grouped = grouped.into_iter().skip(offset).collect();
+            }
+            if let Some(limit) = select.limit {
+                grouped.truncate(limit);
+            }
+            let group_column = table
+                .columns
+                .get(group_idx)
+                .expect("group column index came from table");
+            let columns = vec![
+                match group_column.def.ty {
+                    gpu_db_protocol::SqlType::Int4 => int4_column(&group_column.def.name),
+                    gpu_db_protocol::SqlType::Text => text_column(&group_column.def.name),
+                },
+                int8_column("count"),
+            ];
+            let rows = grouped
+                .into_iter()
+                .map(|(value, count)| vec![Some(format_sql_value(&value)), Some(count.to_string())])
+                .collect();
+            Ok(SelectResult { columns, rows })
+        }
+        SelectProjection::All | SelectProjection::Columns(_) => unreachable!(),
+    }
 }
 
 fn format_sql_value(value: &SqlValue) -> String {
@@ -8260,6 +8406,29 @@ fn describe_query_columns(session: &Session, query: &str) -> Option<Vec<Column>>
             }
             selected
         }
+        SelectProjection::CountAll => vec![CatalogColumn {
+            attnum: 1,
+            def: gpu_db_protocol::ColumnDef {
+                name: "count".to_string(),
+                ty: SqlType::Int4,
+            },
+        }],
+        SelectProjection::GroupedCount { column } => {
+            let group_column = table
+                .columns
+                .iter()
+                .find(|candidate| candidate.def.name == column)?;
+            vec![
+                group_column.clone(),
+                CatalogColumn {
+                    attnum: 2,
+                    def: gpu_db_protocol::ColumnDef {
+                        name: "count".to_string(),
+                        ty: SqlType::Int4,
+                    },
+                },
+            ]
+        }
     };
     Some(
         selected_columns
@@ -15359,6 +15528,32 @@ mod tests {
             err.message,
             "SELECT DISTINCT ORDER BY must reference a selected column"
         );
+        let Command::Select(select) =
+            parse_command("select name, count(*) from people group by name order by name").unwrap()
+        else {
+            panic!("expected supported SELECT aggregate parse");
+        };
+        let result = execute_select_result(&session, &select).unwrap();
+        assert_eq!(
+            result.columns,
+            vec![text_column("name"), int8_column("count")]
+        );
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![Some("Ada".to_string()), Some("1".to_string())],
+                vec![Some("Grace".to_string()), Some("2".to_string())],
+                vec![Some("Linus".to_string()), Some("1".to_string())],
+            ]
+        );
+        let Command::Select(select) =
+            parse_command("select count(*) from people where id >= 2").unwrap()
+        else {
+            panic!("expected supported SELECT aggregate parse");
+        };
+        let result = execute_select_result(&session, &select).unwrap();
+        assert_eq!(result.columns, vec![int8_column("count")]);
+        assert_eq!(result.rows, vec![vec![Some("3".to_string())]]);
 
         assert_eq!(
             describe_parameterized_select_shape(

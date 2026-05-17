@@ -9,8 +9,8 @@
     "execution.gpu_routing_and_batching": {
       "failed": 0,
       "ignored": 0,
-      "passed": 77,
-      "total": 77
+      "passed": 78,
+      "total": 78
     },
     "protocol.client_flows": {
       "failed": 0,
@@ -27,8 +27,8 @@
     "protocol.extended_query": {
       "failed": 0,
       "ignored": 0,
-      "passed": 303,
-      "total": 303
+      "passed": 304,
+      "total": 304
     },
     "replication.operational_cluster": {
       "failed": 0,
@@ -51,20 +51,20 @@
     "sql.gpu_bridge": {
       "failed": 0,
       "ignored": 0,
-      "passed": 22,
-      "total": 22
+      "passed": 23,
+      "total": 23
     },
     "sql.parser_features": {
       "failed": 0,
       "ignored": 0,
-      "passed": 54,
-      "total": 54
+      "passed": 55,
+      "total": 55
     },
     "sql.relational_foundation": {
       "failed": 0,
       "ignored": 0,
-      "passed": 78,
-      "total": 78
+      "passed": 80,
+      "total": 80
     },
     "sql.transaction_flows": {
       "failed": 0,
@@ -89,8 +89,8 @@
   "totals": {
     "failed": 0,
     "ignored": 0,
-    "passed": 1000,
-    "total": 1000
+    "passed": 1002,
+    "total": 1002
   },
   "trend_hook": {
     "baseline_available": true,

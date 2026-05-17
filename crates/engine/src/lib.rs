@@ -6021,6 +6021,7 @@ impl RelationalSqlGpuBridgeReport {
 struct BoundRelationalSelect {
     selected_columns: Vec<RelationalColumn>,
     selected_indexes: Vec<usize>,
+    group_by_index: Option<usize>,
     filter: Option<(usize, SelectFilterOp, SqlValue)>,
     filters: Vec<(usize, SelectFilterOp, SqlValue)>,
     filter_groups: Vec<Vec<(usize, SelectFilterOp, SqlValue)>>,
@@ -6208,11 +6209,28 @@ fn bind_relational_select(
             .iter()
             .map(|name| relational_column_index(table, name))
             .collect::<Result<Vec<_>, _>>()?,
+        SelectProjection::CountAll => Vec::new(),
+        SelectProjection::GroupedCount { column } => vec![relational_column_index(table, column)?],
     };
-    let selected_columns = selected_indexes
+    let mut selected_columns = selected_indexes
         .iter()
         .map(|idx| table.columns[*idx].clone())
         .collect::<Vec<_>>();
+    if matches!(
+        select.projection,
+        SelectProjection::CountAll | SelectProjection::GroupedCount { .. }
+    ) {
+        let count_attnum = selected_columns.len() as i16 + 1;
+        selected_columns.push(RelationalColumn {
+            id: 0,
+            table_oid: table.oid,
+            attnum: count_attnum,
+            name: "count".to_string(),
+            ty: SqlType::Int4,
+            type_oid: SqlType::Int4.postgres_oid(),
+            type_size: SqlType::Int4.type_size(),
+        });
+    }
     let raw_filter_groups = if select.filter_groups.is_empty() {
         let filter_refs = if select.filters.is_empty() {
             select.filter.iter().cloned().collect::<Vec<_>>()
@@ -6245,7 +6263,11 @@ fn bind_relational_select(
         .order_by
         .as_ref()
         .map(|order| {
-            relational_column_index(table, &order.column).map(|idx| (idx, order.descending))
+            if select_is_aggregate(select) && order.column.eq_ignore_ascii_case("count") {
+                Ok((usize::MAX, order.descending))
+            } else {
+                relational_column_index(table, &order.column).map(|idx| (idx, order.descending))
+            }
         })
         .transpose()?;
     if select.distinct {
@@ -6264,12 +6286,53 @@ fn bind_relational_select(
                     }
                 }
             }
+            SelectProjection::CountAll | SelectProjection::GroupedCount { .. } => unreachable!(),
         }
+    }
+    let group_by_index = if let Some(group_by) = &select.group_by {
+        Some(relational_column_index(table, group_by)?)
+    } else {
+        None
+    };
+    match (&select.projection, group_by_index) {
+        (SelectProjection::CountAll, None) => {}
+        (SelectProjection::CountAll, Some(_)) => {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "GROUP BY requires grouped COUNT(*) projection".to_string(),
+            )));
+        }
+        (SelectProjection::GroupedCount { column }, Some(idx)) => {
+            let projected_idx = relational_column_index(table, column)?;
+            if projected_idx != idx {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "GROUP BY column must match grouped COUNT(*) projection".to_string(),
+                )));
+            }
+            if let Some(order) = &select.order_by {
+                if order.column != *column && !order.column.eq_ignore_ascii_case("count") {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        "GROUP BY ORDER BY must reference grouped column or count".to_string(),
+                    )));
+                }
+            }
+        }
+        (SelectProjection::GroupedCount { .. }, None) => {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "grouped COUNT(*) requires GROUP BY".to_string(),
+            )));
+        }
+        (SelectProjection::All | SelectProjection::Columns(_), Some(_)) => {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "GROUP BY requires COUNT(*) projection".to_string(),
+            )));
+        }
+        (SelectProjection::All | SelectProjection::Columns(_), None) => {}
     }
 
     Ok(BoundRelationalSelect {
         selected_columns,
         selected_indexes,
+        group_by_index,
         filter,
         filters,
         filter_groups,
@@ -6282,7 +6345,7 @@ fn relational_select_pushes_limit(select: &Select) -> bool {
 }
 
 fn relational_select_pushed_limit(select: &Select, ordered_access_path: bool) -> Option<usize> {
-    if select.distinct {
+    if select.distinct || select_is_aggregate(select) {
         return None;
     }
     let can_push = select.order_by.is_none() || ordered_access_path;
@@ -6298,7 +6361,7 @@ fn relational_select_limit_satisfied_by_access_path(
     select: &Select,
     access_path: &RelationalAccessPath,
 ) -> bool {
-    if select.distinct {
+    if select.distinct || select_is_aggregate(select) {
         return false;
     }
     select.offset.is_none()
@@ -6333,6 +6396,13 @@ fn relational_select_needs_host_sql_finalization(
 
 fn select_has_relational_filters(select: &Select) -> bool {
     select.filter.is_some() || !select.filters.is_empty() || !select.filter_groups.is_empty()
+}
+
+fn select_is_aggregate(select: &Select) -> bool {
+    matches!(
+        select.projection,
+        SelectProjection::CountAll | SelectProjection::GroupedCount { .. }
+    )
 }
 
 fn current_timestamp_micros() -> u64 {
@@ -7107,6 +7177,11 @@ impl Engine {
         let visibility = StorageVisibility {
             read_txn_id: self.visible_up_to,
         };
+        let query_order = if select_is_aggregate(select) {
+            None
+        } else {
+            bound.order
+        };
         if bound.filter_groups.len() > 1 {
             if let Some((column_idx, keys)) = self
                 .relational_keys_matching_same_column_equality_groups(
@@ -7116,11 +7191,10 @@ impl Engine {
                 )
             {
                 let mut keys = keys;
-                let order_column = bound
-                    .order
+                let order_column = query_order
                     .as_ref()
                     .map(|(idx, _)| table.columns[*idx].clone());
-                if let Some((order_idx, descending)) = bound.order {
+                if let Some((order_idx, descending)) = query_order {
                     keys =
                         self.relational_sort_keys_by_column(table, keys, order_idx, descending)?;
                 }
@@ -7129,9 +7203,9 @@ impl Engine {
                     source: MvccReadSource::KeyBatchLookup { keys },
                     visibility,
                     filter: None,
-                    order: bound.order.is_none().then_some(MvccReadOrder::KeyAsc),
+                    order: query_order.is_none().then_some(MvccReadOrder::KeyAsc),
                     projection: MvccProjection::KeyValue,
-                    limit: relational_select_pushed_limit(select, bound.order.is_some()),
+                    limit: relational_select_pushed_limit(select, query_order.is_some()),
                 };
                 let table_column = table
                     .columns
@@ -7143,8 +7217,7 @@ impl Engine {
                         predicate_column: Some(table_column.name.clone()),
                         predicate_op: Some(SelectFilterOp::Eq),
                         order_column: order_column.name,
-                        descending: bound
-                            .order
+                        descending: query_order
                             .map(|(_, descending)| descending)
                             .unwrap_or(false),
                         matched_keys,
@@ -7160,11 +7233,10 @@ impl Engine {
             }
             let mut keys =
                 self.relational_keys_matching_filter_groups(table, &bound.filter_groups)?;
-            let order_column = bound
-                .order
+            let order_column = query_order
                 .as_ref()
                 .map(|(idx, _)| table.columns[*idx].clone());
-            if let Some((order_idx, descending)) = bound.order {
+            if let Some((order_idx, descending)) = query_order {
                 keys = self.relational_sort_keys_by_column(table, keys, order_idx, descending)?;
             }
             let matched_keys = keys.len();
@@ -7172,9 +7244,9 @@ impl Engine {
                 source: MvccReadSource::KeyBatchLookup { keys },
                 visibility,
                 filter: None,
-                order: bound.order.is_none().then_some(MvccReadOrder::KeyAsc),
+                order: query_order.is_none().then_some(MvccReadOrder::KeyAsc),
                 projection: MvccProjection::KeyValue,
-                limit: relational_select_pushed_limit(select, bound.order.is_some()),
+                limit: relational_select_pushed_limit(select, query_order.is_some()),
             };
             let access_path = if let Some(order_column) = order_column {
                 RelationalAccessPath::OrderedKeyBatch {
@@ -7182,8 +7254,7 @@ impl Engine {
                     predicate_column: Some("<disjunction>".to_string()),
                     predicate_op: None,
                     order_column: order_column.name,
-                    descending: bound
-                        .order
+                    descending: query_order
                         .map(|(_, descending)| descending)
                         .unwrap_or(false),
                     matched_keys,
@@ -7200,11 +7271,10 @@ impl Engine {
 
         if bound.filters.len() > 1 {
             let mut keys = self.relational_keys_matching_filters(table, &bound.filters)?;
-            let order_column = bound
-                .order
+            let order_column = query_order
                 .as_ref()
                 .map(|(idx, _)| table.columns[*idx].clone());
-            if let Some((order_idx, descending)) = bound.order {
+            if let Some((order_idx, descending)) = query_order {
                 keys = self.relational_sort_keys_by_column(table, keys, order_idx, descending)?;
             }
             let matched_keys = keys.len();
@@ -7212,9 +7282,9 @@ impl Engine {
                 source: MvccReadSource::KeyBatchLookup { keys },
                 visibility,
                 filter: None,
-                order: bound.order.is_none().then_some(MvccReadOrder::KeyAsc),
+                order: query_order.is_none().then_some(MvccReadOrder::KeyAsc),
                 projection: MvccProjection::KeyValue,
-                limit: relational_select_pushed_limit(select, bound.order.is_some()),
+                limit: relational_select_pushed_limit(select, query_order.is_some()),
             };
             let access_path = if let Some(order_column) = order_column {
                 RelationalAccessPath::OrderedKeyBatch {
@@ -7222,8 +7292,7 @@ impl Engine {
                     predicate_column: Some("<conjunction>".to_string()),
                     predicate_op: None,
                     order_column: order_column.name,
-                    descending: bound
-                        .order
+                    descending: query_order
                         .map(|(_, descending)| descending)
                         .unwrap_or(false),
                     matched_keys,
@@ -7255,11 +7324,10 @@ impl Engine {
             } else {
                 self.relational_keys_matching_filter(table, *column_idx, *op, value)?
             };
-            let order_column = bound
-                .order
+            let order_column = query_order
                 .as_ref()
                 .map(|(idx, _)| table.columns[*idx].clone());
-            if let Some((order_idx, descending)) = bound.order {
+            if let Some((order_idx, descending)) = query_order {
                 keys = self.relational_sort_keys_by_column(table, keys, order_idx, descending)?;
             }
             let matched_keys = keys.len();
@@ -7267,9 +7335,9 @@ impl Engine {
                 source: MvccReadSource::KeyBatchLookup { keys },
                 visibility,
                 filter: None,
-                order: bound.order.is_none().then_some(MvccReadOrder::KeyAsc),
+                order: query_order.is_none().then_some(MvccReadOrder::KeyAsc),
                 projection: MvccProjection::KeyValue,
-                limit: relational_select_pushed_limit(select, bound.order.is_some()),
+                limit: relational_select_pushed_limit(select, query_order.is_some()),
             };
             let access_path = if let Some(order_column) = order_column {
                 RelationalAccessPath::OrderedKeyBatch {
@@ -7277,8 +7345,7 @@ impl Engine {
                     predicate_column: Some(table_column.name.clone()),
                     predicate_op: Some(*op),
                     order_column: order_column.name,
-                    descending: bound
-                        .order
+                    descending: query_order
                         .map(|(_, descending)| descending)
                         .unwrap_or(false),
                     matched_keys,
@@ -7300,7 +7367,7 @@ impl Engine {
             return Ok((query, access_path));
         }
 
-        if let Some((order_idx, descending)) = bound.order {
+        if let Some((order_idx, descending)) = query_order {
             let keys =
                 self.relational_ordered_table_keys(table, visibility, order_idx, descending)?;
             let matched_keys = keys.len();
@@ -7527,6 +7594,56 @@ impl Engine {
                 continue;
             }
             rows.push(decoded);
+        }
+
+        if select_is_aggregate(select) {
+            let mut aggregate_rows = match &select.projection {
+                SelectProjection::CountAll => vec![vec![SqlValue::Int4(rows.len() as i32)]],
+                SelectProjection::GroupedCount { .. } => {
+                    let group_idx = bound
+                        .group_by_index
+                        .expect("grouped COUNT(*) validation requires GROUP BY");
+                    let mut counts: BTreeMap<SqlValue, usize> = BTreeMap::new();
+                    for row in rows {
+                        *counts.entry(row[group_idx].clone()).or_default() += 1;
+                    }
+                    counts
+                        .into_iter()
+                        .map(|(value, count)| vec![value, SqlValue::Int4(count as i32)])
+                        .collect::<Vec<_>>()
+                }
+                SelectProjection::All | SelectProjection::Columns(_) => unreachable!(),
+            };
+
+            if let Some(order) = &select.order_by {
+                let order_idx = if order.column.eq_ignore_ascii_case("count") {
+                    aggregate_rows.first().map_or(0, |row| row.len() - 1)
+                } else {
+                    0
+                };
+                aggregate_rows.sort_by(|left, right| {
+                    compare_sql_values(&left[order_idx], &right[order_idx])
+                        .then_with(|| compare_sql_values(&left[0], &right[0]))
+                });
+                if order.descending {
+                    aggregate_rows.reverse();
+                }
+            }
+            if let Some(offset) = select.offset {
+                aggregate_rows = aggregate_rows.into_iter().skip(offset).collect();
+            }
+            if let Some(limit) = select.limit {
+                aggregate_rows.truncate(limit);
+            }
+
+            return Ok(RelationalSelectResult {
+                columns: bound.selected_columns,
+                rows: aggregate_rows,
+                planned_target: mvcc_result.planned_target,
+                executed_target: mvcc_result.executed_target,
+                fallback_reason: mvcc_result.fallback_reason,
+                access_path,
+            });
         }
 
         if select.distinct {
@@ -23511,6 +23628,57 @@ mod tests {
                 matched_keys: 4,
             }
         );
+    }
+
+    #[test]
+    fn relational_sql_gpu_bridge_count_group_by_keeps_gpu_row_fetch() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO people (id, name) VALUES (1, 'Ada'), (2, 'Grace'), (3, 'Grace'), (4, 'Linus')",
+        )
+        .unwrap();
+
+        let Command::Select(select) = parse_command(
+            "SELECT name, COUNT(*) FROM people WHERE id >= 2 GROUP BY name ORDER BY count DESC LIMIT 1",
+        )
+        .unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let result = e
+            .execute_relational_select_with_backend(&select, &FirstCudaSliceParityBackend)
+            .unwrap();
+
+        assert_eq!(
+            result.rows,
+            vec![vec![SqlValue::Text("Grace".to_string()), SqlValue::Int4(2)]]
+        );
+        assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.fallback_reason, None);
+        assert_eq!(
+            result.access_path,
+            RelationalAccessPath::FilteredKeyBatch {
+                table: "people".to_string(),
+                predicate_column: "id".to_string(),
+                predicate_op: SelectFilterOp::Gte,
+                matched_keys: 3,
+            }
+        );
+
+        let Command::Select(count_select) =
+            parse_command("SELECT COUNT(*) FROM people WHERE name = 'Grace'").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let count_result = e
+            .execute_relational_select_with_backend(&count_select, &FirstCudaSliceParityBackend)
+            .unwrap();
+        assert_eq!(count_result.rows, vec![vec![SqlValue::Int4(2)]]);
+        assert_eq!(count_result.fallback_reason, None);
     }
 
     #[test]

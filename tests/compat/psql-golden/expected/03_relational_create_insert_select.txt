@@ -70,8 +70,28 @@ INSERT 0 4
  Ada
 (2 rows)
 
+=== relational count aggregation ===
+ count
+-------
+     2
+(1 row)
+
+ name  | count
+-------+-------
+ Ada   |     1
+ Grace |     2
+ Linus |     1
+(3 rows)
+
+=== relational aggregate unsupported recovery ===
+psql:03_relational_create_insert_select.sql:27: ERROR:  grouped COUNT(*) requires GROUP BY
+ count
+-------
+     3
+(1 row)
+
 === relational distinct unsupported recovery ===
-psql:03_relational_create_insert_select.sql:24: ERROR:  SELECT DISTINCT ORDER BY must reference a selected column
+psql:03_relational_create_insert_select.sql:30: ERROR:  SELECT DISTINCT ORDER BY must reference a selected column
  id
 ----
   1
@@ -84,7 +104,7 @@ psql:03_relational_create_insert_select.sql:24: ERROR:  SELECT DISTINCT ORDER BY
 (1 row)
 
 === relational negative offset recovery ===
-psql:03_relational_create_insert_select.sql:29: ERROR:  OFFSET must not be negative
+psql:03_relational_create_insert_select.sql:35: ERROR:  OFFSET must not be negative
  id
 ----
   3
