@@ -127,13 +127,14 @@ Current implemented scope:
 - `scripts/run_replication_packaged_smoke.sh` builds `gpu_db_replication`'s `operational_cluster_smoke` example and executes the resulting local binary from `target/debug/examples/operational_cluster_smoke`.
 - `scripts/run_replication_multiprocess_smoke.sh` builds `gpu_db_replication`'s `operational_multiprocess_smoke` example and executes a bounded parent-plus-child-process deployment proof: the parent leader sends TCP AppendEntries frames to two independent follower child processes, then verifies follower catch-up and read-after-apply output.
 - `scripts/run_replication_service_smoke.sh` builds `gpu_db_replication`'s `operational_service_smoke` example and executes a bounded follower-service deployment proof: the parent leader sends multiple sequential TCP AppendEntries requests to two long-running follower service processes, verifies committed apply/read-after-apply output, and observes controlled service shutdown.
+- `scripts/run_replication_supervised_restart_smoke.sh` reuses the packaged service example to execute a bounded restart-supervision proof: the parent leader restarts one follower service, replays the full durable prefix after restart, keeps a second follower service live, and verifies both followers catch up through real TCP AppendEntries traffic before controlled shutdown.
 - `scripts/run_replication_container_smoke.sh` builds a local Docker image from the same `operational_service_smoke` example, starts two follower service containers on a user-defined local network, drives real TCP AppendEntries from the host leader through published container ports, verifies committed apply/read-after-apply output, and observes controlled shutdown.
 - The scenario demonstrates leader write admission, typed append-entries request/response handling with a tested binary frame codec and single-request TCP send/serve helper, follower catch-up, read-after-apply, deterministic request-vote election before failover, old-leader `NotLeader` rejection after failover, and continued writes on the elected leader.
 - The smoke commands emit an `operational_deployment_preflight=passed` line only when the smoke proof passes and the current TCP append-entries transport evidence, deterministic election evidence, packaged-local entrypoint evidence, deployment scope, and gap status are explicitly reported.
 
 Current simulated/not-yet-implemented scope:
 
-- No production service manager or daemon supervision. The implemented packaging proofs are reproducible local binary smoke harnesses, including bounded multi-process parent/follower and long-running follower-service proofs.
+- No production service manager or daemon supervision. The implemented packaging proofs are reproducible local binary smoke harnesses, including bounded multi-process parent/follower, long-running follower-service, and restart-plus-replay proofs.
 - No membership reconfiguration. The current election proof is deterministic request-vote voting inside the local smoke harness, not a timer-driven production election loop.
 - No Kubernetes deployment harness. The local Docker smoke is a bounded packaging proof, not a production orchestration contract.
 
@@ -144,6 +145,7 @@ scripts/run_replication_cluster_smoke.sh
 scripts/run_replication_packaged_smoke.sh
 scripts/run_replication_multiprocess_smoke.sh
 scripts/run_replication_service_smoke.sh
+scripts/run_replication_supervised_restart_smoke.sh
 scripts/run_replication_container_smoke.sh
 ```
 
@@ -162,6 +164,7 @@ Pass criteria:
 - `deployment_gap_network_transport`, `deployment_gap_automatic_election`, and `deployment_gap_packaged_deployment` report `implemented`.
 - Multi-process smoke output includes `operational_replication_multiprocess_smoke=passed`, `multiprocess_transport=tcp_append_entries`, one `multiprocess_follower ... caught_up=true` line per child process, and explicit `deployment_gap_packaged_multiprocess_smoke=implemented`.
 - Service smoke output includes `operational_replication_service_smoke=passed`, `service_transport=tcp_append_entries`, one `service_follower ... caught_up=true` line per follower service, `service_shutdown=controlled`, `deployment_gap_long_running_service=implemented`, and `deployment_gap_container_deployment=missing`.
+- Supervised-restart smoke output includes `operational_replication_supervised_restart_smoke=passed`, `supervised_restart_transport=tcp_append_entries`, the restarted follower reporting catch-up before and after restart, `supervised_restart_replay=full_durable_prefix_after_restart`, `deployment_gap_service_restart_supervision=implemented_bounded_local_smoke`, and explicit missing lines for production supervision and Kubernetes deployment.
 - Container smoke output includes `operational_replication_container_smoke=host_parent_passed`, `container_deployment_scope=host_leader_two_follower_service_containers`, one `service_follower ... caught_up=true` line per follower container, `service_shutdown=controlled`, and `deployment_gap_container_deployment=implemented`.
 
 ## 5) CPU Fallback Monitoring (No-GPU bootstrap)

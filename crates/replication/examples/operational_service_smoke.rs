@@ -42,6 +42,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     if args.get(1).map(String::as_str) == Some("--follower-service") {
         return run_follower_service(&args[2..]);
     }
+    if args.get(1).map(String::as_str) == Some("--supervised-restart") {
+        return run_supervised_restart_parent();
+    }
     run_parent(&args[1..])
 }
 
@@ -191,6 +194,167 @@ fn run_parent(args: &[String]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn run_supervised_restart_parent() -> Result<(), Box<dyn Error>> {
+    let mut leader = RaftReplicator::new(3);
+    leader.become_leader(1);
+
+    let first = leader.propose(b"create table t(id int)".to_vec())?;
+    let second = leader.propose(b"insert into t values (1)".to_vec())?;
+    let term = leader.current_term();
+    let first_batch = vec![
+        LogEntry {
+            term,
+            index: first.index,
+            payload: b"create table t(id int)".to_vec(),
+        },
+        LogEntry {
+            term,
+            index: second.index,
+            payload: b"insert into t values (1)".to_vec(),
+        },
+    ];
+
+    let mut restarting_follower = spawn_follower_service_with_requests(2, 2)?;
+    let mut stable_follower = spawn_follower_service(3)?;
+    let mut append_batches_sent = 0usize;
+    let mut heartbeat_batches_sent = 0usize;
+    let mut follower_acks_recorded = 0usize;
+
+    for follower in [&restarting_follower, &stable_follower] {
+        send_checked(
+            follower,
+            AppendEntriesRequest {
+                leader_term: term,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: first_batch.clone(),
+                leader_commit: 0,
+            },
+        )?;
+        append_batches_sent += 1;
+        leader.register_follower_ack(first.index, follower.id);
+        leader.register_follower_ack(second.index, follower.id);
+        follower_acks_recorded += 2;
+    }
+    leader.wait_committed(second, TIMEOUT)?;
+
+    for follower in [&restarting_follower, &stable_follower] {
+        send_checked(
+            follower,
+            AppendEntriesRequest {
+                leader_term: term,
+                prev_log_index: second.index,
+                prev_log_term: term,
+                entries: vec![],
+                leader_commit: leader.commit_index(),
+            },
+        )?;
+        heartbeat_batches_sent += 1;
+    }
+
+    let before_restart_output = finish_follower_service(&mut restarting_follower)?;
+    if !before_restart_output.contains(
+        "service_follower id=2 commit=2 applied=2 caught_up=true read_after_apply=create table t(id int) | insert into t values (1)",
+    ) {
+        return Err("restarting follower did not report pre-restart catch-up".into());
+    }
+
+    let third = leader.propose(b"insert into t values (2)".to_vec())?;
+    send_checked(
+        &stable_follower,
+        AppendEntriesRequest {
+            leader_term: term,
+            prev_log_index: second.index,
+            prev_log_term: term,
+            entries: vec![LogEntry {
+                term,
+                index: third.index,
+                payload: b"insert into t values (2)".to_vec(),
+            }],
+            leader_commit: leader.commit_index(),
+        },
+    )?;
+    append_batches_sent += 1;
+    leader.register_follower_ack(third.index, stable_follower.id);
+    follower_acks_recorded += 1;
+
+    let mut restarted_follower = spawn_follower_service_with_requests(2, 2)?;
+    let replay_batch = vec![
+        LogEntry {
+            term,
+            index: first.index,
+            payload: b"create table t(id int)".to_vec(),
+        },
+        LogEntry {
+            term,
+            index: second.index,
+            payload: b"insert into t values (1)".to_vec(),
+        },
+        LogEntry {
+            term,
+            index: third.index,
+            payload: b"insert into t values (2)".to_vec(),
+        },
+    ];
+    send_checked(
+        &restarted_follower,
+        AppendEntriesRequest {
+            leader_term: term,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: replay_batch,
+            leader_commit: leader.commit_index(),
+        },
+    )?;
+    append_batches_sent += 1;
+    leader.register_follower_ack(third.index, restarted_follower.id);
+    follower_acks_recorded += 1;
+    leader.wait_committed(third, TIMEOUT)?;
+
+    for follower in [&restarted_follower, &stable_follower] {
+        send_checked(
+            follower,
+            AppendEntriesRequest {
+                leader_term: term,
+                prev_log_index: third.index,
+                prev_log_term: term,
+                entries: vec![],
+                leader_commit: leader.commit_index(),
+            },
+        )?;
+        heartbeat_batches_sent += 1;
+    }
+
+    let restarted_output = finish_follower_service(&mut restarted_follower)?;
+    let stable_output = finish_follower_service(&mut stable_follower)?;
+    let expected_restarted = "service_follower id=2 commit=3 applied=3 caught_up=true read_after_apply=create table t(id int) | insert into t values (1) | insert into t values (2)";
+    let expected_stable = "service_follower id=3 commit=3 applied=3 caught_up=true read_after_apply=create table t(id int) | insert into t values (1) | insert into t values (2)";
+    if !restarted_output.contains(expected_restarted) {
+        return Err(
+            format!("missing restarted follower evidence line: {expected_restarted}").into(),
+        );
+    }
+    if !stable_output.contains(expected_stable) {
+        return Err(format!("missing stable follower evidence line: {expected_stable}").into());
+    }
+
+    println!("operational_replication_supervised_restart_smoke=passed");
+    println!("supervised_restart_scope=parent_leader_restarts_one_follower_service");
+    println!(
+        "supervised_restart_transport=tcp_append_entries follower_services=2 restarted_follower=2 append_batches_sent={append_batches_sent} heartbeat_batches_sent={heartbeat_batches_sent} follower_acks_recorded={follower_acks_recorded}"
+    );
+    print!("{before_restart_output}");
+    print!("{restarted_output}");
+    print!("{stable_output}");
+    println!("supervised_restart_replay=full_durable_prefix_after_restart");
+    println!("service_shutdown=controlled follower_services=2");
+    println!("deployment_gap_service_restart_supervision=implemented_bounded_local_smoke");
+    println!("deployment_gap_production_supervision=missing");
+    println!("deployment_gap_kubernetes_deployment=missing");
+
+    Ok(())
+}
+
 fn parse_external_followers(args: &[String]) -> Result<Vec<FollowerService>, Box<dyn Error>> {
     let mut followers = Vec::new();
     let mut iter = args.iter();
@@ -231,13 +395,20 @@ fn send_checked(
 }
 
 fn spawn_follower_service(id: u64) -> Result<FollowerService, Box<dyn Error>> {
+    spawn_follower_service_with_requests(id, FOLLOWER_REQUESTS)
+}
+
+fn spawn_follower_service_with_requests(
+    id: u64,
+    expected_requests: usize,
+) -> Result<FollowerService, Box<dyn Error>> {
     let current = env::current_exe()?;
     let mut child = Command::new(current)
         .arg("--follower-service")
         .arg("--id")
         .arg(id.to_string())
         .arg("--expected-requests")
-        .arg(FOLLOWER_REQUESTS.to_string())
+        .arg(expected_requests.to_string())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()?;
