@@ -32,7 +32,7 @@ def classify(test_id: str) -> list[str]:
             buckets.append("protocol.extended_query")
         if re.search(r"transaction|begin|commit|rollback", test_id):
             buckets.append("sql.transaction_flows")
-        if re.search(r"relational|create_table|insert|select", test_id):
+        if re.search(r"relational|create_table|insert|select|delete", test_id):
             buckets.append("sql.relational_foundation")
         if re.search(r"catalog|pg_catalog|introspection|schema|type", test_id):
             buckets.append("sql.catalog_schema_types")
@@ -57,7 +57,7 @@ def classify(test_id: str) -> list[str]:
         )
     if re.search(r"extended|bind|parse|portal|prepared|parameterized|cursor|fetch_count|gdesc", test_id):
         buckets.append("protocol.extended_query")
-    if re.search(r"relational|create_table|insert|select|truncate", test_id):
+    if re.search(r"relational|create_table|insert|select|delete|truncate", test_id):
         buckets.append("sql.relational_foundation")
     if re.search(r"sql_gpu|gpu_bridge|relational_sql_select_cuda|relational_sql_select_gpu", test_id):
         buckets.append("sql.gpu_bridge")

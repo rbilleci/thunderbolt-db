@@ -201,6 +201,68 @@ fn row_matches_select_filters(
     Ok(false)
 }
 
+fn row_matches_delete_filters(
+    table: &Table,
+    row: &[SqlValue],
+    delete: &gpu_db_protocol::Delete,
+) -> Result<bool, ErrorField> {
+    let filter_groups = if delete.filter_groups.is_empty() {
+        if delete.filters.is_empty() {
+            delete
+                .filter
+                .iter()
+                .cloned()
+                .map(|filter| vec![filter])
+                .collect::<Vec<_>>()
+        } else {
+            vec![delete.filters.clone()]
+        }
+    } else {
+        delete.filter_groups.clone()
+    };
+
+    if filter_groups.is_empty() {
+        return Err(ErrorField {
+            code: "42601",
+            message: "DELETE requires WHERE filters",
+            position: None,
+        });
+    }
+
+    for filters in filter_groups {
+        let mut group_matches = true;
+        for filter in filters {
+            let Some(idx) = table
+                .columns
+                .iter()
+                .position(|column| column.def.name == filter.column)
+            else {
+                return Err(ErrorField {
+                    code: "42703",
+                    message: "column does not exist",
+                    position: None,
+                });
+            };
+            if !sql_value_matches_type(&filter.value, table.columns[idx].def.ty) {
+                return Err(ErrorField {
+                    code: "42804",
+                    message: "column type mismatch",
+                    position: None,
+                });
+            }
+            if !select_filter_matches(&row[idx], filter.op, &filter.value) {
+                group_matches = false;
+                break;
+            }
+        }
+        if group_matches {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
 fn execute_select_result(
     session: &Session,
     select: &gpu_db_protocol::Select,
@@ -4643,6 +4705,36 @@ fn execute_statement(
                 session.mark_table_dirty(table_name);
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, &format!("INSERT 0 {inserted_count}"));
+            }
+            Command::Delete(delete) => {
+                let table_name = delete.table.clone();
+                let Some(table) = session.tables.get_mut(&table_name) else {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "42P01",
+                            message: "relation does not exist",
+                            position: None,
+                        },
+                    );
+                };
+                let mut delete_mask = Vec::with_capacity(table.rows.len());
+                for row in &table.rows {
+                    match row_matches_delete_filters(table, row, &delete) {
+                        Ok(matches) => delete_mask.push(matches),
+                        Err(error) => return write_error(stream, &error),
+                    }
+                }
+                let deleted_count = delete_mask.iter().filter(|matches| **matches).count();
+                let mut delete_mask = delete_mask.into_iter();
+                let kept = std::mem::take(&mut table.rows)
+                    .into_iter()
+                    .filter(|_| !delete_mask.next().unwrap_or(false))
+                    .collect();
+                table.rows = kept;
+                session.mark_table_dirty(table_name);
+                session.persist_catalog_snapshot();
+                return write_command_complete(stream, &format!("DELETE {deleted_count}"));
             }
             Command::Select(select) => {
                 let result = match execute_select_result(session, &select) {
@@ -9949,6 +10041,63 @@ mod tests {
 
         execute_statement(&mut writer, &mut session, "SELECT id FROM people", true).unwrap();
         assert_eq!(read_backend_tags(&mut reader, 2), vec![b'T', b'C']);
+    }
+
+    #[test]
+    fn simple_relational_delete_removes_matching_rows_and_recovers() {
+        let mut session = Session::default();
+        session.tables.insert(
+            "people".to_string(),
+            Table {
+                oid: FIRST_USER_RELATION_OID,
+                name: "people".to_string(),
+                columns: vec![
+                    CatalogColumn {
+                        attnum: 1,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "id".to_string(),
+                            ty: SqlType::Int4,
+                        },
+                    },
+                    CatalogColumn {
+                        attnum: 2,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "name".to_string(),
+                            ty: SqlType::Text,
+                        },
+                    },
+                ],
+                rows: vec![
+                    vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())],
+                    vec![SqlValue::Int4(2), SqlValue::Text("Linus".to_string())],
+                    vec![SqlValue::Int4(3), SqlValue::Text("Grace".to_string())],
+                    vec![
+                        SqlValue::Int4(4),
+                        SqlValue::Text("Ada Lovelace".to_string()),
+                    ],
+                ],
+            },
+        );
+        let (mut writer, mut reader) = tcp_pair();
+
+        execute_statement(
+            &mut writer,
+            &mut session,
+            "DELETE FROM people WHERE id = 2 OR name LIKE 'Ada%'",
+            true,
+        )
+        .unwrap();
+
+        let messages = read_backend_messages(&mut reader, 1);
+        assert_eq!(messages[0].0, b'C');
+        assert_eq!(messages[0].1, b"DELETE 3\0");
+        assert_eq!(
+            session.tables["people"].rows,
+            vec![vec![SqlValue::Int4(3), SqlValue::Text("Grace".to_string())]]
+        );
+
+        execute_statement(&mut writer, &mut session, "SELECT id FROM people", true).unwrap();
+        assert_eq!(read_backend_tags(&mut reader, 3), vec![b'T', b'D', b'C']);
     }
 
     #[test]

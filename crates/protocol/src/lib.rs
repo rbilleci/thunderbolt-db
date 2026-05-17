@@ -11,6 +11,7 @@ pub enum Command {
     GetKv { key: String },
     CreateTable(CreateTable),
     Insert(Insert),
+    Delete(Delete),
     Select(Select),
 }
 
@@ -62,6 +63,14 @@ pub struct Insert {
     pub table: String,
     pub columns: Vec<String>,
     pub rows: Vec<Vec<SqlValue>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Delete {
+    pub table: String,
+    pub filter: Option<SelectFilter>,
+    pub filters: Vec<SelectFilter>,
+    pub filter_groups: Vec<Vec<SelectFilter>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -172,7 +181,7 @@ pub enum ParseError {
     InvalidDel,
     #[error("invalid GET syntax; expected: GET key")]
     InvalidGet,
-    #[error("invalid relational SQL syntax; supported subset: CREATE TABLE name (...), INSERT INTO name (...) VALUES (...), SELECT [DISTINCT] columns|COUNT(*)|SUM(int4_column)|AVG(int4_column)|MIN(column)|MAX(column)|column, COUNT(*)|column, SUM(int4_column)|column, AVG(int4_column)|column, MIN(column)|column, MAX(column) FROM name [WHERE column (=|<|<=|>|>=) literal | column BETWEEN literal AND literal | column IN (literal, ...) | text_column LIKE 'prefix%' [AND ...] [OR ...]] [GROUP BY column] [ORDER BY selected_column|count|sum|avg|min|max [ASC|DESC]] [LIMIT n] [OFFSET n]")]
+    #[error("invalid relational SQL syntax; supported subset: CREATE TABLE name (...), INSERT INTO name (...) VALUES (...), DELETE FROM name WHERE column (=|<|<=|>|>=) literal | column BETWEEN literal AND literal | column IN (literal, ...) | text_column LIKE 'prefix%' [AND ...] [OR ...], SELECT [DISTINCT] columns|COUNT(*)|SUM(int4_column)|AVG(int4_column)|MIN(column)|MAX(column)|column, COUNT(*)|column, SUM(int4_column)|column, AVG(int4_column)|column, MIN(column)|column, MAX(column) FROM name [WHERE column (=|<|<=|>|>=) literal | column BETWEEN literal AND literal | column IN (literal, ...) | text_column LIKE 'prefix%' [AND ...] [OR ...]] [GROUP BY column] [ORDER BY selected_column|count|sum|avg|min|max [ASC|DESC]] [LIMIT n] [OFFSET n]")]
     InvalidRelationalSql,
     #[error("LIMIT must not be negative")]
     NegativeLimit,
@@ -1509,6 +1518,14 @@ fn parse_relational_command(input: &str) -> Option<Result<Command, ParseError>> 
     if first.eq_ignore_ascii_case("INSERT") {
         return Some(parse_insert(input).map(Command::Insert));
     }
+    if first.eq_ignore_ascii_case("DELETE")
+        && strip_keyword_prefix_case_insensitive(input, "DELETE")
+            .map(str::trim_start)
+            .and_then(|tail| strip_keyword_prefix_case_insensitive(tail, "FROM"))
+            .is_some_and(|tail| find_keyword_outside_quotes(tail, "WHERE").is_some())
+    {
+        return Some(parse_delete(input).map(Command::Delete));
+    }
     if first.eq_ignore_ascii_case("SELECT") {
         return Some(parse_select(input).map(Command::Select));
     }
@@ -1627,6 +1644,28 @@ fn parse_insert(input: &str) -> Result<Insert, ParseError> {
         table,
         columns,
         rows,
+    })
+}
+
+fn parse_delete(input: &str) -> Result<Delete, ParseError> {
+    let rest = strip_keyword_prefix_case_insensitive(input, "DELETE")
+        .and_then(|s| strip_keyword_prefix_case_insensitive(s.trim_start(), "FROM"))
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    let where_pos =
+        find_keyword_outside_quotes(rest, "WHERE").ok_or(ParseError::InvalidRelationalSql)?;
+    let table = normalize_relation_identifier(rest[..where_pos].trim())?;
+    let filter_input = rest[where_pos + "WHERE".len()..].trim();
+    if filter_input.is_empty() {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let filter_groups = parse_select_filter_groups(filter_input)?;
+    let filters = filter_groups.first().cloned().unwrap_or_default();
+    Ok(Delete {
+        table,
+        filter: filters.first().cloned(),
+        filters,
+        filter_groups,
     })
 }
 
@@ -8655,6 +8694,47 @@ mod tests {
                     vec![SqlValue::Int4(5), SqlValue::Text("Mary".to_string())],
                 ],
             })
+        );
+
+        assert_eq!(
+            parse_command("DELETE FROM public.people WHERE id = 1 OR name LIKE 'Ada%'").unwrap(),
+            Command::Delete(Delete {
+                table: "people".to_string(),
+                filter: Some(SelectFilter {
+                    column: "id".to_string(),
+                    op: SelectFilterOp::Eq,
+                    value: SqlValue::Int4(1),
+                }),
+                filters: vec![SelectFilter {
+                    column: "id".to_string(),
+                    op: SelectFilterOp::Eq,
+                    value: SqlValue::Int4(1),
+                }],
+                filter_groups: vec![
+                    vec![SelectFilter {
+                        column: "id".to_string(),
+                        op: SelectFilterOp::Eq,
+                        value: SqlValue::Int4(1),
+                    }],
+                    vec![SelectFilter {
+                        column: "name".to_string(),
+                        op: SelectFilterOp::LikePrefix,
+                        value: SqlValue::Text("Ada".to_string()),
+                    }],
+                ],
+            })
+        );
+        assert_eq!(
+            parse_command("DELETE FROM balance").unwrap(),
+            Command::DeleteKv {
+                key: "balance".to_string(),
+            }
+        );
+        assert_eq!(
+            parse_command("DELETE FROM public.people").unwrap(),
+            Command::DeleteKv {
+                key: "public.people".to_string(),
+            }
         );
 
         assert_eq!(

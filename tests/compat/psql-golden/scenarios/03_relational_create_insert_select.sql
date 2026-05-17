@@ -48,3 +48,7 @@ SELECT id, name FROM people ORDER BY id LIMIT 1 OFFSET 1;
 \echo === relational negative offset recovery ===
 SELECT id FROM people ORDER BY id OFFSET -1;
 SELECT id FROM people ORDER BY id LIMIT 1 OFFSET 2;
+\echo === relational delete workflow ===
+DELETE FROM people WHERE id = 2 OR name LIKE 'Ada%';
+SELECT id, name FROM people ORDER BY id;
+SELECT COUNT(*) FROM people;

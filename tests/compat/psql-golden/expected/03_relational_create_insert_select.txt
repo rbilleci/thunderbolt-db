@@ -159,3 +159,16 @@ psql:03_relational_create_insert_select.sql:49: ERROR:  OFFSET must not be negat
 ----
   3
 (1 row)
+
+=== relational delete workflow ===
+DELETE 2
+ id | name
+----+-------
+  3 | Grace
+  4 | Grace
+(2 rows)
+
+ count
+-------
+     2
+(1 row)

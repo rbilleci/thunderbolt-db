@@ -58,7 +58,7 @@ impl Planner {
                 },
                 kind: PlanKind::Mutation,
             },
-            Command::CreateTable(_) | Command::Insert(_) => PlanNode {
+            Command::CreateTable(_) | Command::Insert(_) | Command::Delete(_) => PlanNode {
                 op: PlannedOp {
                     name: "relational_write".to_string(),
                     target: DeviceTarget::Gpu(self.cfg.default_gpu_id),
@@ -187,6 +187,20 @@ mod tests {
                 order_by: None,
                 limit: None,
                 offset: None,
+            }),
+            Command::Delete(gpu_db_protocol::Delete {
+                table: "t".to_string(),
+                filter: None,
+                filters: vec![gpu_db_protocol::SelectFilter {
+                    column: "id".to_string(),
+                    op: gpu_db_protocol::SelectFilterOp::Eq,
+                    value: gpu_db_protocol::SqlValue::Int4(1),
+                }],
+                filter_groups: vec![vec![gpu_db_protocol::SelectFilter {
+                    column: "id".to_string(),
+                    op: gpu_db_protocol::SelectFilterOp::Eq,
+                    value: gpu_db_protocol::SqlValue::Int4(1),
+                }]],
             }),
             Command::Begin,
             Command::Commit { chain: false },
