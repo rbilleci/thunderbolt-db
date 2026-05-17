@@ -103,6 +103,7 @@ pub struct Select {
     pub distinct: bool,
     pub projection: SelectProjection,
     pub group_by: Option<String>,
+    pub having_groups: Vec<Vec<SelectFilter>>,
     pub filter: Option<SelectFilter>,
     pub filters: Vec<SelectFilter>,
     pub filter_groups: Vec<Vec<SelectFilter>>,
@@ -197,7 +198,7 @@ pub enum ParseError {
     InvalidDel,
     #[error("invalid GET syntax; expected: GET key")]
     InvalidGet,
-    #[error("invalid relational SQL syntax; supported subset: CREATE TABLE name (...), INSERT INTO name (...) VALUES (...), UPDATE name SET column = literal [, ...] WHERE column (=|<|<=|>|>=) literal | column BETWEEN literal AND literal | column IN (literal, ...) | text_column LIKE 'prefix%' [AND ...] [OR ...], DELETE FROM name WHERE column (=|<|<=|>|>=) literal | column BETWEEN literal AND literal | column IN (literal, ...) | text_column LIKE 'prefix%' [AND ...] [OR ...], SELECT [DISTINCT] columns|COUNT(*)|SUM(int4_column)|AVG(int4_column)|MIN(column)|MAX(column)|column, COUNT(*)|column, SUM(int4_column)|column, AVG(int4_column)|column, MIN(column)|column, MAX(column) FROM name [WHERE column (=|<|<=|>|>=) literal | column BETWEEN literal AND literal | column IN (literal, ...) | text_column LIKE 'prefix%' [AND ...] [OR ...]] [GROUP BY column] [ORDER BY selected_column|count|sum|avg|min|max [ASC|DESC]] [LIMIT n] [OFFSET n]")]
+    #[error("invalid relational SQL syntax; supported subset: CREATE TABLE name (...), INSERT INTO name (...) VALUES (...), UPDATE name SET column = literal [, ...] WHERE column (=|<|<=|>|>=) literal | column BETWEEN literal AND literal | column IN (literal, ...) | text_column LIKE 'prefix%' [AND ...] [OR ...], DELETE FROM name WHERE column (=|<|<=|>|>=) literal | column BETWEEN literal AND literal | column IN (literal, ...) | text_column LIKE 'prefix%' [AND ...] [OR ...], SELECT [DISTINCT] columns|COUNT(*)|SUM(int4_column)|AVG(int4_column)|MIN(column)|MAX(column)|column, COUNT(*)|column, SUM(int4_column)|column, AVG(int4_column)|column, MIN(column)|column, MAX(column) FROM name [WHERE column (=|<|<=|>|>=) literal | column BETWEEN literal AND literal | column IN (literal, ...) | text_column LIKE 'prefix%' [AND ...] [OR ...]] [GROUP BY column] [HAVING grouped_column|count|sum|avg|min|max (=|<|<=|>|>=) literal [AND ...] [OR ...]] [ORDER BY selected_column|count|sum|avg|min|max [ASC|DESC]] [LIMIT n] [OFFSET n]")]
     InvalidRelationalSql,
     #[error("LIMIT must not be negative")]
     NegativeLimit,
@@ -1777,6 +1778,7 @@ fn parse_select(input: &str) -> Result<Select, ParseError> {
 
     let mut filter_groups = Vec::new();
     let mut group_by = None;
+    let mut having_groups = Vec::new();
     let mut order_by = None;
     let mut limit = None;
     let mut offset = None;
@@ -1793,6 +1795,11 @@ fn parse_select(input: &str) -> Result<Select, ParseError> {
             let next = next_clause_pos(after_by).unwrap_or(after_by.len());
             group_by = Some(normalize_identifier(after_by[..next].trim())?);
             tail = after_by[next..].trim_start();
+        } else if let Some(after_having) = strip_keyword_prefix_case_insensitive(tail, "HAVING") {
+            let after_having = after_having.trim_start();
+            let next = next_clause_pos(after_having).unwrap_or(after_having.len());
+            having_groups = parse_select_filter_groups(after_having[..next].trim())?;
+            tail = after_having[next..].trim_start();
         } else if let Some(after_order) = strip_keyword_prefix_case_insensitive(tail, "ORDER") {
             let after_by = strip_keyword_prefix_case_insensitive(after_order.trim_start(), "BY")
                 .ok_or(ParseError::InvalidRelationalSql)?
@@ -1821,6 +1828,7 @@ fn parse_select(input: &str) -> Result<Select, ParseError> {
         distinct,
         projection,
         group_by,
+        having_groups,
         filter: filters.first().cloned(),
         filters,
         filter_groups,
@@ -2403,7 +2411,7 @@ fn is_keyword_boundary(input: &str, start: usize, len: usize) -> bool {
 }
 
 fn next_clause_pos(input: &str) -> Option<usize> {
-    ["WHERE", "GROUP", "ORDER", "LIMIT", "OFFSET"]
+    ["WHERE", "GROUP", "HAVING", "ORDER", "LIMIT", "OFFSET"]
         .into_iter()
         .filter_map(|keyword| find_keyword_outside_quotes(input, keyword))
         .min()
@@ -8854,6 +8862,7 @@ mod tests {
                 distinct: false,
                 projection: SelectProjection::Columns(vec!["id".to_string()]),
                 group_by: None,
+                having_groups: Vec::new(),
                 filter: Some(SelectFilter {
                     column: "id".to_string(),
                     op: SelectFilterOp::Eq,
@@ -8881,6 +8890,7 @@ mod tests {
                 distinct: false,
                 projection: SelectProjection::Columns(vec!["id".to_string()]),
                 group_by: None,
+                having_groups: Vec::new(),
                 filter: Some(SelectFilter {
                     column: "id".to_string(),
                     op: SelectFilterOp::Eq,
@@ -8908,6 +8918,7 @@ mod tests {
                 distinct: false,
                 projection: SelectProjection::Columns(vec!["id".to_string(), "name".to_string()]),
                 group_by: None,
+                having_groups: Vec::new(),
                 filter: None,
                 filters: Vec::new(),
                 filter_groups: Vec::new(),
@@ -8932,6 +8943,7 @@ mod tests {
                 distinct: false,
                 projection: SelectProjection::Columns(vec!["id".to_string()]),
                 group_by: None,
+                having_groups: Vec::new(),
                 filter: None,
                 filters: Vec::new(),
                 filter_groups: Vec::new(),
@@ -8950,6 +8962,7 @@ mod tests {
                 distinct: false,
                 projection: SelectProjection::Columns(vec!["id".to_string()]),
                 group_by: None,
+                having_groups: Vec::new(),
                 filter: None,
                 filters: Vec::new(),
                 filter_groups: Vec::new(),
@@ -8970,6 +8983,7 @@ mod tests {
                 distinct: false,
                 projection: SelectProjection::Columns(vec!["id".to_string(), "name".to_string()]),
                 group_by: None,
+                having_groups: Vec::new(),
                 filter: Some(SelectFilter {
                     column: "id".to_string(),
                     op: SelectFilterOp::Eq,
@@ -9001,6 +9015,7 @@ mod tests {
                 distinct: false,
                 projection: SelectProjection::Columns(vec!["name".to_string()]),
                 group_by: None,
+                having_groups: Vec::new(),
                 filter: Some(SelectFilter {
                     column: "id".to_string(),
                     op: SelectFilterOp::Gte,
@@ -9032,6 +9047,7 @@ mod tests {
                 distinct: false,
                 projection: SelectProjection::Columns(vec!["name".to_string()]),
                 group_by: None,
+                having_groups: Vec::new(),
                 filter: Some(SelectFilter {
                     column: "id".to_string(),
                     op: SelectFilterOp::Gte,
@@ -9066,6 +9082,7 @@ mod tests {
                 distinct: false,
                 projection: SelectProjection::Columns(vec!["name".to_string()]),
                 group_by: None,
+                having_groups: Vec::new(),
                 filter: Some(SelectFilter {
                     column: "id".to_string(),
                     op: SelectFilterOp::Gte,
@@ -9097,6 +9114,7 @@ mod tests {
                 distinct: false,
                 projection: SelectProjection::Columns(vec!["name".to_string()]),
                 group_by: None,
+                having_groups: Vec::new(),
                 filter: Some(SelectFilter {
                     column: "name".to_string(),
                     op: SelectFilterOp::Eq,
@@ -9128,6 +9146,7 @@ mod tests {
                 distinct: false,
                 projection: SelectProjection::Columns(vec!["id".to_string(), "name".to_string()]),
                 group_by: None,
+                having_groups: Vec::new(),
                 filter: Some(SelectFilter {
                     column: "id".to_string(),
                     op: SelectFilterOp::Eq,
@@ -9166,6 +9185,7 @@ mod tests {
                 distinct: false,
                 projection: SelectProjection::Columns(vec!["name".to_string()]),
                 group_by: None,
+                having_groups: Vec::new(),
                 filter: Some(SelectFilter {
                     column: "id".to_string(),
                     op: SelectFilterOp::Gte,
@@ -9208,6 +9228,7 @@ mod tests {
                 distinct: false,
                 projection: SelectProjection::Columns(vec!["name".to_string()]),
                 group_by: None,
+                having_groups: Vec::new(),
                 filter: Some(SelectFilter {
                     column: "id".to_string(),
                     op: SelectFilterOp::Eq,
@@ -9243,6 +9264,7 @@ mod tests {
                 distinct: false,
                 projection: SelectProjection::Columns(vec!["name".to_string()]),
                 group_by: None,
+                having_groups: Vec::new(),
                 filter: Some(SelectFilter {
                     column: "id".to_string(),
                     op: SelectFilterOp::Eq,
@@ -9281,6 +9303,7 @@ mod tests {
                 distinct: false,
                 projection: SelectProjection::Columns(vec!["id".to_string()]),
                 group_by: None,
+                having_groups: Vec::new(),
                 filter: Some(SelectFilter {
                     column: "id".to_string(),
                     op: SelectFilterOp::Eq,
@@ -9367,6 +9390,7 @@ mod tests {
                 distinct: false,
                 projection: SelectProjection::Columns(vec!["id".to_string()]),
                 group_by: None,
+                having_groups: Vec::new(),
                 filter: Some(SelectFilter {
                     column: "id".to_string(),
                     op: SelectFilterOp::Eq,
@@ -9411,6 +9435,7 @@ mod tests {
                 distinct: false,
                 projection: SelectProjection::Columns(vec!["name".to_string()]),
                 group_by: None,
+                having_groups: Vec::new(),
                 filter: Some(SelectFilter {
                     column: "name".to_string(),
                     op: SelectFilterOp::Eq,
@@ -9479,6 +9504,7 @@ mod tests {
                 distinct: false,
                 projection: SelectProjection::Columns(vec!["id".to_string()]),
                 group_by: None,
+                having_groups: Vec::new(),
                 filter: Some(SelectFilter {
                     column: "id".to_string(),
                     op: SelectFilterOp::Gte,
@@ -9525,6 +9551,7 @@ mod tests {
                 distinct: false,
                 projection: SelectProjection::Columns(vec!["name".to_string()]),
                 group_by: None,
+                having_groups: Vec::new(),
                 filter: Some(SelectFilter {
                     column: "name".to_string(),
                     op: SelectFilterOp::Gte,
@@ -9582,6 +9609,7 @@ mod tests {
                 distinct: false,
                 projection: SelectProjection::Columns(vec!["id".to_string()]),
                 group_by: None,
+                having_groups: Vec::new(),
                 filter: Some(SelectFilter {
                     column: "name".to_string(),
                     op: SelectFilterOp::LikePrefix,
@@ -9613,6 +9641,7 @@ mod tests {
                 distinct: false,
                 projection: SelectProjection::Columns(vec!["name".to_string()]),
                 group_by: None,
+                having_groups: Vec::new(),
                 filter: Some(SelectFilter {
                     column: "name".to_string(),
                     op: SelectFilterOp::LikePrefix,
@@ -9667,6 +9696,7 @@ mod tests {
                 distinct: true,
                 projection: SelectProjection::Columns(vec!["name".to_string(), "id".to_string()]),
                 group_by: None,
+                having_groups: Vec::new(),
                 filter: Some(SelectFilter {
                     column: "name".to_string(),
                     op: SelectFilterOp::LikePrefix,
@@ -9701,7 +9731,7 @@ mod tests {
     fn parses_relational_count_aggregates() {
         assert_eq!(
             parse_command(
-                "SELECT name, COUNT(*) FROM people WHERE id >= 2 GROUP BY name ORDER BY count DESC LIMIT 2 OFFSET 1",
+                "SELECT name, COUNT(*) FROM people WHERE id >= 2 GROUP BY name HAVING count >= 2 OR name = 'Ada' ORDER BY count DESC LIMIT 2 OFFSET 1",
             )
             .unwrap(),
             Command::Select(Select {
@@ -9711,6 +9741,18 @@ mod tests {
                     column: "name".to_string(),
                 },
                 group_by: Some("name".to_string()),
+                having_groups: vec![
+                    vec![SelectFilter {
+                        column: "count".to_string(),
+                        op: SelectFilterOp::Gte,
+                        value: SqlValue::Int4(2),
+                    }],
+                    vec![SelectFilter {
+                        column: "name".to_string(),
+                        op: SelectFilterOp::Eq,
+                        value: SqlValue::Text("Ada".to_string()),
+                    }],
+                ],
                 filter: Some(SelectFilter {
                     column: "id".to_string(),
                     op: SelectFilterOp::Gte,
@@ -9742,6 +9784,7 @@ mod tests {
                 distinct: false,
                 projection: SelectProjection::CountAll,
                 group_by: None,
+                having_groups: Vec::new(),
                 filter: None,
                 filters: Vec::new(),
                 filter_groups: Vec::new(),
@@ -9755,6 +9798,46 @@ mod tests {
             parse_command("SELECT COUNT(*), id FROM people"),
             Err(ParseError::InvalidRelationalSql)
         ));
+    }
+
+    #[test]
+    fn parses_relational_having_aggregates() {
+        assert_eq!(
+            parse_command(
+                "SELECT name, SUM(id) FROM people GROUP BY name HAVING sum > 2 AND name LIKE 'G%' ORDER BY sum DESC",
+            )
+            .unwrap(),
+            Command::Select(Select {
+                table: "people".to_string(),
+                distinct: false,
+                projection: SelectProjection::GroupedSum {
+                    group_column: "name".to_string(),
+                    sum_column: "id".to_string(),
+                },
+                group_by: Some("name".to_string()),
+                having_groups: vec![vec![
+                    SelectFilter {
+                        column: "sum".to_string(),
+                        op: SelectFilterOp::Gt,
+                        value: SqlValue::Int4(2),
+                    },
+                    SelectFilter {
+                        column: "name".to_string(),
+                        op: SelectFilterOp::LikePrefix,
+                        value: SqlValue::Text("G".to_string()),
+                    },
+                ]],
+                filter: None,
+                filters: Vec::new(),
+                filter_groups: Vec::new(),
+                order_by: Some(SelectOrder {
+                    column: "sum".to_string(),
+                    descending: true,
+                }),
+                limit: None,
+                offset: None,
+            })
+        );
     }
 
     #[test]
@@ -9772,6 +9855,7 @@ mod tests {
                     sum_column: "id".to_string(),
                 },
                 group_by: Some("name".to_string()),
+                having_groups: Vec::new(),
                 filter: Some(SelectFilter {
                     column: "id".to_string(),
                     op: SelectFilterOp::Gte,
@@ -9805,6 +9889,7 @@ mod tests {
                     column: "id".to_string(),
                 },
                 group_by: None,
+                having_groups: Vec::new(),
                 filter: None,
                 filters: Vec::new(),
                 filter_groups: Vec::new(),
@@ -9835,6 +9920,7 @@ mod tests {
                     avg_column: "id".to_string(),
                 },
                 group_by: Some("name".to_string()),
+                having_groups: Vec::new(),
                 filter: Some(SelectFilter {
                     column: "id".to_string(),
                     op: SelectFilterOp::Gte,
@@ -9868,6 +9954,7 @@ mod tests {
                     column: "id".to_string(),
                 },
                 group_by: None,
+                having_groups: Vec::new(),
                 filter: None,
                 filters: Vec::new(),
                 filter_groups: Vec::new(),
@@ -9902,6 +9989,7 @@ mod tests {
                     min_column: "id".to_string(),
                 },
                 group_by: Some("name".to_string()),
+                having_groups: Vec::new(),
                 filter: Some(SelectFilter {
                     column: "id".to_string(),
                     op: SelectFilterOp::Gte,
@@ -9935,6 +10023,7 @@ mod tests {
                     column: "name".to_string(),
                 },
                 group_by: None,
+                having_groups: Vec::new(),
                 filter: None,
                 filters: Vec::new(),
                 filter_groups: Vec::new(),

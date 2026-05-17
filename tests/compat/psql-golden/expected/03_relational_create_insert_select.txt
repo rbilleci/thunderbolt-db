@@ -130,18 +130,54 @@ INSERT 0 4
  Linus |   2
 (2 rows)
 
+=== relational having aggregation ===
+ name  | count
+-------+-------
+ Grace |     2
+(1 row)
+
+ name  | sum
+-------+-----
+ Grace |   7
+(1 row)
+
+ name  |        avg
+-------+--------------------
+ Grace | 3.5000000000000000
+(1 row)
+
+ name  | min
+-------+-----
+ Linus |   2
+ Grace |   3
+(2 rows)
+
+ name  | max
+-------+-----
+ Grace |   4
+ Linus |   2
+(2 rows)
+
+=== relational having unsupported recovery ===
+psql:03_relational_create_insert_select.sql:44: ERROR:  HAVING must reference grouped column or aggregate result
+psql:03_relational_create_insert_select.sql:45: ERROR:  HAVING requires GROUP BY
+ name  | count
+-------+-------
+ Grace |     2
+(1 row)
+
 === relational aggregate unsupported recovery ===
-psql:03_relational_create_insert_select.sql:38: ERROR:  grouped COUNT(*) requires GROUP BY
-psql:03_relational_create_insert_select.sql:39: ERROR:  SUM only supports int4 columns
-psql:03_relational_create_insert_select.sql:40: ERROR:  AVG only supports int4 columns
-psql:03_relational_create_insert_select.sql:41: ERROR:  grouped MIN/MAX requires GROUP BY
+psql:03_relational_create_insert_select.sql:48: ERROR:  grouped COUNT(*) requires GROUP BY
+psql:03_relational_create_insert_select.sql:49: ERROR:  SUM only supports int4 columns
+psql:03_relational_create_insert_select.sql:50: ERROR:  AVG only supports int4 columns
+psql:03_relational_create_insert_select.sql:51: ERROR:  grouped MIN/MAX requires GROUP BY
  count
 -------
      3
 (1 row)
 
 === relational distinct unsupported recovery ===
-psql:03_relational_create_insert_select.sql:44: ERROR:  SELECT DISTINCT ORDER BY must reference a selected column
+psql:03_relational_create_insert_select.sql:54: ERROR:  SELECT DISTINCT ORDER BY must reference a selected column
  id
 ----
   1
@@ -154,7 +190,7 @@ psql:03_relational_create_insert_select.sql:44: ERROR:  SELECT DISTINCT ORDER BY
 (1 row)
 
 === relational negative offset recovery ===
-psql:03_relational_create_insert_select.sql:49: ERROR:  OFFSET must not be negative
+psql:03_relational_create_insert_select.sql:59: ERROR:  OFFSET must not be negative
  id
 ----
   3
@@ -176,8 +212,8 @@ UPDATE 2
 (1 row)
 
 === relational update unsupported recovery ===
-psql:03_relational_create_insert_select.sql:56: ERROR:  query shape is not supported by the compatibility stub
-psql:03_relational_create_insert_select.sql:57: ERROR:  column type mismatch
+psql:03_relational_create_insert_select.sql:66: ERROR:  query shape is not supported by the compatibility stub
+psql:03_relational_create_insert_select.sql:67: ERROR:  column type mismatch
  id | name
 ----+-------
   3 | Grace

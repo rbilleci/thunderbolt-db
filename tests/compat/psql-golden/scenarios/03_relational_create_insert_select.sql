@@ -34,6 +34,16 @@ SELECT MIN(id) FROM people WHERE id >= 2;
 SELECT MAX(name) FROM people WHERE id >= 2;
 SELECT name, MIN(id) FROM people GROUP BY name ORDER BY min DESC LIMIT 2;
 SELECT name, MAX(id) FROM people GROUP BY name ORDER BY max DESC LIMIT 2;
+\echo === relational having aggregation ===
+SELECT name, COUNT(*) FROM people GROUP BY name HAVING count >= 2 ORDER BY name;
+SELECT name, SUM(id) FROM people GROUP BY name HAVING sum > 2 ORDER BY sum DESC;
+SELECT name, AVG(id) FROM people GROUP BY name HAVING avg > 2 ORDER BY avg DESC;
+SELECT name, MIN(id) FROM people GROUP BY name HAVING min >= 2 ORDER BY min;
+SELECT name, MAX(id) FROM people GROUP BY name HAVING name = 'Grace' OR max = 2 ORDER BY name;
+\echo === relational having unsupported recovery ===
+SELECT name, COUNT(*) FROM people GROUP BY name HAVING id = 1;
+SELECT COUNT(*) FROM people HAVING count > 1;
+SELECT name, COUNT(*) FROM people GROUP BY name HAVING count >= 2;
 \echo === relational aggregate unsupported recovery ===
 SELECT name, COUNT(*) FROM people ORDER BY name;
 SELECT SUM(name) FROM people;

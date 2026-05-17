@@ -83,13 +83,20 @@ fn compare_sql_values(left: &SqlValue, right: &SqlValue) -> std::cmp::Ordering {
         (SqlValue::Int4(left), SqlValue::Int8(right)) => i64::from(*left).cmp(right),
         (SqlValue::Int8(left), SqlValue::Int4(right)) => left.cmp(&i64::from(*right)),
         (SqlValue::Numeric(left), SqlValue::Numeric(right)) => compare_numeric_strings(left, right),
+        (SqlValue::Int4(left), SqlValue::Numeric(right)) => {
+            compare_numeric_strings(&left.to_string(), right)
+        }
+        (SqlValue::Int8(left), SqlValue::Numeric(right)) => {
+            compare_numeric_strings(&left.to_string(), right)
+        }
+        (SqlValue::Numeric(left), SqlValue::Int4(right)) => {
+            compare_numeric_strings(left, &right.to_string())
+        }
+        (SqlValue::Numeric(left), SqlValue::Int8(right)) => {
+            compare_numeric_strings(left, &right.to_string())
+        }
         (SqlValue::Text(left), SqlValue::Text(right)) => left.cmp(right),
-        (SqlValue::Int4(_) | SqlValue::Int8(_), SqlValue::Numeric(_) | SqlValue::Text(_)) => {
-            std::cmp::Ordering::Less
-        }
-        (SqlValue::Numeric(_), SqlValue::Int4(_) | SqlValue::Int8(_)) => {
-            std::cmp::Ordering::Greater
-        }
+        (SqlValue::Int4(_) | SqlValue::Int8(_), SqlValue::Text(_)) => std::cmp::Ordering::Less,
         (SqlValue::Numeric(_), SqlValue::Text(_)) => std::cmp::Ordering::Less,
         (SqlValue::Text(_), SqlValue::Int4(_) | SqlValue::Int8(_) | SqlValue::Numeric(_)) => {
             std::cmp::Ordering::Greater
@@ -251,6 +258,44 @@ fn row_matches_delete_filters(
                 });
             }
             if !select_filter_matches(&row[idx], filter.op, &filter.value) {
+                group_matches = false;
+                break;
+            }
+        }
+        if group_matches {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+fn grouped_row_matches_having(
+    select: &gpu_db_protocol::Select,
+    group_column: &str,
+    group_value: &SqlValue,
+    aggregate_name: &'static str,
+    aggregate_value: &SqlValue,
+) -> Result<bool, ErrorField> {
+    if select.having_groups.is_empty() {
+        return Ok(true);
+    }
+
+    for filters in &select.having_groups {
+        let mut group_matches = true;
+        for filter in filters {
+            let value = if filter.column == group_column {
+                group_value
+            } else if filter.column.eq_ignore_ascii_case(aggregate_name) {
+                aggregate_value
+            } else {
+                return Err(ErrorField {
+                    code: "0A000",
+                    message: "HAVING must reference grouped column or aggregate result",
+                    position: None,
+                });
+            };
+            if !select_filter_matches(value, filter.op, &filter.value) {
                 group_matches = false;
                 break;
             }
@@ -486,6 +531,13 @@ fn execute_aggregate_select_result(
             Err(error) => return Err(error),
         }
     }
+    if !select.having_groups.is_empty() && select.group_by.is_none() {
+        return Err(ErrorField {
+            code: "0A000",
+            message: "HAVING requires GROUP BY",
+            position: None,
+        });
+    }
 
     match &select.projection {
         SelectProjection::CountAll => {
@@ -548,6 +600,23 @@ fn execute_aggregate_select_result(
                 *counts.entry(row[group_idx].clone()).or_default() += 1;
             }
             let mut grouped = counts.into_iter().collect::<Vec<_>>();
+            grouped = grouped
+                .into_iter()
+                .filter_map(|(group_value, count)| {
+                    let aggregate = SqlValue::Int8(count as i64);
+                    match grouped_row_matches_having(
+                        select,
+                        column,
+                        &group_value,
+                        "count",
+                        &aggregate,
+                    ) {
+                        Ok(true) => Some(Ok((group_value, count))),
+                        Ok(false) => None,
+                        Err(error) => Some(Err(error)),
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             if let Some(order) = &select.order_by {
                 if order.column == *column {
                     grouped.sort_by(|(left, _), (right, _)| compare_sql_values(left, right));
@@ -664,6 +733,23 @@ fn execute_aggregate_select_result(
                 *sums.entry(row[group_idx].clone()).or_default() += i64::from(value);
             }
             let mut grouped = sums.into_iter().collect::<Vec<_>>();
+            grouped = grouped
+                .into_iter()
+                .filter_map(|(group_value, sum)| {
+                    let aggregate = SqlValue::Int8(sum);
+                    match grouped_row_matches_having(
+                        select,
+                        group_column,
+                        &group_value,
+                        "sum",
+                        &aggregate,
+                    ) {
+                        Ok(true) => Some(Ok((group_value, sum))),
+                        Ok(false) => None,
+                        Err(error) => Some(Err(error)),
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             if let Some(order) = &select.order_by {
                 if order.column == *group_column {
                     grouped.sort_by(|(left, _), (right, _)| compare_sql_values(left, right));
@@ -771,6 +857,26 @@ fn execute_aggregate_select_result(
                 entry.1 += 1;
             }
             let mut grouped = averages.into_iter().collect::<Vec<_>>();
+            grouped = grouped
+                .into_iter()
+                .filter_map(|(group_value, (sum, count))| {
+                    let aggregate = SqlValue::Numeric(
+                        average_text(sum, count)
+                            .unwrap_or_else(|| "0.0000000000000000".to_string()),
+                    );
+                    match grouped_row_matches_having(
+                        select,
+                        group_column,
+                        &group_value,
+                        "avg",
+                        &aggregate,
+                    ) {
+                        Ok(true) => Some(Ok((group_value, (sum, count)))),
+                        Ok(false) => None,
+                        Err(error) => Some(Err(error)),
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             if let Some(order) = &select.order_by {
                 if order.column == *group_column {
                     grouped.sort_by(|(left, _), (right, _)| compare_sql_values(left, right));
@@ -898,6 +1004,22 @@ fn execute_aggregate_select_result(
                     .or_insert_with(|| row[value_idx].clone());
             }
             let mut grouped = extrema.into_iter().collect::<Vec<_>>();
+            grouped = grouped
+                .into_iter()
+                .filter_map(|(group_value, extreme)| {
+                    match grouped_row_matches_having(
+                        select,
+                        group_column,
+                        &group_value,
+                        aggregate_name,
+                        &extreme,
+                    ) {
+                        Ok(true) => Some(Ok((group_value, extreme))),
+                        Ok(false) => None,
+                        Err(error) => Some(Err(error)),
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             if let Some(order) = &select.order_by {
                 if order.column == *group_column {
                     grouped.sort_by(|(left, _), (right, _)| compare_sql_values(left, right));
