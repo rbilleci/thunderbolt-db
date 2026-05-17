@@ -125,10 +125,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("- concurrency: 1");
     println!("- device_info: {device_info}");
     println!(
-        "- current_data_residency_model: bounded_resident_snapshot_probe_with_cuda_allocation_proof_plus_per_query_h2d_fallback"
+        "- current_data_residency_model: bounded_resident_snapshot_probe_with_retained_cuda_allocation_plus_per_query_h2d_fallback"
     );
     println!("- warm_resident_snapshot_execution_supported: true");
-    println!("- production_device_cache_supported: false");
+    println!("- production_device_cache_supported: bounded_retained_snapshot_handle");
     println!(
         "- resident_device_memory_proof_supported: {}",
         resident_snapshot.device_memory_proof.is_some()
@@ -156,6 +156,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             .as_ref()
             .map(|proof| proof.gpu_id.to_string())
             .unwrap_or_else(|| "None".to_string())
+    );
+    println!(
+        "- resident_device_memory_retained: {}",
+        resident_snapshot
+            .device_memory_proof
+            .as_ref()
+            .map(|proof| proof.retained)
+            .unwrap_or(false)
     );
     println!(
         "- resident_snapshot_valid_before_mutation: {}",
@@ -297,7 +305,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     print_probe(&mutation_probe);
     println!();
     println!(
-        "decision: current P7 evidence includes bounded resident table-data snapshot SELECT probes with zero per-query H2D transfer for the app lookup workload and supported aggregate/distinct SQL shapes, plus resident-byte accounting, WAL-safe invalidation, manual refresh-cost accounting, memory-pressure fallback metadata, deterministic resident-snapshot budget admission/eviction, and a real CUDA allocation/copy proof when local driver hardware is available. Keep production CUDA allocator claims out of scope until resident snapshots retain managed device-memory handles for execution."
+        "decision: current P7 evidence includes bounded resident table-data snapshot SELECT probes with zero per-query H2D transfer for the app lookup workload and supported aggregate/distinct SQL shapes, plus resident-byte accounting, WAL-safe invalidation, manual refresh-cost accounting, memory-pressure fallback metadata, deterministic resident-snapshot budget admission/eviction, and a retained real CUDA allocation/copy handle for encoded snapshot bytes when local driver hardware is available. Keep broad production CUDA cache claims out of scope until query kernels read directly from retained device-memory handles."
     );
 
     Ok(())

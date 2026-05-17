@@ -6,9 +6,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpu_db_batching::{BatchItem, DualTriggerBatcher, FlushReason};
 use gpu_db_execution::{
-    CudaDeviceMemoryProof, CudaDriverRuntime, CudaMvccRowBatch, DeviceRouter, DeviceTarget,
-    FilterOperator, LimitOperator, MockGpuRuntime, Operator, PlannedOp, ProjectOperator,
-    RouteDecision, ScanOperator, SortOperator,
+    CudaDeviceMemoryProof, CudaDriverRuntime, CudaMvccRowBatch, CudaResidentDeviceMemory,
+    DeviceRouter, DeviceTarget, FilterOperator, LimitOperator, MockGpuRuntime, Operator, PlannedOp,
+    ProjectOperator, RouteDecision, ScanOperator, SortOperator,
 };
 use gpu_db_metrics::{BatchFlushReason, FallbackReason, RuntimeMetrics, RuntimeMetricsSnapshot};
 use gpu_db_observability::{
@@ -5917,6 +5917,7 @@ pub struct Engine {
     relational_catalog: BTreeMap<String, RelationalTable>,
     relational_value_index: BTreeMap<RelationalIndexKey, Vec<String>>,
     relational_residency: BTreeMap<String, RelationalResidencySnapshot>,
+    relational_residency_device_memory: BTreeMap<String, CudaResidentDeviceMemory>,
     relational_residency_budget_bytes_by_gpu: BTreeMap<u16, u64>,
     relational_next_oid: u32,
     relational_next_column_id: u32,
@@ -7043,6 +7044,7 @@ impl Engine {
             relational_catalog: BTreeMap::new(),
             relational_value_index: BTreeMap::new(),
             relational_residency: BTreeMap::new(),
+            relational_residency_device_memory: BTreeMap::new(),
             relational_residency_budget_bytes_by_gpu: BTreeMap::new(),
             relational_next_oid: FIRST_USER_RELATION_OID,
             relational_next_column_id: FIRST_USER_COLUMN_ID,
@@ -7207,19 +7209,27 @@ impl Engine {
     }
 
     fn invalidate_relational_residency(&mut self, txn_id: TxnId, index: Index) {
-        for snapshot in self.relational_residency.values_mut() {
+        for (table, snapshot) in self.relational_residency.iter_mut() {
             if snapshot.invalidated_by_txn_id.is_none() {
                 snapshot.invalidated_by_txn_id = Some(txn_id);
                 snapshot.invalidated_at_index = Some(index);
             }
+            if let Some(proof) = snapshot.device_memory_proof.as_mut() {
+                proof.retained = false;
+            }
+            self.relational_residency_device_memory.remove(table);
         }
     }
 
     fn invalidate_relational_residency_for_memory_pressure(&mut self, gpu_id: u16) {
-        for snapshot in self.relational_residency.values_mut() {
+        for (table, snapshot) in self.relational_residency.iter_mut() {
             if snapshot.gpu_id == gpu_id {
                 snapshot.invalidated_by_memory_pressure = true;
                 snapshot.memory_pressure_active = true;
+                if let Some(proof) = snapshot.device_memory_proof.as_mut() {
+                    proof.retained = false;
+                }
+                self.relational_residency_device_memory.remove(table);
             }
         }
     }
@@ -8598,8 +8608,10 @@ impl Engine {
         let admission_budget_bytes = self.relational_residency_budget_bytes(gpu_id);
         let (evicted_tables_on_admission, resident_bytes_after_admission) =
             self.admit_relational_residency_snapshot(table, gpu_id, resident_bytes)?;
-        let device_memory_proof =
-            self.relational_residency_device_memory_proof(gpu_id, &device_payload);
+        let device_memory = self.relational_residency_device_memory(gpu_id, &device_payload);
+        let device_memory_proof = device_memory
+            .as_ref()
+            .map(|device_memory| device_memory.metadata().clone());
         let snapshot = RelationalResidencySnapshot {
             gpu_id,
             schema: catalog_table.schema,
@@ -8633,6 +8645,13 @@ impl Engine {
             evicted_tables_on_admission,
             device_memory_proof,
         };
+        if let Some(device_memory) = device_memory {
+            self.relational_residency_device_memory
+                .insert(catalog_table.name.clone(), device_memory);
+        } else {
+            self.relational_residency_device_memory
+                .remove(&catalog_table.name);
+        }
         self.relational_residency
             .insert(catalog_table.name, snapshot.clone());
         Ok(snapshot)
@@ -8681,6 +8700,7 @@ impl Engine {
                 break;
             }
             self.relational_residency.remove(&map_key);
+            self.relational_residency_device_memory.remove(&map_key);
             current_bytes = current_bytes.saturating_sub(bytes);
             evicted_tables.push(map_key);
         }
@@ -8688,13 +8708,13 @@ impl Engine {
         Ok((evicted_tables, current_bytes + resident_bytes))
     }
 
-    fn relational_residency_device_memory_proof(
+    fn relational_residency_device_memory(
         &mut self,
         gpu_id: u16,
         payload: &[u8],
-    ) -> Option<CudaDeviceMemoryProof> {
+    ) -> Option<CudaResidentDeviceMemory> {
         let runtime = self.cuda_driver_probe_runtime();
-        runtime.verify_device_memory_copy(gpu_id, payload).ok()
+        runtime.retain_device_memory_copy(gpu_id, payload).ok()
     }
 
     fn relational_resident_bytes_for_gpu_excluding(&self, gpu_id: u16, table: &str) -> u64 {
@@ -11591,6 +11611,7 @@ mod tests {
 
         let snapshot = e.populate_relational_residency_snapshot("events").unwrap();
         assert_eq!(snapshot.device_memory_proof, None);
+        assert_eq!(e.relational_residency_device_memory.len(), 0);
 
         let status = e.status_snapshot();
         assert_eq!(
@@ -11619,6 +11640,9 @@ mod tests {
             .unwrap();
 
         let events = e.populate_relational_residency_snapshot("events").unwrap();
+        if let Some(proof) = &events.device_memory_proof {
+            assert!(proof.retained);
+        }
         let aux = e.populate_relational_residency_snapshot("aux").unwrap();
         let budget_bytes = events.resident_bytes;
         e.set_relational_residency_budget_bytes(0, budget_bytes);
@@ -11662,12 +11686,18 @@ mod tests {
         assert!(!invalidated_table.valid);
         assert_eq!(invalidated_table.invalidated_by_txn_id, Some(5));
         assert_eq!(invalidated.relational_residency.invalid_snapshot_count(), 1);
+        if let Some(proof) = &invalidated_table.device_memory_proof {
+            assert!(!proof.retained);
+        }
 
         e.mark_gpu_memory_pressured(0);
         let pressured = e.status_snapshot();
         let pressured_table = pressured.relational_residency.table("events").unwrap();
         assert!(pressured_table.memory_pressure_active);
         assert!(pressured_table.invalidated_by_memory_pressure);
+        if let Some(proof) = &pressured_table.device_memory_proof {
+            assert!(!proof.retained);
+        }
         assert_eq!(
             pressured
                 .relational_residency
