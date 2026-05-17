@@ -24,6 +24,8 @@ The first local archive-cleanup slice is exact target suffix cleanup for PITR br
 
 The first base-backup-aware retention slice is checkpoint-backed local archive cleanup. `Engine::plan_durable_wal_archive_retention_from_checkpoint(...)` and `Engine::apply_durable_wal_archive_retention_from_checkpoint(...)` validate the checkpoint-control base backup against the archive before cleanup, require either the full base prefix or the retained base-boundary record to match byte-for-byte, then rewrite the archive so it keeps the base-boundary record plus durable suffix. Base-plus-archive recovery to exact transaction and timestamp targets continues to validate overlap after cleanup. This remains a local checkpoint-control proof, not a physical page-image base backup, object-storage retention policy, timeline fork manager, or automatic background cleanup system.
 
+The first streaming-ingestion slice registers an already-written checksummed WAL segment into an existing local archive. `Engine::ingest_durable_wal_archive_segment(...)` validates the current archive, reads and checksums the incoming segment, requires the incoming transaction ids to advance beyond the current durable boundary, preserves or requires timestamp metadata consistently, and atomically rewrites the manifest only after validation. Recovery and timestamp-target restore then treat the ingested segment as part of the durable archive. This is local segment ingestion, not continuous object-storage shipping or timeline branching.
+
 ## Recovery sequence
 
 1. Validate control metadata
@@ -32,7 +34,7 @@ The first base-backup-aware retention slice is checkpoint-backed local archive c
 4. Rebuild volatile caches (GPU) from durable state
 5. Open for traffic after readiness gates pass
 
-Current limitation: checkpoint-control metadata covers one selected durable segment, and the archive manifest covers ordered replay of all durable records plus exact transaction-bound and exact timestamp-bound prefix restore, checkpoint-backed base-plus-archive restore, transaction/timestamp-target suffix cleanup, and checkpoint-backed base-window archive cleanup. Operators should treat the checked-in file-backed paths as restart/replay and local PITR proofs with deterministic segment discovery, not as physical page-image base backups, streaming archive ingestion, durable object-storage backup, timeline branching, or automatic background cleanup.
+Current limitation: checkpoint-control metadata covers one selected durable segment, and the archive manifest covers ordered replay of all durable records plus exact transaction-bound and exact timestamp-bound prefix restore, checkpoint-backed base-plus-archive restore, transaction/timestamp-target suffix cleanup, checkpoint-backed base-window archive cleanup, and local ingestion of a newly arrived checksummed segment. Operators should treat the checked-in file-backed paths as restart/replay and local PITR proofs with deterministic segment discovery, not as physical page-image base backups, durable object-storage backup, timeline branching, or automatic background cleanup.
 
 ## Compaction/snapshot boundary
 

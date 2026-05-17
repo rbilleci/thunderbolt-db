@@ -52,7 +52,7 @@ To make new compatibility tests visible in the right bucket:
    - `parses_`, `rejects_` for SQL/parser coverage
    - `relational`, `create_table`, `insert`, or `select` for the P1 relational SQL foundation bucket
    - `sql_gpu`, `gpu_bridge`, `relational_sql_select_cuda`, or `relational_sql_select_gpu` for the P4 SQL-to-GPU bridge bucket
-   - `relational_index`, `access_path`, or `equality_index` for the P5 storage/indexing bucket
+   - `relational_index`, `access_path`, `equality_index`, `archive_ingest`, `archive_ingests`, or `segment_ingestion` for the P5 storage/indexing bucket
    - `relational_catalog`, `catalog_schema`, `catalog_introspection`, `pg_catalog`, `pg_type`, `pg_namespace`, `information_schema`, `type_metadata`, `column_id`, or `relation_oid` for the P2 catalog/schema/type bucket
    - `operational_replication`, `cluster_smoke`, `deployment_preflight`, `deployment_package`, `append_entries_transport`, `read_after_apply`, or `failover` for the P6 local operational replication bucket
    - `transaction`, `commit`, `rollback` for transaction flows

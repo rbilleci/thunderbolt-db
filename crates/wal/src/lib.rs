@@ -452,6 +452,73 @@ pub fn write_wal_archive_with_timestamps(
     Ok(manifest)
 }
 
+pub fn append_wal_archive_segment(
+    manifest_path: impl AsRef<Path>,
+    segment_path: impl AsRef<Path>,
+) -> Result<WalArchiveManifest, EngineError> {
+    append_wal_archive_segment_with_timestamps(manifest_path, segment_path, &[])
+}
+
+pub fn append_wal_archive_segment_with_timestamps(
+    manifest_path: impl AsRef<Path>,
+    segment_path: impl AsRef<Path>,
+    record_timestamps: &[WalArchiveRecordTimestamp],
+) -> Result<WalArchiveManifest, EngineError> {
+    let manifest_path = manifest_path.as_ref();
+    let segment_path = segment_path.as_ref();
+    let (manifest, mut records) = read_wal_archive(manifest_path)?;
+    let segment_records = read_wal_segment(segment_path)?;
+    if segment_records.is_empty() {
+        return Err(EngineError::Durability(format!(
+            "WAL archive {} cannot ingest empty segment {}",
+            manifest_path.display(),
+            segment_path.display()
+        )));
+    }
+
+    validate_archive_ingest_timestamps(
+        manifest_path,
+        &manifest,
+        &segment_records,
+        record_timestamps,
+    )?;
+    validate_archive_ingest_continuity(manifest_path, &manifest, &segment_records)?;
+
+    let appended_record_count = segment_records.len();
+    let appended_first_txn_id = segment_records.first().map(|record| record.txn_id);
+    let appended_last_txn_id = segment_records.last().map(|record| record.txn_id);
+    records.extend(segment_records);
+    let mut combined_timestamps = manifest.record_timestamps.clone();
+    combined_timestamps.extend_from_slice(record_timestamps);
+    validate_timestamp_metadata(manifest_path, &records, &combined_timestamps)?;
+
+    let manifest_segment_path = segment_path
+        .strip_prefix(manifest_path.parent().unwrap_or_else(|| Path::new(".")))
+        .unwrap_or(segment_path)
+        .to_path_buf();
+    let mut segments = manifest.segments;
+    segments.push(WalArchiveSegment {
+        segment_path: manifest_segment_path,
+        record_count: appended_record_count,
+        first_txn_id: appended_first_txn_id,
+        last_txn_id: appended_last_txn_id,
+    });
+
+    let appended = WalArchiveManifest {
+        segments,
+        checkpoint: WalCheckpointMeta {
+            durable_record_count: records.len(),
+            last_durable_txn_id: records.last().map(|record| record.txn_id),
+        },
+        record_timestamps: combined_timestamps,
+    };
+    validate_archive_manifest_shape(manifest_path, &appended)?;
+    validate_archive_records(manifest_path, &appended, &records)?;
+    validate_archive_timestamps(manifest_path, &appended, &records)?;
+    write_wal_archive_manifest(manifest_path, &appended)?;
+    Ok(appended)
+}
+
 pub fn write_wal_archive_manifest(
     path: impl AsRef<Path>,
     manifest: &WalArchiveManifest,
@@ -1271,6 +1338,86 @@ fn validate_archive_manifest_shape(
             manifest.checkpoint.durable_record_count,
             manifest.record_timestamps.len()
         )));
+    }
+    Ok(())
+}
+
+fn validate_archive_ingest_continuity(
+    manifest_path: &Path,
+    manifest: &WalArchiveManifest,
+    segment_records: &[WalRecord],
+) -> Result<(), EngineError> {
+    let Some(first_appended_txn) = segment_records.first().map(|record| record.txn_id) else {
+        return Ok(());
+    };
+    if let Some(last_durable_txn) = manifest.checkpoint.last_durable_txn_id {
+        if first_appended_txn <= last_durable_txn {
+            return Err(EngineError::Durability(format!(
+                "WAL archive {} ingest segment starts at transaction {} not after durable transaction {}",
+                manifest_path.display(),
+                first_appended_txn,
+                last_durable_txn
+            )));
+        }
+    }
+    for window in segment_records.windows(2) {
+        if window[0].txn_id >= window[1].txn_id {
+            return Err(EngineError::Durability(format!(
+                "WAL archive {} ingest segment has non-increasing transaction order at {} then {}",
+                manifest_path.display(),
+                window[0].txn_id,
+                window[1].txn_id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_archive_ingest_timestamps(
+    manifest_path: &Path,
+    manifest: &WalArchiveManifest,
+    segment_records: &[WalRecord],
+    record_timestamps: &[WalArchiveRecordTimestamp],
+) -> Result<(), EngineError> {
+    match (
+        manifest.record_timestamps.is_empty(),
+        manifest.checkpoint.durable_record_count,
+        record_timestamps.is_empty(),
+    ) {
+        (true, 0, _) => {}
+        (true, _, true) => {}
+        (true, _, false) => {
+            return Err(EngineError::Durability(format!(
+                "WAL archive {} cannot add timestamp metadata to an existing archive without timestamps",
+                manifest_path.display()
+            )));
+        }
+        (false, _, true) => {
+            return Err(EngineError::Durability(format!(
+                "WAL archive {} requires timestamp metadata for ingested segment",
+                manifest_path.display()
+            )));
+        }
+        (false, _, false) => {}
+    }
+    validate_timestamp_metadata(manifest_path, segment_records, record_timestamps)?;
+    if let (Some(existing_last), Some(appended_first)) = (
+        manifest
+            .record_timestamps
+            .last()
+            .map(|timestamp| timestamp.timestamp_micros),
+        record_timestamps
+            .first()
+            .map(|timestamp| timestamp.timestamp_micros),
+    ) {
+        if appended_first < existing_last {
+            return Err(EngineError::Durability(format!(
+                "WAL archive {} ingest segment timestamp {} is before last archived timestamp {}",
+                manifest_path.display(),
+                appended_first,
+                existing_last
+            )));
+        }
     }
     Ok(())
 }
@@ -2146,6 +2293,151 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
 
         assert!(err.to_string().contains("ambiguous"));
+    }
+
+    #[test]
+    fn wal_archive_ingests_next_segment_and_preserves_timestamps() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpu-db-wal-archive-ingest-{}-{}",
+            std::process::id(),
+            NEXT_TEST_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let manifest_path = dir.join("MANIFEST");
+        let segment_dir = dir.join("segments");
+        let ingest_segment = segment_dir.join("segment-0002.wal");
+        let records = vec![
+            WalRecord {
+                txn_id: 1,
+                payload: b"SET a=1".to_vec(),
+            },
+            WalRecord {
+                txn_id: 2,
+                payload: b"SET b=2".to_vec(),
+            },
+        ];
+        let timestamps = vec![
+            WalArchiveRecordTimestamp {
+                txn_id: 1,
+                timestamp_micros: 1_000,
+            },
+            WalArchiveRecordTimestamp {
+                txn_id: 2,
+                timestamp_micros: 2_000,
+            },
+        ];
+        let ingest_records = vec![
+            WalRecord {
+                txn_id: 3,
+                payload: b"SET c=3".to_vec(),
+            },
+            WalRecord {
+                txn_id: 4,
+                payload: b"SET d=4".to_vec(),
+            },
+        ];
+        let ingest_timestamps = vec![
+            WalArchiveRecordTimestamp {
+                txn_id: 3,
+                timestamp_micros: 3_000,
+            },
+            WalArchiveRecordTimestamp {
+                txn_id: 4,
+                timestamp_micros: 4_000,
+            },
+        ];
+
+        write_wal_archive_with_timestamps(&manifest_path, &segment_dir, &records, 2, &timestamps)
+            .unwrap();
+        write_wal_segment(&ingest_segment, &ingest_records).unwrap();
+        let manifest = append_wal_archive_segment_with_timestamps(
+            &manifest_path,
+            &ingest_segment,
+            &ingest_timestamps,
+        )
+        .unwrap();
+        let (_read_manifest, read_records) = read_wal_archive(&manifest_path).unwrap();
+        let (_manifest, target, target_records) =
+            read_wal_archive_to_timestamp_micros(&manifest_path, 4_000).unwrap();
+        let _ = fs::remove_dir_all(dir);
+
+        assert_eq!(manifest.segments.len(), 2);
+        assert_eq!(manifest.checkpoint.durable_record_count, 4);
+        assert_eq!(manifest.checkpoint.last_durable_txn_id, Some(4));
+        assert_eq!(manifest.record_timestamps.len(), 4);
+        assert_eq!(read_records.len(), 4);
+        assert_eq!(read_records[3].payload, b"SET d=4");
+        assert_eq!(target.target_txn_id, 4);
+        assert_eq!(target_records.len(), 4);
+    }
+
+    #[test]
+    fn wal_archive_ingest_rejects_non_increasing_segment_without_manifest_mutation() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpu-db-wal-archive-ingest-reject-{}-{}",
+            std::process::id(),
+            NEXT_TEST_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let manifest_path = dir.join("MANIFEST");
+        let segment_dir = dir.join("segments");
+        let ingest_segment = segment_dir.join("segment-0002.wal");
+        let records = vec![WalRecord {
+            txn_id: 2,
+            payload: b"SET b=2".to_vec(),
+        }];
+        let ingest_records = vec![WalRecord {
+            txn_id: 2,
+            payload: b"SET duplicate=2".to_vec(),
+        }];
+
+        write_wal_archive(&manifest_path, &segment_dir, &records, 1).unwrap();
+        let before_manifest = fs::read_to_string(&manifest_path).unwrap();
+        write_wal_segment(&ingest_segment, &ingest_records).unwrap();
+        let err = append_wal_archive_segment(&manifest_path, &ingest_segment).unwrap_err();
+        let after_manifest = fs::read_to_string(&manifest_path).unwrap();
+        let (_manifest, read_records) = read_wal_archive(&manifest_path).unwrap();
+        let _ = fs::remove_dir_all(dir);
+
+        assert!(err.to_string().contains("not after durable transaction 2"));
+        assert_eq!(after_manifest, before_manifest);
+        assert_eq!(read_records.len(), 1);
+        assert_eq!(read_records[0].payload, b"SET b=2");
+    }
+
+    #[test]
+    fn wal_archive_ingest_requires_timestamp_metadata_when_archive_has_timestamps() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpu-db-wal-archive-ingest-timestamp-required-{}-{}",
+            std::process::id(),
+            NEXT_TEST_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let manifest_path = dir.join("MANIFEST");
+        let segment_dir = dir.join("segments");
+        let ingest_segment = segment_dir.join("segment-0002.wal");
+        let records = vec![WalRecord {
+            txn_id: 1,
+            payload: b"SET a=1".to_vec(),
+        }];
+        let timestamps = vec![WalArchiveRecordTimestamp {
+            txn_id: 1,
+            timestamp_micros: 1_000,
+        }];
+        let ingest_records = vec![WalRecord {
+            txn_id: 2,
+            payload: b"SET b=2".to_vec(),
+        }];
+
+        write_wal_archive_with_timestamps(&manifest_path, &segment_dir, &records, 1, &timestamps)
+            .unwrap();
+        let before_manifest = fs::read_to_string(&manifest_path).unwrap();
+        write_wal_segment(&ingest_segment, &ingest_records).unwrap();
+        let err = append_wal_archive_segment(&manifest_path, &ingest_segment).unwrap_err();
+        let after_manifest = fs::read_to_string(&manifest_path).unwrap();
+        let _ = fs::remove_dir_all(dir);
+
+        assert!(err
+            .to_string()
+            .contains("requires timestamp metadata for ingested segment"));
+        assert_eq!(after_manifest, before_manifest);
     }
 
     #[test]
