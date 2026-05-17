@@ -100,6 +100,7 @@ pub enum SelectFilterOp {
     Lte,
     Gt,
     Gte,
+    LikePrefix,
 }
 
 impl SelectFilterOp {
@@ -110,6 +111,7 @@ impl SelectFilterOp {
             Self::Lte => Self::Gte,
             Self::Gt => Self::Lt,
             Self::Gte => Self::Lte,
+            Self::LikePrefix => Self::LikePrefix,
         }
     }
 }
@@ -132,7 +134,7 @@ pub enum ParseError {
     InvalidDel,
     #[error("invalid GET syntax; expected: GET key")]
     InvalidGet,
-    #[error("invalid relational SQL syntax; supported subset: CREATE TABLE name (...), INSERT INTO name (...) VALUES (...), SELECT columns FROM name [WHERE column (=|<|<=|>|>=) literal | column IN (literal, ...) [AND ...] [OR ...]] [ORDER BY column [ASC|DESC]] [LIMIT n]")]
+    #[error("invalid relational SQL syntax; supported subset: CREATE TABLE name (...), INSERT INTO name (...) VALUES (...), SELECT columns FROM name [WHERE column (=|<|<=|>|>=) literal | column BETWEEN literal AND literal | column IN (literal, ...) | text_column LIKE 'prefix%' [AND ...] [OR ...]] [ORDER BY column [ASC|DESC]] [LIMIT n]")]
     InvalidRelationalSql,
     #[error("LIMIT must not be negative")]
     NegativeLimit,
@@ -1744,6 +1746,9 @@ fn parse_select_filter_factor(input: &str) -> Result<Vec<Vec<SelectFilter>>, Par
     if let Some(groups) = parse_select_in_filter_groups(input)? {
         return Ok(groups);
     }
+    if let Some(filter) = parse_select_like_prefix_filter(input)? {
+        return Ok(vec![vec![filter]]);
+    }
     Ok(vec![vec![parse_select_filter(input)?]])
 }
 
@@ -1802,6 +1807,28 @@ fn parse_select_in_filter_groups(
         })
         .collect::<Result<Vec<_>, ParseError>>()?;
     Ok(Some(groups))
+}
+
+fn parse_select_like_prefix_filter(input: &str) -> Result<Option<SelectFilter>, ParseError> {
+    let Some(pos) = find_keyword_outside_quotes(input, "LIKE") else {
+        return Ok(None);
+    };
+    let column = normalize_identifier(input[..pos].trim())?;
+    let pattern = parse_sql_value(input[pos + "LIKE".len()..].trim())?;
+    let SqlValue::Text(pattern) = pattern else {
+        return Err(ParseError::InvalidRelationalSql);
+    };
+    let Some(prefix) = pattern.strip_suffix('%') else {
+        return Err(ParseError::InvalidRelationalSql);
+    };
+    if prefix.contains('%') || prefix.contains('_') {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    Ok(Some(SelectFilter {
+        column,
+        op: SelectFilterOp::LikePrefix,
+        value: SqlValue::Text(prefix.to_string()),
+    }))
 }
 
 fn split_select_filter(input: &str) -> Result<(&str, SelectFilterOp, &str), ParseError> {
@@ -9080,6 +9107,82 @@ mod tests {
 
         assert!(matches!(
             parse_command("SELECT id FROM people WHERE id NOT BETWEEN 1 AND 3"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+    }
+
+    #[test]
+    fn parses_relational_select_prefix_like_predicates_as_filters() {
+        assert_eq!(
+            parse_command("SELECT id FROM people WHERE name LIKE 'Gra%' ORDER BY id").unwrap(),
+            Command::Select(Select {
+                table: "people".to_string(),
+                projection: SelectProjection::Columns(vec!["id".to_string()]),
+                filter: Some(SelectFilter {
+                    column: "name".to_string(),
+                    op: SelectFilterOp::LikePrefix,
+                    value: SqlValue::Text("Gra".to_string()),
+                }),
+                filters: vec![SelectFilter {
+                    column: "name".to_string(),
+                    op: SelectFilterOp::LikePrefix,
+                    value: SqlValue::Text("Gra".to_string()),
+                }],
+                filter_groups: vec![vec![SelectFilter {
+                    column: "name".to_string(),
+                    op: SelectFilterOp::LikePrefix,
+                    value: SqlValue::Text("Gra".to_string()),
+                }]],
+                order_by: Some(SelectOrder {
+                    column: "id".to_string(),
+                    descending: false,
+                }),
+                limit: None,
+            })
+        );
+
+        assert_eq!(
+            parse_command("SELECT name FROM people WHERE name LIKE 'A%' OR id = 3").unwrap(),
+            Command::Select(Select {
+                table: "people".to_string(),
+                projection: SelectProjection::Columns(vec!["name".to_string()]),
+                filter: Some(SelectFilter {
+                    column: "name".to_string(),
+                    op: SelectFilterOp::LikePrefix,
+                    value: SqlValue::Text("A".to_string()),
+                }),
+                filters: vec![SelectFilter {
+                    column: "name".to_string(),
+                    op: SelectFilterOp::LikePrefix,
+                    value: SqlValue::Text("A".to_string()),
+                }],
+                filter_groups: vec![
+                    vec![SelectFilter {
+                        column: "name".to_string(),
+                        op: SelectFilterOp::LikePrefix,
+                        value: SqlValue::Text("A".to_string()),
+                    }],
+                    vec![SelectFilter {
+                        column: "id".to_string(),
+                        op: SelectFilterOp::Eq,
+                        value: SqlValue::Int4(3),
+                    }],
+                ],
+                order_by: None,
+                limit: None,
+            })
+        );
+
+        assert!(matches!(
+            parse_command("SELECT id FROM people WHERE name NOT LIKE 'A%'"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command("SELECT id FROM people WHERE name LIKE '%da'"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command("SELECT id FROM people WHERE name LIKE 'A_a%'"),
             Err(ParseError::InvalidRelationalSql)
         ));
     }

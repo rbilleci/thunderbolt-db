@@ -6166,6 +6166,10 @@ fn select_filter_matches(left: &SqlValue, op: SelectFilterOp, right: &SqlValue) 
         SelectFilterOp::Lte => !compare_sql_values(left, right).is_gt(),
         SelectFilterOp::Gt => compare_sql_values(left, right).is_gt(),
         SelectFilterOp::Gte => !compare_sql_values(left, right).is_lt(),
+        SelectFilterOp::LikePrefix => match (left, right) {
+            (SqlValue::Text(left), SqlValue::Text(prefix)) => left.starts_with(prefix),
+            _ => false,
+        },
     }
 }
 
@@ -23693,6 +23697,48 @@ mod tests {
                 order_column: "id".to_string(),
                 descending: true,
                 matched_keys: 3,
+            }
+        );
+        assert_eq!(e.status_snapshot().latest_fallback_reason(), None);
+    }
+
+    #[test]
+    fn relational_sql_gpu_bridge_prefix_like_predicate_uses_filtered_key_batch() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO people (id, name) VALUES (1, 'Ada'), (2, 'Linus'), (3, 'Grace'), (4, 'Grady')",
+        )
+        .unwrap();
+
+        let Command::Select(select) =
+            parse_command("SELECT id FROM people WHERE name LIKE 'Gra%' ORDER BY id DESC LIMIT 2")
+                .unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let result = e
+            .execute_relational_select_with_backend(&select, &FirstCudaSliceParityBackend)
+            .unwrap();
+
+        assert_eq!(
+            result.rows,
+            vec![vec![SqlValue::Int4(4)], vec![SqlValue::Int4(3)]]
+        );
+        assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.fallback_reason, None);
+        assert_eq!(
+            result.access_path,
+            RelationalAccessPath::OrderedKeyBatch {
+                table: "people".to_string(),
+                predicate_column: Some("name".to_string()),
+                predicate_op: Some(SelectFilterOp::LikePrefix),
+                order_column: "id".to_string(),
+                descending: true,
+                matched_keys: 2,
             }
         );
         assert_eq!(e.status_snapshot().latest_fallback_reason(), None);

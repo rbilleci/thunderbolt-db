@@ -54,3 +54,9 @@ INSERT 0 3
   3 | Grace
   2 | Linus
 (2 rows)
+
+=== relational prefix like filter ===
+ id | name
+----+-------
+  3 | Grace
+(1 row)

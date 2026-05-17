@@ -16,3 +16,5 @@ SELECT id, name FROM people WHERE (id = 1 OR id = 3) AND (name = 'Ada' OR name =
 SELECT id, name FROM people WHERE id IN (1, 3) ORDER BY id DESC;
 \echo === relational between filter ===
 SELECT id, name FROM people WHERE id BETWEEN 2 AND 3 ORDER BY id DESC;
+\echo === relational prefix like filter ===
+SELECT id, name FROM people WHERE name LIKE 'Gra%' ORDER BY id DESC;

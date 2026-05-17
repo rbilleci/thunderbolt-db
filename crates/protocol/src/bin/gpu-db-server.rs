@@ -76,6 +76,10 @@ fn select_filter_matches(left: &SqlValue, op: SelectFilterOp, right: &SqlValue) 
         SelectFilterOp::Lte => !compare_sql_values(left, right).is_gt(),
         SelectFilterOp::Gt => compare_sql_values(left, right).is_gt(),
         SelectFilterOp::Gte => !compare_sql_values(left, right).is_lt(),
+        SelectFilterOp::LikePrefix => match (left, right) {
+            (SqlValue::Text(left), SqlValue::Text(prefix)) => left.starts_with(prefix),
+            _ => false,
+        },
     }
 }
 
