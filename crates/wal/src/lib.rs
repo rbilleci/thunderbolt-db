@@ -9,6 +9,7 @@ const WAL_SEGMENT_MAGIC: &[u8; 10] = b"GPUDBWAL1\n";
 const WAL_CONTROL_MAGIC: &str = "GPUDBWALCONTROL1";
 const WAL_ARCHIVE_MANIFEST_MAGIC: &str = "GPUDBWALARCHIVE1";
 const WAL_ARCHIVE_TIMELINE_MAGIC: &str = "GPUDBWALTIMELINE1";
+const WAL_ARCHIVE_OBJECT_BACKUP_MAGIC: &str = "GPUDBWALOBJECTBACKUP1";
 const WAL_RECORD_HEADER_LEN: usize = 24;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,6 +89,20 @@ pub struct WalArchiveTimeline {
 pub struct WalArchiveTimelineBranch {
     pub timeline: WalArchiveTimeline,
     pub manifest: WalArchiveManifest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalArchiveObject {
+    pub source_path: PathBuf,
+    pub object_path: PathBuf,
+    pub byte_len: u64,
+    pub checksum: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalArchiveObjectBackup {
+    pub archive_manifest: WalArchiveManifest,
+    pub objects: Vec<WalArchiveObject>,
 }
 
 #[derive(Debug, Default)]
@@ -536,6 +551,123 @@ pub fn append_wal_archive_segment_with_timestamps(
     Ok(appended)
 }
 
+pub fn export_wal_archive_object_backup(
+    manifest_path: impl AsRef<Path>,
+    backup_manifest_path: impl AsRef<Path>,
+    object_dir: impl AsRef<Path>,
+) -> Result<WalArchiveObjectBackup, EngineError> {
+    let manifest_path = manifest_path.as_ref();
+    let backup_manifest_path = backup_manifest_path.as_ref();
+    let object_dir = object_dir.as_ref();
+    let (archive_manifest, _records) = read_wal_archive(manifest_path)?;
+
+    fs::create_dir_all(object_dir).map_err(|err| {
+        EngineError::Durability(format!(
+            "failed to create WAL archive object directory {}: {err}",
+            object_dir.display()
+        ))
+    })?;
+
+    let mut objects = Vec::with_capacity(archive_manifest.segments.len() + 1);
+    objects.push(write_wal_archive_backup_object(
+        backup_manifest_path,
+        Path::new("MANIFEST"),
+        manifest_path,
+        &object_dir.join("archive-manifest.object"),
+    )?);
+    for (idx, segment) in archive_manifest.segments.iter().enumerate() {
+        let segment_source_path = resolve_manifest_path(manifest_path, &segment.segment_path);
+        let object_path = object_dir.join(format!("segment-{:04}.wal.object", idx + 1));
+        objects.push(write_wal_archive_backup_object(
+            backup_manifest_path,
+            &segment.segment_path,
+            &segment_source_path,
+            &object_path,
+        )?);
+    }
+
+    let backup = WalArchiveObjectBackup {
+        archive_manifest,
+        objects,
+    };
+    write_wal_archive_object_backup_manifest(backup_manifest_path, &backup)?;
+    Ok(backup)
+}
+
+pub fn restore_wal_archive_object_backup(
+    backup_manifest_path: impl AsRef<Path>,
+    restored_manifest_path: impl AsRef<Path>,
+    restored_segment_dir: impl AsRef<Path>,
+) -> Result<WalArchiveManifest, EngineError> {
+    let backup_manifest_path = backup_manifest_path.as_ref();
+    let restored_manifest_path = restored_manifest_path.as_ref();
+    let restored_segment_dir = restored_segment_dir.as_ref();
+    let backup = read_wal_archive_object_backup_manifest(backup_manifest_path)?;
+    validate_archive_manifest_shape(backup_manifest_path, &backup.archive_manifest)?;
+
+    let manifest_object = backup
+        .objects
+        .iter()
+        .find(|object| object.source_path == Path::new("MANIFEST"))
+        .ok_or_else(|| {
+            EngineError::Durability(format!(
+                "WAL archive object backup {} has no manifest object",
+                backup_manifest_path.display()
+            ))
+        })?;
+    let _manifest_bytes =
+        read_verified_wal_archive_backup_object(backup_manifest_path, manifest_object)?;
+
+    fs::create_dir_all(restored_segment_dir).map_err(|err| {
+        EngineError::Durability(format!(
+            "failed to create restored WAL archive segment directory {}: {err}",
+            restored_segment_dir.display()
+        ))
+    })?;
+
+    let mut restored_segments = Vec::with_capacity(backup.archive_manifest.segments.len());
+    for (idx, segment) in backup.archive_manifest.segments.iter().enumerate() {
+        let object = backup
+            .objects
+            .iter()
+            .find(|object| object.source_path == segment.segment_path)
+            .ok_or_else(|| {
+                EngineError::Durability(format!(
+                    "WAL archive object backup {} missing segment object {}",
+                    backup_manifest_path.display(),
+                    segment.segment_path.display()
+                ))
+            })?;
+        let bytes = read_verified_wal_archive_backup_object(backup_manifest_path, object)?;
+        let restored_segment_path =
+            restored_segment_dir.join(format!("segment-{:04}.wal", idx + 1));
+        write_verified_backup_bytes(&restored_segment_path, &bytes)?;
+        let manifest_segment_path = restored_segment_path
+            .strip_prefix(
+                restored_manifest_path
+                    .parent()
+                    .unwrap_or_else(|| Path::new(".")),
+            )
+            .unwrap_or(&restored_segment_path)
+            .to_path_buf();
+        restored_segments.push(WalArchiveSegment {
+            segment_path: manifest_segment_path,
+            record_count: segment.record_count,
+            first_txn_id: segment.first_txn_id,
+            last_txn_id: segment.last_txn_id,
+        });
+    }
+
+    let restored_manifest = WalArchiveManifest {
+        segments: restored_segments,
+        checkpoint: backup.archive_manifest.checkpoint,
+        record_timestamps: backup.archive_manifest.record_timestamps,
+    };
+    write_wal_archive_manifest(restored_manifest_path, &restored_manifest)?;
+    let (validated_manifest, _records) = read_wal_archive(restored_manifest_path)?;
+    Ok(validated_manifest)
+}
+
 pub fn fork_wal_archive_timeline_to_txn(
     source_manifest_path: impl AsRef<Path>,
     branch_manifest_path: impl AsRef<Path>,
@@ -753,6 +885,339 @@ pub fn read_wal_archive_timeline(
     validate_timeline_path(path, "source_manifest_path", &timeline.source_manifest_path)?;
     validate_timeline_path(path, "branch_manifest_path", &timeline.branch_manifest_path)?;
     Ok(timeline)
+}
+
+pub fn write_wal_archive_object_backup_manifest(
+    path: impl AsRef<Path>,
+    backup: &WalArchiveObjectBackup,
+) -> Result<(), EngineError> {
+    let path = path.as_ref();
+    validate_archive_manifest_shape(path, &backup.archive_manifest)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            EngineError::Durability(format!(
+                "failed to create WAL archive object backup directory {}: {err}",
+                parent.display()
+            ))
+        })?;
+    }
+
+    let manifest = &backup.archive_manifest;
+    let mut body = format!(
+        "{WAL_ARCHIVE_OBJECT_BACKUP_MAGIC}\ndurable_record_count={}\nlast_durable_txn_id={}\nsegments={}\n",
+        manifest.checkpoint.durable_record_count,
+        format_optional_txn(manifest.checkpoint.last_durable_txn_id),
+        manifest.segments.len()
+    );
+    for segment in &manifest.segments {
+        validate_backup_path(path, "segment", &segment.segment_path)?;
+        body.push_str(&format!(
+            "segment={}|{}|{}|{}\n",
+            segment.segment_path.display(),
+            segment.record_count,
+            format_optional_txn(segment.first_txn_id),
+            format_optional_txn(segment.last_txn_id)
+        ));
+    }
+    body.push_str(&format!(
+        "record_timestamps={}\n",
+        manifest.record_timestamps.len()
+    ));
+    for timestamp in &manifest.record_timestamps {
+        body.push_str(&format!(
+            "record_timestamp={}|{}\n",
+            timestamp.txn_id, timestamp.timestamp_micros
+        ));
+    }
+    body.push_str(&format!("objects={}\n", backup.objects.len()));
+    for object in &backup.objects {
+        validate_backup_path(path, "object source", &object.source_path)?;
+        validate_backup_path(path, "object path", &object.object_path)?;
+        body.push_str(&format!(
+            "object={}|{}|{}|{}\n",
+            object.source_path.display(),
+            object.object_path.display(),
+            object.byte_len,
+            object.checksum
+        ));
+    }
+
+    let tmp_path = temporary_control_path(path);
+    let write_result = (|| {
+        let mut file = File::create(&tmp_path).map_err(|err| {
+            EngineError::Durability(format!(
+                "failed to create WAL archive object backup {}: {err}",
+                tmp_path.display()
+            ))
+        })?;
+        file.write_all(body.as_bytes()).map_err(|err| {
+            EngineError::Durability(format!(
+                "failed to write WAL archive object backup {}: {err}",
+                tmp_path.display()
+            ))
+        })?;
+        file.sync_all().map_err(|err| {
+            EngineError::Durability(format!(
+                "failed to sync WAL archive object backup {}: {err}",
+                tmp_path.display()
+            ))
+        })?;
+        Ok::<_, EngineError>(())
+    })();
+
+    if let Err(err) = write_result {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+
+    fs::rename(&tmp_path, path).map_err(|err| {
+        let _ = fs::remove_file(&tmp_path);
+        EngineError::Durability(format!(
+            "failed to install WAL archive object backup {}: {err}",
+            path.display()
+        ))
+    })
+}
+
+pub fn read_wal_archive_object_backup_manifest(
+    path: impl AsRef<Path>,
+) -> Result<WalArchiveObjectBackup, EngineError> {
+    let path = path.as_ref();
+    let body = fs::read_to_string(path).map_err(|err| {
+        EngineError::Durability(format!(
+            "failed to read WAL archive object backup {}: {err}",
+            path.display()
+        ))
+    })?;
+    let mut lines = body.lines();
+    if lines.next() != Some(WAL_ARCHIVE_OBJECT_BACKUP_MAGIC) {
+        return Err(EngineError::Durability(format!(
+            "invalid WAL archive object backup header {}",
+            path.display()
+        )));
+    }
+
+    let durable_record_count = parse_control_value(lines.next(), "durable_record_count", path)?
+        .parse()
+        .map_err(|err| {
+            EngineError::Durability(format!(
+                "invalid WAL archive object backup durable_record_count {}: {err}",
+                path.display()
+            ))
+        })?;
+    let last_durable_txn_id = parse_optional_txn(
+        parse_control_value(lines.next(), "last_durable_txn_id", path)?,
+        "last_durable_txn_id",
+        path,
+    )?;
+    let segment_count: usize = parse_control_value(lines.next(), "segments", path)?
+        .parse()
+        .map_err(|err| {
+            EngineError::Durability(format!(
+                "invalid WAL archive object backup segments {}: {err}",
+                path.display()
+            ))
+        })?;
+    let mut segments = Vec::with_capacity(segment_count);
+    for _ in 0..segment_count {
+        let raw = parse_control_value(lines.next(), "segment", path)?;
+        let mut parts = raw.split('|');
+        let segment_path = PathBuf::from(parts.next().ok_or_else(|| {
+            EngineError::Durability(format!(
+                "missing WAL archive object backup segment path in {}",
+                path.display()
+            ))
+        })?);
+        let record_count = parts
+            .next()
+            .ok_or_else(|| {
+                EngineError::Durability(format!(
+                    "missing WAL archive object backup segment count in {}",
+                    path.display()
+                ))
+            })?
+            .parse()
+            .map_err(|err| {
+                EngineError::Durability(format!(
+                    "invalid WAL archive object backup segment count {}: {err}",
+                    path.display()
+                ))
+            })?;
+        let first_txn_id = parse_optional_txn(
+            parts.next().ok_or_else(|| {
+                EngineError::Durability(format!(
+                    "missing WAL archive object backup segment first txn in {}",
+                    path.display()
+                ))
+            })?,
+            "segment first txn",
+            path,
+        )?;
+        let last_txn_id = parse_optional_txn(
+            parts.next().ok_or_else(|| {
+                EngineError::Durability(format!(
+                    "missing WAL archive object backup segment last txn in {}",
+                    path.display()
+                ))
+            })?,
+            "segment last txn",
+            path,
+        )?;
+        if parts.next().is_some() {
+            return Err(EngineError::Durability(format!(
+                "invalid WAL archive object backup segment field count in {}",
+                path.display()
+            )));
+        }
+        segments.push(WalArchiveSegment {
+            segment_path,
+            record_count,
+            first_txn_id,
+            last_txn_id,
+        });
+    }
+
+    let timestamp_count: usize = parse_control_value(lines.next(), "record_timestamps", path)?
+        .parse()
+        .map_err(|err| {
+            EngineError::Durability(format!(
+                "invalid WAL archive object backup timestamp count {}: {err}",
+                path.display()
+            ))
+        })?;
+    let mut record_timestamps = Vec::with_capacity(timestamp_count);
+    for _ in 0..timestamp_count {
+        let raw = parse_control_value(lines.next(), "record_timestamp", path)?;
+        let mut parts = raw.split('|');
+        let txn_id = parts
+            .next()
+            .ok_or_else(|| {
+                EngineError::Durability(format!(
+                    "missing WAL archive object backup timestamp txn in {}",
+                    path.display()
+                ))
+            })?
+            .parse()
+            .map_err(|err| {
+                EngineError::Durability(format!(
+                    "invalid WAL archive object backup timestamp txn {}: {err}",
+                    path.display()
+                ))
+            })?;
+        let timestamp_micros = parts
+            .next()
+            .ok_or_else(|| {
+                EngineError::Durability(format!(
+                    "missing WAL archive object backup timestamp value in {}",
+                    path.display()
+                ))
+            })?
+            .parse()
+            .map_err(|err| {
+                EngineError::Durability(format!(
+                    "invalid WAL archive object backup timestamp value {}: {err}",
+                    path.display()
+                ))
+            })?;
+        if parts.next().is_some() {
+            return Err(EngineError::Durability(format!(
+                "invalid WAL archive object backup timestamp field count in {}",
+                path.display()
+            )));
+        }
+        record_timestamps.push(WalArchiveRecordTimestamp {
+            txn_id,
+            timestamp_micros,
+        });
+    }
+
+    let object_count: usize = parse_control_value(lines.next(), "objects", path)?
+        .parse()
+        .map_err(|err| {
+            EngineError::Durability(format!(
+                "invalid WAL archive object backup object count {}: {err}",
+                path.display()
+            ))
+        })?;
+    let mut objects = Vec::with_capacity(object_count);
+    for _ in 0..object_count {
+        let raw = parse_control_value(lines.next(), "object", path)?;
+        let mut parts = raw.split('|');
+        let source_path = PathBuf::from(parts.next().ok_or_else(|| {
+            EngineError::Durability(format!(
+                "missing WAL archive object backup source path in {}",
+                path.display()
+            ))
+        })?);
+        let object_path = PathBuf::from(parts.next().ok_or_else(|| {
+            EngineError::Durability(format!(
+                "missing WAL archive object backup object path in {}",
+                path.display()
+            ))
+        })?);
+        let byte_len = parts
+            .next()
+            .ok_or_else(|| {
+                EngineError::Durability(format!(
+                    "missing WAL archive object backup byte length in {}",
+                    path.display()
+                ))
+            })?
+            .parse()
+            .map_err(|err| {
+                EngineError::Durability(format!(
+                    "invalid WAL archive object backup byte length {}: {err}",
+                    path.display()
+                ))
+            })?;
+        let checksum = parts
+            .next()
+            .ok_or_else(|| {
+                EngineError::Durability(format!(
+                    "missing WAL archive object backup checksum in {}",
+                    path.display()
+                ))
+            })?
+            .parse()
+            .map_err(|err| {
+                EngineError::Durability(format!(
+                    "invalid WAL archive object backup checksum {}: {err}",
+                    path.display()
+                ))
+            })?;
+        if parts.next().is_some() {
+            return Err(EngineError::Durability(format!(
+                "invalid WAL archive object backup object field count in {}",
+                path.display()
+            )));
+        }
+        objects.push(WalArchiveObject {
+            source_path,
+            object_path,
+            byte_len,
+            checksum,
+        });
+    }
+    if lines.next().is_some() {
+        return Err(EngineError::Durability(format!(
+            "unexpected trailing WAL archive object backup data in {}",
+            path.display()
+        )));
+    }
+
+    let archive_manifest = WalArchiveManifest {
+        segments,
+        checkpoint: WalCheckpointMeta {
+            durable_record_count,
+            last_durable_txn_id,
+        },
+        record_timestamps,
+    };
+    validate_archive_manifest_shape(path, &archive_manifest)?;
+    Ok(WalArchiveObjectBackup {
+        archive_manifest,
+        objects,
+    })
 }
 
 pub fn write_wal_archive_manifest(
@@ -1515,6 +1980,125 @@ fn retained_timestamps(
     &manifest.record_timestamps[..retained_record_count.min(manifest.record_timestamps.len())]
 }
 
+fn write_wal_archive_backup_object(
+    backup_manifest_path: &Path,
+    source_path: &Path,
+    source_file_path: &Path,
+    object_path: &Path,
+) -> Result<WalArchiveObject, EngineError> {
+    validate_backup_path(backup_manifest_path, "object source", source_path)?;
+    validate_backup_path(backup_manifest_path, "object path", object_path)?;
+    let bytes = fs::read(source_file_path).map_err(|err| {
+        EngineError::Durability(format!(
+            "failed to read WAL archive backup source {}: {err}",
+            source_file_path.display()
+        ))
+    })?;
+    write_verified_backup_bytes(object_path, &bytes)?;
+    let object_path = object_path
+        .strip_prefix(
+            backup_manifest_path
+                .parent()
+                .unwrap_or_else(|| Path::new(".")),
+        )
+        .unwrap_or(object_path)
+        .to_path_buf();
+    Ok(WalArchiveObject {
+        source_path: source_path.to_path_buf(),
+        object_path,
+        byte_len: bytes.len() as u64,
+        checksum: wal_object_checksum(&bytes),
+    })
+}
+
+fn read_verified_wal_archive_backup_object(
+    backup_manifest_path: &Path,
+    object: &WalArchiveObject,
+) -> Result<Vec<u8>, EngineError> {
+    let object_path = resolve_manifest_path(backup_manifest_path, &object.object_path);
+    let bytes = fs::read(&object_path).map_err(|err| {
+        EngineError::Durability(format!(
+            "failed to read WAL archive backup object {}: {err}",
+            object_path.display()
+        ))
+    })?;
+    if bytes.len() as u64 != object.byte_len {
+        return Err(EngineError::Durability(format!(
+            "WAL archive backup object {} expected {} bytes but read {}",
+            object_path.display(),
+            object.byte_len,
+            bytes.len()
+        )));
+    }
+    let actual_checksum = wal_object_checksum(&bytes);
+    if actual_checksum != object.checksum {
+        return Err(EngineError::Durability(format!(
+            "WAL archive backup object {} checksum mismatch",
+            object_path.display()
+        )));
+    }
+    Ok(bytes)
+}
+
+fn write_verified_backup_bytes(path: &Path, bytes: &[u8]) -> Result<(), EngineError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            EngineError::Durability(format!(
+                "failed to create WAL archive backup object directory {}: {err}",
+                parent.display()
+            ))
+        })?;
+    }
+    let tmp_path = temporary_control_path(path);
+    let write_result = (|| {
+        let mut file = File::create(&tmp_path).map_err(|err| {
+            EngineError::Durability(format!(
+                "failed to create WAL archive backup object {}: {err}",
+                tmp_path.display()
+            ))
+        })?;
+        file.write_all(bytes).map_err(|err| {
+            EngineError::Durability(format!(
+                "failed to write WAL archive backup object {}: {err}",
+                tmp_path.display()
+            ))
+        })?;
+        file.sync_all().map_err(|err| {
+            EngineError::Durability(format!(
+                "failed to sync WAL archive backup object {}: {err}",
+                tmp_path.display()
+            ))
+        })?;
+        Ok::<_, EngineError>(())
+    })();
+    if let Err(err) = write_result {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+    fs::rename(&tmp_path, path).map_err(|err| {
+        let _ = fs::remove_file(&tmp_path);
+        EngineError::Durability(format!(
+            "failed to install WAL archive backup object {}: {err}",
+            path.display()
+        ))
+    })
+}
+
+fn validate_backup_path(path: &Path, field: &str, value: &Path) -> Result<(), EngineError> {
+    let rendered = value.to_string_lossy();
+    if rendered.is_empty()
+        || rendered.contains('|')
+        || rendered.contains('\n')
+        || rendered.contains('\r')
+    {
+        return Err(EngineError::Durability(format!(
+            "WAL archive object backup {field} contains unsupported path in {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 fn archive_records_per_segment(
     manifest_path: &Path,
     manifest: &WalArchiveManifest,
@@ -1949,6 +2533,15 @@ fn wal_record_checksum(txn_id: TxnId, payload_len: u64, payload: &[u8]) -> u64 {
     hash
 }
 
+fn wal_object_checksum(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2341,6 +2934,125 @@ mod tests {
         );
         assert_eq!(recovered_records.len(), 3);
         assert_eq!(recovered_records[2].payload, b"SET c=3");
+    }
+
+    #[test]
+    fn wal_archive_object_backup_exports_and_restores_archive() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpu-db-wal-object-backup-{}-{}",
+            std::process::id(),
+            NEXT_TEST_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let manifest_path = dir.join("source").join("MANIFEST");
+        let segment_dir = dir.join("source").join("segments");
+        let backup_path = dir.join("backup").join("BACKUP");
+        let object_dir = dir.join("backup").join("objects");
+        let restored_manifest_path = dir.join("restored").join("MANIFEST");
+        let restored_segment_dir = dir.join("restored").join("segments");
+        let records = vec![
+            WalRecord {
+                txn_id: 1,
+                payload: b"SET a=1".to_vec(),
+            },
+            WalRecord {
+                txn_id: 2,
+                payload: b"SET b=2".to_vec(),
+            },
+            WalRecord {
+                txn_id: 3,
+                payload: b"SET c=3".to_vec(),
+            },
+        ];
+        let timestamps = vec![
+            WalArchiveRecordTimestamp {
+                txn_id: 1,
+                timestamp_micros: 1_000,
+            },
+            WalArchiveRecordTimestamp {
+                txn_id: 2,
+                timestamp_micros: 2_000,
+            },
+            WalArchiveRecordTimestamp {
+                txn_id: 3,
+                timestamp_micros: 3_000,
+            },
+        ];
+
+        let source_manifest = write_wal_archive_with_timestamps(
+            &manifest_path,
+            &segment_dir,
+            &records,
+            2,
+            &timestamps,
+        )
+        .unwrap();
+        let backup =
+            export_wal_archive_object_backup(&manifest_path, &backup_path, &object_dir).unwrap();
+        let restored_manifest = restore_wal_archive_object_backup(
+            &backup_path,
+            &restored_manifest_path,
+            &restored_segment_dir,
+        )
+        .unwrap();
+        let (_validated_manifest, restored_records) =
+            read_wal_archive(&restored_manifest_path).unwrap();
+        let (_timestamp_manifest, target, timestamp_records) =
+            read_wal_archive_to_timestamp_micros(&restored_manifest_path, 2_000).unwrap();
+        let _ = fs::remove_dir_all(dir);
+
+        assert_eq!(backup.archive_manifest, source_manifest);
+        assert_eq!(backup.objects.len(), 3);
+        assert_eq!(restored_manifest.checkpoint, source_manifest.checkpoint);
+        assert_eq!(restored_manifest.record_timestamps, timestamps);
+        assert_eq!(restored_records, records);
+        assert_eq!(target.target_txn_id, 2);
+        assert_eq!(timestamp_records.len(), 2);
+    }
+
+    #[test]
+    fn wal_archive_object_backup_rejects_corrupt_object_before_manifest_install() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpu-db-wal-object-backup-corrupt-{}-{}",
+            std::process::id(),
+            NEXT_TEST_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let manifest_path = dir.join("source").join("MANIFEST");
+        let segment_dir = dir.join("source").join("segments");
+        let backup_path = dir.join("backup").join("BACKUP");
+        let object_dir = dir.join("backup").join("objects");
+        let restored_manifest_path = dir.join("restored").join("MANIFEST");
+        let restored_segment_dir = dir.join("restored").join("segments");
+        let records = vec![WalRecord {
+            txn_id: 1,
+            payload: b"SET a=1".to_vec(),
+        }];
+
+        write_wal_archive(&manifest_path, &segment_dir, &records, 1).unwrap();
+        let backup =
+            export_wal_archive_object_backup(&manifest_path, &backup_path, &object_dir).unwrap();
+        let segment_object = backup
+            .objects
+            .iter()
+            .find(|object| object.source_path != Path::new("MANIFEST"))
+            .unwrap();
+        let object_path = resolve_manifest_path(&backup_path, &segment_object.object_path);
+        fs::write(&object_path, b"corrupt wal object").unwrap();
+
+        let err = restore_wal_archive_object_backup(
+            &backup_path,
+            &restored_manifest_path,
+            &restored_segment_dir,
+        )
+        .unwrap_err();
+        let manifest_installed = restored_manifest_path.exists();
+        let _ = fs::remove_dir_all(dir);
+
+        let err = err.to_string();
+        assert!(
+            err.contains("checksum mismatch")
+                || (err.contains("expected") && err.contains("bytes"))
+        );
+        assert!(!manifest_installed);
     }
 
     #[test]

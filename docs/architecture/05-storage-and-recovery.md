@@ -28,6 +28,8 @@ The first streaming-ingestion slice registers an already-written checksummed WAL
 
 The first timeline-branch slice forks an exact transaction or timestamp PITR target into a new local archive manifest and sidecar timeline metadata. `Engine::fork_durable_wal_archive_timeline_to_txn(...)` and `Engine::fork_durable_wal_archive_timeline_to_timestamp_micros(...)` validate the source archive and requested target before writing a branch archive containing only the selected durable prefix, then record the new timeline id, optional parent timeline id, fork transaction, optional fork timestamp, source manifest, and branch manifest. This is local restore-branch identity and ancestry proof, not a production timeline fork manager or cross-archive conflict resolver.
 
+The first object-backup slice exports a validated local WAL archive into an object-store-style bundle. `Engine::export_durable_wal_archive_object_backup(...)` writes a backup manifest plus manifest/segment objects with byte lengths and checksums; `Engine::restore_durable_wal_archive_object_backup(...)` verifies every object before installing a restored archive manifest and segment set. This is a file-backed object-bundle proof for backup/restore validation, not an S3/GCS/Azure client, credential model, continuous shipping daemon, or retention policy engine.
+
 ## Recovery sequence
 
 1. Validate control metadata
@@ -36,7 +38,7 @@ The first timeline-branch slice forks an exact transaction or timestamp PITR tar
 4. Rebuild volatile caches (GPU) from durable state
 5. Open for traffic after readiness gates pass
 
-Current limitation: checkpoint-control metadata covers one selected durable segment, and the archive manifest covers ordered replay of all durable records plus exact transaction-bound and exact timestamp-bound prefix restore, checkpoint-backed base-plus-archive restore, transaction/timestamp-target suffix cleanup, checkpoint-backed base-window archive cleanup, local ingestion of a newly arrived checksummed segment, and local timeline-branch forks with ancestry metadata. Operators should treat the checked-in file-backed paths as restart/replay and local PITR proofs with deterministic segment discovery, not as physical page-image base backups, durable object-storage backup, production timeline management, or automatic background cleanup.
+Current limitation: checkpoint-control metadata covers one selected durable segment, and the archive manifest covers ordered replay of all durable records plus exact transaction-bound and exact timestamp-bound prefix restore, checkpoint-backed base-plus-archive restore, transaction/timestamp-target suffix cleanup, checkpoint-backed base-window archive cleanup, local ingestion of a newly arrived checksummed segment, local timeline-branch forks with ancestry metadata, and checked object-bundle export/restore. Operators should treat the checked-in file-backed paths as restart/replay, local PITR, and local object-backup proofs with deterministic segment discovery, not as physical page-image base backups, production object-storage integration, production timeline management, or automatic background cleanup.
 
 ## Compaction/snapshot boundary
 

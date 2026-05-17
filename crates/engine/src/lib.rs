@@ -30,13 +30,15 @@ use gpu_db_types::{CommitToken, EngineError, Index, LogEntry, Role, SnapshotMeta
 use gpu_db_wal::{
     append_wal_archive_segment_with_timestamps, apply_wal_archive_retention_from_txn,
     apply_wal_archive_retention_to_timestamp_micros, apply_wal_archive_retention_to_txn,
-    fork_wal_archive_timeline_to_timestamp_micros, fork_wal_archive_timeline_to_txn,
-    plan_wal_archive_retention_from_txn, plan_wal_archive_retention_to_timestamp_micros,
-    plan_wal_archive_retention_to_txn, read_wal_archive, read_wal_archive_timeline,
-    read_wal_archive_to_timestamp_micros, read_wal_archive_to_txn, read_wal_checkpoint,
-    read_wal_segment, write_wal_archive_with_timestamps, write_wal_control_file, write_wal_segment,
-    WalArchiveManifest, WalArchiveRecordTimestamp, WalArchiveRetentionPlan, WalArchiveTimeline,
-    WalArchiveTimelineBranch, WalBuffer, WalControlFile, WalRecord,
+    export_wal_archive_object_backup, fork_wal_archive_timeline_to_timestamp_micros,
+    fork_wal_archive_timeline_to_txn, plan_wal_archive_retention_from_txn,
+    plan_wal_archive_retention_to_timestamp_micros, plan_wal_archive_retention_to_txn,
+    read_wal_archive, read_wal_archive_timeline, read_wal_archive_to_timestamp_micros,
+    read_wal_archive_to_txn, read_wal_checkpoint, read_wal_segment,
+    restore_wal_archive_object_backup, write_wal_archive_with_timestamps, write_wal_control_file,
+    write_wal_segment, WalArchiveManifest, WalArchiveObjectBackup, WalArchiveRecordTimestamp,
+    WalArchiveRetentionPlan, WalArchiveTimeline, WalArchiveTimelineBranch, WalBuffer,
+    WalControlFile, WalRecord,
 };
 
 #[derive(Debug, Default)]
@@ -8704,6 +8706,26 @@ impl Engine {
         record_timestamps: &[WalArchiveRecordTimestamp],
     ) -> Result<WalArchiveManifest, EngineError> {
         append_wal_archive_segment_with_timestamps(manifest_path, segment_path, record_timestamps)
+    }
+
+    pub fn export_durable_wal_archive_object_backup(
+        manifest_path: impl AsRef<std::path::Path>,
+        backup_manifest_path: impl AsRef<std::path::Path>,
+        object_dir: impl AsRef<std::path::Path>,
+    ) -> Result<WalArchiveObjectBackup, EngineError> {
+        export_wal_archive_object_backup(manifest_path, backup_manifest_path, object_dir)
+    }
+
+    pub fn restore_durable_wal_archive_object_backup(
+        backup_manifest_path: impl AsRef<std::path::Path>,
+        restored_manifest_path: impl AsRef<std::path::Path>,
+        restored_segment_dir: impl AsRef<std::path::Path>,
+    ) -> Result<WalArchiveManifest, EngineError> {
+        restore_wal_archive_object_backup(
+            backup_manifest_path,
+            restored_manifest_path,
+            restored_segment_dir,
+        )
     }
 
     pub fn fork_durable_wal_archive_timeline_to_txn(
@@ -25655,6 +25677,80 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
 
         assert_eq!(recovered.wal_unflushed_count(), 0);
+        assert_eq!(recovered.wal_flushed_count(), 3);
+        let table = recovered.relational_catalog_table("people").unwrap();
+        assert_eq!(table.oid, FIRST_USER_RELATION_OID);
+        let Command::Select(select) =
+            parse_command("SELECT id FROM people WHERE name = 'Grace'").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let result = recovered.execute_relational_select(&select).unwrap();
+
+        assert_eq!(
+            result.access_path,
+            RelationalAccessPath::EqualityIndex {
+                table: "people".to_string(),
+                column: "name".to_string(),
+                matched_keys: 1,
+            }
+        );
+        assert_eq!(result.rows, vec![vec![SqlValue::Int4(2)]]);
+    }
+
+    #[test]
+    fn relational_state_recovers_from_wal_archive_object_backup() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpu-db-engine-wal-object-backup-{}-{}",
+            std::process::id(),
+            NEXT_TEST_WAL_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let manifest_path = dir.join("source").join("MANIFEST");
+        let segment_dir = dir.join("source").join("segments");
+        let backup_path = dir.join("backup").join("BACKUP");
+        let object_dir = dir.join("backup").join("objects");
+        let restored_manifest_path = dir.join("restored").join("MANIFEST");
+        let restored_segment_dir = dir.join("restored").join("segments");
+        let mut e = Engine::new_local();
+        e.execute_text_at_timestamp_micros(1, "CREATE TABLE people (id INT, name TEXT)", 1_000)
+            .unwrap();
+        e.execute_text_at_timestamp_micros(
+            2,
+            "INSERT INTO people (id, name) VALUES (1, 'Ada')",
+            2_000,
+        )
+        .unwrap();
+        e.execute_text_at_timestamp_micros(
+            3,
+            "INSERT INTO people (id, name) VALUES (2, 'Grace')",
+            3_000,
+        )
+        .unwrap();
+
+        e.persist_durable_wal_archive(&manifest_path, &segment_dir, 1)
+            .unwrap();
+        let backup = Engine::export_durable_wal_archive_object_backup(
+            &manifest_path,
+            &backup_path,
+            &object_dir,
+        )
+        .unwrap();
+        let restored_manifest = Engine::restore_durable_wal_archive_object_backup(
+            &backup_path,
+            &restored_manifest_path,
+            &restored_segment_dir,
+        )
+        .unwrap();
+        let mut recovered = Engine::recover_from_durable_wal_archive_to_timestamp_micros(
+            &restored_manifest_path,
+            3_000,
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+
+        assert_eq!(backup.objects.len(), 4);
+        assert_eq!(restored_manifest.checkpoint.durable_record_count, 3);
+        assert_eq!(restored_manifest.record_timestamps.len(), 3);
         assert_eq!(recovered.wal_flushed_count(), 3);
         let table = recovered.relational_catalog_table("people").unwrap();
         assert_eq!(table.oid, FIRST_USER_RELATION_OID);

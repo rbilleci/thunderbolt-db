@@ -3,8 +3,8 @@
     "durability.invariants": {
       "failed": 0,
       "ignored": 0,
-      "passed": 83,
-      "total": 83
+      "passed": 86,
+      "total": 86
     },
     "execution.gpu_routing_and_batching": {
       "failed": 0,
@@ -63,8 +63,8 @@
     "sql.relational_foundation": {
       "failed": 0,
       "ignored": 0,
-      "passed": 107,
-      "total": 107
+      "passed": 108,
+      "total": 108
     },
     "sql.transaction_flows": {
       "failed": 0,
@@ -75,8 +75,8 @@
     "storage.indexing": {
       "failed": 0,
       "ignored": 0,
-      "passed": 31,
-      "total": 31
+      "passed": 34,
+      "total": 34
     },
     "uncategorized": {
       "failed": 0,
@@ -89,8 +89,8 @@
   "totals": {
     "failed": 0,
     "ignored": 0,
-    "passed": 1019,
-    "total": 1019
+    "passed": 1022,
+    "total": 1022
   },
   "trend_hook": {
     "baseline_available": true,
