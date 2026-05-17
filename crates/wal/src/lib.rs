@@ -892,6 +892,48 @@ pub fn plan_wal_archive_retention_to_txn(
     })
 }
 
+pub fn plan_wal_archive_retention_to_timestamp_micros(
+    manifest_path: impl AsRef<Path>,
+    target_timestamp_micros: u64,
+) -> Result<WalArchiveRetentionPlan, EngineError> {
+    let manifest_path = manifest_path.as_ref();
+    let (manifest, target, retained_records) =
+        read_wal_archive_to_timestamp_micros(manifest_path, target_timestamp_micros)?;
+    let records_per_segment = archive_records_per_segment(manifest_path, &manifest)?;
+    let segment_dir = archive_segment_dir(manifest_path, &manifest)?;
+    let retained_manifest = build_wal_archive_manifest(
+        manifest_path,
+        &segment_dir,
+        &retained_records,
+        records_per_segment,
+        &manifest.record_timestamps[..target
+            .recovered_record_count
+            .min(manifest.record_timestamps.len())],
+    );
+    let retained_paths: HashSet<PathBuf> = retained_manifest
+        .segments
+        .iter()
+        .map(|segment| resolve_manifest_path(manifest_path, &segment.segment_path))
+        .collect();
+    let removed_segments = manifest
+        .segments
+        .iter()
+        .map(|segment| resolve_manifest_path(manifest_path, &segment.segment_path))
+        .filter(|path| !retained_paths.contains(path))
+        .collect();
+
+    Ok(WalArchiveRetentionPlan {
+        target_txn_id: target.target_txn_id,
+        retained_record_count: target.recovered_record_count,
+        removed_record_count: manifest
+            .checkpoint
+            .durable_record_count
+            .saturating_sub(target.recovered_record_count),
+        retained_manifest,
+        removed_segments,
+    })
+}
+
 pub fn plan_wal_archive_retention_from_txn(
     manifest_path: impl AsRef<Path>,
     base_txn_id: TxnId,
@@ -1003,6 +1045,47 @@ pub fn apply_wal_archive_retention_from_txn(
         manifest_path,
         &segment_dir,
         retained_records,
+        records_per_segment,
+        retained_timestamps,
+    )?;
+    for removed_segment in &plan.removed_segments {
+        match fs::remove_file(removed_segment) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(EngineError::Durability(format!(
+                    "failed to remove obsolete WAL archive segment {}: {err}",
+                    removed_segment.display()
+                )));
+            }
+        }
+    }
+
+    Ok(WalArchiveRetentionPlan {
+        retained_manifest,
+        ..plan
+    })
+}
+
+pub fn apply_wal_archive_retention_to_timestamp_micros(
+    manifest_path: impl AsRef<Path>,
+    target_timestamp_micros: u64,
+) -> Result<WalArchiveRetentionPlan, EngineError> {
+    let manifest_path = manifest_path.as_ref();
+    let (manifest, _target, retained_records) =
+        read_wal_archive_to_timestamp_micros(manifest_path, target_timestamp_micros)?;
+    let records_per_segment = archive_records_per_segment(manifest_path, &manifest)?;
+    let segment_dir = archive_segment_dir(manifest_path, &manifest)?;
+    let plan =
+        plan_wal_archive_retention_to_timestamp_micros(manifest_path, target_timestamp_micros)?;
+
+    let retained_timestamps = &manifest.record_timestamps[..plan
+        .retained_record_count
+        .min(manifest.record_timestamps.len())];
+    let retained_manifest = write_wal_archive_with_timestamps(
+        manifest_path,
+        &segment_dir,
+        &retained_records,
         records_per_segment,
         retained_timestamps,
     )?;
@@ -2171,6 +2254,136 @@ mod tests {
             .to_string()
             .contains("beyond last durable transaction"));
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn wal_archive_timestamp_retention_rewrites_manifest_and_preserves_timestamp_prefix() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpu-db-wal-archive-timestamp-retention-{}-{}",
+            std::process::id(),
+            NEXT_TEST_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let manifest_path = dir.join("MANIFEST");
+        let segment_dir = dir.join("segments");
+        let records = vec![
+            WalRecord {
+                txn_id: 1,
+                payload: b"SET a=1".to_vec(),
+            },
+            WalRecord {
+                txn_id: 2,
+                payload: b"SET b=2".to_vec(),
+            },
+            WalRecord {
+                txn_id: 3,
+                payload: b"SET c=3".to_vec(),
+            },
+            WalRecord {
+                txn_id: 4,
+                payload: b"SET d=4".to_vec(),
+            },
+        ];
+        let timestamps = vec![
+            WalArchiveRecordTimestamp {
+                txn_id: 1,
+                timestamp_micros: 1_000,
+            },
+            WalArchiveRecordTimestamp {
+                txn_id: 2,
+                timestamp_micros: 2_000,
+            },
+            WalArchiveRecordTimestamp {
+                txn_id: 3,
+                timestamp_micros: 3_000,
+            },
+            WalArchiveRecordTimestamp {
+                txn_id: 4,
+                timestamp_micros: 4_000,
+            },
+        ];
+
+        write_wal_archive_with_timestamps(&manifest_path, &segment_dir, &records, 1, &timestamps)
+            .unwrap();
+        let removed_tail = segment_dir.join("segment-0004.wal");
+        assert!(removed_tail.exists());
+
+        let plan = apply_wal_archive_retention_to_timestamp_micros(&manifest_path, 3_000).unwrap();
+        let (retained_manifest, retained_records) = read_wal_archive(&manifest_path).unwrap();
+        let target_err = read_wal_archive_to_timestamp_micros(&manifest_path, 4_000).unwrap_err();
+
+        assert_eq!(plan.target_txn_id, 3);
+        assert_eq!(plan.retained_record_count, 3);
+        assert_eq!(plan.removed_record_count, 1);
+        assert!(!removed_tail.exists());
+        assert_eq!(retained_manifest.checkpoint.durable_record_count, 3);
+        assert_eq!(retained_manifest.checkpoint.last_durable_txn_id, Some(3));
+        assert_eq!(
+            retained_manifest.record_timestamps,
+            vec![
+                WalArchiveRecordTimestamp {
+                    txn_id: 1,
+                    timestamp_micros: 1_000,
+                },
+                WalArchiveRecordTimestamp {
+                    txn_id: 2,
+                    timestamp_micros: 2_000,
+                },
+                WalArchiveRecordTimestamp {
+                    txn_id: 3,
+                    timestamp_micros: 3_000,
+                },
+            ]
+        );
+        assert_eq!(retained_records.len(), 3);
+        assert_eq!(retained_records[2].payload, b"SET c=3");
+        assert!(target_err
+            .to_string()
+            .contains("beyond last durable timestamp"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn wal_archive_timestamp_retention_rejects_between_boundary_without_mutation() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpu-db-wal-archive-timestamp-retention-missing-{}-{}",
+            std::process::id(),
+            NEXT_TEST_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let manifest_path = dir.join("MANIFEST");
+        let segment_dir = dir.join("segments");
+        let records = vec![
+            WalRecord {
+                txn_id: 10,
+                payload: b"SET a=1".to_vec(),
+            },
+            WalRecord {
+                txn_id: 20,
+                payload: b"SET b=2".to_vec(),
+            },
+        ];
+        let timestamps = vec![
+            WalArchiveRecordTimestamp {
+                txn_id: 10,
+                timestamp_micros: 10_000,
+            },
+            WalArchiveRecordTimestamp {
+                txn_id: 20,
+                timestamp_micros: 20_000,
+            },
+        ];
+
+        write_wal_archive_with_timestamps(&manifest_path, &segment_dir, &records, 1, &timestamps)
+            .unwrap();
+        let before_manifest = fs::read_to_string(&manifest_path).unwrap();
+        let err =
+            apply_wal_archive_retention_to_timestamp_micros(&manifest_path, 15_000).unwrap_err();
+        let after_manifest = fs::read_to_string(&manifest_path).unwrap();
+        let _ = fs::remove_dir_all(dir);
+
+        assert!(err
+            .to_string()
+            .contains("falls between archived transaction boundaries"));
+        assert_eq!(after_manifest, before_manifest);
     }
 
     #[test]

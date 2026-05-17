@@ -28,12 +28,13 @@ use gpu_db_storage::{
 use gpu_db_txn::{TxnError, TxnManager};
 use gpu_db_types::{CommitToken, EngineError, Index, LogEntry, Role, SnapshotMeta, Term, TxnId};
 use gpu_db_wal::{
-    apply_wal_archive_retention_from_txn, apply_wal_archive_retention_to_txn,
-    plan_wal_archive_retention_from_txn, plan_wal_archive_retention_to_txn, read_wal_archive,
-    read_wal_archive_to_timestamp_micros, read_wal_archive_to_txn, read_wal_checkpoint,
-    read_wal_segment, write_wal_archive_with_timestamps, write_wal_control_file, write_wal_segment,
-    WalArchiveManifest, WalArchiveRecordTimestamp, WalArchiveRetentionPlan, WalBuffer,
-    WalControlFile, WalRecord,
+    apply_wal_archive_retention_from_txn, apply_wal_archive_retention_to_timestamp_micros,
+    apply_wal_archive_retention_to_txn, plan_wal_archive_retention_from_txn,
+    plan_wal_archive_retention_to_timestamp_micros, plan_wal_archive_retention_to_txn,
+    read_wal_archive, read_wal_archive_to_timestamp_micros, read_wal_archive_to_txn,
+    read_wal_checkpoint, read_wal_segment, write_wal_archive_with_timestamps,
+    write_wal_control_file, write_wal_segment, WalArchiveManifest, WalArchiveRecordTimestamp,
+    WalArchiveRetentionPlan, WalBuffer, WalControlFile, WalRecord,
 };
 
 #[derive(Debug, Default)]
@@ -7771,6 +7772,20 @@ impl Engine {
         target_txn_id: TxnId,
     ) -> Result<WalArchiveRetentionPlan, EngineError> {
         apply_wal_archive_retention_to_txn(manifest_path, target_txn_id)
+    }
+
+    pub fn plan_durable_wal_archive_retention_to_timestamp_micros(
+        manifest_path: impl AsRef<std::path::Path>,
+        target_timestamp_micros: u64,
+    ) -> Result<WalArchiveRetentionPlan, EngineError> {
+        plan_wal_archive_retention_to_timestamp_micros(manifest_path, target_timestamp_micros)
+    }
+
+    pub fn apply_durable_wal_archive_retention_to_timestamp_micros(
+        manifest_path: impl AsRef<std::path::Path>,
+        target_timestamp_micros: u64,
+    ) -> Result<WalArchiveRetentionPlan, EngineError> {
+        apply_wal_archive_retention_to_timestamp_micros(manifest_path, target_timestamp_micros)
     }
 
     pub fn plan_durable_wal_archive_retention_from_checkpoint(
@@ -24384,6 +24399,88 @@ mod tests {
         assert_eq!(plan.retained_record_count, 3);
         assert_eq!(plan.removed_record_count, 1);
         assert_eq!(recovered.wal_flushed_count(), 3);
+
+        let Command::Select(grace_select) =
+            parse_command("SELECT id FROM people WHERE name = 'Grace'").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let grace_result = recovered.execute_relational_select(&grace_select).unwrap();
+        assert_eq!(
+            grace_result.access_path,
+            RelationalAccessPath::EqualityIndex {
+                table: "people".to_string(),
+                column: "name".to_string(),
+                matched_keys: 1,
+            }
+        );
+        assert_eq!(grace_result.rows, vec![vec![SqlValue::Int4(2)]]);
+
+        let Command::Select(katherine_select) =
+            parse_command("SELECT id FROM people WHERE name = 'Katherine'").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let katherine_result = recovered
+            .execute_relational_select(&katherine_select)
+            .unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+
+        assert_eq!(katherine_result.rows, Vec::<Vec<SqlValue>>::new());
+    }
+
+    #[test]
+    fn relational_state_recovers_after_timestamp_wal_archive_retention_cleanup() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpu-db-engine-wal-archive-timestamp-retention-{}-{}",
+            std::process::id(),
+            NEXT_TEST_WAL_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let manifest_path = dir.join("MANIFEST");
+        let segment_dir = dir.join("segments");
+        let mut e = Engine::new_local();
+        e.execute_text_at_timestamp_micros(1, "CREATE TABLE people (id INT, name TEXT)", 1_000)
+            .unwrap();
+        e.execute_text_at_timestamp_micros(
+            2,
+            "INSERT INTO people (id, name) VALUES (1, 'Ada')",
+            2_000,
+        )
+        .unwrap();
+        e.execute_text_at_timestamp_micros(
+            3,
+            "INSERT INTO people (id, name) VALUES (2, 'Grace')",
+            3_000,
+        )
+        .unwrap();
+        e.execute_text_at_timestamp_micros(
+            4,
+            "INSERT INTO people (id, name) VALUES (3, 'Katherine')",
+            4_000,
+        )
+        .unwrap();
+
+        e.persist_durable_wal_archive(&manifest_path, &segment_dir, 1)
+            .unwrap();
+        let plan =
+            Engine::apply_durable_wal_archive_retention_to_timestamp_micros(&manifest_path, 3_000)
+                .unwrap();
+        let mut recovered = Engine::recover_from_durable_wal_archive(&manifest_path).unwrap();
+        let timestamp_err = match Engine::recover_from_durable_wal_archive_to_timestamp_micros(
+            &manifest_path,
+            4_000,
+        ) {
+            Ok(_) => panic!("expected timestamp target beyond retained archive to fail"),
+            Err(err) => err,
+        };
+
+        assert_eq!(plan.target_txn_id, 3);
+        assert_eq!(plan.retained_record_count, 3);
+        assert_eq!(plan.removed_record_count, 1);
+        assert_eq!(recovered.wal_flushed_count(), 3);
+        assert!(timestamp_err
+            .to_string()
+            .contains("beyond last durable timestamp"));
 
         let Command::Select(grace_select) =
             parse_command("SELECT id FROM people WHERE name = 'Grace'").unwrap()
