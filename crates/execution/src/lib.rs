@@ -141,6 +141,15 @@ impl CudaResidentDeviceMemory {
         launch_cuda_resident_i32_sum(self, byte_offset, row_count)
     }
 
+    pub fn grouped_sum_i32_from_payload(
+        &self,
+        group_byte_offset: u64,
+        sum_byte_offset: u64,
+        row_count: u64,
+    ) -> Result<Vec<CudaI32GroupedSum>, CudaRuntimeProbeError> {
+        launch_cuda_resident_i32_grouped_sum(self, group_byte_offset, sum_byte_offset, row_count)
+    }
+
     pub fn project_i32_compare_from_payload(
         &self,
         byte_offset: u64,
@@ -197,6 +206,12 @@ impl CudaI32Comparison {
             Self::Gte => 4,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CudaI32GroupedSum {
+    pub group: i32,
+    pub sum: i64,
 }
 
 impl Drop for CudaResidentDeviceMemory {
@@ -1468,6 +1483,347 @@ done:
     drop(module_guard);
     drop(allocation_guard);
     Ok(output)
+}
+
+fn launch_cuda_resident_i32_grouped_sum(
+    resident: &CudaResidentDeviceMemory,
+    group_byte_offset: u64,
+    sum_byte_offset: u64,
+    row_count: u64,
+) -> Result<Vec<CudaI32GroupedSum>, CudaRuntimeProbeError> {
+    type CuMemAlloc = unsafe extern "C" fn(*mut u64, usize) -> i32;
+    type CuMemFree = unsafe extern "C" fn(u64) -> i32;
+    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+    type CuModuleLoadData = unsafe extern "C" fn(*mut *mut c_void, *const c_void) -> i32;
+    type CuModuleUnload = unsafe extern "C" fn(*mut c_void) -> i32;
+    type CuModuleGetFunction =
+        unsafe extern "C" fn(*mut *mut c_void, *mut c_void, *const i8) -> i32;
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+    type CuCtxSynchronize = unsafe extern "C" fn() -> i32;
+
+    const PTX: &[u8] = br#"
+.version 6.0
+.target sm_30
+.address_size 64
+
+.visible .entry gpu_db_resident_i32_grouped_sum(
+    .param .u64 resident_ptr,
+    .param .u64 group_byte_offset,
+    .param .u64 sum_byte_offset,
+    .param .u64 row_count,
+    .param .u64 out_groups_ptr,
+    .param .u64 out_sums_ptr,
+    .param .u64 out_count_ptr
+)
+{
+    .reg .pred %p_done;
+    .reg .pred %p_found;
+    .reg .pred %p_scan_done;
+    .reg .pred %p_same;
+    .reg .u64 %resident;
+    .reg .u64 %group_offset;
+    .reg .u64 %sum_offset;
+    .reg .u64 %rows;
+    .reg .u64 %out_groups;
+    .reg .u64 %out_sums;
+    .reg .u64 %out_count;
+    .reg .u64 %group_base;
+    .reg .u64 %sum_base;
+    .reg .u64 %idx;
+    .reg .u64 %scan;
+    .reg .u64 %group_count;
+    .reg .u64 %input_addr;
+    .reg .u64 %output_addr;
+    .reg .s32 %group_value;
+    .reg .s32 %sum_value;
+    .reg .s32 %existing_group;
+    .reg .s64 %sum_wide;
+    .reg .s64 %existing_sum;
+    .reg .s64 %new_sum;
+
+    ld.param.u64 %resident, [resident_ptr];
+    ld.param.u64 %group_offset, [group_byte_offset];
+    ld.param.u64 %sum_offset, [sum_byte_offset];
+    ld.param.u64 %rows, [row_count];
+    ld.param.u64 %out_groups, [out_groups_ptr];
+    ld.param.u64 %out_sums, [out_sums_ptr];
+    ld.param.u64 %out_count, [out_count_ptr];
+
+    add.u64 %group_base, %resident, %group_offset;
+    add.u64 %sum_base, %resident, %sum_offset;
+    mov.u64 %idx, 0;
+    mov.u64 %group_count, 0;
+
+row_loop:
+    setp.ge.u64 %p_done, %idx, %rows;
+    @%p_done bra done;
+
+    mul.lo.u64 %input_addr, %idx, 4;
+    add.u64 %input_addr, %group_base, %input_addr;
+    ld.global.s32 %group_value, [%input_addr];
+    mul.lo.u64 %input_addr, %idx, 4;
+    add.u64 %input_addr, %sum_base, %input_addr;
+    ld.global.s32 %sum_value, [%input_addr];
+    cvt.s64.s32 %sum_wide, %sum_value;
+
+    mov.u64 %scan, 0;
+    mov.pred %p_found, 0;
+
+scan_loop:
+    setp.ge.u64 %p_scan_done, %scan, %group_count;
+    @%p_scan_done bra insert_or_next;
+    mul.lo.u64 %output_addr, %scan, 4;
+    add.u64 %output_addr, %out_groups, %output_addr;
+    ld.global.s32 %existing_group, [%output_addr];
+    setp.eq.s32 %p_same, %existing_group, %group_value;
+    @!%p_same bra scan_next;
+
+    mul.lo.u64 %output_addr, %scan, 8;
+    add.u64 %output_addr, %out_sums, %output_addr;
+    ld.global.s64 %existing_sum, [%output_addr];
+    add.s64 %new_sum, %existing_sum, %sum_wide;
+    st.global.s64 [%output_addr], %new_sum;
+    mov.pred %p_found, 1;
+    bra next_row;
+
+scan_next:
+    add.u64 %scan, %scan, 1;
+    bra scan_loop;
+
+insert_or_next:
+    @%p_found bra next_row;
+    mul.lo.u64 %output_addr, %group_count, 4;
+    add.u64 %output_addr, %out_groups, %output_addr;
+    st.global.s32 [%output_addr], %group_value;
+    mul.lo.u64 %output_addr, %group_count, 8;
+    add.u64 %output_addr, %out_sums, %output_addr;
+    st.global.s64 [%output_addr], %sum_wide;
+    add.u64 %group_count, %group_count, 1;
+
+next_row:
+    add.u64 %idx, %idx, 1;
+    bra row_loop;
+
+done:
+    st.global.u64 [%out_count], %group_count;
+    ret;
+}
+"#;
+
+    let group_bytes = row_count
+        .checked_mul(std::mem::size_of::<i32>() as u64)
+        .and_then(|bytes| group_byte_offset.checked_add(bytes))
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let sum_bytes = row_count
+        .checked_mul(std::mem::size_of::<i32>() as u64)
+        .and_then(|bytes| sum_byte_offset.checked_add(bytes))
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    if group_bytes > resident.metadata.allocated_bytes {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(
+            group_bytes as usize,
+        ));
+    }
+    if sum_bytes > resident.metadata.allocated_bytes {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(
+            sum_bytes as usize,
+        ));
+    }
+    if row_count == 0 {
+        return Ok(Vec::new());
+    }
+
+    let cu_mem_alloc = unsafe {
+        resident
+            ._lib
+            .get::<CuMemAlloc>(b"cuMemAlloc_v2\0")
+            .or_else(|_| resident._lib.get::<CuMemAlloc>(b"cuMemAlloc\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_mem_free = unsafe {
+        resident
+            ._lib
+            .get::<CuMemFree>(b"cuMemFree_v2\0")
+            .or_else(|_| resident._lib.get::<CuMemFree>(b"cuMemFree\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_memcpy_dtoh = unsafe {
+        resident
+            ._lib
+            .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+            .or_else(|_| resident._lib.get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_module_load_data = unsafe {
+        resident
+            ._lib
+            .get::<CuModuleLoadData>(b"cuModuleLoadData\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_module_unload = unsafe {
+        resident
+            ._lib
+            .get::<CuModuleUnload>(b"cuModuleUnload\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_module_get_function = unsafe {
+        resident
+            ._lib
+            .get::<CuModuleGetFunction>(b"cuModuleGetFunction\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_launch_kernel = unsafe {
+        resident
+            ._lib
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_ctx_synchronize = unsafe {
+        resident
+            ._lib
+            .get::<CuCtxSynchronize>(b"cuCtxSynchronize\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+
+    let group_output_bytes = usize::try_from(
+        row_count
+            .checked_mul(std::mem::size_of::<i32>() as u64)
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?,
+    )
+    .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let sum_output_bytes = usize::try_from(
+        row_count
+            .checked_mul(std::mem::size_of::<i64>() as u64)
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?,
+    )
+    .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let mut device_groups = 0_u64;
+    check_cuda(unsafe { cu_mem_alloc(&mut device_groups, group_output_bytes) })?;
+    let groups_guard = CudaDeviceAllocationGuard {
+        ptr: device_groups,
+        free: *cu_mem_free,
+    };
+    let mut device_sums = 0_u64;
+    check_cuda(unsafe { cu_mem_alloc(&mut device_sums, sum_output_bytes) })?;
+    let sums_guard = CudaDeviceAllocationGuard {
+        ptr: device_sums,
+        free: *cu_mem_free,
+    };
+    let mut device_count = 0_u64;
+    check_cuda(unsafe { cu_mem_alloc(&mut device_count, std::mem::size_of::<u64>()) })?;
+    let count_guard = CudaDeviceAllocationGuard {
+        ptr: device_count,
+        free: *cu_mem_free,
+    };
+
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+
+    let mut module = std::ptr::null_mut();
+    check_cuda(unsafe { cu_module_load_data(&mut module, ptx.as_ptr().cast::<c_void>()) })?;
+    let module_guard = CudaModuleGuard {
+        module,
+        unload: *cu_module_unload,
+    };
+
+    let mut function = std::ptr::null_mut();
+    check_cuda(unsafe {
+        cu_module_get_function(
+            &mut function,
+            module,
+            c"gpu_db_resident_i32_grouped_sum".as_ptr(),
+        )
+    })?;
+
+    let mut resident_arg = resident.device_ptr;
+    let mut group_offset_arg = group_byte_offset;
+    let mut sum_offset_arg = sum_byte_offset;
+    let mut rows_arg = row_count;
+    let mut groups_arg = groups_guard.ptr;
+    let mut sums_arg = sums_guard.ptr;
+    let mut count_arg = count_guard.ptr;
+    let mut args = [
+        (&mut resident_arg as *mut u64).cast::<c_void>(),
+        (&mut group_offset_arg as *mut u64).cast::<c_void>(),
+        (&mut sum_offset_arg as *mut u64).cast::<c_void>(),
+        (&mut rows_arg as *mut u64).cast::<c_void>(),
+        (&mut groups_arg as *mut u64).cast::<c_void>(),
+        (&mut sums_arg as *mut u64).cast::<c_void>(),
+        (&mut count_arg as *mut u64).cast::<c_void>(),
+    ];
+    check_cuda(unsafe {
+        cu_launch_kernel(
+            function,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            0,
+            std::ptr::null_mut(),
+            args.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    })?;
+    check_cuda(unsafe { cu_ctx_synchronize() })?;
+
+    let mut output_count = 0_u64;
+    check_cuda(unsafe {
+        cu_memcpy_dtoh(
+            (&mut output_count as *mut u64).cast::<c_void>(),
+            count_guard.ptr,
+            std::mem::size_of::<u64>(),
+        )
+    })?;
+    if output_count > row_count {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(
+            usize::try_from(output_count).unwrap_or(usize::MAX),
+        ));
+    }
+
+    let output_len = usize::try_from(output_count)
+        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let mut groups = vec![0_i32; output_len];
+    let mut sums = vec![0_i64; output_len];
+    if output_len > 0 {
+        check_cuda(unsafe {
+            cu_memcpy_dtoh(
+                groups.as_mut_ptr().cast::<c_void>(),
+                groups_guard.ptr,
+                output_len * std::mem::size_of::<i32>(),
+            )
+        })?;
+        check_cuda(unsafe {
+            cu_memcpy_dtoh(
+                sums.as_mut_ptr().cast::<c_void>(),
+                sums_guard.ptr,
+                output_len * std::mem::size_of::<i64>(),
+            )
+        })?;
+    }
+
+    drop(module_guard);
+    drop(count_guard);
+    drop(sums_guard);
+    drop(groups_guard);
+    Ok(groups
+        .into_iter()
+        .zip(sums)
+        .map(|(group, sum)| CudaI32GroupedSum { group, sum })
+        .collect())
 }
 
 fn launch_cuda_resident_i32_compare_project(

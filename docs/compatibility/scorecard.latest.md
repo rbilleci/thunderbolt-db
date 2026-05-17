@@ -1,14 +1,14 @@
 # Compatibility Scorecard
 
 ## Totals
-- total: 1033
-- passed: 1033
+- total: 1034
+- passed: 1034
 - failed: 0
 - ignored: 0
 
 ## Bucket Summary
 - durability.invariants: total=88 passed=88 failed=0 ignored=0
-- execution.gpu_routing_and_batching: total=80 passed=80 failed=0 ignored=0
+- execution.gpu_routing_and_batching: total=81 passed=81 failed=0 ignored=0
 - protocol.client_flows: total=115 passed=115 failed=0 ignored=0
 - protocol.error_paths: total=104 passed=104 failed=0 ignored=0
 - protocol.extended_query: total=309 passed=309 failed=0 ignored=0

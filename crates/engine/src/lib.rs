@@ -8272,6 +8272,138 @@ impl Engine {
         })
     }
 
+    pub fn execute_relational_grouped_sum_with_resident_device_memory_probe(
+        &mut self,
+        select: &Select,
+    ) -> Result<RelationalSelectResult, ExecuteError> {
+        let (table, bound) = self.bind_relational_select_for_execution(select)?;
+        let SelectProjection::GroupedSum {
+            group_column,
+            sum_column,
+        } = &select.projection
+        else {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory grouped SUM proof currently supports only SELECT int4_group, SUM(int4_column) GROUP BY int4_group"
+                    .to_string(),
+            )));
+        };
+        if select.distinct
+            || !select.having_groups.is_empty()
+            || select.filter.is_some()
+            || !select.filters.is_empty()
+            || !select.filter_groups.is_empty()
+            || select.offset.is_some()
+        {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory grouped SUM proof currently supports only unfiltered grouped SUM with optional ORDER BY and LIMIT"
+                    .to_string(),
+            )));
+        }
+        let Some(group_by) = &select.group_by else {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory grouped SUM proof requires GROUP BY".to_string(),
+            )));
+        };
+        if !group_by.eq_ignore_ascii_case(group_column) {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory grouped SUM proof requires GROUP BY to match the projected group column"
+                    .to_string(),
+            )));
+        }
+        let group_idx = relational_column_index(&table, group_column)?;
+        let sum_idx = relational_column_index(&table, sum_column)?;
+        if table.columns[group_idx].ty != SqlType::Int4
+            || table.columns[sum_idx].ty != SqlType::Int4
+        {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory grouped SUM proof currently supports only int4 group and sum columns"
+                    .to_string(),
+            )));
+        }
+
+        let (_query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
+        let snapshot = self
+            .relational_residency_snapshot(&table.name)
+            .ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "relation \"{}\" has no resident snapshot",
+                    table.name
+                )))
+            })?;
+        if snapshot.schema != table.schema || snapshot.table != table.name {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident snapshot no longer matches catalog table identity".to_string(),
+            )));
+        }
+        if !snapshot.is_valid() {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "relation \"{}\" resident snapshot is invalid",
+                table.name
+            ))));
+        }
+        let device_memory = self
+            .relational_residency_device_memory
+            .get(&table.name)
+            .ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "relation \"{}\" has no retained resident device memory",
+                    table.name
+                )))
+            })?;
+        let group_offset = resident_device_int4_column_offset(&snapshot, &table, group_idx)?;
+        let sum_offset = resident_device_int4_column_offset(&snapshot, &table, sum_idx)?;
+        let row_count = u64::try_from(snapshot.row_count).map_err(|_| {
+            ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident snapshot row count exceeds retained device-memory proof range"
+                    .to_string(),
+            ))
+        })?;
+        let started = Instant::now();
+        let mut groups = device_memory
+            .grouped_sum_i32_from_payload(group_offset, sum_offset, row_count)
+            .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
+        let elapsed = started.elapsed();
+        groups.sort_by_key(|group| group.group);
+        if let Some(order) = &select.order_by {
+            let order_by_sum = select_is_aggregate_result_column(select, &order.column);
+            groups.sort_by(|left, right| {
+                let ordering = if order_by_sum {
+                    left.sum.cmp(&right.sum)
+                } else {
+                    left.group.cmp(&right.group)
+                };
+                ordering.then_with(|| left.group.cmp(&right.group))
+            });
+            if order.descending {
+                groups.reverse();
+            }
+        }
+        if let Some(limit) = select.limit {
+            groups.truncate(limit);
+        }
+        let result_d2h_bytes = groups
+            .len()
+            .checked_mul(std::mem::size_of::<i32>() + std::mem::size_of::<i64>())
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<u64>()))
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .unwrap_or(u64::MAX);
+        self.metrics.observe_d2h_bytes(result_d2h_bytes);
+        self.metrics
+            .observe_kernel_exec_ms(elapsed.as_millis().try_into().unwrap_or(u64::MAX).max(1));
+
+        Ok(RelationalSelectResult {
+            columns: bound.selected_columns,
+            rows: groups
+                .into_iter()
+                .map(|group| vec![SqlValue::Int4(group.group), SqlValue::Int8(group.sum)])
+                .collect(),
+            planned_target: DeviceTarget::Gpu(snapshot.gpu_id),
+            executed_target: DeviceTarget::Gpu(snapshot.gpu_id),
+            fallback_reason: None,
+            access_path,
+        })
+    }
+
     pub fn execute_relational_projection_with_resident_device_memory_probe(
         &mut self,
         select: &Select,
@@ -12372,6 +12504,17 @@ mod tests {
             .to_string();
         assert!(err.contains("has no retained resident device memory"));
 
+        let Command::Select(grouped_sum_select) =
+            parse_command("SELECT id, SUM(id) FROM events GROUP BY id").unwrap()
+        else {
+            unreachable!()
+        };
+        let err = e
+            .execute_relational_grouped_sum_with_resident_device_memory_probe(&grouped_sum_select)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("has no retained resident device memory"));
+
         let Command::Select(projection_select) =
             parse_command("SELECT id FROM events WHERE id >= 1").unwrap()
         else {
@@ -12493,6 +12636,68 @@ mod tests {
         e.mark_gpu_memory_pressured(0);
         assert!(e
             .execute_relational_ordered_projection_with_resident_device_memory_probe(&select)
+            .unwrap_err()
+            .to_string()
+            .contains("resident snapshot is invalid"));
+    }
+
+    #[test]
+    fn gpu_resident_device_memory_grouped_sum_probe_materializes_int4_results() {
+        let mut e = Engine::new_local();
+        e.execute_text(
+            1,
+            "CREATE TABLE events (bucket INT, label TEXT, amount INT)",
+        )
+        .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO events (bucket, label, amount) VALUES (1, 'alpha', 10), (2, 'beta', 30), (1, 'gamma', 20), (3, 'delta', 40), (2, 'epsilon', 5)",
+        )
+        .unwrap();
+        let snapshot = e.populate_relational_residency_snapshot("events").unwrap();
+        if snapshot.device_memory_proof.is_none() {
+            return;
+        }
+        let Command::Select(select) = parse_command(
+            "SELECT bucket, SUM(amount) FROM events GROUP BY bucket ORDER BY sum DESC LIMIT 2",
+        )
+        .unwrap() else {
+            unreachable!()
+        };
+        let cpu = e.execute_relational_select(&select).unwrap();
+        let before = e.metrics().snapshot();
+        let resident = e
+            .execute_relational_grouped_sum_with_resident_device_memory_probe(&select)
+            .unwrap();
+        let after = e.metrics().snapshot();
+
+        assert_eq!(resident.columns, cpu.columns);
+        assert_eq!(resident.rows, cpu.rows);
+        assert_eq!(
+            resident.rows,
+            vec![
+                vec![SqlValue::Int4(3), SqlValue::Int8(40)],
+                vec![SqlValue::Int4(2), SqlValue::Int8(35)]
+            ]
+        );
+        assert_eq!(resident.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(resident.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(resident.fallback_reason, None);
+        assert_eq!(after.h2d_bytes_total - before.h2d_bytes_total, 0);
+        assert_eq!(
+            after.d2h_bytes_total - before.d2h_bytes_total,
+            2 * (std::mem::size_of::<i32>() + std::mem::size_of::<i64>()) as u64
+                + std::mem::size_of::<u64>() as u64
+        );
+        assert_eq!(after.kernel_exec_samples - before.kernel_exec_samples, 1);
+
+        e.execute_text(
+            3,
+            "INSERT INTO events (bucket, label, amount) VALUES (4, 'zeta', 50)",
+        )
+        .unwrap();
+        assert!(e
+            .execute_relational_grouped_sum_with_resident_device_memory_probe(&select)
             .unwrap_err()
             .to_string()
             .contains("resident snapshot is invalid"));

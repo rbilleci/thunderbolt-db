@@ -61,6 +61,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         "SELECT amount FROM events WHERE amount >= {} ORDER BY amount DESC LIMIT 8",
         row_count.saturating_sub(row_count / 5).max(1)
     ))?;
+    let grouped_sum_query =
+        select("SELECT bucket, SUM(amount) FROM events GROUP BY bucket ORDER BY sum DESC LIMIT 8")?;
     let mutation_query = select(&format!(
         "SELECT * FROM events WHERE id = {}",
         row_count + 1
@@ -127,10 +129,17 @@ fn main() -> Result<(), Box<dyn Error>> {
         &ordered_projection_cpu_result,
         "resident_device_memory_ordered_projection_kernel_probe",
     )?;
+    let grouped_sum_cpu_result = cpu.execute_relational_select(&grouped_sum_query)?;
+    let resident_device_grouped_sum_probe = timed_resident_device_grouped_sum_probe(
+        &mut gpu,
+        &grouped_sum_query,
+        &grouped_sum_cpu_result,
+        "resident_device_memory_grouped_sum_kernel_probe",
+    )?;
 
     let new_id = row_count + 1;
     let insert_sql = format!(
-        "INSERT INTO events (id, account, amount, category) VALUES ({new_id}, 'acct_refresh', 7777, 'refresh')"
+        "INSERT INTO events (id, account, amount, category, bucket) VALUES ({new_id}, 'acct_refresh', 7777, 'refresh', 777)"
     );
     cpu.execute_text((row_count + 4) as u64, &insert_sql)?;
     gpu.execute_text((row_count + 4) as u64, &insert_sql)?;
@@ -190,7 +199,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("- warm_resident_snapshot_execution_supported: true");
     println!("- production_device_cache_supported: bounded_retained_snapshot_handle");
     println!(
-        "- resident_device_memory_query_kernel_supported: bounded_count_all_int4_equality_count_int4_range_count_int4_sum_int4_projection_and_int4_ordered_projection"
+        "- resident_device_memory_query_kernel_supported: bounded_count_all_int4_equality_count_int4_range_count_int4_sum_int4_projection_int4_ordered_projection_and_int4_grouped_sum"
     );
     println!(
         "- resident_device_memory_proof_supported: {}",
@@ -377,10 +386,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!();
     print_probe(&resident_device_ordered_projection_probe);
     println!();
+    print_probe(&resident_device_grouped_sum_probe);
+    println!();
     print_probe(&mutation_probe);
     println!();
     println!(
-        "decision: current P7 evidence includes bounded resident table-data snapshot SELECT probes with zero per-query H2D transfer for the app lookup workload and supported aggregate/distinct SQL shapes, retained-device-memory COUNT(*), int4 equality-predicate COUNT(*), int4 range-predicate COUNT(*), int4 SUM, int4 predicate-projection, and bounded int4 ordered-projection proofs over the resident allocation, resident-byte accounting, WAL-safe invalidation, manual refresh-cost accounting, memory-pressure fallback metadata, deterministic resident-snapshot budget admission/eviction, and a retained real CUDA allocation/copy handle for encoded snapshot bytes when local driver hardware is available. Keep broad production CUDA cache claims out of scope until grouped aggregate kernels read directly from retained device-memory handles."
+        "decision: current P7 evidence includes bounded resident table-data snapshot SELECT probes with zero per-query H2D transfer for the app lookup workload and supported aggregate/distinct SQL shapes, retained-device-memory COUNT(*), int4 equality-predicate COUNT(*), int4 range-predicate COUNT(*), int4 SUM, int4 predicate-projection, bounded int4 ordered-projection, and int4 grouped-SUM proofs over the resident allocation, resident-byte accounting, WAL-safe invalidation, manual refresh-cost accounting, memory-pressure fallback metadata, deterministic resident-snapshot budget admission/eviction, and a retained real CUDA allocation/copy handle for encoded snapshot bytes when local driver hardware is available. Keep broad production CUDA cache claims out of scope until broader grouped aggregate and expression kernels read directly from retained device-memory handles."
     );
 
     Ok(())
@@ -604,6 +615,42 @@ fn timed_resident_device_ordered_projection_probe(
     })
 }
 
+fn timed_resident_device_grouped_sum_probe(
+    engine: &mut Engine,
+    query: &Select,
+    expected: &RelationalSelectResult,
+    name: &'static str,
+) -> Result<ProbeReport, Box<dyn Error>> {
+    let before = engine.metrics().snapshot();
+    let start = Instant::now();
+    let result = engine.execute_relational_grouped_sum_with_resident_device_memory_probe(query)?;
+    let elapsed = start.elapsed();
+    let after = engine.metrics().snapshot();
+    let correctness_validated = result.columns == expected.columns && result.rows == expected.rows;
+    if !correctness_validated {
+        return Err(format!("{name} resident device-memory grouped SUM diverged").into());
+    }
+    Ok(ProbeReport {
+        name,
+        elapsed,
+        result_rows: result.rows.len(),
+        planned_target: format!("{:?}", result.planned_target),
+        executed_target: format!("{:?}", result.executed_target),
+        access_path: format!("{:?}", result.access_path),
+        sql_fallback: result.fallback_reason.is_some(),
+        fallback_reason: result
+            .fallback_reason
+            .as_ref()
+            .map(|reason| format!("{reason:?}"))
+            .unwrap_or_else(|| "None".to_string()),
+        h2d_bytes: after.h2d_bytes_total - before.h2d_bytes_total,
+        d2h_bytes: after.d2h_bytes_total - before.d2h_bytes_total,
+        kernel_exec_samples: after.kernel_exec_samples - before.kernel_exec_samples,
+        kernel_exec_total_ms: after.kernel_exec_total_ms - before.kernel_exec_total_ms,
+        correctness_validated,
+    })
+}
+
 fn timed_resident_probe_many(
     engine: &mut Engine,
     queries: &[Select],
@@ -756,7 +803,7 @@ fn seeded_engine(row_count: usize) -> Result<Engine, Box<dyn Error>> {
     let mut engine = Engine::new_local();
     engine.execute_text(
         1,
-        "CREATE TABLE events (id INT, account TEXT, amount INT, category TEXT)",
+        "CREATE TABLE events (id INT, account TEXT, amount INT, category TEXT, bucket INT)",
     )?;
     engine.execute_text(2, "CREATE TABLE resident_aux (id INT, label TEXT)")?;
     engine.execute_text(3, "INSERT INTO resident_aux (id, label) VALUES (1, 'aux')")?;
@@ -764,8 +811,9 @@ fn seeded_engine(row_count: usize) -> Result<Engine, Box<dyn Error>> {
         let account = format!("acct{}", id % 64);
         let category = if id % 2 == 0 { "even" } else { "odd" };
         let amount = (id % 10_000) as i32;
+        let bucket = (id % 8) as i32;
         let sql = format!(
-            "INSERT INTO events (id, account, amount, category) VALUES ({id}, '{account}', {amount}, '{category}')"
+            "INSERT INTO events (id, account, amount, category, bucket) VALUES ({id}, '{account}', {amount}, '{category}', {bucket})"
         );
         engine.execute_text((id + 3) as u64, &sql)?;
     }
