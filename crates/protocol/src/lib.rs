@@ -1,3 +1,4 @@
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Begin,
@@ -99,6 +100,20 @@ pub enum SelectProjection {
         group_column: String,
         sum_column: String,
     },
+    Min {
+        column: String,
+    },
+    GroupedMin {
+        group_column: String,
+        min_column: String,
+    },
+    Max {
+        column: String,
+    },
+    GroupedMax {
+        group_column: String,
+        max_column: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,7 +164,7 @@ pub enum ParseError {
     InvalidDel,
     #[error("invalid GET syntax; expected: GET key")]
     InvalidGet,
-    #[error("invalid relational SQL syntax; supported subset: CREATE TABLE name (...), INSERT INTO name (...) VALUES (...), SELECT [DISTINCT] columns|COUNT(*)|SUM(int4_column)|column, COUNT(*)|column, SUM(int4_column) FROM name [WHERE column (=|<|<=|>|>=) literal | column BETWEEN literal AND literal | column IN (literal, ...) | text_column LIKE 'prefix%' [AND ...] [OR ...]] [GROUP BY column] [ORDER BY selected_column|count|sum [ASC|DESC]] [LIMIT n] [OFFSET n]")]
+    #[error("invalid relational SQL syntax; supported subset: CREATE TABLE name (...), INSERT INTO name (...) VALUES (...), SELECT [DISTINCT] columns|COUNT(*)|SUM(int4_column)|MIN(column)|MAX(column)|column, COUNT(*)|column, SUM(int4_column)|column, MIN(column)|column, MAX(column) FROM name [WHERE column (=|<|<=|>|>=) literal | column BETWEEN literal AND literal | column IN (literal, ...) | text_column LIKE 'prefix%' [AND ...] [OR ...]] [GROUP BY column] [ORDER BY selected_column|count|sum|min|max [ASC|DESC]] [LIMIT n] [OFFSET n]")]
     InvalidRelationalSql,
     #[error("LIMIT must not be negative")]
     NegativeLimit,
@@ -1708,6 +1723,12 @@ fn parse_projection(input: &str) -> Result<SelectProjection, ParseError> {
     if let Some(column) = parse_aggregate_call(input, "SUM")? {
         return Ok(SelectProjection::Sum { column });
     }
+    if let Some(column) = parse_aggregate_call(input, "MIN")? {
+        return Ok(SelectProjection::Min { column });
+    }
+    if let Some(column) = parse_aggregate_call(input, "MAX")? {
+        return Ok(SelectProjection::Max { column });
+    }
     let items = split_csv(input)?;
     if items.len() == 2 && items[1].trim().eq_ignore_ascii_case("COUNT(*)") {
         return Ok(SelectProjection::GroupedCount {
@@ -1719,6 +1740,18 @@ fn parse_projection(input: &str) -> Result<SelectProjection, ParseError> {
             return Ok(SelectProjection::GroupedSum {
                 group_column: normalize_identifier(items[0].trim())?,
                 sum_column,
+            });
+        }
+        if let Some(min_column) = parse_aggregate_call(items[1].trim(), "MIN")? {
+            return Ok(SelectProjection::GroupedMin {
+                group_column: normalize_identifier(items[0].trim())?,
+                min_column,
+            });
+        }
+        if let Some(max_column) = parse_aggregate_call(items[1].trim(), "MAX")? {
+            return Ok(SelectProjection::GroupedMax {
+                group_column: normalize_identifier(items[0].trim())?,
+                max_column,
             });
         }
     }
@@ -1742,7 +1775,7 @@ fn parse_aggregate_call(input: &str, expected: &str) -> Result<Option<String>, P
         return Ok(None);
     };
     if !name.eq_ignore_ascii_case(expected) {
-        return Err(ParseError::InvalidRelationalSql);
+        return Ok(None);
     }
     let open = input.find('(').ok_or(ParseError::InvalidRelationalSql)?;
     let close = input.rfind(')').ok_or(ParseError::InvalidRelationalSql)?;
@@ -9566,6 +9599,69 @@ mod tests {
 
         assert!(matches!(
             parse_command("SELECT SUM(id), name FROM people"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+    }
+
+    #[test]
+    fn parses_relational_min_max_aggregates() {
+        assert_eq!(
+            parse_command(
+                "SELECT name, MIN(id) FROM people WHERE id >= 2 GROUP BY name ORDER BY min DESC LIMIT 2 OFFSET 1",
+            )
+            .unwrap(),
+            Command::Select(Select {
+                table: "people".to_string(),
+                distinct: false,
+                projection: SelectProjection::GroupedMin {
+                    group_column: "name".to_string(),
+                    min_column: "id".to_string(),
+                },
+                group_by: Some("name".to_string()),
+                filter: Some(SelectFilter {
+                    column: "id".to_string(),
+                    op: SelectFilterOp::Gte,
+                    value: SqlValue::Int4(2),
+                }),
+                filters: vec![SelectFilter {
+                    column: "id".to_string(),
+                    op: SelectFilterOp::Gte,
+                    value: SqlValue::Int4(2),
+                }],
+                filter_groups: vec![vec![SelectFilter {
+                    column: "id".to_string(),
+                    op: SelectFilterOp::Gte,
+                    value: SqlValue::Int4(2),
+                }]],
+                order_by: Some(SelectOrder {
+                    column: "min".to_string(),
+                    descending: true,
+                }),
+                limit: Some(2),
+                offset: Some(1),
+            })
+        );
+
+        assert_eq!(
+            parse_command("SELECT MAX(name) FROM people").unwrap(),
+            Command::Select(Select {
+                table: "people".to_string(),
+                distinct: false,
+                projection: SelectProjection::Max {
+                    column: "name".to_string(),
+                },
+                group_by: None,
+                filter: None,
+                filters: Vec::new(),
+                filter_groups: Vec::new(),
+                order_by: None,
+                limit: None,
+                offset: None,
+            })
+        );
+
+        assert!(matches!(
+            parse_command("SELECT MIN(id), name FROM people"),
             Err(ParseError::InvalidRelationalSql)
         ));
     }

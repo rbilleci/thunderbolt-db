@@ -26,9 +26,15 @@ SELECT name, COUNT(*) FROM people GROUP BY name ORDER BY name;
 \echo === relational sum aggregation ===
 SELECT SUM(id) FROM people WHERE name = 'Grace';
 SELECT name, SUM(id) FROM people GROUP BY name ORDER BY sum DESC LIMIT 2;
+\echo === relational min max aggregation ===
+SELECT MIN(id) FROM people WHERE id >= 2;
+SELECT MAX(name) FROM people WHERE id >= 2;
+SELECT name, MIN(id) FROM people GROUP BY name ORDER BY min DESC LIMIT 2;
+SELECT name, MAX(id) FROM people GROUP BY name ORDER BY max DESC LIMIT 2;
 \echo === relational aggregate unsupported recovery ===
 SELECT name, COUNT(*) FROM people ORDER BY name;
 SELECT SUM(name) FROM people;
+SELECT name, MAX(id) FROM people ORDER BY name;
 SELECT COUNT(*) FROM people WHERE id >= 2;
 \echo === relational distinct unsupported recovery ===
 SELECT DISTINCT name FROM people ORDER BY id;

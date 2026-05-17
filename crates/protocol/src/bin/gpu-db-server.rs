@@ -162,6 +162,10 @@ fn execute_select_result(
             | SelectProjection::GroupedCount { .. }
             | SelectProjection::Sum { .. }
             | SelectProjection::GroupedSum { .. }
+            | SelectProjection::Min { .. }
+            | SelectProjection::GroupedMin { .. }
+            | SelectProjection::Max { .. }
+            | SelectProjection::GroupedMax { .. }
     ) {
         return execute_aggregate_select_result(table, select);
     }
@@ -197,7 +201,11 @@ fn execute_select_result(
         SelectProjection::CountAll
         | SelectProjection::GroupedCount { .. }
         | SelectProjection::Sum { .. }
-        | SelectProjection::GroupedSum { .. } => unreachable!(),
+        | SelectProjection::GroupedSum { .. }
+        | SelectProjection::Min { .. }
+        | SelectProjection::GroupedMin { .. }
+        | SelectProjection::Max { .. }
+        | SelectProjection::GroupedMax { .. } => unreachable!(),
     };
     if select.distinct {
         match &select.projection {
@@ -222,7 +230,11 @@ fn execute_select_result(
             SelectProjection::CountAll
             | SelectProjection::GroupedCount { .. }
             | SelectProjection::Sum { .. }
-            | SelectProjection::GroupedSum { .. } => unreachable!(),
+            | SelectProjection::GroupedSum { .. }
+            | SelectProjection::Min { .. }
+            | SelectProjection::GroupedMin { .. }
+            | SelectProjection::Max { .. }
+            | SelectProjection::GroupedMax { .. } => unreachable!(),
         }
     }
     let selected_indexes = selected_columns
@@ -571,7 +583,153 @@ fn execute_aggregate_select_result(
                 .collect();
             Ok(SelectResult { columns, rows })
         }
+        SelectProjection::Min { column } | SelectProjection::Max { column } => {
+            let aggregate_name = match &select.projection {
+                SelectProjection::Min { .. } => "min",
+                SelectProjection::Max { .. } => "max",
+                _ => unreachable!(),
+            };
+            if select.group_by.is_some() {
+                return Err(ErrorField {
+                    code: "0A000",
+                    message: "GROUP BY requires grouped MIN/MAX projection",
+                    position: None,
+                });
+            }
+            if let Some(order) = &select.order_by {
+                if !order.column.eq_ignore_ascii_case(aggregate_name) {
+                    return Err(ErrorField {
+                        code: "0A000",
+                        message: "MIN/MAX ORDER BY only supports the aggregate result",
+                        position: None,
+                    });
+                }
+            }
+            let value_idx = column_index(table, column)?;
+            let value = if matches!(select.projection, SelectProjection::Min { .. }) {
+                rows.iter()
+                    .map(|row| row[value_idx].clone())
+                    .min_by(compare_sql_values)
+            } else {
+                rows.iter()
+                    .map(|row| row[value_idx].clone())
+                    .max_by(compare_sql_values)
+            };
+            let mut aggregate_rows = vec![vec![value.as_ref().map(format_sql_value)]];
+            if let Some(offset) = select.offset {
+                aggregate_rows = aggregate_rows.into_iter().skip(offset).collect();
+            }
+            if let Some(limit) = select.limit {
+                aggregate_rows.truncate(limit);
+            }
+            Ok(SelectResult {
+                columns: vec![aggregate_result_column(table, value_idx, aggregate_name)],
+                rows: aggregate_rows,
+            })
+        }
+        SelectProjection::GroupedMin {
+            group_column,
+            min_column,
+        }
+        | SelectProjection::GroupedMax {
+            group_column,
+            max_column: min_column,
+        } => {
+            let aggregate_name = match &select.projection {
+                SelectProjection::GroupedMin { .. } => "min",
+                SelectProjection::GroupedMax { .. } => "max",
+                _ => unreachable!(),
+            };
+            let Some(group_by) = &select.group_by else {
+                return Err(ErrorField {
+                    code: "0A000",
+                    message: "grouped MIN/MAX requires GROUP BY",
+                    position: None,
+                });
+            };
+            if group_by != group_column {
+                return Err(ErrorField {
+                    code: "0A000",
+                    message: "GROUP BY column must match grouped MIN/MAX projection",
+                    position: None,
+                });
+            }
+            let group_idx = column_index(table, group_column)?;
+            let value_idx = column_index(table, min_column)?;
+            let mut extrema: BTreeMap<SqlValue, SqlValue> = BTreeMap::new();
+            let choose_min = matches!(select.projection, SelectProjection::GroupedMin { .. });
+            for row in rows {
+                extrema
+                    .entry(row[group_idx].clone())
+                    .and_modify(|current| {
+                        let ordering = compare_sql_values(&row[value_idx], current);
+                        if (choose_min && ordering.is_lt()) || (!choose_min && ordering.is_gt()) {
+                            *current = row[value_idx].clone();
+                        }
+                    })
+                    .or_insert_with(|| row[value_idx].clone());
+            }
+            let mut grouped = extrema.into_iter().collect::<Vec<_>>();
+            if let Some(order) = &select.order_by {
+                if order.column == *group_column {
+                    grouped.sort_by(|(left, _), (right, _)| compare_sql_values(left, right));
+                } else if order.column.eq_ignore_ascii_case(aggregate_name) {
+                    grouped.sort_by(|(left_value, left_extreme), (right_value, right_extreme)| {
+                        compare_sql_values(left_extreme, right_extreme)
+                            .then_with(|| compare_sql_values(left_value, right_value))
+                    });
+                } else {
+                    return Err(ErrorField {
+                        code: "0A000",
+                        message: "GROUP BY ORDER BY must reference grouped column or min/max",
+                        position: None,
+                    });
+                }
+                if order.descending {
+                    grouped.reverse();
+                }
+            }
+            if let Some(offset) = select.offset {
+                grouped = grouped.into_iter().skip(offset).collect();
+            }
+            if let Some(limit) = select.limit {
+                grouped.truncate(limit);
+            }
+            let columns = vec![
+                aggregate_result_column(table, group_idx, group_column),
+                aggregate_result_column(table, value_idx, aggregate_name),
+            ];
+            let rows = grouped
+                .into_iter()
+                .map(|(value, extreme)| {
+                    vec![
+                        Some(format_sql_value(&value)),
+                        Some(format_sql_value(&extreme)),
+                    ]
+                })
+                .collect();
+            Ok(SelectResult { columns, rows })
+        }
         SelectProjection::All | SelectProjection::Columns(_) => unreachable!(),
+    }
+}
+
+fn column_index(table: &Table, column: &str) -> Result<usize, ErrorField> {
+    table
+        .columns
+        .iter()
+        .position(|candidate| candidate.def.name == column)
+        .ok_or(ErrorField {
+            code: "42703",
+            message: "column does not exist",
+            position: None,
+        })
+}
+
+fn aggregate_result_column(table: &Table, idx: usize, name: &str) -> Column {
+    match table.columns[idx].def.ty {
+        gpu_db_protocol::SqlType::Int4 => int4_column(name),
+        gpu_db_protocol::SqlType::Text => text_column(name),
     }
 }
 
@@ -8611,13 +8769,71 @@ fn describe_query_columns(session: &Session, query: &str) -> Option<Vec<Column>>
                 ]
             })
         }
+        SelectProjection::Min { column } => {
+            let value_column = table
+                .columns
+                .iter()
+                .find(|candidate| candidate.def.name == column)?;
+            Some(vec![column_def_to_result_column_with_name(
+                value_column,
+                "min",
+            )])
+        }
+        SelectProjection::Max { column } => {
+            let value_column = table
+                .columns
+                .iter()
+                .find(|candidate| candidate.def.name == column)?;
+            Some(vec![column_def_to_result_column_with_name(
+                value_column,
+                "max",
+            )])
+        }
+        SelectProjection::GroupedMin {
+            group_column,
+            min_column,
+        } => {
+            let group_column = table
+                .columns
+                .iter()
+                .find(|candidate| candidate.def.name == group_column)?;
+            let value_column = table
+                .columns
+                .iter()
+                .find(|candidate| candidate.def.name == min_column)?;
+            Some(vec![
+                column_def_to_result_column(group_column),
+                column_def_to_result_column_with_name(value_column, "min"),
+            ])
+        }
+        SelectProjection::GroupedMax {
+            group_column,
+            max_column,
+        } => {
+            let group_column = table
+                .columns
+                .iter()
+                .find(|candidate| candidate.def.name == group_column)?;
+            let value_column = table
+                .columns
+                .iter()
+                .find(|candidate| candidate.def.name == max_column)?;
+            Some(vec![
+                column_def_to_result_column(group_column),
+                column_def_to_result_column_with_name(value_column, "max"),
+            ])
+        }
     }
 }
 
 fn column_def_to_result_column(column: &CatalogColumn) -> Column {
+    column_def_to_result_column_with_name(column, &column.def.name)
+}
+
+fn column_def_to_result_column_with_name(column: &CatalogColumn, name: &str) -> Column {
     match column.def.ty {
-        SqlType::Int4 => int4_column(&column.def.name),
-        SqlType::Text => text_column(&column.def.name),
+        SqlType::Int4 => int4_column(name),
+        SqlType::Text => text_column(name),
     }
 }
 
@@ -15767,6 +15983,41 @@ mod tests {
         let err = execute_select_result(&session, &select).unwrap_err();
         assert_eq!(err.code, "0A000");
         assert_eq!(err.message, "SUM only supports int4 columns");
+        let Command::Select(select) =
+            parse_command("select name, min(id) from people group by name order by min desc")
+                .unwrap()
+        else {
+            panic!("expected supported SELECT min aggregate parse");
+        };
+        let result = execute_select_result(&session, &select).unwrap();
+        assert_eq!(
+            result.columns,
+            vec![text_column("name"), int4_column("min")]
+        );
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![Some("Grace".to_string()), Some("3".to_string())],
+                vec![Some("Linus".to_string()), Some("2".to_string())],
+                vec![Some("Ada".to_string()), Some("1".to_string())],
+            ]
+        );
+        let Command::Select(select) =
+            parse_command("select max(name) from people where id <= 2").unwrap()
+        else {
+            panic!("expected supported SELECT max aggregate parse");
+        };
+        let result = execute_select_result(&session, &select).unwrap();
+        assert_eq!(result.columns, vec![text_column("max")]);
+        assert_eq!(result.rows, vec![vec![Some("Linus".to_string())]]);
+        let Command::Select(select) =
+            parse_command("select name, max(id) from people order by name").unwrap()
+        else {
+            panic!("expected supported SELECT grouped max aggregate parse");
+        };
+        let err = execute_select_result(&session, &select).unwrap_err();
+        assert_eq!(err.code, "0A000");
+        assert_eq!(err.message, "grouped MIN/MAX requires GROUP BY");
 
         assert_eq!(
             describe_parameterized_select_shape(
