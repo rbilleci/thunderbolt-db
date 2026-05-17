@@ -1,6 +1,6 @@
 # P7 GPU Residency Baseline
 
-- git_sha: de62944f724752b9998a8baf7d4487e3f2dc573d
+- git_sha: ceb9a69e49f081be88436189793f175e19edc8bc
 - stream: benchmark
 - dataset_rows: 1000
 - lookup_count: 16
@@ -16,7 +16,7 @@
 - current_data_residency_model: bounded_resident_snapshot_probe_with_retained_cuda_allocation_plus_per_query_h2d_fallback
 - warm_resident_snapshot_execution_supported: true
 - production_device_cache_supported: bounded_retained_snapshot_handle
-- resident_device_memory_query_kernel_supported: bounded_count_all_int4_equality_count_int4_range_count_int4_sum_avg_min_max_filtered_sum_avg_min_max_int4_projection_int4_ordered_projection_int4_grouped_count_sum_avg_min_max_and_filtered_grouped_count_sum_avg_min_max
+- resident_device_memory_query_kernel_supported: bounded_count_all_int4_equality_count_int4_range_count_int4_sum_avg_min_max_filtered_sum_avg_min_max_int4_projection_int4_distinct_projection_int4_ordered_projection_int4_grouped_count_sum_avg_min_max_and_filtered_grouped_count_sum_avg_min_max
 - resident_device_memory_proof_supported: true
 - resident_device_memory_allocated_bytes: 73135
 - resident_device_memory_copied_bytes: 73135
@@ -45,7 +45,7 @@
 - resident_refresh_invalidated_by_txn_id: 1004
 - resident_refresh_invalidated_at_index: 1004
 - resident_refresh_invalidated_by_memory_pressure: true
-- resident_refresh_elapsed_ms: 80.294
+- resident_refresh_elapsed_ms: 81.994
 - resident_budget_admission_supported: true
 - resident_budget_bytes: 52403
 - resident_budget_bytes_after_admission: 52403
@@ -60,7 +60,7 @@
 - correctness_oracle: CPU relational engine
 
 ### cold_per_query_h2d_probe
-- elapsed_us: 497326
+- elapsed_us: 491574
 - result_rows: 16
 - planned_target: Gpu(0)
 - executed_target: Gpu(0)
@@ -70,11 +70,11 @@
 - h2d_bytes: 1429
 - d2h_bytes: 973
 - kernel_exec_samples: 1
-- kernel_exec_total_ms: 459
+- kernel_exec_total_ms: 452
 - correctness_validated: true
 
 ### warm_resident_snapshot_probe
-- elapsed_us: 9813
+- elapsed_us: 9814
 - result_rows: 16
 - planned_target: Gpu(0)
 - executed_target: Gpu(0)
@@ -88,7 +88,7 @@
 - correctness_validated: true
 
 ### warm_resident_aggregate_distinct_probe
-- elapsed_us: 37764
+- elapsed_us: 38115
 - result_rows: 9
 - planned_target: Gpu(0)
 - executed_target: Gpu(0)
@@ -102,7 +102,7 @@
 - correctness_validated: true
 
 ### resident_device_memory_count_kernel_probe
-- elapsed_us: 402
+- elapsed_us: 389
 - result_rows: 1
 - planned_target: Gpu(0)
 - executed_target: Gpu(0)
@@ -116,7 +116,7 @@
 - correctness_validated: true
 
 ### resident_device_memory_filtered_count_kernel_probe
-- elapsed_us: 396
+- elapsed_us: 393
 - result_rows: 1
 - planned_target: Gpu(0)
 - executed_target: Gpu(0)
@@ -130,7 +130,7 @@
 - correctness_validated: true
 
 ### resident_device_memory_range_count_kernel_probe
-- elapsed_us: 2746
+- elapsed_us: 2776
 - result_rows: 1
 - planned_target: Gpu(0)
 - executed_target: Gpu(0)
@@ -144,7 +144,7 @@
 - correctness_validated: true
 
 ### resident_device_memory_sum_kernel_probe
-- elapsed_us: 382
+- elapsed_us: 378
 - result_rows: 1
 - planned_target: Gpu(0)
 - executed_target: Gpu(0)
@@ -158,7 +158,7 @@
 - correctness_validated: true
 
 ### resident_device_memory_avg_kernel_probe
-- elapsed_us: 27274
+- elapsed_us: 27487
 - result_rows: 1
 - planned_target: Gpu(0)
 - executed_target: Gpu(0)
@@ -172,7 +172,7 @@
 - correctness_validated: true
 
 ### resident_device_memory_min_kernel_probe
-- elapsed_us: 27282
+- elapsed_us: 27491
 - result_rows: 1
 - planned_target: Gpu(0)
 - executed_target: Gpu(0)
@@ -186,7 +186,7 @@
 - correctness_validated: true
 
 ### resident_device_memory_max_kernel_probe
-- elapsed_us: 27284
+- elapsed_us: 27484
 - result_rows: 1
 - planned_target: Gpu(0)
 - executed_target: Gpu(0)
@@ -200,7 +200,7 @@
 - correctness_validated: true
 
 ### resident_device_memory_filtered_sum_kernel_probe
-- elapsed_us: 2737
+- elapsed_us: 2830
 - result_rows: 1
 - planned_target: Gpu(0)
 - executed_target: Gpu(0)
@@ -214,7 +214,7 @@
 - correctness_validated: true
 
 ### resident_device_memory_filtered_avg_kernel_probe
-- elapsed_us: 2750
+- elapsed_us: 2810
 - result_rows: 1
 - planned_target: Gpu(0)
 - executed_target: Gpu(0)
@@ -228,7 +228,7 @@
 - correctness_validated: true
 
 ### resident_device_memory_filtered_min_kernel_probe
-- elapsed_us: 2786
+- elapsed_us: 2808
 - result_rows: 1
 - planned_target: Gpu(0)
 - executed_target: Gpu(0)
@@ -242,7 +242,7 @@
 - correctness_validated: true
 
 ### resident_device_memory_filtered_max_kernel_probe
-- elapsed_us: 2773
+- elapsed_us: 2794
 - result_rows: 1
 - planned_target: Gpu(0)
 - executed_target: Gpu(0)
@@ -256,7 +256,7 @@
 - correctness_validated: true
 
 ### resident_device_memory_projection_kernel_probe
-- elapsed_us: 2743
+- elapsed_us: 2801
 - result_rows: 201
 - planned_target: Gpu(0)
 - executed_target: Gpu(0)
@@ -269,8 +269,22 @@
 - kernel_exec_total_ms: 1
 - correctness_validated: true
 
+### resident_device_memory_distinct_projection_kernel_probe
+- elapsed_us: 3341
+- result_rows: 8
+- planned_target: Gpu(0)
+- executed_target: Gpu(0)
+- access_path: OrderedKeyBatch { table: "events", predicate_column: None, predicate_op: None, order_column: "bucket", descending: true, matched_keys: 1000 }
+- sql_fallback: false
+- fallback_reason: None
+- h2d_bytes: 0
+- d2h_bytes: 4008
+- kernel_exec_samples: 1
+- kernel_exec_total_ms: 1
+- correctness_validated: true
+
 ### resident_device_memory_ordered_projection_kernel_probe
-- elapsed_us: 61728
+- elapsed_us: 62629
 - result_rows: 8
 - planned_target: Gpu(0)
 - executed_target: Gpu(0)
@@ -284,7 +298,7 @@
 - correctness_validated: true
 
 ### resident_device_memory_grouped_sum_kernel_probe
-- elapsed_us: 870
+- elapsed_us: 861
 - result_rows: 8
 - planned_target: Gpu(0)
 - executed_target: Gpu(0)
@@ -298,7 +312,7 @@
 - correctness_validated: true
 
 ### resident_device_memory_grouped_count_kernel_probe
-- elapsed_us: 855
+- elapsed_us: 844
 - result_rows: 8
 - planned_target: Gpu(0)
 - executed_target: Gpu(0)
@@ -312,7 +326,7 @@
 - correctness_validated: true
 
 ### resident_device_memory_grouped_avg_kernel_probe
-- elapsed_us: 871
+- elapsed_us: 863
 - result_rows: 8
 - planned_target: Gpu(0)
 - executed_target: Gpu(0)
@@ -326,7 +340,7 @@
 - correctness_validated: true
 
 ### resident_device_memory_grouped_min_kernel_probe
-- elapsed_us: 858
+- elapsed_us: 848
 - result_rows: 8
 - planned_target: Gpu(0)
 - executed_target: Gpu(0)
@@ -340,7 +354,7 @@
 - correctness_validated: true
 
 ### resident_device_memory_grouped_max_kernel_probe
-- elapsed_us: 856
+- elapsed_us: 870
 - result_rows: 8
 - planned_target: Gpu(0)
 - executed_target: Gpu(0)
@@ -354,7 +368,7 @@
 - correctness_validated: true
 
 ### resident_device_memory_filtered_grouped_sum_kernel_probe
-- elapsed_us: 2934
+- elapsed_us: 2991
 - result_rows: 8
 - planned_target: Gpu(0)
 - executed_target: Gpu(0)
@@ -368,7 +382,7 @@
 - correctness_validated: true
 
 ### resident_device_memory_filtered_grouped_count_kernel_probe
-- elapsed_us: 2937
+- elapsed_us: 2991
 - result_rows: 8
 - planned_target: Gpu(0)
 - executed_target: Gpu(0)
@@ -382,7 +396,7 @@
 - correctness_validated: true
 
 ### resident_device_memory_filtered_grouped_avg_kernel_probe
-- elapsed_us: 2928
+- elapsed_us: 3030
 - result_rows: 8
 - planned_target: Gpu(0)
 - executed_target: Gpu(0)
@@ -396,7 +410,7 @@
 - correctness_validated: true
 
 ### resident_device_memory_filtered_grouped_min_kernel_probe
-- elapsed_us: 2895
+- elapsed_us: 3006
 - result_rows: 8
 - planned_target: Gpu(0)
 - executed_target: Gpu(0)
@@ -410,7 +424,7 @@
 - correctness_validated: true
 
 ### resident_device_memory_filtered_grouped_max_kernel_probe
-- elapsed_us: 2911
+- elapsed_us: 3003
 - result_rows: 8
 - planned_target: Gpu(0)
 - executed_target: Gpu(0)
@@ -424,7 +438,7 @@
 - correctness_validated: true
 
 ### post_mutation_per_query_h2d_probe
-- elapsed_us: 417914
+- elapsed_us: 414198
 - result_rows: 1
 - planned_target: Gpu(0)
 - executed_target: Gpu(0)
@@ -434,7 +448,7 @@
 - h2d_bytes: 111
 - d2h_bytes: 75
 - kernel_exec_samples: 1
-- kernel_exec_total_ms: 417
+- kernel_exec_total_ms: 413
 - correctness_validated: true
 
-decision: current P7 evidence includes bounded resident table-data snapshot SELECT probes with zero per-query H2D transfer for the app lookup workload and supported aggregate/distinct SQL shapes, retained-device-memory COUNT(*), int4 equality-predicate COUNT(*), int4 range-predicate COUNT(*), int4 scalar SUM/AVG/MIN/MAX, int4 filtered scalar SUM/AVG/MIN/MAX, int4 predicate-projection, bounded int4 ordered-projection, int4 grouped COUNT/SUM/AVG/MIN/MAX, and int4 filtered grouped COUNT/SUM/AVG/MIN/MAX proofs over the resident allocation, resident-byte accounting, WAL-safe invalidation, manual refresh-cost accounting, memory-pressure fallback metadata, deterministic resident-snapshot budget admission/eviction, and a retained real CUDA allocation/copy handle for encoded snapshot bytes when local driver hardware is available. Keep broad production CUDA cache claims out of scope until broader expression kernels read directly from retained device-memory handles.
+decision: current P7 evidence includes bounded resident table-data snapshot SELECT probes with zero per-query H2D transfer for the app lookup workload and supported aggregate/distinct SQL shapes, retained-device-memory COUNT(*), int4 equality-predicate COUNT(*), int4 range-predicate COUNT(*), int4 scalar SUM/AVG/MIN/MAX, int4 filtered scalar SUM/AVG/MIN/MAX, int4 predicate-projection, int4 distinct projection, bounded int4 ordered-projection, int4 grouped COUNT/SUM/AVG/MIN/MAX, and int4 filtered grouped COUNT/SUM/AVG/MIN/MAX proofs over the resident allocation, resident-byte accounting, WAL-safe invalidation, manual refresh-cost accounting, memory-pressure fallback metadata, deterministic resident-snapshot budget admission/eviction, and a retained real CUDA allocation/copy handle for encoded snapshot bytes when local driver hardware is available. Keep broad production CUDA cache claims out of scope until broader expression kernels read directly from retained device-memory handles.
