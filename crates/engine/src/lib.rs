@@ -6,9 +6,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpu_db_batching::{BatchItem, DualTriggerBatcher, FlushReason};
 use gpu_db_execution::{
-    CudaDeviceMemoryProof, CudaDriverRuntime, CudaMvccRowBatch, CudaResidentDeviceMemory,
-    DeviceRouter, DeviceTarget, FilterOperator, LimitOperator, MockGpuRuntime, Operator, PlannedOp,
-    ProjectOperator, RouteDecision, ScanOperator, SortOperator,
+    CudaDeviceMemoryProof, CudaDriverRuntime, CudaI32Comparison, CudaMvccRowBatch,
+    CudaResidentDeviceMemory, DeviceRouter, DeviceTarget, FilterOperator, LimitOperator,
+    MockGpuRuntime, Operator, PlannedOp, ProjectOperator, RouteDecision, ScanOperator,
+    SortOperator,
 };
 use gpu_db_metrics::{BatchFlushReason, FallbackReason, RuntimeMetrics, RuntimeMetricsSnapshot};
 use gpu_db_observability::{
@@ -6047,6 +6048,16 @@ fn resident_device_int4_column_offset(
     Ok(offset)
 }
 
+fn resident_device_i32_comparison(op: SelectFilterOp) -> Option<CudaI32Comparison> {
+    match op {
+        SelectFilterOp::Lt => Some(CudaI32Comparison::Lt),
+        SelectFilterOp::Lte => Some(CudaI32Comparison::Lte),
+        SelectFilterOp::Gt => Some(CudaI32Comparison::Gt),
+        SelectFilterOp::Gte => Some(CudaI32Comparison::Gte),
+        SelectFilterOp::Eq | SelectFilterOp::LikePrefix => None,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelationalResidencyRefreshCost {
     pub previous_row_count: usize,
@@ -8070,6 +8081,101 @@ impl Engine {
         let count = i32::try_from(filtered_count).map_err(|_| {
             ExecuteError::Engine(EngineError::ApplyFailed(format!(
                 "resident device-memory filtered count {filtered_count} exceeds supported COUNT(*) result range"
+            )))
+        })?;
+
+        Ok(RelationalSelectResult {
+            columns: bound.selected_columns,
+            rows: vec![vec![SqlValue::Int4(count)]],
+            planned_target: DeviceTarget::Gpu(snapshot.gpu_id),
+            executed_target: DeviceTarget::Gpu(snapshot.gpu_id),
+            fallback_reason: None,
+            access_path,
+        })
+    }
+
+    pub fn execute_relational_range_count_with_resident_device_memory_probe(
+        &mut self,
+        select: &Select,
+    ) -> Result<RelationalSelectResult, ExecuteError> {
+        let (table, bound) = self.bind_relational_select_for_execution(select)?;
+        if select.distinct
+            || !matches!(select.projection, SelectProjection::CountAll)
+            || select.group_by.is_some()
+            || !select.having_groups.is_empty()
+            || select.order_by.is_some()
+            || select.limit.is_some()
+            || select.offset.is_some()
+            || bound.filter_groups.len() != 1
+            || bound.filter_groups[0].len() != 1
+        {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory range count proof currently supports only SELECT COUNT(*) with one int4 range predicate"
+                    .to_string(),
+            )));
+        }
+        let (filter_idx, op, value) = bound.filter_groups[0][0].clone();
+        let Some(comparison) = resident_device_i32_comparison(op) else {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory range count proof currently supports only int4 non-equality predicates"
+                    .to_string(),
+            )));
+        };
+        let SqlValue::Int4(needle) = value else {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory range count proof currently supports only int4 non-equality predicates"
+                    .to_string(),
+            )));
+        };
+        if table.columns[filter_idx].ty != SqlType::Int4 {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory range count proof currently supports only int4 non-equality predicates"
+                    .to_string(),
+            )));
+        }
+
+        let (_query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
+        let snapshot = self
+            .relational_residency_snapshot(&table.name)
+            .ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "relation \"{}\" has no resident snapshot",
+                    table.name
+                )))
+            })?;
+        if snapshot.schema != table.schema || snapshot.table != table.name {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident snapshot no longer matches catalog table identity".to_string(),
+            )));
+        }
+        if !snapshot.is_valid() {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "relation \"{}\" resident snapshot is invalid",
+                table.name
+            ))));
+        }
+        let device_memory = self
+            .relational_residency_device_memory
+            .get(&table.name)
+            .ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "relation \"{}\" has no retained resident device memory",
+                    table.name
+                )))
+            })?;
+        let byte_offset = resident_device_int4_column_offset(&snapshot, &table, filter_idx)?;
+        let row_count = u64::try_from(snapshot.row_count).map_err(|_| {
+            ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident snapshot row count exceeds retained device-memory proof range"
+                    .to_string(),
+            ))
+        })?;
+        let filtered_count = device_memory
+            .count_i32_compare_from_payload(byte_offset, row_count, needle, comparison)
+            .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
+        let count = i32::try_from(filtered_count).map_err(|_| {
+            ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "resident device-memory range count {filtered_count} exceeds supported COUNT(*) result range"
             )))
         })?;
 
@@ -11892,6 +11998,17 @@ mod tests {
         };
         let err = e
             .execute_relational_filtered_count_with_resident_device_memory_probe(&filtered_select)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("has no retained resident device memory"));
+
+        let Command::Select(range_select) =
+            parse_command("SELECT COUNT(*) FROM events WHERE id >= 1").unwrap()
+        else {
+            unreachable!()
+        };
+        let err = e
+            .execute_relational_range_count_with_resident_device_memory_probe(&range_select)
             .unwrap_err()
             .to_string();
         assert!(err.contains("has no retained resident device memory"));

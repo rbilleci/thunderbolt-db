@@ -122,6 +122,35 @@ impl CudaResidentDeviceMemory {
     ) -> Result<u64, CudaRuntimeProbeError> {
         launch_cuda_resident_i32_equal_count(self, byte_offset, row_count, needle)
     }
+
+    pub fn count_i32_compare_from_payload(
+        &self,
+        byte_offset: u64,
+        row_count: u64,
+        needle: i32,
+        comparison: CudaI32Comparison,
+    ) -> Result<u64, CudaRuntimeProbeError> {
+        launch_cuda_resident_i32_compare_count(self, byte_offset, row_count, needle, comparison)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CudaI32Comparison {
+    Lt,
+    Lte,
+    Gt,
+    Gte,
+}
+
+impl CudaI32Comparison {
+    fn code(self) -> u32 {
+        match self {
+            Self::Lt => 1,
+            Self::Lte => 2,
+            Self::Gt => 3,
+            Self::Gte => 4,
+        }
+    }
 }
 
 impl Drop for CudaResidentDeviceMemory {
@@ -920,6 +949,249 @@ done:
         (&mut offset_arg as *mut u64).cast::<c_void>(),
         (&mut rows_arg as *mut u64).cast::<c_void>(),
         (&mut needle_arg as *mut i32).cast::<c_void>(),
+        (&mut output_arg as *mut u64).cast::<c_void>(),
+    ];
+    check_cuda(unsafe {
+        cu_launch_kernel(
+            function,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            0,
+            std::ptr::null_mut(),
+            args.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    })?;
+    check_cuda(unsafe { cu_ctx_synchronize() })?;
+
+    let mut output = 0_u64;
+    check_cuda(unsafe {
+        cu_memcpy_dtoh(
+            (&mut output as *mut u64).cast::<c_void>(),
+            allocation_guard.ptr,
+            std::mem::size_of::<u64>(),
+        )
+    })?;
+    drop(module_guard);
+    drop(allocation_guard);
+    Ok(output)
+}
+
+fn launch_cuda_resident_i32_compare_count(
+    resident: &CudaResidentDeviceMemory,
+    byte_offset: u64,
+    row_count: u64,
+    needle: i32,
+    comparison: CudaI32Comparison,
+) -> Result<u64, CudaRuntimeProbeError> {
+    type CuMemAlloc = unsafe extern "C" fn(*mut u64, usize) -> i32;
+    type CuMemFree = unsafe extern "C" fn(u64) -> i32;
+    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+    type CuModuleLoadData = unsafe extern "C" fn(*mut *mut c_void, *const c_void) -> i32;
+    type CuModuleUnload = unsafe extern "C" fn(*mut c_void) -> i32;
+    type CuModuleGetFunction =
+        unsafe extern "C" fn(*mut *mut c_void, *mut c_void, *const i8) -> i32;
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+    type CuCtxSynchronize = unsafe extern "C" fn() -> i32;
+
+    const PTX: &[u8] = br#"
+.version 6.0
+.target sm_30
+.address_size 64
+
+.visible .entry gpu_db_resident_i32_compare_count(
+    .param .u64 resident_ptr,
+    .param .u64 byte_offset,
+    .param .u64 row_count,
+    .param .s32 needle,
+    .param .u32 comparison,
+    .param .u64 out_ptr
+)
+{
+    .reg .pred %p_done;
+    .reg .pred %p_lt;
+    .reg .pred %p_lte;
+    .reg .pred %p_gt;
+    .reg .pred %p_gte;
+    .reg .pred %p_code_lt;
+    .reg .pred %p_code_lte;
+    .reg .pred %p_code_gt;
+    .reg .pred %p_code_gte;
+    .reg .pred %p_match;
+    .reg .u64 %resident;
+    .reg .u64 %offset;
+    .reg .u64 %rows;
+    .reg .u64 %out;
+    .reg .u64 %base;
+    .reg .u64 %idx;
+    .reg .u64 %addr;
+    .reg .u64 %matches;
+    .reg .u32 %comparison;
+    .reg .s32 %needle;
+    .reg .s32 %value;
+
+    ld.param.u64 %resident, [resident_ptr];
+    ld.param.u64 %offset, [byte_offset];
+    ld.param.u64 %rows, [row_count];
+    ld.param.s32 %needle, [needle];
+    ld.param.u32 %comparison, [comparison];
+    ld.param.u64 %out, [out_ptr];
+
+    add.u64 %base, %resident, %offset;
+    mov.u64 %idx, 0;
+    mov.u64 %matches, 0;
+
+loop:
+    setp.ge.u64 %p_done, %idx, %rows;
+    @%p_done bra done;
+    mul.lo.u64 %addr, %idx, 4;
+    add.u64 %addr, %base, %addr;
+    ld.global.s32 %value, [%addr];
+    setp.lt.s32 %p_lt, %value, %needle;
+    setp.le.s32 %p_lte, %value, %needle;
+    setp.gt.s32 %p_gt, %value, %needle;
+    setp.ge.s32 %p_gte, %value, %needle;
+    setp.eq.u32 %p_code_lt, %comparison, 1;
+    setp.eq.u32 %p_code_lte, %comparison, 2;
+    setp.eq.u32 %p_code_gt, %comparison, 3;
+    setp.eq.u32 %p_code_gte, %comparison, 4;
+    mov.pred %p_match, 0;
+    and.pred %p_lt, %p_lt, %p_code_lt;
+    or.pred %p_match, %p_match, %p_lt;
+    and.pred %p_lte, %p_lte, %p_code_lte;
+    or.pred %p_match, %p_match, %p_lte;
+    and.pred %p_gt, %p_gt, %p_code_gt;
+    or.pred %p_match, %p_match, %p_gt;
+    and.pred %p_gte, %p_gte, %p_code_gte;
+    or.pred %p_match, %p_match, %p_gte;
+    @!%p_match bra next;
+    add.u64 %matches, %matches, 1;
+
+next:
+    add.u64 %idx, %idx, 1;
+    bra loop;
+
+done:
+    st.global.u64 [%out], %matches;
+    ret;
+}
+"#;
+
+    let bytes = row_count
+        .checked_mul(std::mem::size_of::<i32>() as u64)
+        .and_then(|bytes| byte_offset.checked_add(bytes))
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    if bytes > resident.metadata.allocated_bytes {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(bytes as usize));
+    }
+
+    let cu_mem_alloc = unsafe {
+        resident
+            ._lib
+            .get::<CuMemAlloc>(b"cuMemAlloc_v2\0")
+            .or_else(|_| resident._lib.get::<CuMemAlloc>(b"cuMemAlloc\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_mem_free = unsafe {
+        resident
+            ._lib
+            .get::<CuMemFree>(b"cuMemFree_v2\0")
+            .or_else(|_| resident._lib.get::<CuMemFree>(b"cuMemFree\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_memcpy_dtoh = unsafe {
+        resident
+            ._lib
+            .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+            .or_else(|_| resident._lib.get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_module_load_data = unsafe {
+        resident
+            ._lib
+            .get::<CuModuleLoadData>(b"cuModuleLoadData\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_module_unload = unsafe {
+        resident
+            ._lib
+            .get::<CuModuleUnload>(b"cuModuleUnload\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_module_get_function = unsafe {
+        resident
+            ._lib
+            .get::<CuModuleGetFunction>(b"cuModuleGetFunction\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_launch_kernel = unsafe {
+        resident
+            ._lib
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_ctx_synchronize = unsafe {
+        resident
+            ._lib
+            .get::<CuCtxSynchronize>(b"cuCtxSynchronize\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+
+    let mut device_output = 0_u64;
+    check_cuda(unsafe { cu_mem_alloc(&mut device_output, std::mem::size_of::<u64>()) })?;
+    let allocation_guard = CudaDeviceAllocationGuard {
+        ptr: device_output,
+        free: *cu_mem_free,
+    };
+
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+
+    let mut module = std::ptr::null_mut();
+    check_cuda(unsafe { cu_module_load_data(&mut module, ptx.as_ptr().cast::<c_void>()) })?;
+    let module_guard = CudaModuleGuard {
+        module,
+        unload: *cu_module_unload,
+    };
+
+    let mut function = std::ptr::null_mut();
+    check_cuda(unsafe {
+        cu_module_get_function(
+            &mut function,
+            module,
+            c"gpu_db_resident_i32_compare_count".as_ptr(),
+        )
+    })?;
+
+    let mut resident_arg = resident.device_ptr;
+    let mut offset_arg = byte_offset;
+    let mut rows_arg = row_count;
+    let mut needle_arg = needle;
+    let mut comparison_arg = comparison.code();
+    let mut output_arg = allocation_guard.ptr;
+    let mut args = [
+        (&mut resident_arg as *mut u64).cast::<c_void>(),
+        (&mut offset_arg as *mut u64).cast::<c_void>(),
+        (&mut rows_arg as *mut u64).cast::<c_void>(),
+        (&mut needle_arg as *mut i32).cast::<c_void>(),
+        (&mut comparison_arg as *mut u32).cast::<c_void>(),
         (&mut output_arg as *mut u64).cast::<c_void>(),
     ];
     check_cuda(unsafe {
