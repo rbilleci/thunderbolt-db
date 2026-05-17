@@ -6079,6 +6079,7 @@ fn relational_index_value(value: &SqlValue) -> String {
     match value {
         SqlValue::Int4(value) => format!("i:{value}"),
         SqlValue::Int8(value) => format!("n:{value}"),
+        SqlValue::Numeric(value) => format!("d:{value}"),
         SqlValue::Text(value) => format!("t:{value}"),
     }
 }
@@ -6089,6 +6090,7 @@ fn encode_relational_row(values: &[SqlValue]) -> String {
         .map(|value| match value {
             SqlValue::Int4(value) => format!("i:{value}"),
             SqlValue::Int8(value) => format!("n:{value}"),
+            SqlValue::Numeric(value) => format!("d:{value}"),
             SqlValue::Text(value) => {
                 format!("t:{}", value.replace('\\', "\\\\").replace('|', "\\|"))
             }
@@ -6164,10 +6166,56 @@ fn compare_sql_values(left: &SqlValue, right: &SqlValue) -> Ordering {
         (SqlValue::Int8(left), SqlValue::Int8(right)) => left.cmp(right),
         (SqlValue::Int4(left), SqlValue::Int8(right)) => i64::from(*left).cmp(right),
         (SqlValue::Int8(left), SqlValue::Int4(right)) => left.cmp(&i64::from(*right)),
+        (SqlValue::Numeric(left), SqlValue::Numeric(right)) => compare_numeric_strings(left, right),
         (SqlValue::Text(left), SqlValue::Text(right)) => left.cmp(right),
-        (SqlValue::Int4(_) | SqlValue::Int8(_), SqlValue::Text(_)) => Ordering::Less,
-        (SqlValue::Text(_), SqlValue::Int4(_) | SqlValue::Int8(_)) => Ordering::Greater,
+        (SqlValue::Int4(_) | SqlValue::Int8(_), SqlValue::Numeric(_) | SqlValue::Text(_)) => {
+            Ordering::Less
+        }
+        (SqlValue::Numeric(_), SqlValue::Int4(_) | SqlValue::Int8(_)) => Ordering::Greater,
+        (SqlValue::Numeric(_), SqlValue::Text(_)) => Ordering::Less,
+        (SqlValue::Text(_), SqlValue::Int4(_) | SqlValue::Int8(_) | SqlValue::Numeric(_)) => {
+            Ordering::Greater
+        }
     }
+}
+
+fn compare_numeric_strings(left: &str, right: &str) -> Ordering {
+    let (left_negative, left_abs) = left
+        .strip_prefix('-')
+        .map_or((false, left), |value| (true, value));
+    let (right_negative, right_abs) = right
+        .strip_prefix('-')
+        .map_or((false, right), |value| (true, value));
+    match (left_negative, right_negative) {
+        (true, false) => return Ordering::Less,
+        (false, true) => return Ordering::Greater,
+        _ => {}
+    }
+    let magnitude = compare_unsigned_numeric_strings(left_abs, right_abs);
+    if left_negative {
+        magnitude.reverse()
+    } else {
+        magnitude
+    }
+}
+
+fn compare_unsigned_numeric_strings(left: &str, right: &str) -> Ordering {
+    let (left_whole, left_frac) = left.split_once('.').unwrap_or((left, ""));
+    let (right_whole, right_frac) = right.split_once('.').unwrap_or((right, ""));
+    let left_whole = left_whole.trim_start_matches('0');
+    let right_whole = right_whole.trim_start_matches('0');
+    left_whole
+        .len()
+        .cmp(&right_whole.len())
+        .then_with(|| left_whole.cmp(right_whole))
+        .then_with(|| {
+            let width = left_frac.len().max(right_frac.len());
+            let mut left_padded = left_frac.to_string();
+            let mut right_padded = right_frac.to_string();
+            left_padded.extend(std::iter::repeat_n('0', width - left_padded.len()));
+            right_padded.extend(std::iter::repeat_n('0', width - right_padded.len()));
+            left_padded.cmp(&right_padded)
+        })
 }
 
 fn select_filter_matches(left: &SqlValue, op: SelectFilterOp, right: &SqlValue) -> bool {
@@ -6225,6 +6273,10 @@ fn bind_relational_select(
         SelectProjection::GroupedSum { group_column, .. } => {
             vec![relational_column_index(table, group_column)?]
         }
+        SelectProjection::Avg { .. } => Vec::new(),
+        SelectProjection::GroupedAvg { group_column, .. } => {
+            vec![relational_column_index(table, group_column)?]
+        }
         SelectProjection::Min { .. } | SelectProjection::Max { .. } => Vec::new(),
         SelectProjection::GroupedMin { group_column, .. }
         | SelectProjection::GroupedMax { group_column, .. } => {
@@ -6241,6 +6293,8 @@ fn bind_relational_select(
             | SelectProjection::GroupedCount { .. }
             | SelectProjection::Sum { .. }
             | SelectProjection::GroupedSum { .. }
+            | SelectProjection::Avg { .. }
+            | SelectProjection::GroupedAvg { .. }
             | SelectProjection::Min { .. }
             | SelectProjection::GroupedMin { .. }
             | SelectProjection::Max { .. }
@@ -6249,15 +6303,22 @@ fn bind_relational_select(
         let aggregate_name = match &select.projection {
             SelectProjection::CountAll | SelectProjection::GroupedCount { .. } => "count",
             SelectProjection::Sum { .. } | SelectProjection::GroupedSum { .. } => "sum",
+            SelectProjection::Avg { .. } | SelectProjection::GroupedAvg { .. } => "avg",
             SelectProjection::Min { .. } | SelectProjection::GroupedMin { .. } => "min",
             SelectProjection::Max { .. } | SelectProjection::GroupedMax { .. } => "max",
             SelectProjection::All | SelectProjection::Columns(_) => unreachable!(),
         };
-        let (aggregate_ty, aggregate_type_oid, aggregate_type_size) =
+        let (aggregate_ty, aggregate_type_oid, aggregate_type_size) = if matches!(
+            select.projection,
+            SelectProjection::Avg { .. } | SelectProjection::GroupedAvg { .. }
+        ) {
+            (SqlType::Int4, 1700, -1)
+        } else {
             match aggregate_source_column(table, select)? {
                 Some(column) => (column.ty, column.type_oid, column.type_size),
                 None => (SqlType::Int4, 20, 8),
-            };
+            }
+        };
         let aggregate_attnum = selected_columns.len() as i16 + 1;
         selected_columns.push(RelationalColumn {
             id: 0,
@@ -6328,6 +6389,8 @@ fn bind_relational_select(
             | SelectProjection::GroupedCount { .. }
             | SelectProjection::Sum { .. }
             | SelectProjection::GroupedSum { .. }
+            | SelectProjection::Avg { .. }
+            | SelectProjection::GroupedAvg { .. }
             | SelectProjection::Min { .. }
             | SelectProjection::GroupedMin { .. }
             | SelectProjection::Max { .. }
@@ -6406,6 +6469,48 @@ fn bind_relational_select(
         (SelectProjection::GroupedSum { .. }, None) => {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                 "grouped SUM requires GROUP BY".to_string(),
+            )));
+        }
+        (SelectProjection::Avg { column }, None) => {
+            validate_avg_column(table, column)?;
+            if let Some(order) = &select.order_by {
+                if !order.column.eq_ignore_ascii_case("avg") {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        "AVG ORDER BY only supports avg".to_string(),
+                    )));
+                }
+            }
+        }
+        (SelectProjection::Avg { .. }, Some(_)) => {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "GROUP BY requires grouped AVG projection".to_string(),
+            )));
+        }
+        (
+            SelectProjection::GroupedAvg {
+                group_column,
+                avg_column,
+            },
+            Some(idx),
+        ) => {
+            let projected_idx = relational_column_index(table, group_column)?;
+            if projected_idx != idx {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "GROUP BY column must match grouped AVG projection".to_string(),
+                )));
+            }
+            validate_avg_column(table, avg_column)?;
+            if let Some(order) = &select.order_by {
+                if order.column != *group_column && !order.column.eq_ignore_ascii_case("avg") {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        "GROUP BY ORDER BY must reference grouped column or avg".to_string(),
+                    )));
+                }
+            }
+        }
+        (SelectProjection::GroupedAvg { .. }, None) => {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "grouped AVG requires GROUP BY".to_string(),
             )));
         }
         (SelectProjection::Min { column } | SelectProjection::Max { column }, None) => {
@@ -6535,6 +6640,8 @@ fn select_is_aggregate(select: &Select) -> bool {
             | SelectProjection::GroupedCount { .. }
             | SelectProjection::Sum { .. }
             | SelectProjection::GroupedSum { .. }
+            | SelectProjection::Avg { .. }
+            | SelectProjection::GroupedAvg { .. }
             | SelectProjection::Min { .. }
             | SelectProjection::GroupedMin { .. }
             | SelectProjection::Max { .. }
@@ -6549,6 +6656,9 @@ fn select_is_aggregate_result_column(select: &Select, column: &str) -> bool {
         }
         SelectProjection::Sum { .. } | SelectProjection::GroupedSum { .. } => {
             column.eq_ignore_ascii_case("sum")
+        }
+        SelectProjection::Avg { .. } | SelectProjection::GroupedAvg { .. } => {
+            column.eq_ignore_ascii_case("avg")
         }
         SelectProjection::Min { .. } | SelectProjection::GroupedMin { .. } => {
             column.eq_ignore_ascii_case("min")
@@ -6572,6 +6682,8 @@ fn aggregate_source_column<'a>(
         | SelectProjection::GroupedCount { .. }
         | SelectProjection::Sum { .. }
         | SelectProjection::GroupedSum { .. }
+        | SelectProjection::Avg { .. }
+        | SelectProjection::GroupedAvg { .. }
         | SelectProjection::All
         | SelectProjection::Columns(_) => None,
     };
@@ -6608,13 +6720,63 @@ fn validate_grouped_extreme(
 }
 
 fn validate_sum_column(table: &RelationalTable, column: &str) -> Result<usize, ExecuteError> {
+    validate_int4_aggregate_column(table, column, "SUM")
+}
+
+fn validate_avg_column(table: &RelationalTable, column: &str) -> Result<usize, ExecuteError> {
+    validate_int4_aggregate_column(table, column, "AVG")
+}
+
+fn validate_int4_aggregate_column(
+    table: &RelationalTable,
+    column: &str,
+    aggregate: &'static str,
+) -> Result<usize, ExecuteError> {
     let idx = relational_column_index(table, column)?;
     if !matches!(table.columns[idx].ty, SqlType::Int4) {
         return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-            "SUM only supports int4 columns".to_string(),
+            aggregate_int4_error_message(aggregate).to_string(),
         )));
     }
     Ok(idx)
+}
+
+fn aggregate_int4_error_message(aggregate: &str) -> &'static str {
+    match aggregate {
+        "AVG" => "AVG only supports int4 columns",
+        _ => "SUM only supports int4 columns",
+    }
+}
+
+fn int4_aggregate_value(value: &SqlValue, aggregate: &'static str) -> Result<i32, ExecuteError> {
+    match value {
+        SqlValue::Int4(value) => Ok(*value),
+        SqlValue::Int8(_) | SqlValue::Numeric(_) | SqlValue::Text(_) => Err(ExecuteError::Engine(
+            EngineError::ApplyFailed(aggregate_int4_error_message(aggregate).to_string()),
+        )),
+    }
+}
+
+fn average_sql_value(sum: i128, count: usize) -> SqlValue {
+    if count == 0 {
+        return SqlValue::Numeric(String::new());
+    }
+    let count = count as i128;
+    let negative = sum.is_negative();
+    let abs_sum = sum.abs();
+    let whole = abs_sum / count;
+    let mut remainder = abs_sum % count;
+    let mut fractional = String::with_capacity(16);
+    for _ in 0..16 {
+        remainder *= 10;
+        fractional.push(char::from(b'0' + u8::try_from(remainder / count).unwrap()));
+        remainder %= count;
+    }
+    SqlValue::Numeric(format!(
+        "{}{}.{fractional}",
+        if negative { "-" } else { "" },
+        whole
+    ))
 }
 
 fn current_timestamp_micros() -> u64 {
@@ -7828,14 +7990,7 @@ impl Engine {
                     let sum_idx = validate_sum_column(&table, column)?;
                     let sum = rows
                         .iter()
-                        .map(|row| match &row[sum_idx] {
-                            SqlValue::Int4(value) => Ok(i64::from(*value)),
-                            SqlValue::Int8(_) | SqlValue::Text(_) => {
-                                Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                                    "SUM only supports int4 columns".to_string(),
-                                )))
-                            }
-                        })
+                        .map(|row| int4_aggregate_value(&row[sum_idx], "SUM").map(i64::from))
                         .collect::<Result<Vec<_>, _>>()?
                         .into_iter()
                         .sum::<i64>();
@@ -7848,18 +8003,38 @@ impl Engine {
                     let sum_idx = validate_sum_column(&table, sum_column)?;
                     let mut sums: BTreeMap<SqlValue, i64> = BTreeMap::new();
                     for row in rows {
-                        let value = match &row[sum_idx] {
-                            SqlValue::Int4(value) => i64::from(*value),
-                            SqlValue::Int8(_) | SqlValue::Text(_) => {
-                                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                                    "SUM only supports int4 columns".to_string(),
-                                )));
-                            }
-                        };
+                        let value = i64::from(int4_aggregate_value(&row[sum_idx], "SUM")?);
                         *sums.entry(row[group_idx].clone()).or_default() += value;
                     }
                     sums.into_iter()
                         .map(|(value, sum)| vec![value, SqlValue::Int8(sum)])
+                        .collect::<Vec<_>>()
+                }
+                SelectProjection::Avg { column } => {
+                    let avg_idx = validate_avg_column(&table, column)?;
+                    let mut sum = 0_i128;
+                    let mut count = 0_usize;
+                    for row in &rows {
+                        sum += i128::from(int4_aggregate_value(&row[avg_idx], "AVG")?);
+                        count += 1;
+                    }
+                    vec![vec![average_sql_value(sum, count)]]
+                }
+                SelectProjection::GroupedAvg { avg_column, .. } => {
+                    let group_idx = bound
+                        .group_by_index
+                        .expect("grouped AVG validation requires GROUP BY");
+                    let avg_idx = validate_avg_column(&table, avg_column)?;
+                    let mut averages: BTreeMap<SqlValue, (i128, usize)> = BTreeMap::new();
+                    for row in rows {
+                        let value = int4_aggregate_value(&row[avg_idx], "AVG")?;
+                        let entry = averages.entry(row[group_idx].clone()).or_default();
+                        entry.0 += i128::from(value);
+                        entry.1 += 1;
+                    }
+                    averages
+                        .into_iter()
+                        .map(|(value, (sum, count))| vec![value, average_sql_value(sum, count)])
                         .collect::<Vec<_>>()
                 }
                 SelectProjection::Min { column } | SelectProjection::Max { column } => {
@@ -23991,6 +24166,44 @@ mod tests {
         assert_eq!(sum_result.planned_target, DeviceTarget::Gpu(0));
         assert_eq!(sum_result.executed_target, DeviceTarget::Gpu(0));
         assert_eq!(sum_result.fallback_reason, None);
+
+        let Command::Select(avg_select) = parse_command(
+            "SELECT name, AVG(id) FROM people WHERE id >= 2 GROUP BY name ORDER BY avg DESC LIMIT 1",
+        )
+        .unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let avg_result = e
+            .execute_relational_select_with_backend(&avg_select, &FirstCudaSliceParityBackend)
+            .unwrap();
+        assert_eq!(
+            avg_result.rows,
+            vec![vec![
+                SqlValue::Text("Linus".to_string()),
+                SqlValue::Numeric("4.0000000000000000".to_string())
+            ]]
+        );
+        assert_eq!(avg_result.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(avg_result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(avg_result.fallback_reason, None);
+
+        let Command::Select(avg_scalar_select) =
+            parse_command("SELECT AVG(id) FROM people WHERE name = 'Grace'").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let avg_scalar_result = e
+            .execute_relational_select_with_backend(
+                &avg_scalar_select,
+                &FirstCudaSliceParityBackend,
+            )
+            .unwrap();
+        assert_eq!(
+            avg_scalar_result.rows,
+            vec![vec![SqlValue::Numeric("2.5000000000000000".to_string())]]
+        );
+        assert_eq!(avg_scalar_result.fallback_reason, None);
 
         let Command::Select(min_select) = parse_command(
             "SELECT name, MIN(id) FROM people WHERE id >= 2 GROUP BY name ORDER BY min DESC LIMIT 1",

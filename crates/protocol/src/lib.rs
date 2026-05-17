@@ -68,6 +68,7 @@ pub struct Insert {
 pub enum SqlValue {
     Int4(i32),
     Int8(i64),
+    Numeric(String),
     Text(String),
 }
 
@@ -99,6 +100,13 @@ pub enum SelectProjection {
     GroupedSum {
         group_column: String,
         sum_column: String,
+    },
+    Avg {
+        column: String,
+    },
+    GroupedAvg {
+        group_column: String,
+        avg_column: String,
     },
     Min {
         column: String,
@@ -164,7 +172,7 @@ pub enum ParseError {
     InvalidDel,
     #[error("invalid GET syntax; expected: GET key")]
     InvalidGet,
-    #[error("invalid relational SQL syntax; supported subset: CREATE TABLE name (...), INSERT INTO name (...) VALUES (...), SELECT [DISTINCT] columns|COUNT(*)|SUM(int4_column)|MIN(column)|MAX(column)|column, COUNT(*)|column, SUM(int4_column)|column, MIN(column)|column, MAX(column) FROM name [WHERE column (=|<|<=|>|>=) literal | column BETWEEN literal AND literal | column IN (literal, ...) | text_column LIKE 'prefix%' [AND ...] [OR ...]] [GROUP BY column] [ORDER BY selected_column|count|sum|min|max [ASC|DESC]] [LIMIT n] [OFFSET n]")]
+    #[error("invalid relational SQL syntax; supported subset: CREATE TABLE name (...), INSERT INTO name (...) VALUES (...), SELECT [DISTINCT] columns|COUNT(*)|SUM(int4_column)|AVG(int4_column)|MIN(column)|MAX(column)|column, COUNT(*)|column, SUM(int4_column)|column, AVG(int4_column)|column, MIN(column)|column, MAX(column) FROM name [WHERE column (=|<|<=|>|>=) literal | column BETWEEN literal AND literal | column IN (literal, ...) | text_column LIKE 'prefix%' [AND ...] [OR ...]] [GROUP BY column] [ORDER BY selected_column|count|sum|avg|min|max [ASC|DESC]] [LIMIT n] [OFFSET n]")]
     InvalidRelationalSql,
     #[error("LIMIT must not be negative")]
     NegativeLimit,
@@ -1646,6 +1654,12 @@ fn parse_select(input: &str) -> Result<Select, ParseError> {
                 | SelectProjection::GroupedCount { .. }
                 | SelectProjection::Sum { .. }
                 | SelectProjection::GroupedSum { .. }
+                | SelectProjection::Avg { .. }
+                | SelectProjection::GroupedAvg { .. }
+                | SelectProjection::Min { .. }
+                | SelectProjection::GroupedMin { .. }
+                | SelectProjection::Max { .. }
+                | SelectProjection::GroupedMax { .. }
         )
     {
         return Err(ParseError::InvalidRelationalSql);
@@ -1723,6 +1737,9 @@ fn parse_projection(input: &str) -> Result<SelectProjection, ParseError> {
     if let Some(column) = parse_aggregate_call(input, "SUM")? {
         return Ok(SelectProjection::Sum { column });
     }
+    if let Some(column) = parse_aggregate_call(input, "AVG")? {
+        return Ok(SelectProjection::Avg { column });
+    }
     if let Some(column) = parse_aggregate_call(input, "MIN")? {
         return Ok(SelectProjection::Min { column });
     }
@@ -1740,6 +1757,12 @@ fn parse_projection(input: &str) -> Result<SelectProjection, ParseError> {
             return Ok(SelectProjection::GroupedSum {
                 group_column: normalize_identifier(items[0].trim())?,
                 sum_column,
+            });
+        }
+        if let Some(avg_column) = parse_aggregate_call(items[1].trim(), "AVG")? {
+            return Ok(SelectProjection::GroupedAvg {
+                group_column: normalize_identifier(items[0].trim())?,
+                avg_column,
             });
         }
         if let Some(min_column) = parse_aggregate_call(items[1].trim(), "MIN")? {
@@ -1806,7 +1829,9 @@ fn parse_select_limit(input: &str) -> Result<usize, ParseError> {
     match parse_sql_value(input)? {
         SqlValue::Int4(value) if value >= 0 => Ok(value as usize),
         SqlValue::Int4(_) => Err(ParseError::NegativeLimit),
-        SqlValue::Int8(_) | SqlValue::Text(_) => Err(ParseError::InvalidRelationalSql),
+        SqlValue::Int8(_) | SqlValue::Numeric(_) | SqlValue::Text(_) => {
+            Err(ParseError::InvalidRelationalSql)
+        }
     }
 }
 
@@ -1814,7 +1839,9 @@ fn parse_select_offset(input: &str) -> Result<usize, ParseError> {
     match parse_sql_value(input)? {
         SqlValue::Int4(value) if value >= 0 => Ok(value as usize),
         SqlValue::Int4(_) => Err(ParseError::NegativeOffset),
-        SqlValue::Int8(_) | SqlValue::Text(_) => Err(ParseError::InvalidRelationalSql),
+        SqlValue::Int8(_) | SqlValue::Numeric(_) | SqlValue::Text(_) => {
+            Err(ParseError::InvalidRelationalSql)
+        }
     }
 }
 
@@ -9599,6 +9626,73 @@ mod tests {
 
         assert!(matches!(
             parse_command("SELECT SUM(id), name FROM people"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+    }
+
+    #[test]
+    fn parses_relational_avg_aggregates() {
+        assert_eq!(
+            parse_command(
+                "SELECT name, AVG(id) FROM people WHERE id >= 2 GROUP BY name ORDER BY avg DESC LIMIT 2 OFFSET 1",
+            )
+            .unwrap(),
+            Command::Select(Select {
+                table: "people".to_string(),
+                distinct: false,
+                projection: SelectProjection::GroupedAvg {
+                    group_column: "name".to_string(),
+                    avg_column: "id".to_string(),
+                },
+                group_by: Some("name".to_string()),
+                filter: Some(SelectFilter {
+                    column: "id".to_string(),
+                    op: SelectFilterOp::Gte,
+                    value: SqlValue::Int4(2),
+                }),
+                filters: vec![SelectFilter {
+                    column: "id".to_string(),
+                    op: SelectFilterOp::Gte,
+                    value: SqlValue::Int4(2),
+                }],
+                filter_groups: vec![vec![SelectFilter {
+                    column: "id".to_string(),
+                    op: SelectFilterOp::Gte,
+                    value: SqlValue::Int4(2),
+                }]],
+                order_by: Some(SelectOrder {
+                    column: "avg".to_string(),
+                    descending: true,
+                }),
+                limit: Some(2),
+                offset: Some(1),
+            })
+        );
+
+        assert_eq!(
+            parse_command("SELECT AVG(id) FROM people").unwrap(),
+            Command::Select(Select {
+                table: "people".to_string(),
+                distinct: false,
+                projection: SelectProjection::Avg {
+                    column: "id".to_string(),
+                },
+                group_by: None,
+                filter: None,
+                filters: Vec::new(),
+                filter_groups: Vec::new(),
+                order_by: None,
+                limit: None,
+                offset: None,
+            })
+        );
+
+        assert!(matches!(
+            parse_command("SELECT AVG(id), name FROM people"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command("SELECT DISTINCT AVG(id) FROM people"),
             Err(ParseError::InvalidRelationalSql)
         ));
     }

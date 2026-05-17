@@ -52,6 +52,14 @@ fn int8_column(name: &str) -> Column {
     }
 }
 
+fn numeric_column(name: &str) -> Column {
+    Column {
+        name: name.to_string(),
+        oid: 1700,
+        type_size: -1,
+    }
+}
+
 fn bool_column(name: &str) -> Column {
     Column {
         name: name.to_string(),
@@ -74,10 +82,58 @@ fn compare_sql_values(left: &SqlValue, right: &SqlValue) -> std::cmp::Ordering {
         (SqlValue::Int8(left), SqlValue::Int8(right)) => left.cmp(right),
         (SqlValue::Int4(left), SqlValue::Int8(right)) => i64::from(*left).cmp(right),
         (SqlValue::Int8(left), SqlValue::Int4(right)) => left.cmp(&i64::from(*right)),
+        (SqlValue::Numeric(left), SqlValue::Numeric(right)) => compare_numeric_strings(left, right),
         (SqlValue::Text(left), SqlValue::Text(right)) => left.cmp(right),
-        (SqlValue::Int4(_) | SqlValue::Int8(_), SqlValue::Text(_)) => std::cmp::Ordering::Less,
-        (SqlValue::Text(_), SqlValue::Int4(_) | SqlValue::Int8(_)) => std::cmp::Ordering::Greater,
+        (SqlValue::Int4(_) | SqlValue::Int8(_), SqlValue::Numeric(_) | SqlValue::Text(_)) => {
+            std::cmp::Ordering::Less
+        }
+        (SqlValue::Numeric(_), SqlValue::Int4(_) | SqlValue::Int8(_)) => {
+            std::cmp::Ordering::Greater
+        }
+        (SqlValue::Numeric(_), SqlValue::Text(_)) => std::cmp::Ordering::Less,
+        (SqlValue::Text(_), SqlValue::Int4(_) | SqlValue::Int8(_) | SqlValue::Numeric(_)) => {
+            std::cmp::Ordering::Greater
+        }
     }
+}
+
+fn compare_numeric_strings(left: &str, right: &str) -> std::cmp::Ordering {
+    let (left_negative, left_abs) = left
+        .strip_prefix('-')
+        .map_or((false, left), |value| (true, value));
+    let (right_negative, right_abs) = right
+        .strip_prefix('-')
+        .map_or((false, right), |value| (true, value));
+    match (left_negative, right_negative) {
+        (true, false) => return std::cmp::Ordering::Less,
+        (false, true) => return std::cmp::Ordering::Greater,
+        _ => {}
+    }
+    let magnitude = compare_unsigned_numeric_strings(left_abs, right_abs);
+    if left_negative {
+        magnitude.reverse()
+    } else {
+        magnitude
+    }
+}
+
+fn compare_unsigned_numeric_strings(left: &str, right: &str) -> std::cmp::Ordering {
+    let (left_whole, left_frac) = left.split_once('.').unwrap_or((left, ""));
+    let (right_whole, right_frac) = right.split_once('.').unwrap_or((right, ""));
+    let left_whole = left_whole.trim_start_matches('0');
+    let right_whole = right_whole.trim_start_matches('0');
+    left_whole
+        .len()
+        .cmp(&right_whole.len())
+        .then_with(|| left_whole.cmp(right_whole))
+        .then_with(|| {
+            let width = left_frac.len().max(right_frac.len());
+            let mut left_padded = left_frac.to_string();
+            let mut right_padded = right_frac.to_string();
+            left_padded.extend(std::iter::repeat_n('0', width - left_padded.len()));
+            right_padded.extend(std::iter::repeat_n('0', width - right_padded.len()));
+            left_padded.cmp(&right_padded)
+        })
 }
 
 fn select_filter_matches(left: &SqlValue, op: SelectFilterOp, right: &SqlValue) -> bool {
@@ -162,6 +218,8 @@ fn execute_select_result(
             | SelectProjection::GroupedCount { .. }
             | SelectProjection::Sum { .. }
             | SelectProjection::GroupedSum { .. }
+            | SelectProjection::Avg { .. }
+            | SelectProjection::GroupedAvg { .. }
             | SelectProjection::Min { .. }
             | SelectProjection::GroupedMin { .. }
             | SelectProjection::Max { .. }
@@ -202,6 +260,8 @@ fn execute_select_result(
         | SelectProjection::GroupedCount { .. }
         | SelectProjection::Sum { .. }
         | SelectProjection::GroupedSum { .. }
+        | SelectProjection::Avg { .. }
+        | SelectProjection::GroupedAvg { .. }
         | SelectProjection::Min { .. }
         | SelectProjection::GroupedMin { .. }
         | SelectProjection::Max { .. }
@@ -231,6 +291,8 @@ fn execute_select_result(
             | SelectProjection::GroupedCount { .. }
             | SelectProjection::Sum { .. }
             | SelectProjection::GroupedSum { .. }
+            | SelectProjection::Avg { .. }
+            | SelectProjection::GroupedAvg { .. }
             | SelectProjection::Min { .. }
             | SelectProjection::GroupedMin { .. }
             | SelectProjection::Max { .. }
@@ -583,6 +645,110 @@ fn execute_aggregate_select_result(
                 .collect();
             Ok(SelectResult { columns, rows })
         }
+        SelectProjection::Avg { column } => {
+            if select.group_by.is_some() {
+                return Err(ErrorField {
+                    code: "0A000",
+                    message: "GROUP BY requires grouped AVG projection",
+                    position: None,
+                });
+            }
+            if let Some(order) = &select.order_by {
+                if !order.column.eq_ignore_ascii_case("avg") {
+                    return Err(ErrorField {
+                        code: "0A000",
+                        message: "AVG ORDER BY only supports avg",
+                        position: None,
+                    });
+                }
+            }
+            let avg_idx = int4_column_index_for_aggregate(table, column, "AVG")?;
+            let mut sum = 0_i128;
+            let mut count = 0_usize;
+            for row in &rows {
+                sum += i128::from(int4_value_for_aggregate(&row[avg_idx], "AVG")?);
+                count += 1;
+            }
+            let mut aggregate_rows = vec![vec![average_text(sum, count)]];
+            if let Some(offset) = select.offset {
+                aggregate_rows = aggregate_rows.into_iter().skip(offset).collect();
+            }
+            if let Some(limit) = select.limit {
+                aggregate_rows.truncate(limit);
+            }
+            Ok(SelectResult {
+                columns: vec![numeric_column("avg")],
+                rows: aggregate_rows,
+            })
+        }
+        SelectProjection::GroupedAvg {
+            group_column,
+            avg_column,
+        } => {
+            let Some(group_by) = &select.group_by else {
+                return Err(ErrorField {
+                    code: "0A000",
+                    message: "grouped AVG requires GROUP BY",
+                    position: None,
+                });
+            };
+            if group_by != group_column {
+                return Err(ErrorField {
+                    code: "0A000",
+                    message: "GROUP BY column must match grouped AVG projection",
+                    position: None,
+                });
+            }
+            let group_idx = column_index(table, group_column)?;
+            let avg_idx = int4_column_index_for_aggregate(table, avg_column, "AVG")?;
+            let mut averages: BTreeMap<SqlValue, (i128, usize)> = BTreeMap::new();
+            for row in rows {
+                let value = int4_value_for_aggregate(&row[avg_idx], "AVG")?;
+                let entry = averages.entry(row[group_idx].clone()).or_default();
+                entry.0 += i128::from(value);
+                entry.1 += 1;
+            }
+            let mut grouped = averages.into_iter().collect::<Vec<_>>();
+            if let Some(order) = &select.order_by {
+                if order.column == *group_column {
+                    grouped.sort_by(|(left, _), (right, _)| compare_sql_values(left, right));
+                } else if order.column.eq_ignore_ascii_case("avg") {
+                    grouped.sort_by(
+                        |(left_value, (left_sum, left_count)),
+                         (right_value, (right_sum, right_count))| {
+                            compare_averages(*left_sum, *left_count, *right_sum, *right_count)
+                                .then_with(|| compare_sql_values(left_value, right_value))
+                        },
+                    );
+                } else {
+                    return Err(ErrorField {
+                        code: "0A000",
+                        message: "GROUP BY ORDER BY must reference grouped column or avg",
+                        position: None,
+                    });
+                }
+                if order.descending {
+                    grouped.reverse();
+                }
+            }
+            if let Some(offset) = select.offset {
+                grouped = grouped.into_iter().skip(offset).collect();
+            }
+            if let Some(limit) = select.limit {
+                grouped.truncate(limit);
+            }
+            let columns = vec![
+                aggregate_result_column(table, group_idx, group_column),
+                numeric_column("avg"),
+            ];
+            let rows = grouped
+                .into_iter()
+                .map(|(value, (sum, count))| {
+                    vec![Some(format_sql_value(&value)), average_text(sum, count)]
+                })
+                .collect();
+            Ok(SelectResult { columns, rows })
+        }
         SelectProjection::Min { column } | SelectProjection::Max { column } => {
             let aggregate_name = match &select.projection {
                 SelectProjection::Min { .. } => "min",
@@ -734,6 +900,14 @@ fn aggregate_result_column(table: &Table, idx: usize, name: &str) -> Column {
 }
 
 fn int4_column_index(table: &Table, column: &str) -> Result<usize, ErrorField> {
+    int4_column_index_for_aggregate(table, column, "SUM")
+}
+
+fn int4_column_index_for_aggregate(
+    table: &Table,
+    column: &str,
+    aggregate: &'static str,
+) -> Result<usize, ErrorField> {
     let Some(idx) = table
         .columns
         .iter()
@@ -748,7 +922,7 @@ fn int4_column_index(table: &Table, column: &str) -> Result<usize, ErrorField> {
     if !matches!(table.columns[idx].def.ty, gpu_db_protocol::SqlType::Int4) {
         return Err(ErrorField {
             code: "0A000",
-            message: "SUM only supports int4 columns",
+            message: aggregate_int4_error_message(aggregate),
             position: None,
         });
     }
@@ -756,20 +930,63 @@ fn int4_column_index(table: &Table, column: &str) -> Result<usize, ErrorField> {
 }
 
 fn int4_value(value: &SqlValue) -> Result<i32, ErrorField> {
+    int4_value_for_aggregate(value, "SUM")
+}
+
+fn int4_value_for_aggregate(value: &SqlValue, aggregate: &'static str) -> Result<i32, ErrorField> {
     match value {
         SqlValue::Int4(value) => Ok(*value),
-        SqlValue::Int8(_) | SqlValue::Text(_) => Err(ErrorField {
+        SqlValue::Int8(_) | SqlValue::Numeric(_) | SqlValue::Text(_) => Err(ErrorField {
             code: "0A000",
-            message: "SUM only supports int4 columns",
+            message: aggregate_int4_error_message(aggregate),
             position: None,
         }),
     }
+}
+
+fn aggregate_int4_error_message(aggregate: &str) -> &'static str {
+    match aggregate {
+        "AVG" => "AVG only supports int4 columns",
+        _ => "SUM only supports int4 columns",
+    }
+}
+
+fn average_text(sum: i128, count: usize) -> Option<String> {
+    if count == 0 {
+        return None;
+    }
+    let count = count as i128;
+    let negative = sum.is_negative();
+    let abs_sum = sum.abs();
+    let whole = abs_sum / count;
+    let mut remainder = abs_sum % count;
+    let mut fractional = String::with_capacity(16);
+    for _ in 0..16 {
+        remainder *= 10;
+        fractional.push(char::from(b'0' + u8::try_from(remainder / count).unwrap()));
+        remainder %= count;
+    }
+    Some(format!(
+        "{}{}.{fractional}",
+        if negative { "-" } else { "" },
+        whole
+    ))
+}
+
+fn compare_averages(
+    left_sum: i128,
+    left_count: usize,
+    right_sum: i128,
+    right_count: usize,
+) -> std::cmp::Ordering {
+    (left_sum * right_count as i128).cmp(&(right_sum * left_count as i128))
 }
 
 fn format_sql_value(value: &SqlValue) -> String {
     match value {
         SqlValue::Int4(value) => value.to_string(),
         SqlValue::Int8(value) => value.to_string(),
+        SqlValue::Numeric(value) => value.clone(),
         SqlValue::Text(value) => value.clone(),
     }
 }
@@ -8740,6 +8957,13 @@ fn describe_query_columns(session: &Session, query: &str) -> Option<Vec<Column>>
                 .find(|candidate| candidate.def.name == column)?;
             matches!(sum_column.def.ty, SqlType::Int4).then(|| vec![int8_column("sum")])
         }
+        SelectProjection::Avg { column } => {
+            let avg_column = table
+                .columns
+                .iter()
+                .find(|candidate| candidate.def.name == column)?;
+            matches!(avg_column.def.ty, SqlType::Int4).then(|| vec![numeric_column("avg")])
+        }
         SelectProjection::GroupedCount { column } => {
             let group_column = table
                 .columns
@@ -8766,6 +8990,25 @@ fn describe_query_columns(session: &Session, query: &str) -> Option<Vec<Column>>
                 vec![
                     column_def_to_result_column(group_column),
                     int8_column("sum"),
+                ]
+            })
+        }
+        SelectProjection::GroupedAvg {
+            group_column,
+            avg_column,
+        } => {
+            let group_column = table
+                .columns
+                .iter()
+                .find(|candidate| candidate.def.name == group_column)?;
+            let avg_column = table
+                .columns
+                .iter()
+                .find(|candidate| candidate.def.name == avg_column)?;
+            matches!(avg_column.def.ty, SqlType::Int4).then(|| {
+                vec![
+                    column_def_to_result_column(group_column),
+                    numeric_column("avg"),
                 ]
             })
         }
@@ -15983,6 +16226,51 @@ mod tests {
         let err = execute_select_result(&session, &select).unwrap_err();
         assert_eq!(err.code, "0A000");
         assert_eq!(err.message, "SUM only supports int4 columns");
+        let Command::Select(select) =
+            parse_command("select name, avg(id) from people group by name order by avg desc")
+                .unwrap()
+        else {
+            panic!("expected supported SELECT avg aggregate parse");
+        };
+        let result = execute_select_result(&session, &select).unwrap();
+        assert_eq!(
+            result.columns,
+            vec![text_column("name"), numeric_column("avg")]
+        );
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![
+                    Some("Grace".to_string()),
+                    Some("3.5000000000000000".to_string())
+                ],
+                vec![
+                    Some("Linus".to_string()),
+                    Some("2.0000000000000000".to_string())
+                ],
+                vec![
+                    Some("Ada".to_string()),
+                    Some("1.0000000000000000".to_string())
+                ],
+            ]
+        );
+        let Command::Select(select) =
+            parse_command("select avg(id) from people where name = 'Grace'").unwrap()
+        else {
+            panic!("expected supported SELECT avg aggregate parse");
+        };
+        let result = execute_select_result(&session, &select).unwrap();
+        assert_eq!(result.columns, vec![numeric_column("avg")]);
+        assert_eq!(
+            result.rows,
+            vec![vec![Some("3.5000000000000000".to_string())]]
+        );
+        let Command::Select(select) = parse_command("select avg(name) from people").unwrap() else {
+            panic!("expected supported SELECT avg aggregate parse");
+        };
+        let err = execute_select_result(&session, &select).unwrap_err();
+        assert_eq!(err.code, "0A000");
+        assert_eq!(err.message, "AVG only supports int4 columns");
         let Command::Select(select) =
             parse_command("select name, min(id) from people group by name order by min desc")
                 .unwrap()

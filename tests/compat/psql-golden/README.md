@@ -2,7 +2,7 @@
 
 This suite exercises a real `psql`/libpq path and compares normalized output against golden artifacts.
 
-Scenario 03 covers the supported relational create/insert/select path, including single-column filters, literal `BETWEEN` inclusive ranges, prefix-only text `LIKE 'prefix%'` predicates, narrow conjunctions, disjunctions, parenthesized nested `AND`/`OR` predicates, literal `IN (...)` membership over `int4`/`text` comparisons, `SELECT DISTINCT` duplicate elimination over selected columns, `COUNT(*)`, `SUM(int4_column)`, `MIN(column)`, `MAX(column)`, grouped `column, COUNT(*)`, grouped `column, SUM(int4_column)`, and grouped `column, MIN|MAX(column)` reporting, and ordered `LIMIT`/`OFFSET` pagination.
+Scenario 03 covers the supported relational create/insert/select path, including single-column filters, literal `BETWEEN` inclusive ranges, prefix-only text `LIKE 'prefix%'` predicates, narrow conjunctions, disjunctions, parenthesized nested `AND`/`OR` predicates, literal `IN (...)` membership over `int4`/`text` comparisons, `SELECT DISTINCT` duplicate elimination over selected columns, `COUNT(*)`, `SUM(int4_column)`, `AVG(int4_column)`, `MIN(column)`, `MAX(column)`, grouped `column, COUNT(*)`, grouped `column, SUM(int4_column)`, grouped `column, AVG(int4_column)`, and grouped `column, MIN|MAX(column)` reporting, and ordered `LIMIT`/`OFFSET` pagination.
 
 ## Run
 
