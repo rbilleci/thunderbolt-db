@@ -125,10 +125,38 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("- concurrency: 1");
     println!("- device_info: {device_info}");
     println!(
-        "- current_data_residency_model: bounded_resident_snapshot_probe_plus_per_query_h2d_fallback"
+        "- current_data_residency_model: bounded_resident_snapshot_probe_with_cuda_allocation_proof_plus_per_query_h2d_fallback"
     );
     println!("- warm_resident_snapshot_execution_supported: true");
     println!("- production_device_cache_supported: false");
+    println!(
+        "- resident_device_memory_proof_supported: {}",
+        resident_snapshot.device_memory_proof.is_some()
+    );
+    println!(
+        "- resident_device_memory_allocated_bytes: {}",
+        resident_snapshot
+            .device_memory_proof
+            .as_ref()
+            .map(|proof| proof.allocated_bytes)
+            .unwrap_or_default()
+    );
+    println!(
+        "- resident_device_memory_copied_bytes: {}",
+        resident_snapshot
+            .device_memory_proof
+            .as_ref()
+            .map(|proof| proof.copied_bytes)
+            .unwrap_or_default()
+    );
+    println!(
+        "- resident_device_memory_gpu_id: {}",
+        resident_snapshot
+            .device_memory_proof
+            .as_ref()
+            .map(|proof| proof.gpu_id.to_string())
+            .unwrap_or_else(|| "None".to_string())
+    );
     println!(
         "- resident_snapshot_valid_before_mutation: {}",
         resident_snapshot.is_valid()
@@ -269,7 +297,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     print_probe(&mutation_probe);
     println!();
     println!(
-        "decision: current P7 evidence includes bounded resident table-data snapshot SELECT probes with zero per-query H2D transfer for the app lookup workload and supported aggregate/distinct SQL shapes, plus resident-byte accounting, WAL-safe invalidation, manual refresh-cost accounting, memory-pressure fallback metadata, and deterministic resident-snapshot budget admission/eviction. Keep production CUDA allocator claims out of scope until resident snapshots own real device memory."
+        "decision: current P7 evidence includes bounded resident table-data snapshot SELECT probes with zero per-query H2D transfer for the app lookup workload and supported aggregate/distinct SQL shapes, plus resident-byte accounting, WAL-safe invalidation, manual refresh-cost accounting, memory-pressure fallback metadata, deterministic resident-snapshot budget admission/eviction, and a real CUDA allocation/copy proof when local driver hardware is available. Keep production CUDA allocator claims out of scope until resident snapshots retain managed device-memory handles for execution."
     );
 
     Ok(())

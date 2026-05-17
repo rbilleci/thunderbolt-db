@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use gpu_db_execution::GpuRuntimeSnapshot;
+use gpu_db_execution::{CudaDeviceMemoryProof, GpuRuntimeSnapshot};
 use gpu_db_metrics::{FallbackReason, GpuParityIssue, RuntimeMetricsSnapshot};
 use gpu_db_types::{Index, Role, Term, TxnId};
 
@@ -129,6 +129,7 @@ pub struct RelationalResidencyTableStatus {
     pub admission_budget_bytes: Option<u64>,
     pub resident_bytes_after_admission: u64,
     pub evicted_tables_on_admission: Vec<String>,
+    pub device_memory_proof: Option<CudaDeviceMemoryProof>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -720,6 +721,7 @@ mod tests {
                     admission_budget_bytes: Some(256),
                     resident_bytes_after_admission: 128,
                     evicted_tables_on_admission: Vec::new(),
+                    device_memory_proof: None,
                 },
                 RelationalResidencyTableStatus {
                     schema: "public".to_string(),
@@ -737,6 +739,7 @@ mod tests {
                     admission_budget_bytes: Some(256),
                     resident_bytes_after_admission: 192,
                     evicted_tables_on_admission: vec!["old_events".to_string()],
+                    device_memory_proof: None,
                 },
             ],
             resident_bytes_by_gpu: BTreeMap::from([(0, 192)]),

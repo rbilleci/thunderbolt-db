@@ -6,9 +6,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpu_db_batching::{BatchItem, DualTriggerBatcher, FlushReason};
 use gpu_db_execution::{
-    CudaDriverRuntime, CudaMvccRowBatch, DeviceRouter, DeviceTarget, FilterOperator, LimitOperator,
-    MockGpuRuntime, Operator, PlannedOp, ProjectOperator, RouteDecision, ScanOperator,
-    SortOperator,
+    CudaDeviceMemoryProof, CudaDriverRuntime, CudaMvccRowBatch, DeviceRouter, DeviceTarget,
+    FilterOperator, LimitOperator, MockGpuRuntime, Operator, PlannedOp, ProjectOperator,
+    RouteDecision, ScanOperator, SortOperator,
 };
 use gpu_db_metrics::{BatchFlushReason, FallbackReason, RuntimeMetrics, RuntimeMetricsSnapshot};
 use gpu_db_observability::{
@@ -5979,6 +5979,7 @@ pub struct RelationalResidencySnapshot {
     pub admission_budget_bytes: Option<u64>,
     pub resident_bytes_after_admission: u64,
     pub evicted_tables_on_admission: Vec<String>,
+    pub device_memory_proof: Option<CudaDeviceMemoryProof>,
 }
 
 impl RelationalResidencySnapshot {
@@ -8566,10 +8567,13 @@ impl Engine {
         let mut row_count = 0usize;
         let mut resident_bytes = 0u64;
         let mut resident_rows = Vec::new();
+        let mut device_payload = Vec::new();
         while let Some(tuple) = cursor.next() {
             if !tuple.key.starts_with(&prefix) {
                 continue;
             }
+            device_payload.extend_from_slice(tuple.key.as_bytes());
+            device_payload.extend_from_slice(tuple.value.as_bytes());
             let decoded = decode_relational_row(&tuple.value, &catalog_table.columns)?;
             row_count += 1;
             resident_bytes = resident_bytes
@@ -8594,6 +8598,8 @@ impl Engine {
         let admission_budget_bytes = self.relational_residency_budget_bytes(gpu_id);
         let (evicted_tables_on_admission, resident_bytes_after_admission) =
             self.admit_relational_residency_snapshot(table, gpu_id, resident_bytes)?;
+        let device_memory_proof =
+            self.relational_residency_device_memory_proof(gpu_id, &device_payload);
         let snapshot = RelationalResidencySnapshot {
             gpu_id,
             schema: catalog_table.schema,
@@ -8625,6 +8631,7 @@ impl Engine {
             admission_budget_bytes,
             resident_bytes_after_admission,
             evicted_tables_on_admission,
+            device_memory_proof,
         };
         self.relational_residency
             .insert(catalog_table.name, snapshot.clone());
@@ -8681,6 +8688,15 @@ impl Engine {
         Ok((evicted_tables, current_bytes + resident_bytes))
     }
 
+    fn relational_residency_device_memory_proof(
+        &mut self,
+        gpu_id: u16,
+        payload: &[u8],
+    ) -> Option<CudaDeviceMemoryProof> {
+        let runtime = self.cuda_driver_probe_runtime();
+        runtime.verify_device_memory_copy(gpu_id, payload).ok()
+    }
+
     fn relational_resident_bytes_for_gpu_excluding(&self, gpu_id: u16, table: &str) -> u64 {
         self.relational_residency
             .iter()
@@ -8735,6 +8751,7 @@ impl Engine {
                     admission_budget_bytes: snapshot.admission_budget_bytes,
                     resident_bytes_after_admission: snapshot.resident_bytes_after_admission,
                     evicted_tables_on_admission: snapshot.evicted_tables_on_admission.clone(),
+                    device_memory_proof: snapshot.device_memory_proof.clone(),
                 }
             })
             .collect::<Vec<_>>();
@@ -11561,6 +11578,29 @@ mod tests {
         assert!(pressured.invalidated_by_memory_pressure);
         assert!(pressured.memory_pressure_active);
         assert!(!pressured.is_valid());
+    }
+
+    #[test]
+    fn resident_snapshot_records_absent_device_memory_proof_when_cuda_unavailable() {
+        let mut e = Engine::new_local();
+        e.cached_cuda_probe_runtime = Some(CudaDriverRuntime::unavailable());
+        e.execute_text(1, "CREATE TABLE events (id INT, label TEXT)")
+            .unwrap();
+        e.execute_text(2, "INSERT INTO events (id, label) VALUES (1, 'alpha')")
+            .unwrap();
+
+        let snapshot = e.populate_relational_residency_snapshot("events").unwrap();
+        assert_eq!(snapshot.device_memory_proof, None);
+
+        let status = e.status_snapshot();
+        assert_eq!(
+            status
+                .relational_residency
+                .table("events")
+                .unwrap()
+                .device_memory_proof,
+            None
+        );
     }
 
     #[test]
