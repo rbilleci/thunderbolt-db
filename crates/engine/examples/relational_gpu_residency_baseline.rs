@@ -72,8 +72,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let insert_sql = format!(
         "INSERT INTO events (id, account, amount, category) VALUES ({new_id}, 'acct_refresh', 7777, 'refresh')"
     );
-    cpu.execute_text((row_count + 2) as u64, &insert_sql)?;
-    gpu.execute_text((row_count + 2) as u64, &insert_sql)?;
+    cpu.execute_text((row_count + 4) as u64, &insert_sql)?;
+    gpu.execute_text((row_count + 4) as u64, &insert_sql)?;
     let invalidated_snapshot = gpu
         .relational_residency_snapshot("events")
         .ok_or("missing resident snapshot after mutation")?;
@@ -104,6 +104,19 @@ fn main() -> Result<(), Box<dyn Error>> {
         .last_refresh_cost
         .as_ref()
         .ok_or("missing refresh-cost metadata after residency refresh")?;
+    let aux_snapshot = gpu.populate_relational_residency_snapshot("resident_aux")?;
+    gpu.set_relational_residency_budget_bytes(0, refreshed_snapshot.resident_bytes);
+    let budgeted_snapshot = gpu.populate_relational_residency_snapshot("events")?;
+    let budget_evicted_aux = gpu.relational_residency_snapshot("resident_aux").is_none();
+    let oversize_err = {
+        gpu.set_relational_residency_budget_bytes(0, refreshed_snapshot.resident_bytes - 1);
+        gpu.populate_relational_residency_snapshot("events")
+            .err()
+            .map(|err| err.to_string())
+            .unwrap_or_else(|| "accepted".to_string())
+    };
+    let oversize_rejected = oversize_err.contains("exceeding GPU 0 residency budget");
+    gpu.clear_relational_residency_budget_bytes(0);
 
     println!("# P7 GPU Residency Baseline");
     println!();
@@ -212,6 +225,29 @@ fn main() -> Result<(), Box<dyn Error>> {
         "- resident_refresh_elapsed_ms: {:.3}",
         refresh_elapsed.as_secs_f64() * 1000.0
     );
+    println!("- resident_budget_admission_supported: true");
+    println!(
+        "- resident_budget_bytes: {}",
+        budgeted_snapshot.admission_budget_bytes.unwrap_or_default()
+    );
+    println!(
+        "- resident_budget_bytes_after_admission: {}",
+        budgeted_snapshot.resident_bytes_after_admission
+    );
+    println!(
+        "- resident_budget_evicted_tables: {}",
+        if budgeted_snapshot.evicted_tables_on_admission.is_empty() {
+            "none".to_string()
+        } else {
+            budgeted_snapshot.evicted_tables_on_admission.join(",")
+        }
+    );
+    println!("- resident_budget_evicted_aux_snapshot: {budget_evicted_aux}");
+    println!(
+        "- resident_budget_aux_bytes_before_eviction: {}",
+        aux_snapshot.resident_bytes
+    );
+    println!("- resident_budget_oversize_rejected: {oversize_rejected}");
     println!("- memory_pressure_fallback_supported: true");
     println!(
         "- memory_pressure_invalidates_resident_snapshot: {}",
@@ -233,7 +269,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     print_probe(&mutation_probe);
     println!();
     println!(
-        "decision: current P7 evidence includes bounded resident table-data snapshot SELECT probes with zero per-query H2D transfer for the app lookup workload and supported aggregate/distinct SQL shapes, plus resident-byte accounting, WAL-safe invalidation, manual refresh-cost accounting, and memory-pressure fallback metadata. Keep production CUDA cache and allocator claims out of scope until resident snapshots are backed by real device memory management."
+        "decision: current P7 evidence includes bounded resident table-data snapshot SELECT probes with zero per-query H2D transfer for the app lookup workload and supported aggregate/distinct SQL shapes, plus resident-byte accounting, WAL-safe invalidation, manual refresh-cost accounting, memory-pressure fallback metadata, and deterministic resident-snapshot budget admission/eviction. Keep production CUDA allocator claims out of scope until resident snapshots own real device memory."
     );
 
     Ok(())
@@ -393,6 +429,8 @@ fn seeded_engine(row_count: usize) -> Result<Engine, Box<dyn Error>> {
         1,
         "CREATE TABLE events (id INT, account TEXT, amount INT, category TEXT)",
     )?;
+    engine.execute_text(2, "CREATE TABLE resident_aux (id INT, label TEXT)")?;
+    engine.execute_text(3, "INSERT INTO resident_aux (id, label) VALUES (1, 'aux')")?;
     for id in 1..=row_count {
         let account = format!("acct{}", id % 64);
         let category = if id % 2 == 0 { "even" } else { "odd" };
@@ -400,7 +438,7 @@ fn seeded_engine(row_count: usize) -> Result<Engine, Box<dyn Error>> {
         let sql = format!(
             "INSERT INTO events (id, account, amount, category) VALUES ({id}, '{account}', {amount}, '{category}')"
         );
-        engine.execute_text((id + 1) as u64, &sql)?;
+        engine.execute_text((id + 3) as u64, &sql)?;
     }
     Ok(engine)
 }

@@ -5916,6 +5916,7 @@ pub struct Engine {
     relational_catalog: BTreeMap<String, RelationalTable>,
     relational_value_index: BTreeMap<RelationalIndexKey, Vec<String>>,
     relational_residency: BTreeMap<String, RelationalResidencySnapshot>,
+    relational_residency_budget_bytes_by_gpu: BTreeMap<u16, u64>,
     relational_next_oid: u32,
     relational_next_column_id: u32,
     relational_next_row_id: u64,
@@ -5974,6 +5975,9 @@ pub struct RelationalResidencySnapshot {
     pub invalidated_by_memory_pressure: bool,
     pub memory_pressure_active: bool,
     pub last_refresh_cost: Option<RelationalResidencyRefreshCost>,
+    pub admission_budget_bytes: Option<u64>,
+    pub resident_bytes_after_admission: u64,
+    pub evicted_tables_on_admission: Vec<String>,
 }
 
 impl RelationalResidencySnapshot {
@@ -7037,6 +7041,7 @@ impl Engine {
             relational_catalog: BTreeMap::new(),
             relational_value_index: BTreeMap::new(),
             relational_residency: BTreeMap::new(),
+            relational_residency_budget_bytes_by_gpu: BTreeMap::new(),
             relational_next_oid: FIRST_USER_RELATION_OID,
             relational_next_column_id: FIRST_USER_COLUMN_ID,
             relational_next_row_id: 1,
@@ -7085,6 +7090,30 @@ impl Engine {
 
     pub fn clear_gpu_memory_pressured(&mut self, gpu_id: u16) {
         self.router.runtime_mut().clear_memory_pressured(gpu_id);
+    }
+
+    pub fn set_relational_residency_budget_bytes(&mut self, gpu_id: u16, budget_bytes: u64) {
+        self.relational_residency_budget_bytes_by_gpu
+            .insert(gpu_id, budget_bytes);
+    }
+
+    pub fn clear_relational_residency_budget_bytes(&mut self, gpu_id: u16) {
+        self.relational_residency_budget_bytes_by_gpu
+            .remove(&gpu_id);
+    }
+
+    pub fn relational_residency_budget_bytes(&self, gpu_id: u16) -> Option<u64> {
+        self.relational_residency_budget_bytes_by_gpu
+            .get(&gpu_id)
+            .copied()
+    }
+
+    pub fn relational_resident_bytes_for_gpu(&self, gpu_id: u16) -> u64 {
+        self.relational_residency
+            .values()
+            .filter(|snapshot| snapshot.gpu_id == gpu_id)
+            .map(|snapshot| snapshot.resident_bytes)
+            .sum()
     }
 
     pub fn set_gpu_runtime_saturated(&mut self, saturated: bool) {
@@ -8561,6 +8590,9 @@ impl Engine {
             .snapshot()
             .memory_pressured_gpu_ids
             .contains(&gpu_id);
+        let admission_budget_bytes = self.relational_residency_budget_bytes(gpu_id);
+        let (evicted_tables_on_admission, resident_bytes_after_admission) =
+            self.admit_relational_residency_snapshot(table, gpu_id, resident_bytes)?;
         let snapshot = RelationalResidencySnapshot {
             gpu_id,
             schema: catalog_table.schema,
@@ -8589,10 +8621,71 @@ impl Engine {
                     invalidated_by_memory_pressure: previous.invalidated_by_memory_pressure,
                 }
             }),
+            admission_budget_bytes,
+            resident_bytes_after_admission,
+            evicted_tables_on_admission,
         };
         self.relational_residency
             .insert(catalog_table.name, snapshot.clone());
         Ok(snapshot)
+    }
+
+    fn admit_relational_residency_snapshot(
+        &mut self,
+        table: &str,
+        gpu_id: u16,
+        resident_bytes: u64,
+    ) -> Result<(Vec<String>, u64), ExecuteError> {
+        let Some(budget_bytes) = self.relational_residency_budget_bytes(gpu_id) else {
+            let resident_bytes_after_admission = self
+                .relational_resident_bytes_for_gpu_excluding(gpu_id, table)
+                .saturating_add(resident_bytes);
+            return Ok((Vec::new(), resident_bytes_after_admission));
+        };
+        if resident_bytes > budget_bytes {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "relation \"{table}\" resident snapshot requires {resident_bytes} bytes, exceeding GPU {gpu_id} residency budget {budget_bytes} bytes"
+            ))));
+        }
+
+        let mut current_bytes = self.relational_resident_bytes_for_gpu_excluding(gpu_id, table);
+        let mut evicted_tables = Vec::new();
+        if current_bytes.saturating_add(resident_bytes) <= budget_bytes {
+            return Ok((evicted_tables, current_bytes + resident_bytes));
+        }
+
+        let mut candidates = self
+            .relational_residency
+            .iter()
+            .filter(|(name, snapshot)| name.as_str() != table && snapshot.gpu_id == gpu_id)
+            .map(|(name, snapshot)| {
+                (
+                    snapshot.valid_through_index,
+                    snapshot.table.clone(),
+                    name.clone(),
+                    snapshot.resident_bytes,
+                )
+            })
+            .collect::<Vec<_>>();
+        candidates.sort();
+        for (_valid_through_index, _snapshot_table, map_key, bytes) in candidates {
+            if current_bytes.saturating_add(resident_bytes) <= budget_bytes {
+                break;
+            }
+            self.relational_residency.remove(&map_key);
+            current_bytes = current_bytes.saturating_sub(bytes);
+            evicted_tables.push(map_key);
+        }
+
+        Ok((evicted_tables, current_bytes + resident_bytes))
+    }
+
+    fn relational_resident_bytes_for_gpu_excluding(&self, gpu_id: u16, table: &str) -> u64 {
+        self.relational_residency
+            .iter()
+            .filter(|(name, snapshot)| name.as_str() != table && snapshot.gpu_id == gpu_id)
+            .map(|(_name, snapshot)| snapshot.resident_bytes)
+            .sum()
     }
 
     pub fn relational_residency_snapshot(
@@ -11320,6 +11413,97 @@ mod tests {
                 "{sql}"
             );
         }
+    }
+
+    #[test]
+    fn resident_snapshot_budget_evicts_oldest_table_before_admission() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE small_a (id INT, label TEXT)")
+            .unwrap();
+        e.execute_text(2, "INSERT INTO small_a (id, label) VALUES (1, 'a')")
+            .unwrap();
+        let small_a = e.populate_relational_residency_snapshot("small_a").unwrap();
+
+        e.execute_text(3, "CREATE TABLE small_b (id INT, label TEXT)")
+            .unwrap();
+        e.execute_text(4, "INSERT INTO small_b (id, label) VALUES (2, 'b')")
+            .unwrap();
+        let small_b = e.populate_relational_residency_snapshot("small_b").unwrap();
+
+        let budget_bytes = small_b.resident_bytes.saturating_mul(2);
+        e.set_relational_residency_budget_bytes(0, budget_bytes);
+        e.execute_text(5, "CREATE TABLE small_c (id INT, label TEXT)")
+            .unwrap();
+        e.execute_text(6, "INSERT INTO small_c (id, label) VALUES (3, 'c')")
+            .unwrap();
+        let small_c = e.populate_relational_residency_snapshot("small_c").unwrap();
+
+        assert_eq!(small_c.admission_budget_bytes, Some(budget_bytes));
+        assert_eq!(small_c.evicted_tables_on_admission, vec!["small_a"]);
+        assert!(e.relational_residency_snapshot("small_a").is_none());
+        assert!(e.relational_residency_snapshot("small_b").is_some());
+        assert!(e.relational_residency_snapshot("small_c").is_some());
+        assert_eq!(
+            small_c.resident_bytes_after_admission,
+            e.relational_resident_bytes_for_gpu(0)
+        );
+        assert_eq!(small_a.valid_through_index, 2);
+        assert_eq!(small_b.valid_through_index, 4);
+    }
+
+    #[test]
+    fn resident_snapshot_budget_rejects_oversized_snapshot_without_mutation() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE events (id INT, label TEXT)")
+            .unwrap();
+        e.execute_text(2, "INSERT INTO events (id, label) VALUES (1, 'alpha')")
+            .unwrap();
+        let original = e.populate_relational_residency_snapshot("events").unwrap();
+
+        e.set_relational_residency_budget_bytes(0, original.resident_bytes - 1);
+        let err = e
+            .populate_relational_residency_snapshot("events")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("exceeding GPU 0 residency budget"));
+
+        let retained = e.relational_residency_snapshot("events").unwrap();
+        assert_eq!(retained, original);
+        assert_eq!(
+            e.relational_resident_bytes_for_gpu(0),
+            original.resident_bytes
+        );
+    }
+
+    #[test]
+    fn resident_snapshot_budget_keeps_wal_and_pressure_invalidation_semantics() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE events (id INT, label TEXT)")
+            .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO events (id, label) VALUES (1, 'alpha'), (2, 'beta')",
+        )
+        .unwrap();
+        let original = e.populate_relational_residency_snapshot("events").unwrap();
+        let budget_bytes = original.resident_bytes + 128;
+        e.set_relational_residency_budget_bytes(0, budget_bytes);
+
+        e.execute_text(3, "INSERT INTO events (id, label) VALUES (3, 'gamma')")
+            .unwrap();
+        let invalidated = e.relational_residency_snapshot("events").unwrap();
+        assert_eq!(invalidated.invalidated_by_txn_id, Some(3));
+        assert!(!invalidated.is_valid());
+
+        let refreshed = e.populate_relational_residency_snapshot("events").unwrap();
+        assert_eq!(refreshed.admission_budget_bytes, Some(budget_bytes));
+        assert!(refreshed.is_valid());
+
+        e.mark_gpu_memory_pressured(0);
+        let pressured = e.relational_residency_snapshot("events").unwrap();
+        assert!(pressured.invalidated_by_memory_pressure);
+        assert!(pressured.memory_pressure_active);
+        assert!(!pressured.is_valid());
     }
 
     #[test]
