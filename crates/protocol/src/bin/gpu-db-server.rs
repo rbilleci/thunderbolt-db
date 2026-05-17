@@ -3413,6 +3413,9 @@ fn execute_statement(
     if is_pg_dump_session_set_statement(&canonical) {
         return write_command_complete(stream, "SET");
     }
+    if canonical == "create schema public" {
+        return write_command_complete(stream, "CREATE SCHEMA");
+    }
     if canonical == "reset search_path" {
         return write_command_complete(stream, "RESET");
     }
@@ -3513,6 +3516,13 @@ fn execute_statement(
                     None,
                 ],
             ],
+        );
+    }
+    if is_pg_dump_public_namespace_oid_lookup_query(&canonical) {
+        return write_single_row(
+            stream,
+            &[int4_column("oid")],
+            &[vec![Some(PUBLIC_NAMESPACE_OID.to_string())]],
         );
     }
     if let Some(table) = pg_dump_table_oid_lookup_query_table(&canonical) {
@@ -4345,6 +4355,13 @@ fn execute_statement(
                 text_column("Description"),
             ],
             &catalog_psql_describe_type_verbose_rows_for_supported_types(),
+        );
+    }
+    if is_pg_dump_public_namespace_oid_lookup_query(&canonical) {
+        return write_single_row(
+            stream,
+            &[int4_column("oid")],
+            &[vec![Some(PUBLIC_NAMESPACE_OID.to_string())]],
         );
     }
     if let Some(table) = pg_dump_table_oid_lookup_query_table(&canonical) {
@@ -5687,6 +5704,11 @@ fn pg_dump_table_oid_lookup_query_table(canonical: &str) -> Option<String> {
         .strip_prefix(prefix)?
         .strip_suffix(suffix)
         .map(str::to_string)
+}
+
+fn is_pg_dump_public_namespace_oid_lookup_query(canonical: &str) -> bool {
+    canonical
+        == "select oid from pg_catalog.pg_namespace n where n.nspname operator(pg_catalog.~) '^(public)$' collate pg_catalog.default"
 }
 
 fn pg_dump_table_oid_lookup_rows(
@@ -15064,6 +15086,18 @@ mod tests {
             information_schema_rich_tables_catalog_query_table(literal_catalog_query),
             Some("people".to_string())
         );
+    }
+
+    #[test]
+    fn catalog_pg_namespace_pg_dump_public_schema_discovery_queries() {
+        assert!(is_pg_dump_public_namespace_oid_lookup_query(
+            "select oid from pg_catalog.pg_namespace n where n.nspname operator(pg_catalog.~) '^(public)$' collate pg_catalog.default"
+        ));
+
+        let mut session = Session::default();
+        let (mut writer, mut reader) = tcp_pair();
+        execute_statement(&mut writer, &mut session, "CREATE SCHEMA public", true).unwrap();
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'C']);
     }
 
     #[test]

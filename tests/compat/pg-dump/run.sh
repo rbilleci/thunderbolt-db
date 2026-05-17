@@ -54,7 +54,7 @@ INSERT INTO events (event_id, note) VALUES (11, 'updated');
 SQL
 
 PGHOST=127.0.0.1 PGPORT="$SOURCE_PORT" PGDATABASE=postgres PGUSER=postgres \
-  pg_dump --table=accounts --table=events --no-owner --no-privileges --format=plain \
+  pg_dump --schema=public --no-owner --no-privileges --format=plain \
   >"$OUT_DIR/dump.sql" 2>"$OUT_DIR/pg_dump.err"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$RESTORE_PORT" --shared-catalog \
@@ -83,8 +83,9 @@ diff -u "$OUT_DIR/verify.expected" "$OUT_DIR/verify.out"
 
 grep -F "COPY public.accounts (id, name) FROM stdin;" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "COPY public.events (event_id, note) FROM stdin;" "$OUT_DIR/dump.sql" >/dev/null
+grep -F "CREATE SCHEMA public;" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "CREATE TABLE public.accounts (" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "CREATE TABLE public.events (" "$OUT_DIR/dump.sql" >/dev/null
 
-echo "pg_dump_plain_schema_data_restore=passed"
+echo "pg_dump_plain_public_schema_restore=passed"
 echo "dump_file=$OUT_DIR/dump.sql"
