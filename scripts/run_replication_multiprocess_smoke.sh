@@ -22,7 +22,7 @@ required_lines=(
   "multiprocess_follower id=2 commit=2 applied=2 caught_up=true read_after_apply=create table t(id int) | insert into t values (1)"
   "multiprocess_follower id=3 commit=2 applied=2 caught_up=true read_after_apply=create table t(id int) | insert into t values (1)"
   "deployment_gap_packaged_multiprocess_smoke=implemented"
-  "deployment_gap_long_running_service=missing"
+  "deployment_gap_long_running_service=implemented_by_service_smoke"
   "deployment_gap_container_deployment=missing"
 )
 
