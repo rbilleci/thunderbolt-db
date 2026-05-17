@@ -54,19 +54,13 @@ INSERT INTO events (event_id, note) VALUES (11, 'updated');
 SQL
 
 PGHOST=127.0.0.1 PGPORT="$SOURCE_PORT" PGDATABASE=postgres PGUSER=postgres \
-  pg_dump --data-only --table=accounts --table=events --no-owner --no-privileges --format=plain \
+  pg_dump --table=accounts --table=events --no-owner --no-privileges --format=plain \
   >"$OUT_DIR/dump.sql" 2>"$OUT_DIR/pg_dump.err"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/restore-server.log" 2>&1 &
 restore_pid=$!
 wait_for_port "$RESTORE_PORT"
-
-PGHOST=127.0.0.1 PGPORT="$RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres \
-  psql -v ON_ERROR_STOP=1 -X -q <<'SQL'
-CREATE TABLE accounts (id int4, name text);
-CREATE TABLE events (event_id int4, note text);
-SQL
 
 PGHOST=127.0.0.1 PGPORT="$RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres \
   psql -v ON_ERROR_STOP=1 -X -q -f "$OUT_DIR/dump.sql" \
@@ -89,6 +83,8 @@ diff -u "$OUT_DIR/verify.expected" "$OUT_DIR/verify.out"
 
 grep -F "COPY public.accounts (id, name) FROM stdin;" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "COPY public.events (event_id, note) FROM stdin;" "$OUT_DIR/dump.sql" >/dev/null
+grep -F "CREATE TABLE public.accounts (" "$OUT_DIR/dump.sql" >/dev/null
+grep -F "CREATE TABLE public.events (" "$OUT_DIR/dump.sql" >/dev/null
 
-echo "pg_dump_plain_data_restore=passed"
+echo "pg_dump_plain_schema_data_restore=passed"
 echo "dump_file=$OUT_DIR/dump.sql"

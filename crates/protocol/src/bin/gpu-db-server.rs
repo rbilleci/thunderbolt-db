@@ -8088,6 +8088,8 @@ fn is_pg_dump_session_set_statement(canonical: &str) -> bool {
             | "set xmloption = content"
             | "set client_min_messages = warning"
             | "set row_security = off"
+            | "set default_tablespace = ''"
+            | "set default_table_access_method = heap"
             | "set transaction isolation level repeatable read, read only"
     )
 }

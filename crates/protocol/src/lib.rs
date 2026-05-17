@@ -1483,7 +1483,7 @@ fn parse_create_table(input: &str) -> Result<CreateTable, ParseError> {
     if close <= open || !rest[close + 1..].trim().is_empty() {
         return Err(ParseError::InvalidRelationalSql);
     }
-    let table = normalize_identifier(rest[..open].trim())?;
+    let table = normalize_relation_identifier(rest[..open].trim())?;
     let mut columns = Vec::new();
     for raw_column in split_csv(&rest[open + 1..close])? {
         let mut parts = raw_column.split_whitespace();
@@ -1534,7 +1534,7 @@ fn parse_insert(input: &str) -> Result<Insert, ParseError> {
         .ok_or(ParseError::InvalidRelationalSql)?
         .trim_start();
     let open = rest.find('(').ok_or(ParseError::InvalidRelationalSql)?;
-    let table = normalize_identifier(rest[..open].trim())?;
+    let table = normalize_relation_identifier(rest[..open].trim())?;
     let close = find_matching_paren(rest, open).ok_or(ParseError::InvalidRelationalSql)?;
     let columns = split_csv(&rest[open + 1..close])?
         .into_iter()
@@ -1587,7 +1587,7 @@ fn parse_select(input: &str) -> Result<Select, ParseError> {
     let projection = parse_projection(rest[..from_pos].trim())?;
     let mut tail = rest[from_pos + "FROM".len()..].trim_start();
     let table_end = tail.find(char::is_whitespace).unwrap_or(tail.len());
-    let table = normalize_identifier(&tail[..table_end])?;
+    let table = normalize_relation_identifier(&tail[..table_end])?;
     tail = tail[table_end..].trim_start();
 
     let mut filter_groups = Vec::new();
@@ -1844,6 +1844,17 @@ fn normalize_identifier(input: &str) -> Result<String, ParseError> {
         return Err(ParseError::InvalidRelationalSql);
     }
     Ok(s.to_ascii_lowercase())
+}
+
+fn normalize_relation_identifier(input: &str) -> Result<String, ParseError> {
+    let s = input.trim();
+    if let Some((schema, table)) = s.split_once('.') {
+        if normalize_identifier(schema)? != "public" {
+            return Err(ParseError::InvalidRelationalSql);
+        }
+        return normalize_identifier(table);
+    }
+    normalize_identifier(s)
 }
 
 fn split_csv(input: &str) -> Result<Vec<&str>, ParseError> {
@@ -8180,6 +8191,27 @@ mod tests {
         );
 
         assert_eq!(
+            parse_command("CREATE TABLE public.dump_people (id integer, name text)").unwrap(),
+            Command::CreateTable(CreateTable {
+                table: "dump_people".to_string(),
+                columns: vec![
+                    ColumnDef {
+                        name: "id".to_string(),
+                        ty: SqlType::Int4,
+                    },
+                    ColumnDef {
+                        name: "name".to_string(),
+                        ty: SqlType::Text,
+                    },
+                ],
+            })
+        );
+        assert!(matches!(
+            parse_command("CREATE TABLE private.dump_people (id integer)"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+
+        assert_eq!(
             parse_command("INSERT INTO people (id, name) VALUES (1, 'Ada'), (2, 'Linus')").unwrap(),
             Command::Insert(Insert {
                 table: "people".to_string(),
@@ -8217,6 +8249,15 @@ mod tests {
         );
 
         assert_eq!(
+            parse_command("INSERT INTO public.people (id, name) VALUES (3, 'Grace')").unwrap(),
+            Command::Insert(Insert {
+                table: "people".to_string(),
+                columns: vec!["id".to_string(), "name".to_string()],
+                rows: vec![vec![SqlValue::Int4(3), SqlValue::Text("Grace".to_string())]],
+            })
+        );
+
+        assert_eq!(
             parse_command("SELECT id FROM people WHERE id = +1 LIMIT +1").unwrap(),
             Command::Select(Select {
                 table: "people".to_string(),
@@ -8238,6 +8279,30 @@ mod tests {
                 }]],
                 order_by: None,
                 limit: Some(1),
+            })
+        );
+        assert_eq!(
+            parse_command("SELECT id FROM public.people WHERE id = 1").unwrap(),
+            Command::Select(Select {
+                table: "people".to_string(),
+                projection: SelectProjection::Columns(vec!["id".to_string()]),
+                filter: Some(SelectFilter {
+                    column: "id".to_string(),
+                    op: SelectFilterOp::Eq,
+                    value: SqlValue::Int4(1),
+                }),
+                filters: vec![SelectFilter {
+                    column: "id".to_string(),
+                    op: SelectFilterOp::Eq,
+                    value: SqlValue::Int4(1),
+                }],
+                filter_groups: vec![vec![SelectFilter {
+                    column: "id".to_string(),
+                    op: SelectFilterOp::Eq,
+                    value: SqlValue::Int4(1),
+                }]],
+                order_by: None,
+                limit: None,
             })
         );
         assert!(matches!(
