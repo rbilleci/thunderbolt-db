@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -46,6 +47,15 @@ pub struct WalArchiveRecoveryTarget {
     pub target_txn_id: TxnId,
     pub recovered_record_count: usize,
     pub last_recovered_txn_id: TxnId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalArchiveRetentionPlan {
+    pub target_txn_id: TxnId,
+    pub retained_record_count: usize,
+    pub removed_record_count: usize,
+    pub retained_manifest: WalArchiveManifest,
+    pub removed_segments: Vec<PathBuf>,
 }
 
 #[derive(Debug, Default)]
@@ -668,6 +678,81 @@ pub fn read_wal_archive_to_txn(
     ))
 }
 
+pub fn plan_wal_archive_retention_to_txn(
+    manifest_path: impl AsRef<Path>,
+    target_txn_id: TxnId,
+) -> Result<WalArchiveRetentionPlan, EngineError> {
+    let manifest_path = manifest_path.as_ref();
+    let (manifest, target, retained_records) =
+        read_wal_archive_to_txn(manifest_path, target_txn_id)?;
+    let records_per_segment = archive_records_per_segment(manifest_path, &manifest)?;
+    let segment_dir = archive_segment_dir(manifest_path, &manifest)?;
+    let retained_manifest = build_wal_archive_manifest(
+        manifest_path,
+        &segment_dir,
+        &retained_records,
+        records_per_segment,
+    );
+    let retained_paths: HashSet<PathBuf> = retained_manifest
+        .segments
+        .iter()
+        .map(|segment| resolve_manifest_path(manifest_path, &segment.segment_path))
+        .collect();
+    let removed_segments = manifest
+        .segments
+        .iter()
+        .map(|segment| resolve_manifest_path(manifest_path, &segment.segment_path))
+        .filter(|path| !retained_paths.contains(path))
+        .collect();
+
+    Ok(WalArchiveRetentionPlan {
+        target_txn_id,
+        retained_record_count: target.recovered_record_count,
+        removed_record_count: manifest
+            .checkpoint
+            .durable_record_count
+            .saturating_sub(target.recovered_record_count),
+        retained_manifest,
+        removed_segments,
+    })
+}
+
+pub fn apply_wal_archive_retention_to_txn(
+    manifest_path: impl AsRef<Path>,
+    target_txn_id: TxnId,
+) -> Result<WalArchiveRetentionPlan, EngineError> {
+    let manifest_path = manifest_path.as_ref();
+    let (manifest, _target, retained_records) =
+        read_wal_archive_to_txn(manifest_path, target_txn_id)?;
+    let records_per_segment = archive_records_per_segment(manifest_path, &manifest)?;
+    let segment_dir = archive_segment_dir(manifest_path, &manifest)?;
+    let plan = plan_wal_archive_retention_to_txn(manifest_path, target_txn_id)?;
+
+    let retained_manifest = write_wal_archive(
+        manifest_path,
+        &segment_dir,
+        &retained_records,
+        records_per_segment,
+    )?;
+    for removed_segment in &plan.removed_segments {
+        match fs::remove_file(removed_segment) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(EngineError::Durability(format!(
+                    "failed to remove obsolete WAL archive segment {}: {err}",
+                    removed_segment.display()
+                )));
+            }
+        }
+    }
+
+    Ok(WalArchiveRetentionPlan {
+        retained_manifest,
+        ..plan
+    })
+}
+
 fn validate_checkpoint_control(
     control_path: &Path,
     control: &WalControlFile,
@@ -691,6 +776,70 @@ fn validate_checkpoint_control(
         )));
     }
     Ok(())
+}
+
+fn build_wal_archive_manifest(
+    manifest_path: &Path,
+    segment_dir: &Path,
+    records: &[WalRecord],
+    records_per_segment: usize,
+) -> WalArchiveManifest {
+    let mut segments = Vec::new();
+    for (index, chunk) in records.chunks(records_per_segment).enumerate() {
+        let file_name = format!("segment-{:04}.wal", index + 1);
+        let segment_path = segment_dir.join(&file_name);
+        let manifest_segment_path = segment_path
+            .strip_prefix(manifest_path.parent().unwrap_or_else(|| Path::new(".")))
+            .unwrap_or(&segment_path)
+            .to_path_buf();
+        segments.push(WalArchiveSegment {
+            segment_path: manifest_segment_path,
+            record_count: chunk.len(),
+            first_txn_id: chunk.first().map(|record| record.txn_id),
+            last_txn_id: chunk.last().map(|record| record.txn_id),
+        });
+    }
+    WalArchiveManifest {
+        segments,
+        checkpoint: WalCheckpointMeta {
+            durable_record_count: records.len(),
+            last_durable_txn_id: records.last().map(|record| record.txn_id),
+        },
+    }
+}
+
+fn archive_records_per_segment(
+    manifest_path: &Path,
+    manifest: &WalArchiveManifest,
+) -> Result<usize, EngineError> {
+    manifest
+        .segments
+        .first()
+        .map(|segment| segment.record_count)
+        .filter(|record_count| *record_count > 0)
+        .ok_or_else(|| {
+            EngineError::Durability(format!(
+                "WAL archive {} has no segment sizing for retention",
+                manifest_path.display()
+            ))
+        })
+}
+
+fn archive_segment_dir(
+    manifest_path: &Path,
+    manifest: &WalArchiveManifest,
+) -> Result<PathBuf, EngineError> {
+    let first_segment = manifest.segments.first().ok_or_else(|| {
+        EngineError::Durability(format!(
+            "WAL archive {} has no segment directory for retention",
+            manifest_path.display()
+        ))
+    })?;
+    let first_segment_path = resolve_manifest_path(manifest_path, &first_segment.segment_path);
+    Ok(first_segment_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf())
 }
 
 fn validate_archive_manifest_shape(
@@ -1380,6 +1529,142 @@ mod tests {
         assert!(err
             .to_string()
             .contains("does not contain target transaction"));
+    }
+
+    #[test]
+    fn wal_archive_retention_plan_keeps_exact_transaction_prefix() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpu-db-wal-archive-retention-plan-{}-{}",
+            std::process::id(),
+            NEXT_TEST_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let manifest_path = dir.join("MANIFEST");
+        let segment_dir = dir.join("segments");
+        let records = vec![
+            WalRecord {
+                txn_id: 1,
+                payload: b"SET a=1".to_vec(),
+            },
+            WalRecord {
+                txn_id: 2,
+                payload: b"SET b=2".to_vec(),
+            },
+            WalRecord {
+                txn_id: 3,
+                payload: b"SET c=3".to_vec(),
+            },
+            WalRecord {
+                txn_id: 4,
+                payload: b"SET d=4".to_vec(),
+            },
+            WalRecord {
+                txn_id: 5,
+                payload: b"SET e=5".to_vec(),
+            },
+        ];
+
+        write_wal_archive(&manifest_path, &segment_dir, &records, 2).unwrap();
+        let plan = plan_wal_archive_retention_to_txn(&manifest_path, 3).unwrap();
+        let _ = fs::remove_dir_all(dir);
+
+        assert_eq!(plan.target_txn_id, 3);
+        assert_eq!(plan.retained_record_count, 3);
+        assert_eq!(plan.removed_record_count, 2);
+        assert_eq!(plan.retained_manifest.segments.len(), 2);
+        assert_eq!(
+            plan.retained_manifest.checkpoint,
+            WalCheckpointMeta {
+                durable_record_count: 3,
+                last_durable_txn_id: Some(3),
+            }
+        );
+        assert_eq!(plan.retained_manifest.segments[1].record_count, 1);
+        assert_eq!(plan.retained_manifest.segments[1].last_txn_id, Some(3));
+        assert_eq!(
+            plan.removed_segments,
+            vec![segment_dir.join("segment-0003.wal")]
+        );
+    }
+
+    #[test]
+    fn wal_archive_retention_apply_rewrites_manifest_and_removes_tail_segments() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpu-db-wal-archive-retention-apply-{}-{}",
+            std::process::id(),
+            NEXT_TEST_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let manifest_path = dir.join("MANIFEST");
+        let segment_dir = dir.join("segments");
+        let records = vec![
+            WalRecord {
+                txn_id: 1,
+                payload: b"SET a=1".to_vec(),
+            },
+            WalRecord {
+                txn_id: 2,
+                payload: b"SET b=2".to_vec(),
+            },
+            WalRecord {
+                txn_id: 3,
+                payload: b"SET c=3".to_vec(),
+            },
+            WalRecord {
+                txn_id: 4,
+                payload: b"SET d=4".to_vec(),
+            },
+            WalRecord {
+                txn_id: 5,
+                payload: b"SET e=5".to_vec(),
+            },
+        ];
+
+        write_wal_archive(&manifest_path, &segment_dir, &records, 2).unwrap();
+        let removed_tail = segment_dir.join("segment-0003.wal");
+        assert!(removed_tail.exists());
+
+        let plan = apply_wal_archive_retention_to_txn(&manifest_path, 3).unwrap();
+        let (retained_manifest, retained_records) = read_wal_archive(&manifest_path).unwrap();
+        let target_err = read_wal_archive_to_txn(&manifest_path, 4).unwrap_err();
+
+        assert_eq!(plan.retained_record_count, 3);
+        assert_eq!(plan.removed_record_count, 2);
+        assert!(!removed_tail.exists());
+        assert_eq!(retained_manifest.checkpoint.durable_record_count, 3);
+        assert_eq!(retained_manifest.checkpoint.last_durable_txn_id, Some(3));
+        assert_eq!(retained_records.len(), 3);
+        assert_eq!(retained_records[2].payload, b"SET c=3");
+        assert!(target_err
+            .to_string()
+            .contains("beyond last durable transaction"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn wal_archive_retention_rejects_malformed_archive_before_cleanup() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpu-db-wal-archive-retention-malformed-{}-{}",
+            std::process::id(),
+            NEXT_TEST_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let manifest_path = dir.join("MANIFEST");
+        let segment_dir = dir.join("segments");
+        let records = vec![
+            WalRecord {
+                txn_id: 2,
+                payload: b"SET b=2".to_vec(),
+            },
+            WalRecord {
+                txn_id: 1,
+                payload: b"SET a=1".to_vec(),
+            },
+        ];
+
+        write_wal_archive(&manifest_path, &segment_dir, &records, 1).unwrap();
+        let err = apply_wal_archive_retention_to_txn(&manifest_path, 1).unwrap_err();
+        assert!(segment_dir.join("segment-0002.wal").exists());
+        let _ = fs::remove_dir_all(dir);
+
+        assert!(err.to_string().contains("non-increasing transaction order"));
     }
 
     #[test]

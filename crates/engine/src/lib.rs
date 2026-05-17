@@ -28,9 +28,10 @@ use gpu_db_storage::{
 use gpu_db_txn::{TxnError, TxnManager};
 use gpu_db_types::{CommitToken, EngineError, Index, LogEntry, Role, SnapshotMeta, Term, TxnId};
 use gpu_db_wal::{
-    read_wal_archive, read_wal_archive_to_txn, read_wal_checkpoint, read_wal_segment,
-    write_wal_archive, write_wal_control_file, write_wal_segment, WalArchiveManifest, WalBuffer,
-    WalControlFile, WalRecord,
+    apply_wal_archive_retention_to_txn, plan_wal_archive_retention_to_txn, read_wal_archive,
+    read_wal_archive_to_txn, read_wal_checkpoint, read_wal_segment, write_wal_archive,
+    write_wal_control_file, write_wal_segment, WalArchiveManifest, WalArchiveRetentionPlan,
+    WalBuffer, WalControlFile, WalRecord,
 };
 
 #[derive(Debug, Default)]
@@ -7609,6 +7610,20 @@ impl Engine {
             self.durable_wal_records(),
             records_per_segment,
         )
+    }
+
+    pub fn plan_durable_wal_archive_retention_to_txn(
+        manifest_path: impl AsRef<std::path::Path>,
+        target_txn_id: TxnId,
+    ) -> Result<WalArchiveRetentionPlan, EngineError> {
+        plan_wal_archive_retention_to_txn(manifest_path, target_txn_id)
+    }
+
+    pub fn apply_durable_wal_archive_retention_to_txn(
+        manifest_path: impl AsRef<std::path::Path>,
+        target_txn_id: TxnId,
+    ) -> Result<WalArchiveRetentionPlan, EngineError> {
+        apply_wal_archive_retention_to_txn(manifest_path, target_txn_id)
     }
 
     pub fn checkpoint_vacuum_mvcc_versions(
@@ -23900,6 +23915,66 @@ mod tests {
         let katherine_result = recovered
             .execute_relational_select(&katherine_select)
             .unwrap();
+        assert_eq!(katherine_result.rows, Vec::<Vec<SqlValue>>::new());
+    }
+
+    #[test]
+    fn relational_state_recovers_after_wal_archive_retention_cleanup() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpu-db-engine-wal-archive-retention-{}-{}",
+            std::process::id(),
+            NEXT_TEST_WAL_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let manifest_path = dir.join("MANIFEST");
+        let segment_dir = dir.join("segments");
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(2, "INSERT INTO people (id, name) VALUES (1, 'Ada')")
+            .unwrap();
+        e.execute_text(3, "INSERT INTO people (id, name) VALUES (2, 'Grace')")
+            .unwrap();
+        e.execute_text(4, "INSERT INTO people (id, name) VALUES (3, 'Katherine')")
+            .unwrap();
+
+        e.persist_durable_wal_archive(&manifest_path, &segment_dir, 1)
+            .unwrap();
+        let obsolete_tail = segment_dir.join("segment-0004.wal");
+        assert!(obsolete_tail.exists());
+        let plan = Engine::apply_durable_wal_archive_retention_to_txn(&manifest_path, 3).unwrap();
+
+        let mut recovered = Engine::recover_from_durable_wal_archive(&manifest_path).unwrap();
+        assert!(!obsolete_tail.exists());
+        assert_eq!(plan.retained_record_count, 3);
+        assert_eq!(plan.removed_record_count, 1);
+        assert_eq!(recovered.wal_flushed_count(), 3);
+
+        let Command::Select(grace_select) =
+            parse_command("SELECT id FROM people WHERE name = 'Grace'").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let grace_result = recovered.execute_relational_select(&grace_select).unwrap();
+        assert_eq!(
+            grace_result.access_path,
+            RelationalAccessPath::EqualityIndex {
+                table: "people".to_string(),
+                column: "name".to_string(),
+                matched_keys: 1,
+            }
+        );
+        assert_eq!(grace_result.rows, vec![vec![SqlValue::Int4(2)]]);
+
+        let Command::Select(katherine_select) =
+            parse_command("SELECT id FROM people WHERE name = 'Katherine'").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let katherine_result = recovered
+            .execute_relational_select(&katherine_select)
+            .unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+
         assert_eq!(katherine_result.rows, Vec::<Vec<SqlValue>>::new());
     }
 
