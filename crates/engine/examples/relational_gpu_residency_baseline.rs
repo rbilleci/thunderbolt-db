@@ -43,6 +43,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let query = app_batched_lookup_query(row_count, lookup_count)?;
     let aggregate_distinct_queries = aggregate_distinct_queries()?;
+    let count_query = select("SELECT COUNT(*) FROM events")?;
     let mutation_query = select(&format!(
         "SELECT * FROM events WHERE id = {}",
         row_count + 1
@@ -66,6 +67,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         &aggregate_distinct_queries,
         &aggregate_distinct_cpu_results,
         "warm_resident_aggregate_distinct_probe",
+    )?;
+    let count_cpu_result = cpu.execute_relational_select(&count_query)?;
+    let resident_device_count_probe = timed_resident_device_count_probe(
+        &mut gpu,
+        &count_query,
+        &count_cpu_result,
+        "resident_device_memory_count_kernel_probe",
     )?;
 
     let new_id = row_count + 1;
@@ -129,6 +137,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
     println!("- warm_resident_snapshot_execution_supported: true");
     println!("- production_device_cache_supported: bounded_retained_snapshot_handle");
+    println!("- resident_device_memory_query_kernel_supported: bounded_count_all");
     println!(
         "- resident_device_memory_proof_supported: {}",
         resident_snapshot.device_memory_proof.is_some()
@@ -302,13 +311,51 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!();
     print_probe(&warm_resident_aggregate_distinct_probe);
     println!();
+    print_probe(&resident_device_count_probe);
+    println!();
     print_probe(&mutation_probe);
     println!();
     println!(
-        "decision: current P7 evidence includes bounded resident table-data snapshot SELECT probes with zero per-query H2D transfer for the app lookup workload and supported aggregate/distinct SQL shapes, plus resident-byte accounting, WAL-safe invalidation, manual refresh-cost accounting, memory-pressure fallback metadata, deterministic resident-snapshot budget admission/eviction, and a retained real CUDA allocation/copy handle for encoded snapshot bytes when local driver hardware is available. Keep broad production CUDA cache claims out of scope until query kernels read directly from retained device-memory handles."
+        "decision: current P7 evidence includes bounded resident table-data snapshot SELECT probes with zero per-query H2D transfer for the app lookup workload and supported aggregate/distinct SQL shapes, a retained-device-memory COUNT(*) kernel proof over the resident allocation, resident-byte accounting, WAL-safe invalidation, manual refresh-cost accounting, memory-pressure fallback metadata, deterministic resident-snapshot budget admission/eviction, and a retained real CUDA allocation/copy handle for encoded snapshot bytes when local driver hardware is available. Keep broad production CUDA cache claims out of scope until broader query kernels read directly from retained device-memory handles."
     );
 
     Ok(())
+}
+
+fn timed_resident_device_count_probe(
+    engine: &mut Engine,
+    query: &Select,
+    expected: &RelationalSelectResult,
+    name: &'static str,
+) -> Result<ProbeReport, Box<dyn Error>> {
+    let before = engine.metrics().snapshot();
+    let start = Instant::now();
+    let result = engine.execute_relational_count_with_resident_device_memory_probe(query)?;
+    let elapsed = start.elapsed();
+    let after = engine.metrics().snapshot();
+    let correctness_validated = result.columns == expected.columns && result.rows == expected.rows;
+    if !correctness_validated {
+        return Err(format!("{name} resident device-memory count diverged").into());
+    }
+    Ok(ProbeReport {
+        name,
+        elapsed,
+        result_rows: result.rows.len(),
+        planned_target: format!("{:?}", result.planned_target),
+        executed_target: format!("{:?}", result.executed_target),
+        access_path: format!("{:?}", result.access_path),
+        sql_fallback: result.fallback_reason.is_some(),
+        fallback_reason: result
+            .fallback_reason
+            .as_ref()
+            .map(|reason| format!("{reason:?}"))
+            .unwrap_or_else(|| "None".to_string()),
+        h2d_bytes: after.h2d_bytes_total - before.h2d_bytes_total,
+        d2h_bytes: after.d2h_bytes_total - before.d2h_bytes_total,
+        kernel_exec_samples: after.kernel_exec_samples - before.kernel_exec_samples,
+        kernel_exec_total_ms: after.kernel_exec_total_ms - before.kernel_exec_total_ms,
+        correctness_validated,
+    })
 }
 
 fn timed_resident_probe_many(

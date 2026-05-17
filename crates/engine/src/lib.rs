@@ -7858,6 +7858,81 @@ impl Engine {
         self.finalize_relational_select(select, table, bound, access_path, result)
     }
 
+    pub fn execute_relational_count_with_resident_device_memory_probe(
+        &mut self,
+        select: &Select,
+    ) -> Result<RelationalSelectResult, ExecuteError> {
+        let (table, bound) = self.bind_relational_select_for_execution(select)?;
+        if select.distinct
+            || !matches!(select.projection, SelectProjection::CountAll)
+            || select.group_by.is_some()
+            || !select.having_groups.is_empty()
+            || select.filter.is_some()
+            || !select.filters.is_empty()
+            || !select.filter_groups.is_empty()
+            || select.order_by.is_some()
+            || select.limit.is_some()
+            || select.offset.is_some()
+        {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory query proof currently supports only unfiltered SELECT COUNT(*)"
+                    .to_string(),
+            )));
+        }
+        let (_query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
+        let snapshot = self
+            .relational_residency_snapshot(&table.name)
+            .ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "relation \"{}\" has no resident snapshot",
+                    table.name
+                )))
+            })?;
+        if snapshot.schema != table.schema || snapshot.table != table.name {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident snapshot no longer matches catalog table identity".to_string(),
+            )));
+        }
+        if !snapshot.is_valid() {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "relation \"{}\" resident snapshot is invalid",
+                table.name
+            ))));
+        }
+        let device_memory = self
+            .relational_residency_device_memory
+            .get(&table.name)
+            .ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "relation \"{}\" has no retained resident device memory",
+                    table.name
+                )))
+            })?;
+        let row_count = device_memory
+            .count_rows_from_header()
+            .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
+        if row_count != snapshot.row_count as u64 {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "resident device-memory row-count proof returned {row_count}, expected {}",
+                snapshot.row_count
+            ))));
+        }
+        let count = i32::try_from(row_count).map_err(|_| {
+            ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "resident device-memory row count {row_count} exceeds supported COUNT(*) result range"
+            )))
+        })?;
+
+        Ok(RelationalSelectResult {
+            columns: bound.selected_columns,
+            rows: vec![vec![SqlValue::Int4(count)]],
+            planned_target: DeviceTarget::Gpu(snapshot.gpu_id),
+            executed_target: DeviceTarget::Gpu(snapshot.gpu_id),
+            fallback_reason: None,
+            access_path,
+        })
+    }
+
     #[cfg(test)]
     fn execute_relational_select_with_backend<B: MvccExecutionBackend>(
         &mut self,
@@ -8577,7 +8652,7 @@ impl Engine {
         let mut row_count = 0usize;
         let mut resident_bytes = 0u64;
         let mut resident_rows = Vec::new();
-        let mut device_payload = Vec::new();
+        let mut device_payload = vec![0; std::mem::size_of::<u64>()];
         while let Some(tuple) = cursor.next() {
             if !tuple.key.starts_with(&prefix) {
                 continue;
@@ -8596,6 +8671,8 @@ impl Engine {
                 );
             resident_rows.push(decoded);
         }
+        device_payload[..std::mem::size_of::<u64>()]
+            .copy_from_slice(&(row_count as u64).to_le_bytes());
         drop(cursor);
 
         let gpu_id = self.planner.default_gpu_id();
@@ -11622,6 +11699,15 @@ mod tests {
                 .device_memory_proof,
             None
         );
+
+        let Command::Select(select) = parse_command("SELECT COUNT(*) FROM events").unwrap() else {
+            unreachable!()
+        };
+        let err = e
+            .execute_relational_count_with_resident_device_memory_probe(&select)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("has no retained resident device memory"));
     }
 
     #[test]

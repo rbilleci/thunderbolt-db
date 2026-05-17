@@ -109,6 +109,10 @@ impl CudaResidentDeviceMemory {
     pub fn metadata(&self) -> &CudaDeviceMemoryProof {
         &self.metadata
     }
+
+    pub fn count_rows_from_header(&self) -> Result<u64, CudaRuntimeProbeError> {
+        launch_cuda_resident_row_count(self)
+    }
 }
 
 impl Drop for CudaResidentDeviceMemory {
@@ -559,6 +563,171 @@ fn launch_cuda_resident_device_memory(
         cu_ctx_destroy,
         _lib: lib,
     })
+}
+
+fn launch_cuda_resident_row_count(
+    resident: &CudaResidentDeviceMemory,
+) -> Result<u64, CudaRuntimeProbeError> {
+    type CuMemAlloc = unsafe extern "C" fn(*mut u64, usize) -> i32;
+    type CuMemFree = unsafe extern "C" fn(u64) -> i32;
+    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+    type CuModuleLoadData = unsafe extern "C" fn(*mut *mut c_void, *const c_void) -> i32;
+    type CuModuleUnload = unsafe extern "C" fn(*mut c_void) -> i32;
+    type CuModuleGetFunction =
+        unsafe extern "C" fn(*mut *mut c_void, *mut c_void, *const i8) -> i32;
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+    type CuCtxSynchronize = unsafe extern "C" fn() -> i32;
+
+    const PTX: &[u8] = br#"
+.version 6.0
+.target sm_30
+.address_size 64
+
+.visible .entry gpu_db_resident_row_count(
+    .param .u64 resident_ptr,
+    .param .u64 out_ptr
+)
+{
+    .reg .u64 %resident;
+    .reg .u64 %out;
+    .reg .u64 %rows;
+    ld.param.u64 %resident, [resident_ptr];
+    ld.param.u64 %out, [out_ptr];
+    ld.global.u64 %rows, [%resident];
+    st.global.u64 [%out], %rows;
+    ret;
+}
+"#;
+
+    if resident.metadata.allocated_bytes < std::mem::size_of::<u64>() as u64 {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(
+            resident.metadata.allocated_bytes as usize,
+        ));
+    }
+
+    let cu_mem_alloc = unsafe {
+        resident
+            ._lib
+            .get::<CuMemAlloc>(b"cuMemAlloc_v2\0")
+            .or_else(|_| resident._lib.get::<CuMemAlloc>(b"cuMemAlloc\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_mem_free = unsafe {
+        resident
+            ._lib
+            .get::<CuMemFree>(b"cuMemFree_v2\0")
+            .or_else(|_| resident._lib.get::<CuMemFree>(b"cuMemFree\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_memcpy_dtoh = unsafe {
+        resident
+            ._lib
+            .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+            .or_else(|_| resident._lib.get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_module_load_data = unsafe {
+        resident
+            ._lib
+            .get::<CuModuleLoadData>(b"cuModuleLoadData\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_module_unload = unsafe {
+        resident
+            ._lib
+            .get::<CuModuleUnload>(b"cuModuleUnload\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_module_get_function = unsafe {
+        resident
+            ._lib
+            .get::<CuModuleGetFunction>(b"cuModuleGetFunction\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_launch_kernel = unsafe {
+        resident
+            ._lib
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_ctx_synchronize = unsafe {
+        resident
+            ._lib
+            .get::<CuCtxSynchronize>(b"cuCtxSynchronize\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+
+    let mut device_output = 0_u64;
+    check_cuda(unsafe { cu_mem_alloc(&mut device_output, std::mem::size_of::<u64>()) })?;
+    let allocation_guard = CudaDeviceAllocationGuard {
+        ptr: device_output,
+        free: *cu_mem_free,
+    };
+
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+
+    let mut module = std::ptr::null_mut();
+    check_cuda(unsafe { cu_module_load_data(&mut module, ptx.as_ptr().cast::<c_void>()) })?;
+    let module_guard = CudaModuleGuard {
+        module,
+        unload: *cu_module_unload,
+    };
+
+    let mut function = std::ptr::null_mut();
+    check_cuda(unsafe {
+        cu_module_get_function(&mut function, module, c"gpu_db_resident_row_count".as_ptr())
+    })?;
+
+    let mut resident_arg = resident.device_ptr;
+    let mut output_arg = allocation_guard.ptr;
+    let mut args = [
+        (&mut resident_arg as *mut u64).cast::<c_void>(),
+        (&mut output_arg as *mut u64).cast::<c_void>(),
+    ];
+    check_cuda(unsafe {
+        cu_launch_kernel(
+            function,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            0,
+            std::ptr::null_mut(),
+            args.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    })?;
+    check_cuda(unsafe { cu_ctx_synchronize() })?;
+
+    let mut output = 0_u64;
+    check_cuda(unsafe {
+        cu_memcpy_dtoh(
+            (&mut output as *mut u64).cast::<c_void>(),
+            allocation_guard.ptr,
+            std::mem::size_of::<u64>(),
+        )
+    })?;
+
+    drop(module_guard);
+    drop(allocation_guard);
+
+    Ok(output)
 }
 
 impl GpuRuntime for CudaDriverRuntime {
