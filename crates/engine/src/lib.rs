@@ -8189,6 +8189,89 @@ impl Engine {
         })
     }
 
+    pub fn execute_relational_sum_with_resident_device_memory_probe(
+        &mut self,
+        select: &Select,
+    ) -> Result<RelationalSelectResult, ExecuteError> {
+        let (table, bound) = self.bind_relational_select_for_execution(select)?;
+        let SelectProjection::Sum { column } = &select.projection else {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory SUM proof currently supports only SELECT SUM(int4_column)"
+                    .to_string(),
+            )));
+        };
+        if select.distinct
+            || select.group_by.is_some()
+            || !select.having_groups.is_empty()
+            || select.filter.is_some()
+            || !select.filters.is_empty()
+            || !select.filter_groups.is_empty()
+            || select.order_by.is_some()
+            || select.limit.is_some()
+            || select.offset.is_some()
+        {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory SUM proof currently supports only unfiltered SELECT SUM(int4_column)"
+                    .to_string(),
+            )));
+        }
+        let sum_idx = relational_column_index(&table, column)?;
+        if table.columns[sum_idx].ty != SqlType::Int4 {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory SUM proof currently supports only int4 columns".to_string(),
+            )));
+        }
+
+        let (_query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
+        let snapshot = self
+            .relational_residency_snapshot(&table.name)
+            .ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "relation \"{}\" has no resident snapshot",
+                    table.name
+                )))
+            })?;
+        if snapshot.schema != table.schema || snapshot.table != table.name {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident snapshot no longer matches catalog table identity".to_string(),
+            )));
+        }
+        if !snapshot.is_valid() {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "relation \"{}\" resident snapshot is invalid",
+                table.name
+            ))));
+        }
+        let device_memory = self
+            .relational_residency_device_memory
+            .get(&table.name)
+            .ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "relation \"{}\" has no retained resident device memory",
+                    table.name
+                )))
+            })?;
+        let byte_offset = resident_device_int4_column_offset(&snapshot, &table, sum_idx)?;
+        let row_count = u64::try_from(snapshot.row_count).map_err(|_| {
+            ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident snapshot row count exceeds retained device-memory proof range"
+                    .to_string(),
+            ))
+        })?;
+        let sum = device_memory
+            .sum_i32_from_payload(byte_offset, row_count)
+            .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
+
+        Ok(RelationalSelectResult {
+            columns: bound.selected_columns,
+            rows: vec![vec![SqlValue::Int8(sum)]],
+            planned_target: DeviceTarget::Gpu(snapshot.gpu_id),
+            executed_target: DeviceTarget::Gpu(snapshot.gpu_id),
+            fallback_reason: None,
+            access_path,
+        })
+    }
+
     #[cfg(test)]
     fn execute_relational_select_with_backend<B: MvccExecutionBackend>(
         &mut self,
@@ -12009,6 +12092,16 @@ mod tests {
         };
         let err = e
             .execute_relational_range_count_with_resident_device_memory_probe(&range_select)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("has no retained resident device memory"));
+
+        let Command::Select(sum_select) = parse_command("SELECT SUM(id) FROM events").unwrap()
+        else {
+            unreachable!()
+        };
+        let err = e
+            .execute_relational_sum_with_resident_device_memory_probe(&sum_select)
             .unwrap_err()
             .to_string();
         assert!(err.contains("has no retained resident device memory"));
