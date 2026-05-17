@@ -13,7 +13,8 @@ use gpu_db_execution::{
 use gpu_db_metrics::{BatchFlushReason, FallbackReason, RuntimeMetrics, RuntimeMetricsSnapshot};
 use gpu_db_observability::{
     ActiveFallbackReason, EngineStatusSnapshot, EngineTelemetrySnapshot, FallbackStatus,
-    ReadinessStatus, ReplicationLagSnapshot, SnapshotStatus, TelemetrySink,
+    ReadinessStatus, RelationalResidencyStatus, RelationalResidencyTableStatus,
+    ReplicationLagSnapshot, SnapshotStatus, TelemetrySink,
 };
 use gpu_db_planner::{ExecutionPlan, Planner, PlannerConfig};
 use gpu_db_protocol::{
@@ -8704,6 +8705,58 @@ impl Engine {
         })
     }
 
+    fn relational_residency_status(&self) -> RelationalResidencyStatus {
+        let mut tables = self
+            .relational_residency
+            .values()
+            .map(|snapshot| {
+                let memory_pressure_active = self
+                    .router
+                    .runtime()
+                    .snapshot()
+                    .memory_pressured_gpu_ids
+                    .contains(&snapshot.gpu_id);
+                RelationalResidencyTableStatus {
+                    schema: snapshot.schema.clone(),
+                    table: snapshot.table.clone(),
+                    gpu_id: snapshot.gpu_id,
+                    row_count: snapshot.row_count,
+                    column_count: snapshot.column_count,
+                    resident_bytes: snapshot.resident_bytes,
+                    valid_through_index: snapshot.valid_through_index,
+                    valid: snapshot.invalidated_by_txn_id.is_none()
+                        && snapshot.invalidated_at_index.is_none()
+                        && !snapshot.invalidated_by_memory_pressure
+                        && !memory_pressure_active,
+                    invalidated_by_txn_id: snapshot.invalidated_by_txn_id,
+                    invalidated_at_index: snapshot.invalidated_at_index,
+                    invalidated_by_memory_pressure: snapshot.invalidated_by_memory_pressure,
+                    memory_pressure_active,
+                    admission_budget_bytes: snapshot.admission_budget_bytes,
+                    resident_bytes_after_admission: snapshot.resident_bytes_after_admission,
+                    evicted_tables_on_admission: snapshot.evicted_tables_on_admission.clone(),
+                }
+            })
+            .collect::<Vec<_>>();
+        tables.sort_by(|left, right| {
+            left.gpu_id
+                .cmp(&right.gpu_id)
+                .then_with(|| left.schema.cmp(&right.schema))
+                .then_with(|| left.table.cmp(&right.table))
+        });
+
+        let mut resident_bytes_by_gpu = BTreeMap::new();
+        for table in &tables {
+            *resident_bytes_by_gpu.entry(table.gpu_id).or_insert(0) += table.resident_bytes;
+        }
+
+        RelationalResidencyStatus {
+            tables,
+            resident_bytes_by_gpu,
+            budget_bytes_by_gpu: self.relational_residency_budget_bytes_by_gpu.clone(),
+        }
+    }
+
     pub fn execute_mvcc_query(
         &mut self,
         query: &MvccReadQuery,
@@ -9318,6 +9371,7 @@ impl Engine {
 
     pub fn telemetry_snapshot(&self) -> EngineTelemetrySnapshot {
         let marks = self.replication_watermarks();
+        let relational_residency = self.relational_residency_status();
         EngineTelemetrySnapshot {
             role: marks.role,
             replication_lag: ReplicationLagSnapshot {
@@ -9343,6 +9397,7 @@ impl Engine {
             follower_promotion_ready: marks.follower_promotion_ready,
             gpu_parity_fallbacks: self.metrics.fallback_counts_by_gpu_parity_issue(),
             gpu_runtime: self.router.runtime().snapshot(),
+            relational_residency,
         }
     }
 
@@ -9367,7 +9422,7 @@ impl Engine {
             active_reasons.push(ActiveFallbackReason::GpuQueueSaturated);
         }
 
-        EngineStatusSnapshot::new(
+        let mut status = EngineStatusSnapshot::new(
             marks.role,
             marks.term,
             SnapshotStatus {
@@ -9402,7 +9457,9 @@ impl Engine {
             },
             runtime_metrics,
         )
-        .expect("engine status snapshot invariants should hold")
+        .expect("engine status snapshot invariants should hold");
+        status.relational_residency = self.relational_residency_status();
+        status
     }
 
     pub fn publish_telemetry<S: TelemetrySink>(&self, sink: &mut S) {
@@ -11504,6 +11561,84 @@ mod tests {
         assert!(pressured.invalidated_by_memory_pressure);
         assert!(pressured.memory_pressure_active);
         assert!(!pressured.is_valid());
+    }
+
+    #[test]
+    fn status_and_telemetry_surface_relational_residency_state() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE events (id INT, label TEXT)")
+            .unwrap();
+        e.execute_text(2, "CREATE TABLE aux (id INT, label TEXT)")
+            .unwrap();
+        e.execute_text(
+            3,
+            "INSERT INTO events (id, label) VALUES (1, 'alpha'), (2, 'beta')",
+        )
+        .unwrap();
+        e.execute_text(4, "INSERT INTO aux (id, label) VALUES (1, 'aux')")
+            .unwrap();
+
+        let events = e.populate_relational_residency_snapshot("events").unwrap();
+        let aux = e.populate_relational_residency_snapshot("aux").unwrap();
+        let budget_bytes = events.resident_bytes;
+        e.set_relational_residency_budget_bytes(0, budget_bytes);
+        let admitted = e.populate_relational_residency_snapshot("events").unwrap();
+        assert_eq!(admitted.evicted_tables_on_admission, vec!["aux"]);
+
+        let status = e.status_snapshot();
+        assert_eq!(status.resident_table_count(), 1);
+        assert_eq!(status.relational_residency.snapshot_count(), 1);
+        assert_eq!(status.relational_residency.valid_snapshot_count(), 1);
+        assert_eq!(
+            status.relational_residency.total_resident_bytes(),
+            events.resident_bytes
+        );
+        assert_eq!(
+            status.relational_residency.budget_bytes_by_gpu.get(&0),
+            Some(&budget_bytes)
+        );
+        assert_eq!(
+            status.relational_residency.resident_bytes_by_gpu.get(&0),
+            Some(&events.resident_bytes)
+        );
+        let table = status.relational_residency.table("events").unwrap();
+        assert_eq!(table.schema, "public");
+        assert_eq!(table.gpu_id, 0);
+        assert_eq!(table.row_count, 2);
+        assert_eq!(table.column_count, 2);
+        assert_eq!(table.resident_bytes, events.resident_bytes);
+        assert_eq!(table.admission_budget_bytes, Some(budget_bytes));
+        assert_eq!(table.resident_bytes_after_admission, events.resident_bytes);
+        assert_eq!(table.evicted_tables_on_admission, vec!["aux"]);
+        assert!(table.valid);
+        assert!(status.relational_residency.table("aux").is_none());
+        status.validate().unwrap();
+
+        e.execute_text(5, "INSERT INTO events (id, label) VALUES (3, 'gamma')")
+            .unwrap();
+        let invalidated = e.telemetry_snapshot();
+        let invalidated_table = invalidated.relational_residency.table("events").unwrap();
+        assert_eq!(invalidated.resident_table_count(), 1);
+        assert!(!invalidated_table.valid);
+        assert_eq!(invalidated_table.invalidated_by_txn_id, Some(5));
+        assert_eq!(invalidated.relational_residency.invalid_snapshot_count(), 1);
+
+        e.mark_gpu_memory_pressured(0);
+        let pressured = e.status_snapshot();
+        let pressured_table = pressured.relational_residency.table("events").unwrap();
+        assert!(pressured_table.memory_pressure_active);
+        assert!(pressured_table.invalidated_by_memory_pressure);
+        assert_eq!(
+            pressured
+                .relational_residency
+                .memory_pressured_snapshot_count(),
+            1
+        );
+        assert_eq!(
+            e.relational_resident_bytes_for_gpu(0),
+            events.resident_bytes
+        );
+        assert!(aux.resident_bytes > 0);
     }
 
     #[test]

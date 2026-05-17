@@ -112,6 +112,66 @@ pub struct ReadinessStatus {
     pub follower_promotion_ready: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationalResidencyTableStatus {
+    pub schema: String,
+    pub table: String,
+    pub gpu_id: u16,
+    pub row_count: usize,
+    pub column_count: usize,
+    pub resident_bytes: u64,
+    pub valid_through_index: Index,
+    pub valid: bool,
+    pub invalidated_by_txn_id: Option<TxnId>,
+    pub invalidated_at_index: Option<Index>,
+    pub invalidated_by_memory_pressure: bool,
+    pub memory_pressure_active: bool,
+    pub admission_budget_bytes: Option<u64>,
+    pub resident_bytes_after_admission: u64,
+    pub evicted_tables_on_admission: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RelationalResidencyStatus {
+    pub tables: Vec<RelationalResidencyTableStatus>,
+    pub resident_bytes_by_gpu: BTreeMap<u16, u64>,
+    pub budget_bytes_by_gpu: BTreeMap<u16, u64>,
+}
+
+impl RelationalResidencyStatus {
+    pub fn snapshot_count(&self) -> usize {
+        self.tables.len()
+    }
+
+    pub fn valid_snapshot_count(&self) -> usize {
+        self.tables.iter().filter(|table| table.valid).count()
+    }
+
+    pub fn invalid_snapshot_count(&self) -> usize {
+        self.snapshot_count()
+            .saturating_sub(self.valid_snapshot_count())
+    }
+
+    pub fn memory_pressured_snapshot_count(&self) -> usize {
+        self.tables
+            .iter()
+            .filter(|table| table.memory_pressure_active || table.invalidated_by_memory_pressure)
+            .count()
+    }
+
+    pub fn total_resident_bytes(&self) -> u64 {
+        self.resident_bytes_by_gpu.values().copied().sum()
+    }
+
+    pub fn table(&self, table: &str) -> Option<&RelationalResidencyTableStatus> {
+        self.tables.iter().find(|status| status.table == table)
+    }
+
+    pub fn has_resident_tables(&self) -> bool {
+        !self.tables.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct EngineStatusSnapshot {
     pub role: Role,
@@ -120,6 +180,7 @@ pub struct EngineStatusSnapshot {
     pub replication_lag: ReplicationLagSnapshot,
     pub readiness: ReadinessStatus,
     pub fallback: FallbackStatus,
+    pub relational_residency: RelationalResidencyStatus,
     pub runtime_metrics: RuntimeMetricsSnapshot,
 }
 
@@ -196,6 +257,7 @@ impl EngineStatusSnapshot {
             replication_lag,
             readiness,
             fallback,
+            relational_residency: RelationalResidencyStatus::default(),
             runtime_metrics,
         };
         snapshot.validate()?;
@@ -298,6 +360,10 @@ impl EngineStatusSnapshot {
     pub fn replication_distance(&self) -> Index {
         self.replication_lag.max_gap()
     }
+
+    pub fn resident_table_count(&self) -> usize {
+        self.relational_residency.snapshot_count()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -320,6 +386,7 @@ pub struct EngineTelemetrySnapshot {
     pub follower_promotion_ready: bool,
     pub gpu_parity_fallbacks: BTreeMap<GpuParityIssue, u64>,
     pub gpu_runtime: GpuRuntimeSnapshot,
+    pub relational_residency: RelationalResidencyStatus,
 }
 
 impl EngineTelemetrySnapshot {
@@ -425,6 +492,10 @@ impl EngineTelemetrySnapshot {
             && self.total_backlog_items() == 0
             && !self.has_backlog_blockers()
     }
+
+    pub fn resident_table_count(&self) -> usize {
+        self.relational_residency.snapshot_count()
+    }
 }
 
 pub trait TelemetrySink {
@@ -504,6 +575,7 @@ mod tests {
             follower_promotion_ready: false,
             gpu_parity_fallbacks: BTreeMap::new(),
             gpu_runtime: GpuRuntimeSnapshot::default(),
+            relational_residency: RelationalResidencyStatus::default(),
         }
     }
 
@@ -593,6 +665,7 @@ mod tests {
         assert_eq!(snapshot.total_backlog_items(), 0);
         assert!(snapshot.is_write_path_quiescent());
         assert!(snapshot.is_fully_caught_up());
+        assert_eq!(snapshot.resident_table_count(), 0);
         assert!(snapshot.quiescent_for_failover);
         assert!(!snapshot.follower_promotion_ready);
 
@@ -625,6 +698,59 @@ mod tests {
         assert!(!snapshot.is_write_path_quiescent());
         assert!(!snapshot.is_fully_caught_up());
         assert!(!snapshot.quiescent_for_failover);
+    }
+
+    #[test]
+    fn residency_status_helpers_summarize_tables_and_budgets() {
+        let status = RelationalResidencyStatus {
+            tables: vec![
+                RelationalResidencyTableStatus {
+                    schema: "public".to_string(),
+                    table: "events".to_string(),
+                    gpu_id: 0,
+                    row_count: 2,
+                    column_count: 2,
+                    resident_bytes: 128,
+                    valid_through_index: 4,
+                    valid: true,
+                    invalidated_by_txn_id: None,
+                    invalidated_at_index: None,
+                    invalidated_by_memory_pressure: false,
+                    memory_pressure_active: false,
+                    admission_budget_bytes: Some(256),
+                    resident_bytes_after_admission: 128,
+                    evicted_tables_on_admission: Vec::new(),
+                },
+                RelationalResidencyTableStatus {
+                    schema: "public".to_string(),
+                    table: "stale_events".to_string(),
+                    gpu_id: 0,
+                    row_count: 1,
+                    column_count: 2,
+                    resident_bytes: 64,
+                    valid_through_index: 2,
+                    valid: false,
+                    invalidated_by_txn_id: Some(5),
+                    invalidated_at_index: Some(5),
+                    invalidated_by_memory_pressure: true,
+                    memory_pressure_active: true,
+                    admission_budget_bytes: Some(256),
+                    resident_bytes_after_admission: 192,
+                    evicted_tables_on_admission: vec!["old_events".to_string()],
+                },
+            ],
+            resident_bytes_by_gpu: BTreeMap::from([(0, 192)]),
+            budget_bytes_by_gpu: BTreeMap::from([(0, 256)]),
+        };
+
+        assert!(status.has_resident_tables());
+        assert_eq!(status.snapshot_count(), 2);
+        assert_eq!(status.valid_snapshot_count(), 1);
+        assert_eq!(status.invalid_snapshot_count(), 1);
+        assert_eq!(status.memory_pressured_snapshot_count(), 1);
+        assert_eq!(status.total_resident_bytes(), 192);
+        assert_eq!(status.table("events").unwrap().row_count, 2);
+        assert!(status.table("missing").is_none());
     }
 
     #[test]
