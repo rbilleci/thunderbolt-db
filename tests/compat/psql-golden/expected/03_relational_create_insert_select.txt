@@ -40,3 +40,10 @@ INSERT 0 3
   1 | Ada
   3 | Grace
 (2 rows)
+
+=== relational in membership filter ===
+ id | name
+----+-------
+  3 | Grace
+  1 | Ada
+(2 rows)

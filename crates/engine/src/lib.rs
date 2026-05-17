@@ -23616,6 +23616,47 @@ mod tests {
     }
 
     #[test]
+    fn relational_sql_gpu_bridge_in_membership_uses_index_batch() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO people (id, name) VALUES (1, 'Ada'), (2, 'Linus'), (3, 'Grace'), (4, 'Katherine')",
+        )
+        .unwrap();
+
+        let Command::Select(select) =
+            parse_command("SELECT id FROM people WHERE id IN (1, 3) ORDER BY id DESC").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let result = e
+            .execute_relational_select_with_backend(&select, &FirstCudaSliceParityBackend)
+            .unwrap();
+
+        assert_eq!(
+            result.rows,
+            vec![vec![SqlValue::Int4(3)], vec![SqlValue::Int4(1)]]
+        );
+        assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.fallback_reason, None);
+        assert_eq!(
+            result.access_path,
+            RelationalAccessPath::OrderedKeyBatch {
+                table: "people".to_string(),
+                predicate_column: Some("id".to_string()),
+                predicate_op: Some(SelectFilterOp::Eq),
+                order_column: "id".to_string(),
+                descending: true,
+                matched_keys: 2,
+            }
+        );
+        assert_eq!(e.status_snapshot().latest_fallback_reason(), None);
+    }
+
+    #[test]
     fn relational_sql_gpu_bridge_or_predicates_with_order_use_ordered_key_batch() {
         let mut e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")

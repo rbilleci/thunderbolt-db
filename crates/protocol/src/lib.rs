@@ -132,7 +132,7 @@ pub enum ParseError {
     InvalidDel,
     #[error("invalid GET syntax; expected: GET key")]
     InvalidGet,
-    #[error("invalid relational SQL syntax; supported subset: CREATE TABLE name (...), INSERT INTO name (...) VALUES (...), SELECT columns FROM name [WHERE column (=|<|<=|>|>=) literal [AND ...] [OR ...]] [ORDER BY column [ASC|DESC]] [LIMIT n]")]
+    #[error("invalid relational SQL syntax; supported subset: CREATE TABLE name (...), INSERT INTO name (...) VALUES (...), SELECT columns FROM name [WHERE column (=|<|<=|>|>=) literal | column IN (literal, ...) [AND ...] [OR ...]] [ORDER BY column [ASC|DESC]] [LIMIT n]")]
     InvalidRelationalSql,
     #[error("LIMIT must not be negative")]
     NegativeLimit,
@@ -1738,7 +1738,39 @@ fn parse_select_filter_factor(input: &str) -> Result<Vec<Vec<SelectFilter>>, Par
             return parse_select_filter_or_groups(&input[1..close]);
         }
     }
+    if let Some(groups) = parse_select_in_filter_groups(input)? {
+        return Ok(groups);
+    }
     Ok(vec![vec![parse_select_filter(input)?]])
+}
+
+fn parse_select_in_filter_groups(
+    input: &str,
+) -> Result<Option<Vec<Vec<SelectFilter>>>, ParseError> {
+    let Some(pos) = find_keyword_outside_quotes(input, "IN") else {
+        return Ok(None);
+    };
+    let column = normalize_identifier(input[..pos].trim())?;
+    let values = input[pos + "IN".len()..].trim();
+    if !values.starts_with('(') {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let close = find_matching_paren(values, 0).ok_or(ParseError::InvalidRelationalSql)?;
+    if close != values.len() - 1 {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let values = split_csv(&values[1..close])?;
+    let groups = values
+        .into_iter()
+        .map(|value| {
+            Ok(vec![SelectFilter {
+                column: column.clone(),
+                op: SelectFilterOp::Eq,
+                value: parse_sql_value(value)?,
+            }])
+        })
+        .collect::<Result<Vec<_>, ParseError>>()?;
+    Ok(Some(groups))
 }
 
 fn split_select_filter(input: &str) -> Result<(&str, SelectFilterOp, &str), ParseError> {
@@ -8744,5 +8776,111 @@ mod tests {
                 limit: None,
             })
         );
+    }
+
+    #[test]
+    fn parses_relational_select_in_membership_predicates_as_filter_groups() {
+        assert_eq!(
+            parse_command("SELECT id FROM people WHERE id IN (1, 3, 5) ORDER BY id").unwrap(),
+            Command::Select(Select {
+                table: "people".to_string(),
+                projection: SelectProjection::Columns(vec!["id".to_string()]),
+                filter: Some(SelectFilter {
+                    column: "id".to_string(),
+                    op: SelectFilterOp::Eq,
+                    value: SqlValue::Int4(1),
+                }),
+                filters: vec![SelectFilter {
+                    column: "id".to_string(),
+                    op: SelectFilterOp::Eq,
+                    value: SqlValue::Int4(1),
+                }],
+                filter_groups: vec![
+                    vec![SelectFilter {
+                        column: "id".to_string(),
+                        op: SelectFilterOp::Eq,
+                        value: SqlValue::Int4(1),
+                    }],
+                    vec![SelectFilter {
+                        column: "id".to_string(),
+                        op: SelectFilterOp::Eq,
+                        value: SqlValue::Int4(3),
+                    }],
+                    vec![SelectFilter {
+                        column: "id".to_string(),
+                        op: SelectFilterOp::Eq,
+                        value: SqlValue::Int4(5),
+                    }],
+                ],
+                order_by: Some(SelectOrder {
+                    column: "id".to_string(),
+                    descending: false,
+                }),
+                limit: None,
+            })
+        );
+
+        assert_eq!(
+            parse_command("SELECT name FROM people WHERE name IN ('Ada', 'Grace') AND id >= 2")
+                .unwrap(),
+            Command::Select(Select {
+                table: "people".to_string(),
+                projection: SelectProjection::Columns(vec!["name".to_string()]),
+                filter: Some(SelectFilter {
+                    column: "name".to_string(),
+                    op: SelectFilterOp::Eq,
+                    value: SqlValue::Text("Ada".to_string()),
+                }),
+                filters: vec![
+                    SelectFilter {
+                        column: "name".to_string(),
+                        op: SelectFilterOp::Eq,
+                        value: SqlValue::Text("Ada".to_string()),
+                    },
+                    SelectFilter {
+                        column: "id".to_string(),
+                        op: SelectFilterOp::Gte,
+                        value: SqlValue::Int4(2),
+                    },
+                ],
+                filter_groups: vec![
+                    vec![
+                        SelectFilter {
+                            column: "name".to_string(),
+                            op: SelectFilterOp::Eq,
+                            value: SqlValue::Text("Ada".to_string()),
+                        },
+                        SelectFilter {
+                            column: "id".to_string(),
+                            op: SelectFilterOp::Gte,
+                            value: SqlValue::Int4(2),
+                        },
+                    ],
+                    vec![
+                        SelectFilter {
+                            column: "name".to_string(),
+                            op: SelectFilterOp::Eq,
+                            value: SqlValue::Text("Grace".to_string()),
+                        },
+                        SelectFilter {
+                            column: "id".to_string(),
+                            op: SelectFilterOp::Gte,
+                            value: SqlValue::Int4(2),
+                        },
+                    ],
+                ],
+                order_by: None,
+                limit: None,
+            })
+        );
+
+        assert!(matches!(
+            parse_command("SELECT id FROM people WHERE id IN ()"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command("SELECT id FROM people WHERE id NOT IN (1, 2)"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
     }
 }
