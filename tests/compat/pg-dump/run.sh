@@ -7,6 +7,7 @@ SOURCE_PORT="${PG_DUMP_SMOKE_SOURCE_PORT:-55444}"
 RESTORE_PORT="${PG_DUMP_SMOKE_RESTORE_PORT:-55445}"
 CUSTOM_RESTORE_PORT="${PG_DUMP_SMOKE_CUSTOM_RESTORE_PORT:-55446}"
 DIRECTORY_RESTORE_PORT="${PG_DUMP_SMOKE_DIRECTORY_RESTORE_PORT:-55447}"
+TAR_RESTORE_PORT="${PG_DUMP_SMOKE_TAR_RESTORE_PORT:-55448}"
 
 rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR"
@@ -15,6 +16,7 @@ source_pid=""
 restore_pid=""
 custom_restore_pid=""
 directory_restore_pid=""
+tar_restore_pid=""
 
 cleanup() {
   if [[ -n "$source_pid" ]]; then
@@ -32,6 +34,10 @@ cleanup() {
   if [[ -n "$directory_restore_pid" ]]; then
     kill "$directory_restore_pid" 2>/dev/null || true
     wait "$directory_restore_pid" 2>/dev/null || true
+  fi
+  if [[ -n "$tar_restore_pid" ]]; then
+    kill "$tar_restore_pid" 2>/dev/null || true
+    wait "$tar_restore_pid" 2>/dev/null || true
   fi
 }
 trap cleanup EXIT
@@ -76,6 +82,10 @@ PGHOST=127.0.0.1 PGPORT="$SOURCE_PORT" PGDATABASE=postgres PGUSER=postgres \
 PGHOST=127.0.0.1 PGPORT="$SOURCE_PORT" PGDATABASE=postgres PGUSER=postgres \
   pg_dump --schema=public --no-owner --no-privileges --format=directory \
   --file="$OUT_DIR/dump.dir" 2>"$OUT_DIR/pg_dump_directory.err"
+
+PGHOST=127.0.0.1 PGPORT="$SOURCE_PORT" PGDATABASE=postgres PGUSER=postgres \
+  pg_dump --schema=public --no-owner --no-privileges --format=tar \
+  --file="$OUT_DIR/dump.tar" 2>"$OUT_DIR/pg_dump_tar.err"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/restore-server.log" 2>&1 &
@@ -135,8 +145,26 @@ PGHOST=127.0.0.1 PGPORT="$DIRECTORY_RESTORE_PORT" PGDATABASE=postgres PGUSER=pos
 
 diff -u "$OUT_DIR/verify.expected" "$OUT_DIR/directory-verify.out"
 
+cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$TAR_RESTORE_PORT" --shared-catalog \
+  >"$OUT_DIR/tar-restore-server.log" 2>&1 &
+tar_restore_pid=$!
+wait_for_port "$TAR_RESTORE_PORT"
+
+PGHOST=127.0.0.1 PGPORT="$TAR_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres \
+  pg_restore --no-owner --no-privileges --dbname=postgres "$OUT_DIR/dump.tar" \
+  >"$OUT_DIR/tar-restore.out" 2>"$OUT_DIR/tar-restore.err"
+
+PGHOST=127.0.0.1 PGPORT="$TAR_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres \
+  psql -v ON_ERROR_STOP=1 -X -A -t \
+  -c "SELECT id, name FROM accounts ORDER BY id;" \
+  -c "SELECT event_id, note FROM events ORDER BY event_id;" \
+  >"$OUT_DIR/tar-verify.out" 2>"$OUT_DIR/tar-verify.err"
+
+diff -u "$OUT_DIR/verify.expected" "$OUT_DIR/tar-verify.out"
+
 pg_restore --list "$OUT_DIR/dump.custom" >"$OUT_DIR/dump.custom.toc"
 pg_restore --list "$OUT_DIR/dump.dir" >"$OUT_DIR/dump.dir.toc"
+pg_restore --list "$OUT_DIR/dump.tar" >"$OUT_DIR/dump.tar.toc"
 
 grep -F "COPY public.accounts (id, name) FROM stdin;" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "COPY public.events (event_id, note) FROM stdin;" "$OUT_DIR/dump.sql" >/dev/null
@@ -153,10 +181,17 @@ grep -F "TABLE public accounts" "$OUT_DIR/dump.dir.toc" >/dev/null
 grep -F "TABLE public events" "$OUT_DIR/dump.dir.toc" >/dev/null
 grep -F "TABLE DATA public accounts" "$OUT_DIR/dump.dir.toc" >/dev/null
 grep -F "TABLE DATA public events" "$OUT_DIR/dump.dir.toc" >/dev/null
+grep -F "SCHEMA - public" "$OUT_DIR/dump.tar.toc" >/dev/null
+grep -F "TABLE public accounts" "$OUT_DIR/dump.tar.toc" >/dev/null
+grep -F "TABLE public events" "$OUT_DIR/dump.tar.toc" >/dev/null
+grep -F "TABLE DATA public accounts" "$OUT_DIR/dump.tar.toc" >/dev/null
+grep -F "TABLE DATA public events" "$OUT_DIR/dump.tar.toc" >/dev/null
 
 echo "pg_dump_plain_public_schema_restore=passed"
 echo "pg_dump_custom_public_schema_pg_restore=passed"
 echo "pg_dump_directory_public_schema_pg_restore=passed"
+echo "pg_dump_tar_public_schema_pg_restore=passed"
 echo "dump_file=$OUT_DIR/dump.sql"
 echo "custom_dump_file=$OUT_DIR/dump.custom"
 echo "directory_dump_dir=$OUT_DIR/dump.dir"
+echo "tar_dump_file=$OUT_DIR/dump.tar"
