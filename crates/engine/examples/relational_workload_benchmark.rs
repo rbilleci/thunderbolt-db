@@ -54,6 +54,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     let disjunctive_queries = vec![select(
         "SELECT id, amount FROM events WHERE amount >= 990 OR category = 'odd' ORDER BY amount DESC LIMIT 25",
     )?];
+    let aggregate_distinct_queries = vec![
+        select("SELECT DISTINCT category FROM events ORDER BY category")?,
+        select(
+            "SELECT category, COUNT(*) FROM events WHERE amount >= 900 GROUP BY category ORDER BY count DESC",
+        )?,
+        select(
+            "SELECT category, SUM(amount) FROM events WHERE amount >= 900 GROUP BY category ORDER BY sum DESC",
+        )?,
+        select("SELECT AVG(amount) FROM events WHERE category = 'even'")?,
+        select("SELECT MIN(amount) FROM events WHERE amount >= 900")?,
+        select("SELECT MAX(amount) FROM events WHERE amount >= 900")?,
+    ];
 
     let app = run_workload("app_indexed_point_lookup", row_count, &app_queries)?;
     let app_batched = run_workload("app_batched_or_lookup", row_count, &app_batched_queries)?;
@@ -68,6 +80,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         "analytic_disjunctive_filter",
         row_count,
         &disjunctive_queries,
+    )?;
+    let aggregate_distinct = run_workload(
+        "analytic_aggregate_distinct",
+        row_count,
+        &aggregate_distinct_queries,
     )?;
 
     println!("# P7 Relational Workload Benchmark");
@@ -89,6 +106,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!();
     print_workload(&disjunctive);
     println!();
+    print_workload(&aggregate_distinct);
+    println!();
     print_decision(
         &app,
         &app_batched,
@@ -96,6 +115,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         &range,
         &conjunctive,
         &disjunctive,
+        &aggregate_distinct,
     );
 
     Ok(())
@@ -168,24 +188,25 @@ fn print_decision(
     range: &WorkloadReport,
     conjunctive: &WorkloadReport,
     disjunctive: &WorkloadReport,
+    aggregate_distinct: &WorkloadReport,
 ) {
     if analytic.bridge.gpu_executed_count > 0 && analytic.gpu_elapsed < analytic.cpu_elapsed {
         println!(
-            "decision: GPU probe is faster for the analytical scan in this run; keep prioritizing SQL predicate/order/projection pushdown so more relational shapes can use the same path."
+            "decision: GPU probe is faster for the analytical scan in this run; aggregate/distinct SQL shapes also have correctness, routing, fallback, transfer, and timing evidence, so keep prioritizing SQL predicate/order/projection pushdown and measured workload wins before making broader performance claims."
         );
         return;
     }
 
     if app_batched.bridge.gpu_executed_count > 0 && app_batched.gpu_elapsed < app.gpu_elapsed {
         println!(
-            "decision: batching lookup predicates into one supported OR query reduces GPU probe latency versus repeated point lookups, but analytical scans still do not beat CPU; prioritize batching plus transfer layout before making broad performance claims."
+            "decision: batching lookup predicates into one supported OR query reduces GPU probe latency versus repeated point lookups, and aggregate/distinct SQL shapes now have correctness, routing, fallback, transfer, and timing evidence; analytical scans still do not beat CPU, so prioritize batching plus transfer layout before making broad performance claims."
         );
         return;
     }
 
     if analytic.bridge.gpu_executed_count > 0 {
         println!(
-            "decision: analytical scans reach GPU execution with SQL-level transfer and timing telemetry but do not yet beat the CPU baseline in this run; compare batched lookup latency against repeated point lookups, then prioritize transfer layout, batching, and driver-level timing refinement before making broad performance claims."
+            "decision: analytical scans reach GPU execution with SQL-level transfer and timing telemetry but do not yet beat the CPU baseline in this run; aggregate/distinct SQL shapes have the same benchmark evidence boundary, so prioritize transfer layout, batching, and driver-level timing refinement before making broad performance claims."
         );
         return;
     }
@@ -196,6 +217,7 @@ fn print_decision(
         || range.bridge.cpu_fallback_count > 0
         || conjunctive.bridge.cpu_fallback_count > 0
         || disjunctive.bridge.cpu_fallback_count > 0
+        || aggregate_distinct.bridge.cpu_fallback_count > 0
     {
         println!(
             "decision: current relational workloads still fall back for important SQL shapes; prioritize SQL-to-GPU bridge expansion before claiming workload-level GPU advantage."
@@ -204,7 +226,7 @@ fn print_decision(
     }
 
     println!(
-        "decision: no GPU advantage was demonstrated; keep P7 claims limited to correctness and routing evidence until a measured workload beats CPU."
+        "decision: no GPU advantage was demonstrated; aggregate/distinct SQL shapes now have correctness, routing, fallback, transfer, and timing evidence, but keep broad P7 performance claims limited until a measured workload beats CPU."
     );
 }
 
