@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+OUT_DIR="${PG_DUMP_SMOKE_OUT_DIR:-$ROOT_DIR/target/pg-dump-smoke}"
+SOURCE_PORT="${PG_DUMP_SMOKE_SOURCE_PORT:-55444}"
+RESTORE_PORT="${PG_DUMP_SMOKE_RESTORE_PORT:-55445}"
+
+rm -rf "$OUT_DIR"
+mkdir -p "$OUT_DIR"
+
+source_pid=""
+restore_pid=""
+
+cleanup() {
+  if [[ -n "$source_pid" ]]; then
+    kill "$source_pid" 2>/dev/null || true
+    wait "$source_pid" 2>/dev/null || true
+  fi
+  if [[ -n "$restore_pid" ]]; then
+    kill "$restore_pid" 2>/dev/null || true
+    wait "$restore_pid" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
+
+wait_for_port() {
+  local port="$1"
+  for _ in $(seq 1 160); do
+    if (echo >"/dev/tcp/127.0.0.1/$port") >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "server on port $port did not become ready" >&2
+  return 1
+}
+
+cd "$ROOT_DIR"
+
+cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$SOURCE_PORT" --shared-catalog \
+  >"$OUT_DIR/source-server.log" 2>&1 &
+source_pid=$!
+wait_for_port "$SOURCE_PORT"
+
+PGHOST=127.0.0.1 PGPORT="$SOURCE_PORT" PGDATABASE=postgres PGUSER=postgres \
+  psql -v ON_ERROR_STOP=1 -X -q <<'SQL'
+CREATE TABLE accounts (id int4, name text);
+INSERT INTO accounts (id, name) VALUES (1, 'Ada');
+INSERT INTO accounts (id, name) VALUES (2, 'Grace');
+CREATE TABLE events (event_id int4, note text);
+INSERT INTO events (event_id, note) VALUES (10, 'created');
+INSERT INTO events (event_id, note) VALUES (11, 'updated');
+SQL
+
+PGHOST=127.0.0.1 PGPORT="$SOURCE_PORT" PGDATABASE=postgres PGUSER=postgres \
+  pg_dump --data-only --table=accounts --table=events --no-owner --no-privileges --format=plain \
+  >"$OUT_DIR/dump.sql" 2>"$OUT_DIR/pg_dump.err"
+
+cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$RESTORE_PORT" --shared-catalog \
+  >"$OUT_DIR/restore-server.log" 2>&1 &
+restore_pid=$!
+wait_for_port "$RESTORE_PORT"
+
+PGHOST=127.0.0.1 PGPORT="$RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres \
+  psql -v ON_ERROR_STOP=1 -X -q <<'SQL'
+CREATE TABLE accounts (id int4, name text);
+CREATE TABLE events (event_id int4, note text);
+SQL
+
+PGHOST=127.0.0.1 PGPORT="$RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres \
+  psql -v ON_ERROR_STOP=1 -X -q -f "$OUT_DIR/dump.sql" \
+  >"$OUT_DIR/restore.out" 2>"$OUT_DIR/restore.err"
+
+PGHOST=127.0.0.1 PGPORT="$RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres \
+  psql -v ON_ERROR_STOP=1 -X -A -t \
+  -c "SELECT id, name FROM accounts ORDER BY id;" \
+  -c "SELECT event_id, note FROM events ORDER BY event_id;" \
+  >"$OUT_DIR/verify.out" 2>"$OUT_DIR/verify.err"
+
+cat >"$OUT_DIR/verify.expected" <<'EOF'
+1|Ada
+2|Grace
+10|created
+11|updated
+EOF
+
+diff -u "$OUT_DIR/verify.expected" "$OUT_DIR/verify.out"
+
+grep -F "COPY public.accounts (id, name) FROM stdin;" "$OUT_DIR/dump.sql" >/dev/null
+grep -F "COPY public.events (event_id, note) FROM stdin;" "$OUT_DIR/dump.sql" >/dev/null
+
+echo "pg_dump_plain_data_restore=passed"
+echo "dump_file=$OUT_DIR/dump.sql"

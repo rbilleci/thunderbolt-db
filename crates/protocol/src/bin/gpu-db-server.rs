@@ -2,6 +2,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 
 use gpu_db_protocol::{
@@ -11,6 +12,7 @@ use gpu_db_protocol::{
 use gpu_db_protocol::{DescribeTarget, SqlType};
 
 const PUBLIC_NAMESPACE_OID: u32 = 2200;
+static SHARED_CATALOG: OnceLock<Mutex<SharedCatalog>> = OnceLock::new();
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Column {
@@ -236,23 +238,67 @@ struct Session {
     tables: HashMap<String, Table>,
     copy_in: Option<CopyInState>,
     next_relation_oid: u32,
+    shared_catalog: bool,
 }
 
-impl Default for Session {
+#[derive(Clone, Debug)]
+struct SharedCatalog {
+    tables: HashMap<String, Table>,
+    next_relation_oid: u32,
+}
+
+impl Default for SharedCatalog {
     fn default() -> Self {
         Self {
-            in_transaction: false,
-            prepared: HashMap::new(),
-            portals: HashMap::new(),
-            cursors: HashMap::new(),
             tables: HashMap::new(),
-            copy_in: None,
             next_relation_oid: FIRST_USER_RELATION_OID,
         }
     }
 }
 
+fn shared_catalog() -> &'static Mutex<SharedCatalog> {
+    SHARED_CATALOG.get_or_init(|| Mutex::new(SharedCatalog::default()))
+}
+
+impl Default for Session {
+    fn default() -> Self {
+        Self::new(false)
+    }
+}
+
 impl Session {
+    fn new(shared_catalog_enabled: bool) -> Self {
+        let catalog = if shared_catalog_enabled {
+            shared_catalog()
+                .lock()
+                .expect("shared catalog mutex poisoned")
+                .clone()
+        } else {
+            SharedCatalog::default()
+        };
+        Self {
+            in_transaction: false,
+            prepared: HashMap::new(),
+            portals: HashMap::new(),
+            cursors: HashMap::new(),
+            tables: catalog.tables,
+            copy_in: None,
+            next_relation_oid: catalog.next_relation_oid,
+            shared_catalog: shared_catalog_enabled,
+        }
+    }
+
+    fn persist_catalog_snapshot(&self) {
+        if !self.shared_catalog {
+            return;
+        }
+        let mut catalog = shared_catalog()
+            .lock()
+            .expect("shared catalog mutex poisoned");
+        catalog.tables = self.tables.clone();
+        catalog.next_relation_oid = self.next_relation_oid;
+    }
+
     fn close_extended_target(&mut self, target: DescribeTarget, name: &str) {
         match target {
             DescribeTarget::Statement => {
@@ -363,16 +409,23 @@ struct SelectResult {
 
 const FIRST_USER_RELATION_OID: u32 = 16_384;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ServerConfig {
+    listen: String,
+    shared_catalog: bool,
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let listen = parse_listen_arg(env::args().skip(1))?;
-    let listener = TcpListener::bind(&listen)?;
-    eprintln!("gpu-db-server listening on {listen}");
+    let config = parse_args(env::args().skip(1))?;
+    let listener = TcpListener::bind(&config.listen)?;
+    eprintln!("gpu-db-server listening on {}", config.listen);
 
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                thread::spawn(|| {
-                    if let Err(error) = handle_client(stream) {
+                let shared_catalog = config.shared_catalog;
+                thread::spawn(move || {
+                    if let Err(error) = handle_client(stream, shared_catalog) {
                         eprintln!("client error: {error}");
                     }
                 });
@@ -384,11 +437,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn parse_listen_arg<I>(mut args: I) -> Result<String, String>
+fn parse_args<I>(mut args: I) -> Result<ServerConfig, String>
 where
     I: Iterator<Item = String>,
 {
     let mut listen = String::from("127.0.0.1:5432");
+    let mut shared_catalog = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--listen" => {
@@ -397,18 +451,26 @@ where
                     .ok_or_else(|| String::from("missing value for --listen"))?;
                 listen = value;
             }
+            "--shared-catalog" => {
+                shared_catalog = true;
+            }
             "-h" | "--help" => {
-                return Err(String::from("usage: gpu-db-server [--listen HOST:PORT]"));
+                return Err(String::from(
+                    "usage: gpu-db-server [--listen HOST:PORT] [--shared-catalog]",
+                ));
             }
             other => return Err(format!("unsupported argument: {other}")),
         }
     }
-    Ok(listen)
+    Ok(ServerConfig {
+        listen,
+        shared_catalog,
+    })
 }
 
-fn handle_client(mut stream: TcpStream) -> io::Result<()> {
+fn handle_client(mut stream: TcpStream, shared_catalog: bool) -> io::Result<()> {
     startup_handshake(&mut stream)?;
-    let mut session = Session::default();
+    let mut session = Session::new(shared_catalog);
     let mut extended_error_pending = false;
 
     loop {
@@ -2791,10 +2853,31 @@ fn is_copy_statement(statement: &str) -> bool {
 fn parse_copy_to_stdout_table(statement: &str) -> Option<String> {
     let statement = strip_leading_sql_comments(statement.trim())?;
     let canonical = canonical_sql(statement);
-    let table = canonical
+    let target = canonical
         .strip_prefix("copy ")?
         .strip_suffix(" to stdout")?
         .trim();
+    let table = if let Some(open) = target.find('(') {
+        let close = target.rfind(')')?;
+        if close <= open || !target[close + 1..].trim().is_empty() {
+            return None;
+        }
+        let table = target[..open].trim();
+        let columns = target[open + 1..close]
+            .split(',')
+            .map(str::trim)
+            .collect::<Vec<_>>();
+        if columns.is_empty()
+            || columns
+                .iter()
+                .any(|column| !is_simple_copy_identifier(column))
+        {
+            return None;
+        }
+        table
+    } else {
+        target
+    };
     if table.is_empty()
         || table
             .contains(|ch: char| ch.is_whitespace() || matches!(ch, '(' | ')' | ',' | '\'' | '"'))
@@ -3064,6 +3147,7 @@ fn apply_copy_in_rows(session: &mut Session, copy: CopyInState) -> Option<ErrorF
             .rows
             .push(projected.into_iter().map(Option::unwrap).collect());
     }
+    session.persist_catalog_snapshot();
     None
 }
 
@@ -3325,6 +3409,198 @@ fn execute_statement(
         }
     }
 
+    let canonical = canonical_sql(statement);
+    if is_pg_dump_session_set_statement(&canonical) {
+        return write_command_complete(stream, "SET");
+    }
+    if canonical == "reset search_path" {
+        return write_command_complete(stream, "RESET");
+    }
+    if canonical.starts_with("lock table ") && canonical.ends_with(" in access share mode") {
+        return write_command_complete(stream, "LOCK TABLE");
+    }
+    if canonical == "select pg_catalog.set_config('search_path', '', false)" {
+        return write_single_row(
+            stream,
+            &[text_column("set_config")],
+            &[vec![Some(String::new())]],
+        );
+    }
+    if canonical == "select pg_catalog.set_config('search_path', 'public', false)" {
+        return write_single_row(
+            stream,
+            &[text_column("set_config")],
+            &[vec![Some("public".to_string())]],
+        );
+    }
+    if canonical
+        == "select set_config(name, 'view, foreign-table', false) from pg_settings where name = 'restrict_nonsystem_relation_kind'"
+    {
+        return write_select_rows(stream, &[text_column("set_config")], &[], true);
+    }
+    if canonical == "select pg_catalog.pg_is_in_recovery()" {
+        return write_single_row(
+            stream,
+            &[bool_column("pg_is_in_recovery")],
+            &[vec![Some("f".to_string())]],
+        );
+    }
+    if canonical == "select pg_catalog.current_schemas(false)" {
+        return write_single_row(
+            stream,
+            &[text_column("current_schemas")],
+            &[vec![Some("{public}".to_string())]],
+        );
+    }
+    if canonical
+        == "select count(*) from pg_subscription where subdbid = (select oid from pg_database where datname = current_database())"
+    {
+        return write_single_row(stream, &[int4_column("count")], &[vec![Some("0".to_string())]]);
+    }
+    if canonical == "select oid, rolname from pg_catalog.pg_roles order by 1" {
+        return write_single_row(
+            stream,
+            &[int4_column("oid"), text_column("rolname")],
+            &[vec![Some("10".to_string()), Some("postgres".to_string())]],
+        );
+    }
+    if canonical
+        == "select x.tableoid, x.oid, x.extname, n.nspname, x.extrelocatable, x.extversion, x.extconfig, x.extcondition from pg_extension x join pg_namespace n on n.oid = x.extnamespace"
+    {
+        return write_single_row(
+            stream,
+            &[
+                int4_column("tableoid"),
+                int4_column("oid"),
+                text_column("extname"),
+                text_column("nspname"),
+                bool_column("extrelocatable"),
+                text_column("extversion"),
+                text_column("extconfig"),
+                text_column("extcondition"),
+            ],
+            &catalog_empty_rows(),
+        );
+    }
+    if canonical
+        == "select n.tableoid, n.oid, n.nspname, n.nspowner, n.nspacl, acldefault('n', n.nspowner) as acldefault from pg_namespace n"
+    {
+        return write_single_row(
+            stream,
+            &[
+                int4_column("tableoid"),
+                int4_column("oid"),
+                text_column("nspname"),
+                int4_column("nspowner"),
+                text_column("nspacl"),
+                text_column("acldefault"),
+            ],
+            &[
+                vec![
+                    Some("2615".to_string()),
+                    Some("11".to_string()),
+                    Some("pg_catalog".to_string()),
+                    Some("10".to_string()),
+                    None,
+                    None,
+                ],
+                vec![
+                    Some("2615".to_string()),
+                    Some(PUBLIC_NAMESPACE_OID.to_string()),
+                    Some("public".to_string()),
+                    Some("10".to_string()),
+                    None,
+                    None,
+                ],
+            ],
+        );
+    }
+    if let Some(table) = pg_dump_table_oid_lookup_query_table(&canonical) {
+        return write_single_row(
+            stream,
+            &[int4_column("oid")],
+            &pg_dump_table_oid_lookup_rows(session, &table),
+        );
+    }
+    if is_pg_dump_class_metadata_query(&canonical) {
+        return write_single_row(
+            stream,
+            &pg_dump_class_metadata_columns(),
+            &pg_dump_class_metadata_rows(session),
+        );
+    }
+    if let Some(oids) = pg_dump_attribute_metadata_query_oids(&canonical) {
+        return write_single_row(
+            stream,
+            &pg_dump_attribute_metadata_columns(),
+            &pg_dump_attribute_metadata_rows(session, &oids),
+        );
+    }
+    if canonical == pg_dump_type_metadata_query() {
+        return write_single_row(
+            stream,
+            &pg_dump_type_metadata_columns(),
+            &pg_dump_type_metadata_rows(),
+        );
+    }
+    if let Some(columns) = pg_dump_empty_catalog_query_columns(&canonical) {
+        return write_single_row(stream, &columns, &catalog_empty_rows());
+    }
+    if canonical.starts_with("with recursive w as ( select d1.objid") {
+        return write_single_row(
+            stream,
+            &[
+                int4_column("classid"),
+                int4_column("objid"),
+                int4_column("refobjid"),
+            ],
+            &catalog_empty_rows(),
+        );
+    }
+    if canonical.starts_with("select classid, objid, refclassid, refobjid, deptype from pg_depend")
+    {
+        return write_single_row(
+            stream,
+            &[
+                int4_column("classid"),
+                int4_column("objid"),
+                int4_column("refclassid"),
+                int4_column("refobjid"),
+                text_column("deptype"),
+            ],
+            &catalog_empty_rows(),
+        );
+    }
+    if canonical
+        == "select description, classoid, objoid, objsubid from pg_catalog.pg_description order by classoid, objoid, objsubid"
+    {
+        return write_single_row(
+            stream,
+            &[
+                text_column("description"),
+                int4_column("classoid"),
+                int4_column("objoid"),
+                int4_column("objsubid"),
+            ],
+            &catalog_empty_rows(),
+        );
+    }
+    if canonical
+        == "select label, provider, classoid, objoid, objsubid from pg_catalog.pg_seclabels order by classoid, objoid, objsubid"
+    {
+        return write_single_row(
+            stream,
+            &[
+                text_column("label"),
+                text_column("provider"),
+                int4_column("classoid"),
+                int4_column("objoid"),
+                int4_column("objsubid"),
+            ],
+            &catalog_empty_rows(),
+        );
+    }
+
     if let Ok(command) = parse_command(statement) {
         match command {
             Command::CreateTable(create) => {
@@ -3376,6 +3652,7 @@ fn execute_statement(
                         rows: Vec::new(),
                     },
                 );
+                session.persist_catalog_snapshot();
                 return write_command_complete(stream, "CREATE TABLE");
             }
             Command::Insert(insert) => {
@@ -3440,6 +3717,7 @@ fn execute_statement(
                         .rows
                         .push(projected.into_iter().map(Option::unwrap).collect());
                 }
+                session.persist_catalog_snapshot();
                 return write_command_complete(stream, &format!("INSERT 0 {inserted_count}"));
             }
             Command::Select(select) => {
@@ -3476,7 +3754,34 @@ fn execute_statement(
         }
     }
 
-    let canonical = canonical_sql(statement);
+    if is_pg_dump_session_set_statement(&canonical) {
+        return write_command_complete(stream, "SET");
+    }
+    if canonical == "reset search_path" {
+        return write_command_complete(stream, "RESET");
+    }
+    if canonical.starts_with("lock table ") && canonical.ends_with(" in access share mode") {
+        return write_command_complete(stream, "LOCK TABLE");
+    }
+    if canonical == "select pg_catalog.set_config('search_path', '', false)" {
+        return write_single_row(
+            stream,
+            &[text_column("set_config")],
+            &[vec![Some(String::new())]],
+        );
+    }
+    if canonical
+        == "select set_config(name, 'view, foreign-table', false) from pg_settings where name = 'restrict_nonsystem_relation_kind'"
+    {
+        return write_select_rows(stream, &[text_column("set_config")], &[], true);
+    }
+    if canonical == "select pg_catalog.pg_is_in_recovery()" {
+        return write_single_row(
+            stream,
+            &[bool_column("pg_is_in_recovery")],
+            &[vec![Some("f".to_string())]],
+        );
+    }
     if let Some(rows) = psql_describe_query_type_rows(&canonical) {
         return write_single_row(stream, &[text_column("Column"), text_column("Type")], &rows);
     }
@@ -3820,6 +4125,24 @@ fn execute_statement(
             &catalog_empty_rows(),
         );
     }
+    if canonical
+        == "select x.tableoid, x.oid, x.extname, n.nspname, x.extrelocatable, x.extversion, x.extconfig, x.extcondition from pg_extension x join pg_namespace n on n.oid = x.extnamespace"
+    {
+        return write_single_row(
+            stream,
+            &[
+                int4_column("tableoid"),
+                int4_column("oid"),
+                text_column("extname"),
+                text_column("nspname"),
+                bool_column("extrelocatable"),
+                text_column("extversion"),
+                text_column("extconfig"),
+                text_column("extcondition"),
+            ],
+            &catalog_empty_rows(),
+        );
+    }
     if canonical == psql_list_languages_catalog_query() {
         return write_single_row(
             stream,
@@ -3880,6 +4203,13 @@ fn execute_statement(
                 bool_column("rolbypassrls"),
             ],
             &catalog_psql_describe_role_rows(),
+        );
+    }
+    if canonical == "select oid, rolname from pg_catalog.pg_roles order by 1" {
+        return write_single_row(
+            stream,
+            &[int4_column("oid"), text_column("rolname")],
+            &[vec![Some("10".to_string()), Some("postgres".to_string())]],
         );
     }
     if canonical == psql_list_databases_catalog_query() {
@@ -3946,6 +4276,39 @@ fn execute_statement(
             &pg_catalog_namespace_rows(),
         );
     }
+    if canonical
+        == "select n.tableoid, n.oid, n.nspname, n.nspowner, n.nspacl, acldefault('n', n.nspowner) as acldefault from pg_namespace n"
+    {
+        return write_single_row(
+            stream,
+            &[
+                int4_column("tableoid"),
+                int4_column("oid"),
+                text_column("nspname"),
+                int4_column("nspowner"),
+                text_column("nspacl"),
+                text_column("acldefault"),
+            ],
+            &[
+                vec![
+                    Some("2615".to_string()),
+                    Some("11".to_string()),
+                    Some("pg_catalog".to_string()),
+                    Some("10".to_string()),
+                    None,
+                    None,
+                ],
+                vec![
+                    Some("2615".to_string()),
+                    Some(PUBLIC_NAMESPACE_OID.to_string()),
+                    Some("public".to_string()),
+                    Some("10".to_string()),
+                    None,
+                    None,
+                ],
+            ],
+        );
+    }
     if let Some(type_name) = psql_describe_type_catalog_query_type(&canonical) {
         return write_single_row(
             stream,
@@ -3983,6 +4346,30 @@ fn execute_statement(
             ],
             &catalog_psql_describe_type_verbose_rows_for_supported_types(),
         );
+    }
+    if let Some(table) = pg_dump_table_oid_lookup_query_table(&canonical) {
+        return write_single_row(
+            stream,
+            &[int4_column("oid")],
+            &pg_dump_table_oid_lookup_rows(session, &table),
+        );
+    }
+    if is_pg_dump_class_metadata_query(&canonical) {
+        return write_single_row(
+            stream,
+            &pg_dump_class_metadata_columns(),
+            &pg_dump_class_metadata_rows(session),
+        );
+    }
+    if canonical == pg_dump_type_metadata_query() {
+        return write_single_row(
+            stream,
+            &pg_dump_type_metadata_columns(),
+            &pg_dump_type_metadata_rows(),
+        );
+    }
+    if let Some(columns) = pg_dump_empty_catalog_query_columns(&canonical) {
+        return write_single_row(stream, &columns, &catalog_empty_rows());
     }
     if catalog_describe_relation_lookup_query_all_schemas(&canonical)
         || catalog_describe_relation_lookup_query_public_namespace(&canonical)
@@ -5291,6 +5678,642 @@ fn catalog_describe_relation_lookup_query_public_namespace(canonical: &str) -> b
 fn catalog_describe_relation_lookup_query_all_schemas(canonical: &str) -> bool {
     canonical
         == "select c.oid, n.nspname, c.relname from pg_catalog.pg_class c left join pg_catalog.pg_namespace n on n.oid = c.relnamespace order by 2, 3"
+}
+
+fn pg_dump_table_oid_lookup_query_table(canonical: &str) -> Option<String> {
+    let prefix = "select c.oid from pg_catalog.pg_class c left join pg_catalog.pg_namespace n on n.oid operator(pg_catalog.=) c.relnamespace where c.relkind operator(pg_catalog.=) any (array['r', 's', 'v', 'm', 'f', 'p']) and c.relname operator(pg_catalog.~) '^(";
+    let suffix = ")$' collate pg_catalog.default and pg_catalog.pg_table_is_visible(c.oid)";
+    canonical
+        .strip_prefix(prefix)?
+        .strip_suffix(suffix)
+        .map(str::to_string)
+}
+
+fn pg_dump_table_oid_lookup_rows(
+    session: &Session,
+    relname_pattern: &str,
+) -> Vec<Vec<Option<String>>> {
+    let mut tables = session.tables.values().collect::<Vec<_>>();
+    tables.sort_by_key(|table| table.oid);
+    tables
+        .into_iter()
+        .filter(|table| psql_relname_pattern_matches(relname_pattern, &table.name))
+        .map(|table| vec![Some(table.oid.to_string())])
+        .collect()
+}
+
+fn is_pg_dump_class_metadata_query(canonical: &str) -> bool {
+    canonical.starts_with("select c.tableoid, c.oid, c.relname, c.relnamespace, c.relkind, c.reltype, c.relowner, c.relchecks, c.relhasindex, c.relhasrules, c.relpages, c.relhastriggers, c.relpersistence, c.reloftype, c.relacl, acldefault(")
+        && canonical.contains("from pg_class c left join pg_depend d")
+        && canonical.ends_with("where c.relkind in ('r', 's', 'v', 'c', 'm', 'f', 'p') order by c.oid")
+}
+
+fn pg_dump_class_metadata_columns() -> Vec<Column> {
+    vec![
+        int4_column("tableoid"),
+        int4_column("oid"),
+        text_column("relname"),
+        int4_column("relnamespace"),
+        text_column("relkind"),
+        int4_column("reltype"),
+        int4_column("relowner"),
+        int4_column("relchecks"),
+        bool_column("relhasindex"),
+        bool_column("relhasrules"),
+        int4_column("relpages"),
+        bool_column("relhastriggers"),
+        text_column("relpersistence"),
+        int4_column("reloftype"),
+        text_column("relacl"),
+        text_column("acldefault"),
+        int4_column("foreignserver"),
+        text_column("relfrozenxid"),
+        text_column("tfrozenxid"),
+        int4_column("toid"),
+        int4_column("toastpages"),
+        text_column("toast_reloptions"),
+        int4_column("owning_tab"),
+        int4_column("owning_col"),
+        text_column("reltablespace"),
+        bool_column("relhasoids"),
+        bool_column("relispopulated"),
+        text_column("relreplident"),
+        bool_column("relrowsecurity"),
+        bool_column("relforcerowsecurity"),
+        text_column("relminmxid"),
+        text_column("tminmxid"),
+        text_column("reloptions"),
+        text_column("checkoption"),
+        text_column("amname"),
+        bool_column("is_identity_sequence"),
+        bool_column("ispartition"),
+    ]
+}
+
+fn pg_dump_class_metadata_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut tables = session.tables.values().collect::<Vec<_>>();
+    tables.sort_by_key(|table| table.oid);
+    tables
+        .into_iter()
+        .map(|table| {
+            vec![
+                Some("1259".to_string()),
+                Some(table.oid.to_string()),
+                Some(table.name.clone()),
+                Some(PUBLIC_NAMESPACE_OID.to_string()),
+                Some("r".to_string()),
+                Some("0".to_string()),
+                Some("10".to_string()),
+                Some("0".to_string()),
+                Some("f".to_string()),
+                Some("f".to_string()),
+                Some("0".to_string()),
+                Some("f".to_string()),
+                Some("p".to_string()),
+                Some("0".to_string()),
+                None,
+                None,
+                Some("0".to_string()),
+                Some("0".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("f".to_string()),
+                Some("t".to_string()),
+                Some("d".to_string()),
+                Some("f".to_string()),
+                Some("f".to_string()),
+                Some("0".to_string()),
+                None,
+                None,
+                None,
+                Some("heap".to_string()),
+                Some("f".to_string()),
+                Some("f".to_string()),
+            ]
+        })
+        .collect()
+}
+
+fn pg_dump_attribute_metadata_query_oids(canonical: &str) -> Option<Vec<u32>> {
+    let marker = "from unnest('{";
+    let (_, rest) = canonical.split_once(marker)?;
+    let (oids, rest) = rest.split_once("}'::pg_catalog.oid[]")?;
+    if !rest.contains("join pg_catalog.pg_attribute a") {
+        return None;
+    }
+    let parsed = oids
+        .split(',')
+        .map(str::parse::<u32>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    (!parsed.is_empty()).then_some(parsed)
+}
+
+fn pg_dump_attribute_metadata_columns() -> Vec<Column> {
+    vec![
+        int4_column("attrelid"),
+        int4_column("attnum"),
+        text_column("attname"),
+        int4_column("attstattarget"),
+        text_column("attstorage"),
+        text_column("typstorage"),
+        bool_column("attnotnull"),
+        bool_column("atthasdef"),
+        bool_column("attisdropped"),
+        int4_column("attlen"),
+        text_column("attalign"),
+        bool_column("attislocal"),
+        text_column("atttypname"),
+        text_column("attoptions"),
+        int4_column("attcollation"),
+        text_column("attfdwoptions"),
+        text_column("attcompression"),
+        text_column("attidentity"),
+        text_column("attmissingval"),
+        text_column("attgenerated"),
+    ]
+}
+
+fn pg_dump_attribute_metadata_rows(
+    session: &Session,
+    relation_oids: &[u32],
+) -> Vec<Vec<Option<String>>> {
+    let mut rows = Vec::new();
+    for oid in relation_oids {
+        let Some(table) = session.tables.values().find(|table| table.oid == *oid) else {
+            continue;
+        };
+        for column in &table.columns {
+            rows.push(vec![
+                Some(table.oid.to_string()),
+                Some(column.attnum.to_string()),
+                Some(column.def.name.clone()),
+                Some("-1".to_string()),
+                Some(sql_type_storage_code(column.def.ty).to_string()),
+                Some(sql_type_storage_code(column.def.ty).to_string()),
+                Some("f".to_string()),
+                Some("f".to_string()),
+                Some("f".to_string()),
+                Some(column.def.ty.type_size().to_string()),
+                Some(sql_type_alignment_code(column.def.ty).to_string()),
+                Some("t".to_string()),
+                Some(sql_type_display_name(column.def.ty).to_string()),
+                None,
+                Some("0".to_string()),
+                None,
+                Some(String::new()),
+                Some(String::new()),
+                None,
+                Some(String::new()),
+            ]);
+        }
+    }
+    rows
+}
+
+fn sql_type_alignment_code(ty: SqlType) -> &'static str {
+    match ty {
+        SqlType::Int4 => "i",
+        SqlType::Text => "i",
+    }
+}
+
+fn pg_dump_empty_catalog_query_columns(canonical: &str) -> Option<Vec<Column>> {
+    if canonical
+        .starts_with("select p.tableoid, p.oid, p.proname, p.prolang, p.pronargs, p.proargtypes")
+        && canonical.contains("from pg_proc p")
+    {
+        return Some(vec![
+            int4_column("tableoid"),
+            int4_column("oid"),
+            text_column("proname"),
+            int4_column("prolang"),
+            int4_column("pronargs"),
+            text_column("proargtypes"),
+            int4_column("prorettype"),
+            text_column("proacl"),
+            text_column("acldefault"),
+            int4_column("pronamespace"),
+            int4_column("proowner"),
+        ]);
+    }
+    if canonical.starts_with("select p.tableoid, p.oid, p.proname as aggname")
+        && canonical.contains("from pg_proc p")
+    {
+        return Some(vec![
+            int4_column("tableoid"),
+            int4_column("oid"),
+            text_column("aggname"),
+            int4_column("aggnamespace"),
+            int4_column("pronargs"),
+            text_column("proargtypes"),
+            int4_column("proowner"),
+            text_column("aggacl"),
+            text_column("acldefault"),
+        ]);
+    }
+    if canonical
+        == "select tableoid, oid, lanname, lanpltrusted, lanplcallfoid, laninline, lanvalidator, lanacl, acldefault('l', lanowner) as acldefault, lanowner from pg_language where lanispl order by oid"
+    {
+        return Some(vec![
+            int4_column("tableoid"),
+            int4_column("oid"),
+            text_column("lanname"),
+            bool_column("lanpltrusted"),
+            int4_column("lanplcallfoid"),
+            int4_column("laninline"),
+            int4_column("lanvalidator"),
+            text_column("lanacl"),
+            text_column("acldefault"),
+            int4_column("lanowner"),
+        ]);
+    }
+    if canonical == "select tableoid, oid, oprname, oprnamespace, oprowner, oprkind, oprleft, oprright, oprcode::oid as oprcode from pg_operator" {
+        return Some(vec![
+            int4_column("tableoid"),
+            int4_column("oid"),
+            text_column("oprname"),
+            int4_column("oprnamespace"),
+            int4_column("oprowner"),
+            text_column("oprkind"),
+            int4_column("oprleft"),
+            int4_column("oprright"),
+            int4_column("oprcode"),
+        ]);
+    }
+    if canonical
+        == "select tableoid, oid, amname, amtype, amhandler::pg_catalog.regproc as amhandler from pg_am"
+    {
+        return Some(vec![
+            int4_column("tableoid"),
+            int4_column("oid"),
+            text_column("amname"),
+            text_column("amtype"),
+            text_column("amhandler"),
+        ]);
+    }
+    if canonical
+        == "select tableoid, oid, opcmethod, opcname, opcnamespace, opcowner from pg_opclass"
+    {
+        return Some(vec![
+            int4_column("tableoid"),
+            int4_column("oid"),
+            int4_column("opcmethod"),
+            text_column("opcname"),
+            int4_column("opcnamespace"),
+            int4_column("opcowner"),
+        ]);
+    }
+    if canonical
+        == "select tableoid, oid, opfmethod, opfname, opfnamespace, opfowner from pg_opfamily"
+    {
+        return Some(vec![
+            int4_column("tableoid"),
+            int4_column("oid"),
+            int4_column("opfmethod"),
+            text_column("opfname"),
+            int4_column("opfnamespace"),
+            int4_column("opfowner"),
+        ]);
+    }
+    if canonical == "select tableoid, oid, prsname, prsnamespace, prsstart::oid, prstoken::oid, prsend::oid, prsheadline::oid, prslextype::oid from pg_ts_parser" {
+        return Some(vec![
+            int4_column("tableoid"),
+            int4_column("oid"),
+            text_column("prsname"),
+            int4_column("prsnamespace"),
+            int4_column("prsstart"),
+            int4_column("prstoken"),
+            int4_column("prsend"),
+            int4_column("prsheadline"),
+            int4_column("prslextype"),
+        ]);
+    }
+    if canonical
+        == "select tableoid, oid, tmplname, tmplnamespace, tmplinit::oid, tmpllexize::oid from pg_ts_template"
+    {
+        return Some(vec![
+            int4_column("tableoid"),
+            int4_column("oid"),
+            text_column("tmplname"),
+            int4_column("tmplnamespace"),
+            int4_column("tmplinit"),
+            int4_column("tmpllexize"),
+        ]);
+    }
+    if canonical
+        == "select tableoid, oid, dictname, dictnamespace, dictowner, dicttemplate, dictinitoption from pg_ts_dict"
+    {
+        return Some(vec![
+            int4_column("tableoid"),
+            int4_column("oid"),
+            text_column("dictname"),
+            int4_column("dictnamespace"),
+            int4_column("dictowner"),
+            int4_column("dicttemplate"),
+            text_column("dictinitoption"),
+        ]);
+    }
+    if canonical
+        == "select tableoid, oid, cfgname, cfgnamespace, cfgowner, cfgparser from pg_ts_config"
+    {
+        return Some(vec![
+            int4_column("tableoid"),
+            int4_column("oid"),
+            text_column("cfgname"),
+            int4_column("cfgnamespace"),
+            int4_column("cfgowner"),
+            int4_column("cfgparser"),
+        ]);
+    }
+    if canonical.starts_with("select tableoid, oid, fdwname, fdwowner")
+        && canonical.contains("from pg_foreign_data_wrapper")
+    {
+        return Some(vec![
+            int4_column("tableoid"),
+            int4_column("oid"),
+            text_column("fdwname"),
+            int4_column("fdwowner"),
+            text_column("fdwhandler"),
+            text_column("fdwvalidator"),
+            text_column("fdwacl"),
+            text_column("acldefault"),
+            text_column("fdwoptions"),
+        ]);
+    }
+    if canonical.starts_with("select tableoid, oid, srvname, srvowner")
+        && canonical.contains("from pg_foreign_server")
+    {
+        return Some(vec![
+            int4_column("tableoid"),
+            int4_column("oid"),
+            text_column("srvname"),
+            int4_column("srvowner"),
+            int4_column("srvfdw"),
+            text_column("srvtype"),
+            text_column("srvversion"),
+            text_column("srvacl"),
+            text_column("acldefault"),
+            text_column("srvoptions"),
+        ]);
+    }
+    if canonical.starts_with("select oid, tableoid, defaclrole")
+        && canonical.contains("from pg_default_acl")
+    {
+        return Some(vec![
+            int4_column("oid"),
+            int4_column("tableoid"),
+            int4_column("defaclrole"),
+            int4_column("defaclnamespace"),
+            text_column("defaclobjtype"),
+            text_column("defaclacl"),
+            text_column("acldefault"),
+        ]);
+    }
+    if canonical == "select tableoid, oid, collname, collnamespace, collowner, collencoding from pg_collation" {
+        return Some(vec![
+            int4_column("tableoid"),
+            int4_column("oid"),
+            text_column("collname"),
+            int4_column("collnamespace"),
+            int4_column("collowner"),
+            int4_column("collencoding"),
+        ]);
+    }
+    if canonical == "select tableoid, oid, conname, connamespace, conowner from pg_conversion" {
+        return Some(vec![
+            int4_column("tableoid"),
+            int4_column("oid"),
+            text_column("conname"),
+            int4_column("connamespace"),
+            int4_column("conowner"),
+        ]);
+    }
+    if canonical.starts_with("select tableoid, oid, castsource, casttarget")
+        && canonical.contains("from pg_cast")
+    {
+        return Some(vec![
+            int4_column("tableoid"),
+            int4_column("oid"),
+            int4_column("castsource"),
+            int4_column("casttarget"),
+            int4_column("castfunc"),
+            text_column("castcontext"),
+            text_column("castmethod"),
+        ]);
+    }
+    if canonical == "select tableoid, oid, trftype, trflang, trffromsql::oid, trftosql::oid from pg_transform order by 3,4" {
+        return Some(vec![
+            int4_column("tableoid"),
+            int4_column("oid"),
+            int4_column("trftype"),
+            int4_column("trflang"),
+            int4_column("trffromsql"),
+            int4_column("trftosql"),
+        ]);
+    }
+    if canonical == "select inhrelid, inhparent from pg_inherits" {
+        return Some(vec![int4_column("inhrelid"), int4_column("inhparent")]);
+    }
+    if canonical.starts_with("select partrelid from pg_partitioned_table") {
+        return Some(vec![int4_column("partrelid")]);
+    }
+    if canonical.starts_with("select t.tableoid, t.oid, i.indrelid")
+        && canonical.contains("join pg_catalog.pg_index i")
+    {
+        return Some(vec![
+            int4_column("tableoid"),
+            int4_column("oid"),
+            int4_column("indrelid"),
+            text_column("indexname"),
+            text_column("indexdef"),
+            text_column("indkey"),
+            bool_column("indisclustered"),
+            text_column("contype"),
+            text_column("conname"),
+            bool_column("condeferrable"),
+            bool_column("condeferred"),
+            int4_column("contableoid"),
+            int4_column("conoid"),
+            text_column("condef"),
+            text_column("tablespace"),
+            text_column("indreloptions"),
+            bool_column("indisreplident"),
+            int4_column("parentidx"),
+            int4_column("indnkeyatts"),
+            int4_column("indnatts"),
+            text_column("indstatcols"),
+            text_column("indstatvals"),
+            bool_column("indnullsnotdistinct"),
+        ]);
+    }
+    if canonical == "select tableoid, oid, stxname, stxnamespace, stxowner, stxrelid, stxstattarget from pg_catalog.pg_statistic_ext" {
+        return Some(vec![
+            int4_column("tableoid"),
+            int4_column("oid"),
+            text_column("stxname"),
+            int4_column("stxnamespace"),
+            int4_column("stxowner"),
+            int4_column("stxrelid"),
+            int4_column("stxstattarget"),
+        ]);
+    }
+    if canonical.starts_with("select c.tableoid, c.oid, conrelid, conname")
+        && canonical.contains("join pg_catalog.pg_constraint c")
+    {
+        return Some(vec![
+            int4_column("tableoid"),
+            int4_column("oid"),
+            int4_column("conrelid"),
+            text_column("conname"),
+            int4_column("confrelid"),
+            int4_column("conindid"),
+            text_column("condef"),
+        ]);
+    }
+    if canonical.starts_with("select t.tgrelid, t.tgname")
+        && canonical.contains("join pg_catalog.pg_trigger t")
+    {
+        return Some(vec![
+            int4_column("tgrelid"),
+            text_column("tgname"),
+            text_column("tgfname"),
+            text_column("tgdef"),
+            text_column("tgenabled"),
+            int4_column("tableoid"),
+            int4_column("oid"),
+            bool_column("tgispartition"),
+        ]);
+    }
+    if canonical == "select tableoid, oid, rulename, ev_class as ruletable, ev_type, is_instead, ev_enabled from pg_rewrite order by oid" {
+        return Some(vec![
+            int4_column("tableoid"),
+            int4_column("oid"),
+            text_column("rulename"),
+            int4_column("ruletable"),
+            text_column("ev_type"),
+            bool_column("is_instead"),
+            text_column("ev_enabled"),
+        ]);
+    }
+    if canonical.starts_with("select pol.oid, pol.tableoid, pol.polrelid")
+        && canonical.contains("join pg_catalog.pg_policy pol")
+    {
+        return Some(vec![
+            int4_column("oid"),
+            int4_column("tableoid"),
+            int4_column("polrelid"),
+            text_column("polname"),
+            text_column("polcmd"),
+            bool_column("polpermissive"),
+            text_column("polroles"),
+            text_column("polqual"),
+            text_column("polwithcheck"),
+        ]);
+    }
+    if canonical.starts_with("select p.tableoid, p.oid, p.pubname")
+        && canonical.contains("from pg_publication p")
+    {
+        return Some(vec![
+            int4_column("tableoid"),
+            int4_column("oid"),
+            text_column("pubname"),
+            int4_column("pubowner"),
+            bool_column("puballtables"),
+            bool_column("pubinsert"),
+            bool_column("pubupdate"),
+            bool_column("pubdelete"),
+            bool_column("pubtruncate"),
+            bool_column("pubviaroot"),
+        ]);
+    }
+    if canonical.starts_with("select tableoid, oid, prpubid, prrelid")
+        && canonical.contains("from pg_catalog.pg_publication_rel pr")
+    {
+        return Some(vec![
+            int4_column("tableoid"),
+            int4_column("oid"),
+            int4_column("prpubid"),
+            int4_column("prrelid"),
+            text_column("prrelqual"),
+            text_column("prattrs"),
+        ]);
+    }
+    if canonical
+        == "select tableoid, oid, pnpubid, pnnspid from pg_catalog.pg_publication_namespace"
+    {
+        return Some(vec![
+            int4_column("tableoid"),
+            int4_column("oid"),
+            int4_column("pnpubid"),
+            int4_column("pnnspid"),
+        ]);
+    }
+    if canonical.starts_with("select e.tableoid, e.oid, evtname")
+        && canonical.contains("from pg_event_trigger e")
+    {
+        return Some(vec![
+            int4_column("tableoid"),
+            int4_column("oid"),
+            text_column("evtname"),
+            text_column("evtenabled"),
+            text_column("evtevent"),
+            int4_column("evtowner"),
+            text_column("evttags"),
+            text_column("evtfname"),
+        ]);
+    }
+    None
+}
+
+fn pg_dump_type_metadata_query() -> &'static str {
+    "select tableoid, oid, typname, typnamespace, typacl, acldefault('t', typowner) as acldefault, typowner, typelem, typrelid, case when typrelid = 0 then ' '::\"char\" else (select relkind from pg_class where oid = typrelid) end as typrelkind, typtype, typisdefined, typname[0] = '_' and typelem != 0 and (select typarray from pg_type te where oid = pg_type.typelem) = oid as isarray from pg_type"
+}
+
+fn pg_dump_type_metadata_columns() -> Vec<Column> {
+    vec![
+        int4_column("tableoid"),
+        int4_column("oid"),
+        text_column("typname"),
+        int4_column("typnamespace"),
+        text_column("typacl"),
+        text_column("acldefault"),
+        int4_column("typowner"),
+        int4_column("typelem"),
+        int4_column("typrelid"),
+        text_column("typrelkind"),
+        text_column("typtype"),
+        bool_column("typisdefined"),
+        bool_column("isarray"),
+    ]
+}
+
+fn pg_dump_type_metadata_rows() -> Vec<Vec<Option<String>>> {
+    SUPPORTED_SQL_TYPES
+        .into_iter()
+        .map(|ty| {
+            vec![
+                Some("1247".to_string()),
+                Some(ty.postgres_oid().to_string()),
+                Some(ty.catalog_name().to_string()),
+                Some("11".to_string()),
+                None,
+                None,
+                Some("10".to_string()),
+                Some("0".to_string()),
+                Some("0".to_string()),
+                Some(" ".to_string()),
+                Some("b".to_string()),
+                Some("t".to_string()),
+                Some("f".to_string()),
+            ]
+        })
+        .collect()
 }
 
 fn catalog_describe_relation_lookup_rows(
@@ -7046,6 +8069,27 @@ fn canonical_sql(input: &str) -> String {
         }
     }
     canonical.trim().to_owned()
+}
+
+fn is_pg_dump_session_set_statement(canonical: &str) -> bool {
+    let normalized = canonical.replace(" to ", " = ");
+    matches!(
+        normalized.as_str(),
+        "set datestyle = iso"
+            | "set intervalstyle = postgres"
+            | "set extra_float_digits = 3"
+            | "set statement_timeout = 0"
+            | "set lock_timeout = 0"
+            | "set idle_in_transaction_session_timeout = 0"
+            | "set client_encoding = 'utf8'"
+            | "set standard_conforming_strings = on"
+            | "set synchronize_seqscans = off"
+            | "set check_function_bodies = false"
+            | "set xmloption = content"
+            | "set client_min_messages = warning"
+            | "set row_security = off"
+            | "set transaction isolation level repeatable read, read only"
+    )
 }
 
 fn write_authentication_ok(stream: &mut TcpStream) -> io::Result<()> {
@@ -14021,17 +15065,28 @@ mod tests {
     }
 
     #[test]
-    fn listen_arg_defaults_and_overrides() {
+    fn args_default_listen_and_shared_catalog_opt_in() {
         assert_eq!(
-            parse_listen_arg(std::iter::empty()).unwrap(),
-            "127.0.0.1:5432"
+            parse_args(std::iter::empty()).unwrap(),
+            ServerConfig {
+                listen: "127.0.0.1:5432".to_string(),
+                shared_catalog: false,
+            }
         );
         assert_eq!(
-            parse_listen_arg(
-                vec![String::from("--listen"), String::from("0.0.0.0:9999")].into_iter()
+            parse_args(
+                vec![
+                    String::from("--shared-catalog"),
+                    String::from("--listen"),
+                    String::from("0.0.0.0:9999"),
+                ]
+                .into_iter(),
             )
             .unwrap(),
-            "0.0.0.0:9999"
+            ServerConfig {
+                listen: "0.0.0.0:9999".to_string(),
+                shared_catalog: true,
+            }
         );
     }
 }
