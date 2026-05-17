@@ -1914,6 +1914,7 @@ fn handle_parse(
     if describe_query_columns(session, &describe_query).is_none()
         && describe_extended_query_columns(session, &describe_query).is_none()
         && describe_extended_query_columns(session, &query).is_none()
+        && !is_supported_extended_dml(session, &describe_query)
     {
         write_error(
             stream,
@@ -2169,6 +2170,42 @@ fn handle_execute(
         }
         execute_portal_batch(stream, session, portal_name, max_rows)?;
         return Ok(false);
+    }
+    match parse_command(&bound_query) {
+        Ok(Command::Insert(insert)) => {
+            let tag = match execute_extended_insert(session, insert) {
+                Ok(tag) => tag,
+                Err(error) => {
+                    write_error(stream, &error)?;
+                    return Ok(true);
+                }
+            };
+            write_command_complete(stream, &tag)?;
+            return Ok(false);
+        }
+        Ok(Command::Delete(delete)) => {
+            let tag = match execute_extended_delete(session, delete) {
+                Ok(tag) => tag,
+                Err(error) => {
+                    write_error(stream, &error)?;
+                    return Ok(true);
+                }
+            };
+            write_command_complete(stream, &tag)?;
+            return Ok(false);
+        }
+        Ok(Command::Update(update)) => {
+            let tag = match execute_extended_update(session, update) {
+                Ok(tag) => tag,
+                Err(error) => {
+                    write_error(stream, &error)?;
+                    return Ok(true);
+                }
+            };
+            write_command_complete(stream, &tag)?;
+            return Ok(false);
+        }
+        _ => {}
     }
     let select = match parse_command(&bound_query) {
         Ok(Command::Select(select)) => select,
@@ -2841,7 +2878,7 @@ fn describe_extended_query_columns(session: &Session, query: &str) -> Option<Vec
 }
 
 fn extended_query_result_column_count(session: &Session, query: &str) -> Option<usize> {
-    if parse_declare_cursor(query).is_some() {
+    if parse_declare_cursor(query).is_some() || is_supported_extended_dml(session, query) {
         Some(0)
     } else {
         describe_extended_query_columns(session, query).map(|columns| columns.len())
@@ -3682,6 +3719,167 @@ fn parse_supported_cursor_name(name: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+fn execute_extended_insert(
+    session: &mut Session,
+    insert: gpu_db_protocol::Insert,
+) -> Result<String, ErrorField> {
+    let table_name = insert.table;
+    let Some(table) = session.tables.get_mut(&table_name) else {
+        return Err(ErrorField {
+            code: "42P01",
+            message: "relation does not exist",
+            position: None,
+        });
+    };
+    let indexes = if insert.columns.is_empty() {
+        (0..table.columns.len()).collect::<Vec<_>>()
+    } else {
+        let mut indexes = Vec::with_capacity(insert.columns.len());
+        for column in &insert.columns {
+            let Some(idx) = table
+                .columns
+                .iter()
+                .position(|candidate| candidate.def.name == *column)
+            else {
+                return Err(ErrorField {
+                    code: "42703",
+                    message: "column does not exist",
+                    position: None,
+                });
+            };
+            indexes.push(idx);
+        }
+        indexes
+    };
+    let inserted_count = insert.rows.len();
+    for row in insert.rows {
+        if row.len() != indexes.len() {
+            return Err(ErrorField {
+                code: "42601",
+                message: "INSERT value count must match target columns",
+                position: None,
+            });
+        }
+        let mut projected = vec![None; table.columns.len()];
+        for (source_idx, target_idx) in indexes.iter().copied().enumerate() {
+            if !sql_value_matches_type(&row[source_idx], table.columns[target_idx].def.ty) {
+                return Err(ErrorField {
+                    code: "42804",
+                    message: "column type mismatch",
+                    position: None,
+                });
+            }
+            projected[target_idx] = Some(row[source_idx].clone());
+        }
+        if projected.iter().any(Option::is_none) {
+            return Err(ErrorField {
+                code: "0A000",
+                message: "INSERT must provide every column",
+                position: None,
+            });
+        }
+        table
+            .rows
+            .push(projected.into_iter().map(Option::unwrap).collect());
+    }
+    session.mark_table_dirty(table_name);
+    session.persist_catalog_snapshot();
+    Ok(format!("INSERT 0 {inserted_count}"))
+}
+
+fn execute_extended_delete(
+    session: &mut Session,
+    delete: gpu_db_protocol::Delete,
+) -> Result<String, ErrorField> {
+    let table_name = delete.table.clone();
+    let Some(table) = session.tables.get_mut(&table_name) else {
+        return Err(ErrorField {
+            code: "42P01",
+            message: "relation does not exist",
+            position: None,
+        });
+    };
+    let mut delete_mask = Vec::with_capacity(table.rows.len());
+    for row in &table.rows {
+        delete_mask.push(row_matches_delete_filters(table, row, &delete)?);
+    }
+    let deleted_count = delete_mask.iter().filter(|matches| **matches).count();
+    let mut delete_mask = delete_mask.into_iter();
+    let kept = std::mem::take(&mut table.rows)
+        .into_iter()
+        .filter(|_| !delete_mask.next().unwrap_or(false))
+        .collect();
+    table.rows = kept;
+    session.mark_table_dirty(table_name);
+    session.persist_catalog_snapshot();
+    Ok(format!("DELETE {deleted_count}"))
+}
+
+fn execute_extended_update(
+    session: &mut Session,
+    update: gpu_db_protocol::Update,
+) -> Result<String, ErrorField> {
+    let table_name = update.table.clone();
+    let Some(table) = session.tables.get_mut(&table_name) else {
+        return Err(ErrorField {
+            code: "42P01",
+            message: "relation does not exist",
+            position: None,
+        });
+    };
+    let mut seen = BTreeSet::new();
+    let mut assignments = Vec::with_capacity(update.assignments.len());
+    for assignment in &update.assignments {
+        let Some(idx) = table
+            .columns
+            .iter()
+            .position(|column| column.def.name == assignment.column)
+        else {
+            return Err(ErrorField {
+                code: "42703",
+                message: "column does not exist",
+                position: None,
+            });
+        };
+        if !seen.insert(idx) {
+            return Err(ErrorField {
+                code: "42601",
+                message: "column assigned more than once",
+                position: None,
+            });
+        }
+        if !sql_value_matches_type(&assignment.value, table.columns[idx].def.ty) {
+            return Err(ErrorField {
+                code: "42804",
+                message: "column type mismatch",
+                position: None,
+            });
+        }
+        assignments.push((idx, assignment.value.clone()));
+    }
+    let delete_shape = gpu_db_protocol::Delete {
+        table: update.table.clone(),
+        filter: update.filter.clone(),
+        filters: update.filters.clone(),
+        filter_groups: update.filter_groups.clone(),
+    };
+    let mut update_mask = Vec::with_capacity(table.rows.len());
+    for row in &table.rows {
+        update_mask.push(row_matches_delete_filters(table, row, &delete_shape)?);
+    }
+    let updated_count = update_mask.iter().filter(|matches| **matches).count();
+    for (row, matches) in table.rows.iter_mut().zip(update_mask) {
+        if matches {
+            for (idx, value) in &assignments {
+                row[*idx] = value.clone();
+            }
+        }
+    }
+    session.mark_table_dirty(table_name);
+    session.persist_catalog_snapshot();
+    Ok(format!("UPDATE {updated_count}"))
 }
 
 fn execute_declare_cursor(
@@ -8562,6 +8760,7 @@ fn infer_extended_parameter_type_oids(session: &Session, query: &str) -> Option<
         return infer_sql_execute_parameter_type_oids(session, &name, &parameters);
     }
     infer_select_parameter_type_oids(session, query)
+        .or_else(|| infer_dml_parameter_type_oids(session, query))
 }
 
 fn infer_sql_execute_parameter_type_oids(
@@ -8745,6 +8944,219 @@ fn infer_select_parameter_type_oids(session: &Session, query: &str) -> Option<Ve
     }
 
     Some(oids)
+}
+
+fn infer_dml_parameter_type_oids(session: &Session, query: &str) -> Option<Vec<u32>> {
+    let canonical = canonical_sql(query);
+    let max_idx = max_placeholder_index(&canonical);
+    if max_idx == 0 {
+        return Some(Vec::new());
+    }
+    let dummy_query = replace_parameter_placeholders_with_dummy_literals(&canonical);
+    let command = parse_command(&dummy_query).ok()?;
+    let mut oids = vec![0; max_idx];
+    match command {
+        Command::Insert(insert) => {
+            let table = session.tables.get(&insert.table)?;
+            let indexes = if insert.columns.is_empty() {
+                (0..table.columns.len()).collect::<Vec<_>>()
+            } else {
+                insert
+                    .columns
+                    .iter()
+                    .map(|column| {
+                        table
+                            .columns
+                            .iter()
+                            .position(|candidate| candidate.def.name == *column)
+                    })
+                    .collect::<Option<Vec<_>>>()?
+            };
+            for (value_idx, value) in insert_value_fragments(&canonical)?.into_iter().enumerate() {
+                let column_idx = indexes.get(value_idx % indexes.len()).copied()?;
+                assign_fragment_placeholder_oids(
+                    value,
+                    table.columns[column_idx].def.ty.postgres_oid(),
+                    &mut oids,
+                );
+            }
+        }
+        Command::Update(update) => {
+            let table = session.tables.get(&update.table)?;
+            for assignment in update_assignment_fragments(&canonical)? {
+                let (column, value) = assignment.split_once('=')?;
+                let column = column.trim();
+                let column = table
+                    .columns
+                    .iter()
+                    .find(|candidate| candidate.def.name == column)?;
+                assign_fragment_placeholder_oids(value, column.def.ty.postgres_oid(), &mut oids);
+            }
+            assign_filter_placeholder_oids(table, &dml_where_clause(&canonical), &mut oids);
+        }
+        Command::Delete(delete) => {
+            let table = session.tables.get(&delete.table)?;
+            assign_filter_placeholder_oids(table, &dml_where_clause(&canonical), &mut oids);
+        }
+        _ => return None,
+    }
+    Some(oids)
+}
+
+fn is_supported_extended_dml(session: &Session, query: &str) -> bool {
+    let canonical = canonical_sql(query);
+    let dummy_query = replace_parameter_placeholders_with_dummy_literals(&canonical);
+    match parse_command(&dummy_query) {
+        Ok(Command::Insert(insert)) => session.tables.get(&insert.table).is_some_and(|table| {
+            if insert.rows.is_empty() {
+                return false;
+            }
+            let expected = if insert.columns.is_empty() {
+                table.columns.len()
+            } else {
+                if insert.columns.iter().any(|column| {
+                    !table
+                        .columns
+                        .iter()
+                        .any(|candidate| candidate.def.name == *column)
+                }) {
+                    return false;
+                }
+                insert.columns.len()
+            };
+            insert.rows.iter().all(|row| row.len() == expected)
+        }),
+        Ok(Command::Update(update)) => session.tables.get(&update.table).is_some_and(|table| {
+            !update.assignments.is_empty()
+                && update.assignments.iter().all(|assignment| {
+                    table
+                        .columns
+                        .iter()
+                        .any(|column| column.def.name == assignment.column)
+                })
+                && update.filter.is_some()
+        }),
+        Ok(Command::Delete(delete)) => {
+            session.tables.contains_key(&delete.table) && delete.filter.is_some()
+        }
+        _ => false,
+    }
+}
+
+fn insert_value_fragments(canonical: &str) -> Option<Vec<&str>> {
+    let values_pos = canonical.find(" values ")?;
+    let mut tail = canonical[values_pos + " values ".len()..].trim();
+    let mut values = Vec::new();
+    loop {
+        let open = tail.find('(')?;
+        if !tail[..open].trim().is_empty() {
+            return None;
+        }
+        let close = matching_paren_index(tail, open)?;
+        values.extend(split_sql_csv(&tail[open + 1..close])?);
+        tail = tail[close + 1..].trim_start();
+        if tail.is_empty() {
+            break;
+        }
+        tail = tail.strip_prefix(',')?.trim_start();
+    }
+    Some(values)
+}
+
+fn update_assignment_fragments(canonical: &str) -> Option<Vec<&str>> {
+    let set_pos = canonical.find(" set ")?;
+    let where_pos = canonical[set_pos + " set ".len()..].find(" where ")? + set_pos + " set ".len();
+    split_sql_csv(canonical[set_pos + " set ".len()..where_pos].trim())
+}
+
+fn dml_where_clause(canonical: &str) -> String {
+    let Some(where_pos) = canonical.find(" where ") else {
+        return String::new();
+    };
+    canonical[where_pos + " where ".len()..].to_string()
+}
+
+fn assign_filter_placeholder_oids(table: &Table, where_clause: &str, oids: &mut [u32]) {
+    for column in &table.columns {
+        for op in ["=", "<=", ">=", "<", ">"] {
+            let needle = format!("{} {op} $", column.def.name);
+            let mut rest = where_clause;
+            while let Some(pos) = rest.find(&needle) {
+                assign_placeholder_digits_oid(
+                    &rest[pos + needle.len()..],
+                    column.def.ty.postgres_oid(),
+                    oids,
+                );
+                rest = &rest[pos + needle.len()..];
+            }
+            let suffix = format!(" {op} {}", column.def.name);
+            let mut rest = where_clause;
+            while let Some(pos) = rest.find('$') {
+                let digits = rest[pos + 1..]
+                    .chars()
+                    .take_while(|ch| ch.is_ascii_digit())
+                    .collect::<String>();
+                if !digits.is_empty() && rest[pos + 1 + digits.len()..].starts_with(&suffix) {
+                    assign_placeholder_index_oid(&digits, column.def.ty.postgres_oid(), oids);
+                }
+                rest = &rest[pos + 1..];
+            }
+        }
+    }
+}
+
+fn assign_fragment_placeholder_oids(fragment: &str, oid: u32, oids: &mut [u32]) {
+    let mut rest = fragment;
+    while let Some(pos) = rest.find('$') {
+        assign_placeholder_digits_oid(&rest[pos + 1..], oid, oids);
+        rest = &rest[pos + 1..];
+    }
+}
+
+fn assign_placeholder_digits_oid(rest: &str, oid: u32, oids: &mut [u32]) {
+    let digits = rest
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    assign_placeholder_index_oid(&digits, oid, oids);
+}
+
+fn assign_placeholder_index_oid(digits: &str, oid: u32, oids: &mut [u32]) {
+    if let Ok(idx) = digits.parse::<usize>() {
+        if idx > 0 && idx <= oids.len() {
+            oids[idx - 1] = oid;
+        }
+    }
+}
+
+fn matching_paren_index(input: &str, open: usize) -> Option<usize> {
+    let mut chars = input[open..].char_indices().peekable();
+    let mut depth = 0usize;
+    let mut in_quote = false;
+    while let Some((relative_idx, ch)) = chars.next() {
+        if ch == '\'' {
+            if in_quote && matches!(chars.peek(), Some((_, '\''))) {
+                chars.next();
+                continue;
+            }
+            in_quote = !in_quote;
+            continue;
+        }
+        if in_quote {
+            continue;
+        }
+        match ch {
+            '(' => depth = depth.saturating_add(1),
+            ')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(open + relative_idx);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn select_where_clause(canonical: &str) -> String {
@@ -13882,7 +14294,7 @@ mod tests {
     }
 
     #[test]
-    fn extended_parse_rejects_unsupported_non_select_statements() {
+    fn extended_parse_accepts_bounded_dml_statements() {
         let mut session = Session::default();
         session.tables.insert(
             "people".to_string(),
@@ -13910,17 +14322,129 @@ mod tests {
         );
         let (mut writer, mut reader) = tcp_pair();
 
-        assert!(handle_parse(
+        assert!(!handle_parse(
             &mut writer,
             &mut session,
             "insert_people".to_string(),
             "INSERT INTO people (id, name) VALUES ($1, $2)".to_string(),
-            vec![23, 25]
+            Vec::new()
         )
         .unwrap());
 
-        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'E']);
-        assert!(!session.prepared.contains_key("insert_people"));
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'1']);
+        assert_eq!(
+            session.prepared.get("insert_people"),
+            Some(&PreparedStatement::Extended(PreparedQuery {
+                query: "INSERT INTO people (id, name) VALUES ($1, $2)".to_string(),
+                parameter_type_oids: vec![23, 25],
+            }))
+        );
+    }
+
+    #[test]
+    fn extended_dml_insert_update_delete_execute_and_recover() {
+        let mut session = Session::default();
+        session.tables.insert(
+            "people".to_string(),
+            Table {
+                oid: FIRST_USER_RELATION_OID,
+                name: "people".to_string(),
+                columns: vec![
+                    CatalogColumn {
+                        attnum: 1,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "id".to_string(),
+                            ty: SqlType::Int4,
+                        },
+                    },
+                    CatalogColumn {
+                        attnum: 2,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "name".to_string(),
+                            ty: SqlType::Text,
+                        },
+                    },
+                ],
+                rows: Vec::new(),
+            },
+        );
+        let (mut writer, mut reader) = tcp_pair();
+
+        assert!(!handle_parse(
+            &mut writer,
+            &mut session,
+            "insert_people".to_string(),
+            "INSERT INTO people (id, name) VALUES ($1, $2)".to_string(),
+            Vec::new()
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'1']);
+        assert!(!handle_bind(
+            &mut writer,
+            &mut session,
+            "insert_portal".to_string(),
+            "insert_people".to_string(),
+            Vec::new(),
+            vec![Some(b"1".to_vec()), Some(b"Ada".to_vec())],
+            Vec::new()
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'2']);
+        assert!(!handle_execute(&mut writer, &mut session, "insert_portal", 0).unwrap());
+        let messages = read_backend_messages(&mut reader, 1);
+        assert_eq!(messages[0].0, b'C');
+        assert_eq!(messages[0].1, b"INSERT 0 1\0");
+
+        assert!(!handle_parse(
+            &mut writer,
+            &mut session,
+            "update_people".to_string(),
+            "UPDATE people SET name = $1 WHERE id = $2".to_string(),
+            Vec::new()
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'1']);
+        assert!(!handle_bind(
+            &mut writer,
+            &mut session,
+            "update_portal".to_string(),
+            "update_people".to_string(),
+            Vec::new(),
+            vec![Some(b"Grace".to_vec()), Some(b"1".to_vec())],
+            Vec::new()
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'2']);
+        assert!(!handle_execute(&mut writer, &mut session, "update_portal", 0).unwrap());
+        let messages = read_backend_messages(&mut reader, 1);
+        assert_eq!(messages[0].0, b'C');
+        assert_eq!(messages[0].1, b"UPDATE 1\0");
+
+        assert!(!handle_parse(
+            &mut writer,
+            &mut session,
+            "delete_people".to_string(),
+            "DELETE FROM people WHERE name = $1".to_string(),
+            Vec::new()
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'1']);
+        assert!(!handle_bind(
+            &mut writer,
+            &mut session,
+            "delete_portal".to_string(),
+            "delete_people".to_string(),
+            Vec::new(),
+            vec![Some(b"Grace".to_vec())],
+            Vec::new()
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'2']);
+        assert!(!handle_execute(&mut writer, &mut session, "delete_portal", 0).unwrap());
+        let messages = read_backend_messages(&mut reader, 1);
+        assert_eq!(messages[0].0, b'C');
+        assert_eq!(messages[0].1, b"DELETE 1\0");
+        assert!(session.tables["people"].rows.is_empty());
     }
 
     #[test]
@@ -14069,12 +14593,12 @@ mod tests {
                 "too_many_oids",
             ),
             (
-                "unsupported_insert",
-                "INSERT INTO people (id, name) VALUES ($1, $2)",
-                vec![23, 25],
+                "unsupported_update_without_where",
+                "UPDATE people SET name = $1",
+                vec![25],
                 "0A000",
                 "extended query protocol only supports relational SELECT",
-                "unsupported_insert",
+                "unsupported_update_without_where",
             ),
         ] {
             let mut session = Session::default();

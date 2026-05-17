@@ -1,0 +1,12 @@
+=== psql extended dml supported ===
+CREATE TABLE
+INSERT 0 1
+UPDATE 1
+DELETE 0
+psql:86_protocol_psql_extended_insert_update_delete_supported.sql:6: ERROR:  invalid input syntax for parameter type oid 23: "bad"
+INSERT 0 1
+DELETE 1
+ id | name
+----+-------
+  2 | Linus
+(1 row)

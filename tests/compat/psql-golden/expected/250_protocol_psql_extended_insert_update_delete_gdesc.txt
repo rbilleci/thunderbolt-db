@@ -1,0 +1,18 @@
+=== psql extended dml gdesc metadata recovery ===
+CREATE TABLE
+The command has no result, or the result has no columns.
+INSERT 0 1
+The command has no result, or the result has no columns.
+UPDATE 1
+The command has no result, or the result has no columns.
+ id | name
+----+-------
+  1 | Grace
+(1 row)
+
+DELETE 1
+INSERT 0 1
+ id | name
+----+-------
+  2 | Linus
+(1 row)
