@@ -16,6 +16,7 @@ struct WorkloadReport {
     result_rows: usize,
     correctness_validated: bool,
     bridge: RelationalSqlGpuBridgeReport,
+    access_paths: Vec<String>,
     h2d_bytes_total: u64,
     d2h_bytes_total: u64,
     kernel_exec_samples: u64,
@@ -141,6 +142,10 @@ fn print_workload(report: &WorkloadReport) {
         "- cpu_fallback_rate_permyriad: {}",
         report.bridge.cpu_fallback_permyriad
     );
+    println!("- access_paths:");
+    for access_path in &report.access_paths {
+        println!("  - {access_path}");
+    }
     println!("- h2d_bytes_total: {}", report.h2d_bytes_total);
     println!(
         "- h2d_bytes_per_query: {:.2}",
@@ -229,6 +234,12 @@ fn run_workload(
 
     let result_rows = gpu_results.iter().map(|result| result.rows.len()).sum();
     let bridge = RelationalSqlGpuBridgeReport::from_results(&gpu_results);
+    let mut access_paths = gpu_results
+        .iter()
+        .map(|result| format!("{:?}", result.access_path))
+        .collect::<Vec<_>>();
+    access_paths.sort();
+    access_paths.dedup();
     let metrics = gpu.metrics().snapshot();
 
     Ok(WorkloadReport {
@@ -241,6 +252,7 @@ fn run_workload(
         result_rows,
         correctness_validated,
         bridge,
+        access_paths,
         h2d_bytes_total: metrics.h2d_bytes_total,
         d2h_bytes_total: metrics.d2h_bytes_total,
         kernel_exec_samples: metrics.kernel_exec_samples,

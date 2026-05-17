@@ -7067,6 +7067,58 @@ impl Engine {
             read_txn_id: self.visible_up_to,
         };
         if bound.filter_groups.len() > 1 {
+            if let Some((column_idx, keys)) = self
+                .relational_keys_matching_same_column_equality_groups(
+                    table,
+                    &select.table,
+                    &bound.filter_groups,
+                )
+            {
+                let mut keys = keys;
+                let order_column = bound
+                    .order
+                    .as_ref()
+                    .map(|(idx, _)| table.columns[*idx].clone());
+                if let Some((order_idx, descending)) = bound.order {
+                    keys =
+                        self.relational_sort_keys_by_column(table, keys, order_idx, descending)?;
+                }
+                let matched_keys = keys.len();
+                let query = MvccReadQuery {
+                    source: MvccReadSource::KeyBatchLookup { keys },
+                    visibility,
+                    filter: None,
+                    order: bound.order.is_none().then_some(MvccReadOrder::KeyAsc),
+                    projection: MvccProjection::KeyValue,
+                    limit: (relational_select_pushes_limit(select) || bound.order.is_some())
+                        .then_some(select.limit)
+                        .flatten(),
+                };
+                let table_column = table
+                    .columns
+                    .get(column_idx)
+                    .expect("bound filter column came from table");
+                let access_path = if let Some(order_column) = order_column {
+                    RelationalAccessPath::OrderedKeyBatch {
+                        table: select.table.clone(),
+                        predicate_column: Some(table_column.name.clone()),
+                        predicate_op: Some(SelectFilterOp::Eq),
+                        order_column: order_column.name,
+                        descending: bound
+                            .order
+                            .map(|(_, descending)| descending)
+                            .unwrap_or(false),
+                        matched_keys,
+                    }
+                } else {
+                    RelationalAccessPath::EqualityIndex {
+                        table: select.table.clone(),
+                        column: table_column.name.clone(),
+                        matched_keys,
+                    }
+                };
+                return Ok((query, access_path));
+            }
             let mut keys =
                 self.relational_keys_matching_filter_groups(table, &bound.filter_groups)?;
             let order_column = bound
@@ -7254,6 +7306,41 @@ impl Engine {
             },
             RelationalAccessPath::FullTableScan,
         ))
+    }
+
+    fn relational_keys_matching_same_column_equality_groups(
+        &self,
+        table: &RelationalTable,
+        table_name: &str,
+        filter_groups: &[Vec<(usize, SelectFilterOp, SqlValue)>],
+    ) -> Option<(usize, Vec<String>)> {
+        let mut column_idx = None;
+        let mut keys = BTreeSet::new();
+        for group in filter_groups {
+            let [(idx, op, value)] = group.as_slice() else {
+                return None;
+            };
+            if *op != SelectFilterOp::Eq {
+                return None;
+            }
+            match column_idx {
+                Some(existing_idx) if existing_idx != *idx => return None,
+                Some(_) => {}
+                None => column_idx = Some(*idx),
+            }
+            let column = table
+                .columns
+                .get(*idx)
+                .expect("bound filter column came from table");
+            if let Some(index_keys) = self.relational_value_index.get(&RelationalIndexKey {
+                table: table_name.to_string(),
+                column: column.name.clone(),
+                value: relational_index_value(value),
+            }) {
+                keys.extend(index_keys.iter().cloned());
+            }
+        }
+        column_idx.map(|idx| (idx, keys.into_iter().collect()))
     }
 
     fn relational_sort_keys_by_column(
@@ -23448,6 +23535,84 @@ mod tests {
             }
         );
         assert_eq!(e.status_snapshot().latest_fallback_reason(), None);
+    }
+
+    #[test]
+    fn relational_sql_gpu_bridge_same_column_or_equality_uses_index_batch() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO people (id, name) VALUES (1, 'Ada'), (2, 'Linus'), (3, 'Grace'), (4, 'Katherine')",
+        )
+        .unwrap();
+
+        let Command::Select(select) =
+            parse_command("SELECT id FROM people WHERE id = 2 OR id = 4").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let result = e
+            .execute_relational_select_with_backend(&select, &FirstCudaSliceParityBackend)
+            .unwrap();
+
+        assert_eq!(
+            result.rows,
+            vec![vec![SqlValue::Int4(2)], vec![SqlValue::Int4(4)]]
+        );
+        assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.fallback_reason, None);
+        assert_eq!(
+            result.access_path,
+            RelationalAccessPath::EqualityIndex {
+                table: "people".to_string(),
+                column: "id".to_string(),
+                matched_keys: 2,
+            }
+        );
+        assert_eq!(e.status_snapshot().latest_fallback_reason(), None);
+    }
+
+    #[test]
+    fn relational_sql_gpu_bridge_same_column_or_equality_with_order_uses_ordered_index_batch() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO people (id, name) VALUES (1, 'Ada'), (2, 'Linus'), (3, 'Grace'), (4, 'Katherine')",
+        )
+        .unwrap();
+
+        let Command::Select(select) =
+            parse_command("SELECT id FROM people WHERE id = 1 OR id = 3 ORDER BY id DESC").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let result = e
+            .execute_relational_select_with_backend(&select, &FirstCudaSliceParityBackend)
+            .unwrap();
+
+        assert_eq!(
+            result.rows,
+            vec![vec![SqlValue::Int4(3)], vec![SqlValue::Int4(1)]]
+        );
+        assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.fallback_reason, None);
+        assert_eq!(
+            result.access_path,
+            RelationalAccessPath::OrderedKeyBatch {
+                table: "people".to_string(),
+                predicate_column: Some("id".to_string()),
+                predicate_op: Some(SelectFilterOp::Eq),
+                order_column: "id".to_string(),
+                descending: true,
+                matched_keys: 2,
+            }
+        );
     }
 
     #[test]
