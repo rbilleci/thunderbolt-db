@@ -10,6 +10,7 @@ DIRECTORY_RESTORE_PORT="${PG_DUMP_SMOKE_DIRECTORY_RESTORE_PORT:-55447}"
 TAR_RESTORE_PORT="${PG_DUMP_SMOKE_TAR_RESTORE_PORT:-55448}"
 PARALLEL_DIRECTORY_RESTORE_PORT="${PG_DUMP_SMOKE_PARALLEL_DIRECTORY_RESTORE_PORT:-55449}"
 CLEAN_RESTORE_PORT="${PG_DUMP_SMOKE_CLEAN_RESTORE_PORT:-55450}"
+INSERT_RESTORE_PORT="${PG_DUMP_SMOKE_INSERT_RESTORE_PORT:-55451}"
 
 rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR"
@@ -21,6 +22,7 @@ directory_restore_pid=""
 tar_restore_pid=""
 parallel_directory_restore_pid=""
 clean_restore_pid=""
+insert_restore_pid=""
 
 cleanup() {
   if [[ -n "$source_pid" ]]; then
@@ -50,6 +52,10 @@ cleanup() {
   if [[ -n "$clean_restore_pid" ]]; then
     kill "$clean_restore_pid" 2>/dev/null || true
     wait "$clean_restore_pid" 2>/dev/null || true
+  fi
+  if [[ -n "$insert_restore_pid" ]]; then
+    kill "$insert_restore_pid" 2>/dev/null || true
+    wait "$insert_restore_pid" 2>/dev/null || true
   fi
 }
 trap cleanup EXIT
@@ -98,6 +104,11 @@ PGHOST=127.0.0.1 PGPORT="$SOURCE_PORT" PGDATABASE=postgres PGUSER=postgres \
 PGHOST=127.0.0.1 PGPORT="$SOURCE_PORT" PGDATABASE=postgres PGUSER=postgres \
   pg_dump --schema=public --no-owner --no-privileges --format=tar \
   --file="$OUT_DIR/dump.tar" 2>"$OUT_DIR/pg_dump_tar.err"
+
+PGHOST=127.0.0.1 PGPORT="$SOURCE_PORT" PGDATABASE=postgres PGUSER=postgres \
+  pg_dump --schema=public --no-owner --no-privileges --format=plain \
+  --inserts --rows-per-insert=2 \
+  >"$OUT_DIR/dump-inserts.sql" 2>"$OUT_DIR/pg_dump_inserts.err"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/restore-server.log" 2>&1 &
@@ -216,12 +227,33 @@ PGHOST=127.0.0.1 PGPORT="$CLEAN_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgre
 
 diff -u "$OUT_DIR/verify.expected" "$OUT_DIR/clean-verify.out"
 
+cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$INSERT_RESTORE_PORT" --shared-catalog \
+  >"$OUT_DIR/insert-restore-server.log" 2>&1 &
+insert_restore_pid=$!
+wait_for_port "$INSERT_RESTORE_PORT"
+
+PGHOST=127.0.0.1 PGPORT="$INSERT_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres \
+  psql -v ON_ERROR_STOP=1 -X -q -f "$OUT_DIR/dump-inserts.sql" \
+  >"$OUT_DIR/insert-restore.out" 2>"$OUT_DIR/insert-restore.err"
+
+PGHOST=127.0.0.1 PGPORT="$INSERT_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres \
+  psql -v ON_ERROR_STOP=1 -X -A -t \
+  -c "SELECT id, name FROM accounts ORDER BY id;" \
+  -c "SELECT event_id, note FROM events ORDER BY event_id;" \
+  >"$OUT_DIR/insert-verify.out" 2>"$OUT_DIR/insert-verify.err"
+
+diff -u "$OUT_DIR/verify.expected" "$OUT_DIR/insert-verify.out"
+
 pg_restore --list "$OUT_DIR/dump.custom" >"$OUT_DIR/dump.custom.toc"
 pg_restore --list "$OUT_DIR/dump.dir" >"$OUT_DIR/dump.dir.toc"
 pg_restore --list "$OUT_DIR/dump.tar" >"$OUT_DIR/dump.tar.toc"
 
 grep -F "COPY public.accounts (id, name) FROM stdin;" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "COPY public.events (event_id, note) FROM stdin;" "$OUT_DIR/dump.sql" >/dev/null
+grep -F "INSERT INTO public.accounts VALUES" "$OUT_DIR/dump-inserts.sql" >/dev/null
+grep -F "	(1, 'Ada')," "$OUT_DIR/dump-inserts.sql" >/dev/null
+grep -F "INSERT INTO public.events VALUES" "$OUT_DIR/dump-inserts.sql" >/dev/null
+grep -F "	(10, 'created')," "$OUT_DIR/dump-inserts.sql" >/dev/null
 grep -F "CREATE SCHEMA public;" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "CREATE TABLE public.accounts (" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "CREATE TABLE public.events (" "$OUT_DIR/dump.sql" >/dev/null
@@ -247,7 +279,9 @@ echo "pg_dump_directory_public_schema_pg_restore=passed"
 echo "pg_dump_tar_public_schema_pg_restore=passed"
 echo "pg_dump_directory_parallel_public_schema_pg_restore=passed"
 echo "pg_dump_custom_clean_if_exists_pg_restore=passed"
+echo "pg_dump_plain_insert_style_restore=passed"
 echo "dump_file=$OUT_DIR/dump.sql"
+echo "insert_dump_file=$OUT_DIR/dump-inserts.sql"
 echo "custom_dump_file=$OUT_DIR/dump.custom"
 echo "directory_dump_dir=$OUT_DIR/dump.dir"
 echo "tar_dump_file=$OUT_DIR/dump.tar"

@@ -1,0 +1,17 @@
+=== pg_dump insert-style restore boundary ===
+CREATE TABLE
+INSERT 0 2
+ id | name
+----+-------
+  1 | Ada
+  2 | Grace
+(2 rows)
+
+DECLARE CURSOR
+ id | name
+----+-------
+  1 | Ada
+  2 | Grace
+(2 rows)
+
+CLOSE CURSOR

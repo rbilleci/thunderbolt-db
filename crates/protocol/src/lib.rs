@@ -1533,19 +1533,29 @@ fn parse_insert(input: &str) -> Result<Insert, ParseError> {
         .and_then(|s| strip_keyword_prefix_case_insensitive(s.trim_start(), "INTO"))
         .ok_or(ParseError::InvalidRelationalSql)?
         .trim_start();
-    let open = rest.find('(').ok_or(ParseError::InvalidRelationalSql)?;
-    let table = normalize_relation_identifier(rest[..open].trim())?;
-    let close = find_matching_paren(rest, open).ok_or(ParseError::InvalidRelationalSql)?;
-    let columns = split_csv(&rest[open + 1..close])?
-        .into_iter()
-        .map(|column| normalize_identifier(column.trim()))
-        .collect::<Result<Vec<_>, _>>()?;
-    if columns.is_empty() {
-        return Err(ParseError::InvalidRelationalSql);
-    }
-    let values = strip_keyword_prefix_case_insensitive(rest[close + 1..].trim_start(), "VALUES")
-        .ok_or(ParseError::InvalidRelationalSql)?
-        .trim_start();
+    let values_pos =
+        find_keyword_outside_quotes(rest, "VALUES").ok_or(ParseError::InvalidRelationalSql)?;
+    let target = rest[..values_pos].trim();
+    let values = rest[values_pos + "VALUES".len()..].trim_start();
+    let (table, columns) = if let Some(open) = target.find('(') {
+        let close = find_matching_paren(target, open).ok_or(ParseError::InvalidRelationalSql)?;
+        if !target[close + 1..].trim().is_empty() {
+            return Err(ParseError::InvalidRelationalSql);
+        }
+        let columns = split_csv(&target[open + 1..close])?
+            .into_iter()
+            .map(|column| normalize_identifier(column.trim()))
+            .collect::<Result<Vec<_>, _>>()?;
+        if columns.is_empty() {
+            return Err(ParseError::InvalidRelationalSql);
+        }
+        (
+            normalize_relation_identifier(target[..open].trim())?,
+            columns,
+        )
+    } else {
+        (normalize_relation_identifier(target)?, Vec::new())
+    };
     let mut rows = Vec::new();
     let mut tail = values;
     loop {
@@ -1558,7 +1568,7 @@ fn parse_insert(input: &str) -> Result<Insert, ParseError> {
             .into_iter()
             .map(parse_sql_value)
             .collect::<Result<Vec<_>, _>>()?;
-        if row.len() != columns.len() {
+        if !columns.is_empty() && row.len() != columns.len() {
             return Err(ParseError::InvalidRelationalSql);
         }
         rows.push(row);
@@ -1586,6 +1596,9 @@ fn parse_select(input: &str) -> Result<Select, ParseError> {
         find_keyword_outside_quotes(rest, "FROM").ok_or(ParseError::InvalidRelationalSql)?;
     let projection = parse_projection(rest[..from_pos].trim())?;
     let mut tail = rest[from_pos + "FROM".len()..].trim_start();
+    if let Some(after_only) = strip_keyword_prefix_case_insensitive(tail, "ONLY") {
+        tail = after_only.trim_start();
+    }
     let table_end = tail.find(char::is_whitespace).unwrap_or(tail.len());
     let table = normalize_relation_identifier(&tail[..table_end])?;
     tail = tail[table_end..].trim_start();
@@ -8258,6 +8271,19 @@ mod tests {
         );
 
         assert_eq!(
+            parse_command("INSERT INTO public.people VALUES (4, 'Katherine'), (5, 'Mary')")
+                .unwrap(),
+            Command::Insert(Insert {
+                table: "people".to_string(),
+                columns: Vec::new(),
+                rows: vec![
+                    vec![SqlValue::Int4(4), SqlValue::Text("Katherine".to_string())],
+                    vec![SqlValue::Int4(5), SqlValue::Text("Mary".to_string())],
+                ],
+            })
+        );
+
+        assert_eq!(
             parse_command("SELECT id FROM people WHERE id = +1 LIMIT +1").unwrap(),
             Command::Select(Select {
                 table: "people".to_string(),
@@ -8301,6 +8327,18 @@ mod tests {
                     op: SelectFilterOp::Eq,
                     value: SqlValue::Int4(1),
                 }]],
+                order_by: None,
+                limit: None,
+            })
+        );
+        assert_eq!(
+            parse_command("SELECT id, name FROM ONLY public.people").unwrap(),
+            Command::Select(Select {
+                table: "people".to_string(),
+                projection: SelectProjection::Columns(vec!["id".to_string(), "name".to_string()]),
+                filter: None,
+                filters: Vec::new(),
+                filter_groups: Vec::new(),
                 order_by: None,
                 limit: None,
             })

@@ -3790,26 +3790,41 @@ fn execute_statement(
                         },
                     );
                 };
-                let mut indexes = Vec::with_capacity(insert.columns.len());
-                for column in &insert.columns {
-                    let Some(idx) = table
-                        .columns
-                        .iter()
-                        .position(|candidate| candidate.def.name == *column)
-                    else {
+                let indexes = if insert.columns.is_empty() {
+                    (0..table.columns.len()).collect::<Vec<_>>()
+                } else {
+                    let mut indexes = Vec::with_capacity(insert.columns.len());
+                    for column in &insert.columns {
+                        let Some(idx) = table
+                            .columns
+                            .iter()
+                            .position(|candidate| candidate.def.name == *column)
+                        else {
+                            return write_error(
+                                stream,
+                                &ErrorField {
+                                    code: "42703",
+                                    message: "column does not exist",
+                                    position: None,
+                                },
+                            );
+                        };
+                        indexes.push(idx);
+                    }
+                    indexes
+                };
+                let inserted_count = insert.rows.len();
+                for row in insert.rows {
+                    if row.len() != indexes.len() {
                         return write_error(
                             stream,
                             &ErrorField {
-                                code: "42703",
-                                message: "column does not exist",
+                                code: "42601",
+                                message: "INSERT value count must match target columns",
                                 position: None,
                             },
                         );
-                    };
-                    indexes.push(idx);
-                }
-                let inserted_count = insert.rows.len();
-                for row in insert.rows {
+                    }
                     let mut projected = vec![None; table.columns.len()];
                     for (source_idx, target_idx) in indexes.iter().copied().enumerate() {
                         if !sql_value_matches_type(

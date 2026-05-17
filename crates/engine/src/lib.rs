@@ -6560,18 +6560,28 @@ impl Engine {
                 EngineError::ApplyFailed(format!("relation \"{}\" does not exist", insert.table))
             })?
             .clone();
-        let mut column_indexes = Vec::with_capacity(insert.columns.len());
-        for column in &insert.columns {
-            let idx = table
-                .columns
-                .iter()
-                .position(|candidate| candidate.name == *column)
-                .ok_or_else(|| {
-                    EngineError::ApplyFailed(format!("column \"{}\" does not exist", column))
-                })?;
-            column_indexes.push(idx);
-        }
+        let column_indexes = if insert.columns.is_empty() {
+            (0..table.columns.len()).collect::<Vec<_>>()
+        } else {
+            let mut indexes = Vec::with_capacity(insert.columns.len());
+            for column in &insert.columns {
+                let idx = table
+                    .columns
+                    .iter()
+                    .position(|candidate| candidate.name == *column)
+                    .ok_or_else(|| {
+                        EngineError::ApplyFailed(format!("column \"{}\" does not exist", column))
+                    })?;
+                indexes.push(idx);
+            }
+            indexes
+        };
         for row in insert.rows {
+            if row.len() != column_indexes.len() {
+                return Err(EngineError::ApplyFailed(
+                    "INSERT value count must match target columns".to_string(),
+                ));
+            }
             let mut values = vec![None; table.columns.len()];
             for (source_idx, target_idx) in column_indexes.iter().copied().enumerate() {
                 let value = row[source_idx].clone();
