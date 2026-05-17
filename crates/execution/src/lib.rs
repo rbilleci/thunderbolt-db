@@ -155,6 +155,23 @@ impl CudaResidentDeviceMemory {
         )
     }
 
+    pub fn filtered_stats_i32_compare_from_payload(
+        &self,
+        byte_offset: u64,
+        row_count: u64,
+        needle: i32,
+        comparison: CudaI32Comparison,
+    ) -> Result<CudaI32Stats, CudaRuntimeProbeError> {
+        let values = launch_cuda_resident_i32_compare_project(
+            self,
+            byte_offset,
+            row_count,
+            needle,
+            comparison,
+        )?;
+        Ok(CudaI32Stats::from_values(&values))
+    }
+
     pub fn project_i32_compare_from_payload(
         &self,
         byte_offset: u64,
@@ -220,6 +237,25 @@ pub struct CudaI32GroupedStats {
     pub sum: i64,
     pub min: i32,
     pub max: i32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CudaI32Stats {
+    pub count: u64,
+    pub sum: i64,
+    pub min: Option<i32>,
+    pub max: Option<i32>,
+}
+
+impl CudaI32Stats {
+    fn from_values(values: &[i32]) -> Self {
+        Self {
+            count: values.len() as u64,
+            sum: values.iter().map(|value| i64::from(*value)).sum(),
+            min: values.iter().copied().min(),
+            max: values.iter().copied().max(),
+        }
+    }
 }
 
 impl Drop for CudaResidentDeviceMemory {
