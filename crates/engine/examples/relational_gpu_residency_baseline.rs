@@ -3,6 +3,7 @@ use std::error::Error;
 use std::time::{Duration, Instant};
 
 use gpu_db_engine::{Engine, RelationalSelectResult};
+use gpu_db_metrics::FallbackReason;
 use gpu_db_protocol::{parse_command, Command, Select};
 
 #[derive(Debug)]
@@ -75,6 +76,19 @@ fn main() -> Result<(), Box<dyn Error>> {
         &mutation_cpu_result,
         "post_mutation_per_query_h2d_probe",
     )?;
+    gpu.mark_gpu_memory_pressured(0);
+    let pressure_snapshot = gpu
+        .relational_residency_snapshot("events")
+        .ok_or("missing resident snapshot after memory pressure")?;
+    gpu.enqueue_set_text(
+        (row_count + 3) as u64,
+        "SET residency_pressure_probe=1",
+        Instant::now(),
+    )?;
+    let memory_pressure_fallback_count = gpu
+        .metrics()
+        .fallback_for(FallbackReason::GpuMemoryPressure);
+    gpu.clear_gpu_memory_pressured(0);
     let refresh_started = Instant::now();
     let refreshed_snapshot = gpu.populate_relational_residency_snapshot("events")?;
     let refresh_elapsed = refresh_started.elapsed();
@@ -100,6 +114,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!(
         "- resident_snapshot_valid_after_mutation: {}",
         invalidated_snapshot.is_valid()
+    );
+    println!(
+        "- resident_snapshot_valid_under_memory_pressure: {}",
+        pressure_snapshot.is_valid()
     );
     println!(
         "- resident_bytes_current: {}",
@@ -178,10 +196,23 @@ fn main() -> Result<(), Box<dyn Error>> {
             .unwrap_or_else(|| "None".to_string())
     );
     println!(
+        "- resident_refresh_invalidated_by_memory_pressure: {}",
+        refresh_cost.invalidated_by_memory_pressure
+    );
+    println!(
         "- resident_refresh_elapsed_ms: {:.3}",
         refresh_elapsed.as_secs_f64() * 1000.0
     );
-    println!("- memory_pressure_fallback_supported: false");
+    println!("- memory_pressure_fallback_supported: true");
+    println!(
+        "- memory_pressure_invalidates_resident_snapshot: {}",
+        pressure_snapshot.invalidated_by_memory_pressure
+    );
+    println!(
+        "- memory_pressure_active_on_snapshot: {}",
+        pressure_snapshot.memory_pressure_active
+    );
+    println!("- memory_pressure_fallback_count: {memory_pressure_fallback_count}");
     println!("- correctness_oracle: CPU relational engine");
     println!();
     print_probe(&cold_probe);
@@ -191,7 +222,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     print_probe(&mutation_probe);
     println!();
     println!(
-        "decision: current P7 evidence includes resident-byte accounting, WAL-safe invalidation metadata, and manual mutation refresh-cost accounting, but query execution still uses per-query H2D probe transfer. Do not claim warm-resident performance until the engine executes from resident table data and adds memory-pressure fallback evidence."
+        "decision: current P7 evidence includes resident-byte accounting, WAL-safe invalidation metadata, manual mutation refresh-cost accounting, and memory-pressure fallback metadata, but query execution still uses per-query H2D probe transfer. Do not claim warm-resident performance until the engine executes from resident table data."
     );
 
     Ok(())

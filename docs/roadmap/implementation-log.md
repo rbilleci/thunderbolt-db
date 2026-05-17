@@ -1244,3 +1244,4 @@
 3. Introduce durability error-path tests for commit pipeline.
 
 - Advanced P3 extended wire-protocol recovery coverage with real PostgreSQL 16 `psql` scenario 169. Invalid extended bind execution now has a golden case proving the error path preserves the prepared statement so later bound-portal `\gdesc`, execution, and supported SELECT traffic recover in the same session.
+- P7 residency hardening now treats GPU memory pressure as an explicit resident-snapshot fallback boundary: marking a GPU pressured invalidates existing residency snapshots for that GPU, records `GpuMemoryPressure` fallback telemetry, and the residency baseline reports this metadata while continuing to reject warm-resident execution claims until queries execute from resident table data.

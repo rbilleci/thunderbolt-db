@@ -5970,13 +5970,17 @@ pub struct RelationalResidencySnapshot {
     pub valid_through_index: Index,
     pub invalidated_by_txn_id: Option<TxnId>,
     pub invalidated_at_index: Option<Index>,
+    pub invalidated_by_memory_pressure: bool,
     pub memory_pressure_active: bool,
     pub last_refresh_cost: Option<RelationalResidencyRefreshCost>,
 }
 
 impl RelationalResidencySnapshot {
     pub fn is_valid(&self) -> bool {
-        self.invalidated_by_txn_id.is_none() && self.invalidated_at_index.is_none()
+        self.invalidated_by_txn_id.is_none()
+            && self.invalidated_at_index.is_none()
+            && !self.invalidated_by_memory_pressure
+            && !self.memory_pressure_active
     }
 }
 
@@ -5992,6 +5996,7 @@ pub struct RelationalResidencyRefreshCost {
     pub refreshed_through_index: Index,
     pub invalidated_by_txn_id: Option<TxnId>,
     pub invalidated_at_index: Option<Index>,
+    pub invalidated_by_memory_pressure: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7074,6 +7079,7 @@ impl Engine {
 
     pub fn mark_gpu_memory_pressured(&mut self, gpu_id: u16) {
         self.router.runtime_mut().mark_memory_pressured(gpu_id);
+        self.invalidate_relational_residency_for_memory_pressure(gpu_id);
     }
 
     pub fn clear_gpu_memory_pressured(&mut self, gpu_id: u16) {
@@ -7173,6 +7179,15 @@ impl Engine {
             if snapshot.invalidated_by_txn_id.is_none() {
                 snapshot.invalidated_by_txn_id = Some(txn_id);
                 snapshot.invalidated_at_index = Some(index);
+            }
+        }
+    }
+
+    fn invalidate_relational_residency_for_memory_pressure(&mut self, gpu_id: u16) {
+        for snapshot in self.relational_residency.values_mut() {
+            if snapshot.gpu_id == gpu_id {
+                snapshot.invalidated_by_memory_pressure = true;
+                snapshot.memory_pressure_active = true;
             }
         }
     }
@@ -8494,6 +8509,12 @@ impl Engine {
         drop(cursor);
 
         let gpu_id = self.planner.default_gpu_id();
+        let memory_pressure_active = self
+            .router
+            .runtime()
+            .snapshot()
+            .memory_pressured_gpu_ids
+            .contains(&gpu_id);
         let snapshot = RelationalResidencySnapshot {
             gpu_id,
             schema: catalog_table.schema,
@@ -8504,12 +8525,8 @@ impl Engine {
             valid_through_index: self.visible_up_to,
             invalidated_by_txn_id: None,
             invalidated_at_index: None,
-            memory_pressure_active: self
-                .router
-                .runtime()
-                .snapshot()
-                .memory_pressured_gpu_ids
-                .contains(&gpu_id),
+            invalidated_by_memory_pressure: memory_pressure_active,
+            memory_pressure_active,
             last_refresh_cost: previous_snapshot.as_ref().map(|previous| {
                 RelationalResidencyRefreshCost {
                     previous_row_count: previous.row_count,
@@ -8522,6 +8539,7 @@ impl Engine {
                     refreshed_through_index: self.visible_up_to,
                     invalidated_by_txn_id: previous.invalidated_by_txn_id,
                     invalidated_at_index: previous.invalidated_at_index,
+                    invalidated_by_memory_pressure: previous.invalidated_by_memory_pressure,
                 }
             }),
         };
@@ -11111,7 +11129,8 @@ mod tests {
         e.mark_gpu_memory_pressured(0);
         let pressured = e.relational_residency_snapshot("events").unwrap();
         assert!(pressured.memory_pressure_active);
-        assert!(pressured.is_valid());
+        assert!(pressured.invalidated_by_memory_pressure);
+        assert!(!pressured.is_valid());
 
         let valid_through = pressured.valid_through_index;
         e.execute_text(3, "INSERT INTO events (id, label) VALUES (3, 'gamma')")
@@ -11129,6 +11148,7 @@ mod tests {
         assert_eq!(refreshed.valid_through_index, e.visible_up_to);
         assert!(refreshed.is_valid());
         assert!(!refreshed.memory_pressure_active);
+        assert!(!refreshed.invalidated_by_memory_pressure);
         let refresh_cost = refreshed.last_refresh_cost.unwrap();
         assert_eq!(refresh_cost.previous_row_count, 2);
         assert_eq!(refresh_cost.refreshed_row_count, 3);
@@ -11152,6 +11172,7 @@ mod tests {
             refresh_cost.invalidated_at_index,
             invalidated.invalidated_at_index
         );
+        assert!(refresh_cost.invalidated_by_memory_pressure);
     }
 
     #[test]
