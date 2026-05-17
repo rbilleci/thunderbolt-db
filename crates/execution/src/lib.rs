@@ -151,6 +151,25 @@ impl CudaResidentDeviceMemory {
             self,
             group_byte_offset,
             value_byte_offset,
+            None,
+            row_count,
+        )
+    }
+
+    pub fn filtered_grouped_stats_i32_compare_from_payload(
+        &self,
+        group_byte_offset: u64,
+        value_byte_offset: u64,
+        filter_byte_offset: u64,
+        row_count: u64,
+        needle: i32,
+        comparison: CudaI32Comparison,
+    ) -> Result<Vec<CudaI32GroupedStats>, CudaRuntimeProbeError> {
+        launch_cuda_resident_i32_grouped_stats(
+            self,
+            group_byte_offset,
+            value_byte_offset,
+            Some((filter_byte_offset, needle, comparison)),
             row_count,
         )
     }
@@ -1533,6 +1552,7 @@ fn launch_cuda_resident_i32_grouped_stats(
     resident: &CudaResidentDeviceMemory,
     group_byte_offset: u64,
     value_byte_offset: u64,
+    filter: Option<(u64, i32, CudaI32Comparison)>,
     row_count: u64,
 ) -> Result<Vec<CudaI32GroupedStats>, CudaRuntimeProbeError> {
     type CuMemAlloc = unsafe extern "C" fn(*mut u64, usize) -> i32;
@@ -1566,7 +1586,10 @@ fn launch_cuda_resident_i32_grouped_stats(
     .param .u64 resident_ptr,
     .param .u64 group_byte_offset,
     .param .u64 value_byte_offset,
+    .param .u64 filter_byte_offset,
     .param .u64 row_count,
+    .param .s32 needle,
+    .param .u32 comparison,
     .param .u64 out_groups_ptr,
     .param .u64 out_counts_ptr,
     .param .u64 out_sums_ptr,
@@ -1582,6 +1605,7 @@ fn launch_cuda_resident_i32_grouped_stats(
     .reg .u64 %resident;
     .reg .u64 %group_offset;
     .reg .u64 %value_offset;
+    .reg .u64 %filter_offset;
     .reg .u64 %rows;
     .reg .u64 %out_groups;
     .reg .u64 %out_counts;
@@ -1591,6 +1615,7 @@ fn launch_cuda_resident_i32_grouped_stats(
     .reg .u64 %out_count;
     .reg .u64 %group_base;
     .reg .u64 %value_base;
+    .reg .u64 %filter_base;
     .reg .u64 %idx;
     .reg .u64 %scan;
     .reg .u64 %group_count;
@@ -1598,6 +1623,9 @@ fn launch_cuda_resident_i32_grouped_stats(
     .reg .u64 %output_addr;
     .reg .s32 %group_value;
     .reg .s32 %value;
+    .reg .s32 %filter_value;
+    .reg .s32 %needle;
+    .reg .u32 %comparison;
     .reg .s32 %existing_group;
     .reg .s64 %value_wide;
     .reg .u64 %existing_count;
@@ -1608,11 +1636,16 @@ fn launch_cuda_resident_i32_grouped_stats(
     .reg .s32 %existing_max;
     .reg .pred %p_less;
     .reg .pred %p_greater;
+    .reg .pred %p_check;
+    .reg .pred %p_match;
 
     ld.param.u64 %resident, [resident_ptr];
     ld.param.u64 %group_offset, [group_byte_offset];
     ld.param.u64 %value_offset, [value_byte_offset];
+    ld.param.u64 %filter_offset, [filter_byte_offset];
     ld.param.u64 %rows, [row_count];
+    ld.param.s32 %needle, [needle];
+    ld.param.u32 %comparison, [comparison];
     ld.param.u64 %out_groups, [out_groups_ptr];
     ld.param.u64 %out_counts, [out_counts_ptr];
     ld.param.u64 %out_sums, [out_sums_ptr];
@@ -1622,6 +1655,7 @@ fn launch_cuda_resident_i32_grouped_stats(
 
     add.u64 %group_base, %resident, %group_offset;
     add.u64 %value_base, %resident, %value_offset;
+    add.u64 %filter_base, %resident, %filter_offset;
     mov.u64 %idx, 0;
     mov.u64 %group_count, 0;
 
@@ -1629,6 +1663,36 @@ row_loop:
     setp.ge.u64 %p_done, %idx, %rows;
     @%p_done bra done;
 
+    setp.eq.u32 %p_check, %comparison, 0;
+    @%p_check bra predicate_pass;
+    mul.lo.u64 %input_addr, %idx, 4;
+    add.u64 %input_addr, %filter_base, %input_addr;
+    ld.global.s32 %filter_value, [%input_addr];
+    mov.pred %p_match, 0;
+    setp.eq.u32 %p_check, %comparison, 1;
+    @%p_check bra cmp_lt;
+    setp.eq.u32 %p_check, %comparison, 2;
+    @%p_check bra cmp_lte;
+    setp.eq.u32 %p_check, %comparison, 3;
+    @%p_check bra cmp_gt;
+    setp.eq.u32 %p_check, %comparison, 4;
+    @%p_check bra cmp_gte;
+    bra next_row;
+cmp_lt:
+    setp.lt.s32 %p_match, %filter_value, %needle;
+    bra predicate_checked;
+cmp_lte:
+    setp.le.s32 %p_match, %filter_value, %needle;
+    bra predicate_checked;
+cmp_gt:
+    setp.gt.s32 %p_match, %filter_value, %needle;
+    bra predicate_checked;
+cmp_gte:
+    setp.ge.s32 %p_match, %filter_value, %needle;
+predicate_checked:
+    @!%p_match bra next_row;
+
+predicate_pass:
     mul.lo.u64 %input_addr, %idx, 4;
     add.u64 %input_addr, %group_base, %input_addr;
     ld.global.s32 %group_value, [%input_addr];
@@ -1732,6 +1796,21 @@ done:
             value_bytes as usize,
         ));
     }
+    let (filter_byte_offset, needle, comparison_code) =
+        if let Some((filter_byte_offset, needle, comparison)) = filter {
+            let filter_bytes = row_count
+                .checked_mul(std::mem::size_of::<i32>() as u64)
+                .and_then(|bytes| filter_byte_offset.checked_add(bytes))
+                .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+            if filter_bytes > resident.metadata.allocated_bytes {
+                return Err(CudaRuntimeProbeError::InvalidInputLength(
+                    filter_bytes as usize,
+                ));
+            }
+            (filter_byte_offset, needle, comparison.code())
+        } else {
+            (group_byte_offset, 0, 0)
+        };
     if row_count == 0 {
         return Ok(Vec::new());
     }
@@ -1861,7 +1940,10 @@ done:
     let mut resident_arg = resident.device_ptr;
     let mut group_offset_arg = group_byte_offset;
     let mut value_offset_arg = value_byte_offset;
+    let mut filter_offset_arg = filter_byte_offset;
     let mut rows_arg = row_count;
+    let mut needle_arg = needle;
+    let mut comparison_arg = comparison_code;
     let mut groups_arg = groups_guard.ptr;
     let mut counts_arg = counts_guard.ptr;
     let mut sums_arg = sums_guard.ptr;
@@ -1872,7 +1954,10 @@ done:
         (&mut resident_arg as *mut u64).cast::<c_void>(),
         (&mut group_offset_arg as *mut u64).cast::<c_void>(),
         (&mut value_offset_arg as *mut u64).cast::<c_void>(),
+        (&mut filter_offset_arg as *mut u64).cast::<c_void>(),
         (&mut rows_arg as *mut u64).cast::<c_void>(),
+        (&mut needle_arg as *mut i32).cast::<c_void>(),
+        (&mut comparison_arg as *mut u32).cast::<c_void>(),
         (&mut groups_arg as *mut u64).cast::<c_void>(),
         (&mut counts_arg as *mut u64).cast::<c_void>(),
         (&mut sums_arg as *mut u64).cast::<c_void>(),

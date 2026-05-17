@@ -8729,6 +8729,210 @@ impl Engine {
         })
     }
 
+    pub fn execute_relational_filtered_grouped_aggregate_with_resident_device_memory_probe(
+        &mut self,
+        select: &Select,
+    ) -> Result<RelationalSelectResult, ExecuteError> {
+        let (table, bound) = self.bind_relational_select_for_execution(select)?;
+        let (group_column, value_column) = match &select.projection {
+            SelectProjection::GroupedCount { column } => (column, column),
+            SelectProjection::GroupedSum {
+                group_column,
+                sum_column,
+            } => (group_column, sum_column),
+            SelectProjection::GroupedAvg {
+                group_column,
+                avg_column,
+            } => (group_column, avg_column),
+            SelectProjection::GroupedMin {
+                group_column,
+                min_column,
+            } => (group_column, min_column),
+            SelectProjection::GroupedMax {
+                group_column,
+                max_column,
+            } => (group_column, max_column),
+            _ => {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "resident device-memory filtered grouped aggregate proof currently supports only grouped COUNT/SUM/AVG/MIN/MAX"
+                        .to_string(),
+                )));
+            }
+        };
+        if select.distinct
+            || !select.having_groups.is_empty()
+            || select.offset.is_some()
+            || bound.filter_groups.len() != 1
+            || bound.filter_groups[0].len() != 1
+        {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory filtered grouped aggregate proof currently supports only one int4 comparison predicate with optional ORDER BY and LIMIT"
+                    .to_string(),
+            )));
+        }
+        let Some(group_by) = &select.group_by else {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory filtered grouped aggregate proof requires GROUP BY"
+                    .to_string(),
+            )));
+        };
+        if !group_by.eq_ignore_ascii_case(group_column) {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory filtered grouped aggregate proof requires GROUP BY to match the projected group column"
+                    .to_string(),
+            )));
+        }
+        let group_idx = relational_column_index(&table, group_column)?;
+        let value_idx = relational_column_index(&table, value_column)?;
+        let (filter_idx, op, value) = bound.filter_groups[0][0].clone();
+        let Some(comparison) = resident_device_i32_comparison(op) else {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory filtered grouped aggregate proof currently supports only non-equality int4 comparisons"
+                    .to_string(),
+            )));
+        };
+        let SqlValue::Int4(needle) = value else {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory filtered grouped aggregate proof currently supports only int4 comparison literals"
+                    .to_string(),
+            )));
+        };
+        if table.columns[group_idx].ty != SqlType::Int4
+            || table.columns[value_idx].ty != SqlType::Int4
+            || table.columns[filter_idx].ty != SqlType::Int4
+        {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory filtered grouped aggregate proof currently supports only int4 group, aggregate, and filter columns"
+                    .to_string(),
+            )));
+        }
+
+        let (_query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
+        let snapshot = self
+            .relational_residency_snapshot(&table.name)
+            .ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "relation \"{}\" has no resident snapshot",
+                    table.name
+                )))
+            })?;
+        if snapshot.schema != table.schema || snapshot.table != table.name {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident snapshot no longer matches catalog table identity".to_string(),
+            )));
+        }
+        if !snapshot.is_valid() {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "relation \"{}\" resident snapshot is invalid",
+                table.name
+            ))));
+        }
+        let device_memory = self
+            .relational_residency_device_memory
+            .get(&table.name)
+            .ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "relation \"{}\" has no retained resident device memory",
+                    table.name
+                )))
+            })?;
+        let group_offset = resident_device_int4_column_offset(&snapshot, &table, group_idx)?;
+        let value_offset = resident_device_int4_column_offset(&snapshot, &table, value_idx)?;
+        let filter_offset = resident_device_int4_column_offset(&snapshot, &table, filter_idx)?;
+        let row_count = u64::try_from(snapshot.row_count).map_err(|_| {
+            ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident snapshot row count exceeds retained device-memory proof range"
+                    .to_string(),
+            ))
+        })?;
+        let started = Instant::now();
+        let mut grouped_stats = device_memory
+            .filtered_grouped_stats_i32_compare_from_payload(
+                group_offset,
+                value_offset,
+                filter_offset,
+                row_count,
+                needle,
+                comparison,
+            )
+            .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
+        let elapsed = started.elapsed();
+        let copied_group_count = grouped_stats.len();
+        let mut rows = grouped_stats
+            .drain(..)
+            .map(|group| {
+                let aggregate: SqlValue = match &select.projection {
+                    SelectProjection::GroupedCount { .. } => {
+                        let count = i32::try_from(group.count).map_err(|_| {
+                            ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                                "resident device-memory filtered grouped count {} exceeds supported COUNT(*) result range",
+                                group.count
+                            )))
+                        })?;
+                        Ok::<SqlValue, ExecuteError>(SqlValue::Int4(count))
+                    }
+                    SelectProjection::GroupedSum { .. } => {
+                        Ok::<SqlValue, ExecuteError>(SqlValue::Int8(group.sum))
+                    }
+                    SelectProjection::GroupedAvg { .. } => {
+                        Ok::<SqlValue, ExecuteError>(average_sql_value(
+                            i128::from(group.sum),
+                            group.count as usize,
+                        ))
+                    }
+                    SelectProjection::GroupedMin { .. } => {
+                        Ok::<SqlValue, ExecuteError>(SqlValue::Int4(group.min))
+                    }
+                    SelectProjection::GroupedMax { .. } => {
+                        Ok::<SqlValue, ExecuteError>(SqlValue::Int4(group.max))
+                    }
+                    _ => unreachable!(),
+                }?;
+                Ok(vec![SqlValue::Int4(group.group), aggregate])
+            })
+            .collect::<Result<Vec<_>, ExecuteError>>()?;
+        rows.sort_by(|left, right| compare_sql_values(&left[0], &right[0]));
+        if let Some(order) = &select.order_by {
+            let order_by_sum = select_is_aggregate_result_column(select, &order.column);
+            rows.sort_by(|left, right| {
+                let ordering = if order_by_sum {
+                    compare_sql_values(&left[1], &right[1])
+                } else {
+                    compare_sql_values(&left[0], &right[0])
+                };
+                ordering.then_with(|| compare_sql_values(&left[0], &right[0]))
+            });
+            if order.descending {
+                rows.reverse();
+            }
+        }
+        if let Some(limit) = select.limit {
+            rows.truncate(limit);
+        }
+        let result_d2h_bytes = copied_group_count
+            .checked_mul(
+                std::mem::size_of::<i32>()
+                    + std::mem::size_of::<u64>()
+                    + std::mem::size_of::<i64>()
+                    + (2 * std::mem::size_of::<i32>()),
+            )
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<u64>()))
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .unwrap_or(u64::MAX);
+        self.metrics.observe_d2h_bytes(result_d2h_bytes);
+        self.metrics
+            .observe_kernel_exec_ms(elapsed.as_millis().try_into().unwrap_or(u64::MAX).max(1));
+
+        Ok(RelationalSelectResult {
+            columns: bound.selected_columns,
+            rows,
+            planned_target: DeviceTarget::Gpu(snapshot.gpu_id),
+            executed_target: DeviceTarget::Gpu(snapshot.gpu_id),
+            fallback_reason: None,
+            access_path,
+        })
+    }
+
     pub fn execute_relational_projection_with_resident_device_memory_probe(
         &mut self,
         select: &Select,
@@ -13069,6 +13273,100 @@ mod tests {
         .unwrap();
         assert!(e
             .execute_relational_grouped_sum_with_resident_device_memory_probe(&select)
+            .unwrap_err()
+            .to_string()
+            .contains("resident snapshot is invalid"));
+    }
+
+    #[test]
+    fn gpu_resident_device_memory_filtered_grouped_aggregate_probe_materializes_int4_results() {
+        let mut e = Engine::new_local();
+        e.execute_text(
+            1,
+            "CREATE TABLE events (bucket INT, label TEXT, amount INT)",
+        )
+        .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO events (bucket, label, amount) VALUES (1, 'alpha', 10), (2, 'beta', 30), (1, 'gamma', 20), (3, 'delta', 40), (2, 'epsilon', 5), (3, 'zeta', 15)",
+        )
+        .unwrap();
+        let snapshot = e.populate_relational_residency_snapshot("events").unwrap();
+        if snapshot.device_memory_proof.is_none() {
+            return;
+        }
+
+        for sql in [
+            "SELECT bucket, COUNT(*) FROM events WHERE amount >= 15 GROUP BY bucket ORDER BY count DESC LIMIT 2",
+            "SELECT bucket, SUM(amount) FROM events WHERE amount >= 15 GROUP BY bucket ORDER BY sum DESC LIMIT 2",
+            "SELECT bucket, AVG(amount) FROM events WHERE amount >= 15 GROUP BY bucket ORDER BY avg DESC LIMIT 2",
+            "SELECT bucket, MIN(amount) FROM events WHERE amount >= 15 GROUP BY bucket ORDER BY min DESC LIMIT 2",
+            "SELECT bucket, MAX(amount) FROM events WHERE amount >= 15 GROUP BY bucket ORDER BY max DESC LIMIT 2",
+        ] {
+            let Command::Select(select) = parse_command(sql).unwrap() else {
+                unreachable!()
+            };
+            let cpu = e.execute_relational_select(&select).unwrap();
+            let before = e.metrics().snapshot();
+            let resident = e
+                .execute_relational_filtered_grouped_aggregate_with_resident_device_memory_probe(
+                    &select,
+                )
+                .unwrap();
+            let after = e.metrics().snapshot();
+
+            assert_eq!(resident.columns, cpu.columns, "{sql}");
+            assert_eq!(resident.rows, cpu.rows, "{sql}");
+            assert_eq!(resident.planned_target, DeviceTarget::Gpu(0));
+            assert_eq!(resident.executed_target, DeviceTarget::Gpu(0));
+            assert_eq!(resident.fallback_reason, None);
+            assert_eq!(after.h2d_bytes_total - before.h2d_bytes_total, 0, "{sql}");
+            assert!(
+                after.d2h_bytes_total > before.d2h_bytes_total,
+                "{sql} should read filtered grouped stats from device memory"
+            );
+            assert_eq!(after.kernel_exec_samples - before.kernel_exec_samples, 1);
+        }
+
+        let Command::Select(unsupported_equality) = parse_command(
+            "SELECT bucket, SUM(amount) FROM events WHERE amount = 20 GROUP BY bucket",
+        )
+        .unwrap() else {
+            unreachable!()
+        };
+        let err = e
+            .execute_relational_filtered_grouped_aggregate_with_resident_device_memory_probe(
+                &unsupported_equality,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("supports only non-equality int4 comparisons"));
+
+        let Command::Select(unsupported_text) = parse_command(
+            "SELECT bucket, MAX(amount) FROM events WHERE label >= 'beta' GROUP BY bucket",
+        )
+        .unwrap() else {
+            unreachable!()
+        };
+        let err = e
+            .execute_relational_filtered_grouped_aggregate_with_resident_device_memory_probe(
+                &unsupported_text,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("supports only int4 comparison literals"));
+
+        let Command::Select(select) = parse_command(
+            "SELECT bucket, SUM(amount) FROM events WHERE amount >= 15 GROUP BY bucket",
+        )
+        .unwrap() else {
+            unreachable!()
+        };
+        e.mark_gpu_memory_pressured(0);
+        assert!(e
+            .execute_relational_filtered_grouped_aggregate_with_resident_device_memory_probe(
+                &select
+            )
             .unwrap_err()
             .to_string()
             .contains("resident snapshot is invalid"));
