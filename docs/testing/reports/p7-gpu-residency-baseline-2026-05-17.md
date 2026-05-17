@@ -16,7 +16,7 @@
 - current_data_residency_model: bounded_resident_snapshot_probe_with_retained_cuda_allocation_plus_per_query_h2d_fallback
 - warm_resident_snapshot_execution_supported: true
 - production_device_cache_supported: bounded_retained_snapshot_handle
-- resident_device_memory_query_kernel_supported: bounded_count_all_int4_equality_count_int4_range_count_int4_sum_avg_min_max_filtered_sum_avg_min_max_int4_projection_int4_distinct_projection_int4_filtered_distinct_projection_int4_ordered_projection_int4_grouped_count_sum_avg_min_max_and_filtered_grouped_count_sum_avg_min_max
+- resident_device_memory_query_kernel_supported: bounded_count_all_int4_equality_count_int4_range_count_int4_sum_avg_min_max_filtered_sum_avg_min_max_int4_projection_int4_distinct_projection_int4_filtered_distinct_projection_int4_filtered_ordered_projection_int4_grouped_count_sum_avg_min_max_and_filtered_grouped_count_sum_avg_min_max
 - resident_device_memory_proof_supported: true
 - resident_device_memory_allocated_bytes: 73135
 - resident_device_memory_copied_bytes: 73135
@@ -297,7 +297,7 @@
 - kernel_exec_total_ms: 1
 - correctness_validated: true
 
-### resident_device_memory_ordered_projection_kernel_probe
+### resident_device_memory_filtered_ordered_projection_kernel_probe
 - elapsed_us: 63426
 - result_rows: 8
 - planned_target: Gpu(0)
@@ -465,4 +465,4 @@
 - kernel_exec_total_ms: 422
 - correctness_validated: true
 
-decision: current P7 evidence includes bounded resident table-data snapshot SELECT probes with zero per-query H2D transfer for the app lookup workload and supported aggregate/distinct SQL shapes, retained-device-memory COUNT(*), int4 equality-predicate COUNT(*), int4 range-predicate COUNT(*), int4 scalar SUM/AVG/MIN/MAX, int4 filtered scalar SUM/AVG/MIN/MAX, int4 predicate-projection, int4 distinct projection, int4 filtered distinct projection, bounded int4 ordered-projection, int4 grouped COUNT/SUM/AVG/MIN/MAX, and int4 filtered grouped COUNT/SUM/AVG/MIN/MAX proofs over the resident allocation, resident-byte accounting, WAL-safe invalidation, manual refresh-cost accounting, memory-pressure fallback metadata, deterministic resident-snapshot budget admission/eviction, and a retained real CUDA allocation/copy handle for encoded snapshot bytes when local driver hardware is available. Keep broad production CUDA cache claims out of scope until broader expression kernels read directly from retained device-memory handles.
+decision: current P7 evidence includes bounded resident table-data snapshot SELECT probes with zero per-query H2D transfer for the app lookup workload and supported aggregate/distinct SQL shapes, retained-device-memory COUNT(*), int4 equality-predicate COUNT(*), int4 range-predicate COUNT(*), int4 scalar SUM/AVG/MIN/MAX, int4 filtered scalar SUM/AVG/MIN/MAX, int4 predicate-projection, int4 distinct projection, int4 filtered distinct projection, bounded int4 filtered ordered-projection, int4 grouped COUNT/SUM/AVG/MIN/MAX, and int4 filtered grouped COUNT/SUM/AVG/MIN/MAX proofs over the resident allocation, resident-byte accounting, WAL-safe invalidation, manual refresh-cost accounting, memory-pressure fallback metadata, deterministic resident-snapshot budget admission/eviction, and a retained real CUDA allocation/copy handle for encoded snapshot bytes when local driver hardware is available. Keep broad production CUDA cache claims out of scope until broader expression kernels read directly from retained device-memory handles.
