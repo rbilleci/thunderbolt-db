@@ -23,8 +23,12 @@ SELECT DISTINCT name FROM people ORDER BY name DESC LIMIT 2 OFFSET 1;
 \echo === relational count aggregation ===
 SELECT COUNT(*) FROM people WHERE name = 'Grace';
 SELECT name, COUNT(*) FROM people GROUP BY name ORDER BY name;
+\echo === relational sum aggregation ===
+SELECT SUM(id) FROM people WHERE name = 'Grace';
+SELECT name, SUM(id) FROM people GROUP BY name ORDER BY sum DESC LIMIT 2;
 \echo === relational aggregate unsupported recovery ===
 SELECT name, COUNT(*) FROM people ORDER BY name;
+SELECT SUM(name) FROM people;
 SELECT COUNT(*) FROM people WHERE id >= 2;
 \echo === relational distinct unsupported recovery ===
 SELECT DISTINCT name FROM people ORDER BY id;

@@ -6078,6 +6078,7 @@ fn relational_key_prefix(table: &str) -> String {
 fn relational_index_value(value: &SqlValue) -> String {
     match value {
         SqlValue::Int4(value) => format!("i:{value}"),
+        SqlValue::Int8(value) => format!("n:{value}"),
         SqlValue::Text(value) => format!("t:{value}"),
     }
 }
@@ -6087,6 +6088,7 @@ fn encode_relational_row(values: &[SqlValue]) -> String {
         .iter()
         .map(|value| match value {
             SqlValue::Int4(value) => format!("i:{value}"),
+            SqlValue::Int8(value) => format!("n:{value}"),
             SqlValue::Text(value) => {
                 format!("t:{}", value.replace('\\', "\\\\").replace('|', "\\|"))
             }
@@ -6108,22 +6110,27 @@ fn decode_relational_row(
     parts
         .into_iter()
         .zip(columns.iter())
-        .map(
-            |(part, column)| match (part.strip_prefix("i:"), part.strip_prefix("t:"), column.ty) {
-                (Some(value), _, SqlType::Int4) => {
+        .map(|(part, column)| {
+            match (
+                part.strip_prefix("i:"),
+                part.strip_prefix("t:"),
+                part.strip_prefix("n:"),
+                column.ty,
+            ) {
+                (Some(value), _, _, SqlType::Int4) => {
                     value.parse::<i32>().map(SqlValue::Int4).map_err(|_| {
                         ExecuteError::Engine(EngineError::ApplyFailed(
                             "stored INT value is invalid".to_string(),
                         ))
                     })
                 }
-                (_, Some(value), SqlType::Text) => Ok(SqlValue::Text(value.to_string())),
+                (_, Some(value), _, SqlType::Text) => Ok(SqlValue::Text(value.to_string())),
                 _ => Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
                     "stored value for column \"{}\" has wrong type",
                     column.name
                 )))),
-            },
-        )
+            }
+        })
         .collect()
 }
 
@@ -6154,9 +6161,12 @@ fn split_escaped_row(input: &str) -> Vec<String> {
 fn compare_sql_values(left: &SqlValue, right: &SqlValue) -> Ordering {
     match (left, right) {
         (SqlValue::Int4(left), SqlValue::Int4(right)) => left.cmp(right),
+        (SqlValue::Int8(left), SqlValue::Int8(right)) => left.cmp(right),
+        (SqlValue::Int4(left), SqlValue::Int8(right)) => i64::from(*left).cmp(right),
+        (SqlValue::Int8(left), SqlValue::Int4(right)) => left.cmp(&i64::from(*right)),
         (SqlValue::Text(left), SqlValue::Text(right)) => left.cmp(right),
-        (SqlValue::Int4(_), SqlValue::Text(_)) => Ordering::Less,
-        (SqlValue::Text(_), SqlValue::Int4(_)) => Ordering::Greater,
+        (SqlValue::Int4(_) | SqlValue::Int8(_), SqlValue::Text(_)) => Ordering::Less,
+        (SqlValue::Text(_), SqlValue::Int4(_) | SqlValue::Int8(_)) => Ordering::Greater,
     }
 }
 
@@ -6211,6 +6221,10 @@ fn bind_relational_select(
             .collect::<Result<Vec<_>, _>>()?,
         SelectProjection::CountAll => Vec::new(),
         SelectProjection::GroupedCount { column } => vec![relational_column_index(table, column)?],
+        SelectProjection::Sum { .. } => Vec::new(),
+        SelectProjection::GroupedSum { group_column, .. } => {
+            vec![relational_column_index(table, group_column)?]
+        }
     };
     let mut selected_columns = selected_indexes
         .iter()
@@ -6218,17 +6232,25 @@ fn bind_relational_select(
         .collect::<Vec<_>>();
     if matches!(
         select.projection,
-        SelectProjection::CountAll | SelectProjection::GroupedCount { .. }
+        SelectProjection::CountAll
+            | SelectProjection::GroupedCount { .. }
+            | SelectProjection::Sum { .. }
+            | SelectProjection::GroupedSum { .. }
     ) {
-        let count_attnum = selected_columns.len() as i16 + 1;
+        let aggregate_name = match &select.projection {
+            SelectProjection::CountAll | SelectProjection::GroupedCount { .. } => "count",
+            SelectProjection::Sum { .. } | SelectProjection::GroupedSum { .. } => "sum",
+            SelectProjection::All | SelectProjection::Columns(_) => unreachable!(),
+        };
+        let aggregate_attnum = selected_columns.len() as i16 + 1;
         selected_columns.push(RelationalColumn {
             id: 0,
             table_oid: table.oid,
-            attnum: count_attnum,
-            name: "count".to_string(),
+            attnum: aggregate_attnum,
+            name: aggregate_name.to_string(),
             ty: SqlType::Int4,
-            type_oid: SqlType::Int4.postgres_oid(),
-            type_size: SqlType::Int4.type_size(),
+            type_oid: 20,
+            type_size: 8,
         });
     }
     let raw_filter_groups = if select.filter_groups.is_empty() {
@@ -6263,7 +6285,7 @@ fn bind_relational_select(
         .order_by
         .as_ref()
         .map(|order| {
-            if select_is_aggregate(select) && order.column.eq_ignore_ascii_case("count") {
+            if select_is_aggregate_result_column(select, &order.column) {
                 Ok((usize::MAX, order.descending))
             } else {
                 relational_column_index(table, &order.column).map(|idx| (idx, order.descending))
@@ -6286,7 +6308,10 @@ fn bind_relational_select(
                     }
                 }
             }
-            SelectProjection::CountAll | SelectProjection::GroupedCount { .. } => unreachable!(),
+            SelectProjection::CountAll
+            | SelectProjection::GroupedCount { .. }
+            | SelectProjection::Sum { .. }
+            | SelectProjection::GroupedSum { .. } => unreachable!(),
         }
     }
     let group_by_index = if let Some(group_by) = &select.group_by {
@@ -6319,6 +6344,48 @@ fn bind_relational_select(
         (SelectProjection::GroupedCount { .. }, None) => {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                 "grouped COUNT(*) requires GROUP BY".to_string(),
+            )));
+        }
+        (SelectProjection::Sum { column }, None) => {
+            validate_sum_column(table, column)?;
+            if let Some(order) = &select.order_by {
+                if !order.column.eq_ignore_ascii_case("sum") {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        "SUM ORDER BY only supports sum".to_string(),
+                    )));
+                }
+            }
+        }
+        (SelectProjection::Sum { .. }, Some(_)) => {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "GROUP BY requires grouped SUM projection".to_string(),
+            )));
+        }
+        (
+            SelectProjection::GroupedSum {
+                group_column,
+                sum_column,
+            },
+            Some(idx),
+        ) => {
+            let projected_idx = relational_column_index(table, group_column)?;
+            if projected_idx != idx {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "GROUP BY column must match grouped SUM projection".to_string(),
+                )));
+            }
+            validate_sum_column(table, sum_column)?;
+            if let Some(order) = &select.order_by {
+                if order.column != *group_column && !order.column.eq_ignore_ascii_case("sum") {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        "GROUP BY ORDER BY must reference grouped column or sum".to_string(),
+                    )));
+                }
+            }
+        }
+        (SelectProjection::GroupedSum { .. }, None) => {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "grouped SUM requires GROUP BY".to_string(),
             )));
         }
         (SelectProjection::All | SelectProjection::Columns(_), Some(_)) => {
@@ -6401,8 +6468,33 @@ fn select_has_relational_filters(select: &Select) -> bool {
 fn select_is_aggregate(select: &Select) -> bool {
     matches!(
         select.projection,
-        SelectProjection::CountAll | SelectProjection::GroupedCount { .. }
+        SelectProjection::CountAll
+            | SelectProjection::GroupedCount { .. }
+            | SelectProjection::Sum { .. }
+            | SelectProjection::GroupedSum { .. }
     )
+}
+
+fn select_is_aggregate_result_column(select: &Select, column: &str) -> bool {
+    match select.projection {
+        SelectProjection::CountAll | SelectProjection::GroupedCount { .. } => {
+            column.eq_ignore_ascii_case("count")
+        }
+        SelectProjection::Sum { .. } | SelectProjection::GroupedSum { .. } => {
+            column.eq_ignore_ascii_case("sum")
+        }
+        SelectProjection::All | SelectProjection::Columns(_) => false,
+    }
+}
+
+fn validate_sum_column(table: &RelationalTable, column: &str) -> Result<usize, ExecuteError> {
+    let idx = relational_column_index(table, column)?;
+    if !matches!(table.columns[idx].ty, SqlType::Int4) {
+        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+            "SUM only supports int4 columns".to_string(),
+        )));
+    }
+    Ok(idx)
 }
 
 fn current_timestamp_micros() -> u64 {
@@ -7612,11 +7704,49 @@ impl Engine {
                         .map(|(value, count)| vec![value, SqlValue::Int4(count as i32)])
                         .collect::<Vec<_>>()
                 }
+                SelectProjection::Sum { column } => {
+                    let sum_idx = validate_sum_column(&table, column)?;
+                    let sum = rows
+                        .iter()
+                        .map(|row| match &row[sum_idx] {
+                            SqlValue::Int4(value) => Ok(i64::from(*value)),
+                            SqlValue::Int8(_) | SqlValue::Text(_) => {
+                                Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                                    "SUM only supports int4 columns".to_string(),
+                                )))
+                            }
+                        })
+                        .collect::<Result<Vec<_>, _>>()?
+                        .into_iter()
+                        .sum::<i64>();
+                    vec![vec![SqlValue::Int8(sum)]]
+                }
+                SelectProjection::GroupedSum { sum_column, .. } => {
+                    let group_idx = bound
+                        .group_by_index
+                        .expect("grouped SUM validation requires GROUP BY");
+                    let sum_idx = validate_sum_column(&table, sum_column)?;
+                    let mut sums: BTreeMap<SqlValue, i64> = BTreeMap::new();
+                    for row in rows {
+                        let value = match &row[sum_idx] {
+                            SqlValue::Int4(value) => i64::from(*value),
+                            SqlValue::Int8(_) | SqlValue::Text(_) => {
+                                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                                    "SUM only supports int4 columns".to_string(),
+                                )));
+                            }
+                        };
+                        *sums.entry(row[group_idx].clone()).or_default() += value;
+                    }
+                    sums.into_iter()
+                        .map(|(value, sum)| vec![value, SqlValue::Int8(sum)])
+                        .collect::<Vec<_>>()
+                }
                 SelectProjection::All | SelectProjection::Columns(_) => unreachable!(),
             };
 
             if let Some(order) = &select.order_by {
-                let order_idx = if order.column.eq_ignore_ascii_case("count") {
+                let order_idx = if select_is_aggregate_result_column(select, &order.column) {
                     aggregate_rows.first().map_or(0, |row| row.len() - 1)
                 } else {
                     0
@@ -23679,6 +23809,24 @@ mod tests {
             .unwrap();
         assert_eq!(count_result.rows, vec![vec![SqlValue::Int4(2)]]);
         assert_eq!(count_result.fallback_reason, None);
+
+        let Command::Select(sum_select) = parse_command(
+            "SELECT name, SUM(id) FROM people WHERE id >= 2 GROUP BY name ORDER BY sum DESC LIMIT 1",
+        )
+        .unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let sum_result = e
+            .execute_relational_select_with_backend(&sum_select, &FirstCudaSliceParityBackend)
+            .unwrap();
+        assert_eq!(
+            sum_result.rows,
+            vec![vec![SqlValue::Text("Grace".to_string()), SqlValue::Int8(5)]]
+        );
+        assert_eq!(sum_result.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(sum_result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(sum_result.fallback_reason, None);
     }
 
     #[test]

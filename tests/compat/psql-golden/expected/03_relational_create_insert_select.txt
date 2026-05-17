@@ -83,15 +83,28 @@ INSERT 0 4
  Linus |     1
 (3 rows)
 
+=== relational sum aggregation ===
+ sum
+-----
+   7
+(1 row)
+
+ name  | sum
+-------+-----
+ Grace |   7
+ Linus |   2
+(2 rows)
+
 === relational aggregate unsupported recovery ===
-psql:03_relational_create_insert_select.sql:27: ERROR:  grouped COUNT(*) requires GROUP BY
+psql:03_relational_create_insert_select.sql:30: ERROR:  grouped COUNT(*) requires GROUP BY
+psql:03_relational_create_insert_select.sql:31: ERROR:  SUM only supports int4 columns
  count
 -------
      3
 (1 row)
 
 === relational distinct unsupported recovery ===
-psql:03_relational_create_insert_select.sql:30: ERROR:  SELECT DISTINCT ORDER BY must reference a selected column
+psql:03_relational_create_insert_select.sql:34: ERROR:  SELECT DISTINCT ORDER BY must reference a selected column
  id
 ----
   1
@@ -104,7 +117,7 @@ psql:03_relational_create_insert_select.sql:30: ERROR:  SELECT DISTINCT ORDER BY
 (1 row)
 
 === relational negative offset recovery ===
-psql:03_relational_create_insert_select.sql:35: ERROR:  OFFSET must not be negative
+psql:03_relational_create_insert_select.sql:39: ERROR:  OFFSET must not be negative
  id
 ----
   3

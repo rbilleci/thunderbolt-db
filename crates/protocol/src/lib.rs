@@ -66,6 +66,7 @@ pub struct Insert {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SqlValue {
     Int4(i32),
+    Int8(i64),
     Text(String),
 }
 
@@ -88,7 +89,16 @@ pub enum SelectProjection {
     All,
     Columns(Vec<String>),
     CountAll,
-    GroupedCount { column: String },
+    GroupedCount {
+        column: String,
+    },
+    Sum {
+        column: String,
+    },
+    GroupedSum {
+        group_column: String,
+        sum_column: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,7 +149,7 @@ pub enum ParseError {
     InvalidDel,
     #[error("invalid GET syntax; expected: GET key")]
     InvalidGet,
-    #[error("invalid relational SQL syntax; supported subset: CREATE TABLE name (...), INSERT INTO name (...) VALUES (...), SELECT [DISTINCT] columns|COUNT(*)|column, COUNT(*) FROM name [WHERE column (=|<|<=|>|>=) literal | column BETWEEN literal AND literal | column IN (literal, ...) | text_column LIKE 'prefix%' [AND ...] [OR ...]] [GROUP BY column] [ORDER BY selected_column|count [ASC|DESC]] [LIMIT n] [OFFSET n]")]
+    #[error("invalid relational SQL syntax; supported subset: CREATE TABLE name (...), INSERT INTO name (...) VALUES (...), SELECT [DISTINCT] columns|COUNT(*)|SUM(int4_column)|column, COUNT(*)|column, SUM(int4_column) FROM name [WHERE column (=|<|<=|>|>=) literal | column BETWEEN literal AND literal | column IN (literal, ...) | text_column LIKE 'prefix%' [AND ...] [OR ...]] [GROUP BY column] [ORDER BY selected_column|count|sum [ASC|DESC]] [LIMIT n] [OFFSET n]")]
     InvalidRelationalSql,
     #[error("LIMIT must not be negative")]
     NegativeLimit,
@@ -1619,6 +1629,8 @@ fn parse_select(input: &str) -> Result<Select, ParseError> {
             SelectProjection::All
                 | SelectProjection::CountAll
                 | SelectProjection::GroupedCount { .. }
+                | SelectProjection::Sum { .. }
+                | SelectProjection::GroupedSum { .. }
         )
     {
         return Err(ParseError::InvalidRelationalSql);
@@ -1693,16 +1705,26 @@ fn parse_projection(input: &str) -> Result<SelectProjection, ParseError> {
     if input.eq_ignore_ascii_case("COUNT(*)") {
         return Ok(SelectProjection::CountAll);
     }
+    if let Some(column) = parse_aggregate_call(input, "SUM")? {
+        return Ok(SelectProjection::Sum { column });
+    }
     let items = split_csv(input)?;
     if items.len() == 2 && items[1].trim().eq_ignore_ascii_case("COUNT(*)") {
         return Ok(SelectProjection::GroupedCount {
             column: normalize_identifier(items[0].trim())?,
         });
     }
-    if items
-        .iter()
-        .any(|item| item.trim().eq_ignore_ascii_case("COUNT(*)"))
-    {
+    if items.len() == 2 {
+        if let Some(sum_column) = parse_aggregate_call(items[1].trim(), "SUM")? {
+            return Ok(SelectProjection::GroupedSum {
+                group_column: normalize_identifier(items[0].trim())?,
+                sum_column,
+            });
+        }
+    }
+    if items.iter().any(|item| {
+        item.trim().eq_ignore_ascii_case("COUNT(*)") || aggregate_call_name(item.trim()).is_some()
+    }) {
         return Err(ParseError::InvalidRelationalSql);
     }
     let columns = items
@@ -1715,11 +1737,43 @@ fn parse_projection(input: &str) -> Result<SelectProjection, ParseError> {
     Ok(SelectProjection::Columns(columns))
 }
 
+fn parse_aggregate_call(input: &str, expected: &str) -> Result<Option<String>, ParseError> {
+    let Some(name) = aggregate_call_name(input) else {
+        return Ok(None);
+    };
+    if !name.eq_ignore_ascii_case(expected) {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let open = input.find('(').ok_or(ParseError::InvalidRelationalSql)?;
+    let close = input.rfind(')').ok_or(ParseError::InvalidRelationalSql)?;
+    if close + 1 != input.len() || close <= open + 1 {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    Ok(Some(normalize_identifier(input[open + 1..close].trim())?))
+}
+
+fn aggregate_call_name(input: &str) -> Option<&str> {
+    let open = input.find('(')?;
+    if !input.ends_with(')') {
+        return None;
+    }
+    let name = input[..open].trim();
+    let mut chars = name.chars();
+    let first = chars.next()?;
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return None;
+    }
+    if chars.any(|ch| !(ch == '_' || ch == '$' || ch.is_ascii_alphanumeric())) {
+        return None;
+    }
+    (!name.is_empty()).then_some(name)
+}
+
 fn parse_select_limit(input: &str) -> Result<usize, ParseError> {
     match parse_sql_value(input)? {
         SqlValue::Int4(value) if value >= 0 => Ok(value as usize),
         SqlValue::Int4(_) => Err(ParseError::NegativeLimit),
-        SqlValue::Text(_) => Err(ParseError::InvalidRelationalSql),
+        SqlValue::Int8(_) | SqlValue::Text(_) => Err(ParseError::InvalidRelationalSql),
     }
 }
 
@@ -1727,7 +1781,7 @@ fn parse_select_offset(input: &str) -> Result<usize, ParseError> {
     match parse_sql_value(input)? {
         SqlValue::Int4(value) if value >= 0 => Ok(value as usize),
         SqlValue::Int4(_) => Err(ParseError::NegativeOffset),
-        SqlValue::Text(_) => Err(ParseError::InvalidRelationalSql),
+        SqlValue::Int8(_) | SqlValue::Text(_) => Err(ParseError::InvalidRelationalSql),
     }
 }
 
@@ -9449,6 +9503,69 @@ mod tests {
 
         assert!(matches!(
             parse_command("SELECT COUNT(*), id FROM people"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+    }
+
+    #[test]
+    fn parses_relational_sum_aggregates() {
+        assert_eq!(
+            parse_command(
+                "SELECT name, SUM(id) FROM people WHERE id >= 2 GROUP BY name ORDER BY sum DESC LIMIT 2 OFFSET 1",
+            )
+            .unwrap(),
+            Command::Select(Select {
+                table: "people".to_string(),
+                distinct: false,
+                projection: SelectProjection::GroupedSum {
+                    group_column: "name".to_string(),
+                    sum_column: "id".to_string(),
+                },
+                group_by: Some("name".to_string()),
+                filter: Some(SelectFilter {
+                    column: "id".to_string(),
+                    op: SelectFilterOp::Gte,
+                    value: SqlValue::Int4(2),
+                }),
+                filters: vec![SelectFilter {
+                    column: "id".to_string(),
+                    op: SelectFilterOp::Gte,
+                    value: SqlValue::Int4(2),
+                }],
+                filter_groups: vec![vec![SelectFilter {
+                    column: "id".to_string(),
+                    op: SelectFilterOp::Gte,
+                    value: SqlValue::Int4(2),
+                }]],
+                order_by: Some(SelectOrder {
+                    column: "sum".to_string(),
+                    descending: true,
+                }),
+                limit: Some(2),
+                offset: Some(1),
+            })
+        );
+
+        assert_eq!(
+            parse_command("SELECT SUM(id) FROM people").unwrap(),
+            Command::Select(Select {
+                table: "people".to_string(),
+                distinct: false,
+                projection: SelectProjection::Sum {
+                    column: "id".to_string(),
+                },
+                group_by: None,
+                filter: None,
+                filters: Vec::new(),
+                filter_groups: Vec::new(),
+                order_by: None,
+                limit: None,
+                offset: None,
+            })
+        );
+
+        assert!(matches!(
+            parse_command("SELECT SUM(id), name FROM people"),
             Err(ParseError::InvalidRelationalSql)
         ));
     }

@@ -71,9 +71,12 @@ fn sql_value_matches_type(value: &SqlValue, ty: gpu_db_protocol::SqlType) -> boo
 fn compare_sql_values(left: &SqlValue, right: &SqlValue) -> std::cmp::Ordering {
     match (left, right) {
         (SqlValue::Int4(left), SqlValue::Int4(right)) => left.cmp(right),
+        (SqlValue::Int8(left), SqlValue::Int8(right)) => left.cmp(right),
+        (SqlValue::Int4(left), SqlValue::Int8(right)) => i64::from(*left).cmp(right),
+        (SqlValue::Int8(left), SqlValue::Int4(right)) => left.cmp(&i64::from(*right)),
         (SqlValue::Text(left), SqlValue::Text(right)) => left.cmp(right),
-        (SqlValue::Int4(_), SqlValue::Text(_)) => std::cmp::Ordering::Less,
-        (SqlValue::Text(_), SqlValue::Int4(_)) => std::cmp::Ordering::Greater,
+        (SqlValue::Int4(_) | SqlValue::Int8(_), SqlValue::Text(_)) => std::cmp::Ordering::Less,
+        (SqlValue::Text(_), SqlValue::Int4(_) | SqlValue::Int8(_)) => std::cmp::Ordering::Greater,
     }
 }
 
@@ -155,7 +158,10 @@ fn execute_select_result(
     };
     if matches!(
         select.projection,
-        SelectProjection::CountAll | SelectProjection::GroupedCount { .. }
+        SelectProjection::CountAll
+            | SelectProjection::GroupedCount { .. }
+            | SelectProjection::Sum { .. }
+            | SelectProjection::GroupedSum { .. }
     ) {
         return execute_aggregate_select_result(table, select);
     }
@@ -188,7 +194,10 @@ fn execute_select_result(
             }
             selected
         }
-        SelectProjection::CountAll | SelectProjection::GroupedCount { .. } => unreachable!(),
+        SelectProjection::CountAll
+        | SelectProjection::GroupedCount { .. }
+        | SelectProjection::Sum { .. }
+        | SelectProjection::GroupedSum { .. } => unreachable!(),
     };
     if select.distinct {
         match &select.projection {
@@ -210,7 +219,10 @@ fn execute_select_result(
                     }
                 }
             }
-            SelectProjection::CountAll | SelectProjection::GroupedCount { .. } => unreachable!(),
+            SelectProjection::CountAll
+            | SelectProjection::GroupedCount { .. }
+            | SelectProjection::Sum { .. }
+            | SelectProjection::GroupedSum { .. } => unreachable!(),
         }
     }
     let selected_indexes = selected_columns
@@ -443,13 +455,163 @@ fn execute_aggregate_select_result(
                 .collect();
             Ok(SelectResult { columns, rows })
         }
+        SelectProjection::Sum { column } => {
+            if select.group_by.is_some() {
+                return Err(ErrorField {
+                    code: "0A000",
+                    message: "GROUP BY requires grouped SUM projection",
+                    position: None,
+                });
+            }
+            if let Some(order) = &select.order_by {
+                if !order.column.eq_ignore_ascii_case("sum") {
+                    return Err(ErrorField {
+                        code: "0A000",
+                        message: "SUM ORDER BY only supports sum",
+                        position: None,
+                    });
+                }
+            }
+            let sum_idx = int4_column_index(table, column)?;
+            let sum = rows
+                .iter()
+                .map(|row| int4_value(&row[sum_idx]))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .map(i64::from)
+                .sum::<i64>();
+            let mut aggregate_rows = vec![vec![Some(sum.to_string())]];
+            if let Some(offset) = select.offset {
+                aggregate_rows = aggregate_rows.into_iter().skip(offset).collect();
+            }
+            if let Some(limit) = select.limit {
+                aggregate_rows.truncate(limit);
+            }
+            Ok(SelectResult {
+                columns: vec![int8_column("sum")],
+                rows: aggregate_rows,
+            })
+        }
+        SelectProjection::GroupedSum {
+            group_column,
+            sum_column,
+        } => {
+            let Some(group_by) = &select.group_by else {
+                return Err(ErrorField {
+                    code: "0A000",
+                    message: "grouped SUM requires GROUP BY",
+                    position: None,
+                });
+            };
+            if group_by != group_column {
+                return Err(ErrorField {
+                    code: "0A000",
+                    message: "GROUP BY column must match grouped SUM projection",
+                    position: None,
+                });
+            }
+            let Some(group_idx) = table
+                .columns
+                .iter()
+                .position(|candidate| candidate.def.name == *group_column)
+            else {
+                return Err(ErrorField {
+                    code: "42703",
+                    message: "column does not exist",
+                    position: None,
+                });
+            };
+            let sum_idx = int4_column_index(table, sum_column)?;
+            let mut sums: BTreeMap<SqlValue, i64> = BTreeMap::new();
+            for row in rows {
+                let value = int4_value(&row[sum_idx])?;
+                *sums.entry(row[group_idx].clone()).or_default() += i64::from(value);
+            }
+            let mut grouped = sums.into_iter().collect::<Vec<_>>();
+            if let Some(order) = &select.order_by {
+                if order.column == *group_column {
+                    grouped.sort_by(|(left, _), (right, _)| compare_sql_values(left, right));
+                } else if order.column.eq_ignore_ascii_case("sum") {
+                    grouped.sort_by(|(left_value, left_sum), (right_value, right_sum)| {
+                        left_sum
+                            .cmp(right_sum)
+                            .then_with(|| compare_sql_values(left_value, right_value))
+                    });
+                } else {
+                    return Err(ErrorField {
+                        code: "0A000",
+                        message: "GROUP BY ORDER BY must reference grouped column or sum",
+                        position: None,
+                    });
+                }
+                if order.descending {
+                    grouped.reverse();
+                }
+            }
+            if let Some(offset) = select.offset {
+                grouped = grouped.into_iter().skip(offset).collect();
+            }
+            if let Some(limit) = select.limit {
+                grouped.truncate(limit);
+            }
+            let group_column_def = table
+                .columns
+                .get(group_idx)
+                .expect("group column index came from table");
+            let columns = vec![
+                match group_column_def.def.ty {
+                    gpu_db_protocol::SqlType::Int4 => int4_column(&group_column_def.def.name),
+                    gpu_db_protocol::SqlType::Text => text_column(&group_column_def.def.name),
+                },
+                int8_column("sum"),
+            ];
+            let rows = grouped
+                .into_iter()
+                .map(|(value, sum)| vec![Some(format_sql_value(&value)), Some(sum.to_string())])
+                .collect();
+            Ok(SelectResult { columns, rows })
+        }
         SelectProjection::All | SelectProjection::Columns(_) => unreachable!(),
+    }
+}
+
+fn int4_column_index(table: &Table, column: &str) -> Result<usize, ErrorField> {
+    let Some(idx) = table
+        .columns
+        .iter()
+        .position(|candidate| candidate.def.name == column)
+    else {
+        return Err(ErrorField {
+            code: "42703",
+            message: "column does not exist",
+            position: None,
+        });
+    };
+    if !matches!(table.columns[idx].def.ty, gpu_db_protocol::SqlType::Int4) {
+        return Err(ErrorField {
+            code: "0A000",
+            message: "SUM only supports int4 columns",
+            position: None,
+        });
+    }
+    Ok(idx)
+}
+
+fn int4_value(value: &SqlValue) -> Result<i32, ErrorField> {
+    match value {
+        SqlValue::Int4(value) => Ok(*value),
+        SqlValue::Int8(_) | SqlValue::Text(_) => Err(ErrorField {
+            code: "0A000",
+            message: "SUM only supports int4 columns",
+            position: None,
+        }),
     }
 }
 
 fn format_sql_value(value: &SqlValue) -> String {
     match value {
         SqlValue::Int4(value) => value.to_string(),
+        SqlValue::Int8(value) => value.to_string(),
         SqlValue::Text(value) => value.clone(),
     }
 }
@@ -8393,8 +8555,14 @@ fn describe_query_columns(session: &Session, query: &str) -> Option<Vec<Column>>
         _ => describe_parameterized_select_shape(query)?,
     };
     let table = session.tables.get(&table_name)?;
-    let selected_columns = match projection {
-        SelectProjection::All => table.columns.clone(),
+    match projection {
+        SelectProjection::All => Some(
+            table
+                .columns
+                .iter()
+                .map(column_def_to_result_column)
+                .collect(),
+        ),
         SelectProjection::Columns(columns) => {
             let mut selected = Vec::with_capacity(columns.len());
             for column in columns {
@@ -8402,43 +8570,55 @@ fn describe_query_columns(session: &Session, query: &str) -> Option<Vec<Column>>
                     .columns
                     .iter()
                     .find(|candidate| candidate.def.name == column)?;
-                selected.push(column.clone());
+                selected.push(column_def_to_result_column(column));
             }
-            selected
+            Some(selected)
         }
-        SelectProjection::CountAll => vec![CatalogColumn {
-            attnum: 1,
-            def: gpu_db_protocol::ColumnDef {
-                name: "count".to_string(),
-                ty: SqlType::Int4,
-            },
-        }],
+        SelectProjection::CountAll => Some(vec![int8_column("count")]),
+        SelectProjection::Sum { column } => {
+            let sum_column = table
+                .columns
+                .iter()
+                .find(|candidate| candidate.def.name == column)?;
+            matches!(sum_column.def.ty, SqlType::Int4).then(|| vec![int8_column("sum")])
+        }
         SelectProjection::GroupedCount { column } => {
             let group_column = table
                 .columns
                 .iter()
                 .find(|candidate| candidate.def.name == column)?;
-            vec![
-                group_column.clone(),
-                CatalogColumn {
-                    attnum: 2,
-                    def: gpu_db_protocol::ColumnDef {
-                        name: "count".to_string(),
-                        ty: SqlType::Int4,
-                    },
-                },
-            ]
+            Some(vec![
+                column_def_to_result_column(group_column),
+                int8_column("count"),
+            ])
         }
-    };
-    Some(
-        selected_columns
-            .iter()
-            .map(|column| match column.def.ty {
-                SqlType::Int4 => int4_column(&column.def.name),
-                SqlType::Text => text_column(&column.def.name),
+        SelectProjection::GroupedSum {
+            group_column,
+            sum_column,
+        } => {
+            let group_column = table
+                .columns
+                .iter()
+                .find(|candidate| candidate.def.name == group_column)?;
+            let sum_column = table
+                .columns
+                .iter()
+                .find(|candidate| candidate.def.name == sum_column)?;
+            matches!(sum_column.def.ty, SqlType::Int4).then(|| {
+                vec![
+                    column_def_to_result_column(group_column),
+                    int8_column("sum"),
+                ]
             })
-            .collect(),
-    )
+        }
+    }
+}
+
+fn column_def_to_result_column(column: &CatalogColumn) -> Column {
+    match column.def.ty {
+        SqlType::Int4 => int4_column(&column.def.name),
+        SqlType::Text => text_column(&column.def.name),
+    }
 }
 
 fn describe_parameterized_select_shape(query: &str) -> Option<(String, SelectProjection)> {
@@ -15554,6 +15734,39 @@ mod tests {
         let result = execute_select_result(&session, &select).unwrap();
         assert_eq!(result.columns, vec![int8_column("count")]);
         assert_eq!(result.rows, vec![vec![Some("3".to_string())]]);
+        let Command::Select(select) =
+            parse_command("select name, sum(id) from people group by name order by sum desc")
+                .unwrap()
+        else {
+            panic!("expected supported SELECT sum aggregate parse");
+        };
+        let result = execute_select_result(&session, &select).unwrap();
+        assert_eq!(
+            result.columns,
+            vec![text_column("name"), int8_column("sum")]
+        );
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![Some("Grace".to_string()), Some("7".to_string())],
+                vec![Some("Linus".to_string()), Some("2".to_string())],
+                vec![Some("Ada".to_string()), Some("1".to_string())],
+            ]
+        );
+        let Command::Select(select) =
+            parse_command("select sum(id) from people where name = 'Grace'").unwrap()
+        else {
+            panic!("expected supported SELECT sum aggregate parse");
+        };
+        let result = execute_select_result(&session, &select).unwrap();
+        assert_eq!(result.columns, vec![int8_column("sum")]);
+        assert_eq!(result.rows, vec![vec![Some("7".to_string())]]);
+        let Command::Select(select) = parse_command("select sum(name) from people").unwrap() else {
+            panic!("expected supported SELECT sum aggregate parse");
+        };
+        let err = execute_select_result(&session, &select).unwrap_err();
+        assert_eq!(err.code, "0A000");
+        assert_eq!(err.message, "SUM only supports int4 columns");
 
         assert_eq!(
             describe_parameterized_select_shape(
