@@ -11,6 +11,7 @@ TAR_RESTORE_PORT="${PG_DUMP_SMOKE_TAR_RESTORE_PORT:-55448}"
 PARALLEL_DIRECTORY_RESTORE_PORT="${PG_DUMP_SMOKE_PARALLEL_DIRECTORY_RESTORE_PORT:-55449}"
 CLEAN_RESTORE_PORT="${PG_DUMP_SMOKE_CLEAN_RESTORE_PORT:-55450}"
 INSERT_RESTORE_PORT="${PG_DUMP_SMOKE_INSERT_RESTORE_PORT:-55451}"
+SPLIT_RESTORE_PORT="${PG_DUMP_SMOKE_SPLIT_RESTORE_PORT:-55452}"
 
 rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR"
@@ -23,6 +24,7 @@ tar_restore_pid=""
 parallel_directory_restore_pid=""
 clean_restore_pid=""
 insert_restore_pid=""
+split_restore_pid=""
 
 cleanup() {
   if [[ -n "$source_pid" ]]; then
@@ -56,6 +58,10 @@ cleanup() {
   if [[ -n "$insert_restore_pid" ]]; then
     kill "$insert_restore_pid" 2>/dev/null || true
     wait "$insert_restore_pid" 2>/dev/null || true
+  fi
+  if [[ -n "$split_restore_pid" ]]; then
+    kill "$split_restore_pid" 2>/dev/null || true
+    wait "$split_restore_pid" 2>/dev/null || true
   fi
 }
 trap cleanup EXIT
@@ -109,6 +115,16 @@ PGHOST=127.0.0.1 PGPORT="$SOURCE_PORT" PGDATABASE=postgres PGUSER=postgres \
   pg_dump --schema=public --no-owner --no-privileges --format=plain \
   --inserts --rows-per-insert=2 \
   >"$OUT_DIR/dump-inserts.sql" 2>"$OUT_DIR/pg_dump_inserts.err"
+
+PGHOST=127.0.0.1 PGPORT="$SOURCE_PORT" PGDATABASE=postgres PGUSER=postgres \
+  pg_dump --schema=public --no-owner --no-privileges --format=plain \
+  --schema-only \
+  >"$OUT_DIR/dump-schema.sql" 2>"$OUT_DIR/pg_dump_schema.err"
+
+PGHOST=127.0.0.1 PGPORT="$SOURCE_PORT" PGDATABASE=postgres PGUSER=postgres \
+  pg_dump --schema=public --no-owner --no-privileges --format=plain \
+  --data-only \
+  >"$OUT_DIR/dump-data.sql" 2>"$OUT_DIR/pg_dump_data.err"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/restore-server.log" 2>&1 &
@@ -244,6 +260,27 @@ PGHOST=127.0.0.1 PGPORT="$INSERT_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgr
 
 diff -u "$OUT_DIR/verify.expected" "$OUT_DIR/insert-verify.out"
 
+cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$SPLIT_RESTORE_PORT" --shared-catalog \
+  >"$OUT_DIR/split-restore-server.log" 2>&1 &
+split_restore_pid=$!
+wait_for_port "$SPLIT_RESTORE_PORT"
+
+PGHOST=127.0.0.1 PGPORT="$SPLIT_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres \
+  psql -v ON_ERROR_STOP=1 -X -q -f "$OUT_DIR/dump-schema.sql" \
+  >"$OUT_DIR/split-schema-restore.out" 2>"$OUT_DIR/split-schema-restore.err"
+
+PGHOST=127.0.0.1 PGPORT="$SPLIT_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres \
+  psql -v ON_ERROR_STOP=1 -X -q -f "$OUT_DIR/dump-data.sql" \
+  >"$OUT_DIR/split-data-restore.out" 2>"$OUT_DIR/split-data-restore.err"
+
+PGHOST=127.0.0.1 PGPORT="$SPLIT_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres \
+  psql -v ON_ERROR_STOP=1 -X -A -t \
+  -c "SELECT id, name FROM accounts ORDER BY id;" \
+  -c "SELECT event_id, note FROM events ORDER BY event_id;" \
+  >"$OUT_DIR/split-verify.out" 2>"$OUT_DIR/split-verify.err"
+
+diff -u "$OUT_DIR/verify.expected" "$OUT_DIR/split-verify.out"
+
 pg_restore --list "$OUT_DIR/dump.custom" >"$OUT_DIR/dump.custom.toc"
 pg_restore --list "$OUT_DIR/dump.dir" >"$OUT_DIR/dump.dir.toc"
 pg_restore --list "$OUT_DIR/dump.tar" >"$OUT_DIR/dump.tar.toc"
@@ -257,6 +294,11 @@ grep -F "	(10, 'created')," "$OUT_DIR/dump-inserts.sql" >/dev/null
 grep -F "CREATE SCHEMA public;" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "CREATE TABLE public.accounts (" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "CREATE TABLE public.events (" "$OUT_DIR/dump.sql" >/dev/null
+grep -F "CREATE SCHEMA public;" "$OUT_DIR/dump-schema.sql" >/dev/null
+grep -F "CREATE TABLE public.accounts (" "$OUT_DIR/dump-schema.sql" >/dev/null
+grep -F "CREATE TABLE public.events (" "$OUT_DIR/dump-schema.sql" >/dev/null
+grep -F "COPY public.accounts (id, name) FROM stdin;" "$OUT_DIR/dump-data.sql" >/dev/null
+grep -F "COPY public.events (event_id, note) FROM stdin;" "$OUT_DIR/dump-data.sql" >/dev/null
 grep -F "SCHEMA - public" "$OUT_DIR/dump.custom.toc" >/dev/null
 grep -F "TABLE public accounts" "$OUT_DIR/dump.custom.toc" >/dev/null
 grep -F "TABLE public events" "$OUT_DIR/dump.custom.toc" >/dev/null
@@ -280,8 +322,11 @@ echo "pg_dump_tar_public_schema_pg_restore=passed"
 echo "pg_dump_directory_parallel_public_schema_pg_restore=passed"
 echo "pg_dump_custom_clean_if_exists_pg_restore=passed"
 echo "pg_dump_plain_insert_style_restore=passed"
+echo "pg_dump_plain_split_schema_data_restore=passed"
 echo "dump_file=$OUT_DIR/dump.sql"
 echo "insert_dump_file=$OUT_DIR/dump-inserts.sql"
+echo "schema_dump_file=$OUT_DIR/dump-schema.sql"
+echo "data_dump_file=$OUT_DIR/dump-data.sql"
 echo "custom_dump_file=$OUT_DIR/dump.custom"
 echo "directory_dump_dir=$OUT_DIR/dump.dir"
 echo "tar_dump_file=$OUT_DIR/dump.tar"
