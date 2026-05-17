@@ -78,6 +78,7 @@ pub struct Select {
     pub filter_groups: Vec<Vec<SelectFilter>>,
     pub order_by: Option<SelectOrder>,
     pub limit: Option<usize>,
+    pub offset: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,10 +135,12 @@ pub enum ParseError {
     InvalidDel,
     #[error("invalid GET syntax; expected: GET key")]
     InvalidGet,
-    #[error("invalid relational SQL syntax; supported subset: CREATE TABLE name (...), INSERT INTO name (...) VALUES (...), SELECT columns FROM name [WHERE column (=|<|<=|>|>=) literal | column BETWEEN literal AND literal | column IN (literal, ...) | text_column LIKE 'prefix%' [AND ...] [OR ...]] [ORDER BY column [ASC|DESC]] [LIMIT n]")]
+    #[error("invalid relational SQL syntax; supported subset: CREATE TABLE name (...), INSERT INTO name (...) VALUES (...), SELECT columns FROM name [WHERE column (=|<|<=|>|>=) literal | column BETWEEN literal AND literal | column IN (literal, ...) | text_column LIKE 'prefix%' [AND ...] [OR ...]] [ORDER BY column [ASC|DESC]] [LIMIT n] [OFFSET n]")]
     InvalidRelationalSql,
     #[error("LIMIT must not be negative")]
     NegativeLimit,
+    #[error("OFFSET must not be negative")]
+    NegativeOffset,
     #[error("invalid RESET/DISCARD/DEALLOCATE/CLOSE/LISTEN/NOTIFY/UNLISTEN syntax; expected: RESET ALL|ROLE|AUTHORIZATION|AUTH|SESSION AUTHORIZATION[ [TO] DEFAULT]|SESSION AUTH[ [TO] DEFAULT], DISCARD {{ALL|TEMP|TEMPORARY|TEMP TABLES|TEMPORARY TABLES|PLANS|SEQUENCES}}, DEALLOCATE {{ALL|name|PREPARE|PREPARED name}}, CLOSE {{ALL|name}}, LISTEN channel, NOTIFY channel[, payload], or UNLISTEN [*|ALL|channel]")]
     InvalidReset,
 }
@@ -1608,6 +1611,7 @@ fn parse_select(input: &str) -> Result<Select, ParseError> {
     let mut filter_groups = Vec::new();
     let mut order_by = None;
     let mut limit = None;
+    let mut offset = None;
     while !tail.is_empty() {
         if let Some(after_where) = strip_keyword_prefix_case_insensitive(tail, "WHERE") {
             let after_where = after_where.trim_start();
@@ -1626,6 +1630,11 @@ fn parse_select(input: &str) -> Result<Select, ParseError> {
             let next = next_clause_pos(after_limit).unwrap_or(after_limit.len());
             limit = Some(parse_select_limit(after_limit[..next].trim())?);
             tail = after_limit[next..].trim_start();
+        } else if let Some(after_offset) = strip_keyword_prefix_case_insensitive(tail, "OFFSET") {
+            let after_offset = after_offset.trim_start();
+            let next = next_clause_pos(after_offset).unwrap_or(after_offset.len());
+            offset = Some(parse_select_offset(after_offset[..next].trim())?);
+            tail = after_offset[next..].trim_start();
         } else {
             return Err(ParseError::InvalidRelationalSql);
         }
@@ -1640,6 +1649,7 @@ fn parse_select(input: &str) -> Result<Select, ParseError> {
         filter_groups,
         order_by,
         limit,
+        offset,
     })
 }
 
@@ -1661,6 +1671,14 @@ fn parse_select_limit(input: &str) -> Result<usize, ParseError> {
     match parse_sql_value(input)? {
         SqlValue::Int4(value) if value >= 0 => Ok(value as usize),
         SqlValue::Int4(_) => Err(ParseError::NegativeLimit),
+        SqlValue::Text(_) => Err(ParseError::InvalidRelationalSql),
+    }
+}
+
+fn parse_select_offset(input: &str) -> Result<usize, ParseError> {
+    match parse_sql_value(input)? {
+        SqlValue::Int4(value) if value >= 0 => Ok(value as usize),
+        SqlValue::Int4(_) => Err(ParseError::NegativeOffset),
         SqlValue::Text(_) => Err(ParseError::InvalidRelationalSql),
     }
 }
@@ -2120,7 +2138,7 @@ fn is_keyword_boundary(input: &str, start: usize, len: usize) -> bool {
 }
 
 fn next_clause_pos(input: &str) -> Option<usize> {
-    ["WHERE", "ORDER", "LIMIT"]
+    ["WHERE", "ORDER", "LIMIT", "OFFSET"]
         .into_iter()
         .filter_map(|keyword| find_keyword_outside_quotes(input, keyword))
         .min()
@@ -8499,6 +8517,7 @@ mod tests {
                 }]],
                 order_by: None,
                 limit: Some(1),
+                offset: None,
             })
         );
         assert_eq!(
@@ -8523,6 +8542,7 @@ mod tests {
                 }]],
                 order_by: None,
                 limit: None,
+                offset: None,
             })
         );
         assert_eq!(
@@ -8535,12 +8555,50 @@ mod tests {
                 filter_groups: Vec::new(),
                 order_by: None,
                 limit: None,
+                offset: None,
             })
         );
         assert!(matches!(
             parse_command("SELECT id FROM people ORDER BY id LIMIT -1"),
             Err(ParseError::NegativeLimit)
         ));
+        assert!(matches!(
+            parse_command("SELECT id FROM people ORDER BY id OFFSET -1"),
+            Err(ParseError::NegativeOffset)
+        ));
+
+        assert_eq!(
+            parse_command("SELECT id FROM people ORDER BY id LIMIT 2 OFFSET 1").unwrap(),
+            Command::Select(Select {
+                table: "people".to_string(),
+                projection: SelectProjection::Columns(vec!["id".to_string()]),
+                filter: None,
+                filters: Vec::new(),
+                filter_groups: Vec::new(),
+                order_by: Some(SelectOrder {
+                    column: "id".to_string(),
+                    descending: false,
+                }),
+                limit: Some(2),
+                offset: Some(1),
+            })
+        );
+        assert_eq!(
+            parse_command("SELECT id FROM people ORDER BY id OFFSET 1 LIMIT 2").unwrap(),
+            Command::Select(Select {
+                table: "people".to_string(),
+                projection: SelectProjection::Columns(vec!["id".to_string()]),
+                filter: None,
+                filters: Vec::new(),
+                filter_groups: Vec::new(),
+                order_by: Some(SelectOrder {
+                    column: "id".to_string(),
+                    descending: false,
+                }),
+                limit: Some(2),
+                offset: Some(1),
+            })
+        );
 
         assert_eq!(
             parse_command("SELECT id, name FROM people WHERE id = 1 ORDER BY name DESC LIMIT 5")
@@ -8568,6 +8626,7 @@ mod tests {
                     descending: true,
                 }),
                 limit: Some(5),
+                offset: None,
             })
         );
 
@@ -8596,6 +8655,7 @@ mod tests {
                     descending: false,
                 }),
                 limit: Some(5),
+                offset: None,
             })
         );
 
@@ -8624,6 +8684,7 @@ mod tests {
                     descending: false,
                 }),
                 limit: Some(5),
+                offset: None,
             })
         );
 
@@ -8655,6 +8716,7 @@ mod tests {
                     descending: false,
                 }),
                 limit: Some(5),
+                offset: None,
             })
         );
 
@@ -8680,6 +8742,7 @@ mod tests {
                 }]],
                 order_by: None,
                 limit: None,
+                offset: None,
             })
         );
 
@@ -8718,6 +8781,7 @@ mod tests {
                     descending: false,
                 }),
                 limit: None,
+                offset: None,
             })
         );
 
@@ -8757,6 +8821,7 @@ mod tests {
                 ]],
                 order_by: None,
                 limit: None,
+                offset: None,
             })
         );
 
@@ -8789,6 +8854,7 @@ mod tests {
                 ],
                 order_by: None,
                 limit: None,
+                offset: None,
             })
         );
 
@@ -8821,6 +8887,7 @@ mod tests {
                 ],
                 order_by: None,
                 limit: None,
+                offset: None,
             })
         );
 
@@ -8904,6 +8971,7 @@ mod tests {
                     descending: false,
                 }),
                 limit: None,
+                offset: None,
             })
         );
     }
@@ -8947,6 +9015,7 @@ mod tests {
                     descending: false,
                 }),
                 limit: None,
+                offset: None,
             })
         );
 
@@ -9001,6 +9070,7 @@ mod tests {
                 ],
                 order_by: None,
                 limit: None,
+                offset: None,
             })
         );
 
@@ -9055,6 +9125,7 @@ mod tests {
                     descending: false,
                 }),
                 limit: None,
+                offset: None,
             })
         );
 
@@ -9102,6 +9173,7 @@ mod tests {
                 ],
                 order_by: None,
                 limit: None,
+                offset: None,
             })
         );
 
@@ -9138,6 +9210,7 @@ mod tests {
                     descending: false,
                 }),
                 limit: None,
+                offset: None,
             })
         );
 
@@ -9170,6 +9243,7 @@ mod tests {
                 ],
                 order_by: None,
                 limit: None,
+                offset: None,
             })
         );
 

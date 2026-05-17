@@ -191,6 +191,9 @@ fn execute_select_result(
             rows.reverse();
         }
     }
+    if let Some(offset) = select.offset {
+        rows = rows.into_iter().skip(offset).collect();
+    }
     if let Some(limit) = select.limit {
         rows.truncate(limit);
     }
@@ -1231,6 +1234,10 @@ fn handle_execute(
             write_error(stream, &negative_limit_error_field())?;
             return Ok(true);
         }
+        Err(ParseError::NegativeOffset) => {
+            write_error(stream, &negative_offset_error_field())?;
+            return Ok(true);
+        }
         Ok(_) | Err(_) => {
             write_error(
                 stream,
@@ -1961,6 +1968,7 @@ fn execute_sql_prepared_result(
             let select = match parse_command(&bound_query) {
                 Ok(Command::Select(select)) => select,
                 Err(ParseError::NegativeLimit) => return Err(negative_limit_error_field()),
+                Err(ParseError::NegativeOffset) => return Err(negative_offset_error_field()),
                 Ok(_) | Err(_) => {
                     return Err(ErrorField {
                         code: "0A000",
@@ -2777,6 +2785,10 @@ fn execute_declare_cursor(
                 write_error(stream, &negative_limit_error_field())?;
                 return Ok(true);
             }
+            Err(ParseError::NegativeOffset) => {
+                write_error(stream, &negative_offset_error_field())?;
+                return Ok(true);
+            }
             Ok(_) | Err(_) => {
                 write_error(
                     stream,
@@ -3416,6 +3428,9 @@ fn execute_statement(
                     Err(ParseError::NegativeLimit) => {
                         return write_error(stream, &negative_limit_error_field());
                     }
+                    Err(ParseError::NegativeOffset) => {
+                        return write_error(stream, &negative_offset_error_field());
+                    }
                     Ok(_) | Err(_) => {
                         return write_error(
                             stream,
@@ -3726,8 +3741,15 @@ fn execute_statement(
         );
     }
 
-    if let Ok(command) = parse_command(statement) {
-        match command {
+    match parse_command(statement) {
+        Err(ParseError::NegativeLimit) => {
+            return write_error(stream, &negative_limit_error_field())
+        }
+        Err(ParseError::NegativeOffset) => {
+            return write_error(stream, &negative_offset_error_field());
+        }
+        Err(_) => {}
+        Ok(command) => match command {
             Command::CreateTable(create) => {
                 if session.tables.contains_key(&create.table) {
                     return write_error(
@@ -3895,7 +3917,7 @@ fn execute_statement(
             | Command::SetKv { .. }
             | Command::DeleteKv { .. }
             | Command::GetKv { .. } => {}
-        }
+        },
     }
 
     if is_pg_dump_session_set_statement(&canonical) {
@@ -7668,6 +7690,11 @@ fn infer_select_parameter_type_oids(session: &Session, query: &str) -> Option<Ve
             oids[idx - 1] = SqlType::Int4.postgres_oid();
         }
     }
+    if let Some(idx) = select_offset_placeholder_index(&canonical) {
+        if idx > 0 && idx <= oids.len() {
+            oids[idx - 1] = SqlType::Int4.postgres_oid();
+        }
+    }
 
     Some(oids)
 }
@@ -7677,7 +7704,7 @@ fn select_where_clause(canonical: &str) -> String {
         return String::new();
     };
     let after_where = &canonical[where_pos + " where ".len()..];
-    let end = [" order by ", " limit "]
+    let end = [" order by ", " limit ", " offset "]
         .into_iter()
         .filter_map(|marker| after_where.find(marker))
         .min()
@@ -7686,9 +7713,17 @@ fn select_where_clause(canonical: &str) -> String {
 }
 
 fn select_limit_placeholder_index(canonical: &str) -> Option<usize> {
-    let limit_pos = canonical.rfind(" limit ")?;
-    let after_limit = canonical[limit_pos + " limit ".len()..].trim();
-    let rest = after_limit.strip_prefix('$')?;
+    select_clause_placeholder_index(canonical, " limit ")
+}
+
+fn select_offset_placeholder_index(canonical: &str) -> Option<usize> {
+    select_clause_placeholder_index(canonical, " offset ")
+}
+
+fn select_clause_placeholder_index(canonical: &str, clause: &str) -> Option<usize> {
+    let clause_pos = canonical.rfind(clause)?;
+    let after_clause = canonical[clause_pos + clause.len()..].trim();
+    let rest = after_clause.strip_prefix('$')?;
     rest.chars()
         .take_while(|ch| ch.is_ascii_digit())
         .collect::<String>()
@@ -8123,6 +8158,14 @@ fn negative_limit_error_field() -> ErrorField {
     }
 }
 
+fn negative_offset_error_field() -> ErrorField {
+    ErrorField {
+        code: "2201X",
+        message: "OFFSET must not be negative",
+        position: None,
+    }
+}
+
 fn describe_query_columns(session: &Session, query: &str) -> Option<Vec<Column>> {
     let (table_name, projection) = match parse_command(query).ok() {
         Some(Command::Select(select)) => (select.table, select.projection),
@@ -8166,15 +8209,30 @@ fn describe_parameterized_select_shape(query: &str) -> Option<(String, SelectPro
             };
             select
         }
+        Err(ParseError::NegativeOffset) => {
+            let describe_query = replace_negative_offset_with_zero(&dummy_query)?;
+            let Ok(Command::Select(select)) = parse_command(&describe_query) else {
+                return None;
+            };
+            select
+        }
         Ok(_) | Err(_) => return None,
     };
     Some((select.table, select.projection))
 }
 
 fn replace_negative_limit_with_zero(query: &str) -> Option<String> {
-    let limit_pos = query.rfind(" limit ")?;
-    let after_limit = &query[limit_pos + " limit ".len()..];
-    let trimmed = after_limit.trim_start();
+    replace_negative_clause_value_with_zero(query, " limit ")
+}
+
+fn replace_negative_offset_with_zero(query: &str) -> Option<String> {
+    replace_negative_clause_value_with_zero(query, " offset ")
+}
+
+fn replace_negative_clause_value_with_zero(query: &str, clause: &str) -> Option<String> {
+    let clause_pos = query.rfind(clause)?;
+    let after_clause = &query[clause_pos + clause.len()..];
+    let trimmed = after_clause.trim_start();
     let minus_len = trimmed.strip_prefix('-')?.len();
     let digit_count = trimmed[1..]
         .chars()
@@ -8183,8 +8241,8 @@ fn replace_negative_limit_with_zero(query: &str) -> Option<String> {
     if digit_count == 0 {
         return None;
     }
-    let leading_ws_len = after_limit.len() - trimmed.len();
-    let start = limit_pos + " limit ".len() + leading_ws_len;
+    let leading_ws_len = after_clause.len() - trimmed.len();
+    let start = clause_pos + clause.len() + leading_ws_len;
     let end = start + (trimmed.len() - minus_len) + digit_count;
     let mut rewritten = String::with_capacity(query.len());
     rewritten.push_str(&query[..start]);
@@ -15184,10 +15242,29 @@ mod tests {
                 vec![Some("3".to_string()), Some("Grace".to_string())],
             ]
         );
+        let Command::Select(select) =
+            parse_command("select id, name from people order by id limit 1 offset 1").unwrap()
+        else {
+            panic!("expected supported SELECT");
+        };
+        let result = execute_select_result(&session, &select).unwrap();
+        assert_eq!(
+            result.rows,
+            vec![vec![Some("2".to_string()), Some("Linus".to_string())]]
+        );
 
         assert_eq!(
             describe_parameterized_select_shape(
                 "select id from people where id > $1 order by id limit $2"
+            ),
+            Some((
+                "people".to_string(),
+                SelectProjection::Columns(vec!["id".to_string()])
+            ))
+        );
+        assert_eq!(
+            describe_parameterized_select_shape(
+                "select id from people where id > $1 order by id limit $2 offset $3"
             ),
             Some((
                 "people".to_string(),

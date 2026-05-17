@@ -18,3 +18,8 @@ SELECT id, name FROM people WHERE id IN (1, 3) ORDER BY id DESC;
 SELECT id, name FROM people WHERE id BETWEEN 2 AND 3 ORDER BY id DESC;
 \echo === relational prefix like filter ===
 SELECT id, name FROM people WHERE name LIKE 'Gra%' ORDER BY id DESC;
+\echo === relational ordered limit offset ===
+SELECT id, name FROM people ORDER BY id LIMIT 1 OFFSET 1;
+\echo === relational negative offset recovery ===
+SELECT id FROM people ORDER BY id OFFSET -1;
+SELECT id FROM people ORDER BY id LIMIT 1 OFFSET 2;

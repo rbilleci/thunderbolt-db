@@ -152,6 +152,7 @@ mod tests {
             filter_groups: Vec::new(),
             order_by: None,
             limit: None,
+            offset: None,
         }));
 
         let node = &plan.nodes()[0];
@@ -181,6 +182,7 @@ mod tests {
                 filter_groups: Vec::new(),
                 order_by: None,
                 limit: None,
+                offset: None,
             }),
             Command::Begin,
             Command::Commit { chain: false },

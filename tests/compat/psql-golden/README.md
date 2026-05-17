@@ -2,7 +2,7 @@
 
 This suite exercises a real `psql`/libpq path and compares normalized output against golden artifacts.
 
-Scenario 03 covers the supported relational create/insert/select path, including single-column filters, literal `BETWEEN` inclusive ranges, prefix-only text `LIKE 'prefix%'` predicates, narrow conjunctions, disjunctions, parenthesized nested `AND`/`OR` predicates, and literal `IN (...)` membership over `int4`/`text` comparisons.
+Scenario 03 covers the supported relational create/insert/select path, including single-column filters, literal `BETWEEN` inclusive ranges, prefix-only text `LIKE 'prefix%'` predicates, narrow conjunctions, disjunctions, parenthesized nested `AND`/`OR` predicates, literal `IN (...)` membership over `int4`/`text` comparisons, and ordered `LIMIT`/`OFFSET` pagination.
 
 ## Run
 

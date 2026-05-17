@@ -6260,16 +6260,27 @@ fn bind_relational_select(
 }
 
 fn relational_select_pushes_limit(select: &Select) -> bool {
-    select.limit.is_some() && select.order_by.is_none()
+    select.limit.is_some() && select.offset.is_none() && select.order_by.is_none()
+}
+
+fn relational_select_pushed_limit(select: &Select, ordered_access_path: bool) -> Option<usize> {
+    let can_push = select.order_by.is_none() || ordered_access_path;
+    if !can_push {
+        return None;
+    }
+    select
+        .limit
+        .map(|limit| limit.saturating_add(select.offset.unwrap_or(0)))
 }
 
 fn relational_select_limit_satisfied_by_access_path(
     select: &Select,
     access_path: &RelationalAccessPath,
 ) -> bool {
-    relational_select_pushes_limit(select)
-        || (select.limit.is_some()
-            && matches!(access_path, RelationalAccessPath::OrderedKeyBatch { .. }))
+    select.offset.is_none()
+        && (relational_select_pushes_limit(select)
+            || (select.limit.is_some()
+                && matches!(access_path, RelationalAccessPath::OrderedKeyBatch { .. })))
 }
 
 fn relational_select_needs_host_sql_finalization(
@@ -6291,6 +6302,7 @@ fn relational_select_needs_host_sql_finalization(
         || (select.order_by.is_some()
             && !matches!(access_path, RelationalAccessPath::OrderedKeyBatch { .. }))
         || (select.limit.is_some()
+            && select.offset.is_none()
             && !relational_select_limit_satisfied_by_access_path(select, access_path))
 }
 
@@ -7094,9 +7106,7 @@ impl Engine {
                     filter: None,
                     order: bound.order.is_none().then_some(MvccReadOrder::KeyAsc),
                     projection: MvccProjection::KeyValue,
-                    limit: (relational_select_pushes_limit(select) || bound.order.is_some())
-                        .then_some(select.limit)
-                        .flatten(),
+                    limit: relational_select_pushed_limit(select, bound.order.is_some()),
                 };
                 let table_column = table
                     .columns
@@ -7139,9 +7149,7 @@ impl Engine {
                 filter: None,
                 order: bound.order.is_none().then_some(MvccReadOrder::KeyAsc),
                 projection: MvccProjection::KeyValue,
-                limit: (relational_select_pushes_limit(select) || bound.order.is_some())
-                    .then_some(select.limit)
-                    .flatten(),
+                limit: relational_select_pushed_limit(select, bound.order.is_some()),
             };
             let access_path = if let Some(order_column) = order_column {
                 RelationalAccessPath::OrderedKeyBatch {
@@ -7181,9 +7189,7 @@ impl Engine {
                 filter: None,
                 order: bound.order.is_none().then_some(MvccReadOrder::KeyAsc),
                 projection: MvccProjection::KeyValue,
-                limit: (relational_select_pushes_limit(select) || bound.order.is_some())
-                    .then_some(select.limit)
-                    .flatten(),
+                limit: relational_select_pushed_limit(select, bound.order.is_some()),
             };
             let access_path = if let Some(order_column) = order_column {
                 RelationalAccessPath::OrderedKeyBatch {
@@ -7238,9 +7244,7 @@ impl Engine {
                 filter: None,
                 order: bound.order.is_none().then_some(MvccReadOrder::KeyAsc),
                 projection: MvccProjection::KeyValue,
-                limit: (relational_select_pushes_limit(select) || bound.order.is_some())
-                    .then_some(select.limit)
-                    .flatten(),
+                limit: relational_select_pushed_limit(select, bound.order.is_some()),
             };
             let access_path = if let Some(order_column) = order_column {
                 RelationalAccessPath::OrderedKeyBatch {
@@ -7282,7 +7286,7 @@ impl Engine {
                     filter: None,
                     order: None,
                     projection: MvccProjection::KeyValue,
-                    limit: select.limit,
+                    limit: relational_select_pushed_limit(select, true),
                 },
                 RelationalAccessPath::OrderedKeyBatch {
                     table: select.table.clone(),
@@ -7304,9 +7308,7 @@ impl Engine {
                 ))),
                 order: Some(MvccReadOrder::KeyAsc),
                 projection: MvccProjection::KeyValue,
-                limit: relational_select_pushes_limit(select)
-                    .then_some(select.limit)
-                    .flatten(),
+                limit: relational_select_pushed_limit(select, false),
             },
             RelationalAccessPath::FullTableScan,
         ))
@@ -7511,6 +7513,9 @@ impl Engine {
             }
         }
         if !relational_select_limit_satisfied_by_access_path(select, &access_path) {
+            if let Some(offset) = select.offset {
+                rows = rows.into_iter().skip(offset).collect();
+            }
             if let Some(limit) = select.limit {
                 rows.truncate(limit);
             }
@@ -23313,6 +23318,85 @@ mod tests {
                 order_column: "name".to_string(),
                 descending: true,
                 matched_keys: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn relational_sql_gpu_bridge_ordered_limit_offset_uses_ordered_key_batch() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO people (id, name) VALUES (1, 'Ada'), (2, 'Linus'), (3, 'Grace'), (4, 'Katherine')",
+        )
+        .unwrap();
+
+        let Command::Select(select) =
+            parse_command("SELECT id FROM people ORDER BY id LIMIT 2 OFFSET 1").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let result = e
+            .execute_relational_select_with_backend(&select, &FirstCudaSliceParityBackend)
+            .unwrap();
+
+        assert_eq!(
+            result.rows,
+            vec![vec![SqlValue::Int4(2)], vec![SqlValue::Int4(3)]]
+        );
+        assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.fallback_reason, None);
+        assert_eq!(
+            result.access_path,
+            RelationalAccessPath::OrderedKeyBatch {
+                table: "people".to_string(),
+                predicate_column: None,
+                predicate_op: None,
+                order_column: "id".to_string(),
+                descending: false,
+                matched_keys: 4,
+            }
+        );
+        assert_eq!(e.status_snapshot().latest_fallback_reason(), None);
+    }
+
+    #[test]
+    fn relational_sql_gpu_bridge_filtered_offset_without_limit_skips_after_order() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO people (id, name) VALUES (1, 'Ada'), (2, 'Linus'), (3, 'Grace'), (4, 'Grady')",
+        )
+        .unwrap();
+
+        let Command::Select(select) =
+            parse_command("SELECT id FROM people WHERE name LIKE 'Gra%' ORDER BY id OFFSET 1")
+                .unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let result = e
+            .execute_relational_select_with_backend(&select, &FirstCudaSliceParityBackend)
+            .unwrap();
+
+        assert_eq!(result.rows, vec![vec![SqlValue::Int4(4)]]);
+        assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.fallback_reason, None);
+        assert_eq!(
+            result.access_path,
+            RelationalAccessPath::OrderedKeyBatch {
+                table: "people".to_string(),
+                predicate_column: Some("name".to_string()),
+                predicate_op: Some(SelectFilterOp::LikePrefix),
+                order_column: "id".to_string(),
+                descending: false,
+                matched_keys: 2,
             }
         );
     }

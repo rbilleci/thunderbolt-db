@@ -60,3 +60,16 @@ INSERT 0 3
 ----+-------
   3 | Grace
 (1 row)
+
+=== relational ordered limit offset ===
+ id | name
+----+-------
+  2 | Linus
+(1 row)
+
+=== relational negative offset recovery ===
+psql:03_relational_create_insert_select.sql:24: ERROR:  OFFSET must not be negative
+ id
+----
+  3
+(1 row)
