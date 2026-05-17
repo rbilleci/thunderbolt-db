@@ -4736,6 +4736,82 @@ fn execute_statement(
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, &format!("DELETE {deleted_count}"));
             }
+            Command::Update(update) => {
+                let table_name = update.table.clone();
+                let Some(table) = session.tables.get_mut(&table_name) else {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "42P01",
+                            message: "relation does not exist",
+                            position: None,
+                        },
+                    );
+                };
+                let mut seen = BTreeSet::new();
+                let mut assignments = Vec::with_capacity(update.assignments.len());
+                for assignment in &update.assignments {
+                    let Some(idx) = table
+                        .columns
+                        .iter()
+                        .position(|column| column.def.name == assignment.column)
+                    else {
+                        return write_error(
+                            stream,
+                            &ErrorField {
+                                code: "42703",
+                                message: "column does not exist",
+                                position: None,
+                            },
+                        );
+                    };
+                    if !seen.insert(idx) {
+                        return write_error(
+                            stream,
+                            &ErrorField {
+                                code: "42601",
+                                message: "column assigned more than once",
+                                position: None,
+                            },
+                        );
+                    }
+                    if !sql_value_matches_type(&assignment.value, table.columns[idx].def.ty) {
+                        return write_error(
+                            stream,
+                            &ErrorField {
+                                code: "42804",
+                                message: "column type mismatch",
+                                position: None,
+                            },
+                        );
+                    }
+                    assignments.push((idx, assignment.value.clone()));
+                }
+                let delete_shape = gpu_db_protocol::Delete {
+                    table: update.table.clone(),
+                    filter: update.filter.clone(),
+                    filters: update.filters.clone(),
+                    filter_groups: update.filter_groups.clone(),
+                };
+                let mut update_mask = Vec::with_capacity(table.rows.len());
+                for row in &table.rows {
+                    match row_matches_delete_filters(table, row, &delete_shape) {
+                        Ok(matches) => update_mask.push(matches),
+                        Err(error) => return write_error(stream, &error),
+                    }
+                }
+                let updated_count = update_mask.iter().filter(|matches| **matches).count();
+                for (row, matches) in table.rows.iter_mut().zip(update_mask) {
+                    if matches {
+                        for (idx, value) in &assignments {
+                            row[*idx] = value.clone();
+                        }
+                    }
+                }
+                session.mark_table_dirty(table_name);
+                session.persist_catalog_snapshot();
+                return write_command_complete(stream, &format!("UPDATE {updated_count}"));
+            }
             Command::Select(select) => {
                 let result = match execute_select_result(session, &select) {
                     Ok(result) => result,
@@ -10098,6 +10174,71 @@ mod tests {
 
         execute_statement(&mut writer, &mut session, "SELECT id FROM people", true).unwrap();
         assert_eq!(read_backend_tags(&mut reader, 3), vec![b'T', b'D', b'C']);
+    }
+
+    #[test]
+    fn simple_relational_update_changes_matching_rows_and_recovers() {
+        let mut session = Session::default();
+        session.tables.insert(
+            "people".to_string(),
+            Table {
+                oid: FIRST_USER_RELATION_OID,
+                name: "people".to_string(),
+                columns: vec![
+                    CatalogColumn {
+                        attnum: 1,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "id".to_string(),
+                            ty: SqlType::Int4,
+                        },
+                    },
+                    CatalogColumn {
+                        attnum: 2,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "name".to_string(),
+                            ty: SqlType::Text,
+                        },
+                    },
+                ],
+                rows: vec![
+                    vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())],
+                    vec![SqlValue::Int4(2), SqlValue::Text("Linus".to_string())],
+                    vec![SqlValue::Int4(3), SqlValue::Text("Grace".to_string())],
+                    vec![
+                        SqlValue::Int4(4),
+                        SqlValue::Text("Ada Lovelace".to_string()),
+                    ],
+                ],
+            },
+        );
+        let (mut writer, mut reader) = tcp_pair();
+
+        execute_statement(
+            &mut writer,
+            &mut session,
+            "UPDATE people SET name = 'Updated' WHERE id = 2 OR name LIKE 'Ada%'",
+            true,
+        )
+        .unwrap();
+
+        let messages = read_backend_messages(&mut reader, 1);
+        assert_eq!(messages[0].0, b'C');
+        assert_eq!(messages[0].1, b"UPDATE 3\0");
+        assert_eq!(
+            session.tables["people"].rows,
+            vec![
+                vec![SqlValue::Int4(1), SqlValue::Text("Updated".to_string())],
+                vec![SqlValue::Int4(2), SqlValue::Text("Updated".to_string())],
+                vec![SqlValue::Int4(3), SqlValue::Text("Grace".to_string())],
+                vec![SqlValue::Int4(4), SqlValue::Text("Updated".to_string())],
+            ]
+        );
+
+        execute_statement(&mut writer, &mut session, "SELECT id FROM people", true).unwrap();
+        assert_eq!(
+            read_backend_tags(&mut reader, 6),
+            vec![b'T', b'D', b'D', b'D', b'D', b'C']
+        );
     }
 
     #[test]

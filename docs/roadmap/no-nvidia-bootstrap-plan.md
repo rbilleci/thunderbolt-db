@@ -338,6 +338,7 @@ Goal:
 Initial target:
 - `CREATE TABLE` for a minimal typed table shape.
 - `INSERT` into that table.
+- `UPDATE <table> SET <column> = <literal> [, ...] WHERE ...` for the same deliberately narrow predicate subset.
 - `SELECT <columns> FROM <table> [WHERE ...] [ORDER BY ...] [LIMIT ...]` for a deliberately narrow predicate/order subset.
 - Deterministic error reporting for unsupported relational syntax.
 
@@ -346,7 +347,7 @@ Exit criteria:
 2. Supported relational reads execute through engine-facing storage/execution APIs, not only the compatibility stub. First slice landed on 2026-05-11 by lowering engine relational reads through `MvccReadQuery` with CPU reference execution and explicit GPU parity fallback.
 3. At least one psql golden scenario creates a table, inserts rows, selects rows, and asserts stable output. Scenario `03_relational_create_insert_select.sql` was added on 2026-05-11; local execution still requires `psql` in the run shell.
 4. Compatibility scorecard has explicit relational SQL buckets with passing/failing counts. First classifier bucket `sql.relational_foundation` landed on 2026-05-11.
-5. Docs state the exact supported relational SQL subset and the next unsupported syntax boundary. README and compatibility matrix first-slice wording landed on 2026-05-11; P4 range bridge work later widened the narrow `WHERE` subset from equality-only to single-column literal comparisons (`=`, `<`, `<=`, `>`, `>=`), literal `BETWEEN` inclusive ranges, narrow `AND` conjunctions, top-level `OR` groups over those literal predicates, parenthesized nested `AND`/`OR` predicates, literal `IN (...)` membership, prefix-only text `LIKE 'prefix%'`, ordered `LIMIT`/`OFFSET` pagination, and `SELECT DISTINCT` over selected columns. A later DML slice added filtered `DELETE FROM table WHERE ...` over the same literal predicate subset through WAL/MVCC tombstones and real psql golden coverage while keeping joins, broader expressions, `NOT BETWEEN`, `NOT IN`, subquery `IN`, NULLs, updates, constraints, and broad coercion unsupported.
+5. Docs state the exact supported relational SQL subset and the next unsupported syntax boundary. README and compatibility matrix first-slice wording landed on 2026-05-11; P4 range bridge work later widened the narrow `WHERE` subset from equality-only to single-column literal comparisons (`=`, `<`, `<=`, `>`, `>=`), literal `BETWEEN` inclusive ranges, narrow `AND` conjunctions, top-level `OR` groups over those literal predicates, parenthesized nested `AND`/`OR` predicates, literal `IN (...)` membership, prefix-only text `LIKE 'prefix%'`, ordered `LIMIT`/`OFFSET` pagination, and `SELECT DISTINCT` over selected columns. Later DML slices added filtered `DELETE FROM table WHERE ...` and filtered `UPDATE table SET column = literal [, ...] WHERE ...` over the same literal predicate subset through WAL/MVCC mutation semantics and real psql golden coverage while keeping joins, broader expressions, arithmetic/expression assignments, `NOT BETWEEN`, `NOT IN`, subquery `IN`, NULLs/defaults, constraints, and broad coercion unsupported.
 
 ### P2. Catalog, schema, and type spine
 

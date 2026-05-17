@@ -12,6 +12,7 @@ pub enum Command {
     CreateTable(CreateTable),
     Insert(Insert),
     Delete(Delete),
+    Update(Update),
     Select(Select),
 }
 
@@ -71,6 +72,21 @@ pub struct Delete {
     pub filter: Option<SelectFilter>,
     pub filters: Vec<SelectFilter>,
     pub filter_groups: Vec<Vec<SelectFilter>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Update {
+    pub table: String,
+    pub assignments: Vec<UpdateAssignment>,
+    pub filter: Option<SelectFilter>,
+    pub filters: Vec<SelectFilter>,
+    pub filter_groups: Vec<Vec<SelectFilter>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateAssignment {
+    pub column: String,
+    pub value: SqlValue,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -181,7 +197,7 @@ pub enum ParseError {
     InvalidDel,
     #[error("invalid GET syntax; expected: GET key")]
     InvalidGet,
-    #[error("invalid relational SQL syntax; supported subset: CREATE TABLE name (...), INSERT INTO name (...) VALUES (...), DELETE FROM name WHERE column (=|<|<=|>|>=) literal | column BETWEEN literal AND literal | column IN (literal, ...) | text_column LIKE 'prefix%' [AND ...] [OR ...], SELECT [DISTINCT] columns|COUNT(*)|SUM(int4_column)|AVG(int4_column)|MIN(column)|MAX(column)|column, COUNT(*)|column, SUM(int4_column)|column, AVG(int4_column)|column, MIN(column)|column, MAX(column) FROM name [WHERE column (=|<|<=|>|>=) literal | column BETWEEN literal AND literal | column IN (literal, ...) | text_column LIKE 'prefix%' [AND ...] [OR ...]] [GROUP BY column] [ORDER BY selected_column|count|sum|avg|min|max [ASC|DESC]] [LIMIT n] [OFFSET n]")]
+    #[error("invalid relational SQL syntax; supported subset: CREATE TABLE name (...), INSERT INTO name (...) VALUES (...), UPDATE name SET column = literal [, ...] WHERE column (=|<|<=|>|>=) literal | column BETWEEN literal AND literal | column IN (literal, ...) | text_column LIKE 'prefix%' [AND ...] [OR ...], DELETE FROM name WHERE column (=|<|<=|>|>=) literal | column BETWEEN literal AND literal | column IN (literal, ...) | text_column LIKE 'prefix%' [AND ...] [OR ...], SELECT [DISTINCT] columns|COUNT(*)|SUM(int4_column)|AVG(int4_column)|MIN(column)|MAX(column)|column, COUNT(*)|column, SUM(int4_column)|column, AVG(int4_column)|column, MIN(column)|column, MAX(column) FROM name [WHERE column (=|<|<=|>|>=) literal | column BETWEEN literal AND literal | column IN (literal, ...) | text_column LIKE 'prefix%' [AND ...] [OR ...]] [GROUP BY column] [ORDER BY selected_column|count|sum|avg|min|max [ASC|DESC]] [LIMIT n] [OFFSET n]")]
     InvalidRelationalSql,
     #[error("LIMIT must not be negative")]
     NegativeLimit,
@@ -1518,6 +1534,12 @@ fn parse_relational_command(input: &str) -> Option<Result<Command, ParseError>> 
     if first.eq_ignore_ascii_case("INSERT") {
         return Some(parse_insert(input).map(Command::Insert));
     }
+    if first.eq_ignore_ascii_case("UPDATE")
+        && find_keyword_outside_quotes(input, "SET").is_some()
+        && find_keyword_outside_quotes(input, "WHERE").is_some()
+    {
+        return Some(parse_update(input).map(Command::Update));
+    }
     if first.eq_ignore_ascii_case("DELETE")
         && strip_keyword_prefix_case_insensitive(input, "DELETE")
             .map(str::trim_start)
@@ -1667,6 +1689,48 @@ fn parse_delete(input: &str) -> Result<Delete, ParseError> {
         filters,
         filter_groups,
     })
+}
+
+fn parse_update(input: &str) -> Result<Update, ParseError> {
+    let rest = strip_keyword_prefix_case_insensitive(input, "UPDATE")
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    let set_pos =
+        find_keyword_outside_quotes(rest, "SET").ok_or(ParseError::InvalidRelationalSql)?;
+    let table = normalize_relation_identifier(rest[..set_pos].trim())?;
+    let after_set = rest[set_pos + "SET".len()..].trim_start();
+    let where_pos =
+        find_keyword_outside_quotes(after_set, "WHERE").ok_or(ParseError::InvalidRelationalSql)?;
+    let assignment_input = after_set[..where_pos].trim();
+    let filter_input = after_set[where_pos + "WHERE".len()..].trim();
+    if assignment_input.is_empty() || filter_input.is_empty() {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let assignments = split_csv(assignment_input)?
+        .into_iter()
+        .map(parse_update_assignment)
+        .collect::<Result<Vec<_>, _>>()?;
+    if assignments.is_empty() {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let filter_groups = parse_select_filter_groups(filter_input)?;
+    let filters = filter_groups.first().cloned().unwrap_or_default();
+    Ok(Update {
+        table,
+        assignments,
+        filter: filters.first().cloned(),
+        filters,
+        filter_groups,
+    })
+}
+
+fn parse_update_assignment(input: &str) -> Result<UpdateAssignment, ParseError> {
+    let (column, value) = input
+        .split_once('=')
+        .ok_or(ParseError::InvalidRelationalSql)?;
+    let column = normalize_identifier(column.trim())?;
+    let value = parse_sql_value(value.trim())?;
+    Ok(UpdateAssignment { column, value })
 }
 
 fn parse_select(input: &str) -> Result<Select, ParseError> {
@@ -8724,6 +8788,52 @@ mod tests {
                 ],
             })
         );
+        assert_eq!(
+            parse_command("UPDATE public.people SET name = 'Updated', id = 10 WHERE id = 1 OR name LIKE 'Ada%'").unwrap(),
+            Command::Update(Update {
+                table: "people".to_string(),
+                assignments: vec![
+                    UpdateAssignment {
+                        column: "name".to_string(),
+                        value: SqlValue::Text("Updated".to_string()),
+                    },
+                    UpdateAssignment {
+                        column: "id".to_string(),
+                        value: SqlValue::Int4(10),
+                    },
+                ],
+                filter: Some(SelectFilter {
+                    column: "id".to_string(),
+                    op: SelectFilterOp::Eq,
+                    value: SqlValue::Int4(1),
+                }),
+                filters: vec![SelectFilter {
+                    column: "id".to_string(),
+                    op: SelectFilterOp::Eq,
+                    value: SqlValue::Int4(1),
+                }],
+                filter_groups: vec![
+                    vec![SelectFilter {
+                        column: "id".to_string(),
+                        op: SelectFilterOp::Eq,
+                        value: SqlValue::Int4(1),
+                    }],
+                    vec![SelectFilter {
+                        column: "name".to_string(),
+                        op: SelectFilterOp::LikePrefix,
+                        value: SqlValue::Text("Ada".to_string()),
+                    }],
+                ],
+            })
+        );
+        assert!(matches!(
+            parse_command("UPDATE public.people SET name = 'Updated'"),
+            Err(ParseError::Unsupported(_))
+        ));
+        assert!(matches!(
+            parse_command("UPDATE public.people SET name = 'Updated' WHERE"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
         assert_eq!(
             parse_command("DELETE FROM balance").unwrap(),
             Command::DeleteKv {

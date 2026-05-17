@@ -58,7 +58,10 @@ impl Planner {
                 },
                 kind: PlanKind::Mutation,
             },
-            Command::CreateTable(_) | Command::Insert(_) | Command::Delete(_) => PlanNode {
+            Command::CreateTable(_)
+            | Command::Insert(_)
+            | Command::Delete(_)
+            | Command::Update(_) => PlanNode {
                 op: PlannedOp {
                     name: "relational_write".to_string(),
                     target: DeviceTarget::Gpu(self.cfg.default_gpu_id),
@@ -190,6 +193,24 @@ mod tests {
             }),
             Command::Delete(gpu_db_protocol::Delete {
                 table: "t".to_string(),
+                filter: None,
+                filters: vec![gpu_db_protocol::SelectFilter {
+                    column: "id".to_string(),
+                    op: gpu_db_protocol::SelectFilterOp::Eq,
+                    value: gpu_db_protocol::SqlValue::Int4(1),
+                }],
+                filter_groups: vec![vec![gpu_db_protocol::SelectFilter {
+                    column: "id".to_string(),
+                    op: gpu_db_protocol::SelectFilterOp::Eq,
+                    value: gpu_db_protocol::SqlValue::Int4(1),
+                }]],
+            }),
+            Command::Update(gpu_db_protocol::Update {
+                table: "t".to_string(),
+                assignments: vec![gpu_db_protocol::UpdateAssignment {
+                    column: "name".to_string(),
+                    value: gpu_db_protocol::SqlValue::Text("updated".to_string()),
+                }],
                 filter: None,
                 filters: vec![gpu_db_protocol::SelectFilter {
                     column: "id".to_string(),

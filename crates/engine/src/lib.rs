@@ -18,7 +18,7 @@ use gpu_db_observability::{
 use gpu_db_planner::{ExecutionPlan, Planner, PlannerConfig};
 use gpu_db_protocol::{
     parse_command, ColumnDef, Command, CreateTable, Delete, Insert, ParseError, Select,
-    SelectFilterOp, SelectProjection, SqlType, SqlValue,
+    SelectFilterOp, SelectProjection, SqlType, SqlValue, Update,
 };
 use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine};
 use gpu_db_storage::{
@@ -64,6 +64,7 @@ impl ReplicatedStateMachine for KvStateMachine {
                     | Command::CreateTable(_)
                     | Command::Insert(_)
                     | Command::Delete(_)
+                    | Command::Update(_)
                     | Command::Select(_) => {}
                 }
             }
@@ -6578,6 +6579,7 @@ fn bind_relational_select(
 
 type BoundDeleteFilter = (usize, SelectFilterOp, SqlValue);
 type BoundDeleteFilterGroup = Vec<BoundDeleteFilter>;
+type BoundUpdateAssignment = (usize, SqlValue);
 
 fn bind_delete_filter_groups(
     table: &RelationalTable,
@@ -6609,6 +6611,33 @@ fn bind_delete_filter_groups(
                     Ok((idx, filter.op, filter.value))
                 })
                 .collect()
+        })
+        .collect()
+}
+
+fn bind_update_assignments(
+    table: &RelationalTable,
+    update: &Update,
+) -> Result<Vec<BoundUpdateAssignment>, ExecuteError> {
+    let mut seen = BTreeSet::new();
+    update
+        .assignments
+        .iter()
+        .map(|assignment| {
+            let idx = relational_column_index(table, &assignment.column)?;
+            if !seen.insert(idx) {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "column \"{}\" assigned more than once",
+                    assignment.column
+                ))));
+            }
+            if !sql_value_matches_type(&assignment.value, table.columns[idx].ty) {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "invalid value for column \"{}\"",
+                    assignment.column
+                ))));
+            }
+            Ok((idx, assignment.value.clone()))
         })
         .collect()
 }
@@ -7135,6 +7164,7 @@ impl Engine {
             Command::CreateTable(create) => self.apply_create_table(create)?,
             Command::Insert(insert) => self.apply_insert(insert, txn_id)?,
             Command::Delete(delete) => self.apply_delete(delete, txn_id)?,
+            Command::Update(update) => self.apply_update(update, txn_id)?,
             _ => {}
         }
 
@@ -7307,6 +7337,73 @@ impl Engine {
         Ok(())
     }
 
+    fn apply_update(&mut self, update: Update, txn_id: TxnId) -> Result<(), EngineError> {
+        let table = self
+            .relational_catalog
+            .get(&update.table)
+            .ok_or_else(|| {
+                EngineError::ApplyFailed(format!("relation \"{}\" does not exist", update.table))
+            })?
+            .clone();
+        let assignments = bind_update_assignments(&table, &update)
+            .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+        let filter_groups = bind_delete_filter_groups(
+            &table,
+            &Delete {
+                table: update.table.clone(),
+                filter: update.filter.clone(),
+                filters: update.filters.clone(),
+                filter_groups: update.filter_groups.clone(),
+            },
+        )
+        .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+        let visibility = StorageVisibility {
+            read_txn_id: txn_id,
+        };
+        let prefix = relational_key_prefix(&update.table);
+        let mut updates = Vec::new();
+        let mut cursor = self
+            .mvcc_store
+            .seq_scan_open(visibility)
+            .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+
+        while let Some(tuple) = cursor.next() {
+            if !tuple.key.starts_with(&prefix) {
+                continue;
+            }
+            let mut row = decode_relational_row(&tuple.value, &table.columns)
+                .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+            if filter_groups.iter().any(|filters| {
+                filters
+                    .iter()
+                    .all(|(idx, op, value)| select_filter_matches(&row[*idx], *op, value))
+            }) {
+                for (idx, value) in &assignments {
+                    row[*idx] = value.clone();
+                }
+                updates.push((tuple.tuple_id, tuple.key.clone(), row));
+            }
+        }
+        drop(cursor);
+
+        for (tuple_id, row_key, values) in updates {
+            self.mvcc_store
+                .tuple_update(tuple_id, encode_relational_row(&values), txn_id)
+                .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+            for (column, value) in table.columns.iter().zip(values.iter()) {
+                self.relational_value_index
+                    .entry(RelationalIndexKey {
+                        table: update.table.clone(),
+                        column: column.name.clone(),
+                        value: relational_index_value(value),
+                    })
+                    .or_default()
+                    .push(row_key.clone());
+            }
+        }
+        Ok(())
+    }
+
     pub fn enqueue_set_text(
         &mut self,
         txn_id: u64,
@@ -7319,7 +7416,8 @@ impl Engine {
             | Command::DeleteKv { .. }
             | Command::CreateTable(_)
             | Command::Insert(_)
-            | Command::Delete(_) => {
+            | Command::Delete(_)
+            | Command::Update(_) => {
                 if self.repl.role() != Role::Leader {
                     return Err(ExecuteError::Engine(EngineError::NotLeader));
                 }
@@ -7498,7 +7596,8 @@ impl Engine {
             | Command::DeleteKv { .. }
             | Command::CreateTable(_)
             | Command::Insert(_)
-            | Command::Delete(_) => match self.route_command(&cmd) {
+            | Command::Delete(_)
+            | Command::Update(_) => match self.route_command(&cmd) {
                 RouteDecision::Gpu(_) | RouteDecision::Cpu => {
                     self.commit_mutation_at(txn_id, text.as_bytes().to_vec(), timestamp_micros)?;
                 }
@@ -7574,6 +7673,7 @@ impl Engine {
             Command::CreateTable(_) => Err(ExecuteError::NonReadCommand("CREATE TABLE")),
             Command::Insert(_) => Err(ExecuteError::NonReadCommand("INSERT")),
             Command::Delete(_) => Err(ExecuteError::NonReadCommand("DELETE")),
+            Command::Update(_) => Err(ExecuteError::NonReadCommand("UPDATE")),
             Command::Select(_) => Err(ExecuteError::NonReadCommand("SELECT")),
         }
     }
@@ -23975,6 +24075,71 @@ mod tests {
                 table: "people".to_string(),
                 column: "id".to_string(),
                 matched_keys: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn relational_sql_update_uses_wal_before_visibility_and_rebuilds_from_wal() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO people (id, name) VALUES (1, 'Ada'), (2, 'Linus'), (3, 'Grace'), (4, 'Ada Lovelace')",
+        )
+        .unwrap();
+        e.execute_text(
+            3,
+            "UPDATE people SET name = 'Updated' WHERE id = 2 OR name LIKE 'Ada%'",
+        )
+        .unwrap();
+
+        let Command::Select(select) =
+            parse_command("SELECT id, name FROM people ORDER BY id").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let result = e.execute_relational_select(&select).unwrap();
+
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![SqlValue::Int4(1), SqlValue::Text("Updated".to_string())],
+                vec![SqlValue::Int4(2), SqlValue::Text("Updated".to_string())],
+                vec![SqlValue::Int4(3), SqlValue::Text("Grace".to_string())],
+                vec![SqlValue::Int4(4), SqlValue::Text("Updated".to_string())],
+            ]
+        );
+        assert_eq!(e.durable_wal_records().len(), 3);
+
+        let mut recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let recovered_result = recovered.execute_relational_select(&select).unwrap();
+        assert_eq!(recovered_result.rows, result.rows);
+
+        let Command::Select(index_select) =
+            parse_command("SELECT id FROM people WHERE name = 'Updated' ORDER BY id").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let index_result = recovered.execute_relational_select(&index_select).unwrap();
+        assert_eq!(
+            index_result.rows,
+            vec![
+                vec![SqlValue::Int4(1)],
+                vec![SqlValue::Int4(2)],
+                vec![SqlValue::Int4(4)],
+            ]
+        );
+        assert_eq!(
+            index_result.access_path,
+            RelationalAccessPath::OrderedKeyBatch {
+                table: "people".to_string(),
+                predicate_column: Some("name".to_string()),
+                predicate_op: Some(SelectFilterOp::Eq),
+                order_column: "id".to_string(),
+                descending: false,
+                matched_keys: 3,
             }
         );
     }

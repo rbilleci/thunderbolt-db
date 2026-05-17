@@ -160,6 +160,30 @@ psql:03_relational_create_insert_select.sql:49: ERROR:  OFFSET must not be negat
   3
 (1 row)
 
+=== relational update workflow ===
+UPDATE 2
+ id |  name
+----+---------
+  1 | Updated
+  2 | Updated
+  3 | Grace
+  4 | Grace
+(4 rows)
+
+ count
+-------
+     2
+(1 row)
+
+=== relational update unsupported recovery ===
+psql:03_relational_create_insert_select.sql:56: ERROR:  query shape is not supported by the compatibility stub
+psql:03_relational_create_insert_select.sql:57: ERROR:  column type mismatch
+ id | name
+----+-------
+  3 | Grace
+  4 | Grace
+(2 rows)
+
 === relational delete workflow ===
 DELETE 2
  id | name
