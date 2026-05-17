@@ -4699,6 +4699,15 @@ fn execute_statement(
             &[vec![Some("public".to_string())]],
         );
     }
+    if canonical == "select pg_advisory_unlock_all()"
+        || canonical == "select pg_catalog.pg_advisory_unlock_all()"
+    {
+        return write_single_row(
+            stream,
+            &[text_column("pg_advisory_unlock_all")],
+            &[vec![None]],
+        );
+    }
     if canonical
         == "select set_config(name, 'view, foreign-table', false) from pg_settings where name = 'restrict_nonsystem_relation_kind'"
     {
@@ -5180,6 +5189,15 @@ fn execute_statement(
             stream,
             &[text_column("set_config")],
             &[vec![Some(String::new())]],
+        );
+    }
+    if canonical == "select pg_advisory_unlock_all()"
+        || canonical == "select pg_catalog.pg_advisory_unlock_all()"
+    {
+        return write_single_row(
+            stream,
+            &[text_column("pg_advisory_unlock_all")],
+            &[vec![None]],
         );
     }
     if canonical
@@ -10256,6 +10274,33 @@ mod tests {
             tags.push(tag);
         }
         tags
+    }
+
+    #[test]
+    fn asyncpg_default_pool_session_reset_query_is_session_control_noop() {
+        let mut session = Session::default();
+        let (mut writer, mut reader) = tcp_pair();
+
+        run_simple_query(
+            &mut writer,
+            &mut session,
+            "SELECT pg_advisory_unlock_all(); CLOSE ALL; UNLISTEN *; RESET ALL;",
+        )
+        .unwrap();
+        let messages = read_backend_messages(&mut reader, 7);
+        assert_eq!(
+            messages.iter().map(|(tag, _)| *tag).collect::<Vec<_>>(),
+            vec![b'T', b'D', b'C', b'C', b'C', b'C', b'Z']
+        );
+        assert_eq!(messages[2].1, b"SELECT 1\0".to_vec());
+
+        run_simple_query(&mut writer, &mut session, "SELECT 1 AS one;").unwrap();
+        let messages = read_backend_messages(&mut reader, 4);
+        assert_eq!(
+            messages.iter().map(|(tag, _)| *tag).collect::<Vec<_>>(),
+            vec![b'T', b'D', b'C', b'Z']
+        );
+        assert_eq!(messages[2].1, b"SELECT 1\0".to_vec());
     }
 
     fn error_field_value(payload: &[u8], field_tag: u8) -> Option<String> {

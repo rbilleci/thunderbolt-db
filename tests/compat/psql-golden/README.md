@@ -29,6 +29,8 @@ Optional:
 
 When `PSQL_GOLDEN_BOOT_CMD` is set, the harness starts the target service itself, waits for the configured TCP endpoint to accept connections, captures boot logs in `target/psql-golden/boot.log`, and writes a machine-readable scenario report to `PSQL_GOLDEN_REPORT` for CI scorecards.
 
+Scenario 02 covers PostgreSQL-style session reset/setup probes, including the asyncpg default reset cleanup sequence `SELECT pg_advisory_unlock_all(); CLOSE ALL; UNLISTEN *; RESET ALL;`, as bounded no-op compatibility that leaves later SQL prepared traffic usable.
+
 ## Update expected artifacts
 
 1. Run the suite against the target endpoint.

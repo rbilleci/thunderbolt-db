@@ -1,4 +1,6 @@
 \echo === session reset probes ===
+SELECT pg_advisory_unlock_all();
+CLOSE ALL;
 RESET ALL;
 DISCARD ALL;
 DEALLOCATE ALL;

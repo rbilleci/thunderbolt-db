@@ -1,5 +1,7 @@
 # Implementation Log
 
+- 2026-05-17: Hardened the asyncpg compatibility lane by accepting `SELECT pg_advisory_unlock_all()` as a bounded session-control no-op for driver reset cleanup, alongside existing `CLOSE ALL`, `UNLISTEN *`, and `RESET ALL` reset probes. The checked-in asyncpg smoke now uses the driver's default pool reset hook and proves pool reuse plus later prepared SELECT traffic without claiming broader advisory-lock semantics.
+
 - 2026-05-17: Added bounded relational `DELETE FROM table WHERE ...` support over the existing literal predicate subset. The parser now distinguishes filtered relational deletes from key-value `DELETE FROM key` aliases, engine execution routes deletes through the WAL-before-visibility mutation path with MVCC tombstones and WAL replay recovery, the PostgreSQL compatibility endpoint returns `DELETE n` for simple-query traffic, psql golden scenario 03 proves later SELECT recovery, and the compatibility scorecard classifier counts delete coverage in `sql.relational_foundation`.
 
 - 2026-05-17: Added a P7 GPU-residency baseline benchmark and report. `scripts/run_p7_gpu_residency_baseline.sh` runs the checked-in `relational_gpu_residency_baseline` example, measures cold and warm-runtime per-query H2D CUDA probe traffic plus a post-mutation probe, validates CPU/GPU correctness, and records warm-resident execution, resident-byte accounting, resident refresh, and memory-pressure fallback as unsupported until MVCC/WAL-safe resident invalidation or refresh exists.

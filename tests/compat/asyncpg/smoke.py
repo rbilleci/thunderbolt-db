@@ -76,10 +76,6 @@ async def connect(port: int, application_name: str):
     )
 
 
-async def skip_pool_reset(_connection):
-    return None
-
-
 async def main(repo_root: Path) -> None:
     server = Server(repo_root)
     server.start()
@@ -126,21 +122,26 @@ async def main(repo_root: Path) -> None:
             ssl=False,
             min_size=1,
             max_size=1,
-            reset=skip_pool_reset,
             server_settings={"application_name": "asyncpg_pool_smoke"},
         )
         try:
-            pooled_setup = await pool.execute(
-                """
-                CREATE TABLE asyncpg_pool_check (id INT, name TEXT);
-                INSERT INTO asyncpg_pool_check (id, name) VALUES (1, 'pooled');
-                """
+            async with pool.acquire() as pooled_conn:
+                pooled_setup = await pooled_conn.execute(
+                    """
+                    CREATE TABLE asyncpg_pool_check (id INT, name TEXT);
+                    INSERT INTO asyncpg_pool_check (id, name) VALUES (1, 'pooled');
+                    """
+                )
+                assert pooled_setup == "INSERT 0 1"
+                pooled = await pooled_conn.fetchrow(
+                    "SELECT id, name FROM asyncpg_pool_check WHERE id = $1", 1
+                )
+                assert dict(pooled) == {"id": 1, "name": "pooled"}
+
+            reused = await pool.fetchrow(
+                "SELECT name FROM asyncpg_pool_check WHERE id = $1", 1
             )
-            assert pooled_setup == "INSERT 0 1"
-            pooled = await pool.fetchrow(
-                "SELECT id, name FROM asyncpg_pool_check WHERE id = $1", 1
-            )
-            assert dict(pooled) == {"id": 1, "name": "pooled"}
+            assert reused["name"] == "pooled"
         finally:
             await pool.close()
 

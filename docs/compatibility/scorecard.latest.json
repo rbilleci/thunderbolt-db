@@ -15,8 +15,8 @@
     "protocol.client_flows": {
       "failed": 0,
       "ignored": 0,
-      "passed": 114,
-      "total": 114
+      "passed": 115,
+      "total": 115
     },
     "protocol.error_paths": {
       "failed": 0,
@@ -89,11 +89,29 @@
   "totals": {
     "failed": 0,
     "ignored": 0,
-    "passed": 1011,
-    "total": 1011
+    "passed": 1012,
+    "total": 1012
   },
   "trend_hook": {
-    "baseline_available": false,
-    "note": "No baseline configured yet. Add docs/compatibility/scorecard.baseline.json to enable diffs."
+    "baseline_available": true,
+    "baseline_failed": 0,
+    "bucket_failed_delta": {
+      "durability.invariants": 0,
+      "execution.gpu_routing_and_batching": 0,
+      "protocol.client_flows": 0,
+      "protocol.error_paths": 0,
+      "protocol.extended_query": 0,
+      "replication.operational_cluster": 0,
+      "replication.role_and_log": 0,
+      "sql.catalog_schema_types": 0,
+      "sql.gpu_bridge": 0,
+      "sql.parser_features": 0,
+      "sql.relational_foundation": 0,
+      "sql.transaction_flows": 0,
+      "storage.indexing": 0,
+      "uncategorized": 0
+    },
+    "current_failed": 0,
+    "failed_delta": 0
   }
 }

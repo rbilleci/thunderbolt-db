@@ -1,4 +1,10 @@
 === session reset probes ===
+ pg_advisory_unlock_all
+------------------------
+
+(1 row)
+
+CLOSE CURSOR
 RESET
 DISCARD ALL
 DEALLOCATE ALL
