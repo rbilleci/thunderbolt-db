@@ -30,12 +30,13 @@ use gpu_db_types::{CommitToken, EngineError, Index, LogEntry, Role, SnapshotMeta
 use gpu_db_wal::{
     append_wal_archive_segment_with_timestamps, apply_wal_archive_retention_from_txn,
     apply_wal_archive_retention_to_timestamp_micros, apply_wal_archive_retention_to_txn,
+    fork_wal_archive_timeline_to_timestamp_micros, fork_wal_archive_timeline_to_txn,
     plan_wal_archive_retention_from_txn, plan_wal_archive_retention_to_timestamp_micros,
-    plan_wal_archive_retention_to_txn, read_wal_archive, read_wal_archive_to_timestamp_micros,
-    read_wal_archive_to_txn, read_wal_checkpoint, read_wal_segment,
-    write_wal_archive_with_timestamps, write_wal_control_file, write_wal_segment,
-    WalArchiveManifest, WalArchiveRecordTimestamp, WalArchiveRetentionPlan, WalBuffer,
-    WalControlFile, WalRecord,
+    plan_wal_archive_retention_to_txn, read_wal_archive, read_wal_archive_timeline,
+    read_wal_archive_to_timestamp_micros, read_wal_archive_to_txn, read_wal_checkpoint,
+    read_wal_segment, write_wal_archive_with_timestamps, write_wal_control_file, write_wal_segment,
+    WalArchiveManifest, WalArchiveRecordTimestamp, WalArchiveRetentionPlan, WalArchiveTimeline,
+    WalArchiveTimelineBranch, WalBuffer, WalControlFile, WalRecord,
 };
 
 #[derive(Debug, Default)]
@@ -8703,6 +8704,52 @@ impl Engine {
         record_timestamps: &[WalArchiveRecordTimestamp],
     ) -> Result<WalArchiveManifest, EngineError> {
         append_wal_archive_segment_with_timestamps(manifest_path, segment_path, record_timestamps)
+    }
+
+    pub fn fork_durable_wal_archive_timeline_to_txn(
+        source_manifest_path: impl AsRef<std::path::Path>,
+        branch_manifest_path: impl AsRef<std::path::Path>,
+        branch_segment_dir: impl AsRef<std::path::Path>,
+        timeline_path: impl AsRef<std::path::Path>,
+        timeline_id: impl AsRef<str>,
+        parent_timeline_id: Option<&str>,
+        target_txn_id: TxnId,
+    ) -> Result<WalArchiveTimelineBranch, EngineError> {
+        fork_wal_archive_timeline_to_txn(
+            source_manifest_path,
+            branch_manifest_path,
+            branch_segment_dir,
+            timeline_path,
+            timeline_id,
+            parent_timeline_id,
+            target_txn_id,
+        )
+    }
+
+    pub fn fork_durable_wal_archive_timeline_to_timestamp_micros(
+        source_manifest_path: impl AsRef<std::path::Path>,
+        branch_manifest_path: impl AsRef<std::path::Path>,
+        branch_segment_dir: impl AsRef<std::path::Path>,
+        timeline_path: impl AsRef<std::path::Path>,
+        timeline_id: impl AsRef<str>,
+        parent_timeline_id: Option<&str>,
+        target_timestamp_micros: u64,
+    ) -> Result<WalArchiveTimelineBranch, EngineError> {
+        fork_wal_archive_timeline_to_timestamp_micros(
+            source_manifest_path,
+            branch_manifest_path,
+            branch_segment_dir,
+            timeline_path,
+            timeline_id,
+            parent_timeline_id,
+            target_timestamp_micros,
+        )
+    }
+
+    pub fn read_durable_wal_archive_timeline(
+        timeline_path: impl AsRef<std::path::Path>,
+    ) -> Result<WalArchiveTimeline, EngineError> {
+        read_wal_archive_timeline(timeline_path)
     }
 
     pub fn plan_durable_wal_archive_retention_to_txn(
@@ -25850,6 +25897,95 @@ mod tests {
         let katherine_result = recovered
             .execute_relational_select(&katherine_select)
             .unwrap();
+        assert_eq!(katherine_result.rows, Vec::<Vec<SqlValue>>::new());
+    }
+
+    #[test]
+    fn relational_state_recovers_from_forked_wal_archive_timeline_branch() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpu-db-engine-wal-archive-timeline-{}-{}",
+            std::process::id(),
+            NEXT_TEST_WAL_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let source_manifest = dir.join("source").join("MANIFEST");
+        let source_segments = dir.join("source").join("segments");
+        let branch_manifest = dir.join("branch").join("MANIFEST");
+        let branch_segments = dir.join("branch").join("segments");
+        let timeline_path = dir.join("branch").join("TIMELINE");
+        let mut e = Engine::new_local();
+        e.execute_text_at_timestamp_micros(1, "CREATE TABLE people (id INT, name TEXT)", 1_000)
+            .unwrap();
+        e.execute_text_at_timestamp_micros(
+            2,
+            "INSERT INTO people (id, name) VALUES (1, 'Ada')",
+            2_000,
+        )
+        .unwrap();
+        e.execute_text_at_timestamp_micros(
+            3,
+            "INSERT INTO people (id, name) VALUES (2, 'Grace')",
+            3_000,
+        )
+        .unwrap();
+        e.execute_text_at_timestamp_micros(
+            4,
+            "INSERT INTO people (id, name) VALUES (3, 'Katherine')",
+            4_000,
+        )
+        .unwrap();
+        e.persist_durable_wal_archive(&source_manifest, &source_segments, 2)
+            .unwrap();
+
+        let branch = Engine::fork_durable_wal_archive_timeline_to_timestamp_micros(
+            &source_manifest,
+            &branch_manifest,
+            &branch_segments,
+            &timeline_path,
+            "timeline-branch-0002",
+            Some("timeline-main-0001"),
+            3_000,
+        )
+        .unwrap();
+        let timeline = Engine::read_durable_wal_archive_timeline(&timeline_path).unwrap();
+        let mut recovered = Engine::recover_from_durable_wal_archive(&branch_manifest).unwrap();
+
+        assert_eq!(branch.timeline, timeline);
+        assert_eq!(timeline.timeline_id, "timeline-branch-0002");
+        assert_eq!(
+            timeline.parent_timeline_id.as_deref(),
+            Some("timeline-main-0001")
+        );
+        assert_eq!(timeline.fork_txn_id, 3);
+        assert_eq!(timeline.fork_timestamp_micros, Some(3_000));
+        assert_eq!(branch.manifest.checkpoint.durable_record_count, 3);
+        assert_eq!(recovered.wal_flushed_count(), 3);
+
+        let Command::Select(grace_select) =
+            parse_command("SELECT id FROM people WHERE name = 'Grace'").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let grace_result = recovered.execute_relational_select(&grace_select).unwrap();
+        assert_eq!(
+            grace_result.access_path,
+            RelationalAccessPath::EqualityIndex {
+                table: "people".to_string(),
+                column: "name".to_string(),
+                matched_keys: 1,
+            }
+        );
+        assert_eq!(grace_result.rows, vec![vec![SqlValue::Int4(2)]]);
+
+        let Command::Select(katherine_select) =
+            parse_command("SELECT id FROM people WHERE name = 'Katherine'").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let katherine_result = recovered
+            .execute_relational_select(&katherine_select)
+            .unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+
         assert_eq!(katherine_result.rows, Vec::<Vec<SqlValue>>::new());
     }
 

@@ -29,7 +29,7 @@ This document defines operational resilience strategy and implementation boundar
 - Continuous WAL archive to durable object storage.
 - Archive retention policy tied to PITR window target.
 - Archive lag is monitored and alertable.
-- Current checked-in local proof: an ordered WAL archive manifest can reference multiple checksummed segment files, validate per-segment record counts and transaction ranges, ingest a newly arrived checksummed segment with transaction/timestamp continuity checks through `Engine::ingest_durable_wal_archive_segment(...)`, replay the full durable prefix through engine recovery, replay only the exact archived transaction-bound prefix requested by `Engine::recover_from_durable_wal_archive_to_txn(...)`, replay only the exact engine-written timestamp-bound prefix requested by `Engine::recover_from_durable_wal_archive_to_timestamp_micros(...)`, combine a checkpoint-control base backup with an overlapping archive suffix through `Engine::recover_from_durable_wal_checkpoint_and_archive_to_txn(...)` / `Engine::recover_from_durable_wal_checkpoint_and_archive_to_timestamp_micros(...)`, clean up a PITR branch archive to an exact transaction prefix with `Engine::apply_durable_wal_archive_retention_to_txn(...)`, clean up a PITR branch archive to an exact timestamp prefix with `Engine::apply_durable_wal_archive_retention_to_timestamp_micros(...)`, or clean up an archive window before a validated checkpoint-control base backup with `Engine::apply_durable_wal_archive_retention_from_checkpoint(...)`. This is a local restart/restore, local segment-ingestion, transaction-bound PITR, timestamp-bound PITR, checkpoint-backed base-plus-archive restore, post-target suffix-cleanup, and checkpoint-backed base-window cleanup proof, not continuous object-storage archival, physical page-image base-backup restore, timeline branching, or automatic background cleanup.
+- Current checked-in local proof: an ordered WAL archive manifest can reference multiple checksummed segment files, validate per-segment record counts and transaction ranges, ingest a newly arrived checksummed segment with transaction/timestamp continuity checks through `Engine::ingest_durable_wal_archive_segment(...)`, replay the full durable prefix through engine recovery, replay only the exact archived transaction-bound prefix requested by `Engine::recover_from_durable_wal_archive_to_txn(...)`, replay only the exact engine-written timestamp-bound prefix requested by `Engine::recover_from_durable_wal_archive_to_timestamp_micros(...)`, combine a checkpoint-control base backup with an overlapping archive suffix through `Engine::recover_from_durable_wal_checkpoint_and_archive_to_txn(...)` / `Engine::recover_from_durable_wal_checkpoint_and_archive_to_timestamp_micros(...)`, clean up a PITR branch archive to an exact transaction prefix with `Engine::apply_durable_wal_archive_retention_to_txn(...)`, clean up a PITR branch archive to an exact timestamp prefix with `Engine::apply_durable_wal_archive_retention_to_timestamp_micros(...)`, clean up an archive window before a validated checkpoint-control base backup with `Engine::apply_durable_wal_archive_retention_from_checkpoint(...)`, or fork an exact transaction/timestamp PITR target into a local branch archive plus sidecar timeline identity/ancestry metadata with `Engine::fork_durable_wal_archive_timeline_to_txn(...)` / `Engine::fork_durable_wal_archive_timeline_to_timestamp_micros(...)`. This is a local restart/restore, local segment-ingestion, transaction-bound PITR, timestamp-bound PITR, checkpoint-backed base-plus-archive restore, post-target suffix-cleanup, checkpoint-backed base-window cleanup, and local timeline-branch metadata proof, not continuous object-storage archival, physical page-image base-backup restore, production timeline management, or automatic background cleanup.
 
 ## PITR model
 
@@ -46,8 +46,8 @@ This document defines operational resilience strategy and implementation boundar
 5. Validate consistency and readiness
 
 ### Timeline handling
-- New restore branch produces new timeline identity.
-- Timeline ancestry must be preserved for auditability.
+- New restore branch produces new timeline identity. The local proof writes sidecar timeline metadata for exact transaction/timestamp archive forks.
+- Timeline ancestry must be preserved for auditability. The local proof records an optional parent timeline id plus the fork transaction and timestamp boundary; production timeline management remains future work.
 
 ## Replication and failover
 
@@ -105,10 +105,10 @@ This document defines operational resilience strategy and implementation boundar
 ### v0
 - Base backup + WAL archiving + local restore
 - Crash recovery validation in CI/nightly
-- Implemented local proof: multi-segment durable WAL archive manifest + replay for the full committed prefix, an exact archived transaction boundary, an exact engine-written timestamp boundary, a checkpoint-backed base-plus-archive restore target, or a cleaned transaction-target archive prefix.
+- Implemented local proof: multi-segment durable WAL archive manifest + replay for the full committed prefix, an exact archived transaction boundary, an exact engine-written timestamp boundary, a checkpoint-backed base-plus-archive restore target, a cleaned transaction-target archive prefix, or a local timeline branch archive with sidecar ancestry metadata.
 
 ### v0.5
-- Timeline handling
+- Production timeline management
 - Durable object-storage retention policies and background cleanup
 - Node bootstrap/catch-up automation basics
 

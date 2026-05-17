@@ -8,6 +8,7 @@ use gpu_db_types::{EngineError, TxnId};
 const WAL_SEGMENT_MAGIC: &[u8; 10] = b"GPUDBWAL1\n";
 const WAL_CONTROL_MAGIC: &str = "GPUDBWALCONTROL1";
 const WAL_ARCHIVE_MANIFEST_MAGIC: &str = "GPUDBWALARCHIVE1";
+const WAL_ARCHIVE_TIMELINE_MAGIC: &str = "GPUDBWALTIMELINE1";
 const WAL_RECORD_HEADER_LEN: usize = 24;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,6 +72,22 @@ pub struct WalArchiveRetentionPlan {
     pub removed_record_count: usize,
     pub retained_manifest: WalArchiveManifest,
     pub removed_segments: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalArchiveTimeline {
+    pub timeline_id: String,
+    pub parent_timeline_id: Option<String>,
+    pub fork_txn_id: TxnId,
+    pub fork_timestamp_micros: Option<u64>,
+    pub source_manifest_path: PathBuf,
+    pub branch_manifest_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalArchiveTimelineBranch {
+    pub timeline: WalArchiveTimeline,
+    pub manifest: WalArchiveManifest,
 }
 
 #[derive(Debug, Default)]
@@ -517,6 +534,225 @@ pub fn append_wal_archive_segment_with_timestamps(
     validate_archive_timestamps(manifest_path, &appended, &records)?;
     write_wal_archive_manifest(manifest_path, &appended)?;
     Ok(appended)
+}
+
+pub fn fork_wal_archive_timeline_to_txn(
+    source_manifest_path: impl AsRef<Path>,
+    branch_manifest_path: impl AsRef<Path>,
+    branch_segment_dir: impl AsRef<Path>,
+    timeline_path: impl AsRef<Path>,
+    timeline_id: impl AsRef<str>,
+    parent_timeline_id: Option<&str>,
+    target_txn_id: TxnId,
+) -> Result<WalArchiveTimelineBranch, EngineError> {
+    let source_manifest_path = source_manifest_path.as_ref();
+    let branch_manifest_path = branch_manifest_path.as_ref();
+    let branch_segment_dir = branch_segment_dir.as_ref();
+    let timeline_path = timeline_path.as_ref();
+    let timeline = validate_timeline_identity(
+        timeline_path,
+        timeline_id.as_ref(),
+        parent_timeline_id,
+        source_manifest_path,
+        branch_manifest_path,
+        target_txn_id,
+        None,
+    )?;
+    let (source_manifest, target, records) =
+        read_wal_archive_to_txn(source_manifest_path, target_txn_id)?;
+    let record_timestamps = retained_timestamps(&source_manifest, target.recovered_record_count);
+    let records_per_segment = archive_records_per_segment(source_manifest_path, &source_manifest)?;
+    let manifest = write_wal_archive_with_timestamps(
+        branch_manifest_path,
+        branch_segment_dir,
+        &records,
+        records_per_segment,
+        record_timestamps,
+    )?;
+    write_wal_archive_timeline(timeline_path, &timeline)?;
+    Ok(WalArchiveTimelineBranch { timeline, manifest })
+}
+
+pub fn fork_wal_archive_timeline_to_timestamp_micros(
+    source_manifest_path: impl AsRef<Path>,
+    branch_manifest_path: impl AsRef<Path>,
+    branch_segment_dir: impl AsRef<Path>,
+    timeline_path: impl AsRef<Path>,
+    timeline_id: impl AsRef<str>,
+    parent_timeline_id: Option<&str>,
+    target_timestamp_micros: u64,
+) -> Result<WalArchiveTimelineBranch, EngineError> {
+    let source_manifest_path = source_manifest_path.as_ref();
+    let branch_manifest_path = branch_manifest_path.as_ref();
+    let branch_segment_dir = branch_segment_dir.as_ref();
+    let timeline_path = timeline_path.as_ref();
+    let (source_manifest, target, records) =
+        read_wal_archive_to_timestamp_micros(source_manifest_path, target_timestamp_micros)?;
+    let timeline = validate_timeline_identity(
+        timeline_path,
+        timeline_id.as_ref(),
+        parent_timeline_id,
+        source_manifest_path,
+        branch_manifest_path,
+        target.target_txn_id,
+        Some(target_timestamp_micros),
+    )?;
+    let record_timestamps = retained_timestamps(&source_manifest, target.recovered_record_count);
+    let records_per_segment = archive_records_per_segment(source_manifest_path, &source_manifest)?;
+    let manifest = write_wal_archive_with_timestamps(
+        branch_manifest_path,
+        branch_segment_dir,
+        &records,
+        records_per_segment,
+        record_timestamps,
+    )?;
+    write_wal_archive_timeline(timeline_path, &timeline)?;
+    Ok(WalArchiveTimelineBranch { timeline, manifest })
+}
+
+pub fn write_wal_archive_timeline(
+    path: impl AsRef<Path>,
+    timeline: &WalArchiveTimeline,
+) -> Result<(), EngineError> {
+    let path = path.as_ref();
+    validate_timeline_value(path, "timeline_id", &timeline.timeline_id)?;
+    if let Some(parent) = timeline.parent_timeline_id.as_ref() {
+        validate_timeline_value(path, "parent_timeline_id", parent)?;
+        if parent == &timeline.timeline_id {
+            return Err(EngineError::Durability(format!(
+                "WAL archive timeline {} cannot be its own parent",
+                timeline.timeline_id
+            )));
+        }
+    }
+    validate_timeline_path(path, "source_manifest_path", &timeline.source_manifest_path)?;
+    validate_timeline_path(path, "branch_manifest_path", &timeline.branch_manifest_path)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            EngineError::Durability(format!(
+                "failed to create WAL timeline directory {}: {err}",
+                parent.display()
+            ))
+        })?;
+    }
+
+    let body = format!(
+        "{WAL_ARCHIVE_TIMELINE_MAGIC}\ntimeline_id={}\nparent_timeline_id={}\nfork_txn_id={}\nfork_timestamp_micros={}\nsource_manifest_path={}\nbranch_manifest_path={}\n",
+        timeline.timeline_id,
+        timeline
+            .parent_timeline_id
+            .as_deref()
+            .unwrap_or("none"),
+        timeline.fork_txn_id,
+        format_optional_u64(timeline.fork_timestamp_micros),
+        timeline.source_manifest_path.display(),
+        timeline.branch_manifest_path.display()
+    );
+
+    let tmp_path = temporary_control_path(path);
+    let write_result = (|| {
+        let mut file = File::create(&tmp_path).map_err(|err| {
+            EngineError::Durability(format!(
+                "failed to create WAL archive timeline {}: {err}",
+                tmp_path.display()
+            ))
+        })?;
+        file.write_all(body.as_bytes()).map_err(|err| {
+            EngineError::Durability(format!(
+                "failed to write WAL archive timeline {}: {err}",
+                tmp_path.display()
+            ))
+        })?;
+        file.sync_all().map_err(|err| {
+            EngineError::Durability(format!(
+                "failed to sync WAL archive timeline {}: {err}",
+                tmp_path.display()
+            ))
+        })?;
+        Ok::<_, EngineError>(())
+    })();
+
+    if let Err(err) = write_result {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+
+    fs::rename(&tmp_path, path).map_err(|err| {
+        let _ = fs::remove_file(&tmp_path);
+        EngineError::Durability(format!(
+            "failed to install WAL archive timeline {}: {err}",
+            path.display()
+        ))
+    })
+}
+
+pub fn read_wal_archive_timeline(
+    path: impl AsRef<Path>,
+) -> Result<WalArchiveTimeline, EngineError> {
+    let path = path.as_ref();
+    let body = fs::read_to_string(path).map_err(|err| {
+        EngineError::Durability(format!(
+            "failed to read WAL archive timeline {}: {err}",
+            path.display()
+        ))
+    })?;
+    let mut lines = body.lines();
+    if lines.next() != Some(WAL_ARCHIVE_TIMELINE_MAGIC) {
+        return Err(EngineError::Durability(format!(
+            "invalid WAL archive timeline header {}",
+            path.display()
+        )));
+    }
+
+    let timeline_id = parse_control_value(lines.next(), "timeline_id", path)?.to_string();
+    let parent_timeline_id = match parse_control_value(lines.next(), "parent_timeline_id", path)? {
+        "none" => None,
+        parent => Some(parent.to_string()),
+    };
+    let fork_txn_id = parse_control_value(lines.next(), "fork_txn_id", path)?
+        .parse()
+        .map_err(|err| {
+            EngineError::Durability(format!(
+                "invalid WAL archive timeline fork transaction {}: {err}",
+                path.display()
+            ))
+        })?;
+    let fork_timestamp_micros = parse_optional_u64(
+        parse_control_value(lines.next(), "fork_timestamp_micros", path)?,
+        "fork timestamp",
+        path,
+    )?;
+    let source_manifest_path = PathBuf::from(parse_control_value(
+        lines.next(),
+        "source_manifest_path",
+        path,
+    )?);
+    let branch_manifest_path = PathBuf::from(parse_control_value(
+        lines.next(),
+        "branch_manifest_path",
+        path,
+    )?);
+    let timeline = WalArchiveTimeline {
+        timeline_id,
+        parent_timeline_id,
+        fork_txn_id,
+        fork_timestamp_micros,
+        source_manifest_path,
+        branch_manifest_path,
+    };
+    validate_timeline_value(path, "timeline_id", &timeline.timeline_id)?;
+    if let Some(parent) = timeline.parent_timeline_id.as_ref() {
+        validate_timeline_value(path, "parent_timeline_id", parent)?;
+        if parent == &timeline.timeline_id {
+            return Err(EngineError::Durability(format!(
+                "WAL archive timeline {} cannot be its own parent",
+                timeline.timeline_id
+            )));
+        }
+    }
+    validate_timeline_path(path, "source_manifest_path", &timeline.source_manifest_path)?;
+    validate_timeline_path(path, "branch_manifest_path", &timeline.branch_manifest_path)?;
+    Ok(timeline)
 }
 
 pub fn write_wal_archive_manifest(
@@ -1272,6 +1508,13 @@ fn build_wal_archive_manifest(
     }
 }
 
+fn retained_timestamps(
+    manifest: &WalArchiveManifest,
+    retained_record_count: usize,
+) -> &[WalArchiveRecordTimestamp] {
+    &manifest.record_timestamps[..retained_record_count.min(manifest.record_timestamps.len())]
+}
+
 fn archive_records_per_segment(
     manifest_path: &Path,
     manifest: &WalArchiveManifest,
@@ -1422,6 +1665,69 @@ fn validate_archive_ingest_timestamps(
     Ok(())
 }
 
+fn validate_timeline_identity(
+    timeline_path: &Path,
+    timeline_id: &str,
+    parent_timeline_id: Option<&str>,
+    source_manifest_path: &Path,
+    branch_manifest_path: &Path,
+    fork_txn_id: TxnId,
+    fork_timestamp_micros: Option<u64>,
+) -> Result<WalArchiveTimeline, EngineError> {
+    validate_timeline_value(timeline_path, "timeline_id", timeline_id)?;
+    if let Some(parent) = parent_timeline_id {
+        validate_timeline_value(timeline_path, "parent_timeline_id", parent)?;
+        if parent == timeline_id {
+            return Err(EngineError::Durability(format!(
+                "WAL archive timeline {timeline_id} cannot be its own parent"
+            )));
+        }
+    }
+    if source_manifest_path == branch_manifest_path {
+        return Err(EngineError::Durability(format!(
+            "WAL archive timeline {timeline_id} cannot fork into the source manifest {}",
+            source_manifest_path.display()
+        )));
+    }
+    validate_timeline_path(timeline_path, "source_manifest_path", source_manifest_path)?;
+    validate_timeline_path(timeline_path, "branch_manifest_path", branch_manifest_path)?;
+    Ok(WalArchiveTimeline {
+        timeline_id: timeline_id.to_string(),
+        parent_timeline_id: parent_timeline_id.map(ToOwned::to_owned),
+        fork_txn_id,
+        fork_timestamp_micros,
+        source_manifest_path: source_manifest_path.to_path_buf(),
+        branch_manifest_path: branch_manifest_path.to_path_buf(),
+    })
+}
+
+fn validate_timeline_value(path: &Path, field: &str, value: &str) -> Result<(), EngineError> {
+    if value.is_empty() {
+        return Err(EngineError::Durability(format!(
+            "WAL archive timeline {field} must not be empty in {}",
+            path.display()
+        )));
+    }
+    if value == "none" || value.contains('\n') || value.contains('\r') {
+        return Err(EngineError::Durability(format!(
+            "WAL archive timeline {field} contains unsupported value in {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_timeline_path(path: &Path, field: &str, value: &Path) -> Result<(), EngineError> {
+    let rendered = value.to_string_lossy();
+    if rendered.is_empty() || rendered.contains('\n') || rendered.contains('\r') {
+        return Err(EngineError::Durability(format!(
+            "WAL archive timeline {field} contains unsupported path in {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 fn validate_archive_segment(
     manifest_path: &Path,
     segment: &WalArchiveSegment,
@@ -1552,7 +1858,25 @@ fn format_optional_txn(txn_id: Option<TxnId>) -> String {
         .unwrap_or_else(|| "none".to_string())
 }
 
+fn format_optional_u64(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "none".to_string())
+}
+
 fn parse_optional_txn(raw: &str, field: &str, path: &Path) -> Result<Option<TxnId>, EngineError> {
+    match raw {
+        "none" => Ok(None),
+        raw => raw.parse().map(Some).map_err(|err| {
+            EngineError::Durability(format!(
+                "invalid WAL archive {field} {}: {err}",
+                path.display()
+            ))
+        }),
+    }
+}
+
+fn parse_optional_u64(raw: &str, field: &str, path: &Path) -> Result<Option<u64>, EngineError> {
     match raw {
         "none" => Ok(None),
         raw => raw.parse().map(Some).map_err(|err| {
@@ -2438,6 +2762,147 @@ mod tests {
             .to_string()
             .contains("requires timestamp metadata for ingested segment"));
         assert_eq!(after_manifest, before_manifest);
+    }
+
+    #[test]
+    fn wal_archive_forks_transaction_timeline_with_ancestry() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpu-db-wal-archive-timeline-txn-{}-{}",
+            std::process::id(),
+            NEXT_TEST_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let source_manifest = dir.join("source").join("MANIFEST");
+        let source_segments = dir.join("source").join("segments");
+        let branch_manifest = dir.join("branch").join("MANIFEST");
+        let branch_segments = dir.join("branch").join("segments");
+        let timeline_path = dir.join("branch").join("TIMELINE");
+        let records = vec![
+            WalRecord {
+                txn_id: 1,
+                payload: b"CREATE TABLE people (id INT, name TEXT)".to_vec(),
+            },
+            WalRecord {
+                txn_id: 2,
+                payload: b"INSERT INTO people (id, name) VALUES (1, 'Ada')".to_vec(),
+            },
+            WalRecord {
+                txn_id: 3,
+                payload: b"INSERT INTO people (id, name) VALUES (2, 'Grace')".to_vec(),
+            },
+        ];
+        write_wal_archive(&source_manifest, &source_segments, &records, 1).unwrap();
+
+        let branch = fork_wal_archive_timeline_to_txn(
+            &source_manifest,
+            &branch_manifest,
+            &branch_segments,
+            &timeline_path,
+            "timeline-0002",
+            Some("timeline-0001"),
+            2,
+        )
+        .unwrap();
+        let timeline = read_wal_archive_timeline(&timeline_path).unwrap();
+        let (_manifest, branch_records) = read_wal_archive(&branch_manifest).unwrap();
+        let _ = fs::remove_dir_all(dir);
+
+        assert_eq!(branch.timeline, timeline);
+        assert_eq!(timeline.timeline_id, "timeline-0002");
+        assert_eq!(
+            timeline.parent_timeline_id.as_deref(),
+            Some("timeline-0001")
+        );
+        assert_eq!(timeline.fork_txn_id, 2);
+        assert_eq!(timeline.fork_timestamp_micros, None);
+        assert_eq!(branch.manifest.checkpoint.durable_record_count, 2);
+        assert_eq!(branch.manifest.checkpoint.last_durable_txn_id, Some(2));
+        assert_eq!(branch_records.len(), 2);
+        assert_eq!(branch_records[1].txn_id, 2);
+    }
+
+    #[test]
+    fn wal_archive_forks_timestamp_timeline_and_rejects_self_parent_without_mutation() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpu-db-wal-archive-timeline-timestamp-{}-{}",
+            std::process::id(),
+            NEXT_TEST_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let source_manifest = dir.join("source").join("MANIFEST");
+        let source_segments = dir.join("source").join("segments");
+        let branch_manifest = dir.join("branch").join("MANIFEST");
+        let branch_segments = dir.join("branch").join("segments");
+        let timeline_path = dir.join("branch").join("TIMELINE");
+        let records = vec![
+            WalRecord {
+                txn_id: 1,
+                payload: b"CREATE TABLE people (id INT, name TEXT)".to_vec(),
+            },
+            WalRecord {
+                txn_id: 2,
+                payload: b"INSERT INTO people (id, name) VALUES (1, 'Ada')".to_vec(),
+            },
+            WalRecord {
+                txn_id: 3,
+                payload: b"INSERT INTO people (id, name) VALUES (2, 'Grace')".to_vec(),
+            },
+        ];
+        let timestamps = vec![
+            WalArchiveRecordTimestamp {
+                txn_id: 1,
+                timestamp_micros: 1_000,
+            },
+            WalArchiveRecordTimestamp {
+                txn_id: 2,
+                timestamp_micros: 2_000,
+            },
+            WalArchiveRecordTimestamp {
+                txn_id: 3,
+                timestamp_micros: 3_000,
+            },
+        ];
+        write_wal_archive_with_timestamps(
+            &source_manifest,
+            &source_segments,
+            &records,
+            2,
+            &timestamps,
+        )
+        .unwrap();
+
+        let self_parent_err = fork_wal_archive_timeline_to_timestamp_micros(
+            &source_manifest,
+            &branch_manifest,
+            &branch_segments,
+            &timeline_path,
+            "timeline-0002",
+            Some("timeline-0002"),
+            2_000,
+        )
+        .unwrap_err();
+        assert!(!branch_manifest.exists());
+        assert!(self_parent_err
+            .to_string()
+            .contains("cannot be its own parent"));
+
+        let branch = fork_wal_archive_timeline_to_timestamp_micros(
+            &source_manifest,
+            &branch_manifest,
+            &branch_segments,
+            &timeline_path,
+            "timeline-0002",
+            Some("timeline-0001"),
+            2_000,
+        )
+        .unwrap();
+        let timeline = read_wal_archive_timeline(&timeline_path).unwrap();
+        let (_manifest, branch_records) = read_wal_archive(&branch_manifest).unwrap();
+        let _ = fs::remove_dir_all(dir);
+
+        assert_eq!(timeline.fork_txn_id, 2);
+        assert_eq!(timeline.fork_timestamp_micros, Some(2_000));
+        assert_eq!(branch.manifest.record_timestamps.len(), 2);
+        assert_eq!(branch_records.len(), 2);
+        assert_eq!(branch.timeline, timeline);
     }
 
     #[test]
