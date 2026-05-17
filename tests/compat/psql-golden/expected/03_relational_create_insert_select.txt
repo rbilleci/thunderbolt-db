@@ -1,12 +1,13 @@
 === relational create insert select ===
 CREATE TABLE
-INSERT 0 3
+INSERT 0 4
  id | name
 ----+-------
   1 | Ada
   2 | Linus
   3 | Grace
-(3 rows)
+  4 | Grace
+(4 rows)
 
 === relational filter order limit ===
  name  | id
@@ -18,13 +19,13 @@ INSERT 0 3
  name
 -------
  Grace
- Linus
+ Grace
 (2 rows)
 
 === relational conjunctive filter ===
  id
 ----
-  3
+  4
 (1 row)
 
 === relational disjunctive filter ===
@@ -58,7 +59,22 @@ INSERT 0 3
 === relational prefix like filter ===
  id | name
 ----+-------
+  4 | Grace
   3 | Grace
+(2 rows)
+
+=== relational distinct projection ===
+ name
+-------
+ Grace
+ Ada
+(2 rows)
+
+=== relational distinct unsupported recovery ===
+psql:03_relational_create_insert_select.sql:24: ERROR:  SELECT DISTINCT ORDER BY must reference a selected column
+ id
+----
+  1
 (1 row)
 
 === relational ordered limit offset ===
@@ -68,7 +84,7 @@ INSERT 0 3
 (1 row)
 
 === relational negative offset recovery ===
-psql:03_relational_create_insert_select.sql:24: ERROR:  OFFSET must not be negative
+psql:03_relational_create_insert_select.sql:29: ERROR:  OFFSET must not be negative
  id
 ----
   3

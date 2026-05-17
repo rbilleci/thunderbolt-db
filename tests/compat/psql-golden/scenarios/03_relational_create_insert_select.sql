@@ -1,6 +1,6 @@
 \echo === relational create insert select ===
 CREATE TABLE people (id INT, name TEXT);
-INSERT INTO people (id, name) VALUES (1, 'Ada'), (2, 'Linus'), (3, 'Grace');
+INSERT INTO people (id, name) VALUES (1, 'Ada'), (2, 'Linus'), (3, 'Grace'), (4, 'Grace');
 SELECT id, name FROM people ORDER BY id;
 \echo === relational filter order limit ===
 SELECT name, id FROM people WHERE id = 2 ORDER BY name DESC LIMIT 1;
@@ -18,6 +18,11 @@ SELECT id, name FROM people WHERE id IN (1, 3) ORDER BY id DESC;
 SELECT id, name FROM people WHERE id BETWEEN 2 AND 3 ORDER BY id DESC;
 \echo === relational prefix like filter ===
 SELECT id, name FROM people WHERE name LIKE 'Gra%' ORDER BY id DESC;
+\echo === relational distinct projection ===
+SELECT DISTINCT name FROM people ORDER BY name DESC LIMIT 2 OFFSET 1;
+\echo === relational distinct unsupported recovery ===
+SELECT DISTINCT name FROM people ORDER BY id;
+SELECT DISTINCT id FROM people ORDER BY id LIMIT 1;
 \echo === relational ordered limit offset ===
 SELECT id, name FROM people ORDER BY id LIMIT 1 OFFSET 1;
 \echo === relational negative offset recovery ===

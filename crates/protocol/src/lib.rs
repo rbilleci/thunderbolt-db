@@ -63,7 +63,7 @@ pub struct Insert {
     pub rows: Vec<Vec<SqlValue>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SqlValue {
     Int4(i32),
     Text(String),
@@ -72,6 +72,7 @@ pub enum SqlValue {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Select {
     pub table: String,
+    pub distinct: bool,
     pub projection: SelectProjection,
     pub filter: Option<SelectFilter>,
     pub filters: Vec<SelectFilter>,
@@ -135,7 +136,7 @@ pub enum ParseError {
     InvalidDel,
     #[error("invalid GET syntax; expected: GET key")]
     InvalidGet,
-    #[error("invalid relational SQL syntax; supported subset: CREATE TABLE name (...), INSERT INTO name (...) VALUES (...), SELECT columns FROM name [WHERE column (=|<|<=|>|>=) literal | column BETWEEN literal AND literal | column IN (literal, ...) | text_column LIKE 'prefix%' [AND ...] [OR ...]] [ORDER BY column [ASC|DESC]] [LIMIT n] [OFFSET n]")]
+    #[error("invalid relational SQL syntax; supported subset: CREATE TABLE name (...), INSERT INTO name (...) VALUES (...), SELECT [DISTINCT] columns FROM name [WHERE column (=|<|<=|>|>=) literal | column BETWEEN literal AND literal | column IN (literal, ...) | text_column LIKE 'prefix%' [AND ...] [OR ...]] [ORDER BY selected_column [ASC|DESC]] [LIMIT n] [OFFSET n]")]
     InvalidRelationalSql,
     #[error("LIMIT must not be negative")]
     NegativeLimit,
@@ -1599,7 +1600,19 @@ fn parse_select(input: &str) -> Result<Select, ParseError> {
         .trim_start();
     let from_pos =
         find_keyword_outside_quotes(rest, "FROM").ok_or(ParseError::InvalidRelationalSql)?;
-    let projection = parse_projection(rest[..from_pos].trim())?;
+    let mut projection_input = rest[..from_pos].trim();
+    let distinct = if let Some(after_distinct) =
+        strip_keyword_prefix_case_insensitive(projection_input, "DISTINCT")
+    {
+        projection_input = after_distinct.trim_start();
+        true
+    } else {
+        false
+    };
+    let projection = parse_projection(projection_input)?;
+    if distinct && matches!(projection, SelectProjection::All) {
+        return Err(ParseError::InvalidRelationalSql);
+    }
     let mut tail = rest[from_pos + "FROM".len()..].trim_start();
     if let Some(after_only) = strip_keyword_prefix_case_insensitive(tail, "ONLY") {
         tail = after_only.trim_start();
@@ -1643,6 +1656,7 @@ fn parse_select(input: &str) -> Result<Select, ParseError> {
     let filters = filter_groups.first().cloned().unwrap_or_default();
     Ok(Select {
         table,
+        distinct,
         projection,
         filter: filters.first().cloned(),
         filters,
@@ -8499,6 +8513,7 @@ mod tests {
             parse_command("SELECT id FROM people WHERE id = +1 LIMIT +1").unwrap(),
             Command::Select(Select {
                 table: "people".to_string(),
+                distinct: false,
                 projection: SelectProjection::Columns(vec!["id".to_string()]),
                 filter: Some(SelectFilter {
                     column: "id".to_string(),
@@ -8524,6 +8539,7 @@ mod tests {
             parse_command("SELECT id FROM public.people WHERE id = 1").unwrap(),
             Command::Select(Select {
                 table: "people".to_string(),
+                distinct: false,
                 projection: SelectProjection::Columns(vec!["id".to_string()]),
                 filter: Some(SelectFilter {
                     column: "id".to_string(),
@@ -8549,6 +8565,7 @@ mod tests {
             parse_command("SELECT id, name FROM ONLY public.people").unwrap(),
             Command::Select(Select {
                 table: "people".to_string(),
+                distinct: false,
                 projection: SelectProjection::Columns(vec!["id".to_string(), "name".to_string()]),
                 filter: None,
                 filters: Vec::new(),
@@ -8571,6 +8588,7 @@ mod tests {
             parse_command("SELECT id FROM people ORDER BY id LIMIT 2 OFFSET 1").unwrap(),
             Command::Select(Select {
                 table: "people".to_string(),
+                distinct: false,
                 projection: SelectProjection::Columns(vec!["id".to_string()]),
                 filter: None,
                 filters: Vec::new(),
@@ -8587,6 +8605,7 @@ mod tests {
             parse_command("SELECT id FROM people ORDER BY id OFFSET 1 LIMIT 2").unwrap(),
             Command::Select(Select {
                 table: "people".to_string(),
+                distinct: false,
                 projection: SelectProjection::Columns(vec!["id".to_string()]),
                 filter: None,
                 filters: Vec::new(),
@@ -8605,6 +8624,7 @@ mod tests {
                 .unwrap(),
             Command::Select(Select {
                 table: "people".to_string(),
+                distinct: false,
                 projection: SelectProjection::Columns(vec!["id".to_string(), "name".to_string()]),
                 filter: Some(SelectFilter {
                     column: "id".to_string(),
@@ -8634,6 +8654,7 @@ mod tests {
             parse_command("SELECT name FROM people WHERE id >= 2 ORDER BY id LIMIT 5").unwrap(),
             Command::Select(Select {
                 table: "people".to_string(),
+                distinct: false,
                 projection: SelectProjection::Columns(vec!["name".to_string()]),
                 filter: Some(SelectFilter {
                     column: "id".to_string(),
@@ -8663,6 +8684,7 @@ mod tests {
             parse_command("SELECT name FROM people WHERE 2 <= id ORDER BY id LIMIT 5").unwrap(),
             Command::Select(Select {
                 table: "people".to_string(),
+                distinct: false,
                 projection: SelectProjection::Columns(vec!["name".to_string()]),
                 filter: Some(SelectFilter {
                     column: "id".to_string(),
@@ -8695,6 +8717,7 @@ mod tests {
             .unwrap(),
             Command::Select(Select {
                 table: "people".to_string(),
+                distinct: false,
                 projection: SelectProjection::Columns(vec!["name".to_string()]),
                 filter: Some(SelectFilter {
                     column: "id".to_string(),
@@ -8724,6 +8747,7 @@ mod tests {
             parse_command("SELECT name FROM people WHERE name = 'O''Brien'").unwrap(),
             Command::Select(Select {
                 table: "people".to_string(),
+                distinct: false,
                 projection: SelectProjection::Columns(vec!["name".to_string()]),
                 filter: Some(SelectFilter {
                     column: "name".to_string(),
@@ -8753,6 +8777,7 @@ mod tests {
             .unwrap(),
             Command::Select(Select {
                 table: "people".to_string(),
+                distinct: false,
                 projection: SelectProjection::Columns(vec!["id".to_string(), "name".to_string()]),
                 filter: Some(SelectFilter {
                     column: "id".to_string(),
@@ -8789,6 +8814,7 @@ mod tests {
             parse_command("SELECT name FROM people WHERE id >= 2 AND name = 'Ada'").unwrap(),
             Command::Select(Select {
                 table: "people".to_string(),
+                distinct: false,
                 projection: SelectProjection::Columns(vec!["name".to_string()]),
                 filter: Some(SelectFilter {
                     column: "id".to_string(),
@@ -8829,6 +8855,7 @@ mod tests {
             parse_command("SELECT name FROM people WHERE id = 1 OR name = 'Ada'").unwrap(),
             Command::Select(Select {
                 table: "people".to_string(),
+                distinct: false,
                 projection: SelectProjection::Columns(vec!["name".to_string()]),
                 filter: Some(SelectFilter {
                     column: "id".to_string(),
@@ -8862,6 +8889,7 @@ mod tests {
             parse_command("SELECT name FROM people WHERE (id = 1) OR (name = 'Ada')").unwrap(),
             Command::Select(Select {
                 table: "people".to_string(),
+                distinct: false,
                 projection: SelectProjection::Columns(vec!["name".to_string()]),
                 filter: Some(SelectFilter {
                     column: "id".to_string(),
@@ -8898,6 +8926,7 @@ mod tests {
             .unwrap(),
             Command::Select(Select {
                 table: "people".to_string(),
+                distinct: false,
                 projection: SelectProjection::Columns(vec!["id".to_string()]),
                 filter: Some(SelectFilter {
                     column: "id".to_string(),
@@ -8982,6 +9011,7 @@ mod tests {
             parse_command("SELECT id FROM people WHERE id IN (1, 3, 5) ORDER BY id").unwrap(),
             Command::Select(Select {
                 table: "people".to_string(),
+                distinct: false,
                 projection: SelectProjection::Columns(vec!["id".to_string()]),
                 filter: Some(SelectFilter {
                     column: "id".to_string(),
@@ -9024,6 +9054,7 @@ mod tests {
                 .unwrap(),
             Command::Select(Select {
                 table: "people".to_string(),
+                distinct: false,
                 projection: SelectProjection::Columns(vec!["name".to_string()]),
                 filter: Some(SelectFilter {
                     column: "name".to_string(),
@@ -9090,6 +9121,7 @@ mod tests {
             parse_command("SELECT id FROM people WHERE id BETWEEN 2 AND 4 ORDER BY id").unwrap(),
             Command::Select(Select {
                 table: "people".to_string(),
+                distinct: false,
                 projection: SelectProjection::Columns(vec!["id".to_string()]),
                 filter: Some(SelectFilter {
                     column: "id".to_string(),
@@ -9134,6 +9166,7 @@ mod tests {
                 .unwrap(),
             Command::Select(Select {
                 table: "people".to_string(),
+                distinct: false,
                 projection: SelectProjection::Columns(vec!["name".to_string()]),
                 filter: Some(SelectFilter {
                     column: "name".to_string(),
@@ -9189,6 +9222,7 @@ mod tests {
             parse_command("SELECT id FROM people WHERE name LIKE 'Gra%' ORDER BY id").unwrap(),
             Command::Select(Select {
                 table: "people".to_string(),
+                distinct: false,
                 projection: SelectProjection::Columns(vec!["id".to_string()]),
                 filter: Some(SelectFilter {
                     column: "name".to_string(),
@@ -9218,6 +9252,7 @@ mod tests {
             parse_command("SELECT name FROM people WHERE name LIKE 'A%' OR id = 3").unwrap(),
             Command::Select(Select {
                 table: "people".to_string(),
+                distinct: false,
                 projection: SelectProjection::Columns(vec!["name".to_string()]),
                 filter: Some(SelectFilter {
                     column: "name".to_string(),
@@ -9257,6 +9292,47 @@ mod tests {
         ));
         assert!(matches!(
             parse_command("SELECT id FROM people WHERE name LIKE 'A_a%'"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+    }
+
+    #[test]
+    fn parses_relational_select_distinct_projection() {
+        assert_eq!(
+            parse_command(
+                "SELECT DISTINCT name, id FROM people WHERE name LIKE 'G%' ORDER BY name DESC LIMIT 2 OFFSET 1",
+            )
+            .unwrap(),
+            Command::Select(Select {
+                table: "people".to_string(),
+                distinct: true,
+                projection: SelectProjection::Columns(vec!["name".to_string(), "id".to_string()]),
+                filter: Some(SelectFilter {
+                    column: "name".to_string(),
+                    op: SelectFilterOp::LikePrefix,
+                    value: SqlValue::Text("G".to_string()),
+                }),
+                filters: vec![SelectFilter {
+                    column: "name".to_string(),
+                    op: SelectFilterOp::LikePrefix,
+                    value: SqlValue::Text("G".to_string()),
+                }],
+                filter_groups: vec![vec![SelectFilter {
+                    column: "name".to_string(),
+                    op: SelectFilterOp::LikePrefix,
+                    value: SqlValue::Text("G".to_string()),
+                }]],
+                order_by: Some(SelectOrder {
+                    column: "name".to_string(),
+                    descending: true,
+                }),
+                limit: Some(2),
+                offset: Some(1),
+            })
+        );
+
+        assert!(matches!(
+            parse_command("SELECT DISTINCT * FROM people"),
             Err(ParseError::InvalidRelationalSql)
         ));
     }

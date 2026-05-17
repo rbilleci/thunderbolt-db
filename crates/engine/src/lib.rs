@@ -6248,6 +6248,24 @@ fn bind_relational_select(
             relational_column_index(table, &order.column).map(|idx| (idx, order.descending))
         })
         .transpose()?;
+    if select.distinct {
+        match &select.projection {
+            SelectProjection::All => {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "SELECT DISTINCT * is unsupported".to_string(),
+                )));
+            }
+            SelectProjection::Columns(columns) => {
+                if let Some(order) = &select.order_by {
+                    if !columns.iter().any(|column| column == &order.column) {
+                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                            "SELECT DISTINCT ORDER BY must reference a selected column".to_string(),
+                        )));
+                    }
+                }
+            }
+        }
+    }
 
     Ok(BoundRelationalSelect {
         selected_columns,
@@ -6264,6 +6282,9 @@ fn relational_select_pushes_limit(select: &Select) -> bool {
 }
 
 fn relational_select_pushed_limit(select: &Select, ordered_access_path: bool) -> Option<usize> {
+    if select.distinct {
+        return None;
+    }
     let can_push = select.order_by.is_none() || ordered_access_path;
     if !can_push {
         return None;
@@ -6277,6 +6298,9 @@ fn relational_select_limit_satisfied_by_access_path(
     select: &Select,
     access_path: &RelationalAccessPath,
 ) -> bool {
+    if select.distinct {
+        return false;
+    }
     select.offset.is_none()
         && (relational_select_pushes_limit(select)
             || (select.limit.is_some()
@@ -6303,6 +6327,7 @@ fn relational_select_needs_host_sql_finalization(
             && !matches!(access_path, RelationalAccessPath::OrderedKeyBatch { .. }))
         || (select.limit.is_some()
             && select.offset.is_none()
+            && !select.distinct
             && !relational_select_limit_satisfied_by_access_path(select, access_path))
 }
 
@@ -7502,6 +7527,49 @@ impl Engine {
                 continue;
             }
             rows.push(decoded);
+        }
+
+        if select.distinct {
+            let mut projected = Vec::new();
+            let mut seen = BTreeSet::new();
+            for row in rows {
+                let selected = bound
+                    .selected_indexes
+                    .iter()
+                    .map(|idx| row[*idx].clone())
+                    .collect::<Vec<_>>();
+                if seen.insert(selected.clone()) {
+                    projected.push(selected);
+                }
+            }
+            if let Some((order_idx, descending)) = &bound.order {
+                let selected_order_idx = bound
+                    .selected_indexes
+                    .iter()
+                    .position(|idx| idx == order_idx)
+                    .expect("DISTINCT ORDER BY was validated against selected columns");
+                projected.sort_by(|left, right| {
+                    compare_sql_values(&left[selected_order_idx], &right[selected_order_idx])
+                });
+                if *descending {
+                    projected.reverse();
+                }
+            }
+            if let Some(offset) = select.offset {
+                projected = projected.into_iter().skip(offset).collect();
+            }
+            if let Some(limit) = select.limit {
+                projected.truncate(limit);
+            }
+
+            return Ok(RelationalSelectResult {
+                columns: bound.selected_columns,
+                rows: projected,
+                planned_target: mvcc_result.planned_target,
+                executed_target: mvcc_result.executed_target,
+                fallback_reason: mvcc_result.fallback_reason,
+                access_path,
+            });
         }
 
         if !matches!(access_path, RelationalAccessPath::OrderedKeyBatch { .. }) {
@@ -23402,6 +23470,50 @@ mod tests {
     }
 
     #[test]
+    fn relational_sql_gpu_bridge_distinct_projection_keeps_gpu_row_fetch() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO people (id, name) VALUES (1, 'Ada'), (2, 'Grace'), (3, 'Grace'), (4, 'Linus')",
+        )
+        .unwrap();
+
+        let Command::Select(select) =
+            parse_command("SELECT DISTINCT name FROM people ORDER BY name DESC LIMIT 2 OFFSET 1")
+                .unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let result = e
+            .execute_relational_select_with_backend(&select, &FirstCudaSliceParityBackend)
+            .unwrap();
+
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![SqlValue::Text("Grace".to_string())],
+                vec![SqlValue::Text("Ada".to_string())],
+            ]
+        );
+        assert_eq!(result.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.fallback_reason, None);
+        assert_eq!(
+            result.access_path,
+            RelationalAccessPath::OrderedKeyBatch {
+                table: "people".to_string(),
+                predicate_column: None,
+                predicate_op: None,
+                order_column: "name".to_string(),
+                descending: true,
+                matched_keys: 4,
+            }
+        );
+    }
+
+    #[test]
     fn relational_sql_equality_predicate_and_limit_push_down_to_gpu_bridge() {
         let mut e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
@@ -24288,6 +24400,16 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("column \"missing\" does not exist"));
+
+        let Command::Select(bad_distinct) =
+            parse_command("SELECT DISTINCT name FROM people ORDER BY id").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        assert!(bind_relational_select(table, &bad_distinct)
+            .unwrap_err()
+            .to_string()
+            .contains("SELECT DISTINCT ORDER BY must reference a selected column"));
     }
 
     #[test]

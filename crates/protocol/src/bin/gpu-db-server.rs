@@ -166,6 +166,38 @@ fn execute_select_result(
             selected
         }
     };
+    if select.distinct {
+        match &select.projection {
+            SelectProjection::All => {
+                return Err(ErrorField {
+                    code: "0A000",
+                    message: "SELECT DISTINCT * is unsupported",
+                    position: None,
+                });
+            }
+            SelectProjection::Columns(columns) => {
+                if let Some(order) = &select.order_by {
+                    if !columns.iter().any(|column| column == &order.column) {
+                        return Err(ErrorField {
+                            code: "0A000",
+                            message: "SELECT DISTINCT ORDER BY must reference a selected column",
+                            position: None,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    let selected_indexes = selected_columns
+        .iter()
+        .map(|selected| {
+            table
+                .columns
+                .iter()
+                .position(|column| column.def.name == selected.def.name)
+                .expect("selected column came from table")
+        })
+        .collect::<Vec<_>>();
     let mut rows = Vec::new();
     for row in &table.rows {
         match row_matches_select_filters(table, row, select) {
@@ -173,6 +205,59 @@ fn execute_select_result(
             Ok(false) => {}
             Err(error) => return Err(error),
         }
+    }
+    if select.distinct {
+        let mut projected = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for row in &rows {
+            let selected = selected_indexes
+                .iter()
+                .map(|idx| row[*idx].clone())
+                .collect::<Vec<_>>();
+            if seen.insert(selected.clone()) {
+                projected.push(selected);
+            }
+        }
+        if let Some(order) = &select.order_by {
+            let Some(selected_order_idx) = selected_columns
+                .iter()
+                .position(|column| column.def.name == order.column)
+            else {
+                return Err(ErrorField {
+                    code: "42703",
+                    message: "column does not exist",
+                    position: None,
+                });
+            };
+            projected.sort_by(|left, right| {
+                compare_sql_values(&left[selected_order_idx], &right[selected_order_idx])
+            });
+            if order.descending {
+                projected.reverse();
+            }
+        }
+        if let Some(offset) = select.offset {
+            projected = projected.into_iter().skip(offset).collect();
+        }
+        if let Some(limit) = select.limit {
+            projected.truncate(limit);
+        }
+        let columns = selected_columns
+            .iter()
+            .map(|column| match column.def.ty {
+                gpu_db_protocol::SqlType::Int4 => int4_column(&column.def.name),
+                gpu_db_protocol::SqlType::Text => text_column(&column.def.name),
+            })
+            .collect::<Vec<_>>();
+        let rows = projected
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|value| Some(format_sql_value(value)))
+                    .collect()
+            })
+            .collect::<Vec<_>>();
+        return Ok(SelectResult { columns, rows });
     }
     if let Some(order) = &select.order_by {
         let Some(idx) = table
@@ -197,16 +282,6 @@ fn execute_select_result(
     if let Some(limit) = select.limit {
         rows.truncate(limit);
     }
-    let selected_indexes = selected_columns
-        .iter()
-        .map(|selected| {
-            table
-                .columns
-                .iter()
-                .position(|column| column.def.name == selected.def.name)
-                .expect("selected column came from table")
-        })
-        .collect::<Vec<_>>();
     let columns = selected_columns
         .iter()
         .map(|column| match column.def.ty {
@@ -15251,6 +15326,38 @@ mod tests {
         assert_eq!(
             result.rows,
             vec![vec![Some("2".to_string()), Some("Linus".to_string())]]
+        );
+        session
+            .tables
+            .get_mut("people")
+            .unwrap()
+            .rows
+            .push(vec![SqlValue::Int4(4), SqlValue::Text("Grace".to_string())]);
+        let Command::Select(select) =
+            parse_command("select distinct name from people order by name desc limit 2 offset 1")
+                .unwrap()
+        else {
+            panic!("expected supported SELECT");
+        };
+        let result = execute_select_result(&session, &select).unwrap();
+        assert_eq!(result.columns, vec![text_column("name")]);
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![Some("Grace".to_string())],
+                vec![Some("Ada".to_string())],
+            ]
+        );
+        let Command::Select(select) =
+            parse_command("select distinct name from people order by id").unwrap()
+        else {
+            panic!("expected supported SELECT parse");
+        };
+        let err = execute_select_result(&session, &select).unwrap_err();
+        assert_eq!(err.code, "0A000");
+        assert_eq!(
+            err.message,
+            "SELECT DISTINCT ORDER BY must reference a selected column"
         );
 
         assert_eq!(

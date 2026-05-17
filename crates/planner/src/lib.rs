@@ -146,6 +146,7 @@ mod tests {
         let planner = Planner::default();
         let plan = planner.plan_command(&Command::Select(gpu_db_protocol::Select {
             table: "people".to_string(),
+            distinct: false,
             projection: gpu_db_protocol::SelectProjection::All,
             filter: None,
             filters: Vec::new(),
@@ -176,6 +177,7 @@ mod tests {
             },
             Command::Select(gpu_db_protocol::Select {
                 table: "t".to_string(),
+                distinct: false,
                 projection: gpu_db_protocol::SelectProjection::All,
                 filter: None,
                 filters: Vec::new(),
