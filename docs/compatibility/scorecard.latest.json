@@ -9,8 +9,8 @@
     "execution.gpu_routing_and_batching": {
       "failed": 0,
       "ignored": 0,
-      "passed": 81,
-      "total": 81
+      "passed": 82,
+      "total": 82
     },
     "protocol.client_flows": {
       "failed": 0,
@@ -89,8 +89,8 @@
   "totals": {
     "failed": 0,
     "ignored": 0,
-    "passed": 1034,
-    "total": 1034
+    "passed": 1035,
+    "total": 1035
   },
   "trend_hook": {
     "baseline_available": true,
