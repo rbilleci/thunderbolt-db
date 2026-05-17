@@ -14,3 +14,5 @@ SELECT id, name FROM people WHERE (id = 1) OR (name = 'Grace') ORDER BY id LIMIT
 SELECT id, name FROM people WHERE (id = 1 OR id = 3) AND (name = 'Ada' OR name = 'Grace') ORDER BY id;
 \echo === relational in membership filter ===
 SELECT id, name FROM people WHERE id IN (1, 3) ORDER BY id DESC;
+\echo === relational between filter ===
+SELECT id, name FROM people WHERE id BETWEEN 2 AND 3 ORDER BY id DESC;

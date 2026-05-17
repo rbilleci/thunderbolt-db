@@ -47,3 +47,10 @@ INSERT 0 3
   3 | Grace
   1 | Ada
 (2 rows)
+
+=== relational between filter ===
+ id | name
+----+-------
+  3 | Grace
+  2 | Linus
+(2 rows)

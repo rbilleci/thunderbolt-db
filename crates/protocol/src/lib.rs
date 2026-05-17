@@ -1710,7 +1710,7 @@ fn parse_select_filter_or_groups(input: &str) -> Result<Vec<Vec<SelectFilter>>, 
 }
 
 fn parse_select_filter_and_groups(input: &str) -> Result<Vec<Vec<SelectFilter>>, ParseError> {
-    let parts = split_keyword_chain_outside_quotes(input, "AND")?;
+    let parts = split_select_and_chain_outside_quotes(input)?;
     if parts.len() == 1 {
         return parse_select_filter_factor(input);
     }
@@ -1738,10 +1738,41 @@ fn parse_select_filter_factor(input: &str) -> Result<Vec<Vec<SelectFilter>>, Par
             return parse_select_filter_or_groups(&input[1..close]);
         }
     }
+    if let Some(group) = parse_select_between_filter_group(input)? {
+        return Ok(vec![group]);
+    }
     if let Some(groups) = parse_select_in_filter_groups(input)? {
         return Ok(groups);
     }
     Ok(vec![vec![parse_select_filter(input)?]])
+}
+
+fn parse_select_between_filter_group(input: &str) -> Result<Option<Vec<SelectFilter>>, ParseError> {
+    let Some(pos) = find_keyword_outside_quotes(input, "BETWEEN") else {
+        return Ok(None);
+    };
+    let column = normalize_identifier(input[..pos].trim())?;
+    let bounds = input[pos + "BETWEEN".len()..].trim();
+    let Some(and_pos) = find_keyword_outside_quotes(bounds, "AND") else {
+        return Err(ParseError::InvalidRelationalSql);
+    };
+    let lower = bounds[..and_pos].trim();
+    let upper = bounds[and_pos + "AND".len()..].trim();
+    if lower.is_empty() || upper.is_empty() {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    Ok(Some(vec![
+        SelectFilter {
+            column: column.clone(),
+            op: SelectFilterOp::Gte,
+            value: parse_sql_value(lower)?,
+        },
+        SelectFilter {
+            column,
+            op: SelectFilterOp::Lte,
+            value: parse_sql_value(upper)?,
+        },
+    ]))
 }
 
 fn parse_select_in_filter_groups(
@@ -2082,6 +2113,78 @@ fn split_keyword_chain_outside_quotes<'a>(
         input = input[pos + keyword.len()..].trim_start();
     }
     let tail = input.trim();
+    if tail.is_empty() {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    parts.push(tail);
+    Ok(parts)
+}
+
+fn split_select_and_chain_outside_quotes(input: &str) -> Result<Vec<&str>, ParseError> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut in_quote = false;
+    let mut depth = 0usize;
+    let mut skip_next_and = false;
+    let bytes = input.as_bytes();
+    let lower = input.to_ascii_lowercase();
+    let mut idx = 0usize;
+
+    while idx < bytes.len() {
+        if bytes[idx] == b'\'' {
+            if in_quote && bytes.get(idx + 1) == Some(&b'\'') {
+                idx += 2;
+                continue;
+            }
+            in_quote = !in_quote;
+            idx += 1;
+            continue;
+        }
+        match bytes[idx] {
+            b'(' if !in_quote => {
+                depth += 1;
+                idx += 1;
+                continue;
+            }
+            b')' if !in_quote => {
+                depth = depth.saturating_sub(1);
+                idx += 1;
+                continue;
+            }
+            _ => {}
+        }
+        if !in_quote
+            && depth == 0
+            && lower[idx..].starts_with("between")
+            && is_keyword_boundary(input, idx, "between".len())
+        {
+            skip_next_and = true;
+            idx += "between".len();
+            continue;
+        }
+        if !in_quote
+            && depth == 0
+            && lower[idx..].starts_with("and")
+            && is_keyword_boundary(input, idx, "and".len())
+        {
+            if skip_next_and {
+                skip_next_and = false;
+                idx += "and".len();
+                continue;
+            }
+            let part = input[start..idx].trim();
+            if part.is_empty() {
+                return Err(ParseError::InvalidRelationalSql);
+            }
+            parts.push(part);
+            idx += "and".len();
+            start = idx;
+            continue;
+        }
+        idx += 1;
+    }
+
+    let tail = input[start..].trim();
     if tail.is_empty() {
         return Err(ParseError::InvalidRelationalSql);
     }
@@ -8880,6 +8983,103 @@ mod tests {
         ));
         assert!(matches!(
             parse_command("SELECT id FROM people WHERE id NOT IN (1, 2)"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+    }
+
+    #[test]
+    fn parses_relational_select_between_predicates_as_filter_groups() {
+        assert_eq!(
+            parse_command("SELECT id FROM people WHERE id BETWEEN 2 AND 4 ORDER BY id").unwrap(),
+            Command::Select(Select {
+                table: "people".to_string(),
+                projection: SelectProjection::Columns(vec!["id".to_string()]),
+                filter: Some(SelectFilter {
+                    column: "id".to_string(),
+                    op: SelectFilterOp::Gte,
+                    value: SqlValue::Int4(2),
+                }),
+                filters: vec![
+                    SelectFilter {
+                        column: "id".to_string(),
+                        op: SelectFilterOp::Gte,
+                        value: SqlValue::Int4(2),
+                    },
+                    SelectFilter {
+                        column: "id".to_string(),
+                        op: SelectFilterOp::Lte,
+                        value: SqlValue::Int4(4),
+                    },
+                ],
+                filter_groups: vec![vec![
+                    SelectFilter {
+                        column: "id".to_string(),
+                        op: SelectFilterOp::Gte,
+                        value: SqlValue::Int4(2),
+                    },
+                    SelectFilter {
+                        column: "id".to_string(),
+                        op: SelectFilterOp::Lte,
+                        value: SqlValue::Int4(4),
+                    },
+                ]],
+                order_by: Some(SelectOrder {
+                    column: "id".to_string(),
+                    descending: false,
+                }),
+                limit: None,
+            })
+        );
+
+        assert_eq!(
+            parse_command("SELECT name FROM people WHERE name BETWEEN 'Ada' AND 'Grace' OR id = 4")
+                .unwrap(),
+            Command::Select(Select {
+                table: "people".to_string(),
+                projection: SelectProjection::Columns(vec!["name".to_string()]),
+                filter: Some(SelectFilter {
+                    column: "name".to_string(),
+                    op: SelectFilterOp::Gte,
+                    value: SqlValue::Text("Ada".to_string()),
+                }),
+                filters: vec![
+                    SelectFilter {
+                        column: "name".to_string(),
+                        op: SelectFilterOp::Gte,
+                        value: SqlValue::Text("Ada".to_string()),
+                    },
+                    SelectFilter {
+                        column: "name".to_string(),
+                        op: SelectFilterOp::Lte,
+                        value: SqlValue::Text("Grace".to_string()),
+                    },
+                ],
+                filter_groups: vec![
+                    vec![
+                        SelectFilter {
+                            column: "name".to_string(),
+                            op: SelectFilterOp::Gte,
+                            value: SqlValue::Text("Ada".to_string()),
+                        },
+                        SelectFilter {
+                            column: "name".to_string(),
+                            op: SelectFilterOp::Lte,
+                            value: SqlValue::Text("Grace".to_string()),
+                        },
+                    ],
+                    vec![SelectFilter {
+                        column: "id".to_string(),
+                        op: SelectFilterOp::Eq,
+                        value: SqlValue::Int4(4),
+                    }],
+                ],
+                order_by: None,
+                limit: None,
+            })
+        );
+
+        assert!(matches!(
+            parse_command("SELECT id FROM people WHERE id NOT BETWEEN 1 AND 3"),
             Err(ParseError::InvalidRelationalSql)
         ));
     }
