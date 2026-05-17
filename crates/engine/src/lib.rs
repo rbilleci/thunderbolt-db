@@ -8276,16 +8276,38 @@ impl Engine {
         &mut self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
+        self.execute_relational_grouped_aggregate_with_resident_device_memory_probe(select)
+    }
+
+    pub fn execute_relational_grouped_aggregate_with_resident_device_memory_probe(
+        &mut self,
+        select: &Select,
+    ) -> Result<RelationalSelectResult, ExecuteError> {
         let (table, bound) = self.bind_relational_select_for_execution(select)?;
-        let SelectProjection::GroupedSum {
-            group_column,
-            sum_column,
-        } = &select.projection
-        else {
-            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "resident device-memory grouped SUM proof currently supports only SELECT int4_group, SUM(int4_column) GROUP BY int4_group"
-                    .to_string(),
-            )));
+        let (group_column, value_column) = match &select.projection {
+            SelectProjection::GroupedCount { column } => (column, column),
+            SelectProjection::GroupedSum {
+                group_column,
+                sum_column,
+            } => (group_column, sum_column),
+            SelectProjection::GroupedAvg {
+                group_column,
+                avg_column,
+            } => (group_column, avg_column),
+            SelectProjection::GroupedMin {
+                group_column,
+                min_column,
+            } => (group_column, min_column),
+            SelectProjection::GroupedMax {
+                group_column,
+                max_column,
+            } => (group_column, max_column),
+            _ => {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "resident device-memory grouped aggregate proof currently supports only grouped COUNT/SUM/AVG/MIN/MAX"
+                        .to_string(),
+                )));
+            }
         };
         if select.distinct
             || !select.having_groups.is_empty()
@@ -8295,28 +8317,28 @@ impl Engine {
             || select.offset.is_some()
         {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "resident device-memory grouped SUM proof currently supports only unfiltered grouped SUM with optional ORDER BY and LIMIT"
+                "resident device-memory grouped aggregate proof currently supports only unfiltered grouped aggregates with optional ORDER BY and LIMIT"
                     .to_string(),
             )));
         }
         let Some(group_by) = &select.group_by else {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "resident device-memory grouped SUM proof requires GROUP BY".to_string(),
+                "resident device-memory grouped aggregate proof requires GROUP BY".to_string(),
             )));
         };
         if !group_by.eq_ignore_ascii_case(group_column) {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "resident device-memory grouped SUM proof requires GROUP BY to match the projected group column"
+                "resident device-memory grouped aggregate proof requires GROUP BY to match the projected group column"
                     .to_string(),
             )));
         }
         let group_idx = relational_column_index(&table, group_column)?;
-        let sum_idx = relational_column_index(&table, sum_column)?;
+        let value_idx = relational_column_index(&table, value_column)?;
         if table.columns[group_idx].ty != SqlType::Int4
-            || table.columns[sum_idx].ty != SqlType::Int4
+            || table.columns[value_idx].ty != SqlType::Int4
         {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "resident device-memory grouped SUM proof currently supports only int4 group and sum columns"
+                "resident device-memory grouped aggregate proof currently supports only int4 group and value columns"
                     .to_string(),
             )));
         }
@@ -8351,7 +8373,7 @@ impl Engine {
                 )))
             })?;
         let group_offset = resident_device_int4_column_offset(&snapshot, &table, group_idx)?;
-        let sum_offset = resident_device_int4_column_offset(&snapshot, &table, sum_idx)?;
+        let value_offset = resident_device_int4_column_offset(&snapshot, &table, value_idx)?;
         let row_count = u64::try_from(snapshot.row_count).map_err(|_| {
             ExecuteError::Engine(EngineError::ApplyFailed(
                 "resident snapshot row count exceeds retained device-memory proof range"
@@ -8359,31 +8381,69 @@ impl Engine {
             ))
         })?;
         let started = Instant::now();
-        let mut groups = device_memory
-            .grouped_sum_i32_from_payload(group_offset, sum_offset, row_count)
+        let mut grouped_stats = device_memory
+            .grouped_stats_i32_from_payload(group_offset, value_offset, row_count)
             .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
         let elapsed = started.elapsed();
-        groups.sort_by_key(|group| group.group);
+        let copied_group_count = grouped_stats.len();
+        let mut rows = grouped_stats
+            .drain(..)
+            .map(|group| {
+                let aggregate: SqlValue = match &select.projection {
+                    SelectProjection::GroupedCount { .. } => {
+                        let count = i32::try_from(group.count).map_err(|_| {
+                            ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                                "resident device-memory grouped count {} exceeds supported COUNT(*) result range",
+                                group.count
+                            )))
+                        })?;
+                        Ok::<SqlValue, ExecuteError>(SqlValue::Int4(count))
+                    }
+                    SelectProjection::GroupedSum { .. } => {
+                        Ok::<SqlValue, ExecuteError>(SqlValue::Int8(group.sum))
+                    }
+                    SelectProjection::GroupedAvg { .. } => {
+                        Ok::<SqlValue, ExecuteError>(average_sql_value(
+                            i128::from(group.sum),
+                            group.count as usize,
+                        ))
+                    }
+                    SelectProjection::GroupedMin { .. } => {
+                        Ok::<SqlValue, ExecuteError>(SqlValue::Int4(group.min))
+                    }
+                    SelectProjection::GroupedMax { .. } => {
+                        Ok::<SqlValue, ExecuteError>(SqlValue::Int4(group.max))
+                    }
+                    _ => unreachable!(),
+                }?;
+                Ok(vec![SqlValue::Int4(group.group), aggregate])
+            })
+            .collect::<Result<Vec<_>, ExecuteError>>()?;
+        rows.sort_by(|left, right| compare_sql_values(&left[0], &right[0]));
         if let Some(order) = &select.order_by {
             let order_by_sum = select_is_aggregate_result_column(select, &order.column);
-            groups.sort_by(|left, right| {
+            rows.sort_by(|left, right| {
                 let ordering = if order_by_sum {
-                    left.sum.cmp(&right.sum)
+                    compare_sql_values(&left[1], &right[1])
                 } else {
-                    left.group.cmp(&right.group)
+                    compare_sql_values(&left[0], &right[0])
                 };
-                ordering.then_with(|| left.group.cmp(&right.group))
+                ordering.then_with(|| compare_sql_values(&left[0], &right[0]))
             });
             if order.descending {
-                groups.reverse();
+                rows.reverse();
             }
         }
         if let Some(limit) = select.limit {
-            groups.truncate(limit);
+            rows.truncate(limit);
         }
-        let result_d2h_bytes = groups
-            .len()
-            .checked_mul(std::mem::size_of::<i32>() + std::mem::size_of::<i64>())
+        let result_d2h_bytes = copied_group_count
+            .checked_mul(
+                std::mem::size_of::<i32>()
+                    + std::mem::size_of::<u64>()
+                    + std::mem::size_of::<i64>()
+                    + (2 * std::mem::size_of::<i32>()),
+            )
             .and_then(|bytes| bytes.checked_add(std::mem::size_of::<u64>()))
             .and_then(|bytes| u64::try_from(bytes).ok())
             .unwrap_or(u64::MAX);
@@ -8393,10 +8453,7 @@ impl Engine {
 
         Ok(RelationalSelectResult {
             columns: bound.selected_columns,
-            rows: groups
-                .into_iter()
-                .map(|group| vec![SqlValue::Int4(group.group), SqlValue::Int8(group.sum)])
-                .collect(),
+            rows,
             planned_target: DeviceTarget::Gpu(snapshot.gpu_id),
             executed_target: DeviceTarget::Gpu(snapshot.gpu_id),
             fallback_reason: None,
@@ -12642,7 +12699,7 @@ mod tests {
     }
 
     #[test]
-    fn gpu_resident_device_memory_grouped_sum_probe_materializes_int4_results() {
+    fn gpu_resident_device_memory_grouped_aggregate_probe_materializes_int4_results() {
         let mut e = Engine::new_local();
         e.execute_text(
             1,
@@ -12686,10 +12743,33 @@ mod tests {
         assert_eq!(after.h2d_bytes_total - before.h2d_bytes_total, 0);
         assert_eq!(
             after.d2h_bytes_total - before.d2h_bytes_total,
-            2 * (std::mem::size_of::<i32>() + std::mem::size_of::<i64>()) as u64
+            3 * (std::mem::size_of::<i32>()
+                + std::mem::size_of::<u64>()
+                + std::mem::size_of::<i64>()
+                + (2 * std::mem::size_of::<i32>())) as u64
                 + std::mem::size_of::<u64>() as u64
         );
         assert_eq!(after.kernel_exec_samples - before.kernel_exec_samples, 1);
+
+        for sql in [
+            "SELECT bucket, COUNT(*) FROM events GROUP BY bucket ORDER BY count DESC LIMIT 2",
+            "SELECT bucket, AVG(amount) FROM events GROUP BY bucket ORDER BY avg DESC LIMIT 2",
+            "SELECT bucket, MIN(amount) FROM events GROUP BY bucket ORDER BY min DESC LIMIT 2",
+            "SELECT bucket, MAX(amount) FROM events GROUP BY bucket ORDER BY max DESC LIMIT 2",
+        ] {
+            let Command::Select(select) = parse_command(sql).unwrap() else {
+                unreachable!()
+            };
+            let cpu = e.execute_relational_select(&select).unwrap();
+            let resident = e
+                .execute_relational_grouped_aggregate_with_resident_device_memory_probe(&select)
+                .unwrap();
+            assert_eq!(resident.columns, cpu.columns, "{sql}");
+            assert_eq!(resident.rows, cpu.rows, "{sql}");
+            assert_eq!(resident.planned_target, DeviceTarget::Gpu(0));
+            assert_eq!(resident.executed_target, DeviceTarget::Gpu(0));
+            assert_eq!(resident.fallback_reason, None);
+        }
 
         e.execute_text(
             3,

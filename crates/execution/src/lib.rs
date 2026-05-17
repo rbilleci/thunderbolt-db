@@ -141,13 +141,18 @@ impl CudaResidentDeviceMemory {
         launch_cuda_resident_i32_sum(self, byte_offset, row_count)
     }
 
-    pub fn grouped_sum_i32_from_payload(
+    pub fn grouped_stats_i32_from_payload(
         &self,
         group_byte_offset: u64,
-        sum_byte_offset: u64,
+        value_byte_offset: u64,
         row_count: u64,
-    ) -> Result<Vec<CudaI32GroupedSum>, CudaRuntimeProbeError> {
-        launch_cuda_resident_i32_grouped_sum(self, group_byte_offset, sum_byte_offset, row_count)
+    ) -> Result<Vec<CudaI32GroupedStats>, CudaRuntimeProbeError> {
+        launch_cuda_resident_i32_grouped_stats(
+            self,
+            group_byte_offset,
+            value_byte_offset,
+            row_count,
+        )
     }
 
     pub fn project_i32_compare_from_payload(
@@ -209,9 +214,12 @@ impl CudaI32Comparison {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CudaI32GroupedSum {
+pub struct CudaI32GroupedStats {
     pub group: i32,
+    pub count: u64,
     pub sum: i64,
+    pub min: i32,
+    pub max: i32,
 }
 
 impl Drop for CudaResidentDeviceMemory {
@@ -1485,12 +1493,12 @@ done:
     Ok(output)
 }
 
-fn launch_cuda_resident_i32_grouped_sum(
+fn launch_cuda_resident_i32_grouped_stats(
     resident: &CudaResidentDeviceMemory,
     group_byte_offset: u64,
-    sum_byte_offset: u64,
+    value_byte_offset: u64,
     row_count: u64,
-) -> Result<Vec<CudaI32GroupedSum>, CudaRuntimeProbeError> {
+) -> Result<Vec<CudaI32GroupedStats>, CudaRuntimeProbeError> {
     type CuMemAlloc = unsafe extern "C" fn(*mut u64, usize) -> i32;
     type CuMemFree = unsafe extern "C" fn(u64) -> i32;
     type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
@@ -1518,13 +1526,16 @@ fn launch_cuda_resident_i32_grouped_sum(
 .target sm_30
 .address_size 64
 
-.visible .entry gpu_db_resident_i32_grouped_sum(
+.visible .entry gpu_db_resident_i32_grouped_stats(
     .param .u64 resident_ptr,
     .param .u64 group_byte_offset,
-    .param .u64 sum_byte_offset,
+    .param .u64 value_byte_offset,
     .param .u64 row_count,
     .param .u64 out_groups_ptr,
+    .param .u64 out_counts_ptr,
     .param .u64 out_sums_ptr,
+    .param .u64 out_mins_ptr,
+    .param .u64 out_maxs_ptr,
     .param .u64 out_count_ptr
 )
 {
@@ -1534,35 +1545,47 @@ fn launch_cuda_resident_i32_grouped_sum(
     .reg .pred %p_same;
     .reg .u64 %resident;
     .reg .u64 %group_offset;
-    .reg .u64 %sum_offset;
+    .reg .u64 %value_offset;
     .reg .u64 %rows;
     .reg .u64 %out_groups;
+    .reg .u64 %out_counts;
     .reg .u64 %out_sums;
+    .reg .u64 %out_mins;
+    .reg .u64 %out_maxs;
     .reg .u64 %out_count;
     .reg .u64 %group_base;
-    .reg .u64 %sum_base;
+    .reg .u64 %value_base;
     .reg .u64 %idx;
     .reg .u64 %scan;
     .reg .u64 %group_count;
     .reg .u64 %input_addr;
     .reg .u64 %output_addr;
     .reg .s32 %group_value;
-    .reg .s32 %sum_value;
+    .reg .s32 %value;
     .reg .s32 %existing_group;
-    .reg .s64 %sum_wide;
+    .reg .s64 %value_wide;
+    .reg .u64 %existing_count;
+    .reg .u64 %new_count;
     .reg .s64 %existing_sum;
     .reg .s64 %new_sum;
+    .reg .s32 %existing_min;
+    .reg .s32 %existing_max;
+    .reg .pred %p_less;
+    .reg .pred %p_greater;
 
     ld.param.u64 %resident, [resident_ptr];
     ld.param.u64 %group_offset, [group_byte_offset];
-    ld.param.u64 %sum_offset, [sum_byte_offset];
+    ld.param.u64 %value_offset, [value_byte_offset];
     ld.param.u64 %rows, [row_count];
     ld.param.u64 %out_groups, [out_groups_ptr];
+    ld.param.u64 %out_counts, [out_counts_ptr];
     ld.param.u64 %out_sums, [out_sums_ptr];
+    ld.param.u64 %out_mins, [out_mins_ptr];
+    ld.param.u64 %out_maxs, [out_maxs_ptr];
     ld.param.u64 %out_count, [out_count_ptr];
 
     add.u64 %group_base, %resident, %group_offset;
-    add.u64 %sum_base, %resident, %sum_offset;
+    add.u64 %value_base, %resident, %value_offset;
     mov.u64 %idx, 0;
     mov.u64 %group_count, 0;
 
@@ -1574,9 +1597,9 @@ row_loop:
     add.u64 %input_addr, %group_base, %input_addr;
     ld.global.s32 %group_value, [%input_addr];
     mul.lo.u64 %input_addr, %idx, 4;
-    add.u64 %input_addr, %sum_base, %input_addr;
-    ld.global.s32 %sum_value, [%input_addr];
-    cvt.s64.s32 %sum_wide, %sum_value;
+    add.u64 %input_addr, %value_base, %input_addr;
+    ld.global.s32 %value, [%input_addr];
+    cvt.s64.s32 %value_wide, %value;
 
     mov.u64 %scan, 0;
     mov.pred %p_found, 0;
@@ -1591,10 +1614,33 @@ scan_loop:
     @!%p_same bra scan_next;
 
     mul.lo.u64 %output_addr, %scan, 8;
+    add.u64 %output_addr, %out_counts, %output_addr;
+    ld.global.u64 %existing_count, [%output_addr];
+    add.u64 %new_count, %existing_count, 1;
+    st.global.u64 [%output_addr], %new_count;
+
+    mul.lo.u64 %output_addr, %scan, 8;
     add.u64 %output_addr, %out_sums, %output_addr;
     ld.global.s64 %existing_sum, [%output_addr];
-    add.s64 %new_sum, %existing_sum, %sum_wide;
+    add.s64 %new_sum, %existing_sum, %value_wide;
     st.global.s64 [%output_addr], %new_sum;
+
+    mul.lo.u64 %output_addr, %scan, 4;
+    add.u64 %output_addr, %out_mins, %output_addr;
+    ld.global.s32 %existing_min, [%output_addr];
+    setp.lt.s32 %p_less, %value, %existing_min;
+    @!%p_less bra keep_min;
+    st.global.s32 [%output_addr], %value;
+keep_min:
+
+    mul.lo.u64 %output_addr, %scan, 4;
+    add.u64 %output_addr, %out_maxs, %output_addr;
+    ld.global.s32 %existing_max, [%output_addr];
+    setp.gt.s32 %p_greater, %value, %existing_max;
+    @!%p_greater bra keep_max;
+    st.global.s32 [%output_addr], %value;
+keep_max:
+
     mov.pred %p_found, 1;
     bra next_row;
 
@@ -1608,8 +1654,18 @@ insert_or_next:
     add.u64 %output_addr, %out_groups, %output_addr;
     st.global.s32 [%output_addr], %group_value;
     mul.lo.u64 %output_addr, %group_count, 8;
+    add.u64 %output_addr, %out_counts, %output_addr;
+    mov.u64 %new_count, 1;
+    st.global.u64 [%output_addr], %new_count;
+    mul.lo.u64 %output_addr, %group_count, 8;
     add.u64 %output_addr, %out_sums, %output_addr;
-    st.global.s64 [%output_addr], %sum_wide;
+    st.global.s64 [%output_addr], %value_wide;
+    mul.lo.u64 %output_addr, %group_count, 4;
+    add.u64 %output_addr, %out_mins, %output_addr;
+    st.global.s32 [%output_addr], %value;
+    mul.lo.u64 %output_addr, %group_count, 4;
+    add.u64 %output_addr, %out_maxs, %output_addr;
+    st.global.s32 [%output_addr], %value;
     add.u64 %group_count, %group_count, 1;
 
 next_row:
@@ -1626,18 +1682,18 @@ done:
         .checked_mul(std::mem::size_of::<i32>() as u64)
         .and_then(|bytes| group_byte_offset.checked_add(bytes))
         .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
-    let sum_bytes = row_count
+    let value_bytes = row_count
         .checked_mul(std::mem::size_of::<i32>() as u64)
-        .and_then(|bytes| sum_byte_offset.checked_add(bytes))
+        .and_then(|bytes| value_byte_offset.checked_add(bytes))
         .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
     if group_bytes > resident.metadata.allocated_bytes {
         return Err(CudaRuntimeProbeError::InvalidInputLength(
             group_bytes as usize,
         ));
     }
-    if sum_bytes > resident.metadata.allocated_bytes {
+    if value_bytes > resident.metadata.allocated_bytes {
         return Err(CudaRuntimeProbeError::InvalidInputLength(
-            sum_bytes as usize,
+            value_bytes as usize,
         ));
     }
     if row_count == 0 {
@@ -1714,10 +1770,29 @@ done:
         ptr: device_groups,
         free: *cu_mem_free,
     };
+    let counts_output_bytes = sum_output_bytes;
+    let mut device_counts = 0_u64;
+    check_cuda(unsafe { cu_mem_alloc(&mut device_counts, counts_output_bytes) })?;
+    let counts_guard = CudaDeviceAllocationGuard {
+        ptr: device_counts,
+        free: *cu_mem_free,
+    };
     let mut device_sums = 0_u64;
     check_cuda(unsafe { cu_mem_alloc(&mut device_sums, sum_output_bytes) })?;
     let sums_guard = CudaDeviceAllocationGuard {
         ptr: device_sums,
+        free: *cu_mem_free,
+    };
+    let mut device_mins = 0_u64;
+    check_cuda(unsafe { cu_mem_alloc(&mut device_mins, group_output_bytes) })?;
+    let mins_guard = CudaDeviceAllocationGuard {
+        ptr: device_mins,
+        free: *cu_mem_free,
+    };
+    let mut device_maxs = 0_u64;
+    check_cuda(unsafe { cu_mem_alloc(&mut device_maxs, group_output_bytes) })?;
+    let maxs_guard = CudaDeviceAllocationGuard {
+        ptr: device_maxs,
         free: *cu_mem_free,
     };
     let mut device_count = 0_u64;
@@ -1743,24 +1818,30 @@ done:
         cu_module_get_function(
             &mut function,
             module,
-            c"gpu_db_resident_i32_grouped_sum".as_ptr(),
+            c"gpu_db_resident_i32_grouped_stats".as_ptr(),
         )
     })?;
 
     let mut resident_arg = resident.device_ptr;
     let mut group_offset_arg = group_byte_offset;
-    let mut sum_offset_arg = sum_byte_offset;
+    let mut value_offset_arg = value_byte_offset;
     let mut rows_arg = row_count;
     let mut groups_arg = groups_guard.ptr;
+    let mut counts_arg = counts_guard.ptr;
     let mut sums_arg = sums_guard.ptr;
+    let mut mins_arg = mins_guard.ptr;
+    let mut maxs_arg = maxs_guard.ptr;
     let mut count_arg = count_guard.ptr;
     let mut args = [
         (&mut resident_arg as *mut u64).cast::<c_void>(),
         (&mut group_offset_arg as *mut u64).cast::<c_void>(),
-        (&mut sum_offset_arg as *mut u64).cast::<c_void>(),
+        (&mut value_offset_arg as *mut u64).cast::<c_void>(),
         (&mut rows_arg as *mut u64).cast::<c_void>(),
         (&mut groups_arg as *mut u64).cast::<c_void>(),
+        (&mut counts_arg as *mut u64).cast::<c_void>(),
         (&mut sums_arg as *mut u64).cast::<c_void>(),
+        (&mut mins_arg as *mut u64).cast::<c_void>(),
+        (&mut maxs_arg as *mut u64).cast::<c_void>(),
         (&mut count_arg as *mut u64).cast::<c_void>(),
     ];
     check_cuda(unsafe {
@@ -1797,7 +1878,10 @@ done:
     let output_len = usize::try_from(output_count)
         .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
     let mut groups = vec![0_i32; output_len];
+    let mut counts = vec![0_u64; output_len];
     let mut sums = vec![0_i64; output_len];
+    let mut mins = vec![0_i32; output_len];
+    let mut maxs = vec![0_i32; output_len];
     if output_len > 0 {
         check_cuda(unsafe {
             cu_memcpy_dtoh(
@@ -1808,21 +1892,54 @@ done:
         })?;
         check_cuda(unsafe {
             cu_memcpy_dtoh(
+                counts.as_mut_ptr().cast::<c_void>(),
+                counts_guard.ptr,
+                output_len * std::mem::size_of::<u64>(),
+            )
+        })?;
+        check_cuda(unsafe {
+            cu_memcpy_dtoh(
                 sums.as_mut_ptr().cast::<c_void>(),
                 sums_guard.ptr,
                 output_len * std::mem::size_of::<i64>(),
+            )
+        })?;
+        check_cuda(unsafe {
+            cu_memcpy_dtoh(
+                mins.as_mut_ptr().cast::<c_void>(),
+                mins_guard.ptr,
+                output_len * std::mem::size_of::<i32>(),
+            )
+        })?;
+        check_cuda(unsafe {
+            cu_memcpy_dtoh(
+                maxs.as_mut_ptr().cast::<c_void>(),
+                maxs_guard.ptr,
+                output_len * std::mem::size_of::<i32>(),
             )
         })?;
     }
 
     drop(module_guard);
     drop(count_guard);
+    drop(maxs_guard);
+    drop(mins_guard);
     drop(sums_guard);
+    drop(counts_guard);
     drop(groups_guard);
     Ok(groups
         .into_iter()
+        .zip(counts)
         .zip(sums)
-        .map(|(group, sum)| CudaI32GroupedSum { group, sum })
+        .zip(mins)
+        .zip(maxs)
+        .map(|((((group, count), sum), min), max)| CudaI32GroupedStats {
+            group,
+            count,
+            sum,
+            min,
+            max,
+        })
         .collect())
 }
 

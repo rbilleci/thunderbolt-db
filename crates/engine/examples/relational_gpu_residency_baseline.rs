@@ -63,6 +63,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     ))?;
     let grouped_sum_query =
         select("SELECT bucket, SUM(amount) FROM events GROUP BY bucket ORDER BY sum DESC LIMIT 8")?;
+    let grouped_count_query =
+        select("SELECT bucket, COUNT(*) FROM events GROUP BY bucket ORDER BY count DESC LIMIT 8")?;
+    let grouped_avg_query =
+        select("SELECT bucket, AVG(amount) FROM events GROUP BY bucket ORDER BY avg DESC LIMIT 8")?;
+    let grouped_min_query =
+        select("SELECT bucket, MIN(amount) FROM events GROUP BY bucket ORDER BY min DESC LIMIT 8")?;
+    let grouped_max_query =
+        select("SELECT bucket, MAX(amount) FROM events GROUP BY bucket ORDER BY max DESC LIMIT 8")?;
     let mutation_query = select(&format!(
         "SELECT * FROM events WHERE id = {}",
         row_count + 1
@@ -136,6 +144,34 @@ fn main() -> Result<(), Box<dyn Error>> {
         &grouped_sum_cpu_result,
         "resident_device_memory_grouped_sum_kernel_probe",
     )?;
+    let grouped_count_cpu_result = cpu.execute_relational_select(&grouped_count_query)?;
+    let resident_device_grouped_count_probe = timed_resident_device_grouped_aggregate_probe(
+        &mut gpu,
+        &grouped_count_query,
+        &grouped_count_cpu_result,
+        "resident_device_memory_grouped_count_kernel_probe",
+    )?;
+    let grouped_avg_cpu_result = cpu.execute_relational_select(&grouped_avg_query)?;
+    let resident_device_grouped_avg_probe = timed_resident_device_grouped_aggregate_probe(
+        &mut gpu,
+        &grouped_avg_query,
+        &grouped_avg_cpu_result,
+        "resident_device_memory_grouped_avg_kernel_probe",
+    )?;
+    let grouped_min_cpu_result = cpu.execute_relational_select(&grouped_min_query)?;
+    let resident_device_grouped_min_probe = timed_resident_device_grouped_aggregate_probe(
+        &mut gpu,
+        &grouped_min_query,
+        &grouped_min_cpu_result,
+        "resident_device_memory_grouped_min_kernel_probe",
+    )?;
+    let grouped_max_cpu_result = cpu.execute_relational_select(&grouped_max_query)?;
+    let resident_device_grouped_max_probe = timed_resident_device_grouped_aggregate_probe(
+        &mut gpu,
+        &grouped_max_query,
+        &grouped_max_cpu_result,
+        "resident_device_memory_grouped_max_kernel_probe",
+    )?;
 
     let new_id = row_count + 1;
     let insert_sql = format!(
@@ -199,7 +235,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("- warm_resident_snapshot_execution_supported: true");
     println!("- production_device_cache_supported: bounded_retained_snapshot_handle");
     println!(
-        "- resident_device_memory_query_kernel_supported: bounded_count_all_int4_equality_count_int4_range_count_int4_sum_int4_projection_int4_ordered_projection_and_int4_grouped_sum"
+        "- resident_device_memory_query_kernel_supported: bounded_count_all_int4_equality_count_int4_range_count_int4_sum_int4_projection_int4_ordered_projection_and_int4_grouped_count_sum_avg_min_max"
     );
     println!(
         "- resident_device_memory_proof_supported: {}",
@@ -388,10 +424,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!();
     print_probe(&resident_device_grouped_sum_probe);
     println!();
+    print_probe(&resident_device_grouped_count_probe);
+    println!();
+    print_probe(&resident_device_grouped_avg_probe);
+    println!();
+    print_probe(&resident_device_grouped_min_probe);
+    println!();
+    print_probe(&resident_device_grouped_max_probe);
+    println!();
     print_probe(&mutation_probe);
     println!();
     println!(
-        "decision: current P7 evidence includes bounded resident table-data snapshot SELECT probes with zero per-query H2D transfer for the app lookup workload and supported aggregate/distinct SQL shapes, retained-device-memory COUNT(*), int4 equality-predicate COUNT(*), int4 range-predicate COUNT(*), int4 SUM, int4 predicate-projection, bounded int4 ordered-projection, and int4 grouped-SUM proofs over the resident allocation, resident-byte accounting, WAL-safe invalidation, manual refresh-cost accounting, memory-pressure fallback metadata, deterministic resident-snapshot budget admission/eviction, and a retained real CUDA allocation/copy handle for encoded snapshot bytes when local driver hardware is available. Keep broad production CUDA cache claims out of scope until broader grouped aggregate and expression kernels read directly from retained device-memory handles."
+        "decision: current P7 evidence includes bounded resident table-data snapshot SELECT probes with zero per-query H2D transfer for the app lookup workload and supported aggregate/distinct SQL shapes, retained-device-memory COUNT(*), int4 equality-predicate COUNT(*), int4 range-predicate COUNT(*), int4 SUM, int4 predicate-projection, bounded int4 ordered-projection, and int4 grouped COUNT/SUM/AVG/MIN/MAX proofs over the resident allocation, resident-byte accounting, WAL-safe invalidation, manual refresh-cost accounting, memory-pressure fallback metadata, deterministic resident-snapshot budget admission/eviction, and a retained real CUDA allocation/copy handle for encoded snapshot bytes when local driver hardware is available. Keep broad production CUDA cache claims out of scope until expression kernels read directly from retained device-memory handles."
     );
 
     Ok(())
@@ -621,14 +665,24 @@ fn timed_resident_device_grouped_sum_probe(
     expected: &RelationalSelectResult,
     name: &'static str,
 ) -> Result<ProbeReport, Box<dyn Error>> {
+    timed_resident_device_grouped_aggregate_probe(engine, query, expected, name)
+}
+
+fn timed_resident_device_grouped_aggregate_probe(
+    engine: &mut Engine,
+    query: &Select,
+    expected: &RelationalSelectResult,
+    name: &'static str,
+) -> Result<ProbeReport, Box<dyn Error>> {
     let before = engine.metrics().snapshot();
     let start = Instant::now();
-    let result = engine.execute_relational_grouped_sum_with_resident_device_memory_probe(query)?;
+    let result =
+        engine.execute_relational_grouped_aggregate_with_resident_device_memory_probe(query)?;
     let elapsed = start.elapsed();
     let after = engine.metrics().snapshot();
     let correctness_validated = result.columns == expected.columns && result.rows == expected.rows;
     if !correctness_validated {
-        return Err(format!("{name} resident device-memory grouped SUM diverged").into());
+        return Err(format!("{name} resident device-memory grouped aggregate diverged").into());
     }
     Ok(ProbeReport {
         name,
