@@ -29,7 +29,7 @@ This document defines operational resilience strategy and implementation boundar
 - Continuous WAL archive to durable object storage.
 - Archive retention policy tied to PITR window target.
 - Archive lag is monitored and alertable.
-- Current checked-in local proof: an ordered WAL archive manifest can reference multiple checksummed segment files, validate per-segment record counts and transaction ranges, replay the full durable prefix through engine recovery, replay only the exact archived transaction-bound prefix requested by `Engine::recover_from_durable_wal_archive_to_txn(...)`, replay only the exact engine-written timestamp-bound prefix requested by `Engine::recover_from_durable_wal_archive_to_timestamp_micros(...)`, or clean up a PITR branch archive to an exact transaction prefix with `Engine::apply_durable_wal_archive_retention_to_txn(...)`. This is a local restart/restore, transaction-bound PITR, timestamp-bound PITR, and post-target suffix-cleanup proof, not continuous object-storage archival, base-backup restore, timeline branching, base-backup-aware retention-window cleanup, or automatic background cleanup.
+- Current checked-in local proof: an ordered WAL archive manifest can reference multiple checksummed segment files, validate per-segment record counts and transaction ranges, replay the full durable prefix through engine recovery, replay only the exact archived transaction-bound prefix requested by `Engine::recover_from_durable_wal_archive_to_txn(...)`, replay only the exact engine-written timestamp-bound prefix requested by `Engine::recover_from_durable_wal_archive_to_timestamp_micros(...)`, combine a checkpoint-control base backup with an overlapping archive suffix through `Engine::recover_from_durable_wal_checkpoint_and_archive_to_txn(...)` / `Engine::recover_from_durable_wal_checkpoint_and_archive_to_timestamp_micros(...)`, or clean up a PITR branch archive to an exact transaction prefix with `Engine::apply_durable_wal_archive_retention_to_txn(...)`. This is a local restart/restore, transaction-bound PITR, timestamp-bound PITR, checkpoint-backed base-plus-archive restore, and post-target suffix-cleanup proof, not continuous object-storage archival, physical page-image base-backup restore, timeline branching, base-backup-aware retention-window cleanup, or automatic background cleanup.
 
 ## PITR model
 
@@ -105,7 +105,7 @@ This document defines operational resilience strategy and implementation boundar
 ### v0
 - Base backup + WAL archiving + local restore
 - Crash recovery validation in CI/nightly
-- Implemented local proof: multi-segment durable WAL archive manifest + replay for the full committed prefix, an exact archived transaction boundary, an exact engine-written timestamp boundary, or a cleaned transaction-target archive prefix.
+- Implemented local proof: multi-segment durable WAL archive manifest + replay for the full committed prefix, an exact archived transaction boundary, an exact engine-written timestamp boundary, a checkpoint-backed base-plus-archive restore target, or a cleaned transaction-target archive prefix.
 
 ### v0.5
 - Timeline handling and base-backup-aware retention windows

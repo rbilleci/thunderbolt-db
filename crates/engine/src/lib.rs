@@ -6352,6 +6352,60 @@ impl Engine {
         Self::recover_from_durable_wal(&records)
     }
 
+    pub fn recover_from_durable_wal_checkpoint_and_archive_to_txn(
+        control_path: impl AsRef<std::path::Path>,
+        manifest_path: impl AsRef<std::path::Path>,
+        target_txn_id: TxnId,
+    ) -> Result<Self, EngineError> {
+        let (control, base_records) = read_wal_checkpoint(control_path)?;
+        let (_manifest, _target, archive_records) =
+            read_wal_archive_to_txn(manifest_path, target_txn_id)?;
+        Self::recover_from_checkpoint_and_archive_records(&control, &base_records, &archive_records)
+    }
+
+    pub fn recover_from_durable_wal_checkpoint_and_archive_to_timestamp_micros(
+        control_path: impl AsRef<std::path::Path>,
+        manifest_path: impl AsRef<std::path::Path>,
+        target_timestamp_micros: u64,
+    ) -> Result<Self, EngineError> {
+        let (control, base_records) = read_wal_checkpoint(control_path)?;
+        let (_manifest, _target, archive_records) =
+            read_wal_archive_to_timestamp_micros(manifest_path, target_timestamp_micros)?;
+        Self::recover_from_checkpoint_and_archive_records(&control, &base_records, &archive_records)
+    }
+
+    fn recover_from_checkpoint_and_archive_records(
+        control: &WalControlFile,
+        base_records: &[WalRecord],
+        archive_records: &[WalRecord],
+    ) -> Result<Self, EngineError> {
+        let base_last_txn_id = control.checkpoint.last_durable_txn_id.ok_or_else(|| {
+            EngineError::Durability(
+                "base backup checkpoint has no durable transaction boundary".to_string(),
+            )
+        })?;
+        let boundary_index = archive_records
+            .iter()
+            .position(|record| record.txn_id == base_last_txn_id)
+            .ok_or_else(|| {
+                EngineError::Durability(format!(
+                    "WAL archive does not overlap base backup transaction boundary {}",
+                    base_last_txn_id
+                ))
+            })?;
+        let archive_prefix = &archive_records[..=boundary_index];
+        if archive_prefix != base_records {
+            return Err(EngineError::Durability(format!(
+                "WAL archive prefix does not match base backup checkpoint boundary {}",
+                base_last_txn_id
+            )));
+        }
+
+        let mut recovered_records = base_records.to_vec();
+        recovered_records.extend_from_slice(&archive_records[boundary_index + 1..]);
+        Self::recover_from_durable_wal(&recovered_records)
+    }
+
     pub fn with_planner_config(planner_cfg: PlannerConfig) -> Self {
         Self {
             repl: LocalReplicator::leader(),
@@ -24067,6 +24121,179 @@ mod tests {
             .execute_relational_select(&katherine_select)
             .unwrap();
         assert_eq!(katherine_result.rows, Vec::<Vec<SqlValue>>::new());
+    }
+
+    #[test]
+    fn relational_state_recovers_from_base_checkpoint_plus_wal_archive_transaction_target() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpu-db-engine-base-archive-target-{}-{}",
+            std::process::id(),
+            NEXT_TEST_WAL_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let control_path = dir.join("base").join("CONTROL");
+        let base_segment_path = dir.join("base").join("base.wal");
+        let manifest_path = dir.join("archive").join("MANIFEST");
+        let segment_dir = dir.join("archive").join("segments");
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(2, "INSERT INTO people (id, name) VALUES (1, 'Ada')")
+            .unwrap();
+        e.persist_durable_wal_checkpoint(&control_path, &base_segment_path)
+            .unwrap();
+        e.execute_text(3, "INSERT INTO people (id, name) VALUES (2, 'Grace')")
+            .unwrap();
+        e.execute_text(4, "INSERT INTO people (id, name) VALUES (3, 'Katherine')")
+            .unwrap();
+        e.persist_durable_wal_archive(&manifest_path, &segment_dir, 2)
+            .unwrap();
+
+        let mut recovered = Engine::recover_from_durable_wal_checkpoint_and_archive_to_txn(
+            &control_path,
+            &manifest_path,
+            3,
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+
+        assert_eq!(recovered.wal_flushed_count(), 3);
+        let table = recovered.relational_catalog_table("people").unwrap();
+        assert_eq!(table.oid, FIRST_USER_RELATION_OID);
+
+        let Command::Select(grace_select) =
+            parse_command("SELECT id FROM people WHERE name = 'Grace'").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let grace_result = recovered.execute_relational_select(&grace_select).unwrap();
+        assert_eq!(
+            grace_result.access_path,
+            RelationalAccessPath::EqualityIndex {
+                table: "people".to_string(),
+                column: "name".to_string(),
+                matched_keys: 1,
+            }
+        );
+        assert_eq!(grace_result.rows, vec![vec![SqlValue::Int4(2)]]);
+
+        let Command::Select(katherine_select) =
+            parse_command("SELECT id FROM people WHERE name = 'Katherine'").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let katherine_result = recovered
+            .execute_relational_select(&katherine_select)
+            .unwrap();
+        assert_eq!(katherine_result.rows, Vec::<Vec<SqlValue>>::new());
+    }
+
+    #[test]
+    fn relational_state_recovers_from_base_checkpoint_plus_wal_archive_timestamp_target() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpu-db-engine-base-archive-timestamp-target-{}-{}",
+            std::process::id(),
+            NEXT_TEST_WAL_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let control_path = dir.join("base").join("CONTROL");
+        let base_segment_path = dir.join("base").join("base.wal");
+        let manifest_path = dir.join("archive").join("MANIFEST");
+        let segment_dir = dir.join("archive").join("segments");
+        let mut e = Engine::new_local();
+        e.execute_text_at_timestamp_micros(1, "CREATE TABLE people (id INT, name TEXT)", 1_000)
+            .unwrap();
+        e.execute_text_at_timestamp_micros(
+            2,
+            "INSERT INTO people (id, name) VALUES (1, 'Ada')",
+            2_000,
+        )
+        .unwrap();
+        e.persist_durable_wal_checkpoint(&control_path, &base_segment_path)
+            .unwrap();
+        e.execute_text_at_timestamp_micros(
+            3,
+            "INSERT INTO people (id, name) VALUES (2, 'Grace')",
+            3_000,
+        )
+        .unwrap();
+        e.execute_text_at_timestamp_micros(
+            4,
+            "INSERT INTO people (id, name) VALUES (3, 'Katherine')",
+            4_000,
+        )
+        .unwrap();
+        e.persist_durable_wal_archive(&manifest_path, &segment_dir, 2)
+            .unwrap();
+
+        let mut recovered =
+            Engine::recover_from_durable_wal_checkpoint_and_archive_to_timestamp_micros(
+                &control_path,
+                &manifest_path,
+                3_000,
+            )
+            .unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+
+        assert_eq!(recovered.wal_flushed_count(), 3);
+        let Command::Select(grace_select) =
+            parse_command("SELECT id FROM people WHERE name = 'Grace'").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let grace_result = recovered.execute_relational_select(&grace_select).unwrap();
+        assert_eq!(grace_result.rows, vec![vec![SqlValue::Int4(2)]]);
+
+        let Command::Select(katherine_select) =
+            parse_command("SELECT id FROM people WHERE name = 'Katherine'").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let katherine_result = recovered
+            .execute_relational_select(&katherine_select)
+            .unwrap();
+        assert_eq!(katherine_result.rows, Vec::<Vec<SqlValue>>::new());
+    }
+
+    #[test]
+    fn base_checkpoint_plus_wal_archive_rejects_missing_base_overlap() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpu-db-engine-base-archive-missing-overlap-{}-{}",
+            std::process::id(),
+            NEXT_TEST_WAL_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let control_path = dir.join("base").join("CONTROL");
+        let base_segment_path = dir.join("base").join("base.wal");
+        let manifest_path = dir.join("archive").join("MANIFEST");
+        let segment_dir = dir.join("archive").join("segments");
+        let mut base = Engine::new_local();
+        base.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        base.execute_text(2, "INSERT INTO people (id, name) VALUES (1, 'Ada')")
+            .unwrap();
+        base.persist_durable_wal_checkpoint(&control_path, &base_segment_path)
+            .unwrap();
+
+        let mut archive = Engine::new_local();
+        archive
+            .execute_text(3, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        archive
+            .execute_text(4, "INSERT INTO people (id, name) VALUES (2, 'Grace')")
+            .unwrap();
+        archive
+            .persist_durable_wal_archive(&manifest_path, &segment_dir, 1)
+            .unwrap();
+
+        let err = match Engine::recover_from_durable_wal_checkpoint_and_archive_to_txn(
+            &control_path,
+            &manifest_path,
+            4,
+        ) {
+            Ok(_) => panic!("expected missing base overlap error"),
+            Err(err) => err,
+        };
+        let _ = std::fs::remove_dir_all(dir);
+
+        assert!(err.to_string().contains("does not overlap base backup"));
     }
 
     #[test]

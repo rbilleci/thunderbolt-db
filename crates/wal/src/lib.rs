@@ -10,7 +10,7 @@ const WAL_CONTROL_MAGIC: &str = "GPUDBWALCONTROL1";
 const WAL_ARCHIVE_MANIFEST_MAGIC: &str = "GPUDBWALARCHIVE1";
 const WAL_RECORD_HEADER_LEN: usize = 24;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalRecord {
     pub txn_id: TxnId,
     pub payload: Vec<u8>,
