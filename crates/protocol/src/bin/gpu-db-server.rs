@@ -388,6 +388,7 @@ struct CopyInState {
     columns: Vec<String>,
     pending_text: String,
     pending_rows: Vec<Vec<SqlValue>>,
+    seen_terminator: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3083,6 +3084,7 @@ fn begin_copy_from_stdin(
         columns,
         pending_text: String::new(),
         pending_rows: Vec::new(),
+        seen_terminator: false,
     });
     write_copy_in_response(stream, table.columns.len())
 }
@@ -3108,6 +3110,10 @@ fn handle_copy_data(session: &mut Session, bytes: &[u8]) -> Option<ErrorField> {
         }
         copy.pending_text.drain(..=newline);
         if line == r"\." {
+            copy.seen_terminator = true;
+            continue;
+        }
+        if copy.seen_terminator && line.is_empty() {
             continue;
         }
         if let Some(error) = parse_copy_text_row(table, &copy.columns, &line)
@@ -3186,6 +3192,9 @@ fn execute_statement(
     statement: &str,
     include_row_description: bool,
 ) -> io::Result<()> {
+    if strip_sql_comments(statement).trim().is_empty() {
+        return write_empty_query_response(stream);
+    }
     if let Some(table) = parse_copy_to_stdout_table(statement) {
         return execute_copy_to_stdout(stream, session, &table);
     }
@@ -3551,6 +3560,13 @@ fn execute_statement(
             stream,
             &pg_dump_type_metadata_columns(),
             &pg_dump_type_metadata_rows(),
+        );
+    }
+    if canonical == pg_dump_database_metadata_query() {
+        return write_single_row(
+            stream,
+            &pg_dump_database_metadata_columns(),
+            &pg_dump_database_metadata_rows(),
         );
     }
     if let Some(columns) = pg_dump_empty_catalog_query_columns(&canonical) {
@@ -4383,6 +4399,13 @@ fn execute_statement(
             stream,
             &pg_dump_type_metadata_columns(),
             &pg_dump_type_metadata_rows(),
+        );
+    }
+    if canonical == pg_dump_database_metadata_query() {
+        return write_single_row(
+            stream,
+            &pg_dump_database_metadata_columns(),
+            &pg_dump_database_metadata_rows(),
         );
     }
     if let Some(columns) = pg_dump_empty_catalog_query_columns(&canonical) {
@@ -5955,6 +5978,21 @@ fn pg_dump_empty_catalog_query_columns(canonical: &str) -> Option<Vec<Column>> {
             int4_column("lanowner"),
         ]);
     }
+    if canonical
+        == "select provider, label from pg_catalog.pg_shseclabel where classoid = 'pg_catalog.pg_database'::pg_catalog.regclass and objoid = '5'"
+    {
+        return Some(vec![text_column("provider"), text_column("label")]);
+    }
+    if canonical
+        == "select unnest(setconfig) from pg_db_role_setting where setrole = 0 and setdatabase = '5'::oid"
+    {
+        return Some(vec![text_column("unnest")]);
+    }
+    if canonical
+        == "select rolname, unnest(setconfig) from pg_db_role_setting s, pg_roles r where setrole = r.oid and setdatabase = '5'::oid"
+    {
+        return Some(vec![text_column("rolname"), text_column("unnest")]);
+    }
     if canonical == "select tableoid, oid, oprname, oprnamespace, oprowner, oprkind, oprleft, oprright, oprcode::oid as oprcode from pg_operator" {
         return Some(vec![
             int4_column("tableoid"),
@@ -6336,6 +6374,58 @@ fn pg_dump_type_metadata_rows() -> Vec<Vec<Option<String>>> {
             ]
         })
         .collect()
+}
+
+fn pg_dump_database_metadata_query() -> &'static str {
+    "select tableoid, oid, datname, datdba, pg_encoding_to_char(encoding) as encoding, datcollate, datctype, datfrozenxid, datacl, acldefault('d', datdba) as acldefault, datistemplate, datconnlimit, datminmxid, datlocprovider, daticulocale, datcollversion, daticurules, (select spcname from pg_tablespace t where t.oid = dattablespace) as tablespace, shobj_description(oid, 'pg_database') as description from pg_database where datname = current_database()"
+}
+
+fn pg_dump_database_metadata_columns() -> Vec<Column> {
+    vec![
+        int4_column("tableoid"),
+        int4_column("oid"),
+        text_column("datname"),
+        int4_column("datdba"),
+        text_column("encoding"),
+        text_column("datcollate"),
+        text_column("datctype"),
+        text_column("datfrozenxid"),
+        text_column("datacl"),
+        text_column("acldefault"),
+        bool_column("datistemplate"),
+        int4_column("datconnlimit"),
+        text_column("datminmxid"),
+        text_column("datlocprovider"),
+        text_column("daticulocale"),
+        text_column("datcollversion"),
+        text_column("daticurules"),
+        text_column("tablespace"),
+        text_column("description"),
+    ]
+}
+
+fn pg_dump_database_metadata_rows() -> Vec<Vec<Option<String>>> {
+    vec![vec![
+        Some("1262".to_string()),
+        Some("5".to_string()),
+        Some("postgres".to_string()),
+        Some("10".to_string()),
+        Some("UTF8".to_string()),
+        Some("C.UTF-8".to_string()),
+        Some("C.UTF-8".to_string()),
+        Some("0".to_string()),
+        None,
+        None,
+        Some("f".to_string()),
+        Some("-1".to_string()),
+        Some("0".to_string()),
+        Some("c".to_string()),
+        None,
+        None,
+        None,
+        Some("pg_default".to_string()),
+        None,
+    ]]
 }
 
 fn catalog_describe_relation_lookup_rows(
@@ -15098,6 +15188,20 @@ mod tests {
         let (mut writer, mut reader) = tcp_pair();
         execute_statement(&mut writer, &mut session, "CREATE SCHEMA public", true).unwrap();
         assert_eq!(read_backend_tags(&mut reader, 1), vec![b'C']);
+    }
+
+    #[test]
+    fn catalog_pg_dump_custom_archive_database_metadata_query() {
+        assert_eq!(
+            canonical_sql(
+                "SELECT tableoid, oid, datname, datdba, pg_encoding_to_char(encoding) AS encoding, datcollate, datctype, datfrozenxid, datacl, acldefault('d', datdba) AS acldefault, datistemplate, datconnlimit, datminmxid, datlocprovider, daticulocale, datcollversion, daticurules, (SELECT spcname FROM pg_tablespace t WHERE t.oid = dattablespace) AS tablespace, shobj_description(oid, 'pg_database') AS description FROM pg_database WHERE datname = current_database()"
+            ),
+            pg_dump_database_metadata_query()
+        );
+        assert_eq!(
+            pg_dump_database_metadata_rows()[0][2],
+            Some("postgres".to_string())
+        );
     }
 
     #[test]

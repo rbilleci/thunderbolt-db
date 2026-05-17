@@ -5,12 +5,14 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 OUT_DIR="${PG_DUMP_SMOKE_OUT_DIR:-$ROOT_DIR/target/pg-dump-smoke}"
 SOURCE_PORT="${PG_DUMP_SMOKE_SOURCE_PORT:-55444}"
 RESTORE_PORT="${PG_DUMP_SMOKE_RESTORE_PORT:-55445}"
+CUSTOM_RESTORE_PORT="${PG_DUMP_SMOKE_CUSTOM_RESTORE_PORT:-55446}"
 
 rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR"
 
 source_pid=""
 restore_pid=""
+custom_restore_pid=""
 
 cleanup() {
   if [[ -n "$source_pid" ]]; then
@@ -20,6 +22,10 @@ cleanup() {
   if [[ -n "$restore_pid" ]]; then
     kill "$restore_pid" 2>/dev/null || true
     wait "$restore_pid" 2>/dev/null || true
+  fi
+  if [[ -n "$custom_restore_pid" ]]; then
+    kill "$custom_restore_pid" 2>/dev/null || true
+    wait "$custom_restore_pid" 2>/dev/null || true
   fi
 }
 trap cleanup EXIT
@@ -57,6 +63,10 @@ PGHOST=127.0.0.1 PGPORT="$SOURCE_PORT" PGDATABASE=postgres PGUSER=postgres \
   pg_dump --schema=public --no-owner --no-privileges --format=plain \
   >"$OUT_DIR/dump.sql" 2>"$OUT_DIR/pg_dump.err"
 
+PGHOST=127.0.0.1 PGPORT="$SOURCE_PORT" PGDATABASE=postgres PGUSER=postgres \
+  pg_dump --schema=public --no-owner --no-privileges --format=custom \
+  --file="$OUT_DIR/dump.custom" 2>"$OUT_DIR/pg_dump_custom.err"
+
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/restore-server.log" 2>&1 &
 restore_pid=$!
@@ -81,11 +91,37 @@ EOF
 
 diff -u "$OUT_DIR/verify.expected" "$OUT_DIR/verify.out"
 
+cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$CUSTOM_RESTORE_PORT" --shared-catalog \
+  >"$OUT_DIR/custom-restore-server.log" 2>&1 &
+custom_restore_pid=$!
+wait_for_port "$CUSTOM_RESTORE_PORT"
+
+PGHOST=127.0.0.1 PGPORT="$CUSTOM_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres \
+  pg_restore --no-owner --no-privileges --dbname=postgres "$OUT_DIR/dump.custom" \
+  >"$OUT_DIR/custom-restore.out" 2>"$OUT_DIR/custom-restore.err"
+
+PGHOST=127.0.0.1 PGPORT="$CUSTOM_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres \
+  psql -v ON_ERROR_STOP=1 -X -A -t \
+  -c "SELECT id, name FROM accounts ORDER BY id;" \
+  -c "SELECT event_id, note FROM events ORDER BY event_id;" \
+  >"$OUT_DIR/custom-verify.out" 2>"$OUT_DIR/custom-verify.err"
+
+diff -u "$OUT_DIR/verify.expected" "$OUT_DIR/custom-verify.out"
+
+pg_restore --list "$OUT_DIR/dump.custom" >"$OUT_DIR/dump.custom.toc"
+
 grep -F "COPY public.accounts (id, name) FROM stdin;" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "COPY public.events (event_id, note) FROM stdin;" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "CREATE SCHEMA public;" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "CREATE TABLE public.accounts (" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "CREATE TABLE public.events (" "$OUT_DIR/dump.sql" >/dev/null
+grep -F "SCHEMA - public" "$OUT_DIR/dump.custom.toc" >/dev/null
+grep -F "TABLE public accounts" "$OUT_DIR/dump.custom.toc" >/dev/null
+grep -F "TABLE public events" "$OUT_DIR/dump.custom.toc" >/dev/null
+grep -F "TABLE DATA public accounts" "$OUT_DIR/dump.custom.toc" >/dev/null
+grep -F "TABLE DATA public events" "$OUT_DIR/dump.custom.toc" >/dev/null
 
 echo "pg_dump_plain_public_schema_restore=passed"
+echo "pg_dump_custom_public_schema_pg_restore=passed"
 echo "dump_file=$OUT_DIR/dump.sql"
+echo "custom_dump_file=$OUT_DIR/dump.custom"
