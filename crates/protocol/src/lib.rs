@@ -1685,28 +1685,60 @@ fn parse_select_filter(input: &str) -> Result<SelectFilter, ParseError> {
     Err(ParseError::InvalidRelationalSql)
 }
 
-fn parse_select_filters(input: &str) -> Result<Vec<SelectFilter>, ParseError> {
-    let input = trim_wrapping_parentheses(input)?;
-    let filters = split_keyword_chain_outside_quotes(input, "AND")?
-        .into_iter()
-        .map(|filter| parse_select_filter(filter.trim()))
-        .collect::<Result<Vec<_>, _>>()?;
-    if filters.is_empty() {
-        return Err(ParseError::InvalidRelationalSql);
-    }
-    Ok(filters)
-}
-
 fn parse_select_filter_groups(input: &str) -> Result<Vec<Vec<SelectFilter>>, ParseError> {
-    let input = trim_wrapping_parentheses(input)?;
-    let groups = split_keyword_chain_outside_quotes(input, "OR")?
-        .into_iter()
-        .map(|group| parse_select_filters(group.trim()))
-        .collect::<Result<Vec<_>, _>>()?;
+    let groups = parse_select_filter_or_groups(input)?;
     if groups.is_empty() || groups.iter().any(Vec::is_empty) {
         return Err(ParseError::InvalidRelationalSql);
     }
     Ok(groups)
+}
+
+fn parse_select_filter_or_groups(input: &str) -> Result<Vec<Vec<SelectFilter>>, ParseError> {
+    let input = trim_wrapping_parentheses(input)?;
+    let parts = split_keyword_chain_outside_quotes(input, "OR")?;
+    if parts.len() == 1 {
+        return parse_select_filter_and_groups(input);
+    }
+    let groups = parts
+        .into_iter()
+        .map(parse_select_filter_and_groups)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    Ok(groups)
+}
+
+fn parse_select_filter_and_groups(input: &str) -> Result<Vec<Vec<SelectFilter>>, ParseError> {
+    let parts = split_keyword_chain_outside_quotes(input, "AND")?;
+    if parts.len() == 1 {
+        return parse_select_filter_factor(input);
+    }
+    let mut groups = vec![Vec::new()];
+    for part in parts {
+        let factor_groups = parse_select_filter_factor(part)?;
+        let mut combined = Vec::new();
+        for existing in &groups {
+            for factor_group in &factor_groups {
+                let mut group = existing.clone();
+                group.extend(factor_group.iter().cloned());
+                combined.push(group);
+            }
+        }
+        groups = combined;
+    }
+    Ok(groups)
+}
+
+fn parse_select_filter_factor(input: &str) -> Result<Vec<Vec<SelectFilter>>, ParseError> {
+    let input = input.trim();
+    if input.starts_with('(') {
+        let close = find_matching_paren(input, 0).ok_or(ParseError::InvalidRelationalSql)?;
+        if close == input.len() - 1 {
+            return parse_select_filter_or_groups(&input[1..close]);
+        }
+    }
+    Ok(vec![vec![parse_select_filter(input)?]])
 }
 
 fn split_select_filter(input: &str) -> Result<(&str, SelectFilterOp, &str), ParseError> {
@@ -8626,6 +8658,89 @@ mod tests {
                     }],
                 ],
                 order_by: None,
+                limit: None,
+            })
+        );
+
+        assert_eq!(
+            parse_command(
+                "SELECT id FROM people WHERE (id = 1 OR id = 3) AND (name = 'Ada' OR name = 'Grace') ORDER BY id"
+            )
+            .unwrap(),
+            Command::Select(Select {
+                table: "people".to_string(),
+                projection: SelectProjection::Columns(vec!["id".to_string()]),
+                filter: Some(SelectFilter {
+                    column: "id".to_string(),
+                    op: SelectFilterOp::Eq,
+                    value: SqlValue::Int4(1),
+                }),
+                filters: vec![
+                    SelectFilter {
+                        column: "id".to_string(),
+                        op: SelectFilterOp::Eq,
+                        value: SqlValue::Int4(1),
+                    },
+                    SelectFilter {
+                        column: "name".to_string(),
+                        op: SelectFilterOp::Eq,
+                        value: SqlValue::Text("Ada".to_string()),
+                    },
+                ],
+                filter_groups: vec![
+                    vec![
+                        SelectFilter {
+                            column: "id".to_string(),
+                            op: SelectFilterOp::Eq,
+                            value: SqlValue::Int4(1),
+                        },
+                        SelectFilter {
+                            column: "name".to_string(),
+                            op: SelectFilterOp::Eq,
+                            value: SqlValue::Text("Ada".to_string()),
+                        },
+                    ],
+                    vec![
+                        SelectFilter {
+                            column: "id".to_string(),
+                            op: SelectFilterOp::Eq,
+                            value: SqlValue::Int4(1),
+                        },
+                        SelectFilter {
+                            column: "name".to_string(),
+                            op: SelectFilterOp::Eq,
+                            value: SqlValue::Text("Grace".to_string()),
+                        },
+                    ],
+                    vec![
+                        SelectFilter {
+                            column: "id".to_string(),
+                            op: SelectFilterOp::Eq,
+                            value: SqlValue::Int4(3),
+                        },
+                        SelectFilter {
+                            column: "name".to_string(),
+                            op: SelectFilterOp::Eq,
+                            value: SqlValue::Text("Ada".to_string()),
+                        },
+                    ],
+                    vec![
+                        SelectFilter {
+                            column: "id".to_string(),
+                            op: SelectFilterOp::Eq,
+                            value: SqlValue::Int4(3),
+                        },
+                        SelectFilter {
+                            column: "name".to_string(),
+                            op: SelectFilterOp::Eq,
+                            value: SqlValue::Text("Grace".to_string()),
+                        },
+                    ],
+                ],
+                order_by: Some(SelectOrder {
+                    column: "id".to_string(),
+                    descending: false,
+                }),
                 limit: None,
             })
         );

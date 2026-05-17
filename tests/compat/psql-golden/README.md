@@ -2,6 +2,8 @@
 
 This suite exercises a real `psql`/libpq path and compares normalized output against golden artifacts.
 
+Scenario 03 covers the supported relational create/insert/select path, including single-column filters, narrow conjunctions, disjunctions, and parenthesized nested `AND`/`OR` predicates over literal `int4`/`text` comparisons.
+
 ## Run
 
 ```bash
