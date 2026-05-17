@@ -75,6 +75,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         &mutation_cpu_result,
         "post_mutation_per_query_h2d_probe",
     )?;
+    let refresh_started = Instant::now();
+    let refreshed_snapshot = gpu.populate_relational_residency_snapshot("events")?;
+    let refresh_elapsed = refresh_started.elapsed();
+    let refresh_cost = refreshed_snapshot
+        .last_refresh_cost
+        .as_ref()
+        .ok_or("missing refresh-cost metadata after residency refresh")?;
 
     println!("# P7 GPU Residency Baseline");
     println!();
@@ -83,7 +90,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("- concurrency: 1");
     println!("- device_info: {device_info}");
     println!(
-        "- current_data_residency_model: accounted_invalidated_snapshot_plus_per_query_h2d_probe"
+        "- current_data_residency_model: accounted_invalidated_refresh_cost_plus_per_query_h2d_probe"
     );
     println!("- warm_resident_execution_supported: false");
     println!(
@@ -117,7 +124,63 @@ fn main() -> Result<(), Box<dyn Error>> {
             .map(|index| index.to_string())
             .unwrap_or_else(|| "None".to_string())
     );
-    println!("- resident_refresh_supported: manual_snapshot_refresh_only");
+    println!(
+        "- resident_refreshed_rows_current: {}",
+        refreshed_snapshot.row_count
+    );
+    println!(
+        "- resident_refreshed_bytes_current: {}",
+        refreshed_snapshot.resident_bytes
+    );
+    println!("- resident_refresh_supported: manual_snapshot_refresh_with_cost_accounting");
+    println!("- resident_refresh_cost_recorded: true");
+    println!(
+        "- resident_refresh_previous_rows: {}",
+        refresh_cost.previous_row_count
+    );
+    println!(
+        "- resident_refresh_refreshed_rows: {}",
+        refresh_cost.refreshed_row_count
+    );
+    println!("- resident_refresh_row_delta: {}", refresh_cost.row_delta);
+    println!(
+        "- resident_refresh_previous_bytes: {}",
+        refresh_cost.previous_resident_bytes
+    );
+    println!(
+        "- resident_refresh_refreshed_bytes: {}",
+        refresh_cost.refreshed_resident_bytes
+    );
+    println!(
+        "- resident_refresh_byte_delta: {}",
+        refresh_cost.resident_byte_delta
+    );
+    println!(
+        "- resident_refresh_from_index: {}",
+        refresh_cost.refreshed_from_index
+    );
+    println!(
+        "- resident_refresh_through_index: {}",
+        refresh_cost.refreshed_through_index
+    );
+    println!(
+        "- resident_refresh_invalidated_by_txn_id: {}",
+        refresh_cost
+            .invalidated_by_txn_id
+            .map(|txn_id| txn_id.to_string())
+            .unwrap_or_else(|| "None".to_string())
+    );
+    println!(
+        "- resident_refresh_invalidated_at_index: {}",
+        refresh_cost
+            .invalidated_at_index
+            .map(|index| index.to_string())
+            .unwrap_or_else(|| "None".to_string())
+    );
+    println!(
+        "- resident_refresh_elapsed_ms: {:.3}",
+        refresh_elapsed.as_secs_f64() * 1000.0
+    );
     println!("- memory_pressure_fallback_supported: false");
     println!("- correctness_oracle: CPU relational engine");
     println!();
@@ -128,7 +191,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     print_probe(&mutation_probe);
     println!();
     println!(
-        "decision: current P7 evidence includes resident-byte accounting plus WAL-safe invalidation metadata, but query execution still uses per-query H2D probe transfer. Do not claim warm-resident performance until the engine executes from resident table data and adds memory-pressure fallback plus mutation refresh-cost evidence."
+        "decision: current P7 evidence includes resident-byte accounting, WAL-safe invalidation metadata, and manual mutation refresh-cost accounting, but query execution still uses per-query H2D probe transfer. Do not claim warm-resident performance until the engine executes from resident table data and adds memory-pressure fallback evidence."
     );
 
     Ok(())

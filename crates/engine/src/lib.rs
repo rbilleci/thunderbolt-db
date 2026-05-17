@@ -5971,12 +5971,27 @@ pub struct RelationalResidencySnapshot {
     pub invalidated_by_txn_id: Option<TxnId>,
     pub invalidated_at_index: Option<Index>,
     pub memory_pressure_active: bool,
+    pub last_refresh_cost: Option<RelationalResidencyRefreshCost>,
 }
 
 impl RelationalResidencySnapshot {
     pub fn is_valid(&self) -> bool {
         self.invalidated_by_txn_id.is_none() && self.invalidated_at_index.is_none()
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationalResidencyRefreshCost {
+    pub previous_row_count: usize,
+    pub refreshed_row_count: usize,
+    pub row_delta: i128,
+    pub previous_resident_bytes: u64,
+    pub refreshed_resident_bytes: u64,
+    pub resident_byte_delta: i128,
+    pub refreshed_from_index: Index,
+    pub refreshed_through_index: Index,
+    pub invalidated_by_txn_id: Option<TxnId>,
+    pub invalidated_at_index: Option<Index>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -8444,6 +8459,7 @@ impl Engine {
         &mut self,
         table: &str,
     ) -> Result<RelationalResidencySnapshot, ExecuteError> {
+        let previous_snapshot = self.relational_residency.get(table).cloned();
         let catalog_table = self
             .relational_catalog
             .get(table)
@@ -8494,6 +8510,20 @@ impl Engine {
                 .snapshot()
                 .memory_pressured_gpu_ids
                 .contains(&gpu_id),
+            last_refresh_cost: previous_snapshot.as_ref().map(|previous| {
+                RelationalResidencyRefreshCost {
+                    previous_row_count: previous.row_count,
+                    refreshed_row_count: row_count,
+                    row_delta: row_count as i128 - previous.row_count as i128,
+                    previous_resident_bytes: previous.resident_bytes,
+                    refreshed_resident_bytes: resident_bytes,
+                    resident_byte_delta: resident_bytes as i128 - previous.resident_bytes as i128,
+                    refreshed_from_index: previous.valid_through_index,
+                    refreshed_through_index: self.visible_up_to,
+                    invalidated_by_txn_id: previous.invalidated_by_txn_id,
+                    invalidated_at_index: previous.invalidated_at_index,
+                }
+            }),
         };
         self.relational_residency
             .insert(catalog_table.name, snapshot.clone());
@@ -11076,6 +11106,7 @@ mod tests {
         assert_eq!(snapshot.valid_through_index, e.visible_up_to);
         assert!(snapshot.is_valid());
         assert!(!snapshot.memory_pressure_active);
+        assert_eq!(snapshot.last_refresh_cost, None);
 
         e.mark_gpu_memory_pressured(0);
         let pressured = e.relational_residency_snapshot("events").unwrap();
@@ -11098,6 +11129,29 @@ mod tests {
         assert_eq!(refreshed.valid_through_index, e.visible_up_to);
         assert!(refreshed.is_valid());
         assert!(!refreshed.memory_pressure_active);
+        let refresh_cost = refreshed.last_refresh_cost.unwrap();
+        assert_eq!(refresh_cost.previous_row_count, 2);
+        assert_eq!(refresh_cost.refreshed_row_count, 3);
+        assert_eq!(refresh_cost.row_delta, 1);
+        assert_eq!(
+            refresh_cost.previous_resident_bytes,
+            snapshot.resident_bytes
+        );
+        assert_eq!(
+            refresh_cost.refreshed_resident_bytes,
+            refreshed.resident_bytes
+        );
+        assert!(refresh_cost.resident_byte_delta > 0);
+        assert_eq!(refresh_cost.refreshed_from_index, valid_through);
+        assert_eq!(
+            refresh_cost.refreshed_through_index,
+            refreshed.valid_through_index
+        );
+        assert_eq!(refresh_cost.invalidated_by_txn_id, Some(3));
+        assert_eq!(
+            refresh_cost.invalidated_at_index,
+            invalidated.invalidated_at_index
+        );
     }
 
     #[test]
