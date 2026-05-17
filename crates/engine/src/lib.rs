@@ -5971,6 +5971,7 @@ pub struct RelationalResidencySnapshot {
     pub column_count: usize,
     pub resident_bytes: u64,
     pub resident_rows: Vec<Vec<SqlValue>>,
+    pub resident_device_int4_columns: Vec<String>,
     pub valid_through_index: Index,
     pub invalidated_by_txn_id: Option<TxnId>,
     pub invalidated_at_index: Option<Index>,
@@ -5990,6 +5991,60 @@ impl RelationalResidencySnapshot {
             && !self.invalidated_by_memory_pressure
             && !self.memory_pressure_active
     }
+}
+
+fn resident_device_int4_column_offset(
+    snapshot: &RelationalResidencySnapshot,
+    table: &RelationalTable,
+    column_idx: usize,
+) -> Result<u64, ExecuteError> {
+    let column = table.columns.get(column_idx).ok_or_else(|| {
+        ExecuteError::Engine(EngineError::ApplyFailed(
+            "resident device-memory predicate column is outside the catalog table".to_string(),
+        ))
+    })?;
+    if column.ty != SqlType::Int4 {
+        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+            "resident device-memory predicate column is not int4".to_string(),
+        )));
+    }
+    let int4_ordinal = table
+        .columns
+        .iter()
+        .take(column_idx)
+        .filter(|candidate| candidate.ty == SqlType::Int4)
+        .count();
+    if snapshot
+        .resident_device_int4_columns
+        .get(int4_ordinal)
+        .is_none_or(|name| name != &column.name)
+    {
+        return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+            "resident snapshot device payload has no int4 column \"{}\"",
+            column.name
+        ))));
+    }
+    let row_count = u64::try_from(snapshot.row_count).map_err(|_| {
+        ExecuteError::Engine(EngineError::ApplyFailed(
+            "resident snapshot row count exceeds retained device-memory proof range".to_string(),
+        ))
+    })?;
+    let int4_width = std::mem::size_of::<i32>() as u64;
+    let offset = row_count
+        .checked_mul(int4_width)
+        .and_then(|column_bytes| {
+            (int4_ordinal as u64)
+                .checked_mul(column_bytes)
+                .and_then(|prefix_bytes| {
+                    (std::mem::size_of::<u64>() as u64).checked_add(prefix_bytes)
+                })
+        })
+        .ok_or_else(|| {
+            ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident snapshot int4 payload offset overflowed".to_string(),
+            ))
+        })?;
+    Ok(offset)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7933,6 +7988,101 @@ impl Engine {
         })
     }
 
+    pub fn execute_relational_filtered_count_with_resident_device_memory_probe(
+        &mut self,
+        select: &Select,
+    ) -> Result<RelationalSelectResult, ExecuteError> {
+        let (table, bound) = self.bind_relational_select_for_execution(select)?;
+        if select.distinct
+            || !matches!(select.projection, SelectProjection::CountAll)
+            || select.group_by.is_some()
+            || !select.having_groups.is_empty()
+            || select.order_by.is_some()
+            || select.limit.is_some()
+            || select.offset.is_some()
+            || bound.filter_groups.len() != 1
+            || bound.filter_groups[0].len() != 1
+        {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory filtered count proof currently supports only SELECT COUNT(*) with one int4 equality predicate"
+                    .to_string(),
+            )));
+        }
+        let (filter_idx, op, value) = bound.filter_groups[0][0].clone();
+        if op != SelectFilterOp::Eq {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory filtered count proof currently supports only int4 equality predicates"
+                    .to_string(),
+            )));
+        }
+        let SqlValue::Int4(needle) = value else {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory filtered count proof currently supports only int4 equality predicates"
+                    .to_string(),
+            )));
+        };
+        if table.columns[filter_idx].ty != SqlType::Int4 {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory filtered count proof currently supports only int4 equality predicates"
+                    .to_string(),
+            )));
+        }
+
+        let (_query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
+        let snapshot = self
+            .relational_residency_snapshot(&table.name)
+            .ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "relation \"{}\" has no resident snapshot",
+                    table.name
+                )))
+            })?;
+        if snapshot.schema != table.schema || snapshot.table != table.name {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident snapshot no longer matches catalog table identity".to_string(),
+            )));
+        }
+        if !snapshot.is_valid() {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "relation \"{}\" resident snapshot is invalid",
+                table.name
+            ))));
+        }
+        let device_memory = self
+            .relational_residency_device_memory
+            .get(&table.name)
+            .ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "relation \"{}\" has no retained resident device memory",
+                    table.name
+                )))
+            })?;
+        let byte_offset = resident_device_int4_column_offset(&snapshot, &table, filter_idx)?;
+        let row_count = u64::try_from(snapshot.row_count).map_err(|_| {
+            ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident snapshot row count exceeds retained device-memory proof range"
+                    .to_string(),
+            ))
+        })?;
+        let filtered_count = device_memory
+            .count_i32_equal_from_payload(byte_offset, row_count, needle)
+            .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
+        let count = i32::try_from(filtered_count).map_err(|_| {
+            ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "resident device-memory filtered count {filtered_count} exceeds supported COUNT(*) result range"
+            )))
+        })?;
+
+        Ok(RelationalSelectResult {
+            columns: bound.selected_columns,
+            rows: vec![vec![SqlValue::Int4(count)]],
+            planned_target: DeviceTarget::Gpu(snapshot.gpu_id),
+            executed_target: DeviceTarget::Gpu(snapshot.gpu_id),
+            fallback_reason: None,
+            access_path,
+        })
+    }
+
     #[cfg(test)]
     fn execute_relational_select_with_backend<B: MvccExecutionBackend>(
         &mut self,
@@ -8652,13 +8802,13 @@ impl Engine {
         let mut row_count = 0usize;
         let mut resident_bytes = 0u64;
         let mut resident_rows = Vec::new();
-        let mut device_payload = vec![0; std::mem::size_of::<u64>()];
+        let mut raw_device_tail = Vec::new();
         while let Some(tuple) = cursor.next() {
             if !tuple.key.starts_with(&prefix) {
                 continue;
             }
-            device_payload.extend_from_slice(tuple.key.as_bytes());
-            device_payload.extend_from_slice(tuple.value.as_bytes());
+            raw_device_tail.extend_from_slice(tuple.key.as_bytes());
+            raw_device_tail.extend_from_slice(tuple.value.as_bytes());
             let decoded = decode_relational_row(&tuple.value, &catalog_table.columns)?;
             row_count += 1;
             resident_bytes = resident_bytes
@@ -8671,6 +8821,30 @@ impl Engine {
                 );
             resident_rows.push(decoded);
         }
+        let resident_device_int4_columns = catalog_table
+            .columns
+            .iter()
+            .filter(|column| column.ty == SqlType::Int4)
+            .map(|column| column.name.clone())
+            .collect::<Vec<_>>();
+        let mut device_payload = vec![0; std::mem::size_of::<u64>()];
+        for column in catalog_table
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_idx, column)| column.ty == SqlType::Int4)
+            .map(|(idx, _column)| idx)
+        {
+            for row in &resident_rows {
+                let SqlValue::Int4(value) = row[column] else {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        "resident snapshot int4 payload encountered non-int4 value".to_string(),
+                    )));
+                };
+                device_payload.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        device_payload.extend_from_slice(&raw_device_tail);
         device_payload[..std::mem::size_of::<u64>()]
             .copy_from_slice(&(row_count as u64).to_le_bytes());
         drop(cursor);
@@ -8697,6 +8871,7 @@ impl Engine {
             column_count: catalog_table.columns.len(),
             resident_bytes,
             resident_rows,
+            resident_device_int4_columns,
             valid_through_index: self.visible_up_to,
             invalidated_by_txn_id: None,
             invalidated_at_index: None,
@@ -11431,6 +11606,7 @@ mod tests {
         assert_eq!(snapshot.table, "events");
         assert_eq!(snapshot.row_count, 2);
         assert_eq!(snapshot.column_count, 2);
+        assert_eq!(snapshot.resident_device_int4_columns, vec!["id"]);
         assert!(snapshot.resident_bytes >= 8 + "alpha".len() as u64 + "beta".len() as u64);
         assert_eq!(snapshot.valid_through_index, e.visible_up_to);
         assert!(snapshot.is_valid());
@@ -11705,6 +11881,17 @@ mod tests {
         };
         let err = e
             .execute_relational_count_with_resident_device_memory_probe(&select)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("has no retained resident device memory"));
+
+        let Command::Select(filtered_select) =
+            parse_command("SELECT COUNT(*) FROM events WHERE id = 1").unwrap()
+        else {
+            unreachable!()
+        };
+        let err = e
+            .execute_relational_filtered_count_with_resident_device_memory_probe(&filtered_select)
             .unwrap_err()
             .to_string();
         assert!(err.contains("has no retained resident device memory"));
