@@ -236,6 +236,7 @@ struct Session {
     portals: HashMap<String, Portal>,
     cursors: HashMap<String, Cursor>,
     tables: HashMap<String, Table>,
+    dirty_tables: BTreeSet<String>,
     copy_in: Option<CopyInState>,
     next_relation_oid: u32,
     shared_catalog: bool,
@@ -282,21 +283,32 @@ impl Session {
             portals: HashMap::new(),
             cursors: HashMap::new(),
             tables: catalog.tables,
+            dirty_tables: BTreeSet::new(),
             copy_in: None,
             next_relation_oid: catalog.next_relation_oid,
             shared_catalog: shared_catalog_enabled,
         }
     }
 
-    fn persist_catalog_snapshot(&self) {
+    fn mark_table_dirty(&mut self, table: impl Into<String>) {
+        self.dirty_tables.insert(table.into());
+    }
+
+    fn persist_catalog_snapshot(&mut self) {
         if !self.shared_catalog {
+            self.dirty_tables.clear();
             return;
         }
         let mut catalog = shared_catalog()
             .lock()
             .expect("shared catalog mutex poisoned");
-        catalog.tables = self.tables.clone();
-        catalog.next_relation_oid = self.next_relation_oid;
+        for table_name in &self.dirty_tables {
+            if let Some(table) = self.tables.get(table_name) {
+                catalog.tables.insert(table_name.clone(), table.clone());
+            }
+        }
+        catalog.next_relation_oid = catalog.next_relation_oid.max(self.next_relation_oid);
+        self.dirty_tables.clear();
     }
 
     fn close_extended_target(&mut self, target: DescribeTarget, name: &str) {
@@ -2940,6 +2952,22 @@ fn is_simple_copy_identifier(identifier: &str) -> bool {
             .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
+fn parse_truncate_table(statement: &str) -> Option<String> {
+    let statement = strip_leading_sql_comments(statement.trim())?;
+    let canonical = canonical_sql(statement);
+    let mut target = canonical.strip_prefix("truncate table ")?.trim();
+    target = target.strip_prefix("only ").unwrap_or(target).trim();
+    let mut parts = target.split_whitespace();
+    let table = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    if !is_simple_copy_table_name(table) {
+        return None;
+    }
+    Some(table.strip_prefix("public.").unwrap_or(table).to_string())
+}
+
 fn copy_text_value(value: &SqlValue) -> String {
     format_sql_value(value)
         .replace('\\', r"\\")
@@ -3153,6 +3181,7 @@ fn apply_copy_in_rows(session: &mut Session, copy: CopyInState) -> Option<ErrorF
             .rows
             .push(projected.into_iter().map(Option::unwrap).collect());
     }
+    session.mark_table_dirty(copy.table);
     session.persist_catalog_snapshot();
     None
 }
@@ -3431,6 +3460,22 @@ fn execute_statement(
     if canonical.starts_with("lock table ") && canonical.ends_with(" in access share mode") {
         return write_command_complete(stream, "LOCK TABLE");
     }
+    if let Some(table_name) = parse_truncate_table(statement) {
+        let Some(table) = session.tables.get_mut(&table_name) else {
+            return write_error(
+                stream,
+                &ErrorField {
+                    code: "42P01",
+                    message: "relation does not exist",
+                    position: None,
+                },
+            );
+        };
+        table.rows.clear();
+        session.mark_table_dirty(table_name);
+        session.persist_catalog_snapshot();
+        return write_command_complete(stream, "TRUNCATE TABLE");
+    }
     if canonical == "select pg_catalog.set_config('search_path', '', false)" {
         return write_single_row(
             stream,
@@ -3669,8 +3714,9 @@ fn execute_statement(
                     columns.push(CatalogColumn { attnum, def });
                 }
                 let name = create.table;
+                let table_name = name.clone();
                 session.tables.insert(
-                    name.clone(),
+                    table_name.clone(),
                     Table {
                         oid,
                         name,
@@ -3678,11 +3724,13 @@ fn execute_statement(
                         rows: Vec::new(),
                     },
                 );
+                session.mark_table_dirty(table_name);
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, "CREATE TABLE");
             }
             Command::Insert(insert) => {
-                let Some(table) = session.tables.get_mut(&insert.table) else {
+                let table_name = insert.table;
+                let Some(table) = session.tables.get_mut(&table_name) else {
                     return write_error(
                         stream,
                         &ErrorField {
@@ -3743,6 +3791,7 @@ fn execute_statement(
                         .rows
                         .push(projected.into_iter().map(Option::unwrap).collect());
                 }
+                session.mark_table_dirty(table_name);
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, &format!("INSERT 0 {inserted_count}"));
             }
@@ -8518,6 +8567,76 @@ mod tests {
         None
     }
 
+    fn test_table(name: &str, rows: Vec<Vec<SqlValue>>) -> Table {
+        Table {
+            oid: FIRST_USER_RELATION_OID,
+            name: name.to_string(),
+            columns: vec![CatalogColumn {
+                attnum: 1,
+                def: gpu_db_protocol::ColumnDef {
+                    name: "id".to_string(),
+                    ty: SqlType::Int4,
+                },
+            }],
+            rows,
+        }
+    }
+
+    #[test]
+    fn shared_catalog_persistence_merges_dirty_tables() {
+        let accounts = "parallel_restore_accounts";
+        let events = "parallel_restore_events";
+        {
+            let mut catalog = shared_catalog()
+                .lock()
+                .expect("shared catalog mutex poisoned");
+            catalog.tables.remove(accounts);
+            catalog.tables.remove(events);
+        }
+
+        let mut accounts_session = Session::new(true);
+        accounts_session.tables.insert(
+            accounts.to_string(),
+            test_table(accounts, vec![vec![SqlValue::Int4(1)]]),
+        );
+        accounts_session.tables.insert(
+            events.to_string(),
+            test_table(events, vec![vec![SqlValue::Int4(10)]]),
+        );
+
+        let mut events_session = Session::new(true);
+        events_session.tables = accounts_session.tables.clone();
+        accounts_session
+            .tables
+            .get_mut(accounts)
+            .unwrap()
+            .rows
+            .push(vec![SqlValue::Int4(2)]);
+        accounts_session.mark_table_dirty(accounts);
+        accounts_session.persist_catalog_snapshot();
+
+        events_session
+            .tables
+            .get_mut(events)
+            .unwrap()
+            .rows
+            .push(vec![SqlValue::Int4(11)]);
+        events_session.mark_table_dirty(events);
+        events_session.persist_catalog_snapshot();
+
+        let catalog = shared_catalog()
+            .lock()
+            .expect("shared catalog mutex poisoned");
+        assert_eq!(
+            catalog.tables[accounts].rows,
+            vec![vec![SqlValue::Int4(1)], vec![SqlValue::Int4(2)]]
+        );
+        assert_eq!(
+            catalog.tables[events].rows,
+            vec![vec![SqlValue::Int4(10)], vec![SqlValue::Int4(11)]]
+        );
+    }
+
     #[test]
     fn canonical_sql_collapses_case_whitespace_and_semicolons() {
         assert_eq!(
@@ -8585,6 +8704,24 @@ mod tests {
             parse_copy_from_stdin("COPY people FROM STDIN WITH CSV"),
             None
         );
+    }
+
+    #[test]
+    fn truncate_table_detection_is_narrow() {
+        assert_eq!(
+            parse_truncate_table("TRUNCATE TABLE ONLY public.people;"),
+            Some("people".to_string())
+        );
+        assert_eq!(
+            parse_truncate_table("/* restore */ TRUNCATE TABLE people;"),
+            Some("people".to_string())
+        );
+        assert_eq!(parse_truncate_table("TRUNCATE people"), None);
+        assert_eq!(
+            parse_truncate_table("TRUNCATE TABLE public.people CASCADE"),
+            None
+        );
+        assert_eq!(parse_truncate_table("TRUNCATE TABLE \"people\""), None);
     }
 
     #[test]
@@ -8720,6 +8857,43 @@ mod tests {
             read_backend_tags(&mut reader, 4),
             vec![b'T', b'D', b'C', b'Z']
         );
+    }
+
+    #[test]
+    fn truncate_table_clears_rows_and_recovers() {
+        let mut session = Session::default();
+        session.tables.insert(
+            "people".to_string(),
+            Table {
+                oid: FIRST_USER_RELATION_OID,
+                name: "people".to_string(),
+                columns: vec![CatalogColumn {
+                    attnum: 1,
+                    def: gpu_db_protocol::ColumnDef {
+                        name: "id".to_string(),
+                        ty: SqlType::Int4,
+                    },
+                }],
+                rows: vec![vec![SqlValue::Int4(1)], vec![SqlValue::Int4(2)]],
+            },
+        );
+        let (mut writer, mut reader) = tcp_pair();
+
+        execute_statement(
+            &mut writer,
+            &mut session,
+            "TRUNCATE TABLE ONLY public.people",
+            true,
+        )
+        .unwrap();
+
+        let messages = read_backend_messages(&mut reader, 1);
+        assert_eq!(messages[0].0, b'C');
+        assert_eq!(messages[0].1, b"TRUNCATE TABLE\0");
+        assert!(session.tables["people"].rows.is_empty());
+
+        execute_statement(&mut writer, &mut session, "SELECT id FROM people", true).unwrap();
+        assert_eq!(read_backend_tags(&mut reader, 2), vec![b'T', b'C']);
     }
 
     #[test]

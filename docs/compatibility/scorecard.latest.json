@@ -15,8 +15,8 @@
     "protocol.client_flows": {
       "failed": 0,
       "ignored": 0,
-      "passed": 106,
-      "total": 106
+      "passed": 114,
+      "total": 114
     },
     "protocol.error_paths": {
       "failed": 0,
@@ -45,8 +45,8 @@
     "sql.catalog_schema_types": {
       "failed": 0,
       "ignored": 0,
-      "passed": 86,
-      "total": 86
+      "passed": 88,
+      "total": 88
     },
     "sql.gpu_bridge": {
       "failed": 0,
@@ -63,8 +63,8 @@
     "sql.relational_foundation": {
       "failed": 0,
       "ignored": 0,
-      "passed": 51,
-      "total": 51
+      "passed": 59,
+      "total": 59
     },
     "sql.transaction_flows": {
       "failed": 0,
@@ -81,16 +81,16 @@
     "uncategorized": {
       "failed": 0,
       "ignored": 0,
-      "passed": 189,
-      "total": 189
+      "passed": 183,
+      "total": 183
     }
   },
   "top_failing_categories": [],
   "totals": {
     "failed": 0,
     "ignored": 0,
-    "passed": 964,
-    "total": 964
+    "passed": 967,
+    "total": 967
   },
   "trend_hook": {
     "baseline_available": true,

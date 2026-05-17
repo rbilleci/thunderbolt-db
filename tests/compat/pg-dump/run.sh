@@ -8,6 +8,7 @@ RESTORE_PORT="${PG_DUMP_SMOKE_RESTORE_PORT:-55445}"
 CUSTOM_RESTORE_PORT="${PG_DUMP_SMOKE_CUSTOM_RESTORE_PORT:-55446}"
 DIRECTORY_RESTORE_PORT="${PG_DUMP_SMOKE_DIRECTORY_RESTORE_PORT:-55447}"
 TAR_RESTORE_PORT="${PG_DUMP_SMOKE_TAR_RESTORE_PORT:-55448}"
+PARALLEL_DIRECTORY_RESTORE_PORT="${PG_DUMP_SMOKE_PARALLEL_DIRECTORY_RESTORE_PORT:-55449}"
 
 rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR"
@@ -17,6 +18,7 @@ restore_pid=""
 custom_restore_pid=""
 directory_restore_pid=""
 tar_restore_pid=""
+parallel_directory_restore_pid=""
 
 cleanup() {
   if [[ -n "$source_pid" ]]; then
@@ -38,6 +40,10 @@ cleanup() {
   if [[ -n "$tar_restore_pid" ]]; then
     kill "$tar_restore_pid" 2>/dev/null || true
     wait "$tar_restore_pid" 2>/dev/null || true
+  fi
+  if [[ -n "$parallel_directory_restore_pid" ]]; then
+    kill "$parallel_directory_restore_pid" 2>/dev/null || true
+    wait "$parallel_directory_restore_pid" 2>/dev/null || true
   fi
 }
 trap cleanup EXIT
@@ -162,6 +168,23 @@ PGHOST=127.0.0.1 PGPORT="$TAR_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres 
 
 diff -u "$OUT_DIR/verify.expected" "$OUT_DIR/tar-verify.out"
 
+cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$PARALLEL_DIRECTORY_RESTORE_PORT" --shared-catalog \
+  >"$OUT_DIR/directory-parallel-restore-server.log" 2>&1 &
+parallel_directory_restore_pid=$!
+wait_for_port "$PARALLEL_DIRECTORY_RESTORE_PORT"
+
+PGHOST=127.0.0.1 PGPORT="$PARALLEL_DIRECTORY_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres \
+  pg_restore --jobs=2 --no-owner --no-privileges --dbname=postgres "$OUT_DIR/dump.dir" \
+  >"$OUT_DIR/directory-parallel-restore.out" 2>"$OUT_DIR/directory-parallel-restore.err"
+
+PGHOST=127.0.0.1 PGPORT="$PARALLEL_DIRECTORY_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres \
+  psql -v ON_ERROR_STOP=1 -X -A -t \
+  -c "SELECT id, name FROM accounts ORDER BY id;" \
+  -c "SELECT event_id, note FROM events ORDER BY event_id;" \
+  >"$OUT_DIR/directory-parallel-verify.out" 2>"$OUT_DIR/directory-parallel-verify.err"
+
+diff -u "$OUT_DIR/verify.expected" "$OUT_DIR/directory-parallel-verify.out"
+
 pg_restore --list "$OUT_DIR/dump.custom" >"$OUT_DIR/dump.custom.toc"
 pg_restore --list "$OUT_DIR/dump.dir" >"$OUT_DIR/dump.dir.toc"
 pg_restore --list "$OUT_DIR/dump.tar" >"$OUT_DIR/dump.tar.toc"
@@ -191,6 +214,7 @@ echo "pg_dump_plain_public_schema_restore=passed"
 echo "pg_dump_custom_public_schema_pg_restore=passed"
 echo "pg_dump_directory_public_schema_pg_restore=passed"
 echo "pg_dump_tar_public_schema_pg_restore=passed"
+echo "pg_dump_directory_parallel_public_schema_pg_restore=passed"
 echo "dump_file=$OUT_DIR/dump.sql"
 echo "custom_dump_file=$OUT_DIR/dump.custom"
 echo "directory_dump_dir=$OUT_DIR/dump.dir"

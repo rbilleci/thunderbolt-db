@@ -45,7 +45,7 @@ def classify(test_id: str) -> list[str]:
             buckets.append("sql.parser_features")
         if re.search(r"relational|create_table|insert|select", test_id):
             buckets.append("sql.relational_foundation")
-    if "gpu_db_server::" in test_id and re.search(r"simple_query|frontend|protocol", test_id):
+    if "gpu_db_server::" in test_id and re.search(r"simple_query|frontend|protocol|copy|truncate", test_id):
         buckets.append("protocol.client_flows")
     if re.search(r"tokio_postgres|sqlx|async_driver", test_id):
         buckets.extend(
@@ -57,7 +57,7 @@ def classify(test_id: str) -> list[str]:
         )
     if re.search(r"extended|bind|parse|portal|prepared|parameterized|cursor|fetch_count|gdesc", test_id):
         buckets.append("protocol.extended_query")
-    if re.search(r"relational|create_table|insert|select", test_id):
+    if re.search(r"relational|create_table|insert|select|truncate", test_id):
         buckets.append("sql.relational_foundation")
     if re.search(r"sql_gpu|gpu_bridge|relational_sql_select_cuda|relational_sql_select_gpu", test_id):
         buckets.append("sql.gpu_bridge")
@@ -67,7 +67,7 @@ def classify(test_id: str) -> list[str]:
     ):
         buckets.append("storage.indexing")
     if re.search(
-        r"relational_catalog|catalog_helpers|catalog_schema|catalog_introspection|pg_catalog|pg_type|pg_namespace|information_schema|type_metadata|database_metadata|pg_dump|column_id|relation_oid",
+        r"relational_catalog|catalog_helpers|catalog_schema|catalog_introspection|shared_catalog|pg_catalog|pg_type|pg_namespace|information_schema|type_metadata|database_metadata|pg_dump|column_id|relation_oid",
         test_id,
     ):
         buckets.append("sql.catalog_schema_types")
