@@ -53,11 +53,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     let cpu_result = cpu.execute_relational_select(&query)?;
     let cold_probe = timed_probe(&mut gpu, &query, &cpu_result, "cold_per_query_h2d_probe")?;
     let resident_snapshot = gpu.populate_relational_residency_snapshot("events")?;
-    let warm_runtime_probe = timed_probe(
+    let warm_resident_probe = timed_resident_probe(
         &mut gpu,
         &query,
         &cpu_result,
-        "warm_runtime_per_query_h2d_probe",
+        "warm_resident_snapshot_probe",
     )?;
 
     let new_id = row_count + 1;
@@ -104,9 +104,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("- concurrency: 1");
     println!("- device_info: {device_info}");
     println!(
-        "- current_data_residency_model: accounted_invalidated_refresh_cost_plus_per_query_h2d_probe"
+        "- current_data_residency_model: bounded_resident_snapshot_probe_plus_per_query_h2d_fallback"
     );
-    println!("- warm_resident_execution_supported: false");
+    println!("- warm_resident_snapshot_execution_supported: true");
+    println!("- production_device_cache_supported: false");
     println!(
         "- resident_snapshot_valid_before_mutation: {}",
         resident_snapshot.is_valid()
@@ -217,15 +218,51 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!();
     print_probe(&cold_probe);
     println!();
-    print_probe(&warm_runtime_probe);
+    print_probe(&warm_resident_probe);
     println!();
     print_probe(&mutation_probe);
     println!();
     println!(
-        "decision: current P7 evidence includes resident-byte accounting, WAL-safe invalidation metadata, manual mutation refresh-cost accounting, and memory-pressure fallback metadata, but query execution still uses per-query H2D probe transfer. Do not claim warm-resident performance until the engine executes from resident table data."
+        "decision: current P7 evidence includes a bounded resident table-data snapshot SELECT probe with zero per-query H2D transfer for the app lookup workload, plus resident-byte accounting, WAL-safe invalidation, manual refresh-cost accounting, and memory-pressure fallback metadata. Keep production CUDA cache and allocator claims out of scope until resident snapshots are backed by real device memory management."
     );
 
     Ok(())
+}
+
+fn timed_resident_probe(
+    engine: &mut Engine,
+    query: &Select,
+    expected: &RelationalSelectResult,
+    name: &'static str,
+) -> Result<ProbeReport, Box<dyn Error>> {
+    let before = engine.metrics().snapshot();
+    let start = Instant::now();
+    let result = engine.execute_relational_select_with_resident_snapshot_probe(query)?;
+    let elapsed = start.elapsed();
+    let after = engine.metrics().snapshot();
+    let correctness_validated = result.columns == expected.columns && result.rows == expected.rows;
+    if !correctness_validated {
+        return Err(format!("{name} resident snapshot results diverged").into());
+    }
+    Ok(ProbeReport {
+        name,
+        elapsed,
+        result_rows: result.rows.len(),
+        planned_target: format!("{:?}", result.planned_target),
+        executed_target: format!("{:?}", result.executed_target),
+        access_path: format!("{:?}", result.access_path),
+        sql_fallback: result.fallback_reason.is_some(),
+        fallback_reason: result
+            .fallback_reason
+            .as_ref()
+            .map(|reason| format!("{reason:?}"))
+            .unwrap_or_else(|| "None".to_string()),
+        h2d_bytes: after.h2d_bytes_total - before.h2d_bytes_total,
+        d2h_bytes: after.d2h_bytes_total - before.d2h_bytes_total,
+        kernel_exec_samples: after.kernel_exec_samples - before.kernel_exec_samples,
+        kernel_exec_total_ms: after.kernel_exec_total_ms - before.kernel_exec_total_ms,
+        correctness_validated,
+    })
 }
 
 fn timed_probe(

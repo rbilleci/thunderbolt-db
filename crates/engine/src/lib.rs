@@ -5967,6 +5967,7 @@ pub struct RelationalResidencySnapshot {
     pub row_count: usize,
     pub column_count: usize,
     pub resident_bytes: u64,
+    pub resident_rows: Vec<Vec<SqlValue>>,
     pub valid_through_index: Index,
     pub invalidated_by_txn_id: Option<TxnId>,
     pub invalidated_at_index: Option<Index>,
@@ -7773,6 +7774,49 @@ impl Engine {
         self.finalize_relational_select(select, table, bound, access_path, result)
     }
 
+    pub fn execute_relational_select_with_resident_snapshot_probe(
+        &mut self,
+        select: &Select,
+    ) -> Result<RelationalSelectResult, ExecuteError> {
+        let (table, bound) = self.bind_relational_select_for_execution(select)?;
+        let (_query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
+        let snapshot = self
+            .relational_residency_snapshot(&table.name)
+            .ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "relation \"{}\" has no resident snapshot",
+                    table.name
+                )))
+            })?;
+        if snapshot.schema != table.schema || snapshot.table != table.name {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident snapshot no longer matches catalog table identity".to_string(),
+            )));
+        }
+        if !snapshot.is_valid() {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "relation \"{}\" resident snapshot is invalid",
+                table.name
+            ))));
+        }
+
+        let result = MvccReadResult {
+            planned_target: DeviceTarget::Gpu(snapshot.gpu_id),
+            executed_target: DeviceTarget::Gpu(snapshot.gpu_id),
+            fallback_reason: None,
+            rows: snapshot
+                .resident_rows
+                .iter()
+                .map(|row| MvccReadRow {
+                    source_key: None,
+                    key: None,
+                    value: Some(encode_relational_row(row)),
+                })
+                .collect(),
+        };
+        self.finalize_relational_select(select, table, bound, access_path, result)
+    }
+
     #[cfg(test)]
     fn execute_relational_select_with_backend<B: MvccExecutionBackend>(
         &mut self,
@@ -8491,6 +8535,7 @@ impl Engine {
         let mut cursor = self.mvcc_store.seq_scan_open(visibility)?;
         let mut row_count = 0usize;
         let mut resident_bytes = 0u64;
+        let mut resident_rows = Vec::new();
         while let Some(tuple) = cursor.next() {
             if !tuple.key.starts_with(&prefix) {
                 continue;
@@ -8505,6 +8550,7 @@ impl Engine {
                         .map(relational_resident_value_bytes)
                         .sum::<u64>(),
                 );
+            resident_rows.push(decoded);
         }
         drop(cursor);
 
@@ -8522,6 +8568,7 @@ impl Engine {
             row_count,
             column_count: catalog_table.columns.len(),
             resident_bytes,
+            resident_rows,
             valid_through_index: self.visible_up_to,
             invalidated_by_txn_id: None,
             invalidated_at_index: None,
@@ -11173,6 +11220,55 @@ mod tests {
             invalidated.invalidated_at_index
         );
         assert!(refresh_cost.invalidated_by_memory_pressure);
+    }
+
+    #[test]
+    fn resident_snapshot_probe_reads_valid_snapshot_and_rejects_invalidated_state() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE events (id INT, label TEXT)")
+            .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO events (id, label) VALUES (1, 'alpha'), (2, 'beta')",
+        )
+        .unwrap();
+        let Command::Select(select) =
+            parse_command("SELECT label FROM events WHERE id = 2 LIMIT 1").unwrap()
+        else {
+            panic!("expected SELECT");
+        };
+        let cpu = e.execute_relational_select(&select).unwrap();
+
+        let snapshot = e.populate_relational_residency_snapshot("events").unwrap();
+        assert!(snapshot.is_valid());
+        assert_eq!(snapshot.resident_rows.len(), 2);
+
+        let before = e.metrics().snapshot();
+        let resident = e
+            .execute_relational_select_with_resident_snapshot_probe(&select)
+            .unwrap();
+        let after = e.metrics().snapshot();
+        assert_eq!(resident.rows, cpu.rows);
+        assert_eq!(resident.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(resident.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(resident.fallback_reason, None);
+        assert_eq!(after.h2d_bytes_total - before.h2d_bytes_total, 0);
+
+        e.execute_text(3, "INSERT INTO events (id, label) VALUES (3, 'gamma')")
+            .unwrap();
+        assert!(e
+            .execute_relational_select_with_resident_snapshot_probe(&select)
+            .unwrap_err()
+            .to_string()
+            .contains("resident snapshot is invalid"));
+
+        e.populate_relational_residency_snapshot("events").unwrap();
+        e.mark_gpu_memory_pressured(0);
+        assert!(e
+            .execute_relational_select_with_resident_snapshot_probe(&select)
+            .unwrap_err()
+            .to_string()
+            .contains("resident snapshot is invalid"));
     }
 
     #[test]
