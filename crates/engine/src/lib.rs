@@ -8391,6 +8391,153 @@ impl Engine {
         })
     }
 
+    pub fn execute_relational_ordered_projection_with_resident_device_memory_probe(
+        &mut self,
+        select: &Select,
+    ) -> Result<RelationalSelectResult, ExecuteError> {
+        let (table, bound) = self.bind_relational_select_for_execution(select)?;
+        if select.distinct
+            || select.group_by.is_some()
+            || !select.having_groups.is_empty()
+            || select.offset.is_some()
+            || bound.selected_indexes.len() != 1
+            || bound.filter_groups.len() != 1
+            || bound.filter_groups[0].len() != 1
+        {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory ordered projection proof currently supports only SELECT one_int4_column with one int4 range predicate, ORDER BY that column, and LIMIT"
+                    .to_string(),
+            )));
+        }
+        let projection_idx = bound.selected_indexes[0];
+        if table.columns[projection_idx].ty != SqlType::Int4 {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory ordered projection proof currently supports only int4 projection columns"
+                    .to_string(),
+            )));
+        }
+        let Some((order_idx, descending)) = bound.order else {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory ordered projection proof currently requires ORDER BY"
+                    .to_string(),
+            )));
+        };
+        if order_idx != projection_idx {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory ordered projection proof currently requires ORDER BY to use the projected int4 column"
+                    .to_string(),
+            )));
+        }
+        let Some(limit) = select.limit else {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory ordered projection proof currently requires LIMIT"
+                    .to_string(),
+            )));
+        };
+        let limit = u64::try_from(limit).map_err(|_| {
+            ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory ordered projection LIMIT exceeds proof range".to_string(),
+            ))
+        })?;
+        let (filter_idx, op, value) = bound.filter_groups[0][0].clone();
+        let Some(comparison) = resident_device_i32_comparison(op) else {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory ordered projection proof currently supports only int4 non-equality predicates"
+                    .to_string(),
+            )));
+        };
+        let SqlValue::Int4(needle) = value else {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory ordered projection proof currently supports only int4 non-equality predicates"
+                    .to_string(),
+            )));
+        };
+        if table.columns[filter_idx].ty != SqlType::Int4 {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory ordered projection proof currently supports only int4 non-equality predicates"
+                    .to_string(),
+            )));
+        }
+
+        let (_query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
+        let snapshot = self
+            .relational_residency_snapshot(&table.name)
+            .ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "relation \"{}\" has no resident snapshot",
+                    table.name
+                )))
+            })?;
+        if snapshot.schema != table.schema || snapshot.table != table.name {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident snapshot no longer matches catalog table identity".to_string(),
+            )));
+        }
+        if !snapshot.is_valid() {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "relation \"{}\" resident snapshot is invalid",
+                table.name
+            ))));
+        }
+        let device_memory = self
+            .relational_residency_device_memory
+            .get(&table.name)
+            .ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "relation \"{}\" has no retained resident device memory",
+                    table.name
+                )))
+            })?;
+        let filter_offset = resident_device_int4_column_offset(&snapshot, &table, filter_idx)?;
+        let projection_offset =
+            resident_device_int4_column_offset(&snapshot, &table, projection_idx)?;
+        if filter_offset != projection_offset {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory ordered projection proof currently requires predicate and projection to use the same int4 column"
+                    .to_string(),
+            )));
+        }
+        let row_count = u64::try_from(snapshot.row_count).map_err(|_| {
+            ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident snapshot row count exceeds retained device-memory proof range"
+                    .to_string(),
+            ))
+        })?;
+        let started = Instant::now();
+        let values = device_memory
+            .project_i32_compare_ordered_from_payload(
+                projection_offset,
+                row_count,
+                needle,
+                comparison,
+                descending,
+                limit,
+            )
+            .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
+        let elapsed = started.elapsed();
+        let result_d2h_bytes = values
+            .len()
+            .checked_mul(std::mem::size_of::<i32>())
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<u64>()))
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .unwrap_or(u64::MAX);
+        self.metrics.observe_d2h_bytes(result_d2h_bytes);
+        self.metrics
+            .observe_kernel_exec_ms(elapsed.as_millis().try_into().unwrap_or(u64::MAX).max(1));
+
+        Ok(RelationalSelectResult {
+            columns: bound.selected_columns,
+            rows: values
+                .into_iter()
+                .map(|value| vec![SqlValue::Int4(value)])
+                .collect(),
+            planned_target: DeviceTarget::Gpu(snapshot.gpu_id),
+            executed_target: DeviceTarget::Gpu(snapshot.gpu_id),
+            fallback_reason: None,
+            access_path,
+        })
+    }
+
     #[cfg(test)]
     fn execute_relational_select_with_backend<B: MvccExecutionBackend>(
         &mut self,
@@ -12235,6 +12382,19 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("has no retained resident device memory"));
+
+        let Command::Select(ordered_projection_select) =
+            parse_command("SELECT id FROM events WHERE id >= 1 ORDER BY id DESC LIMIT 1").unwrap()
+        else {
+            unreachable!()
+        };
+        let err = e
+            .execute_relational_ordered_projection_with_resident_device_memory_probe(
+                &ordered_projection_select,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("has no retained resident device memory"));
     }
 
     #[test]
@@ -12282,6 +12442,57 @@ mod tests {
         .unwrap();
         assert!(e
             .execute_relational_projection_with_resident_device_memory_probe(&select)
+            .unwrap_err()
+            .to_string()
+            .contains("resident snapshot is invalid"));
+    }
+
+    #[test]
+    fn gpu_resident_device_memory_ordered_projection_probe_materializes_int4_results() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE events (id INT, label TEXT, amount INT)")
+            .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO events (id, label, amount) VALUES (1, 'alpha', 10), (2, 'beta', 30), (3, 'gamma', 20), (4, 'delta', 40)",
+        )
+        .unwrap();
+        let snapshot = e.populate_relational_residency_snapshot("events").unwrap();
+        if snapshot.device_memory_proof.is_none() {
+            return;
+        }
+        let Command::Select(select) = parse_command(
+            "SELECT amount FROM events WHERE amount >= 20 ORDER BY amount DESC LIMIT 2",
+        )
+        .unwrap() else {
+            unreachable!()
+        };
+        let cpu = e.execute_relational_select(&select).unwrap();
+        let before = e.metrics().snapshot();
+        let resident = e
+            .execute_relational_ordered_projection_with_resident_device_memory_probe(&select)
+            .unwrap();
+        let after = e.metrics().snapshot();
+
+        assert_eq!(resident.columns, cpu.columns);
+        assert_eq!(resident.rows, cpu.rows);
+        assert_eq!(
+            resident.rows,
+            vec![vec![SqlValue::Int4(40)], vec![SqlValue::Int4(30)]]
+        );
+        assert_eq!(resident.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(resident.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(resident.fallback_reason, None);
+        assert_eq!(after.h2d_bytes_total - before.h2d_bytes_total, 0);
+        assert_eq!(
+            after.d2h_bytes_total - before.d2h_bytes_total,
+            2 * std::mem::size_of::<i32>() as u64 + std::mem::size_of::<u64>() as u64
+        );
+        assert_eq!(after.kernel_exec_samples - before.kernel_exec_samples, 1);
+
+        e.mark_gpu_memory_pressured(0);
+        assert!(e
+            .execute_relational_ordered_projection_with_resident_device_memory_probe(&select)
             .unwrap_err()
             .to_string()
             .contains("resident snapshot is invalid"));
