@@ -51,6 +51,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let cpu_result = cpu.execute_relational_select(&query)?;
     let cold_probe = timed_probe(&mut gpu, &query, &cpu_result, "cold_per_query_h2d_probe")?;
+    let resident_snapshot = gpu.populate_relational_residency_snapshot("events")?;
     let warm_runtime_probe = timed_probe(
         &mut gpu,
         &query,
@@ -64,6 +65,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
     cpu.execute_text((row_count + 2) as u64, &insert_sql)?;
     gpu.execute_text((row_count + 2) as u64, &insert_sql)?;
+    let invalidated_snapshot = gpu
+        .relational_residency_snapshot("events")
+        .ok_or("missing resident snapshot after mutation")?;
     let mutation_cpu_result = cpu.execute_relational_select(&mutation_query)?;
     let mutation_probe = timed_probe(
         &mut gpu,
@@ -78,10 +82,42 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("- lookup_count: {lookup_count}");
     println!("- concurrency: 1");
     println!("- device_info: {device_info}");
-    println!("- current_data_residency_model: per_query_h2d_probe");
+    println!(
+        "- current_data_residency_model: accounted_invalidated_snapshot_plus_per_query_h2d_probe"
+    );
     println!("- warm_resident_execution_supported: false");
-    println!("- resident_bytes_current: 0");
-    println!("- resident_refresh_supported: false");
+    println!(
+        "- resident_snapshot_valid_before_mutation: {}",
+        resident_snapshot.is_valid()
+    );
+    println!(
+        "- resident_snapshot_valid_after_mutation: {}",
+        invalidated_snapshot.is_valid()
+    );
+    println!(
+        "- resident_bytes_current: {}",
+        resident_snapshot.resident_bytes
+    );
+    println!("- resident_rows_current: {}", resident_snapshot.row_count);
+    println!(
+        "- resident_valid_through_index: {}",
+        resident_snapshot.valid_through_index
+    );
+    println!(
+        "- resident_invalidated_by_txn_id: {}",
+        invalidated_snapshot
+            .invalidated_by_txn_id
+            .map(|txn_id| txn_id.to_string())
+            .unwrap_or_else(|| "None".to_string())
+    );
+    println!(
+        "- resident_invalidated_at_index: {}",
+        invalidated_snapshot
+            .invalidated_at_index
+            .map(|index| index.to_string())
+            .unwrap_or_else(|| "None".to_string())
+    );
+    println!("- resident_refresh_supported: manual_snapshot_refresh_only");
     println!("- memory_pressure_fallback_supported: false");
     println!("- correctness_oracle: CPU relational engine");
     println!();
@@ -92,7 +128,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     print_probe(&mutation_probe);
     println!();
     println!(
-        "decision: current P7 evidence measures cached CUDA runtime plus per-query H2D transfer, not GPU-resident table data. Do not claim warm-resident performance until the engine implements MVCC/WAL-safe resident invalidation or refresh, resident-byte accounting, memory-pressure fallback, and a mutation refresh-cost benchmark."
+        "decision: current P7 evidence includes resident-byte accounting plus WAL-safe invalidation metadata, but query execution still uses per-query H2D probe transfer. Do not claim warm-resident performance until the engine executes from resident table data and adds memory-pressure fallback plus mutation refresh-cost evidence."
     );
 
     Ok(())

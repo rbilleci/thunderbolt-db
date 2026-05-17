@@ -5915,6 +5915,7 @@ pub struct Engine {
     mvcc_store: InMemoryTupleStore,
     relational_catalog: BTreeMap<String, RelationalTable>,
     relational_value_index: BTreeMap<RelationalIndexKey, Vec<String>>,
+    relational_residency: BTreeMap<String, RelationalResidencySnapshot>,
     relational_next_oid: u32,
     relational_next_column_id: u32,
     relational_next_row_id: u64,
@@ -5956,6 +5957,26 @@ pub struct RelationalSelectResult {
     pub executed_target: DeviceTarget,
     pub fallback_reason: Option<FallbackReason>,
     pub access_path: RelationalAccessPath,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationalResidencySnapshot {
+    pub gpu_id: u16,
+    pub schema: String,
+    pub table: String,
+    pub row_count: usize,
+    pub column_count: usize,
+    pub resident_bytes: u64,
+    pub valid_through_index: Index,
+    pub invalidated_by_txn_id: Option<TxnId>,
+    pub invalidated_at_index: Option<Index>,
+    pub memory_pressure_active: bool,
+}
+
+impl RelationalResidencySnapshot {
+    pub fn is_valid(&self) -> bool {
+        self.invalidated_by_txn_id.is_none() && self.invalidated_at_index.is_none()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6087,6 +6108,15 @@ fn relational_index_value(value: &SqlValue) -> String {
         SqlValue::Int8(value) => format!("n:{value}"),
         SqlValue::Numeric(value) => format!("d:{value}"),
         SqlValue::Text(value) => format!("t:{value}"),
+    }
+}
+
+fn relational_resident_value_bytes(value: &SqlValue) -> u64 {
+    match value {
+        SqlValue::Int4(_) => 4,
+        SqlValue::Int8(_) => 8,
+        SqlValue::Numeric(value) => value.len() as u64,
+        SqlValue::Text(value) => value.len() as u64,
     }
 }
 
@@ -6985,6 +7015,7 @@ impl Engine {
             mvcc_store: InMemoryTupleStore::new(),
             relational_catalog: BTreeMap::new(),
             relational_value_index: BTreeMap::new(),
+            relational_residency: BTreeMap::new(),
             relational_next_oid: FIRST_USER_RELATION_OID,
             relational_next_column_id: FIRST_USER_COLUMN_ID,
             relational_next_row_id: 1,
@@ -7115,10 +7146,20 @@ impl Engine {
             self.repl.mark_applied(e.index);
         }
 
+        self.invalidate_relational_residency(txn_id, token.index);
         self.visible_up_to = self.visible_up_to.max(token.index);
         self.metrics.inc_commit();
 
         Ok(token)
+    }
+
+    fn invalidate_relational_residency(&mut self, txn_id: TxnId, index: Index) {
+        for snapshot in self.relational_residency.values_mut() {
+            if snapshot.invalidated_by_txn_id.is_none() {
+                snapshot.invalidated_by_txn_id = Some(txn_id);
+                snapshot.invalidated_at_index = Some(index);
+            }
+        }
     }
 
     fn apply_mvcc_entry(&mut self, entry: &LogEntry) -> Result<(), EngineError> {
@@ -8397,6 +8438,82 @@ impl Engine {
 
     pub fn relational_catalog_table(&self, table: &str) -> Option<&RelationalTable> {
         self.relational_catalog.get(table)
+    }
+
+    pub fn populate_relational_residency_snapshot(
+        &mut self,
+        table: &str,
+    ) -> Result<RelationalResidencySnapshot, ExecuteError> {
+        let catalog_table = self
+            .relational_catalog
+            .get(table)
+            .ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "relation \"{table}\" does not exist"
+                )))
+            })?
+            .clone();
+        let visibility = StorageVisibility {
+            read_txn_id: self.visible_up_to,
+        };
+        let prefix = relational_key_prefix(table);
+        let mut cursor = self.mvcc_store.seq_scan_open(visibility)?;
+        let mut row_count = 0usize;
+        let mut resident_bytes = 0u64;
+        while let Some(tuple) = cursor.next() {
+            if !tuple.key.starts_with(&prefix) {
+                continue;
+            }
+            let decoded = decode_relational_row(&tuple.value, &catalog_table.columns)?;
+            row_count += 1;
+            resident_bytes = resident_bytes
+                .saturating_add(tuple.key.len() as u64)
+                .saturating_add(
+                    decoded
+                        .iter()
+                        .map(relational_resident_value_bytes)
+                        .sum::<u64>(),
+                );
+        }
+        drop(cursor);
+
+        let gpu_id = self.planner.default_gpu_id();
+        let snapshot = RelationalResidencySnapshot {
+            gpu_id,
+            schema: catalog_table.schema,
+            table: catalog_table.name.clone(),
+            row_count,
+            column_count: catalog_table.columns.len(),
+            resident_bytes,
+            valid_through_index: self.visible_up_to,
+            invalidated_by_txn_id: None,
+            invalidated_at_index: None,
+            memory_pressure_active: self
+                .router
+                .runtime()
+                .snapshot()
+                .memory_pressured_gpu_ids
+                .contains(&gpu_id),
+        };
+        self.relational_residency
+            .insert(catalog_table.name, snapshot.clone());
+        Ok(snapshot)
+    }
+
+    pub fn relational_residency_snapshot(
+        &self,
+        table: &str,
+    ) -> Option<RelationalResidencySnapshot> {
+        self.relational_residency.get(table).map(|snapshot| {
+            let mut snapshot = snapshot.clone();
+            snapshot.memory_pressure_active = self
+                .router
+                .runtime()
+                .snapshot()
+                .memory_pressured_gpu_ids
+                .contains(&snapshot.gpu_id);
+            snapshot
+        })
     }
 
     pub fn execute_mvcc_query(
@@ -10937,6 +11054,50 @@ mod tests {
 
         e.export_snapshot_meta();
         assert_eq!(e.replication_watermarks().snapshot_id, 2);
+    }
+
+    #[test]
+    fn relational_residency_snapshot_accounts_bytes_and_invalidates_on_later_wal_apply() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE events (id INT, label TEXT)")
+            .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO events (id, label) VALUES (1, 'alpha'), (2, 'beta')",
+        )
+        .unwrap();
+
+        let snapshot = e.populate_relational_residency_snapshot("events").unwrap();
+        assert_eq!(snapshot.gpu_id, 0);
+        assert_eq!(snapshot.table, "events");
+        assert_eq!(snapshot.row_count, 2);
+        assert_eq!(snapshot.column_count, 2);
+        assert!(snapshot.resident_bytes >= 8 + "alpha".len() as u64 + "beta".len() as u64);
+        assert_eq!(snapshot.valid_through_index, e.visible_up_to);
+        assert!(snapshot.is_valid());
+        assert!(!snapshot.memory_pressure_active);
+
+        e.mark_gpu_memory_pressured(0);
+        let pressured = e.relational_residency_snapshot("events").unwrap();
+        assert!(pressured.memory_pressure_active);
+        assert!(pressured.is_valid());
+
+        let valid_through = pressured.valid_through_index;
+        e.execute_text(3, "INSERT INTO events (id, label) VALUES (3, 'gamma')")
+            .unwrap();
+        let invalidated = e.relational_residency_snapshot("events").unwrap();
+        assert_eq!(invalidated.valid_through_index, valid_through);
+        assert_eq!(invalidated.invalidated_by_txn_id, Some(3));
+        assert!(invalidated.invalidated_at_index.unwrap() > valid_through);
+        assert!(!invalidated.is_valid());
+
+        e.clear_gpu_memory_pressured(0);
+        let refreshed = e.populate_relational_residency_snapshot("events").unwrap();
+        assert_eq!(refreshed.row_count, 3);
+        assert!(refreshed.resident_bytes > snapshot.resident_bytes);
+        assert_eq!(refreshed.valid_through_index, e.visible_up_to);
+        assert!(refreshed.is_valid());
+        assert!(!refreshed.memory_pressure_active);
     }
 
     #[test]
