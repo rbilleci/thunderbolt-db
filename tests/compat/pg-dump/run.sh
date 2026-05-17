@@ -9,6 +9,7 @@ CUSTOM_RESTORE_PORT="${PG_DUMP_SMOKE_CUSTOM_RESTORE_PORT:-55446}"
 DIRECTORY_RESTORE_PORT="${PG_DUMP_SMOKE_DIRECTORY_RESTORE_PORT:-55447}"
 TAR_RESTORE_PORT="${PG_DUMP_SMOKE_TAR_RESTORE_PORT:-55448}"
 PARALLEL_DIRECTORY_RESTORE_PORT="${PG_DUMP_SMOKE_PARALLEL_DIRECTORY_RESTORE_PORT:-55449}"
+CLEAN_RESTORE_PORT="${PG_DUMP_SMOKE_CLEAN_RESTORE_PORT:-55450}"
 
 rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR"
@@ -19,6 +20,7 @@ custom_restore_pid=""
 directory_restore_pid=""
 tar_restore_pid=""
 parallel_directory_restore_pid=""
+clean_restore_pid=""
 
 cleanup() {
   if [[ -n "$source_pid" ]]; then
@@ -44,6 +46,10 @@ cleanup() {
   if [[ -n "$parallel_directory_restore_pid" ]]; then
     kill "$parallel_directory_restore_pid" 2>/dev/null || true
     wait "$parallel_directory_restore_pid" 2>/dev/null || true
+  fi
+  if [[ -n "$clean_restore_pid" ]]; then
+    kill "$clean_restore_pid" 2>/dev/null || true
+    wait "$clean_restore_pid" 2>/dev/null || true
   fi
 }
 trap cleanup EXIT
@@ -185,6 +191,31 @@ PGHOST=127.0.0.1 PGPORT="$PARALLEL_DIRECTORY_RESTORE_PORT" PGDATABASE=postgres P
 
 diff -u "$OUT_DIR/verify.expected" "$OUT_DIR/directory-parallel-verify.out"
 
+cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$CLEAN_RESTORE_PORT" --shared-catalog \
+  >"$OUT_DIR/clean-restore-server.log" 2>&1 &
+clean_restore_pid=$!
+wait_for_port "$CLEAN_RESTORE_PORT"
+
+PGHOST=127.0.0.1 PGPORT="$CLEAN_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres \
+  psql -v ON_ERROR_STOP=1 -X -q <<'SQL'
+CREATE TABLE accounts (id int4, name text);
+INSERT INTO accounts (id, name) VALUES (99, 'stale account');
+CREATE TABLE events (event_id int4, note text);
+INSERT INTO events (event_id, note) VALUES (99, 'stale event');
+SQL
+
+PGHOST=127.0.0.1 PGPORT="$CLEAN_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres \
+  pg_restore --clean --if-exists --no-owner --no-privileges --dbname=postgres "$OUT_DIR/dump.custom" \
+  >"$OUT_DIR/clean-restore.out" 2>"$OUT_DIR/clean-restore.err"
+
+PGHOST=127.0.0.1 PGPORT="$CLEAN_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres \
+  psql -v ON_ERROR_STOP=1 -X -A -t \
+  -c "SELECT id, name FROM accounts ORDER BY id;" \
+  -c "SELECT event_id, note FROM events ORDER BY event_id;" \
+  >"$OUT_DIR/clean-verify.out" 2>"$OUT_DIR/clean-verify.err"
+
+diff -u "$OUT_DIR/verify.expected" "$OUT_DIR/clean-verify.out"
+
 pg_restore --list "$OUT_DIR/dump.custom" >"$OUT_DIR/dump.custom.toc"
 pg_restore --list "$OUT_DIR/dump.dir" >"$OUT_DIR/dump.dir.toc"
 pg_restore --list "$OUT_DIR/dump.tar" >"$OUT_DIR/dump.tar.toc"
@@ -215,6 +246,7 @@ echo "pg_dump_custom_public_schema_pg_restore=passed"
 echo "pg_dump_directory_public_schema_pg_restore=passed"
 echo "pg_dump_tar_public_schema_pg_restore=passed"
 echo "pg_dump_directory_parallel_public_schema_pg_restore=passed"
+echo "pg_dump_custom_clean_if_exists_pg_restore=passed"
 echo "dump_file=$OUT_DIR/dump.sql"
 echo "custom_dump_file=$OUT_DIR/dump.custom"
 echo "directory_dump_dir=$OUT_DIR/dump.dir"

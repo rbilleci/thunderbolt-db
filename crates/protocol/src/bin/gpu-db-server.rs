@@ -305,6 +305,8 @@ impl Session {
         for table_name in &self.dirty_tables {
             if let Some(table) = self.tables.get(table_name) {
                 catalog.tables.insert(table_name.clone(), table.clone());
+            } else {
+                catalog.tables.remove(table_name);
             }
         }
         catalog.next_relation_oid = catalog.next_relation_oid.max(self.next_relation_oid);
@@ -2968,6 +2970,36 @@ fn parse_truncate_table(statement: &str) -> Option<String> {
     Some(table.strip_prefix("public.").unwrap_or(table).to_string())
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct DropTable {
+    table: String,
+    if_exists: bool,
+}
+
+fn parse_drop_table(statement: &str) -> Option<DropTable> {
+    let statement = strip_leading_sql_comments(statement.trim())?;
+    let canonical = canonical_sql(statement);
+    let mut target = canonical.strip_prefix("drop table ")?.trim();
+    let if_exists = if let Some(remaining) = target.strip_prefix("if exists ") {
+        target = remaining.trim();
+        true
+    } else {
+        false
+    };
+    let mut parts = target.split_whitespace();
+    let table = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    if !is_simple_copy_table_name(table) {
+        return None;
+    }
+    Some(DropTable {
+        table: table.strip_prefix("public.").unwrap_or(table).to_string(),
+        if_exists,
+    })
+}
+
 fn copy_text_value(value: &SqlValue) -> String {
     format_sql_value(value)
         .replace('\\', r"\\")
@@ -3454,6 +3486,9 @@ fn execute_statement(
     if canonical == "create schema public" {
         return write_command_complete(stream, "CREATE SCHEMA");
     }
+    if canonical == "drop schema if exists public" {
+        return write_command_complete(stream, "DROP SCHEMA");
+    }
     if canonical == "reset search_path" {
         return write_command_complete(stream, "RESET");
     }
@@ -3475,6 +3510,21 @@ fn execute_statement(
         session.mark_table_dirty(table_name);
         session.persist_catalog_snapshot();
         return write_command_complete(stream, "TRUNCATE TABLE");
+    }
+    if let Some(drop) = parse_drop_table(statement) {
+        if session.tables.remove(&drop.table).is_none() && !drop.if_exists {
+            return write_error(
+                stream,
+                &ErrorField {
+                    code: "42P01",
+                    message: "relation does not exist",
+                    position: None,
+                },
+            );
+        }
+        session.mark_table_dirty(drop.table);
+        session.persist_catalog_snapshot();
+        return write_command_complete(stream, "DROP TABLE");
     }
     if canonical == "select pg_catalog.set_config('search_path', '', false)" {
         return write_single_row(
@@ -8638,6 +8688,30 @@ mod tests {
     }
 
     #[test]
+    fn shared_catalog_persistence_removes_dirty_deleted_tables() {
+        let table = "clean_restore_accounts";
+        {
+            let mut catalog = shared_catalog()
+                .lock()
+                .expect("shared catalog mutex poisoned");
+            catalog.tables.insert(
+                table.to_string(),
+                test_table(table, vec![vec![SqlValue::Int4(99)]]),
+            );
+        }
+
+        let mut session = Session::new(true);
+        assert!(session.tables.remove(table).is_some());
+        session.mark_table_dirty(table);
+        session.persist_catalog_snapshot();
+
+        let catalog = shared_catalog()
+            .lock()
+            .expect("shared catalog mutex poisoned");
+        assert!(!catalog.tables.contains_key(table));
+    }
+
+    #[test]
     fn canonical_sql_collapses_case_whitespace_and_semicolons() {
         assert_eq!(
             canonical_sql("  SELECT   1   AS One ; ; "),
@@ -8722,6 +8796,27 @@ mod tests {
             None
         );
         assert_eq!(parse_truncate_table("TRUNCATE TABLE \"people\""), None);
+    }
+
+    #[test]
+    fn drop_table_detection_is_narrow() {
+        assert_eq!(
+            parse_drop_table("DROP TABLE IF EXISTS public.people;"),
+            Some(DropTable {
+                table: "people".to_string(),
+                if_exists: true,
+            })
+        );
+        assert_eq!(
+            parse_drop_table("/* restore */ DROP TABLE people;"),
+            Some(DropTable {
+                table: "people".to_string(),
+                if_exists: false,
+            })
+        );
+        assert_eq!(parse_drop_table("DROP TABLE public.people CASCADE"), None);
+        assert_eq!(parse_drop_table("DROP SCHEMA IF EXISTS public"), None);
+        assert_eq!(parse_drop_table("DROP TABLE \"people\""), None);
     }
 
     #[test]

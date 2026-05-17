@@ -1,0 +1,18 @@
+=== psql drop table clean-restore boundary ===
+CREATE TABLE
+INSERT 0 1
+DROP TABLE
+CREATE TABLE
+INSERT 0 1
+ id | name
+----+------
+  1 | Ada
+(1 row)
+
+DROP TABLE
+DROP SCHEMA
+CREATE SCHEMA
+ name
+------
+ Ada
+(1 row)
