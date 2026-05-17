@@ -28,7 +28,8 @@ use gpu_db_storage::{
 use gpu_db_txn::{TxnError, TxnManager};
 use gpu_db_types::{CommitToken, EngineError, Index, LogEntry, Role, SnapshotMeta, Term, TxnId};
 use gpu_db_wal::{
-    apply_wal_archive_retention_to_txn, plan_wal_archive_retention_to_txn, read_wal_archive,
+    apply_wal_archive_retention_from_txn, apply_wal_archive_retention_to_txn,
+    plan_wal_archive_retention_from_txn, plan_wal_archive_retention_to_txn, read_wal_archive,
     read_wal_archive_to_timestamp_micros, read_wal_archive_to_txn, read_wal_checkpoint,
     read_wal_segment, write_wal_archive_with_timestamps, write_wal_control_file, write_wal_segment,
     WalArchiveManifest, WalArchiveRecordTimestamp, WalArchiveRetentionPlan, WalBuffer,
@@ -6379,6 +6380,19 @@ impl Engine {
         base_records: &[WalRecord],
         archive_records: &[WalRecord],
     ) -> Result<Self, EngineError> {
+        let boundary_index =
+            Self::validate_checkpoint_archive_overlap(control, base_records, archive_records)?;
+
+        let mut recovered_records = base_records.to_vec();
+        recovered_records.extend_from_slice(&archive_records[boundary_index + 1..]);
+        Self::recover_from_durable_wal(&recovered_records)
+    }
+
+    fn validate_checkpoint_archive_overlap(
+        control: &WalControlFile,
+        base_records: &[WalRecord],
+        archive_records: &[WalRecord],
+    ) -> Result<usize, EngineError> {
         let base_last_txn_id = control.checkpoint.last_durable_txn_id.ok_or_else(|| {
             EngineError::Durability(
                 "base backup checkpoint has no durable transaction boundary".to_string(),
@@ -6394,16 +6408,16 @@ impl Engine {
                 ))
             })?;
         let archive_prefix = &archive_records[..=boundary_index];
-        if archive_prefix != base_records {
-            return Err(EngineError::Durability(format!(
-                "WAL archive prefix does not match base backup checkpoint boundary {}",
-                base_last_txn_id
-            )));
+        if archive_prefix == base_records {
+            return Ok(boundary_index);
         }
-
-        let mut recovered_records = base_records.to_vec();
-        recovered_records.extend_from_slice(&archive_records[boundary_index + 1..]);
-        Self::recover_from_durable_wal(&recovered_records)
+        if boundary_index == 0 && archive_records.first() == base_records.last() {
+            return Ok(boundary_index);
+        }
+        Err(EngineError::Durability(format!(
+            "WAL archive prefix does not match base backup checkpoint boundary {}",
+            base_last_txn_id
+        )))
     }
 
     pub fn with_planner_config(planner_cfg: PlannerConfig) -> Self {
@@ -7757,6 +7771,38 @@ impl Engine {
         target_txn_id: TxnId,
     ) -> Result<WalArchiveRetentionPlan, EngineError> {
         apply_wal_archive_retention_to_txn(manifest_path, target_txn_id)
+    }
+
+    pub fn plan_durable_wal_archive_retention_from_checkpoint(
+        control_path: impl AsRef<std::path::Path>,
+        manifest_path: impl AsRef<std::path::Path>,
+    ) -> Result<WalArchiveRetentionPlan, EngineError> {
+        let manifest_path = manifest_path.as_ref();
+        let (control, base_records) = read_wal_checkpoint(control_path)?;
+        let (_manifest, archive_records) = read_wal_archive(manifest_path)?;
+        Self::validate_checkpoint_archive_overlap(&control, &base_records, &archive_records)?;
+        let base_last_txn_id = control.checkpoint.last_durable_txn_id.ok_or_else(|| {
+            EngineError::Durability(
+                "base backup checkpoint has no durable transaction boundary".to_string(),
+            )
+        })?;
+        plan_wal_archive_retention_from_txn(manifest_path, base_last_txn_id)
+    }
+
+    pub fn apply_durable_wal_archive_retention_from_checkpoint(
+        control_path: impl AsRef<std::path::Path>,
+        manifest_path: impl AsRef<std::path::Path>,
+    ) -> Result<WalArchiveRetentionPlan, EngineError> {
+        let manifest_path = manifest_path.as_ref();
+        let (control, base_records) = read_wal_checkpoint(control_path)?;
+        let (_manifest, archive_records) = read_wal_archive(manifest_path)?;
+        Self::validate_checkpoint_archive_overlap(&control, &base_records, &archive_records)?;
+        let base_last_txn_id = control.checkpoint.last_durable_txn_id.ok_or_else(|| {
+            EngineError::Durability(
+                "base backup checkpoint has no durable transaction boundary".to_string(),
+            )
+        })?;
+        apply_wal_archive_retention_from_txn(manifest_path, base_last_txn_id)
     }
 
     pub fn checkpoint_vacuum_mvcc_versions(
@@ -24366,6 +24412,150 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
 
         assert_eq!(katherine_result.rows, Vec::<Vec<SqlValue>>::new());
+    }
+
+    #[test]
+    fn relational_state_recovers_after_base_checkpoint_archive_retention_cleanup() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpu-db-engine-base-archive-retention-{}-{}",
+            std::process::id(),
+            NEXT_TEST_WAL_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let control_path = dir.join("base").join("CONTROL");
+        let base_segment_path = dir.join("base").join("base.wal");
+        let manifest_path = dir.join("archive").join("MANIFEST");
+        let segment_dir = dir.join("archive").join("segments");
+        let mut e = Engine::new_local();
+        e.execute_text_at_timestamp_micros(1, "CREATE TABLE people (id INT, name TEXT)", 1_000)
+            .unwrap();
+        e.execute_text_at_timestamp_micros(
+            2,
+            "INSERT INTO people (id, name) VALUES (1, 'Ada')",
+            2_000,
+        )
+        .unwrap();
+        e.persist_durable_wal_checkpoint(&control_path, &base_segment_path)
+            .unwrap();
+        e.execute_text_at_timestamp_micros(
+            3,
+            "INSERT INTO people (id, name) VALUES (2, 'Grace')",
+            3_000,
+        )
+        .unwrap();
+        e.execute_text_at_timestamp_micros(
+            4,
+            "INSERT INTO people (id, name) VALUES (3, 'Katherine')",
+            4_000,
+        )
+        .unwrap();
+
+        e.persist_durable_wal_archive(&manifest_path, &segment_dir, 1)
+            .unwrap();
+        let plan = Engine::apply_durable_wal_archive_retention_from_checkpoint(
+            &control_path,
+            &manifest_path,
+        )
+        .unwrap();
+        let mut recovered = Engine::recover_from_durable_wal_checkpoint_and_archive_to_txn(
+            &control_path,
+            &manifest_path,
+            3,
+        )
+        .unwrap();
+        let mut timestamp_recovered =
+            Engine::recover_from_durable_wal_checkpoint_and_archive_to_timestamp_micros(
+                &control_path,
+                &manifest_path,
+                3_000,
+            )
+            .unwrap();
+
+        assert_eq!(plan.target_txn_id, 2);
+        assert_eq!(plan.removed_record_count, 1);
+        assert_eq!(plan.retained_record_count, 3);
+        assert_eq!(recovered.wal_flushed_count(), 3);
+        assert_eq!(timestamp_recovered.wal_flushed_count(), 3);
+
+        let Command::Select(grace_select) =
+            parse_command("SELECT id FROM people WHERE name = 'Grace'").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let grace_result = recovered.execute_relational_select(&grace_select).unwrap();
+        assert_eq!(
+            grace_result.access_path,
+            RelationalAccessPath::EqualityIndex {
+                table: "people".to_string(),
+                column: "name".to_string(),
+                matched_keys: 1,
+            }
+        );
+        assert_eq!(grace_result.rows, vec![vec![SqlValue::Int4(2)]]);
+
+        let timestamp_grace = timestamp_recovered
+            .execute_relational_select(&grace_select)
+            .unwrap();
+        assert_eq!(timestamp_grace.rows, vec![vec![SqlValue::Int4(2)]]);
+
+        let Command::Select(katherine_select) =
+            parse_command("SELECT id FROM people WHERE name = 'Katherine'").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let katherine_result = recovered
+            .execute_relational_select(&katherine_select)
+            .unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+
+        assert_eq!(katherine_result.rows, Vec::<Vec<SqlValue>>::new());
+    }
+
+    #[test]
+    fn base_checkpoint_archive_retention_rejects_prefix_mismatch_before_cleanup() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpu-db-engine-base-archive-retention-mismatch-{}-{}",
+            std::process::id(),
+            NEXT_TEST_WAL_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let control_path = dir.join("base").join("CONTROL");
+        let base_segment_path = dir.join("base").join("base.wal");
+        let manifest_path = dir.join("archive").join("MANIFEST");
+        let segment_dir = dir.join("archive").join("segments");
+        let mut base = Engine::new_local();
+        base.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        base.execute_text(2, "INSERT INTO people (id, name) VALUES (1, 'Ada')")
+            .unwrap();
+        base.persist_durable_wal_checkpoint(&control_path, &base_segment_path)
+            .unwrap();
+
+        let mut archive = Engine::new_local();
+        archive
+            .execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        archive
+            .execute_text(2, "INSERT INTO people (id, name) VALUES (99, 'Mismatch')")
+            .unwrap();
+        archive
+            .execute_text(3, "INSERT INTO people (id, name) VALUES (2, 'Grace')")
+            .unwrap();
+        archive
+            .persist_durable_wal_archive(&manifest_path, &segment_dir, 1)
+            .unwrap();
+
+        let original_manifest = std::fs::read_to_string(&manifest_path).unwrap();
+        let err = match Engine::apply_durable_wal_archive_retention_from_checkpoint(
+            &control_path,
+            &manifest_path,
+        ) {
+            Ok(_) => panic!("expected prefix mismatch error"),
+            Err(err) => err,
+        };
+        let after_manifest = std::fs::read_to_string(&manifest_path).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+
+        assert!(err.to_string().contains("prefix does not match"));
+        assert_eq!(after_manifest, original_manifest);
     }
 
     #[test]

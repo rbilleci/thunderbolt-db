@@ -107,7 +107,8 @@ For the current single-node relational WAL segment proof:
 7. For timestamp-bound PITR proof, recover engine-written archives with `Engine::recover_from_durable_wal_archive_to_timestamp_micros(...)`; the archive reader validates the whole archive, requires per-transaction timestamp metadata, then replays only an exact timestamp-bound prefix while rejecting missing metadata, before-first, beyond-durable, between-boundary, and ambiguous timestamp targets.
 8. For checkpoint-backed base-plus-archive restore, recover with `Engine::recover_from_durable_wal_checkpoint_and_archive_to_txn(...)` or `Engine::recover_from_durable_wal_checkpoint_and_archive_to_timestamp_micros(...)`; the recovery path validates the base checkpoint, validates the archive target, requires the archive prefix to overlap and match the base boundary, then replays the base plus archive suffix only.
 9. For local PITR-branch archive cleanup, inspect `Engine::plan_durable_wal_archive_retention_to_txn(...)`, then apply `Engine::apply_durable_wal_archive_retention_to_txn(...)`; cleanup validates the whole archive, rewrites the manifest and segment files to the exact retained transaction prefix, and removes only obsolete post-target segments after the replacement manifest is installed.
-10. Treat physical page-image base backups, streaming archive ingestion, durable object-storage backup, base-backup-aware retention windows, and automatic background cleanup as not yet implemented.
+10. For checkpoint-backed base-window archive cleanup, inspect `Engine::plan_durable_wal_archive_retention_from_checkpoint(...)`, then apply `Engine::apply_durable_wal_archive_retention_from_checkpoint(...)`; cleanup validates the base checkpoint against the archive before rewriting, retains the base-boundary record plus durable suffix, and preserves later base-plus-archive transaction/timestamp restore.
+11. Treat physical page-image base backups, streaming archive ingestion, durable object-storage backup, timeline branching, and automatic background cleanup as not yet implemented.
 
 Failure criteria:
 
@@ -176,7 +177,7 @@ Operator checks:
 
 Current bootstrap storage can vacuum old MVCC tuple versions only through `Engine::checkpoint_vacuum_mvcc_versions(safe_txn_id)`. Choose a non-zero safe transaction id that is at or below the flushed WAL boundary and older than every active transaction. The call refuses unsafe boundaries, reports removed tuple/version counts, and keeps the durable WAL prefix as the replay source of truth.
 
-Do not manually prune tuple versions, relational row keys, or equality-index entries. Relational indexes remain volatile and are rebuilt from the durable WAL prefix during recovery; the current control file covers one selected durable segment, and the archive manifest covers ordered multi-segment replay, exact transaction-bound prefix restore, exact timestamp-bound prefix restore for engine-written archives, checkpoint-backed base-plus-archive restore, and transaction-target suffix cleanup. Base-backup-aware archive retention windows and automatic background cleanup are still future storage work.
+Do not manually prune tuple versions, relational row keys, or equality-index entries. Relational indexes remain volatile and are rebuilt from the durable WAL prefix during recovery; the current control file covers one selected durable segment, and the archive manifest covers ordered multi-segment replay, exact transaction-bound prefix restore, exact timestamp-bound prefix restore for engine-written archives, checkpoint-backed base-plus-archive restore, transaction-target suffix cleanup, and checkpoint-backed base-window archive cleanup. Automatic background cleanup is still future storage work.
 
 ## 6) Release Evidence Bundle
 

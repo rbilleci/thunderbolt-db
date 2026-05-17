@@ -892,6 +892,139 @@ pub fn plan_wal_archive_retention_to_txn(
     })
 }
 
+pub fn plan_wal_archive_retention_from_txn(
+    manifest_path: impl AsRef<Path>,
+    base_txn_id: TxnId,
+) -> Result<WalArchiveRetentionPlan, EngineError> {
+    let manifest_path = manifest_path.as_ref();
+    let (manifest, records) = read_wal_archive(manifest_path)?;
+    let first_txn = records.first().map(|record| record.txn_id).ok_or_else(|| {
+        EngineError::Durability(format!(
+            "WAL archive {} has no records for base transaction {}",
+            manifest_path.display(),
+            base_txn_id
+        ))
+    })?;
+    if base_txn_id < first_txn {
+        return Err(EngineError::Durability(format!(
+            "WAL archive {} base transaction {} is before first archived transaction {}",
+            manifest_path.display(),
+            base_txn_id,
+            first_txn
+        )));
+    }
+    let last_txn = manifest.checkpoint.last_durable_txn_id.ok_or_else(|| {
+        EngineError::Durability(format!(
+            "WAL archive {} has no durable transaction for base transaction {}",
+            manifest_path.display(),
+            base_txn_id
+        ))
+    })?;
+    if base_txn_id > last_txn {
+        return Err(EngineError::Durability(format!(
+            "WAL archive {} base transaction {} is beyond last durable transaction {}",
+            manifest_path.display(),
+            base_txn_id,
+            last_txn
+        )));
+    }
+    let start_index = records
+        .iter()
+        .position(|record| record.txn_id == base_txn_id)
+        .ok_or_else(|| {
+            EngineError::Durability(format!(
+                "WAL archive {} does not contain base backup transaction boundary {}",
+                manifest_path.display(),
+                base_txn_id
+            ))
+        })?;
+    let retained_records = records[start_index..].to_vec();
+    let records_per_segment = archive_records_per_segment(manifest_path, &manifest)?;
+    let segment_dir = archive_segment_dir(manifest_path, &manifest)?;
+    let retained_timestamps = if manifest.record_timestamps.is_empty() {
+        &[][..]
+    } else {
+        &manifest.record_timestamps[start_index..]
+    };
+    let retained_manifest = build_wal_archive_manifest(
+        manifest_path,
+        &segment_dir,
+        &retained_records,
+        records_per_segment,
+        retained_timestamps,
+    );
+    let retained_paths: HashSet<PathBuf> = retained_manifest
+        .segments
+        .iter()
+        .map(|segment| resolve_manifest_path(manifest_path, &segment.segment_path))
+        .collect();
+    let removed_segments = manifest
+        .segments
+        .iter()
+        .map(|segment| resolve_manifest_path(manifest_path, &segment.segment_path))
+        .filter(|path| !retained_paths.contains(path))
+        .collect();
+
+    Ok(WalArchiveRetentionPlan {
+        target_txn_id: base_txn_id,
+        retained_record_count: retained_records.len(),
+        removed_record_count: start_index,
+        retained_manifest,
+        removed_segments,
+    })
+}
+
+pub fn apply_wal_archive_retention_from_txn(
+    manifest_path: impl AsRef<Path>,
+    base_txn_id: TxnId,
+) -> Result<WalArchiveRetentionPlan, EngineError> {
+    let manifest_path = manifest_path.as_ref();
+    let (manifest, records) = read_wal_archive(manifest_path)?;
+    let plan = plan_wal_archive_retention_from_txn(manifest_path, base_txn_id)?;
+    let start_index = records
+        .iter()
+        .position(|record| record.txn_id == base_txn_id)
+        .ok_or_else(|| {
+            EngineError::Durability(format!(
+                "WAL archive {} does not contain base backup transaction boundary {}",
+                manifest_path.display(),
+                base_txn_id
+            ))
+        })?;
+    let records_per_segment = archive_records_per_segment(manifest_path, &manifest)?;
+    let segment_dir = archive_segment_dir(manifest_path, &manifest)?;
+    let retained_records = &records[start_index..];
+    let retained_timestamps = if manifest.record_timestamps.is_empty() {
+        &[][..]
+    } else {
+        &manifest.record_timestamps[start_index..]
+    };
+    let retained_manifest = write_wal_archive_with_timestamps(
+        manifest_path,
+        &segment_dir,
+        retained_records,
+        records_per_segment,
+        retained_timestamps,
+    )?;
+    for removed_segment in &plan.removed_segments {
+        match fs::remove_file(removed_segment) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(EngineError::Durability(format!(
+                    "failed to remove obsolete WAL archive segment {}: {err}",
+                    removed_segment.display()
+                )));
+            }
+        }
+    }
+
+    Ok(WalArchiveRetentionPlan {
+        retained_manifest,
+        ..plan
+    })
+}
+
 pub fn apply_wal_archive_retention_to_txn(
     manifest_path: impl AsRef<Path>,
     target_txn_id: TxnId,
@@ -2038,6 +2171,123 @@ mod tests {
             .to_string()
             .contains("beyond last durable transaction"));
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn wal_archive_base_retention_plan_keeps_base_boundary_suffix() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpu-db-wal-archive-base-retention-plan-{}-{}",
+            std::process::id(),
+            NEXT_TEST_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let manifest_path = dir.join("MANIFEST");
+        let segment_dir = dir.join("segments");
+        let records = vec![
+            WalRecord {
+                txn_id: 1,
+                payload: b"SET a=1".to_vec(),
+            },
+            WalRecord {
+                txn_id: 2,
+                payload: b"SET b=2".to_vec(),
+            },
+            WalRecord {
+                txn_id: 3,
+                payload: b"SET c=3".to_vec(),
+            },
+            WalRecord {
+                txn_id: 4,
+                payload: b"SET d=4".to_vec(),
+            },
+        ];
+        let timestamps = vec![
+            WalArchiveRecordTimestamp {
+                txn_id: 1,
+                timestamp_micros: 1_000,
+            },
+            WalArchiveRecordTimestamp {
+                txn_id: 2,
+                timestamp_micros: 2_000,
+            },
+            WalArchiveRecordTimestamp {
+                txn_id: 3,
+                timestamp_micros: 3_000,
+            },
+            WalArchiveRecordTimestamp {
+                txn_id: 4,
+                timestamp_micros: 4_000,
+            },
+        ];
+
+        write_wal_archive_with_timestamps(&manifest_path, &segment_dir, &records, 1, &timestamps)
+            .unwrap();
+        let plan = plan_wal_archive_retention_from_txn(&manifest_path, 2).unwrap();
+        let _ = fs::remove_dir_all(dir);
+
+        assert_eq!(plan.target_txn_id, 2);
+        assert_eq!(plan.retained_record_count, 3);
+        assert_eq!(plan.removed_record_count, 1);
+        assert_eq!(plan.retained_manifest.checkpoint.durable_record_count, 3);
+        assert_eq!(
+            plan.retained_manifest.checkpoint.last_durable_txn_id,
+            Some(4)
+        );
+        assert_eq!(plan.retained_manifest.segments[0].first_txn_id, Some(2));
+        assert_eq!(plan.retained_manifest.record_timestamps[0].txn_id, 2);
+        assert_eq!(
+            plan.retained_manifest.record_timestamps[0].timestamp_micros,
+            2_000
+        );
+    }
+
+    #[test]
+    fn wal_archive_base_retention_apply_rewrites_to_base_suffix() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpu-db-wal-archive-base-retention-apply-{}-{}",
+            std::process::id(),
+            NEXT_TEST_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let manifest_path = dir.join("MANIFEST");
+        let segment_dir = dir.join("segments");
+        let records = vec![
+            WalRecord {
+                txn_id: 1,
+                payload: b"SET a=1".to_vec(),
+            },
+            WalRecord {
+                txn_id: 2,
+                payload: b"SET b=2".to_vec(),
+            },
+            WalRecord {
+                txn_id: 3,
+                payload: b"SET c=3".to_vec(),
+            },
+            WalRecord {
+                txn_id: 4,
+                payload: b"SET d=4".to_vec(),
+            },
+        ];
+
+        write_wal_archive(&manifest_path, &segment_dir, &records, 1).unwrap();
+        let plan = apply_wal_archive_retention_from_txn(&manifest_path, 2).unwrap();
+        let (retained_manifest, retained_records) = read_wal_archive(&manifest_path).unwrap();
+        let target_err = read_wal_archive_to_txn(&manifest_path, 1).unwrap_err();
+        let _ = fs::remove_dir_all(dir);
+
+        assert_eq!(plan.retained_record_count, 3);
+        assert_eq!(plan.removed_record_count, 1);
+        assert_eq!(retained_manifest.checkpoint.durable_record_count, 3);
+        assert_eq!(retained_manifest.checkpoint.last_durable_txn_id, Some(4));
+        assert_eq!(
+            retained_records
+                .iter()
+                .map(|record| record.txn_id)
+                .collect::<Vec<_>>(),
+            vec![2, 3, 4]
+        );
+        assert!(target_err
+            .to_string()
+            .contains("before first archived transaction"));
     }
 
     #[test]
