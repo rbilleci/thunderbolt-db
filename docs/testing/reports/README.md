@@ -10,6 +10,7 @@ Use UTC timestamps and stream identifiers:
 - `YYYYMMDDTHHMMSSZ-durability-<scenario>.md`
 - `YYYYMMDDTHHMMSSZ-replication-<scenario>.md`
 - `YYYY-MM-DD-<milestone>-benchmark-<scenario>.md`
+- `YYYY-MM-DD-<milestone>-<scenario>.md`
 - `YYYYMMDDTHHMMSSZ-jepsen-<scenario>.md`
 
 ## Minimum report fields
