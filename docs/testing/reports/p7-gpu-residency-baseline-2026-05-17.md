@@ -1,6 +1,6 @@
 # P7 GPU Residency Baseline
 
-- git_sha: 494e698513baccdb660330a82f4851b8ef2276b5
+- git_sha: da4398de8b91d1143e50bc5e8161fabb6e8190e7
 - stream: benchmark
 - dataset_rows: 1000
 - lookup_count: 16
@@ -39,7 +39,7 @@
 - resident_refresh_invalidated_by_txn_id: 1002
 - resident_refresh_invalidated_at_index: 1002
 - resident_refresh_invalidated_by_memory_pressure: true
-- resident_refresh_elapsed_ms: 2.427
+- resident_refresh_elapsed_ms: 2.437
 - memory_pressure_fallback_supported: true
 - memory_pressure_invalidates_resident_snapshot: true
 - memory_pressure_active_on_snapshot: true
@@ -47,7 +47,7 @@
 - correctness_oracle: CPU relational engine
 
 ### cold_per_query_h2d_probe
-- elapsed_us: 501242
+- elapsed_us: 507777
 - result_rows: 16
 - planned_target: Gpu(0)
 - executed_target: Gpu(0)
@@ -57,11 +57,11 @@
 - h2d_bytes: 1365
 - d2h_bytes: 909
 - kernel_exec_samples: 1
-- kernel_exec_total_ms: 463
+- kernel_exec_total_ms: 467
 - correctness_validated: true
 
 ### warm_resident_snapshot_probe
-- elapsed_us: 8725
+- elapsed_us: 9242
 - result_rows: 16
 - planned_target: Gpu(0)
 - executed_target: Gpu(0)
@@ -74,8 +74,22 @@
 - kernel_exec_total_ms: 0
 - correctness_validated: true
 
+### warm_resident_aggregate_distinct_probe
+- elapsed_us: 31493
+- result_rows: 9
+- planned_target: Gpu(0)
+- executed_target: Gpu(0)
+- access_path: EqualityIndex { table: "events", column: "category", matched_keys: 500 }; FilteredKeyBatch { table: "events", predicate_column: "amount", predicate_op: Gte, matched_keys: 101 }; OrderedKeyBatch { table: "events", predicate_column: None, predicate_op: None, order_column: "category", descending: false, matched_keys: 1000 }
+- sql_fallback: false
+- fallback_reason: None
+- h2d_bytes: 0
+- d2h_bytes: 0
+- kernel_exec_samples: 0
+- kernel_exec_total_ms: 0
+- correctness_validated: true
+
 ### post_mutation_per_query_h2d_probe
-- elapsed_us: 418741
+- elapsed_us: 424973
 - result_rows: 1
 - planned_target: Gpu(0)
 - executed_target: Gpu(0)
@@ -85,7 +99,7 @@
 - h2d_bytes: 105
 - d2h_bytes: 69
 - kernel_exec_samples: 1
-- kernel_exec_total_ms: 418
+- kernel_exec_total_ms: 424
 - correctness_validated: true
 
-decision: current P7 evidence includes a bounded resident table-data snapshot SELECT probe with zero per-query H2D transfer for the app lookup workload, plus resident-byte accounting, WAL-safe invalidation, manual refresh-cost accounting, and memory-pressure fallback metadata. Keep production CUDA cache and allocator claims out of scope until resident snapshots are backed by real device memory management.
+decision: current P7 evidence includes bounded resident table-data snapshot SELECT probes with zero per-query H2D transfer for the app lookup workload and supported aggregate/distinct SQL shapes, plus resident-byte accounting, WAL-safe invalidation, manual refresh-cost accounting, and memory-pressure fallback metadata. Keep production CUDA cache and allocator claims out of scope until resident snapshots are backed by real device memory management.

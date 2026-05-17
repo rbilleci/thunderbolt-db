@@ -11272,6 +11272,57 @@ mod tests {
     }
 
     #[test]
+    fn resident_snapshot_probe_reads_aggregate_distinct_without_transfer() {
+        let mut e = Engine::new_local();
+        e.execute_text(
+            1,
+            "CREATE TABLE events (id INT, label TEXT, amount INT, category TEXT)",
+        )
+        .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO events (id, label, amount, category) VALUES (1, 'alpha', 10, 'odd'), (2, 'beta', 20, 'even'), (3, 'gamma', 30, 'odd')",
+        )
+        .unwrap();
+        let queries = [
+            "SELECT DISTINCT category FROM events ORDER BY category",
+            "SELECT category, COUNT(*) FROM events GROUP BY category ORDER BY count DESC",
+            "SELECT category, SUM(amount) FROM events GROUP BY category ORDER BY sum DESC",
+            "SELECT AVG(amount) FROM events WHERE category = 'odd'",
+            "SELECT MIN(amount) FROM events",
+            "SELECT MAX(amount) FROM events",
+        ];
+
+        let snapshot = e.populate_relational_residency_snapshot("events").unwrap();
+        assert!(snapshot.is_valid());
+
+        for sql in queries {
+            let Command::Select(select) = parse_command(sql).unwrap() else {
+                panic!("expected SELECT");
+            };
+            let cpu = e.execute_relational_select(&select).unwrap();
+            let before = e.metrics().snapshot();
+            let resident = e
+                .execute_relational_select_with_resident_snapshot_probe(&select)
+                .unwrap();
+            let after = e.metrics().snapshot();
+
+            assert_eq!(resident.columns, cpu.columns, "{sql}");
+            assert_eq!(resident.rows, cpu.rows, "{sql}");
+            assert_eq!(resident.planned_target, DeviceTarget::Gpu(0), "{sql}");
+            assert_eq!(resident.executed_target, DeviceTarget::Gpu(0), "{sql}");
+            assert_eq!(resident.fallback_reason, None, "{sql}");
+            assert_eq!(after.h2d_bytes_total - before.h2d_bytes_total, 0, "{sql}");
+            assert_eq!(after.d2h_bytes_total - before.d2h_bytes_total, 0, "{sql}");
+            assert_eq!(
+                after.kernel_exec_samples - before.kernel_exec_samples,
+                0,
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
     fn telemetry_snapshot_reflects_replication_lag_and_runtime_metrics() {
         let mut e = Engine::with_batching(8, Duration::from_secs(60));
         let t0 = Instant::now();

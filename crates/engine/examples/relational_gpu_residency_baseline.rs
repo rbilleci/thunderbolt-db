@@ -42,6 +42,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let query = app_batched_lookup_query(row_count, lookup_count)?;
+    let aggregate_distinct_queries = aggregate_distinct_queries()?;
     let mutation_query = select(&format!(
         "SELECT * FROM events WHERE id = {}",
         row_count + 1
@@ -58,6 +59,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         &query,
         &cpu_result,
         "warm_resident_snapshot_probe",
+    )?;
+    let aggregate_distinct_cpu_results = execute_queries(&mut cpu, &aggregate_distinct_queries)?;
+    let warm_resident_aggregate_distinct_probe = timed_resident_probe_many(
+        &mut gpu,
+        &aggregate_distinct_queries,
+        &aggregate_distinct_cpu_results,
+        "warm_resident_aggregate_distinct_probe",
     )?;
 
     let new_id = row_count + 1;
@@ -220,13 +228,75 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!();
     print_probe(&warm_resident_probe);
     println!();
+    print_probe(&warm_resident_aggregate_distinct_probe);
+    println!();
     print_probe(&mutation_probe);
     println!();
     println!(
-        "decision: current P7 evidence includes a bounded resident table-data snapshot SELECT probe with zero per-query H2D transfer for the app lookup workload, plus resident-byte accounting, WAL-safe invalidation, manual refresh-cost accounting, and memory-pressure fallback metadata. Keep production CUDA cache and allocator claims out of scope until resident snapshots are backed by real device memory management."
+        "decision: current P7 evidence includes bounded resident table-data snapshot SELECT probes with zero per-query H2D transfer for the app lookup workload and supported aggregate/distinct SQL shapes, plus resident-byte accounting, WAL-safe invalidation, manual refresh-cost accounting, and memory-pressure fallback metadata. Keep production CUDA cache and allocator claims out of scope until resident snapshots are backed by real device memory management."
     );
 
     Ok(())
+}
+
+fn timed_resident_probe_many(
+    engine: &mut Engine,
+    queries: &[Select],
+    expected: &[RelationalSelectResult],
+    name: &'static str,
+) -> Result<ProbeReport, Box<dyn Error>> {
+    let before = engine.metrics().snapshot();
+    let start = Instant::now();
+    let mut results = Vec::with_capacity(queries.len());
+    for query in queries {
+        results.push(engine.execute_relational_select_with_resident_snapshot_probe(query)?);
+    }
+    let elapsed = start.elapsed();
+    let after = engine.metrics().snapshot();
+    let correctness_validated = results.len() == expected.len()
+        && results.iter().zip(expected).all(|(actual, expected)| {
+            actual.columns == expected.columns && actual.rows == expected.rows
+        });
+    if !correctness_validated {
+        return Err(format!("{name} resident snapshot results diverged").into());
+    }
+    let result_rows = results.iter().map(|result| result.rows.len()).sum();
+    let sql_fallback = results
+        .iter()
+        .any(|result| result.fallback_reason.is_some());
+    let fallback_reason = results
+        .iter()
+        .find_map(|result| {
+            result
+                .fallback_reason
+                .as_ref()
+                .map(|reason| format!("{reason:?}"))
+        })
+        .unwrap_or_else(|| "None".to_string());
+    let access_paths = {
+        let mut paths = results
+            .iter()
+            .map(|result| format!("{:?}", result.access_path))
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths.dedup();
+        paths.join("; ")
+    };
+    Ok(ProbeReport {
+        name,
+        elapsed,
+        result_rows,
+        planned_target: "Gpu(0)".to_string(),
+        executed_target: "Gpu(0)".to_string(),
+        access_path: access_paths,
+        sql_fallback,
+        fallback_reason,
+        h2d_bytes: after.h2d_bytes_total - before.h2d_bytes_total,
+        d2h_bytes: after.d2h_bytes_total - before.d2h_bytes_total,
+        kernel_exec_samples: after.kernel_exec_samples - before.kernel_exec_samples,
+        kernel_exec_total_ms: after.kernel_exec_total_ms - before.kernel_exec_total_ms,
+        correctness_validated,
+    })
 }
 
 fn timed_resident_probe(
@@ -348,6 +418,31 @@ fn app_batched_lookup_query(
         "SELECT * FROM events WHERE {} ORDER BY id ASC",
         predicates.join(" OR ")
     ))
+}
+
+fn aggregate_distinct_queries() -> Result<Vec<Select>, Box<dyn Error>> {
+    Ok(vec![
+        select("SELECT DISTINCT category FROM events ORDER BY category")?,
+        select(
+            "SELECT category, COUNT(*) FROM events WHERE amount >= 900 GROUP BY category ORDER BY count DESC",
+        )?,
+        select(
+            "SELECT category, SUM(amount) FROM events WHERE amount >= 900 GROUP BY category ORDER BY sum DESC",
+        )?,
+        select("SELECT AVG(amount) FROM events WHERE category = 'even'")?,
+        select("SELECT MIN(amount) FROM events WHERE amount >= 900")?,
+        select("SELECT MAX(amount) FROM events WHERE amount >= 900")?,
+    ])
+}
+
+fn execute_queries(
+    engine: &mut Engine,
+    queries: &[Select],
+) -> Result<Vec<RelationalSelectResult>, Box<dyn Error>> {
+    queries
+        .iter()
+        .map(|query| engine.execute_relational_select(query).map_err(Into::into))
+        .collect()
 }
 
 fn select(sql: &str) -> Result<Select, Box<dyn Error>> {
