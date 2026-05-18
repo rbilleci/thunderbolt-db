@@ -27,6 +27,28 @@ If failed:
 3. Open/append incident note with root-cause hypothesis.
 4. Re-run full gate only after fix is committed.
 
+### 1b) Bounded Replication Deployment Preflight
+
+Run before treating the current P6 replication packaging envelope as deployable in a local/operator test environment:
+
+```bash
+scripts/run_replication_deployment_preflight.sh
+```
+
+Pass criteria:
+
+- `operational_replication_deployment_preflight=passed`
+- Packaged follower service smoke passes.
+- Systemd unit/environment contract verification passes.
+- Kubernetes two-follower manifest contract verification passes.
+- Docker Compose restart smoke passes with one follower restarted and replayed from the durable prefix while the other follower stays live.
+
+Boundaries:
+
+- This is not a live systemd installation.
+- This is not a live Kubernetes rollout.
+- Missing or unusable local Docker/Compose is an environment blocker for this preflight, not a product pass.
+
 ## 2) WAL Durability Incident (Flush Failure)
 
 Symptoms:
@@ -134,12 +156,13 @@ Current implemented scope:
 - `scripts/run_replication_compose_restart_smoke.sh` builds the same local Docker image, starts two follower services from `docker/replication-service/compose-smoke.yml`, restarts one service through `docker compose restart`, re-discovers its published port, replays the full durable prefix into the restarted service while a second service remains live, and verifies both services catch up before Compose teardown.
 - `scripts/run_replication_systemd_verify.sh` builds the same follower service binary, validates `systemd/replication-follower/gpu-db-replication-follower@.service` with `systemd-analyze`, and checks the instance environment examples preserve the follower id / expected request count / listen address command contract.
 - `scripts/run_replication_kubernetes_verify.sh` builds the same follower service binary and validates `k8s/replication-service/follower-services.yml` as two follower Deployments plus two Services that preserve the follower id / expected request count / listen address / append port command contract. If `kubectl` exists locally, the script also runs a client-side dry-run; otherwise it reports manifest-contract-only evidence.
+- `scripts/run_replication_deployment_preflight.sh` aggregates the packaged follower-service smoke, systemd contract verification, Kubernetes manifest verification, and Docker Compose restart smoke into one bounded local deployment preflight.
 - The scenario demonstrates leader write admission, typed append-entries request/response handling with a tested binary frame codec and single-request TCP send/serve helper, follower catch-up, read-after-apply, deterministic request-vote election before failover, old-leader `NotLeader` rejection after failover, and continued writes on the elected leader.
 - The smoke commands emit an `operational_deployment_preflight=passed` line only when the smoke proof passes and the current TCP append-entries transport evidence, deterministic election evidence, packaged-local entrypoint evidence, deployment scope, and gap status are explicitly reported.
 
 Current simulated/not-yet-implemented scope:
 
-- No live production service manager or daemon supervision. The implemented packaging proofs are reproducible local binary, Docker, Docker Compose, systemd-artifact, and Kubernetes-manifest validation harnesses, including bounded multi-process parent/follower, long-running follower-service, service restart-plus-replay, container deployment, container restart-plus-replay, Compose-managed restart-plus-replay, checked systemd unit/environment command-contract proofs, and checked Kubernetes Deployment/Service command-contract proofs.
+- No live production service manager or daemon supervision. The implemented packaging proofs are reproducible local binary, Docker, Docker Compose, systemd-artifact, Kubernetes-manifest validation, and aggregate deployment-preflight harnesses, including bounded multi-process parent/follower, long-running follower-service, service restart-plus-replay, container deployment, container restart-plus-replay, Compose-managed restart-plus-replay, checked systemd unit/environment command-contract proofs, checked Kubernetes Deployment/Service command-contract proofs, and one combined local preflight gate.
 - No membership reconfiguration. The current election proof is deterministic request-vote voting inside the local smoke harness, not a timer-driven production election loop.
 - No live Kubernetes deployment harness. The checked Kubernetes manifests are a local artifact contract for the existing follower service, not a production rollout, readiness/liveness probe, storage, or service-discovery proof.
 
@@ -156,6 +179,7 @@ scripts/run_replication_container_restart_smoke.sh
 scripts/run_replication_compose_restart_smoke.sh
 scripts/run_replication_systemd_verify.sh
 scripts/run_replication_kubernetes_verify.sh
+scripts/run_replication_deployment_preflight.sh
 ```
 
 Pass criteria:
@@ -166,6 +190,7 @@ Pass criteria:
 - Output includes `deployment_transport=single_request_tcp_append_entries` with append batch, heartbeat batch, and follower-ack counts.
 - Output includes `deployment_election=deterministic_request_vote` with candidate id, elected term, vote count, quorum, and elected status.
 - Output includes `deployment_package=local_cargo_example_binary` with the Rust example entrypoint and both smoke script paths.
+- Aggregate preflight output includes `operational_replication_deployment_preflight=passed`.
 - Follower output reports `follower_caught_up=true`.
 - `follower_read_after_apply` includes the post-failover write.
 - `promoted_leader_commit`, `follower_commit`, and `follower_applied` are equal.
