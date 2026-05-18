@@ -3,8 +3,8 @@
     "durability.invariants": {
       "failed": 0,
       "ignored": 0,
-      "passed": 90,
-      "total": 90
+      "passed": 91,
+      "total": 91
     },
     "execution.gpu_routing_and_batching": {
       "failed": 0,
@@ -75,8 +75,8 @@
     "storage.indexing": {
       "failed": 0,
       "ignored": 0,
-      "passed": 36,
-      "total": 36
+      "passed": 37,
+      "total": 37
     },
     "uncategorized": {
       "failed": 0,
@@ -89,8 +89,8 @@
   "totals": {
     "failed": 0,
     "ignored": 0,
-    "passed": 1063,
-    "total": 1063
+    "passed": 1064,
+    "total": 1064
   },
   "trend_hook": {
     "baseline_available": true,

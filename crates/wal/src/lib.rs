@@ -615,8 +615,16 @@ pub fn restore_wal_archive_object_backup(
                 backup_manifest_path.display()
             ))
         })?;
-    let _manifest_bytes =
+    let manifest_bytes =
         read_verified_wal_archive_backup_object(backup_manifest_path, manifest_object)?;
+    let expected_manifest_bytes =
+        render_wal_archive_manifest_body(&backup.archive_manifest)?.into_bytes();
+    if manifest_bytes != expected_manifest_bytes {
+        return Err(EngineError::Durability(format!(
+            "WAL archive object backup {} manifest object does not match backup manifest metadata",
+            backup_manifest_path.display()
+        )));
+    }
 
     fs::create_dir_all(restored_segment_dir).map_err(|err| {
         EngineError::Durability(format!(
@@ -1234,33 +1242,7 @@ pub fn write_wal_archive_manifest(
         })?;
     }
 
-    let mut body = format!(
-        "{WAL_ARCHIVE_MANIFEST_MAGIC}\ndurable_record_count={}\nlast_durable_txn_id={}\nsegments={}\n",
-        manifest.checkpoint.durable_record_count,
-        format_optional_txn(manifest.checkpoint.last_durable_txn_id),
-        manifest.segments.len()
-    );
-    for segment in &manifest.segments {
-        if segment.segment_path.to_string_lossy().contains('|') {
-            return Err(EngineError::Durability(format!(
-                "WAL archive segment path contains unsupported delimiter: {}",
-                segment.segment_path.display()
-            )));
-        }
-        body.push_str(&format!(
-            "segment={}|{}|{}|{}\n",
-            segment.segment_path.display(),
-            segment.record_count,
-            format_optional_txn(segment.first_txn_id),
-            format_optional_txn(segment.last_txn_id)
-        ));
-    }
-    for timestamp in &manifest.record_timestamps {
-        body.push_str(&format!(
-            "record_timestamp={}|{}\n",
-            timestamp.txn_id, timestamp.timestamp_micros
-        ));
-    }
+    let body = render_wal_archive_manifest_body(manifest)?;
 
     let tmp_path = temporary_control_path(path);
     let write_result = (|| {
@@ -1297,6 +1279,37 @@ pub fn write_wal_archive_manifest(
             path.display()
         ))
     })
+}
+
+fn render_wal_archive_manifest_body(manifest: &WalArchiveManifest) -> Result<String, EngineError> {
+    let mut body = format!(
+        "{WAL_ARCHIVE_MANIFEST_MAGIC}\ndurable_record_count={}\nlast_durable_txn_id={}\nsegments={}\n",
+        manifest.checkpoint.durable_record_count,
+        format_optional_txn(manifest.checkpoint.last_durable_txn_id),
+        manifest.segments.len()
+    );
+    for segment in &manifest.segments {
+        if segment.segment_path.to_string_lossy().contains('|') {
+            return Err(EngineError::Durability(format!(
+                "WAL archive segment path contains unsupported delimiter: {}",
+                segment.segment_path.display()
+            )));
+        }
+        body.push_str(&format!(
+            "segment={}|{}|{}|{}\n",
+            segment.segment_path.display(),
+            segment.record_count,
+            format_optional_txn(segment.first_txn_id),
+            format_optional_txn(segment.last_txn_id)
+        ));
+    }
+    for timestamp in &manifest.record_timestamps {
+        body.push_str(&format!(
+            "record_timestamp={}|{}\n",
+            timestamp.txn_id, timestamp.timestamp_micros
+        ));
+    }
+    Ok(body)
 }
 
 pub fn read_wal_archive_manifest(
@@ -3053,6 +3066,66 @@ mod tests {
                 || (err.contains("expected") && err.contains("bytes"))
         );
         assert!(!manifest_installed);
+    }
+
+    #[test]
+    fn wal_archive_object_backup_rejects_manifest_metadata_drift_before_install() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpu-db-wal-object-backup-manifest-drift-{}-{}",
+            std::process::id(),
+            NEXT_TEST_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let manifest_path = dir.join("source").join("MANIFEST");
+        let segment_dir = dir.join("source").join("segments");
+        let backup_path = dir.join("backup").join("BACKUP");
+        let object_dir = dir.join("backup").join("objects");
+        let restored_manifest_path = dir.join("restored").join("MANIFEST");
+        let restored_segment_dir = dir.join("restored").join("segments");
+        let records = vec![
+            WalRecord {
+                txn_id: 1,
+                payload: b"SET a=1".to_vec(),
+            },
+            WalRecord {
+                txn_id: 2,
+                payload: b"SET b=2".to_vec(),
+            },
+        ];
+        let timestamps = vec![
+            WalArchiveRecordTimestamp {
+                txn_id: 1,
+                timestamp_micros: 1_000,
+            },
+            WalArchiveRecordTimestamp {
+                txn_id: 2,
+                timestamp_micros: 2_000,
+            },
+        ];
+
+        write_wal_archive_with_timestamps(&manifest_path, &segment_dir, &records, 1, &timestamps)
+            .unwrap();
+        export_wal_archive_object_backup(&manifest_path, &backup_path, &object_dir).unwrap();
+        let backup_body = fs::read_to_string(&backup_path).unwrap();
+        fs::write(
+            &backup_path,
+            backup_body.replace("record_timestamp=2|2000", "record_timestamp=2|2500"),
+        )
+        .unwrap();
+
+        let err = restore_wal_archive_object_backup(
+            &backup_path,
+            &restored_manifest_path,
+            &restored_segment_dir,
+        )
+        .unwrap_err();
+        let manifest_installed = restored_manifest_path.exists();
+        let segment_dir_installed = restored_segment_dir.exists();
+        let _ = fs::remove_dir_all(dir);
+
+        let err = err.to_string();
+        assert!(err.contains("manifest object does not match backup manifest metadata"));
+        assert!(!manifest_installed);
+        assert!(!segment_dir_installed);
     }
 
     #[test]
