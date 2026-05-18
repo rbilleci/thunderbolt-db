@@ -65,11 +65,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     let between_count_query = select(&format!(
         "SELECT COUNT(*) FROM events WHERE id BETWEEN {between_count_lower} AND {between_count_upper}"
     ))?;
+    let filtered_scalar_threshold = row_count.saturating_sub(row_count / 5).max(1);
+    let filter_group_count_query = select(&format!(
+        "SELECT COUNT(*) FROM events WHERE id >= {between_count_lower} AND amount <= {filtered_scalar_threshold} OR bucket = 3"
+    ))?;
     let sum_query = select("SELECT SUM(amount) FROM events")?;
     let avg_query = select("SELECT AVG(amount) FROM events")?;
     let min_query = select("SELECT MIN(amount) FROM events")?;
     let max_query = select("SELECT MAX(amount) FROM events")?;
-    let filtered_scalar_threshold = row_count.saturating_sub(row_count / 5).max(1);
     let filtered_scalar_sum_query = select(&format!(
         "SELECT SUM(amount) FROM events WHERE amount >= {filtered_scalar_threshold}"
     ))?;
@@ -197,6 +200,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         &between_count_query,
         &between_count_cpu_result,
         "resident_device_memory_between_count_kernel_probe",
+    )?;
+    let filter_group_count_cpu_result = cpu.execute_relational_select(&filter_group_count_query)?;
+    let resident_device_filter_group_count_probe = timed_resident_device_filter_group_count_probe(
+        &mut gpu,
+        &filter_group_count_query,
+        &filter_group_count_cpu_result,
+        "resident_device_memory_filter_group_count_kernel_probe",
     )?;
     let sum_cpu_result = cpu.execute_relational_select(&sum_query)?;
     let resident_device_sum_probe = timed_resident_device_sum_probe(
@@ -471,7 +481,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("- warm_resident_snapshot_execution_supported: true");
     println!("- production_device_cache_supported: bounded_retained_snapshot_handle");
     println!(
-        "- resident_device_memory_query_kernel_supported: bounded_count_all_int4_equality_count_int4_membership_count_int4_range_count_int4_between_count_int4_sum_avg_min_max_filtered_sum_avg_min_max_between_sum_avg_min_max_int4_projection_int4_paginated_distinct_projection_int4_paginated_filtered_distinct_projection_int4_paginated_filtered_ordered_projection_int4_grouped_count_sum_avg_min_max_grouped_having_and_filtered_grouped_count_sum_avg_min_max_filtered_grouped_having"
+        "- resident_device_memory_query_kernel_supported: bounded_count_all_int4_equality_count_int4_membership_count_int4_range_count_int4_between_count_int4_filter_group_count_int4_sum_avg_min_max_filtered_sum_avg_min_max_between_sum_avg_min_max_int4_projection_int4_paginated_distinct_projection_int4_paginated_filtered_distinct_projection_int4_paginated_filtered_ordered_projection_int4_grouped_count_sum_avg_min_max_grouped_having_and_filtered_grouped_count_sum_avg_min_max_filtered_grouped_having"
     );
     println!(
         "- resident_device_memory_proof_supported: {}",
@@ -640,6 +650,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("- memory_pressure_fallback_count: {memory_pressure_fallback_count}");
     println!("- correctness_oracle: CPU relational engine");
     println!();
+    println!("## Retained Query-Kernel Capability Matrix");
+    println!();
+    println!("- supported_count_filters: unfiltered, int4 equality, int4 IN membership, int4 range comparison, int4 BETWEEN, retained int4 AND/OR filter groups");
+    println!("- supported_retained_aggregates: int4 scalar SUM/AVG/MIN/MAX, int4 filtered scalar SUM/AVG/MIN/MAX, int4 BETWEEN scalar SUM/AVG/MIN/MAX, int4 grouped and filtered-grouped COUNT/SUM/AVG/MIN/MAX with grouped HAVING");
+    println!("- supported_retained_projections: int4 predicate projection, int4 paginated distinct projection, int4 paginated filtered distinct projection, bounded int4 paginated filtered ordered projection");
+    println!("- unsupported_retained_filters: text prefix LIKE, non-prefix LIKE, subqueries, non-int4 filter-group payload columns, arbitrary expression trees");
+    println!("- unsupported_production_cache_claims: broad workload-level GPU advantage, production cache manager, allocator/eviction policy beyond deterministic budget admission evidence");
+    println!();
     print_probe(&cold_probe);
     println!();
     print_probe(&warm_resident_probe);
@@ -655,6 +673,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     print_probe(&resident_device_range_count_probe);
     println!();
     print_probe(&resident_device_between_count_probe);
+    println!();
+    print_probe(&resident_device_filter_group_count_probe);
     println!();
     print_probe(&resident_device_sum_probe);
     println!();
@@ -711,7 +731,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     print_probe(&mutation_probe);
     println!();
     println!(
-        "decision: current P7 evidence includes bounded resident table-data snapshot SELECT probes with zero per-query H2D transfer for the app lookup workload and supported aggregate/distinct SQL shapes, retained-device-memory COUNT(*), int4 equality-predicate COUNT(*), int4 membership-predicate COUNT(*), int4 range-predicate COUNT(*), int4 BETWEEN-predicate COUNT(*), int4 scalar SUM/AVG/MIN/MAX, int4 filtered scalar SUM/AVG/MIN/MAX, int4 BETWEEN scalar SUM/AVG/MIN/MAX, int4 predicate-projection, int4 paginated distinct projection, int4 paginated filtered distinct projection, bounded int4 paginated filtered ordered-projection, int4 grouped COUNT/SUM/AVG/MIN/MAX with grouped HAVING, and int4 filtered grouped COUNT/SUM/AVG/MIN/MAX with filtered grouped HAVING proofs over the resident allocation, resident-byte accounting, WAL-safe invalidation, manual refresh-cost accounting, memory-pressure fallback metadata, deterministic resident-snapshot budget admission/eviction, and a retained real CUDA allocation/copy handle for encoded snapshot bytes when local driver hardware is available. Keep broad production CUDA cache claims out of scope until broader expression kernels read directly from retained device-memory handles."
+        "decision: current P7 evidence includes bounded resident table-data snapshot SELECT probes with zero per-query H2D transfer for the app lookup workload and supported aggregate/distinct SQL shapes, retained-device-memory COUNT(*), int4 equality-predicate COUNT(*), int4 membership-predicate COUNT(*), int4 range-predicate COUNT(*), int4 BETWEEN-predicate COUNT(*), retained int4 AND/OR filter-group COUNT(*), int4 scalar SUM/AVG/MIN/MAX, int4 filtered scalar SUM/AVG/MIN/MAX, int4 BETWEEN scalar SUM/AVG/MIN/MAX, int4 predicate-projection, int4 paginated distinct projection, int4 paginated filtered distinct projection, bounded int4 paginated filtered ordered-projection, int4 grouped COUNT/SUM/AVG/MIN/MAX with grouped HAVING, and int4 filtered grouped COUNT/SUM/AVG/MIN/MAX with filtered grouped HAVING proofs over the resident allocation, resident-byte accounting, WAL-safe invalidation, manual refresh-cost accounting, memory-pressure fallback metadata, deterministic resident-snapshot budget admission/eviction, and a retained real CUDA allocation/copy handle for encoded snapshot bytes when local driver hardware is available. Retained text prefix LIKE and broader expression kernels remain the production CUDA-cache boundary."
     );
 
     Ok(())
@@ -768,6 +788,43 @@ fn timed_resident_device_filtered_count_probe(
     let correctness_validated = result.columns == expected.columns && result.rows == expected.rows;
     if !correctness_validated {
         return Err(format!("{name} resident device-memory filtered count diverged").into());
+    }
+    Ok(ProbeReport {
+        name,
+        elapsed,
+        result_rows: result.rows.len(),
+        planned_target: format!("{:?}", result.planned_target),
+        executed_target: format!("{:?}", result.executed_target),
+        access_path: format!("{:?}", result.access_path),
+        sql_fallback: result.fallback_reason.is_some(),
+        fallback_reason: result
+            .fallback_reason
+            .as_ref()
+            .map(|reason| format!("{reason:?}"))
+            .unwrap_or_else(|| "None".to_string()),
+        h2d_bytes: after.h2d_bytes_total - before.h2d_bytes_total,
+        d2h_bytes: after.d2h_bytes_total - before.d2h_bytes_total,
+        kernel_exec_samples: after.kernel_exec_samples - before.kernel_exec_samples,
+        kernel_exec_total_ms: after.kernel_exec_total_ms - before.kernel_exec_total_ms,
+        correctness_validated,
+    })
+}
+
+fn timed_resident_device_filter_group_count_probe(
+    engine: &mut Engine,
+    query: &Select,
+    expected: &RelationalSelectResult,
+    name: &'static str,
+) -> Result<ProbeReport, Box<dyn Error>> {
+    let before = engine.metrics().snapshot();
+    let start = Instant::now();
+    let result =
+        engine.execute_relational_filter_group_count_with_resident_device_memory_probe(query)?;
+    let elapsed = start.elapsed();
+    let after = engine.metrics().snapshot();
+    let correctness_validated = result.columns == expected.columns && result.rows == expected.rows;
+    if !correctness_validated {
+        return Err(format!("{name} resident device-memory filter-group count diverged").into());
     }
     Ok(ProbeReport {
         name,
