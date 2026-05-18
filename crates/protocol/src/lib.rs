@@ -102,7 +102,9 @@ pub struct CommentOn {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommentTarget {
     Database { database: String },
+    Role { role: String },
     Schema { schema: String },
+    Tablespace { tablespace: String },
     Table { table: String },
     Column { table: String, column: String },
     Index { index: String },
@@ -1695,6 +1697,15 @@ fn parse_comment_on(input: &str) -> Result<CommentOn, ParseError> {
             CommentTarget::Database { database },
             rest[is_pos + "IS".len()..].trim(),
         )
+    } else if let Some(rest) = strip_keyword_prefix_case_insensitive(rest, "ROLE") {
+        let rest = rest.trim_start();
+        let is_pos =
+            find_keyword_outside_quotes(rest, "IS").ok_or(ParseError::InvalidRelationalSql)?;
+        let role = normalize_identifier(rest[..is_pos].trim())?;
+        (
+            CommentTarget::Role { role },
+            rest[is_pos + "IS".len()..].trim(),
+        )
     } else if let Some(rest) = strip_keyword_prefix_case_insensitive(rest, "SCHEMA") {
         let rest = rest.trim_start();
         let is_pos =
@@ -1702,6 +1713,15 @@ fn parse_comment_on(input: &str) -> Result<CommentOn, ParseError> {
         let schema = normalize_identifier(rest[..is_pos].trim())?;
         (
             CommentTarget::Schema { schema },
+            rest[is_pos + "IS".len()..].trim(),
+        )
+    } else if let Some(rest) = strip_keyword_prefix_case_insensitive(rest, "TABLESPACE") {
+        let rest = rest.trim_start();
+        let is_pos =
+            find_keyword_outside_quotes(rest, "IS").ok_or(ParseError::InvalidRelationalSql)?;
+        let tablespace = normalize_identifier(rest[..is_pos].trim())?;
+        (
+            CommentTarget::Tablespace { tablespace },
             rest[is_pos + "IS".len()..].trim(),
         )
     } else if let Some(rest) = strip_keyword_prefix_case_insensitive(rest, "TABLE") {
@@ -9396,6 +9416,26 @@ mod tests {
                     schema: "public".to_string(),
                 },
                 comment: Some("application schema".to_string()),
+            })
+        );
+
+        assert_eq!(
+            parse_command("COMMENT ON ROLE postgres IS 'bootstrap role'").unwrap(),
+            Command::CommentOn(CommentOn {
+                target: CommentTarget::Role {
+                    role: "postgres".to_string(),
+                },
+                comment: Some("bootstrap role".to_string()),
+            })
+        );
+
+        assert_eq!(
+            parse_command("COMMENT ON TABLESPACE pg_default IS 'default storage'").unwrap(),
+            Command::CommentOn(CommentOn {
+                target: CommentTarget::Tablespace {
+                    tablespace: "pg_default".to_string(),
+                },
+                comment: Some("default storage".to_string()),
             })
         );
 

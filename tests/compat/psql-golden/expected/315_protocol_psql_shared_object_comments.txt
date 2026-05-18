@@ -1,0 +1,56 @@
+Pager usage is off.
+=== shared object comments ===
+COMMENT
+COMMENT
+COMMENT
+                                      List of roles
+ Role name |                         Attributes                         |  Description
+-----------+------------------------------------------------------------+----------------
+ postgres  | Superuser, Create role, Create DB, Replication, Bypass RLS | bootstrap role
+
+                                    List of tablespaces
+    Name    |  Owner   | Location | Access privileges | Options |  Size   |   Description
+------------+----------+----------+-------------------+---------+---------+-----------------
+ pg_default | postgres |          |                   |         | 0 bytes | default storage
+ pg_global  | postgres |          |                   |         | 0 bytes | global storage
+(2 rows)
+
+  role_comment
+----------------
+ bootstrap role
+(1 row)
+
+ tablespace_comment
+--------------------
+ default storage
+(1 row)
+
+ global_tablespace_comment
+---------------------------
+ global storage
+(1 row)
+
+COMMENT
+COMMENT
+COMMENT
+ role_comment_cleared
+----------------------
+ t
+(1 row)
+
+ tablespace_comment_cleared
+----------------------------
+ t
+(1 row)
+
+ global_tablespace_comment_cleared
+-----------------------------------
+ t
+(1 row)
+
+psql:315_protocol_psql_shared_object_comments.sql:17: ERROR:  role does not exist
+psql:315_protocol_psql_shared_object_comments.sql:18: ERROR:  tablespace does not exist
+                             List of roles
+ Role name |                         Attributes
+-----------+------------------------------------------------------------
+ postgres  | Superuser, Create role, Create DB, Replication, Bypass RLS

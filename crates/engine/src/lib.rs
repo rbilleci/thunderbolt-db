@@ -5991,7 +5991,9 @@ pub struct RelationalView {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RelationalCommentTarget {
     Database { database: String },
+    Role { role: String },
     Schema { schema: String },
+    Tablespace { tablespace: String },
     Table { table: String },
     Column { table: String, attnum: i16 },
     Index { index: String },
@@ -7872,6 +7874,15 @@ impl Engine {
                 }
                 RelationalCommentTarget::Database { database }
             }
+            CommentTarget::Role { role } => {
+                if role != "postgres" {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "role \"{}\" does not exist",
+                        role
+                    )));
+                }
+                RelationalCommentTarget::Role { role }
+            }
             CommentTarget::Schema { schema } => {
                 if schema != "public" {
                     return Err(EngineError::ApplyFailed(format!(
@@ -7880,6 +7891,15 @@ impl Engine {
                     )));
                 }
                 RelationalCommentTarget::Schema { schema }
+            }
+            CommentTarget::Tablespace { tablespace } => {
+                if tablespace != "pg_default" && tablespace != "pg_global" {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "tablespace \"{}\" does not exist",
+                        tablespace
+                    )));
+                }
+                RelationalCommentTarget::Tablespace { tablespace }
             }
             CommentTarget::Table { table } => {
                 if !self.relational_catalog.contains_key(&table) {
@@ -11852,10 +11872,26 @@ impl Engine {
             .map(String::as_str)
     }
 
+    pub fn relational_role_comment(&self, role: &str) -> Option<&str> {
+        self.relational_comments
+            .get(&RelationalCommentTarget::Role {
+                role: role.to_string(),
+            })
+            .map(String::as_str)
+    }
+
     pub fn relational_schema_comment(&self, schema: &str) -> Option<&str> {
         self.relational_comments
             .get(&RelationalCommentTarget::Schema {
                 schema: schema.to_string(),
+            })
+            .map(String::as_str)
+    }
+
+    pub fn relational_tablespace_comment(&self, tablespace: &str) -> Option<&str> {
+        self.relational_comments
+            .get(&RelationalCommentTarget::Tablespace {
+                tablespace: tablespace.to_string(),
             })
             .map(String::as_str)
     }
@@ -31775,43 +31811,61 @@ mod tests {
             .unwrap();
         e.execute_text(2, "COMMENT ON DATABASE postgres IS 'primary database'")
             .unwrap();
-        e.execute_text(3, "COMMENT ON SCHEMA public IS 'application schema'")
+        e.execute_text(3, "COMMENT ON ROLE postgres IS 'bootstrap role'")
             .unwrap();
-        e.execute_text(4, "COMMENT ON TABLE public.people IS 'lookup people'")
+        e.execute_text(4, "COMMENT ON SCHEMA public IS 'application schema'")
             .unwrap();
-        e.execute_text(5, "COMMENT ON COLUMN public.people.name IS 'display name'")
+        e.execute_text(5, "COMMENT ON TABLESPACE pg_default IS 'default storage'")
             .unwrap();
-        e.execute_text(6, "CREATE INDEX people_name_idx ON people (name)")
+        e.execute_text(6, "COMMENT ON TABLESPACE pg_global IS 'global storage'")
+            .unwrap();
+        e.execute_text(7, "COMMENT ON TABLE public.people IS 'lookup people'")
+            .unwrap();
+        e.execute_text(8, "COMMENT ON COLUMN public.people.name IS 'display name'")
+            .unwrap();
+        e.execute_text(9, "CREATE INDEX people_name_idx ON people (name)")
             .unwrap();
         e.execute_text(
-            7,
+            10,
             "COMMENT ON INDEX public.people_name_idx IS 'name lookup'",
         )
         .unwrap();
         e.execute_text(
-            8,
+            11,
             "ALTER TABLE ONLY public.people ADD CONSTRAINT people_pkey PRIMARY KEY (id)",
         )
         .unwrap();
         e.execute_text(
-            9,
+            12,
             "COMMENT ON CONSTRAINT people_pkey ON public.people IS 'row identity'",
         )
         .unwrap();
         e.execute_text(
-            10,
+            13,
             "CREATE VIEW public.people_lookup AS SELECT id, name FROM people WHERE id > 0 ORDER BY id",
         )
         .unwrap();
-        e.execute_text(11, "COMMENT ON VIEW public.people_lookup IS 'lookup view'")
+        e.execute_text(14, "COMMENT ON VIEW public.people_lookup IS 'lookup view'")
             .unwrap();
         assert_eq!(
             e.relational_database_comment("postgres"),
             Some("primary database")
         );
         assert_eq!(
+            e.relational_role_comment("postgres"),
+            Some("bootstrap role")
+        );
+        assert_eq!(
             e.relational_schema_comment("public"),
             Some("application schema")
+        );
+        assert_eq!(
+            e.relational_tablespace_comment("pg_default"),
+            Some("default storage")
+        );
+        assert_eq!(
+            e.relational_tablespace_comment("pg_global"),
+            Some("global storage")
         );
         assert_eq!(e.relational_table_comment("people"), Some("lookup people"));
         assert_eq!(
@@ -31837,8 +31891,20 @@ mod tests {
             Some("primary database")
         );
         assert_eq!(
+            recovered.relational_role_comment("postgres"),
+            Some("bootstrap role")
+        );
+        assert_eq!(
             recovered.relational_schema_comment("public"),
             Some("application schema")
+        );
+        assert_eq!(
+            recovered.relational_tablespace_comment("pg_default"),
+            Some("default storage")
+        );
+        assert_eq!(
+            recovered.relational_tablespace_comment("pg_global"),
+            Some("global storage")
         );
         assert_eq!(
             recovered.relational_table_comment("people"),
@@ -31861,23 +31927,32 @@ mod tests {
             Some("lookup view")
         );
 
-        e.execute_text(12, "COMMENT ON DATABASE postgres IS NULL")
+        e.execute_text(15, "COMMENT ON DATABASE postgres IS NULL")
             .unwrap();
         assert_eq!(e.relational_database_comment("postgres"), None);
-        e.execute_text(13, "COMMENT ON SCHEMA public IS NULL")
+        e.execute_text(16, "COMMENT ON ROLE postgres IS NULL")
+            .unwrap();
+        assert_eq!(e.relational_role_comment("postgres"), None);
+        e.execute_text(17, "COMMENT ON SCHEMA public IS NULL")
             .unwrap();
         assert_eq!(e.relational_schema_comment("public"), None);
-        e.execute_text(14, "COMMENT ON COLUMN public.people.name IS NULL")
+        e.execute_text(18, "COMMENT ON TABLESPACE pg_default IS NULL")
+            .unwrap();
+        assert_eq!(e.relational_tablespace_comment("pg_default"), None);
+        e.execute_text(19, "COMMENT ON TABLESPACE pg_global IS NULL")
+            .unwrap();
+        assert_eq!(e.relational_tablespace_comment("pg_global"), None);
+        e.execute_text(20, "COMMENT ON COLUMN public.people.name IS NULL")
             .unwrap();
         assert_eq!(e.relational_column_comment("people", 2), None);
-        e.execute_text(15, "DROP INDEX people_name_idx").unwrap();
+        e.execute_text(21, "DROP INDEX people_name_idx").unwrap();
         assert_eq!(e.relational_index_comment("people_name_idx"), None);
-        e.execute_text(16, "DROP INDEX people_pkey").unwrap();
+        e.execute_text(22, "DROP INDEX people_pkey").unwrap();
         assert_eq!(
             e.relational_constraint_comment("people", "people_pkey"),
             None
         );
-        e.execute_text(17, "DROP VIEW people_lookup").unwrap();
+        e.execute_text(23, "DROP VIEW people_lookup").unwrap();
         assert_eq!(e.relational_view_comment("people_lookup"), None);
 
         let mut missing = Engine::new_local();
@@ -31927,6 +32002,16 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("database \"template1\" does not exist"));
+        assert!(Engine::new_local()
+            .execute_text(1, "COMMENT ON ROLE missing_role IS 'bad'")
+            .unwrap_err()
+            .to_string()
+            .contains("role \"missing_role\" does not exist"));
+        assert!(Engine::new_local()
+            .execute_text(1, "COMMENT ON TABLESPACE missing_space IS 'bad'")
+            .unwrap_err()
+            .to_string()
+            .contains("tablespace \"missing_space\" does not exist"));
     }
 
     #[test]

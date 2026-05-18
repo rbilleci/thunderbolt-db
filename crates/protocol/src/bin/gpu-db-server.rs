@@ -1644,7 +1644,9 @@ struct CatalogIndex {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum CatalogCommentTarget {
     Database { database: String },
+    Role { role: String },
     Schema { schema: String },
+    Tablespace { tablespace: String },
     Table { table: String },
     Column { table: String, attnum: i16 },
     Index { index: String },
@@ -5448,7 +5450,9 @@ fn execute_statement(
                 | CatalogCommentTarget::Constraint { table, .. } => table == &drop.table,
                 CatalogCommentTarget::Index { index } => dropped_index_names.contains(index),
                 CatalogCommentTarget::Database { .. } => false,
+                CatalogCommentTarget::Role { .. } => false,
                 CatalogCommentTarget::Schema { .. } => false,
+                CatalogCommentTarget::Tablespace { .. } => false,
                 CatalogCommentTarget::View { .. } => false,
             })
             .cloned()
@@ -5666,6 +5670,142 @@ fn execute_statement(
                     database: "postgres".to_string(),
                 })
                 .cloned()]],
+        );
+    }
+    if canonical == "select pg_catalog.shobj_description(10, 'pg_authid')" {
+        return write_single_row(
+            stream,
+            &[text_column("shobj_description")],
+            &[vec![session
+                .comments
+                .get(&CatalogCommentTarget::Role {
+                    role: "postgres".to_string(),
+                })
+                .cloned()]],
+        );
+    }
+    if canonical == "select pg_catalog.shobj_description(10, 'pg_authid') as role_comment" {
+        return write_single_row(
+            stream,
+            &[text_column("role_comment")],
+            &[vec![session
+                .comments
+                .get(&CatalogCommentTarget::Role {
+                    role: "postgres".to_string(),
+                })
+                .cloned()]],
+        );
+    }
+    if canonical
+        == "select pg_catalog.shobj_description(10, 'pg_authid') is null as role_comment_cleared"
+    {
+        return write_single_row(
+            stream,
+            &[bool_column("role_comment_cleared")],
+            &[vec![Some(
+                if session.comments.contains_key(&CatalogCommentTarget::Role {
+                    role: "postgres".to_string(),
+                }) {
+                    "f"
+                } else {
+                    "t"
+                }
+                .to_string(),
+            )]],
+        );
+    }
+    if canonical == "select pg_catalog.shobj_description(1663, 'pg_tablespace')" {
+        return write_single_row(
+            stream,
+            &[text_column("shobj_description")],
+            &[vec![session
+                .comments
+                .get(&CatalogCommentTarget::Tablespace {
+                    tablespace: "pg_default".to_string(),
+                })
+                .cloned()]],
+        );
+    }
+    if canonical
+        == "select pg_catalog.shobj_description(1663, 'pg_tablespace') as tablespace_comment"
+    {
+        return write_single_row(
+            stream,
+            &[text_column("tablespace_comment")],
+            &[vec![session
+                .comments
+                .get(&CatalogCommentTarget::Tablespace {
+                    tablespace: "pg_default".to_string(),
+                })
+                .cloned()]],
+        );
+    }
+    if canonical
+        == "select pg_catalog.shobj_description(1663, 'pg_tablespace') is null as tablespace_comment_cleared"
+    {
+        return write_single_row(
+            stream,
+            &[bool_column("tablespace_comment_cleared")],
+            &[vec![Some(
+                if session
+                    .comments
+                    .contains_key(&CatalogCommentTarget::Tablespace {
+                        tablespace: "pg_default".to_string(),
+                    })
+                {
+                    "f"
+                } else {
+                    "t"
+                }
+                .to_string(),
+            )]],
+        );
+    }
+    if canonical == "select pg_catalog.shobj_description(1664, 'pg_tablespace')" {
+        return write_single_row(
+            stream,
+            &[text_column("shobj_description")],
+            &[vec![session
+                .comments
+                .get(&CatalogCommentTarget::Tablespace {
+                    tablespace: "pg_global".to_string(),
+                })
+                .cloned()]],
+        );
+    }
+    if canonical
+        == "select pg_catalog.shobj_description(1664, 'pg_tablespace') as global_tablespace_comment"
+    {
+        return write_single_row(
+            stream,
+            &[text_column("global_tablespace_comment")],
+            &[vec![session
+                .comments
+                .get(&CatalogCommentTarget::Tablespace {
+                    tablespace: "pg_global".to_string(),
+                })
+                .cloned()]],
+        );
+    }
+    if canonical
+        == "select pg_catalog.shobj_description(1664, 'pg_tablespace') is null as global_tablespace_comment_cleared"
+    {
+        return write_single_row(
+            stream,
+            &[bool_column("global_tablespace_comment_cleared")],
+            &[vec![Some(
+                if session
+                    .comments
+                    .contains_key(&CatalogCommentTarget::Tablespace {
+                        tablespace: "pg_global".to_string(),
+                    })
+                {
+                    "f"
+                } else {
+                    "t"
+                }
+                .to_string(),
+            )]],
         );
     }
     if is_pg_dump_index_metadata_query(&canonical) {
@@ -6050,7 +6190,9 @@ fn execute_statement(
                                 constraint == &drop.name
                             }
                             CatalogCommentTarget::Database { .. }
+                            | CatalogCommentTarget::Role { .. }
                             | CatalogCommentTarget::Schema { .. }
+                            | CatalogCommentTarget::Tablespace { .. }
                             | CatalogCommentTarget::Table { .. }
                             | CatalogCommentTarget::Column { .. }
                             | CatalogCommentTarget::Index { .. }
@@ -6121,6 +6263,19 @@ fn execute_statement(
                         }
                         CatalogCommentTarget::Database { database }
                     }
+                    CommentTarget::Role { role } => {
+                        if role != "postgres" {
+                            return write_error(
+                                stream,
+                                &ErrorField {
+                                    code: "42704",
+                                    message: "role does not exist",
+                                    position: None,
+                                },
+                            );
+                        }
+                        CatalogCommentTarget::Role { role }
+                    }
                     CommentTarget::Schema { schema } => {
                         if schema != "public" {
                             return write_error(
@@ -6133,6 +6288,19 @@ fn execute_statement(
                             );
                         }
                         CatalogCommentTarget::Schema { schema }
+                    }
+                    CommentTarget::Tablespace { tablespace } => {
+                        if tablespace != "pg_default" && tablespace != "pg_global" {
+                            return write_error(
+                                stream,
+                                &ErrorField {
+                                    code: "42704",
+                                    message: "tablespace does not exist",
+                                    position: None,
+                                },
+                            );
+                        }
+                        CatalogCommentTarget::Tablespace { tablespace }
                     }
                     CommentTarget::Table { table } => {
                         if !session.tables.contains_key(&table) {
@@ -6962,22 +7130,29 @@ fn execute_statement(
             &catalog_empty_rows(),
         );
     }
-    if canonical == psql_describe_roles_catalog_query() {
+    if canonical == psql_describe_roles_catalog_query()
+        || canonical == psql_describe_roles_verbose_catalog_query()
+    {
+        let verbose = canonical == psql_describe_roles_verbose_catalog_query();
+        let mut columns = vec![
+            text_column("rolname"),
+            bool_column("rolsuper"),
+            bool_column("rolinherit"),
+            bool_column("rolcreaterole"),
+            bool_column("rolcreatedb"),
+            bool_column("rolcanlogin"),
+            int4_column("rolconnlimit"),
+            text_column("rolvaliduntil"),
+        ];
+        if verbose {
+            columns.push(text_column("Description"));
+        }
+        columns.push(bool_column("rolreplication"));
+        columns.push(bool_column("rolbypassrls"));
         return write_single_row(
             stream,
-            &[
-                text_column("rolname"),
-                bool_column("rolsuper"),
-                bool_column("rolinherit"),
-                bool_column("rolcreaterole"),
-                bool_column("rolcreatedb"),
-                bool_column("rolcanlogin"),
-                int4_column("rolconnlimit"),
-                text_column("rolvaliduntil"),
-                bool_column("rolreplication"),
-                bool_column("rolbypassrls"),
-            ],
-            &catalog_psql_describe_role_rows(),
+            &columns,
+            &catalog_psql_describe_role_rows(session, verbose),
         );
     }
     if canonical == "select oid, rolname from pg_catalog.pg_roles order by 1" {
@@ -7032,7 +7207,22 @@ fn execute_statement(
                 text_column("Owner"),
                 text_column("Location"),
             ],
-            &catalog_psql_list_tablespace_rows(),
+            &catalog_psql_list_tablespace_rows(session, false),
+        );
+    }
+    if canonical == psql_list_tablespaces_verbose_catalog_query() {
+        return write_single_row(
+            stream,
+            &[
+                text_column("Name"),
+                text_column("Owner"),
+                text_column("Location"),
+                text_column("Access privileges"),
+                text_column("Options"),
+                text_column("Size"),
+                text_column("Description"),
+            ],
+            &catalog_psql_list_tablespace_rows(session, true),
         );
     }
     if canonical == psql_list_access_methods_catalog_query() {
@@ -8286,8 +8476,12 @@ fn psql_describe_roles_catalog_query() -> &'static str {
     "select r.rolname, r.rolsuper, r.rolinherit, r.rolcreaterole, r.rolcreatedb, r.rolcanlogin, r.rolconnlimit, r.rolvaliduntil , r.rolreplication , r.rolbypassrls from pg_catalog.pg_roles r where r.rolname !~ '^pg_' order by 1"
 }
 
-fn catalog_psql_describe_role_rows() -> Vec<Vec<Option<String>>> {
-    vec![vec![
+fn psql_describe_roles_verbose_catalog_query() -> &'static str {
+    "select r.rolname, r.rolsuper, r.rolinherit, r.rolcreaterole, r.rolcreatedb, r.rolcanlogin, r.rolconnlimit, r.rolvaliduntil , pg_catalog.shobj_description(r.oid, 'pg_authid') as description , r.rolreplication , r.rolbypassrls from pg_catalog.pg_roles r where r.rolname !~ '^pg_' order by 1"
+}
+
+fn catalog_psql_describe_role_rows(session: &Session, verbose: bool) -> Vec<Vec<Option<String>>> {
+    let mut row = vec![
         Some("postgres".to_string()),
         Some("t".to_string()),
         Some("t".to_string()),
@@ -8296,9 +8490,19 @@ fn catalog_psql_describe_role_rows() -> Vec<Vec<Option<String>>> {
         Some("t".to_string()),
         Some("-1".to_string()),
         None,
-        Some("t".to_string()),
-        Some("t".to_string()),
-    ]]
+    ];
+    if verbose {
+        row.push(
+            session
+                .comments
+                .get(&CatalogCommentTarget::Role {
+                    role: "postgres".to_string(),
+                })
+                .cloned(),
+        );
+    }
+    row.extend([Some("t".to_string()), Some("t".to_string())]);
+    vec![row]
 }
 
 fn psql_list_databases_catalog_query() -> &'static str {
@@ -8349,19 +8553,34 @@ fn psql_list_tablespaces_catalog_query() -> &'static str {
     "select spcname as \"name\", pg_catalog.pg_get_userbyid(spcowner) as \"owner\", pg_catalog.pg_tablespace_location(oid) as \"location\" from pg_catalog.pg_tablespace order by 1"
 }
 
-fn catalog_psql_list_tablespace_rows() -> Vec<Vec<Option<String>>> {
-    vec![
-        vec![
-            Some("pg_default".to_string()),
+fn psql_list_tablespaces_verbose_catalog_query() -> &'static str {
+    "select spcname as \"name\", pg_catalog.pg_get_userbyid(spcowner) as \"owner\", pg_catalog.pg_tablespace_location(oid) as \"location\", pg_catalog.array_to_string(spcacl, e'\\n') as \"access privileges\", spcoptions as \"options\", pg_catalog.pg_size_pretty(pg_catalog.pg_tablespace_size(oid)) as \"size\", pg_catalog.shobj_description(oid, 'pg_tablespace') as \"description\" from pg_catalog.pg_tablespace order by 1"
+}
+
+fn catalog_psql_list_tablespace_rows(session: &Session, verbose: bool) -> Vec<Vec<Option<String>>> {
+    let mut rows = Vec::new();
+    for name in ["pg_default", "pg_global"] {
+        let mut row = vec![
+            Some(name.to_string()),
             Some("postgres".to_string()),
             Some(String::new()),
-        ],
-        vec![
-            Some("pg_global".to_string()),
-            Some("postgres".to_string()),
-            Some(String::new()),
-        ],
-    ]
+        ];
+        if verbose {
+            row.push(None);
+            row.push(None);
+            row.push(Some("0 bytes".to_string()));
+            row.push(
+                session
+                    .comments
+                    .get(&CatalogCommentTarget::Tablespace {
+                        tablespace: name.to_string(),
+                    })
+                    .cloned(),
+            );
+        }
+        rows.push(row);
+    }
+    rows
 }
 
 fn psql_list_access_methods_catalog_query() -> &'static str {
@@ -10993,7 +11212,9 @@ fn pg_dump_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
         .filter_map(|(target, description)| match target {
             CatalogCommentTarget::Index { index } => Some((index, description)),
             CatalogCommentTarget::Database { .. }
+            | CatalogCommentTarget::Role { .. }
             | CatalogCommentTarget::Schema { .. }
+            | CatalogCommentTarget::Tablespace { .. }
             | CatalogCommentTarget::Table { .. }
             | CatalogCommentTarget::Column { .. }
             | CatalogCommentTarget::View { .. }
@@ -11019,7 +11240,9 @@ fn pg_dump_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
                 Some((table, constraint, description))
             }
             CatalogCommentTarget::Database { .. }
+            | CatalogCommentTarget::Role { .. }
             | CatalogCommentTarget::Schema { .. }
+            | CatalogCommentTarget::Tablespace { .. }
             | CatalogCommentTarget::Table { .. }
             | CatalogCommentTarget::Column { .. }
             | CatalogCommentTarget::View { .. }
@@ -14685,7 +14908,11 @@ mod tests {
             "select r.rolname, r.rolsuper, r.rolinherit, r.rolcreaterole, r.rolcreatedb, r.rolcanlogin, r.rolconnlimit, r.rolvaliduntil , r.rolreplication , r.rolbypassrls from pg_catalog.pg_roles r where r.rolname !~ '^pg_' order by 1"
         );
         assert_eq!(
-            catalog_psql_describe_role_rows(),
+            psql_describe_roles_verbose_catalog_query(),
+            "select r.rolname, r.rolsuper, r.rolinherit, r.rolcreaterole, r.rolcreatedb, r.rolcanlogin, r.rolconnlimit, r.rolvaliduntil , pg_catalog.shobj_description(r.oid, 'pg_authid') as description , r.rolreplication , r.rolbypassrls from pg_catalog.pg_roles r where r.rolname !~ '^pg_' order by 1"
+        );
+        assert_eq!(
+            catalog_psql_describe_role_rows(&Session::default(), false),
             vec![vec![
                 Some("postgres".to_string()),
                 Some("t".to_string()),
@@ -14698,6 +14925,17 @@ mod tests {
                 Some("t".to_string()),
                 Some("t".to_string()),
             ]]
+        );
+        let mut commented_role = Session::default();
+        commented_role.comments.insert(
+            CatalogCommentTarget::Role {
+                role: "postgres".to_string(),
+            },
+            "bootstrap role".to_string(),
+        );
+        assert_eq!(
+            catalog_psql_describe_role_rows(&commented_role, true)[0][8],
+            Some("bootstrap role".to_string())
         );
         assert_eq!(
             psql_list_databases_catalog_query(),
@@ -14737,7 +14975,11 @@ mod tests {
             "select spcname as \"name\", pg_catalog.pg_get_userbyid(spcowner) as \"owner\", pg_catalog.pg_tablespace_location(oid) as \"location\" from pg_catalog.pg_tablespace order by 1"
         );
         assert_eq!(
-            catalog_psql_list_tablespace_rows(),
+            psql_list_tablespaces_verbose_catalog_query(),
+            "select spcname as \"name\", pg_catalog.pg_get_userbyid(spcowner) as \"owner\", pg_catalog.pg_tablespace_location(oid) as \"location\", pg_catalog.array_to_string(spcacl, e'\\n') as \"access privileges\", spcoptions as \"options\", pg_catalog.pg_size_pretty(pg_catalog.pg_tablespace_size(oid)) as \"size\", pg_catalog.shobj_description(oid, 'pg_tablespace') as \"description\" from pg_catalog.pg_tablespace order by 1"
+        );
+        assert_eq!(
+            catalog_psql_list_tablespace_rows(&Session::default(), false),
             vec![
                 vec![
                     Some("pg_default".to_string()),
@@ -14750,6 +14992,17 @@ mod tests {
                     Some(String::new()),
                 ],
             ]
+        );
+        let mut commented_tablespace = Session::default();
+        commented_tablespace.comments.insert(
+            CatalogCommentTarget::Tablespace {
+                tablespace: "pg_default".to_string(),
+            },
+            "default storage".to_string(),
+        );
+        assert_eq!(
+            catalog_psql_list_tablespace_rows(&commented_tablespace, true)[0][6],
+            Some("default storage".to_string())
         );
         assert_eq!(
             psql_list_access_methods_catalog_query(),
@@ -21088,10 +21341,22 @@ mod tests {
             "primary database".to_string(),
         );
         session.comments.insert(
+            CatalogCommentTarget::Role {
+                role: "postgres".to_string(),
+            },
+            "bootstrap role".to_string(),
+        );
+        session.comments.insert(
             CatalogCommentTarget::Schema {
                 schema: "public".to_string(),
             },
             "application schema".to_string(),
+        );
+        session.comments.insert(
+            CatalogCommentTarget::Tablespace {
+                tablespace: "pg_default".to_string(),
+            },
+            "default storage".to_string(),
         );
         session.tables.insert(
             "commented".to_string(),
@@ -21154,6 +21419,14 @@ mod tests {
             "lookup view".to_string(),
         );
 
+        assert_eq!(
+            catalog_psql_describe_role_rows(&session, true)[0][8],
+            Some("bootstrap role".to_string())
+        );
+        assert_eq!(
+            catalog_psql_list_tablespace_rows(&session, true)[0][6],
+            Some("default storage".to_string())
+        );
         assert_eq!(
             catalog_psql_describe_schema_verbose_rows(&session),
             vec![vec![
