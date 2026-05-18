@@ -1,0 +1,11 @@
+=== psql copy meta csv header program recovery ===
+CREATE TABLE
+COPY 2
+COPY 2
+id,name
+1,Ada
+2,"Grace, ""Hopper"""
+      name
+-----------------
+ Grace, "Hopper"
+(1 row)

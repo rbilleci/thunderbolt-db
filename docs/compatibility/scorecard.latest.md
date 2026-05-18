@@ -1,32 +1,31 @@
 # Compatibility Scorecard
 
 ## Totals
-- total: 1044
-- passed: 1044
+- total: 1048
+- passed: 1048
 - failed: 0
 - ignored: 0
 
 ## Bucket Summary
-- durability.invariants: total=88 passed=88 failed=0 ignored=0
+- durability.invariants: total=83 passed=83 failed=0 ignored=0
 - execution.gpu_routing_and_batching: total=86 passed=86 failed=0 ignored=0
-- protocol.client_flows: total=119 passed=119 failed=0 ignored=0
-- protocol.error_paths: total=104 passed=104 failed=0 ignored=0
+- protocol.client_flows: total=72 passed=72 failed=0 ignored=0
+- protocol.error_paths: total=94 passed=94 failed=0 ignored=0
 - protocol.extended_query: total=309 passed=309 failed=0 ignored=0
 - replication.operational_cluster: total=6 passed=6 failed=0 ignored=0
-- replication.role_and_log: total=227 passed=227 failed=0 ignored=0
+- replication.role_and_log: total=174 passed=174 failed=0 ignored=0
 - sql.catalog_schema_types: total=90 passed=90 failed=0 ignored=0
 - sql.gpu_bridge: total=23 passed=23 failed=0 ignored=0
-- sql.parser_features: total=59 passed=59 failed=0 ignored=0
 - sql.relational_foundation: total=111 passed=111 failed=0 ignored=0
 - sql.transaction_flows: total=99 passed=99 failed=0 ignored=0
 - storage.indexing: total=34 passed=34 failed=0 ignored=0
-- uncategorized: total=183 passed=183 failed=0 ignored=0
+- uncategorized: total=230 passed=230 failed=0 ignored=0
 
 ## Top failing categories
 - none
 
 ## Trend hook
-- {"baseline_available": true, "baseline_failed": 0, "current_failed": 0, "failed_delta": 0, "bucket_failed_delta": {"durability.invariants": 0, "execution.gpu_routing_and_batching": 0, "protocol.client_flows": 0, "protocol.error_paths": 0, "protocol.extended_query": 0, "replication.operational_cluster": 0, "replication.role_and_log": 0, "sql.catalog_schema_types": 0, "sql.gpu_bridge": 0, "sql.parser_features": 0, "sql.relational_foundation": 0, "sql.transaction_flows": 0, "storage.indexing": 0, "uncategorized": 0}}
+- {"baseline_available": true, "baseline_failed": 0, "current_failed": 0, "failed_delta": 0, "bucket_failed_delta": {"durability.invariants": 0, "execution.gpu_routing_and_batching": 0, "protocol.client_flows": 0, "protocol.error_paths": 0, "protocol.extended_query": 0, "replication.operational_cluster": 0, "replication.role_and_log": 0, "sql.catalog_schema_types": 0, "sql.gpu_bridge": 0, "sql.relational_foundation": 0, "sql.transaction_flows": 0, "storage.indexing": 0, "uncategorized": 0}}
 
 ## Bucket failed deltas vs baseline
 - durability.invariants: +0
@@ -38,7 +37,6 @@
 - replication.role_and_log: +0
 - sql.catalog_schema_types: +0
 - sql.gpu_bridge: +0
-- sql.parser_features: +0
 - sql.relational_foundation: +0
 - sql.transaction_flows: +0
 - storage.indexing: +0
