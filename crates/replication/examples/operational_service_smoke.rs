@@ -45,6 +45,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     if args.get(1).map(String::as_str) == Some("--supervised-restart") {
         return run_supervised_restart_parent();
     }
+    if args.get(1).map(String::as_str) == Some("--container-supervised-restart") {
+        return run_container_supervised_restart_parent(&args[2..]);
+    }
     run_parent(&args[1..])
 }
 
@@ -355,6 +358,216 @@ fn run_supervised_restart_parent() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn run_container_supervised_restart_parent(args: &[String]) -> Result<(), Box<dyn Error>> {
+    let mut restarting_follower = None;
+    let mut stable_follower = None;
+    let mut restart_container = None;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--restarting-follower" => {
+                restarting_follower = Some(parse_external_follower(
+                    iter.next().ok_or("missing --restarting-follower value")?,
+                )?);
+            }
+            "--stable-follower" => {
+                stable_follower = Some(parse_external_follower(
+                    iter.next().ok_or("missing --stable-follower value")?,
+                )?);
+            }
+            "--restart-container" => {
+                restart_container = Some(iter.next().ok_or("missing --restart-container value")?);
+            }
+            _ => return Err(format!("unknown container restart argument: {arg}").into()),
+        }
+    }
+    let mut restarting_follower = restarting_follower.ok_or("missing --restarting-follower")?;
+    let stable_follower = stable_follower.ok_or("missing --stable-follower")?;
+    let restart_container = restart_container.ok_or("missing --restart-container")?;
+    if restarting_follower.id == stable_follower.id {
+        return Err("restarting and stable followers must be distinct".into());
+    }
+
+    let mut leader = RaftReplicator::new(3);
+    leader.become_leader(1);
+
+    let first = leader.propose(b"create table t(id int)".to_vec())?;
+    let second = leader.propose(b"insert into t values (1)".to_vec())?;
+    let term = leader.current_term();
+    let first_batch = vec![
+        LogEntry {
+            term,
+            index: first.index,
+            payload: b"create table t(id int)".to_vec(),
+        },
+        LogEntry {
+            term,
+            index: second.index,
+            payload: b"insert into t values (1)".to_vec(),
+        },
+    ];
+    let mut append_batches_sent = 0usize;
+    let mut heartbeat_batches_sent = 0usize;
+    let mut follower_acks_recorded = 0usize;
+
+    for follower in [&restarting_follower, &stable_follower] {
+        send_checked(
+            follower,
+            AppendEntriesRequest {
+                leader_term: term,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: first_batch.clone(),
+                leader_commit: 0,
+            },
+        )?;
+        append_batches_sent += 1;
+        leader.register_follower_ack(first.index, follower.id);
+        leader.register_follower_ack(second.index, follower.id);
+        follower_acks_recorded += 2;
+    }
+    leader.wait_committed(second, TIMEOUT)?;
+
+    for follower in [&restarting_follower, &stable_follower] {
+        send_checked(
+            follower,
+            AppendEntriesRequest {
+                leader_term: term,
+                prev_log_index: second.index,
+                prev_log_term: term,
+                entries: vec![],
+                leader_commit: leader.commit_index(),
+            },
+        )?;
+        heartbeat_batches_sent += 1;
+    }
+
+    let restart_status = Command::new("docker")
+        .arg("restart")
+        .arg(restart_container)
+        .stdout(Stdio::null())
+        .status()?;
+    if !restart_status.success() {
+        return Err(format!("docker restart {restart_container} failed: {restart_status}").into());
+    }
+    restarting_follower.addr = docker_published_addr(restart_container)?;
+
+    let third = leader.propose(b"insert into t values (2)".to_vec())?;
+    send_checked(
+        &stable_follower,
+        AppendEntriesRequest {
+            leader_term: term,
+            prev_log_index: second.index,
+            prev_log_term: term,
+            entries: vec![LogEntry {
+                term,
+                index: third.index,
+                payload: b"insert into t values (2)".to_vec(),
+            }],
+            leader_commit: leader.commit_index(),
+        },
+    )?;
+    append_batches_sent += 1;
+    leader.register_follower_ack(third.index, stable_follower.id);
+    follower_acks_recorded += 1;
+
+    let replay_batch = vec![
+        LogEntry {
+            term,
+            index: first.index,
+            payload: b"create table t(id int)".to_vec(),
+        },
+        LogEntry {
+            term,
+            index: second.index,
+            payload: b"insert into t values (1)".to_vec(),
+        },
+        LogEntry {
+            term,
+            index: third.index,
+            payload: b"insert into t values (2)".to_vec(),
+        },
+    ];
+    send_checked_with_retry(
+        &restarting_follower,
+        AppendEntriesRequest {
+            leader_term: term,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: replay_batch,
+            leader_commit: leader.commit_index(),
+        },
+    )?;
+    append_batches_sent += 1;
+    leader.register_follower_ack(third.index, restarting_follower.id);
+    follower_acks_recorded += 1;
+    leader.wait_committed(third, TIMEOUT)?;
+
+    for follower in [&restarting_follower, &stable_follower] {
+        send_checked(
+            follower,
+            AppendEntriesRequest {
+                leader_term: term,
+                prev_log_index: third.index,
+                prev_log_term: term,
+                entries: vec![],
+                leader_commit: leader.commit_index(),
+            },
+        )?;
+        heartbeat_batches_sent += 1;
+    }
+
+    println!("operational_replication_container_restart_smoke=host_parent_passed");
+    println!("container_restart_scope=host_leader_restarts_one_follower_container");
+    println!(
+        "container_restart_transport=tcp_append_entries follower_containers=2 restarted_follower={} stable_follower={} append_batches_sent={append_batches_sent} heartbeat_batches_sent={heartbeat_batches_sent} follower_acks_recorded={follower_acks_recorded}",
+        restarting_follower.id, stable_follower.id
+    );
+    println!("container_restart_replay=full_durable_prefix_after_restart");
+    println!("deployment_gap_container_restart_supervision=implemented_bounded_local_smoke");
+    println!("deployment_gap_production_supervision=missing");
+    println!("deployment_gap_kubernetes_deployment=missing");
+
+    Ok(())
+}
+
+fn parse_external_follower(value: &str) -> Result<FollowerService, Box<dyn Error>> {
+    let (id, addr) = value
+        .split_once('=')
+        .ok_or_else(|| format!("external follower must be id=addr, got {value}"))?;
+    Ok(FollowerService {
+        id: id.parse()?,
+        addr: addr.parse()?,
+        child: None,
+        stdout: None,
+    })
+}
+
+fn docker_published_addr(container: &str) -> Result<SocketAddr, Box<dyn Error>> {
+    let output = Command::new("docker")
+        .arg("port")
+        .arg(container)
+        .arg("55432/tcp")
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "docker port {container} 55432/tcp failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    let stdout = String::from_utf8(output.stdout)?;
+    let line = stdout
+        .lines()
+        .next()
+        .ok_or_else(|| format!("docker port {container} returned no mapping"))?;
+    let port = line
+        .rsplit_once(':')
+        .ok_or_else(|| format!("unexpected docker port mapping: {line}"))?
+        .1;
+    Ok(format!("127.0.0.1:{port}").parse()?)
+}
+
 fn parse_external_followers(args: &[String]) -> Result<Vec<FollowerService>, Box<dyn Error>> {
     let mut followers = Vec::new();
     let mut iter = args.iter();
@@ -362,15 +575,7 @@ fn parse_external_followers(args: &[String]) -> Result<Vec<FollowerService>, Box
         match arg.as_str() {
             "--external-follower" => {
                 let value = iter.next().ok_or("missing --external-follower value")?;
-                let (id, addr) = value
-                    .split_once('=')
-                    .ok_or_else(|| format!("external follower must be id=addr, got {value}"))?;
-                followers.push(FollowerService {
-                    id: id.parse()?,
-                    addr: addr.parse()?,
-                    child: None,
-                    stdout: None,
-                });
+                followers.push(parse_external_follower(value)?);
             }
             _ => return Err(format!("unknown parent argument: {arg}").into()),
         }
@@ -392,6 +597,28 @@ fn send_checked(
         )
         .into())
     }
+}
+
+fn send_checked_with_retry(
+    follower: &FollowerService,
+    request: AppendEntriesRequest,
+) -> Result<(), Box<dyn Error>> {
+    let mut last_error = None;
+    for _ in 0..50 {
+        match send_checked(follower, request.clone()) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                last_error = Some(err.to_string());
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+    Err(format!(
+        "follower {} did not accept append entries after restart: {}",
+        follower.id,
+        last_error.unwrap_or_else(|| "unknown error".to_string())
+    )
+    .into())
 }
 
 fn spawn_follower_service(id: u64) -> Result<FollowerService, Box<dyn Error>> {
