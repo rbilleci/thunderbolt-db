@@ -21,7 +21,7 @@ use gpu_db_planner::{ExecutionPlan, Planner, PlannerConfig};
 use gpu_db_protocol::{
     parse_command, AddUniqueConstraint, ColumnDef, Command, CommentTarget, CreateIndex,
     CreateTable, CreateView, Delete, DropIndex, DropTable, DropView, Insert, ParseError, Select,
-    SelectFilterOp, SelectProjection, SqlType, SqlValue, Update,
+    SelectFilterOp, SelectProjection, SqlType, SqlValue, TruncateTable, Update,
 };
 use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine};
 use gpu_db_storage::{
@@ -77,6 +77,7 @@ impl ReplicatedStateMachine for KvStateMachine {
                     | Command::CreateIndex(_)
                     | Command::CreateView(_)
                     | Command::DropTable(_)
+                    | Command::TruncateTable(_)
                     | Command::DropIndex(_)
                     | Command::DropView(_)
                     | Command::AlterColumnDefault(_)
@@ -7515,6 +7516,7 @@ impl Engine {
             Command::CreateIndex(create) => self.apply_create_index(create)?,
             Command::CreateView(create) => self.apply_create_view(create)?,
             Command::DropTable(drop) => self.apply_drop_table(drop, txn_id)?,
+            Command::TruncateTable(truncate) => self.apply_truncate_table(truncate, txn_id)?,
             Command::DropIndex(drop) => self.apply_drop_index(drop)?,
             Command::DropView(drop) => self.apply_drop_view(drop)?,
             Command::AlterColumnDefault(alter) => self.apply_alter_column_default(alter)?,
@@ -7898,6 +7900,48 @@ impl Engine {
         });
         self.relational_residency.remove(&drop.name);
         self.relational_residency_device_memory.remove(&drop.name);
+        Ok(())
+    }
+
+    fn apply_truncate_table(
+        &mut self,
+        truncate: TruncateTable,
+        txn_id: TxnId,
+    ) -> Result<(), EngineError> {
+        if self.relational_views.contains_key(&truncate.name) {
+            return Err(EngineError::ApplyFailed(format!(
+                "relation \"{}\" is not a table",
+                truncate.name
+            )));
+        }
+        let table = self
+            .relational_catalog
+            .get(&truncate.name)
+            .ok_or_else(|| {
+                EngineError::ApplyFailed(format!("relation \"{}\" does not exist", truncate.name))
+            })?
+            .clone();
+
+        let prefix = relational_key_prefix(&table.name);
+        let visibility = StorageVisibility {
+            read_txn_id: txn_id,
+        };
+        let mut tuple_ids = Vec::new();
+        let mut cursor = self
+            .mvcc_store
+            .seq_scan_open(visibility)
+            .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+        while let Some(tuple) = cursor.next() {
+            if tuple.key.starts_with(&prefix) {
+                tuple_ids.push(tuple.tuple_id);
+            }
+        }
+        std::mem::drop(cursor);
+        for tuple_id in tuple_ids {
+            self.mvcc_store
+                .tuple_delete(tuple_id, txn_id)
+                .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+        }
         Ok(())
     }
 
@@ -8552,6 +8596,7 @@ impl Engine {
             | Command::CreateIndex(_)
             | Command::CreateView(_)
             | Command::DropTable(_)
+            | Command::TruncateTable(_)
             | Command::DropIndex(_)
             | Command::DropView(_)
             | Command::AlterColumnDefault(_)
@@ -8747,6 +8792,7 @@ impl Engine {
             | Command::CreateIndex(_)
             | Command::CreateView(_)
             | Command::DropTable(_)
+            | Command::TruncateTable(_)
             | Command::DropIndex(_)
             | Command::DropView(_)
             | Command::AlterColumnDefault(_)
@@ -8843,6 +8889,7 @@ impl Engine {
             Command::CreateIndex(_) => Err(ExecuteError::NonReadCommand("CREATE INDEX")),
             Command::CreateView(_) => Err(ExecuteError::NonReadCommand("CREATE VIEW")),
             Command::DropTable(_) => Err(ExecuteError::NonReadCommand("DROP TABLE")),
+            Command::TruncateTable(_) => Err(ExecuteError::NonReadCommand("TRUNCATE TABLE")),
             Command::DropIndex(_) => Err(ExecuteError::NonReadCommand("DROP INDEX")),
             Command::DropView(_) => Err(ExecuteError::NonReadCommand("DROP VIEW")),
             Command::AlterColumnDefault(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
@@ -31960,6 +32007,121 @@ mod tests {
         assert!(
             view_drop.contains("relation \"people_view\" is not a table"),
             "{view_drop}"
+        );
+        assert!(with_view.relational_catalog_view("people_view").is_some());
+    }
+
+    #[test]
+    fn relational_catalog_truncates_table_and_replays_from_wal() {
+        let mut e = Engine::new_local();
+        e.execute_text(
+            1,
+            "CREATE TABLE people (id INT PRIMARY KEY, name TEXT UNIQUE)",
+        )
+        .unwrap();
+        e.execute_text(2, "CREATE TABLE teams (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(
+            3,
+            "INSERT INTO people (id, name) VALUES (1, 'Ada'), (2, 'Grace')",
+        )
+        .unwrap();
+        e.execute_text(4, "INSERT INTO teams (id, name) VALUES (9, 'Infra')")
+            .unwrap();
+        e.execute_text(5, "CREATE INDEX people_name_idx ON people (name)")
+            .unwrap();
+        e.execute_text(6, "COMMENT ON TABLE public.people IS 'people table'")
+            .unwrap();
+        e.execute_text(7, "COMMENT ON COLUMN public.people.name IS 'display name'")
+            .unwrap();
+        e.execute_text(8, "COMMENT ON INDEX public.people_name_idx IS 'lookup'")
+            .unwrap();
+        e.execute_text(
+            9,
+            "COMMENT ON CONSTRAINT people_pkey ON public.people IS 'identity'",
+        )
+        .unwrap();
+        let snapshot = e.populate_relational_residency_snapshot("people").unwrap();
+        assert!(snapshot.is_valid());
+
+        e.execute_text(10, "TRUNCATE TABLE ONLY public.people")
+            .unwrap();
+
+        let Command::Select(empty_people) =
+            parse_command("SELECT id, name FROM people ORDER BY id ASC").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        assert!(e
+            .execute_relational_select(&empty_people)
+            .unwrap()
+            .rows
+            .is_empty());
+        assert!(e.relational_catalog_table("people").is_some());
+        assert!(e.relational_catalog_table("teams").is_some());
+        assert_eq!(e.relational_table_comment("people"), Some("people table"));
+        assert_eq!(
+            e.relational_column_comment("people", 2),
+            Some("display name")
+        );
+        assert_eq!(
+            e.relational_index_comment("people_name_idx"),
+            Some("lookup")
+        );
+        assert_eq!(
+            e.relational_constraint_comment("people", "people_pkey"),
+            Some("identity")
+        );
+        assert!(e
+            .relational_residency_snapshot("people")
+            .is_some_and(|snapshot| !snapshot.is_valid()));
+
+        e.execute_text(11, "INSERT INTO people (id, name) VALUES (1, 'Ada')")
+            .unwrap();
+        let result = e.execute_relational_select(&empty_people).unwrap();
+        assert_eq!(
+            result.rows,
+            vec![vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())]]
+        );
+
+        let mut recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let recovered_result = recovered.execute_relational_select(&empty_people).unwrap();
+        assert_eq!(
+            recovered_result.rows,
+            vec![vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())]]
+        );
+        assert_eq!(
+            recovered.relational_table_comment("people"),
+            Some("people table")
+        );
+        assert_eq!(
+            recovered.relational_constraint_comment("people", "people_pkey"),
+            Some("identity")
+        );
+
+        let missing_truncate = e
+            .execute_text(12, "TRUNCATE TABLE missing_people")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            missing_truncate.contains("relation \"missing_people\" does not exist"),
+            "{missing_truncate}"
+        );
+
+        let mut with_view = Engine::new_local();
+        with_view
+            .execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        with_view
+            .execute_text(2, "CREATE VIEW public.people_view AS SELECT * FROM people")
+            .unwrap();
+        let view_truncate = with_view
+            .execute_text(3, "TRUNCATE people_view")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            view_truncate.contains("relation \"people_view\" is not a table"),
+            "{view_truncate}"
         );
         assert!(with_view.relational_catalog_view("people_view").is_some());
     }

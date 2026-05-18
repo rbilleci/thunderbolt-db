@@ -15,6 +15,7 @@ pub enum Command {
     CreateIndex(CreateIndex),
     CreateView(CreateView),
     DropTable(DropTable),
+    TruncateTable(TruncateTable),
     DropIndex(DropIndex),
     DropView(DropView),
     AlterColumnDefault(AlterColumnDefault),
@@ -79,6 +80,11 @@ pub struct CreateView {
 pub struct DropTable {
     pub name: String,
     pub if_exists: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TruncateTable {
+    pub name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1660,6 +1666,9 @@ fn parse_relational_command(input: &str) -> Option<Result<Command, ParseError>> 
         }
         return Some(Err(ParseError::InvalidRelationalSql));
     }
+    if first.eq_ignore_ascii_case("TRUNCATE") {
+        return Some(parse_truncate_table(input).map(Command::TruncateTable));
+    }
     if first.eq_ignore_ascii_case("ALTER") {
         if find_keyword_outside_quotes(input, "ADD").is_some() {
             return Some(parse_add_table_constraint(input));
@@ -2236,6 +2245,34 @@ fn parse_drop_table(input: &str) -> Result<DropTable, ParseError> {
     Ok(DropTable {
         name: normalize_relation_identifier(table.trim())?,
         if_exists,
+    })
+}
+
+fn parse_truncate_table(input: &str) -> Result<TruncateTable, ParseError> {
+    let mut rest = strip_keyword_prefix_case_insensitive(input, "TRUNCATE")
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    if let Some(after_table) = strip_keyword_prefix_case_insensitive(rest, "TABLE") {
+        rest = after_table.trim_start();
+    }
+    if let Some(after_only) = strip_keyword_prefix_case_insensitive(rest, "ONLY") {
+        rest = after_only.trim_start();
+    }
+    if rest.is_empty()
+        || find_keyword_outside_quotes(rest, "CASCADE").is_some()
+        || find_keyword_outside_quotes(rest, "RESTRICT").is_some()
+        || find_keyword_outside_quotes(rest, "RESTART").is_some()
+        || find_keyword_outside_quotes(rest, "CONTINUE").is_some()
+        || find_keyword_outside_quotes(rest, "IDENTITY").is_some()
+    {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let tables = split_csv(rest)?;
+    let [table] = tables.as_slice() else {
+        return Err(ParseError::InvalidRelationalSql);
+    };
+    Ok(TruncateTable {
+        name: normalize_relation_identifier(table.trim())?,
     })
 }
 
@@ -9755,6 +9792,35 @@ mod tests {
         ));
         assert!(matches!(
             parse_command("DROP TABLE private.people"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+
+        assert_eq!(
+            parse_command("TRUNCATE TABLE ONLY public.people").unwrap(),
+            Command::TruncateTable(TruncateTable {
+                name: "people".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_command("TRUNCATE people").unwrap(),
+            Command::TruncateTable(TruncateTable {
+                name: "people".to_string(),
+            })
+        );
+        assert!(matches!(
+            parse_command("TRUNCATE TABLE people RESTART IDENTITY"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command("TRUNCATE TABLE people CASCADE"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command("TRUNCATE TABLE public.a, public.b"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command("TRUNCATE TABLE private.people"),
             Err(ParseError::InvalidRelationalSql)
         ));
 

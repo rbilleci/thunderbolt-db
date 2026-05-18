@@ -4618,14 +4618,26 @@ fn is_simple_copy_identifier(identifier: &str) -> bool {
 fn parse_truncate_table(statement: &str) -> Option<String> {
     let statement = strip_leading_sql_comments(statement.trim())?;
     let canonical = canonical_sql(statement);
-    let mut target = canonical.strip_prefix("truncate table ")?.trim();
+    let mut target = canonical.strip_prefix("truncate ")?.trim();
+    target = target.strip_prefix("table ").unwrap_or(target).trim();
     target = target.strip_prefix("only ").unwrap_or(target).trim();
+    if target.contains(" cascade")
+        || target.contains(" restrict")
+        || target.contains(" restart ")
+        || target.contains(" continue ")
+        || target.contains(" identity")
+    {
+        return None;
+    }
     let mut parts = target.split_whitespace();
     let table = parts.next()?;
     if parts.next().is_some() {
         return None;
     }
     if !is_simple_copy_table_name(table) {
+        return None;
+    }
+    if table.contains('.') && !table.starts_with("public.") {
         return None;
     }
     Some(table.strip_prefix("public.").unwrap_or(table).to_string())
@@ -5406,6 +5418,16 @@ fn execute_statement(
         return write_command_complete(stream, "LOCK TABLE");
     }
     if let Some(table_name) = parse_truncate_table(statement) {
+        if session.views.contains_key(&table_name) {
+            return write_error(
+                stream,
+                &ErrorField {
+                    code: "42809",
+                    message: "relation is not a table",
+                    position: None,
+                },
+            );
+        }
         let Some(table) = session.tables.get_mut(&table_name) else {
             return write_error(
                 stream,
@@ -6731,6 +6753,7 @@ fn execute_statement(
             }
             Command::Flush
             | Command::ResetAll
+            | Command::TruncateTable(_)
             | Command::SetKv { .. }
             | Command::DeleteKv { .. }
             | Command::GetKv { .. } => {}
@@ -13675,7 +13698,17 @@ mod tests {
             parse_truncate_table("/* restore */ TRUNCATE TABLE people;"),
             Some("people".to_string())
         );
-        assert_eq!(parse_truncate_table("TRUNCATE people"), None);
+        assert_eq!(
+            parse_truncate_table("TRUNCATE people"),
+            Some("people".to_string())
+        );
+        assert_eq!(
+            parse_truncate_table("TRUNCATE TABLE public.people RESTART IDENTITY"),
+            None
+        );
+        assert_eq!(parse_truncate_table("TRUNCATE TABLE people CASCADE"), None);
+        assert_eq!(parse_truncate_table("TRUNCATE TABLE people, teams"), None);
+        assert_eq!(parse_truncate_table("TRUNCATE TABLE private.people"), None);
         assert_eq!(
             parse_truncate_table("TRUNCATE TABLE public.people CASCADE"),
             None

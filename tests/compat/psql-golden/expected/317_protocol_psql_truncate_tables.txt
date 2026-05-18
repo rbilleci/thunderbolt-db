@@ -1,0 +1,66 @@
+=== bounded SQL table truncates ===
+CREATE TABLE
+CREATE TABLE
+INSERT 0 2
+INSERT 0 1
+CREATE INDEX
+COMMENT
+COMMENT
+COMMENT
+COMMENT
+                                      Table "public.truncate_people"
+ Column |  Type   | Collation | Nullable | Default | Storage  | Compression | Stats target | Description
+--------+---------+-----------+----------+---------+----------+-------------+--------------+--------------
+ id     | integer |           |          |         | plain    |             |              |
+ name   | text    |           |          |         | extended |             |              | display name
+Indexes:
+    "truncate_people_name_idx" btree (name)
+    "truncate_people_name_key" UNIQUE CONSTRAINT, btree (name)
+    "truncate_people_pkey" PRIMARY KEY, btree (id)
+Access method: heap
+
+TRUNCATE TABLE
+ id | name
+----+------
+(0 rows)
+
+                                      Table "public.truncate_people"
+ Column |  Type   | Collation | Nullable | Default | Storage  | Compression | Stats target | Description
+--------+---------+-----------+----------+---------+----------+-------------+--------------+--------------
+ id     | integer |           |          |         | plain    |             |              |
+ name   | text    |           |          |         | extended |             |              | display name
+Indexes:
+    "truncate_people_name_idx" btree (name)
+    "truncate_people_name_key" UNIQUE CONSTRAINT, btree (name)
+    "truncate_people_pkey" PRIMARY KEY, btree (id)
+Access method: heap
+
+                       Object descriptions
+ Schema |         Name         |      Object      | Description
+--------+----------------------+------------------+--------------
+ public | truncate_people      | table            | people table
+ public | truncate_people_pkey | table constraint | identity
+(2 rows)
+
+INSERT 0 1
+ id | name
+----+------
+  1 | Ada
+(1 row)
+
+ id | name
+----+-------
+  9 | Infra
+(1 row)
+
+CREATE VIEW
+psql:317_protocol_psql_truncate_tables.sql:20: ERROR:  relation is not a table
+ id | name
+----+-------
+  9 | Infra
+(1 row)
+
+psql:317_protocol_psql_truncate_tables.sql:22: ERROR:  relation does not exist
+psql:317_protocol_psql_truncate_tables.sql:23: ERROR:  query shape is not supported by the compatibility stub
+psql:317_protocol_psql_truncate_tables.sql:24: ERROR:  query shape is not supported by the compatibility stub
+psql:317_protocol_psql_truncate_tables.sql:25: ERROR:  query shape is not supported by the compatibility stub
