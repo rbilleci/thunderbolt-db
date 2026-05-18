@@ -5932,7 +5932,7 @@ fn execute_statement(
             }
             Command::CreateView(create) => {
                 if session.tables.contains_key(&create.name)
-                    || session.views.contains_key(&create.name)
+                    || (!create.or_replace && session.views.contains_key(&create.name))
                 {
                     return write_error(
                         stream,
@@ -5956,19 +5956,24 @@ fn execute_statement(
                 if let Err(error) = execute_select_result(session, &create.query) {
                     return write_error(stream, &error);
                 }
-                let oid = session.next_relation_oid;
-                session.next_relation_oid = match session.next_relation_oid.checked_add(1) {
-                    Some(next) => next,
-                    None => {
-                        return write_error(
-                            stream,
-                            &ErrorField {
-                                code: "54000",
-                                message: "relation OID allocation exhausted",
-                                position: None,
-                            },
-                        );
-                    }
+                let oid = if let Some(existing) = session.views.get(&create.name) {
+                    existing.oid
+                } else {
+                    let oid = session.next_relation_oid;
+                    session.next_relation_oid = match session.next_relation_oid.checked_add(1) {
+                        Some(next) => next,
+                        None => {
+                            return write_error(
+                                stream,
+                                &ErrorField {
+                                    code: "54000",
+                                    message: "relation OID allocation exhausted",
+                                    position: None,
+                                },
+                            );
+                        }
+                    };
+                    oid
                 };
                 let name = create.name;
                 session.views.insert(

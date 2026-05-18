@@ -71,6 +71,7 @@ pub struct CreateView {
     pub name: String,
     pub query: Select,
     pub definition: String,
+    pub or_replace: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1628,6 +1629,13 @@ fn parse_relational_command(input: &str) -> Option<Result<Command, ParseError>> 
         if second.eq_ignore_ascii_case("VIEW") {
             return Some(parse_create_view(input).map(Command::CreateView));
         }
+        if second.eq_ignore_ascii_case("OR") {
+            let third = input.split_whitespace().nth(2)?;
+            let fourth = input.split_whitespace().nth(3)?;
+            if third.eq_ignore_ascii_case("REPLACE") && fourth.eq_ignore_ascii_case("VIEW") {
+                return Some(parse_create_view(input).map(Command::CreateView));
+            }
+        }
         return Some(Err(ParseError::InvalidRelationalSql));
     }
     if first.eq_ignore_ascii_case("DROP") {
@@ -2051,11 +2059,21 @@ fn parse_create_table(input: &str) -> Result<CreateTable, ParseError> {
 
 fn parse_create_view(input: &str) -> Result<CreateView, ParseError> {
     let rest = strip_keyword_prefix_case_insensitive(input, "CREATE")
-        .and_then(|s| strip_keyword_prefix_case_insensitive(s.trim_start(), "VIEW"))
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    let (rest, or_replace) = if let Some(after_or) =
+        strip_keyword_prefix_case_insensitive(rest, "OR")
+    {
+        let after_replace = strip_keyword_prefix_case_insensitive(after_or.trim_start(), "REPLACE")
+            .ok_or(ParseError::InvalidRelationalSql)?;
+        (after_replace.trim_start(), true)
+    } else {
+        (rest, false)
+    };
+    let rest = strip_keyword_prefix_case_insensitive(rest, "VIEW")
         .ok_or(ParseError::InvalidRelationalSql)?
         .trim_start();
     if strip_keyword_prefix_case_insensitive(rest, "IF").is_some()
-        || strip_keyword_prefix_case_insensitive(rest, "OR").is_some()
         || strip_keyword_prefix_case_insensitive(rest, "TEMP").is_some()
         || strip_keyword_prefix_case_insensitive(rest, "TEMPORARY").is_some()
         || strip_keyword_prefix_case_insensitive(rest, "MATERIALIZED").is_some()
@@ -2081,6 +2099,7 @@ fn parse_create_view(input: &str) -> Result<CreateView, ParseError> {
         name,
         query,
         definition: definition.to_string(),
+        or_replace,
     })
 }
 
@@ -9582,12 +9601,30 @@ mod tests {
                 },
                 definition: "SELECT id, name FROM people WHERE id > 1 ORDER BY id LIMIT 5"
                     .to_string(),
+                or_replace: false,
             })
         );
-        assert!(matches!(
-            parse_command("CREATE OR REPLACE VIEW active_people AS SELECT * FROM people"),
-            Err(ParseError::InvalidRelationalSql)
-        ));
+        assert_eq!(
+            parse_command("CREATE OR REPLACE VIEW active_people AS SELECT * FROM people").unwrap(),
+            Command::CreateView(CreateView {
+                name: "active_people".to_string(),
+                query: Select {
+                    table: "people".to_string(),
+                    distinct: false,
+                    projection: SelectProjection::All,
+                    group_by: None,
+                    having_groups: Vec::new(),
+                    filter: None,
+                    filters: Vec::new(),
+                    filter_groups: Vec::new(),
+                    order_by: None,
+                    limit: None,
+                    offset: None,
+                },
+                definition: "SELECT * FROM people".to_string(),
+                or_replace: true,
+            })
+        );
         assert_eq!(
             parse_command("DROP VIEW public.active_people").unwrap(),
             Command::DropView(DropView {

@@ -1,0 +1,40 @@
+=== bounded SQL create or replace views ===
+CREATE TABLE
+INSERT 0 3
+CREATE VIEW
+COMMENT
+CREATE VIEW
+ id | name
+----+-------
+  3 | Grace
+(1 row)
+
+ schemaname |          viewname          | viewowner |                            definition
+------------+----------------------------+-----------+-------------------------------------------------------------------
+ public     | active_replace_view_people | postgres  | SELECT id, name FROM replace_view_people WHERE id > 2 ORDER BY id
+(1 row)
+
+ table_catalog | table_schema |         table_name         |                          view_definition                          | check_option | is_updatable | is_insertable_into | is_trigger_updatable | is_trigger_deletable | is_trigger_insertable
+---------------+--------------+----------------------------+-------------------------------------------------------------------+--------------+--------------+--------------------+----------------------+----------------------+-----------------------
+ postgres      | public       | active_replace_view_people | SELECT id, name FROM replace_view_people WHERE id > 2 ORDER BY id | NONE         | NO           | NO                 | NO                   | NO                   | NO
+(1 row)
+
+                                          List of relations
+ Schema |            Name            | Type |  Owner   | Persistence | Size |       Description
+--------+----------------------------+------+----------+-------------+------+-------------------------
+ public | active_replace_view_people | view | postgres | permanent   |      | active replacement view
+(1 row)
+
+psql:314_protocol_psql_replace_views.sql:17: ERROR:  relation does not exist
+ id | name
+----+-------
+  3 | Grace
+(1 row)
+
+psql:314_protocol_psql_replace_views.sql:19: ERROR:  query shape is not supported by the compatibility stub
+ id | name
+----+-------
+  1 | Ada
+  2 | Linus
+  3 | Grace
+(3 rows)

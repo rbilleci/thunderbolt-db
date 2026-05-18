@@ -7526,7 +7526,7 @@ impl Engine {
 
     fn apply_create_view(&mut self, create: CreateView) -> Result<(), EngineError> {
         if self.relational_catalog.contains_key(&create.name)
-            || self.relational_views.contains_key(&create.name)
+            || (!create.or_replace && self.relational_views.contains_key(&create.name))
         {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" already exists",
@@ -7544,10 +7544,16 @@ impl Engine {
                 create.query.table
             )));
         }
-        let oid = self.relational_next_oid;
-        self.relational_next_oid = self.relational_next_oid.checked_add(1).ok_or_else(|| {
-            EngineError::ApplyFailed("relational view OID allocation exhausted".to_string())
-        })?;
+        let oid = if let Some(existing) = self.relational_views.get(&create.name) {
+            existing.oid
+        } else {
+            let oid = self.relational_next_oid;
+            self.relational_next_oid =
+                self.relational_next_oid.checked_add(1).ok_or_else(|| {
+                    EngineError::ApplyFailed("relational view OID allocation exhausted".to_string())
+                })?;
+            oid
+        };
         self.relational_views.insert(
             create.name.clone(),
             RelationalView {
@@ -30006,6 +30012,87 @@ mod tests {
         assert!(recovered
             .execute_relational_select(&filtered_view_select)
             .is_err());
+    }
+
+    #[test]
+    fn relational_sql_create_or_replace_view_replays_from_wal() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO people (id, name) VALUES (1, 'Ada'), (2, 'Linus'), (3, 'Grace')",
+        )
+        .unwrap();
+        e.execute_text(
+            3,
+            "CREATE VIEW public.active_people AS SELECT id, name FROM people WHERE id > 1 ORDER BY id",
+        )
+        .unwrap();
+        e.execute_text(
+            4,
+            "COMMENT ON VIEW public.active_people IS 'active people view'",
+        )
+        .unwrap();
+        let oid = e.relational_catalog_view("active_people").unwrap().oid;
+        e.execute_text(
+            5,
+            "CREATE OR REPLACE VIEW public.active_people AS SELECT id, name FROM people WHERE id > 2 ORDER BY id",
+        )
+        .unwrap();
+
+        let view = e.relational_catalog_view("active_people").unwrap();
+        assert_eq!(view.oid, oid);
+        assert_eq!(
+            view.definition,
+            "SELECT id, name FROM people WHERE id > 2 ORDER BY id"
+        );
+        assert_eq!(
+            e.relational_view_comment("active_people"),
+            Some("active people view")
+        );
+
+        let Command::Select(select) = parse_command("SELECT * FROM active_people").unwrap() else {
+            panic!("expected SELECT plan");
+        };
+        let result = e.execute_relational_select(&select).unwrap();
+        assert_eq!(
+            result.rows,
+            vec![vec![SqlValue::Int4(3), SqlValue::Text("Grace".to_string())]]
+        );
+
+        let mut recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        assert_eq!(
+            recovered
+                .relational_catalog_view("active_people")
+                .unwrap()
+                .definition,
+            "SELECT id, name FROM people WHERE id > 2 ORDER BY id"
+        );
+        assert_eq!(
+            recovered.relational_view_comment("active_people"),
+            Some("active people view")
+        );
+        let recovered_result = recovered.execute_relational_select(&select).unwrap();
+        assert_eq!(recovered_result.rows, result.rows);
+
+        let replaced_err = e
+            .execute_text(
+                6,
+                "CREATE OR REPLACE VIEW public.active_people AS SELECT * FROM missing_people",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            replaced_err.contains("relation \"missing_people\" does not exist"),
+            "{replaced_err}"
+        );
+        assert_eq!(
+            e.relational_catalog_view("active_people")
+                .unwrap()
+                .definition,
+            "SELECT id, name FROM people WHERE id > 2 ORDER BY id"
+        );
     }
 
     #[test]
