@@ -75,6 +75,7 @@ impl ReplicatedStateMachine for KvStateMachine {
                     | Command::AddPrimaryKey(_)
                     | Command::AddUniqueConstraint(_)
                     | Command::AddColumn(_)
+                    | Command::DropColumn(_)
                     | Command::DropConstraint(_)
                     | Command::CreateIndex(_)
                     | Command::CreateView(_)
@@ -7516,6 +7517,7 @@ impl Engine {
             Command::AddPrimaryKey(add) => self.apply_add_primary_key(add)?,
             Command::AddUniqueConstraint(add) => self.apply_add_unique_constraint(add)?,
             Command::AddColumn(add) => self.apply_add_column(add, txn_id)?,
+            Command::DropColumn(drop) => self.apply_drop_column(drop, txn_id)?,
             Command::DropConstraint(drop) => self.apply_drop_constraint(drop)?,
             Command::CreateIndex(create) => self.apply_create_index(create)?,
             Command::CreateView(create) => self.apply_create_view(create)?,
@@ -8251,6 +8253,122 @@ impl Engine {
         Ok(())
     }
 
+    fn apply_drop_column(
+        &mut self,
+        drop_column: gpu_db_protocol::DropColumn,
+        txn_id: TxnId,
+    ) -> Result<(), EngineError> {
+        if self.relational_views.contains_key(&drop_column.table) {
+            return Err(EngineError::ApplyFailed(format!(
+                "relation \"{}\" is not a table",
+                drop_column.table
+            )));
+        }
+        let table = self
+            .relational_catalog
+            .get(&drop_column.table)
+            .ok_or_else(|| {
+                EngineError::ApplyFailed(format!(
+                    "relation \"{}\" does not exist",
+                    drop_column.table
+                ))
+            })?
+            .clone();
+        let drop_idx = table
+            .columns
+            .iter()
+            .position(|column| column.name == drop_column.column)
+            .ok_or_else(|| {
+                EngineError::ApplyFailed(format!(
+                    "column \"{}\" does not exist",
+                    drop_column.column
+                ))
+            })?;
+        if table
+            .indexes
+            .iter()
+            .any(|index| index.column == drop_column.column)
+        {
+            return Err(EngineError::ApplyFailed(format!(
+                "cannot drop column \"{}\" because an index or constraint depends on it",
+                drop_column.column
+            )));
+        }
+
+        let prefix = relational_key_prefix(&drop_column.table);
+        let visibility = StorageVisibility {
+            read_txn_id: txn_id,
+        };
+        let mut updates = Vec::new();
+        let mut cursor = self
+            .mvcc_store
+            .seq_scan_open(visibility)
+            .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+        while let Some(tuple) = cursor.next() {
+            if !tuple.key.starts_with(&prefix) {
+                continue;
+            }
+            let mut row = decode_relational_row(&tuple.value, &table.columns)
+                .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+            row.remove(drop_idx);
+            updates.push((tuple.tuple_id, row));
+        }
+        drop(cursor);
+
+        for (tuple_id, values) in updates {
+            self.mvcc_store
+                .tuple_update(tuple_id, encode_relational_row(&values), txn_id)
+                .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+        }
+        self.relational_value_index
+            .retain(|key, _| !(key.table == drop_column.table && key.column == drop_column.column));
+
+        let dropped_attnum = table.columns[drop_idx].attnum;
+        let table_ref = self
+            .relational_catalog
+            .get_mut(&drop_column.table)
+            .expect("table existence validated");
+        table_ref.columns.remove(drop_idx);
+        for (idx, column) in table_ref.columns.iter_mut().enumerate() {
+            column.attnum = i16::try_from(idx + 1).map_err(|_| {
+                EngineError::ApplyFailed("too many columns for bootstrap catalog".to_string())
+            })?;
+        }
+
+        let shifted_comments = self
+            .relational_comments
+            .iter()
+            .filter_map(|(target, comment)| match target {
+                RelationalCommentTarget::Column { table, attnum }
+                    if table == &drop_column.table && *attnum > dropped_attnum =>
+                {
+                    Some((
+                        target.clone(),
+                        RelationalCommentTarget::Column {
+                            table: table.clone(),
+                            attnum: *attnum - 1,
+                        },
+                        comment.clone(),
+                    ))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        self.relational_comments.retain(|target, _| match target {
+            RelationalCommentTarget::Column { table, attnum } => {
+                !(table == &drop_column.table && *attnum >= dropped_attnum)
+            }
+            _ => true,
+        });
+        for (_, new_target, comment) in shifted_comments {
+            self.relational_comments.insert(new_target, comment);
+        }
+        self.relational_residency.remove(&drop_column.table);
+        self.relational_residency_device_memory
+            .remove(&drop_column.table);
+        Ok(())
+    }
+
     fn apply_insert(&mut self, insert: Insert, txn_id: TxnId) -> Result<(), EngineError> {
         let table = self
             .relational_catalog
@@ -8610,6 +8728,37 @@ impl Engine {
                     )));
                 }
             }
+            Command::DropColumn(drop) => {
+                if self.relational_views.contains_key(&drop.table) {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "relation \"{}\" is not a table",
+                        drop.table
+                    )));
+                }
+                let table = self.relational_catalog.get(&drop.table).ok_or_else(|| {
+                    EngineError::ApplyFailed(format!("relation \"{}\" does not exist", drop.table))
+                })?;
+                if !table
+                    .columns
+                    .iter()
+                    .any(|column| column.name == drop.column)
+                {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "column \"{}\" does not exist",
+                        drop.column
+                    )));
+                }
+                if table
+                    .indexes
+                    .iter()
+                    .any(|index| index.column == drop.column)
+                {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "cannot drop column \"{}\" because an index or constraint depends on it",
+                        drop.column
+                    )));
+                }
+            }
             Command::DropConstraint(drop) => {
                 let Some(table) = self.relational_catalog.get(&drop.table) else {
                     if drop.table_if_exists {
@@ -8787,6 +8936,7 @@ impl Engine {
             | Command::AddPrimaryKey(_)
             | Command::AddUniqueConstraint(_)
             | Command::AddColumn(_)
+            | Command::DropColumn(_)
             | Command::DropConstraint(_)
             | Command::CreateIndex(_)
             | Command::CreateView(_)
@@ -8985,6 +9135,7 @@ impl Engine {
             | Command::AddPrimaryKey(_)
             | Command::AddUniqueConstraint(_)
             | Command::AddColumn(_)
+            | Command::DropColumn(_)
             | Command::DropConstraint(_)
             | Command::CreateIndex(_)
             | Command::CreateView(_)
@@ -9084,6 +9235,7 @@ impl Engine {
             Command::AddPrimaryKey(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
             Command::AddUniqueConstraint(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
             Command::AddColumn(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
+            Command::DropColumn(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
             Command::DropConstraint(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
             Command::CreateIndex(_) => Err(ExecuteError::NonReadCommand("CREATE INDEX")),
             Command::CreateView(_) => Err(ExecuteError::NonReadCommand("CREATE VIEW")),
@@ -30273,6 +30425,94 @@ mod tests {
                 .contains("ADD COLUMN requires a literal DEFAULT"),
             "{unsupported}"
         );
+    }
+
+    #[test]
+    fn relational_drop_column_rewrites_rows_and_replays() {
+        let mut e = Engine::new_local();
+        e.execute_text(
+            1,
+            "CREATE TABLE drop_column_people (id INT, name TEXT, bucket INT DEFAULT 7)",
+        )
+        .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO drop_column_people (id, name) VALUES (1, 'Ada'), (2, 'Linus')",
+        )
+        .unwrap();
+        e.execute_text(
+            3,
+            "COMMENT ON COLUMN public.drop_column_people.name IS 'drop me'",
+        )
+        .unwrap();
+        e.execute_text(
+            4,
+            "COMMENT ON COLUMN public.drop_column_people.bucket IS 'keep me'",
+        )
+        .unwrap();
+        e.execute_text(
+            5,
+            "ALTER TABLE ONLY public.drop_column_people DROP COLUMN name",
+        )
+        .unwrap();
+        e.execute_text(6, "INSERT INTO drop_column_people (id) VALUES (3)")
+            .unwrap();
+
+        let Command::Select(select) =
+            parse_command("SELECT id, bucket FROM drop_column_people ORDER BY id ASC").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let result = e.execute_relational_select(&select).unwrap();
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![SqlValue::Int4(1), SqlValue::Int4(7)],
+                vec![SqlValue::Int4(2), SqlValue::Int4(7)],
+                vec![SqlValue::Int4(3), SqlValue::Int4(7)],
+            ]
+        );
+        let table = e.relational_catalog_table("drop_column_people").unwrap();
+        assert_eq!(
+            table
+                .columns
+                .iter()
+                .map(|column| (column.name.as_str(), column.attnum))
+                .collect::<Vec<_>>(),
+            vec![("id", 1), ("bucket", 2)]
+        );
+        assert_eq!(
+            e.relational_column_comment("drop_column_people", 2),
+            Some("keep me")
+        );
+
+        let mut recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let recovered_result = recovered.execute_relational_select(&select).unwrap();
+        assert_eq!(recovered_result.rows, result.rows);
+        assert_eq!(
+            recovered.relational_column_comment("drop_column_people", 2),
+            Some("keep me")
+        );
+
+        let missing_column = e
+            .execute_text(
+                7,
+                "ALTER TABLE public.drop_column_people DROP COLUMN missing_name",
+            )
+            .unwrap_err();
+        assert!(missing_column.to_string().contains("does not exist"));
+
+        let mut constrained = Engine::new_local();
+        constrained
+            .execute_text(
+                1,
+                "CREATE TABLE constrained_people (id INT PRIMARY KEY, name TEXT)",
+            )
+            .unwrap();
+        let dependency = constrained
+            .execute_text(2, "ALTER TABLE constrained_people DROP COLUMN id")
+            .unwrap_err();
+        assert!(dependency.to_string().contains("depends on it"));
     }
 
     #[test]

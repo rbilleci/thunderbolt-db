@@ -1249,6 +1249,105 @@ fn validate_unique_indexes(table: &Table, indexes: &[CatalogIndex]) -> Result<()
     Ok(())
 }
 
+fn drop_column_from_session(
+    session: &mut Session,
+    table_name: &str,
+    column_name: &str,
+) -> Result<(), ErrorField> {
+    if session.views.contains_key(table_name) {
+        return Err(ErrorField {
+            code: "42809",
+            message: "relation is not a table",
+            position: None,
+        });
+    }
+    let Some(table) = session.tables.get_mut(table_name) else {
+        return Err(ErrorField {
+            code: "42P01",
+            message: "relation does not exist",
+            position: None,
+        });
+    };
+    let Some(drop_idx) = table
+        .columns
+        .iter()
+        .position(|column| column.def.name == column_name)
+    else {
+        return Err(ErrorField {
+            code: "42703",
+            message: "column does not exist",
+            position: None,
+        });
+    };
+    if session
+        .indexes
+        .iter()
+        .any(|index| index.table == table_name && index.column == column_name)
+    {
+        return Err(ErrorField {
+            code: "2BP01",
+            message: "cannot drop column because an index or constraint depends on it",
+            position: None,
+        });
+    }
+
+    let dropped_attnum = table.columns[drop_idx].attnum;
+    table.columns.remove(drop_idx);
+    for (idx, column) in table.columns.iter_mut().enumerate() {
+        column.attnum = i16::try_from(idx + 1).map_err(|_| ErrorField {
+            code: "54000",
+            message: "too many columns for bootstrap catalog",
+            position: None,
+        })?;
+    }
+    for row in &mut table.rows {
+        row.remove(drop_idx);
+    }
+
+    let shifted_comments = session
+        .comments
+        .iter()
+        .filter_map(|(target, comment)| match target {
+            CatalogCommentTarget::Column { table, attnum }
+                if table == table_name && *attnum > dropped_attnum =>
+            {
+                Some((
+                    target.clone(),
+                    CatalogCommentTarget::Column {
+                        table: table.clone(),
+                        attnum: *attnum - 1,
+                    },
+                    comment.clone(),
+                ))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let removed_targets = session
+        .comments
+        .keys()
+        .filter(|target| match target {
+            CatalogCommentTarget::Column { table, attnum } => {
+                table == table_name && *attnum >= dropped_attnum
+            }
+            _ => false,
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for target in removed_targets {
+        session.comments.remove(&target);
+        session.mark_comment_dirty(target);
+    }
+    for (old_target, new_target, comment) in shifted_comments {
+        session.comments.remove(&old_target);
+        session.comments.insert(new_target.clone(), comment);
+        session.mark_comment_dirty(new_target);
+    }
+    session.mark_table_dirty(table_name.to_string());
+    session.persist_catalog_snapshot();
+    Ok(())
+}
+
 fn shared_catalog_contains_table(table: &str) -> bool {
     shared_catalog()
         .lock()
@@ -6474,6 +6573,12 @@ fn execute_statement(
                 }
                 session.mark_table_dirty(add.table);
                 session.persist_catalog_snapshot();
+                return write_command_complete(stream, "ALTER TABLE");
+            }
+            Command::DropColumn(drop) => {
+                if let Err(error) = drop_column_from_session(session, &drop.table, &drop.column) {
+                    return write_error(stream, &error);
+                }
                 return write_command_complete(stream, "ALTER TABLE");
             }
             Command::CommentOn(comment) => {

@@ -13,6 +13,7 @@ pub enum Command {
     AddPrimaryKey(AddPrimaryKey),
     AddUniqueConstraint(AddUniqueConstraint),
     AddColumn(AddColumn),
+    DropColumn(DropColumn),
     DropConstraint(DropConstraint),
     CreateIndex(CreateIndex),
     CreateView(CreateView),
@@ -66,6 +67,12 @@ pub struct AddUniqueConstraint {
 pub struct AddColumn {
     pub table: String,
     pub column: ColumnDef,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropColumn {
+    pub table: String,
+    pub column: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1689,6 +1696,9 @@ fn parse_relational_command(input: &str) -> Option<Result<Command, ParseError>> 
         if find_keyword_outside_quotes(input, "DROP").is_some()
             && find_keyword_outside_quotes(input, "DEFAULT").is_none()
         {
+            if parse_drop_column(input).is_ok() {
+                return Some(parse_drop_column(input).map(Command::DropColumn));
+            }
             return Some(parse_drop_table_constraint(input).map(Command::DropConstraint));
         }
         if find_keyword_outside_quotes(input, "ADD").is_some() {
@@ -1944,6 +1954,37 @@ fn parse_alter_table_add(input: &str) -> Result<Command, ParseError> {
         table,
         column: parse_column_def(column_tail)?,
     }))
+}
+
+fn parse_drop_column(input: &str) -> Result<DropColumn, ParseError> {
+    let mut rest = strip_keyword_prefix_case_insensitive(input, "ALTER")
+        .and_then(|s| strip_keyword_prefix_case_insensitive(s.trim_start(), "TABLE"))
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    rest = strip_keyword_prefix_case_insensitive(rest, "ONLY")
+        .map(str::trim_start)
+        .unwrap_or(rest);
+    let drop_pos =
+        find_keyword_outside_quotes(rest, "DROP").ok_or(ParseError::InvalidRelationalSql)?;
+    let table = normalize_relation_identifier(rest[..drop_pos].trim())?;
+    rest = rest[drop_pos + "DROP".len()..].trim_start();
+    rest = strip_keyword_prefix_case_insensitive(rest, "COLUMN")
+        .map(str::trim_start)
+        .unwrap_or(rest);
+    if rest.is_empty()
+        || find_keyword_outside_quotes(rest, "CASCADE").is_some()
+        || find_keyword_outside_quotes(rest, "RESTRICT").is_some()
+    {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let columns = split_csv(rest)?;
+    let [column] = columns.as_slice() else {
+        return Err(ParseError::InvalidRelationalSql);
+    };
+    Ok(DropColumn {
+        table,
+        column: normalize_identifier(column.trim())?,
+    })
 }
 
 fn parse_column_def(input: &str) -> Result<ColumnDef, ParseError> {
@@ -9892,6 +9933,28 @@ mod tests {
             parse_command(
                 "ALTER TABLE private.default_people ADD COLUMN tag TEXT DEFAULT 'bad'::text"
             ),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert_eq!(
+            parse_command("ALTER TABLE ONLY public.default_people DROP COLUMN tag").unwrap(),
+            Command::DropColumn(DropColumn {
+                table: "default_people".to_string(),
+                column: "tag".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_command("ALTER TABLE default_people DROP bucket").unwrap(),
+            Command::DropColumn(DropColumn {
+                table: "default_people".to_string(),
+                column: "bucket".to_string(),
+            })
+        );
+        assert!(matches!(
+            parse_command("ALTER TABLE default_people DROP COLUMN tag CASCADE"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command("ALTER TABLE default_people DROP COLUMN tag, bucket"),
             Err(ParseError::InvalidRelationalSql)
         ));
         assert_eq!(

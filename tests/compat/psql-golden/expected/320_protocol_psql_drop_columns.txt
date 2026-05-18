@@ -1,0 +1,60 @@
+=== bounded drop column ===
+CREATE TABLE
+INSERT 0 2
+COMMENT
+COMMENT
+                                    Table "public.drop_column_people"
+ Column |  Type   | Collation | Nullable | Default | Storage  | Compression | Stats target | Description
+--------+---------+-----------+----------+---------+----------+-------------+--------------+-------------
+ id     | integer |           |          |         | plain    |             |              |
+ name   | text    |           |          |         | extended |             |              | drop me
+ bucket | integer |           |          | 7       | plain    |             |              | keep me
+Indexes:
+    "drop_column_people_pkey" PRIMARY KEY, btree (id)
+Access method: heap
+
+ALTER TABLE
+ id | bucket
+----+--------
+  1 |      7
+  2 |      7
+(2 rows)
+
+INSERT 0 1
+ id | bucket
+----+--------
+  1 |      7
+  2 |      7
+  3 |      7
+(3 rows)
+
+ column_name | data_type | is_nullable | column_default
+-------------+-----------+-------------+----------------
+ id          | integer   | YES         |
+ bucket      | integer   | YES         | 7
+(2 rows)
+
+ nspname |      relname       | attname | default_expr
+---------+--------------------+---------+--------------
+ public  | drop_column_people | bucket  | 7
+(1 row)
+
+                                   Table "public.drop_column_people"
+ Column |  Type   | Collation | Nullable | Default | Storage | Compression | Stats target | Description
+--------+---------+-----------+----------+---------+---------+-------------+--------------+-------------
+ id     | integer |           |          |         | plain   |             |              |
+ bucket | integer |           |          | 7       | plain   |             |              | keep me
+Indexes:
+    "drop_column_people_pkey" PRIMARY KEY, btree (id)
+Access method: heap
+
+psql:320_protocol_psql_drop_columns.sql:23: ERROR:  column does not exist
+psql:320_protocol_psql_drop_columns.sql:24: ERROR:  cannot drop column because an index or constraint depends on it
+CREATE VIEW
+psql:320_protocol_psql_drop_columns.sql:26: ERROR:  relation is not a table
+ id | bucket
+----+--------
+  1 |      7
+  2 |      7
+  3 |      7
+(3 rows)
