@@ -626,45 +626,88 @@ pub fn restore_wal_archive_object_backup(
         )));
     }
 
-    fs::create_dir_all(restored_segment_dir).map_err(|err| {
-        EngineError::Durability(format!(
-            "failed to create restored WAL archive segment directory {}: {err}",
+    if restored_segment_dir.exists() {
+        return Err(EngineError::Durability(format!(
+            "restored WAL archive segment directory {} already exists",
             restored_segment_dir.display()
+        )));
+    }
+    let restored_segment_parent = restored_segment_dir
+        .parent()
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(restored_segment_parent).map_err(|err| {
+        EngineError::Durability(format!(
+            "failed to create restored WAL archive segment parent {}: {err}",
+            restored_segment_parent.display()
+        ))
+    })?;
+    let restored_segment_name = restored_segment_dir
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "segments".to_string());
+    let staging_segment_dir = restored_segment_parent.join(format!(
+        ".{restored_segment_name}.restore-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&staging_segment_dir);
+    fs::create_dir_all(&staging_segment_dir).map_err(|err| {
+        EngineError::Durability(format!(
+            "failed to create staging WAL archive segment directory {}: {err}",
+            staging_segment_dir.display()
         ))
     })?;
 
-    let mut restored_segments = Vec::with_capacity(backup.archive_manifest.segments.len());
-    for (idx, segment) in backup.archive_manifest.segments.iter().enumerate() {
-        let object = backup
-            .objects
-            .iter()
-            .find(|object| object.source_path == segment.segment_path)
-            .ok_or_else(|| {
-                EngineError::Durability(format!(
-                    "WAL archive object backup {} missing segment object {}",
-                    backup_manifest_path.display(),
-                    segment.segment_path.display()
-                ))
-            })?;
-        let bytes = read_verified_wal_archive_backup_object(backup_manifest_path, object)?;
-        let restored_segment_path =
-            restored_segment_dir.join(format!("segment-{:04}.wal", idx + 1));
-        write_verified_backup_bytes(&restored_segment_path, &bytes)?;
-        let manifest_segment_path = restored_segment_path
-            .strip_prefix(
-                restored_manifest_path
-                    .parent()
-                    .unwrap_or_else(|| Path::new(".")),
-            )
-            .unwrap_or(&restored_segment_path)
-            .to_path_buf();
-        restored_segments.push(WalArchiveSegment {
-            segment_path: manifest_segment_path,
-            record_count: segment.record_count,
-            first_txn_id: segment.first_txn_id,
-            last_txn_id: segment.last_txn_id,
-        });
-    }
+    let restore_result = (|| {
+        let mut restored_segments = Vec::with_capacity(backup.archive_manifest.segments.len());
+        for (idx, segment) in backup.archive_manifest.segments.iter().enumerate() {
+            let object = backup
+                .objects
+                .iter()
+                .find(|object| object.source_path == segment.segment_path)
+                .ok_or_else(|| {
+                    EngineError::Durability(format!(
+                        "WAL archive object backup {} missing segment object {}",
+                        backup_manifest_path.display(),
+                        segment.segment_path.display()
+                    ))
+                })?;
+            let bytes = read_verified_wal_archive_backup_object(backup_manifest_path, object)?;
+            let final_segment_path =
+                restored_segment_dir.join(format!("segment-{:04}.wal", idx + 1));
+            let staging_segment_path =
+                staging_segment_dir.join(format!("segment-{:04}.wal", idx + 1));
+            write_verified_backup_bytes(&staging_segment_path, &bytes)?;
+            let manifest_segment_path = final_segment_path
+                .strip_prefix(
+                    restored_manifest_path
+                        .parent()
+                        .unwrap_or_else(|| Path::new(".")),
+                )
+                .unwrap_or(&final_segment_path)
+                .to_path_buf();
+            restored_segments.push(WalArchiveSegment {
+                segment_path: manifest_segment_path,
+                record_count: segment.record_count,
+                first_txn_id: segment.first_txn_id,
+                last_txn_id: segment.last_txn_id,
+            });
+        }
+
+        fs::rename(&staging_segment_dir, restored_segment_dir).map_err(|err| {
+            EngineError::Durability(format!(
+                "failed to install restored WAL archive segment directory {}: {err}",
+                restored_segment_dir.display()
+            ))
+        })?;
+        Ok::<_, EngineError>(restored_segments)
+    })();
+    let restored_segments = match restore_result {
+        Ok(restored_segments) => restored_segments,
+        Err(err) => {
+            let _ = fs::remove_dir_all(&staging_segment_dir);
+            return Err(err);
+        }
+    };
 
     let restored_manifest = WalArchiveManifest {
         segments: restored_segments,
@@ -3066,6 +3109,71 @@ mod tests {
                 || (err.contains("expected") && err.contains("bytes"))
         );
         assert!(!manifest_installed);
+    }
+
+    #[test]
+    fn wal_archive_object_backup_rejects_late_corrupt_object_before_segment_install() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpu-db-wal-object-backup-late-corrupt-{}-{}",
+            std::process::id(),
+            NEXT_TEST_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let manifest_path = dir.join("source").join("MANIFEST");
+        let segment_dir = dir.join("source").join("segments");
+        let backup_path = dir.join("backup").join("BACKUP");
+        let object_dir = dir.join("backup").join("objects");
+        let restored_manifest_path = dir.join("restored").join("MANIFEST");
+        let restored_segment_dir = dir.join("restored").join("segments");
+        let records = vec![
+            WalRecord {
+                txn_id: 1,
+                payload: b"SET a=1".to_vec(),
+            },
+            WalRecord {
+                txn_id: 2,
+                payload: b"SET b=2".to_vec(),
+            },
+        ];
+
+        write_wal_archive(&manifest_path, &segment_dir, &records, 1).unwrap();
+        let backup =
+            export_wal_archive_object_backup(&manifest_path, &backup_path, &object_dir).unwrap();
+        let second_segment_object = backup
+            .objects
+            .iter()
+            .filter(|object| object.source_path != Path::new("MANIFEST"))
+            .nth(1)
+            .unwrap();
+        let object_path = resolve_manifest_path(&backup_path, &second_segment_object.object_path);
+        fs::write(&object_path, b"late corrupt wal object").unwrap();
+
+        let err = restore_wal_archive_object_backup(
+            &backup_path,
+            &restored_manifest_path,
+            &restored_segment_dir,
+        )
+        .unwrap_err();
+        let manifest_installed = restored_manifest_path.exists();
+        let segment_dir_installed = restored_segment_dir.exists();
+        let staging_segment_dir_installed = restored_segment_dir
+            .parent()
+            .unwrap()
+            .join(format!(
+                ".{}.restore-{}",
+                restored_segment_dir.file_name().unwrap().to_string_lossy(),
+                std::process::id()
+            ))
+            .exists();
+        let _ = fs::remove_dir_all(dir);
+
+        let err = err.to_string();
+        assert!(
+            err.contains("checksum mismatch")
+                || (err.contains("expected") && err.contains("bytes"))
+        );
+        assert!(!manifest_installed);
+        assert!(!segment_dir_installed);
+        assert!(!staging_segment_dir_installed);
     }
 
     #[test]
