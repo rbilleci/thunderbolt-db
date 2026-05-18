@@ -1380,6 +1380,7 @@ struct CatalogIndex {
 enum CatalogCommentTarget {
     Table { table: String },
     Column { table: String, attnum: i16 },
+    Index { index: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -5119,6 +5120,12 @@ fn execute_statement(
             );
         }
         let old_index_count = session.indexes.len();
+        let dropped_index_names = session
+            .indexes
+            .iter()
+            .filter(|index| index.table == drop.table)
+            .map(|index| index.name.clone())
+            .collect::<BTreeSet<_>>();
         session.indexes.retain(|index| index.table != drop.table);
         session.dirty_indexes |= session.indexes.len() != old_index_count;
         let dropped_comment_targets = session
@@ -5127,6 +5134,7 @@ fn execute_statement(
             .filter(|target| match target {
                 CatalogCommentTarget::Table { table }
                 | CatalogCommentTarget::Column { table, .. } => table == &drop.table,
+                CatalogCommentTarget::Index { index } => dropped_index_names.contains(index),
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -5482,6 +5490,13 @@ fn execute_statement(
                     );
                 }
                 session.dirty_indexes |= session.indexes.len() != old_index_count;
+                if session.indexes.len() != old_index_count {
+                    let target = CatalogCommentTarget::Index {
+                        index: drop.name.clone(),
+                    };
+                    session.comments.remove(&target);
+                    session.mark_comment_dirty(target);
+                }
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, "DROP INDEX");
             }
@@ -5569,6 +5584,21 @@ fn execute_statement(
                             table,
                             attnum: column_ref.attnum,
                         }
+                    }
+                    CommentTarget::Index { index } => {
+                        if !session.indexes.iter().any(|candidate| {
+                            candidate.name == index && session.tables.contains_key(&candidate.table)
+                        }) {
+                            return write_error(
+                                stream,
+                                &ErrorField {
+                                    code: "42704",
+                                    message: "index does not exist",
+                                    position: None,
+                                },
+                            );
+                        }
+                        CatalogCommentTarget::Index { index }
                     }
                 };
                 if let Some(value) = comment.comment {
@@ -5938,6 +5968,23 @@ fn execute_statement(
                 text_column("Policies"),
             ],
             &catalog_psql_describe_table_privilege_rows_filtered(session, &filter),
+        );
+    }
+    if canonical == psql_describe_indexes_verbose_catalog_query() {
+        return write_single_row(
+            stream,
+            &[
+                text_column("Schema"),
+                text_column("Name"),
+                text_column("Type"),
+                text_column("Owner"),
+                text_column("Table"),
+                text_column("Persistence"),
+                text_column("Access method"),
+                text_column("Size"),
+                text_column("Description"),
+            ],
+            &psql_describe_index_verbose_rows(session),
         );
     }
     if canonical == psql_describe_indexes_catalog_query()
@@ -7019,6 +7066,19 @@ fn execute_statement(
             &pg_catalog_description_rows(session),
         );
     }
+    if canonical == pg_catalog_table_index_descriptions_query() {
+        return write_single_row(
+            stream,
+            &[
+                text_column("nspname"),
+                text_column("relname"),
+                text_column("relkind"),
+                text_column("attname"),
+                text_column("description"),
+            ],
+            &pg_catalog_table_index_description_rows(session),
+        );
+    }
     if psql_list_object_descriptions_query(&canonical) {
         return write_single_row(
             stream,
@@ -7372,6 +7432,10 @@ fn psql_describe_table_privileges_catalog_query_filter(
 
 fn psql_describe_indexes_catalog_query() -> &'static str {
     "select n.nspname as \"schema\", c.relname as \"name\", case c.relkind when 'r' then 'table' when 'v' then 'view' when 'm' then 'materialized view' when 'i' then 'index' when 's' then 'sequence' when 't' then 'toast table' when 'f' then 'foreign table' when 'p' then 'partitioned table' when 'i' then 'partitioned index' end as \"type\", pg_catalog.pg_get_userbyid(c.relowner) as \"owner\", c2.relname as \"table\" from pg_catalog.pg_class c left join pg_catalog.pg_namespace n on n.oid = c.relnamespace left join pg_catalog.pg_am am on am.oid = c.relam left join pg_catalog.pg_index i on i.indexrelid = c.oid left join pg_catalog.pg_class c2 on i.indrelid = c2.oid where c.relkind in ('i','i','') and n.nspname <> 'pg_catalog' and n.nspname !~ '^pg_toast' and n.nspname <> 'information_schema' and pg_catalog.pg_table_is_visible(c.oid) order by 1,2"
+}
+
+fn psql_describe_indexes_verbose_catalog_query() -> &'static str {
+    "select n.nspname as \"schema\", c.relname as \"name\", case c.relkind when 'r' then 'table' when 'v' then 'view' when 'm' then 'materialized view' when 'i' then 'index' when 's' then 'sequence' when 't' then 'toast table' when 'f' then 'foreign table' when 'p' then 'partitioned table' when 'i' then 'partitioned index' end as \"type\", pg_catalog.pg_get_userbyid(c.relowner) as \"owner\", c2.relname as \"table\", case c.relpersistence when 'p' then 'permanent' when 't' then 'temporary' when 'u' then 'unlogged' end as \"persistence\", am.amname as \"access method\", pg_catalog.pg_size_pretty(pg_catalog.pg_table_size(c.oid)) as \"size\", pg_catalog.obj_description(c.oid, 'pg_class') as \"description\" from pg_catalog.pg_class c left join pg_catalog.pg_namespace n on n.oid = c.relnamespace left join pg_catalog.pg_am am on am.oid = c.relam left join pg_catalog.pg_index i on i.indexrelid = c.oid left join pg_catalog.pg_class c2 on i.indrelid = c2.oid where c.relkind in ('i','i','') and n.nspname <> 'pg_catalog' and n.nspname !~ '^pg_toast' and n.nspname <> 'information_schema' and pg_catalog.pg_table_is_visible(c.oid) order by 1,2"
 }
 
 fn psql_describe_indexes_catalog_query_schema_filter(canonical: &str) -> Option<String> {
@@ -8030,38 +8094,19 @@ fn pg_dump_index_metadata_columns() -> Vec<Column> {
 }
 
 fn pg_dump_index_metadata_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    let mut indexed = session
-        .indexes
-        .iter()
-        .filter_map(|index| {
-            let table = session.tables.get(&index.table)?;
-            let column = table
-                .columns
-                .iter()
-                .find(|column| column.def.name == index.column)?;
-            Some((table.oid, table.name.clone(), column.attnum, index.clone()))
-        })
-        .collect::<Vec<_>>();
-    indexed.sort_by(|left, right| {
-        left.0
-            .cmp(&right.0)
-            .then_with(|| left.3.name.cmp(&right.3.name))
-    });
-    indexed
+    catalog_index_entries(session)
         .into_iter()
-        .enumerate()
-        .map(|(idx, (table_oid, table_name, attnum, index))| {
-            let oid = FIRST_USER_INDEX_OID + idx as u32;
+        .map(|entry| {
             vec![
                 Some("1259".to_string()),
-                Some(oid.to_string()),
-                Some(table_oid.to_string()),
-                Some(index.name.clone()),
+                Some(entry.index_oid.to_string()),
+                Some(entry.table_oid.to_string()),
+                Some(entry.index.name.clone()),
                 Some(format!(
                     "CREATE INDEX {} ON public.{} USING btree ({})",
-                    index.name, table_name, index.column
+                    entry.index.name, entry.table_name, entry.index.column
                 )),
-                Some(attnum.to_string()),
+                Some(entry.attnum.to_string()),
                 Some("f".to_string()),
                 None,
                 None,
@@ -8082,6 +8127,55 @@ fn pg_dump_index_metadata_rows(session: &Session) -> Vec<Vec<Option<String>>> {
             ]
         })
         .collect()
+}
+
+#[derive(Clone)]
+struct CatalogIndexEntry {
+    table_oid: u32,
+    table_name: String,
+    attnum: i16,
+    index_oid: u32,
+    index: CatalogIndex,
+}
+
+fn catalog_index_entries(session: &Session) -> Vec<CatalogIndexEntry> {
+    let mut indexed = session
+        .indexes
+        .iter()
+        .filter_map(|index| {
+            let table = session.tables.get(&index.table)?;
+            let column = table
+                .columns
+                .iter()
+                .find(|column| column.def.name == index.column)?;
+            Some((table.oid, table.name.clone(), column.attnum, index.clone()))
+        })
+        .collect::<Vec<_>>();
+    indexed.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.3.name.cmp(&right.3.name))
+    });
+    indexed
+        .into_iter()
+        .enumerate()
+        .map(
+            |(idx, (table_oid, table_name, attnum, index))| CatalogIndexEntry {
+                table_oid,
+                table_name,
+                attnum,
+                index_oid: FIRST_USER_INDEX_OID + idx as u32,
+                index,
+            },
+        )
+        .collect()
+}
+
+fn catalog_index_oid(session: &Session, index_name: &str) -> Option<u32> {
+    catalog_index_entries(session)
+        .into_iter()
+        .find(|entry| entry.index.name == index_name)
+        .map(|entry| entry.index_oid)
 }
 
 fn pg_dump_attrdef_metadata_query_relation_oids(canonical: &str) -> Option<Vec<u32>> {
@@ -8990,6 +9084,37 @@ fn psql_describe_index_rows(session: &Session) -> Vec<Vec<Option<String>>> {
     rows.into_iter().map(|(_, row)| row).collect()
 }
 
+fn psql_describe_index_verbose_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut rows = session
+        .indexes
+        .iter()
+        .filter(|index| session.tables.contains_key(&index.table))
+        .map(|index| {
+            (
+                index.name.clone(),
+                vec![
+                    Some("public".to_string()),
+                    Some(index.name.clone()),
+                    Some("index".to_string()),
+                    Some("postgres".to_string()),
+                    Some(index.table.clone()),
+                    Some("permanent".to_string()),
+                    Some("btree".to_string()),
+                    None,
+                    session
+                        .comments
+                        .get(&CatalogCommentTarget::Index {
+                            index: index.name.clone(),
+                        })
+                        .cloned(),
+                ],
+            )
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+    rows.into_iter().map(|(_, row)| row).collect()
+}
+
 fn pg_catalog_class_plain_tables_query() -> &'static str {
     "select c.oid, n.nspname, c.relname, c.relkind, c.relpersistence from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace where n.nspname = 'public' and c.relkind = 'r' order by c.relname"
 }
@@ -9543,6 +9668,10 @@ fn pg_catalog_descriptions_query() -> &'static str {
     "select n.nspname, c.relname, a.attname, d.description from pg_catalog.pg_description d join pg_catalog.pg_class c on c.oid = d.objoid join pg_catalog.pg_namespace n on n.oid = c.relnamespace left join pg_catalog.pg_attribute a on a.attrelid = c.oid and a.attnum = d.objsubid where n.nspname = 'public' and c.relkind = 'r' order by c.relname, d.objsubid"
 }
 
+fn pg_catalog_table_index_descriptions_query() -> &'static str {
+    "select n.nspname, c.relname, c.relkind, a.attname, d.description from pg_catalog.pg_description d join pg_catalog.pg_class c on c.oid = d.objoid join pg_catalog.pg_namespace n on n.oid = c.relnamespace left join pg_catalog.pg_attribute a on a.attrelid = c.oid and a.attnum = d.objsubid where n.nspname = 'public' and c.relkind in ('r','i') order by c.relkind, c.relname, d.objsubid"
+}
+
 fn pg_catalog_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
     let mut rows = Vec::new();
     let mut tables = session.tables.values().collect::<Vec<_>>();
@@ -9575,6 +9704,39 @@ fn pg_catalog_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
     rows
 }
 
+fn pg_catalog_table_index_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut rows = Vec::new();
+    let mut indexes = session
+        .indexes
+        .iter()
+        .filter(|index| session.tables.contains_key(&index.table))
+        .collect::<Vec<_>>();
+    indexes.sort_by(|left, right| left.name.cmp(&right.name));
+    for index in indexes {
+        if let Some(description) = session.comments.get(&CatalogCommentTarget::Index {
+            index: index.name.clone(),
+        }) {
+            rows.push(vec![
+                Some("public".to_string()),
+                Some(index.name.clone()),
+                Some("i".to_string()),
+                None,
+                Some(description.clone()),
+            ]);
+        }
+    }
+    for row in pg_catalog_description_rows(session) {
+        rows.push(vec![
+            row[0].clone(),
+            row[1].clone(),
+            Some("r".to_string()),
+            row[2].clone(),
+            row[3].clone(),
+        ]);
+    }
+    rows
+}
+
 fn pg_dump_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
     let mut rows = Vec::new();
     let mut tables = session.tables.values().collect::<Vec<_>>();
@@ -9602,6 +9764,25 @@ fn pg_dump_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
                     Some(column.attnum.to_string()),
                 ]);
             }
+        }
+    }
+    let mut index_comments = session
+        .comments
+        .iter()
+        .filter_map(|(target, description)| match target {
+            CatalogCommentTarget::Index { index } => Some((index, description)),
+            CatalogCommentTarget::Table { .. } | CatalogCommentTarget::Column { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    index_comments.sort_by(|left, right| left.0.cmp(right.0));
+    for (index, description) in index_comments {
+        if let Some(oid) = catalog_index_oid(session, index) {
+            rows.push(vec![
+                Some(description.clone()),
+                Some("1259".to_string()),
+                Some(oid.to_string()),
+                Some("0".to_string()),
+            ]);
         }
     }
     rows
@@ -11314,6 +11495,12 @@ mod tests {
             table: "people".to_string(),
             column: "id".to_string(),
         });
+        session.comments.insert(
+            CatalogCommentTarget::Index {
+                index: "people_name_idx".to_string(),
+            },
+            "lookup index".to_string(),
+        );
 
         assert_eq!(
             pg_catalog_index_rows(&session),
@@ -11332,6 +11519,29 @@ mod tests {
                 Some("index".to_string()),
                 Some("postgres".to_string()),
                 Some("people".to_string()),
+            ]]
+        );
+        assert_eq!(
+            psql_describe_index_verbose_rows(&session),
+            vec![vec![
+                Some("public".to_string()),
+                Some("people_name_idx".to_string()),
+                Some("index".to_string()),
+                Some("postgres".to_string()),
+                Some("people".to_string()),
+                Some("permanent".to_string()),
+                Some("btree".to_string()),
+                None,
+                Some("lookup index".to_string()),
+            ]]
+        );
+        assert_eq!(
+            pg_dump_description_rows(&session),
+            vec![vec![
+                Some("lookup index".to_string()),
+                Some("1259".to_string()),
+                Some(FIRST_USER_INDEX_OID.to_string()),
+                Some("0".to_string()),
             ]]
         );
         assert_eq!(

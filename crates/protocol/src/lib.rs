@@ -56,6 +56,7 @@ pub struct CommentOn {
 pub enum CommentTarget {
     Table { table: String },
     Column { table: String, column: String },
+    Index { index: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1638,6 +1639,15 @@ fn parse_comment_on(input: &str) -> Result<CommentOn, ParseError> {
         let column = normalize_identifier(column.trim())?;
         (
             CommentTarget::Column { table, column },
+            rest[is_pos + "IS".len()..].trim(),
+        )
+    } else if let Some(rest) = strip_keyword_prefix_case_insensitive(rest, "INDEX") {
+        let rest = rest.trim_start();
+        let is_pos =
+            find_keyword_outside_quotes(rest, "IS").ok_or(ParseError::InvalidRelationalSql)?;
+        let index = normalize_relation_identifier(rest[..is_pos].trim())?;
+        (
+            CommentTarget::Index { index },
             rest[is_pos + "IS".len()..].trim(),
         )
     } else {
@@ -8927,6 +8937,16 @@ mod tests {
                     column: "name".to_string(),
                 },
                 comment: None,
+            })
+        );
+
+        assert_eq!(
+            parse_command("COMMENT ON INDEX public.people_name_idx IS 'lookup index'").unwrap(),
+            Command::CommentOn(CommentOn {
+                target: CommentTarget::Index {
+                    index: "people_name_idx".to_string(),
+                },
+                comment: Some("lookup index".to_string()),
             })
         );
 

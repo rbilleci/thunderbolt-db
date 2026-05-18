@@ -5974,6 +5974,7 @@ pub struct RelationalIndex {
 pub enum RelationalCommentTarget {
     Table { table: String },
     Column { table: String, attnum: i16 },
+    Index { index: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7573,6 +7574,10 @@ impl Engine {
             let old_len = table.indexes.len();
             table.indexes.retain(|index| index.name != drop.name);
             if table.indexes.len() != old_len {
+                self.relational_comments
+                    .remove(&RelationalCommentTarget::Index {
+                        index: drop.name.clone(),
+                    });
                 return Ok(());
             }
         }
@@ -7611,6 +7616,20 @@ impl Engine {
                     table,
                     attnum: column_ref.attnum,
                 }
+            }
+            CommentTarget::Index { index } => {
+                if !self.relational_catalog.values().any(|table| {
+                    table
+                        .indexes
+                        .iter()
+                        .any(|candidate| candidate.name == index)
+                }) {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "index \"{}\" does not exist",
+                        index
+                    )));
+                }
+                RelationalCommentTarget::Index { index }
             }
         };
         if let Some(value) = comment.comment {
@@ -11192,6 +11211,14 @@ impl Engine {
             .get(&RelationalCommentTarget::Column {
                 table: table.to_string(),
                 attnum,
+            })
+            .map(String::as_str)
+    }
+
+    pub fn relational_index_comment(&self, index: &str) -> Option<&str> {
+        self.relational_comments
+            .get(&RelationalCommentTarget::Index {
+                index: index.to_string(),
             })
             .map(String::as_str)
     }
@@ -30599,10 +30626,21 @@ mod tests {
             .unwrap();
         e.execute_text(3, "COMMENT ON COLUMN public.people.name IS 'display name'")
             .unwrap();
+        e.execute_text(4, "CREATE INDEX people_name_idx ON people (name)")
+            .unwrap();
+        e.execute_text(
+            5,
+            "COMMENT ON INDEX public.people_name_idx IS 'name lookup'",
+        )
+        .unwrap();
         assert_eq!(e.relational_table_comment("people"), Some("lookup people"));
         assert_eq!(
             e.relational_column_comment("people", 2),
             Some("display name")
+        );
+        assert_eq!(
+            e.relational_index_comment("people_name_idx"),
+            Some("name lookup")
         );
 
         let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
@@ -30614,15 +30652,36 @@ mod tests {
             recovered.relational_column_comment("people", 2),
             Some("display name")
         );
+        assert_eq!(
+            recovered.relational_index_comment("people_name_idx"),
+            Some("name lookup")
+        );
 
-        e.execute_text(4, "COMMENT ON COLUMN public.people.name IS NULL")
+        e.execute_text(6, "COMMENT ON COLUMN public.people.name IS NULL")
             .unwrap();
         assert_eq!(e.relational_column_comment("people", 2), None);
-        assert!(e
-            .execute_text(5, "COMMENT ON COLUMN public.people.missing IS 'bad'")
+        e.execute_text(7, "DROP INDEX people_name_idx").unwrap();
+        assert_eq!(e.relational_index_comment("people_name_idx"), None);
+
+        let mut missing = Engine::new_local();
+        missing
+            .execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        assert!(missing
+            .execute_text(2, "COMMENT ON COLUMN public.people.missing IS 'bad'")
             .unwrap_err()
             .to_string()
             .contains("column \"missing\" does not exist"));
+
+        let mut missing_index = Engine::new_local();
+        missing_index
+            .execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        assert!(missing_index
+            .execute_text(2, "COMMENT ON INDEX public.people_name_idx IS 'bad'")
+            .unwrap_err()
+            .to_string()
+            .contains("index \"people_name_idx\" does not exist"));
     }
 
     #[test]

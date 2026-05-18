@@ -1,5 +1,7 @@
 === table and column comments ===
 CREATE TABLE
+CREATE INDEX
+COMMENT
 COMMENT
 COMMENT
  nspname |    relname     | attname |     description
@@ -8,12 +10,25 @@ COMMENT
  public  | comment_people | name    | display name
 (2 rows)
 
+ nspname |         relname         | relkind | attname |     description
+---------+-------------------------+---------+---------+---------------------
+ public  | comment_people_name_idx | i       |         | name lookup index
+ public  | comment_people          | r       |         | people lookup table
+ public  | comment_people          | r       | name    | display name
+(3 rows)
+
                                       Table "public.comment_people"
  Column |  Type   | Collation | Nullable | Default | Storage  | Compression | Stats target | Description
 --------+---------+-----------+----------+---------+----------+-------------+--------------+--------------
  id     | integer |           |          |         | plain    |             |              |
  name   | text    |           |          |         | extended |             |              | display name
 Access method: heap
+
+                                                       List of relations
+ Schema |          Name           | Type  |  Owner   |     Table      | Persistence | Access method | Size |    Description
+--------+-------------------------+-------+----------+----------------+-------------+---------------+------+-------------------
+ public | comment_people_name_idx | index | postgres | comment_people | permanent   | btree         |      | name lookup index
+(1 row)
 
                   Object descriptions
  Schema |      Name      | Object |     Description
@@ -22,11 +37,12 @@ Access method: heap
 (1 row)
 
 COMMENT
+COMMENT
  nspname |    relname     | attname |     description
 ---------+----------------+---------+---------------------
  public  | comment_people |         | people lookup table
 (1 row)
 
-psql:305_protocol_psql_comments.sql:22: ERROR:  relation does not exist
-psql:305_protocol_psql_comments.sql:23: ERROR:  column does not exist
-psql:305_protocol_psql_comments.sql:24: ERROR:  query shape is not supported by the compatibility stub
+psql:305_protocol_psql_comments.sql:33: ERROR:  relation does not exist
+psql:305_protocol_psql_comments.sql:34: ERROR:  column does not exist
+psql:305_protocol_psql_comments.sql:35: ERROR:  index does not exist

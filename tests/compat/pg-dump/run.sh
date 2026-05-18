@@ -111,12 +111,14 @@ INSERT INTO accounts (id) VALUES (2);
 CREATE INDEX accounts_name_idx ON accounts (name);
 COMMENT ON TABLE public.accounts IS 'accounts table';
 COMMENT ON COLUMN public.accounts.name IS 'account display name';
+COMMENT ON INDEX public.accounts_name_idx IS 'accounts name lookup';
 CREATE TABLE events (event_id int4, note text);
 INSERT INTO events (event_id, note) VALUES (10, 'created');
 INSERT INTO events (event_id, note) VALUES (11, 'updated');
 CREATE INDEX events_note_idx ON events (note);
 COMMENT ON TABLE public.events IS 'events table';
 COMMENT ON COLUMN public.events.note IS 'event note';
+COMMENT ON INDEX public.events_note_idx IS 'events note lookup';
 SQL
 
 PGHOST=127.0.0.1 PGPORT="$SOURCE_PORT" PGDATABASE=postgres PGUSER=postgres \
@@ -178,10 +180,12 @@ events|events_note_idx|CREATE INDEX events_note_idx ON public.events USING btree
 EOF
 
 cat >"$OUT_DIR/comment-verify.expected" <<'EOF'
-public|accounts||accounts table
-public|accounts|name|account display name
-public|events||events table
-public|events|note|event note
+public|accounts_name_idx|i||accounts name lookup
+public|events_note_idx|i||events note lookup
+public|accounts|r||accounts table
+public|accounts|r|name|account display name
+public|events|r||events table
+public|events|r|note|event note
 EOF
 
 diff -u "$OUT_DIR/verify.expected" "$OUT_DIR/verify.out"
@@ -203,7 +207,7 @@ verify_comments() {
   local prefix="$2"
   PGHOST=127.0.0.1 PGPORT="$port" PGDATABASE=postgres PGUSER=postgres \
     psql -v ON_ERROR_STOP=1 -X -A -t \
-    -c "SELECT n.nspname, c.relname, a.attname, d.description FROM pg_catalog.pg_description d JOIN pg_catalog.pg_class c ON c.oid = d.objoid JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = d.objsubid WHERE n.nspname = 'public' AND c.relkind = 'r' ORDER BY c.relname, d.objsubid;" \
+    -c "SELECT n.nspname, c.relname, c.relkind, a.attname, d.description FROM pg_catalog.pg_description d JOIN pg_catalog.pg_class c ON c.oid = d.objoid JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = d.objsubid WHERE n.nspname = 'public' AND c.relkind IN ('r','i') ORDER BY c.relkind, c.relname, d.objsubid;" \
     >"$OUT_DIR/${prefix}-comment-verify.out" 2>"$OUT_DIR/${prefix}-comment-verify.err"
   diff -u "$OUT_DIR/comment-verify.expected" "$OUT_DIR/${prefix}-comment-verify.out"
 }
@@ -444,8 +448,10 @@ grep -F "CREATE INDEX accounts_name_idx ON public.accounts USING btree (name);" 
 grep -F "CREATE INDEX events_note_idx ON public.events USING btree (note);" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "COMMENT ON TABLE public.accounts IS 'accounts table';" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "COMMENT ON COLUMN public.accounts.name IS 'account display name';" "$OUT_DIR/dump.sql" >/dev/null
+grep -F "COMMENT ON INDEX public.accounts_name_idx IS 'accounts name lookup';" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "COMMENT ON TABLE public.events IS 'events table';" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "COMMENT ON COLUMN public.events.note IS 'event note';" "$OUT_DIR/dump.sql" >/dev/null
+grep -F "COMMENT ON INDEX public.events_note_idx IS 'events note lookup';" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "CREATE SCHEMA public;" "$OUT_DIR/dump-schema.sql" >/dev/null
 grep -F "CREATE TABLE public.accounts (" "$OUT_DIR/dump-schema.sql" >/dev/null
 grep -F "    name text DEFAULT 'unknown'::text," "$OUT_DIR/dump-schema.sql" >/dev/null
@@ -455,8 +461,10 @@ grep -F "CREATE INDEX accounts_name_idx ON public.accounts USING btree (name);" 
 grep -F "CREATE INDEX events_note_idx ON public.events USING btree (note);" "$OUT_DIR/dump-schema.sql" >/dev/null
 grep -F "COMMENT ON TABLE public.accounts IS 'accounts table';" "$OUT_DIR/dump-schema.sql" >/dev/null
 grep -F "COMMENT ON COLUMN public.accounts.name IS 'account display name';" "$OUT_DIR/dump-schema.sql" >/dev/null
+grep -F "COMMENT ON INDEX public.accounts_name_idx IS 'accounts name lookup';" "$OUT_DIR/dump-schema.sql" >/dev/null
 grep -F "COMMENT ON TABLE public.events IS 'events table';" "$OUT_DIR/dump-schema.sql" >/dev/null
 grep -F "COMMENT ON COLUMN public.events.note IS 'event note';" "$OUT_DIR/dump-schema.sql" >/dev/null
+grep -F "COMMENT ON INDEX public.events_note_idx IS 'events note lookup';" "$OUT_DIR/dump-schema.sql" >/dev/null
 grep -F "COPY public.accounts (id, name, tier) FROM stdin;" "$OUT_DIR/dump-data.sql" >/dev/null
 grep -F "COPY public.events (event_id, note) FROM stdin;" "$OUT_DIR/dump-data.sql" >/dev/null
 grep -F "SCHEMA - public" "$OUT_DIR/dump.custom.toc" >/dev/null
