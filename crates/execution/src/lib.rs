@@ -246,6 +246,28 @@ impl CudaResidentDeviceMemory {
         Ok(CudaI32Stats::from_values(&values))
     }
 
+    pub fn stats_i32_between_from_payload(
+        &self,
+        byte_offset: u64,
+        row_count: u64,
+        lower_inclusive: i32,
+        upper_inclusive: i32,
+    ) -> Result<(CudaI32Stats, u64), CudaRuntimeProbeError> {
+        if lower_inclusive > upper_inclusive {
+            return Ok((CudaI32Stats::from_values(&[]), 0));
+        }
+        let mut values = launch_cuda_resident_i32_compare_project(
+            self,
+            byte_offset,
+            row_count,
+            lower_inclusive,
+            CudaI32Comparison::Gte,
+        )?;
+        let readback_count = values.len() as u64;
+        values.retain(|value| *value <= upper_inclusive);
+        Ok((CudaI32Stats::from_values(&values), readback_count))
+    }
+
     pub fn project_i32_compare_from_payload(
         &self,
         byte_offset: u64,

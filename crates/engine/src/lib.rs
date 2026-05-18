@@ -8718,6 +8718,184 @@ impl Engine {
         })
     }
 
+    pub fn execute_relational_between_scalar_aggregate_with_resident_device_memory_probe(
+        &mut self,
+        select: &Select,
+    ) -> Result<RelationalSelectResult, ExecuteError> {
+        let (table, bound) = self.bind_relational_select_for_execution(select)?;
+        let (aggregate_column, aggregate_name) = match &select.projection {
+            SelectProjection::Sum { column } => (column, "SUM"),
+            SelectProjection::Avg { column } => (column, "AVG"),
+            SelectProjection::Min { column } => (column, "MIN"),
+            SelectProjection::Max { column } => (column, "MAX"),
+            _ => {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "resident device-memory BETWEEN scalar aggregate proof currently supports only SUM/AVG/MIN/MAX(int4_column)"
+                        .to_string(),
+                )));
+            }
+        };
+        if select.distinct
+            || select.group_by.is_some()
+            || !select.having_groups.is_empty()
+            || select.order_by.is_some()
+            || select.limit.is_some()
+            || select.offset.is_some()
+            || bound.filter_groups.len() != 1
+            || bound.filter_groups[0].len() != 2
+        {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory BETWEEN scalar aggregate proof currently supports only one int4 BETWEEN predicate"
+                    .to_string(),
+            )));
+        }
+        let aggregate_idx = relational_column_index(&table, aggregate_column)?;
+        let mut filter_idx = None;
+        let mut lower = None;
+        let mut upper = None;
+        for (idx, op, value) in &bound.filter_groups[0] {
+            if filter_idx
+                .replace(*idx)
+                .is_some_and(|existing| existing != *idx)
+            {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "resident device-memory BETWEEN scalar aggregate proof requires both range bounds to target the same column"
+                        .to_string(),
+                )));
+            }
+            let SqlValue::Int4(value) = value else {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "resident device-memory BETWEEN scalar aggregate proof supports only int4 bounds"
+                        .to_string(),
+                )));
+            };
+            match op {
+                SelectFilterOp::Gte => lower = Some(*value),
+                SelectFilterOp::Lte => upper = Some(*value),
+                _ => {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        "resident device-memory BETWEEN scalar aggregate proof currently supports only inclusive int4 bounds"
+                            .to_string(),
+                    )));
+                }
+            }
+        }
+        let filter_idx = filter_idx.ok_or_else(|| {
+            ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory BETWEEN scalar aggregate proof requires an int4 predicate column"
+                    .to_string(),
+            ))
+        })?;
+        if filter_idx != aggregate_idx {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory BETWEEN scalar aggregate proof currently requires the predicate column to match the aggregate column"
+                    .to_string(),
+            )));
+        }
+        let lower = lower.ok_or_else(|| {
+            ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory BETWEEN scalar aggregate proof requires a lower inclusive bound"
+                    .to_string(),
+            ))
+        })?;
+        let upper = upper.ok_or_else(|| {
+            ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory BETWEEN scalar aggregate proof requires an upper inclusive bound"
+                    .to_string(),
+            ))
+        })?;
+        if table.columns[aggregate_idx].ty != SqlType::Int4 {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "resident device-memory BETWEEN scalar aggregate proof currently supports only int4 columns for {aggregate_name}"
+            ))));
+        }
+
+        let (_query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
+        let snapshot = self
+            .relational_residency_snapshot(&table.name)
+            .ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "relation \"{}\" has no resident snapshot",
+                    table.name
+                )))
+            })?;
+        if snapshot.schema != table.schema || snapshot.table != table.name {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident snapshot no longer matches catalog table identity".to_string(),
+            )));
+        }
+        if !snapshot.is_valid() {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "relation \"{}\" resident snapshot is invalid",
+                table.name
+            ))));
+        }
+        let device_memory = self
+            .relational_residency_device_memory
+            .get(&table.name)
+            .ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "relation \"{}\" has no retained resident device memory",
+                    table.name
+                )))
+            })?;
+        let byte_offset = resident_device_int4_column_offset(&snapshot, &table, aggregate_idx)?;
+        let row_count = u64::try_from(snapshot.row_count).map_err(|_| {
+            ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident snapshot row count exceeds retained device-memory proof range"
+                    .to_string(),
+            ))
+        })?;
+        let started = Instant::now();
+        let (stats, readback_count) = device_memory
+            .stats_i32_between_from_payload(byte_offset, row_count, lower, upper)
+            .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
+        let elapsed = started.elapsed();
+        let result_value = match &select.projection {
+            SelectProjection::Sum { .. } => SqlValue::Int8(stats.sum),
+            SelectProjection::Avg { .. } => average_sql_value(
+                i128::from(stats.sum),
+                usize::try_from(stats.count).map_err(|_| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                        "resident device-memory BETWEEN aggregate count {} exceeds AVG result range",
+                        stats.count
+                    )))
+                })?,
+            ),
+            SelectProjection::Min { .. } => stats
+                .min
+                .map(SqlValue::Int4)
+                .unwrap_or_else(|| SqlValue::Text(String::new())),
+            SelectProjection::Max { .. } => stats
+                .max
+                .map(SqlValue::Int4)
+                .unwrap_or_else(|| SqlValue::Text(String::new())),
+            _ => unreachable!(),
+        };
+        let result_d2h_bytes = if lower > upper {
+            0
+        } else {
+            readback_count
+                .checked_mul(std::mem::size_of::<i32>() as u64)
+                .and_then(|bytes| bytes.checked_add(std::mem::size_of::<u64>() as u64))
+                .unwrap_or(u64::MAX)
+        };
+        self.metrics.observe_d2h_bytes(result_d2h_bytes);
+        if lower <= upper {
+            self.metrics
+                .observe_kernel_exec_ms(elapsed.as_millis().try_into().unwrap_or(u64::MAX).max(1));
+        }
+
+        Ok(RelationalSelectResult {
+            columns: bound.selected_columns,
+            rows: vec![vec![result_value]],
+            planned_target: DeviceTarget::Gpu(snapshot.gpu_id),
+            executed_target: DeviceTarget::Gpu(snapshot.gpu_id),
+            fallback_reason: None,
+            access_path,
+        })
+    }
+
     pub fn execute_relational_scalar_aggregate_with_resident_device_memory_probe(
         &mut self,
         select: &Select,
@@ -14643,6 +14821,123 @@ mod tests {
         e.mark_gpu_memory_pressured(0);
         assert!(e
             .execute_relational_filtered_scalar_aggregate_with_resident_device_memory_probe(&select)
+            .unwrap_err()
+            .to_string()
+            .contains("resident snapshot is invalid"));
+    }
+
+    #[test]
+    fn gpu_resident_device_memory_between_scalar_aggregate_probe_materializes_int4_results() {
+        let mut e = Engine::new_local();
+        e.execute_text(
+            1,
+            "CREATE TABLE events (bucket INT, label TEXT, amount INT)",
+        )
+        .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO events (bucket, label, amount) VALUES (1, 'alpha', 10), (2, 'beta', 30), (1, 'gamma', 20), (3, 'delta', 40), (2, 'epsilon', 5)",
+        )
+        .unwrap();
+        let snapshot = e.populate_relational_residency_snapshot("events").unwrap();
+        if snapshot.device_memory_proof.is_none() {
+            return;
+        }
+
+        for sql in [
+            "SELECT SUM(amount) FROM events WHERE amount BETWEEN 10 AND 30",
+            "SELECT AVG(amount) FROM events WHERE amount BETWEEN 10 AND 30",
+            "SELECT MIN(amount) FROM events WHERE amount BETWEEN 10 AND 30",
+            "SELECT MAX(amount) FROM events WHERE amount BETWEEN 10 AND 30",
+            "SELECT SUM(amount) FROM events WHERE amount BETWEEN 40 AND 10",
+        ] {
+            let Command::Select(select) = parse_command(sql).unwrap() else {
+                unreachable!()
+            };
+            let cpu = e.execute_relational_select(&select).unwrap();
+            let before = e.metrics().snapshot();
+            let resident = e
+                .execute_relational_between_scalar_aggregate_with_resident_device_memory_probe(
+                    &select,
+                )
+                .unwrap();
+            let after = e.metrics().snapshot();
+
+            assert_eq!(resident.columns, cpu.columns, "{sql}");
+            assert_eq!(resident.rows, cpu.rows, "{sql}");
+            assert_eq!(resident.planned_target, DeviceTarget::Gpu(0), "{sql}");
+            assert_eq!(resident.executed_target, DeviceTarget::Gpu(0), "{sql}");
+            assert_eq!(resident.fallback_reason, None, "{sql}");
+            assert_eq!(after.h2d_bytes_total - before.h2d_bytes_total, 0, "{sql}");
+            if sql.contains("40 AND 10") {
+                assert_eq!(after.d2h_bytes_total - before.d2h_bytes_total, 0, "{sql}");
+                assert_eq!(
+                    after.kernel_exec_samples - before.kernel_exec_samples,
+                    0,
+                    "{sql}"
+                );
+            } else {
+                assert_eq!(
+                    after.d2h_bytes_total - before.d2h_bytes_total,
+                    4 * std::mem::size_of::<i32>() as u64 + std::mem::size_of::<u64>() as u64,
+                    "{sql}"
+                );
+                assert_eq!(
+                    after.kernel_exec_samples - before.kernel_exec_samples,
+                    1,
+                    "{sql}"
+                );
+            }
+        }
+
+        let Command::Select(unsupported_text) =
+            parse_command("SELECT MAX(label) FROM events WHERE label BETWEEN 'beta' AND 'gamma'")
+                .unwrap()
+        else {
+            unreachable!()
+        };
+        let err = e
+            .execute_relational_between_scalar_aggregate_with_resident_device_memory_probe(
+                &unsupported_text,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("supports only int4 bounds"));
+
+        let Command::Select(unsupported_cross_column) =
+            parse_command("SELECT SUM(amount) FROM events WHERE bucket BETWEEN 1 AND 2").unwrap()
+        else {
+            unreachable!()
+        };
+        let err = e
+            .execute_relational_between_scalar_aggregate_with_resident_device_memory_probe(
+                &unsupported_cross_column,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("requires the predicate column to match the aggregate column"));
+
+        let Command::Select(equality_only) =
+            parse_command("SELECT SUM(amount) FROM events WHERE amount = 20").unwrap()
+        else {
+            unreachable!()
+        };
+        let err = e
+            .execute_relational_between_scalar_aggregate_with_resident_device_memory_probe(
+                &equality_only,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("one int4 BETWEEN predicate"));
+
+        let Command::Select(select) =
+            parse_command("SELECT SUM(amount) FROM events WHERE amount BETWEEN 10 AND 30").unwrap()
+        else {
+            unreachable!()
+        };
+        e.mark_gpu_memory_pressured(0);
+        assert!(e
+            .execute_relational_between_scalar_aggregate_with_resident_device_memory_probe(&select)
             .unwrap_err()
             .to_string()
             .contains("resident snapshot is invalid"));
