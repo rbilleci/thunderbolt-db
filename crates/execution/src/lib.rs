@@ -216,7 +216,7 @@ impl CudaResidentDeviceMemory {
         needle: i32,
         comparison: CudaI32Comparison,
         descending: bool,
-        limit: u64,
+        window: (u64, u64),
     ) -> Result<Vec<i32>, CudaRuntimeProbeError> {
         let mut values = launch_cuda_resident_i32_compare_project(
             self,
@@ -230,11 +230,12 @@ impl CudaResidentDeviceMemory {
         } else {
             values.sort_unstable();
         }
-        values.truncate(
-            usize::try_from(limit)
-                .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?,
-        );
-        Ok(values)
+        let (offset, limit) = window;
+        let offset = usize::try_from(offset)
+            .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        let limit = usize::try_from(limit)
+            .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        Ok(values.into_iter().skip(offset).take(limit).collect())
     }
 }
 

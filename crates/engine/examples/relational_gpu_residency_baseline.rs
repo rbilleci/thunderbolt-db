@@ -74,14 +74,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         filtered_scalar_threshold
     ))?;
     let distinct_projection_query =
-        select("SELECT DISTINCT bucket FROM events ORDER BY bucket DESC LIMIT 8")?;
+        select("SELECT DISTINCT bucket FROM events ORDER BY bucket DESC LIMIT 8 OFFSET 2")?;
     let filtered_distinct_bucket_threshold = 4;
     let filtered_distinct_projection_query = select(&format!(
-        "SELECT DISTINCT bucket FROM events WHERE bucket >= {} ORDER BY bucket DESC LIMIT 8",
+        "SELECT DISTINCT bucket FROM events WHERE bucket >= {} ORDER BY bucket DESC LIMIT 8 OFFSET 1",
         filtered_distinct_bucket_threshold
     ))?;
     let filtered_ordered_projection_query = select(&format!(
-        "SELECT amount FROM events WHERE amount >= {} ORDER BY amount DESC LIMIT 8",
+        "SELECT amount FROM events WHERE amount >= {} ORDER BY amount DESC LIMIT 8 OFFSET 2",
         filtered_scalar_threshold
     ))?;
     let grouped_sum_query =
@@ -395,7 +395,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("- warm_resident_snapshot_execution_supported: true");
     println!("- production_device_cache_supported: bounded_retained_snapshot_handle");
     println!(
-        "- resident_device_memory_query_kernel_supported: bounded_count_all_int4_equality_count_int4_range_count_int4_sum_avg_min_max_filtered_sum_avg_min_max_int4_projection_int4_distinct_projection_int4_filtered_distinct_projection_int4_filtered_ordered_projection_int4_grouped_count_sum_avg_min_max_and_filtered_grouped_count_sum_avg_min_max"
+        "- resident_device_memory_query_kernel_supported: bounded_count_all_int4_equality_count_int4_range_count_int4_sum_avg_min_max_filtered_sum_avg_min_max_int4_projection_int4_paginated_distinct_projection_int4_paginated_filtered_distinct_projection_int4_paginated_filtered_ordered_projection_int4_grouped_count_sum_avg_min_max_and_filtered_grouped_count_sum_avg_min_max"
     );
     println!(
         "- resident_device_memory_proof_supported: {}",
@@ -623,7 +623,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     print_probe(&mutation_probe);
     println!();
     println!(
-        "decision: current P7 evidence includes bounded resident table-data snapshot SELECT probes with zero per-query H2D transfer for the app lookup workload and supported aggregate/distinct SQL shapes, retained-device-memory COUNT(*), int4 equality-predicate COUNT(*), int4 range-predicate COUNT(*), int4 scalar SUM/AVG/MIN/MAX, int4 filtered scalar SUM/AVG/MIN/MAX, int4 predicate-projection, int4 distinct projection, int4 filtered distinct projection, bounded int4 filtered ordered-projection, int4 grouped COUNT/SUM/AVG/MIN/MAX, and int4 filtered grouped COUNT/SUM/AVG/MIN/MAX proofs over the resident allocation, resident-byte accounting, WAL-safe invalidation, manual refresh-cost accounting, memory-pressure fallback metadata, deterministic resident-snapshot budget admission/eviction, and a retained real CUDA allocation/copy handle for encoded snapshot bytes when local driver hardware is available. Keep broad production CUDA cache claims out of scope until broader expression kernels read directly from retained device-memory handles."
+        "decision: current P7 evidence includes bounded resident table-data snapshot SELECT probes with zero per-query H2D transfer for the app lookup workload and supported aggregate/distinct SQL shapes, retained-device-memory COUNT(*), int4 equality-predicate COUNT(*), int4 range-predicate COUNT(*), int4 scalar SUM/AVG/MIN/MAX, int4 filtered scalar SUM/AVG/MIN/MAX, int4 predicate-projection, int4 paginated distinct projection, int4 paginated filtered distinct projection, bounded int4 paginated filtered ordered-projection, int4 grouped COUNT/SUM/AVG/MIN/MAX, and int4 filtered grouped COUNT/SUM/AVG/MIN/MAX proofs over the resident allocation, resident-byte accounting, WAL-safe invalidation, manual refresh-cost accounting, memory-pressure fallback metadata, deterministic resident-snapshot budget admission/eviction, and a retained real CUDA allocation/copy handle for encoded snapshot bytes when local driver hardware is available. Keep broad production CUDA cache claims out of scope until broader expression kernels read directly from retained device-memory handles."
     );
 
     Ok(())

@@ -9063,11 +9063,16 @@ impl Engine {
             || select.filter.is_some()
             || !select.filters.is_empty()
             || !select.filter_groups.is_empty()
-            || select.offset.is_some()
             || bound.selected_indexes.len() != 1
         {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "resident device-memory distinct projection proof currently supports only SELECT DISTINCT one_int4_column with optional same-column ORDER BY and LIMIT"
+                "resident device-memory distinct projection proof currently supports only SELECT DISTINCT one_int4_column with optional same-column ORDER BY, LIMIT, and OFFSET"
+                    .to_string(),
+            )));
+        }
+        if select.offset.is_some() && (bound.order.is_none() || select.limit.is_none()) {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory distinct projection OFFSET proof currently requires same-column ORDER BY and LIMIT"
                     .to_string(),
             )));
         }
@@ -9155,6 +9160,9 @@ impl Engine {
                 rows.reverse();
             }
         }
+        if let Some(offset) = select.offset {
+            rows = rows.into_iter().skip(offset).collect();
+        }
         if let Some(limit) = select.limit {
             rows.truncate(limit);
         }
@@ -9177,13 +9185,18 @@ impl Engine {
         if !select.distinct
             || select.group_by.is_some()
             || !select.having_groups.is_empty()
-            || select.offset.is_some()
             || bound.selected_indexes.len() != 1
             || bound.filter_groups.len() != 1
             || bound.filter_groups[0].len() != 1
         {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "resident device-memory filtered distinct projection proof currently supports only SELECT DISTINCT one_int4_column with one same-column int4 comparison predicate, optional same-column ORDER BY, and LIMIT"
+                "resident device-memory filtered distinct projection proof currently supports only SELECT DISTINCT one_int4_column with one same-column int4 comparison predicate, optional same-column ORDER BY, LIMIT, and OFFSET"
+                    .to_string(),
+            )));
+        }
+        if select.offset.is_some() && (bound.order.is_none() || select.limit.is_none()) {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory filtered distinct projection OFFSET proof currently requires same-column ORDER BY and LIMIT"
                     .to_string(),
             )));
         }
@@ -9290,6 +9303,9 @@ impl Engine {
                 rows.reverse();
             }
         }
+        if let Some(offset) = select.offset {
+            rows = rows.into_iter().skip(offset).collect();
+        }
         if let Some(limit) = select.limit {
             rows.truncate(limit);
         }
@@ -9312,7 +9328,6 @@ impl Engine {
         if select.distinct
             || select.group_by.is_some()
             || !select.having_groups.is_empty()
-            || select.offset.is_some()
             || bound.selected_indexes.len() != 1
             || bound.filter_groups.len() != 1
             || bound.filter_groups[0].len() != 1
@@ -9350,6 +9365,11 @@ impl Engine {
         let limit = u64::try_from(limit).map_err(|_| {
             ExecuteError::Engine(EngineError::ApplyFailed(
                 "resident device-memory ordered projection LIMIT exceeds proof range".to_string(),
+            ))
+        })?;
+        let offset = u64::try_from(select.offset.unwrap_or(0)).map_err(|_| {
+            ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory ordered projection OFFSET exceeds proof range".to_string(),
             ))
         })?;
         let (filter_idx, op, value) = bound.filter_groups[0][0].clone();
@@ -9424,7 +9444,7 @@ impl Engine {
                 needle,
                 comparison,
                 descending,
-                limit,
+                (offset, limit),
             )
             .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
         let elapsed = started.elapsed();
@@ -13422,7 +13442,7 @@ mod tests {
             return;
         }
         let Command::Select(select) = parse_command(
-            "SELECT amount FROM events WHERE amount >= 20 ORDER BY amount DESC LIMIT 2",
+            "SELECT amount FROM events WHERE amount >= 20 ORDER BY amount DESC LIMIT 2 OFFSET 1",
         )
         .unwrap() else {
             unreachable!()
@@ -13438,7 +13458,7 @@ mod tests {
         assert_eq!(resident.rows, cpu.rows);
         assert_eq!(
             resident.rows,
-            vec![vec![SqlValue::Int4(40)], vec![SqlValue::Int4(30)]]
+            vec![vec![SqlValue::Int4(30)], vec![SqlValue::Int4(20)]]
         );
         assert_eq!(resident.planned_target, DeviceTarget::Gpu(0));
         assert_eq!(resident.executed_target, DeviceTarget::Gpu(0));
@@ -13472,10 +13492,10 @@ mod tests {
         if snapshot.device_memory_proof.is_none() {
             return;
         }
-        let Command::Select(select) =
-            parse_command("SELECT DISTINCT bucket FROM events ORDER BY bucket DESC LIMIT 2")
-                .unwrap()
-        else {
+        let Command::Select(select) = parse_command(
+            "SELECT DISTINCT bucket FROM events ORDER BY bucket DESC LIMIT 2 OFFSET 1",
+        )
+        .unwrap() else {
             unreachable!()
         };
         let cpu = e.execute_relational_select(&select).unwrap();
@@ -13489,7 +13509,7 @@ mod tests {
         assert_eq!(resident.rows, cpu.rows);
         assert_eq!(
             resident.rows,
-            vec![vec![SqlValue::Int4(3)], vec![SqlValue::Int4(2)]]
+            vec![vec![SqlValue::Int4(2)], vec![SqlValue::Int4(1)]]
         );
         assert_eq!(resident.planned_target, DeviceTarget::Gpu(0));
         assert_eq!(resident.executed_target, DeviceTarget::Gpu(0));
@@ -13514,6 +13534,19 @@ mod tests {
             .to_string();
         assert!(err.contains("supports only int4 projection columns"));
 
+        let Command::Select(unsupported_offset_without_order) =
+            parse_command("SELECT DISTINCT bucket FROM events OFFSET 1").unwrap()
+        else {
+            unreachable!()
+        };
+        let err = e
+            .execute_relational_distinct_projection_with_resident_device_memory_probe(
+                &unsupported_offset_without_order,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("OFFSET proof currently requires same-column ORDER BY and LIMIT"));
+
         let Command::Select(unsupported_filter) =
             parse_command("SELECT DISTINCT bucket FROM events WHERE bucket >= 2").unwrap()
         else {
@@ -13525,7 +13558,7 @@ mod tests {
             )
             .unwrap_err()
             .to_string();
-        assert!(err.contains("optional same-column ORDER BY and LIMIT"));
+        assert!(err.contains("optional same-column ORDER BY, LIMIT, and OFFSET"));
 
         e.mark_gpu_memory_pressured(0);
         assert!(e
@@ -13550,7 +13583,7 @@ mod tests {
             return;
         }
         let Command::Select(select) = parse_command(
-            "SELECT DISTINCT bucket FROM events WHERE bucket >= 2 ORDER BY bucket DESC LIMIT 2",
+            "SELECT DISTINCT bucket FROM events WHERE bucket >= 2 ORDER BY bucket DESC LIMIT 2 OFFSET 1",
         )
         .unwrap() else {
             unreachable!()
@@ -13568,7 +13601,7 @@ mod tests {
         assert_eq!(resident.rows, cpu.rows);
         assert_eq!(
             resident.rows,
-            vec![vec![SqlValue::Int4(4)], vec![SqlValue::Int4(3)]]
+            vec![vec![SqlValue::Int4(3)], vec![SqlValue::Int4(2)]]
         );
         assert_eq!(resident.planned_target, DeviceTarget::Gpu(0));
         assert_eq!(resident.executed_target, DeviceTarget::Gpu(0));
@@ -13593,6 +13626,19 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("requires predicate and projection to use the same int4 column"));
+
+        let Command::Select(unsupported_offset_without_order) =
+            parse_command("SELECT DISTINCT bucket FROM events WHERE bucket >= 2 OFFSET 1").unwrap()
+        else {
+            unreachable!()
+        };
+        let err = e
+            .execute_relational_filtered_distinct_projection_with_resident_device_memory_probe(
+                &unsupported_offset_without_order,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("OFFSET proof currently requires same-column ORDER BY and LIMIT"));
 
         let Command::Select(unsupported_equality) =
             parse_command("SELECT DISTINCT bucket FROM events WHERE bucket = 2").unwrap()
