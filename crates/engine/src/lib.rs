@@ -38,10 +38,11 @@ use gpu_db_wal::{
     read_wal_archive, read_wal_archive_timeline, read_wal_archive_timeline_registry,
     read_wal_archive_to_timestamp_micros, read_wal_archive_to_txn, read_wal_checkpoint,
     read_wal_segment, register_wal_archive_timeline, restore_wal_archive_object_backup,
-    write_wal_archive_timeline, write_wal_archive_with_timestamps, write_wal_control_file,
-    write_wal_segment, WalArchiveManifest, WalArchiveObjectBackup, WalArchiveRecordTimestamp,
-    WalArchiveRetentionPlan, WalArchiveTimeline, WalArchiveTimelineBranch,
-    WalArchiveTimelineRegistry, WalBuffer, WalControlFile, WalRecord,
+    select_wal_archive_timeline, write_wal_archive_timeline, write_wal_archive_with_timestamps,
+    write_wal_control_file, write_wal_segment, WalArchiveManifest, WalArchiveObjectBackup,
+    WalArchiveRecordTimestamp, WalArchiveRetentionPlan, WalArchiveTimeline,
+    WalArchiveTimelineBranch, WalArchiveTimelineRegistry, WalArchiveTimelineSelection, WalBuffer,
+    WalControlFile, WalRecord,
 };
 
 #[derive(Debug, Default)]
@@ -11702,6 +11703,21 @@ impl Engine {
         registry_path: impl AsRef<std::path::Path>,
     ) -> Result<WalArchiveTimelineRegistry, EngineError> {
         read_wal_archive_timeline_registry(registry_path)
+    }
+
+    pub fn select_durable_wal_archive_timeline(
+        registry_path: impl AsRef<std::path::Path>,
+        timeline_id: impl AsRef<str>,
+    ) -> Result<WalArchiveTimelineSelection, EngineError> {
+        select_wal_archive_timeline(registry_path, timeline_id)
+    }
+
+    pub fn recover_from_registered_durable_wal_archive_timeline(
+        registry_path: impl AsRef<std::path::Path>,
+        timeline_id: impl AsRef<str>,
+    ) -> Result<Self, EngineError> {
+        let selection = select_wal_archive_timeline(registry_path, timeline_id)?;
+        Self::recover_from_durable_wal_archive(selection.entry.branch_manifest_path)
     }
 
     pub fn plan_durable_wal_archive_retention_to_txn(
@@ -30754,9 +30770,25 @@ mod tests {
             .unwrap();
         let registry =
             Engine::register_durable_wal_archive_timeline(&registry_path, &timeline_path).unwrap();
-        let mut recovered = Engine::recover_from_durable_wal_archive(&branch_manifest).unwrap();
+        let selection =
+            Engine::select_durable_wal_archive_timeline(&registry_path, "timeline-branch-0002")
+                .unwrap();
+        let missing_selection_err =
+            Engine::select_durable_wal_archive_timeline(&registry_path, "timeline-missing")
+                .unwrap_err();
+        let mut recovered = Engine::recover_from_registered_durable_wal_archive_timeline(
+            &registry_path,
+            "timeline-branch-0002",
+        )
+        .unwrap();
 
         assert_eq!(branch.timeline, timeline);
+        assert_eq!(selection.timeline, timeline);
+        assert_eq!(selection.entry.branch_manifest_path, branch_manifest);
+        assert_eq!(selection.manifest.checkpoint.durable_record_count, 3);
+        assert!(missing_selection_err
+            .to_string()
+            .contains("has no timeline timeline-missing"));
         assert_eq!(registry.timelines.len(), 2);
         assert_eq!(registry.timelines[1].timeline_id, "timeline-branch-0002");
         assert_eq!(

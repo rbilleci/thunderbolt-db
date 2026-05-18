@@ -108,6 +108,13 @@ pub struct WalArchiveTimelineRegistry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalArchiveTimelineSelection {
+    pub entry: WalArchiveTimelineRegistryEntry,
+    pub timeline: WalArchiveTimeline,
+    pub manifest: WalArchiveManifest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalArchiveObject {
     pub source_path: PathBuf,
     pub object_path: PathBuf,
@@ -1005,6 +1012,48 @@ pub fn register_wal_archive_timeline(
     });
     write_wal_archive_timeline_registry(registry_path, &registry)?;
     read_wal_archive_timeline_registry(registry_path)
+}
+
+pub fn select_wal_archive_timeline(
+    registry_path: impl AsRef<Path>,
+    timeline_id: impl AsRef<str>,
+) -> Result<WalArchiveTimelineSelection, EngineError> {
+    let registry_path = registry_path.as_ref();
+    let timeline_id = timeline_id.as_ref();
+    validate_timeline_value(registry_path, "timeline_id", timeline_id)?;
+    let registry = read_wal_archive_timeline_registry(registry_path)?;
+    let entry = registry
+        .timelines
+        .iter()
+        .find(|entry| entry.timeline_id == timeline_id)
+        .cloned()
+        .ok_or_else(|| {
+            EngineError::Durability(format!(
+                "WAL archive timeline registry {} has no timeline {}",
+                registry_path.display(),
+                timeline_id
+            ))
+        })?;
+    let timeline = read_wal_archive_timeline(&entry.timeline_path)?;
+    if timeline.timeline_id != entry.timeline_id
+        || timeline.parent_timeline_id != entry.parent_timeline_id
+        || timeline.fork_txn_id != entry.fork_txn_id
+        || timeline.fork_timestamp_micros != entry.fork_timestamp_micros
+        || timeline.branch_manifest_path != entry.branch_manifest_path
+    {
+        return Err(EngineError::Durability(format!(
+            "WAL archive timeline registry {} entry {} does not match sidecar {}",
+            registry_path.display(),
+            entry.timeline_id,
+            entry.timeline_path.display()
+        )));
+    }
+    let (manifest, _records) = read_wal_archive(&timeline.branch_manifest_path)?;
+    Ok(WalArchiveTimelineSelection {
+        entry,
+        timeline,
+        manifest,
+    })
 }
 
 pub fn write_wal_archive_timeline_registry(
@@ -4149,6 +4198,89 @@ mod tests {
             .to_string()
             .contains("already contains timeline timeline-0002"));
         assert_eq!(after_registry, before_registry);
+    }
+
+    #[test]
+    fn wal_archive_timeline_registry_selects_validated_branch_and_rejects_stale_sidecar() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpu-db-wal-archive-timeline-select-{}-{}",
+            std::process::id(),
+            NEXT_TEST_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let source_manifest = dir.join("source").join("MANIFEST");
+        let source_segments = dir.join("source").join("segments");
+        let root_timeline_path = dir.join("source").join("TIMELINE");
+        let branch_manifest = dir.join("branch").join("MANIFEST");
+        let branch_segments = dir.join("branch").join("segments");
+        let branch_timeline_path = dir.join("branch").join("TIMELINE");
+        let registry_path = dir.join("TIMELINE_REGISTRY");
+        let records = vec![
+            WalRecord {
+                txn_id: 1,
+                payload: b"CREATE TABLE people (id INT, name TEXT)".to_vec(),
+            },
+            WalRecord {
+                txn_id: 2,
+                payload: b"INSERT INTO people (id, name) VALUES (1, 'Ada')".to_vec(),
+            },
+            WalRecord {
+                txn_id: 3,
+                payload: b"INSERT INTO people (id, name) VALUES (2, 'Grace')".to_vec(),
+            },
+        ];
+        write_wal_archive(&source_manifest, &source_segments, &records, 1).unwrap();
+        write_wal_archive_timeline(
+            &root_timeline_path,
+            &WalArchiveTimeline {
+                timeline_id: "timeline-0001".to_string(),
+                parent_timeline_id: None,
+                fork_txn_id: 0,
+                fork_timestamp_micros: None,
+                source_manifest_path: source_manifest.clone(),
+                branch_manifest_path: source_manifest.clone(),
+            },
+        )
+        .unwrap();
+        fork_wal_archive_timeline_to_txn(
+            &source_manifest,
+            &branch_manifest,
+            &branch_segments,
+            &branch_timeline_path,
+            "timeline-0002",
+            Some("timeline-0001"),
+            2,
+        )
+        .unwrap();
+        register_wal_archive_timeline(&registry_path, &root_timeline_path).unwrap();
+        register_wal_archive_timeline(&registry_path, &branch_timeline_path).unwrap();
+
+        let selection = select_wal_archive_timeline(&registry_path, "timeline-0002").unwrap();
+        assert_eq!(selection.entry.timeline_id, "timeline-0002");
+        assert_eq!(selection.timeline.fork_txn_id, 2);
+        assert_eq!(selection.manifest.checkpoint.durable_record_count, 2);
+
+        let missing_err =
+            select_wal_archive_timeline(&registry_path, "timeline-missing").unwrap_err();
+        assert!(missing_err
+            .to_string()
+            .contains("has no timeline timeline-missing"));
+
+        write_wal_archive_timeline(
+            &branch_timeline_path,
+            &WalArchiveTimeline {
+                timeline_id: "timeline-0002".to_string(),
+                parent_timeline_id: Some("timeline-0001".to_string()),
+                fork_txn_id: 3,
+                fork_timestamp_micros: None,
+                source_manifest_path: source_manifest.clone(),
+                branch_manifest_path: branch_manifest.clone(),
+            },
+        )
+        .unwrap();
+        let stale_err = select_wal_archive_timeline(&registry_path, "timeline-0002").unwrap_err();
+        let _ = fs::remove_dir_all(dir);
+
+        assert!(stale_err.to_string().contains("does not match sidecar"));
     }
 
     #[test]
