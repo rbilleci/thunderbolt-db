@@ -1352,6 +1352,8 @@ struct CopyInState {
     format: CopyFormat,
     header: bool,
     delimiter: char,
+    quote: char,
+    escape: char,
     pending_text: String,
     pending_rows: Vec<Vec<SqlValue>>,
     seen_terminator: bool,
@@ -1368,6 +1370,8 @@ struct CopyOptions {
     format: CopyFormat,
     header: bool,
     delimiter: char,
+    quote: char,
+    escape: char,
 }
 
 impl CopyOptions {
@@ -1375,18 +1379,24 @@ impl CopyOptions {
         format: CopyFormat::Text,
         header: false,
         delimiter: '\t',
+        quote: '"',
+        escape: '"',
     };
 
     const CSV: Self = Self {
         format: CopyFormat::Csv,
         header: false,
         delimiter: ',',
+        quote: '"',
+        escape: '"',
     };
 
     const CSV_HEADER: Self = Self {
         format: CopyFormat::Csv,
         header: true,
         delimiter: ',',
+        quote: '"',
+        escape: '"',
     };
 }
 
@@ -4159,6 +4169,10 @@ fn parse_copy_options(options: &str) -> Option<CopyOptions> {
     let mut format = None;
     let mut header = false;
     let mut delimiter = ',';
+    let mut quote = '"';
+    let mut escape = '"';
+    let mut quote_set = false;
+    let mut escape_set = false;
 
     for part in split_sql_csv(parenthesized)? {
         let part = part.trim();
@@ -4186,9 +4200,35 @@ fn parse_copy_options(options: &str) -> Option<CopyOptions> {
             if matches!(delimiter, '"' | '\n' | '\r') {
                 return None;
             }
+        } else if canonical_sql(part).strip_prefix("quote ").is_some() {
+            let rest_start = sql_keyword_rest_start(part, "quote")?;
+            let raw_value = part[rest_start..]
+                .trim()
+                .strip_prefix('=')
+                .unwrap_or(part[rest_start..].trim())
+                .trim();
+            quote = decode_single_copy_option_char(raw_value)?;
+            quote_set = true;
+        } else if canonical_sql(part).strip_prefix("escape ").is_some() {
+            let rest_start = sql_keyword_rest_start(part, "escape")?;
+            let raw_value = part[rest_start..]
+                .trim()
+                .strip_prefix('=')
+                .unwrap_or(part[rest_start..].trim())
+                .trim();
+            escape = decode_single_copy_option_char(raw_value)?;
+            escape_set = true;
         } else {
             return None;
         }
+    }
+
+    if quote_set && !escape_set {
+        escape = quote;
+    }
+
+    if delimiter == quote || delimiter == escape {
+        return None;
     }
 
     match format {
@@ -4196,9 +4236,21 @@ fn parse_copy_options(options: &str) -> Option<CopyOptions> {
             format: CopyFormat::Csv,
             header,
             delimiter,
+            quote,
+            escape,
         }),
         _ => None,
     }
+}
+
+fn decode_single_copy_option_char(raw_value: &str) -> Option<char> {
+    let decoded = decode_sql_execute_string_literal(raw_value)?;
+    let mut chars = decoded.chars();
+    let value = chars.next()?;
+    if chars.next().is_some() || matches!(value, '\n' | '\r') {
+        return None;
+    }
+    Some(value)
 }
 
 fn is_simple_copy_table_name(table: &str) -> bool {
@@ -4269,10 +4321,17 @@ fn copy_text_value(value: &SqlValue) -> String {
         .replace('\r', r"\r")
 }
 
-fn copy_csv_value(value: &SqlValue, delimiter: char) -> String {
+fn copy_csv_value(value: &SqlValue, delimiter: char, quote: char, escape: char) -> String {
     let text = format_sql_value(value);
-    if text.contains([delimiter, '"', '\n', '\r']) {
-        format!("\"{}\"", text.replace('"', "\"\""))
+    if text.contains([delimiter, quote, escape, '\n', '\r']) {
+        let mut escaped = String::with_capacity(text.len());
+        for ch in text.chars() {
+            if ch == quote || ch == escape {
+                escaped.push(escape);
+            }
+            escaped.push(ch);
+        }
+        format!("{quote}{escaped}{quote}")
     } else {
         text
     }
@@ -4335,7 +4394,12 @@ struct CopyCsvField {
     quoted: bool,
 }
 
-fn parse_copy_csv_row(line: &str, delimiter: char) -> Result<Vec<CopyCsvField>, ErrorField> {
+fn parse_copy_csv_row(
+    line: &str,
+    delimiter: char,
+    quote: char,
+    escape: char,
+) -> Result<Vec<CopyCsvField>, ErrorField> {
     let mut fields = Vec::new();
     let mut field = String::new();
     let mut chars = line.chars().peekable();
@@ -4345,10 +4409,16 @@ fn parse_copy_csv_row(line: &str, delimiter: char) -> Result<Vec<CopyCsvField>, 
 
     while let Some(ch) = chars.next() {
         if in_quotes {
-            if ch == '"' {
-                if matches!(chars.peek(), Some('"')) {
+            if ch == escape
+                && matches!(chars.peek(), Some(next) if *next == quote || *next == escape)
+            {
+                if let Some(escaped) = chars.next() {
+                    field.push(escaped);
+                }
+            } else if ch == quote {
+                if quote == escape && matches!(chars.peek(), Some(next) if *next == quote) {
                     chars.next();
-                    field.push('"');
+                    field.push(quote);
                 } else {
                     in_quotes = false;
                     after_quote = true;
@@ -4360,7 +4430,7 @@ fn parse_copy_csv_row(line: &str, delimiter: char) -> Result<Vec<CopyCsvField>, 
         }
 
         match ch {
-            '"' if field.is_empty() && !after_quote => {
+            _ if ch == quote && field.is_empty() && !after_quote => {
                 quoted = true;
                 in_quotes = true;
             }
@@ -4444,6 +4514,8 @@ fn execute_copy_to_stdout(
             payload.push_str(&copy_csv_value(
                 &SqlValue::Text(column.def.name.clone()),
                 options.delimiter,
+                options.quote,
+                options.escape,
             ));
         }
         payload.push('\n');
@@ -4460,7 +4532,12 @@ fn execute_copy_to_stdout(
             }
             match options.format {
                 CopyFormat::Text => payload.push_str(&copy_text_value(value)),
-                CopyFormat::Csv => payload.push_str(&copy_csv_value(value, options.delimiter)),
+                CopyFormat::Csv => payload.push_str(&copy_csv_value(
+                    value,
+                    options.delimiter,
+                    options.quote,
+                    options.escape,
+                )),
             }
         }
         payload.push('\n');
@@ -4526,6 +4603,8 @@ fn begin_copy_from_stdin(
         format: options.format,
         header: options.header,
         delimiter: options.delimiter,
+        quote: options.quote,
+        escape: options.escape,
         pending_text: String::new(),
         pending_rows: Vec::new(),
         seen_terminator: false,
@@ -4564,10 +4643,17 @@ fn handle_copy_data(session: &mut Session, bytes: &[u8]) -> Option<ErrorField> {
             copy.header = false;
             continue;
         }
-        if let Some(error) =
-            parse_copy_row(table, &copy.columns, copy.format, copy.delimiter, &line)
-                .map(|row| copy.pending_rows.push(row))
-                .err()
+        if let Some(error) = parse_copy_row(
+            table,
+            &copy.columns,
+            copy.format,
+            copy.delimiter,
+            copy.quote,
+            copy.escape,
+            &line,
+        )
+        .map(|row| copy.pending_rows.push(row))
+        .err()
         {
             return Some(error);
         }
@@ -4612,6 +4698,8 @@ fn parse_copy_row(
     columns: &[String],
     format: CopyFormat,
     delimiter: char,
+    quote: char,
+    escape: char,
     line: &str,
 ) -> Result<Vec<SqlValue>, ErrorField> {
     let mut row = Vec::with_capacity(columns.len());
@@ -4639,7 +4727,7 @@ fn parse_copy_row(
             }
         }
         CopyFormat::Csv => {
-            let fields = parse_copy_csv_row(line, delimiter)?;
+            let fields = parse_copy_csv_row(line, delimiter, quote, escape)?;
             if fields.len() != columns.len() {
                 return Err(ErrorField {
                     code: "22P04",
@@ -10730,7 +10818,37 @@ mod tests {
                 CopyOptions {
                     format: CopyFormat::Csv,
                     header: true,
-                    delimiter: '|'
+                    delimiter: '|',
+                    quote: '"',
+                    escape: '"',
+                }
+            ))
+        );
+        assert_eq!(
+            parse_copy_to_stdout_table(
+                "COPY people TO STDOUT WITH (FORMAT csv, HEADER, DELIMITER '|', QUOTE '''', ESCAPE '\\')"
+            ),
+            Some((
+                "people".to_string(),
+                CopyOptions {
+                    format: CopyFormat::Csv,
+                    header: true,
+                    delimiter: '|',
+                    quote: '\'',
+                    escape: '\\',
+                }
+            ))
+        );
+        assert_eq!(
+            parse_copy_to_stdout_table("COPY people TO STDOUT WITH (FORMAT csv, QUOTE '|')"),
+            Some((
+                "people".to_string(),
+                CopyOptions {
+                    format: CopyFormat::Csv,
+                    header: false,
+                    delimiter: ',',
+                    quote: '|',
+                    escape: '|',
                 }
             ))
         );
@@ -10789,7 +10907,25 @@ mod tests {
                 CopyOptions {
                     format: CopyFormat::Csv,
                     header: true,
-                    delimiter: '|'
+                    delimiter: '|',
+                    quote: '"',
+                    escape: '"',
+                }
+            ))
+        );
+        assert_eq!(
+            parse_copy_from_stdin(
+                "COPY public.people (id, name) FROM STDIN WITH (FORMAT csv, HEADER true, DELIMITER '|', QUOTE '''', ESCAPE '\\')"
+            ),
+            Some((
+                "people".to_string(),
+                Some(vec!["id".to_string(), "name".to_string()]),
+                CopyOptions {
+                    format: CopyFormat::Csv,
+                    header: true,
+                    delimiter: '|',
+                    quote: '\'',
+                    escape: '\\',
                 }
             ))
         );
@@ -10799,7 +10935,9 @@ mod tests {
             None
         );
         assert_eq!(
-            parse_copy_from_stdin("COPY people FROM STDIN WITH (FORMAT csv, QUOTE '''')"),
+            parse_copy_from_stdin(
+                "COPY people FROM STDIN WITH (FORMAT csv, DELIMITER '|', QUOTE '|')"
+            ),
             None
         );
     }

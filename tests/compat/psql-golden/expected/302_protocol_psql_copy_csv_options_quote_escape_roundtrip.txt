@@ -1,0 +1,18 @@
+=== psql copy csv parenthesized quote escape import export recovery ===
+CREATE TABLE
+COPY 3
+ id |        name
+----+--------------------
+  1 | Ada
+  2 | Grace;Hopper
+  3 | Pipe | and slash \
+(3 rows)
+
+id;name
+1;Ada
+2;|Grace;Hopper|
+3;|Pipe \| and slash \\|
+        name
+--------------------
+ Pipe | and slash \
+(1 row)
