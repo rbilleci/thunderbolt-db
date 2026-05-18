@@ -12,6 +12,9 @@ PARALLEL_DIRECTORY_RESTORE_PORT="${PG_DUMP_SMOKE_PARALLEL_DIRECTORY_RESTORE_PORT
 CLEAN_RESTORE_PORT="${PG_DUMP_SMOKE_CLEAN_RESTORE_PORT:-55450}"
 INSERT_RESTORE_PORT="${PG_DUMP_SMOKE_INSERT_RESTORE_PORT:-55451}"
 SPLIT_RESTORE_PORT="${PG_DUMP_SMOKE_SPLIT_RESTORE_PORT:-55452}"
+CUSTOM_SPLIT_RESTORE_PORT="${PG_DUMP_SMOKE_CUSTOM_SPLIT_RESTORE_PORT:-55453}"
+DIRECTORY_SPLIT_RESTORE_PORT="${PG_DUMP_SMOKE_DIRECTORY_SPLIT_RESTORE_PORT:-55454}"
+TAR_SPLIT_RESTORE_PORT="${PG_DUMP_SMOKE_TAR_SPLIT_RESTORE_PORT:-55455}"
 
 rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR"
@@ -25,6 +28,9 @@ parallel_directory_restore_pid=""
 clean_restore_pid=""
 insert_restore_pid=""
 split_restore_pid=""
+custom_split_restore_pid=""
+directory_split_restore_pid=""
+tar_split_restore_pid=""
 
 cleanup() {
   if [[ -n "$source_pid" ]]; then
@@ -62,6 +68,18 @@ cleanup() {
   if [[ -n "$split_restore_pid" ]]; then
     kill "$split_restore_pid" 2>/dev/null || true
     wait "$split_restore_pid" 2>/dev/null || true
+  fi
+  if [[ -n "$custom_split_restore_pid" ]]; then
+    kill "$custom_split_restore_pid" 2>/dev/null || true
+    wait "$custom_split_restore_pid" 2>/dev/null || true
+  fi
+  if [[ -n "$directory_split_restore_pid" ]]; then
+    kill "$directory_split_restore_pid" 2>/dev/null || true
+    wait "$directory_split_restore_pid" 2>/dev/null || true
+  fi
+  if [[ -n "$tar_split_restore_pid" ]]; then
+    kill "$tar_split_restore_pid" 2>/dev/null || true
+    wait "$tar_split_restore_pid" 2>/dev/null || true
   fi
 }
 trap cleanup EXIT
@@ -307,6 +325,72 @@ PGHOST=127.0.0.1 PGPORT="$SPLIT_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgre
 diff -u "$OUT_DIR/verify.expected" "$OUT_DIR/split-verify.out"
 verify_indexes "$SPLIT_RESTORE_PORT" "split"
 
+cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$CUSTOM_SPLIT_RESTORE_PORT" --shared-catalog \
+  >"$OUT_DIR/custom-split-restore-server.log" 2>&1 &
+custom_split_restore_pid=$!
+wait_for_port "$CUSTOM_SPLIT_RESTORE_PORT"
+
+PGHOST=127.0.0.1 PGPORT="$CUSTOM_SPLIT_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres \
+  pg_restore --schema-only --no-owner --no-privileges --dbname=postgres "$OUT_DIR/dump.custom" \
+  >"$OUT_DIR/custom-split-schema-restore.out" 2>"$OUT_DIR/custom-split-schema-restore.err"
+
+PGHOST=127.0.0.1 PGPORT="$CUSTOM_SPLIT_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres \
+  pg_restore --data-only --no-owner --no-privileges --dbname=postgres "$OUT_DIR/dump.custom" \
+  >"$OUT_DIR/custom-split-data-restore.out" 2>"$OUT_DIR/custom-split-data-restore.err"
+
+PGHOST=127.0.0.1 PGPORT="$CUSTOM_SPLIT_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres \
+  psql -v ON_ERROR_STOP=1 -X -A -t \
+  -c "SELECT id, name FROM accounts ORDER BY id;" \
+  -c "SELECT event_id, note FROM events ORDER BY event_id;" \
+  >"$OUT_DIR/custom-split-verify.out" 2>"$OUT_DIR/custom-split-verify.err"
+
+diff -u "$OUT_DIR/verify.expected" "$OUT_DIR/custom-split-verify.out"
+verify_indexes "$CUSTOM_SPLIT_RESTORE_PORT" "custom-split"
+
+cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$DIRECTORY_SPLIT_RESTORE_PORT" --shared-catalog \
+  >"$OUT_DIR/directory-split-restore-server.log" 2>&1 &
+directory_split_restore_pid=$!
+wait_for_port "$DIRECTORY_SPLIT_RESTORE_PORT"
+
+PGHOST=127.0.0.1 PGPORT="$DIRECTORY_SPLIT_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres \
+  pg_restore --schema-only --no-owner --no-privileges --dbname=postgres "$OUT_DIR/dump.dir" \
+  >"$OUT_DIR/directory-split-schema-restore.out" 2>"$OUT_DIR/directory-split-schema-restore.err"
+
+PGHOST=127.0.0.1 PGPORT="$DIRECTORY_SPLIT_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres \
+  pg_restore --data-only --no-owner --no-privileges --dbname=postgres "$OUT_DIR/dump.dir" \
+  >"$OUT_DIR/directory-split-data-restore.out" 2>"$OUT_DIR/directory-split-data-restore.err"
+
+PGHOST=127.0.0.1 PGPORT="$DIRECTORY_SPLIT_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres \
+  psql -v ON_ERROR_STOP=1 -X -A -t \
+  -c "SELECT id, name FROM accounts ORDER BY id;" \
+  -c "SELECT event_id, note FROM events ORDER BY event_id;" \
+  >"$OUT_DIR/directory-split-verify.out" 2>"$OUT_DIR/directory-split-verify.err"
+
+diff -u "$OUT_DIR/verify.expected" "$OUT_DIR/directory-split-verify.out"
+verify_indexes "$DIRECTORY_SPLIT_RESTORE_PORT" "directory-split"
+
+cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$TAR_SPLIT_RESTORE_PORT" --shared-catalog \
+  >"$OUT_DIR/tar-split-restore-server.log" 2>&1 &
+tar_split_restore_pid=$!
+wait_for_port "$TAR_SPLIT_RESTORE_PORT"
+
+PGHOST=127.0.0.1 PGPORT="$TAR_SPLIT_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres \
+  pg_restore --schema-only --no-owner --no-privileges --dbname=postgres "$OUT_DIR/dump.tar" \
+  >"$OUT_DIR/tar-split-schema-restore.out" 2>"$OUT_DIR/tar-split-schema-restore.err"
+
+PGHOST=127.0.0.1 PGPORT="$TAR_SPLIT_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres \
+  pg_restore --data-only --no-owner --no-privileges --dbname=postgres "$OUT_DIR/dump.tar" \
+  >"$OUT_DIR/tar-split-data-restore.out" 2>"$OUT_DIR/tar-split-data-restore.err"
+
+PGHOST=127.0.0.1 PGPORT="$TAR_SPLIT_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres \
+  psql -v ON_ERROR_STOP=1 -X -A -t \
+  -c "SELECT id, name FROM accounts ORDER BY id;" \
+  -c "SELECT event_id, note FROM events ORDER BY event_id;" \
+  >"$OUT_DIR/tar-split-verify.out" 2>"$OUT_DIR/tar-split-verify.err"
+
+diff -u "$OUT_DIR/verify.expected" "$OUT_DIR/tar-split-verify.out"
+verify_indexes "$TAR_SPLIT_RESTORE_PORT" "tar-split"
+
 pg_restore --list "$OUT_DIR/dump.custom" >"$OUT_DIR/dump.custom.toc"
 pg_restore --list "$OUT_DIR/dump.dir" >"$OUT_DIR/dump.dir.toc"
 pg_restore --list "$OUT_DIR/dump.tar" >"$OUT_DIR/dump.tar.toc"
@@ -359,6 +443,9 @@ echo "pg_dump_directory_parallel_public_schema_pg_restore=passed"
 echo "pg_dump_custom_clean_if_exists_pg_restore=passed"
 echo "pg_dump_plain_insert_style_restore=passed"
 echo "pg_dump_plain_split_schema_data_restore=passed"
+echo "pg_dump_custom_split_schema_data_restore=passed"
+echo "pg_dump_directory_split_schema_data_restore=passed"
+echo "pg_dump_tar_split_schema_data_restore=passed"
 echo "pg_dump_metadata_index_restore=passed"
 echo "dump_file=$OUT_DIR/dump.sql"
 echo "insert_dump_file=$OUT_DIR/dump-inserts.sql"
