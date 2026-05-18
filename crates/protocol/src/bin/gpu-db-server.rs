@@ -1225,6 +1225,72 @@ fn validate_unique_indexes(table: &Table, indexes: &[CatalogIndex]) -> Result<()
     Ok(())
 }
 
+fn add_primary_key_to_session(
+    session: &mut Session,
+    table_name: &str,
+    constraint_name: String,
+    column: String,
+) -> Result<(), ErrorField> {
+    if session
+        .indexes
+        .iter()
+        .any(|index| index.name == constraint_name)
+    {
+        return Err(ErrorField {
+            code: "42P07",
+            message: "relation already exists",
+            position: None,
+        });
+    }
+    if session
+        .indexes
+        .iter()
+        .any(|index| index.table == table_name && index.primary_key)
+    {
+        return Err(ErrorField {
+            code: "42P16",
+            message: "multiple primary keys are not allowed",
+            position: None,
+        });
+    }
+    let Some(table) = session.tables.get(table_name) else {
+        return Err(ErrorField {
+            code: "42P01",
+            message: "relation does not exist",
+            position: None,
+        });
+    };
+    if !table
+        .columns
+        .iter()
+        .any(|candidate| candidate.def.name == column)
+    {
+        return Err(ErrorField {
+            code: "42703",
+            message: "column does not exist",
+            position: None,
+        });
+    }
+    let mut candidate_indexes = session.indexes.clone();
+    candidate_indexes.push(CatalogIndex {
+        name: constraint_name.clone(),
+        table: table_name.to_string(),
+        column: column.clone(),
+        unique: true,
+        primary_key: true,
+    });
+    validate_unique_indexes(table, &candidate_indexes)?;
+    session.indexes.push(CatalogIndex {
+        name: constraint_name,
+        table: table_name.to_string(),
+        column,
+        unique: true,
+        primary_key: true,
+    });
+    session.dirty_indexes = true;
+    Ok(())
+}
+
 fn format_default_expr(value: &SqlValue) -> String {
     match value {
         SqlValue::Int4(value) => value.to_string(),
@@ -1423,6 +1489,7 @@ struct CatalogIndex {
     table: String,
     column: String,
     unique: bool,
+    primary_key: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -5468,6 +5535,7 @@ fn execute_statement(
                     };
                     columns.push(CatalogColumn { attnum, def });
                 }
+                let primary_key = create.primary_key.clone();
                 let name = create.table;
                 let table_name = name.clone();
                 session.tables.insert(
@@ -5479,9 +5547,35 @@ fn execute_statement(
                         rows: Vec::new(),
                     },
                 );
+                if let Some(primary_key) = primary_key {
+                    let constraint_name = primary_key
+                        .name
+                        .unwrap_or_else(|| format!("{}_pkey", table_name));
+                    if let Err(error) = add_primary_key_to_session(
+                        session,
+                        &table_name,
+                        constraint_name,
+                        primary_key.column,
+                    ) {
+                        session.tables.remove(&table_name);
+                        return write_error(stream, &error);
+                    }
+                }
                 session.mark_table_dirty(table_name);
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, "CREATE TABLE");
+            }
+            Command::AddPrimaryKey(add) => {
+                if let Err(error) = add_primary_key_to_session(
+                    session,
+                    &add.table,
+                    add.name.clone(),
+                    add.column.clone(),
+                ) {
+                    return write_error(stream, &error);
+                }
+                session.persist_catalog_snapshot();
+                return write_command_complete(stream, "ALTER TABLE");
             }
             Command::CreateIndex(create) => {
                 if session
@@ -5529,6 +5623,7 @@ fn execute_statement(
                         table: create.table.clone(),
                         column: create.column.clone(),
                         unique: true,
+                        primary_key: false,
                     });
                     if let Err(error) = validate_unique_indexes(table, &candidate_indexes) {
                         return write_error(stream, &error);
@@ -5539,6 +5634,7 @@ fn execute_statement(
                     table: create.table.clone(),
                     column: create.column,
                     unique: create.unique,
+                    primary_key: false,
                 });
                 session.dirty_indexes = true;
                 session.persist_catalog_snapshot();
@@ -6669,6 +6765,26 @@ fn execute_statement(
                 text_column("attgenerated"),
             ],
             &catalog_describe_attribute_rows(session, oid),
+        );
+    }
+    if let Some(oid) = catalog_describe_index_query_oid(&canonical) {
+        return write_single_row(
+            stream,
+            &[
+                text_column("relname"),
+                text_column("indisprimary"),
+                text_column("indisunique"),
+                text_column("indisclustered"),
+                text_column("indisvalid"),
+                text_column("pg_get_indexdef"),
+                text_column("pg_get_constraintdef"),
+                text_column("contype"),
+                text_column("condeferrable"),
+                text_column("condeferred"),
+                text_column("indisreplident"),
+                int4_column("reltablespace"),
+            ],
+            &catalog_describe_index_rows(session, oid),
         );
     }
     if let Some(oid) = catalog_describe_policy_query_oid(&canonical) {
@@ -8187,13 +8303,19 @@ fn pg_dump_index_metadata_rows(session: &Session) -> Vec<Vec<Option<String>>> {
                 Some(catalog_index_definition(&entry.index)),
                 Some(entry.attnum.to_string()),
                 Some("f".to_string()),
-                None,
-                None,
+                entry.index.primary_key.then_some("p".to_string()),
+                entry.index.primary_key.then_some(entry.index.name.clone()),
                 Some("f".to_string()),
                 Some("f".to_string()),
-                None,
-                None,
-                None,
+                entry.index.primary_key.then_some("2606".to_string()),
+                entry
+                    .index
+                    .primary_key
+                    .then_some(catalog_constraint_oid(&entry).to_string()),
+                entry
+                    .index
+                    .primary_key
+                    .then_some(format!("PRIMARY KEY ({})", entry.index.column)),
                 Some(String::new()),
                 None,
                 Some("f".to_string()),
@@ -8246,6 +8368,17 @@ fn catalog_index_entries(session: &Session) -> Vec<CatalogIndexEntry> {
             },
         )
         .collect()
+}
+
+fn catalog_primary_key_entries(session: &Session) -> Vec<CatalogIndexEntry> {
+    catalog_index_entries(session)
+        .into_iter()
+        .filter(|entry| entry.index.primary_key)
+        .collect()
+}
+
+fn catalog_constraint_oid(entry: &CatalogIndexEntry) -> u32 {
+    40_000 + entry.index_oid
 }
 
 fn catalog_index_oid(session: &Session, index_name: &str) -> Option<u32> {
@@ -8864,14 +8997,18 @@ fn catalog_describe_relation_flags_query_oid(canonical: &str) -> Option<u32> {
 }
 
 fn catalog_describe_relation_flags_rows(session: &Session, oid: u32) -> Vec<Vec<Option<String>>> {
-    if !session.tables.values().any(|table| table.oid == oid) {
+    let Some(table) = session.tables.values().find(|table| table.oid == oid) else {
         return Vec::new();
-    }
+    };
+    let relhasindex = session
+        .indexes
+        .iter()
+        .any(|index| index.table == table.name);
 
     vec![vec![
         Some("0".to_string()),
         Some("r".to_string()),
-        Some("f".to_string()),
+        Some(if relhasindex { "t" } else { "f" }.to_string()),
         Some("f".to_string()),
         Some("f".to_string()),
         Some("f".to_string()),
@@ -8895,6 +9032,42 @@ fn catalog_describe_attribute_query_oid(canonical: &str) -> Option<u32> {
         .strip_suffix(suffix)?
         .parse()
         .ok()
+}
+
+fn catalog_describe_index_query_oid(canonical: &str) -> Option<u32> {
+    let prefix = "select c2.relname, i.indisprimary, i.indisunique, i.indisclustered, i.indisvalid, pg_catalog.pg_get_indexdef(i.indexrelid, 0, true), pg_catalog.pg_get_constraintdef(con.oid, true), contype, condeferrable, condeferred, i.indisreplident, c2.reltablespace from pg_catalog.pg_class c, pg_catalog.pg_class c2, pg_catalog.pg_index i left join pg_catalog.pg_constraint con on (conrelid = i.indrelid and conindid = i.indexrelid and contype in ('p','u','x')) where c.oid = '";
+    let suffix = "' and c.oid = i.indrelid and i.indexrelid = c2.oid order by i.indisprimary desc, c2.relname";
+    canonical
+        .strip_prefix(prefix)?
+        .strip_suffix(suffix)?
+        .parse()
+        .ok()
+}
+
+fn catalog_describe_index_rows(session: &Session, table_oid: u32) -> Vec<Vec<Option<String>>> {
+    catalog_index_entries(session)
+        .into_iter()
+        .filter(|entry| entry.table_oid == table_oid)
+        .map(|entry| {
+            vec![
+                Some(entry.index.name.clone()),
+                Some(if entry.index.primary_key { "t" } else { "f" }.to_string()),
+                Some(if entry.index.unique { "t" } else { "f" }.to_string()),
+                Some("f".to_string()),
+                Some("t".to_string()),
+                Some(catalog_index_definition(&entry.index)),
+                entry
+                    .index
+                    .primary_key
+                    .then_some(format!("PRIMARY KEY ({})", entry.index.column)),
+                entry.index.primary_key.then_some("p".to_string()),
+                entry.index.primary_key.then_some("f".to_string()),
+                entry.index.primary_key.then_some("f".to_string()),
+                Some("f".to_string()),
+                Some("0".to_string()),
+            ]
+        })
+        .collect()
 }
 
 fn catalog_describe_verbose_attribute_query_oid(canonical: &str) -> Option<u32> {
@@ -9674,8 +9847,19 @@ fn information_schema_table_constraints_query() -> &'static str {
 }
 
 fn information_schema_table_constraint_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    let _supported_plain_table_count = session.tables.len();
-    Vec::new()
+    let mut rows = catalog_primary_key_entries(session)
+        .into_iter()
+        .map(|entry| {
+            vec![
+                Some("public".to_string()),
+                Some(entry.index.table.clone()),
+                Some(entry.index.name.clone()),
+                Some("PRIMARY KEY".to_string()),
+            ]
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| left[1].cmp(&right[1]).then_with(|| left[2].cmp(&right[2])));
+    rows
 }
 
 fn information_schema_key_column_usage_query() -> &'static str {
@@ -9683,8 +9867,18 @@ fn information_schema_key_column_usage_query() -> &'static str {
 }
 
 fn information_schema_key_column_usage_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    let _supported_plain_table_count = session.tables.len();
-    Vec::new()
+    catalog_primary_key_entries(session)
+        .into_iter()
+        .map(|entry| {
+            vec![
+                Some("public".to_string()),
+                Some(entry.index.table.clone()),
+                Some(entry.index.column.clone()),
+                Some(entry.index.name.clone()),
+                Some("1".to_string()),
+            ]
+        })
+        .collect()
 }
 
 fn information_schema_views_query() -> &'static str {
@@ -9710,8 +9904,17 @@ fn pg_catalog_constraints_query() -> &'static str {
 }
 
 fn pg_catalog_constraint_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    let _supported_plain_table_count = session.tables.len();
-    Vec::new()
+    catalog_primary_key_entries(session)
+        .into_iter()
+        .map(|entry| {
+            vec![
+                Some("public".to_string()),
+                Some(entry.index.table.clone()),
+                Some(entry.index.name.clone()),
+                Some("p".to_string()),
+            ]
+        })
+        .collect()
 }
 
 fn pg_catalog_attrdefs_query() -> &'static str {
@@ -11569,6 +11772,7 @@ mod tests {
             table: "people".to_string(),
             column: "id".to_string(),
             unique: false,
+            primary_key: false,
         });
         session.comments.insert(
             CatalogCommentTarget::Index {
@@ -11670,6 +11874,7 @@ mod tests {
             table: table_name.to_string(),
             column: "id".to_string(),
             unique: false,
+            primary_key: false,
         });
         session.mark_table_dirty(table_name);
         session.dirty_indexes = true;
@@ -11785,6 +11990,7 @@ mod tests {
             table: table_name.to_string(),
             column: "id".to_string(),
             unique: false,
+            primary_key: false,
         });
         index_session.dirty_indexes = true;
         other_index_session.indexes.push(CatalogIndex {
@@ -11792,6 +11998,7 @@ mod tests {
             table: other_table_name.to_string(),
             column: "id".to_string(),
             unique: false,
+            primary_key: false,
         });
         other_index_session.dirty_indexes = true;
 

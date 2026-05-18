@@ -59,6 +59,7 @@ impl Planner {
                 kind: PlanKind::Mutation,
             },
             Command::CreateTable(_)
+            | Command::AddPrimaryKey(_)
             | Command::CreateIndex(_)
             | Command::DropIndex(_)
             | Command::AlterColumnDefault(_)

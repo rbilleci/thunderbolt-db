@@ -1,0 +1,58 @@
+=== primary key constraints ===
+CREATE TABLE
+INSERT 0 2
+ table_schema | table_name | constraint_name | constraint_type
+--------------+------------+-----------------+-----------------
+ public       | pk_people  | pk_people_pkey  | PRIMARY KEY
+(1 row)
+
+ table_schema | table_name | column_name | constraint_name | ordinal_position
+--------------+------------+-------------+-----------------+------------------
+ public       | pk_people  | id          | pk_people_pkey  |                1
+(1 row)
+
+ nspname |  relname  |    conname     | contype
+---------+-----------+----------------+---------
+ public  | pk_people | pk_people_pkey | p
+(1 row)
+
+ schemaname | tablename |   indexname    |                                indexdef
+------------+-----------+----------------+-------------------------------------------------------------------------
+ public     | pk_people | pk_people_pkey | CREATE UNIQUE INDEX pk_people_pkey ON public.pk_people USING btree (id)
+(1 row)
+
+             Table "public.pk_people"
+ Column |  Type   | Collation | Nullable | Default
+--------+---------+-----------+----------+---------
+ id     | integer |           |          |
+ name   | text    |           |          |
+Indexes:
+    "pk_people_pkey" PRIMARY KEY, btree (id)
+
+psql:307_protocol_psql_primary_keys.sql:14: ERROR:  duplicate key value violates unique index
+ id | name
+----+-------
+  1 | Ada
+  2 | Grace
+(2 rows)
+
+psql:307_protocol_psql_primary_keys.sql:16: ERROR:  duplicate key value violates unique index
+ id | name
+----+-------
+  1 | Ada
+  2 | Grace
+(2 rows)
+
+CREATE TABLE
+INSERT 0 2
+ALTER TABLE
+psql:307_protocol_psql_primary_keys.sql:21: ERROR:  duplicate key value violates unique index
+ id | name
+----+------
+  1 | core
+  2 | db
+(2 rows)
+
+CREATE TABLE
+INSERT 0 2
+psql:307_protocol_psql_primary_keys.sql:25: ERROR:  duplicate key value violates unique index

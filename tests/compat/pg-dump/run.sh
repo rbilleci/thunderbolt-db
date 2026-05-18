@@ -105,7 +105,7 @@ wait_for_port "$SOURCE_PORT"
 
 PGHOST=127.0.0.1 PGPORT="$SOURCE_PORT" PGDATABASE=postgres PGUSER=postgres \
   psql -v ON_ERROR_STOP=1 -X -q <<'SQL'
-CREATE TABLE accounts (id int4, name text DEFAULT 'unknown'::text, tier int4 DEFAULT 7);
+CREATE TABLE accounts (id int4 PRIMARY KEY, name text DEFAULT 'unknown'::text, tier int4 DEFAULT 7);
 INSERT INTO accounts (id, name) VALUES (1, 'Ada');
 INSERT INTO accounts (id) VALUES (2);
 CREATE INDEX accounts_name_idx ON accounts (name);
@@ -176,7 +176,12 @@ EOF
 
 cat >"$OUT_DIR/index-verify.expected" <<'EOF'
 accounts|accounts_name_idx|CREATE INDEX accounts_name_idx ON public.accounts USING btree (name)
+accounts|accounts_pkey|CREATE UNIQUE INDEX accounts_pkey ON public.accounts USING btree (id)
 events|events_note_idx|CREATE INDEX events_note_idx ON public.events USING btree (note)
+EOF
+
+cat >"$OUT_DIR/constraint-verify.expected" <<'EOF'
+public|accounts|accounts_pkey|p
 EOF
 
 cat >"$OUT_DIR/comment-verify.expected" <<'EOF'
@@ -201,6 +206,18 @@ verify_indexes() {
 }
 
 verify_indexes "$RESTORE_PORT" "restore"
+
+verify_constraints() {
+  local port="$1"
+  local prefix="$2"
+  PGHOST=127.0.0.1 PGPORT="$port" PGDATABASE=postgres PGUSER=postgres \
+    psql -v ON_ERROR_STOP=1 -X -A -t \
+    -c "SELECT n.nspname, c.relname, con.conname, con.contype FROM pg_catalog.pg_constraint con JOIN pg_catalog.pg_class c ON c.oid = con.conrelid JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' ORDER BY c.relname, con.conname;" \
+    >"$OUT_DIR/${prefix}-constraint-verify.out" 2>"$OUT_DIR/${prefix}-constraint-verify.err"
+  diff -u "$OUT_DIR/constraint-verify.expected" "$OUT_DIR/${prefix}-constraint-verify.out"
+}
+
+verify_constraints "$RESTORE_PORT" "restore"
 
 verify_comments() {
   local port="$1"
@@ -231,6 +248,7 @@ PGHOST=127.0.0.1 PGPORT="$CUSTOM_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgr
 
 diff -u "$OUT_DIR/verify.expected" "$OUT_DIR/custom-verify.out"
 verify_indexes "$CUSTOM_RESTORE_PORT" "custom"
+verify_constraints "$CUSTOM_RESTORE_PORT" "custom"
 verify_comments "$CUSTOM_RESTORE_PORT" "custom"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$DIRECTORY_RESTORE_PORT" --shared-catalog \
@@ -250,6 +268,7 @@ PGHOST=127.0.0.1 PGPORT="$DIRECTORY_RESTORE_PORT" PGDATABASE=postgres PGUSER=pos
 
 diff -u "$OUT_DIR/verify.expected" "$OUT_DIR/directory-verify.out"
 verify_indexes "$DIRECTORY_RESTORE_PORT" "directory"
+verify_constraints "$DIRECTORY_RESTORE_PORT" "directory"
 verify_comments "$DIRECTORY_RESTORE_PORT" "directory"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$TAR_RESTORE_PORT" --shared-catalog \
@@ -269,6 +288,7 @@ PGHOST=127.0.0.1 PGPORT="$TAR_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres 
 
 diff -u "$OUT_DIR/verify.expected" "$OUT_DIR/tar-verify.out"
 verify_indexes "$TAR_RESTORE_PORT" "tar"
+verify_constraints "$TAR_RESTORE_PORT" "tar"
 verify_comments "$TAR_RESTORE_PORT" "tar"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$PARALLEL_DIRECTORY_RESTORE_PORT" --shared-catalog \
@@ -288,6 +308,7 @@ PGHOST=127.0.0.1 PGPORT="$PARALLEL_DIRECTORY_RESTORE_PORT" PGDATABASE=postgres P
 
 diff -u "$OUT_DIR/verify.expected" "$OUT_DIR/directory-parallel-verify.out"
 verify_indexes "$PARALLEL_DIRECTORY_RESTORE_PORT" "directory-parallel"
+verify_constraints "$PARALLEL_DIRECTORY_RESTORE_PORT" "directory-parallel"
 verify_comments "$PARALLEL_DIRECTORY_RESTORE_PORT" "directory-parallel"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$CLEAN_RESTORE_PORT" --shared-catalog \
@@ -315,6 +336,7 @@ PGHOST=127.0.0.1 PGPORT="$CLEAN_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgre
 
 diff -u "$OUT_DIR/verify.expected" "$OUT_DIR/clean-verify.out"
 verify_indexes "$CLEAN_RESTORE_PORT" "clean"
+verify_constraints "$CLEAN_RESTORE_PORT" "clean"
 verify_comments "$CLEAN_RESTORE_PORT" "clean"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$INSERT_RESTORE_PORT" --shared-catalog \
@@ -334,6 +356,7 @@ PGHOST=127.0.0.1 PGPORT="$INSERT_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgr
 
 diff -u "$OUT_DIR/verify.expected" "$OUT_DIR/insert-verify.out"
 verify_indexes "$INSERT_RESTORE_PORT" "insert"
+verify_constraints "$INSERT_RESTORE_PORT" "insert"
 verify_comments "$INSERT_RESTORE_PORT" "insert"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$SPLIT_RESTORE_PORT" --shared-catalog \
@@ -357,6 +380,7 @@ PGHOST=127.0.0.1 PGPORT="$SPLIT_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgre
 
 diff -u "$OUT_DIR/verify.expected" "$OUT_DIR/split-verify.out"
 verify_indexes "$SPLIT_RESTORE_PORT" "split"
+verify_constraints "$SPLIT_RESTORE_PORT" "split"
 verify_comments "$SPLIT_RESTORE_PORT" "split"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$CUSTOM_SPLIT_RESTORE_PORT" --shared-catalog \
@@ -380,6 +404,7 @@ PGHOST=127.0.0.1 PGPORT="$CUSTOM_SPLIT_RESTORE_PORT" PGDATABASE=postgres PGUSER=
 
 diff -u "$OUT_DIR/verify.expected" "$OUT_DIR/custom-split-verify.out"
 verify_indexes "$CUSTOM_SPLIT_RESTORE_PORT" "custom-split"
+verify_constraints "$CUSTOM_SPLIT_RESTORE_PORT" "custom-split"
 verify_comments "$CUSTOM_SPLIT_RESTORE_PORT" "custom-split"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$DIRECTORY_SPLIT_RESTORE_PORT" --shared-catalog \
@@ -403,6 +428,7 @@ PGHOST=127.0.0.1 PGPORT="$DIRECTORY_SPLIT_RESTORE_PORT" PGDATABASE=postgres PGUS
 
 diff -u "$OUT_DIR/verify.expected" "$OUT_DIR/directory-split-verify.out"
 verify_indexes "$DIRECTORY_SPLIT_RESTORE_PORT" "directory-split"
+verify_constraints "$DIRECTORY_SPLIT_RESTORE_PORT" "directory-split"
 verify_comments "$DIRECTORY_SPLIT_RESTORE_PORT" "directory-split"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$TAR_SPLIT_RESTORE_PORT" --shared-catalog \
@@ -426,6 +452,7 @@ PGHOST=127.0.0.1 PGPORT="$TAR_SPLIT_RESTORE_PORT" PGDATABASE=postgres PGUSER=pos
 
 diff -u "$OUT_DIR/verify.expected" "$OUT_DIR/tar-split-verify.out"
 verify_indexes "$TAR_SPLIT_RESTORE_PORT" "tar-split"
+verify_constraints "$TAR_SPLIT_RESTORE_PORT" "tar-split"
 verify_comments "$TAR_SPLIT_RESTORE_PORT" "tar-split"
 
 pg_restore --list "$OUT_DIR/dump.custom" >"$OUT_DIR/dump.custom.toc"

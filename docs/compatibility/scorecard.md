@@ -50,10 +50,10 @@ To make new compatibility tests visible in the right bucket:
    - `extended`, `bind`, `parse`, `portal`, `prepared`, `parameterized`, `cursor`, `fetch_count`, or `gdesc` for the P3 extended-query bucket
    - `error`, `unsupported`, `missing`, `mismatch`, `invalid`, `rejects_`, `does_not_exist`, `not_supported`, or `sqlstate` for the protocol error-path bucket
    - `parses_`, `rejects_` for SQL/parser coverage
-   - `relational`, `create_table`, `insert`, or `select` for the P1 relational SQL foundation bucket
+   - `relational`, `create_table`, `insert`, `select`, `primary_key`, or `constraint` for the P1 relational SQL foundation bucket
    - `sql_gpu`, `gpu_bridge`, `relational_sql_select_cuda`, or `relational_sql_select_gpu` for the P4 SQL-to-GPU bridge bucket
-   - `relational_index`, `access_path`, `equality_index`, `archive_ingest`, `archive_ingests`, `segment_ingestion`, `archive_timeline`, `timeline_branch`, `timeline_registry`, `maintenance_cleanup`, or `object_backup` for the P5 storage/indexing bucket
-   - `relational_catalog`, `catalog_schema`, `catalog_introspection`, `pg_catalog`, `pg_type`, `pg_namespace`, `information_schema`, `type_metadata`, `column_id`, `relation_oid`, `create_index`, or `catalog_index` for the P2 catalog/schema/type bucket
+   - `relational_index`, `access_path`, `equality_index`, `primary_key`, `archive_ingest`, `archive_ingests`, `segment_ingestion`, `archive_timeline`, `timeline_branch`, `timeline_registry`, `maintenance_cleanup`, or `object_backup` for the P5 storage/indexing bucket
+   - `relational_catalog`, `catalog_schema`, `catalog_introspection`, `pg_catalog`, `pg_type`, `pg_namespace`, `information_schema`, `type_metadata`, `column_id`, `relation_oid`, `create_index`, `catalog_index`, `primary_key`, or `constraint` for the P2 catalog/schema/type bucket
    - `operational_replication`, `cluster_smoke`, `deployment_preflight`, `deployment_package`, `append_entries_transport`, `read_after_apply`, or `failover` for the P6 local operational replication bucket
    - `transaction`, `commit`, `rollback` for transaction flows
 2. If a new category is needed, add or refine matching rules in `classify()` inside `scripts/generate_compat_scorecard.py`.

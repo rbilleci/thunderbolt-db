@@ -22,6 +22,8 @@ COMMENT
 --------+---------+-----------+----------+---------+----------+-------------+--------------+--------------
  id     | integer |           |          |         | plain    |             |              |
  name   | text    |           |          |         | extended |             |              | display name
+Indexes:
+    "comment_people_name_idx" btree (name)
 Access method: heap
 
                                                        List of relations
