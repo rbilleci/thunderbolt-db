@@ -1617,7 +1617,17 @@ fn parse_create_index(input: &str) -> Result<CreateIndex, ParseError> {
     if close <= open || !target[close + 1..].trim().is_empty() {
         return Err(ParseError::InvalidRelationalSql);
     }
-    let table = normalize_relation_identifier(target[..open].trim())?;
+    let table_target = target[..open].trim();
+    let table_target =
+        if let Some((table, method)) = split_optional_create_index_method(table_target) {
+            if !method.eq_ignore_ascii_case("btree") {
+                return Err(ParseError::InvalidRelationalSql);
+            }
+            table
+        } else {
+            table_target
+        };
+    let table = normalize_relation_identifier(table_target)?;
     let columns = split_csv(&target[open + 1..close])?;
     let [column] = columns.as_slice() else {
         return Err(ParseError::InvalidRelationalSql);
@@ -1628,6 +1638,13 @@ fn parse_create_index(input: &str) -> Result<CreateIndex, ParseError> {
         table,
         column,
     })
+}
+
+fn split_optional_create_index_method(target: &str) -> Option<(&str, &str)> {
+    let using_pos = find_keyword_outside_quotes(target, "USING")?;
+    let table = target[..using_pos].trim();
+    let method = target[using_pos + "USING".len()..].trim();
+    (!table.is_empty() && !method.is_empty()).then_some((table, method))
 }
 
 fn parse_supported_sql_type_name(input: &str) -> Option<SqlType> {
@@ -8758,6 +8775,19 @@ mod tests {
                 column: "name".to_string(),
             })
         );
+        assert_eq!(
+            parse_command("CREATE INDEX people_name_idx ON public.people USING btree (name)")
+                .unwrap(),
+            Command::CreateIndex(CreateIndex {
+                name: "people_name_idx".to_string(),
+                table: "people".to_string(),
+                column: "name".to_string(),
+            })
+        );
+        assert!(matches!(
+            parse_command("CREATE INDEX people_name_idx ON people USING hash (name)"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
         assert!(matches!(
             parse_command("CREATE UNIQUE INDEX people_name_idx ON people (name)"),
             Err(ParseError::InvalidRelationalSql)

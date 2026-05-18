@@ -12,6 +12,7 @@ use gpu_db_protocol::{
 use gpu_db_protocol::{DescribeTarget, SqlType};
 
 const PUBLIC_NAMESPACE_OID: u32 = 2200;
+const FIRST_USER_INDEX_OID: u32 = 20_000;
 static SHARED_CATALOG: OnceLock<Mutex<SharedCatalog>> = OnceLock::new();
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1266,7 +1267,30 @@ impl Session {
         }
         catalog.next_relation_oid = catalog.next_relation_oid.max(self.next_relation_oid);
         if self.dirty_indexes {
-            catalog.indexes = self.indexes.clone();
+            let deleted_tables = self
+                .dirty_tables
+                .iter()
+                .filter(|table_name| !self.tables.contains_key(*table_name))
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            catalog
+                .indexes
+                .retain(|index| !deleted_tables.contains(&index.table));
+            for index in self
+                .indexes
+                .iter()
+                .filter(|index| self.tables.contains_key(&index.table))
+            {
+                if let Some(existing) = catalog
+                    .indexes
+                    .iter_mut()
+                    .find(|existing| existing.name == index.name)
+                {
+                    *existing = index.clone();
+                } else {
+                    catalog.indexes.push(index.clone());
+                }
+            }
             self.dirty_indexes = false;
         }
         self.dirty_tables.clear();
@@ -4330,6 +4354,18 @@ fn parse_drop_table(statement: &str) -> Option<DropTable> {
     })
 }
 
+fn parse_drop_index_if_exists(statement: &str) -> Option<String> {
+    let statement = strip_leading_sql_comments(statement.trim())?;
+    let canonical = canonical_sql(statement);
+    let target = canonical.strip_prefix("drop index if exists ")?.trim();
+    let mut parts = target.split_whitespace();
+    let index = parts.next()?;
+    if parts.next().is_some() || !is_simple_copy_table_name(index) {
+        return None;
+    }
+    Some(index.strip_prefix("public.").unwrap_or(index).to_string())
+}
+
 fn copy_text_value(value: &SqlValue) -> String {
     format_sql_value(value)
         .replace('\\', r"\\")
@@ -5054,6 +5090,13 @@ fn execute_statement(
         session.persist_catalog_snapshot();
         return write_command_complete(stream, "DROP TABLE");
     }
+    if let Some(index_name) = parse_drop_index_if_exists(statement) {
+        let old_index_count = session.indexes.len();
+        session.indexes.retain(|index| index.name != index_name);
+        session.dirty_indexes |= session.indexes.len() != old_index_count;
+        session.persist_catalog_snapshot();
+        return write_command_complete(stream, "DROP INDEX");
+    }
     if canonical == "select pg_catalog.set_config('search_path', '', false)" {
         return write_single_row(
             stream,
@@ -5199,6 +5242,13 @@ fn execute_statement(
             stream,
             &pg_dump_database_metadata_columns(),
             &pg_dump_database_metadata_rows(),
+        );
+    }
+    if is_pg_dump_index_metadata_query(&canonical) {
+        return write_single_row(
+            stream,
+            &pg_dump_index_metadata_columns(),
+            &pg_dump_index_metadata_rows(session),
         );
     }
     if let Some(columns) = pg_dump_empty_catalog_query_columns(&canonical) {
@@ -5367,7 +5417,6 @@ fn execute_statement(
                     column: create.column,
                 });
                 session.dirty_indexes = true;
-                session.mark_table_dirty(create.table);
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, "CREATE INDEX");
             }
@@ -6230,6 +6279,13 @@ fn execute_statement(
             &pg_dump_database_metadata_rows(),
         );
     }
+    if is_pg_dump_index_metadata_query(&canonical) {
+        return write_single_row(
+            stream,
+            &pg_dump_index_metadata_columns(),
+            &pg_dump_index_metadata_rows(session),
+        );
+    }
     if let Some(columns) = pg_dump_empty_catalog_query_columns(&canonical) {
         return write_single_row(stream, &columns, &catalog_empty_rows());
     }
@@ -6396,6 +6452,17 @@ fn execute_statement(
                 text_column("indexdef"),
             ],
             &pg_catalog_index_rows(session),
+        );
+    }
+    if canonical == pg_catalog_indexes_without_schema_query() {
+        return write_single_row(
+            stream,
+            &[
+                text_column("tablename"),
+                text_column("indexname"),
+                text_column("indexdef"),
+            ],
+            &pg_catalog_index_rows_without_schema(session),
         );
     }
     if canonical == pg_catalog_class_plain_tables_query() {
@@ -7623,6 +7690,9 @@ fn pg_dump_class_metadata_rows(session: &Session) -> Vec<Vec<Option<String>>> {
     tables
         .into_iter()
         .map(|table| {
+            let relhasindex = session.indexes.iter().any(|index| {
+                index.table == table.name && session.tables.contains_key(&index.table)
+            });
             vec![
                 Some("1259".to_string()),
                 Some(table.oid.to_string()),
@@ -7632,7 +7702,7 @@ fn pg_dump_class_metadata_rows(session: &Session) -> Vec<Vec<Option<String>>> {
                 Some("0".to_string()),
                 Some("10".to_string()),
                 Some("0".to_string()),
-                Some("f".to_string()),
+                Some(if relhasindex { "t" } else { "f" }.to_string()),
                 Some("f".to_string()),
                 Some("0".to_string()),
                 Some("f".to_string()),
@@ -7741,6 +7811,94 @@ fn pg_dump_attribute_metadata_rows(
         }
     }
     rows
+}
+
+fn is_pg_dump_index_metadata_query(canonical: &str) -> bool {
+    canonical.starts_with("select t.tableoid, t.oid, i.indrelid")
+        && canonical.contains("join pg_catalog.pg_index i")
+}
+
+fn pg_dump_index_metadata_columns() -> Vec<Column> {
+    vec![
+        int4_column("tableoid"),
+        int4_column("oid"),
+        int4_column("indrelid"),
+        text_column("indexname"),
+        text_column("indexdef"),
+        text_column("indkey"),
+        bool_column("indisclustered"),
+        text_column("contype"),
+        text_column("conname"),
+        bool_column("condeferrable"),
+        bool_column("condeferred"),
+        int4_column("contableoid"),
+        int4_column("conoid"),
+        text_column("condef"),
+        text_column("tablespace"),
+        text_column("indreloptions"),
+        bool_column("indisreplident"),
+        int4_column("parentidx"),
+        int4_column("indnkeyatts"),
+        int4_column("indnatts"),
+        text_column("indstatcols"),
+        text_column("indstatvals"),
+        bool_column("indnullsnotdistinct"),
+    ]
+}
+
+fn pg_dump_index_metadata_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut indexed = session
+        .indexes
+        .iter()
+        .filter_map(|index| {
+            let table = session.tables.get(&index.table)?;
+            let column = table
+                .columns
+                .iter()
+                .find(|column| column.def.name == index.column)?;
+            Some((table.oid, table.name.clone(), column.attnum, index.clone()))
+        })
+        .collect::<Vec<_>>();
+    indexed.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.3.name.cmp(&right.3.name))
+    });
+    indexed
+        .into_iter()
+        .enumerate()
+        .map(|(idx, (table_oid, table_name, attnum, index))| {
+            let oid = FIRST_USER_INDEX_OID + idx as u32;
+            vec![
+                Some("1259".to_string()),
+                Some(oid.to_string()),
+                Some(table_oid.to_string()),
+                Some(index.name.clone()),
+                Some(format!(
+                    "CREATE INDEX {} ON public.{} USING btree ({})",
+                    index.name, table_name, index.column
+                )),
+                Some(attnum.to_string()),
+                Some("f".to_string()),
+                None,
+                None,
+                Some("f".to_string()),
+                Some("f".to_string()),
+                None,
+                None,
+                None,
+                Some(String::new()),
+                None,
+                Some("f".to_string()),
+                Some("0".to_string()),
+                Some("1".to_string()),
+                Some("1".to_string()),
+                None,
+                None,
+                Some("f".to_string()),
+            ]
+        })
+        .collect()
 }
 
 fn sql_type_alignment_code(ty: SqlType) -> &'static str {
@@ -8530,6 +8688,10 @@ fn pg_catalog_indexes_query() -> &'static str {
     "select schemaname, tablename, indexname, indexdef from pg_catalog.pg_indexes where schemaname = 'public' order by tablename, indexname"
 }
 
+fn pg_catalog_indexes_without_schema_query() -> &'static str {
+    "select tablename, indexname, indexdef from pg_catalog.pg_indexes where schemaname = 'public' order by tablename, indexname"
+}
+
 fn pg_catalog_index_rows(session: &Session) -> Vec<Vec<Option<String>>> {
     let mut rows = session
         .indexes
@@ -8556,6 +8718,13 @@ fn pg_catalog_index_rows(session: &Session) -> Vec<Vec<Option<String>>> {
                 Some(definition),
             ]
         })
+        .collect()
+}
+
+fn pg_catalog_index_rows_without_schema(session: &Session) -> Vec<Vec<Option<String>>> {
+    pg_catalog_index_rows(session)
+        .into_iter()
+        .map(|row| row.into_iter().skip(1).collect())
         .collect()
 }
 
@@ -10835,6 +11004,34 @@ mod tests {
                 Some("people".to_string()),
             ]]
         );
+        assert_eq!(
+            pg_dump_index_metadata_rows(&session),
+            vec![vec![
+                Some("1259".to_string()),
+                Some(FIRST_USER_INDEX_OID.to_string()),
+                Some(FIRST_USER_RELATION_OID.to_string()),
+                Some("people_name_idx".to_string()),
+                Some("CREATE INDEX people_name_idx ON public.people USING btree (id)".to_string()),
+                Some("1".to_string()),
+                Some("f".to_string()),
+                None,
+                None,
+                Some("f".to_string()),
+                Some("f".to_string()),
+                None,
+                None,
+                None,
+                Some(String::new()),
+                None,
+                Some("f".to_string()),
+                Some("0".to_string()),
+                Some("1".to_string()),
+                Some("1".to_string()),
+                None,
+                None,
+                Some("f".to_string()),
+            ]]
+        );
     }
 
     #[test]
@@ -10931,6 +11128,111 @@ mod tests {
         assert_eq!(
             catalog.tables[events].rows,
             vec![vec![SqlValue::Int4(10)], vec![SqlValue::Int4(11)]]
+        );
+    }
+
+    #[test]
+    fn shared_catalog_index_update_does_not_overwrite_table_rows() {
+        let table_name = "parallel_index_restore_accounts";
+        let index_name = "parallel_index_restore_accounts_id_idx";
+        let other_table_name = "parallel_index_restore_events";
+        let other_index_name = "parallel_index_restore_events_id_idx";
+        {
+            let mut catalog = shared_catalog()
+                .lock()
+                .expect("shared catalog mutex poisoned");
+            catalog.tables.remove(table_name);
+            catalog.tables.remove(other_table_name);
+            catalog.indexes.retain(|index| index.name != index_name);
+            catalog
+                .indexes
+                .retain(|index| index.name != other_index_name);
+        }
+
+        let mut data_session = Session::new(true);
+        data_session.tables.insert(
+            table_name.to_string(),
+            test_table(table_name, vec![vec![SqlValue::Int4(1)]]),
+        );
+        data_session.tables.insert(
+            other_table_name.to_string(),
+            test_table(other_table_name, vec![vec![SqlValue::Int4(10)]]),
+        );
+        data_session.mark_table_dirty(table_name);
+        data_session.mark_table_dirty(other_table_name);
+        data_session.persist_catalog_snapshot();
+
+        let mut index_session = Session::new(true);
+        let mut other_index_session = Session::new(true);
+        index_session.indexes.push(CatalogIndex {
+            name: index_name.to_string(),
+            table: table_name.to_string(),
+            column: "id".to_string(),
+        });
+        index_session.dirty_indexes = true;
+        other_index_session.indexes.push(CatalogIndex {
+            name: other_index_name.to_string(),
+            table: other_table_name.to_string(),
+            column: "id".to_string(),
+        });
+        other_index_session.dirty_indexes = true;
+
+        data_session
+            .tables
+            .get_mut(table_name)
+            .unwrap()
+            .rows
+            .push(vec![SqlValue::Int4(2)]);
+        data_session.mark_table_dirty(table_name);
+        data_session.persist_catalog_snapshot();
+        other_index_session.persist_catalog_snapshot();
+        index_session.persist_catalog_snapshot();
+
+        let catalog = shared_catalog()
+            .lock()
+            .expect("shared catalog mutex poisoned");
+        assert_eq!(
+            catalog.tables[table_name].rows,
+            vec![vec![SqlValue::Int4(1)], vec![SqlValue::Int4(2)]]
+        );
+        assert!(catalog
+            .indexes
+            .iter()
+            .any(|index| index.name == index_name && index.table == table_name));
+        assert!(catalog
+            .indexes
+            .iter()
+            .any(|index| index.name == other_index_name && index.table == other_table_name));
+        drop(catalog);
+
+        let mut catalog = shared_catalog()
+            .lock()
+            .expect("shared catalog mutex poisoned");
+        catalog.tables.remove(table_name);
+        catalog.tables.remove(other_table_name);
+        catalog.indexes.retain(|index| index.name != index_name);
+        catalog
+            .indexes
+            .retain(|index| index.name != other_index_name);
+    }
+
+    #[test]
+    fn clean_restore_drop_index_if_exists_is_narrow() {
+        assert_eq!(
+            parse_drop_index_if_exists("DROP INDEX IF EXISTS public.accounts_name_idx;"),
+            Some("accounts_name_idx".to_string())
+        );
+        assert_eq!(
+            parse_drop_index_if_exists("-- restore cleanup\nDROP INDEX IF EXISTS events_note_idx;"),
+            Some("events_note_idx".to_string())
+        );
+        assert_eq!(
+            parse_drop_index_if_exists("DROP INDEX accounts_name_idx"),
+            None
+        );
+        assert_eq!(
+            parse_drop_index_if_exists("DROP INDEX IF EXISTS public.a, public.b"),
+            None
         );
     }
 
