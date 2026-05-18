@@ -6,8 +6,9 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 
 use gpu_db_protocol::{
-    parse_command, parse_frontend_message, parse_startup_packet, Command, FrontendMessage,
-    ParseError, SelectFilterOp, SelectProjection, SqlValue, StartupPacket, SUPPORTED_SQL_TYPES,
+    parse_command, parse_frontend_message, parse_startup_packet, Command, CommentTarget,
+    FrontendMessage, ParseError, SelectFilterOp, SelectProjection, SqlValue, StartupPacket,
+    SUPPORTED_SQL_TYPES,
 };
 use gpu_db_protocol::{DescribeTarget, SqlType};
 
@@ -1196,8 +1197,10 @@ struct Session {
     cursors: HashMap<String, Cursor>,
     tables: HashMap<String, Table>,
     indexes: Vec<CatalogIndex>,
+    comments: BTreeMap<CatalogCommentTarget, String>,
     dirty_tables: BTreeSet<String>,
     dirty_indexes: bool,
+    dirty_comment_targets: BTreeSet<CatalogCommentTarget>,
     copy_in: Option<CopyInState>,
     next_relation_oid: u32,
     shared_catalog: bool,
@@ -1207,6 +1210,7 @@ struct Session {
 struct SharedCatalog {
     tables: HashMap<String, Table>,
     indexes: Vec<CatalogIndex>,
+    comments: BTreeMap<CatalogCommentTarget, String>,
     next_relation_oid: u32,
 }
 
@@ -1215,6 +1219,7 @@ impl Default for SharedCatalog {
         Self {
             tables: HashMap::new(),
             indexes: Vec::new(),
+            comments: BTreeMap::new(),
             next_relation_oid: FIRST_USER_RELATION_OID,
         }
     }
@@ -1247,8 +1252,10 @@ impl Session {
             cursors: HashMap::new(),
             tables: catalog.tables,
             indexes: catalog.indexes,
+            comments: catalog.comments,
             dirty_tables: BTreeSet::new(),
             dirty_indexes: false,
+            dirty_comment_targets: BTreeSet::new(),
             copy_in: None,
             next_relation_oid: catalog.next_relation_oid,
             shared_catalog: shared_catalog_enabled,
@@ -1259,9 +1266,14 @@ impl Session {
         self.dirty_tables.insert(table.into());
     }
 
+    fn mark_comment_dirty(&mut self, target: CatalogCommentTarget) {
+        self.dirty_comment_targets.insert(target);
+    }
+
     fn persist_catalog_snapshot(&mut self) {
         if !self.shared_catalog {
             self.dirty_tables.clear();
+            self.dirty_comment_targets.clear();
             return;
         }
         let mut catalog = shared_catalog()
@@ -1302,6 +1314,14 @@ impl Session {
             }
             self.dirty_indexes = false;
         }
+        for target in &self.dirty_comment_targets {
+            if let Some(comment) = self.comments.get(target) {
+                catalog.comments.insert(target.clone(), comment.clone());
+            } else {
+                catalog.comments.remove(target);
+            }
+        }
+        self.dirty_comment_targets.clear();
         self.dirty_tables.clear();
     }
 
@@ -1354,6 +1374,12 @@ struct CatalogIndex {
     name: String,
     table: String,
     column: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum CatalogCommentTarget {
+    Table { table: String },
+    Column { table: String, attnum: i16 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -5107,6 +5133,19 @@ fn execute_statement(
         let old_index_count = session.indexes.len();
         session.indexes.retain(|index| index.table != drop.table);
         session.dirty_indexes |= session.indexes.len() != old_index_count;
+        let dropped_comment_targets = session
+            .comments
+            .keys()
+            .filter(|target| match target {
+                CatalogCommentTarget::Table { table }
+                | CatalogCommentTarget::Column { table, .. } => table == &drop.table,
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for target in dropped_comment_targets {
+            session.comments.remove(&target);
+            session.mark_comment_dirty(target);
+        }
         session.mark_table_dirty(drop.table);
         session.persist_catalog_snapshot();
         return write_command_complete(stream, "DROP TABLE");
@@ -5318,7 +5357,7 @@ fn execute_statement(
                 int4_column("objoid"),
                 int4_column("objsubid"),
             ],
-            &catalog_empty_rows(),
+            &pg_dump_description_rows(session),
         );
     }
     if canonical
@@ -5487,6 +5526,61 @@ fn execute_statement(
                 session.mark_table_dirty(alter.table);
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, "ALTER TABLE");
+            }
+            Command::CommentOn(comment) => {
+                let target = match comment.target {
+                    CommentTarget::Table { table } => {
+                        if !session.tables.contains_key(&table) {
+                            return write_error(
+                                stream,
+                                &ErrorField {
+                                    code: "42P01",
+                                    message: "relation does not exist",
+                                    position: None,
+                                },
+                            );
+                        }
+                        CatalogCommentTarget::Table { table }
+                    }
+                    CommentTarget::Column { table, column } => {
+                        let Some(table_ref) = session.tables.get(&table) else {
+                            return write_error(
+                                stream,
+                                &ErrorField {
+                                    code: "42P01",
+                                    message: "relation does not exist",
+                                    position: None,
+                                },
+                            );
+                        };
+                        let Some(column_ref) = table_ref
+                            .columns
+                            .iter()
+                            .find(|candidate| candidate.def.name == column)
+                        else {
+                            return write_error(
+                                stream,
+                                &ErrorField {
+                                    code: "42703",
+                                    message: "column does not exist",
+                                    position: None,
+                                },
+                            );
+                        };
+                        CatalogCommentTarget::Column {
+                            table,
+                            attnum: column_ref.attnum,
+                        }
+                    }
+                };
+                if let Some(value) = comment.comment {
+                    session.comments.insert(target.clone(), value);
+                } else {
+                    session.comments.remove(&target);
+                }
+                session.mark_comment_dirty(target);
+                session.persist_catalog_snapshot();
+                return write_command_complete(stream, "COMMENT");
             }
             Command::Insert(insert) => {
                 let table_name = insert.table;
@@ -6936,7 +7030,7 @@ fn execute_statement(
                 text_column("Object"),
                 text_column("Description"),
             ],
-            &catalog_empty_rows(),
+            &psql_object_description_rows(session),
         );
     }
     if canonical
@@ -7583,11 +7677,15 @@ fn catalog_psql_describe_table_verbose_rows_filtered(
     catalog_psql_describe_table_rows_filtered(session, filter)
         .into_iter()
         .map(|mut row| {
+            let table_name = row[1].clone().unwrap_or_default();
             row.extend([
                 Some("permanent".to_string()),
                 Some("heap".to_string()),
                 None,
-                None,
+                session
+                    .comments
+                    .get(&CatalogCommentTarget::Table { table: table_name })
+                    .cloned(),
             ]);
             row
         })
@@ -8662,7 +8760,13 @@ fn catalog_describe_verbose_attribute_rows(
                 Some(sql_type_storage_code(column.def.ty).to_string()),
                 Some(String::new()),
                 None,
-                None,
+                session
+                    .comments
+                    .get(&CatalogCommentTarget::Column {
+                        table: table.name.clone(),
+                        attnum: column.attnum,
+                    })
+                    .cloned(),
             ]
         })
         .collect()
@@ -9442,12 +9546,86 @@ fn pg_catalog_descriptions_query() -> &'static str {
 }
 
 fn pg_catalog_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    let _supported_plain_table_and_column_count = session
-        .tables
-        .values()
-        .map(|table| 1 + table.columns.len())
-        .sum::<usize>();
-    Vec::new()
+    let mut rows = Vec::new();
+    let mut tables = session.tables.values().collect::<Vec<_>>();
+    tables.sort_by(|left, right| left.name.cmp(&right.name));
+    for table in tables {
+        if let Some(description) = session.comments.get(&CatalogCommentTarget::Table {
+            table: table.name.clone(),
+        }) {
+            rows.push(vec![
+                Some("public".to_string()),
+                Some(table.name.clone()),
+                None,
+                Some(description.clone()),
+            ]);
+        }
+        for column in &table.columns {
+            if let Some(description) = session.comments.get(&CatalogCommentTarget::Column {
+                table: table.name.clone(),
+                attnum: column.attnum,
+            }) {
+                rows.push(vec![
+                    Some("public".to_string()),
+                    Some(table.name.clone()),
+                    Some(column.def.name.clone()),
+                    Some(description.clone()),
+                ]);
+            }
+        }
+    }
+    rows
+}
+
+fn pg_dump_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut rows = Vec::new();
+    let mut tables = session.tables.values().collect::<Vec<_>>();
+    tables.sort_by_key(|table| table.oid);
+    for table in tables {
+        if let Some(description) = session.comments.get(&CatalogCommentTarget::Table {
+            table: table.name.clone(),
+        }) {
+            rows.push(vec![
+                Some(description.clone()),
+                Some("1259".to_string()),
+                Some(table.oid.to_string()),
+                Some("0".to_string()),
+            ]);
+        }
+        for column in &table.columns {
+            if let Some(description) = session.comments.get(&CatalogCommentTarget::Column {
+                table: table.name.clone(),
+                attnum: column.attnum,
+            }) {
+                rows.push(vec![
+                    Some(description.clone()),
+                    Some("1259".to_string()),
+                    Some(table.oid.to_string()),
+                    Some(column.attnum.to_string()),
+                ]);
+            }
+        }
+    }
+    rows
+}
+
+fn psql_object_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut rows = Vec::new();
+    let mut tables = session.tables.values().collect::<Vec<_>>();
+    tables.sort_by(|left, right| left.name.cmp(&right.name));
+    for table in tables {
+        if let Some(description) = session.comments.get(&CatalogCommentTarget::Table {
+            table: table.name.clone(),
+        }) {
+            rows.push(vec![
+                Some("public".to_string()),
+                Some(table.name.clone()),
+                Some("table".to_string()),
+                Some(description.clone()),
+            ]);
+        }
+    }
+    rows
 }
 
 fn psql_list_object_descriptions_query(canonical: &str) -> bool {
@@ -19312,6 +19490,94 @@ mod tests {
                     Some("'Ada''s'::text".to_string()),
                 ],
             ]
+        );
+    }
+
+    #[test]
+    fn catalog_queries_expose_table_and_column_comments() {
+        let mut session = Session::default();
+        session.tables.insert(
+            "commented".to_string(),
+            Table {
+                oid: FIRST_USER_RELATION_OID,
+                name: "commented".to_string(),
+                columns: vec![
+                    CatalogColumn {
+                        attnum: 1,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "id".to_string(),
+                            ty: SqlType::Int4,
+                            default: None,
+                        },
+                    },
+                    CatalogColumn {
+                        attnum: 2,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "name".to_string(),
+                            ty: SqlType::Text,
+                            default: None,
+                        },
+                    },
+                ],
+                rows: Vec::new(),
+            },
+        );
+        session.comments.insert(
+            CatalogCommentTarget::Table {
+                table: "commented".to_string(),
+            },
+            "lookup table".to_string(),
+        );
+        session.comments.insert(
+            CatalogCommentTarget::Column {
+                table: "commented".to_string(),
+                attnum: 2,
+            },
+            "display name".to_string(),
+        );
+
+        assert_eq!(
+            pg_catalog_description_rows(&session),
+            vec![
+                vec![
+                    Some("public".to_string()),
+                    Some("commented".to_string()),
+                    None,
+                    Some("lookup table".to_string()),
+                ],
+                vec![
+                    Some("public".to_string()),
+                    Some("commented".to_string()),
+                    Some("name".to_string()),
+                    Some("display name".to_string()),
+                ],
+            ]
+        );
+        assert_eq!(
+            pg_dump_description_rows(&session),
+            vec![
+                vec![
+                    Some("lookup table".to_string()),
+                    Some("1259".to_string()),
+                    Some(FIRST_USER_RELATION_OID.to_string()),
+                    Some("0".to_string()),
+                ],
+                vec![
+                    Some("display name".to_string()),
+                    Some("1259".to_string()),
+                    Some(FIRST_USER_RELATION_OID.to_string()),
+                    Some("2".to_string()),
+                ],
+            ]
+        );
+        assert_eq!(
+            psql_object_description_rows(&session),
+            vec![vec![
+                Some("public".to_string()),
+                Some("commented".to_string()),
+                Some("table".to_string()),
+                Some("lookup table".to_string()),
+            ]]
         );
     }
 

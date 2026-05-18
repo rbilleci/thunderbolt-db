@@ -109,10 +109,14 @@ CREATE TABLE accounts (id int4, name text DEFAULT 'unknown'::text, tier int4 DEF
 INSERT INTO accounts (id, name) VALUES (1, 'Ada');
 INSERT INTO accounts (id) VALUES (2);
 CREATE INDEX accounts_name_idx ON accounts (name);
+COMMENT ON TABLE public.accounts IS 'accounts table';
+COMMENT ON COLUMN public.accounts.name IS 'account display name';
 CREATE TABLE events (event_id int4, note text);
 INSERT INTO events (event_id, note) VALUES (10, 'created');
 INSERT INTO events (event_id, note) VALUES (11, 'updated');
 CREATE INDEX events_note_idx ON events (note);
+COMMENT ON TABLE public.events IS 'events table';
+COMMENT ON COLUMN public.events.note IS 'event note';
 SQL
 
 PGHOST=127.0.0.1 PGPORT="$SOURCE_PORT" PGDATABASE=postgres PGUSER=postgres \
@@ -173,6 +177,13 @@ accounts|accounts_name_idx|CREATE INDEX accounts_name_idx ON public.accounts USI
 events|events_note_idx|CREATE INDEX events_note_idx ON public.events USING btree (note)
 EOF
 
+cat >"$OUT_DIR/comment-verify.expected" <<'EOF'
+public|accounts||accounts table
+public|accounts|name|account display name
+public|events||events table
+public|events|note|event note
+EOF
+
 diff -u "$OUT_DIR/verify.expected" "$OUT_DIR/verify.out"
 
 verify_indexes() {
@@ -186,6 +197,18 @@ verify_indexes() {
 }
 
 verify_indexes "$RESTORE_PORT" "restore"
+
+verify_comments() {
+  local port="$1"
+  local prefix="$2"
+  PGHOST=127.0.0.1 PGPORT="$port" PGDATABASE=postgres PGUSER=postgres \
+    psql -v ON_ERROR_STOP=1 -X -A -t \
+    -c "SELECT n.nspname, c.relname, a.attname, d.description FROM pg_catalog.pg_description d JOIN pg_catalog.pg_class c ON c.oid = d.objoid JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = d.objsubid WHERE n.nspname = 'public' AND c.relkind = 'r' ORDER BY c.relname, d.objsubid;" \
+    >"$OUT_DIR/${prefix}-comment-verify.out" 2>"$OUT_DIR/${prefix}-comment-verify.err"
+  diff -u "$OUT_DIR/comment-verify.expected" "$OUT_DIR/${prefix}-comment-verify.out"
+}
+
+verify_comments "$RESTORE_PORT" "restore"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$CUSTOM_RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/custom-restore-server.log" 2>&1 &
@@ -204,6 +227,7 @@ PGHOST=127.0.0.1 PGPORT="$CUSTOM_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgr
 
 diff -u "$OUT_DIR/verify.expected" "$OUT_DIR/custom-verify.out"
 verify_indexes "$CUSTOM_RESTORE_PORT" "custom"
+verify_comments "$CUSTOM_RESTORE_PORT" "custom"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$DIRECTORY_RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/directory-restore-server.log" 2>&1 &
@@ -222,6 +246,7 @@ PGHOST=127.0.0.1 PGPORT="$DIRECTORY_RESTORE_PORT" PGDATABASE=postgres PGUSER=pos
 
 diff -u "$OUT_DIR/verify.expected" "$OUT_DIR/directory-verify.out"
 verify_indexes "$DIRECTORY_RESTORE_PORT" "directory"
+verify_comments "$DIRECTORY_RESTORE_PORT" "directory"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$TAR_RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/tar-restore-server.log" 2>&1 &
@@ -240,6 +265,7 @@ PGHOST=127.0.0.1 PGPORT="$TAR_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres 
 
 diff -u "$OUT_DIR/verify.expected" "$OUT_DIR/tar-verify.out"
 verify_indexes "$TAR_RESTORE_PORT" "tar"
+verify_comments "$TAR_RESTORE_PORT" "tar"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$PARALLEL_DIRECTORY_RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/directory-parallel-restore-server.log" 2>&1 &
@@ -258,6 +284,7 @@ PGHOST=127.0.0.1 PGPORT="$PARALLEL_DIRECTORY_RESTORE_PORT" PGDATABASE=postgres P
 
 diff -u "$OUT_DIR/verify.expected" "$OUT_DIR/directory-parallel-verify.out"
 verify_indexes "$PARALLEL_DIRECTORY_RESTORE_PORT" "directory-parallel"
+verify_comments "$PARALLEL_DIRECTORY_RESTORE_PORT" "directory-parallel"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$CLEAN_RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/clean-restore-server.log" 2>&1 &
@@ -284,6 +311,7 @@ PGHOST=127.0.0.1 PGPORT="$CLEAN_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgre
 
 diff -u "$OUT_DIR/verify.expected" "$OUT_DIR/clean-verify.out"
 verify_indexes "$CLEAN_RESTORE_PORT" "clean"
+verify_comments "$CLEAN_RESTORE_PORT" "clean"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$INSERT_RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/insert-restore-server.log" 2>&1 &
@@ -302,6 +330,7 @@ PGHOST=127.0.0.1 PGPORT="$INSERT_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgr
 
 diff -u "$OUT_DIR/verify.expected" "$OUT_DIR/insert-verify.out"
 verify_indexes "$INSERT_RESTORE_PORT" "insert"
+verify_comments "$INSERT_RESTORE_PORT" "insert"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$SPLIT_RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/split-restore-server.log" 2>&1 &
@@ -324,6 +353,7 @@ PGHOST=127.0.0.1 PGPORT="$SPLIT_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgre
 
 diff -u "$OUT_DIR/verify.expected" "$OUT_DIR/split-verify.out"
 verify_indexes "$SPLIT_RESTORE_PORT" "split"
+verify_comments "$SPLIT_RESTORE_PORT" "split"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$CUSTOM_SPLIT_RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/custom-split-restore-server.log" 2>&1 &
@@ -346,6 +376,7 @@ PGHOST=127.0.0.1 PGPORT="$CUSTOM_SPLIT_RESTORE_PORT" PGDATABASE=postgres PGUSER=
 
 diff -u "$OUT_DIR/verify.expected" "$OUT_DIR/custom-split-verify.out"
 verify_indexes "$CUSTOM_SPLIT_RESTORE_PORT" "custom-split"
+verify_comments "$CUSTOM_SPLIT_RESTORE_PORT" "custom-split"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$DIRECTORY_SPLIT_RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/directory-split-restore-server.log" 2>&1 &
@@ -368,6 +399,7 @@ PGHOST=127.0.0.1 PGPORT="$DIRECTORY_SPLIT_RESTORE_PORT" PGDATABASE=postgres PGUS
 
 diff -u "$OUT_DIR/verify.expected" "$OUT_DIR/directory-split-verify.out"
 verify_indexes "$DIRECTORY_SPLIT_RESTORE_PORT" "directory-split"
+verify_comments "$DIRECTORY_SPLIT_RESTORE_PORT" "directory-split"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$TAR_SPLIT_RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/tar-split-restore-server.log" 2>&1 &
@@ -390,6 +422,7 @@ PGHOST=127.0.0.1 PGPORT="$TAR_SPLIT_RESTORE_PORT" PGDATABASE=postgres PGUSER=pos
 
 diff -u "$OUT_DIR/verify.expected" "$OUT_DIR/tar-split-verify.out"
 verify_indexes "$TAR_SPLIT_RESTORE_PORT" "tar-split"
+verify_comments "$TAR_SPLIT_RESTORE_PORT" "tar-split"
 
 pg_restore --list "$OUT_DIR/dump.custom" >"$OUT_DIR/dump.custom.toc"
 pg_restore --list "$OUT_DIR/dump.dir" >"$OUT_DIR/dump.dir.toc"
@@ -409,6 +442,10 @@ grep -F "    tier integer DEFAULT 7" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "CREATE TABLE public.events (" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "CREATE INDEX accounts_name_idx ON public.accounts USING btree (name);" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "CREATE INDEX events_note_idx ON public.events USING btree (note);" "$OUT_DIR/dump.sql" >/dev/null
+grep -F "COMMENT ON TABLE public.accounts IS 'accounts table';" "$OUT_DIR/dump.sql" >/dev/null
+grep -F "COMMENT ON COLUMN public.accounts.name IS 'account display name';" "$OUT_DIR/dump.sql" >/dev/null
+grep -F "COMMENT ON TABLE public.events IS 'events table';" "$OUT_DIR/dump.sql" >/dev/null
+grep -F "COMMENT ON COLUMN public.events.note IS 'event note';" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "CREATE SCHEMA public;" "$OUT_DIR/dump-schema.sql" >/dev/null
 grep -F "CREATE TABLE public.accounts (" "$OUT_DIR/dump-schema.sql" >/dev/null
 grep -F "    name text DEFAULT 'unknown'::text," "$OUT_DIR/dump-schema.sql" >/dev/null
@@ -416,6 +453,10 @@ grep -F "    tier integer DEFAULT 7" "$OUT_DIR/dump-schema.sql" >/dev/null
 grep -F "CREATE TABLE public.events (" "$OUT_DIR/dump-schema.sql" >/dev/null
 grep -F "CREATE INDEX accounts_name_idx ON public.accounts USING btree (name);" "$OUT_DIR/dump-schema.sql" >/dev/null
 grep -F "CREATE INDEX events_note_idx ON public.events USING btree (note);" "$OUT_DIR/dump-schema.sql" >/dev/null
+grep -F "COMMENT ON TABLE public.accounts IS 'accounts table';" "$OUT_DIR/dump-schema.sql" >/dev/null
+grep -F "COMMENT ON COLUMN public.accounts.name IS 'account display name';" "$OUT_DIR/dump-schema.sql" >/dev/null
+grep -F "COMMENT ON TABLE public.events IS 'events table';" "$OUT_DIR/dump-schema.sql" >/dev/null
+grep -F "COMMENT ON COLUMN public.events.note IS 'event note';" "$OUT_DIR/dump-schema.sql" >/dev/null
 grep -F "COPY public.accounts (id, name, tier) FROM stdin;" "$OUT_DIR/dump-data.sql" >/dev/null
 grep -F "COPY public.events (event_id, note) FROM stdin;" "$OUT_DIR/dump-data.sql" >/dev/null
 grep -F "SCHEMA - public" "$OUT_DIR/dump.custom.toc" >/dev/null

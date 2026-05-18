@@ -19,8 +19,8 @@ use gpu_db_observability::{
 };
 use gpu_db_planner::{ExecutionPlan, Planner, PlannerConfig};
 use gpu_db_protocol::{
-    parse_command, ColumnDef, Command, CreateIndex, CreateTable, Delete, Insert, ParseError,
-    Select, SelectFilterOp, SelectProjection, SqlType, SqlValue, Update,
+    parse_command, ColumnDef, Command, CommentTarget, CreateIndex, CreateTable, Delete, Insert,
+    ParseError, Select, SelectFilterOp, SelectProjection, SqlType, SqlValue, Update,
 };
 use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine};
 use gpu_db_storage::{
@@ -73,6 +73,7 @@ impl ReplicatedStateMachine for KvStateMachine {
                     | Command::CreateTable(_)
                     | Command::CreateIndex(_)
                     | Command::AlterColumnDefault(_)
+                    | Command::CommentOn(_)
                     | Command::Insert(_)
                     | Command::Delete(_)
                     | Command::Update(_)
@@ -5921,6 +5922,7 @@ pub struct Engine {
     sm: KvStateMachine,
     mvcc_store: InMemoryTupleStore,
     relational_catalog: BTreeMap<String, RelationalTable>,
+    relational_comments: BTreeMap<RelationalCommentTarget, String>,
     relational_value_index: BTreeMap<RelationalIndexKey, Vec<String>>,
     relational_residency: BTreeMap<String, RelationalResidencySnapshot>,
     relational_residency_device_memory: BTreeMap<String, CudaResidentDeviceMemory>,
@@ -5965,6 +5967,12 @@ pub struct RelationalIndex {
     pub name: String,
     pub table: String,
     pub column: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RelationalCommentTarget {
+    Table { table: String },
+    Column { table: String, attnum: i16 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7225,6 +7233,7 @@ impl Engine {
             sm: KvStateMachine::default(),
             mvcc_store: InMemoryTupleStore::new(),
             relational_catalog: BTreeMap::new(),
+            relational_comments: BTreeMap::new(),
             relational_value_index: BTreeMap::new(),
             relational_residency: BTreeMap::new(),
             relational_residency_device_memory: BTreeMap::new(),
@@ -7464,6 +7473,7 @@ impl Engine {
             Command::CreateTable(create) => self.apply_create_table(create)?,
             Command::CreateIndex(create) => self.apply_create_index(create)?,
             Command::AlterColumnDefault(alter) => self.apply_alter_column_default(alter)?,
+            Command::CommentOn(comment) => self.apply_comment_on(comment)?,
             Command::Insert(insert) => self.apply_insert(insert, txn_id)?,
             Command::Delete(delete) => self.apply_delete(delete, txn_id)?,
             Command::Update(update) => self.apply_update(update, txn_id)?,
@@ -7553,6 +7563,42 @@ impl Engine {
             table: create.table,
             column: create.column,
         });
+        Ok(())
+    }
+
+    fn apply_comment_on(&mut self, comment: gpu_db_protocol::CommentOn) -> Result<(), EngineError> {
+        let target = match comment.target {
+            CommentTarget::Table { table } => {
+                if !self.relational_catalog.contains_key(&table) {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "relation \"{}\" does not exist",
+                        table
+                    )));
+                }
+                RelationalCommentTarget::Table { table }
+            }
+            CommentTarget::Column { table, column } => {
+                let table_ref = self.relational_catalog.get(&table).ok_or_else(|| {
+                    EngineError::ApplyFailed(format!("relation \"{}\" does not exist", table))
+                })?;
+                let column_ref = table_ref
+                    .columns
+                    .iter()
+                    .find(|candidate| candidate.name == column)
+                    .ok_or_else(|| {
+                        EngineError::ApplyFailed(format!("column \"{}\" does not exist", column))
+                    })?;
+                RelationalCommentTarget::Column {
+                    table,
+                    attnum: column_ref.attnum,
+                }
+            }
+        };
+        if let Some(value) = comment.comment {
+            self.relational_comments.insert(target, value);
+        } else {
+            self.relational_comments.remove(&target);
+        }
         Ok(())
     }
 
@@ -7787,6 +7833,7 @@ impl Engine {
             | Command::CreateTable(_)
             | Command::CreateIndex(_)
             | Command::AlterColumnDefault(_)
+            | Command::CommentOn(_)
             | Command::Insert(_)
             | Command::Delete(_)
             | Command::Update(_) => {
@@ -7969,6 +8016,7 @@ impl Engine {
             | Command::CreateTable(_)
             | Command::CreateIndex(_)
             | Command::AlterColumnDefault(_)
+            | Command::CommentOn(_)
             | Command::Insert(_)
             | Command::Delete(_)
             | Command::Update(_) => match self.route_command(&cmd) {
@@ -8047,6 +8095,7 @@ impl Engine {
             Command::CreateTable(_) => Err(ExecuteError::NonReadCommand("CREATE TABLE")),
             Command::CreateIndex(_) => Err(ExecuteError::NonReadCommand("CREATE INDEX")),
             Command::AlterColumnDefault(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
+            Command::CommentOn(_) => Err(ExecuteError::NonReadCommand("COMMENT")),
             Command::Insert(_) => Err(ExecuteError::NonReadCommand("INSERT")),
             Command::Delete(_) => Err(ExecuteError::NonReadCommand("DELETE")),
             Command::Update(_) => Err(ExecuteError::NonReadCommand("UPDATE")),
@@ -11106,6 +11155,23 @@ impl Engine {
 
     pub fn relational_catalog_table(&self, table: &str) -> Option<&RelationalTable> {
         self.relational_catalog.get(table)
+    }
+
+    pub fn relational_table_comment(&self, table: &str) -> Option<&str> {
+        self.relational_comments
+            .get(&RelationalCommentTarget::Table {
+                table: table.to_string(),
+            })
+            .map(String::as_str)
+    }
+
+    pub fn relational_column_comment(&self, table: &str, attnum: i16) -> Option<&str> {
+        self.relational_comments
+            .get(&RelationalCommentTarget::Column {
+                table: table.to_string(),
+                attnum,
+            })
+            .map(String::as_str)
     }
 
     pub fn populate_relational_residency_snapshot(
@@ -30463,6 +30529,41 @@ mod tests {
             .unwrap();
         assert!(missing
             .execute_text(2, "CREATE INDEX people_missing_idx ON people (missing)")
+            .unwrap_err()
+            .to_string()
+            .contains("column \"missing\" does not exist"));
+    }
+
+    #[test]
+    fn relational_catalog_records_comments_and_replays_from_wal() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(2, "COMMENT ON TABLE public.people IS 'lookup people'")
+            .unwrap();
+        e.execute_text(3, "COMMENT ON COLUMN public.people.name IS 'display name'")
+            .unwrap();
+        assert_eq!(e.relational_table_comment("people"), Some("lookup people"));
+        assert_eq!(
+            e.relational_column_comment("people", 2),
+            Some("display name")
+        );
+
+        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        assert_eq!(
+            recovered.relational_table_comment("people"),
+            Some("lookup people")
+        );
+        assert_eq!(
+            recovered.relational_column_comment("people", 2),
+            Some("display name")
+        );
+
+        e.execute_text(4, "COMMENT ON COLUMN public.people.name IS NULL")
+            .unwrap();
+        assert_eq!(e.relational_column_comment("people", 2), None);
+        assert!(e
+            .execute_text(5, "COMMENT ON COLUMN public.people.missing IS 'bad'")
             .unwrap_err()
             .to_string()
             .contains("column \"missing\" does not exist"));

@@ -12,6 +12,7 @@ pub enum Command {
     CreateTable(CreateTable),
     CreateIndex(CreateIndex),
     AlterColumnDefault(AlterColumnDefault),
+    CommentOn(CommentOn),
     Insert(Insert),
     Delete(Delete),
     Update(Update),
@@ -36,6 +37,18 @@ pub struct AlterColumnDefault {
     pub table: String,
     pub column: String,
     pub default: SqlValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommentOn {
+    pub target: CommentTarget,
+    pub comment: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommentTarget {
+    Table { table: String },
+    Column { table: String, column: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1559,6 +1572,9 @@ fn parse_relational_command(input: &str) -> Option<Result<Command, ParseError>> 
     if first.eq_ignore_ascii_case("ALTER") {
         return Some(parse_alter_column_default(input).map(Command::AlterColumnDefault));
     }
+    if first.eq_ignore_ascii_case("COMMENT") {
+        return Some(parse_comment_on(input).map(Command::CommentOn));
+    }
     if first.eq_ignore_ascii_case("INSERT") {
         return Some(parse_insert(input).map(Command::Insert));
     }
@@ -1580,6 +1596,48 @@ fn parse_relational_command(input: &str) -> Option<Result<Command, ParseError>> 
         return Some(parse_select(input).map(Command::Select));
     }
     None
+}
+
+fn parse_comment_on(input: &str) -> Result<CommentOn, ParseError> {
+    let rest = strip_keyword_prefix_case_insensitive(input, "COMMENT")
+        .and_then(|s| strip_keyword_prefix_case_insensitive(s.trim_start(), "ON"))
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    let (target, rest) = if let Some(rest) = strip_keyword_prefix_case_insensitive(rest, "TABLE") {
+        let rest = rest.trim_start();
+        let is_pos =
+            find_keyword_outside_quotes(rest, "IS").ok_or(ParseError::InvalidRelationalSql)?;
+        let table = normalize_relation_identifier(rest[..is_pos].trim())?;
+        (
+            CommentTarget::Table { table },
+            rest[is_pos + "IS".len()..].trim(),
+        )
+    } else if let Some(rest) = strip_keyword_prefix_case_insensitive(rest, "COLUMN") {
+        let rest = rest.trim_start();
+        let is_pos =
+            find_keyword_outside_quotes(rest, "IS").ok_or(ParseError::InvalidRelationalSql)?;
+        let target = rest[..is_pos].trim();
+        let (table, column) = target
+            .rsplit_once('.')
+            .ok_or(ParseError::InvalidRelationalSql)?;
+        let table = normalize_relation_identifier(table.trim())?;
+        let column = normalize_identifier(column.trim())?;
+        (
+            CommentTarget::Column { table, column },
+            rest[is_pos + "IS".len()..].trim(),
+        )
+    } else {
+        return Err(ParseError::InvalidRelationalSql);
+    };
+    let comment = if rest.eq_ignore_ascii_case("NULL") {
+        None
+    } else {
+        match parse_sql_value(rest)? {
+            SqlValue::Text(value) => Some(value),
+            _ => return Err(ParseError::InvalidRelationalSql),
+        }
+    };
+    Ok(CommentOn { target, comment })
 }
 
 fn parse_alter_column_default(input: &str) -> Result<AlterColumnDefault, ParseError> {
@@ -8791,6 +8849,38 @@ mod tests {
                         default: None,
                     },
                 ],
+            })
+        );
+
+        assert_eq!(
+            parse_command("COMMENT ON TABLE public.people IS 'lookup people'").unwrap(),
+            Command::CommentOn(CommentOn {
+                target: CommentTarget::Table {
+                    table: "people".to_string(),
+                },
+                comment: Some("lookup people".to_string()),
+            })
+        );
+
+        assert_eq!(
+            parse_command("COMMENT ON COLUMN public.people.name IS 'display name'").unwrap(),
+            Command::CommentOn(CommentOn {
+                target: CommentTarget::Column {
+                    table: "people".to_string(),
+                    column: "name".to_string(),
+                },
+                comment: Some("display name".to_string()),
+            })
+        );
+
+        assert_eq!(
+            parse_command("COMMENT ON COLUMN public.people.name IS NULL").unwrap(),
+            Command::CommentOn(CommentOn {
+                target: CommentTarget::Column {
+                    table: "people".to_string(),
+                    column: "name".to_string(),
+                },
+                comment: None,
             })
         );
 

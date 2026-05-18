@@ -61,6 +61,7 @@ impl Planner {
             Command::CreateTable(_)
             | Command::CreateIndex(_)
             | Command::AlterColumnDefault(_)
+            | Command::CommentOn(_)
             | Command::Insert(_)
             | Command::Delete(_)
             | Command::Update(_) => PlanNode {

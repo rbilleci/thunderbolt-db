@@ -1,0 +1,32 @@
+=== table and column comments ===
+CREATE TABLE
+COMMENT
+COMMENT
+ nspname |    relname     | attname |     description
+---------+----------------+---------+---------------------
+ public  | comment_people |         | people lookup table
+ public  | comment_people | name    | display name
+(2 rows)
+
+                                      Table "public.comment_people"
+ Column |  Type   | Collation | Nullable | Default | Storage  | Compression | Stats target | Description
+--------+---------+-----------+----------+---------+----------+-------------+--------------+--------------
+ id     | integer |           |          |         | plain    |             |              |
+ name   | text    |           |          |         | extended |             |              | display name
+Access method: heap
+
+                  Object descriptions
+ Schema |      Name      | Object |     Description
+--------+----------------+--------+---------------------
+ public | comment_people | table  | people lookup table
+(1 row)
+
+COMMENT
+ nspname |    relname     | attname |     description
+---------+----------------+---------+---------------------
+ public  | comment_people |         | people lookup table
+(1 row)
+
+psql:305_protocol_psql_comments.sql:22: ERROR:  relation does not exist
+psql:305_protocol_psql_comments.sql:23: ERROR:  column does not exist
+psql:305_protocol_psql_comments.sql:24: ERROR:  query shape is not supported by the compatibility stub
