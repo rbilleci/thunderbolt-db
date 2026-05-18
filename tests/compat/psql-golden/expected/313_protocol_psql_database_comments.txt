@@ -1,0 +1,25 @@
+=== bounded database comments ===
+COMMENT
+                                                                      List of databases
+   Name   |  Owner   | Encoding | Locale Provider | Collate |  Ctype  | ICU Locale | ICU Rules | Access privileges |  Size   | Tablespace |   Description
+----------+----------+----------+-----------------+---------+---------+------------+-----------+-------------------+---------+------------+------------------
+ postgres | postgres | UTF8     | libc            | C.UTF-8 | C.UTF-8 |            |           |                   | 0 bytes | pg_default | primary database
+(1 row)
+
+ shobj_description
+-------------------
+ primary database
+(1 row)
+
+COMMENT
+                                                                   List of databases
+   Name   |  Owner   | Encoding | Locale Provider | Collate |  Ctype  | ICU Locale | ICU Rules | Access privileges |  Size   | Tablespace | Description
+----------+----------+----------+-----------------+---------+---------+------------+-----------+-------------------+---------+------------+-------------
+ postgres | postgres | UTF8     | libc            | C.UTF-8 | C.UTF-8 |            |           |                   | 0 bytes | pg_default |
+(1 row)
+
+psql:313_protocol_psql_database_comments.sql:7: ERROR:  database does not exist
+ one
+-----
+   1
+(1 row)

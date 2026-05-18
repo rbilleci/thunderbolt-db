@@ -13,6 +13,7 @@ use gpu_db_protocol::{
 use gpu_db_protocol::{DescribeTarget, SqlType};
 
 const PUBLIC_NAMESPACE_OID: u32 = 2200;
+const POSTGRES_DATABASE_OID: u32 = 5;
 const FIRST_USER_INDEX_OID: u32 = 20_000;
 static SHARED_CATALOG: OnceLock<Mutex<SharedCatalog>> = OnceLock::new();
 
@@ -1642,6 +1643,7 @@ struct CatalogIndex {
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum CatalogCommentTarget {
+    Database { database: String },
     Schema { schema: String },
     Table { table: String },
     Column { table: String, attnum: i16 },
@@ -5445,6 +5447,7 @@ fn execute_statement(
                 | CatalogCommentTarget::Column { table, .. }
                 | CatalogCommentTarget::Constraint { table, .. } => table == &drop.table,
                 CatalogCommentTarget::Index { index } => dropped_index_names.contains(index),
+                CatalogCommentTarget::Database { .. } => false,
                 CatalogCommentTarget::Schema { .. } => false,
                 CatalogCommentTarget::View { .. } => false,
             })
@@ -5650,7 +5653,19 @@ fn execute_statement(
         return write_single_row(
             stream,
             &pg_dump_database_metadata_columns(),
-            &pg_dump_database_metadata_rows(),
+            &pg_dump_database_metadata_rows(session),
+        );
+    }
+    if canonical == "select pg_catalog.shobj_description(5, 'pg_database')" {
+        return write_single_row(
+            stream,
+            &[text_column("shobj_description")],
+            &[vec![session
+                .comments
+                .get(&CatalogCommentTarget::Database {
+                    database: "postgres".to_string(),
+                })
+                .cloned()]],
         );
     }
     if is_pg_dump_index_metadata_query(&canonical) {
@@ -6029,7 +6044,8 @@ fn execute_statement(
                             CatalogCommentTarget::Constraint { constraint, .. } => {
                                 constraint == &drop.name
                             }
-                            CatalogCommentTarget::Schema { .. }
+                            CatalogCommentTarget::Database { .. }
+                            | CatalogCommentTarget::Schema { .. }
                             | CatalogCommentTarget::Table { .. }
                             | CatalogCommentTarget::Column { .. }
                             | CatalogCommentTarget::Index { .. }
@@ -6087,6 +6103,19 @@ fn execute_statement(
             }
             Command::CommentOn(comment) => {
                 let target = match comment.target {
+                    CommentTarget::Database { database } => {
+                        if database != "postgres" {
+                            return write_error(
+                                stream,
+                                &ErrorField {
+                                    code: "3D000",
+                                    message: "database does not exist",
+                                    position: None,
+                                },
+                            );
+                        }
+                        CatalogCommentTarget::Database { database }
+                    }
                     CommentTarget::Schema { schema } => {
                         if schema != "public" {
                             return write_error(
@@ -6967,7 +6996,27 @@ fn execute_statement(
                 text_column("ICU Rules"),
                 text_column("Access privileges"),
             ],
-            &catalog_psql_list_database_rows(),
+            &catalog_psql_list_database_rows(session),
+        );
+    }
+    if canonical == psql_list_databases_verbose_catalog_query() {
+        return write_single_row(
+            stream,
+            &[
+                text_column("Name"),
+                text_column("Owner"),
+                text_column("Encoding"),
+                text_column("Locale Provider"),
+                text_column("Collate"),
+                text_column("Ctype"),
+                text_column("ICU Locale"),
+                text_column("ICU Rules"),
+                text_column("Access privileges"),
+                text_column("Size"),
+                text_column("Tablespace"),
+                text_column("Description"),
+            ],
+            &catalog_psql_list_database_verbose_rows(session),
         );
     }
     if canonical == psql_list_tablespaces_catalog_query() {
@@ -7127,7 +7176,7 @@ fn execute_statement(
         return write_single_row(
             stream,
             &pg_dump_database_metadata_columns(),
-            &pg_dump_database_metadata_rows(),
+            &pg_dump_database_metadata_rows(session),
         );
     }
     if is_pg_dump_index_metadata_query(&canonical) {
@@ -8251,7 +8300,11 @@ fn psql_list_databases_catalog_query() -> &'static str {
     "select d.datname as \"name\", pg_catalog.pg_get_userbyid(d.datdba) as \"owner\", pg_catalog.pg_encoding_to_char(d.encoding) as \"encoding\", case d.datlocprovider when 'c' then 'libc' when 'i' then 'icu' end as \"locale provider\", d.datcollate as \"collate\", d.datctype as \"ctype\", d.daticulocale as \"icu locale\", d.daticurules as \"icu rules\", pg_catalog.array_to_string(d.datacl, e'\\n') as \"access privileges\" from pg_catalog.pg_database d order by 1"
 }
 
-fn catalog_psql_list_database_rows() -> Vec<Vec<Option<String>>> {
+fn psql_list_databases_verbose_catalog_query() -> &'static str {
+    "select d.datname as \"name\", pg_catalog.pg_get_userbyid(d.datdba) as \"owner\", pg_catalog.pg_encoding_to_char(d.encoding) as \"encoding\", case d.datlocprovider when 'c' then 'libc' when 'i' then 'icu' end as \"locale provider\", d.datcollate as \"collate\", d.datctype as \"ctype\", d.daticulocale as \"icu locale\", d.daticurules as \"icu rules\", pg_catalog.array_to_string(d.datacl, e'\\n') as \"access privileges\", case when pg_catalog.has_database_privilege(d.datname, 'connect') then pg_catalog.pg_size_pretty(pg_catalog.pg_database_size(d.datname)) else 'no access' end as \"size\", t.spcname as \"tablespace\", pg_catalog.shobj_description(d.oid, 'pg_database') as \"description\" from pg_catalog.pg_database d join pg_catalog.pg_tablespace t on d.dattablespace = t.oid order by 1"
+}
+
+fn catalog_psql_list_database_rows(_session: &Session) -> Vec<Vec<Option<String>>> {
     vec![vec![
         Some("postgres".to_string()),
         Some("postgres".to_string()),
@@ -8262,6 +8315,28 @@ fn catalog_psql_list_database_rows() -> Vec<Vec<Option<String>>> {
         None,
         None,
         None,
+    ]]
+}
+
+fn catalog_psql_list_database_verbose_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    vec![vec![
+        Some("postgres".to_string()),
+        Some("postgres".to_string()),
+        Some("UTF8".to_string()),
+        Some("libc".to_string()),
+        Some("C.UTF-8".to_string()),
+        Some("C.UTF-8".to_string()),
+        None,
+        None,
+        None,
+        Some("0 bytes".to_string()),
+        Some("pg_default".to_string()),
+        session
+            .comments
+            .get(&CatalogCommentTarget::Database {
+                database: "postgres".to_string(),
+            })
+            .cloned(),
     ]]
 }
 
@@ -9581,10 +9656,10 @@ fn pg_dump_database_metadata_columns() -> Vec<Column> {
     ]
 }
 
-fn pg_dump_database_metadata_rows() -> Vec<Vec<Option<String>>> {
+fn pg_dump_database_metadata_rows(session: &Session) -> Vec<Vec<Option<String>>> {
     vec![vec![
         Some("1262".to_string()),
-        Some("5".to_string()),
+        Some(POSTGRES_DATABASE_OID.to_string()),
         Some("postgres".to_string()),
         Some("10".to_string()),
         Some("UTF8".to_string()),
@@ -9601,7 +9676,12 @@ fn pg_dump_database_metadata_rows() -> Vec<Vec<Option<String>>> {
         None,
         None,
         Some("pg_default".to_string()),
-        None,
+        session
+            .comments
+            .get(&CatalogCommentTarget::Database {
+                database: "postgres".to_string(),
+            })
+            .cloned(),
     ]]
 }
 
@@ -10907,7 +10987,8 @@ fn pg_dump_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
         .iter()
         .filter_map(|(target, description)| match target {
             CatalogCommentTarget::Index { index } => Some((index, description)),
-            CatalogCommentTarget::Schema { .. }
+            CatalogCommentTarget::Database { .. }
+            | CatalogCommentTarget::Schema { .. }
             | CatalogCommentTarget::Table { .. }
             | CatalogCommentTarget::Column { .. }
             | CatalogCommentTarget::View { .. }
@@ -10932,7 +11013,8 @@ fn pg_dump_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
             CatalogCommentTarget::Constraint { table, constraint } => {
                 Some((table, constraint, description))
             }
-            CatalogCommentTarget::Schema { .. }
+            CatalogCommentTarget::Database { .. }
+            | CatalogCommentTarget::Schema { .. }
             | CatalogCommentTarget::Table { .. }
             | CatalogCommentTarget::Column { .. }
             | CatalogCommentTarget::View { .. }
@@ -14617,7 +14699,11 @@ mod tests {
             "select d.datname as \"name\", pg_catalog.pg_get_userbyid(d.datdba) as \"owner\", pg_catalog.pg_encoding_to_char(d.encoding) as \"encoding\", case d.datlocprovider when 'c' then 'libc' when 'i' then 'icu' end as \"locale provider\", d.datcollate as \"collate\", d.datctype as \"ctype\", d.daticulocale as \"icu locale\", d.daticurules as \"icu rules\", pg_catalog.array_to_string(d.datacl, e'\\n') as \"access privileges\" from pg_catalog.pg_database d order by 1"
         );
         assert_eq!(
-            catalog_psql_list_database_rows(),
+            psql_list_databases_verbose_catalog_query(),
+            "select d.datname as \"name\", pg_catalog.pg_get_userbyid(d.datdba) as \"owner\", pg_catalog.pg_encoding_to_char(d.encoding) as \"encoding\", case d.datlocprovider when 'c' then 'libc' when 'i' then 'icu' end as \"locale provider\", d.datcollate as \"collate\", d.datctype as \"ctype\", d.daticulocale as \"icu locale\", d.daticurules as \"icu rules\", pg_catalog.array_to_string(d.datacl, e'\\n') as \"access privileges\", case when pg_catalog.has_database_privilege(d.datname, 'connect') then pg_catalog.pg_size_pretty(pg_catalog.pg_database_size(d.datname)) else 'no access' end as \"size\", t.spcname as \"tablespace\", pg_catalog.shobj_description(d.oid, 'pg_database') as \"description\" from pg_catalog.pg_database d join pg_catalog.pg_tablespace t on d.dattablespace = t.oid order by 1"
+        );
+        assert_eq!(
+            catalog_psql_list_database_rows(&Session::default()),
             vec![vec![
                 Some("postgres".to_string()),
                 Some("postgres".to_string()),
@@ -14629,6 +14715,17 @@ mod tests {
                 None,
                 None,
             ]]
+        );
+        let mut commented_database = Session::default();
+        commented_database.comments.insert(
+            CatalogCommentTarget::Database {
+                database: "postgres".to_string(),
+            },
+            "primary database".to_string(),
+        );
+        assert_eq!(
+            catalog_psql_list_database_verbose_rows(&commented_database)[0][11],
+            Some("primary database".to_string())
         );
         assert_eq!(
             psql_list_tablespaces_catalog_query(),
@@ -20871,8 +20968,19 @@ mod tests {
             pg_dump_database_metadata_query()
         );
         assert_eq!(
-            pg_dump_database_metadata_rows()[0][2],
+            pg_dump_database_metadata_rows(&Session::default())[0][2],
             Some("postgres".to_string())
+        );
+        let mut session = Session::default();
+        session.comments.insert(
+            CatalogCommentTarget::Database {
+                database: "postgres".to_string(),
+            },
+            "primary database".to_string(),
+        );
+        assert_eq!(
+            pg_dump_database_metadata_rows(&session)[0][18],
+            Some("primary database".to_string())
         );
     }
 
@@ -20968,6 +21076,12 @@ mod tests {
     #[test]
     fn catalog_queries_expose_table_and_column_comments() {
         let mut session = Session::default();
+        session.comments.insert(
+            CatalogCommentTarget::Database {
+                database: "postgres".to_string(),
+            },
+            "primary database".to_string(),
+        );
         session.comments.insert(
             CatalogCommentTarget::Schema {
                 schema: "public".to_string(),

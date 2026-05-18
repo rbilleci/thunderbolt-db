@@ -669,6 +669,10 @@ Post-closeout CUDA gap closure:
 - Progress on 2026-05-11: native distinct/intersect/except/symmetric-difference sources whose children are already CUDA-resolvable now select each child through CUDA source/visibility masks before preserving the existing host set/multiset semantics and downstream CUDA filter/order/projection path. Follow-up closeout coverage now enumerates every current native set/multiset variant (`ConcatDistinct`, `IntersectDistinct`, `IntersectAll`, `ExceptDistinct`, `ExceptAll`, `SymmetricDifferenceDistinct`, `SymmetricDifferenceAll`) through the classifier, backend-swap parity path, and local CUDA regression. This removes the correctness-routing gap for native composition children without pretending the set algebra itself is device-side; remaining work is performance-only native device-side set/multiset algebra if a future benchmark target requires it.
 - Progress on 2026-05-11: native `Concat` now accepts any CUDA-resolvable child, including nested distinct/intersect/except/symmetric-difference composition, by resolving each child through CUDA source/visibility masks before applying the existing concat fan-in/order/limit/projection path. The mixed MVCC CUDA benchmark fixture now has 100% GPU execution and 0% CPU fallback for its current scan/concat/nested-composition mix; remaining set/multiset work is still performance-only device-side algebra if a future benchmark target requires it.
 
+## Catalog Follow-Up Notes
+
+- 2026-05-18: Real psql golden scenario 313 proves bounded `COMMENT ON DATABASE postgres` metadata through `psql \l+`, `pg_catalog.shobj_description(..., 'pg_database')`, pg-dump database metadata, cleanup, unsupported-database recovery, and engine WAL replay. Broader shared-object comments remain out of scope.
+
 ## First CUDA transition slice (once NVIDIA hardware is available)
 
 This section records the already-started first slice. Future loop runs should treat it as gate-0/bootstrap evidence for the CUDA completion loop above, not as the full roadmap.
