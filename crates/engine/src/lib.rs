@@ -7067,6 +7067,16 @@ fn current_timestamp_micros() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableWalArchiveRetentionWindowPlan {
+    pub current_timestamp_micros: u64,
+    pub pitr_window_micros: u64,
+    pub cutoff_timestamp_micros: u64,
+    pub base_txn_id: TxnId,
+    pub base_timestamp_micros: u64,
+    pub retention_plan: WalArchiveRetentionPlan,
+}
+
 impl Engine {
     pub fn new_local() -> Self {
         Self::with_planner_config(PlannerConfig::default())
@@ -11731,6 +11741,95 @@ impl Engine {
             )
         })?;
         apply_wal_archive_retention_from_txn(manifest_path, base_last_txn_id)
+    }
+
+    pub fn plan_durable_wal_archive_retention_from_checkpoint_window(
+        control_path: impl AsRef<std::path::Path>,
+        manifest_path: impl AsRef<std::path::Path>,
+        current_timestamp_micros: u64,
+        pitr_window_micros: u64,
+    ) -> Result<DurableWalArchiveRetentionWindowPlan, EngineError> {
+        let control_path = control_path.as_ref();
+        let manifest_path = manifest_path.as_ref();
+        let cutoff_timestamp_micros = current_timestamp_micros
+            .checked_sub(pitr_window_micros)
+            .ok_or_else(|| {
+                EngineError::Durability(format!(
+                    "PITR retention window {pitr_window_micros} exceeds current timestamp {current_timestamp_micros}"
+                ))
+            })?;
+        let (control, base_records) = read_wal_checkpoint(control_path)?;
+        let (manifest, archive_records) = read_wal_archive(manifest_path)?;
+        Self::validate_checkpoint_archive_overlap(&control, &base_records, &archive_records)?;
+        let base_txn_id = control.checkpoint.last_durable_txn_id.ok_or_else(|| {
+            EngineError::Durability(
+                "base backup checkpoint has no durable transaction boundary".to_string(),
+            )
+        })?;
+        if manifest.record_timestamps.is_empty() {
+            return Err(EngineError::Durability(format!(
+                "WAL archive {} has no timestamp metadata for PITR-window retention",
+                manifest_path.display()
+            )));
+        }
+        let last_timestamp_micros = manifest
+            .record_timestamps
+            .last()
+            .map(|timestamp| timestamp.timestamp_micros)
+            .unwrap_or_default();
+        if current_timestamp_micros < last_timestamp_micros {
+            return Err(EngineError::Durability(format!(
+                "PITR retention current timestamp {current_timestamp_micros} is before last archived timestamp {last_timestamp_micros}"
+            )));
+        }
+        let base_timestamp_micros = manifest
+            .record_timestamps
+            .iter()
+            .find(|timestamp| timestamp.txn_id == base_txn_id)
+            .map(|timestamp| timestamp.timestamp_micros)
+            .ok_or_else(|| {
+                EngineError::Durability(format!(
+                    "WAL archive {} has no timestamp metadata for base checkpoint transaction {}",
+                    manifest_path.display(),
+                    base_txn_id
+                ))
+            })?;
+        if base_timestamp_micros > cutoff_timestamp_micros {
+            return Err(EngineError::Durability(format!(
+                "base checkpoint transaction {base_txn_id} timestamp {base_timestamp_micros} is newer than PITR retention cutoff {cutoff_timestamp_micros}"
+            )));
+        }
+
+        let retention_plan = plan_wal_archive_retention_from_txn(manifest_path, base_txn_id)?;
+        Ok(DurableWalArchiveRetentionWindowPlan {
+            current_timestamp_micros,
+            pitr_window_micros,
+            cutoff_timestamp_micros,
+            base_txn_id,
+            base_timestamp_micros,
+            retention_plan,
+        })
+    }
+
+    pub fn apply_durable_wal_archive_retention_from_checkpoint_window(
+        control_path: impl AsRef<std::path::Path>,
+        manifest_path: impl AsRef<std::path::Path>,
+        current_timestamp_micros: u64,
+        pitr_window_micros: u64,
+    ) -> Result<DurableWalArchiveRetentionWindowPlan, EngineError> {
+        let control_path = control_path.as_ref();
+        let manifest_path = manifest_path.as_ref();
+        let plan = Self::plan_durable_wal_archive_retention_from_checkpoint_window(
+            control_path,
+            manifest_path,
+            current_timestamp_micros,
+            pitr_window_micros,
+        )?;
+        let retention_plan = apply_wal_archive_retention_from_txn(manifest_path, plan.base_txn_id)?;
+        Ok(DurableWalArchiveRetentionWindowPlan {
+            retention_plan,
+            ..plan
+        })
     }
 
     pub fn checkpoint_vacuum_mvcc_versions(
@@ -31127,6 +31226,148 @@ mod tests {
 
         assert!(err.to_string().contains("prefix does not match"));
         assert_eq!(after_manifest, original_manifest);
+    }
+
+    #[test]
+    fn checkpoint_window_archive_retention_preserves_pitr_recovery() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpu-db-engine-checkpoint-window-retention-{}-{}",
+            std::process::id(),
+            NEXT_TEST_WAL_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let control_path = dir.join("base").join("CONTROL");
+        let base_segment_path = dir.join("base").join("base.wal");
+        let manifest_path = dir.join("archive").join("MANIFEST");
+        let segment_dir = dir.join("archive").join("segments");
+        let mut e = Engine::new_local();
+        e.execute_text_at_timestamp_micros(1, "CREATE TABLE people (id INT, name TEXT)", 1_000)
+            .unwrap();
+        e.execute_text_at_timestamp_micros(
+            2,
+            "INSERT INTO people (id, name) VALUES (1, 'Ada')",
+            2_000,
+        )
+        .unwrap();
+        e.persist_durable_wal_checkpoint(&control_path, &base_segment_path)
+            .unwrap();
+        e.execute_text_at_timestamp_micros(
+            3,
+            "INSERT INTO people (id, name) VALUES (2, 'Grace')",
+            3_000,
+        )
+        .unwrap();
+        e.execute_text_at_timestamp_micros(
+            4,
+            "INSERT INTO people (id, name) VALUES (3, 'Katherine')",
+            4_000,
+        )
+        .unwrap();
+        e.execute_text_at_timestamp_micros(
+            5,
+            "INSERT INTO people (id, name) VALUES (4, 'Dorothy')",
+            5_000,
+        )
+        .unwrap();
+
+        e.persist_durable_wal_archive(&manifest_path, &segment_dir, 1)
+            .unwrap();
+        let plan = Engine::apply_durable_wal_archive_retention_from_checkpoint_window(
+            &control_path,
+            &manifest_path,
+            6_000,
+            3_000,
+        )
+        .unwrap();
+        let mut recovered = Engine::recover_from_durable_wal_checkpoint_and_archive_to_txn(
+            &control_path,
+            &manifest_path,
+            4,
+        )
+        .unwrap();
+        let mut timestamp_recovered =
+            Engine::recover_from_durable_wal_checkpoint_and_archive_to_timestamp_micros(
+                &control_path,
+                &manifest_path,
+                4_000,
+            )
+            .unwrap();
+
+        assert_eq!(plan.cutoff_timestamp_micros, 3_000);
+        assert_eq!(plan.base_txn_id, 2);
+        assert_eq!(plan.base_timestamp_micros, 2_000);
+        assert_eq!(plan.retention_plan.retained_record_count, 4);
+        assert_eq!(plan.retention_plan.removed_record_count, 1);
+        assert_eq!(recovered.wal_flushed_count(), 4);
+        assert_eq!(timestamp_recovered.wal_flushed_count(), 4);
+
+        let Command::Select(grace_select) =
+            parse_command("SELECT id FROM people WHERE name = 'Grace'").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let grace_result = recovered.execute_relational_select(&grace_select).unwrap();
+        assert_eq!(grace_result.rows, vec![vec![SqlValue::Int4(2)]]);
+        let timestamp_grace = timestamp_recovered
+            .execute_relational_select(&grace_select)
+            .unwrap();
+        assert_eq!(timestamp_grace.rows, vec![vec![SqlValue::Int4(2)]]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn checkpoint_window_archive_retention_rejects_unsafe_recent_base_without_mutation() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpu-db-engine-checkpoint-window-retention-reject-{}-{}",
+            std::process::id(),
+            NEXT_TEST_WAL_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let control_path = dir.join("base").join("CONTROL");
+        let base_segment_path = dir.join("base").join("base.wal");
+        let manifest_path = dir.join("archive").join("MANIFEST");
+        let segment_dir = dir.join("archive").join("segments");
+        let mut e = Engine::new_local();
+        e.execute_text_at_timestamp_micros(1, "CREATE TABLE people (id INT, name TEXT)", 1_000)
+            .unwrap();
+        e.execute_text_at_timestamp_micros(
+            2,
+            "INSERT INTO people (id, name) VALUES (1, 'Ada')",
+            2_000,
+        )
+        .unwrap();
+        e.execute_text_at_timestamp_micros(
+            3,
+            "INSERT INTO people (id, name) VALUES (2, 'Grace')",
+            3_000,
+        )
+        .unwrap();
+        e.persist_durable_wal_checkpoint(&control_path, &base_segment_path)
+            .unwrap();
+        e.execute_text_at_timestamp_micros(
+            4,
+            "INSERT INTO people (id, name) VALUES (3, 'Katherine')",
+            4_000,
+        )
+        .unwrap();
+
+        e.persist_durable_wal_archive(&manifest_path, &segment_dir, 1)
+            .unwrap();
+        let original_manifest = std::fs::read_to_string(&manifest_path).unwrap();
+        let first_segment = segment_dir.join("segment-0001.wal");
+        let err = match Engine::apply_durable_wal_archive_retention_from_checkpoint_window(
+            &control_path,
+            &manifest_path,
+            4_000,
+            2_000,
+        ) {
+            Ok(_) => panic!("expected unsafe recent base error"),
+            Err(err) => err,
+        };
+        let after_manifest = std::fs::read_to_string(&manifest_path).unwrap();
+
+        assert!(err.to_string().contains("newer than PITR retention cutoff"));
+        assert_eq!(after_manifest, original_manifest);
+        assert!(first_segment.exists());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
