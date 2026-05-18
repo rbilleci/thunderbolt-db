@@ -133,14 +133,15 @@ Current implemented scope:
 - `scripts/run_replication_container_restart_smoke.sh` reuses that local Docker image path to start two follower containers, restart one follower container, replay the full durable prefix into the restarted container while a second container remains live, and verify both containers catch up before controlled shutdown.
 - `scripts/run_replication_compose_restart_smoke.sh` builds the same local Docker image, starts two follower services from `docker/replication-service/compose-smoke.yml`, restarts one service through `docker compose restart`, re-discovers its published port, replays the full durable prefix into the restarted service while a second service remains live, and verifies both services catch up before Compose teardown.
 - `scripts/run_replication_systemd_verify.sh` builds the same follower service binary, validates `systemd/replication-follower/gpu-db-replication-follower@.service` with `systemd-analyze`, and checks the instance environment examples preserve the follower id / expected request count / listen address command contract.
+- `scripts/run_replication_kubernetes_verify.sh` builds the same follower service binary and validates `k8s/replication-service/follower-services.yml` as two follower Deployments plus two Services that preserve the follower id / expected request count / listen address / append port command contract. If `kubectl` exists locally, the script also runs a client-side dry-run; otherwise it reports manifest-contract-only evidence.
 - The scenario demonstrates leader write admission, typed append-entries request/response handling with a tested binary frame codec and single-request TCP send/serve helper, follower catch-up, read-after-apply, deterministic request-vote election before failover, old-leader `NotLeader` rejection after failover, and continued writes on the elected leader.
 - The smoke commands emit an `operational_deployment_preflight=passed` line only when the smoke proof passes and the current TCP append-entries transport evidence, deterministic election evidence, packaged-local entrypoint evidence, deployment scope, and gap status are explicitly reported.
 
 Current simulated/not-yet-implemented scope:
 
-- No live production service manager or daemon supervision. The implemented packaging proofs are reproducible local binary, Docker, Docker Compose, and systemd-artifact validation harnesses, including bounded multi-process parent/follower, long-running follower-service, service restart-plus-replay, container deployment, container restart-plus-replay, Compose-managed restart-plus-replay, and checked systemd unit/environment command-contract proofs.
+- No live production service manager or daemon supervision. The implemented packaging proofs are reproducible local binary, Docker, Docker Compose, systemd-artifact, and Kubernetes-manifest validation harnesses, including bounded multi-process parent/follower, long-running follower-service, service restart-plus-replay, container deployment, container restart-plus-replay, Compose-managed restart-plus-replay, checked systemd unit/environment command-contract proofs, and checked Kubernetes Deployment/Service command-contract proofs.
 - No membership reconfiguration. The current election proof is deterministic request-vote voting inside the local smoke harness, not a timer-driven production election loop.
-- No Kubernetes deployment harness. The local Docker smoke is a bounded packaging proof, not a production orchestration contract.
+- No live Kubernetes deployment harness. The checked Kubernetes manifests are a local artifact contract for the existing follower service, not a production rollout, readiness/liveness probe, storage, or service-discovery proof.
 
 Run from repository root:
 
@@ -154,6 +155,7 @@ scripts/run_replication_container_smoke.sh
 scripts/run_replication_container_restart_smoke.sh
 scripts/run_replication_compose_restart_smoke.sh
 scripts/run_replication_systemd_verify.sh
+scripts/run_replication_kubernetes_verify.sh
 ```
 
 Pass criteria:
@@ -176,6 +178,7 @@ Pass criteria:
 - Container-restart smoke output includes `operational_replication_container_restart_smoke=host_parent_passed`, `container_restart_transport=tcp_append_entries`, the restarted follower container reporting catch-up before and after restart, `container_restart_replay=full_durable_prefix_after_restart`, `deployment_gap_container_restart_supervision=implemented_bounded_local_smoke`, and explicit missing lines for production supervision and Kubernetes deployment.
 - Compose-restart smoke output includes `operational_replication_compose_restart_smoke=host_parent_passed`, `compose_restart_transport=tcp_append_entries`, the restarted Compose service reporting catch-up before and after restart, `compose_restart_replay=full_durable_prefix_after_restart`, `deployment_gap_compose_restart_supervision=implemented_bounded_local_smoke`, and explicit missing lines for production supervision and Kubernetes deployment.
 - Systemd verification output includes `operational_replication_systemd_verify=passed`, the checked unit and environment file paths, `systemd_service_contract=follower_service id_expected_requests_listen`, `deployment_gap_production_service_manager=implemented_unit_syntax_and_command_contract`, and explicit missing lines for live systemd supervision and Kubernetes deployment.
+- Kubernetes verification output includes `operational_replication_kubernetes_verify=passed`, the checked manifest path, `kubernetes_service_contract=follower_service id_expected_requests_listen_append_port`, `deployment_gap_kubernetes_deployment=implemented_manifest_contract`, and `deployment_gap_live_kubernetes_rollout=missing`.
 
 ## 5) CPU Fallback Monitoring (No-GPU bootstrap)
 

@@ -2028,6 +2028,39 @@ mod tests {
     }
 
     #[test]
+    fn operational_replication_kubernetes_manifest_contract_matches_follower_service() {
+        let manifest = include_str!("../../../k8s/replication-service/follower-services.yml");
+
+        for follower_id in ["2", "3"] {
+            assert!(manifest.contains(&format!("name: gpu-db-replication-follower-{follower_id}")));
+            assert!(manifest.contains(&format!(
+                "gpu-db.openclaw.dev/follower-id: \"{follower_id}\""
+            )));
+            assert!(manifest.contains(&format!(
+                "- name: GPU_DB_REPLICATION_FOLLOWER_ID\n              value: \"{follower_id}\""
+            )));
+        }
+        assert!(manifest.contains("kind: Deployment"));
+        assert!(manifest.contains("kind: Service"));
+        assert!(manifest.contains("image: gpu-db-replication-service:local"));
+        assert!(manifest.contains("imagePullPolicy: IfNotPresent"));
+        assert!(manifest.contains("- --follower-service"));
+        assert!(manifest.contains("- --id"));
+        assert!(manifest.contains("- $(GPU_DB_REPLICATION_FOLLOWER_ID)"));
+        assert!(manifest.contains("- --expected-requests"));
+        assert!(manifest.contains("- $(GPU_DB_REPLICATION_EXPECTED_REQUESTS)"));
+        assert!(manifest.contains("- --listen"));
+        assert!(manifest.contains("- $(GPU_DB_REPLICATION_LISTEN_ADDR)"));
+        assert!(manifest
+            .contains("- name: GPU_DB_REPLICATION_EXPECTED_REQUESTS\n              value: \"4\""));
+        assert!(manifest.contains(
+            "- name: GPU_DB_REPLICATION_LISTEN_ADDR\n              value: 0.0.0.0:55432"
+        ));
+        assert!(manifest.contains("containerPort: 55432"));
+        assert!(manifest.contains("targetPort: append"));
+    }
+
+    #[test]
     fn request_vote_elects_up_to_date_candidate_and_rejects_stale_log() {
         let mut leader = RaftReplicator::new(3);
         let mut up_to_date = RaftReplicator::new(3);
