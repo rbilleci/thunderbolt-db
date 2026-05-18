@@ -123,6 +123,26 @@ impl CudaResidentDeviceMemory {
         launch_cuda_resident_i32_equal_count(self, byte_offset, row_count, needle)
     }
 
+    pub fn count_i32_in_from_payload(
+        &self,
+        byte_offset: u64,
+        row_count: u64,
+        needles: &[i32],
+    ) -> Result<u64, CudaRuntimeProbeError> {
+        let mut total = 0_u64;
+        for needle in needles {
+            total = total
+                .checked_add(launch_cuda_resident_i32_equal_count(
+                    self,
+                    byte_offset,
+                    row_count,
+                    *needle,
+                )?)
+                .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        }
+        Ok(total)
+    }
+
     pub fn count_i32_compare_from_payload(
         &self,
         byte_offset: u64,

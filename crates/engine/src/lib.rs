@@ -8141,6 +8141,128 @@ impl Engine {
         })
     }
 
+    pub fn execute_relational_membership_count_with_resident_device_memory_probe(
+        &mut self,
+        select: &Select,
+    ) -> Result<RelationalSelectResult, ExecuteError> {
+        let (table, bound) = self.bind_relational_select_for_execution(select)?;
+        if select.distinct
+            || !matches!(select.projection, SelectProjection::CountAll)
+            || select.group_by.is_some()
+            || !select.having_groups.is_empty()
+            || select.order_by.is_some()
+            || select.limit.is_some()
+            || select.offset.is_some()
+            || bound.filter_groups.len() < 2
+        {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory membership count proof currently supports only SELECT COUNT(*) with one int4 IN membership predicate"
+                    .to_string(),
+            )));
+        }
+
+        let mut filter_idx = None;
+        let mut needles = BTreeSet::new();
+        for group in &bound.filter_groups {
+            if group.len() != 1 {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "resident device-memory membership count proof currently supports only one int4 IN membership predicate"
+                        .to_string(),
+                )));
+            }
+            let (idx, op, value) = group[0].clone();
+            if op != SelectFilterOp::Eq {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "resident device-memory membership count proof currently supports only int4 equality membership predicates"
+                        .to_string(),
+                )));
+            }
+            if filter_idx
+                .replace(idx)
+                .is_some_and(|existing| existing != idx)
+            {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "resident device-memory membership count proof requires all membership values to target the same column"
+                        .to_string(),
+                )));
+            }
+            let SqlValue::Int4(needle) = value else {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "resident device-memory membership count proof currently supports only int4 membership literals"
+                        .to_string(),
+                )));
+            };
+            needles.insert(needle);
+        }
+        let filter_idx = filter_idx.ok_or_else(|| {
+            ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory membership count proof requires at least one membership literal"
+                    .to_string(),
+            ))
+        })?;
+        if table.columns[filter_idx].ty != SqlType::Int4 {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory membership count proof currently supports only int4 membership predicates"
+                    .to_string(),
+            )));
+        }
+
+        let (_query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
+        let snapshot = self
+            .relational_residency_snapshot(&table.name)
+            .ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "relation \"{}\" has no resident snapshot",
+                    table.name
+                )))
+            })?;
+        if snapshot.schema != table.schema || snapshot.table != table.name {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident snapshot no longer matches catalog table identity".to_string(),
+            )));
+        }
+        if !snapshot.is_valid() {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "relation \"{}\" resident snapshot is invalid",
+                table.name
+            ))));
+        }
+        let device_memory = self
+            .relational_residency_device_memory
+            .get(&table.name)
+            .ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "relation \"{}\" has no retained resident device memory",
+                    table.name
+                )))
+            })?;
+        let byte_offset = resident_device_int4_column_offset(&snapshot, &table, filter_idx)?;
+        let row_count = u64::try_from(snapshot.row_count).map_err(|_| {
+            ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident snapshot row count exceeds retained device-memory proof range"
+                    .to_string(),
+            ))
+        })?;
+        let needles = needles.into_iter().collect::<Vec<_>>();
+        let membership_count = device_memory
+            .count_i32_in_from_payload(byte_offset, row_count, &needles)
+            .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
+        let count = i32::try_from(membership_count).map_err(|_| {
+            ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "resident device-memory membership count {membership_count} exceeds supported COUNT(*) result range"
+            )))
+        })?;
+
+        Ok(RelationalSelectResult {
+            columns: bound.selected_columns,
+            rows: vec![vec![SqlValue::Int4(count)]],
+            planned_target: DeviceTarget::Gpu(snapshot.gpu_id),
+            executed_target: DeviceTarget::Gpu(snapshot.gpu_id),
+            fallback_reason: None,
+            access_path,
+        })
+    }
+
     pub fn execute_relational_range_count_with_resident_device_memory_probe(
         &mut self,
         select: &Select,
@@ -13399,6 +13521,19 @@ mod tests {
             .to_string();
         assert!(err.contains("has no retained resident device memory"));
 
+        let Command::Select(membership_select) =
+            parse_command("SELECT COUNT(*) FROM events WHERE id IN (1, 2)").unwrap()
+        else {
+            unreachable!()
+        };
+        let err = e
+            .execute_relational_membership_count_with_resident_device_memory_probe(
+                &membership_select,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("has no retained resident device memory"));
+
         let Command::Select(range_select) =
             parse_command("SELECT COUNT(*) FROM events WHERE id >= 1").unwrap()
         else {
@@ -14039,6 +14174,89 @@ mod tests {
             .execute_relational_filtered_grouped_aggregate_with_resident_device_memory_probe(
                 &select
             )
+            .unwrap_err()
+            .to_string()
+            .contains("resident snapshot is invalid"));
+    }
+
+    #[test]
+    fn gpu_resident_device_memory_membership_count_probe_materializes_int4_results() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE events (id INT, label TEXT, amount INT)")
+            .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO events (id, label, amount) VALUES (1, 'alpha', 10), (2, 'beta', 30), (1, 'gamma', 20), (3, 'delta', 40), (4, 'epsilon', 5)",
+        )
+        .unwrap();
+        let snapshot = e.populate_relational_residency_snapshot("events").unwrap();
+        if snapshot.device_memory_proof.is_none() {
+            return;
+        }
+
+        for sql in [
+            "SELECT COUNT(*) FROM events WHERE id IN (1, 3, 99)",
+            "SELECT COUNT(*) FROM events WHERE id IN (1, 1, 3)",
+        ] {
+            let Command::Select(select) = parse_command(sql).unwrap() else {
+                unreachable!()
+            };
+            let cpu = e.execute_relational_select(&select).unwrap();
+            let before = e.metrics().snapshot();
+            let resident = e
+                .execute_relational_membership_count_with_resident_device_memory_probe(&select)
+                .unwrap();
+            let after = e.metrics().snapshot();
+
+            assert_eq!(resident.columns, cpu.columns, "{sql}");
+            assert_eq!(resident.rows, cpu.rows, "{sql}");
+            assert_eq!(resident.planned_target, DeviceTarget::Gpu(0));
+            assert_eq!(resident.executed_target, DeviceTarget::Gpu(0));
+            assert_eq!(resident.fallback_reason, None);
+            assert_eq!(after.h2d_bytes_total - before.h2d_bytes_total, 0);
+        }
+
+        let Command::Select(text_membership) =
+            parse_command("SELECT COUNT(*) FROM events WHERE label IN ('alpha', 'delta')").unwrap()
+        else {
+            unreachable!()
+        };
+        let err = e
+            .execute_relational_membership_count_with_resident_device_memory_probe(&text_membership)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("supports only int4 membership literals"));
+
+        let Command::Select(cross_column) =
+            parse_command("SELECT COUNT(*) FROM events WHERE id = 1 OR amount = 40").unwrap()
+        else {
+            unreachable!()
+        };
+        let err = e
+            .execute_relational_membership_count_with_resident_device_memory_probe(&cross_column)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("requires all membership values to target the same column"));
+
+        let Command::Select(equality_only) =
+            parse_command("SELECT COUNT(*) FROM events WHERE id = 1").unwrap()
+        else {
+            unreachable!()
+        };
+        let err = e
+            .execute_relational_membership_count_with_resident_device_memory_probe(&equality_only)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("one int4 IN membership predicate"));
+
+        e.mark_gpu_memory_pressured(0);
+        let Command::Select(select) =
+            parse_command("SELECT COUNT(*) FROM events WHERE id IN (1, 3)").unwrap()
+        else {
+            unreachable!()
+        };
+        assert!(e
+            .execute_relational_membership_count_with_resident_device_memory_probe(&select)
             .unwrap_err()
             .to_string()
             .contains("resident snapshot is invalid"));
