@@ -1349,9 +1349,16 @@ struct Cursor {
 struct CopyInState {
     table: String,
     columns: Vec<String>,
+    format: CopyFormat,
     pending_text: String,
     pending_rows: Vec<Vec<SqlValue>>,
     seen_terminator: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CopyFormat {
+    Text,
+    Csv,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -4021,13 +4028,17 @@ fn is_copy_statement(statement: &str) -> bool {
         .is_some_and(|statement| canonical_sql(statement).starts_with("copy "))
 }
 
-fn parse_copy_to_stdout_table(statement: &str) -> Option<String> {
+fn parse_copy_to_stdout_table(statement: &str) -> Option<(String, CopyFormat)> {
     let statement = strip_leading_sql_comments(statement.trim())?;
     let canonical = canonical_sql(statement);
-    let target = canonical
-        .strip_prefix("copy ")?
-        .strip_suffix(" to stdout")?
-        .trim();
+    let mut target = canonical.strip_prefix("copy ")?.trim();
+    let format = if let Some(before_options) = target.strip_suffix(" to stdout with csv") {
+        target = before_options.trim();
+        CopyFormat::Csv
+    } else {
+        target = target.strip_suffix(" to stdout")?.trim();
+        CopyFormat::Text
+    };
     let table = if let Some(open) = target.find('(') {
         let close = target.rfind(')')?;
         if close <= open || !target[close + 1..].trim().is_empty() {
@@ -4055,16 +4066,23 @@ fn parse_copy_to_stdout_table(statement: &str) -> Option<String> {
     {
         return None;
     }
-    Some(table.strip_prefix("public.").unwrap_or(table).to_string())
+    Some((
+        table.strip_prefix("public.").unwrap_or(table).to_string(),
+        format,
+    ))
 }
 
-fn parse_copy_from_stdin(statement: &str) -> Option<(String, Option<Vec<String>>)> {
+fn parse_copy_from_stdin(statement: &str) -> Option<(String, Option<Vec<String>>, CopyFormat)> {
     let statement = strip_leading_sql_comments(statement.trim())?;
     let canonical = canonical_sql(statement);
-    let target = canonical
-        .strip_prefix("copy ")?
-        .strip_suffix(" from stdin")?
-        .trim();
+    let mut target = canonical.strip_prefix("copy ")?.trim();
+    let format = if let Some(before_options) = target.strip_suffix(" from stdin with csv") {
+        target = before_options.trim();
+        CopyFormat::Csv
+    } else {
+        target = target.strip_suffix(" from stdin")?.trim();
+        CopyFormat::Text
+    };
     let (table, columns) = if let Some(open) = target.find('(') {
         let close = target.rfind(')')?;
         if close <= open || !target[close + 1..].trim().is_empty() {
@@ -4093,6 +4111,7 @@ fn parse_copy_from_stdin(statement: &str) -> Option<(String, Option<Vec<String>>
     Some((
         table.strip_prefix("public.").unwrap_or(table).to_string(),
         columns,
+        format,
     ))
 }
 
@@ -4164,6 +4183,15 @@ fn copy_text_value(value: &SqlValue) -> String {
         .replace('\r', r"\r")
 }
 
+fn copy_csv_value(value: &SqlValue) -> String {
+    let text = format_sql_value(value);
+    if text.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", text.replace('"', "\"\""))
+    } else {
+        text
+    }
+}
+
 fn parse_copy_text_value(input: &str, ty: SqlType) -> Result<SqlValue, ErrorField> {
     if input == r"\N" {
         return Err(ErrorField {
@@ -4215,10 +4243,100 @@ fn decode_copy_text(input: &str) -> Result<String, ErrorField> {
     Ok(output)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct CopyCsvField {
+    text: String,
+    quoted: bool,
+}
+
+fn parse_copy_csv_row(line: &str) -> Result<Vec<CopyCsvField>, ErrorField> {
+    let mut fields = Vec::new();
+    let mut field = String::new();
+    let mut chars = line.chars().peekable();
+    let mut quoted = false;
+    let mut in_quotes = false;
+    let mut after_quote = false;
+
+    while let Some(ch) = chars.next() {
+        if in_quotes {
+            if ch == '"' {
+                if matches!(chars.peek(), Some('"')) {
+                    chars.next();
+                    field.push('"');
+                } else {
+                    in_quotes = false;
+                    after_quote = true;
+                }
+            } else {
+                field.push(ch);
+            }
+            continue;
+        }
+
+        match ch {
+            '"' if field.is_empty() && !after_quote => {
+                quoted = true;
+                in_quotes = true;
+            }
+            ',' => {
+                fields.push(CopyCsvField {
+                    text: std::mem::take(&mut field),
+                    quoted,
+                });
+                after_quote = false;
+            }
+            _ if after_quote => {
+                return Err(ErrorField {
+                    code: "22P04",
+                    message: "malformed CSV quoted field",
+                    position: None,
+                });
+            }
+            _ => field.push(ch),
+        }
+    }
+
+    if in_quotes {
+        return Err(ErrorField {
+            code: "22P04",
+            message: "unterminated CSV quoted field",
+            position: None,
+        });
+    }
+    fields.push(CopyCsvField {
+        text: field,
+        quoted,
+    });
+    Ok(fields)
+}
+
+fn parse_copy_csv_value(field: &CopyCsvField, ty: SqlType) -> Result<SqlValue, ErrorField> {
+    if !field.quoted && field.text.is_empty() {
+        return Err(ErrorField {
+            code: "0A000",
+            message: "COPY NULL values are not supported by the compatibility endpoint",
+            position: None,
+        });
+    }
+    match ty {
+        SqlType::Int4 => field
+            .text
+            .parse::<i32>()
+            .map(SqlValue::Int4)
+            .map_err(|_| ErrorField {
+                code: "22P02",
+                message: "invalid input syntax for type integer",
+                position: None,
+            }),
+        SqlType::Text => Ok(SqlValue::Text(field.text.clone())),
+    }
+}
+
 fn execute_copy_to_stdout(
     stream: &mut TcpStream,
     session: &Session,
     table_name: &str,
+    format: CopyFormat,
 ) -> io::Result<()> {
     let Some(table) = session.tables.get(table_name) else {
         return write_error(
@@ -4235,9 +4353,15 @@ fn execute_copy_to_stdout(
         let mut payload = String::new();
         for (idx, value) in row.iter().enumerate() {
             if idx > 0 {
-                payload.push('\t');
+                payload.push(match format {
+                    CopyFormat::Text => '\t',
+                    CopyFormat::Csv => ',',
+                });
             }
-            payload.push_str(&copy_text_value(value));
+            match format {
+                CopyFormat::Text => payload.push_str(&copy_text_value(value)),
+                CopyFormat::Csv => payload.push_str(&copy_csv_value(value)),
+            }
         }
         payload.push('\n');
         write_copy_data(stream, payload.as_bytes())?;
@@ -4251,6 +4375,7 @@ fn begin_copy_from_stdin(
     session: &mut Session,
     table_name: &str,
     requested_columns: Option<Vec<String>>,
+    format: CopyFormat,
 ) -> io::Result<()> {
     let Some(table) = session.tables.get(table_name) else {
         return write_error(
@@ -4298,6 +4423,7 @@ fn begin_copy_from_stdin(
     session.copy_in = Some(CopyInState {
         table: table_name.to_string(),
         columns,
+        format,
         pending_text: String::new(),
         pending_rows: Vec::new(),
         seen_terminator: false,
@@ -4332,7 +4458,7 @@ fn handle_copy_data(session: &mut Session, bytes: &[u8]) -> Option<ErrorField> {
         if copy.seen_terminator && line.is_empty() {
             continue;
         }
-        if let Some(error) = parse_copy_text_row(table, &copy.columns, &line)
+        if let Some(error) = parse_copy_row(table, &copy.columns, copy.format, &line)
             .map(|row| copy.pending_rows.push(row))
             .err()
         {
@@ -4374,31 +4500,58 @@ fn apply_copy_in_rows(session: &mut Session, copy: CopyInState) -> Option<ErrorF
     None
 }
 
-fn parse_copy_text_row(
+fn parse_copy_row(
     table: &Table,
     columns: &[String],
+    format: CopyFormat,
     line: &str,
 ) -> Result<Vec<SqlValue>, ErrorField> {
-    let fields = line.split('\t').collect::<Vec<_>>();
-    if fields.len() != columns.len() {
-        return Err(ErrorField {
-            code: "22P04",
-            message: "COPY row has wrong number of columns",
-            position: None,
-        });
-    }
-    let mut row = Vec::with_capacity(fields.len());
-    for (field, column_name) in fields.iter().zip(columns.iter()) {
-        let column = table
-            .columns
-            .iter()
-            .find(|candidate| candidate.def.name == *column_name)
-            .ok_or(ErrorField {
-                code: "42703",
-                message: "column does not exist",
-                position: None,
-            })?;
-        row.push(parse_copy_text_value(field, column.def.ty)?);
+    let mut row = Vec::with_capacity(columns.len());
+    match format {
+        CopyFormat::Text => {
+            let fields = line.split('\t').collect::<Vec<_>>();
+            if fields.len() != columns.len() {
+                return Err(ErrorField {
+                    code: "22P04",
+                    message: "COPY row has wrong number of columns",
+                    position: None,
+                });
+            }
+            for (field, column_name) in fields.iter().zip(columns.iter()) {
+                let column = table
+                    .columns
+                    .iter()
+                    .find(|candidate| candidate.def.name == *column_name)
+                    .ok_or(ErrorField {
+                        code: "42703",
+                        message: "column does not exist",
+                        position: None,
+                    })?;
+                row.push(parse_copy_text_value(field, column.def.ty)?);
+            }
+        }
+        CopyFormat::Csv => {
+            let fields = parse_copy_csv_row(line)?;
+            if fields.len() != columns.len() {
+                return Err(ErrorField {
+                    code: "22P04",
+                    message: "COPY row has wrong number of columns",
+                    position: None,
+                });
+            }
+            for (field, column_name) in fields.iter().zip(columns.iter()) {
+                let column = table
+                    .columns
+                    .iter()
+                    .find(|candidate| candidate.def.name == *column_name)
+                    .ok_or(ErrorField {
+                        code: "42703",
+                        message: "column does not exist",
+                        position: None,
+                    })?;
+                row.push(parse_copy_csv_value(field, column.def.ty)?);
+            }
+        }
     }
     Ok(row)
 }
@@ -4412,11 +4565,11 @@ fn execute_statement(
     if strip_sql_comments(statement).trim().is_empty() {
         return write_empty_query_response(stream);
     }
-    if let Some(table) = parse_copy_to_stdout_table(statement) {
-        return execute_copy_to_stdout(stream, session, &table);
+    if let Some((table, format)) = parse_copy_to_stdout_table(statement) {
+        return execute_copy_to_stdout(stream, session, &table, format);
     }
-    if let Some((table, columns)) = parse_copy_from_stdin(statement) {
-        return begin_copy_from_stdin(stream, session, &table, columns);
+    if let Some((table, columns, format)) = parse_copy_from_stdin(statement) {
+        return begin_copy_from_stdin(stream, session, &table, columns, format);
     }
     if is_copy_statement(statement) {
         return write_error(
@@ -10446,11 +10599,15 @@ mod tests {
     fn copy_to_stdout_table_detection_is_narrow() {
         assert_eq!(
             parse_copy_to_stdout_table("COPY public.people TO STDOUT;"),
-            Some("people".to_string())
+            Some(("people".to_string(), CopyFormat::Text))
         );
         assert_eq!(
             parse_copy_to_stdout_table("/* comment */ COPY people TO STDOUT"),
-            Some("people".to_string())
+            Some(("people".to_string(), CopyFormat::Text))
+        );
+        assert_eq!(
+            parse_copy_to_stdout_table("COPY people TO STDOUT WITH CSV"),
+            Some(("people".to_string(), CopyFormat::Csv))
         );
         assert_eq!(parse_copy_to_stdout_table("COPY people FROM STDIN"), None);
         assert_eq!(
@@ -10458,7 +10615,7 @@ mod tests {
             None
         );
         assert_eq!(
-            parse_copy_to_stdout_table("COPY people TO STDOUT WITH CSV"),
+            parse_copy_to_stdout_table("COPY people TO STDOUT WITH CSV HEADER"),
             None
         );
     }
@@ -10467,13 +10624,26 @@ mod tests {
     fn copy_from_stdin_table_detection_is_narrow() {
         assert_eq!(
             parse_copy_from_stdin("COPY public.people FROM STDIN;"),
-            Some(("people".to_string(), None))
+            Some(("people".to_string(), None, CopyFormat::Text))
         );
         assert_eq!(
             parse_copy_from_stdin("/* comment */ COPY people (id, name) FROM STDIN"),
             Some((
                 "people".to_string(),
-                Some(vec!["id".to_string(), "name".to_string()])
+                Some(vec!["id".to_string(), "name".to_string()]),
+                CopyFormat::Text
+            ))
+        );
+        assert_eq!(
+            parse_copy_from_stdin("COPY people FROM STDIN WITH CSV"),
+            Some(("people".to_string(), None, CopyFormat::Csv))
+        );
+        assert_eq!(
+            parse_copy_from_stdin("COPY public.people (id, name) FROM STDIN WITH CSV"),
+            Some((
+                "people".to_string(),
+                Some(vec!["id".to_string(), "name".to_string()]),
+                CopyFormat::Csv
             ))
         );
         assert_eq!(parse_copy_from_stdin("COPY people TO STDOUT"), None);
@@ -10482,7 +10652,7 @@ mod tests {
             None
         );
         assert_eq!(
-            parse_copy_from_stdin("COPY people FROM STDIN WITH CSV"),
+            parse_copy_from_stdin("COPY people FROM STDIN WITH CSV HEADER"),
             None
         );
     }
@@ -10581,6 +10751,68 @@ mod tests {
     }
 
     #[test]
+    fn simple_copy_to_stdout_with_csv_quotes_fields_and_recovers() {
+        let mut session = Session::default();
+        session.tables.insert(
+            "people".to_string(),
+            Table {
+                oid: FIRST_USER_RELATION_OID,
+                name: "people".to_string(),
+                columns: vec![
+                    CatalogColumn {
+                        attnum: 1,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "id".to_string(),
+                            ty: SqlType::Int4,
+                        },
+                    },
+                    CatalogColumn {
+                        attnum: 2,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "name".to_string(),
+                            ty: SqlType::Text,
+                        },
+                    },
+                ],
+                rows: vec![
+                    vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())],
+                    vec![
+                        SqlValue::Int4(2),
+                        SqlValue::Text("Grace, \"Amazing\"".to_string()),
+                    ],
+                ],
+            },
+        );
+        let (mut writer, mut reader) = tcp_pair();
+
+        execute_statement(
+            &mut writer,
+            &mut session,
+            "COPY people TO STDOUT WITH CSV",
+            true,
+        )
+        .unwrap();
+
+        let messages = read_backend_messages(&mut reader, 5);
+        assert_eq!(
+            messages.iter().map(|(tag, _)| *tag).collect::<Vec<_>>(),
+            vec![b'H', b'd', b'd', b'c', b'C']
+        );
+        assert_eq!(messages[1].1, b"1,Ada\n");
+        assert_eq!(messages[2].1, b"2,\"Grace, \"\"Amazing\"\"\"\n");
+        assert_eq!(messages[4].1, b"COPY 2\0");
+
+        execute_statement(
+            &mut writer,
+            &mut session,
+            "SELECT name FROM people WHERE id = 2",
+            true,
+        )
+        .unwrap();
+        assert_eq!(read_backend_tags(&mut reader, 3), vec![b'T', b'D', b'C']);
+    }
+
+    #[test]
     fn simple_copy_from_stdin_accepts_data_done_and_recovers() {
         let mut session = Session::default();
         session.tables.insert(
@@ -10644,6 +10876,86 @@ mod tests {
                 vec![
                     SqlValue::Int4(2),
                     SqlValue::Text("Grace\tHopper".to_string())
+                ],
+            ]
+        );
+
+        assert!(handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::SimpleQuery("SELECT name FROM people WHERE id = 2".to_string())
+        )
+        .unwrap());
+        assert_eq!(
+            read_backend_tags(&mut reader, 4),
+            vec![b'T', b'D', b'C', b'Z']
+        );
+    }
+
+    #[test]
+    fn simple_copy_from_stdin_with_csv_accepts_quoted_data_and_recovers() {
+        let mut session = Session::default();
+        session.tables.insert(
+            "people".to_string(),
+            Table {
+                oid: FIRST_USER_RELATION_OID,
+                name: "people".to_string(),
+                columns: vec![
+                    CatalogColumn {
+                        attnum: 1,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "id".to_string(),
+                            ty: SqlType::Int4,
+                        },
+                    },
+                    CatalogColumn {
+                        attnum: 2,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "name".to_string(),
+                            ty: SqlType::Text,
+                        },
+                    },
+                ],
+                rows: Vec::new(),
+            },
+        );
+        let mut extended_error_pending = false;
+        let (mut writer, mut reader) = tcp_pair();
+
+        assert!(handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::SimpleQuery("COPY people FROM STDIN WITH CSV".to_string())
+        )
+        .unwrap());
+        let messages = read_backend_messages(&mut reader, 1);
+        assert_eq!(messages[0].0, b'G');
+        assert_eq!(messages[0].1, vec![0, 0, 2, 0, 0, 0, 0]);
+
+        assert!(handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::CopyData(b"1,Ada\n2,\"Grace, \"\"Hopper\"\"\"\n".to_vec())
+        )
+        .unwrap());
+        assert!(handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::CopyDone
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 2), vec![b'C', b'Z']);
+        assert_eq!(
+            session.tables["people"].rows,
+            vec![
+                vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())],
+                vec![
+                    SqlValue::Int4(2),
+                    SqlValue::Text("Grace, \"Hopper\"".to_string())
                 ],
             ]
         );

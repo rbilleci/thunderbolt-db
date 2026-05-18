@@ -102,8 +102,8 @@ async def main(repo_root: Path) -> None:
         assert empty_rows == []
 
         try:
-            await conn.execute("COPY asyncpg_people FROM STDIN WITH CSV")
-            raise AssertionError("COPY FROM STDIN WITH CSV unexpectedly succeeded")
+            await conn.execute("COPY asyncpg_people FROM STDIN WITH CSV HEADER")
+            raise AssertionError("COPY FROM STDIN WITH CSV HEADER unexpectedly succeeded")
         except asyncpg.PostgresError as error:
             assert error.sqlstate == "0A000"
 

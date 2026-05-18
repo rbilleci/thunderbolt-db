@@ -1,0 +1,17 @@
+=== psql copy csv import export recovery ===
+CREATE TABLE
+COPY 3
+ id |      name
+----+-----------------
+  1 | Ada
+  2 | Grace, "Hopper"
+  3 | Line\tLiteral
+(3 rows)
+
+1,Ada
+2,"Grace, ""Hopper"""
+3,Line\tLiteral
+      name
+-----------------
+ Grace, "Hopper"
+(1 row)

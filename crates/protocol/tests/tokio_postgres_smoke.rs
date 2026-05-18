@@ -93,9 +93,9 @@ async fn tokio_postgres_supported_subset_smoke_with_unsupported_recovery(
     assert!(empty_rows.is_empty());
 
     let unsupported = client
-        .simple_query("COPY driver_people FROM STDIN WITH CSV")
+        .simple_query("COPY driver_people FROM STDIN WITH CSV HEADER")
         .await
-        .expect_err("COPY FROM STDIN WITH CSV remains explicitly unsupported");
+        .expect_err("COPY FROM STDIN WITH CSV HEADER remains explicitly unsupported");
     assert_eq!(unsupported.code().map(|code| code.code()), Some("0A000"));
 
     let recovered = client
