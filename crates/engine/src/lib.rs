@@ -20,8 +20,8 @@ use gpu_db_observability::{
 use gpu_db_planner::{ExecutionPlan, Planner, PlannerConfig};
 use gpu_db_protocol::{
     parse_command, AddUniqueConstraint, ColumnDef, Command, CommentTarget, CreateIndex,
-    CreateTable, CreateView, Delete, DropIndex, DropTable, DropView, Insert, ParseError, Select,
-    SelectFilterOp, SelectProjection, SqlType, SqlValue, TruncateTable, Update,
+    CreateTable, CreateView, Delete, DropConstraint, DropIndex, DropTable, DropView, Insert,
+    ParseError, Select, SelectFilterOp, SelectProjection, SqlType, SqlValue, TruncateTable, Update,
 };
 use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine};
 use gpu_db_storage::{
@@ -74,6 +74,7 @@ impl ReplicatedStateMachine for KvStateMachine {
                     | Command::CreateTable(_)
                     | Command::AddPrimaryKey(_)
                     | Command::AddUniqueConstraint(_)
+                    | Command::DropConstraint(_)
                     | Command::CreateIndex(_)
                     | Command::CreateView(_)
                     | Command::DropTable(_)
@@ -7513,6 +7514,7 @@ impl Engine {
             Command::CreateTable(create) => self.apply_create_table(create)?,
             Command::AddPrimaryKey(add) => self.apply_add_primary_key(add)?,
             Command::AddUniqueConstraint(add) => self.apply_add_unique_constraint(add)?,
+            Command::DropConstraint(drop) => self.apply_drop_constraint(drop)?,
             Command::CreateIndex(create) => self.apply_create_index(create)?,
             Command::CreateView(create) => self.apply_create_view(create)?,
             Command::DropTable(drop) => self.apply_drop_table(drop, txn_id)?,
@@ -7756,6 +7758,41 @@ impl Engine {
             unique: true,
         };
         self.apply_create_index_with_constraint_flags(create, false, true)
+    }
+
+    fn apply_drop_constraint(&mut self, drop: DropConstraint) -> Result<(), EngineError> {
+        let Some(table) = self.relational_catalog.get_mut(&drop.table) else {
+            if drop.table_if_exists {
+                return Ok(());
+            }
+            return Err(EngineError::ApplyFailed(format!(
+                "relation \"{}\" does not exist",
+                drop.table
+            )));
+        };
+        let old_len = table.indexes.len();
+        table.indexes.retain(|index| {
+            !(index.name == drop.name && (index.primary_key || index.unique_constraint))
+        });
+        if table.indexes.len() == old_len {
+            if drop.if_exists {
+                return Ok(());
+            }
+            return Err(EngineError::ApplyFailed(format!(
+                "constraint \"{}\" does not exist",
+                drop.name
+            )));
+        }
+        self.relational_comments
+            .remove(&RelationalCommentTarget::Index {
+                index: drop.name.clone(),
+            });
+        self.relational_comments
+            .remove(&RelationalCommentTarget::Constraint {
+                table: drop.table,
+                constraint: drop.name,
+            });
+        Ok(())
     }
 
     fn visible_relational_rows(
@@ -8438,6 +8475,26 @@ impl Engine {
                 )?;
                 Self::validate_unique_values(&rows, column_idx, &add.name)?;
             }
+            Command::DropConstraint(drop) => {
+                let Some(table) = self.relational_catalog.get(&drop.table) else {
+                    if drop.table_if_exists {
+                        return Ok(());
+                    }
+                    return Err(EngineError::ApplyFailed(format!(
+                        "relation \"{}\" does not exist",
+                        drop.table
+                    )));
+                };
+                if !table.indexes.iter().any(|index| {
+                    index.name == drop.name && (index.primary_key || index.unique_constraint)
+                }) && !drop.if_exists
+                {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "constraint \"{}\" does not exist",
+                        drop.name
+                    )));
+                }
+            }
             Command::Insert(insert) => {
                 let table = self.relational_catalog.get(&insert.table).ok_or_else(|| {
                     EngineError::ApplyFailed(format!(
@@ -8567,6 +8624,7 @@ impl Engine {
         match cmd {
             Command::AddPrimaryKey(_) => true,
             Command::AddUniqueConstraint(_) => true,
+            Command::DropConstraint(_) => true,
             Command::CreateIndex(create) => create.unique,
             Command::Insert(insert) => self
                 .relational_catalog
@@ -8593,6 +8651,7 @@ impl Engine {
             | Command::CreateTable(_)
             | Command::AddPrimaryKey(_)
             | Command::AddUniqueConstraint(_)
+            | Command::DropConstraint(_)
             | Command::CreateIndex(_)
             | Command::CreateView(_)
             | Command::DropTable(_)
@@ -8789,6 +8848,7 @@ impl Engine {
             | Command::CreateTable(_)
             | Command::AddPrimaryKey(_)
             | Command::AddUniqueConstraint(_)
+            | Command::DropConstraint(_)
             | Command::CreateIndex(_)
             | Command::CreateView(_)
             | Command::DropTable(_)
@@ -8886,6 +8946,7 @@ impl Engine {
             Command::CreateTable(_) => Err(ExecuteError::NonReadCommand("CREATE TABLE")),
             Command::AddPrimaryKey(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
             Command::AddUniqueConstraint(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
+            Command::DropConstraint(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
             Command::CreateIndex(_) => Err(ExecuteError::NonReadCommand("CREATE INDEX")),
             Command::CreateView(_) => Err(ExecuteError::NonReadCommand("CREATE VIEW")),
             Command::DropTable(_) => Err(ExecuteError::NonReadCommand("DROP TABLE")),
@@ -31912,6 +31973,89 @@ mod tests {
         assert!(
             missing_err.contains("index \"people_name_idx\" does not exist"),
             "{missing_err}"
+        );
+    }
+
+    #[test]
+    fn relational_catalog_drops_constraints_and_replays_from_wal() {
+        let mut e = Engine::new_local();
+        e.execute_text(
+            1,
+            "CREATE TABLE people (id INT PRIMARY KEY, name TEXT UNIQUE)",
+        )
+        .unwrap();
+        e.execute_text(
+            2,
+            "COMMENT ON INDEX public.people_name_key IS 'name uniqueness'",
+        )
+        .unwrap();
+        e.execute_text(
+            3,
+            "COMMENT ON CONSTRAINT people_pkey ON public.people IS 'row identity'",
+        )
+        .unwrap();
+        e.execute_text(
+            4,
+            "ALTER TABLE IF EXISTS ONLY public.people DROP CONSTRAINT IF EXISTS people_pkey",
+        )
+        .unwrap();
+        e.execute_text(
+            5,
+            "ALTER TABLE ONLY public.people DROP CONSTRAINT people_name_key",
+        )
+        .unwrap();
+
+        let table = e.relational_catalog_table("people").unwrap();
+        assert!(table.indexes.is_empty());
+        assert_eq!(e.relational_index_comment("people_name_key"), None);
+        assert_eq!(
+            e.relational_constraint_comment("people", "people_pkey"),
+            None
+        );
+        e.execute_text(
+            6,
+            "INSERT INTO people (id, name) VALUES (1, 'Ada'), (1, 'Ada')",
+        )
+        .unwrap();
+
+        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        assert!(recovered
+            .relational_catalog_table("people")
+            .unwrap()
+            .indexes
+            .is_empty());
+        assert_eq!(recovered.relational_index_comment("people_name_key"), None);
+        assert_eq!(
+            recovered.relational_constraint_comment("people", "people_pkey"),
+            None
+        );
+
+        e.execute_text(
+            7,
+            "ALTER TABLE ONLY public.people DROP CONSTRAINT IF EXISTS people_pkey",
+        )
+        .unwrap();
+        let missing_constraint = e
+            .execute_text(
+                8,
+                "ALTER TABLE ONLY public.people DROP CONSTRAINT people_pkey",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            missing_constraint.contains("constraint \"people_pkey\" does not exist"),
+            "{missing_constraint}"
+        );
+        let missing_table = e
+            .execute_text(
+                9,
+                "ALTER TABLE ONLY public.missing_people DROP CONSTRAINT people_pkey",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            missing_table.contains("relation \"missing_people\" does not exist"),
+            "{missing_table}"
         );
     }
 

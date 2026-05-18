@@ -12,6 +12,7 @@ pub enum Command {
     CreateTable(CreateTable),
     AddPrimaryKey(AddPrimaryKey),
     AddUniqueConstraint(AddUniqueConstraint),
+    DropConstraint(DropConstraint),
     CreateIndex(CreateIndex),
     CreateView(CreateView),
     DropTable(DropTable),
@@ -58,6 +59,14 @@ pub struct AddUniqueConstraint {
     pub table: String,
     pub name: String,
     pub column: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropConstraint {
+    pub table: String,
+    pub name: String,
+    pub table_if_exists: bool,
+    pub if_exists: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1670,6 +1679,9 @@ fn parse_relational_command(input: &str) -> Option<Result<Command, ParseError>> 
         return Some(parse_truncate_table(input).map(Command::TruncateTable));
     }
     if first.eq_ignore_ascii_case("ALTER") {
+        if find_keyword_outside_quotes(input, "DROP").is_some() {
+            return Some(parse_drop_table_constraint(input).map(Command::DropConstraint));
+        }
         if find_keyword_outside_quotes(input, "ADD").is_some() {
             return Some(parse_add_table_constraint(input));
         }
@@ -1881,6 +1893,58 @@ fn parse_add_table_constraint(input: &str) -> Result<Command, ParseError> {
         return parse_add_unique_constraint(input).map(Command::AddUniqueConstraint);
     }
     Err(ParseError::InvalidRelationalSql)
+}
+
+fn parse_drop_table_constraint(input: &str) -> Result<DropConstraint, ParseError> {
+    let mut rest = strip_keyword_prefix_case_insensitive(input, "ALTER")
+        .and_then(|s| strip_keyword_prefix_case_insensitive(s.trim_start(), "TABLE"))
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    let table_if_exists = if let Some(after_if) = strip_keyword_prefix_case_insensitive(rest, "IF")
+    {
+        let after_exists = strip_keyword_prefix_case_insensitive(after_if.trim_start(), "EXISTS")
+            .ok_or(ParseError::InvalidRelationalSql)?;
+        rest = after_exists.trim_start();
+        true
+    } else {
+        false
+    };
+    rest = strip_keyword_prefix_case_insensitive(rest, "ONLY")
+        .map(str::trim_start)
+        .unwrap_or(rest);
+    let drop_pos =
+        find_keyword_outside_quotes(rest, "DROP").ok_or(ParseError::InvalidRelationalSql)?;
+    let table = normalize_relation_identifier(rest[..drop_pos].trim())?;
+    rest = rest[drop_pos + "DROP".len()..].trim_start();
+    rest = strip_keyword_prefix_case_insensitive(rest, "CONSTRAINT")
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    let constraint_if_exists = if let Some(after_if) =
+        strip_keyword_prefix_case_insensitive(rest, "IF")
+    {
+        let after_exists = strip_keyword_prefix_case_insensitive(after_if.trim_start(), "EXISTS")
+            .ok_or(ParseError::InvalidRelationalSql)?;
+        rest = after_exists.trim_start();
+        true
+    } else {
+        false
+    };
+    if rest.is_empty()
+        || find_keyword_outside_quotes(rest, "CASCADE").is_some()
+        || find_keyword_outside_quotes(rest, "RESTRICT").is_some()
+    {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let constraints = split_csv(rest)?;
+    let [constraint] = constraints.as_slice() else {
+        return Err(ParseError::InvalidRelationalSql);
+    };
+    Ok(DropConstraint {
+        table,
+        name: normalize_identifier(constraint.trim())?,
+        table_if_exists,
+        if_exists: constraint_if_exists,
+    })
 }
 
 fn parse_alter_table_add_constraint(input: &str) -> Result<(String, String, &str), ParseError> {
@@ -9474,6 +9538,32 @@ mod tests {
                 column: "name".to_string(),
             })
         );
+        assert_eq!(
+            parse_command(
+                "ALTER TABLE IF EXISTS ONLY public.keyed_people DROP CONSTRAINT IF EXISTS keyed_people_name_key"
+            )
+            .unwrap(),
+            Command::DropConstraint(DropConstraint {
+                table: "keyed_people".to_string(),
+                name: "keyed_people_name_key".to_string(),
+                table_if_exists: true,
+                if_exists: true,
+            })
+        );
+        assert_eq!(
+            parse_command("ALTER TABLE ONLY keyed_people DROP CONSTRAINT keyed_people_pkey")
+                .unwrap(),
+            Command::DropConstraint(DropConstraint {
+                table: "keyed_people".to_string(),
+                name: "keyed_people_pkey".to_string(),
+                table_if_exists: false,
+                if_exists: false,
+            })
+        );
+        assert!(parse_command(
+            "ALTER TABLE ONLY public.keyed_people DROP CONSTRAINT keyed_people_pkey CASCADE"
+        )
+        .is_err());
 
         assert_eq!(
             parse_command("COMMENT ON DATABASE postgres IS 'primary database'").unwrap(),

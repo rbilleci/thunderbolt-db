@@ -674,6 +674,7 @@ Post-closeout CUDA gap closure:
 ## Catalog Follow-Up Notes
 
 - 2026-05-18: Real psql golden scenario 313 proves bounded `COMMENT ON DATABASE postgres` metadata through `psql \l+`, `pg_catalog.shobj_description(..., 'pg_database')`, pg-dump database metadata, cleanup, unsupported-database recovery, and engine WAL replay. Scenario 315 proves bounded `COMMENT ON ROLE postgres` and `COMMENT ON TABLESPACE {pg_default|pg_global}` metadata through `psql \du+` / `\db+`, `pg_catalog.shobj_description(..., 'pg_authid'|'pg_tablespace')`, cleanup, unsupported-target recovery, and engine WAL replay. Shared-object comments beyond bootstrap database/role/tablespaces remain out of scope.
+- 2026-05-18: Real psql golden scenario 318 proves bounded `ALTER TABLE [IF EXISTS] [ONLY] [public.]table DROP CONSTRAINT [IF EXISTS] constraint` for supported primary-key and unique constraints. The engine-owned path WAL-replays constraint metadata removal, cleans supported index/constraint comments, preserves table rows, permits duplicate values after the constraint is removed, and keeps missing-table/constraint plus cascade boundaries explicit.
 
 ## First CUDA transition slice (once NVIDIA hardware is available)
 

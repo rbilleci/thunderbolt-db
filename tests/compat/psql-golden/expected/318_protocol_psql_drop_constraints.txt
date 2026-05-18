@@ -1,0 +1,63 @@
+=== drop constraints ===
+CREATE TABLE
+INSERT 0 2
+COMMENT
+COMMENT
+             Table "public.dc_people"
+ Column |  Type   | Collation | Nullable | Default
+--------+---------+-----------+----------+---------
+ id     | integer |           |          |
+ name   | text    |           |          |
+Indexes:
+    "dc_people_name_key" UNIQUE CONSTRAINT, btree (name)
+    "dc_people_pkey" PRIMARY KEY, btree (id)
+
+                    Object descriptions
+ Schema |      Name      |      Object      | Description
+--------+----------------+------------------+--------------
+ public | dc_people_pkey | table constraint | row identity
+(1 row)
+
+                    Object descriptions
+ Schema |      Name      |      Object      | Description
+--------+----------------+------------------+--------------
+ public | dc_people_pkey | table constraint | row identity
+(1 row)
+
+ALTER TABLE
+ALTER TABLE
+             Table "public.dc_people"
+ Column |  Type   | Collation | Nullable | Default
+--------+---------+-----------+----------+---------
+ id     | integer |           |          |
+ name   | text    |           |          |
+
+         Object descriptions
+ Schema | Name | Object | Description
+--------+------+--------+-------------
+(0 rows)
+
+         Object descriptions
+ Schema | Name | Object | Description
+--------+------+--------+-------------
+(0 rows)
+
+INSERT 0 1
+ id | name
+----+-------
+  1 | Ada
+  1 | Ada
+  2 | Grace
+(3 rows)
+
+ALTER TABLE
+psql:318_protocol_psql_drop_constraints.sql:17: ERROR:  constraint does not exist
+ALTER TABLE
+psql:318_protocol_psql_drop_constraints.sql:19: ERROR:  relation does not exist
+psql:318_protocol_psql_drop_constraints.sql:20: ERROR:  query shape is not supported by the compatibility stub
+ id | name
+----+-------
+  1 | Ada
+  1 | Ada
+  2 | Grace
+(3 rows)

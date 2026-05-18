@@ -31,6 +31,8 @@ When `PSQL_GOLDEN_BOOT_CMD` is set, the harness starts the target service itself
 
 Scenario 02 covers PostgreSQL-style session reset/setup probes, including the asyncpg default reset cleanup sequence `SELECT pg_advisory_unlock_all(); CLOSE ALL; UNLISTEN *; RESET ALL;`, as bounded no-op compatibility that leaves later SQL prepared traffic usable.
 
+Scenario 318 covers bounded `ALTER TABLE ... DROP CONSTRAINT` over supported primary-key and unique constraints, including `IF EXISTS`, metadata/comment cleanup in `psql \d` / `\dd`, duplicate inserts after removal, missing-target recovery, and unsupported cascade rejection.
+
 ## Update expected artifacts
 
 1. Run the suite against the target endpoint.

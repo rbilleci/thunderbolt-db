@@ -4653,6 +4653,7 @@ struct DropTable {
 struct DropConstraint {
     table: String,
     constraint: String,
+    table_if_exists: bool,
     if_exists: bool,
 }
 
@@ -4684,7 +4685,12 @@ fn parse_alter_table_drop_constraint(statement: &str) -> Option<DropConstraint> 
     let statement = strip_leading_sql_comments(statement.trim())?;
     let canonical = canonical_sql(statement);
     let mut target = canonical.strip_prefix("alter table ")?;
-    target = target.strip_prefix("if exists ").unwrap_or(target).trim();
+    let table_if_exists = if let Some(remaining) = target.strip_prefix("if exists ") {
+        target = remaining.trim();
+        true
+    } else {
+        false
+    };
     target = target.strip_prefix("only ").unwrap_or(target).trim();
     let (table, rest) = target.split_once(" drop constraint ")?;
     if !is_simple_copy_table_name(table) {
@@ -4705,6 +4711,7 @@ fn parse_alter_table_drop_constraint(statement: &str) -> Option<DropConstraint> 
     Some(DropConstraint {
         table: table.strip_prefix("public.").unwrap_or(table).to_string(),
         constraint: constraint.to_string(),
+        table_if_exists,
         if_exists,
     })
 }
@@ -5499,7 +5506,7 @@ fn execute_statement(
     }
     if let Some(drop) = parse_alter_table_drop_constraint(statement) {
         if !session.tables.contains_key(&drop.table) {
-            if drop.if_exists {
+            if drop.table_if_exists {
                 return write_command_complete(stream, "ALTER TABLE");
             }
             return write_error(
@@ -6033,6 +6040,54 @@ fn execute_statement(
                     add.column.clone(),
                 ) {
                     return write_error(stream, &error);
+                }
+                session.persist_catalog_snapshot();
+                return write_command_complete(stream, "ALTER TABLE");
+            }
+            Command::DropConstraint(drop) => {
+                if !session.tables.contains_key(&drop.table) {
+                    if drop.table_if_exists {
+                        return write_command_complete(stream, "ALTER TABLE");
+                    }
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "42P01",
+                            message: "relation does not exist",
+                            position: None,
+                        },
+                    );
+                }
+                let old_index_count = session.indexes.len();
+                session.indexes.retain(|index| {
+                    !(index.table == drop.table
+                        && index.name == drop.name
+                        && (index.primary_key || index.unique_constraint))
+                });
+                if session.indexes.len() == old_index_count && !drop.if_exists {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "42704",
+                            message: "constraint does not exist",
+                            position: None,
+                        },
+                    );
+                }
+                session.dirty_indexes |= session.indexes.len() != old_index_count;
+                if session.indexes.len() != old_index_count {
+                    for target in [
+                        CatalogCommentTarget::Index {
+                            index: drop.name.clone(),
+                        },
+                        CatalogCommentTarget::Constraint {
+                            table: drop.table.clone(),
+                            constraint: drop.name.clone(),
+                        },
+                    ] {
+                        session.comments.remove(&target);
+                        session.mark_comment_dirty(target);
+                    }
                 }
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, "ALTER TABLE");
@@ -13740,10 +13795,11 @@ mod tests {
                 "ALTER TABLE IF EXISTS ONLY public.accounts DROP CONSTRAINT IF EXISTS accounts_pkey;"
             ),
             Some(DropConstraint {
-                table: "accounts".to_string(),
-                constraint: "accounts_pkey".to_string(),
-                if_exists: true,
-            })
+                        table: "accounts".to_string(),
+                        constraint: "accounts_pkey".to_string(),
+                        table_if_exists: true,
+                        if_exists: true,
+                    })
         );
         assert_eq!(
             parse_alter_table_drop_constraint(
@@ -13752,6 +13808,7 @@ mod tests {
             Some(DropConstraint {
                 table: "accounts".to_string(),
                 constraint: "accounts_pkey".to_string(),
+                table_if_exists: false,
                 if_exists: false,
             })
         );
