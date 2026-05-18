@@ -313,6 +313,16 @@ Queue reconciliation note (2026-05-04):
 
 ## Post-CUDA PostgreSQL-compatible product loop
 
+2026-05-18 pg-dump/view follow-up: the bounded stored-view slice now includes real
+`pg_dump` / `pg_restore` evidence for one supported public base-table view. The
+compatibility endpoint exposes pg-dump-facing `pg_class`, `pg_attribute`,
+`pg_get_viewdef`, and dependency metadata for bounded views so plain/custom/
+directory/tar, split, parallel-directory, insert-style, and clean-restore smoke
+paths preserve the view definition and `SELECT * FROM view`. Full view
+replacement, cascade/dependency semantics beyond restore ordering, materialized
+views, updateable views, and view-on-view behavior remain outside the current
+proof.
+
 Status: active as of 2026-05-11. The no-GPU bootstrap queue and CUDA completion gates are closed for their defined scope. The autonomous loop now moves from internal MVCC/CUDA completion to the larger product goal: a PostgreSQL-compatible GPU-backed database engine.
 
 Loop rules:

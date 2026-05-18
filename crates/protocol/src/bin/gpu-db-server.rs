@@ -5648,6 +5648,13 @@ fn execute_statement(
             &pg_dump_index_metadata_rows(session),
         );
     }
+    if let Some(view_oid) = pg_dump_view_definition_query_oid(&canonical) {
+        return write_single_row(
+            stream,
+            &[text_column("viewdef")],
+            &pg_dump_view_definition_rows(session, view_oid),
+        );
+    }
     if let Some(relation_oids) = pg_dump_attrdef_metadata_query_relation_oids(&canonical) {
         return write_single_row(
             stream,
@@ -5680,7 +5687,7 @@ fn execute_statement(
                 int4_column("refobjid"),
                 text_column("deptype"),
             ],
-            &catalog_empty_rows(),
+            &pg_dump_dependency_rows(session),
         );
     }
     if canonical
@@ -7059,6 +7066,13 @@ fn execute_statement(
             stream,
             &pg_dump_index_metadata_columns(),
             &pg_dump_index_metadata_rows(session),
+        );
+    }
+    if let Some(view_oid) = pg_dump_view_definition_query_oid(&canonical) {
+        return write_single_row(
+            stream,
+            &[text_column("viewdef")],
+            &pg_dump_view_definition_rows(session, view_oid),
         );
     }
     if let Some(relation_oids) = pg_dump_attrdef_metadata_query_relation_oids(&canonical) {
@@ -8462,13 +8476,22 @@ fn pg_dump_table_oid_lookup_rows(
     session: &Session,
     relname_pattern: &str,
 ) -> Vec<Vec<Option<String>>> {
+    let mut rows = Vec::new();
     let mut tables = session.tables.values().collect::<Vec<_>>();
     tables.sort_by_key(|table| table.oid);
-    tables
-        .into_iter()
-        .filter(|table| psql_relname_pattern_matches(relname_pattern, &table.name))
-        .map(|table| vec![Some(table.oid.to_string())])
-        .collect()
+    for table in tables {
+        if psql_relname_pattern_matches(relname_pattern, &table.name) {
+            rows.push(vec![Some(table.oid.to_string())]);
+        }
+    }
+    let mut views = session.views.values().collect::<Vec<_>>();
+    views.sort_by_key(|view| view.oid);
+    for view in views {
+        if psql_relname_pattern_matches(relname_pattern, &view.name) {
+            rows.push(vec![Some(view.oid.to_string())]);
+        }
+    }
+    rows
 }
 
 fn is_pg_dump_class_metadata_query(canonical: &str) -> bool {
@@ -8520,55 +8543,80 @@ fn pg_dump_class_metadata_columns() -> Vec<Column> {
 }
 
 fn pg_dump_class_metadata_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut rows = Vec::new();
     let mut tables = session.tables.values().collect::<Vec<_>>();
     tables.sort_by_key(|table| table.oid);
-    tables
-        .into_iter()
-        .map(|table| {
-            let relhasindex = session.indexes.iter().any(|index| {
-                index.table == table.name && session.tables.contains_key(&index.table)
-            });
-            vec![
-                Some("1259".to_string()),
-                Some(table.oid.to_string()),
-                Some(table.name.clone()),
-                Some(PUBLIC_NAMESPACE_OID.to_string()),
-                Some("r".to_string()),
-                Some("0".to_string()),
-                Some("10".to_string()),
-                Some("0".to_string()),
-                Some(if relhasindex { "t" } else { "f" }.to_string()),
-                Some("f".to_string()),
-                Some("0".to_string()),
-                Some("f".to_string()),
-                Some("p".to_string()),
-                Some("0".to_string()),
-                None,
-                None,
-                Some("0".to_string()),
-                Some("0".to_string()),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some("f".to_string()),
-                Some("t".to_string()),
-                Some("d".to_string()),
-                Some("f".to_string()),
-                Some("f".to_string()),
-                Some("0".to_string()),
-                None,
-                None,
-                None,
-                Some("heap".to_string()),
-                Some("f".to_string()),
-                Some("f".to_string()),
-            ]
-        })
-        .collect()
+    for table in tables {
+        let relhasindex = session
+            .indexes
+            .iter()
+            .any(|index| index.table == table.name && session.tables.contains_key(&index.table));
+        rows.push(pg_dump_class_metadata_row(
+            table.oid,
+            &table.name,
+            "r",
+            relhasindex,
+            false,
+            Some("heap"),
+        ));
+    }
+    let mut views = session.views.values().collect::<Vec<_>>();
+    views.sort_by_key(|view| view.oid);
+    for view in views {
+        rows.push(pg_dump_class_metadata_row(
+            view.oid, &view.name, "v", false, true, None,
+        ));
+    }
+    rows
+}
+
+fn pg_dump_class_metadata_row(
+    oid: u32,
+    name: &str,
+    relkind: &str,
+    relhasindex: bool,
+    relhasrules: bool,
+    amname: Option<&str>,
+) -> Vec<Option<String>> {
+    vec![
+        Some("1259".to_string()),
+        Some(oid.to_string()),
+        Some(name.to_string()),
+        Some(PUBLIC_NAMESPACE_OID.to_string()),
+        Some(relkind.to_string()),
+        Some("0".to_string()),
+        Some("10".to_string()),
+        Some("0".to_string()),
+        Some(if relhasindex { "t" } else { "f" }.to_string()),
+        Some(if relhasrules { "t" } else { "f" }.to_string()),
+        Some("0".to_string()),
+        Some("f".to_string()),
+        Some("p".to_string()),
+        Some("0".to_string()),
+        None,
+        None,
+        Some("0".to_string()),
+        Some("0".to_string()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some("f".to_string()),
+        Some("t".to_string()),
+        Some("d".to_string()),
+        Some("f".to_string()),
+        Some("f".to_string()),
+        Some("0".to_string()),
+        None,
+        None,
+        None,
+        amname.map(str::to_string),
+        Some("f".to_string()),
+        Some("f".to_string()),
+    ]
 }
 
 fn pg_dump_attribute_metadata_query_oids(canonical: &str) -> Option<Vec<u32>> {
@@ -8617,42 +8665,85 @@ fn pg_dump_attribute_metadata_rows(
 ) -> Vec<Vec<Option<String>>> {
     let mut rows = Vec::new();
     for oid in relation_oids {
-        let Some(table) = session.tables.values().find(|table| table.oid == *oid) else {
+        if let Some(table) = session.tables.values().find(|table| table.oid == *oid) {
+            for column in &table.columns {
+                rows.push(pg_dump_attribute_metadata_row(
+                    table.oid,
+                    column.attnum,
+                    &column.def.name,
+                    column.def.ty,
+                    column.def.default.is_some(),
+                ));
+            }
             continue;
-        };
-        for column in &table.columns {
-            rows.push(vec![
-                Some(table.oid.to_string()),
-                Some(column.attnum.to_string()),
-                Some(column.def.name.clone()),
-                Some("-1".to_string()),
-                Some(sql_type_storage_code(column.def.ty).to_string()),
-                Some(sql_type_storage_code(column.def.ty).to_string()),
-                Some("f".to_string()),
-                Some(
-                    if column.def.default.is_some() {
-                        "t"
-                    } else {
-                        "f"
-                    }
-                    .to_string(),
-                ),
-                Some("f".to_string()),
-                Some(column.def.ty.type_size().to_string()),
-                Some(sql_type_alignment_code(column.def.ty).to_string()),
-                Some("t".to_string()),
-                Some(sql_type_display_name(column.def.ty).to_string()),
-                None,
-                Some("0".to_string()),
-                None,
-                Some(String::new()),
-                Some(String::new()),
-                None,
-                Some(String::new()),
-            ]);
+        }
+        if let Some(view) = session.views.values().find(|view| view.oid == *oid) {
+            let Some(table) = session.tables.get(&view.query.table) else {
+                continue;
+            };
+            let columns = match &view.query.projection {
+                SelectProjection::All => table.columns.iter().collect::<Vec<_>>(),
+                SelectProjection::Columns(names) => names
+                    .iter()
+                    .filter_map(|name| table.columns.iter().find(|column| column.def.name == *name))
+                    .collect::<Vec<_>>(),
+                SelectProjection::CountAll
+                | SelectProjection::GroupedCount { .. }
+                | SelectProjection::Sum { .. }
+                | SelectProjection::GroupedSum { .. }
+                | SelectProjection::Avg { .. }
+                | SelectProjection::GroupedAvg { .. }
+                | SelectProjection::Min { .. }
+                | SelectProjection::GroupedMin { .. }
+                | SelectProjection::Max { .. }
+                | SelectProjection::GroupedMax { .. } => Vec::new(),
+            };
+            for (idx, column) in columns.into_iter().enumerate() {
+                let Ok(attnum) = i16::try_from(idx + 1) else {
+                    continue;
+                };
+                rows.push(pg_dump_attribute_metadata_row(
+                    view.oid,
+                    attnum,
+                    &column.def.name,
+                    column.def.ty,
+                    false,
+                ));
+            }
         }
     }
     rows
+}
+
+fn pg_dump_attribute_metadata_row(
+    relation_oid: u32,
+    attnum: i16,
+    name: &str,
+    ty: SqlType,
+    has_default: bool,
+) -> Vec<Option<String>> {
+    vec![
+        Some(relation_oid.to_string()),
+        Some(attnum.to_string()),
+        Some(name.to_string()),
+        Some("-1".to_string()),
+        Some(sql_type_storage_code(ty).to_string()),
+        Some(sql_type_storage_code(ty).to_string()),
+        Some("f".to_string()),
+        Some(if has_default { "t" } else { "f" }.to_string()),
+        Some("f".to_string()),
+        Some(ty.type_size().to_string()),
+        Some(sql_type_alignment_code(ty).to_string()),
+        Some("t".to_string()),
+        Some(sql_type_display_name(ty).to_string()),
+        None,
+        Some("0".to_string()),
+        None,
+        Some(String::new()),
+        Some(String::new()),
+        None,
+        Some(String::new()),
+    ]
 }
 
 fn is_pg_dump_index_metadata_query(canonical: &str) -> bool {
@@ -8724,6 +8815,43 @@ fn pg_dump_index_metadata_rows(session: &Session) -> Vec<Vec<Option<String>>> {
             ]
         })
         .collect()
+}
+
+fn pg_dump_view_definition_query_oid(canonical: &str) -> Option<u32> {
+    let prefix = "select pg_catalog.pg_get_viewdef('";
+    let suffix = "'::pg_catalog.oid) as viewdef";
+    canonical
+        .strip_prefix(prefix)?
+        .strip_suffix(suffix)?
+        .parse()
+        .ok()
+}
+
+fn pg_dump_view_definition_rows(session: &Session, view_oid: u32) -> Vec<Vec<Option<String>>> {
+    session
+        .views
+        .values()
+        .find(|view| view.oid == view_oid)
+        .map(|view| vec![vec![Some(format!("{};", view.definition))]])
+        .unwrap_or_default()
+}
+
+fn pg_dump_dependency_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut rows = Vec::new();
+    let mut views = session.views.values().collect::<Vec<_>>();
+    views.sort_by_key(|view| view.oid);
+    for view in views {
+        if let Some(table) = session.tables.get(&view.query.table) {
+            rows.push(vec![
+                Some("1259".to_string()),
+                Some(view.oid.to_string()),
+                Some("1259".to_string()),
+                Some(table.oid.to_string()),
+                Some("n".to_string()),
+            ]);
+        }
+    }
+    rows
 }
 
 #[derive(Clone)]
