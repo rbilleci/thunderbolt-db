@@ -112,7 +112,7 @@ pub struct DropView {
 pub struct AlterColumnDefault {
     pub table: String,
     pub column: String,
-    pub default: SqlValue,
+    pub default: Option<SqlValue>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1679,7 +1679,9 @@ fn parse_relational_command(input: &str) -> Option<Result<Command, ParseError>> 
         return Some(parse_truncate_table(input).map(Command::TruncateTable));
     }
     if first.eq_ignore_ascii_case("ALTER") {
-        if find_keyword_outside_quotes(input, "DROP").is_some() {
+        if find_keyword_outside_quotes(input, "DROP").is_some()
+            && find_keyword_outside_quotes(input, "DEFAULT").is_none()
+        {
             return Some(parse_drop_table_constraint(input).map(Command::DropConstraint));
         }
         if find_keyword_outside_quotes(input, "ADD").is_some() {
@@ -1838,22 +1840,40 @@ fn parse_alter_column_default(input: &str) -> Result<AlterColumnDefault, ParseEr
     let rest = strip_keyword_prefix_case_insensitive(rest, "COLUMN")
         .map(str::trim_start)
         .unwrap_or(rest);
-    let set_pos =
-        find_keyword_outside_quotes(rest, "SET").ok_or(ParseError::InvalidRelationalSql)?;
-    let column = normalize_identifier(rest[..set_pos].trim())?;
+    if let Some(set_pos) = find_keyword_outside_quotes(rest, "SET") {
+        let column = normalize_identifier(rest[..set_pos].trim())?;
+        let rest = strip_keyword_prefix_case_insensitive(
+            rest[set_pos + "SET".len()..].trim_start(),
+            "DEFAULT",
+        )
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim();
+        if rest.is_empty() {
+            return Err(ParseError::InvalidRelationalSql);
+        }
+        return Ok(AlterColumnDefault {
+            table,
+            column,
+            default: Some(parse_sql_value(rest)?),
+        });
+    }
+
+    let drop_pos =
+        find_keyword_outside_quotes(rest, "DROP").ok_or(ParseError::InvalidRelationalSql)?;
+    let column = normalize_identifier(rest[..drop_pos].trim())?;
     let rest = strip_keyword_prefix_case_insensitive(
-        rest[set_pos + "SET".len()..].trim_start(),
+        rest[drop_pos + "DROP".len()..].trim_start(),
         "DEFAULT",
     )
     .ok_or(ParseError::InvalidRelationalSql)?
     .trim();
-    if rest.is_empty() {
+    if !rest.is_empty() {
         return Err(ParseError::InvalidRelationalSql);
     }
     Ok(AlterColumnDefault {
         table,
         column,
-        default: parse_sql_value(rest)?,
+        default: None,
     })
 }
 
@@ -9767,7 +9787,15 @@ mod tests {
             Command::AlterColumnDefault(AlterColumnDefault {
                 table: "default_people".to_string(),
                 column: "name".to_string(),
-                default: SqlValue::Text("Grace".to_string()),
+                default: Some(SqlValue::Text("Grace".to_string())),
+            })
+        );
+        assert_eq!(
+            parse_command("ALTER TABLE public.default_people ALTER name DROP DEFAULT").unwrap(),
+            Command::AlterColumnDefault(AlterColumnDefault {
+                table: "default_people".to_string(),
+                column: "name".to_string(),
+                default: None,
             })
         );
         assert_eq!(

@@ -28,3 +28,30 @@ INSERT 0 1
  id     | integer |           |          |
  name   | text    |           |          | 'changed'::text
  bucket | integer |           |          | 7
+
+ALTER TABLE
+psql:304_protocol_psql_column_defaults.sql:20: ERROR:  INSERT must provide every column without a default
+ column_name | data_type | is_nullable | column_default
+-------------+-----------+-------------+----------------
+ id          | integer   | YES         |
+ name        | text      | YES         |
+ bucket      | integer   | YES         | 7
+(3 rows)
+
+ nspname |    relname     | attname | default_expr
+---------+----------------+---------+--------------
+ public  | default_people | bucket  | 7
+(1 row)
+
+           Table "public.default_people"
+ Column |  Type   | Collation | Nullable | Default
+--------+---------+-----------+----------+---------
+ id     | integer |           |          |
+ name   | text    |           |          |
+ bucket | integer |           |          | 7
+
+ id |  name   | bucket
+----+---------+--------
+  1 | unknown |      7
+  2 | changed |      7
+(2 rows)

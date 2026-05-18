@@ -6376,7 +6376,13 @@ fn execute_statement(
                         },
                     );
                 };
-                if !sql_value_matches_type(&alter.default, column.def.ty) {
+                let Some(default) = alter.default else {
+                    column.def.default = None;
+                    session.mark_table_dirty(alter.table);
+                    session.persist_catalog_snapshot();
+                    return write_command_complete(stream, "ALTER TABLE");
+                };
+                if !sql_value_matches_type(&default, column.def.ty) {
                     return write_error(
                         stream,
                         &ErrorField {
@@ -6386,7 +6392,7 @@ fn execute_statement(
                         },
                     );
                 }
-                column.def.default = Some(alter.default);
+                column.def.default = Some(default);
                 session.mark_table_dirty(alter.table);
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, "ALTER TABLE");

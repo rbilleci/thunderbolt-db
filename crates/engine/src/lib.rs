@@ -8139,13 +8139,17 @@ impl Engine {
             .ok_or_else(|| {
                 EngineError::ApplyFailed(format!("column \"{}\" does not exist", alter.column))
             })?;
-        if !sql_value_matches_type(&alter.default, column.ty) {
+        let Some(default) = alter.default else {
+            column.default = None;
+            return Ok(());
+        };
+        if !sql_value_matches_type(&default, column.ty) {
             return Err(EngineError::ApplyFailed(format!(
                 "invalid default for column \"{}\"",
                 alter.column
             )));
         }
-        column.default = Some(alter.default);
+        column.default = Some(default);
         Ok(())
     }
 
@@ -30006,6 +30010,11 @@ mod tests {
         .unwrap();
         e.execute_text(5, "INSERT INTO default_people (id) VALUES (3)")
             .unwrap();
+        e.execute_text(
+            6,
+            "ALTER TABLE ONLY public.default_people ALTER COLUMN name DROP DEFAULT",
+        )
+        .unwrap();
 
         let Command::Select(select) =
             parse_command("SELECT id, name, bucket FROM default_people ORDER BY id ASC").unwrap()
@@ -30038,16 +30047,13 @@ mod tests {
         let table = recovered
             .relational_catalog_table("default_people")
             .unwrap();
-        assert_eq!(
-            table.columns[1].default,
-            Some(SqlValue::Text("changed".to_string()))
-        );
+        assert_eq!(table.columns[1].default, None);
         assert_eq!(table.columns[2].default, Some(SqlValue::Int4(7)));
         let recovered_result = recovered.execute_relational_select(&select).unwrap();
         assert_eq!(recovered_result.rows, result.rows);
 
         let err = e
-            .execute_text(6, "INSERT INTO default_people (name) VALUES ('missing id')")
+            .execute_text(7, "INSERT INTO default_people (id, bucket) VALUES (4, 8)")
             .unwrap_err();
         assert!(err
             .to_string()

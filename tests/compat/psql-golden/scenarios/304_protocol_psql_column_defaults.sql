@@ -16,3 +16,18 @@ JOIN pg_catalog.pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum
 WHERE n.nspname = 'public'
 ORDER BY c.relname, a.attnum;
 \d default_people
+ALTER TABLE ONLY public.default_people ALTER COLUMN name DROP DEFAULT;
+INSERT INTO default_people (id, bucket) VALUES (3, 9);
+SELECT column_name, data_type, is_nullable, column_default FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'default_people' ORDER BY ordinal_position;
+SELECT n.nspname,
+       c.relname,
+       a.attname,
+       pg_catalog.pg_get_expr(d.adbin, d.adrelid) AS default_expr
+FROM pg_catalog.pg_attrdef d
+JOIN pg_catalog.pg_class c ON c.oid = d.adrelid
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+JOIN pg_catalog.pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum
+WHERE n.nspname = 'public'
+ORDER BY c.relname, a.attnum;
+\d default_people
+SELECT id, name, bucket FROM default_people ORDER BY id;
