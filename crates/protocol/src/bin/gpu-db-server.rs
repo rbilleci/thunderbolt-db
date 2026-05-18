@@ -5950,6 +5950,31 @@ fn execute_statement(
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, "CREATE VIEW");
             }
+            Command::DropView(drop) => {
+                if session.tables.contains_key(&drop.name) {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "42809",
+                            message: "relation is not a view",
+                            position: None,
+                        },
+                    );
+                }
+                if session.views.remove(&drop.name).is_none() && !drop.if_exists {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "42P01",
+                            message: "view does not exist",
+                            position: None,
+                        },
+                    );
+                }
+                session.mark_view_dirty(drop.name);
+                session.persist_catalog_snapshot();
+                return write_command_complete(stream, "DROP VIEW");
+            }
             Command::DropIndex(drop) => {
                 let old_index_count = session.indexes.len();
                 session.indexes.retain(|index| index.name != drop.name);
@@ -12608,6 +12633,40 @@ mod tests {
             .lock()
             .expect("shared catalog mutex poisoned");
         assert!(!catalog.tables.contains_key(table));
+    }
+
+    #[test]
+    fn shared_catalog_persistence_removes_dirty_deleted_views() {
+        let view = "clean_restore_active_people";
+        let Command::Select(query) =
+            parse_command("SELECT id, name FROM people ORDER BY id").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        {
+            let mut catalog = shared_catalog()
+                .lock()
+                .expect("shared catalog mutex poisoned");
+            catalog.views.insert(
+                view.to_string(),
+                View {
+                    oid: FIRST_USER_RELATION_OID,
+                    name: view.to_string(),
+                    query,
+                    definition: "SELECT id, name FROM people ORDER BY id".to_string(),
+                },
+            );
+        }
+
+        let mut session = Session::new(true);
+        assert!(session.views.remove(view).is_some());
+        session.mark_view_dirty(view);
+        session.persist_catalog_snapshot();
+
+        let catalog = shared_catalog()
+            .lock()
+            .expect("shared catalog mutex poisoned");
+        assert!(!catalog.views.contains_key(view));
     }
 
     #[test]

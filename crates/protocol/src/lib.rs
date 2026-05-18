@@ -15,6 +15,7 @@ pub enum Command {
     CreateIndex(CreateIndex),
     CreateView(CreateView),
     DropIndex(DropIndex),
+    DropView(DropView),
     AlterColumnDefault(AlterColumnDefault),
     CommentOn(CommentOn),
     Insert(Insert),
@@ -74,6 +75,12 @@ pub struct CreateView {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DropIndex {
+    pub name: String,
+    pub if_exists: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropView {
     pub name: String,
     pub if_exists: bool,
 }
@@ -1625,6 +1632,9 @@ fn parse_relational_command(input: &str) -> Option<Result<Command, ParseError>> 
         if second.eq_ignore_ascii_case("INDEX") {
             return Some(parse_drop_index(input).map(Command::DropIndex));
         }
+        if second.eq_ignore_ascii_case("VIEW") {
+            return Some(parse_drop_view(input).map(Command::DropView));
+        }
         return Some(Err(ParseError::InvalidRelationalSql));
     }
     if first.eq_ignore_ascii_case("ALTER") {
@@ -2116,6 +2126,38 @@ fn parse_drop_index(input: &str) -> Result<DropIndex, ParseError> {
     };
     Ok(DropIndex {
         name: normalize_relation_identifier(index.trim())?,
+        if_exists,
+    })
+}
+
+fn parse_drop_view(input: &str) -> Result<DropView, ParseError> {
+    let mut rest = strip_keyword_prefix_case_insensitive(input, "DROP")
+        .and_then(|s| strip_keyword_prefix_case_insensitive(s.trim_start(), "VIEW"))
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    if strip_keyword_prefix_case_insensitive(rest, "MATERIALIZED").is_some() {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let if_exists = if let Some(after_if) = strip_keyword_prefix_case_insensitive(rest, "IF") {
+        let after_exists = strip_keyword_prefix_case_insensitive(after_if.trim_start(), "EXISTS")
+            .ok_or(ParseError::InvalidRelationalSql)?;
+        rest = after_exists.trim_start();
+        true
+    } else {
+        false
+    };
+    if rest.is_empty() || find_keyword_outside_quotes(rest, "CASCADE").is_some() {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    if find_keyword_outside_quotes(rest, "RESTRICT").is_some() {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let views = split_csv(rest)?;
+    let [view] = views.as_slice() else {
+        return Err(ParseError::InvalidRelationalSql);
+    };
+    Ok(DropView {
+        name: normalize_relation_identifier(view.trim())?,
         if_exists,
     })
 }
@@ -9483,6 +9525,32 @@ mod tests {
         );
         assert!(matches!(
             parse_command("CREATE OR REPLACE VIEW active_people AS SELECT * FROM people"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert_eq!(
+            parse_command("DROP VIEW public.active_people").unwrap(),
+            Command::DropView(DropView {
+                name: "active_people".to_string(),
+                if_exists: false,
+            })
+        );
+        assert_eq!(
+            parse_command("DROP VIEW IF EXISTS active_people").unwrap(),
+            Command::DropView(DropView {
+                name: "active_people".to_string(),
+                if_exists: true,
+            })
+        );
+        assert!(matches!(
+            parse_command("DROP VIEW active_people CASCADE"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command("DROP VIEW public.a, public.b"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command("DROP MATERIALIZED VIEW active_people"),
             Err(ParseError::InvalidRelationalSql)
         ));
 

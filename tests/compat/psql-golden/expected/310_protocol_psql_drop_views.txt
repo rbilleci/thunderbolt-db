@@ -1,0 +1,50 @@
+=== bounded SQL view drops ===
+CREATE TABLE
+INSERT 0 3
+CREATE VIEW
+CREATE VIEW
+ id | name
+----+-------
+  2 | Linus
+  3 | Grace
+(2 rows)
+
+DROP VIEW
+ schemaname |        viewname        | viewowner |                     definition
+------------+------------------------+-----------+----------------------------------------------------
+ public     | other_drop_view_people | postgres  | SELECT id, name FROM drop_view_people WHERE id = 1
+(1 row)
+
+ table_catalog | table_schema |       table_name       |                  view_definition                   | check_option | is_updatable | is_insertable_into | is_trigger_updatable | is_trigger_deletable | is_trigger_insertable
+---------------+--------------+------------------------+----------------------------------------------------+--------------+--------------+--------------------+----------------------+----------------------+-----------------------
+ postgres      | public       | other_drop_view_people | SELECT id, name FROM drop_view_people WHERE id = 1 | NONE         | NO           | NO                 | NO                   | NO                   | NO
+(1 row)
+
+                 List of relations
+ Schema |          Name          | Type |  Owner
+--------+------------------------+------+----------
+ public | other_drop_view_people | view | postgres
+(1 row)
+
+                                  List of relations
+ Schema |          Name          | Type |  Owner   | Persistence | Size | Description
+--------+------------------------+------+----------+-------------+------+-------------
+ public | other_drop_view_people | view | postgres | permanent   |      |
+(1 row)
+
+ id | name
+----+-------
+  1 | Ada
+  2 | Linus
+  3 | Grace
+(3 rows)
+
+psql:310_protocol_psql_drop_views.sql:19: ERROR:  relation does not exist
+psql:310_protocol_psql_drop_views.sql:20: ERROR:  view does not exist
+DROP VIEW
+psql:310_protocol_psql_drop_views.sql:22: ERROR:  relation is not a view
+psql:310_protocol_psql_drop_views.sql:23: ERROR:  query shape is not supported by the compatibility stub
+ id | name
+----+------
+  1 | Ada
+(1 row)

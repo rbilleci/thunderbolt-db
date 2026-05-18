@@ -64,6 +64,7 @@ impl Planner {
             | Command::CreateIndex(_)
             | Command::CreateView(_)
             | Command::DropIndex(_)
+            | Command::DropView(_)
             | Command::AlterColumnDefault(_)
             | Command::CommentOn(_)
             | Command::Insert(_)

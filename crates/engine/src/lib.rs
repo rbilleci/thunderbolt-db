@@ -20,8 +20,8 @@ use gpu_db_observability::{
 use gpu_db_planner::{ExecutionPlan, Planner, PlannerConfig};
 use gpu_db_protocol::{
     parse_command, AddUniqueConstraint, ColumnDef, Command, CommentTarget, CreateIndex,
-    CreateTable, CreateView, Delete, DropIndex, Insert, ParseError, Select, SelectFilterOp,
-    SelectProjection, SqlType, SqlValue, Update,
+    CreateTable, CreateView, Delete, DropIndex, DropView, Insert, ParseError, Select,
+    SelectFilterOp, SelectProjection, SqlType, SqlValue, Update,
 };
 use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine};
 use gpu_db_storage::{
@@ -77,6 +77,7 @@ impl ReplicatedStateMachine for KvStateMachine {
                     | Command::CreateIndex(_)
                     | Command::CreateView(_)
                     | Command::DropIndex(_)
+                    | Command::DropView(_)
                     | Command::AlterColumnDefault(_)
                     | Command::CommentOn(_)
                     | Command::Insert(_)
@@ -7508,6 +7509,7 @@ impl Engine {
             Command::CreateIndex(create) => self.apply_create_index(create)?,
             Command::CreateView(create) => self.apply_create_view(create)?,
             Command::DropIndex(drop) => self.apply_drop_index(drop)?,
+            Command::DropView(drop) => self.apply_drop_view(drop)?,
             Command::AlterColumnDefault(alter) => self.apply_alter_column_default(alter)?,
             Command::CommentOn(comment) => self.apply_comment_on(comment)?,
             Command::Insert(insert) => self.apply_insert(insert, txn_id)?,
@@ -7823,6 +7825,22 @@ impl Engine {
         }
         Err(EngineError::ApplyFailed(format!(
             "index \"{}\" does not exist",
+            drop.name
+        )))
+    }
+
+    fn apply_drop_view(&mut self, drop: DropView) -> Result<(), EngineError> {
+        if self.relational_catalog.contains_key(&drop.name) {
+            return Err(EngineError::ApplyFailed(format!(
+                "relation \"{}\" is not a view",
+                drop.name
+            )));
+        }
+        if self.relational_views.remove(&drop.name).is_some() || drop.if_exists {
+            return Ok(());
+        }
+        Err(EngineError::ApplyFailed(format!(
+            "view \"{}\" does not exist",
             drop.name
         )))
     }
@@ -8404,6 +8422,7 @@ impl Engine {
             | Command::CreateIndex(_)
             | Command::CreateView(_)
             | Command::DropIndex(_)
+            | Command::DropView(_)
             | Command::AlterColumnDefault(_)
             | Command::CommentOn(_)
             | Command::Insert(_)
@@ -8597,6 +8616,7 @@ impl Engine {
             | Command::CreateIndex(_)
             | Command::CreateView(_)
             | Command::DropIndex(_)
+            | Command::DropView(_)
             | Command::AlterColumnDefault(_)
             | Command::CommentOn(_)
             | Command::Insert(_)
@@ -8691,6 +8711,7 @@ impl Engine {
             Command::CreateIndex(_) => Err(ExecuteError::NonReadCommand("CREATE INDEX")),
             Command::CreateView(_) => Err(ExecuteError::NonReadCommand("CREATE VIEW")),
             Command::DropIndex(_) => Err(ExecuteError::NonReadCommand("DROP INDEX")),
+            Command::DropView(_) => Err(ExecuteError::NonReadCommand("DROP VIEW")),
             Command::AlterColumnDefault(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
             Command::CommentOn(_) => Err(ExecuteError::NonReadCommand("COMMENT")),
             Command::Insert(_) => Err(ExecuteError::NonReadCommand("INSERT")),
@@ -29918,6 +29939,67 @@ mod tests {
         assert!(recovered
             .execute_relational_select(&filtered_view_select)
             .is_err());
+    }
+
+    #[test]
+    fn relational_sql_drop_view_replays_from_wal() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO people (id, name) VALUES (1, 'Ada'), (2, 'Linus')",
+        )
+        .unwrap();
+        e.execute_text(
+            3,
+            "CREATE VIEW public.active_people AS SELECT id, name FROM people ORDER BY id",
+        )
+        .unwrap();
+        e.execute_text(
+            4,
+            "CREATE VIEW public.other_people AS SELECT id, name FROM people WHERE id = 2",
+        )
+        .unwrap();
+        e.execute_text(5, "DROP VIEW public.active_people").unwrap();
+
+        assert!(e.relational_catalog_view("active_people").is_none());
+        assert!(e.relational_catalog_view("other_people").is_some());
+        assert!(e.relational_catalog_table("people").is_some());
+
+        let mut recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        assert!(recovered.relational_catalog_view("active_people").is_none());
+        assert!(recovered.relational_catalog_view("other_people").is_some());
+
+        let Command::Select(table_select) =
+            parse_command("SELECT id, name FROM people ORDER BY id").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let table_result = recovered.execute_relational_select(&table_select).unwrap();
+        assert_eq!(
+            table_result.rows,
+            vec![
+                vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())],
+                vec![SqlValue::Int4(2), SqlValue::Text("Linus".to_string())],
+            ]
+        );
+
+        e.execute_text(6, "DROP VIEW IF EXISTS active_people")
+            .unwrap();
+        let missing = e.execute_text(7, "DROP VIEW active_people").unwrap_err();
+        assert!(missing
+            .to_string()
+            .contains("view \"active_people\" does not exist"));
+
+        let mut table_target_engine = Engine::new_local();
+        table_target_engine
+            .execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        let table_target = table_target_engine
+            .execute_text(2, "DROP VIEW people")
+            .unwrap_err();
+        assert!(table_target.to_string().contains("not a view"));
     }
 
     #[test]
