@@ -153,6 +153,33 @@ impl CudaResidentDeviceMemory {
         launch_cuda_resident_i32_compare_count(self, byte_offset, row_count, needle, comparison)
     }
 
+    pub fn count_i32_between_from_payload(
+        &self,
+        byte_offset: u64,
+        row_count: u64,
+        lower_inclusive: i32,
+        upper_inclusive: i32,
+    ) -> Result<u64, CudaRuntimeProbeError> {
+        if lower_inclusive > upper_inclusive {
+            return Ok(0);
+        }
+        let greater_or_equal_lower_count = launch_cuda_resident_i32_compare_count(
+            self,
+            byte_offset,
+            row_count,
+            lower_inclusive,
+            CudaI32Comparison::Gte,
+        )?;
+        let greater_than_upper_count = launch_cuda_resident_i32_compare_count(
+            self,
+            byte_offset,
+            row_count,
+            upper_inclusive,
+            CudaI32Comparison::Gt,
+        )?;
+        Ok(greater_or_equal_lower_count.saturating_sub(greater_than_upper_count))
+    }
+
     pub fn sum_i32_from_payload(
         &self,
         byte_offset: u64,

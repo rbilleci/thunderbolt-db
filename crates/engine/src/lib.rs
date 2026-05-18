@@ -8358,6 +8358,145 @@ impl Engine {
         })
     }
 
+    pub fn execute_relational_between_count_with_resident_device_memory_probe(
+        &mut self,
+        select: &Select,
+    ) -> Result<RelationalSelectResult, ExecuteError> {
+        let (table, bound) = self.bind_relational_select_for_execution(select)?;
+        if select.distinct
+            || !matches!(select.projection, SelectProjection::CountAll)
+            || select.group_by.is_some()
+            || !select.having_groups.is_empty()
+            || select.order_by.is_some()
+            || select.limit.is_some()
+            || select.offset.is_some()
+            || bound.filter_groups.len() != 1
+            || bound.filter_groups[0].len() != 2
+        {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory BETWEEN count proof currently supports only SELECT COUNT(*) with one int4 BETWEEN predicate"
+                    .to_string(),
+            )));
+        }
+
+        let mut filter_idx = None;
+        let mut lower = None;
+        let mut upper = None;
+        for (idx, op, value) in bound.filter_groups[0].iter().cloned() {
+            if filter_idx
+                .replace(idx)
+                .is_some_and(|existing| existing != idx)
+            {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "resident device-memory BETWEEN count proof requires both range bounds to target the same column"
+                        .to_string(),
+                )));
+            }
+            let SqlValue::Int4(value) = value else {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "resident device-memory BETWEEN count proof currently supports only int4 bounds"
+                        .to_string(),
+                )));
+            };
+            match op {
+                SelectFilterOp::Gte => lower = Some(value),
+                SelectFilterOp::Lte => upper = Some(value),
+                _ => {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        "resident device-memory BETWEEN count proof currently supports only inclusive int4 bounds"
+                            .to_string(),
+                    )));
+                }
+            }
+        }
+        let filter_idx = filter_idx.ok_or_else(|| {
+            ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory BETWEEN count proof requires an int4 predicate column"
+                    .to_string(),
+            ))
+        })?;
+        let lower = lower.ok_or_else(|| {
+            ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory BETWEEN count proof requires a lower inclusive bound"
+                    .to_string(),
+            ))
+        })?;
+        let upper = upper.ok_or_else(|| {
+            ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory BETWEEN count proof requires an upper inclusive bound"
+                    .to_string(),
+            ))
+        })?;
+        if table.columns[filter_idx].ty != SqlType::Int4 {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory BETWEEN count proof currently supports only int4 predicates"
+                    .to_string(),
+            )));
+        }
+
+        let (_query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
+        let snapshot = self
+            .relational_residency_snapshot(&table.name)
+            .ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "relation \"{}\" has no resident snapshot",
+                    table.name
+                )))
+            })?;
+        if snapshot.schema != table.schema || snapshot.table != table.name {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident snapshot no longer matches catalog table identity".to_string(),
+            )));
+        }
+        if !snapshot.is_valid() {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "relation \"{}\" resident snapshot is invalid",
+                table.name
+            ))));
+        }
+        let device_memory = self
+            .relational_residency_device_memory
+            .get(&table.name)
+            .ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "relation \"{}\" has no retained resident device memory",
+                    table.name
+                )))
+            })?;
+        let byte_offset = resident_device_int4_column_offset(&snapshot, &table, filter_idx)?;
+        let row_count = u64::try_from(snapshot.row_count).map_err(|_| {
+            ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident snapshot row count exceeds retained device-memory proof range"
+                    .to_string(),
+            ))
+        })?;
+        let started = Instant::now();
+        let between_count = device_memory
+            .count_i32_between_from_payload(byte_offset, row_count, lower, upper)
+            .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
+        let elapsed = started.elapsed();
+        self.metrics
+            .observe_d2h_bytes(2 * std::mem::size_of::<u64>() as u64);
+        self.metrics
+            .observe_kernel_exec_ms(elapsed.as_millis().try_into().unwrap_or(u64::MAX).max(1));
+        self.metrics
+            .observe_kernel_exec_ms(elapsed.as_millis().try_into().unwrap_or(u64::MAX).max(1));
+        let count = i32::try_from(between_count).map_err(|_| {
+            ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "resident device-memory BETWEEN count {between_count} exceeds supported COUNT(*) result range"
+            )))
+        })?;
+
+        Ok(RelationalSelectResult {
+            columns: bound.selected_columns,
+            rows: vec![vec![SqlValue::Int4(count)]],
+            planned_target: DeviceTarget::Gpu(snapshot.gpu_id),
+            executed_target: DeviceTarget::Gpu(snapshot.gpu_id),
+            fallback_reason: None,
+            access_path,
+        })
+    }
+
     pub fn execute_relational_sum_with_resident_device_memory_probe(
         &mut self,
         select: &Select,
@@ -14257,6 +14396,96 @@ mod tests {
         };
         assert!(e
             .execute_relational_membership_count_with_resident_device_memory_probe(&select)
+            .unwrap_err()
+            .to_string()
+            .contains("resident snapshot is invalid"));
+    }
+
+    #[test]
+    fn gpu_resident_device_memory_between_count_probe_materializes_int4_results() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE events (id INT, label TEXT, amount INT)")
+            .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO events (id, label, amount) VALUES (1, 'alpha', 10), (2, 'beta', 30), (3, 'gamma', 20), (4, 'delta', 40), (5, 'epsilon', 5)",
+        )
+        .unwrap();
+        let snapshot = e.populate_relational_residency_snapshot("events").unwrap();
+        if snapshot.device_memory_proof.is_none() {
+            return;
+        }
+
+        for sql in [
+            "SELECT COUNT(*) FROM events WHERE id BETWEEN 2 AND 4",
+            "SELECT COUNT(*) FROM events WHERE id BETWEEN 4 AND 2",
+        ] {
+            let Command::Select(select) = parse_command(sql).unwrap() else {
+                unreachable!()
+            };
+            let cpu = e.execute_relational_select(&select).unwrap();
+            let before = e.metrics().snapshot();
+            let resident = e
+                .execute_relational_between_count_with_resident_device_memory_probe(&select)
+                .unwrap();
+            let after = e.metrics().snapshot();
+
+            assert_eq!(resident.columns, cpu.columns, "{sql}");
+            assert_eq!(resident.rows, cpu.rows, "{sql}");
+            assert_eq!(resident.planned_target, DeviceTarget::Gpu(0), "{sql}");
+            assert_eq!(resident.executed_target, DeviceTarget::Gpu(0), "{sql}");
+            assert_eq!(resident.fallback_reason, None, "{sql}");
+            assert_eq!(after.h2d_bytes_total - before.h2d_bytes_total, 0, "{sql}");
+            assert!(after.d2h_bytes_total > before.d2h_bytes_total, "{sql}");
+            assert_eq!(
+                after.kernel_exec_samples - before.kernel_exec_samples,
+                2,
+                "{sql}"
+            );
+        }
+
+        let Command::Select(cross_column) =
+            parse_command("SELECT COUNT(*) FROM events WHERE id >= 2 AND amount <= 40").unwrap()
+        else {
+            unreachable!()
+        };
+        let err = e
+            .execute_relational_between_count_with_resident_device_memory_probe(&cross_column)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("requires both range bounds to target the same column"));
+
+        let Command::Select(text_bounds) =
+            parse_command("SELECT COUNT(*) FROM events WHERE label >= 'beta' AND label <= 'gamma'")
+                .unwrap()
+        else {
+            unreachable!()
+        };
+        let err = e
+            .execute_relational_between_count_with_resident_device_memory_probe(&text_bounds)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("supports only int4 bounds"));
+
+        let Command::Select(equality_only) =
+            parse_command("SELECT COUNT(*) FROM events WHERE id = 2").unwrap()
+        else {
+            unreachable!()
+        };
+        let err = e
+            .execute_relational_between_count_with_resident_device_memory_probe(&equality_only)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("one int4 BETWEEN predicate"));
+
+        e.mark_gpu_memory_pressured(0);
+        let Command::Select(select) =
+            parse_command("SELECT COUNT(*) FROM events WHERE id BETWEEN 2 AND 4").unwrap()
+        else {
+            unreachable!()
+        };
+        assert!(e
+            .execute_relational_between_count_with_resident_device_memory_probe(&select)
             .unwrap_err()
             .to_string()
             .contains("resident snapshot is invalid"));
