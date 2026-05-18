@@ -5990,6 +5990,7 @@ pub struct RelationalView {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RelationalCommentTarget {
+    Schema { schema: String },
     Table { table: String },
     Column { table: String, attnum: i16 },
     Index { index: String },
@@ -7855,6 +7856,15 @@ impl Engine {
 
     fn apply_comment_on(&mut self, comment: gpu_db_protocol::CommentOn) -> Result<(), EngineError> {
         let target = match comment.target {
+            CommentTarget::Schema { schema } => {
+                if schema != "public" {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "schema \"{}\" does not exist",
+                        schema
+                    )));
+                }
+                RelationalCommentTarget::Schema { schema }
+            }
             CommentTarget::Table { table } => {
                 if !self.relational_catalog.contains_key(&table) {
                     return Err(EngineError::ApplyFailed(format!(
@@ -11814,6 +11824,14 @@ impl Engine {
         self.relational_comments
             .get(&RelationalCommentTarget::Table {
                 table: table.to_string(),
+            })
+            .map(String::as_str)
+    }
+
+    pub fn relational_schema_comment(&self, schema: &str) -> Option<&str> {
+        self.relational_comments
+            .get(&RelationalCommentTarget::Schema {
+                schema: schema.to_string(),
             })
             .map(String::as_str)
     }
@@ -31650,34 +31668,40 @@ mod tests {
         let mut e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
-        e.execute_text(2, "COMMENT ON TABLE public.people IS 'lookup people'")
+        e.execute_text(2, "COMMENT ON SCHEMA public IS 'application schema'")
             .unwrap();
-        e.execute_text(3, "COMMENT ON COLUMN public.people.name IS 'display name'")
+        e.execute_text(3, "COMMENT ON TABLE public.people IS 'lookup people'")
             .unwrap();
-        e.execute_text(4, "CREATE INDEX people_name_idx ON people (name)")
+        e.execute_text(4, "COMMENT ON COLUMN public.people.name IS 'display name'")
+            .unwrap();
+        e.execute_text(5, "CREATE INDEX people_name_idx ON people (name)")
             .unwrap();
         e.execute_text(
-            5,
+            6,
             "COMMENT ON INDEX public.people_name_idx IS 'name lookup'",
         )
         .unwrap();
         e.execute_text(
-            6,
+            7,
             "ALTER TABLE ONLY public.people ADD CONSTRAINT people_pkey PRIMARY KEY (id)",
         )
         .unwrap();
         e.execute_text(
-            7,
+            8,
             "COMMENT ON CONSTRAINT people_pkey ON public.people IS 'row identity'",
         )
         .unwrap();
         e.execute_text(
-            8,
+            9,
             "CREATE VIEW public.people_lookup AS SELECT id, name FROM people WHERE id > 0 ORDER BY id",
         )
         .unwrap();
-        e.execute_text(9, "COMMENT ON VIEW public.people_lookup IS 'lookup view'")
+        e.execute_text(10, "COMMENT ON VIEW public.people_lookup IS 'lookup view'")
             .unwrap();
+        assert_eq!(
+            e.relational_schema_comment("public"),
+            Some("application schema")
+        );
         assert_eq!(e.relational_table_comment("people"), Some("lookup people"));
         assert_eq!(
             e.relational_column_comment("people", 2),
@@ -31697,6 +31721,10 @@ mod tests {
         );
 
         let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        assert_eq!(
+            recovered.relational_schema_comment("public"),
+            Some("application schema")
+        );
         assert_eq!(
             recovered.relational_table_comment("people"),
             Some("lookup people")
@@ -31718,17 +31746,20 @@ mod tests {
             Some("lookup view")
         );
 
-        e.execute_text(10, "COMMENT ON COLUMN public.people.name IS NULL")
+        e.execute_text(11, "COMMENT ON SCHEMA public IS NULL")
+            .unwrap();
+        assert_eq!(e.relational_schema_comment("public"), None);
+        e.execute_text(12, "COMMENT ON COLUMN public.people.name IS NULL")
             .unwrap();
         assert_eq!(e.relational_column_comment("people", 2), None);
-        e.execute_text(11, "DROP INDEX people_name_idx").unwrap();
+        e.execute_text(13, "DROP INDEX people_name_idx").unwrap();
         assert_eq!(e.relational_index_comment("people_name_idx"), None);
-        e.execute_text(12, "DROP INDEX people_pkey").unwrap();
+        e.execute_text(14, "DROP INDEX people_pkey").unwrap();
         assert_eq!(
             e.relational_constraint_comment("people", "people_pkey"),
             None
         );
-        e.execute_text(13, "DROP VIEW people_lookup").unwrap();
+        e.execute_text(15, "DROP VIEW people_lookup").unwrap();
         assert_eq!(e.relational_view_comment("people_lookup"), None);
 
         let mut missing = Engine::new_local();
@@ -31767,6 +31798,12 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("constraint \"people_pkey\" does not exist"));
+
+        assert!(Engine::new_local()
+            .execute_text(1, "COMMENT ON SCHEMA private IS 'bad'")
+            .unwrap_err()
+            .to_string()
+            .contains("schema \"private\" does not exist"));
     }
 
     #[test]

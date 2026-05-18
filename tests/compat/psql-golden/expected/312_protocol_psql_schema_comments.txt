@@ -1,0 +1,38 @@
+=== bounded schema comments ===
+COMMENT
+                      List of schemas
+  Name  |  Owner   | Access privileges |    Description
+--------+----------+-------------------+--------------------
+ public | postgres |                   | application schema
+(1 row)
+
+ nspname |    description
+---------+--------------------
+ public  | application schema
+(1 row)
+
+              Object descriptions
+ Schema |  Name  | Object |    Description
+--------+--------+--------+--------------------
+ public | public | schema | application schema
+(1 row)
+
+COMMENT
+                   List of schemas
+  Name  |  Owner   | Access privileges | Description
+--------+----------+-------------------+-------------
+ public | postgres |                   |
+(1 row)
+
+ nspname | description
+---------+-------------
+ public  |
+(1 row)
+
+psql:312_protocol_psql_schema_comments.sql:15: ERROR:  schema does not exist
+CREATE TABLE
+INSERT 0 1
+ id
+----
+  1
+(1 row)

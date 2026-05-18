@@ -100,6 +100,7 @@ pub struct CommentOn {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommentTarget {
+    Schema { schema: String },
     Table { table: String },
     Column { table: String, column: String },
     Index { index: String },
@@ -1675,7 +1676,16 @@ fn parse_comment_on(input: &str) -> Result<CommentOn, ParseError> {
         .and_then(|s| strip_keyword_prefix_case_insensitive(s.trim_start(), "ON"))
         .ok_or(ParseError::InvalidRelationalSql)?
         .trim_start();
-    let (target, rest) = if let Some(rest) = strip_keyword_prefix_case_insensitive(rest, "TABLE") {
+    let (target, rest) = if let Some(rest) = strip_keyword_prefix_case_insensitive(rest, "SCHEMA") {
+        let rest = rest.trim_start();
+        let is_pos =
+            find_keyword_outside_quotes(rest, "IS").ok_or(ParseError::InvalidRelationalSql)?;
+        let schema = normalize_identifier(rest[..is_pos].trim())?;
+        (
+            CommentTarget::Schema { schema },
+            rest[is_pos + "IS".len()..].trim(),
+        )
+    } else if let Some(rest) = strip_keyword_prefix_case_insensitive(rest, "TABLE") {
         let rest = rest.trim_start();
         let is_pos =
             find_keyword_outside_quotes(rest, "IS").ok_or(ParseError::InvalidRelationalSql)?;
@@ -9336,6 +9346,16 @@ mod tests {
                 table: "keyed_people".to_string(),
                 name: "keyed_people_name_key".to_string(),
                 column: "name".to_string(),
+            })
+        );
+
+        assert_eq!(
+            parse_command("COMMENT ON SCHEMA public IS 'application schema'").unwrap(),
+            Command::CommentOn(CommentOn {
+                target: CommentTarget::Schema {
+                    schema: "public".to_string(),
+                },
+                comment: Some("application schema".to_string()),
             })
         );
 

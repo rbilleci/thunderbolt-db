@@ -1642,6 +1642,7 @@ struct CatalogIndex {
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum CatalogCommentTarget {
+    Schema { schema: String },
     Table { table: String },
     Column { table: String, attnum: i16 },
     Index { index: String },
@@ -5444,6 +5445,7 @@ fn execute_statement(
                 | CatalogCommentTarget::Column { table, .. }
                 | CatalogCommentTarget::Constraint { table, .. } => table == &drop.table,
                 CatalogCommentTarget::Index { index } => dropped_index_names.contains(index),
+                CatalogCommentTarget::Schema { .. } => false,
                 CatalogCommentTarget::View { .. } => false,
             })
             .cloned()
@@ -6027,7 +6029,8 @@ fn execute_statement(
                             CatalogCommentTarget::Constraint { constraint, .. } => {
                                 constraint == &drop.name
                             }
-                            CatalogCommentTarget::Table { .. }
+                            CatalogCommentTarget::Schema { .. }
+                            | CatalogCommentTarget::Table { .. }
                             | CatalogCommentTarget::Column { .. }
                             | CatalogCommentTarget::Index { .. }
                             | CatalogCommentTarget::View { .. } => false,
@@ -6084,6 +6087,19 @@ fn execute_statement(
             }
             Command::CommentOn(comment) => {
                 let target = match comment.target {
+                    CommentTarget::Schema { schema } => {
+                        if schema != "public" {
+                            return write_error(
+                                stream,
+                                &ErrorField {
+                                    code: "3F000",
+                                    message: "schema does not exist",
+                                    position: None,
+                                },
+                            );
+                        }
+                        CatalogCommentTarget::Schema { schema }
+                    }
                     CommentTarget::Table { table } => {
                         if !session.tables.contains_key(&table) {
                             return write_error(
@@ -6988,7 +7004,14 @@ fn execute_statement(
                 text_column("Access privileges"),
                 text_column("Description"),
             ],
-            &catalog_psql_describe_schema_verbose_rows(),
+            &catalog_psql_describe_schema_verbose_rows(session),
+        );
+    }
+    if canonical == pg_catalog_schema_description_query() {
+        return write_single_row(
+            stream,
+            &[text_column("nspname"), text_column("description")],
+            &pg_catalog_schema_description_rows(session),
         );
     }
     if canonical == psql_describe_schema_publications_query() {
@@ -8478,12 +8501,17 @@ fn catalog_psql_describe_schema_rows() -> Vec<Vec<Option<String>>> {
     ]]
 }
 
-fn catalog_psql_describe_schema_verbose_rows() -> Vec<Vec<Option<String>>> {
+fn catalog_psql_describe_schema_verbose_rows(session: &Session) -> Vec<Vec<Option<String>>> {
     vec![vec![
         Some("public".to_string()),
         Some("postgres".to_string()),
         None,
-        None,
+        session
+            .comments
+            .get(&CatalogCommentTarget::Schema {
+                schema: "public".to_string(),
+            })
+            .cloned(),
     ]]
 }
 
@@ -8495,6 +8523,22 @@ fn pg_catalog_namespace_rows() -> Vec<Vec<Option<String>>> {
     vec![vec![
         Some(PUBLIC_NAMESPACE_OID.to_string()),
         Some("public".to_string()),
+    ]]
+}
+
+fn pg_catalog_schema_description_query() -> &'static str {
+    "select n.nspname, pg_catalog.obj_description(n.oid, 'pg_namespace') as description from pg_catalog.pg_namespace n where n.nspname = 'public' order by n.nspname"
+}
+
+fn pg_catalog_schema_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    vec![vec![
+        Some("public".to_string()),
+        session
+            .comments
+            .get(&CatalogCommentTarget::Schema {
+                schema: "public".to_string(),
+            })
+            .cloned(),
     ]]
 }
 
@@ -10807,6 +10851,16 @@ fn pg_catalog_table_index_description_rows_without_views(
 
 fn pg_dump_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
     let mut rows = Vec::new();
+    if let Some(description) = session.comments.get(&CatalogCommentTarget::Schema {
+        schema: "public".to_string(),
+    }) {
+        rows.push(vec![
+            Some(description.clone()),
+            Some("2615".to_string()),
+            Some(PUBLIC_NAMESPACE_OID.to_string()),
+            Some("0".to_string()),
+        ]);
+    }
     let mut tables = session.tables.values().collect::<Vec<_>>();
     tables.sort_by_key(|table| table.oid);
     for table in tables {
@@ -10853,7 +10907,8 @@ fn pg_dump_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
         .iter()
         .filter_map(|(target, description)| match target {
             CatalogCommentTarget::Index { index } => Some((index, description)),
-            CatalogCommentTarget::Table { .. }
+            CatalogCommentTarget::Schema { .. }
+            | CatalogCommentTarget::Table { .. }
             | CatalogCommentTarget::Column { .. }
             | CatalogCommentTarget::View { .. }
             | CatalogCommentTarget::Constraint { .. } => None,
@@ -10877,7 +10932,8 @@ fn pg_dump_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
             CatalogCommentTarget::Constraint { table, constraint } => {
                 Some((table, constraint, description))
             }
-            CatalogCommentTarget::Table { .. }
+            CatalogCommentTarget::Schema { .. }
+            | CatalogCommentTarget::Table { .. }
             | CatalogCommentTarget::Column { .. }
             | CatalogCommentTarget::View { .. }
             | CatalogCommentTarget::Index { .. } => None,
@@ -10903,6 +10959,16 @@ fn pg_dump_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
 
 fn psql_object_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
     let mut rows = Vec::new();
+    if let Some(description) = session.comments.get(&CatalogCommentTarget::Schema {
+        schema: "public".to_string(),
+    }) {
+        rows.push(vec![
+            Some("public".to_string()),
+            Some("public".to_string()),
+            Some("schema".to_string()),
+            Some(description.clone()),
+        ]);
+    }
     let mut tables = session.tables.values().collect::<Vec<_>>();
     tables.sort_by(|left, right| left.name.cmp(&right.name));
     for table in tables {
@@ -14669,8 +14735,9 @@ mod tests {
                 Some("postgres".to_string())
             ]]
         );
+        let default_schema_session = Session::default();
         assert_eq!(
-            catalog_psql_describe_schema_verbose_rows(),
+            catalog_psql_describe_schema_verbose_rows(&default_schema_session),
             vec![vec![
                 Some("public".to_string()),
                 Some("postgres".to_string()),
@@ -20901,6 +20968,12 @@ mod tests {
     #[test]
     fn catalog_queries_expose_table_and_column_comments() {
         let mut session = Session::default();
+        session.comments.insert(
+            CatalogCommentTarget::Schema {
+                schema: "public".to_string(),
+            },
+            "application schema".to_string(),
+        );
         session.tables.insert(
             "commented".to_string(),
             Table {
@@ -20963,6 +21036,22 @@ mod tests {
         );
 
         assert_eq!(
+            catalog_psql_describe_schema_verbose_rows(&session),
+            vec![vec![
+                Some("public".to_string()),
+                Some("postgres".to_string()),
+                None,
+                Some("application schema".to_string()),
+            ]]
+        );
+        assert_eq!(
+            pg_catalog_schema_description_rows(&session),
+            vec![vec![
+                Some("public".to_string()),
+                Some("application schema".to_string()),
+            ]]
+        );
+        assert_eq!(
             pg_catalog_description_rows(&session),
             vec![
                 vec![
@@ -20989,6 +21078,12 @@ mod tests {
             pg_dump_description_rows(&session),
             vec![
                 vec![
+                    Some("application schema".to_string()),
+                    Some("2615".to_string()),
+                    Some(PUBLIC_NAMESPACE_OID.to_string()),
+                    Some("0".to_string()),
+                ],
+                vec![
                     Some("lookup table".to_string()),
                     Some("1259".to_string()),
                     Some(FIRST_USER_RELATION_OID.to_string()),
@@ -21011,6 +21106,12 @@ mod tests {
         assert_eq!(
             psql_object_description_rows(&session),
             vec![
+                vec![
+                    Some("public".to_string()),
+                    Some("public".to_string()),
+                    Some("schema".to_string()),
+                    Some("application schema".to_string()),
+                ],
                 vec![
                     Some("public".to_string()),
                     Some("commented".to_string()),
