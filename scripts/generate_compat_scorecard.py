@@ -32,9 +32,9 @@ def classify(test_id: str) -> list[str]:
             buckets.append("protocol.extended_query")
         if re.search(r"transaction|begin|commit|rollback", test_id):
             buckets.append("sql.transaction_flows")
-        if re.search(r"relational|create_table|insert|select|delete|update|column_defaults|column_default|comments|comment", test_id):
+        if re.search(r"relational|create_table|insert|select|delete|update|unique|index|column_defaults|column_default|comments|comment", test_id):
             buckets.append("sql.relational_foundation")
-        if re.search(r"catalog|pg_catalog|introspection|schema|type|column_defaults|column_default|attrdef|comments|comment|description", test_id):
+        if re.search(r"catalog|pg_catalog|introspection|schema|type|unique|index|column_defaults|column_default|attrdef|comments|comment|description", test_id):
             buckets.append("sql.catalog_schema_types")
     if "gpu_db_protocol::" in test_id:
         if re.search(r"startup|frontend|ssl|cancel|session_lifecycle", test_id):
@@ -43,7 +43,7 @@ def classify(test_id: str) -> list[str]:
             buckets.append("protocol.extended_query")
         if re.search(r"parses_|rejects_", test_id):
             buckets.append("sql.parser_features")
-        if re.search(r"relational|create_table|insert|select|column_defaults|column_default|comments|comment", test_id):
+        if re.search(r"relational|create_table|insert|select|unique|index|column_defaults|column_default|comments|comment", test_id):
             buckets.append("sql.relational_foundation")
     if "gpu_db_server::" in test_id and re.search(
         r"simple_query|frontend|protocol|session_reset|copy|truncate|comments|comment|description", test_id
@@ -59,17 +59,17 @@ def classify(test_id: str) -> list[str]:
         )
     if re.search(r"extended|bind|parse|portal|prepared|parameterized|cursor|fetch_count|gdesc", test_id):
         buckets.append("protocol.extended_query")
-    if re.search(r"relational|create_table|insert|select|delete|update|truncate|column_defaults|column_default|comments|comment", test_id):
+    if re.search(r"relational|create_table|insert|select|delete|update|truncate|unique|index|column_defaults|column_default|comments|comment", test_id):
         buckets.append("sql.relational_foundation")
     if re.search(r"sql_gpu|gpu_bridge|relational_sql_select_cuda|relational_sql_select_gpu", test_id):
         buckets.append("sql.gpu_bridge")
     if re.search(
-        r"relational_index|access_path|equality_index|checkpoint_vacuum|checkpoint_control|prune_versions|retention|timestamp_target|archive_ingest|archive_ingests|segment_ingestion|archive_timeline|timeline_branch|timeline_registry|maintenance_cleanup|object_backup|base_checkpoint|checkpoint_plus_wal_archive",
+        r"relational_index|access_path|equality_index|unique_index|checkpoint_vacuum|checkpoint_control|prune_versions|retention|timestamp_target|archive_ingest|archive_ingests|segment_ingestion|archive_timeline|timeline_branch|timeline_registry|maintenance_cleanup|object_backup|base_checkpoint|checkpoint_plus_wal_archive",
         test_id,
     ):
         buckets.append("storage.indexing")
     if re.search(
-        r"relational_catalog|catalog_helpers|catalog_schema|catalog_introspection|shared_catalog|pg_catalog|pg_type|pg_namespace|information_schema|type_metadata|database_metadata|pg_dump|column_id|relation_oid|create_index|catalog_index|column_default|attrdef|comment|description",
+        r"relational_catalog|catalog_helpers|catalog_schema|catalog_introspection|shared_catalog|pg_catalog|pg_type|pg_namespace|information_schema|type_metadata|database_metadata|pg_dump|column_id|relation_oid|create_index|catalog_index|unique_index|column_default|attrdef|comment|description",
         test_id,
     ):
         buckets.append("sql.catalog_schema_types")

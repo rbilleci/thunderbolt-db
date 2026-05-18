@@ -5968,6 +5968,7 @@ pub struct RelationalIndex {
     pub name: String,
     pub table: String,
     pub column: String,
+    pub unique: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -7547,25 +7548,94 @@ impl Engine {
         }
         let table = self
             .relational_catalog
-            .get_mut(&create.table)
+            .get(&create.table)
             .ok_or_else(|| {
                 EngineError::ApplyFailed(format!("relation \"{}\" does not exist", create.table))
-            })?;
-        if !table
+            })?
+            .clone();
+        let Some(column_idx) = table
             .columns
             .iter()
-            .any(|column| column.name == create.column)
-        {
+            .position(|column| column.name == create.column)
+        else {
             return Err(EngineError::ApplyFailed(format!(
                 "column \"{}\" does not exist",
                 create.column
             )));
+        };
+        if create.unique {
+            let visibility = StorageVisibility {
+                read_txn_id: self.visible_up_to as TxnId,
+            };
+            let rows = self.visible_relational_rows(&table, visibility)?;
+            Self::validate_unique_values(&rows, column_idx, &create.name)?;
         }
-        table.indexes.push(RelationalIndex {
-            name: create.name,
-            table: create.table,
-            column: create.column,
-        });
+        self.relational_catalog
+            .get_mut(&create.table)
+            .expect("table existence validated")
+            .indexes
+            .push(RelationalIndex {
+                name: create.name,
+                table: create.table,
+                column: create.column,
+                unique: create.unique,
+            });
+        Ok(())
+    }
+
+    fn visible_relational_rows(
+        &self,
+        table: &RelationalTable,
+        visibility: StorageVisibility,
+    ) -> Result<Vec<Vec<SqlValue>>, EngineError> {
+        let prefix = relational_key_prefix(&table.name);
+        let mut rows = Vec::new();
+        let mut cursor = self
+            .mvcc_store
+            .seq_scan_open(visibility)
+            .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+        while let Some(tuple) = cursor.next() {
+            if tuple.key.starts_with(&prefix) {
+                rows.push(
+                    decode_relational_row(&tuple.value, &table.columns)
+                        .map_err(|err| EngineError::ApplyFailed(err.to_string()))?,
+                );
+            }
+        }
+        Ok(rows)
+    }
+
+    fn validate_unique_values(
+        rows: &[Vec<SqlValue>],
+        column_idx: usize,
+        index_name: &str,
+    ) -> Result<(), EngineError> {
+        let mut seen = BTreeSet::new();
+        for row in rows {
+            if !seen.insert(row[column_idx].clone()) {
+                return Err(EngineError::ApplyFailed(format!(
+                    "duplicate key value violates unique index \"{}\"",
+                    index_name
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_unique_indexes_for_rows(
+        table: &RelationalTable,
+        rows: &[Vec<SqlValue>],
+    ) -> Result<(), EngineError> {
+        for index in table.indexes.iter().filter(|index| index.unique) {
+            let Some(column_idx) = table
+                .columns
+                .iter()
+                .position(|column| column.name == index.column)
+            else {
+                continue;
+            };
+            Self::validate_unique_values(rows, column_idx, &index.name)?;
+        }
         Ok(())
     }
 
@@ -7691,6 +7761,7 @@ impl Engine {
             }
             indexes
         };
+        let mut new_rows = Vec::with_capacity(insert.rows.len());
         for row in insert.rows {
             if row.len() != column_indexes.len() {
                 return Err(EngineError::ApplyFailed(
@@ -7721,6 +7792,21 @@ impl Engine {
                 ));
             }
             let values = values.into_iter().map(Option::unwrap).collect::<Vec<_>>();
+            new_rows.push(values);
+        }
+
+        if table.indexes.iter().any(|index| index.unique) {
+            let mut candidate_rows = self.visible_relational_rows(
+                &table,
+                StorageVisibility {
+                    read_txn_id: txn_id,
+                },
+            )?;
+            candidate_rows.extend(new_rows.clone());
+            Self::validate_unique_indexes_for_rows(&table, &candidate_rows)?;
+        }
+
+        for values in new_rows {
             let row_id = self.relational_next_row_id;
             self.relational_next_row_id += 1;
             let row_key = relational_row_key(&insert.table, row_id);
@@ -7816,6 +7902,7 @@ impl Engine {
         };
         let prefix = relational_key_prefix(&update.table);
         let mut updates = Vec::new();
+        let mut candidate_rows = Vec::new();
         let mut cursor = self
             .mvcc_store
             .seq_scan_open(visibility)
@@ -7836,9 +7923,16 @@ impl Engine {
                     row[*idx] = value.clone();
                 }
                 updates.push((tuple.tuple_id, tuple.key.clone(), row));
+            } else {
+                candidate_rows.push(row);
             }
         }
         drop(cursor);
+
+        if table.indexes.iter().any(|index| index.unique) {
+            candidate_rows.extend(updates.iter().map(|(_, _, row)| row.clone()));
+            Self::validate_unique_indexes_for_rows(&table, &candidate_rows)?;
+        }
 
         for (tuple_id, row_key, values) in updates {
             self.mvcc_store
@@ -7856,6 +7950,187 @@ impl Engine {
             }
         }
         Ok(())
+    }
+
+    fn preflight_unique_index_constraints(
+        &self,
+        cmd: &Command,
+        txn_id: TxnId,
+    ) -> Result<(), EngineError> {
+        match cmd {
+            Command::CreateIndex(create) if create.unique => {
+                if self
+                    .relational_catalog
+                    .values()
+                    .any(|table| table.indexes.iter().any(|index| index.name == create.name))
+                {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "relation \"{}\" already exists",
+                        create.name
+                    )));
+                }
+                let table = self.relational_catalog.get(&create.table).ok_or_else(|| {
+                    EngineError::ApplyFailed(format!(
+                        "relation \"{}\" does not exist",
+                        create.table
+                    ))
+                })?;
+                let column_idx = table
+                    .columns
+                    .iter()
+                    .position(|column| column.name == create.column)
+                    .ok_or_else(|| {
+                        EngineError::ApplyFailed(format!(
+                            "column \"{}\" does not exist",
+                            create.column
+                        ))
+                    })?;
+                let rows = self.visible_relational_rows(
+                    table,
+                    StorageVisibility {
+                        read_txn_id: self.visible_up_to as TxnId,
+                    },
+                )?;
+                Self::validate_unique_values(&rows, column_idx, &create.name)?;
+            }
+            Command::Insert(insert) => {
+                let table = self.relational_catalog.get(&insert.table).ok_or_else(|| {
+                    EngineError::ApplyFailed(format!(
+                        "relation \"{}\" does not exist",
+                        insert.table
+                    ))
+                })?;
+                if !table.indexes.iter().any(|index| index.unique) {
+                    return Ok(());
+                }
+                let column_indexes = if insert.columns.is_empty() {
+                    (0..table.columns.len()).collect::<Vec<_>>()
+                } else {
+                    let mut indexes = Vec::with_capacity(insert.columns.len());
+                    for column in &insert.columns {
+                        let idx = table
+                            .columns
+                            .iter()
+                            .position(|candidate| candidate.name == *column)
+                            .ok_or_else(|| {
+                                EngineError::ApplyFailed(format!(
+                                    "column \"{}\" does not exist",
+                                    column
+                                ))
+                            })?;
+                        indexes.push(idx);
+                    }
+                    indexes
+                };
+                let mut new_rows = Vec::with_capacity(insert.rows.len());
+                for row in &insert.rows {
+                    if row.len() != column_indexes.len() {
+                        return Err(EngineError::ApplyFailed(
+                            "INSERT value count must match target columns".to_string(),
+                        ));
+                    }
+                    let mut values = vec![None; table.columns.len()];
+                    for (source_idx, target_idx) in column_indexes.iter().copied().enumerate() {
+                        let value = row[source_idx].clone();
+                        let expected_ty = table.columns[target_idx].ty;
+                        if !sql_value_matches_type(&value, expected_ty) {
+                            return Err(EngineError::ApplyFailed(format!(
+                                "invalid value for column \"{}\"",
+                                table.columns[target_idx].name
+                            )));
+                        }
+                        values[target_idx] = Some(value);
+                    }
+                    for (idx, value) in values.iter_mut().enumerate() {
+                        if value.is_none() {
+                            *value = table.columns[idx].default.clone();
+                        }
+                    }
+                    if values.iter().any(Option::is_none) {
+                        return Err(EngineError::ApplyFailed(
+                            "INSERT must provide every column without a default in the bootstrap relational subset"
+                                .to_string(),
+                        ));
+                    }
+                    new_rows.push(values.into_iter().map(Option::unwrap).collect());
+                }
+                let mut candidate_rows = self.visible_relational_rows(
+                    table,
+                    StorageVisibility {
+                        read_txn_id: txn_id,
+                    },
+                )?;
+                candidate_rows.extend(new_rows);
+                Self::validate_unique_indexes_for_rows(table, &candidate_rows)?;
+            }
+            Command::Update(update) => {
+                let table = self.relational_catalog.get(&update.table).ok_or_else(|| {
+                    EngineError::ApplyFailed(format!(
+                        "relation \"{}\" does not exist",
+                        update.table
+                    ))
+                })?;
+                if !table.indexes.iter().any(|index| index.unique) {
+                    return Ok(());
+                }
+                let assignments = bind_update_assignments(table, update)
+                    .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+                let filter_groups = bind_delete_filter_groups(
+                    table,
+                    &Delete {
+                        table: update.table.clone(),
+                        filter: update.filter.clone(),
+                        filters: update.filters.clone(),
+                        filter_groups: update.filter_groups.clone(),
+                    },
+                )
+                .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+                let visibility = StorageVisibility {
+                    read_txn_id: txn_id,
+                };
+                let prefix = relational_key_prefix(&update.table);
+                let mut candidate_rows = Vec::new();
+                let mut cursor = self
+                    .mvcc_store
+                    .seq_scan_open(visibility)
+                    .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+                while let Some(tuple) = cursor.next() {
+                    if !tuple.key.starts_with(&prefix) {
+                        continue;
+                    }
+                    let mut row = decode_relational_row(&tuple.value, &table.columns)
+                        .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+                    if filter_groups.iter().any(|filters| {
+                        filters
+                            .iter()
+                            .all(|(idx, op, value)| select_filter_matches(&row[*idx], *op, value))
+                    }) {
+                        for (idx, value) in &assignments {
+                            row[*idx] = value.clone();
+                        }
+                    }
+                    candidate_rows.push(row);
+                }
+                Self::validate_unique_indexes_for_rows(table, &candidate_rows)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn command_requires_immediate_unique_index_commit(&self, cmd: &Command) -> bool {
+        match cmd {
+            Command::CreateIndex(create) => create.unique,
+            Command::Insert(insert) => self
+                .relational_catalog
+                .get(&insert.table)
+                .is_some_and(|table| table.indexes.iter().any(|index| index.unique)),
+            Command::Update(update) => self
+                .relational_catalog
+                .get(&update.table)
+                .is_some_and(|table| table.indexes.iter().any(|index| index.unique)),
+            _ => false,
+        }
     }
 
     pub fn enqueue_set_text(
@@ -7878,6 +8153,12 @@ impl Engine {
             | Command::Update(_) => {
                 if self.repl.role() != Role::Leader {
                     return Err(ExecuteError::Engine(EngineError::NotLeader));
+                }
+                self.preflight_unique_index_constraints(&cmd, txn_id)?;
+                if self.command_requires_immediate_unique_index_commit(&cmd) {
+                    self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
+                    self.commit_mutation(txn_id, text.as_bytes().to_vec())?;
+                    return Ok(());
                 }
 
                 match self.route_command(&cmd) {
@@ -8059,15 +8340,26 @@ impl Engine {
             | Command::CommentOn(_)
             | Command::Insert(_)
             | Command::Delete(_)
-            | Command::Update(_) => match self.route_command(&cmd) {
-                RouteDecision::Gpu(_) | RouteDecision::Cpu => {
-                    self.commit_mutation_at(txn_id, text.as_bytes().to_vec(), timestamp_micros)?;
+            | Command::Update(_) => {
+                self.preflight_unique_index_constraints(&cmd, txn_id)?;
+                match self.route_command(&cmd) {
+                    RouteDecision::Gpu(_) | RouteDecision::Cpu => {
+                        self.commit_mutation_at(
+                            txn_id,
+                            text.as_bytes().to_vec(),
+                            timestamp_micros,
+                        )?;
+                    }
+                    RouteDecision::CpuFallback { reason, .. } => {
+                        self.metrics.inc_gpu_fallback(reason);
+                        self.commit_mutation_at(
+                            txn_id,
+                            text.as_bytes().to_vec(),
+                            timestamp_micros,
+                        )?;
+                    }
                 }
-                RouteDecision::CpuFallback { reason, .. } => {
-                    self.metrics.inc_gpu_fallback(reason);
-                    self.commit_mutation_at(txn_id, text.as_bytes().to_vec(), timestamp_micros)?;
-                }
-            },
+            }
             Command::Flush => {
                 self.flush_admin()?;
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
@@ -30547,6 +30839,7 @@ mod tests {
                 name: "people_name_idx".to_string(),
                 table: "people".to_string(),
                 column: "name".to_string(),
+                unique: false,
             }]
         );
 
@@ -30560,6 +30853,7 @@ mod tests {
                 name: "people_name_idx".to_string(),
                 table: "people".to_string(),
                 column: "name".to_string(),
+                unique: false,
             }]
         );
 
@@ -30581,6 +30875,94 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("column \"missing\" does not exist"));
+    }
+
+    #[test]
+    fn relational_unique_index_rejects_duplicate_create_insert_update_and_replays_from_wal() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO people (id, name) VALUES (1, 'Ada'), (2, 'Grace')",
+        )
+        .unwrap();
+        e.execute_text(3, "CREATE UNIQUE INDEX people_name_uidx ON people (name)")
+            .unwrap();
+
+        let indexes = e
+            .relational_catalog_table("people")
+            .unwrap()
+            .indexes
+            .clone();
+        assert_eq!(
+            indexes,
+            vec![RelationalIndex {
+                name: "people_name_uidx".to_string(),
+                table: "people".to_string(),
+                column: "name".to_string(),
+                unique: true,
+            }]
+        );
+
+        let duplicate_insert = e
+            .execute_text(4, "INSERT INTO people (id, name) VALUES (3, 'Ada')")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            duplicate_insert.contains("duplicate key value violates unique index"),
+            "{duplicate_insert}"
+        );
+        let duplicate_update = e
+            .execute_text(5, "UPDATE people SET name = 'Ada' WHERE id = 2")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            duplicate_update.contains("duplicate key value violates unique index"),
+            "{duplicate_update}"
+        );
+
+        let Command::Select(select) =
+            parse_command("SELECT id, name FROM people ORDER BY id ASC").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let result = e.execute_relational_select(&select).unwrap();
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())],
+                vec![SqlValue::Int4(2), SqlValue::Text("Grace".to_string())],
+            ]
+        );
+
+        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        assert_eq!(
+            recovered
+                .relational_catalog_table("people")
+                .unwrap()
+                .indexes,
+            indexes
+        );
+
+        let mut duplicate_existing = Engine::new_local();
+        duplicate_existing
+            .execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        duplicate_existing
+            .execute_text(
+                2,
+                "INSERT INTO people (id, name) VALUES (1, 'Ada'), (2, 'Ada')",
+            )
+            .unwrap();
+        let create_err = duplicate_existing
+            .execute_text(3, "CREATE UNIQUE INDEX people_name_uidx ON people (name)")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            create_err.contains("duplicate key value violates unique index"),
+            "{create_err}"
+        );
     }
 
     #[test]

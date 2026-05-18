@@ -31,6 +31,7 @@ pub struct CreateIndex {
     pub name: String,
     pub table: String,
     pub column: String,
+    pub unique: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -236,7 +237,7 @@ pub enum ParseError {
     InvalidDel,
     #[error("invalid GET syntax; expected: GET key")]
     InvalidGet,
-    #[error("invalid relational SQL syntax; supported subset: CREATE TABLE name (...), CREATE INDEX name ON table (column), DROP INDEX [IF EXISTS] name, INSERT INTO name (...) VALUES (...), UPDATE name SET column = literal [, ...] WHERE column (=|<|<=|>|>=) literal | column BETWEEN literal AND literal | column IN (literal, ...) | text_column LIKE 'prefix%' [AND ...] [OR ...], DELETE FROM name WHERE column (=|<|<=|>|>=) literal | column BETWEEN literal AND literal | column IN (literal, ...) | text_column LIKE 'prefix%' [AND ...] [OR ...], SELECT [DISTINCT] columns|COUNT(*)|SUM(int4_column)|AVG(int4_column)|MIN(column)|MAX(column)|column, COUNT(*)|column, SUM(int4_column)|column, AVG(int4_column)|column, MIN(column)|column, MAX(column) FROM name [WHERE column (=|<|<=|>|>=) literal | column BETWEEN literal AND literal | column IN (literal, ...) | text_column LIKE 'prefix%' [AND ...] [OR ...]] [GROUP BY column] [HAVING grouped_column|count|sum|avg|min|max (=|<|<=|>|>=) literal [AND ...] [OR ...]] [ORDER BY selected_column|count|sum|avg|min|max [ASC|DESC]] [LIMIT n] [OFFSET n]")]
+    #[error("invalid relational SQL syntax; supported subset: CREATE TABLE name (...), CREATE [UNIQUE] INDEX name ON table (column), DROP INDEX [IF EXISTS] name, INSERT INTO name (...) VALUES (...), UPDATE name SET column = literal [, ...] WHERE column (=|<|<=|>|>=) literal | column BETWEEN literal AND literal | column IN (literal, ...) | text_column LIKE 'prefix%' [AND ...] [OR ...], DELETE FROM name WHERE column (=|<|<=|>|>=) literal | column BETWEEN literal AND literal | column IN (literal, ...) | text_column LIKE 'prefix%' [AND ...] [OR ...], SELECT [DISTINCT] columns|COUNT(*)|SUM(int4_column)|AVG(int4_column)|MIN(column)|MAX(column)|column, COUNT(*)|column, SUM(int4_column)|column, AVG(int4_column)|column, MIN(column)|column, MAX(column) FROM name [WHERE column (=|<|<=|>|>=) literal | column BETWEEN literal AND literal | column IN (literal, ...) | text_column LIKE 'prefix%' [AND ...] [OR ...]] [GROUP BY column] [HAVING grouped_column|count|sum|avg|min|max (=|<|<=|>|>=) literal [AND ...] [OR ...]] [ORDER BY selected_column|count|sum|avg|min|max [ASC|DESC]] [LIMIT n] [OFFSET n]")]
     InvalidRelationalSql,
     #[error("LIMIT must not be negative")]
     NegativeLimit,
@@ -1572,7 +1573,7 @@ fn parse_relational_command(input: &str) -> Option<Result<Command, ParseError>> 
         if second.eq_ignore_ascii_case("TABLE") {
             return Some(parse_create_table(input).map(Command::CreateTable));
         }
-        if second.eq_ignore_ascii_case("INDEX") {
+        if second.eq_ignore_ascii_case("INDEX") || second.eq_ignore_ascii_case("UNIQUE") {
             return Some(parse_create_index(input).map(Command::CreateIndex));
         }
         return Some(Err(ParseError::InvalidRelationalSql));
@@ -1751,7 +1752,15 @@ fn parse_create_table(input: &str) -> Result<CreateTable, ParseError> {
 
 fn parse_create_index(input: &str) -> Result<CreateIndex, ParseError> {
     let rest = strip_keyword_prefix_case_insensitive(input, "CREATE")
-        .and_then(|s| strip_keyword_prefix_case_insensitive(s.trim_start(), "INDEX"))
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    let (unique, rest) =
+        if let Some(after_unique) = strip_keyword_prefix_case_insensitive(rest, "UNIQUE") {
+            (true, after_unique.trim_start())
+        } else {
+            (false, rest)
+        };
+    let rest = strip_keyword_prefix_case_insensitive(rest, "INDEX")
         .ok_or(ParseError::InvalidRelationalSql)?
         .trim_start();
     let on_pos = find_keyword_outside_quotes(rest, "ON").ok_or(ParseError::InvalidRelationalSql)?;
@@ -1782,6 +1791,7 @@ fn parse_create_index(input: &str) -> Result<CreateIndex, ParseError> {
         name,
         table,
         column,
+        unique,
     })
 }
 
@@ -9050,6 +9060,7 @@ mod tests {
                 name: "people_name_idx".to_string(),
                 table: "people".to_string(),
                 column: "name".to_string(),
+                unique: false,
             })
         );
         assert_eq!(
@@ -9059,14 +9070,23 @@ mod tests {
                 name: "people_name_idx".to_string(),
                 table: "people".to_string(),
                 column: "name".to_string(),
+                unique: false,
+            })
+        );
+        assert_eq!(
+            parse_command(
+                "CREATE UNIQUE INDEX people_name_idx ON public.people USING btree (name)"
+            )
+            .unwrap(),
+            Command::CreateIndex(CreateIndex {
+                name: "people_name_idx".to_string(),
+                table: "people".to_string(),
+                column: "name".to_string(),
+                unique: true,
             })
         );
         assert!(matches!(
             parse_command("CREATE INDEX people_name_idx ON people USING hash (name)"),
-            Err(ParseError::InvalidRelationalSql)
-        ));
-        assert!(matches!(
-            parse_command("CREATE UNIQUE INDEX people_name_idx ON people (name)"),
             Err(ParseError::InvalidRelationalSql)
         ));
         assert!(matches!(

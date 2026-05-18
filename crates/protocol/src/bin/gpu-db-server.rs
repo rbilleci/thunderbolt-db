@@ -1177,6 +1177,54 @@ fn format_sql_value(value: &SqlValue) -> String {
     }
 }
 
+fn index_definition_prefix(unique: bool) -> &'static str {
+    if unique {
+        "CREATE UNIQUE INDEX"
+    } else {
+        "CREATE INDEX"
+    }
+}
+
+fn catalog_index_definition(index: &CatalogIndex) -> String {
+    format!(
+        "{} {} ON public.{} USING btree ({})",
+        index_definition_prefix(index.unique),
+        index.name,
+        index.table,
+        index.column
+    )
+}
+
+fn unique_index_violation_error(_index_name: &str) -> ErrorField {
+    ErrorField {
+        code: "23505",
+        message: "duplicate key value violates unique index",
+        position: None,
+    }
+}
+
+fn validate_unique_indexes(table: &Table, indexes: &[CatalogIndex]) -> Result<(), ErrorField> {
+    for index in indexes
+        .iter()
+        .filter(|index| index.table == table.name && index.unique)
+    {
+        let Some(column_idx) = table
+            .columns
+            .iter()
+            .position(|column| column.def.name == index.column)
+        else {
+            continue;
+        };
+        let mut seen = BTreeSet::new();
+        for row in &table.rows {
+            if !seen.insert(row[column_idx].clone()) {
+                return Err(unique_index_violation_error(&index.name));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn format_default_expr(value: &SqlValue) -> String {
     match value {
         SqlValue::Int4(value) => value.to_string(),
@@ -1374,6 +1422,7 @@ struct CatalogIndex {
     name: String,
     table: String,
     column: String,
+    unique: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -4746,6 +4795,7 @@ fn apply_copy_in_rows(session: &mut Session, copy: CopyInState) -> Option<ErrorF
             position: None,
         });
     }
+    let catalog_indexes = session.indexes.clone();
     let table = session.tables.get_mut(&copy.table)?;
     let mut indexes = Vec::with_capacity(copy.columns.len());
     for column in &copy.columns {
@@ -4756,6 +4806,7 @@ fn apply_copy_in_rows(session: &mut Session, copy: CopyInState) -> Option<ErrorF
                 .position(|candidate| candidate.def.name == *column)?,
         );
     }
+    let mut new_rows = Vec::with_capacity(copy.pending_rows.len());
     for row in copy.pending_rows {
         let mut projected = vec![None; table.columns.len()];
         for (source_idx, target_idx) in indexes.iter().copied().enumerate() {
@@ -4773,10 +4824,14 @@ fn apply_copy_in_rows(session: &mut Session, copy: CopyInState) -> Option<ErrorF
                 position: None,
             });
         }
-        table
-            .rows
-            .push(projected.into_iter().map(Option::unwrap).collect());
+        new_rows.push(projected.into_iter().map(Option::unwrap).collect());
     }
+    let mut candidate_table = table.clone();
+    candidate_table.rows.extend(new_rows.clone());
+    if let Err(error) = validate_unique_indexes(&candidate_table, &catalog_indexes) {
+        return Some(error);
+    }
+    table.rows.extend(new_rows);
     session.mark_table_dirty(copy.table);
     session.persist_catalog_snapshot();
     None
@@ -5467,10 +5522,23 @@ fn execute_statement(
                         },
                     );
                 }
+                if create.unique {
+                    let mut candidate_indexes = session.indexes.clone();
+                    candidate_indexes.push(CatalogIndex {
+                        name: create.name.clone(),
+                        table: create.table.clone(),
+                        column: create.column.clone(),
+                        unique: true,
+                    });
+                    if let Err(error) = validate_unique_indexes(table, &candidate_indexes) {
+                        return write_error(stream, &error);
+                    }
+                }
                 session.indexes.push(CatalogIndex {
                     name: create.name,
                     table: create.table.clone(),
                     column: create.column,
+                    unique: create.unique,
                 });
                 session.dirty_indexes = true;
                 session.persist_catalog_snapshot();
@@ -5612,6 +5680,7 @@ fn execute_statement(
             }
             Command::Insert(insert) => {
                 let table_name = insert.table;
+                let catalog_indexes = session.indexes.clone();
                 let Some(table) = session.tables.get_mut(&table_name) else {
                     return write_error(
                         stream,
@@ -5646,6 +5715,7 @@ fn execute_statement(
                     indexes
                 };
                 let inserted_count = insert.rows.len();
+                let mut new_rows = Vec::with_capacity(inserted_count);
                 for row in insert.rows {
                     if row.len() != indexes.len() {
                         return write_error(
@@ -5689,10 +5759,14 @@ fn execute_statement(
                             },
                         );
                     }
-                    table
-                        .rows
-                        .push(projected.into_iter().map(Option::unwrap).collect());
+                    new_rows.push(projected.into_iter().map(Option::unwrap).collect());
                 }
+                let mut candidate_table = table.clone();
+                candidate_table.rows.extend(new_rows.clone());
+                if let Err(error) = validate_unique_indexes(&candidate_table, &catalog_indexes) {
+                    return write_error(stream, &error);
+                }
+                table.rows.extend(new_rows);
                 session.mark_table_dirty(table_name);
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, &format!("INSERT 0 {inserted_count}"));
@@ -5729,6 +5803,7 @@ fn execute_statement(
             }
             Command::Update(update) => {
                 let table_name = update.table.clone();
+                let catalog_indexes = session.indexes.clone();
                 let Some(table) = session.tables.get_mut(&table_name) else {
                     return write_error(
                         stream,
@@ -5792,13 +5867,20 @@ fn execute_statement(
                     }
                 }
                 let updated_count = update_mask.iter().filter(|matches| **matches).count();
-                for (row, matches) in table.rows.iter_mut().zip(update_mask) {
+                let mut candidate_rows = table.rows.clone();
+                for (row, matches) in candidate_rows.iter_mut().zip(update_mask) {
                     if matches {
                         for (idx, value) in &assignments {
                             row[*idx] = value.clone();
                         }
                     }
                 }
+                let mut candidate_table = table.clone();
+                candidate_table.rows = candidate_rows;
+                if let Err(error) = validate_unique_indexes(&candidate_table, &catalog_indexes) {
+                    return write_error(stream, &error);
+                }
+                table.rows = candidate_table.rows;
                 session.mark_table_dirty(table_name);
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, &format!("UPDATE {updated_count}"));
@@ -8102,10 +8184,7 @@ fn pg_dump_index_metadata_rows(session: &Session) -> Vec<Vec<Option<String>>> {
                 Some(entry.index_oid.to_string()),
                 Some(entry.table_oid.to_string()),
                 Some(entry.index.name.clone()),
-                Some(format!(
-                    "CREATE INDEX {} ON public.{} USING btree ({})",
-                    entry.index.name, entry.table_name, entry.index.column
-                )),
+                Some(catalog_index_definition(&entry.index)),
                 Some(entry.attnum.to_string()),
                 Some("f".to_string()),
                 None,
@@ -8132,7 +8211,6 @@ fn pg_dump_index_metadata_rows(session: &Session) -> Vec<Vec<Option<String>>> {
 #[derive(Clone)]
 struct CatalogIndexEntry {
     table_oid: u32,
-    table_name: String,
     attnum: i16,
     index_oid: u32,
     index: CatalogIndex,
@@ -8160,9 +8238,8 @@ fn catalog_index_entries(session: &Session) -> Vec<CatalogIndexEntry> {
         .into_iter()
         .enumerate()
         .map(
-            |(idx, (table_oid, table_name, attnum, index))| CatalogIndexEntry {
+            |(idx, (table_oid, _table_name, attnum, index))| CatalogIndexEntry {
                 table_oid,
-                table_name,
                 attnum,
                 index_oid: FIRST_USER_INDEX_OID + idx as u32,
                 index,
@@ -9035,10 +9112,7 @@ fn pg_catalog_index_rows(session: &Session) -> Vec<Vec<Option<String>>> {
             (
                 index.table.clone(),
                 index.name.clone(),
-                format!(
-                    "CREATE INDEX {} ON public.{} USING btree ({})",
-                    index.name, index.table, index.column
-                ),
+                catalog_index_definition(index),
             )
         })
         .collect::<Vec<_>>();
@@ -11494,6 +11568,7 @@ mod tests {
             name: "people_name_idx".to_string(),
             table: "people".to_string(),
             column: "id".to_string(),
+            unique: false,
         });
         session.comments.insert(
             CatalogCommentTarget::Index {
@@ -11594,6 +11669,7 @@ mod tests {
             name: index_name.to_string(),
             table: table_name.to_string(),
             column: "id".to_string(),
+            unique: false,
         });
         session.mark_table_dirty(table_name);
         session.dirty_indexes = true;
@@ -11708,12 +11784,14 @@ mod tests {
             name: index_name.to_string(),
             table: table_name.to_string(),
             column: "id".to_string(),
+            unique: false,
         });
         index_session.dirty_indexes = true;
         other_index_session.indexes.push(CatalogIndex {
             name: other_index_name.to_string(),
             table: other_table_name.to_string(),
             column: "id".to_string(),
+            unique: false,
         });
         other_index_session.dirty_indexes = true;
 

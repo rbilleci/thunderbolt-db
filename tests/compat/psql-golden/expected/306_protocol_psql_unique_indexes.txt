@@ -1,0 +1,39 @@
+=== unique index enforcement ===
+CREATE TABLE
+INSERT 0 2
+CREATE INDEX
+ schemaname |   tablename   |        indexname        |                                        indexdef
+------------+---------------+-------------------------+----------------------------------------------------------------------------------------
+ public     | unique_people | unique_people_name_uidx | CREATE UNIQUE INDEX unique_people_name_uidx ON public.unique_people USING btree (name)
+(1 row)
+
+                                                   List of relations
+ Schema |          Name           | Type  |  Owner   |     Table     | Persistence | Access method | Size | Description
+--------+-------------------------+-------+----------+---------------+-------------+---------------+------+-------------
+ public | unique_people_name_uidx | index | postgres | unique_people | permanent   | btree         |      |
+(1 row)
+
+psql:306_protocol_psql_unique_indexes.sql:7: ERROR:  duplicate key value violates unique index
+ id | name
+----+-------
+  1 | Ada
+  2 | Grace
+(2 rows)
+
+psql:306_protocol_psql_unique_indexes.sql:9: ERROR:  duplicate key value violates unique index
+ id | name
+----+-------
+  1 | Ada
+  2 | Grace
+(2 rows)
+
+psql:306_protocol_psql_unique_indexes.sql:13: ERROR:  duplicate key value violates unique index
+ id | name
+----+-------
+  1 | Ada
+  2 | Grace
+(2 rows)
+
+CREATE TABLE
+INSERT 0 2
+psql:306_protocol_psql_unique_indexes.sql:17: ERROR:  duplicate key value violates unique index
