@@ -60,6 +60,7 @@ impl Planner {
             },
             Command::CreateTable(_)
             | Command::CreateIndex(_)
+            | Command::DropIndex(_)
             | Command::AlterColumnDefault(_)
             | Command::CommentOn(_)
             | Command::Insert(_)

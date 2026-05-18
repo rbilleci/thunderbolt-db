@@ -7,8 +7,7 @@ CREATE INDEX
  public | di_empty_people_name_idx | index | postgres | di_empty_people
 (1 row)
 
-                           List of relations
- Schema |           Name           | Type  |  Owner   |      Table
---------+--------------------------+-------+----------+-----------------
- public | di_empty_people_name_idx | index | postgres | di_empty_people
-(1 row)
+DROP INDEX
+psql:21_catalog_psql_list_indexes_empty.sql:6: error: Did not find any relations.
+DROP INDEX
+psql:21_catalog_psql_list_indexes_empty.sql:8: error: Did not find any relation named "public.*".

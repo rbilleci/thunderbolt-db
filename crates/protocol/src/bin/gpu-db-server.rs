@@ -4389,18 +4389,6 @@ fn parse_drop_table(statement: &str) -> Option<DropTable> {
     })
 }
 
-fn parse_drop_index_if_exists(statement: &str) -> Option<String> {
-    let statement = strip_leading_sql_comments(statement.trim())?;
-    let canonical = canonical_sql(statement);
-    let target = canonical.strip_prefix("drop index if exists ")?.trim();
-    let mut parts = target.split_whitespace();
-    let index = parts.next()?;
-    if parts.next().is_some() || !is_simple_copy_table_name(index) {
-        return None;
-    }
-    Some(index.strip_prefix("public.").unwrap_or(index).to_string())
-}
-
 fn copy_text_value(value: &SqlValue) -> String {
     format_sql_value(value)
         .replace('\\', r"\\")
@@ -5150,13 +5138,6 @@ fn execute_statement(
         session.persist_catalog_snapshot();
         return write_command_complete(stream, "DROP TABLE");
     }
-    if let Some(index_name) = parse_drop_index_if_exists(statement) {
-        let old_index_count = session.indexes.len();
-        session.indexes.retain(|index| index.name != index_name);
-        session.dirty_indexes |= session.indexes.len() != old_index_count;
-        session.persist_catalog_snapshot();
-        return write_command_complete(stream, "DROP INDEX");
-    }
     if canonical == "select pg_catalog.set_config('search_path', '', false)" {
         return write_single_row(
             stream,
@@ -5486,6 +5467,23 @@ fn execute_statement(
                 session.dirty_indexes = true;
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, "CREATE INDEX");
+            }
+            Command::DropIndex(drop) => {
+                let old_index_count = session.indexes.len();
+                session.indexes.retain(|index| index.name != drop.name);
+                if session.indexes.len() == old_index_count && !drop.if_exists {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "42704",
+                            message: "index does not exist",
+                            position: None,
+                        },
+                    );
+                }
+                session.dirty_indexes |= session.indexes.len() != old_index_count;
+                session.persist_catalog_snapshot();
+                return write_command_complete(stream, "DROP INDEX");
             }
             Command::AlterColumnDefault(alter) => {
                 let Some(table) = session.tables.get_mut(&alter.table) else {
@@ -11546,26 +11544,6 @@ mod tests {
         catalog
             .indexes
             .retain(|index| index.name != other_index_name);
-    }
-
-    #[test]
-    fn clean_restore_drop_index_if_exists_is_narrow() {
-        assert_eq!(
-            parse_drop_index_if_exists("DROP INDEX IF EXISTS public.accounts_name_idx;"),
-            Some("accounts_name_idx".to_string())
-        );
-        assert_eq!(
-            parse_drop_index_if_exists("-- restore cleanup\nDROP INDEX IF EXISTS events_note_idx;"),
-            Some("events_note_idx".to_string())
-        );
-        assert_eq!(
-            parse_drop_index_if_exists("DROP INDEX accounts_name_idx"),
-            None
-        );
-        assert_eq!(
-            parse_drop_index_if_exists("DROP INDEX IF EXISTS public.a, public.b"),
-            None
-        );
     }
 
     #[test]

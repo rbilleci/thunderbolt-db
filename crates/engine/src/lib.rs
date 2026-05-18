@@ -19,8 +19,8 @@ use gpu_db_observability::{
 };
 use gpu_db_planner::{ExecutionPlan, Planner, PlannerConfig};
 use gpu_db_protocol::{
-    parse_command, ColumnDef, Command, CommentTarget, CreateIndex, CreateTable, Delete, Insert,
-    ParseError, Select, SelectFilterOp, SelectProjection, SqlType, SqlValue, Update,
+    parse_command, ColumnDef, Command, CommentTarget, CreateIndex, CreateTable, Delete, DropIndex,
+    Insert, ParseError, Select, SelectFilterOp, SelectProjection, SqlType, SqlValue, Update,
 };
 use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine};
 use gpu_db_storage::{
@@ -72,6 +72,7 @@ impl ReplicatedStateMachine for KvStateMachine {
                     | Command::GetKv { .. }
                     | Command::CreateTable(_)
                     | Command::CreateIndex(_)
+                    | Command::DropIndex(_)
                     | Command::AlterColumnDefault(_)
                     | Command::CommentOn(_)
                     | Command::Insert(_)
@@ -7472,6 +7473,7 @@ impl Engine {
             }
             Command::CreateTable(create) => self.apply_create_table(create)?,
             Command::CreateIndex(create) => self.apply_create_index(create)?,
+            Command::DropIndex(drop) => self.apply_drop_index(drop)?,
             Command::AlterColumnDefault(alter) => self.apply_alter_column_default(alter)?,
             Command::CommentOn(comment) => self.apply_comment_on(comment)?,
             Command::Insert(insert) => self.apply_insert(insert, txn_id)?,
@@ -7564,6 +7566,23 @@ impl Engine {
             column: create.column,
         });
         Ok(())
+    }
+
+    fn apply_drop_index(&mut self, drop: DropIndex) -> Result<(), EngineError> {
+        for table in self.relational_catalog.values_mut() {
+            let old_len = table.indexes.len();
+            table.indexes.retain(|index| index.name != drop.name);
+            if table.indexes.len() != old_len {
+                return Ok(());
+            }
+        }
+        if drop.if_exists {
+            return Ok(());
+        }
+        Err(EngineError::ApplyFailed(format!(
+            "index \"{}\" does not exist",
+            drop.name
+        )))
     }
 
     fn apply_comment_on(&mut self, comment: gpu_db_protocol::CommentOn) -> Result<(), EngineError> {
@@ -7832,6 +7851,7 @@ impl Engine {
             | Command::DeleteKv { .. }
             | Command::CreateTable(_)
             | Command::CreateIndex(_)
+            | Command::DropIndex(_)
             | Command::AlterColumnDefault(_)
             | Command::CommentOn(_)
             | Command::Insert(_)
@@ -8015,6 +8035,7 @@ impl Engine {
             | Command::DeleteKv { .. }
             | Command::CreateTable(_)
             | Command::CreateIndex(_)
+            | Command::DropIndex(_)
             | Command::AlterColumnDefault(_)
             | Command::CommentOn(_)
             | Command::Insert(_)
@@ -8094,6 +8115,7 @@ impl Engine {
             Command::DeleteKv { .. } => Err(ExecuteError::NonReadCommand("DEL/DELETE")),
             Command::CreateTable(_) => Err(ExecuteError::NonReadCommand("CREATE TABLE")),
             Command::CreateIndex(_) => Err(ExecuteError::NonReadCommand("CREATE INDEX")),
+            Command::DropIndex(_) => Err(ExecuteError::NonReadCommand("DROP INDEX")),
             Command::AlterColumnDefault(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
             Command::CommentOn(_) => Err(ExecuteError::NonReadCommand("COMMENT")),
             Command::Insert(_) => Err(ExecuteError::NonReadCommand("INSERT")),
@@ -30532,6 +30554,40 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("column \"missing\" does not exist"));
+    }
+
+    #[test]
+    fn relational_catalog_drops_index_and_replays_from_wal() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(2, "CREATE INDEX people_name_idx ON people (name)")
+            .unwrap();
+        e.execute_text(3, "DROP INDEX public.people_name_idx")
+            .unwrap();
+        assert!(e
+            .relational_catalog_table("people")
+            .unwrap()
+            .indexes
+            .is_empty());
+
+        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        assert!(recovered
+            .relational_catalog_table("people")
+            .unwrap()
+            .indexes
+            .is_empty());
+
+        e.execute_text(4, "DROP INDEX IF EXISTS people_name_idx")
+            .unwrap();
+        let missing_err = e
+            .execute_text(5, "DROP INDEX people_name_idx")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            missing_err.contains("index \"people_name_idx\" does not exist"),
+            "{missing_err}"
+        );
     }
 
     #[test]

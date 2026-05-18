@@ -2,4 +2,7 @@
 CREATE TABLE di_empty_people (id INT, name TEXT);
 CREATE INDEX di_empty_people_name_idx ON di_empty_people (name);
 \di
+DROP INDEX public.di_empty_people_name_idx;
+\di
+DROP INDEX IF EXISTS public.di_empty_people_name_idx;
 \di public.*

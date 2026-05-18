@@ -5,3 +5,14 @@ CREATE INDEX
 ------------+-------------------+----------------------------+----------------------------------------------------------------------------------------
  public     | pg_indexes_people | pg_indexes_people_name_idx | CREATE INDEX pg_indexes_people_name_idx ON public.pg_indexes_people USING btree (name)
 (1 row)
+
+DROP INDEX
+ schemaname | tablename | indexname | indexdef
+------------+-----------+-----------+----------
+(0 rows)
+
+DROP INDEX
+psql:28_catalog_pg_indexes.sql:8: ERROR:  index does not exist
+ schemaname | tablename | indexname | indexdef
+------------+-----------+-----------+----------
+(0 rows)

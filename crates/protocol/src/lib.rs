@@ -11,6 +11,7 @@ pub enum Command {
     GetKv { key: String },
     CreateTable(CreateTable),
     CreateIndex(CreateIndex),
+    DropIndex(DropIndex),
     AlterColumnDefault(AlterColumnDefault),
     CommentOn(CommentOn),
     Insert(Insert),
@@ -30,6 +31,12 @@ pub struct CreateIndex {
     pub name: String,
     pub table: String,
     pub column: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropIndex {
+    pub name: String,
+    pub if_exists: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -228,7 +235,7 @@ pub enum ParseError {
     InvalidDel,
     #[error("invalid GET syntax; expected: GET key")]
     InvalidGet,
-    #[error("invalid relational SQL syntax; supported subset: CREATE TABLE name (...), CREATE INDEX name ON table (column), INSERT INTO name (...) VALUES (...), UPDATE name SET column = literal [, ...] WHERE column (=|<|<=|>|>=) literal | column BETWEEN literal AND literal | column IN (literal, ...) | text_column LIKE 'prefix%' [AND ...] [OR ...], DELETE FROM name WHERE column (=|<|<=|>|>=) literal | column BETWEEN literal AND literal | column IN (literal, ...) | text_column LIKE 'prefix%' [AND ...] [OR ...], SELECT [DISTINCT] columns|COUNT(*)|SUM(int4_column)|AVG(int4_column)|MIN(column)|MAX(column)|column, COUNT(*)|column, SUM(int4_column)|column, AVG(int4_column)|column, MIN(column)|column, MAX(column) FROM name [WHERE column (=|<|<=|>|>=) literal | column BETWEEN literal AND literal | column IN (literal, ...) | text_column LIKE 'prefix%' [AND ...] [OR ...]] [GROUP BY column] [HAVING grouped_column|count|sum|avg|min|max (=|<|<=|>|>=) literal [AND ...] [OR ...]] [ORDER BY selected_column|count|sum|avg|min|max [ASC|DESC]] [LIMIT n] [OFFSET n]")]
+    #[error("invalid relational SQL syntax; supported subset: CREATE TABLE name (...), CREATE INDEX name ON table (column), DROP INDEX [IF EXISTS] name, INSERT INTO name (...) VALUES (...), UPDATE name SET column = literal [, ...] WHERE column (=|<|<=|>|>=) literal | column BETWEEN literal AND literal | column IN (literal, ...) | text_column LIKE 'prefix%' [AND ...] [OR ...], DELETE FROM name WHERE column (=|<|<=|>|>=) literal | column BETWEEN literal AND literal | column IN (literal, ...) | text_column LIKE 'prefix%' [AND ...] [OR ...], SELECT [DISTINCT] columns|COUNT(*)|SUM(int4_column)|AVG(int4_column)|MIN(column)|MAX(column)|column, COUNT(*)|column, SUM(int4_column)|column, AVG(int4_column)|column, MIN(column)|column, MAX(column) FROM name [WHERE column (=|<|<=|>|>=) literal | column BETWEEN literal AND literal | column IN (literal, ...) | text_column LIKE 'prefix%' [AND ...] [OR ...]] [GROUP BY column] [HAVING grouped_column|count|sum|avg|min|max (=|<|<=|>|>=) literal [AND ...] [OR ...]] [ORDER BY selected_column|count|sum|avg|min|max [ASC|DESC]] [LIMIT n] [OFFSET n]")]
     InvalidRelationalSql,
     #[error("LIMIT must not be negative")]
     NegativeLimit,
@@ -1569,6 +1576,13 @@ fn parse_relational_command(input: &str) -> Option<Result<Command, ParseError>> 
         }
         return Some(Err(ParseError::InvalidRelationalSql));
     }
+    if first.eq_ignore_ascii_case("DROP") {
+        let second = input.split_whitespace().nth(1)?;
+        if second.eq_ignore_ascii_case("INDEX") {
+            return Some(parse_drop_index(input).map(Command::DropIndex));
+        }
+        return Some(Err(ParseError::InvalidRelationalSql));
+    }
     if first.eq_ignore_ascii_case("ALTER") {
         return Some(parse_alter_column_default(input).map(Command::AlterColumnDefault));
     }
@@ -1758,6 +1772,38 @@ fn parse_create_index(input: &str) -> Result<CreateIndex, ParseError> {
         name,
         table,
         column,
+    })
+}
+
+fn parse_drop_index(input: &str) -> Result<DropIndex, ParseError> {
+    let mut rest = strip_keyword_prefix_case_insensitive(input, "DROP")
+        .and_then(|s| strip_keyword_prefix_case_insensitive(s.trim_start(), "INDEX"))
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    if strip_keyword_prefix_case_insensitive(rest, "CONCURRENTLY").is_some() {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let if_exists = if let Some(after_if) = strip_keyword_prefix_case_insensitive(rest, "IF") {
+        let after_exists = strip_keyword_prefix_case_insensitive(after_if.trim_start(), "EXISTS")
+            .ok_or(ParseError::InvalidRelationalSql)?;
+        rest = after_exists.trim_start();
+        true
+    } else {
+        false
+    };
+    if rest.is_empty() || find_keyword_outside_quotes(rest, "CASCADE").is_some() {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    if find_keyword_outside_quotes(rest, "RESTRICT").is_some() {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let indexes = split_csv(rest)?;
+    let [index] = indexes.as_slice() else {
+        return Err(ParseError::InvalidRelationalSql);
+    };
+    Ok(DropIndex {
+        name: normalize_relation_identifier(index.trim())?,
+        if_exists,
     })
 }
 
@@ -9005,6 +9051,32 @@ mod tests {
         ));
         assert!(matches!(
             parse_command("CREATE INDEX people_multi_idx ON people (id, name)"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert_eq!(
+            parse_command("DROP INDEX public.people_name_idx").unwrap(),
+            Command::DropIndex(DropIndex {
+                name: "people_name_idx".to_string(),
+                if_exists: false,
+            })
+        );
+        assert_eq!(
+            parse_command("DROP INDEX IF EXISTS people_name_idx").unwrap(),
+            Command::DropIndex(DropIndex {
+                name: "people_name_idx".to_string(),
+                if_exists: true,
+            })
+        );
+        assert!(matches!(
+            parse_command("DROP INDEX CONCURRENTLY people_name_idx"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command("DROP INDEX public.a, public.b"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command("DROP INDEX people_name_idx CASCADE"),
             Err(ParseError::InvalidRelationalSql)
         ));
 
