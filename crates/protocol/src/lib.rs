@@ -73,6 +73,7 @@ pub enum CommentTarget {
     Table { table: String },
     Column { table: String, column: String },
     Index { index: String },
+    Constraint { table: String, constraint: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1668,6 +1669,19 @@ fn parse_comment_on(input: &str) -> Result<CommentOn, ParseError> {
         (
             CommentTarget::Index { index },
             rest[is_pos + "IS".len()..].trim(),
+        )
+    } else if let Some(rest) = strip_keyword_prefix_case_insensitive(rest, "CONSTRAINT") {
+        let rest = rest.trim_start();
+        let on_pos =
+            find_keyword_outside_quotes(rest, "ON").ok_or(ParseError::InvalidRelationalSql)?;
+        let constraint = normalize_identifier(rest[..on_pos].trim())?;
+        let after_on = rest[on_pos + "ON".len()..].trim_start();
+        let is_pos =
+            find_keyword_outside_quotes(after_on, "IS").ok_or(ParseError::InvalidRelationalSql)?;
+        let table = normalize_relation_identifier(after_on[..is_pos].trim())?;
+        (
+            CommentTarget::Constraint { table, constraint },
+            after_on[is_pos + "IS".len()..].trim(),
         )
     } else {
         return Err(ParseError::InvalidRelationalSql);
@@ -9130,6 +9144,18 @@ mod tests {
                     index: "people_name_idx".to_string(),
                 },
                 comment: Some("lookup index".to_string()),
+            })
+        );
+
+        assert_eq!(
+            parse_command("COMMENT ON CONSTRAINT people_pkey ON public.people IS 'row identity'")
+                .unwrap(),
+            Command::CommentOn(CommentOn {
+                target: CommentTarget::Constraint {
+                    table: "people".to_string(),
+                    constraint: "people_pkey".to_string(),
+                },
+                comment: Some("row identity".to_string()),
             })
         );
 

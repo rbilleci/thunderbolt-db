@@ -1225,6 +1225,34 @@ fn validate_unique_indexes(table: &Table, indexes: &[CatalogIndex]) -> Result<()
     Ok(())
 }
 
+fn shared_catalog_contains_table(table: &str) -> bool {
+    shared_catalog()
+        .lock()
+        .expect("shared catalog mutex poisoned")
+        .tables
+        .contains_key(table)
+}
+
+fn shared_catalog_contains_live_index(index: &str) -> bool {
+    let catalog = shared_catalog()
+        .lock()
+        .expect("shared catalog mutex poisoned");
+    catalog
+        .indexes
+        .iter()
+        .any(|candidate| candidate.name == index && catalog.tables.contains_key(&candidate.table))
+}
+
+fn shared_catalog_contains_primary_key_constraint(table: &str, constraint: &str) -> bool {
+    let catalog = shared_catalog()
+        .lock()
+        .expect("shared catalog mutex poisoned");
+    catalog.tables.contains_key(table)
+        && catalog.indexes.iter().any(|candidate| {
+            candidate.table == table && candidate.name == constraint && candidate.primary_key
+        })
+}
+
 fn add_primary_key_to_session(
     session: &mut Session,
     table_name: &str,
@@ -1497,6 +1525,7 @@ enum CatalogCommentTarget {
     Table { table: String },
     Column { table: String, attnum: i16 },
     Index { index: String },
+    Constraint { table: String, constraint: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -4482,6 +4511,13 @@ struct DropTable {
     if_exists: bool,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct DropConstraint {
+    table: String,
+    constraint: String,
+    if_exists: bool,
+}
+
 fn parse_drop_table(statement: &str) -> Option<DropTable> {
     let statement = strip_leading_sql_comments(statement.trim())?;
     let canonical = canonical_sql(statement);
@@ -4502,6 +4538,35 @@ fn parse_drop_table(statement: &str) -> Option<DropTable> {
     }
     Some(DropTable {
         table: table.strip_prefix("public.").unwrap_or(table).to_string(),
+        if_exists,
+    })
+}
+
+fn parse_alter_table_drop_constraint(statement: &str) -> Option<DropConstraint> {
+    let statement = strip_leading_sql_comments(statement.trim())?;
+    let canonical = canonical_sql(statement);
+    let mut target = canonical.strip_prefix("alter table ")?;
+    target = target.strip_prefix("if exists ").unwrap_or(target).trim();
+    target = target.strip_prefix("only ").unwrap_or(target).trim();
+    let (table, rest) = target.split_once(" drop constraint ")?;
+    if !is_simple_copy_table_name(table) {
+        return None;
+    }
+    let mut rest = rest.trim();
+    let if_exists = if let Some(remaining) = rest.strip_prefix("if exists ") {
+        rest = remaining.trim();
+        true
+    } else {
+        false
+    };
+    let mut parts = rest.split_whitespace();
+    let constraint = parts.next()?;
+    if parts.next().is_some() || !is_simple_copy_identifier(constraint) {
+        return None;
+    }
+    Some(DropConstraint {
+        table: table.strip_prefix("public.").unwrap_or(table).to_string(),
+        constraint: constraint.to_string(),
         if_exists,
     })
 }
@@ -5255,7 +5320,8 @@ fn execute_statement(
             .keys()
             .filter(|target| match target {
                 CatalogCommentTarget::Table { table }
-                | CatalogCommentTarget::Column { table, .. } => table == &drop.table,
+                | CatalogCommentTarget::Column { table, .. }
+                | CatalogCommentTarget::Constraint { table, .. } => table == &drop.table,
                 CatalogCommentTarget::Index { index } => dropped_index_names.contains(index),
             })
             .cloned()
@@ -5267,6 +5333,52 @@ fn execute_statement(
         session.mark_table_dirty(drop.table);
         session.persist_catalog_snapshot();
         return write_command_complete(stream, "DROP TABLE");
+    }
+    if let Some(drop) = parse_alter_table_drop_constraint(statement) {
+        if !session.tables.contains_key(&drop.table) {
+            if drop.if_exists {
+                return write_command_complete(stream, "ALTER TABLE");
+            }
+            return write_error(
+                stream,
+                &ErrorField {
+                    code: "42P01",
+                    message: "relation does not exist",
+                    position: None,
+                },
+            );
+        }
+        let old_index_count = session.indexes.len();
+        session.indexes.retain(|index| {
+            !(index.table == drop.table && index.name == drop.constraint && index.primary_key)
+        });
+        if session.indexes.len() == old_index_count && !drop.if_exists {
+            return write_error(
+                stream,
+                &ErrorField {
+                    code: "42704",
+                    message: "constraint does not exist",
+                    position: None,
+                },
+            );
+        }
+        session.dirty_indexes |= session.indexes.len() != old_index_count;
+        if session.indexes.len() != old_index_count {
+            for target in [
+                CatalogCommentTarget::Index {
+                    index: drop.constraint.clone(),
+                },
+                CatalogCommentTarget::Constraint {
+                    table: drop.table.clone(),
+                    constraint: drop.constraint.clone(),
+                },
+            ] {
+                session.comments.remove(&target);
+                session.mark_comment_dirty(target);
+            }
+        }
+        session.persist_catalog_snapshot();
+        return write_command_complete(stream, "ALTER TABLE");
     }
     if canonical == "select pg_catalog.set_config('search_path', '', false)" {
         return write_single_row(
@@ -5660,6 +5772,23 @@ fn execute_statement(
                     };
                     session.comments.remove(&target);
                     session.mark_comment_dirty(target);
+                    let dropped_constraint_targets = session
+                        .comments
+                        .keys()
+                        .filter(|target| match target {
+                            CatalogCommentTarget::Constraint { constraint, .. } => {
+                                constraint == &drop.name
+                            }
+                            CatalogCommentTarget::Table { .. }
+                            | CatalogCommentTarget::Column { .. }
+                            | CatalogCommentTarget::Index { .. } => false,
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    for target in dropped_constraint_targets {
+                        session.comments.remove(&target);
+                        session.mark_comment_dirty(target);
+                    }
                 }
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, "DROP INDEX");
@@ -5750,9 +5879,11 @@ fn execute_statement(
                         }
                     }
                     CommentTarget::Index { index } => {
-                        if !session.indexes.iter().any(|candidate| {
+                        let exists = session.indexes.iter().any(|candidate| {
                             candidate.name == index && session.tables.contains_key(&candidate.table)
-                        }) {
+                        }) || (session.shared_catalog
+                            && shared_catalog_contains_live_index(&index));
+                        if !exists {
                             return write_error(
                                 stream,
                                 &ErrorField {
@@ -5763,6 +5894,37 @@ fn execute_statement(
                             );
                         }
                         CatalogCommentTarget::Index { index }
+                    }
+                    CommentTarget::Constraint { table, constraint } => {
+                        let table_exists = session.tables.contains_key(&table)
+                            || (session.shared_catalog && shared_catalog_contains_table(&table));
+                        if !table_exists {
+                            return write_error(
+                                stream,
+                                &ErrorField {
+                                    code: "42P01",
+                                    message: "relation does not exist",
+                                    position: None,
+                                },
+                            );
+                        }
+                        let exists = session.indexes.iter().any(|candidate| {
+                            candidate.table == table
+                                && candidate.name == constraint
+                                && candidate.primary_key
+                        }) || (session.shared_catalog
+                            && shared_catalog_contains_primary_key_constraint(&table, &constraint));
+                        if !exists {
+                            return write_error(
+                                stream,
+                                &ErrorField {
+                                    code: "42704",
+                                    message: "constraint does not exist",
+                                    position: None,
+                                },
+                            );
+                        }
+                        CatalogCommentTarget::Constraint { table, constraint }
                     }
                 };
                 if let Some(value) = comment.comment {
@@ -7262,6 +7424,18 @@ fn execute_statement(
                 text_column("description"),
             ],
             &pg_catalog_description_rows(session),
+        );
+    }
+    if canonical == pg_catalog_constraint_descriptions_query() {
+        return write_single_row(
+            stream,
+            &[
+                text_column("nspname"),
+                text_column("relname"),
+                text_column("conname"),
+                text_column("description"),
+            ],
+            &pg_catalog_constraint_description_rows(session),
         );
     }
     if canonical == pg_catalog_table_index_descriptions_query() {
@@ -9945,6 +10119,10 @@ fn pg_catalog_descriptions_query() -> &'static str {
     "select n.nspname, c.relname, a.attname, d.description from pg_catalog.pg_description d join pg_catalog.pg_class c on c.oid = d.objoid join pg_catalog.pg_namespace n on n.oid = c.relnamespace left join pg_catalog.pg_attribute a on a.attrelid = c.oid and a.attnum = d.objsubid where n.nspname = 'public' and c.relkind = 'r' order by c.relname, d.objsubid"
 }
 
+fn pg_catalog_constraint_descriptions_query() -> &'static str {
+    "select n.nspname, c.relname, con.conname, d.description from pg_catalog.pg_description d join pg_catalog.pg_constraint con on con.oid = d.objoid join pg_catalog.pg_class c on c.oid = con.conrelid join pg_catalog.pg_namespace n on n.oid = c.relnamespace where n.nspname = 'public' order by c.relname, con.conname"
+}
+
 fn pg_catalog_table_index_descriptions_query() -> &'static str {
     "select n.nspname, c.relname, c.relkind, a.attname, d.description from pg_catalog.pg_description d join pg_catalog.pg_class c on c.oid = d.objoid join pg_catalog.pg_namespace n on n.oid = c.relnamespace left join pg_catalog.pg_attribute a on a.attrelid = c.oid and a.attnum = d.objsubid where n.nspname = 'public' and c.relkind in ('r','i') order by c.relkind, c.relname, d.objsubid"
 }
@@ -9979,6 +10157,35 @@ fn pg_catalog_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
         }
     }
     rows
+}
+
+fn pg_catalog_constraint_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut constraints = catalog_primary_key_entries(session);
+    constraints.sort_by(|left, right| {
+        left.index
+            .table
+            .cmp(&right.index.table)
+            .then_with(|| left.index.name.cmp(&right.index.name))
+    });
+    constraints
+        .into_iter()
+        .filter_map(|entry| {
+            session
+                .comments
+                .get(&CatalogCommentTarget::Constraint {
+                    table: entry.index.table.clone(),
+                    constraint: entry.index.name.clone(),
+                })
+                .map(|description| {
+                    vec![
+                        Some("public".to_string()),
+                        Some(entry.index.table),
+                        Some(entry.index.name),
+                        Some(description.clone()),
+                    ]
+                })
+        })
+        .collect()
 }
 
 fn pg_catalog_table_index_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
@@ -10048,7 +10255,9 @@ fn pg_dump_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
         .iter()
         .filter_map(|(target, description)| match target {
             CatalogCommentTarget::Index { index } => Some((index, description)),
-            CatalogCommentTarget::Table { .. } | CatalogCommentTarget::Column { .. } => None,
+            CatalogCommentTarget::Table { .. }
+            | CatalogCommentTarget::Column { .. }
+            | CatalogCommentTarget::Constraint { .. } => None,
         })
         .collect::<Vec<_>>();
     index_comments.sort_by(|left, right| left.0.cmp(right.0));
@@ -10058,6 +10267,33 @@ fn pg_dump_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
                 Some(description.clone()),
                 Some("1259".to_string()),
                 Some(oid.to_string()),
+                Some("0".to_string()),
+            ]);
+        }
+    }
+    let mut constraint_comments = session
+        .comments
+        .iter()
+        .filter_map(|(target, description)| match target {
+            CatalogCommentTarget::Constraint { table, constraint } => {
+                Some((table, constraint, description))
+            }
+            CatalogCommentTarget::Table { .. }
+            | CatalogCommentTarget::Column { .. }
+            | CatalogCommentTarget::Index { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    constraint_comments
+        .sort_by(|left, right| left.0.cmp(right.0).then_with(|| left.1.cmp(right.1)));
+    for (table_name, constraint_name, description) in constraint_comments {
+        if let Some(entry) = catalog_primary_key_entries(session)
+            .into_iter()
+            .find(|entry| &entry.index.table == table_name && &entry.index.name == constraint_name)
+        {
+            rows.push(vec![
+                Some(description.clone()),
+                Some("2606".to_string()),
+                Some(catalog_constraint_oid(&entry).to_string()),
                 Some("0".to_string()),
             ]);
         }
@@ -10077,6 +10313,26 @@ fn psql_object_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
                 Some("public".to_string()),
                 Some(table.name.clone()),
                 Some("table".to_string()),
+                Some(description.clone()),
+            ]);
+        }
+    }
+    let mut constraints = catalog_primary_key_entries(session);
+    constraints.sort_by(|left, right| {
+        left.index
+            .table
+            .cmp(&right.index.table)
+            .then_with(|| left.index.name.cmp(&right.index.name))
+    });
+    for entry in constraints {
+        if let Some(description) = session.comments.get(&CatalogCommentTarget::Constraint {
+            table: entry.index.table.clone(),
+            constraint: entry.index.name.clone(),
+        }) {
+            rows.push(vec![
+                Some("public".to_string()),
+                Some(entry.index.name),
+                Some("table constraint".to_string()),
                 Some(description.clone()),
             ]);
         }
@@ -12277,6 +12533,30 @@ mod tests {
         assert_eq!(parse_drop_table("DROP TABLE public.people CASCADE"), None);
         assert_eq!(parse_drop_table("DROP SCHEMA IF EXISTS public"), None);
         assert_eq!(parse_drop_table("DROP TABLE \"people\""), None);
+        assert_eq!(
+            parse_alter_table_drop_constraint(
+                "ALTER TABLE IF EXISTS ONLY public.accounts DROP CONSTRAINT IF EXISTS accounts_pkey;"
+            ),
+            Some(DropConstraint {
+                table: "accounts".to_string(),
+                constraint: "accounts_pkey".to_string(),
+                if_exists: true,
+            })
+        );
+        assert_eq!(
+            parse_alter_table_drop_constraint(
+                "ALTER TABLE ONLY accounts DROP CONSTRAINT accounts_pkey;"
+            ),
+            Some(DropConstraint {
+                table: "accounts".to_string(),
+                constraint: "accounts_pkey".to_string(),
+                if_exists: false,
+            })
+        );
+        assert_eq!(
+            parse_alter_table_drop_constraint("ALTER TABLE accounts DROP COLUMN id"),
+            None
+        );
     }
 
     #[test]

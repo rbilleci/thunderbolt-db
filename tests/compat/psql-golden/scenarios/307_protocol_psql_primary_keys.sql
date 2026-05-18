@@ -10,6 +10,23 @@ JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
 WHERE n.nspname = 'public'
 ORDER BY c.relname, con.conname;
 SELECT schemaname, tablename, indexname, indexdef FROM pg_catalog.pg_indexes WHERE schemaname = 'public' ORDER BY tablename, indexname;
+COMMENT ON CONSTRAINT pk_people_pkey ON public.pk_people IS 'row identity';
+SELECT n.nspname, c.relname, con.conname, d.description
+FROM pg_catalog.pg_description d
+JOIN pg_catalog.pg_constraint con ON con.oid = d.objoid
+JOIN pg_catalog.pg_class c ON c.oid = con.conrelid
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = 'public'
+ORDER BY c.relname, con.conname;
+\dd pk_people_pkey
+COMMENT ON CONSTRAINT pk_people_pkey ON public.pk_people IS NULL;
+SELECT n.nspname, c.relname, con.conname, d.description
+FROM pg_catalog.pg_description d
+JOIN pg_catalog.pg_constraint con ON con.oid = d.objoid
+JOIN pg_catalog.pg_class c ON c.oid = con.conrelid
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = 'public'
+ORDER BY c.relname, con.conname;
 \d pk_people
 INSERT INTO pk_people (id, name) VALUES (1, 'Edsger');
 SELECT id, name FROM pk_people ORDER BY id;

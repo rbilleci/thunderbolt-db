@@ -5978,6 +5978,7 @@ pub enum RelationalCommentTarget {
     Table { table: String },
     Column { table: String, attnum: i16 },
     Index { index: String },
+    Constraint { table: String, constraint: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7701,6 +7702,11 @@ impl Engine {
 
     fn apply_drop_index(&mut self, drop: DropIndex) -> Result<(), EngineError> {
         for table in self.relational_catalog.values_mut() {
+            let dropped_constraint = table
+                .indexes
+                .iter()
+                .find(|index| index.name == drop.name && index.primary_key)
+                .map(|index| (index.table.clone(), index.name.clone()));
             let old_len = table.indexes.len();
             table.indexes.retain(|index| index.name != drop.name);
             if table.indexes.len() != old_len {
@@ -7708,6 +7714,10 @@ impl Engine {
                     .remove(&RelationalCommentTarget::Index {
                         index: drop.name.clone(),
                     });
+                if let Some((table, constraint)) = dropped_constraint {
+                    self.relational_comments
+                        .remove(&RelationalCommentTarget::Constraint { table, constraint });
+                }
                 return Ok(());
             }
         }
@@ -7760,6 +7770,22 @@ impl Engine {
                     )));
                 }
                 RelationalCommentTarget::Index { index }
+            }
+            CommentTarget::Constraint { table, constraint } => {
+                let table_ref = self.relational_catalog.get(&table).ok_or_else(|| {
+                    EngineError::ApplyFailed(format!("relation \"{}\" does not exist", table))
+                })?;
+                if !table_ref
+                    .indexes
+                    .iter()
+                    .any(|candidate| candidate.primary_key && candidate.name == constraint)
+                {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "constraint \"{}\" does not exist",
+                        constraint
+                    )));
+                }
+                RelationalCommentTarget::Constraint { table, constraint }
             }
         };
         if let Some(value) = comment.comment {
@@ -11613,6 +11639,15 @@ impl Engine {
         self.relational_comments
             .get(&RelationalCommentTarget::Index {
                 index: index.to_string(),
+            })
+            .map(String::as_str)
+    }
+
+    pub fn relational_constraint_comment(&self, table: &str, constraint: &str) -> Option<&str> {
+        self.relational_comments
+            .get(&RelationalCommentTarget::Constraint {
+                table: table.to_string(),
+                constraint: constraint.to_string(),
             })
             .map(String::as_str)
     }
@@ -31215,6 +31250,16 @@ mod tests {
             "COMMENT ON INDEX public.people_name_idx IS 'name lookup'",
         )
         .unwrap();
+        e.execute_text(
+            6,
+            "ALTER TABLE ONLY public.people ADD CONSTRAINT people_pkey PRIMARY KEY (id)",
+        )
+        .unwrap();
+        e.execute_text(
+            7,
+            "COMMENT ON CONSTRAINT people_pkey ON public.people IS 'row identity'",
+        )
+        .unwrap();
         assert_eq!(e.relational_table_comment("people"), Some("lookup people"));
         assert_eq!(
             e.relational_column_comment("people", 2),
@@ -31223,6 +31268,10 @@ mod tests {
         assert_eq!(
             e.relational_index_comment("people_name_idx"),
             Some("name lookup")
+        );
+        assert_eq!(
+            e.relational_constraint_comment("people", "people_pkey"),
+            Some("row identity")
         );
 
         let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
@@ -31238,12 +31287,21 @@ mod tests {
             recovered.relational_index_comment("people_name_idx"),
             Some("name lookup")
         );
+        assert_eq!(
+            recovered.relational_constraint_comment("people", "people_pkey"),
+            Some("row identity")
+        );
 
-        e.execute_text(6, "COMMENT ON COLUMN public.people.name IS NULL")
+        e.execute_text(8, "COMMENT ON COLUMN public.people.name IS NULL")
             .unwrap();
         assert_eq!(e.relational_column_comment("people", 2), None);
-        e.execute_text(7, "DROP INDEX people_name_idx").unwrap();
+        e.execute_text(9, "DROP INDEX people_name_idx").unwrap();
         assert_eq!(e.relational_index_comment("people_name_idx"), None);
+        e.execute_text(10, "DROP INDEX people_pkey").unwrap();
+        assert_eq!(
+            e.relational_constraint_comment("people", "people_pkey"),
+            None
+        );
 
         let mut missing = Engine::new_local();
         missing
@@ -31264,6 +31322,19 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("index \"people_name_idx\" does not exist"));
+
+        let mut missing_constraint = Engine::new_local();
+        missing_constraint
+            .execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        assert!(missing_constraint
+            .execute_text(
+                2,
+                "COMMENT ON CONSTRAINT people_pkey ON public.people IS 'bad'",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("constraint \"people_pkey\" does not exist"));
     }
 
     #[test]

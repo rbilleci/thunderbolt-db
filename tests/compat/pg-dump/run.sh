@@ -112,6 +112,7 @@ CREATE INDEX accounts_name_idx ON accounts (name);
 COMMENT ON TABLE public.accounts IS 'accounts table';
 COMMENT ON COLUMN public.accounts.name IS 'account display name';
 COMMENT ON INDEX public.accounts_name_idx IS 'accounts name lookup';
+COMMENT ON CONSTRAINT accounts_pkey ON public.accounts IS 'accounts row identity';
 CREATE TABLE events (event_id int4, note text);
 INSERT INTO events (event_id, note) VALUES (10, 'created');
 INSERT INTO events (event_id, note) VALUES (11, 'updated');
@@ -193,6 +194,10 @@ public|events|r||events table
 public|events|r|note|event note
 EOF
 
+cat >"$OUT_DIR/constraint-comment-verify.expected" <<'EOF'
+public|accounts|accounts_pkey|accounts row identity
+EOF
+
 diff -u "$OUT_DIR/verify.expected" "$OUT_DIR/verify.out"
 
 verify_indexes() {
@@ -231,6 +236,18 @@ verify_comments() {
 
 verify_comments "$RESTORE_PORT" "restore"
 
+verify_constraint_comments() {
+  local port="$1"
+  local prefix="$2"
+  PGHOST=127.0.0.1 PGPORT="$port" PGDATABASE=postgres PGUSER=postgres \
+    psql -v ON_ERROR_STOP=1 -X -A -t \
+    -c "SELECT n.nspname, c.relname, con.conname, d.description FROM pg_catalog.pg_description d JOIN pg_catalog.pg_constraint con ON con.oid = d.objoid JOIN pg_catalog.pg_class c ON c.oid = con.conrelid JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' ORDER BY c.relname, con.conname;" \
+    >"$OUT_DIR/${prefix}-constraint-comment-verify.out" 2>"$OUT_DIR/${prefix}-constraint-comment-verify.err"
+  diff -u "$OUT_DIR/constraint-comment-verify.expected" "$OUT_DIR/${prefix}-constraint-comment-verify.out"
+}
+
+verify_constraint_comments "$RESTORE_PORT" "restore"
+
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$CUSTOM_RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/custom-restore-server.log" 2>&1 &
 custom_restore_pid=$!
@@ -250,6 +267,7 @@ diff -u "$OUT_DIR/verify.expected" "$OUT_DIR/custom-verify.out"
 verify_indexes "$CUSTOM_RESTORE_PORT" "custom"
 verify_constraints "$CUSTOM_RESTORE_PORT" "custom"
 verify_comments "$CUSTOM_RESTORE_PORT" "custom"
+verify_constraint_comments "$CUSTOM_RESTORE_PORT" "custom"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$DIRECTORY_RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/directory-restore-server.log" 2>&1 &
@@ -270,6 +288,7 @@ diff -u "$OUT_DIR/verify.expected" "$OUT_DIR/directory-verify.out"
 verify_indexes "$DIRECTORY_RESTORE_PORT" "directory"
 verify_constraints "$DIRECTORY_RESTORE_PORT" "directory"
 verify_comments "$DIRECTORY_RESTORE_PORT" "directory"
+verify_constraint_comments "$DIRECTORY_RESTORE_PORT" "directory"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$TAR_RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/tar-restore-server.log" 2>&1 &
@@ -290,6 +309,7 @@ diff -u "$OUT_DIR/verify.expected" "$OUT_DIR/tar-verify.out"
 verify_indexes "$TAR_RESTORE_PORT" "tar"
 verify_constraints "$TAR_RESTORE_PORT" "tar"
 verify_comments "$TAR_RESTORE_PORT" "tar"
+verify_constraint_comments "$TAR_RESTORE_PORT" "tar"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$PARALLEL_DIRECTORY_RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/directory-parallel-restore-server.log" 2>&1 &
@@ -310,6 +330,7 @@ diff -u "$OUT_DIR/verify.expected" "$OUT_DIR/directory-parallel-verify.out"
 verify_indexes "$PARALLEL_DIRECTORY_RESTORE_PORT" "directory-parallel"
 verify_constraints "$PARALLEL_DIRECTORY_RESTORE_PORT" "directory-parallel"
 verify_comments "$PARALLEL_DIRECTORY_RESTORE_PORT" "directory-parallel"
+verify_constraint_comments "$PARALLEL_DIRECTORY_RESTORE_PORT" "directory-parallel"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$CLEAN_RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/clean-restore-server.log" 2>&1 &
@@ -338,6 +359,7 @@ diff -u "$OUT_DIR/verify.expected" "$OUT_DIR/clean-verify.out"
 verify_indexes "$CLEAN_RESTORE_PORT" "clean"
 verify_constraints "$CLEAN_RESTORE_PORT" "clean"
 verify_comments "$CLEAN_RESTORE_PORT" "clean"
+verify_constraint_comments "$CLEAN_RESTORE_PORT" "clean"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$INSERT_RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/insert-restore-server.log" 2>&1 &
@@ -358,6 +380,7 @@ diff -u "$OUT_DIR/verify.expected" "$OUT_DIR/insert-verify.out"
 verify_indexes "$INSERT_RESTORE_PORT" "insert"
 verify_constraints "$INSERT_RESTORE_PORT" "insert"
 verify_comments "$INSERT_RESTORE_PORT" "insert"
+verify_constraint_comments "$INSERT_RESTORE_PORT" "insert"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$SPLIT_RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/split-restore-server.log" 2>&1 &
@@ -382,6 +405,7 @@ diff -u "$OUT_DIR/verify.expected" "$OUT_DIR/split-verify.out"
 verify_indexes "$SPLIT_RESTORE_PORT" "split"
 verify_constraints "$SPLIT_RESTORE_PORT" "split"
 verify_comments "$SPLIT_RESTORE_PORT" "split"
+verify_constraint_comments "$SPLIT_RESTORE_PORT" "split"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$CUSTOM_SPLIT_RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/custom-split-restore-server.log" 2>&1 &
@@ -406,6 +430,7 @@ diff -u "$OUT_DIR/verify.expected" "$OUT_DIR/custom-split-verify.out"
 verify_indexes "$CUSTOM_SPLIT_RESTORE_PORT" "custom-split"
 verify_constraints "$CUSTOM_SPLIT_RESTORE_PORT" "custom-split"
 verify_comments "$CUSTOM_SPLIT_RESTORE_PORT" "custom-split"
+verify_constraint_comments "$CUSTOM_SPLIT_RESTORE_PORT" "custom-split"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$DIRECTORY_SPLIT_RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/directory-split-restore-server.log" 2>&1 &
@@ -430,6 +455,7 @@ diff -u "$OUT_DIR/verify.expected" "$OUT_DIR/directory-split-verify.out"
 verify_indexes "$DIRECTORY_SPLIT_RESTORE_PORT" "directory-split"
 verify_constraints "$DIRECTORY_SPLIT_RESTORE_PORT" "directory-split"
 verify_comments "$DIRECTORY_SPLIT_RESTORE_PORT" "directory-split"
+verify_constraint_comments "$DIRECTORY_SPLIT_RESTORE_PORT" "directory-split"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$TAR_SPLIT_RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/tar-split-restore-server.log" 2>&1 &
@@ -454,6 +480,7 @@ diff -u "$OUT_DIR/verify.expected" "$OUT_DIR/tar-split-verify.out"
 verify_indexes "$TAR_SPLIT_RESTORE_PORT" "tar-split"
 verify_constraints "$TAR_SPLIT_RESTORE_PORT" "tar-split"
 verify_comments "$TAR_SPLIT_RESTORE_PORT" "tar-split"
+verify_constraint_comments "$TAR_SPLIT_RESTORE_PORT" "tar-split"
 
 pg_restore --list "$OUT_DIR/dump.custom" >"$OUT_DIR/dump.custom.toc"
 pg_restore --list "$OUT_DIR/dump.dir" >"$OUT_DIR/dump.dir.toc"

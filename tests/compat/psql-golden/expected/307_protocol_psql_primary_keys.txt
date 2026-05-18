@@ -21,6 +21,23 @@ INSERT 0 2
  public     | pk_people | pk_people_pkey | CREATE UNIQUE INDEX pk_people_pkey ON public.pk_people USING btree (id)
 (1 row)
 
+COMMENT
+ nspname |  relname  |    conname     | description
+---------+-----------+----------------+--------------
+ public  | pk_people | pk_people_pkey | row identity
+(1 row)
+
+                    Object descriptions
+ Schema |      Name      |      Object      | Description
+--------+----------------+------------------+--------------
+ public | pk_people_pkey | table constraint | row identity
+(1 row)
+
+COMMENT
+ nspname | relname | conname | description
+---------+---------+---------+-------------
+(0 rows)
+
              Table "public.pk_people"
  Column |  Type   | Collation | Nullable | Default
 --------+---------+-----------+----------+---------
@@ -29,14 +46,14 @@ INSERT 0 2
 Indexes:
     "pk_people_pkey" PRIMARY KEY, btree (id)
 
-psql:307_protocol_psql_primary_keys.sql:14: ERROR:  duplicate key value violates unique index
+psql:307_protocol_psql_primary_keys.sql:31: ERROR:  duplicate key value violates unique index
  id | name
 ----+-------
   1 | Ada
   2 | Grace
 (2 rows)
 
-psql:307_protocol_psql_primary_keys.sql:16: ERROR:  duplicate key value violates unique index
+psql:307_protocol_psql_primary_keys.sql:33: ERROR:  duplicate key value violates unique index
  id | name
 ----+-------
   1 | Ada
@@ -46,7 +63,7 @@ psql:307_protocol_psql_primary_keys.sql:16: ERROR:  duplicate key value violates
 CREATE TABLE
 INSERT 0 2
 ALTER TABLE
-psql:307_protocol_psql_primary_keys.sql:21: ERROR:  duplicate key value violates unique index
+psql:307_protocol_psql_primary_keys.sql:38: ERROR:  duplicate key value violates unique index
  id | name
 ----+------
   1 | core
@@ -55,4 +72,4 @@ psql:307_protocol_psql_primary_keys.sql:21: ERROR:  duplicate key value violates
 
 CREATE TABLE
 INSERT 0 2
-psql:307_protocol_psql_primary_keys.sql:25: ERROR:  duplicate key value violates unique index
+psql:307_protocol_psql_primary_keys.sql:42: ERROR:  duplicate key value violates unique index
