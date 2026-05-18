@@ -105,9 +105,9 @@ wait_for_port "$SOURCE_PORT"
 
 PGHOST=127.0.0.1 PGPORT="$SOURCE_PORT" PGDATABASE=postgres PGUSER=postgres \
   psql -v ON_ERROR_STOP=1 -X -q <<'SQL'
-CREATE TABLE accounts (id int4, name text);
+CREATE TABLE accounts (id int4, name text DEFAULT 'unknown'::text, tier int4 DEFAULT 7);
 INSERT INTO accounts (id, name) VALUES (1, 'Ada');
-INSERT INTO accounts (id, name) VALUES (2, 'Grace');
+INSERT INTO accounts (id) VALUES (2);
 CREATE INDEX accounts_name_idx ON accounts (name);
 CREATE TABLE events (event_id int4, note text);
 INSERT INTO events (event_id, note) VALUES (10, 'created');
@@ -157,13 +157,13 @@ PGHOST=127.0.0.1 PGPORT="$RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres \
 
 PGHOST=127.0.0.1 PGPORT="$RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres \
   psql -v ON_ERROR_STOP=1 -X -A -t \
-  -c "SELECT id, name FROM accounts ORDER BY id;" \
+  -c "SELECT id, name, tier FROM accounts ORDER BY id;" \
   -c "SELECT event_id, note FROM events ORDER BY event_id;" \
   >"$OUT_DIR/verify.out" 2>"$OUT_DIR/verify.err"
 
 cat >"$OUT_DIR/verify.expected" <<'EOF'
-1|Ada
-2|Grace
+1|Ada|7
+2|unknown|7
 10|created
 11|updated
 EOF
@@ -198,7 +198,7 @@ PGHOST=127.0.0.1 PGPORT="$CUSTOM_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgr
 
 PGHOST=127.0.0.1 PGPORT="$CUSTOM_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres \
   psql -v ON_ERROR_STOP=1 -X -A -t \
-  -c "SELECT id, name FROM accounts ORDER BY id;" \
+  -c "SELECT id, name, tier FROM accounts ORDER BY id;" \
   -c "SELECT event_id, note FROM events ORDER BY event_id;" \
   >"$OUT_DIR/custom-verify.out" 2>"$OUT_DIR/custom-verify.err"
 
@@ -216,7 +216,7 @@ PGHOST=127.0.0.1 PGPORT="$DIRECTORY_RESTORE_PORT" PGDATABASE=postgres PGUSER=pos
 
 PGHOST=127.0.0.1 PGPORT="$DIRECTORY_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres \
   psql -v ON_ERROR_STOP=1 -X -A -t \
-  -c "SELECT id, name FROM accounts ORDER BY id;" \
+  -c "SELECT id, name, tier FROM accounts ORDER BY id;" \
   -c "SELECT event_id, note FROM events ORDER BY event_id;" \
   >"$OUT_DIR/directory-verify.out" 2>"$OUT_DIR/directory-verify.err"
 
@@ -234,7 +234,7 @@ PGHOST=127.0.0.1 PGPORT="$TAR_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres 
 
 PGHOST=127.0.0.1 PGPORT="$TAR_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres \
   psql -v ON_ERROR_STOP=1 -X -A -t \
-  -c "SELECT id, name FROM accounts ORDER BY id;" \
+  -c "SELECT id, name, tier FROM accounts ORDER BY id;" \
   -c "SELECT event_id, note FROM events ORDER BY event_id;" \
   >"$OUT_DIR/tar-verify.out" 2>"$OUT_DIR/tar-verify.err"
 
@@ -252,7 +252,7 @@ PGHOST=127.0.0.1 PGPORT="$PARALLEL_DIRECTORY_RESTORE_PORT" PGDATABASE=postgres P
 
 PGHOST=127.0.0.1 PGPORT="$PARALLEL_DIRECTORY_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres \
   psql -v ON_ERROR_STOP=1 -X -A -t \
-  -c "SELECT id, name FROM accounts ORDER BY id;" \
+  -c "SELECT id, name, tier FROM accounts ORDER BY id;" \
   -c "SELECT event_id, note FROM events ORDER BY event_id;" \
   >"$OUT_DIR/directory-parallel-verify.out" 2>"$OUT_DIR/directory-parallel-verify.err"
 
@@ -278,7 +278,7 @@ PGHOST=127.0.0.1 PGPORT="$CLEAN_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgre
 
 PGHOST=127.0.0.1 PGPORT="$CLEAN_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres \
   psql -v ON_ERROR_STOP=1 -X -A -t \
-  -c "SELECT id, name FROM accounts ORDER BY id;" \
+  -c "SELECT id, name, tier FROM accounts ORDER BY id;" \
   -c "SELECT event_id, note FROM events ORDER BY event_id;" \
   >"$OUT_DIR/clean-verify.out" 2>"$OUT_DIR/clean-verify.err"
 
@@ -296,7 +296,7 @@ PGHOST=127.0.0.1 PGPORT="$INSERT_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgr
 
 PGHOST=127.0.0.1 PGPORT="$INSERT_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres \
   psql -v ON_ERROR_STOP=1 -X -A -t \
-  -c "SELECT id, name FROM accounts ORDER BY id;" \
+  -c "SELECT id, name, tier FROM accounts ORDER BY id;" \
   -c "SELECT event_id, note FROM events ORDER BY event_id;" \
   >"$OUT_DIR/insert-verify.out" 2>"$OUT_DIR/insert-verify.err"
 
@@ -318,7 +318,7 @@ PGHOST=127.0.0.1 PGPORT="$SPLIT_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgre
 
 PGHOST=127.0.0.1 PGPORT="$SPLIT_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres \
   psql -v ON_ERROR_STOP=1 -X -A -t \
-  -c "SELECT id, name FROM accounts ORDER BY id;" \
+  -c "SELECT id, name, tier FROM accounts ORDER BY id;" \
   -c "SELECT event_id, note FROM events ORDER BY event_id;" \
   >"$OUT_DIR/split-verify.out" 2>"$OUT_DIR/split-verify.err"
 
@@ -340,7 +340,7 @@ PGHOST=127.0.0.1 PGPORT="$CUSTOM_SPLIT_RESTORE_PORT" PGDATABASE=postgres PGUSER=
 
 PGHOST=127.0.0.1 PGPORT="$CUSTOM_SPLIT_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres \
   psql -v ON_ERROR_STOP=1 -X -A -t \
-  -c "SELECT id, name FROM accounts ORDER BY id;" \
+  -c "SELECT id, name, tier FROM accounts ORDER BY id;" \
   -c "SELECT event_id, note FROM events ORDER BY event_id;" \
   >"$OUT_DIR/custom-split-verify.out" 2>"$OUT_DIR/custom-split-verify.err"
 
@@ -362,7 +362,7 @@ PGHOST=127.0.0.1 PGPORT="$DIRECTORY_SPLIT_RESTORE_PORT" PGDATABASE=postgres PGUS
 
 PGHOST=127.0.0.1 PGPORT="$DIRECTORY_SPLIT_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres \
   psql -v ON_ERROR_STOP=1 -X -A -t \
-  -c "SELECT id, name FROM accounts ORDER BY id;" \
+  -c "SELECT id, name, tier FROM accounts ORDER BY id;" \
   -c "SELECT event_id, note FROM events ORDER BY event_id;" \
   >"$OUT_DIR/directory-split-verify.out" 2>"$OUT_DIR/directory-split-verify.err"
 
@@ -384,7 +384,7 @@ PGHOST=127.0.0.1 PGPORT="$TAR_SPLIT_RESTORE_PORT" PGDATABASE=postgres PGUSER=pos
 
 PGHOST=127.0.0.1 PGPORT="$TAR_SPLIT_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres \
   psql -v ON_ERROR_STOP=1 -X -A -t \
-  -c "SELECT id, name FROM accounts ORDER BY id;" \
+  -c "SELECT id, name, tier FROM accounts ORDER BY id;" \
   -c "SELECT event_id, note FROM events ORDER BY event_id;" \
   >"$OUT_DIR/tar-split-verify.out" 2>"$OUT_DIR/tar-split-verify.err"
 
@@ -395,23 +395,28 @@ pg_restore --list "$OUT_DIR/dump.custom" >"$OUT_DIR/dump.custom.toc"
 pg_restore --list "$OUT_DIR/dump.dir" >"$OUT_DIR/dump.dir.toc"
 pg_restore --list "$OUT_DIR/dump.tar" >"$OUT_DIR/dump.tar.toc"
 
-grep -F "COPY public.accounts (id, name) FROM stdin;" "$OUT_DIR/dump.sql" >/dev/null
+grep -F "COPY public.accounts (id, name, tier) FROM stdin;" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "COPY public.events (event_id, note) FROM stdin;" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "INSERT INTO public.accounts VALUES" "$OUT_DIR/dump-inserts.sql" >/dev/null
-grep -F "	(1, 'Ada')," "$OUT_DIR/dump-inserts.sql" >/dev/null
+grep -F "	(1, 'Ada', 7)," "$OUT_DIR/dump-inserts.sql" >/dev/null
+grep -F "	(2, 'unknown', 7);" "$OUT_DIR/dump-inserts.sql" >/dev/null
 grep -F "INSERT INTO public.events VALUES" "$OUT_DIR/dump-inserts.sql" >/dev/null
 grep -F "	(10, 'created')," "$OUT_DIR/dump-inserts.sql" >/dev/null
 grep -F "CREATE SCHEMA public;" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "CREATE TABLE public.accounts (" "$OUT_DIR/dump.sql" >/dev/null
+grep -F "    name text DEFAULT 'unknown'::text," "$OUT_DIR/dump.sql" >/dev/null
+grep -F "    tier integer DEFAULT 7" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "CREATE TABLE public.events (" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "CREATE INDEX accounts_name_idx ON public.accounts USING btree (name);" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "CREATE INDEX events_note_idx ON public.events USING btree (note);" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "CREATE SCHEMA public;" "$OUT_DIR/dump-schema.sql" >/dev/null
 grep -F "CREATE TABLE public.accounts (" "$OUT_DIR/dump-schema.sql" >/dev/null
+grep -F "    name text DEFAULT 'unknown'::text," "$OUT_DIR/dump-schema.sql" >/dev/null
+grep -F "    tier integer DEFAULT 7" "$OUT_DIR/dump-schema.sql" >/dev/null
 grep -F "CREATE TABLE public.events (" "$OUT_DIR/dump-schema.sql" >/dev/null
 grep -F "CREATE INDEX accounts_name_idx ON public.accounts USING btree (name);" "$OUT_DIR/dump-schema.sql" >/dev/null
 grep -F "CREATE INDEX events_note_idx ON public.events USING btree (note);" "$OUT_DIR/dump-schema.sql" >/dev/null
-grep -F "COPY public.accounts (id, name) FROM stdin;" "$OUT_DIR/dump-data.sql" >/dev/null
+grep -F "COPY public.accounts (id, name, tier) FROM stdin;" "$OUT_DIR/dump-data.sql" >/dev/null
 grep -F "COPY public.events (event_id, note) FROM stdin;" "$OUT_DIR/dump-data.sql" >/dev/null
 grep -F "SCHEMA - public" "$OUT_DIR/dump.custom.toc" >/dev/null
 grep -F "TABLE public accounts" "$OUT_DIR/dump.custom.toc" >/dev/null

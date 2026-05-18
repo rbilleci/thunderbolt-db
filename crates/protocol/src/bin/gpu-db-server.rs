@@ -1176,6 +1176,15 @@ fn format_sql_value(value: &SqlValue) -> String {
     }
 }
 
+fn format_default_expr(value: &SqlValue) -> String {
+    match value {
+        SqlValue::Int4(value) => value.to_string(),
+        SqlValue::Text(value) => format!("'{}'::text", value.replace('\'', "''")),
+        SqlValue::Int8(value) => value.to_string(),
+        SqlValue::Numeric(value) => value.clone(),
+    }
+}
+
 fn sql_type_oid_text(ty: gpu_db_protocol::SqlType) -> String {
     ty.postgres_oid().to_string()
 }
@@ -4737,6 +4746,18 @@ fn apply_copy_in_rows(session: &mut Session, copy: CopyInState) -> Option<ErrorF
         for (source_idx, target_idx) in indexes.iter().copied().enumerate() {
             projected[target_idx] = Some(row[source_idx].clone());
         }
+        for (idx, value) in projected.iter_mut().enumerate() {
+            if value.is_none() {
+                *value = table.columns[idx].def.default.clone();
+            }
+        }
+        if projected.iter().any(Option::is_none) {
+            return Some(ErrorField {
+                code: "0A000",
+                message: "COPY must provide every column without a default",
+                position: None,
+            });
+        }
         table
             .rows
             .push(projected.into_iter().map(Option::unwrap).collect());
@@ -5251,6 +5272,13 @@ fn execute_statement(
             &pg_dump_index_metadata_rows(session),
         );
     }
+    if let Some(relation_oids) = pg_dump_attrdef_metadata_query_relation_oids(&canonical) {
+        return write_single_row(
+            stream,
+            &pg_dump_attrdef_metadata_columns(),
+            &pg_dump_attrdef_metadata_rows(session, &relation_oids),
+        );
+    }
     if let Some(columns) = pg_dump_empty_catalog_query_columns(&canonical) {
         return write_single_row(stream, &columns, &catalog_empty_rows());
     }
@@ -5420,6 +5448,46 @@ fn execute_statement(
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, "CREATE INDEX");
             }
+            Command::AlterColumnDefault(alter) => {
+                let Some(table) = session.tables.get_mut(&alter.table) else {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "42P01",
+                            message: "relation does not exist",
+                            position: None,
+                        },
+                    );
+                };
+                let Some(column) = table
+                    .columns
+                    .iter_mut()
+                    .find(|column| column.def.name == alter.column)
+                else {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "42703",
+                            message: "column does not exist",
+                            position: None,
+                        },
+                    );
+                };
+                if !sql_value_matches_type(&alter.default, column.def.ty) {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "42804",
+                            message: "column default type mismatch",
+                            position: None,
+                        },
+                    );
+                }
+                column.def.default = Some(alter.default);
+                session.mark_table_dirty(alter.table);
+                session.persist_catalog_snapshot();
+                return write_command_complete(stream, "ALTER TABLE");
+            }
             Command::Insert(insert) => {
                 let table_name = insert.table;
                 let Some(table) = session.tables.get_mut(&table_name) else {
@@ -5484,12 +5552,17 @@ fn execute_statement(
                         }
                         projected[target_idx] = Some(row[source_idx].clone());
                     }
+                    for (idx, value) in projected.iter_mut().enumerate() {
+                        if value.is_none() {
+                            *value = table.columns[idx].def.default.clone();
+                        }
+                    }
                     if projected.iter().any(Option::is_none) {
                         return write_error(
                             stream,
                             &ErrorField {
                                 code: "0A000",
-                                message: "INSERT must provide every column",
+                                message: "INSERT must provide every column without a default",
                                 position: None,
                             },
                         );
@@ -6284,6 +6357,13 @@ fn execute_statement(
             stream,
             &pg_dump_index_metadata_columns(),
             &pg_dump_index_metadata_rows(session),
+        );
+    }
+    if let Some(relation_oids) = pg_dump_attrdef_metadata_query_relation_oids(&canonical) {
+        return write_single_row(
+            stream,
+            &pg_dump_attrdef_metadata_columns(),
+            &pg_dump_attrdef_metadata_rows(session, &relation_oids),
         );
     }
     if let Some(columns) = pg_dump_empty_catalog_query_columns(&canonical) {
@@ -7794,7 +7874,14 @@ fn pg_dump_attribute_metadata_rows(
                 Some(sql_type_storage_code(column.def.ty).to_string()),
                 Some(sql_type_storage_code(column.def.ty).to_string()),
                 Some("f".to_string()),
-                Some("f".to_string()),
+                Some(
+                    if column.def.default.is_some() {
+                        "t"
+                    } else {
+                        "f"
+                    }
+                    .to_string(),
+                ),
                 Some("f".to_string()),
                 Some(column.def.ty.type_size().to_string()),
                 Some(sql_type_alignment_code(column.def.ty).to_string()),
@@ -7897,6 +7984,57 @@ fn pg_dump_index_metadata_rows(session: &Session) -> Vec<Vec<Option<String>>> {
                 None,
                 Some("f".to_string()),
             ]
+        })
+        .collect()
+}
+
+fn pg_dump_attrdef_metadata_query_relation_oids(canonical: &str) -> Option<Vec<u32>> {
+    let prefix = "select a.tableoid, a.oid, adrelid, adnum, pg_catalog.pg_get_expr(adbin, adrelid) as adsrc from unnest('{";
+    let suffix = "}'::pg_catalog.oid[]) as src(tbloid) join pg_catalog.pg_attrdef a on (src.tbloid = a.adrelid) order by a.adrelid, a.adnum";
+    let body = canonical.strip_prefix(prefix)?.strip_suffix(suffix)?;
+    let oids = body
+        .split(',')
+        .map(|raw| raw.trim().parse::<u32>())
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    (!oids.is_empty()).then_some(oids)
+}
+
+fn pg_dump_attrdef_metadata_columns() -> Vec<Column> {
+    vec![
+        int4_column("tableoid"),
+        int4_column("oid"),
+        int4_column("adrelid"),
+        int4_column("adnum"),
+        text_column("adsrc"),
+    ]
+}
+
+fn pg_dump_attrdef_metadata_rows(
+    session: &Session,
+    relation_oids: &[u32],
+) -> Vec<Vec<Option<String>>> {
+    let requested = relation_oids.iter().copied().collect::<BTreeSet<_>>();
+    let mut tables = session
+        .tables
+        .values()
+        .filter(|table| requested.contains(&table.oid))
+        .collect::<Vec<_>>();
+    tables.sort_by_key(|table| table.oid);
+    tables
+        .into_iter()
+        .flat_map(|table| {
+            table.columns.iter().filter_map(|column| {
+                column.def.default.as_ref().map(|default| {
+                    vec![
+                        Some("2604".to_string()),
+                        Some((30_000_u32 + table.oid + column.attnum as u32).to_string()),
+                        Some(table.oid.to_string()),
+                        Some(column.attnum.to_string()),
+                        Some(format_default_expr(default)),
+                    ]
+                })
+            })
         })
         .collect()
 }
@@ -8516,7 +8654,7 @@ fn catalog_describe_verbose_attribute_rows(
             vec![
                 Some(column.def.name.clone()),
                 Some(sql_type_display_name(column.def.ty).to_string()),
-                None,
+                column.def.default.as_ref().map(format_default_expr),
                 Some("f".to_string()),
                 None,
                 Some(String::new()),
@@ -8541,7 +8679,7 @@ fn catalog_describe_attribute_rows(session: &Session, oid: u32) -> Vec<Vec<Optio
             vec![
                 Some(column.def.name.clone()),
                 Some(sql_type_display_name(column.def.ty).to_string()),
-                None,
+                column.def.default.as_ref().map(format_default_expr),
                 Some("f".to_string()),
                 None,
                 Some(String::new()),
@@ -9071,7 +9209,7 @@ fn information_schema_column_detail_rows(
                 Some(column.def.name.clone()),
                 Some(sql_type_display_name(column.def.ty).to_string()),
                 Some("YES".to_string()),
-                None,
+                column.def.default.as_ref().map(format_default_expr),
             ]
         })
         .collect()
@@ -9093,7 +9231,7 @@ fn information_schema_rich_column_rows(session: &Session) -> Vec<Vec<Option<Stri
                     Some(table.name.clone()),
                     Some(column.def.name.clone()),
                     Some(column.attnum.to_string()),
-                    None,
+                    column.def.default.as_ref().map(format_default_expr),
                     Some("YES".to_string()),
                     Some(sql_type_display_name(column.def.ty).to_string()),
                     Some("pg_catalog".to_string()),
@@ -9199,7 +9337,7 @@ fn information_schema_extended_column_rows_for_catalog_table(
             Some(table.name.clone()),
             Some(column.def.name.clone()),
             Some(column.attnum.to_string()),
-            None,
+            column.def.default.as_ref().map(format_default_expr),
             Some("YES".to_string()),
             Some(sql_type_display_name(column.def.ty).to_string()),
             None,
@@ -9280,8 +9418,23 @@ fn pg_catalog_attrdefs_query() -> &'static str {
 }
 
 fn pg_catalog_attrdef_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    let _supported_plain_table_count = session.tables.len();
-    Vec::new()
+    let mut tables = session.tables.values().collect::<Vec<_>>();
+    tables.sort_by(|left, right| left.name.cmp(&right.name));
+    tables
+        .into_iter()
+        .flat_map(|table| {
+            table.columns.iter().filter_map(|column| {
+                column.def.default.as_ref().map(|default| {
+                    vec![
+                        Some("public".to_string()),
+                        Some(table.name.clone()),
+                        Some(column.def.name.clone()),
+                        Some(format_default_expr(default)),
+                    ]
+                })
+            })
+        })
+        .collect()
 }
 
 fn pg_catalog_descriptions_query() -> &'static str {
@@ -10967,6 +11120,7 @@ mod tests {
                 def: gpu_db_protocol::ColumnDef {
                     name: "id".to_string(),
                     ty: SqlType::Int4,
+                    default: None,
                 },
             }],
             rows,
@@ -11488,6 +11642,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "id".to_string(),
                             ty: SqlType::Int4,
+                            default: None,
                         },
                     },
                     CatalogColumn {
@@ -11495,6 +11650,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "name".to_string(),
                             ty: SqlType::Text,
+                            default: None,
                         },
                     },
                 ],
@@ -11542,6 +11698,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "id".to_string(),
                             ty: SqlType::Int4,
+                            default: None,
                         },
                     },
                     CatalogColumn {
@@ -11549,6 +11706,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "name".to_string(),
                             ty: SqlType::Text,
+                            default: None,
                         },
                     },
                 ],
@@ -11604,6 +11762,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "id".to_string(),
                             ty: SqlType::Int4,
+                            default: None,
                         },
                     },
                     CatalogColumn {
@@ -11611,6 +11770,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "full_name".to_string(),
                             ty: SqlType::Text,
+                            default: None,
                         },
                     },
                 ],
@@ -11660,6 +11820,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "id".to_string(),
                             ty: SqlType::Int4,
+                            default: None,
                         },
                     },
                     CatalogColumn {
@@ -11667,6 +11828,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "full_name".to_string(),
                             ty: SqlType::Text,
+                            default: None,
                         },
                     },
                 ],
@@ -11723,6 +11885,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "id".to_string(),
                             ty: SqlType::Int4,
+                            default: None,
                         },
                     },
                     CatalogColumn {
@@ -11730,6 +11893,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "name".to_string(),
                             ty: SqlType::Text,
+                            default: None,
                         },
                     },
                 ],
@@ -11804,6 +11968,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "id".to_string(),
                             ty: SqlType::Int4,
+                            default: None,
                         },
                     },
                     CatalogColumn {
@@ -11811,6 +11976,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "name".to_string(),
                             ty: SqlType::Text,
+                            default: None,
                         },
                     },
                 ],
@@ -11885,6 +12051,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "id".to_string(),
                             ty: SqlType::Int4,
+                            default: None,
                         },
                     },
                     CatalogColumn {
@@ -11892,6 +12059,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "name".to_string(),
                             ty: SqlType::Text,
+                            default: None,
                         },
                     },
                 ],
@@ -11965,6 +12133,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "id".to_string(),
                             ty: SqlType::Int4,
+                            default: None,
                         },
                     },
                     CatalogColumn {
@@ -11972,6 +12141,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "name".to_string(),
                             ty: SqlType::Text,
+                            default: None,
                         },
                     },
                 ],
@@ -12043,6 +12213,7 @@ mod tests {
                     def: gpu_db_protocol::ColumnDef {
                         name: "id".to_string(),
                         ty: SqlType::Int4,
+                        default: None,
                     },
                 }],
                 rows: vec![vec![SqlValue::Int4(1)], vec![SqlValue::Int4(2)]],
@@ -12081,6 +12252,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "id".to_string(),
                             ty: SqlType::Int4,
+                            default: None,
                         },
                     },
                     CatalogColumn {
@@ -12088,6 +12260,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "name".to_string(),
                             ty: SqlType::Text,
+                            default: None,
                         },
                     },
                 ],
@@ -12138,6 +12311,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "id".to_string(),
                             ty: SqlType::Int4,
+                            default: None,
                         },
                     },
                     CatalogColumn {
@@ -12145,6 +12319,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "name".to_string(),
                             ty: SqlType::Text,
+                            default: None,
                         },
                     },
                 ],
@@ -12502,6 +12677,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "id".to_string(),
                             ty: gpu_db_protocol::SqlType::Int4,
+                            default: None,
                         },
                     },
                     CatalogColumn {
@@ -12509,6 +12685,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "name".to_string(),
                             ty: gpu_db_protocol::SqlType::Text,
+                            default: None,
                         },
                     },
                 ],
@@ -12525,6 +12702,7 @@ mod tests {
                     def: gpu_db_protocol::ColumnDef {
                         name: "id".to_string(),
                         ty: gpu_db_protocol::SqlType::Int4,
+                        default: None,
                     },
                 }],
                 rows: Vec::new(),
@@ -13972,6 +14150,7 @@ mod tests {
                     def: gpu_db_protocol::ColumnDef {
                         name: "id".to_string(),
                         ty: gpu_db_protocol::SqlType::Int4,
+                        default: None,
                     },
                 }],
                 rows: Vec::new(),
@@ -14007,6 +14186,7 @@ mod tests {
                     def: gpu_db_protocol::ColumnDef {
                         name: "id".to_string(),
                         ty: gpu_db_protocol::SqlType::Int4,
+                        default: None,
                     },
                 },
                 CatalogColumn {
@@ -14014,6 +14194,7 @@ mod tests {
                     def: gpu_db_protocol::ColumnDef {
                         name: "name".to_string(),
                         ty: gpu_db_protocol::SqlType::Text,
+                        default: None,
                     },
                 },
             ],
@@ -14060,6 +14241,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "id".to_string(),
                             ty: gpu_db_protocol::SqlType::Int4,
+                            default: None,
                         },
                     },
                     CatalogColumn {
@@ -14067,6 +14249,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "name".to_string(),
                             ty: gpu_db_protocol::SqlType::Text,
+                            default: None,
                         },
                     },
                 ],
@@ -14270,6 +14453,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "id".to_string(),
                             ty: SqlType::Int4,
+                            default: None,
                         },
                     },
                     CatalogColumn {
@@ -14277,6 +14461,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "name".to_string(),
                             ty: SqlType::Text,
+                            default: None,
                         },
                     },
                 ],
@@ -14392,6 +14577,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "id".to_string(),
                             ty: SqlType::Int4,
+                            default: None,
                         },
                     },
                     CatalogColumn {
@@ -14399,6 +14585,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "name".to_string(),
                             ty: SqlType::Text,
+                            default: None,
                         },
                     },
                 ],
@@ -14499,6 +14686,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "id".to_string(),
                             ty: SqlType::Int4,
+                            default: None,
                         },
                     },
                     CatalogColumn {
@@ -14506,6 +14694,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "name".to_string(),
                             ty: SqlType::Text,
+                            default: None,
                         },
                     },
                 ],
@@ -14564,6 +14753,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "id".to_string(),
                             ty: SqlType::Int4,
+                            default: None,
                         },
                     },
                     CatalogColumn {
@@ -14571,6 +14761,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "name".to_string(),
                             ty: SqlType::Text,
+                            default: None,
                         },
                     },
                 ],
@@ -14671,6 +14862,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "id".to_string(),
                             ty: SqlType::Int4,
+                            default: None,
                         },
                     },
                     CatalogColumn {
@@ -14678,6 +14870,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "name".to_string(),
                             ty: SqlType::Text,
+                            default: None,
                         },
                     },
                 ],
@@ -14760,6 +14953,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "id".to_string(),
                             ty: SqlType::Int4,
+                            default: None,
                         },
                     },
                     CatalogColumn {
@@ -14767,6 +14961,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "name".to_string(),
                             ty: SqlType::Text,
+                            default: None,
                         },
                     },
                 ],
@@ -14865,6 +15060,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "id".to_string(),
                             ty: SqlType::Int4,
+                            default: None,
                         },
                     },
                     CatalogColumn {
@@ -14872,6 +15068,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "name".to_string(),
                             ty: SqlType::Text,
+                            default: None,
                         },
                     },
                 ],
@@ -15047,6 +15244,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "id".to_string(),
                             ty: SqlType::Int4,
+                            default: None,
                         },
                     },
                     CatalogColumn {
@@ -15054,6 +15252,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "name".to_string(),
                             ty: SqlType::Text,
+                            default: None,
                         },
                     },
                 ],
@@ -15140,6 +15339,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "id".to_string(),
                             ty: SqlType::Int4,
+                            default: None,
                         },
                     },
                     CatalogColumn {
@@ -15147,6 +15347,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "name".to_string(),
                             ty: SqlType::Text,
+                            default: None,
                         },
                     },
                 ],
@@ -15284,6 +15485,7 @@ mod tests {
                             def: gpu_db_protocol::ColumnDef {
                                 name: "id".to_string(),
                                 ty: SqlType::Int4,
+                                default: None,
                             },
                         },
                         CatalogColumn {
@@ -15291,6 +15493,7 @@ mod tests {
                             def: gpu_db_protocol::ColumnDef {
                                 name: "name".to_string(),
                                 ty: SqlType::Text,
+                                default: None,
                             },
                         },
                     ],
@@ -15399,6 +15602,7 @@ mod tests {
                             def: gpu_db_protocol::ColumnDef {
                                 name: "id".to_string(),
                                 ty: SqlType::Int4,
+                                default: None,
                             },
                         },
                         CatalogColumn {
@@ -15406,6 +15610,7 @@ mod tests {
                             def: gpu_db_protocol::ColumnDef {
                                 name: "name".to_string(),
                                 ty: SqlType::Text,
+                                default: None,
                             },
                         },
                     ],
@@ -15502,6 +15707,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "id".to_string(),
                             ty: SqlType::Int4,
+                            default: None,
                         },
                     },
                     CatalogColumn {
@@ -15509,6 +15715,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "name".to_string(),
                             ty: SqlType::Text,
+                            default: None,
                         },
                     },
                 ],
@@ -15632,6 +15839,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "id".to_string(),
                             ty: SqlType::Int4,
+                            default: None,
                         },
                     },
                     CatalogColumn {
@@ -15639,6 +15847,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "name".to_string(),
                             ty: SqlType::Text,
+                            default: None,
                         },
                     },
                 ],
@@ -15721,6 +15930,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "id".to_string(),
                             ty: SqlType::Int4,
+                            default: None,
                         },
                     },
                     CatalogColumn {
@@ -15728,6 +15938,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "name".to_string(),
                             ty: SqlType::Text,
+                            default: None,
                         },
                     },
                 ],
@@ -15769,6 +15980,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "id".to_string(),
                             ty: SqlType::Int4,
+                            default: None,
                         },
                     },
                     CatalogColumn {
@@ -15776,6 +15988,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "name".to_string(),
                             ty: SqlType::Text,
+                            default: None,
                         },
                     },
                 ],
@@ -15901,6 +16114,7 @@ mod tests {
                     def: gpu_db_protocol::ColumnDef {
                         name: "id".to_string(),
                         ty: SqlType::Int4,
+                        default: None,
                     },
                 }],
                 rows: Vec::new(),
@@ -15943,6 +16157,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "id".to_string(),
                             ty: SqlType::Int4,
+                            default: None,
                         },
                     },
                     CatalogColumn {
@@ -15950,6 +16165,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "name".to_string(),
                             ty: SqlType::Text,
+                            default: None,
                         },
                     },
                 ],
@@ -16027,6 +16243,7 @@ mod tests {
                             def: gpu_db_protocol::ColumnDef {
                                 name: "id".to_string(),
                                 ty: SqlType::Int4,
+                                default: None,
                             },
                         },
                         CatalogColumn {
@@ -16034,6 +16251,7 @@ mod tests {
                             def: gpu_db_protocol::ColumnDef {
                                 name: "name".to_string(),
                                 ty: SqlType::Text,
+                                default: None,
                             },
                         },
                     ],
@@ -16365,6 +16583,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "id".to_string(),
                             ty: SqlType::Int4,
+                            default: None,
                         },
                     },
                     CatalogColumn {
@@ -16372,6 +16591,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "name".to_string(),
                             ty: SqlType::Text,
+                            default: None,
                         },
                     },
                 ],
@@ -16477,6 +16697,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "id".to_string(),
                             ty: SqlType::Int4,
+                            default: None,
                         },
                     },
                     CatalogColumn {
@@ -16484,6 +16705,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "name".to_string(),
                             ty: SqlType::Text,
+                            default: None,
                         },
                     },
                 ],
@@ -16607,6 +16829,7 @@ mod tests {
                             def: gpu_db_protocol::ColumnDef {
                                 name: "id".to_string(),
                                 ty: SqlType::Int4,
+                                default: None,
                             },
                         },
                         CatalogColumn {
@@ -16614,6 +16837,7 @@ mod tests {
                             def: gpu_db_protocol::ColumnDef {
                                 name: "name".to_string(),
                                 ty: SqlType::Text,
+                                default: None,
                             },
                         },
                     ],
@@ -16728,6 +16952,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "id".to_string(),
                             ty: SqlType::Int4,
+                            default: None,
                         },
                     },
                     CatalogColumn {
@@ -16735,6 +16960,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "name".to_string(),
                             ty: SqlType::Text,
+                            default: None,
                         },
                     },
                 ],
@@ -16789,6 +17015,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "id".to_string(),
                             ty: SqlType::Int4,
+                            default: None,
                         },
                     },
                     CatalogColumn {
@@ -16796,6 +17023,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "name".to_string(),
                             ty: SqlType::Text,
+                            default: None,
                         },
                     },
                 ],
@@ -16998,6 +17226,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "id".to_string(),
                             ty: SqlType::Int4,
+                            default: None,
                         },
                     },
                     CatalogColumn {
@@ -17005,6 +17234,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "name".to_string(),
                             ty: SqlType::Text,
+                            default: None,
                         },
                     },
                 ],
@@ -17076,6 +17306,7 @@ mod tests {
                     def: gpu_db_protocol::ColumnDef {
                         name: "id".to_string(),
                         ty: SqlType::Int4,
+                        default: None,
                     },
                 }],
                 rows: vec![vec![SqlValue::Int4(1)]],
@@ -17130,6 +17361,7 @@ mod tests {
                     def: gpu_db_protocol::ColumnDef {
                         name: "id".to_string(),
                         ty: gpu_db_protocol::SqlType::Int4,
+                        default: None,
                     },
                 }],
                 rows: vec![
@@ -17189,6 +17421,7 @@ mod tests {
                     def: gpu_db_protocol::ColumnDef {
                         name: "id".to_string(),
                         ty: SqlType::Int4,
+                        default: None,
                     },
                 }],
                 rows: vec![vec![SqlValue::Int4(1)]],
@@ -17245,6 +17478,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "id".to_string(),
                             ty: SqlType::Int4,
+                            default: None,
                         },
                     },
                     CatalogColumn {
@@ -17252,6 +17486,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "name".to_string(),
                             ty: SqlType::Text,
+                            default: None,
                         },
                     },
                 ],
@@ -17283,6 +17518,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "id".to_string(),
                             ty: SqlType::Int4,
+                            default: None,
                         },
                     },
                     CatalogColumn {
@@ -17290,6 +17526,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "name".to_string(),
                             ty: SqlType::Text,
+                            default: None,
                         },
                     },
                 ],
@@ -17355,6 +17592,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "id".to_string(),
                             ty: SqlType::Int4,
+                            default: None,
                         },
                     },
                     CatalogColumn {
@@ -17362,6 +17600,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "name".to_string(),
                             ty: SqlType::Text,
+                            default: None,
                         },
                     },
                 ],
@@ -17438,6 +17677,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "id".to_string(),
                             ty: SqlType::Int4,
+                            default: None,
                         },
                     },
                     CatalogColumn {
@@ -17445,6 +17685,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "name".to_string(),
                             ty: SqlType::Text,
+                            default: None,
                         },
                     },
                 ],
@@ -17507,6 +17748,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "id".to_string(),
                             ty: SqlType::Int4,
+                            default: None,
                         },
                     },
                     CatalogColumn {
@@ -17514,6 +17756,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "name".to_string(),
                             ty: SqlType::Text,
+                            default: None,
                         },
                     },
                 ],
@@ -17558,6 +17801,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "id".to_string(),
                             ty: SqlType::Int4,
+                            default: None,
                         },
                     },
                     CatalogColumn {
@@ -17565,6 +17809,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "name".to_string(),
                             ty: SqlType::Text,
+                            default: None,
                         },
                     },
                 ],
@@ -17610,6 +17855,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "id".to_string(),
                             ty: SqlType::Int4,
+                            default: None,
                         },
                     },
                     CatalogColumn {
@@ -17617,6 +17863,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "name".to_string(),
                             ty: SqlType::Text,
+                            default: None,
                         },
                     },
                 ],
@@ -18443,6 +18690,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "id".to_string(),
                             ty: SqlType::Int4,
+                            default: None,
                         },
                     },
                     CatalogColumn {
@@ -18450,6 +18698,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "name".to_string(),
                             ty: SqlType::Text,
+                            default: None,
                         },
                     },
                 ],
@@ -18697,6 +18946,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "id".to_string(),
                             ty: SqlType::Int4,
+                            default: None,
                         },
                     },
                     CatalogColumn {
@@ -18704,6 +18954,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "name".to_string(),
                             ty: SqlType::Text,
+                            default: None,
                         },
                     },
                 ],
@@ -18758,6 +19009,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "id".to_string(),
                             ty: SqlType::Int4,
+                            default: None,
                         },
                     },
                     CatalogColumn {
@@ -18765,6 +19017,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "name".to_string(),
                             ty: SqlType::Text,
+                            default: None,
                         },
                     },
                 ],
@@ -18970,6 +19223,95 @@ mod tests {
         assert_eq!(
             pg_dump_database_metadata_rows()[0][2],
             Some("postgres".to_string())
+        );
+    }
+
+    #[test]
+    fn catalog_queries_expose_literal_column_defaults() {
+        let mut session = Session::default();
+        session.tables.insert(
+            "defaults".to_string(),
+            Table {
+                oid: FIRST_USER_RELATION_OID,
+                name: "defaults".to_string(),
+                columns: vec![
+                    CatalogColumn {
+                        attnum: 1,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "id".to_string(),
+                            ty: SqlType::Int4,
+                            default: Some(SqlValue::Int4(7)),
+                        },
+                    },
+                    CatalogColumn {
+                        attnum: 2,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "name".to_string(),
+                            ty: SqlType::Text,
+                            default: Some(SqlValue::Text("Ada's".to_string())),
+                        },
+                    },
+                ],
+                rows: Vec::new(),
+            },
+        );
+
+        assert_eq!(
+            information_schema_column_detail_rows(&session, "defaults"),
+            vec![
+                vec![
+                    Some("id".to_string()),
+                    Some("integer".to_string()),
+                    Some("YES".to_string()),
+                    Some("7".to_string()),
+                ],
+                vec![
+                    Some("name".to_string()),
+                    Some("text".to_string()),
+                    Some("YES".to_string()),
+                    Some("'Ada''s'::text".to_string()),
+                ],
+            ]
+        );
+        assert_eq!(
+            catalog_describe_attribute_rows(&session, FIRST_USER_RELATION_OID),
+            vec![
+                vec![
+                    Some("id".to_string()),
+                    Some("integer".to_string()),
+                    Some("7".to_string()),
+                    Some("f".to_string()),
+                    None,
+                    Some(String::new()),
+                    Some(String::new()),
+                ],
+                vec![
+                    Some("name".to_string()),
+                    Some("text".to_string()),
+                    Some("'Ada''s'::text".to_string()),
+                    Some("f".to_string()),
+                    None,
+                    Some(String::new()),
+                    Some(String::new()),
+                ],
+            ]
+        );
+        assert_eq!(
+            pg_catalog_attrdef_rows(&session),
+            vec![
+                vec![
+                    Some("public".to_string()),
+                    Some("defaults".to_string()),
+                    Some("id".to_string()),
+                    Some("7".to_string()),
+                ],
+                vec![
+                    Some("public".to_string()),
+                    Some("defaults".to_string()),
+                    Some("name".to_string()),
+                    Some("'Ada''s'::text".to_string()),
+                ],
+            ]
         );
     }
 

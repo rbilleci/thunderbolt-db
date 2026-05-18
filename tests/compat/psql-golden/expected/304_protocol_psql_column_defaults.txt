@@ -1,0 +1,30 @@
+=== literal column defaults ===
+CREATE TABLE
+INSERT 0 1
+ALTER TABLE
+INSERT 0 1
+ id |  name   | bucket
+----+---------+--------
+  1 | unknown |      7
+  2 | changed |      7
+(2 rows)
+
+ column_name | data_type | is_nullable | column_default
+-------------+-----------+-------------+-----------------
+ id          | integer   | YES         |
+ name        | text      | YES         | 'changed'::text
+ bucket      | integer   | YES         | 7
+(3 rows)
+
+ nspname |    relname     | attname |  default_expr
+---------+----------------+---------+-----------------
+ public  | default_people | name    | 'changed'::text
+ public  | default_people | bucket  | 7
+(2 rows)
+
+               Table "public.default_people"
+ Column |  Type   | Collation | Nullable |     Default
+--------+---------+-----------+----------+-----------------
+ id     | integer |           |          |
+ name   | text    |           |          | 'changed'::text
+ bucket | integer |           |          | 7

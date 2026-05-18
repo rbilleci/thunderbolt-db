@@ -11,6 +11,7 @@ pub enum Command {
     GetKv { key: String },
     CreateTable(CreateTable),
     CreateIndex(CreateIndex),
+    AlterColumnDefault(AlterColumnDefault),
     Insert(Insert),
     Delete(Delete),
     Update(Update),
@@ -31,9 +32,17 @@ pub struct CreateIndex {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlterColumnDefault {
+    pub table: String,
+    pub column: String,
+    pub default: SqlValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnDef {
     pub name: String,
     pub ty: SqlType,
+    pub default: Option<SqlValue>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1547,6 +1556,9 @@ fn parse_relational_command(input: &str) -> Option<Result<Command, ParseError>> 
         }
         return Some(Err(ParseError::InvalidRelationalSql));
     }
+    if first.eq_ignore_ascii_case("ALTER") {
+        return Some(parse_alter_column_default(input).map(Command::AlterColumnDefault));
+    }
     if first.eq_ignore_ascii_case("INSERT") {
         return Some(parse_insert(input).map(Command::Insert));
     }
@@ -1570,6 +1582,40 @@ fn parse_relational_command(input: &str) -> Option<Result<Command, ParseError>> 
     None
 }
 
+fn parse_alter_column_default(input: &str) -> Result<AlterColumnDefault, ParseError> {
+    let rest = strip_keyword_prefix_case_insensitive(input, "ALTER")
+        .and_then(|s| strip_keyword_prefix_case_insensitive(s.trim_start(), "TABLE"))
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    let rest = strip_keyword_prefix_case_insensitive(rest, "ONLY")
+        .map(str::trim_start)
+        .unwrap_or(rest);
+    let alter_pos =
+        find_keyword_outside_quotes(rest, "ALTER").ok_or(ParseError::InvalidRelationalSql)?;
+    let table = normalize_relation_identifier(rest[..alter_pos].trim())?;
+    let rest = rest[alter_pos + "ALTER".len()..].trim_start();
+    let rest = strip_keyword_prefix_case_insensitive(rest, "COLUMN")
+        .map(str::trim_start)
+        .unwrap_or(rest);
+    let set_pos =
+        find_keyword_outside_quotes(rest, "SET").ok_or(ParseError::InvalidRelationalSql)?;
+    let column = normalize_identifier(rest[..set_pos].trim())?;
+    let rest = strip_keyword_prefix_case_insensitive(
+        rest[set_pos + "SET".len()..].trim_start(),
+        "DEFAULT",
+    )
+    .ok_or(ParseError::InvalidRelationalSql)?
+    .trim();
+    if rest.is_empty() {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    Ok(AlterColumnDefault {
+        table,
+        column,
+        default: parse_sql_value(rest)?,
+    })
+}
+
 fn parse_create_table(input: &str) -> Result<CreateTable, ParseError> {
     let rest = strip_keyword_prefix_case_insensitive(input, "CREATE")
         .and_then(|s| strip_keyword_prefix_case_insensitive(s.trim_start(), "TABLE"))
@@ -1588,15 +1634,32 @@ fn parse_create_table(input: &str) -> Result<CreateTable, ParseError> {
             .next()
             .ok_or(ParseError::InvalidRelationalSql)
             .and_then(normalize_identifier)?;
-        let ty = match parts.next().ok_or(ParseError::InvalidRelationalSql)? {
+        let raw_ty = parts.next().ok_or(ParseError::InvalidRelationalSql)?;
+        let ty = match raw_ty {
             ty if parse_supported_sql_type_name(ty) == Some(SqlType::Int4) => SqlType::Int4,
             ty if parse_supported_sql_type_name(ty) == Some(SqlType::Text) => SqlType::Text,
             _ => return Err(ParseError::InvalidRelationalSql),
         };
-        if parts.next().is_some() {
-            return Err(ParseError::InvalidRelationalSql);
-        }
-        columns.push(ColumnDef { name, ty });
+        let raw_default = parts.collect::<Vec<_>>().join(" ");
+        let default = if raw_default.is_empty() {
+            None
+        } else {
+            let default_value = strip_keyword_prefix_case_insensitive(&raw_default, "DEFAULT")
+                .ok_or(ParseError::InvalidRelationalSql)?
+                .trim();
+            if default_value.is_empty() {
+                return Err(ParseError::InvalidRelationalSql);
+            }
+            let value = parse_sql_value(default_value)?;
+            if !matches!(
+                (&value, ty),
+                (SqlValue::Int4(_), SqlType::Int4) | (SqlValue::Text(_), SqlType::Text)
+            ) {
+                return Err(ParseError::InvalidRelationalSql);
+            }
+            Some(value)
+        };
+        columns.push(ColumnDef { name, ty, default });
     }
     if columns.is_empty() {
         return Err(ParseError::InvalidRelationalSql);
@@ -8720,10 +8783,12 @@ mod tests {
                     ColumnDef {
                         name: "id".to_string(),
                         ty: SqlType::Int4,
+                        default: None,
                     },
                     ColumnDef {
                         name: "name".to_string(),
                         ty: SqlType::Text,
+                        default: None,
                     },
                 ],
             })
@@ -8737,10 +8802,12 @@ mod tests {
                     ColumnDef {
                         name: "id".to_string(),
                         ty: SqlType::Int4,
+                        default: None,
                     },
                     ColumnDef {
                         name: "owner".to_string(),
                         ty: SqlType::Text,
+                        default: None,
                     },
                 ],
             })
@@ -8754,10 +8821,12 @@ mod tests {
                     ColumnDef {
                         name: "id".to_string(),
                         ty: SqlType::Int4,
+                        default: None,
                     },
                     ColumnDef {
                         name: "name".to_string(),
                         ty: SqlType::Text,
+                        default: None,
                     },
                 ],
             })
@@ -8766,6 +8835,58 @@ mod tests {
             parse_command("CREATE TABLE private.dump_people (id integer)"),
             Err(ParseError::InvalidRelationalSql)
         ));
+        assert_eq!(
+            parse_command(
+                "CREATE TABLE default_people (id INT DEFAULT 7, name TEXT DEFAULT 'Ada''s'::text)"
+            )
+            .unwrap(),
+            Command::CreateTable(CreateTable {
+                table: "default_people".to_string(),
+                columns: vec![
+                    ColumnDef {
+                        name: "id".to_string(),
+                        ty: SqlType::Int4,
+                        default: Some(SqlValue::Int4(7)),
+                    },
+                    ColumnDef {
+                        name: "name".to_string(),
+                        ty: SqlType::Text,
+                        default: Some(SqlValue::Text("Ada's".to_string())),
+                    },
+                ],
+            })
+        );
+        assert!(matches!(
+            parse_command("CREATE TABLE invalid_default (id INT DEFAULT 'bad'::text)"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert_eq!(
+            parse_command("CREATE TABLE type_named_columns (integer_col integer, text_col text)")
+                .unwrap(),
+            Command::CreateTable(CreateTable {
+                table: "type_named_columns".to_string(),
+                columns: vec![
+                    ColumnDef {
+                        name: "integer_col".to_string(),
+                        ty: SqlType::Int4,
+                        default: None,
+                    },
+                    ColumnDef {
+                        name: "text_col".to_string(),
+                        ty: SqlType::Text,
+                        default: None,
+                    },
+                ],
+            })
+        );
+        assert_eq!(
+            parse_command("ALTER TABLE ONLY public.default_people ALTER COLUMN name SET DEFAULT 'Grace'::text").unwrap(),
+            Command::AlterColumnDefault(AlterColumnDefault {
+                table: "default_people".to_string(),
+                column: "name".to_string(),
+                default: SqlValue::Text("Grace".to_string()),
+            })
+        );
 
         assert_eq!(
             parse_command("CREATE INDEX people_name_idx ON public.people (name)").unwrap(),

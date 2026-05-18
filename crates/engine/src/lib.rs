@@ -72,6 +72,7 @@ impl ReplicatedStateMachine for KvStateMachine {
                     | Command::GetKv { .. }
                     | Command::CreateTable(_)
                     | Command::CreateIndex(_)
+                    | Command::AlterColumnDefault(_)
                     | Command::Insert(_)
                     | Command::Delete(_)
                     | Command::Update(_)
@@ -5954,6 +5955,7 @@ pub struct RelationalColumn {
     pub attnum: i16,
     pub name: String,
     pub ty: SqlType,
+    pub default: Option<SqlValue>,
     pub type_oid: u32,
     pub type_size: i16,
 }
@@ -6217,6 +6219,7 @@ impl RelationalColumn {
             attnum,
             name: def.name,
             ty: def.ty,
+            default: def.default,
             type_oid: def.ty.postgres_oid(),
             type_size: def.ty.type_size(),
         }
@@ -6226,6 +6229,7 @@ impl RelationalColumn {
         ColumnDef {
             name: self.name.clone(),
             ty: self.ty,
+            default: self.default.clone(),
         }
     }
 }
@@ -6505,6 +6509,7 @@ fn bind_relational_select(
             attnum: aggregate_attnum,
             name: aggregate_name.to_string(),
             ty: aggregate_ty,
+            default: None,
             type_oid: aggregate_type_oid,
             type_size: aggregate_type_size,
         });
@@ -7458,6 +7463,7 @@ impl Engine {
             }
             Command::CreateTable(create) => self.apply_create_table(create)?,
             Command::CreateIndex(create) => self.apply_create_index(create)?,
+            Command::AlterColumnDefault(alter) => self.apply_alter_column_default(alter)?,
             Command::Insert(insert) => self.apply_insert(insert, txn_id)?,
             Command::Delete(delete) => self.apply_delete(delete, txn_id)?,
             Command::Update(update) => self.apply_update(update, txn_id)?,
@@ -7550,6 +7556,33 @@ impl Engine {
         Ok(())
     }
 
+    fn apply_alter_column_default(
+        &mut self,
+        alter: gpu_db_protocol::AlterColumnDefault,
+    ) -> Result<(), EngineError> {
+        let table = self
+            .relational_catalog
+            .get_mut(&alter.table)
+            .ok_or_else(|| {
+                EngineError::ApplyFailed(format!("relation \"{}\" does not exist", alter.table))
+            })?;
+        let column = table
+            .columns
+            .iter_mut()
+            .find(|column| column.name == alter.column)
+            .ok_or_else(|| {
+                EngineError::ApplyFailed(format!("column \"{}\" does not exist", alter.column))
+            })?;
+        if !sql_value_matches_type(&alter.default, column.ty) {
+            return Err(EngineError::ApplyFailed(format!(
+                "invalid default for column \"{}\"",
+                alter.column
+            )));
+        }
+        column.default = Some(alter.default);
+        Ok(())
+    }
+
     fn apply_insert(&mut self, insert: Insert, txn_id: TxnId) -> Result<(), EngineError> {
         let table = self
             .relational_catalog
@@ -7592,9 +7625,14 @@ impl Engine {
                 }
                 values[target_idx] = Some(value);
             }
+            for (idx, value) in values.iter_mut().enumerate() {
+                if value.is_none() {
+                    *value = table.columns[idx].default.clone();
+                }
+            }
             if values.iter().any(Option::is_none) {
                 return Err(EngineError::ApplyFailed(
-                    "INSERT must provide every column in the bootstrap relational subset"
+                    "INSERT must provide every column without a default in the bootstrap relational subset"
                         .to_string(),
                 ));
             }
@@ -7748,6 +7786,7 @@ impl Engine {
             | Command::DeleteKv { .. }
             | Command::CreateTable(_)
             | Command::CreateIndex(_)
+            | Command::AlterColumnDefault(_)
             | Command::Insert(_)
             | Command::Delete(_)
             | Command::Update(_) => {
@@ -7929,6 +7968,7 @@ impl Engine {
             | Command::DeleteKv { .. }
             | Command::CreateTable(_)
             | Command::CreateIndex(_)
+            | Command::AlterColumnDefault(_)
             | Command::Insert(_)
             | Command::Delete(_)
             | Command::Update(_) => match self.route_command(&cmd) {
@@ -8006,6 +8046,7 @@ impl Engine {
             Command::DeleteKv { .. } => Err(ExecuteError::NonReadCommand("DEL/DELETE")),
             Command::CreateTable(_) => Err(ExecuteError::NonReadCommand("CREATE TABLE")),
             Command::CreateIndex(_) => Err(ExecuteError::NonReadCommand("CREATE INDEX")),
+            Command::AlterColumnDefault(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
             Command::Insert(_) => Err(ExecuteError::NonReadCommand("INSERT")),
             Command::Delete(_) => Err(ExecuteError::NonReadCommand("DELETE")),
             Command::Update(_) => Err(ExecuteError::NonReadCommand("UPDATE")),
@@ -28917,10 +28958,12 @@ mod tests {
                 ColumnDef {
                     name: "name".to_string(),
                     ty: SqlType::Text,
+                    default: None,
                 },
                 ColumnDef {
                     name: "id".to_string(),
                     ty: SqlType::Int4,
+                    default: None,
                 },
             ]
         );
@@ -28945,6 +28988,76 @@ mod tests {
                 matched_keys: 1,
             }
         );
+    }
+
+    #[test]
+    fn relational_column_defaults_fill_omitted_insert_columns_and_replay() {
+        let mut e = Engine::new_local();
+        e.execute_text(
+            1,
+            "CREATE TABLE default_people (id INT, name TEXT DEFAULT 'unknown'::text, bucket INT DEFAULT 7)",
+        )
+        .unwrap();
+        e.execute_text(2, "INSERT INTO default_people (id) VALUES (1)")
+            .unwrap();
+        e.execute_text(
+            3,
+            "ALTER TABLE ONLY public.default_people ALTER COLUMN name SET DEFAULT 'changed'::text",
+        )
+        .unwrap();
+        e.execute_text(
+            4,
+            "INSERT INTO default_people (id, name, bucket) VALUES (2, 'Ada', 9)",
+        )
+        .unwrap();
+        e.execute_text(5, "INSERT INTO default_people (id) VALUES (3)")
+            .unwrap();
+
+        let Command::Select(select) =
+            parse_command("SELECT id, name, bucket FROM default_people ORDER BY id ASC").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let result = e.execute_relational_select(&select).unwrap();
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![
+                    SqlValue::Int4(1),
+                    SqlValue::Text("unknown".to_string()),
+                    SqlValue::Int4(7),
+                ],
+                vec![
+                    SqlValue::Int4(2),
+                    SqlValue::Text("Ada".to_string()),
+                    SqlValue::Int4(9),
+                ],
+                vec![
+                    SqlValue::Int4(3),
+                    SqlValue::Text("changed".to_string()),
+                    SqlValue::Int4(7),
+                ],
+            ]
+        );
+
+        let mut recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let table = recovered
+            .relational_catalog_table("default_people")
+            .unwrap();
+        assert_eq!(
+            table.columns[1].default,
+            Some(SqlValue::Text("changed".to_string()))
+        );
+        assert_eq!(table.columns[2].default, Some(SqlValue::Int4(7)));
+        let recovered_result = recovered.execute_relational_select(&select).unwrap();
+        assert_eq!(recovered_result.rows, result.rows);
+
+        let err = e
+            .execute_text(6, "INSERT INTO default_people (name) VALUES ('missing id')")
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("INSERT must provide every column without a default"));
     }
 
     #[test]
@@ -30279,6 +30392,7 @@ mod tests {
                 attnum: 1,
                 name: "id".to_string(),
                 ty: SqlType::Int4,
+                default: None,
                 type_oid: SqlType::Int4.postgres_oid(),
                 type_size: SqlType::Int4.type_size(),
             }
@@ -30291,6 +30405,7 @@ mod tests {
                 attnum: 2,
                 name: "name".to_string(),
                 ty: SqlType::Text,
+                default: None,
                 type_oid: SqlType::Text.postgres_oid(),
                 type_size: SqlType::Text.type_size(),
             }
