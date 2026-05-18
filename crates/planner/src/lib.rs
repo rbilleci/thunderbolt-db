@@ -60,6 +60,7 @@ impl Planner {
             },
             Command::CreateTable(_)
             | Command::AddPrimaryKey(_)
+            | Command::AddUniqueConstraint(_)
             | Command::CreateIndex(_)
             | Command::DropIndex(_)
             | Command::AlterColumnDefault(_)

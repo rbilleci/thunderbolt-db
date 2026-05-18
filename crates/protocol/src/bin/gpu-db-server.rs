@@ -1243,13 +1243,15 @@ fn shared_catalog_contains_live_index(index: &str) -> bool {
         .any(|candidate| candidate.name == index && catalog.tables.contains_key(&candidate.table))
 }
 
-fn shared_catalog_contains_primary_key_constraint(table: &str, constraint: &str) -> bool {
+fn shared_catalog_contains_table_constraint(table: &str, constraint: &str) -> bool {
     let catalog = shared_catalog()
         .lock()
         .expect("shared catalog mutex poisoned");
     catalog.tables.contains_key(table)
         && catalog.indexes.iter().any(|candidate| {
-            candidate.table == table && candidate.name == constraint && candidate.primary_key
+            candidate.table == table
+                && candidate.name == constraint
+                && (candidate.primary_key || candidate.unique_constraint)
         })
 }
 
@@ -1306,6 +1308,7 @@ fn add_primary_key_to_session(
         column: column.clone(),
         unique: true,
         primary_key: true,
+        unique_constraint: false,
     });
     validate_unique_indexes(table, &candidate_indexes)?;
     session.indexes.push(CatalogIndex {
@@ -1314,6 +1317,64 @@ fn add_primary_key_to_session(
         column,
         unique: true,
         primary_key: true,
+        unique_constraint: false,
+    });
+    session.dirty_indexes = true;
+    Ok(())
+}
+
+fn add_unique_constraint_to_session(
+    session: &mut Session,
+    table_name: &str,
+    constraint_name: String,
+    column: String,
+) -> Result<(), ErrorField> {
+    if session
+        .indexes
+        .iter()
+        .any(|index| index.name == constraint_name)
+    {
+        return Err(ErrorField {
+            code: "42P07",
+            message: "relation already exists",
+            position: None,
+        });
+    }
+    let Some(table) = session.tables.get(table_name) else {
+        return Err(ErrorField {
+            code: "42P01",
+            message: "relation does not exist",
+            position: None,
+        });
+    };
+    if !table
+        .columns
+        .iter()
+        .any(|candidate| candidate.def.name == column)
+    {
+        return Err(ErrorField {
+            code: "42703",
+            message: "column does not exist",
+            position: None,
+        });
+    }
+    let mut candidate_indexes = session.indexes.clone();
+    candidate_indexes.push(CatalogIndex {
+        name: constraint_name.clone(),
+        table: table_name.to_string(),
+        column: column.clone(),
+        unique: true,
+        primary_key: false,
+        unique_constraint: true,
+    });
+    validate_unique_indexes(table, &candidate_indexes)?;
+    session.indexes.push(CatalogIndex {
+        name: constraint_name,
+        table: table_name.to_string(),
+        column,
+        unique: true,
+        primary_key: false,
+        unique_constraint: true,
     });
     session.dirty_indexes = true;
     Ok(())
@@ -1518,6 +1579,7 @@ struct CatalogIndex {
     column: String,
     unique: bool,
     primary_key: bool,
+    unique_constraint: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -5350,7 +5412,9 @@ fn execute_statement(
         }
         let old_index_count = session.indexes.len();
         session.indexes.retain(|index| {
-            !(index.table == drop.table && index.name == drop.constraint && index.primary_key)
+            !(index.table == drop.table
+                && index.name == drop.constraint
+                && (index.primary_key || index.unique_constraint))
         });
         if session.indexes.len() == old_index_count && !drop.if_exists {
             return write_error(
@@ -5670,6 +5734,22 @@ fn execute_statement(
                         primary_key.column,
                     ) {
                         session.tables.remove(&table_name);
+                        session.indexes.retain(|index| index.table != table_name);
+                        return write_error(stream, &error);
+                    }
+                }
+                for unique in create.unique_constraints {
+                    let constraint_name = unique
+                        .name
+                        .unwrap_or_else(|| format!("{}_{}_key", table_name, unique.column));
+                    if let Err(error) = add_unique_constraint_to_session(
+                        session,
+                        &table_name,
+                        constraint_name,
+                        unique.column,
+                    ) {
+                        session.tables.remove(&table_name);
+                        session.indexes.retain(|index| index.table != table_name);
                         return write_error(stream, &error);
                     }
                 }
@@ -5679,6 +5759,18 @@ fn execute_statement(
             }
             Command::AddPrimaryKey(add) => {
                 if let Err(error) = add_primary_key_to_session(
+                    session,
+                    &add.table,
+                    add.name.clone(),
+                    add.column.clone(),
+                ) {
+                    return write_error(stream, &error);
+                }
+                session.persist_catalog_snapshot();
+                return write_command_complete(stream, "ALTER TABLE");
+            }
+            Command::AddUniqueConstraint(add) => {
+                if let Err(error) = add_unique_constraint_to_session(
                     session,
                     &add.table,
                     add.name.clone(),
@@ -5736,6 +5828,7 @@ fn execute_statement(
                         column: create.column.clone(),
                         unique: true,
                         primary_key: false,
+                        unique_constraint: false,
                     });
                     if let Err(error) = validate_unique_indexes(table, &candidate_indexes) {
                         return write_error(stream, &error);
@@ -5747,6 +5840,7 @@ fn execute_statement(
                     column: create.column,
                     unique: create.unique,
                     primary_key: false,
+                    unique_constraint: false,
                 });
                 session.dirty_indexes = true;
                 session.persist_catalog_snapshot();
@@ -5911,9 +6005,9 @@ fn execute_statement(
                         let exists = session.indexes.iter().any(|candidate| {
                             candidate.table == table
                                 && candidate.name == constraint
-                                && candidate.primary_key
+                                && (candidate.primary_key || candidate.unique_constraint)
                         }) || (session.shared_catalog
-                            && shared_catalog_contains_primary_key_constraint(&table, &constraint));
+                            && shared_catalog_contains_table_constraint(&table, &constraint));
                         if !exists {
                             return write_error(
                                 stream,
@@ -8477,19 +8571,18 @@ fn pg_dump_index_metadata_rows(session: &Session) -> Vec<Vec<Option<String>>> {
                 Some(catalog_index_definition(&entry.index)),
                 Some(entry.attnum.to_string()),
                 Some("f".to_string()),
-                entry.index.primary_key.then_some("p".to_string()),
-                entry.index.primary_key.then_some(entry.index.name.clone()),
+                (entry.index.primary_key || entry.index.unique_constraint)
+                    .then_some(catalog_constraint_contype(&entry.index).to_string()),
+                (entry.index.primary_key || entry.index.unique_constraint)
+                    .then_some(entry.index.name.clone()),
                 Some("f".to_string()),
                 Some("f".to_string()),
-                entry.index.primary_key.then_some("2606".to_string()),
-                entry
-                    .index
-                    .primary_key
+                (entry.index.primary_key || entry.index.unique_constraint)
+                    .then_some("2606".to_string()),
+                (entry.index.primary_key || entry.index.unique_constraint)
                     .then_some(catalog_constraint_oid(&entry).to_string()),
-                entry
-                    .index
-                    .primary_key
-                    .then_some(format!("PRIMARY KEY ({})", entry.index.column)),
+                (entry.index.primary_key || entry.index.unique_constraint)
+                    .then_some(catalog_constraint_definition(&entry.index)),
                 Some(String::new()),
                 None,
                 Some("f".to_string()),
@@ -8544,11 +8637,31 @@ fn catalog_index_entries(session: &Session) -> Vec<CatalogIndexEntry> {
         .collect()
 }
 
-fn catalog_primary_key_entries(session: &Session) -> Vec<CatalogIndexEntry> {
+fn catalog_constraint_entries(session: &Session) -> Vec<CatalogIndexEntry> {
     catalog_index_entries(session)
         .into_iter()
-        .filter(|entry| entry.index.primary_key)
+        .filter(|entry| entry.index.primary_key || entry.index.unique_constraint)
         .collect()
+}
+
+fn catalog_constraint_type(index: &CatalogIndex) -> &'static str {
+    if index.primary_key {
+        "PRIMARY KEY"
+    } else {
+        "UNIQUE"
+    }
+}
+
+fn catalog_constraint_contype(index: &CatalogIndex) -> &'static str {
+    if index.primary_key {
+        "p"
+    } else {
+        "u"
+    }
+}
+
+fn catalog_constraint_definition(index: &CatalogIndex) -> String {
+    format!("{} ({})", catalog_constraint_type(index), index.column)
 }
 
 fn catalog_constraint_oid(entry: &CatalogIndexEntry) -> u32 {
@@ -9230,13 +9343,14 @@ fn catalog_describe_index_rows(session: &Session, table_oid: u32) -> Vec<Vec<Opt
                 Some("f".to_string()),
                 Some("t".to_string()),
                 Some(catalog_index_definition(&entry.index)),
-                entry
-                    .index
-                    .primary_key
-                    .then_some(format!("PRIMARY KEY ({})", entry.index.column)),
-                entry.index.primary_key.then_some("p".to_string()),
-                entry.index.primary_key.then_some("f".to_string()),
-                entry.index.primary_key.then_some("f".to_string()),
+                (entry.index.primary_key || entry.index.unique_constraint)
+                    .then_some(catalog_constraint_definition(&entry.index)),
+                (entry.index.primary_key || entry.index.unique_constraint)
+                    .then_some(catalog_constraint_contype(&entry.index).to_string()),
+                (entry.index.primary_key || entry.index.unique_constraint)
+                    .then_some("f".to_string()),
+                (entry.index.primary_key || entry.index.unique_constraint)
+                    .then_some("f".to_string()),
                 Some("f".to_string()),
                 Some("0".to_string()),
             ]
@@ -10021,14 +10135,14 @@ fn information_schema_table_constraints_query() -> &'static str {
 }
 
 fn information_schema_table_constraint_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    let mut rows = catalog_primary_key_entries(session)
+    let mut rows = catalog_constraint_entries(session)
         .into_iter()
         .map(|entry| {
             vec![
                 Some("public".to_string()),
                 Some(entry.index.table.clone()),
                 Some(entry.index.name.clone()),
-                Some("PRIMARY KEY".to_string()),
+                Some(catalog_constraint_type(&entry.index).to_string()),
             ]
         })
         .collect::<Vec<_>>();
@@ -10041,7 +10155,7 @@ fn information_schema_key_column_usage_query() -> &'static str {
 }
 
 fn information_schema_key_column_usage_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    catalog_primary_key_entries(session)
+    catalog_constraint_entries(session)
         .into_iter()
         .map(|entry| {
             vec![
@@ -10078,14 +10192,14 @@ fn pg_catalog_constraints_query() -> &'static str {
 }
 
 fn pg_catalog_constraint_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    catalog_primary_key_entries(session)
+    catalog_constraint_entries(session)
         .into_iter()
         .map(|entry| {
             vec![
                 Some("public".to_string()),
                 Some(entry.index.table.clone()),
                 Some(entry.index.name.clone()),
-                Some("p".to_string()),
+                Some(catalog_constraint_contype(&entry.index).to_string()),
             ]
         })
         .collect()
@@ -10160,7 +10274,7 @@ fn pg_catalog_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
 }
 
 fn pg_catalog_constraint_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    let mut constraints = catalog_primary_key_entries(session);
+    let mut constraints = catalog_constraint_entries(session);
     constraints.sort_by(|left, right| {
         left.index
             .table
@@ -10286,7 +10400,7 @@ fn pg_dump_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
     constraint_comments
         .sort_by(|left, right| left.0.cmp(right.0).then_with(|| left.1.cmp(right.1)));
     for (table_name, constraint_name, description) in constraint_comments {
-        if let Some(entry) = catalog_primary_key_entries(session)
+        if let Some(entry) = catalog_constraint_entries(session)
             .into_iter()
             .find(|entry| &entry.index.table == table_name && &entry.index.name == constraint_name)
         {
@@ -10317,7 +10431,7 @@ fn psql_object_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
             ]);
         }
     }
-    let mut constraints = catalog_primary_key_entries(session);
+    let mut constraints = catalog_constraint_entries(session);
     constraints.sort_by(|left, right| {
         left.index
             .table
@@ -12029,6 +12143,7 @@ mod tests {
             column: "id".to_string(),
             unique: false,
             primary_key: false,
+            unique_constraint: false,
         });
         session.comments.insert(
             CatalogCommentTarget::Index {
@@ -12131,6 +12246,7 @@ mod tests {
             column: "id".to_string(),
             unique: false,
             primary_key: false,
+            unique_constraint: false,
         });
         session.mark_table_dirty(table_name);
         session.dirty_indexes = true;
@@ -12247,6 +12363,7 @@ mod tests {
             column: "id".to_string(),
             unique: false,
             primary_key: false,
+            unique_constraint: false,
         });
         index_session.dirty_indexes = true;
         other_index_session.indexes.push(CatalogIndex {
@@ -12255,6 +12372,7 @@ mod tests {
             column: "id".to_string(),
             unique: false,
             primary_key: false,
+            unique_constraint: false,
         });
         other_index_session.dirty_indexes = true;
 

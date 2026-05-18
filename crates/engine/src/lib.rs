@@ -19,8 +19,9 @@ use gpu_db_observability::{
 };
 use gpu_db_planner::{ExecutionPlan, Planner, PlannerConfig};
 use gpu_db_protocol::{
-    parse_command, ColumnDef, Command, CommentTarget, CreateIndex, CreateTable, Delete, DropIndex,
-    Insert, ParseError, Select, SelectFilterOp, SelectProjection, SqlType, SqlValue, Update,
+    parse_command, AddUniqueConstraint, ColumnDef, Command, CommentTarget, CreateIndex,
+    CreateTable, Delete, DropIndex, Insert, ParseError, Select, SelectFilterOp, SelectProjection,
+    SqlType, SqlValue, Update,
 };
 use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine};
 use gpu_db_storage::{
@@ -72,6 +73,7 @@ impl ReplicatedStateMachine for KvStateMachine {
                     | Command::GetKv { .. }
                     | Command::CreateTable(_)
                     | Command::AddPrimaryKey(_)
+                    | Command::AddUniqueConstraint(_)
                     | Command::CreateIndex(_)
                     | Command::DropIndex(_)
                     | Command::AlterColumnDefault(_)
@@ -5971,6 +5973,7 @@ pub struct RelationalIndex {
     pub column: String,
     pub unique: bool,
     pub primary_key: bool,
+    pub unique_constraint: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -7478,6 +7481,7 @@ impl Engine {
             }
             Command::CreateTable(create) => self.apply_create_table(create)?,
             Command::AddPrimaryKey(add) => self.apply_add_primary_key(add)?,
+            Command::AddUniqueConstraint(add) => self.apply_add_unique_constraint(add)?,
             Command::CreateIndex(create) => self.apply_create_index(create)?,
             Command::DropIndex(drop) => self.apply_drop_index(drop)?,
             Command::AlterColumnDefault(alter) => self.apply_alter_column_default(alter)?,
@@ -7524,33 +7528,51 @@ impl Engine {
             columns.push(RelationalColumn::from_def(id, oid, attnum, column));
         }
         let primary_key = create.primary_key.clone();
+        let unique_constraints = create.unique_constraints.clone();
         let name = create.table;
+        let mut indexes = Vec::new();
+        if let Some(primary_key) = primary_key {
+            let constraint_name = primary_key.name.unwrap_or_else(|| format!("{}_pkey", name));
+            indexes.push(RelationalIndex {
+                name: constraint_name,
+                table: name.clone(),
+                column: primary_key.column,
+                unique: true,
+                primary_key: true,
+                unique_constraint: false,
+            });
+        }
+        for unique in unique_constraints {
+            let constraint_name = unique
+                .name
+                .unwrap_or_else(|| format!("{}_{}_key", name, unique.column));
+            if indexes.iter().any(|index| index.name == constraint_name) {
+                return Err(EngineError::ApplyFailed(format!(
+                    "relation \"{}\" already exists",
+                    constraint_name
+                )));
+            }
+            indexes.push(RelationalIndex {
+                name: constraint_name,
+                table: name.clone(),
+                column: unique.column,
+                unique: true,
+                primary_key: false,
+                unique_constraint: true,
+            });
+        }
         self.relational_catalog.insert(
             name.clone(),
             RelationalTable {
                 schema: PUBLIC_SCHEMA_NAME.to_string(),
-                name: name.clone(),
+                name,
                 oid,
                 columns,
-                indexes: Vec::new(),
+                indexes,
             },
         );
         self.relational_next_oid = next_oid;
         self.relational_next_column_id = next_column_id;
-        if let Some(primary_key) = primary_key {
-            let constraint_name = primary_key.name.unwrap_or_else(|| format!("{}_pkey", name));
-            self.relational_catalog
-                .get_mut(&name)
-                .expect("table was just inserted")
-                .indexes
-                .push(RelationalIndex {
-                    name: constraint_name,
-                    table: name,
-                    column: primary_key.column,
-                    unique: true,
-                    primary_key: true,
-                });
-        }
         Ok(())
     }
 
@@ -7584,17 +7606,18 @@ impl Engine {
             column: add.column,
             unique: true,
         };
-        self.apply_create_index_with_primary_key(create, true)
+        self.apply_create_index_with_constraint_flags(create, true, false)
     }
 
     fn apply_create_index(&mut self, create: CreateIndex) -> Result<(), EngineError> {
-        self.apply_create_index_with_primary_key(create, false)
+        self.apply_create_index_with_constraint_flags(create, false, false)
     }
 
-    fn apply_create_index_with_primary_key(
+    fn apply_create_index_with_constraint_flags(
         &mut self,
         create: CreateIndex,
         primary_key: bool,
+        unique_constraint: bool,
     ) -> Result<(), EngineError> {
         if self
             .relational_catalog
@@ -7640,8 +7663,19 @@ impl Engine {
                 column: create.column,
                 unique: create.unique,
                 primary_key,
+                unique_constraint,
             });
         Ok(())
+    }
+
+    fn apply_add_unique_constraint(&mut self, add: AddUniqueConstraint) -> Result<(), EngineError> {
+        let create = CreateIndex {
+            name: add.name,
+            table: add.table,
+            column: add.column,
+            unique: true,
+        };
+        self.apply_create_index_with_constraint_flags(create, false, true)
     }
 
     fn visible_relational_rows(
@@ -8117,6 +8151,38 @@ impl Engine {
                 )?;
                 Self::validate_unique_values(&rows, column_idx, &add.name)?;
             }
+            Command::AddUniqueConstraint(add) => {
+                if self
+                    .relational_catalog
+                    .values()
+                    .any(|table| table.indexes.iter().any(|index| index.name == add.name))
+                {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "relation \"{}\" already exists",
+                        add.name
+                    )));
+                }
+                let table = self.relational_catalog.get(&add.table).ok_or_else(|| {
+                    EngineError::ApplyFailed(format!("relation \"{}\" does not exist", add.table))
+                })?;
+                let column_idx = table
+                    .columns
+                    .iter()
+                    .position(|column| column.name == add.column)
+                    .ok_or_else(|| {
+                        EngineError::ApplyFailed(format!(
+                            "column \"{}\" does not exist",
+                            add.column
+                        ))
+                    })?;
+                let rows = self.visible_relational_rows(
+                    table,
+                    StorageVisibility {
+                        read_txn_id: self.visible_up_to as TxnId,
+                    },
+                )?;
+                Self::validate_unique_values(&rows, column_idx, &add.name)?;
+            }
             Command::Insert(insert) => {
                 let table = self.relational_catalog.get(&insert.table).ok_or_else(|| {
                     EngineError::ApplyFailed(format!(
@@ -8245,6 +8311,7 @@ impl Engine {
     fn command_requires_immediate_unique_index_commit(&self, cmd: &Command) -> bool {
         match cmd {
             Command::AddPrimaryKey(_) => true,
+            Command::AddUniqueConstraint(_) => true,
             Command::CreateIndex(create) => create.unique,
             Command::Insert(insert) => self
                 .relational_catalog
@@ -8270,6 +8337,7 @@ impl Engine {
             | Command::DeleteKv { .. }
             | Command::CreateTable(_)
             | Command::AddPrimaryKey(_)
+            | Command::AddUniqueConstraint(_)
             | Command::CreateIndex(_)
             | Command::DropIndex(_)
             | Command::AlterColumnDefault(_)
@@ -8461,6 +8529,7 @@ impl Engine {
             | Command::DeleteKv { .. }
             | Command::CreateTable(_)
             | Command::AddPrimaryKey(_)
+            | Command::AddUniqueConstraint(_)
             | Command::CreateIndex(_)
             | Command::DropIndex(_)
             | Command::AlterColumnDefault(_)
@@ -8553,6 +8622,7 @@ impl Engine {
             Command::DeleteKv { .. } => Err(ExecuteError::NonReadCommand("DEL/DELETE")),
             Command::CreateTable(_) => Err(ExecuteError::NonReadCommand("CREATE TABLE")),
             Command::AddPrimaryKey(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
+            Command::AddUniqueConstraint(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
             Command::CreateIndex(_) => Err(ExecuteError::NonReadCommand("CREATE INDEX")),
             Command::DropIndex(_) => Err(ExecuteError::NonReadCommand("DROP INDEX")),
             Command::AlterColumnDefault(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
@@ -30978,6 +31048,7 @@ mod tests {
                 column: "name".to_string(),
                 unique: false,
                 primary_key: false,
+                unique_constraint: false,
             }]
         );
 
@@ -30993,6 +31064,7 @@ mod tests {
                 column: "name".to_string(),
                 unique: false,
                 primary_key: false,
+                unique_constraint: false,
             }]
         );
 
@@ -31042,6 +31114,7 @@ mod tests {
                 column: "name".to_string(),
                 unique: true,
                 primary_key: false,
+                unique_constraint: false,
             }]
         );
 
@@ -31106,6 +31179,96 @@ mod tests {
     }
 
     #[test]
+    fn relational_unique_constraints_reject_duplicates_and_replay_from_wal() {
+        let mut e = Engine::new_local();
+        e.execute_text(
+            1,
+            "CREATE TABLE people (id INT, name TEXT UNIQUE, CONSTRAINT people_id_key UNIQUE (id))",
+        )
+        .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO people (id, name) VALUES (1, 'Ada'), (2, 'Grace')",
+        )
+        .unwrap();
+
+        let indexes = e
+            .relational_catalog_table("people")
+            .unwrap()
+            .indexes
+            .clone();
+        assert_eq!(
+            indexes,
+            vec![
+                RelationalIndex {
+                    name: "people_name_key".to_string(),
+                    table: "people".to_string(),
+                    column: "name".to_string(),
+                    unique: true,
+                    primary_key: false,
+                    unique_constraint: true,
+                },
+                RelationalIndex {
+                    name: "people_id_key".to_string(),
+                    table: "people".to_string(),
+                    column: "id".to_string(),
+                    unique: true,
+                    primary_key: false,
+                    unique_constraint: true,
+                },
+            ]
+        );
+
+        let duplicate_insert = e
+            .execute_text(3, "INSERT INTO people (id, name) VALUES (3, 'Ada')")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            duplicate_insert.contains("duplicate key value violates unique index"),
+            "{duplicate_insert}"
+        );
+        let duplicate_update = e
+            .execute_text(4, "UPDATE people SET id = 1 WHERE name = 'Grace'")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            duplicate_update.contains("duplicate key value violates unique index"),
+            "{duplicate_update}"
+        );
+
+        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        assert_eq!(
+            recovered
+                .relational_catalog_table("people")
+                .unwrap()
+                .indexes,
+            indexes
+        );
+
+        let mut alter = Engine::new_local();
+        alter
+            .execute_text(1, "CREATE TABLE teams (id INT, name TEXT)")
+            .unwrap();
+        alter
+            .execute_text(
+                2,
+                "INSERT INTO teams (id, name) VALUES (1, 'core'), (2, 'db')",
+            )
+            .unwrap();
+        alter
+            .execute_text(
+                3,
+                "ALTER TABLE ONLY public.teams ADD CONSTRAINT teams_name_key UNIQUE (name)",
+            )
+            .unwrap();
+        assert!(alter
+            .execute_text(4, "INSERT INTO teams (id, name) VALUES (3, 'core')")
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate key value violates unique index"));
+    }
+
+    #[test]
     fn relational_primary_key_rejects_duplicates_and_replays_from_wal() {
         let mut e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE people (id INT PRIMARY KEY, name TEXT)")
@@ -31129,6 +31292,7 @@ mod tests {
                 column: "id".to_string(),
                 unique: true,
                 primary_key: true,
+                unique_constraint: false,
             }]
         );
 
