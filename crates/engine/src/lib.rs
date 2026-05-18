@@ -7080,6 +7080,12 @@ pub struct DurableWalArchiveRetentionWindowPlan {
     pub retention_plan: WalArchiveRetentionPlan,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableWalArchiveMaintenancePlan {
+    pub retention_window_plan: DurableWalArchiveRetentionWindowPlan,
+    pub timeline_prune_plan: WalArchiveTimelinePrunePlan,
+}
+
 impl Engine {
     pub fn new_local() -> Self {
         Self::with_planner_config(PlannerConfig::default())
@@ -11881,6 +11887,64 @@ impl Engine {
         Ok(DurableWalArchiveRetentionWindowPlan {
             retention_plan,
             ..plan
+        })
+    }
+
+    pub fn plan_durable_wal_archive_maintenance_cleanup(
+        control_path: impl AsRef<std::path::Path>,
+        manifest_path: impl AsRef<std::path::Path>,
+        registry_path: impl AsRef<std::path::Path>,
+        retained_timeline_id: impl AsRef<str>,
+        current_timestamp_micros: u64,
+        pitr_window_micros: u64,
+    ) -> Result<DurableWalArchiveMaintenancePlan, EngineError> {
+        let retention_window_plan =
+            Self::plan_durable_wal_archive_retention_from_checkpoint_window(
+                control_path,
+                manifest_path,
+                current_timestamp_micros,
+                pitr_window_micros,
+            )?;
+        let timeline_prune_plan =
+            plan_wal_archive_timeline_prune(registry_path, retained_timeline_id)?;
+        Ok(DurableWalArchiveMaintenancePlan {
+            retention_window_plan,
+            timeline_prune_plan,
+        })
+    }
+
+    pub fn apply_durable_wal_archive_maintenance_cleanup(
+        control_path: impl AsRef<std::path::Path>,
+        manifest_path: impl AsRef<std::path::Path>,
+        registry_path: impl AsRef<std::path::Path>,
+        retained_timeline_id: impl AsRef<str>,
+        current_timestamp_micros: u64,
+        pitr_window_micros: u64,
+    ) -> Result<DurableWalArchiveMaintenancePlan, EngineError> {
+        let control_path = control_path.as_ref();
+        let manifest_path = manifest_path.as_ref();
+        let registry_path = registry_path.as_ref();
+        let retained_timeline_id = retained_timeline_id.as_ref();
+        Self::plan_durable_wal_archive_maintenance_cleanup(
+            control_path,
+            manifest_path,
+            registry_path,
+            retained_timeline_id,
+            current_timestamp_micros,
+            pitr_window_micros,
+        )?;
+        let retention_window_plan =
+            Self::apply_durable_wal_archive_retention_from_checkpoint_window(
+                control_path,
+                manifest_path,
+                current_timestamp_micros,
+                pitr_window_micros,
+            )?;
+        let timeline_prune_plan =
+            apply_wal_archive_timeline_prune(registry_path, retained_timeline_id)?;
+        Ok(DurableWalArchiveMaintenancePlan {
+            retention_window_plan,
+            timeline_prune_plan,
         })
     }
 
@@ -31444,6 +31508,269 @@ mod tests {
             .unwrap();
         assert_eq!(timestamp_grace.rows, vec![vec![SqlValue::Int4(2)]]);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn maintenance_cleanup_prunes_archive_and_timelines_before_registered_recovery() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpu-db-engine-maintenance-cleanup-{}-{}",
+            std::process::id(),
+            NEXT_TEST_WAL_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let control_path = dir.join("base").join("CONTROL");
+        let base_segment_path = dir.join("base").join("base.wal");
+        let manifest_path = dir.join("archive").join("MANIFEST");
+        let segment_dir = dir.join("archive").join("segments");
+        let source_timeline_path = dir.join("timeline-main").join("TIMELINE");
+        let keep_manifest = dir.join("timeline-keep").join("MANIFEST");
+        let keep_segments = dir.join("timeline-keep").join("segments");
+        let keep_timeline_path = dir.join("timeline-keep").join("TIMELINE");
+        let prune_manifest = dir.join("timeline-prune").join("MANIFEST");
+        let prune_segments = dir.join("timeline-prune").join("segments");
+        let prune_timeline_path = dir.join("timeline-prune").join("TIMELINE");
+        let registry_path = dir.join("TIMELINE_REGISTRY");
+        let mut e = Engine::new_local();
+        e.execute_text_at_timestamp_micros(1, "CREATE TABLE people (id INT, name TEXT)", 1_000)
+            .unwrap();
+        e.execute_text_at_timestamp_micros(
+            2,
+            "INSERT INTO people (id, name) VALUES (1, 'Ada')",
+            2_000,
+        )
+        .unwrap();
+        e.persist_durable_wal_checkpoint(&control_path, &base_segment_path)
+            .unwrap();
+        e.execute_text_at_timestamp_micros(
+            3,
+            "INSERT INTO people (id, name) VALUES (2, 'Grace')",
+            3_000,
+        )
+        .unwrap();
+        e.execute_text_at_timestamp_micros(
+            4,
+            "INSERT INTO people (id, name) VALUES (3, 'Katherine')",
+            4_000,
+        )
+        .unwrap();
+        e.execute_text_at_timestamp_micros(
+            5,
+            "INSERT INTO people (id, name) VALUES (4, 'Dorothy')",
+            5_000,
+        )
+        .unwrap();
+
+        e.persist_durable_wal_archive(&manifest_path, &segment_dir, 1)
+            .unwrap();
+        Engine::write_durable_wal_archive_timeline(
+            &source_timeline_path,
+            &WalArchiveTimeline {
+                timeline_id: "timeline-main-0001".to_string(),
+                parent_timeline_id: None,
+                fork_txn_id: 0,
+                fork_timestamp_micros: None,
+                source_manifest_path: manifest_path.clone(),
+                branch_manifest_path: manifest_path.clone(),
+            },
+        )
+        .unwrap();
+        Engine::fork_durable_wal_archive_timeline_to_timestamp_micros(
+            &manifest_path,
+            &keep_manifest,
+            &keep_segments,
+            &keep_timeline_path,
+            "timeline-keep-0002",
+            Some("timeline-main-0001"),
+            4_000,
+        )
+        .unwrap();
+        Engine::fork_durable_wal_archive_timeline_to_timestamp_micros(
+            &manifest_path,
+            &prune_manifest,
+            &prune_segments,
+            &prune_timeline_path,
+            "timeline-prune-0003",
+            Some("timeline-main-0001"),
+            3_000,
+        )
+        .unwrap();
+        Engine::register_durable_wal_archive_timeline(&registry_path, &source_timeline_path)
+            .unwrap();
+        Engine::register_durable_wal_archive_timeline(&registry_path, &keep_timeline_path).unwrap();
+        Engine::register_durable_wal_archive_timeline(&registry_path, &prune_timeline_path)
+            .unwrap();
+
+        let dry_run = Engine::plan_durable_wal_archive_maintenance_cleanup(
+            &control_path,
+            &manifest_path,
+            &registry_path,
+            "timeline-keep-0002",
+            6_000,
+            3_000,
+        )
+        .unwrap();
+        let applied = Engine::apply_durable_wal_archive_maintenance_cleanup(
+            &control_path,
+            &manifest_path,
+            &registry_path,
+            "timeline-keep-0002",
+            6_000,
+            3_000,
+        )
+        .unwrap();
+        let mut recovered = Engine::recover_from_registered_durable_wal_archive_timeline(
+            &registry_path,
+            "timeline-keep-0002",
+        )
+        .unwrap();
+        let pruned_err =
+            Engine::select_durable_wal_archive_timeline(&registry_path, "timeline-prune-0003")
+                .unwrap_err();
+
+        assert_eq!(dry_run, applied);
+        assert_eq!(applied.retention_window_plan.base_txn_id, 2);
+        assert_eq!(
+            applied
+                .retention_window_plan
+                .retention_plan
+                .removed_record_count,
+            1
+        );
+        assert_eq!(
+            applied.timeline_prune_plan.retained_timeline_ids,
+            vec![
+                "timeline-main-0001".to_string(),
+                "timeline-keep-0002".to_string()
+            ]
+        );
+        assert_eq!(
+            applied.timeline_prune_plan.removed_timeline_ids,
+            vec!["timeline-prune-0003".to_string()]
+        );
+        let (retained_archive, _retained_records) = read_wal_archive(&manifest_path).unwrap();
+        assert_eq!(retained_archive.segments[0].first_txn_id, Some(2));
+        assert!(!prune_timeline_path.exists());
+        assert!(!prune_manifest.exists());
+        assert!(keep_timeline_path.exists());
+        assert!(keep_manifest.exists());
+        assert!(pruned_err
+            .to_string()
+            .contains("has no timeline timeline-prune-0003"));
+
+        let Command::Select(katherine_select) =
+            parse_command("SELECT id FROM people WHERE name = 'Katherine'").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let katherine_result = recovered
+            .execute_relational_select(&katherine_select)
+            .unwrap();
+        let Command::Select(dorothy_select) =
+            parse_command("SELECT id FROM people WHERE name = 'Dorothy'").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let dorothy_result = recovered
+            .execute_relational_select(&dorothy_select)
+            .unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+
+        assert_eq!(katherine_result.rows, vec![vec![SqlValue::Int4(3)]]);
+        assert_eq!(dorothy_result.rows, Vec::<Vec<SqlValue>>::new());
+    }
+
+    #[test]
+    fn maintenance_cleanup_rejects_stale_timeline_before_archive_mutation() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpu-db-engine-maintenance-cleanup-stale-{}-{}",
+            std::process::id(),
+            NEXT_TEST_WAL_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let control_path = dir.join("base").join("CONTROL");
+        let base_segment_path = dir.join("base").join("base.wal");
+        let manifest_path = dir.join("archive").join("MANIFEST");
+        let segment_dir = dir.join("archive").join("segments");
+        let source_timeline_path = dir.join("timeline-main").join("TIMELINE");
+        let branch_manifest = dir.join("timeline-branch").join("MANIFEST");
+        let branch_segments = dir.join("timeline-branch").join("segments");
+        let branch_timeline_path = dir.join("timeline-branch").join("TIMELINE");
+        let registry_path = dir.join("TIMELINE_REGISTRY");
+        let mut e = Engine::new_local();
+        e.execute_text_at_timestamp_micros(1, "CREATE TABLE people (id INT, name TEXT)", 1_000)
+            .unwrap();
+        e.execute_text_at_timestamp_micros(
+            2,
+            "INSERT INTO people (id, name) VALUES (1, 'Ada')",
+            2_000,
+        )
+        .unwrap();
+        e.persist_durable_wal_checkpoint(&control_path, &base_segment_path)
+            .unwrap();
+        e.execute_text_at_timestamp_micros(
+            3,
+            "INSERT INTO people (id, name) VALUES (2, 'Grace')",
+            3_000,
+        )
+        .unwrap();
+
+        e.persist_durable_wal_archive(&manifest_path, &segment_dir, 1)
+            .unwrap();
+        Engine::write_durable_wal_archive_timeline(
+            &source_timeline_path,
+            &WalArchiveTimeline {
+                timeline_id: "timeline-main-0001".to_string(),
+                parent_timeline_id: None,
+                fork_txn_id: 0,
+                fork_timestamp_micros: None,
+                source_manifest_path: manifest_path.clone(),
+                branch_manifest_path: manifest_path.clone(),
+            },
+        )
+        .unwrap();
+        Engine::fork_durable_wal_archive_timeline_to_txn(
+            &manifest_path,
+            &branch_manifest,
+            &branch_segments,
+            &branch_timeline_path,
+            "timeline-branch-0002",
+            Some("timeline-main-0001"),
+            3,
+        )
+        .unwrap();
+        Engine::register_durable_wal_archive_timeline(&registry_path, &source_timeline_path)
+            .unwrap();
+        Engine::register_durable_wal_archive_timeline(&registry_path, &branch_timeline_path)
+            .unwrap();
+        let original_manifest = std::fs::read_to_string(&manifest_path).unwrap();
+        let original_registry = std::fs::read_to_string(&registry_path).unwrap();
+        Engine::write_durable_wal_archive_timeline(
+            &branch_timeline_path,
+            &WalArchiveTimeline {
+                timeline_id: "timeline-branch-0002".to_string(),
+                parent_timeline_id: Some("timeline-main-0001".to_string()),
+                fork_txn_id: 2,
+                fork_timestamp_micros: None,
+                source_manifest_path: manifest_path.clone(),
+                branch_manifest_path: branch_manifest.clone(),
+            },
+        )
+        .unwrap();
+
+        let err = Engine::apply_durable_wal_archive_maintenance_cleanup(
+            &control_path,
+            &manifest_path,
+            &registry_path,
+            "timeline-branch-0002",
+            6_000,
+            3_000,
+        )
+        .unwrap_err();
+        let after_manifest = std::fs::read_to_string(&manifest_path).unwrap();
+        let after_registry = std::fs::read_to_string(&registry_path).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+
+        assert!(err.to_string().contains("does not match sidecar"));
+        assert_eq!(after_manifest, original_manifest);
+        assert_eq!(after_registry, original_registry);
     }
 
     #[test]
