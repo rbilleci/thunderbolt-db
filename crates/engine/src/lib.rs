@@ -32,17 +32,18 @@ use gpu_db_types::{CommitToken, EngineError, Index, LogEntry, Role, SnapshotMeta
 use gpu_db_wal::{
     append_wal_archive_segment_with_timestamps, apply_wal_archive_retention_from_txn,
     apply_wal_archive_retention_to_timestamp_micros, apply_wal_archive_retention_to_txn,
-    export_wal_archive_object_backup, fork_wal_archive_timeline_to_timestamp_micros,
-    fork_wal_archive_timeline_to_txn, plan_wal_archive_retention_from_txn,
-    plan_wal_archive_retention_to_timestamp_micros, plan_wal_archive_retention_to_txn,
-    read_wal_archive, read_wal_archive_timeline, read_wal_archive_timeline_registry,
+    apply_wal_archive_timeline_prune, export_wal_archive_object_backup,
+    fork_wal_archive_timeline_to_timestamp_micros, fork_wal_archive_timeline_to_txn,
+    plan_wal_archive_retention_from_txn, plan_wal_archive_retention_to_timestamp_micros,
+    plan_wal_archive_retention_to_txn, plan_wal_archive_timeline_prune, read_wal_archive,
+    read_wal_archive_timeline, read_wal_archive_timeline_registry,
     read_wal_archive_to_timestamp_micros, read_wal_archive_to_txn, read_wal_checkpoint,
     read_wal_segment, register_wal_archive_timeline, restore_wal_archive_object_backup,
     select_wal_archive_timeline, write_wal_archive_timeline, write_wal_archive_with_timestamps,
     write_wal_control_file, write_wal_segment, WalArchiveManifest, WalArchiveObjectBackup,
     WalArchiveRecordTimestamp, WalArchiveRetentionPlan, WalArchiveTimeline,
-    WalArchiveTimelineBranch, WalArchiveTimelineRegistry, WalArchiveTimelineSelection, WalBuffer,
-    WalControlFile, WalRecord,
+    WalArchiveTimelineBranch, WalArchiveTimelinePrunePlan, WalArchiveTimelineRegistry,
+    WalArchiveTimelineSelection, WalBuffer, WalControlFile, WalRecord,
 };
 
 #[derive(Debug, Default)]
@@ -11710,6 +11711,20 @@ impl Engine {
         timeline_id: impl AsRef<str>,
     ) -> Result<WalArchiveTimelineSelection, EngineError> {
         select_wal_archive_timeline(registry_path, timeline_id)
+    }
+
+    pub fn plan_durable_wal_archive_timeline_prune(
+        registry_path: impl AsRef<std::path::Path>,
+        retained_timeline_id: impl AsRef<str>,
+    ) -> Result<WalArchiveTimelinePrunePlan, EngineError> {
+        plan_wal_archive_timeline_prune(registry_path, retained_timeline_id)
+    }
+
+    pub fn apply_durable_wal_archive_timeline_prune(
+        registry_path: impl AsRef<std::path::Path>,
+        retained_timeline_id: impl AsRef<str>,
+    ) -> Result<WalArchiveTimelinePrunePlan, EngineError> {
+        apply_wal_archive_timeline_prune(registry_path, retained_timeline_id)
     }
 
     pub fn recover_from_registered_durable_wal_archive_timeline(
@@ -30716,8 +30731,11 @@ mod tests {
         let source_segments = dir.join("source").join("segments");
         let branch_manifest = dir.join("branch").join("MANIFEST");
         let branch_segments = dir.join("branch").join("segments");
+        let pruned_branch_manifest = dir.join("pruned-branch").join("MANIFEST");
+        let pruned_branch_segments = dir.join("pruned-branch").join("segments");
         let source_timeline_path = dir.join("source").join("TIMELINE");
         let timeline_path = dir.join("branch").join("TIMELINE");
+        let pruned_timeline_path = dir.join("pruned-branch").join("TIMELINE");
         let registry_path = dir.join("TIMELINE_REGISTRY");
         let mut e = Engine::new_local();
         e.execute_text_at_timestamp_micros(1, "CREATE TABLE people (id INT, name TEXT)", 1_000)
@@ -30766,15 +30784,35 @@ mod tests {
         )
         .unwrap();
         let timeline = Engine::read_durable_wal_archive_timeline(&timeline_path).unwrap();
+        Engine::fork_durable_wal_archive_timeline_to_timestamp_micros(
+            &source_manifest,
+            &pruned_branch_manifest,
+            &pruned_branch_segments,
+            &pruned_timeline_path,
+            "timeline-pruned-0003",
+            Some("timeline-main-0001"),
+            2_000,
+        )
+        .unwrap();
         Engine::register_durable_wal_archive_timeline(&registry_path, &source_timeline_path)
             .unwrap();
         let registry =
             Engine::register_durable_wal_archive_timeline(&registry_path, &timeline_path).unwrap();
+        Engine::register_durable_wal_archive_timeline(&registry_path, &pruned_timeline_path)
+            .unwrap();
         let selection =
             Engine::select_durable_wal_archive_timeline(&registry_path, "timeline-branch-0002")
                 .unwrap();
+        let prune_plan = Engine::apply_durable_wal_archive_timeline_prune(
+            &registry_path,
+            "timeline-branch-0002",
+        )
+        .unwrap();
         let missing_selection_err =
             Engine::select_durable_wal_archive_timeline(&registry_path, "timeline-missing")
+                .unwrap_err();
+        let pruned_selection_err =
+            Engine::select_durable_wal_archive_timeline(&registry_path, "timeline-pruned-0003")
                 .unwrap_err();
         let mut recovered = Engine::recover_from_registered_durable_wal_archive_timeline(
             &registry_path,
@@ -30789,8 +30827,25 @@ mod tests {
         assert!(missing_selection_err
             .to_string()
             .contains("has no timeline timeline-missing"));
+        assert!(pruned_selection_err
+            .to_string()
+            .contains("has no timeline timeline-pruned-0003"));
         assert_eq!(registry.timelines.len(), 2);
         assert_eq!(registry.timelines[1].timeline_id, "timeline-branch-0002");
+        assert_eq!(
+            prune_plan.retained_timeline_ids,
+            vec![
+                "timeline-main-0001".to_string(),
+                "timeline-branch-0002".to_string()
+            ]
+        );
+        assert_eq!(
+            prune_plan.removed_timeline_ids,
+            vec!["timeline-pruned-0003".to_string()]
+        );
+        assert!(!pruned_timeline_path.exists());
+        assert!(!pruned_branch_manifest.exists());
+        assert!(!pruned_branch_segments.join("segment-0001.wal").exists());
         assert_eq!(
             registry.timelines[1].parent_timeline_id.as_deref(),
             Some("timeline-main-0001")
