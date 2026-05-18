@@ -69,7 +69,7 @@ def classify(test_id: str) -> list[str]:
     ):
         buckets.append("storage.indexing")
     if re.search(
-        r"relational_catalog|catalog_helpers|catalog_schema|catalog_introspection|shared_catalog|pg_catalog|pg_type|pg_namespace|information_schema|type_metadata|database_metadata|pg_dump|column_id|relation_oid",
+        r"relational_catalog|catalog_helpers|catalog_schema|catalog_introspection|shared_catalog|pg_catalog|pg_type|pg_namespace|information_schema|type_metadata|database_metadata|pg_dump|column_id|relation_oid|create_index|catalog_index",
         test_id,
     ):
         buckets.append("sql.catalog_schema_types")

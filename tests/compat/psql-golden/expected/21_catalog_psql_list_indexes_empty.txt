@@ -1,4 +1,14 @@
-=== psql di index meta-command empty subset ===
+=== psql di index meta-command supported subset ===
 CREATE TABLE
-psql:21_catalog_psql_list_indexes_empty.sql:3: error: Did not find any relations.
-psql:21_catalog_psql_list_indexes_empty.sql:4: error: Did not find any relation named "public.*".
+CREATE INDEX
+                           List of relations
+ Schema |           Name           | Type  |  Owner   |      Table
+--------+--------------------------+-------+----------+-----------------
+ public | di_empty_people_name_idx | index | postgres | di_empty_people
+(1 row)
+
+                           List of relations
+ Schema |           Name           | Type  |  Owner   |      Table
+--------+--------------------------+-------+----------+-----------------
+ public | di_empty_people_name_idx | index | postgres | di_empty_people
+(1 row)

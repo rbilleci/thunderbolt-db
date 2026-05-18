@@ -19,8 +19,8 @@ use gpu_db_observability::{
 };
 use gpu_db_planner::{ExecutionPlan, Planner, PlannerConfig};
 use gpu_db_protocol::{
-    parse_command, ColumnDef, Command, CreateTable, Delete, Insert, ParseError, Select,
-    SelectFilterOp, SelectProjection, SqlType, SqlValue, Update,
+    parse_command, ColumnDef, Command, CreateIndex, CreateTable, Delete, Insert, ParseError,
+    Select, SelectFilterOp, SelectProjection, SqlType, SqlValue, Update,
 };
 use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine};
 use gpu_db_storage::{
@@ -71,6 +71,7 @@ impl ReplicatedStateMachine for KvStateMachine {
                     | Command::ResetAll
                     | Command::GetKv { .. }
                     | Command::CreateTable(_)
+                    | Command::CreateIndex(_)
                     | Command::Insert(_)
                     | Command::Delete(_)
                     | Command::Update(_)
@@ -5943,6 +5944,7 @@ pub struct RelationalTable {
     pub name: String,
     pub oid: u32,
     pub columns: Vec<RelationalColumn>,
+    pub indexes: Vec<RelationalIndex>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5954,6 +5956,13 @@ pub struct RelationalColumn {
     pub ty: SqlType,
     pub type_oid: u32,
     pub type_size: i16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationalIndex {
+    pub name: String,
+    pub table: String,
+    pub column: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7448,6 +7457,7 @@ impl Engine {
                 }
             }
             Command::CreateTable(create) => self.apply_create_table(create)?,
+            Command::CreateIndex(create) => self.apply_create_index(create)?,
             Command::Insert(insert) => self.apply_insert(insert, txn_id)?,
             Command::Delete(delete) => self.apply_delete(delete, txn_id)?,
             Command::Update(update) => self.apply_update(update, txn_id)?,
@@ -7497,10 +7507,46 @@ impl Engine {
                 name,
                 oid,
                 columns,
+                indexes: Vec::new(),
             },
         );
         self.relational_next_oid = next_oid;
         self.relational_next_column_id = next_column_id;
+        Ok(())
+    }
+
+    fn apply_create_index(&mut self, create: CreateIndex) -> Result<(), EngineError> {
+        if self
+            .relational_catalog
+            .values()
+            .any(|table| table.indexes.iter().any(|index| index.name == create.name))
+        {
+            return Err(EngineError::ApplyFailed(format!(
+                "relation \"{}\" already exists",
+                create.name
+            )));
+        }
+        let table = self
+            .relational_catalog
+            .get_mut(&create.table)
+            .ok_or_else(|| {
+                EngineError::ApplyFailed(format!("relation \"{}\" does not exist", create.table))
+            })?;
+        if !table
+            .columns
+            .iter()
+            .any(|column| column.name == create.column)
+        {
+            return Err(EngineError::ApplyFailed(format!(
+                "column \"{}\" does not exist",
+                create.column
+            )));
+        }
+        table.indexes.push(RelationalIndex {
+            name: create.name,
+            table: create.table,
+            column: create.column,
+        });
         Ok(())
     }
 
@@ -7701,6 +7747,7 @@ impl Engine {
             Command::SetKv { .. }
             | Command::DeleteKv { .. }
             | Command::CreateTable(_)
+            | Command::CreateIndex(_)
             | Command::Insert(_)
             | Command::Delete(_)
             | Command::Update(_) => {
@@ -7881,6 +7928,7 @@ impl Engine {
             Command::SetKv { .. }
             | Command::DeleteKv { .. }
             | Command::CreateTable(_)
+            | Command::CreateIndex(_)
             | Command::Insert(_)
             | Command::Delete(_)
             | Command::Update(_) => match self.route_command(&cmd) {
@@ -7957,6 +8005,7 @@ impl Engine {
             Command::SetKv { .. } => Err(ExecuteError::NonReadCommand("SET")),
             Command::DeleteKv { .. } => Err(ExecuteError::NonReadCommand("DEL/DELETE")),
             Command::CreateTable(_) => Err(ExecuteError::NonReadCommand("CREATE TABLE")),
+            Command::CreateIndex(_) => Err(ExecuteError::NonReadCommand("CREATE INDEX")),
             Command::Insert(_) => Err(ExecuteError::NonReadCommand("INSERT")),
             Command::Delete(_) => Err(ExecuteError::NonReadCommand("DELETE")),
             Command::Update(_) => Err(ExecuteError::NonReadCommand("UPDATE")),
@@ -30252,6 +30301,56 @@ mod tests {
             e.relational_catalog_table("teams").unwrap().oid,
             FIRST_USER_RELATION_OID + 1
         );
+    }
+
+    #[test]
+    fn relational_catalog_records_create_index_and_replays_from_wal() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(2, "CREATE INDEX people_name_idx ON people (name)")
+            .unwrap();
+        let table = e.relational_catalog_table("people").unwrap();
+        assert_eq!(
+            table.indexes,
+            vec![RelationalIndex {
+                name: "people_name_idx".to_string(),
+                table: "people".to_string(),
+                column: "name".to_string(),
+            }]
+        );
+
+        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        assert_eq!(
+            recovered
+                .relational_catalog_table("people")
+                .unwrap()
+                .indexes,
+            vec![RelationalIndex {
+                name: "people_name_idx".to_string(),
+                table: "people".to_string(),
+                column: "name".to_string(),
+            }]
+        );
+
+        let duplicate_err = e
+            .execute_text(3, "CREATE INDEX people_name_idx ON people (id)")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            duplicate_err.contains("relation \"people_name_idx\" already exists"),
+            "{duplicate_err}"
+        );
+
+        let mut missing = Engine::new_local();
+        missing
+            .execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        assert!(missing
+            .execute_text(2, "CREATE INDEX people_missing_idx ON people (missing)")
+            .unwrap_err()
+            .to_string()
+            .contains("column \"missing\" does not exist"));
     }
 
     #[test]

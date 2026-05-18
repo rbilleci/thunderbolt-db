@@ -1,5 +1,7 @@
-=== pg_catalog pg_indexes empty supported subset ===
+=== pg_catalog pg_indexes supported subset ===
 CREATE TABLE
- schemaname | tablename | indexname | indexdef
-------------+-----------+-----------+----------
-(0 rows)
+CREATE INDEX
+ schemaname |     tablename     |         indexname          |                                        indexdef
+------------+-------------------+----------------------------+----------------------------------------------------------------------------------------
+ public     | pg_indexes_people | pg_indexes_people_name_idx | CREATE INDEX pg_indexes_people_name_idx ON public.pg_indexes_people USING btree (name)
+(1 row)

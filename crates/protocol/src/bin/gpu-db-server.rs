@@ -1185,7 +1185,9 @@ struct Session {
     portals: HashMap<String, Portal>,
     cursors: HashMap<String, Cursor>,
     tables: HashMap<String, Table>,
+    indexes: Vec<CatalogIndex>,
     dirty_tables: BTreeSet<String>,
+    dirty_indexes: bool,
     copy_in: Option<CopyInState>,
     next_relation_oid: u32,
     shared_catalog: bool,
@@ -1194,6 +1196,7 @@ struct Session {
 #[derive(Clone, Debug)]
 struct SharedCatalog {
     tables: HashMap<String, Table>,
+    indexes: Vec<CatalogIndex>,
     next_relation_oid: u32,
 }
 
@@ -1201,6 +1204,7 @@ impl Default for SharedCatalog {
     fn default() -> Self {
         Self {
             tables: HashMap::new(),
+            indexes: Vec::new(),
             next_relation_oid: FIRST_USER_RELATION_OID,
         }
     }
@@ -1232,7 +1236,9 @@ impl Session {
             portals: HashMap::new(),
             cursors: HashMap::new(),
             tables: catalog.tables,
+            indexes: catalog.indexes,
             dirty_tables: BTreeSet::new(),
+            dirty_indexes: false,
             copy_in: None,
             next_relation_oid: catalog.next_relation_oid,
             shared_catalog: shared_catalog_enabled,
@@ -1259,6 +1265,10 @@ impl Session {
             }
         }
         catalog.next_relation_oid = catalog.next_relation_oid.max(self.next_relation_oid);
+        if self.dirty_indexes {
+            catalog.indexes = self.indexes.clone();
+            self.dirty_indexes = false;
+        }
         self.dirty_tables.clear();
     }
 
@@ -1304,6 +1314,13 @@ struct Table {
 struct CatalogColumn {
     attnum: i16,
     def: gpu_db_protocol::ColumnDef,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CatalogIndex {
+    name: String,
+    table: String,
+    column: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -5030,6 +5047,9 @@ fn execute_statement(
                 },
             );
         }
+        let old_index_count = session.indexes.len();
+        session.indexes.retain(|index| index.table != drop.table);
+        session.dirty_indexes |= session.indexes.len() != old_index_count;
         session.mark_table_dirty(drop.table);
         session.persist_catalog_snapshot();
         return write_command_complete(stream, "DROP TABLE");
@@ -5301,6 +5321,55 @@ fn execute_statement(
                 session.mark_table_dirty(table_name);
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, "CREATE TABLE");
+            }
+            Command::CreateIndex(create) => {
+                if session
+                    .indexes
+                    .iter()
+                    .any(|index| index.name == create.name)
+                {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "42P07",
+                            message: "relation already exists",
+                            position: None,
+                        },
+                    );
+                }
+                let Some(table) = session.tables.get_mut(&create.table) else {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "42P01",
+                            message: "relation does not exist",
+                            position: None,
+                        },
+                    );
+                };
+                if !table
+                    .columns
+                    .iter()
+                    .any(|column| column.def.name == create.column)
+                {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "42703",
+                            message: "column does not exist",
+                            position: None,
+                        },
+                    );
+                }
+                session.indexes.push(CatalogIndex {
+                    name: create.name,
+                    table: create.table.clone(),
+                    column: create.column,
+                });
+                session.dirty_indexes = true;
+                session.mark_table_dirty(create.table);
+                session.persist_catalog_snapshot();
+                return write_command_complete(stream, "CREATE INDEX");
             }
             Command::Insert(insert) => {
                 let table_name = insert.table;
@@ -5669,7 +5738,7 @@ fn execute_statement(
                 text_column("Owner"),
                 text_column("Table"),
             ],
-            &catalog_empty_rows(),
+            &psql_describe_index_rows(session),
         );
     }
     if canonical == psql_describe_views_catalog_query() {
@@ -8461,8 +8530,55 @@ fn pg_catalog_indexes_query() -> &'static str {
     "select schemaname, tablename, indexname, indexdef from pg_catalog.pg_indexes where schemaname = 'public' order by tablename, indexname"
 }
 
-fn pg_catalog_index_rows(_session: &Session) -> Vec<Vec<Option<String>>> {
-    Vec::new()
+fn pg_catalog_index_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut rows = session
+        .indexes
+        .iter()
+        .filter(|index| session.tables.contains_key(&index.table))
+        .map(|index| {
+            (
+                index.table.clone(),
+                index.name.clone(),
+                format!(
+                    "CREATE INDEX {} ON public.{} USING btree ({})",
+                    index.name, index.table, index.column
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    rows.into_iter()
+        .map(|(table, index, definition)| {
+            vec![
+                Some("public".to_string()),
+                Some(table),
+                Some(index),
+                Some(definition),
+            ]
+        })
+        .collect()
+}
+
+fn psql_describe_index_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut rows = session
+        .indexes
+        .iter()
+        .filter(|index| session.tables.contains_key(&index.table))
+        .map(|index| {
+            (
+                index.name.clone(),
+                vec![
+                    Some("public".to_string()),
+                    Some(index.name.clone()),
+                    Some("index".to_string()),
+                    Some("postgres".to_string()),
+                    Some(index.table.clone()),
+                ],
+            )
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+    rows.into_iter().map(|(_, row)| row).collect()
 }
 
 fn pg_catalog_class_plain_tables_query() -> &'static str {
@@ -10686,6 +10802,81 @@ mod tests {
             }],
             rows,
         }
+    }
+
+    #[test]
+    fn catalog_index_rows_reflect_created_indexes() {
+        let mut session = Session::default();
+        session
+            .tables
+            .insert("people".to_string(), test_table("people", Vec::new()));
+        session.indexes.push(CatalogIndex {
+            name: "people_name_idx".to_string(),
+            table: "people".to_string(),
+            column: "id".to_string(),
+        });
+
+        assert_eq!(
+            pg_catalog_index_rows(&session),
+            vec![vec![
+                Some("public".to_string()),
+                Some("people".to_string()),
+                Some("people_name_idx".to_string()),
+                Some("CREATE INDEX people_name_idx ON public.people USING btree (id)".to_string()),
+            ]]
+        );
+        assert_eq!(
+            psql_describe_index_rows(&session),
+            vec![vec![
+                Some("public".to_string()),
+                Some("people_name_idx".to_string()),
+                Some("index".to_string()),
+                Some("postgres".to_string()),
+                Some("people".to_string()),
+            ]]
+        );
+    }
+
+    #[test]
+    fn shared_catalog_persistence_carries_index_metadata() {
+        let table_name = "shared_index_people";
+        let index_name = "shared_index_people_id_idx";
+        {
+            let mut catalog = shared_catalog()
+                .lock()
+                .expect("shared catalog mutex poisoned");
+            catalog.tables.remove(table_name);
+            catalog.indexes.retain(|index| index.name != index_name);
+        }
+
+        let mut session = Session::new(true);
+        session
+            .tables
+            .insert(table_name.to_string(), test_table(table_name, Vec::new()));
+        session.indexes.push(CatalogIndex {
+            name: index_name.to_string(),
+            table: table_name.to_string(),
+            column: "id".to_string(),
+        });
+        session.mark_table_dirty(table_name);
+        session.dirty_indexes = true;
+        session.persist_catalog_snapshot();
+
+        let reloaded = Session::new(true);
+        assert!(pg_catalog_index_rows(&reloaded).contains(&vec![
+            Some("public".to_string()),
+            Some(table_name.to_string()),
+            Some(index_name.to_string()),
+            Some(format!(
+                "CREATE INDEX {index_name} ON public.{table_name} USING btree (id)"
+            )),
+        ]));
+
+        let mut catalog = shared_catalog()
+            .lock()
+            .expect("shared catalog mutex poisoned");
+        catalog.tables.remove(table_name);
+        catalog.indexes.retain(|index| index.name != index_name);
     }
 
     #[test]

@@ -10,6 +10,7 @@ pub enum Command {
     DeleteKv { key: String },
     GetKv { key: String },
     CreateTable(CreateTable),
+    CreateIndex(CreateIndex),
     Insert(Insert),
     Delete(Delete),
     Update(Update),
@@ -20,6 +21,13 @@ pub enum Command {
 pub struct CreateTable {
     pub table: String,
     pub columns: Vec<ColumnDef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateIndex {
+    pub name: String,
+    pub table: String,
+    pub column: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -198,7 +206,7 @@ pub enum ParseError {
     InvalidDel,
     #[error("invalid GET syntax; expected: GET key")]
     InvalidGet,
-    #[error("invalid relational SQL syntax; supported subset: CREATE TABLE name (...), INSERT INTO name (...) VALUES (...), UPDATE name SET column = literal [, ...] WHERE column (=|<|<=|>|>=) literal | column BETWEEN literal AND literal | column IN (literal, ...) | text_column LIKE 'prefix%' [AND ...] [OR ...], DELETE FROM name WHERE column (=|<|<=|>|>=) literal | column BETWEEN literal AND literal | column IN (literal, ...) | text_column LIKE 'prefix%' [AND ...] [OR ...], SELECT [DISTINCT] columns|COUNT(*)|SUM(int4_column)|AVG(int4_column)|MIN(column)|MAX(column)|column, COUNT(*)|column, SUM(int4_column)|column, AVG(int4_column)|column, MIN(column)|column, MAX(column) FROM name [WHERE column (=|<|<=|>|>=) literal | column BETWEEN literal AND literal | column IN (literal, ...) | text_column LIKE 'prefix%' [AND ...] [OR ...]] [GROUP BY column] [HAVING grouped_column|count|sum|avg|min|max (=|<|<=|>|>=) literal [AND ...] [OR ...]] [ORDER BY selected_column|count|sum|avg|min|max [ASC|DESC]] [LIMIT n] [OFFSET n]")]
+    #[error("invalid relational SQL syntax; supported subset: CREATE TABLE name (...), CREATE INDEX name ON table (column), INSERT INTO name (...) VALUES (...), UPDATE name SET column = literal [, ...] WHERE column (=|<|<=|>|>=) literal | column BETWEEN literal AND literal | column IN (literal, ...) | text_column LIKE 'prefix%' [AND ...] [OR ...], DELETE FROM name WHERE column (=|<|<=|>|>=) literal | column BETWEEN literal AND literal | column IN (literal, ...) | text_column LIKE 'prefix%' [AND ...] [OR ...], SELECT [DISTINCT] columns|COUNT(*)|SUM(int4_column)|AVG(int4_column)|MIN(column)|MAX(column)|column, COUNT(*)|column, SUM(int4_column)|column, AVG(int4_column)|column, MIN(column)|column, MAX(column) FROM name [WHERE column (=|<|<=|>|>=) literal | column BETWEEN literal AND literal | column IN (literal, ...) | text_column LIKE 'prefix%' [AND ...] [OR ...]] [GROUP BY column] [HAVING grouped_column|count|sum|avg|min|max (=|<|<=|>|>=) literal [AND ...] [OR ...]] [ORDER BY selected_column|count|sum|avg|min|max [ASC|DESC]] [LIMIT n] [OFFSET n]")]
     InvalidRelationalSql,
     #[error("LIMIT must not be negative")]
     NegativeLimit,
@@ -1530,7 +1538,14 @@ fn strip_set_scope_prefix<'a>(input: &'a str, scope: &str) -> Option<&'a str> {
 fn parse_relational_command(input: &str) -> Option<Result<Command, ParseError>> {
     let first = input.split_whitespace().next()?;
     if first.eq_ignore_ascii_case("CREATE") {
-        return Some(parse_create_table(input).map(Command::CreateTable));
+        let second = input.split_whitespace().nth(1)?;
+        if second.eq_ignore_ascii_case("TABLE") {
+            return Some(parse_create_table(input).map(Command::CreateTable));
+        }
+        if second.eq_ignore_ascii_case("INDEX") {
+            return Some(parse_create_index(input).map(Command::CreateIndex));
+        }
+        return Some(Err(ParseError::InvalidRelationalSql));
     }
     if first.eq_ignore_ascii_case("INSERT") {
         return Some(parse_insert(input).map(Command::Insert));
@@ -1587,6 +1602,32 @@ fn parse_create_table(input: &str) -> Result<CreateTable, ParseError> {
         return Err(ParseError::InvalidRelationalSql);
     }
     Ok(CreateTable { table, columns })
+}
+
+fn parse_create_index(input: &str) -> Result<CreateIndex, ParseError> {
+    let rest = strip_keyword_prefix_case_insensitive(input, "CREATE")
+        .and_then(|s| strip_keyword_prefix_case_insensitive(s.trim_start(), "INDEX"))
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    let on_pos = find_keyword_outside_quotes(rest, "ON").ok_or(ParseError::InvalidRelationalSql)?;
+    let name = normalize_relation_identifier(rest[..on_pos].trim())?;
+    let target = rest[on_pos + "ON".len()..].trim_start();
+    let open = target.find('(').ok_or(ParseError::InvalidRelationalSql)?;
+    let close = find_matching_paren(target, open).ok_or(ParseError::InvalidRelationalSql)?;
+    if close <= open || !target[close + 1..].trim().is_empty() {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let table = normalize_relation_identifier(target[..open].trim())?;
+    let columns = split_csv(&target[open + 1..close])?;
+    let [column] = columns.as_slice() else {
+        return Err(ParseError::InvalidRelationalSql);
+    };
+    let column = normalize_identifier(column.trim())?;
+    Ok(CreateIndex {
+        name,
+        table,
+        column,
+    })
 }
 
 fn parse_supported_sql_type_name(input: &str) -> Option<SqlType> {
@@ -8706,6 +8747,23 @@ mod tests {
         );
         assert!(matches!(
             parse_command("CREATE TABLE private.dump_people (id integer)"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+
+        assert_eq!(
+            parse_command("CREATE INDEX people_name_idx ON public.people (name)").unwrap(),
+            Command::CreateIndex(CreateIndex {
+                name: "people_name_idx".to_string(),
+                table: "people".to_string(),
+                column: "name".to_string(),
+            })
+        );
+        assert!(matches!(
+            parse_command("CREATE UNIQUE INDEX people_name_idx ON people (name)"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command("CREATE INDEX people_multi_idx ON people (id, name)"),
             Err(ParseError::InvalidRelationalSql)
         ));
 

@@ -59,6 +59,7 @@ impl Planner {
                 kind: PlanKind::Mutation,
             },
             Command::CreateTable(_)
+            | Command::CreateIndex(_)
             | Command::Insert(_)
             | Command::Delete(_)
             | Command::Update(_) => PlanNode {
