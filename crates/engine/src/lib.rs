@@ -20,8 +20,8 @@ use gpu_db_observability::{
 use gpu_db_planner::{ExecutionPlan, Planner, PlannerConfig};
 use gpu_db_protocol::{
     parse_command, AddUniqueConstraint, ColumnDef, Command, CommentTarget, CreateIndex,
-    CreateTable, Delete, DropIndex, Insert, ParseError, Select, SelectFilterOp, SelectProjection,
-    SqlType, SqlValue, Update,
+    CreateTable, CreateView, Delete, DropIndex, Insert, ParseError, Select, SelectFilterOp,
+    SelectProjection, SqlType, SqlValue, Update,
 };
 use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine};
 use gpu_db_storage::{
@@ -75,6 +75,7 @@ impl ReplicatedStateMachine for KvStateMachine {
                     | Command::AddPrimaryKey(_)
                     | Command::AddUniqueConstraint(_)
                     | Command::CreateIndex(_)
+                    | Command::CreateView(_)
                     | Command::DropIndex(_)
                     | Command::AlterColumnDefault(_)
                     | Command::CommentOn(_)
@@ -5926,6 +5927,7 @@ pub struct Engine {
     sm: KvStateMachine,
     mvcc_store: InMemoryTupleStore,
     relational_catalog: BTreeMap<String, RelationalTable>,
+    relational_views: BTreeMap<String, RelationalView>,
     relational_comments: BTreeMap<RelationalCommentTarget, String>,
     relational_value_index: BTreeMap<RelationalIndexKey, Vec<String>>,
     relational_residency: BTreeMap<String, RelationalResidencySnapshot>,
@@ -5974,6 +5976,15 @@ pub struct RelationalIndex {
     pub unique: bool,
     pub primary_key: bool,
     pub unique_constraint: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationalView {
+    pub schema: String,
+    pub name: String,
+    pub oid: u32,
+    pub query: Select,
+    pub definition: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -6899,6 +6910,17 @@ fn select_has_relational_filters(select: &Select) -> bool {
     select.filter.is_some() || !select.filters.is_empty() || !select.filter_groups.is_empty()
 }
 
+fn select_is_plain_view_scan(select: &Select) -> bool {
+    !select.distinct
+        && matches!(select.projection, SelectProjection::All)
+        && select.group_by.is_none()
+        && select.having_groups.is_empty()
+        && !select_has_relational_filters(select)
+        && select.order_by.is_none()
+        && select.limit.is_none()
+        && select.offset.is_none()
+}
+
 fn select_is_aggregate(select: &Select) -> bool {
     matches!(
         select.projection,
@@ -7242,6 +7264,7 @@ impl Engine {
             sm: KvStateMachine::default(),
             mvcc_store: InMemoryTupleStore::new(),
             relational_catalog: BTreeMap::new(),
+            relational_views: BTreeMap::new(),
             relational_comments: BTreeMap::new(),
             relational_value_index: BTreeMap::new(),
             relational_residency: BTreeMap::new(),
@@ -7483,6 +7506,7 @@ impl Engine {
             Command::AddPrimaryKey(add) => self.apply_add_primary_key(add)?,
             Command::AddUniqueConstraint(add) => self.apply_add_unique_constraint(add)?,
             Command::CreateIndex(create) => self.apply_create_index(create)?,
+            Command::CreateView(create) => self.apply_create_view(create)?,
             Command::DropIndex(drop) => self.apply_drop_index(drop)?,
             Command::AlterColumnDefault(alter) => self.apply_alter_column_default(alter)?,
             Command::CommentOn(comment) => self.apply_comment_on(comment)?,
@@ -7495,8 +7519,47 @@ impl Engine {
         Ok(())
     }
 
+    fn apply_create_view(&mut self, create: CreateView) -> Result<(), EngineError> {
+        if self.relational_catalog.contains_key(&create.name)
+            || self.relational_views.contains_key(&create.name)
+        {
+            return Err(EngineError::ApplyFailed(format!(
+                "relation \"{}\" already exists",
+                create.name
+            )));
+        }
+        if self.relational_views.contains_key(&create.query.table) {
+            return Err(EngineError::ApplyFailed(
+                "views over views are unsupported".to_string(),
+            ));
+        }
+        if !self.relational_catalog.contains_key(&create.query.table) {
+            return Err(EngineError::ApplyFailed(format!(
+                "relation \"{}\" does not exist",
+                create.query.table
+            )));
+        }
+        let oid = self.relational_next_oid;
+        self.relational_next_oid = self.relational_next_oid.checked_add(1).ok_or_else(|| {
+            EngineError::ApplyFailed("relational view OID allocation exhausted".to_string())
+        })?;
+        self.relational_views.insert(
+            create.name.clone(),
+            RelationalView {
+                schema: PUBLIC_SCHEMA_NAME.to_string(),
+                name: create.name,
+                oid,
+                query: create.query,
+                definition: create.definition,
+            },
+        );
+        Ok(())
+    }
+
     fn apply_create_table(&mut self, create: CreateTable) -> Result<(), EngineError> {
-        if self.relational_catalog.contains_key(&create.table) {
+        if self.relational_catalog.contains_key(&create.table)
+            || self.relational_views.contains_key(&create.table)
+        {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" already exists",
                 create.table
@@ -8339,6 +8402,7 @@ impl Engine {
             | Command::AddPrimaryKey(_)
             | Command::AddUniqueConstraint(_)
             | Command::CreateIndex(_)
+            | Command::CreateView(_)
             | Command::DropIndex(_)
             | Command::AlterColumnDefault(_)
             | Command::CommentOn(_)
@@ -8531,6 +8595,7 @@ impl Engine {
             | Command::AddPrimaryKey(_)
             | Command::AddUniqueConstraint(_)
             | Command::CreateIndex(_)
+            | Command::CreateView(_)
             | Command::DropIndex(_)
             | Command::AlterColumnDefault(_)
             | Command::CommentOn(_)
@@ -8624,6 +8689,7 @@ impl Engine {
             Command::AddPrimaryKey(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
             Command::AddUniqueConstraint(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
             Command::CreateIndex(_) => Err(ExecuteError::NonReadCommand("CREATE INDEX")),
+            Command::CreateView(_) => Err(ExecuteError::NonReadCommand("CREATE VIEW")),
             Command::DropIndex(_) => Err(ExecuteError::NonReadCommand("DROP INDEX")),
             Command::AlterColumnDefault(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
             Command::CommentOn(_) => Err(ExecuteError::NonReadCommand("COMMENT")),
@@ -8638,6 +8704,14 @@ impl Engine {
         &mut self,
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
+        if let Some(view) = self.relational_views.get(&select.table).cloned() {
+            if !select_is_plain_view_scan(select) {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "only plain SELECT * FROM view is supported for views".to_string(),
+                )));
+            }
+            return self.execute_relational_select(&view.query);
+        }
         let (table, bound) = self.bind_relational_select_for_execution(select)?;
         let (query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
         let result = self.execute_mvcc_query(&query)?;
@@ -11686,6 +11760,10 @@ impl Engine {
 
     pub fn relational_catalog_table(&self, table: &str) -> Option<&RelationalTable> {
         self.relational_catalog.get(table)
+    }
+
+    pub fn relational_catalog_view(&self, view: &str) -> Option<&RelationalView> {
+        self.relational_views.get(view)
     }
 
     pub fn relational_table_comment(&self, table: &str) -> Option<&str> {
@@ -29784,6 +29862,62 @@ mod tests {
                 matched_keys: 3,
             }
         );
+    }
+
+    #[test]
+    fn relational_sql_views_select_and_replay_from_wal() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO people (id, name) VALUES (1, 'Ada'), (2, 'Linus'), (3, 'Grace')",
+        )
+        .unwrap();
+        e.execute_text(
+            3,
+            "CREATE VIEW public.active_people AS SELECT id, name FROM people WHERE id > 1 ORDER BY id",
+        )
+        .unwrap();
+
+        let view = e.relational_catalog_view("active_people").unwrap();
+        assert_eq!(view.name, "active_people");
+        assert_eq!(
+            view.definition,
+            "SELECT id, name FROM people WHERE id > 1 ORDER BY id"
+        );
+
+        let Command::Select(select) = parse_command("SELECT * FROM active_people").unwrap() else {
+            panic!("expected SELECT plan");
+        };
+        let result = e.execute_relational_select(&select).unwrap();
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![SqlValue::Int4(2), SqlValue::Text("Linus".to_string())],
+                vec![SqlValue::Int4(3), SqlValue::Text("Grace".to_string())],
+            ]
+        );
+
+        let mut recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        assert_eq!(
+            recovered
+                .relational_catalog_view("active_people")
+                .unwrap()
+                .definition,
+            "SELECT id, name FROM people WHERE id > 1 ORDER BY id"
+        );
+        let recovered_result = recovered.execute_relational_select(&select).unwrap();
+        assert_eq!(recovered_result.rows, result.rows);
+
+        let Command::Select(filtered_view_select) =
+            parse_command("SELECT id FROM active_people WHERE id = 2").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        assert!(recovered
+            .execute_relational_select(&filtered_view_select)
+            .is_err());
     }
 
     #[test]

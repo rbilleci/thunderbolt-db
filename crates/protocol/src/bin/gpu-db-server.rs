@@ -315,6 +315,16 @@ fn execute_select_result(
     select: &gpu_db_protocol::Select,
 ) -> Result<SelectResult, ErrorField> {
     let Some(table) = session.tables.get(&select.table) else {
+        if let Some(view) = session.views.get(&select.table) {
+            if !select_is_plain_view_scan(select) {
+                return Err(ErrorField {
+                    code: "0A000",
+                    message: "only plain SELECT * FROM view is supported for views",
+                    position: None,
+                });
+            }
+            return execute_select_result(session, &view.query);
+        }
         return Err(ErrorField {
             code: "42P01",
             message: "relation does not exist",
@@ -519,6 +529,19 @@ fn execute_select_result(
         })
         .collect::<Vec<_>>();
     Ok(SelectResult { columns, rows })
+}
+
+fn select_is_plain_view_scan(select: &gpu_db_protocol::Select) -> bool {
+    !select.distinct
+        && matches!(select.projection, SelectProjection::All)
+        && select.group_by.is_none()
+        && select.having_groups.is_empty()
+        && select.filter.is_none()
+        && select.filters.is_empty()
+        && select.filter_groups.is_empty()
+        && select.order_by.is_none()
+        && select.limit.is_none()
+        && select.offset.is_none()
 }
 
 fn execute_aggregate_select_result(
@@ -1399,9 +1422,11 @@ struct Session {
     portals: HashMap<String, Portal>,
     cursors: HashMap<String, Cursor>,
     tables: HashMap<String, Table>,
+    views: HashMap<String, View>,
     indexes: Vec<CatalogIndex>,
     comments: BTreeMap<CatalogCommentTarget, String>,
     dirty_tables: BTreeSet<String>,
+    dirty_views: BTreeSet<String>,
     dirty_indexes: bool,
     dirty_comment_targets: BTreeSet<CatalogCommentTarget>,
     copy_in: Option<CopyInState>,
@@ -1412,6 +1437,7 @@ struct Session {
 #[derive(Clone, Debug)]
 struct SharedCatalog {
     tables: HashMap<String, Table>,
+    views: HashMap<String, View>,
     indexes: Vec<CatalogIndex>,
     comments: BTreeMap<CatalogCommentTarget, String>,
     next_relation_oid: u32,
@@ -1421,6 +1447,7 @@ impl Default for SharedCatalog {
     fn default() -> Self {
         Self {
             tables: HashMap::new(),
+            views: HashMap::new(),
             indexes: Vec::new(),
             comments: BTreeMap::new(),
             next_relation_oid: FIRST_USER_RELATION_OID,
@@ -1454,9 +1481,11 @@ impl Session {
             portals: HashMap::new(),
             cursors: HashMap::new(),
             tables: catalog.tables,
+            views: catalog.views,
             indexes: catalog.indexes,
             comments: catalog.comments,
             dirty_tables: BTreeSet::new(),
+            dirty_views: BTreeSet::new(),
             dirty_indexes: false,
             dirty_comment_targets: BTreeSet::new(),
             copy_in: None,
@@ -1469,6 +1498,10 @@ impl Session {
         self.dirty_tables.insert(table.into());
     }
 
+    fn mark_view_dirty(&mut self, view: impl Into<String>) {
+        self.dirty_views.insert(view.into());
+    }
+
     fn mark_comment_dirty(&mut self, target: CatalogCommentTarget) {
         self.dirty_comment_targets.insert(target);
     }
@@ -1476,6 +1509,7 @@ impl Session {
     fn persist_catalog_snapshot(&mut self) {
         if !self.shared_catalog {
             self.dirty_tables.clear();
+            self.dirty_views.clear();
             self.dirty_comment_targets.clear();
             return;
         }
@@ -1487,6 +1521,13 @@ impl Session {
                 catalog.tables.insert(table_name.clone(), table.clone());
             } else {
                 catalog.tables.remove(table_name);
+            }
+        }
+        for view_name in &self.dirty_views {
+            if let Some(view) = self.views.get(view_name) {
+                catalog.views.insert(view_name.clone(), view.clone());
+            } else {
+                catalog.views.remove(view_name);
             }
         }
         catalog.next_relation_oid = catalog.next_relation_oid.max(self.next_relation_oid);
@@ -1526,6 +1567,7 @@ impl Session {
         }
         self.dirty_comment_targets.clear();
         self.dirty_tables.clear();
+        self.dirty_views.clear();
     }
 
     fn close_extended_target(&mut self, target: DescribeTarget, name: &str) {
@@ -1564,6 +1606,14 @@ struct Table {
     name: String,
     columns: Vec<CatalogColumn>,
     rows: Vec<Vec<SqlValue>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct View {
+    oid: u32,
+    name: String,
+    query: gpu_db_protocol::Select,
+    definition: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -5846,6 +5896,60 @@ fn execute_statement(
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, "CREATE INDEX");
             }
+            Command::CreateView(create) => {
+                if session.tables.contains_key(&create.name)
+                    || session.views.contains_key(&create.name)
+                {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "42P07",
+                            message: "relation already exists",
+                            position: None,
+                        },
+                    );
+                }
+                if session.views.contains_key(&create.query.table) {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "0A000",
+                            message: "views over views are unsupported",
+                            position: None,
+                        },
+                    );
+                }
+                if let Err(error) = execute_select_result(session, &create.query) {
+                    return write_error(stream, &error);
+                }
+                let oid = session.next_relation_oid;
+                session.next_relation_oid = match session.next_relation_oid.checked_add(1) {
+                    Some(next) => next,
+                    None => {
+                        return write_error(
+                            stream,
+                            &ErrorField {
+                                code: "54000",
+                                message: "relation OID allocation exhausted",
+                                position: None,
+                            },
+                        );
+                    }
+                };
+                let name = create.name;
+                session.views.insert(
+                    name.clone(),
+                    View {
+                        oid,
+                        name: name.clone(),
+                        query: create.query,
+                        definition: create.definition,
+                    },
+                );
+                session.mark_view_dirty(name);
+                session.persist_catalog_snapshot();
+                return write_command_complete(stream, "CREATE VIEW");
+            }
             Command::DropIndex(drop) => {
                 let old_index_count = session.indexes.len();
                 session.indexes.retain(|index| index.name != drop.name);
@@ -6445,7 +6549,7 @@ fn execute_statement(
                 text_column("Type"),
                 text_column("Owner"),
             ],
-            &catalog_empty_rows(),
+            &psql_describe_view_rows(session),
         );
     }
     if canonical == psql_describe_views_verbose_catalog_query() {
@@ -6460,7 +6564,7 @@ fn execute_statement(
                 text_column("Size"),
                 text_column("Description"),
             ],
-            &catalog_empty_rows(),
+            &psql_describe_view_verbose_rows(session),
         );
     }
     if canonical == psql_describe_materialized_views_catalog_query() {
@@ -10174,8 +10278,26 @@ fn information_schema_views_query() -> &'static str {
 }
 
 fn information_schema_view_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    let _supported_plain_table_count = session.tables.len();
-    Vec::new()
+    let mut rows = session
+        .views
+        .values()
+        .map(|view| {
+            vec![
+                Some("postgres".to_string()),
+                Some("public".to_string()),
+                Some(view.name.clone()),
+                Some(view.definition.clone()),
+                Some("NONE".to_string()),
+                Some("NO".to_string()),
+                Some("NO".to_string()),
+                Some("NO".to_string()),
+                Some("NO".to_string()),
+                Some("NO".to_string()),
+            ]
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| left[2].cmp(&right[2]));
+    rows
 }
 
 fn pg_catalog_views_query() -> &'static str {
@@ -10183,8 +10305,57 @@ fn pg_catalog_views_query() -> &'static str {
 }
 
 fn pg_catalog_view_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    let _supported_plain_table_count = session.tables.len();
-    Vec::new()
+    let mut rows = session
+        .views
+        .values()
+        .map(|view| {
+            vec![
+                Some("public".to_string()),
+                Some(view.name.clone()),
+                Some("postgres".to_string()),
+                Some(view.definition.clone()),
+            ]
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| left[1].cmp(&right[1]));
+    rows
+}
+
+fn psql_describe_view_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut rows = session
+        .views
+        .values()
+        .map(|view| {
+            vec![
+                Some("public".to_string()),
+                Some(view.name.clone()),
+                Some("view".to_string()),
+                Some("postgres".to_string()),
+            ]
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| left[1].cmp(&right[1]));
+    rows
+}
+
+fn psql_describe_view_verbose_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut rows = session
+        .views
+        .values()
+        .map(|view| {
+            vec![
+                Some("public".to_string()),
+                Some(view.name.clone()),
+                Some("view".to_string()),
+                Some("postgres".to_string()),
+                Some("permanent".to_string()),
+                None,
+                None,
+            ]
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| left[1].cmp(&right[1]));
+    rows
 }
 
 fn pg_catalog_constraints_query() -> &'static str {

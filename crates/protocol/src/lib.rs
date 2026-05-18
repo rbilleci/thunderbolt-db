@@ -13,6 +13,7 @@ pub enum Command {
     AddPrimaryKey(AddPrimaryKey),
     AddUniqueConstraint(AddUniqueConstraint),
     CreateIndex(CreateIndex),
+    CreateView(CreateView),
     DropIndex(DropIndex),
     AlterColumnDefault(AlterColumnDefault),
     CommentOn(CommentOn),
@@ -62,6 +63,13 @@ pub struct CreateIndex {
     pub table: String,
     pub column: String,
     pub unique: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateView {
+    pub name: String,
+    pub query: Select,
+    pub definition: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1607,6 +1615,9 @@ fn parse_relational_command(input: &str) -> Option<Result<Command, ParseError>> 
         if second.eq_ignore_ascii_case("INDEX") || second.eq_ignore_ascii_case("UNIQUE") {
             return Some(parse_create_index(input).map(Command::CreateIndex));
         }
+        if second.eq_ignore_ascii_case("VIEW") {
+            return Some(parse_create_view(input).map(Command::CreateView));
+        }
         return Some(Err(ParseError::InvalidRelationalSql));
     }
     if first.eq_ignore_ascii_case("DROP") {
@@ -1994,6 +2005,41 @@ fn parse_create_table(input: &str) -> Result<CreateTable, ParseError> {
         columns,
         primary_key,
         unique_constraints,
+    })
+}
+
+fn parse_create_view(input: &str) -> Result<CreateView, ParseError> {
+    let rest = strip_keyword_prefix_case_insensitive(input, "CREATE")
+        .and_then(|s| strip_keyword_prefix_case_insensitive(s.trim_start(), "VIEW"))
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    if strip_keyword_prefix_case_insensitive(rest, "IF").is_some()
+        || strip_keyword_prefix_case_insensitive(rest, "OR").is_some()
+        || strip_keyword_prefix_case_insensitive(rest, "TEMP").is_some()
+        || strip_keyword_prefix_case_insensitive(rest, "TEMPORARY").is_some()
+        || strip_keyword_prefix_case_insensitive(rest, "MATERIALIZED").is_some()
+    {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let as_pos = find_keyword_outside_quotes(rest, "AS").ok_or(ParseError::InvalidRelationalSql)?;
+    let name = normalize_relation_identifier(rest[..as_pos].trim())?;
+    let definition = rest[as_pos + "AS".len()..].trim();
+    if definition.is_empty() {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    if find_keyword_outside_quotes(definition, "WITH").is_some()
+        && definition.to_ascii_uppercase().contains("CHECK OPTION")
+    {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let query = parse_select(definition)?;
+    if query.table == name {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    Ok(CreateView {
+        name,
+        query,
+        definition: definition.to_string(),
     })
 }
 
@@ -9396,6 +9442,49 @@ mod tests {
                 default: SqlValue::Text("Grace".to_string()),
             })
         );
+        assert_eq!(
+            parse_command("CREATE VIEW public.active_people AS SELECT id, name FROM people WHERE id > 1 ORDER BY id LIMIT 5").unwrap(),
+            Command::CreateView(CreateView {
+                name: "active_people".to_string(),
+                query: Select {
+                    table: "people".to_string(),
+                    distinct: false,
+                    projection: SelectProjection::Columns(vec![
+                        "id".to_string(),
+                        "name".to_string(),
+                    ]),
+                    group_by: None,
+                    having_groups: Vec::new(),
+                    filter: Some(SelectFilter {
+                        column: "id".to_string(),
+                        op: SelectFilterOp::Gt,
+                        value: SqlValue::Int4(1),
+                    }),
+                    filters: vec![SelectFilter {
+                        column: "id".to_string(),
+                        op: SelectFilterOp::Gt,
+                        value: SqlValue::Int4(1),
+                    }],
+                    filter_groups: vec![vec![SelectFilter {
+                        column: "id".to_string(),
+                        op: SelectFilterOp::Gt,
+                        value: SqlValue::Int4(1),
+                    }]],
+                    order_by: Some(SelectOrder {
+                        column: "id".to_string(),
+                        descending: false,
+                    }),
+                    limit: Some(5),
+                    offset: None,
+                },
+                definition: "SELECT id, name FROM people WHERE id > 1 ORDER BY id LIMIT 5"
+                    .to_string(),
+            })
+        );
+        assert!(matches!(
+            parse_command("CREATE OR REPLACE VIEW active_people AS SELECT * FROM people"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
 
         assert_eq!(
             parse_command("CREATE INDEX people_name_idx ON public.people (name)").unwrap(),
