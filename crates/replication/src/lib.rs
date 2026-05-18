@@ -2003,6 +2003,31 @@ mod tests {
     }
 
     #[test]
+    fn operational_replication_systemd_unit_contract_matches_follower_service() {
+        let unit = include_str!(
+            "../../../systemd/replication-follower/gpu-db-replication-follower@.service"
+        );
+        let follower_a =
+            include_str!("../../../systemd/replication-follower/replication-follower@2.env");
+        let follower_b =
+            include_str!("../../../systemd/replication-follower/replication-follower@3.env");
+
+        assert!(unit.contains("EnvironmentFile=-/etc/gpu-db/replication-follower@%i.env"));
+        assert!(unit.contains(
+            "ExecStart=/usr/local/bin/operational_service_smoke --follower-service --id ${GPU_DB_REPLICATION_FOLLOWER_ID} --expected-requests ${GPU_DB_REPLICATION_EXPECTED_REQUESTS} --listen ${GPU_DB_REPLICATION_LISTEN_ADDR}"
+        ));
+        assert!(unit.contains("Restart=on-failure"));
+        assert!(unit.contains("NoNewPrivileges=true"));
+        assert!(unit.contains("ProtectSystem=strict"));
+
+        for env_file in [follower_a, follower_b] {
+            assert!(env_file.contains("GPU_DB_REPLICATION_FOLLOWER_ID="));
+            assert!(env_file.contains("GPU_DB_REPLICATION_EXPECTED_REQUESTS=4"));
+            assert!(env_file.contains("GPU_DB_REPLICATION_LISTEN_ADDR=0.0.0.0:55432"));
+        }
+    }
+
+    #[test]
     fn request_vote_elects_up_to_date_candidate_and_rejects_stale_log() {
         let mut leader = RaftReplicator::new(3);
         let mut up_to_date = RaftReplicator::new(3);

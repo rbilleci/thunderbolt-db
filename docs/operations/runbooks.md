@@ -132,12 +132,13 @@ Current implemented scope:
 - `scripts/run_replication_container_smoke.sh` builds a local Docker image from the same `operational_service_smoke` example, starts two follower service containers on a user-defined local network, drives real TCP AppendEntries from the host leader through published container ports, verifies committed apply/read-after-apply output, and observes controlled shutdown.
 - `scripts/run_replication_container_restart_smoke.sh` reuses that local Docker image path to start two follower containers, restart one follower container, replay the full durable prefix into the restarted container while a second container remains live, and verify both containers catch up before controlled shutdown.
 - `scripts/run_replication_compose_restart_smoke.sh` builds the same local Docker image, starts two follower services from `docker/replication-service/compose-smoke.yml`, restarts one service through `docker compose restart`, re-discovers its published port, replays the full durable prefix into the restarted service while a second service remains live, and verifies both services catch up before Compose teardown.
+- `scripts/run_replication_systemd_verify.sh` builds the same follower service binary, validates `systemd/replication-follower/gpu-db-replication-follower@.service` with `systemd-analyze`, and checks the instance environment examples preserve the follower id / expected request count / listen address command contract.
 - The scenario demonstrates leader write admission, typed append-entries request/response handling with a tested binary frame codec and single-request TCP send/serve helper, follower catch-up, read-after-apply, deterministic request-vote election before failover, old-leader `NotLeader` rejection after failover, and continued writes on the elected leader.
 - The smoke commands emit an `operational_deployment_preflight=passed` line only when the smoke proof passes and the current TCP append-entries transport evidence, deterministic election evidence, packaged-local entrypoint evidence, deployment scope, and gap status are explicitly reported.
 
 Current simulated/not-yet-implemented scope:
 
-- No production service manager or daemon supervision. The implemented packaging proofs are reproducible local binary, Docker, and Docker Compose smoke harnesses, including bounded multi-process parent/follower, long-running follower-service, service restart-plus-replay, container deployment, container restart-plus-replay, and Compose-managed restart-plus-replay proofs.
+- No live production service manager or daemon supervision. The implemented packaging proofs are reproducible local binary, Docker, Docker Compose, and systemd-artifact validation harnesses, including bounded multi-process parent/follower, long-running follower-service, service restart-plus-replay, container deployment, container restart-plus-replay, Compose-managed restart-plus-replay, and checked systemd unit/environment command-contract proofs.
 - No membership reconfiguration. The current election proof is deterministic request-vote voting inside the local smoke harness, not a timer-driven production election loop.
 - No Kubernetes deployment harness. The local Docker smoke is a bounded packaging proof, not a production orchestration contract.
 
@@ -152,6 +153,7 @@ scripts/run_replication_supervised_restart_smoke.sh
 scripts/run_replication_container_smoke.sh
 scripts/run_replication_container_restart_smoke.sh
 scripts/run_replication_compose_restart_smoke.sh
+scripts/run_replication_systemd_verify.sh
 ```
 
 Pass criteria:
@@ -173,6 +175,7 @@ Pass criteria:
 - Container smoke output includes `operational_replication_container_smoke=host_parent_passed`, `container_deployment_scope=host_leader_two_follower_service_containers`, one `service_follower ... caught_up=true` line per follower container, `service_shutdown=controlled`, and `deployment_gap_container_deployment=implemented`.
 - Container-restart smoke output includes `operational_replication_container_restart_smoke=host_parent_passed`, `container_restart_transport=tcp_append_entries`, the restarted follower container reporting catch-up before and after restart, `container_restart_replay=full_durable_prefix_after_restart`, `deployment_gap_container_restart_supervision=implemented_bounded_local_smoke`, and explicit missing lines for production supervision and Kubernetes deployment.
 - Compose-restart smoke output includes `operational_replication_compose_restart_smoke=host_parent_passed`, `compose_restart_transport=tcp_append_entries`, the restarted Compose service reporting catch-up before and after restart, `compose_restart_replay=full_durable_prefix_after_restart`, `deployment_gap_compose_restart_supervision=implemented_bounded_local_smoke`, and explicit missing lines for production supervision and Kubernetes deployment.
+- Systemd verification output includes `operational_replication_systemd_verify=passed`, the checked unit and environment file paths, `systemd_service_contract=follower_service id_expected_requests_listen`, `deployment_gap_production_service_manager=implemented_unit_syntax_and_command_contract`, and explicit missing lines for live systemd supervision and Kubernetes deployment.
 
 ## 5) CPU Fallback Monitoring (No-GPU bootstrap)
 
