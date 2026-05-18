@@ -6865,6 +6865,53 @@ fn select_is_aggregate_result_column(select: &Select, column: &str) -> bool {
     }
 }
 
+fn select_aggregate_result_column_name(select: &Select) -> Option<&'static str> {
+    match select.projection {
+        SelectProjection::CountAll | SelectProjection::GroupedCount { .. } => Some("count"),
+        SelectProjection::Sum { .. } | SelectProjection::GroupedSum { .. } => Some("sum"),
+        SelectProjection::Avg { .. } | SelectProjection::GroupedAvg { .. } => Some("avg"),
+        SelectProjection::Min { .. } | SelectProjection::GroupedMin { .. } => Some("min"),
+        SelectProjection::Max { .. } | SelectProjection::GroupedMax { .. } => Some("max"),
+        SelectProjection::All | SelectProjection::Columns(_) => None,
+    }
+}
+
+fn grouped_row_matches_having(
+    select: &Select,
+    group_column: &str,
+    group_value: &SqlValue,
+    aggregate_name: &'static str,
+    aggregate_value: &SqlValue,
+) -> Result<bool, ExecuteError> {
+    if select.having_groups.is_empty() {
+        return Ok(true);
+    }
+
+    for filters in &select.having_groups {
+        let mut group_matches = true;
+        for filter in filters {
+            let value = if filter.column == group_column {
+                group_value
+            } else if filter.column.eq_ignore_ascii_case(aggregate_name) {
+                aggregate_value
+            } else {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "HAVING must reference grouped column or aggregate result".to_string(),
+                )));
+            };
+            if !select_filter_matches(value, filter.op, &filter.value) {
+                group_matches = false;
+                break;
+            }
+        }
+        if group_matches {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
 fn aggregate_source_column<'a>(
     table: &'a RelationalTable,
     select: &Select,
@@ -8578,14 +8625,13 @@ impl Engine {
             }
         };
         if select.distinct
-            || !select.having_groups.is_empty()
             || select.filter.is_some()
             || !select.filters.is_empty()
             || !select.filter_groups.is_empty()
             || select.offset.is_some()
         {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "resident device-memory grouped aggregate proof currently supports only unfiltered grouped aggregates with optional ORDER BY and LIMIT"
+                "resident device-memory grouped aggregate proof currently supports only unfiltered grouped aggregates with optional HAVING, ORDER BY, and LIMIT"
                     .to_string(),
             )));
         }
@@ -8688,6 +8734,27 @@ impl Engine {
             })
             .collect::<Result<Vec<_>, ExecuteError>>()?;
         rows.sort_by(|left, right| compare_sql_values(&left[0], &right[0]));
+        if !select.having_groups.is_empty() {
+            let aggregate_name =
+                select_aggregate_result_column_name(select).expect("grouped aggregate projection");
+            rows = rows
+                .into_iter()
+                .filter_map(|row| {
+                    let matches = grouped_row_matches_having(
+                        select,
+                        group_column,
+                        &row[0],
+                        aggregate_name,
+                        &row[1],
+                    );
+                    match matches {
+                        Ok(true) => Some(Ok(row)),
+                        Ok(false) => None,
+                        Err(err) => Some(Err(err)),
+                    }
+                })
+                .collect::<Result<Vec<_>, ExecuteError>>()?;
+        }
         if let Some(order) = &select.order_by {
             let order_by_sum = select_is_aggregate_result_column(select, &order.column);
             rows.sort_by(|left, right| {
@@ -8760,13 +8827,12 @@ impl Engine {
             }
         };
         if select.distinct
-            || !select.having_groups.is_empty()
             || select.offset.is_some()
             || bound.filter_groups.len() != 1
             || bound.filter_groups[0].len() != 1
         {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
-                "resident device-memory filtered grouped aggregate proof currently supports only one int4 comparison predicate with optional ORDER BY and LIMIT"
+                "resident device-memory filtered grouped aggregate proof currently supports only one int4 comparison predicate with optional HAVING, ORDER BY, and LIMIT"
                     .to_string(),
             )));
         }
@@ -8892,6 +8958,27 @@ impl Engine {
             })
             .collect::<Result<Vec<_>, ExecuteError>>()?;
         rows.sort_by(|left, right| compare_sql_values(&left[0], &right[0]));
+        if !select.having_groups.is_empty() {
+            let aggregate_name =
+                select_aggregate_result_column_name(select).expect("grouped aggregate projection");
+            rows = rows
+                .into_iter()
+                .filter_map(|row| {
+                    let matches = grouped_row_matches_having(
+                        select,
+                        group_column,
+                        &row[0],
+                        aggregate_name,
+                        &row[1],
+                    );
+                    match matches {
+                        Ok(true) => Some(Ok(row)),
+                        Ok(false) => None,
+                        Err(err) => Some(Err(err)),
+                    }
+                })
+                .collect::<Result<Vec<_>, ExecuteError>>()?;
+        }
         if let Some(order) = &select.order_by {
             let order_by_sum = select_is_aggregate_result_column(select, &order.column);
             rows.sort_by(|left, right| {
@@ -10042,6 +10129,34 @@ impl Engine {
                 }
                 SelectProjection::All | SelectProjection::Columns(_) => unreachable!(),
             };
+
+            if !select.having_groups.is_empty() {
+                let group_idx = bound.group_by_index.ok_or_else(|| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(
+                        "HAVING requires GROUP BY".to_string(),
+                    ))
+                })?;
+                let group_column = &table.columns[group_idx].name;
+                let aggregate_name = select_aggregate_result_column_name(select)
+                    .expect("aggregate projection has result column name");
+                aggregate_rows = aggregate_rows
+                    .into_iter()
+                    .filter_map(|row| {
+                        let matches = grouped_row_matches_having(
+                            select,
+                            group_column,
+                            &row[0],
+                            aggregate_name,
+                            row.last().expect("aggregate row has result value"),
+                        );
+                        match matches {
+                            Ok(true) => Some(Ok(row)),
+                            Ok(false) => None,
+                            Err(err) => Some(Err(err)),
+                        }
+                    })
+                    .collect::<Result<Vec<_>, ExecuteError>>()?;
+            }
 
             if let Some(order) = &select.order_by {
                 let order_idx = if select_is_aggregate_result_column(select, &order.column) {
@@ -13664,6 +13779,60 @@ mod tests {
     }
 
     #[test]
+    fn relational_select_grouped_having_filters_engine_aggregate_rows() {
+        let mut e = Engine::new_local();
+        e.execute_text(
+            1,
+            "CREATE TABLE events (bucket INT, label TEXT, amount INT)",
+        )
+        .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO events (bucket, label, amount) VALUES (1, 'alpha', 10), (2, 'beta', 30), (1, 'gamma', 20), (3, 'delta', 40), (2, 'epsilon', 5), (3, 'zeta', 15)",
+        )
+        .unwrap();
+
+        let Command::Select(select) = parse_command(
+            "SELECT bucket, SUM(amount) FROM events GROUP BY bucket HAVING bucket >= 2 AND sum > 40 ORDER BY sum DESC",
+        )
+        .unwrap() else {
+            unreachable!()
+        };
+        let result = e.execute_relational_select(&select).unwrap();
+        assert_eq!(
+            result.rows,
+            vec![vec![SqlValue::Int4(3), SqlValue::Int8(55)]]
+        );
+
+        let Command::Select(or_select) = parse_command(
+            "SELECT bucket, MAX(amount) FROM events GROUP BY bucket HAVING bucket = 1 OR max >= 40 ORDER BY bucket",
+        )
+        .unwrap() else {
+            unreachable!()
+        };
+        let result = e.execute_relational_select(&or_select).unwrap();
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![SqlValue::Int4(1), SqlValue::Int4(20)],
+                vec![SqlValue::Int4(3), SqlValue::Int4(40)]
+            ]
+        );
+
+        let Command::Select(unsupported_having) =
+            parse_command("SELECT bucket, COUNT(*) FROM events GROUP BY bucket HAVING amount > 10")
+                .unwrap()
+        else {
+            unreachable!()
+        };
+        let err = e
+            .execute_relational_select(&unsupported_having)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("HAVING must reference grouped column or aggregate result"));
+    }
+
+    #[test]
     fn gpu_resident_device_memory_grouped_aggregate_probe_materializes_int4_results() {
         let mut e = Engine::new_local();
         e.execute_text(
@@ -13718,9 +13887,11 @@ mod tests {
 
         for sql in [
             "SELECT bucket, COUNT(*) FROM events GROUP BY bucket ORDER BY count DESC LIMIT 2",
+            "SELECT bucket, COUNT(*) FROM events GROUP BY bucket HAVING count >= 2 ORDER BY bucket",
             "SELECT bucket, AVG(amount) FROM events GROUP BY bucket ORDER BY avg DESC LIMIT 2",
             "SELECT bucket, MIN(amount) FROM events GROUP BY bucket ORDER BY min DESC LIMIT 2",
             "SELECT bucket, MAX(amount) FROM events GROUP BY bucket ORDER BY max DESC LIMIT 2",
+            "SELECT bucket, MAX(amount) FROM events GROUP BY bucket HAVING bucket = 1 OR max >= 40 ORDER BY bucket",
         ] {
             let Command::Select(select) = parse_command(sql).unwrap() else {
                 unreachable!()
@@ -13735,6 +13906,20 @@ mod tests {
             assert_eq!(resident.executed_target, DeviceTarget::Gpu(0));
             assert_eq!(resident.fallback_reason, None);
         }
+
+        let Command::Select(unsupported_having) = parse_command(
+            "SELECT bucket, SUM(amount) FROM events GROUP BY bucket HAVING amount > 10",
+        )
+        .unwrap() else {
+            unreachable!()
+        };
+        let err = e
+            .execute_relational_grouped_aggregate_with_resident_device_memory_probe(
+                &unsupported_having,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("HAVING must reference grouped column or aggregate result"));
 
         e.execute_text(
             3,
@@ -13768,10 +13953,13 @@ mod tests {
 
         for sql in [
             "SELECT bucket, COUNT(*) FROM events WHERE amount >= 15 GROUP BY bucket ORDER BY count DESC LIMIT 2",
+            "SELECT bucket, COUNT(*) FROM events WHERE amount >= 15 GROUP BY bucket HAVING count >= 2 ORDER BY bucket",
             "SELECT bucket, SUM(amount) FROM events WHERE amount >= 15 GROUP BY bucket ORDER BY sum DESC LIMIT 2",
+            "SELECT bucket, SUM(amount) FROM events WHERE amount >= 15 GROUP BY bucket HAVING sum > 30 ORDER BY sum DESC",
             "SELECT bucket, AVG(amount) FROM events WHERE amount >= 15 GROUP BY bucket ORDER BY avg DESC LIMIT 2",
             "SELECT bucket, MIN(amount) FROM events WHERE amount >= 15 GROUP BY bucket ORDER BY min DESC LIMIT 2",
             "SELECT bucket, MAX(amount) FROM events WHERE amount >= 15 GROUP BY bucket ORDER BY max DESC LIMIT 2",
+            "SELECT bucket, MAX(amount) FROM events WHERE amount >= 15 GROUP BY bucket HAVING bucket = 2 OR max >= 40 ORDER BY bucket",
         ] {
             let Command::Select(select) = parse_command(sql).unwrap() else {
                 unreachable!()
@@ -13825,6 +14013,20 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("supports only int4 comparison literals"));
+
+        let Command::Select(unsupported_having) = parse_command(
+            "SELECT bucket, SUM(amount) FROM events WHERE amount >= 15 GROUP BY bucket HAVING amount > 10",
+        )
+        .unwrap() else {
+            unreachable!()
+        };
+        let err = e
+            .execute_relational_filtered_grouped_aggregate_with_resident_device_memory_probe(
+                &unsupported_having,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("HAVING must reference grouped column or aggregate result"));
 
         let Command::Select(select) = parse_command(
             "SELECT bucket, SUM(amount) FROM events WHERE amount >= 15 GROUP BY bucket",

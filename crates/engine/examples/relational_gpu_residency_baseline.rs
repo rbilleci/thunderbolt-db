@@ -86,8 +86,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     ))?;
     let grouped_sum_query =
         select("SELECT bucket, SUM(amount) FROM events GROUP BY bucket ORDER BY sum DESC LIMIT 8")?;
-    let grouped_count_query =
-        select("SELECT bucket, COUNT(*) FROM events GROUP BY bucket ORDER BY count DESC LIMIT 8")?;
+    let grouped_count_query = select(
+        "SELECT bucket, COUNT(*) FROM events GROUP BY bucket HAVING count >= 40 ORDER BY count DESC LIMIT 8",
+    )?;
     let grouped_avg_query =
         select("SELECT bucket, AVG(amount) FROM events GROUP BY bucket ORDER BY avg DESC LIMIT 8")?;
     let grouped_min_query =
@@ -95,7 +96,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let grouped_max_query =
         select("SELECT bucket, MAX(amount) FROM events GROUP BY bucket ORDER BY max DESC LIMIT 8")?;
     let filtered_grouped_sum_query = select(&format!(
-        "SELECT bucket, SUM(amount) FROM events WHERE amount >= {filtered_scalar_threshold} GROUP BY bucket ORDER BY sum DESC LIMIT 8"
+        "SELECT bucket, SUM(amount) FROM events WHERE amount >= {filtered_scalar_threshold} GROUP BY bucket HAVING sum > 0 ORDER BY sum DESC LIMIT 8"
     ))?;
     let filtered_grouped_count_query = select(&format!(
         "SELECT bucket, COUNT(*) FROM events WHERE amount >= {filtered_scalar_threshold} GROUP BY bucket ORDER BY count DESC LIMIT 8"
@@ -395,7 +396,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("- warm_resident_snapshot_execution_supported: true");
     println!("- production_device_cache_supported: bounded_retained_snapshot_handle");
     println!(
-        "- resident_device_memory_query_kernel_supported: bounded_count_all_int4_equality_count_int4_range_count_int4_sum_avg_min_max_filtered_sum_avg_min_max_int4_projection_int4_paginated_distinct_projection_int4_paginated_filtered_distinct_projection_int4_paginated_filtered_ordered_projection_int4_grouped_count_sum_avg_min_max_and_filtered_grouped_count_sum_avg_min_max"
+        "- resident_device_memory_query_kernel_supported: bounded_count_all_int4_equality_count_int4_range_count_int4_sum_avg_min_max_filtered_sum_avg_min_max_int4_projection_int4_paginated_distinct_projection_int4_paginated_filtered_distinct_projection_int4_paginated_filtered_ordered_projection_int4_grouped_count_sum_avg_min_max_grouped_having_and_filtered_grouped_count_sum_avg_min_max_filtered_grouped_having"
     );
     println!(
         "- resident_device_memory_proof_supported: {}",
@@ -623,7 +624,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     print_probe(&mutation_probe);
     println!();
     println!(
-        "decision: current P7 evidence includes bounded resident table-data snapshot SELECT probes with zero per-query H2D transfer for the app lookup workload and supported aggregate/distinct SQL shapes, retained-device-memory COUNT(*), int4 equality-predicate COUNT(*), int4 range-predicate COUNT(*), int4 scalar SUM/AVG/MIN/MAX, int4 filtered scalar SUM/AVG/MIN/MAX, int4 predicate-projection, int4 paginated distinct projection, int4 paginated filtered distinct projection, bounded int4 paginated filtered ordered-projection, int4 grouped COUNT/SUM/AVG/MIN/MAX, and int4 filtered grouped COUNT/SUM/AVG/MIN/MAX proofs over the resident allocation, resident-byte accounting, WAL-safe invalidation, manual refresh-cost accounting, memory-pressure fallback metadata, deterministic resident-snapshot budget admission/eviction, and a retained real CUDA allocation/copy handle for encoded snapshot bytes when local driver hardware is available. Keep broad production CUDA cache claims out of scope until broader expression kernels read directly from retained device-memory handles."
+        "decision: current P7 evidence includes bounded resident table-data snapshot SELECT probes with zero per-query H2D transfer for the app lookup workload and supported aggregate/distinct SQL shapes, retained-device-memory COUNT(*), int4 equality-predicate COUNT(*), int4 range-predicate COUNT(*), int4 scalar SUM/AVG/MIN/MAX, int4 filtered scalar SUM/AVG/MIN/MAX, int4 predicate-projection, int4 paginated distinct projection, int4 paginated filtered distinct projection, bounded int4 paginated filtered ordered-projection, int4 grouped COUNT/SUM/AVG/MIN/MAX with grouped HAVING, and int4 filtered grouped COUNT/SUM/AVG/MIN/MAX with filtered grouped HAVING proofs over the resident allocation, resident-byte accounting, WAL-safe invalidation, manual refresh-cost accounting, memory-pressure fallback metadata, deterministic resident-snapshot budget admission/eviction, and a retained real CUDA allocation/copy handle for encoded snapshot bytes when local driver hardware is available. Keep broad production CUDA cache claims out of scope until broader expression kernels read directly from retained device-memory handles."
     );
 
     Ok(())
