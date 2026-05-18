@@ -180,6 +180,24 @@ impl CudaResidentDeviceMemory {
         Ok(greater_or_equal_lower_count.saturating_sub(greater_than_upper_count))
     }
 
+    pub fn count_text_prefix_from_payload(
+        &self,
+        offsets_byte_offset: u64,
+        bytes_byte_offset: u64,
+        bytes_len: u64,
+        row_count: u64,
+        prefix: &[u8],
+    ) -> Result<u64, CudaRuntimeProbeError> {
+        launch_cuda_resident_text_prefix_count(
+            self,
+            offsets_byte_offset,
+            bytes_byte_offset,
+            bytes_len,
+            row_count,
+            prefix,
+        )
+    }
+
     pub fn sum_i32_from_payload(
         &self,
         byte_offset: u64,
@@ -1424,6 +1442,92 @@ done:
     drop(module_guard);
     drop(allocation_guard);
     Ok(output)
+}
+
+fn launch_cuda_resident_text_prefix_count(
+    resident: &CudaResidentDeviceMemory,
+    offsets_byte_offset: u64,
+    bytes_byte_offset: u64,
+    bytes_len: u64,
+    row_count: u64,
+    prefix: &[u8],
+) -> Result<u64, CudaRuntimeProbeError> {
+    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+
+    let offsets_len = row_count
+        .checked_add(1)
+        .and_then(|count| count.checked_mul(std::mem::size_of::<u64>() as u64))
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let offsets_end = offsets_byte_offset
+        .checked_add(offsets_len)
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let bytes_end = bytes_byte_offset
+        .checked_add(bytes_len)
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    if offsets_end > resident.metadata.allocated_bytes
+        || bytes_end > resident.metadata.allocated_bytes
+    {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(
+            offsets_end.max(bytes_end) as usize,
+        ));
+    }
+    let offsets_len_usize = usize::try_from(offsets_len)
+        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let bytes_len_usize = usize::try_from(bytes_len)
+        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let row_count_usize = usize::try_from(row_count)
+        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+
+    let cu_memcpy_dtoh = unsafe {
+        resident
+            ._lib
+            .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+            .or_else(|_| resident._lib.get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+
+    let mut raw_offsets = vec![0_u8; offsets_len_usize];
+    check_cuda(unsafe {
+        cu_memcpy_dtoh(
+            raw_offsets.as_mut_ptr().cast::<c_void>(),
+            resident.device_ptr + offsets_byte_offset,
+            offsets_len_usize,
+        )
+    })?;
+    let mut bytes = vec![0_u8; bytes_len_usize];
+    if bytes_len_usize > 0 {
+        check_cuda(unsafe {
+            cu_memcpy_dtoh(
+                bytes.as_mut_ptr().cast::<c_void>(),
+                resident.device_ptr + bytes_byte_offset,
+                bytes_len_usize,
+            )
+        })?;
+    }
+
+    let mut offsets = Vec::with_capacity(row_count_usize + 1);
+    for chunk in raw_offsets.chunks_exact(std::mem::size_of::<u64>()) {
+        offsets.push(u64::from_le_bytes(chunk.try_into().map_err(|_| {
+            CudaRuntimeProbeError::InvalidInputLength(raw_offsets.len())
+        })?));
+    }
+    if offsets.len() != row_count_usize + 1 || offsets.first().copied() != Some(0) {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(offsets.len()));
+    }
+    let mut matches = 0_u64;
+    for pair in offsets.windows(2) {
+        let start = usize::try_from(pair[0])
+            .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        let end = usize::try_from(pair[1])
+            .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        if start > end || end > bytes.len() {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(end));
+        }
+        if bytes[start..end].starts_with(prefix) {
+            matches = matches.saturating_add(1);
+        }
+    }
+    Ok(matches)
 }
 
 fn launch_cuda_resident_i32_sum(

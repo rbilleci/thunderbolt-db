@@ -5973,6 +5973,7 @@ pub struct RelationalResidencySnapshot {
     pub resident_bytes: u64,
     pub resident_rows: Vec<Vec<SqlValue>>,
     pub resident_device_int4_columns: Vec<String>,
+    pub resident_device_text_columns: Vec<ResidentDeviceTextColumnLayout>,
     pub valid_through_index: Index,
     pub invalidated_by_txn_id: Option<TxnId>,
     pub invalidated_at_index: Option<Index>,
@@ -5983,6 +5984,14 @@ pub struct RelationalResidencySnapshot {
     pub resident_bytes_after_admission: u64,
     pub evicted_tables_on_admission: Vec<String>,
     pub device_memory_proof: Option<CudaDeviceMemoryProof>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResidentDeviceTextColumnLayout {
+    pub name: String,
+    pub offsets_byte_offset: u64,
+    pub bytes_byte_offset: u64,
+    pub bytes_len: u64,
 }
 
 impl RelationalResidencySnapshot {
@@ -6046,6 +6055,34 @@ fn resident_device_int4_column_offset(
             ))
         })?;
     Ok(offset)
+}
+
+fn resident_device_text_column_layout<'a>(
+    snapshot: &'a RelationalResidencySnapshot,
+    table: &RelationalTable,
+    column_idx: usize,
+) -> Result<&'a ResidentDeviceTextColumnLayout, ExecuteError> {
+    let column = table.columns.get(column_idx).ok_or_else(|| {
+        ExecuteError::Engine(EngineError::ApplyFailed(
+            "resident device-memory predicate column is outside the catalog table".to_string(),
+        ))
+    })?;
+    if column.ty != SqlType::Text {
+        return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+            "resident device-memory text-prefix count proof currently supports only text predicates"
+                .to_string(),
+        )));
+    }
+    snapshot
+        .resident_device_text_columns
+        .iter()
+        .find(|layout| layout.name == column.name)
+        .ok_or_else(|| {
+            ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "resident snapshot device payload has no text column \"{}\"",
+                column.name
+            )))
+        })
 }
 
 fn resident_device_i32_comparison(op: SelectFilterOp) -> Option<CudaI32Comparison> {
@@ -8128,6 +8165,106 @@ impl Engine {
         let count = i32::try_from(filtered_count).map_err(|_| {
             ExecuteError::Engine(EngineError::ApplyFailed(format!(
                 "resident device-memory filtered count {filtered_count} exceeds supported COUNT(*) result range"
+            )))
+        })?;
+
+        Ok(RelationalSelectResult {
+            columns: bound.selected_columns,
+            rows: vec![vec![SqlValue::Int4(count)]],
+            planned_target: DeviceTarget::Gpu(snapshot.gpu_id),
+            executed_target: DeviceTarget::Gpu(snapshot.gpu_id),
+            fallback_reason: None,
+            access_path,
+        })
+    }
+
+    pub fn execute_relational_text_prefix_count_with_resident_device_memory_probe(
+        &mut self,
+        select: &Select,
+    ) -> Result<RelationalSelectResult, ExecuteError> {
+        let (table, bound) = self.bind_relational_select_for_execution(select)?;
+        if select.distinct
+            || !matches!(select.projection, SelectProjection::CountAll)
+            || select.group_by.is_some()
+            || !select.having_groups.is_empty()
+            || select.order_by.is_some()
+            || select.limit.is_some()
+            || select.offset.is_some()
+            || bound.filter_groups.len() != 1
+            || bound.filter_groups[0].len() != 1
+        {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory text-prefix count proof currently supports only SELECT COUNT(*) with one text prefix LIKE predicate"
+                    .to_string(),
+            )));
+        }
+        let (filter_idx, op, value) = bound.filter_groups[0][0].clone();
+        if op != SelectFilterOp::LikePrefix {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory text-prefix count proof currently supports only text prefix LIKE predicates"
+                    .to_string(),
+            )));
+        }
+        let SqlValue::Text(prefix) = value else {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory text-prefix count proof currently supports only text prefix LIKE predicates"
+                    .to_string(),
+            )));
+        };
+
+        let (_query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
+        let snapshot = self
+            .relational_residency_snapshot(&table.name)
+            .ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "relation \"{}\" has no resident snapshot",
+                    table.name
+                )))
+            })?;
+        if snapshot.schema != table.schema || snapshot.table != table.name {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident snapshot no longer matches catalog table identity".to_string(),
+            )));
+        }
+        if !snapshot.is_valid() {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "relation \"{}\" resident snapshot is invalid",
+                table.name
+            ))));
+        }
+        let device_memory = self
+            .relational_residency_device_memory
+            .get(&table.name)
+            .ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "relation \"{}\" has no retained resident device memory",
+                    table.name
+                )))
+            })?;
+        let layout = resident_device_text_column_layout(&snapshot, &table, filter_idx)?;
+        let row_count = u64::try_from(snapshot.row_count).map_err(|_| {
+            ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident snapshot row count exceeds retained device-memory proof range"
+                    .to_string(),
+            ))
+        })?;
+        let matched_count = device_memory
+            .count_text_prefix_from_payload(
+                layout.offsets_byte_offset,
+                layout.bytes_byte_offset,
+                layout.bytes_len,
+                row_count,
+                prefix.as_bytes(),
+            )
+            .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
+        self.metrics.observe_d2h_bytes(
+            (row_count + 1)
+                .saturating_mul(std::mem::size_of::<u64>() as u64)
+                .saturating_add(layout.bytes_len),
+        );
+        let count = i32::try_from(matched_count).map_err(|_| {
+            ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "resident device-memory text-prefix count {matched_count} exceeds supported COUNT(*) result range"
             )))
         })?;
 
@@ -10910,6 +11047,7 @@ impl Engine {
             .map(|column| column.name.clone())
             .collect::<Vec<_>>();
         let mut device_payload = vec![0; std::mem::size_of::<u64>()];
+        let mut resident_device_text_columns = Vec::new();
         for column in catalog_table
             .columns
             .iter()
@@ -10925,6 +11063,37 @@ impl Engine {
                 };
                 device_payload.extend_from_slice(&value.to_le_bytes());
             }
+        }
+        for (column_idx, column) in catalog_table
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_idx, column)| column.ty == SqlType::Text)
+        {
+            let offsets_byte_offset = device_payload.len() as u64;
+            let mut text_offsets = Vec::with_capacity(row_count + 1);
+            let mut text_bytes = Vec::new();
+            text_offsets.push(0_u64);
+            for row in &resident_rows {
+                let SqlValue::Text(value) = &row[column_idx] else {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                        "resident snapshot text payload encountered non-text value".to_string(),
+                    )));
+                };
+                text_bytes.extend_from_slice(value.as_bytes());
+                text_offsets.push(text_bytes.len() as u64);
+            }
+            for offset in &text_offsets {
+                device_payload.extend_from_slice(&offset.to_le_bytes());
+            }
+            let bytes_byte_offset = device_payload.len() as u64;
+            device_payload.extend_from_slice(&text_bytes);
+            resident_device_text_columns.push(ResidentDeviceTextColumnLayout {
+                name: column.name.clone(),
+                offsets_byte_offset,
+                bytes_byte_offset,
+                bytes_len: text_bytes.len() as u64,
+            });
         }
         device_payload.extend_from_slice(&raw_device_tail);
         device_payload[..std::mem::size_of::<u64>()]
@@ -10954,6 +11123,7 @@ impl Engine {
             resident_bytes,
             resident_rows,
             resident_device_int4_columns,
+            resident_device_text_columns,
             valid_through_index: self.visible_up_to,
             invalidated_by_txn_id: None,
             invalidated_at_index: None,
@@ -13978,6 +14148,19 @@ mod tests {
             .to_string();
         assert!(err.contains("has no retained resident device memory"));
 
+        let Command::Select(text_prefix_select) =
+            parse_command("SELECT COUNT(*) FROM events WHERE label LIKE 'a%'").unwrap()
+        else {
+            unreachable!()
+        };
+        let err = e
+            .execute_relational_text_prefix_count_with_resident_device_memory_probe(
+                &text_prefix_select,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("has no retained resident device memory"));
+
         let Command::Select(membership_select) =
             parse_command("SELECT COUNT(*) FROM events WHERE id IN (1, 2)").unwrap()
         else {
@@ -14883,6 +15066,86 @@ mod tests {
         };
         assert!(e
             .execute_relational_filter_group_count_with_resident_device_memory_probe(&select)
+            .unwrap_err()
+            .to_string()
+            .contains("resident snapshot is invalid"));
+    }
+
+    #[test]
+    fn gpu_resident_device_memory_text_prefix_count_probe_materializes_text_results() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE events (id INT, label TEXT, amount INT)")
+            .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO events (id, label, amount) VALUES (1, 'alpha', 10), (2, 'alpine', 30), (3, 'beta', 20), (4, 'alphabet', 40), (5, 'gamma', 5)",
+        )
+        .unwrap();
+        let snapshot = e.populate_relational_residency_snapshot("events").unwrap();
+        assert_eq!(
+            snapshot
+                .resident_device_text_columns
+                .iter()
+                .map(|layout| layout.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["label"]
+        );
+        if snapshot.device_memory_proof.is_none() {
+            return;
+        }
+
+        let Command::Select(select) =
+            parse_command("SELECT COUNT(*) FROM events WHERE label LIKE 'alp%'").unwrap()
+        else {
+            unreachable!()
+        };
+        let cpu = e.execute_relational_select(&select).unwrap();
+        let before = e.metrics().snapshot();
+        let resident = e
+            .execute_relational_text_prefix_count_with_resident_device_memory_probe(&select)
+            .unwrap();
+        let after = e.metrics().snapshot();
+
+        assert_eq!(resident.columns, cpu.columns);
+        assert_eq!(resident.rows, cpu.rows);
+        assert_eq!(resident.rows, vec![vec![SqlValue::Int4(3)]]);
+        assert_eq!(resident.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(resident.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(resident.fallback_reason, None);
+        assert_eq!(after.h2d_bytes_total - before.h2d_bytes_total, 0);
+        assert!(after.d2h_bytes_total > before.d2h_bytes_total);
+        assert_eq!(after.kernel_exec_samples - before.kernel_exec_samples, 0);
+
+        let Command::Select(unsupported_int4) =
+            parse_command("SELECT COUNT(*) FROM events WHERE id LIKE '1%'").unwrap()
+        else {
+            unreachable!()
+        };
+        let err = e
+            .execute_relational_text_prefix_count_with_resident_device_memory_probe(
+                &unsupported_int4,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("supports only text predicates"));
+
+        let Command::Select(unsupported_ordered) =
+            parse_command("SELECT COUNT(*) FROM events WHERE label LIKE 'alp%' ORDER BY count")
+                .unwrap()
+        else {
+            unreachable!()
+        };
+        let err = e
+            .execute_relational_text_prefix_count_with_resident_device_memory_probe(
+                &unsupported_ordered,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("one text prefix LIKE predicate"));
+
+        e.mark_gpu_memory_pressured(0);
+        assert!(e
+            .execute_relational_text_prefix_count_with_resident_device_memory_probe(&select)
             .unwrap_err()
             .to_string()
             .contains("resident snapshot is invalid"));
