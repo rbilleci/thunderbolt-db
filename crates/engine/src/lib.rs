@@ -35,12 +35,13 @@ use gpu_db_wal::{
     export_wal_archive_object_backup, fork_wal_archive_timeline_to_timestamp_micros,
     fork_wal_archive_timeline_to_txn, plan_wal_archive_retention_from_txn,
     plan_wal_archive_retention_to_timestamp_micros, plan_wal_archive_retention_to_txn,
-    read_wal_archive, read_wal_archive_timeline, read_wal_archive_to_timestamp_micros,
-    read_wal_archive_to_txn, read_wal_checkpoint, read_wal_segment,
-    restore_wal_archive_object_backup, write_wal_archive_with_timestamps, write_wal_control_file,
+    read_wal_archive, read_wal_archive_timeline, read_wal_archive_timeline_registry,
+    read_wal_archive_to_timestamp_micros, read_wal_archive_to_txn, read_wal_checkpoint,
+    read_wal_segment, register_wal_archive_timeline, restore_wal_archive_object_backup,
+    write_wal_archive_timeline, write_wal_archive_with_timestamps, write_wal_control_file,
     write_wal_segment, WalArchiveManifest, WalArchiveObjectBackup, WalArchiveRecordTimestamp,
-    WalArchiveRetentionPlan, WalArchiveTimeline, WalArchiveTimelineBranch, WalBuffer,
-    WalControlFile, WalRecord,
+    WalArchiveRetentionPlan, WalArchiveTimeline, WalArchiveTimelineBranch,
+    WalArchiveTimelineRegistry, WalBuffer, WalControlFile, WalRecord,
 };
 
 #[derive(Debug, Default)]
@@ -11681,6 +11682,26 @@ impl Engine {
         timeline_path: impl AsRef<std::path::Path>,
     ) -> Result<WalArchiveTimeline, EngineError> {
         read_wal_archive_timeline(timeline_path)
+    }
+
+    pub fn write_durable_wal_archive_timeline(
+        timeline_path: impl AsRef<std::path::Path>,
+        timeline: &WalArchiveTimeline,
+    ) -> Result<(), EngineError> {
+        write_wal_archive_timeline(timeline_path, timeline)
+    }
+
+    pub fn register_durable_wal_archive_timeline(
+        registry_path: impl AsRef<std::path::Path>,
+        timeline_path: impl AsRef<std::path::Path>,
+    ) -> Result<WalArchiveTimelineRegistry, EngineError> {
+        register_wal_archive_timeline(registry_path, timeline_path)
+    }
+
+    pub fn read_durable_wal_archive_timeline_registry(
+        registry_path: impl AsRef<std::path::Path>,
+    ) -> Result<WalArchiveTimelineRegistry, EngineError> {
+        read_wal_archive_timeline_registry(registry_path)
     }
 
     pub fn plan_durable_wal_archive_retention_to_txn(
@@ -30679,7 +30700,9 @@ mod tests {
         let source_segments = dir.join("source").join("segments");
         let branch_manifest = dir.join("branch").join("MANIFEST");
         let branch_segments = dir.join("branch").join("segments");
+        let source_timeline_path = dir.join("source").join("TIMELINE");
         let timeline_path = dir.join("branch").join("TIMELINE");
+        let registry_path = dir.join("TIMELINE_REGISTRY");
         let mut e = Engine::new_local();
         e.execute_text_at_timestamp_micros(1, "CREATE TABLE people (id INT, name TEXT)", 1_000)
             .unwrap();
@@ -30703,6 +30726,18 @@ mod tests {
         .unwrap();
         e.persist_durable_wal_archive(&source_manifest, &source_segments, 2)
             .unwrap();
+        Engine::write_durable_wal_archive_timeline(
+            &source_timeline_path,
+            &WalArchiveTimeline {
+                timeline_id: "timeline-main-0001".to_string(),
+                parent_timeline_id: None,
+                fork_txn_id: 0,
+                fork_timestamp_micros: None,
+                source_manifest_path: source_manifest.clone(),
+                branch_manifest_path: source_manifest.clone(),
+            },
+        )
+        .unwrap();
 
         let branch = Engine::fork_durable_wal_archive_timeline_to_timestamp_micros(
             &source_manifest,
@@ -30715,9 +30750,19 @@ mod tests {
         )
         .unwrap();
         let timeline = Engine::read_durable_wal_archive_timeline(&timeline_path).unwrap();
+        Engine::register_durable_wal_archive_timeline(&registry_path, &source_timeline_path)
+            .unwrap();
+        let registry =
+            Engine::register_durable_wal_archive_timeline(&registry_path, &timeline_path).unwrap();
         let mut recovered = Engine::recover_from_durable_wal_archive(&branch_manifest).unwrap();
 
         assert_eq!(branch.timeline, timeline);
+        assert_eq!(registry.timelines.len(), 2);
+        assert_eq!(registry.timelines[1].timeline_id, "timeline-branch-0002");
+        assert_eq!(
+            registry.timelines[1].parent_timeline_id.as_deref(),
+            Some("timeline-main-0001")
+        );
         assert_eq!(timeline.timeline_id, "timeline-branch-0002");
         assert_eq!(
             timeline.parent_timeline_id.as_deref(),

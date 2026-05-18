@@ -64,7 +64,7 @@ def classify(test_id: str) -> list[str]:
     if re.search(r"sql_gpu|gpu_bridge|relational_sql_select_cuda|relational_sql_select_gpu", test_id):
         buckets.append("sql.gpu_bridge")
     if re.search(
-        r"relational_index|access_path|equality_index|checkpoint_vacuum|checkpoint_control|prune_versions|retention|timestamp_target|archive_ingest|archive_ingests|segment_ingestion|archive_timeline|timeline_branch|object_backup|base_checkpoint|checkpoint_plus_wal_archive",
+        r"relational_index|access_path|equality_index|checkpoint_vacuum|checkpoint_control|prune_versions|retention|timestamp_target|archive_ingest|archive_ingests|segment_ingestion|archive_timeline|timeline_branch|timeline_registry|object_backup|base_checkpoint|checkpoint_plus_wal_archive",
         test_id,
     ):
         buckets.append("storage.indexing")

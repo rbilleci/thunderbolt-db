@@ -9,6 +9,7 @@ const WAL_SEGMENT_MAGIC: &[u8; 10] = b"GPUDBWAL1\n";
 const WAL_CONTROL_MAGIC: &str = "GPUDBWALCONTROL1";
 const WAL_ARCHIVE_MANIFEST_MAGIC: &str = "GPUDBWALARCHIVE1";
 const WAL_ARCHIVE_TIMELINE_MAGIC: &str = "GPUDBWALTIMELINE1";
+const WAL_ARCHIVE_TIMELINE_REGISTRY_MAGIC: &str = "GPUDBWALTIMELINEREGISTRY1";
 const WAL_ARCHIVE_OBJECT_BACKUP_MAGIC: &str = "GPUDBWALOBJECTBACKUP1";
 const WAL_RECORD_HEADER_LEN: usize = 24;
 
@@ -89,6 +90,21 @@ pub struct WalArchiveTimeline {
 pub struct WalArchiveTimelineBranch {
     pub timeline: WalArchiveTimeline,
     pub manifest: WalArchiveManifest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalArchiveTimelineRegistryEntry {
+    pub timeline_id: String,
+    pub parent_timeline_id: Option<String>,
+    pub fork_txn_id: TxnId,
+    pub fork_timestamp_micros: Option<u64>,
+    pub timeline_path: PathBuf,
+    pub branch_manifest_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalArchiveTimelineRegistry {
+    pub timelines: Vec<WalArchiveTimelineRegistryEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -936,6 +952,202 @@ pub fn read_wal_archive_timeline(
     validate_timeline_path(path, "source_manifest_path", &timeline.source_manifest_path)?;
     validate_timeline_path(path, "branch_manifest_path", &timeline.branch_manifest_path)?;
     Ok(timeline)
+}
+
+pub fn register_wal_archive_timeline(
+    registry_path: impl AsRef<Path>,
+    timeline_path: impl AsRef<Path>,
+) -> Result<WalArchiveTimelineRegistry, EngineError> {
+    let registry_path = registry_path.as_ref();
+    let timeline_path = timeline_path.as_ref();
+    let timeline = read_wal_archive_timeline(timeline_path)?;
+    let mut registry = if registry_path.exists() {
+        read_wal_archive_timeline_registry(registry_path)?
+    } else {
+        WalArchiveTimelineRegistry {
+            timelines: Vec::new(),
+        }
+    };
+    if registry
+        .timelines
+        .iter()
+        .any(|entry| entry.timeline_id == timeline.timeline_id)
+    {
+        return Err(EngineError::Durability(format!(
+            "WAL archive timeline registry {} already contains timeline {}",
+            registry_path.display(),
+            timeline.timeline_id
+        )));
+    }
+    if let Some(parent) = timeline.parent_timeline_id.as_ref() {
+        if !registry
+            .timelines
+            .iter()
+            .any(|entry| &entry.timeline_id == parent)
+        {
+            return Err(EngineError::Durability(format!(
+                "WAL archive timeline registry {} is missing parent timeline {} for child {}",
+                registry_path.display(),
+                parent,
+                timeline.timeline_id
+            )));
+        }
+    }
+
+    let (_manifest, _records) = read_wal_archive(&timeline.branch_manifest_path)?;
+    registry.timelines.push(WalArchiveTimelineRegistryEntry {
+        timeline_id: timeline.timeline_id,
+        parent_timeline_id: timeline.parent_timeline_id,
+        fork_txn_id: timeline.fork_txn_id,
+        fork_timestamp_micros: timeline.fork_timestamp_micros,
+        timeline_path: timeline_path.to_path_buf(),
+        branch_manifest_path: timeline.branch_manifest_path,
+    });
+    write_wal_archive_timeline_registry(registry_path, &registry)?;
+    read_wal_archive_timeline_registry(registry_path)
+}
+
+pub fn write_wal_archive_timeline_registry(
+    path: impl AsRef<Path>,
+    registry: &WalArchiveTimelineRegistry,
+) -> Result<(), EngineError> {
+    let path = path.as_ref();
+    validate_timeline_registry_shape(path, registry)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            EngineError::Durability(format!(
+                "failed to create WAL archive timeline registry directory {}: {err}",
+                parent.display()
+            ))
+        })?;
+    }
+
+    let mut body = format!(
+        "{WAL_ARCHIVE_TIMELINE_REGISTRY_MAGIC}\ntimeline_count={}\n",
+        registry.timelines.len()
+    );
+    for entry in &registry.timelines {
+        body.push_str(&format!(
+            "timeline={}|{}|{}|{}|{}|{}\n",
+            entry.timeline_id,
+            entry.parent_timeline_id.as_deref().unwrap_or("none"),
+            entry.fork_txn_id,
+            format_optional_u64(entry.fork_timestamp_micros),
+            entry.timeline_path.display(),
+            entry.branch_manifest_path.display()
+        ));
+    }
+
+    let tmp_path = temporary_control_path(path);
+    let write_result = (|| {
+        let mut file = File::create(&tmp_path).map_err(|err| {
+            EngineError::Durability(format!(
+                "failed to create WAL archive timeline registry {}: {err}",
+                tmp_path.display()
+            ))
+        })?;
+        file.write_all(body.as_bytes()).map_err(|err| {
+            EngineError::Durability(format!(
+                "failed to write WAL archive timeline registry {}: {err}",
+                tmp_path.display()
+            ))
+        })?;
+        file.sync_all().map_err(|err| {
+            EngineError::Durability(format!(
+                "failed to sync WAL archive timeline registry {}: {err}",
+                tmp_path.display()
+            ))
+        })?;
+        Ok::<_, EngineError>(())
+    })();
+
+    if let Err(err) = write_result {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+
+    fs::rename(&tmp_path, path).map_err(|err| {
+        let _ = fs::remove_file(&tmp_path);
+        EngineError::Durability(format!(
+            "failed to install WAL archive timeline registry {}: {err}",
+            path.display()
+        ))
+    })
+}
+
+pub fn read_wal_archive_timeline_registry(
+    path: impl AsRef<Path>,
+) -> Result<WalArchiveTimelineRegistry, EngineError> {
+    let path = path.as_ref();
+    let body = fs::read_to_string(path).map_err(|err| {
+        EngineError::Durability(format!(
+            "failed to read WAL archive timeline registry {}: {err}",
+            path.display()
+        ))
+    })?;
+    let mut lines = body.lines();
+    if lines.next() != Some(WAL_ARCHIVE_TIMELINE_REGISTRY_MAGIC) {
+        return Err(EngineError::Durability(format!(
+            "invalid WAL archive timeline registry header {}",
+            path.display()
+        )));
+    }
+    let expected_count: usize = parse_control_value(lines.next(), "timeline_count", path)?
+        .parse()
+        .map_err(|err| {
+            EngineError::Durability(format!(
+                "invalid WAL archive timeline registry count {}: {err}",
+                path.display()
+            ))
+        })?;
+    let mut timelines = Vec::new();
+    for line in lines {
+        let raw = line.strip_prefix("timeline=").ok_or_else(|| {
+            EngineError::Durability(format!(
+                "invalid WAL archive timeline registry entry in {}",
+                path.display()
+            ))
+        })?;
+        let parts: Vec<&str> = raw.split('|').collect();
+        if parts.len() != 6 {
+            return Err(EngineError::Durability(format!(
+                "invalid WAL archive timeline registry entry in {}",
+                path.display()
+            )));
+        }
+        let parent_timeline_id = match parts[1] {
+            "none" => None,
+            parent => Some(parent.to_string()),
+        };
+        let entry = WalArchiveTimelineRegistryEntry {
+            timeline_id: parts[0].to_string(),
+            parent_timeline_id,
+            fork_txn_id: parts[2].parse().map_err(|err| {
+                EngineError::Durability(format!(
+                    "invalid WAL archive timeline registry fork transaction {}: {err}",
+                    path.display()
+                ))
+            })?,
+            fork_timestamp_micros: parse_optional_u64(
+                parts[3],
+                "timeline registry fork timestamp",
+                path,
+            )?,
+            timeline_path: PathBuf::from(parts[4]),
+            branch_manifest_path: PathBuf::from(parts[5]),
+        };
+        timelines.push(entry);
+    }
+    let registry = WalArchiveTimelineRegistry { timelines };
+    if registry.timelines.len() != expected_count {
+        return Err(EngineError::Durability(format!(
+            "WAL archive timeline registry {} expected {expected_count} timelines but found {}",
+            path.display(),
+            registry.timelines.len()
+        )));
+    }
+    validate_timeline_registry_shape(path, &registry)?;
+    Ok(registry)
 }
 
 pub fn write_wal_archive_object_backup_manifest(
@@ -2359,11 +2571,52 @@ fn validate_timeline_value(path: &Path, field: &str, value: &str) -> Result<(), 
 
 fn validate_timeline_path(path: &Path, field: &str, value: &Path) -> Result<(), EngineError> {
     let rendered = value.to_string_lossy();
-    if rendered.is_empty() || rendered.contains('\n') || rendered.contains('\r') {
+    if rendered.is_empty()
+        || rendered.contains('\n')
+        || rendered.contains('\r')
+        || rendered.contains('|')
+    {
         return Err(EngineError::Durability(format!(
             "WAL archive timeline {field} contains unsupported path in {}",
             path.display()
         )));
+    }
+    Ok(())
+}
+
+fn validate_timeline_registry_shape(
+    path: &Path,
+    registry: &WalArchiveTimelineRegistry,
+) -> Result<(), EngineError> {
+    let mut seen = HashSet::new();
+    for entry in &registry.timelines {
+        validate_timeline_value(path, "timeline_id", &entry.timeline_id)?;
+        if !seen.insert(entry.timeline_id.clone()) {
+            return Err(EngineError::Durability(format!(
+                "WAL archive timeline registry {} contains duplicate timeline {}",
+                path.display(),
+                entry.timeline_id
+            )));
+        }
+        if let Some(parent) = entry.parent_timeline_id.as_ref() {
+            validate_timeline_value(path, "parent_timeline_id", parent)?;
+            if parent == &entry.timeline_id {
+                return Err(EngineError::Durability(format!(
+                    "WAL archive timeline {} cannot be its own parent",
+                    entry.timeline_id
+                )));
+            }
+            if !seen.contains(parent) {
+                return Err(EngineError::Durability(format!(
+                    "WAL archive timeline registry {} lists child {} before parent {}",
+                    path.display(),
+                    entry.timeline_id,
+                    parent
+                )));
+            }
+        }
+        validate_timeline_path(path, "timeline_path", &entry.timeline_path)?;
+        validate_timeline_path(path, "branch_manifest_path", &entry.branch_manifest_path)?;
     }
     Ok(())
 }
@@ -3796,6 +4049,106 @@ mod tests {
         assert_eq!(branch.manifest.record_timestamps.len(), 2);
         assert_eq!(branch_records.len(), 2);
         assert_eq!(branch.timeline, timeline);
+    }
+
+    #[test]
+    fn wal_archive_timeline_registry_requires_parent_before_child_and_unique_ids() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpu-db-wal-archive-timeline-registry-{}-{}",
+            std::process::id(),
+            NEXT_TEST_PATH_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let source_manifest = dir.join("source").join("MANIFEST");
+        let source_segments = dir.join("source").join("segments");
+        let root_timeline_path = dir.join("source").join("TIMELINE");
+        let branch_manifest = dir.join("branch").join("MANIFEST");
+        let branch_segments = dir.join("branch").join("segments");
+        let branch_timeline_path = dir.join("branch").join("TIMELINE");
+        let missing_parent_branch_manifest = dir.join("missing-parent").join("MANIFEST");
+        let missing_parent_branch_segments = dir.join("missing-parent").join("segments");
+        let missing_parent_timeline_path = dir.join("missing-parent").join("TIMELINE");
+        let registry_path = dir.join("TIMELINE_REGISTRY");
+        let records = vec![
+            WalRecord {
+                txn_id: 1,
+                payload: b"CREATE TABLE people (id INT, name TEXT)".to_vec(),
+            },
+            WalRecord {
+                txn_id: 2,
+                payload: b"INSERT INTO people (id, name) VALUES (1, 'Ada')".to_vec(),
+            },
+            WalRecord {
+                txn_id: 3,
+                payload: b"INSERT INTO people (id, name) VALUES (2, 'Grace')".to_vec(),
+            },
+        ];
+        write_wal_archive(&source_manifest, &source_segments, &records, 1).unwrap();
+        write_wal_archive_timeline(
+            &root_timeline_path,
+            &WalArchiveTimeline {
+                timeline_id: "timeline-0001".to_string(),
+                parent_timeline_id: None,
+                fork_txn_id: 0,
+                fork_timestamp_micros: None,
+                source_manifest_path: source_manifest.clone(),
+                branch_manifest_path: source_manifest.clone(),
+            },
+        )
+        .unwrap();
+        fork_wal_archive_timeline_to_txn(
+            &source_manifest,
+            &branch_manifest,
+            &branch_segments,
+            &branch_timeline_path,
+            "timeline-0002",
+            Some("timeline-0001"),
+            2,
+        )
+        .unwrap();
+        fork_wal_archive_timeline_to_txn(
+            &source_manifest,
+            &missing_parent_branch_manifest,
+            &missing_parent_branch_segments,
+            &missing_parent_timeline_path,
+            "timeline-0003",
+            Some("timeline-missing"),
+            2,
+        )
+        .unwrap();
+
+        let missing_parent_err =
+            register_wal_archive_timeline(&registry_path, &missing_parent_timeline_path)
+                .unwrap_err();
+        assert!(missing_parent_err
+            .to_string()
+            .contains("missing parent timeline timeline-missing"));
+        assert!(!registry_path.exists());
+
+        let root_registry =
+            register_wal_archive_timeline(&registry_path, &root_timeline_path).unwrap();
+        assert_eq!(root_registry.timelines.len(), 1);
+        assert_eq!(root_registry.timelines[0].timeline_id, "timeline-0001");
+
+        let registry =
+            register_wal_archive_timeline(&registry_path, &branch_timeline_path).unwrap();
+        assert_eq!(registry.timelines.len(), 2);
+        assert_eq!(registry.timelines[1].timeline_id, "timeline-0002");
+        assert_eq!(
+            registry.timelines[1].parent_timeline_id.as_deref(),
+            Some("timeline-0001")
+        );
+        assert_eq!(registry.timelines[1].fork_txn_id, 2);
+
+        let before_registry = fs::read_to_string(&registry_path).unwrap();
+        let duplicate_err =
+            register_wal_archive_timeline(&registry_path, &branch_timeline_path).unwrap_err();
+        let after_registry = fs::read_to_string(&registry_path).unwrap();
+        let _ = fs::remove_dir_all(dir);
+
+        assert!(duplicate_err
+            .to_string()
+            .contains("already contains timeline timeline-0002"));
+        assert_eq!(after_registry, before_registry);
     }
 
     #[test]
