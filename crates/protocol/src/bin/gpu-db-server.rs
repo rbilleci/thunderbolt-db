@@ -1351,6 +1351,7 @@ struct CopyInState {
     columns: Vec<String>,
     format: CopyFormat,
     header: bool,
+    delimiter: char,
     pending_text: String,
     pending_rows: Vec<Vec<SqlValue>>,
     seen_terminator: bool,
@@ -1366,22 +1367,26 @@ enum CopyFormat {
 struct CopyOptions {
     format: CopyFormat,
     header: bool,
+    delimiter: char,
 }
 
 impl CopyOptions {
     const TEXT: Self = Self {
         format: CopyFormat::Text,
         header: false,
+        delimiter: '\t',
     };
 
     const CSV: Self = Self {
         format: CopyFormat::Csv,
         header: false,
+        delimiter: ',',
     };
 
     const CSV_HEADER: Self = Self {
         format: CopyFormat::Csv,
         header: true,
+        delimiter: ',',
     };
 }
 
@@ -4055,17 +4060,8 @@ fn is_copy_statement(statement: &str) -> bool {
 fn parse_copy_to_stdout_table(statement: &str) -> Option<(String, CopyOptions)> {
     let statement = strip_leading_sql_comments(statement.trim())?;
     let canonical = canonical_sql(statement);
-    let mut target = canonical.strip_prefix("copy ")?.trim();
-    let options = if let Some(before_options) = target.strip_suffix(" to stdout with csv header") {
-        target = before_options.trim();
-        CopyOptions::CSV_HEADER
-    } else if let Some(before_options) = target.strip_suffix(" to stdout with csv") {
-        target = before_options.trim();
-        CopyOptions::CSV
-    } else {
-        target = target.strip_suffix(" to stdout")?.trim();
-        CopyOptions::TEXT
-    };
+    let target = canonical.strip_prefix("copy ")?.trim();
+    let (target, options) = parse_copy_target_and_options(target, "to stdout")?;
     let table = if let Some(open) = target.find('(') {
         let close = target.rfind(')')?;
         if close <= open || !target[close + 1..].trim().is_empty() {
@@ -4102,17 +4098,8 @@ fn parse_copy_to_stdout_table(statement: &str) -> Option<(String, CopyOptions)> 
 fn parse_copy_from_stdin(statement: &str) -> Option<(String, Option<Vec<String>>, CopyOptions)> {
     let statement = strip_leading_sql_comments(statement.trim())?;
     let canonical = canonical_sql(statement);
-    let mut target = canonical.strip_prefix("copy ")?.trim();
-    let options = if let Some(before_options) = target.strip_suffix(" from stdin with csv header") {
-        target = before_options.trim();
-        CopyOptions::CSV_HEADER
-    } else if let Some(before_options) = target.strip_suffix(" from stdin with csv") {
-        target = before_options.trim();
-        CopyOptions::CSV
-    } else {
-        target = target.strip_suffix(" from stdin")?.trim();
-        CopyOptions::TEXT
-    };
+    let target = canonical.strip_prefix("copy ")?.trim();
+    let (target, options) = parse_copy_target_and_options(target, "from stdin")?;
     let (table, columns) = if let Some(open) = target.find('(') {
         let close = target.rfind(')')?;
         if close <= open || !target[close + 1..].trim().is_empty() {
@@ -4143,6 +4130,75 @@ fn parse_copy_from_stdin(statement: &str) -> Option<(String, Option<Vec<String>>
         columns,
         options,
     ))
+}
+
+fn parse_copy_target_and_options<'a>(
+    target: &'a str,
+    direction: &str,
+) -> Option<(&'a str, CopyOptions)> {
+    let marker = format!(" {direction}");
+    let direction_idx = target.rfind(&marker)?;
+    let table = target[..direction_idx].trim();
+    let after_direction = target[direction_idx + marker.len()..].trim();
+    if after_direction.is_empty() {
+        return Some((table, CopyOptions::TEXT));
+    }
+    let options = after_direction.strip_prefix("with ")?.trim();
+    parse_copy_options(options).map(|options| (table, options))
+}
+
+fn parse_copy_options(options: &str) -> Option<CopyOptions> {
+    if options == "csv" {
+        return Some(CopyOptions::CSV);
+    }
+    if options == "csv header" {
+        return Some(CopyOptions::CSV_HEADER);
+    }
+
+    let parenthesized = parenthesized_list(options)?;
+    let mut format = None;
+    let mut header = false;
+    let mut delimiter = ',';
+
+    for part in split_sql_csv(parenthesized)? {
+        let part = part.trim();
+        let normalized = canonical_sql(part).replace(" = ", " ");
+        if normalized == "format csv" {
+            format = Some(CopyFormat::Csv);
+        } else if normalized == "header" || normalized == "header true" || normalized == "header on"
+        {
+            header = true;
+        } else if normalized == "header false" || normalized == "header off" {
+            header = false;
+        } else if canonical_sql(part).strip_prefix("delimiter ").is_some() {
+            let rest_start = sql_keyword_rest_start(part, "delimiter")?;
+            let raw_value = part[rest_start..]
+                .trim()
+                .strip_prefix('=')
+                .unwrap_or(part[rest_start..].trim())
+                .trim();
+            let decoded = decode_sql_execute_string_literal(raw_value)?;
+            let mut chars = decoded.chars();
+            delimiter = chars.next()?;
+            if chars.next().is_some() {
+                return None;
+            }
+            if matches!(delimiter, '"' | '\n' | '\r') {
+                return None;
+            }
+        } else {
+            return None;
+        }
+    }
+
+    match format {
+        Some(CopyFormat::Csv) => Some(CopyOptions {
+            format: CopyFormat::Csv,
+            header,
+            delimiter,
+        }),
+        _ => None,
+    }
 }
 
 fn is_simple_copy_table_name(table: &str) -> bool {
@@ -4213,9 +4269,9 @@ fn copy_text_value(value: &SqlValue) -> String {
         .replace('\r', r"\r")
 }
 
-fn copy_csv_value(value: &SqlValue) -> String {
+fn copy_csv_value(value: &SqlValue, delimiter: char) -> String {
     let text = format_sql_value(value);
-    if text.contains([',', '"', '\n', '\r']) {
+    if text.contains([delimiter, '"', '\n', '\r']) {
         format!("\"{}\"", text.replace('"', "\"\""))
     } else {
         text
@@ -4279,7 +4335,7 @@ struct CopyCsvField {
     quoted: bool,
 }
 
-fn parse_copy_csv_row(line: &str) -> Result<Vec<CopyCsvField>, ErrorField> {
+fn parse_copy_csv_row(line: &str, delimiter: char) -> Result<Vec<CopyCsvField>, ErrorField> {
     let mut fields = Vec::new();
     let mut field = String::new();
     let mut chars = line.chars().peekable();
@@ -4308,7 +4364,7 @@ fn parse_copy_csv_row(line: &str) -> Result<Vec<CopyCsvField>, ErrorField> {
                 quoted = true;
                 in_quotes = true;
             }
-            ',' => {
+            _ if ch == delimiter => {
                 fields.push(CopyCsvField {
                     text: std::mem::take(&mut field),
                     quoted,
@@ -4383,9 +4439,12 @@ fn execute_copy_to_stdout(
         let mut payload = String::new();
         for (idx, column) in table.columns.iter().enumerate() {
             if idx > 0 {
-                payload.push(',');
+                payload.push(options.delimiter);
             }
-            payload.push_str(&copy_csv_value(&SqlValue::Text(column.def.name.clone())));
+            payload.push_str(&copy_csv_value(
+                &SqlValue::Text(column.def.name.clone()),
+                options.delimiter,
+            ));
         }
         payload.push('\n');
         write_copy_data(stream, payload.as_bytes())?;
@@ -4396,12 +4455,12 @@ fn execute_copy_to_stdout(
             if idx > 0 {
                 payload.push(match options.format {
                     CopyFormat::Text => '\t',
-                    CopyFormat::Csv => ',',
+                    CopyFormat::Csv => options.delimiter,
                 });
             }
             match options.format {
                 CopyFormat::Text => payload.push_str(&copy_text_value(value)),
-                CopyFormat::Csv => payload.push_str(&copy_csv_value(value)),
+                CopyFormat::Csv => payload.push_str(&copy_csv_value(value, options.delimiter)),
             }
         }
         payload.push('\n');
@@ -4466,6 +4525,7 @@ fn begin_copy_from_stdin(
         columns,
         format: options.format,
         header: options.header,
+        delimiter: options.delimiter,
         pending_text: String::new(),
         pending_rows: Vec::new(),
         seen_terminator: false,
@@ -4504,9 +4564,10 @@ fn handle_copy_data(session: &mut Session, bytes: &[u8]) -> Option<ErrorField> {
             copy.header = false;
             continue;
         }
-        if let Some(error) = parse_copy_row(table, &copy.columns, copy.format, &line)
-            .map(|row| copy.pending_rows.push(row))
-            .err()
+        if let Some(error) =
+            parse_copy_row(table, &copy.columns, copy.format, copy.delimiter, &line)
+                .map(|row| copy.pending_rows.push(row))
+                .err()
         {
             return Some(error);
         }
@@ -4550,6 +4611,7 @@ fn parse_copy_row(
     table: &Table,
     columns: &[String],
     format: CopyFormat,
+    delimiter: char,
     line: &str,
 ) -> Result<Vec<SqlValue>, ErrorField> {
     let mut row = Vec::with_capacity(columns.len());
@@ -4577,7 +4639,7 @@ fn parse_copy_row(
             }
         }
         CopyFormat::Csv => {
-            let fields = parse_copy_csv_row(line)?;
+            let fields = parse_copy_csv_row(line, delimiter)?;
             if fields.len() != columns.len() {
                 return Err(ErrorField {
                     code: "22P04",
@@ -10659,9 +10721,26 @@ mod tests {
             parse_copy_to_stdout_table("COPY people TO STDOUT WITH CSV HEADER"),
             Some(("people".to_string(), CopyOptions::CSV_HEADER))
         );
+        assert_eq!(
+            parse_copy_to_stdout_table(
+                "COPY people TO STDOUT WITH (FORMAT csv, HEADER, DELIMITER '|')"
+            ),
+            Some((
+                "people".to_string(),
+                CopyOptions {
+                    format: CopyFormat::Csv,
+                    header: true,
+                    delimiter: '|'
+                }
+            ))
+        );
         assert_eq!(parse_copy_to_stdout_table("COPY people FROM STDIN"), None);
         assert_eq!(
             parse_copy_to_stdout_table("COPY (SELECT * FROM people) TO STDOUT"),
+            None
+        );
+        assert_eq!(
+            parse_copy_to_stdout_table("COPY people TO STDOUT WITH (FORMAT csv, NULL '')"),
             None
         );
     }
@@ -10700,9 +10779,27 @@ mod tests {
                 CopyOptions::CSV_HEADER
             ))
         );
+        assert_eq!(
+            parse_copy_from_stdin(
+                "COPY public.people (id, name) FROM STDIN WITH (FORMAT csv, HEADER true, DELIMITER '|')"
+            ),
+            Some((
+                "people".to_string(),
+                Some(vec!["id".to_string(), "name".to_string()]),
+                CopyOptions {
+                    format: CopyFormat::Csv,
+                    header: true,
+                    delimiter: '|'
+                }
+            ))
+        );
         assert_eq!(parse_copy_from_stdin("COPY people TO STDOUT"), None);
         assert_eq!(
             parse_copy_from_stdin("COPY (SELECT * FROM people) FROM STDIN"),
+            None
+        );
+        assert_eq!(
+            parse_copy_from_stdin("COPY people FROM STDIN WITH (FORMAT csv, QUOTE '''')"),
             None
         );
     }
@@ -10919,6 +11016,69 @@ mod tests {
     }
 
     #[test]
+    fn simple_copy_to_stdout_with_parenthesized_csv_delimiter_recovers() {
+        let mut session = Session::default();
+        session.tables.insert(
+            "people".to_string(),
+            Table {
+                oid: FIRST_USER_RELATION_OID,
+                name: "people".to_string(),
+                columns: vec![
+                    CatalogColumn {
+                        attnum: 1,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "id".to_string(),
+                            ty: SqlType::Int4,
+                        },
+                    },
+                    CatalogColumn {
+                        attnum: 2,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "full_name".to_string(),
+                            ty: SqlType::Text,
+                        },
+                    },
+                ],
+                rows: vec![
+                    vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())],
+                    vec![
+                        SqlValue::Int4(2),
+                        SqlValue::Text("Grace|Hopper".to_string()),
+                    ],
+                ],
+            },
+        );
+        let (mut writer, mut reader) = tcp_pair();
+
+        execute_statement(
+            &mut writer,
+            &mut session,
+            "COPY people TO STDOUT WITH (FORMAT csv, HEADER, DELIMITER '|')",
+            true,
+        )
+        .unwrap();
+
+        let messages = read_backend_messages(&mut reader, 6);
+        assert_eq!(
+            messages.iter().map(|(tag, _)| *tag).collect::<Vec<_>>(),
+            vec![b'H', b'd', b'd', b'd', b'c', b'C']
+        );
+        assert_eq!(messages[1].1, b"id|full_name\n");
+        assert_eq!(messages[2].1, b"1|Ada\n");
+        assert_eq!(messages[3].1, b"2|\"Grace|Hopper\"\n");
+        assert_eq!(messages[5].1, b"COPY 2\0");
+
+        execute_statement(
+            &mut writer,
+            &mut session,
+            "SELECT full_name FROM people WHERE id = 2",
+            true,
+        )
+        .unwrap();
+        assert_eq!(read_backend_tags(&mut reader, 3), vec![b'T', b'D', b'C']);
+    }
+
+    #[test]
     fn simple_copy_from_stdin_accepts_data_done_and_recovers() {
         let mut session = Session::default();
         session.tables.insert(
@@ -10982,6 +11142,87 @@ mod tests {
                 vec![
                     SqlValue::Int4(2),
                     SqlValue::Text("Grace\tHopper".to_string())
+                ],
+            ]
+        );
+
+        assert!(handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::SimpleQuery("SELECT name FROM people WHERE id = 2".to_string())
+        )
+        .unwrap());
+        assert_eq!(
+            read_backend_tags(&mut reader, 4),
+            vec![b'T', b'D', b'C', b'Z']
+        );
+    }
+
+    #[test]
+    fn simple_copy_from_stdin_with_parenthesized_csv_delimiter_recovers() {
+        let mut session = Session::default();
+        session.tables.insert(
+            "people".to_string(),
+            Table {
+                oid: FIRST_USER_RELATION_OID,
+                name: "people".to_string(),
+                columns: vec![
+                    CatalogColumn {
+                        attnum: 1,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "id".to_string(),
+                            ty: SqlType::Int4,
+                        },
+                    },
+                    CatalogColumn {
+                        attnum: 2,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "name".to_string(),
+                            ty: SqlType::Text,
+                        },
+                    },
+                ],
+                rows: Vec::new(),
+            },
+        );
+        let mut extended_error_pending = false;
+        let (mut writer, mut reader) = tcp_pair();
+
+        assert!(handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::SimpleQuery(
+                "COPY people FROM STDIN WITH (FORMAT csv, HEADER, DELIMITER '|')".to_string()
+            )
+        )
+        .unwrap());
+        let messages = read_backend_messages(&mut reader, 1);
+        assert_eq!(messages[0].0, b'G');
+
+        assert!(handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::CopyData(b"id|name\n1|Ada\n2|\"Grace|Hopper\"\n".to_vec())
+        )
+        .unwrap());
+        assert!(handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::CopyDone
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 2), vec![b'C', b'Z']);
+        assert_eq!(
+            session.tables["people"].rows,
+            vec![
+                vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())],
+                vec![
+                    SqlValue::Int4(2),
+                    SqlValue::Text("Grace|Hopper".to_string())
                 ],
             ]
         );

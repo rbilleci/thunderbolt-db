@@ -1,0 +1,18 @@
+=== psql copy csv parenthesized delimiter import export recovery ===
+CREATE TABLE
+COPY 3
+ id |      name
+----+----------------
+  1 | Ada
+  2 | Grace|Hopper
+  3 | Comma, Literal
+(3 rows)
+
+id|name
+1|Ada
+2|"Grace|Hopper"
+3|Comma, Literal
+     name
+--------------
+ Grace|Hopper
+(1 row)
