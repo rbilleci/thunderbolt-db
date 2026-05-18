@@ -1,0 +1,26 @@
+services:
+  follower-a:
+    image: ${GPU_DB_REPLICATION_SERVICE_IMAGE:-gpu-db-replication-service-smoke:local}
+    command:
+      - --follower-service
+      - --id
+      - "2"
+      - --expected-requests
+      - "2"
+      - --listen
+      - 0.0.0.0:55432
+    ports:
+      - "127.0.0.1::55432"
+
+  follower-b:
+    image: ${GPU_DB_REPLICATION_SERVICE_IMAGE:-gpu-db-replication-service-smoke:local}
+    command:
+      - --follower-service
+      - --id
+      - "3"
+      - --expected-requests
+      - "4"
+      - --listen
+      - 0.0.0.0:55432
+    ports:
+      - "127.0.0.1::55432"
