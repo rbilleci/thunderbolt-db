@@ -1348,6 +1348,60 @@ fn drop_column_from_session(
     Ok(())
 }
 
+fn rename_column_in_session(
+    session: &mut Session,
+    table_name: &str,
+    old_name: &str,
+    new_name: &str,
+) -> Result<(), ErrorField> {
+    if session.views.contains_key(table_name) {
+        return Err(ErrorField {
+            code: "42809",
+            message: "relation is not a table",
+            position: None,
+        });
+    }
+    let Some(table) = session.tables.get_mut(table_name) else {
+        return Err(ErrorField {
+            code: "42P01",
+            message: "relation does not exist",
+            position: None,
+        });
+    };
+    let Some(column_idx) = table
+        .columns
+        .iter()
+        .position(|column| column.def.name == old_name)
+    else {
+        return Err(ErrorField {
+            code: "42703",
+            message: "column does not exist",
+            position: None,
+        });
+    };
+    if table
+        .columns
+        .iter()
+        .any(|column| column.def.name == new_name)
+    {
+        return Err(ErrorField {
+            code: "42701",
+            message: "column already exists",
+            position: None,
+        });
+    }
+    table.columns[column_idx].def.name = new_name.to_string();
+    for index in &mut session.indexes {
+        if index.table == table_name && index.column == old_name {
+            index.column = new_name.to_string();
+            session.dirty_indexes = true;
+        }
+    }
+    session.mark_table_dirty(table_name.to_string());
+    session.persist_catalog_snapshot();
+    Ok(())
+}
+
 fn shared_catalog_contains_table(table: &str) -> bool {
     shared_catalog()
         .lock()
@@ -6573,6 +6627,17 @@ fn execute_statement(
                 }
                 session.mark_table_dirty(add.table);
                 session.persist_catalog_snapshot();
+                return write_command_complete(stream, "ALTER TABLE");
+            }
+            Command::RenameColumn(rename) => {
+                if let Err(error) = rename_column_in_session(
+                    session,
+                    &rename.table,
+                    &rename.old_name,
+                    &rename.new_name,
+                ) {
+                    return write_error(stream, &error);
+                }
                 return write_command_complete(stream, "ALTER TABLE");
             }
             Command::DropColumn(drop) => {

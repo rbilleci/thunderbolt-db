@@ -1,0 +1,58 @@
+=== bounded rename column ===
+CREATE TABLE
+INSERT 0 2
+COMMENT
+                                       Table "public.rename_column_people"
+ Column |  Type   | Collation | Nullable |     Default     | Storage  | Compression | Stats target | Description
+--------+---------+-----------+----------+-----------------+----------+-------------+--------------+--------------
+ id     | integer |           |          |                 | plain    |             |              |
+ name   | text    |           |          | 'unknown'::text | extended |             |              | display name
+Indexes:
+    "rename_column_people_pkey" PRIMARY KEY, btree (id)
+Access method: heap
+
+ALTER TABLE
+ALTER TABLE
+INSERT 0 1
+ person_id | display_name
+-----------+--------------
+         1 | Ada
+         2 | Linus
+         3 | unknown
+(3 rows)
+
+ person_id | display_name
+-----------+--------------
+         2 | Linus
+(1 row)
+
+ column_name  | data_type | is_nullable | column_default
+--------------+-----------+-------------+-----------------
+ person_id    | integer   | YES         |
+ display_name | text      | YES         | 'unknown'::text
+(2 rows)
+
+ nspname |       relname        |   attname    |  default_expr
+---------+----------------------+--------------+-----------------
+ public  | rename_column_people | display_name | 'unknown'::text
+(1 row)
+
+                                          Table "public.rename_column_people"
+    Column    |  Type   | Collation | Nullable |     Default     | Storage  | Compression | Stats target | Description
+--------------+---------+-----------+----------+-----------------+----------+-------------+--------------+--------------
+ person_id    | integer |           |          |                 | plain    |             |              |
+ display_name | text    |           |          | 'unknown'::text | extended |             |              | display name
+Indexes:
+    "rename_column_people_pkey" PRIMARY KEY, btree (person_id)
+Access method: heap
+
+psql:321_protocol_psql_rename_columns.sql:23: ERROR:  column already exists
+psql:321_protocol_psql_rename_columns.sql:24: ERROR:  column does not exist
+CREATE VIEW
+psql:321_protocol_psql_rename_columns.sql:26: ERROR:  relation is not a table
+ person_id | display_name
+-----------+--------------
+         1 | Ada
+         2 | Linus
+         3 | unknown
+(3 rows)
