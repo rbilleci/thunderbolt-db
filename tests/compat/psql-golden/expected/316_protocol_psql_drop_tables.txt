@@ -1,0 +1,53 @@
+=== bounded SQL table drops ===
+CREATE TABLE
+CREATE TABLE
+INSERT 0 2
+CREATE INDEX
+COMMENT
+COMMENT
+COMMENT
+COMMENT
+               List of relations
+ Schema |       Name        | Type  |  Owner
+--------+-------------------+-------+----------
+ public | drop_table_people | table | postgres
+ public | drop_table_teams  | table | postgres
+(2 rows)
+
+                                     Table "public.drop_table_people"
+ Column |  Type   | Collation | Nullable | Default | Storage  | Compression | Stats target | Description
+--------+---------+-----------+----------+---------+----------+-------------+--------------+--------------
+ id     | integer |           |          |         | plain    |             |              |
+ name   | text    |           |          |         | extended |             |              | display name
+Indexes:
+    "drop_table_people_name_idx" btree (name)
+    "drop_table_people_name_key" UNIQUE CONSTRAINT, btree (name)
+    "drop_table_people_pkey" PRIMARY KEY, btree (id)
+Access method: heap
+
+DROP TABLE
+              List of relations
+ Schema |       Name       | Type  |  Owner
+--------+------------------+-------+----------
+ public | drop_table_teams | table | postgres
+(1 row)
+
+         Object descriptions
+ Schema | Name | Object | Description
+--------+------+--------+-------------
+(0 rows)
+
+psql:316_protocol_psql_drop_tables.sql:15: ERROR:  relation does not exist
+psql:316_protocol_psql_drop_tables.sql:16: ERROR:  relation does not exist
+DROP TABLE
+CREATE VIEW
+psql:316_protocol_psql_drop_tables.sql:19: ERROR:  relation is not a table
+ id | name
+----+------
+(0 rows)
+
+psql:316_protocol_psql_drop_tables.sql:21: ERROR:  query shape is not supported by the compatibility stub
+psql:316_protocol_psql_drop_tables.sql:22: ERROR:  query shape is not supported by the compatibility stub
+ id | name
+----+------
+(0 rows)

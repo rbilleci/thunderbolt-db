@@ -5422,6 +5422,16 @@ fn execute_statement(
         return write_command_complete(stream, "TRUNCATE TABLE");
     }
     if let Some(drop) = parse_drop_table(statement) {
+        if session.views.contains_key(&drop.table) {
+            return write_error(
+                stream,
+                &ErrorField {
+                    code: "42809",
+                    message: "relation is not a table",
+                    position: None,
+                },
+            );
+        }
         if session.tables.remove(&drop.table).is_none() && !drop.if_exists {
             return write_error(
                 stream,
@@ -6161,6 +6171,62 @@ fn execute_statement(
                 session.mark_view_dirty(drop.name);
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, "DROP VIEW");
+            }
+            Command::DropTable(drop) => {
+                if session.views.contains_key(&drop.name) {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "42809",
+                            message: "relation is not a table",
+                            position: None,
+                        },
+                    );
+                }
+                if session.tables.remove(&drop.name).is_none() && !drop.if_exists {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "42P01",
+                            message: "relation does not exist",
+                            position: None,
+                        },
+                    );
+                }
+                let old_index_count = session.indexes.len();
+                let dropped_index_names = session
+                    .indexes
+                    .iter()
+                    .filter(|index| index.table == drop.name)
+                    .map(|index| index.name.clone())
+                    .collect::<BTreeSet<_>>();
+                session.indexes.retain(|index| index.table != drop.name);
+                session.dirty_indexes |= session.indexes.len() != old_index_count;
+                let dropped_comment_targets = session
+                    .comments
+                    .keys()
+                    .filter(|target| match target {
+                        CatalogCommentTarget::Table { table }
+                        | CatalogCommentTarget::Column { table, .. }
+                        | CatalogCommentTarget::Constraint { table, .. } => table == &drop.name,
+                        CatalogCommentTarget::Index { index } => {
+                            dropped_index_names.contains(index)
+                        }
+                        CatalogCommentTarget::Database { .. }
+                        | CatalogCommentTarget::Role { .. }
+                        | CatalogCommentTarget::Schema { .. }
+                        | CatalogCommentTarget::Tablespace { .. }
+                        | CatalogCommentTarget::View { .. } => false,
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for target in dropped_comment_targets {
+                    session.comments.remove(&target);
+                    session.mark_comment_dirty(target);
+                }
+                session.mark_table_dirty(drop.name);
+                session.persist_catalog_snapshot();
+                return write_command_complete(stream, "DROP TABLE");
             }
             Command::DropIndex(drop) => {
                 let old_index_count = session.indexes.len();
@@ -13313,6 +13379,81 @@ mod tests {
             .lock()
             .expect("shared catalog mutex poisoned");
         assert!(!catalog.tables.contains_key(table));
+    }
+
+    #[test]
+    fn shared_catalog_table_drop_removes_indexes_and_comments() {
+        let table = "drop_shared_accounts";
+        let index = "drop_shared_accounts_id_idx";
+        let table_target = CatalogCommentTarget::Table {
+            table: table.to_string(),
+        };
+        let column_target = CatalogCommentTarget::Column {
+            table: table.to_string(),
+            attnum: 1,
+        };
+        let index_target = CatalogCommentTarget::Index {
+            index: index.to_string(),
+        };
+        let schema_target = CatalogCommentTarget::Schema {
+            schema: "public".to_string(),
+        };
+        {
+            let mut catalog = shared_catalog()
+                .lock()
+                .expect("shared catalog mutex poisoned");
+            catalog.tables.insert(
+                table.to_string(),
+                test_table(table, vec![vec![SqlValue::Int4(99)]]),
+            );
+            catalog.indexes.push(CatalogIndex {
+                name: index.to_string(),
+                table: table.to_string(),
+                column: "id".to_string(),
+                unique: false,
+                primary_key: false,
+                unique_constraint: false,
+            });
+            catalog
+                .comments
+                .insert(table_target.clone(), "table comment".to_string());
+            catalog
+                .comments
+                .insert(column_target.clone(), "column comment".to_string());
+            catalog
+                .comments
+                .insert(index_target.clone(), "index comment".to_string());
+            catalog
+                .comments
+                .insert(schema_target.clone(), "schema comment".to_string());
+        }
+
+        let mut session = Session::new(true);
+        assert!(session.tables.remove(table).is_some());
+        session.indexes.retain(|candidate| candidate.table != table);
+        session.dirty_indexes = true;
+        for target in [&table_target, &column_target, &index_target] {
+            session.comments.remove(target);
+            session.mark_comment_dirty(target.clone());
+        }
+        session.mark_table_dirty(table);
+        session.persist_catalog_snapshot();
+
+        let catalog = shared_catalog()
+            .lock()
+            .expect("shared catalog mutex poisoned");
+        assert!(!catalog.tables.contains_key(table));
+        assert!(!catalog
+            .indexes
+            .iter()
+            .any(|candidate| candidate.table == table));
+        assert!(!catalog.comments.contains_key(&table_target));
+        assert!(!catalog.comments.contains_key(&column_target));
+        assert!(!catalog.comments.contains_key(&index_target));
+        assert_eq!(
+            catalog.comments.get(&schema_target),
+            Some(&"schema comment".to_string())
+        );
     }
 
     #[test]

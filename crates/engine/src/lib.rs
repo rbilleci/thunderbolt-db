@@ -20,7 +20,7 @@ use gpu_db_observability::{
 use gpu_db_planner::{ExecutionPlan, Planner, PlannerConfig};
 use gpu_db_protocol::{
     parse_command, AddUniqueConstraint, ColumnDef, Command, CommentTarget, CreateIndex,
-    CreateTable, CreateView, Delete, DropIndex, DropView, Insert, ParseError, Select,
+    CreateTable, CreateView, Delete, DropIndex, DropTable, DropView, Insert, ParseError, Select,
     SelectFilterOp, SelectProjection, SqlType, SqlValue, Update,
 };
 use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine};
@@ -76,6 +76,7 @@ impl ReplicatedStateMachine for KvStateMachine {
                     | Command::AddUniqueConstraint(_)
                     | Command::CreateIndex(_)
                     | Command::CreateView(_)
+                    | Command::DropTable(_)
                     | Command::DropIndex(_)
                     | Command::DropView(_)
                     | Command::AlterColumnDefault(_)
@@ -7513,6 +7514,7 @@ impl Engine {
             Command::AddUniqueConstraint(add) => self.apply_add_unique_constraint(add)?,
             Command::CreateIndex(create) => self.apply_create_index(create)?,
             Command::CreateView(create) => self.apply_create_view(create)?,
+            Command::DropTable(drop) => self.apply_drop_table(drop, txn_id)?,
             Command::DropIndex(drop) => self.apply_drop_index(drop)?,
             Command::DropView(drop) => self.apply_drop_view(drop)?,
             Command::AlterColumnDefault(alter) => self.apply_alter_column_default(alter)?,
@@ -7838,6 +7840,65 @@ impl Engine {
             "index \"{}\" does not exist",
             drop.name
         )))
+    }
+
+    fn apply_drop_table(&mut self, drop: DropTable, txn_id: TxnId) -> Result<(), EngineError> {
+        if self.relational_views.contains_key(&drop.name) {
+            return Err(EngineError::ApplyFailed(format!(
+                "relation \"{}\" is not a table",
+                drop.name
+            )));
+        }
+        let Some(table) = self.relational_catalog.remove(&drop.name) else {
+            if drop.if_exists {
+                return Ok(());
+            }
+            return Err(EngineError::ApplyFailed(format!(
+                "relation \"{}\" does not exist",
+                drop.name
+            )));
+        };
+
+        let prefix = relational_key_prefix(&table.name);
+        let visibility = StorageVisibility {
+            read_txn_id: txn_id,
+        };
+        let mut tuple_ids = Vec::new();
+        let mut cursor = self
+            .mvcc_store
+            .seq_scan_open(visibility)
+            .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+        while let Some(tuple) = cursor.next() {
+            if tuple.key.starts_with(&prefix) {
+                tuple_ids.push(tuple.tuple_id);
+            }
+        }
+        std::mem::drop(cursor);
+        for tuple_id in tuple_ids {
+            self.mvcc_store
+                .tuple_delete(tuple_id, txn_id)
+                .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+        }
+
+        let index_names = table
+            .indexes
+            .iter()
+            .map(|index| index.name.clone())
+            .collect::<BTreeSet<_>>();
+        self.relational_comments.retain(|target, _| match target {
+            RelationalCommentTarget::Table { table }
+            | RelationalCommentTarget::Column { table, .. }
+            | RelationalCommentTarget::Constraint { table, .. } => table != &drop.name,
+            RelationalCommentTarget::Index { index } => !index_names.contains(index),
+            RelationalCommentTarget::Database { .. }
+            | RelationalCommentTarget::Role { .. }
+            | RelationalCommentTarget::Schema { .. }
+            | RelationalCommentTarget::Tablespace { .. }
+            | RelationalCommentTarget::View { .. } => true,
+        });
+        self.relational_residency.remove(&drop.name);
+        self.relational_residency_device_memory.remove(&drop.name);
+        Ok(())
     }
 
     fn apply_drop_view(&mut self, drop: DropView) -> Result<(), EngineError> {
@@ -8490,6 +8551,7 @@ impl Engine {
             | Command::AddUniqueConstraint(_)
             | Command::CreateIndex(_)
             | Command::CreateView(_)
+            | Command::DropTable(_)
             | Command::DropIndex(_)
             | Command::DropView(_)
             | Command::AlterColumnDefault(_)
@@ -8684,6 +8746,7 @@ impl Engine {
             | Command::AddUniqueConstraint(_)
             | Command::CreateIndex(_)
             | Command::CreateView(_)
+            | Command::DropTable(_)
             | Command::DropIndex(_)
             | Command::DropView(_)
             | Command::AlterColumnDefault(_)
@@ -8779,6 +8842,7 @@ impl Engine {
             Command::AddUniqueConstraint(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
             Command::CreateIndex(_) => Err(ExecuteError::NonReadCommand("CREATE INDEX")),
             Command::CreateView(_) => Err(ExecuteError::NonReadCommand("CREATE VIEW")),
+            Command::DropTable(_) => Err(ExecuteError::NonReadCommand("DROP TABLE")),
             Command::DropIndex(_) => Err(ExecuteError::NonReadCommand("DROP INDEX")),
             Command::DropView(_) => Err(ExecuteError::NonReadCommand("DROP VIEW")),
             Command::AlterColumnDefault(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
@@ -31802,6 +31866,102 @@ mod tests {
             missing_err.contains("index \"people_name_idx\" does not exist"),
             "{missing_err}"
         );
+    }
+
+    #[test]
+    fn relational_catalog_drops_table_and_replays_from_wal() {
+        let mut e = Engine::new_local();
+        e.execute_text(
+            1,
+            "CREATE TABLE people (id INT PRIMARY KEY, name TEXT UNIQUE)",
+        )
+        .unwrap();
+        e.execute_text(2, "CREATE TABLE teams (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(
+            3,
+            "INSERT INTO people (id, name) VALUES (1, 'Ada'), (2, 'Grace')",
+        )
+        .unwrap();
+        e.execute_text(4, "CREATE INDEX people_name_idx ON people (name)")
+            .unwrap();
+        e.execute_text(5, "COMMENT ON TABLE public.people IS 'people table'")
+            .unwrap();
+        e.execute_text(6, "COMMENT ON COLUMN public.people.name IS 'display name'")
+            .unwrap();
+        e.execute_text(7, "COMMENT ON INDEX public.people_name_idx IS 'lookup'")
+            .unwrap();
+        e.execute_text(
+            8,
+            "COMMENT ON CONSTRAINT people_pkey ON public.people IS 'identity'",
+        )
+        .unwrap();
+        e.execute_text(9, "COMMENT ON ROLE postgres IS 'bootstrap role'")
+            .unwrap();
+        let snapshot = e.populate_relational_residency_snapshot("people").unwrap();
+        assert!(snapshot.is_valid());
+        assert!(e.relational_residency_snapshot("people").is_some());
+        e.execute_text(10, "DROP TABLE public.people").unwrap();
+
+        assert!(e.relational_catalog_table("people").is_none());
+        assert!(e.relational_catalog_table("teams").is_some());
+        assert!(e.relational_residency_snapshot("people").is_none());
+        assert!(!e.relational_residency_device_memory.contains_key("people"));
+        assert_eq!(e.relational_table_comment("people"), None);
+        assert_eq!(e.relational_column_comment("people", 2), None);
+        assert_eq!(e.relational_index_comment("people_name_idx"), None);
+        assert_eq!(
+            e.relational_constraint_comment("people", "people_pkey"),
+            None
+        );
+        assert_eq!(
+            e.relational_role_comment("postgres"),
+            Some("bootstrap role")
+        );
+        let missing_select = e
+            .execute_text(11, "INSERT INTO people (id, name) VALUES (3, 'Edsger')")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            missing_select.contains("relation \"people\" does not exist"),
+            "{missing_select}"
+        );
+
+        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        assert!(recovered.relational_catalog_table("people").is_none());
+        assert!(recovered.relational_catalog_table("teams").is_some());
+        assert_eq!(recovered.relational_table_comment("people"), None);
+        assert_eq!(
+            recovered.relational_role_comment("postgres"),
+            Some("bootstrap role")
+        );
+
+        e.execute_text(12, "DROP TABLE IF EXISTS people").unwrap();
+        let missing_drop = e
+            .execute_text(13, "DROP TABLE people")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            missing_drop.contains("relation \"people\" does not exist"),
+            "{missing_drop}"
+        );
+
+        let mut with_view = Engine::new_local();
+        with_view
+            .execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        with_view
+            .execute_text(2, "CREATE VIEW public.people_view AS SELECT * FROM people")
+            .unwrap();
+        let view_drop = with_view
+            .execute_text(3, "DROP TABLE people_view")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            view_drop.contains("relation \"people_view\" is not a table"),
+            "{view_drop}"
+        );
+        assert!(with_view.relational_catalog_view("people_view").is_some());
     }
 
     #[test]
