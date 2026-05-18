@@ -1,0 +1,47 @@
+=== bounded add column default ===
+CREATE TABLE
+INSERT 0 2
+ALTER TABLE
+ id | name  | bucket
+----+-------+--------
+  1 | Ada   |      7
+  2 | Linus |      7
+(2 rows)
+
+INSERT 0 1
+ id | name  | bucket
+----+-------+--------
+  1 | Ada   |      7
+  2 | Linus |      7
+  3 | Grace |      7
+(3 rows)
+
+ column_name | data_type | is_nullable | column_default
+-------------+-----------+-------------+----------------
+ id          | integer   | YES         |
+ name        | text      | YES         |
+ bucket      | integer   | YES         | 7
+(3 rows)
+
+ nspname |      relname      | attname | default_expr
+---------+-------------------+---------+--------------
+ public  | add_column_people | bucket  | 7
+(1 row)
+
+         Table "public.add_column_people"
+ Column |  Type   | Collation | Nullable | Default
+--------+---------+-----------+----------+---------
+ id     | integer |           |          |
+ name   | text    |           |          |
+ bucket | integer |           |          | 7
+
+psql:319_protocol_psql_add_columns.sql:20: ERROR:  ADD COLUMN requires a literal DEFAULT
+psql:319_protocol_psql_add_columns.sql:21: ERROR:  column already exists
+CREATE VIEW
+psql:319_protocol_psql_add_columns.sql:23: ERROR:  relation is not a table
+ id | name  | bucket
+----+-------+--------
+  1 | Ada   |      7
+  2 | Linus |      7
+  3 | Grace |      7
+(3 rows)

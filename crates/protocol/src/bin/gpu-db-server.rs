@@ -6397,6 +6397,85 @@ fn execute_statement(
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, "ALTER TABLE");
             }
+            Command::AddColumn(add) => {
+                if session.views.contains_key(&add.table) {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "42809",
+                            message: "relation is not a table",
+                            position: None,
+                        },
+                    );
+                }
+                let Some(default) = add.column.default.clone() else {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "0A000",
+                            message: "ADD COLUMN requires a literal DEFAULT",
+                            position: None,
+                        },
+                    );
+                };
+                if !sql_value_matches_type(&default, add.column.ty) {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "42804",
+                            message: "column default type mismatch",
+                            position: None,
+                        },
+                    );
+                }
+                let Some(table) = session.tables.get_mut(&add.table) else {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "42P01",
+                            message: "relation does not exist",
+                            position: None,
+                        },
+                    );
+                };
+                if table
+                    .columns
+                    .iter()
+                    .any(|column| column.def.name == add.column.name)
+                {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "42701",
+                            message: "column already exists",
+                            position: None,
+                        },
+                    );
+                }
+                let attnum = match i16::try_from(table.columns.len() + 1) {
+                    Ok(attnum) => attnum,
+                    Err(_) => {
+                        return write_error(
+                            stream,
+                            &ErrorField {
+                                code: "54000",
+                                message: "too many columns for bootstrap catalog",
+                                position: None,
+                            },
+                        );
+                    }
+                };
+                table.columns.push(CatalogColumn {
+                    attnum,
+                    def: add.column,
+                });
+                for row in &mut table.rows {
+                    row.push(default.clone());
+                }
+                session.mark_table_dirty(add.table);
+                session.persist_catalog_snapshot();
+                return write_command_complete(stream, "ALTER TABLE");
+            }
             Command::CommentOn(comment) => {
                 let target = match comment.target {
                     CommentTarget::Database { database } => {

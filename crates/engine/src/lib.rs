@@ -74,6 +74,7 @@ impl ReplicatedStateMachine for KvStateMachine {
                     | Command::CreateTable(_)
                     | Command::AddPrimaryKey(_)
                     | Command::AddUniqueConstraint(_)
+                    | Command::AddColumn(_)
                     | Command::DropConstraint(_)
                     | Command::CreateIndex(_)
                     | Command::CreateView(_)
@@ -7514,6 +7515,7 @@ impl Engine {
             Command::CreateTable(create) => self.apply_create_table(create)?,
             Command::AddPrimaryKey(add) => self.apply_add_primary_key(add)?,
             Command::AddUniqueConstraint(add) => self.apply_add_unique_constraint(add)?,
+            Command::AddColumn(add) => self.apply_add_column(add, txn_id)?,
             Command::DropConstraint(drop) => self.apply_drop_constraint(drop)?,
             Command::CreateIndex(create) => self.apply_create_index(create)?,
             Command::CreateView(create) => self.apply_create_view(create)?,
@@ -8153,6 +8155,102 @@ impl Engine {
         Ok(())
     }
 
+    fn apply_add_column(
+        &mut self,
+        add: gpu_db_protocol::AddColumn,
+        txn_id: TxnId,
+    ) -> Result<(), EngineError> {
+        if self.relational_views.contains_key(&add.table) {
+            return Err(EngineError::ApplyFailed(format!(
+                "relation \"{}\" is not a table",
+                add.table
+            )));
+        }
+        let Some(default) = add.column.default.clone() else {
+            return Err(EngineError::ApplyFailed(
+                "ADD COLUMN requires a literal DEFAULT in the bootstrap relational subset"
+                    .to_string(),
+            ));
+        };
+        if !sql_value_matches_type(&default, add.column.ty) {
+            return Err(EngineError::ApplyFailed(format!(
+                "invalid default for column \"{}\"",
+                add.column.name
+            )));
+        }
+        let table = self
+            .relational_catalog
+            .get(&add.table)
+            .ok_or_else(|| {
+                EngineError::ApplyFailed(format!("relation \"{}\" does not exist", add.table))
+            })?
+            .clone();
+        if table
+            .columns
+            .iter()
+            .any(|column| column.name == add.column.name)
+        {
+            return Err(EngineError::ApplyFailed(format!(
+                "column \"{}\" of relation \"{}\" already exists",
+                add.column.name, add.table
+            )));
+        }
+        let next_attnum = i16::try_from(table.columns.len() + 1).map_err(|_| {
+            EngineError::ApplyFailed("too many columns for bootstrap catalog".to_string())
+        })?;
+        let column_id = self.relational_next_column_id;
+        let next_column_id = self
+            .relational_next_column_id
+            .checked_add(1)
+            .ok_or_else(|| {
+                EngineError::ApplyFailed("relational column id allocation exhausted".to_string())
+            })?;
+        let new_column = RelationalColumn::from_def(column_id, table.oid, next_attnum, add.column);
+
+        let prefix = relational_key_prefix(&add.table);
+        let visibility = StorageVisibility {
+            read_txn_id: txn_id,
+        };
+        let mut updates = Vec::new();
+        let mut cursor = self
+            .mvcc_store
+            .seq_scan_open(visibility)
+            .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+        while let Some(tuple) = cursor.next() {
+            if !tuple.key.starts_with(&prefix) {
+                continue;
+            }
+            let mut row = decode_relational_row(&tuple.value, &table.columns)
+                .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+            row.push(default.clone());
+            updates.push((tuple.tuple_id, tuple.key.clone(), row));
+        }
+        drop(cursor);
+
+        for (tuple_id, row_key, values) in updates {
+            self.mvcc_store
+                .tuple_update(tuple_id, encode_relational_row(&values), txn_id)
+                .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+            self.relational_value_index
+                .entry(RelationalIndexKey {
+                    table: add.table.clone(),
+                    column: new_column.name.clone(),
+                    value: relational_index_value(&default),
+                })
+                .or_default()
+                .push(row_key);
+        }
+        let table_ref = self
+            .relational_catalog
+            .get_mut(&add.table)
+            .expect("table existence validated");
+        table_ref.columns.push(new_column.clone());
+        self.relational_next_column_id = next_column_id;
+        self.relational_residency.remove(&add.table);
+        self.relational_residency_device_memory.remove(&add.table);
+        Ok(())
+    }
+
     fn apply_insert(&mut self, insert: Insert, txn_id: TxnId) -> Result<(), EngineError> {
         let table = self
             .relational_catalog
@@ -8479,6 +8577,39 @@ impl Engine {
                 )?;
                 Self::validate_unique_values(&rows, column_idx, &add.name)?;
             }
+            Command::AddColumn(add) => {
+                if self.relational_views.contains_key(&add.table) {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "relation \"{}\" is not a table",
+                        add.table
+                    )));
+                }
+                let Some(default) = add.column.default.as_ref() else {
+                    return Err(EngineError::ApplyFailed(
+                        "ADD COLUMN requires a literal DEFAULT in the bootstrap relational subset"
+                            .to_string(),
+                    ));
+                };
+                if !sql_value_matches_type(default, add.column.ty) {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "invalid default for column \"{}\"",
+                        add.column.name
+                    )));
+                }
+                let table = self.relational_catalog.get(&add.table).ok_or_else(|| {
+                    EngineError::ApplyFailed(format!("relation \"{}\" does not exist", add.table))
+                })?;
+                if table
+                    .columns
+                    .iter()
+                    .any(|column| column.name == add.column.name)
+                {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "column \"{}\" of relation \"{}\" already exists",
+                        add.column.name, add.table
+                    )));
+                }
+            }
             Command::DropConstraint(drop) => {
                 let Some(table) = self.relational_catalog.get(&drop.table) else {
                     if drop.table_if_exists {
@@ -8655,6 +8786,7 @@ impl Engine {
             | Command::CreateTable(_)
             | Command::AddPrimaryKey(_)
             | Command::AddUniqueConstraint(_)
+            | Command::AddColumn(_)
             | Command::DropConstraint(_)
             | Command::CreateIndex(_)
             | Command::CreateView(_)
@@ -8852,6 +8984,7 @@ impl Engine {
             | Command::CreateTable(_)
             | Command::AddPrimaryKey(_)
             | Command::AddUniqueConstraint(_)
+            | Command::AddColumn(_)
             | Command::DropConstraint(_)
             | Command::CreateIndex(_)
             | Command::CreateView(_)
@@ -8950,6 +9083,7 @@ impl Engine {
             Command::CreateTable(_) => Err(ExecuteError::NonReadCommand("CREATE TABLE")),
             Command::AddPrimaryKey(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
             Command::AddUniqueConstraint(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
+            Command::AddColumn(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
             Command::DropConstraint(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
             Command::CreateIndex(_) => Err(ExecuteError::NonReadCommand("CREATE INDEX")),
             Command::CreateView(_) => Err(ExecuteError::NonReadCommand("CREATE VIEW")),
@@ -30058,6 +30192,87 @@ mod tests {
         assert!(err
             .to_string()
             .contains("INSERT must provide every column without a default"));
+    }
+
+    #[test]
+    fn relational_add_column_default_rewrites_rows_and_replays() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE default_people (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO default_people (id, name) VALUES (1, 'Ada'), (2, 'Linus')",
+        )
+        .unwrap();
+        e.execute_text(
+            3,
+            "ALTER TABLE ONLY public.default_people ADD COLUMN bucket INT DEFAULT 7",
+        )
+        .unwrap();
+        e.execute_text(
+            4,
+            "INSERT INTO default_people (id, name) VALUES (3, 'Grace')",
+        )
+        .unwrap();
+
+        let Command::Select(select) =
+            parse_command("SELECT id, name, bucket FROM default_people ORDER BY id ASC").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let result = e.execute_relational_select(&select).unwrap();
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![
+                    SqlValue::Int4(1),
+                    SqlValue::Text("Ada".to_string()),
+                    SqlValue::Int4(7),
+                ],
+                vec![
+                    SqlValue::Int4(2),
+                    SqlValue::Text("Linus".to_string()),
+                    SqlValue::Int4(7),
+                ],
+                vec![
+                    SqlValue::Int4(3),
+                    SqlValue::Text("Grace".to_string()),
+                    SqlValue::Int4(7),
+                ],
+            ]
+        );
+
+        let mut recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let table = recovered
+            .relational_catalog_table("default_people")
+            .unwrap();
+        assert_eq!(table.columns.len(), 3);
+        assert_eq!(table.columns[2].name, "bucket");
+        assert_eq!(table.columns[2].attnum, 3);
+        assert_eq!(table.columns[2].default, Some(SqlValue::Int4(7)));
+        let recovered_result = recovered.execute_relational_select(&select).unwrap();
+        assert_eq!(recovered_result.rows, result.rows);
+
+        let duplicate = e
+            .execute_text(
+                5,
+                "ALTER TABLE public.default_people ADD COLUMN bucket INT DEFAULT 9",
+            )
+            .unwrap_err();
+        assert!(duplicate.to_string().contains("already exists"));
+        let mut no_default = Engine::new_local();
+        no_default
+            .execute_text(1, "CREATE TABLE default_people (id INT)")
+            .unwrap();
+        let unsupported = no_default
+            .execute_text(2, "ALTER TABLE public.default_people ADD COLUMN note TEXT")
+            .unwrap_err();
+        assert!(
+            unsupported
+                .to_string()
+                .contains("ADD COLUMN requires a literal DEFAULT"),
+            "{unsupported}"
+        );
     }
 
     #[test]

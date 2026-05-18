@@ -12,6 +12,7 @@ pub enum Command {
     CreateTable(CreateTable),
     AddPrimaryKey(AddPrimaryKey),
     AddUniqueConstraint(AddUniqueConstraint),
+    AddColumn(AddColumn),
     DropConstraint(DropConstraint),
     CreateIndex(CreateIndex),
     CreateView(CreateView),
@@ -59,6 +60,12 @@ pub struct AddUniqueConstraint {
     pub table: String,
     pub name: String,
     pub column: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddColumn {
+    pub table: String,
+    pub column: ColumnDef,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1685,7 +1692,7 @@ fn parse_relational_command(input: &str) -> Option<Result<Command, ParseError>> 
             return Some(parse_drop_table_constraint(input).map(Command::DropConstraint));
         }
         if find_keyword_outside_quotes(input, "ADD").is_some() {
-            return Some(parse_add_table_constraint(input));
+            return Some(parse_alter_table_add(input));
         }
         return Some(parse_alter_column_default(input).map(Command::AlterColumnDefault));
     }
@@ -1913,6 +1920,64 @@ fn parse_add_table_constraint(input: &str) -> Result<Command, ParseError> {
         return parse_add_unique_constraint(input).map(Command::AddUniqueConstraint);
     }
     Err(ParseError::InvalidRelationalSql)
+}
+
+fn parse_alter_table_add(input: &str) -> Result<Command, ParseError> {
+    let rest = strip_keyword_prefix_case_insensitive(input, "ALTER")
+        .and_then(|s| strip_keyword_prefix_case_insensitive(s.trim_start(), "TABLE"))
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    let rest = strip_keyword_prefix_case_insensitive(rest, "ONLY")
+        .map(str::trim_start)
+        .unwrap_or(rest);
+    let add_pos =
+        find_keyword_outside_quotes(rest, "ADD").ok_or(ParseError::InvalidRelationalSql)?;
+    let table = normalize_relation_identifier(rest[..add_pos].trim())?;
+    let add_tail = rest[add_pos + "ADD".len()..].trim_start();
+    if strip_keyword_prefix_case_insensitive(add_tail, "CONSTRAINT").is_some() {
+        return parse_add_table_constraint(input);
+    }
+    let column_tail = strip_keyword_prefix_case_insensitive(add_tail, "COLUMN")
+        .map(str::trim_start)
+        .unwrap_or(add_tail);
+    Ok(Command::AddColumn(AddColumn {
+        table,
+        column: parse_column_def(column_tail)?,
+    }))
+}
+
+fn parse_column_def(input: &str) -> Result<ColumnDef, ParseError> {
+    let mut parts = input.split_whitespace();
+    let name = parts
+        .next()
+        .ok_or(ParseError::InvalidRelationalSql)
+        .and_then(normalize_identifier)?;
+    let raw_ty = parts.next().ok_or(ParseError::InvalidRelationalSql)?;
+    let ty = match raw_ty {
+        ty if parse_supported_sql_type_name(ty) == Some(SqlType::Int4) => SqlType::Int4,
+        ty if parse_supported_sql_type_name(ty) == Some(SqlType::Text) => SqlType::Text,
+        _ => return Err(ParseError::InvalidRelationalSql),
+    };
+    let tail = parts.collect::<Vec<_>>().join(" ");
+    let default = if tail.is_empty() {
+        None
+    } else {
+        let default_value = strip_keyword_prefix_case_insensitive(&tail, "DEFAULT")
+            .ok_or(ParseError::InvalidRelationalSql)?
+            .trim();
+        if default_value.is_empty() {
+            return Err(ParseError::InvalidRelationalSql);
+        }
+        let value = parse_sql_value(default_value)?;
+        if !matches!(
+            (&value, ty),
+            (SqlValue::Int4(_), SqlType::Int4) | (SqlValue::Text(_), SqlType::Text)
+        ) {
+            return Err(ParseError::InvalidRelationalSql);
+        }
+        Some(value)
+    };
+    Ok(ColumnDef { name, ty, default })
 }
 
 fn parse_drop_table_constraint(input: &str) -> Result<DropConstraint, ParseError> {
@@ -9798,6 +9863,37 @@ mod tests {
                 default: None,
             })
         );
+        assert_eq!(
+            parse_command(
+                "ALTER TABLE ONLY public.default_people ADD COLUMN tag TEXT DEFAULT 'new'::text"
+            )
+            .unwrap(),
+            Command::AddColumn(AddColumn {
+                table: "default_people".to_string(),
+                column: ColumnDef {
+                    name: "tag".to_string(),
+                    ty: SqlType::Text,
+                    default: Some(SqlValue::Text("new".to_string())),
+                },
+            })
+        );
+        assert_eq!(
+            parse_command("ALTER TABLE public.default_people ADD bucket INT DEFAULT 4").unwrap(),
+            Command::AddColumn(AddColumn {
+                table: "default_people".to_string(),
+                column: ColumnDef {
+                    name: "bucket".to_string(),
+                    ty: SqlType::Int4,
+                    default: Some(SqlValue::Int4(4)),
+                },
+            })
+        );
+        assert!(matches!(
+            parse_command(
+                "ALTER TABLE private.default_people ADD COLUMN tag TEXT DEFAULT 'bad'::text"
+            ),
+            Err(ParseError::InvalidRelationalSql)
+        ));
         assert_eq!(
             parse_command("CREATE VIEW public.active_people AS SELECT id, name FROM people WHERE id > 1 ORDER BY id LIMIT 5").unwrap(),
             Command::CreateView(CreateView {
