@@ -1256,6 +1256,14 @@ fn shared_catalog_contains_table(table: &str) -> bool {
         .contains_key(table)
 }
 
+fn shared_catalog_contains_view(view: &str) -> bool {
+    shared_catalog()
+        .lock()
+        .expect("shared catalog mutex poisoned")
+        .views
+        .contains_key(view)
+}
+
 fn shared_catalog_contains_live_index(index: &str) -> bool {
     let catalog = shared_catalog()
         .lock()
@@ -1637,6 +1645,7 @@ enum CatalogCommentTarget {
     Table { table: String },
     Column { table: String, attnum: i16 },
     Index { index: String },
+    View { view: String },
     Constraint { table: String, constraint: String },
 }
 
@@ -5435,6 +5444,7 @@ fn execute_statement(
                 | CatalogCommentTarget::Column { table, .. }
                 | CatalogCommentTarget::Constraint { table, .. } => table == &drop.table,
                 CatalogCommentTarget::Index { index } => dropped_index_names.contains(index),
+                CatalogCommentTarget::View { .. } => false,
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -5968,7 +5978,8 @@ fn execute_statement(
                         },
                     );
                 }
-                if session.views.remove(&drop.name).is_none() && !drop.if_exists {
+                let removed = session.views.remove(&drop.name).is_some();
+                if !removed && !drop.if_exists {
                     return write_error(
                         stream,
                         &ErrorField {
@@ -5977,6 +5988,13 @@ fn execute_statement(
                             position: None,
                         },
                     );
+                }
+                if removed {
+                    let target = CatalogCommentTarget::View {
+                        view: drop.name.clone(),
+                    };
+                    session.comments.remove(&target);
+                    session.mark_comment_dirty(target);
                 }
                 session.mark_view_dirty(drop.name);
                 session.persist_catalog_snapshot();
@@ -6011,7 +6029,8 @@ fn execute_statement(
                             }
                             CatalogCommentTarget::Table { .. }
                             | CatalogCommentTarget::Column { .. }
-                            | CatalogCommentTarget::Index { .. } => false,
+                            | CatalogCommentTarget::Index { .. }
+                            | CatalogCommentTarget::View { .. } => false,
                         })
                         .cloned()
                         .collect::<Vec<_>>();
@@ -6124,6 +6143,33 @@ fn execute_statement(
                             );
                         }
                         CatalogCommentTarget::Index { index }
+                    }
+                    CommentTarget::View { view } => {
+                        let exists = session.views.contains_key(&view)
+                            || (session.shared_catalog && shared_catalog_contains_view(&view));
+                        if !exists {
+                            if session.tables.contains_key(&view)
+                                || (session.shared_catalog && shared_catalog_contains_table(&view))
+                            {
+                                return write_error(
+                                    stream,
+                                    &ErrorField {
+                                        code: "42809",
+                                        message: "relation is not a view",
+                                        position: None,
+                                    },
+                                );
+                            }
+                            return write_error(
+                                stream,
+                                &ErrorField {
+                                    code: "42P01",
+                                    message: "view does not exist",
+                                    position: None,
+                                },
+                            );
+                        }
+                        CatalogCommentTarget::View { view }
                     }
                     CommentTarget::Constraint { table, constraint } => {
                         let table_exists = session.tables.contains_key(&table)
@@ -7663,6 +7709,18 @@ fn execute_statement(
             &pg_catalog_description_rows(session),
         );
     }
+    if canonical == pg_catalog_table_descriptions_query() {
+        return write_single_row(
+            stream,
+            &[
+                text_column("nspname"),
+                text_column("relname"),
+                text_column("attname"),
+                text_column("description"),
+            ],
+            &pg_catalog_table_description_rows(session),
+        );
+    }
     if canonical == pg_catalog_constraint_descriptions_query() {
         return write_single_row(
             stream,
@@ -7686,6 +7744,19 @@ fn execute_statement(
                 text_column("description"),
             ],
             &pg_catalog_table_index_description_rows(session),
+        );
+    }
+    if canonical == pg_catalog_table_index_descriptions_without_views_query() {
+        return write_single_row(
+            stream,
+            &[
+                text_column("nspname"),
+                text_column("relname"),
+                text_column("relkind"),
+                text_column("attname"),
+                text_column("description"),
+            ],
+            &pg_catalog_table_index_description_rows_without_views(session),
         );
     }
     if psql_list_object_descriptions_query(&canonical) {
@@ -10503,7 +10574,12 @@ fn psql_describe_view_verbose_rows(session: &Session) -> Vec<Vec<Option<String>>
                 Some("postgres".to_string()),
                 Some("permanent".to_string()),
                 None,
-                None,
+                session
+                    .comments
+                    .get(&CatalogCommentTarget::View {
+                        view: view.name.clone(),
+                    })
+                    .cloned(),
             ]
         })
         .collect::<Vec<_>>();
@@ -10554,6 +10630,10 @@ fn pg_catalog_attrdef_rows(session: &Session) -> Vec<Vec<Option<String>>> {
 }
 
 fn pg_catalog_descriptions_query() -> &'static str {
+    "select n.nspname, c.relname, a.attname, d.description from pg_catalog.pg_description d join pg_catalog.pg_class c on c.oid = d.objoid join pg_catalog.pg_namespace n on n.oid = c.relnamespace left join pg_catalog.pg_attribute a on a.attrelid = c.oid and a.attnum = d.objsubid where n.nspname = 'public' and c.relkind in ('r','v') order by c.relname, d.objsubid"
+}
+
+fn pg_catalog_table_descriptions_query() -> &'static str {
     "select n.nspname, c.relname, a.attname, d.description from pg_catalog.pg_description d join pg_catalog.pg_class c on c.oid = d.objoid join pg_catalog.pg_namespace n on n.oid = c.relnamespace left join pg_catalog.pg_attribute a on a.attrelid = c.oid and a.attnum = d.objsubid where n.nspname = 'public' and c.relkind = 'r' order by c.relname, d.objsubid"
 }
 
@@ -10562,10 +10642,14 @@ fn pg_catalog_constraint_descriptions_query() -> &'static str {
 }
 
 fn pg_catalog_table_index_descriptions_query() -> &'static str {
+    "select n.nspname, c.relname, c.relkind, a.attname, d.description from pg_catalog.pg_description d join pg_catalog.pg_class c on c.oid = d.objoid join pg_catalog.pg_namespace n on n.oid = c.relnamespace left join pg_catalog.pg_attribute a on a.attrelid = c.oid and a.attnum = d.objsubid where n.nspname = 'public' and c.relkind in ('r','i','v') order by c.relkind, c.relname, d.objsubid"
+}
+
+fn pg_catalog_table_index_descriptions_without_views_query() -> &'static str {
     "select n.nspname, c.relname, c.relkind, a.attname, d.description from pg_catalog.pg_description d join pg_catalog.pg_class c on c.oid = d.objoid join pg_catalog.pg_namespace n on n.oid = c.relnamespace left join pg_catalog.pg_attribute a on a.attrelid = c.oid and a.attnum = d.objsubid where n.nspname = 'public' and c.relkind in ('r','i') order by c.relkind, c.relname, d.objsubid"
 }
 
-fn pg_catalog_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+fn pg_catalog_table_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
     let mut rows = Vec::new();
     let mut tables = session.tables.values().collect::<Vec<_>>();
     tables.sort_by(|left, right| left.name.cmp(&right.name));
@@ -10592,6 +10676,25 @@ fn pg_catalog_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
                     Some(description.clone()),
                 ]);
             }
+        }
+    }
+    rows
+}
+
+fn pg_catalog_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut rows = pg_catalog_table_description_rows(session);
+    let mut views = session.views.values().collect::<Vec<_>>();
+    views.sort_by(|left, right| left.name.cmp(&right.name));
+    for view in views {
+        if let Some(description) = session.comments.get(&CatalogCommentTarget::View {
+            view: view.name.clone(),
+        }) {
+            rows.push(vec![
+                Some("public".to_string()),
+                Some(view.name.clone()),
+                None,
+                Some(description.clone()),
+            ]);
         }
     }
     rows
@@ -10648,6 +10751,49 @@ fn pg_catalog_table_index_description_rows(session: &Session) -> Vec<Vec<Option<
         }
     }
     for row in pg_catalog_description_rows(session) {
+        let relkind = if session
+            .views
+            .contains_key(row[1].as_deref().unwrap_or_default())
+        {
+            "v"
+        } else {
+            "r"
+        };
+        rows.push(vec![
+            row[0].clone(),
+            row[1].clone(),
+            Some(relkind.to_string()),
+            row[2].clone(),
+            row[3].clone(),
+        ]);
+    }
+    rows
+}
+
+fn pg_catalog_table_index_description_rows_without_views(
+    session: &Session,
+) -> Vec<Vec<Option<String>>> {
+    let mut rows = Vec::new();
+    let mut indexes = session
+        .indexes
+        .iter()
+        .filter(|index| session.tables.contains_key(&index.table))
+        .collect::<Vec<_>>();
+    indexes.sort_by(|left, right| left.name.cmp(&right.name));
+    for index in indexes {
+        if let Some(description) = session.comments.get(&CatalogCommentTarget::Index {
+            index: index.name.clone(),
+        }) {
+            rows.push(vec![
+                Some("public".to_string()),
+                Some(index.name.clone()),
+                Some("i".to_string()),
+                None,
+                Some(description.clone()),
+            ]);
+        }
+    }
+    for row in pg_catalog_table_description_rows(session) {
         rows.push(vec![
             row[0].clone(),
             row[1].clone(),
@@ -10688,6 +10834,20 @@ fn pg_dump_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
             }
         }
     }
+    let mut views = session.views.values().collect::<Vec<_>>();
+    views.sort_by_key(|view| view.oid);
+    for view in views {
+        if let Some(description) = session.comments.get(&CatalogCommentTarget::View {
+            view: view.name.clone(),
+        }) {
+            rows.push(vec![
+                Some(description.clone()),
+                Some("1259".to_string()),
+                Some(view.oid.to_string()),
+                Some("0".to_string()),
+            ]);
+        }
+    }
     let mut index_comments = session
         .comments
         .iter()
@@ -10695,6 +10855,7 @@ fn pg_dump_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
             CatalogCommentTarget::Index { index } => Some((index, description)),
             CatalogCommentTarget::Table { .. }
             | CatalogCommentTarget::Column { .. }
+            | CatalogCommentTarget::View { .. }
             | CatalogCommentTarget::Constraint { .. } => None,
         })
         .collect::<Vec<_>>();
@@ -10718,6 +10879,7 @@ fn pg_dump_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
             }
             CatalogCommentTarget::Table { .. }
             | CatalogCommentTarget::Column { .. }
+            | CatalogCommentTarget::View { .. }
             | CatalogCommentTarget::Index { .. } => None,
         })
         .collect::<Vec<_>>();
@@ -10751,6 +10913,20 @@ fn psql_object_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
                 Some("public".to_string()),
                 Some(table.name.clone()),
                 Some("table".to_string()),
+                Some(description.clone()),
+            ]);
+        }
+    }
+    let mut views = session.views.values().collect::<Vec<_>>();
+    views.sort_by(|left, right| left.name.cmp(&right.name));
+    for view in views {
+        if let Some(description) = session.comments.get(&CatalogCommentTarget::View {
+            view: view.name.clone(),
+        }) {
+            rows.push(vec![
+                Some("public".to_string()),
+                Some(view.name.clone()),
+                Some("view".to_string()),
                 Some(description.clone()),
             ]);
         }
@@ -14849,7 +15025,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            pg_catalog_descriptions_query(),
+            pg_catalog_table_descriptions_query(),
             "select n.nspname, c.relname, a.attname, d.description from pg_catalog.pg_description d join pg_catalog.pg_class c on c.oid = d.objoid join pg_catalog.pg_namespace n on n.oid = c.relnamespace left join pg_catalog.pg_attribute a on a.attrelid = c.oid and a.attnum = d.objsubid where n.nspname = 'public' and c.relkind = 'r' order by c.relname, d.objsubid"
         );
         assert!(pg_catalog_description_rows(&session).is_empty());
@@ -20764,6 +20940,27 @@ mod tests {
             },
             "display name".to_string(),
         );
+        let view_query =
+            match parse_command("SELECT id, name FROM commented WHERE id > 0 ORDER BY id").unwrap()
+            {
+                Command::Select(select) => select,
+                _ => panic!("expected SELECT"),
+            };
+        session.views.insert(
+            "commented_view".to_string(),
+            View {
+                oid: FIRST_USER_RELATION_OID + 1,
+                name: "commented_view".to_string(),
+                query: view_query,
+                definition: "SELECT id, name FROM commented WHERE id > 0 ORDER BY id".to_string(),
+            },
+        );
+        session.comments.insert(
+            CatalogCommentTarget::View {
+                view: "commented_view".to_string(),
+            },
+            "lookup view".to_string(),
+        );
 
         assert_eq!(
             pg_catalog_description_rows(&session),
@@ -20779,6 +20976,12 @@ mod tests {
                     Some("commented".to_string()),
                     Some("name".to_string()),
                     Some("display name".to_string()),
+                ],
+                vec![
+                    Some("public".to_string()),
+                    Some("commented_view".to_string()),
+                    None,
+                    Some("lookup view".to_string()),
                 ],
             ]
         );
@@ -20797,16 +21000,30 @@ mod tests {
                     Some(FIRST_USER_RELATION_OID.to_string()),
                     Some("2".to_string()),
                 ],
+                vec![
+                    Some("lookup view".to_string()),
+                    Some("1259".to_string()),
+                    Some((FIRST_USER_RELATION_OID + 1).to_string()),
+                    Some("0".to_string()),
+                ],
             ]
         );
         assert_eq!(
             psql_object_description_rows(&session),
-            vec![vec![
-                Some("public".to_string()),
-                Some("commented".to_string()),
-                Some("table".to_string()),
-                Some("lookup table".to_string()),
-            ]]
+            vec![
+                vec![
+                    Some("public".to_string()),
+                    Some("commented".to_string()),
+                    Some("table".to_string()),
+                    Some("lookup table".to_string()),
+                ],
+                vec![
+                    Some("public".to_string()),
+                    Some("commented_view".to_string()),
+                    Some("view".to_string()),
+                    Some("lookup view".to_string()),
+                ],
+            ]
         );
     }
 

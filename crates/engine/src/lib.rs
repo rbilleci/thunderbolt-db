@@ -5993,6 +5993,7 @@ pub enum RelationalCommentTarget {
     Table { table: String },
     Column { table: String, attnum: i16 },
     Index { index: String },
+    View { view: String },
     Constraint { table: String, constraint: String },
 }
 
@@ -7836,7 +7837,14 @@ impl Engine {
                 drop.name
             )));
         }
-        if self.relational_views.remove(&drop.name).is_some() || drop.if_exists {
+        if self.relational_views.remove(&drop.name).is_some() {
+            self.relational_comments
+                .remove(&RelationalCommentTarget::View {
+                    view: drop.name.clone(),
+                });
+            return Ok(());
+        }
+        if drop.if_exists {
             return Ok(());
         }
         Err(EngineError::ApplyFailed(format!(
@@ -7885,6 +7893,21 @@ impl Engine {
                     )));
                 }
                 RelationalCommentTarget::Index { index }
+            }
+            CommentTarget::View { view } => {
+                if !self.relational_views.contains_key(&view) {
+                    if self.relational_catalog.contains_key(&view) {
+                        return Err(EngineError::ApplyFailed(format!(
+                            "relation \"{}\" is not a view",
+                            view
+                        )));
+                    }
+                    return Err(EngineError::ApplyFailed(format!(
+                        "view \"{}\" does not exist",
+                        view
+                    )));
+                }
+                RelationalCommentTarget::View { view }
             }
             CommentTarget::Constraint { table, constraint } => {
                 let table_ref = self.relational_catalog.get(&table).ok_or_else(|| {
@@ -11808,6 +11831,14 @@ impl Engine {
         self.relational_comments
             .get(&RelationalCommentTarget::Index {
                 index: index.to_string(),
+            })
+            .map(String::as_str)
+    }
+
+    pub fn relational_view_comment(&self, view: &str) -> Option<&str> {
+        self.relational_comments
+            .get(&RelationalCommentTarget::View {
+                view: view.to_string(),
             })
             .map(String::as_str)
     }
@@ -31640,6 +31671,13 @@ mod tests {
             "COMMENT ON CONSTRAINT people_pkey ON public.people IS 'row identity'",
         )
         .unwrap();
+        e.execute_text(
+            8,
+            "CREATE VIEW public.people_lookup AS SELECT id, name FROM people WHERE id > 0 ORDER BY id",
+        )
+        .unwrap();
+        e.execute_text(9, "COMMENT ON VIEW public.people_lookup IS 'lookup view'")
+            .unwrap();
         assert_eq!(e.relational_table_comment("people"), Some("lookup people"));
         assert_eq!(
             e.relational_column_comment("people", 2),
@@ -31652,6 +31690,10 @@ mod tests {
         assert_eq!(
             e.relational_constraint_comment("people", "people_pkey"),
             Some("row identity")
+        );
+        assert_eq!(
+            e.relational_view_comment("people_lookup"),
+            Some("lookup view")
         );
 
         let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
@@ -31671,17 +31713,23 @@ mod tests {
             recovered.relational_constraint_comment("people", "people_pkey"),
             Some("row identity")
         );
+        assert_eq!(
+            recovered.relational_view_comment("people_lookup"),
+            Some("lookup view")
+        );
 
-        e.execute_text(8, "COMMENT ON COLUMN public.people.name IS NULL")
+        e.execute_text(10, "COMMENT ON COLUMN public.people.name IS NULL")
             .unwrap();
         assert_eq!(e.relational_column_comment("people", 2), None);
-        e.execute_text(9, "DROP INDEX people_name_idx").unwrap();
+        e.execute_text(11, "DROP INDEX people_name_idx").unwrap();
         assert_eq!(e.relational_index_comment("people_name_idx"), None);
-        e.execute_text(10, "DROP INDEX people_pkey").unwrap();
+        e.execute_text(12, "DROP INDEX people_pkey").unwrap();
         assert_eq!(
             e.relational_constraint_comment("people", "people_pkey"),
             None
         );
+        e.execute_text(13, "DROP VIEW people_lookup").unwrap();
+        assert_eq!(e.relational_view_comment("people_lookup"), None);
 
         let mut missing = Engine::new_local();
         missing
@@ -31702,6 +31750,10 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("index \"people_name_idx\" does not exist"));
+
+        assert!(missing_index
+            .execute_text(3, "COMMENT ON VIEW public.people IS 'bad'")
+            .is_err());
 
         let mut missing_constraint = Engine::new_local();
         missing_constraint

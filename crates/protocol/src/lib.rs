@@ -103,6 +103,7 @@ pub enum CommentTarget {
     Table { table: String },
     Column { table: String, column: String },
     Index { index: String },
+    View { view: String },
     Constraint { table: String, constraint: String },
 }
 
@@ -1704,6 +1705,15 @@ fn parse_comment_on(input: &str) -> Result<CommentOn, ParseError> {
         let index = normalize_relation_identifier(rest[..is_pos].trim())?;
         (
             CommentTarget::Index { index },
+            rest[is_pos + "IS".len()..].trim(),
+        )
+    } else if let Some(rest) = strip_keyword_prefix_case_insensitive(rest, "VIEW") {
+        let rest = rest.trim_start();
+        let is_pos =
+            find_keyword_outside_quotes(rest, "IS").ok_or(ParseError::InvalidRelationalSql)?;
+        let view = normalize_relation_identifier(rest[..is_pos].trim())?;
+        (
+            CommentTarget::View { view },
             rest[is_pos + "IS".len()..].trim(),
         )
     } else if let Some(rest) = strip_keyword_prefix_case_insensitive(rest, "CONSTRAINT") {
@@ -9368,6 +9378,16 @@ mod tests {
                     index: "people_name_idx".to_string(),
                 },
                 comment: Some("lookup index".to_string()),
+            })
+        );
+
+        assert_eq!(
+            parse_command("COMMENT ON VIEW public.active_people IS 'active people view'").unwrap(),
+            Command::CommentOn(CommentOn {
+                target: CommentTarget::View {
+                    view: "active_people".to_string(),
+                },
+                comment: Some("active people view".to_string()),
             })
         );
 

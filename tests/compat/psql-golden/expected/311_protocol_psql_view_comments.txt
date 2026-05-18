@@ -1,0 +1,39 @@
+=== bounded SQL view comments ===
+CREATE TABLE
+INSERT 0 2
+CREATE VIEW
+COMMENT
+                                        List of relations
+ Schema |            Name            | Type |  Owner   | Persistence | Size |    Description
+--------+----------------------------+------+----------+-------------+------+--------------------
+ public | active_comment_view_people | view | postgres | permanent   |      | active people view
+(1 row)
+
+ nspname |          relname           | attname |    description
+---------+----------------------------+---------+--------------------
+ public  | active_comment_view_people |         | active people view
+(1 row)
+
+                        Object descriptions
+ Schema |            Name            | Object |    Description
+--------+----------------------------+--------+--------------------
+ public | active_comment_view_people | view   | active people view
+(1 row)
+
+COMMENT
+                                    List of relations
+ Schema |            Name            | Type |  Owner   | Persistence | Size | Description
+--------+----------------------------+------+----------+-------------+------+-------------
+ public | active_comment_view_people | view | postgres | permanent   |      |
+(1 row)
+
+psql:311_protocol_psql_view_comments.sql:17: ERROR:  view does not exist
+psql:311_protocol_psql_view_comments.sql:18: ERROR:  relation is not a view
+psql:311_protocol_psql_view_comments.sql:19: ERROR:  query shape is not supported by the compatibility stub
+DROP VIEW
+psql:311_protocol_psql_view_comments.sql:21: ERROR:  view does not exist
+ id | name
+----+-------
+  1 | Ada
+  2 | Linus
+(2 rows)
