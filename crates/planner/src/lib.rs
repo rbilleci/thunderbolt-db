@@ -63,6 +63,7 @@ impl Planner {
             | Command::AddUniqueConstraint(_)
             | Command::AddColumn(_)
             | Command::RenameColumn(_)
+            | Command::RenameConstraint(_)
             | Command::DropColumn(_)
             | Command::DropConstraint(_)
             | Command::CreateIndex(_)

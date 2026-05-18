@@ -1,0 +1,81 @@
+=== bounded rename constraint ===
+CREATE TABLE
+INSERT 0 2
+COMMENT
+COMMENT
+                                 Table "public.rename_constraint_people"
+ Column |  Type   | Collation | Nullable | Default | Storage  | Compression | Stats target | Description
+--------+---------+-----------+----------+---------+----------+-------------+--------------+-------------
+ id     | integer |           |          |         | plain    |             |              |
+ name   | text    |           |          |         | extended |             |              |
+Indexes:
+    "rename_constraint_people_name_key" UNIQUE CONSTRAINT, btree (name)
+    "rename_constraint_people_pkey" PRIMARY KEY, btree (id)
+Access method: heap
+
+ALTER TABLE
+ALTER TABLE
+ table_schema |        table_name        |              constraint_name              | constraint_type
+--------------+--------------------------+-------------------------------------------+-----------------
+ public       | rename_constraint_people | rename_constraint_people_display_name_key | UNIQUE
+ public       | rename_constraint_people | rename_constraint_people_id_pkey          | PRIMARY KEY
+(2 rows)
+
+ table_schema |        table_name        | column_name |              constraint_name              | ordinal_position
+--------------+--------------------------+-------------+-------------------------------------------+------------------
+ public       | rename_constraint_people | name        | rename_constraint_people_display_name_key |                1
+ public       | rename_constraint_people | id          | rename_constraint_people_id_pkey          |                1
+(2 rows)
+
+ nspname |         relname          |                  conname                  | contype
+---------+--------------------------+-------------------------------------------+---------
+ public  | rename_constraint_people | rename_constraint_people_display_name_key | u
+ public  | rename_constraint_people | rename_constraint_people_id_pkey          | p
+(2 rows)
+
+ schemaname |        tablename         |                 indexname                 |                                                      indexdef
+------------+--------------------------+-------------------------------------------+---------------------------------------------------------------------------------------------------------------------
+ public     | rename_constraint_people | rename_constraint_people_display_name_key | CREATE UNIQUE INDEX rename_constraint_people_display_name_key ON public.rename_constraint_people USING btree (name)
+ public     | rename_constraint_people | rename_constraint_people_id_pkey          | CREATE UNIQUE INDEX rename_constraint_people_id_pkey ON public.rename_constraint_people USING btree (id)
+(2 rows)
+
+ nspname |         relname          |             conname              | description
+---------+--------------------------+----------------------------------+--------------
+ public  | rename_constraint_people | rename_constraint_people_id_pkey | row identity
+(1 row)
+
+                             Object descriptions
+ Schema |               Name               |      Object      | Description
+--------+----------------------------------+------------------+--------------
+ public | rename_constraint_people_id_pkey | table constraint | row identity
+(1 row)
+
+                                                                         List of relations
+ Schema |                   Name                    | Type  |  Owner   |          Table           | Persistence | Access method | Size |        Description
+--------+-------------------------------------------+-------+----------+--------------------------+-------------+---------------+------+---------------------------
+ public | rename_constraint_people_display_name_key | index | postgres | rename_constraint_people | permanent   | btree         |      | unique display name index
+ public | rename_constraint_people_id_pkey          | index | postgres | rename_constraint_people | permanent   | btree         |      |
+(2 rows)
+
+                                 Table "public.rename_constraint_people"
+ Column |  Type   | Collation | Nullable | Default | Storage  | Compression | Stats target | Description
+--------+---------+-----------+----------+---------+----------+-------------+--------------+-------------
+ id     | integer |           |          |         | plain    |             |              |
+ name   | text    |           |          |         | extended |             |              |
+Indexes:
+    "rename_constraint_people_display_name_key" UNIQUE CONSTRAINT, btree (name)
+    "rename_constraint_people_id_pkey" PRIMARY KEY, btree (id)
+Access method: heap
+
+psql:322_protocol_psql_rename_constraints.sql:37: ERROR:  duplicate key value violates unique index
+psql:322_protocol_psql_rename_constraints.sql:38: ERROR:  relation already exists
+psql:322_protocol_psql_rename_constraints.sql:39: ERROR:  constraint does not exist
+ALTER TABLE
+CREATE VIEW
+psql:322_protocol_psql_rename_constraints.sql:42: ERROR:  relation is not a table
+psql:322_protocol_psql_rename_constraints.sql:43: ERROR:  query shape is not supported by the compatibility stub
+ id | name
+----+-------
+  1 | Ada
+  2 | Linus
+(2 rows)

@@ -14,6 +14,7 @@ pub enum Command {
     AddUniqueConstraint(AddUniqueConstraint),
     AddColumn(AddColumn),
     RenameColumn(RenameColumn),
+    RenameConstraint(RenameConstraint),
     DropColumn(DropColumn),
     DropConstraint(DropConstraint),
     CreateIndex(CreateIndex),
@@ -81,6 +82,14 @@ pub struct RenameColumn {
     pub table: String,
     pub old_name: String,
     pub new_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenameConstraint {
+    pub table: String,
+    pub old_name: String,
+    pub new_name: String,
+    pub table_if_exists: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1702,6 +1711,9 @@ fn parse_relational_command(input: &str) -> Option<Result<Command, ParseError>> 
     }
     if first.eq_ignore_ascii_case("ALTER") {
         if find_keyword_outside_quotes(input, "RENAME").is_some() {
+            if parse_rename_constraint(input).is_ok() {
+                return Some(parse_rename_constraint(input).map(Command::RenameConstraint));
+            }
             return Some(parse_rename_column(input).map(Command::RenameColumn));
         }
         if find_keyword_outside_quotes(input, "DROP").is_some()
@@ -2026,6 +2038,46 @@ fn parse_rename_column(input: &str) -> Result<RenameColumn, ParseError> {
         table,
         old_name,
         new_name: normalize_identifier(new_tail)?,
+    })
+}
+
+fn parse_rename_constraint(input: &str) -> Result<RenameConstraint, ParseError> {
+    let mut rest = strip_keyword_prefix_case_insensitive(input, "ALTER")
+        .and_then(|s| strip_keyword_prefix_case_insensitive(s.trim_start(), "TABLE"))
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    let table_if_exists = if let Some(remaining) = strip_keyword_prefix_case_insensitive(rest, "IF")
+        .and_then(|s| strip_keyword_prefix_case_insensitive(s.trim_start(), "EXISTS"))
+    {
+        rest = remaining.trim_start();
+        true
+    } else {
+        false
+    };
+    rest = strip_keyword_prefix_case_insensitive(rest, "ONLY")
+        .map(str::trim_start)
+        .unwrap_or(rest);
+    let rename_pos =
+        find_keyword_outside_quotes(rest, "RENAME").ok_or(ParseError::InvalidRelationalSql)?;
+    let table = normalize_relation_identifier(rest[..rename_pos].trim())?;
+    rest = rest[rename_pos + "RENAME".len()..].trim_start();
+    rest = strip_keyword_prefix_case_insensitive(rest, "CONSTRAINT")
+        .map(str::trim_start)
+        .ok_or(ParseError::InvalidRelationalSql)?;
+    let to_pos = find_keyword_outside_quotes(rest, "TO").ok_or(ParseError::InvalidRelationalSql)?;
+    let old_name = normalize_identifier(rest[..to_pos].trim())?;
+    let new_tail = rest[to_pos + "TO".len()..].trim();
+    if new_tail.is_empty()
+        || find_keyword_outside_quotes(new_tail, "CASCADE").is_some()
+        || find_keyword_outside_quotes(new_tail, "RESTRICT").is_some()
+    {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    Ok(RenameConstraint {
+        table,
+        old_name,
+        new_name: normalize_identifier(new_tail)?,
+        table_if_exists,
     })
 }
 
@@ -9753,6 +9805,22 @@ mod tests {
         );
         assert!(parse_command(
             "ALTER TABLE public.keyed_people RENAME COLUMN name TO display_name CASCADE"
+        )
+        .is_err());
+        assert_eq!(
+            parse_command(
+                "ALTER TABLE IF EXISTS ONLY public.keyed_people RENAME CONSTRAINT keyed_people_pkey TO keyed_people_id_pkey"
+            )
+            .unwrap(),
+            Command::RenameConstraint(RenameConstraint {
+                table: "keyed_people".to_string(),
+                old_name: "keyed_people_pkey".to_string(),
+                new_name: "keyed_people_id_pkey".to_string(),
+                table_if_exists: true,
+            })
+        );
+        assert!(parse_command(
+            "ALTER TABLE public.keyed_people RENAME CONSTRAINT keyed_people_pkey TO keyed_people_id_pkey CASCADE"
         )
         .is_err());
 

@@ -1402,6 +1402,82 @@ fn rename_column_in_session(
     Ok(())
 }
 
+fn rename_constraint_in_session(
+    session: &mut Session,
+    table_name: &str,
+    old_name: &str,
+    new_name: &str,
+    table_if_exists: bool,
+) -> Result<(), ErrorField> {
+    if session.views.contains_key(table_name) {
+        return Err(ErrorField {
+            code: "42809",
+            message: "relation is not a table",
+            position: None,
+        });
+    }
+    if !session.tables.contains_key(table_name) {
+        if table_if_exists {
+            return Ok(());
+        }
+        return Err(ErrorField {
+            code: "42P01",
+            message: "relation does not exist",
+            position: None,
+        });
+    }
+    if session.indexes.iter().any(|index| index.name == new_name) {
+        return Err(ErrorField {
+            code: "42P07",
+            message: "relation already exists",
+            position: None,
+        });
+    }
+    let Some(index) = session.indexes.iter_mut().find(|index| {
+        index.table == table_name
+            && index.name == old_name
+            && (index.primary_key || index.unique_constraint)
+    }) else {
+        return Err(ErrorField {
+            code: "42704",
+            message: "constraint does not exist",
+            position: None,
+        });
+    };
+    index.name = new_name.to_string();
+    session.dirty_indexes = true;
+
+    let old_index_target = CatalogCommentTarget::Index {
+        index: old_name.to_string(),
+    };
+    if let Some(comment) = session.comments.remove(&old_index_target) {
+        let new_index_target = CatalogCommentTarget::Index {
+            index: new_name.to_string(),
+        };
+        session.comments.insert(new_index_target.clone(), comment);
+        session.mark_comment_dirty(old_index_target);
+        session.mark_comment_dirty(new_index_target);
+    }
+    let old_constraint_target = CatalogCommentTarget::Constraint {
+        table: table_name.to_string(),
+        constraint: old_name.to_string(),
+    };
+    if let Some(comment) = session.comments.remove(&old_constraint_target) {
+        let new_constraint_target = CatalogCommentTarget::Constraint {
+            table: table_name.to_string(),
+            constraint: new_name.to_string(),
+        };
+        session
+            .comments
+            .insert(new_constraint_target.clone(), comment);
+        session.mark_comment_dirty(old_constraint_target);
+        session.mark_comment_dirty(new_constraint_target);
+    }
+
+    session.persist_catalog_snapshot();
+    Ok(())
+}
+
 fn shared_catalog_contains_table(table: &str) -> bool {
     shared_catalog()
         .lock()
@@ -6243,6 +6319,18 @@ fn execute_statement(
                     }
                 }
                 session.persist_catalog_snapshot();
+                return write_command_complete(stream, "ALTER TABLE");
+            }
+            Command::RenameConstraint(rename) => {
+                if let Err(error) = rename_constraint_in_session(
+                    session,
+                    &rename.table,
+                    &rename.old_name,
+                    &rename.new_name,
+                    rename.table_if_exists,
+                ) {
+                    return write_error(stream, &error);
+                }
                 return write_command_complete(stream, "ALTER TABLE");
             }
             Command::CreateIndex(create) => {
