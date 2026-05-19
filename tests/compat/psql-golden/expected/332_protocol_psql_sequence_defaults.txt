@@ -63,6 +63,50 @@ INSERT 0 2
  name        | text      | YES         |
 (2 rows)
 
-psql:332_protocol_psql_sequence_defaults.sql:38: ERROR:  sequence does not exist
+ALTER TABLE
+ALTER TABLE
+psql:332_protocol_psql_sequence_defaults.sql:37: ERROR:  INSERT must provide every column without a default
+psql:332_protocol_psql_sequence_defaults.sql:38: ERROR:  INSERT must provide every column without a default
+ nspname | relname | attname | default_expr
+---------+---------+---------+--------------
+(0 rows)
+
+ column_name | data_type | is_nullable | column_default
+-------------+-----------+-------------+----------------
+ id          | integer   | YES         |
+ name        | text      | YES         |
+(2 rows)
+
+ column_name | data_type | is_nullable | column_default
+-------------+-----------+-------------+----------------
+ id          | integer   | YES         |
+ name        | text      | YES         |
+(2 rows)
+
+           Table "public.manual_people"
+ Column |  Type   | Collation | Nullable | Default
+--------+---------+-----------+----------+---------
+ id     | integer |           |          |
+ name   | text    |           |          |
+
+           Table "public.serial_people"
+ Column |  Type   | Collation | Nullable | Default
+--------+---------+-----------+----------+---------
+ id     | integer |           |          |
+ name   | text    |           |          |
+Indexes:
+    "serial_people_pkey" PRIMARY KEY, btree (id)
+
+ last_value | is_called
+------------+-----------
+          2 | t
+(1 row)
+
+ last_value | is_called
+------------+-----------
+          2 | t
+(1 row)
+
+psql:332_protocol_psql_sequence_defaults.sql:64: ERROR:  sequence does not exist
 CREATE TABLE
-psql:332_protocol_psql_sequence_defaults.sql:43: ERROR:  relation is not a sequence
+psql:332_protocol_psql_sequence_defaults.sql:69: ERROR:  relation is not a sequence

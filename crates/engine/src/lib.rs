@@ -11674,12 +11674,6 @@ impl Engine {
                         insert.table
                     ))
                 })?;
-                if !table.indexes.iter().any(|index| index.unique)
-                    && table.check_constraints.is_empty()
-                    && table.foreign_keys.is_empty()
-                {
-                    return Ok(());
-                }
                 let column_indexes = if insert.columns.is_empty() {
                     (0..table.columns.len()).collect::<Vec<_>>()
                 } else {
@@ -33737,9 +33731,41 @@ mod tests {
         let recovered_result = recovered.execute_relational_select(&select).unwrap();
         assert_eq!(recovered_result.rows, result.rows);
 
+        e.execute_text(
+            6,
+            "ALTER TABLE ONLY public.default_people ALTER COLUMN bucket DROP DEFAULT",
+        )
+        .unwrap();
+        let table = e.relational_catalog_table("default_people").unwrap();
+        assert_eq!(table.columns[2].default, None);
+        let sequence = e.relational_catalog_sequence("default_bucket_seq").unwrap();
+        assert_eq!(sequence.last_value, 3);
+        assert!(sequence.is_called);
+        let missing_default = e
+            .execute_text(
+                7,
+                "INSERT INTO default_people (id, name) VALUES (4, 'Barbara')",
+            )
+            .unwrap_err();
+        assert!(missing_default
+            .to_string()
+            .contains("INSERT must provide every column without a default"));
+
+        let recovered_after_drop =
+            Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let recovered_table = recovered_after_drop
+            .relational_catalog_table("default_people")
+            .unwrap();
+        assert_eq!(recovered_table.columns[2].default, None);
+        let recovered_sequence = recovered_after_drop
+            .relational_catalog_sequence("default_bucket_seq")
+            .unwrap();
+        assert_eq!(recovered_sequence.last_value, 3);
+        assert!(recovered_sequence.is_called);
+
         let missing = e
             .execute_text(
-                6,
+                8,
                 "ALTER TABLE default_people ADD COLUMN missing_bucket INT DEFAULT nextval('missing_bucket_seq'::regclass)",
             )
             .unwrap_err();
@@ -33754,10 +33780,10 @@ mod tests {
             .all(|column| column.name != "missing_bucket"));
 
         let table_target = e
-            .execute_text(7, "CREATE TABLE default_target_table (id INT)")
+            .execute_text(9, "CREATE TABLE default_target_table (id INT)")
             .and_then(|_| {
                 e.execute_text(
-                    8,
+                    10,
                     "ALTER TABLE default_people ADD COLUMN bad_bucket INT DEFAULT nextval('default_target_table'::regclass)",
                 )
             })
