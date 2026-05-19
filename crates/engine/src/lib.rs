@@ -20,9 +20,10 @@ use gpu_db_observability::{
 use gpu_db_planner::{ExecutionPlan, Planner, PlannerConfig};
 use gpu_db_protocol::{
     parse_command, AddUniqueConstraint, ColumnDef, Command, CommentTarget, CreateIndex,
-    CreateTable, CreateView, Delete, DropConstraint, DropIndex, DropTable, DropView, Insert,
-    ParseError, RenameColumn, RenameConstraint, RenameIndex, RenameTable, RenameView, Select,
-    SelectFilterOp, SelectProjection, SqlType, SqlValue, TruncateTable, Update,
+    CreateSequence, CreateTable, CreateView, Delete, DropConstraint, DropIndex, DropSequence,
+    DropTable, DropView, Insert, ParseError, RenameColumn, RenameConstraint, RenameIndex,
+    RenameTable, RenameView, Select, SelectFilterOp, SelectProjection, SqlType, SqlValue,
+    TruncateTable, Update,
 };
 use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine};
 use gpu_db_storage::{
@@ -85,10 +86,12 @@ impl ReplicatedStateMachine for KvStateMachine {
                     | Command::RenameIndex(_)
                     | Command::CreateView(_)
                     | Command::RenameView(_)
+                    | Command::CreateSequence(_)
                     | Command::DropTable(_)
                     | Command::TruncateTable(_)
                     | Command::DropIndex(_)
                     | Command::DropView(_)
+                    | Command::DropSequence(_)
                     | Command::AlterColumnDefault(_)
                     | Command::CommentOn(_)
                     | Command::Insert(_)
@@ -5940,6 +5943,7 @@ pub struct Engine {
     mvcc_store: InMemoryTupleStore,
     relational_catalog: BTreeMap<String, RelationalTable>,
     relational_views: BTreeMap<String, RelationalView>,
+    relational_sequences: BTreeMap<String, RelationalSequence>,
     relational_comments: BTreeMap<RelationalCommentTarget, String>,
     relational_value_index: BTreeMap<RelationalIndexKey, Vec<String>>,
     relational_residency: BTreeMap<String, RelationalResidencySnapshot>,
@@ -5999,6 +6003,13 @@ pub struct RelationalView {
     pub definition: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationalSequence {
+    pub schema: String,
+    pub name: String,
+    pub oid: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RelationalCommentTarget {
     Database { database: String },
@@ -6009,6 +6020,7 @@ pub enum RelationalCommentTarget {
     Column { table: String, attnum: i16 },
     Index { index: String },
     View { view: String },
+    Sequence { sequence: String },
     Constraint { table: String, constraint: String },
 }
 
@@ -7282,6 +7294,7 @@ impl Engine {
             mvcc_store: InMemoryTupleStore::new(),
             relational_catalog: BTreeMap::new(),
             relational_views: BTreeMap::new(),
+            relational_sequences: BTreeMap::new(),
             relational_comments: BTreeMap::new(),
             relational_value_index: BTreeMap::new(),
             relational_residency: BTreeMap::new(),
@@ -7532,10 +7545,12 @@ impl Engine {
             Command::RenameIndex(rename) => self.apply_rename_index(rename)?,
             Command::CreateView(create) => self.apply_create_view(create)?,
             Command::RenameView(rename) => self.apply_rename_view(rename)?,
+            Command::CreateSequence(create) => self.apply_create_sequence(create)?,
             Command::DropTable(drop) => self.apply_drop_table(drop, txn_id)?,
             Command::TruncateTable(truncate) => self.apply_truncate_table(truncate, txn_id)?,
             Command::DropIndex(drop) => self.apply_drop_index(drop)?,
             Command::DropView(drop) => self.apply_drop_view(drop)?,
+            Command::DropSequence(drop) => self.apply_drop_sequence(drop)?,
             Command::AlterColumnDefault(alter) => self.apply_alter_column_default(alter)?,
             Command::CommentOn(comment) => self.apply_comment_on(comment)?,
             Command::Insert(insert) => self.apply_insert(insert, txn_id)?,
@@ -7549,6 +7564,7 @@ impl Engine {
 
     fn apply_create_view(&mut self, create: CreateView) -> Result<(), EngineError> {
         if self.relational_catalog.contains_key(&create.name)
+            || self.relational_sequences.contains_key(&create.name)
             || (!create.or_replace && self.relational_views.contains_key(&create.name))
         {
             return Err(EngineError::ApplyFailed(format!(
@@ -7590,9 +7606,35 @@ impl Engine {
         Ok(())
     }
 
+    fn apply_create_sequence(&mut self, create: CreateSequence) -> Result<(), EngineError> {
+        if self.relational_catalog.contains_key(&create.name)
+            || self.relational_views.contains_key(&create.name)
+            || self.relational_sequences.contains_key(&create.name)
+        {
+            return Err(EngineError::ApplyFailed(format!(
+                "relation \"{}\" already exists",
+                create.name
+            )));
+        }
+        let oid = self.relational_next_oid;
+        self.relational_next_oid = self.relational_next_oid.checked_add(1).ok_or_else(|| {
+            EngineError::ApplyFailed("relational sequence OID allocation exhausted".to_string())
+        })?;
+        self.relational_sequences.insert(
+            create.name.clone(),
+            RelationalSequence {
+                schema: PUBLIC_SCHEMA_NAME.to_string(),
+                name: create.name,
+                oid,
+            },
+        );
+        Ok(())
+    }
+
     fn apply_create_table(&mut self, create: CreateTable) -> Result<(), EngineError> {
         if self.relational_catalog.contains_key(&create.table)
             || self.relational_views.contains_key(&create.table)
+            || self.relational_sequences.contains_key(&create.table)
         {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" already exists",
@@ -7681,6 +7723,9 @@ impl Engine {
             .relational_catalog
             .values()
             .any(|table| table.indexes.iter().any(|index| index.name == add.name))
+            || self.relational_catalog.contains_key(&add.name)
+            || self.relational_views.contains_key(&add.name)
+            || self.relational_sequences.contains_key(&add.name)
         {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" already exists",
@@ -7720,6 +7765,9 @@ impl Engine {
             .relational_catalog
             .values()
             .any(|table| table.indexes.iter().any(|index| index.name == create.name))
+            || self.relational_catalog.contains_key(&create.name)
+            || self.relational_views.contains_key(&create.name)
+            || self.relational_sequences.contains_key(&create.name)
         {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" already exists",
@@ -7831,7 +7879,8 @@ impl Engine {
                 .indexes
                 .iter()
                 .any(|index| index.name == rename.new_name)
-        }) {
+        }) || self.relational_sequences.contains_key(&rename.new_name)
+        {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" already exists",
                 rename.new_name
@@ -8068,6 +8117,7 @@ impl Engine {
         }
         if self.relational_catalog.contains_key(&rename.new_name)
             || self.relational_views.contains_key(&rename.new_name)
+            || self.relational_sequences.contains_key(&rename.new_name)
         {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" already exists",
@@ -8244,7 +8294,8 @@ impl Engine {
                 | RelationalCommentTarget::Role { .. }
                 | RelationalCommentTarget::Schema { .. }
                 | RelationalCommentTarget::Tablespace { .. }
-                | RelationalCommentTarget::View { .. } => true,
+                | RelationalCommentTarget::View { .. }
+                | RelationalCommentTarget::Sequence { .. } => true,
             });
             self.relational_residency.remove(name);
             self.relational_residency_device_memory.remove(name);
@@ -8262,6 +8313,12 @@ impl Engine {
                 )));
             }
             if self.relational_views.contains_key(name) {
+                return Err(EngineError::ApplyFailed(format!(
+                    "relation \"{}\" is not a table",
+                    name
+                )));
+            }
+            if self.relational_sequences.contains_key(name) {
                 return Err(EngineError::ApplyFailed(format!(
                     "relation \"{}\" is not a table",
                     name
@@ -8331,6 +8388,20 @@ impl Engine {
         Ok(())
     }
 
+    fn apply_drop_sequence(&mut self, drop: DropSequence) -> Result<(), EngineError> {
+        self.preflight_drop_sequence(&drop)?;
+        for name in &drop.names {
+            if self.relational_sequences.remove(name).is_none() {
+                continue;
+            }
+            self.relational_comments
+                .remove(&RelationalCommentTarget::Sequence {
+                    sequence: name.clone(),
+                });
+        }
+        Ok(())
+    }
+
     fn preflight_drop_view(&self, drop: &DropView) -> Result<(), EngineError> {
         let mut seen = BTreeSet::new();
         for name in &drop.names {
@@ -8346,9 +8417,42 @@ impl Engine {
                     name
                 )));
             }
+            if self.relational_sequences.contains_key(name) {
+                return Err(EngineError::ApplyFailed(format!(
+                    "relation \"{}\" is not a view",
+                    name
+                )));
+            }
             if !drop.if_exists && !self.relational_views.contains_key(name) {
                 return Err(EngineError::ApplyFailed(format!(
                     "view \"{}\" does not exist",
+                    name
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn preflight_drop_sequence(&self, drop: &DropSequence) -> Result<(), EngineError> {
+        let mut seen = BTreeSet::new();
+        for name in &drop.names {
+            if !seen.insert(name) {
+                return Err(EngineError::ApplyFailed(format!(
+                    "sequence \"{}\" specified more than once",
+                    name
+                )));
+            }
+            if self.relational_catalog.contains_key(name)
+                || self.relational_views.contains_key(name)
+            {
+                return Err(EngineError::ApplyFailed(format!(
+                    "relation \"{}\" is not a sequence",
+                    name
+                )));
+            }
+            if !drop.if_exists && !self.relational_sequences.contains_key(name) {
+                return Err(EngineError::ApplyFailed(format!(
+                    "sequence \"{}\" does not exist",
                     name
                 )));
             }
@@ -8365,6 +8469,7 @@ impl Engine {
         }
         if self.relational_catalog.contains_key(&rename.new_name)
             || self.relational_views.contains_key(&rename.new_name)
+            || self.relational_sequences.contains_key(&rename.new_name)
         {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" already exists",
@@ -8473,7 +8578,9 @@ impl Engine {
             }
             CommentTarget::View { view } => {
                 if !self.relational_views.contains_key(&view) {
-                    if self.relational_catalog.contains_key(&view) {
+                    if self.relational_catalog.contains_key(&view)
+                        || self.relational_sequences.contains_key(&view)
+                    {
                         return Err(EngineError::ApplyFailed(format!(
                             "relation \"{}\" is not a view",
                             view
@@ -8485,6 +8592,23 @@ impl Engine {
                     )));
                 }
                 RelationalCommentTarget::View { view }
+            }
+            CommentTarget::Sequence { sequence } => {
+                if !self.relational_sequences.contains_key(&sequence) {
+                    if self.relational_catalog.contains_key(&sequence)
+                        || self.relational_views.contains_key(&sequence)
+                    {
+                        return Err(EngineError::ApplyFailed(format!(
+                            "relation \"{}\" is not a sequence",
+                            sequence
+                        )));
+                    }
+                    return Err(EngineError::ApplyFailed(format!(
+                        "sequence \"{}\" does not exist",
+                        sequence
+                    )));
+                }
+                RelationalCommentTarget::Sequence { sequence }
             }
             CommentTarget::Constraint { table, constraint } => {
                 let table_ref = self.relational_catalog.get(&table).ok_or_else(|| {
@@ -9395,6 +9519,7 @@ impl Engine {
             Command::DropTable(drop) => self.preflight_drop_table(drop)?,
             Command::DropIndex(drop) => self.preflight_drop_index(drop)?,
             Command::DropView(drop) => self.preflight_drop_view(drop)?,
+            Command::DropSequence(drop) => self.preflight_drop_sequence(drop)?,
             Command::Insert(insert) => {
                 let table = self.relational_catalog.get(&insert.table).ok_or_else(|| {
                     EngineError::ApplyFailed(format!(
@@ -9561,10 +9686,12 @@ impl Engine {
             | Command::RenameIndex(_)
             | Command::CreateView(_)
             | Command::RenameView(_)
+            | Command::CreateSequence(_)
             | Command::DropTable(_)
             | Command::TruncateTable(_)
             | Command::DropIndex(_)
             | Command::DropView(_)
+            | Command::DropSequence(_)
             | Command::AlterColumnDefault(_)
             | Command::CommentOn(_)
             | Command::Insert(_)
@@ -9765,10 +9892,12 @@ impl Engine {
             | Command::RenameIndex(_)
             | Command::CreateView(_)
             | Command::RenameView(_)
+            | Command::CreateSequence(_)
             | Command::DropTable(_)
             | Command::TruncateTable(_)
             | Command::DropIndex(_)
             | Command::DropView(_)
+            | Command::DropSequence(_)
             | Command::AlterColumnDefault(_)
             | Command::CommentOn(_)
             | Command::Insert(_)
@@ -9870,10 +9999,12 @@ impl Engine {
             Command::RenameIndex(_) => Err(ExecuteError::NonReadCommand("ALTER INDEX")),
             Command::CreateView(_) => Err(ExecuteError::NonReadCommand("CREATE VIEW")),
             Command::RenameView(_) => Err(ExecuteError::NonReadCommand("ALTER VIEW")),
+            Command::CreateSequence(_) => Err(ExecuteError::NonReadCommand("CREATE SEQUENCE")),
             Command::DropTable(_) => Err(ExecuteError::NonReadCommand("DROP TABLE")),
             Command::TruncateTable(_) => Err(ExecuteError::NonReadCommand("TRUNCATE TABLE")),
             Command::DropIndex(_) => Err(ExecuteError::NonReadCommand("DROP INDEX")),
             Command::DropView(_) => Err(ExecuteError::NonReadCommand("DROP VIEW")),
+            Command::DropSequence(_) => Err(ExecuteError::NonReadCommand("DROP SEQUENCE")),
             Command::AlterColumnDefault(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
             Command::CommentOn(_) => Err(ExecuteError::NonReadCommand("COMMENT")),
             Command::Insert(_) => Err(ExecuteError::NonReadCommand("INSERT")),
@@ -12949,6 +13080,10 @@ impl Engine {
         self.relational_views.get(view)
     }
 
+    pub fn relational_catalog_sequence(&self, sequence: &str) -> Option<&RelationalSequence> {
+        self.relational_sequences.get(sequence)
+    }
+
     pub fn relational_table_comment(&self, table: &str) -> Option<&str> {
         self.relational_comments
             .get(&RelationalCommentTarget::Table {
@@ -13010,6 +13145,14 @@ impl Engine {
         self.relational_comments
             .get(&RelationalCommentTarget::View {
                 view: view.to_string(),
+            })
+            .map(String::as_str)
+    }
+
+    pub fn relational_sequence_comment(&self, sequence: &str) -> Option<&str> {
+        self.relational_comments
+            .get(&RelationalCommentTarget::Sequence {
+                sequence: sequence.to_string(),
             })
             .map(String::as_str)
     }
@@ -31955,6 +32098,70 @@ mod tests {
         assert!(duplicate
             .to_string()
             .contains("view \"active_people\" specified more than once"));
+    }
+
+    #[test]
+    fn relational_sql_sequence_catalog_objects_replay_from_wal() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(2, "CREATE SEQUENCE public.people_seq")
+            .unwrap();
+        e.execute_text(3, "COMMENT ON SEQUENCE public.people_seq IS 'people ids'")
+            .unwrap();
+
+        let sequence = e.relational_catalog_sequence("people_seq").unwrap();
+        assert_eq!(sequence.name, "people_seq");
+        let oid = sequence.oid;
+        assert_eq!(
+            e.relational_sequence_comment("people_seq"),
+            Some("people ids")
+        );
+
+        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        assert_eq!(
+            recovered
+                .relational_catalog_sequence("people_seq")
+                .unwrap()
+                .oid,
+            oid
+        );
+        assert_eq!(
+            recovered.relational_sequence_comment("people_seq"),
+            Some("people ids")
+        );
+
+        e.execute_text(4, "DROP SEQUENCE IF EXISTS missing_seq, people_seq")
+            .unwrap();
+        assert!(e.relational_catalog_sequence("people_seq").is_none());
+        assert_eq!(e.relational_sequence_comment("people_seq"), None);
+
+        let recovered_after_drop =
+            Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        assert!(recovered_after_drop
+            .relational_catalog_sequence("people_seq")
+            .is_none());
+
+        let mut boundary = Engine::new_local();
+        boundary
+            .execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        let duplicate = boundary
+            .execute_text(2, "CREATE SEQUENCE people")
+            .unwrap_err();
+        assert!(duplicate
+            .to_string()
+            .contains("relation \"people\" already exists"));
+        let table_target = boundary
+            .execute_text(3, "DROP SEQUENCE people")
+            .unwrap_err();
+        assert!(table_target.to_string().contains("not a sequence"));
+        let missing = boundary
+            .execute_text(4, "DROP SEQUENCE missing_seq")
+            .unwrap_err();
+        assert!(missing
+            .to_string()
+            .contains("sequence \"missing_seq\" does not exist"));
     }
 
     #[test]

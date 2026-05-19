@@ -1,0 +1,51 @@
+=== psql bounded sequence catalog objects ===
+CREATE SEQUENCE
+CREATE SEQUENCE
+COMMENT
+             List of relations
+ Schema |    Name    |   Type   |  Owner
+--------+------------+----------+----------
+ public | seq_people | sequence | postgres
+ public | seq_teams  | sequence | postgres
+(2 rows)
+
+                                List of relations
+ Schema |    Name    |   Type   |  Owner   | Persistence |  Size   | Description
+--------+------------+----------+----------+-------------+---------+-------------
+ public | seq_people | sequence | postgres | permanent   | 0 bytes | people ids
+ public | seq_teams  | sequence | postgres | permanent   | 0 bytes |
+(2 rows)
+
+  oid  | nspname |  relname   | relkind | relpersistence
+-------+---------+------------+---------+----------------
+ 16384 | public  | seq_people | s       | p
+ 16385 | public  | seq_teams  | s       | p
+(2 rows)
+
+ nspname |  relname   | attname | description
+---------+------------+---------+-------------
+ public  | seq_people |         | people ids
+(1 row)
+
+             Object descriptions
+ Schema |    Name    |  Object  | Description
+--------+------------+----------+-------------
+ public | seq_people | sequence | people ids
+(1 row)
+
+psql:330_protocol_psql_sequences.sql:20: ERROR:  sequence does not exist
+             List of relations
+ Schema |    Name    |   Type   |  Owner
+--------+------------+----------+----------
+ public | seq_people | sequence | postgres
+ public | seq_teams  | sequence | postgres
+(2 rows)
+
+DROP SEQUENCE
+psql:330_protocol_psql_sequences.sql:23: error: Did not find any relations.
+CREATE TABLE
+psql:330_protocol_psql_sequences.sql:25: ERROR:  relation is not a sequence
+psql:330_protocol_psql_sequences.sql:26: ERROR:  relation already exists
+psql:330_protocol_psql_sequences.sql:27: ERROR:  query shape is not supported by the compatibility stub
+psql:330_protocol_psql_sequences.sql:28: ERROR:  relation is not a sequence
+psql:330_protocol_psql_sequences.sql:29: error: Did not find any relations.

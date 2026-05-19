@@ -1645,6 +1645,14 @@ fn shared_catalog_contains_view(view: &str) -> bool {
         .contains_key(view)
 }
 
+fn shared_catalog_contains_sequence(sequence: &str) -> bool {
+    shared_catalog()
+        .lock()
+        .expect("shared catalog mutex poisoned")
+        .sequences
+        .contains_key(sequence)
+}
+
 fn shared_catalog_contains_live_index(index: &str) -> bool {
     let catalog = shared_catalog()
         .lock()
@@ -1812,10 +1820,12 @@ struct Session {
     cursors: HashMap<String, Cursor>,
     tables: HashMap<String, Table>,
     views: HashMap<String, View>,
+    sequences: HashMap<String, Sequence>,
     indexes: Vec<CatalogIndex>,
     comments: BTreeMap<CatalogCommentTarget, String>,
     dirty_tables: BTreeSet<String>,
     dirty_views: BTreeSet<String>,
+    dirty_sequences: BTreeSet<String>,
     dirty_indexes: bool,
     dirty_comment_targets: BTreeSet<CatalogCommentTarget>,
     copy_in: Option<CopyInState>,
@@ -1827,6 +1837,7 @@ struct Session {
 struct SharedCatalog {
     tables: HashMap<String, Table>,
     views: HashMap<String, View>,
+    sequences: HashMap<String, Sequence>,
     indexes: Vec<CatalogIndex>,
     comments: BTreeMap<CatalogCommentTarget, String>,
     next_relation_oid: u32,
@@ -1837,6 +1848,7 @@ impl Default for SharedCatalog {
         Self {
             tables: HashMap::new(),
             views: HashMap::new(),
+            sequences: HashMap::new(),
             indexes: Vec::new(),
             comments: BTreeMap::new(),
             next_relation_oid: FIRST_USER_RELATION_OID,
@@ -1871,10 +1883,12 @@ impl Session {
             cursors: HashMap::new(),
             tables: catalog.tables,
             views: catalog.views,
+            sequences: catalog.sequences,
             indexes: catalog.indexes,
             comments: catalog.comments,
             dirty_tables: BTreeSet::new(),
             dirty_views: BTreeSet::new(),
+            dirty_sequences: BTreeSet::new(),
             dirty_indexes: false,
             dirty_comment_targets: BTreeSet::new(),
             copy_in: None,
@@ -1891,6 +1905,10 @@ impl Session {
         self.dirty_views.insert(view.into());
     }
 
+    fn mark_sequence_dirty(&mut self, sequence: impl Into<String>) {
+        self.dirty_sequences.insert(sequence.into());
+    }
+
     fn mark_comment_dirty(&mut self, target: CatalogCommentTarget) {
         self.dirty_comment_targets.insert(target);
     }
@@ -1899,6 +1917,7 @@ impl Session {
         if !self.shared_catalog {
             self.dirty_tables.clear();
             self.dirty_views.clear();
+            self.dirty_sequences.clear();
             self.dirty_comment_targets.clear();
             return;
         }
@@ -1917,6 +1936,15 @@ impl Session {
                 catalog.views.insert(view_name.clone(), view.clone());
             } else {
                 catalog.views.remove(view_name);
+            }
+        }
+        for sequence_name in &self.dirty_sequences {
+            if let Some(sequence) = self.sequences.get(sequence_name) {
+                catalog
+                    .sequences
+                    .insert(sequence_name.clone(), sequence.clone());
+            } else {
+                catalog.sequences.remove(sequence_name);
             }
         }
         catalog.next_relation_oid = catalog.next_relation_oid.max(self.next_relation_oid);
@@ -1963,6 +1991,7 @@ impl Session {
         self.dirty_comment_targets.clear();
         self.dirty_tables.clear();
         self.dirty_views.clear();
+        self.dirty_sequences.clear();
     }
 
     fn close_extended_target(&mut self, target: DescribeTarget, name: &str) {
@@ -2012,6 +2041,12 @@ struct View {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+struct Sequence {
+    oid: u32,
+    name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct CatalogColumn {
     attnum: i16,
     def: gpu_db_protocol::ColumnDef,
@@ -2037,6 +2072,7 @@ enum CatalogCommentTarget {
     Column { table: String, attnum: i16 },
     Index { index: String },
     View { view: String },
+    Sequence { sequence: String },
     Constraint { table: String, constraint: String },
 }
 
@@ -5909,7 +5945,8 @@ fn execute_statement(
                 | CatalogCommentTarget::Role { .. }
                 | CatalogCommentTarget::Schema { .. }
                 | CatalogCommentTarget::Tablespace { .. }
-                | CatalogCommentTarget::View { .. } => false,
+                | CatalogCommentTarget::View { .. }
+                | CatalogCommentTarget::Sequence { .. } => false,
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -6352,7 +6389,10 @@ fn execute_statement(
         Err(_) => {}
         Ok(command) => match command {
             Command::CreateTable(create) => {
-                if session.tables.contains_key(&create.table) {
+                if session.tables.contains_key(&create.table)
+                    || session.views.contains_key(&create.table)
+                    || session.sequences.contains_key(&create.table)
+                {
                     return write_error(
                         stream,
                         &ErrorField {
@@ -6536,6 +6576,9 @@ fn execute_statement(
                     .indexes
                     .iter()
                     .any(|index| index.name == create.name)
+                    || session.tables.contains_key(&create.name)
+                    || session.views.contains_key(&create.name)
+                    || session.sequences.contains_key(&create.name)
                 {
                     return write_error(
                         stream,
@@ -6606,6 +6649,7 @@ fn execute_statement(
             }
             Command::CreateView(create) => {
                 if session.tables.contains_key(&create.name)
+                    || session.sequences.contains_key(&create.name)
                     || (!create.or_replace && session.views.contains_key(&create.name))
                 {
                     return write_error(
@@ -6686,6 +6730,7 @@ fn execute_statement(
                 }
                 if session.tables.contains_key(&rename.new_name)
                     || session.views.contains_key(&rename.new_name)
+                    || session.sequences.contains_key(&rename.new_name)
                 {
                     return write_error(
                         stream,
@@ -6718,6 +6763,46 @@ fn execute_statement(
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, "ALTER VIEW");
             }
+            Command::CreateSequence(create) => {
+                if session.tables.contains_key(&create.name)
+                    || session.views.contains_key(&create.name)
+                    || session.sequences.contains_key(&create.name)
+                {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "42P07",
+                            message: "relation already exists",
+                            position: None,
+                        },
+                    );
+                }
+                let oid = session.next_relation_oid;
+                session.next_relation_oid = match session.next_relation_oid.checked_add(1) {
+                    Some(next) => next,
+                    None => {
+                        return write_error(
+                            stream,
+                            &ErrorField {
+                                code: "54000",
+                                message: "relation OID allocation exhausted",
+                                position: None,
+                            },
+                        );
+                    }
+                };
+                let name = create.name;
+                session.sequences.insert(
+                    name.clone(),
+                    Sequence {
+                        oid,
+                        name: name.clone(),
+                    },
+                );
+                session.mark_sequence_dirty(name);
+                session.persist_catalog_snapshot();
+                return write_command_complete(stream, "CREATE SEQUENCE");
+            }
             Command::DropView(drop) => {
                 let mut seen = BTreeSet::new();
                 for name in &drop.names {
@@ -6732,6 +6817,16 @@ fn execute_statement(
                         );
                     }
                     if session.tables.contains_key(name) {
+                        return write_error(
+                            stream,
+                            &ErrorField {
+                                code: "42809",
+                                message: "relation is not a view",
+                                position: None,
+                            },
+                        );
+                    }
+                    if session.sequences.contains_key(name) {
                         return write_error(
                             stream,
                             &ErrorField {
@@ -6763,6 +6858,53 @@ fn execute_statement(
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, "DROP VIEW");
             }
+            Command::DropSequence(drop) => {
+                let mut seen = BTreeSet::new();
+                for name in &drop.names {
+                    if !seen.insert(name) {
+                        return write_error(
+                            stream,
+                            &ErrorField {
+                                code: "42710",
+                                message: "sequence specified more than once",
+                                position: None,
+                            },
+                        );
+                    }
+                    if session.tables.contains_key(name) || session.views.contains_key(name) {
+                        return write_error(
+                            stream,
+                            &ErrorField {
+                                code: "42809",
+                                message: "relation is not a sequence",
+                                position: None,
+                            },
+                        );
+                    }
+                    if !drop.if_exists && !session.sequences.contains_key(name) {
+                        return write_error(
+                            stream,
+                            &ErrorField {
+                                code: "42P01",
+                                message: "sequence does not exist",
+                                position: None,
+                            },
+                        );
+                    }
+                }
+                for name in &drop.names {
+                    if session.sequences.remove(name).is_some() {
+                        let target = CatalogCommentTarget::Sequence {
+                            sequence: name.clone(),
+                        };
+                        session.comments.remove(&target);
+                        session.mark_comment_dirty(target);
+                    }
+                    session.mark_sequence_dirty(name.clone());
+                }
+                session.persist_catalog_snapshot();
+                return write_command_complete(stream, "DROP SEQUENCE");
+            }
             Command::DropTable(drop) => {
                 let mut seen = BTreeSet::new();
                 for name in &drop.names {
@@ -6777,6 +6919,16 @@ fn execute_statement(
                         );
                     }
                     if session.views.contains_key(name) {
+                        return write_error(
+                            stream,
+                            &ErrorField {
+                                code: "42809",
+                                message: "relation is not a table",
+                                position: None,
+                            },
+                        );
+                    }
+                    if session.sequences.contains_key(name) {
                         return write_error(
                             stream,
                             &ErrorField {
@@ -6829,7 +6981,8 @@ fn execute_statement(
                         | CatalogCommentTarget::Role { .. }
                         | CatalogCommentTarget::Schema { .. }
                         | CatalogCommentTarget::Tablespace { .. }
-                        | CatalogCommentTarget::View { .. } => false,
+                        | CatalogCommentTarget::View { .. }
+                        | CatalogCommentTarget::Sequence { .. } => false,
                     })
                     .cloned()
                     .collect::<Vec<_>>();
@@ -6883,7 +7036,8 @@ fn execute_statement(
                             | CatalogCommentTarget::Table { .. }
                             | CatalogCommentTarget::Column { .. }
                             | CatalogCommentTarget::Index { .. }
-                            | CatalogCommentTarget::View { .. } => false,
+                            | CatalogCommentTarget::View { .. }
+                            | CatalogCommentTarget::Sequence { .. } => false,
                         })
                         .cloned()
                         .collect::<Vec<_>>();
@@ -7157,6 +7311,9 @@ fn execute_statement(
                         if !exists {
                             if session.tables.contains_key(&view)
                                 || (session.shared_catalog && shared_catalog_contains_table(&view))
+                                || session.sequences.contains_key(&view)
+                                || (session.shared_catalog
+                                    && shared_catalog_contains_sequence(&view))
                             {
                                 return write_error(
                                     stream,
@@ -7177,6 +7334,37 @@ fn execute_statement(
                             );
                         }
                         CatalogCommentTarget::View { view }
+                    }
+                    CommentTarget::Sequence { sequence } => {
+                        let exists = session.sequences.contains_key(&sequence)
+                            || (session.shared_catalog
+                                && shared_catalog_contains_sequence(&sequence));
+                        if !exists {
+                            if session.tables.contains_key(&sequence)
+                                || session.views.contains_key(&sequence)
+                                || (session.shared_catalog
+                                    && (shared_catalog_contains_table(&sequence)
+                                        || shared_catalog_contains_view(&sequence)))
+                            {
+                                return write_error(
+                                    stream,
+                                    &ErrorField {
+                                        code: "42809",
+                                        message: "relation is not a sequence",
+                                        position: None,
+                                    },
+                                );
+                            }
+                            return write_error(
+                                stream,
+                                &ErrorField {
+                                    code: "42P01",
+                                    message: "sequence does not exist",
+                                    position: None,
+                                },
+                            );
+                        }
+                        CatalogCommentTarget::Sequence { sequence }
                     }
                     CommentTarget::Constraint { table, constraint } => {
                         let table_exists = session.tables.contains_key(&table)
@@ -7690,7 +7878,7 @@ fn execute_statement(
                 text_column("Type"),
                 text_column("Owner"),
             ],
-            &catalog_empty_rows(),
+            &psql_describe_sequence_rows(session),
         );
     }
     if canonical == psql_describe_sequences_verbose_catalog_query() {
@@ -7705,7 +7893,7 @@ fn execute_statement(
                 text_column("Size"),
                 text_column("Description"),
             ],
-            &catalog_empty_rows(),
+            &psql_describe_sequence_verbose_rows(session),
         );
     }
     if canonical == psql_describe_functions_catalog_query() {
@@ -8397,6 +8585,19 @@ fn execute_statement(
             &pg_catalog_class_plain_table_rows(session),
         );
     }
+    if canonical == pg_catalog_class_sequences_query() {
+        return write_single_row(
+            stream,
+            &[
+                int4_column("oid"),
+                text_column("nspname"),
+                text_column("relname"),
+                text_column("relkind"),
+                text_column("relpersistence"),
+            ],
+            &pg_catalog_class_sequence_rows(session),
+        );
+    }
     if let Some(tables) = pg_catalog_class_plain_tables_in_query_tables(&canonical) {
         return write_single_row(
             stream,
@@ -8754,7 +8955,9 @@ fn execute_statement(
             &pg_catalog_attrdef_rows(session),
         );
     }
-    if canonical == pg_catalog_descriptions_query() {
+    if canonical == pg_catalog_descriptions_query()
+        || canonical == pg_catalog_descriptions_with_sequences_query()
+    {
         return write_single_row(
             stream,
             &[
@@ -8790,7 +8993,9 @@ fn execute_statement(
             &pg_catalog_constraint_description_rows(session),
         );
     }
-    if canonical == pg_catalog_table_index_descriptions_query() {
+    if canonical == pg_catalog_table_index_descriptions_query()
+        || canonical == pg_catalog_table_index_sequence_descriptions_query()
+    {
         return write_single_row(
             stream,
             &[
@@ -10755,36 +10960,57 @@ fn catalog_describe_relation_lookup_rows(
     session: &Session,
     relname_pattern: &str,
 ) -> Vec<Vec<Option<String>>> {
+    let mut rows = Vec::new();
     let mut tables = session.tables.values().collect::<Vec<_>>();
     tables.sort_by(|left, right| left.name.cmp(&right.name));
-    tables
+    for table in tables
         .into_iter()
         .filter(|table| psql_relname_pattern_matches(relname_pattern, &table.name))
-        .map(|table| {
-            vec![
-                Some(table.oid.to_string()),
-                Some("public".to_string()),
-                Some(table.name.clone()),
-            ]
-        })
-        .collect()
+    {
+        rows.push(vec![
+            Some(table.oid.to_string()),
+            Some("public".to_string()),
+            Some(table.name.clone()),
+        ]);
+    }
+    let mut sequences = session.sequences.values().collect::<Vec<_>>();
+    sequences.sort_by(|left, right| left.name.cmp(&right.name));
+    for sequence in sequences
+        .into_iter()
+        .filter(|sequence| psql_relname_pattern_matches(relname_pattern, &sequence.name))
+    {
+        rows.push(vec![
+            Some(sequence.oid.to_string()),
+            Some("public".to_string()),
+            Some(sequence.name.clone()),
+        ]);
+    }
+    rows
 }
 
 fn catalog_describe_relation_lookup_rows_for_public_namespace(
     session: &Session,
 ) -> Vec<Vec<Option<String>>> {
+    let mut rows = Vec::new();
     let mut tables = session.tables.values().collect::<Vec<_>>();
     tables.sort_by(|left, right| left.name.cmp(&right.name));
-    tables
-        .into_iter()
-        .map(|table| {
-            vec![
-                Some(table.oid.to_string()),
-                Some("public".to_string()),
-                Some(table.name.clone()),
-            ]
-        })
-        .collect()
+    for table in tables {
+        rows.push(vec![
+            Some(table.oid.to_string()),
+            Some("public".to_string()),
+            Some(table.name.clone()),
+        ]);
+    }
+    let mut sequences = session.sequences.values().collect::<Vec<_>>();
+    sequences.sort_by(|left, right| left.name.cmp(&right.name));
+    for sequence in sequences {
+        rows.push(vec![
+            Some(sequence.oid.to_string()),
+            Some("public".to_string()),
+            Some(sequence.name.clone()),
+        ]);
+    }
+    rows
 }
 
 fn catalog_describe_relation_flags_query_oid(canonical: &str) -> Option<u32> {
@@ -10802,6 +11028,29 @@ fn catalog_describe_relation_flags_query_oid(canonical: &str) -> Option<u32> {
 }
 
 fn catalog_describe_relation_flags_rows(session: &Session, oid: u32) -> Vec<Vec<Option<String>>> {
+    if session
+        .sequences
+        .values()
+        .any(|sequence| sequence.oid == oid)
+    {
+        return vec![vec![
+            Some("0".to_string()),
+            Some("s".to_string()),
+            Some("f".to_string()),
+            Some("f".to_string()),
+            Some("f".to_string()),
+            Some("f".to_string()),
+            Some("f".to_string()),
+            Some("f".to_string()),
+            Some("f".to_string()),
+            Some(String::new()),
+            Some("0".to_string()),
+            Some(String::new()),
+            Some("p".to_string()),
+            Some("d".to_string()),
+            None,
+        ]];
+    }
     let Some(table) = session.tables.values().find(|table| table.oid == oid) else {
         return Vec::new();
     };
@@ -11219,6 +11468,27 @@ fn pg_catalog_class_plain_table_rows_from_tables(tables: Vec<&Table>) -> Vec<Vec
                 Some("public".to_string()),
                 Some(table.name.clone()),
                 Some("r".to_string()),
+                Some("p".to_string()),
+            ]
+        })
+        .collect()
+}
+
+fn pg_catalog_class_sequences_query() -> &'static str {
+    "select c.oid, n.nspname, c.relname, c.relkind, c.relpersistence from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace where n.nspname = 'public' and c.relkind = 's' order by c.relname"
+}
+
+fn pg_catalog_class_sequence_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut sequences = session.sequences.values().collect::<Vec<_>>();
+    sequences.sort_by(|left, right| left.name.cmp(&right.name));
+    sequences
+        .into_iter()
+        .map(|sequence| {
+            vec![
+                Some(sequence.oid.to_string()),
+                Some("public".to_string()),
+                Some(sequence.name.clone()),
+                Some("s".to_string()),
                 Some("p".to_string()),
             ]
         })
@@ -11777,6 +12047,48 @@ fn psql_describe_view_verbose_rows(session: &Session) -> Vec<Vec<Option<String>>
     rows
 }
 
+fn psql_describe_sequence_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut rows = session
+        .sequences
+        .values()
+        .map(|sequence| {
+            vec![
+                Some("public".to_string()),
+                Some(sequence.name.clone()),
+                Some("sequence".to_string()),
+                Some("postgres".to_string()),
+            ]
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| left[1].cmp(&right[1]));
+    rows
+}
+
+fn psql_describe_sequence_verbose_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut rows = session
+        .sequences
+        .values()
+        .map(|sequence| {
+            vec![
+                Some("public".to_string()),
+                Some(sequence.name.clone()),
+                Some("sequence".to_string()),
+                Some("postgres".to_string()),
+                Some("permanent".to_string()),
+                Some("0 bytes".to_string()),
+                session
+                    .comments
+                    .get(&CatalogCommentTarget::Sequence {
+                        sequence: sequence.name.clone(),
+                    })
+                    .cloned(),
+            ]
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| left[1].cmp(&right[1]));
+    rows
+}
+
 fn pg_catalog_constraints_query() -> &'static str {
     "select n.nspname, c.relname, con.conname, con.contype from pg_catalog.pg_constraint con join pg_catalog.pg_class c on c.oid = con.conrelid join pg_catalog.pg_namespace n on n.oid = c.relnamespace where n.nspname = 'public' order by c.relname, con.conname"
 }
@@ -11823,6 +12135,10 @@ fn pg_catalog_descriptions_query() -> &'static str {
     "select n.nspname, c.relname, a.attname, d.description from pg_catalog.pg_description d join pg_catalog.pg_class c on c.oid = d.objoid join pg_catalog.pg_namespace n on n.oid = c.relnamespace left join pg_catalog.pg_attribute a on a.attrelid = c.oid and a.attnum = d.objsubid where n.nspname = 'public' and c.relkind in ('r','v') order by c.relname, d.objsubid"
 }
 
+fn pg_catalog_descriptions_with_sequences_query() -> &'static str {
+    "select n.nspname, c.relname, a.attname, d.description from pg_catalog.pg_description d join pg_catalog.pg_class c on c.oid = d.objoid join pg_catalog.pg_namespace n on n.oid = c.relnamespace left join pg_catalog.pg_attribute a on a.attrelid = c.oid and a.attnum = d.objsubid where n.nspname = 'public' and c.relkind in ('r','v','s') order by c.relname, d.objsubid"
+}
+
 fn pg_catalog_table_descriptions_query() -> &'static str {
     "select n.nspname, c.relname, a.attname, d.description from pg_catalog.pg_description d join pg_catalog.pg_class c on c.oid = d.objoid join pg_catalog.pg_namespace n on n.oid = c.relnamespace left join pg_catalog.pg_attribute a on a.attrelid = c.oid and a.attnum = d.objsubid where n.nspname = 'public' and c.relkind = 'r' order by c.relname, d.objsubid"
 }
@@ -11833,6 +12149,10 @@ fn pg_catalog_constraint_descriptions_query() -> &'static str {
 
 fn pg_catalog_table_index_descriptions_query() -> &'static str {
     "select n.nspname, c.relname, c.relkind, a.attname, d.description from pg_catalog.pg_description d join pg_catalog.pg_class c on c.oid = d.objoid join pg_catalog.pg_namespace n on n.oid = c.relnamespace left join pg_catalog.pg_attribute a on a.attrelid = c.oid and a.attnum = d.objsubid where n.nspname = 'public' and c.relkind in ('r','i','v') order by c.relkind, c.relname, d.objsubid"
+}
+
+fn pg_catalog_table_index_sequence_descriptions_query() -> &'static str {
+    "select n.nspname, c.relname, c.relkind, a.attname, d.description from pg_catalog.pg_description d join pg_catalog.pg_class c on c.oid = d.objoid join pg_catalog.pg_namespace n on n.oid = c.relnamespace left join pg_catalog.pg_attribute a on a.attrelid = c.oid and a.attnum = d.objsubid where n.nspname = 'public' and c.relkind in ('r','i','v','s') order by c.relkind, c.relname, d.objsubid"
 }
 
 fn pg_catalog_table_index_descriptions_without_views_query() -> &'static str {
@@ -11882,6 +12202,20 @@ fn pg_catalog_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
             rows.push(vec![
                 Some("public".to_string()),
                 Some(view.name.clone()),
+                None,
+                Some(description.clone()),
+            ]);
+        }
+    }
+    let mut sequences = session.sequences.values().collect::<Vec<_>>();
+    sequences.sort_by(|left, right| left.name.cmp(&right.name));
+    for sequence in sequences {
+        if let Some(description) = session.comments.get(&CatalogCommentTarget::Sequence {
+            sequence: sequence.name.clone(),
+        }) {
+            rows.push(vec![
+                Some("public".to_string()),
+                Some(sequence.name.clone()),
                 None,
                 Some(description.clone()),
             ]);
@@ -11941,11 +12275,11 @@ fn pg_catalog_table_index_description_rows(session: &Session) -> Vec<Vec<Option<
         }
     }
     for row in pg_catalog_description_rows(session) {
-        let relkind = if session
-            .views
-            .contains_key(row[1].as_deref().unwrap_or_default())
-        {
+        let name = row[1].as_deref().unwrap_or_default();
+        let relkind = if session.views.contains_key(name) {
             "v"
+        } else if session.sequences.contains_key(name) {
+            "s"
         } else {
             "r"
         };
@@ -12048,6 +12382,20 @@ fn pg_dump_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
             ]);
         }
     }
+    let mut sequences = session.sequences.values().collect::<Vec<_>>();
+    sequences.sort_by_key(|sequence| sequence.oid);
+    for sequence in sequences {
+        if let Some(description) = session.comments.get(&CatalogCommentTarget::Sequence {
+            sequence: sequence.name.clone(),
+        }) {
+            rows.push(vec![
+                Some(description.clone()),
+                Some("1259".to_string()),
+                Some(sequence.oid.to_string()),
+                Some("0".to_string()),
+            ]);
+        }
+    }
     let mut index_comments = session
         .comments
         .iter()
@@ -12060,6 +12408,7 @@ fn pg_dump_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
             | CatalogCommentTarget::Table { .. }
             | CatalogCommentTarget::Column { .. }
             | CatalogCommentTarget::View { .. }
+            | CatalogCommentTarget::Sequence { .. }
             | CatalogCommentTarget::Constraint { .. } => None,
         })
         .collect::<Vec<_>>();
@@ -12088,6 +12437,7 @@ fn pg_dump_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
             | CatalogCommentTarget::Table { .. }
             | CatalogCommentTarget::Column { .. }
             | CatalogCommentTarget::View { .. }
+            | CatalogCommentTarget::Sequence { .. }
             | CatalogCommentTarget::Index { .. } => None,
         })
         .collect::<Vec<_>>();
@@ -12145,6 +12495,20 @@ fn psql_object_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
                 Some("public".to_string()),
                 Some(view.name.clone()),
                 Some("view".to_string()),
+                Some(description.clone()),
+            ]);
+        }
+    }
+    let mut sequences = session.sequences.values().collect::<Vec<_>>();
+    sequences.sort_by(|left, right| left.name.cmp(&right.name));
+    for sequence in sequences {
+        if let Some(description) = session.comments.get(&CatalogCommentTarget::Sequence {
+            sequence: sequence.name.clone(),
+        }) {
+            rows.push(vec![
+                Some("public".to_string()),
+                Some(sequence.name.clone()),
+                Some("sequence".to_string()),
                 Some(description.clone()),
             ]);
         }

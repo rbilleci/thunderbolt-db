@@ -22,6 +22,8 @@ pub enum Command {
     RenameIndex(RenameIndex),
     CreateView(CreateView),
     RenameView(RenameView),
+    CreateSequence(CreateSequence),
+    DropSequence(DropSequence),
     DropTable(DropTable),
     TruncateTable(TruncateTable),
     DropIndex(DropIndex),
@@ -139,6 +141,17 @@ pub struct RenameView {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateSequence {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropSequence {
+    pub names: Vec<String>,
+    pub if_exists: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DropTable {
     pub names: Vec<String>,
     pub if_exists: bool,
@@ -184,6 +197,7 @@ pub enum CommentTarget {
     Column { table: String, column: String },
     Index { index: String },
     View { view: String },
+    Sequence { sequence: String },
     Constraint { table: String, constraint: String },
 }
 
@@ -1706,6 +1720,9 @@ fn parse_relational_command(input: &str) -> Option<Result<Command, ParseError>> 
         if second.eq_ignore_ascii_case("VIEW") {
             return Some(parse_create_view(input).map(Command::CreateView));
         }
+        if second.eq_ignore_ascii_case("SEQUENCE") {
+            return Some(parse_create_sequence(input).map(Command::CreateSequence));
+        }
         if second.eq_ignore_ascii_case("OR") {
             let third = input.split_whitespace().nth(2)?;
             let fourth = input.split_whitespace().nth(3)?;
@@ -1725,6 +1742,9 @@ fn parse_relational_command(input: &str) -> Option<Result<Command, ParseError>> 
         }
         if second.eq_ignore_ascii_case("VIEW") {
             return Some(parse_drop_view(input).map(Command::DropView));
+        }
+        if second.eq_ignore_ascii_case("SEQUENCE") {
+            return Some(parse_drop_sequence(input).map(Command::DropSequence));
         }
         return Some(Err(ParseError::InvalidRelationalSql));
     }
@@ -1875,6 +1895,15 @@ fn parse_comment_on(input: &str) -> Result<CommentOn, ParseError> {
         let view = normalize_relation_identifier(rest[..is_pos].trim())?;
         (
             CommentTarget::View { view },
+            rest[is_pos + "IS".len()..].trim(),
+        )
+    } else if let Some(rest) = strip_keyword_prefix_case_insensitive(rest, "SEQUENCE") {
+        let rest = rest.trim_start();
+        let is_pos =
+            find_keyword_outside_quotes(rest, "IS").ok_or(ParseError::InvalidRelationalSql)?;
+        let sequence = normalize_relation_identifier(rest[..is_pos].trim())?;
+        (
+            CommentTarget::Sequence { sequence },
             rest[is_pos + "IS".len()..].trim(),
         )
     } else if let Some(rest) = strip_keyword_prefix_case_insensitive(rest, "CONSTRAINT") {
@@ -2501,6 +2530,24 @@ fn parse_create_view(input: &str) -> Result<CreateView, ParseError> {
     })
 }
 
+fn parse_create_sequence(input: &str) -> Result<CreateSequence, ParseError> {
+    let rest = strip_keyword_prefix_case_insensitive(input, "CREATE")
+        .and_then(|s| strip_keyword_prefix_case_insensitive(s.trim_start(), "SEQUENCE"))
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim();
+    if rest.is_empty()
+        || strip_keyword_prefix_case_insensitive(rest, "IF").is_some()
+        || strip_keyword_prefix_case_insensitive(rest, "TEMP").is_some()
+        || strip_keyword_prefix_case_insensitive(rest, "TEMPORARY").is_some()
+        || rest.split_whitespace().count() != 1
+    {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    Ok(CreateSequence {
+        name: normalize_relation_identifier(rest)?,
+    })
+}
+
 fn parse_create_index(input: &str) -> Result<CreateIndex, ParseError> {
     let rest = strip_keyword_prefix_case_insensitive(input, "CREATE")
         .ok_or(ParseError::InvalidRelationalSql)?
@@ -2732,6 +2779,38 @@ fn parse_drop_view(input: &str) -> Result<DropView, ParseError> {
         names: views
             .iter()
             .map(|view| normalize_relation_identifier(view.trim()))
+            .collect::<Result<Vec<_>, _>>()?,
+        if_exists,
+    })
+}
+
+fn parse_drop_sequence(input: &str) -> Result<DropSequence, ParseError> {
+    let mut rest = strip_keyword_prefix_case_insensitive(input, "DROP")
+        .and_then(|s| strip_keyword_prefix_case_insensitive(s.trim_start(), "SEQUENCE"))
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    let if_exists = if let Some(after_if) = strip_keyword_prefix_case_insensitive(rest, "IF") {
+        let after_exists = strip_keyword_prefix_case_insensitive(after_if.trim_start(), "EXISTS")
+            .ok_or(ParseError::InvalidRelationalSql)?;
+        rest = after_exists.trim_start();
+        true
+    } else {
+        false
+    };
+    if rest.is_empty()
+        || find_keyword_outside_quotes(rest, "CASCADE").is_some()
+        || find_keyword_outside_quotes(rest, "RESTRICT").is_some()
+    {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let sequences = split_csv(rest)?;
+    if sequences.is_empty() {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    Ok(DropSequence {
+        names: sequences
+            .into_iter()
+            .map(|sequence| normalize_relation_identifier(sequence.trim()))
             .collect::<Result<Vec<_>, _>>()?,
         if_exists,
     })
@@ -11846,6 +11925,41 @@ mod tests {
 
         assert!(matches!(
             parse_command("SELECT MIN(id), name FROM people"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+    }
+
+    #[test]
+    fn parses_bounded_sequence_catalog_ddl() {
+        assert_eq!(
+            parse_command("CREATE SEQUENCE public.seq_people").unwrap(),
+            Command::CreateSequence(CreateSequence {
+                name: "seq_people".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_command("DROP SEQUENCE IF EXISTS public.seq_people, seq_teams").unwrap(),
+            Command::DropSequence(DropSequence {
+                names: vec!["seq_people".to_string(), "seq_teams".to_string()],
+                if_exists: true,
+            })
+        );
+        assert_eq!(
+            parse_command("COMMENT ON SEQUENCE public.seq_people IS 'ids'").unwrap(),
+            Command::CommentOn(CommentOn {
+                target: CommentTarget::Sequence {
+                    sequence: "seq_people".to_string(),
+                },
+                comment: Some("ids".to_string()),
+            })
+        );
+
+        assert!(matches!(
+            parse_command("CREATE SEQUENCE seq_people START WITH 10"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command("DROP SEQUENCE seq_people CASCADE"),
             Err(ParseError::InvalidRelationalSql)
         ));
     }
