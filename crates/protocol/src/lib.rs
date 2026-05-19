@@ -29,6 +29,7 @@ pub enum Command {
     CreateMaterializedView(CreateMaterializedView),
     RefreshMaterializedView(RefreshMaterializedView),
     RenameMaterializedView(RenameMaterializedView),
+    CreateExtension(CreateExtension),
     CreateSequence(CreateSequence),
     CreateDomain(CreateDomain),
     SequenceNextVal(SequenceNextVal),
@@ -414,6 +415,13 @@ pub struct CreateDomain {
 pub struct DropDomain {
     pub domains: Vec<String>,
     pub if_exists: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateExtension {
+    pub name: String,
+    pub if_not_exists: bool,
+    pub schema: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1973,6 +1981,9 @@ fn parse_relational_command(input: &str) -> Option<Result<Command, ParseError>> 
         }
         if second.eq_ignore_ascii_case("SUBSCRIPTION") {
             return Some(parse_create_subscription(input).map(Command::CreateSubscription));
+        }
+        if second.eq_ignore_ascii_case("EXTENSION") {
+            return Some(parse_create_extension(input).map(Command::CreateExtension));
         }
         if second.eq_ignore_ascii_case("OR") {
             let third = input.split_whitespace().nth(2)?;
@@ -4222,6 +4233,50 @@ fn parse_create_domain(input: &str) -> Result<CreateDomain, ParseError> {
     }
     let base_type = parse_supported_sql_type_name(tail).ok_or(ParseError::InvalidRelationalSql)?;
     Ok(CreateDomain { name, base_type })
+}
+
+fn parse_create_extension(input: &str) -> Result<CreateExtension, ParseError> {
+    let mut rest = strip_keyword_prefix_case_insensitive(input, "CREATE")
+        .and_then(|s| strip_keyword_prefix_case_insensitive(s.trim_start(), "EXTENSION"))
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    let if_not_exists = if let Some(after_if) = strip_keyword_prefix_case_insensitive(rest, "IF") {
+        let after_not = strip_keyword_prefix_case_insensitive(after_if.trim_start(), "NOT")
+            .ok_or(ParseError::InvalidRelationalSql)?;
+        let after_exists = strip_keyword_prefix_case_insensitive(after_not.trim_start(), "EXISTS")
+            .ok_or(ParseError::InvalidRelationalSql)?;
+        rest = after_exists.trim_start();
+        true
+    } else {
+        false
+    };
+    if rest.is_empty() {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let (name, tail) = if let Some(with_pos) = find_keyword_outside_quotes(rest, "WITH") {
+        (
+            normalize_identifier(rest[..with_pos].trim())?,
+            rest[with_pos + "WITH".len()..].trim_start(),
+        )
+    } else {
+        (normalize_identifier(rest)?, "")
+    };
+    let schema = if tail.is_empty() {
+        None
+    } else {
+        let schema = strip_keyword_prefix_case_insensitive(tail, "SCHEMA")
+            .ok_or(ParseError::InvalidRelationalSql)?
+            .trim_start();
+        if schema.is_empty() || find_keyword_outside_quotes(schema, "VERSION").is_some() {
+            return Err(ParseError::InvalidRelationalSql);
+        }
+        Some(normalize_identifier(schema)?)
+    };
+    Ok(CreateExtension {
+        name,
+        if_not_exists,
+        schema,
+    })
 }
 
 fn parse_drop_domain(input: &str) -> Result<DropDomain, ParseError> {
@@ -13973,6 +14028,50 @@ default: Some(ColumnDefault::SequenceNextVal {
         ));
         assert!(matches!(
             parse_command("DROP DOMAIN account_id CASCADE"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+    }
+
+    #[test]
+    fn parses_bounded_bootstrap_extension_create() {
+        assert_eq!(
+            parse_command("CREATE EXTENSION IF NOT EXISTS plpgsql").unwrap(),
+            Command::CreateExtension(CreateExtension {
+                name: "plpgsql".to_string(),
+                if_not_exists: true,
+                schema: None,
+            })
+        );
+        assert_eq!(
+            parse_command("CREATE EXTENSION IF NOT EXISTS \"plpgsql\" WITH SCHEMA pg_catalog")
+                .unwrap(),
+            Command::CreateExtension(CreateExtension {
+                name: "plpgsql".to_string(),
+                if_not_exists: true,
+                schema: Some("pg_catalog".to_string()),
+            })
+        );
+        assert_eq!(
+            parse_command("CREATE EXTENSION plpgsql").unwrap(),
+            Command::CreateExtension(CreateExtension {
+                name: "plpgsql".to_string(),
+                if_not_exists: false,
+                schema: None,
+            })
+        );
+
+        assert!(matches!(
+            parse_command("CREATE EXTENSION IF NOT EXISTS plpgsql VERSION '1.0'"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command("CREATE EXTENSION IF NOT EXISTS plpgsql WITH VERSION '1.0'"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command(
+                "CREATE EXTENSION IF NOT EXISTS plpgsql WITH SCHEMA public VERSION '1.0'"
+            ),
             Err(ParseError::InvalidRelationalSql)
         ));
     }

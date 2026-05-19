@@ -1,5 +1,11 @@
 === catalog psql list bootstrap extension ===
 Pager usage is off.
+CREATE EXTENSION
+CREATE EXTENSION
+psql:54_catalog_psql_list_extensions_empty.sql:5: ERROR:  extension "plpgsql" already exists
+psql:54_catalog_psql_list_extensions_empty.sql:6: ERROR:  only the bootstrap plpgsql extension is supported
+psql:54_catalog_psql_list_extensions_empty.sql:7: ERROR:  plpgsql extension creation is only supported in pg_catalog
+psql:54_catalog_psql_list_extensions_empty.sql:8: ERROR:  query shape is not supported by the compatibility stub
                  List of installed extensions
   Name   | Version |   Schema   |         Description
 ---------+---------+------------+------------------------------

@@ -139,6 +139,13 @@ impl Planner {
                 },
                 kind: PlanKind::Admin,
             },
+            Command::CreateExtension(_) => PlanNode {
+                op: PlannedOp {
+                    name: "bootstrap_extension_create".to_string(),
+                    target: DeviceTarget::Cpu,
+                },
+                kind: PlanKind::Admin,
+            },
             Command::ResetAll => PlanNode {
                 op: PlannedOp {
                     name: "session_reset_all".to_string(),

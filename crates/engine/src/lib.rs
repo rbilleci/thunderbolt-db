@@ -20,7 +20,7 @@ use gpu_db_observability::{
 use gpu_db_planner::{ExecutionPlan, Planner, PlannerConfig};
 use gpu_db_protocol::{
     parse_command, AclRelationKind, AddCheckConstraint, AddForeignKey, AddUniqueConstraint,
-    ColumnDef, ColumnDefault, Command, CommentTarget, CreateDomain, CreateIndex,
+    ColumnDef, ColumnDefault, Command, CommentTarget, CreateDomain, CreateExtension, CreateIndex,
     CreateMaterializedView, CreatePublication, CreateSchema, CreateSequence, CreateSubscription,
     CreateTable, CreateView, Delete, DropConstraint, DropDomain, DropIndex, DropMaterializedView,
     DropPublication, DropSchema, DropSequence, DropSubscription, DropTable, DropView, Insert,
@@ -97,6 +97,7 @@ impl ReplicatedStateMachine for KvStateMachine {
                     | Command::CreateMaterializedView(_)
                     | Command::RefreshMaterializedView(_)
                     | Command::RenameMaterializedView(_)
+                    | Command::CreateExtension(_)
                     | Command::CreateSequence(_)
                     | Command::CreateDomain(_)
                     | Command::SequenceNextVal(_)
@@ -6175,6 +6176,29 @@ impl RelationalResidencySnapshot {
     }
 }
 
+fn validate_bootstrap_create_extension(create: &CreateExtension) -> Result<(), EngineError> {
+    if create.name != "plpgsql" {
+        return Err(EngineError::ApplyFailed(
+            "only the bootstrap plpgsql extension is supported".to_string(),
+        ));
+    }
+    if create
+        .schema
+        .as_deref()
+        .is_some_and(|schema| schema != "pg_catalog")
+    {
+        return Err(EngineError::ApplyFailed(
+            "plpgsql extension creation is only supported in pg_catalog".to_string(),
+        ));
+    }
+    if !create.if_not_exists {
+        return Err(EngineError::ApplyFailed(
+            "extension \"plpgsql\" already exists".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn resident_device_int4_column_offset(
     snapshot: &RelationalResidencySnapshot,
     table: &RelationalTable,
@@ -12077,6 +12101,10 @@ impl Engine {
             Command::ResetAll => {
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
+            Command::CreateExtension(create) => {
+                validate_bootstrap_create_extension(&create).map_err(ExecuteError::Engine)?;
+                self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
+            }
             Command::Begin => {
                 self.txn_manager.begin_with_id(txn_id)?;
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
@@ -12278,6 +12306,10 @@ impl Engine {
             Command::ResetAll => {
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
+            Command::CreateExtension(create) => {
+                validate_bootstrap_create_extension(&create).map_err(ExecuteError::Engine)?;
+                self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
+            }
             Command::Begin => {
                 self.txn_manager.begin_with_id(txn_id)?;
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
@@ -12355,6 +12387,7 @@ impl Engine {
             Command::CreateMaterializedView(_) => {
                 Err(ExecuteError::NonReadCommand("CREATE MATERIALIZED VIEW"))
             }
+            Command::CreateExtension(_) => Err(ExecuteError::NonReadCommand("CREATE EXTENSION")),
             Command::RefreshMaterializedView(_) => {
                 Err(ExecuteError::NonReadCommand("REFRESH MATERIALIZED VIEW"))
             }
@@ -17727,14 +17760,61 @@ mod tests {
         e.execute_text(4, "FLUSH").unwrap();
         e.execute_text(5, "RESET ALL").unwrap();
         e.execute_text(6, "DISCARD TEMP").unwrap();
+        e.execute_text(
+            7,
+            "CREATE EXTENSION IF NOT EXISTS plpgsql WITH SCHEMA pg_catalog",
+        )
+        .unwrap();
 
         assert_eq!(e.active_txn_count(), 0);
-        assert_eq!(e.metrics().fallback_total, 8);
-        assert_eq!(e.metrics().fallback_for(FallbackReason::NotGpuEligible), 8);
+        assert_eq!(e.metrics().fallback_total, 9);
+        assert_eq!(e.metrics().fallback_for(FallbackReason::NotGpuEligible), 9);
         assert_eq!(
             e.metrics().last_fallback_reason(),
             Some(FallbackReason::NotGpuEligible)
         );
+        assert_eq!(e.metrics().commits_total, 0);
+    }
+
+    #[test]
+    fn execute_text_bounds_bootstrap_extension_create() {
+        let mut e = Engine::new_local();
+
+        e.execute_text(1, "CREATE EXTENSION IF NOT EXISTS plpgsql")
+            .unwrap();
+        e.execute_text(
+            2,
+            "CREATE EXTENSION IF NOT EXISTS \"plpgsql\" WITH SCHEMA pg_catalog",
+        )
+        .unwrap();
+
+        let duplicate = e.execute_text(3, "CREATE EXTENSION plpgsql").unwrap_err();
+        assert!(matches!(
+            duplicate,
+            ExecuteError::Engine(EngineError::ApplyFailed(message))
+                if message == "extension \"plpgsql\" already exists"
+        ));
+
+        let unsupported = e
+            .execute_text(4, "CREATE EXTENSION IF NOT EXISTS hstore")
+            .unwrap_err();
+        assert!(matches!(
+            unsupported,
+            ExecuteError::Engine(EngineError::ApplyFailed(message))
+                if message == "only the bootstrap plpgsql extension is supported"
+        ));
+
+        let wrong_schema = e
+            .execute_text(
+                5,
+                "CREATE EXTENSION IF NOT EXISTS plpgsql WITH SCHEMA public",
+            )
+            .unwrap_err();
+        assert!(matches!(
+            wrong_schema,
+            ExecuteError::Engine(EngineError::ApplyFailed(message))
+                if message == "plpgsql extension creation is only supported in pg_catalog"
+        ));
         assert_eq!(e.metrics().commits_total, 0);
     }
 

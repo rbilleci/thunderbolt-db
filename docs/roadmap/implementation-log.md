@@ -1,5 +1,9 @@
 # Implementation Log
 
+## 2026-05-20
+
+- Added bounded bootstrap-extension restore/setup handling. `CREATE EXTENSION IF NOT EXISTS plpgsql` and `CREATE EXTENSION IF NOT EXISTS "plpgsql" WITH SCHEMA pg_catalog` are accepted as idempotent no-op traffic against the metadata-only bootstrap extension already exposed through `\dx` and direct `pg_catalog.pg_extension` discovery. Duplicate non-`IF NOT EXISTS` creates, unsupported extension names, unsupported schemas, and `DROP EXTENSION` remain rejected while extension drop/update/relocation, extension-owned dependencies, and procedural execution stay out of scope. Real psql golden scenario 54 covers the client-facing workflow.
+
 ## 2026-05-19
 
 - Closed the bounded column-default lifecycle gap for sequence-backed defaults. `ALTER TABLE [ONLY] [public.]table ALTER [COLUMN] column DROP DEFAULT` now has engine and real psql evidence for explicit `nextval(...)` and implicit `SERIAL` defaults: catalog metadata is cleared from `pg_attrdef`, `information_schema.columns`, and `psql \d`, existing rows and sequence state are preserved, and later omitted-column inserts reject before WAL append/visibility. Sequence ownership/dependency semantics, identity/generated defaults, NULL/expression defaults, and broader `ALTER COLUMN` behavior remain out of scope. Real psql golden scenario 332 covers the client-facing workflow.

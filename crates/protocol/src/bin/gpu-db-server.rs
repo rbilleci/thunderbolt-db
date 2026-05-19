@@ -8024,6 +8024,43 @@ fn execute_statement(
         }
         Err(_) => {}
         Ok(command) => match command {
+            Command::CreateExtension(create) => {
+                if create.name != "plpgsql" {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "0A000",
+                            message: "only the bootstrap plpgsql extension is supported",
+                            position: None,
+                        },
+                    );
+                }
+                if create
+                    .schema
+                    .as_deref()
+                    .is_some_and(|schema| schema != "pg_catalog")
+                {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "0A000",
+                            message: "plpgsql extension creation is only supported in pg_catalog",
+                            position: None,
+                        },
+                    );
+                }
+                if !create.if_not_exists {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "42710",
+                            message: "extension \"plpgsql\" already exists",
+                            position: None,
+                        },
+                    );
+                }
+                return write_command_complete(stream, "CREATE EXTENSION");
+            }
             Command::CreateSchema(create) => {
                 if create.name != "public" {
                     return write_error(

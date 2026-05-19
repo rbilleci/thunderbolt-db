@@ -27,8 +27,8 @@
     "protocol.extended_query": {
       "failed": 0,
       "ignored": 0,
-      "passed": 313,
-      "total": 313
+      "passed": 314,
+      "total": 314
     },
     "replication.operational_cluster": {
       "failed": 0,
@@ -57,8 +57,8 @@
     "sql.parser_features": {
       "failed": 0,
       "ignored": 0,
-      "passed": 63,
-      "total": 63
+      "passed": 64,
+      "total": 64
     },
     "sql.relational_foundation": {
       "failed": 0,
@@ -81,16 +81,16 @@
     "uncategorized": {
       "failed": 0,
       "ignored": 0,
-      "passed": 181,
-      "total": 181
+      "passed": 182,
+      "total": 182
     }
   },
   "top_failing_categories": [],
   "totals": {
     "failed": 0,
     "ignored": 0,
-    "passed": 1163,
-    "total": 1163
+    "passed": 1165,
+    "total": 1165
   },
   "trend_hook": {
     "baseline_available": true,
