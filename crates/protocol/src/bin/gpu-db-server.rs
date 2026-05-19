@@ -17,6 +17,8 @@ const PUBLIC_NAMESPACE_OID: u32 = 2200;
 const POSTGRES_DATABASE_OID: u32 = 5;
 const PG_EXTENSION_CLASS_OID: u32 = 3079;
 const PG_LANGUAGE_CLASS_OID: u32 = 2612;
+const PG_PUBLICATION_CLASS_OID: u32 = 6104;
+const PG_SUBSCRIPTION_CLASS_OID: u32 = 6100;
 const PLPGSQL_EXTENSION_OID: u32 = 13_500;
 const PLPGSQL_LANGUAGE_OID: u32 = 13_501;
 const PLPGSQL_CALL_HANDLER_OID: u32 = 13_502;
@@ -3184,6 +3186,11 @@ fn drop_publication(
     }
     for name in names {
         session.publications.remove(name);
+        let target = CatalogCommentTarget::Publication {
+            publication: name.clone(),
+        };
+        session.comments.remove(&target);
+        session.mark_comment_dirty(target);
         session.mark_publication_dirty(name.clone());
     }
     Ok(())
@@ -3263,6 +3270,11 @@ fn drop_subscription(
     }
     for name in names {
         session.subscriptions.remove(name);
+        let target = CatalogCommentTarget::Subscription {
+            subscription: name.clone(),
+        };
+        session.comments.remove(&target);
+        session.mark_comment_dirty(target);
         session.mark_subscription_dirty(name.clone());
     }
     Ok(())
@@ -3417,6 +3429,8 @@ enum CatalogCommentTarget {
     MaterializedView { materialized_view: String },
     Sequence { sequence: String },
     Domain { domain: String },
+    Publication { publication: String },
+    Subscription { subscription: String },
     Constraint { table: String, constraint: String },
 }
 
@@ -7418,7 +7432,9 @@ fn execute_statement(
                 | CatalogCommentTarget::View { .. }
                 | CatalogCommentTarget::MaterializedView { .. }
                 | CatalogCommentTarget::Sequence { .. }
-                | CatalogCommentTarget::Domain { .. } => false,
+                | CatalogCommentTarget::Domain { .. }
+                | CatalogCommentTarget::Publication { .. }
+                | CatalogCommentTarget::Subscription { .. } => false,
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -9328,7 +9344,9 @@ fn execute_statement(
                         | CatalogCommentTarget::View { .. }
                         | CatalogCommentTarget::MaterializedView { .. }
                         | CatalogCommentTarget::Sequence { .. }
-                        | CatalogCommentTarget::Domain { .. } => false,
+                        | CatalogCommentTarget::Domain { .. }
+                        | CatalogCommentTarget::Publication { .. }
+                        | CatalogCommentTarget::Subscription { .. } => false,
                     })
                     .cloned()
                     .collect::<Vec<_>>();
@@ -9385,7 +9403,9 @@ fn execute_statement(
                             | CatalogCommentTarget::View { .. }
                             | CatalogCommentTarget::MaterializedView { .. }
                             | CatalogCommentTarget::Sequence { .. }
-                            | CatalogCommentTarget::Domain { .. } => false,
+                            | CatalogCommentTarget::Domain { .. }
+                            | CatalogCommentTarget::Publication { .. }
+                            | CatalogCommentTarget::Subscription { .. } => false,
                         })
                         .cloned()
                         .collect::<Vec<_>>();
@@ -9816,6 +9836,32 @@ fn execute_statement(
                             );
                         }
                         CatalogCommentTarget::Domain { domain }
+                    }
+                    CommentTarget::Publication { publication } => {
+                        if !session.publications.contains_key(&publication) {
+                            return write_error(
+                                stream,
+                                &ErrorField {
+                                    code: "42704",
+                                    message: "publication does not exist",
+                                    position: None,
+                                },
+                            );
+                        }
+                        CatalogCommentTarget::Publication { publication }
+                    }
+                    CommentTarget::Subscription { subscription } => {
+                        if !session.subscriptions.contains_key(&subscription) {
+                            return write_error(
+                                stream,
+                                &ErrorField {
+                                    code: "42704",
+                                    message: "subscription does not exist",
+                                    position: None,
+                                },
+                            );
+                        }
+                        CatalogCommentTarget::Subscription { subscription }
                     }
                     CommentTarget::Constraint { table, constraint } => {
                         let table_exists = session.tables.contains_key(&table)
@@ -16307,6 +16353,34 @@ fn pg_dump_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
             ]);
         }
     }
+    let mut publications = session.publications.values().collect::<Vec<_>>();
+    publications.sort_by_key(|publication| publication.oid);
+    for publication in publications {
+        if let Some(description) = session.comments.get(&CatalogCommentTarget::Publication {
+            publication: publication.name.clone(),
+        }) {
+            rows.push(vec![
+                Some(description.clone()),
+                Some(PG_PUBLICATION_CLASS_OID.to_string()),
+                Some(publication.oid.to_string()),
+                Some("0".to_string()),
+            ]);
+        }
+    }
+    let mut subscriptions = session.subscriptions.values().collect::<Vec<_>>();
+    subscriptions.sort_by_key(|subscription| subscription.oid);
+    for subscription in subscriptions {
+        if let Some(description) = session.comments.get(&CatalogCommentTarget::Subscription {
+            subscription: subscription.name.clone(),
+        }) {
+            rows.push(vec![
+                Some(description.clone()),
+                Some(PG_SUBSCRIPTION_CLASS_OID.to_string()),
+                Some(subscription.oid.to_string()),
+                Some("0".to_string()),
+            ]);
+        }
+    }
     let mut index_comments = session
         .comments
         .iter()
@@ -16322,6 +16396,8 @@ fn pg_dump_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
             | CatalogCommentTarget::MaterializedView { .. }
             | CatalogCommentTarget::Sequence { .. }
             | CatalogCommentTarget::Domain { .. }
+            | CatalogCommentTarget::Publication { .. }
+            | CatalogCommentTarget::Subscription { .. }
             | CatalogCommentTarget::Constraint { .. } => None,
         })
         .collect::<Vec<_>>();
@@ -16353,6 +16429,8 @@ fn pg_dump_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
             | CatalogCommentTarget::MaterializedView { .. }
             | CatalogCommentTarget::Sequence { .. }
             | CatalogCommentTarget::Domain { .. }
+            | CatalogCommentTarget::Publication { .. }
+            | CatalogCommentTarget::Subscription { .. }
             | CatalogCommentTarget::Index { .. } => None,
         })
         .collect::<Vec<_>>();
@@ -16472,6 +16550,34 @@ fn psql_object_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
                 Some("public".to_string()),
                 Some(sequence.name.clone()),
                 Some("sequence".to_string()),
+                Some(description.clone()),
+            ]);
+        }
+    }
+    let mut publications = session.publications.values().collect::<Vec<_>>();
+    publications.sort_by(|left, right| left.name.cmp(&right.name));
+    for publication in publications {
+        if let Some(description) = session.comments.get(&CatalogCommentTarget::Publication {
+            publication: publication.name.clone(),
+        }) {
+            rows.push(vec![
+                None,
+                Some(publication.name.clone()),
+                Some("publication".to_string()),
+                Some(description.clone()),
+            ]);
+        }
+    }
+    let mut subscriptions = session.subscriptions.values().collect::<Vec<_>>();
+    subscriptions.sort_by(|left, right| left.name.cmp(&right.name));
+    for subscription in subscriptions {
+        if let Some(description) = session.comments.get(&CatalogCommentTarget::Subscription {
+            subscription: subscription.name.clone(),
+        }) {
+            rows.push(vec![
+                None,
+                Some(subscription.name.clone()),
+                Some("subscription".to_string()),
                 Some(description.clone()),
             ]);
         }

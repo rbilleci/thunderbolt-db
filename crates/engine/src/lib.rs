@@ -6120,6 +6120,8 @@ pub enum RelationalCommentTarget {
     MaterializedView { materialized_view: String },
     Sequence { sequence: String },
     Domain { domain: String },
+    Publication { publication: String },
+    Subscription { subscription: String },
     Constraint { table: String, constraint: String },
 }
 
@@ -9272,7 +9274,9 @@ impl Engine {
                 | RelationalCommentTarget::View { .. }
                 | RelationalCommentTarget::MaterializedView { .. }
                 | RelationalCommentTarget::Sequence { .. }
-                | RelationalCommentTarget::Domain { .. } => true,
+                | RelationalCommentTarget::Domain { .. }
+                | RelationalCommentTarget::Publication { .. }
+                | RelationalCommentTarget::Subscription { .. } => true,
             });
             self.relational_residency.remove(name);
             self.relational_residency_device_memory.remove(name);
@@ -9511,6 +9515,10 @@ impl Engine {
         self.preflight_drop_publication(&drop)?;
         for name in &drop.names {
             self.relational_publications.remove(name);
+            self.relational_comments
+                .remove(&RelationalCommentTarget::Publication {
+                    publication: name.clone(),
+                });
         }
         Ok(())
     }
@@ -9585,6 +9593,10 @@ impl Engine {
         self.preflight_drop_subscription(&drop)?;
         for name in &drop.names {
             self.relational_subscriptions.remove(name);
+            self.relational_comments
+                .remove(&RelationalCommentTarget::Subscription {
+                    subscription: name.clone(),
+                });
         }
         Ok(())
     }
@@ -10260,6 +10272,24 @@ impl Engine {
                     )));
                 }
                 RelationalCommentTarget::Domain { domain }
+            }
+            CommentTarget::Publication { publication } => {
+                if !self.relational_publications.contains_key(&publication) {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "publication \"{}\" does not exist",
+                        publication
+                    )));
+                }
+                RelationalCommentTarget::Publication { publication }
+            }
+            CommentTarget::Subscription { subscription } => {
+                if !self.relational_subscriptions.contains_key(&subscription) {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "subscription \"{}\" does not exist",
+                        subscription
+                    )));
+                }
+                RelationalCommentTarget::Subscription { subscription }
             }
             CommentTarget::Constraint { table, constraint } => {
                 let table_ref = self.relational_catalog.get(&table).ok_or_else(|| {
@@ -15610,6 +15640,22 @@ impl Engine {
             .get(&RelationalCommentTarget::Constraint {
                 table: table.to_string(),
                 constraint: constraint.to_string(),
+            })
+            .map(String::as_str)
+    }
+
+    pub fn relational_publication_comment(&self, publication: &str) -> Option<&str> {
+        self.relational_comments
+            .get(&RelationalCommentTarget::Publication {
+                publication: publication.to_string(),
+            })
+            .map(String::as_str)
+    }
+
+    pub fn relational_subscription_comment(&self, subscription: &str) -> Option<&str> {
+        self.relational_comments
+            .get(&RelationalCommentTarget::Subscription {
+                subscription: subscription.to_string(),
             })
             .map(String::as_str)
     }
@@ -37989,6 +38035,90 @@ mod tests {
         assert!(e.relational_catalog_subscription("app_sub").is_none());
         e.execute_text(8, "DROP SUBSCRIPTION IF EXISTS missing_sub")
             .unwrap();
+    }
+
+    #[test]
+    fn relational_catalog_records_logical_replication_comments_and_replays_from_wal() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(2, "CREATE PUBLICATION app_pub FOR TABLE people")
+            .unwrap();
+        e.execute_text(
+            3,
+            "CREATE SUBSCRIPTION app_sub CONNECTION 'host=localhost dbname=postgres' PUBLICATION app_pub WITH (connect = false, enabled = false)",
+        )
+        .unwrap();
+
+        e.execute_text(
+            4,
+            "COMMENT ON PUBLICATION app_pub IS 'publication metadata'",
+        )
+        .unwrap();
+        e.execute_text(
+            5,
+            "COMMENT ON SUBSCRIPTION app_sub IS 'subscription metadata'",
+        )
+        .unwrap();
+        assert_eq!(
+            e.relational_publication_comment("app_pub"),
+            Some("publication metadata")
+        );
+        assert_eq!(
+            e.relational_subscription_comment("app_sub"),
+            Some("subscription metadata")
+        );
+
+        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        assert_eq!(
+            recovered.relational_publication_comment("app_pub"),
+            Some("publication metadata")
+        );
+        assert_eq!(
+            recovered.relational_subscription_comment("app_sub"),
+            Some("subscription metadata")
+        );
+
+        let mut missing_pub_engine = Engine::new_local();
+        missing_pub_engine
+            .execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        let missing_publication = missing_pub_engine
+            .execute_text(2, "COMMENT ON PUBLICATION missing_pub IS 'missing'")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            missing_publication.contains("publication \"missing_pub\" does not exist"),
+            "{missing_publication}"
+        );
+        let mut missing_sub_engine = Engine::new_local();
+        missing_sub_engine
+            .execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        missing_sub_engine
+            .execute_text(2, "CREATE PUBLICATION app_pub FOR TABLE people")
+            .unwrap();
+        let missing_subscription = missing_sub_engine
+            .execute_text(3, "COMMENT ON SUBSCRIPTION missing_sub IS 'missing'")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            missing_subscription.contains("subscription \"missing_sub\" does not exist"),
+            "{missing_subscription}"
+        );
+
+        e.execute_text(8, "COMMENT ON PUBLICATION app_pub IS NULL")
+            .unwrap();
+        assert_eq!(e.relational_publication_comment("app_pub"), None);
+        e.execute_text(
+            9,
+            "COMMENT ON PUBLICATION app_pub IS 'publication metadata'",
+        )
+        .unwrap();
+        e.execute_text(10, "DROP SUBSCRIPTION app_sub").unwrap();
+        e.execute_text(11, "DROP PUBLICATION app_pub").unwrap();
+        assert_eq!(e.relational_subscription_comment("app_sub"), None);
+        assert_eq!(e.relational_publication_comment("app_pub"), None);
     }
 
     #[test]

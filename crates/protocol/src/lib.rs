@@ -391,6 +391,8 @@ pub enum CommentTarget {
     MaterializedView { materialized_view: String },
     Sequence { sequence: String },
     Domain { domain: String },
+    Publication { publication: String },
+    Subscription { subscription: String },
     Constraint { table: String, constraint: String },
 }
 
@@ -2322,6 +2324,24 @@ fn parse_comment_on(input: &str) -> Result<CommentOn, ParseError> {
         let domain = normalize_relation_identifier(rest[..is_pos].trim())?;
         (
             CommentTarget::Domain { domain },
+            rest[is_pos + "IS".len()..].trim(),
+        )
+    } else if let Some(rest) = strip_keyword_prefix_case_insensitive(rest, "PUBLICATION") {
+        let rest = rest.trim_start();
+        let is_pos =
+            find_keyword_outside_quotes(rest, "IS").ok_or(ParseError::InvalidRelationalSql)?;
+        let publication = normalize_identifier(rest[..is_pos].trim())?;
+        (
+            CommentTarget::Publication { publication },
+            rest[is_pos + "IS".len()..].trim(),
+        )
+    } else if let Some(rest) = strip_keyword_prefix_case_insensitive(rest, "SUBSCRIPTION") {
+        let rest = rest.trim_start();
+        let is_pos =
+            find_keyword_outside_quotes(rest, "IS").ok_or(ParseError::InvalidRelationalSql)?;
+        let subscription = normalize_identifier(rest[..is_pos].trim())?;
+        (
+            CommentTarget::Subscription { subscription },
             rest[is_pos + "IS".len()..].trim(),
         )
     } else if let Some(rest) = strip_keyword_prefix_case_insensitive(rest, "CONSTRAINT") {
@@ -12191,6 +12211,15 @@ default: Some(ColumnDefault::SequenceNextVal {
                 if_exists: true,
             })
         );
+        assert_eq!(
+            parse_command("COMMENT ON PUBLICATION app_pub IS 'app publication'").unwrap(),
+            Command::CommentOn(CommentOn {
+                target: CommentTarget::Publication {
+                    publication: "app_pub".to_string(),
+                },
+                comment: Some("app publication".to_string()),
+            })
+        );
         assert!(matches!(
             parse_command("CREATE PUBLICATION app_pub FOR TABLE private.people"),
             Err(ParseError::InvalidRelationalSql)
@@ -12219,6 +12248,15 @@ default: Some(ColumnDefault::SequenceNextVal {
             Command::DropSubscription(DropSubscription {
                 names: vec!["app_sub".to_string(), "stale_sub".to_string()],
                 if_exists: true,
+            })
+        );
+        assert_eq!(
+            parse_command("COMMENT ON SUBSCRIPTION app_sub IS NULL").unwrap(),
+            Command::CommentOn(CommentOn {
+                target: CommentTarget::Subscription {
+                    subscription: "app_sub".to_string(),
+                },
+                comment: None,
             })
         );
         assert!(matches!(

@@ -3,24 +3,47 @@ CREATE TABLE
 CREATE PUBLICATION
 CREATE PUBLICATION
 CREATE SUBSCRIPTION
+COMMENT
+COMMENT
               List of subscriptions
   Name   |  Owner   | Enabled |   Publication
 ---------+----------+---------+------------------
  app_sub | postgres | f       | sub_pub, sub_all
 (1 row)
 
+                        Object descriptions
+ Schema |  Name   |    Object    |           Description
+--------+---------+--------------+---------------------------------
+        | sub_pub | publication  | subscription source publication
+        | app_sub | subscription | disabled subscription metadata
+(2 rows)
+
+           description           | classoid | objoid | objsubid
+---------------------------------+----------+--------+----------
+ disabled subscription metadata  |     6100 |  16387 |        0
+ subscription source publication |     6104 |  16385 |        0
+(2 rows)
+
  subname | subenabled |          subconninfo           |  subpublications
 ---------+------------+--------------------------------+-------------------
  app_sub | f          | host=localhost dbname=postgres | {sub_pub,sub_all}
 (1 row)
 
-psql:337_protocol_psql_subscriptions.sql:10: ERROR:  subscription already exists
-psql:337_protocol_psql_subscriptions.sql:11: ERROR:  publication does not exist
-psql:337_protocol_psql_subscriptions.sql:12: ERROR:  subscription publication specified more than once
-psql:337_protocol_psql_subscriptions.sql:13: ERROR:  query shape is not supported by the compatibility stub
-psql:337_protocol_psql_subscriptions.sql:14: ERROR:  query shape is not supported by the compatibility stub
-psql:337_protocol_psql_subscriptions.sql:15: ERROR:  query shape is not supported by the compatibility stub
-psql:337_protocol_psql_subscriptions.sql:16: ERROR:  subscription does not exist
+psql:337_protocol_psql_subscriptions.sql:16: ERROR:  publication does not exist
+psql:337_protocol_psql_subscriptions.sql:17: ERROR:  subscription does not exist
+COMMENT
+           description           | classoid | objoid | objsubid
+---------------------------------+----------+--------+----------
+ subscription source publication |     6104 |  16385 |        0
+(1 row)
+
+psql:337_protocol_psql_subscriptions.sql:22: ERROR:  subscription already exists
+psql:337_protocol_psql_subscriptions.sql:23: ERROR:  publication does not exist
+psql:337_protocol_psql_subscriptions.sql:24: ERROR:  subscription publication specified more than once
+psql:337_protocol_psql_subscriptions.sql:25: ERROR:  query shape is not supported by the compatibility stub
+psql:337_protocol_psql_subscriptions.sql:26: ERROR:  query shape is not supported by the compatibility stub
+psql:337_protocol_psql_subscriptions.sql:27: ERROR:  query shape is not supported by the compatibility stub
+psql:337_protocol_psql_subscriptions.sql:28: ERROR:  subscription does not exist
 DROP SUBSCRIPTION
 DROP SUBSCRIPTION
         List of subscriptions
@@ -32,4 +55,8 @@ DROP PUBLICATION
                               List of publications
  Name | Owner | All tables | Inserts | Updates | Deletes | Truncates | Via root
 ------+-------+------------+---------+---------+---------+-----------+----------
+(0 rows)
+
+ description | classoid | objoid | objsubid
+-------------+----------+--------+----------
 (0 rows)
