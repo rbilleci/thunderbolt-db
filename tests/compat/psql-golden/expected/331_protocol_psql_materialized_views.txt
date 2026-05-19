@@ -105,6 +105,26 @@ psql:331_protocol_psql_materialized_views.sql:46: error: Did not find any relati
 CREATE VIEW
 psql:331_protocol_psql_materialized_views.sql:48: ERROR:  materialized views over views are unsupported
 CREATE TABLE
-psql:331_protocol_psql_materialized_views.sql:50: ERROR:  relation already exists
-psql:331_protocol_psql_materialized_views.sql:51: ERROR:  query shape is not supported by the compatibility stub
-psql:331_protocol_psql_materialized_views.sql:52: ERROR:  relation is not a materialized view
+INSERT 0 2
+psql:331_protocol_psql_materialized_views.sql:51: ERROR:  relation already exists
+SELECT 0
+ id
+----
+ 10
+ 11
+(2 rows)
+
+SELECT 0
+ id
+----
+(0 rows)
+
+REFRESH MATERIALIZED VIEW
+ id
+----
+ 10
+ 11
+(2 rows)
+
+DROP MATERIALIZED VIEW
+psql:331_protocol_psql_materialized_views.sql:59: ERROR:  relation is not a materialized view

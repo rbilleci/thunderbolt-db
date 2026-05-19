@@ -7688,6 +7688,11 @@ impl Engine {
             });
         }
         self.relational_next_column_id = next_column_id;
+        let rows = if create.with_data {
+            result.rows
+        } else {
+            Vec::new()
+        };
         self.relational_materialized_views.insert(
             create.name.clone(),
             RelationalMaterializedView {
@@ -7697,7 +7702,7 @@ impl Engine {
                 query: create.query,
                 definition: create.definition,
                 columns,
-                rows: result.rows,
+                rows,
             },
         );
         Ok(())

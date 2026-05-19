@@ -150,6 +150,7 @@ pub struct CreateMaterializedView {
     pub name: String,
     pub query: Select,
     pub definition: String,
+    pub with_data: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2644,8 +2645,20 @@ fn parse_create_materialized_view(input: &str) -> Result<CreateMaterializedView,
     }
     let as_pos = find_keyword_outside_quotes(rest, "AS").ok_or(ParseError::InvalidRelationalSql)?;
     let name = normalize_relation_identifier(rest[..as_pos].trim())?;
-    let definition = rest[as_pos + "AS".len()..].trim();
-    if definition.is_empty() || find_keyword_outside_quotes(definition, "WITH").is_some() {
+    let mut definition = rest[as_pos + "AS".len()..].trim();
+    let mut with_data = true;
+    if let Some(with_pos) = find_keyword_outside_quotes(definition, "WITH") {
+        let options = definition[with_pos + "WITH".len()..].trim();
+        if options.eq_ignore_ascii_case("DATA") {
+            with_data = true;
+        } else if options.eq_ignore_ascii_case("NO DATA") {
+            with_data = false;
+        } else {
+            return Err(ParseError::InvalidRelationalSql);
+        }
+        definition = definition[..with_pos].trim_end();
+    }
+    if definition.is_empty() {
         return Err(ParseError::InvalidRelationalSql);
     }
     let query = parse_select(definition)?;
@@ -2656,6 +2669,7 @@ fn parse_create_materialized_view(input: &str) -> Result<CreateMaterializedView,
         name,
         query,
         definition: definition.to_string(),
+        with_data,
     })
 }
 
@@ -12256,6 +12270,31 @@ mod tests {
                     offset: None,
                 },
                 definition: "SELECT id, name FROM people ORDER BY id".to_string(),
+                with_data: true,
+            })
+        );
+        assert_eq!(
+            parse_command(
+                "CREATE MATERIALIZED VIEW mv_people AS SELECT * FROM people WITH NO DATA"
+            )
+            .unwrap(),
+            Command::CreateMaterializedView(CreateMaterializedView {
+                name: "mv_people".to_string(),
+                query: Select {
+                    table: "people".to_string(),
+                    distinct: false,
+                    projection: SelectProjection::All,
+                    group_by: None,
+                    having_groups: Vec::new(),
+                    filter: None,
+                    filters: Vec::new(),
+                    filter_groups: Vec::new(),
+                    order_by: None,
+                    limit: None,
+                    offset: None,
+                },
+                definition: "SELECT * FROM people".to_string(),
+                with_data: false,
             })
         );
         assert_eq!(
@@ -12290,10 +12329,10 @@ mod tests {
             })
         );
 
-        assert!(matches!(
-            parse_command("CREATE MATERIALIZED VIEW mv_people AS SELECT * FROM people WITH DATA"),
-            Err(ParseError::InvalidRelationalSql)
-        ));
+        assert!(parse_command(
+            "CREATE MATERIALIZED VIEW mv_people AS SELECT * FROM people WITH DATA"
+        )
+        .is_ok());
         assert!(matches!(
             parse_command("REFRESH MATERIALIZED VIEW CONCURRENTLY mv_people"),
             Err(ParseError::InvalidRelationalSql)

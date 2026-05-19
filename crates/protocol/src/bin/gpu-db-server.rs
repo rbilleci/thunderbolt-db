@@ -7015,10 +7015,13 @@ fn execute_statement(
                         );
                     }
                 };
-                let (columns, rows) = match materialize_select_rows(result, None) {
+                let (columns, mut rows) = match materialize_select_rows(result, None) {
                     Ok(materialized) => materialized,
                     Err(error) => return write_error(stream, &error),
                 };
+                if !create.with_data {
+                    rows.clear();
+                }
                 let name = create.name;
                 session.materialized_views.insert(
                     name.clone(),
@@ -10528,6 +10531,13 @@ fn pg_dump_table_oid_lookup_rows(
             rows.push(vec![Some(view.oid.to_string())]);
         }
     }
+    let mut materialized_views = session.materialized_views.values().collect::<Vec<_>>();
+    materialized_views.sort_by_key(|view| view.oid);
+    for view in materialized_views {
+        if psql_relname_pattern_matches(relname_pattern, &view.name) {
+            rows.push(vec![Some(view.oid.to_string())]);
+        }
+    }
     rows
 }
 
@@ -10602,6 +10612,18 @@ fn pg_dump_class_metadata_rows(session: &Session) -> Vec<Vec<Option<String>>> {
     for view in views {
         rows.push(pg_dump_class_metadata_row(
             view.oid, &view.name, "v", false, true, None,
+        ));
+    }
+    let mut materialized_views = session.materialized_views.values().collect::<Vec<_>>();
+    materialized_views.sort_by_key(|view| view.oid);
+    for view in materialized_views {
+        rows.push(pg_dump_class_metadata_row(
+            view.oid,
+            &view.name,
+            "m",
+            false,
+            true,
+            Some("heap"),
         ));
     }
     rows
@@ -10747,6 +10769,22 @@ fn pg_dump_attribute_metadata_rows(
                     false,
                 ));
             }
+            continue;
+        }
+        if let Some(view) = session
+            .materialized_views
+            .values()
+            .find(|view| view.oid == *oid)
+        {
+            for column in &view.columns {
+                rows.push(pg_dump_attribute_metadata_row(
+                    view.oid,
+                    column.attnum,
+                    &column.def.name,
+                    column.def.ty,
+                    false,
+                ));
+            }
         }
     }
     rows
@@ -10865,8 +10903,11 @@ fn pg_dump_view_definition_query_oid(canonical: &str) -> Option<u32> {
 }
 
 fn pg_dump_view_definition_rows(session: &Session, view_oid: u32) -> Vec<Vec<Option<String>>> {
+    if let Some(view) = session.views.values().find(|view| view.oid == view_oid) {
+        return vec![vec![Some(format!("{};", view.definition))]];
+    }
     session
-        .views
+        .materialized_views
         .values()
         .find(|view| view.oid == view_oid)
         .map(|view| vec![vec![Some(format!("{};", view.definition))]])
@@ -10878,6 +10919,19 @@ fn pg_dump_dependency_rows(session: &Session) -> Vec<Vec<Option<String>>> {
     let mut views = session.views.values().collect::<Vec<_>>();
     views.sort_by_key(|view| view.oid);
     for view in views {
+        if let Some(table) = session.tables.get(&view.query.table) {
+            rows.push(vec![
+                Some("1259".to_string()),
+                Some(view.oid.to_string()),
+                Some("1259".to_string()),
+                Some(table.oid.to_string()),
+                Some("n".to_string()),
+            ]);
+        }
+    }
+    let mut materialized_views = session.materialized_views.values().collect::<Vec<_>>();
+    materialized_views.sort_by_key(|view| view.oid);
+    for view in materialized_views {
         if let Some(table) = session.tables.get(&view.query.table) {
             rows.push(vec![
                 Some("1259".to_string()),
