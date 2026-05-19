@@ -12,6 +12,7 @@ pub enum Command {
     CreateTable(CreateTable),
     AddPrimaryKey(AddPrimaryKey),
     AddUniqueConstraint(AddUniqueConstraint),
+    AddCheckConstraint(AddCheckConstraint),
     AddColumn(AddColumn),
     RenameTable(RenameTable),
     RenameColumn(RenameColumn),
@@ -60,6 +61,7 @@ pub struct CreateTable {
     pub columns: Vec<ColumnDef>,
     pub primary_key: Option<PrimaryKey>,
     pub unique_constraints: Vec<UniqueConstraint>,
+    pub check_constraints: Vec<CheckConstraint>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,6 +88,19 @@ pub struct AddUniqueConstraint {
     pub table: String,
     pub name: String,
     pub column: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckConstraint {
+    pub name: Option<String>,
+    pub filter: SelectFilter,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddCheckConstraint {
+    pub table: String,
+    pub name: String,
+    pub filter: SelectFilter,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2353,6 +2368,16 @@ fn parse_add_unique_constraint(input: &str) -> Result<AddUniqueConstraint, Parse
     })
 }
 
+fn parse_add_check_constraint(input: &str) -> Result<AddCheckConstraint, ParseError> {
+    let (table, name, rest) = parse_alter_table_add_constraint(input)?;
+    let filter = parse_check_constraint_filter(rest)?;
+    Ok(AddCheckConstraint {
+        table,
+        name,
+        filter,
+    })
+}
+
 fn parse_add_table_constraint(input: &str) -> Result<Command, ParseError> {
     let (_, _, rest) = parse_alter_table_add_constraint(input)?;
     if strip_keyword_prefix_case_insensitive(rest, "PRIMARY").is_some() {
@@ -2360,6 +2385,9 @@ fn parse_add_table_constraint(input: &str) -> Result<Command, ParseError> {
     }
     if strip_keyword_prefix_case_insensitive(rest, "UNIQUE").is_some() {
         return parse_add_unique_constraint(input).map(Command::AddUniqueConstraint);
+    }
+    if strip_keyword_prefix_case_insensitive(rest, "CHECK").is_some() {
+        return parse_add_check_constraint(input).map(Command::AddCheckConstraint);
     }
     Err(ParseError::InvalidRelationalSql)
 }
@@ -2686,15 +2714,32 @@ fn parse_alter_table_add_constraint(input: &str) -> Result<(String, String, &str
         .trim_start();
     let primary_pos = find_keyword_outside_quotes(rest, "PRIMARY");
     let unique_pos = find_keyword_outside_quotes(rest, "UNIQUE");
-    let constraint_pos = match (primary_pos, unique_pos) {
-        (Some(primary), Some(unique)) => Some(primary.min(unique)),
-        (Some(primary), None) => Some(primary),
-        (None, Some(unique)) => Some(unique),
-        (None, None) => None,
-    }
-    .ok_or(ParseError::InvalidRelationalSql)?;
+    let check_pos = find_keyword_outside_quotes(rest, "CHECK");
+    let constraint_pos = [primary_pos, unique_pos, check_pos]
+        .into_iter()
+        .flatten()
+        .min()
+        .ok_or(ParseError::InvalidRelationalSql)?;
     let name = normalize_identifier(rest[..constraint_pos].trim())?;
     Ok((table, name, rest[constraint_pos..].trim_start()))
+}
+
+fn parse_check_constraint_filter(rest: &str) -> Result<SelectFilter, ParseError> {
+    let rest = strip_keyword_prefix_case_insensitive(rest, "CHECK")
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    if !rest.starts_with('(') {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let close = find_matching_paren(rest, 0).ok_or(ParseError::InvalidRelationalSql)?;
+    if close != rest.len() - 1 {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let filter = parse_select_filter(&rest[1..close])?;
+    if matches!(filter.op, SelectFilterOp::LikePrefix) {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    Ok(filter)
 }
 
 fn parse_single_constraint_column(rest: &str) -> Result<String, ParseError> {
@@ -2724,19 +2769,19 @@ fn parse_create_table(input: &str) -> Result<CreateTable, ParseError> {
     let mut columns = Vec::new();
     let mut primary_key = None;
     let mut unique_constraints = Vec::new();
+    let mut check_constraints = Vec::new();
     for raw_column in split_csv(&rest[open + 1..close])? {
         let trimmed = raw_column.trim();
         if let Some(after_constraint) = strip_keyword_prefix_case_insensitive(trimmed, "CONSTRAINT")
         {
             let primary_pos = find_keyword_outside_quotes(after_constraint, "PRIMARY");
             let unique_pos = find_keyword_outside_quotes(after_constraint, "UNIQUE");
-            let constraint_pos = match (primary_pos, unique_pos) {
-                (Some(primary), Some(unique)) => Some(primary.min(unique)),
-                (Some(primary), None) => Some(primary),
-                (None, Some(unique)) => Some(unique),
-                (None, None) => None,
-            }
-            .ok_or(ParseError::InvalidRelationalSql)?;
+            let check_pos = find_keyword_outside_quotes(after_constraint, "CHECK");
+            let constraint_pos = [primary_pos, unique_pos, check_pos]
+                .into_iter()
+                .flatten()
+                .min()
+                .ok_or(ParseError::InvalidRelationalSql)?;
             let name = normalize_identifier(after_constraint[..constraint_pos].trim())?;
             let rest = after_constraint[constraint_pos..].trim_start();
             if strip_keyword_prefix_case_insensitive(rest, "PRIMARY").is_some() {
@@ -2756,6 +2801,11 @@ fn parse_create_table(input: &str) -> Result<CreateTable, ParseError> {
                 unique_constraints.push(UniqueConstraint {
                     name: Some(name),
                     column: parse_single_constraint_column(rest.trim_start())?,
+                });
+            } else if strip_keyword_prefix_case_insensitive(rest, "CHECK").is_some() {
+                check_constraints.push(CheckConstraint {
+                    name: Some(name),
+                    filter: parse_check_constraint_filter(rest)?,
                 });
             } else {
                 return Err(ParseError::InvalidRelationalSql);
@@ -2788,6 +2838,13 @@ fn parse_create_table(input: &str) -> Result<CreateTable, ParseError> {
             unique_constraints.push(UniqueConstraint {
                 name: None,
                 column: parse_single_constraint_column(rest.trim_start())?,
+            });
+            continue;
+        }
+        if strip_keyword_prefix_case_insensitive(trimmed, "CHECK").is_some() {
+            check_constraints.push(CheckConstraint {
+                name: None,
+                filter: parse_check_constraint_filter(trimmed)?,
             });
             continue;
         }
@@ -2891,11 +2948,20 @@ fn parse_create_table(input: &str) -> Result<CreateTable, ParseError> {
             return Err(ParseError::InvalidRelationalSql);
         }
     }
+    for check in &check_constraints {
+        if !columns
+            .iter()
+            .any(|column| column.name == check.filter.column)
+        {
+            return Err(ParseError::InvalidRelationalSql);
+        }
+    }
     Ok(CreateTable {
         table,
         columns,
         primary_key,
         unique_constraints,
+        check_constraints,
     })
 }
 
@@ -10978,6 +11044,7 @@ mod tests {
                 ],
                 primary_key: None,
                 unique_constraints: Vec::new(),
+                check_constraints: Vec::new(),
             })
         );
 
@@ -11004,6 +11071,7 @@ mod tests {
                     column: "id".to_string(),
                 }),
                 unique_constraints: Vec::new(),
+                check_constraints: Vec::new(),
             })
         );
 
@@ -11039,8 +11107,61 @@ default: None,
                         column: "id".to_string(),
                     },
                 ],
+                check_constraints: Vec::new(),
             })
         );
+
+        assert_eq!(
+            parse_command(
+                "CREATE TABLE check_people (id INT, name TEXT, CONSTRAINT check_people_id_positive CHECK (id > 0), CHECK (name = 'Ada'))"
+            )
+            .unwrap(),
+            Command::CreateTable(CreateTable {
+                table: "check_people".to_string(),
+                columns: vec![
+                    ColumnDef {
+                        name: "id".to_string(),
+                        ty: SqlType::Int4,
+                        domain: None,
+                        default: None,
+                    },
+                    ColumnDef {
+                        name: "name".to_string(),
+                        ty: SqlType::Text,
+                        domain: None,
+                        default: None,
+                    },
+                ],
+                primary_key: None,
+                unique_constraints: Vec::new(),
+                check_constraints: vec![
+                    CheckConstraint {
+                        name: Some("check_people_id_positive".to_string()),
+                        filter: SelectFilter {
+                            column: "id".to_string(),
+                            op: SelectFilterOp::Gt,
+                            value: SqlValue::Int4(0),
+                        },
+                    },
+                    CheckConstraint {
+                        name: None,
+                        filter: SelectFilter {
+                            column: "name".to_string(),
+                            op: SelectFilterOp::Eq,
+                            value: SqlValue::Text("Ada".to_string()),
+                        },
+                    },
+                ],
+            })
+        );
+        assert!(matches!(
+            parse_command("CREATE TABLE bad_check_people (id INT, CHECK (missing > 0))"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command("CREATE TABLE bad_check_people (id INT, CHECK (id BETWEEN 1 AND 3))"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
 
         assert_eq!(
             parse_command("ALTER TABLE ONLY public.keyed_people ADD CONSTRAINT keyed_people_pkey PRIMARY KEY (id)").unwrap(),
@@ -11058,6 +11179,27 @@ default: None,
                 column: "name".to_string(),
             })
         );
+        assert_eq!(
+            parse_command(
+                "ALTER TABLE ONLY public.keyed_people ADD CONSTRAINT keyed_people_id_positive CHECK (id > 0)"
+            )
+            .unwrap(),
+            Command::AddCheckConstraint(AddCheckConstraint {
+                table: "keyed_people".to_string(),
+                name: "keyed_people_id_positive".to_string(),
+                filter: SelectFilter {
+                    column: "id".to_string(),
+                    op: SelectFilterOp::Gt,
+                    value: SqlValue::Int4(0),
+                },
+            })
+        );
+        assert!(matches!(
+            parse_command(
+                "ALTER TABLE ONLY public.keyed_people ADD CONSTRAINT keyed_people_id_between CHECK (id BETWEEN 1 AND 3)"
+            ),
+            Err(ParseError::InvalidRelationalSql)
+        ));
         assert_eq!(
             parse_command(
                 "ALTER TABLE IF EXISTS ONLY public.keyed_people DROP CONSTRAINT IF EXISTS keyed_people_name_key"
@@ -11275,6 +11417,7 @@ default: None,
                 ],
                 primary_key: None,
                 unique_constraints: Vec::new(),
+                check_constraints: Vec::new(),
             })
         );
 
@@ -11298,6 +11441,7 @@ default: None,
                 ],
                 primary_key: None,
                 unique_constraints: Vec::new(),
+                check_constraints: Vec::new(),
             })
         );
         assert!(matches!(
@@ -11327,6 +11471,7 @@ default: None,
                 ],
                 primary_key: None,
                 unique_constraints: Vec::new(),
+                check_constraints: Vec::new(),
             })
         );
         assert!(matches!(
@@ -11359,6 +11504,7 @@ default: None,
                     column: "id".to_string(),
                 }),
                 unique_constraints: Vec::new(),
+                check_constraints: Vec::new(),
             })
         );
         assert_eq!(
@@ -11379,6 +11525,7 @@ default: Some(ColumnDefault::SequenceNextVal {
                 }],
                 primary_key: None,
                 unique_constraints: Vec::new(),
+                check_constraints: Vec::new(),
             })
         );
         assert!(matches!(
@@ -11406,6 +11553,7 @@ default: Some(ColumnDefault::SequenceNextVal {
                 ],
                 primary_key: None,
                 unique_constraints: Vec::new(),
+                check_constraints: Vec::new(),
             })
         );
         assert_eq!(
@@ -13385,6 +13533,7 @@ default: Some(ColumnDefault::SequenceNextVal {
                 ],
                 primary_key: None,
                 unique_constraints: Vec::new(),
+                check_constraints: Vec::new(),
             })
         );
 

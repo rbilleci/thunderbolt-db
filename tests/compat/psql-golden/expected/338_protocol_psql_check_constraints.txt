@@ -1,0 +1,73 @@
+=== bounded check constraints ===
+CREATE TABLE
+INSERT 0 2
+psql:338_protocol_psql_check_constraints.sql:4: ERROR:  new row violates check constraint
+ id | name
+----+-------
+  1 | Ada
+  2 | Linus
+(2 rows)
+
+psql:338_protocol_psql_check_constraints.sql:6: ERROR:  new row violates check constraint
+ id | name
+----+-------
+  1 | Ada
+  2 | Linus
+(2 rows)
+
+COMMENT
+ table_schema |  table_name  |     constraint_name      | constraint_type
+--------------+--------------+--------------------------+-----------------
+ public       | check_people | check_people_id_positive | CHECK
+(1 row)
+
+ nspname |   relname    |         conname          | contype
+---------+--------------+--------------------------+---------
+ public  | check_people | check_people_id_positive | c
+(1 row)
+
+ nspname |   relname    |         conname          |    description
+---------+--------------+--------------------------+-------------------
+ public  | check_people | check_people_id_positive | positive ids only
+(1 row)
+
+                                       Table "public.check_people"
+ Column |  Type   | Collation | Nullable | Default | Storage  | Compression | Stats target | Description
+--------+---------+-----------+----------+---------+----------+-------------+--------------+-------------
+ id     | integer |           |          |         | plain    |             |              |
+ name   | text    |           |          |         | extended |             |              |
+Check constraints:
+    "check_people_id_positive" CHECK ((id > 0))
+Access method: heap
+
+ALTER TABLE
+                                       Table "public.check_people"
+ Column |  Type   | Collation | Nullable | Default | Storage  | Compression | Stats target | Description
+--------+---------+-----------+----------+---------+----------+-------------+--------------+-------------
+ id     | integer |           |          |         | plain    |             |              |
+ name   | text    |           |          |         | extended |             |              |
+Check constraints:
+    "check_people_id_gt_zero" CHECK ((id > 0))
+Access method: heap
+
+ALTER TABLE
+INSERT 0 1
+ id |        name
+----+--------------------
+ -3 | Allowed after drop
+  1 | Ada
+  2 | Linus
+(3 rows)
+
+CREATE TABLE
+INSERT 0 2
+psql:338_protocol_psql_check_constraints.sql:31: ERROR:  new row violates check constraint
+ id | name
+----+------
+ -1 | bad
+  1 | ok
+(2 rows)
+
+psql:338_protocol_psql_check_constraints.sql:33: ERROR:  column does not exist
+psql:338_protocol_psql_check_constraints.sql:34: ERROR:  query shape is not supported by the compatibility stub
+psql:338_protocol_psql_check_constraints.sql:35: ERROR:  query shape is not supported by the compatibility stub

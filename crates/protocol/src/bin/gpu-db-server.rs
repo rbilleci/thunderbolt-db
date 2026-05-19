@@ -7,7 +7,7 @@ use std::thread;
 
 use gpu_db_protocol::{
     parse_command, parse_frontend_message, parse_startup_packet, ColumnDefault, Command,
-    CommentTarget, FrontendMessage, ParseError, PublicationTarget, SelectFilterOp,
+    CommentTarget, FrontendMessage, ParseError, PublicationTarget, SelectFilter, SelectFilterOp,
     SelectProjection, SqlValue, StartupPacket, TablePrivilege, SUPPORTED_SQL_TYPES,
 };
 use gpu_db_protocol::{DescribeTarget, SqlType};
@@ -1384,6 +1384,35 @@ fn validate_unique_indexes(table: &Table, indexes: &[CatalogIndex]) -> Result<()
     Ok(())
 }
 
+fn check_constraint_violation_error(_table: &str, _constraint: &str) -> ErrorField {
+    ErrorField {
+        code: "23514",
+        message: "new row violates check constraint",
+        position: None,
+    }
+}
+
+fn validate_check_constraints(table: &Table) -> Result<(), ErrorField> {
+    for constraint in &table.check_constraints {
+        let Some(column_idx) = table
+            .columns
+            .iter()
+            .position(|column| column.def.name == constraint.column)
+        else {
+            continue;
+        };
+        for row in &table.rows {
+            if !select_filter_matches(&row[column_idx], constraint.op, &constraint.value) {
+                return Err(check_constraint_violation_error(
+                    &table.name,
+                    &constraint.name,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn drop_column_from_session(
     session: &mut Session,
     table_name: &str,
@@ -1421,6 +1450,10 @@ fn drop_column_from_session(
         .indexes
         .iter()
         .any(|index| index.table == table_name && index.column == column_name)
+        || table
+            .check_constraints
+            .iter()
+            .any(|constraint| constraint.column == column_name)
     {
         return Err(ErrorField {
             code: "2BP01",
@@ -1538,6 +1571,11 @@ fn rename_column_in_session(
             session.dirty_indexes = true;
         }
     }
+    for constraint in &mut table.check_constraints {
+        if constraint.column == old_name {
+            constraint.column = new_name.to_string();
+        }
+    }
     session.mark_table_dirty(table_name.to_string());
     session.persist_catalog_snapshot();
     Ok(())
@@ -1571,6 +1609,12 @@ fn rename_constraint_in_session(
         });
     }
     if session.indexes.iter().any(|index| index.name == new_name)
+        || session.tables.values().any(|table| {
+            table
+                .check_constraints
+                .iter()
+                .any(|constraint| constraint.name == new_name)
+        })
         || session.tables.contains_key(new_name)
         || session.views.contains_key(new_name)
         || session.materialized_views.contains_key(new_name)
@@ -1582,19 +1626,35 @@ fn rename_constraint_in_session(
             position: None,
         });
     }
-    let Some(index) = session.indexes.iter_mut().find(|index| {
+    if let Some(index) = session.indexes.iter_mut().find(|index| {
         index.table == table_name
             && index.name == old_name
             && (index.primary_key || index.unique_constraint)
-    }) else {
+    }) {
+        index.name = new_name.to_string();
+        session.dirty_indexes = true;
+    } else if let Some(table) = session.tables.get_mut(table_name) {
+        if let Some(check) = table
+            .check_constraints
+            .iter_mut()
+            .find(|constraint| constraint.name == old_name)
+        {
+            check.name = new_name.to_string();
+            session.mark_table_dirty(table_name.to_string());
+        } else {
+            return Err(ErrorField {
+                code: "42704",
+                message: "constraint does not exist",
+                position: None,
+            });
+        }
+    } else {
         return Err(ErrorField {
             code: "42704",
             message: "constraint does not exist",
             position: None,
         });
-    };
-    index.name = new_name.to_string();
-    session.dirty_indexes = true;
+    }
 
     let old_index_target = CatalogCommentTarget::Index {
         index: old_name.to_string(),
@@ -1896,11 +1956,17 @@ fn shared_catalog_contains_table_constraint(table: &str, constraint: &str) -> bo
     let catalog = shared_catalog()
         .lock()
         .expect("shared catalog mutex poisoned");
-    catalog.tables.contains_key(table)
+    (catalog.tables.contains_key(table)
         && catalog.indexes.iter().any(|candidate| {
             candidate.table == table
                 && candidate.name == constraint
                 && (candidate.primary_key || candidate.unique_constraint)
+        }))
+        || catalog.tables.get(table).is_some_and(|table| {
+            table
+                .check_constraints
+                .iter()
+                .any(|candidate| candidate.name == constraint)
         })
 }
 
@@ -2390,6 +2456,7 @@ struct Table {
     name: String,
     columns: Vec<CatalogColumn>,
     rows: Vec<Vec<SqlValue>>,
+    check_constraints: Vec<CatalogCheckConstraint>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2840,6 +2907,76 @@ fn drop_subscription(
     Ok(())
 }
 
+fn add_check_constraint_to_session(
+    session: &mut Session,
+    table_name: &str,
+    constraint_name: String,
+    filter: SelectFilter,
+) -> Result<(), ErrorField> {
+    if session
+        .indexes
+        .iter()
+        .any(|index| index.name == constraint_name)
+        || session.tables.values().any(|table| {
+            table
+                .check_constraints
+                .iter()
+                .any(|constraint| constraint.name == constraint_name)
+        })
+        || session.tables.contains_key(&constraint_name)
+        || session.views.contains_key(&constraint_name)
+        || session.materialized_views.contains_key(&constraint_name)
+        || session.sequences.contains_key(&constraint_name)
+    {
+        return Err(ErrorField {
+            code: "42710",
+            message: "constraint already exists",
+            position: None,
+        });
+    }
+    let Some(table) = session.tables.get(table_name) else {
+        return Err(ErrorField {
+            code: "42P01",
+            message: "relation does not exist",
+            position: None,
+        });
+    };
+    let Some(column) = table
+        .columns
+        .iter()
+        .find(|column| column.def.name == filter.column)
+    else {
+        return Err(ErrorField {
+            code: "42703",
+            message: "column does not exist",
+            position: None,
+        });
+    };
+    if !sql_value_matches_type(&filter.value, column.def.ty) {
+        return Err(ErrorField {
+            code: "42804",
+            message: "column type mismatch",
+            position: None,
+        });
+    }
+    let mut candidate = table.clone();
+    candidate.check_constraints.push(CatalogCheckConstraint {
+        name: constraint_name,
+        table: table_name.to_string(),
+        column: filter.column,
+        op: filter.op,
+        value: filter.value,
+    });
+    validate_check_constraints(&candidate)?;
+    session
+        .tables
+        .get_mut(table_name)
+        .expect("table existence checked")
+        .check_constraints = candidate.check_constraints;
+    session.mark_table_dirty(table_name.to_string());
+    Ok(())
+}
+
 fn evaluate_column_default(
     session: &mut Session,
     default: &ColumnDefault,
@@ -2882,6 +3019,15 @@ struct CatalogIndex {
     unique: bool,
     primary_key: bool,
     unique_constraint: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CatalogCheckConstraint {
+    name: String,
+    table: String,
+    column: String,
+    op: SelectFilterOp,
+    value: SqlValue,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -6384,6 +6530,9 @@ fn apply_copy_in_rows(session: &mut Session, copy: CopyInState) -> Option<ErrorF
     if let Err(error) = validate_unique_indexes(&candidate_table, &catalog_indexes) {
         return Some(error);
     }
+    if let Err(error) = validate_check_constraints(&candidate_table) {
+        return Some(error);
+    }
     session.tables.get_mut(&copy.table)?.rows.extend(new_rows);
     session.mark_table_dirty(copy.table);
     session.persist_catalog_snapshot();
@@ -6893,7 +7042,18 @@ fn execute_statement(
                 && index.name == drop.constraint
                 && (index.primary_key || index.unique_constraint))
         });
-        if session.indexes.len() == old_index_count && !drop.if_exists {
+        let mut dropped_check = false;
+        if let Some(table) = session.tables.get_mut(&drop.table) {
+            let old_check_count = table.check_constraints.len();
+            table
+                .check_constraints
+                .retain(|constraint| constraint.name != drop.constraint);
+            dropped_check = table.check_constraints.len() != old_check_count;
+            if dropped_check {
+                session.mark_table_dirty(drop.table.clone());
+            }
+        }
+        if session.indexes.len() == old_index_count && !dropped_check && !drop.if_exists {
             return write_error(
                 stream,
                 &ErrorField {
@@ -6904,7 +7064,7 @@ fn execute_statement(
             );
         }
         session.dirty_indexes |= session.indexes.len() != old_index_count;
-        if session.indexes.len() != old_index_count {
+        if session.indexes.len() != old_index_count || dropped_check {
             for target in [
                 CatalogCommentTarget::Index {
                     index: drop.constraint.clone(),
@@ -7426,6 +7586,7 @@ fn execute_statement(
                     columns.push(CatalogColumn { attnum, def });
                 }
                 let primary_key = create.primary_key.clone();
+                let check_constraints = create.check_constraints.clone();
                 let name = create.table;
                 let table_name = name.clone();
                 for column in &columns {
@@ -7471,6 +7632,7 @@ fn execute_statement(
                         name,
                         columns,
                         rows: Vec::new(),
+                        check_constraints: Vec::new(),
                     },
                 );
                 if let Some(primary_key) = primary_key {
@@ -7501,6 +7663,25 @@ fn execute_statement(
                         &table_name,
                         constraint_name,
                         unique.column,
+                    ) {
+                        session.tables.remove(&table_name);
+                        session.indexes.retain(|index| index.table != table_name);
+                        for sequence in &implicit_sequences {
+                            session.sequences.remove(sequence);
+                            session.mark_sequence_dirty(sequence.clone());
+                        }
+                        return write_error(stream, &error);
+                    }
+                }
+                for check in check_constraints {
+                    let constraint_name = check
+                        .name
+                        .unwrap_or_else(|| format!("{}_{}_check", table_name, check.filter.column));
+                    if let Err(error) = add_check_constraint_to_session(
+                        session,
+                        &table_name,
+                        constraint_name,
+                        check.filter,
                     ) {
                         session.tables.remove(&table_name);
                         session.indexes.retain(|index| index.table != table_name);
@@ -7545,6 +7726,15 @@ fn execute_statement(
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, "ALTER TABLE");
             }
+            Command::AddCheckConstraint(add) => {
+                if let Err(error) =
+                    add_check_constraint_to_session(session, &add.table, add.name, add.filter)
+                {
+                    return write_error(stream, &error);
+                }
+                session.persist_catalog_snapshot();
+                return write_command_complete(stream, "ALTER TABLE");
+            }
             Command::DropConstraint(drop) => {
                 if !session.tables.contains_key(&drop.table) {
                     if drop.table_if_exists {
@@ -7565,7 +7755,18 @@ fn execute_statement(
                         && index.name == drop.name
                         && (index.primary_key || index.unique_constraint))
                 });
-                if session.indexes.len() == old_index_count && !drop.if_exists {
+                let mut dropped_check = false;
+                if let Some(table) = session.tables.get_mut(&drop.table) {
+                    let old_check_count = table.check_constraints.len();
+                    table
+                        .check_constraints
+                        .retain(|constraint| constraint.name != drop.name);
+                    dropped_check = table.check_constraints.len() != old_check_count;
+                    if dropped_check {
+                        session.mark_table_dirty(drop.table.clone());
+                    }
+                }
+                if session.indexes.len() == old_index_count && !dropped_check && !drop.if_exists {
                     return write_error(
                         stream,
                         &ErrorField {
@@ -7576,7 +7777,7 @@ fn execute_statement(
                     );
                 }
                 session.dirty_indexes |= session.indexes.len() != old_index_count;
-                if session.indexes.len() != old_index_count {
+                if session.indexes.len() != old_index_count || dropped_check {
                     for target in [
                         CatalogCommentTarget::Index {
                             index: drop.name.clone(),
@@ -9002,6 +9203,11 @@ fn execute_statement(
                             candidate.table == table
                                 && candidate.name == constraint
                                 && (candidate.primary_key || candidate.unique_constraint)
+                        }) || session.tables.get(&table).is_some_and(|table| {
+                            table
+                                .check_constraints
+                                .iter()
+                                .any(|candidate| candidate.name == constraint)
                         }) || (session.shared_catalog
                             && shared_catalog_contains_table_constraint(&table, &constraint));
                         if !exists {
@@ -9147,6 +9353,9 @@ fn execute_statement(
                 if let Err(error) = validate_unique_indexes(&candidate_table, &catalog_indexes) {
                     return write_error(stream, &error);
                 }
+                if let Err(error) = validate_check_constraints(&candidate_table) {
+                    return write_error(stream, &error);
+                }
                 session
                     .tables
                     .get_mut(&table_name)
@@ -9264,6 +9473,9 @@ fn execute_statement(
                 let mut candidate_table = table.clone();
                 candidate_table.rows = candidate_rows;
                 if let Err(error) = validate_unique_indexes(&candidate_table, &catalog_indexes) {
+                    return write_error(stream, &error);
+                }
+                if let Err(error) = validate_check_constraints(&candidate_table) {
                     return write_error(stream, &error);
                 }
                 table.rows = candidate_table.rows;
@@ -10226,6 +10438,13 @@ fn execute_statement(
                 int4_column("reltablespace"),
             ],
             &catalog_describe_index_rows(session, oid),
+        );
+    }
+    if let Some(oid) = catalog_describe_check_constraints_query_oid(&canonical) {
+        return write_single_row(
+            stream,
+            &[text_column("conname"), text_column("pg_get_constraintdef")],
+            &catalog_describe_check_constraint_rows(session, oid),
         );
     }
     if let Some(oid) = catalog_describe_policy_query_oid(&canonical) {
@@ -12091,6 +12310,7 @@ fn pg_dump_class_metadata_rows(session: &Session) -> Vec<Vec<Option<String>>> {
             table.oid,
             &table.name,
             "r",
+            table.check_constraints.len(),
             relhasindex,
             false,
             Some("heap"),
@@ -12100,7 +12320,7 @@ fn pg_dump_class_metadata_rows(session: &Session) -> Vec<Vec<Option<String>>> {
     views.sort_by_key(|view| view.oid);
     for view in views {
         rows.push(pg_dump_class_metadata_row(
-            view.oid, &view.name, "v", false, true, None,
+            view.oid, &view.name, "v", 0, false, true, None,
         ));
     }
     let mut materialized_views = session.materialized_views.values().collect::<Vec<_>>();
@@ -12110,6 +12330,7 @@ fn pg_dump_class_metadata_rows(session: &Session) -> Vec<Vec<Option<String>>> {
             view.oid,
             &view.name,
             "m",
+            0,
             false,
             true,
             Some("heap"),
@@ -12122,6 +12343,7 @@ fn pg_dump_class_metadata_rows(session: &Session) -> Vec<Vec<Option<String>>> {
             sequence.oid,
             &sequence.name,
             "S",
+            0,
             false,
             false,
             None,
@@ -12134,6 +12356,7 @@ fn pg_dump_class_metadata_row(
     oid: u32,
     name: &str,
     relkind: &str,
+    relchecks: usize,
     relhasindex: bool,
     relhasrules: bool,
     amname: Option<&str>,
@@ -12144,7 +12367,7 @@ fn pg_dump_class_metadata_row(
         Some(name.to_string()),
         Some(PUBLIC_NAMESPACE_OID.to_string()),
         Some(relkind.to_string()),
-        Some("0".to_string()),
+        Some(relchecks.to_string()),
         Some("10".to_string()),
         Some("0".to_string()),
         Some(if relhasindex { "t" } else { "f" }.to_string()),
@@ -13421,7 +13644,7 @@ fn catalog_describe_relation_flags_rows(session: &Session, oid: u32) -> Vec<Vec<
         .any(|index| index.table == table.name);
 
     vec![vec![
-        Some("0".to_string()),
+        Some(table.check_constraints.len().to_string()),
         Some("r".to_string()),
         Some(if relhasindex { "t" } else { "f" }.to_string()),
         Some("f".to_string()),
@@ -13457,6 +13680,53 @@ fn catalog_describe_index_query_oid(canonical: &str) -> Option<u32> {
         .strip_suffix(suffix)?
         .parse()
         .ok()
+}
+
+fn catalog_describe_check_constraints_query_oid(canonical: &str) -> Option<u32> {
+    let prefix = "select r.conname, pg_catalog.pg_get_constraintdef(r.oid, true) from pg_catalog.pg_constraint r where r.conrelid = '";
+    let suffix = "' and r.contype = 'c' order by 1";
+    canonical
+        .strip_prefix(prefix)?
+        .strip_suffix(suffix)?
+        .parse()
+        .ok()
+}
+
+fn check_constraint_definition(constraint: &CatalogCheckConstraint) -> String {
+    let op = match constraint.op {
+        SelectFilterOp::Eq => "=",
+        SelectFilterOp::Lt => "<",
+        SelectFilterOp::Lte => "<=",
+        SelectFilterOp::Gt => ">",
+        SelectFilterOp::Gte => ">=",
+        SelectFilterOp::LikePrefix => "LIKE",
+    };
+    let value = match &constraint.value {
+        SqlValue::Text(value) => format!("'{}'", value.replace('\'', "''")),
+        value => format_sql_value(value),
+    };
+    format!("CHECK (({} {} {}))", constraint.column, op, value)
+}
+
+fn catalog_describe_check_constraint_rows(
+    session: &Session,
+    table_oid: u32,
+) -> Vec<Vec<Option<String>>> {
+    let Some(table) = session.tables.values().find(|table| table.oid == table_oid) else {
+        return Vec::new();
+    };
+    let mut rows = table
+        .check_constraints
+        .iter()
+        .map(|constraint| {
+            vec![
+                Some(constraint.name.clone()),
+                Some(check_constraint_definition(constraint)),
+            ]
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| left[0].cmp(&right[0]));
+    rows
 }
 
 fn catalog_describe_index_rows(session: &Session, table_oid: u32) -> Vec<Vec<Option<String>>> {
@@ -14440,6 +14710,16 @@ fn information_schema_table_constraint_rows(session: &Session) -> Vec<Vec<Option
             ]
         })
         .collect::<Vec<_>>();
+    for table in session.tables.values() {
+        for constraint in &table.check_constraints {
+            rows.push(vec![
+                Some("public".to_string()),
+                Some(table.name.clone()),
+                Some(constraint.name.clone()),
+                Some("CHECK".to_string()),
+            ]);
+        }
+    }
     rows.sort_by(|left, right| left[1].cmp(&right[1]).then_with(|| left[2].cmp(&right[2])));
     rows
 }
@@ -14643,7 +14923,7 @@ fn pg_catalog_constraints_query() -> &'static str {
 }
 
 fn pg_catalog_constraint_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    catalog_constraint_entries(session)
+    let mut rows = catalog_constraint_entries(session)
         .into_iter()
         .map(|entry| {
             vec![
@@ -14653,7 +14933,19 @@ fn pg_catalog_constraint_rows(session: &Session) -> Vec<Vec<Option<String>>> {
                 Some(catalog_constraint_contype(&entry.index).to_string()),
             ]
         })
-        .collect()
+        .collect::<Vec<_>>();
+    for table in session.tables.values() {
+        for constraint in &table.check_constraints {
+            rows.push(vec![
+                Some("public".to_string()),
+                Some(table.name.clone()),
+                Some(constraint.name.clone()),
+                Some("c".to_string()),
+            ]);
+        }
+    }
+    rows.sort_by(|left, right| left[1].cmp(&right[1]).then_with(|| left[2].cmp(&right[2])));
+    rows
 }
 
 fn pg_catalog_attrdefs_query() -> &'static str {
@@ -14799,32 +15091,37 @@ fn pg_catalog_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
 }
 
 fn pg_catalog_constraint_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    let mut constraints = catalog_constraint_entries(session);
-    constraints.sort_by(|left, right| {
-        left.index
-            .table
-            .cmp(&right.index.table)
-            .then_with(|| left.index.name.cmp(&right.index.name))
-    });
-    constraints
-        .into_iter()
-        .filter_map(|entry| {
-            session
-                .comments
-                .get(&CatalogCommentTarget::Constraint {
-                    table: entry.index.table.clone(),
-                    constraint: entry.index.name.clone(),
-                })
-                .map(|description| {
-                    vec![
-                        Some("public".to_string()),
-                        Some(entry.index.table),
-                        Some(entry.index.name),
-                        Some(description.clone()),
-                    ]
-                })
-        })
-        .collect()
+    let mut rows = Vec::new();
+    for entry in catalog_constraint_entries(session) {
+        if let Some(description) = session.comments.get(&CatalogCommentTarget::Constraint {
+            table: entry.index.table.clone(),
+            constraint: entry.index.name.clone(),
+        }) {
+            rows.push(vec![
+                Some("public".to_string()),
+                Some(entry.index.table),
+                Some(entry.index.name),
+                Some(description.clone()),
+            ]);
+        }
+    }
+    for table in session.tables.values() {
+        for constraint in &table.check_constraints {
+            if let Some(description) = session.comments.get(&CatalogCommentTarget::Constraint {
+                table: table.name.clone(),
+                constraint: constraint.name.clone(),
+            }) {
+                rows.push(vec![
+                    Some("public".to_string()),
+                    Some(table.name.clone()),
+                    Some(constraint.name.clone()),
+                    Some(description.clone()),
+                ]);
+            }
+        }
+    }
+    rows.sort_by(|left, right| left[1].cmp(&right[1]).then_with(|| left[2].cmp(&right[2])));
+    rows
 }
 
 fn pg_catalog_table_index_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
@@ -16874,6 +17171,7 @@ mod tests {
                 },
             }],
             rows,
+            check_constraints: Vec::new(),
         }
     }
 
@@ -17962,6 +18260,7 @@ mod tests {
                     vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())],
                     vec![SqlValue::Int4(2), SqlValue::Text("Tab\tName".to_string())],
                 ],
+                check_constraints: Vec::new(),
             },
         );
         let (mut writer, mut reader) = tcp_pair();
@@ -18023,6 +18322,7 @@ mod tests {
                         SqlValue::Text("Grace, \"Amazing\"".to_string()),
                     ],
                 ],
+                check_constraints: Vec::new(),
             },
         );
         let (mut writer, mut reader) = tcp_pair();
@@ -18083,6 +18383,7 @@ mod tests {
                     },
                 ],
                 rows: vec![vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())]],
+                check_constraints: Vec::new(),
             },
         );
         let (mut writer, mut reader) = tcp_pair();
@@ -18149,6 +18450,7 @@ mod tests {
                         SqlValue::Text("Grace|Hopper".to_string()),
                     ],
                 ],
+                check_constraints: Vec::new(),
             },
         );
         let (mut writer, mut reader) = tcp_pair();
@@ -18210,6 +18512,7 @@ mod tests {
                     },
                 ],
                 rows: Vec::new(),
+                check_constraints: Vec::new(),
             },
         );
         let mut extended_error_pending = false;
@@ -18295,6 +18598,7 @@ mod tests {
                     },
                 ],
                 rows: Vec::new(),
+                check_constraints: Vec::new(),
             },
         );
         let mut extended_error_pending = false;
@@ -18380,6 +18684,7 @@ mod tests {
                     },
                 ],
                 rows: Vec::new(),
+                check_constraints: Vec::new(),
             },
         );
         let mut extended_error_pending = false;
@@ -18464,6 +18769,7 @@ mod tests {
                     },
                 ],
                 rows: Vec::new(),
+                check_constraints: Vec::new(),
             },
         );
         let mut extended_error_pending = false;
@@ -18539,6 +18845,7 @@ mod tests {
                     },
                 }],
                 rows: vec![vec![SqlValue::Int4(1)], vec![SqlValue::Int4(2)]],
+                check_constraints: Vec::new(),
             },
         );
         session.sequences.insert(
@@ -18608,6 +18915,7 @@ mod tests {
                         SqlValue::Text("Ada Lovelace".to_string()),
                     ],
                 ],
+                check_constraints: Vec::new(),
             },
         );
         let (mut writer, mut reader) = tcp_pair();
@@ -18669,6 +18977,7 @@ mod tests {
                         SqlValue::Text("Ada Lovelace".to_string()),
                     ],
                 ],
+                check_constraints: Vec::new(),
             },
         );
         let (mut writer, mut reader) = tcp_pair();
@@ -19029,6 +19338,7 @@ mod tests {
                     },
                 ],
                 rows: Vec::new(),
+                check_constraints: Vec::new(),
             },
         );
         session.tables.insert(
@@ -19046,6 +19356,7 @@ mod tests {
                     },
                 }],
                 rows: Vec::new(),
+                check_constraints: Vec::new(),
             },
         );
 
@@ -19227,6 +19538,7 @@ mod tests {
                     vec![SqlValue::Int4(1), SqlValue::Text("ada".to_string())],
                     vec![SqlValue::Int4(2), SqlValue::Text("grace".to_string())],
                 ],
+                check_constraints: Vec::new(),
             },
         );
         assert_eq!(
@@ -20577,6 +20889,7 @@ mod tests {
                     },
                 }],
                 rows: Vec::new(),
+                check_constraints: Vec::new(),
             },
         );
 
@@ -20624,6 +20937,7 @@ mod tests {
                 },
             ],
             rows: Vec::new(),
+            check_constraints: Vec::new(),
         };
         let Command::Select(select) =
             parse_command("SELECT id, name FROM people WHERE (id = 1) OR (name = 'Grace')")
@@ -20681,6 +20995,7 @@ mod tests {
                     },
                 ],
                 rows: Vec::new(),
+                check_constraints: Vec::new(),
             },
         );
 
@@ -20895,6 +21210,7 @@ mod tests {
                     },
                 ],
                 rows: vec![vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())]],
+                check_constraints: Vec::new(),
             },
         );
         let (mut writer, mut reader) = tcp_pair();
@@ -21021,6 +21337,7 @@ mod tests {
                     },
                 ],
                 rows: Vec::new(),
+                check_constraints: Vec::new(),
             },
         );
 
@@ -21136,6 +21453,7 @@ mod tests {
                     vec![SqlValue::Int4(2), SqlValue::Text("Linus".to_string())],
                     vec![SqlValue::Int4(3), SqlValue::Text("Grace".to_string())],
                 ],
+                check_constraints: Vec::new(),
             },
         );
         let (mut writer, mut reader) = tcp_pair();
@@ -21205,6 +21523,7 @@ mod tests {
                     vec![SqlValue::Int4(2), SqlValue::Text("Linus".to_string())],
                     vec![SqlValue::Int4(3), SqlValue::Text("Grace".to_string())],
                 ],
+                check_constraints: Vec::new(),
             },
         );
         let (mut writer, mut reader) = tcp_pair();
@@ -21316,6 +21635,7 @@ mod tests {
                     vec![SqlValue::Int4(2), SqlValue::Text("Linus".to_string())],
                     vec![SqlValue::Int4(3), SqlValue::Text("Grace".to_string())],
                 ],
+                check_constraints: Vec::new(),
             },
         );
         session.prepared.insert(
@@ -21405,6 +21725,7 @@ mod tests {
                     },
                 ],
                 rows: vec![vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())]],
+                check_constraints: Vec::new(),
             },
         );
         session.prepared.insert(
@@ -21517,6 +21838,7 @@ mod tests {
                     vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())],
                     vec![SqlValue::Int4(2), SqlValue::Text("Linus".to_string())],
                 ],
+                check_constraints: Vec::new(),
             },
         );
         let (mut writer, mut reader) = tcp_pair();
@@ -21703,6 +22025,7 @@ mod tests {
                     vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())],
                     vec![SqlValue::Int4(2), SqlValue::Text("Linus".to_string())],
                 ],
+                check_constraints: Vec::new(),
             },
         );
         let query = PreparedQuery {
@@ -21800,6 +22123,7 @@ mod tests {
                     vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())],
                     vec![SqlValue::Int4(2), SqlValue::Text("Linus".to_string())],
                 ],
+                check_constraints: Vec::new(),
             },
         );
         let query = PreparedQuery {
@@ -21945,6 +22269,7 @@ mod tests {
                         },
                     ],
                     rows: vec![vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())]],
+                    check_constraints: Vec::new(),
                 },
             );
             session.replace_extended_statement(
@@ -22064,6 +22389,7 @@ mod tests {
                         },
                     ],
                     rows: vec![vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())]],
+                    check_constraints: Vec::new(),
                 },
             );
             session.replace_extended_statement(
@@ -22171,6 +22497,7 @@ mod tests {
                     },
                 ],
                 rows: vec![vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())]],
+                check_constraints: Vec::new(),
             },
         );
         session.replace_extended_statement(
@@ -22305,6 +22632,7 @@ mod tests {
                     },
                 ],
                 rows: Vec::new(),
+                check_constraints: Vec::new(),
             },
         );
         let first = PreparedQuery {
@@ -22398,6 +22726,7 @@ mod tests {
                     },
                 ],
                 rows: Vec::new(),
+                check_constraints: Vec::new(),
             },
         );
         let (mut writer, mut reader) = tcp_pair();
@@ -22450,6 +22779,7 @@ mod tests {
                     },
                 ],
                 rows: Vec::new(),
+                check_constraints: Vec::new(),
             },
         );
         let (mut writer, mut reader) = tcp_pair();
@@ -22576,6 +22906,7 @@ mod tests {
                     },
                 }],
                 rows: Vec::new(),
+                check_constraints: Vec::new(),
             },
         );
         let (mut writer, mut reader) = tcp_pair();
@@ -22630,6 +22961,7 @@ mod tests {
                     },
                 ],
                 rows: Vec::new(),
+                check_constraints: Vec::new(),
             },
         );
         let (mut writer, mut reader) = tcp_pair();
@@ -22718,6 +23050,7 @@ mod tests {
                         },
                     ],
                     rows: vec![vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())]],
+                    check_constraints: Vec::new(),
                 },
             );
             let (mut writer, mut reader) = tcp_pair();
@@ -23060,6 +23393,7 @@ mod tests {
                     },
                 ],
                 rows: vec![vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())]],
+                check_constraints: Vec::new(),
             },
         );
         session.replace_extended_statement(
@@ -23176,6 +23510,7 @@ mod tests {
                     },
                 ],
                 rows: vec![vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())]],
+                check_constraints: Vec::new(),
             },
         );
         session.replace_extended_statement(
@@ -23310,6 +23645,7 @@ mod tests {
                         },
                     ],
                     rows: vec![vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())]],
+                    check_constraints: Vec::new(),
                 },
             );
             session.replace_extended_statement(
@@ -23435,6 +23771,7 @@ mod tests {
                     },
                 ],
                 rows: Vec::new(),
+                check_constraints: Vec::new(),
             },
         );
         let query = PreparedQuery {
@@ -23500,6 +23837,7 @@ mod tests {
                     },
                 ],
                 rows: Vec::new(),
+                check_constraints: Vec::new(),
             },
         );
         session.prepared.insert(
@@ -23717,6 +24055,7 @@ mod tests {
                     vec![SqlValue::Int4(2), SqlValue::Text("Linus".to_string())],
                     vec![SqlValue::Int4(3), SqlValue::Text("Grace".to_string())],
                 ],
+                check_constraints: Vec::new(),
             },
         );
         session.replace_extended_portal(
@@ -23785,6 +24124,7 @@ mod tests {
                     },
                 }],
                 rows: vec![vec![SqlValue::Int4(1)]],
+                check_constraints: Vec::new(),
             },
         );
         session.replace_extended_portal(
@@ -23845,6 +24185,7 @@ mod tests {
                     vec![SqlValue::Int4(2)],
                     vec![SqlValue::Int4(3)],
                 ],
+                check_constraints: Vec::new(),
             },
         );
         session.portals.insert(
@@ -23902,6 +24243,7 @@ mod tests {
                     },
                 }],
                 rows: vec![vec![SqlValue::Int4(1)]],
+                check_constraints: Vec::new(),
             },
         );
         session.replace_extended_portal(
@@ -23970,6 +24312,7 @@ mod tests {
                     },
                 ],
                 rows: Vec::new(),
+                check_constraints: Vec::new(),
             },
         );
 
@@ -24012,6 +24355,7 @@ mod tests {
                     },
                 ],
                 rows: vec![vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())]],
+                check_constraints: Vec::new(),
             },
         );
         session.prepared.insert(
@@ -24088,6 +24432,7 @@ mod tests {
                     },
                 ],
                 rows: vec![vec![SqlValue::Int4(2), SqlValue::Text("Ada".to_string())]],
+                check_constraints: Vec::new(),
             },
         );
         session.prepared.insert(
@@ -24175,6 +24520,7 @@ mod tests {
                     },
                 ],
                 rows: Vec::new(),
+                check_constraints: Vec::new(),
             },
         );
         session.prepared.insert(
@@ -24248,6 +24594,7 @@ mod tests {
                     },
                 ],
                 rows: Vec::new(),
+                check_constraints: Vec::new(),
             },
         );
         session.prepared.insert(
@@ -24303,6 +24650,7 @@ mod tests {
                     },
                 ],
                 rows: Vec::new(),
+                check_constraints: Vec::new(),
             },
         );
         session.prepared.insert(
@@ -24359,6 +24707,7 @@ mod tests {
                     },
                 ],
                 rows: Vec::new(),
+                check_constraints: Vec::new(),
             },
         );
         session.prepared.insert(
@@ -25200,6 +25549,7 @@ mod tests {
                     vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())],
                     vec![SqlValue::Int4(3), SqlValue::Text("Grace".to_string())],
                 ],
+                check_constraints: Vec::new(),
             },
         );
         let Command::Select(select) =
@@ -25457,6 +25807,7 @@ mod tests {
                     vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())],
                     vec![SqlValue::Int4(2), SqlValue::Text("Grace".to_string())],
                 ],
+                check_constraints: Vec::new(),
             },
         );
         session.prepared.insert(
@@ -25522,6 +25873,7 @@ mod tests {
                     vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())],
                     vec![SqlValue::Int4(2), SqlValue::Text("Linus".to_string())],
                 ],
+                check_constraints: Vec::new(),
             },
         );
         let (mut writer, mut reader) = tcp_pair();
@@ -25765,6 +26117,7 @@ mod tests {
                     },
                 ],
                 rows: Vec::new(),
+                check_constraints: Vec::new(),
             },
         );
 
@@ -25880,6 +26233,7 @@ mod tests {
                     },
                 ],
                 rows: Vec::new(),
+                check_constraints: Vec::new(),
             },
         );
         session.comments.insert(

@@ -19,14 +19,14 @@ use gpu_db_observability::{
 };
 use gpu_db_planner::{ExecutionPlan, Planner, PlannerConfig};
 use gpu_db_protocol::{
-    parse_command, AddUniqueConstraint, ColumnDef, ColumnDefault, Command, CommentTarget,
-    CreateDomain, CreateIndex, CreateMaterializedView, CreatePublication, CreateSequence,
-    CreateSubscription, CreateTable, CreateView, Delete, DropConstraint, DropDomain, DropIndex,
-    DropMaterializedView, DropPublication, DropSequence, DropSubscription, DropTable, DropView,
-    Insert, ParseError, PublicationTarget, RefreshMaterializedView, RenameColumn, RenameConstraint,
-    RenameIndex, RenameMaterializedView, RenameSequence, RenameTable, RenameView, Select,
-    SelectFilterOp, SelectProjection, SequenceNextVal, SequenceSetVal, SqlType, SqlValue,
-    TablePrivilege, TruncateTable, Update,
+    parse_command, AddCheckConstraint, AddUniqueConstraint, ColumnDef, ColumnDefault, Command,
+    CommentTarget, CreateDomain, CreateIndex, CreateMaterializedView, CreatePublication,
+    CreateSequence, CreateSubscription, CreateTable, CreateView, Delete, DropConstraint,
+    DropDomain, DropIndex, DropMaterializedView, DropPublication, DropSequence, DropSubscription,
+    DropTable, DropView, Insert, ParseError, PublicationTarget, RefreshMaterializedView,
+    RenameColumn, RenameConstraint, RenameIndex, RenameMaterializedView, RenameSequence,
+    RenameTable, RenameView, Select, SelectFilterOp, SelectProjection, SequenceNextVal,
+    SequenceSetVal, SqlType, SqlValue, TablePrivilege, TruncateTable, Update,
 };
 use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine};
 use gpu_db_storage::{
@@ -79,6 +79,7 @@ impl ReplicatedStateMachine for KvStateMachine {
                     | Command::CreateTable(_)
                     | Command::AddPrimaryKey(_)
                     | Command::AddUniqueConstraint(_)
+                    | Command::AddCheckConstraint(_)
                     | Command::AddColumn(_)
                     | Command::RenameTable(_)
                     | Command::RenameColumn(_)
@@ -5996,6 +5997,7 @@ pub struct RelationalTable {
     pub oid: u32,
     pub columns: Vec<RelationalColumn>,
     pub indexes: Vec<RelationalIndex>,
+    pub check_constraints: Vec<RelationalCheckConstraint>,
     pub acl: BTreeMap<String, BTreeSet<TablePrivilege>>,
 }
 
@@ -6020,6 +6022,14 @@ pub struct RelationalIndex {
     pub unique: bool,
     pub primary_key: bool,
     pub unique_constraint: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationalCheckConstraint {
+    pub name: String,
+    pub column: String,
+    pub op: SelectFilterOp,
+    pub value: SqlValue,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7638,6 +7648,7 @@ impl Engine {
             Command::CreateTable(create) => self.apply_create_table(create)?,
             Command::AddPrimaryKey(add) => self.apply_add_primary_key(add)?,
             Command::AddUniqueConstraint(add) => self.apply_add_unique_constraint(add)?,
+            Command::AddCheckConstraint(add) => self.apply_add_check_constraint(add)?,
             Command::AddColumn(add) => self.apply_add_column(add, txn_id)?,
             Command::RenameTable(rename) => self.apply_rename_table(rename, txn_id)?,
             Command::RenameColumn(rename) => self.apply_rename_column(rename)?,
@@ -8119,8 +8130,10 @@ impl Engine {
         }
         let primary_key = create.primary_key.clone();
         let unique_constraints = create.unique_constraints.clone();
+        let check_constraints = create.check_constraints.clone();
         let name = create.table;
         let mut indexes = Vec::new();
+        let mut checks = Vec::new();
         if let Some(primary_key) = primary_key {
             let constraint_name = primary_key.name.unwrap_or_else(|| format!("{}_pkey", name));
             indexes.push(RelationalIndex {
@@ -8151,6 +8164,42 @@ impl Engine {
                 unique_constraint: true,
             });
         }
+        for check in check_constraints {
+            let Some(column) = columns
+                .iter()
+                .find(|column| column.name == check.filter.column)
+            else {
+                return Err(EngineError::ApplyFailed(format!(
+                    "column \"{}\" does not exist",
+                    check.filter.column
+                )));
+            };
+            if !sql_value_matches_type(&check.filter.value, column.ty) {
+                return Err(EngineError::ApplyFailed(format!(
+                    "invalid value for column \"{}\"",
+                    check.filter.column
+                )));
+            }
+            let constraint_name = check
+                .name
+                .unwrap_or_else(|| format!("{}_{}_check", name, check.filter.column));
+            if indexes.iter().any(|index| index.name == constraint_name)
+                || checks
+                    .iter()
+                    .any(|candidate: &RelationalCheckConstraint| candidate.name == constraint_name)
+            {
+                return Err(EngineError::ApplyFailed(format!(
+                    "constraint \"{}\" already exists",
+                    constraint_name
+                )));
+            }
+            checks.push(RelationalCheckConstraint {
+                name: constraint_name,
+                column: check.filter.column,
+                op: check.filter.op,
+                value: check.filter.value,
+            });
+        }
         self.relational_next_oid = next_oid;
         for sequence in &implicit_sequences {
             self.create_implicit_sequence(sequence)?;
@@ -8164,6 +8213,7 @@ impl Engine {
                 oid,
                 columns,
                 indexes,
+                check_constraints: checks,
                 acl: self.relational_default_table_acl.clone(),
             },
         );
@@ -8284,6 +8334,21 @@ impl Engine {
         self.apply_create_index_with_constraint_flags(create, false, true)
     }
 
+    fn apply_add_check_constraint(&mut self, add: AddCheckConstraint) -> Result<(), EngineError> {
+        self.preflight_add_check_constraint(&add)?;
+        let table = self
+            .relational_catalog
+            .get_mut(&add.table)
+            .expect("table existence preflighted");
+        table.check_constraints.push(RelationalCheckConstraint {
+            name: add.name,
+            column: add.filter.column,
+            op: add.filter.op,
+            value: add.filter.value,
+        });
+        Ok(())
+    }
+
     fn apply_drop_constraint(&mut self, drop: DropConstraint) -> Result<(), EngineError> {
         let Some(table) = self.relational_catalog.get_mut(&drop.table) else {
             if drop.table_if_exists {
@@ -8294,11 +8359,15 @@ impl Engine {
                 drop.table
             )));
         };
-        let old_len = table.indexes.len();
+        let old_index_len = table.indexes.len();
         table.indexes.retain(|index| {
             !(index.name == drop.name && (index.primary_key || index.unique_constraint))
         });
-        if table.indexes.len() == old_len {
+        let old_check_len = table.check_constraints.len();
+        table
+            .check_constraints
+            .retain(|constraint| constraint.name != drop.name);
+        if table.indexes.len() == old_index_len && table.check_constraints.len() == old_check_len {
             if drop.if_exists {
                 return Ok(());
             }
@@ -8361,15 +8430,22 @@ impl Engine {
             .relational_catalog
             .get_mut(&rename.table)
             .expect("table existence validated");
-        let Some(index) = table.indexes.iter_mut().find(|index| {
+        if let Some(index) = table.indexes.iter_mut().find(|index| {
             index.name == rename.old_name && (index.primary_key || index.unique_constraint)
-        }) else {
+        }) {
+            index.name = rename.new_name.clone();
+        } else if let Some(check) = table
+            .check_constraints
+            .iter_mut()
+            .find(|constraint| constraint.name == rename.old_name)
+        {
+            check.name = rename.new_name.clone();
+        } else {
             return Err(EngineError::ApplyFailed(format!(
                 "constraint \"{}\" does not exist",
                 rename.old_name
             )));
         };
-        index.name = rename.new_name.clone();
 
         let old_index_target = RelationalCommentTarget::Index {
             index: rename.old_name.clone(),
@@ -8450,6 +8526,70 @@ impl Engine {
                 continue;
             };
             Self::validate_unique_values(rows, column_idx, &index.name)?;
+        }
+        Ok(())
+    }
+
+    fn validate_check_constraints_for_rows(
+        table: &RelationalTable,
+        rows: &[Vec<SqlValue>],
+    ) -> Result<(), EngineError> {
+        for constraint in &table.check_constraints {
+            let column_idx = relational_column_index(table, &constraint.column)
+                .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+            for row in rows {
+                if !select_filter_matches(&row[column_idx], constraint.op, &constraint.value) {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "new row for relation \"{}\" violates check constraint \"{}\"",
+                        table.name, constraint.name
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn preflight_add_check_constraint(&self, add: &AddCheckConstraint) -> Result<(), EngineError> {
+        let table = self.relational_catalog.get(&add.table).ok_or_else(|| {
+            EngineError::ApplyFailed(format!("relation \"{}\" does not exist", add.table))
+        })?;
+        if self.relational_catalog.values().any(|candidate| {
+            candidate.indexes.iter().any(|index| index.name == add.name)
+                || candidate
+                    .check_constraints
+                    .iter()
+                    .any(|constraint| constraint.name == add.name)
+        }) || self.relational_catalog.contains_key(&add.name)
+            || self.relational_views.contains_key(&add.name)
+            || self.relational_materialized_views.contains_key(&add.name)
+            || self.relational_sequences.contains_key(&add.name)
+        {
+            return Err(EngineError::ApplyFailed(format!(
+                "constraint \"{}\" already exists",
+                add.name
+            )));
+        }
+        let column_idx = relational_column_index(table, &add.filter.column)
+            .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+        if !sql_value_matches_type(&add.filter.value, table.columns[column_idx].ty) {
+            return Err(EngineError::ApplyFailed(format!(
+                "invalid value for column \"{}\"",
+                add.filter.column
+            )));
+        }
+        let rows = self.visible_relational_rows(
+            table,
+            StorageVisibility {
+                read_txn_id: self.visible_up_to as TxnId,
+            },
+        )?;
+        for row in rows {
+            if !select_filter_matches(&row[column_idx], add.filter.op, &add.filter.value) {
+                return Err(EngineError::ApplyFailed(format!(
+                    "check constraint \"{}\" is violated by some row",
+                    add.name
+                )));
+            }
         }
         Ok(())
     }
@@ -9650,7 +9790,11 @@ impl Engine {
                 if !table_ref.indexes.iter().any(|candidate| {
                     candidate.name == constraint
                         && (candidate.primary_key || candidate.unique_constraint)
-                }) {
+                }) && !table_ref
+                    .check_constraints
+                    .iter()
+                    .any(|candidate| candidate.name == constraint)
+                {
                     return Err(EngineError::ApplyFailed(format!(
                         "constraint \"{}\" does not exist",
                         constraint
@@ -9917,6 +10061,11 @@ impl Engine {
                 index.column = rename.new_name.clone();
             }
         }
+        for constraint in &mut table_ref.check_constraints {
+            if constraint.column == rename.old_name {
+                constraint.column = rename.new_name.clone();
+            }
+        }
         self.relational_residency.remove(&rename.table);
         self.relational_residency_device_memory
             .remove(&rename.table);
@@ -9963,6 +10112,10 @@ impl Engine {
             .indexes
             .iter()
             .any(|index| index.column == drop_column.column)
+            || table
+                .check_constraints
+                .iter()
+                .any(|constraint| constraint.column == drop_column.column)
         {
             return Err(EngineError::ApplyFailed(format!(
                 "cannot drop column \"{}\" because an index or constraint depends on it",
@@ -10114,6 +10267,16 @@ impl Engine {
             candidate_rows.extend(new_rows.clone());
             Self::validate_unique_indexes_for_rows(&table, &candidate_rows)?;
         }
+        if !table.check_constraints.is_empty() {
+            let mut candidate_rows = self.visible_relational_rows(
+                &table,
+                StorageVisibility {
+                    read_txn_id: txn_id,
+                },
+            )?;
+            candidate_rows.extend(new_rows.clone());
+            Self::validate_check_constraints_for_rows(&table, &candidate_rows)?;
+        }
 
         for values in new_rows {
             let row_id = self.relational_next_row_id;
@@ -10238,9 +10401,14 @@ impl Engine {
         }
         drop(cursor);
 
-        if table.indexes.iter().any(|index| index.unique) {
+        if table.indexes.iter().any(|index| index.unique) || !table.check_constraints.is_empty() {
             candidate_rows.extend(updates.iter().map(|(_, _, row)| row.clone()));
+        }
+        if table.indexes.iter().any(|index| index.unique) {
             Self::validate_unique_indexes_for_rows(&table, &candidate_rows)?;
+        }
+        if !table.check_constraints.is_empty() {
+            Self::validate_check_constraints_for_rows(&table, &candidate_rows)?;
         }
 
         for (tuple_id, row_key, values) in updates {
@@ -10413,6 +10581,7 @@ impl Engine {
                 )?;
                 Self::validate_unique_values(&rows, column_idx, &add.name)?;
             }
+            Command::AddCheckConstraint(add) => self.preflight_add_check_constraint(add)?,
             Command::AddColumn(add) => {
                 if self.relational_views.contains_key(&add.table)
                     || self.relational_materialized_views.contains_key(&add.table)
@@ -10565,6 +10734,10 @@ impl Engine {
                         .indexes
                         .iter()
                         .any(|index| index.name == rename.new_name)
+                        || candidate
+                            .check_constraints
+                            .iter()
+                            .any(|constraint| constraint.name == rename.new_name)
                 }) || self.relational_catalog.contains_key(&rename.new_name)
                     || self.relational_views.contains_key(&rename.new_name)
                     || self
@@ -10579,7 +10752,11 @@ impl Engine {
                 }
                 if !table.indexes.iter().any(|index| {
                     index.name == rename.old_name && (index.primary_key || index.unique_constraint)
-                }) {
+                }) && !table
+                    .check_constraints
+                    .iter()
+                    .any(|constraint| constraint.name == rename.old_name)
+                {
                     return Err(EngineError::ApplyFailed(format!(
                         "constraint \"{}\" does not exist",
                         rename.old_name
@@ -10753,6 +10930,10 @@ impl Engine {
                     .indexes
                     .iter()
                     .any(|index| index.column == drop.column)
+                    || table
+                        .check_constraints
+                        .iter()
+                        .any(|constraint| constraint.column == drop.column)
                 {
                     return Err(EngineError::ApplyFailed(format!(
                         "cannot drop column \"{}\" because an index or constraint depends on it",
@@ -10772,7 +10953,11 @@ impl Engine {
                 };
                 if !table.indexes.iter().any(|index| {
                     index.name == drop.name && (index.primary_key || index.unique_constraint)
-                }) && !drop.if_exists
+                }) && !table
+                    .check_constraints
+                    .iter()
+                    .any(|constraint| constraint.name == drop.name)
+                    && !drop.if_exists
                 {
                     return Err(EngineError::ApplyFailed(format!(
                         "constraint \"{}\" does not exist",
@@ -10800,7 +10985,9 @@ impl Engine {
                         insert.table
                     ))
                 })?;
-                if !table.indexes.iter().any(|index| index.unique) {
+                if !table.indexes.iter().any(|index| index.unique)
+                    && table.check_constraints.is_empty()
+                {
                     return Ok(());
                 }
                 let column_indexes = if insert.columns.is_empty() {
@@ -10892,6 +11079,7 @@ impl Engine {
                 )?;
                 candidate_rows.extend(new_rows);
                 Self::validate_unique_indexes_for_rows(table, &candidate_rows)?;
+                Self::validate_check_constraints_for_rows(table, &candidate_rows)?;
             }
             Command::Update(update) => {
                 let table = self.relational_catalog.get(&update.table).ok_or_else(|| {
@@ -10900,7 +11088,9 @@ impl Engine {
                         update.table
                     ))
                 })?;
-                if !table.indexes.iter().any(|index| index.unique) {
+                if !table.indexes.iter().any(|index| index.unique)
+                    && table.check_constraints.is_empty()
+                {
                     return Ok(());
                 }
                 let assignments = bind_update_assignments(table, update)
@@ -10942,6 +11132,7 @@ impl Engine {
                     candidate_rows.push(row);
                 }
                 Self::validate_unique_indexes_for_rows(table, &candidate_rows)?;
+                Self::validate_check_constraints_for_rows(table, &candidate_rows)?;
             }
             _ => {}
         }
@@ -10952,16 +11143,25 @@ impl Engine {
         match cmd {
             Command::AddPrimaryKey(_) => true,
             Command::AddUniqueConstraint(_) => true,
+            Command::AddCheckConstraint(_) => true,
             Command::DropConstraint(_) => true,
             Command::CreateIndex(create) => create.unique,
-            Command::Insert(insert) => self
-                .relational_catalog
-                .get(&insert.table)
-                .is_some_and(|table| table.indexes.iter().any(|index| index.unique)),
-            Command::Update(update) => self
-                .relational_catalog
-                .get(&update.table)
-                .is_some_and(|table| table.indexes.iter().any(|index| index.unique)),
+            Command::Insert(insert) => {
+                self.relational_catalog
+                    .get(&insert.table)
+                    .is_some_and(|table| {
+                        table.indexes.iter().any(|index| index.unique)
+                            || !table.check_constraints.is_empty()
+                    })
+            }
+            Command::Update(update) => {
+                self.relational_catalog
+                    .get(&update.table)
+                    .is_some_and(|table| {
+                        table.indexes.iter().any(|index| index.unique)
+                            || !table.check_constraints.is_empty()
+                    })
+            }
             _ => false,
         }
     }
@@ -10979,6 +11179,7 @@ impl Engine {
             | Command::CreateTable(_)
             | Command::AddPrimaryKey(_)
             | Command::AddUniqueConstraint(_)
+            | Command::AddCheckConstraint(_)
             | Command::AddColumn(_)
             | Command::RenameTable(_)
             | Command::RenameColumn(_)
@@ -11202,6 +11403,7 @@ impl Engine {
             | Command::CreateTable(_)
             | Command::AddPrimaryKey(_)
             | Command::AddUniqueConstraint(_)
+            | Command::AddCheckConstraint(_)
             | Command::AddColumn(_)
             | Command::RenameTable(_)
             | Command::RenameColumn(_)
@@ -11326,6 +11528,7 @@ impl Engine {
             Command::CreateTable(_) => Err(ExecuteError::NonReadCommand("CREATE TABLE")),
             Command::AddPrimaryKey(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
             Command::AddUniqueConstraint(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
+            Command::AddCheckConstraint(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
             Command::AddColumn(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
             Command::RenameTable(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
             Command::RenameColumn(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
@@ -35540,6 +35743,130 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("duplicate key value violates unique index"));
+    }
+
+    #[test]
+    fn relational_check_constraints_enforce_and_replay_from_wal() {
+        let mut e = Engine::new_local();
+        e.execute_text(
+            1,
+            "CREATE TABLE people (id INT, name TEXT, CONSTRAINT people_id_positive CHECK (id > 0))",
+        )
+        .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO people (id, name) VALUES (1, 'Ada'), (2, 'Grace')",
+        )
+        .unwrap();
+
+        let checks = e
+            .relational_catalog_table("people")
+            .unwrap()
+            .check_constraints
+            .clone();
+        assert_eq!(
+            checks,
+            vec![RelationalCheckConstraint {
+                name: "people_id_positive".to_string(),
+                column: "id".to_string(),
+                op: SelectFilterOp::Gt,
+                value: SqlValue::Int4(0),
+            }]
+        );
+
+        let invalid_insert = e
+            .execute_text(3, "INSERT INTO people (id, name) VALUES (-1, 'Bad')")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            invalid_insert.contains("violates check constraint"),
+            "{invalid_insert}"
+        );
+        let invalid_update = e
+            .execute_text(4, "UPDATE people SET id = -2 WHERE name = 'Grace'")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            invalid_update.contains("violates check constraint"),
+            "{invalid_update}"
+        );
+
+        let Command::Select(select) =
+            parse_command("SELECT id, name FROM people ORDER BY id ASC").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let result = e.execute_relational_select(&select).unwrap();
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())],
+                vec![SqlValue::Int4(2), SqlValue::Text("Grace".to_string())],
+            ]
+        );
+
+        e.execute_text(
+            5,
+            "ALTER TABLE ONLY public.people RENAME CONSTRAINT people_id_positive TO people_id_gt_zero",
+        )
+        .unwrap();
+        e.execute_text(6, "ALTER TABLE public.people RENAME COLUMN id TO person_id")
+            .unwrap();
+        let table = e.relational_catalog_table("people").unwrap();
+        assert_eq!(table.check_constraints[0].name, "people_id_gt_zero");
+        assert_eq!(table.check_constraints[0].column, "person_id");
+        let renamed_checks = table.check_constraints.clone();
+        assert!(e
+            .execute_text(7, "ALTER TABLE public.people DROP COLUMN person_id")
+            .unwrap_err()
+            .to_string()
+            .contains("index or constraint depends on it"));
+
+        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        assert_eq!(
+            recovered
+                .relational_catalog_table("people")
+                .unwrap()
+                .check_constraints,
+            renamed_checks
+        );
+
+        let mut alter = Engine::new_local();
+        alter
+            .execute_text(1, "CREATE TABLE teams (id INT, name TEXT)")
+            .unwrap();
+        alter
+            .execute_text(
+                2,
+                "INSERT INTO teams (id, name) VALUES (1, 'core'), (-1, 'bad')",
+            )
+            .unwrap();
+        let existing_rows = alter
+            .execute_text(
+                3,
+                "ALTER TABLE ONLY public.teams ADD CONSTRAINT teams_id_positive CHECK (id > 0)",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            existing_rows.contains("violates check constraint")
+                || existing_rows.contains("violated by some row"),
+            "{existing_rows}"
+        );
+        alter
+            .execute_text(4, "CREATE TABLE valid_teams (id INT, name TEXT)")
+            .unwrap();
+        alter
+            .execute_text(
+                5,
+                "ALTER TABLE ONLY public.valid_teams ADD CONSTRAINT valid_teams_id_positive CHECK (id > 0)",
+            )
+            .unwrap();
+        assert!(alter
+            .execute_text(6, "INSERT INTO valid_teams (id, name) VALUES (-2, 'bad')")
+            .unwrap_err()
+            .to_string()
+            .contains("violates check constraint"));
     }
 
     #[test]
