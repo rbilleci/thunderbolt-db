@@ -59,7 +59,7 @@ def classify(test_id: str) -> list[str]:
         )
     if re.search(r"extended|bind|parse|portal|prepared|parameterized|cursor|fetch_count|gdesc", test_id):
         buckets.append("protocol.extended_query")
-    if re.search(r"relational|create_table|insert|select|delete|update|truncate|unique|primary|constraint|index|view|sequence|publication|grant|revoke|acl|privilege|column_defaults|column_default|add_columns|add_column|rename_tables|rename_table|rename_columns|rename_column|drop_tables|drop_table|drop_columns|drop_column|comments|comment", test_id):
+    if re.search(r"relational|create_table|insert|select|delete|update|truncate|unique|primary|constraint|index|view|sequence|domain|publication|grant|revoke|acl|privilege|column_defaults|column_default|add_columns|add_column|rename_tables|rename_table|rename_columns|rename_column|drop_tables|drop_table|drop_columns|drop_column|comments|comment", test_id):
         buckets.append("sql.relational_foundation")
     if re.search(r"sql_gpu|gpu_bridge|relational_sql_select_cuda|relational_sql_select_gpu", test_id):
         buckets.append("sql.gpu_bridge")
@@ -69,7 +69,7 @@ def classify(test_id: str) -> list[str]:
     ):
         buckets.append("storage.indexing")
     if re.search(
-        r"relational_catalog|catalog_helpers|catalog_schema|catalog_introspection|shared_catalog|pg_catalog|pg_type|pg_namespace|information_schema|type_metadata|database_metadata|pg_dump|column_id|relation_oid|create_index|catalog_index|unique_index|primary_key|constraint|key_column|view|sequence|publication|grant|revoke|acl|privilege|truncate_table|drop_table|add_column|rename_table|rename_column|drop_column|column_default|attrdef|comment|description",
+        r"relational_catalog|catalog_helpers|catalog_schema|catalog_introspection|shared_catalog|pg_catalog|pg_type|pg_namespace|information_schema|type_metadata|database_metadata|pg_dump|column_id|relation_oid|create_index|catalog_index|unique_index|primary_key|constraint|key_column|view|sequence|domain|publication|grant|revoke|acl|privilege|truncate_table|drop_table|add_column|rename_table|rename_column|drop_column|column_default|attrdef|comment|description",
         test_id,
     ):
         buckets.append("sql.catalog_schema_types")

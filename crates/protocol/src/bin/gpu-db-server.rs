@@ -2059,6 +2059,7 @@ struct Session {
     views: HashMap<String, View>,
     materialized_views: HashMap<String, MaterializedView>,
     sequences: HashMap<String, Sequence>,
+    domains: BTreeMap<String, Domain>,
     publications: BTreeMap<String, Publication>,
     currval_sequences: HashMap<String, i64>,
     indexes: Vec<CatalogIndex>,
@@ -2069,6 +2070,7 @@ struct Session {
     dirty_views: BTreeSet<String>,
     dirty_materialized_views: BTreeSet<String>,
     dirty_sequences: BTreeSet<String>,
+    dirty_domains: BTreeSet<String>,
     dirty_publications: BTreeSet<String>,
     dirty_indexes: bool,
     dirty_table_acls: BTreeSet<String>,
@@ -2085,6 +2087,7 @@ struct SharedCatalog {
     views: HashMap<String, View>,
     materialized_views: HashMap<String, MaterializedView>,
     sequences: HashMap<String, Sequence>,
+    domains: BTreeMap<String, Domain>,
     publications: BTreeMap<String, Publication>,
     indexes: Vec<CatalogIndex>,
     table_acls: BTreeMap<String, BTreeMap<String, BTreeSet<TablePrivilege>>>,
@@ -2100,6 +2103,7 @@ impl Default for SharedCatalog {
             views: HashMap::new(),
             materialized_views: HashMap::new(),
             sequences: HashMap::new(),
+            domains: BTreeMap::new(),
             publications: BTreeMap::new(),
             indexes: Vec::new(),
             table_acls: BTreeMap::new(),
@@ -2139,6 +2143,7 @@ impl Session {
             views: catalog.views,
             materialized_views: catalog.materialized_views,
             sequences: catalog.sequences,
+            domains: catalog.domains,
             publications: catalog.publications,
             currval_sequences: HashMap::new(),
             indexes: catalog.indexes,
@@ -2149,6 +2154,7 @@ impl Session {
             dirty_views: BTreeSet::new(),
             dirty_materialized_views: BTreeSet::new(),
             dirty_sequences: BTreeSet::new(),
+            dirty_domains: BTreeSet::new(),
             dirty_publications: BTreeSet::new(),
             dirty_indexes: false,
             dirty_table_acls: BTreeSet::new(),
@@ -2176,6 +2182,10 @@ impl Session {
         self.dirty_sequences.insert(sequence.into());
     }
 
+    fn mark_domain_dirty(&mut self, domain: impl Into<String>) {
+        self.dirty_domains.insert(domain.into());
+    }
+
     fn mark_publication_dirty(&mut self, publication: impl Into<String>) {
         self.dirty_publications.insert(publication.into());
     }
@@ -2198,6 +2208,7 @@ impl Session {
             self.dirty_views.clear();
             self.dirty_materialized_views.clear();
             self.dirty_sequences.clear();
+            self.dirty_domains.clear();
             self.dirty_publications.clear();
             self.dirty_table_acls.clear();
             self.dirty_default_table_acl = false;
@@ -2237,6 +2248,13 @@ impl Session {
                     .insert(sequence_name.clone(), sequence.clone());
             } else {
                 catalog.sequences.remove(sequence_name);
+            }
+        }
+        for domain_name in &self.dirty_domains {
+            if let Some(domain) = self.domains.get(domain_name) {
+                catalog.domains.insert(domain_name.clone(), domain.clone());
+            } else {
+                catalog.domains.remove(domain_name);
             }
         }
         for publication_name in &self.dirty_publications {
@@ -2305,6 +2323,7 @@ impl Session {
         self.dirty_views.clear();
         self.dirty_materialized_views.clear();
         self.dirty_sequences.clear();
+        self.dirty_domains.clear();
         self.dirty_publications.clear();
         self.dirty_table_acls.clear();
     }
@@ -2371,6 +2390,13 @@ struct Sequence {
     name: String,
     last_value: i64,
     is_called: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Domain {
+    oid: u32,
+    name: String,
+    base_type: gpu_db_protocol::SqlType,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2739,6 +2765,7 @@ enum CatalogCommentTarget {
     View { view: String },
     MaterializedView { materialized_view: String },
     Sequence { sequence: String },
+    Domain { domain: String },
     Constraint { table: String, constraint: String },
 }
 
@@ -6680,7 +6707,8 @@ fn execute_statement(
                 | CatalogCommentTarget::Tablespace { .. }
                 | CatalogCommentTarget::View { .. }
                 | CatalogCommentTarget::MaterializedView { .. }
-                | CatalogCommentTarget::Sequence { .. } => false,
+                | CatalogCommentTarget::Sequence { .. }
+                | CatalogCommentTarget::Domain { .. } => false,
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -7800,6 +7828,7 @@ fn execute_statement(
                     || session.views.contains_key(&create.name)
                     || session.materialized_views.contains_key(&create.name)
                     || session.sequences.contains_key(&create.name)
+                    || session.domains.contains_key(&create.name)
                 {
                     return write_error(
                         stream,
@@ -7837,6 +7866,49 @@ fn execute_statement(
                 session.mark_sequence_dirty(name);
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, "CREATE SEQUENCE");
+            }
+            Command::CreateDomain(create) => {
+                if session.tables.contains_key(&create.name)
+                    || session.views.contains_key(&create.name)
+                    || session.materialized_views.contains_key(&create.name)
+                    || session.sequences.contains_key(&create.name)
+                    || session.domains.contains_key(&create.name)
+                {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "42710",
+                            message: "type already exists",
+                            position: None,
+                        },
+                    );
+                }
+                let oid = session.next_relation_oid;
+                session.next_relation_oid = match session.next_relation_oid.checked_add(1) {
+                    Some(next) => next,
+                    None => {
+                        return write_error(
+                            stream,
+                            &ErrorField {
+                                code: "54000",
+                                message: "domain OID allocation exhausted",
+                                position: None,
+                            },
+                        );
+                    }
+                };
+                let name = create.name;
+                session.domains.insert(
+                    name.clone(),
+                    Domain {
+                        oid,
+                        name: name.clone(),
+                        base_type: create.base_type,
+                    },
+                );
+                session.mark_domain_dirty(name);
+                session.persist_catalog_snapshot();
+                return write_command_complete(stream, "CREATE DOMAIN");
             }
             Command::SequenceNextVal(nextval) => {
                 if let Some(error) = sequence_target_error(session, &nextval.name) {
@@ -8077,6 +8149,43 @@ fn execute_statement(
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, "DROP SEQUENCE");
             }
+            Command::DropDomain(drop) => {
+                let mut seen = BTreeSet::new();
+                for name in &drop.domains {
+                    if !seen.insert(name) {
+                        return write_error(
+                            stream,
+                            &ErrorField {
+                                code: "42710",
+                                message: "domain specified more than once",
+                                position: None,
+                            },
+                        );
+                    }
+                    if !drop.if_exists && !session.domains.contains_key(name) {
+                        return write_error(
+                            stream,
+                            &ErrorField {
+                                code: "42704",
+                                message: "domain does not exist",
+                                position: None,
+                            },
+                        );
+                    }
+                }
+                for name in &drop.domains {
+                    if session.domains.remove(name).is_some() {
+                        let target = CatalogCommentTarget::Domain {
+                            domain: name.clone(),
+                        };
+                        session.comments.remove(&target);
+                        session.mark_comment_dirty(target);
+                    }
+                    session.mark_domain_dirty(name.clone());
+                }
+                session.persist_catalog_snapshot();
+                return write_command_complete(stream, "DROP DOMAIN");
+            }
             Command::CreatePublication(create) => {
                 if let Err(error) = create_publication(session, create.name, create.target) {
                     return write_error(stream, &error);
@@ -8181,7 +8290,8 @@ fn execute_statement(
                         | CatalogCommentTarget::Tablespace { .. }
                         | CatalogCommentTarget::View { .. }
                         | CatalogCommentTarget::MaterializedView { .. }
-                        | CatalogCommentTarget::Sequence { .. } => false,
+                        | CatalogCommentTarget::Sequence { .. }
+                        | CatalogCommentTarget::Domain { .. } => false,
                     })
                     .cloned()
                     .collect::<Vec<_>>();
@@ -8237,7 +8347,8 @@ fn execute_statement(
                             | CatalogCommentTarget::Index { .. }
                             | CatalogCommentTarget::View { .. }
                             | CatalogCommentTarget::MaterializedView { .. }
-                            | CatalogCommentTarget::Sequence { .. } => false,
+                            | CatalogCommentTarget::Sequence { .. }
+                            | CatalogCommentTarget::Domain { .. } => false,
                         })
                         .cloned()
                         .collect::<Vec<_>>();
@@ -8654,6 +8765,20 @@ fn execute_statement(
                             );
                         }
                         CatalogCommentTarget::Sequence { sequence }
+                    }
+                    CommentTarget::Domain { domain } => {
+                        let exists = session.domains.contains_key(&domain);
+                        if !exists {
+                            return write_error(
+                                stream,
+                                &ErrorField {
+                                    code: "42704",
+                                    message: "domain does not exist",
+                                    position: None,
+                                },
+                            );
+                        }
+                        CatalogCommentTarget::Domain { domain }
                     }
                     CommentTarget::Constraint { table, constraint } => {
                         let table_exists = session.tables.contains_key(&table)
@@ -9441,7 +9566,7 @@ fn execute_statement(
                 text_column("Default"),
                 text_column("Check"),
             ],
-            &catalog_empty_rows(),
+            &catalog_domain_rows(session, false),
         );
     }
     if canonical == psql_list_domains_verbose_catalog_query() {
@@ -9458,7 +9583,21 @@ fn execute_statement(
                 text_column("Access privileges"),
                 text_column("Description"),
             ],
-            &catalog_empty_rows(),
+            &catalog_domain_rows(session, true),
+        );
+    }
+    if canonical
+        == "select oid, typname, typbasetype, typtype from pg_catalog.pg_type where typtype = 'd' order by typname"
+    {
+        return write_single_row(
+            stream,
+            &[
+                int4_column("oid"),
+                text_column("typname"),
+                int4_column("typbasetype"),
+                text_column("typtype"),
+            ],
+            &catalog_domain_type_rows(session),
         );
     }
     if canonical == psql_describe_roles_catalog_query()
@@ -10864,6 +11003,51 @@ fn psql_list_domains_catalog_query() -> &'static str {
 
 fn psql_list_domains_verbose_catalog_query() -> &'static str {
     "select n.nspname as \"schema\", t.typname as \"name\", pg_catalog.format_type(t.typbasetype, t.typtypmod) as \"type\", (select c.collname from pg_catalog.pg_collation c, pg_catalog.pg_type bt where c.oid = t.typcollation and bt.oid = t.typbasetype and t.typcollation <> bt.typcollation) as \"collation\", case when t.typnotnull then 'not null' end as \"nullable\", t.typdefault as \"default\", pg_catalog.array_to_string(array( select pg_catalog.pg_get_constraintdef(r.oid, true) from pg_catalog.pg_constraint r where t.oid = r.contypid ), ' ') as \"check\", pg_catalog.array_to_string(t.typacl, e'\\n') as \"access privileges\", d.description as \"description\" from pg_catalog.pg_type t left join pg_catalog.pg_namespace n on n.oid = t.typnamespace left join pg_catalog.pg_description d on d.classoid = t.tableoid and d.objoid = t.oid and d.objsubid = 0 where t.typtype = 'd' and n.nspname <> 'pg_catalog' and n.nspname <> 'information_schema' and pg_catalog.pg_type_is_visible(t.oid) order by 1, 2"
+}
+
+fn catalog_domain_rows(session: &Session, verbose: bool) -> Vec<Vec<Option<String>>> {
+    session
+        .domains
+        .values()
+        .map(|domain| {
+            let mut row = vec![
+                Some("public".to_string()),
+                Some(domain.name.clone()),
+                Some(sql_type_display_name(domain.base_type).to_string()),
+                None,
+                None,
+                None,
+                None,
+            ];
+            if verbose {
+                row.push(None);
+                row.push(
+                    session
+                        .comments
+                        .get(&CatalogCommentTarget::Domain {
+                            domain: domain.name.clone(),
+                        })
+                        .cloned(),
+                );
+            }
+            row
+        })
+        .collect()
+}
+
+fn catalog_domain_type_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    session
+        .domains
+        .values()
+        .map(|domain| {
+            vec![
+                Some(domain.oid.to_string()),
+                Some(domain.name.clone()),
+                Some(domain.base_type.postgres_oid().to_string()),
+                Some("d".to_string()),
+            ]
+        })
+        .collect()
 }
 
 fn psql_describe_roles_catalog_query() -> &'static str {
@@ -14352,6 +14536,7 @@ fn pg_dump_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
             | CatalogCommentTarget::View { .. }
             | CatalogCommentTarget::MaterializedView { .. }
             | CatalogCommentTarget::Sequence { .. }
+            | CatalogCommentTarget::Domain { .. }
             | CatalogCommentTarget::Constraint { .. } => None,
         })
         .collect::<Vec<_>>();
@@ -14382,6 +14567,7 @@ fn pg_dump_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
             | CatalogCommentTarget::View { .. }
             | CatalogCommentTarget::MaterializedView { .. }
             | CatalogCommentTarget::Sequence { .. }
+            | CatalogCommentTarget::Domain { .. }
             | CatalogCommentTarget::Index { .. } => None,
         })
         .collect::<Vec<_>>();

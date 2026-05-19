@@ -26,11 +26,13 @@ pub enum Command {
     RefreshMaterializedView(RefreshMaterializedView),
     RenameMaterializedView(RenameMaterializedView),
     CreateSequence(CreateSequence),
+    CreateDomain(CreateDomain),
     SequenceNextVal(SequenceNextVal),
     SequenceCurrVal(SequenceCurrVal),
     SequenceSetVal(SequenceSetVal),
     RenameSequence(RenameSequence),
     DropSequence(DropSequence),
+    DropDomain(DropDomain),
     CreatePublication(CreatePublication),
     DropPublication(DropPublication),
     GrantTable(GrantTable),
@@ -308,6 +310,7 @@ pub enum CommentTarget {
     View { view: String },
     MaterializedView { materialized_view: String },
     Sequence { sequence: String },
+    Domain { domain: String },
     Constraint { table: String, constraint: String },
 }
 
@@ -316,6 +319,18 @@ pub struct ColumnDef {
     pub name: String,
     pub ty: SqlType,
     pub default: Option<ColumnDefault>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateDomain {
+    pub name: String,
+    pub base_type: SqlType,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropDomain {
+    pub domains: Vec<String>,
+    pub if_exists: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1864,6 +1879,9 @@ fn parse_relational_command(input: &str) -> Option<Result<Command, ParseError>> 
         if second.eq_ignore_ascii_case("SEQUENCE") {
             return Some(parse_create_sequence(input).map(Command::CreateSequence));
         }
+        if second.eq_ignore_ascii_case("DOMAIN") {
+            return Some(parse_create_domain(input).map(Command::CreateDomain));
+        }
         if second.eq_ignore_ascii_case("PUBLICATION") {
             return Some(parse_create_publication(input).map(Command::CreatePublication));
         }
@@ -1897,6 +1915,9 @@ fn parse_relational_command(input: &str) -> Option<Result<Command, ParseError>> 
         }
         if second.eq_ignore_ascii_case("SEQUENCE") {
             return Some(parse_drop_sequence(input).map(Command::DropSequence));
+        }
+        if second.eq_ignore_ascii_case("DOMAIN") {
+            return Some(parse_drop_domain(input).map(Command::DropDomain));
         }
         if second.eq_ignore_ascii_case("PUBLICATION") {
             return Some(parse_drop_publication(input).map(Command::DropPublication));
@@ -2193,6 +2214,15 @@ fn parse_comment_on(input: &str) -> Result<CommentOn, ParseError> {
         let sequence = normalize_relation_identifier(rest[..is_pos].trim())?;
         (
             CommentTarget::Sequence { sequence },
+            rest[is_pos + "IS".len()..].trim(),
+        )
+    } else if let Some(rest) = strip_keyword_prefix_case_insensitive(rest, "DOMAIN") {
+        let rest = rest.trim_start();
+        let is_pos =
+            find_keyword_outside_quotes(rest, "IS").ok_or(ParseError::InvalidRelationalSql)?;
+        let domain = normalize_relation_identifier(rest[..is_pos].trim())?;
+        (
+            CommentTarget::Domain { domain },
             rest[is_pos + "IS".len()..].trim(),
         )
     } else if let Some(rest) = strip_keyword_prefix_case_insensitive(rest, "CONSTRAINT") {
@@ -3647,6 +3677,58 @@ fn parse_drop_materialized_view(input: &str) -> Result<DropMaterializedView, Par
         names: views
             .into_iter()
             .map(|view| normalize_relation_identifier(view.trim()))
+            .collect::<Result<Vec<_>, _>>()?,
+        if_exists,
+    })
+}
+
+fn parse_create_domain(input: &str) -> Result<CreateDomain, ParseError> {
+    let rest = strip_keyword_prefix_case_insensitive(input, "CREATE")
+        .and_then(|s| strip_keyword_prefix_case_insensitive(s.trim_start(), "DOMAIN"))
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    let as_pos = find_keyword_outside_quotes(rest, "AS").ok_or(ParseError::InvalidRelationalSql)?;
+    let name = normalize_relation_identifier(rest[..as_pos].trim())?;
+    let tail = rest[as_pos + "AS".len()..].trim();
+    if tail.is_empty()
+        || find_keyword_outside_quotes(tail, "DEFAULT").is_some()
+        || find_keyword_outside_quotes(tail, "CHECK").is_some()
+        || find_keyword_outside_quotes(tail, "COLLATE").is_some()
+        || find_keyword_outside_quotes(tail, "NOT").is_some()
+        || tail.contains('(')
+        || tail.contains(')')
+        || tail.contains('[')
+        || tail.contains(']')
+    {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let base_type = parse_supported_sql_type_name(tail).ok_or(ParseError::InvalidRelationalSql)?;
+    Ok(CreateDomain { name, base_type })
+}
+
+fn parse_drop_domain(input: &str) -> Result<DropDomain, ParseError> {
+    let mut rest = strip_keyword_prefix_case_insensitive(input, "DROP")
+        .and_then(|s| strip_keyword_prefix_case_insensitive(s.trim_start(), "DOMAIN"))
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    let if_exists = if let Some(after_if) = strip_keyword_prefix_case_insensitive(rest, "IF") {
+        let after_exists = strip_keyword_prefix_case_insensitive(after_if.trim_start(), "EXISTS")
+            .ok_or(ParseError::InvalidRelationalSql)?;
+        rest = after_exists.trim_start();
+        true
+    } else {
+        false
+    };
+    if rest.is_empty()
+        || find_keyword_outside_quotes(rest, "CASCADE").is_some()
+        || find_keyword_outside_quotes(rest, "RESTRICT").is_some()
+    {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    Ok(DropDomain {
+        domains: split_csv(rest)?
+            .into_iter()
+            .map(|domain| normalize_relation_identifier(domain.trim()))
             .collect::<Result<Vec<_>, _>>()?,
         if_exists,
     })
@@ -13035,6 +13117,53 @@ mod tests {
         ));
         assert!(matches!(
             parse_command("ALTER SEQUENCE seq_people RENAME TO seq_person_ids CASCADE"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+    }
+
+    #[test]
+    fn parses_bounded_domain_catalog_ddl() {
+        assert_eq!(
+            parse_command("CREATE DOMAIN public.account_id AS int4").unwrap(),
+            Command::CreateDomain(CreateDomain {
+                name: "account_id".to_string(),
+                base_type: SqlType::Int4,
+            })
+        );
+        assert_eq!(
+            parse_command("CREATE DOMAIN label AS pg_catalog.text").unwrap(),
+            Command::CreateDomain(CreateDomain {
+                name: "label".to_string(),
+                base_type: SqlType::Text,
+            })
+        );
+        assert_eq!(
+            parse_command("COMMENT ON DOMAIN public.account_id IS 'domain ids'").unwrap(),
+            Command::CommentOn(CommentOn {
+                target: CommentTarget::Domain {
+                    domain: "account_id".to_string(),
+                },
+                comment: Some("domain ids".to_string()),
+            })
+        );
+        assert_eq!(
+            parse_command("DROP DOMAIN IF EXISTS public.account_id, label").unwrap(),
+            Command::DropDomain(DropDomain {
+                domains: vec!["account_id".to_string(), "label".to_string()],
+                if_exists: true,
+            })
+        );
+
+        assert!(matches!(
+            parse_command("CREATE DOMAIN account_id AS int4 CHECK (VALUE > 0)"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command("CREATE DOMAIN account_id AS bigint"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command("DROP DOMAIN account_id CASCADE"),
             Err(ParseError::InvalidRelationalSql)
         ));
     }

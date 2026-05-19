@@ -1,0 +1,33 @@
+=== protocol psql domains ===
+CREATE DOMAIN
+CREATE DOMAIN
+COMMENT
+                            List of domains
+ Schema |    Name    |  Type   | Collation | Nullable | Default | Check
+--------+------------+---------+-----------+----------+---------+-------
+ public | account_id | integer |           |          |         |
+ public | label      | text    |           |          |         |
+(2 rows)
+
+                                                List of domains
+ Schema |    Name    |  Type   | Collation | Nullable | Default | Check | Access privileges |    Description
+--------+------------+---------+-----------+----------+---------+-------+-------------------+-------------------
+ public | account_id | integer |           |          |         |       |                   | Account id domain
+ public | label      | text    |           |          |         |       |                   |
+(2 rows)
+
+  oid  |  typname   | typbasetype | typtype
+-------+------------+-------------+---------
+ 16384 | account_id |          23 | d
+ 16385 | label      |          25 | d
+(2 rows)
+
+psql:336_protocol_psql_domains.sql:8: ERROR:  domain does not exist
+DROP DOMAIN
+psql:336_protocol_psql_domains.sql:10: ERROR:  query shape is not supported by the compatibility stub
+psql:336_protocol_psql_domains.sql:11: ERROR:  query shape is not supported by the compatibility stub
+DROP DOMAIN
+                        List of domains
+ Schema | Name | Type | Collation | Nullable | Default | Check
+--------+------+------+-----------+----------+---------+-------
+(0 rows)

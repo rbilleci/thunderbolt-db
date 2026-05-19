@@ -20,9 +20,9 @@ use gpu_db_observability::{
 use gpu_db_planner::{ExecutionPlan, Planner, PlannerConfig};
 use gpu_db_protocol::{
     parse_command, AddUniqueConstraint, ColumnDef, ColumnDefault, Command, CommentTarget,
-    CreateIndex, CreateMaterializedView, CreatePublication, CreateSequence, CreateTable,
-    CreateView, Delete, DropConstraint, DropIndex, DropMaterializedView, DropPublication,
-    DropSequence, DropTable, DropView, Insert, ParseError, PublicationTarget,
+    CreateDomain, CreateIndex, CreateMaterializedView, CreatePublication, CreateSequence,
+    CreateTable, CreateView, Delete, DropConstraint, DropDomain, DropIndex, DropMaterializedView,
+    DropPublication, DropSequence, DropTable, DropView, Insert, ParseError, PublicationTarget,
     RefreshMaterializedView, RenameColumn, RenameConstraint, RenameIndex, RenameMaterializedView,
     RenameSequence, RenameTable, RenameView, Select, SelectFilterOp, SelectProjection,
     SequenceNextVal, SequenceSetVal, SqlType, SqlValue, TablePrivilege, TruncateTable, Update,
@@ -92,6 +92,7 @@ impl ReplicatedStateMachine for KvStateMachine {
                     | Command::RefreshMaterializedView(_)
                     | Command::RenameMaterializedView(_)
                     | Command::CreateSequence(_)
+                    | Command::CreateDomain(_)
                     | Command::SequenceNextVal(_)
                     | Command::SequenceCurrVal(_)
                     | Command::SequenceSetVal(_)
@@ -104,6 +105,7 @@ impl ReplicatedStateMachine for KvStateMachine {
                     | Command::DropView(_)
                     | Command::DropMaterializedView(_)
                     | Command::DropSequence(_)
+                    | Command::DropDomain(_)
                     | Command::GrantTable(_)
                     | Command::RevokeTable(_)
                     | Command::GrantDefaultTablePrivileges(_)
@@ -5961,6 +5963,7 @@ pub struct Engine {
     relational_views: BTreeMap<String, RelationalView>,
     relational_materialized_views: BTreeMap<String, RelationalMaterializedView>,
     relational_sequences: BTreeMap<String, RelationalSequence>,
+    relational_domains: BTreeMap<String, RelationalDomain>,
     relational_publications: BTreeMap<String, RelationalPublication>,
     relational_default_table_acl: BTreeMap<String, BTreeSet<TablePrivilege>>,
     relational_comments: BTreeMap<RelationalCommentTarget, String>,
@@ -6044,6 +6047,14 @@ pub struct RelationalSequence {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationalDomain {
+    pub schema: String,
+    pub name: String,
+    pub oid: u32,
+    pub base_type: SqlType,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelationalPublication {
     pub name: String,
     pub oid: u32,
@@ -6063,6 +6074,7 @@ pub enum RelationalCommentTarget {
     View { view: String },
     MaterializedView { materialized_view: String },
     Sequence { sequence: String },
+    Domain { domain: String },
     Constraint { table: String, constraint: String },
 }
 
@@ -7358,6 +7370,7 @@ impl Engine {
             relational_views: BTreeMap::new(),
             relational_materialized_views: BTreeMap::new(),
             relational_sequences: BTreeMap::new(),
+            relational_domains: BTreeMap::new(),
             relational_publications: BTreeMap::new(),
             relational_default_table_acl: BTreeMap::new(),
             relational_comments: BTreeMap::new(),
@@ -7620,6 +7633,7 @@ impl Engine {
                 self.apply_rename_materialized_view(rename)?
             }
             Command::CreateSequence(create) => self.apply_create_sequence(create)?,
+            Command::CreateDomain(create) => self.apply_create_domain(create)?,
             Command::SequenceNextVal(nextval) => {
                 self.apply_sequence_nextval(nextval)?;
             }
@@ -7633,6 +7647,7 @@ impl Engine {
             Command::DropView(drop) => self.apply_drop_view(drop)?,
             Command::DropMaterializedView(drop) => self.apply_drop_materialized_view(drop)?,
             Command::DropSequence(drop) => self.apply_drop_sequence(drop)?,
+            Command::DropDomain(drop) => self.apply_drop_domain(drop)?,
             Command::CreatePublication(create) => self.apply_create_publication(create)?,
             Command::DropPublication(drop) => self.apply_drop_publication(drop)?,
             Command::GrantTable(grant) => {
@@ -7845,6 +7860,72 @@ impl Engine {
         self.apply_create_sequence(CreateSequence {
             name: name.to_string(),
         })
+    }
+
+    fn preflight_create_domain(&self, create: &CreateDomain) -> Result<(), EngineError> {
+        if self.relational_catalog.contains_key(&create.name)
+            || self.relational_views.contains_key(&create.name)
+            || self
+                .relational_materialized_views
+                .contains_key(&create.name)
+            || self.relational_sequences.contains_key(&create.name)
+            || self.relational_domains.contains_key(&create.name)
+        {
+            return Err(EngineError::ApplyFailed(format!(
+                "type \"{}\" already exists",
+                create.name
+            )));
+        }
+        Ok(())
+    }
+
+    fn apply_create_domain(&mut self, create: CreateDomain) -> Result<(), EngineError> {
+        self.preflight_create_domain(&create)?;
+        let oid = self.relational_next_oid;
+        self.relational_next_oid = self.relational_next_oid.checked_add(1).ok_or_else(|| {
+            EngineError::ApplyFailed("relational domain OID allocation exhausted".to_string())
+        })?;
+        self.relational_domains.insert(
+            create.name.clone(),
+            RelationalDomain {
+                schema: PUBLIC_SCHEMA_NAME.to_string(),
+                name: create.name,
+                oid,
+                base_type: create.base_type,
+            },
+        );
+        Ok(())
+    }
+
+    fn preflight_drop_domain(&self, drop: &DropDomain) -> Result<(), EngineError> {
+        let mut seen = BTreeSet::new();
+        for name in &drop.domains {
+            if !seen.insert(name) {
+                return Err(EngineError::ApplyFailed(format!(
+                    "domain \"{}\" specified more than once",
+                    name
+                )));
+            }
+            if !drop.if_exists && !self.relational_domains.contains_key(name) {
+                return Err(EngineError::ApplyFailed(format!(
+                    "domain \"{}\" does not exist",
+                    name
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_drop_domain(&mut self, drop: DropDomain) -> Result<(), EngineError> {
+        self.preflight_drop_domain(&drop)?;
+        for name in &drop.domains {
+            self.relational_domains.remove(name);
+            self.relational_comments
+                .remove(&RelationalCommentTarget::Domain {
+                    domain: name.clone(),
+                });
+        }
+        Ok(())
     }
 
     fn preflight_implicit_sequence_name(&self, name: &str) -> Result<(), EngineError> {
@@ -8636,7 +8717,8 @@ impl Engine {
                 | RelationalCommentTarget::Tablespace { .. }
                 | RelationalCommentTarget::View { .. }
                 | RelationalCommentTarget::MaterializedView { .. }
-                | RelationalCommentTarget::Sequence { .. } => true,
+                | RelationalCommentTarget::Sequence { .. }
+                | RelationalCommentTarget::Domain { .. } => true,
             });
             self.relational_residency.remove(name);
             self.relational_residency_device_memory.remove(name);
@@ -9419,6 +9501,15 @@ impl Engine {
                     )));
                 }
                 RelationalCommentTarget::Sequence { sequence }
+            }
+            CommentTarget::Domain { domain } => {
+                if !self.relational_domains.contains_key(&domain) {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "domain \"{}\" does not exist",
+                        domain
+                    )));
+                }
+                RelationalCommentTarget::Domain { domain }
             }
             CommentTarget::Constraint { table, constraint } => {
                 let table_ref = self.relational_catalog.get(&table).ok_or_else(|| {
@@ -10450,6 +10541,7 @@ impl Engine {
                 }
             }
             Command::CreateSequence(create) => self.preflight_create_sequence(create)?,
+            Command::CreateDomain(create) => self.preflight_create_domain(create)?,
             Command::SequenceNextVal(nextval) => self.preflight_sequence_target(&nextval.name)?,
             Command::SequenceSetVal(setval) => self.preflight_sequence_target(&setval.name)?,
             Command::RenameSequence(rename) => {
@@ -10542,6 +10634,7 @@ impl Engine {
             Command::DropView(drop) => self.preflight_drop_view(drop)?,
             Command::DropMaterializedView(drop) => self.preflight_drop_materialized_view(drop)?,
             Command::DropSequence(drop) => self.preflight_drop_sequence(drop)?,
+            Command::DropDomain(drop) => self.preflight_drop_domain(drop)?,
             Command::GrantTable(grant) => self.preflight_table_acl_target(&grant.table)?,
             Command::RevokeTable(revoke) => self.preflight_table_acl_target(&revoke.table)?,
             Command::CreatePublication(create) => self.preflight_create_publication(create)?,
@@ -10747,6 +10840,7 @@ impl Engine {
             | Command::RefreshMaterializedView(_)
             | Command::RenameMaterializedView(_)
             | Command::CreateSequence(_)
+            | Command::CreateDomain(_)
             | Command::SequenceNextVal(_)
             | Command::SequenceSetVal(_)
             | Command::RenameSequence(_)
@@ -10756,6 +10850,7 @@ impl Engine {
             | Command::DropView(_)
             | Command::DropMaterializedView(_)
             | Command::DropSequence(_)
+            | Command::DropDomain(_)
             | Command::GrantTable(_)
             | Command::RevokeTable(_)
             | Command::CreatePublication(_)
@@ -10966,6 +11061,7 @@ impl Engine {
             | Command::RefreshMaterializedView(_)
             | Command::RenameMaterializedView(_)
             | Command::CreateSequence(_)
+            | Command::CreateDomain(_)
             | Command::SequenceNextVal(_)
             | Command::SequenceSetVal(_)
             | Command::RenameSequence(_)
@@ -10975,6 +11071,7 @@ impl Engine {
             | Command::DropView(_)
             | Command::DropMaterializedView(_)
             | Command::DropSequence(_)
+            | Command::DropDomain(_)
             | Command::GrantTable(_)
             | Command::RevokeTable(_)
             | Command::CreatePublication(_)
@@ -11092,6 +11189,7 @@ impl Engine {
                 Err(ExecuteError::NonReadCommand("ALTER MATERIALIZED VIEW"))
             }
             Command::CreateSequence(_) => Err(ExecuteError::NonReadCommand("CREATE SEQUENCE")),
+            Command::CreateDomain(_) => Err(ExecuteError::NonReadCommand("CREATE DOMAIN")),
             Command::SequenceNextVal(_) => Err(ExecuteError::NonReadCommand("SELECT nextval")),
             Command::SequenceSetVal(_) => Err(ExecuteError::NonReadCommand("SELECT setval")),
             Command::RenameSequence(_) => Err(ExecuteError::NonReadCommand("ALTER SEQUENCE")),
@@ -11103,6 +11201,7 @@ impl Engine {
                 Err(ExecuteError::NonReadCommand("DROP MATERIALIZED VIEW"))
             }
             Command::DropSequence(_) => Err(ExecuteError::NonReadCommand("DROP SEQUENCE")),
+            Command::DropDomain(_) => Err(ExecuteError::NonReadCommand("DROP DOMAIN")),
             Command::GrantTable(_) => Err(ExecuteError::NonReadCommand("GRANT")),
             Command::RevokeTable(_) => Err(ExecuteError::NonReadCommand("REVOKE")),
             Command::CreatePublication(_) => {
@@ -14232,6 +14331,10 @@ impl Engine {
 
     pub fn relational_catalog_sequence(&self, sequence: &str) -> Option<&RelationalSequence> {
         self.relational_sequences.get(sequence)
+    }
+
+    pub fn relational_catalog_domain(&self, domain: &str) -> Option<&RelationalDomain> {
+        self.relational_domains.get(domain)
     }
 
     pub fn relational_catalog_publication(
@@ -36227,6 +36330,61 @@ mod tests {
         assert!(
             missing_table.contains("relation \"missing_people\" does not exist"),
             "{missing_table}"
+        );
+    }
+
+    #[test]
+    fn relational_catalog_records_domains_and_replays_from_wal() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE DOMAIN public.account_id AS int4")
+            .unwrap();
+        e.execute_text(2, "COMMENT ON DOMAIN public.account_id IS 'account ids'")
+            .unwrap();
+
+        let domain = e.relational_catalog_domain("account_id").unwrap();
+        assert_eq!(domain.name, "account_id");
+        assert_eq!(domain.base_type, SqlType::Int4);
+        let oid = domain.oid;
+        assert_eq!(
+            e.relational_comments
+                .get(&RelationalCommentTarget::Domain {
+                    domain: "account_id".to_string(),
+                })
+                .map(String::as_str),
+            Some("account ids")
+        );
+
+        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let recovered_domain = recovered.relational_catalog_domain("account_id").unwrap();
+        assert_eq!(recovered_domain.oid, oid);
+        assert_eq!(recovered_domain.base_type, SqlType::Int4);
+
+        e.execute_text(3, "DROP DOMAIN account_id").unwrap();
+        assert!(e.relational_catalog_domain("account_id").is_none());
+        assert!(!e
+            .relational_comments
+            .contains_key(&RelationalCommentTarget::Domain {
+                domain: "account_id".to_string(),
+            }));
+        e.execute_text(4, "DROP DOMAIN IF EXISTS missing_domain")
+            .unwrap();
+
+        let duplicate = e
+            .execute_text(5, "CREATE DOMAIN label AS text")
+            .and_then(|_| e.execute_text(6, "CREATE DOMAIN label AS text"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            duplicate.contains("type \"label\" already exists"),
+            "{duplicate}"
+        );
+        let missing = e
+            .execute_text(7, "COMMENT ON DOMAIN missing_domain IS 'nope'")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            missing.contains("domain \"missing_domain\" does not exist"),
+            "{missing}"
         );
     }
 
