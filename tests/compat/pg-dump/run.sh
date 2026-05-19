@@ -105,6 +105,10 @@ wait_for_port "$SOURCE_PORT"
 
 PGHOST=127.0.0.1 PGPORT="$SOURCE_PORT" PGDATABASE=postgres PGUSER=postgres \
   psql -v ON_ERROR_STOP=1 -X -q <<'SQL'
+CREATE DOMAIN public.account_id AS int4;
+CREATE DOMAIN public.account_label AS text;
+COMMENT ON DOMAIN public.account_id IS 'account id domain';
+COMMENT ON DOMAIN public.account_label IS 'account label domain';
 CREATE TABLE accounts (id int4 PRIMARY KEY, name text DEFAULT 'unknown'::text, tier int4 DEFAULT 7);
 INSERT INTO accounts (id, name) VALUES (1, 'Ada');
 INSERT INTO accounts (id) VALUES (2);
@@ -120,6 +124,8 @@ CREATE INDEX events_note_idx ON events (note);
 COMMENT ON TABLE public.events IS 'events table';
 COMMENT ON COLUMN public.events.note IS 'event note';
 COMMENT ON INDEX public.events_note_idx IS 'events note lookup';
+CREATE TABLE domain_accounts (id account_id, label account_label);
+INSERT INTO domain_accounts (id, label) VALUES (7, 'Ada'), (8, 'Grace');
 CREATE VIEW public.account_lookup AS SELECT id, name FROM accounts WHERE id > 1 ORDER BY id;
 COMMENT ON VIEW public.account_lookup IS 'active account lookup';
 CREATE MATERIALIZED VIEW public.account_snapshot AS SELECT id, name FROM accounts ORDER BY id;
@@ -181,6 +187,15 @@ cat >"$OUT_DIR/verify.expected" <<'EOF'
 2|unknown|7
 10|created
 11|updated
+EOF
+
+cat >"$OUT_DIR/domain-verify.expected" <<'EOF'
+account_id|23|d
+account_label|25|d
+id|account_id|public|account_id
+label|account_label|public|account_label
+7|Ada
+8|Grace
 EOF
 
 cat >"$OUT_DIR/index-verify.expected" <<'EOF'
@@ -322,6 +337,29 @@ verify_sequences() {
 
 verify_sequences "$RESTORE_PORT" "restore"
 
+verify_domains() {
+  local port="$1"
+  local prefix="$2"
+  PGHOST=127.0.0.1 PGPORT="$port" PGDATABASE=postgres PGUSER=postgres \
+    psql -v ON_ERROR_STOP=1 -X -A -t \
+    -c "SELECT oid, typname, typbasetype, typtype FROM pg_catalog.pg_type WHERE typtype = 'd' ORDER BY typname;" \
+    2>"$OUT_DIR/${prefix}-domain-type-verify.err" \
+    | cut -d'|' -f2- >"$OUT_DIR/${prefix}-domain-verify.out"
+  PGHOST=127.0.0.1 PGPORT="$port" PGDATABASE=postgres PGUSER=postgres \
+    psql -v ON_ERROR_STOP=1 -X -A -t \
+    -c "SELECT column_name, data_type, udt_schema, udt_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'domain_accounts' ORDER BY ordinal_position;" \
+    -c "SELECT id, label FROM domain_accounts ORDER BY id;" \
+    >>"$OUT_DIR/${prefix}-domain-verify.out" 2>"$OUT_DIR/${prefix}-domain-verify.err"
+  diff -u "$OUT_DIR/domain-verify.expected" "$OUT_DIR/${prefix}-domain-verify.out"
+  PGHOST=127.0.0.1 PGPORT="$port" PGDATABASE=postgres PGUSER=postgres \
+    psql -v ON_ERROR_STOP=1 -X -q -c '\dD+' \
+    >"$OUT_DIR/${prefix}-domain-describe.out" 2>"$OUT_DIR/${prefix}-domain-describe.err"
+  grep -F "account id domain" "$OUT_DIR/${prefix}-domain-describe.out" >/dev/null
+  grep -F "account label domain" "$OUT_DIR/${prefix}-domain-describe.out" >/dev/null
+}
+
+verify_domains "$RESTORE_PORT" "restore"
+
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$CUSTOM_RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/custom-restore-server.log" 2>&1 &
 custom_restore_pid=$!
@@ -345,6 +383,7 @@ verify_constraint_comments "$CUSTOM_RESTORE_PORT" "custom"
 verify_views "$CUSTOM_RESTORE_PORT" "custom"
 verify_materialized_views "$CUSTOM_RESTORE_PORT" "custom"
 verify_sequences "$CUSTOM_RESTORE_PORT" "custom"
+verify_domains "$CUSTOM_RESTORE_PORT" "custom"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$DIRECTORY_RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/directory-restore-server.log" 2>&1 &
@@ -369,6 +408,7 @@ verify_constraint_comments "$DIRECTORY_RESTORE_PORT" "directory"
 verify_views "$DIRECTORY_RESTORE_PORT" "directory"
 verify_materialized_views "$DIRECTORY_RESTORE_PORT" "directory"
 verify_sequences "$DIRECTORY_RESTORE_PORT" "directory"
+verify_domains "$DIRECTORY_RESTORE_PORT" "directory"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$TAR_RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/tar-restore-server.log" 2>&1 &
@@ -393,6 +433,7 @@ verify_constraint_comments "$TAR_RESTORE_PORT" "tar"
 verify_views "$TAR_RESTORE_PORT" "tar"
 verify_materialized_views "$TAR_RESTORE_PORT" "tar"
 verify_sequences "$TAR_RESTORE_PORT" "tar"
+verify_domains "$TAR_RESTORE_PORT" "tar"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$PARALLEL_DIRECTORY_RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/directory-parallel-restore-server.log" 2>&1 &
@@ -417,6 +458,7 @@ verify_constraint_comments "$PARALLEL_DIRECTORY_RESTORE_PORT" "directory-paralle
 verify_views "$PARALLEL_DIRECTORY_RESTORE_PORT" "directory-parallel"
 verify_materialized_views "$PARALLEL_DIRECTORY_RESTORE_PORT" "directory-parallel"
 verify_sequences "$PARALLEL_DIRECTORY_RESTORE_PORT" "directory-parallel"
+verify_domains "$PARALLEL_DIRECTORY_RESTORE_PORT" "directory-parallel"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$CLEAN_RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/clean-restore-server.log" 2>&1 &
@@ -430,6 +472,9 @@ INSERT INTO accounts (id, name) VALUES (99, 'stale account');
 CREATE VIEW public.account_lookup AS SELECT id, name FROM accounts WHERE id = 99 ORDER BY id;
 CREATE MATERIALIZED VIEW public.account_snapshot AS SELECT id, name FROM accounts ORDER BY id;
 CREATE SEQUENCE public.account_seq;
+CREATE DOMAIN public.account_id AS int4;
+CREATE DOMAIN public.account_label AS text;
+CREATE TABLE domain_accounts (id account_id, label account_label);
 CREATE TABLE events (event_id int4, note text);
 INSERT INTO events (event_id, note) VALUES (99, 'stale event');
 SQL
@@ -452,6 +497,7 @@ verify_constraint_comments "$CLEAN_RESTORE_PORT" "clean"
 verify_views "$CLEAN_RESTORE_PORT" "clean"
 verify_materialized_views "$CLEAN_RESTORE_PORT" "clean"
 verify_sequences "$CLEAN_RESTORE_PORT" "clean"
+verify_domains "$CLEAN_RESTORE_PORT" "clean"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$INSERT_RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/insert-restore-server.log" 2>&1 &
@@ -476,6 +522,7 @@ verify_constraint_comments "$INSERT_RESTORE_PORT" "insert"
 verify_views "$INSERT_RESTORE_PORT" "insert"
 verify_materialized_views "$INSERT_RESTORE_PORT" "insert"
 verify_sequences "$INSERT_RESTORE_PORT" "insert"
+verify_domains "$INSERT_RESTORE_PORT" "insert"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$SPLIT_RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/split-restore-server.log" 2>&1 &
@@ -504,6 +551,7 @@ verify_constraint_comments "$SPLIT_RESTORE_PORT" "split"
 verify_views "$SPLIT_RESTORE_PORT" "split"
 verify_materialized_views "$SPLIT_RESTORE_PORT" "split" "$OUT_DIR/materialized-view-empty.expected"
 verify_sequences "$SPLIT_RESTORE_PORT" "split"
+verify_domains "$SPLIT_RESTORE_PORT" "split"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$CUSTOM_SPLIT_RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/custom-split-restore-server.log" 2>&1 &
@@ -532,6 +580,7 @@ verify_constraint_comments "$CUSTOM_SPLIT_RESTORE_PORT" "custom-split"
 verify_views "$CUSTOM_SPLIT_RESTORE_PORT" "custom-split"
 verify_materialized_views "$CUSTOM_SPLIT_RESTORE_PORT" "custom-split" "$OUT_DIR/materialized-view-empty.expected"
 verify_sequences "$CUSTOM_SPLIT_RESTORE_PORT" "custom-split"
+verify_domains "$CUSTOM_SPLIT_RESTORE_PORT" "custom-split"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$DIRECTORY_SPLIT_RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/directory-split-restore-server.log" 2>&1 &
@@ -560,6 +609,7 @@ verify_constraint_comments "$DIRECTORY_SPLIT_RESTORE_PORT" "directory-split"
 verify_views "$DIRECTORY_SPLIT_RESTORE_PORT" "directory-split"
 verify_materialized_views "$DIRECTORY_SPLIT_RESTORE_PORT" "directory-split" "$OUT_DIR/materialized-view-empty.expected"
 verify_sequences "$DIRECTORY_SPLIT_RESTORE_PORT" "directory-split"
+verify_domains "$DIRECTORY_SPLIT_RESTORE_PORT" "directory-split"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$TAR_SPLIT_RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/tar-split-restore-server.log" 2>&1 &
@@ -588,6 +638,7 @@ verify_constraint_comments "$TAR_SPLIT_RESTORE_PORT" "tar-split"
 verify_views "$TAR_SPLIT_RESTORE_PORT" "tar-split"
 verify_materialized_views "$TAR_SPLIT_RESTORE_PORT" "tar-split" "$OUT_DIR/materialized-view-empty.expected"
 verify_sequences "$TAR_SPLIT_RESTORE_PORT" "tar-split"
+verify_domains "$TAR_SPLIT_RESTORE_PORT" "tar-split"
 
 pg_restore --list "$OUT_DIR/dump.custom" >"$OUT_DIR/dump.custom.toc"
 pg_restore --list "$OUT_DIR/dump.dir" >"$OUT_DIR/dump.dir.toc"
@@ -601,10 +652,15 @@ grep -F "	(2, 'unknown', 7);" "$OUT_DIR/dump-inserts.sql" >/dev/null
 grep -F "INSERT INTO public.events VALUES" "$OUT_DIR/dump-inserts.sql" >/dev/null
 grep -F "	(10, 'created')," "$OUT_DIR/dump-inserts.sql" >/dev/null
 grep -F "CREATE SCHEMA public;" "$OUT_DIR/dump.sql" >/dev/null
+grep -F "CREATE DOMAIN public.account_id AS integer;" "$OUT_DIR/dump.sql" >/dev/null
+grep -F "CREATE DOMAIN public.account_label AS text;" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "CREATE TABLE public.accounts (" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "    name text DEFAULT 'unknown'::text," "$OUT_DIR/dump.sql" >/dev/null
 grep -F "    tier integer DEFAULT 7" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "CREATE TABLE public.events (" "$OUT_DIR/dump.sql" >/dev/null
+grep -F "CREATE TABLE public.domain_accounts (" "$OUT_DIR/dump.sql" >/dev/null
+grep -F "    id account_id," "$OUT_DIR/dump.sql" >/dev/null
+grep -F "    label account_label" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "CREATE INDEX accounts_name_idx ON public.accounts USING btree (name);" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "CREATE INDEX events_note_idx ON public.events USING btree (note);" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "CREATE VIEW public.account_lookup AS" "$OUT_DIR/dump.sql" >/dev/null
@@ -619,6 +675,8 @@ grep -F "CREATE SEQUENCE public.account_seq" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "START WITH 1" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "SELECT pg_catalog.setval('public.account_seq', 2, true);" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "COMMENT ON SEQUENCE public.account_seq IS 'account sequence';" "$OUT_DIR/dump.sql" >/dev/null
+grep -F "COMMENT ON DOMAIN public.account_id IS 'account id domain';" "$OUT_DIR/dump.sql" >/dev/null
+grep -F "COMMENT ON DOMAIN public.account_label IS 'account label domain';" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "COMMENT ON TABLE public.accounts IS 'accounts table';" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "COMMENT ON COLUMN public.accounts.name IS 'account display name';" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "COMMENT ON INDEX public.accounts_name_idx IS 'accounts name lookup';" "$OUT_DIR/dump.sql" >/dev/null
@@ -626,10 +684,15 @@ grep -F "COMMENT ON TABLE public.events IS 'events table';" "$OUT_DIR/dump.sql" 
 grep -F "COMMENT ON COLUMN public.events.note IS 'event note';" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "COMMENT ON INDEX public.events_note_idx IS 'events note lookup';" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "CREATE SCHEMA public;" "$OUT_DIR/dump-schema.sql" >/dev/null
+grep -F "CREATE DOMAIN public.account_id AS integer;" "$OUT_DIR/dump-schema.sql" >/dev/null
+grep -F "CREATE DOMAIN public.account_label AS text;" "$OUT_DIR/dump-schema.sql" >/dev/null
 grep -F "CREATE TABLE public.accounts (" "$OUT_DIR/dump-schema.sql" >/dev/null
 grep -F "    name text DEFAULT 'unknown'::text," "$OUT_DIR/dump-schema.sql" >/dev/null
 grep -F "    tier integer DEFAULT 7" "$OUT_DIR/dump-schema.sql" >/dev/null
 grep -F "CREATE TABLE public.events (" "$OUT_DIR/dump-schema.sql" >/dev/null
+grep -F "CREATE TABLE public.domain_accounts (" "$OUT_DIR/dump-schema.sql" >/dev/null
+grep -F "    id account_id," "$OUT_DIR/dump-schema.sql" >/dev/null
+grep -F "    label account_label" "$OUT_DIR/dump-schema.sql" >/dev/null
 grep -F "CREATE INDEX accounts_name_idx ON public.accounts USING btree (name);" "$OUT_DIR/dump-schema.sql" >/dev/null
 grep -F "CREATE INDEX events_note_idx ON public.events USING btree (note);" "$OUT_DIR/dump-schema.sql" >/dev/null
 grep -F "CREATE VIEW public.account_lookup AS" "$OUT_DIR/dump-schema.sql" >/dev/null
@@ -640,6 +703,8 @@ grep -F "  WITH NO DATA;" "$OUT_DIR/dump-schema.sql" >/dev/null
 grep -F "COMMENT ON MATERIALIZED VIEW public.account_snapshot IS 'account snapshot';" "$OUT_DIR/dump-schema.sql" >/dev/null
 grep -F "CREATE SEQUENCE public.account_seq" "$OUT_DIR/dump-schema.sql" >/dev/null
 grep -F "COMMENT ON SEQUENCE public.account_seq IS 'account sequence';" "$OUT_DIR/dump-schema.sql" >/dev/null
+grep -F "COMMENT ON DOMAIN public.account_id IS 'account id domain';" "$OUT_DIR/dump-schema.sql" >/dev/null
+grep -F "COMMENT ON DOMAIN public.account_label IS 'account label domain';" "$OUT_DIR/dump-schema.sql" >/dev/null
 grep -F "COMMENT ON TABLE public.accounts IS 'accounts table';" "$OUT_DIR/dump-schema.sql" >/dev/null
 grep -F "COMMENT ON COLUMN public.accounts.name IS 'account display name';" "$OUT_DIR/dump-schema.sql" >/dev/null
 grep -F "COMMENT ON INDEX public.accounts_name_idx IS 'accounts name lookup';" "$OUT_DIR/dump-schema.sql" >/dev/null
@@ -647,6 +712,7 @@ grep -F "COMMENT ON TABLE public.events IS 'events table';" "$OUT_DIR/dump-schem
 grep -F "COMMENT ON COLUMN public.events.note IS 'event note';" "$OUT_DIR/dump-schema.sql" >/dev/null
 grep -F "COMMENT ON INDEX public.events_note_idx IS 'events note lookup';" "$OUT_DIR/dump-schema.sql" >/dev/null
 grep -F "COPY public.accounts (id, name, tier) FROM stdin;" "$OUT_DIR/dump-data.sql" >/dev/null
+grep -F "COPY public.domain_accounts (id, label) FROM stdin;" "$OUT_DIR/dump-data.sql" >/dev/null
 grep -F "COPY public.events (event_id, note) FROM stdin;" "$OUT_DIR/dump-data.sql" >/dev/null
 grep -F "SELECT pg_catalog.setval('public.account_seq', 2, true);" "$OUT_DIR/dump-data.sql" >/dev/null
 if grep -F "REFRESH MATERIALIZED VIEW public.account_snapshot;" "$OUT_DIR/dump-data.sql" >/dev/null; then
@@ -654,7 +720,10 @@ if grep -F "REFRESH MATERIALIZED VIEW public.account_snapshot;" "$OUT_DIR/dump-d
   exit 1
 fi
 grep -F "SCHEMA - public" "$OUT_DIR/dump.custom.toc" >/dev/null
+grep -F "DOMAIN public account_id" "$OUT_DIR/dump.custom.toc" >/dev/null
+grep -F "DOMAIN public account_label" "$OUT_DIR/dump.custom.toc" >/dev/null
 grep -F "TABLE public accounts" "$OUT_DIR/dump.custom.toc" >/dev/null
+grep -F "TABLE public domain_accounts" "$OUT_DIR/dump.custom.toc" >/dev/null
 grep -F "TABLE public events" "$OUT_DIR/dump.custom.toc" >/dev/null
 grep -F "INDEX public accounts_name_idx" "$OUT_DIR/dump.custom.toc" >/dev/null
 grep -F "INDEX public events_note_idx" "$OUT_DIR/dump.custom.toc" >/dev/null
@@ -664,9 +733,13 @@ grep -F "MATERIALIZED VIEW DATA public account_snapshot" "$OUT_DIR/dump.custom.t
 grep -F "SEQUENCE public account_seq" "$OUT_DIR/dump.custom.toc" >/dev/null
 grep -F "SEQUENCE SET public account_seq" "$OUT_DIR/dump.custom.toc" >/dev/null
 grep -F "TABLE DATA public accounts" "$OUT_DIR/dump.custom.toc" >/dev/null
+grep -F "TABLE DATA public domain_accounts" "$OUT_DIR/dump.custom.toc" >/dev/null
 grep -F "TABLE DATA public events" "$OUT_DIR/dump.custom.toc" >/dev/null
 grep -F "SCHEMA - public" "$OUT_DIR/dump.dir.toc" >/dev/null
+grep -F "DOMAIN public account_id" "$OUT_DIR/dump.dir.toc" >/dev/null
+grep -F "DOMAIN public account_label" "$OUT_DIR/dump.dir.toc" >/dev/null
 grep -F "TABLE public accounts" "$OUT_DIR/dump.dir.toc" >/dev/null
+grep -F "TABLE public domain_accounts" "$OUT_DIR/dump.dir.toc" >/dev/null
 grep -F "TABLE public events" "$OUT_DIR/dump.dir.toc" >/dev/null
 grep -F "INDEX public accounts_name_idx" "$OUT_DIR/dump.dir.toc" >/dev/null
 grep -F "INDEX public events_note_idx" "$OUT_DIR/dump.dir.toc" >/dev/null
@@ -676,9 +749,13 @@ grep -F "MATERIALIZED VIEW DATA public account_snapshot" "$OUT_DIR/dump.dir.toc"
 grep -F "SEQUENCE public account_seq" "$OUT_DIR/dump.dir.toc" >/dev/null
 grep -F "SEQUENCE SET public account_seq" "$OUT_DIR/dump.dir.toc" >/dev/null
 grep -F "TABLE DATA public accounts" "$OUT_DIR/dump.dir.toc" >/dev/null
+grep -F "TABLE DATA public domain_accounts" "$OUT_DIR/dump.dir.toc" >/dev/null
 grep -F "TABLE DATA public events" "$OUT_DIR/dump.dir.toc" >/dev/null
 grep -F "SCHEMA - public" "$OUT_DIR/dump.tar.toc" >/dev/null
+grep -F "DOMAIN public account_id" "$OUT_DIR/dump.tar.toc" >/dev/null
+grep -F "DOMAIN public account_label" "$OUT_DIR/dump.tar.toc" >/dev/null
 grep -F "TABLE public accounts" "$OUT_DIR/dump.tar.toc" >/dev/null
+grep -F "TABLE public domain_accounts" "$OUT_DIR/dump.tar.toc" >/dev/null
 grep -F "TABLE public events" "$OUT_DIR/dump.tar.toc" >/dev/null
 grep -F "INDEX public accounts_name_idx" "$OUT_DIR/dump.tar.toc" >/dev/null
 grep -F "INDEX public events_note_idx" "$OUT_DIR/dump.tar.toc" >/dev/null
@@ -688,6 +765,7 @@ grep -F "MATERIALIZED VIEW DATA public account_snapshot" "$OUT_DIR/dump.tar.toc"
 grep -F "SEQUENCE public account_seq" "$OUT_DIR/dump.tar.toc" >/dev/null
 grep -F "SEQUENCE SET public account_seq" "$OUT_DIR/dump.tar.toc" >/dev/null
 grep -F "TABLE DATA public accounts" "$OUT_DIR/dump.tar.toc" >/dev/null
+grep -F "TABLE DATA public domain_accounts" "$OUT_DIR/dump.tar.toc" >/dev/null
 grep -F "TABLE DATA public events" "$OUT_DIR/dump.tar.toc" >/dev/null
 
 echo "pg_dump_plain_public_schema_restore=passed"
@@ -705,6 +783,7 @@ echo "pg_dump_metadata_index_restore=passed"
 echo "pg_dump_bounded_view_restore=passed"
 echo "pg_dump_bounded_materialized_view_restore=passed"
 echo "pg_dump_bounded_sequence_restore=passed"
+echo "pg_dump_bounded_domain_restore=passed"
 echo "dump_file=$OUT_DIR/dump.sql"
 echo "insert_dump_file=$OUT_DIR/dump-inserts.sql"
 echo "schema_dump_file=$OUT_DIR/dump-schema.sql"

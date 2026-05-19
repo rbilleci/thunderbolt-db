@@ -6341,6 +6341,7 @@ fn execute_statement(
     if strip_sql_comments(statement).trim().is_empty() {
         return write_empty_query_response(stream);
     }
+    let canonical = canonical_sql(statement);
     if let Some((table, options)) = parse_copy_to_stdout_table(statement) {
         return execute_copy_to_stdout(stream, session, &table, options);
     }
@@ -6430,6 +6431,12 @@ fn execute_statement(
         }
     }
 
+    if is_pg_dump_domain_constraints_prepare(&canonical)
+        || is_pg_dump_domain_dump_prepare(&canonical)
+    {
+        return write_command_complete(stream, "PREPARE");
+    }
+
     if let Some((name, parameter_type_oids, query)) = parse_sql_prepare(statement) {
         let query = strip_sql_comments(&query);
         if contains_zero_placeholder(&query) {
@@ -6472,6 +6479,22 @@ fn execute_statement(
             }),
         );
         return write_command_complete(stream, "PREPARE");
+    }
+
+    if is_pg_dump_domain_constraints_execute(&canonical) {
+        return write_single_row(
+            stream,
+            &pg_dump_domain_constraints_columns(),
+            &Vec::<Vec<Option<String>>>::new(),
+        );
+    }
+
+    if let Some(oid) = pg_dump_domain_dump_execute_oid(&canonical) {
+        return write_single_row(
+            stream,
+            &pg_dump_domain_dump_columns(),
+            &pg_dump_domain_dump_rows(session, oid),
+        );
     }
 
     if let Some((name, parameters)) = parse_sql_execute(statement) {
@@ -6918,7 +6941,7 @@ fn execute_statement(
         return write_single_row(
             stream,
             &pg_dump_type_metadata_columns(),
-            &pg_dump_type_metadata_rows(),
+            &pg_dump_type_metadata_rows(session),
         );
     }
     if canonical == pg_dump_database_metadata_query() {
@@ -9871,7 +9894,7 @@ fn execute_statement(
         return write_single_row(
             stream,
             &pg_dump_type_metadata_columns(),
-            &pg_dump_type_metadata_rows(),
+            &pg_dump_type_metadata_rows(session),
         );
     }
     if canonical == pg_dump_database_metadata_query() {
@@ -12008,6 +12031,7 @@ fn pg_dump_attribute_metadata_rows(
                     column.attnum,
                     &column.def.name,
                     column.def.ty,
+                    column.def.domain.as_deref(),
                     column.def.default.is_some(),
                 ));
             }
@@ -12043,6 +12067,7 @@ fn pg_dump_attribute_metadata_rows(
                     attnum,
                     &column.def.name,
                     column.def.ty,
+                    column.def.domain.as_deref(),
                     false,
                 ));
             }
@@ -12059,6 +12084,7 @@ fn pg_dump_attribute_metadata_rows(
                     column.attnum,
                     &column.def.name,
                     column.def.ty,
+                    column.def.domain.as_deref(),
                     false,
                 ));
             }
@@ -12072,6 +12098,7 @@ fn pg_dump_attribute_metadata_row(
     attnum: i16,
     name: &str,
     ty: SqlType,
+    domain: Option<&str>,
     has_default: bool,
 ) -> Vec<Option<String>> {
     vec![
@@ -12087,7 +12114,11 @@ fn pg_dump_attribute_metadata_row(
         Some(ty.type_size().to_string()),
         Some(sql_type_alignment_code(ty).to_string()),
         Some("t".to_string()),
-        Some(sql_type_display_name(ty).to_string()),
+        Some(
+            domain
+                .map(str::to_string)
+                .unwrap_or_else(|| sql_type_display_name(ty).to_string()),
+        ),
         None,
         Some("0".to_string()),
         None,
@@ -12873,6 +12904,62 @@ fn pg_dump_empty_catalog_query_columns(canonical: &str) -> Option<Vec<Column>> {
     None
 }
 
+fn is_pg_dump_domain_constraints_prepare(canonical: &str) -> bool {
+    canonical
+        == "prepare getdomainconstraints(pg_catalog.oid) as select tableoid, oid, conname, pg_catalog.pg_get_constraintdef(oid) as consrc, convalidated from pg_catalog.pg_constraint where contypid = $1 order by conname"
+}
+
+fn is_pg_dump_domain_constraints_execute(canonical: &str) -> bool {
+    canonical.starts_with("execute getdomainconstraints(") && canonical.ends_with(')')
+}
+
+fn pg_dump_domain_constraints_columns() -> Vec<Column> {
+    vec![
+        int4_column("tableoid"),
+        int4_column("oid"),
+        text_column("conname"),
+        text_column("consrc"),
+        bool_column("convalidated"),
+    ]
+}
+
+fn is_pg_dump_domain_dump_prepare(canonical: &str) -> bool {
+    canonical
+        == "prepare dumpdomain(pg_catalog.oid) as select t.typnotnull, pg_catalog.format_type(t.typbasetype, t.typtypmod) as typdefn, pg_catalog.pg_get_expr(t.typdefaultbin, 'pg_catalog.pg_type'::pg_catalog.regclass) as typdefaultbin, t.typdefault, case when t.typcollation <> u.typcollation then t.typcollation else 0 end as typcollation from pg_catalog.pg_type t left join pg_catalog.pg_type u on (t.typbasetype = u.oid) where t.oid = $1"
+}
+
+fn pg_dump_domain_dump_execute_oid(canonical: &str) -> Option<u32> {
+    canonical
+        .strip_prefix("execute dumpdomain(")?
+        .strip_suffix(')')?
+        .trim_matches('\'')
+        .parse()
+        .ok()
+}
+
+fn pg_dump_domain_dump_columns() -> Vec<Column> {
+    vec![
+        bool_column("typnotnull"),
+        text_column("typdefn"),
+        text_column("typdefaultbin"),
+        text_column("typdefault"),
+        int4_column("typcollation"),
+    ]
+}
+
+fn pg_dump_domain_dump_rows(session: &Session, oid: u32) -> Vec<Vec<Option<String>>> {
+    let Some(domain) = session.domains.values().find(|domain| domain.oid == oid) else {
+        return Vec::new();
+    };
+    vec![vec![
+        Some("f".to_string()),
+        Some(sql_type_display_name(domain.base_type).to_string()),
+        None,
+        None,
+        Some("0".to_string()),
+    ]]
+}
+
 fn pg_dump_type_metadata_query() -> &'static str {
     "select tableoid, oid, typname, typnamespace, typacl, acldefault('t', typowner) as acldefault, typowner, typelem, typrelid, case when typrelid = 0 then ' '::\"char\" else (select relkind from pg_class where oid = typrelid) end as typrelkind, typtype, typisdefined, typname[0] = '_' and typelem != 0 and (select typarray from pg_type te where oid = pg_type.typelem) = oid as isarray from pg_type"
 }
@@ -12895,8 +12982,8 @@ fn pg_dump_type_metadata_columns() -> Vec<Column> {
     ]
 }
 
-fn pg_dump_type_metadata_rows() -> Vec<Vec<Option<String>>> {
-    SUPPORTED_SQL_TYPES
+fn pg_dump_type_metadata_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut rows = SUPPORTED_SQL_TYPES
         .into_iter()
         .map(|ty| {
             vec![
@@ -12915,7 +13002,27 @@ fn pg_dump_type_metadata_rows() -> Vec<Vec<Option<String>>> {
                 Some("f".to_string()),
             ]
         })
-        .collect()
+        .collect::<Vec<_>>();
+    let mut domains = session.domains.values().collect::<Vec<_>>();
+    domains.sort_by_key(|domain| domain.oid);
+    for domain in domains {
+        rows.push(vec![
+            Some("1247".to_string()),
+            Some(domain.oid.to_string()),
+            Some(domain.name.clone()),
+            Some(PUBLIC_NAMESPACE_OID.to_string()),
+            None,
+            None,
+            Some("10".to_string()),
+            Some("0".to_string()),
+            Some("0".to_string()),
+            Some(" ".to_string()),
+            Some("d".to_string()),
+            Some("t".to_string()),
+            Some("f".to_string()),
+        ]);
+    }
+    rows
 }
 
 fn pg_dump_database_metadata_query() -> &'static str {
@@ -14626,6 +14733,20 @@ fn pg_dump_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
                 Some(description.clone()),
                 Some("1259".to_string()),
                 Some(view.oid.to_string()),
+                Some("0".to_string()),
+            ]);
+        }
+    }
+    let mut domains = session.domains.values().collect::<Vec<_>>();
+    domains.sort_by_key(|domain| domain.oid);
+    for domain in domains {
+        if let Some(description) = session.comments.get(&CatalogCommentTarget::Domain {
+            domain: domain.name.clone(),
+        }) {
+            rows.push(vec![
+                Some(description.clone()),
+                Some("1247".to_string()),
+                Some(domain.oid.to_string()),
                 Some("0".to_string()),
             ]);
         }
