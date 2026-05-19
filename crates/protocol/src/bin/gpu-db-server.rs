@@ -576,6 +576,36 @@ fn execute_select_result(
     Ok(SelectResult { columns, rows })
 }
 
+fn session_view_depends_on(session: &Session, view: &str, target: &str) -> bool {
+    let mut seen = BTreeSet::new();
+    session_view_depends_on_inner(session, view, target, &mut seen)
+}
+
+fn session_view_depends_on_inner(
+    session: &Session,
+    view: &str,
+    target: &str,
+    seen: &mut BTreeSet<String>,
+) -> bool {
+    if view == target {
+        return true;
+    }
+    if !seen.insert(view.to_string()) {
+        return false;
+    }
+    let Some(view) = session.views.get(view) else {
+        return false;
+    };
+    session_view_depends_on_inner(session, &view.query.table, target, seen)
+}
+
+fn session_view_has_dependents(session: &Session, view: &str) -> bool {
+    session
+        .views
+        .keys()
+        .any(|candidate| candidate != view && session_view_depends_on(session, candidate, view))
+}
+
 fn select_is_plain_view_scan(select: &gpu_db_protocol::Select) -> bool {
     !select.distinct
         && matches!(select.projection, SelectProjection::All)
@@ -8358,22 +8388,34 @@ fn execute_statement(
                         },
                     );
                 }
-                if session.views.contains_key(&create.query.table) {
-                    return write_error(
-                        stream,
-                        &ErrorField {
-                            code: "0A000",
-                            message: "views over views are unsupported",
-                            position: None,
-                        },
-                    );
-                }
                 if session.materialized_views.contains_key(&create.query.table) {
                     return write_error(
                         stream,
                         &ErrorField {
                             code: "0A000",
                             message: "views over materialized views are unsupported",
+                            position: None,
+                        },
+                    );
+                }
+                if create.or_replace && session_view_has_dependents(session, &create.name) {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "2BP01",
+                            message: "cannot replace view because another view depends on it",
+                            position: None,
+                        },
+                    );
+                }
+                if session.views.contains_key(&create.query.table)
+                    && session_view_depends_on(session, &create.query.table, &create.name)
+                {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "0A000",
+                            message: "view dependency cycle is unsupported",
                             position: None,
                         },
                     );
@@ -8556,6 +8598,16 @@ fn execute_statement(
                         &ErrorField {
                             code: "42P07",
                             message: "relation already exists",
+                            position: None,
+                        },
+                    );
+                }
+                if session_view_has_dependents(session, &rename.old_name) {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "2BP01",
+                            message: "cannot rename view because another view depends on it",
                             position: None,
                         },
                     );
@@ -8806,6 +8858,7 @@ fn execute_statement(
             }
             Command::DropView(drop) => {
                 let mut seen = BTreeSet::new();
+                let drop_names = drop.names.iter().cloned().collect::<BTreeSet<_>>();
                 for name in &drop.names {
                     if !seen.insert(name) {
                         return write_error(
@@ -8853,6 +8906,19 @@ fn execute_statement(
                             &ErrorField {
                                 code: "42P01",
                                 message: "view does not exist",
+                                position: None,
+                            },
+                        );
+                    }
+                    if session.views.keys().any(|candidate| {
+                        !drop_names.contains(candidate)
+                            && session_view_depends_on(session, candidate, name)
+                    }) {
+                        return write_error(
+                            stream,
+                            &ErrorField {
+                                code: "2BP01",
+                                message: "cannot drop view because another view depends on it",
                                 position: None,
                             },
                         );

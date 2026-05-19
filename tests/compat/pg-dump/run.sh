@@ -128,6 +128,8 @@ CREATE TABLE domain_accounts (id account_id, label account_label);
 INSERT INTO domain_accounts (id, label) VALUES (7, 'Ada'), (8, 'Grace');
 CREATE VIEW public.account_lookup AS SELECT id, name FROM accounts WHERE id > 1 ORDER BY id;
 COMMENT ON VIEW public.account_lookup IS 'active account lookup';
+CREATE VIEW public.account_lookup_layer AS SELECT * FROM account_lookup;
+COMMENT ON VIEW public.account_lookup_layer IS 'layered account lookup';
 CREATE MATERIALIZED VIEW public.account_snapshot AS SELECT id, name FROM accounts ORDER BY id;
 COMMENT ON MATERIALIZED VIEW public.account_snapshot IS 'account snapshot';
 CREATE SEQUENCE public.account_seq;
@@ -216,6 +218,7 @@ public|accounts|r|name|account display name
 public|events|r||events table
 public|events|r|note|event note
 public|account_lookup|v||active account lookup
+public|account_lookup_layer|v||layered account lookup
 public|account_snapshot|m||account snapshot
 public|account_seq|s||account sequence
 EOF
@@ -276,6 +279,8 @@ verify_constraint_comments "$RESTORE_PORT" "restore"
 
 cat >"$OUT_DIR/view-verify.expected" <<'EOF'
 public|account_lookup|postgres|SELECT id, name FROM accounts WHERE id > 1 ORDER BY id
+public|account_lookup_layer|postgres|SELECT * FROM account_lookup
+2|unknown
 2|unknown
 EOF
 
@@ -286,6 +291,7 @@ verify_views() {
     psql -v ON_ERROR_STOP=1 -X -A -t \
     -c "SELECT schemaname, viewname, viewowner, definition FROM pg_catalog.pg_views WHERE schemaname = 'public' ORDER BY viewname;" \
     -c "SELECT * FROM account_lookup;" \
+    -c "SELECT * FROM account_lookup_layer;" \
     >"$OUT_DIR/${prefix}-view-verify.out" 2>"$OUT_DIR/${prefix}-view-verify.err"
   diff -u "$OUT_DIR/view-verify.expected" "$OUT_DIR/${prefix}-view-verify.out"
 }
@@ -470,6 +476,7 @@ PGHOST=127.0.0.1 PGPORT="$CLEAN_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgre
 CREATE TABLE accounts (id int4, name text);
 INSERT INTO accounts (id, name) VALUES (99, 'stale account');
 CREATE VIEW public.account_lookup AS SELECT id, name FROM accounts WHERE id = 99 ORDER BY id;
+CREATE VIEW public.account_lookup_layer AS SELECT * FROM account_lookup;
 CREATE MATERIALIZED VIEW public.account_snapshot AS SELECT id, name FROM accounts ORDER BY id;
 CREATE SEQUENCE public.account_seq;
 CREATE DOMAIN public.account_id AS int4;
@@ -666,6 +673,9 @@ grep -F "CREATE INDEX events_note_idx ON public.events USING btree (note);" "$OU
 grep -F "CREATE VIEW public.account_lookup AS" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "SELECT id, name FROM accounts WHERE id > 1 ORDER BY id;" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "COMMENT ON VIEW public.account_lookup IS 'active account lookup';" "$OUT_DIR/dump.sql" >/dev/null
+grep -F "CREATE VIEW public.account_lookup_layer AS" "$OUT_DIR/dump.sql" >/dev/null
+grep -F "SELECT * FROM account_lookup;" "$OUT_DIR/dump.sql" >/dev/null
+grep -F "COMMENT ON VIEW public.account_lookup_layer IS 'layered account lookup';" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "CREATE MATERIALIZED VIEW public.account_snapshot AS" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "SELECT id, name FROM accounts ORDER BY id" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "  WITH NO DATA;" "$OUT_DIR/dump.sql" >/dev/null
@@ -698,6 +708,9 @@ grep -F "CREATE INDEX events_note_idx ON public.events USING btree (note);" "$OU
 grep -F "CREATE VIEW public.account_lookup AS" "$OUT_DIR/dump-schema.sql" >/dev/null
 grep -F "SELECT id, name FROM accounts WHERE id > 1 ORDER BY id;" "$OUT_DIR/dump-schema.sql" >/dev/null
 grep -F "COMMENT ON VIEW public.account_lookup IS 'active account lookup';" "$OUT_DIR/dump-schema.sql" >/dev/null
+grep -F "CREATE VIEW public.account_lookup_layer AS" "$OUT_DIR/dump-schema.sql" >/dev/null
+grep -F "SELECT * FROM account_lookup;" "$OUT_DIR/dump-schema.sql" >/dev/null
+grep -F "COMMENT ON VIEW public.account_lookup_layer IS 'layered account lookup';" "$OUT_DIR/dump-schema.sql" >/dev/null
 grep -F "CREATE MATERIALIZED VIEW public.account_snapshot AS" "$OUT_DIR/dump-schema.sql" >/dev/null
 grep -F "  WITH NO DATA;" "$OUT_DIR/dump-schema.sql" >/dev/null
 grep -F "COMMENT ON MATERIALIZED VIEW public.account_snapshot IS 'account snapshot';" "$OUT_DIR/dump-schema.sql" >/dev/null
@@ -728,6 +741,7 @@ grep -F "TABLE public events" "$OUT_DIR/dump.custom.toc" >/dev/null
 grep -F "INDEX public accounts_name_idx" "$OUT_DIR/dump.custom.toc" >/dev/null
 grep -F "INDEX public events_note_idx" "$OUT_DIR/dump.custom.toc" >/dev/null
 grep -F "VIEW public account_lookup" "$OUT_DIR/dump.custom.toc" >/dev/null
+grep -F "VIEW public account_lookup_layer" "$OUT_DIR/dump.custom.toc" >/dev/null
 grep -F "MATERIALIZED VIEW public account_snapshot" "$OUT_DIR/dump.custom.toc" >/dev/null
 grep -F "MATERIALIZED VIEW DATA public account_snapshot" "$OUT_DIR/dump.custom.toc" >/dev/null
 grep -F "SEQUENCE public account_seq" "$OUT_DIR/dump.custom.toc" >/dev/null
@@ -744,6 +758,7 @@ grep -F "TABLE public events" "$OUT_DIR/dump.dir.toc" >/dev/null
 grep -F "INDEX public accounts_name_idx" "$OUT_DIR/dump.dir.toc" >/dev/null
 grep -F "INDEX public events_note_idx" "$OUT_DIR/dump.dir.toc" >/dev/null
 grep -F "VIEW public account_lookup" "$OUT_DIR/dump.dir.toc" >/dev/null
+grep -F "VIEW public account_lookup_layer" "$OUT_DIR/dump.dir.toc" >/dev/null
 grep -F "MATERIALIZED VIEW public account_snapshot" "$OUT_DIR/dump.dir.toc" >/dev/null
 grep -F "MATERIALIZED VIEW DATA public account_snapshot" "$OUT_DIR/dump.dir.toc" >/dev/null
 grep -F "SEQUENCE public account_seq" "$OUT_DIR/dump.dir.toc" >/dev/null
@@ -760,6 +775,7 @@ grep -F "TABLE public events" "$OUT_DIR/dump.tar.toc" >/dev/null
 grep -F "INDEX public accounts_name_idx" "$OUT_DIR/dump.tar.toc" >/dev/null
 grep -F "INDEX public events_note_idx" "$OUT_DIR/dump.tar.toc" >/dev/null
 grep -F "VIEW public account_lookup" "$OUT_DIR/dump.tar.toc" >/dev/null
+grep -F "VIEW public account_lookup_layer" "$OUT_DIR/dump.tar.toc" >/dev/null
 grep -F "MATERIALIZED VIEW public account_snapshot" "$OUT_DIR/dump.tar.toc" >/dev/null
 grep -F "MATERIALIZED VIEW DATA public account_snapshot" "$OUT_DIR/dump.tar.toc" >/dev/null
 grep -F "SEQUENCE public account_seq" "$OUT_DIR/dump.tar.toc" >/dev/null

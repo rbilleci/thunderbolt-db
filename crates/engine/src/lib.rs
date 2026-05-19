@@ -7744,11 +7744,6 @@ impl Engine {
                 create.name
             )));
         }
-        if self.relational_views.contains_key(&create.query.table) {
-            return Err(EngineError::ApplyFailed(
-                "views over views are unsupported".to_string(),
-            ));
-        }
         if self
             .relational_materialized_views
             .contains_key(&create.query.table)
@@ -7757,7 +7752,18 @@ impl Engine {
                 "views over materialized views are unsupported".to_string(),
             ));
         }
-        if !self.relational_catalog.contains_key(&create.query.table) {
+        if create.or_replace && self.relational_view_has_dependents(&create.name) {
+            return Err(EngineError::ApplyFailed(
+                "cannot replace view because another view depends on it".to_string(),
+            ));
+        }
+        if self.relational_views.contains_key(&create.query.table) {
+            if self.relational_view_depends_on(&create.query.table, &create.name) {
+                return Err(EngineError::ApplyFailed(
+                    "view dependency cycle is unsupported".to_string(),
+                ));
+            }
+        } else if !self.relational_catalog.contains_key(&create.query.table) {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" does not exist",
                 create.query.table
@@ -7784,6 +7790,35 @@ impl Engine {
             },
         );
         Ok(())
+    }
+
+    fn relational_view_depends_on(&self, view: &str, target: &str) -> bool {
+        let mut seen = BTreeSet::new();
+        self.relational_view_depends_on_inner(view, target, &mut seen)
+    }
+
+    fn relational_view_depends_on_inner(
+        &self,
+        view: &str,
+        target: &str,
+        seen: &mut BTreeSet<String>,
+    ) -> bool {
+        if view == target {
+            return true;
+        }
+        if !seen.insert(view.to_string()) {
+            return false;
+        }
+        let Some(view) = self.relational_views.get(view) else {
+            return false;
+        };
+        self.relational_view_depends_on_inner(&view.query.table, target, seen)
+    }
+
+    fn relational_view_has_dependents(&self, view: &str) -> bool {
+        self.relational_views.iter().any(|(candidate, _)| {
+            candidate != view && self.relational_view_depends_on(candidate, view)
+        })
     }
 
     fn apply_create_materialized_view(
@@ -9801,6 +9836,7 @@ impl Engine {
 
     fn preflight_drop_view(&self, drop: &DropView) -> Result<(), EngineError> {
         let mut seen = BTreeSet::new();
+        let drop_names = drop.names.iter().cloned().collect::<BTreeSet<_>>();
         for name in &drop.names {
             if !seen.insert(name) {
                 return Err(EngineError::ApplyFailed(format!(
@@ -9829,6 +9865,14 @@ impl Engine {
             if !drop.if_exists && !self.relational_views.contains_key(name) {
                 return Err(EngineError::ApplyFailed(format!(
                     "view \"{}\" does not exist",
+                    name
+                )));
+            }
+            if self.relational_views.iter().any(|(candidate, _)| {
+                !drop_names.contains(candidate) && self.relational_view_depends_on(candidate, name)
+            }) {
+                return Err(EngineError::ApplyFailed(format!(
+                    "cannot drop view \"{}\" because another view depends on it",
                     name
                 )));
             }
@@ -9917,6 +9961,12 @@ impl Engine {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" already exists",
                 rename.new_name
+            )));
+        }
+        if self.relational_view_has_dependents(&rename.old_name) {
+            return Err(EngineError::ApplyFailed(format!(
+                "cannot rename view \"{}\" because another view depends on it",
+                rename.old_name
             )));
         }
         let Some(mut view) = self.relational_views.remove(&rename.old_name) else {
@@ -11259,6 +11309,45 @@ impl Engine {
                     )));
                 }
             }
+            Command::CreateView(create) => {
+                if self.relational_catalog.contains_key(&create.name)
+                    || self
+                        .relational_materialized_views
+                        .contains_key(&create.name)
+                    || self.relational_sequences.contains_key(&create.name)
+                    || (!create.or_replace && self.relational_views.contains_key(&create.name))
+                {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "relation \"{}\" already exists",
+                        create.name
+                    )));
+                }
+                if self
+                    .relational_materialized_views
+                    .contains_key(&create.query.table)
+                {
+                    return Err(EngineError::ApplyFailed(
+                        "views over materialized views are unsupported".to_string(),
+                    ));
+                }
+                if create.or_replace && self.relational_view_has_dependents(&create.name) {
+                    return Err(EngineError::ApplyFailed(
+                        "cannot replace view because another view depends on it".to_string(),
+                    ));
+                }
+                if self.relational_views.contains_key(&create.query.table) {
+                    if self.relational_view_depends_on(&create.query.table, &create.name) {
+                        return Err(EngineError::ApplyFailed(
+                            "view dependency cycle is unsupported".to_string(),
+                        ));
+                    }
+                } else if !self.relational_catalog.contains_key(&create.query.table) {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "relation \"{}\" does not exist",
+                        create.query.table
+                    )));
+                }
+            }
             Command::RenameView(rename) => {
                 if self.relational_catalog.contains_key(&rename.old_name)
                     || self
@@ -11287,6 +11376,12 @@ impl Engine {
                     return Err(EngineError::ApplyFailed(format!(
                         "relation \"{}\" already exists",
                         rename.new_name
+                    )));
+                }
+                if self.relational_view_has_dependents(&rename.old_name) {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "cannot rename view \"{}\" because another view depends on it",
+                        rename.old_name
                     )));
                 }
             }
@@ -34224,6 +34319,105 @@ mod tests {
                 .definition,
             "SELECT id, name FROM people WHERE id > 2 ORDER BY id"
         );
+    }
+
+    #[test]
+    fn relational_sql_layered_views_select_and_replay_from_wal() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO people (id, name) VALUES (1, 'Ada'), (2, 'Linus'), (3, 'Grace')",
+        )
+        .unwrap();
+        e.execute_text(
+            3,
+            "CREATE VIEW public.active_people AS SELECT id, name FROM people WHERE id > 1 ORDER BY id",
+        )
+        .unwrap();
+        e.execute_text(
+            4,
+            "CREATE VIEW public.active_people_names AS SELECT * FROM active_people",
+        )
+        .unwrap();
+        e.execute_text(
+            5,
+            "COMMENT ON VIEW public.active_people_names IS 'layered active people'",
+        )
+        .unwrap();
+
+        let Command::Select(select) = parse_command("SELECT * FROM active_people_names").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let result = e.execute_relational_select(&select).unwrap();
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![SqlValue::Int4(2), SqlValue::Text("Linus".to_string())],
+                vec![SqlValue::Int4(3), SqlValue::Text("Grace".to_string())],
+            ]
+        );
+
+        let mut recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        assert_eq!(
+            recovered
+                .relational_catalog_view("active_people_names")
+                .unwrap()
+                .definition,
+            "SELECT * FROM active_people"
+        );
+        assert_eq!(
+            recovered.relational_view_comment("active_people_names"),
+            Some("layered active people")
+        );
+        let recovered_result = recovered.execute_relational_select(&select).unwrap();
+        assert_eq!(recovered_result.rows, result.rows);
+
+        let replace_parent_err = recovered
+            .execute_text(
+                6,
+                "CREATE OR REPLACE VIEW public.active_people AS SELECT id, name FROM people WHERE id > 2 ORDER BY id",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            replace_parent_err.contains("cannot replace view because another view depends on it"),
+            "{replace_parent_err}"
+        );
+
+        let rename_parent_err = recovered
+            .execute_text(
+                7,
+                "ALTER VIEW public.active_people RENAME TO active_people_base",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            rename_parent_err.contains("cannot rename view"),
+            "{rename_parent_err}"
+        );
+
+        let drop_parent_err = recovered
+            .execute_text(8, "DROP VIEW public.active_people")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            drop_parent_err.contains("cannot drop view"),
+            "{drop_parent_err}"
+        );
+
+        recovered
+            .execute_text(
+                9,
+                "DROP VIEW public.active_people_names, public.active_people",
+            )
+            .unwrap();
+        assert!(recovered
+            .relational_catalog_view("active_people_names")
+            .is_none());
+        assert!(recovered.relational_catalog_view("active_people").is_none());
     }
 
     #[test]

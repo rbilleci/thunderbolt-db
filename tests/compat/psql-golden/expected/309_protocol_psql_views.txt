@@ -32,8 +32,38 @@ CREATE VIEW
 
 psql:309_protocol_psql_views.sql:16: ERROR:  query shape is not supported by the compatibility stub
 psql:309_protocol_psql_views.sql:17: ERROR:  relation already exists
-psql:309_protocol_psql_views.sql:18: ERROR:  views over views are unsupported
-psql:309_protocol_psql_views.sql:19: ERROR:  only plain SELECT * FROM view is supported for views
+CREATE VIEW
+COMMENT
+ id | name
+----+-------
+  2 | Linus
+  3 | Grace
+(2 rows)
+
+ schemaname |      viewname      | viewowner |                        definition
+------------+--------------------+-----------+-----------------------------------------------------------
+ public     | active_view_people | postgres  | SELECT id, name FROM view_people WHERE id > 1 ORDER BY id
+ public     | nested_view_people | postgres  | SELECT * FROM active_view_people
+(2 rows)
+
+ table_catalog | table_schema |     table_name     |                      view_definition                      | check_option | is_updatable | is_insertable_into | is_trigger_updatable | is_trigger_deletable | is_trigger_insertable
+---------------+--------------+--------------------+-----------------------------------------------------------+--------------+--------------+--------------------+----------------------+----------------------+-----------------------
+ postgres      | public       | active_view_people | SELECT id, name FROM view_people WHERE id > 1 ORDER BY id | NONE         | NO           | NO                 | NO                   | NO                   | NO
+ postgres      | public       | nested_view_people | SELECT * FROM active_view_people                          | NONE         | NO           | NO                 | NO                   | NO                   | NO
+(2 rows)
+
+                                     List of relations
+ Schema |        Name        | Type |  Owner   | Persistence | Size |     Description
+--------+--------------------+------+----------+-------------+------+----------------------
+ public | active_view_people | view | postgres | permanent   |      |
+ public | nested_view_people | view | postgres | permanent   |      | nested active people
+(2 rows)
+
+psql:309_protocol_psql_views.sql:30: ERROR:  cannot replace view because another view depends on it
+psql:309_protocol_psql_views.sql:31: ERROR:  cannot rename view because another view depends on it
+psql:309_protocol_psql_views.sql:32: ERROR:  cannot drop view because another view depends on it
+psql:309_protocol_psql_views.sql:33: ERROR:  only plain SELECT * FROM view is supported for views
+DROP VIEW
  id | name
 ----+-------
   1 | Ada

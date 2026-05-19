@@ -16,5 +16,20 @@ ORDER BY table_name;
 CREATE VIEW public.missing_view_people AS SELECT * FROM missing_view_people;
 CREATE VIEW public.active_view_people AS SELECT * FROM view_people;
 CREATE VIEW public.nested_view_people AS SELECT * FROM active_view_people;
+COMMENT ON VIEW public.nested_view_people IS 'nested active people';
+SELECT * FROM nested_view_people;
+SELECT schemaname, viewname, viewowner, definition
+FROM pg_catalog.pg_views
+WHERE schemaname = 'public'
+ORDER BY viewname;
+SELECT table_catalog, table_schema, table_name, view_definition, check_option, is_updatable, is_insertable_into, is_trigger_updatable, is_trigger_deletable, is_trigger_insertable
+FROM information_schema.views
+WHERE table_schema = 'public'
+ORDER BY table_name;
+\dv+
+CREATE OR REPLACE VIEW public.active_view_people AS SELECT id, name FROM view_people WHERE id > 2 ORDER BY id;
+ALTER VIEW public.active_view_people RENAME TO active_view_people_base;
+DROP VIEW public.active_view_people;
 SELECT id FROM active_view_people WHERE id = 2;
+DROP VIEW public.nested_view_people, public.active_view_people;
 SELECT * FROM view_people ORDER BY id;
