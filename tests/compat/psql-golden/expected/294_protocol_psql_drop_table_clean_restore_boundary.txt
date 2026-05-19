@@ -10,7 +10,7 @@ INSERT 0 1
 (1 row)
 
 DROP TABLE
-DROP SCHEMA
+psql:294_protocol_psql_drop_table_clean_restore_boundary.sql:9: ERROR:  cannot drop non-empty schema "public"
 CREATE SCHEMA
  name
 ------

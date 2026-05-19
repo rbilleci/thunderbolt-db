@@ -1,0 +1,42 @@
+=== psql bounded public schema lifecycle ===
+COMMENT
+                      List of schemas
+  Name  |  Owner   | Access privileges |    Description
+--------+----------+-------------------+--------------------
+ public | postgres |                   | application schema
+(1 row)
+
+CREATE TABLE
+psql:340_protocol_psql_schema_lifecycle.sql:5: ERROR:  cannot drop non-empty schema "public"
+ name
+------
+(0 rows)
+
+                      List of schemas
+  Name  |  Owner   | Access privileges |    Description
+--------+----------+-------------------+--------------------
+ public | postgres |                   | application schema
+(1 row)
+
+DROP TABLE
+DROP SCHEMA
+ schema_name | schema_owner
+-------------+--------------
+(0 rows)
+
+psql:340_protocol_psql_schema_lifecycle.sql:11: ERROR:  schema does not exist
+CREATE SCHEMA
+CREATE SCHEMA
+psql:340_protocol_psql_schema_lifecycle.sql:14: ERROR:  schema "public" already exists
+CREATE TABLE
+INSERT 0 1
+ name
+------
+ Ada
+(1 row)
+
+                   List of schemas
+  Name  |  Owner   | Access privileges | Description
+--------+----------+-------------------+-------------
+ public | postgres |                   |
+(1 row)

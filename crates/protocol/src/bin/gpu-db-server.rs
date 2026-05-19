@@ -2345,6 +2345,8 @@ struct Session {
     domains: BTreeMap<String, Domain>,
     publications: BTreeMap<String, Publication>,
     subscriptions: BTreeMap<String, Subscription>,
+    public_schema_exists: bool,
+    public_schema_implicit: bool,
     currval_sequences: HashMap<String, i64>,
     indexes: Vec<CatalogIndex>,
     table_acls: BTreeMap<String, BTreeMap<String, BTreeSet<TablePrivilege>>>,
@@ -2357,6 +2359,7 @@ struct Session {
     dirty_domains: BTreeSet<String>,
     dirty_publications: BTreeSet<String>,
     dirty_subscriptions: BTreeSet<String>,
+    dirty_schema: bool,
     dirty_indexes: bool,
     dirty_table_acls: BTreeSet<String>,
     dirty_default_table_acl: bool,
@@ -2375,6 +2378,8 @@ struct SharedCatalog {
     domains: BTreeMap<String, Domain>,
     publications: BTreeMap<String, Publication>,
     subscriptions: BTreeMap<String, Subscription>,
+    public_schema_exists: bool,
+    public_schema_implicit: bool,
     indexes: Vec<CatalogIndex>,
     table_acls: BTreeMap<String, BTreeMap<String, BTreeSet<TablePrivilege>>>,
     default_table_acl: BTreeMap<String, BTreeSet<TablePrivilege>>,
@@ -2392,6 +2397,8 @@ impl Default for SharedCatalog {
             domains: BTreeMap::new(),
             publications: BTreeMap::new(),
             subscriptions: BTreeMap::new(),
+            public_schema_exists: true,
+            public_schema_implicit: true,
             indexes: Vec::new(),
             table_acls: BTreeMap::new(),
             default_table_acl: BTreeMap::new(),
@@ -2433,6 +2440,8 @@ impl Session {
             domains: catalog.domains,
             publications: catalog.publications,
             subscriptions: catalog.subscriptions,
+            public_schema_exists: catalog.public_schema_exists,
+            public_schema_implicit: catalog.public_schema_implicit,
             currval_sequences: HashMap::new(),
             indexes: catalog.indexes,
             table_acls: catalog.table_acls,
@@ -2445,6 +2454,7 @@ impl Session {
             dirty_domains: BTreeSet::new(),
             dirty_publications: BTreeSet::new(),
             dirty_subscriptions: BTreeSet::new(),
+            dirty_schema: false,
             dirty_indexes: false,
             dirty_table_acls: BTreeSet::new(),
             dirty_default_table_acl: false,
@@ -2483,6 +2493,10 @@ impl Session {
         self.dirty_subscriptions.insert(subscription.into());
     }
 
+    fn mark_schema_dirty(&mut self) {
+        self.dirty_schema = true;
+    }
+
     fn mark_table_acl_dirty(&mut self, table: impl Into<String>) {
         self.dirty_table_acls.insert(table.into());
     }
@@ -2504,6 +2518,7 @@ impl Session {
             self.dirty_domains.clear();
             self.dirty_publications.clear();
             self.dirty_subscriptions.clear();
+            self.dirty_schema = false;
             self.dirty_table_acls.clear();
             self.dirty_default_table_acl = false;
             self.dirty_comment_targets.clear();
@@ -2579,6 +2594,11 @@ impl Session {
         if self.dirty_default_table_acl {
             catalog.default_table_acl = self.default_table_acl.clone();
             self.dirty_default_table_acl = false;
+        }
+        if self.dirty_schema {
+            catalog.public_schema_exists = self.public_schema_exists;
+            catalog.public_schema_implicit = self.public_schema_implicit;
+            self.dirty_schema = false;
         }
         catalog.next_relation_oid = catalog.next_relation_oid.max(self.next_relation_oid);
         if self.dirty_indexes {
@@ -7101,12 +7121,6 @@ fn execute_statement(
     if is_pg_dump_session_set_statement(&canonical) {
         return write_command_complete(stream, "SET");
     }
-    if canonical == "create schema public" {
-        return write_command_complete(stream, "CREATE SCHEMA");
-    }
-    if canonical == "drop schema if exists public" {
-        return write_command_complete(stream, "DROP SCHEMA");
-    }
     if canonical == "reset search_path" {
         return write_command_complete(stream, "RESET");
     }
@@ -7740,6 +7754,28 @@ fn execute_statement(
             &catalog_empty_rows(),
         );
     }
+    if canonical
+        == "select classid, objid, refobjid from pg_depend where refclassid = 'pg_extension'::regclass and deptype = 'e' order by 3"
+    {
+        return write_single_row(
+            stream,
+            &[
+                int4_column("classid"),
+                int4_column("objid"),
+                int4_column("refobjid"),
+            ],
+            &catalog_empty_rows(),
+        );
+    }
+    if canonical
+        == "select conrelid, confrelid from pg_constraint join pg_depend on (objid = confrelid) where contype = 'f' and refclassid = 'pg_extension'::regclass and classid = 'pg_class'::regclass"
+    {
+        return write_single_row(
+            stream,
+            &[int4_column("conrelid"), int4_column("confrelid")],
+            &catalog_empty_rows(),
+        );
+    }
     if canonical.starts_with("select classid, objid, refclassid, refobjid, deptype from pg_depend")
     {
         return write_single_row(
@@ -7844,7 +7880,102 @@ fn execute_statement(
         }
         Err(_) => {}
         Ok(command) => match command {
+            Command::CreateSchema(create) => {
+                if create.name != "public" {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "0A000",
+                            message: "only the public schema is supported",
+                            position: None,
+                        },
+                    );
+                }
+                if session.public_schema_exists
+                    && !create.if_not_exists
+                    && !session.public_schema_implicit
+                {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "42P06",
+                            message: "schema \"public\" already exists",
+                            position: None,
+                        },
+                    );
+                }
+                session.public_schema_exists = true;
+                session.public_schema_implicit = false;
+                session.mark_schema_dirty();
+                session.persist_catalog_snapshot();
+                return write_command_complete(stream, "CREATE SCHEMA");
+            }
+            Command::DropSchema(drop) => {
+                if drop.name != "public" {
+                    if drop.if_exists {
+                        return write_command_complete(stream, "DROP SCHEMA");
+                    }
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "3F000",
+                            message: "schema does not exist",
+                            position: None,
+                        },
+                    );
+                }
+                if !session.public_schema_exists {
+                    if drop.if_exists {
+                        return write_command_complete(stream, "DROP SCHEMA");
+                    }
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "3F000",
+                            message: "schema does not exist",
+                            position: None,
+                        },
+                    );
+                }
+                if !session.tables.is_empty()
+                    || !session.views.is_empty()
+                    || !session.materialized_views.is_empty()
+                    || !session.sequences.is_empty()
+                    || !session.domains.is_empty()
+                    || !session.publications.is_empty()
+                    || !session.subscriptions.is_empty()
+                {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "2BP01",
+                            message: "cannot drop non-empty schema \"public\"",
+                            position: None,
+                        },
+                    );
+                }
+                session.public_schema_exists = false;
+                session.public_schema_implicit = false;
+                let target = CatalogCommentTarget::Schema {
+                    schema: "public".to_string(),
+                };
+                session.comments.remove(&target);
+                session.mark_schema_dirty();
+                session.mark_comment_dirty(target);
+                session.persist_catalog_snapshot();
+                return write_command_complete(stream, "DROP SCHEMA");
+            }
             Command::CreateTable(create) => {
+                if !session.public_schema_exists {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "3F000",
+                            message: "schema does not exist",
+                            position: None,
+                        },
+                    );
+                }
                 if session.tables.contains_key(&create.table)
                     || session.views.contains_key(&create.table)
                     || session.materialized_views.contains_key(&create.table)
@@ -10486,7 +10617,7 @@ fn execute_statement(
         return write_single_row(
             stream,
             &[text_column("Name"), text_column("Owner")],
-            &catalog_psql_describe_schema_rows(),
+            &catalog_psql_describe_schema_rows(session),
         );
     }
     if psql_describe_schemas_verbose_catalog_query_public_filter(&canonical) {
@@ -10519,7 +10650,7 @@ fn execute_statement(
         return write_single_row(
             stream,
             &[int4_column("oid"), text_column("nspname")],
-            &pg_catalog_namespace_rows(),
+            &pg_catalog_namespace_rows(session),
         );
     }
     if canonical
@@ -11251,7 +11382,7 @@ fn execute_statement(
         return write_single_row(
             stream,
             &[text_column("schema_name"), text_column("schema_owner")],
-            &information_schema_schemata_rows(),
+            &information_schema_schemata_rows(session),
         );
     }
     if canonical == information_schema_table_constraints_query() {
@@ -12503,7 +12634,10 @@ fn psql_relname_pattern_matches(pattern: &str, table_name: &str) -> bool {
     table_name == pattern
 }
 
-fn catalog_psql_describe_schema_rows() -> Vec<Vec<Option<String>>> {
+fn catalog_psql_describe_schema_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    if !session.public_schema_exists {
+        return Vec::new();
+    }
     vec![vec![
         Some("public".to_string()),
         Some("postgres".to_string()),
@@ -12511,6 +12645,9 @@ fn catalog_psql_describe_schema_rows() -> Vec<Vec<Option<String>>> {
 }
 
 fn catalog_psql_describe_schema_verbose_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    if !session.public_schema_exists {
+        return Vec::new();
+    }
     vec![vec![
         Some("public".to_string()),
         Some("postgres".to_string()),
@@ -12528,7 +12665,10 @@ fn pg_catalog_namespace_query() -> &'static str {
     "select oid, nspname from pg_catalog.pg_namespace where nspname = 'public' order by oid"
 }
 
-fn pg_catalog_namespace_rows() -> Vec<Vec<Option<String>>> {
+fn pg_catalog_namespace_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    if !session.public_schema_exists {
+        return Vec::new();
+    }
     vec![vec![
         Some(PUBLIC_NAMESPACE_OID.to_string()),
         Some("public".to_string()),
@@ -12540,6 +12680,9 @@ fn pg_catalog_schema_description_query() -> &'static str {
 }
 
 fn pg_catalog_schema_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    if !session.public_schema_exists {
+        return Vec::new();
+    }
     vec![vec![
         Some("public".to_string()),
         session
@@ -15230,7 +15373,10 @@ fn information_schema_schemata_query() -> &'static str {
     "select schema_name, schema_owner from information_schema.schemata where schema_name = 'public' order by schema_name"
 }
 
-fn information_schema_schemata_rows() -> Vec<Vec<Option<String>>> {
+fn information_schema_schemata_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    if !session.public_schema_exists {
+        return Vec::new();
+    }
     vec![vec![
         Some("public".to_string()),
         Some("postgres".to_string()),
@@ -20413,7 +20559,7 @@ mod tests {
             "select pg_catalog.pg_get_userbyid(d.defaclrole) as \"owner\", n.nspname as \"schema\", case d.defaclobjtype when 'r' then 'table' when 's' then 'sequence' when 'f' then 'function' when 't' then 'type' when 'n' then 'schema' end as \"type\", pg_catalog.array_to_string(d.defaclacl, e'\\n') as \"access privileges\" from pg_catalog.pg_default_acl d left join pg_catalog.pg_namespace n on n.oid = d.defaclnamespace order by 1, 2, 3"
         );
         assert_eq!(
-            catalog_psql_describe_schema_rows(),
+            catalog_psql_describe_schema_rows(&Session::default()),
             vec![vec![
                 Some("public".to_string()),
                 Some("postgres".to_string())
@@ -21332,7 +21478,7 @@ mod tests {
             "select schema_name, schema_owner from information_schema.schemata where schema_name = 'public' order by schema_name"
         );
         assert_eq!(
-            information_schema_schemata_rows(),
+            information_schema_schemata_rows(&Session::default()),
             vec![vec![
                 Some("public".to_string()),
                 Some("postgres".to_string())
@@ -21343,7 +21489,7 @@ mod tests {
             "select oid, nspname from pg_catalog.pg_namespace where nspname = 'public' order by oid"
         );
         assert_eq!(
-            pg_catalog_namespace_rows(),
+            pg_catalog_namespace_rows(&Session::default()),
             vec![vec![
                 Some(PUBLIC_NAMESPACE_OID.to_string()),
                 Some("public".to_string())

@@ -9,6 +9,8 @@ pub enum Command {
     SetKv { key: String, value: String },
     DeleteKv { key: String },
     GetKv { key: String },
+    CreateSchema(CreateSchema),
+    DropSchema(DropSchema),
     CreateTable(CreateTable),
     AddPrimaryKey(AddPrimaryKey),
     AddUniqueConstraint(AddUniqueConstraint),
@@ -54,6 +56,18 @@ pub enum Command {
     Delete(Delete),
     Update(Update),
     Select(Select),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateSchema {
+    pub name: String,
+    pub if_not_exists: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropSchema {
+    pub name: String,
+    pub if_exists: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1903,6 +1917,9 @@ fn parse_relational_command(input: &str) -> Option<Result<Command, ParseError>> 
         if second.eq_ignore_ascii_case("TABLE") {
             return Some(parse_create_table(input).map(Command::CreateTable));
         }
+        if second.eq_ignore_ascii_case("SCHEMA") {
+            return Some(parse_create_schema(input).map(Command::CreateSchema));
+        }
         if second.eq_ignore_ascii_case("INDEX") || second.eq_ignore_ascii_case("UNIQUE") {
             return Some(parse_create_index(input).map(Command::CreateIndex));
         }
@@ -1942,6 +1959,9 @@ fn parse_relational_command(input: &str) -> Option<Result<Command, ParseError>> 
         let second = input.split_whitespace().nth(1)?;
         if second.eq_ignore_ascii_case("TABLE") {
             return Some(parse_drop_table(input).map(Command::DropTable));
+        }
+        if second.eq_ignore_ascii_case("SCHEMA") {
+            return Some(parse_drop_schema(input).map(Command::DropSchema));
         }
         if second.eq_ignore_ascii_case("INDEX") {
             return Some(parse_drop_index(input).map(Command::DropIndex));
@@ -2803,6 +2823,62 @@ fn parse_single_constraint_column(rest: &str) -> Result<String, ParseError> {
         return Err(ParseError::InvalidRelationalSql);
     };
     normalize_identifier(column.trim())
+}
+
+fn parse_create_schema(input: &str) -> Result<CreateSchema, ParseError> {
+    let mut rest = strip_keyword_prefix_case_insensitive(input, "CREATE")
+        .and_then(|s| strip_keyword_prefix_case_insensitive(s.trim_start(), "SCHEMA"))
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    let if_not_exists = if let Some(after_if) = strip_keyword_prefix_case_insensitive(rest, "IF") {
+        let after_not = strip_keyword_prefix_case_insensitive(after_if.trim_start(), "NOT")
+            .ok_or(ParseError::InvalidRelationalSql)?;
+        let after_exists = strip_keyword_prefix_case_insensitive(after_not.trim_start(), "EXISTS")
+            .ok_or(ParseError::InvalidRelationalSql)?;
+        rest = after_exists.trim_start();
+        true
+    } else {
+        false
+    };
+    if rest.is_empty()
+        || find_keyword_outside_quotes(rest, "AUTHORIZATION").is_some()
+        || find_keyword_outside_quotes(rest, "CREATE").is_some()
+    {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    Ok(CreateSchema {
+        name: normalize_identifier(rest)?,
+        if_not_exists,
+    })
+}
+
+fn parse_drop_schema(input: &str) -> Result<DropSchema, ParseError> {
+    let mut rest = strip_keyword_prefix_case_insensitive(input, "DROP")
+        .and_then(|s| strip_keyword_prefix_case_insensitive(s.trim_start(), "SCHEMA"))
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    let if_exists = if let Some(after_if) = strip_keyword_prefix_case_insensitive(rest, "IF") {
+        let after_exists = strip_keyword_prefix_case_insensitive(after_if.trim_start(), "EXISTS")
+            .ok_or(ParseError::InvalidRelationalSql)?;
+        rest = after_exists.trim_start();
+        true
+    } else {
+        false
+    };
+    if rest.is_empty()
+        || find_keyword_outside_quotes(rest, "CASCADE").is_some()
+        || find_keyword_outside_quotes(rest, "RESTRICT").is_some()
+    {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let schemas = split_csv(rest)?;
+    let [schema] = schemas.as_slice() else {
+        return Err(ParseError::InvalidRelationalSql);
+    };
+    Ok(DropSchema {
+        name: normalize_identifier(schema.trim())?,
+        if_exists,
+    })
 }
 
 fn parse_create_table(input: &str) -> Result<CreateTable, ParseError> {
@@ -11812,6 +11888,21 @@ default: Some(ColumnDefault::SequenceNextVal {
                 if_exists: true,
             })
         );
+        assert_eq!(
+            parse_command("CREATE SCHEMA IF NOT EXISTS public").unwrap(),
+            Command::CreateSchema(CreateSchema {
+                name: "public".to_string(),
+                if_not_exists: true,
+            })
+        );
+        assert_eq!(
+            parse_command("DROP SCHEMA IF EXISTS public").unwrap(),
+            Command::DropSchema(DropSchema {
+                name: "public".to_string(),
+                if_exists: true,
+            })
+        );
+        assert!(parse_command("DROP SCHEMA public CASCADE").is_err());
         assert_eq!(
             parse_command("DROP VIEW public.a, public.b").unwrap(),
             Command::DropView(DropView {

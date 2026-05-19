@@ -21,12 +21,13 @@ use gpu_db_planner::{ExecutionPlan, Planner, PlannerConfig};
 use gpu_db_protocol::{
     parse_command, AddCheckConstraint, AddForeignKey, AddUniqueConstraint, ColumnDef,
     ColumnDefault, Command, CommentTarget, CreateDomain, CreateIndex, CreateMaterializedView,
-    CreatePublication, CreateSequence, CreateSubscription, CreateTable, CreateView, Delete,
-    DropConstraint, DropDomain, DropIndex, DropMaterializedView, DropPublication, DropSequence,
-    DropSubscription, DropTable, DropView, Insert, ParseError, PublicationTarget,
-    RefreshMaterializedView, RenameColumn, RenameConstraint, RenameIndex, RenameMaterializedView,
-    RenameSequence, RenameTable, RenameView, Select, SelectFilterOp, SelectProjection,
-    SequenceNextVal, SequenceSetVal, SqlType, SqlValue, TablePrivilege, TruncateTable, Update,
+    CreatePublication, CreateSchema, CreateSequence, CreateSubscription, CreateTable, CreateView,
+    Delete, DropConstraint, DropDomain, DropIndex, DropMaterializedView, DropPublication,
+    DropSchema, DropSequence, DropSubscription, DropTable, DropView, Insert, ParseError,
+    PublicationTarget, RefreshMaterializedView, RenameColumn, RenameConstraint, RenameIndex,
+    RenameMaterializedView, RenameSequence, RenameTable, RenameView, Select, SelectFilterOp,
+    SelectProjection, SequenceNextVal, SequenceSetVal, SqlType, SqlValue, TablePrivilege,
+    TruncateTable, Update,
 };
 use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine};
 use gpu_db_storage::{
@@ -76,6 +77,8 @@ impl ReplicatedStateMachine for KvStateMachine {
                     | Command::Flush
                     | Command::ResetAll
                     | Command::GetKv { .. }
+                    | Command::CreateSchema(_)
+                    | Command::DropSchema(_)
                     | Command::CreateTable(_)
                     | Command::AddPrimaryKey(_)
                     | Command::AddUniqueConstraint(_)
@@ -5971,6 +5974,8 @@ pub struct Engine {
     relational_domains: BTreeMap<String, RelationalDomain>,
     relational_publications: BTreeMap<String, RelationalPublication>,
     relational_subscriptions: BTreeMap<String, RelationalSubscription>,
+    relational_public_schema_exists: bool,
+    relational_public_schema_implicit: bool,
     relational_default_table_acl: BTreeMap<String, BTreeSet<TablePrivilege>>,
     relational_comments: BTreeMap<RelationalCommentTarget, String>,
     relational_value_index: BTreeMap<RelationalIndexKey, Vec<String>>,
@@ -7417,6 +7422,8 @@ impl Engine {
             relational_domains: BTreeMap::new(),
             relational_publications: BTreeMap::new(),
             relational_subscriptions: BTreeMap::new(),
+            relational_public_schema_exists: true,
+            relational_public_schema_implicit: true,
             relational_default_table_acl: BTreeMap::new(),
             relational_comments: BTreeMap::new(),
             relational_value_index: BTreeMap::new(),
@@ -7655,6 +7662,8 @@ impl Engine {
                         .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
                 }
             }
+            Command::CreateSchema(create) => self.apply_create_schema(create)?,
+            Command::DropSchema(drop) => self.apply_drop_schema(drop)?,
             Command::CreateTable(create) => self.apply_create_table(create)?,
             Command::AddPrimaryKey(add) => self.apply_add_primary_key(add)?,
             Command::AddUniqueConstraint(add) => self.apply_add_unique_constraint(add)?,
@@ -8080,7 +8089,73 @@ impl Engine {
         Ok(setval.value)
     }
 
+    fn apply_create_schema(&mut self, create: CreateSchema) -> Result<(), EngineError> {
+        if create.name != PUBLIC_SCHEMA_NAME {
+            return Err(EngineError::ApplyFailed(format!(
+                "schema \"{}\" is not supported",
+                create.name
+            )));
+        }
+        if self.relational_public_schema_exists
+            && !create.if_not_exists
+            && !self.relational_public_schema_implicit
+        {
+            return Err(EngineError::ApplyFailed(format!(
+                "schema \"{}\" already exists",
+                create.name
+            )));
+        }
+        self.relational_public_schema_exists = true;
+        self.relational_public_schema_implicit = false;
+        Ok(())
+    }
+
+    fn apply_drop_schema(&mut self, drop: DropSchema) -> Result<(), EngineError> {
+        if drop.name != PUBLIC_SCHEMA_NAME {
+            if drop.if_exists {
+                return Ok(());
+            }
+            return Err(EngineError::ApplyFailed(format!(
+                "schema \"{}\" does not exist",
+                drop.name
+            )));
+        }
+        if !self.relational_public_schema_exists {
+            if drop.if_exists {
+                return Ok(());
+            }
+            return Err(EngineError::ApplyFailed(format!(
+                "schema \"{}\" does not exist",
+                drop.name
+            )));
+        }
+        if !self.relational_catalog.is_empty()
+            || !self.relational_views.is_empty()
+            || !self.relational_materialized_views.is_empty()
+            || !self.relational_sequences.is_empty()
+            || !self.relational_domains.is_empty()
+            || !self.relational_publications.is_empty()
+            || !self.relational_subscriptions.is_empty()
+        {
+            return Err(EngineError::ApplyFailed(format!(
+                "cannot drop non-empty schema \"{}\"",
+                drop.name
+            )));
+        }
+        self.relational_public_schema_exists = false;
+        self.relational_public_schema_implicit = false;
+        self.relational_comments
+            .remove(&RelationalCommentTarget::Schema { schema: drop.name });
+        Ok(())
+    }
+
     fn apply_create_table(&mut self, create: CreateTable) -> Result<(), EngineError> {
+        if !self.relational_public_schema_exists {
+            return Err(EngineError::ApplyFailed(format!(
+                "schema \"{}\" does not exist",
+                PUBLIC_SCHEMA_NAME
+            )));
+        }
         if self.relational_catalog.contains_key(&create.table)
             || self.relational_views.contains_key(&create.table)
             || self
@@ -10757,7 +10832,61 @@ impl Engine {
         txn_id: TxnId,
     ) -> Result<(), EngineError> {
         match cmd {
+            Command::CreateSchema(create) => {
+                if create.name != PUBLIC_SCHEMA_NAME {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "schema \"{}\" is not supported",
+                        create.name
+                    )));
+                }
+                if self.relational_public_schema_exists
+                    && !create.if_not_exists
+                    && !self.relational_public_schema_implicit
+                {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "schema \"{}\" already exists",
+                        create.name
+                    )));
+                }
+            }
+            Command::DropSchema(drop) => {
+                if drop.name != PUBLIC_SCHEMA_NAME {
+                    if !drop.if_exists {
+                        return Err(EngineError::ApplyFailed(format!(
+                            "schema \"{}\" does not exist",
+                            drop.name
+                        )));
+                    }
+                    return Ok(());
+                }
+                if !self.relational_public_schema_exists && !drop.if_exists {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "schema \"{}\" does not exist",
+                        drop.name
+                    )));
+                }
+                if self.relational_public_schema_exists
+                    && (!self.relational_catalog.is_empty()
+                        || !self.relational_views.is_empty()
+                        || !self.relational_materialized_views.is_empty()
+                        || !self.relational_sequences.is_empty()
+                        || !self.relational_domains.is_empty()
+                        || !self.relational_publications.is_empty()
+                        || !self.relational_subscriptions.is_empty())
+                {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "cannot drop non-empty schema \"{}\"",
+                        drop.name
+                    )));
+                }
+            }
             Command::CreateTable(create) => {
+                if !self.relational_public_schema_exists {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "schema \"{}\" does not exist",
+                        PUBLIC_SCHEMA_NAME
+                    )));
+                }
                 let mut implicit_sequences = BTreeSet::new();
                 for column in &create.columns {
                     if let Some(domain_name) = column.domain.as_ref() {
@@ -11598,6 +11727,8 @@ impl Engine {
         match cmd {
             Command::SetKv { .. }
             | Command::DeleteKv { .. }
+            | Command::CreateSchema(_)
+            | Command::DropSchema(_)
             | Command::CreateTable(_)
             | Command::AddPrimaryKey(_)
             | Command::AddUniqueConstraint(_)
@@ -11823,6 +11954,8 @@ impl Engine {
         match cmd {
             Command::SetKv { .. }
             | Command::DeleteKv { .. }
+            | Command::CreateSchema(_)
+            | Command::DropSchema(_)
             | Command::CreateTable(_)
             | Command::AddPrimaryKey(_)
             | Command::AddUniqueConstraint(_)
@@ -11949,6 +12082,8 @@ impl Engine {
             Command::ResetAll => Err(ExecuteError::NonReadCommand("RESET ALL")),
             Command::SetKv { .. } => Err(ExecuteError::NonReadCommand("SET")),
             Command::DeleteKv { .. } => Err(ExecuteError::NonReadCommand("DEL/DELETE")),
+            Command::CreateSchema(_) => Err(ExecuteError::NonReadCommand("CREATE SCHEMA")),
+            Command::DropSchema(_) => Err(ExecuteError::NonReadCommand("DROP SCHEMA")),
             Command::CreateTable(_) => Err(ExecuteError::NonReadCommand("CREATE TABLE")),
             Command::AddPrimaryKey(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
             Command::AddUniqueConstraint(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
@@ -37454,6 +37589,60 @@ mod tests {
             missing.contains("domain \"missing_domain\" does not exist"),
             "{missing}"
         );
+    }
+
+    #[test]
+    fn relational_catalog_records_bounded_public_schema_lifecycle() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "COMMENT ON SCHEMA public IS 'application schema'")
+            .unwrap();
+        let non_empty = e
+            .execute_text(2, "CREATE TABLE people (id INT, name TEXT)")
+            .and_then(|_| e.execute_text(3, "DROP SCHEMA IF EXISTS public"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            non_empty.contains("cannot drop non-empty schema \"public\""),
+            "{non_empty}"
+        );
+        assert!(e.relational_public_schema_exists);
+        assert_eq!(
+            e.relational_schema_comment("public"),
+            Some("application schema")
+        );
+
+        e.execute_text(4, "DROP TABLE people").unwrap();
+        e.execute_text(5, "DROP SCHEMA IF EXISTS public").unwrap();
+        assert!(!e.relational_public_schema_exists);
+        assert_eq!(e.relational_schema_comment("public"), None);
+
+        let missing_schema = e
+            .execute_text(6, "CREATE TABLE blocked (id INT)")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            missing_schema.contains("schema \"public\" does not exist"),
+            "{missing_schema}"
+        );
+
+        e.execute_text(7, "CREATE SCHEMA public").unwrap();
+        e.execute_text(8, "CREATE SCHEMA IF NOT EXISTS public")
+            .unwrap();
+        let duplicate = e
+            .execute_text(9, "CREATE SCHEMA public")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            duplicate.contains("schema \"public\" already exists"),
+            "{duplicate}"
+        );
+        e.execute_text(10, "CREATE TABLE recreated (id INT)")
+            .unwrap();
+
+        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        assert!(recovered.relational_public_schema_exists);
+        assert!(recovered.relational_catalog_table("recreated").is_some());
+        assert_eq!(recovered.relational_schema_comment("public"), None);
     }
 
     #[test]

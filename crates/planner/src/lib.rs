@@ -59,6 +59,8 @@ impl Planner {
                 kind: PlanKind::Mutation,
             },
             Command::CreateTable(_)
+            | Command::CreateSchema(_)
+            | Command::DropSchema(_)
             | Command::AddPrimaryKey(_)
             | Command::AddUniqueConstraint(_)
             | Command::AddCheckConstraint(_)
