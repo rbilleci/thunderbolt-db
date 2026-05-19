@@ -326,6 +326,35 @@ fn execute_select_result(
             }
             return execute_select_result(session, &view.query);
         }
+        if let Some(view) = session.materialized_views.get(&select.table) {
+            if !select_is_plain_view_scan(select) {
+                return Err(ErrorField {
+                    code: "0A000",
+                    message:
+                        "only plain SELECT * FROM materialized view is supported for materialized views",
+                    position: None,
+                });
+            }
+            return Ok(SelectResult {
+                columns: view
+                    .columns
+                    .iter()
+                    .map(|column| match column.def.ty {
+                        gpu_db_protocol::SqlType::Int4 => int4_column(&column.def.name),
+                        gpu_db_protocol::SqlType::Text => text_column(&column.def.name),
+                    })
+                    .collect(),
+                rows: view
+                    .rows
+                    .iter()
+                    .map(|row| {
+                        row.iter()
+                            .map(|value| Some(format_sql_value(value)))
+                            .collect()
+                    })
+                    .collect(),
+            });
+        }
         return Err(ErrorField {
             code: "42P01",
             message: "relation does not exist",
@@ -1201,6 +1230,25 @@ fn format_sql_value(value: &SqlValue) -> String {
     }
 }
 
+fn parse_materialized_row_value(
+    value: &str,
+    ty: gpu_db_protocol::SqlType,
+) -> Result<SqlValue, ErrorField> {
+    match ty {
+        gpu_db_protocol::SqlType::Int4 => {
+            value
+                .parse::<i32>()
+                .map(SqlValue::Int4)
+                .map_err(|_| ErrorField {
+                    code: "22P02",
+                    message: "invalid input syntax for type integer",
+                    position: None,
+                })
+        }
+        gpu_db_protocol::SqlType::Text => Ok(SqlValue::Text(value.to_string())),
+    }
+}
+
 fn index_definition_prefix(unique: bool) -> &'static str {
     if unique {
         "CREATE UNIQUE INDEX"
@@ -1254,7 +1302,10 @@ fn drop_column_from_session(
     table_name: &str,
     column_name: &str,
 ) -> Result<(), ErrorField> {
-    if session.views.contains_key(table_name) {
+    if session.views.contains_key(table_name)
+        || session.materialized_views.contains_key(table_name)
+        || session.sequences.contains_key(table_name)
+    {
         return Err(ErrorField {
             code: "42809",
             message: "relation is not a table",
@@ -1354,7 +1405,10 @@ fn rename_column_in_session(
     old_name: &str,
     new_name: &str,
 ) -> Result<(), ErrorField> {
-    if session.views.contains_key(table_name) {
+    if session.views.contains_key(table_name)
+        || session.materialized_views.contains_key(table_name)
+        || session.sequences.contains_key(table_name)
+    {
         return Err(ErrorField {
             code: "42809",
             message: "relation is not a table",
@@ -1409,7 +1463,10 @@ fn rename_constraint_in_session(
     new_name: &str,
     table_if_exists: bool,
 ) -> Result<(), ErrorField> {
-    if session.views.contains_key(table_name) {
+    if session.views.contains_key(table_name)
+        || session.materialized_views.contains_key(table_name)
+        || session.sequences.contains_key(table_name)
+    {
         return Err(ErrorField {
             code: "42809",
             message: "relation is not a table",
@@ -1426,7 +1483,12 @@ fn rename_constraint_in_session(
             position: None,
         });
     }
-    if session.indexes.iter().any(|index| index.name == new_name) {
+    if session.indexes.iter().any(|index| index.name == new_name)
+        || session.tables.contains_key(new_name)
+        || session.views.contains_key(new_name)
+        || session.materialized_views.contains_key(new_name)
+        || session.sequences.contains_key(new_name)
+    {
         return Err(ErrorField {
             code: "42P07",
             message: "relation already exists",
@@ -1483,7 +1545,12 @@ fn rename_index_in_session(
     old_name: &str,
     new_name: &str,
 ) -> Result<(), ErrorField> {
-    if session.indexes.iter().any(|index| index.name == new_name) {
+    if session.indexes.iter().any(|index| index.name == new_name)
+        || session.tables.contains_key(new_name)
+        || session.views.contains_key(new_name)
+        || session.materialized_views.contains_key(new_name)
+        || session.sequences.contains_key(new_name)
+    {
         return Err(ErrorField {
             code: "42P07",
             message: "relation already exists",
@@ -1534,7 +1601,10 @@ fn rename_sequence_in_session(
     old_name: &str,
     new_name: &str,
 ) -> Result<(), ErrorField> {
-    if session.tables.contains_key(old_name) || session.views.contains_key(old_name) {
+    if session.tables.contains_key(old_name)
+        || session.views.contains_key(old_name)
+        || session.materialized_views.contains_key(old_name)
+    {
         return Err(ErrorField {
             code: "42809",
             message: "relation is not a sequence",
@@ -1550,6 +1620,7 @@ fn rename_sequence_in_session(
     }
     if session.tables.contains_key(new_name)
         || session.views.contains_key(new_name)
+        || session.materialized_views.contains_key(new_name)
         || session.sequences.contains_key(new_name)
     {
         return Err(ErrorField {
@@ -1589,7 +1660,10 @@ fn rename_table_in_session(
     new_name: &str,
     if_exists: bool,
 ) -> Result<(), ErrorField> {
-    if session.views.contains_key(old_name) {
+    if session.views.contains_key(old_name)
+        || session.materialized_views.contains_key(old_name)
+        || session.sequences.contains_key(old_name)
+    {
         return Err(ErrorField {
             code: "42809",
             message: "relation is not a table",
@@ -1608,6 +1682,7 @@ fn rename_table_in_session(
     }
     if session.tables.contains_key(new_name)
         || session.views.contains_key(new_name)
+        || session.materialized_views.contains_key(new_name)
         || session.sequences.contains_key(new_name)
     {
         return Err(ErrorField {
@@ -1742,6 +1817,10 @@ fn add_primary_key_to_session(
         .indexes
         .iter()
         .any(|index| index.name == constraint_name)
+        || session.tables.contains_key(&constraint_name)
+        || session.views.contains_key(&constraint_name)
+        || session.materialized_views.contains_key(&constraint_name)
+        || session.sequences.contains_key(&constraint_name)
     {
         return Err(ErrorField {
             code: "42P07",
@@ -1810,6 +1889,10 @@ fn add_unique_constraint_to_session(
         .indexes
         .iter()
         .any(|index| index.name == constraint_name)
+        || session.tables.contains_key(&constraint_name)
+        || session.views.contains_key(&constraint_name)
+        || session.materialized_views.contains_key(&constraint_name)
+        || session.sequences.contains_key(&constraint_name)
     {
         return Err(ErrorField {
             code: "42P07",
@@ -1877,11 +1960,13 @@ struct Session {
     cursors: HashMap<String, Cursor>,
     tables: HashMap<String, Table>,
     views: HashMap<String, View>,
+    materialized_views: HashMap<String, MaterializedView>,
     sequences: HashMap<String, Sequence>,
     indexes: Vec<CatalogIndex>,
     comments: BTreeMap<CatalogCommentTarget, String>,
     dirty_tables: BTreeSet<String>,
     dirty_views: BTreeSet<String>,
+    dirty_materialized_views: BTreeSet<String>,
     dirty_sequences: BTreeSet<String>,
     dirty_indexes: bool,
     dirty_comment_targets: BTreeSet<CatalogCommentTarget>,
@@ -1894,6 +1979,7 @@ struct Session {
 struct SharedCatalog {
     tables: HashMap<String, Table>,
     views: HashMap<String, View>,
+    materialized_views: HashMap<String, MaterializedView>,
     sequences: HashMap<String, Sequence>,
     indexes: Vec<CatalogIndex>,
     comments: BTreeMap<CatalogCommentTarget, String>,
@@ -1905,6 +1991,7 @@ impl Default for SharedCatalog {
         Self {
             tables: HashMap::new(),
             views: HashMap::new(),
+            materialized_views: HashMap::new(),
             sequences: HashMap::new(),
             indexes: Vec::new(),
             comments: BTreeMap::new(),
@@ -1940,11 +2027,13 @@ impl Session {
             cursors: HashMap::new(),
             tables: catalog.tables,
             views: catalog.views,
+            materialized_views: catalog.materialized_views,
             sequences: catalog.sequences,
             indexes: catalog.indexes,
             comments: catalog.comments,
             dirty_tables: BTreeSet::new(),
             dirty_views: BTreeSet::new(),
+            dirty_materialized_views: BTreeSet::new(),
             dirty_sequences: BTreeSet::new(),
             dirty_indexes: false,
             dirty_comment_targets: BTreeSet::new(),
@@ -1962,6 +2051,10 @@ impl Session {
         self.dirty_views.insert(view.into());
     }
 
+    fn mark_materialized_view_dirty(&mut self, view: impl Into<String>) {
+        self.dirty_materialized_views.insert(view.into());
+    }
+
     fn mark_sequence_dirty(&mut self, sequence: impl Into<String>) {
         self.dirty_sequences.insert(sequence.into());
     }
@@ -1974,6 +2067,7 @@ impl Session {
         if !self.shared_catalog {
             self.dirty_tables.clear();
             self.dirty_views.clear();
+            self.dirty_materialized_views.clear();
             self.dirty_sequences.clear();
             self.dirty_comment_targets.clear();
             return;
@@ -1993,6 +2087,15 @@ impl Session {
                 catalog.views.insert(view_name.clone(), view.clone());
             } else {
                 catalog.views.remove(view_name);
+            }
+        }
+        for view_name in &self.dirty_materialized_views {
+            if let Some(view) = self.materialized_views.get(view_name) {
+                catalog
+                    .materialized_views
+                    .insert(view_name.clone(), view.clone());
+            } else {
+                catalog.materialized_views.remove(view_name);
             }
         }
         for sequence_name in &self.dirty_sequences {
@@ -2048,6 +2151,7 @@ impl Session {
         self.dirty_comment_targets.clear();
         self.dirty_tables.clear();
         self.dirty_views.clear();
+        self.dirty_materialized_views.clear();
         self.dirty_sequences.clear();
     }
 
@@ -2098,6 +2202,16 @@ struct View {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+struct MaterializedView {
+    oid: u32,
+    name: String,
+    query: gpu_db_protocol::Select,
+    definition: String,
+    columns: Vec<CatalogColumn>,
+    rows: Vec<Vec<SqlValue>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Sequence {
     oid: u32,
     name: String,
@@ -2129,6 +2243,7 @@ enum CatalogCommentTarget {
     Column { table: String, attnum: i16 },
     Index { index: String },
     View { view: String },
+    MaterializedView { materialized_view: String },
     Sequence { sequence: String },
     Constraint { table: String, constraint: String },
 }
@@ -5915,7 +6030,10 @@ fn execute_statement(
         return write_command_complete(stream, "LOCK TABLE");
     }
     if let Some(table_name) = parse_truncate_table(statement) {
-        if session.views.contains_key(&table_name) {
+        if session.views.contains_key(&table_name)
+            || session.materialized_views.contains_key(&table_name)
+            || session.sequences.contains_key(&table_name)
+        {
             return write_error(
                 stream,
                 &ErrorField {
@@ -5953,7 +6071,10 @@ fn execute_statement(
                     },
                 );
             }
-            if session.views.contains_key(table) {
+            if session.views.contains_key(table)
+                || session.materialized_views.contains_key(table)
+                || session.sequences.contains_key(table)
+            {
                 return write_error(
                     stream,
                     &ErrorField {
@@ -6003,6 +6124,7 @@ fn execute_statement(
                 | CatalogCommentTarget::Schema { .. }
                 | CatalogCommentTarget::Tablespace { .. }
                 | CatalogCommentTarget::View { .. }
+                | CatalogCommentTarget::MaterializedView { .. }
                 | CatalogCommentTarget::Sequence { .. } => false,
             })
             .cloned()
@@ -6448,6 +6570,7 @@ fn execute_statement(
             Command::CreateTable(create) => {
                 if session.tables.contains_key(&create.table)
                     || session.views.contains_key(&create.table)
+                    || session.materialized_views.contains_key(&create.table)
                     || session.sequences.contains_key(&create.table)
                 {
                     return write_error(
@@ -6635,6 +6758,7 @@ fn execute_statement(
                     .any(|index| index.name == create.name)
                     || session.tables.contains_key(&create.name)
                     || session.views.contains_key(&create.name)
+                    || session.materialized_views.contains_key(&create.name)
                     || session.sequences.contains_key(&create.name)
                 {
                     return write_error(
@@ -6706,6 +6830,7 @@ fn execute_statement(
             }
             Command::CreateView(create) => {
                 if session.tables.contains_key(&create.name)
+                    || session.materialized_views.contains_key(&create.name)
                     || session.sequences.contains_key(&create.name)
                     || (!create.or_replace && session.views.contains_key(&create.name))
                 {
@@ -6724,6 +6849,16 @@ fn execute_statement(
                         &ErrorField {
                             code: "0A000",
                             message: "views over views are unsupported",
+                            position: None,
+                        },
+                    );
+                }
+                if session.materialized_views.contains_key(&create.query.table) {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "0A000",
+                            message: "views over materialized views are unsupported",
                             position: None,
                         },
                     );
@@ -6764,6 +6899,125 @@ fn execute_statement(
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, "CREATE VIEW");
             }
+            Command::CreateMaterializedView(create) => {
+                if session.tables.contains_key(&create.name)
+                    || session.views.contains_key(&create.name)
+                    || session.materialized_views.contains_key(&create.name)
+                    || session.sequences.contains_key(&create.name)
+                {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "42P07",
+                            message: "relation already exists",
+                            position: None,
+                        },
+                    );
+                }
+                if session.views.contains_key(&create.query.table)
+                    || session.materialized_views.contains_key(&create.query.table)
+                {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "0A000",
+                            message: "materialized views over views are unsupported",
+                            position: None,
+                        },
+                    );
+                }
+                let result = match execute_select_result(session, &create.query) {
+                    Ok(result) => result,
+                    Err(error) => return write_error(stream, &error),
+                };
+                let oid = session.next_relation_oid;
+                session.next_relation_oid = match session.next_relation_oid.checked_add(1) {
+                    Some(next) => next,
+                    None => {
+                        return write_error(
+                            stream,
+                            &ErrorField {
+                                code: "54000",
+                                message: "relation OID allocation exhausted",
+                                position: None,
+                            },
+                        );
+                    }
+                };
+                let result_rows = result.rows;
+                let columns = result
+                    .columns
+                    .into_iter()
+                    .enumerate()
+                    .map(|(idx, column)| {
+                        Ok(CatalogColumn {
+                            attnum: i16::try_from(idx + 1).map_err(|_| ErrorField {
+                                code: "54000",
+                                message: "too many columns for bootstrap catalog",
+                                position: None,
+                            })?,
+                            def: gpu_db_protocol::ColumnDef {
+                                name: column.name,
+                                ty: match column.oid {
+                                    23 => gpu_db_protocol::SqlType::Int4,
+                                    25 => gpu_db_protocol::SqlType::Text,
+                                    _ => {
+                                        return Err(ErrorField {
+                                            code: "0A000",
+                                            message: "materialized view column type is unsupported",
+                                            position: None,
+                                        })
+                                    }
+                                },
+                                default: None,
+                            },
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>();
+                let columns = match columns {
+                    Ok(columns) => columns,
+                    Err(error) => return write_error(stream, &error),
+                };
+                let column_types = columns
+                    .iter()
+                    .map(|column| column.def.ty)
+                    .collect::<Vec<_>>();
+                let rows = result_rows
+                    .into_iter()
+                    .map(|row| {
+                        row.into_iter()
+                            .zip(column_types.iter().copied())
+                            .map(|(value, ty)| match value {
+                                Some(value) => parse_materialized_row_value(&value, ty),
+                                None => Err(ErrorField {
+                                    code: "0A000",
+                                    message: "NULL materialized view rows are unsupported",
+                                    position: None,
+                                }),
+                            })
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .collect::<Result<Vec<_>, _>>();
+                let rows = match rows {
+                    Ok(rows) => rows,
+                    Err(error) => return write_error(stream, &error),
+                };
+                let name = create.name;
+                session.materialized_views.insert(
+                    name.clone(),
+                    MaterializedView {
+                        oid,
+                        name: name.clone(),
+                        query: create.query,
+                        definition: create.definition,
+                        columns,
+                        rows,
+                    },
+                );
+                session.mark_materialized_view_dirty(name);
+                session.persist_catalog_snapshot();
+                return write_command_complete(stream, "SELECT 0");
+            }
             Command::RenameView(rename) => {
                 if session.tables.contains_key(&rename.old_name) {
                     return write_error(
@@ -6787,6 +7041,7 @@ fn execute_statement(
                 }
                 if session.tables.contains_key(&rename.new_name)
                     || session.views.contains_key(&rename.new_name)
+                    || session.materialized_views.contains_key(&rename.new_name)
                     || session.sequences.contains_key(&rename.new_name)
                 {
                     return write_error(
@@ -6820,9 +7075,72 @@ fn execute_statement(
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, "ALTER VIEW");
             }
+            Command::RenameMaterializedView(rename) => {
+                if session.tables.contains_key(&rename.old_name)
+                    || session.views.contains_key(&rename.old_name)
+                    || session.sequences.contains_key(&rename.old_name)
+                {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "42809",
+                            message: "relation is not a materialized view",
+                            position: None,
+                        },
+                    );
+                }
+                if !session.materialized_views.contains_key(&rename.old_name) {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "42P01",
+                            message: "materialized view does not exist",
+                            position: None,
+                        },
+                    );
+                }
+                if session.tables.contains_key(&rename.new_name)
+                    || session.views.contains_key(&rename.new_name)
+                    || session.materialized_views.contains_key(&rename.new_name)
+                    || session.sequences.contains_key(&rename.new_name)
+                {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "42P07",
+                            message: "relation already exists",
+                            position: None,
+                        },
+                    );
+                }
+                let mut view = session
+                    .materialized_views
+                    .remove(&rename.old_name)
+                    .expect("materialized view existence validated");
+                view.name = rename.new_name.clone();
+                session
+                    .materialized_views
+                    .insert(rename.new_name.clone(), view);
+                session.mark_materialized_view_dirty(rename.old_name.clone());
+                session.mark_materialized_view_dirty(rename.new_name.clone());
+                let old_target = CatalogCommentTarget::MaterializedView {
+                    materialized_view: rename.old_name,
+                };
+                if let Some(comment) = session.comments.remove(&old_target) {
+                    session.mark_comment_dirty(old_target);
+                    let new_target = CatalogCommentTarget::MaterializedView {
+                        materialized_view: rename.new_name,
+                    };
+                    session.comments.insert(new_target.clone(), comment);
+                    session.mark_comment_dirty(new_target);
+                }
+                session.persist_catalog_snapshot();
+                return write_command_complete(stream, "ALTER MATERIALIZED VIEW");
+            }
             Command::CreateSequence(create) => {
                 if session.tables.contains_key(&create.name)
                     || session.views.contains_key(&create.name)
+                    || session.materialized_views.contains_key(&create.name)
                     || session.sequences.contains_key(&create.name)
                 {
                     return write_error(
@@ -6901,6 +7219,16 @@ fn execute_statement(
                             },
                         );
                     }
+                    if session.materialized_views.contains_key(name) {
+                        return write_error(
+                            stream,
+                            &ErrorField {
+                                code: "42809",
+                                message: "relation is not a view",
+                                position: None,
+                            },
+                        );
+                    }
                     if !drop.if_exists && !session.views.contains_key(name) {
                         return write_error(
                             stream,
@@ -6923,6 +7251,56 @@ fn execute_statement(
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, "DROP VIEW");
             }
+            Command::DropMaterializedView(drop) => {
+                let mut seen = BTreeSet::new();
+                for name in &drop.names {
+                    if !seen.insert(name) {
+                        return write_error(
+                            stream,
+                            &ErrorField {
+                                code: "42710",
+                                message: "materialized view specified more than once",
+                                position: None,
+                            },
+                        );
+                    }
+                    if session.tables.contains_key(name)
+                        || session.views.contains_key(name)
+                        || session.sequences.contains_key(name)
+                    {
+                        return write_error(
+                            stream,
+                            &ErrorField {
+                                code: "42809",
+                                message: "relation is not a materialized view",
+                                position: None,
+                            },
+                        );
+                    }
+                    if !drop.if_exists && !session.materialized_views.contains_key(name) {
+                        return write_error(
+                            stream,
+                            &ErrorField {
+                                code: "42P01",
+                                message: "materialized view does not exist",
+                                position: None,
+                            },
+                        );
+                    }
+                }
+                for name in &drop.names {
+                    if session.materialized_views.remove(name).is_some() {
+                        let target = CatalogCommentTarget::MaterializedView {
+                            materialized_view: name.clone(),
+                        };
+                        session.comments.remove(&target);
+                        session.mark_comment_dirty(target);
+                    }
+                    session.mark_materialized_view_dirty(name.clone());
+                }
+                session.persist_catalog_snapshot();
+                return write_command_complete(stream, "DROP MATERIALIZED VIEW");
+            }
             Command::DropSequence(drop) => {
                 let mut seen = BTreeSet::new();
                 for name in &drop.names {
@@ -6936,7 +7314,10 @@ fn execute_statement(
                             },
                         );
                     }
-                    if session.tables.contains_key(name) || session.views.contains_key(name) {
+                    if session.tables.contains_key(name)
+                        || session.views.contains_key(name)
+                        || session.materialized_views.contains_key(name)
+                    {
                         return write_error(
                             stream,
                             &ErrorField {
@@ -6984,6 +7365,16 @@ fn execute_statement(
                         );
                     }
                     if session.views.contains_key(name) {
+                        return write_error(
+                            stream,
+                            &ErrorField {
+                                code: "42809",
+                                message: "relation is not a table",
+                                position: None,
+                            },
+                        );
+                    }
+                    if session.materialized_views.contains_key(name) {
                         return write_error(
                             stream,
                             &ErrorField {
@@ -7047,6 +7438,7 @@ fn execute_statement(
                         | CatalogCommentTarget::Schema { .. }
                         | CatalogCommentTarget::Tablespace { .. }
                         | CatalogCommentTarget::View { .. }
+                        | CatalogCommentTarget::MaterializedView { .. }
                         | CatalogCommentTarget::Sequence { .. } => false,
                     })
                     .cloned()
@@ -7102,6 +7494,7 @@ fn execute_statement(
                             | CatalogCommentTarget::Column { .. }
                             | CatalogCommentTarget::Index { .. }
                             | CatalogCommentTarget::View { .. }
+                            | CatalogCommentTarget::MaterializedView { .. }
                             | CatalogCommentTarget::Sequence { .. } => false,
                         })
                         .cloned()
@@ -7115,6 +7508,19 @@ fn execute_statement(
                 return write_command_complete(stream, "DROP INDEX");
             }
             Command::AlterColumnDefault(alter) => {
+                if session.views.contains_key(&alter.table)
+                    || session.materialized_views.contains_key(&alter.table)
+                    || session.sequences.contains_key(&alter.table)
+                {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "42809",
+                            message: "relation is not a table",
+                            position: None,
+                        },
+                    );
+                }
                 let Some(table) = session.tables.get_mut(&alter.table) else {
                     return write_error(
                         stream,
@@ -7161,7 +7567,10 @@ fn execute_statement(
                 return write_command_complete(stream, "ALTER TABLE");
             }
             Command::AddColumn(add) => {
-                if session.views.contains_key(&add.table) {
+                if session.views.contains_key(&add.table)
+                    || session.materialized_views.contains_key(&add.table)
+                    || session.sequences.contains_key(&add.table)
+                {
                     return write_error(
                         stream,
                         &ErrorField {
@@ -7399,6 +7808,33 @@ fn execute_statement(
                             );
                         }
                         CatalogCommentTarget::View { view }
+                    }
+                    CommentTarget::MaterializedView { materialized_view } => {
+                        let exists = session.materialized_views.contains_key(&materialized_view);
+                        if !exists {
+                            if session.tables.contains_key(&materialized_view)
+                                || session.views.contains_key(&materialized_view)
+                                || session.sequences.contains_key(&materialized_view)
+                            {
+                                return write_error(
+                                    stream,
+                                    &ErrorField {
+                                        code: "42809",
+                                        message: "relation is not a materialized view",
+                                        position: None,
+                                    },
+                                );
+                            }
+                            return write_error(
+                                stream,
+                                &ErrorField {
+                                    code: "42P01",
+                                    message: "materialized view does not exist",
+                                    position: None,
+                                },
+                            );
+                        }
+                        CatalogCommentTarget::MaterializedView { materialized_view }
                     }
                     CommentTarget::Sequence { sequence } => {
                         let exists = session.sequences.contains_key(&sequence)
@@ -7915,7 +8351,7 @@ fn execute_statement(
                 text_column("Type"),
                 text_column("Owner"),
             ],
-            &catalog_empty_rows(),
+            &psql_describe_materialized_view_rows(session),
         );
     }
     if canonical == psql_describe_materialized_views_verbose_catalog_query() {
@@ -7931,7 +8367,7 @@ fn execute_statement(
                 text_column("Size"),
                 text_column("Description"),
             ],
-            &catalog_empty_rows(),
+            &psql_describe_materialized_view_verbose_rows(session),
         );
     }
     if canonical == psql_describe_sequences_catalog_query() {
@@ -8663,6 +9099,19 @@ fn execute_statement(
             &pg_catalog_class_sequence_rows(session),
         );
     }
+    if canonical == pg_catalog_class_materialized_views_query() {
+        return write_single_row(
+            stream,
+            &[
+                int4_column("oid"),
+                text_column("nspname"),
+                text_column("relname"),
+                text_column("relkind"),
+                text_column("relpersistence"),
+            ],
+            &pg_catalog_class_materialized_view_rows(session),
+        );
+    }
     if let Some(tables) = pg_catalog_class_plain_tables_in_query_tables(&canonical) {
         return write_single_row(
             stream,
@@ -9022,6 +9471,7 @@ fn execute_statement(
     }
     if canonical == pg_catalog_descriptions_query()
         || canonical == pg_catalog_descriptions_with_sequences_query()
+        || canonical == pg_catalog_descriptions_with_materialized_views_query()
     {
         return write_single_row(
             stream,
@@ -9060,6 +9510,7 @@ fn execute_statement(
     }
     if canonical == pg_catalog_table_index_descriptions_query()
         || canonical == pg_catalog_table_index_sequence_descriptions_query()
+        || canonical == pg_catalog_table_index_sequence_matview_descriptions_query()
     {
         return write_single_row(
             stream,
@@ -11050,6 +11501,18 @@ fn catalog_describe_relation_lookup_rows(
             Some(sequence.name.clone()),
         ]);
     }
+    let mut materialized_views = session.materialized_views.values().collect::<Vec<_>>();
+    materialized_views.sort_by(|left, right| left.name.cmp(&right.name));
+    for view in materialized_views
+        .into_iter()
+        .filter(|view| psql_relname_pattern_matches(relname_pattern, &view.name))
+    {
+        rows.push(vec![
+            Some(view.oid.to_string()),
+            Some("public".to_string()),
+            Some(view.name.clone()),
+        ]);
+    }
     rows
 }
 
@@ -11073,6 +11536,15 @@ fn catalog_describe_relation_lookup_rows_for_public_namespace(
             Some(sequence.oid.to_string()),
             Some("public".to_string()),
             Some(sequence.name.clone()),
+        ]);
+    }
+    let mut materialized_views = session.materialized_views.values().collect::<Vec<_>>();
+    materialized_views.sort_by(|left, right| left.name.cmp(&right.name));
+    for view in materialized_views {
+        rows.push(vec![
+            Some(view.oid.to_string()),
+            Some("public".to_string()),
+            Some(view.name.clone()),
         ]);
     }
     rows
@@ -11114,6 +11586,29 @@ fn catalog_describe_relation_flags_rows(session: &Session, oid: u32) -> Vec<Vec<
             Some("p".to_string()),
             Some("d".to_string()),
             None,
+        ]];
+    }
+    if session
+        .materialized_views
+        .values()
+        .any(|view| view.oid == oid)
+    {
+        return vec![vec![
+            Some("0".to_string()),
+            Some("m".to_string()),
+            Some("f".to_string()),
+            Some("f".to_string()),
+            Some("f".to_string()),
+            Some("f".to_string()),
+            Some("f".to_string()),
+            Some("f".to_string()),
+            Some("f".to_string()),
+            Some(String::new()),
+            Some("0".to_string()),
+            Some(String::new()),
+            Some("p".to_string()),
+            Some("d".to_string()),
+            Some("heap".to_string()),
         ]];
     }
     let Some(table) = session.tables.values().find(|table| table.oid == oid) else {
@@ -11543,6 +12038,10 @@ fn pg_catalog_class_sequences_query() -> &'static str {
     "select c.oid, n.nspname, c.relname, c.relkind, c.relpersistence from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace where n.nspname = 'public' and c.relkind = 's' order by c.relname"
 }
 
+fn pg_catalog_class_materialized_views_query() -> &'static str {
+    "select c.oid, n.nspname, c.relname, c.relkind, c.relpersistence from pg_catalog.pg_class c join pg_catalog.pg_namespace n on n.oid = c.relnamespace where n.nspname = 'public' and c.relkind = 'm' order by c.relname"
+}
+
 fn pg_catalog_class_sequence_rows(session: &Session) -> Vec<Vec<Option<String>>> {
     let mut sequences = session.sequences.values().collect::<Vec<_>>();
     sequences.sort_by(|left, right| left.name.cmp(&right.name));
@@ -11554,6 +12053,23 @@ fn pg_catalog_class_sequence_rows(session: &Session) -> Vec<Vec<Option<String>>>
                 Some("public".to_string()),
                 Some(sequence.name.clone()),
                 Some("s".to_string()),
+                Some("p".to_string()),
+            ]
+        })
+        .collect()
+}
+
+fn pg_catalog_class_materialized_view_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut views = session.materialized_views.values().collect::<Vec<_>>();
+    views.sort_by(|left, right| left.name.cmp(&right.name));
+    views
+        .into_iter()
+        .map(|view| {
+            vec![
+                Some(view.oid.to_string()),
+                Some("public".to_string()),
+                Some(view.name.clone()),
+                Some("m".to_string()),
                 Some("p".to_string()),
             ]
         })
@@ -12112,6 +12628,49 @@ fn psql_describe_view_verbose_rows(session: &Session) -> Vec<Vec<Option<String>>
     rows
 }
 
+fn psql_describe_materialized_view_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut rows = session
+        .materialized_views
+        .values()
+        .map(|view| {
+            vec![
+                Some("public".to_string()),
+                Some(view.name.clone()),
+                Some("materialized view".to_string()),
+                Some("postgres".to_string()),
+            ]
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| left[1].cmp(&right[1]));
+    rows
+}
+
+fn psql_describe_materialized_view_verbose_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut rows = session
+        .materialized_views
+        .values()
+        .map(|view| {
+            vec![
+                Some("public".to_string()),
+                Some(view.name.clone()),
+                Some("materialized view".to_string()),
+                Some("postgres".to_string()),
+                Some("permanent".to_string()),
+                Some("heap".to_string()),
+                Some("0 bytes".to_string()),
+                session
+                    .comments
+                    .get(&CatalogCommentTarget::MaterializedView {
+                        materialized_view: view.name.clone(),
+                    })
+                    .cloned(),
+            ]
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| left[1].cmp(&right[1]));
+    rows
+}
+
 fn psql_describe_sequence_rows(session: &Session) -> Vec<Vec<Option<String>>> {
     let mut rows = session
         .sequences
@@ -12204,6 +12763,10 @@ fn pg_catalog_descriptions_with_sequences_query() -> &'static str {
     "select n.nspname, c.relname, a.attname, d.description from pg_catalog.pg_description d join pg_catalog.pg_class c on c.oid = d.objoid join pg_catalog.pg_namespace n on n.oid = c.relnamespace left join pg_catalog.pg_attribute a on a.attrelid = c.oid and a.attnum = d.objsubid where n.nspname = 'public' and c.relkind in ('r','v','s') order by c.relname, d.objsubid"
 }
 
+fn pg_catalog_descriptions_with_materialized_views_query() -> &'static str {
+    "select n.nspname, c.relname, a.attname, d.description from pg_catalog.pg_description d join pg_catalog.pg_class c on c.oid = d.objoid join pg_catalog.pg_namespace n on n.oid = c.relnamespace left join pg_catalog.pg_attribute a on a.attrelid = c.oid and a.attnum = d.objsubid where n.nspname = 'public' and c.relkind in ('r','v','m','s') order by c.relname, d.objsubid"
+}
+
 fn pg_catalog_table_descriptions_query() -> &'static str {
     "select n.nspname, c.relname, a.attname, d.description from pg_catalog.pg_description d join pg_catalog.pg_class c on c.oid = d.objoid join pg_catalog.pg_namespace n on n.oid = c.relnamespace left join pg_catalog.pg_attribute a on a.attrelid = c.oid and a.attnum = d.objsubid where n.nspname = 'public' and c.relkind = 'r' order by c.relname, d.objsubid"
 }
@@ -12218,6 +12781,10 @@ fn pg_catalog_table_index_descriptions_query() -> &'static str {
 
 fn pg_catalog_table_index_sequence_descriptions_query() -> &'static str {
     "select n.nspname, c.relname, c.relkind, a.attname, d.description from pg_catalog.pg_description d join pg_catalog.pg_class c on c.oid = d.objoid join pg_catalog.pg_namespace n on n.oid = c.relnamespace left join pg_catalog.pg_attribute a on a.attrelid = c.oid and a.attnum = d.objsubid where n.nspname = 'public' and c.relkind in ('r','i','v','s') order by c.relkind, c.relname, d.objsubid"
+}
+
+fn pg_catalog_table_index_sequence_matview_descriptions_query() -> &'static str {
+    "select n.nspname, c.relname, c.relkind, a.attname, d.description from pg_catalog.pg_description d join pg_catalog.pg_class c on c.oid = d.objoid join pg_catalog.pg_namespace n on n.oid = c.relnamespace left join pg_catalog.pg_attribute a on a.attrelid = c.oid and a.attnum = d.objsubid where n.nspname = 'public' and c.relkind in ('r','i','v','m','s') order by c.relkind, c.relname, d.objsubid"
 }
 
 fn pg_catalog_table_index_descriptions_without_views_query() -> &'static str {
@@ -12264,6 +12831,23 @@ fn pg_catalog_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
         if let Some(description) = session.comments.get(&CatalogCommentTarget::View {
             view: view.name.clone(),
         }) {
+            rows.push(vec![
+                Some("public".to_string()),
+                Some(view.name.clone()),
+                None,
+                Some(description.clone()),
+            ]);
+        }
+    }
+    let mut materialized_views = session.materialized_views.values().collect::<Vec<_>>();
+    materialized_views.sort_by(|left, right| left.name.cmp(&right.name));
+    for view in materialized_views {
+        if let Some(description) = session
+            .comments
+            .get(&CatalogCommentTarget::MaterializedView {
+                materialized_view: view.name.clone(),
+            })
+        {
             rows.push(vec![
                 Some("public".to_string()),
                 Some(view.name.clone()),
@@ -12343,6 +12927,8 @@ fn pg_catalog_table_index_description_rows(session: &Session) -> Vec<Vec<Option<
         let name = row[1].as_deref().unwrap_or_default();
         let relkind = if session.views.contains_key(name) {
             "v"
+        } else if session.materialized_views.contains_key(name) {
+            "m"
         } else if session.sequences.contains_key(name) {
             "s"
         } else {
@@ -12461,6 +13047,23 @@ fn pg_dump_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
             ]);
         }
     }
+    let mut materialized_views = session.materialized_views.values().collect::<Vec<_>>();
+    materialized_views.sort_by_key(|view| view.oid);
+    for view in materialized_views {
+        if let Some(description) = session
+            .comments
+            .get(&CatalogCommentTarget::MaterializedView {
+                materialized_view: view.name.clone(),
+            })
+        {
+            rows.push(vec![
+                Some(description.clone()),
+                Some("1259".to_string()),
+                Some(view.oid.to_string()),
+                Some("0".to_string()),
+            ]);
+        }
+    }
     let mut index_comments = session
         .comments
         .iter()
@@ -12473,6 +13076,7 @@ fn pg_dump_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
             | CatalogCommentTarget::Table { .. }
             | CatalogCommentTarget::Column { .. }
             | CatalogCommentTarget::View { .. }
+            | CatalogCommentTarget::MaterializedView { .. }
             | CatalogCommentTarget::Sequence { .. }
             | CatalogCommentTarget::Constraint { .. } => None,
         })
@@ -12502,6 +13106,7 @@ fn pg_dump_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
             | CatalogCommentTarget::Table { .. }
             | CatalogCommentTarget::Column { .. }
             | CatalogCommentTarget::View { .. }
+            | CatalogCommentTarget::MaterializedView { .. }
             | CatalogCommentTarget::Sequence { .. }
             | CatalogCommentTarget::Index { .. } => None,
         })
@@ -12560,6 +13165,23 @@ fn psql_object_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
                 Some("public".to_string()),
                 Some(view.name.clone()),
                 Some("view".to_string()),
+                Some(description.clone()),
+            ]);
+        }
+    }
+    let mut materialized_views = session.materialized_views.values().collect::<Vec<_>>();
+    materialized_views.sort_by(|left, right| left.name.cmp(&right.name));
+    for view in materialized_views {
+        if let Some(description) = session
+            .comments
+            .get(&CatalogCommentTarget::MaterializedView {
+                materialized_view: view.name.clone(),
+            })
+        {
+            rows.push(vec![
+                Some("public".to_string()),
+                Some(view.name.clone()),
+                Some("materialized view".to_string()),
                 Some(description.clone()),
             ]);
         }

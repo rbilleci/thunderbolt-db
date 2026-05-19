@@ -29,7 +29,7 @@ COMMENT
 
 psql:311_protocol_psql_view_comments.sql:17: ERROR:  view does not exist
 psql:311_protocol_psql_view_comments.sql:18: ERROR:  relation is not a view
-psql:311_protocol_psql_view_comments.sql:19: ERROR:  query shape is not supported by the compatibility stub
+psql:311_protocol_psql_view_comments.sql:19: ERROR:  relation is not a materialized view
 DROP VIEW
 psql:311_protocol_psql_view_comments.sql:21: ERROR:  view does not exist
  id | name

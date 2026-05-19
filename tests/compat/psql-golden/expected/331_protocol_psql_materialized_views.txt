@@ -1,0 +1,97 @@
+=== psql bounded materialized view lifecycle ===
+CREATE TABLE
+INSERT 0 3
+SELECT 0
+COMMENT
+                 List of relations
+ Schema |   Name    |       Type        |  Owner
+--------+-----------+-------------------+----------
+ public | mv_people | materialized view | postgres
+(1 row)
+
+                                              List of relations
+ Schema |   Name    |       Type        |  Owner   | Persistence | Access method |  Size   |   Description
+--------+-----------+-------------------+----------+-------------+---------------+---------+-----------------
+ public | mv_people | materialized view | postgres | permanent   | heap          | 0 bytes | people snapshot
+(1 row)
+
+ id | name
+----+-------
+  2 | Linus
+  3 | Grace
+(2 rows)
+
+INSERT 0 1
+ id | name
+----+-------
+  2 | Linus
+  3 | Grace
+(2 rows)
+
+  oid  | nspname |  relname  | relkind | relpersistence
+-------+---------+-----------+---------+----------------
+ 16385 | public  | mv_people | m       | p
+(1 row)
+
+ nspname |  relname  | attname |   description
+---------+-----------+---------+-----------------
+ public  | mv_people |         | people snapshot
+(1 row)
+
+                   Object descriptions
+ Schema |   Name    |      Object       |   Description
+--------+-----------+-------------------+-----------------
+ public | mv_people | materialized view | people snapshot
+(1 row)
+
+ALTER MATERIALIZED VIEW
+                                                  List of relations
+ Schema |        Name        |       Type        |  Owner   | Persistence | Access method |  Size   |   Description
+--------+--------------------+-------------------+----------+-------------+---------------+---------+-----------------
+ public | mv_people_snapshot | materialized view | postgres | permanent   | heap          | 0 bytes | people snapshot
+(1 row)
+
+ id | name
+----+-------
+  2 | Linus
+  3 | Grace
+(2 rows)
+
+psql:331_protocol_psql_materialized_views.sql:27: ERROR:  relation does not exist
+SELECT 0
+psql:331_protocol_psql_materialized_views.sql:29: ERROR:  relation already exists
+psql:331_protocol_psql_materialized_views.sql:30: ERROR:  materialized view does not exist
+psql:331_protocol_psql_materialized_views.sql:31: ERROR:  relation is not a materialized view
+psql:331_protocol_psql_materialized_views.sql:32: ERROR:  query shape is not supported by the compatibility stub
+psql:331_protocol_psql_materialized_views.sql:33: ERROR:  materialized view does not exist
+psql:331_protocol_psql_materialized_views.sql:34: ERROR:  materialized view does not exist
+                     List of relations
+ Schema |        Name        |       Type        |  Owner
+--------+--------------------+-------------------+----------
+ public | mv_other           | materialized view | postgres
+ public | mv_people_snapshot | materialized view | postgres
+(2 rows)
+
+DROP MATERIALIZED VIEW
+                List of relations
+ Schema |   Name   |       Type        |  Owner
+--------+----------+-------------------+----------
+ public | mv_other | materialized view | postgres
+(1 row)
+
+ id |  name
+----+---------
+  1 | Ada
+  2 | Linus
+  3 | Grace
+  4 | Barbara
+(4 rows)
+
+DROP MATERIALIZED VIEW
+psql:331_protocol_psql_materialized_views.sql:40: error: Did not find any relations.
+CREATE VIEW
+psql:331_protocol_psql_materialized_views.sql:42: ERROR:  materialized views over views are unsupported
+CREATE TABLE
+psql:331_protocol_psql_materialized_views.sql:44: ERROR:  relation already exists
+psql:331_protocol_psql_materialized_views.sql:45: ERROR:  query shape is not supported by the compatibility stub
+psql:331_protocol_psql_materialized_views.sql:46: ERROR:  relation is not a materialized view

@@ -22,12 +22,15 @@ pub enum Command {
     RenameIndex(RenameIndex),
     CreateView(CreateView),
     RenameView(RenameView),
+    CreateMaterializedView(CreateMaterializedView),
+    RenameMaterializedView(RenameMaterializedView),
     CreateSequence(CreateSequence),
     RenameSequence(RenameSequence),
     DropSequence(DropSequence),
     DropTable(DropTable),
     TruncateTable(TruncateTable),
     DropIndex(DropIndex),
+    DropMaterializedView(DropMaterializedView),
     DropView(DropView),
     AlterColumnDefault(AlterColumnDefault),
     CommentOn(CommentOn),
@@ -142,6 +145,19 @@ pub struct RenameView {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateMaterializedView {
+    pub name: String,
+    pub query: Select,
+    pub definition: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenameMaterializedView {
+    pub old_name: String,
+    pub new_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateSequence {
     pub name: String,
 }
@@ -176,6 +192,12 @@ pub struct DropIndex {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropMaterializedView {
+    pub names: Vec<String>,
+    pub if_exists: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DropView {
     pub names: Vec<String>,
     pub if_exists: bool,
@@ -204,6 +226,7 @@ pub enum CommentTarget {
     Column { table: String, column: String },
     Index { index: String },
     View { view: String },
+    MaterializedView { materialized_view: String },
     Sequence { sequence: String },
     Constraint { table: String, constraint: String },
 }
@@ -1727,6 +1750,14 @@ fn parse_relational_command(input: &str) -> Option<Result<Command, ParseError>> 
         if second.eq_ignore_ascii_case("VIEW") {
             return Some(parse_create_view(input).map(Command::CreateView));
         }
+        if second.eq_ignore_ascii_case("MATERIALIZED") {
+            let third = input.split_whitespace().nth(2)?;
+            if third.eq_ignore_ascii_case("VIEW") {
+                return Some(
+                    parse_create_materialized_view(input).map(Command::CreateMaterializedView),
+                );
+            }
+        }
         if second.eq_ignore_ascii_case("SEQUENCE") {
             return Some(parse_create_sequence(input).map(Command::CreateSequence));
         }
@@ -1750,6 +1781,14 @@ fn parse_relational_command(input: &str) -> Option<Result<Command, ParseError>> 
         if second.eq_ignore_ascii_case("VIEW") {
             return Some(parse_drop_view(input).map(Command::DropView));
         }
+        if second.eq_ignore_ascii_case("MATERIALIZED") {
+            let third = input.split_whitespace().nth(2)?;
+            if third.eq_ignore_ascii_case("VIEW") {
+                return Some(
+                    parse_drop_materialized_view(input).map(Command::DropMaterializedView),
+                );
+            }
+        }
         if second.eq_ignore_ascii_case("SEQUENCE") {
             return Some(parse_drop_sequence(input).map(Command::DropSequence));
         }
@@ -1765,6 +1804,15 @@ fn parse_relational_command(input: &str) -> Option<Result<Command, ParseError>> 
             .is_some_and(|second| second.eq_ignore_ascii_case("INDEX"))
         {
             return Some(parse_rename_index(input).map(Command::RenameIndex));
+        }
+        if input
+            .split_whitespace()
+            .nth(1)
+            .is_some_and(|second| second.eq_ignore_ascii_case("MATERIALIZED"))
+        {
+            return Some(
+                parse_rename_materialized_view(input).map(Command::RenameMaterializedView),
+            );
         }
         if input
             .split_whitespace()
@@ -1909,6 +1957,17 @@ fn parse_comment_on(input: &str) -> Result<CommentOn, ParseError> {
         let view = normalize_relation_identifier(rest[..is_pos].trim())?;
         (
             CommentTarget::View { view },
+            rest[is_pos + "IS".len()..].trim(),
+        )
+    } else if let Some(rest) = strip_keyword_prefix_case_insensitive(rest, "MATERIALIZED") {
+        let rest = strip_keyword_prefix_case_insensitive(rest.trim_start(), "VIEW")
+            .ok_or(ParseError::InvalidRelationalSql)?
+            .trim_start();
+        let is_pos =
+            find_keyword_outside_quotes(rest, "IS").ok_or(ParseError::InvalidRelationalSql)?;
+        let materialized_view = normalize_relation_identifier(rest[..is_pos].trim())?;
+        (
+            CommentTarget::MaterializedView { materialized_view },
             rest[is_pos + "IS".len()..].trim(),
         )
     } else if let Some(rest) = strip_keyword_prefix_case_insensitive(rest, "SEQUENCE") {
@@ -2562,6 +2621,35 @@ fn parse_create_sequence(input: &str) -> Result<CreateSequence, ParseError> {
     })
 }
 
+fn parse_create_materialized_view(input: &str) -> Result<CreateMaterializedView, ParseError> {
+    let rest = strip_keyword_prefix_case_insensitive(input, "CREATE")
+        .and_then(|s| strip_keyword_prefix_case_insensitive(s.trim_start(), "MATERIALIZED"))
+        .and_then(|s| strip_keyword_prefix_case_insensitive(s.trim_start(), "VIEW"))
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    if strip_keyword_prefix_case_insensitive(rest, "IF").is_some()
+        || strip_keyword_prefix_case_insensitive(rest, "TEMP").is_some()
+        || strip_keyword_prefix_case_insensitive(rest, "TEMPORARY").is_some()
+    {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let as_pos = find_keyword_outside_quotes(rest, "AS").ok_or(ParseError::InvalidRelationalSql)?;
+    let name = normalize_relation_identifier(rest[..as_pos].trim())?;
+    let definition = rest[as_pos + "AS".len()..].trim();
+    if definition.is_empty() || find_keyword_outside_quotes(definition, "WITH").is_some() {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let query = parse_select(definition)?;
+    if query.table == name {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    Ok(CreateMaterializedView {
+        name,
+        query,
+        definition: definition.to_string(),
+    })
+}
+
 fn parse_create_index(input: &str) -> Result<CreateIndex, ParseError> {
     let rest = strip_keyword_prefix_case_insensitive(input, "CREATE")
         .ok_or(ParseError::InvalidRelationalSql)?
@@ -2733,6 +2821,37 @@ fn parse_rename_sequence(input: &str) -> Result<RenameSequence, ParseError> {
     })
 }
 
+fn parse_rename_materialized_view(input: &str) -> Result<RenameMaterializedView, ParseError> {
+    let rest = strip_keyword_prefix_case_insensitive(input, "ALTER")
+        .and_then(|s| strip_keyword_prefix_case_insensitive(s.trim_start(), "MATERIALIZED"))
+        .and_then(|s| strip_keyword_prefix_case_insensitive(s.trim_start(), "VIEW"))
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    if strip_keyword_prefix_case_insensitive(rest, "IF").is_some()
+        || strip_keyword_prefix_case_insensitive(rest, "ALL").is_some()
+        || strip_keyword_prefix_case_insensitive(rest, "CURRENT").is_some()
+    {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let rename_pos =
+        find_keyword_outside_quotes(rest, "RENAME").ok_or(ParseError::InvalidRelationalSql)?;
+    let old_name = normalize_relation_identifier(rest[..rename_pos].trim())?;
+    let after_rename = rest[rename_pos + "RENAME".len()..].trim_start();
+    let after_to = strip_keyword_prefix_case_insensitive(after_rename, "TO")
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim();
+    if after_to.is_empty()
+        || find_keyword_outside_quotes(after_to, "CASCADE").is_some()
+        || find_keyword_outside_quotes(after_to, "RESTRICT").is_some()
+    {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    Ok(RenameMaterializedView {
+        old_name,
+        new_name: normalize_identifier(after_to)?,
+    })
+}
+
 fn parse_drop_table(input: &str) -> Result<DropTable, ParseError> {
     let mut rest = strip_keyword_prefix_case_insensitive(input, "DROP")
         .and_then(|s| strip_keyword_prefix_case_insensitive(s.trim_start(), "TABLE"))
@@ -2855,6 +2974,39 @@ fn parse_drop_sequence(input: &str) -> Result<DropSequence, ParseError> {
         names: sequences
             .into_iter()
             .map(|sequence| normalize_relation_identifier(sequence.trim()))
+            .collect::<Result<Vec<_>, _>>()?,
+        if_exists,
+    })
+}
+
+fn parse_drop_materialized_view(input: &str) -> Result<DropMaterializedView, ParseError> {
+    let mut rest = strip_keyword_prefix_case_insensitive(input, "DROP")
+        .and_then(|s| strip_keyword_prefix_case_insensitive(s.trim_start(), "MATERIALIZED"))
+        .and_then(|s| strip_keyword_prefix_case_insensitive(s.trim_start(), "VIEW"))
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    let if_exists = if let Some(after_if) = strip_keyword_prefix_case_insensitive(rest, "IF") {
+        let after_exists = strip_keyword_prefix_case_insensitive(after_if.trim_start(), "EXISTS")
+            .ok_or(ParseError::InvalidRelationalSql)?;
+        rest = after_exists.trim_start();
+        true
+    } else {
+        false
+    };
+    if rest.is_empty()
+        || find_keyword_outside_quotes(rest, "CASCADE").is_some()
+        || find_keyword_outside_quotes(rest, "RESTRICT").is_some()
+    {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let views = split_csv(rest)?;
+    if views.is_empty() {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    Ok(DropMaterializedView {
+        names: views
+            .into_iter()
+            .map(|view| normalize_relation_identifier(view.trim()))
             .collect::<Result<Vec<_>, _>>()?,
         if_exists,
     })
@@ -10482,18 +10634,25 @@ mod tests {
             parse_command("ALTER VIEW active_people RENAME TO renamed_people CASCADE"),
             Err(ParseError::InvalidRelationalSql)
         ));
-        assert!(matches!(
-            parse_command("ALTER MATERIALIZED VIEW active_people RENAME TO renamed_people"),
-            Err(ParseError::InvalidRelationalSql)
-        ));
+        assert_eq!(
+            parse_command("ALTER MATERIALIZED VIEW active_people RENAME TO renamed_people")
+                .unwrap(),
+            Command::RenameMaterializedView(RenameMaterializedView {
+                old_name: "active_people".to_string(),
+                new_name: "renamed_people".to_string(),
+            })
+        );
         assert!(matches!(
             parse_command("ALTER VIEW public.active_people RENAME TO public.renamed_people"),
             Err(ParseError::InvalidRelationalSql)
         ));
-        assert!(matches!(
-            parse_command("DROP MATERIALIZED VIEW active_people"),
-            Err(ParseError::InvalidRelationalSql)
-        ));
+        assert_eq!(
+            parse_command("DROP MATERIALIZED VIEW active_people").unwrap(),
+            Command::DropMaterializedView(DropMaterializedView {
+                names: vec!["active_people".to_string()],
+                if_exists: false,
+            })
+        );
 
         assert_eq!(
             parse_command("DROP TABLE public.people").unwrap(),
@@ -12023,6 +12182,77 @@ mod tests {
         ));
         assert!(matches!(
             parse_command("ALTER SEQUENCE seq_people RENAME TO seq_person_ids CASCADE"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+    }
+
+    #[test]
+    fn parses_bounded_materialized_view_lifecycle() {
+        assert_eq!(
+            parse_command(
+                "CREATE MATERIALIZED VIEW public.mv_people AS SELECT id, name FROM people ORDER BY id"
+            )
+            .unwrap(),
+            Command::CreateMaterializedView(CreateMaterializedView {
+                name: "mv_people".to_string(),
+                query: Select {
+                    table: "people".to_string(),
+                    distinct: false,
+                    projection: SelectProjection::Columns(vec![
+                        "id".to_string(),
+                        "name".to_string(),
+                    ]),
+                    group_by: None,
+                    having_groups: Vec::new(),
+                    filter: None,
+                    filters: Vec::new(),
+                    filter_groups: Vec::new(),
+                    order_by: Some(SelectOrder {
+                        column: "id".to_string(),
+                        descending: false,
+                    }),
+                    limit: None,
+                    offset: None,
+                },
+                definition: "SELECT id, name FROM people ORDER BY id".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_command("ALTER MATERIALIZED VIEW public.mv_people RENAME TO mv_people_old")
+                .unwrap(),
+            Command::RenameMaterializedView(RenameMaterializedView {
+                old_name: "mv_people".to_string(),
+                new_name: "mv_people_old".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_command("DROP MATERIALIZED VIEW IF EXISTS public.mv_people_old, mv_other")
+                .unwrap(),
+            Command::DropMaterializedView(DropMaterializedView {
+                names: vec!["mv_people_old".to_string(), "mv_other".to_string()],
+                if_exists: true,
+            })
+        );
+        assert_eq!(
+            parse_command("COMMENT ON MATERIALIZED VIEW public.mv_people IS 'snapshot'").unwrap(),
+            Command::CommentOn(CommentOn {
+                target: CommentTarget::MaterializedView {
+                    materialized_view: "mv_people".to_string(),
+                },
+                comment: Some("snapshot".to_string()),
+            })
+        );
+
+        assert!(matches!(
+            parse_command("CREATE MATERIALIZED VIEW mv_people AS SELECT * FROM people WITH DATA"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command("DROP MATERIALIZED VIEW mv_people CASCADE"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command("ALTER MATERIALIZED VIEW mv_people RENAME TO public.mv_people_old"),
             Err(ParseError::InvalidRelationalSql)
         ));
     }

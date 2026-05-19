@@ -20,10 +20,11 @@ use gpu_db_observability::{
 use gpu_db_planner::{ExecutionPlan, Planner, PlannerConfig};
 use gpu_db_protocol::{
     parse_command, AddUniqueConstraint, ColumnDef, Command, CommentTarget, CreateIndex,
-    CreateSequence, CreateTable, CreateView, Delete, DropConstraint, DropIndex, DropSequence,
-    DropTable, DropView, Insert, ParseError, RenameColumn, RenameConstraint, RenameIndex,
-    RenameSequence, RenameTable, RenameView, Select, SelectFilterOp, SelectProjection, SqlType,
-    SqlValue, TruncateTable, Update,
+    CreateMaterializedView, CreateSequence, CreateTable, CreateView, Delete, DropConstraint,
+    DropIndex, DropMaterializedView, DropSequence, DropTable, DropView, Insert, ParseError,
+    RenameColumn, RenameConstraint, RenameIndex, RenameMaterializedView, RenameSequence,
+    RenameTable, RenameView, Select, SelectFilterOp, SelectProjection, SqlType, SqlValue,
+    TruncateTable, Update,
 };
 use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine};
 use gpu_db_storage::{
@@ -86,12 +87,15 @@ impl ReplicatedStateMachine for KvStateMachine {
                     | Command::RenameIndex(_)
                     | Command::CreateView(_)
                     | Command::RenameView(_)
+                    | Command::CreateMaterializedView(_)
+                    | Command::RenameMaterializedView(_)
                     | Command::CreateSequence(_)
                     | Command::RenameSequence(_)
                     | Command::DropTable(_)
                     | Command::TruncateTable(_)
                     | Command::DropIndex(_)
                     | Command::DropView(_)
+                    | Command::DropMaterializedView(_)
                     | Command::DropSequence(_)
                     | Command::AlterColumnDefault(_)
                     | Command::CommentOn(_)
@@ -5944,6 +5948,7 @@ pub struct Engine {
     mvcc_store: InMemoryTupleStore,
     relational_catalog: BTreeMap<String, RelationalTable>,
     relational_views: BTreeMap<String, RelationalView>,
+    relational_materialized_views: BTreeMap<String, RelationalMaterializedView>,
     relational_sequences: BTreeMap<String, RelationalSequence>,
     relational_comments: BTreeMap<RelationalCommentTarget, String>,
     relational_value_index: BTreeMap<RelationalIndexKey, Vec<String>>,
@@ -6005,6 +6010,17 @@ pub struct RelationalView {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationalMaterializedView {
+    pub schema: String,
+    pub name: String,
+    pub oid: u32,
+    pub query: Select,
+    pub definition: String,
+    pub columns: Vec<RelationalColumn>,
+    pub rows: Vec<Vec<SqlValue>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelationalSequence {
     pub schema: String,
     pub name: String,
@@ -6021,6 +6037,7 @@ pub enum RelationalCommentTarget {
     Column { table: String, attnum: i16 },
     Index { index: String },
     View { view: String },
+    MaterializedView { materialized_view: String },
     Sequence { sequence: String },
     Constraint { table: String, constraint: String },
 }
@@ -7295,6 +7312,7 @@ impl Engine {
             mvcc_store: InMemoryTupleStore::new(),
             relational_catalog: BTreeMap::new(),
             relational_views: BTreeMap::new(),
+            relational_materialized_views: BTreeMap::new(),
             relational_sequences: BTreeMap::new(),
             relational_comments: BTreeMap::new(),
             relational_value_index: BTreeMap::new(),
@@ -7546,12 +7564,19 @@ impl Engine {
             Command::RenameIndex(rename) => self.apply_rename_index(rename)?,
             Command::CreateView(create) => self.apply_create_view(create)?,
             Command::RenameView(rename) => self.apply_rename_view(rename)?,
+            Command::CreateMaterializedView(create) => {
+                self.apply_create_materialized_view(create)?
+            }
+            Command::RenameMaterializedView(rename) => {
+                self.apply_rename_materialized_view(rename)?
+            }
             Command::CreateSequence(create) => self.apply_create_sequence(create)?,
             Command::RenameSequence(rename) => self.apply_rename_sequence(rename)?,
             Command::DropTable(drop) => self.apply_drop_table(drop, txn_id)?,
             Command::TruncateTable(truncate) => self.apply_truncate_table(truncate, txn_id)?,
             Command::DropIndex(drop) => self.apply_drop_index(drop)?,
             Command::DropView(drop) => self.apply_drop_view(drop)?,
+            Command::DropMaterializedView(drop) => self.apply_drop_materialized_view(drop)?,
             Command::DropSequence(drop) => self.apply_drop_sequence(drop)?,
             Command::AlterColumnDefault(alter) => self.apply_alter_column_default(alter)?,
             Command::CommentOn(comment) => self.apply_comment_on(comment)?,
@@ -7566,6 +7591,9 @@ impl Engine {
 
     fn apply_create_view(&mut self, create: CreateView) -> Result<(), EngineError> {
         if self.relational_catalog.contains_key(&create.name)
+            || self
+                .relational_materialized_views
+                .contains_key(&create.name)
             || self.relational_sequences.contains_key(&create.name)
             || (!create.or_replace && self.relational_views.contains_key(&create.name))
         {
@@ -7577,6 +7605,14 @@ impl Engine {
         if self.relational_views.contains_key(&create.query.table) {
             return Err(EngineError::ApplyFailed(
                 "views over views are unsupported".to_string(),
+            ));
+        }
+        if self
+            .relational_materialized_views
+            .contains_key(&create.query.table)
+        {
+            return Err(EngineError::ApplyFailed(
+                "views over materialized views are unsupported".to_string(),
             ));
         }
         if !self.relational_catalog.contains_key(&create.query.table) {
@@ -7608,9 +7644,67 @@ impl Engine {
         Ok(())
     }
 
+    fn apply_create_materialized_view(
+        &mut self,
+        create: CreateMaterializedView,
+    ) -> Result<(), EngineError> {
+        self.preflight_create_materialized_view(&create)?;
+        let result = self
+            .execute_relational_select(&create.query)
+            .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+        let oid = self.relational_next_oid;
+        self.relational_next_oid = self.relational_next_oid.checked_add(1).ok_or_else(|| {
+            EngineError::ApplyFailed(
+                "relational materialized view OID allocation exhausted".to_string(),
+            )
+        })?;
+        let mut columns = Vec::with_capacity(result.columns.len());
+        let mut next_column_id = self.relational_next_column_id;
+        for (idx, column) in result.columns.into_iter().enumerate() {
+            let attnum = i16::try_from(idx + 1).map_err(|_| {
+                EngineError::ApplyFailed(
+                    "too many columns for bootstrap materialized view".to_string(),
+                )
+            })?;
+            let id = next_column_id;
+            next_column_id = next_column_id.checked_add(1).ok_or_else(|| {
+                EngineError::ApplyFailed(
+                    "relational materialized view column id allocation exhausted".to_string(),
+                )
+            })?;
+            columns.push(RelationalColumn {
+                id,
+                table_oid: oid,
+                attnum,
+                name: column.name,
+                ty: column.ty,
+                default: None,
+                type_oid: column.type_oid,
+                type_size: column.type_size,
+            });
+        }
+        self.relational_next_column_id = next_column_id;
+        self.relational_materialized_views.insert(
+            create.name.clone(),
+            RelationalMaterializedView {
+                schema: PUBLIC_SCHEMA_NAME.to_string(),
+                name: create.name,
+                oid,
+                query: create.query,
+                definition: create.definition,
+                columns,
+                rows: result.rows,
+            },
+        );
+        Ok(())
+    }
+
     fn apply_create_sequence(&mut self, create: CreateSequence) -> Result<(), EngineError> {
         if self.relational_catalog.contains_key(&create.name)
             || self.relational_views.contains_key(&create.name)
+            || self
+                .relational_materialized_views
+                .contains_key(&create.name)
             || self.relational_sequences.contains_key(&create.name)
         {
             return Err(EngineError::ApplyFailed(format!(
@@ -7636,6 +7730,9 @@ impl Engine {
     fn apply_create_table(&mut self, create: CreateTable) -> Result<(), EngineError> {
         if self.relational_catalog.contains_key(&create.table)
             || self.relational_views.contains_key(&create.table)
+            || self
+                .relational_materialized_views
+                .contains_key(&create.table)
             || self.relational_sequences.contains_key(&create.table)
         {
             return Err(EngineError::ApplyFailed(format!(
@@ -7727,6 +7824,7 @@ impl Engine {
             .any(|table| table.indexes.iter().any(|index| index.name == add.name))
             || self.relational_catalog.contains_key(&add.name)
             || self.relational_views.contains_key(&add.name)
+            || self.relational_materialized_views.contains_key(&add.name)
             || self.relational_sequences.contains_key(&add.name)
         {
             return Err(EngineError::ApplyFailed(format!(
@@ -7769,6 +7867,9 @@ impl Engine {
             .any(|table| table.indexes.iter().any(|index| index.name == create.name))
             || self.relational_catalog.contains_key(&create.name)
             || self.relational_views.contains_key(&create.name)
+            || self
+                .relational_materialized_views
+                .contains_key(&create.name)
             || self.relational_sequences.contains_key(&create.name)
         {
             return Err(EngineError::ApplyFailed(format!(
@@ -7861,7 +7962,12 @@ impl Engine {
     }
 
     fn apply_rename_constraint(&mut self, rename: RenameConstraint) -> Result<(), EngineError> {
-        if self.relational_views.contains_key(&rename.table) {
+        if self.relational_views.contains_key(&rename.table)
+            || self
+                .relational_materialized_views
+                .contains_key(&rename.table)
+            || self.relational_sequences.contains_key(&rename.table)
+        {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" is not a table",
                 rename.table
@@ -7881,7 +7987,12 @@ impl Engine {
                 .indexes
                 .iter()
                 .any(|index| index.name == rename.new_name)
-        }) || self.relational_sequences.contains_key(&rename.new_name)
+        }) || self.relational_catalog.contains_key(&rename.new_name)
+            || self.relational_views.contains_key(&rename.new_name)
+            || self
+                .relational_materialized_views
+                .contains_key(&rename.new_name)
+            || self.relational_sequences.contains_key(&rename.new_name)
         {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" already exists",
@@ -8102,7 +8213,12 @@ impl Engine {
         rename: RenameTable,
         txn_id: TxnId,
     ) -> Result<(), EngineError> {
-        if self.relational_views.contains_key(&rename.old_name) {
+        if self.relational_views.contains_key(&rename.old_name)
+            || self
+                .relational_materialized_views
+                .contains_key(&rename.old_name)
+            || self.relational_sequences.contains_key(&rename.old_name)
+        {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" is not a table",
                 rename.old_name
@@ -8119,6 +8235,9 @@ impl Engine {
         }
         if self.relational_catalog.contains_key(&rename.new_name)
             || self.relational_views.contains_key(&rename.new_name)
+            || self
+                .relational_materialized_views
+                .contains_key(&rename.new_name)
             || self.relational_sequences.contains_key(&rename.new_name)
         {
             return Err(EngineError::ApplyFailed(format!(
@@ -8297,6 +8416,7 @@ impl Engine {
                 | RelationalCommentTarget::Schema { .. }
                 | RelationalCommentTarget::Tablespace { .. }
                 | RelationalCommentTarget::View { .. }
+                | RelationalCommentTarget::MaterializedView { .. }
                 | RelationalCommentTarget::Sequence { .. } => true,
             });
             self.relational_residency.remove(name);
@@ -8341,7 +8461,12 @@ impl Engine {
         truncate: TruncateTable,
         txn_id: TxnId,
     ) -> Result<(), EngineError> {
-        if self.relational_views.contains_key(&truncate.name) {
+        if self.relational_views.contains_key(&truncate.name)
+            || self
+                .relational_materialized_views
+                .contains_key(&truncate.name)
+            || self.relational_sequences.contains_key(&truncate.name)
+        {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" is not a table",
                 truncate.name
@@ -8390,6 +8515,23 @@ impl Engine {
         Ok(())
     }
 
+    fn apply_drop_materialized_view(
+        &mut self,
+        drop: DropMaterializedView,
+    ) -> Result<(), EngineError> {
+        self.preflight_drop_materialized_view(&drop)?;
+        for name in &drop.names {
+            if self.relational_materialized_views.remove(name).is_none() {
+                continue;
+            }
+            self.relational_comments
+                .remove(&RelationalCommentTarget::MaterializedView {
+                    materialized_view: name.clone(),
+                });
+        }
+        Ok(())
+    }
+
     fn apply_drop_sequence(&mut self, drop: DropSequence) -> Result<(), EngineError> {
         self.preflight_drop_sequence(&drop)?;
         for name in &drop.names {
@@ -8407,6 +8549,9 @@ impl Engine {
     fn apply_rename_sequence(&mut self, rename: RenameSequence) -> Result<(), EngineError> {
         if self.relational_catalog.contains_key(&rename.old_name)
             || self.relational_views.contains_key(&rename.old_name)
+            || self
+                .relational_materialized_views
+                .contains_key(&rename.old_name)
         {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" is not a sequence",
@@ -8421,6 +8566,9 @@ impl Engine {
         }
         if self.relational_catalog.contains_key(&rename.new_name)
             || self.relational_views.contains_key(&rename.new_name)
+            || self
+                .relational_materialized_views
+                .contains_key(&rename.new_name)
             || self.relational_sequences.contains_key(&rename.new_name)
         {
             return Err(EngineError::ApplyFailed(format!(
@@ -8449,14 +8597,100 @@ impl Engine {
         Ok(())
     }
 
+    fn apply_rename_materialized_view(
+        &mut self,
+        rename: RenameMaterializedView,
+    ) -> Result<(), EngineError> {
+        if self.relational_catalog.contains_key(&rename.old_name)
+            || self.relational_views.contains_key(&rename.old_name)
+            || self.relational_sequences.contains_key(&rename.old_name)
+        {
+            return Err(EngineError::ApplyFailed(format!(
+                "relation \"{}\" is not a materialized view",
+                rename.old_name
+            )));
+        }
+        if self.relational_catalog.contains_key(&rename.new_name)
+            || self.relational_views.contains_key(&rename.new_name)
+            || self
+                .relational_materialized_views
+                .contains_key(&rename.new_name)
+            || self.relational_sequences.contains_key(&rename.new_name)
+        {
+            return Err(EngineError::ApplyFailed(format!(
+                "relation \"{}\" already exists",
+                rename.new_name
+            )));
+        }
+        let Some(mut view) = self.relational_materialized_views.remove(&rename.old_name) else {
+            return Err(EngineError::ApplyFailed(format!(
+                "materialized view \"{}\" does not exist",
+                rename.old_name
+            )));
+        };
+        view.name = rename.new_name.clone();
+        self.relational_materialized_views
+            .insert(rename.new_name.clone(), view);
+
+        let old_target = RelationalCommentTarget::MaterializedView {
+            materialized_view: rename.old_name,
+        };
+        if let Some(comment) = self.relational_comments.remove(&old_target) {
+            self.relational_comments.insert(
+                RelationalCommentTarget::MaterializedView {
+                    materialized_view: rename.new_name,
+                },
+                comment,
+            );
+        }
+        Ok(())
+    }
+
     fn preflight_create_sequence(&self, create: &CreateSequence) -> Result<(), EngineError> {
         if self.relational_catalog.contains_key(&create.name)
             || self.relational_views.contains_key(&create.name)
+            || self
+                .relational_materialized_views
+                .contains_key(&create.name)
             || self.relational_sequences.contains_key(&create.name)
         {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" already exists",
                 create.name
+            )));
+        }
+        Ok(())
+    }
+
+    fn preflight_create_materialized_view(
+        &self,
+        create: &CreateMaterializedView,
+    ) -> Result<(), EngineError> {
+        if self.relational_catalog.contains_key(&create.name)
+            || self.relational_views.contains_key(&create.name)
+            || self
+                .relational_materialized_views
+                .contains_key(&create.name)
+            || self.relational_sequences.contains_key(&create.name)
+        {
+            return Err(EngineError::ApplyFailed(format!(
+                "relation \"{}\" already exists",
+                create.name
+            )));
+        }
+        if self.relational_views.contains_key(&create.query.table)
+            || self
+                .relational_materialized_views
+                .contains_key(&create.query.table)
+        {
+            return Err(EngineError::ApplyFailed(
+                "materialized views over views are unsupported".to_string(),
+            ));
+        }
+        if !self.relational_catalog.contains_key(&create.query.table) {
+            return Err(EngineError::ApplyFailed(format!(
+                "relation \"{}\" does not exist",
+                create.query.table
             )));
         }
         Ok(())
@@ -8483,9 +8717,46 @@ impl Engine {
                     name
                 )));
             }
+            if self.relational_materialized_views.contains_key(name) {
+                return Err(EngineError::ApplyFailed(format!(
+                    "relation \"{}\" is not a view",
+                    name
+                )));
+            }
             if !drop.if_exists && !self.relational_views.contains_key(name) {
                 return Err(EngineError::ApplyFailed(format!(
                     "view \"{}\" does not exist",
+                    name
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn preflight_drop_materialized_view(
+        &self,
+        drop: &DropMaterializedView,
+    ) -> Result<(), EngineError> {
+        let mut seen = BTreeSet::new();
+        for name in &drop.names {
+            if !seen.insert(name) {
+                return Err(EngineError::ApplyFailed(format!(
+                    "materialized view \"{}\" specified more than once",
+                    name
+                )));
+            }
+            if self.relational_catalog.contains_key(name)
+                || self.relational_views.contains_key(name)
+                || self.relational_sequences.contains_key(name)
+            {
+                return Err(EngineError::ApplyFailed(format!(
+                    "relation \"{}\" is not a materialized view",
+                    name
+                )));
+            }
+            if !drop.if_exists && !self.relational_materialized_views.contains_key(name) {
+                return Err(EngineError::ApplyFailed(format!(
+                    "materialized view \"{}\" does not exist",
                     name
                 )));
             }
@@ -8504,6 +8775,7 @@ impl Engine {
             }
             if self.relational_catalog.contains_key(name)
                 || self.relational_views.contains_key(name)
+                || self.relational_materialized_views.contains_key(name)
             {
                 return Err(EngineError::ApplyFailed(format!(
                     "relation \"{}\" is not a sequence",
@@ -8521,7 +8793,12 @@ impl Engine {
     }
 
     fn apply_rename_view(&mut self, rename: RenameView) -> Result<(), EngineError> {
-        if self.relational_catalog.contains_key(&rename.old_name) {
+        if self.relational_catalog.contains_key(&rename.old_name)
+            || self
+                .relational_materialized_views
+                .contains_key(&rename.old_name)
+            || self.relational_sequences.contains_key(&rename.old_name)
+        {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" is not a view",
                 rename.old_name
@@ -8529,6 +8806,9 @@ impl Engine {
         }
         if self.relational_catalog.contains_key(&rename.new_name)
             || self.relational_views.contains_key(&rename.new_name)
+            || self
+                .relational_materialized_views
+                .contains_key(&rename.new_name)
             || self.relational_sequences.contains_key(&rename.new_name)
         {
             return Err(EngineError::ApplyFailed(format!(
@@ -8639,6 +8919,7 @@ impl Engine {
             CommentTarget::View { view } => {
                 if !self.relational_views.contains_key(&view) {
                     if self.relational_catalog.contains_key(&view)
+                        || self.relational_materialized_views.contains_key(&view)
                         || self.relational_sequences.contains_key(&view)
                     {
                         return Err(EngineError::ApplyFailed(format!(
@@ -8653,10 +8934,32 @@ impl Engine {
                 }
                 RelationalCommentTarget::View { view }
             }
+            CommentTarget::MaterializedView { materialized_view } => {
+                if !self
+                    .relational_materialized_views
+                    .contains_key(&materialized_view)
+                {
+                    if self.relational_catalog.contains_key(&materialized_view)
+                        || self.relational_views.contains_key(&materialized_view)
+                        || self.relational_sequences.contains_key(&materialized_view)
+                    {
+                        return Err(EngineError::ApplyFailed(format!(
+                            "relation \"{}\" is not a materialized view",
+                            materialized_view
+                        )));
+                    }
+                    return Err(EngineError::ApplyFailed(format!(
+                        "materialized view \"{}\" does not exist",
+                        materialized_view
+                    )));
+                }
+                RelationalCommentTarget::MaterializedView { materialized_view }
+            }
             CommentTarget::Sequence { sequence } => {
                 if !self.relational_sequences.contains_key(&sequence) {
                     if self.relational_catalog.contains_key(&sequence)
                         || self.relational_views.contains_key(&sequence)
+                        || self.relational_materialized_views.contains_key(&sequence)
                     {
                         return Err(EngineError::ApplyFailed(format!(
                             "relation \"{}\" is not a sequence",
@@ -8730,7 +9033,10 @@ impl Engine {
         add: gpu_db_protocol::AddColumn,
         txn_id: TxnId,
     ) -> Result<(), EngineError> {
-        if self.relational_views.contains_key(&add.table) {
+        if self.relational_views.contains_key(&add.table)
+            || self.relational_materialized_views.contains_key(&add.table)
+            || self.relational_sequences.contains_key(&add.table)
+        {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" is not a table",
                 add.table
@@ -8822,7 +9128,12 @@ impl Engine {
     }
 
     fn apply_rename_column(&mut self, rename: RenameColumn) -> Result<(), EngineError> {
-        if self.relational_views.contains_key(&rename.table) {
+        if self.relational_views.contains_key(&rename.table)
+            || self
+                .relational_materialized_views
+                .contains_key(&rename.table)
+            || self.relational_sequences.contains_key(&rename.table)
+        {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" is not a table",
                 rename.table
@@ -8898,7 +9209,12 @@ impl Engine {
         drop_column: gpu_db_protocol::DropColumn,
         txn_id: TxnId,
     ) -> Result<(), EngineError> {
-        if self.relational_views.contains_key(&drop_column.table) {
+        if self.relational_views.contains_key(&drop_column.table)
+            || self
+                .relational_materialized_views
+                .contains_key(&drop_column.table)
+            || self.relational_sequences.contains_key(&drop_column.table)
+        {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" is not a table",
                 drop_column.table
@@ -9235,6 +9551,12 @@ impl Engine {
                     .relational_catalog
                     .values()
                     .any(|table| table.indexes.iter().any(|index| index.name == create.name))
+                    || self.relational_catalog.contains_key(&create.name)
+                    || self.relational_views.contains_key(&create.name)
+                    || self
+                        .relational_materialized_views
+                        .contains_key(&create.name)
+                    || self.relational_sequences.contains_key(&create.name)
                 {
                     return Err(EngineError::ApplyFailed(format!(
                         "relation \"{}\" already exists",
@@ -9270,6 +9592,10 @@ impl Engine {
                     .relational_catalog
                     .values()
                     .any(|table| table.indexes.iter().any(|index| index.name == add.name))
+                    || self.relational_catalog.contains_key(&add.name)
+                    || self.relational_views.contains_key(&add.name)
+                    || self.relational_materialized_views.contains_key(&add.name)
+                    || self.relational_sequences.contains_key(&add.name)
                 {
                     return Err(EngineError::ApplyFailed(format!(
                         "relation \"{}\" already exists",
@@ -9308,6 +9634,10 @@ impl Engine {
                     .relational_catalog
                     .values()
                     .any(|table| table.indexes.iter().any(|index| index.name == add.name))
+                    || self.relational_catalog.contains_key(&add.name)
+                    || self.relational_views.contains_key(&add.name)
+                    || self.relational_materialized_views.contains_key(&add.name)
+                    || self.relational_sequences.contains_key(&add.name)
                 {
                     return Err(EngineError::ApplyFailed(format!(
                         "relation \"{}\" already exists",
@@ -9336,7 +9666,10 @@ impl Engine {
                 Self::validate_unique_values(&rows, column_idx, &add.name)?;
             }
             Command::AddColumn(add) => {
-                if self.relational_views.contains_key(&add.table) {
+                if self.relational_views.contains_key(&add.table)
+                    || self.relational_materialized_views.contains_key(&add.table)
+                    || self.relational_sequences.contains_key(&add.table)
+                {
                     return Err(EngineError::ApplyFailed(format!(
                         "relation \"{}\" is not a table",
                         add.table
@@ -9370,6 +9703,9 @@ impl Engine {
             }
             Command::RenameTable(rename) => {
                 if self.relational_views.contains_key(&rename.old_name)
+                    || self
+                        .relational_materialized_views
+                        .contains_key(&rename.old_name)
                     || self.relational_sequences.contains_key(&rename.old_name)
                 {
                     return Err(EngineError::ApplyFailed(format!(
@@ -9388,6 +9724,9 @@ impl Engine {
                 }
                 if self.relational_catalog.contains_key(&rename.new_name)
                     || self.relational_views.contains_key(&rename.new_name)
+                    || self
+                        .relational_materialized_views
+                        .contains_key(&rename.new_name)
                     || self.relational_sequences.contains_key(&rename.new_name)
                 {
                     return Err(EngineError::ApplyFailed(format!(
@@ -9407,7 +9746,12 @@ impl Engine {
                 }
             }
             Command::RenameColumn(rename) => {
-                if self.relational_views.contains_key(&rename.table) {
+                if self.relational_views.contains_key(&rename.table)
+                    || self
+                        .relational_materialized_views
+                        .contains_key(&rename.table)
+                    || self.relational_sequences.contains_key(&rename.table)
+                {
                     return Err(EngineError::ApplyFailed(format!(
                         "relation \"{}\" is not a table",
                         rename.table
@@ -9441,7 +9785,12 @@ impl Engine {
                 }
             }
             Command::RenameConstraint(rename) => {
-                if self.relational_views.contains_key(&rename.table) {
+                if self.relational_views.contains_key(&rename.table)
+                    || self
+                        .relational_materialized_views
+                        .contains_key(&rename.table)
+                    || self.relational_sequences.contains_key(&rename.table)
+                {
                     return Err(EngineError::ApplyFailed(format!(
                         "relation \"{}\" is not a table",
                         rename.table
@@ -9461,7 +9810,13 @@ impl Engine {
                         .indexes
                         .iter()
                         .any(|index| index.name == rename.new_name)
-                }) {
+                }) || self.relational_catalog.contains_key(&rename.new_name)
+                    || self.relational_views.contains_key(&rename.new_name)
+                    || self
+                        .relational_materialized_views
+                        .contains_key(&rename.new_name)
+                    || self.relational_sequences.contains_key(&rename.new_name)
+                {
                     return Err(EngineError::ApplyFailed(format!(
                         "relation \"{}\" already exists",
                         rename.new_name
@@ -9482,7 +9837,13 @@ impl Engine {
                         .indexes
                         .iter()
                         .any(|index| index.name == rename.new_name)
-                }) {
+                }) || self.relational_catalog.contains_key(&rename.new_name)
+                    || self.relational_views.contains_key(&rename.new_name)
+                    || self
+                        .relational_materialized_views
+                        .contains_key(&rename.new_name)
+                    || self.relational_sequences.contains_key(&rename.new_name)
+                {
                     return Err(EngineError::ApplyFailed(format!(
                         "relation \"{}\" already exists",
                         rename.new_name
@@ -9507,7 +9868,12 @@ impl Engine {
                 }
             }
             Command::RenameView(rename) => {
-                if self.relational_catalog.contains_key(&rename.old_name) {
+                if self.relational_catalog.contains_key(&rename.old_name)
+                    || self
+                        .relational_materialized_views
+                        .contains_key(&rename.old_name)
+                    || self.relational_sequences.contains_key(&rename.old_name)
+                {
                     return Err(EngineError::ApplyFailed(format!(
                         "relation \"{}\" is not a view",
                         rename.old_name
@@ -9521,6 +9887,44 @@ impl Engine {
                 }
                 if self.relational_catalog.contains_key(&rename.new_name)
                     || self.relational_views.contains_key(&rename.new_name)
+                    || self
+                        .relational_materialized_views
+                        .contains_key(&rename.new_name)
+                    || self.relational_sequences.contains_key(&rename.new_name)
+                {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "relation \"{}\" already exists",
+                        rename.new_name
+                    )));
+                }
+            }
+            Command::CreateMaterializedView(create) => {
+                self.preflight_create_materialized_view(create)?
+            }
+            Command::RenameMaterializedView(rename) => {
+                if self.relational_catalog.contains_key(&rename.old_name)
+                    || self.relational_views.contains_key(&rename.old_name)
+                    || self.relational_sequences.contains_key(&rename.old_name)
+                {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "relation \"{}\" is not a materialized view",
+                        rename.old_name
+                    )));
+                }
+                if !self
+                    .relational_materialized_views
+                    .contains_key(&rename.old_name)
+                {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "materialized view \"{}\" does not exist",
+                        rename.old_name
+                    )));
+                }
+                if self.relational_catalog.contains_key(&rename.new_name)
+                    || self.relational_views.contains_key(&rename.new_name)
+                    || self
+                        .relational_materialized_views
+                        .contains_key(&rename.new_name)
                     || self.relational_sequences.contains_key(&rename.new_name)
                 {
                     return Err(EngineError::ApplyFailed(format!(
@@ -9533,6 +9937,9 @@ impl Engine {
             Command::RenameSequence(rename) => {
                 if self.relational_catalog.contains_key(&rename.old_name)
                     || self.relational_views.contains_key(&rename.old_name)
+                    || self
+                        .relational_materialized_views
+                        .contains_key(&rename.old_name)
                 {
                     return Err(EngineError::ApplyFailed(format!(
                         "relation \"{}\" is not a sequence",
@@ -9547,6 +9954,9 @@ impl Engine {
                 }
                 if self.relational_catalog.contains_key(&rename.new_name)
                     || self.relational_views.contains_key(&rename.new_name)
+                    || self
+                        .relational_materialized_views
+                        .contains_key(&rename.new_name)
                     || self.relational_sequences.contains_key(&rename.new_name)
                 {
                     return Err(EngineError::ApplyFailed(format!(
@@ -9556,7 +9966,10 @@ impl Engine {
                 }
             }
             Command::DropColumn(drop) => {
-                if self.relational_views.contains_key(&drop.table) {
+                if self.relational_views.contains_key(&drop.table)
+                    || self.relational_materialized_views.contains_key(&drop.table)
+                    || self.relational_sequences.contains_key(&drop.table)
+                {
                     return Err(EngineError::ApplyFailed(format!(
                         "relation \"{}\" is not a table",
                         drop.table
@@ -9609,6 +10022,7 @@ impl Engine {
             Command::DropTable(drop) => self.preflight_drop_table(drop)?,
             Command::DropIndex(drop) => self.preflight_drop_index(drop)?,
             Command::DropView(drop) => self.preflight_drop_view(drop)?,
+            Command::DropMaterializedView(drop) => self.preflight_drop_materialized_view(drop)?,
             Command::DropSequence(drop) => self.preflight_drop_sequence(drop)?,
             Command::Insert(insert) => {
                 let table = self.relational_catalog.get(&insert.table).ok_or_else(|| {
@@ -9776,12 +10190,15 @@ impl Engine {
             | Command::RenameIndex(_)
             | Command::CreateView(_)
             | Command::RenameView(_)
+            | Command::CreateMaterializedView(_)
+            | Command::RenameMaterializedView(_)
             | Command::CreateSequence(_)
             | Command::RenameSequence(_)
             | Command::DropTable(_)
             | Command::TruncateTable(_)
             | Command::DropIndex(_)
             | Command::DropView(_)
+            | Command::DropMaterializedView(_)
             | Command::DropSequence(_)
             | Command::AlterColumnDefault(_)
             | Command::CommentOn(_)
@@ -9983,12 +10400,15 @@ impl Engine {
             | Command::RenameIndex(_)
             | Command::CreateView(_)
             | Command::RenameView(_)
+            | Command::CreateMaterializedView(_)
+            | Command::RenameMaterializedView(_)
             | Command::CreateSequence(_)
             | Command::RenameSequence(_)
             | Command::DropTable(_)
             | Command::TruncateTable(_)
             | Command::DropIndex(_)
             | Command::DropView(_)
+            | Command::DropMaterializedView(_)
             | Command::DropSequence(_)
             | Command::AlterColumnDefault(_)
             | Command::CommentOn(_)
@@ -10091,12 +10511,21 @@ impl Engine {
             Command::RenameIndex(_) => Err(ExecuteError::NonReadCommand("ALTER INDEX")),
             Command::CreateView(_) => Err(ExecuteError::NonReadCommand("CREATE VIEW")),
             Command::RenameView(_) => Err(ExecuteError::NonReadCommand("ALTER VIEW")),
+            Command::CreateMaterializedView(_) => {
+                Err(ExecuteError::NonReadCommand("CREATE MATERIALIZED VIEW"))
+            }
+            Command::RenameMaterializedView(_) => {
+                Err(ExecuteError::NonReadCommand("ALTER MATERIALIZED VIEW"))
+            }
             Command::CreateSequence(_) => Err(ExecuteError::NonReadCommand("CREATE SEQUENCE")),
             Command::RenameSequence(_) => Err(ExecuteError::NonReadCommand("ALTER SEQUENCE")),
             Command::DropTable(_) => Err(ExecuteError::NonReadCommand("DROP TABLE")),
             Command::TruncateTable(_) => Err(ExecuteError::NonReadCommand("TRUNCATE TABLE")),
             Command::DropIndex(_) => Err(ExecuteError::NonReadCommand("DROP INDEX")),
             Command::DropView(_) => Err(ExecuteError::NonReadCommand("DROP VIEW")),
+            Command::DropMaterializedView(_) => {
+                Err(ExecuteError::NonReadCommand("DROP MATERIALIZED VIEW"))
+            }
             Command::DropSequence(_) => Err(ExecuteError::NonReadCommand("DROP SEQUENCE")),
             Command::AlterColumnDefault(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
             Command::CommentOn(_) => Err(ExecuteError::NonReadCommand("COMMENT")),
@@ -10118,6 +10547,26 @@ impl Engine {
                 )));
             }
             return self.execute_relational_select(&view.query);
+        }
+        if let Some(view) = self
+            .relational_materialized_views
+            .get(&select.table)
+            .cloned()
+        {
+            if !select_is_plain_view_scan(select) {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "only plain SELECT * FROM materialized view is supported for materialized views"
+                        .to_string(),
+                )));
+            }
+            return Ok(RelationalSelectResult {
+                columns: view.columns,
+                rows: view.rows,
+                planned_target: DeviceTarget::Cpu,
+                executed_target: DeviceTarget::Cpu,
+                fallback_reason: Some(FallbackReason::NotGpuEligible),
+                access_path: RelationalAccessPath::FullTableScan,
+            });
         }
         let (table, bound) = self.bind_relational_select_for_execution(select)?;
         let (query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
@@ -13173,6 +13622,13 @@ impl Engine {
         self.relational_views.get(view)
     }
 
+    pub fn relational_catalog_materialized_view(
+        &self,
+        materialized_view: &str,
+    ) -> Option<&RelationalMaterializedView> {
+        self.relational_materialized_views.get(materialized_view)
+    }
+
     pub fn relational_catalog_sequence(&self, sequence: &str) -> Option<&RelationalSequence> {
         self.relational_sequences.get(sequence)
     }
@@ -13246,6 +13702,14 @@ impl Engine {
         self.relational_comments
             .get(&RelationalCommentTarget::Sequence {
                 sequence: sequence.to_string(),
+            })
+            .map(String::as_str)
+    }
+
+    pub fn relational_materialized_view_comment(&self, materialized_view: &str) -> Option<&str> {
+        self.relational_comments
+            .get(&RelationalCommentTarget::MaterializedView {
+                materialized_view: materialized_view.to_string(),
             })
             .map(String::as_str)
     }
@@ -32291,6 +32755,119 @@ mod tests {
             .execute_text(4, "ALTER SEQUENCE people RENAME TO people_seq_renamed")
             .unwrap_err();
         assert!(table_rename_target.to_string().contains("not a sequence"));
+    }
+
+    #[test]
+    fn relational_sql_materialized_view_lifecycle_replays_from_wal() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO people (id, name) VALUES (1, 'Ada'), (2, 'Linus'), (3, 'Grace')",
+        )
+        .unwrap();
+        e.execute_text(
+            3,
+            "CREATE MATERIALIZED VIEW public.mv_people AS SELECT id, name FROM people WHERE id > 1 ORDER BY id",
+        )
+        .unwrap();
+        e.execute_text(
+            4,
+            "COMMENT ON MATERIALIZED VIEW public.mv_people IS 'people snapshot'",
+        )
+        .unwrap();
+
+        let view = e.relational_catalog_materialized_view("mv_people").unwrap();
+        assert_eq!(view.name, "mv_people");
+        let oid = view.oid;
+        assert_eq!(view.rows.len(), 2);
+        assert_eq!(
+            e.relational_materialized_view_comment("mv_people"),
+            Some("people snapshot")
+        );
+
+        e.execute_text(5, "INSERT INTO people (id, name) VALUES (4, 'Barbara')")
+            .unwrap();
+        let Command::Select(select) = parse_command("SELECT * FROM mv_people").unwrap() else {
+            panic!("expected SELECT plan");
+        };
+        let result = e.execute_relational_select(&select).unwrap();
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![SqlValue::Int4(2), SqlValue::Text("Linus".to_string())],
+                vec![SqlValue::Int4(3), SqlValue::Text("Grace".to_string())],
+            ]
+        );
+
+        e.execute_text(
+            6,
+            "ALTER MATERIALIZED VIEW public.mv_people RENAME TO mv_people_snapshot",
+        )
+        .unwrap();
+        assert!(e
+            .relational_catalog_materialized_view("mv_people")
+            .is_none());
+        assert_eq!(
+            e.relational_catalog_materialized_view("mv_people_snapshot")
+                .unwrap()
+                .oid,
+            oid
+        );
+        assert_eq!(
+            e.relational_materialized_view_comment("mv_people_snapshot"),
+            Some("people snapshot")
+        );
+
+        let mut recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let Command::Select(renamed_select) =
+            parse_command("SELECT * FROM mv_people_snapshot").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let recovered_result = recovered
+            .execute_relational_select(&renamed_select)
+            .unwrap();
+        assert_eq!(recovered_result.rows, result.rows);
+        assert_eq!(
+            recovered.relational_materialized_view_comment("mv_people_snapshot"),
+            Some("people snapshot")
+        );
+
+        e.execute_text(
+            7,
+            "DROP MATERIALIZED VIEW IF EXISTS missing_mv, mv_people_snapshot",
+        )
+        .unwrap();
+        assert!(e
+            .relational_catalog_materialized_view("mv_people_snapshot")
+            .is_none());
+        assert_eq!(
+            e.relational_materialized_view_comment("mv_people_snapshot"),
+            None
+        );
+
+        let mut boundary = Engine::new_local();
+        boundary
+            .execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        boundary
+            .execute_text(2, "CREATE TABLE other_people (id INT, name TEXT)")
+            .unwrap();
+        let table_target = boundary
+            .execute_text(3, "DROP MATERIALIZED VIEW people")
+            .unwrap_err();
+        assert!(table_target.to_string().contains("not a materialized view"));
+        let duplicate = boundary
+            .execute_text(
+                4,
+                "CREATE MATERIALIZED VIEW people AS SELECT id, name FROM other_people",
+            )
+            .unwrap_err();
+        assert!(duplicate
+            .to_string()
+            .contains("relation \"people\" already exists"));
     }
 
     #[test]

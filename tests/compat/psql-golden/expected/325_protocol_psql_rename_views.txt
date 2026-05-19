@@ -42,7 +42,7 @@ CREATE VIEW
 psql:325_protocol_psql_rename_views.sql:27: ERROR:  relation already exists
 psql:325_protocol_psql_rename_views.sql:28: ERROR:  view does not exist
 psql:325_protocol_psql_rename_views.sql:29: ERROR:  relation is not a view
-psql:325_protocol_psql_rename_views.sql:30: ERROR:  query shape is not supported by the compatibility stub
+psql:325_protocol_psql_rename_views.sql:30: ERROR:  relation is not a materialized view
 psql:325_protocol_psql_rename_views.sql:31: ERROR:  query shape is not supported by the compatibility stub
 psql:325_protocol_psql_rename_views.sql:32: ERROR:  query shape is not supported by the compatibility stub
  id | name
