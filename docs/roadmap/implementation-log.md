@@ -1,5 +1,9 @@
 # Implementation Log
 
+## 2026-05-19
+
+- Added bounded multi-index `DROP INDEX [IF EXISTS] [public.]index [, ...]` support for supported metadata-backed public indexes. The parser, engine, and protocol catalog now validate all required index targets before mutation, remove the requested indexes and supported index/constraint comments, preserve table rows and later reads, replay through durable WAL, and keep `CONCURRENTLY`, `CASCADE`/`RESTRICT`, unsupported schemas, physical index storage, and broader dependency semantics out of scope. Real PostgreSQL 16 psql golden scenario 327 covers the client-facing workflow across `pg_catalog.pg_indexes`, `psql \di+`, missing-target recovery, `IF EXISTS`, and unsupported boundaries.
+
 ## 2026-05-18
 
 - Added bounded default-backed `ALTER TABLE [ONLY] [public.]table ADD [COLUMN] column {INT|INTEGER|TEXT} DEFAULT literal` support for supported public base tables. The parser, planner, engine, and protocol catalog now reject no-default, duplicate-column, missing-relation, view-target, unsupported-schema, and type-mismatch boundaries; rewrite existing visible rows with the literal default before catalog exposure; use the same default for later omitted-column inserts; expose the new column through `information_schema.columns`, `pg_catalog.pg_attrdef`, and real `psql \d`; and replay catalog plus rewritten rows through durable WAL recovery. Real PostgreSQL 16 psql golden scenario 319 covers the client-facing workflow.

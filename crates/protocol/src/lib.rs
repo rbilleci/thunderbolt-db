@@ -151,7 +151,7 @@ pub struct TruncateTable {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DropIndex {
-    pub name: String,
+    pub names: Vec<String>,
     pub if_exists: bool,
 }
 
@@ -2569,11 +2569,14 @@ fn parse_drop_index(input: &str) -> Result<DropIndex, ParseError> {
         return Err(ParseError::InvalidRelationalSql);
     }
     let indexes = split_csv(rest)?;
-    let [index] = indexes.as_slice() else {
+    if indexes.is_empty() {
         return Err(ParseError::InvalidRelationalSql);
-    };
+    }
     Ok(DropIndex {
-        name: normalize_relation_identifier(index.trim())?,
+        names: indexes
+            .into_iter()
+            .map(|index| normalize_relation_identifier(index.trim()))
+            .collect::<Result<Vec<_>, _>>()?,
         if_exists,
     })
 }
@@ -10458,23 +10461,26 @@ mod tests {
         assert_eq!(
             parse_command("DROP INDEX public.people_name_idx").unwrap(),
             Command::DropIndex(DropIndex {
-                name: "people_name_idx".to_string(),
+                names: vec!["people_name_idx".to_string()],
                 if_exists: false,
             })
         );
         assert_eq!(
             parse_command("DROP INDEX IF EXISTS people_name_idx").unwrap(),
             Command::DropIndex(DropIndex {
-                name: "people_name_idx".to_string(),
+                names: vec!["people_name_idx".to_string()],
                 if_exists: true,
+            })
+        );
+        assert_eq!(
+            parse_command("DROP INDEX public.a, public.b").unwrap(),
+            Command::DropIndex(DropIndex {
+                names: vec!["a".to_string(), "b".to_string()],
+                if_exists: false,
             })
         );
         assert!(matches!(
             parse_command("DROP INDEX CONCURRENTLY people_name_idx"),
-            Err(ParseError::InvalidRelationalSql)
-        ));
-        assert!(matches!(
-            parse_command("DROP INDEX public.a, public.b"),
             Err(ParseError::InvalidRelationalSql)
         ));
         assert!(matches!(

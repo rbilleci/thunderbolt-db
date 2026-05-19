@@ -1,0 +1,56 @@
+=== bounded multi-index drop ===
+CREATE TABLE
+INSERT 0 2
+CREATE INDEX
+CREATE INDEX
+COMMENT
+COMMENT
+                                                       List of relations
+ Schema |            Name            | Type  |  Owner   |       Table       | Persistence | Access method | Size | Description
+--------+----------------------------+-------+----------+-------------------+-------------+---------------+------+-------------
+ public | drop_index_people_city_idx | index | postgres | drop_index_people | permanent   | btree         |      | city lookup
+ public | drop_index_people_name_idx | index | postgres | drop_index_people | permanent   | btree         |      | name lookup
+ public | drop_index_people_pkey     | index | postgres | drop_index_people | permanent   | btree         |      |
+(3 rows)
+
+psql:327_protocol_psql_drop_indexes.sql:9: ERROR:  index does not exist
+ schemaname |     tablename     |         indexname          |                                        indexdef
+------------+-------------------+----------------------------+-----------------------------------------------------------------------------------------
+ public     | drop_index_people | drop_index_people_city_idx | CREATE INDEX drop_index_people_city_idx ON public.drop_index_people USING btree (city)
+ public     | drop_index_people | drop_index_people_name_idx | CREATE INDEX drop_index_people_name_idx ON public.drop_index_people USING btree (name)
+ public     | drop_index_people | drop_index_people_pkey     | CREATE UNIQUE INDEX drop_index_people_pkey ON public.drop_index_people USING btree (id)
+(3 rows)
+
+DROP INDEX
+                                                       List of relations
+ Schema |            Name            | Type  |  Owner   |       Table       | Persistence | Access method | Size | Description
+--------+----------------------------+-------+----------+-------------------+-------------+---------------+------+-------------
+ public | drop_index_people_city_idx | index | postgres | drop_index_people | permanent   | btree         |      | city lookup
+ public | drop_index_people_pkey     | index | postgres | drop_index_people | permanent   | btree         |      |
+(2 rows)
+
+ schemaname |     tablename     |         indexname          |                                        indexdef
+------------+-------------------+----------------------------+-----------------------------------------------------------------------------------------
+ public     | drop_index_people | drop_index_people_city_idx | CREATE INDEX drop_index_people_city_idx ON public.drop_index_people USING btree (city)
+ public     | drop_index_people | drop_index_people_pkey     | CREATE UNIQUE INDEX drop_index_people_pkey ON public.drop_index_people USING btree (id)
+(2 rows)
+
+ id | name
+----+-------
+  2 | Linus
+(1 row)
+
+DROP INDEX
+psql:327_protocol_psql_drop_indexes.sql:22: error: Did not find any relations.
+ id | name
+----+------
+  1 | Ada
+(1 row)
+
+psql:327_protocol_psql_drop_indexes.sql:24: ERROR:  query shape is not supported by the compatibility stub
+psql:327_protocol_psql_drop_indexes.sql:25: ERROR:  query shape is not supported by the compatibility stub
+psql:327_protocol_psql_drop_indexes.sql:26: ERROR:  query shape is not supported by the compatibility stub
+ id | name
+----+------
+  1 | Ada
+(1 row)

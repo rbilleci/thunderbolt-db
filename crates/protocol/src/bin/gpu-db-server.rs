@@ -6778,31 +6778,40 @@ fn execute_statement(
                 return write_command_complete(stream, "DROP TABLE");
             }
             Command::DropIndex(drop) => {
-                let old_index_count = session.indexes.len();
-                session.indexes.retain(|index| index.name != drop.name);
-                if session.indexes.len() == old_index_count && !drop.if_exists {
-                    return write_error(
-                        stream,
-                        &ErrorField {
-                            code: "42704",
-                            message: "index does not exist",
-                            position: None,
-                        },
-                    );
+                if !drop.if_exists {
+                    for name in &drop.names {
+                        if !session.indexes.iter().any(|index| index.name == *name) {
+                            return write_error(
+                                stream,
+                                &ErrorField {
+                                    code: "42704",
+                                    message: "index does not exist",
+                                    position: None,
+                                },
+                            );
+                        }
+                    }
                 }
+                let old_index_count = session.indexes.len();
+                let drop_names = drop.names.iter().cloned().collect::<BTreeSet<_>>();
+                session
+                    .indexes
+                    .retain(|index| !drop_names.contains(&index.name));
                 session.dirty_indexes |= session.indexes.len() != old_index_count;
                 if session.indexes.len() != old_index_count {
-                    let target = CatalogCommentTarget::Index {
-                        index: drop.name.clone(),
-                    };
-                    session.comments.remove(&target);
-                    session.mark_comment_dirty(target);
+                    for name in &drop.names {
+                        let target = CatalogCommentTarget::Index {
+                            index: name.clone(),
+                        };
+                        session.comments.remove(&target);
+                        session.mark_comment_dirty(target);
+                    }
                     let dropped_constraint_targets = session
                         .comments
                         .keys()
                         .filter(|target| match target {
                             CatalogCommentTarget::Constraint { constraint, .. } => {
-                                constraint == &drop.name
+                                drop_names.contains(constraint)
                             }
                             CatalogCommentTarget::Database { .. }
                             | CatalogCommentTarget::Role { .. }

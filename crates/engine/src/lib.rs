@@ -7935,33 +7935,67 @@ impl Engine {
     }
 
     fn apply_drop_index(&mut self, drop: DropIndex) -> Result<(), EngineError> {
-        for table in self.relational_catalog.values_mut() {
-            let dropped_constraint = table
-                .indexes
-                .iter()
-                .find(|index| index.name == drop.name && index.primary_key)
-                .map(|index| (index.table.clone(), index.name.clone()));
-            let old_len = table.indexes.len();
-            table.indexes.retain(|index| index.name != drop.name);
-            if table.indexes.len() != old_len {
-                self.relational_comments
-                    .remove(&RelationalCommentTarget::Index {
-                        index: drop.name.clone(),
-                    });
-                if let Some((table, constraint)) = dropped_constraint {
-                    self.relational_comments
-                        .remove(&RelationalCommentTarget::Constraint { table, constraint });
+        if !drop.if_exists {
+            for name in &drop.names {
+                if !self
+                    .relational_catalog
+                    .values()
+                    .any(|table| table.indexes.iter().any(|index| index.name == *name))
+                {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "index \"{}\" does not exist",
+                        name
+                    )));
                 }
-                return Ok(());
             }
         }
+        let drop_names = drop.names.iter().cloned().collect::<BTreeSet<_>>();
+        let mut dropped_constraints = Vec::new();
+        for table in self.relational_catalog.values_mut() {
+            dropped_constraints.extend(
+                table
+                    .indexes
+                    .iter()
+                    .filter(|index| {
+                        drop_names.contains(&index.name)
+                            && (index.primary_key || index.unique_constraint)
+                    })
+                    .map(|index| (index.table.clone(), index.name.clone())),
+            );
+            table
+                .indexes
+                .retain(|index| !drop_names.contains(&index.name));
+        }
+        for name in &drop.names {
+            self.relational_comments
+                .remove(&RelationalCommentTarget::Index {
+                    index: name.clone(),
+                });
+        }
+        for (table, constraint) in dropped_constraints {
+            self.relational_comments
+                .remove(&RelationalCommentTarget::Constraint { table, constraint });
+        }
+        Ok(())
+    }
+
+    fn preflight_drop_index(&self, drop: &DropIndex) -> Result<(), EngineError> {
         if drop.if_exists {
             return Ok(());
         }
-        Err(EngineError::ApplyFailed(format!(
-            "index \"{}\" does not exist",
-            drop.name
-        )))
+        for name in &drop.names {
+            if !self
+                .relational_catalog
+                .values()
+                .any(|table| table.indexes.iter().any(|index| index.name == *name))
+            {
+                return Err(EngineError::ApplyFailed(format!(
+                    "index \"{}\" does not exist",
+                    name
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn apply_rename_index(&mut self, rename: RenameIndex) -> Result<(), EngineError> {
@@ -9328,6 +9362,7 @@ impl Engine {
                     )));
                 }
             }
+            Command::DropIndex(drop) => self.preflight_drop_index(drop)?,
             Command::Insert(insert) => {
                 let table = self.relational_catalog.get(&insert.table).ok_or_else(|| {
                     EngineError::ApplyFailed(format!(
@@ -33462,6 +33497,93 @@ mod tests {
         assert!(
             missing_err.contains("index \"people_name_idx\" does not exist"),
             "{missing_err}"
+        );
+
+        let mut multi = Engine::new_local();
+        multi
+            .execute_text(
+                1,
+                "CREATE TABLE people (id INT PRIMARY KEY, name TEXT, city TEXT)",
+            )
+            .unwrap();
+        multi
+            .execute_text(
+                2,
+                "INSERT INTO people (id, name, city) VALUES (1, 'Ada', 'London')",
+            )
+            .unwrap();
+        multi
+            .execute_text(3, "CREATE INDEX people_name_idx ON people (name)")
+            .unwrap();
+        multi
+            .execute_text(4, "CREATE INDEX people_city_idx ON people (city)")
+            .unwrap();
+        multi
+            .execute_text(
+                5,
+                "COMMENT ON INDEX public.people_name_idx IS 'name lookup'",
+            )
+            .unwrap();
+        multi
+            .execute_text(
+                6,
+                "COMMENT ON INDEX public.people_city_idx IS 'city lookup'",
+            )
+            .unwrap();
+        let partial_err = multi
+            .execute_text(7, "DROP INDEX public.people_name_idx, public.missing_idx")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            partial_err.contains("index \"missing_idx\" does not exist"),
+            "{partial_err}"
+        );
+        assert_eq!(
+            multi.relational_index_comment("people_name_idx"),
+            Some("name lookup")
+        );
+        multi
+            .execute_text(
+                8,
+                "DROP INDEX public.people_name_idx, public.people_city_idx",
+            )
+            .unwrap();
+        let table_indexes = multi
+            .relational_catalog_table("people")
+            .unwrap()
+            .indexes
+            .clone();
+        assert_eq!(
+            table_indexes,
+            vec![RelationalIndex {
+                name: "people_pkey".to_string(),
+                table: "people".to_string(),
+                column: "id".to_string(),
+                unique: true,
+                primary_key: true,
+                unique_constraint: false,
+            }]
+        );
+        assert_eq!(multi.relational_index_comment("people_name_idx"), None);
+        assert_eq!(multi.relational_index_comment("people_city_idx"), None);
+        let Command::Select(select) =
+            parse_command("SELECT id, name FROM people WHERE id = 1").unwrap()
+        else {
+            panic!("expected SELECT");
+        };
+        let rows = multi.execute_relational_select(&select).unwrap();
+        assert_eq!(
+            rows.rows,
+            vec![vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())]]
+        );
+
+        let recovered = Engine::recover_from_durable_wal(multi.durable_wal_records()).unwrap();
+        assert_eq!(
+            recovered
+                .relational_catalog_table("people")
+                .unwrap()
+                .indexes,
+            table_indexes
         );
     }
 
