@@ -1,0 +1,35 @@
+=== protocol psql bounded subscriptions ===
+CREATE TABLE
+CREATE PUBLICATION
+CREATE PUBLICATION
+CREATE SUBSCRIPTION
+              List of subscriptions
+  Name   |  Owner   | Enabled |   Publication
+---------+----------+---------+------------------
+ app_sub | postgres | f       | sub_pub, sub_all
+(1 row)
+
+ subname | subenabled |          subconninfo           |  subpublications
+---------+------------+--------------------------------+-------------------
+ app_sub | f          | host=localhost dbname=postgres | {sub_pub,sub_all}
+(1 row)
+
+psql:337_protocol_psql_subscriptions.sql:10: ERROR:  subscription already exists
+psql:337_protocol_psql_subscriptions.sql:11: ERROR:  publication does not exist
+psql:337_protocol_psql_subscriptions.sql:12: ERROR:  subscription publication specified more than once
+psql:337_protocol_psql_subscriptions.sql:13: ERROR:  query shape is not supported by the compatibility stub
+psql:337_protocol_psql_subscriptions.sql:14: ERROR:  query shape is not supported by the compatibility stub
+psql:337_protocol_psql_subscriptions.sql:15: ERROR:  query shape is not supported by the compatibility stub
+psql:337_protocol_psql_subscriptions.sql:16: ERROR:  subscription does not exist
+DROP SUBSCRIPTION
+DROP SUBSCRIPTION
+        List of subscriptions
+ Name | Owner | Enabled | Publication
+------+-------+---------+-------------
+(0 rows)
+
+DROP PUBLICATION
+                              List of publications
+ Name | Owner | All tables | Inserts | Updates | Deletes | Truncates | Via root
+------+-------+------------+---------+---------+---------+-----------+----------
+(0 rows)

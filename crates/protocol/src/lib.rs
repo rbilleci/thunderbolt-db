@@ -35,6 +35,8 @@ pub enum Command {
     DropDomain(DropDomain),
     CreatePublication(CreatePublication),
     DropPublication(DropPublication),
+    CreateSubscription(CreateSubscription),
+    DropSubscription(DropSubscription),
     GrantTable(GrantTable),
     RevokeTable(RevokeTable),
     GrantDefaultTablePrivileges(DefaultTablePrivileges),
@@ -223,6 +225,19 @@ pub struct CreatePublication {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DropPublication {
+    pub names: Vec<String>,
+    pub if_exists: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateSubscription {
+    pub name: String,
+    pub connection: String,
+    pub publications: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropSubscription {
     pub names: Vec<String>,
     pub if_exists: bool,
 }
@@ -1886,6 +1901,9 @@ fn parse_relational_command(input: &str) -> Option<Result<Command, ParseError>> 
         if second.eq_ignore_ascii_case("PUBLICATION") {
             return Some(parse_create_publication(input).map(Command::CreatePublication));
         }
+        if second.eq_ignore_ascii_case("SUBSCRIPTION") {
+            return Some(parse_create_subscription(input).map(Command::CreateSubscription));
+        }
         if second.eq_ignore_ascii_case("OR") {
             let third = input.split_whitespace().nth(2)?;
             let fourth = input.split_whitespace().nth(3)?;
@@ -1922,6 +1940,9 @@ fn parse_relational_command(input: &str) -> Option<Result<Command, ParseError>> 
         }
         if second.eq_ignore_ascii_case("PUBLICATION") {
             return Some(parse_drop_publication(input).map(Command::DropPublication));
+        }
+        if second.eq_ignore_ascii_case("SUBSCRIPTION") {
+            return Some(parse_drop_subscription(input).map(Command::DropSubscription));
         }
         return Some(Err(ParseError::InvalidRelationalSql));
     }
@@ -3436,6 +3457,120 @@ fn parse_drop_publication(input: &str) -> Result<DropPublication, ParseError> {
         names: publications
             .into_iter()
             .map(|publication| normalize_identifier(publication.trim()))
+            .collect::<Result<Vec<_>, _>>()?,
+        if_exists,
+    })
+}
+
+fn parse_create_subscription(input: &str) -> Result<CreateSubscription, ParseError> {
+    let rest = strip_keyword_prefix_case_insensitive(input, "CREATE")
+        .and_then(|s| strip_keyword_prefix_case_insensitive(s.trim_start(), "SUBSCRIPTION"))
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    let (raw_name, rest) = split_leading_identifier(rest)?;
+    let name = normalize_identifier(raw_name)?;
+    let rest = strip_keyword_prefix_case_insensitive(rest.trim_start(), "CONNECTION")
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    let publication_idx =
+        find_keyword_outside_quotes(rest, "PUBLICATION").ok_or(ParseError::InvalidRelationalSql)?;
+    let (connection_literal, after_connection) = rest.split_at(publication_idx);
+    let Ok(SqlValue::Text(connection)) = parse_sql_value(connection_literal.trim()) else {
+        return Err(ParseError::InvalidRelationalSql);
+    };
+    let rest = strip_keyword_prefix_case_insensitive(after_connection, "PUBLICATION")
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    let (publication_list, option_clause) =
+        if let Some(with_idx) = find_keyword_outside_quotes(rest, "WITH") {
+            let (publications, options) = rest.split_at(with_idx);
+            (
+                publications.trim(),
+                Some(
+                    strip_keyword_prefix_case_insensitive(options, "WITH")
+                        .ok_or(ParseError::InvalidRelationalSql)?
+                        .trim(),
+                ),
+            )
+        } else {
+            (rest.trim(), None)
+        };
+    if publication_list.is_empty() {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let publications = split_csv(publication_list)?
+        .into_iter()
+        .map(|publication| normalize_identifier(publication.trim()))
+        .collect::<Result<Vec<_>, _>>()?;
+    if publications.is_empty() {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let Some(options) = option_clause else {
+        return Err(ParseError::InvalidRelationalSql);
+    };
+    let options = options
+        .strip_prefix('(')
+        .and_then(|s| s.strip_suffix(')'))
+        .ok_or(ParseError::InvalidRelationalSql)?;
+    let mut saw_connect = false;
+    let mut saw_enabled = false;
+    for option in split_csv(options)? {
+        let (key, value) = option
+            .split_once('=')
+            .ok_or(ParseError::InvalidRelationalSql)?;
+        let key = key.trim();
+        let value = value.trim();
+        if key.eq_ignore_ascii_case("connect") {
+            if saw_connect || parse_bool_literal(value)? {
+                return Err(ParseError::InvalidRelationalSql);
+            }
+            saw_connect = true;
+        } else if key.eq_ignore_ascii_case("enabled") {
+            if saw_enabled || parse_bool_literal(value)? {
+                return Err(ParseError::InvalidRelationalSql);
+            }
+            saw_enabled = true;
+        } else {
+            return Err(ParseError::InvalidRelationalSql);
+        }
+    }
+    if !saw_connect || !saw_enabled {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    Ok(CreateSubscription {
+        name,
+        connection,
+        publications,
+    })
+}
+
+fn parse_drop_subscription(input: &str) -> Result<DropSubscription, ParseError> {
+    let mut rest = strip_keyword_prefix_case_insensitive(input, "DROP")
+        .and_then(|s| strip_keyword_prefix_case_insensitive(s.trim_start(), "SUBSCRIPTION"))
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    let if_exists = if let Some(after_if) = strip_keyword_prefix_case_insensitive(rest, "IF") {
+        let after_exists = strip_keyword_prefix_case_insensitive(after_if.trim_start(), "EXISTS")
+            .ok_or(ParseError::InvalidRelationalSql)?;
+        rest = after_exists.trim_start();
+        true
+    } else {
+        false
+    };
+    if rest.is_empty()
+        || find_keyword_outside_quotes(rest, "CASCADE").is_some()
+        || find_keyword_outside_quotes(rest, "RESTRICT").is_some()
+    {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let subscriptions = split_csv(rest)?;
+    if subscriptions.is_empty() {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    Ok(DropSubscription {
+        names: subscriptions
+            .into_iter()
+            .map(|subscription| normalize_identifier(subscription.trim()))
             .collect::<Result<Vec<_>, _>>()?,
         if_exists,
     })
@@ -11592,6 +11727,46 @@ default: Some(ColumnDefault::SequenceNextVal {
         ));
         assert!(matches!(
             parse_command("DROP PUBLICATION app_pub CASCADE"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert_eq!(
+            parse_command(
+                "CREATE SUBSCRIPTION app_sub CONNECTION 'host=localhost dbname=postgres' PUBLICATION app_pub, all_pub WITH (connect = false, enabled = false)"
+            )
+            .unwrap(),
+            Command::CreateSubscription(CreateSubscription {
+                name: "app_sub".to_string(),
+                connection: "host=localhost dbname=postgres".to_string(),
+                publications: vec!["app_pub".to_string(), "all_pub".to_string()],
+            })
+        );
+        assert_eq!(
+            parse_command("DROP SUBSCRIPTION IF EXISTS app_sub, stale_sub").unwrap(),
+            Command::DropSubscription(DropSubscription {
+                names: vec!["app_sub".to_string(), "stale_sub".to_string()],
+                if_exists: true,
+            })
+        );
+        assert!(matches!(
+            parse_command(
+                "CREATE SUBSCRIPTION app_sub CONNECTION 'host=localhost' PUBLICATION app_pub"
+            ),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command(
+                "CREATE SUBSCRIPTION app_sub CONNECTION 'host=localhost' PUBLICATION app_pub WITH (connect = true, enabled = false)"
+            ),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command(
+                "CREATE SUBSCRIPTION app_sub CONNECTION 'host=localhost' PUBLICATION app_pub WITH (connect = false, enabled = true)"
+            ),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command("DROP SUBSCRIPTION app_sub CASCADE"),
             Err(ParseError::InvalidRelationalSql)
         ));
 

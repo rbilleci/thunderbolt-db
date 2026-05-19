@@ -2058,6 +2058,7 @@ struct Session {
     sequences: HashMap<String, Sequence>,
     domains: BTreeMap<String, Domain>,
     publications: BTreeMap<String, Publication>,
+    subscriptions: BTreeMap<String, Subscription>,
     currval_sequences: HashMap<String, i64>,
     indexes: Vec<CatalogIndex>,
     table_acls: BTreeMap<String, BTreeMap<String, BTreeSet<TablePrivilege>>>,
@@ -2069,6 +2070,7 @@ struct Session {
     dirty_sequences: BTreeSet<String>,
     dirty_domains: BTreeSet<String>,
     dirty_publications: BTreeSet<String>,
+    dirty_subscriptions: BTreeSet<String>,
     dirty_indexes: bool,
     dirty_table_acls: BTreeSet<String>,
     dirty_default_table_acl: bool,
@@ -2086,6 +2088,7 @@ struct SharedCatalog {
     sequences: HashMap<String, Sequence>,
     domains: BTreeMap<String, Domain>,
     publications: BTreeMap<String, Publication>,
+    subscriptions: BTreeMap<String, Subscription>,
     indexes: Vec<CatalogIndex>,
     table_acls: BTreeMap<String, BTreeMap<String, BTreeSet<TablePrivilege>>>,
     default_table_acl: BTreeMap<String, BTreeSet<TablePrivilege>>,
@@ -2102,6 +2105,7 @@ impl Default for SharedCatalog {
             sequences: HashMap::new(),
             domains: BTreeMap::new(),
             publications: BTreeMap::new(),
+            subscriptions: BTreeMap::new(),
             indexes: Vec::new(),
             table_acls: BTreeMap::new(),
             default_table_acl: BTreeMap::new(),
@@ -2142,6 +2146,7 @@ impl Session {
             sequences: catalog.sequences,
             domains: catalog.domains,
             publications: catalog.publications,
+            subscriptions: catalog.subscriptions,
             currval_sequences: HashMap::new(),
             indexes: catalog.indexes,
             table_acls: catalog.table_acls,
@@ -2153,6 +2158,7 @@ impl Session {
             dirty_sequences: BTreeSet::new(),
             dirty_domains: BTreeSet::new(),
             dirty_publications: BTreeSet::new(),
+            dirty_subscriptions: BTreeSet::new(),
             dirty_indexes: false,
             dirty_table_acls: BTreeSet::new(),
             dirty_default_table_acl: false,
@@ -2187,6 +2193,10 @@ impl Session {
         self.dirty_publications.insert(publication.into());
     }
 
+    fn mark_subscription_dirty(&mut self, subscription: impl Into<String>) {
+        self.dirty_subscriptions.insert(subscription.into());
+    }
+
     fn mark_table_acl_dirty(&mut self, table: impl Into<String>) {
         self.dirty_table_acls.insert(table.into());
     }
@@ -2207,6 +2217,7 @@ impl Session {
             self.dirty_sequences.clear();
             self.dirty_domains.clear();
             self.dirty_publications.clear();
+            self.dirty_subscriptions.clear();
             self.dirty_table_acls.clear();
             self.dirty_default_table_acl = false;
             self.dirty_comment_targets.clear();
@@ -2261,6 +2272,15 @@ impl Session {
                     .insert(publication_name.clone(), publication.clone());
             } else {
                 catalog.publications.remove(publication_name);
+            }
+        }
+        for subscription_name in &self.dirty_subscriptions {
+            if let Some(subscription) = self.subscriptions.get(subscription_name) {
+                catalog
+                    .subscriptions
+                    .insert(subscription_name.clone(), subscription.clone());
+            } else {
+                catalog.subscriptions.remove(subscription_name);
             }
         }
         for table_name in &self.dirty_table_acls {
@@ -2322,6 +2342,7 @@ impl Session {
         self.dirty_sequences.clear();
         self.dirty_domains.clear();
         self.dirty_publications.clear();
+        self.dirty_subscriptions.clear();
         self.dirty_table_acls.clear();
     }
 
@@ -2402,6 +2423,15 @@ struct Publication {
     name: String,
     all_tables: bool,
     tables: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Subscription {
+    oid: u32,
+    name: String,
+    connection: String,
+    publications: Vec<String>,
+    enabled: bool,
 }
 
 fn sequence_target_error(session: &Session, name: &str) -> Option<ErrorField> {
@@ -2719,6 +2749,85 @@ fn drop_publication(
     for name in names {
         session.publications.remove(name);
         session.mark_publication_dirty(name.clone());
+    }
+    Ok(())
+}
+
+fn create_subscription(
+    session: &mut Session,
+    name: String,
+    connection: String,
+    publications: Vec<String>,
+) -> Result<(), ErrorField> {
+    if session.subscriptions.contains_key(&name) {
+        return Err(ErrorField {
+            code: "42710",
+            message: "subscription already exists",
+            position: None,
+        });
+    }
+    let mut seen = BTreeSet::new();
+    for publication in &publications {
+        if !seen.insert(publication.clone()) {
+            return Err(ErrorField {
+                code: "42710",
+                message: "subscription publication specified more than once",
+                position: None,
+            });
+        }
+        if !session.publications.contains_key(publication) {
+            return Err(ErrorField {
+                code: "42704",
+                message: "publication does not exist",
+                position: None,
+            });
+        }
+    }
+    let oid = session.next_relation_oid;
+    session.next_relation_oid = session.next_relation_oid.checked_add(1).ok_or(ErrorField {
+        code: "54000",
+        message: "subscription OID allocation exhausted",
+        position: None,
+    })?;
+    session.subscriptions.insert(
+        name.clone(),
+        Subscription {
+            oid,
+            name: name.clone(),
+            connection,
+            publications,
+            enabled: false,
+        },
+    );
+    session.mark_subscription_dirty(name);
+    Ok(())
+}
+
+fn drop_subscription(
+    session: &mut Session,
+    names: &[String],
+    if_exists: bool,
+) -> Result<(), ErrorField> {
+    let mut seen = BTreeSet::new();
+    for name in names {
+        if !seen.insert(name.clone()) {
+            return Err(ErrorField {
+                code: "42710",
+                message: "subscription specified more than once",
+                position: None,
+            });
+        }
+        if !if_exists && !session.subscriptions.contains_key(name) {
+            return Err(ErrorField {
+                code: "42704",
+                message: "subscription does not exist",
+                position: None,
+            });
+        }
+    }
+    for name in names {
+        session.subscriptions.remove(name);
+        session.mark_subscription_dirty(name.clone());
     }
     Ok(())
 }
@@ -6849,7 +6958,11 @@ fn execute_statement(
     if canonical
         == "select count(*) from pg_subscription where subdbid = (select oid from pg_database where datname = current_database())"
     {
-        return write_single_row(stream, &[int4_column("count")], &[vec![Some("0".to_string())]]);
+        return write_single_row(
+            stream,
+            &[int4_column("count")],
+            &[vec![Some(session.subscriptions.len().to_string())]],
+        );
     }
     if canonical == "select oid, rolname from pg_catalog.pg_roles order by 1" {
         return write_single_row(
@@ -8256,6 +8369,25 @@ fn execute_statement(
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, "DROP PUBLICATION");
             }
+            Command::CreateSubscription(create) => {
+                if let Err(error) = create_subscription(
+                    session,
+                    create.name,
+                    create.connection,
+                    create.publications,
+                ) {
+                    return write_error(stream, &error);
+                }
+                session.persist_catalog_snapshot();
+                return write_command_complete(stream, "CREATE SUBSCRIPTION");
+            }
+            Command::DropSubscription(drop) => {
+                if let Err(error) = drop_subscription(session, &drop.names, drop.if_exists) {
+                    return write_error(stream, &error);
+                }
+                session.persist_catalog_snapshot();
+                return write_command_complete(stream, "DROP SUBSCRIPTION");
+            }
             Command::DropTable(drop) => {
                 let mut seen = BTreeSet::new();
                 for name in &drop.names {
@@ -9553,7 +9685,21 @@ fn execute_statement(
                 bool_column("Enabled"),
                 text_column("Publication"),
             ],
-            &catalog_empty_rows(),
+            &catalog_psql_subscription_rows(session),
+        );
+    }
+    if canonical
+        == "select subname, subenabled, subconninfo, subpublications from pg_catalog.pg_subscription order by subname"
+    {
+        return write_single_row(
+            stream,
+            &[
+                text_column("subname"),
+                bool_column("subenabled"),
+                text_column("subconninfo"),
+                text_column("subpublications"),
+            ],
+            &catalog_subscription_direct_rows(session),
         );
     }
     if canonical == psql_list_default_access_privileges_catalog_query() {
@@ -11645,6 +11791,36 @@ fn catalog_describe_publication_rows(session: &Session, oid: u32) -> Vec<Vec<Opt
         }
     }
     rows
+}
+
+fn catalog_psql_subscription_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    session
+        .subscriptions
+        .values()
+        .map(|subscription| {
+            vec![
+                Some(subscription.name.clone()),
+                Some("postgres".to_string()),
+                Some(bool_text(subscription.enabled)),
+                Some(subscription.publications.join(", ")),
+            ]
+        })
+        .collect()
+}
+
+fn catalog_subscription_direct_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    session
+        .subscriptions
+        .values()
+        .map(|subscription| {
+            vec![
+                Some(subscription.name.clone()),
+                Some(bool_text(subscription.enabled)),
+                Some(subscription.connection.clone()),
+                Some(format!("{{{}}}", subscription.publications.join(","))),
+            ]
+        })
+        .collect()
 }
 
 fn catalog_schema_publication_rows(session: &Session) -> Vec<Vec<Option<String>>> {

@@ -21,11 +21,12 @@ use gpu_db_planner::{ExecutionPlan, Planner, PlannerConfig};
 use gpu_db_protocol::{
     parse_command, AddUniqueConstraint, ColumnDef, ColumnDefault, Command, CommentTarget,
     CreateDomain, CreateIndex, CreateMaterializedView, CreatePublication, CreateSequence,
-    CreateTable, CreateView, Delete, DropConstraint, DropDomain, DropIndex, DropMaterializedView,
-    DropPublication, DropSequence, DropTable, DropView, Insert, ParseError, PublicationTarget,
-    RefreshMaterializedView, RenameColumn, RenameConstraint, RenameIndex, RenameMaterializedView,
-    RenameSequence, RenameTable, RenameView, Select, SelectFilterOp, SelectProjection,
-    SequenceNextVal, SequenceSetVal, SqlType, SqlValue, TablePrivilege, TruncateTable, Update,
+    CreateSubscription, CreateTable, CreateView, Delete, DropConstraint, DropDomain, DropIndex,
+    DropMaterializedView, DropPublication, DropSequence, DropSubscription, DropTable, DropView,
+    Insert, ParseError, PublicationTarget, RefreshMaterializedView, RenameColumn, RenameConstraint,
+    RenameIndex, RenameMaterializedView, RenameSequence, RenameTable, RenameView, Select,
+    SelectFilterOp, SelectProjection, SequenceNextVal, SequenceSetVal, SqlType, SqlValue,
+    TablePrivilege, TruncateTable, Update,
 };
 use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine};
 use gpu_db_storage::{
@@ -99,6 +100,8 @@ impl ReplicatedStateMachine for KvStateMachine {
                     | Command::RenameSequence(_)
                     | Command::CreatePublication(_)
                     | Command::DropPublication(_)
+                    | Command::CreateSubscription(_)
+                    | Command::DropSubscription(_)
                     | Command::DropTable(_)
                     | Command::TruncateTable(_)
                     | Command::DropIndex(_)
@@ -5965,6 +5968,7 @@ pub struct Engine {
     relational_sequences: BTreeMap<String, RelationalSequence>,
     relational_domains: BTreeMap<String, RelationalDomain>,
     relational_publications: BTreeMap<String, RelationalPublication>,
+    relational_subscriptions: BTreeMap<String, RelationalSubscription>,
     relational_default_table_acl: BTreeMap<String, BTreeSet<TablePrivilege>>,
     relational_comments: BTreeMap<RelationalCommentTarget, String>,
     relational_value_index: BTreeMap<RelationalIndexKey, Vec<String>>,
@@ -6061,6 +6065,15 @@ pub struct RelationalPublication {
     pub oid: u32,
     pub all_tables: bool,
     pub tables: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationalSubscription {
+    pub name: String,
+    pub oid: u32,
+    pub connection: String,
+    pub publications: Vec<String>,
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -7383,6 +7396,7 @@ impl Engine {
             relational_sequences: BTreeMap::new(),
             relational_domains: BTreeMap::new(),
             relational_publications: BTreeMap::new(),
+            relational_subscriptions: BTreeMap::new(),
             relational_default_table_acl: BTreeMap::new(),
             relational_comments: BTreeMap::new(),
             relational_value_index: BTreeMap::new(),
@@ -7661,6 +7675,8 @@ impl Engine {
             Command::DropDomain(drop) => self.apply_drop_domain(drop)?,
             Command::CreatePublication(create) => self.apply_create_publication(create)?,
             Command::DropPublication(drop) => self.apply_drop_publication(drop)?,
+            Command::CreateSubscription(create) => self.apply_create_subscription(create)?,
+            Command::DropSubscription(drop) => self.apply_drop_subscription(drop)?,
             Command::GrantTable(grant) => {
                 self.apply_grant_table(&grant.table, &grant.grantee, &grant.privileges)?
             }
@@ -8985,6 +9001,80 @@ impl Engine {
         self.preflight_drop_publication(&drop)?;
         for name in &drop.names {
             self.relational_publications.remove(name);
+        }
+        Ok(())
+    }
+
+    fn preflight_create_subscription(
+        &self,
+        create: &CreateSubscription,
+    ) -> Result<(), EngineError> {
+        if self.relational_subscriptions.contains_key(&create.name) {
+            return Err(EngineError::ApplyFailed(format!(
+                "subscription \"{}\" already exists",
+                create.name
+            )));
+        }
+        let mut seen = BTreeSet::new();
+        for publication in &create.publications {
+            if !seen.insert(publication) {
+                return Err(EngineError::ApplyFailed(format!(
+                    "publication \"{}\" specified more than once",
+                    publication
+                )));
+            }
+            if !self.relational_publications.contains_key(publication) {
+                return Err(EngineError::ApplyFailed(format!(
+                    "publication \"{}\" does not exist",
+                    publication
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_create_subscription(&mut self, create: CreateSubscription) -> Result<(), EngineError> {
+        self.preflight_create_subscription(&create)?;
+        let oid = self.relational_next_oid;
+        self.relational_next_oid = self.relational_next_oid.checked_add(1).ok_or_else(|| {
+            EngineError::ApplyFailed("relational subscription OID allocation exhausted".to_string())
+        })?;
+        self.relational_subscriptions.insert(
+            create.name.clone(),
+            RelationalSubscription {
+                name: create.name,
+                oid,
+                connection: create.connection,
+                publications: create.publications,
+                enabled: false,
+            },
+        );
+        Ok(())
+    }
+
+    fn preflight_drop_subscription(&self, drop: &DropSubscription) -> Result<(), EngineError> {
+        let mut seen = BTreeSet::new();
+        for name in &drop.names {
+            if !seen.insert(name) {
+                return Err(EngineError::ApplyFailed(format!(
+                    "subscription \"{}\" specified more than once",
+                    name
+                )));
+            }
+            if !drop.if_exists && !self.relational_subscriptions.contains_key(name) {
+                return Err(EngineError::ApplyFailed(format!(
+                    "subscription \"{}\" does not exist",
+                    name
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_drop_subscription(&mut self, drop: DropSubscription) -> Result<(), EngineError> {
+        self.preflight_drop_subscription(&drop)?;
+        for name in &drop.names {
+            self.relational_subscriptions.remove(name);
         }
         Ok(())
     }
@@ -10700,6 +10790,8 @@ impl Engine {
             Command::RevokeTable(revoke) => self.preflight_table_acl_target(&revoke.table)?,
             Command::CreatePublication(create) => self.preflight_create_publication(create)?,
             Command::DropPublication(drop) => self.preflight_drop_publication(drop)?,
+            Command::CreateSubscription(create) => self.preflight_create_subscription(create)?,
+            Command::DropSubscription(drop) => self.preflight_drop_subscription(drop)?,
             Command::GrantDefaultTablePrivileges(_) | Command::RevokeDefaultTablePrivileges(_) => {}
             Command::Insert(insert) => {
                 let table = self.relational_catalog.get(&insert.table).ok_or_else(|| {
@@ -10916,6 +11008,8 @@ impl Engine {
             | Command::RevokeTable(_)
             | Command::CreatePublication(_)
             | Command::DropPublication(_)
+            | Command::CreateSubscription(_)
+            | Command::DropSubscription(_)
             | Command::GrantDefaultTablePrivileges(_)
             | Command::RevokeDefaultTablePrivileges(_)
             | Command::AlterColumnDefault(_)
@@ -11137,6 +11231,8 @@ impl Engine {
             | Command::RevokeTable(_)
             | Command::CreatePublication(_)
             | Command::DropPublication(_)
+            | Command::CreateSubscription(_)
+            | Command::DropSubscription(_)
             | Command::GrantDefaultTablePrivileges(_)
             | Command::RevokeDefaultTablePrivileges(_)
             | Command::AlterColumnDefault(_)
@@ -11269,6 +11365,10 @@ impl Engine {
                 Err(ExecuteError::NonReadCommand("CREATE PUBLICATION"))
             }
             Command::DropPublication(_) => Err(ExecuteError::NonReadCommand("DROP PUBLICATION")),
+            Command::CreateSubscription(_) => {
+                Err(ExecuteError::NonReadCommand("CREATE SUBSCRIPTION"))
+            }
+            Command::DropSubscription(_) => Err(ExecuteError::NonReadCommand("DROP SUBSCRIPTION")),
             Command::GrantDefaultTablePrivileges(_) => {
                 Err(ExecuteError::NonReadCommand("ALTER DEFAULT PRIVILEGES"))
             }
@@ -14403,6 +14503,13 @@ impl Engine {
         publication: &str,
     ) -> Option<&RelationalPublication> {
         self.relational_publications.get(publication)
+    }
+
+    pub fn relational_catalog_subscription(
+        &self,
+        subscription: &str,
+    ) -> Option<&RelationalSubscription> {
+        self.relational_subscriptions.get(subscription)
     }
 
     pub fn relational_table_comment(&self, table: &str) -> Option<&str> {
@@ -36396,6 +36503,67 @@ mod tests {
             missing_table.contains("relation \"missing_people\" does not exist"),
             "{missing_table}"
         );
+    }
+
+    #[test]
+    fn relational_catalog_records_disabled_subscriptions_and_replays_from_wal() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(2, "CREATE PUBLICATION app_pub FOR TABLE people")
+            .unwrap();
+        e.execute_text(3, "CREATE PUBLICATION all_pub FOR ALL TABLES")
+            .unwrap();
+        e.execute_text(
+            4,
+            "CREATE SUBSCRIPTION app_sub CONNECTION 'host=localhost dbname=postgres' PUBLICATION app_pub, all_pub WITH (connect = false, enabled = false)",
+        )
+        .unwrap();
+
+        let subscription = e.relational_catalog_subscription("app_sub").unwrap();
+        assert_eq!(subscription.connection, "host=localhost dbname=postgres");
+        assert_eq!(
+            subscription.publications,
+            vec!["app_pub".to_string(), "all_pub".to_string()]
+        );
+        assert!(!subscription.enabled);
+
+        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        assert_eq!(
+            recovered
+                .relational_catalog_subscription("app_sub")
+                .unwrap()
+                .publications,
+            vec!["app_pub".to_string(), "all_pub".to_string()]
+        );
+
+        let duplicate = e
+            .execute_text(
+                5,
+                "CREATE SUBSCRIPTION app_sub CONNECTION 'host=localhost' PUBLICATION app_pub WITH (connect = false, enabled = false)",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            duplicate.contains("subscription \"app_sub\" already exists"),
+            "{duplicate}"
+        );
+        let missing_publication = e
+            .execute_text(
+                6,
+                "CREATE SUBSCRIPTION missing_pub_sub CONNECTION 'host=localhost' PUBLICATION missing_pub WITH (connect = false, enabled = false)",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            missing_publication.contains("publication \"missing_pub\" does not exist"),
+            "{missing_publication}"
+        );
+
+        e.execute_text(7, "DROP SUBSCRIPTION app_sub").unwrap();
+        assert!(e.relational_catalog_subscription("app_sub").is_none());
+        e.execute_text(8, "DROP SUBSCRIPTION IF EXISTS missing_sub")
+            .unwrap();
     }
 
     #[test]

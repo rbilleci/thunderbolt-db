@@ -81,6 +81,8 @@ impl Planner {
             | Command::RenameSequence(_)
             | Command::CreatePublication(_)
             | Command::DropPublication(_)
+            | Command::CreateSubscription(_)
+            | Command::DropSubscription(_)
             | Command::DropTable(_)
             | Command::TruncateTable(_)
             | Command::DropIndex(_)
