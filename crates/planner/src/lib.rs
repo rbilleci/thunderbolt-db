@@ -75,6 +75,8 @@ impl Planner {
             | Command::RefreshMaterializedView(_)
             | Command::RenameMaterializedView(_)
             | Command::CreateSequence(_)
+            | Command::SequenceNextVal(_)
+            | Command::SequenceSetVal(_)
             | Command::RenameSequence(_)
             | Command::DropTable(_)
             | Command::TruncateTable(_)
@@ -100,7 +102,7 @@ impl Planner {
                 },
                 kind: PlanKind::Read,
             },
-            Command::Select(_) => PlanNode {
+            Command::Select(_) | Command::SequenceCurrVal(_) => PlanNode {
                 op: PlannedOp {
                     name: "relational_select".to_string(),
                     target: DeviceTarget::Gpu(self.cfg.default_gpu_id),

@@ -23,8 +23,8 @@ use gpu_db_protocol::{
     CreateMaterializedView, CreateSequence, CreateTable, CreateView, Delete, DropConstraint,
     DropIndex, DropMaterializedView, DropSequence, DropTable, DropView, Insert, ParseError,
     RefreshMaterializedView, RenameColumn, RenameConstraint, RenameIndex, RenameMaterializedView,
-    RenameSequence, RenameTable, RenameView, Select, SelectFilterOp, SelectProjection, SqlType,
-    SqlValue, TruncateTable, Update,
+    RenameSequence, RenameTable, RenameView, Select, SelectFilterOp, SelectProjection,
+    SequenceNextVal, SequenceSetVal, SqlType, SqlValue, TruncateTable, Update,
 };
 use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine};
 use gpu_db_storage::{
@@ -91,6 +91,9 @@ impl ReplicatedStateMachine for KvStateMachine {
                     | Command::RefreshMaterializedView(_)
                     | Command::RenameMaterializedView(_)
                     | Command::CreateSequence(_)
+                    | Command::SequenceNextVal(_)
+                    | Command::SequenceCurrVal(_)
+                    | Command::SequenceSetVal(_)
                     | Command::RenameSequence(_)
                     | Command::DropTable(_)
                     | Command::TruncateTable(_)
@@ -6026,6 +6029,8 @@ pub struct RelationalSequence {
     pub schema: String,
     pub name: String,
     pub oid: u32,
+    pub last_value: i64,
+    pub is_called: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -7575,6 +7580,12 @@ impl Engine {
                 self.apply_rename_materialized_view(rename)?
             }
             Command::CreateSequence(create) => self.apply_create_sequence(create)?,
+            Command::SequenceNextVal(nextval) => {
+                self.apply_sequence_nextval(nextval)?;
+            }
+            Command::SequenceSetVal(setval) => {
+                self.apply_sequence_setval(setval)?;
+            }
             Command::RenameSequence(rename) => self.apply_rename_sequence(rename)?,
             Command::DropTable(drop) => self.apply_drop_table(drop, txn_id)?,
             Command::TruncateTable(truncate) => self.apply_truncate_table(truncate, txn_id)?,
@@ -7769,9 +7780,41 @@ impl Engine {
                 schema: PUBLIC_SCHEMA_NAME.to_string(),
                 name: create.name,
                 oid,
+                last_value: 1,
+                is_called: false,
             },
         );
         Ok(())
+    }
+
+    fn apply_sequence_nextval(&mut self, nextval: SequenceNextVal) -> Result<i64, EngineError> {
+        self.preflight_sequence_target(&nextval.name)?;
+        let sequence = self
+            .relational_sequences
+            .get_mut(&nextval.name)
+            .expect("sequence target preflighted");
+        let value = if sequence.is_called {
+            sequence
+                .last_value
+                .checked_add(1)
+                .ok_or_else(|| EngineError::ApplyFailed("sequence value overflow".to_string()))?
+        } else {
+            sequence.last_value
+        };
+        sequence.last_value = value;
+        sequence.is_called = true;
+        Ok(value)
+    }
+
+    fn apply_sequence_setval(&mut self, setval: SequenceSetVal) -> Result<i64, EngineError> {
+        self.preflight_sequence_target(&setval.name)?;
+        let sequence = self
+            .relational_sequences
+            .get_mut(&setval.name)
+            .expect("sequence target preflighted");
+        sequence.last_value = setval.value;
+        sequence.is_called = setval.is_called;
+        Ok(setval.value)
     }
 
     fn apply_create_table(&mut self, create: CreateTable) -> Result<(), EngineError> {
@@ -8704,6 +8747,23 @@ impl Engine {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" already exists",
                 create.name
+            )));
+        }
+        Ok(())
+    }
+
+    fn preflight_sequence_target(&self, name: &str) -> Result<(), EngineError> {
+        if self.relational_catalog.contains_key(name)
+            || self.relational_views.contains_key(name)
+            || self.relational_materialized_views.contains_key(name)
+        {
+            return Err(EngineError::ApplyFailed(format!(
+                "relation \"{name}\" is not a sequence"
+            )));
+        }
+        if !self.relational_sequences.contains_key(name) {
+            return Err(EngineError::ApplyFailed(format!(
+                "sequence \"{name}\" does not exist"
             )));
         }
         Ok(())
@@ -10009,6 +10069,8 @@ impl Engine {
                 }
             }
             Command::CreateSequence(create) => self.preflight_create_sequence(create)?,
+            Command::SequenceNextVal(nextval) => self.preflight_sequence_target(&nextval.name)?,
+            Command::SequenceSetVal(setval) => self.preflight_sequence_target(&setval.name)?,
             Command::RenameSequence(rename) => {
                 if self.relational_catalog.contains_key(&rename.old_name)
                     || self.relational_views.contains_key(&rename.old_name)
@@ -10269,6 +10331,8 @@ impl Engine {
             | Command::RefreshMaterializedView(_)
             | Command::RenameMaterializedView(_)
             | Command::CreateSequence(_)
+            | Command::SequenceNextVal(_)
+            | Command::SequenceSetVal(_)
             | Command::RenameSequence(_)
             | Command::DropTable(_)
             | Command::TruncateTable(_)
@@ -10362,7 +10426,7 @@ impl Engine {
                     self.metrics.observe_d2h_bytes(len as u64);
                 }
             }
-            Command::Select(_) => {
+            Command::Select(_) | Command::SequenceCurrVal(_) => {
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
         }
@@ -10480,6 +10544,8 @@ impl Engine {
             | Command::RefreshMaterializedView(_)
             | Command::RenameMaterializedView(_)
             | Command::CreateSequence(_)
+            | Command::SequenceNextVal(_)
+            | Command::SequenceSetVal(_)
             | Command::RenameSequence(_)
             | Command::DropTable(_)
             | Command::TruncateTable(_)
@@ -10545,7 +10611,7 @@ impl Engine {
                     self.metrics.observe_d2h_bytes(len as u64);
                 }
             }
-            Command::Select(_) => {
+            Command::Select(_) | Command::SequenceCurrVal(_) => {
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
         }
@@ -10598,6 +10664,8 @@ impl Engine {
                 Err(ExecuteError::NonReadCommand("ALTER MATERIALIZED VIEW"))
             }
             Command::CreateSequence(_) => Err(ExecuteError::NonReadCommand("CREATE SEQUENCE")),
+            Command::SequenceNextVal(_) => Err(ExecuteError::NonReadCommand("SELECT nextval")),
+            Command::SequenceSetVal(_) => Err(ExecuteError::NonReadCommand("SELECT setval")),
             Command::RenameSequence(_) => Err(ExecuteError::NonReadCommand("ALTER SEQUENCE")),
             Command::DropTable(_) => Err(ExecuteError::NonReadCommand("DROP TABLE")),
             Command::TruncateTable(_) => Err(ExecuteError::NonReadCommand("TRUNCATE TABLE")),
@@ -10612,7 +10680,9 @@ impl Engine {
             Command::Insert(_) => Err(ExecuteError::NonReadCommand("INSERT")),
             Command::Delete(_) => Err(ExecuteError::NonReadCommand("DELETE")),
             Command::Update(_) => Err(ExecuteError::NonReadCommand("UPDATE")),
-            Command::Select(_) => Err(ExecuteError::NonReadCommand("SELECT")),
+            Command::Select(_) | Command::SequenceCurrVal(_) => {
+                Err(ExecuteError::NonReadCommand("SELECT"))
+            }
         }
     }
 
@@ -32835,6 +32905,57 @@ mod tests {
             .execute_text(4, "ALTER SEQUENCE people RENAME TO people_seq_renamed")
             .unwrap_err();
         assert!(table_rename_target.to_string().contains("not a sequence"));
+    }
+
+    #[test]
+    fn relational_sql_sequence_values_replay_from_wal() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE SEQUENCE public.people_seq")
+            .unwrap();
+        let sequence = e.relational_catalog_sequence("people_seq").unwrap();
+        assert_eq!(sequence.last_value, 1);
+        assert!(!sequence.is_called);
+
+        e.execute_text(2, "SELECT nextval('public.people_seq'::regclass)")
+            .unwrap();
+        let sequence = e.relational_catalog_sequence("people_seq").unwrap();
+        assert_eq!(sequence.last_value, 1);
+        assert!(sequence.is_called);
+
+        e.execute_text(3, "SELECT nextval('people_seq'::regclass)")
+            .unwrap();
+        let sequence = e.relational_catalog_sequence("people_seq").unwrap();
+        assert_eq!(sequence.last_value, 2);
+        assert!(sequence.is_called);
+
+        e.execute_text(4, "SELECT setval('public.people_seq', 10, false)")
+            .unwrap();
+        let sequence = e.relational_catalog_sequence("people_seq").unwrap();
+        assert_eq!(sequence.last_value, 10);
+        assert!(!sequence.is_called);
+
+        e.execute_text(5, "SELECT nextval('people_seq'::regclass)")
+            .unwrap();
+        let sequence = e.relational_catalog_sequence("people_seq").unwrap();
+        assert_eq!(sequence.last_value, 10);
+        assert!(sequence.is_called);
+
+        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let sequence = recovered.relational_catalog_sequence("people_seq").unwrap();
+        assert_eq!(sequence.last_value, 10);
+        assert!(sequence.is_called);
+
+        let table_target = e
+            .execute_text(6, "CREATE TABLE table_target (id INT)")
+            .and_then(|_| e.execute_text(7, "SELECT nextval('table_target'::regclass)"))
+            .unwrap_err();
+        assert!(table_target.to_string().contains("not a sequence"));
+        let missing = e
+            .execute_text(8, "SELECT setval('missing_seq'::regclass, 1)")
+            .unwrap_err();
+        assert!(missing
+            .to_string()
+            .contains("sequence \"missing_seq\" does not exist"));
     }
 
     #[test]

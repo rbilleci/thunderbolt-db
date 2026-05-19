@@ -125,6 +125,8 @@ COMMENT ON VIEW public.account_lookup IS 'active account lookup';
 CREATE MATERIALIZED VIEW public.account_snapshot AS SELECT id, name FROM accounts ORDER BY id;
 COMMENT ON MATERIALIZED VIEW public.account_snapshot IS 'account snapshot';
 CREATE SEQUENCE public.account_seq;
+SELECT nextval('public.account_seq'::regclass) \g /dev/null
+SELECT nextval('public.account_seq'::regclass) \g /dev/null
 COMMENT ON SEQUENCE public.account_seq IS 'account sequence';
 SQL
 
@@ -297,6 +299,9 @@ verify_materialized_views "$RESTORE_PORT" "restore"
 cat >"$OUT_DIR/sequence-verify.expected" <<'EOF'
 public|account_seq|s|p
 EOF
+cat >"$OUT_DIR/sequence-value-verify.expected" <<'EOF'
+2|t
+EOF
 
 verify_sequences() {
   local port="$1"
@@ -307,6 +312,12 @@ verify_sequences() {
     2>"$OUT_DIR/${prefix}-sequence-verify.err" \
     | cut -d'|' -f2- >"$OUT_DIR/${prefix}-sequence-verify.out"
   diff -u "$OUT_DIR/sequence-verify.expected" "$OUT_DIR/${prefix}-sequence-verify.out"
+  PGHOST=127.0.0.1 PGPORT="$port" PGDATABASE=postgres PGUSER=postgres \
+    psql -v ON_ERROR_STOP=1 -X -A -t \
+    -c "SELECT last_value, is_called FROM public.account_seq;" \
+    >"$OUT_DIR/${prefix}-sequence-value-verify.out" \
+    2>"$OUT_DIR/${prefix}-sequence-value-verify.err"
+  diff -u "$OUT_DIR/sequence-value-verify.expected" "$OUT_DIR/${prefix}-sequence-value-verify.out"
 }
 
 verify_sequences "$RESTORE_PORT" "restore"
@@ -606,7 +617,7 @@ grep -F "REFRESH MATERIALIZED VIEW public.account_snapshot;" "$OUT_DIR/dump.sql"
 grep -F "COMMENT ON MATERIALIZED VIEW public.account_snapshot IS 'account snapshot';" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "CREATE SEQUENCE public.account_seq" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "START WITH 1" "$OUT_DIR/dump.sql" >/dev/null
-grep -F "SELECT pg_catalog.setval('public.account_seq', 1, false);" "$OUT_DIR/dump.sql" >/dev/null
+grep -F "SELECT pg_catalog.setval('public.account_seq', 2, true);" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "COMMENT ON SEQUENCE public.account_seq IS 'account sequence';" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "COMMENT ON TABLE public.accounts IS 'accounts table';" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "COMMENT ON COLUMN public.accounts.name IS 'account display name';" "$OUT_DIR/dump.sql" >/dev/null
@@ -637,7 +648,7 @@ grep -F "COMMENT ON COLUMN public.events.note IS 'event note';" "$OUT_DIR/dump-s
 grep -F "COMMENT ON INDEX public.events_note_idx IS 'events note lookup';" "$OUT_DIR/dump-schema.sql" >/dev/null
 grep -F "COPY public.accounts (id, name, tier) FROM stdin;" "$OUT_DIR/dump-data.sql" >/dev/null
 grep -F "COPY public.events (event_id, note) FROM stdin;" "$OUT_DIR/dump-data.sql" >/dev/null
-grep -F "SELECT pg_catalog.setval('public.account_seq', 1, false);" "$OUT_DIR/dump-data.sql" >/dev/null
+grep -F "SELECT pg_catalog.setval('public.account_seq', 2, true);" "$OUT_DIR/dump-data.sql" >/dev/null
 if grep -F "REFRESH MATERIALIZED VIEW public.account_snapshot;" "$OUT_DIR/dump-data.sql" >/dev/null; then
   echo "plain data-only dump unexpectedly included materialized view refresh" >&2
   exit 1

@@ -1706,6 +1706,11 @@ fn rename_sequence_in_session(
         .expect("sequence existence validated");
     sequence.name = new_name.to_string();
     session.sequences.insert(new_name.to_string(), sequence);
+    if let Some(value) = session.currval_sequences.remove(old_name) {
+        session
+            .currval_sequences
+            .insert(new_name.to_string(), value);
+    }
     session.mark_sequence_dirty(old_name.to_string());
     session.mark_sequence_dirty(new_name.to_string());
 
@@ -2033,6 +2038,7 @@ struct Session {
     views: HashMap<String, View>,
     materialized_views: HashMap<String, MaterializedView>,
     sequences: HashMap<String, Sequence>,
+    currval_sequences: HashMap<String, i64>,
     indexes: Vec<CatalogIndex>,
     comments: BTreeMap<CatalogCommentTarget, String>,
     dirty_tables: BTreeSet<String>,
@@ -2100,6 +2106,7 @@ impl Session {
             views: catalog.views,
             materialized_views: catalog.materialized_views,
             sequences: catalog.sequences,
+            currval_sequences: HashMap::new(),
             indexes: catalog.indexes,
             comments: catalog.comments,
             dirty_tables: BTreeSet::new(),
@@ -2286,6 +2293,44 @@ struct MaterializedView {
 struct Sequence {
     oid: u32,
     name: String,
+    last_value: i64,
+    is_called: bool,
+}
+
+fn sequence_target_error(session: &Session, name: &str) -> Option<ErrorField> {
+    if session.tables.contains_key(name)
+        || session.views.contains_key(name)
+        || session.materialized_views.contains_key(name)
+    {
+        return Some(ErrorField {
+            code: "42809",
+            message: "relation is not a sequence",
+            position: None,
+        });
+    }
+    if !session.sequences.contains_key(name) {
+        return Some(ErrorField {
+            code: "42P01",
+            message: "sequence does not exist",
+            position: None,
+        });
+    }
+    None
+}
+
+fn next_sequence_value(sequence: &mut Sequence) -> Result<i64, ErrorField> {
+    let value = if sequence.is_called {
+        sequence.last_value.checked_add(1).ok_or(ErrorField {
+            code: "2200H",
+            message: "sequence value overflow",
+            position: None,
+        })?
+    } else {
+        sequence.last_value
+    };
+    sequence.last_value = value;
+    sequence.is_called = true;
+    Ok(value)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -6635,12 +6680,16 @@ fn execute_statement(
             &catalog_empty_rows(),
         );
     }
-    if let Some(sequence) = pg_dump_sequence_setval_query_name(&canonical) {
-        if session.sequences.contains_key(&sequence) {
+    if let Some((sequence, value, is_called)) = pg_dump_sequence_setval_query(&canonical) {
+        if let Some(sequence_state) = session.sequences.get_mut(&sequence) {
+            sequence_state.last_value = value;
+            sequence_state.is_called = is_called;
+            session.mark_sequence_dirty(sequence);
+            session.persist_catalog_snapshot();
             return write_single_row(
                 stream,
                 &[int8_column("setval")],
-                &[vec![Some("1".to_string())]],
+                &[vec![Some(value.to_string())]],
             );
         }
         return write_error(
@@ -6653,11 +6702,14 @@ fn execute_statement(
         );
     }
     if let Some(sequence) = pg_dump_sequence_last_value_query_name(&canonical) {
-        if session.sequences.contains_key(&sequence) {
+        if let Some(sequence_state) = session.sequences.get(&sequence) {
             return write_single_row(
                 stream,
                 &[int8_column("last_value"), bool_column("is_called")],
-                &[vec![Some("1".to_string()), Some("f".to_string())]],
+                &[vec![
+                    Some(sequence_state.last_value.to_string()),
+                    Some(if sequence_state.is_called { "t" } else { "f" }.to_string()),
+                ]],
             );
         }
         return write_error(
@@ -7276,11 +7328,78 @@ fn execute_statement(
                     Sequence {
                         oid,
                         name: name.clone(),
+                        last_value: 1,
+                        is_called: false,
                     },
                 );
                 session.mark_sequence_dirty(name);
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, "CREATE SEQUENCE");
+            }
+            Command::SequenceNextVal(nextval) => {
+                if let Some(error) = sequence_target_error(session, &nextval.name) {
+                    return write_error(stream, &error);
+                }
+                let sequence = session
+                    .sequences
+                    .get_mut(&nextval.name)
+                    .expect("sequence target checked");
+                let value = match next_sequence_value(sequence) {
+                    Ok(value) => value,
+                    Err(error) => return write_error(stream, &error),
+                };
+                session
+                    .currval_sequences
+                    .insert(nextval.name.clone(), value);
+                session.mark_sequence_dirty(nextval.name);
+                session.persist_catalog_snapshot();
+                return write_select_rows(
+                    stream,
+                    &[int8_column("nextval")],
+                    &[vec![Some(value.to_string())]],
+                    include_row_description,
+                );
+            }
+            Command::SequenceCurrVal(currval) => {
+                if let Some(error) = sequence_target_error(session, &currval.name) {
+                    return write_error(stream, &error);
+                }
+                let Some(value) = session.currval_sequences.get(&currval.name).copied() else {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "55000",
+                            message: "currval of sequence is not yet defined in this session",
+                            position: None,
+                        },
+                    );
+                };
+                return write_select_rows(
+                    stream,
+                    &[int8_column("currval")],
+                    &[vec![Some(value.to_string())]],
+                    include_row_description,
+                );
+            }
+            Command::SequenceSetVal(setval) => {
+                if let Some(error) = sequence_target_error(session, &setval.name) {
+                    return write_error(stream, &error);
+                }
+                let value = setval.value;
+                let sequence = session
+                    .sequences
+                    .get_mut(&setval.name)
+                    .expect("sequence target checked");
+                sequence.last_value = value;
+                sequence.is_called = setval.is_called;
+                session.mark_sequence_dirty(setval.name);
+                session.persist_catalog_snapshot();
+                return write_select_rows(
+                    stream,
+                    &[int8_column("setval")],
+                    &[vec![Some(value.to_string())]],
+                    include_row_description,
+                );
             }
             Command::RenameSequence(rename) => {
                 if let Err(error) =
@@ -7449,6 +7568,7 @@ fn execute_statement(
                         };
                         session.comments.remove(&target);
                         session.mark_comment_dirty(target);
+                        session.currval_sequences.remove(name);
                     }
                     session.mark_sequence_dirty(name.clone());
                 }
@@ -11188,11 +11308,28 @@ fn pg_dump_sequence_last_value_query_name(canonical: &str) -> Option<String> {
     Some(name.strip_prefix("public.").unwrap_or(name).to_string())
 }
 
-fn pg_dump_sequence_setval_query_name(canonical: &str) -> Option<String> {
+fn pg_dump_sequence_setval_query(canonical: &str) -> Option<(String, i64, bool)> {
     let prefix = "select pg_catalog.setval('";
-    let suffix = "', 1, false)";
-    let name = canonical.strip_prefix(prefix)?.strip_suffix(suffix)?;
-    Some(name.strip_prefix("public.").unwrap_or(name).to_string())
+    let rest = canonical.strip_prefix(prefix)?;
+    let (name, rest) = rest.split_once("',")?;
+    let (value, is_called) = rest.strip_suffix(')')?.split_once(',')?;
+    let value = value.trim().parse::<i64>().ok()?;
+    let is_called = if is_called.trim().eq_ignore_ascii_case("true")
+        || is_called.trim().eq_ignore_ascii_case("t")
+    {
+        true
+    } else if is_called.trim().eq_ignore_ascii_case("false")
+        || is_called.trim().eq_ignore_ascii_case("f")
+    {
+        false
+    } else {
+        return None;
+    };
+    Some((
+        name.strip_prefix("public.").unwrap_or(name).to_string(),
+        value,
+        is_called,
+    ))
 }
 
 fn sql_type_alignment_code(ty: SqlType) -> &'static str {
@@ -15439,6 +15576,8 @@ mod tests {
             Sequence {
                 oid: FIRST_USER_RELATION_OID,
                 name: old_sequence_name.to_string(),
+                last_value: 1,
+                is_called: false,
             },
         );
         session.comments.insert(

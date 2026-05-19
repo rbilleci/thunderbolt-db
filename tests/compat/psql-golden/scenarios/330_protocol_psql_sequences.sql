@@ -18,6 +18,14 @@ LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = d.objsu
 WHERE n.nspname = 'public' AND c.relkind IN ('r','v','s')
 ORDER BY c.relname, d.objsubid;
 \dd seq_*
+SELECT currval('public.seq_person_ids'::regclass);
+SELECT nextval('public.seq_person_ids'::regclass);
+SELECT currval('seq_person_ids'::regclass);
+SELECT setval('public.seq_person_ids', 10, false);
+SELECT nextval('seq_person_ids'::regclass);
+SELECT pg_catalog.setval('public.seq_person_ids', 20);
+SELECT nextval('seq_person_ids'::regclass);
+SELECT last_value, is_called FROM public.seq_person_ids;
 DROP SEQUENCE seq_missing;
 \ds
 ALTER SEQUENCE seq_missing RENAME TO seq_archived;

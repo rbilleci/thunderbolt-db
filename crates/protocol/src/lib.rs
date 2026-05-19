@@ -26,6 +26,9 @@ pub enum Command {
     RefreshMaterializedView(RefreshMaterializedView),
     RenameMaterializedView(RenameMaterializedView),
     CreateSequence(CreateSequence),
+    SequenceNextVal(SequenceNextVal),
+    SequenceCurrVal(SequenceCurrVal),
+    SequenceSetVal(SequenceSetVal),
     RenameSequence(RenameSequence),
     DropSequence(DropSequence),
     DropTable(DropTable),
@@ -167,6 +170,23 @@ pub struct RenameMaterializedView {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateSequence {
     pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SequenceNextVal {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SequenceCurrVal {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SequenceSetVal {
+    pub name: String,
+    pub value: i64,
+    pub is_called: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1881,9 +1901,102 @@ fn parse_relational_command(input: &str) -> Option<Result<Command, ParseError>> 
         return Some(parse_delete(input).map(Command::Delete));
     }
     if first.eq_ignore_ascii_case("SELECT") {
+        if let Ok(sequence_command) = parse_sequence_value_function(input) {
+            return Some(Ok(sequence_command));
+        }
         return Some(parse_select(input).map(Command::Select));
     }
     None
+}
+
+fn parse_sequence_value_function(input: &str) -> Result<Command, ParseError> {
+    let rest = strip_keyword_prefix_case_insensitive(input, "SELECT")
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim();
+    if find_keyword_outside_quotes(rest, "FROM").is_some() {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let open = rest.find('(').ok_or(ParseError::InvalidRelationalSql)?;
+    let close = find_matching_paren(rest, open).ok_or(ParseError::InvalidRelationalSql)?;
+    if !rest[close + 1..].trim().is_empty() {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let function = rest[..open].trim();
+    let function = function
+        .strip_prefix("pg_catalog.")
+        .or_else(|| function.strip_prefix("PG_CATALOG."))
+        .unwrap_or(function);
+    let args = split_csv(&rest[open + 1..close])?;
+    match function.to_ascii_lowercase().as_str() {
+        "nextval" => {
+            let [target] = args.as_slice() else {
+                return Err(ParseError::InvalidRelationalSql);
+            };
+            Ok(Command::SequenceNextVal(SequenceNextVal {
+                name: parse_sequence_regclass_arg(target.trim())?,
+            }))
+        }
+        "currval" => {
+            let [target] = args.as_slice() else {
+                return Err(ParseError::InvalidRelationalSql);
+            };
+            Ok(Command::SequenceCurrVal(SequenceCurrVal {
+                name: parse_sequence_regclass_arg(target.trim())?,
+            }))
+        }
+        "setval" => {
+            let ([target, value] | [target, value, _]) = args.as_slice() else {
+                return Err(ParseError::InvalidRelationalSql);
+            };
+            let is_called = if args.len() == 3 {
+                parse_bool_literal(args[2].trim())?
+            } else {
+                true
+            };
+            Ok(Command::SequenceSetVal(SequenceSetVal {
+                name: parse_sequence_regclass_arg(target.trim())?,
+                value: parse_i64_literal(value.trim())?,
+                is_called,
+            }))
+        }
+        _ => Err(ParseError::InvalidRelationalSql),
+    }
+}
+
+fn parse_sequence_regclass_arg(input: &str) -> Result<String, ParseError> {
+    let literal = input
+        .split_once("::")
+        .map(|(literal, cast)| {
+            let cast = cast.trim();
+            if cast.eq_ignore_ascii_case("regclass")
+                || cast.eq_ignore_ascii_case("pg_catalog.regclass")
+            {
+                Ok(literal.trim())
+            } else {
+                Err(ParseError::InvalidRelationalSql)
+            }
+        })
+        .unwrap_or(Ok(input.trim()))?;
+    let SqlValue::Text(name) = parse_sql_value(literal)? else {
+        return Err(ParseError::InvalidRelationalSql);
+    };
+    normalize_relation_identifier(&name)
+}
+
+fn parse_i64_literal(input: &str) -> Result<i64, ParseError> {
+    input
+        .parse::<i64>()
+        .map_err(|_| ParseError::InvalidRelationalSql)
+}
+
+fn parse_bool_literal(input: &str) -> Result<bool, ParseError> {
+    if input.eq_ignore_ascii_case("true") || input.eq_ignore_ascii_case("t") {
+        Ok(true)
+    } else if input.eq_ignore_ascii_case("false") || input.eq_ignore_ascii_case("f") {
+        Ok(false)
+    } else {
+        Err(ParseError::InvalidRelationalSql)
+    }
 }
 
 fn parse_comment_on(input: &str) -> Result<CommentOn, ParseError> {
@@ -12260,6 +12373,51 @@ mod tests {
         ));
         assert!(matches!(
             parse_command("ALTER SEQUENCE seq_people RENAME TO seq_person_ids CASCADE"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+    }
+
+    #[test]
+    fn parses_bounded_sequence_value_functions() {
+        assert_eq!(
+            parse_command("SELECT nextval('public.seq_people'::regclass)").unwrap(),
+            Command::SequenceNextVal(SequenceNextVal {
+                name: "seq_people".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_command("SELECT pg_catalog.currval('seq_people'::pg_catalog.regclass)").unwrap(),
+            Command::SequenceCurrVal(SequenceCurrVal {
+                name: "seq_people".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_command("SELECT setval('public.seq_people', 42, false)").unwrap(),
+            Command::SequenceSetVal(SequenceSetVal {
+                name: "seq_people".to_string(),
+                value: 42,
+                is_called: false,
+            })
+        );
+        assert_eq!(
+            parse_command("SELECT pg_catalog.setval('public.seq_people', 42)").unwrap(),
+            Command::SequenceSetVal(SequenceSetVal {
+                name: "seq_people".to_string(),
+                value: 42,
+                is_called: true,
+            })
+        );
+
+        assert!(matches!(
+            parse_command("SELECT nextval('other.seq_people'::regclass)"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command("SELECT setval('seq_people', '42', false)"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command("SELECT nextval('seq_people') FROM seq_people"),
             Err(ParseError::InvalidRelationalSql)
         ));
     }

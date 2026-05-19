@@ -34,7 +34,43 @@ ALTER SEQUENCE
  public | seq_person_ids | sequence | people ids
 (1 row)
 
-psql:330_protocol_psql_sequences.sql:21: ERROR:  sequence does not exist
+psql:330_protocol_psql_sequences.sql:21: ERROR:  currval of sequence is not yet defined in this session
+ nextval
+---------
+       1
+(1 row)
+
+ currval
+---------
+       1
+(1 row)
+
+ setval
+--------
+     10
+(1 row)
+
+ nextval
+---------
+      10
+(1 row)
+
+ setval
+--------
+     20
+(1 row)
+
+ nextval
+---------
+      21
+(1 row)
+
+ last_value | is_called
+------------+-----------
+         21 | t
+(1 row)
+
+psql:330_protocol_psql_sequences.sql:29: ERROR:  sequence does not exist
                List of relations
  Schema |      Name      |   Type   |  Owner
 --------+----------------+----------+----------
@@ -42,16 +78,16 @@ psql:330_protocol_psql_sequences.sql:21: ERROR:  sequence does not exist
  public | seq_teams      | sequence | postgres
 (2 rows)
 
-psql:330_protocol_psql_sequences.sql:23: ERROR:  sequence does not exist
-psql:330_protocol_psql_sequences.sql:24: ERROR:  relation already exists
-CREATE TABLE
-psql:330_protocol_psql_sequences.sql:26: ERROR:  relation already exists
-psql:330_protocol_psql_sequences.sql:27: ERROR:  relation is not a sequence
-DROP SEQUENCE
-psql:330_protocol_psql_sequences.sql:29: error: Did not find any relations.
-CREATE TABLE
-psql:330_protocol_psql_sequences.sql:31: ERROR:  relation is not a sequence
+psql:330_protocol_psql_sequences.sql:31: ERROR:  sequence does not exist
 psql:330_protocol_psql_sequences.sql:32: ERROR:  relation already exists
-psql:330_protocol_psql_sequences.sql:33: ERROR:  query shape is not supported by the compatibility stub
-psql:330_protocol_psql_sequences.sql:34: ERROR:  relation is not a sequence
-psql:330_protocol_psql_sequences.sql:35: error: Did not find any relations.
+CREATE TABLE
+psql:330_protocol_psql_sequences.sql:34: ERROR:  relation already exists
+psql:330_protocol_psql_sequences.sql:35: ERROR:  relation is not a sequence
+DROP SEQUENCE
+psql:330_protocol_psql_sequences.sql:37: error: Did not find any relations.
+CREATE TABLE
+psql:330_protocol_psql_sequences.sql:39: ERROR:  relation is not a sequence
+psql:330_protocol_psql_sequences.sql:40: ERROR:  relation already exists
+psql:330_protocol_psql_sequences.sql:41: ERROR:  query shape is not supported by the compatibility stub
+psql:330_protocol_psql_sequences.sql:42: ERROR:  relation is not a sequence
+psql:330_protocol_psql_sequences.sql:43: error: Did not find any relations.
