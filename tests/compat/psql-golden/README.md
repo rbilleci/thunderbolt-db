@@ -33,6 +33,7 @@ Scenario 02 covers PostgreSQL-style session reset/setup probes, including the as
 
 Scenario 318 covers bounded `ALTER TABLE ... DROP CONSTRAINT` over supported primary-key and unique constraints, including `IF EXISTS`, metadata/comment cleanup in `psql \d` / `\dd`, duplicate inserts after removal, missing-target recovery, and unsupported cascade rejection.
 Scenario 322 covers bounded `ALTER TABLE ... RENAME CONSTRAINT` over supported primary-key and unique constraints, including information-schema and pg-catalog metadata retargeting, `psql \d+` / `\dd` / `\di+` visibility, supported comment retargeting, duplicate enforcement under the new name, missing/duplicate/view recovery, and unsupported cascade rejection.
+Scenario 323 covers bounded `ALTER INDEX ... RENAME TO` over supported non-constraint indexes, including `pg_catalog.pg_indexes`, `pg_catalog.pg_description`, `psql \di+`, supported comment retargeting, equality-index reads under the new name, missing/duplicate/constraint-backed recovery, and unsupported schema-qualified target rejection.
 
 ## Update expected artifacts
 

@@ -67,6 +67,7 @@ impl Planner {
             | Command::DropColumn(_)
             | Command::DropConstraint(_)
             | Command::CreateIndex(_)
+            | Command::RenameIndex(_)
             | Command::CreateView(_)
             | Command::DropTable(_)
             | Command::TruncateTable(_)

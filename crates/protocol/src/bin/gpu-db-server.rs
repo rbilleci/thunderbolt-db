@@ -1478,6 +1478,57 @@ fn rename_constraint_in_session(
     Ok(())
 }
 
+fn rename_index_in_session(
+    session: &mut Session,
+    old_name: &str,
+    new_name: &str,
+) -> Result<(), ErrorField> {
+    if session.indexes.iter().any(|index| index.name == new_name) {
+        return Err(ErrorField {
+            code: "42P07",
+            message: "relation already exists",
+            position: None,
+        });
+    }
+    let Some(index) = session
+        .indexes
+        .iter_mut()
+        .find(|index| index.name == old_name)
+    else {
+        return Err(ErrorField {
+            code: "42704",
+            message: "index does not exist",
+            position: None,
+        });
+    };
+    if index.primary_key || index.unique_constraint {
+        return Err(ErrorField {
+            code: "0A000",
+            message: "cannot rename constraint-backed index with ALTER INDEX",
+            position: None,
+        });
+    }
+    let table_name = index.table.clone();
+    index.name = new_name.to_string();
+    session.dirty_indexes = true;
+    session.mark_table_dirty(table_name);
+
+    let old_target = CatalogCommentTarget::Index {
+        index: old_name.to_string(),
+    };
+    if let Some(comment) = session.comments.remove(&old_target) {
+        let new_target = CatalogCommentTarget::Index {
+            index: new_name.to_string(),
+        };
+        session.comments.insert(new_target.clone(), comment);
+        session.mark_comment_dirty(old_target);
+        session.mark_comment_dirty(new_target);
+    }
+
+    session.persist_catalog_snapshot();
+    Ok(())
+}
+
 fn shared_catalog_contains_table(table: &str) -> bool {
     shared_catalog()
         .lock()
@@ -1776,9 +1827,15 @@ impl Session {
                 .filter(|table_name| !self.tables.contains_key(*table_name))
                 .cloned()
                 .collect::<BTreeSet<_>>();
-            catalog
-                .indexes
-                .retain(|index| !deleted_tables.contains(&index.table));
+            let replaced_tables = self
+                .dirty_tables
+                .iter()
+                .filter(|table_name| self.tables.contains_key(*table_name))
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            catalog.indexes.retain(|index| {
+                !deleted_tables.contains(&index.table) && !replaced_tables.contains(&index.table)
+            });
             for index in self
                 .indexes
                 .iter()
@@ -6397,6 +6454,14 @@ fn execute_statement(
                 session.dirty_indexes = true;
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, "CREATE INDEX");
+            }
+            Command::RenameIndex(rename) => {
+                if let Err(error) =
+                    rename_index_in_session(session, &rename.old_name, &rename.new_name)
+                {
+                    return write_error(stream, &error);
+                }
+                return write_command_complete(stream, "ALTER INDEX");
             }
             Command::CreateView(create) => {
                 if session.tables.contains_key(&create.name)
@@ -13630,6 +13695,117 @@ mod tests {
             .expect("shared catalog mutex poisoned");
         catalog.tables.remove(table_name);
         catalog.indexes.retain(|index| index.name != index_name);
+    }
+
+    #[test]
+    fn shared_catalog_persistence_carries_renamed_index_metadata() {
+        let table_name = "shared_rename_index_people";
+        let old_index_name = "shared_rename_index_people_id_idx";
+        let new_index_name = "shared_rename_index_people_lookup_idx";
+        {
+            let mut catalog = shared_catalog()
+                .lock()
+                .expect("shared catalog mutex poisoned");
+            catalog.tables.remove(table_name);
+            catalog
+                .indexes
+                .retain(|index| index.name != old_index_name && index.name != new_index_name);
+            catalog.comments.remove(&CatalogCommentTarget::Index {
+                index: old_index_name.to_string(),
+            });
+            catalog.comments.remove(&CatalogCommentTarget::Index {
+                index: new_index_name.to_string(),
+            });
+        }
+
+        let mut session = Session::new(true);
+        session
+            .tables
+            .insert(table_name.to_string(), test_table(table_name, Vec::new()));
+        session.indexes.push(CatalogIndex {
+            name: old_index_name.to_string(),
+            table: table_name.to_string(),
+            column: "id".to_string(),
+            unique: false,
+            primary_key: false,
+            unique_constraint: false,
+        });
+        session.comments.insert(
+            CatalogCommentTarget::Index {
+                index: old_index_name.to_string(),
+            },
+            "lookup index".to_string(),
+        );
+        session.mark_table_dirty(table_name);
+        session.dirty_indexes = true;
+        session.persist_catalog_snapshot();
+
+        rename_index_in_session(&mut session, old_index_name, new_index_name).unwrap();
+
+        let reloaded = Session::new(true);
+        assert!(pg_catalog_index_rows(&reloaded).contains(&vec![
+            Some("public".to_string()),
+            Some(table_name.to_string()),
+            Some(new_index_name.to_string()),
+            Some(format!(
+                "CREATE INDEX {new_index_name} ON public.{table_name} USING btree (id)"
+            )),
+        ]));
+        assert!(psql_describe_index_verbose_rows(&reloaded).contains(&vec![
+            Some("public".to_string()),
+            Some(new_index_name.to_string()),
+            Some("index".to_string()),
+            Some("postgres".to_string()),
+            Some(table_name.to_string()),
+            Some("permanent".to_string()),
+            Some("btree".to_string()),
+            None,
+            Some("lookup index".to_string()),
+        ]));
+        assert!(!pg_catalog_index_rows(&reloaded)
+            .iter()
+            .any(|row| { row.get(2).and_then(Option::as_deref) == Some(old_index_name) }));
+
+        assert_eq!(
+            rename_index_in_session(&mut session, "missing_idx", "another_idx")
+                .unwrap_err()
+                .code,
+            "42704"
+        );
+        session.indexes.push(CatalogIndex {
+            name: "shared_rename_index_people_pkey".to_string(),
+            table: table_name.to_string(),
+            column: "id".to_string(),
+            unique: true,
+            primary_key: true,
+            unique_constraint: false,
+        });
+        assert_eq!(
+            rename_index_in_session(
+                &mut session,
+                "shared_rename_index_people_pkey",
+                "shared_rename_index_people_id_idx"
+            )
+            .unwrap_err()
+            .code,
+            "0A000"
+        );
+
+        let mut catalog = shared_catalog()
+            .lock()
+            .expect("shared catalog mutex poisoned");
+        catalog.tables.remove(table_name);
+        catalog.indexes.retain(|index| {
+            index.name != old_index_name
+                && index.name != new_index_name
+                && index.name != "shared_rename_index_people_pkey"
+        });
+        catalog.comments.remove(&CatalogCommentTarget::Index {
+            index: old_index_name.to_string(),
+        });
+        catalog.comments.remove(&CatalogCommentTarget::Index {
+            index: new_index_name.to_string(),
+        });
     }
 
     #[test]

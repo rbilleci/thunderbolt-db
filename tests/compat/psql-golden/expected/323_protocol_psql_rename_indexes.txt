@@ -1,0 +1,42 @@
+=== bounded rename index ===
+CREATE TABLE
+INSERT 0 2
+CREATE INDEX
+COMMENT
+                                                              List of relations
+ Schema |             Name             | Type  |  Owner   |        Table        | Persistence | Access method | Size |      Description
+--------+------------------------------+-------+----------+---------------------+-------------+---------------+------+------------------------
+ public | rename_index_people_name_idx | index | postgres | rename_index_people | permanent   | btree         |      | lookup by display name
+(1 row)
+
+ALTER INDEX
+ schemaname |      tablename      |           indexname            |                                           indexdef
+------------+---------------------+--------------------------------+----------------------------------------------------------------------------------------------
+ public     | rename_index_people | rename_index_people_lookup_idx | CREATE INDEX rename_index_people_lookup_idx ON public.rename_index_people USING btree (name)
+(1 row)
+
+ nspname |            relname             | relkind | attname |      description
+---------+--------------------------------+---------+---------+------------------------
+ public  | rename_index_people_lookup_idx | i       |         | lookup by display name
+(1 row)
+
+                                                               List of relations
+ Schema |              Name              | Type  |  Owner   |        Table        | Persistence | Access method | Size |      Description
+--------+--------------------------------+-------+----------+---------------------+-------------+---------------+------+------------------------
+ public | rename_index_people_lookup_idx | index | postgres | rename_index_people | permanent   | btree         |      | lookup by display name
+(1 row)
+
+ id | name
+----+-------
+  2 | Linus
+(1 row)
+
+psql:323_protocol_psql_rename_indexes.sql:22: ERROR:  relation already exists
+psql:323_protocol_psql_rename_indexes.sql:23: ERROR:  index does not exist
+CREATE TABLE
+psql:323_protocol_psql_rename_indexes.sql:25: ERROR:  cannot rename constraint-backed index with ALTER INDEX
+psql:323_protocol_psql_rename_indexes.sql:26: ERROR:  query shape is not supported by the compatibility stub
+ id | name
+----+-------
+  2 | Linus
+(1 row)

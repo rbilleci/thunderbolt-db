@@ -21,8 +21,8 @@ use gpu_db_planner::{ExecutionPlan, Planner, PlannerConfig};
 use gpu_db_protocol::{
     parse_command, AddUniqueConstraint, ColumnDef, Command, CommentTarget, CreateIndex,
     CreateTable, CreateView, Delete, DropConstraint, DropIndex, DropTable, DropView, Insert,
-    ParseError, RenameColumn, RenameConstraint, Select, SelectFilterOp, SelectProjection, SqlType,
-    SqlValue, TruncateTable, Update,
+    ParseError, RenameColumn, RenameConstraint, RenameIndex, Select, SelectFilterOp,
+    SelectProjection, SqlType, SqlValue, TruncateTable, Update,
 };
 use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine};
 use gpu_db_storage::{
@@ -81,6 +81,7 @@ impl ReplicatedStateMachine for KvStateMachine {
                     | Command::DropColumn(_)
                     | Command::DropConstraint(_)
                     | Command::CreateIndex(_)
+                    | Command::RenameIndex(_)
                     | Command::CreateView(_)
                     | Command::DropTable(_)
                     | Command::TruncateTable(_)
@@ -7525,6 +7526,7 @@ impl Engine {
             Command::DropColumn(drop) => self.apply_drop_column(drop, txn_id)?,
             Command::DropConstraint(drop) => self.apply_drop_constraint(drop)?,
             Command::CreateIndex(create) => self.apply_create_index(create)?,
+            Command::RenameIndex(rename) => self.apply_rename_index(rename)?,
             Command::CreateView(create) => self.apply_create_view(create)?,
             Command::DropTable(drop) => self.apply_drop_table(drop, txn_id)?,
             Command::TruncateTable(truncate) => self.apply_truncate_table(truncate, txn_id)?,
@@ -7955,6 +7957,54 @@ impl Engine {
         Err(EngineError::ApplyFailed(format!(
             "index \"{}\" does not exist",
             drop.name
+        )))
+    }
+
+    fn apply_rename_index(&mut self, rename: RenameIndex) -> Result<(), EngineError> {
+        if self.relational_catalog.values().any(|table| {
+            table
+                .indexes
+                .iter()
+                .any(|index| index.name == rename.new_name)
+        }) {
+            return Err(EngineError::ApplyFailed(format!(
+                "relation \"{}\" already exists",
+                rename.new_name
+            )));
+        }
+
+        for table in self.relational_catalog.values_mut() {
+            let Some(index) = table
+                .indexes
+                .iter_mut()
+                .find(|index| index.name == rename.old_name)
+            else {
+                continue;
+            };
+            if index.primary_key || index.unique_constraint {
+                return Err(EngineError::ApplyFailed(format!(
+                    "cannot rename constraint-backed index \"{}\" with ALTER INDEX",
+                    rename.old_name
+                )));
+            }
+            index.name = rename.new_name.clone();
+            let old_target = RelationalCommentTarget::Index {
+                index: rename.old_name,
+            };
+            if let Some(comment) = self.relational_comments.remove(&old_target) {
+                self.relational_comments.insert(
+                    RelationalCommentTarget::Index {
+                        index: rename.new_name,
+                    },
+                    comment,
+                );
+            }
+            return Ok(());
+        }
+
+        Err(EngineError::ApplyFailed(format!(
+            "index \"{}\" does not exist",
+            rename.old_name
         )))
     }
 
@@ -8942,6 +8992,36 @@ impl Engine {
                     )));
                 }
             }
+            Command::RenameIndex(rename) => {
+                if self.relational_catalog.values().any(|table| {
+                    table
+                        .indexes
+                        .iter()
+                        .any(|index| index.name == rename.new_name)
+                }) {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "relation \"{}\" already exists",
+                        rename.new_name
+                    )));
+                }
+                let Some(index) = self
+                    .relational_catalog
+                    .values()
+                    .flat_map(|table| table.indexes.iter())
+                    .find(|index| index.name == rename.old_name)
+                else {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "index \"{}\" does not exist",
+                        rename.old_name
+                    )));
+                };
+                if index.primary_key || index.unique_constraint {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "cannot rename constraint-backed index \"{}\" with ALTER INDEX",
+                        rename.old_name
+                    )));
+                }
+            }
             Command::DropColumn(drop) => {
                 if self.relational_views.contains_key(&drop.table) {
                     return Err(EngineError::ApplyFailed(format!(
@@ -9155,6 +9235,7 @@ impl Engine {
             | Command::DropColumn(_)
             | Command::DropConstraint(_)
             | Command::CreateIndex(_)
+            | Command::RenameIndex(_)
             | Command::CreateView(_)
             | Command::DropTable(_)
             | Command::TruncateTable(_)
@@ -9356,6 +9437,7 @@ impl Engine {
             | Command::DropColumn(_)
             | Command::DropConstraint(_)
             | Command::CreateIndex(_)
+            | Command::RenameIndex(_)
             | Command::CreateView(_)
             | Command::DropTable(_)
             | Command::TruncateTable(_)
@@ -9458,6 +9540,7 @@ impl Engine {
             Command::DropColumn(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
             Command::DropConstraint(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
             Command::CreateIndex(_) => Err(ExecuteError::NonReadCommand("CREATE INDEX")),
+            Command::RenameIndex(_) => Err(ExecuteError::NonReadCommand("ALTER INDEX")),
             Command::CreateView(_) => Err(ExecuteError::NonReadCommand("CREATE VIEW")),
             Command::DropTable(_) => Err(ExecuteError::NonReadCommand("DROP TABLE")),
             Command::TruncateTable(_) => Err(ExecuteError::NonReadCommand("TRUNCATE TABLE")),
@@ -32894,6 +32977,111 @@ mod tests {
         assert!(
             missing_err.contains("index \"people_name_idx\" does not exist"),
             "{missing_err}"
+        );
+    }
+
+    #[test]
+    fn relational_catalog_renames_index_and_replays_from_wal() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO people (id, name) VALUES (1, 'Ada'), (2, 'Linus')",
+        )
+        .unwrap();
+        e.execute_text(3, "CREATE INDEX people_name_idx ON people (name)")
+            .unwrap();
+        e.execute_text(4, "COMMENT ON INDEX public.people_name_idx IS 'lookup'")
+            .unwrap();
+        e.execute_text(
+            5,
+            "ALTER INDEX public.people_name_idx RENAME TO people_lookup_idx",
+        )
+        .unwrap();
+
+        let table = e.relational_catalog_table("people").unwrap();
+        let renamed_indexes = table.indexes.clone();
+        assert_eq!(
+            renamed_indexes,
+            vec![RelationalIndex {
+                name: "people_lookup_idx".to_string(),
+                table: "people".to_string(),
+                column: "name".to_string(),
+                unique: false,
+                primary_key: false,
+                unique_constraint: false,
+            }]
+        );
+        assert_eq!(
+            e.relational_index_comment("people_lookup_idx"),
+            Some("lookup")
+        );
+        assert_eq!(e.relational_index_comment("people_name_idx"), None);
+
+        let Command::Select(select) =
+            parse_command("SELECT id FROM people WHERE name = 'Linus'").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let result = e.execute_relational_select(&select).unwrap();
+        assert_eq!(
+            result.access_path,
+            RelationalAccessPath::EqualityIndex {
+                table: "people".to_string(),
+                column: "name".to_string(),
+                matched_keys: 1,
+            }
+        );
+        assert_eq!(result.rows, vec![vec![SqlValue::Int4(2)]]);
+
+        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        assert_eq!(
+            recovered
+                .relational_catalog_table("people")
+                .unwrap()
+                .indexes,
+            renamed_indexes
+        );
+        assert_eq!(
+            recovered.relational_index_comment("people_lookup_idx"),
+            Some("lookup")
+        );
+
+        let duplicate_err = e
+            .execute_text(
+                6,
+                "ALTER INDEX people_lookup_idx RENAME TO people_lookup_idx",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            duplicate_err.contains("relation \"people_lookup_idx\" already exists"),
+            "{duplicate_err}"
+        );
+        let missing_err = e
+            .execute_text(7, "ALTER INDEX people_name_idx RENAME TO people_old_idx")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            missing_err.contains("index \"people_name_idx\" does not exist"),
+            "{missing_err}"
+        );
+
+        let mut constrained = Engine::new_local();
+        constrained
+            .execute_text(1, "CREATE TABLE keyed_people (id INT PRIMARY KEY)")
+            .unwrap();
+        let constraint_err = constrained
+            .execute_text(
+                2,
+                "ALTER INDEX keyed_people_pkey RENAME TO keyed_people_id_idx",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            constraint_err.contains("cannot rename constraint-backed index"),
+            "{constraint_err}"
         );
     }
 
