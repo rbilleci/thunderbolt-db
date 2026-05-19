@@ -2622,12 +2622,22 @@ fn parse_create_sequence(input: &str) -> Result<CreateSequence, ParseError> {
         || strip_keyword_prefix_case_insensitive(rest, "IF").is_some()
         || strip_keyword_prefix_case_insensitive(rest, "TEMP").is_some()
         || strip_keyword_prefix_case_insensitive(rest, "TEMPORARY").is_some()
-        || rest.split_whitespace().count() != 1
+    {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let mut parts = rest.split_whitespace();
+    let Some(name) = parts.next() else {
+        return Err(ParseError::InvalidRelationalSql);
+    };
+    let suffix = parts.collect::<Vec<_>>().join(" ");
+    if !suffix.is_empty()
+        && !suffix
+            .eq_ignore_ascii_case("START WITH 1 INCREMENT BY 1 NO MINVALUE NO MAXVALUE CACHE 1")
     {
         return Err(ParseError::InvalidRelationalSql);
     }
     Ok(CreateSequence {
-        name: normalize_relation_identifier(rest)?,
+        name: normalize_relation_identifier(name)?,
     })
 }
 
@@ -12196,6 +12206,15 @@ mod tests {
             })
         );
         assert_eq!(
+            parse_command(
+                "CREATE SEQUENCE public.seq_people START WITH 1 INCREMENT BY 1 NO MINVALUE NO MAXVALUE CACHE 1"
+            )
+            .unwrap(),
+            Command::CreateSequence(CreateSequence {
+                name: "seq_people".to_string(),
+            })
+        );
+        assert_eq!(
             parse_command("DROP SEQUENCE IF EXISTS public.seq_people, seq_teams").unwrap(),
             Command::DropSequence(DropSequence {
                 names: vec!["seq_people".to_string(), "seq_teams".to_string()],
@@ -12221,6 +12240,10 @@ mod tests {
 
         assert!(matches!(
             parse_command("CREATE SEQUENCE seq_people START WITH 10"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command("CREATE SEQUENCE seq_people AS bigint"),
             Err(ParseError::InvalidRelationalSql)
         ));
         assert!(matches!(

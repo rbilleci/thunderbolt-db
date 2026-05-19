@@ -6402,6 +6402,13 @@ fn execute_statement(
             &pg_dump_database_metadata_rows(session),
         );
     }
+    if let Some(sequence_oid) = pg_dump_sequence_metadata_query_oid(&canonical) {
+        return write_single_row(
+            stream,
+            &pg_dump_sequence_metadata_columns(),
+            &pg_dump_sequence_metadata_rows(session, sequence_oid),
+        );
+    }
     if canonical == "select pg_catalog.shobj_description(5, 'pg_database')" {
         return write_single_row(
             stream,
@@ -6626,6 +6633,40 @@ fn execute_statement(
                 int4_column("objsubid"),
             ],
             &catalog_empty_rows(),
+        );
+    }
+    if let Some(sequence) = pg_dump_sequence_setval_query_name(&canonical) {
+        if session.sequences.contains_key(&sequence) {
+            return write_single_row(
+                stream,
+                &[int8_column("setval")],
+                &[vec![Some("1".to_string())]],
+            );
+        }
+        return write_error(
+            stream,
+            &ErrorField {
+                code: "42P01",
+                message: "relation does not exist",
+                position: None,
+            },
+        );
+    }
+    if let Some(sequence) = pg_dump_sequence_last_value_query_name(&canonical) {
+        if session.sequences.contains_key(&sequence) {
+            return write_single_row(
+                stream,
+                &[int8_column("last_value"), bool_column("is_called")],
+                &[vec![Some("1".to_string()), Some("f".to_string())]],
+            );
+        }
+        return write_error(
+            stream,
+            &ErrorField {
+                code: "42P01",
+                message: "relation does not exist",
+                position: None,
+            },
         );
     }
 
@@ -10538,6 +10579,13 @@ fn pg_dump_table_oid_lookup_rows(
             rows.push(vec![Some(view.oid.to_string())]);
         }
     }
+    let mut sequences = session.sequences.values().collect::<Vec<_>>();
+    sequences.sort_by_key(|sequence| sequence.oid);
+    for sequence in sequences {
+        if psql_relname_pattern_matches(relname_pattern, &sequence.name) {
+            rows.push(vec![Some(sequence.oid.to_string())]);
+        }
+    }
     rows
 }
 
@@ -10626,6 +10674,18 @@ fn pg_dump_class_metadata_rows(session: &Session) -> Vec<Vec<Option<String>>> {
             Some("heap"),
         ));
     }
+    let mut sequences = session.sequences.values().collect::<Vec<_>>();
+    sequences.sort_by_key(|sequence| sequence.oid);
+    for sequence in sequences {
+        rows.push(pg_dump_class_metadata_row(
+            sequence.oid,
+            &sequence.name,
+            "S",
+            false,
+            false,
+            None,
+        ));
+    }
     rows
 }
 
@@ -10685,12 +10745,13 @@ fn pg_dump_attribute_metadata_query_oids(canonical: &str) -> Option<Vec<u32>> {
     if !rest.contains("join pg_catalog.pg_attribute a") {
         return None;
     }
-    let parsed = oids
-        .split(',')
+    if oids.trim().is_empty() {
+        return Some(Vec::new());
+    }
+    oids.split(',')
         .map(str::parse::<u32>)
         .collect::<Result<Vec<_>, _>>()
-        .ok()?;
-    (!parsed.is_empty()).then_some(parsed)
+        .ok()
 }
 
 fn pg_dump_attribute_metadata_columns() -> Vec<Column> {
@@ -11072,6 +11133,66 @@ fn pg_dump_attrdef_metadata_rows(
             })
         })
         .collect()
+}
+
+fn pg_dump_sequence_metadata_query_oid(canonical: &str) -> Option<u32> {
+    let prefix = "select format_type(seqtypid, null), seqstart, seqincrement, seqmax, seqmin, seqcache, seqcycle from pg_catalog.pg_sequence where seqrelid = '";
+    let suffix = "'::oid";
+    canonical
+        .strip_prefix(prefix)?
+        .strip_suffix(suffix)?
+        .parse()
+        .ok()
+}
+
+fn pg_dump_sequence_metadata_columns() -> Vec<Column> {
+    vec![
+        text_column("format_type"),
+        int8_column("seqstart"),
+        int8_column("seqincrement"),
+        int8_column("seqmax"),
+        int8_column("seqmin"),
+        int8_column("seqcache"),
+        bool_column("seqcycle"),
+    ]
+}
+
+fn pg_dump_sequence_metadata_rows(
+    session: &Session,
+    sequence_oid: u32,
+) -> Vec<Vec<Option<String>>> {
+    if session
+        .sequences
+        .values()
+        .any(|sequence| sequence.oid == sequence_oid)
+    {
+        return vec![vec![
+            Some("bigint".to_string()),
+            Some("1".to_string()),
+            Some("1".to_string()),
+            Some("9223372036854775807".to_string()),
+            Some("1".to_string()),
+            Some("1".to_string()),
+            Some("f".to_string()),
+        ]];
+    }
+    Vec::new()
+}
+
+fn pg_dump_sequence_last_value_query_name(canonical: &str) -> Option<String> {
+    let prefix = "select last_value, is_called from ";
+    let name = canonical.strip_prefix(prefix)?.trim();
+    if name.contains(' ') || name.contains('(') || name.contains(')') {
+        return None;
+    }
+    Some(name.strip_prefix("public.").unwrap_or(name).to_string())
+}
+
+fn pg_dump_sequence_setval_query_name(canonical: &str) -> Option<String> {
+    let prefix = "select pg_catalog.setval('";
+    let suffix = "', 1, false)";
+    let name = canonical.strip_prefix(prefix)?.strip_suffix(suffix)?;
+    Some(name.strip_prefix("public.").unwrap_or(name).to_string())
 }
 
 fn sql_type_alignment_code(ty: SqlType) -> &'static str {
@@ -13240,6 +13361,37 @@ fn pg_dump_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
             ]);
         }
     }
+    rows.sort_by(|left, right| {
+        let left_key = (
+            left[1]
+                .as_deref()
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or_default(),
+            left[2]
+                .as_deref()
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or_default(),
+            left[3]
+                .as_deref()
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or_default(),
+        );
+        let right_key = (
+            right[1]
+                .as_deref()
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or_default(),
+            right[2]
+                .as_deref()
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or_default(),
+            right[3]
+                .as_deref()
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or_default(),
+        );
+        left_key.cmp(&right_key)
+    });
     rows
 }
 
@@ -23914,12 +24066,6 @@ mod tests {
             pg_dump_description_rows(&session),
             vec![
                 vec![
-                    Some("application schema".to_string()),
-                    Some("2615".to_string()),
-                    Some(PUBLIC_NAMESPACE_OID.to_string()),
-                    Some("0".to_string()),
-                ],
-                vec![
                     Some("lookup table".to_string()),
                     Some("1259".to_string()),
                     Some(FIRST_USER_RELATION_OID.to_string()),
@@ -23935,6 +24081,12 @@ mod tests {
                     Some("lookup view".to_string()),
                     Some("1259".to_string()),
                     Some((FIRST_USER_RELATION_OID + 1).to_string()),
+                    Some("0".to_string()),
+                ],
+                vec![
+                    Some("application schema".to_string()),
+                    Some("2615".to_string()),
+                    Some(PUBLIC_NAMESPACE_OID.to_string()),
                     Some("0".to_string()),
                 ],
             ]

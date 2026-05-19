@@ -124,6 +124,8 @@ CREATE VIEW public.account_lookup AS SELECT id, name FROM accounts WHERE id > 1 
 COMMENT ON VIEW public.account_lookup IS 'active account lookup';
 CREATE MATERIALIZED VIEW public.account_snapshot AS SELECT id, name FROM accounts ORDER BY id;
 COMMENT ON MATERIALIZED VIEW public.account_snapshot IS 'account snapshot';
+CREATE SEQUENCE public.account_seq;
+COMMENT ON SEQUENCE public.account_seq IS 'account sequence';
 SQL
 
 PGHOST=127.0.0.1 PGPORT="$SOURCE_PORT" PGDATABASE=postgres PGUSER=postgres \
@@ -198,6 +200,7 @@ public|events|r||events table
 public|events|r|note|event note
 public|account_lookup|v||active account lookup
 public|account_snapshot|m||account snapshot
+public|account_seq|s||account sequence
 EOF
 
 cat >"$OUT_DIR/constraint-comment-verify.expected" <<'EOF'
@@ -291,6 +294,23 @@ verify_materialized_views() {
 
 verify_materialized_views "$RESTORE_PORT" "restore"
 
+cat >"$OUT_DIR/sequence-verify.expected" <<'EOF'
+public|account_seq|s|p
+EOF
+
+verify_sequences() {
+  local port="$1"
+  local prefix="$2"
+  PGHOST=127.0.0.1 PGPORT="$port" PGDATABASE=postgres PGUSER=postgres \
+    psql -v ON_ERROR_STOP=1 -X -A -t \
+    -c "SELECT c.oid, n.nspname, c.relname, c.relkind, c.relpersistence FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relkind = 's' ORDER BY c.relname;" \
+    2>"$OUT_DIR/${prefix}-sequence-verify.err" \
+    | cut -d'|' -f2- >"$OUT_DIR/${prefix}-sequence-verify.out"
+  diff -u "$OUT_DIR/sequence-verify.expected" "$OUT_DIR/${prefix}-sequence-verify.out"
+}
+
+verify_sequences "$RESTORE_PORT" "restore"
+
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$CUSTOM_RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/custom-restore-server.log" 2>&1 &
 custom_restore_pid=$!
@@ -313,6 +333,7 @@ verify_comments "$CUSTOM_RESTORE_PORT" "custom"
 verify_constraint_comments "$CUSTOM_RESTORE_PORT" "custom"
 verify_views "$CUSTOM_RESTORE_PORT" "custom"
 verify_materialized_views "$CUSTOM_RESTORE_PORT" "custom"
+verify_sequences "$CUSTOM_RESTORE_PORT" "custom"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$DIRECTORY_RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/directory-restore-server.log" 2>&1 &
@@ -336,6 +357,7 @@ verify_comments "$DIRECTORY_RESTORE_PORT" "directory"
 verify_constraint_comments "$DIRECTORY_RESTORE_PORT" "directory"
 verify_views "$DIRECTORY_RESTORE_PORT" "directory"
 verify_materialized_views "$DIRECTORY_RESTORE_PORT" "directory"
+verify_sequences "$DIRECTORY_RESTORE_PORT" "directory"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$TAR_RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/tar-restore-server.log" 2>&1 &
@@ -359,6 +381,7 @@ verify_comments "$TAR_RESTORE_PORT" "tar"
 verify_constraint_comments "$TAR_RESTORE_PORT" "tar"
 verify_views "$TAR_RESTORE_PORT" "tar"
 verify_materialized_views "$TAR_RESTORE_PORT" "tar"
+verify_sequences "$TAR_RESTORE_PORT" "tar"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$PARALLEL_DIRECTORY_RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/directory-parallel-restore-server.log" 2>&1 &
@@ -382,6 +405,7 @@ verify_comments "$PARALLEL_DIRECTORY_RESTORE_PORT" "directory-parallel"
 verify_constraint_comments "$PARALLEL_DIRECTORY_RESTORE_PORT" "directory-parallel"
 verify_views "$PARALLEL_DIRECTORY_RESTORE_PORT" "directory-parallel"
 verify_materialized_views "$PARALLEL_DIRECTORY_RESTORE_PORT" "directory-parallel"
+verify_sequences "$PARALLEL_DIRECTORY_RESTORE_PORT" "directory-parallel"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$CLEAN_RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/clean-restore-server.log" 2>&1 &
@@ -394,6 +418,7 @@ CREATE TABLE accounts (id int4, name text);
 INSERT INTO accounts (id, name) VALUES (99, 'stale account');
 CREATE VIEW public.account_lookup AS SELECT id, name FROM accounts WHERE id = 99 ORDER BY id;
 CREATE MATERIALIZED VIEW public.account_snapshot AS SELECT id, name FROM accounts ORDER BY id;
+CREATE SEQUENCE public.account_seq;
 CREATE TABLE events (event_id int4, note text);
 INSERT INTO events (event_id, note) VALUES (99, 'stale event');
 SQL
@@ -415,6 +440,7 @@ verify_comments "$CLEAN_RESTORE_PORT" "clean"
 verify_constraint_comments "$CLEAN_RESTORE_PORT" "clean"
 verify_views "$CLEAN_RESTORE_PORT" "clean"
 verify_materialized_views "$CLEAN_RESTORE_PORT" "clean"
+verify_sequences "$CLEAN_RESTORE_PORT" "clean"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$INSERT_RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/insert-restore-server.log" 2>&1 &
@@ -438,6 +464,7 @@ verify_comments "$INSERT_RESTORE_PORT" "insert"
 verify_constraint_comments "$INSERT_RESTORE_PORT" "insert"
 verify_views "$INSERT_RESTORE_PORT" "insert"
 verify_materialized_views "$INSERT_RESTORE_PORT" "insert"
+verify_sequences "$INSERT_RESTORE_PORT" "insert"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$SPLIT_RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/split-restore-server.log" 2>&1 &
@@ -465,6 +492,7 @@ verify_comments "$SPLIT_RESTORE_PORT" "split"
 verify_constraint_comments "$SPLIT_RESTORE_PORT" "split"
 verify_views "$SPLIT_RESTORE_PORT" "split"
 verify_materialized_views "$SPLIT_RESTORE_PORT" "split" "$OUT_DIR/materialized-view-empty.expected"
+verify_sequences "$SPLIT_RESTORE_PORT" "split"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$CUSTOM_SPLIT_RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/custom-split-restore-server.log" 2>&1 &
@@ -492,6 +520,7 @@ verify_comments "$CUSTOM_SPLIT_RESTORE_PORT" "custom-split"
 verify_constraint_comments "$CUSTOM_SPLIT_RESTORE_PORT" "custom-split"
 verify_views "$CUSTOM_SPLIT_RESTORE_PORT" "custom-split"
 verify_materialized_views "$CUSTOM_SPLIT_RESTORE_PORT" "custom-split" "$OUT_DIR/materialized-view-empty.expected"
+verify_sequences "$CUSTOM_SPLIT_RESTORE_PORT" "custom-split"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$DIRECTORY_SPLIT_RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/directory-split-restore-server.log" 2>&1 &
@@ -519,6 +548,7 @@ verify_comments "$DIRECTORY_SPLIT_RESTORE_PORT" "directory-split"
 verify_constraint_comments "$DIRECTORY_SPLIT_RESTORE_PORT" "directory-split"
 verify_views "$DIRECTORY_SPLIT_RESTORE_PORT" "directory-split"
 verify_materialized_views "$DIRECTORY_SPLIT_RESTORE_PORT" "directory-split" "$OUT_DIR/materialized-view-empty.expected"
+verify_sequences "$DIRECTORY_SPLIT_RESTORE_PORT" "directory-split"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$TAR_SPLIT_RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/tar-split-restore-server.log" 2>&1 &
@@ -546,6 +576,7 @@ verify_comments "$TAR_SPLIT_RESTORE_PORT" "tar-split"
 verify_constraint_comments "$TAR_SPLIT_RESTORE_PORT" "tar-split"
 verify_views "$TAR_SPLIT_RESTORE_PORT" "tar-split"
 verify_materialized_views "$TAR_SPLIT_RESTORE_PORT" "tar-split" "$OUT_DIR/materialized-view-empty.expected"
+verify_sequences "$TAR_SPLIT_RESTORE_PORT" "tar-split"
 
 pg_restore --list "$OUT_DIR/dump.custom" >"$OUT_DIR/dump.custom.toc"
 pg_restore --list "$OUT_DIR/dump.dir" >"$OUT_DIR/dump.dir.toc"
@@ -573,6 +604,10 @@ grep -F "SELECT id, name FROM accounts ORDER BY id" "$OUT_DIR/dump.sql" >/dev/nu
 grep -F "  WITH NO DATA;" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "REFRESH MATERIALIZED VIEW public.account_snapshot;" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "COMMENT ON MATERIALIZED VIEW public.account_snapshot IS 'account snapshot';" "$OUT_DIR/dump.sql" >/dev/null
+grep -F "CREATE SEQUENCE public.account_seq" "$OUT_DIR/dump.sql" >/dev/null
+grep -F "START WITH 1" "$OUT_DIR/dump.sql" >/dev/null
+grep -F "SELECT pg_catalog.setval('public.account_seq', 1, false);" "$OUT_DIR/dump.sql" >/dev/null
+grep -F "COMMENT ON SEQUENCE public.account_seq IS 'account sequence';" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "COMMENT ON TABLE public.accounts IS 'accounts table';" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "COMMENT ON COLUMN public.accounts.name IS 'account display name';" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "COMMENT ON INDEX public.accounts_name_idx IS 'accounts name lookup';" "$OUT_DIR/dump.sql" >/dev/null
@@ -592,6 +627,8 @@ grep -F "COMMENT ON VIEW public.account_lookup IS 'active account lookup';" "$OU
 grep -F "CREATE MATERIALIZED VIEW public.account_snapshot AS" "$OUT_DIR/dump-schema.sql" >/dev/null
 grep -F "  WITH NO DATA;" "$OUT_DIR/dump-schema.sql" >/dev/null
 grep -F "COMMENT ON MATERIALIZED VIEW public.account_snapshot IS 'account snapshot';" "$OUT_DIR/dump-schema.sql" >/dev/null
+grep -F "CREATE SEQUENCE public.account_seq" "$OUT_DIR/dump-schema.sql" >/dev/null
+grep -F "COMMENT ON SEQUENCE public.account_seq IS 'account sequence';" "$OUT_DIR/dump-schema.sql" >/dev/null
 grep -F "COMMENT ON TABLE public.accounts IS 'accounts table';" "$OUT_DIR/dump-schema.sql" >/dev/null
 grep -F "COMMENT ON COLUMN public.accounts.name IS 'account display name';" "$OUT_DIR/dump-schema.sql" >/dev/null
 grep -F "COMMENT ON INDEX public.accounts_name_idx IS 'accounts name lookup';" "$OUT_DIR/dump-schema.sql" >/dev/null
@@ -600,6 +637,7 @@ grep -F "COMMENT ON COLUMN public.events.note IS 'event note';" "$OUT_DIR/dump-s
 grep -F "COMMENT ON INDEX public.events_note_idx IS 'events note lookup';" "$OUT_DIR/dump-schema.sql" >/dev/null
 grep -F "COPY public.accounts (id, name, tier) FROM stdin;" "$OUT_DIR/dump-data.sql" >/dev/null
 grep -F "COPY public.events (event_id, note) FROM stdin;" "$OUT_DIR/dump-data.sql" >/dev/null
+grep -F "SELECT pg_catalog.setval('public.account_seq', 1, false);" "$OUT_DIR/dump-data.sql" >/dev/null
 if grep -F "REFRESH MATERIALIZED VIEW public.account_snapshot;" "$OUT_DIR/dump-data.sql" >/dev/null; then
   echo "plain data-only dump unexpectedly included materialized view refresh" >&2
   exit 1
@@ -612,6 +650,8 @@ grep -F "INDEX public events_note_idx" "$OUT_DIR/dump.custom.toc" >/dev/null
 grep -F "VIEW public account_lookup" "$OUT_DIR/dump.custom.toc" >/dev/null
 grep -F "MATERIALIZED VIEW public account_snapshot" "$OUT_DIR/dump.custom.toc" >/dev/null
 grep -F "MATERIALIZED VIEW DATA public account_snapshot" "$OUT_DIR/dump.custom.toc" >/dev/null
+grep -F "SEQUENCE public account_seq" "$OUT_DIR/dump.custom.toc" >/dev/null
+grep -F "SEQUENCE SET public account_seq" "$OUT_DIR/dump.custom.toc" >/dev/null
 grep -F "TABLE DATA public accounts" "$OUT_DIR/dump.custom.toc" >/dev/null
 grep -F "TABLE DATA public events" "$OUT_DIR/dump.custom.toc" >/dev/null
 grep -F "SCHEMA - public" "$OUT_DIR/dump.dir.toc" >/dev/null
@@ -622,6 +662,8 @@ grep -F "INDEX public events_note_idx" "$OUT_DIR/dump.dir.toc" >/dev/null
 grep -F "VIEW public account_lookup" "$OUT_DIR/dump.dir.toc" >/dev/null
 grep -F "MATERIALIZED VIEW public account_snapshot" "$OUT_DIR/dump.dir.toc" >/dev/null
 grep -F "MATERIALIZED VIEW DATA public account_snapshot" "$OUT_DIR/dump.dir.toc" >/dev/null
+grep -F "SEQUENCE public account_seq" "$OUT_DIR/dump.dir.toc" >/dev/null
+grep -F "SEQUENCE SET public account_seq" "$OUT_DIR/dump.dir.toc" >/dev/null
 grep -F "TABLE DATA public accounts" "$OUT_DIR/dump.dir.toc" >/dev/null
 grep -F "TABLE DATA public events" "$OUT_DIR/dump.dir.toc" >/dev/null
 grep -F "SCHEMA - public" "$OUT_DIR/dump.tar.toc" >/dev/null
@@ -632,6 +674,8 @@ grep -F "INDEX public events_note_idx" "$OUT_DIR/dump.tar.toc" >/dev/null
 grep -F "VIEW public account_lookup" "$OUT_DIR/dump.tar.toc" >/dev/null
 grep -F "MATERIALIZED VIEW public account_snapshot" "$OUT_DIR/dump.tar.toc" >/dev/null
 grep -F "MATERIALIZED VIEW DATA public account_snapshot" "$OUT_DIR/dump.tar.toc" >/dev/null
+grep -F "SEQUENCE public account_seq" "$OUT_DIR/dump.tar.toc" >/dev/null
+grep -F "SEQUENCE SET public account_seq" "$OUT_DIR/dump.tar.toc" >/dev/null
 grep -F "TABLE DATA public accounts" "$OUT_DIR/dump.tar.toc" >/dev/null
 grep -F "TABLE DATA public events" "$OUT_DIR/dump.tar.toc" >/dev/null
 
@@ -649,6 +693,7 @@ echo "pg_dump_tar_split_schema_data_restore=passed"
 echo "pg_dump_metadata_index_restore=passed"
 echo "pg_dump_bounded_view_restore=passed"
 echo "pg_dump_bounded_materialized_view_restore=passed"
+echo "pg_dump_bounded_sequence_restore=passed"
 echo "dump_file=$OUT_DIR/dump.sql"
 echo "insert_dump_file=$OUT_DIR/dump-inserts.sql"
 echo "schema_dump_file=$OUT_DIR/dump-schema.sql"
