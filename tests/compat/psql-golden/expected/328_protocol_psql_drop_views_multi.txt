@@ -1,0 +1,82 @@
+=== bounded multi-view drops ===
+CREATE TABLE
+INSERT 0 3
+CREATE VIEW
+CREATE VIEW
+CREATE VIEW
+COMMENT
+COMMENT
+                                    List of relations
+ Schema |           Name           | Type |  Owner   | Persistence | Size |  Description
+--------+--------------------------+------+----------+-------------+------+---------------
+ public | active_drop_views_people | view | postgres | permanent   |      | active people
+ public | other_drop_views_people  | view | postgres | permanent   |      | other people
+ public | third_drop_views_people  | view | postgres | permanent   |      |
+(3 rows)
+
+psql:328_protocol_psql_drop_views_multi.sql:10: ERROR:  view does not exist
+                                    List of relations
+ Schema |           Name           | Type |  Owner   | Persistence | Size |  Description
+--------+--------------------------+------+----------+-------------+------+---------------
+ public | active_drop_views_people | view | postgres | permanent   |      | active people
+ public | other_drop_views_people  | view | postgres | permanent   |      | other people
+ public | third_drop_views_people  | view | postgres | permanent   |      |
+(3 rows)
+
+DROP VIEW
+                                   List of relations
+ Schema |          Name           | Type |  Owner   | Persistence | Size | Description
+--------+-------------------------+------+----------+-------------+------+--------------
+ public | other_drop_views_people | view | postgres | permanent   |      | other people
+ public | third_drop_views_people | view | postgres | permanent   |      |
+(2 rows)
+
+ schemaname |        viewname         | viewowner |                               definition
+------------+-------------------------+-----------+-------------------------------------------------------------------------
+ public     | other_drop_views_people | postgres  | SELECT id, name FROM drop_views_people WHERE id = 1
+ public     | third_drop_views_people | postgres  | SELECT id, name FROM drop_views_people WHERE name LIKE 'G%' ORDER BY id
+(2 rows)
+
+ nspname |         relname         | attname | description
+---------+-------------------------+---------+--------------
+ public  | other_drop_views_people |         | other people
+(1 row)
+
+                   Object descriptions
+ Schema |          Name           | Object | Description
+--------+-------------------------+--------+--------------
+ public | other_drop_views_people | view   | other people
+(1 row)
+
+DROP VIEW
+psql:328_protocol_psql_drop_views_multi.sql:27: error: Did not find any relations.
+ id | name
+----+-------
+  1 | Ada
+  2 | Linus
+  3 | Grace
+(3 rows)
+
+CREATE VIEW
+psql:328_protocol_psql_drop_views_multi.sql:30: ERROR:  view specified more than once
+                                     List of relations
+ Schema |            Name             | Type |  Owner   | Persistence | Size | Description
+--------+-----------------------------+------+----------+-------------+------+-------------
+ public | duplicate_drop_views_people | view | postgres | permanent   |      |
+(1 row)
+
+psql:328_protocol_psql_drop_views_multi.sql:32: ERROR:  relation is not a view
+                                     List of relations
+ Schema |            Name             | Type |  Owner   | Persistence | Size | Description
+--------+-----------------------------+------+----------+-------------+------+-------------
+ public | duplicate_drop_views_people | view | postgres | permanent   |      |
+(1 row)
+
+psql:328_protocol_psql_drop_views_multi.sql:34: ERROR:  query shape is not supported by the compatibility stub
+psql:328_protocol_psql_drop_views_multi.sql:35: ERROR:  query shape is not supported by the compatibility stub
+ id | name
+----+-------
+  1 | Ada
+  2 | Linus
+  3 | Grace
+(3 rows)

@@ -6689,35 +6689,47 @@ fn execute_statement(
                 return write_command_complete(stream, "ALTER VIEW");
             }
             Command::DropView(drop) => {
-                if session.tables.contains_key(&drop.name) {
-                    return write_error(
-                        stream,
-                        &ErrorField {
-                            code: "42809",
-                            message: "relation is not a view",
-                            position: None,
-                        },
-                    );
+                let mut seen = BTreeSet::new();
+                for name in &drop.names {
+                    if !seen.insert(name) {
+                        return write_error(
+                            stream,
+                            &ErrorField {
+                                code: "42710",
+                                message: "view specified more than once",
+                                position: None,
+                            },
+                        );
+                    }
+                    if session.tables.contains_key(name) {
+                        return write_error(
+                            stream,
+                            &ErrorField {
+                                code: "42809",
+                                message: "relation is not a view",
+                                position: None,
+                            },
+                        );
+                    }
+                    if !drop.if_exists && !session.views.contains_key(name) {
+                        return write_error(
+                            stream,
+                            &ErrorField {
+                                code: "42P01",
+                                message: "view does not exist",
+                                position: None,
+                            },
+                        );
+                    }
                 }
-                let removed = session.views.remove(&drop.name).is_some();
-                if !removed && !drop.if_exists {
-                    return write_error(
-                        stream,
-                        &ErrorField {
-                            code: "42P01",
-                            message: "view does not exist",
-                            position: None,
-                        },
-                    );
+                for name in &drop.names {
+                    if session.views.remove(name).is_some() {
+                        let target = CatalogCommentTarget::View { view: name.clone() };
+                        session.comments.remove(&target);
+                        session.mark_comment_dirty(target);
+                    }
+                    session.mark_view_dirty(name.clone());
                 }
-                if removed {
-                    let target = CatalogCommentTarget::View {
-                        view: drop.name.clone(),
-                    };
-                    session.comments.remove(&target);
-                    session.mark_comment_dirty(target);
-                }
-                session.mark_view_dirty(drop.name);
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, "DROP VIEW");
             }

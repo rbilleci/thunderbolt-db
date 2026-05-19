@@ -157,7 +157,7 @@ pub struct DropIndex {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DropView {
-    pub name: String,
+    pub names: Vec<String>,
     pub if_exists: bool,
 }
 
@@ -2722,11 +2722,14 @@ fn parse_drop_view(input: &str) -> Result<DropView, ParseError> {
         return Err(ParseError::InvalidRelationalSql);
     }
     let views = split_csv(rest)?;
-    let [view] = views.as_slice() else {
+    if views.is_empty() {
         return Err(ParseError::InvalidRelationalSql);
-    };
+    }
     Ok(DropView {
-        name: normalize_relation_identifier(view.trim())?,
+        names: views
+            .iter()
+            .map(|view| normalize_relation_identifier(view.trim()))
+            .collect::<Result<Vec<_>, _>>()?,
         if_exists,
     })
 }
@@ -10320,15 +10323,22 @@ mod tests {
         assert_eq!(
             parse_command("DROP VIEW public.active_people").unwrap(),
             Command::DropView(DropView {
-                name: "active_people".to_string(),
+                names: vec!["active_people".to_string()],
                 if_exists: false,
             })
         );
         assert_eq!(
             parse_command("DROP VIEW IF EXISTS active_people").unwrap(),
             Command::DropView(DropView {
-                name: "active_people".to_string(),
+                names: vec!["active_people".to_string()],
                 if_exists: true,
+            })
+        );
+        assert_eq!(
+            parse_command("DROP VIEW public.a, public.b").unwrap(),
+            Command::DropView(DropView {
+                names: vec!["a".to_string(), "b".to_string()],
+                if_exists: false,
             })
         );
         assert_eq!(
@@ -10352,10 +10362,6 @@ mod tests {
         ));
         assert!(matches!(
             parse_command("ALTER VIEW public.active_people RENAME TO public.renamed_people"),
-            Err(ParseError::InvalidRelationalSql)
-        ));
-        assert!(matches!(
-            parse_command("DROP VIEW public.a, public.b"),
             Err(ParseError::InvalidRelationalSql)
         ));
         assert!(matches!(

@@ -8304,26 +8304,40 @@ impl Engine {
     }
 
     fn apply_drop_view(&mut self, drop: DropView) -> Result<(), EngineError> {
-        if self.relational_catalog.contains_key(&drop.name) {
-            return Err(EngineError::ApplyFailed(format!(
-                "relation \"{}\" is not a view",
-                drop.name
-            )));
-        }
-        if self.relational_views.remove(&drop.name).is_some() {
+        self.preflight_drop_view(&drop)?;
+        for name in &drop.names {
+            if self.relational_views.remove(name).is_none() {
+                continue;
+            }
             self.relational_comments
-                .remove(&RelationalCommentTarget::View {
-                    view: drop.name.clone(),
-                });
-            return Ok(());
+                .remove(&RelationalCommentTarget::View { view: name.clone() });
         }
-        if drop.if_exists {
-            return Ok(());
+        Ok(())
+    }
+
+    fn preflight_drop_view(&self, drop: &DropView) -> Result<(), EngineError> {
+        let mut seen = BTreeSet::new();
+        for name in &drop.names {
+            if !seen.insert(name) {
+                return Err(EngineError::ApplyFailed(format!(
+                    "view \"{}\" specified more than once",
+                    name
+                )));
+            }
+            if self.relational_catalog.contains_key(name) {
+                return Err(EngineError::ApplyFailed(format!(
+                    "relation \"{}\" is not a view",
+                    name
+                )));
+            }
+            if !drop.if_exists && !self.relational_views.contains_key(name) {
+                return Err(EngineError::ApplyFailed(format!(
+                    "view \"{}\" does not exist",
+                    name
+                )));
+            }
         }
-        Err(EngineError::ApplyFailed(format!(
-            "view \"{}\" does not exist",
-            drop.name
-        )))
+        Ok(())
     }
 
     fn apply_rename_view(&mut self, rename: RenameView) -> Result<(), EngineError> {
@@ -9363,6 +9377,7 @@ impl Engine {
                 }
             }
             Command::DropIndex(drop) => self.preflight_drop_index(drop)?,
+            Command::DropView(drop) => self.preflight_drop_view(drop)?,
             Command::Insert(insert) => {
                 let table = self.relational_catalog.get(&insert.table).ok_or_else(|| {
                     EngineError::ApplyFailed(format!(
@@ -31847,15 +31862,16 @@ mod tests {
             "CREATE VIEW public.other_people AS SELECT id, name FROM people WHERE id = 2",
         )
         .unwrap();
-        e.execute_text(5, "DROP VIEW public.active_people").unwrap();
+        e.execute_text(5, "DROP VIEW public.active_people, public.other_people")
+            .unwrap();
 
         assert!(e.relational_catalog_view("active_people").is_none());
-        assert!(e.relational_catalog_view("other_people").is_some());
+        assert!(e.relational_catalog_view("other_people").is_none());
         assert!(e.relational_catalog_table("people").is_some());
 
         let mut recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
         assert!(recovered.relational_catalog_view("active_people").is_none());
-        assert!(recovered.relational_catalog_view("other_people").is_some());
+        assert!(recovered.relational_catalog_view("other_people").is_none());
 
         let Command::Select(table_select) =
             parse_command("SELECT id, name FROM people ORDER BY id").unwrap()
@@ -31886,6 +31902,42 @@ mod tests {
             .execute_text(2, "DROP VIEW people")
             .unwrap_err();
         assert!(table_target.to_string().contains("not a view"));
+
+        let mut preflight_engine = Engine::new_local();
+        preflight_engine
+            .execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        preflight_engine
+            .execute_text(
+                2,
+                "CREATE VIEW public.active_people AS SELECT id, name FROM people ORDER BY id",
+            )
+            .unwrap();
+        preflight_engine
+            .execute_text(
+                3,
+                "CREATE VIEW public.other_people AS SELECT id, name FROM people WHERE id = 2",
+            )
+            .unwrap();
+        let missing_batch = preflight_engine
+            .execute_text(4, "DROP VIEW active_people, missing_people")
+            .unwrap_err();
+        assert!(missing_batch
+            .to_string()
+            .contains("view \"missing_people\" does not exist"));
+        assert!(preflight_engine
+            .relational_catalog_view("active_people")
+            .is_some());
+        assert!(preflight_engine
+            .relational_catalog_view("other_people")
+            .is_some());
+
+        let duplicate = preflight_engine
+            .execute_text(5, "DROP VIEW active_people, active_people")
+            .unwrap_err();
+        assert!(duplicate
+            .to_string()
+            .contains("view \"active_people\" specified more than once"));
     }
 
     #[test]
