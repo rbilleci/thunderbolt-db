@@ -318,6 +318,7 @@ pub enum CommentTarget {
 pub struct ColumnDef {
     pub name: String,
     pub ty: SqlType,
+    pub domain: Option<String>,
     pub default: Option<ColumnDefault>,
 }
 
@@ -2511,12 +2512,15 @@ fn parse_column_def(input: &str) -> Result<ColumnDef, ParseError> {
         .ok_or(ParseError::InvalidRelationalSql)
         .and_then(normalize_identifier)?;
     let raw_ty = parts.next().ok_or(ParseError::InvalidRelationalSql)?;
-    let ty = match raw_ty {
-        ty if parse_supported_sql_type_name(ty) == Some(SqlType::Int4) => SqlType::Int4,
-        ty if parse_supported_sql_type_name(ty) == Some(SqlType::Text) => SqlType::Text,
-        _ => return Err(ParseError::InvalidRelationalSql),
+    let (ty, domain) = match raw_ty {
+        ty if parse_supported_sql_type_name(ty) == Some(SqlType::Int4) => (SqlType::Int4, None),
+        ty if parse_supported_sql_type_name(ty) == Some(SqlType::Text) => (SqlType::Text, None),
+        ty => (SqlType::Int4, Some(normalize_relation_identifier(ty)?)),
     };
     let tail = parts.collect::<Vec<_>>().join(" ");
+    if domain.is_some() && !tail.is_empty() {
+        return Err(ParseError::InvalidRelationalSql);
+    }
     let default = if tail.is_empty() {
         None
     } else {
@@ -2528,7 +2532,12 @@ fn parse_column_def(input: &str) -> Result<ColumnDef, ParseError> {
         }
         Some(parse_typed_column_default(default_value, ty, None)?)
     };
-    Ok(ColumnDef { name, ty, default })
+    Ok(ColumnDef {
+        name,
+        ty,
+        domain,
+        default,
+    })
 }
 
 fn parse_column_default_expr(
@@ -2768,14 +2777,14 @@ fn parse_create_table(input: &str) -> Result<CreateTable, ParseError> {
             .and_then(normalize_identifier)?;
         let raw_ty = parts.next().ok_or(ParseError::InvalidRelationalSql)?;
         let mut serial_sequence = None;
-        let ty = match raw_ty {
-            ty if parse_supported_sql_type_name(ty) == Some(SqlType::Int4) => SqlType::Int4,
-            ty if parse_supported_sql_type_name(ty) == Some(SqlType::Text) => SqlType::Text,
+        let (ty, domain) = match raw_ty {
+            ty if parse_supported_sql_type_name(ty) == Some(SqlType::Int4) => (SqlType::Int4, None),
+            ty if parse_supported_sql_type_name(ty) == Some(SqlType::Text) => (SqlType::Text, None),
             ty if ty.eq_ignore_ascii_case("serial") || ty.eq_ignore_ascii_case("serial4") => {
                 serial_sequence = Some(format!("{}_{}_seq", table, name));
-                SqlType::Int4
+                (SqlType::Int4, None)
             }
-            _ => return Err(ParseError::InvalidRelationalSql),
+            ty => (SqlType::Int4, Some(normalize_relation_identifier(ty)?)),
         };
         let mut tail = parts.collect::<Vec<_>>().join(" ");
         let mut column_primary_key = false;
@@ -2804,6 +2813,9 @@ fn parse_create_table(input: &str) -> Result<CreateTable, ParseError> {
         let default = if tail.is_empty() && serial_sequence.is_none() {
             None
         } else {
+            if domain.is_some() {
+                return Err(ParseError::InvalidRelationalSql);
+            }
             if serial_sequence.is_some() && !tail.is_empty() {
                 return Err(ParseError::InvalidRelationalSql);
             }
@@ -2838,7 +2850,12 @@ fn parse_create_table(input: &str) -> Result<CreateTable, ParseError> {
                 column: name.clone(),
             });
         }
-        columns.push(ColumnDef { name, ty, default });
+        columns.push(ColumnDef {
+            name,
+            ty,
+            domain,
+            default,
+        });
     }
     if columns.is_empty() {
         return Err(ParseError::InvalidRelationalSql);
@@ -10814,11 +10831,13 @@ mod tests {
                     ColumnDef {
                         name: "id".to_string(),
                         ty: SqlType::Int4,
+                        domain: None,
                         default: None,
                     },
                     ColumnDef {
                         name: "name".to_string(),
                         ty: SqlType::Text,
+                        domain: None,
                         default: None,
                     },
                 ],
@@ -10835,11 +10854,13 @@ mod tests {
                     ColumnDef {
                         name: "id".to_string(),
                         ty: SqlType::Int4,
+                        domain: None,
                         default: None,
                     },
                     ColumnDef {
                         name: "name".to_string(),
                         ty: SqlType::Text,
+                        domain: None,
                         default: None,
                     },
                 ],
@@ -10862,12 +10883,14 @@ mod tests {
                     ColumnDef {
                         name: "id".to_string(),
                         ty: SqlType::Int4,
-                        default: None,
+                        domain: None,
+default: None,
                     },
                     ColumnDef {
                         name: "name".to_string(),
                         ty: SqlType::Text,
-                        default: None,
+                        domain: None,
+default: None,
                     },
                 ],
                 primary_key: None,
@@ -11105,11 +11128,13 @@ mod tests {
                     ColumnDef {
                         name: "id".to_string(),
                         ty: SqlType::Int4,
+                        domain: None,
                         default: None,
                     },
                     ColumnDef {
                         name: "owner".to_string(),
                         ty: SqlType::Text,
+                        domain: None,
                         default: None,
                     },
                 ],
@@ -11126,11 +11151,13 @@ mod tests {
                     ColumnDef {
                         name: "id".to_string(),
                         ty: SqlType::Int4,
+                        domain: None,
                         default: None,
                     },
                     ColumnDef {
                         name: "name".to_string(),
                         ty: SqlType::Text,
+                        domain: None,
                         default: None,
                     },
                 ],
@@ -11153,11 +11180,13 @@ mod tests {
                     ColumnDef {
                         name: "id".to_string(),
                         ty: SqlType::Int4,
+                        domain: None,
                         default: Some(ColumnDefault::Literal(SqlValue::Int4(7))),
                     },
                     ColumnDef {
                         name: "name".to_string(),
                         ty: SqlType::Text,
+                        domain: None,
                         default: Some(ColumnDefault::Literal(SqlValue::Text("Ada's".to_string()))),
                     },
                 ],
@@ -11177,6 +11206,7 @@ mod tests {
                     ColumnDef {
                         name: "id".to_string(),
                         ty: SqlType::Int4,
+                        domain: None,
                         default: Some(ColumnDefault::SequenceNextVal {
                             sequence: "serial_people_id_seq".to_string(),
                             create_if_missing: true,
@@ -11185,6 +11215,7 @@ mod tests {
                     ColumnDef {
                         name: "name".to_string(),
                         ty: SqlType::Text,
+                        domain: None,
                         default: None,
                     },
                 ],
@@ -11205,7 +11236,8 @@ mod tests {
                 columns: vec![ColumnDef {
                     name: "id".to_string(),
                     ty: SqlType::Int4,
-                    default: Some(ColumnDefault::SequenceNextVal {
+                    domain: None,
+default: Some(ColumnDefault::SequenceNextVal {
                         sequence: "people_seq".to_string(),
                         create_if_missing: false,
                     }),
@@ -11227,11 +11259,13 @@ mod tests {
                     ColumnDef {
                         name: "integer_col".to_string(),
                         ty: SqlType::Int4,
+                        domain: None,
                         default: None,
                     },
                     ColumnDef {
                         name: "text_col".to_string(),
                         ty: SqlType::Text,
+                        domain: None,
                         default: None,
                     },
                 ],
@@ -11276,6 +11310,7 @@ mod tests {
                 column: ColumnDef {
                     name: "tag".to_string(),
                     ty: SqlType::Text,
+                    domain: None,
                     default: Some(ColumnDefault::Literal(SqlValue::Text("new".to_string()))),
                 },
             })
@@ -11287,6 +11322,7 @@ mod tests {
                 column: ColumnDef {
                     name: "bucket".to_string(),
                     ty: SqlType::Int4,
+                    domain: None,
                     default: Some(ColumnDefault::Literal(SqlValue::Int4(4))),
                 },
             })
@@ -11301,7 +11337,8 @@ mod tests {
                 column: ColumnDef {
                     name: "bucket".to_string(),
                     ty: SqlType::Int4,
-                    default: Some(ColumnDefault::SequenceNextVal {
+                    domain: None,
+default: Some(ColumnDefault::SequenceNextVal {
                         sequence: "default_bucket_seq".to_string(),
                         create_if_missing: false,
                     }),
@@ -13153,9 +13190,35 @@ mod tests {
                 if_exists: true,
             })
         );
+        assert_eq!(
+            parse_command("CREATE TABLE accounts (id account_id, label public.label)").unwrap(),
+            Command::CreateTable(CreateTable {
+                table: "accounts".to_string(),
+                columns: vec![
+                    ColumnDef {
+                        name: "id".to_string(),
+                        ty: SqlType::Int4,
+                        domain: Some("account_id".to_string()),
+                        default: None,
+                    },
+                    ColumnDef {
+                        name: "label".to_string(),
+                        ty: SqlType::Int4,
+                        domain: Some("label".to_string()),
+                        default: None,
+                    },
+                ],
+                primary_key: None,
+                unique_constraints: Vec::new(),
+            })
+        );
 
         assert!(matches!(
             parse_command("CREATE DOMAIN account_id AS int4 CHECK (VALUE > 0)"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command("CREATE TABLE accounts (id account_id DEFAULT 1)"),
             Err(ParseError::InvalidRelationalSql)
         ));
         assert!(matches!(

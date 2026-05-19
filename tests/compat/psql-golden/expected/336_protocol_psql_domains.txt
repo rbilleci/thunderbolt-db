@@ -25,7 +25,34 @@ COMMENT
 psql:336_protocol_psql_domains.sql:8: ERROR:  domain does not exist
 DROP DOMAIN
 psql:336_protocol_psql_domains.sql:10: ERROR:  query shape is not supported by the compatibility stub
-psql:336_protocol_psql_domains.sql:11: ERROR:  query shape is not supported by the compatibility stub
+CREATE TABLE
+INSERT 0 2
+ id | label
+----+-------
+  7 | Ada
+  8 | Grace
+(2 rows)
+
+            Table "public.domain_accounts"
+ Column |    Type    | Collation | Nullable | Default
+--------+------------+-----------+----------+---------
+ id     | account_id |           |          |
+ label  | label      |           |          |
+
+ attname | atttypid
+---------+----------
+ id      |    16384
+ label   |    16385
+(2 rows)
+
+ column_name | data_type  | udt_schema |  udt_name
+-------------+------------+------------+------------
+ id          | account_id | public     | account_id
+ label       | label      | public     | label
+(2 rows)
+
+psql:336_protocol_psql_domains.sql:17: ERROR:  cannot drop domain because other objects depend on it
+DROP TABLE
 DROP DOMAIN
                         List of domains
  Schema | Name | Type | Collation | Nullable | Default | Check

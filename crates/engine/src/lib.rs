@@ -6002,6 +6002,7 @@ pub struct RelationalColumn {
     pub attnum: i16,
     pub name: String,
     pub ty: SqlType,
+    pub domain: Option<String>,
     pub default: Option<ColumnDefault>,
     pub type_oid: u32,
     pub type_size: i16,
@@ -6323,16 +6324,24 @@ const FIRST_USER_RELATION_OID: u32 = 16_384;
 const FIRST_USER_COLUMN_ID: u32 = 1;
 
 impl RelationalColumn {
-    fn from_def(id: u32, table_oid: u32, attnum: i16, def: ColumnDef) -> Self {
+    fn from_def(
+        id: u32,
+        table_oid: u32,
+        attnum: i16,
+        def: ColumnDef,
+        type_oid: u32,
+        type_size: i16,
+    ) -> Self {
         Self {
             id,
             table_oid,
             attnum,
             name: def.name,
             ty: def.ty,
+            domain: def.domain,
             default: def.default,
-            type_oid: def.ty.postgres_oid(),
-            type_size: def.ty.type_size(),
+            type_oid,
+            type_size,
         }
     }
 
@@ -6340,6 +6349,7 @@ impl RelationalColumn {
         ColumnDef {
             name: self.name.clone(),
             ty: self.ty,
+            domain: self.domain.clone(),
             default: self.default.clone(),
         }
     }
@@ -6640,6 +6650,7 @@ fn bind_relational_select(
             attnum: aggregate_attnum,
             name: aggregate_name.to_string(),
             ty: aggregate_ty,
+            domain: None,
             default: None,
             type_oid: aggregate_type_oid,
             type_size: aggregate_type_size,
@@ -7762,6 +7773,7 @@ impl Engine {
                 attnum,
                 name: column.name,
                 ty: column.ty,
+                domain: None,
                 default: None,
                 type_oid: column.type_oid,
                 type_size: column.type_size,
@@ -7912,6 +7924,17 @@ impl Engine {
                     name
                 )));
             }
+            if self.relational_catalog.values().any(|table| {
+                table
+                    .columns
+                    .iter()
+                    .any(|column| column.domain.as_deref() == Some(name.as_str()))
+            }) {
+                return Err(EngineError::ApplyFailed(format!(
+                    "cannot drop domain \"{}\" because other objects depend on it",
+                    name
+                )));
+            }
         }
         Ok(())
     }
@@ -7926,6 +7949,21 @@ impl Engine {
                 });
         }
         Ok(())
+    }
+
+    fn resolve_column_domain_type(
+        &self,
+        column: &mut ColumnDef,
+    ) -> Result<(u32, i16), EngineError> {
+        if let Some(domain_name) = column.domain.as_ref() {
+            let domain = self.relational_domains.get(domain_name).ok_or_else(|| {
+                EngineError::ApplyFailed(format!("type \"{}\" does not exist", domain_name))
+            })?;
+            column.ty = domain.base_type;
+            Ok((domain.oid, domain.base_type.type_size()))
+        } else {
+            Ok((column.ty.postgres_oid(), column.ty.type_size()))
+        }
     }
 
     fn preflight_implicit_sequence_name(&self, name: &str) -> Result<(), EngineError> {
@@ -8011,6 +8049,7 @@ impl Engine {
                 .relational_materialized_views
                 .contains_key(&create.table)
             || self.relational_sequences.contains_key(&create.table)
+            || self.relational_domains.contains_key(&create.table)
         {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" already exists",
@@ -8046,7 +8085,8 @@ impl Engine {
         }
         let mut columns = Vec::with_capacity(create.columns.len());
         let mut next_column_id = self.relational_next_column_id;
-        for (idx, column) in create.columns.into_iter().enumerate() {
+        for (idx, mut column) in create.columns.into_iter().enumerate() {
+            let (type_oid, type_size) = self.resolve_column_domain_type(&mut column)?;
             if let Some(default) = column.default.as_ref() {
                 self.preflight_column_default_target(default)?;
             }
@@ -8057,7 +8097,9 @@ impl Engine {
             next_column_id = next_column_id.checked_add(1).ok_or_else(|| {
                 EngineError::ApplyFailed("relational column id allocation exhausted".to_string())
             })?;
-            columns.push(RelationalColumn::from_def(id, oid, attnum, column));
+            columns.push(RelationalColumn::from_def(
+                id, oid, attnum, column, type_oid, type_size,
+            ));
         }
         let primary_key = create.primary_key.clone();
         let unique_constraints = create.unique_constraints.clone();
@@ -9584,6 +9626,8 @@ impl Engine {
         add: gpu_db_protocol::AddColumn,
         txn_id: TxnId,
     ) -> Result<(), EngineError> {
+        let mut column_def = add.column;
+        let (type_oid, type_size) = self.resolve_column_domain_type(&mut column_def)?;
         if self.relational_views.contains_key(&add.table)
             || self.relational_materialized_views.contains_key(&add.table)
             || self.relational_sequences.contains_key(&add.table)
@@ -9593,7 +9637,7 @@ impl Engine {
                 add.table
             )));
         }
-        let Some(default) = add.column.default.clone() else {
+        let Some(default) = column_def.default.clone() else {
             return Err(EngineError::ApplyFailed(
                 "ADD COLUMN requires a supported DEFAULT in the bootstrap relational subset"
                     .to_string(),
@@ -9604,10 +9648,10 @@ impl Engine {
                 "ADD COLUMN SERIAL is unsupported in the bootstrap relational subset".to_string(),
             ));
         }
-        if !column_default_matches_type(&default, add.column.ty) {
+        if !column_default_matches_type(&default, column_def.ty) {
             return Err(EngineError::ApplyFailed(format!(
                 "invalid default for column \"{}\"",
-                add.column.name
+                column_def.name
             )));
         }
         let table = self
@@ -9620,11 +9664,11 @@ impl Engine {
         if table
             .columns
             .iter()
-            .any(|column| column.name == add.column.name)
+            .any(|column| column.name == column_def.name)
         {
             return Err(EngineError::ApplyFailed(format!(
                 "column \"{}\" of relation \"{}\" already exists",
-                add.column.name, add.table
+                column_def.name, add.table
             )));
         }
         self.preflight_column_default_target(&default)?;
@@ -9649,7 +9693,14 @@ impl Engine {
             .ok_or_else(|| {
                 EngineError::ApplyFailed("relational column id allocation exhausted".to_string())
             })?;
-        let new_column = RelationalColumn::from_def(column_id, table.oid, next_attnum, add.column);
+        let new_column = RelationalColumn::from_def(
+            column_id,
+            table.oid,
+            next_attnum,
+            column_def,
+            type_oid,
+            type_size,
+        );
 
         let prefix = relational_key_prefix(&add.table);
         let visibility = StorageVisibility {
@@ -10128,6 +10179,16 @@ impl Engine {
         match cmd {
             Command::CreateTable(create) => {
                 let mut implicit_sequences = BTreeSet::new();
+                for column in &create.columns {
+                    if let Some(domain_name) = column.domain.as_ref() {
+                        if !self.relational_domains.contains_key(domain_name) {
+                            return Err(EngineError::ApplyFailed(format!(
+                                "type \"{}\" does not exist",
+                                domain_name
+                            )));
+                        }
+                    }
+                }
                 for default in sequence_defaults(&create.columns) {
                     if let ColumnDefault::SequenceNextVal {
                         sequence,
@@ -32284,11 +32345,13 @@ mod tests {
                 ColumnDef {
                     name: "name".to_string(),
                     ty: SqlType::Text,
+                    domain: None,
                     default: None,
                 },
                 ColumnDef {
                     name: "id".to_string(),
                     ty: SqlType::Int4,
+                    domain: None,
                     default: None,
                 },
             ]
@@ -35108,6 +35171,7 @@ mod tests {
                 attnum: 1,
                 name: "id".to_string(),
                 ty: SqlType::Int4,
+                domain: None,
                 default: None,
                 type_oid: SqlType::Int4.postgres_oid(),
                 type_size: SqlType::Int4.type_size(),
@@ -35121,6 +35185,7 @@ mod tests {
                 attnum: 2,
                 name: "name".to_string(),
                 ty: SqlType::Text,
+                domain: None,
                 default: None,
                 type_oid: SqlType::Text.postgres_oid(),
                 type_size: SqlType::Text.type_size(),
@@ -36340,11 +36405,19 @@ mod tests {
             .unwrap();
         e.execute_text(2, "COMMENT ON DOMAIN public.account_id IS 'account ids'")
             .unwrap();
+        e.execute_text(3, "CREATE TABLE accounts (id account_id, name TEXT)")
+            .unwrap();
+        e.execute_text(4, "INSERT INTO accounts VALUES (7, 'Ada')")
+            .unwrap();
 
         let domain = e.relational_catalog_domain("account_id").unwrap();
         assert_eq!(domain.name, "account_id");
         assert_eq!(domain.base_type, SqlType::Int4);
         let oid = domain.oid;
+        let table = e.relational_catalog_table("accounts").unwrap();
+        assert_eq!(table.columns[0].domain.as_deref(), Some("account_id"));
+        assert_eq!(table.columns[0].ty, SqlType::Int4);
+        assert_eq!(table.columns[0].type_oid, oid);
         assert_eq!(
             e.relational_comments
                 .get(&RelationalCommentTarget::Domain {
@@ -36358,20 +36431,34 @@ mod tests {
         let recovered_domain = recovered.relational_catalog_domain("account_id").unwrap();
         assert_eq!(recovered_domain.oid, oid);
         assert_eq!(recovered_domain.base_type, SqlType::Int4);
+        let recovered_table = recovered.relational_catalog_table("accounts").unwrap();
+        assert_eq!(
+            recovered_table.columns[0].domain.as_deref(),
+            Some("account_id")
+        );
+        assert_eq!(recovered_table.columns[0].type_oid, oid);
 
-        e.execute_text(3, "DROP DOMAIN account_id").unwrap();
+        let dependent = e.execute_text(5, "DROP DOMAIN account_id").unwrap_err();
+        assert!(
+            dependent
+                .to_string()
+                .contains("cannot drop domain \"account_id\" because other objects depend on it"),
+            "{dependent}"
+        );
+        e.execute_text(6, "DROP TABLE accounts").unwrap();
+        e.execute_text(7, "DROP DOMAIN account_id").unwrap();
         assert!(e.relational_catalog_domain("account_id").is_none());
         assert!(!e
             .relational_comments
             .contains_key(&RelationalCommentTarget::Domain {
                 domain: "account_id".to_string(),
             }));
-        e.execute_text(4, "DROP DOMAIN IF EXISTS missing_domain")
+        e.execute_text(8, "DROP DOMAIN IF EXISTS missing_domain")
             .unwrap();
 
         let duplicate = e
-            .execute_text(5, "CREATE DOMAIN label AS text")
-            .and_then(|_| e.execute_text(6, "CREATE DOMAIN label AS text"))
+            .execute_text(9, "CREATE DOMAIN label AS text")
+            .and_then(|_| e.execute_text(10, "CREATE DOMAIN label AS text"))
             .unwrap_err()
             .to_string();
         assert!(
@@ -36379,7 +36466,7 @@ mod tests {
             "{duplicate}"
         );
         let missing = e
-            .execute_text(7, "COMMENT ON DOMAIN missing_domain IS 'nope'")
+            .execute_text(11, "COMMENT ON DOMAIN missing_domain IS 'nope'")
             .unwrap_err()
             .to_string();
         assert!(
