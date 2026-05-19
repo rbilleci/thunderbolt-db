@@ -1529,6 +1529,106 @@ fn rename_index_in_session(
     Ok(())
 }
 
+fn rename_table_in_session(
+    session: &mut Session,
+    old_name: &str,
+    new_name: &str,
+    if_exists: bool,
+) -> Result<(), ErrorField> {
+    if session.views.contains_key(old_name) {
+        return Err(ErrorField {
+            code: "42809",
+            message: "relation is not a table",
+            position: None,
+        });
+    }
+    if !session.tables.contains_key(old_name) {
+        if if_exists {
+            return Ok(());
+        }
+        return Err(ErrorField {
+            code: "42P01",
+            message: "relation does not exist",
+            position: None,
+        });
+    }
+    if session.tables.contains_key(new_name) || session.views.contains_key(new_name) {
+        return Err(ErrorField {
+            code: "42P07",
+            message: "relation already exists",
+            position: None,
+        });
+    }
+    if session
+        .views
+        .values()
+        .any(|view| view.query.table == old_name)
+    {
+        return Err(ErrorField {
+            code: "2BP01",
+            message: "cannot rename relation because a view depends on it",
+            position: None,
+        });
+    }
+    let Some(mut table) = session.tables.remove(old_name) else {
+        return Ok(());
+    };
+    table.name = new_name.to_string();
+    session.tables.insert(new_name.to_string(), table);
+    for index in &mut session.indexes {
+        if index.table == old_name {
+            index.table = new_name.to_string();
+            session.dirty_indexes = true;
+        }
+    }
+
+    let mut retargeted_comments = Vec::new();
+    let old_targets = session
+        .comments
+        .iter()
+        .filter_map(|(target, comment)| match target {
+            CatalogCommentTarget::Table { table } if table == old_name => Some((
+                target.clone(),
+                CatalogCommentTarget::Table {
+                    table: new_name.to_string(),
+                },
+                comment.clone(),
+            )),
+            CatalogCommentTarget::Column { table, attnum } if table == old_name => Some((
+                target.clone(),
+                CatalogCommentTarget::Column {
+                    table: new_name.to_string(),
+                    attnum: *attnum,
+                },
+                comment.clone(),
+            )),
+            CatalogCommentTarget::Constraint { table, constraint } if table == old_name => Some((
+                target.clone(),
+                CatalogCommentTarget::Constraint {
+                    table: new_name.to_string(),
+                    constraint: constraint.clone(),
+                },
+                comment.clone(),
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for (old_target, new_target, comment) in old_targets {
+        session.comments.remove(&old_target);
+        retargeted_comments.push((old_target, new_target, comment));
+    }
+    for (old_target, new_target, comment) in retargeted_comments {
+        session.comments.insert(new_target.clone(), comment);
+        session.mark_comment_dirty(old_target);
+        session.mark_comment_dirty(new_target);
+    }
+
+    session.mark_table_dirty(old_name.to_string());
+    session.mark_table_dirty(new_name.to_string());
+    session.persist_catalog_snapshot();
+    Ok(())
+}
+
 fn shared_catalog_contains_table(table: &str) -> bool {
     shared_catalog()
         .lock()
@@ -6385,6 +6485,17 @@ fn execute_statement(
                     &rename.old_name,
                     &rename.new_name,
                     rename.table_if_exists,
+                ) {
+                    return write_error(stream, &error);
+                }
+                return write_command_complete(stream, "ALTER TABLE");
+            }
+            Command::RenameTable(rename) => {
+                if let Err(error) = rename_table_in_session(
+                    session,
+                    &rename.old_name,
+                    &rename.new_name,
+                    rename.if_exists,
                 ) {
                     return write_error(stream, &error);
                 }
@@ -13805,6 +13916,121 @@ mod tests {
         });
         catalog.comments.remove(&CatalogCommentTarget::Index {
             index: new_index_name.to_string(),
+        });
+    }
+
+    #[test]
+    fn shared_catalog_persistence_carries_renamed_table_metadata() {
+        let old_table_name = "shared_rename_table_people";
+        let new_table_name = "shared_renamed_table_people";
+        let index_name = "shared_rename_table_people_id_idx";
+        {
+            let mut catalog = shared_catalog()
+                .lock()
+                .expect("shared catalog mutex poisoned");
+            catalog.tables.remove(old_table_name);
+            catalog.tables.remove(new_table_name);
+            catalog.indexes.retain(|index| index.name != index_name);
+            catalog.comments.remove(&CatalogCommentTarget::Table {
+                table: old_table_name.to_string(),
+            });
+            catalog.comments.remove(&CatalogCommentTarget::Table {
+                table: new_table_name.to_string(),
+            });
+            catalog.comments.remove(&CatalogCommentTarget::Constraint {
+                table: old_table_name.to_string(),
+                constraint: index_name.to_string(),
+            });
+            catalog.comments.remove(&CatalogCommentTarget::Constraint {
+                table: new_table_name.to_string(),
+                constraint: index_name.to_string(),
+            });
+        }
+
+        let mut session = Session::new(true);
+        session.tables.insert(
+            old_table_name.to_string(),
+            test_table(old_table_name, vec![vec![SqlValue::Int4(1)]]),
+        );
+        session.indexes.push(CatalogIndex {
+            name: index_name.to_string(),
+            table: old_table_name.to_string(),
+            column: "id".to_string(),
+            unique: true,
+            primary_key: true,
+            unique_constraint: false,
+        });
+        session.comments.insert(
+            CatalogCommentTarget::Table {
+                table: old_table_name.to_string(),
+            },
+            "shared table".to_string(),
+        );
+        session.comments.insert(
+            CatalogCommentTarget::Constraint {
+                table: old_table_name.to_string(),
+                constraint: index_name.to_string(),
+            },
+            "shared pkey".to_string(),
+        );
+        session.mark_table_dirty(old_table_name);
+        session.dirty_indexes = true;
+        session.persist_catalog_snapshot();
+
+        rename_table_in_session(&mut session, old_table_name, new_table_name, false).unwrap();
+
+        let reloaded = Session::new(true);
+        assert!(!reloaded.tables.contains_key(old_table_name));
+        assert!(reloaded.tables.contains_key(new_table_name));
+        assert!(pg_catalog_index_rows(&reloaded).contains(&vec![
+            Some("public".to_string()),
+            Some(new_table_name.to_string()),
+            Some(index_name.to_string()),
+            Some(format!(
+                "CREATE UNIQUE INDEX {index_name} ON public.{new_table_name} USING btree (id)"
+            )),
+        ]));
+        assert!(pg_catalog_table_description_rows(&reloaded).contains(&vec![
+            Some("public".to_string()),
+            Some(new_table_name.to_string()),
+            None,
+            Some("shared table".to_string()),
+        ]));
+        assert!(
+            pg_catalog_constraint_description_rows(&reloaded).contains(&vec![
+                Some("public".to_string()),
+                Some(new_table_name.to_string()),
+                Some(index_name.to_string()),
+                Some("shared pkey".to_string()),
+            ])
+        );
+        assert_eq!(
+            rename_table_in_session(&mut session, "missing_shared_table", "unused", false)
+                .unwrap_err()
+                .code,
+            "42P01"
+        );
+        rename_table_in_session(&mut session, "missing_shared_table", "unused", true).unwrap();
+
+        let mut catalog = shared_catalog()
+            .lock()
+            .expect("shared catalog mutex poisoned");
+        catalog.tables.remove(old_table_name);
+        catalog.tables.remove(new_table_name);
+        catalog.indexes.retain(|index| index.name != index_name);
+        catalog.comments.remove(&CatalogCommentTarget::Table {
+            table: old_table_name.to_string(),
+        });
+        catalog.comments.remove(&CatalogCommentTarget::Table {
+            table: new_table_name.to_string(),
+        });
+        catalog.comments.remove(&CatalogCommentTarget::Constraint {
+            table: old_table_name.to_string(),
+            constraint: index_name.to_string(),
+        });
+        catalog.comments.remove(&CatalogCommentTarget::Constraint {
+            table: new_table_name.to_string(),
+            constraint: index_name.to_string(),
         });
     }
 

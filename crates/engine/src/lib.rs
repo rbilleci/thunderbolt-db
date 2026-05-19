@@ -21,7 +21,7 @@ use gpu_db_planner::{ExecutionPlan, Planner, PlannerConfig};
 use gpu_db_protocol::{
     parse_command, AddUniqueConstraint, ColumnDef, Command, CommentTarget, CreateIndex,
     CreateTable, CreateView, Delete, DropConstraint, DropIndex, DropTable, DropView, Insert,
-    ParseError, RenameColumn, RenameConstraint, RenameIndex, Select, SelectFilterOp,
+    ParseError, RenameColumn, RenameConstraint, RenameIndex, RenameTable, Select, SelectFilterOp,
     SelectProjection, SqlType, SqlValue, TruncateTable, Update,
 };
 use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine};
@@ -76,6 +76,7 @@ impl ReplicatedStateMachine for KvStateMachine {
                     | Command::AddPrimaryKey(_)
                     | Command::AddUniqueConstraint(_)
                     | Command::AddColumn(_)
+                    | Command::RenameTable(_)
                     | Command::RenameColumn(_)
                     | Command::RenameConstraint(_)
                     | Command::DropColumn(_)
@@ -7521,6 +7522,7 @@ impl Engine {
             Command::AddPrimaryKey(add) => self.apply_add_primary_key(add)?,
             Command::AddUniqueConstraint(add) => self.apply_add_unique_constraint(add)?,
             Command::AddColumn(add) => self.apply_add_column(add, txn_id)?,
+            Command::RenameTable(rename) => self.apply_rename_table(rename, txn_id)?,
             Command::RenameColumn(rename) => self.apply_rename_column(rename)?,
             Command::RenameConstraint(rename) => self.apply_rename_constraint(rename)?,
             Command::DropColumn(drop) => self.apply_drop_column(drop, txn_id)?,
@@ -8006,6 +8008,162 @@ impl Engine {
             "index \"{}\" does not exist",
             rename.old_name
         )))
+    }
+
+    fn apply_rename_table(
+        &mut self,
+        rename: RenameTable,
+        txn_id: TxnId,
+    ) -> Result<(), EngineError> {
+        if self.relational_views.contains_key(&rename.old_name) {
+            return Err(EngineError::ApplyFailed(format!(
+                "relation \"{}\" is not a table",
+                rename.old_name
+            )));
+        }
+        if !self.relational_catalog.contains_key(&rename.old_name) {
+            if rename.if_exists {
+                return Ok(());
+            }
+            return Err(EngineError::ApplyFailed(format!(
+                "relation \"{}\" does not exist",
+                rename.old_name
+            )));
+        }
+        if self.relational_catalog.contains_key(&rename.new_name)
+            || self.relational_views.contains_key(&rename.new_name)
+        {
+            return Err(EngineError::ApplyFailed(format!(
+                "relation \"{}\" already exists",
+                rename.new_name
+            )));
+        }
+        if self
+            .relational_views
+            .values()
+            .any(|view| view.query.table == rename.old_name)
+        {
+            return Err(EngineError::ApplyFailed(format!(
+                "cannot rename relation \"{}\" because a view depends on it",
+                rename.old_name
+            )));
+        }
+        let Some(mut table) = self.relational_catalog.remove(&rename.old_name) else {
+            return Ok(());
+        };
+
+        let old_prefix = relational_key_prefix(&rename.old_name);
+        let visibility = StorageVisibility {
+            read_txn_id: txn_id,
+        };
+        let mut moves = Vec::new();
+        let mut cursor = self
+            .mvcc_store
+            .seq_scan_open(visibility)
+            .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+        while let Some(tuple) = cursor.next() {
+            if tuple.key.starts_with(&old_prefix) {
+                moves.push((tuple.tuple_id, tuple.value.clone()));
+            }
+        }
+        drop(cursor);
+
+        for (tuple_id, value) in moves {
+            let row_id = self.relational_next_row_id;
+            self.relational_next_row_id += 1;
+            let new_key = relational_row_key(&rename.new_name, row_id);
+            self.mvcc_store
+                .tuple_insert(
+                    NewTuple {
+                        key: new_key,
+                        value,
+                    },
+                    txn_id,
+                )
+                .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+            self.mvcc_store
+                .tuple_delete(tuple_id, txn_id)
+                .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+        }
+
+        table.name = rename.new_name.clone();
+        for index in &mut table.indexes {
+            index.table = rename.new_name.clone();
+        }
+        self.relational_catalog
+            .insert(rename.new_name.clone(), table.clone());
+
+        self.relational_value_index
+            .retain(|key, _| key.table != rename.old_name);
+        let visibility = StorageVisibility {
+            read_txn_id: txn_id,
+        };
+        let new_prefix = relational_key_prefix(&rename.new_name);
+        let mut cursor = self
+            .mvcc_store
+            .seq_scan_open(visibility)
+            .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+        while let Some(tuple) = cursor.next() {
+            if !tuple.key.starts_with(&new_prefix) {
+                continue;
+            }
+            let values = decode_relational_row(&tuple.value, &table.columns)
+                .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+            for (column, value) in table.columns.iter().zip(values.iter()) {
+                self.relational_value_index
+                    .entry(RelationalIndexKey {
+                        table: rename.new_name.clone(),
+                        column: column.name.clone(),
+                        value: relational_index_value(value),
+                    })
+                    .or_default()
+                    .push(tuple.key.clone());
+            }
+        }
+
+        let mut retargeted_comments = Vec::new();
+        self.relational_comments
+            .retain(|target, comment| match target {
+                RelationalCommentTarget::Table { table } if table == &rename.old_name => {
+                    retargeted_comments.push((
+                        RelationalCommentTarget::Table {
+                            table: rename.new_name.clone(),
+                        },
+                        comment.clone(),
+                    ));
+                    false
+                }
+                RelationalCommentTarget::Column { table, attnum } if table == &rename.old_name => {
+                    retargeted_comments.push((
+                        RelationalCommentTarget::Column {
+                            table: rename.new_name.clone(),
+                            attnum: *attnum,
+                        },
+                        comment.clone(),
+                    ));
+                    false
+                }
+                RelationalCommentTarget::Constraint { table, constraint }
+                    if table == &rename.old_name =>
+                {
+                    retargeted_comments.push((
+                        RelationalCommentTarget::Constraint {
+                            table: rename.new_name.clone(),
+                            constraint: constraint.clone(),
+                        },
+                        comment.clone(),
+                    ));
+                    false
+                }
+                _ => true,
+            });
+        for (target, comment) in retargeted_comments {
+            self.relational_comments.insert(target, comment);
+        }
+        self.relational_residency.remove(&rename.old_name);
+        self.relational_residency_device_memory
+            .remove(&rename.old_name);
+        Ok(())
     }
 
     fn apply_drop_table(&mut self, drop: DropTable, txn_id: TxnId) -> Result<(), EngineError> {
@@ -8922,6 +9080,41 @@ impl Engine {
                     )));
                 }
             }
+            Command::RenameTable(rename) => {
+                if self.relational_views.contains_key(&rename.old_name) {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "relation \"{}\" is not a table",
+                        rename.old_name
+                    )));
+                }
+                if !self.relational_catalog.contains_key(&rename.old_name) {
+                    if rename.if_exists {
+                        return Ok(());
+                    }
+                    return Err(EngineError::ApplyFailed(format!(
+                        "relation \"{}\" does not exist",
+                        rename.old_name
+                    )));
+                }
+                if self.relational_catalog.contains_key(&rename.new_name)
+                    || self.relational_views.contains_key(&rename.new_name)
+                {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "relation \"{}\" already exists",
+                        rename.new_name
+                    )));
+                }
+                if self
+                    .relational_views
+                    .values()
+                    .any(|view| view.query.table == rename.old_name)
+                {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "cannot rename relation \"{}\" because a view depends on it",
+                        rename.old_name
+                    )));
+                }
+            }
             Command::RenameColumn(rename) => {
                 if self.relational_views.contains_key(&rename.table) {
                     return Err(EngineError::ApplyFailed(format!(
@@ -9230,6 +9423,7 @@ impl Engine {
             | Command::AddPrimaryKey(_)
             | Command::AddUniqueConstraint(_)
             | Command::AddColumn(_)
+            | Command::RenameTable(_)
             | Command::RenameColumn(_)
             | Command::RenameConstraint(_)
             | Command::DropColumn(_)
@@ -9432,6 +9626,7 @@ impl Engine {
             | Command::AddPrimaryKey(_)
             | Command::AddUniqueConstraint(_)
             | Command::AddColumn(_)
+            | Command::RenameTable(_)
             | Command::RenameColumn(_)
             | Command::RenameConstraint(_)
             | Command::DropColumn(_)
@@ -9535,6 +9730,7 @@ impl Engine {
             Command::AddPrimaryKey(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
             Command::AddUniqueConstraint(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
             Command::AddColumn(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
+            Command::RenameTable(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
             Command::RenameColumn(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
             Command::RenameConstraint(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
             Command::DropColumn(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
@@ -30816,6 +31012,143 @@ mod tests {
             .execute_text(2, "ALTER TABLE constrained_people DROP COLUMN id")
             .unwrap_err();
         assert!(dependency.to_string().contains("depends on it"));
+    }
+
+    #[test]
+    fn relational_rename_table_rewrites_rows_catalog_comments_and_replays() {
+        let mut e = Engine::new_local();
+        e.execute_text(
+            1,
+            "CREATE TABLE rename_table_people (id INT PRIMARY KEY, name TEXT UNIQUE, bucket INT DEFAULT 7)",
+        )
+        .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO rename_table_people (id, name) VALUES (1, 'Ada'), (2, 'Linus')",
+        )
+        .unwrap();
+        e.execute_text(
+            3,
+            "COMMENT ON TABLE public.rename_table_people IS 'old table'",
+        )
+        .unwrap();
+        e.execute_text(
+            4,
+            "COMMENT ON COLUMN public.rename_table_people.name IS 'person name'",
+        )
+        .unwrap();
+        e.execute_text(
+            5,
+            "COMMENT ON CONSTRAINT rename_table_people_pkey ON public.rename_table_people IS 'primary id'",
+        )
+        .unwrap();
+        e.execute_text(
+            6,
+            "ALTER TABLE ONLY public.rename_table_people RENAME TO renamed_table_people",
+        )
+        .unwrap();
+        e.execute_text(
+            7,
+            "INSERT INTO renamed_table_people (id, name) VALUES (3, 'Grace')",
+        )
+        .unwrap();
+
+        assert!(e.relational_catalog_table("rename_table_people").is_none());
+        let table = e.relational_catalog_table("renamed_table_people").unwrap();
+        assert_eq!(table.name, "renamed_table_people");
+        assert_eq!(
+            table
+                .indexes
+                .iter()
+                .map(|index| (index.name.as_str(), index.table.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("rename_table_people_pkey", "renamed_table_people"),
+                ("rename_table_people_name_key", "renamed_table_people"),
+            ]
+        );
+        assert_eq!(
+            e.relational_table_comment("renamed_table_people"),
+            Some("old table")
+        );
+        assert_eq!(
+            e.relational_column_comment("renamed_table_people", 2),
+            Some("person name")
+        );
+        assert_eq!(
+            e.relational_constraint_comment("renamed_table_people", "rename_table_people_pkey"),
+            Some("primary id")
+        );
+
+        let Command::Select(select) =
+            parse_command("SELECT id, name, bucket FROM renamed_table_people WHERE id = 2")
+                .unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let result = e.execute_relational_select(&select).unwrap();
+        assert_eq!(
+            result.rows,
+            vec![vec![
+                SqlValue::Int4(2),
+                SqlValue::Text("Linus".to_string()),
+                SqlValue::Int4(7),
+            ]]
+        );
+        assert_eq!(
+            result.access_path,
+            RelationalAccessPath::EqualityIndex {
+                table: "renamed_table_people".to_string(),
+                column: "id".to_string(),
+                matched_keys: 1,
+            }
+        );
+
+        let old_select = parse_command("SELECT id FROM rename_table_people WHERE id = 1").unwrap();
+        let Command::Select(old_select) = old_select else {
+            panic!("expected SELECT plan");
+        };
+        assert!(e.execute_relational_select(&old_select).is_err());
+
+        let mut recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let recovered_result = recovered.execute_relational_select(&select).unwrap();
+        assert_eq!(recovered_result.rows, result.rows);
+        assert_eq!(
+            recovered.relational_table_comment("renamed_table_people"),
+            Some("old table")
+        );
+        assert_eq!(
+            recovered
+                .relational_constraint_comment("renamed_table_people", "rename_table_people_pkey"),
+            Some("primary id")
+        );
+
+        let duplicate = e
+            .execute_text(
+                8,
+                "ALTER TABLE renamed_table_people RENAME TO renamed_table_people",
+            )
+            .unwrap_err();
+        assert!(duplicate.to_string().contains("already exists"));
+
+        let mut view_engine = Engine::new_local();
+        view_engine
+            .execute_text(1, "CREATE TABLE rename_table_base (id INT, name TEXT)")
+            .unwrap();
+        view_engine
+            .execute_text(
+                2,
+                "CREATE VIEW rename_table_view AS SELECT id, name FROM rename_table_base",
+            )
+            .unwrap();
+        let dependency = view_engine
+            .execute_text(3, "ALTER TABLE rename_table_base RENAME TO renamed_base")
+            .unwrap_err();
+        assert!(dependency.to_string().contains("view depends on it"));
+        let view_err = view_engine
+            .execute_text(4, "ALTER TABLE rename_table_view RENAME TO renamed_view")
+            .unwrap_err();
+        assert!(view_err.to_string().contains("is not a table"));
     }
 
     #[test]

@@ -13,6 +13,7 @@ pub enum Command {
     AddPrimaryKey(AddPrimaryKey),
     AddUniqueConstraint(AddUniqueConstraint),
     AddColumn(AddColumn),
+    RenameTable(RenameTable),
     RenameColumn(RenameColumn),
     RenameConstraint(RenameConstraint),
     DropColumn(DropColumn),
@@ -76,6 +77,13 @@ pub struct AddColumn {
 pub struct DropColumn {
     pub table: String,
     pub column: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenameTable {
+    pub old_name: String,
+    pub new_name: String,
+    pub if_exists: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1728,6 +1736,9 @@ fn parse_relational_command(input: &str) -> Option<Result<Command, ParseError>> 
             if parse_rename_constraint(input).is_ok() {
                 return Some(parse_rename_constraint(input).map(Command::RenameConstraint));
             }
+            if parse_rename_table(input).is_ok() {
+                return Some(parse_rename_table(input).map(Command::RenameTable));
+            }
             return Some(parse_rename_column(input).map(Command::RenameColumn));
         }
         if find_keyword_outside_quotes(input, "DROP").is_some()
@@ -2021,6 +2032,42 @@ fn parse_drop_column(input: &str) -> Result<DropColumn, ParseError> {
     Ok(DropColumn {
         table,
         column: normalize_identifier(column.trim())?,
+    })
+}
+
+fn parse_rename_table(input: &str) -> Result<RenameTable, ParseError> {
+    let mut rest = strip_keyword_prefix_case_insensitive(input, "ALTER")
+        .and_then(|s| strip_keyword_prefix_case_insensitive(s.trim_start(), "TABLE"))
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    let if_exists = if let Some(remaining) = strip_keyword_prefix_case_insensitive(rest, "IF")
+        .and_then(|s| strip_keyword_prefix_case_insensitive(s.trim_start(), "EXISTS"))
+    {
+        rest = remaining.trim_start();
+        true
+    } else {
+        false
+    };
+    rest = strip_keyword_prefix_case_insensitive(rest, "ONLY")
+        .map(str::trim_start)
+        .unwrap_or(rest);
+    let rename_pos =
+        find_keyword_outside_quotes(rest, "RENAME").ok_or(ParseError::InvalidRelationalSql)?;
+    let old_name = normalize_relation_identifier(rest[..rename_pos].trim())?;
+    rest = rest[rename_pos + "RENAME".len()..].trim_start();
+    let new_tail = strip_keyword_prefix_case_insensitive(rest, "TO")
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim();
+    if new_tail.is_empty()
+        || find_keyword_outside_quotes(new_tail, "CASCADE").is_some()
+        || find_keyword_outside_quotes(new_tail, "RESTRICT").is_some()
+    {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    Ok(RenameTable {
+        old_name,
+        new_name: normalize_identifier(new_tail)?,
+        if_exists,
     })
 }
 
@@ -9828,6 +9875,33 @@ mod tests {
             "ALTER TABLE ONLY public.keyed_people DROP CONSTRAINT keyed_people_pkey CASCADE"
         )
         .is_err());
+        assert_eq!(
+            parse_command(
+                "ALTER TABLE IF EXISTS ONLY public.keyed_people RENAME TO archived_people"
+            )
+            .unwrap(),
+            Command::RenameTable(RenameTable {
+                old_name: "keyed_people".to_string(),
+                new_name: "archived_people".to_string(),
+                if_exists: true,
+            })
+        );
+        assert_eq!(
+            parse_command("ALTER TABLE public.keyed_people RENAME TO renamed_people").unwrap(),
+            Command::RenameTable(RenameTable {
+                old_name: "keyed_people".to_string(),
+                new_name: "renamed_people".to_string(),
+                if_exists: false,
+            })
+        );
+        assert!(
+            parse_command("ALTER TABLE public.keyed_people RENAME TO public.renamed_people")
+                .is_err()
+        );
+        assert!(
+            parse_command("ALTER TABLE public.keyed_people RENAME TO renamed_people CASCADE")
+                .is_err()
+        );
         assert_eq!(
             parse_command(
                 "ALTER TABLE ONLY public.keyed_people RENAME COLUMN name TO display_name"

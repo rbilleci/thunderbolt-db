@@ -1,0 +1,121 @@
+=== bounded rename table ===
+CREATE TABLE
+INSERT 0 2
+COMMENT
+COMMENT
+COMMENT
+                                         List of relations
+ Schema |        Name         | Type  |  Owner   | Persistence | Access method | Size | Description
+--------+---------------------+-------+----------+-------------+---------------+------+-------------
+ public | rename_table_people | table | postgres | permanent   | heap          |      | old table
+(1 row)
+
+                                   Table "public.rename_table_people"
+ Column |  Type   | Collation | Nullable | Default | Storage  | Compression | Stats target | Description
+--------+---------+-----------+----------+---------+----------+-------------+--------------+-------------
+ id     | integer |           |          |         | plain    |             |              |
+ name   | text    |           |          |         | extended |             |              | person name
+ bucket | integer |           |          | 7       | plain    |             |              |
+Indexes:
+    "rename_table_people_name_key" UNIQUE CONSTRAINT, btree (name)
+    "rename_table_people_pkey" PRIMARY KEY, btree (id)
+Access method: heap
+
+ALTER TABLE
+psql:324_protocol_psql_rename_tables.sql:10: error: Did not find any relation named "public.rename_table*".
+                                          List of relations
+ Schema |         Name         | Type  |  Owner   | Persistence | Access method | Size | Description
+--------+----------------------+-------+----------+-------------+---------------+------+-------------
+ public | renamed_table_people | table | postgres | permanent   | heap          |      | old table
+(1 row)
+
+                                   Table "public.renamed_table_people"
+ Column |  Type   | Collation | Nullable | Default | Storage  | Compression | Stats target | Description
+--------+---------+-----------+----------+---------+----------+-------------+--------------+-------------
+ id     | integer |           |          |         | plain    |             |              |
+ name   | text    |           |          |         | extended |             |              | person name
+ bucket | integer |           |          | 7       | plain    |             |              |
+Indexes:
+    "rename_table_people_name_key" UNIQUE CONSTRAINT, btree (name)
+    "rename_table_people_pkey" PRIMARY KEY, btree (id)
+Access method: heap
+
+ table_schema |      table_name      | table_type
+--------------+----------------------+------------
+ public       | renamed_table_people | BASE TABLE
+(1 row)
+
+ column_name | data_type | is_nullable | column_default
+-------------+-----------+-------------+----------------
+ id          | integer   | YES         |
+ name        | text      | YES         |
+ bucket      | integer   | YES         | 7
+(3 rows)
+
+ table_schema |      table_name      |       constraint_name        | constraint_type
+--------------+----------------------+------------------------------+-----------------
+ public       | renamed_table_people | rename_table_people_name_key | UNIQUE
+ public       | renamed_table_people | rename_table_people_pkey     | PRIMARY KEY
+(2 rows)
+
+ table_schema |      table_name      | column_name |       constraint_name        | ordinal_position
+--------------+----------------------+-------------+------------------------------+------------------
+ public       | renamed_table_people | name        | rename_table_people_name_key |                1
+ public       | renamed_table_people | id          | rename_table_people_pkey     |                1
+(2 rows)
+
+ nspname |       relname        |           conname            | contype
+---------+----------------------+------------------------------+---------
+ public  | renamed_table_people | rename_table_people_name_key | u
+ public  | renamed_table_people | rename_table_people_pkey     | p
+(2 rows)
+
+ schemaname |      tablename       |          indexname           |                                              indexdef
+------------+----------------------+------------------------------+----------------------------------------------------------------------------------------------------
+ public     | renamed_table_people | rename_table_people_name_key | CREATE UNIQUE INDEX rename_table_people_name_key ON public.renamed_table_people USING btree (name)
+ public     | renamed_table_people | rename_table_people_pkey     | CREATE UNIQUE INDEX rename_table_people_pkey ON public.renamed_table_people USING btree (id)
+(2 rows)
+
+ nspname |       relname        |         conname          | description
+---------+----------------------+--------------------------+-------------
+ public  | renamed_table_people | rename_table_people_pkey | primary id
+(1 row)
+
+ nspname |       relname        | relkind | attname | description
+---------+----------------------+---------+---------+-------------
+ public  | renamed_table_people | r       |         | old table
+ public  | renamed_table_people | r       | name    | person name
+(2 rows)
+
+                        Object descriptions
+ Schema |           Name           |      Object      | Description
+--------+--------------------------+------------------+-------------
+ public | renamed_table_people     | table            | old table
+ public | rename_table_people_pkey | table constraint | primary id
+(2 rows)
+
+                                                         List of relations
+ Schema |             Name             | Type  |  Owner   |        Table         | Persistence | Access method | Size | Description
+--------+------------------------------+-------+----------+----------------------+-------------+---------------+------+-------------
+ public | rename_table_people_name_key | index | postgres | renamed_table_people | permanent   | btree         |      |
+ public | rename_table_people_pkey     | index | postgres | renamed_table_people | permanent   | btree         |      |
+(2 rows)
+
+INSERT 0 1
+ id | name  | bucket
+----+-------+--------
+  2 | Linus |      7
+(1 row)
+
+psql:324_protocol_psql_rename_tables.sql:58: ERROR:  relation does not exist
+psql:324_protocol_psql_rename_tables.sql:59: ERROR:  relation already exists
+psql:324_protocol_psql_rename_tables.sql:60: ERROR:  relation does not exist
+ALTER TABLE
+CREATE VIEW
+psql:324_protocol_psql_rename_tables.sql:63: ERROR:  cannot rename relation because a view depends on it
+psql:324_protocol_psql_rename_tables.sql:64: ERROR:  relation is not a table
+psql:324_protocol_psql_rename_tables.sql:65: ERROR:  query shape is not supported by the compatibility stub
+ id | name  | bucket
+----+-------+--------
+  3 | Grace |      7
+(1 row)
