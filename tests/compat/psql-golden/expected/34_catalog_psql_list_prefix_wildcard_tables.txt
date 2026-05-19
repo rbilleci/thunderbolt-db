@@ -9,9 +9,9 @@ CREATE TABLE
  public | prefix_teams  | table | postgres
 (2 rows)
 
-                                      List of relations
- Schema |     Name      | Type  |  Owner   | Persistence | Access method | Size | Description
---------+---------------+-------+----------+-------------+---------------+------+-------------
- public | prefix_people | table | postgres | permanent   | heap          |      |
- public | prefix_teams  | table | postgres | permanent   | heap          |      |
+                                        List of relations
+ Schema |     Name      | Type  |  Owner   | Persistence | Access method |  Size   | Description
+--------+---------------+-------+----------+-------------+---------------+---------+-------------
+ public | prefix_people | table | postgres | permanent   | heap          | 0 bytes |
+ public | prefix_teams  | table | postgres | permanent   | heap          | 0 bytes |
 (2 rows)

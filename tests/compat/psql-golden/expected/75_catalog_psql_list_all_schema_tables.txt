@@ -9,9 +9,9 @@ CREATE TABLE
 (2 rows)
 
 === psql all-schema verbose table listing ===
-                                        List of relations
- Schema |       Name        | Type  |  Owner   | Persistence | Access method | Size | Description
---------+-------------------+-------+----------+-------------+---------------+------+-------------
- public | all_schema_people | table | postgres | permanent   | heap          |      |
- public | all_schema_teams  | table | postgres | permanent   | heap          |      |
+                                          List of relations
+ Schema |       Name        | Type  |  Owner   | Persistence | Access method |  Size   | Description
+--------+-------------------+-------+----------+-------------+---------------+---------+-------------
+ public | all_schema_people | table | postgres | permanent   | heap          | 0 bytes |
+ public | all_schema_teams  | table | postgres | permanent   | heap          | 0 bytes |
 (2 rows)

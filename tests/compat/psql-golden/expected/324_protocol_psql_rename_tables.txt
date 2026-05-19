@@ -4,10 +4,10 @@ INSERT 0 2
 COMMENT
 COMMENT
 COMMENT
-                                         List of relations
- Schema |        Name         | Type  |  Owner   | Persistence | Access method | Size | Description
---------+---------------------+-------+----------+-------------+---------------+------+-------------
- public | rename_table_people | table | postgres | permanent   | heap          |      | old table
+                                           List of relations
+ Schema |        Name         | Type  |  Owner   | Persistence | Access method |   Size   | Description
+--------+---------------------+-------+----------+-------------+---------------+----------+-------------
+ public | rename_table_people | table | postgres | permanent   | heap          | 72 bytes | old table
 (1 row)
 
                                    Table "public.rename_table_people"
@@ -23,10 +23,10 @@ Access method: heap
 
 ALTER TABLE
 psql:324_protocol_psql_rename_tables.sql:10: error: Did not find any relation named "public.rename_table*".
-                                          List of relations
- Schema |         Name         | Type  |  Owner   | Persistence | Access method | Size | Description
---------+----------------------+-------+----------+-------------+---------------+------+-------------
- public | renamed_table_people | table | postgres | permanent   | heap          |      | old table
+                                            List of relations
+ Schema |         Name         | Type  |  Owner   | Persistence | Access method |   Size   | Description
+--------+----------------------+-------+----------+-------------+---------------+----------+-------------
+ public | renamed_table_people | table | postgres | permanent   | heap          | 72 bytes | old table
 (1 row)
 
                                    Table "public.renamed_table_people"

@@ -1,0 +1,32 @@
+=== catalog psql table size metadata ===
+CREATE TABLE
+                                         List of relations
+ Schema |       Name       | Type  |  Owner   | Persistence | Access method |  Size   | Description
+--------+------------------+-------+----------+-------------+---------------+---------+-------------
+ public | heap_size_people | table | postgres | permanent   | heap          | 0 bytes |
+(1 row)
+
+INSERT 0 2
+                                          List of relations
+ Schema |       Name       | Type  |  Owner   | Persistence | Access method |   Size   | Description
+--------+------------------+-------+----------+-------------+---------------+----------+-------------
+ public | heap_size_people | table | postgres | permanent   | heap          | 64 bytes |
+(1 row)
+
+                                          List of relations
+ Schema |       Name       | Type  |  Owner   | Persistence | Access method |   Size   | Description
+--------+------------------+-------+----------+-------------+---------------+----------+-------------
+ public | heap_size_people | table | postgres | permanent   | heap          | 64 bytes |
+(1 row)
+
+                                          List of relations
+ Schema |       Name       | Type  |  Owner   | Persistence | Access method |   Size   | Description
+--------+------------------+-------+----------+-------------+---------------+----------+-------------
+ public | heap_size_people | table | postgres | permanent   | heap          | 64 bytes |
+(1 row)
+
+                                          List of relations
+ Schema |       Name       | Type  |  Owner   | Persistence | Access method |   Size   | Description
+--------+------------------+-------+----------+-------------+---------------+----------+-------------
+ public | heap_size_people | table | postgres | permanent   | heap          | 64 bytes |
+(1 row)

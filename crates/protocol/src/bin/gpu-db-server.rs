@@ -9456,22 +9456,74 @@ fn catalog_psql_describe_table_verbose_rows_filtered(
     session: &Session,
     filter: &PsqlDescribeTablesFilter,
 ) -> Vec<Vec<Option<String>>> {
-    catalog_psql_describe_table_rows_filtered(session, filter)
+    if filter.namespace != "public" {
+        return Vec::new();
+    }
+    let mut tables = session.tables.values().collect::<Vec<_>>();
+    tables.sort_by(|left, right| left.name.cmp(&right.name));
+    tables
         .into_iter()
-        .map(|mut row| {
-            let table_name = row[1].clone().unwrap_or_default();
-            row.extend([
+        .filter(|table| {
+            filter
+                .relname_pattern
+                .as_deref()
+                .is_none_or(|pattern| psql_relname_pattern_matches(pattern, &table.name))
+        })
+        .map(|table| {
+            vec![
+                Some("public".to_string()),
+                Some(table.name.clone()),
+                Some("table".to_string()),
+                Some("postgres".to_string()),
                 Some("permanent".to_string()),
                 Some("heap".to_string()),
-                None,
+                Some(psql_pretty_table_size(table)),
                 session
                     .comments
-                    .get(&CatalogCommentTarget::Table { table: table_name })
+                    .get(&CatalogCommentTarget::Table {
+                        table: table.name.clone(),
+                    })
                     .cloned(),
-            ]);
-            row
+            ]
         })
         .collect()
+}
+
+fn psql_pretty_table_size(table: &Table) -> String {
+    psql_size_pretty(compat_table_heap_size_bytes(table))
+}
+
+fn compat_table_heap_size_bytes(table: &Table) -> u64 {
+    table
+        .rows
+        .iter()
+        .map(|row| 24 + row.iter().map(compat_sql_value_size_bytes).sum::<u64>())
+        .sum()
+}
+
+fn compat_sql_value_size_bytes(value: &SqlValue) -> u64 {
+    match value {
+        SqlValue::Int4(_) => 4,
+        SqlValue::Text(value) => value.len() as u64,
+        SqlValue::Int8(_) => 8,
+        SqlValue::Numeric(value) => value.len() as u64,
+    }
+}
+
+fn psql_size_pretty(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+
+    if bytes < 10 * KB {
+        format!("{bytes} bytes")
+    } else if bytes < 10 * MB {
+        format!("{} kB", bytes / KB)
+    } else if bytes < 10 * GB {
+        format!("{} MB", bytes / MB)
+    } else {
+        format!("{} GB", bytes / GB)
+    }
 }
 
 fn catalog_psql_describe_table_privilege_rows_filtered(
@@ -15762,7 +15814,7 @@ mod tests {
                     Some("postgres".to_string()),
                     Some("permanent".to_string()),
                     Some("heap".to_string()),
-                    None,
+                    Some("0 bytes".to_string()),
                     None,
                 ],
                 vec![
@@ -15772,7 +15824,7 @@ mod tests {
                     Some("postgres".to_string()),
                     Some("permanent".to_string()),
                     Some("heap".to_string()),
-                    None,
+                    Some("0 bytes".to_string()),
                     None,
                 ],
             ]
@@ -15843,9 +15895,43 @@ mod tests {
                 Some("postgres".to_string()),
                 Some("permanent".to_string()),
                 Some("heap".to_string()),
-                None,
+                Some("0 bytes".to_string()),
                 None,
             ]]
+        );
+        let mut sized_session = Session::default();
+        sized_session.tables.insert(
+            "people".to_string(),
+            Table {
+                oid: FIRST_USER_RELATION_OID,
+                name: "people".to_string(),
+                columns: vec![
+                    CatalogColumn {
+                        attnum: 1,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "id".to_string(),
+                            ty: gpu_db_protocol::SqlType::Int4,
+                            default: None,
+                        },
+                    },
+                    CatalogColumn {
+                        attnum: 2,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "name".to_string(),
+                            ty: gpu_db_protocol::SqlType::Text,
+                            default: None,
+                        },
+                    },
+                ],
+                rows: vec![
+                    vec![SqlValue::Int4(1), SqlValue::Text("ada".to_string())],
+                    vec![SqlValue::Int4(2), SqlValue::Text("grace".to_string())],
+                ],
+            },
+        );
+        assert_eq!(
+            catalog_psql_describe_table_verbose_rows(&sized_session)[0][6],
+            Some("64 bytes".to_string())
         );
         assert_eq!(
             psql_describe_tables_verbose_catalog_query_filter(

@@ -2,15 +2,15 @@
 CREATE TABLE
 CREATE TABLE
 CREATE TABLE
-                                          List of relations
- Schema |         Name          | Type  |  Owner   | Persistence | Access method | Size | Description
---------+-----------------------+-------+----------+-------------+---------------+------+-------------
- public | schema_verbose_people | table | postgres | permanent   | heap          |      |
- public | schema_verbose_teams  | table | postgres | permanent   | heap          |      |
+                                            List of relations
+ Schema |         Name          | Type  |  Owner   | Persistence | Access method |  Size   | Description
+--------+-----------------------+-------+----------+-------------+---------------+---------+-------------
+ public | schema_verbose_people | table | postgres | permanent   | heap          | 0 bytes |
+ public | schema_verbose_teams  | table | postgres | permanent   | heap          | 0 bytes |
 (2 rows)
 
-                                          List of relations
- Schema |         Name          | Type  |  Owner   | Persistence | Access method | Size | Description
---------+-----------------------+-------+----------+-------------+---------------+------+-------------
- public | schema_verbose_people | table | postgres | permanent   | heap          |      |
+                                            List of relations
+ Schema |         Name          | Type  |  Owner   | Persistence | Access method |  Size   | Description
+--------+-----------------------+-------+----------+-------------+---------------+---------+-------------
+ public | schema_verbose_people | table | postgres | permanent   | heap          | 0 bytes |
 (1 row)
