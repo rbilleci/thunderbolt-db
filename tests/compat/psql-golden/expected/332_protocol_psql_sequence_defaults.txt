@@ -1,0 +1,68 @@
+=== psql bounded sequence-backed defaults ===
+CREATE TABLE
+                            Table "public.serial_people"
+ Column |  Type   | Collation | Nullable |                  Default
+--------+---------+-----------+----------+-------------------------------------------
+ id     | integer |           |          | nextval('serial_people_id_seq'::regclass)
+ name   | text    |           |          |
+Indexes:
+    "serial_people_pkey" PRIMARY KEY, btree (id)
+
+                  List of relations
+ Schema |         Name         |   Type   |  Owner
+--------+----------------------+----------+----------
+ public | serial_people_id_seq | sequence | postgres
+(1 row)
+
+INSERT 0 2
+ id | name
+----+-------
+  1 | Ada
+  2 | Linus
+(2 rows)
+
+ last_value | is_called
+------------+-----------
+          2 | t
+(1 row)
+
+ currval
+---------
+       2
+(1 row)
+
+CREATE SEQUENCE
+CREATE TABLE
+INSERT 0 2
+ id |  name
+----+---------
+  1 | Grace
+  2 | Barbara
+(2 rows)
+
+ last_value | is_called
+------------+-----------
+          2 | t
+(1 row)
+
+ nspname |    relname    | attname |               default_expr
+---------+---------------+---------+-------------------------------------------
+ public  | manual_people | id      | nextval('manual_people_seq'::regclass)
+ public  | serial_people | id      | nextval('serial_people_id_seq'::regclass)
+(2 rows)
+
+ column_name | data_type | is_nullable |              column_default
+-------------+-----------+-------------+-------------------------------------------
+ id          | integer   | YES         | nextval('serial_people_id_seq'::regclass)
+ name        | text      | YES         |
+(2 rows)
+
+ column_name | data_type | is_nullable |             column_default
+-------------+-----------+-------------+----------------------------------------
+ id          | integer   | YES         | nextval('manual_people_seq'::regclass)
+ name        | text      | YES         |
+(2 rows)
+
+psql:332_protocol_psql_sequence_defaults.sql:38: ERROR:  sequence does not exist
+CREATE TABLE
+psql:332_protocol_psql_sequence_defaults.sql:43: ERROR:  relation is not a sequence

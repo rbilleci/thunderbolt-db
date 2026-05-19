@@ -19,12 +19,12 @@ use gpu_db_observability::{
 };
 use gpu_db_planner::{ExecutionPlan, Planner, PlannerConfig};
 use gpu_db_protocol::{
-    parse_command, AddUniqueConstraint, ColumnDef, Command, CommentTarget, CreateIndex,
-    CreateMaterializedView, CreateSequence, CreateTable, CreateView, Delete, DropConstraint,
-    DropIndex, DropMaterializedView, DropSequence, DropTable, DropView, Insert, ParseError,
-    RefreshMaterializedView, RenameColumn, RenameConstraint, RenameIndex, RenameMaterializedView,
-    RenameSequence, RenameTable, RenameView, Select, SelectFilterOp, SelectProjection,
-    SequenceNextVal, SequenceSetVal, SqlType, SqlValue, TruncateTable, Update,
+    parse_command, AddUniqueConstraint, ColumnDef, ColumnDefault, Command, CommentTarget,
+    CreateIndex, CreateMaterializedView, CreateSequence, CreateTable, CreateView, Delete,
+    DropConstraint, DropIndex, DropMaterializedView, DropSequence, DropTable, DropView, Insert,
+    ParseError, RefreshMaterializedView, RenameColumn, RenameConstraint, RenameIndex,
+    RenameMaterializedView, RenameSequence, RenameTable, RenameView, Select, SelectFilterOp,
+    SelectProjection, SequenceNextVal, SequenceSetVal, SqlType, SqlValue, TruncateTable, Update,
 };
 use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine};
 use gpu_db_storage::{
@@ -5989,7 +5989,7 @@ pub struct RelationalColumn {
     pub attnum: i16,
     pub name: String,
     pub ty: SqlType,
-    pub default: Option<SqlValue>,
+    pub default: Option<ColumnDefault>,
     pub type_oid: u32,
     pub type_size: i16,
 }
@@ -6320,6 +6320,17 @@ fn sql_value_matches_type(value: &SqlValue, ty: SqlType) -> bool {
         (value, ty),
         (SqlValue::Int4(_), SqlType::Int4) | (SqlValue::Text(_), SqlType::Text)
     )
+}
+
+fn column_default_matches_type(value: &ColumnDefault, ty: SqlType) -> bool {
+    match value {
+        ColumnDefault::Literal(value) => sql_value_matches_type(value, ty),
+        ColumnDefault::SequenceNextVal { .. } => ty == SqlType::Int4,
+    }
+}
+
+fn sequence_defaults(columns: &[ColumnDef]) -> impl Iterator<Item = &ColumnDefault> {
+    columns.iter().filter_map(|column| column.default.as_ref())
 }
 
 fn relational_row_key(table: &str, row_id: u64) -> String {
@@ -7787,6 +7798,39 @@ impl Engine {
         Ok(())
     }
 
+    fn create_implicit_sequence(&mut self, name: &str) -> Result<(), EngineError> {
+        self.apply_create_sequence(CreateSequence {
+            name: name.to_string(),
+        })
+    }
+
+    fn preflight_implicit_sequence_name(&self, name: &str) -> Result<(), EngineError> {
+        if self.relational_catalog.contains_key(name)
+            || self.relational_views.contains_key(name)
+            || self.relational_materialized_views.contains_key(name)
+            || self.relational_sequences.contains_key(name)
+        {
+            return Err(EngineError::ApplyFailed(format!(
+                "relation \"{name}\" already exists"
+            )));
+        }
+        Ok(())
+    }
+
+    fn preflight_column_default_target(&self, default: &ColumnDefault) -> Result<(), EngineError> {
+        match default {
+            ColumnDefault::Literal(_) => Ok(()),
+            ColumnDefault::SequenceNextVal {
+                sequence,
+                create_if_missing: true,
+            } => self.preflight_implicit_sequence_name(sequence),
+            ColumnDefault::SequenceNextVal {
+                sequence,
+                create_if_missing: false,
+            } => self.preflight_sequence_target(sequence),
+        }
+    }
+
     fn apply_sequence_nextval(&mut self, nextval: SequenceNextVal) -> Result<i64, EngineError> {
         self.preflight_sequence_target(&nextval.name)?;
         let sequence = self
@@ -7804,6 +7848,25 @@ impl Engine {
         sequence.last_value = value;
         sequence.is_called = true;
         Ok(value)
+    }
+
+    fn evaluate_column_default(
+        &mut self,
+        default: &ColumnDefault,
+    ) -> Result<SqlValue, EngineError> {
+        match default {
+            ColumnDefault::Literal(value) => Ok(value.clone()),
+            ColumnDefault::SequenceNextVal { sequence, .. } => {
+                let value = self.apply_sequence_nextval(SequenceNextVal {
+                    name: sequence.clone(),
+                })?;
+                i32::try_from(value).map(SqlValue::Int4).map_err(|_| {
+                    EngineError::ApplyFailed(
+                        "sequence value is out of range for int4 default".to_string(),
+                    )
+                })
+            }
+        }
     }
 
     fn apply_sequence_setval(&mut self, setval: SequenceSetVal) -> Result<i64, EngineError> {
@@ -7843,9 +7906,26 @@ impl Engine {
         let next_oid = self.relational_next_oid.checked_add(1).ok_or_else(|| {
             EngineError::ApplyFailed("relational table OID allocation exhausted".to_string())
         })?;
+        let implicit_sequences = create
+            .columns
+            .iter()
+            .filter_map(|column| match &column.default {
+                Some(ColumnDefault::SequenceNextVal {
+                    sequence,
+                    create_if_missing: true,
+                }) => Some(sequence.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for sequence in &implicit_sequences {
+            self.preflight_implicit_sequence_name(sequence)?;
+        }
         let mut columns = Vec::with_capacity(create.columns.len());
         let mut next_column_id = self.relational_next_column_id;
         for (idx, column) in create.columns.into_iter().enumerate() {
+            if let Some(default) = column.default.as_ref() {
+                self.preflight_column_default_target(default)?;
+            }
             let attnum = i16::try_from(idx + 1).map_err(|_| {
                 EngineError::ApplyFailed("too many columns for bootstrap catalog".to_string())
             })?;
@@ -7889,6 +7969,11 @@ impl Engine {
                 unique_constraint: true,
             });
         }
+        self.relational_next_oid = next_oid;
+        for sequence in &implicit_sequences {
+            self.create_implicit_sequence(sequence)?;
+        }
+        let next_oid = self.relational_next_oid.max(next_oid);
         self.relational_catalog.insert(
             name.clone(),
             RelationalTable {
@@ -9133,6 +9218,25 @@ impl Engine {
         &mut self,
         alter: gpu_db_protocol::AlterColumnDefault,
     ) -> Result<(), EngineError> {
+        if let Some(default) = alter.default.as_ref() {
+            let table = self.relational_catalog.get(&alter.table).ok_or_else(|| {
+                EngineError::ApplyFailed(format!("relation \"{}\" does not exist", alter.table))
+            })?;
+            let column = table
+                .columns
+                .iter()
+                .find(|column| column.name == alter.column)
+                .ok_or_else(|| {
+                    EngineError::ApplyFailed(format!("column \"{}\" does not exist", alter.column))
+                })?;
+            if !column_default_matches_type(default, column.ty) {
+                return Err(EngineError::ApplyFailed(format!(
+                    "invalid default for column \"{}\"",
+                    alter.column
+                )));
+            }
+            self.preflight_column_default_target(default)?;
+        }
         let table = self
             .relational_catalog
             .get_mut(&alter.table)
@@ -9150,12 +9254,6 @@ impl Engine {
             column.default = None;
             return Ok(());
         };
-        if !sql_value_matches_type(&default, column.ty) {
-            return Err(EngineError::ApplyFailed(format!(
-                "invalid default for column \"{}\"",
-                alter.column
-            )));
-        }
         column.default = Some(default);
         Ok(())
     }
@@ -9180,7 +9278,13 @@ impl Engine {
                     .to_string(),
             ));
         };
-        if !sql_value_matches_type(&default, add.column.ty) {
+        let ColumnDefault::Literal(default_value) = default.clone() else {
+            return Err(EngineError::ApplyFailed(
+                "ADD COLUMN requires a literal DEFAULT in the bootstrap relational subset"
+                    .to_string(),
+            ));
+        };
+        if !sql_value_matches_type(&default_value, add.column.ty) {
             return Err(EngineError::ApplyFailed(format!(
                 "invalid default for column \"{}\"",
                 add.column.name
@@ -9230,7 +9334,7 @@ impl Engine {
             }
             let mut row = decode_relational_row(&tuple.value, &table.columns)
                 .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
-            row.push(default.clone());
+            row.push(default_value.clone());
             updates.push((tuple.tuple_id, tuple.key.clone(), row));
         }
         drop(cursor);
@@ -9243,7 +9347,7 @@ impl Engine {
                 .entry(RelationalIndexKey {
                     table: add.table.clone(),
                     column: new_column.name.clone(),
-                    value: relational_index_value(&default),
+                    value: relational_index_value(&default_value),
                 })
                 .or_default()
                 .push(row_key);
@@ -9502,7 +9606,9 @@ impl Engine {
             }
             for (idx, value) in values.iter_mut().enumerate() {
                 if value.is_none() {
-                    *value = table.columns[idx].default.clone();
+                    if let Some(default) = table.columns[idx].default.clone() {
+                        *value = Some(self.evaluate_column_default(&default)?);
+                    }
                 }
             }
             if values.iter().any(Option::is_none) {
@@ -9678,6 +9784,23 @@ impl Engine {
         txn_id: TxnId,
     ) -> Result<(), EngineError> {
         match cmd {
+            Command::CreateTable(create) => {
+                let mut implicit_sequences = BTreeSet::new();
+                for default in sequence_defaults(&create.columns) {
+                    if let ColumnDefault::SequenceNextVal {
+                        sequence,
+                        create_if_missing: true,
+                    } = default
+                    {
+                        if !implicit_sequences.insert(sequence.clone()) {
+                            return Err(EngineError::ApplyFailed(format!(
+                                "relation \"{sequence}\" already exists"
+                            )));
+                        }
+                    }
+                    self.preflight_column_default_target(default)?;
+                }
+            }
             Command::CreateIndex(create) if create.unique => {
                 if self
                     .relational_catalog
@@ -9813,7 +9936,9 @@ impl Engine {
                             .to_string(),
                     ));
                 };
-                if !sql_value_matches_type(default, add.column.ty) {
+                if !matches!(default, ColumnDefault::Literal(_))
+                    || !column_default_matches_type(default, add.column.ty)
+                {
                     return Err(EngineError::ApplyFailed(format!(
                         "invalid default for column \"{}\"",
                         add.column.name
@@ -10190,6 +10315,7 @@ impl Engine {
                     }
                     indexes
                 };
+                let mut simulated_sequences = self.relational_sequences.clone();
                 let mut new_rows = Vec::with_capacity(insert.rows.len());
                 for row in &insert.rows {
                     if row.len() != column_indexes.len() {
@@ -10211,7 +10337,36 @@ impl Engine {
                     }
                     for (idx, value) in values.iter_mut().enumerate() {
                         if value.is_none() {
-                            *value = table.columns[idx].default.clone();
+                            if let Some(default) = table.columns[idx].default.clone() {
+                                *value = Some(match default {
+                                    ColumnDefault::Literal(value) => value,
+                                    ColumnDefault::SequenceNextVal { sequence, .. } => {
+                                        self.preflight_sequence_target(&sequence)?;
+                                        let sequence_state = simulated_sequences
+                                            .get_mut(&sequence)
+                                            .expect("sequence target preflighted");
+                                        let value = if sequence_state.is_called {
+                                            sequence_state.last_value.checked_add(1).ok_or_else(
+                                                || {
+                                                    EngineError::ApplyFailed(
+                                                        "sequence value overflow".to_string(),
+                                                    )
+                                                },
+                                            )?
+                                        } else {
+                                            sequence_state.last_value
+                                        };
+                                        sequence_state.last_value = value;
+                                        sequence_state.is_called = true;
+                                        SqlValue::Int4(i32::try_from(value).map_err(|_| {
+                                            EngineError::ApplyFailed(
+                                                "sequence value is out of range for int4 default"
+                                                    .to_string(),
+                                            )
+                                        })?)
+                                    }
+                                });
+                            }
                         }
                     }
                     if values.iter().any(Option::is_none) {
@@ -31815,7 +31970,10 @@ mod tests {
             .relational_catalog_table("default_people")
             .unwrap();
         assert_eq!(table.columns[1].default, None);
-        assert_eq!(table.columns[2].default, Some(SqlValue::Int4(7)));
+        assert_eq!(
+            table.columns[2].default,
+            Some(ColumnDefault::Literal(SqlValue::Int4(7)))
+        );
         let recovered_result = recovered.execute_relational_select(&select).unwrap();
         assert_eq!(recovered_result.rows, result.rows);
 
@@ -31882,7 +32040,10 @@ mod tests {
         assert_eq!(table.columns.len(), 3);
         assert_eq!(table.columns[2].name, "bucket");
         assert_eq!(table.columns[2].attnum, 3);
-        assert_eq!(table.columns[2].default, Some(SqlValue::Int4(7)));
+        assert_eq!(
+            table.columns[2].default,
+            Some(ColumnDefault::Literal(SqlValue::Int4(7)))
+        );
         let recovered_result = recovered.execute_relational_select(&select).unwrap();
         assert_eq!(recovered_result.rows, result.rows);
 
@@ -32956,6 +33117,123 @@ mod tests {
         assert!(missing
             .to_string()
             .contains("sequence \"missing_seq\" does not exist"));
+    }
+
+    #[test]
+    fn relational_sequence_defaults_fill_omitted_columns_and_replay() {
+        let mut e = Engine::new_local();
+        e.execute_text(
+            1,
+            "CREATE TABLE serial_people (id SERIAL PRIMARY KEY, name TEXT)",
+        )
+        .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO serial_people (name) VALUES ('Ada'), ('Linus')",
+        )
+        .unwrap();
+        e.execute_text(3, "CREATE SEQUENCE public.manual_people_seq")
+            .unwrap();
+        e.execute_text(
+            4,
+            "CREATE TABLE manual_people (id INT DEFAULT nextval('public.manual_people_seq'::regclass), name TEXT)",
+        )
+        .unwrap();
+        e.execute_text(
+            5,
+            "INSERT INTO manual_people (name) VALUES ('Grace'), ('Barbara')",
+        )
+        .unwrap();
+        e.execute_text(6, "CREATE TABLE after_serial_oid_check (id INT)")
+            .unwrap();
+
+        let serial_people_oid = e.relational_catalog_table("serial_people").unwrap().oid;
+        let serial_sequence_oid = e
+            .relational_catalog_sequence("serial_people_id_seq")
+            .unwrap()
+            .oid;
+        let after_serial_oid = e
+            .relational_catalog_table("after_serial_oid_check")
+            .unwrap()
+            .oid;
+        assert_ne!(serial_people_oid, serial_sequence_oid);
+        assert_ne!(after_serial_oid, serial_sequence_oid);
+        assert!(after_serial_oid > serial_sequence_oid);
+
+        let Command::Select(serial_select) =
+            parse_command("SELECT id, name FROM serial_people ORDER BY id ASC").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let serial_result = e.execute_relational_select(&serial_select).unwrap();
+        assert_eq!(
+            serial_result.rows,
+            vec![
+                vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())],
+                vec![SqlValue::Int4(2), SqlValue::Text("Linus".to_string())],
+            ]
+        );
+        let serial_sequence = e
+            .relational_catalog_sequence("serial_people_id_seq")
+            .unwrap();
+        assert_eq!(serial_sequence.last_value, 2);
+        assert!(serial_sequence.is_called);
+
+        let Command::Select(manual_select) =
+            parse_command("SELECT id, name FROM manual_people ORDER BY id ASC").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let manual_result = e.execute_relational_select(&manual_select).unwrap();
+        assert_eq!(
+            manual_result.rows,
+            vec![
+                vec![SqlValue::Int4(1), SqlValue::Text("Grace".to_string())],
+                vec![SqlValue::Int4(2), SqlValue::Text("Barbara".to_string())],
+            ]
+        );
+
+        let mut recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let recovered_serial = recovered.execute_relational_select(&serial_select).unwrap();
+        assert_eq!(recovered_serial.rows, serial_result.rows);
+        let recovered_manual = recovered.execute_relational_select(&manual_select).unwrap();
+        assert_eq!(recovered_manual.rows, manual_result.rows);
+        let recovered_sequence = recovered
+            .relational_catalog_sequence("manual_people_seq")
+            .unwrap();
+        assert_eq!(recovered_sequence.last_value, 2);
+        assert!(recovered_sequence.is_called);
+
+        let missing = e
+            .execute_text(
+                7,
+                "CREATE TABLE missing_default (id INT DEFAULT nextval('missing_seq'::regclass), name TEXT)",
+            )
+            .unwrap_err();
+        assert!(missing
+            .to_string()
+            .contains("sequence \"missing_seq\" does not exist"));
+        assert!(e.relational_catalog_table("missing_default").is_none());
+
+        let table_target = e
+            .execute_text(
+                8,
+                "CREATE TABLE bad_default (id INT DEFAULT nextval('serial_people'::regclass), name TEXT)",
+            )
+            .unwrap_err();
+        assert!(table_target
+            .to_string()
+            .contains("relation \"serial_people\" is not a sequence"));
+
+        let missing_alter = e
+            .execute_text(
+                9,
+                "ALTER TABLE manual_people ALTER COLUMN id SET DEFAULT nextval('still_missing_seq'::regclass)",
+            )
+            .unwrap_err();
+        assert!(missing_alter
+            .to_string()
+            .contains("sequence \"still_missing_seq\" does not exist"));
     }
 
     #[test]

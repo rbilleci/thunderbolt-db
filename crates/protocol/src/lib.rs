@@ -234,7 +234,7 @@ pub struct DropView {
 pub struct AlterColumnDefault {
     pub table: String,
     pub column: String,
-    pub default: Option<SqlValue>,
+    pub default: Option<ColumnDefault>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -262,7 +262,16 @@ pub enum CommentTarget {
 pub struct ColumnDef {
     pub name: String,
     pub ty: SqlType,
-    pub default: Option<SqlValue>,
+    pub default: Option<ColumnDefault>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ColumnDefault {
+    Literal(SqlValue),
+    SequenceNextVal {
+        sequence: String,
+        create_if_missing: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2158,7 +2167,7 @@ fn parse_alter_column_default(input: &str) -> Result<AlterColumnDefault, ParseEr
         return Ok(AlterColumnDefault {
             table,
             column,
-            default: Some(parse_sql_value(rest)?),
+            default: Some(parse_column_default_expr(rest, None)?),
         });
     }
 
@@ -2403,16 +2412,65 @@ fn parse_column_def(input: &str) -> Result<ColumnDef, ParseError> {
         if default_value.is_empty() {
             return Err(ParseError::InvalidRelationalSql);
         }
-        let value = parse_sql_value(default_value)?;
-        if !matches!(
-            (&value, ty),
-            (SqlValue::Int4(_), SqlType::Int4) | (SqlValue::Text(_), SqlType::Text)
-        ) {
-            return Err(ParseError::InvalidRelationalSql);
-        }
-        Some(value)
+        Some(parse_typed_column_default(default_value, ty, None)?)
     };
     Ok(ColumnDef { name, ty, default })
+}
+
+fn parse_column_default_expr(
+    input: &str,
+    implicit_serial_sequence: Option<String>,
+) -> Result<ColumnDefault, ParseError> {
+    let trimmed = input.trim();
+    if let Some(sequence) = implicit_serial_sequence {
+        if !trimmed.is_empty() {
+            return Err(ParseError::InvalidRelationalSql);
+        }
+        return Ok(ColumnDefault::SequenceNextVal {
+            sequence,
+            create_if_missing: true,
+        });
+    }
+    let function = trimmed
+        .strip_prefix("pg_catalog.")
+        .or_else(|| trimmed.strip_prefix("PG_CATALOG."))
+        .unwrap_or(trimmed);
+    if let Some(args) = function
+        .strip_prefix("nextval")
+        .or_else(|| function.strip_prefix("NEXTVAL"))
+    {
+        let args = args.trim_start();
+        if !args.starts_with('(') {
+            return Err(ParseError::InvalidRelationalSql);
+        }
+        let close = find_matching_paren(args, 0).ok_or(ParseError::InvalidRelationalSql)?;
+        if !args[close + 1..].trim().is_empty() {
+            return Err(ParseError::InvalidRelationalSql);
+        }
+        let parts = split_csv(&args[1..close])?;
+        let [target] = parts.as_slice() else {
+            return Err(ParseError::InvalidRelationalSql);
+        };
+        return Ok(ColumnDefault::SequenceNextVal {
+            sequence: parse_sequence_regclass_arg(target.trim())?,
+            create_if_missing: false,
+        });
+    }
+    Ok(ColumnDefault::Literal(parse_sql_value(trimmed)?))
+}
+
+fn parse_typed_column_default(
+    input: &str,
+    ty: SqlType,
+    implicit_serial_sequence: Option<String>,
+) -> Result<ColumnDefault, ParseError> {
+    let default = parse_column_default_expr(input, implicit_serial_sequence)?;
+    match (&default, ty) {
+        (ColumnDefault::Literal(SqlValue::Int4(_)), SqlType::Int4)
+        | (ColumnDefault::Literal(SqlValue::Text(_)), SqlType::Text)
+        | (ColumnDefault::SequenceNextVal { .. }, SqlType::Int4) => Ok(default),
+        _ => Err(ParseError::InvalidRelationalSql),
+    }
 }
 
 fn parse_drop_table_constraint(input: &str) -> Result<DropConstraint, ParseError> {
@@ -2595,9 +2653,14 @@ fn parse_create_table(input: &str) -> Result<CreateTable, ParseError> {
             .ok_or(ParseError::InvalidRelationalSql)
             .and_then(normalize_identifier)?;
         let raw_ty = parts.next().ok_or(ParseError::InvalidRelationalSql)?;
+        let mut serial_sequence = None;
         let ty = match raw_ty {
             ty if parse_supported_sql_type_name(ty) == Some(SqlType::Int4) => SqlType::Int4,
             ty if parse_supported_sql_type_name(ty) == Some(SqlType::Text) => SqlType::Text,
+            ty if ty.eq_ignore_ascii_case("serial") || ty.eq_ignore_ascii_case("serial4") => {
+                serial_sequence = Some(format!("{}_{}_seq", table, name));
+                SqlType::Int4
+            }
             _ => return Err(ParseError::InvalidRelationalSql),
         };
         let mut tail = parts.collect::<Vec<_>>().join(" ");
@@ -2624,23 +2687,27 @@ fn parse_create_table(input: &str) -> Result<CreateTable, ParseError> {
             tail = tail[..unique_pos].trim().to_string();
             column_unique = true;
         }
-        let default = if tail.is_empty() {
+        let default = if tail.is_empty() && serial_sequence.is_none() {
             None
         } else {
-            let default_value = strip_keyword_prefix_case_insensitive(&tail, "DEFAULT")
-                .ok_or(ParseError::InvalidRelationalSql)?
-                .trim();
-            if default_value.is_empty() {
+            if serial_sequence.is_some() && !tail.is_empty() {
                 return Err(ParseError::InvalidRelationalSql);
             }
-            let value = parse_sql_value(default_value)?;
-            if !matches!(
-                (&value, ty),
-                (SqlValue::Int4(_), SqlType::Int4) | (SqlValue::Text(_), SqlType::Text)
-            ) {
+            let default_value = if serial_sequence.is_some() {
+                ""
+            } else {
+                strip_keyword_prefix_case_insensitive(&tail, "DEFAULT")
+                    .ok_or(ParseError::InvalidRelationalSql)?
+                    .trim()
+            };
+            if default_value.is_empty() && serial_sequence.is_none() {
                 return Err(ParseError::InvalidRelationalSql);
             }
-            Some(value)
+            Some(parse_typed_column_default(
+                default_value,
+                ty,
+                serial_sequence,
+            )?)
         };
         if column_primary_key {
             if primary_key.is_some() {
@@ -10609,12 +10676,12 @@ mod tests {
                     ColumnDef {
                         name: "id".to_string(),
                         ty: SqlType::Int4,
-                        default: Some(SqlValue::Int4(7)),
+                        default: Some(ColumnDefault::Literal(SqlValue::Int4(7))),
                     },
                     ColumnDef {
                         name: "name".to_string(),
                         ty: SqlType::Text,
-                        default: Some(SqlValue::Text("Ada's".to_string())),
+                        default: Some(ColumnDefault::Literal(SqlValue::Text("Ada's".to_string()))),
                     },
                 ],
                 primary_key: None,
@@ -10623,6 +10690,55 @@ mod tests {
         );
         assert!(matches!(
             parse_command("CREATE TABLE invalid_default (id INT DEFAULT 'bad'::text)"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert_eq!(
+            parse_command("CREATE TABLE serial_people (id SERIAL PRIMARY KEY, name TEXT)").unwrap(),
+            Command::CreateTable(CreateTable {
+                table: "serial_people".to_string(),
+                columns: vec![
+                    ColumnDef {
+                        name: "id".to_string(),
+                        ty: SqlType::Int4,
+                        default: Some(ColumnDefault::SequenceNextVal {
+                            sequence: "serial_people_id_seq".to_string(),
+                            create_if_missing: true,
+                        }),
+                    },
+                    ColumnDef {
+                        name: "name".to_string(),
+                        ty: SqlType::Text,
+                        default: None,
+                    },
+                ],
+                primary_key: Some(PrimaryKey {
+                    name: None,
+                    column: "id".to_string(),
+                }),
+                unique_constraints: Vec::new(),
+            })
+        );
+        assert_eq!(
+            parse_command(
+                "CREATE TABLE seq_default_people (id INT DEFAULT nextval('public.people_seq'::regclass))"
+            )
+            .unwrap(),
+            Command::CreateTable(CreateTable {
+                table: "seq_default_people".to_string(),
+                columns: vec![ColumnDef {
+                    name: "id".to_string(),
+                    ty: SqlType::Int4,
+                    default: Some(ColumnDefault::SequenceNextVal {
+                        sequence: "people_seq".to_string(),
+                        create_if_missing: false,
+                    }),
+                }],
+                primary_key: None,
+                unique_constraints: Vec::new(),
+            })
+        );
+        assert!(matches!(
+            parse_command("CREATE TABLE invalid_serial (id TEXT DEFAULT nextval('people_seq'))"),
             Err(ParseError::InvalidRelationalSql)
         ));
         assert_eq!(
@@ -10651,7 +10767,18 @@ mod tests {
             Command::AlterColumnDefault(AlterColumnDefault {
                 table: "default_people".to_string(),
                 column: "name".to_string(),
-                default: Some(SqlValue::Text("Grace".to_string())),
+                default: Some(ColumnDefault::Literal(SqlValue::Text("Grace".to_string()))),
+            })
+        );
+        assert_eq!(
+            parse_command("ALTER TABLE ONLY public.default_people ALTER COLUMN id SET DEFAULT nextval('public.default_people_id_seq'::regclass)").unwrap(),
+            Command::AlterColumnDefault(AlterColumnDefault {
+                table: "default_people".to_string(),
+                column: "id".to_string(),
+                default: Some(ColumnDefault::SequenceNextVal {
+                    sequence: "default_people_id_seq".to_string(),
+                    create_if_missing: false,
+                }),
             })
         );
         assert_eq!(
@@ -10672,7 +10799,7 @@ mod tests {
                 column: ColumnDef {
                     name: "tag".to_string(),
                     ty: SqlType::Text,
-                    default: Some(SqlValue::Text("new".to_string())),
+                    default: Some(ColumnDefault::Literal(SqlValue::Text("new".to_string()))),
                 },
             })
         );
@@ -10683,7 +10810,7 @@ mod tests {
                 column: ColumnDef {
                     name: "bucket".to_string(),
                     ty: SqlType::Int4,
-                    default: Some(SqlValue::Int4(4)),
+                    default: Some(ColumnDefault::Literal(SqlValue::Int4(4))),
                 },
             })
         );

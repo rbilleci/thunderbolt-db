@@ -6,9 +6,9 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 
 use gpu_db_protocol::{
-    parse_command, parse_frontend_message, parse_startup_packet, Command, CommentTarget,
-    FrontendMessage, ParseError, SelectFilterOp, SelectProjection, SqlValue, StartupPacket,
-    SUPPORTED_SQL_TYPES,
+    parse_command, parse_frontend_message, parse_startup_packet, ColumnDefault, Command,
+    CommentTarget, FrontendMessage, ParseError, SelectFilterOp, SelectProjection, SqlValue,
+    StartupPacket, SUPPORTED_SQL_TYPES,
 };
 use gpu_db_protocol::{DescribeTarget, SqlType};
 
@@ -77,6 +77,13 @@ fn sql_value_matches_type(value: &SqlValue, ty: gpu_db_protocol::SqlType) -> boo
         (SqlValue::Int4(_), gpu_db_protocol::SqlType::Int4)
             | (SqlValue::Text(_), gpu_db_protocol::SqlType::Text)
     )
+}
+
+fn column_default_matches_type(value: &ColumnDefault, ty: gpu_db_protocol::SqlType) -> bool {
+    match value {
+        ColumnDefault::Literal(value) => sql_value_matches_type(value, ty),
+        ColumnDefault::SequenceNextVal { .. } => ty == gpu_db_protocol::SqlType::Int4,
+    }
 }
 
 fn compare_sql_values(left: &SqlValue, right: &SqlValue) -> std::cmp::Ordering {
@@ -2025,6 +2032,15 @@ fn format_default_expr(value: &SqlValue) -> String {
     }
 }
 
+fn format_column_default_expr(value: &ColumnDefault) -> String {
+    match value {
+        ColumnDefault::Literal(value) => format_default_expr(value),
+        ColumnDefault::SequenceNextVal { sequence, .. } => {
+            format!("nextval('{}'::regclass)", sequence.replace('\'', "''"))
+        }
+    }
+}
+
 fn sql_type_oid_text(ty: gpu_db_protocol::SqlType) -> String {
     ty.postgres_oid().to_string()
 }
@@ -2331,6 +2347,96 @@ fn next_sequence_value(sequence: &mut Sequence) -> Result<i64, ErrorField> {
     sequence.last_value = value;
     sequence.is_called = true;
     Ok(value)
+}
+
+fn create_implicit_sequence(session: &mut Session, name: &str) -> Result<(), ErrorField> {
+    if session.tables.contains_key(name)
+        || session.views.contains_key(name)
+        || session.materialized_views.contains_key(name)
+        || session.sequences.contains_key(name)
+    {
+        return Err(ErrorField {
+            code: "42P07",
+            message: "relation already exists",
+            position: None,
+        });
+    }
+    let oid = session.next_relation_oid;
+    session.next_relation_oid = session.next_relation_oid.checked_add(1).ok_or(ErrorField {
+        code: "54000",
+        message: "relation OID allocation exhausted",
+        position: None,
+    })?;
+    session.sequences.insert(
+        name.to_string(),
+        Sequence {
+            oid,
+            name: name.to_string(),
+            last_value: 1,
+            is_called: false,
+        },
+    );
+    session.mark_sequence_dirty(name.to_string());
+    Ok(())
+}
+
+fn preflight_column_default_target(
+    session: &Session,
+    default: &ColumnDefault,
+) -> Option<ErrorField> {
+    match default {
+        ColumnDefault::Literal(_) => None,
+        ColumnDefault::SequenceNextVal {
+            sequence,
+            create_if_missing: true,
+        } => {
+            if session.tables.contains_key(sequence)
+                || session.views.contains_key(sequence)
+                || session.materialized_views.contains_key(sequence)
+                || session.sequences.contains_key(sequence)
+            {
+                Some(ErrorField {
+                    code: "42P07",
+                    message: "relation already exists",
+                    position: None,
+                })
+            } else {
+                None
+            }
+        }
+        ColumnDefault::SequenceNextVal {
+            sequence,
+            create_if_missing: false,
+        } => sequence_target_error(session, sequence),
+    }
+}
+
+fn evaluate_column_default(
+    session: &mut Session,
+    default: &ColumnDefault,
+) -> Result<SqlValue, ErrorField> {
+    match default {
+        ColumnDefault::Literal(value) => Ok(value.clone()),
+        ColumnDefault::SequenceNextVal { sequence, .. } => {
+            if let Some(error) = sequence_target_error(session, sequence) {
+                return Err(error);
+            }
+            let sequence_state = session
+                .sequences
+                .get_mut(sequence)
+                .expect("sequence target checked");
+            let value = next_sequence_value(sequence_state)?;
+            session.currval_sequences.insert(sequence.clone(), value);
+            session.mark_sequence_dirty(sequence.clone());
+            i32::try_from(value)
+                .map(SqlValue::Int4)
+                .map_err(|_| ErrorField {
+                    code: "22003",
+                    message: "sequence value is out of range for int4 default",
+                    position: None,
+                })
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -5794,7 +5900,7 @@ fn apply_copy_in_rows(session: &mut Session, copy: CopyInState) -> Option<ErrorF
         });
     }
     let catalog_indexes = session.indexes.clone();
-    let table = session.tables.get_mut(&copy.table)?;
+    let table = session.tables.get(&copy.table)?.clone();
     let mut indexes = Vec::with_capacity(copy.columns.len());
     for column in &copy.columns {
         indexes.push(
@@ -5812,7 +5918,12 @@ fn apply_copy_in_rows(session: &mut Session, copy: CopyInState) -> Option<ErrorF
         }
         for (idx, value) in projected.iter_mut().enumerate() {
             if value.is_none() {
-                *value = table.columns[idx].def.default.clone();
+                if let Some(default) = table.columns[idx].def.default.clone() {
+                    match evaluate_column_default(session, &default) {
+                        Ok(default_value) => *value = Some(default_value),
+                        Err(error) => return Some(error),
+                    }
+                }
             }
         }
         if projected.iter().any(Option::is_none) {
@@ -5829,7 +5940,7 @@ fn apply_copy_in_rows(session: &mut Session, copy: CopyInState) -> Option<ErrorF
     if let Err(error) = validate_unique_indexes(&candidate_table, &catalog_indexes) {
         return Some(error);
     }
-    table.rows.extend(new_rows);
+    session.tables.get_mut(&copy.table)?.rows.extend(new_rows);
     session.mark_table_dirty(copy.table);
     session.persist_catalog_snapshot();
     None
@@ -6746,20 +6857,6 @@ fn execute_statement(
                         },
                     );
                 }
-                let oid = session.next_relation_oid;
-                session.next_relation_oid = match session.next_relation_oid.checked_add(1) {
-                    Some(next) => next,
-                    None => {
-                        return write_error(
-                            stream,
-                            &ErrorField {
-                                code: "54000",
-                                message: "relation OID allocation exhausted",
-                                position: None,
-                            },
-                        );
-                    }
-                };
                 let mut columns = Vec::with_capacity(create.columns.len());
                 for (idx, def) in create.columns.into_iter().enumerate() {
                     let Ok(attnum) = i16::try_from(idx + 1) else {
@@ -6777,6 +6874,42 @@ fn execute_statement(
                 let primary_key = create.primary_key.clone();
                 let name = create.table;
                 let table_name = name.clone();
+                for column in &columns {
+                    if let Some(default) = column.def.default.as_ref() {
+                        if let Some(error) = preflight_column_default_target(session, default) {
+                            return write_error(stream, &error);
+                        }
+                    }
+                }
+                let oid = session.next_relation_oid;
+                session.next_relation_oid = match session.next_relation_oid.checked_add(1) {
+                    Some(next) => next,
+                    None => {
+                        return write_error(
+                            stream,
+                            &ErrorField {
+                                code: "54000",
+                                message: "relation OID allocation exhausted",
+                                position: None,
+                            },
+                        );
+                    }
+                };
+                let implicit_sequences = columns
+                    .iter()
+                    .filter_map(|column| match &column.def.default {
+                        Some(ColumnDefault::SequenceNextVal {
+                            sequence,
+                            create_if_missing: true,
+                        }) => Some(sequence.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                for sequence in &implicit_sequences {
+                    if let Err(error) = create_implicit_sequence(session, sequence) {
+                        return write_error(stream, &error);
+                    }
+                }
                 session.tables.insert(
                     table_name.clone(),
                     Table {
@@ -6798,6 +6931,10 @@ fn execute_statement(
                     ) {
                         session.tables.remove(&table_name);
                         session.indexes.retain(|index| index.table != table_name);
+                        for sequence in &implicit_sequences {
+                            session.sequences.remove(sequence);
+                            session.mark_sequence_dirty(sequence.clone());
+                        }
                         return write_error(stream, &error);
                     }
                 }
@@ -6813,6 +6950,10 @@ fn execute_statement(
                     ) {
                         session.tables.remove(&table_name);
                         session.indexes.retain(|index| index.table != table_name);
+                        for sequence in &implicit_sequences {
+                            session.sequences.remove(sequence);
+                            session.mark_sequence_dirty(sequence.clone());
+                        }
                         return write_error(stream, &error);
                     }
                 }
@@ -7745,7 +7886,7 @@ fn execute_statement(
                         },
                     );
                 }
-                let Some(table) = session.tables.get_mut(&alter.table) else {
+                let Some(table) = session.tables.get(&alter.table) else {
                     return write_error(
                         stream,
                         &ErrorField {
@@ -7757,7 +7898,7 @@ fn execute_statement(
                 };
                 let Some(column) = table
                     .columns
-                    .iter_mut()
+                    .iter()
                     .find(|column| column.def.name == alter.column)
                 else {
                     return write_error(
@@ -7769,13 +7910,22 @@ fn execute_statement(
                         },
                     );
                 };
-                let Some(default) = alter.default else {
-                    column.def.default = None;
+                let Some(default) = alter.default.clone() else {
+                    session
+                        .tables
+                        .get_mut(&alter.table)
+                        .expect("table existence checked")
+                        .columns
+                        .iter_mut()
+                        .find(|column| column.def.name == alter.column)
+                        .expect("column existence checked")
+                        .def
+                        .default = None;
                     session.mark_table_dirty(alter.table);
                     session.persist_catalog_snapshot();
                     return write_command_complete(stream, "ALTER TABLE");
                 };
-                if !sql_value_matches_type(&default, column.def.ty) {
+                if !column_default_matches_type(&default, column.def.ty) {
                     return write_error(
                         stream,
                         &ErrorField {
@@ -7785,7 +7935,19 @@ fn execute_statement(
                         },
                     );
                 }
-                column.def.default = Some(default);
+                if let Some(error) = preflight_column_default_target(session, &default) {
+                    return write_error(stream, &error);
+                }
+                session
+                    .tables
+                    .get_mut(&alter.table)
+                    .expect("table existence checked")
+                    .columns
+                    .iter_mut()
+                    .find(|column| column.def.name == alter.column)
+                    .expect("column existence checked")
+                    .def
+                    .default = Some(default);
                 session.mark_table_dirty(alter.table);
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, "ALTER TABLE");
@@ -7814,7 +7976,17 @@ fn execute_statement(
                         },
                     );
                 };
-                if !sql_value_matches_type(&default, add.column.ty) {
+                let ColumnDefault::Literal(default_value) = default.clone() else {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "0A000",
+                            message: "ADD COLUMN requires a literal DEFAULT",
+                            position: None,
+                        },
+                    );
+                };
+                if !sql_value_matches_type(&default_value, add.column.ty) {
                     return write_error(
                         stream,
                         &ErrorField {
@@ -7866,7 +8038,7 @@ fn execute_statement(
                     def: add.column,
                 });
                 for row in &mut table.rows {
-                    row.push(default.clone());
+                    row.push(default_value.clone());
                 }
                 session.mark_table_dirty(add.table);
                 session.persist_catalog_snapshot();
@@ -8135,7 +8307,7 @@ fn execute_statement(
             Command::Insert(insert) => {
                 let table_name = insert.table;
                 let catalog_indexes = session.indexes.clone();
-                let Some(table) = session.tables.get_mut(&table_name) else {
+                let Some(table) = session.tables.get(&table_name).cloned() else {
                     return write_error(
                         stream,
                         &ErrorField {
@@ -8200,7 +8372,12 @@ fn execute_statement(
                     }
                     for (idx, value) in projected.iter_mut().enumerate() {
                         if value.is_none() {
-                            *value = table.columns[idx].def.default.clone();
+                            if let Some(default) = table.columns[idx].def.default.clone() {
+                                match evaluate_column_default(session, &default) {
+                                    Ok(default_value) => *value = Some(default_value),
+                                    Err(error) => return write_error(stream, &error),
+                                }
+                            }
                         }
                     }
                     if projected.iter().any(Option::is_none) {
@@ -8220,7 +8397,12 @@ fn execute_statement(
                 if let Err(error) = validate_unique_indexes(&candidate_table, &catalog_indexes) {
                     return write_error(stream, &error);
                 }
-                table.rows.extend(new_rows);
+                session
+                    .tables
+                    .get_mut(&table_name)
+                    .expect("table existence checked")
+                    .rows
+                    .extend(new_rows);
                 session.mark_table_dirty(table_name);
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, &format!("INSERT 0 {inserted_count}"));
@@ -11247,7 +11429,7 @@ fn pg_dump_attrdef_metadata_rows(
                         Some((30_000_u32 + table.oid + column.attnum as u32).to_string()),
                         Some(table.oid.to_string()),
                         Some(column.attnum.to_string()),
-                        Some(format_default_expr(default)),
+                        Some(format_column_default_expr(default)),
                     ]
                 })
             })
@@ -12081,7 +12263,7 @@ fn catalog_describe_verbose_attribute_rows(
             vec![
                 Some(column.def.name.clone()),
                 Some(sql_type_display_name(column.def.ty).to_string()),
-                column.def.default.as_ref().map(format_default_expr),
+                column.def.default.as_ref().map(format_column_default_expr),
                 Some("f".to_string()),
                 None,
                 Some(String::new()),
@@ -12112,7 +12294,7 @@ fn catalog_describe_attribute_rows(session: &Session, oid: u32) -> Vec<Vec<Optio
             vec![
                 Some(column.def.name.clone()),
                 Some(sql_type_display_name(column.def.ty).to_string()),
-                column.def.default.as_ref().map(format_default_expr),
+                column.def.default.as_ref().map(format_column_default_expr),
                 Some("f".to_string()),
                 None,
                 Some(String::new()),
@@ -12712,7 +12894,7 @@ fn information_schema_column_detail_rows(
                 Some(column.def.name.clone()),
                 Some(sql_type_display_name(column.def.ty).to_string()),
                 Some("YES".to_string()),
-                column.def.default.as_ref().map(format_default_expr),
+                column.def.default.as_ref().map(format_column_default_expr),
             ]
         })
         .collect()
@@ -12734,7 +12916,7 @@ fn information_schema_rich_column_rows(session: &Session) -> Vec<Vec<Option<Stri
                     Some(table.name.clone()),
                     Some(column.def.name.clone()),
                     Some(column.attnum.to_string()),
-                    column.def.default.as_ref().map(format_default_expr),
+                    column.def.default.as_ref().map(format_column_default_expr),
                     Some("YES".to_string()),
                     Some(sql_type_display_name(column.def.ty).to_string()),
                     Some("pg_catalog".to_string()),
@@ -12840,7 +13022,7 @@ fn information_schema_extended_column_rows_for_catalog_table(
             Some(table.name.clone()),
             Some(column.def.name.clone()),
             Some(column.attnum.to_string()),
-            column.def.default.as_ref().map(format_default_expr),
+            column.def.default.as_ref().map(format_column_default_expr),
             Some("YES".to_string()),
             Some(sql_type_display_name(column.def.ty).to_string()),
             None,
@@ -13119,7 +13301,7 @@ fn pg_catalog_attrdef_rows(session: &Session) -> Vec<Vec<Option<String>>> {
                         Some("public".to_string()),
                         Some(table.name.clone()),
                         Some(column.def.name.clone()),
-                        Some(format_default_expr(default)),
+                        Some(format_column_default_expr(default)),
                     ]
                 })
             })
@@ -23991,7 +24173,7 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "id".to_string(),
                             ty: SqlType::Int4,
-                            default: Some(SqlValue::Int4(7)),
+                            default: Some(ColumnDefault::Literal(SqlValue::Int4(7))),
                         },
                     },
                     CatalogColumn {
@@ -23999,7 +24181,9 @@ mod tests {
                         def: gpu_db_protocol::ColumnDef {
                             name: "name".to_string(),
                             ty: SqlType::Text,
-                            default: Some(SqlValue::Text("Ada's".to_string())),
+                            default: Some(ColumnDefault::Literal(SqlValue::Text(
+                                "Ada's".to_string(),
+                            ))),
                         },
                     },
                 ],
