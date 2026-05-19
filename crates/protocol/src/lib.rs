@@ -282,6 +282,15 @@ pub struct DropSubscription {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AclRelationKind {
+    Relation,
+    Table,
+    View,
+    MaterializedView,
+    Sequence,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TablePrivilege {
     Select,
     Insert,
@@ -291,14 +300,16 @@ pub enum TablePrivilege {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrantTable {
-    pub table: String,
+    pub relation: String,
+    pub kind: AclRelationKind,
     pub grantee: String,
     pub privileges: Vec<TablePrivilege>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RevokeTable {
-    pub table: String,
+    pub relation: String,
+    pub kind: AclRelationKind,
     pub grantee: String,
     pub privileges: Vec<TablePrivilege>,
 }
@@ -3788,8 +3799,10 @@ fn parse_grant_table(input: &str) -> Result<GrantTable, ParseError> {
     let grantee = strip_keyword_prefix_case_insensitive(grantee, "TO")
         .ok_or(ParseError::InvalidRelationalSql)?
         .trim();
+    let (relation, kind) = parse_acl_relation_target(target)?;
     Ok(GrantTable {
-        table: parse_acl_table_target(target)?,
+        relation,
+        kind,
         grantee: parse_acl_grantee(grantee)?,
         privileges: parse_table_privileges(privileges)?,
     })
@@ -3815,8 +3828,10 @@ fn parse_revoke_table(input: &str) -> Result<RevokeTable, ParseError> {
     let grantee = strip_keyword_prefix_case_insensitive(grantee, "FROM")
         .ok_or(ParseError::InvalidRelationalSql)?
         .trim();
+    let (relation, kind) = parse_acl_relation_target(target)?;
     Ok(RevokeTable {
-        table: parse_acl_table_target(target)?,
+        relation,
+        kind,
         grantee: parse_acl_grantee(grantee)?,
         privileges: parse_table_privileges(privileges)?,
     })
@@ -3931,8 +3946,25 @@ fn split_leading_identifier(input: &str) -> Result<(&str, &str), ParseError> {
     Ok((&trimmed[..end], &trimmed[end..]))
 }
 
-fn parse_acl_table_target(target: &str) -> Result<String, ParseError> {
+fn parse_acl_relation_target(target: &str) -> Result<(String, AclRelationKind), ParseError> {
     let mut target = target.trim();
+    let mut kind = AclRelationKind::Relation;
+    if let Some(after_materialized) = strip_keyword_prefix_case_insensitive(target, "MATERIALIZED")
+    {
+        target = strip_keyword_prefix_case_insensitive(after_materialized.trim_start(), "VIEW")
+            .ok_or(ParseError::InvalidRelationalSql)?
+            .trim_start();
+        kind = AclRelationKind::MaterializedView;
+    } else if let Some(after_sequence) = strip_keyword_prefix_case_insensitive(target, "SEQUENCE") {
+        target = after_sequence.trim_start();
+        kind = AclRelationKind::Sequence;
+    } else if let Some(after_table) = strip_keyword_prefix_case_insensitive(target, "TABLE") {
+        target = after_table.trim_start();
+        kind = AclRelationKind::Table;
+    } else if let Some(after_view) = strip_keyword_prefix_case_insensitive(target, "VIEW") {
+        target = after_view.trim_start();
+        kind = AclRelationKind::View;
+    }
     if let Some(after_table) = strip_keyword_prefix_case_insensitive(target, "TABLE") {
         target = after_table.trim_start();
     }
@@ -3945,7 +3977,7 @@ fn parse_acl_table_target(target: &str) -> Result<String, ParseError> {
     {
         return Err(ParseError::InvalidRelationalSql);
     }
-    normalize_relation_identifier(target)
+    Ok((normalize_relation_identifier(target)?, kind))
 }
 
 fn parse_acl_grantee(grantee: &str) -> Result<String, ParseError> {
@@ -12093,7 +12125,8 @@ default: Some(ColumnDefault::SequenceNextVal {
         assert_eq!(
             parse_command("GRANT SELECT, INSERT ON TABLE public.people TO PUBLIC").unwrap(),
             Command::GrantTable(GrantTable {
-                table: "people".to_string(),
+                relation: "people".to_string(),
+                kind: AclRelationKind::Table,
                 grantee: "public".to_string(),
                 privileges: vec![TablePrivilege::Select, TablePrivilege::Insert],
             })
@@ -12101,7 +12134,8 @@ default: Some(ColumnDefault::SequenceNextVal {
         assert_eq!(
             parse_command("GRANT ALL PRIVILEGES ON people TO postgres").unwrap(),
             Command::GrantTable(GrantTable {
-                table: "people".to_string(),
+                relation: "people".to_string(),
+                kind: AclRelationKind::Relation,
                 grantee: "postgres".to_string(),
                 privileges: vec![
                     TablePrivilege::Select,
@@ -12114,9 +12148,37 @@ default: Some(ColumnDefault::SequenceNextVal {
         assert_eq!(
             parse_command("REVOKE UPDATE, DELETE ON TABLE people FROM PUBLIC").unwrap(),
             Command::RevokeTable(RevokeTable {
-                table: "people".to_string(),
+                relation: "people".to_string(),
+                kind: AclRelationKind::Table,
                 grantee: "public".to_string(),
                 privileges: vec![TablePrivilege::Update, TablePrivilege::Delete],
+            })
+        );
+        assert_eq!(
+            parse_command("GRANT SELECT ON VIEW public.people_view TO PUBLIC").unwrap(),
+            Command::GrantTable(GrantTable {
+                relation: "people_view".to_string(),
+                kind: AclRelationKind::View,
+                grantee: "public".to_string(),
+                privileges: vec![TablePrivilege::Select],
+            })
+        );
+        assert_eq!(
+            parse_command("REVOKE SELECT ON MATERIALIZED VIEW people_mv FROM PUBLIC").unwrap(),
+            Command::RevokeTable(RevokeTable {
+                relation: "people_mv".to_string(),
+                kind: AclRelationKind::MaterializedView,
+                grantee: "public".to_string(),
+                privileges: vec![TablePrivilege::Select],
+            })
+        );
+        assert_eq!(
+            parse_command("GRANT SELECT, UPDATE ON SEQUENCE people_id_seq TO postgres").unwrap(),
+            Command::GrantTable(GrantTable {
+                relation: "people_id_seq".to_string(),
+                kind: AclRelationKind::Sequence,
+                grantee: "postgres".to_string(),
+                privileges: vec![TablePrivilege::Select, TablePrivilege::Update],
             })
         );
         assert!(matches!(

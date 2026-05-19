@@ -5,14 +5,14 @@ CREATE SEQUENCE public.acl_people_seq;
 GRANT SELECT, INSERT ON TABLE public.acl_people TO PUBLIC;
 \dp acl_people
 GRANT ALL PRIVILEGES ON acl_people TO postgres;
-\z public.acl_*
+\z public.acl_people
 REVOKE INSERT ON TABLE acl_people FROM PUBLIC;
 \dp acl_people
 REVOKE ALL PRIVILEGES ON acl_people FROM postgres;
-\z public.acl_*
+\z public.acl_people
 GRANT SELECT ON TABLE missing_acl_people TO PUBLIC;
-GRANT SELECT ON acl_people_view TO PUBLIC;
-GRANT SELECT ON acl_people_seq TO PUBLIC;
+GRANT SELECT ON TABLE acl_people_view TO PUBLIC;
+GRANT SELECT ON TABLE acl_people_seq TO PUBLIC;
 GRANT UPDATE (name) ON acl_people TO PUBLIC;
 GRANT SELECT ON private.acl_people TO PUBLIC;
 GRANT SELECT ON acl_people TO missing_role;

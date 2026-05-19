@@ -1,0 +1,67 @@
+=== bounded relation ACL metadata ===
+CREATE TABLE
+INSERT 0 2
+CREATE VIEW
+SELECT 0
+CREATE SEQUENCE
+GRANT
+GRANT
+GRANT
+                                         Access privileges
+ Schema |      Name      |       Type        |  Access privileges   | Column privileges | Policies
+--------+----------------+-------------------+----------------------+-------------------+----------
+ public | rel_acl_mv     | materialized view | =r/postgres          |                   |
+ public | rel_acl_people | table             |                      |                   |
+ public | rel_acl_seq    | sequence          | postgres=rw/postgres |                   |
+ public | rel_acl_view   | view              | =r/postgres          |                   |
+(4 rows)
+
+                                         Access privileges
+ Schema |      Name      |       Type        |  Access privileges   | Column privileges | Policies
+--------+----------------+-------------------+----------------------+-------------------+----------
+ public | rel_acl_mv     | materialized view | =r/postgres          |                   |
+ public | rel_acl_people | table             |                      |                   |
+ public | rel_acl_seq    | sequence          | postgres=rw/postgres |                   |
+ public | rel_acl_view   | view              | =r/postgres          |                   |
+(4 rows)
+
+ALTER VIEW
+ALTER MATERIALIZED VIEW
+ALTER SEQUENCE
+                                            Access privileges
+ Schema |         Name         |       Type        |  Access privileges   | Column privileges | Policies
+--------+----------------------+-------------------+----------------------+-------------------+----------
+ public | rel_acl_mv_renamed   | materialized view | =r/postgres          |                   |
+ public | rel_acl_people       | table             |                      |                   |
+ public | rel_acl_seq_renamed  | sequence          | postgres=rw/postgres |                   |
+ public | rel_acl_view_renamed | view              | =r/postgres          |                   |
+(4 rows)
+
+REVOKE
+REVOKE
+                                           Access privileges
+ Schema |         Name         |       Type        |  Access privileges  | Column privileges | Policies
+--------+----------------------+-------------------+---------------------+-------------------+----------
+ public | rel_acl_mv_renamed   | materialized view | =r/postgres         |                   |
+ public | rel_acl_people       | table             |                     |                   |
+ public | rel_acl_seq_renamed  | sequence          | postgres=r/postgres |                   |
+ public | rel_acl_view_renamed | view              |                     |                   |
+(4 rows)
+
+DROP VIEW
+DROP MATERIALIZED VIEW
+DROP SEQUENCE
+                                 Access privileges
+ Schema |      Name      | Type  | Access privileges | Column privileges | Policies
+--------+----------------+-------+-------------------+-------------------+----------
+ public | rel_acl_people | table |                   |                   |
+(1 row)
+
+psql:341_protocol_psql_relation_acls.sql:23: ERROR:  relation is not a view
+psql:341_protocol_psql_relation_acls.sql:24: ERROR:  relation is not a materialized view
+psql:341_protocol_psql_relation_acls.sql:25: ERROR:  relation is not a sequence
+psql:341_protocol_psql_relation_acls.sql:26: ERROR:  relation does not exist
+ name
+-------
+ grace
+(1 row)

@@ -6,9 +6,9 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 
 use gpu_db_protocol::{
-    parse_command, parse_frontend_message, parse_startup_packet, ColumnDefault, Command,
-    CommentTarget, FrontendMessage, ParseError, PublicationTarget, SelectFilter, SelectFilterOp,
-    SelectProjection, SqlValue, StartupPacket, TablePrivilege, SUPPORTED_SQL_TYPES,
+    parse_command, parse_frontend_message, parse_startup_packet, AclRelationKind, ColumnDefault,
+    Command, CommentTarget, FrontendMessage, ParseError, PublicationTarget, SelectFilter,
+    SelectFilterOp, SelectProjection, SqlValue, StartupPacket, TablePrivilege, SUPPORTED_SQL_TYPES,
 };
 use gpu_db_protocol::{DescribeTarget, SqlType};
 
@@ -2009,6 +2009,11 @@ fn rename_sequence_in_session(
             .currval_sequences
             .insert(new_name.to_string(), value);
     }
+    if let Some(acl) = session.table_acls.remove(old_name) {
+        session.table_acls.insert(new_name.to_string(), acl);
+        session.mark_table_acl_dirty(old_name.to_string());
+        session.mark_table_acl_dirty(new_name.to_string());
+    }
     session.mark_sequence_dirty(old_name.to_string());
     session.mark_sequence_dirty(new_name.to_string());
 
@@ -2896,59 +2901,86 @@ fn add_column_default_supported(default: &ColumnDefault) -> bool {
     }
 }
 
-fn table_acl_target_error(session: &Session, table: &str) -> Option<ErrorField> {
-    if session.views.contains_key(table)
-        || session.materialized_views.contains_key(table)
-        || session.sequences.contains_key(table)
-    {
-        return Some(ErrorField {
-            code: "42809",
-            message: "relation is not a table",
-            position: None,
-        });
+fn acl_relation_kind(session: &Session, relation: &str) -> Option<AclRelationKind> {
+    if session.tables.contains_key(relation) {
+        Some(AclRelationKind::Table)
+    } else if session.views.contains_key(relation) {
+        Some(AclRelationKind::View)
+    } else if session.materialized_views.contains_key(relation) {
+        Some(AclRelationKind::MaterializedView)
+    } else if session.sequences.contains_key(relation) {
+        Some(AclRelationKind::Sequence)
+    } else {
+        None
     }
-    if !session.tables.contains_key(table) {
+}
+
+fn relation_acl_target_error(
+    session: &Session,
+    relation: &str,
+    kind: AclRelationKind,
+) -> Option<ErrorField> {
+    let Some(actual) = acl_relation_kind(session, relation) else {
         return Some(ErrorField {
             code: "42P01",
             message: "relation does not exist",
+            position: None,
+        });
+    };
+    if kind != AclRelationKind::Relation && kind != actual {
+        return Some(ErrorField {
+            code: "42809",
+            message: acl_relation_kind_error(kind),
             position: None,
         });
     }
     None
 }
 
-fn grant_table_acl(
+fn acl_relation_kind_error(kind: AclRelationKind) -> &'static str {
+    match kind {
+        AclRelationKind::Relation => "relation does not exist",
+        AclRelationKind::Table => "relation is not a table",
+        AclRelationKind::View => "relation is not a view",
+        AclRelationKind::MaterializedView => "relation is not a materialized view",
+        AclRelationKind::Sequence => "relation is not a sequence",
+    }
+}
+
+fn grant_relation_acl(
     session: &mut Session,
-    table: &str,
+    relation: &str,
+    kind: AclRelationKind,
     grantee: &str,
     privileges: &[TablePrivilege],
 ) -> Result<(), ErrorField> {
-    if let Some(error) = table_acl_target_error(session, table) {
+    if let Some(error) = relation_acl_target_error(session, relation, kind) {
         return Err(error);
     }
     let grantee_acl = session
         .table_acls
-        .entry(table.to_string())
+        .entry(relation.to_string())
         .or_default()
         .entry(grantee.to_string())
         .or_default();
     for privilege in privileges {
         grantee_acl.insert(*privilege);
     }
-    session.mark_table_acl_dirty(table.to_string());
+    session.mark_table_acl_dirty(relation.to_string());
     Ok(())
 }
 
-fn revoke_table_acl(
+fn revoke_relation_acl(
     session: &mut Session,
-    table: &str,
+    relation: &str,
+    kind: AclRelationKind,
     grantee: &str,
     privileges: &[TablePrivilege],
 ) -> Result<(), ErrorField> {
-    if let Some(error) = table_acl_target_error(session, table) {
+    if let Some(error) = relation_acl_target_error(session, relation, kind) {
         return Err(error);
     }
-    let remove_table_acl = if let Some(acl) = session.table_acls.get_mut(table) {
+    let remove_table_acl = if let Some(acl) = session.table_acls.get_mut(relation) {
         if let Some(grantee_acl) = acl.get_mut(grantee) {
             for privilege in privileges {
                 grantee_acl.remove(privilege);
@@ -2962,9 +2994,9 @@ fn revoke_table_acl(
         false
     };
     if remove_table_acl {
-        session.table_acls.remove(table);
+        session.table_acls.remove(relation);
     }
-    session.mark_table_acl_dirty(table.to_string());
+    session.mark_table_acl_dirty(relation.to_string());
     Ok(())
 }
 
@@ -8620,6 +8652,11 @@ fn execute_statement(
                 session.views.insert(rename.new_name.clone(), view);
                 session.mark_view_dirty(rename.old_name.clone());
                 session.mark_view_dirty(rename.new_name.clone());
+                if let Some(acl) = session.table_acls.remove(&rename.old_name) {
+                    session.table_acls.insert(rename.new_name.clone(), acl);
+                    session.mark_table_acl_dirty(rename.old_name.clone());
+                    session.mark_table_acl_dirty(rename.new_name.clone());
+                }
                 let old_target = CatalogCommentTarget::View {
                     view: rename.old_name,
                 };
@@ -8682,6 +8719,11 @@ fn execute_statement(
                     .insert(rename.new_name.clone(), view);
                 session.mark_materialized_view_dirty(rename.old_name.clone());
                 session.mark_materialized_view_dirty(rename.new_name.clone());
+                if let Some(acl) = session.table_acls.remove(&rename.old_name) {
+                    session.table_acls.insert(rename.new_name.clone(), acl);
+                    session.mark_table_acl_dirty(rename.old_name.clone());
+                    session.mark_table_acl_dirty(rename.new_name.clone());
+                }
                 let old_target = CatalogCommentTarget::MaterializedView {
                     materialized_view: rename.old_name,
                 };
@@ -8926,6 +8968,8 @@ fn execute_statement(
                 }
                 for name in &drop.names {
                     if session.views.remove(name).is_some() {
+                        session.table_acls.remove(name);
+                        session.mark_table_acl_dirty(name.clone());
                         let target = CatalogCommentTarget::View { view: name.clone() };
                         session.comments.remove(&target);
                         session.mark_comment_dirty(target);
@@ -8974,6 +9018,8 @@ fn execute_statement(
                 }
                 for name in &drop.names {
                     if session.materialized_views.remove(name).is_some() {
+                        session.table_acls.remove(name);
+                        session.mark_table_acl_dirty(name.clone());
                         let target = CatalogCommentTarget::MaterializedView {
                             materialized_view: name.clone(),
                         };
@@ -9024,6 +9070,8 @@ fn execute_statement(
                 }
                 for name in &drop.names {
                     if session.sequences.remove(name).is_some() {
+                        session.table_acls.remove(name);
+                        session.mark_table_acl_dirty(name.clone());
                         let target = CatalogCommentTarget::Sequence {
                             sequence: name.clone(),
                         };
@@ -9752,18 +9800,26 @@ fn execute_statement(
                 return write_command_complete(stream, "COMMENT");
             }
             Command::GrantTable(grant) => {
-                if let Err(error) =
-                    grant_table_acl(session, &grant.table, &grant.grantee, &grant.privileges)
-                {
+                if let Err(error) = grant_relation_acl(
+                    session,
+                    &grant.relation,
+                    grant.kind,
+                    &grant.grantee,
+                    &grant.privileges,
+                ) {
                     return write_error(stream, &error);
                 }
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, "GRANT");
             }
             Command::RevokeTable(revoke) => {
-                if let Err(error) =
-                    revoke_table_acl(session, &revoke.table, &revoke.grantee, &revoke.privileges)
-                {
+                if let Err(error) = revoke_relation_acl(
+                    session,
+                    &revoke.relation,
+                    revoke.kind,
+                    &revoke.grantee,
+                    &revoke.privileges,
+                ) {
                     return write_error(stream, &error);
                 }
                 session.persist_catalog_snapshot();
@@ -12432,31 +12488,47 @@ fn catalog_psql_describe_table_privilege_rows_filtered(
     if filter.namespace != "public" {
         return Vec::new();
     }
-    let mut tables = session.tables.values().collect::<Vec<_>>();
-    tables.sort_by(|left, right| left.name.cmp(&right.name));
-    tables
-        .into_iter()
-        .filter(|table| {
-            filter
-                .relname_pattern
-                .as_deref()
-                .is_none_or(|pattern| psql_relname_pattern_matches(pattern, &table.name))
-        })
-        .map(|table| {
-            vec![
-                Some("public".to_string()),
-                Some(table.name.clone()),
-                Some("table".to_string()),
-                table_acl_display(session, &table.name),
-                None,
-                None,
-            ]
-        })
-        .collect()
+    let mut rows = Vec::new();
+    for (name, kind) in session
+        .tables
+        .keys()
+        .map(|name| (name.as_str(), "table"))
+        .chain(session.views.keys().map(|name| (name.as_str(), "view")))
+        .chain(
+            session
+                .materialized_views
+                .keys()
+                .map(|name| (name.as_str(), "materialized view")),
+        )
+        .chain(
+            session
+                .sequences
+                .keys()
+                .map(|name| (name.as_str(), "sequence")),
+        )
+    {
+        if filter
+            .relname_pattern
+            .as_deref()
+            .is_some_and(|pattern| !psql_relname_pattern_matches(pattern, name))
+        {
+            continue;
+        }
+        rows.push(vec![
+            Some("public".to_string()),
+            Some(name.to_string()),
+            Some(kind.to_string()),
+            relation_acl_display(session, name),
+            None,
+            None,
+        ]);
+    }
+    rows.sort_by(|left, right| left[1].cmp(&right[1]).then_with(|| left[2].cmp(&right[2])));
+    rows
 }
 
-fn table_acl_display(session: &Session, table: &str) -> Option<String> {
-    let acl = session.table_acls.get(table)?;
+fn relation_acl_display(session: &Session, relation: &str) -> Option<String> {
+    let acl = session.table_acls.get(relation)?;
     acl_display(acl)
 }
 
@@ -18142,7 +18214,7 @@ mod tests {
 
         let final_session = Session::new(true);
         assert_eq!(
-            table_acl_display(&final_session, table_name),
+            relation_acl_display(&final_session, table_name),
             Some("=r/postgres".to_string())
         );
         assert_eq!(
@@ -18161,6 +18233,117 @@ mod tests {
         catalog.tables.remove(table_name);
         catalog.table_acls.remove(table_name);
         catalog.default_table_acl.clear();
+    }
+
+    #[test]
+    fn relation_acl_rows_include_supported_views_materialized_views_and_sequences() {
+        let mut session = Session::default();
+        session.tables.insert(
+            "rel_acl_people".to_string(),
+            test_table("rel_acl_people", Vec::new()),
+        );
+        let query = match parse_command("SELECT * FROM rel_acl_people").unwrap() {
+            Command::Select(select) => select,
+            other => panic!("expected select, got {other:?}"),
+        };
+        session.views.insert(
+            "rel_acl_view".to_string(),
+            View {
+                oid: FIRST_USER_RELATION_OID + 1,
+                name: "rel_acl_view".to_string(),
+                query: query.clone(),
+                definition: "SELECT * FROM rel_acl_people".to_string(),
+            },
+        );
+        session.materialized_views.insert(
+            "rel_acl_mv".to_string(),
+            MaterializedView {
+                oid: FIRST_USER_RELATION_OID + 2,
+                name: "rel_acl_mv".to_string(),
+                query,
+                definition: "SELECT * FROM rel_acl_people".to_string(),
+                columns: Vec::new(),
+                rows: Vec::new(),
+            },
+        );
+        session.sequences.insert(
+            "rel_acl_seq".to_string(),
+            Sequence {
+                oid: FIRST_USER_RELATION_OID + 3,
+                name: "rel_acl_seq".to_string(),
+                last_value: 1,
+                is_called: false,
+            },
+        );
+        grant_relation_acl(
+            &mut session,
+            "rel_acl_view",
+            AclRelationKind::View,
+            "public",
+            &[TablePrivilege::Select],
+        )
+        .unwrap();
+        grant_relation_acl(
+            &mut session,
+            "rel_acl_mv",
+            AclRelationKind::MaterializedView,
+            "public",
+            &[TablePrivilege::Select],
+        )
+        .unwrap();
+        grant_relation_acl(
+            &mut session,
+            "rel_acl_seq",
+            AclRelationKind::Sequence,
+            "postgres",
+            &[TablePrivilege::Select, TablePrivilege::Update],
+        )
+        .unwrap();
+
+        let rows = catalog_psql_describe_table_privilege_rows_filtered(
+            &session,
+            &PsqlDescribeTablesFilter {
+                namespace: "public".to_string(),
+                relname_pattern: None,
+            },
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![
+                    Some("public".to_string()),
+                    Some("rel_acl_mv".to_string()),
+                    Some("materialized view".to_string()),
+                    Some("=r/postgres".to_string()),
+                    None,
+                    None,
+                ],
+                vec![
+                    Some("public".to_string()),
+                    Some("rel_acl_people".to_string()),
+                    Some("table".to_string()),
+                    None,
+                    None,
+                    None,
+                ],
+                vec![
+                    Some("public".to_string()),
+                    Some("rel_acl_seq".to_string()),
+                    Some("sequence".to_string()),
+                    Some("postgres=rw/postgres".to_string()),
+                    None,
+                    None,
+                ],
+                vec![
+                    Some("public".to_string()),
+                    Some("rel_acl_view".to_string()),
+                    Some("view".to_string()),
+                    Some("=r/postgres".to_string()),
+                    None,
+                    None,
+                ],
+            ]
+        );
     }
 
     #[test]

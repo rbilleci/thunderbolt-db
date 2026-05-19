@@ -19,15 +19,15 @@ use gpu_db_observability::{
 };
 use gpu_db_planner::{ExecutionPlan, Planner, PlannerConfig};
 use gpu_db_protocol::{
-    parse_command, AddCheckConstraint, AddForeignKey, AddUniqueConstraint, ColumnDef,
-    ColumnDefault, Command, CommentTarget, CreateDomain, CreateIndex, CreateMaterializedView,
-    CreatePublication, CreateSchema, CreateSequence, CreateSubscription, CreateTable, CreateView,
-    Delete, DropConstraint, DropDomain, DropIndex, DropMaterializedView, DropPublication,
-    DropSchema, DropSequence, DropSubscription, DropTable, DropView, Insert, ParseError,
-    PublicationTarget, RefreshMaterializedView, RenameColumn, RenameConstraint, RenameIndex,
-    RenameMaterializedView, RenameSequence, RenameTable, RenameView, Select, SelectFilterOp,
-    SelectProjection, SequenceNextVal, SequenceSetVal, SqlType, SqlValue, TablePrivilege,
-    TruncateTable, Update,
+    parse_command, AclRelationKind, AddCheckConstraint, AddForeignKey, AddUniqueConstraint,
+    ColumnDef, ColumnDefault, Command, CommentTarget, CreateDomain, CreateIndex,
+    CreateMaterializedView, CreatePublication, CreateSchema, CreateSequence, CreateSubscription,
+    CreateTable, CreateView, Delete, DropConstraint, DropDomain, DropIndex, DropMaterializedView,
+    DropPublication, DropSchema, DropSequence, DropSubscription, DropTable, DropView, Insert,
+    ParseError, PublicationTarget, RefreshMaterializedView, RenameColumn, RenameConstraint,
+    RenameIndex, RenameMaterializedView, RenameSequence, RenameTable, RenameView, Select,
+    SelectFilterOp, SelectProjection, SequenceNextVal, SequenceSetVal, SqlType, SqlValue,
+    TablePrivilege, TruncateTable, Update,
 };
 use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine};
 use gpu_db_storage::{
@@ -6054,6 +6054,7 @@ pub struct RelationalView {
     pub oid: u32,
     pub query: Select,
     pub definition: String,
+    pub acl: BTreeMap<String, BTreeSet<TablePrivilege>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6065,6 +6066,7 @@ pub struct RelationalMaterializedView {
     pub definition: String,
     pub columns: Vec<RelationalColumn>,
     pub rows: Vec<Vec<SqlValue>>,
+    pub acl: BTreeMap<String, BTreeSet<TablePrivilege>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6074,6 +6076,7 @@ pub struct RelationalSequence {
     pub oid: u32,
     pub last_value: i64,
     pub is_called: bool,
+    pub acl: BTreeMap<String, BTreeSet<TablePrivilege>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6219,6 +6222,16 @@ fn resident_device_int4_column_offset(
             ))
         })?;
     Ok(offset)
+}
+
+fn acl_relation_kind_label(kind: AclRelationKind) -> &'static str {
+    match kind {
+        AclRelationKind::Relation => "relation",
+        AclRelationKind::Table => "table",
+        AclRelationKind::View => "view",
+        AclRelationKind::MaterializedView => "materialized view",
+        AclRelationKind::Sequence => "sequence",
+    }
 }
 
 fn resident_device_text_column_layout<'a>(
@@ -7708,12 +7721,18 @@ impl Engine {
             Command::DropPublication(drop) => self.apply_drop_publication(drop)?,
             Command::CreateSubscription(create) => self.apply_create_subscription(create)?,
             Command::DropSubscription(drop) => self.apply_drop_subscription(drop)?,
-            Command::GrantTable(grant) => {
-                self.apply_grant_table(&grant.table, &grant.grantee, &grant.privileges)?
-            }
-            Command::RevokeTable(revoke) => {
-                self.apply_revoke_table(&revoke.table, &revoke.grantee, &revoke.privileges)?
-            }
+            Command::GrantTable(grant) => self.apply_grant_acl(
+                &grant.relation,
+                grant.kind,
+                &grant.grantee,
+                &grant.privileges,
+            )?,
+            Command::RevokeTable(revoke) => self.apply_revoke_acl(
+                &revoke.relation,
+                revoke.kind,
+                &revoke.grantee,
+                &revoke.privileges,
+            )?,
             Command::GrantDefaultTablePrivileges(grant) => {
                 self.apply_grant_default_table_privileges(&grant.grantee, &grant.privileges)
             }
@@ -7769,15 +7788,15 @@ impl Engine {
                 create.query.table
             )));
         }
-        let oid = if let Some(existing) = self.relational_views.get(&create.name) {
-            existing.oid
+        let (oid, acl) = if let Some(existing) = self.relational_views.get(&create.name) {
+            (existing.oid, existing.acl.clone())
         } else {
             let oid = self.relational_next_oid;
             self.relational_next_oid =
                 self.relational_next_oid.checked_add(1).ok_or_else(|| {
                     EngineError::ApplyFailed("relational view OID allocation exhausted".to_string())
                 })?;
-            oid
+            (oid, BTreeMap::new())
         };
         self.relational_views.insert(
             create.name.clone(),
@@ -7787,6 +7806,7 @@ impl Engine {
                 oid,
                 query: create.query,
                 definition: create.definition,
+                acl,
             },
         );
         Ok(())
@@ -7877,6 +7897,7 @@ impl Engine {
                 definition: create.definition,
                 columns,
                 rows,
+                acl: BTreeMap::new(),
             },
         );
         Ok(())
@@ -7945,6 +7966,7 @@ impl Engine {
                 oid,
                 last_value: 1,
                 is_called: false,
+                acl: BTreeMap::new(),
             },
         );
         Ok(())
@@ -9706,41 +9728,90 @@ impl Engine {
         Ok(())
     }
 
-    fn apply_grant_table(
+    fn preflight_acl_target(
+        &self,
+        relation: &str,
+        kind: AclRelationKind,
+    ) -> Result<(), EngineError> {
+        let actual = self.acl_relation_kind(relation).ok_or_else(|| {
+            EngineError::ApplyFailed(format!("relation \"{relation}\" does not exist"))
+        })?;
+        if kind != AclRelationKind::Relation && kind != actual {
+            return Err(EngineError::ApplyFailed(format!(
+                "relation \"{relation}\" is not a {}",
+                acl_relation_kind_label(kind)
+            )));
+        }
+        Ok(())
+    }
+
+    fn acl_relation_kind(&self, relation: &str) -> Option<AclRelationKind> {
+        if self.relational_catalog.contains_key(relation) {
+            Some(AclRelationKind::Table)
+        } else if self.relational_views.contains_key(relation) {
+            Some(AclRelationKind::View)
+        } else if self.relational_materialized_views.contains_key(relation) {
+            Some(AclRelationKind::MaterializedView)
+        } else if self.relational_sequences.contains_key(relation) {
+            Some(AclRelationKind::Sequence)
+        } else {
+            None
+        }
+    }
+
+    fn relational_acl_mut(
         &mut self,
-        table: &str,
+        relation: &str,
+    ) -> Option<&mut BTreeMap<String, BTreeSet<TablePrivilege>>> {
+        if let Some(table) = self.relational_catalog.get_mut(relation) {
+            Some(&mut table.acl)
+        } else if let Some(view) = self.relational_views.get_mut(relation) {
+            Some(&mut view.acl)
+        } else if let Some(view) = self.relational_materialized_views.get_mut(relation) {
+            Some(&mut view.acl)
+        } else if let Some(sequence) = self.relational_sequences.get_mut(relation) {
+            Some(&mut sequence.acl)
+        } else {
+            None
+        }
+    }
+
+    fn apply_grant_acl(
+        &mut self,
+        relation: &str,
+        kind: AclRelationKind,
         grantee: &str,
         privileges: &[TablePrivilege],
     ) -> Result<(), EngineError> {
-        self.preflight_table_acl_target(table)?;
-        let table = self
-            .relational_catalog
-            .get_mut(table)
-            .expect("table ACL target preflighted");
-        let acl = table.acl.entry(grantee.to_string()).or_default();
+        self.preflight_acl_target(relation, kind)?;
+        let acl = self
+            .relational_acl_mut(relation)
+            .expect("relation ACL target preflighted")
+            .entry(grantee.to_string())
+            .or_default();
         for privilege in privileges {
             acl.insert(*privilege);
         }
         Ok(())
     }
 
-    fn apply_revoke_table(
+    fn apply_revoke_acl(
         &mut self,
-        table: &str,
+        relation: &str,
+        kind: AclRelationKind,
         grantee: &str,
         privileges: &[TablePrivilege],
     ) -> Result<(), EngineError> {
-        self.preflight_table_acl_target(table)?;
-        let table = self
-            .relational_catalog
-            .get_mut(table)
-            .expect("table ACL target preflighted");
-        if let Some(acl) = table.acl.get_mut(grantee) {
+        self.preflight_acl_target(relation, kind)?;
+        let relation_acl = self
+            .relational_acl_mut(relation)
+            .expect("relation ACL target preflighted");
+        if let Some(acl) = relation_acl.get_mut(grantee) {
             for privilege in privileges {
                 acl.remove(privilege);
             }
             if acl.is_empty() {
-                table.acl.remove(grantee);
+                relation_acl.remove(grantee);
             }
         }
         Ok(())
@@ -11530,8 +11601,10 @@ impl Engine {
             Command::DropMaterializedView(drop) => self.preflight_drop_materialized_view(drop)?,
             Command::DropSequence(drop) => self.preflight_drop_sequence(drop)?,
             Command::DropDomain(drop) => self.preflight_drop_domain(drop)?,
-            Command::GrantTable(grant) => self.preflight_table_acl_target(&grant.table)?,
-            Command::RevokeTable(revoke) => self.preflight_table_acl_target(&revoke.table)?,
+            Command::GrantTable(grant) => self.preflight_acl_target(&grant.relation, grant.kind)?,
+            Command::RevokeTable(revoke) => {
+                self.preflight_acl_target(&revoke.relation, revoke.kind)?
+            }
             Command::CreatePublication(create) => self.preflight_create_publication(create)?,
             Command::DropPublication(drop) => self.preflight_drop_publication(drop)?,
             Command::CreateSubscription(create) => self.preflight_create_subscription(create)?,
@@ -15331,6 +15404,26 @@ impl Engine {
         table: &str,
     ) -> Option<&BTreeMap<String, BTreeSet<TablePrivilege>>> {
         self.relational_catalog.get(table).map(|table| &table.acl)
+    }
+
+    pub fn relational_relation_acl(
+        &self,
+        relation: &str,
+    ) -> Option<&BTreeMap<String, BTreeSet<TablePrivilege>>> {
+        self.relational_catalog
+            .get(relation)
+            .map(|table| &table.acl)
+            .or_else(|| self.relational_views.get(relation).map(|view| &view.acl))
+            .or_else(|| {
+                self.relational_materialized_views
+                    .get(relation)
+                    .map(|view| &view.acl)
+            })
+            .or_else(|| {
+                self.relational_sequences
+                    .get(relation)
+                    .map(|sequence| &sequence.acl)
+            })
     }
 
     pub fn relational_default_table_acl(&self) -> &BTreeMap<String, BTreeSet<TablePrivilege>> {
@@ -37458,7 +37551,7 @@ mod tests {
     }
 
     #[test]
-    fn relational_catalog_records_table_acl_metadata_and_replays_from_wal() {
+    fn relational_catalog_records_relation_acl_metadata_and_replays_from_wal() {
         let mut e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
             .unwrap();
@@ -37504,20 +37597,79 @@ mod tests {
             "{missing}"
         );
 
-        let mut with_view = Engine::new_local();
-        with_view
-            .execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+        e.execute_text(7, "CREATE VIEW people_view AS SELECT * FROM people")
             .unwrap();
-        with_view
-            .execute_text(2, "CREATE VIEW public.people_view AS SELECT * FROM people")
+        e.execute_text(
+            8,
+            "CREATE MATERIALIZED VIEW people_mv AS SELECT * FROM people WITH DATA",
+        )
+        .unwrap();
+        e.execute_text(9, "CREATE SEQUENCE people_seq").unwrap();
+        e.execute_text(10, "GRANT SELECT ON VIEW people_view TO PUBLIC")
             .unwrap();
-        let view_grant = with_view
-            .execute_text(3, "GRANT SELECT ON people_view TO PUBLIC")
+        e.execute_text(11, "GRANT SELECT ON MATERIALIZED VIEW people_mv TO PUBLIC")
+            .unwrap();
+        e.execute_text(
+            12,
+            "GRANT SELECT, UPDATE ON SEQUENCE people_seq TO postgres",
+        )
+        .unwrap();
+
+        assert_eq!(
+            e.relational_relation_acl("people_view")
+                .unwrap()
+                .get("public")
+                .unwrap(),
+            &BTreeSet::from([TablePrivilege::Select])
+        );
+        assert_eq!(
+            e.relational_relation_acl("people_mv")
+                .unwrap()
+                .get("public")
+                .unwrap(),
+            &BTreeSet::from([TablePrivilege::Select])
+        );
+        assert_eq!(
+            e.relational_relation_acl("people_seq")
+                .unwrap()
+                .get("postgres")
+                .unwrap(),
+            &BTreeSet::from([TablePrivilege::Select, TablePrivilege::Update])
+        );
+
+        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        assert_eq!(
+            recovered
+                .relational_relation_acl("people_view")
+                .unwrap()
+                .get("public")
+                .unwrap(),
+            &BTreeSet::from([TablePrivilege::Select])
+        );
+        assert_eq!(
+            recovered
+                .relational_relation_acl("people_mv")
+                .unwrap()
+                .get("public")
+                .unwrap(),
+            &BTreeSet::from([TablePrivilege::Select])
+        );
+        assert_eq!(
+            recovered
+                .relational_relation_acl("people_seq")
+                .unwrap()
+                .get("postgres")
+                .unwrap(),
+            &BTreeSet::from([TablePrivilege::Select, TablePrivilege::Update])
+        );
+
+        let wrong_kind = e
+            .execute_text(13, "GRANT SELECT ON TABLE people_view TO PUBLIC")
             .unwrap_err()
             .to_string();
         assert!(
-            view_grant.contains("relation \"people_view\" is not a table"),
-            "{view_grant}"
+            wrong_kind.contains("relation \"people_view\" is not a table"),
+            "{wrong_kind}"
         );
     }
 
