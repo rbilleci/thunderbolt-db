@@ -8203,61 +8203,77 @@ impl Engine {
     }
 
     fn apply_drop_table(&mut self, drop: DropTable, txn_id: TxnId) -> Result<(), EngineError> {
-        if self.relational_views.contains_key(&drop.name) {
-            return Err(EngineError::ApplyFailed(format!(
-                "relation \"{}\" is not a table",
-                drop.name
-            )));
-        }
-        let Some(table) = self.relational_catalog.remove(&drop.name) else {
-            if drop.if_exists {
-                return Ok(());
-            }
-            return Err(EngineError::ApplyFailed(format!(
-                "relation \"{}\" does not exist",
-                drop.name
-            )));
-        };
+        self.preflight_drop_table(&drop)?;
 
-        let prefix = relational_key_prefix(&table.name);
-        let visibility = StorageVisibility {
-            read_txn_id: txn_id,
-        };
-        let mut tuple_ids = Vec::new();
-        let mut cursor = self
-            .mvcc_store
-            .seq_scan_open(visibility)
-            .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
-        while let Some(tuple) = cursor.next() {
-            if tuple.key.starts_with(&prefix) {
-                tuple_ids.push(tuple.tuple_id);
-            }
-        }
-        std::mem::drop(cursor);
-        for tuple_id in tuple_ids {
-            self.mvcc_store
-                .tuple_delete(tuple_id, txn_id)
+        for name in &drop.names {
+            let Some(table) = self.relational_catalog.remove(name) else {
+                continue;
+            };
+            let prefix = relational_key_prefix(&table.name);
+            let visibility = StorageVisibility {
+                read_txn_id: txn_id,
+            };
+            let mut tuple_ids = Vec::new();
+            let mut cursor = self
+                .mvcc_store
+                .seq_scan_open(visibility)
                 .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
-        }
+            while let Some(tuple) = cursor.next() {
+                if tuple.key.starts_with(&prefix) {
+                    tuple_ids.push(tuple.tuple_id);
+                }
+            }
+            std::mem::drop(cursor);
+            for tuple_id in tuple_ids {
+                self.mvcc_store
+                    .tuple_delete(tuple_id, txn_id)
+                    .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+            }
 
-        let index_names = table
-            .indexes
-            .iter()
-            .map(|index| index.name.clone())
-            .collect::<BTreeSet<_>>();
-        self.relational_comments.retain(|target, _| match target {
-            RelationalCommentTarget::Table { table }
-            | RelationalCommentTarget::Column { table, .. }
-            | RelationalCommentTarget::Constraint { table, .. } => table != &drop.name,
-            RelationalCommentTarget::Index { index } => !index_names.contains(index),
-            RelationalCommentTarget::Database { .. }
-            | RelationalCommentTarget::Role { .. }
-            | RelationalCommentTarget::Schema { .. }
-            | RelationalCommentTarget::Tablespace { .. }
-            | RelationalCommentTarget::View { .. } => true,
-        });
-        self.relational_residency.remove(&drop.name);
-        self.relational_residency_device_memory.remove(&drop.name);
+            let index_names = table
+                .indexes
+                .iter()
+                .map(|index| index.name.clone())
+                .collect::<BTreeSet<_>>();
+            self.relational_comments.retain(|target, _| match target {
+                RelationalCommentTarget::Table { table }
+                | RelationalCommentTarget::Column { table, .. }
+                | RelationalCommentTarget::Constraint { table, .. } => table != name,
+                RelationalCommentTarget::Index { index } => !index_names.contains(index),
+                RelationalCommentTarget::Database { .. }
+                | RelationalCommentTarget::Role { .. }
+                | RelationalCommentTarget::Schema { .. }
+                | RelationalCommentTarget::Tablespace { .. }
+                | RelationalCommentTarget::View { .. } => true,
+            });
+            self.relational_residency.remove(name);
+            self.relational_residency_device_memory.remove(name);
+        }
+        Ok(())
+    }
+
+    fn preflight_drop_table(&self, drop: &DropTable) -> Result<(), EngineError> {
+        let mut seen = BTreeSet::new();
+        for name in &drop.names {
+            if !seen.insert(name) {
+                return Err(EngineError::ApplyFailed(format!(
+                    "table \"{}\" specified more than once",
+                    name
+                )));
+            }
+            if self.relational_views.contains_key(name) {
+                return Err(EngineError::ApplyFailed(format!(
+                    "relation \"{}\" is not a table",
+                    name
+                )));
+            }
+            if !drop.if_exists && !self.relational_catalog.contains_key(name) {
+                return Err(EngineError::ApplyFailed(format!(
+                    "relation \"{}\" does not exist",
+                    name
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -9376,6 +9392,7 @@ impl Engine {
                     )));
                 }
             }
+            Command::DropTable(drop) => self.preflight_drop_table(drop)?,
             Command::DropIndex(drop) => self.preflight_drop_index(drop)?,
             Command::DropView(drop) => self.preflight_drop_view(drop)?,
             Command::Insert(insert) => {
@@ -33921,6 +33938,118 @@ mod tests {
             "{view_drop}"
         );
         assert!(with_view.relational_catalog_view("people_view").is_some());
+    }
+
+    #[test]
+    fn relational_catalog_drops_table_batches_atomically_and_replays() {
+        let mut e = Engine::new_local();
+        e.execute_text(
+            1,
+            "CREATE TABLE batch_people (id INT PRIMARY KEY, name TEXT)",
+        )
+        .unwrap();
+        e.execute_text(2, "CREATE TABLE batch_teams (id INT, name TEXT UNIQUE)")
+            .unwrap();
+        e.execute_text(3, "CREATE TABLE batch_keep (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(
+            4,
+            "INSERT INTO batch_people (id, name) VALUES (1, 'Ada'), (2, 'Grace')",
+        )
+        .unwrap();
+        e.execute_text(
+            5,
+            "INSERT INTO batch_teams (id, name) VALUES (10, 'Compiler')",
+        )
+        .unwrap();
+        e.execute_text(
+            6,
+            "CREATE INDEX batch_people_name_idx ON batch_people (name)",
+        )
+        .unwrap();
+        e.execute_text(7, "COMMENT ON TABLE public.batch_people IS 'people table'")
+            .unwrap();
+        e.execute_text(
+            8,
+            "COMMENT ON COLUMN public.batch_teams.name IS 'team name'",
+        )
+        .unwrap();
+        e.execute_text(
+            9,
+            "COMMENT ON INDEX public.batch_people_name_idx IS 'lookup'",
+        )
+        .unwrap();
+        assert!(e
+            .populate_relational_residency_snapshot("batch_people")
+            .unwrap()
+            .is_valid());
+
+        e.execute_text(10, "DROP TABLE public.batch_people, public.batch_teams")
+            .unwrap();
+
+        assert!(e.relational_catalog_table("batch_people").is_none());
+        assert!(e.relational_catalog_table("batch_teams").is_none());
+        assert!(e.relational_catalog_table("batch_keep").is_some());
+        assert_eq!(e.relational_table_comment("batch_people"), None);
+        assert_eq!(e.relational_column_comment("batch_teams", 2), None);
+        assert_eq!(e.relational_index_comment("batch_people_name_idx"), None);
+        assert!(e.relational_residency_snapshot("batch_people").is_none());
+
+        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        assert!(recovered.relational_catalog_table("batch_people").is_none());
+        assert!(recovered.relational_catalog_table("batch_teams").is_none());
+        assert!(recovered.relational_catalog_table("batch_keep").is_some());
+
+        let mut atomic = Engine::new_local();
+        atomic
+            .execute_text(1, "CREATE TABLE atomic_people (id INT, name TEXT)")
+            .unwrap();
+        atomic
+            .execute_text(2, "CREATE TABLE atomic_teams (id INT, name TEXT)")
+            .unwrap();
+        atomic
+            .execute_text(
+                3,
+                "CREATE VIEW public.atomic_view AS SELECT id, name FROM atomic_people",
+            )
+            .unwrap();
+        let missing = atomic
+            .execute_text(4, "DROP TABLE atomic_people, missing_atomic")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            missing.contains("relation \"missing_atomic\" does not exist"),
+            "{missing}"
+        );
+        assert!(atomic.relational_catalog_table("atomic_people").is_some());
+        assert!(atomic.relational_catalog_table("atomic_teams").is_some());
+
+        let duplicate = atomic
+            .execute_text(5, "DROP TABLE atomic_people, atomic_people")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            duplicate.contains("table \"atomic_people\" specified more than once"),
+            "{duplicate}"
+        );
+        assert!(atomic.relational_catalog_table("atomic_people").is_some());
+
+        let view_target = atomic
+            .execute_text(6, "DROP TABLE IF EXISTS missing_atomic, atomic_view")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            view_target.contains("relation \"atomic_view\" is not a table"),
+            "{view_target}"
+        );
+        assert!(atomic.relational_catalog_view("atomic_view").is_some());
+        assert!(atomic.relational_catalog_table("atomic_people").is_some());
+
+        atomic
+            .execute_text(7, "DROP TABLE IF EXISTS missing_atomic, atomic_people")
+            .unwrap();
+        assert!(atomic.relational_catalog_table("atomic_people").is_none());
+        assert!(atomic.relational_catalog_table("atomic_teams").is_some());
     }
 
     #[test]

@@ -140,7 +140,7 @@ pub struct RenameView {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DropTable {
-    pub name: String,
+    pub names: Vec<String>,
     pub if_exists: bool,
 }
 
@@ -2662,11 +2662,14 @@ fn parse_drop_table(input: &str) -> Result<DropTable, ParseError> {
         return Err(ParseError::InvalidRelationalSql);
     }
     let tables = split_csv(rest)?;
-    let [table] = tables.as_slice() else {
+    if tables.is_empty() {
         return Err(ParseError::InvalidRelationalSql);
     };
     Ok(DropTable {
-        name: normalize_relation_identifier(table.trim())?,
+        names: tables
+            .into_iter()
+            .map(|table| normalize_relation_identifier(table.trim()))
+            .collect::<Result<Vec<_>, _>>()?,
         if_exists,
     })
 }
@@ -10372,23 +10375,26 @@ mod tests {
         assert_eq!(
             parse_command("DROP TABLE public.people").unwrap(),
             Command::DropTable(DropTable {
-                name: "people".to_string(),
+                names: vec!["people".to_string()],
                 if_exists: false,
             })
         );
         assert_eq!(
             parse_command("DROP TABLE IF EXISTS people").unwrap(),
             Command::DropTable(DropTable {
-                name: "people".to_string(),
+                names: vec!["people".to_string()],
                 if_exists: true,
+            })
+        );
+        assert_eq!(
+            parse_command("DROP TABLE public.a, public.b").unwrap(),
+            Command::DropTable(DropTable {
+                names: vec!["a".to_string(), "b".to_string()],
+                if_exists: false,
             })
         );
         assert!(matches!(
             parse_command("DROP TABLE people CASCADE"),
-            Err(ParseError::InvalidRelationalSql)
-        ));
-        assert!(matches!(
-            parse_command("DROP TABLE public.a, public.b"),
             Err(ParseError::InvalidRelationalSql)
         ));
         assert!(matches!(

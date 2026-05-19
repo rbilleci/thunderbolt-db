@@ -5031,7 +5031,7 @@ fn parse_truncate_table(statement: &str) -> Option<String> {
 
 #[derive(Debug, PartialEq, Eq)]
 struct DropTable {
-    table: String,
+    tables: Vec<String>,
     if_exists: bool,
 }
 
@@ -5053,18 +5053,29 @@ fn parse_drop_table(statement: &str) -> Option<DropTable> {
     } else {
         false
     };
-    let mut parts = target.split_whitespace();
-    let table = parts.next()?;
-    if parts.next().is_some() {
+    if target
+        .split(',')
+        .any(|table| table.split_whitespace().count() != 1)
+    {
         return None;
     }
-    if !is_simple_copy_table_name(table) {
+    let tables = target
+        .split(',')
+        .map(str::trim)
+        .map(|table| {
+            if !is_simple_copy_table_name(table) {
+                return None;
+            }
+            if table.contains('.') && !table.starts_with("public.") {
+                return None;
+            }
+            Some(table.strip_prefix("public.").unwrap_or(table).to_string())
+        })
+        .collect::<Option<Vec<_>>>()?;
+    if tables.is_empty() {
         return None;
     }
-    Some(DropTable {
-        table: table.strip_prefix("public.").unwrap_or(table).to_string(),
-        if_exists,
-    })
+    Some(DropTable { tables, if_exists })
 }
 
 fn parse_alter_table_drop_constraint(statement: &str) -> Option<DropConstraint> {
@@ -5837,34 +5848,54 @@ fn execute_statement(
         return write_command_complete(stream, "TRUNCATE TABLE");
     }
     if let Some(drop) = parse_drop_table(statement) {
-        if session.views.contains_key(&drop.table) {
-            return write_error(
-                stream,
-                &ErrorField {
-                    code: "42809",
-                    message: "relation is not a table",
-                    position: None,
-                },
-            );
+        let mut seen = BTreeSet::new();
+        for table in &drop.tables {
+            if !seen.insert(table) {
+                return write_error(
+                    stream,
+                    &ErrorField {
+                        code: "42710",
+                        message: "table specified more than once",
+                        position: None,
+                    },
+                );
+            }
+            if session.views.contains_key(table) {
+                return write_error(
+                    stream,
+                    &ErrorField {
+                        code: "42809",
+                        message: "relation is not a table",
+                        position: None,
+                    },
+                );
+            }
+            if !drop.if_exists && !session.tables.contains_key(table) {
+                return write_error(
+                    stream,
+                    &ErrorField {
+                        code: "42P01",
+                        message: "relation does not exist",
+                        position: None,
+                    },
+                );
+            }
         }
-        if session.tables.remove(&drop.table).is_none() && !drop.if_exists {
-            return write_error(
-                stream,
-                &ErrorField {
-                    code: "42P01",
-                    message: "relation does not exist",
-                    position: None,
-                },
-            );
-        }
-        let old_index_count = session.indexes.len();
+        let drop_tables = drop.tables.iter().cloned().collect::<BTreeSet<_>>();
         let dropped_index_names = session
             .indexes
             .iter()
-            .filter(|index| index.table == drop.table)
+            .filter(|index| drop_tables.contains(&index.table))
             .map(|index| index.name.clone())
             .collect::<BTreeSet<_>>();
-        session.indexes.retain(|index| index.table != drop.table);
+        for table in &drop.tables {
+            session.tables.remove(table);
+            session.mark_table_dirty(table.clone());
+        }
+        let old_index_count = session.indexes.len();
+        session
+            .indexes
+            .retain(|index| !drop_tables.contains(&index.table));
         session.dirty_indexes |= session.indexes.len() != old_index_count;
         let dropped_comment_targets = session
             .comments
@@ -5872,13 +5903,13 @@ fn execute_statement(
             .filter(|target| match target {
                 CatalogCommentTarget::Table { table }
                 | CatalogCommentTarget::Column { table, .. }
-                | CatalogCommentTarget::Constraint { table, .. } => table == &drop.table,
+                | CatalogCommentTarget::Constraint { table, .. } => drop_tables.contains(table),
                 CatalogCommentTarget::Index { index } => dropped_index_names.contains(index),
-                CatalogCommentTarget::Database { .. } => false,
-                CatalogCommentTarget::Role { .. } => false,
-                CatalogCommentTarget::Schema { .. } => false,
-                CatalogCommentTarget::Tablespace { .. } => false,
-                CatalogCommentTarget::View { .. } => false,
+                CatalogCommentTarget::Database { .. }
+                | CatalogCommentTarget::Role { .. }
+                | CatalogCommentTarget::Schema { .. }
+                | CatalogCommentTarget::Tablespace { .. }
+                | CatalogCommentTarget::View { .. } => false,
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -5886,7 +5917,6 @@ fn execute_statement(
             session.comments.remove(&target);
             session.mark_comment_dirty(target);
         }
-        session.mark_table_dirty(drop.table);
         session.persist_catalog_snapshot();
         return write_command_complete(stream, "DROP TABLE");
     }
@@ -6734,34 +6764,54 @@ fn execute_statement(
                 return write_command_complete(stream, "DROP VIEW");
             }
             Command::DropTable(drop) => {
-                if session.views.contains_key(&drop.name) {
-                    return write_error(
-                        stream,
-                        &ErrorField {
-                            code: "42809",
-                            message: "relation is not a table",
-                            position: None,
-                        },
-                    );
+                let mut seen = BTreeSet::new();
+                for name in &drop.names {
+                    if !seen.insert(name) {
+                        return write_error(
+                            stream,
+                            &ErrorField {
+                                code: "42710",
+                                message: "table specified more than once",
+                                position: None,
+                            },
+                        );
+                    }
+                    if session.views.contains_key(name) {
+                        return write_error(
+                            stream,
+                            &ErrorField {
+                                code: "42809",
+                                message: "relation is not a table",
+                                position: None,
+                            },
+                        );
+                    }
+                    if !drop.if_exists && !session.tables.contains_key(name) {
+                        return write_error(
+                            stream,
+                            &ErrorField {
+                                code: "42P01",
+                                message: "relation does not exist",
+                                position: None,
+                            },
+                        );
+                    }
                 }
-                if session.tables.remove(&drop.name).is_none() && !drop.if_exists {
-                    return write_error(
-                        stream,
-                        &ErrorField {
-                            code: "42P01",
-                            message: "relation does not exist",
-                            position: None,
-                        },
-                    );
-                }
-                let old_index_count = session.indexes.len();
+                let drop_names = drop.names.iter().cloned().collect::<BTreeSet<_>>();
                 let dropped_index_names = session
                     .indexes
                     .iter()
-                    .filter(|index| index.table == drop.name)
+                    .filter(|index| drop_names.contains(&index.table))
                     .map(|index| index.name.clone())
                     .collect::<BTreeSet<_>>();
-                session.indexes.retain(|index| index.table != drop.name);
+                for name in &drop.names {
+                    session.tables.remove(name);
+                    session.mark_table_dirty(name.clone());
+                }
+                let old_index_count = session.indexes.len();
+                session
+                    .indexes
+                    .retain(|index| !drop_names.contains(&index.table));
                 session.dirty_indexes |= session.indexes.len() != old_index_count;
                 let dropped_comment_targets = session
                     .comments
@@ -6769,7 +6819,9 @@ fn execute_statement(
                     .filter(|target| match target {
                         CatalogCommentTarget::Table { table }
                         | CatalogCommentTarget::Column { table, .. }
-                        | CatalogCommentTarget::Constraint { table, .. } => table == &drop.name,
+                        | CatalogCommentTarget::Constraint { table, .. } => {
+                            drop_names.contains(table)
+                        }
                         CatalogCommentTarget::Index { index } => {
                             dropped_index_names.contains(index)
                         }
@@ -6785,7 +6837,6 @@ fn execute_statement(
                     session.comments.remove(&target);
                     session.mark_comment_dirty(target);
                 }
-                session.mark_table_dirty(drop.name);
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, "DROP TABLE");
             }
@@ -14649,20 +14700,28 @@ mod tests {
         assert_eq!(
             parse_drop_table("DROP TABLE IF EXISTS public.people;"),
             Some(DropTable {
-                table: "people".to_string(),
+                tables: vec!["people".to_string()],
                 if_exists: true,
             })
         );
         assert_eq!(
             parse_drop_table("/* restore */ DROP TABLE people;"),
             Some(DropTable {
-                table: "people".to_string(),
+                tables: vec!["people".to_string()],
+                if_exists: false,
+            })
+        );
+        assert_eq!(
+            parse_drop_table("DROP TABLE public.people, teams"),
+            Some(DropTable {
+                tables: vec!["people".to_string(), "teams".to_string()],
                 if_exists: false,
             })
         );
         assert_eq!(parse_drop_table("DROP TABLE public.people CASCADE"), None);
         assert_eq!(parse_drop_table("DROP SCHEMA IF EXISTS public"), None);
         assert_eq!(parse_drop_table("DROP TABLE \"people\""), None);
+        assert_eq!(parse_drop_table("DROP TABLE private.people, teams"), None);
         assert_eq!(
             parse_alter_table_drop_constraint(
                 "ALTER TABLE IF EXISTS ONLY public.accounts DROP CONSTRAINT IF EXISTS accounts_pkey;"

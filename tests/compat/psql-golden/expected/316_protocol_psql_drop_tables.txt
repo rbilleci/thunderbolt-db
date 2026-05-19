@@ -47,7 +47,7 @@ psql:316_protocol_psql_drop_tables.sql:19: ERROR:  relation is not a table
 (0 rows)
 
 psql:316_protocol_psql_drop_tables.sql:21: ERROR:  query shape is not supported by the compatibility stub
-psql:316_protocol_psql_drop_tables.sql:22: ERROR:  query shape is not supported by the compatibility stub
+psql:316_protocol_psql_drop_tables.sql:22: ERROR:  relation does not exist
  id | name
 ----+------
 (0 rows)

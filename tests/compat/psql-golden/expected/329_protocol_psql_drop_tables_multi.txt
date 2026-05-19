@@ -1,0 +1,72 @@
+=== bounded SQL multi-table drops ===
+CREATE TABLE
+CREATE TABLE
+CREATE TABLE
+INSERT 0 2
+INSERT 0 1
+CREATE INDEX
+COMMENT
+COMMENT
+COMMENT
+                  List of relations
+ Schema |          Name           | Type  |  Owner
+--------+-------------------------+-------+----------
+ public | drop_table_batch_keep   | table | postgres
+ public | drop_table_batch_people | table | postgres
+ public | drop_table_batch_teams  | table | postgres
+(3 rows)
+
+                                                             List of relations
+ Schema |               Name               | Type  |  Owner   |          Table          | Persistence | Access method | Size | Description
+--------+----------------------------------+-------+----------+-------------------------+-------------+---------------+------+-------------
+ public | drop_table_batch_people_name_idx | index | postgres | drop_table_batch_people | permanent   | btree         |      | lookup
+ public | drop_table_batch_people_pkey     | index | postgres | drop_table_batch_people | permanent   | btree         |      |
+ public | drop_table_batch_teams_name_key  | index | postgres | drop_table_batch_teams  | permanent   | btree         |      |
+(3 rows)
+
+DROP TABLE
+                 List of relations
+ Schema |         Name          | Type  |  Owner
+--------+-----------------------+-------+----------
+ public | drop_table_batch_keep | table | postgres
+(1 row)
+
+psql:329_protocol_psql_drop_tables_multi.sql:15: error: Did not find any relations.
+         Object descriptions
+ Schema | Name | Object | Description
+--------+------+--------+-------------
+(0 rows)
+
+ id | name
+----+------
+(0 rows)
+
+psql:329_protocol_psql_drop_tables_multi.sql:18: ERROR:  relation does not exist
+                 List of relations
+ Schema |         Name          | Type  |  Owner
+--------+-----------------------+-------+----------
+ public | drop_table_batch_keep | table | postgres
+(1 row)
+
+psql:329_protocol_psql_drop_tables_multi.sql:20: ERROR:  table specified more than once
+                 List of relations
+ Schema |         Name          | Type  |  Owner
+--------+-----------------------+-------+----------
+ public | drop_table_batch_keep | table | postgres
+(1 row)
+
+CREATE TABLE
+CREATE VIEW
+psql:329_protocol_psql_drop_tables_multi.sql:24: ERROR:  relation is not a table
+                                  List of relations
+ Schema |         Name          | Type |  Owner   | Persistence | Size | Description
+--------+-----------------------+------+----------+-------------+------+-------------
+ public | drop_table_batch_view | view | postgres | permanent   |      |
+(1 row)
+
+DROP TABLE
+                 List of relations
+ Schema |         Name          | Type  |  Owner
+--------+-----------------------+-------+----------
+ public | drop_table_batch_base | table | postgres
+(1 row)
