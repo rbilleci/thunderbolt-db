@@ -42,6 +42,8 @@ pub enum Command {
     DropPublication(DropPublication),
     CreateSubscription(CreateSubscription),
     DropSubscription(DropSubscription),
+    CreateRole(CreateRole),
+    DropRole(DropRole),
     GrantTable(GrantTable),
     RevokeTable(RevokeTable),
     GrantSchema(SchemaPrivileges),
@@ -280,6 +282,18 @@ pub struct CreateSubscription {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DropSubscription {
+    pub names: Vec<String>,
+    pub if_exists: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateRole {
+    pub name: String,
+    pub login: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropRole {
     pub names: Vec<String>,
     pub if_exists: bool,
 }
@@ -1985,6 +1999,9 @@ fn parse_relational_command(input: &str) -> Option<Result<Command, ParseError>> 
         if second.eq_ignore_ascii_case("EXTENSION") {
             return Some(parse_create_extension(input).map(Command::CreateExtension));
         }
+        if second.eq_ignore_ascii_case("ROLE") || second.eq_ignore_ascii_case("USER") {
+            return Some(parse_create_role(input).map(Command::CreateRole));
+        }
         if second.eq_ignore_ascii_case("OR") {
             let third = input.split_whitespace().nth(2)?;
             let fourth = input.split_whitespace().nth(3)?;
@@ -2027,6 +2044,9 @@ fn parse_relational_command(input: &str) -> Option<Result<Command, ParseError>> 
         }
         if second.eq_ignore_ascii_case("SUBSCRIPTION") {
             return Some(parse_drop_subscription(input).map(Command::DropSubscription));
+        }
+        if second.eq_ignore_ascii_case("ROLE") || second.eq_ignore_ascii_case("USER") {
+            return Some(parse_drop_role(input).map(Command::DropRole));
         }
         return Some(Err(ParseError::InvalidRelationalSql));
     }
@@ -3831,6 +3851,92 @@ fn parse_drop_subscription(input: &str) -> Result<DropSubscription, ParseError> 
     })
 }
 
+fn parse_create_role(input: &str) -> Result<CreateRole, ParseError> {
+    let rest = strip_keyword_prefix_case_insensitive(input, "CREATE")
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    let (is_user, rest) = if let Some(rest) = strip_keyword_prefix_case_insensitive(rest, "USER") {
+        (true, rest.trim_start())
+    } else {
+        (
+            false,
+            strip_keyword_prefix_case_insensitive(rest, "ROLE")
+                .ok_or(ParseError::InvalidRelationalSql)?
+                .trim_start(),
+        )
+    };
+    let (raw_name, rest) = split_leading_identifier(rest)?;
+    let name = normalize_identifier(raw_name)?;
+    let mut rest = rest.trim_start();
+    if let Some(after_with) = strip_keyword_prefix_case_insensitive(rest, "WITH") {
+        rest = after_with.trim_start();
+    }
+    if rest.is_empty() {
+        return Ok(CreateRole {
+            name,
+            login: is_user,
+        });
+    }
+    let mut login = is_user;
+    let mut saw_login_option = false;
+    for token in rest.split_whitespace() {
+        if token.eq_ignore_ascii_case("LOGIN") {
+            if saw_login_option {
+                return Err(ParseError::InvalidRelationalSql);
+            }
+            login = true;
+            saw_login_option = true;
+        } else if token.eq_ignore_ascii_case("NOLOGIN") {
+            if saw_login_option {
+                return Err(ParseError::InvalidRelationalSql);
+            }
+            login = false;
+            saw_login_option = true;
+        } else {
+            return Err(ParseError::InvalidRelationalSql);
+        }
+    }
+    Ok(CreateRole { name, login })
+}
+
+fn parse_drop_role(input: &str) -> Result<DropRole, ParseError> {
+    let mut rest = strip_keyword_prefix_case_insensitive(input, "DROP")
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    if let Some(after_user) = strip_keyword_prefix_case_insensitive(rest, "USER") {
+        rest = after_user.trim_start();
+    } else {
+        rest = strip_keyword_prefix_case_insensitive(rest, "ROLE")
+            .ok_or(ParseError::InvalidRelationalSql)?
+            .trim_start();
+    }
+    let if_exists = if let Some(after_if) = strip_keyword_prefix_case_insensitive(rest, "IF") {
+        let after_exists = strip_keyword_prefix_case_insensitive(after_if.trim_start(), "EXISTS")
+            .ok_or(ParseError::InvalidRelationalSql)?;
+        rest = after_exists.trim_start();
+        true
+    } else {
+        false
+    };
+    if rest.is_empty()
+        || find_keyword_outside_quotes(rest, "CASCADE").is_some()
+        || find_keyword_outside_quotes(rest, "RESTRICT").is_some()
+    {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let roles = split_csv(rest)?;
+    if roles.is_empty() {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    Ok(DropRole {
+        names: roles
+            .into_iter()
+            .map(|role| normalize_identifier(role.trim()))
+            .collect::<Result<Vec<_>, _>>()?,
+        if_exists,
+    })
+}
+
 fn parse_grant_table(input: &str) -> Result<GrantTable, ParseError> {
     let rest = strip_keyword_prefix_case_insensitive(input, "GRANT")
         .ok_or(ParseError::InvalidRelationalSql)?
@@ -4114,11 +4220,7 @@ fn parse_acl_grantee(grantee: &str) -> Result<String, ParseError> {
         return Err(ParseError::InvalidRelationalSql);
     }
     let normalized = normalize_identifier(trimmed)?;
-    if normalized == "public" || normalized == "postgres" {
-        Ok(normalized)
-    } else {
-        Err(ParseError::InvalidRelationalSql)
-    }
+    Ok(normalized)
 }
 
 fn parse_table_privileges(input: &str) -> Result<Vec<TablePrivilege>, ParseError> {
@@ -12404,8 +12506,60 @@ default: Some(ColumnDefault::SequenceNextVal {
             parse_command("GRANT SELECT ON TABLE private.people TO PUBLIC"),
             Err(ParseError::InvalidRelationalSql)
         ));
+        assert_eq!(
+            parse_command("GRANT SELECT ON people TO app_reader").unwrap(),
+            Command::GrantTable(GrantTable {
+                relation: "people".to_string(),
+                kind: AclRelationKind::Relation,
+                grantee: "app_reader".to_string(),
+                privileges: vec![TablePrivilege::Select],
+            })
+        );
+        assert_eq!(
+            parse_command("CREATE ROLE app_reader WITH LOGIN").unwrap(),
+            Command::CreateRole(CreateRole {
+                name: "app_reader".to_string(),
+                login: true,
+            })
+        );
+        assert_eq!(
+            parse_command("CREATE USER app_writer").unwrap(),
+            Command::CreateRole(CreateRole {
+                name: "app_writer".to_string(),
+                login: true,
+            })
+        );
+        assert_eq!(
+            parse_command("CREATE ROLE app_batch NOLOGIN").unwrap(),
+            Command::CreateRole(CreateRole {
+                name: "app_batch".to_string(),
+                login: false,
+            })
+        );
+        assert_eq!(
+            parse_command("DROP ROLE IF EXISTS app_reader, app_writer").unwrap(),
+            Command::DropRole(DropRole {
+                names: vec!["app_reader".to_string(), "app_writer".to_string()],
+                if_exists: true,
+            })
+        );
+        assert_eq!(
+            parse_command("DROP USER app_batch").unwrap(),
+            Command::DropRole(DropRole {
+                names: vec!["app_batch".to_string()],
+                if_exists: false,
+            })
+        );
         assert!(matches!(
-            parse_command("GRANT SELECT ON people TO missing_role"),
+            parse_command("CREATE ROLE app_reader PASSWORD 'secret'"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command("CREATE ROLE app_reader LOGIN NOLOGIN"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command("DROP ROLE app_reader CASCADE"),
             Err(ParseError::InvalidRelationalSql)
         ));
         assert!(matches!(
@@ -12432,10 +12586,14 @@ default: Some(ColumnDefault::SequenceNextVal {
             parse_command("GRANT USAGE ON SCHEMA private TO PUBLIC"),
             Err(ParseError::InvalidRelationalSql)
         ));
-        assert!(matches!(
-            parse_command("GRANT USAGE ON SCHEMA public TO missing_role"),
-            Err(ParseError::InvalidRelationalSql)
-        ));
+        assert_eq!(
+            parse_command("GRANT USAGE ON SCHEMA public TO app_reader").unwrap(),
+            Command::GrantSchema(SchemaPrivileges {
+                schema: "public".to_string(),
+                grantee: "app_reader".to_string(),
+                privileges: vec![SchemaPrivilege::Usage],
+            })
+        );
         assert!(matches!(
             parse_command("GRANT USAGE ON SCHEMA public TO PUBLIC WITH GRANT OPTION"),
             Err(ParseError::InvalidRelationalSql)
@@ -12467,10 +12625,13 @@ default: Some(ColumnDefault::SequenceNextVal {
             parse_command("ALTER DEFAULT PRIVILEGES GRANT SELECT ON SEQUENCES TO PUBLIC"),
             Err(ParseError::InvalidRelationalSql)
         ));
-        assert!(matches!(
-            parse_command("ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO missing_role"),
-            Err(ParseError::InvalidRelationalSql)
-        ));
+        assert_eq!(
+            parse_command("ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO app_reader").unwrap(),
+            Command::GrantDefaultTablePrivileges(DefaultTablePrivileges {
+                grantee: "app_reader".to_string(),
+                privileges: vec![TablePrivilege::Select],
+            })
+        );
 
         assert_eq!(
             parse_command("CREATE INDEX people_name_idx ON public.people (name)").unwrap(),

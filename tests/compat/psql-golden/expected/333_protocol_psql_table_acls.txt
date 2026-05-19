@@ -37,7 +37,7 @@ psql:333_protocol_psql_table_acls.sql:14: ERROR:  relation is not a table
 psql:333_protocol_psql_table_acls.sql:15: ERROR:  relation is not a table
 psql:333_protocol_psql_table_acls.sql:16: ERROR:  query shape is not supported by the compatibility stub
 psql:333_protocol_psql_table_acls.sql:17: ERROR:  query shape is not supported by the compatibility stub
-psql:333_protocol_psql_table_acls.sql:18: ERROR:  query shape is not supported by the compatibility stub
+psql:333_protocol_psql_table_acls.sql:18: ERROR:  role does not exist
 psql:333_protocol_psql_table_acls.sql:19: ERROR:  query shape is not supported by the compatibility stub
  name
 ------

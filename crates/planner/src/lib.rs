@@ -87,6 +87,8 @@ impl Planner {
             | Command::DropPublication(_)
             | Command::CreateSubscription(_)
             | Command::DropSubscription(_)
+            | Command::CreateRole(_)
+            | Command::DropRole(_)
             | Command::DropTable(_)
             | Command::TruncateTable(_)
             | Command::DropIndex(_)

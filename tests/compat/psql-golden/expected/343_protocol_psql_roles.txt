@@ -1,0 +1,75 @@
+=== bounded role metadata and ACL grantees ===
+CREATE ROLE
+CREATE ROLE
+CREATE ROLE
+COMMENT
+                              List of roles
+ Role name  |                         Attributes
+------------+------------------------------------------------------------
+ postgres   | Superuser, Create role, Create DB, Replication, Bypass RLS
+ app_batch  | Cannot login
+ app_reader |
+ app_writer |
+
+                                      List of roles
+ Role name  |                         Attributes                         |  Description
+------------+------------------------------------------------------------+---------------
+ postgres   | Superuser, Create role, Create DB, Replication, Bypass RLS |
+ app_batch  | Cannot login                                               |
+ app_reader |                                                            | read-only app
+ app_writer |                                                            |
+
+  oid  |  rolname
+-------+------------
+    10 | postgres
+ 16386 | app_batch
+ 16384 | app_reader
+ 16385 | app_writer
+(4 rows)
+
+CREATE TABLE
+GRANT
+                                    Access privileges
+ Schema |      Name       | Type  |   Access privileges   | Column privileges | Policies
+--------+-----------------+-------+-----------------------+-------------------+----------
+ public | role_acl_people | table | app_reader=r/postgres |                   |
+(1 row)
+
+GRANT
+                     List of schemas
+  Name  |  Owner   |   Access privileges   | Description
+--------+----------+-----------------------+-------------
+ public | postgres | app_reader=U/postgres |
+(1 row)
+
+ALTER DEFAULT PRIVILEGES
+             Default access privileges
+  Owner   | Schema | Type  |   Access privileges
+----------+--------+-------+-----------------------
+ postgres | public | table | app_writer=r/postgres
+(1 row)
+
+psql:343_protocol_psql_roles.sql:16: ERROR:  role cannot be dropped because dependent metadata exists
+REVOKE
+REVOKE
+COMMENT
+DROP ROLE
+                              List of roles
+ Role name  |                         Attributes
+------------+------------------------------------------------------------
+ postgres   | Superuser, Create role, Create DB, Replication, Bypass RLS
+ app_writer |
+
+ALTER DEFAULT PRIVILEGES
+DROP ROLE
+                             List of roles
+ Role name |                         Attributes
+-----------+------------------------------------------------------------
+ postgres  | Superuser, Create role, Create DB, Replication, Bypass RLS
+
+psql:343_protocol_psql_roles.sql:25: ERROR:  query shape is not supported by the compatibility stub
+psql:343_protocol_psql_roles.sql:26: ERROR:  role already exists
+psql:343_protocol_psql_roles.sql:27: ERROR:  role does not exist
+DROP ROLE
+psql:343_protocol_psql_roles.sql:29: ERROR:  cannot drop bootstrap role
+psql:343_protocol_psql_roles.sql:30: ERROR:  role does not exist

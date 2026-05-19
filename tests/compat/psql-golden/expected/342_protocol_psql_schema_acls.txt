@@ -35,7 +35,7 @@ REVOKE
 (1 row)
 
 psql:342_protocol_psql_schema_acls.sql:12: ERROR:  query shape is not supported by the compatibility stub
-psql:342_protocol_psql_schema_acls.sql:13: ERROR:  query shape is not supported by the compatibility stub
+psql:342_protocol_psql_schema_acls.sql:13: ERROR:  role does not exist
 psql:342_protocol_psql_schema_acls.sql:14: ERROR:  query shape is not supported by the compatibility stub
 GRANT
 DROP SCHEMA

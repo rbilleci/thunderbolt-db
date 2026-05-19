@@ -2383,6 +2383,7 @@ struct Session {
     domains: BTreeMap<String, Domain>,
     publications: BTreeMap<String, Publication>,
     subscriptions: BTreeMap<String, Subscription>,
+    roles: BTreeMap<String, RoleInfo>,
     public_schema_exists: bool,
     public_schema_implicit: bool,
     currval_sequences: HashMap<String, i64>,
@@ -2398,6 +2399,7 @@ struct Session {
     dirty_domains: BTreeSet<String>,
     dirty_publications: BTreeSet<String>,
     dirty_subscriptions: BTreeSet<String>,
+    dirty_roles: BTreeSet<String>,
     dirty_schema: bool,
     dirty_indexes: bool,
     dirty_table_acls: BTreeSet<String>,
@@ -2418,6 +2420,7 @@ struct SharedCatalog {
     domains: BTreeMap<String, Domain>,
     publications: BTreeMap<String, Publication>,
     subscriptions: BTreeMap<String, Subscription>,
+    roles: BTreeMap<String, RoleInfo>,
     public_schema_exists: bool,
     public_schema_implicit: bool,
     indexes: Vec<CatalogIndex>,
@@ -2438,6 +2441,7 @@ impl Default for SharedCatalog {
             domains: BTreeMap::new(),
             publications: BTreeMap::new(),
             subscriptions: BTreeMap::new(),
+            roles: BTreeMap::new(),
             public_schema_exists: true,
             public_schema_implicit: true,
             indexes: Vec::new(),
@@ -2482,6 +2486,7 @@ impl Session {
             domains: catalog.domains,
             publications: catalog.publications,
             subscriptions: catalog.subscriptions,
+            roles: catalog.roles,
             public_schema_exists: catalog.public_schema_exists,
             public_schema_implicit: catalog.public_schema_implicit,
             currval_sequences: HashMap::new(),
@@ -2497,6 +2502,7 @@ impl Session {
             dirty_domains: BTreeSet::new(),
             dirty_publications: BTreeSet::new(),
             dirty_subscriptions: BTreeSet::new(),
+            dirty_roles: BTreeSet::new(),
             dirty_schema: false,
             dirty_indexes: false,
             dirty_table_acls: BTreeSet::new(),
@@ -2537,6 +2543,10 @@ impl Session {
         self.dirty_subscriptions.insert(subscription.into());
     }
 
+    fn mark_role_dirty(&mut self, role: impl Into<String>) {
+        self.dirty_roles.insert(role.into());
+    }
+
     fn mark_schema_dirty(&mut self) {
         self.dirty_schema = true;
     }
@@ -2566,6 +2576,7 @@ impl Session {
             self.dirty_domains.clear();
             self.dirty_publications.clear();
             self.dirty_subscriptions.clear();
+            self.dirty_roles.clear();
             self.dirty_schema = false;
             self.dirty_table_acls.clear();
             self.dirty_schema_acl = false;
@@ -2631,6 +2642,13 @@ impl Session {
                     .insert(subscription_name.clone(), subscription.clone());
             } else {
                 catalog.subscriptions.remove(subscription_name);
+            }
+        }
+        for role_name in &self.dirty_roles {
+            if let Some(role) = self.roles.get(role_name) {
+                catalog.roles.insert(role_name.clone(), role.clone());
+            } else {
+                catalog.roles.remove(role_name);
             }
         }
         for table_name in &self.dirty_table_acls {
@@ -2702,6 +2720,7 @@ impl Session {
         self.dirty_domains.clear();
         self.dirty_publications.clear();
         self.dirty_subscriptions.clear();
+        self.dirty_roles.clear();
         self.dirty_table_acls.clear();
     }
 
@@ -2743,6 +2762,13 @@ struct Table {
     rows: Vec<Vec<SqlValue>>,
     check_constraints: Vec<CatalogCheckConstraint>,
     foreign_keys: Vec<CatalogForeignKey>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RoleInfo {
+    oid: u32,
+    name: String,
+    login: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2933,6 +2959,33 @@ fn acl_relation_kind(session: &Session, relation: &str) -> Option<AclRelationKin
     }
 }
 
+fn role_exists(session: &Session, role: &str) -> bool {
+    role == "postgres" || session.roles.contains_key(role)
+}
+
+fn acl_grantee_error(session: &Session, grantee: &str) -> Option<ErrorField> {
+    if grantee == "public" || role_exists(session, grantee) {
+        None
+    } else {
+        Some(ErrorField {
+            code: "42704",
+            message: "role does not exist",
+            position: None,
+        })
+    }
+}
+
+fn role_has_dependencies(session: &Session, role: &str) -> bool {
+    session.comments.contains_key(&CatalogCommentTarget::Role {
+        role: role.to_string(),
+    }) || session
+        .table_acls
+        .values()
+        .any(|acl| acl.contains_key(role))
+        || session.schema_acl.contains_key(role)
+        || session.default_table_acl.contains_key(role)
+}
+
 fn relation_acl_target_error(
     session: &Session,
     relation: &str,
@@ -2972,6 +3025,9 @@ fn grant_relation_acl(
     grantee: &str,
     privileges: &[TablePrivilege],
 ) -> Result<(), ErrorField> {
+    if let Some(error) = acl_grantee_error(session, grantee) {
+        return Err(error);
+    }
     if let Some(error) = relation_acl_target_error(session, relation, kind) {
         return Err(error);
     }
@@ -2995,6 +3051,9 @@ fn revoke_relation_acl(
     grantee: &str,
     privileges: &[TablePrivilege],
 ) -> Result<(), ErrorField> {
+    if let Some(error) = acl_grantee_error(session, grantee) {
+        return Err(error);
+    }
     if let Some(error) = relation_acl_target_error(session, relation, kind) {
         return Err(error);
     }
@@ -3036,6 +3095,9 @@ fn grant_schema_acl(
     grantee: &str,
     privileges: &[SchemaPrivilege],
 ) -> Result<(), ErrorField> {
+    if let Some(error) = acl_grantee_error(session, grantee) {
+        return Err(error);
+    }
     if let Some(error) = schema_acl_target_error(session, schema) {
         return Err(error);
     }
@@ -3053,6 +3115,9 @@ fn revoke_schema_acl(
     grantee: &str,
     privileges: &[SchemaPrivilege],
 ) -> Result<(), ErrorField> {
+    if let Some(error) = acl_grantee_error(session, grantee) {
+        return Err(error);
+    }
     if let Some(error) = schema_acl_target_error(session, schema) {
         return Err(error);
     }
@@ -3068,7 +3133,14 @@ fn revoke_schema_acl(
     Ok(())
 }
 
-fn grant_default_table_acl(session: &mut Session, grantee: &str, privileges: &[TablePrivilege]) {
+fn grant_default_table_acl(
+    session: &mut Session,
+    grantee: &str,
+    privileges: &[TablePrivilege],
+) -> Result<(), ErrorField> {
+    if let Some(error) = acl_grantee_error(session, grantee) {
+        return Err(error);
+    }
     let acl = session
         .default_table_acl
         .entry(grantee.to_string())
@@ -3077,9 +3149,17 @@ fn grant_default_table_acl(session: &mut Session, grantee: &str, privileges: &[T
         acl.insert(*privilege);
     }
     session.mark_default_table_acl_dirty();
+    Ok(())
 }
 
-fn revoke_default_table_acl(session: &mut Session, grantee: &str, privileges: &[TablePrivilege]) {
+fn revoke_default_table_acl(
+    session: &mut Session,
+    grantee: &str,
+    privileges: &[TablePrivilege],
+) -> Result<(), ErrorField> {
+    if let Some(error) = acl_grantee_error(session, grantee) {
+        return Err(error);
+    }
     if let Some(acl) = session.default_table_acl.get_mut(grantee) {
         for privilege in privileges {
             acl.remove(privilege);
@@ -3089,6 +3169,7 @@ fn revoke_default_table_acl(session: &mut Session, grantee: &str, privileges: &[
         }
     }
     session.mark_default_table_acl_dirty();
+    Ok(())
 }
 
 fn publication_table_target_error(session: &Session, table: &str) -> Option<ErrorField> {
@@ -7569,7 +7650,7 @@ fn execute_statement(
         return write_single_row(
             stream,
             &[int4_column("oid"), text_column("rolname")],
-            &[vec![Some("10".to_string()), Some("postgres".to_string())]],
+            &catalog_role_oid_rows(session),
         );
     }
     if canonical
@@ -9290,6 +9371,92 @@ fn execute_statement(
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, "DROP SUBSCRIPTION");
             }
+            Command::CreateRole(create) => {
+                if role_exists(session, &create.name) {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "42710",
+                            message: "role already exists",
+                            position: None,
+                        },
+                    );
+                }
+                let oid = session.next_relation_oid;
+                let Some(next_oid) = session.next_relation_oid.checked_add(1) else {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "54000",
+                            message: "relational OID counter overflow",
+                            position: None,
+                        },
+                    );
+                };
+                session.next_relation_oid = next_oid;
+                session.roles.insert(
+                    create.name.clone(),
+                    RoleInfo {
+                        oid,
+                        name: create.name.clone(),
+                        login: create.login,
+                    },
+                );
+                session.mark_role_dirty(create.name);
+                session.persist_catalog_snapshot();
+                return write_command_complete(stream, "CREATE ROLE");
+            }
+            Command::DropRole(drop) => {
+                let mut seen = BTreeSet::new();
+                for role in &drop.names {
+                    if !seen.insert(role) {
+                        return write_error(
+                            stream,
+                            &ErrorField {
+                                code: "42710",
+                                message: "role specified more than once",
+                                position: None,
+                            },
+                        );
+                    }
+                    if role == "postgres" {
+                        return write_error(
+                            stream,
+                            &ErrorField {
+                                code: "0A000",
+                                message: "cannot drop bootstrap role",
+                                position: None,
+                            },
+                        );
+                    }
+                    if !drop.if_exists && !session.roles.contains_key(role) {
+                        return write_error(
+                            stream,
+                            &ErrorField {
+                                code: "42704",
+                                message: "role does not exist",
+                                position: None,
+                            },
+                        );
+                    }
+                    if session.roles.contains_key(role) && role_has_dependencies(session, role) {
+                        return write_error(
+                            stream,
+                            &ErrorField {
+                                code: "2BP01",
+                                message: "role cannot be dropped because dependent metadata exists",
+                                position: None,
+                            },
+                        );
+                    }
+                }
+                for role in drop.names {
+                    session.roles.remove(&role);
+                    session.mark_role_dirty(role);
+                }
+                session.persist_catalog_snapshot();
+                return write_command_complete(stream, "DROP ROLE");
+            }
             Command::DropTable(drop) => {
                 let mut seen = BTreeSet::new();
                 for name in &drop.names {
@@ -9674,7 +9841,7 @@ fn execute_statement(
                         CatalogCommentTarget::Database { database }
                     }
                     CommentTarget::Role { role } => {
-                        if role != "postgres" {
+                        if !role_exists(session, &role) {
                             return write_error(
                                 stream,
                                 &ErrorField {
@@ -9995,12 +10162,20 @@ fn execute_statement(
                 return write_command_complete(stream, "REVOKE");
             }
             Command::GrantDefaultTablePrivileges(grant) => {
-                grant_default_table_acl(session, &grant.grantee, &grant.privileges);
+                if let Err(error) =
+                    grant_default_table_acl(session, &grant.grantee, &grant.privileges)
+                {
+                    return write_error(stream, &error);
+                }
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, "ALTER DEFAULT PRIVILEGES");
             }
             Command::RevokeDefaultTablePrivileges(revoke) => {
-                revoke_default_table_acl(session, &revoke.grantee, &revoke.privileges);
+                if let Err(error) =
+                    revoke_default_table_acl(session, &revoke.grantee, &revoke.privileges)
+                {
+                    return write_error(stream, &error);
+                }
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, "ALTER DEFAULT PRIVILEGES");
             }
@@ -10831,7 +11006,7 @@ fn execute_statement(
         return write_single_row(
             stream,
             &[int4_column("oid"), text_column("rolname")],
-            &[vec![Some("10".to_string()), Some("postgres".to_string())]],
+            &catalog_role_oid_rows(session),
         );
     }
     if canonical == psql_list_databases_catalog_query() {
@@ -12330,6 +12505,7 @@ fn psql_describe_roles_verbose_catalog_query() -> &'static str {
 }
 
 fn catalog_psql_describe_role_rows(session: &Session, verbose: bool) -> Vec<Vec<Option<String>>> {
+    let mut rows = Vec::new();
     let mut row = vec![
         Some("postgres".to_string()),
         Some("t".to_string()),
@@ -12351,7 +12527,43 @@ fn catalog_psql_describe_role_rows(session: &Session, verbose: bool) -> Vec<Vec<
         );
     }
     row.extend([Some("t".to_string()), Some("t".to_string())]);
-    vec![row]
+    rows.push(row);
+    for role in session.roles.values() {
+        let mut row = vec![
+            Some(role.name.clone()),
+            Some("f".to_string()),
+            Some("t".to_string()),
+            Some("f".to_string()),
+            Some("f".to_string()),
+            Some(if role.login { "t" } else { "f" }.to_string()),
+            Some("-1".to_string()),
+            None,
+        ];
+        if verbose {
+            row.push(
+                session
+                    .comments
+                    .get(&CatalogCommentTarget::Role {
+                        role: role.name.clone(),
+                    })
+                    .cloned(),
+            );
+        }
+        row.extend([Some("f".to_string()), Some("f".to_string())]);
+        rows.push(row);
+    }
+    rows
+}
+
+fn catalog_role_oid_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut rows = vec![vec![Some("10".to_string()), Some("postgres".to_string())]];
+    rows.extend(
+        session
+            .roles
+            .values()
+            .map(|role| vec![Some(role.oid.to_string()), Some(role.name.clone())]),
+    );
+    rows
 }
 
 fn psql_list_databases_catalog_query() -> &'static str {
@@ -18477,7 +18689,7 @@ mod tests {
         }
 
         let mut session = Session::new(true);
-        grant_default_table_acl(&mut session, "public", &[TablePrivilege::Select]);
+        grant_default_table_acl(&mut session, "public", &[TablePrivilege::Select]).unwrap();
         session.persist_catalog_snapshot();
 
         let mut reloaded = Session::new(true);

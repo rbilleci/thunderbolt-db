@@ -21,13 +21,13 @@ use gpu_db_planner::{ExecutionPlan, Planner, PlannerConfig};
 use gpu_db_protocol::{
     parse_command, AclRelationKind, AddCheckConstraint, AddForeignKey, AddUniqueConstraint,
     ColumnDef, ColumnDefault, Command, CommentTarget, CreateDomain, CreateExtension, CreateIndex,
-    CreateMaterializedView, CreatePublication, CreateSchema, CreateSequence, CreateSubscription,
-    CreateTable, CreateView, Delete, DropConstraint, DropDomain, DropIndex, DropMaterializedView,
-    DropPublication, DropSchema, DropSequence, DropSubscription, DropTable, DropView, Insert,
-    ParseError, PublicationTarget, RefreshMaterializedView, RenameColumn, RenameConstraint,
-    RenameIndex, RenameMaterializedView, RenameSequence, RenameTable, RenameView, SchemaPrivilege,
-    Select, SelectFilterOp, SelectProjection, SequenceNextVal, SequenceSetVal, SqlType, SqlValue,
-    TablePrivilege, TruncateTable, Update,
+    CreateMaterializedView, CreatePublication, CreateRole, CreateSchema, CreateSequence,
+    CreateSubscription, CreateTable, CreateView, Delete, DropConstraint, DropDomain, DropIndex,
+    DropMaterializedView, DropPublication, DropRole, DropSchema, DropSequence, DropSubscription,
+    DropTable, DropView, Insert, ParseError, PublicationTarget, RefreshMaterializedView,
+    RenameColumn, RenameConstraint, RenameIndex, RenameMaterializedView, RenameSequence,
+    RenameTable, RenameView, SchemaPrivilege, Select, SelectFilterOp, SelectProjection,
+    SequenceNextVal, SequenceSetVal, SqlType, SqlValue, TablePrivilege, TruncateTable, Update,
 };
 use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine};
 use gpu_db_storage::{
@@ -108,6 +108,8 @@ impl ReplicatedStateMachine for KvStateMachine {
                     | Command::DropPublication(_)
                     | Command::CreateSubscription(_)
                     | Command::DropSubscription(_)
+                    | Command::CreateRole(_)
+                    | Command::DropRole(_)
                     | Command::DropTable(_)
                     | Command::TruncateTable(_)
                     | Command::DropIndex(_)
@@ -5977,6 +5979,7 @@ pub struct Engine {
     relational_domains: BTreeMap<String, RelationalDomain>,
     relational_publications: BTreeMap<String, RelationalPublication>,
     relational_subscriptions: BTreeMap<String, RelationalSubscription>,
+    relational_roles: BTreeMap<String, RelationalRole>,
     relational_public_schema_exists: bool,
     relational_public_schema_implicit: bool,
     relational_schema_acl: BTreeMap<String, BTreeSet<SchemaPrivilege>>,
@@ -6106,6 +6109,13 @@ pub struct RelationalSubscription {
     pub connection: String,
     pub publications: Vec<String>,
     pub enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationalRole {
+    pub name: String,
+    pub oid: u32,
+    pub login: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -7464,6 +7474,7 @@ impl Engine {
             relational_domains: BTreeMap::new(),
             relational_publications: BTreeMap::new(),
             relational_subscriptions: BTreeMap::new(),
+            relational_roles: BTreeMap::new(),
             relational_public_schema_exists: true,
             relational_public_schema_implicit: true,
             relational_schema_acl: BTreeMap::new(),
@@ -7751,6 +7762,8 @@ impl Engine {
             Command::DropPublication(drop) => self.apply_drop_publication(drop)?,
             Command::CreateSubscription(create) => self.apply_create_subscription(create)?,
             Command::DropSubscription(drop) => self.apply_drop_subscription(drop)?,
+            Command::CreateRole(create) => self.apply_create_role(create)?,
+            Command::DropRole(drop) => self.apply_drop_role(drop)?,
             Command::GrantTable(grant) => self.apply_grant_acl(
                 &grant.relation,
                 grant.kind,
@@ -7770,10 +7783,10 @@ impl Engine {
                 self.apply_revoke_schema_acl(&revoke.schema, &revoke.grantee, &revoke.privileges)?
             }
             Command::GrantDefaultTablePrivileges(grant) => {
-                self.apply_grant_default_table_privileges(&grant.grantee, &grant.privileges)
+                self.apply_grant_default_table_privileges(&grant.grantee, &grant.privileges)?
             }
             Command::RevokeDefaultTablePrivileges(revoke) => {
-                self.apply_revoke_default_table_privileges(&revoke.grantee, &revoke.privileges)
+                self.apply_revoke_default_table_privileges(&revoke.grantee, &revoke.privileges)?
             }
             Command::AlterColumnDefault(alter) => self.apply_alter_column_default(alter)?,
             Command::CommentOn(comment) => self.apply_comment_on(comment)?,
@@ -9516,6 +9529,90 @@ impl Engine {
         Ok(())
     }
 
+    fn role_exists(&self, role: &str) -> bool {
+        role == "postgres" || self.relational_roles.contains_key(role)
+    }
+
+    fn apply_create_role(&mut self, create: CreateRole) -> Result<(), EngineError> {
+        if create.name == "postgres" || self.relational_roles.contains_key(&create.name) {
+            return Err(EngineError::ApplyFailed(format!(
+                "role \"{}\" already exists",
+                create.name
+            )));
+        }
+        let oid = self.relational_next_oid;
+        self.relational_next_oid = self.relational_next_oid.checked_add(1).ok_or_else(|| {
+            EngineError::ApplyFailed("relational OID counter overflow".to_string())
+        })?;
+        self.relational_roles.insert(
+            create.name.clone(),
+            RelationalRole {
+                name: create.name,
+                oid,
+                login: create.login,
+            },
+        );
+        Ok(())
+    }
+
+    fn role_has_dependencies(&self, role: &str) -> bool {
+        self.relational_comments
+            .contains_key(&RelationalCommentTarget::Role {
+                role: role.to_string(),
+            })
+            || self
+                .relational_catalog
+                .values()
+                .any(|table| table.acl.contains_key(role))
+            || self
+                .relational_views
+                .values()
+                .any(|view| view.acl.contains_key(role))
+            || self
+                .relational_materialized_views
+                .values()
+                .any(|view| view.acl.contains_key(role))
+            || self
+                .relational_sequences
+                .values()
+                .any(|sequence| sequence.acl.contains_key(role))
+            || self.relational_schema_acl.contains_key(role)
+            || self.relational_default_table_acl.contains_key(role)
+    }
+
+    fn apply_drop_role(&mut self, drop: DropRole) -> Result<(), EngineError> {
+        let mut seen = BTreeSet::new();
+        for role in &drop.names {
+            if !seen.insert(role.clone()) {
+                return Err(EngineError::ApplyFailed(format!(
+                    "role \"{}\" specified more than once",
+                    role
+                )));
+            }
+            if role == "postgres" {
+                return Err(EngineError::ApplyFailed(
+                    "cannot drop bootstrap role \"postgres\"".to_string(),
+                ));
+            }
+            if !drop.if_exists && !self.relational_roles.contains_key(role) {
+                return Err(EngineError::ApplyFailed(format!(
+                    "role \"{}\" does not exist",
+                    role
+                )));
+            }
+            if self.relational_roles.contains_key(role) && self.role_has_dependencies(role) {
+                return Err(EngineError::ApplyFailed(format!(
+                    "role \"{}\" cannot be dropped because dependent metadata exists",
+                    role
+                )));
+            }
+        }
+        for role in drop.names {
+            self.relational_roles.remove(&role);
+        }
+        Ok(())
+    }
+
     fn preflight_drop_publication(&self, drop: &DropPublication) -> Result<(), EngineError> {
         let mut seen = BTreeSet::new();
         for name in &drop.names {
@@ -9792,6 +9889,16 @@ impl Engine {
         Ok(())
     }
 
+    fn preflight_acl_grantee(&self, grantee: &str) -> Result<(), EngineError> {
+        if self.role_exists(grantee) || grantee == "public" {
+            Ok(())
+        } else {
+            Err(EngineError::ApplyFailed(format!(
+                "role \"{grantee}\" does not exist"
+            )))
+        }
+    }
+
     fn acl_relation_kind(&self, relation: &str) -> Option<AclRelationKind> {
         if self.relational_catalog.contains_key(relation) {
             Some(AclRelationKind::Table)
@@ -9831,6 +9938,7 @@ impl Engine {
         privileges: &[TablePrivilege],
     ) -> Result<(), EngineError> {
         self.preflight_acl_target(relation, kind)?;
+        self.preflight_acl_grantee(grantee)?;
         let acl = self
             .relational_acl_mut(relation)
             .expect("relation ACL target preflighted")
@@ -9850,6 +9958,7 @@ impl Engine {
         privileges: &[TablePrivilege],
     ) -> Result<(), EngineError> {
         self.preflight_acl_target(relation, kind)?;
+        self.preflight_acl_grantee(grantee)?;
         let relation_acl = self
             .relational_acl_mut(relation)
             .expect("relation ACL target preflighted");
@@ -9880,6 +9989,7 @@ impl Engine {
         privileges: &[SchemaPrivilege],
     ) -> Result<(), EngineError> {
         self.preflight_schema_acl_target(schema)?;
+        self.preflight_acl_grantee(grantee)?;
         let acl = self
             .relational_schema_acl
             .entry(grantee.to_string())
@@ -9897,6 +10007,7 @@ impl Engine {
         privileges: &[SchemaPrivilege],
     ) -> Result<(), EngineError> {
         self.preflight_schema_acl_target(schema)?;
+        self.preflight_acl_grantee(grantee)?;
         if let Some(acl) = self.relational_schema_acl.get_mut(grantee) {
             for privilege in privileges {
                 acl.remove(privilege);
@@ -9912,7 +10023,8 @@ impl Engine {
         &mut self,
         grantee: &str,
         privileges: &[TablePrivilege],
-    ) {
+    ) -> Result<(), EngineError> {
+        self.preflight_acl_grantee(grantee)?;
         let acl = self
             .relational_default_table_acl
             .entry(grantee.to_string())
@@ -9920,13 +10032,15 @@ impl Engine {
         for privilege in privileges {
             acl.insert(*privilege);
         }
+        Ok(())
     }
 
     fn apply_revoke_default_table_privileges(
         &mut self,
         grantee: &str,
         privileges: &[TablePrivilege],
-    ) {
+    ) -> Result<(), EngineError> {
+        self.preflight_acl_grantee(grantee)?;
         if let Some(acl) = self.relational_default_table_acl.get_mut(grantee) {
             for privilege in privileges {
                 acl.remove(privilege);
@@ -9935,6 +10049,7 @@ impl Engine {
                 self.relational_default_table_acl.remove(grantee);
             }
         }
+        Ok(())
     }
 
     fn preflight_create_materialized_view(
@@ -10166,7 +10281,7 @@ impl Engine {
                 RelationalCommentTarget::Database { database }
             }
             CommentTarget::Role { role } => {
-                if role != "postgres" {
+                if !self.role_exists(&role) {
                     return Err(EngineError::ApplyFailed(format!(
                         "role \"{}\" does not exist",
                         role
@@ -11710,17 +11825,68 @@ impl Engine {
             Command::DropMaterializedView(drop) => self.preflight_drop_materialized_view(drop)?,
             Command::DropSequence(drop) => self.preflight_drop_sequence(drop)?,
             Command::DropDomain(drop) => self.preflight_drop_domain(drop)?,
-            Command::GrantTable(grant) => self.preflight_acl_target(&grant.relation, grant.kind)?,
-            Command::RevokeTable(revoke) => {
-                self.preflight_acl_target(&revoke.relation, revoke.kind)?
+            Command::GrantTable(grant) => {
+                self.preflight_acl_target(&grant.relation, grant.kind)?;
+                self.preflight_acl_grantee(&grant.grantee)?;
             }
-            Command::GrantSchema(grant) => self.preflight_schema_acl_target(&grant.schema)?,
-            Command::RevokeSchema(revoke) => self.preflight_schema_acl_target(&revoke.schema)?,
+            Command::RevokeTable(revoke) => {
+                self.preflight_acl_target(&revoke.relation, revoke.kind)?;
+                self.preflight_acl_grantee(&revoke.grantee)?;
+            }
+            Command::GrantSchema(grant) => {
+                self.preflight_schema_acl_target(&grant.schema)?;
+                self.preflight_acl_grantee(&grant.grantee)?;
+            }
+            Command::RevokeSchema(revoke) => {
+                self.preflight_schema_acl_target(&revoke.schema)?;
+                self.preflight_acl_grantee(&revoke.grantee)?;
+            }
             Command::CreatePublication(create) => self.preflight_create_publication(create)?,
             Command::DropPublication(drop) => self.preflight_drop_publication(drop)?,
             Command::CreateSubscription(create) => self.preflight_create_subscription(create)?,
             Command::DropSubscription(drop) => self.preflight_drop_subscription(drop)?,
-            Command::GrantDefaultTablePrivileges(_) | Command::RevokeDefaultTablePrivileges(_) => {}
+            Command::CreateRole(create) if self.role_exists(&create.name) => {
+                return Err(EngineError::ApplyFailed(format!(
+                    "role \"{}\" already exists",
+                    create.name
+                )));
+            }
+            Command::CreateRole(_) => {}
+            Command::DropRole(drop) => {
+                let mut seen = BTreeSet::new();
+                for role in &drop.names {
+                    if !seen.insert(role.clone()) {
+                        return Err(EngineError::ApplyFailed(format!(
+                            "role \"{}\" specified more than once",
+                            role
+                        )));
+                    }
+                    if role == "postgres" {
+                        return Err(EngineError::ApplyFailed(
+                            "cannot drop bootstrap role \"postgres\"".to_string(),
+                        ));
+                    }
+                    if !drop.if_exists && !self.relational_roles.contains_key(role) {
+                        return Err(EngineError::ApplyFailed(format!(
+                            "role \"{}\" does not exist",
+                            role
+                        )));
+                    }
+                    if self.relational_roles.contains_key(role) && self.role_has_dependencies(role)
+                    {
+                        return Err(EngineError::ApplyFailed(format!(
+                            "role \"{}\" cannot be dropped because dependent metadata exists",
+                            role
+                        )));
+                    }
+                }
+            }
+            Command::GrantDefaultTablePrivileges(grant) => {
+                self.preflight_acl_grantee(&grant.grantee)?;
+            }
+            Command::RevokeDefaultTablePrivileges(revoke) => {
+                self.preflight_acl_grantee(&revoke.grantee)?;
+            }
             Command::Insert(insert) => {
                 let table = self.relational_catalog.get(&insert.table).ok_or_else(|| {
                     EngineError::ApplyFailed(format!(
@@ -12040,6 +12206,8 @@ impl Engine {
             | Command::DropPublication(_)
             | Command::CreateSubscription(_)
             | Command::DropSubscription(_)
+            | Command::CreateRole(_)
+            | Command::DropRole(_)
             | Command::GrantDefaultTablePrivileges(_)
             | Command::RevokeDefaultTablePrivileges(_)
             | Command::AlterColumnDefault(_)
@@ -12273,6 +12441,8 @@ impl Engine {
             | Command::DropPublication(_)
             | Command::CreateSubscription(_)
             | Command::DropSubscription(_)
+            | Command::CreateRole(_)
+            | Command::DropRole(_)
             | Command::GrantDefaultTablePrivileges(_)
             | Command::RevokeDefaultTablePrivileges(_)
             | Command::AlterColumnDefault(_)
@@ -12420,6 +12590,8 @@ impl Engine {
                 Err(ExecuteError::NonReadCommand("CREATE SUBSCRIPTION"))
             }
             Command::DropSubscription(_) => Err(ExecuteError::NonReadCommand("DROP SUBSCRIPTION")),
+            Command::CreateRole(_) => Err(ExecuteError::NonReadCommand("CREATE ROLE")),
+            Command::DropRole(_) => Err(ExecuteError::NonReadCommand("DROP ROLE")),
             Command::GrantDefaultTablePrivileges(_) => {
                 Err(ExecuteError::NonReadCommand("ALTER DEFAULT PRIVILEGES"))
             }
@@ -15611,6 +15783,10 @@ impl Engine {
             .map(String::as_str)
     }
 
+    pub fn relational_role(&self, role: &str) -> Option<&RelationalRole> {
+        self.relational_roles.get(role)
+    }
+
     pub fn relational_schema_comment(&self, schema: &str) -> Option<&str> {
         self.relational_comments
             .get(&RelationalCommentTarget::Schema {
@@ -17816,6 +17992,87 @@ mod tests {
                 if message == "plpgsql extension creation is only supported in pg_catalog"
         ));
         assert_eq!(e.metrics().commits_total, 0);
+    }
+
+    #[test]
+    fn execute_text_replays_bounded_role_metadata_and_acl_grantees() {
+        let mut e = Engine::new_local();
+
+        e.execute_text(1, "CREATE ROLE app_reader WITH LOGIN")
+            .unwrap();
+        e.execute_text(2, "CREATE USER app_writer").unwrap();
+        e.execute_text(3, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(4, "GRANT SELECT ON TABLE people TO app_reader")
+            .unwrap();
+        e.execute_text(
+            5,
+            "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO app_writer",
+        )
+        .unwrap();
+        e.execute_text(6, "COMMENT ON ROLE app_reader IS 'read-only app'")
+            .unwrap();
+
+        assert!(e.relational_role("app_reader").unwrap().login);
+        assert!(e.relational_role("app_writer").unwrap().login);
+        assert_eq!(
+            e.relational_role_comment("app_reader"),
+            Some("read-only app")
+        );
+        assert!(e
+            .relational_catalog_table("people")
+            .unwrap()
+            .acl
+            .contains_key("app_reader"));
+        assert!(e.relational_default_table_acl.contains_key("app_writer"));
+
+        let dependent_drop = e.execute_text(7, "DROP ROLE app_reader").unwrap_err();
+        assert!(dependent_drop
+            .to_string()
+            .contains("dependent metadata exists"));
+
+        e.execute_text(8, "REVOKE SELECT ON TABLE people FROM app_reader")
+            .unwrap();
+        e.execute_text(9, "COMMENT ON ROLE app_reader IS NULL")
+            .unwrap();
+        e.execute_text(10, "DROP ROLE app_reader").unwrap();
+        e.execute_text(11, "DROP USER IF EXISTS app_missing")
+            .unwrap();
+
+        assert!(e.relational_role("app_reader").is_none());
+        assert!(e.relational_role("app_writer").is_some());
+
+        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        assert!(recovered.relational_role("app_reader").is_none());
+        assert!(recovered.relational_role("app_writer").unwrap().login);
+        assert!(recovered
+            .relational_default_table_acl
+            .contains_key("app_writer"));
+
+        let missing_grantee = Engine::new_local()
+            .execute_text(1, "GRANT SELECT ON TABLE people TO missing_role")
+            .unwrap_err();
+        assert!(missing_grantee
+            .to_string()
+            .contains("relation \"people\" does not exist"));
+
+        let mut missing_role = Engine::new_local();
+        missing_role
+            .execute_text(1, "CREATE TABLE people (id INT)")
+            .unwrap();
+        assert!(missing_role
+            .execute_text(2, "GRANT SELECT ON TABLE people TO missing_role")
+            .unwrap_err()
+            .to_string()
+            .contains("role \"missing_role\" does not exist"));
+        assert!(missing_role
+            .execute_text(3, "DROP ROLE postgres")
+            .unwrap_err()
+            .to_string()
+            .contains("cannot drop bootstrap role"));
+        assert!(missing_role
+            .execute_text(4, "CREATE ROLE app_password PASSWORD 'secret'")
+            .is_err());
     }
 
     #[test]
