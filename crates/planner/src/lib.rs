@@ -72,6 +72,7 @@ impl Planner {
             | Command::CreateView(_)
             | Command::RenameView(_)
             | Command::CreateSequence(_)
+            | Command::RenameSequence(_)
             | Command::DropTable(_)
             | Command::TruncateTable(_)
             | Command::DropIndex(_)

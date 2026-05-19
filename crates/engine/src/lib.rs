@@ -22,8 +22,8 @@ use gpu_db_protocol::{
     parse_command, AddUniqueConstraint, ColumnDef, Command, CommentTarget, CreateIndex,
     CreateSequence, CreateTable, CreateView, Delete, DropConstraint, DropIndex, DropSequence,
     DropTable, DropView, Insert, ParseError, RenameColumn, RenameConstraint, RenameIndex,
-    RenameTable, RenameView, Select, SelectFilterOp, SelectProjection, SqlType, SqlValue,
-    TruncateTable, Update,
+    RenameSequence, RenameTable, RenameView, Select, SelectFilterOp, SelectProjection, SqlType,
+    SqlValue, TruncateTable, Update,
 };
 use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine};
 use gpu_db_storage::{
@@ -87,6 +87,7 @@ impl ReplicatedStateMachine for KvStateMachine {
                     | Command::CreateView(_)
                     | Command::RenameView(_)
                     | Command::CreateSequence(_)
+                    | Command::RenameSequence(_)
                     | Command::DropTable(_)
                     | Command::TruncateTable(_)
                     | Command::DropIndex(_)
@@ -7546,6 +7547,7 @@ impl Engine {
             Command::CreateView(create) => self.apply_create_view(create)?,
             Command::RenameView(rename) => self.apply_rename_view(rename)?,
             Command::CreateSequence(create) => self.apply_create_sequence(create)?,
+            Command::RenameSequence(rename) => self.apply_rename_sequence(rename)?,
             Command::DropTable(drop) => self.apply_drop_table(drop, txn_id)?,
             Command::TruncateTable(truncate) => self.apply_truncate_table(truncate, txn_id)?,
             Command::DropIndex(drop) => self.apply_drop_index(drop)?,
@@ -8398,6 +8400,64 @@ impl Engine {
                 .remove(&RelationalCommentTarget::Sequence {
                     sequence: name.clone(),
                 });
+        }
+        Ok(())
+    }
+
+    fn apply_rename_sequence(&mut self, rename: RenameSequence) -> Result<(), EngineError> {
+        if self.relational_catalog.contains_key(&rename.old_name)
+            || self.relational_views.contains_key(&rename.old_name)
+        {
+            return Err(EngineError::ApplyFailed(format!(
+                "relation \"{}\" is not a sequence",
+                rename.old_name
+            )));
+        }
+        if !self.relational_sequences.contains_key(&rename.old_name) {
+            return Err(EngineError::ApplyFailed(format!(
+                "sequence \"{}\" does not exist",
+                rename.old_name
+            )));
+        }
+        if self.relational_catalog.contains_key(&rename.new_name)
+            || self.relational_views.contains_key(&rename.new_name)
+            || self.relational_sequences.contains_key(&rename.new_name)
+        {
+            return Err(EngineError::ApplyFailed(format!(
+                "relation \"{}\" already exists",
+                rename.new_name
+            )));
+        }
+        let Some(mut sequence) = self.relational_sequences.remove(&rename.old_name) else {
+            return Ok(());
+        };
+        sequence.name = rename.new_name.clone();
+        self.relational_sequences
+            .insert(rename.new_name.clone(), sequence);
+
+        let old_target = RelationalCommentTarget::Sequence {
+            sequence: rename.old_name,
+        };
+        if let Some(comment) = self.relational_comments.remove(&old_target) {
+            self.relational_comments.insert(
+                RelationalCommentTarget::Sequence {
+                    sequence: rename.new_name,
+                },
+                comment,
+            );
+        }
+        Ok(())
+    }
+
+    fn preflight_create_sequence(&self, create: &CreateSequence) -> Result<(), EngineError> {
+        if self.relational_catalog.contains_key(&create.name)
+            || self.relational_views.contains_key(&create.name)
+            || self.relational_sequences.contains_key(&create.name)
+        {
+            return Err(EngineError::ApplyFailed(format!(
+                "relation \"{}\" already exists",
+                create.name
+            )));
         }
         Ok(())
     }
@@ -9309,7 +9369,9 @@ impl Engine {
                 }
             }
             Command::RenameTable(rename) => {
-                if self.relational_views.contains_key(&rename.old_name) {
+                if self.relational_views.contains_key(&rename.old_name)
+                    || self.relational_sequences.contains_key(&rename.old_name)
+                {
                     return Err(EngineError::ApplyFailed(format!(
                         "relation \"{}\" is not a table",
                         rename.old_name
@@ -9326,6 +9388,7 @@ impl Engine {
                 }
                 if self.relational_catalog.contains_key(&rename.new_name)
                     || self.relational_views.contains_key(&rename.new_name)
+                    || self.relational_sequences.contains_key(&rename.new_name)
                 {
                     return Err(EngineError::ApplyFailed(format!(
                         "relation \"{}\" already exists",
@@ -9458,6 +9521,33 @@ impl Engine {
                 }
                 if self.relational_catalog.contains_key(&rename.new_name)
                     || self.relational_views.contains_key(&rename.new_name)
+                    || self.relational_sequences.contains_key(&rename.new_name)
+                {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "relation \"{}\" already exists",
+                        rename.new_name
+                    )));
+                }
+            }
+            Command::CreateSequence(create) => self.preflight_create_sequence(create)?,
+            Command::RenameSequence(rename) => {
+                if self.relational_catalog.contains_key(&rename.old_name)
+                    || self.relational_views.contains_key(&rename.old_name)
+                {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "relation \"{}\" is not a sequence",
+                        rename.old_name
+                    )));
+                }
+                if !self.relational_sequences.contains_key(&rename.old_name) {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "sequence \"{}\" does not exist",
+                        rename.old_name
+                    )));
+                }
+                if self.relational_catalog.contains_key(&rename.new_name)
+                    || self.relational_views.contains_key(&rename.new_name)
+                    || self.relational_sequences.contains_key(&rename.new_name)
                 {
                     return Err(EngineError::ApplyFailed(format!(
                         "relation \"{}\" already exists",
@@ -9687,6 +9777,7 @@ impl Engine {
             | Command::CreateView(_)
             | Command::RenameView(_)
             | Command::CreateSequence(_)
+            | Command::RenameSequence(_)
             | Command::DropTable(_)
             | Command::TruncateTable(_)
             | Command::DropIndex(_)
@@ -9893,6 +9984,7 @@ impl Engine {
             | Command::CreateView(_)
             | Command::RenameView(_)
             | Command::CreateSequence(_)
+            | Command::RenameSequence(_)
             | Command::DropTable(_)
             | Command::TruncateTable(_)
             | Command::DropIndex(_)
@@ -10000,6 +10092,7 @@ impl Engine {
             Command::CreateView(_) => Err(ExecuteError::NonReadCommand("CREATE VIEW")),
             Command::RenameView(_) => Err(ExecuteError::NonReadCommand("ALTER VIEW")),
             Command::CreateSequence(_) => Err(ExecuteError::NonReadCommand("CREATE SEQUENCE")),
+            Command::RenameSequence(_) => Err(ExecuteError::NonReadCommand("ALTER SEQUENCE")),
             Command::DropTable(_) => Err(ExecuteError::NonReadCommand("DROP TABLE")),
             Command::TruncateTable(_) => Err(ExecuteError::NonReadCommand("TRUNCATE TABLE")),
             Command::DropIndex(_) => Err(ExecuteError::NonReadCommand("DROP INDEX")),
@@ -32117,29 +32210,47 @@ mod tests {
             e.relational_sequence_comment("people_seq"),
             Some("people ids")
         );
+        e.execute_text(
+            4,
+            "ALTER SEQUENCE public.people_seq RENAME TO people_id_seq",
+        )
+        .unwrap();
+
+        assert!(e.relational_catalog_sequence("people_seq").is_none());
+        let renamed_sequence = e.relational_catalog_sequence("people_id_seq").unwrap();
+        assert_eq!(renamed_sequence.name, "people_id_seq");
+        assert_eq!(renamed_sequence.oid, oid);
+        assert_eq!(
+            e.relational_sequence_comment("people_id_seq"),
+            Some("people ids")
+        );
+        assert_eq!(e.relational_sequence_comment("people_seq"), None);
 
         let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        assert!(recovered
+            .relational_catalog_sequence("people_seq")
+            .is_none());
         assert_eq!(
             recovered
-                .relational_catalog_sequence("people_seq")
+                .relational_catalog_sequence("people_id_seq")
                 .unwrap()
                 .oid,
             oid
         );
         assert_eq!(
-            recovered.relational_sequence_comment("people_seq"),
+            recovered.relational_sequence_comment("people_id_seq"),
             Some("people ids")
         );
 
-        e.execute_text(4, "DROP SEQUENCE IF EXISTS missing_seq, people_seq")
+        e.execute_text(5, "DROP SEQUENCE IF EXISTS missing_seq, people_id_seq")
             .unwrap();
-        assert!(e.relational_catalog_sequence("people_seq").is_none());
-        assert_eq!(e.relational_sequence_comment("people_seq"), None);
+        assert!(e.relational_catalog_sequence("people_id_seq").is_none());
+        assert_eq!(e.relational_sequence_comment("people_id_seq"), None);
 
         let recovered_after_drop =
             Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
         assert!(recovered_after_drop
-            .relational_catalog_sequence("people_seq")
+            .relational_catalog_sequence("people_id_seq")
             .is_none());
 
         let mut boundary = Engine::new_local();
@@ -32162,6 +32273,24 @@ mod tests {
         assert!(missing
             .to_string()
             .contains("sequence \"missing_seq\" does not exist"));
+
+        let mut rename_boundary = Engine::new_local();
+        rename_boundary
+            .execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        rename_boundary
+            .execute_text(2, "CREATE SEQUENCE people_seq")
+            .unwrap();
+        let duplicate_rename = rename_boundary
+            .execute_text(3, "ALTER SEQUENCE people_seq RENAME TO people_seq")
+            .unwrap_err();
+        assert!(duplicate_rename
+            .to_string()
+            .contains("relation \"people_seq\" already exists"));
+        let table_rename_target = rename_boundary
+            .execute_text(4, "ALTER SEQUENCE people RENAME TO people_seq_renamed")
+            .unwrap_err();
+        assert!(table_rename_target.to_string().contains("not a sequence"));
     }
 
     #[test]

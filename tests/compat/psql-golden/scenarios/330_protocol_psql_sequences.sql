@@ -2,6 +2,7 @@
 CREATE SEQUENCE public.seq_people;
 CREATE SEQUENCE seq_teams;
 COMMENT ON SEQUENCE public.seq_people IS 'people ids';
+ALTER SEQUENCE public.seq_people RENAME TO seq_person_ids;
 \ds
 \ds+
 SELECT c.oid, n.nspname, c.relname, c.relkind, c.relpersistence
@@ -19,7 +20,12 @@ ORDER BY c.relname, d.objsubid;
 \dd seq_*
 DROP SEQUENCE seq_missing;
 \ds
-DROP SEQUENCE public.seq_people, public.seq_teams;
+ALTER SEQUENCE seq_missing RENAME TO seq_archived;
+ALTER SEQUENCE seq_person_ids RENAME TO seq_teams;
+CREATE TABLE seq_table_conflict (id INT);
+ALTER SEQUENCE seq_teams RENAME TO seq_table_conflict;
+ALTER SEQUENCE seq_table_conflict RENAME TO seq_after_table;
+DROP SEQUENCE public.seq_person_ids, public.seq_teams;
 \ds
 CREATE TABLE seq_table_target (id INT);
 DROP SEQUENCE seq_table_target;

@@ -1529,6 +1529,60 @@ fn rename_index_in_session(
     Ok(())
 }
 
+fn rename_sequence_in_session(
+    session: &mut Session,
+    old_name: &str,
+    new_name: &str,
+) -> Result<(), ErrorField> {
+    if session.tables.contains_key(old_name) || session.views.contains_key(old_name) {
+        return Err(ErrorField {
+            code: "42809",
+            message: "relation is not a sequence",
+            position: None,
+        });
+    }
+    if !session.sequences.contains_key(old_name) {
+        return Err(ErrorField {
+            code: "42P01",
+            message: "sequence does not exist",
+            position: None,
+        });
+    }
+    if session.tables.contains_key(new_name)
+        || session.views.contains_key(new_name)
+        || session.sequences.contains_key(new_name)
+    {
+        return Err(ErrorField {
+            code: "42P07",
+            message: "relation already exists",
+            position: None,
+        });
+    }
+    let mut sequence = session
+        .sequences
+        .remove(old_name)
+        .expect("sequence existence validated");
+    sequence.name = new_name.to_string();
+    session.sequences.insert(new_name.to_string(), sequence);
+    session.mark_sequence_dirty(old_name.to_string());
+    session.mark_sequence_dirty(new_name.to_string());
+
+    let old_target = CatalogCommentTarget::Sequence {
+        sequence: old_name.to_string(),
+    };
+    if let Some(comment) = session.comments.remove(&old_target) {
+        let new_target = CatalogCommentTarget::Sequence {
+            sequence: new_name.to_string(),
+        };
+        session.comments.insert(new_target.clone(), comment);
+        session.mark_comment_dirty(old_target);
+        session.mark_comment_dirty(new_target);
+    }
+
+    session.persist_catalog_snapshot();
+    Ok(())
+}
+
 fn rename_table_in_session(
     session: &mut Session,
     old_name: &str,
@@ -1552,7 +1606,10 @@ fn rename_table_in_session(
             position: None,
         });
     }
-    if session.tables.contains_key(new_name) || session.views.contains_key(new_name) {
+    if session.tables.contains_key(new_name)
+        || session.views.contains_key(new_name)
+        || session.sequences.contains_key(new_name)
+    {
         return Err(ErrorField {
             code: "42P07",
             message: "relation already exists",
@@ -6802,6 +6859,14 @@ fn execute_statement(
                 session.mark_sequence_dirty(name);
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, "CREATE SEQUENCE");
+            }
+            Command::RenameSequence(rename) => {
+                if let Err(error) =
+                    rename_sequence_in_session(session, &rename.old_name, &rename.new_name)
+                {
+                    return write_error(stream, &error);
+                }
+                return write_command_complete(stream, "ALTER SEQUENCE");
             }
             Command::DropView(drop) => {
                 let mut seen = BTreeSet::new();
@@ -14459,6 +14524,88 @@ mod tests {
         });
         catalog.comments.remove(&CatalogCommentTarget::Index {
             index: new_index_name.to_string(),
+        });
+    }
+
+    #[test]
+    fn shared_catalog_persistence_carries_renamed_sequence_metadata() {
+        let old_sequence_name = "shared_rename_people_seq";
+        let new_sequence_name = "shared_renamed_people_seq";
+        {
+            let mut catalog = shared_catalog()
+                .lock()
+                .expect("shared catalog mutex poisoned");
+            catalog.sequences.remove(old_sequence_name);
+            catalog.sequences.remove(new_sequence_name);
+            catalog.comments.remove(&CatalogCommentTarget::Sequence {
+                sequence: old_sequence_name.to_string(),
+            });
+            catalog.comments.remove(&CatalogCommentTarget::Sequence {
+                sequence: new_sequence_name.to_string(),
+            });
+        }
+
+        let mut session = Session::new(true);
+        session.sequences.insert(
+            old_sequence_name.to_string(),
+            Sequence {
+                oid: FIRST_USER_RELATION_OID,
+                name: old_sequence_name.to_string(),
+            },
+        );
+        session.comments.insert(
+            CatalogCommentTarget::Sequence {
+                sequence: old_sequence_name.to_string(),
+            },
+            "people ids".to_string(),
+        );
+        session.mark_sequence_dirty(old_sequence_name);
+        session.mark_comment_dirty(CatalogCommentTarget::Sequence {
+            sequence: old_sequence_name.to_string(),
+        });
+        session.persist_catalog_snapshot();
+
+        rename_sequence_in_session(&mut session, old_sequence_name, new_sequence_name).unwrap();
+
+        let reloaded = Session::new(true);
+        assert!(pg_catalog_class_sequence_rows(&reloaded).contains(&vec![
+            Some(FIRST_USER_RELATION_OID.to_string()),
+            Some("public".to_string()),
+            Some(new_sequence_name.to_string()),
+            Some("s".to_string()),
+            Some("p".to_string()),
+        ]));
+        assert!(
+            psql_describe_sequence_verbose_rows(&reloaded).contains(&vec![
+                Some("public".to_string()),
+                Some(new_sequence_name.to_string()),
+                Some("sequence".to_string()),
+                Some("postgres".to_string()),
+                Some("permanent".to_string()),
+                Some("0 bytes".to_string()),
+                Some("people ids".to_string()),
+            ])
+        );
+        assert!(!pg_catalog_class_sequence_rows(&reloaded)
+            .iter()
+            .any(|row| row.get(2).and_then(Option::as_deref) == Some(old_sequence_name)));
+        assert_eq!(
+            rename_sequence_in_session(&mut session, "missing_seq", "another_seq")
+                .unwrap_err()
+                .code,
+            "42P01"
+        );
+
+        let mut catalog = shared_catalog()
+            .lock()
+            .expect("shared catalog mutex poisoned");
+        catalog.sequences.remove(old_sequence_name);
+        catalog.sequences.remove(new_sequence_name);
+        catalog.comments.remove(&CatalogCommentTarget::Sequence {
+            sequence: old_sequence_name.to_string(),
+        });
+        catalog.comments.remove(&CatalogCommentTarget::Sequence {
+            sequence: new_sequence_name.to_string(),
         });
     }
 
