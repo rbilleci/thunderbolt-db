@@ -5440,12 +5440,23 @@ fn is_simple_copy_identifier(identifier: &str) -> bool {
             .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
-fn parse_truncate_table(statement: &str) -> Option<String> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ParsedTruncateTable {
+    table: String,
+    restart_identity: bool,
+}
+
+fn parse_truncate_table(statement: &str) -> Option<ParsedTruncateTable> {
     let statement = strip_leading_sql_comments(statement.trim())?;
     let canonical = canonical_sql(statement);
     let mut target = canonical.strip_prefix("truncate ")?.trim();
     target = target.strip_prefix("table ").unwrap_or(target).trim();
     target = target.strip_prefix("only ").unwrap_or(target).trim();
+    let mut restart_identity = false;
+    if let Some(before_restart) = target.strip_suffix(" restart identity") {
+        target = before_restart.trim_end();
+        restart_identity = true;
+    }
     if target.contains(" cascade")
         || target.contains(" restrict")
         || target.contains(" restart ")
@@ -5465,7 +5476,10 @@ fn parse_truncate_table(statement: &str) -> Option<String> {
     if table.contains('.') && !table.starts_with("public.") {
         return None;
     }
-    Some(table.strip_prefix("public.").unwrap_or(table).to_string())
+    Some(ParsedTruncateTable {
+        table: table.strip_prefix("public.").unwrap_or(table).to_string(),
+        restart_identity,
+    })
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -6265,10 +6279,10 @@ fn execute_statement(
     if canonical.starts_with("lock table ") && canonical.ends_with(" in access share mode") {
         return write_command_complete(stream, "LOCK TABLE");
     }
-    if let Some(table_name) = parse_truncate_table(statement) {
-        if session.views.contains_key(&table_name)
-            || session.materialized_views.contains_key(&table_name)
-            || session.sequences.contains_key(&table_name)
+    if let Some(truncate) = parse_truncate_table(statement) {
+        if session.views.contains_key(&truncate.table)
+            || session.materialized_views.contains_key(&truncate.table)
+            || session.sequences.contains_key(&truncate.table)
         {
             return write_error(
                 stream,
@@ -6279,7 +6293,39 @@ fn execute_statement(
                 },
             );
         }
-        let Some(table) = session.tables.get_mut(&table_name) else {
+        let restart_sequences = if truncate.restart_identity {
+            session
+                .tables
+                .get(&truncate.table)
+                .map(|table| {
+                    table
+                        .columns
+                        .iter()
+                        .filter_map(|column| match &column.def.default {
+                            Some(ColumnDefault::SequenceNextVal { sequence, .. }) => {
+                                Some(sequence.clone())
+                            }
+                            _ => None,
+                        })
+                        .collect::<BTreeSet<_>>()
+                })
+                .unwrap_or_default()
+        } else {
+            BTreeSet::new()
+        };
+        for sequence in &restart_sequences {
+            if !session.sequences.contains_key(sequence) {
+                return write_error(
+                    stream,
+                    &ErrorField {
+                        code: "42P01",
+                        message: "sequence does not exist",
+                        position: None,
+                    },
+                );
+            }
+        }
+        let Some(table) = session.tables.get_mut(&truncate.table) else {
             return write_error(
                 stream,
                 &ErrorField {
@@ -6290,7 +6336,17 @@ fn execute_statement(
             );
         };
         table.rows.clear();
-        session.mark_table_dirty(table_name);
+        session.mark_table_dirty(truncate.table);
+        for sequence in restart_sequences {
+            let sequence_state = session
+                .sequences
+                .get_mut(&sequence)
+                .expect("truncate restart identity sequence preflighted");
+            sequence_state.last_value = 1;
+            sequence_state.is_called = false;
+            session.currval_sequences.remove(&sequence);
+            session.mark_sequence_dirty(sequence);
+        }
         session.persist_catalog_snapshot();
         return write_command_complete(stream, "TRUNCATE TABLE");
     }
@@ -16415,18 +16471,34 @@ mod tests {
     fn truncate_table_detection_is_narrow() {
         assert_eq!(
             parse_truncate_table("TRUNCATE TABLE ONLY public.people;"),
-            Some("people".to_string())
+            Some(ParsedTruncateTable {
+                table: "people".to_string(),
+                restart_identity: false,
+            })
         );
         assert_eq!(
             parse_truncate_table("/* restore */ TRUNCATE TABLE people;"),
-            Some("people".to_string())
+            Some(ParsedTruncateTable {
+                table: "people".to_string(),
+                restart_identity: false,
+            })
         );
         assert_eq!(
             parse_truncate_table("TRUNCATE people"),
-            Some("people".to_string())
+            Some(ParsedTruncateTable {
+                table: "people".to_string(),
+                restart_identity: false,
+            })
         );
         assert_eq!(
             parse_truncate_table("TRUNCATE TABLE public.people RESTART IDENTITY"),
+            Some(ParsedTruncateTable {
+                table: "people".to_string(),
+                restart_identity: true,
+            })
+        );
+        assert_eq!(
+            parse_truncate_table("TRUNCATE TABLE public.people CONTINUE IDENTITY"),
             None
         );
         assert_eq!(parse_truncate_table("TRUNCATE TABLE people CASCADE"), None);
@@ -17079,10 +17151,22 @@ mod tests {
                     def: gpu_db_protocol::ColumnDef {
                         name: "id".to_string(),
                         ty: SqlType::Int4,
-                        default: None,
+                        default: Some(ColumnDefault::SequenceNextVal {
+                            sequence: "people_id_seq".to_string(),
+                            create_if_missing: false,
+                        }),
                     },
                 }],
                 rows: vec![vec![SqlValue::Int4(1)], vec![SqlValue::Int4(2)]],
+            },
+        );
+        session.sequences.insert(
+            "people_id_seq".to_string(),
+            Sequence {
+                oid: FIRST_USER_RELATION_OID + 1,
+                name: "people_id_seq".to_string(),
+                last_value: 2,
+                is_called: true,
             },
         );
         let (mut writer, mut reader) = tcp_pair();
@@ -17090,7 +17174,7 @@ mod tests {
         execute_statement(
             &mut writer,
             &mut session,
-            "TRUNCATE TABLE ONLY public.people",
+            "TRUNCATE TABLE ONLY public.people RESTART IDENTITY",
             true,
         )
         .unwrap();
@@ -17099,6 +17183,8 @@ mod tests {
         assert_eq!(messages[0].0, b'C');
         assert_eq!(messages[0].1, b"TRUNCATE TABLE\0");
         assert!(session.tables["people"].rows.is_empty());
+        assert_eq!(session.sequences["people_id_seq"].last_value, 1);
+        assert!(!session.sequences["people_id_seq"].is_called);
 
         execute_statement(&mut writer, &mut session, "SELECT id FROM people", true).unwrap();
         assert_eq!(read_backend_tags(&mut reader, 2), vec![b'T', b'C']);

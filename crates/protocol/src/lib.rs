@@ -210,6 +210,7 @@ pub struct DropTable {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TruncateTable {
     pub name: String,
+    pub restart_identity: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1561,6 +1562,20 @@ fn strip_keyword_prefix_case_insensitive<'a>(input: &'a str, keyword: &str) -> O
         return None;
     }
     Some(&input[keyword.len()..])
+}
+
+fn strip_keyword_suffix_case_insensitive<'a>(input: &'a str, keyword: &str) -> Option<&'a str> {
+    let trimmed = input.trim_end();
+    if trimmed.len() < keyword.len()
+        || !trimmed[trimmed.len() - keyword.len()..].eq_ignore_ascii_case(keyword)
+    {
+        return None;
+    }
+    let before = &trimmed[..trimmed.len() - keyword.len()];
+    if !before.chars().last().is_some_and(char::is_whitespace) {
+        return None;
+    }
+    Some(before)
 }
 
 fn parse_reset_identifier(input: &str) -> Option<(&str, &str)> {
@@ -3139,6 +3154,11 @@ fn parse_truncate_table(input: &str) -> Result<TruncateTable, ParseError> {
     if let Some(after_only) = strip_keyword_prefix_case_insensitive(rest, "ONLY") {
         rest = after_only.trim_start();
     }
+    let mut restart_identity = false;
+    if let Some(before_restart) = strip_keyword_suffix_case_insensitive(rest, "RESTART IDENTITY") {
+        rest = before_restart.trim_end();
+        restart_identity = true;
+    }
     if rest.is_empty()
         || find_keyword_outside_quotes(rest, "CASCADE").is_some()
         || find_keyword_outside_quotes(rest, "RESTRICT").is_some()
@@ -3154,6 +3174,7 @@ fn parse_truncate_table(input: &str) -> Result<TruncateTable, ParseError> {
     };
     Ok(TruncateTable {
         name: normalize_relation_identifier(table.trim())?,
+        restart_identity,
     })
 }
 
@@ -11010,16 +11031,25 @@ mod tests {
             parse_command("TRUNCATE TABLE ONLY public.people").unwrap(),
             Command::TruncateTable(TruncateTable {
                 name: "people".to_string(),
+                restart_identity: false,
             })
         );
         assert_eq!(
             parse_command("TRUNCATE people").unwrap(),
             Command::TruncateTable(TruncateTable {
                 name: "people".to_string(),
+                restart_identity: false,
+            })
+        );
+        assert_eq!(
+            parse_command("TRUNCATE TABLE people RESTART IDENTITY").unwrap(),
+            Command::TruncateTable(TruncateTable {
+                name: "people".to_string(),
+                restart_identity: true,
             })
         );
         assert!(matches!(
-            parse_command("TRUNCATE TABLE people RESTART IDENTITY"),
+            parse_command("TRUNCATE TABLE people CONTINUE IDENTITY"),
             Err(ParseError::InvalidRelationalSql)
         ));
         assert!(matches!(

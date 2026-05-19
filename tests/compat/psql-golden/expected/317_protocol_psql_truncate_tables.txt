@@ -53,14 +53,38 @@ INSERT 0 1
   9 | Infra
 (1 row)
 
+CREATE TABLE
+INSERT 0 2
+ id | name
+----+-------
+  1 | Ada
+  2 | Grace
+(2 rows)
+
+TRUNCATE TABLE
+ id | name
+----+------
+(0 rows)
+
+ last_value | is_called
+------------+-----------
+          1 | f
+(1 row)
+
+INSERT 0 1
+ id | name
+----+-------
+  1 | Linus
+(1 row)
+
 CREATE VIEW
-psql:317_protocol_psql_truncate_tables.sql:20: ERROR:  relation is not a table
+psql:317_protocol_psql_truncate_tables.sql:28: ERROR:  relation is not a table
  id | name
 ----+-------
   9 | Infra
 (1 row)
 
-psql:317_protocol_psql_truncate_tables.sql:22: ERROR:  relation does not exist
-psql:317_protocol_psql_truncate_tables.sql:23: ERROR:  query shape is not supported by the compatibility stub
-psql:317_protocol_psql_truncate_tables.sql:24: ERROR:  query shape is not supported by the compatibility stub
-psql:317_protocol_psql_truncate_tables.sql:25: ERROR:  query shape is not supported by the compatibility stub
+psql:317_protocol_psql_truncate_tables.sql:30: ERROR:  relation does not exist
+psql:317_protocol_psql_truncate_tables.sql:31: ERROR:  query shape is not supported by the compatibility stub
+psql:317_protocol_psql_truncate_tables.sql:32: ERROR:  query shape is not supported by the compatibility stub
+psql:317_protocol_psql_truncate_tables.sql:33: ERROR:  query shape is not supported by the compatibility stub

@@ -8663,6 +8663,25 @@ impl Engine {
                 EngineError::ApplyFailed(format!("relation \"{}\" does not exist", truncate.name))
             })?
             .clone();
+        let restart_sequences = if truncate.restart_identity {
+            table
+                .columns
+                .iter()
+                .filter_map(|column| match &column.default {
+                    Some(ColumnDefault::SequenceNextVal { sequence, .. }) => Some(sequence.clone()),
+                    _ => None,
+                })
+                .collect::<BTreeSet<_>>()
+        } else {
+            BTreeSet::new()
+        };
+        for sequence in &restart_sequences {
+            if !self.relational_sequences.contains_key(sequence) {
+                return Err(EngineError::ApplyFailed(format!(
+                    "sequence \"{sequence}\" does not exist"
+                )));
+            }
+        }
 
         let prefix = relational_key_prefix(&table.name);
         let visibility = StorageVisibility {
@@ -8683,6 +8702,16 @@ impl Engine {
             self.mvcc_store
                 .tuple_delete(tuple_id, txn_id)
                 .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+        }
+        if truncate.restart_identity {
+            for sequence in restart_sequences {
+                let sequence_state = self
+                    .relational_sequences
+                    .get_mut(&sequence)
+                    .expect("restart identity sequence preflighted");
+                sequence_state.last_value = 1;
+                sequence_state.is_called = false;
+            }
         }
         Ok(())
     }
@@ -35700,8 +35729,53 @@ mod tests {
             Some("identity")
         );
 
+        e.execute_text(12, "CREATE TABLE restart_people (id SERIAL, name TEXT)")
+            .unwrap();
+        e.execute_text(
+            13,
+            "INSERT INTO restart_people (name) VALUES ('Ada'), ('Grace')",
+        )
+        .unwrap();
+        let restart_seq = e
+            .relational_catalog_sequence("restart_people_id_seq")
+            .unwrap();
+        assert_eq!(restart_seq.last_value, 2);
+        assert!(restart_seq.is_called);
+        e.execute_text(14, "TRUNCATE TABLE public.restart_people RESTART IDENTITY")
+            .unwrap();
+        let restart_seq = e
+            .relational_catalog_sequence("restart_people_id_seq")
+            .unwrap();
+        assert_eq!(restart_seq.last_value, 1);
+        assert!(!restart_seq.is_called);
+        e.execute_text(15, "INSERT INTO restart_people (name) VALUES ('Linus')")
+            .unwrap();
+        let Command::Select(restart_select) =
+            parse_command("SELECT id, name FROM restart_people ORDER BY id ASC").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        assert_eq!(
+            e.execute_relational_select(&restart_select).unwrap().rows,
+            vec![vec![SqlValue::Int4(1), SqlValue::Text("Linus".to_string())]]
+        );
+        let mut recovered_restart =
+            Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        assert_eq!(
+            recovered_restart
+                .execute_relational_select(&restart_select)
+                .unwrap()
+                .rows,
+            vec![vec![SqlValue::Int4(1), SqlValue::Text("Linus".to_string())]]
+        );
+        let recovered_seq = recovered_restart
+            .relational_catalog_sequence("restart_people_id_seq")
+            .unwrap();
+        assert_eq!(recovered_seq.last_value, 1);
+        assert!(recovered_seq.is_called);
+
         let missing_truncate = e
-            .execute_text(12, "TRUNCATE TABLE missing_people")
+            .execute_text(16, "TRUNCATE TABLE missing_people")
             .unwrap_err()
             .to_string();
         assert!(
