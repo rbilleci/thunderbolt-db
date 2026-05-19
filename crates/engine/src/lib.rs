@@ -25,8 +25,8 @@ use gpu_db_protocol::{
     CreateTable, CreateView, Delete, DropConstraint, DropDomain, DropIndex, DropMaterializedView,
     DropPublication, DropSchema, DropSequence, DropSubscription, DropTable, DropView, Insert,
     ParseError, PublicationTarget, RefreshMaterializedView, RenameColumn, RenameConstraint,
-    RenameIndex, RenameMaterializedView, RenameSequence, RenameTable, RenameView, Select,
-    SelectFilterOp, SelectProjection, SequenceNextVal, SequenceSetVal, SqlType, SqlValue,
+    RenameIndex, RenameMaterializedView, RenameSequence, RenameTable, RenameView, SchemaPrivilege,
+    Select, SelectFilterOp, SelectProjection, SequenceNextVal, SequenceSetVal, SqlType, SqlValue,
     TablePrivilege, TruncateTable, Update,
 };
 use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine};
@@ -116,6 +116,8 @@ impl ReplicatedStateMachine for KvStateMachine {
                     | Command::DropDomain(_)
                     | Command::GrantTable(_)
                     | Command::RevokeTable(_)
+                    | Command::GrantSchema(_)
+                    | Command::RevokeSchema(_)
                     | Command::GrantDefaultTablePrivileges(_)
                     | Command::RevokeDefaultTablePrivileges(_)
                     | Command::AlterColumnDefault(_)
@@ -5976,6 +5978,7 @@ pub struct Engine {
     relational_subscriptions: BTreeMap<String, RelationalSubscription>,
     relational_public_schema_exists: bool,
     relational_public_schema_implicit: bool,
+    relational_schema_acl: BTreeMap<String, BTreeSet<SchemaPrivilege>>,
     relational_default_table_acl: BTreeMap<String, BTreeSet<TablePrivilege>>,
     relational_comments: BTreeMap<RelationalCommentTarget, String>,
     relational_value_index: BTreeMap<RelationalIndexKey, Vec<String>>,
@@ -7437,6 +7440,7 @@ impl Engine {
             relational_subscriptions: BTreeMap::new(),
             relational_public_schema_exists: true,
             relational_public_schema_implicit: true,
+            relational_schema_acl: BTreeMap::new(),
             relational_default_table_acl: BTreeMap::new(),
             relational_comments: BTreeMap::new(),
             relational_value_index: BTreeMap::new(),
@@ -7733,6 +7737,12 @@ impl Engine {
                 &revoke.grantee,
                 &revoke.privileges,
             )?,
+            Command::GrantSchema(grant) => {
+                self.apply_grant_schema_acl(&grant.schema, &grant.grantee, &grant.privileges)?
+            }
+            Command::RevokeSchema(revoke) => {
+                self.apply_revoke_schema_acl(&revoke.schema, &revoke.grantee, &revoke.privileges)?
+            }
             Command::GrantDefaultTablePrivileges(grant) => {
                 self.apply_grant_default_table_privileges(&grant.grantee, &grant.privileges)
             }
@@ -8201,6 +8211,7 @@ impl Engine {
         }
         self.relational_public_schema_exists = false;
         self.relational_public_schema_implicit = false;
+        self.relational_schema_acl.clear();
         self.relational_comments
             .remove(&RelationalCommentTarget::Schema { schema: drop.name });
         Ok(())
@@ -9812,6 +9823,50 @@ impl Engine {
             }
             if acl.is_empty() {
                 relation_acl.remove(grantee);
+            }
+        }
+        Ok(())
+    }
+
+    fn preflight_schema_acl_target(&self, schema: &str) -> Result<(), EngineError> {
+        if schema != PUBLIC_SCHEMA_NAME || !self.relational_public_schema_exists {
+            return Err(EngineError::ApplyFailed(
+                "schema does not exist".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn apply_grant_schema_acl(
+        &mut self,
+        schema: &str,
+        grantee: &str,
+        privileges: &[SchemaPrivilege],
+    ) -> Result<(), EngineError> {
+        self.preflight_schema_acl_target(schema)?;
+        let acl = self
+            .relational_schema_acl
+            .entry(grantee.to_string())
+            .or_default();
+        for privilege in privileges {
+            acl.insert(*privilege);
+        }
+        Ok(())
+    }
+
+    fn apply_revoke_schema_acl(
+        &mut self,
+        schema: &str,
+        grantee: &str,
+        privileges: &[SchemaPrivilege],
+    ) -> Result<(), EngineError> {
+        self.preflight_schema_acl_target(schema)?;
+        if let Some(acl) = self.relational_schema_acl.get_mut(grantee) {
+            for privilege in privileges {
+                acl.remove(privilege);
+            }
+            if acl.is_empty() {
+                self.relational_schema_acl.remove(grantee);
             }
         }
         Ok(())
@@ -11605,6 +11660,8 @@ impl Engine {
             Command::RevokeTable(revoke) => {
                 self.preflight_acl_target(&revoke.relation, revoke.kind)?
             }
+            Command::GrantSchema(grant) => self.preflight_schema_acl_target(&grant.schema)?,
+            Command::RevokeSchema(revoke) => self.preflight_schema_acl_target(&revoke.schema)?,
             Command::CreatePublication(create) => self.preflight_create_publication(create)?,
             Command::DropPublication(drop) => self.preflight_drop_publication(drop)?,
             Command::CreateSubscription(create) => self.preflight_create_subscription(create)?,
@@ -11929,6 +11986,8 @@ impl Engine {
             | Command::DropDomain(_)
             | Command::GrantTable(_)
             | Command::RevokeTable(_)
+            | Command::GrantSchema(_)
+            | Command::RevokeSchema(_)
             | Command::CreatePublication(_)
             | Command::DropPublication(_)
             | Command::CreateSubscription(_)
@@ -12156,6 +12215,8 @@ impl Engine {
             | Command::DropDomain(_)
             | Command::GrantTable(_)
             | Command::RevokeTable(_)
+            | Command::GrantSchema(_)
+            | Command::RevokeSchema(_)
             | Command::CreatePublication(_)
             | Command::DropPublication(_)
             | Command::CreateSubscription(_)
@@ -12292,6 +12353,8 @@ impl Engine {
             Command::DropDomain(_) => Err(ExecuteError::NonReadCommand("DROP DOMAIN")),
             Command::GrantTable(_) => Err(ExecuteError::NonReadCommand("GRANT")),
             Command::RevokeTable(_) => Err(ExecuteError::NonReadCommand("REVOKE")),
+            Command::GrantSchema(_) => Err(ExecuteError::NonReadCommand("GRANT")),
+            Command::RevokeSchema(_) => Err(ExecuteError::NonReadCommand("REVOKE")),
             Command::CreatePublication(_) => {
                 Err(ExecuteError::NonReadCommand("CREATE PUBLICATION"))
             }
@@ -15428,6 +15491,10 @@ impl Engine {
 
     pub fn relational_default_table_acl(&self) -> &BTreeMap<String, BTreeSet<TablePrivilege>> {
         &self.relational_default_table_acl
+    }
+
+    pub fn relational_schema_acl(&self) -> &BTreeMap<String, BTreeSet<SchemaPrivilege>> {
+        &self.relational_schema_acl
     }
 
     pub fn relational_catalog_view(&self, view: &str) -> Option<&RelationalView> {
@@ -37734,6 +37801,44 @@ mod tests {
                 .unwrap(),
             &BTreeSet::from([TablePrivilege::Select])
         );
+    }
+
+    #[test]
+    fn relational_catalog_records_schema_acl_metadata_and_replays_from_wal() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "GRANT USAGE, CREATE ON SCHEMA public TO PUBLIC")
+            .unwrap();
+        e.execute_text(2, "GRANT ALL PRIVILEGES ON SCHEMA public TO postgres")
+            .unwrap();
+        e.execute_text(3, "REVOKE CREATE ON SCHEMA public FROM PUBLIC")
+            .unwrap();
+
+        assert_eq!(
+            e.relational_schema_acl().get("public").unwrap(),
+            &BTreeSet::from([SchemaPrivilege::Usage])
+        );
+        assert_eq!(
+            e.relational_schema_acl().get("postgres").unwrap(),
+            &BTreeSet::from([SchemaPrivilege::Usage, SchemaPrivilege::Create])
+        );
+
+        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        assert_eq!(recovered.relational_schema_acl(), e.relational_schema_acl());
+
+        let missing = e
+            .execute_text(4, "GRANT USAGE ON SCHEMA private TO PUBLIC")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            missing.contains("invalid relational SQL syntax"),
+            "{missing}"
+        );
+
+        e.execute_text(5, "DROP SCHEMA public").unwrap();
+        assert!(e.relational_schema_acl().is_empty());
+        let recovered_after_drop =
+            Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        assert!(recovered_after_drop.relational_schema_acl().is_empty());
     }
 
     #[test]

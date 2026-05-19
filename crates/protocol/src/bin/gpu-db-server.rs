@@ -7,8 +7,9 @@ use std::thread;
 
 use gpu_db_protocol::{
     parse_command, parse_frontend_message, parse_startup_packet, AclRelationKind, ColumnDefault,
-    Command, CommentTarget, FrontendMessage, ParseError, PublicationTarget, SelectFilter,
-    SelectFilterOp, SelectProjection, SqlValue, StartupPacket, TablePrivilege, SUPPORTED_SQL_TYPES,
+    Command, CommentTarget, FrontendMessage, ParseError, PublicationTarget, SchemaPrivilege,
+    SelectFilter, SelectFilterOp, SelectProjection, SqlValue, StartupPacket, TablePrivilege,
+    SUPPORTED_SQL_TYPES,
 };
 use gpu_db_protocol::{DescribeTarget, SqlType};
 
@@ -2385,6 +2386,7 @@ struct Session {
     currval_sequences: HashMap<String, i64>,
     indexes: Vec<CatalogIndex>,
     table_acls: BTreeMap<String, BTreeMap<String, BTreeSet<TablePrivilege>>>,
+    schema_acl: BTreeMap<String, BTreeSet<SchemaPrivilege>>,
     default_table_acl: BTreeMap<String, BTreeSet<TablePrivilege>>,
     comments: BTreeMap<CatalogCommentTarget, String>,
     dirty_tables: BTreeSet<String>,
@@ -2397,6 +2399,7 @@ struct Session {
     dirty_schema: bool,
     dirty_indexes: bool,
     dirty_table_acls: BTreeSet<String>,
+    dirty_schema_acl: bool,
     dirty_default_table_acl: bool,
     dirty_comment_targets: BTreeSet<CatalogCommentTarget>,
     copy_in: Option<CopyInState>,
@@ -2417,6 +2420,7 @@ struct SharedCatalog {
     public_schema_implicit: bool,
     indexes: Vec<CatalogIndex>,
     table_acls: BTreeMap<String, BTreeMap<String, BTreeSet<TablePrivilege>>>,
+    schema_acl: BTreeMap<String, BTreeSet<SchemaPrivilege>>,
     default_table_acl: BTreeMap<String, BTreeSet<TablePrivilege>>,
     comments: BTreeMap<CatalogCommentTarget, String>,
     next_relation_oid: u32,
@@ -2436,6 +2440,7 @@ impl Default for SharedCatalog {
             public_schema_implicit: true,
             indexes: Vec::new(),
             table_acls: BTreeMap::new(),
+            schema_acl: BTreeMap::new(),
             default_table_acl: BTreeMap::new(),
             comments: BTreeMap::new(),
             next_relation_oid: FIRST_USER_RELATION_OID,
@@ -2480,6 +2485,7 @@ impl Session {
             currval_sequences: HashMap::new(),
             indexes: catalog.indexes,
             table_acls: catalog.table_acls,
+            schema_acl: catalog.schema_acl,
             default_table_acl: catalog.default_table_acl,
             comments: catalog.comments,
             dirty_tables: BTreeSet::new(),
@@ -2492,6 +2498,7 @@ impl Session {
             dirty_schema: false,
             dirty_indexes: false,
             dirty_table_acls: BTreeSet::new(),
+            dirty_schema_acl: false,
             dirty_default_table_acl: false,
             dirty_comment_targets: BTreeSet::new(),
             copy_in: None,
@@ -2536,6 +2543,10 @@ impl Session {
         self.dirty_table_acls.insert(table.into());
     }
 
+    fn mark_schema_acl_dirty(&mut self) {
+        self.dirty_schema_acl = true;
+    }
+
     fn mark_default_table_acl_dirty(&mut self) {
         self.dirty_default_table_acl = true;
     }
@@ -2555,6 +2566,7 @@ impl Session {
             self.dirty_subscriptions.clear();
             self.dirty_schema = false;
             self.dirty_table_acls.clear();
+            self.dirty_schema_acl = false;
             self.dirty_default_table_acl = false;
             self.dirty_comment_targets.clear();
             return;
@@ -2629,6 +2641,10 @@ impl Session {
         if self.dirty_default_table_acl {
             catalog.default_table_acl = self.default_table_acl.clone();
             self.dirty_default_table_acl = false;
+        }
+        if self.dirty_schema_acl {
+            catalog.schema_acl = self.schema_acl.clone();
+            self.dirty_schema_acl = false;
         }
         if self.dirty_schema {
             catalog.public_schema_exists = self.public_schema_exists;
@@ -2997,6 +3013,56 @@ fn revoke_relation_acl(
         session.table_acls.remove(relation);
     }
     session.mark_table_acl_dirty(relation.to_string());
+    Ok(())
+}
+
+fn schema_acl_target_error(session: &Session, schema: &str) -> Option<ErrorField> {
+    if schema != "public" || !session.public_schema_exists {
+        Some(ErrorField {
+            code: "3F000",
+            message: "schema does not exist",
+            position: None,
+        })
+    } else {
+        None
+    }
+}
+
+fn grant_schema_acl(
+    session: &mut Session,
+    schema: &str,
+    grantee: &str,
+    privileges: &[SchemaPrivilege],
+) -> Result<(), ErrorField> {
+    if let Some(error) = schema_acl_target_error(session, schema) {
+        return Err(error);
+    }
+    let acl = session.schema_acl.entry(grantee.to_string()).or_default();
+    for privilege in privileges {
+        acl.insert(*privilege);
+    }
+    session.mark_schema_acl_dirty();
+    Ok(())
+}
+
+fn revoke_schema_acl(
+    session: &mut Session,
+    schema: &str,
+    grantee: &str,
+    privileges: &[SchemaPrivilege],
+) -> Result<(), ErrorField> {
+    if let Some(error) = schema_acl_target_error(session, schema) {
+        return Err(error);
+    }
+    if let Some(acl) = session.schema_acl.get_mut(grantee) {
+        for privilege in privileges {
+            acl.remove(privilege);
+        }
+        if acl.is_empty() {
+            session.schema_acl.remove(grantee);
+        }
+    }
+    session.mark_schema_acl_dirty();
     Ok(())
 }
 
@@ -7544,7 +7610,7 @@ fn execute_statement(
                     Some(PUBLIC_NAMESPACE_OID.to_string()),
                     Some("public".to_string()),
                     Some("10".to_string()),
-                    None,
+                    schema_acl_display(session),
                     None,
                 ],
             ],
@@ -8018,11 +8084,13 @@ fn execute_statement(
                 }
                 session.public_schema_exists = false;
                 session.public_schema_implicit = false;
+                session.schema_acl.clear();
                 let target = CatalogCommentTarget::Schema {
                     schema: "public".to_string(),
                 };
                 session.comments.remove(&target);
                 session.mark_schema_dirty();
+                session.mark_schema_acl_dirty();
                 session.mark_comment_dirty(target);
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, "DROP SCHEMA");
@@ -9825,6 +9893,24 @@ fn execute_statement(
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, "REVOKE");
             }
+            Command::GrantSchema(grant) => {
+                if let Err(error) =
+                    grant_schema_acl(session, &grant.schema, &grant.grantee, &grant.privileges)
+                {
+                    return write_error(stream, &error);
+                }
+                session.persist_catalog_snapshot();
+                return write_command_complete(stream, "GRANT");
+            }
+            Command::RevokeSchema(revoke) => {
+                if let Err(error) =
+                    revoke_schema_acl(session, &revoke.schema, &revoke.grantee, &revoke.privileges)
+                {
+                    return write_error(stream, &error);
+                }
+                session.persist_catalog_snapshot();
+                return write_command_complete(stream, "REVOKE");
+            }
             Command::GrantDefaultTablePrivileges(grant) => {
                 grant_default_table_acl(session, &grant.grantee, &grant.privileges);
                 session.persist_catalog_snapshot();
@@ -10775,6 +10861,13 @@ fn execute_statement(
             &pg_catalog_namespace_rows(session),
         );
     }
+    if canonical == pg_catalog_namespace_acl_query() {
+        return write_single_row(
+            stream,
+            &[text_column("nspname"), text_column("nspacl")],
+            &pg_catalog_namespace_acl_rows(session),
+        );
+    }
     if canonical
         == "select n.tableoid, n.oid, n.nspname, n.nspowner, n.nspacl, acldefault('n', n.nspowner) as acldefault from pg_namespace n"
     {
@@ -10802,7 +10895,7 @@ fn execute_statement(
                     Some(PUBLIC_NAMESPACE_OID.to_string()),
                     Some("public".to_string()),
                     Some("10".to_string()),
-                    None,
+                    schema_acl_display(session),
                     None,
                 ],
             ],
@@ -12532,6 +12625,37 @@ fn relation_acl_display(session: &Session, relation: &str) -> Option<String> {
     acl_display(acl)
 }
 
+fn schema_acl_display(session: &Session) -> Option<String> {
+    let rows = session
+        .schema_acl
+        .iter()
+        .filter_map(|(grantee, privileges)| {
+            if privileges.is_empty() {
+                return None;
+            }
+            let grantee = if grantee == "public" { "" } else { grantee };
+            Some(format!(
+                "{grantee}={}/postgres",
+                schema_privilege_letters(privileges)
+            ))
+        })
+        .collect::<Vec<_>>();
+    (!rows.is_empty()).then(|| rows.join("\n"))
+}
+
+fn schema_privilege_letters(privileges: &BTreeSet<SchemaPrivilege>) -> String {
+    let mut letters = String::new();
+    for (privilege, letter) in [
+        (SchemaPrivilege::Usage, 'U'),
+        (SchemaPrivilege::Create, 'C'),
+    ] {
+        if privileges.contains(&privilege) {
+            letters.push(letter);
+        }
+    }
+    letters
+}
+
 fn catalog_psql_default_access_privilege_rows(session: &Session) -> Vec<Vec<Option<String>>> {
     acl_display(&session.default_table_acl)
         .map(|acl| {
@@ -12789,7 +12913,7 @@ fn catalog_psql_describe_schema_verbose_rows(session: &Session) -> Vec<Vec<Optio
     vec![vec![
         Some("public".to_string()),
         Some("postgres".to_string()),
-        None,
+        schema_acl_display(session),
         session
             .comments
             .get(&CatalogCommentTarget::Schema {
@@ -12803,6 +12927,10 @@ fn pg_catalog_namespace_query() -> &'static str {
     "select oid, nspname from pg_catalog.pg_namespace where nspname = 'public' order by oid"
 }
 
+fn pg_catalog_namespace_acl_query() -> &'static str {
+    "select n.nspname, n.nspacl from pg_catalog.pg_namespace n where n.nspname = 'public' order by n.nspname"
+}
+
 fn pg_catalog_namespace_rows(session: &Session) -> Vec<Vec<Option<String>>> {
     if !session.public_schema_exists {
         return Vec::new();
@@ -12810,6 +12938,16 @@ fn pg_catalog_namespace_rows(session: &Session) -> Vec<Vec<Option<String>>> {
     vec![vec![
         Some(PUBLIC_NAMESPACE_OID.to_string()),
         Some("public".to_string()),
+    ]]
+}
+
+fn pg_catalog_namespace_acl_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    if !session.public_schema_exists {
+        return Vec::new();
+    }
+    vec![vec![
+        Some("public".to_string()),
+        schema_acl_display(session),
     ]]
 }
 

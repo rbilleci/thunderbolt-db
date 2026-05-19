@@ -96,6 +96,8 @@ impl Planner {
             | Command::DropDomain(_)
             | Command::GrantTable(_)
             | Command::RevokeTable(_)
+            | Command::GrantSchema(_)
+            | Command::RevokeSchema(_)
             | Command::GrantDefaultTablePrivileges(_)
             | Command::RevokeDefaultTablePrivileges(_)
             | Command::AlterColumnDefault(_)

@@ -1,0 +1,47 @@
+=== bounded schema ACL metadata ===
+GRANT
+                   List of schemas
+  Name  |  Owner   | Access privileges | Description
+--------+----------+-------------------+-------------
+ public | postgres | =UC/postgres      |
+(1 row)
+
+ nspname |    nspacl
+---------+--------------
+ public  | =UC/postgres
+(1 row)
+
+REVOKE
+GRANT
+                    List of schemas
+  Name  |  Owner   |  Access privileges   | Description
+--------+----------+----------------------+-------------
+ public | postgres | postgres=UC/postgres+|
+        |          | =U/postgres          |
+(1 row)
+
+ nspname |        nspacl
+---------+----------------------
+ public  | postgres=UC/postgres+
+         | =U/postgres
+(1 row)
+
+REVOKE
+REVOKE
+                   List of schemas
+  Name  |  Owner   | Access privileges | Description
+--------+----------+-------------------+-------------
+ public | postgres |                   |
+(1 row)
+
+psql:342_protocol_psql_schema_acls.sql:12: ERROR:  query shape is not supported by the compatibility stub
+psql:342_protocol_psql_schema_acls.sql:13: ERROR:  query shape is not supported by the compatibility stub
+psql:342_protocol_psql_schema_acls.sql:14: ERROR:  query shape is not supported by the compatibility stub
+GRANT
+DROP SCHEMA
+CREATE SCHEMA
+                   List of schemas
+  Name  |  Owner   | Access privileges | Description
+--------+----------+-------------------+-------------
+ public | postgres |                   |
+(1 row)
