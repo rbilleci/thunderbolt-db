@@ -21,6 +21,7 @@ pub enum Command {
     CreateIndex(CreateIndex),
     RenameIndex(RenameIndex),
     CreateView(CreateView),
+    RenameView(RenameView),
     DropTable(DropTable),
     TruncateTable(TruncateTable),
     DropIndex(DropIndex),
@@ -129,6 +130,12 @@ pub struct CreateView {
     pub query: Select,
     pub definition: String,
     pub or_replace: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenameView {
+    pub old_name: String,
+    pub new_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1732,6 +1739,13 @@ fn parse_relational_command(input: &str) -> Option<Result<Command, ParseError>> 
         {
             return Some(parse_rename_index(input).map(Command::RenameIndex));
         }
+        if input
+            .split_whitespace()
+            .nth(1)
+            .is_some_and(|second| second.eq_ignore_ascii_case("VIEW"))
+        {
+            return Some(parse_rename_view(input).map(Command::RenameView));
+        }
         if find_keyword_outside_quotes(input, "RENAME").is_some() {
             if parse_rename_constraint(input).is_ok() {
                 return Some(parse_rename_constraint(input).map(Command::RenameConstraint));
@@ -2589,6 +2603,37 @@ fn parse_rename_index(input: &str) -> Result<RenameIndex, ParseError> {
         return Err(ParseError::InvalidRelationalSql);
     }
     Ok(RenameIndex {
+        old_name,
+        new_name: normalize_identifier(after_to)?,
+    })
+}
+
+fn parse_rename_view(input: &str) -> Result<RenameView, ParseError> {
+    let rest = strip_keyword_prefix_case_insensitive(input, "ALTER")
+        .and_then(|s| strip_keyword_prefix_case_insensitive(s.trim_start(), "VIEW"))
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    if strip_keyword_prefix_case_insensitive(rest, "IF").is_some()
+        || strip_keyword_prefix_case_insensitive(rest, "ALL").is_some()
+        || strip_keyword_prefix_case_insensitive(rest, "CURRENT").is_some()
+        || strip_keyword_prefix_case_insensitive(rest, "MATERIALIZED").is_some()
+    {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let rename_pos =
+        find_keyword_outside_quotes(rest, "RENAME").ok_or(ParseError::InvalidRelationalSql)?;
+    let old_name = normalize_relation_identifier(rest[..rename_pos].trim())?;
+    let after_rename = rest[rename_pos + "RENAME".len()..].trim_start();
+    let after_to = strip_keyword_prefix_case_insensitive(after_rename, "TO")
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim();
+    if after_to.is_empty()
+        || find_keyword_outside_quotes(after_to, "CASCADE").is_some()
+        || find_keyword_outside_quotes(after_to, "RESTRICT").is_some()
+    {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    Ok(RenameView {
         old_name,
         new_name: normalize_identifier(after_to)?,
     })
@@ -10283,8 +10328,27 @@ mod tests {
                 if_exists: true,
             })
         );
+        assert_eq!(
+            parse_command("ALTER VIEW public.active_people RENAME TO renamed_people").unwrap(),
+            Command::RenameView(RenameView {
+                old_name: "active_people".to_string(),
+                new_name: "renamed_people".to_string(),
+            })
+        );
         assert!(matches!(
             parse_command("DROP VIEW active_people CASCADE"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command("ALTER VIEW active_people RENAME TO renamed_people CASCADE"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command("ALTER MATERIALIZED VIEW active_people RENAME TO renamed_people"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command("ALTER VIEW public.active_people RENAME TO public.renamed_people"),
             Err(ParseError::InvalidRelationalSql)
         ));
         assert!(matches!(

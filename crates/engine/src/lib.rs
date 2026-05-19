@@ -21,8 +21,8 @@ use gpu_db_planner::{ExecutionPlan, Planner, PlannerConfig};
 use gpu_db_protocol::{
     parse_command, AddUniqueConstraint, ColumnDef, Command, CommentTarget, CreateIndex,
     CreateTable, CreateView, Delete, DropConstraint, DropIndex, DropTable, DropView, Insert,
-    ParseError, RenameColumn, RenameConstraint, RenameIndex, RenameTable, Select, SelectFilterOp,
-    SelectProjection, SqlType, SqlValue, TruncateTable, Update,
+    ParseError, RenameColumn, RenameConstraint, RenameIndex, RenameTable, RenameView, Select,
+    SelectFilterOp, SelectProjection, SqlType, SqlValue, TruncateTable, Update,
 };
 use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine};
 use gpu_db_storage::{
@@ -84,6 +84,7 @@ impl ReplicatedStateMachine for KvStateMachine {
                     | Command::CreateIndex(_)
                     | Command::RenameIndex(_)
                     | Command::CreateView(_)
+                    | Command::RenameView(_)
                     | Command::DropTable(_)
                     | Command::TruncateTable(_)
                     | Command::DropIndex(_)
@@ -7530,6 +7531,7 @@ impl Engine {
             Command::CreateIndex(create) => self.apply_create_index(create)?,
             Command::RenameIndex(rename) => self.apply_rename_index(rename)?,
             Command::CreateView(create) => self.apply_create_view(create)?,
+            Command::RenameView(rename) => self.apply_rename_view(rename)?,
             Command::DropTable(drop) => self.apply_drop_table(drop, txn_id)?,
             Command::TruncateTable(truncate) => self.apply_truncate_table(truncate, txn_id)?,
             Command::DropIndex(drop) => self.apply_drop_index(drop)?,
@@ -8288,6 +8290,44 @@ impl Engine {
             "view \"{}\" does not exist",
             drop.name
         )))
+    }
+
+    fn apply_rename_view(&mut self, rename: RenameView) -> Result<(), EngineError> {
+        if self.relational_catalog.contains_key(&rename.old_name) {
+            return Err(EngineError::ApplyFailed(format!(
+                "relation \"{}\" is not a view",
+                rename.old_name
+            )));
+        }
+        if self.relational_catalog.contains_key(&rename.new_name)
+            || self.relational_views.contains_key(&rename.new_name)
+        {
+            return Err(EngineError::ApplyFailed(format!(
+                "relation \"{}\" already exists",
+                rename.new_name
+            )));
+        }
+        let Some(mut view) = self.relational_views.remove(&rename.old_name) else {
+            return Err(EngineError::ApplyFailed(format!(
+                "view \"{}\" does not exist",
+                rename.old_name
+            )));
+        };
+        view.name = rename.new_name.clone();
+        self.relational_views.insert(rename.new_name.clone(), view);
+
+        let old_target = RelationalCommentTarget::View {
+            view: rename.old_name,
+        };
+        if let Some(comment) = self.relational_comments.remove(&old_target) {
+            self.relational_comments.insert(
+                RelationalCommentTarget::View {
+                    view: rename.new_name,
+                },
+                comment,
+            );
+        }
+        Ok(())
     }
 
     fn apply_comment_on(&mut self, comment: gpu_db_protocol::CommentOn) -> Result<(), EngineError> {
@@ -9215,6 +9255,28 @@ impl Engine {
                     )));
                 }
             }
+            Command::RenameView(rename) => {
+                if self.relational_catalog.contains_key(&rename.old_name) {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "relation \"{}\" is not a view",
+                        rename.old_name
+                    )));
+                }
+                if !self.relational_views.contains_key(&rename.old_name) {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "view \"{}\" does not exist",
+                        rename.old_name
+                    )));
+                }
+                if self.relational_catalog.contains_key(&rename.new_name)
+                    || self.relational_views.contains_key(&rename.new_name)
+                {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "relation \"{}\" already exists",
+                        rename.new_name
+                    )));
+                }
+            }
             Command::DropColumn(drop) => {
                 if self.relational_views.contains_key(&drop.table) {
                     return Err(EngineError::ApplyFailed(format!(
@@ -9431,6 +9493,7 @@ impl Engine {
             | Command::CreateIndex(_)
             | Command::RenameIndex(_)
             | Command::CreateView(_)
+            | Command::RenameView(_)
             | Command::DropTable(_)
             | Command::TruncateTable(_)
             | Command::DropIndex(_)
@@ -9634,6 +9697,7 @@ impl Engine {
             | Command::CreateIndex(_)
             | Command::RenameIndex(_)
             | Command::CreateView(_)
+            | Command::RenameView(_)
             | Command::DropTable(_)
             | Command::TruncateTable(_)
             | Command::DropIndex(_)
@@ -9738,6 +9802,7 @@ impl Engine {
             Command::CreateIndex(_) => Err(ExecuteError::NonReadCommand("CREATE INDEX")),
             Command::RenameIndex(_) => Err(ExecuteError::NonReadCommand("ALTER INDEX")),
             Command::CreateView(_) => Err(ExecuteError::NonReadCommand("CREATE VIEW")),
+            Command::RenameView(_) => Err(ExecuteError::NonReadCommand("ALTER VIEW")),
             Command::DropTable(_) => Err(ExecuteError::NonReadCommand("DROP TABLE")),
             Command::TruncateTable(_) => Err(ExecuteError::NonReadCommand("TRUNCATE TABLE")),
             Command::DropIndex(_) => Err(ExecuteError::NonReadCommand("DROP INDEX")),
@@ -31638,6 +31703,93 @@ mod tests {
                 .definition,
             "SELECT id, name FROM people WHERE id > 2 ORDER BY id"
         );
+    }
+
+    #[test]
+    fn relational_sql_rename_view_replays_from_wal() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO people (id, name) VALUES (1, 'Ada'), (2, 'Linus'), (3, 'Grace')",
+        )
+        .unwrap();
+        e.execute_text(
+            3,
+            "CREATE VIEW public.active_people AS SELECT id, name FROM people WHERE id > 1 ORDER BY id",
+        )
+        .unwrap();
+        e.execute_text(
+            4,
+            "COMMENT ON VIEW public.active_people IS 'active people view'",
+        )
+        .unwrap();
+        let oid = e.relational_catalog_view("active_people").unwrap().oid;
+        e.execute_text(
+            5,
+            "ALTER VIEW public.active_people RENAME TO renamed_people",
+        )
+        .unwrap();
+
+        assert!(e.relational_catalog_view("active_people").is_none());
+        let view = e.relational_catalog_view("renamed_people").unwrap();
+        assert_eq!(view.oid, oid);
+        assert_eq!(view.name, "renamed_people");
+        assert_eq!(
+            view.definition,
+            "SELECT id, name FROM people WHERE id > 1 ORDER BY id"
+        );
+        assert_eq!(
+            e.relational_view_comment("renamed_people"),
+            Some("active people view")
+        );
+        assert_eq!(e.relational_view_comment("active_people"), None);
+
+        let Command::Select(select) = parse_command("SELECT * FROM renamed_people").unwrap() else {
+            panic!("expected SELECT plan");
+        };
+        let result = e.execute_relational_select(&select).unwrap();
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![SqlValue::Int4(2), SqlValue::Text("Linus".to_string())],
+                vec![SqlValue::Int4(3), SqlValue::Text("Grace".to_string())],
+            ]
+        );
+
+        let mut recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        assert!(recovered.relational_catalog_view("active_people").is_none());
+        assert_eq!(
+            recovered
+                .relational_catalog_view("renamed_people")
+                .unwrap()
+                .oid,
+            oid
+        );
+        assert_eq!(
+            recovered.relational_view_comment("renamed_people"),
+            Some("active people view")
+        );
+        let recovered_result = recovered.execute_relational_select(&select).unwrap();
+        assert_eq!(recovered_result.rows, result.rows);
+
+        let missing = e
+            .execute_text(6, "ALTER VIEW active_people RENAME TO missing_rename")
+            .unwrap_err()
+            .to_string();
+        assert!(missing.contains("view \"active_people\" does not exist"));
+        let duplicate = e
+            .execute_text(7, "ALTER VIEW renamed_people RENAME TO people")
+            .unwrap_err()
+            .to_string();
+        assert!(duplicate.contains("relation \"people\" already exists"));
+
+        let table_target = e
+            .execute_text(8, "ALTER VIEW people RENAME TO people_view")
+            .unwrap_err()
+            .to_string();
+        assert!(table_target.contains("relation \"people\" is not a view"));
     }
 
     #[test]

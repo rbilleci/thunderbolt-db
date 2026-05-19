@@ -1,0 +1,59 @@
+=== bounded SQL view rename ===
+CREATE TABLE
+INSERT 0 3
+CREATE VIEW
+COMMENT
+ALTER VIEW
+ id | name
+----+-------
+  2 | Linus
+  3 | Grace
+(2 rows)
+
+ schemaname |      viewname       | viewowner |                            definition
+------------+---------------------+-----------+------------------------------------------------------------------
+ public     | renamed_view_people | postgres  | SELECT id, name FROM rename_view_people WHERE id > 1 ORDER BY id
+(1 row)
+
+ table_catalog | table_schema |     table_name      |                         view_definition                          | check_option | is_updatable | is_insertable_into | is_trigger_updatable | is_trigger_deletable | is_trigger_insertable
+---------------+--------------+---------------------+------------------------------------------------------------------+--------------+--------------+--------------------+----------------------+----------------------+-----------------------
+ postgres      | public       | renamed_view_people | SELECT id, name FROM rename_view_people WHERE id > 1 ORDER BY id | NONE         | NO           | NO                 | NO                   | NO                   | NO
+(1 row)
+
+ nspname |       relname       | attname |     description
+---------+---------------------+---------+---------------------
+ public  | renamed_view_people |         | active renamed view
+(1 row)
+
+                                     List of relations
+ Schema |        Name         | Type |  Owner   | Persistence | Size |     Description
+--------+---------------------+------+----------+-------------+------+---------------------
+ public | renamed_view_people | view | postgres | permanent   |      | active renamed view
+(1 row)
+
+                     Object descriptions
+ Schema |        Name         | Object |     Description
+--------+---------------------+--------+---------------------
+ public | renamed_view_people | view   | active renamed view
+(1 row)
+
+psql:325_protocol_psql_rename_views.sql:25: ERROR:  relation does not exist
+CREATE VIEW
+psql:325_protocol_psql_rename_views.sql:27: ERROR:  relation already exists
+psql:325_protocol_psql_rename_views.sql:28: ERROR:  view does not exist
+psql:325_protocol_psql_rename_views.sql:29: ERROR:  relation is not a view
+psql:325_protocol_psql_rename_views.sql:30: ERROR:  query shape is not supported by the compatibility stub
+psql:325_protocol_psql_rename_views.sql:31: ERROR:  query shape is not supported by the compatibility stub
+psql:325_protocol_psql_rename_views.sql:32: ERROR:  query shape is not supported by the compatibility stub
+ id | name
+----+-------
+  2 | Linus
+  3 | Grace
+(2 rows)
+
+ id | name
+----+-------
+  1 | Ada
+  2 | Linus
+  3 | Grace
+(3 rows)

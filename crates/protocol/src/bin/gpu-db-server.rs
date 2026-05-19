@@ -6633,6 +6633,61 @@ fn execute_statement(
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, "CREATE VIEW");
             }
+            Command::RenameView(rename) => {
+                if session.tables.contains_key(&rename.old_name) {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "42809",
+                            message: "relation is not a view",
+                            position: None,
+                        },
+                    );
+                }
+                if !session.views.contains_key(&rename.old_name) {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "42P01",
+                            message: "view does not exist",
+                            position: None,
+                        },
+                    );
+                }
+                if session.tables.contains_key(&rename.new_name)
+                    || session.views.contains_key(&rename.new_name)
+                {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "42P07",
+                            message: "relation already exists",
+                            position: None,
+                        },
+                    );
+                }
+                let mut view = session
+                    .views
+                    .remove(&rename.old_name)
+                    .expect("view existence validated");
+                view.name = rename.new_name.clone();
+                session.views.insert(rename.new_name.clone(), view);
+                session.mark_view_dirty(rename.old_name.clone());
+                session.mark_view_dirty(rename.new_name.clone());
+                let old_target = CatalogCommentTarget::View {
+                    view: rename.old_name,
+                };
+                if let Some(comment) = session.comments.remove(&old_target) {
+                    session.mark_comment_dirty(old_target);
+                    let new_target = CatalogCommentTarget::View {
+                        view: rename.new_name,
+                    };
+                    session.comments.insert(new_target.clone(), comment);
+                    session.mark_comment_dirty(new_target);
+                }
+                session.persist_catalog_snapshot();
+                return write_command_complete(stream, "ALTER VIEW");
+            }
             Command::DropView(drop) => {
                 if session.tables.contains_key(&drop.name) {
                     return write_error(
