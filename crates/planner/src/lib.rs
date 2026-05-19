@@ -78,6 +78,8 @@ impl Planner {
             | Command::SequenceNextVal(_)
             | Command::SequenceSetVal(_)
             | Command::RenameSequence(_)
+            | Command::CreatePublication(_)
+            | Command::DropPublication(_)
             | Command::DropTable(_)
             | Command::TruncateTable(_)
             | Command::DropIndex(_)

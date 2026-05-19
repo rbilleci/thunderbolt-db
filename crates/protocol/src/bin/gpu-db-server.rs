@@ -7,8 +7,8 @@ use std::thread;
 
 use gpu_db_protocol::{
     parse_command, parse_frontend_message, parse_startup_packet, ColumnDefault, Command,
-    CommentTarget, FrontendMessage, ParseError, SelectFilterOp, SelectProjection, SqlValue,
-    StartupPacket, TablePrivilege, SUPPORTED_SQL_TYPES,
+    CommentTarget, FrontendMessage, ParseError, PublicationTarget, SelectFilterOp,
+    SelectProjection, SqlValue, StartupPacket, TablePrivilege, SUPPORTED_SQL_TYPES,
 };
 use gpu_db_protocol::{DescribeTarget, SqlType};
 
@@ -2059,6 +2059,7 @@ struct Session {
     views: HashMap<String, View>,
     materialized_views: HashMap<String, MaterializedView>,
     sequences: HashMap<String, Sequence>,
+    publications: BTreeMap<String, Publication>,
     currval_sequences: HashMap<String, i64>,
     indexes: Vec<CatalogIndex>,
     table_acls: BTreeMap<String, BTreeMap<String, BTreeSet<TablePrivilege>>>,
@@ -2068,6 +2069,7 @@ struct Session {
     dirty_views: BTreeSet<String>,
     dirty_materialized_views: BTreeSet<String>,
     dirty_sequences: BTreeSet<String>,
+    dirty_publications: BTreeSet<String>,
     dirty_indexes: bool,
     dirty_table_acls: BTreeSet<String>,
     dirty_default_table_acl: bool,
@@ -2083,6 +2085,7 @@ struct SharedCatalog {
     views: HashMap<String, View>,
     materialized_views: HashMap<String, MaterializedView>,
     sequences: HashMap<String, Sequence>,
+    publications: BTreeMap<String, Publication>,
     indexes: Vec<CatalogIndex>,
     table_acls: BTreeMap<String, BTreeMap<String, BTreeSet<TablePrivilege>>>,
     default_table_acl: BTreeMap<String, BTreeSet<TablePrivilege>>,
@@ -2097,6 +2100,7 @@ impl Default for SharedCatalog {
             views: HashMap::new(),
             materialized_views: HashMap::new(),
             sequences: HashMap::new(),
+            publications: BTreeMap::new(),
             indexes: Vec::new(),
             table_acls: BTreeMap::new(),
             default_table_acl: BTreeMap::new(),
@@ -2135,6 +2139,7 @@ impl Session {
             views: catalog.views,
             materialized_views: catalog.materialized_views,
             sequences: catalog.sequences,
+            publications: catalog.publications,
             currval_sequences: HashMap::new(),
             indexes: catalog.indexes,
             table_acls: catalog.table_acls,
@@ -2144,6 +2149,7 @@ impl Session {
             dirty_views: BTreeSet::new(),
             dirty_materialized_views: BTreeSet::new(),
             dirty_sequences: BTreeSet::new(),
+            dirty_publications: BTreeSet::new(),
             dirty_indexes: false,
             dirty_table_acls: BTreeSet::new(),
             dirty_default_table_acl: false,
@@ -2170,6 +2176,10 @@ impl Session {
         self.dirty_sequences.insert(sequence.into());
     }
 
+    fn mark_publication_dirty(&mut self, publication: impl Into<String>) {
+        self.dirty_publications.insert(publication.into());
+    }
+
     fn mark_table_acl_dirty(&mut self, table: impl Into<String>) {
         self.dirty_table_acls.insert(table.into());
     }
@@ -2188,6 +2198,7 @@ impl Session {
             self.dirty_views.clear();
             self.dirty_materialized_views.clear();
             self.dirty_sequences.clear();
+            self.dirty_publications.clear();
             self.dirty_table_acls.clear();
             self.dirty_default_table_acl = false;
             self.dirty_comment_targets.clear();
@@ -2226,6 +2237,15 @@ impl Session {
                     .insert(sequence_name.clone(), sequence.clone());
             } else {
                 catalog.sequences.remove(sequence_name);
+            }
+        }
+        for publication_name in &self.dirty_publications {
+            if let Some(publication) = self.publications.get(publication_name) {
+                catalog
+                    .publications
+                    .insert(publication_name.clone(), publication.clone());
+            } else {
+                catalog.publications.remove(publication_name);
             }
         }
         for table_name in &self.dirty_table_acls {
@@ -2285,6 +2305,7 @@ impl Session {
         self.dirty_views.clear();
         self.dirty_materialized_views.clear();
         self.dirty_sequences.clear();
+        self.dirty_publications.clear();
         self.dirty_table_acls.clear();
     }
 
@@ -2350,6 +2371,14 @@ struct Sequence {
     name: String,
     last_value: i64,
     is_called: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Publication {
+    oid: u32,
+    name: String,
+    all_tables: bool,
+    tables: Vec<String>,
 }
 
 fn sequence_target_error(session: &Session, name: &str) -> Option<ErrorField> {
@@ -2552,6 +2581,106 @@ fn revoke_default_table_acl(session: &mut Session, grantee: &str, privileges: &[
         }
     }
     session.mark_default_table_acl_dirty();
+}
+
+fn publication_table_target_error(session: &Session, table: &str) -> Option<ErrorField> {
+    if session.views.contains_key(table)
+        || session.materialized_views.contains_key(table)
+        || session.sequences.contains_key(table)
+    {
+        return Some(ErrorField {
+            code: "42809",
+            message: "relation is not a table",
+            position: None,
+        });
+    }
+    if !session.tables.contains_key(table) {
+        return Some(ErrorField {
+            code: "42P01",
+            message: "relation does not exist",
+            position: None,
+        });
+    }
+    None
+}
+
+fn create_publication(
+    session: &mut Session,
+    name: String,
+    target: PublicationTarget,
+) -> Result<(), ErrorField> {
+    if session.publications.contains_key(&name) {
+        return Err(ErrorField {
+            code: "42710",
+            message: "publication already exists",
+            position: None,
+        });
+    }
+    let (all_tables, tables) = match target {
+        PublicationTarget::AllTables => (true, Vec::new()),
+        PublicationTarget::Tables(tables) => {
+            let mut seen = BTreeSet::new();
+            for table in &tables {
+                if !seen.insert(table.clone()) {
+                    return Err(ErrorField {
+                        code: "42710",
+                        message: "publication table specified more than once",
+                        position: None,
+                    });
+                }
+                if let Some(error) = publication_table_target_error(session, table) {
+                    return Err(error);
+                }
+            }
+            (false, tables)
+        }
+    };
+    let oid = session.next_relation_oid;
+    session.next_relation_oid = session.next_relation_oid.checked_add(1).ok_or(ErrorField {
+        code: "54000",
+        message: "publication OID allocation exhausted",
+        position: None,
+    })?;
+    session.publications.insert(
+        name.clone(),
+        Publication {
+            oid,
+            name: name.clone(),
+            all_tables,
+            tables,
+        },
+    );
+    session.mark_publication_dirty(name);
+    Ok(())
+}
+
+fn drop_publication(
+    session: &mut Session,
+    names: &[String],
+    if_exists: bool,
+) -> Result<(), ErrorField> {
+    let mut seen = BTreeSet::new();
+    for name in names {
+        if !seen.insert(name.clone()) {
+            return Err(ErrorField {
+                code: "42710",
+                message: "publication specified more than once",
+                position: None,
+            });
+        }
+        if !if_exists && !session.publications.contains_key(name) {
+            return Err(ErrorField {
+                code: "42704",
+                message: "publication does not exist",
+                position: None,
+            });
+        }
+    }
+    for name in names {
+        session.publications.remove(name);
+        session.mark_publication_dirty(name.clone());
+    }
+    Ok(())
 }
 
 fn evaluate_column_default(
@@ -6933,6 +7062,33 @@ fn execute_statement(
             &pg_dump_attrdef_metadata_rows(session, &relation_oids),
         );
     }
+    if canonical.starts_with("select p.tableoid, p.oid, p.pubname")
+        && canonical.contains("from pg_publication p")
+    {
+        return write_single_row(
+            stream,
+            &pg_catalog_publication_columns(),
+            &catalog_publication_class_rows(session),
+        );
+    }
+    if canonical.starts_with("select tableoid, oid, prpubid, prrelid")
+        && canonical.contains("from pg_catalog.pg_publication_rel pr")
+    {
+        return write_single_row(
+            stream,
+            &pg_catalog_publication_rel_columns(),
+            &catalog_publication_rel_rows(session),
+        );
+    }
+    if canonical
+        == "select tableoid, oid, pnpubid, pnnspid from pg_catalog.pg_publication_namespace"
+    {
+        return write_single_row(
+            stream,
+            &pg_catalog_publication_namespace_columns(),
+            &catalog_publication_namespace_rows(session),
+        );
+    }
     if let Some(columns) = pg_dump_empty_catalog_query_columns(&canonical) {
         return write_single_row(stream, &columns, &catalog_empty_rows());
     }
@@ -7920,6 +8076,20 @@ fn execute_statement(
                 }
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, "DROP SEQUENCE");
+            }
+            Command::CreatePublication(create) => {
+                if let Err(error) = create_publication(session, create.name, create.target) {
+                    return write_error(stream, &error);
+                }
+                session.persist_catalog_snapshot();
+                return write_command_complete(stream, "CREATE PUBLICATION");
+            }
+            Command::DropPublication(drop) => {
+                if let Err(error) = drop_publication(session, &drop.names, drop.if_exists) {
+                    return write_error(stream, &error);
+                }
+                session.persist_catalog_snapshot();
+                return write_command_complete(stream, "DROP PUBLICATION");
             }
             Command::DropTable(drop) => {
                 let mut seen = BTreeSet::new();
@@ -9147,7 +9317,7 @@ fn execute_statement(
                 bool_column("Truncates"),
                 bool_column("Via root"),
             ],
-            &catalog_empty_rows(),
+            &catalog_psql_publication_rows(session),
         );
     }
     if canonical == psql_list_publications_verbose_catalog_query() {
@@ -9164,7 +9334,33 @@ fn execute_statement(
                 bool_column("pubtruncate"),
                 bool_column("pubviaroot"),
             ],
-            &catalog_empty_rows(),
+            &catalog_psql_publication_verbose_rows(session),
+        );
+    }
+    if canonical
+        == "select pubname, puballtables, pubinsert, pubupdate, pubdelete, pubtruncate, pubviaroot from pg_catalog.pg_publication order by pubname"
+    {
+        return write_single_row(
+            stream,
+            &[
+                text_column("pubname"),
+                bool_column("puballtables"),
+                bool_column("pubinsert"),
+                bool_column("pubupdate"),
+                bool_column("pubdelete"),
+                bool_column("pubtruncate"),
+                bool_column("pubviaroot"),
+            ],
+            &catalog_publication_direct_rows(session),
+        );
+    }
+    if canonical
+        == "select p.pubname, c.relname from pg_catalog.pg_publication p join pg_catalog.pg_publication_rel pr on pr.prpubid = p.oid join pg_catalog.pg_class c on c.oid = pr.prrelid order by p.pubname, c.relname"
+    {
+        return write_single_row(
+            stream,
+            &[text_column("pubname"), text_column("relname")],
+            &catalog_publication_rel_direct_rows(session),
         );
     }
     if canonical == psql_list_subscriptions_catalog_query() {
@@ -9394,7 +9590,11 @@ fn execute_statement(
         );
     }
     if canonical == psql_describe_schema_publications_query() {
-        return write_single_row(stream, &[text_column("pubname")], &catalog_empty_rows());
+        return write_single_row(
+            stream,
+            &[text_column("pubname")],
+            &catalog_schema_publication_rows(session),
+        );
     }
     if canonical == pg_catalog_namespace_query() {
         return write_single_row(
@@ -9528,6 +9728,33 @@ fn execute_statement(
             stream,
             &pg_dump_attrdef_metadata_columns(),
             &pg_dump_attrdef_metadata_rows(session, &relation_oids),
+        );
+    }
+    if canonical.starts_with("select p.tableoid, p.oid, p.pubname")
+        && canonical.contains("from pg_publication p")
+    {
+        return write_single_row(
+            stream,
+            &pg_catalog_publication_columns(),
+            &catalog_publication_class_rows(session),
+        );
+    }
+    if canonical.starts_with("select tableoid, oid, prpubid, prrelid")
+        && canonical.contains("from pg_catalog.pg_publication_rel pr")
+    {
+        return write_single_row(
+            stream,
+            &pg_catalog_publication_rel_columns(),
+            &catalog_publication_rel_rows(session),
+        );
+    }
+    if canonical
+        == "select tableoid, oid, pnpubid, pnnspid from pg_catalog.pg_publication_namespace"
+    {
+        return write_single_row(
+            stream,
+            &pg_catalog_publication_namespace_columns(),
+            &catalog_publication_namespace_rows(session),
         );
     }
     if let Some(columns) = pg_dump_empty_catalog_query_columns(&canonical) {
@@ -9673,7 +9900,7 @@ fn execute_statement(
                 text_column("?column?"),
                 text_column("?column?"),
             ],
-            &catalog_empty_rows_for_relation_oid(oid),
+            &catalog_describe_publication_rows(session, oid),
         );
     }
     if let Some(oid) = catalog_describe_inherits_parent_query_oid(&canonical) {
@@ -11023,6 +11250,160 @@ fn catalog_psql_default_access_privilege_rows(session: &Session) -> Vec<Vec<Opti
         .unwrap_or_default()
 }
 
+fn catalog_psql_publication_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    session
+        .publications
+        .values()
+        .map(|publication| {
+            vec![
+                Some(publication.name.clone()),
+                Some("postgres".to_string()),
+                Some(bool_text(publication.all_tables)),
+                Some("t".to_string()),
+                Some("t".to_string()),
+                Some("t".to_string()),
+                Some("t".to_string()),
+                Some("f".to_string()),
+            ]
+        })
+        .collect()
+}
+
+fn catalog_psql_publication_verbose_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    session
+        .publications
+        .values()
+        .map(|publication| {
+            vec![
+                Some(publication.oid.to_string()),
+                Some(publication.name.clone()),
+                Some("postgres".to_string()),
+                Some(bool_text(publication.all_tables)),
+                Some("t".to_string()),
+                Some("t".to_string()),
+                Some("t".to_string()),
+                Some("t".to_string()),
+                Some("f".to_string()),
+            ]
+        })
+        .collect()
+}
+
+fn catalog_publication_class_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    session
+        .publications
+        .values()
+        .map(|publication| {
+            vec![
+                Some("6104".to_string()),
+                Some(publication.oid.to_string()),
+                Some(publication.name.clone()),
+                Some("10".to_string()),
+                Some(bool_text(publication.all_tables)),
+                Some("t".to_string()),
+                Some("t".to_string()),
+                Some("t".to_string()),
+                Some("t".to_string()),
+                Some("f".to_string()),
+            ]
+        })
+        .collect()
+}
+
+fn catalog_publication_direct_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    session
+        .publications
+        .values()
+        .map(|publication| {
+            vec![
+                Some(publication.name.clone()),
+                Some(bool_text(publication.all_tables)),
+                Some("t".to_string()),
+                Some("t".to_string()),
+                Some("t".to_string()),
+                Some("t".to_string()),
+                Some("f".to_string()),
+            ]
+        })
+        .collect()
+}
+
+fn catalog_publication_rel_direct_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut rows = Vec::new();
+    for publication in session.publications.values() {
+        if publication.all_tables {
+            continue;
+        }
+        for table in &publication.tables {
+            if session.tables.contains_key(table) {
+                rows.push(vec![Some(publication.name.clone()), Some(table.clone())]);
+            }
+        }
+    }
+    rows.sort();
+    rows
+}
+
+fn catalog_publication_rel_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut rows = Vec::new();
+    for publication in session.publications.values() {
+        if publication.all_tables {
+            continue;
+        }
+        for table in &publication.tables {
+            if let Some(table_state) = session.tables.get(table) {
+                rows.push(vec![
+                    Some("6106".to_string()),
+                    Some(format!("{}{}", publication.oid, table_state.oid)),
+                    Some(publication.oid.to_string()),
+                    Some(table_state.oid.to_string()),
+                    None,
+                    None,
+                ]);
+            }
+        }
+    }
+    rows
+}
+
+fn catalog_publication_namespace_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    session
+        .publications
+        .values()
+        .filter(|publication| publication.all_tables)
+        .map(|publication| {
+            vec![
+                Some("6237".to_string()),
+                Some((publication.oid + 100_000).to_string()),
+                Some(publication.oid.to_string()),
+                Some(PUBLIC_NAMESPACE_OID.to_string()),
+            ]
+        })
+        .collect()
+}
+
+fn catalog_describe_publication_rows(session: &Session, oid: u32) -> Vec<Vec<Option<String>>> {
+    let Some(table) = session.tables.values().find(|table| table.oid == oid) else {
+        return Vec::new();
+    };
+    let mut rows = Vec::new();
+    for publication in session.publications.values() {
+        if publication.all_tables || publication.tables.iter().any(|name| name == &table.name) {
+            rows.push(vec![Some(publication.name.clone()), None, None]);
+        }
+    }
+    rows
+}
+
+fn catalog_schema_publication_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    session
+        .publications
+        .values()
+        .filter(|publication| publication.all_tables)
+        .map(|publication| vec![Some(publication.name.clone())])
+        .collect()
+}
+
 fn acl_display(acl: &BTreeMap<String, BTreeSet<TablePrivilege>>) -> Option<String> {
     let rows = acl
         .iter()
@@ -11053,6 +11434,10 @@ fn table_privilege_letters(privileges: &BTreeSet<TablePrivilege>) -> String {
         }
     }
     letters
+}
+
+fn bool_text(value: bool) -> String {
+    if value { "t" } else { "f" }.to_string()
 }
 
 fn psql_relname_pattern_matches(pattern: &str, table_name: &str) -> bool {
@@ -11819,6 +12204,41 @@ fn sql_type_alignment_code(ty: SqlType) -> &'static str {
         SqlType::Int4 => "i",
         SqlType::Text => "i",
     }
+}
+
+fn pg_catalog_publication_columns() -> Vec<Column> {
+    vec![
+        int4_column("tableoid"),
+        int4_column("oid"),
+        text_column("pubname"),
+        int4_column("pubowner"),
+        bool_column("puballtables"),
+        bool_column("pubinsert"),
+        bool_column("pubupdate"),
+        bool_column("pubdelete"),
+        bool_column("pubtruncate"),
+        bool_column("pubviaroot"),
+    ]
+}
+
+fn pg_catalog_publication_rel_columns() -> Vec<Column> {
+    vec![
+        int4_column("tableoid"),
+        int4_column("oid"),
+        int4_column("prpubid"),
+        int4_column("prrelid"),
+        text_column("prrelqual"),
+        text_column("prattrs"),
+    ]
+}
+
+fn pg_catalog_publication_namespace_columns() -> Vec<Column> {
+    vec![
+        int4_column("tableoid"),
+        int4_column("oid"),
+        int4_column("pnpubid"),
+        int4_column("pnnspid"),
+    ]
 }
 
 fn pg_dump_empty_catalog_query_columns(canonical: &str) -> Option<Vec<Column>> {

@@ -20,12 +20,12 @@ use gpu_db_observability::{
 use gpu_db_planner::{ExecutionPlan, Planner, PlannerConfig};
 use gpu_db_protocol::{
     parse_command, AddUniqueConstraint, ColumnDef, ColumnDefault, Command, CommentTarget,
-    CreateIndex, CreateMaterializedView, CreateSequence, CreateTable, CreateView, Delete,
-    DropConstraint, DropIndex, DropMaterializedView, DropSequence, DropTable, DropView, Insert,
-    ParseError, RefreshMaterializedView, RenameColumn, RenameConstraint, RenameIndex,
-    RenameMaterializedView, RenameSequence, RenameTable, RenameView, Select, SelectFilterOp,
-    SelectProjection, SequenceNextVal, SequenceSetVal, SqlType, SqlValue, TablePrivilege,
-    TruncateTable, Update,
+    CreateIndex, CreateMaterializedView, CreatePublication, CreateSequence, CreateTable,
+    CreateView, Delete, DropConstraint, DropIndex, DropMaterializedView, DropPublication,
+    DropSequence, DropTable, DropView, Insert, ParseError, PublicationTarget,
+    RefreshMaterializedView, RenameColumn, RenameConstraint, RenameIndex, RenameMaterializedView,
+    RenameSequence, RenameTable, RenameView, Select, SelectFilterOp, SelectProjection,
+    SequenceNextVal, SequenceSetVal, SqlType, SqlValue, TablePrivilege, TruncateTable, Update,
 };
 use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine};
 use gpu_db_storage::{
@@ -96,6 +96,8 @@ impl ReplicatedStateMachine for KvStateMachine {
                     | Command::SequenceCurrVal(_)
                     | Command::SequenceSetVal(_)
                     | Command::RenameSequence(_)
+                    | Command::CreatePublication(_)
+                    | Command::DropPublication(_)
                     | Command::DropTable(_)
                     | Command::TruncateTable(_)
                     | Command::DropIndex(_)
@@ -5959,6 +5961,7 @@ pub struct Engine {
     relational_views: BTreeMap<String, RelationalView>,
     relational_materialized_views: BTreeMap<String, RelationalMaterializedView>,
     relational_sequences: BTreeMap<String, RelationalSequence>,
+    relational_publications: BTreeMap<String, RelationalPublication>,
     relational_default_table_acl: BTreeMap<String, BTreeSet<TablePrivilege>>,
     relational_comments: BTreeMap<RelationalCommentTarget, String>,
     relational_value_index: BTreeMap<RelationalIndexKey, Vec<String>>,
@@ -6038,6 +6041,14 @@ pub struct RelationalSequence {
     pub oid: u32,
     pub last_value: i64,
     pub is_called: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationalPublication {
+    pub name: String,
+    pub oid: u32,
+    pub all_tables: bool,
+    pub tables: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -7347,6 +7358,7 @@ impl Engine {
             relational_views: BTreeMap::new(),
             relational_materialized_views: BTreeMap::new(),
             relational_sequences: BTreeMap::new(),
+            relational_publications: BTreeMap::new(),
             relational_default_table_acl: BTreeMap::new(),
             relational_comments: BTreeMap::new(),
             relational_value_index: BTreeMap::new(),
@@ -7621,6 +7633,8 @@ impl Engine {
             Command::DropView(drop) => self.apply_drop_view(drop)?,
             Command::DropMaterializedView(drop) => self.apply_drop_materialized_view(drop)?,
             Command::DropSequence(drop) => self.apply_drop_sequence(drop)?,
+            Command::CreatePublication(create) => self.apply_create_publication(create)?,
+            Command::DropPublication(drop) => self.apply_drop_publication(drop)?,
             Command::GrantTable(grant) => {
                 self.apply_grant_table(&grant.table, &grant.grantee, &grant.privileges)?
             }
@@ -8776,6 +8790,77 @@ impl Engine {
                 .remove(&RelationalCommentTarget::Sequence {
                     sequence: name.clone(),
                 });
+        }
+        Ok(())
+    }
+
+    fn preflight_create_publication(&self, create: &CreatePublication) -> Result<(), EngineError> {
+        if self.relational_publications.contains_key(&create.name) {
+            return Err(EngineError::ApplyFailed(format!(
+                "publication \"{}\" already exists",
+                create.name
+            )));
+        }
+        if let PublicationTarget::Tables(tables) = &create.target {
+            let mut seen = BTreeSet::new();
+            for table in tables {
+                if !seen.insert(table) {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "table \"{}\" specified more than once",
+                        table
+                    )));
+                }
+                self.preflight_table_acl_target(table)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_create_publication(&mut self, create: CreatePublication) -> Result<(), EngineError> {
+        self.preflight_create_publication(&create)?;
+        let oid = self.relational_next_oid;
+        self.relational_next_oid = self.relational_next_oid.checked_add(1).ok_or_else(|| {
+            EngineError::ApplyFailed("relational publication OID allocation exhausted".to_string())
+        })?;
+        let (all_tables, tables) = match create.target {
+            PublicationTarget::AllTables => (true, Vec::new()),
+            PublicationTarget::Tables(tables) => (false, tables),
+        };
+        self.relational_publications.insert(
+            create.name.clone(),
+            RelationalPublication {
+                name: create.name,
+                oid,
+                all_tables,
+                tables,
+            },
+        );
+        Ok(())
+    }
+
+    fn preflight_drop_publication(&self, drop: &DropPublication) -> Result<(), EngineError> {
+        let mut seen = BTreeSet::new();
+        for name in &drop.names {
+            if !seen.insert(name) {
+                return Err(EngineError::ApplyFailed(format!(
+                    "publication \"{}\" specified more than once",
+                    name
+                )));
+            }
+            if !drop.if_exists && !self.relational_publications.contains_key(name) {
+                return Err(EngineError::ApplyFailed(format!(
+                    "publication \"{}\" does not exist",
+                    name
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_drop_publication(&mut self, drop: DropPublication) -> Result<(), EngineError> {
+        self.preflight_drop_publication(&drop)?;
+        for name in &drop.names {
+            self.relational_publications.remove(name);
         }
         Ok(())
     }
@@ -10459,6 +10544,8 @@ impl Engine {
             Command::DropSequence(drop) => self.preflight_drop_sequence(drop)?,
             Command::GrantTable(grant) => self.preflight_table_acl_target(&grant.table)?,
             Command::RevokeTable(revoke) => self.preflight_table_acl_target(&revoke.table)?,
+            Command::CreatePublication(create) => self.preflight_create_publication(create)?,
+            Command::DropPublication(drop) => self.preflight_drop_publication(drop)?,
             Command::GrantDefaultTablePrivileges(_) | Command::RevokeDefaultTablePrivileges(_) => {}
             Command::Insert(insert) => {
                 let table = self.relational_catalog.get(&insert.table).ok_or_else(|| {
@@ -10671,6 +10758,8 @@ impl Engine {
             | Command::DropSequence(_)
             | Command::GrantTable(_)
             | Command::RevokeTable(_)
+            | Command::CreatePublication(_)
+            | Command::DropPublication(_)
             | Command::GrantDefaultTablePrivileges(_)
             | Command::RevokeDefaultTablePrivileges(_)
             | Command::AlterColumnDefault(_)
@@ -10888,6 +10977,8 @@ impl Engine {
             | Command::DropSequence(_)
             | Command::GrantTable(_)
             | Command::RevokeTable(_)
+            | Command::CreatePublication(_)
+            | Command::DropPublication(_)
             | Command::GrantDefaultTablePrivileges(_)
             | Command::RevokeDefaultTablePrivileges(_)
             | Command::AlterColumnDefault(_)
@@ -11014,6 +11105,10 @@ impl Engine {
             Command::DropSequence(_) => Err(ExecuteError::NonReadCommand("DROP SEQUENCE")),
             Command::GrantTable(_) => Err(ExecuteError::NonReadCommand("GRANT")),
             Command::RevokeTable(_) => Err(ExecuteError::NonReadCommand("REVOKE")),
+            Command::CreatePublication(_) => {
+                Err(ExecuteError::NonReadCommand("CREATE PUBLICATION"))
+            }
+            Command::DropPublication(_) => Err(ExecuteError::NonReadCommand("DROP PUBLICATION")),
             Command::GrantDefaultTablePrivileges(_) => {
                 Err(ExecuteError::NonReadCommand("ALTER DEFAULT PRIVILEGES"))
             }
@@ -14137,6 +14232,13 @@ impl Engine {
 
     pub fn relational_catalog_sequence(&self, sequence: &str) -> Option<&RelationalSequence> {
         self.relational_sequences.get(sequence)
+    }
+
+    pub fn relational_catalog_publication(
+        &self,
+        publication: &str,
+    ) -> Option<&RelationalPublication> {
+        self.relational_publications.get(publication)
     }
 
     pub fn relational_table_comment(&self, table: &str) -> Option<&str> {
@@ -36062,6 +36164,69 @@ mod tests {
                 .get("public")
                 .unwrap(),
             &BTreeSet::from([TablePrivilege::Select])
+        );
+    }
+
+    #[test]
+    fn relational_catalog_records_publications_and_replays_from_wal() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(2, "CREATE TABLE accounts (id INT, owner TEXT)")
+            .unwrap();
+        e.execute_text(
+            3,
+            "CREATE PUBLICATION app_pub FOR TABLE public.people, accounts",
+        )
+        .unwrap();
+        e.execute_text(4, "CREATE PUBLICATION all_pub FOR ALL TABLES")
+            .unwrap();
+
+        let app_pub = e.relational_catalog_publication("app_pub").unwrap();
+        assert!(!app_pub.all_tables);
+        assert_eq!(
+            app_pub.tables,
+            vec!["people".to_string(), "accounts".to_string()]
+        );
+        let all_pub = e.relational_catalog_publication("all_pub").unwrap();
+        assert!(all_pub.all_tables);
+        assert!(all_pub.tables.is_empty());
+
+        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        assert_eq!(
+            recovered
+                .relational_catalog_publication("app_pub")
+                .unwrap()
+                .tables,
+            vec!["people".to_string(), "accounts".to_string()]
+        );
+        assert!(
+            recovered
+                .relational_catalog_publication("all_pub")
+                .unwrap()
+                .all_tables
+        );
+
+        e.execute_text(5, "DROP PUBLICATION app_pub").unwrap();
+        assert!(e.relational_catalog_publication("app_pub").is_none());
+        e.execute_text(6, "DROP PUBLICATION IF EXISTS missing_pub")
+            .unwrap();
+
+        let duplicate = e
+            .execute_text(7, "CREATE PUBLICATION all_pub FOR ALL TABLES")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            duplicate.contains("publication \"all_pub\" already exists"),
+            "{duplicate}"
+        );
+        let missing_table = e
+            .execute_text(8, "CREATE PUBLICATION missing_pub FOR TABLE missing_people")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            missing_table.contains("relation \"missing_people\" does not exist"),
+            "{missing_table}"
         );
     }
 

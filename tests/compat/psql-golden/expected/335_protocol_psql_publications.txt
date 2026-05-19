@@ -1,0 +1,66 @@
+=== protocol psql bounded publications ===
+CREATE TABLE
+CREATE TABLE
+CREATE PUBLICATION
+CREATE PUBLICATION
+                                 List of publications
+  Name   |  Owner   | All tables | Inserts | Updates | Deletes | Truncates | Via root
+---------+----------+------------+---------+---------+---------+-----------+----------
+ all_pub | postgres | t          | t       | t       | t       | t         | f
+ app_pub | postgres | f          | t       | t       | t       | t         | f
+(2 rows)
+
+ pubname | puballtables | pubinsert | pubupdate | pubdelete | pubtruncate | pubviaroot
+---------+--------------+-----------+-----------+-----------+-------------+------------
+ all_pub | t            | t         | t         | t         | t           | f
+ app_pub | f            | t         | t         | t         | t           | f
+(2 rows)
+
+ pubname |   relname
+---------+--------------
+ app_pub | pub_accounts
+ app_pub | pub_people
+(2 rows)
+
+                                        Table "public.pub_people"
+ Column |  Type   | Collation | Nullable | Default | Storage  | Compression | Stats target | Description
+--------+---------+-----------+----------+---------+----------+-------------+--------------+-------------
+ id     | integer |           |          |         | plain    |             |              |
+ name   | text    |           |          |         | extended |             |              |
+Publications:
+    "all_pub"
+    "app_pub"
+Access method: heap
+
+psql:335_protocol_psql_publications.sql:16: ERROR:  publication already exists
+psql:335_protocol_psql_publications.sql:17: ERROR:  relation does not exist
+CREATE VIEW
+psql:335_protocol_psql_publications.sql:19: ERROR:  relation is not a table
+psql:335_protocol_psql_publications.sql:20: ERROR:  query shape is not supported by the compatibility stub
+psql:335_protocol_psql_publications.sql:21: ERROR:  publication does not exist
+DROP PUBLICATION
+DROP PUBLICATION
+                                 List of publications
+  Name   |  Owner   | All tables | Inserts | Updates | Deletes | Truncates | Via root
+---------+----------+------------+---------+---------+---------+-----------+----------
+ all_pub | postgres | t          | t       | t       | t       | t         | f
+(1 row)
+
+                                        Table "public.pub_people"
+ Column |  Type   | Collation | Nullable | Default | Storage  | Compression | Stats target | Description
+--------+---------+-----------+----------+---------+----------+-------------+--------------+-------------
+ id     | integer |           |          |         | plain    |             |              |
+ name   | text    |           |          |         | extended |             |              |
+Publications:
+    "all_pub"
+Access method: heap
+
+DROP PUBLICATION
+                              List of publications
+ Name | Owner | All tables | Inserts | Updates | Deletes | Truncates | Via root
+------+-------+------------+---------+---------+---------+-----------+----------
+(0 rows)
+
+ id | name
+----+------
+(0 rows)

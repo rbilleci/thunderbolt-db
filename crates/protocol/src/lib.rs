@@ -31,6 +31,8 @@ pub enum Command {
     SequenceSetVal(SequenceSetVal),
     RenameSequence(RenameSequence),
     DropSequence(DropSequence),
+    CreatePublication(CreatePublication),
+    DropPublication(DropPublication),
     GrantTable(GrantTable),
     RevokeTable(RevokeTable),
     GrantDefaultTablePrivileges(DefaultTablePrivileges),
@@ -201,6 +203,24 @@ pub struct RenameSequence {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DropSequence {
+    pub names: Vec<String>,
+    pub if_exists: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublicationTarget {
+    AllTables,
+    Tables(Vec<String>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreatePublication {
+    pub name: String,
+    pub target: PublicationTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropPublication {
     pub names: Vec<String>,
     pub if_exists: bool,
 }
@@ -1844,6 +1864,9 @@ fn parse_relational_command(input: &str) -> Option<Result<Command, ParseError>> 
         if second.eq_ignore_ascii_case("SEQUENCE") {
             return Some(parse_create_sequence(input).map(Command::CreateSequence));
         }
+        if second.eq_ignore_ascii_case("PUBLICATION") {
+            return Some(parse_create_publication(input).map(Command::CreatePublication));
+        }
         if second.eq_ignore_ascii_case("OR") {
             let third = input.split_whitespace().nth(2)?;
             let fourth = input.split_whitespace().nth(3)?;
@@ -1874,6 +1897,9 @@ fn parse_relational_command(input: &str) -> Option<Result<Command, ParseError>> 
         }
         if second.eq_ignore_ascii_case("SEQUENCE") {
             return Some(parse_drop_sequence(input).map(Command::DropSequence));
+        }
+        if second.eq_ignore_ascii_case("PUBLICATION") {
+            return Some(parse_drop_publication(input).map(Command::DropPublication));
         }
         return Some(Err(ParseError::InvalidRelationalSql));
     }
@@ -3283,6 +3309,86 @@ fn parse_drop_sequence(input: &str) -> Result<DropSequence, ParseError> {
         names: sequences
             .into_iter()
             .map(|sequence| normalize_relation_identifier(sequence.trim()))
+            .collect::<Result<Vec<_>, _>>()?,
+        if_exists,
+    })
+}
+
+fn parse_create_publication(input: &str) -> Result<CreatePublication, ParseError> {
+    let rest = strip_keyword_prefix_case_insensitive(input, "CREATE")
+        .and_then(|s| strip_keyword_prefix_case_insensitive(s.trim_start(), "PUBLICATION"))
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    let (raw_name, rest) = split_leading_identifier(rest)?;
+    let name = normalize_identifier(raw_name)?;
+    let rest = rest.trim_start();
+    let rest = strip_keyword_prefix_case_insensitive(rest, "FOR")
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    if let Some(after_all) = strip_keyword_prefix_case_insensitive(rest, "ALL") {
+        let after_tables = strip_keyword_prefix_case_insensitive(after_all.trim_start(), "TABLES")
+            .ok_or(ParseError::InvalidRelationalSql)?
+            .trim();
+        if !after_tables.is_empty() {
+            return Err(ParseError::InvalidRelationalSql);
+        }
+        return Ok(CreatePublication {
+            name,
+            target: PublicationTarget::AllTables,
+        });
+    }
+    let rest = strip_keyword_prefix_case_insensitive(rest, "TABLE")
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    if rest.is_empty()
+        || find_keyword_outside_quotes(rest, "WHERE").is_some()
+        || find_keyword_outside_quotes(rest, "WITH").is_some()
+        || find_keyword_outside_quotes(rest, "ONLY").is_some()
+    {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let tables = split_csv(rest)?;
+    if tables.is_empty() {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    Ok(CreatePublication {
+        name,
+        target: PublicationTarget::Tables(
+            tables
+                .into_iter()
+                .map(|table| normalize_relation_identifier(table.trim()))
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+    })
+}
+
+fn parse_drop_publication(input: &str) -> Result<DropPublication, ParseError> {
+    let mut rest = strip_keyword_prefix_case_insensitive(input, "DROP")
+        .and_then(|s| strip_keyword_prefix_case_insensitive(s.trim_start(), "PUBLICATION"))
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    let if_exists = if let Some(after_if) = strip_keyword_prefix_case_insensitive(rest, "IF") {
+        let after_exists = strip_keyword_prefix_case_insensitive(after_if.trim_start(), "EXISTS")
+            .ok_or(ParseError::InvalidRelationalSql)?;
+        rest = after_exists.trim_start();
+        true
+    } else {
+        false
+    };
+    if rest.is_empty()
+        || find_keyword_outside_quotes(rest, "CASCADE").is_some()
+        || find_keyword_outside_quotes(rest, "RESTRICT").is_some()
+    {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let publications = split_csv(rest)?;
+    if publications.is_empty() {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    Ok(DropPublication {
+        names: publications
+            .into_iter()
+            .map(|publication| normalize_identifier(publication.trim()))
             .collect::<Result<Vec<_>, _>>()?,
         if_exists,
     })
@@ -11330,6 +11436,43 @@ mod tests {
         ));
         assert!(matches!(
             parse_command("TRUNCATE TABLE private.people"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+
+        assert_eq!(
+            parse_command("CREATE PUBLICATION app_pub FOR TABLE public.people, accounts").unwrap(),
+            Command::CreatePublication(CreatePublication {
+                name: "app_pub".to_string(),
+                target: PublicationTarget::Tables(vec![
+                    "people".to_string(),
+                    "accounts".to_string(),
+                ]),
+            })
+        );
+        assert_eq!(
+            parse_command("CREATE PUBLICATION all_pub FOR ALL TABLES").unwrap(),
+            Command::CreatePublication(CreatePublication {
+                name: "all_pub".to_string(),
+                target: PublicationTarget::AllTables,
+            })
+        );
+        assert_eq!(
+            parse_command("DROP PUBLICATION IF EXISTS app_pub, all_pub").unwrap(),
+            Command::DropPublication(DropPublication {
+                names: vec!["app_pub".to_string(), "all_pub".to_string()],
+                if_exists: true,
+            })
+        );
+        assert!(matches!(
+            parse_command("CREATE PUBLICATION app_pub FOR TABLE private.people"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command("CREATE PUBLICATION app_pub FOR TABLE people WITH (publish = 'insert')"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command("DROP PUBLICATION app_pub CASCADE"),
             Err(ParseError::InvalidRelationalSql)
         ));
 
