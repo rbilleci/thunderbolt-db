@@ -19,14 +19,14 @@ use gpu_db_observability::{
 };
 use gpu_db_planner::{ExecutionPlan, Planner, PlannerConfig};
 use gpu_db_protocol::{
-    parse_command, AddCheckConstraint, AddUniqueConstraint, ColumnDef, ColumnDefault, Command,
-    CommentTarget, CreateDomain, CreateIndex, CreateMaterializedView, CreatePublication,
-    CreateSequence, CreateSubscription, CreateTable, CreateView, Delete, DropConstraint,
-    DropDomain, DropIndex, DropMaterializedView, DropPublication, DropSequence, DropSubscription,
-    DropTable, DropView, Insert, ParseError, PublicationTarget, RefreshMaterializedView,
-    RenameColumn, RenameConstraint, RenameIndex, RenameMaterializedView, RenameSequence,
-    RenameTable, RenameView, Select, SelectFilterOp, SelectProjection, SequenceNextVal,
-    SequenceSetVal, SqlType, SqlValue, TablePrivilege, TruncateTable, Update,
+    parse_command, AddCheckConstraint, AddForeignKey, AddUniqueConstraint, ColumnDef,
+    ColumnDefault, Command, CommentTarget, CreateDomain, CreateIndex, CreateMaterializedView,
+    CreatePublication, CreateSequence, CreateSubscription, CreateTable, CreateView, Delete,
+    DropConstraint, DropDomain, DropIndex, DropMaterializedView, DropPublication, DropSequence,
+    DropSubscription, DropTable, DropView, Insert, ParseError, PublicationTarget,
+    RefreshMaterializedView, RenameColumn, RenameConstraint, RenameIndex, RenameMaterializedView,
+    RenameSequence, RenameTable, RenameView, Select, SelectFilterOp, SelectProjection,
+    SequenceNextVal, SequenceSetVal, SqlType, SqlValue, TablePrivilege, TruncateTable, Update,
 };
 use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine};
 use gpu_db_storage::{
@@ -80,6 +80,7 @@ impl ReplicatedStateMachine for KvStateMachine {
                     | Command::AddPrimaryKey(_)
                     | Command::AddUniqueConstraint(_)
                     | Command::AddCheckConstraint(_)
+                    | Command::AddForeignKey(_)
                     | Command::AddColumn(_)
                     | Command::RenameTable(_)
                     | Command::RenameColumn(_)
@@ -5998,6 +5999,7 @@ pub struct RelationalTable {
     pub columns: Vec<RelationalColumn>,
     pub indexes: Vec<RelationalIndex>,
     pub check_constraints: Vec<RelationalCheckConstraint>,
+    pub foreign_keys: Vec<RelationalForeignKey>,
     pub acl: BTreeMap<String, BTreeSet<TablePrivilege>>,
 }
 
@@ -6030,6 +6032,14 @@ pub struct RelationalCheckConstraint {
     pub column: String,
     pub op: SelectFilterOp,
     pub value: SqlValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationalForeignKey {
+    pub name: String,
+    pub column: String,
+    pub referenced_table: String,
+    pub referenced_column: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7649,6 +7659,7 @@ impl Engine {
             Command::AddPrimaryKey(add) => self.apply_add_primary_key(add)?,
             Command::AddUniqueConstraint(add) => self.apply_add_unique_constraint(add)?,
             Command::AddCheckConstraint(add) => self.apply_add_check_constraint(add)?,
+            Command::AddForeignKey(add) => self.apply_add_foreign_key(add, txn_id)?,
             Command::AddColumn(add) => self.apply_add_column(add, txn_id)?,
             Command::RenameTable(rename) => self.apply_rename_table(rename, txn_id)?,
             Command::RenameColumn(rename) => self.apply_rename_column(rename)?,
@@ -8214,6 +8225,7 @@ impl Engine {
                 columns,
                 indexes,
                 check_constraints: checks,
+                foreign_keys: Vec::new(),
                 acl: self.relational_default_table_acl.clone(),
             },
         );
@@ -8349,6 +8361,25 @@ impl Engine {
         Ok(())
     }
 
+    fn apply_add_foreign_key(
+        &mut self,
+        add: AddForeignKey,
+        txn_id: TxnId,
+    ) -> Result<(), EngineError> {
+        self.preflight_add_foreign_key(&add, txn_id)?;
+        let table = self
+            .relational_catalog
+            .get_mut(&add.table)
+            .expect("table existence preflighted");
+        table.foreign_keys.push(RelationalForeignKey {
+            name: add.name,
+            column: add.column,
+            referenced_table: add.referenced_table,
+            referenced_column: add.referenced_column,
+        });
+        Ok(())
+    }
+
     fn apply_drop_constraint(&mut self, drop: DropConstraint) -> Result<(), EngineError> {
         let Some(table) = self.relational_catalog.get_mut(&drop.table) else {
             if drop.table_if_exists {
@@ -8367,7 +8398,14 @@ impl Engine {
         table
             .check_constraints
             .retain(|constraint| constraint.name != drop.name);
-        if table.indexes.len() == old_index_len && table.check_constraints.len() == old_check_len {
+        let old_foreign_key_len = table.foreign_keys.len();
+        table
+            .foreign_keys
+            .retain(|constraint| constraint.name != drop.name);
+        if table.indexes.len() == old_index_len
+            && table.check_constraints.len() == old_check_len
+            && table.foreign_keys.len() == old_foreign_key_len
+        {
             if drop.if_exists {
                 return Ok(());
             }
@@ -8440,6 +8478,12 @@ impl Engine {
             .find(|constraint| constraint.name == rename.old_name)
         {
             check.name = rename.new_name.clone();
+        } else if let Some(foreign_key) = table
+            .foreign_keys
+            .iter_mut()
+            .find(|constraint| constraint.name == rename.old_name)
+        {
+            foreign_key.name = rename.new_name.clone();
         } else {
             return Err(EngineError::ApplyFailed(format!(
                 "constraint \"{}\" does not exist",
@@ -8549,6 +8593,67 @@ impl Engine {
         Ok(())
     }
 
+    fn validate_foreign_keys_with_table_rows(
+        &self,
+        changed_table: &str,
+        changed_rows: &[Vec<SqlValue>],
+        visibility: StorageVisibility,
+    ) -> Result<(), EngineError> {
+        for child_table in self.relational_catalog.values() {
+            let child_rows = if child_table.name == changed_table {
+                changed_rows.to_vec()
+            } else {
+                self.visible_relational_rows(child_table, visibility)?
+            };
+            for foreign_key in &child_table.foreign_keys {
+                let Some(parent_table) = self.relational_catalog.get(&foreign_key.referenced_table)
+                else {
+                    continue;
+                };
+                let parent_rows = if parent_table.name == changed_table {
+                    changed_rows.to_vec()
+                } else {
+                    self.visible_relational_rows(parent_table, visibility)?
+                };
+                Self::validate_foreign_key_rows(
+                    child_table,
+                    &child_rows,
+                    parent_table,
+                    &parent_rows,
+                    foreign_key,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_foreign_key_rows(
+        child_table: &RelationalTable,
+        child_rows: &[Vec<SqlValue>],
+        parent_table: &RelationalTable,
+        parent_rows: &[Vec<SqlValue>],
+        foreign_key: &RelationalForeignKey,
+    ) -> Result<(), EngineError> {
+        let child_column_idx = relational_column_index(child_table, &foreign_key.column)
+            .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+        let parent_column_idx =
+            relational_column_index(parent_table, &foreign_key.referenced_column)
+                .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+        let parent_values = parent_rows
+            .iter()
+            .map(|row| row[parent_column_idx].clone())
+            .collect::<BTreeSet<_>>();
+        for row in child_rows {
+            if !parent_values.contains(&row[child_column_idx]) {
+                return Err(EngineError::ApplyFailed(format!(
+                    "insert or update on table \"{}\" violates foreign key constraint \"{}\"",
+                    child_table.name, foreign_key.name
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn preflight_add_check_constraint(&self, add: &AddCheckConstraint) -> Result<(), EngineError> {
         let table = self.relational_catalog.get(&add.table).ok_or_else(|| {
             EngineError::ApplyFailed(format!("relation \"{}\" does not exist", add.table))
@@ -8557,6 +8662,10 @@ impl Engine {
             candidate.indexes.iter().any(|index| index.name == add.name)
                 || candidate
                     .check_constraints
+                    .iter()
+                    .any(|constraint| constraint.name == add.name)
+                || candidate
+                    .foreign_keys
                     .iter()
                     .any(|constraint| constraint.name == add.name)
         }) || self.relational_catalog.contains_key(&add.name)
@@ -8591,6 +8700,87 @@ impl Engine {
                 )));
             }
         }
+        Ok(())
+    }
+
+    fn preflight_add_foreign_key(
+        &self,
+        add: &AddForeignKey,
+        txn_id: TxnId,
+    ) -> Result<(), EngineError> {
+        if add.table == add.referenced_table {
+            return Err(EngineError::ApplyFailed(
+                "self-referential foreign keys are not supported".to_string(),
+            ));
+        }
+        let table = self.relational_catalog.get(&add.table).ok_or_else(|| {
+            EngineError::ApplyFailed(format!("relation \"{}\" does not exist", add.table))
+        })?;
+        let referenced_table = self
+            .relational_catalog
+            .get(&add.referenced_table)
+            .ok_or_else(|| {
+                EngineError::ApplyFailed(format!(
+                    "relation \"{}\" does not exist",
+                    add.referenced_table
+                ))
+            })?;
+        if self.relational_catalog.values().any(|candidate| {
+            candidate.indexes.iter().any(|index| index.name == add.name)
+                || candidate
+                    .check_constraints
+                    .iter()
+                    .any(|constraint| constraint.name == add.name)
+                || candidate
+                    .foreign_keys
+                    .iter()
+                    .any(|constraint| constraint.name == add.name)
+        }) || self.relational_catalog.contains_key(&add.name)
+            || self.relational_views.contains_key(&add.name)
+            || self.relational_materialized_views.contains_key(&add.name)
+            || self.relational_sequences.contains_key(&add.name)
+        {
+            return Err(EngineError::ApplyFailed(format!(
+                "constraint \"{}\" already exists",
+                add.name
+            )));
+        }
+        let column_idx = relational_column_index(table, &add.column)
+            .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+        let referenced_column_idx =
+            relational_column_index(referenced_table, &add.referenced_column)
+                .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+        if table.columns[column_idx].ty != referenced_table.columns[referenced_column_idx].ty {
+            return Err(EngineError::ApplyFailed(
+                "foreign key column type does not match referenced column type".to_string(),
+            ));
+        }
+        let has_referenced_unique_key = referenced_table.indexes.iter().any(|index| {
+            index.column == add.referenced_column && (index.primary_key || index.unique_constraint)
+        });
+        if !has_referenced_unique_key {
+            return Err(EngineError::ApplyFailed(format!(
+                "there is no unique constraint matching given keys for referenced table \"{}\"",
+                add.referenced_table
+            )));
+        }
+        let visibility = StorageVisibility {
+            read_txn_id: txn_id,
+        };
+        let child_rows = self.visible_relational_rows(table, visibility)?;
+        let parent_rows = self.visible_relational_rows(referenced_table, visibility)?;
+        Self::validate_foreign_key_rows(
+            table,
+            &child_rows,
+            referenced_table,
+            &parent_rows,
+            &RelationalForeignKey {
+                name: add.name.clone(),
+                column: add.column.clone(),
+                referenced_table: add.referenced_table.clone(),
+                referenced_column: add.referenced_column.clone(),
+            },
+        )?;
         Ok(())
     }
 
@@ -8654,6 +8844,17 @@ impl Engine {
                     name
                 )));
             }
+        }
+        let drop_names = drop.names.iter().cloned().collect::<BTreeSet<_>>();
+        if self.relational_catalog.values().any(|table| {
+            table.foreign_keys.iter().any(|constraint| {
+                drop_names.contains(&table.name)
+                    || drop_names.contains(&constraint.referenced_table)
+            })
+        }) {
+            return Err(EngineError::ApplyFailed(
+                "cannot drop table because a foreign key constraint depends on it".to_string(),
+            ));
         }
         Ok(())
     }
@@ -8795,8 +8996,20 @@ impl Engine {
         for index in &mut table.indexes {
             index.table = rename.new_name.clone();
         }
+        for foreign_key in &mut table.foreign_keys {
+            if foreign_key.referenced_table == rename.old_name {
+                foreign_key.referenced_table = rename.new_name.clone();
+            }
+        }
         self.relational_catalog
             .insert(rename.new_name.clone(), table.clone());
+        for candidate in self.relational_catalog.values_mut() {
+            for foreign_key in &mut candidate.foreign_keys {
+                if foreign_key.referenced_table == rename.old_name {
+                    foreign_key.referenced_table = rename.new_name.clone();
+                }
+            }
+        }
 
         self.relational_value_index
             .retain(|key, _| key.table != rename.old_name);
@@ -8978,6 +9191,20 @@ impl Engine {
                 EngineError::ApplyFailed(format!("relation \"{}\" does not exist", truncate.name))
             })?
             .clone();
+        if self.relational_catalog.values().any(|candidate| {
+            candidate
+                .foreign_keys
+                .iter()
+                .any(|foreign_key| foreign_key.referenced_table == table.name)
+        }) {
+            self.validate_foreign_keys_with_table_rows(
+                &table.name,
+                &[],
+                StorageVisibility {
+                    read_txn_id: txn_id,
+                },
+            )?;
+        }
         let restart_sequences = if truncate.restart_identity {
             table
                 .columns
@@ -9794,6 +10021,10 @@ impl Engine {
                     .check_constraints
                     .iter()
                     .any(|candidate| candidate.name == constraint)
+                    && !table_ref
+                        .foreign_keys
+                        .iter()
+                        .any(|candidate| candidate.name == constraint)
                 {
                     return Err(EngineError::ApplyFailed(format!(
                         "constraint \"{}\" does not exist",
@@ -10066,6 +10297,28 @@ impl Engine {
                 constraint.column = rename.new_name.clone();
             }
         }
+        for constraint in &mut table_ref.foreign_keys {
+            if constraint.column == rename.old_name {
+                constraint.column = rename.new_name.clone();
+            }
+            if constraint.referenced_table == rename.table
+                && constraint.referenced_column == rename.old_name
+            {
+                constraint.referenced_column = rename.new_name.clone();
+            }
+        }
+        for candidate in self.relational_catalog.values_mut() {
+            if candidate.name == rename.table {
+                continue;
+            }
+            for constraint in &mut candidate.foreign_keys {
+                if constraint.referenced_table == rename.table
+                    && constraint.referenced_column == rename.old_name
+                {
+                    constraint.referenced_column = rename.new_name.clone();
+                }
+            }
+        }
         self.relational_residency.remove(&rename.table);
         self.relational_residency_device_memory
             .remove(&rename.table);
@@ -10116,6 +10369,16 @@ impl Engine {
                 .check_constraints
                 .iter()
                 .any(|constraint| constraint.column == drop_column.column)
+            || table
+                .foreign_keys
+                .iter()
+                .any(|constraint| constraint.column == drop_column.column)
+            || self.relational_catalog.values().any(|candidate| {
+                candidate.foreign_keys.iter().any(|constraint| {
+                    constraint.referenced_table == drop_column.table
+                        && constraint.referenced_column == drop_column.column
+                })
+            })
         {
             return Err(EngineError::ApplyFailed(format!(
                 "cannot drop column \"{}\" because an index or constraint depends on it",
@@ -10277,6 +10540,22 @@ impl Engine {
             candidate_rows.extend(new_rows.clone());
             Self::validate_check_constraints_for_rows(&table, &candidate_rows)?;
         }
+        if !table.foreign_keys.is_empty() {
+            let mut candidate_rows = self.visible_relational_rows(
+                &table,
+                StorageVisibility {
+                    read_txn_id: txn_id,
+                },
+            )?;
+            candidate_rows.extend(new_rows.clone());
+            self.validate_foreign_keys_with_table_rows(
+                &table.name,
+                &candidate_rows,
+                StorageVisibility {
+                    read_txn_id: txn_id,
+                },
+            )?;
+        }
 
         for values in new_rows {
             let row_id = self.relational_next_row_id;
@@ -10341,6 +10620,30 @@ impl Engine {
         }
         drop(cursor);
 
+        if self.relational_catalog.values().any(|candidate| {
+            candidate
+                .foreign_keys
+                .iter()
+                .any(|foreign_key| foreign_key.referenced_table == table.name)
+        }) {
+            let deleted_ids = tuple_ids.iter().copied().collect::<BTreeSet<_>>();
+            let mut candidate_rows = Vec::new();
+            let mut cursor = self
+                .mvcc_store
+                .seq_scan_open(visibility)
+                .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+            while let Some(tuple) = cursor.next() {
+                if tuple.key.starts_with(&prefix) && !deleted_ids.contains(&tuple.tuple_id) {
+                    candidate_rows.push(
+                        decode_relational_row(&tuple.value, &table.columns)
+                            .map_err(|err| EngineError::ApplyFailed(err.to_string()))?,
+                    );
+                }
+            }
+            drop(cursor);
+            self.validate_foreign_keys_with_table_rows(&table.name, &candidate_rows, visibility)?;
+        }
+
         for tuple_id in tuple_ids {
             self.mvcc_store
                 .tuple_delete(tuple_id, txn_id)
@@ -10401,7 +10704,16 @@ impl Engine {
         }
         drop(cursor);
 
-        if table.indexes.iter().any(|index| index.unique) || !table.check_constraints.is_empty() {
+        if table.indexes.iter().any(|index| index.unique)
+            || !table.check_constraints.is_empty()
+            || !table.foreign_keys.is_empty()
+            || self.relational_catalog.values().any(|candidate| {
+                candidate
+                    .foreign_keys
+                    .iter()
+                    .any(|foreign_key| foreign_key.referenced_table == table.name)
+            })
+        {
             candidate_rows.extend(updates.iter().map(|(_, _, row)| row.clone()));
         }
         if table.indexes.iter().any(|index| index.unique) {
@@ -10409,6 +10721,16 @@ impl Engine {
         }
         if !table.check_constraints.is_empty() {
             Self::validate_check_constraints_for_rows(&table, &candidate_rows)?;
+        }
+        if !table.foreign_keys.is_empty()
+            || self.relational_catalog.values().any(|candidate| {
+                candidate
+                    .foreign_keys
+                    .iter()
+                    .any(|foreign_key| foreign_key.referenced_table == table.name)
+            })
+        {
+            self.validate_foreign_keys_with_table_rows(&table.name, &candidate_rows, visibility)?;
         }
 
         for (tuple_id, row_key, values) in updates {
@@ -10582,6 +10904,7 @@ impl Engine {
                 Self::validate_unique_values(&rows, column_idx, &add.name)?;
             }
             Command::AddCheckConstraint(add) => self.preflight_add_check_constraint(add)?,
+            Command::AddForeignKey(add) => self.preflight_add_foreign_key(add, txn_id)?,
             Command::AddColumn(add) => {
                 if self.relational_views.contains_key(&add.table)
                     || self.relational_materialized_views.contains_key(&add.table)
@@ -10738,6 +11061,10 @@ impl Engine {
                             .check_constraints
                             .iter()
                             .any(|constraint| constraint.name == rename.new_name)
+                        || candidate
+                            .foreign_keys
+                            .iter()
+                            .any(|constraint| constraint.name == rename.new_name)
                 }) || self.relational_catalog.contains_key(&rename.new_name)
                     || self.relational_views.contains_key(&rename.new_name)
                     || self
@@ -10756,6 +11083,10 @@ impl Engine {
                     .check_constraints
                     .iter()
                     .any(|constraint| constraint.name == rename.old_name)
+                    && !table
+                        .foreign_keys
+                        .iter()
+                        .any(|constraint| constraint.name == rename.old_name)
                 {
                     return Err(EngineError::ApplyFailed(format!(
                         "constraint \"{}\" does not exist",
@@ -10957,6 +11288,10 @@ impl Engine {
                     .check_constraints
                     .iter()
                     .any(|constraint| constraint.name == drop.name)
+                    && !table
+                        .foreign_keys
+                        .iter()
+                        .any(|constraint| constraint.name == drop.name)
                     && !drop.if_exists
                 {
                     return Err(EngineError::ApplyFailed(format!(
@@ -10987,6 +11322,7 @@ impl Engine {
                 })?;
                 if !table.indexes.iter().any(|index| index.unique)
                     && table.check_constraints.is_empty()
+                    && table.foreign_keys.is_empty()
                 {
                     return Ok(());
                 }
@@ -11080,6 +11416,13 @@ impl Engine {
                 candidate_rows.extend(new_rows);
                 Self::validate_unique_indexes_for_rows(table, &candidate_rows)?;
                 Self::validate_check_constraints_for_rows(table, &candidate_rows)?;
+                self.validate_foreign_keys_with_table_rows(
+                    &table.name,
+                    &candidate_rows,
+                    StorageVisibility {
+                        read_txn_id: txn_id,
+                    },
+                )?;
             }
             Command::Update(update) => {
                 let table = self.relational_catalog.get(&update.table).ok_or_else(|| {
@@ -11090,6 +11433,13 @@ impl Engine {
                 })?;
                 if !table.indexes.iter().any(|index| index.unique)
                     && table.check_constraints.is_empty()
+                    && table.foreign_keys.is_empty()
+                    && !self.relational_catalog.values().any(|candidate| {
+                        candidate
+                            .foreign_keys
+                            .iter()
+                            .any(|foreign_key| foreign_key.referenced_table == table.name)
+                    })
                 {
                     return Ok(());
                 }
@@ -11133,6 +11483,57 @@ impl Engine {
                 }
                 Self::validate_unique_indexes_for_rows(table, &candidate_rows)?;
                 Self::validate_check_constraints_for_rows(table, &candidate_rows)?;
+                self.validate_foreign_keys_with_table_rows(
+                    &table.name,
+                    &candidate_rows,
+                    visibility,
+                )?;
+            }
+            Command::Delete(delete) => {
+                let table = self.relational_catalog.get(&delete.table).ok_or_else(|| {
+                    EngineError::ApplyFailed(format!(
+                        "relation \"{}\" does not exist",
+                        delete.table
+                    ))
+                })?;
+                if !self.relational_catalog.values().any(|candidate| {
+                    candidate
+                        .foreign_keys
+                        .iter()
+                        .any(|foreign_key| foreign_key.referenced_table == table.name)
+                }) {
+                    return Ok(());
+                }
+                let filter_groups = bind_delete_filter_groups(table, delete)
+                    .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+                let visibility = StorageVisibility {
+                    read_txn_id: txn_id,
+                };
+                let prefix = relational_key_prefix(&delete.table);
+                let mut candidate_rows = Vec::new();
+                let mut cursor = self
+                    .mvcc_store
+                    .seq_scan_open(visibility)
+                    .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+                while let Some(tuple) = cursor.next() {
+                    if !tuple.key.starts_with(&prefix) {
+                        continue;
+                    }
+                    let row = decode_relational_row(&tuple.value, &table.columns)
+                        .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+                    if !filter_groups.iter().any(|filters| {
+                        filters
+                            .iter()
+                            .all(|(idx, op, value)| select_filter_matches(&row[*idx], *op, value))
+                    }) {
+                        candidate_rows.push(row);
+                    }
+                }
+                self.validate_foreign_keys_with_table_rows(
+                    &table.name,
+                    &candidate_rows,
+                    visibility,
+                )?;
             }
             _ => {}
         }
@@ -11144,6 +11545,7 @@ impl Engine {
             Command::AddPrimaryKey(_) => true,
             Command::AddUniqueConstraint(_) => true,
             Command::AddCheckConstraint(_) => true,
+            Command::AddForeignKey(_) => true,
             Command::DropConstraint(_) => true,
             Command::CreateIndex(create) => create.unique,
             Command::Insert(insert) => {
@@ -11152,6 +11554,7 @@ impl Engine {
                     .is_some_and(|table| {
                         table.indexes.iter().any(|index| index.unique)
                             || !table.check_constraints.is_empty()
+                            || !table.foreign_keys.is_empty()
                     })
             }
             Command::Update(update) => {
@@ -11160,6 +11563,25 @@ impl Engine {
                     .is_some_and(|table| {
                         table.indexes.iter().any(|index| index.unique)
                             || !table.check_constraints.is_empty()
+                            || !table.foreign_keys.is_empty()
+                            || self.relational_catalog.values().any(|candidate| {
+                                candidate
+                                    .foreign_keys
+                                    .iter()
+                                    .any(|foreign_key| foreign_key.referenced_table == table.name)
+                            })
+                    })
+            }
+            Command::Delete(delete) => {
+                self.relational_catalog
+                    .get(&delete.table)
+                    .is_some_and(|table| {
+                        self.relational_catalog.values().any(|candidate| {
+                            candidate
+                                .foreign_keys
+                                .iter()
+                                .any(|foreign_key| foreign_key.referenced_table == table.name)
+                        })
                     })
             }
             _ => false,
@@ -11180,6 +11602,7 @@ impl Engine {
             | Command::AddPrimaryKey(_)
             | Command::AddUniqueConstraint(_)
             | Command::AddCheckConstraint(_)
+            | Command::AddForeignKey(_)
             | Command::AddColumn(_)
             | Command::RenameTable(_)
             | Command::RenameColumn(_)
@@ -11404,6 +11827,7 @@ impl Engine {
             | Command::AddPrimaryKey(_)
             | Command::AddUniqueConstraint(_)
             | Command::AddCheckConstraint(_)
+            | Command::AddForeignKey(_)
             | Command::AddColumn(_)
             | Command::RenameTable(_)
             | Command::RenameColumn(_)
@@ -11529,6 +11953,7 @@ impl Engine {
             Command::AddPrimaryKey(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
             Command::AddUniqueConstraint(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
             Command::AddCheckConstraint(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
+            Command::AddForeignKey(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
             Command::AddColumn(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
             Command::RenameTable(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
             Command::RenameColumn(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
@@ -35867,6 +36292,67 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("violates check constraint"));
+    }
+
+    #[test]
+    fn relational_foreign_keys_enforce_and_replay_from_wal() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE customers (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
+        e.execute_text(
+            2,
+            "CREATE TABLE orders (id INT PRIMARY KEY, customer_id INT)",
+        )
+        .unwrap();
+        e.execute_text(3, "INSERT INTO customers (id, name) VALUES (1, 'Ada')")
+            .unwrap();
+        e.execute_text(4, "INSERT INTO orders (id, customer_id) VALUES (10, 1)")
+            .unwrap();
+        e.execute_text(
+            5,
+            "ALTER TABLE ONLY orders ADD CONSTRAINT orders_customer_fk FOREIGN KEY (customer_id) REFERENCES customers(id)",
+        )
+        .unwrap();
+
+        let invalid_insert = e
+            .execute_text(6, "INSERT INTO orders (id, customer_id) VALUES (11, 99)")
+            .unwrap_err()
+            .to_string();
+        assert!(invalid_insert.contains("violates foreign key constraint"));
+        let invalid_child_update = e
+            .execute_text(7, "UPDATE orders SET customer_id = 99 WHERE id = 10")
+            .unwrap_err()
+            .to_string();
+        assert!(invalid_child_update.contains("violates foreign key constraint"));
+        let invalid_parent_delete = e
+            .execute_text(8, "DELETE FROM customers WHERE id = 1")
+            .unwrap_err()
+            .to_string();
+        assert!(invalid_parent_delete.contains("violates foreign key constraint"));
+
+        e.execute_text(
+            9,
+            "ALTER TABLE ONLY orders RENAME CONSTRAINT orders_customer_fk TO orders_customer_ref_fk",
+        )
+        .unwrap();
+        e.execute_text(
+            10,
+            "ALTER TABLE ONLY customers RENAME COLUMN id TO customer_id",
+        )
+        .unwrap();
+        e.execute_text(
+            11,
+            "ALTER TABLE IF EXISTS ONLY orders DROP CONSTRAINT orders_customer_ref_fk",
+        )
+        .unwrap();
+        e.execute_text(12, "DELETE FROM customers WHERE customer_id = 1")
+            .unwrap();
+
+        let replayed = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let orders = replayed.relational_catalog_table("orders").unwrap();
+        assert!(orders.foreign_keys.is_empty());
+        let customers = replayed.relational_catalog_table("customers").unwrap();
+        assert_eq!(customers.columns[0].name, "customer_id");
     }
 
     #[test]

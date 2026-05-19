@@ -62,6 +62,7 @@ impl Planner {
             | Command::AddPrimaryKey(_)
             | Command::AddUniqueConstraint(_)
             | Command::AddCheckConstraint(_)
+            | Command::AddForeignKey(_)
             | Command::AddColumn(_)
             | Command::RenameTable(_)
             | Command::RenameColumn(_)

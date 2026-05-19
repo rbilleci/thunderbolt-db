@@ -1413,6 +1413,169 @@ fn validate_check_constraints(table: &Table) -> Result<(), ErrorField> {
     Ok(())
 }
 
+fn foreign_key_violation_error() -> ErrorField {
+    ErrorField {
+        code: "23503",
+        message: "insert or update violates foreign key constraint",
+        position: None,
+    }
+}
+
+fn validate_foreign_keys(session: &Session) -> Result<(), ErrorField> {
+    for table in session.tables.values() {
+        for foreign_key in &table.foreign_keys {
+            let Some(child_column_idx) = table
+                .columns
+                .iter()
+                .position(|column| column.def.name == foreign_key.column)
+            else {
+                continue;
+            };
+            let Some(parent) = session.tables.get(&foreign_key.referenced_table) else {
+                continue;
+            };
+            let Some(parent_column_idx) = parent
+                .columns
+                .iter()
+                .position(|column| column.def.name == foreign_key.referenced_column)
+            else {
+                continue;
+            };
+            let parent_values = parent
+                .rows
+                .iter()
+                .map(|row| row[parent_column_idx].clone())
+                .collect::<BTreeSet<_>>();
+            for row in &table.rows {
+                if !parent_values.contains(&row[child_column_idx]) {
+                    return Err(foreign_key_violation_error());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn add_foreign_key_to_session(
+    session: &mut Session,
+    table_name: &str,
+    constraint_name: String,
+    column: String,
+    referenced_table: String,
+    referenced_column: String,
+) -> Result<(), ErrorField> {
+    if table_name == referenced_table {
+        return Err(ErrorField {
+            code: "0A000",
+            message: "self-referential foreign keys are not supported",
+            position: None,
+        });
+    }
+    if session
+        .indexes
+        .iter()
+        .any(|index| index.name == constraint_name)
+        || session.tables.values().any(|table| {
+            table
+                .check_constraints
+                .iter()
+                .any(|constraint| constraint.name == constraint_name)
+                || table
+                    .foreign_keys
+                    .iter()
+                    .any(|constraint| constraint.name == constraint_name)
+        })
+        || session.tables.contains_key(&constraint_name)
+        || session.views.contains_key(&constraint_name)
+        || session.materialized_views.contains_key(&constraint_name)
+        || session.sequences.contains_key(&constraint_name)
+    {
+        return Err(ErrorField {
+            code: "42710",
+            message: "constraint already exists",
+            position: None,
+        });
+    }
+    let Some(table) = session.tables.get(table_name) else {
+        return Err(ErrorField {
+            code: "42P01",
+            message: "relation does not exist",
+            position: None,
+        });
+    };
+    let Some(child_column) = table
+        .columns
+        .iter()
+        .find(|candidate| candidate.def.name == column)
+    else {
+        return Err(ErrorField {
+            code: "42703",
+            message: "column does not exist",
+            position: None,
+        });
+    };
+    let Some(parent) = session.tables.get(&referenced_table) else {
+        return Err(ErrorField {
+            code: "42P01",
+            message: "referenced relation does not exist",
+            position: None,
+        });
+    };
+    let Some(parent_column) = parent
+        .columns
+        .iter()
+        .find(|candidate| candidate.def.name == referenced_column)
+    else {
+        return Err(ErrorField {
+            code: "42703",
+            message: "referenced column does not exist",
+            position: None,
+        });
+    };
+    if child_column.def.ty != parent_column.def.ty {
+        return Err(ErrorField {
+            code: "42804",
+            message: "foreign key column type does not match referenced column type",
+            position: None,
+        });
+    }
+    if !session.indexes.iter().any(|index| {
+        index.table == referenced_table
+            && index.column == referenced_column
+            && (index.primary_key || index.unique_constraint)
+    }) {
+        return Err(ErrorField {
+            code: "42830",
+            message: "there is no unique constraint matching given keys for referenced table",
+            position: None,
+        });
+    }
+    let foreign_key = CatalogForeignKey {
+        name: constraint_name,
+        table: table_name.to_string(),
+        column,
+        referenced_table,
+        referenced_column,
+    };
+    session
+        .tables
+        .get_mut(table_name)
+        .expect("table existence checked")
+        .foreign_keys
+        .push(foreign_key);
+    if let Err(error) = validate_foreign_keys(session) {
+        session
+            .tables
+            .get_mut(table_name)
+            .expect("table existence checked")
+            .foreign_keys
+            .pop();
+        return Err(error);
+    }
+    session.mark_table_dirty(table_name.to_string());
+    Ok(())
+}
+
 fn drop_column_from_session(
     session: &mut Session,
     table_name: &str,
@@ -1428,6 +1591,11 @@ fn drop_column_from_session(
             position: None,
         });
     }
+    let referenced_by_foreign_key = session.tables.values().any(|candidate| {
+        candidate.foreign_keys.iter().any(|constraint| {
+            constraint.referenced_table == table_name && constraint.referenced_column == column_name
+        })
+    });
     let Some(table) = session.tables.get_mut(table_name) else {
         return Err(ErrorField {
             code: "42P01",
@@ -1454,6 +1622,11 @@ fn drop_column_from_session(
             .check_constraints
             .iter()
             .any(|constraint| constraint.column == column_name)
+        || table
+            .foreign_keys
+            .iter()
+            .any(|constraint| constraint.column == column_name)
+        || referenced_by_foreign_key
     {
         return Err(ErrorField {
             code: "2BP01",
@@ -1576,6 +1749,14 @@ fn rename_column_in_session(
             constraint.column = new_name.to_string();
         }
     }
+    for constraint in &mut table.foreign_keys {
+        if constraint.column == old_name {
+            constraint.column = new_name.to_string();
+        }
+        if constraint.referenced_table == table_name && constraint.referenced_column == old_name {
+            constraint.referenced_column = new_name.to_string();
+        }
+    }
     session.mark_table_dirty(table_name.to_string());
     session.persist_catalog_snapshot();
     Ok(())
@@ -1614,6 +1795,10 @@ fn rename_constraint_in_session(
                 .check_constraints
                 .iter()
                 .any(|constraint| constraint.name == new_name)
+                || table
+                    .foreign_keys
+                    .iter()
+                    .any(|constraint| constraint.name == new_name)
         })
         || session.tables.contains_key(new_name)
         || session.views.contains_key(new_name)
@@ -1640,6 +1825,13 @@ fn rename_constraint_in_session(
             .find(|constraint| constraint.name == old_name)
         {
             check.name = new_name.to_string();
+            session.mark_table_dirty(table_name.to_string());
+        } else if let Some(foreign_key) = table
+            .foreign_keys
+            .iter_mut()
+            .find(|constraint| constraint.name == old_name)
+        {
+            foreign_key.name = new_name.to_string();
             session.mark_table_dirty(table_name.to_string());
         } else {
             return Err(ErrorField {
@@ -1869,6 +2061,26 @@ fn rename_table_in_session(
             index.table = new_name.to_string();
             session.dirty_indexes = true;
         }
+    }
+    let mut dirty_fk_tables = Vec::new();
+    for table in session.tables.values_mut() {
+        let mut changed = false;
+        for foreign_key in &mut table.foreign_keys {
+            if foreign_key.table == old_name {
+                foreign_key.table = new_name.to_string();
+                changed = true;
+            }
+            if foreign_key.referenced_table == old_name {
+                foreign_key.referenced_table = new_name.to_string();
+                changed = true;
+            }
+        }
+        if changed {
+            dirty_fk_tables.push(table.name.clone());
+        }
+    }
+    for table in dirty_fk_tables {
+        session.mark_table_dirty(table);
     }
 
     let mut retargeted_comments = Vec::new();
@@ -2457,6 +2669,7 @@ struct Table {
     columns: Vec<CatalogColumn>,
     rows: Vec<Vec<SqlValue>>,
     check_constraints: Vec<CatalogCheckConstraint>,
+    foreign_keys: Vec<CatalogForeignKey>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2922,6 +3135,10 @@ fn add_check_constraint_to_session(
                 .check_constraints
                 .iter()
                 .any(|constraint| constraint.name == constraint_name)
+                || table
+                    .foreign_keys
+                    .iter()
+                    .any(|constraint| constraint.name == constraint_name)
         })
         || session.tables.contains_key(&constraint_name)
         || session.views.contains_key(&constraint_name)
@@ -3028,6 +3245,15 @@ struct CatalogCheckConstraint {
     column: String,
     op: SelectFilterOp,
     value: SqlValue,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CatalogForeignKey {
+    name: String,
+    table: String,
+    column: String,
+    referenced_table: String,
+    referenced_column: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -6133,6 +6359,17 @@ fn parse_alter_table_drop_constraint(statement: &str) -> Option<DropConstraint> 
     })
 }
 
+fn unsupported_foreign_key_option_query(canonical: &str) -> bool {
+    canonical.starts_with("alter table ")
+        && canonical.contains(" foreign key ")
+        && canonical.contains(" references ")
+        && (canonical.contains(" on delete ")
+            || canonical.contains(" on update ")
+            || canonical.contains(" match ")
+            || canonical.contains(" deferrable")
+            || canonical.contains(" initially "))
+}
+
 fn copy_text_value(value: &SqlValue) -> String {
     format_sql_value(value)
         .replace('\\', r"\\")
@@ -6533,7 +6770,11 @@ fn apply_copy_in_rows(session: &mut Session, copy: CopyInState) -> Option<ErrorF
     if let Err(error) = validate_check_constraints(&candidate_table) {
         return Some(error);
     }
-    session.tables.get_mut(&copy.table)?.rows.extend(new_rows);
+    let old_table = session.tables.insert(copy.table.clone(), candidate_table)?;
+    if let Err(error) = validate_foreign_keys(session) {
+        session.tables.insert(copy.table.clone(), old_table);
+        return Some(error);
+    }
     session.mark_table_dirty(copy.table);
     session.persist_catalog_snapshot();
     None
@@ -6918,7 +7159,7 @@ fn execute_statement(
                 );
             }
         }
-        let Some(table) = session.tables.get_mut(&truncate.table) else {
+        let Some(table) = session.tables.get(&truncate.table).cloned() else {
             return write_error(
                 stream,
                 &ErrorField {
@@ -6928,7 +7169,16 @@ fn execute_statement(
                 },
             );
         };
-        table.rows.clear();
+        let mut candidate_table = table.clone();
+        candidate_table.rows.clear();
+        let old_table = session
+            .tables
+            .insert(truncate.table.clone(), candidate_table)
+            .expect("table existence checked");
+        if let Err(error) = validate_foreign_keys(session) {
+            session.tables.insert(truncate.table.clone(), old_table);
+            return write_error(stream, &error);
+        }
         session.mark_table_dirty(truncate.table);
         for sequence in restart_sequences {
             let sequence_state = session
@@ -6981,6 +7231,21 @@ fn execute_statement(
             }
         }
         let drop_tables = drop.tables.iter().cloned().collect::<BTreeSet<_>>();
+        if session.tables.values().any(|table| {
+            table.foreign_keys.iter().any(|constraint| {
+                drop_tables.contains(&constraint.table)
+                    || drop_tables.contains(&constraint.referenced_table)
+            })
+        }) {
+            return write_error(
+                stream,
+                &ErrorField {
+                    code: "2BP01",
+                    message: "cannot drop table because a foreign key constraint depends on it",
+                    position: None,
+                },
+            );
+        }
         let dropped_index_names = session
             .indexes
             .iter()
@@ -7043,17 +7308,27 @@ fn execute_statement(
                 && (index.primary_key || index.unique_constraint))
         });
         let mut dropped_check = false;
+        let mut dropped_foreign_key = false;
         if let Some(table) = session.tables.get_mut(&drop.table) {
             let old_check_count = table.check_constraints.len();
             table
                 .check_constraints
                 .retain(|constraint| constraint.name != drop.constraint);
             dropped_check = table.check_constraints.len() != old_check_count;
-            if dropped_check {
+            let old_foreign_key_count = table.foreign_keys.len();
+            table
+                .foreign_keys
+                .retain(|constraint| constraint.name != drop.constraint);
+            dropped_foreign_key = table.foreign_keys.len() != old_foreign_key_count;
+            if dropped_check || dropped_foreign_key {
                 session.mark_table_dirty(drop.table.clone());
             }
         }
-        if session.indexes.len() == old_index_count && !dropped_check && !drop.if_exists {
+        if session.indexes.len() == old_index_count
+            && !dropped_check
+            && !dropped_foreign_key
+            && !drop.if_exists
+        {
             return write_error(
                 stream,
                 &ErrorField {
@@ -7064,7 +7339,7 @@ fn execute_statement(
             );
         }
         session.dirty_indexes |= session.indexes.len() != old_index_count;
-        if session.indexes.len() != old_index_count || dropped_check {
+        if session.indexes.len() != old_index_count || dropped_check || dropped_foreign_key {
             for target in [
                 CatalogCommentTarget::Index {
                     index: drop.constraint.clone(),
@@ -7403,6 +7678,13 @@ fn execute_statement(
             &pg_dump_index_metadata_rows(session),
         );
     }
+    if is_catalog_foreign_key_metadata_query(&canonical) {
+        return write_single_row(
+            stream,
+            &catalog_foreign_key_metadata_columns(),
+            &catalog_foreign_key_metadata_rows(session),
+        );
+    }
     if let Some(view_oid) = pg_dump_view_definition_query_oid(&canonical) {
         return write_single_row(
             stream,
@@ -7550,6 +7832,16 @@ fn execute_statement(
         Err(ParseError::NegativeOffset) => {
             return write_error(stream, &negative_offset_error_field());
         }
+        Err(_) if unsupported_foreign_key_option_query(&canonical) => {
+            return write_error(
+                stream,
+                &ErrorField {
+                    code: "0A000",
+                    message: "foreign key options beyond single-column immediate constraints are not supported",
+                    position: None,
+                },
+            );
+        }
         Err(_) => {}
         Ok(command) => match command {
             Command::CreateTable(create) => {
@@ -7633,6 +7925,7 @@ fn execute_statement(
                         columns,
                         rows: Vec::new(),
                         check_constraints: Vec::new(),
+                        foreign_keys: Vec::new(),
                     },
                 );
                 if let Some(primary_key) = primary_key {
@@ -7735,6 +8028,20 @@ fn execute_statement(
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, "ALTER TABLE");
             }
+            Command::AddForeignKey(add) => {
+                if let Err(error) = add_foreign_key_to_session(
+                    session,
+                    &add.table,
+                    add.name,
+                    add.column,
+                    add.referenced_table,
+                    add.referenced_column,
+                ) {
+                    return write_error(stream, &error);
+                }
+                session.persist_catalog_snapshot();
+                return write_command_complete(stream, "ALTER TABLE");
+            }
             Command::DropConstraint(drop) => {
                 if !session.tables.contains_key(&drop.table) {
                     if drop.table_if_exists {
@@ -7756,17 +8063,27 @@ fn execute_statement(
                         && (index.primary_key || index.unique_constraint))
                 });
                 let mut dropped_check = false;
+                let mut dropped_foreign_key = false;
                 if let Some(table) = session.tables.get_mut(&drop.table) {
                     let old_check_count = table.check_constraints.len();
                     table
                         .check_constraints
                         .retain(|constraint| constraint.name != drop.name);
                     dropped_check = table.check_constraints.len() != old_check_count;
-                    if dropped_check {
+                    let old_foreign_key_count = table.foreign_keys.len();
+                    table
+                        .foreign_keys
+                        .retain(|constraint| constraint.name != drop.name);
+                    dropped_foreign_key = table.foreign_keys.len() != old_foreign_key_count;
+                    if dropped_check || dropped_foreign_key {
                         session.mark_table_dirty(drop.table.clone());
                     }
                 }
-                if session.indexes.len() == old_index_count && !dropped_check && !drop.if_exists {
+                if session.indexes.len() == old_index_count
+                    && !dropped_check
+                    && !dropped_foreign_key
+                    && !drop.if_exists
+                {
                     return write_error(
                         stream,
                         &ErrorField {
@@ -7777,7 +8094,8 @@ fn execute_statement(
                     );
                 }
                 session.dirty_indexes |= session.indexes.len() != old_index_count;
-                if session.indexes.len() != old_index_count || dropped_check {
+                if session.indexes.len() != old_index_count || dropped_check || dropped_foreign_key
+                {
                     for target in [
                         CatalogCommentTarget::Index {
                             index: drop.name.clone(),
@@ -9208,6 +9526,10 @@ fn execute_statement(
                                 .check_constraints
                                 .iter()
                                 .any(|candidate| candidate.name == constraint)
+                                || table
+                                    .foreign_keys
+                                    .iter()
+                                    .any(|candidate| candidate.name == constraint)
                         }) || (session.shared_catalog
                             && shared_catalog_contains_table_constraint(&table, &constraint));
                         if !exists {
@@ -9356,19 +9678,21 @@ fn execute_statement(
                 if let Err(error) = validate_check_constraints(&candidate_table) {
                     return write_error(stream, &error);
                 }
-                session
+                let old_table = session
                     .tables
-                    .get_mut(&table_name)
-                    .expect("table existence checked")
-                    .rows
-                    .extend(new_rows);
+                    .insert(table_name.clone(), candidate_table)
+                    .expect("table existence checked");
+                if let Err(error) = validate_foreign_keys(session) {
+                    session.tables.insert(table_name.clone(), old_table);
+                    return write_error(stream, &error);
+                }
                 session.mark_table_dirty(table_name);
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, &format!("INSERT 0 {inserted_count}"));
             }
             Command::Delete(delete) => {
                 let table_name = delete.table.clone();
-                let Some(table) = session.tables.get_mut(&table_name) else {
+                let Some(table) = session.tables.get(&table_name).cloned() else {
                     return write_error(
                         stream,
                         &ErrorField {
@@ -9380,18 +9704,27 @@ fn execute_statement(
                 };
                 let mut delete_mask = Vec::with_capacity(table.rows.len());
                 for row in &table.rows {
-                    match row_matches_delete_filters(table, row, &delete) {
+                    match row_matches_delete_filters(&table, row, &delete) {
                         Ok(matches) => delete_mask.push(matches),
                         Err(error) => return write_error(stream, &error),
                     }
                 }
                 let deleted_count = delete_mask.iter().filter(|matches| **matches).count();
                 let mut delete_mask = delete_mask.into_iter();
-                let kept = std::mem::take(&mut table.rows)
+                let mut candidate_table = table.clone();
+                candidate_table.rows = table
+                    .rows
                     .into_iter()
                     .filter(|_| !delete_mask.next().unwrap_or(false))
                     .collect();
-                table.rows = kept;
+                let old_table = session
+                    .tables
+                    .insert(table_name.clone(), candidate_table)
+                    .expect("table existence checked");
+                if let Err(error) = validate_foreign_keys(session) {
+                    session.tables.insert(table_name.clone(), old_table);
+                    return write_error(stream, &error);
+                }
                 session.mark_table_dirty(table_name);
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, &format!("DELETE {deleted_count}"));
@@ -9399,7 +9732,7 @@ fn execute_statement(
             Command::Update(update) => {
                 let table_name = update.table.clone();
                 let catalog_indexes = session.indexes.clone();
-                let Some(table) = session.tables.get_mut(&table_name) else {
+                let Some(table) = session.tables.get(&table_name).cloned() else {
                     return write_error(
                         stream,
                         &ErrorField {
@@ -9456,7 +9789,7 @@ fn execute_statement(
                 };
                 let mut update_mask = Vec::with_capacity(table.rows.len());
                 for row in &table.rows {
-                    match row_matches_delete_filters(table, row, &delete_shape) {
+                    match row_matches_delete_filters(&table, row, &delete_shape) {
                         Ok(matches) => update_mask.push(matches),
                         Err(error) => return write_error(stream, &error),
                     }
@@ -9478,7 +9811,14 @@ fn execute_statement(
                 if let Err(error) = validate_check_constraints(&candidate_table) {
                     return write_error(stream, &error);
                 }
-                table.rows = candidate_table.rows;
+                let old_table = session
+                    .tables
+                    .insert(table_name.clone(), candidate_table)
+                    .expect("table existence checked");
+                if let Err(error) = validate_foreign_keys(session) {
+                    session.tables.insert(table_name.clone(), old_table);
+                    return write_error(stream, &error);
+                }
                 session.mark_table_dirty(table_name);
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, &format!("UPDATE {updated_count}"));
@@ -10295,6 +10635,13 @@ fn execute_statement(
             &pg_dump_index_metadata_rows(session),
         );
     }
+    if is_catalog_foreign_key_metadata_query(&canonical) {
+        return write_single_row(
+            stream,
+            &catalog_foreign_key_metadata_columns(),
+            &catalog_foreign_key_metadata_rows(session),
+        );
+    }
     if let Some(view_oid) = pg_dump_view_definition_query_oid(&canonical) {
         return write_single_row(
             stream,
@@ -10445,6 +10792,42 @@ fn execute_statement(
             stream,
             &[text_column("conname"), text_column("pg_get_constraintdef")],
             &catalog_describe_check_constraint_rows(session, oid),
+        );
+    }
+    if let Some(oid) = catalog_describe_foreign_keys_query_oid(&canonical) {
+        return write_single_row(
+            stream,
+            &[
+                bool_column("sametable"),
+                text_column("conname"),
+                text_column("condef"),
+                text_column("ontable"),
+            ],
+            &catalog_describe_foreign_key_rows(session, oid),
+        );
+    }
+    if let Some(oid) = catalog_describe_referenced_by_foreign_keys_query_oid(&canonical) {
+        return write_single_row(
+            stream,
+            &[
+                text_column("conname"),
+                text_column("ontable"),
+                text_column("condef"),
+            ],
+            &catalog_describe_referenced_by_foreign_key_rows(session, oid),
+        );
+    }
+    if let Some(oid) = catalog_describe_trigger_query_oid(&canonical) {
+        return write_single_row(
+            stream,
+            &[
+                text_column("tgname"),
+                text_column("pg_get_triggerdef"),
+                text_column("tgenabled"),
+                text_column("tgisinternal"),
+                text_column("parent"),
+            ],
+            &catalog_empty_rows_for_relation_oid(oid),
         );
     }
     if let Some(oid) = catalog_describe_policy_query_oid(&canonical) {
@@ -12625,6 +13008,65 @@ fn pg_dump_index_metadata_rows(session: &Session) -> Vec<Vec<Option<String>>> {
         .collect()
 }
 
+fn is_catalog_foreign_key_metadata_query(canonical: &str) -> bool {
+    canonical.starts_with("select c.tableoid, c.oid, conrelid, conname")
+        && canonical.contains("join pg_catalog.pg_constraint c")
+}
+
+fn catalog_foreign_key_metadata_columns() -> Vec<Column> {
+    vec![
+        int4_column("tableoid"),
+        int4_column("oid"),
+        int4_column("conrelid"),
+        text_column("conname"),
+        int4_column("confrelid"),
+        int4_column("conindid"),
+        text_column("condef"),
+    ]
+}
+
+fn foreign_key_definition(foreign_key: &CatalogForeignKey) -> String {
+    format!(
+        "FOREIGN KEY ({}) REFERENCES {}({})",
+        foreign_key.column, foreign_key.referenced_table, foreign_key.referenced_column
+    )
+}
+
+fn catalog_foreign_key_metadata_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut rows = Vec::new();
+    let index_entries = catalog_index_entries(session);
+    let mut tables = session.tables.values().collect::<Vec<_>>();
+    tables.sort_by_key(|table| table.oid);
+    for table in tables {
+        for (idx, foreign_key) in table.foreign_keys.iter().enumerate() {
+            let referenced_table_oid = session
+                .tables
+                .get(&foreign_key.referenced_table)
+                .map(|table| table.oid)
+                .unwrap_or(0);
+            let referenced_index_oid = index_entries
+                .iter()
+                .find(|entry| {
+                    entry.index.table == foreign_key.referenced_table
+                        && entry.index.column == foreign_key.referenced_column
+                        && (entry.index.primary_key || entry.index.unique_constraint)
+                })
+                .map(|entry| entry.index_oid)
+                .unwrap_or(0);
+            rows.push(vec![
+                Some("2606".to_string()),
+                Some(catalog_foreign_key_oid(table.oid, idx).to_string()),
+                Some(table.oid.to_string()),
+                Some(foreign_key.name.clone()),
+                Some(referenced_table_oid.to_string()),
+                Some(referenced_index_oid.to_string()),
+                Some(foreign_key_definition(foreign_key)),
+            ]);
+        }
+    }
+    rows
+}
+
 fn pg_dump_view_definition_query_oid(canonical: &str) -> Option<u32> {
     let prefix = "select pg_catalog.pg_get_viewdef('";
     let suffix = "'::pg_catalog.oid) as viewdef";
@@ -12747,6 +13189,10 @@ fn catalog_constraint_definition(index: &CatalogIndex) -> String {
 
 fn catalog_constraint_oid(entry: &CatalogIndexEntry) -> u32 {
     40_000 + entry.index_oid
+}
+
+fn catalog_foreign_key_oid(table_oid: u32, idx: usize) -> u32 {
+    80_000 + table_oid + idx as u32
 }
 
 fn catalog_index_oid(session: &Session, index_name: &str) -> Option<u32> {
@@ -13642,13 +14088,20 @@ fn catalog_describe_relation_flags_rows(session: &Session, oid: u32) -> Vec<Vec<
         .indexes
         .iter()
         .any(|index| index.table == table.name);
+    let relhastriggers = !table.foreign_keys.is_empty()
+        || session.tables.values().any(|candidate| {
+            candidate
+                .foreign_keys
+                .iter()
+                .any(|foreign_key| foreign_key.referenced_table == table.name)
+        });
 
     vec![vec![
         Some(table.check_constraints.len().to_string()),
         Some("r".to_string()),
         Some(if relhasindex { "t" } else { "f" }.to_string()),
         Some("f".to_string()),
-        Some("f".to_string()),
+        Some(if relhastriggers { "t" } else { "f" }.to_string()),
         Some("f".to_string()),
         Some("f".to_string()),
         Some("f".to_string()),
@@ -13692,6 +14145,45 @@ fn catalog_describe_check_constraints_query_oid(canonical: &str) -> Option<u32> 
         .ok()
 }
 
+fn catalog_describe_foreign_keys_query_oid(canonical: &str) -> Option<u32> {
+    if !canonical.contains("from pg_catalog.pg_constraint r")
+        || !canonical.contains("r.contype = 'f'")
+        || !canonical.contains("conparentid = 0")
+    {
+        return None;
+    }
+    let marker = "r.conrelid = '";
+    let (_, rest) = canonical.split_once(marker)?;
+    let (oid, _) = rest.split_once('\'')?;
+    oid.parse().ok()
+}
+
+fn catalog_describe_referenced_by_foreign_keys_query_oid(canonical: &str) -> Option<u32> {
+    if !canonical.contains("from pg_catalog.pg_constraint c")
+        || !canonical.contains("confrelid in (select pg_catalog.pg_partition_ancestors('")
+        || !canonical.contains("and contype = 'f'")
+        || !canonical.contains("conparentid = 0")
+    {
+        return None;
+    }
+    let marker = "pg_partition_ancestors('";
+    let (_, rest) = canonical.split_once(marker)?;
+    let (oid, _) = rest.split_once('\'')?;
+    oid.parse().ok()
+}
+
+fn catalog_describe_trigger_query_oid(canonical: &str) -> Option<u32> {
+    if !canonical.contains("from pg_catalog.pg_trigger t")
+        || !canonical.contains("pg_catalog.pg_get_triggerdef(t.oid, true)")
+    {
+        return None;
+    }
+    let marker = "where t.tgrelid = '";
+    let (_, rest) = canonical.split_once(marker)?;
+    let (oid, _) = rest.split_once('\'')?;
+    oid.parse().ok()
+}
+
 fn check_constraint_definition(constraint: &CatalogCheckConstraint) -> String {
     let op = match constraint.op {
         SelectFilterOp::Eq => "=",
@@ -13706,6 +14198,57 @@ fn check_constraint_definition(constraint: &CatalogCheckConstraint) -> String {
         value => format_sql_value(value),
     };
     format!("CHECK (({} {} {}))", constraint.column, op, value)
+}
+
+fn catalog_describe_foreign_key_rows(
+    session: &Session,
+    table_oid: u32,
+) -> Vec<Vec<Option<String>>> {
+    let Some(table) = session.tables.values().find(|table| table.oid == table_oid) else {
+        return Vec::new();
+    };
+    let mut rows = table
+        .foreign_keys
+        .iter()
+        .map(|constraint| {
+            vec![
+                Some("t".to_string()),
+                Some(constraint.name.clone()),
+                Some(foreign_key_definition(constraint)),
+                Some(format!("public.{}", table.name)),
+            ]
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| left[1].cmp(&right[1]));
+    rows
+}
+
+fn catalog_describe_referenced_by_foreign_key_rows(
+    session: &Session,
+    table_oid: u32,
+) -> Vec<Vec<Option<String>>> {
+    let Some(parent_table) = session.tables.values().find(|table| table.oid == table_oid) else {
+        return Vec::new();
+    };
+    let mut rows = session
+        .tables
+        .values()
+        .flat_map(|table| {
+            table
+                .foreign_keys
+                .iter()
+                .filter(|constraint| constraint.referenced_table == parent_table.name)
+                .map(|constraint| {
+                    vec![
+                        Some(constraint.name.clone()),
+                        Some(format!("public.{}", table.name)),
+                        Some(foreign_key_definition(constraint)),
+                    ]
+                })
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| left[0].cmp(&right[0]).then_with(|| left[1].cmp(&right[1])));
+    rows
 }
 
 fn catalog_describe_check_constraint_rows(
@@ -14719,6 +15262,14 @@ fn information_schema_table_constraint_rows(session: &Session) -> Vec<Vec<Option
                 Some("CHECK".to_string()),
             ]);
         }
+        for constraint in &table.foreign_keys {
+            rows.push(vec![
+                Some("public".to_string()),
+                Some(table.name.clone()),
+                Some(constraint.name.clone()),
+                Some("FOREIGN KEY".to_string()),
+            ]);
+        }
     }
     rows.sort_by(|left, right| left[1].cmp(&right[1]).then_with(|| left[2].cmp(&right[2])));
     rows
@@ -14729,7 +15280,7 @@ fn information_schema_key_column_usage_query() -> &'static str {
 }
 
 fn information_schema_key_column_usage_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    catalog_constraint_entries(session)
+    let mut rows = catalog_constraint_entries(session)
         .into_iter()
         .map(|entry| {
             vec![
@@ -14740,7 +15291,20 @@ fn information_schema_key_column_usage_rows(session: &Session) -> Vec<Vec<Option
                 Some("1".to_string()),
             ]
         })
-        .collect()
+        .collect::<Vec<_>>();
+    for table in session.tables.values() {
+        for constraint in &table.foreign_keys {
+            rows.push(vec![
+                Some("public".to_string()),
+                Some(table.name.clone()),
+                Some(constraint.column.clone()),
+                Some(constraint.name.clone()),
+                Some("1".to_string()),
+            ]);
+        }
+    }
+    rows.sort_by(|left, right| left[1].cmp(&right[1]).then_with(|| left[4].cmp(&right[4])));
+    rows
 }
 
 fn information_schema_views_query() -> &'static str {
@@ -14943,6 +15507,14 @@ fn pg_catalog_constraint_rows(session: &Session) -> Vec<Vec<Option<String>>> {
                 Some("c".to_string()),
             ]);
         }
+        for constraint in &table.foreign_keys {
+            rows.push(vec![
+                Some("public".to_string()),
+                Some(table.name.clone()),
+                Some(constraint.name.clone()),
+                Some("f".to_string()),
+            ]);
+        }
     }
     rows.sort_by(|left, right| left[1].cmp(&right[1]).then_with(|| left[2].cmp(&right[2])));
     rows
@@ -15107,6 +15679,19 @@ fn pg_catalog_constraint_description_rows(session: &Session) -> Vec<Vec<Option<S
     }
     for table in session.tables.values() {
         for constraint in &table.check_constraints {
+            if let Some(description) = session.comments.get(&CatalogCommentTarget::Constraint {
+                table: table.name.clone(),
+                constraint: constraint.name.clone(),
+            }) {
+                rows.push(vec![
+                    Some("public".to_string()),
+                    Some(table.name.clone()),
+                    Some(constraint.name.clone()),
+                    Some(description.clone()),
+                ]);
+            }
+        }
+        for constraint in &table.foreign_keys {
             if let Some(description) = session.comments.get(&CatalogCommentTarget::Constraint {
                 table: table.name.clone(),
                 constraint: constraint.name.clone(),
@@ -17172,6 +17757,7 @@ mod tests {
             }],
             rows,
             check_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
         }
     }
 
@@ -18261,6 +18847,7 @@ mod tests {
                     vec![SqlValue::Int4(2), SqlValue::Text("Tab\tName".to_string())],
                 ],
                 check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         );
         let (mut writer, mut reader) = tcp_pair();
@@ -18323,6 +18910,7 @@ mod tests {
                     ],
                 ],
                 check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         );
         let (mut writer, mut reader) = tcp_pair();
@@ -18384,6 +18972,7 @@ mod tests {
                 ],
                 rows: vec![vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())]],
                 check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         );
         let (mut writer, mut reader) = tcp_pair();
@@ -18451,6 +19040,7 @@ mod tests {
                     ],
                 ],
                 check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         );
         let (mut writer, mut reader) = tcp_pair();
@@ -18513,6 +19103,7 @@ mod tests {
                 ],
                 rows: Vec::new(),
                 check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         );
         let mut extended_error_pending = false;
@@ -18599,6 +19190,7 @@ mod tests {
                 ],
                 rows: Vec::new(),
                 check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         );
         let mut extended_error_pending = false;
@@ -18685,6 +19277,7 @@ mod tests {
                 ],
                 rows: Vec::new(),
                 check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         );
         let mut extended_error_pending = false;
@@ -18770,6 +19363,7 @@ mod tests {
                 ],
                 rows: Vec::new(),
                 check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         );
         let mut extended_error_pending = false;
@@ -18846,6 +19440,7 @@ mod tests {
                 }],
                 rows: vec![vec![SqlValue::Int4(1)], vec![SqlValue::Int4(2)]],
                 check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         );
         session.sequences.insert(
@@ -18916,6 +19511,7 @@ mod tests {
                     ],
                 ],
                 check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         );
         let (mut writer, mut reader) = tcp_pair();
@@ -18978,6 +19574,7 @@ mod tests {
                     ],
                 ],
                 check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         );
         let (mut writer, mut reader) = tcp_pair();
@@ -19339,6 +19936,7 @@ mod tests {
                 ],
                 rows: Vec::new(),
                 check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         );
         session.tables.insert(
@@ -19357,6 +19955,7 @@ mod tests {
                 }],
                 rows: Vec::new(),
                 check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         );
 
@@ -19539,6 +20138,7 @@ mod tests {
                     vec![SqlValue::Int4(2), SqlValue::Text("grace".to_string())],
                 ],
                 check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         );
         assert_eq!(
@@ -20890,6 +21490,7 @@ mod tests {
                 }],
                 rows: Vec::new(),
                 check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         );
 
@@ -20938,6 +21539,7 @@ mod tests {
             ],
             rows: Vec::new(),
             check_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
         };
         let Command::Select(select) =
             parse_command("SELECT id, name FROM people WHERE (id = 1) OR (name = 'Grace')")
@@ -20996,6 +21598,7 @@ mod tests {
                 ],
                 rows: Vec::new(),
                 check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         );
 
@@ -21211,6 +21814,7 @@ mod tests {
                 ],
                 rows: vec![vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())]],
                 check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         );
         let (mut writer, mut reader) = tcp_pair();
@@ -21338,6 +21942,7 @@ mod tests {
                 ],
                 rows: Vec::new(),
                 check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         );
 
@@ -21454,6 +22059,7 @@ mod tests {
                     vec![SqlValue::Int4(3), SqlValue::Text("Grace".to_string())],
                 ],
                 check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         );
         let (mut writer, mut reader) = tcp_pair();
@@ -21524,6 +22130,7 @@ mod tests {
                     vec![SqlValue::Int4(3), SqlValue::Text("Grace".to_string())],
                 ],
                 check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         );
         let (mut writer, mut reader) = tcp_pair();
@@ -21636,6 +22243,7 @@ mod tests {
                     vec![SqlValue::Int4(3), SqlValue::Text("Grace".to_string())],
                 ],
                 check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         );
         session.prepared.insert(
@@ -21726,6 +22334,7 @@ mod tests {
                 ],
                 rows: vec![vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())]],
                 check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         );
         session.prepared.insert(
@@ -21839,6 +22448,7 @@ mod tests {
                     vec![SqlValue::Int4(2), SqlValue::Text("Linus".to_string())],
                 ],
                 check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         );
         let (mut writer, mut reader) = tcp_pair();
@@ -22026,6 +22636,7 @@ mod tests {
                     vec![SqlValue::Int4(2), SqlValue::Text("Linus".to_string())],
                 ],
                 check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         );
         let query = PreparedQuery {
@@ -22124,6 +22735,7 @@ mod tests {
                     vec![SqlValue::Int4(2), SqlValue::Text("Linus".to_string())],
                 ],
                 check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         );
         let query = PreparedQuery {
@@ -22270,6 +22882,7 @@ mod tests {
                     ],
                     rows: vec![vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())]],
                     check_constraints: Vec::new(),
+                    foreign_keys: Vec::new(),
                 },
             );
             session.replace_extended_statement(
@@ -22390,6 +23003,7 @@ mod tests {
                     ],
                     rows: vec![vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())]],
                     check_constraints: Vec::new(),
+                    foreign_keys: Vec::new(),
                 },
             );
             session.replace_extended_statement(
@@ -22498,6 +23112,7 @@ mod tests {
                 ],
                 rows: vec![vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())]],
                 check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         );
         session.replace_extended_statement(
@@ -22633,6 +23248,7 @@ mod tests {
                 ],
                 rows: Vec::new(),
                 check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         );
         let first = PreparedQuery {
@@ -22727,6 +23343,7 @@ mod tests {
                 ],
                 rows: Vec::new(),
                 check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         );
         let (mut writer, mut reader) = tcp_pair();
@@ -22780,6 +23397,7 @@ mod tests {
                 ],
                 rows: Vec::new(),
                 check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         );
         let (mut writer, mut reader) = tcp_pair();
@@ -22907,6 +23525,7 @@ mod tests {
                 }],
                 rows: Vec::new(),
                 check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         );
         let (mut writer, mut reader) = tcp_pair();
@@ -22962,6 +23581,7 @@ mod tests {
                 ],
                 rows: Vec::new(),
                 check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         );
         let (mut writer, mut reader) = tcp_pair();
@@ -23051,6 +23671,7 @@ mod tests {
                     ],
                     rows: vec![vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())]],
                     check_constraints: Vec::new(),
+                    foreign_keys: Vec::new(),
                 },
             );
             let (mut writer, mut reader) = tcp_pair();
@@ -23394,6 +24015,7 @@ mod tests {
                 ],
                 rows: vec![vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())]],
                 check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         );
         session.replace_extended_statement(
@@ -23511,6 +24133,7 @@ mod tests {
                 ],
                 rows: vec![vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())]],
                 check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         );
         session.replace_extended_statement(
@@ -23646,6 +24269,7 @@ mod tests {
                     ],
                     rows: vec![vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())]],
                     check_constraints: Vec::new(),
+                    foreign_keys: Vec::new(),
                 },
             );
             session.replace_extended_statement(
@@ -23772,6 +24396,7 @@ mod tests {
                 ],
                 rows: Vec::new(),
                 check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         );
         let query = PreparedQuery {
@@ -23838,6 +24463,7 @@ mod tests {
                 ],
                 rows: Vec::new(),
                 check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         );
         session.prepared.insert(
@@ -24056,6 +24682,7 @@ mod tests {
                     vec![SqlValue::Int4(3), SqlValue::Text("Grace".to_string())],
                 ],
                 check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         );
         session.replace_extended_portal(
@@ -24125,6 +24752,7 @@ mod tests {
                 }],
                 rows: vec![vec![SqlValue::Int4(1)]],
                 check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         );
         session.replace_extended_portal(
@@ -24186,6 +24814,7 @@ mod tests {
                     vec![SqlValue::Int4(3)],
                 ],
                 check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         );
         session.portals.insert(
@@ -24244,6 +24873,7 @@ mod tests {
                 }],
                 rows: vec![vec![SqlValue::Int4(1)]],
                 check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         );
         session.replace_extended_portal(
@@ -24313,6 +24943,7 @@ mod tests {
                 ],
                 rows: Vec::new(),
                 check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         );
 
@@ -24356,6 +24987,7 @@ mod tests {
                 ],
                 rows: vec![vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())]],
                 check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         );
         session.prepared.insert(
@@ -24433,6 +25065,7 @@ mod tests {
                 ],
                 rows: vec![vec![SqlValue::Int4(2), SqlValue::Text("Ada".to_string())]],
                 check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         );
         session.prepared.insert(
@@ -24521,6 +25154,7 @@ mod tests {
                 ],
                 rows: Vec::new(),
                 check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         );
         session.prepared.insert(
@@ -24595,6 +25229,7 @@ mod tests {
                 ],
                 rows: Vec::new(),
                 check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         );
         session.prepared.insert(
@@ -24651,6 +25286,7 @@ mod tests {
                 ],
                 rows: Vec::new(),
                 check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         );
         session.prepared.insert(
@@ -24708,6 +25344,7 @@ mod tests {
                 ],
                 rows: Vec::new(),
                 check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         );
         session.prepared.insert(
@@ -25550,6 +26187,7 @@ mod tests {
                     vec![SqlValue::Int4(3), SqlValue::Text("Grace".to_string())],
                 ],
                 check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         );
         let Command::Select(select) =
@@ -25808,6 +26446,7 @@ mod tests {
                     vec![SqlValue::Int4(2), SqlValue::Text("Grace".to_string())],
                 ],
                 check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         );
         session.prepared.insert(
@@ -25874,6 +26513,7 @@ mod tests {
                     vec![SqlValue::Int4(2), SqlValue::Text("Linus".to_string())],
                 ],
                 check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         );
         let (mut writer, mut reader) = tcp_pair();
@@ -26118,6 +26758,7 @@ mod tests {
                 ],
                 rows: Vec::new(),
                 check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         );
 
@@ -26234,6 +26875,7 @@ mod tests {
                 ],
                 rows: Vec::new(),
                 check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
             },
         );
         session.comments.insert(

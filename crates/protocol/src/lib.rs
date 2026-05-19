@@ -13,6 +13,7 @@ pub enum Command {
     AddPrimaryKey(AddPrimaryKey),
     AddUniqueConstraint(AddUniqueConstraint),
     AddCheckConstraint(AddCheckConstraint),
+    AddForeignKey(AddForeignKey),
     AddColumn(AddColumn),
     RenameTable(RenameTable),
     RenameColumn(RenameColumn),
@@ -101,6 +102,15 @@ pub struct AddCheckConstraint {
     pub table: String,
     pub name: String,
     pub filter: SelectFilter,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddForeignKey {
+    pub table: String,
+    pub name: String,
+    pub column: String,
+    pub referenced_table: String,
+    pub referenced_column: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2378,6 +2388,42 @@ fn parse_add_check_constraint(input: &str) -> Result<AddCheckConstraint, ParseEr
     })
 }
 
+fn parse_add_foreign_key(input: &str) -> Result<AddForeignKey, ParseError> {
+    let (table, name, rest) = parse_alter_table_add_constraint(input)?;
+    let rest = strip_keyword_prefix_case_insensitive(rest, "FOREIGN")
+        .and_then(|s| strip_keyword_prefix_case_insensitive(s.trim_start(), "KEY"))
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    let open = rest.find('(').ok_or(ParseError::InvalidRelationalSql)?;
+    let close = find_matching_paren(rest, open).ok_or(ParseError::InvalidRelationalSql)?;
+    let columns = split_csv(&rest[open + 1..close])?;
+    let [column] = columns.as_slice() else {
+        return Err(ParseError::InvalidRelationalSql);
+    };
+    let column = normalize_identifier(column.trim())?;
+    let rest = rest[close + 1..].trim_start();
+    let rest = strip_keyword_prefix_case_insensitive(rest, "REFERENCES")
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    let open = rest.find('(').ok_or(ParseError::InvalidRelationalSql)?;
+    let close = find_matching_paren(rest, open).ok_or(ParseError::InvalidRelationalSql)?;
+    if close <= open || !rest[close + 1..].trim().is_empty() {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let referenced_table = normalize_relation_identifier(rest[..open].trim())?;
+    let referenced_columns = split_csv(&rest[open + 1..close])?;
+    let [referenced_column] = referenced_columns.as_slice() else {
+        return Err(ParseError::InvalidRelationalSql);
+    };
+    Ok(AddForeignKey {
+        table,
+        name,
+        column,
+        referenced_table,
+        referenced_column: normalize_identifier(referenced_column.trim())?,
+    })
+}
+
 fn parse_add_table_constraint(input: &str) -> Result<Command, ParseError> {
     let (_, _, rest) = parse_alter_table_add_constraint(input)?;
     if strip_keyword_prefix_case_insensitive(rest, "PRIMARY").is_some() {
@@ -2388,6 +2434,9 @@ fn parse_add_table_constraint(input: &str) -> Result<Command, ParseError> {
     }
     if strip_keyword_prefix_case_insensitive(rest, "CHECK").is_some() {
         return parse_add_check_constraint(input).map(Command::AddCheckConstraint);
+    }
+    if strip_keyword_prefix_case_insensitive(rest, "FOREIGN").is_some() {
+        return parse_add_foreign_key(input).map(Command::AddForeignKey);
     }
     Err(ParseError::InvalidRelationalSql)
 }
@@ -2715,7 +2764,8 @@ fn parse_alter_table_add_constraint(input: &str) -> Result<(String, String, &str
     let primary_pos = find_keyword_outside_quotes(rest, "PRIMARY");
     let unique_pos = find_keyword_outside_quotes(rest, "UNIQUE");
     let check_pos = find_keyword_outside_quotes(rest, "CHECK");
-    let constraint_pos = [primary_pos, unique_pos, check_pos]
+    let foreign_pos = find_keyword_outside_quotes(rest, "FOREIGN");
+    let constraint_pos = [primary_pos, unique_pos, check_pos, foreign_pos]
         .into_iter()
         .flatten()
         .min()
@@ -11197,6 +11247,37 @@ default: None,
         assert!(matches!(
             parse_command(
                 "ALTER TABLE ONLY public.keyed_people ADD CONSTRAINT keyed_people_id_between CHECK (id BETWEEN 1 AND 3)"
+            ),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert_eq!(
+            parse_command(
+                "ALTER TABLE ONLY public.orders ADD CONSTRAINT orders_customer_fk FOREIGN KEY (customer_id) REFERENCES public.customers(id)"
+            )
+            .unwrap(),
+            Command::AddForeignKey(AddForeignKey {
+                table: "orders".to_string(),
+                name: "orders_customer_fk".to_string(),
+                column: "customer_id".to_string(),
+                referenced_table: "customers".to_string(),
+                referenced_column: "id".to_string(),
+            })
+        );
+        assert!(matches!(
+            parse_command(
+                "ALTER TABLE orders ADD CONSTRAINT orders_customer_fk FOREIGN KEY (customer_id, tenant_id) REFERENCES customers(id, tenant_id)"
+            ),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command(
+                "ALTER TABLE orders ADD CONSTRAINT orders_customer_fk FOREIGN KEY (customer_id) REFERENCES private.customers(id)"
+            ),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command(
+                "ALTER TABLE orders ADD CONSTRAINT orders_customer_fk FOREIGN KEY (customer_id) REFERENCES customers(id) ON DELETE CASCADE"
             ),
             Err(ParseError::InvalidRelationalSql)
         ));
