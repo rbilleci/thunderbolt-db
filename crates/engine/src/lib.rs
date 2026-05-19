@@ -104,6 +104,8 @@ impl ReplicatedStateMachine for KvStateMachine {
                     | Command::DropSequence(_)
                     | Command::GrantTable(_)
                     | Command::RevokeTable(_)
+                    | Command::GrantDefaultTablePrivileges(_)
+                    | Command::RevokeDefaultTablePrivileges(_)
                     | Command::AlterColumnDefault(_)
                     | Command::CommentOn(_)
                     | Command::Insert(_)
@@ -5957,6 +5959,7 @@ pub struct Engine {
     relational_views: BTreeMap<String, RelationalView>,
     relational_materialized_views: BTreeMap<String, RelationalMaterializedView>,
     relational_sequences: BTreeMap<String, RelationalSequence>,
+    relational_default_table_acl: BTreeMap<String, BTreeSet<TablePrivilege>>,
     relational_comments: BTreeMap<RelationalCommentTarget, String>,
     relational_value_index: BTreeMap<RelationalIndexKey, Vec<String>>,
     relational_residency: BTreeMap<String, RelationalResidencySnapshot>,
@@ -7344,6 +7347,7 @@ impl Engine {
             relational_views: BTreeMap::new(),
             relational_materialized_views: BTreeMap::new(),
             relational_sequences: BTreeMap::new(),
+            relational_default_table_acl: BTreeMap::new(),
             relational_comments: BTreeMap::new(),
             relational_value_index: BTreeMap::new(),
             relational_residency: BTreeMap::new(),
@@ -7622,6 +7626,12 @@ impl Engine {
             }
             Command::RevokeTable(revoke) => {
                 self.apply_revoke_table(&revoke.table, &revoke.grantee, &revoke.privileges)?
+            }
+            Command::GrantDefaultTablePrivileges(grant) => {
+                self.apply_grant_default_table_privileges(&grant.grantee, &grant.privileges)
+            }
+            Command::RevokeDefaultTablePrivileges(revoke) => {
+                self.apply_revoke_default_table_privileges(&revoke.grantee, &revoke.privileges)
             }
             Command::AlterColumnDefault(alter) => self.apply_alter_column_default(alter)?,
             Command::CommentOn(comment) => self.apply_comment_on(comment)?,
@@ -8001,7 +8011,7 @@ impl Engine {
                 oid,
                 columns,
                 indexes,
-                acl: BTreeMap::new(),
+                acl: self.relational_default_table_acl.clone(),
             },
         );
         self.relational_next_oid = next_oid;
@@ -8958,6 +8968,35 @@ impl Engine {
             }
         }
         Ok(())
+    }
+
+    fn apply_grant_default_table_privileges(
+        &mut self,
+        grantee: &str,
+        privileges: &[TablePrivilege],
+    ) {
+        let acl = self
+            .relational_default_table_acl
+            .entry(grantee.to_string())
+            .or_default();
+        for privilege in privileges {
+            acl.insert(*privilege);
+        }
+    }
+
+    fn apply_revoke_default_table_privileges(
+        &mut self,
+        grantee: &str,
+        privileges: &[TablePrivilege],
+    ) {
+        if let Some(acl) = self.relational_default_table_acl.get_mut(grantee) {
+            for privilege in privileges {
+                acl.remove(privilege);
+            }
+            if acl.is_empty() {
+                self.relational_default_table_acl.remove(grantee);
+            }
+        }
     }
 
     fn preflight_create_materialized_view(
@@ -10420,6 +10459,7 @@ impl Engine {
             Command::DropSequence(drop) => self.preflight_drop_sequence(drop)?,
             Command::GrantTable(grant) => self.preflight_table_acl_target(&grant.table)?,
             Command::RevokeTable(revoke) => self.preflight_table_acl_target(&revoke.table)?,
+            Command::GrantDefaultTablePrivileges(_) | Command::RevokeDefaultTablePrivileges(_) => {}
             Command::Insert(insert) => {
                 let table = self.relational_catalog.get(&insert.table).ok_or_else(|| {
                     EngineError::ApplyFailed(format!(
@@ -10631,6 +10671,8 @@ impl Engine {
             | Command::DropSequence(_)
             | Command::GrantTable(_)
             | Command::RevokeTable(_)
+            | Command::GrantDefaultTablePrivileges(_)
+            | Command::RevokeDefaultTablePrivileges(_)
             | Command::AlterColumnDefault(_)
             | Command::CommentOn(_)
             | Command::Insert(_)
@@ -10846,6 +10888,8 @@ impl Engine {
             | Command::DropSequence(_)
             | Command::GrantTable(_)
             | Command::RevokeTable(_)
+            | Command::GrantDefaultTablePrivileges(_)
+            | Command::RevokeDefaultTablePrivileges(_)
             | Command::AlterColumnDefault(_)
             | Command::CommentOn(_)
             | Command::Insert(_)
@@ -10970,6 +11014,12 @@ impl Engine {
             Command::DropSequence(_) => Err(ExecuteError::NonReadCommand("DROP SEQUENCE")),
             Command::GrantTable(_) => Err(ExecuteError::NonReadCommand("GRANT")),
             Command::RevokeTable(_) => Err(ExecuteError::NonReadCommand("REVOKE")),
+            Command::GrantDefaultTablePrivileges(_) => {
+                Err(ExecuteError::NonReadCommand("ALTER DEFAULT PRIVILEGES"))
+            }
+            Command::RevokeDefaultTablePrivileges(_) => {
+                Err(ExecuteError::NonReadCommand("ALTER DEFAULT PRIVILEGES"))
+            }
             Command::AlterColumnDefault(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
             Command::CommentOn(_) => Err(ExecuteError::NonReadCommand("COMMENT")),
             Command::Insert(_) => Err(ExecuteError::NonReadCommand("INSERT")),
@@ -14068,6 +14118,10 @@ impl Engine {
         table: &str,
     ) -> Option<&BTreeMap<String, BTreeSet<TablePrivilege>>> {
         self.relational_catalog.get(table).map(|table| &table.acl)
+    }
+
+    pub fn relational_default_table_acl(&self) -> &BTreeMap<String, BTreeSet<TablePrivilege>> {
+        &self.relational_default_table_acl
     }
 
     pub fn relational_catalog_view(&self, view: &str) -> Option<&RelationalView> {
@@ -35945,6 +35999,69 @@ mod tests {
         assert!(
             view_grant.contains("relation \"people_view\" is not a table"),
             "{view_grant}"
+        );
+    }
+
+    #[test]
+    fn relational_catalog_records_default_table_acl_metadata_and_replays_from_wal() {
+        let mut e = Engine::new_local();
+        e.execute_text(
+            1,
+            "ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public GRANT SELECT, INSERT ON TABLES TO PUBLIC",
+        )
+        .unwrap();
+        e.execute_text(2, "CREATE TABLE first_people (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(
+            3,
+            "ALTER DEFAULT PRIVILEGES REVOKE INSERT ON TABLES FROM PUBLIC",
+        )
+        .unwrap();
+        e.execute_text(4, "CREATE TABLE second_people (id INT, name TEXT)")
+            .unwrap();
+
+        assert_eq!(
+            e.relational_table_acl("first_people")
+                .unwrap()
+                .get("public")
+                .unwrap(),
+            &BTreeSet::from([TablePrivilege::Select, TablePrivilege::Insert])
+        );
+        assert_eq!(
+            e.relational_table_acl("second_people")
+                .unwrap()
+                .get("public")
+                .unwrap(),
+            &BTreeSet::from([TablePrivilege::Select])
+        );
+        assert_eq!(
+            e.relational_default_table_acl().get("public").unwrap(),
+            &BTreeSet::from([TablePrivilege::Select])
+        );
+
+        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        assert_eq!(
+            recovered
+                .relational_table_acl("first_people")
+                .unwrap()
+                .get("public")
+                .unwrap(),
+            &BTreeSet::from([TablePrivilege::Select, TablePrivilege::Insert])
+        );
+        assert_eq!(
+            recovered
+                .relational_table_acl("second_people")
+                .unwrap()
+                .get("public")
+                .unwrap(),
+            &BTreeSet::from([TablePrivilege::Select])
+        );
+        assert_eq!(
+            recovered
+                .relational_default_table_acl()
+                .get("public")
+                .unwrap(),
+            &BTreeSet::from([TablePrivilege::Select])
         );
     }
 

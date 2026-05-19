@@ -86,6 +86,8 @@ impl Planner {
             | Command::DropSequence(_)
             | Command::GrantTable(_)
             | Command::RevokeTable(_)
+            | Command::GrantDefaultTablePrivileges(_)
+            | Command::RevokeDefaultTablePrivileges(_)
             | Command::AlterColumnDefault(_)
             | Command::CommentOn(_)
             | Command::Insert(_)

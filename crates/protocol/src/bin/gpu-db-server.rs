@@ -2062,6 +2062,7 @@ struct Session {
     currval_sequences: HashMap<String, i64>,
     indexes: Vec<CatalogIndex>,
     table_acls: BTreeMap<String, BTreeMap<String, BTreeSet<TablePrivilege>>>,
+    default_table_acl: BTreeMap<String, BTreeSet<TablePrivilege>>,
     comments: BTreeMap<CatalogCommentTarget, String>,
     dirty_tables: BTreeSet<String>,
     dirty_views: BTreeSet<String>,
@@ -2069,6 +2070,7 @@ struct Session {
     dirty_sequences: BTreeSet<String>,
     dirty_indexes: bool,
     dirty_table_acls: BTreeSet<String>,
+    dirty_default_table_acl: bool,
     dirty_comment_targets: BTreeSet<CatalogCommentTarget>,
     copy_in: Option<CopyInState>,
     next_relation_oid: u32,
@@ -2083,6 +2085,7 @@ struct SharedCatalog {
     sequences: HashMap<String, Sequence>,
     indexes: Vec<CatalogIndex>,
     table_acls: BTreeMap<String, BTreeMap<String, BTreeSet<TablePrivilege>>>,
+    default_table_acl: BTreeMap<String, BTreeSet<TablePrivilege>>,
     comments: BTreeMap<CatalogCommentTarget, String>,
     next_relation_oid: u32,
 }
@@ -2096,6 +2099,7 @@ impl Default for SharedCatalog {
             sequences: HashMap::new(),
             indexes: Vec::new(),
             table_acls: BTreeMap::new(),
+            default_table_acl: BTreeMap::new(),
             comments: BTreeMap::new(),
             next_relation_oid: FIRST_USER_RELATION_OID,
         }
@@ -2134,6 +2138,7 @@ impl Session {
             currval_sequences: HashMap::new(),
             indexes: catalog.indexes,
             table_acls: catalog.table_acls,
+            default_table_acl: catalog.default_table_acl,
             comments: catalog.comments,
             dirty_tables: BTreeSet::new(),
             dirty_views: BTreeSet::new(),
@@ -2141,6 +2146,7 @@ impl Session {
             dirty_sequences: BTreeSet::new(),
             dirty_indexes: false,
             dirty_table_acls: BTreeSet::new(),
+            dirty_default_table_acl: false,
             dirty_comment_targets: BTreeSet::new(),
             copy_in: None,
             next_relation_oid: catalog.next_relation_oid,
@@ -2168,6 +2174,10 @@ impl Session {
         self.dirty_table_acls.insert(table.into());
     }
 
+    fn mark_default_table_acl_dirty(&mut self) {
+        self.dirty_default_table_acl = true;
+    }
+
     fn mark_comment_dirty(&mut self, target: CatalogCommentTarget) {
         self.dirty_comment_targets.insert(target);
     }
@@ -2179,6 +2189,7 @@ impl Session {
             self.dirty_materialized_views.clear();
             self.dirty_sequences.clear();
             self.dirty_table_acls.clear();
+            self.dirty_default_table_acl = false;
             self.dirty_comment_targets.clear();
             return;
         }
@@ -2223,6 +2234,10 @@ impl Session {
             } else {
                 catalog.table_acls.remove(table_name);
             }
+        }
+        if self.dirty_default_table_acl {
+            catalog.default_table_acl = self.default_table_acl.clone();
+            self.dirty_default_table_acl = false;
         }
         catalog.next_relation_oid = catalog.next_relation_oid.max(self.next_relation_oid);
         if self.dirty_indexes {
@@ -2514,6 +2529,29 @@ fn revoke_table_acl(
     }
     session.mark_table_acl_dirty(table.to_string());
     Ok(())
+}
+
+fn grant_default_table_acl(session: &mut Session, grantee: &str, privileges: &[TablePrivilege]) {
+    let acl = session
+        .default_table_acl
+        .entry(grantee.to_string())
+        .or_default();
+    for privilege in privileges {
+        acl.insert(*privilege);
+    }
+    session.mark_default_table_acl_dirty();
+}
+
+fn revoke_default_table_acl(session: &mut Session, grantee: &str, privileges: &[TablePrivilege]) {
+    if let Some(acl) = session.default_table_acl.get_mut(grantee) {
+        for privilege in privileges {
+            acl.remove(privilege);
+        }
+        if acl.is_empty() {
+            session.default_table_acl.remove(grantee);
+        }
+    }
+    session.mark_default_table_acl_dirty();
 }
 
 fn evaluate_column_default(
@@ -7118,6 +7156,12 @@ fn execute_statement(
                         return write_error(stream, &error);
                     }
                 }
+                if !session.default_table_acl.is_empty() {
+                    session
+                        .table_acls
+                        .insert(table_name.clone(), session.default_table_acl.clone());
+                    session.mark_table_acl_dirty(table_name.clone());
+                }
                 session.mark_table_dirty(table_name);
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, "CREATE TABLE");
@@ -8500,6 +8544,16 @@ fn execute_statement(
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, "REVOKE");
             }
+            Command::GrantDefaultTablePrivileges(grant) => {
+                grant_default_table_acl(session, &grant.grantee, &grant.privileges);
+                session.persist_catalog_snapshot();
+                return write_command_complete(stream, "ALTER DEFAULT PRIVILEGES");
+            }
+            Command::RevokeDefaultTablePrivileges(revoke) => {
+                revoke_default_table_acl(session, &revoke.grantee, &revoke.privileges);
+                session.persist_catalog_snapshot();
+                return write_command_complete(stream, "ALTER DEFAULT PRIVILEGES");
+            }
             Command::Insert(insert) => {
                 let table_name = insert.table;
                 let catalog_indexes = session.indexes.clone();
@@ -9134,7 +9188,7 @@ fn execute_statement(
                 text_column("Type"),
                 text_column("Access privileges"),
             ],
-            &catalog_empty_rows(),
+            &catalog_psql_default_access_privilege_rows(session),
         );
     }
     if canonical == psql_list_extensions_catalog_query() {
@@ -10953,6 +11007,23 @@ fn catalog_psql_describe_table_privilege_rows_filtered(
 
 fn table_acl_display(session: &Session, table: &str) -> Option<String> {
     let acl = session.table_acls.get(table)?;
+    acl_display(acl)
+}
+
+fn catalog_psql_default_access_privilege_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    acl_display(&session.default_table_acl)
+        .map(|acl| {
+            vec![vec![
+                Some("postgres".to_string()),
+                Some("public".to_string()),
+                Some("table".to_string()),
+                Some(acl),
+            ]]
+        })
+        .unwrap_or_default()
+}
+
+fn acl_display(acl: &BTreeMap<String, BTreeSet<TablePrivilege>>) -> Option<String> {
     let rows = acl
         .iter()
         .filter_map(|(grantee, privileges)| {
@@ -15850,6 +15921,58 @@ mod tests {
             .expect("shared catalog mutex poisoned");
         catalog.tables.remove(table_name);
         catalog.indexes.retain(|index| index.name != index_name);
+    }
+
+    #[test]
+    fn shared_catalog_persistence_carries_default_table_acl_metadata() {
+        let table_name = "shared_default_acl_people";
+        {
+            let mut catalog = shared_catalog()
+                .lock()
+                .expect("shared catalog mutex poisoned");
+            catalog.tables.remove(table_name);
+            catalog.table_acls.remove(table_name);
+            catalog.default_table_acl.clear();
+        }
+
+        let mut session = Session::new(true);
+        grant_default_table_acl(&mut session, "public", &[TablePrivilege::Select]);
+        session.persist_catalog_snapshot();
+
+        let mut reloaded = Session::new(true);
+        reloaded
+            .tables
+            .insert(table_name.to_string(), test_table(table_name, Vec::new()));
+        if !reloaded.default_table_acl.is_empty() {
+            reloaded
+                .table_acls
+                .insert(table_name.to_string(), reloaded.default_table_acl.clone());
+            reloaded.mark_table_acl_dirty(table_name);
+        }
+        reloaded.mark_table_dirty(table_name);
+        reloaded.persist_catalog_snapshot();
+
+        let final_session = Session::new(true);
+        assert_eq!(
+            table_acl_display(&final_session, table_name),
+            Some("=r/postgres".to_string())
+        );
+        assert_eq!(
+            catalog_psql_default_access_privilege_rows(&final_session),
+            vec![vec![
+                Some("postgres".to_string()),
+                Some("public".to_string()),
+                Some("table".to_string()),
+                Some("=r/postgres".to_string()),
+            ]]
+        );
+
+        let mut catalog = shared_catalog()
+            .lock()
+            .expect("shared catalog mutex poisoned");
+        catalog.tables.remove(table_name);
+        catalog.table_acls.remove(table_name);
+        catalog.default_table_acl.clear();
     }
 
     #[test]

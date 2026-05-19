@@ -1,0 +1,76 @@
+=== bounded default table privileges ===
+CREATE TABLE
+ALTER DEFAULT PRIVILEGES
+           Default access privileges
+  Owner   | Schema | Type  | Access privileges
+----------+--------+-------+-------------------
+ postgres | public | table | =ar/postgres
+(1 row)
+
+CREATE TABLE
+                                    Access privileges
+ Schema |         Name         | Type  | Access privileges | Column privileges | Policies
+--------+----------------------+-------+-------------------+-------------------+----------
+ public | default_acl_existing | table |                   |                   |
+(1 row)
+
+                                   Access privileges
+ Schema |       Name        | Type  | Access privileges | Column privileges | Policies
+--------+-------------------+-------+-------------------+-------------------+----------
+ public | default_acl_first | table | =ar/postgres      |                   |
+(1 row)
+
+ALTER DEFAULT PRIVILEGES
+           Default access privileges
+  Owner   | Schema | Type  | Access privileges
+----------+--------+-------+-------------------
+ postgres | public | table | =r/postgres
+(1 row)
+
+CREATE TABLE
+                                   Access privileges
+ Schema |        Name        | Type  | Access privileges | Column privileges | Policies
+--------+--------------------+-------+-------------------+-------------------+----------
+ public | default_acl_second | table | =r/postgres       |                   |
+(1 row)
+
+ALTER DEFAULT PRIVILEGES
+             Default access privileges
+  Owner   | Schema | Type  |   Access privileges
+----------+--------+-------+------------------------
+ postgres | public | table | postgres=arwd/postgres+
+          |        |       | =r/postgres
+(1 row)
+
+CREATE TABLE
+                                       Access privileges
+ Schema |         Name         | Type  |   Access privileges    | Column privileges | Policies
+--------+----------------------+-------+------------------------+-------------------+----------
+ public | default_acl_existing | table |                        |                   |
+ public | default_acl_first    | table | =ar/postgres           |                   |
+ public | default_acl_second   | table | =r/postgres            |                   |
+ public | default_acl_third    | table | postgres=arwd/postgres+|                   |
+        |                      |       | =r/postgres            |                   |
+(4 rows)
+
+ALTER DEFAULT PRIVILEGES
+ALTER DEFAULT PRIVILEGES
+         Default access privileges
+ Owner | Schema | Type | Access privileges
+-------+--------+------+-------------------
+(0 rows)
+
+CREATE TABLE
+                                   Access privileges
+ Schema |        Name        | Type  | Access privileges | Column privileges | Policies
+--------+--------------------+-------+-------------------+-------------------+----------
+ public | default_acl_fourth | table |                   |                   |
+(1 row)
+
+psql:334_protocol_psql_default_table_privileges.sql:21: ERROR:  query shape is not supported by the compatibility stub
+psql:334_protocol_psql_default_table_privileges.sql:22: ERROR:  query shape is not supported by the compatibility stub
+psql:334_protocol_psql_default_table_privileges.sql:23: ERROR:  query shape is not supported by the compatibility stub
+psql:334_protocol_psql_default_table_privileges.sql:24: ERROR:  query shape is not supported by the compatibility stub
+ name
+------
+(0 rows)
