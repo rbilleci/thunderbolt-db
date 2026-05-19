@@ -35,7 +35,7 @@ INSERT 0 1
  name   | text    |           |          |
  bucket | integer |           |          | 7
 
-psql:319_protocol_psql_add_columns.sql:20: ERROR:  ADD COLUMN requires a literal DEFAULT
+psql:319_protocol_psql_add_columns.sql:20: ERROR:  ADD COLUMN requires a supported DEFAULT
 psql:319_protocol_psql_add_columns.sql:21: ERROR:  column already exists
 CREATE VIEW
 psql:319_protocol_psql_add_columns.sql:23: ERROR:  relation is not a table
@@ -45,3 +45,51 @@ psql:319_protocol_psql_add_columns.sql:23: ERROR:  relation is not a table
   2 | Linus |      7
   3 | Grace |      7
 (3 rows)
+
+=== bounded add column sequence default ===
+CREATE TABLE
+INSERT 0 2
+CREATE SEQUENCE
+ALTER TABLE
+ id | name  | bucket
+----+-------+--------
+  1 | Ada   |      1
+  2 | Linus |      2
+(2 rows)
+
+INSERT 0 1
+ id | name  | bucket
+----+-------+--------
+  1 | Ada   |      1
+  2 | Linus |      2
+  3 | Grace |      3
+(3 rows)
+
+ last_value | is_called
+------------+-----------
+          3 | t
+(1 row)
+
+ nspname |          relname           | attname |                default_expr
+---------+----------------------------+---------+--------------------------------------------
+ public  | add_column_people          | bucket  | 7
+ public  | add_column_sequence_people | bucket  | nextval('add_column_bucket_seq'::regclass)
+(2 rows)
+
+ column_name | data_type | is_nullable |               column_default
+-------------+-----------+-------------+--------------------------------------------
+ id          | integer   | YES         |
+ name        | text      | YES         |
+ bucket      | integer   | YES         | nextval('add_column_bucket_seq'::regclass)
+(3 rows)
+
+                      Table "public.add_column_sequence_people"
+ Column |  Type   | Collation | Nullable |                  Default
+--------+---------+-----------+----------+--------------------------------------------
+ id     | integer |           |          |
+ name   | text    |           |          |
+ bucket | integer |           |          | nextval('add_column_bucket_seq'::regclass)
+
+psql:319_protocol_psql_add_columns.sql:49: ERROR:  sequence does not exist
+CREATE TABLE
+psql:319_protocol_psql_add_columns.sql:51: ERROR:  relation is not a sequence

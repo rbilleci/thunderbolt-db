@@ -22,3 +22,30 @@ ALTER TABLE public.add_column_people ADD COLUMN bucket INT DEFAULT 9;
 CREATE VIEW add_column_view AS SELECT id, name FROM add_column_people ORDER BY id;
 ALTER TABLE public.add_column_view ADD COLUMN extra TEXT DEFAULT 'x'::text;
 SELECT id, name, bucket FROM add_column_people ORDER BY id;
+\echo === bounded add column sequence default ===
+CREATE TABLE add_column_sequence_people (id INT, name TEXT);
+INSERT INTO add_column_sequence_people (id, name) VALUES (1, 'Ada'), (2, 'Linus');
+CREATE SEQUENCE public.add_column_bucket_seq;
+ALTER TABLE ONLY public.add_column_sequence_people ADD COLUMN bucket INT DEFAULT nextval('public.add_column_bucket_seq'::regclass);
+SELECT id, name, bucket FROM add_column_sequence_people ORDER BY id;
+INSERT INTO add_column_sequence_people (id, name) VALUES (3, 'Grace');
+SELECT id, name, bucket FROM add_column_sequence_people ORDER BY id;
+SELECT last_value, is_called FROM public.add_column_bucket_seq;
+SELECT n.nspname,
+       c.relname,
+       a.attname,
+       pg_catalog.pg_get_expr(d.adbin, d.adrelid) AS default_expr
+FROM pg_catalog.pg_attrdef d
+JOIN pg_catalog.pg_class c ON c.oid = d.adrelid
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+JOIN pg_catalog.pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum
+WHERE n.nspname = 'public'
+ORDER BY c.relname, a.attnum;
+SELECT column_name, data_type, is_nullable, column_default
+FROM information_schema.columns
+WHERE table_schema = 'public' AND table_name = 'add_column_sequence_people'
+ORDER BY ordinal_position;
+\d add_column_sequence_people
+ALTER TABLE add_column_sequence_people ADD COLUMN missing_bucket INT DEFAULT nextval('missing_bucket_seq'::regclass);
+CREATE TABLE add_column_sequence_target (id INT);
+ALTER TABLE add_column_sequence_people ADD COLUMN bad_bucket INT DEFAULT nextval('add_column_sequence_target'::regclass);

@@ -2411,6 +2411,15 @@ fn preflight_column_default_target(
     }
 }
 
+fn add_column_default_supported(default: &ColumnDefault) -> bool {
+    match default {
+        ColumnDefault::Literal(_) => true,
+        ColumnDefault::SequenceNextVal {
+            create_if_missing, ..
+        } => !create_if_missing,
+    }
+}
+
 fn evaluate_column_default(
     session: &mut Session,
     default: &ColumnDefault,
@@ -7971,22 +7980,22 @@ fn execute_statement(
                         stream,
                         &ErrorField {
                             code: "0A000",
-                            message: "ADD COLUMN requires a literal DEFAULT",
+                            message: "ADD COLUMN requires a supported DEFAULT",
                             position: None,
                         },
                     );
                 };
-                let ColumnDefault::Literal(default_value) = default.clone() else {
+                if !add_column_default_supported(&default) {
                     return write_error(
                         stream,
                         &ErrorField {
                             code: "0A000",
-                            message: "ADD COLUMN requires a literal DEFAULT",
+                            message: "ADD COLUMN SERIAL is unsupported",
                             position: None,
                         },
                     );
-                };
-                if !sql_value_matches_type(&default_value, add.column.ty) {
+                }
+                if !column_default_matches_type(&default, add.column.ty) {
                     return write_error(
                         stream,
                         &ErrorField {
@@ -7996,7 +8005,7 @@ fn execute_statement(
                         },
                     );
                 }
-                let Some(table) = session.tables.get_mut(&add.table) else {
+                let Some(table) = session.tables.get(&add.table) else {
                     return write_error(
                         stream,
                         &ErrorField {
@@ -8020,6 +8029,10 @@ fn execute_statement(
                         },
                     );
                 }
+                if let Some(error) = preflight_column_default_target(session, &default) {
+                    return write_error(stream, &error);
+                }
+                let row_count = table.rows.len();
                 let attnum = match i16::try_from(table.columns.len() + 1) {
                     Ok(attnum) => attnum,
                     Err(_) => {
@@ -8033,12 +8046,23 @@ fn execute_statement(
                         );
                     }
                 };
+                let mut default_values = Vec::with_capacity(row_count);
+                for _ in 0..row_count {
+                    match evaluate_column_default(session, &default) {
+                        Ok(default_value) => default_values.push(default_value),
+                        Err(error) => return write_error(stream, &error),
+                    }
+                }
+                let table = session
+                    .tables
+                    .get_mut(&add.table)
+                    .expect("table existence checked");
                 table.columns.push(CatalogColumn {
                     attnum,
                     def: add.column,
                 });
-                for row in &mut table.rows {
-                    row.push(default_value.clone());
+                for (row, default_value) in table.rows.iter_mut().zip(default_values) {
+                    row.push(default_value);
                 }
                 session.mark_table_dirty(add.table);
                 session.persist_catalog_snapshot();

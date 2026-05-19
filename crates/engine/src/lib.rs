@@ -6329,6 +6329,15 @@ fn column_default_matches_type(value: &ColumnDefault, ty: SqlType) -> bool {
     }
 }
 
+fn add_column_default_supported(default: &ColumnDefault) -> bool {
+    match default {
+        ColumnDefault::Literal(_) => true,
+        ColumnDefault::SequenceNextVal {
+            create_if_missing, ..
+        } => !create_if_missing,
+    }
+}
+
 fn sequence_defaults(columns: &[ColumnDef]) -> impl Iterator<Item = &ColumnDefault> {
     columns.iter().filter_map(|column| column.default.as_ref())
 }
@@ -9274,17 +9283,16 @@ impl Engine {
         }
         let Some(default) = add.column.default.clone() else {
             return Err(EngineError::ApplyFailed(
-                "ADD COLUMN requires a literal DEFAULT in the bootstrap relational subset"
+                "ADD COLUMN requires a supported DEFAULT in the bootstrap relational subset"
                     .to_string(),
             ));
         };
-        let ColumnDefault::Literal(default_value) = default.clone() else {
+        if !add_column_default_supported(&default) {
             return Err(EngineError::ApplyFailed(
-                "ADD COLUMN requires a literal DEFAULT in the bootstrap relational subset"
-                    .to_string(),
+                "ADD COLUMN SERIAL is unsupported in the bootstrap relational subset".to_string(),
             ));
-        };
-        if !sql_value_matches_type(&default_value, add.column.ty) {
+        }
+        if !column_default_matches_type(&default, add.column.ty) {
             return Err(EngineError::ApplyFailed(format!(
                 "invalid default for column \"{}\"",
                 add.column.name
@@ -9307,6 +9315,18 @@ impl Engine {
                 add.column.name, add.table
             )));
         }
+        self.preflight_column_default_target(&default)?;
+        let row_count = self
+            .visible_relational_rows(
+                &table,
+                StorageVisibility {
+                    read_txn_id: txn_id,
+                },
+            )?
+            .len();
+        let default_values = (0..row_count)
+            .map(|_| self.evaluate_column_default(&default))
+            .collect::<Result<Vec<_>, _>>()?;
         let next_attnum = i16::try_from(table.columns.len() + 1).map_err(|_| {
             EngineError::ApplyFailed("too many columns for bootstrap catalog".to_string())
         })?;
@@ -9324,6 +9344,7 @@ impl Engine {
             read_txn_id: txn_id,
         };
         let mut updates = Vec::new();
+        let mut default_values = default_values.into_iter();
         let mut cursor = self
             .mvcc_store
             .seq_scan_open(visibility)
@@ -9334,12 +9355,21 @@ impl Engine {
             }
             let mut row = decode_relational_row(&tuple.value, &table.columns)
                 .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
-            row.push(default_value.clone());
+            let default_value = default_values.next().ok_or_else(|| {
+                EngineError::ApplyFailed("ADD COLUMN default rewrite row count drifted".to_string())
+            })?;
+            row.push(default_value);
             updates.push((tuple.tuple_id, tuple.key.clone(), row));
         }
         drop(cursor);
+        if default_values.next().is_some() {
+            return Err(EngineError::ApplyFailed(
+                "ADD COLUMN default rewrite row count drifted".to_string(),
+            ));
+        }
 
         for (tuple_id, row_key, values) in updates {
+            let index_value = values.last().expect("new column default appended").clone();
             self.mvcc_store
                 .tuple_update(tuple_id, encode_relational_row(&values), txn_id)
                 .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
@@ -9347,7 +9377,7 @@ impl Engine {
                 .entry(RelationalIndexKey {
                     table: add.table.clone(),
                     column: new_column.name.clone(),
-                    value: relational_index_value(&default_value),
+                    value: relational_index_value(&index_value),
                 })
                 .or_default()
                 .push(row_key);
@@ -9932,13 +9962,17 @@ impl Engine {
                 }
                 let Some(default) = add.column.default.as_ref() else {
                     return Err(EngineError::ApplyFailed(
-                        "ADD COLUMN requires a literal DEFAULT in the bootstrap relational subset"
+                        "ADD COLUMN requires a supported DEFAULT in the bootstrap relational subset"
                             .to_string(),
                     ));
                 };
-                if !matches!(default, ColumnDefault::Literal(_))
-                    || !column_default_matches_type(default, add.column.ty)
-                {
+                if !add_column_default_supported(default) {
+                    return Err(EngineError::ApplyFailed(
+                        "ADD COLUMN SERIAL is unsupported in the bootstrap relational subset"
+                            .to_string(),
+                    ));
+                }
+                if !column_default_matches_type(default, add.column.ty) {
                     return Err(EngineError::ApplyFailed(format!(
                         "invalid default for column \"{}\"",
                         add.column.name
@@ -9957,6 +9991,7 @@ impl Engine {
                         add.column.name, add.table
                     )));
                 }
+                self.preflight_column_default_target(default)?;
             }
             Command::RenameTable(rename) => {
                 if self.relational_views.contains_key(&rename.old_name)
@@ -32064,9 +32099,113 @@ mod tests {
         assert!(
             unsupported
                 .to_string()
-                .contains("ADD COLUMN requires a literal DEFAULT"),
+                .contains("ADD COLUMN requires a supported DEFAULT"),
             "{unsupported}"
         );
+    }
+
+    #[test]
+    fn relational_add_column_sequence_default_rewrites_rows_and_replays() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE default_people (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO default_people (id, name) VALUES (1, 'Ada'), (2, 'Linus')",
+        )
+        .unwrap();
+        e.execute_text(3, "CREATE SEQUENCE public.default_bucket_seq")
+            .unwrap();
+        e.execute_text(
+            4,
+            "ALTER TABLE ONLY public.default_people ADD COLUMN bucket INT DEFAULT nextval('public.default_bucket_seq'::regclass)",
+        )
+        .unwrap();
+        e.execute_text(
+            5,
+            "INSERT INTO default_people (id, name) VALUES (3, 'Grace')",
+        )
+        .unwrap();
+
+        let Command::Select(select) =
+            parse_command("SELECT id, name, bucket FROM default_people ORDER BY id ASC").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let result = e.execute_relational_select(&select).unwrap();
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![
+                    SqlValue::Int4(1),
+                    SqlValue::Text("Ada".to_string()),
+                    SqlValue::Int4(1),
+                ],
+                vec![
+                    SqlValue::Int4(2),
+                    SqlValue::Text("Linus".to_string()),
+                    SqlValue::Int4(2),
+                ],
+                vec![
+                    SqlValue::Int4(3),
+                    SqlValue::Text("Grace".to_string()),
+                    SqlValue::Int4(3),
+                ],
+            ]
+        );
+        let sequence = e.relational_catalog_sequence("default_bucket_seq").unwrap();
+        assert_eq!(sequence.last_value, 3);
+        assert!(sequence.is_called);
+
+        let mut recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let recovered_table = recovered
+            .relational_catalog_table("default_people")
+            .unwrap();
+        assert_eq!(
+            recovered_table.columns[2].default,
+            Some(ColumnDefault::SequenceNextVal {
+                sequence: "default_bucket_seq".to_string(),
+                create_if_missing: false,
+            })
+        );
+        assert_eq!(
+            recovered
+                .relational_catalog_sequence("default_bucket_seq")
+                .unwrap()
+                .last_value,
+            3
+        );
+        let recovered_result = recovered.execute_relational_select(&select).unwrap();
+        assert_eq!(recovered_result.rows, result.rows);
+
+        let missing = e
+            .execute_text(
+                6,
+                "ALTER TABLE default_people ADD COLUMN missing_bucket INT DEFAULT nextval('missing_bucket_seq'::regclass)",
+            )
+            .unwrap_err();
+        assert!(missing
+            .to_string()
+            .contains("sequence \"missing_bucket_seq\" does not exist"));
+        assert!(e
+            .relational_catalog_table("default_people")
+            .unwrap()
+            .columns
+            .iter()
+            .all(|column| column.name != "missing_bucket"));
+
+        let table_target = e
+            .execute_text(7, "CREATE TABLE default_target_table (id INT)")
+            .and_then(|_| {
+                e.execute_text(
+                    8,
+                    "ALTER TABLE default_people ADD COLUMN bad_bucket INT DEFAULT nextval('default_target_table'::regclass)",
+                )
+            })
+            .unwrap_err();
+        assert!(table_target
+            .to_string()
+            .contains("relation \"default_target_table\" is not a sequence"));
     }
 
     #[test]

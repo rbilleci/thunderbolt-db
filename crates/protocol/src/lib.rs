@@ -10814,6 +10814,23 @@ mod tests {
                 },
             })
         );
+        assert_eq!(
+            parse_command(
+                "ALTER TABLE public.default_people ADD bucket INT DEFAULT nextval('public.default_bucket_seq'::regclass)"
+            )
+            .unwrap(),
+            Command::AddColumn(AddColumn {
+                table: "default_people".to_string(),
+                column: ColumnDef {
+                    name: "bucket".to_string(),
+                    ty: SqlType::Int4,
+                    default: Some(ColumnDefault::SequenceNextVal {
+                        sequence: "default_bucket_seq".to_string(),
+                        create_if_missing: false,
+                    }),
+                },
+            })
+        );
         assert!(matches!(
             parse_command(
                 "ALTER TABLE private.default_people ADD COLUMN tag TEXT DEFAULT 'bad'::text"
