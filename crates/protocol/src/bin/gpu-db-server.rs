@@ -14,6 +14,14 @@ use gpu_db_protocol::{DescribeTarget, SqlType};
 
 const PUBLIC_NAMESPACE_OID: u32 = 2200;
 const POSTGRES_DATABASE_OID: u32 = 5;
+const PG_EXTENSION_CLASS_OID: u32 = 3079;
+const PG_LANGUAGE_CLASS_OID: u32 = 2612;
+const PLPGSQL_EXTENSION_OID: u32 = 13_500;
+const PLPGSQL_LANGUAGE_OID: u32 = 13_501;
+const PLPGSQL_CALL_HANDLER_OID: u32 = 13_502;
+const PLPGSQL_INLINE_HANDLER_OID: u32 = 13_503;
+const PLPGSQL_VALIDATOR_OID: u32 = 13_504;
+const PLPGSQL_DESCRIPTION: &str = "PL/pgSQL procedural language";
 const FIRST_USER_INDEX_OID: u32 = 20_000;
 static SHARED_CATALOG: OnceLock<Mutex<SharedCatalog>> = OnceLock::new();
 
@@ -6986,7 +6994,16 @@ fn execute_statement(
                 text_column("extconfig"),
                 text_column("extcondition"),
             ],
-            &catalog_empty_rows(),
+            &catalog_extension_discovery_rows(),
+        );
+    }
+    if canonical
+        == "select tableoid, oid, lanname, lanpltrusted, lanplcallfoid, laninline, lanvalidator, lanacl, acldefault('l', lanowner) as acldefault, lanowner from pg_language where lanispl order by oid"
+    {
+        return write_single_row(
+            stream,
+            &pg_language_discovery_columns(),
+            &pg_language_discovery_rows(),
         );
     }
     if canonical
@@ -9723,7 +9740,7 @@ fn execute_statement(
                 text_column("Schema"),
                 text_column("Description"),
             ],
-            &catalog_empty_rows(),
+            &catalog_psql_extension_rows(),
         );
     }
     if canonical
@@ -9741,7 +9758,16 @@ fn execute_statement(
                 text_column("extconfig"),
                 text_column("extcondition"),
             ],
-            &catalog_empty_rows(),
+            &catalog_extension_discovery_rows(),
+        );
+    }
+    if canonical
+        == "select tableoid, oid, lanname, lanpltrusted, lanplcallfoid, laninline, lanvalidator, lanacl, acldefault('l', lanowner) as acldefault, lanowner from pg_language where lanispl order by oid"
+    {
+        return write_single_row(
+            stream,
+            &pg_language_discovery_columns(),
+            &pg_language_discovery_rows(),
         );
     }
     if canonical == psql_list_languages_catalog_query() {
@@ -9753,7 +9779,7 @@ fn execute_statement(
                 bool_column("Trusted"),
                 text_column("Description"),
             ],
-            &catalog_empty_rows(),
+            &catalog_psql_language_rows(),
         );
     }
     if canonical == psql_list_domains_catalog_query() {
@@ -12714,18 +12740,7 @@ fn pg_dump_empty_catalog_query_columns(canonical: &str) -> Option<Vec<Column>> {
     if canonical
         == "select tableoid, oid, lanname, lanpltrusted, lanplcallfoid, laninline, lanvalidator, lanacl, acldefault('l', lanowner) as acldefault, lanowner from pg_language where lanispl order by oid"
     {
-        return Some(vec![
-            int4_column("tableoid"),
-            int4_column("oid"),
-            text_column("lanname"),
-            bool_column("lanpltrusted"),
-            int4_column("lanplcallfoid"),
-            int4_column("laninline"),
-            int4_column("lanvalidator"),
-            text_column("lanacl"),
-            text_column("acldefault"),
-            int4_column("lanowner"),
-        ]);
+        return Some(pg_language_discovery_columns());
     }
     if canonical
         == "select provider, label from pg_catalog.pg_shseclabel where classoid = 'pg_catalog.pg_database'::pg_catalog.regclass and objoid = '5'"
@@ -13681,6 +13696,67 @@ fn catalog_empty_rows_for_relation_oid(_oid: u32) -> Vec<Vec<Option<String>>> {
 
 fn catalog_empty_rows() -> Vec<Vec<Option<String>>> {
     Vec::new()
+}
+
+fn catalog_psql_extension_rows() -> Vec<Vec<Option<String>>> {
+    vec![vec![
+        Some("plpgsql".to_string()),
+        Some("1.0".to_string()),
+        Some("pg_catalog".to_string()),
+        Some(PLPGSQL_DESCRIPTION.to_string()),
+    ]]
+}
+
+fn catalog_extension_discovery_rows() -> Vec<Vec<Option<String>>> {
+    vec![vec![
+        Some(PG_EXTENSION_CLASS_OID.to_string()),
+        Some(PLPGSQL_EXTENSION_OID.to_string()),
+        Some("plpgsql".to_string()),
+        Some("pg_catalog".to_string()),
+        Some("f".to_string()),
+        Some("1.0".to_string()),
+        None,
+        None,
+    ]]
+}
+
+fn catalog_psql_language_rows() -> Vec<Vec<Option<String>>> {
+    vec![vec![
+        Some("plpgsql".to_string()),
+        Some("postgres".to_string()),
+        Some("t".to_string()),
+        Some(PLPGSQL_DESCRIPTION.to_string()),
+    ]]
+}
+
+fn pg_language_discovery_columns() -> Vec<Column> {
+    vec![
+        int4_column("tableoid"),
+        int4_column("oid"),
+        text_column("lanname"),
+        bool_column("lanpltrusted"),
+        int4_column("lanplcallfoid"),
+        int4_column("laninline"),
+        int4_column("lanvalidator"),
+        text_column("lanacl"),
+        text_column("acldefault"),
+        int4_column("lanowner"),
+    ]
+}
+
+fn pg_language_discovery_rows() -> Vec<Vec<Option<String>>> {
+    vec![vec![
+        Some(PG_LANGUAGE_CLASS_OID.to_string()),
+        Some(PLPGSQL_LANGUAGE_OID.to_string()),
+        Some("plpgsql".to_string()),
+        Some("t".to_string()),
+        Some(PLPGSQL_CALL_HANDLER_OID.to_string()),
+        Some(PLPGSQL_INLINE_HANDLER_OID.to_string()),
+        Some(PLPGSQL_VALIDATOR_OID.to_string()),
+        None,
+        Some("postgres=U/postgres".to_string()),
+        Some("10".to_string()),
+    ]]
 }
 
 fn pg_catalog_tables_query() -> &'static str {

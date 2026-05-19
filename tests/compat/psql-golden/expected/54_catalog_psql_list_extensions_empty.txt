@@ -1,5 +1,12 @@
+=== catalog psql list bootstrap extension ===
 Pager usage is off.
-     List of installed extensions
- Name | Version | Schema | Description
-------+---------+--------+-------------
-(0 rows)
+                 List of installed extensions
+  Name   | Version |   Schema   |         Description
+---------+---------+------------+------------------------------
+ plpgsql | 1.0     | pg_catalog | PL/pgSQL procedural language
+(1 row)
+
+ tableoid |  oid  | extname |  nspname   | extrelocatable | extversion | extconfig | extcondition
+----------+-------+---------+------------+----------------+------------+-----------+--------------
+     3079 | 13500 | plpgsql | pg_catalog | f              | 1.0        |           |
+(1 row)

@@ -1,6 +1,12 @@
-=== catalog psql list languages empty ===
+=== catalog psql list bootstrap language ===
 Pager usage is off.
-          List of languages
- Name | Owner | Trusted | Description
-------+-------+---------+-------------
-(0 rows)
+                      List of languages
+  Name   |  Owner   | Trusted |         Description
+---------+----------+---------+------------------------------
+ plpgsql | postgres | t       | PL/pgSQL procedural language
+(1 row)
+
+ tableoid |  oid  | lanname | lanpltrusted | lanplcallfoid | laninline | lanvalidator | lanacl |     acldefault      | lanowner
+----------+-------+---------+--------------+---------------+-----------+--------------+--------+---------------------+----------
+     2612 | 13501 | plpgsql | t            |         13502 |     13503 |        13504 |        | postgres=U/postgres |       10
+(1 row)
