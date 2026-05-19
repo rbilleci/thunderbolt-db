@@ -8,6 +8,8 @@ COMMENT ON MATERIALIZED VIEW public.mv_people IS 'people snapshot';
 SELECT * FROM mv_people;
 INSERT INTO matview_people (id, name) VALUES (4, 'Barbara');
 SELECT * FROM mv_people;
+REFRESH MATERIALIZED VIEW public.mv_people;
+SELECT * FROM mv_people;
 SELECT c.oid, n.nspname, c.relname, c.relkind, c.relpersistence
 FROM pg_catalog.pg_class c
 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
@@ -30,6 +32,10 @@ ALTER MATERIALIZED VIEW mv_people_snapshot RENAME TO mv_other;
 ALTER MATERIALIZED VIEW missing_mv RENAME TO mv_missing;
 ALTER MATERIALIZED VIEW matview_people RENAME TO mv_table_target;
 ALTER MATERIALIZED VIEW mv_people_snapshot RENAME TO public.mv_schema_target;
+REFRESH MATERIALIZED VIEW missing_mv;
+REFRESH MATERIALIZED VIEW matview_people;
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_people_snapshot;
+REFRESH MATERIALIZED VIEW mv_people_snapshot WITH NO DATA;
 DROP MATERIALIZED VIEW missing_mv;
 DROP MATERIALIZED VIEW mv_people_snapshot, missing_mv;
 \dm

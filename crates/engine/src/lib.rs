@@ -22,9 +22,9 @@ use gpu_db_protocol::{
     parse_command, AddUniqueConstraint, ColumnDef, Command, CommentTarget, CreateIndex,
     CreateMaterializedView, CreateSequence, CreateTable, CreateView, Delete, DropConstraint,
     DropIndex, DropMaterializedView, DropSequence, DropTable, DropView, Insert, ParseError,
-    RenameColumn, RenameConstraint, RenameIndex, RenameMaterializedView, RenameSequence,
-    RenameTable, RenameView, Select, SelectFilterOp, SelectProjection, SqlType, SqlValue,
-    TruncateTable, Update,
+    RefreshMaterializedView, RenameColumn, RenameConstraint, RenameIndex, RenameMaterializedView,
+    RenameSequence, RenameTable, RenameView, Select, SelectFilterOp, SelectProjection, SqlType,
+    SqlValue, TruncateTable, Update,
 };
 use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine};
 use gpu_db_storage::{
@@ -88,6 +88,7 @@ impl ReplicatedStateMachine for KvStateMachine {
                     | Command::CreateView(_)
                     | Command::RenameView(_)
                     | Command::CreateMaterializedView(_)
+                    | Command::RefreshMaterializedView(_)
                     | Command::RenameMaterializedView(_)
                     | Command::CreateSequence(_)
                     | Command::RenameSequence(_)
@@ -7567,6 +7568,9 @@ impl Engine {
             Command::CreateMaterializedView(create) => {
                 self.apply_create_materialized_view(create)?
             }
+            Command::RefreshMaterializedView(refresh) => {
+                self.apply_refresh_materialized_view(refresh)?
+            }
             Command::RenameMaterializedView(rename) => {
                 self.apply_rename_materialized_view(rename)?
             }
@@ -7696,6 +7700,44 @@ impl Engine {
                 rows: result.rows,
             },
         );
+        Ok(())
+    }
+
+    fn apply_refresh_materialized_view(
+        &mut self,
+        refresh: RefreshMaterializedView,
+    ) -> Result<(), EngineError> {
+        self.preflight_refresh_materialized_view(&refresh)?;
+        let existing = self
+            .relational_materialized_views
+            .get(&refresh.name)
+            .ok_or_else(|| {
+                EngineError::ApplyFailed(format!(
+                    "materialized view \"{}\" does not exist",
+                    refresh.name
+                ))
+            })?;
+        let query = existing.query.clone();
+        let columns = existing.columns.clone();
+        let result = self
+            .execute_relational_select(&query)
+            .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
+        if result.columns.len() != columns.len()
+            || result
+                .columns
+                .iter()
+                .zip(columns.iter())
+                .any(|(left, right)| left.name != right.name || left.ty != right.ty)
+        {
+            return Err(EngineError::ApplyFailed(
+                "materialized view refresh changed the result shape".to_string(),
+            ));
+        }
+        let view = self
+            .relational_materialized_views
+            .get_mut(&refresh.name)
+            .expect("materialized view existence preflighted");
+        view.rows = result.rows;
         Ok(())
     }
 
@@ -8691,6 +8733,31 @@ impl Engine {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{}\" does not exist",
                 create.query.table
+            )));
+        }
+        Ok(())
+    }
+
+    fn preflight_refresh_materialized_view(
+        &self,
+        refresh: &RefreshMaterializedView,
+    ) -> Result<(), EngineError> {
+        if self.relational_catalog.contains_key(&refresh.name)
+            || self.relational_views.contains_key(&refresh.name)
+            || self.relational_sequences.contains_key(&refresh.name)
+        {
+            return Err(EngineError::ApplyFailed(format!(
+                "relation \"{}\" is not a materialized view",
+                refresh.name
+            )));
+        }
+        if !self
+            .relational_materialized_views
+            .contains_key(&refresh.name)
+        {
+            return Err(EngineError::ApplyFailed(format!(
+                "materialized view \"{}\" does not exist",
+                refresh.name
             )));
         }
         Ok(())
@@ -9901,6 +9968,9 @@ impl Engine {
             Command::CreateMaterializedView(create) => {
                 self.preflight_create_materialized_view(create)?
             }
+            Command::RefreshMaterializedView(refresh) => {
+                self.preflight_refresh_materialized_view(refresh)?
+            }
             Command::RenameMaterializedView(rename) => {
                 if self.relational_catalog.contains_key(&rename.old_name)
                     || self.relational_views.contains_key(&rename.old_name)
@@ -10191,6 +10261,7 @@ impl Engine {
             | Command::CreateView(_)
             | Command::RenameView(_)
             | Command::CreateMaterializedView(_)
+            | Command::RefreshMaterializedView(_)
             | Command::RenameMaterializedView(_)
             | Command::CreateSequence(_)
             | Command::RenameSequence(_)
@@ -10401,6 +10472,7 @@ impl Engine {
             | Command::CreateView(_)
             | Command::RenameView(_)
             | Command::CreateMaterializedView(_)
+            | Command::RefreshMaterializedView(_)
             | Command::RenameMaterializedView(_)
             | Command::CreateSequence(_)
             | Command::RenameSequence(_)
@@ -10513,6 +10585,9 @@ impl Engine {
             Command::RenameView(_) => Err(ExecuteError::NonReadCommand("ALTER VIEW")),
             Command::CreateMaterializedView(_) => {
                 Err(ExecuteError::NonReadCommand("CREATE MATERIALIZED VIEW"))
+            }
+            Command::RefreshMaterializedView(_) => {
+                Err(ExecuteError::NonReadCommand("REFRESH MATERIALIZED VIEW"))
             }
             Command::RenameMaterializedView(_) => {
                 Err(ExecuteError::NonReadCommand("ALTER MATERIALIZED VIEW"))
@@ -32800,9 +32875,26 @@ mod tests {
                 vec![SqlValue::Int4(3), SqlValue::Text("Grace".to_string())],
             ]
         );
+        e.execute_text(6, "REFRESH MATERIALIZED VIEW public.mv_people")
+            .unwrap();
+        let refreshed_result = e.execute_relational_select(&select).unwrap();
+        assert_eq!(
+            refreshed_result.rows,
+            vec![
+                vec![SqlValue::Int4(2), SqlValue::Text("Linus".to_string())],
+                vec![SqlValue::Int4(3), SqlValue::Text("Grace".to_string())],
+                vec![SqlValue::Int4(4), SqlValue::Text("Barbara".to_string())],
+            ]
+        );
+        assert_eq!(
+            e.relational_catalog_materialized_view("mv_people")
+                .unwrap()
+                .oid,
+            oid
+        );
 
         e.execute_text(
-            6,
+            7,
             "ALTER MATERIALIZED VIEW public.mv_people RENAME TO mv_people_snapshot",
         )
         .unwrap();
@@ -32829,14 +32921,14 @@ mod tests {
         let recovered_result = recovered
             .execute_relational_select(&renamed_select)
             .unwrap();
-        assert_eq!(recovered_result.rows, result.rows);
+        assert_eq!(recovered_result.rows, refreshed_result.rows);
         assert_eq!(
             recovered.relational_materialized_view_comment("mv_people_snapshot"),
             Some("people snapshot")
         );
 
         e.execute_text(
-            7,
+            8,
             "DROP MATERIALIZED VIEW IF EXISTS missing_mv, mv_people_snapshot",
         )
         .unwrap();
@@ -32859,9 +32951,21 @@ mod tests {
             .execute_text(3, "DROP MATERIALIZED VIEW people")
             .unwrap_err();
         assert!(table_target.to_string().contains("not a materialized view"));
+        let refresh_table_target = boundary
+            .execute_text(4, "REFRESH MATERIALIZED VIEW people")
+            .unwrap_err();
+        assert!(refresh_table_target
+            .to_string()
+            .contains("not a materialized view"));
+        let refresh_missing = boundary
+            .execute_text(5, "REFRESH MATERIALIZED VIEW missing_mv")
+            .unwrap_err();
+        assert!(refresh_missing
+            .to_string()
+            .contains("materialized view \"missing_mv\" does not exist"));
         let duplicate = boundary
             .execute_text(
-                4,
+                6,
                 "CREATE MATERIALIZED VIEW people AS SELECT id, name FROM other_people",
             )
             .unwrap_err();

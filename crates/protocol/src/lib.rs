@@ -23,6 +23,7 @@ pub enum Command {
     CreateView(CreateView),
     RenameView(RenameView),
     CreateMaterializedView(CreateMaterializedView),
+    RefreshMaterializedView(RefreshMaterializedView),
     RenameMaterializedView(RenameMaterializedView),
     CreateSequence(CreateSequence),
     RenameSequence(RenameSequence),
@@ -149,6 +150,11 @@ pub struct CreateMaterializedView {
     pub name: String,
     pub query: Select,
     pub definition: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefreshMaterializedView {
+    pub name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1797,6 +1803,9 @@ fn parse_relational_command(input: &str) -> Option<Result<Command, ParseError>> 
     if first.eq_ignore_ascii_case("TRUNCATE") {
         return Some(parse_truncate_table(input).map(Command::TruncateTable));
     }
+    if first.eq_ignore_ascii_case("REFRESH") {
+        return Some(parse_refresh_materialized_view(input).map(Command::RefreshMaterializedView));
+    }
     if first.eq_ignore_ascii_case("ALTER") {
         if input
             .split_whitespace()
@@ -2647,6 +2656,38 @@ fn parse_create_materialized_view(input: &str) -> Result<CreateMaterializedView,
         name,
         query,
         definition: definition.to_string(),
+    })
+}
+
+fn parse_refresh_materialized_view(input: &str) -> Result<RefreshMaterializedView, ParseError> {
+    let mut rest = strip_keyword_prefix_case_insensitive(input, "REFRESH")
+        .and_then(|s| strip_keyword_prefix_case_insensitive(s.trim_start(), "MATERIALIZED"))
+        .and_then(|s| strip_keyword_prefix_case_insensitive(s.trim_start(), "VIEW"))
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    if let Some(after_concurrently) = strip_keyword_prefix_case_insensitive(rest, "CONCURRENTLY") {
+        let _ = after_concurrently;
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    if rest.is_empty() {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let with_pos = find_keyword_outside_quotes(rest, "WITH");
+    if let Some(with_pos) = with_pos {
+        let options = rest[with_pos + "WITH".len()..].trim();
+        if !options.eq_ignore_ascii_case("DATA") {
+            return Err(ParseError::InvalidRelationalSql);
+        }
+        rest = rest[..with_pos].trim_end();
+    }
+    if rest.is_empty()
+        || find_keyword_outside_quotes(rest, "CASCADE").is_some()
+        || find_keyword_outside_quotes(rest, "RESTRICT").is_some()
+    {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    Ok(RefreshMaterializedView {
+        name: normalize_relation_identifier(rest)?,
     })
 }
 
@@ -12226,6 +12267,12 @@ mod tests {
             })
         );
         assert_eq!(
+            parse_command("REFRESH MATERIALIZED VIEW public.mv_people WITH DATA").unwrap(),
+            Command::RefreshMaterializedView(RefreshMaterializedView {
+                name: "mv_people".to_string(),
+            })
+        );
+        assert_eq!(
             parse_command("DROP MATERIALIZED VIEW IF EXISTS public.mv_people_old, mv_other")
                 .unwrap(),
             Command::DropMaterializedView(DropMaterializedView {
@@ -12245,6 +12292,14 @@ mod tests {
 
         assert!(matches!(
             parse_command("CREATE MATERIALIZED VIEW mv_people AS SELECT * FROM people WITH DATA"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command("REFRESH MATERIALIZED VIEW CONCURRENTLY mv_people"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command("REFRESH MATERIALIZED VIEW mv_people WITH NO DATA"),
             Err(ParseError::InvalidRelationalSql)
         ));
         assert!(matches!(

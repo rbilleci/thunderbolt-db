@@ -28,6 +28,14 @@ INSERT 0 1
   3 | Grace
 (2 rows)
 
+REFRESH MATERIALIZED VIEW
+ id |  name
+----+---------
+  2 | Linus
+  3 | Grace
+  4 | Barbara
+(3 rows)
+
   oid  | nspname |  relname  | relkind | relpersistence
 -------+---------+-----------+---------+----------------
  16385 | public  | mv_people | m       | p
@@ -51,20 +59,25 @@ ALTER MATERIALIZED VIEW
  public | mv_people_snapshot | materialized view | postgres | permanent   | heap          | 0 bytes | people snapshot
 (1 row)
 
- id | name
-----+-------
+ id |  name
+----+---------
   2 | Linus
   3 | Grace
-(2 rows)
+  4 | Barbara
+(3 rows)
 
-psql:331_protocol_psql_materialized_views.sql:27: ERROR:  relation does not exist
+psql:331_protocol_psql_materialized_views.sql:29: ERROR:  relation does not exist
 SELECT 0
-psql:331_protocol_psql_materialized_views.sql:29: ERROR:  relation already exists
-psql:331_protocol_psql_materialized_views.sql:30: ERROR:  materialized view does not exist
-psql:331_protocol_psql_materialized_views.sql:31: ERROR:  relation is not a materialized view
-psql:331_protocol_psql_materialized_views.sql:32: ERROR:  query shape is not supported by the compatibility stub
-psql:331_protocol_psql_materialized_views.sql:33: ERROR:  materialized view does not exist
-psql:331_protocol_psql_materialized_views.sql:34: ERROR:  materialized view does not exist
+psql:331_protocol_psql_materialized_views.sql:31: ERROR:  relation already exists
+psql:331_protocol_psql_materialized_views.sql:32: ERROR:  materialized view does not exist
+psql:331_protocol_psql_materialized_views.sql:33: ERROR:  relation is not a materialized view
+psql:331_protocol_psql_materialized_views.sql:34: ERROR:  query shape is not supported by the compatibility stub
+psql:331_protocol_psql_materialized_views.sql:35: ERROR:  materialized view does not exist
+psql:331_protocol_psql_materialized_views.sql:36: ERROR:  relation is not a materialized view
+psql:331_protocol_psql_materialized_views.sql:37: ERROR:  query shape is not supported by the compatibility stub
+psql:331_protocol_psql_materialized_views.sql:38: ERROR:  query shape is not supported by the compatibility stub
+psql:331_protocol_psql_materialized_views.sql:39: ERROR:  materialized view does not exist
+psql:331_protocol_psql_materialized_views.sql:40: ERROR:  materialized view does not exist
                      List of relations
  Schema |        Name        |       Type        |  Owner
 --------+--------------------+-------------------+----------
@@ -88,10 +101,10 @@ DROP MATERIALIZED VIEW
 (4 rows)
 
 DROP MATERIALIZED VIEW
-psql:331_protocol_psql_materialized_views.sql:40: error: Did not find any relations.
+psql:331_protocol_psql_materialized_views.sql:46: error: Did not find any relations.
 CREATE VIEW
-psql:331_protocol_psql_materialized_views.sql:42: ERROR:  materialized views over views are unsupported
+psql:331_protocol_psql_materialized_views.sql:48: ERROR:  materialized views over views are unsupported
 CREATE TABLE
-psql:331_protocol_psql_materialized_views.sql:44: ERROR:  relation already exists
-psql:331_protocol_psql_materialized_views.sql:45: ERROR:  query shape is not supported by the compatibility stub
-psql:331_protocol_psql_materialized_views.sql:46: ERROR:  relation is not a materialized view
+psql:331_protocol_psql_materialized_views.sql:50: ERROR:  relation already exists
+psql:331_protocol_psql_materialized_views.sql:51: ERROR:  query shape is not supported by the compatibility stub
+psql:331_protocol_psql_materialized_views.sql:52: ERROR:  relation is not a materialized view

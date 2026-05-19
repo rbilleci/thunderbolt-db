@@ -1249,6 +1249,77 @@ fn parse_materialized_row_value(
     }
 }
 
+fn materialize_select_rows(
+    result: SelectResult,
+    expected_columns: Option<&[CatalogColumn]>,
+) -> Result<(Vec<CatalogColumn>, Vec<Vec<SqlValue>>), ErrorField> {
+    let columns = result
+        .columns
+        .into_iter()
+        .enumerate()
+        .map(|(idx, column)| {
+            Ok(CatalogColumn {
+                attnum: i16::try_from(idx + 1).map_err(|_| ErrorField {
+                    code: "54000",
+                    message: "too many columns for bootstrap catalog",
+                    position: None,
+                })?,
+                def: gpu_db_protocol::ColumnDef {
+                    name: column.name,
+                    ty: match column.oid {
+                        23 => gpu_db_protocol::SqlType::Int4,
+                        25 => gpu_db_protocol::SqlType::Text,
+                        _ => {
+                            return Err(ErrorField {
+                                code: "0A000",
+                                message: "materialized view column type is unsupported",
+                                position: None,
+                            })
+                        }
+                    },
+                    default: None,
+                },
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if let Some(expected_columns) = expected_columns {
+        if columns.len() != expected_columns.len()
+            || columns
+                .iter()
+                .zip(expected_columns.iter())
+                .any(|(left, right)| left.def.name != right.def.name || left.def.ty != right.def.ty)
+        {
+            return Err(ErrorField {
+                code: "0A000",
+                message: "materialized view refresh changed the result shape",
+                position: None,
+            });
+        }
+    }
+    let column_types = columns
+        .iter()
+        .map(|column| column.def.ty)
+        .collect::<Vec<_>>();
+    let rows = result
+        .rows
+        .into_iter()
+        .map(|row| {
+            row.into_iter()
+                .zip(column_types.iter().copied())
+                .map(|(value, ty)| match value {
+                    Some(value) => parse_materialized_row_value(&value, ty),
+                    None => Err(ErrorField {
+                        code: "0A000",
+                        message: "NULL materialized view rows are unsupported",
+                        position: None,
+                    }),
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((columns, rows))
+}
+
 fn index_definition_prefix(unique: bool) -> &'static str {
     if unique {
         "CREATE UNIQUE INDEX"
@@ -6944,62 +7015,8 @@ fn execute_statement(
                         );
                     }
                 };
-                let result_rows = result.rows;
-                let columns = result
-                    .columns
-                    .into_iter()
-                    .enumerate()
-                    .map(|(idx, column)| {
-                        Ok(CatalogColumn {
-                            attnum: i16::try_from(idx + 1).map_err(|_| ErrorField {
-                                code: "54000",
-                                message: "too many columns for bootstrap catalog",
-                                position: None,
-                            })?,
-                            def: gpu_db_protocol::ColumnDef {
-                                name: column.name,
-                                ty: match column.oid {
-                                    23 => gpu_db_protocol::SqlType::Int4,
-                                    25 => gpu_db_protocol::SqlType::Text,
-                                    _ => {
-                                        return Err(ErrorField {
-                                            code: "0A000",
-                                            message: "materialized view column type is unsupported",
-                                            position: None,
-                                        })
-                                    }
-                                },
-                                default: None,
-                            },
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>();
-                let columns = match columns {
-                    Ok(columns) => columns,
-                    Err(error) => return write_error(stream, &error),
-                };
-                let column_types = columns
-                    .iter()
-                    .map(|column| column.def.ty)
-                    .collect::<Vec<_>>();
-                let rows = result_rows
-                    .into_iter()
-                    .map(|row| {
-                        row.into_iter()
-                            .zip(column_types.iter().copied())
-                            .map(|(value, ty)| match value {
-                                Some(value) => parse_materialized_row_value(&value, ty),
-                                None => Err(ErrorField {
-                                    code: "0A000",
-                                    message: "NULL materialized view rows are unsupported",
-                                    position: None,
-                                }),
-                            })
-                            .collect::<Result<Vec<_>, _>>()
-                    })
-                    .collect::<Result<Vec<_>, _>>();
-                let rows = match rows {
-                    Ok(rows) => rows,
+                let (columns, rows) = match materialize_select_rows(result, None) {
+                    Ok(materialized) => materialized,
                     Err(error) => return write_error(stream, &error),
                 };
                 let name = create.name;
@@ -7017,6 +7034,49 @@ fn execute_statement(
                 session.mark_materialized_view_dirty(name);
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, "SELECT 0");
+            }
+            Command::RefreshMaterializedView(refresh) => {
+                if session.tables.contains_key(&refresh.name)
+                    || session.views.contains_key(&refresh.name)
+                    || session.sequences.contains_key(&refresh.name)
+                {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "42809",
+                            message: "relation is not a materialized view",
+                            position: None,
+                        },
+                    );
+                }
+                let Some(existing) = session.materialized_views.get(&refresh.name) else {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "42P01",
+                            message: "materialized view does not exist",
+                            position: None,
+                        },
+                    );
+                };
+                let query = existing.query.clone();
+                let expected_columns = existing.columns.clone();
+                let result = match execute_select_result(session, &query) {
+                    Ok(result) => result,
+                    Err(error) => return write_error(stream, &error),
+                };
+                let (_, rows) = match materialize_select_rows(result, Some(&expected_columns)) {
+                    Ok(materialized) => materialized,
+                    Err(error) => return write_error(stream, &error),
+                };
+                let view = session
+                    .materialized_views
+                    .get_mut(&refresh.name)
+                    .expect("materialized view existence validated");
+                view.rows = rows;
+                session.mark_materialized_view_dirty(refresh.name);
+                session.persist_catalog_snapshot();
+                return write_command_complete(stream, "REFRESH MATERIALIZED VIEW");
             }
             Command::RenameView(rename) => {
                 if session.tables.contains_key(&rename.old_name) {
