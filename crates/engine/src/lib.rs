@@ -24,7 +24,8 @@ use gpu_db_protocol::{
     DropConstraint, DropIndex, DropMaterializedView, DropSequence, DropTable, DropView, Insert,
     ParseError, RefreshMaterializedView, RenameColumn, RenameConstraint, RenameIndex,
     RenameMaterializedView, RenameSequence, RenameTable, RenameView, Select, SelectFilterOp,
-    SelectProjection, SequenceNextVal, SequenceSetVal, SqlType, SqlValue, TruncateTable, Update,
+    SelectProjection, SequenceNextVal, SequenceSetVal, SqlType, SqlValue, TablePrivilege,
+    TruncateTable, Update,
 };
 use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine};
 use gpu_db_storage::{
@@ -101,6 +102,8 @@ impl ReplicatedStateMachine for KvStateMachine {
                     | Command::DropView(_)
                     | Command::DropMaterializedView(_)
                     | Command::DropSequence(_)
+                    | Command::GrantTable(_)
+                    | Command::RevokeTable(_)
                     | Command::AlterColumnDefault(_)
                     | Command::CommentOn(_)
                     | Command::Insert(_)
@@ -5980,6 +5983,7 @@ pub struct RelationalTable {
     pub oid: u32,
     pub columns: Vec<RelationalColumn>,
     pub indexes: Vec<RelationalIndex>,
+    pub acl: BTreeMap<String, BTreeSet<TablePrivilege>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7613,6 +7617,12 @@ impl Engine {
             Command::DropView(drop) => self.apply_drop_view(drop)?,
             Command::DropMaterializedView(drop) => self.apply_drop_materialized_view(drop)?,
             Command::DropSequence(drop) => self.apply_drop_sequence(drop)?,
+            Command::GrantTable(grant) => {
+                self.apply_grant_table(&grant.table, &grant.grantee, &grant.privileges)?
+            }
+            Command::RevokeTable(revoke) => {
+                self.apply_revoke_table(&revoke.table, &revoke.grantee, &revoke.privileges)?
+            }
             Command::AlterColumnDefault(alter) => self.apply_alter_column_default(alter)?,
             Command::CommentOn(comment) => self.apply_comment_on(comment)?,
             Command::Insert(insert) => self.apply_insert(insert, txn_id)?,
@@ -7991,6 +8001,7 @@ impl Engine {
                 oid,
                 columns,
                 indexes,
+                acl: BTreeMap::new(),
             },
         );
         self.relational_next_oid = next_oid;
@@ -8888,6 +8899,63 @@ impl Engine {
             return Err(EngineError::ApplyFailed(format!(
                 "sequence \"{name}\" does not exist"
             )));
+        }
+        Ok(())
+    }
+
+    fn preflight_table_acl_target(&self, table: &str) -> Result<(), EngineError> {
+        if self.relational_views.contains_key(table)
+            || self.relational_materialized_views.contains_key(table)
+            || self.relational_sequences.contains_key(table)
+        {
+            return Err(EngineError::ApplyFailed(format!(
+                "relation \"{table}\" is not a table"
+            )));
+        }
+        if !self.relational_catalog.contains_key(table) {
+            return Err(EngineError::ApplyFailed(format!(
+                "relation \"{table}\" does not exist"
+            )));
+        }
+        Ok(())
+    }
+
+    fn apply_grant_table(
+        &mut self,
+        table: &str,
+        grantee: &str,
+        privileges: &[TablePrivilege],
+    ) -> Result<(), EngineError> {
+        self.preflight_table_acl_target(table)?;
+        let table = self
+            .relational_catalog
+            .get_mut(table)
+            .expect("table ACL target preflighted");
+        let acl = table.acl.entry(grantee.to_string()).or_default();
+        for privilege in privileges {
+            acl.insert(*privilege);
+        }
+        Ok(())
+    }
+
+    fn apply_revoke_table(
+        &mut self,
+        table: &str,
+        grantee: &str,
+        privileges: &[TablePrivilege],
+    ) -> Result<(), EngineError> {
+        self.preflight_table_acl_target(table)?;
+        let table = self
+            .relational_catalog
+            .get_mut(table)
+            .expect("table ACL target preflighted");
+        if let Some(acl) = table.acl.get_mut(grantee) {
+            for privilege in privileges {
+                acl.remove(privilege);
+            }
+            if acl.is_empty() {
+                table.acl.remove(grantee);
+            }
         }
         Ok(())
     }
@@ -10350,6 +10418,8 @@ impl Engine {
             Command::DropView(drop) => self.preflight_drop_view(drop)?,
             Command::DropMaterializedView(drop) => self.preflight_drop_materialized_view(drop)?,
             Command::DropSequence(drop) => self.preflight_drop_sequence(drop)?,
+            Command::GrantTable(grant) => self.preflight_table_acl_target(&grant.table)?,
+            Command::RevokeTable(revoke) => self.preflight_table_acl_target(&revoke.table)?,
             Command::Insert(insert) => {
                 let table = self.relational_catalog.get(&insert.table).ok_or_else(|| {
                     EngineError::ApplyFailed(format!(
@@ -10559,6 +10629,8 @@ impl Engine {
             | Command::DropView(_)
             | Command::DropMaterializedView(_)
             | Command::DropSequence(_)
+            | Command::GrantTable(_)
+            | Command::RevokeTable(_)
             | Command::AlterColumnDefault(_)
             | Command::CommentOn(_)
             | Command::Insert(_)
@@ -10772,6 +10844,8 @@ impl Engine {
             | Command::DropView(_)
             | Command::DropMaterializedView(_)
             | Command::DropSequence(_)
+            | Command::GrantTable(_)
+            | Command::RevokeTable(_)
             | Command::AlterColumnDefault(_)
             | Command::CommentOn(_)
             | Command::Insert(_)
@@ -10894,6 +10968,8 @@ impl Engine {
                 Err(ExecuteError::NonReadCommand("DROP MATERIALIZED VIEW"))
             }
             Command::DropSequence(_) => Err(ExecuteError::NonReadCommand("DROP SEQUENCE")),
+            Command::GrantTable(_) => Err(ExecuteError::NonReadCommand("GRANT")),
+            Command::RevokeTable(_) => Err(ExecuteError::NonReadCommand("REVOKE")),
             Command::AlterColumnDefault(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
             Command::CommentOn(_) => Err(ExecuteError::NonReadCommand("COMMENT")),
             Command::Insert(_) => Err(ExecuteError::NonReadCommand("INSERT")),
@@ -13985,6 +14061,13 @@ impl Engine {
 
     pub fn relational_catalog_table(&self, table: &str) -> Option<&RelationalTable> {
         self.relational_catalog.get(table)
+    }
+
+    pub fn relational_table_acl(
+        &self,
+        table: &str,
+    ) -> Option<&BTreeMap<String, BTreeSet<TablePrivilege>>> {
+        self.relational_catalog.get(table).map(|table| &table.acl)
     }
 
     pub fn relational_catalog_view(&self, view: &str) -> Option<&RelationalView> {
@@ -35799,6 +35882,70 @@ mod tests {
             "{view_truncate}"
         );
         assert!(with_view.relational_catalog_view("people_view").is_some());
+    }
+
+    #[test]
+    fn relational_catalog_records_table_acl_metadata_and_replays_from_wal() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        e.execute_text(2, "GRANT SELECT, INSERT ON TABLE public.people TO PUBLIC")
+            .unwrap();
+        e.execute_text(3, "GRANT ALL PRIVILEGES ON people TO postgres")
+            .unwrap();
+        e.execute_text(4, "REVOKE INSERT ON people FROM PUBLIC")
+            .unwrap();
+
+        let acl = e.relational_table_acl("people").unwrap();
+        assert_eq!(
+            acl.get("public").unwrap(),
+            &BTreeSet::from([TablePrivilege::Select])
+        );
+        assert_eq!(
+            acl.get("postgres").unwrap(),
+            &BTreeSet::from([
+                TablePrivilege::Select,
+                TablePrivilege::Insert,
+                TablePrivilege::Update,
+                TablePrivilege::Delete,
+            ])
+        );
+
+        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let recovered_acl = recovered.relational_table_acl("people").unwrap();
+        assert_eq!(recovered_acl, acl);
+
+        e.execute_text(5, "REVOKE SELECT ON people FROM PUBLIC")
+            .unwrap();
+        assert!(!e
+            .relational_table_acl("people")
+            .unwrap()
+            .contains_key("public"));
+
+        let missing = e
+            .execute_text(6, "GRANT SELECT ON missing_people TO PUBLIC")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            missing.contains("relation \"missing_people\" does not exist"),
+            "{missing}"
+        );
+
+        let mut with_view = Engine::new_local();
+        with_view
+            .execute_text(1, "CREATE TABLE people (id INT, name TEXT)")
+            .unwrap();
+        with_view
+            .execute_text(2, "CREATE VIEW public.people_view AS SELECT * FROM people")
+            .unwrap();
+        let view_grant = with_view
+            .execute_text(3, "GRANT SELECT ON people_view TO PUBLIC")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            view_grant.contains("relation \"people_view\" is not a table"),
+            "{view_grant}"
+        );
     }
 
     #[test]

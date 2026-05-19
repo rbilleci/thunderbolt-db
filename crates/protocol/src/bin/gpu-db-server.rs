@@ -8,7 +8,7 @@ use std::thread;
 use gpu_db_protocol::{
     parse_command, parse_frontend_message, parse_startup_packet, ColumnDefault, Command,
     CommentTarget, FrontendMessage, ParseError, SelectFilterOp, SelectProjection, SqlValue,
-    StartupPacket, SUPPORTED_SQL_TYPES,
+    StartupPacket, TablePrivilege, SUPPORTED_SQL_TYPES,
 };
 use gpu_db_protocol::{DescribeTarget, SqlType};
 
@@ -1790,6 +1790,11 @@ fn rename_table_in_session(
     };
     table.name = new_name.to_string();
     session.tables.insert(new_name.to_string(), table);
+    if let Some(acl) = session.table_acls.remove(old_name) {
+        session.table_acls.insert(new_name.to_string(), acl);
+        session.mark_table_acl_dirty(old_name.to_string());
+        session.mark_table_acl_dirty(new_name.to_string());
+    }
     for index in &mut session.indexes {
         if index.table == old_name {
             index.table = new_name.to_string();
@@ -2056,12 +2061,14 @@ struct Session {
     sequences: HashMap<String, Sequence>,
     currval_sequences: HashMap<String, i64>,
     indexes: Vec<CatalogIndex>,
+    table_acls: BTreeMap<String, BTreeMap<String, BTreeSet<TablePrivilege>>>,
     comments: BTreeMap<CatalogCommentTarget, String>,
     dirty_tables: BTreeSet<String>,
     dirty_views: BTreeSet<String>,
     dirty_materialized_views: BTreeSet<String>,
     dirty_sequences: BTreeSet<String>,
     dirty_indexes: bool,
+    dirty_table_acls: BTreeSet<String>,
     dirty_comment_targets: BTreeSet<CatalogCommentTarget>,
     copy_in: Option<CopyInState>,
     next_relation_oid: u32,
@@ -2075,6 +2082,7 @@ struct SharedCatalog {
     materialized_views: HashMap<String, MaterializedView>,
     sequences: HashMap<String, Sequence>,
     indexes: Vec<CatalogIndex>,
+    table_acls: BTreeMap<String, BTreeMap<String, BTreeSet<TablePrivilege>>>,
     comments: BTreeMap<CatalogCommentTarget, String>,
     next_relation_oid: u32,
 }
@@ -2087,6 +2095,7 @@ impl Default for SharedCatalog {
             materialized_views: HashMap::new(),
             sequences: HashMap::new(),
             indexes: Vec::new(),
+            table_acls: BTreeMap::new(),
             comments: BTreeMap::new(),
             next_relation_oid: FIRST_USER_RELATION_OID,
         }
@@ -2124,12 +2133,14 @@ impl Session {
             sequences: catalog.sequences,
             currval_sequences: HashMap::new(),
             indexes: catalog.indexes,
+            table_acls: catalog.table_acls,
             comments: catalog.comments,
             dirty_tables: BTreeSet::new(),
             dirty_views: BTreeSet::new(),
             dirty_materialized_views: BTreeSet::new(),
             dirty_sequences: BTreeSet::new(),
             dirty_indexes: false,
+            dirty_table_acls: BTreeSet::new(),
             dirty_comment_targets: BTreeSet::new(),
             copy_in: None,
             next_relation_oid: catalog.next_relation_oid,
@@ -2153,6 +2164,10 @@ impl Session {
         self.dirty_sequences.insert(sequence.into());
     }
 
+    fn mark_table_acl_dirty(&mut self, table: impl Into<String>) {
+        self.dirty_table_acls.insert(table.into());
+    }
+
     fn mark_comment_dirty(&mut self, target: CatalogCommentTarget) {
         self.dirty_comment_targets.insert(target);
     }
@@ -2163,6 +2178,7 @@ impl Session {
             self.dirty_views.clear();
             self.dirty_materialized_views.clear();
             self.dirty_sequences.clear();
+            self.dirty_table_acls.clear();
             self.dirty_comment_targets.clear();
             return;
         }
@@ -2199,6 +2215,13 @@ impl Session {
                     .insert(sequence_name.clone(), sequence.clone());
             } else {
                 catalog.sequences.remove(sequence_name);
+            }
+        }
+        for table_name in &self.dirty_table_acls {
+            if let Some(acl) = self.table_acls.get(table_name) {
+                catalog.table_acls.insert(table_name.clone(), acl.clone());
+            } else {
+                catalog.table_acls.remove(table_name);
             }
         }
         catalog.next_relation_oid = catalog.next_relation_oid.max(self.next_relation_oid);
@@ -2247,6 +2270,7 @@ impl Session {
         self.dirty_views.clear();
         self.dirty_materialized_views.clear();
         self.dirty_sequences.clear();
+        self.dirty_table_acls.clear();
     }
 
     fn close_extended_target(&mut self, target: DescribeTarget, name: &str) {
@@ -2418,6 +2442,78 @@ fn add_column_default_supported(default: &ColumnDefault) -> bool {
             create_if_missing, ..
         } => !create_if_missing,
     }
+}
+
+fn table_acl_target_error(session: &Session, table: &str) -> Option<ErrorField> {
+    if session.views.contains_key(table)
+        || session.materialized_views.contains_key(table)
+        || session.sequences.contains_key(table)
+    {
+        return Some(ErrorField {
+            code: "42809",
+            message: "relation is not a table",
+            position: None,
+        });
+    }
+    if !session.tables.contains_key(table) {
+        return Some(ErrorField {
+            code: "42P01",
+            message: "relation does not exist",
+            position: None,
+        });
+    }
+    None
+}
+
+fn grant_table_acl(
+    session: &mut Session,
+    table: &str,
+    grantee: &str,
+    privileges: &[TablePrivilege],
+) -> Result<(), ErrorField> {
+    if let Some(error) = table_acl_target_error(session, table) {
+        return Err(error);
+    }
+    let grantee_acl = session
+        .table_acls
+        .entry(table.to_string())
+        .or_default()
+        .entry(grantee.to_string())
+        .or_default();
+    for privilege in privileges {
+        grantee_acl.insert(*privilege);
+    }
+    session.mark_table_acl_dirty(table.to_string());
+    Ok(())
+}
+
+fn revoke_table_acl(
+    session: &mut Session,
+    table: &str,
+    grantee: &str,
+    privileges: &[TablePrivilege],
+) -> Result<(), ErrorField> {
+    if let Some(error) = table_acl_target_error(session, table) {
+        return Err(error);
+    }
+    let remove_table_acl = if let Some(acl) = session.table_acls.get_mut(table) {
+        if let Some(grantee_acl) = acl.get_mut(grantee) {
+            for privilege in privileges {
+                grantee_acl.remove(privilege);
+            }
+            if grantee_acl.is_empty() {
+                acl.remove(grantee);
+            }
+        }
+        acl.is_empty()
+    } else {
+        false
+    };
+    if remove_table_acl {
+        session.table_acls.remove(table);
+    }
+    session.mark_table_acl_dirty(table.to_string());
+    Ok(())
 }
 
 fn evaluate_column_default(
@@ -7844,7 +7940,9 @@ fn execute_statement(
                     .collect::<BTreeSet<_>>();
                 for name in &drop.names {
                     session.tables.remove(name);
+                    session.table_acls.remove(name);
                     session.mark_table_dirty(name.clone());
+                    session.mark_table_acl_dirty(name.clone());
                 }
                 let old_index_count = session.indexes.len();
                 session
@@ -8383,6 +8481,24 @@ fn execute_statement(
                 session.mark_comment_dirty(target);
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, "COMMENT");
+            }
+            Command::GrantTable(grant) => {
+                if let Err(error) =
+                    grant_table_acl(session, &grant.table, &grant.grantee, &grant.privileges)
+                {
+                    return write_error(stream, &error);
+                }
+                session.persist_catalog_snapshot();
+                return write_command_complete(stream, "GRANT");
+            }
+            Command::RevokeTable(revoke) => {
+                if let Err(error) =
+                    revoke_table_acl(session, &revoke.table, &revoke.grantee, &revoke.privileges)
+                {
+                    return write_error(stream, &error);
+                }
+                session.persist_catalog_snapshot();
+                return write_command_complete(stream, "REVOKE");
             }
             Command::Insert(insert) => {
                 let table_name = insert.table;
@@ -10827,12 +10943,45 @@ fn catalog_psql_describe_table_privilege_rows_filtered(
                 Some("public".to_string()),
                 Some(table.name.clone()),
                 Some("table".to_string()),
-                None,
+                table_acl_display(session, &table.name),
                 None,
                 None,
             ]
         })
         .collect()
+}
+
+fn table_acl_display(session: &Session, table: &str) -> Option<String> {
+    let acl = session.table_acls.get(table)?;
+    let rows = acl
+        .iter()
+        .filter_map(|(grantee, privileges)| {
+            if privileges.is_empty() {
+                return None;
+            }
+            let grantee = if grantee == "public" { "" } else { grantee };
+            Some(format!(
+                "{grantee}={}/postgres",
+                table_privilege_letters(privileges)
+            ))
+        })
+        .collect::<Vec<_>>();
+    (!rows.is_empty()).then(|| rows.join("\n"))
+}
+
+fn table_privilege_letters(privileges: &BTreeSet<TablePrivilege>) -> String {
+    let mut letters = String::new();
+    for (privilege, letter) in [
+        (TablePrivilege::Insert, 'a'),
+        (TablePrivilege::Select, 'r'),
+        (TablePrivilege::Update, 'w'),
+        (TablePrivilege::Delete, 'd'),
+    ] {
+        if privileges.contains(&privilege) {
+            letters.push(letter);
+        }
+    }
+    letters
 }
 
 fn psql_relname_pattern_matches(pattern: &str, table_name: &str) -> bool {

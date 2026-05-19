@@ -31,6 +31,8 @@ pub enum Command {
     SequenceSetVal(SequenceSetVal),
     RenameSequence(RenameSequence),
     DropSequence(DropSequence),
+    GrantTable(GrantTable),
+    RevokeTable(RevokeTable),
     DropTable(DropTable),
     TruncateTable(TruncateTable),
     DropIndex(DropIndex),
@@ -199,6 +201,28 @@ pub struct RenameSequence {
 pub struct DropSequence {
     pub names: Vec<String>,
     pub if_exists: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TablePrivilege {
+    Select,
+    Insert,
+    Update,
+    Delete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantTable {
+    pub table: String,
+    pub grantee: String,
+    pub privileges: Vec<TablePrivilege>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevokeTable {
+    pub table: String,
+    pub grantee: String,
+    pub privileges: Vec<TablePrivilege>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1907,6 +1931,12 @@ fn parse_relational_command(input: &str) -> Option<Result<Command, ParseError>> 
     if first.eq_ignore_ascii_case("COMMENT") {
         return Some(parse_comment_on(input).map(Command::CommentOn));
     }
+    if first.eq_ignore_ascii_case("GRANT") {
+        return Some(parse_grant_table(input).map(Command::GrantTable));
+    }
+    if first.eq_ignore_ascii_case("REVOKE") {
+        return Some(parse_revoke_table(input).map(Command::RevokeTable));
+    }
     if first.eq_ignore_ascii_case("INSERT") {
         return Some(parse_insert(input).map(Command::Insert));
     }
@@ -3243,6 +3273,122 @@ fn parse_drop_sequence(input: &str) -> Result<DropSequence, ParseError> {
             .collect::<Result<Vec<_>, _>>()?,
         if_exists,
     })
+}
+
+fn parse_grant_table(input: &str) -> Result<GrantTable, ParseError> {
+    let rest = strip_keyword_prefix_case_insensitive(input, "GRANT")
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    if find_keyword_outside_quotes(rest, "WITH").is_some()
+        || find_keyword_outside_quotes(rest, "GRANT OPTION").is_some()
+    {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let on_idx = find_keyword_outside_quotes(rest, "ON").ok_or(ParseError::InvalidRelationalSql)?;
+    let (privileges, target_and_grantee) = rest.split_at(on_idx);
+    let target_and_grantee = strip_keyword_prefix_case_insensitive(target_and_grantee, "ON")
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    let to_idx = find_keyword_outside_quotes(target_and_grantee, "TO")
+        .ok_or(ParseError::InvalidRelationalSql)?;
+    let (target, grantee) = target_and_grantee.split_at(to_idx);
+    let grantee = strip_keyword_prefix_case_insensitive(grantee, "TO")
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim();
+    Ok(GrantTable {
+        table: parse_acl_table_target(target)?,
+        grantee: parse_acl_grantee(grantee)?,
+        privileges: parse_table_privileges(privileges)?,
+    })
+}
+
+fn parse_revoke_table(input: &str) -> Result<RevokeTable, ParseError> {
+    let rest = strip_keyword_prefix_case_insensitive(input, "REVOKE")
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    if strip_keyword_prefix_case_insensitive(rest, "GRANT OPTION FOR").is_some()
+        || find_keyword_outside_quotes(rest, "GRANT OPTION").is_some()
+    {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let on_idx = find_keyword_outside_quotes(rest, "ON").ok_or(ParseError::InvalidRelationalSql)?;
+    let (privileges, target_and_grantee) = rest.split_at(on_idx);
+    let target_and_grantee = strip_keyword_prefix_case_insensitive(target_and_grantee, "ON")
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    let from_idx = find_keyword_outside_quotes(target_and_grantee, "FROM")
+        .ok_or(ParseError::InvalidRelationalSql)?;
+    let (target, grantee) = target_and_grantee.split_at(from_idx);
+    let grantee = strip_keyword_prefix_case_insensitive(grantee, "FROM")
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim();
+    Ok(RevokeTable {
+        table: parse_acl_table_target(target)?,
+        grantee: parse_acl_grantee(grantee)?,
+        privileges: parse_table_privileges(privileges)?,
+    })
+}
+
+fn parse_acl_table_target(target: &str) -> Result<String, ParseError> {
+    let mut target = target.trim();
+    if let Some(after_table) = strip_keyword_prefix_case_insensitive(target, "TABLE") {
+        target = after_table.trim_start();
+    }
+    if target.is_empty()
+        || target.contains(',')
+        || find_keyword_outside_quotes(target, "COLUMN").is_some()
+        || find_keyword_outside_quotes(target, "SCHEMA").is_some()
+        || find_keyword_outside_quotes(target, "SEQUENCE").is_some()
+        || find_keyword_outside_quotes(target, "VIEW").is_some()
+    {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    normalize_relation_identifier(target)
+}
+
+fn parse_acl_grantee(grantee: &str) -> Result<String, ParseError> {
+    let trimmed = grantee.trim();
+    if trimmed.contains(',') || trimmed.is_empty() {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let normalized = normalize_identifier(trimmed)?;
+    if normalized == "public" || normalized == "postgres" {
+        Ok(normalized)
+    } else {
+        Err(ParseError::InvalidRelationalSql)
+    }
+}
+
+fn parse_table_privileges(input: &str) -> Result<Vec<TablePrivilege>, ParseError> {
+    let trimmed = input.trim();
+    if trimmed.eq_ignore_ascii_case("ALL") || trimmed.eq_ignore_ascii_case("ALL PRIVILEGES") {
+        return Ok(vec![
+            TablePrivilege::Select,
+            TablePrivilege::Insert,
+            TablePrivilege::Update,
+            TablePrivilege::Delete,
+        ]);
+    }
+    if trimmed.contains('(') || trimmed.contains(')') {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let mut privileges = Vec::new();
+    for token in split_csv(trimmed)? {
+        let privilege = match token.trim().to_ascii_uppercase().as_str() {
+            "SELECT" => TablePrivilege::Select,
+            "INSERT" => TablePrivilege::Insert,
+            "UPDATE" => TablePrivilege::Update,
+            "DELETE" => TablePrivilege::Delete,
+            _ => return Err(ParseError::InvalidRelationalSql),
+        };
+        if !privileges.contains(&privilege) {
+            privileges.push(privilege);
+        }
+    }
+    if privileges.is_empty() {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    Ok(privileges)
 }
 
 fn parse_drop_materialized_view(input: &str) -> Result<DropMaterializedView, ParseError> {
@@ -11062,6 +11208,52 @@ mod tests {
         ));
         assert!(matches!(
             parse_command("TRUNCATE TABLE private.people"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+
+        assert_eq!(
+            parse_command("GRANT SELECT, INSERT ON TABLE public.people TO PUBLIC").unwrap(),
+            Command::GrantTable(GrantTable {
+                table: "people".to_string(),
+                grantee: "public".to_string(),
+                privileges: vec![TablePrivilege::Select, TablePrivilege::Insert],
+            })
+        );
+        assert_eq!(
+            parse_command("GRANT ALL PRIVILEGES ON people TO postgres").unwrap(),
+            Command::GrantTable(GrantTable {
+                table: "people".to_string(),
+                grantee: "postgres".to_string(),
+                privileges: vec![
+                    TablePrivilege::Select,
+                    TablePrivilege::Insert,
+                    TablePrivilege::Update,
+                    TablePrivilege::Delete,
+                ],
+            })
+        );
+        assert_eq!(
+            parse_command("REVOKE UPDATE, DELETE ON TABLE people FROM PUBLIC").unwrap(),
+            Command::RevokeTable(RevokeTable {
+                table: "people".to_string(),
+                grantee: "public".to_string(),
+                privileges: vec![TablePrivilege::Update, TablePrivilege::Delete],
+            })
+        );
+        assert!(matches!(
+            parse_command("GRANT SELECT (id) ON people TO PUBLIC"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command("GRANT SELECT ON TABLE private.people TO PUBLIC"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command("GRANT SELECT ON people TO missing_role"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command("GRANT SELECT ON people TO PUBLIC WITH GRANT OPTION"),
             Err(ParseError::InvalidRelationalSql)
         ));
 

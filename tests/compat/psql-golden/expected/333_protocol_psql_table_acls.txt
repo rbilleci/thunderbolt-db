@@ -1,0 +1,44 @@
+=== bounded table ACL metadata ===
+CREATE TABLE
+CREATE VIEW
+CREATE SEQUENCE
+GRANT
+                               Access privileges
+ Schema |    Name    | Type  | Access privileges | Column privileges | Policies
+--------+------------+-------+-------------------+-------------------+----------
+ public | acl_people | table | =ar/postgres      |                   |
+(1 row)
+
+GRANT
+                                  Access privileges
+ Schema |    Name    | Type  |   Access privileges    | Column privileges | Policies
+--------+------------+-------+------------------------+-------------------+----------
+ public | acl_people | table | postgres=arwd/postgres+|                   |
+        |            |       | =ar/postgres           |                   |
+(1 row)
+
+REVOKE
+                                  Access privileges
+ Schema |    Name    | Type  |   Access privileges    | Column privileges | Policies
+--------+------------+-------+------------------------+-------------------+----------
+ public | acl_people | table | postgres=arwd/postgres+|                   |
+        |            |       | =r/postgres            |                   |
+(1 row)
+
+REVOKE
+                               Access privileges
+ Schema |    Name    | Type  | Access privileges | Column privileges | Policies
+--------+------------+-------+-------------------+-------------------+----------
+ public | acl_people | table | =r/postgres       |                   |
+(1 row)
+
+psql:333_protocol_psql_table_acls.sql:13: ERROR:  relation does not exist
+psql:333_protocol_psql_table_acls.sql:14: ERROR:  relation is not a table
+psql:333_protocol_psql_table_acls.sql:15: ERROR:  relation is not a table
+psql:333_protocol_psql_table_acls.sql:16: ERROR:  query shape is not supported by the compatibility stub
+psql:333_protocol_psql_table_acls.sql:17: ERROR:  query shape is not supported by the compatibility stub
+psql:333_protocol_psql_table_acls.sql:18: ERROR:  query shape is not supported by the compatibility stub
+psql:333_protocol_psql_table_acls.sql:19: ERROR:  query shape is not supported by the compatibility stub
+ name
+------
+(0 rows)

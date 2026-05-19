@@ -84,6 +84,8 @@ impl Planner {
             | Command::DropMaterializedView(_)
             | Command::DropView(_)
             | Command::DropSequence(_)
+            | Command::GrantTable(_)
+            | Command::RevokeTable(_)
             | Command::AlterColumnDefault(_)
             | Command::CommentOn(_)
             | Command::Insert(_)
