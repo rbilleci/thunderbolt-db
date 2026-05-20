@@ -1,8 +1,8 @@
 # Compatibility Scorecard
 
 ## Totals
-- total: 1185
-- passed: 1185
+- total: 1187
+- passed: 1187
 - failed: 0
 - ignored: 0
 
@@ -20,7 +20,7 @@
 - sql.relational_foundation: total=308 passed=308 failed=0 ignored=0
 - sql.transaction_flows: total=99 passed=99 failed=0 ignored=0
 - storage.indexing: total=48 passed=48 failed=0 ignored=0
-- uncategorized: total=181 passed=181 failed=0 ignored=0
+- uncategorized: total=183 passed=183 failed=0 ignored=0
 
 ## Top failing categories
 - none

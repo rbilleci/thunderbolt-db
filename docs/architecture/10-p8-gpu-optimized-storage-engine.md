@@ -415,9 +415,21 @@ route. The checked `resident_warmup_preflight` example and
 `scripts/run_p8_resident_warmup_preflight_smoke.sh` package that API as a local
 operator dry-run/apply gate, including invalidated-entry refresh,
 memory-pressure skip, oversized-budget rejection, and default-route readiness
-checks. This is bounded warmup/policy support, not a production background cache
-daemon: durable GPU pages, autonomous scheduling, external orchestration, and
-broader retained expressions remain outside the first P8 design.
+checks.
+
+The sixth P8 code slice adds `Engine::maintain_relational_residency_with_policy(...)`
+as a scheduler-friendly maintenance tick over the same bounded cache manager.
+It selects named tables or all current supported public base tables, refreshes
+invalidated entries by default, respects optional per-GPU budgets, and returns a
+single summary with warmed, refreshed, already-resident, skipped, error,
+route-ready, and route-blocked counts plus blocker reasons. The checked
+`resident_maintenance_tick` example and
+`scripts/run_p8_resident_maintenance_smoke.sh` prove the tick for basic,
+invalidated, memory-pressure, and oversized-budget cases while preserving the
+default resident execution contract for accepted routes. This is bounded local
+maintenance orchestration, not a production background cache daemon: durable GPU
+pages, autonomous scheduling, external orchestration, and broader retained
+expressions remain outside the first P8 design.
 
 ## Non-Goals For The First P8 Design
 

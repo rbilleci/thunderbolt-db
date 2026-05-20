@@ -6578,6 +6578,51 @@ pub enum RelationalResidencyWarmupAction {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationalResidencyMaintenancePolicy {
+    pub gpu_id: Option<u16>,
+    pub tables: Vec<String>,
+    pub max_table_count: Option<usize>,
+    pub budget_bytes: Option<u64>,
+    pub refresh_invalidated: bool,
+}
+
+impl Default for RelationalResidencyMaintenancePolicy {
+    fn default() -> Self {
+        Self {
+            gpu_id: None,
+            tables: Vec::new(),
+            max_table_count: None,
+            budget_bytes: None,
+            refresh_invalidated: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationalResidencyMaintenanceReport {
+    pub gpu_id: u16,
+    pub budget_bytes: Option<u64>,
+    pub requested_tables: Vec<String>,
+    pub entry_count: usize,
+    pub warmed_count: usize,
+    pub refreshed_count: usize,
+    pub already_resident_count: usize,
+    pub skipped_count: usize,
+    pub error_count: usize,
+    pub route_ready_count: usize,
+    pub route_blocked_count: usize,
+    pub route_ready_tables: Vec<String>,
+    pub route_blockers: Vec<RelationalResidencyMaintenanceBlocker>,
+    pub entries: Vec<RelationalResidencyWarmupEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationalResidencyMaintenanceBlocker {
+    pub table: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RelationalAccessPath {
     FullTableScan,
     EqualityIndex {
@@ -17840,6 +17885,74 @@ impl Engine {
         }
     }
 
+    pub fn maintain_relational_residency_with_policy(
+        &mut self,
+        policy: RelationalResidencyMaintenancePolicy,
+    ) -> RelationalResidencyMaintenanceReport {
+        let warmup = self.warm_relational_residency_with_policy(RelationalResidencyWarmupPolicy {
+            gpu_id: policy.gpu_id,
+            tables: policy.tables,
+            max_table_count: policy.max_table_count,
+            budget_bytes: policy.budget_bytes,
+            refresh_invalidated: policy.refresh_invalidated,
+        });
+        let mut warmed_count = 0;
+        let mut refreshed_count = 0;
+        let mut already_resident_count = 0;
+        let mut skipped_count = 0;
+        let mut error_count = 0;
+        let mut route_ready_tables = Vec::new();
+        let mut route_blockers = Vec::new();
+
+        for entry in &warmup.entries {
+            match entry.action {
+                RelationalResidencyWarmupAction::Warmed => warmed_count += 1,
+                RelationalResidencyWarmupAction::Refreshed => refreshed_count += 1,
+                RelationalResidencyWarmupAction::AlreadyResident => already_resident_count += 1,
+                RelationalResidencyWarmupAction::Skipped => skipped_count += 1,
+                RelationalResidencyWarmupAction::Error => error_count += 1,
+            }
+
+            match entry.route_decision.as_ref() {
+                Some(route) if route.accepted => route_ready_tables.push(entry.table.clone()),
+                Some(route) => route_blockers.push(RelationalResidencyMaintenanceBlocker {
+                    table: entry.table.clone(),
+                    reason: if matches!(
+                        entry.action,
+                        RelationalResidencyWarmupAction::Skipped
+                            | RelationalResidencyWarmupAction::Error
+                    ) {
+                        entry.reason.clone()
+                    } else {
+                        route.reason.clone()
+                    },
+                }),
+                None => route_blockers.push(RelationalResidencyMaintenanceBlocker {
+                    table: entry.table.clone(),
+                    reason: entry.reason.clone(),
+                }),
+            }
+        }
+
+        let entry_count = warmup.entries.len();
+        RelationalResidencyMaintenanceReport {
+            gpu_id: warmup.gpu_id,
+            budget_bytes: warmup.budget_bytes,
+            requested_tables: warmup.requested_tables,
+            entry_count,
+            warmed_count,
+            refreshed_count,
+            already_resident_count,
+            skipped_count,
+            error_count,
+            route_ready_count: route_ready_tables.len(),
+            route_blocked_count: route_blockers.len(),
+            route_ready_tables,
+            route_blockers,
+            entries: warmup.entries,
+        }
+    }
+
     fn warmup_route_readiness_decision(
         &mut self,
         table: &str,
@@ -23352,6 +23465,129 @@ mod tests {
             RelationalResidencyWarmupAction::Skipped
         );
         assert_eq!(pressured.entries[0].reason, "GPU 0 is memory pressured");
+    }
+
+    #[test]
+    fn p8_resident_maintenance_tick_summarizes_refresh_and_route_readiness() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE events (id INT, label TEXT)")
+            .unwrap();
+        e.execute_text(2, "CREATE TABLE aux (id INT, label TEXT)")
+            .unwrap();
+        e.execute_text(
+            3,
+            "INSERT INTO events (id, label) VALUES (1, 'alpha'), (2, 'beta')",
+        )
+        .unwrap();
+        e.execute_text(4, "INSERT INTO aux (id, label) VALUES (1, 'aux')")
+            .unwrap();
+
+        e.warm_relational_residency_with_policy(RelationalResidencyWarmupPolicy {
+            tables: vec!["events".to_string()],
+            refresh_invalidated: true,
+            ..RelationalResidencyWarmupPolicy::default()
+        });
+        e.execute_text(5, "INSERT INTO events (id, label) VALUES (3, 'gamma')")
+            .unwrap();
+        assert_eq!(
+            e.relational_residency_snapshot("events")
+                .unwrap()
+                .invalidated_by_txn_id,
+            Some(5)
+        );
+
+        let report = e.maintain_relational_residency_with_policy(
+            RelationalResidencyMaintenancePolicy::default(),
+        );
+        assert_eq!(report.gpu_id, 0);
+        assert_eq!(report.entry_count, 2);
+        assert_eq!(report.refreshed_count, 1);
+        assert_eq!(report.warmed_count, 1);
+        assert_eq!(report.skipped_count, 0);
+        assert_eq!(report.error_count, 0);
+        assert_eq!(
+            report.route_ready_count + report.route_blocked_count,
+            report.entry_count
+        );
+        assert_eq!(
+            e.relational_residency_snapshot("events")
+                .unwrap()
+                .invalidated_by_txn_id,
+            None
+        );
+        assert!(e.relational_residency_snapshot("aux").is_some());
+
+        let Command::Select(select) = parse_command("SELECT COUNT(*) FROM events").unwrap() else {
+            unreachable!()
+        };
+        let route = e.plan_relational_resident_route(&select);
+        if route.accepted {
+            let result = e.execute_relational_select(&select).unwrap();
+            assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+            assert_eq!(result.fallback_reason, None);
+            assert_eq!(result.rows, vec![vec![SqlValue::Int4(3)]]);
+            assert!(report
+                .route_ready_tables
+                .iter()
+                .any(|table| table == "events"));
+        } else {
+            assert!(report
+                .route_blockers
+                .iter()
+                .any(|blocker| blocker.table == "events" && blocker.reason == route.reason));
+        }
+    }
+
+    #[test]
+    fn p8_resident_maintenance_tick_reports_pressure_and_budget_blockers() {
+        let mut pressured = Engine::new_local();
+        pressured
+            .execute_text(1, "CREATE TABLE events (id INT, label TEXT)")
+            .unwrap();
+        pressured
+            .execute_text(2, "INSERT INTO events (id, label) VALUES (1, 'alpha')")
+            .unwrap();
+        pressured.mark_gpu_memory_pressured(0);
+        let pressure_report = pressured.maintain_relational_residency_with_policy(
+            RelationalResidencyMaintenancePolicy::default(),
+        );
+        assert_eq!(pressure_report.entry_count, 1);
+        assert_eq!(pressure_report.skipped_count, 1);
+        assert_eq!(pressure_report.route_ready_count, 0);
+        assert_eq!(pressure_report.route_blocked_count, 1);
+        assert_eq!(pressure_report.route_blockers[0].table, "events");
+        assert_eq!(
+            pressure_report.route_blockers[0].reason,
+            "GPU 0 is memory pressured"
+        );
+        assert!(pressured.relational_residency_snapshot("events").is_none());
+
+        let mut oversized = Engine::new_local();
+        oversized
+            .execute_text(1, "CREATE TABLE oversized (id INT, label TEXT)")
+            .unwrap();
+        oversized
+            .execute_text(
+                2,
+                "INSERT INTO oversized (id, label) VALUES (1, 'this-row-is-too-large')",
+            )
+            .unwrap();
+        let budget_report = oversized.maintain_relational_residency_with_policy(
+            RelationalResidencyMaintenancePolicy {
+                budget_bytes: Some(1),
+                ..RelationalResidencyMaintenancePolicy::default()
+            },
+        );
+        assert_eq!(budget_report.entry_count, 1);
+        assert_eq!(budget_report.error_count, 1);
+        assert_eq!(budget_report.route_ready_count, 0);
+        assert_eq!(budget_report.route_blocked_count, 1);
+        assert!(budget_report.route_blockers[0]
+            .reason
+            .contains("exceeding GPU 0"));
+        assert!(oversized
+            .relational_residency_snapshot("oversized")
+            .is_none());
     }
 
     #[test]
