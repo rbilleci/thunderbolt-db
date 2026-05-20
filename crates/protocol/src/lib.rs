@@ -13,8 +13,10 @@ pub enum Command {
     DropSchema(DropSchema),
     CreateDatabase(CreateDatabase),
     DropDatabase(DropDatabase),
+    RenameDatabase(RenameDatabase),
     CreateTablespace(CreateTablespace),
     DropTablespace(DropTablespace),
+    RenameTablespace(RenameTablespace),
     CreateTable(CreateTable),
     AddPrimaryKey(AddPrimaryKey),
     AddUniqueConstraint(AddUniqueConstraint),
@@ -48,6 +50,7 @@ pub enum Command {
     DropSubscription(DropSubscription),
     CreateRole(CreateRole),
     DropRole(DropRole),
+    RenameRole(RenameRole),
     GrantTable(GrantTable),
     RevokeTable(RevokeTable),
     GrantSchema(SchemaPrivileges),
@@ -91,6 +94,12 @@ pub struct DropDatabase {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenameDatabase {
+    pub old_name: String,
+    pub new_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateTablespace {
     pub name: String,
     pub location: String,
@@ -100,6 +109,12 @@ pub struct CreateTablespace {
 pub struct DropTablespace {
     pub names: Vec<String>,
     pub if_exists: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenameTablespace {
+    pub old_name: String,
+    pub new_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -323,6 +338,12 @@ pub struct CreateRole {
 pub struct DropRole {
     pub names: Vec<String>,
     pub if_exists: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenameRole {
+    pub old_name: String,
+    pub new_name: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -2101,6 +2122,27 @@ fn parse_relational_command(input: &str) -> Option<Result<Command, ParseError>> 
         return Some(parse_alter_default_table_privileges(input));
     }
     if first.eq_ignore_ascii_case("ALTER") {
+        if input
+            .split_whitespace()
+            .nth(1)
+            .is_some_and(|second| second.eq_ignore_ascii_case("DATABASE"))
+        {
+            return Some(parse_rename_database(input).map(Command::RenameDatabase));
+        }
+        if input
+            .split_whitespace()
+            .nth(1)
+            .is_some_and(|second| second.eq_ignore_ascii_case("TABLESPACE"))
+        {
+            return Some(parse_rename_tablespace(input).map(Command::RenameTablespace));
+        }
+        if input
+            .split_whitespace()
+            .nth(1)
+            .is_some_and(|second| second.eq_ignore_ascii_case("ROLE"))
+        {
+            return Some(parse_rename_role(input).map(Command::RenameRole));
+        }
         if input
             .split_whitespace()
             .nth(1)
@@ -3976,6 +4018,31 @@ fn parse_drop_role(input: &str) -> Result<DropRole, ParseError> {
     })
 }
 
+fn parse_rename_role(input: &str) -> Result<RenameRole, ParseError> {
+    let rest = strip_keyword_prefix_case_insensitive(input, "ALTER")
+        .and_then(|s| strip_keyword_prefix_case_insensitive(s.trim_start(), "ROLE"))
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    let rename_pos =
+        find_keyword_outside_quotes(rest, "RENAME").ok_or(ParseError::InvalidRelationalSql)?;
+    let old_name = normalize_identifier(rest[..rename_pos].trim())?;
+    let after_rename = rest[rename_pos + "RENAME".len()..].trim_start();
+    let after_to = strip_keyword_prefix_case_insensitive(after_rename, "TO")
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim();
+    if after_to.is_empty()
+        || find_keyword_outside_quotes(after_to, "WITH").is_some()
+        || find_keyword_outside_quotes(after_to, "CASCADE").is_some()
+        || find_keyword_outside_quotes(after_to, "RESTRICT").is_some()
+    {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    Ok(RenameRole {
+        old_name,
+        new_name: normalize_identifier(after_to)?,
+    })
+}
+
 fn parse_create_database(input: &str) -> Result<CreateDatabase, ParseError> {
     let rest = strip_keyword_prefix_case_insensitive(input, "CREATE")
         .ok_or(ParseError::InvalidRelationalSql)?
@@ -4023,6 +4090,33 @@ fn parse_drop_database(input: &str) -> Result<DropDatabase, ParseError> {
             .map(|name| normalize_identifier(name.trim()))
             .collect::<Result<Vec<_>, _>>()?,
         if_exists,
+    })
+}
+
+fn parse_rename_database(input: &str) -> Result<RenameDatabase, ParseError> {
+    let rest = strip_keyword_prefix_case_insensitive(input, "ALTER")
+        .and_then(|s| strip_keyword_prefix_case_insensitive(s.trim_start(), "DATABASE"))
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    let rename_pos =
+        find_keyword_outside_quotes(rest, "RENAME").ok_or(ParseError::InvalidRelationalSql)?;
+    let old_name = normalize_identifier(rest[..rename_pos].trim())?;
+    let after_rename = rest[rename_pos + "RENAME".len()..].trim_start();
+    let after_to = strip_keyword_prefix_case_insensitive(after_rename, "TO")
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim();
+    if after_to.is_empty()
+        || find_keyword_outside_quotes(after_to, "WITH").is_some()
+        || find_keyword_outside_quotes(after_to, "OWNER").is_some()
+        || find_keyword_outside_quotes(after_to, "SET").is_some()
+        || find_keyword_outside_quotes(after_to, "CASCADE").is_some()
+        || find_keyword_outside_quotes(after_to, "RESTRICT").is_some()
+    {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    Ok(RenameDatabase {
+        old_name,
+        new_name: normalize_identifier(after_to)?,
     })
 }
 
@@ -4075,6 +4169,33 @@ fn parse_drop_tablespace(input: &str) -> Result<DropTablespace, ParseError> {
             .map(|name| normalize_identifier(name.trim()))
             .collect::<Result<Vec<_>, _>>()?,
         if_exists,
+    })
+}
+
+fn parse_rename_tablespace(input: &str) -> Result<RenameTablespace, ParseError> {
+    let rest = strip_keyword_prefix_case_insensitive(input, "ALTER")
+        .and_then(|s| strip_keyword_prefix_case_insensitive(s.trim_start(), "TABLESPACE"))
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    let rename_pos =
+        find_keyword_outside_quotes(rest, "RENAME").ok_or(ParseError::InvalidRelationalSql)?;
+    let old_name = normalize_identifier(rest[..rename_pos].trim())?;
+    let after_rename = rest[rename_pos + "RENAME".len()..].trim_start();
+    let after_to = strip_keyword_prefix_case_insensitive(after_rename, "TO")
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim();
+    if after_to.is_empty()
+        || find_keyword_outside_quotes(after_to, "WITH").is_some()
+        || find_keyword_outside_quotes(after_to, "OWNER").is_some()
+        || find_keyword_outside_quotes(after_to, "SET").is_some()
+        || find_keyword_outside_quotes(after_to, "CASCADE").is_some()
+        || find_keyword_outside_quotes(after_to, "RESTRICT").is_some()
+    {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    Ok(RenameTablespace {
+        old_name,
+        new_name: normalize_identifier(after_to)?,
     })
 }
 
@@ -12685,6 +12806,13 @@ default: Some(ColumnDefault::SequenceNextVal {
             })
         );
         assert_eq!(
+            parse_command("ALTER ROLE app_reader RENAME TO app_analyst").unwrap(),
+            Command::RenameRole(RenameRole {
+                old_name: "app_reader".to_string(),
+                new_name: "app_analyst".to_string(),
+            })
+        );
+        assert_eq!(
             parse_command("DROP USER app_batch").unwrap(),
             Command::DropRole(DropRole {
                 names: vec!["app_batch".to_string()],
@@ -12711,6 +12839,13 @@ default: Some(ColumnDefault::SequenceNextVal {
             })
         );
         assert_eq!(
+            parse_command("ALTER DATABASE appdb RENAME TO appdb_archive").unwrap(),
+            Command::RenameDatabase(RenameDatabase {
+                old_name: "appdb".to_string(),
+                new_name: "appdb_archive".to_string(),
+            })
+        );
+        assert_eq!(
             parse_command("CREATE TABLESPACE appspace LOCATION '/tmp/gpu-db-appspace'").unwrap(),
             Command::CreateTablespace(CreateTablespace {
                 name: "appspace".to_string(),
@@ -12731,12 +12866,27 @@ default: Some(ColumnDefault::SequenceNextVal {
                 if_exists: true,
             })
         );
+        assert_eq!(
+            parse_command("ALTER TABLESPACE appspace RENAME TO appspace_fast").unwrap(),
+            Command::RenameTablespace(RenameTablespace {
+                old_name: "appspace".to_string(),
+                new_name: "appspace_fast".to_string(),
+            })
+        );
         assert!(matches!(
             parse_command("CREATE DATABASE appdb OWNER postgres"),
             Err(ParseError::InvalidRelationalSql)
         ));
         assert!(matches!(
             parse_command("DROP DATABASE appdb WITH (FORCE)"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command("ALTER DATABASE appdb OWNER TO postgres"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command("ALTER DATABASE appdb RENAME TO appdb_archive SET TABLESPACE pg_default"),
             Err(ParseError::InvalidRelationalSql)
         ));
         assert!(matches!(
@@ -12752,11 +12902,23 @@ default: Some(ColumnDefault::SequenceNextVal {
             Err(ParseError::InvalidRelationalSql)
         ));
         assert!(matches!(
+            parse_command("ALTER TABLESPACE appspace OWNER TO postgres"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command("ALTER TABLESPACE appspace RENAME TO public.appspace"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
             parse_command("CREATE ROLE app_reader PASSWORD 'secret'"),
             Err(ParseError::InvalidRelationalSql)
         ));
         assert!(matches!(
             parse_command("CREATE ROLE app_reader LOGIN NOLOGIN"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command("ALTER ROLE app_reader RENAME TO app_analyst WITH LOGIN"),
             Err(ParseError::InvalidRelationalSql)
         ));
         assert!(matches!(

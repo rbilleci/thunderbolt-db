@@ -1,0 +1,143 @@
+Pager usage is off.
+=== shared object renames ===
+CREATE ROLE
+COMMENT
+CREATE TABLE
+GRANT
+GRANT
+ALTER DEFAULT PRIVILEGES
+ALTER ROLE
+                              List of roles
+  Role name  |                         Attributes
+-------------+------------------------------------------------------------
+ postgres    | Superuser, Create role, Create DB, Replication, Bypass RLS
+ app_analyst |
+
+                                      List of roles
+  Role name  |                         Attributes                         |  Description
+-------------+------------------------------------------------------------+---------------
+ postgres    | Superuser, Create role, Create DB, Replication, Bypass RLS |
+ app_analyst |                                                            | read-only app
+
+  oid  |   rolname
+-------+-------------
+    10 | postgres
+ 16384 | app_analyst
+(2 rows)
+
+                                       Access privileges
+ Schema |         Name         | Type  |   Access privileges    | Column privileges | Policies
+--------+----------------------+-------+------------------------+-------------------+----------
+ public | shared_rename_people | table | app_analyst=r/postgres |                   |
+(1 row)
+
+                     List of schemas
+  Name  |  Owner   |   Access privileges    | Description
+--------+----------+------------------------+-------------
+ public | postgres | app_analyst=U/postgres |
+(1 row)
+
+             Default access privileges
+  Owner   | Schema | Type  |   Access privileges
+----------+--------+-------+------------------------
+ postgres | public | table | app_analyst=r/postgres
+(1 row)
+
+CREATE DATABASE
+COMMENT
+  oid  | datname
+-------+----------
+ 16386 | appdb
+     5 | postgres
+(2 rows)
+
+ALTER DATABASE
+                                                   List of databases
+     Name      |  Owner   | Encoding | Locale Provider | Collate |  Ctype  | ICU Locale | ICU Rules | Access privileges
+---------------+----------+----------+-----------------+---------+---------+------------+-----------+-------------------
+ appdb_archive | postgres | UTF8     | libc            | C.UTF-8 | C.UTF-8 |            |           |
+ postgres      | postgres | UTF8     | libc            | C.UTF-8 | C.UTF-8 |            |           |
+(2 rows)
+
+                                                                          List of databases
+     Name      |  Owner   | Encoding | Locale Provider | Collate |  Ctype  | ICU Locale | ICU Rules | Access privileges |  Size   | Tablespace |     Description
+---------------+----------+----------+-----------------+---------+---------+------------+-----------+-------------------+---------+------------+----------------------
+ appdb_archive | postgres | UTF8     | libc            | C.UTF-8 | C.UTF-8 |            |           |                   | 0 bytes | pg_default | application database
+ postgres      | postgres | UTF8     | libc            | C.UTF-8 | C.UTF-8 |            |           |                   | 0 bytes | pg_default |
+(2 rows)
+
+  oid  |    datname
+-------+---------------
+ 16386 | appdb_archive
+     5 | postgres
+(2 rows)
+
+CREATE TABLESPACE
+COMMENT
+  oid  |  spcname   |       location
+-------+------------+----------------------
+ 16387 | appspace   | /tmp/gpu-db-appspace
+  1663 | pg_default |
+  1664 | pg_global  |
+(3 rows)
+
+ALTER TABLESPACE
+               List of tablespaces
+     Name      |  Owner   |       Location
+---------------+----------+----------------------
+ appspace_fast | postgres | /tmp/gpu-db-appspace
+ pg_default    | postgres |
+ pg_global     | postgres |
+(3 rows)
+
+                                              List of tablespaces
+     Name      |  Owner   |       Location       | Access privileges | Options |  Size   |     Description
+---------------+----------+----------------------+-------------------+---------+---------+---------------------
+ appspace_fast | postgres | /tmp/gpu-db-appspace |                   |         | 0 bytes | application storage
+ pg_default    | postgres |                      |                   |         | 0 bytes |
+ pg_global     | postgres |                      |                   |         | 0 bytes |
+(3 rows)
+
+  oid  |    spcname    |       location
+-------+---------------+----------------------
+ 16387 | appspace_fast | /tmp/gpu-db-appspace
+  1663 | pg_default    |
+  1664 | pg_global     |
+(3 rows)
+
+psql:346_protocol_psql_shared_object_renames.sql:30: ERROR:  cannot rename bootstrap role
+psql:346_protocol_psql_shared_object_renames.sql:31: ERROR:  role does not exist
+CREATE ROLE
+psql:346_protocol_psql_shared_object_renames.sql:33: ERROR:  role already exists
+psql:346_protocol_psql_shared_object_renames.sql:34: ERROR:  cannot rename bootstrap database
+psql:346_protocol_psql_shared_object_renames.sql:35: ERROR:  database does not exist
+CREATE DATABASE
+psql:346_protocol_psql_shared_object_renames.sql:37: ERROR:  database already exists
+psql:346_protocol_psql_shared_object_renames.sql:38: ERROR:  cannot rename bootstrap tablespace
+psql:346_protocol_psql_shared_object_renames.sql:39: ERROR:  tablespace does not exist
+CREATE TABLESPACE
+psql:346_protocol_psql_shared_object_renames.sql:41: ERROR:  tablespace already exists
+REVOKE
+REVOKE
+ALTER DEFAULT PRIVILEGES
+COMMENT
+DROP ROLE
+DROP DATABASE
+DROP TABLESPACE
+                             List of roles
+ Role name |                         Attributes
+-----------+------------------------------------------------------------
+ postgres  | Superuser, Create role, Create DB, Replication, Bypass RLS
+
+                                                 List of databases
+   Name   |  Owner   | Encoding | Locale Provider | Collate |  Ctype  | ICU Locale | ICU Rules | Access privileges
+----------+----------+----------+-----------------+---------+---------+------------+-----------+-------------------
+ postgres | postgres | UTF8     | libc            | C.UTF-8 | C.UTF-8 |            |           |
+(1 row)
+
+       List of tablespaces
+    Name    |  Owner   | Location
+------------+----------+----------
+ pg_default | postgres |
+ pg_global  | postgres |
+(2 rows)

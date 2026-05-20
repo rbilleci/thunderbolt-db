@@ -8373,6 +8373,59 @@ fn execute_statement(
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, "DROP DATABASE");
             }
+            Command::RenameDatabase(rename) => {
+                if rename.old_name == "postgres" {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "0A000",
+                            message: "cannot rename bootstrap database",
+                            position: None,
+                        },
+                    );
+                }
+                if !session.databases.contains_key(&rename.old_name) {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "3D000",
+                            message: "database does not exist",
+                            position: None,
+                        },
+                    );
+                }
+                if database_exists(session, &rename.new_name) {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "42P04",
+                            message: "database already exists",
+                            position: None,
+                        },
+                    );
+                }
+                let mut database = session
+                    .databases
+                    .remove(&rename.old_name)
+                    .expect("database existence validated");
+                database.name = rename.new_name.clone();
+                session.databases.insert(rename.new_name.clone(), database);
+                session.mark_database_dirty(rename.old_name.clone());
+                session.mark_database_dirty(rename.new_name.clone());
+                let old_target = CatalogCommentTarget::Database {
+                    database: rename.old_name,
+                };
+                if let Some(comment) = session.comments.remove(&old_target) {
+                    session.mark_comment_dirty(old_target);
+                    let new_target = CatalogCommentTarget::Database {
+                        database: rename.new_name,
+                    };
+                    session.comments.insert(new_target.clone(), comment);
+                    session.mark_comment_dirty(new_target);
+                }
+                session.persist_catalog_snapshot();
+                return write_command_complete(stream, "ALTER DATABASE");
+            }
             Command::CreateTablespace(create) => {
                 if tablespace_exists(session, &create.name) {
                     return write_error(
@@ -8454,6 +8507,61 @@ fn execute_statement(
                 }
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, "DROP TABLESPACE");
+            }
+            Command::RenameTablespace(rename) => {
+                if matches!(rename.old_name.as_str(), "pg_default" | "pg_global") {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "0A000",
+                            message: "cannot rename bootstrap tablespace",
+                            position: None,
+                        },
+                    );
+                }
+                if !session.tablespaces.contains_key(&rename.old_name) {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "42704",
+                            message: "tablespace does not exist",
+                            position: None,
+                        },
+                    );
+                }
+                if tablespace_exists(session, &rename.new_name) {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "42710",
+                            message: "tablespace already exists",
+                            position: None,
+                        },
+                    );
+                }
+                let mut tablespace = session
+                    .tablespaces
+                    .remove(&rename.old_name)
+                    .expect("tablespace existence validated");
+                tablespace.name = rename.new_name.clone();
+                session
+                    .tablespaces
+                    .insert(rename.new_name.clone(), tablespace);
+                session.mark_tablespace_dirty(rename.old_name.clone());
+                session.mark_tablespace_dirty(rename.new_name.clone());
+                let old_target = CatalogCommentTarget::Tablespace {
+                    tablespace: rename.old_name,
+                };
+                if let Some(comment) = session.comments.remove(&old_target) {
+                    session.mark_comment_dirty(old_target);
+                    let new_target = CatalogCommentTarget::Tablespace {
+                        tablespace: rename.new_name,
+                    };
+                    session.comments.insert(new_target.clone(), comment);
+                    session.mark_comment_dirty(new_target);
+                }
+                session.persist_catalog_snapshot();
+                return write_command_complete(stream, "ALTER TABLESPACE");
             }
             Command::CreateTable(create) => {
                 if !session.public_schema_exists {
@@ -9682,6 +9790,79 @@ fn execute_statement(
                 }
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, "DROP ROLE");
+            }
+            Command::RenameRole(rename) => {
+                if rename.old_name == "postgres" {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "0A000",
+                            message: "cannot rename bootstrap role",
+                            position: None,
+                        },
+                    );
+                }
+                if !session.roles.contains_key(&rename.old_name) {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "42704",
+                            message: "role does not exist",
+                            position: None,
+                        },
+                    );
+                }
+                if role_exists(session, &rename.new_name) {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "42710",
+                            message: "role already exists",
+                            position: None,
+                        },
+                    );
+                }
+                let mut role = session
+                    .roles
+                    .remove(&rename.old_name)
+                    .expect("role existence validated");
+                role.name = rename.new_name.clone();
+                session.roles.insert(rename.new_name.clone(), role);
+                session.mark_role_dirty(rename.old_name.clone());
+                session.mark_role_dirty(rename.new_name.clone());
+                let old_target = CatalogCommentTarget::Role {
+                    role: rename.old_name.clone(),
+                };
+                if let Some(comment) = session.comments.remove(&old_target) {
+                    session.mark_comment_dirty(old_target);
+                    let new_target = CatalogCommentTarget::Role {
+                        role: rename.new_name.clone(),
+                    };
+                    session.comments.insert(new_target.clone(), comment);
+                    session.mark_comment_dirty(new_target);
+                }
+                for acl in session.table_acls.values_mut() {
+                    if let Some(privileges) = acl.remove(&rename.old_name) {
+                        acl.insert(rename.new_name.clone(), privileges);
+                    }
+                }
+                for table in session.table_acls.keys().cloned().collect::<Vec<_>>() {
+                    session.mark_table_acl_dirty(table);
+                }
+                if let Some(privileges) = session.schema_acl.remove(&rename.old_name) {
+                    session
+                        .schema_acl
+                        .insert(rename.new_name.clone(), privileges);
+                    session.mark_schema_acl_dirty();
+                }
+                if let Some(privileges) = session.default_table_acl.remove(&rename.old_name) {
+                    session
+                        .default_table_acl
+                        .insert(rename.new_name.clone(), privileges);
+                    session.mark_default_table_acl_dirty();
+                }
+                session.persist_catalog_snapshot();
+                return write_command_complete(stream, "ALTER ROLE");
             }
             Command::DropTable(drop) => {
                 let mut seen = BTreeSet::new();

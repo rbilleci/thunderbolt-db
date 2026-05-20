@@ -32,9 +32,9 @@ def classify(test_id: str) -> list[str]:
             buckets.append("protocol.extended_query")
         if re.search(r"transaction|begin|commit|rollback", test_id):
             buckets.append("sql.transaction_flows")
-        if re.search(r"relational|create_table|insert|select|delete|update|unique|primary|constraint|foreign_key|foreign_keys|index|view|sequence|publication|subscription|role|roles|database|databases|tablespace|tablespaces|grant|revoke|acl|privilege|column_defaults|column_default|add_columns|add_column|rename_tables|rename_table|rename_columns|rename_column|drop_tables|drop_table|drop_columns|drop_column|comments|comment", test_id):
+        if re.search(r"relational|create_table|insert|select|delete|update|unique|primary|constraint|foreign_key|foreign_keys|index|view|sequence|publication|subscription|role|roles|database|databases|tablespace|tablespaces|shared_object|grant|revoke|acl|privilege|column_defaults|column_default|add_columns|add_column|rename|renames|drop_tables|drop_table|drop_columns|drop_column|comments|comment", test_id):
             buckets.append("sql.relational_foundation")
-        if re.search(r"catalog|pg_catalog|introspection|schema|type|unique|primary|constraint|foreign_key|foreign_keys|key_column|index|view|sequence|publication|subscription|role|roles|database|databases|tablespace|tablespaces|grant|revoke|acl|privilege|column_defaults|column_default|add_columns|add_column|rename_tables|rename_table|rename_columns|rename_column|drop_tables|drop_table|drop_columns|drop_column|attrdef|comments|comment|description", test_id):
+        if re.search(r"catalog|pg_catalog|introspection|schema|type|unique|primary|constraint|foreign_key|foreign_keys|key_column|index|view|sequence|publication|subscription|role|roles|database|databases|tablespace|tablespaces|shared_object|grant|revoke|acl|privilege|column_defaults|column_default|add_columns|add_column|rename|renames|drop_tables|drop_table|drop_columns|drop_column|attrdef|comments|comment|description", test_id):
             buckets.append("sql.catalog_schema_types")
     if "gpu_db_protocol::" in test_id:
         if re.search(r"startup|frontend|ssl|cancel|session_lifecycle", test_id):

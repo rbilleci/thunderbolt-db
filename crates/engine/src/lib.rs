@@ -26,9 +26,10 @@ use gpu_db_protocol::{
     Delete, DropConstraint, DropDatabase, DropDomain, DropIndex, DropMaterializedView,
     DropPublication, DropRole, DropSchema, DropSequence, DropSubscription, DropTable,
     DropTablespace, DropView, Insert, ParseError, PublicationTarget, RefreshMaterializedView,
-    RenameColumn, RenameConstraint, RenameIndex, RenameMaterializedView, RenameSequence,
-    RenameTable, RenameView, SchemaPrivilege, Select, SelectFilterOp, SelectProjection,
-    SequenceNextVal, SequenceSetVal, SqlType, SqlValue, TablePrivilege, TruncateTable, Update,
+    RenameColumn, RenameConstraint, RenameDatabase, RenameIndex, RenameMaterializedView,
+    RenameRole, RenameSequence, RenameTable, RenameTablespace, RenameView, SchemaPrivilege, Select,
+    SelectFilterOp, SelectProjection, SequenceNextVal, SequenceSetVal, SqlType, SqlValue,
+    TablePrivilege, TruncateTable, Update,
 };
 use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine};
 use gpu_db_storage::{
@@ -82,8 +83,10 @@ impl ReplicatedStateMachine for KvStateMachine {
                     | Command::DropSchema(_)
                     | Command::CreateDatabase(_)
                     | Command::DropDatabase(_)
+                    | Command::RenameDatabase(_)
                     | Command::CreateTablespace(_)
                     | Command::DropTablespace(_)
+                    | Command::RenameTablespace(_)
                     | Command::CreateTable(_)
                     | Command::AddPrimaryKey(_)
                     | Command::AddUniqueConstraint(_)
@@ -115,6 +118,7 @@ impl ReplicatedStateMachine for KvStateMachine {
                     | Command::DropSubscription(_)
                     | Command::CreateRole(_)
                     | Command::DropRole(_)
+                    | Command::RenameRole(_)
                     | Command::DropTable(_)
                     | Command::TruncateTable(_)
                     | Command::DropIndex(_)
@@ -7742,8 +7746,10 @@ impl Engine {
             Command::DropSchema(drop) => self.apply_drop_schema(drop)?,
             Command::CreateDatabase(create) => self.apply_create_database(create)?,
             Command::DropDatabase(drop) => self.apply_drop_database(drop)?,
+            Command::RenameDatabase(rename) => self.apply_rename_database(rename)?,
             Command::CreateTablespace(create) => self.apply_create_tablespace(create)?,
             Command::DropTablespace(drop) => self.apply_drop_tablespace(drop)?,
+            Command::RenameTablespace(rename) => self.apply_rename_tablespace(rename)?,
             Command::CreateTable(create) => self.apply_create_table(create)?,
             Command::AddPrimaryKey(add) => self.apply_add_primary_key(add)?,
             Command::AddUniqueConstraint(add) => self.apply_add_unique_constraint(add)?,
@@ -7790,6 +7796,7 @@ impl Engine {
             Command::DropSubscription(drop) => self.apply_drop_subscription(drop)?,
             Command::CreateRole(create) => self.apply_create_role(create)?,
             Command::DropRole(drop) => self.apply_drop_role(drop)?,
+            Command::RenameRole(rename) => self.apply_rename_role(rename)?,
             Command::GrantTable(grant) => self.apply_grant_acl(
                 &grant.relation,
                 grant.kind,
@@ -8343,6 +8350,43 @@ impl Engine {
         Ok(())
     }
 
+    fn apply_rename_database(&mut self, rename: RenameDatabase) -> Result<(), EngineError> {
+        if rename.old_name == "postgres" {
+            return Err(EngineError::ApplyFailed(
+                "cannot rename bootstrap database \"postgres\"".to_string(),
+            ));
+        }
+        if !self.relational_databases.contains_key(&rename.old_name) {
+            return Err(EngineError::ApplyFailed(format!(
+                "database \"{}\" does not exist",
+                rename.old_name
+            )));
+        }
+        if self.database_exists(&rename.new_name) {
+            return Err(EngineError::ApplyFailed(format!(
+                "database \"{}\" already exists",
+                rename.new_name
+            )));
+        }
+        let mut database = self
+            .relational_databases
+            .remove(&rename.old_name)
+            .expect("database existence checked");
+        database.name = rename.new_name.clone();
+        self.relational_databases
+            .insert(rename.new_name.clone(), database);
+        let old_target = RelationalCommentTarget::Database {
+            database: rename.old_name,
+        };
+        if let Some(comment) = self.relational_comments.remove(&old_target) {
+            let new_target = RelationalCommentTarget::Database {
+                database: rename.new_name,
+            };
+            self.relational_comments.insert(new_target, comment);
+        }
+        Ok(())
+    }
+
     fn apply_create_tablespace(&mut self, create: CreateTablespace) -> Result<(), EngineError> {
         if self.tablespace_exists(&create.name) {
             return Err(EngineError::ApplyFailed(format!(
@@ -8393,6 +8437,44 @@ impl Engine {
                 .remove(&RelationalCommentTarget::Tablespace {
                     tablespace: tablespace.clone(),
                 });
+        }
+        Ok(())
+    }
+
+    fn apply_rename_tablespace(&mut self, rename: RenameTablespace) -> Result<(), EngineError> {
+        if matches!(rename.old_name.as_str(), "pg_default" | "pg_global") {
+            return Err(EngineError::ApplyFailed(format!(
+                "cannot rename bootstrap tablespace \"{}\"",
+                rename.old_name
+            )));
+        }
+        if !self.relational_tablespaces.contains_key(&rename.old_name) {
+            return Err(EngineError::ApplyFailed(format!(
+                "tablespace \"{}\" does not exist",
+                rename.old_name
+            )));
+        }
+        if self.tablespace_exists(&rename.new_name) {
+            return Err(EngineError::ApplyFailed(format!(
+                "tablespace \"{}\" already exists",
+                rename.new_name
+            )));
+        }
+        let mut tablespace = self
+            .relational_tablespaces
+            .remove(&rename.old_name)
+            .expect("tablespace existence checked");
+        tablespace.name = rename.new_name.clone();
+        self.relational_tablespaces
+            .insert(rename.new_name.clone(), tablespace);
+        let old_target = RelationalCommentTarget::Tablespace {
+            tablespace: rename.old_name,
+        };
+        if let Some(comment) = self.relational_comments.remove(&old_target) {
+            let new_target = RelationalCommentTarget::Tablespace {
+                tablespace: rename.new_name,
+            };
+            self.relational_comments.insert(new_target, comment);
         }
         Ok(())
     }
@@ -9750,6 +9832,70 @@ impl Engine {
         }
         for role in drop.names {
             self.relational_roles.remove(&role);
+        }
+        Ok(())
+    }
+
+    fn apply_rename_role(&mut self, rename: RenameRole) -> Result<(), EngineError> {
+        if rename.old_name == "postgres" {
+            return Err(EngineError::ApplyFailed(
+                "cannot rename bootstrap role \"postgres\"".to_string(),
+            ));
+        }
+        if !self.relational_roles.contains_key(&rename.old_name) {
+            return Err(EngineError::ApplyFailed(format!(
+                "role \"{}\" does not exist",
+                rename.old_name
+            )));
+        }
+        if self.role_exists(&rename.new_name) {
+            return Err(EngineError::ApplyFailed(format!(
+                "role \"{}\" already exists",
+                rename.new_name
+            )));
+        }
+        let mut role = self
+            .relational_roles
+            .remove(&rename.old_name)
+            .expect("role existence checked");
+        role.name = rename.new_name.clone();
+        self.relational_roles.insert(rename.new_name.clone(), role);
+        let old_target = RelationalCommentTarget::Role {
+            role: rename.old_name.clone(),
+        };
+        if let Some(comment) = self.relational_comments.remove(&old_target) {
+            let new_target = RelationalCommentTarget::Role {
+                role: rename.new_name.clone(),
+            };
+            self.relational_comments.insert(new_target, comment);
+        }
+        for table in self.relational_catalog.values_mut() {
+            if let Some(privileges) = table.acl.remove(&rename.old_name) {
+                table.acl.insert(rename.new_name.clone(), privileges);
+            }
+        }
+        for view in self.relational_views.values_mut() {
+            if let Some(privileges) = view.acl.remove(&rename.old_name) {
+                view.acl.insert(rename.new_name.clone(), privileges);
+            }
+        }
+        for view in self.relational_materialized_views.values_mut() {
+            if let Some(privileges) = view.acl.remove(&rename.old_name) {
+                view.acl.insert(rename.new_name.clone(), privileges);
+            }
+        }
+        for sequence in self.relational_sequences.values_mut() {
+            if let Some(privileges) = sequence.acl.remove(&rename.old_name) {
+                sequence.acl.insert(rename.new_name.clone(), privileges);
+            }
+        }
+        if let Some(privileges) = self.relational_schema_acl.remove(&rename.old_name) {
+            self.relational_schema_acl
+                .insert(rename.new_name.clone(), privileges);
+        }
+        if let Some(privileges) = self.relational_default_table_acl.remove(&rename.old_name) {
+            self.relational_default_table_acl
+                .insert(rename.new_name, privileges);
         }
         Ok(())
     }
@@ -11395,6 +11541,25 @@ impl Engine {
                     }
                 }
             }
+            Command::RenameDatabase(rename) => {
+                if rename.old_name == "postgres" {
+                    return Err(EngineError::ApplyFailed(
+                        "cannot rename bootstrap database \"postgres\"".to_string(),
+                    ));
+                }
+                if !self.relational_databases.contains_key(&rename.old_name) {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "database \"{}\" does not exist",
+                        rename.old_name
+                    )));
+                }
+                if self.database_exists(&rename.new_name) {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "database \"{}\" already exists",
+                        rename.new_name
+                    )));
+                }
+            }
             Command::CreateTablespace(create) if self.tablespace_exists(&create.name) => {
                 return Err(EngineError::ApplyFailed(format!(
                     "tablespace \"{}\" already exists",
@@ -11423,6 +11588,26 @@ impl Engine {
                             tablespace
                         )));
                     }
+                }
+            }
+            Command::RenameTablespace(rename) => {
+                if matches!(rename.old_name.as_str(), "pg_default" | "pg_global") {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "cannot rename bootstrap tablespace \"{}\"",
+                        rename.old_name
+                    )));
+                }
+                if !self.relational_tablespaces.contains_key(&rename.old_name) {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "tablespace \"{}\" does not exist",
+                        rename.old_name
+                    )));
+                }
+                if self.tablespace_exists(&rename.new_name) {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "tablespace \"{}\" already exists",
+                        rename.new_name
+                    )));
                 }
             }
             Command::CreateTable(create) => {
@@ -12081,6 +12266,25 @@ impl Engine {
                     }
                 }
             }
+            Command::RenameRole(rename) => {
+                if rename.old_name == "postgres" {
+                    return Err(EngineError::ApplyFailed(
+                        "cannot rename bootstrap role \"postgres\"".to_string(),
+                    ));
+                }
+                if !self.relational_roles.contains_key(&rename.old_name) {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "role \"{}\" does not exist",
+                        rename.old_name
+                    )));
+                }
+                if self.role_exists(&rename.new_name) {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "role \"{}\" already exists",
+                        rename.new_name
+                    )));
+                }
+            }
             Command::GrantDefaultTablePrivileges(grant) => {
                 self.preflight_acl_grantee(&grant.grantee)?;
             }
@@ -12370,8 +12574,10 @@ impl Engine {
             | Command::DropSchema(_)
             | Command::CreateDatabase(_)
             | Command::DropDatabase(_)
+            | Command::RenameDatabase(_)
             | Command::CreateTablespace(_)
             | Command::DropTablespace(_)
+            | Command::RenameTablespace(_)
             | Command::CreateTable(_)
             | Command::AddPrimaryKey(_)
             | Command::AddUniqueConstraint(_)
@@ -12412,6 +12618,7 @@ impl Engine {
             | Command::DropSubscription(_)
             | Command::CreateRole(_)
             | Command::DropRole(_)
+            | Command::RenameRole(_)
             | Command::GrantDefaultTablePrivileges(_)
             | Command::RevokeDefaultTablePrivileges(_)
             | Command::AlterColumnDefault(_)
@@ -12609,8 +12816,10 @@ impl Engine {
             | Command::DropSchema(_)
             | Command::CreateDatabase(_)
             | Command::DropDatabase(_)
+            | Command::RenameDatabase(_)
             | Command::CreateTablespace(_)
             | Command::DropTablespace(_)
+            | Command::RenameTablespace(_)
             | Command::CreateTable(_)
             | Command::AddPrimaryKey(_)
             | Command::AddUniqueConstraint(_)
@@ -12651,6 +12860,7 @@ impl Engine {
             | Command::DropSubscription(_)
             | Command::CreateRole(_)
             | Command::DropRole(_)
+            | Command::RenameRole(_)
             | Command::GrantDefaultTablePrivileges(_)
             | Command::RevokeDefaultTablePrivileges(_)
             | Command::AlterColumnDefault(_)
@@ -12749,8 +12959,10 @@ impl Engine {
             Command::DropSchema(_) => Err(ExecuteError::NonReadCommand("DROP SCHEMA")),
             Command::CreateDatabase(_) => Err(ExecuteError::NonReadCommand("CREATE DATABASE")),
             Command::DropDatabase(_) => Err(ExecuteError::NonReadCommand("DROP DATABASE")),
+            Command::RenameDatabase(_) => Err(ExecuteError::NonReadCommand("ALTER DATABASE")),
             Command::CreateTablespace(_) => Err(ExecuteError::NonReadCommand("CREATE TABLESPACE")),
             Command::DropTablespace(_) => Err(ExecuteError::NonReadCommand("DROP TABLESPACE")),
+            Command::RenameTablespace(_) => Err(ExecuteError::NonReadCommand("ALTER TABLESPACE")),
             Command::CreateTable(_) => Err(ExecuteError::NonReadCommand("CREATE TABLE")),
             Command::AddPrimaryKey(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
             Command::AddUniqueConstraint(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
@@ -12804,6 +13016,7 @@ impl Engine {
             Command::DropSubscription(_) => Err(ExecuteError::NonReadCommand("DROP SUBSCRIPTION")),
             Command::CreateRole(_) => Err(ExecuteError::NonReadCommand("CREATE ROLE")),
             Command::DropRole(_) => Err(ExecuteError::NonReadCommand("DROP ROLE")),
+            Command::RenameRole(_) => Err(ExecuteError::NonReadCommand("ALTER ROLE")),
             Command::GrantDefaultTablePrivileges(_) => {
                 Err(ExecuteError::NonReadCommand("ALTER DEFAULT PRIVILEGES"))
             }
@@ -18246,24 +18459,43 @@ mod tests {
             .contains_key("app_reader"));
         assert!(e.relational_default_table_acl.contains_key("app_writer"));
 
-        let dependent_drop = e.execute_text(7, "DROP ROLE app_reader").unwrap_err();
+        e.execute_text(7, "ALTER ROLE app_reader RENAME TO app_analyst")
+            .unwrap();
+        assert!(e.relational_role("app_reader").is_none());
+        assert!(e.relational_role("app_analyst").unwrap().login);
+        assert_eq!(
+            e.relational_role_comment("app_analyst"),
+            Some("read-only app")
+        );
+        assert!(e
+            .relational_catalog_table("people")
+            .unwrap()
+            .acl
+            .contains_key("app_analyst"));
+        assert!(!e
+            .relational_catalog_table("people")
+            .unwrap()
+            .acl
+            .contains_key("app_reader"));
+
+        let dependent_drop = e.execute_text(8, "DROP ROLE app_analyst").unwrap_err();
         assert!(dependent_drop
             .to_string()
             .contains("dependent metadata exists"));
 
-        e.execute_text(8, "REVOKE SELECT ON TABLE people FROM app_reader")
+        e.execute_text(9, "REVOKE SELECT ON TABLE people FROM app_analyst")
             .unwrap();
-        e.execute_text(9, "COMMENT ON ROLE app_reader IS NULL")
+        e.execute_text(10, "COMMENT ON ROLE app_analyst IS NULL")
             .unwrap();
-        e.execute_text(10, "DROP ROLE app_reader").unwrap();
-        e.execute_text(11, "DROP USER IF EXISTS app_missing")
+        e.execute_text(11, "DROP ROLE app_analyst").unwrap();
+        e.execute_text(12, "DROP USER IF EXISTS app_missing")
             .unwrap();
 
-        assert!(e.relational_role("app_reader").is_none());
+        assert!(e.relational_role("app_analyst").is_none());
         assert!(e.relational_role("app_writer").is_some());
 
         let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
-        assert!(recovered.relational_role("app_reader").is_none());
+        assert!(recovered.relational_role("app_analyst").is_none());
         assert!(recovered.relational_role("app_writer").unwrap().login);
         assert!(recovered
             .relational_default_table_acl
@@ -18293,6 +18525,16 @@ mod tests {
         assert!(missing_role
             .execute_text(4, "CREATE ROLE app_password PASSWORD 'secret'")
             .is_err());
+        assert!(missing_role
+            .execute_text(5, "ALTER ROLE postgres RENAME TO root")
+            .unwrap_err()
+            .to_string()
+            .contains("cannot rename bootstrap role"));
+        assert!(missing_role
+            .execute_text(6, "ALTER ROLE missing_role RENAME TO renamed_role")
+            .unwrap_err()
+            .to_string()
+            .contains("role \"missing_role\" does not exist"));
     }
 
     #[test]
@@ -18305,25 +18547,46 @@ mod tests {
 
         let appdb = e.relational_database("appdb").unwrap();
         assert_eq!(appdb.name, "appdb");
+        let oid = appdb.oid;
         assert_eq!(
             e.relational_database_comment("appdb"),
             Some("application database")
         );
 
-        let duplicate = e.execute_text(3, "CREATE DATABASE appdb").unwrap_err();
+        e.execute_text(3, "ALTER DATABASE appdb RENAME TO appdb_renamed")
+            .unwrap();
+        let renamed = e.relational_database("appdb_renamed").unwrap();
+        assert_eq!(renamed.oid, oid);
+        assert_eq!(renamed.name, "appdb_renamed");
+        assert_eq!(
+            e.relational_database_comment("appdb_renamed"),
+            Some("application database")
+        );
+        assert_eq!(e.relational_database_comment("appdb"), None);
+
+        let duplicate = e
+            .execute_text(4, "CREATE DATABASE appdb_renamed")
+            .unwrap_err();
         assert!(duplicate
+            .to_string()
+            .contains("database \"appdb_renamed\" already exists"));
+        let duplicate_rename = e
+            .execute_text(5, "CREATE DATABASE appdb")
+            .and_then(|_| e.execute_text(6, "ALTER DATABASE appdb_renamed RENAME TO appdb"))
+            .unwrap_err();
+        assert!(duplicate_rename
             .to_string()
             .contains("database \"appdb\" already exists"));
 
-        e.execute_text(4, "DROP DATABASE appdb").unwrap();
-        assert!(e.relational_database("appdb").is_none());
-        assert_eq!(e.relational_database_comment("appdb"), None);
-        e.execute_text(5, "DROP DATABASE IF EXISTS missing_db")
+        e.execute_text(7, "DROP DATABASE appdb_renamed").unwrap();
+        assert!(e.relational_database("appdb_renamed").is_none());
+        assert_eq!(e.relational_database_comment("appdb_renamed"), None);
+        e.execute_text(8, "DROP DATABASE IF EXISTS missing_db")
             .unwrap();
 
         let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
-        assert!(recovered.relational_database("appdb").is_none());
-        assert_eq!(recovered.relational_database_comment("appdb"), None);
+        assert!(recovered.relational_database("appdb_renamed").is_none());
+        assert_eq!(recovered.relational_database_comment("appdb_renamed"), None);
 
         let mut kept = Engine::new_local();
         kept.execute_text(1, "CREATE DATABASE appdb").unwrap();
@@ -18335,6 +18598,16 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("cannot drop bootstrap database"));
+        assert!(Engine::new_local()
+            .execute_text(1, "ALTER DATABASE postgres RENAME TO appdb")
+            .unwrap_err()
+            .to_string()
+            .contains("cannot rename bootstrap database"));
+        assert!(Engine::new_local()
+            .execute_text(1, "ALTER DATABASE missing_db RENAME TO appdb")
+            .unwrap_err()
+            .to_string()
+            .contains("database \"missing_db\" does not exist"));
         assert!(Engine::new_local()
             .execute_text(1, "CREATE DATABASE templated TEMPLATE template1")
             .is_err());
@@ -38868,53 +39141,93 @@ mod tests {
         let tablespace = e.relational_tablespace("appspace").unwrap();
         assert_eq!(tablespace.name, "appspace");
         assert_eq!(tablespace.location, "/tmp/gpu-db-appspace");
+        let oid = tablespace.oid;
         assert_eq!(
             e.relational_tablespace_comment("appspace"),
             Some("application storage")
         );
 
+        e.execute_text(3, "ALTER TABLESPACE appspace RENAME TO appspace_fast")
+            .unwrap();
+        let renamed = e.relational_tablespace("appspace_fast").unwrap();
+        assert_eq!(renamed.oid, oid);
+        assert_eq!(renamed.location, "/tmp/gpu-db-appspace");
+        assert_eq!(
+            e.relational_tablespace_comment("appspace_fast"),
+            Some("application storage")
+        );
+        assert_eq!(e.relational_tablespace_comment("appspace"), None);
+
         let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
         assert_eq!(
             recovered
-                .relational_tablespace("appspace")
+                .relational_tablespace("appspace_fast")
                 .unwrap()
                 .location,
             "/tmp/gpu-db-appspace"
         );
         assert_eq!(
-            recovered.relational_tablespace_comment("appspace"),
+            recovered.relational_tablespace_comment("appspace_fast"),
             Some("application storage")
         );
 
         let duplicate = e
-            .execute_text(3, "CREATE TABLESPACE appspace LOCATION '/tmp/other'")
+            .execute_text(4, "CREATE TABLESPACE appspace_fast LOCATION '/tmp/other'")
             .unwrap_err()
             .to_string();
         assert!(
-            duplicate.contains("tablespace \"appspace\" already exists"),
+            duplicate.contains("tablespace \"appspace_fast\" already exists"),
             "{duplicate}"
         );
+        let duplicate_rename = e
+            .execute_text(5, "CREATE TABLESPACE appspace LOCATION '/tmp/other'")
+            .and_then(|_| e.execute_text(6, "ALTER TABLESPACE appspace_fast RENAME TO appspace"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            duplicate_rename.contains("tablespace \"appspace\" already exists"),
+            "{duplicate_rename}"
+        );
         let bootstrap = e
-            .execute_text(4, "DROP TABLESPACE pg_default")
+            .execute_text(7, "DROP TABLESPACE pg_default")
             .unwrap_err()
             .to_string();
         assert!(
             bootstrap.contains("cannot drop bootstrap tablespace \"pg_default\""),
             "{bootstrap}"
         );
+        let bootstrap_rename = e
+            .execute_text(8, "ALTER TABLESPACE pg_default RENAME TO appspace_default")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            bootstrap_rename.contains("cannot rename bootstrap tablespace \"pg_default\""),
+            "{bootstrap_rename}"
+        );
         let missing = e
-            .execute_text(5, "DROP TABLESPACE missing_space")
+            .execute_text(9, "DROP TABLESPACE missing_space")
             .unwrap_err()
             .to_string();
         assert!(
             missing.contains("tablespace \"missing_space\" does not exist"),
             "{missing}"
         );
+        let missing_rename = e
+            .execute_text(10, "ALTER TABLESPACE missing_space RENAME TO renamed_space")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            missing_rename.contains("tablespace \"missing_space\" does not exist"),
+            "{missing_rename}"
+        );
 
-        e.execute_text(6, "DROP TABLESPACE IF EXISTS appspace, missing_space")
-            .unwrap();
-        assert!(e.relational_tablespace("appspace").is_none());
-        assert_eq!(e.relational_tablespace_comment("appspace"), None);
+        e.execute_text(
+            11,
+            "DROP TABLESPACE IF EXISTS appspace_fast, appspace, missing_space",
+        )
+        .unwrap();
+        assert!(e.relational_tablespace("appspace_fast").is_none());
+        assert_eq!(e.relational_tablespace_comment("appspace_fast"), None);
     }
 
     #[test]
