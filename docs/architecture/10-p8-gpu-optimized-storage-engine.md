@@ -170,6 +170,199 @@ P8 should turn unknowns into benchmarks:
 - Recovery and warmup sequence.
 - Benchmark plan with pass/fail thresholds.
 
+## First-Slice Decisions
+
+This section closes the first P8 design milestone by fixing the narrow
+implementation target. It does not make a production cache claim by itself; it
+defines the first code slice that can prove the architecture.
+
+### Workload Assumptions
+
+The first P8 slice optimizes one hot public relational table with the current
+supported `int4` and `text` column families. The target workload is a mixed
+read-heavy path:
+
+- point and batched equality lookups on one `int4` key column
+- prefix-only `text LIKE 'prefix%'` filtering on one text column
+- bounded `COUNT(*)` and scalar `SUM`/`AVG`/`MIN`/`MAX` over `int4`
+- append/update/delete rates low enough that a resident segment can remain
+  valid across many reads before refresh is required
+
+The first slice should not optimize joins, multi-table plans, arbitrary
+expressions, NULL semantics, broad type families, or write-heavy workloads. If
+those dominate a benchmark, the expected behavior is truthful CPU fallback or a
+not-admitted residency state.
+
+### Tier Ownership
+
+Correctness remains owned by WAL/checkpoint/archive replay into CPU-visible
+state. The GPU tier is a performance cache only.
+
+The first implementation slice has four tiers:
+
+- durable source of truth: WAL segments, checkpoint control, archive manifests,
+  and PITR registry metadata
+- CPU canonical state: replayed MVCC tuple versions plus relational catalog
+  metadata
+- CPU derived state: rebuildable equality indexes and table statistics
+- GPU resident state: versioned column-group snapshots and optional resident
+  key vectors for admitted hot tables
+
+No resident GPU state can become visible unless it is tied to the catalog table
+OID, a source WAL transaction boundary, a read timestamp/transaction boundary,
+and a validity flag that mutations can clear before the mutated rows become
+visible.
+
+### Physical Layout
+
+The first layout is a CPU-owned row/MVCC source with generated GPU column-group
+segments. This is deliberately narrower than a full storage rewrite.
+
+For each admitted table, the cache manager builds a resident segment from the
+CPU truth:
+
+- `row_id`: stable row ordinal within the resident snapshot
+- `begin_txn` / `end_txn`: visibility bounds copied from MVCC versions
+- one dense `i32` buffer per admitted `int4` column
+- one offsets buffer plus one UTF-8 byte buffer per admitted `text` column
+- optional key-order vector for the first equality lookup key column
+- source metadata: table OID, schema/table name, column identities, source WAL
+  transaction id, row count, byte count, and checksum over encoded buffers
+
+The slice avoids durable GPU pages. Rebuild after restart is always allowed and
+expected.
+
+### Cache Manager State Machine
+
+Each table entry moves through these states:
+
+- `Absent`: no resident state exists.
+- `Admitting`: a build is in progress from a specific CPU snapshot boundary.
+- `Valid`: resident buffers match the source table identity and source boundary.
+- `Invalidated`: a WAL-applied mutation or DDL changed the table after the
+  resident boundary.
+- `Refreshing`: a rebuild is in progress after invalidation.
+- `Evicting`: buffers are being released to satisfy a deterministic budget
+  decision.
+- `Evicted`: metadata records the last eviction reason and byte count, but no
+  resident buffers are available.
+
+Admission is deterministic: reject tables whose encoded segment exceeds the
+per-GPU budget; otherwise evict least-recently-refreshed valid entries, then
+least-recently-refreshed invalidated entries, until the new segment fits.
+Ties are broken by table OID and table name. Memory pressure moves valid
+entries to `Evicting` before accepting new resident reads.
+
+### Mutation, Refresh, And Vacuum Protocol
+
+All table mutations keep the WAL-before-visibility invariant:
+
+1. validate and prepare the mutation
+2. append and flush WAL
+3. mark affected resident table entries `Invalidated`
+4. apply CPU-visible MVCC/catalog state
+5. expose the new visibility boundary
+
+Refresh can be manual in the first slice. Automatic refresh is a later policy
+layer. A refresh records previous bytes, new bytes, row delta, byte delta,
+source WAL boundary, elapsed time, and whether the refresh reused existing
+resident allocation capacity.
+
+Vacuum and compaction can reclaim CPU historical versions only after the
+resident segment has either been rebuilt beyond that safe boundary or marked
+invalid. A valid resident segment must never be the only remaining copy of data
+needed for crash recovery or historical correctness.
+
+### Index Strategy
+
+The first durable correctness index remains CPU rebuildable from WAL and table
+state. The first resident performance index is not a full GPU B-tree; it is a
+compact key-order vector over one supported `int4` key column in the resident
+segment. Equality and batched equality lookups can use that vector to identify
+candidate resident row ordinals, then apply the normal visibility and predicate
+checks over resident buffers.
+
+Range and text-prefix predicates may initially use resident column scans. A
+future resident index family can be admitted only after benchmarks show scan
+cost is the bottleneck and after invalidation/refresh ordering is specified.
+
+### Planner Cost Contract
+
+The planner may choose a resident GPU path only when all of these are true:
+
+- the table has a `Valid` resident entry tied to the requested relation OID
+- the read snapshot is compatible with the resident source boundary
+- selected columns and predicates are supported by the resident layout
+- memory pressure is not forcing eviction
+- estimated resident execution plus refresh risk is cheaper than CPU execution
+  plus transfer
+
+The cost inputs are:
+
+- estimated rows and selected bytes
+- predicate family and selectivity estimate
+- resident byte count and per-GPU budget
+- validity and last refresh age
+- last refresh cost
+- cold-transfer bytes avoided
+- expected CPU index path cost
+- explicit fallback risk reason
+
+The first implementation should expose the chosen reason, rejected reason, and
+cost inputs through status or benchmark output before routing normal SQL traffic
+to resident handles by default.
+
+### Recovery And Warmup
+
+Startup order remains:
+
+1. validate checkpoint/archive/control metadata
+2. replay WAL into CPU canonical state
+3. rebuild CPU indexes/statistics
+4. initialize all GPU residency entries as `Absent`
+5. optionally warm configured tables into `Valid` resident segments
+6. serve traffic with CPU fallback available while warmup is incomplete
+
+Warmup failure must not block correctness. It should surface as an operator
+visible residency rejection or fallback reason.
+
+### Benchmark Gates
+
+The first P8 implementation slice must produce a report that compares CPU,
+cold GPU transfer, and resident GPU execution for the same deterministic data
+set. The report must include:
+
+- correctness parity for all measured queries
+- resident admission/eviction state
+- source WAL boundary and invalidation evidence
+- H2D/D2H bytes per query
+- p50/p95/max latency for CPU, cold GPU, and resident GPU paths
+- refresh cost after one WAL-applied mutation
+- fallback/rejection reasons for unsupported or over-budget cases
+
+The first pass/fail threshold is not "GPU is always faster". It is:
+
+- resident reads perform zero per-query table H2D transfer for admitted tables
+- mutation invalidation happens before post-mutation visibility
+- refresh restores a valid resident entry tied to the new WAL boundary
+- at least one named read-heavy lookup or aggregate workload is faster than the
+  cold GPU-transfer path on the local NVIDIA runner
+- unsupported shapes and over-budget tables fall back with named reasons
+
+### Smallest Implementation Slice
+
+The next P8 code slice should implement an explicit `RelationalResidentCache`
+or equivalent engine component that owns table-residency state transitions,
+budget admission, deterministic eviction, invalidation hooks, refresh metadata,
+and planner-facing cost/rejection facts for one supported public table. It
+should wire into the existing residency status/telemetry surface and extend the
+P7 residency benchmark to exercise admission, mutation invalidation, refresh,
+eviction, and one planner-facing resident-path decision record.
+
+It should not yet make resident GPU execution the default SQL path. The exit
+condition is a truthful, measured cache-manager proof that can safely become a
+planner routing input in a later slice.
+
 ## Non-Goals For The First P8 Design
 
 - Full PostgreSQL heap compatibility.
