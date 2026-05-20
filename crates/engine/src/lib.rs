@@ -25,7 +25,7 @@ use gpu_db_protocol::{
     CreateSchema, CreateSequence, CreateSubscription, CreateTable, CreateTablespace, CreateView,
     DatabasePrivilege, Delete, DropConstraint, DropDatabase, DropDomain, DropExtension, DropIndex,
     DropMaterializedView, DropPublication, DropRole, DropSchema, DropSequence, DropSubscription,
-    DropTable, DropTablespace, DropView, Insert, ParseError, PublicationTarget,
+    DropTable, DropTablespace, DropView, FunctionPrivilege, Insert, ParseError, PublicationTarget,
     RefreshMaterializedView, RenameColumn, RenameConstraint, RenameDatabase, RenameFunction,
     RenameIndex, RenameMaterializedView, RenameRole, RenameSequence, RenameTable, RenameTablespace,
     RenameView, SchemaPrivilege, Select, SelectFilterOp, SelectFunction, SelectProjection,
@@ -141,6 +141,8 @@ impl ReplicatedStateMachine for KvStateMachine {
                     | Command::RevokeDatabase(_)
                     | Command::GrantTablespace(_)
                     | Command::RevokeTablespace(_)
+                    | Command::GrantFunction(_)
+                    | Command::RevokeFunction(_)
                     | Command::GrantDefaultTablePrivileges(_)
                     | Command::RevokeDefaultTablePrivileges(_)
                     | Command::AlterColumnDefault(_)
@@ -6185,6 +6187,7 @@ pub struct RelationalFunction {
     pub oid: u32,
     pub return_type: SqlType,
     pub body: String,
+    pub acl: BTreeMap<String, BTreeSet<FunctionPrivilege>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -8537,6 +8540,14 @@ impl Engine {
                 &revoke.grantee,
                 &revoke.privileges,
             )?,
+            Command::GrantFunction(grant) => {
+                self.apply_grant_function_acl(&grant.function, &grant.grantee, &grant.privileges)?
+            }
+            Command::RevokeFunction(revoke) => self.apply_revoke_function_acl(
+                &revoke.function,
+                &revoke.grantee,
+                &revoke.privileges,
+            )?,
             Command::GrantDefaultTablePrivileges(grant) => {
                 self.apply_grant_default_table_privileges(&grant.grantee, &grant.privileges)?
             }
@@ -8767,6 +8778,7 @@ impl Engine {
                 oid,
                 return_type: create.return_type,
                 body: create.body,
+                acl: BTreeMap::new(),
             },
         );
         Ok(())
@@ -10615,6 +10627,10 @@ impl Engine {
                 .relational_tablespaces
                 .values()
                 .any(|tablespace| tablespace.acl.contains_key(role))
+            || self
+                .relational_functions
+                .values()
+                .any(|function| function.acl.contains_key(role))
             || self.relational_schema_acl.contains_key(role)
             || self.relational_default_table_acl.contains_key(role)
     }
@@ -10713,6 +10729,11 @@ impl Engine {
         for tablespace in self.relational_tablespaces.values_mut() {
             if let Some(privileges) = tablespace.acl.remove(&rename.old_name) {
                 tablespace.acl.insert(rename.new_name.clone(), privileges);
+            }
+        }
+        for function in self.relational_functions.values_mut() {
+            if let Some(privileges) = function.acl.remove(&rename.old_name) {
+                function.acl.insert(rename.new_name.clone(), privileges);
             }
         }
         if let Some(privileges) = self.relational_schema_acl.remove(&rename.old_name) {
@@ -11086,6 +11107,60 @@ impl Engine {
             }
             if acl.is_empty() {
                 relation_acl.remove(grantee);
+            }
+        }
+        Ok(())
+    }
+
+    fn preflight_function_acl_target(&self, function: &str) -> Result<(), EngineError> {
+        if self.relational_functions.contains_key(function) {
+            Ok(())
+        } else {
+            Err(EngineError::ApplyFailed(format!(
+                "function \"{function}\" does not exist"
+            )))
+        }
+    }
+
+    fn apply_grant_function_acl(
+        &mut self,
+        function: &str,
+        grantee: &str,
+        privileges: &[FunctionPrivilege],
+    ) -> Result<(), EngineError> {
+        self.preflight_function_acl_target(function)?;
+        self.preflight_acl_grantee(grantee)?;
+        let acl = self
+            .relational_functions
+            .get_mut(function)
+            .expect("function ACL target preflighted")
+            .acl
+            .entry(grantee.to_string())
+            .or_default();
+        for privilege in privileges {
+            acl.insert(*privilege);
+        }
+        Ok(())
+    }
+
+    fn apply_revoke_function_acl(
+        &mut self,
+        function: &str,
+        grantee: &str,
+        privileges: &[FunctionPrivilege],
+    ) -> Result<(), EngineError> {
+        self.preflight_function_acl_target(function)?;
+        self.preflight_acl_grantee(grantee)?;
+        let function = self
+            .relational_functions
+            .get_mut(function)
+            .expect("function ACL target preflighted");
+        if let Some(acl) = function.acl.get_mut(grantee) {
+            for privilege in privileges {
+                acl.remove(privilege);
+            }
+            if acl.is_empty() {
+                function.acl.remove(grantee);
             }
         }
         Ok(())
@@ -13241,6 +13316,14 @@ impl Engine {
                 self.preflight_tablespace_acl_target(&revoke.tablespace)?;
                 self.preflight_acl_grantee(&revoke.grantee)?;
             }
+            Command::GrantFunction(grant) => {
+                self.preflight_function_acl_target(&grant.function)?;
+                self.preflight_acl_grantee(&grant.grantee)?;
+            }
+            Command::RevokeFunction(revoke) => {
+                self.preflight_function_acl_target(&revoke.function)?;
+                self.preflight_acl_grantee(&revoke.grantee)?;
+            }
             Command::CreatePublication(create) => self.preflight_create_publication(create)?,
             Command::DropPublication(drop) => self.preflight_drop_publication(drop)?,
             Command::CreateSubscription(create) => self.preflight_create_subscription(create)?,
@@ -13634,6 +13717,8 @@ impl Engine {
             | Command::RevokeDatabase(_)
             | Command::GrantTablespace(_)
             | Command::RevokeTablespace(_)
+            | Command::GrantFunction(_)
+            | Command::RevokeFunction(_)
             | Command::CreatePublication(_)
             | Command::DropPublication(_)
             | Command::CreateSubscription(_)
@@ -13887,6 +13972,8 @@ impl Engine {
             | Command::RevokeDatabase(_)
             | Command::GrantTablespace(_)
             | Command::RevokeTablespace(_)
+            | Command::GrantFunction(_)
+            | Command::RevokeFunction(_)
             | Command::CreatePublication(_)
             | Command::DropPublication(_)
             | Command::CreateSubscription(_)
@@ -14052,6 +14139,8 @@ impl Engine {
             Command::RevokeDatabase(_) => Err(ExecuteError::NonReadCommand("REVOKE")),
             Command::GrantTablespace(_) => Err(ExecuteError::NonReadCommand("GRANT")),
             Command::RevokeTablespace(_) => Err(ExecuteError::NonReadCommand("REVOKE")),
+            Command::GrantFunction(_) => Err(ExecuteError::NonReadCommand("GRANT")),
+            Command::RevokeFunction(_) => Err(ExecuteError::NonReadCommand("REVOKE")),
             Command::CreatePublication(_) => {
                 Err(ExecuteError::NonReadCommand("CREATE PUBLICATION"))
             }
@@ -17355,6 +17444,15 @@ impl Engine {
 
     pub fn relational_schema_acl(&self) -> &BTreeMap<String, BTreeSet<SchemaPrivilege>> {
         &self.relational_schema_acl
+    }
+
+    pub fn relational_function_acl(
+        &self,
+        function: &str,
+    ) -> Option<&BTreeMap<String, BTreeSet<FunctionPrivilege>>> {
+        self.relational_functions
+            .get(function)
+            .map(|function| &function.acl)
     }
 
     pub fn relational_catalog_view(&self, view: &str) -> Option<&RelationalView> {
@@ -41392,6 +41490,64 @@ mod tests {
         let recovered_after_drop =
             Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
         assert!(recovered_after_drop.relational_schema_acl().is_empty());
+    }
+
+    #[test]
+    fn relational_catalog_records_function_acl_metadata_and_replays_from_wal() {
+        let mut e = Engine::new_local();
+        e.execute_text(
+            1,
+            "CREATE FUNCTION answer() RETURNS int LANGUAGE sql AS 'SELECT 42'",
+        )
+        .unwrap();
+        e.execute_text(2, "CREATE ROLE app_reader").unwrap();
+        e.execute_text(3, "GRANT EXECUTE ON FUNCTION public.answer() TO app_reader")
+            .unwrap();
+        e.execute_text(4, "GRANT ALL PRIVILEGES ON FUNCTION answer() TO PUBLIC")
+            .unwrap();
+
+        let acl = e.relational_function_acl("answer").unwrap();
+        assert_eq!(
+            acl.get("app_reader").unwrap(),
+            &BTreeSet::from([FunctionPrivilege::Execute])
+        );
+        assert_eq!(
+            acl.get("public").unwrap(),
+            &BTreeSet::from([FunctionPrivilege::Execute])
+        );
+
+        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        assert_eq!(recovered.relational_function_acl("answer").unwrap(), acl);
+
+        e.execute_text(5, "ALTER ROLE app_reader RENAME TO app_executor")
+            .unwrap();
+        assert!(!e
+            .relational_function_acl("answer")
+            .unwrap()
+            .contains_key("app_reader"));
+        assert_eq!(
+            e.relational_function_acl("answer")
+                .unwrap()
+                .get("app_executor")
+                .unwrap(),
+            &BTreeSet::from([FunctionPrivilege::Execute])
+        );
+
+        e.execute_text(6, "REVOKE EXECUTE ON FUNCTION answer() FROM PUBLIC")
+            .unwrap();
+        assert!(!e
+            .relational_function_acl("answer")
+            .unwrap()
+            .contains_key("public"));
+
+        let missing = e
+            .execute_text(7, "GRANT EXECUTE ON FUNCTION missing_answer() TO PUBLIC")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            missing.contains("function \"missing_answer\" does not exist"),
+            "{missing}"
+        );
     }
 
     #[test]

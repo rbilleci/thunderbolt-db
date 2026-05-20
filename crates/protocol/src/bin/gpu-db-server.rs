@@ -7,9 +7,9 @@ use std::thread;
 
 use gpu_db_protocol::{
     parse_command, parse_frontend_message, parse_startup_packet, AclRelationKind, ColumnDefault,
-    Command, CommentTarget, DatabasePrivilege, FrontendMessage, ParseError, PublicationTarget,
-    SchemaPrivilege, SelectFilter, SelectFilterOp, SelectProjection, SqlValue, StartupPacket,
-    TablePrivilege, TablespacePrivilege, SUPPORTED_SQL_TYPES,
+    Command, CommentTarget, DatabasePrivilege, FrontendMessage, FunctionPrivilege, ParseError,
+    PublicationTarget, SchemaPrivilege, SelectFilter, SelectFilterOp, SelectProjection, SqlValue,
+    StartupPacket, TablePrivilege, TablespacePrivilege, SUPPORTED_SQL_TYPES,
 };
 use gpu_db_protocol::{DescribeTarget, SqlType};
 
@@ -622,6 +622,9 @@ fn execute_function_result(
             position: None,
         });
     };
+    if let Some(error) = function_access_permission_error(session, &call.name) {
+        return Err(error);
+    }
     let value = parse_bounded_sql_function_body(&function.body, function.return_type)?;
     let column = match function.return_type {
         SqlType::Int4 => int4_column(&function.name),
@@ -3129,6 +3132,7 @@ struct FunctionInfo {
     name: String,
     return_type: SqlType,
     body: String,
+    acl: BTreeMap<String, BTreeSet<FunctionPrivilege>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3347,6 +3351,27 @@ fn role_has_relation_privilege(
     })
 }
 
+fn role_has_function_privilege(
+    session: &Session,
+    function: &str,
+    privilege: FunctionPrivilege,
+) -> bool {
+    let role = active_role(session);
+    if role == "postgres" {
+        return true;
+    }
+    session.functions.get(function).is_some_and(|function| {
+        function
+            .acl
+            .get(role)
+            .is_some_and(|privileges| privileges.contains(&privilege))
+            || function
+                .acl
+                .get("public")
+                .is_some_and(|privileges| privileges.contains(&privilege))
+    })
+}
+
 fn relation_permission_error(
     session: &Session,
     relation: &str,
@@ -3422,6 +3447,18 @@ fn schema_usage_permission_error(session: &Session, schema: &str) -> Option<Erro
     }
 }
 
+fn function_permission_error(session: &Session, function: &str) -> Option<ErrorField> {
+    if role_has_function_privilege(session, function, FunctionPrivilege::Execute) {
+        None
+    } else {
+        Some(ErrorField {
+            code: "42501",
+            message: "permission denied for function",
+            position: None,
+        })
+    }
+}
+
 fn object_access_permission_error(
     session: &Session,
     relation: &str,
@@ -3429,6 +3466,11 @@ fn object_access_permission_error(
 ) -> Option<ErrorField> {
     schema_usage_permission_error(session, "public")
         .or_else(|| relation_permission_error(session, relation, privilege))
+}
+
+fn function_access_permission_error(session: &Session, function: &str) -> Option<ErrorField> {
+    schema_usage_permission_error(session, "public")
+        .or_else(|| function_permission_error(session, function))
 }
 
 fn role_has_dependencies(session: &Session, role: &str) -> bool {
@@ -3446,8 +3488,24 @@ fn role_has_dependencies(session: &Session, role: &str) -> bool {
             .tablespace_acls
             .values()
             .any(|acl| acl.contains_key(role))
+        || session
+            .functions
+            .values()
+            .any(|function| function.acl.contains_key(role))
         || session.schema_acl.contains_key(role)
         || session.default_table_acl.contains_key(role)
+}
+
+fn function_acl_target_error(session: &Session, function: &str) -> Option<ErrorField> {
+    if session.functions.contains_key(function) {
+        None
+    } else {
+        Some(ErrorField {
+            code: "42883",
+            message: "function does not exist",
+            position: None,
+        })
+    }
 }
 
 fn relation_acl_target_error(
@@ -3543,6 +3601,60 @@ fn revoke_relation_acl(
         session.table_acls.remove(relation);
     }
     session.mark_table_acl_dirty(relation.to_string());
+    Ok(())
+}
+
+fn grant_function_acl(
+    session: &mut Session,
+    function: &str,
+    grantee: &str,
+    privileges: &[FunctionPrivilege],
+) -> Result<(), ErrorField> {
+    if let Some(error) = acl_grantee_error(session, grantee) {
+        return Err(error);
+    }
+    if let Some(error) = function_acl_target_error(session, function) {
+        return Err(error);
+    }
+    let acl = session
+        .functions
+        .get_mut(function)
+        .expect("function ACL target preflighted")
+        .acl
+        .entry(grantee.to_string())
+        .or_default();
+    for privilege in privileges {
+        acl.insert(*privilege);
+    }
+    session.mark_function_dirty(function.to_string());
+    Ok(())
+}
+
+fn revoke_function_acl(
+    session: &mut Session,
+    function: &str,
+    grantee: &str,
+    privileges: &[FunctionPrivilege],
+) -> Result<(), ErrorField> {
+    if let Some(error) = acl_grantee_error(session, grantee) {
+        return Err(error);
+    }
+    if let Some(error) = function_acl_target_error(session, function) {
+        return Err(error);
+    }
+    let function_info = session
+        .functions
+        .get_mut(function)
+        .expect("function ACL target preflighted");
+    if let Some(acl) = function_info.acl.get_mut(grantee) {
+        for privilege in privileges {
+            acl.remove(privilege);
+        }
+        if acl.is_empty() {
+            function_info.acl.remove(grantee);
+        }
+    }
+    session.mark_function_dirty(function.to_string());
     Ok(())
 }
 
@@ -10015,6 +10127,7 @@ fn execute_statement(
                         name: create.name.clone(),
                         return_type: create.return_type,
                         body: create.body,
+                        acl: BTreeMap::new(),
                     },
                 );
                 session.mark_function_dirty(create.name);
@@ -10708,6 +10821,16 @@ fn execute_statement(
                 }
                 for tablespace in session.tablespace_acls.keys().cloned().collect::<Vec<_>>() {
                     session.mark_tablespace_acl_dirty(tablespace);
+                }
+                let mut dirty_functions = Vec::new();
+                for function in session.functions.values_mut() {
+                    if let Some(privileges) = function.acl.remove(&rename.old_name) {
+                        function.acl.insert(rename.new_name.clone(), privileges);
+                        dirty_functions.push(function.name.clone());
+                    }
+                }
+                for function in dirty_functions {
+                    session.mark_function_dirty(function);
                 }
                 if let Some(privileges) = session.schema_acl.remove(&rename.old_name) {
                     session
@@ -11495,6 +11618,27 @@ fn execute_statement(
                 if let Err(error) = revoke_tablespace_acl(
                     session,
                     &revoke.tablespace,
+                    &revoke.grantee,
+                    &revoke.privileges,
+                ) {
+                    return write_error(stream, &error);
+                }
+                session.persist_catalog_snapshot();
+                return write_command_complete(stream, "REVOKE");
+            }
+            Command::GrantFunction(grant) => {
+                if let Err(error) =
+                    grant_function_acl(session, &grant.function, &grant.grantee, &grant.privileges)
+                {
+                    return write_error(stream, &error);
+                }
+                session.persist_catalog_snapshot();
+                return write_command_complete(stream, "GRANT");
+            }
+            Command::RevokeFunction(revoke) => {
+                if let Err(error) = revoke_function_acl(
+                    session,
+                    &revoke.function,
                     &revoke.grantee,
                     &revoke.privileges,
                 ) {
@@ -14600,6 +14744,31 @@ fn tablespace_privilege_letters(privileges: &BTreeSet<TablespacePrivilege>) -> S
     let mut letters = String::new();
     if privileges.contains(&TablespacePrivilege::Create) {
         letters.push('C');
+    }
+    letters
+}
+
+fn function_acl_display(acl: &BTreeMap<String, BTreeSet<FunctionPrivilege>>) -> Option<String> {
+    let rows = acl
+        .iter()
+        .filter_map(|(grantee, privileges)| {
+            if privileges.is_empty() {
+                return None;
+            }
+            let grantee = if grantee == "public" { "" } else { grantee };
+            Some(format!(
+                "{grantee}={}/postgres",
+                function_privilege_letters(privileges)
+            ))
+        })
+        .collect::<Vec<_>>();
+    (!rows.is_empty()).then(|| rows.join("\n"))
+}
+
+fn function_privilege_letters(privileges: &BTreeSet<FunctionPrivilege>) -> String {
+    let mut letters = String::new();
+    if privileges.contains(&FunctionPrivilege::Execute) {
+        letters.push('X');
     }
     letters
 }
@@ -17998,7 +18167,7 @@ fn psql_describe_function_verbose_rows(session: &Session) -> Vec<Vec<Option<Stri
                 Some("unsafe".to_string()),
                 Some("postgres".to_string()),
                 Some("invoker".to_string()),
-                None,
+                function_acl_display(&function.acl),
                 Some("sql".to_string()),
                 None,
                 session
@@ -20726,6 +20895,7 @@ mod tests {
                 name: "acl_answer".to_string(),
                 return_type: SqlType::Int4,
                 body: "SELECT 42".to_string(),
+                acl: BTreeMap::new(),
             },
         );
         grant_relation_acl(
@@ -20760,6 +20930,16 @@ mod tests {
             execute_select_result(&session, &select).unwrap().rows.len(),
             1
         );
+        let err = execute_function_result(&session, &call).unwrap_err();
+        assert_eq!(err.code, "42501");
+        assert_eq!(err.message, "permission denied for function");
+        grant_function_acl(
+            &mut session,
+            "acl_answer",
+            "reader",
+            &[FunctionPrivilege::Execute],
+        )
+        .unwrap();
         assert_eq!(
             execute_function_result(&session, &call).unwrap().rows,
             vec![vec![Some("42".to_string())]]
@@ -21265,6 +21445,7 @@ mod tests {
                 name: old_function_name.to_string(),
                 return_type: SqlType::Int4,
                 body: "SELECT 42".to_string(),
+                acl: BTreeMap::new(),
             },
         );
         session.comments.insert(

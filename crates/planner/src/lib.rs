@@ -114,6 +114,8 @@ impl Planner {
             | Command::RevokeDatabase(_)
             | Command::GrantTablespace(_)
             | Command::RevokeTablespace(_)
+            | Command::GrantFunction(_)
+            | Command::RevokeFunction(_)
             | Command::GrantDefaultTablePrivileges(_)
             | Command::RevokeDefaultTablePrivileges(_)
             | Command::AlterColumnDefault(_)

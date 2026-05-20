@@ -1,0 +1,46 @@
+CREATE ROLE
+CREATE FUNCTION
+GRANT
+SET
+psql:352_protocol_psql_function_execute_acl.sql:5: ERROR:  permission denied for function
+RESET
+GRANT
+                                                                                  List of functions
+ Schema |    Name    | Result data type | Argument data types | Type | Volatility | Parallel |  Owner   | Security |   Access privileges    | Language | Internal name | Description
+--------+------------+------------------+---------------------+------+------------+----------+----------+----------+------------------------+----------+---------------+-------------
+ public | acl_answer | integer          |                     | func | volatile   | unsafe   | postgres | invoker  | func_reader=X/postgres | sql      |               |
+(1 row)
+
+SET
+ acl_answer
+------------
+         42
+(1 row)
+
+RESET
+ALTER ROLE
+SET
+ acl_answer
+------------
+         42
+(1 row)
+
+RESET
+REVOKE
+SET
+psql:352_protocol_psql_function_execute_acl.sql:18: ERROR:  permission denied for function
+RESET
+GRANT
+SET
+ acl_answer
+------------
+         42
+(1 row)
+
+RESET
+REVOKE
+psql:352_protocol_psql_function_execute_acl.sql:25: ERROR:  query shape is not supported by the compatibility stub
+psql:352_protocol_psql_function_execute_acl.sql:26: ERROR:  function does not exist
+REVOKE
+DROP ROLE
+DROP FUNCTION

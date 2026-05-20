@@ -2,6 +2,16 @@
 
 ## 2026-05-20
 
+- Added bounded SQL-function `EXECUTE` ACL metadata and enforcement for the
+  supported zero-argument literal SQL function surface. `GRANT` / `REVOKE
+  EXECUTE ON FUNCTION [public.]name()` now persists through engine WAL replay
+  and shared protocol catalog state, appears in real `psql \df+` access
+  privileges, retargets bounded grantees through supported role rename, and
+  gates non-bootstrap `SET ROLE` function execution after public-schema
+  `USAGE` permits lookup. Real psql golden scenario 352 covers direct and
+  `PUBLIC` grants, revokes, role-rename retargeting, missing targets, and the
+  explicit argument-bearing unsupported boundary.
+
 - Hardened the local GPU residency and release-candidate preflight evidence for
   the first accepted-route CUDA event timing slice. The residency baseline now
   exercises the default accepted resident route, reports per-probe event timing

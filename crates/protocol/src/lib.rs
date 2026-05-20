@@ -63,6 +63,8 @@ pub enum Command {
     RevokeDatabase(DatabasePrivileges),
     GrantTablespace(TablespacePrivileges),
     RevokeTablespace(TablespacePrivileges),
+    GrantFunction(FunctionPrivileges),
+    RevokeFunction(FunctionPrivileges),
     GrantSchema(SchemaPrivileges),
     RevokeSchema(SchemaPrivileges),
     GrantDefaultTablePrivileges(DefaultTablePrivileges),
@@ -414,6 +416,11 @@ pub enum TablespacePrivilege {
     Create,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FunctionPrivilege {
+    Execute,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrantTable {
     pub relation: String,
@@ -449,6 +456,13 @@ pub struct TablespacePrivileges {
     pub tablespace: String,
     pub grantee: String,
     pub privileges: Vec<TablespacePrivilege>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionPrivileges {
+    pub function: String,
+    pub grantee: String,
+    pub privileges: Vec<FunctionPrivilege>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2291,6 +2305,9 @@ fn parse_relational_command(input: &str) -> Option<Result<Command, ParseError>> 
         if parse_grant_tablespace(input).is_ok() {
             return Some(parse_grant_tablespace(input).map(Command::GrantTablespace));
         }
+        if parse_grant_function(input).is_ok() {
+            return Some(parse_grant_function(input).map(Command::GrantFunction));
+        }
         return Some(parse_grant_table(input).map(Command::GrantTable));
     }
     if first.eq_ignore_ascii_case("REVOKE") {
@@ -2302,6 +2319,9 @@ fn parse_relational_command(input: &str) -> Option<Result<Command, ParseError>> 
         }
         if parse_revoke_tablespace(input).is_ok() {
             return Some(parse_revoke_tablespace(input).map(Command::RevokeTablespace));
+        }
+        if parse_revoke_function(input).is_ok() {
+            return Some(parse_revoke_function(input).map(Command::RevokeFunction));
         }
         return Some(parse_revoke_table(input).map(Command::RevokeTable));
     }
@@ -4562,6 +4582,26 @@ fn parse_revoke_tablespace(input: &str) -> Result<TablespacePrivileges, ParseErr
     })
 }
 
+fn parse_grant_function(input: &str) -> Result<FunctionPrivileges, ParseError> {
+    let (privileges, target, grantee) = parse_grant_acl_parts(input)?;
+    let function = parse_function_acl_target(target)?;
+    Ok(FunctionPrivileges {
+        function,
+        grantee: parse_acl_grantee(grantee)?,
+        privileges: parse_function_privileges(privileges)?,
+    })
+}
+
+fn parse_revoke_function(input: &str) -> Result<FunctionPrivileges, ParseError> {
+    let (privileges, target, grantee) = parse_revoke_acl_parts(input)?;
+    let function = parse_function_acl_target(target)?;
+    Ok(FunctionPrivileges {
+        function,
+        grantee: parse_acl_grantee(grantee)?,
+        privileges: parse_function_privileges(privileges)?,
+    })
+}
+
 fn parse_grant_acl_parts(input: &str) -> Result<(&str, &str, &str), ParseError> {
     let rest = strip_keyword_prefix_case_insensitive(input, "GRANT")
         .ok_or(ParseError::InvalidRelationalSql)?
@@ -4618,10 +4658,34 @@ fn parse_named_acl_target(target: &str, keyword: &str) -> Result<String, ParseEr
         || find_keyword_outside_quotes(name, "SCHEMA").is_some()
         || find_keyword_outside_quotes(name, "DATABASE").is_some()
         || find_keyword_outside_quotes(name, "TABLESPACE").is_some()
+        || find_keyword_outside_quotes(name, "FUNCTION").is_some()
     {
         return Err(ParseError::InvalidRelationalSql);
     }
     normalize_identifier(name)
+}
+
+fn parse_function_acl_target(target: &str) -> Result<String, ParseError> {
+    let mut name = strip_keyword_prefix_case_insensitive(target.trim(), "FUNCTION")
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    if name.is_empty()
+        || name.contains(',')
+        || find_keyword_outside_quotes(name, "TABLE").is_some()
+        || find_keyword_outside_quotes(name, "SCHEMA").is_some()
+        || find_keyword_outside_quotes(name, "SEQUENCE").is_some()
+        || find_keyword_outside_quotes(name, "VIEW").is_some()
+    {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    if let Some(open_idx) = find_char_outside_quotes(name, '(') {
+        let (before_args, args) = name.split_at(open_idx);
+        if !args.trim().eq("()") {
+            return Err(ParseError::InvalidRelationalSql);
+        }
+        name = before_args.trim_end();
+    }
+    normalize_relation_identifier(name)
 }
 
 fn parse_acl_schema_target(target: &str) -> Result<String, ParseError> {
@@ -4780,6 +4844,7 @@ fn parse_acl_relation_target(target: &str) -> Result<(String, AclRelationKind), 
         || find_keyword_outside_quotes(target, "COLUMN").is_some()
         || find_keyword_outside_quotes(target, "SCHEMA").is_some()
         || find_keyword_outside_quotes(target, "SEQUENCE").is_some()
+        || find_keyword_outside_quotes(target, "FUNCTION").is_some()
         || find_keyword_outside_quotes(target, "VIEW").is_some()
     {
         return Err(ParseError::InvalidRelationalSql);
@@ -4893,6 +4958,30 @@ fn parse_tablespace_privileges(input: &str) -> Result<Vec<TablespacePrivilege>, 
     for token in split_csv(trimmed)? {
         let privilege = match token.trim().to_ascii_uppercase().as_str() {
             "CREATE" => TablespacePrivilege::Create,
+            _ => return Err(ParseError::InvalidRelationalSql),
+        };
+        if !privileges.contains(&privilege) {
+            privileges.push(privilege);
+        }
+    }
+    if privileges.is_empty() {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    Ok(privileges)
+}
+
+fn parse_function_privileges(input: &str) -> Result<Vec<FunctionPrivilege>, ParseError> {
+    let trimmed = input.trim();
+    if trimmed.eq_ignore_ascii_case("ALL") || trimmed.eq_ignore_ascii_case("ALL PRIVILEGES") {
+        return Ok(vec![FunctionPrivilege::Execute]);
+    }
+    if trimmed.contains('(') || trimmed.contains(')') {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let mut privileges = Vec::new();
+    for token in split_csv(trimmed)? {
+        let privilege = match token.trim().to_ascii_uppercase().as_str() {
+            "EXECUTE" => FunctionPrivilege::Execute,
             _ => return Err(ParseError::InvalidRelationalSql),
         };
         if !privileges.contains(&privilege) {
@@ -5873,6 +5962,28 @@ fn find_matching_paren(input: &str, open: usize) -> Option<usize> {
             _ => {}
         }
         idx += 1;
+    }
+    None
+}
+
+fn find_char_outside_quotes(input: &str, needle: char) -> Option<usize> {
+    let mut in_quote = false;
+    let mut depth = 0usize;
+    for (idx, ch) in input.char_indices() {
+        if ch == '\'' {
+            in_quote = !in_quote;
+            continue;
+        }
+        if !in_quote {
+            if ch == needle && depth == 0 {
+                return Some(idx);
+            }
+            match ch {
+                '(' => depth += 1,
+                ')' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
     }
     None
 }
@@ -13456,6 +13567,30 @@ default: Some(ColumnDefault::SequenceNextVal {
                 privileges: vec![TablespacePrivilege::Create],
             })
         );
+        assert_eq!(
+            parse_command("GRANT EXECUTE ON FUNCTION public.answer() TO app_reader").unwrap(),
+            Command::GrantFunction(FunctionPrivileges {
+                function: "answer".to_string(),
+                grantee: "app_reader".to_string(),
+                privileges: vec![FunctionPrivilege::Execute],
+            })
+        );
+        assert_eq!(
+            parse_command("REVOKE ALL PRIVILEGES ON FUNCTION answer() FROM PUBLIC").unwrap(),
+            Command::RevokeFunction(FunctionPrivileges {
+                function: "answer".to_string(),
+                grantee: "public".to_string(),
+                privileges: vec![FunctionPrivilege::Execute],
+            })
+        );
+        assert!(matches!(
+            parse_command("GRANT SELECT ON FUNCTION answer() TO PUBLIC"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command("GRANT EXECUTE ON FUNCTION answer(int4) TO PUBLIC"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
         assert!(matches!(
             parse_command("GRANT SELECT ON DATABASE appdb TO PUBLIC"),
             Err(ParseError::InvalidRelationalSql)

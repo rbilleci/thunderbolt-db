@@ -51,6 +51,7 @@ SET
 psql:351_protocol_psql_schema_usage_acl_enforcement.sql:33: ERROR:  permission denied for relation
 RESET
 GRANT
+GRANT
 SET
  setval
 --------
@@ -65,10 +66,11 @@ SET
 RESET
 REVOKE
 SET
-psql:351_protocol_psql_schema_usage_acl_enforcement.sql:42: ERROR:  permission denied for schema
 psql:351_protocol_psql_schema_usage_acl_enforcement.sql:43: ERROR:  permission denied for schema
 psql:351_protocol_psql_schema_usage_acl_enforcement.sql:44: ERROR:  permission denied for schema
+psql:351_protocol_psql_schema_usage_acl_enforcement.sql:45: ERROR:  permission denied for schema
 RESET
+REVOKE
 REVOKE
 REVOKE
 REVOKE
