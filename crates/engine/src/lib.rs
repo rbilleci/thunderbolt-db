@@ -6658,7 +6658,11 @@ fn resident_route_query_shape(
     table: &RelationalTable,
     bound: &BoundRelationalSelect,
 ) -> Option<String> {
-    if select.offset.is_some() || select.distinct {
+    if select.distinct {
+        return resident_route_distinct_projection_shape(select, table, bound);
+    }
+
+    if select.offset.is_some() {
         return None;
     }
 
@@ -6795,6 +6799,52 @@ fn resident_route_query_shape(
         }
         _ => None,
     }
+}
+
+fn resident_route_distinct_projection_shape(
+    select: &Select,
+    table: &RelationalTable,
+    bound: &BoundRelationalSelect,
+) -> Option<String> {
+    if select.group_by.is_some()
+        || !select.having_groups.is_empty()
+        || bound.selected_indexes.len() != 1
+    {
+        return None;
+    }
+    let SelectProjection::Columns(_columns) = &select.projection else {
+        return None;
+    };
+    if select.offset.is_some() && (bound.order.is_none() || select.limit.is_none()) {
+        return None;
+    }
+    let projection_idx = bound.selected_indexes[0];
+    if table.columns[projection_idx].ty != SqlType::Int4 {
+        return None;
+    }
+    if let Some((order_idx, _descending)) = bound.order {
+        if order_idx != projection_idx {
+            return None;
+        }
+    }
+    if bound.filter.is_none() && bound.filters.is_empty() && bound.filter_groups.is_empty() {
+        return Some("int4_distinct_projection".to_string());
+    }
+    let filter_groups = if !bound.filter_groups.is_empty() {
+        bound.filter_groups.clone()
+    } else if !bound.filters.is_empty() {
+        vec![bound.filters.clone()]
+    } else {
+        vec![vec![bound.filter.clone()?]]
+    };
+    if filter_groups.len() != 1 || filter_groups[0].len() != 1 {
+        return None;
+    }
+    let (filter_idx, op, value) = filter_groups[0][0].clone();
+    (filter_idx == projection_idx
+        && resident_device_i32_comparison(op).is_some()
+        && matches!(value, SqlValue::Int4(_)))
+    .then(|| "int4_filtered_distinct_projection".to_string())
 }
 
 fn resident_route_grouped_aggregate_shape(
@@ -14019,6 +14069,12 @@ impl Engine {
             "int4_projection" => {
                 self.execute_relational_projection_with_resident_device_memory_probe(select)
             }
+            "int4_distinct_projection" => self
+                .execute_relational_distinct_projection_with_resident_device_memory_probe(select),
+            "int4_filtered_distinct_projection" => self
+                .execute_relational_filtered_distinct_projection_with_resident_device_memory_probe(
+                    select,
+                ),
             shape => Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
                 "resident route accepted unsupported execution shape: {shape}"
             )))),
@@ -22774,6 +22830,8 @@ mod tests {
             "SELECT MIN(id) FROM events WHERE id BETWEEN 1 AND 3",
             "SELECT MAX(id) FROM events WHERE id BETWEEN 1 AND 1",
             "SELECT id FROM events WHERE id > 1",
+            "SELECT DISTINCT bucket FROM events ORDER BY bucket DESC LIMIT 2 OFFSET 1",
+            "SELECT DISTINCT bucket FROM events WHERE bucket >= 2 ORDER BY bucket DESC LIMIT 2 OFFSET 1",
             "SELECT bucket, COUNT(*) FROM events GROUP BY bucket HAVING count >= 1 ORDER BY bucket",
             "SELECT bucket, SUM(amount) FROM events GROUP BY bucket HAVING sum > 20 ORDER BY sum DESC LIMIT 1",
             "SELECT bucket, AVG(amount) FROM events GROUP BY bucket ORDER BY bucket",
@@ -22830,7 +22888,28 @@ mod tests {
                         | "int4_grouped_aggregate"
                         | "int4_filtered_grouped_aggregate"
                         | "int4_projection"
+                        | "int4_distinct_projection"
+                        | "int4_filtered_distinct_projection"
                 ),
+                "{sql}"
+            );
+        }
+
+        for sql in [
+            "SELECT DISTINCT label FROM events ORDER BY label",
+            "SELECT DISTINCT bucket FROM events WHERE id >= 2 ORDER BY bucket DESC LIMIT 2",
+            "SELECT DISTINCT bucket FROM events WHERE bucket = 2",
+            "SELECT DISTINCT bucket FROM events OFFSET 1",
+        ] {
+            let Command::Select(unsupported) = parse_command(sql).unwrap() else {
+                unreachable!()
+            };
+            let unsupported = e.plan_relational_resident_route(&unsupported);
+            assert!(!unsupported.accepted, "{sql}");
+            assert_eq!(unsupported.query_shape, "unsupported_select", "{sql}");
+            assert_eq!(
+                unsupported.reason,
+                "resident routing has no retained-kernel proof for this SELECT shape",
                 "{sql}"
             );
         }

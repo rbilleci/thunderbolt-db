@@ -318,7 +318,10 @@ reason and cost facts visible and fall back to the existing MVCC/CUDA-probe
 path: absent/invalid/evicted snapshots, missing retained device memory,
 unsupported relation kinds, unsupported query shapes, resident bytes, budget
 bytes, refresh bytes, cold H2D bytes, zero resident H2D bytes, and estimated D2H
-rows.
+rows. The current accepted retained-kernel family covers bounded counts,
+count predicates, scalar and grouped aggregates, range-predicate projections,
+and int4 distinct projections, including the bounded same-column filtered
+distinct form.
 
 `Engine::execute_relational_select_with_resident_route(...)` remains the explicit
 execution consumer for the same decision contract. The default read path calls
@@ -387,10 +390,10 @@ The third P8 code slice uses accepted route decisions to drive
 `Engine::execute_relational_select_with_resident_route(...)`, an opt-in resident
 execution path for retained-device-memory `COUNT(*)`, supported int4/text count
 predicates, unfiltered/filtered/`BETWEEN` int4 scalar aggregates, and bounded
-int4 range-predicate projections plus the same bounded grouped aggregate
-shapes. It preserves explicit rejection for unsupported, stale, missing, or
-memory-pressured resident paths and still does not make resident GPU execution
-the default SQL path.
+int4 range-predicate projections plus the same bounded distinct projection and
+grouped aggregate shapes. It preserves explicit rejection for unsupported,
+stale, missing, or memory-pressured resident paths and still does not make
+resident GPU execution the default SQL path.
 
 The fourth P8 code slice integrates that same decision contract into
 `Engine::execute_relational_select(...)`: accepted retained-device-memory routes
@@ -398,7 +401,8 @@ execute by default with zero per-query resident H2D transfer, while every
 rejected route falls back to the existing MVCC/CUDA-probe path. This is default
 planner routing for the bounded retained-kernel shapes only, now including the
 already-proven filtered and `BETWEEN` scalar aggregate kernels plus the
-already-proven grouped and filtered grouped aggregate kernels.
+already-proven distinct projection kernels and grouped/filtered grouped
+aggregate kernels.
 
 The fifth P8 code slice adds `Engine::warm_relational_residency_with_policy(...)`
 as a deterministic, operator-triggered warmup policy over supported public base
