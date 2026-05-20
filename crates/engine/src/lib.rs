@@ -6658,7 +6658,66 @@ fn resident_route_query_shape(
     table: &RelationalTable,
     bound: &BoundRelationalSelect,
 ) -> Option<String> {
-    if select.offset.is_some() || select.order_by.is_some() || select.distinct {
+    if select.offset.is_some() || select.distinct {
+        return None;
+    }
+
+    match &select.projection {
+        SelectProjection::GroupedCount { column } => {
+            return resident_route_grouped_aggregate_shape(select, table, bound, column, column);
+        }
+        SelectProjection::GroupedSum {
+            group_column,
+            sum_column,
+        } => {
+            return resident_route_grouped_aggregate_shape(
+                select,
+                table,
+                bound,
+                group_column,
+                sum_column,
+            );
+        }
+        SelectProjection::GroupedAvg {
+            group_column,
+            avg_column,
+        } => {
+            return resident_route_grouped_aggregate_shape(
+                select,
+                table,
+                bound,
+                group_column,
+                avg_column,
+            );
+        }
+        SelectProjection::GroupedMin {
+            group_column,
+            min_column,
+        } => {
+            return resident_route_grouped_aggregate_shape(
+                select,
+                table,
+                bound,
+                group_column,
+                min_column,
+            );
+        }
+        SelectProjection::GroupedMax {
+            group_column,
+            max_column,
+        } => {
+            return resident_route_grouped_aggregate_shape(
+                select,
+                table,
+                bound,
+                group_column,
+                max_column,
+            );
+        }
+        _ => {}
+    }
+
+    if select.order_by.is_some() {
         return None;
     }
     if select.group_by.is_some() || !select.having_groups.is_empty() {
@@ -6738,6 +6797,49 @@ fn resident_route_query_shape(
     }
 }
 
+fn resident_route_grouped_aggregate_shape(
+    select: &Select,
+    table: &RelationalTable,
+    bound: &BoundRelationalSelect,
+    group_column: &str,
+    value_column: &str,
+) -> Option<String> {
+    let group_by = select.group_by.as_ref()?;
+    if !group_by.eq_ignore_ascii_case(group_column) {
+        return None;
+    }
+    let group_idx = table
+        .columns
+        .iter()
+        .position(|candidate| candidate.name == group_column)?;
+    let value_idx = table
+        .columns
+        .iter()
+        .position(|candidate| candidate.name == value_column)?;
+    if table.columns[group_idx].ty != SqlType::Int4 || table.columns[value_idx].ty != SqlType::Int4
+    {
+        return None;
+    }
+    if bound.filter.is_none() && bound.filters.is_empty() && bound.filter_groups.is_empty() {
+        return Some("int4_grouped_aggregate".to_string());
+    }
+    let filter_groups = if !bound.filter_groups.is_empty() {
+        bound.filter_groups.clone()
+    } else if !bound.filters.is_empty() {
+        vec![bound.filters.clone()]
+    } else {
+        vec![vec![bound.filter.clone()?]]
+    };
+    if filter_groups.len() != 1 || filter_groups[0].len() != 1 {
+        return None;
+    }
+    let (filter_idx, op, value) = filter_groups[0][0].clone();
+    (table.columns.get(filter_idx)?.ty == SqlType::Int4
+        && resident_device_i32_comparison(op).is_some()
+        && matches!(value, SqlValue::Int4(_)))
+    .then(|| "int4_filtered_grouped_aggregate".to_string())
+}
+
 fn resident_route_count_shape(
     table: &RelationalTable,
     bound: &BoundRelationalSelect,
@@ -6791,6 +6893,14 @@ fn resident_route_d2h_rows_estimate(select: &Select, resident_row_count: usize) 
         | SelectProjection::Avg { .. }
         | SelectProjection::Min { .. }
         | SelectProjection::Max { .. } => 1,
+        SelectProjection::GroupedCount { .. }
+        | SelectProjection::GroupedSum { .. }
+        | SelectProjection::GroupedAvg { .. }
+        | SelectProjection::GroupedMin { .. }
+        | SelectProjection::GroupedMax { .. } => select
+            .limit
+            .unwrap_or(resident_row_count)
+            .min(resident_row_count),
         _ => select
             .limit
             .unwrap_or(resident_row_count)
@@ -13897,6 +14007,13 @@ impl Engine {
                 ),
             "int4_between_scalar_aggregate" => self
                 .execute_relational_between_scalar_aggregate_with_resident_device_memory_probe(
+                    select,
+                ),
+            "int4_grouped_aggregate" => {
+                self.execute_relational_grouped_aggregate_with_resident_device_memory_probe(select)
+            }
+            "int4_filtered_grouped_aggregate" => self
+                .execute_relational_filtered_grouped_aggregate_with_resident_device_memory_probe(
                     select,
                 ),
             "int4_projection" => {
@@ -22612,11 +22729,14 @@ mod tests {
     #[test]
     fn p8_default_resident_route_executes_accepted_shapes() {
         let mut e = Engine::new_local();
-        e.execute_text(1, "CREATE TABLE events (id INT, label TEXT)")
-            .unwrap();
+        e.execute_text(
+            1,
+            "CREATE TABLE events (id INT, bucket INT, amount INT, label TEXT)",
+        )
+        .unwrap();
         e.execute_text(
             2,
-            "INSERT INTO events (id, label) VALUES (1, 'alpha'), (2, 'beta'), (3, 'alpine')",
+            "INSERT INTO events (id, bucket, amount, label) VALUES (1, 1, 10, 'alpha'), (2, 1, 20, 'beta'), (3, 2, 30, 'alpine')",
         )
         .unwrap();
         e.populate_relational_residency_snapshot("events").unwrap();
@@ -22654,6 +22774,11 @@ mod tests {
             "SELECT MIN(id) FROM events WHERE id BETWEEN 1 AND 3",
             "SELECT MAX(id) FROM events WHERE id BETWEEN 1 AND 1",
             "SELECT id FROM events WHERE id > 1",
+            "SELECT bucket, COUNT(*) FROM events GROUP BY bucket HAVING count >= 1 ORDER BY bucket",
+            "SELECT bucket, SUM(amount) FROM events GROUP BY bucket HAVING sum > 20 ORDER BY sum DESC LIMIT 1",
+            "SELECT bucket, AVG(amount) FROM events GROUP BY bucket ORDER BY bucket",
+            "SELECT bucket, MIN(amount) FROM events WHERE amount >= 20 GROUP BY bucket HAVING min >= 20 ORDER BY bucket",
+            "SELECT bucket, MAX(amount) FROM events WHERE amount > 10 GROUP BY bucket HAVING bucket = 1 OR max >= 30 ORDER BY max DESC",
         ] {
             let Command::Select(select) = parse_command(sql).unwrap() else {
                 unreachable!()
@@ -22686,7 +22811,43 @@ mod tests {
                 0,
                 "{sql}"
             );
+            assert!(
+                matches!(
+                    e.status_snapshot()
+                        .relational_residency
+                        .latest_route_decision("events")
+                        .unwrap()
+                        .query_shape
+                        .as_str(),
+                    "count_all"
+                        | "int4_equality_count"
+                        | "int4_range_count"
+                        | "text_prefix_like_count"
+                        | "int4_filter_group_count"
+                        | "int4_scalar_aggregate"
+                        | "int4_filtered_scalar_aggregate"
+                        | "int4_between_scalar_aggregate"
+                        | "int4_grouped_aggregate"
+                        | "int4_filtered_grouped_aggregate"
+                        | "int4_projection"
+                ),
+                "{sql}"
+            );
         }
+
+        let Command::Select(unsupported_group_filter) =
+            parse_command("SELECT bucket, COUNT(*) FROM events WHERE amount = 20 GROUP BY bucket")
+                .unwrap()
+        else {
+            unreachable!()
+        };
+        let unsupported = e.plan_relational_resident_route(&unsupported_group_filter);
+        assert!(!unsupported.accepted);
+        assert_eq!(unsupported.query_shape, "unsupported_select");
+        assert_eq!(
+            unsupported.reason,
+            "resident routing has no retained-kernel proof for this SELECT shape"
+        );
     }
 
     #[test]
