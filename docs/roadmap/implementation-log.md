@@ -2,6 +2,14 @@
 
 ## 2026-05-20
 
+- Added a top-level local release-candidate preflight gate.
+  `scripts/run_local_release_candidate_preflight.sh` runs the local
+  PostgreSQL-compatible product preflight plus the local GPU residency
+  preflight, verifies stable evidence lines from both, and reports the combined
+  supported local envelope while keeping blocked driver, production
+  orchestration, durable GPU page, broad retained-expression, and broad CUDA
+  event-timing gaps explicit.
+
 - Added a local GPU residency product preflight gate. `scripts/run_local_gpu_residency_preflight.sh`
   runs the checked GPU residency baseline, resident warmup preflight smoke, and
   resident maintenance smoke, verifies retained CUDA allocation, zero-H2D

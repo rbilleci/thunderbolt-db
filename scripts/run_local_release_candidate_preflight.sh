@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/gpu-db-local-release-candidate.XXXXXX")"
+
+cleanup() {
+  rm -rf "$WORKDIR"
+}
+trap cleanup EXIT
+
+run_gate() {
+  local name="$1"
+  local script="$2"
+  shift 2
+  local output_file="$WORKDIR/${name}.out"
+
+  printf 'local_release_candidate_preflight_step=%s status=running\n' "$name"
+  "$script" >"$output_file"
+  cat "$output_file"
+
+  local required
+  for required in "$@"; do
+    if ! grep -Fq "$required" "$output_file"; then
+      printf 'local release-candidate preflight gate %s missing evidence line: %s\n' "$name" "$required" >&2
+      return 1
+    fi
+  done
+  printf 'local_release_candidate_preflight_step=%s status=passed\n' "$name"
+}
+
+run_gate \
+  postgresql_product \
+  scripts/run_local_product_preflight.sh \
+  "local_product_preflight=passed" \
+  "local_product_preflight_scope=application_drivers_pg_dump_restore_local_resilience" \
+  "local_product_preflight_drivers=tokio-postgres,sqlx,node-postgres,asyncpg,psycopg" \
+  "local_product_preflight_dump_restore=plain_custom_directory_tar_parallel_clean_insert_split" \
+  "local_product_preflight_resilience=backup_pitr_dr_plus_replication_deployment" \
+  "local_product_preflight_gap_pgx=blocked_missing_go" \
+  "local_product_preflight_gap_jdbc_r2dbc=blocked_missing_java_build_tooling" \
+  "local_product_preflight_gap_physical_page_image_backup=missing" \
+  "local_product_preflight_gap_production_object_storage=missing" \
+  "local_product_preflight_gap_live_background_scheduling=missing" \
+  "local_product_preflight_gap_live_systemd_supervision=missing" \
+  "local_product_preflight_gap_live_kubernetes_rollout=missing" \
+  "local_product_preflight_gap_production_timeline_failover=missing"
+
+run_gate \
+  gpu_residency \
+  scripts/run_local_gpu_residency_preflight.sh \
+  "local_gpu_residency_preflight=passed" \
+  "local_gpu_residency_preflight_scope=residency_baseline_warmup_maintenance" \
+  "local_gpu_residency_preflight_resident_device_memory=retained_cuda_allocation" \
+  "local_gpu_residency_preflight_resident_routes=zero_h2d_supported_kernel_shapes" \
+  "local_gpu_residency_preflight_cache_manager=budget_admission_eviction_invalidation_refresh" \
+  "local_gpu_residency_preflight_warmup=operator_triggered_dry_run_apply" \
+  "local_gpu_residency_preflight_maintenance=scheduler_friendly_tick" \
+  "local_gpu_residency_preflight_gap_durable_gpu_pages=missing" \
+  "local_gpu_residency_preflight_gap_autonomous_cache_daemon=missing" \
+  "local_gpu_residency_preflight_gap_external_orchestration=missing" \
+  "local_gpu_residency_preflight_gap_broad_retained_expressions=missing" \
+  "local_gpu_residency_preflight_gap_broad_cuda_event_timing=missing"
+
+printf 'local_release_candidate_preflight=passed\n'
+printf 'local_release_candidate_preflight_scope=postgresql_product_plus_gpu_residency\n'
+printf 'local_release_candidate_preflight_postgresql=application_drivers_pg_dump_restore_local_resilience\n'
+printf 'local_release_candidate_preflight_gpu=residency_baseline_warmup_maintenance\n'
+printf 'local_release_candidate_preflight_drivers=tokio-postgres,sqlx,node-postgres,asyncpg,psycopg\n'
+printf 'local_release_candidate_preflight_gpu_residency=retained_cuda_allocation_zero_h2d_routes_warmup_maintenance\n'
+printf 'local_release_candidate_preflight_gap_pgx=blocked_missing_go\n'
+printf 'local_release_candidate_preflight_gap_jdbc_r2dbc=blocked_missing_java_build_tooling\n'
+printf 'local_release_candidate_preflight_gap_physical_page_image_backup=missing\n'
+printf 'local_release_candidate_preflight_gap_production_object_storage=missing\n'
+printf 'local_release_candidate_preflight_gap_live_background_scheduling=missing\n'
+printf 'local_release_candidate_preflight_gap_live_systemd_supervision=missing\n'
+printf 'local_release_candidate_preflight_gap_live_kubernetes_rollout=missing\n'
+printf 'local_release_candidate_preflight_gap_production_timeline_failover=missing\n'
+printf 'local_release_candidate_preflight_gap_durable_gpu_pages=missing\n'
+printf 'local_release_candidate_preflight_gap_autonomous_cache_daemon=missing\n'
+printf 'local_release_candidate_preflight_gap_external_orchestration=missing\n'
+printf 'local_release_candidate_preflight_gap_broad_retained_expressions=missing\n'
+printf 'local_release_candidate_preflight_gap_broad_cuda_event_timing=missing\n'
