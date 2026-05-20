@@ -2,6 +2,8 @@
 
 ## 2026-05-20
 
+- Added bounded metadata-only database catalog support. `CREATE DATABASE name`, `DROP DATABASE [IF EXISTS] name [, ...]`, and `COMMENT ON DATABASE name` now persist through engine WAL replay and protocol shared catalog state for supported application database rows, appear through real PostgreSQL 16 `psql \l` / `\l+` plus direct `pg_catalog.pg_database` probes, and clean supported database comments on drop. Connection routing, per-database storage namespaces, templates/cloning, owners/ACLs, encoding/locale/tablespace options, `ALTER DATABASE`, `DROP DATABASE FORCE`, permission enforcement, and broader database semantics remain out of scope. Real psql golden scenario 344 covers the client-facing workflow.
+
 - Added bounded bootstrap-extension restore/setup handling. `CREATE EXTENSION IF NOT EXISTS plpgsql` and `CREATE EXTENSION IF NOT EXISTS "plpgsql" WITH SCHEMA pg_catalog` are accepted as idempotent no-op traffic against the metadata-only bootstrap extension already exposed through `\dx` and direct `pg_catalog.pg_extension` discovery. Duplicate non-`IF NOT EXISTS` creates, unsupported extension names, unsupported schemas, and `DROP EXTENSION` remain rejected while extension drop/update/relocation, extension-owned dependencies, and procedural execution stay out of scope. Real psql golden scenario 54 covers the client-facing workflow.
 
 ## 2026-05-19

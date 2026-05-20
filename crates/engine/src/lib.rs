@@ -20,14 +20,15 @@ use gpu_db_observability::{
 use gpu_db_planner::{ExecutionPlan, Planner, PlannerConfig};
 use gpu_db_protocol::{
     parse_command, AclRelationKind, AddCheckConstraint, AddForeignKey, AddUniqueConstraint,
-    ColumnDef, ColumnDefault, Command, CommentTarget, CreateDomain, CreateExtension, CreateIndex,
-    CreateMaterializedView, CreatePublication, CreateRole, CreateSchema, CreateSequence,
-    CreateSubscription, CreateTable, CreateView, Delete, DropConstraint, DropDomain, DropIndex,
-    DropMaterializedView, DropPublication, DropRole, DropSchema, DropSequence, DropSubscription,
-    DropTable, DropView, Insert, ParseError, PublicationTarget, RefreshMaterializedView,
-    RenameColumn, RenameConstraint, RenameIndex, RenameMaterializedView, RenameSequence,
-    RenameTable, RenameView, SchemaPrivilege, Select, SelectFilterOp, SelectProjection,
-    SequenceNextVal, SequenceSetVal, SqlType, SqlValue, TablePrivilege, TruncateTable, Update,
+    ColumnDef, ColumnDefault, Command, CommentTarget, CreateDatabase, CreateDomain,
+    CreateExtension, CreateIndex, CreateMaterializedView, CreatePublication, CreateRole,
+    CreateSchema, CreateSequence, CreateSubscription, CreateTable, CreateView, Delete,
+    DropConstraint, DropDatabase, DropDomain, DropIndex, DropMaterializedView, DropPublication,
+    DropRole, DropSchema, DropSequence, DropSubscription, DropTable, DropView, Insert, ParseError,
+    PublicationTarget, RefreshMaterializedView, RenameColumn, RenameConstraint, RenameIndex,
+    RenameMaterializedView, RenameSequence, RenameTable, RenameView, SchemaPrivilege, Select,
+    SelectFilterOp, SelectProjection, SequenceNextVal, SequenceSetVal, SqlType, SqlValue,
+    TablePrivilege, TruncateTable, Update,
 };
 use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine};
 use gpu_db_storage::{
@@ -79,6 +80,8 @@ impl ReplicatedStateMachine for KvStateMachine {
                     | Command::GetKv { .. }
                     | Command::CreateSchema(_)
                     | Command::DropSchema(_)
+                    | Command::CreateDatabase(_)
+                    | Command::DropDatabase(_)
                     | Command::CreateTable(_)
                     | Command::AddPrimaryKey(_)
                     | Command::AddUniqueConstraint(_)
@@ -5980,6 +5983,7 @@ pub struct Engine {
     relational_publications: BTreeMap<String, RelationalPublication>,
     relational_subscriptions: BTreeMap<String, RelationalSubscription>,
     relational_roles: BTreeMap<String, RelationalRole>,
+    relational_databases: BTreeMap<String, RelationalDatabase>,
     relational_public_schema_exists: bool,
     relational_public_schema_implicit: bool,
     relational_schema_acl: BTreeMap<String, BTreeSet<SchemaPrivilege>>,
@@ -6116,6 +6120,12 @@ pub struct RelationalRole {
     pub name: String,
     pub oid: u32,
     pub login: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationalDatabase {
+    pub name: String,
+    pub oid: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -7475,6 +7485,7 @@ impl Engine {
             relational_publications: BTreeMap::new(),
             relational_subscriptions: BTreeMap::new(),
             relational_roles: BTreeMap::new(),
+            relational_databases: BTreeMap::new(),
             relational_public_schema_exists: true,
             relational_public_schema_implicit: true,
             relational_schema_acl: BTreeMap::new(),
@@ -7718,6 +7729,8 @@ impl Engine {
             }
             Command::CreateSchema(create) => self.apply_create_schema(create)?,
             Command::DropSchema(drop) => self.apply_drop_schema(drop)?,
+            Command::CreateDatabase(create) => self.apply_create_database(create)?,
+            Command::DropDatabase(drop) => self.apply_drop_database(drop)?,
             Command::CreateTable(create) => self.apply_create_table(create)?,
             Command::AddPrimaryKey(add) => self.apply_add_primary_key(add)?,
             Command::AddUniqueConstraint(add) => self.apply_add_unique_constraint(add)?,
@@ -8253,6 +8266,62 @@ impl Engine {
         self.relational_schema_acl.clear();
         self.relational_comments
             .remove(&RelationalCommentTarget::Schema { schema: drop.name });
+        Ok(())
+    }
+
+    fn database_exists(&self, database: &str) -> bool {
+        database == "postgres" || self.relational_databases.contains_key(database)
+    }
+
+    fn apply_create_database(&mut self, create: CreateDatabase) -> Result<(), EngineError> {
+        if self.database_exists(&create.name) {
+            return Err(EngineError::ApplyFailed(format!(
+                "database \"{}\" already exists",
+                create.name
+            )));
+        }
+        let oid = self.relational_next_oid;
+        self.relational_next_oid = self.relational_next_oid.checked_add(1).ok_or_else(|| {
+            EngineError::ApplyFailed("relational database OID allocation exhausted".to_string())
+        })?;
+        self.relational_databases.insert(
+            create.name.clone(),
+            RelationalDatabase {
+                name: create.name,
+                oid,
+            },
+        );
+        Ok(())
+    }
+
+    fn apply_drop_database(&mut self, drop: DropDatabase) -> Result<(), EngineError> {
+        let mut seen = BTreeSet::new();
+        for database in &drop.names {
+            if !seen.insert(database.clone()) {
+                return Err(EngineError::ApplyFailed(format!(
+                    "database \"{}\" specified more than once",
+                    database
+                )));
+            }
+            if database == "postgres" {
+                return Err(EngineError::ApplyFailed(
+                    "cannot drop bootstrap database \"postgres\"".to_string(),
+                ));
+            }
+            if !drop.if_exists && !self.relational_databases.contains_key(database) {
+                return Err(EngineError::ApplyFailed(format!(
+                    "database \"{}\" does not exist",
+                    database
+                )));
+            }
+        }
+        for database in &drop.names {
+            self.relational_databases.remove(database);
+            self.relational_comments
+                .remove(&RelationalCommentTarget::Database {
+                    database: database.clone(),
+                });
+        }
         Ok(())
     }
 
@@ -10272,7 +10341,7 @@ impl Engine {
     fn apply_comment_on(&mut self, comment: gpu_db_protocol::CommentOn) -> Result<(), EngineError> {
         let target = match comment.target {
             CommentTarget::Database { database } => {
-                if database != "postgres" {
+                if !self.database_exists(&database) {
                     return Err(EngineError::ApplyFailed(format!(
                         "database \"{}\" does not exist",
                         database
@@ -11225,6 +11294,35 @@ impl Engine {
                     )));
                 }
             }
+            Command::CreateDatabase(create) if self.database_exists(&create.name) => {
+                return Err(EngineError::ApplyFailed(format!(
+                    "database \"{}\" already exists",
+                    create.name
+                )));
+            }
+            Command::CreateDatabase(_) => {}
+            Command::DropDatabase(drop) => {
+                let mut seen = BTreeSet::new();
+                for database in &drop.names {
+                    if !seen.insert(database.clone()) {
+                        return Err(EngineError::ApplyFailed(format!(
+                            "database \"{}\" specified more than once",
+                            database
+                        )));
+                    }
+                    if database == "postgres" {
+                        return Err(EngineError::ApplyFailed(
+                            "cannot drop bootstrap database \"postgres\"".to_string(),
+                        ));
+                    }
+                    if !drop.if_exists && !self.relational_databases.contains_key(database) {
+                        return Err(EngineError::ApplyFailed(format!(
+                            "database \"{}\" does not exist",
+                            database
+                        )));
+                    }
+                }
+            }
             Command::CreateTable(create) => {
                 if !self.relational_public_schema_exists {
                     return Err(EngineError::ApplyFailed(format!(
@@ -12168,6 +12266,8 @@ impl Engine {
             | Command::DeleteKv { .. }
             | Command::CreateSchema(_)
             | Command::DropSchema(_)
+            | Command::CreateDatabase(_)
+            | Command::DropDatabase(_)
             | Command::CreateTable(_)
             | Command::AddPrimaryKey(_)
             | Command::AddUniqueConstraint(_)
@@ -12403,6 +12503,8 @@ impl Engine {
             | Command::DeleteKv { .. }
             | Command::CreateSchema(_)
             | Command::DropSchema(_)
+            | Command::CreateDatabase(_)
+            | Command::DropDatabase(_)
             | Command::CreateTable(_)
             | Command::AddPrimaryKey(_)
             | Command::AddUniqueConstraint(_)
@@ -12539,6 +12641,8 @@ impl Engine {
             Command::DeleteKv { .. } => Err(ExecuteError::NonReadCommand("DEL/DELETE")),
             Command::CreateSchema(_) => Err(ExecuteError::NonReadCommand("CREATE SCHEMA")),
             Command::DropSchema(_) => Err(ExecuteError::NonReadCommand("DROP SCHEMA")),
+            Command::CreateDatabase(_) => Err(ExecuteError::NonReadCommand("CREATE DATABASE")),
+            Command::DropDatabase(_) => Err(ExecuteError::NonReadCommand("DROP DATABASE")),
             Command::CreateTable(_) => Err(ExecuteError::NonReadCommand("CREATE TABLE")),
             Command::AddPrimaryKey(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
             Command::AddUniqueConstraint(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
@@ -15787,6 +15891,10 @@ impl Engine {
         self.relational_roles.get(role)
     }
 
+    pub fn relational_database(&self, database: &str) -> Option<&RelationalDatabase> {
+        self.relational_databases.get(database)
+    }
+
     pub fn relational_schema_comment(&self, schema: &str) -> Option<&str> {
         self.relational_comments
             .get(&RelationalCommentTarget::Schema {
@@ -18072,6 +18180,51 @@ mod tests {
             .contains("cannot drop bootstrap role"));
         assert!(missing_role
             .execute_text(4, "CREATE ROLE app_password PASSWORD 'secret'")
+            .is_err());
+    }
+
+    #[test]
+    fn execute_text_replays_bounded_database_metadata() {
+        let mut e = Engine::new_local();
+
+        e.execute_text(1, "CREATE DATABASE appdb").unwrap();
+        e.execute_text(2, "COMMENT ON DATABASE appdb IS 'application database'")
+            .unwrap();
+
+        let appdb = e.relational_database("appdb").unwrap();
+        assert_eq!(appdb.name, "appdb");
+        assert_eq!(
+            e.relational_database_comment("appdb"),
+            Some("application database")
+        );
+
+        let duplicate = e.execute_text(3, "CREATE DATABASE appdb").unwrap_err();
+        assert!(duplicate
+            .to_string()
+            .contains("database \"appdb\" already exists"));
+
+        e.execute_text(4, "DROP DATABASE appdb").unwrap();
+        assert!(e.relational_database("appdb").is_none());
+        assert_eq!(e.relational_database_comment("appdb"), None);
+        e.execute_text(5, "DROP DATABASE IF EXISTS missing_db")
+            .unwrap();
+
+        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        assert!(recovered.relational_database("appdb").is_none());
+        assert_eq!(recovered.relational_database_comment("appdb"), None);
+
+        let mut kept = Engine::new_local();
+        kept.execute_text(1, "CREATE DATABASE appdb").unwrap();
+        let recovered_kept = Engine::recover_from_durable_wal(kept.durable_wal_records()).unwrap();
+        assert!(recovered_kept.relational_database("appdb").is_some());
+
+        assert!(Engine::new_local()
+            .execute_text(1, "DROP DATABASE postgres")
+            .unwrap_err()
+            .to_string()
+            .contains("cannot drop bootstrap database"));
+        assert!(Engine::new_local()
+            .execute_text(1, "CREATE DATABASE templated TEMPLATE template1")
             .is_err());
     }
 

@@ -2384,6 +2384,7 @@ struct Session {
     publications: BTreeMap<String, Publication>,
     subscriptions: BTreeMap<String, Subscription>,
     roles: BTreeMap<String, RoleInfo>,
+    databases: BTreeMap<String, DatabaseInfo>,
     public_schema_exists: bool,
     public_schema_implicit: bool,
     currval_sequences: HashMap<String, i64>,
@@ -2400,6 +2401,7 @@ struct Session {
     dirty_publications: BTreeSet<String>,
     dirty_subscriptions: BTreeSet<String>,
     dirty_roles: BTreeSet<String>,
+    dirty_databases: BTreeSet<String>,
     dirty_schema: bool,
     dirty_indexes: bool,
     dirty_table_acls: BTreeSet<String>,
@@ -2421,6 +2423,7 @@ struct SharedCatalog {
     publications: BTreeMap<String, Publication>,
     subscriptions: BTreeMap<String, Subscription>,
     roles: BTreeMap<String, RoleInfo>,
+    databases: BTreeMap<String, DatabaseInfo>,
     public_schema_exists: bool,
     public_schema_implicit: bool,
     indexes: Vec<CatalogIndex>,
@@ -2442,6 +2445,7 @@ impl Default for SharedCatalog {
             publications: BTreeMap::new(),
             subscriptions: BTreeMap::new(),
             roles: BTreeMap::new(),
+            databases: BTreeMap::new(),
             public_schema_exists: true,
             public_schema_implicit: true,
             indexes: Vec::new(),
@@ -2487,6 +2491,7 @@ impl Session {
             publications: catalog.publications,
             subscriptions: catalog.subscriptions,
             roles: catalog.roles,
+            databases: catalog.databases,
             public_schema_exists: catalog.public_schema_exists,
             public_schema_implicit: catalog.public_schema_implicit,
             currval_sequences: HashMap::new(),
@@ -2503,6 +2508,7 @@ impl Session {
             dirty_publications: BTreeSet::new(),
             dirty_subscriptions: BTreeSet::new(),
             dirty_roles: BTreeSet::new(),
+            dirty_databases: BTreeSet::new(),
             dirty_schema: false,
             dirty_indexes: false,
             dirty_table_acls: BTreeSet::new(),
@@ -2547,6 +2553,10 @@ impl Session {
         self.dirty_roles.insert(role.into());
     }
 
+    fn mark_database_dirty(&mut self, database: impl Into<String>) {
+        self.dirty_databases.insert(database.into());
+    }
+
     fn mark_schema_dirty(&mut self) {
         self.dirty_schema = true;
     }
@@ -2577,6 +2587,7 @@ impl Session {
             self.dirty_publications.clear();
             self.dirty_subscriptions.clear();
             self.dirty_roles.clear();
+            self.dirty_databases.clear();
             self.dirty_schema = false;
             self.dirty_table_acls.clear();
             self.dirty_schema_acl = false;
@@ -2651,6 +2662,15 @@ impl Session {
                 catalog.roles.remove(role_name);
             }
         }
+        for database_name in &self.dirty_databases {
+            if let Some(database) = self.databases.get(database_name) {
+                catalog
+                    .databases
+                    .insert(database_name.clone(), database.clone());
+            } else {
+                catalog.databases.remove(database_name);
+            }
+        }
         for table_name in &self.dirty_table_acls {
             if let Some(acl) = self.table_acls.get(table_name) {
                 catalog.table_acls.insert(table_name.clone(), acl.clone());
@@ -2721,6 +2741,7 @@ impl Session {
         self.dirty_publications.clear();
         self.dirty_subscriptions.clear();
         self.dirty_roles.clear();
+        self.dirty_databases.clear();
         self.dirty_table_acls.clear();
     }
 
@@ -2769,6 +2790,12 @@ struct RoleInfo {
     oid: u32,
     name: String,
     login: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DatabaseInfo {
+    oid: u32,
+    name: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2961,6 +2988,10 @@ fn acl_relation_kind(session: &Session, relation: &str) -> Option<AclRelationKin
 
 fn role_exists(session: &Session, role: &str) -> bool {
     role == "postgres" || session.roles.contains_key(role)
+}
+
+fn database_exists(session: &Session, database: &str) -> bool {
+    database == "postgres" || session.databases.contains_key(database)
 }
 
 fn acl_grantee_error(session: &Session, grantee: &str) -> Option<ErrorField> {
@@ -8229,6 +8260,87 @@ fn execute_statement(
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, "DROP SCHEMA");
             }
+            Command::CreateDatabase(create) => {
+                if database_exists(session, &create.name) {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "42P04",
+                            message: "database already exists",
+                            position: None,
+                        },
+                    );
+                }
+                let oid = session.next_relation_oid;
+                let Some(next_oid) = session.next_relation_oid.checked_add(1) else {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "54000",
+                            message: "relational OID counter overflow",
+                            position: None,
+                        },
+                    );
+                };
+                session.next_relation_oid = next_oid;
+                session.databases.insert(
+                    create.name.clone(),
+                    DatabaseInfo {
+                        oid,
+                        name: create.name.clone(),
+                    },
+                );
+                session.mark_database_dirty(create.name);
+                session.persist_catalog_snapshot();
+                return write_command_complete(stream, "CREATE DATABASE");
+            }
+            Command::DropDatabase(drop) => {
+                let mut seen = BTreeSet::new();
+                for database in &drop.names {
+                    if !seen.insert(database) {
+                        return write_error(
+                            stream,
+                            &ErrorField {
+                                code: "42710",
+                                message: "database specified more than once",
+                                position: None,
+                            },
+                        );
+                    }
+                    if database == "postgres" {
+                        return write_error(
+                            stream,
+                            &ErrorField {
+                                code: "0A000",
+                                message: "cannot drop bootstrap database",
+                                position: None,
+                            },
+                        );
+                    }
+                    if !drop.if_exists && !session.databases.contains_key(database) {
+                        return write_error(
+                            stream,
+                            &ErrorField {
+                                code: "3D000",
+                                message: "database does not exist",
+                                position: None,
+                            },
+                        );
+                    }
+                }
+                for database in &drop.names {
+                    if session.databases.remove(database).is_some() {
+                        let target = CatalogCommentTarget::Database {
+                            database: database.clone(),
+                        };
+                        session.comments.remove(&target);
+                        session.mark_comment_dirty(target);
+                    }
+                    session.mark_database_dirty(database.clone());
+                }
+                session.persist_catalog_snapshot();
+                return write_command_complete(stream, "DROP DATABASE");
+            }
             Command::CreateTable(create) => {
                 if !session.public_schema_exists {
                     return write_error(
@@ -9828,7 +9940,7 @@ fn execute_statement(
             Command::CommentOn(comment) => {
                 let target = match comment.target {
                     CommentTarget::Database { database } => {
-                        if database != "postgres" {
+                        if !database_exists(session, &database) {
                             return write_error(
                                 stream,
                                 &ErrorField {
@@ -11044,6 +11156,13 @@ fn execute_statement(
                 text_column("Description"),
             ],
             &catalog_psql_list_database_verbose_rows(session),
+        );
+    }
+    if canonical == "select oid, datname from pg_catalog.pg_database order by datname" {
+        return write_single_row(
+            stream,
+            &[int4_column("oid"), text_column("datname")],
+            &catalog_database_oid_rows(session),
         );
     }
     if canonical == psql_list_tablespaces_catalog_query() {
@@ -12574,9 +12693,9 @@ fn psql_list_databases_verbose_catalog_query() -> &'static str {
     "select d.datname as \"name\", pg_catalog.pg_get_userbyid(d.datdba) as \"owner\", pg_catalog.pg_encoding_to_char(d.encoding) as \"encoding\", case d.datlocprovider when 'c' then 'libc' when 'i' then 'icu' end as \"locale provider\", d.datcollate as \"collate\", d.datctype as \"ctype\", d.daticulocale as \"icu locale\", d.daticurules as \"icu rules\", pg_catalog.array_to_string(d.datacl, e'\\n') as \"access privileges\", case when pg_catalog.has_database_privilege(d.datname, 'connect') then pg_catalog.pg_size_pretty(pg_catalog.pg_database_size(d.datname)) else 'no access' end as \"size\", t.spcname as \"tablespace\", pg_catalog.shobj_description(d.oid, 'pg_database') as \"description\" from pg_catalog.pg_database d join pg_catalog.pg_tablespace t on d.dattablespace = t.oid order by 1"
 }
 
-fn catalog_psql_list_database_rows(_session: &Session) -> Vec<Vec<Option<String>>> {
-    vec![vec![
-        Some("postgres".to_string()),
+fn database_catalog_base_row(name: &str) -> Vec<Option<String>> {
+    vec![
+        Some(name.to_string()),
         Some("postgres".to_string()),
         Some("UTF8".to_string()),
         Some("libc".to_string()),
@@ -12585,29 +12704,68 @@ fn catalog_psql_list_database_rows(_session: &Session) -> Vec<Vec<Option<String>
         None,
         None,
         None,
-    ]]
+    ]
+}
+
+fn catalog_psql_list_database_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut names = vec!["postgres".to_string()];
+    names.extend(
+        session
+            .databases
+            .values()
+            .map(|database| database.name.clone()),
+    );
+    names.sort();
+    names
+        .into_iter()
+        .map(|name| database_catalog_base_row(&name))
+        .collect()
 }
 
 fn catalog_psql_list_database_verbose_rows(session: &Session) -> Vec<Vec<Option<String>>> {
-    vec![vec![
-        Some("postgres".to_string()),
-        Some("postgres".to_string()),
-        Some("UTF8".to_string()),
-        Some("libc".to_string()),
-        Some("C.UTF-8".to_string()),
-        Some("C.UTF-8".to_string()),
-        None,
-        None,
-        None,
-        Some("0 bytes".to_string()),
-        Some("pg_default".to_string()),
-        session
-            .comments
-            .get(&CatalogCommentTarget::Database {
-                database: "postgres".to_string(),
-            })
-            .cloned(),
-    ]]
+    let mut databases = vec![DatabaseInfo {
+        oid: POSTGRES_DATABASE_OID,
+        name: "postgres".to_string(),
+    }];
+    databases.extend(session.databases.values().cloned());
+    databases.sort_by_key(|database| database.name.clone());
+    databases
+        .into_iter()
+        .map(|database| {
+            vec![
+                Some(database.name.clone()),
+                Some("postgres".to_string()),
+                Some("UTF8".to_string()),
+                Some("libc".to_string()),
+                Some("C.UTF-8".to_string()),
+                Some("C.UTF-8".to_string()),
+                None,
+                None,
+                None,
+                Some("0 bytes".to_string()),
+                Some("pg_default".to_string()),
+                session
+                    .comments
+                    .get(&CatalogCommentTarget::Database {
+                        database: database.name.clone(),
+                    })
+                    .cloned(),
+            ]
+        })
+        .collect()
+}
+
+fn catalog_database_oid_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut databases = vec![DatabaseInfo {
+        oid: POSTGRES_DATABASE_OID,
+        name: "postgres".to_string(),
+    }];
+    databases.extend(session.databases.values().cloned());
+    databases.sort_by_key(|database| database.name.clone());
+    databases
+        .into_iter()
+        .map(|database| vec![Some(database.oid.to_string()), Some(database.name)])
+        .collect()
 }
 
 fn psql_list_tablespaces_catalog_query() -> &'static str {
@@ -18729,6 +18887,77 @@ mod tests {
     }
 
     #[test]
+    fn shared_catalog_persistence_carries_database_metadata() {
+        let database_name = "shared_appdb";
+        {
+            let mut catalog = shared_catalog()
+                .lock()
+                .expect("shared catalog mutex poisoned");
+            catalog.databases.remove(database_name);
+            catalog.comments.remove(&CatalogCommentTarget::Database {
+                database: database_name.to_string(),
+            });
+        }
+
+        let mut session = Session::new(true);
+        session.databases.insert(
+            database_name.to_string(),
+            DatabaseInfo {
+                oid: FIRST_USER_RELATION_OID,
+                name: database_name.to_string(),
+            },
+        );
+        session.comments.insert(
+            CatalogCommentTarget::Database {
+                database: database_name.to_string(),
+            },
+            "shared database".to_string(),
+        );
+        session.mark_database_dirty(database_name);
+        session.mark_comment_dirty(CatalogCommentTarget::Database {
+            database: database_name.to_string(),
+        });
+        session.persist_catalog_snapshot();
+
+        let mut reloaded = Session::new(true);
+        assert_eq!(
+            catalog_database_oid_rows(&reloaded),
+            vec![
+                vec![
+                    Some(POSTGRES_DATABASE_OID.to_string()),
+                    Some("postgres".to_string()),
+                ],
+                vec![
+                    Some(FIRST_USER_RELATION_OID.to_string()),
+                    Some(database_name.to_string()),
+                ],
+            ]
+        );
+        assert_eq!(
+            catalog_psql_list_database_verbose_rows(&reloaded)[1][11],
+            Some("shared database".to_string())
+        );
+
+        reloaded.databases.remove(database_name);
+        reloaded.comments.remove(&CatalogCommentTarget::Database {
+            database: database_name.to_string(),
+        });
+        reloaded.mark_database_dirty(database_name);
+        reloaded.mark_comment_dirty(CatalogCommentTarget::Database {
+            database: database_name.to_string(),
+        });
+        reloaded.persist_catalog_snapshot();
+
+        let final_session = Session::new(true);
+        assert!(!final_session.databases.contains_key(database_name));
+        assert!(!final_session
+            .comments
+            .contains_key(&CatalogCommentTarget::Database {
+                database: database_name.to_string(),
+            }));
+    }
+
+    #[test]
     fn relation_acl_rows_include_supported_views_materialized_views_and_sequences() {
         let mut session = Session::default();
         session.tables.insert(
@@ -21183,9 +21412,46 @@ mod tests {
             },
             "primary database".to_string(),
         );
+        commented_database.databases.insert(
+            "appdb".to_string(),
+            DatabaseInfo {
+                oid: FIRST_USER_RELATION_OID,
+                name: "appdb".to_string(),
+            },
+        );
+        commented_database.comments.insert(
+            CatalogCommentTarget::Database {
+                database: "appdb".to_string(),
+            },
+            "application database".to_string(),
+        );
         assert_eq!(
             catalog_psql_list_database_verbose_rows(&commented_database)[0][11],
+            Some("application database".to_string())
+        );
+        assert_eq!(
+            catalog_psql_list_database_verbose_rows(&commented_database)[1][11],
             Some("primary database".to_string())
+        );
+        assert_eq!(
+            catalog_psql_list_database_rows(&commented_database)
+                .into_iter()
+                .map(|row| row[0].clone())
+                .collect::<Vec<_>>(),
+            vec![Some("appdb".to_string()), Some("postgres".to_string())]
+        );
+        assert_eq!(
+            catalog_database_oid_rows(&commented_database),
+            vec![
+                vec![
+                    Some(FIRST_USER_RELATION_OID.to_string()),
+                    Some("appdb".to_string())
+                ],
+                vec![
+                    Some(POSTGRES_DATABASE_OID.to_string()),
+                    Some("postgres".to_string())
+                ],
+            ]
         );
         assert_eq!(
             psql_list_tablespaces_catalog_query(),

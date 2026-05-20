@@ -11,6 +11,8 @@ pub enum Command {
     GetKv { key: String },
     CreateSchema(CreateSchema),
     DropSchema(DropSchema),
+    CreateDatabase(CreateDatabase),
+    DropDatabase(DropDatabase),
     CreateTable(CreateTable),
     AddPrimaryKey(AddPrimaryKey),
     AddUniqueConstraint(AddUniqueConstraint),
@@ -72,6 +74,17 @@ pub struct CreateSchema {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DropSchema {
     pub name: String,
+    pub if_exists: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateDatabase {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropDatabase {
+    pub names: Vec<String>,
     pub if_exists: bool,
 }
 
@@ -1970,6 +1983,9 @@ fn parse_relational_command(input: &str) -> Option<Result<Command, ParseError>> 
         if second.eq_ignore_ascii_case("SCHEMA") {
             return Some(parse_create_schema(input).map(Command::CreateSchema));
         }
+        if second.eq_ignore_ascii_case("DATABASE") {
+            return Some(parse_create_database(input).map(Command::CreateDatabase));
+        }
         if second.eq_ignore_ascii_case("INDEX") || second.eq_ignore_ascii_case("UNIQUE") {
             return Some(parse_create_index(input).map(Command::CreateIndex));
         }
@@ -2018,6 +2034,9 @@ fn parse_relational_command(input: &str) -> Option<Result<Command, ParseError>> 
         }
         if second.eq_ignore_ascii_case("SCHEMA") {
             return Some(parse_drop_schema(input).map(Command::DropSchema));
+        }
+        if second.eq_ignore_ascii_case("DATABASE") {
+            return Some(parse_drop_database(input).map(Command::DropDatabase));
         }
         if second.eq_ignore_ascii_case("INDEX") {
             return Some(parse_drop_index(input).map(Command::DropIndex));
@@ -3932,6 +3951,56 @@ fn parse_drop_role(input: &str) -> Result<DropRole, ParseError> {
         names: roles
             .into_iter()
             .map(|role| normalize_identifier(role.trim()))
+            .collect::<Result<Vec<_>, _>>()?,
+        if_exists,
+    })
+}
+
+fn parse_create_database(input: &str) -> Result<CreateDatabase, ParseError> {
+    let rest = strip_keyword_prefix_case_insensitive(input, "CREATE")
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    let rest = strip_keyword_prefix_case_insensitive(rest, "DATABASE")
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    let (raw_name, rest) = split_leading_identifier(rest)?;
+    if !rest.trim().is_empty() {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    Ok(CreateDatabase {
+        name: normalize_identifier(raw_name)?,
+    })
+}
+
+fn parse_drop_database(input: &str) -> Result<DropDatabase, ParseError> {
+    let mut rest = strip_keyword_prefix_case_insensitive(input, "DROP")
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    rest = strip_keyword_prefix_case_insensitive(rest, "DATABASE")
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    let if_exists = if let Some(after_if) = strip_keyword_prefix_case_insensitive(rest, "IF") {
+        let after_exists = strip_keyword_prefix_case_insensitive(after_if.trim_start(), "EXISTS")
+            .ok_or(ParseError::InvalidRelationalSql)?;
+        rest = after_exists.trim_start();
+        true
+    } else {
+        false
+    };
+    if rest.is_empty()
+        || find_keyword_outside_quotes(rest, "FORCE").is_some()
+        || find_keyword_outside_quotes(rest, "WITH").is_some()
+    {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let names = split_csv(rest)?;
+    if names.is_empty() {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    Ok(DropDatabase {
+        names: names
+            .into_iter()
+            .map(|name| normalize_identifier(name.trim()))
             .collect::<Result<Vec<_>, _>>()?,
         if_exists,
     })
@@ -12550,6 +12619,33 @@ default: Some(ColumnDefault::SequenceNextVal {
                 if_exists: false,
             })
         );
+        assert_eq!(
+            parse_command("CREATE DATABASE appdb").unwrap(),
+            Command::CreateDatabase(CreateDatabase {
+                name: "appdb".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_command("CREATE DATABASE \"App DB\"").unwrap(),
+            Command::CreateDatabase(CreateDatabase {
+                name: "App DB".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_command("DROP DATABASE IF EXISTS appdb, stale_db").unwrap(),
+            Command::DropDatabase(DropDatabase {
+                names: vec!["appdb".to_string(), "stale_db".to_string()],
+                if_exists: true,
+            })
+        );
+        assert!(matches!(
+            parse_command("CREATE DATABASE appdb OWNER postgres"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command("DROP DATABASE appdb WITH (FORCE)"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
         assert!(matches!(
             parse_command("CREATE ROLE app_reader PASSWORD 'secret'"),
             Err(ParseError::InvalidRelationalSql)

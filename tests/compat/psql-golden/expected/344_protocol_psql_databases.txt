@@ -1,0 +1,38 @@
+=== bounded database metadata ===
+CREATE DATABASE
+COMMENT
+                                                 List of databases
+   Name   |  Owner   | Encoding | Locale Provider | Collate |  Ctype  | ICU Locale | ICU Rules | Access privileges
+----------+----------+----------+-----------------+---------+---------+------------+-----------+-------------------
+ appdb    | postgres | UTF8     | libc            | C.UTF-8 | C.UTF-8 |            |           |
+ postgres | postgres | UTF8     | libc            | C.UTF-8 | C.UTF-8 |            |           |
+(2 rows)
+
+                                                                        List of databases
+   Name   |  Owner   | Encoding | Locale Provider | Collate |  Ctype  | ICU Locale | ICU Rules | Access privileges |  Size   | Tablespace |     Description
+----------+----------+----------+-----------------+---------+---------+------------+-----------+-------------------+---------+------------+----------------------
+ appdb    | postgres | UTF8     | libc            | C.UTF-8 | C.UTF-8 |            |           |                   | 0 bytes | pg_default | application database
+ postgres | postgres | UTF8     | libc            | C.UTF-8 | C.UTF-8 |            |           |                   | 0 bytes | pg_default |
+(2 rows)
+
+  oid  | datname
+-------+----------
+ 16384 | appdb
+     5 | postgres
+(2 rows)
+
+DROP DATABASE
+                                                 List of databases
+   Name   |  Owner   | Encoding | Locale Provider | Collate |  Ctype  | ICU Locale | ICU Rules | Access privileges
+----------+----------+----------+-----------------+---------+---------+------------+-----------+-------------------
+ postgres | postgres | UTF8     | libc            | C.UTF-8 | C.UTF-8 |            |           |
+(1 row)
+
+CREATE DATABASE
+psql:344_protocol_psql_databases.sql:10: ERROR:  database already exists
+psql:344_protocol_psql_databases.sql:11: ERROR:  database does not exist
+DROP DATABASE
+psql:344_protocol_psql_databases.sql:13: ERROR:  cannot drop bootstrap database
+psql:344_protocol_psql_databases.sql:14: ERROR:  query shape is not supported by the compatibility stub
+psql:344_protocol_psql_databases.sql:15: ERROR:  database does not exist
+DROP DATABASE
