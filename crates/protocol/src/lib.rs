@@ -36,6 +36,7 @@ pub enum Command {
     RefreshMaterializedView(RefreshMaterializedView),
     RenameMaterializedView(RenameMaterializedView),
     CreateFunction(CreateFunction),
+    RenameFunction(RenameFunction),
     DropFunction(DropFunction),
     SelectFunction(SelectFunction),
     CreateExtension(CreateExtension),
@@ -275,6 +276,12 @@ pub struct CreateFunction {
     pub name: String,
     pub return_type: SqlType,
     pub body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenameFunction {
+    pub old_name: String,
+    pub new_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2226,6 +2233,13 @@ fn parse_relational_command(input: &str) -> Option<Result<Command, ParseError>> 
         if input
             .split_whitespace()
             .nth(1)
+            .is_some_and(|second| second.eq_ignore_ascii_case("FUNCTION"))
+        {
+            return Some(parse_rename_function(input).map(Command::RenameFunction));
+        }
+        if input
+            .split_whitespace()
+            .nth(1)
             .is_some_and(|second| second.eq_ignore_ascii_case("SEQUENCE"))
         {
             return Some(parse_rename_sequence(input).map(Command::RenameSequence));
@@ -3706,6 +3720,43 @@ fn parse_rename_sequence(input: &str) -> Result<RenameSequence, ParseError> {
         return Err(ParseError::InvalidRelationalSql);
     }
     Ok(RenameSequence {
+        old_name,
+        new_name: normalize_identifier(after_to)?,
+    })
+}
+
+fn parse_rename_function(input: &str) -> Result<RenameFunction, ParseError> {
+    let rest = strip_keyword_prefix_case_insensitive(input, "ALTER")
+        .and_then(|s| strip_keyword_prefix_case_insensitive(s.trim_start(), "FUNCTION"))
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    if strip_keyword_prefix_case_insensitive(rest, "IF").is_some()
+        || strip_keyword_prefix_case_insensitive(rest, "ALL").is_some()
+        || strip_keyword_prefix_case_insensitive(rest, "CURRENT").is_some()
+        || find_keyword_outside_quotes(rest, "OWNER").is_some()
+        || find_keyword_outside_quotes(rest, "SET").is_some()
+        || find_keyword_outside_quotes(rest, "RESET").is_some()
+        || find_keyword_outside_quotes(rest, "DEPENDS").is_some()
+    {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let rename_pos =
+        find_keyword_outside_quotes(rest, "RENAME").ok_or(ParseError::InvalidRelationalSql)?;
+    let old_name = normalize_function_signature(rest[..rename_pos].trim())?;
+    let after_rename = rest[rename_pos + "RENAME".len()..].trim_start();
+    let after_to = strip_keyword_prefix_case_insensitive(after_rename, "TO")
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim();
+    if after_to.is_empty()
+        || find_keyword_outside_quotes(after_to, "CASCADE").is_some()
+        || find_keyword_outside_quotes(after_to, "RESTRICT").is_some()
+        || after_to.contains('.')
+        || after_to.contains('(')
+        || after_to.contains(')')
+    {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    Ok(RenameFunction {
         old_name,
         new_name: normalize_identifier(after_to)?,
     })
@@ -14953,6 +15004,13 @@ default: Some(ColumnDefault::SequenceNextVal {
             })
         );
         assert_eq!(
+            parse_command("ALTER FUNCTION public.answer() RENAME TO ultimate_answer").unwrap(),
+            Command::RenameFunction(RenameFunction {
+                old_name: "answer".to_string(),
+                new_name: "ultimate_answer".to_string(),
+            })
+        );
+        assert_eq!(
             parse_command("DROP FUNCTION IF EXISTS public.answer()").unwrap(),
             Command::DropFunction(DropFunction {
                 name: "answer".to_string(),
@@ -14988,6 +15046,18 @@ default: Some(ColumnDefault::SequenceNextVal {
             parse_command(
                 "CREATE FUNCTION public.answer() RETURNS int4 LANGUAGE plpgsql AS 'BEGIN END'"
             ),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command("ALTER FUNCTION public.answer(int4) RENAME TO answer2"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command("ALTER FUNCTION public.answer() RENAME TO public.answer2"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command("ALTER FUNCTION public.answer() OWNER TO postgres"),
             Err(ParseError::InvalidRelationalSql)
         ));
         assert!(matches!(

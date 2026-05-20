@@ -26,10 +26,11 @@ use gpu_db_protocol::{
     DatabasePrivilege, Delete, DropConstraint, DropDatabase, DropDomain, DropIndex,
     DropMaterializedView, DropPublication, DropRole, DropSchema, DropSequence, DropSubscription,
     DropTable, DropTablespace, DropView, Insert, ParseError, PublicationTarget,
-    RefreshMaterializedView, RenameColumn, RenameConstraint, RenameDatabase, RenameIndex,
-    RenameMaterializedView, RenameRole, RenameSequence, RenameTable, RenameTablespace, RenameView,
-    SchemaPrivilege, Select, SelectFilterOp, SelectFunction, SelectProjection, SequenceNextVal,
-    SequenceSetVal, SqlType, SqlValue, TablePrivilege, TablespacePrivilege, TruncateTable, Update,
+    RefreshMaterializedView, RenameColumn, RenameConstraint, RenameDatabase, RenameFunction,
+    RenameIndex, RenameMaterializedView, RenameRole, RenameSequence, RenameTable, RenameTablespace,
+    RenameView, SchemaPrivilege, Select, SelectFilterOp, SelectFunction, SelectProjection,
+    SequenceNextVal, SequenceSetVal, SqlType, SqlValue, TablePrivilege, TablespacePrivilege,
+    TruncateTable, Update,
 };
 use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine};
 use gpu_db_storage::{
@@ -106,6 +107,7 @@ impl ReplicatedStateMachine for KvStateMachine {
                     | Command::RefreshMaterializedView(_)
                     | Command::RenameMaterializedView(_)
                     | Command::CreateFunction(_)
+                    | Command::RenameFunction(_)
                     | Command::DropFunction(_)
                     | Command::SelectFunction(_)
                     | Command::CreateExtension(_)
@@ -7910,6 +7912,7 @@ impl Engine {
                 self.apply_rename_materialized_view(rename)?
             }
             Command::CreateFunction(create) => self.apply_create_function(create)?,
+            Command::RenameFunction(rename) => self.apply_rename_function(rename)?,
             Command::DropFunction(drop) => self.apply_drop_function(drop)?,
             Command::SelectFunction(_) => {}
             Command::CreateSequence(create) => self.apply_create_sequence(create)?,
@@ -8221,6 +8224,39 @@ impl Engine {
             .remove(&RelationalCommentTarget::Function {
                 function: drop.name,
             });
+        Ok(())
+    }
+
+    fn apply_rename_function(&mut self, rename: RenameFunction) -> Result<(), EngineError> {
+        if !self.relational_functions.contains_key(&rename.old_name) {
+            return Err(EngineError::ApplyFailed(format!(
+                "function \"{}\" does not exist",
+                rename.old_name
+            )));
+        }
+        if self.relational_functions.contains_key(&rename.new_name) {
+            return Err(EngineError::ApplyFailed(format!(
+                "function \"{}\" already exists",
+                rename.new_name
+            )));
+        }
+        let Some(mut function) = self.relational_functions.remove(&rename.old_name) else {
+            return Ok(());
+        };
+        function.name = rename.new_name.clone();
+        self.relational_functions
+            .insert(rename.new_name.clone(), function);
+        let old_target = RelationalCommentTarget::Function {
+            function: rename.old_name,
+        };
+        if let Some(comment) = self.relational_comments.remove(&old_target) {
+            self.relational_comments.insert(
+                RelationalCommentTarget::Function {
+                    function: rename.new_name,
+                },
+                comment,
+            );
+        }
         Ok(())
     }
 
@@ -12444,6 +12480,20 @@ impl Engine {
                     create.name
                 )));
             }
+            Command::RenameFunction(rename) => {
+                if !self.relational_functions.contains_key(&rename.old_name) {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "function \"{}\" does not exist",
+                        rename.old_name
+                    )));
+                }
+                if self.relational_functions.contains_key(&rename.new_name) {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "function \"{}\" already exists",
+                        rename.new_name
+                    )));
+                }
+            }
             Command::DropFunction(drop)
                 if !drop.if_exists && !self.relational_functions.contains_key(&drop.name) =>
             {
@@ -12973,6 +13023,7 @@ impl Engine {
             | Command::RefreshMaterializedView(_)
             | Command::RenameMaterializedView(_)
             | Command::CreateFunction(_)
+            | Command::RenameFunction(_)
             | Command::DropFunction(_)
             | Command::CreateSequence(_)
             | Command::CreateDomain(_)
@@ -13221,6 +13272,7 @@ impl Engine {
             | Command::RefreshMaterializedView(_)
             | Command::RenameMaterializedView(_)
             | Command::CreateFunction(_)
+            | Command::RenameFunction(_)
             | Command::DropFunction(_)
             | Command::CreateSequence(_)
             | Command::CreateDomain(_)
@@ -13377,6 +13429,7 @@ impl Engine {
                 Err(ExecuteError::NonReadCommand("ALTER MATERIALIZED VIEW"))
             }
             Command::CreateFunction(_) => Err(ExecuteError::NonReadCommand("CREATE FUNCTION")),
+            Command::RenameFunction(_) => Err(ExecuteError::NonReadCommand("ALTER FUNCTION")),
             Command::DropFunction(_) => Err(ExecuteError::NonReadCommand("DROP FUNCTION")),
             Command::CreateSequence(_) => Err(ExecuteError::NonReadCommand("CREATE SEQUENCE")),
             Command::CreateDomain(_) => Err(ExecuteError::NonReadCommand("CREATE DOMAIN")),
@@ -39587,37 +39640,88 @@ mod tests {
             e.relational_function_comment("answer"),
             Some("metadata only")
         );
+        e.execute_text(
+            3,
+            "ALTER FUNCTION public.answer() RENAME TO ultimate_answer",
+        )
+        .unwrap();
+        assert!(e.relational_catalog_function("answer").is_none());
+        let renamed_function = e.relational_catalog_function("ultimate_answer").unwrap();
+        assert_eq!(renamed_function.oid, oid);
+        assert_eq!(renamed_function.return_type, SqlType::Int4);
+        assert_eq!(renamed_function.body, "SELECT 42");
+        assert_eq!(
+            e.relational_function_comment("ultimate_answer"),
+            Some("metadata only")
+        );
+        assert_eq!(e.relational_function_comment("answer"), None);
 
         let mut recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
-        let recovered_function = recovered.relational_catalog_function("answer").unwrap();
+        let recovered_function = recovered
+            .relational_catalog_function("ultimate_answer")
+            .unwrap();
         assert_eq!(recovered_function.oid, oid);
         assert_eq!(recovered_function.return_type, SqlType::Int4);
         assert_eq!(
-            recovered.relational_function_comment("answer"),
+            recovered.relational_function_comment("ultimate_answer"),
             Some("metadata only")
         );
         let result = recovered
             .execute_relational_function(&SelectFunction {
-                name: "answer".to_string(),
+                name: "ultimate_answer".to_string(),
             })
             .unwrap();
-        assert_eq!(result.columns[0].name, "answer");
+        assert_eq!(result.columns[0].name, "ultimate_answer");
         assert_eq!(result.columns[0].ty, SqlType::Int4);
         assert_eq!(result.rows, vec![vec![SqlValue::Int4(42)]]);
+        let missing_old = recovered
+            .execute_relational_function(&SelectFunction {
+                name: "answer".to_string(),
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(
+            missing_old.contains("function \"answer\" does not exist"),
+            "{missing_old}"
+        );
 
         let duplicate = e
             .execute_text(
-                3,
-                "CREATE FUNCTION public.answer() RETURNS text LANGUAGE sql AS 'SELECT ''x'''",
+                4,
+                "CREATE FUNCTION public.ultimate_answer() RETURNS text LANGUAGE sql AS 'SELECT ''x'''",
             )
             .unwrap_err()
             .to_string();
         assert!(
-            duplicate.contains("function \"answer\" already exists"),
+            duplicate.contains("function \"ultimate_answer\" already exists"),
             "{duplicate}"
         );
+        e.execute_text(
+            5,
+            "CREATE FUNCTION public.greeting() RETURNS text LANGUAGE sql AS 'SELECT ''hello'''",
+        )
+        .unwrap();
+        let duplicate_rename = e
+            .execute_text(
+                6,
+                "ALTER FUNCTION public.ultimate_answer() RENAME TO greeting",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            duplicate_rename.contains("function \"greeting\" already exists"),
+            "{duplicate_rename}"
+        );
+        let missing_rename = e
+            .execute_text(7, "ALTER FUNCTION missing() RENAME TO still_missing")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            missing_rename.contains("function \"missing\" does not exist"),
+            "{missing_rename}"
+        );
         let missing_comment = e
-            .execute_text(4, "COMMENT ON FUNCTION missing() IS 'missing'")
+            .execute_text(8, "COMMENT ON FUNCTION missing() IS 'missing'")
             .unwrap_err()
             .to_string();
         assert!(
@@ -39625,21 +39729,22 @@ mod tests {
             "{missing_comment}"
         );
         let missing_drop = e
-            .execute_text(5, "DROP FUNCTION missing()")
+            .execute_text(9, "DROP FUNCTION missing()")
             .unwrap_err()
             .to_string();
         assert!(
             missing_drop.contains("function \"missing\" does not exist"),
             "{missing_drop}"
         );
-        e.execute_text(6, "DROP FUNCTION IF EXISTS missing()")
+        e.execute_text(10, "DROP FUNCTION IF EXISTS missing()")
             .unwrap();
-        e.execute_text(7, "DROP FUNCTION answer()").unwrap();
-        assert!(e.relational_catalog_function("answer").is_none());
-        assert_eq!(e.relational_function_comment("answer"), None);
+        e.execute_text(11, "DROP FUNCTION ultimate_answer()")
+            .unwrap();
+        assert!(e.relational_catalog_function("ultimate_answer").is_none());
+        assert_eq!(e.relational_function_comment("ultimate_answer"), None);
 
         e.execute_text(
-            8,
+            12,
             "CREATE FUNCTION public.bad_body() RETURNS int4 LANGUAGE sql AS 'SELECT id FROM people'",
         )
         .unwrap();

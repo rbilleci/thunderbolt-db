@@ -14,20 +14,40 @@ JOIN pg_catalog.pg_description d ON d.objoid = p.oid
 WHERE n.nspname = 'public'
 ORDER BY p.proname;
 SELECT answer();
+ALTER FUNCTION public.answer() RENAME TO ultimate_answer;
+\df
+\df+
+SELECT p.oid, n.nspname, p.proname, p.prorettype, pg_catalog.pg_get_function_result(p.oid), p.prosrc
+FROM pg_catalog.pg_proc p
+JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname = 'public'
+ORDER BY p.proname;
+SELECT p.proname, d.description
+FROM pg_catalog.pg_proc p
+JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+JOIN pg_catalog.pg_description d ON d.objoid = p.oid
+WHERE n.nspname = 'public'
+ORDER BY p.proname;
+SELECT ultimate_answer();
+SELECT answer();
 CREATE FUNCTION public.greeting() RETURNS text LANGUAGE sql AS 'SELECT ''hello''';
 SELECT public.greeting();
+ALTER FUNCTION public.ultimate_answer() RENAME TO greeting;
+ALTER FUNCTION missing_function() RENAME TO still_missing;
+ALTER FUNCTION public.ultimate_answer(int4) RENAME TO unsupported_args;
+ALTER FUNCTION public.ultimate_answer() RENAME TO public.unsupported_target;
 CREATE FUNCTION public.bad_body() RETURNS int4 LANGUAGE sql AS 'SELECT id FROM people';
 SELECT bad_body();
 SELECT missing_function();
 SELECT answer(1);
-CREATE FUNCTION public.answer() RETURNS text LANGUAGE sql AS 'SELECT ''x''';
+CREATE FUNCTION public.ultimate_answer() RETURNS text LANGUAGE sql AS 'SELECT ''x''';
 CREATE FUNCTION public.echo(int4) RETURNS int4 LANGUAGE sql AS 'SELECT $1';
 CREATE FUNCTION public.unsupported() RETURNS bigint LANGUAGE sql AS 'SELECT 1';
 CREATE FUNCTION public.unsupported_lang() RETURNS int4 LANGUAGE plpgsql AS 'BEGIN END';
 COMMENT ON FUNCTION missing() IS 'missing';
 DROP FUNCTION missing();
 DROP FUNCTION IF EXISTS missing();
-DROP FUNCTION answer();
+DROP FUNCTION ultimate_answer();
 DROP FUNCTION greeting();
 DROP FUNCTION bad_body();
 \df

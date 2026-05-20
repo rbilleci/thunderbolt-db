@@ -85,6 +85,7 @@ impl Planner {
             | Command::RefreshMaterializedView(_)
             | Command::RenameMaterializedView(_)
             | Command::CreateFunction(_)
+            | Command::RenameFunction(_)
             | Command::DropFunction(_)
             | Command::CreateSequence(_)
             | Command::CreateDomain(_)

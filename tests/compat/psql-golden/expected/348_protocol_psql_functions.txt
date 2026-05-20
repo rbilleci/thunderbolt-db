@@ -27,22 +27,55 @@ COMMENT
      42
 (1 row)
 
+ALTER FUNCTION
+                            List of functions
+ Schema |      Name       | Result data type | Argument data types | Type
+--------+-----------------+------------------+---------------------+------
+ public | ultimate_answer | integer          |                     | func
+(1 row)
+
+                                                                                       List of functions
+ Schema |      Name       | Result data type | Argument data types | Type | Volatility | Parallel |  Owner   | Security | Access privileges | Language | Internal name |      Description
+--------+-----------------+------------------+---------------------+------+------------+----------+----------+----------+-------------------+----------+---------------+------------------------
+ public | ultimate_answer | integer          |                     | func | volatile   | unsafe   | postgres | invoker  |                   | sql      |               | metadata-only function
+(1 row)
+
+  oid  | nspname |     proname     | prorettype | pg_get_function_result |  prosrc
+-------+---------+-----------------+------------+------------------------+-----------
+ 16384 | public  | ultimate_answer |         23 | integer                | SELECT 42
+(1 row)
+
+     proname     |      description
+-----------------+------------------------
+ ultimate_answer | metadata-only function
+(1 row)
+
+ ultimate_answer
+-----------------
+              42
+(1 row)
+
+psql:348_protocol_psql_functions.sql:32: ERROR:  function does not exist
 CREATE FUNCTION
  greeting
 ----------
  hello
 (1 row)
 
+psql:348_protocol_psql_functions.sql:35: ERROR:  function already exists with same argument types
+psql:348_protocol_psql_functions.sql:36: ERROR:  function does not exist
+psql:348_protocol_psql_functions.sql:37: ERROR:  query shape is not supported by the compatibility stub
+psql:348_protocol_psql_functions.sql:38: ERROR:  query shape is not supported by the compatibility stub
 CREATE FUNCTION
-psql:348_protocol_psql_functions.sql:20: ERROR:  only literal SELECT bodies are supported for SQL function execution
-psql:348_protocol_psql_functions.sql:21: ERROR:  function does not exist
-psql:348_protocol_psql_functions.sql:22: ERROR:  query shape is not supported by the compatibility stub
-psql:348_protocol_psql_functions.sql:23: ERROR:  function already exists with same argument types
-psql:348_protocol_psql_functions.sql:24: ERROR:  query shape is not supported by the compatibility stub
-psql:348_protocol_psql_functions.sql:25: ERROR:  query shape is not supported by the compatibility stub
-psql:348_protocol_psql_functions.sql:26: ERROR:  query shape is not supported by the compatibility stub
-psql:348_protocol_psql_functions.sql:27: ERROR:  function does not exist
-psql:348_protocol_psql_functions.sql:28: ERROR:  function does not exist
+psql:348_protocol_psql_functions.sql:40: ERROR:  only literal SELECT bodies are supported for SQL function execution
+psql:348_protocol_psql_functions.sql:41: ERROR:  function does not exist
+psql:348_protocol_psql_functions.sql:42: ERROR:  query shape is not supported by the compatibility stub
+psql:348_protocol_psql_functions.sql:43: ERROR:  function already exists with same argument types
+psql:348_protocol_psql_functions.sql:44: ERROR:  query shape is not supported by the compatibility stub
+psql:348_protocol_psql_functions.sql:45: ERROR:  query shape is not supported by the compatibility stub
+psql:348_protocol_psql_functions.sql:46: ERROR:  query shape is not supported by the compatibility stub
+psql:348_protocol_psql_functions.sql:47: ERROR:  function does not exist
+psql:348_protocol_psql_functions.sql:48: ERROR:  function does not exist
 DROP FUNCTION
 DROP FUNCTION
 DROP FUNCTION

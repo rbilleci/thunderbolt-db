@@ -2174,6 +2174,50 @@ fn rename_sequence_in_session(
     Ok(())
 }
 
+fn rename_function_in_session(
+    session: &mut Session,
+    old_name: &str,
+    new_name: &str,
+) -> Result<(), ErrorField> {
+    if !session.functions.contains_key(old_name) {
+        return Err(ErrorField {
+            code: "42883",
+            message: "function does not exist",
+            position: None,
+        });
+    }
+    if session.functions.contains_key(new_name) {
+        return Err(ErrorField {
+            code: "42723",
+            message: "function already exists with same argument types",
+            position: None,
+        });
+    }
+    let mut function = session
+        .functions
+        .remove(old_name)
+        .expect("function existence validated");
+    function.name = new_name.to_string();
+    session.functions.insert(new_name.to_string(), function);
+    session.mark_function_dirty(old_name.to_string());
+    session.mark_function_dirty(new_name.to_string());
+
+    let old_target = CatalogCommentTarget::Function {
+        function: old_name.to_string(),
+    };
+    if let Some(comment) = session.comments.remove(&old_target) {
+        let new_target = CatalogCommentTarget::Function {
+            function: new_name.to_string(),
+        };
+        session.comments.insert(new_target.clone(), comment);
+        session.mark_comment_dirty(old_target);
+        session.mark_comment_dirty(new_target);
+    }
+
+    session.persist_catalog_snapshot();
+    Ok(())
+}
+
 fn rename_table_in_session(
     session: &mut Session,
     old_name: &str,
@@ -9673,6 +9717,14 @@ fn execute_statement(
                 session.mark_function_dirty(create.name);
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, "CREATE FUNCTION");
+            }
+            Command::RenameFunction(rename) => {
+                if let Err(error) =
+                    rename_function_in_session(session, &rename.old_name, &rename.new_name)
+                {
+                    return write_error(stream, &error);
+                }
+                return write_command_complete(stream, "ALTER FUNCTION");
             }
             Command::CreateSequence(create) => {
                 if session.tables.contains_key(&create.name)
@@ -20451,6 +20503,97 @@ mod tests {
         });
         catalog.comments.remove(&CatalogCommentTarget::Sequence {
             sequence: new_sequence_name.to_string(),
+        });
+    }
+
+    #[test]
+    fn shared_catalog_persistence_carries_renamed_function_metadata() {
+        let old_function_name = "shared_function_answer";
+        let new_function_name = "shared_function_renamed_answer";
+        {
+            let mut catalog = shared_catalog()
+                .lock()
+                .expect("shared catalog mutex poisoned");
+            catalog.functions.remove(old_function_name);
+            catalog.functions.remove(new_function_name);
+            catalog.comments.remove(&CatalogCommentTarget::Function {
+                function: old_function_name.to_string(),
+            });
+            catalog.comments.remove(&CatalogCommentTarget::Function {
+                function: new_function_name.to_string(),
+            });
+        }
+
+        let mut session = Session::new(true);
+        session.functions.insert(
+            old_function_name.to_string(),
+            FunctionInfo {
+                oid: FIRST_USER_RELATION_OID,
+                name: old_function_name.to_string(),
+                return_type: SqlType::Int4,
+                body: "SELECT 42".to_string(),
+            },
+        );
+        session.comments.insert(
+            CatalogCommentTarget::Function {
+                function: old_function_name.to_string(),
+            },
+            "metadata function".to_string(),
+        );
+        session.mark_function_dirty(old_function_name);
+        session.mark_comment_dirty(CatalogCommentTarget::Function {
+            function: old_function_name.to_string(),
+        });
+        session.persist_catalog_snapshot();
+
+        rename_function_in_session(&mut session, old_function_name, new_function_name).unwrap();
+
+        let reloaded = Session::new(true);
+        assert!(pg_catalog_function_rows(&reloaded).contains(&vec![
+            Some(FIRST_USER_RELATION_OID.to_string()),
+            Some("public".to_string()),
+            Some(new_function_name.to_string()),
+            Some("23".to_string()),
+            Some("integer".to_string()),
+            Some("SELECT 42".to_string()),
+        ]));
+        assert!(
+            psql_describe_function_verbose_rows(&reloaded).contains(&vec![
+                Some("public".to_string()),
+                Some(new_function_name.to_string()),
+                Some("integer".to_string()),
+                None,
+                Some("func".to_string()),
+                Some("volatile".to_string()),
+                Some("unsafe".to_string()),
+                Some("postgres".to_string()),
+                Some("invoker".to_string()),
+                None,
+                Some("sql".to_string()),
+                None,
+                Some("metadata function".to_string()),
+            ])
+        );
+        assert!(!pg_catalog_function_rows(&reloaded)
+            .iter()
+            .any(|row| row.get(2).and_then(Option::as_deref) == Some(old_function_name)));
+        assert_eq!(
+            rename_function_in_session(&mut session, "missing_function", "another_function")
+                .unwrap_err()
+                .code,
+            "42883"
+        );
+
+        let mut catalog = shared_catalog()
+            .lock()
+            .expect("shared catalog mutex poisoned");
+        catalog.functions.remove(old_function_name);
+        catalog.functions.remove(new_function_name);
+        catalog.comments.remove(&CatalogCommentTarget::Function {
+            function: old_function_name.to_string(),
+        });
+        catalog.comments.remove(&CatalogCommentTarget::Function {
+            function: new_function_name.to_string(),
         });
     }
 
