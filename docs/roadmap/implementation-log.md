@@ -2,6 +2,14 @@
 
 ## 2026-05-20
 
+- Added a local aggregate application-driver compatibility gate. `scripts/run_application_driver_smokes.sh`
+  runs the checked-in `tokio-postgres`, `sqlx`, `node-postgres`, `asyncpg`, and
+  `psycopg` app-shaped smokes against `gpu-db-server`, emits stable per-driver
+  evidence lines, and reports `pgx` plus JDBC/R2DBC as blocked when local Go or
+  Java build tooling is absent. The gate keeps COPY streaming, TLS/GSS/cancel,
+  richer type/OID metadata, advanced portals, and broad SQL grammar out of
+  scope for the current supported SQL/protocol subset.
+
 - Added a combined local resilience drill with `scripts/run_local_resilience_drill.sh`. The drill runs the checked backup/PITR/DR gate and the checked replication deployment preflight, verifies both evidence contracts, reports the combined local restore/PITR/maintenance/object-bundle plus packaged-service/systemd/Kubernetes/Compose-restart replication envelope, and keeps physical page-image backup, production object storage, live scheduling, live systemd/Kubernetes rollout, and production failover orchestration explicit gaps.
 
 - Reconciled P8 timing source-of-truth wording after the first resident CUDA-event timing slice. Roadmap, README, and no-NVIDIA performance notes now distinguish implemented first accepted-route resident-kernel event samples from broader future CUDA event timing coverage, instead of implying that all driver-level timing publication remains unstarted.
