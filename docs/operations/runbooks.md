@@ -96,6 +96,29 @@ Boundaries:
 - This is not live systemd or Kubernetes rollout.
 - This is not live background scheduling or production timeline failover orchestration.
 
+### 1e) Local PostgreSQL-Compatible Product Preflight
+
+Run before treating the current supported PostgreSQL-facing envelope as a local release candidate:
+
+```bash
+scripts/run_local_product_preflight.sh
+```
+
+Pass criteria:
+
+- `local_product_preflight=passed`
+- Application-driver evidence includes the checked `tokio-postgres`, `sqlx`, `node-postgres`, `asyncpg`, and `psycopg` smoke gates.
+- Dump/restore evidence includes plain, custom, directory, tar, parallel directory, clean, insert-style, and split schema/data restore modes for the supported public object subset.
+- Local resilience evidence includes backup/PITR/DR plus replication deployment preflight.
+- The output names the remaining `pgx`, JDBC/R2DBC, physical backup, production object-storage, live scheduling, live systemd/Kubernetes rollout, and production timeline-failover gaps.
+
+Boundaries:
+
+- This is an aggregate local product-readiness command over existing checked gates.
+- This does not add new SQL/protocol/catalog support.
+- This does not install Go or Java tooling for the remaining driver gates.
+- This does not claim production orchestration or broad PostgreSQL parity beyond the supported subset.
+
 ## 2) WAL Durability Incident (Flush Failure)
 
 Symptoms:
@@ -184,7 +207,8 @@ For the current single-node relational WAL segment proof:
 15. For local object-bundle backup proof, export a validated archive with `Engine::export_durable_wal_archive_object_backup(...)` and restore it with `Engine::restore_durable_wal_archive_object_backup(...)`; restore verifies every manifest/segment object length and checksum, cross-checks the manifest object bytes against the backup manifest metadata, stages restored segment files until every object verifies, and then installs the restored archive manifest. Operators can run the checked preflight with `cargo run -p gpu_db_engine --example wal_archive_object_backup_preflight -- --archive-manifest <MANIFEST> --backup-manifest <BACKUP> --object-dir <OBJECT_DIR> --restored-manifest <RESTORED_MANIFEST> --restored-segment-dir <RESTORED_SEGMENTS> --recover-timestamp-micros <target>`, use `--restore-only` to verify an existing backup manifest/object directory, and use `scripts/run_wal_archive_object_backup_preflight_smoke.sh` as the local regression gate for export/restore/recover evidence plus corrupt-object rejection-before-install.
 16. For the recurring local DR drill, run `scripts/run_backup_pitr_dr_drill.sh`; it aggregates the focused base-plus-archive restore tests, checkpoint PITR-window retention tests, scheduler-safe maintenance preflight, object-bundle backup preflight, and MVCC retention boundary tests into one operator gate.
 17. For a combined local resilience game-day gate, run `scripts/run_local_resilience_drill.sh`; it runs the local backup/PITR/DR drill and the local replication deployment preflight, verifies both evidence contracts, and reports the combined supported scope.
-18. Treat physical page-image base backups, production object-storage APIs, automated production timeline failover orchestration beyond local registered-target selection/pruning, live systemd/Kubernetes rollout, and live background cleanup scheduling as not yet implemented.
+18. For a local PostgreSQL-compatible product preflight, run `scripts/run_local_product_preflight.sh`; it runs the checked application-driver gate, pg_dump/pg_restore gate, and local resilience drill, verifies stable evidence from each, and reports the current supported envelope plus blocked/open gaps.
+19. Treat physical page-image base backups, production object-storage APIs, automated production timeline failover orchestration beyond local registered-target selection/pruning, live systemd/Kubernetes rollout, and live background cleanup scheduling as not yet implemented.
 
 Failure criteria:
 

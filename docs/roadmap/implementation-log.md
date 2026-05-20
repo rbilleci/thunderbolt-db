@@ -2,6 +2,14 @@
 
 ## 2026-05-20
 
+- Added a local PostgreSQL-compatible product preflight gate. `scripts/run_local_product_preflight.sh`
+  runs the checked application-driver smoke gate, the real PostgreSQL 16
+  `pg_dump`/`pg_restore` workflow gate, and the local resilience drill, verifies
+  stable evidence lines from each, and reports the remaining blocked/open gaps
+  for `pgx`, JDBC/R2DBC, physical page-image backup, production object storage,
+  live background scheduling, live systemd/Kubernetes rollout, and production
+  timeline failover without adding new SQL/protocol/catalog behavior.
+
 - Added bounded extended-protocol COPY for the supported public `int4`/`text`
   table COPY subset. The compatibility endpoint now accepts extended
   `Parse`/`Bind`/`Describe`/`Execute` for `COPY [public.]table TO STDOUT` and
