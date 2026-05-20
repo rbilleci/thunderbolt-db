@@ -49,6 +49,7 @@ CREATE ROLE global_reader WITH LOGIN;
 COMMENT ON ROLE global_reader IS 'global metadata reader';
 CREATE TABLESPACE global_space LOCATION '/tmp/gpu-db-global-space';
 COMMENT ON TABLESPACE global_space IS 'global metadata tablespace';
+GRANT CREATE ON TABLESPACE global_space TO global_reader;
 SQL
 
 PGHOST=127.0.0.1 PGPORT="$SOURCE_PORT" PGDATABASE=postgres PGUSER=postgres \
@@ -59,6 +60,7 @@ grep -F "CREATE ROLE global_reader;" "$OUT_DIR/globals.sql" >/dev/null
 grep -F "COMMENT ON ROLE global_reader IS 'global metadata reader';" "$OUT_DIR/globals.sql" >/dev/null
 grep -F "CREATE TABLESPACE global_space OWNER postgres LOCATION '/tmp/gpu-db-global-space';" "$OUT_DIR/globals.sql" >/dev/null
 grep -F "COMMENT ON TABLESPACE global_space IS 'global metadata tablespace';" "$OUT_DIR/globals.sql" >/dev/null
+grep -F "GRANT ALL ON TABLESPACE global_space TO global_reader;" "$OUT_DIR/globals.sql" >/dev/null
 
 grep -Ev '^(CREATE ROLE postgres;|ALTER ROLE .* WITH )' "$OUT_DIR/globals.sql" \
   >"$OUT_DIR/globals-restore.sql"
@@ -83,8 +85,9 @@ grep -F "global metadata reader" "$OUT_DIR/verify.out" >/dev/null
 grep -F "global_space" "$OUT_DIR/verify.out" >/dev/null
 grep -F "/tmp/gpu-db-global-space" "$OUT_DIR/verify.out" >/dev/null
 grep -F "global metadata tablespace" "$OUT_DIR/verify.out" >/dev/null
+grep -F "global_reader=C/postgres" "$OUT_DIR/verify.out" >/dev/null
 
 printf 'pg_dumpall_globals_restore=passed\n'
-printf 'pg_dumpall_globals_scope=roles_tablespaces_comments_no_role_passwords\n'
+printf 'pg_dumpall_globals_scope=roles_tablespaces_comments_tablespace_acls_no_role_passwords\n'
 printf 'pg_dumpall_globals_gap_bootstrap_role_restore=filtered_existing_bootstrap_role\n'
-printf 'pg_dumpall_globals_gap_shared_object_acl_restore=missing\n'
+printf 'pg_dumpall_globals_gap_database_acl_restore=not_emitted_by_globals_only\n'

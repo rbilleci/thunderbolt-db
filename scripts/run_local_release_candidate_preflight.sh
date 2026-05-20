@@ -50,7 +50,7 @@ run_gate \
   "local_product_preflight_resilience=backup_pitr_dr_plus_replication_deployment" \
   "local_product_preflight_privileges=schema_usage_create_relation_sequence_function_execute_default_table_acls" \
   "local_product_preflight_gap_pg_dumpall_bootstrap_role_restore=filtered_existing_bootstrap_role" \
-  "local_product_preflight_gap_pg_dumpall_shared_object_acl_restore=missing" \
+  "local_product_preflight_gap_pg_dumpall_database_acl_restore=not_emitted_by_globals_only" \
   "local_product_preflight_gap_pgx=blocked_missing_go" \
   "local_product_preflight_gap_jdbc_r2dbc=blocked_missing_java_build_tooling" \
   "local_product_preflight_gap_physical_page_image_backup=missing" \
@@ -88,7 +88,7 @@ printf 'local_release_candidate_preflight_gpu_residency=retained_cuda_allocation
 printf 'local_release_candidate_preflight_gap_pgx=blocked_missing_go\n'
 printf 'local_release_candidate_preflight_gap_jdbc_r2dbc=blocked_missing_java_build_tooling\n'
 printf 'local_release_candidate_preflight_gap_pg_dumpall_bootstrap_role_restore=filtered_existing_bootstrap_role\n'
-printf 'local_release_candidate_preflight_gap_pg_dumpall_shared_object_acl_restore=missing\n'
+printf 'local_release_candidate_preflight_gap_pg_dumpall_database_acl_restore=not_emitted_by_globals_only\n'
 printf 'local_release_candidate_preflight_gap_physical_page_image_backup=missing\n'
 printf 'local_release_candidate_preflight_gap_production_object_storage=missing\n'
 printf 'local_release_candidate_preflight_gap_live_background_scheduling=missing\n'

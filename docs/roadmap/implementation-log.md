@@ -68,8 +68,17 @@
   table/view/materialized-view/sequence ACLs, and default table privileges
   round-trip through a real privilege-aware schema dump when the bounded grantee
   role is precreated on the target, while ownership, broader permission enforcement beyond bounded relation ACL DML/SELECT gates,
-  column ACLs, row policies, shared-object/global ACL dumps, and non-table
+  column ACLs, row policies, database ACL restore from globals-only dumps, and non-table
   default privileges remain out of scope.
+
+- Extended the bounded pg_dumpall globals smoke to include supported
+  application tablespace ACLs. The PostgreSQL 16 tablespace metadata query now
+  exposes pg-dumpall-compatible ACL array text for application tablespaces, so
+  `pg_dumpall --globals-only --no-role-passwords` emits the supported
+  `GRANT ALL ON TABLESPACE ...` restore SQL and the checked smoke proves it
+  restores into a fresh shared-catalog endpoint. Unfiltered bootstrap-role
+  restore, database ACL restore from globals-only dumps, ownership fidelity,
+  grant options, and physical tablespace placement remain out of scope.
 
 - Added a top-level local release-candidate preflight gate.
   `scripts/run_local_release_candidate_preflight.sh` runs the local

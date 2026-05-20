@@ -69,9 +69,9 @@ run_gate \
   pg_dumpall_globals \
   tests/compat/pg-dumpall/run.sh \
   "pg_dumpall_globals_restore=passed" \
-  "pg_dumpall_globals_scope=roles_tablespaces_comments_no_role_passwords" \
+  "pg_dumpall_globals_scope=roles_tablespaces_comments_tablespace_acls_no_role_passwords" \
   "pg_dumpall_globals_gap_bootstrap_role_restore=filtered_existing_bootstrap_role" \
-  "pg_dumpall_globals_gap_shared_object_acl_restore=missing"
+  "pg_dumpall_globals_gap_database_acl_restore=not_emitted_by_globals_only"
 
 run_gate \
   local_resilience \
@@ -94,7 +94,7 @@ printf 'local_product_preflight_dump_restore=plain_custom_directory_tar_parallel
 printf 'local_product_preflight_resilience=backup_pitr_dr_plus_replication_deployment\n'
 printf 'local_product_preflight_privileges=schema_usage_create_relation_sequence_function_execute_default_table_acls\n'
 printf 'local_product_preflight_gap_pg_dumpall_bootstrap_role_restore=filtered_existing_bootstrap_role\n'
-printf 'local_product_preflight_gap_pg_dumpall_shared_object_acl_restore=missing\n'
+printf 'local_product_preflight_gap_pg_dumpall_database_acl_restore=not_emitted_by_globals_only\n'
 printf 'local_product_preflight_gap_pgx=blocked_missing_go\n'
 printf 'local_product_preflight_gap_jdbc_r2dbc=blocked_missing_java_build_tooling\n'
 printf 'local_product_preflight_gap_physical_page_image_backup=missing\n'

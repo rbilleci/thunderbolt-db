@@ -14571,8 +14571,8 @@ fn pg_dumpall_tablespace_metadata_rows(session: &Session) -> Vec<Vec<Option<Stri
                 Some(space.name.clone()),
                 Some("postgres".to_string()),
                 Some(space.location.clone()),
-                None,
-                None,
+                tablespace_acl_array_display(session, &space.name),
+                Some("{postgres=C/postgres}".to_string()),
                 None,
                 session
                     .comments
@@ -14971,6 +14971,30 @@ fn tablespace_acl_display(session: &Session, tablespace: &str) -> Option<String>
         })
         .collect::<Vec<_>>();
     (!rows.is_empty()).then(|| rows.join("\n"))
+}
+
+fn tablespace_acl_array_display(session: &Session, tablespace: &str) -> Option<String> {
+    let acl = session.tablespace_acls.get(tablespace)?;
+    let rows = acl
+        .iter()
+        .filter_map(|(grantee, privileges)| {
+            if privileges.is_empty() {
+                return None;
+            }
+            let grantee = if grantee == "public" { "" } else { grantee };
+            Some(format!(
+                "{grantee}={}/postgres",
+                tablespace_privilege_letters(privileges)
+            ))
+        })
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        None
+    } else {
+        let mut with_default = vec!["postgres=C/postgres".to_string()];
+        with_default.extend(rows);
+        Some(format!("{{{}}}", with_default.join(",")))
+    }
 }
 
 fn tablespace_privilege_letters(privileges: &BTreeSet<TablespacePrivilege>) -> String {
@@ -21456,6 +21480,19 @@ mod tests {
             .expect("shared tablespace row");
         assert_eq!(appspace_row[6], Some("shared storage".to_string()));
         assert_eq!(appspace_row[3], Some("=C/postgres".to_string()));
+        assert_eq!(
+            pg_dumpall_tablespace_metadata_rows(&reloaded),
+            vec![vec![
+                Some(FIRST_USER_RELATION_OID.to_string()),
+                Some(tablespace_name.to_string()),
+                Some("postgres".to_string()),
+                Some("/tmp/shared_appspace".to_string()),
+                Some("{postgres=C/postgres,=C/postgres}".to_string()),
+                Some("{postgres=C/postgres}".to_string()),
+                None,
+                Some("shared storage".to_string()),
+            ]]
+        );
 
         reloaded.tablespaces.remove(tablespace_name);
         reloaded.tablespace_acls.remove(tablespace_name);
