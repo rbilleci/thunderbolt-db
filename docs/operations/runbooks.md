@@ -119,6 +119,29 @@ Boundaries:
 - This does not install Go or Java tooling for the remaining driver gates.
 - This does not claim production orchestration or broad PostgreSQL parity beyond the supported subset.
 
+### 1f) Local GPU Residency Product Preflight
+
+Run before treating the current GPU-resident execution envelope as locally checked:
+
+```bash
+scripts/run_local_gpu_residency_preflight.sh
+```
+
+Pass criteria:
+
+- `local_gpu_residency_preflight=passed`
+- Residency baseline evidence includes retained CUDA device-memory support and zero-H2D resident route proofs.
+- Warmup evidence includes dry-run/apply parity, invalidated-entry refresh, memory-pressure skips, oversized-budget rejection, and route-readiness checks.
+- Maintenance evidence includes scheduler-friendly basic, invalidated, memory-pressure, and oversized-budget ticks.
+- The output names the remaining durable GPU page, autonomous cache-daemon, external orchestration, broad retained-expression, and broad CUDA-event-timing gaps.
+
+Boundaries:
+
+- This is an aggregate local verification command over existing checked P8/P7 gates.
+- This does not create durable GPU pages or a production cache daemon.
+- This does not claim broad retained-expression or broad CUDA-event-timing coverage.
+- Missing local NVIDIA/CUDA runtime evidence is an environment blocker for this preflight, not a product pass.
+
 ## 2) WAL Durability Incident (Flush Failure)
 
 Symptoms:

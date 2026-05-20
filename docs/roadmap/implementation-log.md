@@ -2,6 +2,14 @@
 
 ## 2026-05-20
 
+- Added a local GPU residency product preflight gate. `scripts/run_local_gpu_residency_preflight.sh`
+  runs the checked GPU residency baseline, resident warmup preflight smoke, and
+  resident maintenance smoke, verifies retained CUDA allocation, zero-H2D
+  resident route, cache lifecycle, warmup, and maintenance evidence, and
+  reports durable GPU pages, autonomous cache-daemon scheduling, external
+  orchestration, broad retained expressions, and broader CUDA event timing as
+  explicit gaps.
+
 - Added a local PostgreSQL-compatible product preflight gate. `scripts/run_local_product_preflight.sh`
   runs the checked application-driver smoke gate, the real PostgreSQL 16
   `pg_dump`/`pg_restore` workflow gate, and the local resilience drill, verifies

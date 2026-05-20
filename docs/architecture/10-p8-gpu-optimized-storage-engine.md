@@ -440,6 +440,15 @@ expressions remain outside the first P8 design. Broader CUDA event timing
 coverage remains future work beyond the first accepted-route resident-kernel
 samples.
 
+`scripts/run_local_gpu_residency_preflight.sh` is the aggregate local operator
+gate for that P8 envelope. It runs the checked GPU residency baseline,
+resident warmup preflight smoke, and resident maintenance smoke, then verifies
+stable evidence for retained CUDA allocation, zero-H2D resident route proofs,
+cache admission/eviction/invalidation/refresh, operator-triggered warmup, and
+scheduler-friendly maintenance. It reports durable GPU pages, autonomous cache
+daemon scheduling, external orchestration, broad retained expressions, and
+broader CUDA event timing as explicit gaps rather than production claims.
+
 ## Non-Goals For The First P8 Design
 
 - Full PostgreSQL heap compatibility.
