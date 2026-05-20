@@ -6662,10 +6662,6 @@ fn resident_route_query_shape(
         return resident_route_distinct_projection_shape(select, table, bound);
     }
 
-    if select.offset.is_some() {
-        return None;
-    }
-
     match &select.projection {
         SelectProjection::GroupedCount { column } => {
             return resident_route_grouped_aggregate_shape(select, table, bound, column, column);
@@ -6722,6 +6718,10 @@ fn resident_route_query_shape(
     }
 
     if select.order_by.is_some() {
+        return resident_route_ordered_projection_shape(select, table, bound);
+    }
+
+    if select.offset.is_some() {
         return None;
     }
     if select.group_by.is_some() || !select.having_groups.is_empty() {
@@ -6801,6 +6801,35 @@ fn resident_route_query_shape(
     }
 }
 
+fn resident_route_ordered_projection_shape(
+    select: &Select,
+    table: &RelationalTable,
+    bound: &BoundRelationalSelect,
+) -> Option<String> {
+    if select.group_by.is_some()
+        || !select.having_groups.is_empty()
+        || bound.selected_indexes.len() != 1
+        || select.limit.is_none()
+        || bound.filter_groups.len() != 1
+        || bound.filter_groups[0].len() != 1
+    {
+        return None;
+    }
+    let projection_idx = bound.selected_indexes[0];
+    if table.columns[projection_idx].ty != SqlType::Int4 {
+        return None;
+    }
+    let (order_idx, _) = bound.order?;
+    if order_idx != projection_idx {
+        return None;
+    }
+    let (filter_idx, op, value) = bound.filter_groups[0][0].clone();
+    (filter_idx == projection_idx
+        && resident_device_i32_comparison(op).is_some()
+        && matches!(value, SqlValue::Int4(_)))
+    .then(|| "int4_ordered_projection".to_string())
+}
+
 fn resident_route_distinct_projection_shape(
     select: &Select,
     table: &RelationalTable,
@@ -6854,6 +6883,9 @@ fn resident_route_grouped_aggregate_shape(
     group_column: &str,
     value_column: &str,
 ) -> Option<String> {
+    if select.offset.is_some() {
+        return None;
+    }
     let group_by = select.group_by.as_ref()?;
     if !group_by.eq_ignore_ascii_case(group_column) {
         return None;
@@ -14068,6 +14100,9 @@ impl Engine {
                 ),
             "int4_projection" => {
                 self.execute_relational_projection_with_resident_device_memory_probe(select)
+            }
+            "int4_ordered_projection" => {
+                self.execute_relational_ordered_projection_with_resident_device_memory_probe(select)
             }
             "int4_distinct_projection" => self
                 .execute_relational_distinct_projection_with_resident_device_memory_probe(select),
@@ -22830,6 +22865,7 @@ mod tests {
             "SELECT MIN(id) FROM events WHERE id BETWEEN 1 AND 3",
             "SELECT MAX(id) FROM events WHERE id BETWEEN 1 AND 1",
             "SELECT id FROM events WHERE id > 1",
+            "SELECT id FROM events WHERE id >= 1 ORDER BY id DESC LIMIT 2 OFFSET 1",
             "SELECT DISTINCT bucket FROM events ORDER BY bucket DESC LIMIT 2 OFFSET 1",
             "SELECT DISTINCT bucket FROM events WHERE bucket >= 2 ORDER BY bucket DESC LIMIT 2 OFFSET 1",
             "SELECT bucket, COUNT(*) FROM events GROUP BY bucket HAVING count >= 1 ORDER BY bucket",
@@ -22888,6 +22924,7 @@ mod tests {
                         | "int4_grouped_aggregate"
                         | "int4_filtered_grouped_aggregate"
                         | "int4_projection"
+                        | "int4_ordered_projection"
                         | "int4_distinct_projection"
                         | "int4_filtered_distinct_projection"
                 ),
@@ -22900,6 +22937,10 @@ mod tests {
             "SELECT DISTINCT bucket FROM events WHERE id >= 2 ORDER BY bucket DESC LIMIT 2",
             "SELECT DISTINCT bucket FROM events WHERE bucket = 2",
             "SELECT DISTINCT bucket FROM events OFFSET 1",
+            "SELECT id FROM events WHERE id >= 1 ORDER BY id DESC",
+            "SELECT id FROM events WHERE id = 1 ORDER BY id DESC LIMIT 1",
+            "SELECT id FROM events WHERE amount >= 10 ORDER BY id DESC LIMIT 1",
+            "SELECT label FROM events WHERE label LIKE 'a%' ORDER BY label LIMIT 1",
         ] {
             let Command::Select(unsupported) = parse_command(sql).unwrap() else {
                 unreachable!()

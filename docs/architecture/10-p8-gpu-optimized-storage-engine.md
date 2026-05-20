@@ -320,8 +320,8 @@ unsupported relation kinds, unsupported query shapes, resident bytes, budget
 bytes, refresh bytes, cold H2D bytes, zero resident H2D bytes, and estimated D2H
 rows. The current accepted retained-kernel family covers bounded counts,
 count predicates, scalar and grouped aggregates, range-predicate projections,
-and int4 distinct projections, including the bounded same-column filtered
-distinct form.
+same-column filtered ordered projections, and int4 distinct projections,
+including the bounded same-column filtered distinct form.
 
 `Engine::execute_relational_select_with_resident_route(...)` remains the explicit
 execution consumer for the same decision contract. The default read path calls
@@ -401,8 +401,8 @@ execute by default with zero per-query resident H2D transfer, while every
 rejected route falls back to the existing MVCC/CUDA-probe path. This is default
 planner routing for the bounded retained-kernel shapes only, now including the
 already-proven filtered and `BETWEEN` scalar aggregate kernels plus the
-already-proven distinct projection kernels and grouped/filtered grouped
-aggregate kernels.
+already-proven filtered ordered projection kernels, distinct projection kernels,
+and grouped/filtered grouped aggregate kernels.
 
 The fifth P8 code slice adds `Engine::warm_relational_residency_with_policy(...)`
 as a deterministic, operator-triggered warmup policy over supported public base
