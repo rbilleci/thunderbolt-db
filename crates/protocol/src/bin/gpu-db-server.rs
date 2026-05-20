@@ -3360,6 +3360,40 @@ fn relation_permission_error(
     }
 }
 
+fn role_has_schema_privilege(session: &Session, schema: &str, privilege: SchemaPrivilege) -> bool {
+    let role = active_role(session);
+    if role == "postgres" {
+        return true;
+    }
+    if schema != "public" || !session.public_schema_exists {
+        return false;
+    }
+    session
+        .schema_acl
+        .get(role)
+        .is_some_and(|privileges| privileges.contains(&privilege))
+        || session
+            .schema_acl
+            .get("public")
+            .is_some_and(|privileges| privileges.contains(&privilege))
+}
+
+fn schema_permission_error(
+    session: &Session,
+    schema: &str,
+    privilege: SchemaPrivilege,
+) -> Option<ErrorField> {
+    if role_has_schema_privilege(session, schema, privilege) {
+        None
+    } else {
+        Some(ErrorField {
+            code: "42501",
+            message: "permission denied for schema",
+            position: None,
+        })
+    }
+}
+
 fn role_has_dependencies(session: &Session, role: &str) -> bool {
     session.comments.contains_key(&CatalogCommentTarget::Role {
         role: role.to_string(),
@@ -9153,6 +9187,11 @@ fn execute_statement(
                         },
                     );
                 }
+                if let Some(error) =
+                    schema_permission_error(session, "public", SchemaPrivilege::Create)
+                {
+                    return write_error(stream, &error);
+                }
                 if session.tables.contains_key(&create.table)
                     || session.views.contains_key(&create.table)
                     || session.materialized_views.contains_key(&create.table)
@@ -9444,6 +9483,11 @@ fn execute_statement(
                 return write_command_complete(stream, "ALTER TABLE");
             }
             Command::CreateIndex(create) => {
+                if let Some(error) =
+                    schema_permission_error(session, "public", SchemaPrivilege::Create)
+                {
+                    return write_error(stream, &error);
+                }
                 if session
                     .indexes
                     .iter()
@@ -9521,6 +9565,21 @@ fn execute_statement(
                 return write_command_complete(stream, "ALTER INDEX");
             }
             Command::CreateView(create) => {
+                if !session.public_schema_exists {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "3F000",
+                            message: "schema does not exist",
+                            position: None,
+                        },
+                    );
+                }
+                if let Some(error) =
+                    schema_permission_error(session, "public", SchemaPrivilege::Create)
+                {
+                    return write_error(stream, &error);
+                }
                 if session.tables.contains_key(&create.name)
                     || session.materialized_views.contains_key(&create.name)
                     || session.sequences.contains_key(&create.name)
@@ -9604,6 +9663,21 @@ fn execute_statement(
                 return write_command_complete(stream, "CREATE VIEW");
             }
             Command::CreateMaterializedView(create) => {
+                if !session.public_schema_exists {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "3F000",
+                            message: "schema does not exist",
+                            position: None,
+                        },
+                    );
+                }
+                if let Some(error) =
+                    schema_permission_error(session, "public", SchemaPrivilege::Create)
+                {
+                    return write_error(stream, &error);
+                }
                 if session.tables.contains_key(&create.name)
                     || session.views.contains_key(&create.name)
                     || session.materialized_views.contains_key(&create.name)
@@ -9854,6 +9928,21 @@ fn execute_statement(
                 return write_command_complete(stream, "ALTER MATERIALIZED VIEW");
             }
             Command::CreateFunction(create) => {
+                if !session.public_schema_exists {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "3F000",
+                            message: "schema does not exist",
+                            position: None,
+                        },
+                    );
+                }
+                if let Some(error) =
+                    schema_permission_error(session, "public", SchemaPrivilege::Create)
+                {
+                    return write_error(stream, &error);
+                }
                 if session.functions.contains_key(&create.name) {
                     return write_error(
                         stream,
@@ -9898,6 +9987,21 @@ fn execute_statement(
                 return write_command_complete(stream, "ALTER FUNCTION");
             }
             Command::CreateSequence(create) => {
+                if !session.public_schema_exists {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "3F000",
+                            message: "schema does not exist",
+                            position: None,
+                        },
+                    );
+                }
+                if let Some(error) =
+                    schema_permission_error(session, "public", SchemaPrivilege::Create)
+                {
+                    return write_error(stream, &error);
+                }
                 if session.tables.contains_key(&create.name)
                     || session.views.contains_key(&create.name)
                     || session.materialized_views.contains_key(&create.name)
@@ -9942,6 +10046,21 @@ fn execute_statement(
                 return write_command_complete(stream, "CREATE SEQUENCE");
             }
             Command::CreateDomain(create) => {
+                if !session.public_schema_exists {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "3F000",
+                            message: "schema does not exist",
+                            position: None,
+                        },
+                    );
+                }
+                if let Some(error) =
+                    schema_permission_error(session, "public", SchemaPrivilege::Create)
+                {
+                    return write_error(stream, &error);
+                }
                 if session.tables.contains_key(&create.name)
                     || session.views.contains_key(&create.name)
                     || session.materialized_views.contains_key(&create.name)
@@ -10330,6 +10449,11 @@ fn execute_statement(
                 return write_command_complete(stream, "DROP DOMAIN");
             }
             Command::CreatePublication(create) => {
+                if let Some(error) =
+                    schema_permission_error(session, "public", SchemaPrivilege::Create)
+                {
+                    return write_error(stream, &error);
+                }
                 if let Err(error) = create_publication(session, create.name, create.target) {
                     return write_error(stream, &error);
                 }
@@ -10344,6 +10468,11 @@ fn execute_statement(
                 return write_command_complete(stream, "DROP PUBLICATION");
             }
             Command::CreateSubscription(create) => {
+                if let Some(error) =
+                    schema_permission_error(session, "public", SchemaPrivilege::Create)
+                {
+                    return write_error(stream, &error);
+                }
                 if let Err(error) = create_subscription(
                     session,
                     create.name,

@@ -1,0 +1,90 @@
+Pager usage is off.
+=== bounded schema CREATE ACL enforcement ===
+CREATE ROLE
+CREATE TABLE
+INSERT 0 2
+GRANT
+REVOKE
+SET
+psql:350_protocol_psql_schema_create_acl_enforcement.sql:9: ERROR:  permission denied for schema
+psql:350_protocol_psql_schema_create_acl_enforcement.sql:10: ERROR:  permission denied for schema
+psql:350_protocol_psql_schema_create_acl_enforcement.sql:11: ERROR:  permission denied for schema
+psql:350_protocol_psql_schema_create_acl_enforcement.sql:12: ERROR:  permission denied for schema
+psql:350_protocol_psql_schema_create_acl_enforcement.sql:13: ERROR:  permission denied for schema
+psql:350_protocol_psql_schema_create_acl_enforcement.sql:14: ERROR:  permission denied for schema
+psql:350_protocol_psql_schema_create_acl_enforcement.sql:15: ERROR:  permission denied for schema
+psql:350_protocol_psql_schema_create_acl_enforcement.sql:16: ERROR:  permission denied for schema
+RESET
+GRANT
+SET
+CREATE TABLE
+CREATE INDEX
+CREATE SEQUENCE
+CREATE FUNCTION
+CREATE DOMAIN
+CREATE VIEW
+SELECT 0
+CREATE PUBLICATION
+CREATE SUBSCRIPTION
+RESET
+                List of relations
+ Schema |         Name         | Type  |  Owner
+--------+----------------------+-------+----------
+ public | schema_allowed_table | table | postgres
+(1 row)
+
+ schema_allowed_fn
+-------------------
+                42
+(1 row)
+
+ id | name
+----+-------
+  1 | ada
+  2 | grace
+(2 rows)
+
+ id | name
+----+-------
+  1 | ada
+  2 | grace
+(2 rows)
+
+ nextval
+---------
+       1
+(1 row)
+
+REVOKE
+GRANT
+SET
+CREATE TABLE
+RESET
+REVOKE
+ALTER ROLE
+GRANT
+SET
+CREATE SEQUENCE
+RESET
+REVOKE
+SET
+psql:350_protocol_psql_schema_create_acl_enforcement.sql:48: ERROR:  permission denied for schema
+RESET
+ nextval
+---------
+       1
+(1 row)
+
+DROP SUBSCRIPTION
+DROP PUBLICATION
+DROP MATERIALIZED VIEW
+DROP VIEW
+REVOKE
+DROP TABLE
+DROP TABLE
+DROP SEQUENCE
+DROP SEQUENCE
+DROP FUNCTION
+DROP DOMAIN
+DROP TABLE
+DROP ROLE
