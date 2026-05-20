@@ -327,7 +327,12 @@ including the bounded same-column filtered distinct form.
 execution consumer for the same decision contract. The default read path calls
 through it only after the route decision is accepted, so non-accepted routes keep
 correctness on the existing CPU/MVCC-backed path instead of producing resident
-execution errors.
+execution errors. After a successful accepted route execution, the latest route
+decision also records the observed metric deltas for that route: H2D bytes, D2H
+bytes, kernel samples, kernel milliseconds, and result rows. These are derived
+from the existing engine metrics around the route execution and are intended for
+operator comparison against the planner estimates; precise CUDA-event timing is
+still outside the current bounded design.
 
 ### Recovery And Warmup
 
@@ -429,7 +434,8 @@ invalidated, memory-pressure, and oversized-budget cases while preserving the
 default resident execution contract for accepted routes. This is bounded local
 maintenance orchestration, not a production background cache daemon: durable GPU
 pages, autonomous scheduling, external orchestration, and broader retained
-expressions remain outside the first P8 design.
+expressions remain outside the first P8 design. Lower-level CUDA event timing
+instrumentation remains future work beyond the current per-route metric deltas.
 
 ## Non-Goals For The First P8 Design
 

@@ -155,6 +155,11 @@ pub struct RelationalResidentRouteDecisionStatus {
     pub h2d_bytes_if_cold: u64,
     pub d2h_bytes_estimate: u64,
     pub d2h_rows_estimate: usize,
+    pub last_execution_h2d_bytes: Option<u64>,
+    pub last_execution_d2h_bytes: Option<u64>,
+    pub last_execution_kernel_samples: Option<u64>,
+    pub last_execution_kernel_ms: Option<u64>,
+    pub last_execution_rows: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -804,6 +809,11 @@ mod tests {
                 h2d_bytes_if_cold: 128,
                 d2h_bytes_estimate: 8,
                 d2h_rows_estimate: 1,
+                last_execution_h2d_bytes: Some(0),
+                last_execution_d2h_bytes: Some(8),
+                last_execution_kernel_samples: Some(0),
+                last_execution_kernel_ms: Some(0),
+                last_execution_rows: Some(1),
             }],
             resident_bytes_by_gpu: BTreeMap::from([(0, 192)]),
             budget_bytes_by_gpu: BTreeMap::from([(0, 256)]),

@@ -6058,6 +6058,24 @@ impl RelationalResidentCache {
             .insert(decision.table.clone(), decision);
     }
 
+    fn record_route_execution_observation(
+        &mut self,
+        table: &str,
+        h2d_bytes: u64,
+        d2h_bytes: u64,
+        kernel_samples: u64,
+        kernel_ms: u64,
+        rows: usize,
+    ) {
+        if let Some(decision) = self.latest_route_decisions.get_mut(table) {
+            decision.last_execution_h2d_bytes = Some(h2d_bytes);
+            decision.last_execution_d2h_bytes = Some(d2h_bytes);
+            decision.last_execution_kernel_samples = Some(kernel_samples);
+            decision.last_execution_kernel_ms = Some(kernel_ms);
+            decision.last_execution_rows = Some(rows);
+        }
+    }
+
     fn remove_table(&mut self, table: &str) {
         self.snapshots.remove(table);
         self.device_memory.remove(table);
@@ -14152,7 +14170,8 @@ impl Engine {
             ))));
         }
 
-        match decision.query_shape.as_str() {
+        let before_metrics = self.metrics.snapshot();
+        let result = match decision.query_shape.as_str() {
             "count_all" => self.execute_relational_count_with_resident_device_memory_probe(select),
             "int4_equality_count" => {
                 self.execute_relational_filtered_count_with_resident_device_memory_probe(select)
@@ -14204,7 +14223,26 @@ impl Engine {
             shape => Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
                 "resident route accepted unsupported execution shape: {shape}"
             )))),
-        }
+        }?;
+        let after_metrics = self.metrics.snapshot();
+        self.relational_resident_cache
+            .record_route_execution_observation(
+                &decision.table,
+                after_metrics
+                    .h2d_bytes_total
+                    .saturating_sub(before_metrics.h2d_bytes_total),
+                after_metrics
+                    .d2h_bytes_total
+                    .saturating_sub(before_metrics.d2h_bytes_total),
+                after_metrics
+                    .kernel_exec_samples
+                    .saturating_sub(before_metrics.kernel_exec_samples),
+                after_metrics
+                    .kernel_exec_total_ms
+                    .saturating_sub(before_metrics.kernel_exec_total_ms),
+                result.rows.len(),
+            );
+        Ok(result)
     }
 
     pub fn execute_relational_count_with_resident_device_memory_probe(
@@ -18001,6 +18039,11 @@ impl Engine {
             h2d_bytes_if_cold: 0,
             d2h_bytes_estimate: 0,
             d2h_rows_estimate: 0,
+            last_execution_h2d_bytes: None,
+            last_execution_d2h_bytes: None,
+            last_execution_kernel_samples: None,
+            last_execution_kernel_ms: None,
+            last_execution_rows: None,
         }
     }
 
@@ -18095,6 +18138,11 @@ impl Engine {
             h2d_bytes_if_cold: snapshot.resident_bytes,
             d2h_bytes_estimate,
             d2h_rows_estimate: resident_route_d2h_rows_estimate(select, snapshot.row_count),
+            last_execution_h2d_bytes: None,
+            last_execution_d2h_bytes: None,
+            last_execution_kernel_samples: None,
+            last_execution_kernel_ms: None,
+            last_execution_rows: None,
         };
 
         if snapshot.schema != table.schema || snapshot.table != table.name {
@@ -22916,6 +22964,11 @@ mod tests {
         assert_eq!(absent.reason, "relation has no resident snapshot");
         assert_eq!(absent.query_shape, "count_all");
         assert_eq!(absent.d2h_bytes_estimate, 0);
+        assert_eq!(absent.last_execution_h2d_bytes, None);
+        assert_eq!(absent.last_execution_d2h_bytes, None);
+        assert_eq!(absent.last_execution_kernel_samples, None);
+        assert_eq!(absent.last_execution_kernel_ms, None);
+        assert_eq!(absent.last_execution_rows, None);
 
         let snapshot = e.populate_relational_residency_snapshot("events").unwrap();
         let decision = e.plan_relational_resident_route(&count_select);
@@ -22972,6 +23025,11 @@ mod tests {
         assert!(!unsupported.accepted);
         assert_eq!(unsupported.query_shape, "unsupported_select");
         assert_eq!(unsupported.d2h_bytes_estimate, 0);
+        assert_eq!(unsupported.last_execution_h2d_bytes, None);
+        assert_eq!(unsupported.last_execution_d2h_bytes, None);
+        assert_eq!(unsupported.last_execution_kernel_samples, None);
+        assert_eq!(unsupported.last_execution_kernel_ms, None);
+        assert_eq!(unsupported.last_execution_rows, None);
         assert_eq!(
             unsupported.reason,
             "resident routing has no retained-kernel proof for this SELECT shape"
@@ -23051,9 +23109,11 @@ mod tests {
             let resident = e
                 .execute_relational_select_with_resident_route(&select)
                 .unwrap_or_else(|err| panic!("{sql}: {err}"));
+            let before_default_metrics = e.metrics().snapshot();
             let default = e
                 .execute_relational_select(&select)
                 .unwrap_or_else(|err| panic!("{sql}: {err}"));
+            let after_default_metrics = e.metrics().snapshot();
             assert_eq!(resident.rows, expected.rows, "{sql}");
             assert_eq!(resident.columns, expected.columns, "{sql}");
             assert_eq!(default.rows, expected.rows, "{sql}");
@@ -23125,6 +23185,39 @@ mod tests {
             };
             assert_eq!(
                 route_decision.d2h_bytes_estimate, expected_d2h_bytes,
+                "{sql}"
+            );
+            assert_eq!(route_decision.last_execution_h2d_bytes, Some(0), "{sql}");
+            assert_eq!(
+                route_decision.last_execution_d2h_bytes,
+                Some(
+                    after_default_metrics
+                        .d2h_bytes_total
+                        .saturating_sub(before_default_metrics.d2h_bytes_total)
+                ),
+                "{sql}"
+            );
+            assert_eq!(
+                route_decision.last_execution_kernel_samples,
+                Some(
+                    after_default_metrics
+                        .kernel_exec_samples
+                        .saturating_sub(before_default_metrics.kernel_exec_samples)
+                ),
+                "{sql}"
+            );
+            assert_eq!(
+                route_decision.last_execution_kernel_ms,
+                Some(
+                    after_default_metrics
+                        .kernel_exec_total_ms
+                        .saturating_sub(before_default_metrics.kernel_exec_total_ms)
+                ),
+                "{sql}"
+            );
+            assert_eq!(
+                route_decision.last_execution_rows,
+                Some(default.rows.len()),
                 "{sql}"
             );
             assert!(
