@@ -2,6 +2,14 @@
 
 ## 2026-05-20
 
+- Added a local release-candidate evidence bundle wrapper.
+  `scripts/run_local_release_candidate_evidence_bundle.sh` runs the top-level
+  local release-candidate preflight, captures exact git/tooling facts plus the
+  full preflight log under `target/release-candidate-evidence/`, verifies the
+  required explicit remaining-gap lines, and emits a tarball path with SHA-256
+  checksum for release review handoff without expanding SQL/protocol/catalog,
+  driver, CUDA, or production-orchestration support.
+
 - Added privilege-aware pg-dump/pg-restore coverage for bounded public ACL metadata.
   The compatibility endpoint now handles PostgreSQL 16 pg-dump column-ACL and
   initial-privilege discovery as empty unsupported surfaces, exposes relation
