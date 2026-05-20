@@ -2385,6 +2385,7 @@ struct Session {
     subscriptions: BTreeMap<String, Subscription>,
     roles: BTreeMap<String, RoleInfo>,
     databases: BTreeMap<String, DatabaseInfo>,
+    tablespaces: BTreeMap<String, TablespaceInfo>,
     public_schema_exists: bool,
     public_schema_implicit: bool,
     currval_sequences: HashMap<String, i64>,
@@ -2402,6 +2403,7 @@ struct Session {
     dirty_subscriptions: BTreeSet<String>,
     dirty_roles: BTreeSet<String>,
     dirty_databases: BTreeSet<String>,
+    dirty_tablespaces: BTreeSet<String>,
     dirty_schema: bool,
     dirty_indexes: bool,
     dirty_table_acls: BTreeSet<String>,
@@ -2424,6 +2426,7 @@ struct SharedCatalog {
     subscriptions: BTreeMap<String, Subscription>,
     roles: BTreeMap<String, RoleInfo>,
     databases: BTreeMap<String, DatabaseInfo>,
+    tablespaces: BTreeMap<String, TablespaceInfo>,
     public_schema_exists: bool,
     public_schema_implicit: bool,
     indexes: Vec<CatalogIndex>,
@@ -2446,6 +2449,7 @@ impl Default for SharedCatalog {
             subscriptions: BTreeMap::new(),
             roles: BTreeMap::new(),
             databases: BTreeMap::new(),
+            tablespaces: BTreeMap::new(),
             public_schema_exists: true,
             public_schema_implicit: true,
             indexes: Vec::new(),
@@ -2492,6 +2496,7 @@ impl Session {
             subscriptions: catalog.subscriptions,
             roles: catalog.roles,
             databases: catalog.databases,
+            tablespaces: catalog.tablespaces,
             public_schema_exists: catalog.public_schema_exists,
             public_schema_implicit: catalog.public_schema_implicit,
             currval_sequences: HashMap::new(),
@@ -2509,6 +2514,7 @@ impl Session {
             dirty_subscriptions: BTreeSet::new(),
             dirty_roles: BTreeSet::new(),
             dirty_databases: BTreeSet::new(),
+            dirty_tablespaces: BTreeSet::new(),
             dirty_schema: false,
             dirty_indexes: false,
             dirty_table_acls: BTreeSet::new(),
@@ -2557,6 +2563,10 @@ impl Session {
         self.dirty_databases.insert(database.into());
     }
 
+    fn mark_tablespace_dirty(&mut self, tablespace: impl Into<String>) {
+        self.dirty_tablespaces.insert(tablespace.into());
+    }
+
     fn mark_schema_dirty(&mut self) {
         self.dirty_schema = true;
     }
@@ -2588,6 +2598,7 @@ impl Session {
             self.dirty_subscriptions.clear();
             self.dirty_roles.clear();
             self.dirty_databases.clear();
+            self.dirty_tablespaces.clear();
             self.dirty_schema = false;
             self.dirty_table_acls.clear();
             self.dirty_schema_acl = false;
@@ -2671,6 +2682,15 @@ impl Session {
                 catalog.databases.remove(database_name);
             }
         }
+        for tablespace_name in &self.dirty_tablespaces {
+            if let Some(tablespace) = self.tablespaces.get(tablespace_name) {
+                catalog
+                    .tablespaces
+                    .insert(tablespace_name.clone(), tablespace.clone());
+            } else {
+                catalog.tablespaces.remove(tablespace_name);
+            }
+        }
         for table_name in &self.dirty_table_acls {
             if let Some(acl) = self.table_acls.get(table_name) {
                 catalog.table_acls.insert(table_name.clone(), acl.clone());
@@ -2742,6 +2762,7 @@ impl Session {
         self.dirty_subscriptions.clear();
         self.dirty_roles.clear();
         self.dirty_databases.clear();
+        self.dirty_tablespaces.clear();
         self.dirty_table_acls.clear();
     }
 
@@ -2796,6 +2817,13 @@ struct RoleInfo {
 struct DatabaseInfo {
     oid: u32,
     name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TablespaceInfo {
+    oid: u32,
+    name: String,
+    location: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2992,6 +3020,10 @@ fn role_exists(session: &Session, role: &str) -> bool {
 
 fn database_exists(session: &Session, database: &str) -> bool {
     database == "postgres" || session.databases.contains_key(database)
+}
+
+fn tablespace_exists(session: &Session, tablespace: &str) -> bool {
+    matches!(tablespace, "pg_default" | "pg_global") || session.tablespaces.contains_key(tablespace)
 }
 
 fn acl_grantee_error(session: &Session, grantee: &str) -> Option<ErrorField> {
@@ -8341,6 +8373,88 @@ fn execute_statement(
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, "DROP DATABASE");
             }
+            Command::CreateTablespace(create) => {
+                if tablespace_exists(session, &create.name) {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "42710",
+                            message: "tablespace already exists",
+                            position: None,
+                        },
+                    );
+                }
+                let oid = session.next_relation_oid;
+                let Some(next_oid) = session.next_relation_oid.checked_add(1) else {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "54000",
+                            message: "relational OID counter overflow",
+                            position: None,
+                        },
+                    );
+                };
+                session.next_relation_oid = next_oid;
+                session.tablespaces.insert(
+                    create.name.clone(),
+                    TablespaceInfo {
+                        oid,
+                        name: create.name.clone(),
+                        location: create.location,
+                    },
+                );
+                session.mark_tablespace_dirty(create.name);
+                session.persist_catalog_snapshot();
+                return write_command_complete(stream, "CREATE TABLESPACE");
+            }
+            Command::DropTablespace(drop) => {
+                let mut seen = BTreeSet::new();
+                for tablespace in &drop.names {
+                    if !seen.insert(tablespace) {
+                        return write_error(
+                            stream,
+                            &ErrorField {
+                                code: "42710",
+                                message: "tablespace specified more than once",
+                                position: None,
+                            },
+                        );
+                    }
+                    if matches!(tablespace.as_str(), "pg_default" | "pg_global") {
+                        return write_error(
+                            stream,
+                            &ErrorField {
+                                code: "0A000",
+                                message: "cannot drop bootstrap tablespace",
+                                position: None,
+                            },
+                        );
+                    }
+                    if !drop.if_exists && !session.tablespaces.contains_key(tablespace) {
+                        return write_error(
+                            stream,
+                            &ErrorField {
+                                code: "42704",
+                                message: "tablespace does not exist",
+                                position: None,
+                            },
+                        );
+                    }
+                }
+                for tablespace in &drop.names {
+                    if session.tablespaces.remove(tablespace).is_some() {
+                        let target = CatalogCommentTarget::Tablespace {
+                            tablespace: tablespace.clone(),
+                        };
+                        session.comments.remove(&target);
+                        session.mark_comment_dirty(target);
+                    }
+                    session.mark_tablespace_dirty(tablespace.clone());
+                }
+                session.persist_catalog_snapshot();
+                return write_command_complete(stream, "DROP TABLESPACE");
+            }
             Command::CreateTable(create) => {
                 if !session.public_schema_exists {
                     return write_error(
@@ -9979,7 +10093,7 @@ fn execute_statement(
                         CatalogCommentTarget::Schema { schema }
                     }
                     CommentTarget::Tablespace { tablespace } => {
-                        if tablespace != "pg_default" && tablespace != "pg_global" {
+                        if !tablespace_exists(session, &tablespace) {
                             return write_error(
                                 stream,
                                 &ErrorField {
@@ -11189,6 +11303,13 @@ fn execute_statement(
                 text_column("Description"),
             ],
             &catalog_psql_list_tablespace_rows(session, true),
+        );
+    }
+    if canonical == "select oid, spcname, pg_catalog.pg_tablespace_location(oid) as location from pg_catalog.pg_tablespace order by spcname" {
+        return write_single_row(
+            stream,
+            &[int4_column("oid"), text_column("spcname"), text_column("location")],
+            &catalog_tablespace_oid_rows(session),
         );
     }
     if canonical == psql_list_access_methods_catalog_query() {
@@ -12777,12 +12898,26 @@ fn psql_list_tablespaces_verbose_catalog_query() -> &'static str {
 }
 
 fn catalog_psql_list_tablespace_rows(session: &Session, verbose: bool) -> Vec<Vec<Option<String>>> {
+    let mut spaces = vec![
+        TablespaceInfo {
+            oid: 1663,
+            name: "pg_default".to_string(),
+            location: String::new(),
+        },
+        TablespaceInfo {
+            oid: 1664,
+            name: "pg_global".to_string(),
+            location: String::new(),
+        },
+    ];
+    spaces.extend(session.tablespaces.values().cloned());
+    spaces.sort_by_key(|space| space.name.clone());
     let mut rows = Vec::new();
-    for name in ["pg_default", "pg_global"] {
+    for space in spaces {
         let mut row = vec![
-            Some(name.to_string()),
+            Some(space.name.clone()),
             Some("postgres".to_string()),
-            Some(String::new()),
+            Some(space.location.clone()),
         ];
         if verbose {
             row.push(None);
@@ -12792,7 +12927,7 @@ fn catalog_psql_list_tablespace_rows(session: &Session, verbose: bool) -> Vec<Ve
                 session
                     .comments
                     .get(&CatalogCommentTarget::Tablespace {
-                        tablespace: name.to_string(),
+                        tablespace: space.name.clone(),
                     })
                     .cloned(),
             );
@@ -12800,6 +12935,33 @@ fn catalog_psql_list_tablespace_rows(session: &Session, verbose: bool) -> Vec<Ve
         rows.push(row);
     }
     rows
+}
+
+fn catalog_tablespace_oid_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut spaces = vec![
+        TablespaceInfo {
+            oid: 1663,
+            name: "pg_default".to_string(),
+            location: String::new(),
+        },
+        TablespaceInfo {
+            oid: 1664,
+            name: "pg_global".to_string(),
+            location: String::new(),
+        },
+    ];
+    spaces.extend(session.tablespaces.values().cloned());
+    spaces.sort_by_key(|space| space.name.clone());
+    spaces
+        .into_iter()
+        .map(|space| {
+            vec![
+                Some(space.oid.to_string()),
+                Some(space.name),
+                Some(space.location),
+            ]
+        })
+        .collect()
 }
 
 fn psql_list_access_methods_catalog_query() -> &'static str {
@@ -18954,6 +19116,73 @@ mod tests {
             .comments
             .contains_key(&CatalogCommentTarget::Database {
                 database: database_name.to_string(),
+            }));
+    }
+
+    #[test]
+    fn shared_catalog_persistence_carries_tablespace_metadata() {
+        let tablespace_name = "shared_appspace";
+        {
+            let mut catalog = shared_catalog()
+                .lock()
+                .expect("shared catalog mutex poisoned");
+            catalog.tablespaces.remove(tablespace_name);
+            catalog.comments.remove(&CatalogCommentTarget::Tablespace {
+                tablespace: tablespace_name.to_string(),
+            });
+        }
+
+        let mut session = Session::new(true);
+        session.tablespaces.insert(
+            tablespace_name.to_string(),
+            TablespaceInfo {
+                oid: FIRST_USER_RELATION_OID,
+                name: tablespace_name.to_string(),
+                location: "/tmp/shared_appspace".to_string(),
+            },
+        );
+        session.comments.insert(
+            CatalogCommentTarget::Tablespace {
+                tablespace: tablespace_name.to_string(),
+            },
+            "shared storage".to_string(),
+        );
+        session.mark_tablespace_dirty(tablespace_name);
+        session.mark_comment_dirty(CatalogCommentTarget::Tablespace {
+            tablespace: tablespace_name.to_string(),
+        });
+        session.persist_catalog_snapshot();
+
+        let mut reloaded = Session::new(true);
+        let oid_rows = catalog_tablespace_oid_rows(&reloaded);
+        assert!(oid_rows.contains(&vec![
+            Some(FIRST_USER_RELATION_OID.to_string()),
+            Some(tablespace_name.to_string()),
+            Some("/tmp/shared_appspace".to_string()),
+        ]));
+        let verbose_rows = catalog_psql_list_tablespace_rows(&reloaded, true);
+        let appspace_row = verbose_rows
+            .iter()
+            .find(|row| row[0] == Some(tablespace_name.to_string()))
+            .expect("shared tablespace row");
+        assert_eq!(appspace_row[6], Some("shared storage".to_string()));
+
+        reloaded.tablespaces.remove(tablespace_name);
+        reloaded.comments.remove(&CatalogCommentTarget::Tablespace {
+            tablespace: tablespace_name.to_string(),
+        });
+        reloaded.mark_tablespace_dirty(tablespace_name);
+        reloaded.mark_comment_dirty(CatalogCommentTarget::Tablespace {
+            tablespace: tablespace_name.to_string(),
+        });
+        reloaded.persist_catalog_snapshot();
+
+        let final_session = Session::new(true);
+        assert!(!final_session.tablespaces.contains_key(tablespace_name));
+        assert!(!final_session
+            .comments
+            .contains_key(&CatalogCommentTarget::Tablespace {
+                tablespace: tablespace_name.to_string(),
             }));
     }
 

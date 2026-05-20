@@ -63,6 +63,8 @@ impl Planner {
             | Command::DropSchema(_)
             | Command::CreateDatabase(_)
             | Command::DropDatabase(_)
+            | Command::CreateTablespace(_)
+            | Command::DropTablespace(_)
             | Command::AddPrimaryKey(_)
             | Command::AddUniqueConstraint(_)
             | Command::AddCheckConstraint(_)

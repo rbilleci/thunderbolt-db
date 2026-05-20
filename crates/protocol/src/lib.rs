@@ -13,6 +13,8 @@ pub enum Command {
     DropSchema(DropSchema),
     CreateDatabase(CreateDatabase),
     DropDatabase(DropDatabase),
+    CreateTablespace(CreateTablespace),
+    DropTablespace(DropTablespace),
     CreateTable(CreateTable),
     AddPrimaryKey(AddPrimaryKey),
     AddUniqueConstraint(AddUniqueConstraint),
@@ -84,6 +86,18 @@ pub struct CreateDatabase {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DropDatabase {
+    pub names: Vec<String>,
+    pub if_exists: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateTablespace {
+    pub name: String,
+    pub location: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropTablespace {
     pub names: Vec<String>,
     pub if_exists: bool,
 }
@@ -1986,6 +2000,9 @@ fn parse_relational_command(input: &str) -> Option<Result<Command, ParseError>> 
         if second.eq_ignore_ascii_case("DATABASE") {
             return Some(parse_create_database(input).map(Command::CreateDatabase));
         }
+        if second.eq_ignore_ascii_case("TABLESPACE") {
+            return Some(parse_create_tablespace(input).map(Command::CreateTablespace));
+        }
         if second.eq_ignore_ascii_case("INDEX") || second.eq_ignore_ascii_case("UNIQUE") {
             return Some(parse_create_index(input).map(Command::CreateIndex));
         }
@@ -2037,6 +2054,9 @@ fn parse_relational_command(input: &str) -> Option<Result<Command, ParseError>> 
         }
         if second.eq_ignore_ascii_case("DATABASE") {
             return Some(parse_drop_database(input).map(Command::DropDatabase));
+        }
+        if second.eq_ignore_ascii_case("TABLESPACE") {
+            return Some(parse_drop_tablespace(input).map(Command::DropTablespace));
         }
         if second.eq_ignore_ascii_case("INDEX") {
             return Some(parse_drop_index(input).map(Command::DropIndex));
@@ -3998,6 +4018,58 @@ fn parse_drop_database(input: &str) -> Result<DropDatabase, ParseError> {
         return Err(ParseError::InvalidRelationalSql);
     }
     Ok(DropDatabase {
+        names: names
+            .into_iter()
+            .map(|name| normalize_identifier(name.trim()))
+            .collect::<Result<Vec<_>, _>>()?,
+        if_exists,
+    })
+}
+
+fn parse_create_tablespace(input: &str) -> Result<CreateTablespace, ParseError> {
+    let rest = strip_keyword_prefix_case_insensitive(input, "CREATE")
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    let rest = strip_keyword_prefix_case_insensitive(rest, "TABLESPACE")
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    let (raw_name, rest) = split_leading_identifier(rest)?;
+    let name = normalize_identifier(raw_name)?;
+    let rest = strip_keyword_prefix_case_insensitive(rest.trim_start(), "LOCATION")
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    let SqlValue::Text(location) = parse_sql_value(rest)? else {
+        return Err(ParseError::InvalidRelationalSql);
+    };
+    Ok(CreateTablespace { name, location })
+}
+
+fn parse_drop_tablespace(input: &str) -> Result<DropTablespace, ParseError> {
+    let mut rest = strip_keyword_prefix_case_insensitive(input, "DROP")
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    rest = strip_keyword_prefix_case_insensitive(rest, "TABLESPACE")
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    let if_exists = if let Some(after_if) = strip_keyword_prefix_case_insensitive(rest, "IF") {
+        let after_exists = strip_keyword_prefix_case_insensitive(after_if.trim_start(), "EXISTS")
+            .ok_or(ParseError::InvalidRelationalSql)?;
+        rest = after_exists.trim_start();
+        true
+    } else {
+        false
+    };
+    if rest.is_empty()
+        || find_keyword_outside_quotes(rest, "CASCADE").is_some()
+        || find_keyword_outside_quotes(rest, "RESTRICT").is_some()
+    {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let names = split_csv(rest)?;
+    if names.is_empty() {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    Ok(DropTablespace {
         names: names
             .into_iter()
             .map(|name| normalize_identifier(name.trim()))
@@ -12638,12 +12710,45 @@ default: Some(ColumnDefault::SequenceNextVal {
                 if_exists: true,
             })
         );
+        assert_eq!(
+            parse_command("CREATE TABLESPACE appspace LOCATION '/tmp/gpu-db-appspace'").unwrap(),
+            Command::CreateTablespace(CreateTablespace {
+                name: "appspace".to_string(),
+                location: "/tmp/gpu-db-appspace".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_command("CREATE TABLESPACE \"App Space\" LOCATION '/tmp/app space'").unwrap(),
+            Command::CreateTablespace(CreateTablespace {
+                name: "App Space".to_string(),
+                location: "/tmp/app space".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_command("DROP TABLESPACE IF EXISTS appspace, stale_space").unwrap(),
+            Command::DropTablespace(DropTablespace {
+                names: vec!["appspace".to_string(), "stale_space".to_string()],
+                if_exists: true,
+            })
+        );
         assert!(matches!(
             parse_command("CREATE DATABASE appdb OWNER postgres"),
             Err(ParseError::InvalidRelationalSql)
         ));
         assert!(matches!(
             parse_command("DROP DATABASE appdb WITH (FORCE)"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command("CREATE TABLESPACE appspace OWNER postgres LOCATION '/tmp/appspace'"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command("CREATE TABLESPACE appspace"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command("DROP TABLESPACE appspace CASCADE"),
             Err(ParseError::InvalidRelationalSql)
         ));
         assert!(matches!(

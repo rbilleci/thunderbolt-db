@@ -22,13 +22,13 @@ use gpu_db_protocol::{
     parse_command, AclRelationKind, AddCheckConstraint, AddForeignKey, AddUniqueConstraint,
     ColumnDef, ColumnDefault, Command, CommentTarget, CreateDatabase, CreateDomain,
     CreateExtension, CreateIndex, CreateMaterializedView, CreatePublication, CreateRole,
-    CreateSchema, CreateSequence, CreateSubscription, CreateTable, CreateView, Delete,
-    DropConstraint, DropDatabase, DropDomain, DropIndex, DropMaterializedView, DropPublication,
-    DropRole, DropSchema, DropSequence, DropSubscription, DropTable, DropView, Insert, ParseError,
-    PublicationTarget, RefreshMaterializedView, RenameColumn, RenameConstraint, RenameIndex,
-    RenameMaterializedView, RenameSequence, RenameTable, RenameView, SchemaPrivilege, Select,
-    SelectFilterOp, SelectProjection, SequenceNextVal, SequenceSetVal, SqlType, SqlValue,
-    TablePrivilege, TruncateTable, Update,
+    CreateSchema, CreateSequence, CreateSubscription, CreateTable, CreateTablespace, CreateView,
+    Delete, DropConstraint, DropDatabase, DropDomain, DropIndex, DropMaterializedView,
+    DropPublication, DropRole, DropSchema, DropSequence, DropSubscription, DropTable,
+    DropTablespace, DropView, Insert, ParseError, PublicationTarget, RefreshMaterializedView,
+    RenameColumn, RenameConstraint, RenameIndex, RenameMaterializedView, RenameSequence,
+    RenameTable, RenameView, SchemaPrivilege, Select, SelectFilterOp, SelectProjection,
+    SequenceNextVal, SequenceSetVal, SqlType, SqlValue, TablePrivilege, TruncateTable, Update,
 };
 use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine};
 use gpu_db_storage::{
@@ -82,6 +82,8 @@ impl ReplicatedStateMachine for KvStateMachine {
                     | Command::DropSchema(_)
                     | Command::CreateDatabase(_)
                     | Command::DropDatabase(_)
+                    | Command::CreateTablespace(_)
+                    | Command::DropTablespace(_)
                     | Command::CreateTable(_)
                     | Command::AddPrimaryKey(_)
                     | Command::AddUniqueConstraint(_)
@@ -5984,6 +5986,7 @@ pub struct Engine {
     relational_subscriptions: BTreeMap<String, RelationalSubscription>,
     relational_roles: BTreeMap<String, RelationalRole>,
     relational_databases: BTreeMap<String, RelationalDatabase>,
+    relational_tablespaces: BTreeMap<String, RelationalTablespace>,
     relational_public_schema_exists: bool,
     relational_public_schema_implicit: bool,
     relational_schema_acl: BTreeMap<String, BTreeSet<SchemaPrivilege>>,
@@ -6126,6 +6129,13 @@ pub struct RelationalRole {
 pub struct RelationalDatabase {
     pub name: String,
     pub oid: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationalTablespace {
+    pub name: String,
+    pub oid: u32,
+    pub location: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -7486,6 +7496,7 @@ impl Engine {
             relational_subscriptions: BTreeMap::new(),
             relational_roles: BTreeMap::new(),
             relational_databases: BTreeMap::new(),
+            relational_tablespaces: BTreeMap::new(),
             relational_public_schema_exists: true,
             relational_public_schema_implicit: true,
             relational_schema_acl: BTreeMap::new(),
@@ -7731,6 +7742,8 @@ impl Engine {
             Command::DropSchema(drop) => self.apply_drop_schema(drop)?,
             Command::CreateDatabase(create) => self.apply_create_database(create)?,
             Command::DropDatabase(drop) => self.apply_drop_database(drop)?,
+            Command::CreateTablespace(create) => self.apply_create_tablespace(create)?,
+            Command::DropTablespace(drop) => self.apply_drop_tablespace(drop)?,
             Command::CreateTable(create) => self.apply_create_table(create)?,
             Command::AddPrimaryKey(add) => self.apply_add_primary_key(add)?,
             Command::AddUniqueConstraint(add) => self.apply_add_unique_constraint(add)?,
@@ -8273,6 +8286,11 @@ impl Engine {
         database == "postgres" || self.relational_databases.contains_key(database)
     }
 
+    fn tablespace_exists(&self, tablespace: &str) -> bool {
+        matches!(tablespace, "pg_default" | "pg_global")
+            || self.relational_tablespaces.contains_key(tablespace)
+    }
+
     fn apply_create_database(&mut self, create: CreateDatabase) -> Result<(), EngineError> {
         if self.database_exists(&create.name) {
             return Err(EngineError::ApplyFailed(format!(
@@ -8320,6 +8338,60 @@ impl Engine {
             self.relational_comments
                 .remove(&RelationalCommentTarget::Database {
                     database: database.clone(),
+                });
+        }
+        Ok(())
+    }
+
+    fn apply_create_tablespace(&mut self, create: CreateTablespace) -> Result<(), EngineError> {
+        if self.tablespace_exists(&create.name) {
+            return Err(EngineError::ApplyFailed(format!(
+                "tablespace \"{}\" already exists",
+                create.name
+            )));
+        }
+        let oid = self.relational_next_oid;
+        self.relational_next_oid = self.relational_next_oid.checked_add(1).ok_or_else(|| {
+            EngineError::ApplyFailed("relational tablespace OID allocation exhausted".to_string())
+        })?;
+        self.relational_tablespaces.insert(
+            create.name.clone(),
+            RelationalTablespace {
+                name: create.name,
+                oid,
+                location: create.location,
+            },
+        );
+        Ok(())
+    }
+
+    fn apply_drop_tablespace(&mut self, drop: DropTablespace) -> Result<(), EngineError> {
+        let mut seen = BTreeSet::new();
+        for tablespace in &drop.names {
+            if !seen.insert(tablespace.clone()) {
+                return Err(EngineError::ApplyFailed(format!(
+                    "tablespace \"{}\" specified more than once",
+                    tablespace
+                )));
+            }
+            if matches!(tablespace.as_str(), "pg_default" | "pg_global") {
+                return Err(EngineError::ApplyFailed(format!(
+                    "cannot drop bootstrap tablespace \"{}\"",
+                    tablespace
+                )));
+            }
+            if !drop.if_exists && !self.relational_tablespaces.contains_key(tablespace) {
+                return Err(EngineError::ApplyFailed(format!(
+                    "tablespace \"{}\" does not exist",
+                    tablespace
+                )));
+            }
+        }
+        for tablespace in &drop.names {
+            self.relational_tablespaces.remove(tablespace);
+            self.relational_comments
+                .remove(&RelationalCommentTarget::Tablespace {
+                    tablespace: tablespace.clone(),
                 });
         }
         Ok(())
@@ -10368,7 +10440,7 @@ impl Engine {
                 RelationalCommentTarget::Schema { schema }
             }
             CommentTarget::Tablespace { tablespace } => {
-                if tablespace != "pg_default" && tablespace != "pg_global" {
+                if !self.tablespace_exists(&tablespace) {
                     return Err(EngineError::ApplyFailed(format!(
                         "tablespace \"{}\" does not exist",
                         tablespace
@@ -11323,6 +11395,36 @@ impl Engine {
                     }
                 }
             }
+            Command::CreateTablespace(create) if self.tablespace_exists(&create.name) => {
+                return Err(EngineError::ApplyFailed(format!(
+                    "tablespace \"{}\" already exists",
+                    create.name
+                )));
+            }
+            Command::CreateTablespace(_) => {}
+            Command::DropTablespace(drop) => {
+                let mut seen = BTreeSet::new();
+                for tablespace in &drop.names {
+                    if !seen.insert(tablespace.clone()) {
+                        return Err(EngineError::ApplyFailed(format!(
+                            "tablespace \"{}\" specified more than once",
+                            tablespace
+                        )));
+                    }
+                    if matches!(tablespace.as_str(), "pg_default" | "pg_global") {
+                        return Err(EngineError::ApplyFailed(format!(
+                            "cannot drop bootstrap tablespace \"{}\"",
+                            tablespace
+                        )));
+                    }
+                    if !drop.if_exists && !self.relational_tablespaces.contains_key(tablespace) {
+                        return Err(EngineError::ApplyFailed(format!(
+                            "tablespace \"{}\" does not exist",
+                            tablespace
+                        )));
+                    }
+                }
+            }
             Command::CreateTable(create) => {
                 if !self.relational_public_schema_exists {
                     return Err(EngineError::ApplyFailed(format!(
@@ -12268,6 +12370,8 @@ impl Engine {
             | Command::DropSchema(_)
             | Command::CreateDatabase(_)
             | Command::DropDatabase(_)
+            | Command::CreateTablespace(_)
+            | Command::DropTablespace(_)
             | Command::CreateTable(_)
             | Command::AddPrimaryKey(_)
             | Command::AddUniqueConstraint(_)
@@ -12505,6 +12609,8 @@ impl Engine {
             | Command::DropSchema(_)
             | Command::CreateDatabase(_)
             | Command::DropDatabase(_)
+            | Command::CreateTablespace(_)
+            | Command::DropTablespace(_)
             | Command::CreateTable(_)
             | Command::AddPrimaryKey(_)
             | Command::AddUniqueConstraint(_)
@@ -12643,6 +12749,8 @@ impl Engine {
             Command::DropSchema(_) => Err(ExecuteError::NonReadCommand("DROP SCHEMA")),
             Command::CreateDatabase(_) => Err(ExecuteError::NonReadCommand("CREATE DATABASE")),
             Command::DropDatabase(_) => Err(ExecuteError::NonReadCommand("DROP DATABASE")),
+            Command::CreateTablespace(_) => Err(ExecuteError::NonReadCommand("CREATE TABLESPACE")),
+            Command::DropTablespace(_) => Err(ExecuteError::NonReadCommand("DROP TABLESPACE")),
             Command::CreateTable(_) => Err(ExecuteError::NonReadCommand("CREATE TABLE")),
             Command::AddPrimaryKey(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
             Command::AddUniqueConstraint(_) => Err(ExecuteError::NonReadCommand("ALTER TABLE")),
@@ -15893,6 +16001,10 @@ impl Engine {
 
     pub fn relational_database(&self, database: &str) -> Option<&RelationalDatabase> {
         self.relational_databases.get(database)
+    }
+
+    pub fn relational_tablespace(&self, tablespace: &str) -> Option<&RelationalTablespace> {
+        self.relational_tablespaces.get(tablespace)
     }
 
     pub fn relational_schema_comment(&self, schema: &str) -> Option<&str> {
@@ -38740,6 +38852,69 @@ mod tests {
         assert!(recovered.relational_public_schema_exists);
         assert!(recovered.relational_catalog_table("recreated").is_some());
         assert_eq!(recovered.relational_schema_comment("public"), None);
+    }
+
+    #[test]
+    fn relational_catalog_records_bounded_tablespace_metadata() {
+        let mut e = Engine::new_local();
+        e.execute_text(
+            1,
+            "CREATE TABLESPACE appspace LOCATION '/tmp/gpu-db-appspace'",
+        )
+        .unwrap();
+        e.execute_text(2, "COMMENT ON TABLESPACE appspace IS 'application storage'")
+            .unwrap();
+
+        let tablespace = e.relational_tablespace("appspace").unwrap();
+        assert_eq!(tablespace.name, "appspace");
+        assert_eq!(tablespace.location, "/tmp/gpu-db-appspace");
+        assert_eq!(
+            e.relational_tablespace_comment("appspace"),
+            Some("application storage")
+        );
+
+        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        assert_eq!(
+            recovered
+                .relational_tablespace("appspace")
+                .unwrap()
+                .location,
+            "/tmp/gpu-db-appspace"
+        );
+        assert_eq!(
+            recovered.relational_tablespace_comment("appspace"),
+            Some("application storage")
+        );
+
+        let duplicate = e
+            .execute_text(3, "CREATE TABLESPACE appspace LOCATION '/tmp/other'")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            duplicate.contains("tablespace \"appspace\" already exists"),
+            "{duplicate}"
+        );
+        let bootstrap = e
+            .execute_text(4, "DROP TABLESPACE pg_default")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            bootstrap.contains("cannot drop bootstrap tablespace \"pg_default\""),
+            "{bootstrap}"
+        );
+        let missing = e
+            .execute_text(5, "DROP TABLESPACE missing_space")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            missing.contains("tablespace \"missing_space\" does not exist"),
+            "{missing}"
+        );
+
+        e.execute_text(6, "DROP TABLESPACE IF EXISTS appspace, missing_space")
+            .unwrap();
+        assert!(e.relational_tablespace("appspace").is_none());
+        assert_eq!(e.relational_tablespace_comment("appspace"), None);
     }
 
     #[test]
