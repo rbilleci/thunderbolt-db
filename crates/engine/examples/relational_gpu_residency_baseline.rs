@@ -20,6 +20,9 @@ struct ProbeReport {
     d2h_bytes: u64,
     kernel_exec_samples: u64,
     kernel_exec_total_ms: u64,
+    kernel_event_timing_samples: u64,
+    kernel_event_elapsed_total_us: u64,
+    last_kernel_event_elapsed_us: Option<u64>,
     correctness_validated: bool,
 }
 
@@ -173,6 +176,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         &count_query,
         &count_cpu_result,
         "resident_device_memory_count_kernel_probe",
+    )?;
+    let default_resident_route_count_probe = timed_default_resident_route_probe(
+        &mut gpu,
+        &count_query,
+        &count_cpu_result,
+        "default_resident_route_count_kernel_probe",
     )?;
     let filtered_count_cpu_result = cpu.execute_relational_select(&filtered_count_query)?;
     let resident_device_filtered_count_probe = timed_resident_device_filtered_count_probe(
@@ -486,6 +495,52 @@ fn main() -> Result<(), Box<dyn Error>> {
         .table("events")
         .ok_or("missing oversize residency status for events")?;
     gpu.clear_relational_residency_budget_bytes(0);
+    let resident_device_reports = [
+        &default_resident_route_count_probe,
+        &resident_device_count_probe,
+        &resident_device_filtered_count_probe,
+        &resident_device_membership_count_probe,
+        &resident_device_range_count_probe,
+        &resident_device_between_count_probe,
+        &resident_device_filter_group_count_probe,
+        &resident_device_text_prefix_count_probe,
+        &resident_device_sum_probe,
+        &resident_device_avg_probe,
+        &resident_device_min_probe,
+        &resident_device_max_probe,
+        &resident_device_filtered_scalar_sum_probe,
+        &resident_device_filtered_scalar_avg_probe,
+        &resident_device_filtered_scalar_min_probe,
+        &resident_device_filtered_scalar_max_probe,
+        &resident_device_between_scalar_sum_probe,
+        &resident_device_between_scalar_avg_probe,
+        &resident_device_between_scalar_min_probe,
+        &resident_device_between_scalar_max_probe,
+        &resident_device_projection_probe,
+        &resident_device_distinct_projection_probe,
+        &resident_device_filtered_distinct_projection_probe,
+        &resident_device_filtered_ordered_projection_probe,
+        &resident_device_grouped_sum_probe,
+        &resident_device_grouped_count_probe,
+        &resident_device_grouped_avg_probe,
+        &resident_device_grouped_min_probe,
+        &resident_device_grouped_max_probe,
+        &resident_device_filtered_grouped_sum_probe,
+        &resident_device_filtered_grouped_count_probe,
+        &resident_device_filtered_grouped_avg_probe,
+        &resident_device_filtered_grouped_min_probe,
+        &resident_device_filtered_grouped_max_probe,
+    ];
+    let resident_device_memory_event_timing_samples = resident_device_reports
+        .iter()
+        .map(|report| report.kernel_event_timing_samples)
+        .sum::<u64>();
+    let resident_device_memory_event_elapsed_total_us = resident_device_reports
+        .iter()
+        .map(|report| report.kernel_event_elapsed_total_us)
+        .sum::<u64>();
+    let resident_device_memory_event_timing_supported =
+        resident_device_memory_event_timing_samples > 0;
 
     println!("# P7 GPU Residency Baseline");
     println!();
@@ -537,6 +592,15 @@ fn main() -> Result<(), Box<dyn Error>> {
             .as_ref()
             .map(|proof| proof.retained)
             .unwrap_or(false)
+    );
+    println!(
+        "- resident_device_memory_cuda_event_timing_supported: {resident_device_memory_event_timing_supported}"
+    );
+    println!(
+        "- resident_device_memory_cuda_event_timing_samples: {resident_device_memory_event_timing_samples}"
+    );
+    println!(
+        "- resident_device_memory_cuda_event_elapsed_total_us: {resident_device_memory_event_elapsed_total_us}"
     );
     println!(
         "- resident_snapshot_valid_before_mutation: {}",
@@ -722,7 +786,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("- supported_retained_projections: int4 predicate projection, int4 paginated distinct projection, int4 paginated filtered distinct projection, bounded int4 paginated filtered ordered projection");
     println!("- unsupported_retained_filters: non-prefix LIKE, subqueries, text filter groups beyond the single-prefix count proof, non-int4 filter-group payload columns, arbitrary expression trees");
     println!("- retained_filter_family_closeout: supported retained int4 filter groups and text prefix LIKE count are closed for the current SQL subset");
-    println!("- unsupported_production_cache_claims: broad workload-level GPU advantage, normal planner routing to retained handles, production allocator beyond deterministic budget admission evidence");
+    println!("- unsupported_production_cache_claims: broad workload-level GPU advantage, durable GPU pages, autonomous cache-daemon scheduling, external orchestration, richer expressions beyond the current literal subset, broader CUDA event timing coverage");
     println!();
     print_probe(&cold_probe);
     println!();
@@ -731,6 +795,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     print_probe(&warm_resident_aggregate_distinct_probe);
     println!();
     print_probe(&resident_device_count_probe);
+    println!();
+    print_probe(&default_resident_route_count_probe);
     println!();
     print_probe(&resident_device_filtered_count_probe);
     println!();
@@ -799,7 +865,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     print_probe(&mutation_probe);
     println!();
     println!(
-        "decision: current P7 evidence includes bounded resident table-data snapshot SELECT probes with zero per-query H2D transfer for the app lookup workload and supported aggregate/distinct SQL shapes, retained-device-memory COUNT(*), int4 equality-predicate COUNT(*), int4 membership-predicate COUNT(*), int4 range-predicate COUNT(*), int4 BETWEEN-predicate COUNT(*), retained int4 AND/OR filter-group COUNT(*), retained text prefix LIKE COUNT(*), int4 scalar SUM/AVG/MIN/MAX, int4 filtered scalar SUM/AVG/MIN/MAX, int4 BETWEEN scalar SUM/AVG/MIN/MAX, int4 predicate-projection, int4 paginated distinct projection, int4 paginated filtered distinct projection, bounded int4 paginated filtered ordered-projection, int4 grouped COUNT/SUM/AVG/MIN/MAX with grouped HAVING, and int4 filtered grouped COUNT/SUM/AVG/MIN/MAX with filtered grouped HAVING proofs over the resident allocation, resident-byte accounting, WAL-safe invalidation, manual refresh-cost accounting, memory-pressure fallback metadata, deterministic resident-snapshot budget admission/eviction, and a retained real CUDA allocation/copy handle for encoded snapshot bytes when local driver hardware is available. Supported retained string/filter expression-kernel families are closed for the current SQL subset; the remaining production CUDA-cache boundary is normal planner routing to retained handles, a cache manager with allocator/eviction policy, richer expressions beyond the current literal comparison/range/membership/prefix/count/aggregate/projection subset, and driver-level timing refinement."
+        "decision: current P7 evidence includes bounded resident table-data snapshot SELECT probes with zero per-query H2D transfer for the app lookup workload and supported aggregate/distinct SQL shapes, retained-device-memory COUNT(*), int4 equality-predicate COUNT(*), int4 membership-predicate COUNT(*), int4 range-predicate COUNT(*), int4 BETWEEN-predicate COUNT(*), retained int4 AND/OR filter-group COUNT(*), retained text prefix LIKE COUNT(*), int4 scalar SUM/AVG/MIN/MAX, int4 filtered scalar SUM/AVG/MIN/MAX, int4 BETWEEN scalar SUM/AVG/MIN/MAX, int4 predicate-projection, int4 paginated distinct projection, int4 paginated filtered distinct projection, bounded int4 paginated filtered ordered-projection, int4 grouped COUNT/SUM/AVG/MIN/MAX with grouped HAVING, and int4 filtered grouped COUNT/SUM/AVG/MIN/MAX with filtered grouped HAVING proofs over the resident allocation, resident-byte accounting, WAL-safe invalidation, manual refresh-cost accounting, memory-pressure fallback metadata, deterministic resident-snapshot budget admission/eviction, first accepted-route CUDA event timing samples, and a retained real CUDA allocation/copy handle for encoded snapshot bytes when local driver hardware is available. Supported retained string/filter expression-kernel families are closed for the current SQL subset; the remaining production CUDA-cache boundary is richer expressions beyond the current literal comparison/range/membership/prefix/count/aggregate/projection subset, production orchestration beyond bounded warmup and maintenance ticks, durable GPU pages, and broader CUDA event timing coverage."
     );
 
     Ok(())
@@ -837,6 +903,11 @@ fn timed_resident_device_count_probe(
         d2h_bytes: after.d2h_bytes_total - before.d2h_bytes_total,
         kernel_exec_samples: after.kernel_exec_samples - before.kernel_exec_samples,
         kernel_exec_total_ms: after.kernel_exec_total_ms - before.kernel_exec_total_ms,
+        kernel_event_timing_samples: after.kernel_event_timing_samples
+            - before.kernel_event_timing_samples,
+        kernel_event_elapsed_total_us: after.kernel_event_elapsed_total_us
+            - before.kernel_event_elapsed_total_us,
+        last_kernel_event_elapsed_us: after.last_kernel_event_elapsed_us,
         correctness_validated,
     })
 }
@@ -874,6 +945,11 @@ fn timed_resident_device_filtered_count_probe(
         d2h_bytes: after.d2h_bytes_total - before.d2h_bytes_total,
         kernel_exec_samples: after.kernel_exec_samples - before.kernel_exec_samples,
         kernel_exec_total_ms: after.kernel_exec_total_ms - before.kernel_exec_total_ms,
+        kernel_event_timing_samples: after.kernel_event_timing_samples
+            - before.kernel_event_timing_samples,
+        kernel_event_elapsed_total_us: after.kernel_event_elapsed_total_us
+            - before.kernel_event_elapsed_total_us,
+        last_kernel_event_elapsed_us: after.last_kernel_event_elapsed_us,
         correctness_validated,
     })
 }
@@ -911,6 +987,11 @@ fn timed_resident_device_filter_group_count_probe(
         d2h_bytes: after.d2h_bytes_total - before.d2h_bytes_total,
         kernel_exec_samples: after.kernel_exec_samples - before.kernel_exec_samples,
         kernel_exec_total_ms: after.kernel_exec_total_ms - before.kernel_exec_total_ms,
+        kernel_event_timing_samples: after.kernel_event_timing_samples
+            - before.kernel_event_timing_samples,
+        kernel_event_elapsed_total_us: after.kernel_event_elapsed_total_us
+            - before.kernel_event_elapsed_total_us,
+        last_kernel_event_elapsed_us: after.last_kernel_event_elapsed_us,
         correctness_validated,
     })
 }
@@ -948,6 +1029,11 @@ fn timed_resident_device_text_prefix_count_probe(
         d2h_bytes: after.d2h_bytes_total - before.d2h_bytes_total,
         kernel_exec_samples: after.kernel_exec_samples - before.kernel_exec_samples,
         kernel_exec_total_ms: after.kernel_exec_total_ms - before.kernel_exec_total_ms,
+        kernel_event_timing_samples: after.kernel_event_timing_samples
+            - before.kernel_event_timing_samples,
+        kernel_event_elapsed_total_us: after.kernel_event_elapsed_total_us
+            - before.kernel_event_elapsed_total_us,
+        last_kernel_event_elapsed_us: after.last_kernel_event_elapsed_us,
         correctness_validated,
     })
 }
@@ -985,6 +1071,11 @@ fn timed_resident_device_membership_count_probe(
         d2h_bytes: after.d2h_bytes_total - before.d2h_bytes_total,
         kernel_exec_samples: after.kernel_exec_samples - before.kernel_exec_samples,
         kernel_exec_total_ms: after.kernel_exec_total_ms - before.kernel_exec_total_ms,
+        kernel_event_timing_samples: after.kernel_event_timing_samples
+            - before.kernel_event_timing_samples,
+        kernel_event_elapsed_total_us: after.kernel_event_elapsed_total_us
+            - before.kernel_event_elapsed_total_us,
+        last_kernel_event_elapsed_us: after.last_kernel_event_elapsed_us,
         correctness_validated,
     })
 }
@@ -1021,6 +1112,11 @@ fn timed_resident_device_range_count_probe(
         d2h_bytes: after.d2h_bytes_total - before.d2h_bytes_total,
         kernel_exec_samples: after.kernel_exec_samples - before.kernel_exec_samples,
         kernel_exec_total_ms: after.kernel_exec_total_ms - before.kernel_exec_total_ms,
+        kernel_event_timing_samples: after.kernel_event_timing_samples
+            - before.kernel_event_timing_samples,
+        kernel_event_elapsed_total_us: after.kernel_event_elapsed_total_us
+            - before.kernel_event_elapsed_total_us,
+        last_kernel_event_elapsed_us: after.last_kernel_event_elapsed_us,
         correctness_validated,
     })
 }
@@ -1058,6 +1154,11 @@ fn timed_resident_device_between_count_probe(
         d2h_bytes: after.d2h_bytes_total - before.d2h_bytes_total,
         kernel_exec_samples: after.kernel_exec_samples - before.kernel_exec_samples,
         kernel_exec_total_ms: after.kernel_exec_total_ms - before.kernel_exec_total_ms,
+        kernel_event_timing_samples: after.kernel_event_timing_samples
+            - before.kernel_event_timing_samples,
+        kernel_event_elapsed_total_us: after.kernel_event_elapsed_total_us
+            - before.kernel_event_elapsed_total_us,
+        last_kernel_event_elapsed_us: after.last_kernel_event_elapsed_us,
         correctness_validated,
     })
 }
@@ -1094,6 +1195,11 @@ fn timed_resident_device_sum_probe(
         d2h_bytes: after.d2h_bytes_total - before.d2h_bytes_total,
         kernel_exec_samples: after.kernel_exec_samples - before.kernel_exec_samples,
         kernel_exec_total_ms: after.kernel_exec_total_ms - before.kernel_exec_total_ms,
+        kernel_event_timing_samples: after.kernel_event_timing_samples
+            - before.kernel_event_timing_samples,
+        kernel_event_elapsed_total_us: after.kernel_event_elapsed_total_us
+            - before.kernel_event_elapsed_total_us,
+        last_kernel_event_elapsed_us: after.last_kernel_event_elapsed_us,
         correctness_validated,
     })
 }
@@ -1131,6 +1237,11 @@ fn timed_resident_device_scalar_aggregate_probe(
         d2h_bytes: after.d2h_bytes_total - before.d2h_bytes_total,
         kernel_exec_samples: after.kernel_exec_samples - before.kernel_exec_samples,
         kernel_exec_total_ms: after.kernel_exec_total_ms - before.kernel_exec_total_ms,
+        kernel_event_timing_samples: after.kernel_event_timing_samples
+            - before.kernel_event_timing_samples,
+        kernel_event_elapsed_total_us: after.kernel_event_elapsed_total_us
+            - before.kernel_event_elapsed_total_us,
+        last_kernel_event_elapsed_us: after.last_kernel_event_elapsed_us,
         correctness_validated,
     })
 }
@@ -1168,6 +1279,11 @@ fn timed_resident_device_filtered_scalar_aggregate_probe(
         d2h_bytes: after.d2h_bytes_total - before.d2h_bytes_total,
         kernel_exec_samples: after.kernel_exec_samples - before.kernel_exec_samples,
         kernel_exec_total_ms: after.kernel_exec_total_ms - before.kernel_exec_total_ms,
+        kernel_event_timing_samples: after.kernel_event_timing_samples
+            - before.kernel_event_timing_samples,
+        kernel_event_elapsed_total_us: after.kernel_event_elapsed_total_us
+            - before.kernel_event_elapsed_total_us,
+        last_kernel_event_elapsed_us: after.last_kernel_event_elapsed_us,
         correctness_validated,
     })
 }
@@ -1205,6 +1321,11 @@ fn timed_resident_device_between_scalar_aggregate_probe(
         d2h_bytes: after.d2h_bytes_total - before.d2h_bytes_total,
         kernel_exec_samples: after.kernel_exec_samples - before.kernel_exec_samples,
         kernel_exec_total_ms: after.kernel_exec_total_ms - before.kernel_exec_total_ms,
+        kernel_event_timing_samples: after.kernel_event_timing_samples
+            - before.kernel_event_timing_samples,
+        kernel_event_elapsed_total_us: after.kernel_event_elapsed_total_us
+            - before.kernel_event_elapsed_total_us,
+        last_kernel_event_elapsed_us: after.last_kernel_event_elapsed_us,
         correctness_validated,
     })
 }
@@ -1241,6 +1362,11 @@ fn timed_resident_device_projection_probe(
         d2h_bytes: after.d2h_bytes_total - before.d2h_bytes_total,
         kernel_exec_samples: after.kernel_exec_samples - before.kernel_exec_samples,
         kernel_exec_total_ms: after.kernel_exec_total_ms - before.kernel_exec_total_ms,
+        kernel_event_timing_samples: after.kernel_event_timing_samples
+            - before.kernel_event_timing_samples,
+        kernel_event_elapsed_total_us: after.kernel_event_elapsed_total_us
+            - before.kernel_event_elapsed_total_us,
+        last_kernel_event_elapsed_us: after.last_kernel_event_elapsed_us,
         correctness_validated,
     })
 }
@@ -1278,6 +1404,11 @@ fn timed_resident_device_distinct_projection_probe(
         d2h_bytes: after.d2h_bytes_total - before.d2h_bytes_total,
         kernel_exec_samples: after.kernel_exec_samples - before.kernel_exec_samples,
         kernel_exec_total_ms: after.kernel_exec_total_ms - before.kernel_exec_total_ms,
+        kernel_event_timing_samples: after.kernel_event_timing_samples
+            - before.kernel_event_timing_samples,
+        kernel_event_elapsed_total_us: after.kernel_event_elapsed_total_us
+            - before.kernel_event_elapsed_total_us,
+        last_kernel_event_elapsed_us: after.last_kernel_event_elapsed_us,
         correctness_validated,
     })
 }
@@ -1317,6 +1448,11 @@ fn timed_resident_device_filtered_distinct_projection_probe(
         d2h_bytes: after.d2h_bytes_total - before.d2h_bytes_total,
         kernel_exec_samples: after.kernel_exec_samples - before.kernel_exec_samples,
         kernel_exec_total_ms: after.kernel_exec_total_ms - before.kernel_exec_total_ms,
+        kernel_event_timing_samples: after.kernel_event_timing_samples
+            - before.kernel_event_timing_samples,
+        kernel_event_elapsed_total_us: after.kernel_event_elapsed_total_us
+            - before.kernel_event_elapsed_total_us,
+        last_kernel_event_elapsed_us: after.last_kernel_event_elapsed_us,
         correctness_validated,
     })
 }
@@ -1354,6 +1490,11 @@ fn timed_resident_device_ordered_projection_probe(
         d2h_bytes: after.d2h_bytes_total - before.d2h_bytes_total,
         kernel_exec_samples: after.kernel_exec_samples - before.kernel_exec_samples,
         kernel_exec_total_ms: after.kernel_exec_total_ms - before.kernel_exec_total_ms,
+        kernel_event_timing_samples: after.kernel_event_timing_samples
+            - before.kernel_event_timing_samples,
+        kernel_event_elapsed_total_us: after.kernel_event_elapsed_total_us
+            - before.kernel_event_elapsed_total_us,
+        last_kernel_event_elapsed_us: after.last_kernel_event_elapsed_us,
         correctness_validated,
     })
 }
@@ -1400,6 +1541,11 @@ fn timed_resident_device_grouped_aggregate_probe(
         d2h_bytes: after.d2h_bytes_total - before.d2h_bytes_total,
         kernel_exec_samples: after.kernel_exec_samples - before.kernel_exec_samples,
         kernel_exec_total_ms: after.kernel_exec_total_ms - before.kernel_exec_total_ms,
+        kernel_event_timing_samples: after.kernel_event_timing_samples
+            - before.kernel_event_timing_samples,
+        kernel_event_elapsed_total_us: after.kernel_event_elapsed_total_us
+            - before.kernel_event_elapsed_total_us,
+        last_kernel_event_elapsed_us: after.last_kernel_event_elapsed_us,
         correctness_validated,
     })
 }
@@ -1439,6 +1585,11 @@ fn timed_resident_device_filtered_grouped_aggregate_probe(
         d2h_bytes: after.d2h_bytes_total - before.d2h_bytes_total,
         kernel_exec_samples: after.kernel_exec_samples - before.kernel_exec_samples,
         kernel_exec_total_ms: after.kernel_exec_total_ms - before.kernel_exec_total_ms,
+        kernel_event_timing_samples: after.kernel_event_timing_samples
+            - before.kernel_event_timing_samples,
+        kernel_event_elapsed_total_us: after.kernel_event_elapsed_total_us
+            - before.kernel_event_elapsed_total_us,
+        last_kernel_event_elapsed_us: after.last_kernel_event_elapsed_us,
         correctness_validated,
     })
 }
@@ -1499,6 +1650,11 @@ fn timed_resident_probe_many(
         d2h_bytes: after.d2h_bytes_total - before.d2h_bytes_total,
         kernel_exec_samples: after.kernel_exec_samples - before.kernel_exec_samples,
         kernel_exec_total_ms: after.kernel_exec_total_ms - before.kernel_exec_total_ms,
+        kernel_event_timing_samples: after.kernel_event_timing_samples
+            - before.kernel_event_timing_samples,
+        kernel_event_elapsed_total_us: after.kernel_event_elapsed_total_us
+            - before.kernel_event_elapsed_total_us,
+        last_kernel_event_elapsed_us: after.last_kernel_event_elapsed_us,
         correctness_validated,
     })
 }
@@ -1535,6 +1691,11 @@ fn timed_resident_probe(
         d2h_bytes: after.d2h_bytes_total - before.d2h_bytes_total,
         kernel_exec_samples: after.kernel_exec_samples - before.kernel_exec_samples,
         kernel_exec_total_ms: after.kernel_exec_total_ms - before.kernel_exec_total_ms,
+        kernel_event_timing_samples: after.kernel_event_timing_samples
+            - before.kernel_event_timing_samples,
+        kernel_event_elapsed_total_us: after.kernel_event_elapsed_total_us
+            - before.kernel_event_elapsed_total_us,
+        last_kernel_event_elapsed_us: after.last_kernel_event_elapsed_us,
         correctness_validated,
     })
 }
@@ -1571,6 +1732,52 @@ fn timed_probe(
         d2h_bytes: after.d2h_bytes_total - before.d2h_bytes_total,
         kernel_exec_samples: after.kernel_exec_samples - before.kernel_exec_samples,
         kernel_exec_total_ms: after.kernel_exec_total_ms - before.kernel_exec_total_ms,
+        kernel_event_timing_samples: after.kernel_event_timing_samples
+            - before.kernel_event_timing_samples,
+        kernel_event_elapsed_total_us: after.kernel_event_elapsed_total_us
+            - before.kernel_event_elapsed_total_us,
+        last_kernel_event_elapsed_us: after.last_kernel_event_elapsed_us,
+        correctness_validated,
+    })
+}
+
+fn timed_default_resident_route_probe(
+    engine: &mut Engine,
+    query: &Select,
+    expected: &RelationalSelectResult,
+    name: &'static str,
+) -> Result<ProbeReport, Box<dyn Error>> {
+    let before = engine.metrics().snapshot();
+    let start = Instant::now();
+    let result = engine.execute_relational_select(query)?;
+    let elapsed = start.elapsed();
+    let after = engine.metrics().snapshot();
+    let correctness_validated = result.columns == expected.columns && result.rows == expected.rows;
+    if !correctness_validated {
+        return Err(format!("{name} default resident route results diverged").into());
+    }
+    Ok(ProbeReport {
+        name,
+        elapsed,
+        result_rows: result.rows.len(),
+        planned_target: format!("{:?}", result.planned_target),
+        executed_target: format!("{:?}", result.executed_target),
+        access_path: format!("{:?}", result.access_path),
+        sql_fallback: result.fallback_reason.is_some(),
+        fallback_reason: result
+            .fallback_reason
+            .as_ref()
+            .map(|reason| format!("{reason:?}"))
+            .unwrap_or_else(|| "None".to_string()),
+        h2d_bytes: after.h2d_bytes_total - before.h2d_bytes_total,
+        d2h_bytes: after.d2h_bytes_total - before.d2h_bytes_total,
+        kernel_exec_samples: after.kernel_exec_samples - before.kernel_exec_samples,
+        kernel_exec_total_ms: after.kernel_exec_total_ms - before.kernel_exec_total_ms,
+        kernel_event_timing_samples: after.kernel_event_timing_samples
+            - before.kernel_event_timing_samples,
+        kernel_event_elapsed_total_us: after.kernel_event_elapsed_total_us
+            - before.kernel_event_elapsed_total_us,
+        last_kernel_event_elapsed_us: after.last_kernel_event_elapsed_us,
         correctness_validated,
     })
 }
@@ -1588,6 +1795,21 @@ fn print_probe(report: &ProbeReport) {
     println!("- d2h_bytes: {}", report.d2h_bytes);
     println!("- kernel_exec_samples: {}", report.kernel_exec_samples);
     println!("- kernel_exec_total_ms: {}", report.kernel_exec_total_ms);
+    println!(
+        "- kernel_event_timing_samples: {}",
+        report.kernel_event_timing_samples
+    );
+    println!(
+        "- kernel_event_elapsed_total_us: {}",
+        report.kernel_event_elapsed_total_us
+    );
+    println!(
+        "- last_kernel_event_elapsed_us: {}",
+        report
+            .last_kernel_event_elapsed_us
+            .map(|elapsed_us| elapsed_us.to_string())
+            .unwrap_or_else(|| "None".to_string())
+    );
     println!("- correctness_validated: {}", report.correctness_validated);
 }
 

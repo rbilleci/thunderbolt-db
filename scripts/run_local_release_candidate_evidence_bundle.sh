@@ -13,6 +13,7 @@ OUT_DIR="${LOCAL_RELEASE_CANDIDATE_EVIDENCE_DIR:-${OUT_ROOT}/${STAMP}}"
 required_lines=(
   "local_release_candidate_preflight=passed"
   "local_release_candidate_preflight_scope=validation_postgresql_product_plus_gpu_residency"
+  "local_release_candidate_preflight_gpu_residency=retained_cuda_allocation_zero_h2d_routes_event_timing_warmup_maintenance"
   "local_release_candidate_preflight_gap_pgx=blocked_missing_go"
   "local_release_candidate_preflight_gap_jdbc_r2dbc=blocked_missing_java_build_tooling"
   "local_release_candidate_preflight_gap_physical_page_image_backup=missing"

@@ -65,6 +65,7 @@ run_gate \
   "local_gpu_residency_preflight_resident_device_memory=retained_cuda_allocation" \
   "local_gpu_residency_preflight_resident_routes=zero_h2d_supported_kernel_shapes" \
   "local_gpu_residency_preflight_cache_manager=budget_admission_eviction_invalidation_refresh" \
+  "local_gpu_residency_preflight_cuda_event_timing=first_accepted_route_samples" \
   "local_gpu_residency_preflight_warmup=operator_triggered_dry_run_apply" \
   "local_gpu_residency_preflight_maintenance=scheduler_friendly_tick" \
   "local_gpu_residency_preflight_gap_durable_gpu_pages=missing" \
@@ -79,7 +80,7 @@ printf 'local_release_candidate_preflight_validation=fmt_clippy_all_features_psq
 printf 'local_release_candidate_preflight_postgresql=application_drivers_pg_dump_restore_privileges_local_resilience\n'
 printf 'local_release_candidate_preflight_gpu=residency_baseline_warmup_maintenance\n'
 printf 'local_release_candidate_preflight_drivers=tokio-postgres,sqlx,node-postgres,asyncpg,psycopg\n'
-printf 'local_release_candidate_preflight_gpu_residency=retained_cuda_allocation_zero_h2d_routes_warmup_maintenance\n'
+printf 'local_release_candidate_preflight_gpu_residency=retained_cuda_allocation_zero_h2d_routes_event_timing_warmup_maintenance\n'
 printf 'local_release_candidate_preflight_gap_pgx=blocked_missing_go\n'
 printf 'local_release_candidate_preflight_gap_jdbc_r2dbc=blocked_missing_java_build_tooling\n'
 printf 'local_release_candidate_preflight_gap_physical_page_image_backup=missing\n'

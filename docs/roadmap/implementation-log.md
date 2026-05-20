@@ -2,6 +2,14 @@
 
 ## 2026-05-20
 
+- Hardened the local GPU residency and release-candidate preflight evidence for
+  the first accepted-route CUDA event timing slice. The residency baseline now
+  exercises the default accepted resident route, reports per-probe event timing
+  counters plus aggregate first-slice timing support, and the local GPU
+  residency/release/evidence-bundle gates assert that evidence while keeping
+  broader CUDA event timing coverage and production cache orchestration as
+  explicit gaps.
+
 - Added bounded relation ACL enforcement for supported PostgreSQL-facing session
   roles. `SET ROLE {created_role|DEFAULT|NONE}` now mutates protocol session
   current-role state, missing roles fail truthfully, and non-superuser roles
