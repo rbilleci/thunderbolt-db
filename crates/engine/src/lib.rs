@@ -13695,6 +13695,10 @@ impl Engine {
                 access_path: RelationalAccessPath::FullTableScan,
             });
         }
+        let resident_route = self.plan_relational_resident_route(select);
+        if resident_route.accepted {
+            return self.execute_relational_select_with_resident_route(select);
+        }
         let (table, bound) = self.bind_relational_select_for_execution(select)?;
         let (query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
         let result = self.execute_mvcc_query(&query)?;
@@ -22293,7 +22297,7 @@ mod tests {
     }
 
     #[test]
-    fn p8_resident_route_decisions_use_cache_state_without_routing_normal_sql() {
+    fn p8_resident_route_decisions_use_cache_state_and_default_fallbacks() {
         let mut e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE events (id INT, label TEXT)")
             .unwrap();
@@ -22346,10 +22350,15 @@ mod tests {
 
         let normal = e.execute_relational_select(&count_select).unwrap();
         assert_eq!(normal.planned_target, DeviceTarget::Gpu(0));
-        assert_eq!(
-            normal.fallback_reason,
-            Some(FallbackReason::GpuMvccReadParityGap)
-        );
+        if decision.accepted {
+            assert_eq!(normal.executed_target, DeviceTarget::Gpu(0));
+            assert_eq!(normal.fallback_reason, None);
+        } else {
+            assert_eq!(
+                normal.fallback_reason,
+                Some(FallbackReason::GpuMvccReadParityGap)
+            );
+        }
 
         let Command::Select(unsupported) = parse_command("SELECT * FROM events").unwrap() else {
             unreachable!()
@@ -22371,7 +22380,7 @@ mod tests {
     }
 
     #[test]
-    fn p8_opt_in_resident_route_executes_accepted_shapes_without_default_routing() {
+    fn p8_default_resident_route_executes_accepted_shapes() {
         let mut e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE events (id INT, label TEXT)")
             .unwrap();
@@ -22386,13 +22395,6 @@ mod tests {
         else {
             unreachable!()
         };
-        let default = e.execute_relational_select(&count_select).unwrap();
-        assert_eq!(default.planned_target, DeviceTarget::Gpu(0));
-        assert_eq!(
-            default.fallback_reason,
-            Some(FallbackReason::GpuMvccReadParityGap)
-        );
-
         let route = e.plan_relational_resident_route(&count_select);
         if !route.accepted {
             assert_eq!(
@@ -22418,15 +22420,25 @@ mod tests {
             let Command::Select(select) = parse_command(sql).unwrap() else {
                 unreachable!()
             };
-            let expected = e.execute_relational_select(&select).unwrap();
+            let expected = e
+                .execute_relational_select_with_cuda_driver_probe(&select)
+                .unwrap();
             let resident = e
                 .execute_relational_select_with_resident_route(&select)
                 .unwrap_or_else(|err| panic!("{sql}: {err}"));
+            let default = e
+                .execute_relational_select(&select)
+                .unwrap_or_else(|err| panic!("{sql}: {err}"));
             assert_eq!(resident.rows, expected.rows, "{sql}");
             assert_eq!(resident.columns, expected.columns, "{sql}");
+            assert_eq!(default.rows, expected.rows, "{sql}");
+            assert_eq!(default.columns, expected.columns, "{sql}");
             assert_eq!(resident.planned_target, DeviceTarget::Gpu(0), "{sql}");
             assert_eq!(resident.executed_target, DeviceTarget::Gpu(0), "{sql}");
             assert_eq!(resident.fallback_reason, None, "{sql}");
+            assert_eq!(default.planned_target, DeviceTarget::Gpu(0), "{sql}");
+            assert_eq!(default.executed_target, DeviceTarget::Gpu(0), "{sql}");
+            assert_eq!(default.fallback_reason, None, "{sql}");
             assert_eq!(
                 e.status_snapshot()
                     .relational_residency
@@ -22484,6 +22496,12 @@ mod tests {
                 .unwrap()
                 .cache_state,
             "Invalidated"
+        );
+        let fallback = e.execute_relational_select(&absent).unwrap();
+        assert_eq!(fallback.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(
+            fallback.fallback_reason,
+            Some(FallbackReason::GpuMvccReadParityGap)
         );
     }
 

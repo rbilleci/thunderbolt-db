@@ -308,23 +308,23 @@ The cost inputs are:
 - expected CPU index path cost
 - explicit fallback risk reason
 
-The first implementation now exposes accepted/rejected resident route decisions
-through status and telemetry before routing normal SQL traffic to resident
-handles by default. `Engine::plan_relational_resident_route(...)` is
-conservative: it accepts only supported base-table `SELECT` shapes with a valid
-resident snapshot, retained device memory, no active memory-pressure
+The current implementation exposes accepted/rejected resident route decisions
+through status and telemetry and consumes accepted decisions from the normal
+`Engine::execute_relational_select(...)` read path. `Engine::plan_relational_resident_route(...)`
+is conservative: it accepts only supported base-table `SELECT` shapes with a
+valid resident snapshot, retained device memory, no active memory-pressure
 invalidation, and known retained-kernel proof coverage. Rejections keep the
-reason and cost facts visible: absent/invalid/evicted snapshots, missing
-retained device memory, unsupported relation kinds, unsupported query shapes,
-resident bytes, budget bytes, refresh bytes, cold H2D bytes, zero resident H2D
-bytes, and estimated D2H rows.
+reason and cost facts visible and fall back to the existing MVCC/CUDA-probe
+path: absent/invalid/evicted snapshots, missing retained device memory,
+unsupported relation kinds, unsupported query shapes, resident bytes, budget
+bytes, refresh bytes, cold H2D bytes, zero resident H2D bytes, and estimated D2H
+rows.
 
-`Engine::execute_relational_select_with_resident_route(...)` is the first
-execution consumer of those decisions. It is explicitly opt-in: it records the
-same route decision, rejects non-accepted routes before execution, and dispatches
-only the retained-device-memory query shapes whose kernels already have proof
-coverage. The normal SQL execution path still does not consume resident handles
-by default.
+`Engine::execute_relational_select_with_resident_route(...)` remains the explicit
+execution consumer for the same decision contract. The default read path calls
+through it only after the route decision is accepted, so non-accepted routes keep
+correctness on the existing CPU/MVCC-backed path instead of producing resident
+execution errors.
 
 ### Recovery And Warmup
 
@@ -387,8 +387,15 @@ execution path for retained-device-memory `COUNT(*)`, supported int4/text count
 predicates, int4 scalar aggregates, and bounded int4 range-predicate
 projections. It preserves explicit rejection for unsupported, stale, missing,
 or memory-pressured resident paths and still does not make resident GPU
-execution the default SQL path. The next slice is production planner
-integration/default routing using the same decision contract.
+execution the default SQL path.
+
+The fourth P8 code slice integrates that same decision contract into
+`Engine::execute_relational_select(...)`: accepted retained-device-memory routes
+execute by default with zero per-query resident H2D transfer, while every
+rejected route falls back to the existing MVCC/CUDA-probe path. This is default
+planner routing for the bounded retained-kernel shapes only; automatic warmup,
+durable GPU pages, and a production background cache daemon remain outside the
+first P8 design.
 
 ## Non-Goals For The First P8 Design
 

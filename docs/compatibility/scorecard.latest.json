@@ -9,8 +9,8 @@
     "execution.gpu_routing_and_batching": {
       "failed": 0,
       "ignored": 0,
-      "passed": 92,
-      "total": 92
+      "passed": 93,
+      "total": 93
     },
     "protocol.client_flows": {
       "failed": 0,
@@ -75,8 +75,8 @@
     "uncategorized": {
       "failed": 0,
       "ignored": 0,
-      "passed": 221,
-      "total": 221
+      "passed": 220,
+      "total": 220
     }
   },
   "top_failing_categories": [],
