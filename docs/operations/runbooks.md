@@ -144,7 +144,7 @@ Boundaries:
 
 ### 1g) Local Release-Candidate Preflight
 
-Run before treating the combined PostgreSQL-facing and GPU-residency envelope as locally checked for a release candidate:
+Run before treating the combined validation, PostgreSQL-facing, and GPU-residency envelope as locally checked for a release candidate:
 
 ```bash
 scripts/run_local_release_candidate_preflight.sh
@@ -153,6 +153,7 @@ scripts/run_local_release_candidate_preflight.sh
 Pass criteria:
 
 - `local_release_candidate_preflight=passed`
+- Validation evidence includes fmt, clippy, all-features tests, real psql golden coverage, regenerated compatibility scorecard freshness, and checked-in scorecard parity.
 - PostgreSQL product evidence includes the local product preflight over application drivers, pg_dump/restore including bounded privilege restore, and local resilience.
 - GPU residency evidence includes the local residency preflight over retained CUDA allocation, zero-H2D resident routes, warmup, and maintenance.
 - The output names the remaining blocked `pgx` and JDBC/R2DBC driver gates plus physical backup, production object-storage, live scheduling, live systemd/Kubernetes rollout, production timeline-failover, durable GPU page, autonomous cache-daemon, external orchestration, broad retained-expression, and broad CUDA-event-timing gaps.
@@ -252,7 +253,7 @@ For the current single-node relational WAL segment proof:
 16. For the recurring local DR drill, run `scripts/run_backup_pitr_dr_drill.sh`; it aggregates the focused base-plus-archive restore tests, checkpoint PITR-window retention tests, scheduler-safe maintenance preflight, object-bundle backup preflight, and MVCC retention boundary tests into one operator gate.
 17. For a combined local resilience game-day gate, run `scripts/run_local_resilience_drill.sh`; it runs the local backup/PITR/DR drill and the local replication deployment preflight, verifies both evidence contracts, and reports the combined supported scope.
 18. For a local PostgreSQL-compatible product preflight, run `scripts/run_local_product_preflight.sh`; it runs the checked application-driver gate, pg_dump/pg_restore gate including bounded public ACL/default-privilege restore, and local resilience drill, verifies stable evidence from each, and reports the current supported envelope plus blocked/open gaps.
-19. For a top-level local release-candidate preflight, run `scripts/run_local_release_candidate_preflight.sh`; it runs the PostgreSQL-compatible product preflight plus the GPU residency preflight, verifies both evidence contracts, and reports the combined local supported envelope plus blocked/open gaps.
+19. For a top-level local release-candidate preflight, run `scripts/run_local_release_candidate_preflight.sh`; it runs the local validation preflight, PostgreSQL-compatible product preflight, and GPU residency preflight, verifies all three evidence contracts, and reports the combined local supported envelope plus blocked/open gaps.
 20. Treat physical page-image base backups, production object-storage APIs, automated production timeline failover orchestration beyond local registered-target selection/pruning, live systemd/Kubernetes rollout, and live background cleanup scheduling as not yet implemented.
 
 Failure criteria:
