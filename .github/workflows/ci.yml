@@ -19,14 +19,14 @@ jobs:
       - name: fmt
         run: cargo fmt --all -- --check
       - name: clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
       - name: test
         id: cargo_test
         continue-on-error: true
         run: |
           set -euo pipefail
           mkdir -p target/compat
-          cargo test --workspace -- --color never 2>&1 | tee target/compat/cargo-test.log
+          cargo test --all --all-features -- --color never 2>&1 | tee target/compat/cargo-test.log
       - name: psql golden compatibility suite
         id: psql_golden
         continue-on-error: true
