@@ -308,9 +308,16 @@ The cost inputs are:
 - expected CPU index path cost
 - explicit fallback risk reason
 
-The first implementation should expose the chosen reason, rejected reason, and
-cost inputs through status or benchmark output before routing normal SQL traffic
-to resident handles by default.
+The first implementation now exposes accepted/rejected resident route decisions
+through status and telemetry before routing normal SQL traffic to resident
+handles by default. `Engine::plan_relational_resident_route(...)` is
+conservative: it accepts only supported base-table `SELECT` shapes with a valid
+resident snapshot, retained device memory, no active memory-pressure
+invalidation, and known retained-kernel proof coverage. Rejections keep the
+reason and cost facts visible: absent/invalid/evicted snapshots, missing
+retained device memory, unsupported relation kinds, unsupported query shapes,
+resident bytes, budget bytes, refresh bytes, cold H2D bytes, zero resident H2D
+bytes, and estimated D2H rows.
 
 ### Recovery And Warmup
 
@@ -360,10 +367,17 @@ now reports cache state plus the latest admission or rejection decision, and the
 residency benchmark reports admission, mutation invalidation, refresh,
 eviction, oversized rejection, and decision facts.
 
+The second P8 code slice adds the first planner-routing decision contract over
+those facts. It records accepted/rejected resident-route decisions for supported
+`COUNT(*)`, simple int4/text predicate count, int4 scalar aggregate, and bounded
+int4 projection shapes, and rejects absent, evicted, invalidated,
+memory-pressured, no-retained-memory, view/materialized-view, and unsupported
+shape cases without changing normal SQL execution.
+
 This does not yet make resident GPU execution the default SQL path. The next
-code slice should consume these cache-manager facts as a planner-routing input
-while preserving truthful CPU fallback for unsupported, stale, or over-budget
-resident paths.
+code slice should use accepted route decisions to drive an opt-in resident
+execution path while preserving truthful CPU fallback for unsupported, stale, or
+over-budget resident paths.
 
 ## Non-Goals For The First P8 Design
 

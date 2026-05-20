@@ -3,8 +3,8 @@
     "durability.invariants": {
       "failed": 0,
       "ignored": 0,
-      "passed": 130,
-      "total": 130
+      "passed": 135,
+      "total": 135
     },
     "execution.gpu_routing_and_batching": {
       "failed": 0,
@@ -15,14 +15,14 @@
     "protocol.client_flows": {
       "failed": 0,
       "ignored": 0,
-      "passed": 76,
-      "total": 76
+      "passed": 134,
+      "total": 134
     },
     "protocol.error_paths": {
       "failed": 0,
       "ignored": 0,
-      "passed": 94,
-      "total": 94
+      "passed": 104,
+      "total": 104
     },
     "protocol.extended_query": {
       "failed": 0,
@@ -39,8 +39,8 @@
     "replication.role_and_log": {
       "failed": 0,
       "ignored": 0,
-      "passed": 177,
-      "total": 177
+      "passed": 231,
+      "total": 231
     },
     "sql.catalog_schema_types": {
       "failed": 0,
@@ -53,6 +53,12 @@
       "ignored": 0,
       "passed": 23,
       "total": 23
+    },
+    "sql.parser_features": {
+      "failed": 0,
+      "ignored": 0,
+      "passed": 65,
+      "total": 65
     },
     "sql.relational_foundation": {
       "failed": 0,
@@ -75,16 +81,16 @@
     "uncategorized": {
       "failed": 0,
       "ignored": 0,
-      "passed": 218,
-      "total": 218
+      "passed": 183,
+      "total": 183
     }
   },
   "top_failing_categories": [],
   "totals": {
     "failed": 0,
     "ignored": 0,
-    "passed": 1179,
-    "total": 1179
+    "passed": 1181,
+    "total": 1181
   },
   "trend_hook": {
     "baseline_available": true,
@@ -99,6 +105,7 @@
       "replication.role_and_log": 0,
       "sql.catalog_schema_types": 0,
       "sql.gpu_bridge": 0,
+      "sql.parser_features": 0,
       "sql.relational_foundation": 0,
       "sql.transaction_flows": 0,
       "storage.indexing": 0,

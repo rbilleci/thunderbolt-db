@@ -15,7 +15,7 @@ use gpu_db_metrics::{BatchFlushReason, FallbackReason, RuntimeMetrics, RuntimeMe
 use gpu_db_observability::{
     ActiveFallbackReason, EngineStatusSnapshot, EngineTelemetrySnapshot, FallbackStatus,
     ReadinessStatus, RelationalResidencyStatus, RelationalResidencyTableStatus,
-    ReplicationLagSnapshot, SnapshotStatus, TelemetrySink,
+    RelationalResidentRouteDecisionStatus, ReplicationLagSnapshot, SnapshotStatus, TelemetrySink,
 };
 use gpu_db_planner::{ExecutionPlan, Planner, PlannerConfig};
 use gpu_db_protocol::{
@@ -6028,6 +6028,7 @@ struct RelationalResidentCache {
     device_memory: BTreeMap<String, CudaResidentDeviceMemory>,
     budget_bytes_by_gpu: BTreeMap<u16, u64>,
     last_decisions: BTreeMap<String, RelationalResidentCacheDecision>,
+    latest_route_decisions: BTreeMap<String, RelationalResidentRouteDecisionStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6052,9 +6053,15 @@ impl RelationalResidentCache {
         self.last_decisions.get(table)
     }
 
+    fn record_route_decision(&mut self, decision: RelationalResidentRouteDecisionStatus) {
+        self.latest_route_decisions
+            .insert(decision.table.clone(), decision);
+    }
+
     fn remove_table(&mut self, table: &str) {
         self.snapshots.remove(table);
         self.device_memory.remove(table);
+        self.latest_route_decisions.remove(table);
     }
 
     fn install_snapshot(
@@ -6608,6 +6615,111 @@ struct BoundRelationalSelect {
     filters: Vec<(usize, SelectFilterOp, SqlValue)>,
     filter_groups: Vec<Vec<(usize, SelectFilterOp, SqlValue)>>,
     order: Option<(usize, bool)>,
+}
+
+fn resident_route_query_shape(
+    select: &Select,
+    table: &RelationalTable,
+    bound: &BoundRelationalSelect,
+) -> Option<String> {
+    if select.offset.is_some() || select.order_by.is_some() || select.distinct {
+        return None;
+    }
+    if select.group_by.is_some() || !select.having_groups.is_empty() {
+        return None;
+    }
+
+    match &select.projection {
+        SelectProjection::CountAll => resident_route_count_shape(table, bound),
+        SelectProjection::Sum { column }
+        | SelectProjection::Avg { column }
+        | SelectProjection::Min { column }
+        | SelectProjection::Max { column } => {
+            let idx = table
+                .columns
+                .iter()
+                .position(|candidate| candidate.name == *column)?;
+            (table.columns[idx].ty == SqlType::Int4
+                && bound.filter.is_none()
+                && bound.filters.is_empty()
+                && bound.filter_groups.is_empty()
+                && select.limit.is_none())
+            .then(|| "int4_scalar_aggregate".to_string())
+        }
+        SelectProjection::Columns(columns)
+            if columns.len() == 1
+                && bound.filter.is_none()
+                && bound.filters.is_empty()
+                && bound.filter_groups.is_empty() =>
+        {
+            let idx = table
+                .columns
+                .iter()
+                .position(|candidate| candidate.name == columns[0])?;
+            (table.columns[idx].ty == SqlType::Int4).then(|| "int4_projection".to_string())
+        }
+        _ => None,
+    }
+}
+
+fn resident_route_count_shape(
+    table: &RelationalTable,
+    bound: &BoundRelationalSelect,
+) -> Option<String> {
+    if bound.filter.is_none() && bound.filters.is_empty() && bound.filter_groups.is_empty() {
+        return Some("count_all".to_string());
+    }
+    let filter_groups = if !bound.filter_groups.is_empty() {
+        bound.filter_groups.clone()
+    } else if !bound.filters.is_empty() {
+        vec![bound.filters.clone()]
+    } else {
+        vec![vec![bound.filter.clone()?]]
+    };
+    if filter_groups.is_empty() {
+        return Some("count_all".to_string());
+    }
+    if filter_groups.len() == 1 && filter_groups[0].len() == 1 {
+        let (idx, op, value) = &filter_groups[0][0];
+        let column = table.columns.get(*idx)?;
+        return match (column.ty, op, value) {
+            (SqlType::Int4, SelectFilterOp::Eq, SqlValue::Int4(_)) => {
+                Some("int4_equality_count".to_string())
+            }
+            (
+                SqlType::Int4,
+                SelectFilterOp::Lt | SelectFilterOp::Lte | SelectFilterOp::Gt | SelectFilterOp::Gte,
+                SqlValue::Int4(_),
+            ) => Some("int4_range_count".to_string()),
+            (SqlType::Text, SelectFilterOp::LikePrefix, SqlValue::Text(_)) => {
+                Some("text_prefix_like_count".to_string())
+            }
+            _ => None,
+        };
+    }
+    filter_groups
+        .iter()
+        .flatten()
+        .all(|(idx, _op, value)| {
+            table.columns.get(*idx).is_some_and(|column| {
+                column.ty == SqlType::Int4 && matches!(value, SqlValue::Int4(_))
+            })
+        })
+        .then(|| "int4_filter_group_count".to_string())
+}
+
+fn resident_route_d2h_rows_estimate(select: &Select, resident_row_count: usize) -> usize {
+    match select.projection {
+        SelectProjection::CountAll
+        | SelectProjection::Sum { .. }
+        | SelectProjection::Avg { .. }
+        | SelectProjection::Min { .. }
+        | SelectProjection::Max { .. } => 1,
+        _ => select
+            .limit
+            .unwrap_or(resident_row_count)
+            .min(resident_row_count),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -17190,6 +17302,150 @@ impl Engine {
             })
     }
 
+    fn relational_snapshot_cache_state(
+        snapshot: &RelationalResidencySnapshot,
+        memory_pressure_active: bool,
+    ) -> &'static str {
+        if memory_pressure_active || snapshot.invalidated_by_memory_pressure {
+            "InvalidatedByMemoryPressure"
+        } else if snapshot.invalidated_by_txn_id.is_some()
+            || snapshot.invalidated_at_index.is_some()
+        {
+            "Invalidated"
+        } else {
+            "Valid"
+        }
+    }
+
+    fn resident_route_reject(
+        table: &str,
+        reason: impl Into<String>,
+        query_shape: impl Into<String>,
+    ) -> RelationalResidentRouteDecisionStatus {
+        RelationalResidentRouteDecisionStatus {
+            table: table.to_string(),
+            gpu_id: None,
+            accepted: false,
+            reason: reason.into(),
+            query_shape: query_shape.into(),
+            cache_state: "Absent".to_string(),
+            valid: false,
+            has_retained_device_memory: false,
+            estimated_rows: 0,
+            resident_bytes: 0,
+            budget_bytes: None,
+            refresh_resident_bytes: None,
+            h2d_bytes_if_resident: 0,
+            h2d_bytes_if_cold: 0,
+            d2h_rows_estimate: 0,
+        }
+    }
+
+    pub fn plan_relational_resident_route(
+        &mut self,
+        select: &Select,
+    ) -> RelationalResidentRouteDecisionStatus {
+        let decision = self.plan_relational_resident_route_inner(select);
+        self.relational_resident_cache
+            .record_route_decision(decision.clone());
+        decision
+    }
+
+    fn plan_relational_resident_route_inner(
+        &self,
+        select: &Select,
+    ) -> RelationalResidentRouteDecisionStatus {
+        if self.relational_views.contains_key(&select.table)
+            || self
+                .relational_materialized_views
+                .contains_key(&select.table)
+        {
+            return Self::resident_route_reject(
+                &select.table,
+                "resident routing currently supports only public base tables",
+                "unsupported_relation_kind",
+            );
+        }
+
+        let (table, bound) = match self.bind_relational_select_for_execution(select) {
+            Ok(bound) => bound,
+            Err(err) => {
+                return Self::resident_route_reject(
+                    &select.table,
+                    format!("unsupported select shape: {err}"),
+                    "unsupported_select",
+                );
+            }
+        };
+
+        let query_shape = match resident_route_query_shape(select, &table, &bound) {
+            Some(shape) => shape,
+            None => {
+                return Self::resident_route_reject(
+                    &table.name,
+                    "resident routing has no retained-kernel proof for this SELECT shape",
+                    "unsupported_select",
+                );
+            }
+        };
+
+        let Some(snapshot) = self.relational_resident_cache.snapshots.get(&table.name) else {
+            return Self::resident_route_reject(
+                &table.name,
+                "relation has no resident snapshot",
+                query_shape,
+            );
+        };
+        let memory_pressure_active = self
+            .router
+            .runtime()
+            .snapshot()
+            .memory_pressured_gpu_ids
+            .contains(&snapshot.gpu_id);
+        let cache_state = Self::relational_snapshot_cache_state(snapshot, memory_pressure_active);
+        let valid = snapshot.invalidated_by_txn_id.is_none()
+            && snapshot.invalidated_at_index.is_none()
+            && !snapshot.invalidated_by_memory_pressure
+            && !memory_pressure_active;
+        let has_retained_device_memory = self
+            .relational_resident_cache
+            .device_memory
+            .contains_key(&table.name);
+        let mut decision = RelationalResidentRouteDecisionStatus {
+            table: table.name.clone(),
+            gpu_id: Some(snapshot.gpu_id),
+            accepted: false,
+            reason: String::new(),
+            query_shape,
+            cache_state: cache_state.to_string(),
+            valid,
+            has_retained_device_memory,
+            estimated_rows: snapshot.row_count,
+            resident_bytes: snapshot.resident_bytes,
+            budget_bytes: snapshot.admission_budget_bytes,
+            refresh_resident_bytes: snapshot
+                .last_refresh_cost
+                .as_ref()
+                .map(|cost| cost.refreshed_resident_bytes),
+            h2d_bytes_if_resident: 0,
+            h2d_bytes_if_cold: snapshot.resident_bytes,
+            d2h_rows_estimate: resident_route_d2h_rows_estimate(select, snapshot.row_count),
+        };
+
+        if snapshot.schema != table.schema || snapshot.table != table.name {
+            decision.reason =
+                "resident snapshot no longer matches catalog table identity".to_string();
+        } else if !valid {
+            decision.reason = format!("resident snapshot is {cache_state}");
+        } else if !has_retained_device_memory {
+            decision.reason = "resident snapshot has no retained device memory".to_string();
+        } else {
+            decision.accepted = true;
+            decision.reason = "resident route accepted".to_string();
+        }
+        decision
+    }
+
     fn relational_residency_status(&self) -> RelationalResidencyStatus {
         let mut tables = self
             .relational_resident_cache
@@ -17206,15 +17462,7 @@ impl Engine {
                     .relational_resident_cache
                     .last_decision(&snapshot.table);
                 let cache_state =
-                    if memory_pressure_active || snapshot.invalidated_by_memory_pressure {
-                        "InvalidatedByMemoryPressure"
-                    } else if snapshot.invalidated_by_txn_id.is_some()
-                        || snapshot.invalidated_at_index.is_some()
-                    {
-                        "Invalidated"
-                    } else {
-                        "Valid"
-                    };
+                    Self::relational_snapshot_cache_state(snapshot, memory_pressure_active);
                 RelationalResidencyTableStatus {
                     schema: snapshot.schema.clone(),
                     table: snapshot.table.clone(),
@@ -17259,6 +17507,12 @@ impl Engine {
 
         RelationalResidencyStatus {
             tables,
+            latest_route_decisions: self
+                .relational_resident_cache
+                .latest_route_decisions
+                .values()
+                .cloned()
+                .collect(),
             resident_bytes_by_gpu,
             budget_bytes_by_gpu: self.relational_resident_cache.budget_bytes_by_gpu.clone(),
         }
@@ -21975,6 +22229,137 @@ mod tests {
             events.resident_bytes
         );
         assert!(aux.resident_bytes > 0);
+    }
+
+    #[test]
+    fn p8_resident_route_decisions_use_cache_state_without_routing_normal_sql() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE events (id INT, label TEXT)")
+            .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO events (id, label) VALUES (1, 'alpha'), (2, 'beta')",
+        )
+        .unwrap();
+
+        let Command::Select(count_select) = parse_command("SELECT COUNT(*) FROM events").unwrap()
+        else {
+            unreachable!()
+        };
+        let absent = e.plan_relational_resident_route(&count_select);
+        assert!(!absent.accepted);
+        assert_eq!(absent.reason, "relation has no resident snapshot");
+        assert_eq!(absent.query_shape, "count_all");
+
+        let snapshot = e.populate_relational_residency_snapshot("events").unwrap();
+        let decision = e.plan_relational_resident_route(&count_select);
+        assert_eq!(decision.table, "events");
+        assert_eq!(decision.gpu_id, Some(0));
+        assert_eq!(decision.query_shape, "count_all");
+        assert_eq!(decision.cache_state, "Valid");
+        assert!(decision.valid);
+        assert_eq!(decision.estimated_rows, 2);
+        assert_eq!(decision.resident_bytes, snapshot.resident_bytes);
+        assert_eq!(decision.h2d_bytes_if_resident, 0);
+        assert_eq!(decision.h2d_bytes_if_cold, snapshot.resident_bytes);
+        assert_eq!(decision.d2h_rows_estimate, 1);
+        if snapshot.device_memory_proof.is_some() {
+            assert!(decision.accepted);
+            assert!(decision.has_retained_device_memory);
+            assert_eq!(decision.reason, "resident route accepted");
+        } else {
+            assert!(!decision.accepted);
+            assert!(!decision.has_retained_device_memory);
+            assert_eq!(
+                decision.reason,
+                "resident snapshot has no retained device memory"
+            );
+        }
+        assert_eq!(
+            e.status_snapshot()
+                .relational_residency
+                .latest_route_decision("events")
+                .unwrap(),
+            &decision
+        );
+
+        let normal = e.execute_relational_select(&count_select).unwrap();
+        assert_eq!(normal.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(
+            normal.fallback_reason,
+            Some(FallbackReason::GpuMvccReadParityGap)
+        );
+
+        let Command::Select(unsupported) = parse_command("SELECT * FROM events").unwrap() else {
+            unreachable!()
+        };
+        let unsupported = e.plan_relational_resident_route(&unsupported);
+        assert!(!unsupported.accepted);
+        assert_eq!(unsupported.query_shape, "unsupported_select");
+        assert_eq!(
+            unsupported.reason,
+            "resident routing has no retained-kernel proof for this SELECT shape"
+        );
+
+        e.execute_text(3, "INSERT INTO events (id, label) VALUES (3, 'gamma')")
+            .unwrap();
+        let invalidated = e.plan_relational_resident_route(&count_select);
+        assert!(!invalidated.accepted);
+        assert_eq!(invalidated.cache_state, "Invalidated");
+        assert_eq!(invalidated.reason, "resident snapshot is Invalidated");
+    }
+
+    #[test]
+    fn p8_resident_route_decisions_reject_evicted_and_memory_pressured_snapshots() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE events (id INT, label TEXT)")
+            .unwrap();
+        e.execute_text(2, "CREATE TABLE aux (id INT, label TEXT)")
+            .unwrap();
+        e.execute_text(
+            3,
+            "INSERT INTO events (id, label) VALUES (1, 'alpha'), (2, 'beta')",
+        )
+        .unwrap();
+        e.execute_text(4, "INSERT INTO aux (id, label) VALUES (1, 'aux')")
+            .unwrap();
+
+        let aux = e.populate_relational_residency_snapshot("aux").unwrap();
+        let events = e.populate_relational_residency_snapshot("events").unwrap();
+        e.set_relational_residency_budget_bytes(0, events.resident_bytes);
+        let admitted = e.populate_relational_residency_snapshot("events").unwrap();
+        assert_eq!(admitted.evicted_tables_on_admission, vec!["aux"]);
+
+        let Command::Select(aux_count) = parse_command("SELECT COUNT(*) FROM aux").unwrap() else {
+            unreachable!()
+        };
+        let evicted = e.plan_relational_resident_route(&aux_count);
+        assert!(!evicted.accepted);
+        assert_eq!(evicted.reason, "relation has no resident snapshot");
+        assert_eq!(evicted.h2d_bytes_if_cold, 0);
+        assert!(aux.resident_bytes > 0);
+
+        let Command::Select(events_count) = parse_command("SELECT COUNT(*) FROM events").unwrap()
+        else {
+            unreachable!()
+        };
+        e.mark_gpu_memory_pressured(0);
+        let pressured = e.plan_relational_resident_route(&events_count);
+        assert!(!pressured.accepted);
+        assert_eq!(pressured.cache_state, "InvalidatedByMemoryPressure");
+        assert_eq!(
+            pressured.reason,
+            "resident snapshot is InvalidatedByMemoryPressure"
+        );
+        assert!(!pressured.valid);
+        assert_eq!(
+            e.telemetry_snapshot()
+                .relational_residency
+                .latest_route_decision("events")
+                .unwrap()
+                .reason,
+            pressured.reason
+        );
     }
 
     #[test]

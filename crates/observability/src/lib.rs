@@ -137,9 +137,29 @@ pub struct RelationalResidencyTableStatus {
     pub device_memory_proof: Option<CudaDeviceMemoryProof>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationalResidentRouteDecisionStatus {
+    pub table: String,
+    pub gpu_id: Option<u16>,
+    pub accepted: bool,
+    pub reason: String,
+    pub query_shape: String,
+    pub cache_state: String,
+    pub valid: bool,
+    pub has_retained_device_memory: bool,
+    pub estimated_rows: usize,
+    pub resident_bytes: u64,
+    pub budget_bytes: Option<u64>,
+    pub refresh_resident_bytes: Option<u64>,
+    pub h2d_bytes_if_resident: u64,
+    pub h2d_bytes_if_cold: u64,
+    pub d2h_rows_estimate: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RelationalResidencyStatus {
     pub tables: Vec<RelationalResidencyTableStatus>,
+    pub latest_route_decisions: Vec<RelationalResidentRouteDecisionStatus>,
     pub resident_bytes_by_gpu: BTreeMap<u16, u64>,
     pub budget_bytes_by_gpu: BTreeMap<u16, u64>,
 }
@@ -171,6 +191,15 @@ impl RelationalResidencyStatus {
 
     pub fn table(&self, table: &str) -> Option<&RelationalResidencyTableStatus> {
         self.tables.iter().find(|status| status.table == table)
+    }
+
+    pub fn latest_route_decision(
+        &self,
+        table: &str,
+    ) -> Option<&RelationalResidentRouteDecisionStatus> {
+        self.latest_route_decisions
+            .iter()
+            .find(|decision| decision.table == table)
     }
 
     pub fn has_resident_tables(&self) -> bool {
@@ -757,6 +786,23 @@ mod tests {
                     device_memory_proof: None,
                 },
             ],
+            latest_route_decisions: vec![RelationalResidentRouteDecisionStatus {
+                table: "events".to_string(),
+                gpu_id: Some(0),
+                accepted: true,
+                reason: "resident route accepted".to_string(),
+                query_shape: "count_all".to_string(),
+                cache_state: "Valid".to_string(),
+                valid: true,
+                has_retained_device_memory: true,
+                estimated_rows: 2,
+                resident_bytes: 128,
+                budget_bytes: Some(256),
+                refresh_resident_bytes: None,
+                h2d_bytes_if_resident: 0,
+                h2d_bytes_if_cold: 128,
+                d2h_rows_estimate: 1,
+            }],
             resident_bytes_by_gpu: BTreeMap::from([(0, 192)]),
             budget_bytes_by_gpu: BTreeMap::from([(0, 256)]),
         };
@@ -768,7 +814,9 @@ mod tests {
         assert_eq!(status.memory_pressured_snapshot_count(), 1);
         assert_eq!(status.total_resident_bytes(), 192);
         assert_eq!(status.table("events").unwrap().row_count, 2);
+        assert!(status.latest_route_decision("events").unwrap().accepted);
         assert!(status.table("missing").is_none());
+        assert!(status.latest_route_decision("missing").is_none());
     }
 
     #[test]
