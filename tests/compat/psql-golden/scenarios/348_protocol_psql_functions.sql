@@ -13,6 +13,13 @@ JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
 JOIN pg_catalog.pg_description d ON d.objoid = p.oid
 WHERE n.nspname = 'public'
 ORDER BY p.proname;
+SELECT answer();
+CREATE FUNCTION public.greeting() RETURNS text LANGUAGE sql AS 'SELECT ''hello''';
+SELECT public.greeting();
+CREATE FUNCTION public.bad_body() RETURNS int4 LANGUAGE sql AS 'SELECT id FROM people';
+SELECT bad_body();
+SELECT missing_function();
+SELECT answer(1);
 CREATE FUNCTION public.answer() RETURNS text LANGUAGE sql AS 'SELECT ''x''';
 CREATE FUNCTION public.echo(int4) RETURNS int4 LANGUAGE sql AS 'SELECT $1';
 CREATE FUNCTION public.unsupported() RETURNS bigint LANGUAGE sql AS 'SELECT 1';
@@ -21,4 +28,6 @@ COMMENT ON FUNCTION missing() IS 'missing';
 DROP FUNCTION missing();
 DROP FUNCTION IF EXISTS missing();
 DROP FUNCTION answer();
+DROP FUNCTION greeting();
+DROP FUNCTION bad_body();
 \df

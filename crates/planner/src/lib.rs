@@ -140,6 +140,13 @@ impl Planner {
                 },
                 kind: PlanKind::Read,
             },
+            Command::SelectFunction(_) => PlanNode {
+                op: PlannedOp {
+                    name: "routine_select".to_string(),
+                    target: DeviceTarget::Cpu,
+                },
+                kind: PlanKind::Read,
+            },
             Command::Begin | Command::Commit { .. } | Command::Rollback { .. } => PlanNode {
                 op: PlannedOp {
                     name: "txn_control".to_string(),

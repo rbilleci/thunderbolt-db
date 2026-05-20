@@ -37,6 +37,7 @@ pub enum Command {
     RenameMaterializedView(RenameMaterializedView),
     CreateFunction(CreateFunction),
     DropFunction(DropFunction),
+    SelectFunction(SelectFunction),
     CreateExtension(CreateExtension),
     CreateSequence(CreateSequence),
     CreateDomain(CreateDomain),
@@ -280,6 +281,11 @@ pub struct CreateFunction {
 pub struct DropFunction {
     pub name: String,
     pub if_exists: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectFunction {
+    pub name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2294,9 +2300,38 @@ fn parse_relational_command(input: &str) -> Option<Result<Command, ParseError>> 
         if let Ok(sequence_command) = parse_sequence_value_function(input) {
             return Some(Ok(sequence_command));
         }
+        if let Ok(function_command) = parse_select_function(input) {
+            return Some(Ok(function_command));
+        }
         return Some(parse_select(input).map(Command::Select));
     }
     None
+}
+
+fn parse_select_function(input: &str) -> Result<Command, ParseError> {
+    let rest = strip_keyword_prefix_case_insensitive(input, "SELECT")
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim();
+    if find_keyword_outside_quotes(rest, "FROM").is_some()
+        || find_keyword_outside_quotes(rest, "WHERE").is_some()
+        || find_keyword_outside_quotes(rest, "ORDER").is_some()
+        || find_keyword_outside_quotes(rest, "GROUP").is_some()
+        || find_keyword_outside_quotes(rest, "LIMIT").is_some()
+        || find_keyword_outside_quotes(rest, "OFFSET").is_some()
+        || rest.contains(',')
+    {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let open = rest.find('(').ok_or(ParseError::InvalidRelationalSql)?;
+    let close = rest.rfind(')').ok_or(ParseError::InvalidRelationalSql)?;
+    if close + 1 != rest.len() || !rest[open + 1..close].trim().is_empty() {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let name = normalize_function_signature(rest)?;
+    if name == "current_schema" {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    Ok(Command::SelectFunction(SelectFunction { name }))
 }
 
 fn parse_sequence_value_function(input: &str) -> Result<Command, ParseError> {
@@ -14924,6 +14959,18 @@ default: Some(ColumnDefault::SequenceNextVal {
                 if_exists: true,
             })
         );
+        assert_eq!(
+            parse_command("SELECT public.answer()").unwrap(),
+            Command::SelectFunction(SelectFunction {
+                name: "answer".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_command("SELECT answer()").unwrap(),
+            Command::SelectFunction(SelectFunction {
+                name: "answer".to_string(),
+            })
+        );
 
         assert!(matches!(
             parse_command(
@@ -14945,6 +14992,14 @@ default: Some(ColumnDefault::SequenceNextVal {
         ));
         assert!(matches!(
             parse_command("DROP FUNCTION public.answer() CASCADE"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command("SELECT answer(1)"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command("SELECT answer() FROM people"),
             Err(ParseError::InvalidRelationalSql)
         ));
     }

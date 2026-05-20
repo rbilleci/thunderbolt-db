@@ -579,6 +579,144 @@ fn execute_select_result(
     Ok(SelectResult { columns, rows })
 }
 
+fn execute_function_result(
+    session: &Session,
+    call: &gpu_db_protocol::SelectFunction,
+) -> Result<SelectResult, ErrorField> {
+    let Some(function) = session.functions.get(&call.name) else {
+        return Err(ErrorField {
+            code: "42883",
+            message: "function does not exist",
+            position: None,
+        });
+    };
+    let value = parse_bounded_sql_function_body(&function.body, function.return_type)?;
+    let column = match function.return_type {
+        SqlType::Int4 => int4_column(&function.name),
+        SqlType::Text => text_column(&function.name),
+    };
+    Ok(SelectResult {
+        columns: vec![column],
+        rows: vec![vec![Some(format_sql_value(&value))]],
+    })
+}
+
+fn parse_bounded_sql_function_body(
+    body: &str,
+    return_type: SqlType,
+) -> Result<SqlValue, ErrorField> {
+    let Some(rest) = strip_keyword_prefix_case_insensitive(body.trim(), "SELECT") else {
+        return Err(unsupported_function_body_error());
+    };
+    let literal = rest.trim();
+    if literal.is_empty()
+        || find_keyword_outside_quotes(literal, "FROM").is_some()
+        || find_keyword_outside_quotes(literal, "WHERE").is_some()
+        || find_keyword_outside_quotes(literal, "ORDER").is_some()
+        || find_keyword_outside_quotes(literal, "GROUP").is_some()
+        || find_keyword_outside_quotes(literal, "LIMIT").is_some()
+        || find_keyword_outside_quotes(literal, "OFFSET").is_some()
+        || literal.contains(',')
+    {
+        return Err(unsupported_function_body_error());
+    }
+    match return_type {
+        SqlType::Int4 => literal
+            .parse::<i32>()
+            .map(SqlValue::Int4)
+            .map_err(|_| unsupported_function_body_error()),
+        SqlType::Text => parse_bounded_text_literal(literal)
+            .map(SqlValue::Text)
+            .ok_or_else(unsupported_function_body_error),
+    }
+}
+
+fn strip_keyword_prefix_case_insensitive<'a>(input: &'a str, keyword: &str) -> Option<&'a str> {
+    if input.len() < keyword.len() {
+        return None;
+    }
+    let (head, tail) = input.split_at(keyword.len());
+    if !head.eq_ignore_ascii_case(keyword) {
+        return None;
+    }
+    if tail
+        .chars()
+        .next()
+        .is_some_and(|ch| ch == '_' || ch == '$' || ch.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+    Some(tail)
+}
+
+fn find_keyword_outside_quotes(input: &str, keyword: &str) -> Option<usize> {
+    let bytes = input.as_bytes();
+    let keyword_bytes = keyword.as_bytes();
+    let mut idx = 0;
+    let mut in_quote = false;
+    while idx < bytes.len() {
+        if bytes[idx] == b'\'' {
+            if in_quote && idx + 1 < bytes.len() && bytes[idx + 1] == b'\'' {
+                idx += 2;
+                continue;
+            }
+            in_quote = !in_quote;
+            idx += 1;
+            continue;
+        }
+        if !in_quote
+            && idx + keyword_bytes.len() <= bytes.len()
+            && input[idx..idx + keyword_bytes.len()].eq_ignore_ascii_case(keyword)
+        {
+            let before_ok = idx == 0
+                || !bytes[idx - 1].is_ascii_alphanumeric()
+                    && bytes[idx - 1] != b'_'
+                    && bytes[idx - 1] != b'$';
+            let after_idx = idx + keyword_bytes.len();
+            let after_ok = after_idx == bytes.len()
+                || !bytes[after_idx].is_ascii_alphanumeric()
+                    && bytes[after_idx] != b'_'
+                    && bytes[after_idx] != b'$';
+            if before_ok && after_ok {
+                return Some(idx);
+            }
+        }
+        idx += 1;
+    }
+    None
+}
+
+fn parse_bounded_text_literal(input: &str) -> Option<String> {
+    let bytes = input.as_bytes();
+    if bytes.len() < 2 || bytes.first() != Some(&b'\'') || bytes.last() != Some(&b'\'') {
+        return None;
+    }
+    let inner = &input[1..input.len() - 1];
+    let mut result = String::new();
+    let mut chars = inner.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\'' {
+            if chars.peek() == Some(&'\'') {
+                chars.next();
+                result.push('\'');
+            } else {
+                return None;
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+    Some(result)
+}
+
+fn unsupported_function_body_error() -> ErrorField {
+    ErrorField {
+        code: "0A000",
+        message: "only literal SELECT bodies are supported for SQL function execution",
+        position: None,
+    }
+}
+
 fn session_view_depends_on(session: &Session, view: &str, target: &str) -> bool {
     let mut seen = BTreeSet::new();
     session_view_depends_on_inner(session, view, target, &mut seen)
@@ -9850,6 +9988,18 @@ fn execute_statement(
                 session.mark_function_dirty(drop.name);
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, "DROP FUNCTION");
+            }
+            Command::SelectFunction(call) => {
+                let result = match execute_function_result(session, &call) {
+                    Ok(result) => result,
+                    Err(error) => return write_error(stream, &error),
+                };
+                return write_select_rows(
+                    stream,
+                    &result.columns,
+                    &result.rows,
+                    include_row_description,
+                );
             }
             Command::DropSequence(drop) => {
                 let mut seen = BTreeSet::new();

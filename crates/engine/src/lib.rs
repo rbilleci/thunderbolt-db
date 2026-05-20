@@ -28,8 +28,8 @@ use gpu_db_protocol::{
     DropTable, DropTablespace, DropView, Insert, ParseError, PublicationTarget,
     RefreshMaterializedView, RenameColumn, RenameConstraint, RenameDatabase, RenameIndex,
     RenameMaterializedView, RenameRole, RenameSequence, RenameTable, RenameTablespace, RenameView,
-    SchemaPrivilege, Select, SelectFilterOp, SelectProjection, SequenceNextVal, SequenceSetVal,
-    SqlType, SqlValue, TablePrivilege, TablespacePrivilege, TruncateTable, Update,
+    SchemaPrivilege, Select, SelectFilterOp, SelectFunction, SelectProjection, SequenceNextVal,
+    SequenceSetVal, SqlType, SqlValue, TablePrivilege, TablespacePrivilege, TruncateTable, Update,
 };
 use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine};
 use gpu_db_storage::{
@@ -107,6 +107,7 @@ impl ReplicatedStateMachine for KvStateMachine {
                     | Command::RenameMaterializedView(_)
                     | Command::CreateFunction(_)
                     | Command::DropFunction(_)
+                    | Command::SelectFunction(_)
                     | Command::CreateExtension(_)
                     | Command::CreateSequence(_)
                     | Command::CreateDomain(_)
@@ -6252,6 +6253,120 @@ fn validate_bootstrap_create_extension(create: &CreateExtension) -> Result<(), E
     Ok(())
 }
 
+fn parse_bounded_sql_function_body(
+    body: &str,
+    return_type: SqlType,
+) -> Result<SqlValue, ExecuteError> {
+    let Some(rest) = strip_keyword_prefix_case_insensitive(body.trim(), "SELECT") else {
+        return Err(unsupported_function_body_error());
+    };
+    let literal = rest.trim();
+    if literal.is_empty()
+        || find_keyword_outside_quotes(literal, "FROM").is_some()
+        || find_keyword_outside_quotes(literal, "WHERE").is_some()
+        || find_keyword_outside_quotes(literal, "ORDER").is_some()
+        || find_keyword_outside_quotes(literal, "GROUP").is_some()
+        || find_keyword_outside_quotes(literal, "LIMIT").is_some()
+        || find_keyword_outside_quotes(literal, "OFFSET").is_some()
+        || literal.contains(',')
+    {
+        return Err(unsupported_function_body_error());
+    }
+    match return_type {
+        SqlType::Int4 => literal
+            .parse::<i32>()
+            .map(SqlValue::Int4)
+            .map_err(|_| unsupported_function_body_error()),
+        SqlType::Text => parse_bounded_text_literal(literal)
+            .map(SqlValue::Text)
+            .ok_or_else(unsupported_function_body_error),
+    }
+}
+
+fn strip_keyword_prefix_case_insensitive<'a>(input: &'a str, keyword: &str) -> Option<&'a str> {
+    if input.len() < keyword.len() {
+        return None;
+    }
+    let (head, tail) = input.split_at(keyword.len());
+    if !head.eq_ignore_ascii_case(keyword) {
+        return None;
+    }
+    if tail
+        .chars()
+        .next()
+        .is_some_and(|ch| ch == '_' || ch == '$' || ch.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+    Some(tail)
+}
+
+fn find_keyword_outside_quotes(input: &str, keyword: &str) -> Option<usize> {
+    let bytes = input.as_bytes();
+    let keyword_bytes = keyword.as_bytes();
+    let mut idx = 0;
+    let mut in_quote = false;
+    while idx < bytes.len() {
+        if bytes[idx] == b'\'' {
+            if in_quote && idx + 1 < bytes.len() && bytes[idx + 1] == b'\'' {
+                idx += 2;
+                continue;
+            }
+            in_quote = !in_quote;
+            idx += 1;
+            continue;
+        }
+        if !in_quote
+            && idx + keyword_bytes.len() <= bytes.len()
+            && input[idx..idx + keyword_bytes.len()].eq_ignore_ascii_case(keyword)
+        {
+            let before_ok = idx == 0
+                || !bytes[idx - 1].is_ascii_alphanumeric()
+                    && bytes[idx - 1] != b'_'
+                    && bytes[idx - 1] != b'$';
+            let after_idx = idx + keyword_bytes.len();
+            let after_ok = after_idx == bytes.len()
+                || !bytes[after_idx].is_ascii_alphanumeric()
+                    && bytes[after_idx] != b'_'
+                    && bytes[after_idx] != b'$';
+            if before_ok && after_ok {
+                return Some(idx);
+            }
+        }
+        idx += 1;
+    }
+    None
+}
+
+fn parse_bounded_text_literal(input: &str) -> Option<String> {
+    let bytes = input.as_bytes();
+    if bytes.len() < 2 || bytes.first() != Some(&b'\'') || bytes.last() != Some(&b'\'') {
+        return None;
+    }
+    let inner = &input[1..input.len() - 1];
+    let mut result = String::new();
+    let mut chars = inner.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\'' {
+            if chars.peek() == Some(&'\'') {
+                chars.next();
+                result.push('\'');
+            } else {
+                return None;
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+    Some(result)
+}
+
+fn unsupported_function_body_error() -> ExecuteError {
+    ExecuteError::Engine(EngineError::ApplyFailed(
+        "only literal SELECT bodies are supported for SQL function execution".to_string(),
+    ))
+}
+
 fn resident_device_int4_column_offset(
     snapshot: &RelationalResidencySnapshot,
     table: &RelationalTable,
@@ -7796,6 +7911,7 @@ impl Engine {
             }
             Command::CreateFunction(create) => self.apply_create_function(create)?,
             Command::DropFunction(drop) => self.apply_drop_function(drop)?,
+            Command::SelectFunction(_) => {}
             Command::CreateSequence(create) => self.apply_create_sequence(create)?,
             Command::CreateDomain(create) => self.apply_create_domain(create)?,
             Command::SequenceNextVal(nextval) => {
@@ -12977,7 +13093,7 @@ impl Engine {
                     self.metrics.observe_d2h_bytes(len as u64);
                 }
             }
-            Command::Select(_) | Command::SequenceCurrVal(_) => {
+            Command::Select(_) | Command::SelectFunction(_) | Command::SequenceCurrVal(_) => {
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
         }
@@ -13197,7 +13313,7 @@ impl Engine {
                     self.metrics.observe_d2h_bytes(len as u64);
                 }
             }
-            Command::Select(_) | Command::SequenceCurrVal(_) => {
+            Command::Select(_) | Command::SelectFunction(_) | Command::SequenceCurrVal(_) => {
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
         }
@@ -13306,7 +13422,7 @@ impl Engine {
             Command::Insert(_) => Err(ExecuteError::NonReadCommand("INSERT")),
             Command::Delete(_) => Err(ExecuteError::NonReadCommand("DELETE")),
             Command::Update(_) => Err(ExecuteError::NonReadCommand("UPDATE")),
-            Command::Select(_) | Command::SequenceCurrVal(_) => {
+            Command::Select(_) | Command::SelectFunction(_) | Command::SequenceCurrVal(_) => {
                 Err(ExecuteError::NonReadCommand("SELECT"))
             }
         }
@@ -13348,6 +13464,38 @@ impl Engine {
         let (query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
         let result = self.execute_mvcc_query(&query)?;
         self.finalize_relational_select(select, table, bound, access_path, result)
+    }
+
+    pub fn execute_relational_function(
+        &mut self,
+        call: &SelectFunction,
+    ) -> Result<RelationalSelectResult, ExecuteError> {
+        let Some(function) = self.relational_functions.get(&call.name) else {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "function \"{}\" does not exist",
+                call.name
+            ))));
+        };
+        let value = parse_bounded_sql_function_body(&function.body, function.return_type)?;
+        self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
+        Ok(RelationalSelectResult {
+            columns: vec![RelationalColumn {
+                id: 0,
+                table_oid: function.oid,
+                attnum: 1,
+                name: function.name.clone(),
+                ty: function.return_type,
+                domain: None,
+                default: None,
+                type_oid: function.return_type.postgres_oid(),
+                type_size: function.return_type.type_size(),
+            }],
+            rows: vec![vec![value]],
+            planned_target: DeviceTarget::Cpu,
+            executed_target: DeviceTarget::Cpu,
+            fallback_reason: Some(FallbackReason::NotGpuEligible),
+            access_path: RelationalAccessPath::FullTableScan,
+        })
     }
 
     pub fn execute_relational_select_with_cuda_driver_probe(
@@ -39440,7 +39588,7 @@ mod tests {
             Some("metadata only")
         );
 
-        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let mut recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
         let recovered_function = recovered.relational_catalog_function("answer").unwrap();
         assert_eq!(recovered_function.oid, oid);
         assert_eq!(recovered_function.return_type, SqlType::Int4);
@@ -39448,6 +39596,14 @@ mod tests {
             recovered.relational_function_comment("answer"),
             Some("metadata only")
         );
+        let result = recovered
+            .execute_relational_function(&SelectFunction {
+                name: "answer".to_string(),
+            })
+            .unwrap();
+        assert_eq!(result.columns[0].name, "answer");
+        assert_eq!(result.columns[0].ty, SqlType::Int4);
+        assert_eq!(result.rows, vec![vec![SqlValue::Int4(42)]]);
 
         let duplicate = e
             .execute_text(
@@ -39481,6 +39637,22 @@ mod tests {
         e.execute_text(7, "DROP FUNCTION answer()").unwrap();
         assert!(e.relational_catalog_function("answer").is_none());
         assert_eq!(e.relational_function_comment("answer"), None);
+
+        e.execute_text(
+            8,
+            "CREATE FUNCTION public.bad_body() RETURNS int4 LANGUAGE sql AS 'SELECT id FROM people'",
+        )
+        .unwrap();
+        let unsupported = e
+            .execute_relational_function(&SelectFunction {
+                name: "bad_body".to_string(),
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(
+            unsupported.contains("only literal SELECT bodies are supported"),
+            "{unsupported}"
+        );
     }
 
     #[test]
