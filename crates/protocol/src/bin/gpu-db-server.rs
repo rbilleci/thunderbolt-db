@@ -3967,6 +3967,7 @@ enum CatalogCommentTarget {
     Index { index: String },
     View { view: String },
     MaterializedView { materialized_view: String },
+    Extension { extension: String },
     Function { function: String },
     Sequence { sequence: String },
     Domain { domain: String },
@@ -8007,6 +8008,7 @@ fn execute_statement(
                 | CatalogCommentTarget::Tablespace { .. }
                 | CatalogCommentTarget::View { .. }
                 | CatalogCommentTarget::MaterializedView { .. }
+                | CatalogCommentTarget::Extension { .. }
                 | CatalogCommentTarget::Function { .. }
                 | CatalogCommentTarget::Sequence { .. }
                 | CatalogCommentTarget::Domain { .. }
@@ -10503,6 +10505,7 @@ fn execute_statement(
                         | CatalogCommentTarget::Tablespace { .. }
                         | CatalogCommentTarget::View { .. }
                         | CatalogCommentTarget::MaterializedView { .. }
+                        | CatalogCommentTarget::Extension { .. }
                         | CatalogCommentTarget::Function { .. }
                         | CatalogCommentTarget::Sequence { .. }
                         | CatalogCommentTarget::Domain { .. }
@@ -10563,6 +10566,7 @@ fn execute_statement(
                             | CatalogCommentTarget::Index { .. }
                             | CatalogCommentTarget::View { .. }
                             | CatalogCommentTarget::MaterializedView { .. }
+                            | CatalogCommentTarget::Extension { .. }
                             | CatalogCommentTarget::Function { .. }
                             | CatalogCommentTarget::Sequence { .. }
                             | CatalogCommentTarget::Domain { .. }
@@ -10966,6 +10970,19 @@ fn execute_statement(
                             );
                         }
                         CatalogCommentTarget::Function { function }
+                    }
+                    CommentTarget::Extension { extension } => {
+                        if extension != "plpgsql" {
+                            return write_error(
+                                stream,
+                                &ErrorField {
+                                    code: "42704",
+                                    message: "extension does not exist",
+                                    position: None,
+                                },
+                            );
+                        }
+                        CatalogCommentTarget::Extension { extension }
                     }
                     CommentTarget::Sequence { sequence } => {
                         let exists = session.sequences.contains_key(&sequence)
@@ -11950,7 +11967,7 @@ fn execute_statement(
                 text_column("Schema"),
                 text_column("Description"),
             ],
-            &catalog_psql_extension_rows(),
+            &catalog_psql_extension_rows(session),
         );
     }
     if canonical
@@ -16614,12 +16631,22 @@ fn catalog_empty_rows() -> Vec<Vec<Option<String>>> {
     Vec::new()
 }
 
-fn catalog_psql_extension_rows() -> Vec<Vec<Option<String>>> {
+fn bootstrap_extension_description(session: &Session) -> String {
+    session
+        .comments
+        .get(&CatalogCommentTarget::Extension {
+            extension: "plpgsql".to_string(),
+        })
+        .cloned()
+        .unwrap_or_else(|| PLPGSQL_DESCRIPTION.to_string())
+}
+
+fn catalog_psql_extension_rows(session: &Session) -> Vec<Vec<Option<String>>> {
     vec![vec![
         Some("plpgsql".to_string()),
         Some("1.0".to_string()),
         Some("pg_catalog".to_string()),
-        Some(PLPGSQL_DESCRIPTION.to_string()),
+        Some(bootstrap_extension_description(session)),
     ]]
 }
 
@@ -17976,6 +18003,16 @@ fn pg_catalog_table_index_description_rows_without_views(
 
 fn pg_dump_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
     let mut rows = Vec::new();
+    if let Some(description) = session.comments.get(&CatalogCommentTarget::Extension {
+        extension: "plpgsql".to_string(),
+    }) {
+        rows.push(vec![
+            Some(description.clone()),
+            Some(PG_EXTENSION_CLASS_OID.to_string()),
+            Some(PLPGSQL_EXTENSION_OID.to_string()),
+            Some("0".to_string()),
+        ]);
+    }
     if let Some(description) = session.comments.get(&CatalogCommentTarget::Schema {
         schema: "public".to_string(),
     }) {
@@ -18127,6 +18164,7 @@ fn pg_dump_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
             | CatalogCommentTarget::Column { .. }
             | CatalogCommentTarget::View { .. }
             | CatalogCommentTarget::MaterializedView { .. }
+            | CatalogCommentTarget::Extension { .. }
             | CatalogCommentTarget::Function { .. }
             | CatalogCommentTarget::Sequence { .. }
             | CatalogCommentTarget::Domain { .. }
@@ -18161,6 +18199,7 @@ fn pg_dump_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
             | CatalogCommentTarget::Column { .. }
             | CatalogCommentTarget::View { .. }
             | CatalogCommentTarget::MaterializedView { .. }
+            | CatalogCommentTarget::Extension { .. }
             | CatalogCommentTarget::Function { .. }
             | CatalogCommentTarget::Sequence { .. }
             | CatalogCommentTarget::Domain { .. }
@@ -18220,6 +18259,16 @@ fn pg_dump_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
 
 fn psql_object_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
     let mut rows = Vec::new();
+    if let Some(description) = session.comments.get(&CatalogCommentTarget::Extension {
+        extension: "plpgsql".to_string(),
+    }) {
+        rows.push(vec![
+            Some("pg_catalog".to_string()),
+            Some("plpgsql".to_string()),
+            Some("extension".to_string()),
+            Some(description.clone()),
+        ]);
+    }
     if let Some(description) = session.comments.get(&CatalogCommentTarget::Schema {
         schema: "public".to_string(),
     }) {
@@ -20115,6 +20164,33 @@ mod tests {
                 Some("f".to_string()),
             ]]
         );
+    }
+
+    #[test]
+    fn catalog_extension_rows_reflect_supported_comment() {
+        let mut session = Session::default();
+        session.comments.insert(
+            CatalogCommentTarget::Extension {
+                extension: "plpgsql".to_string(),
+            },
+            "bootstrap extension".to_string(),
+        );
+
+        assert_eq!(
+            catalog_psql_extension_rows(&session),
+            vec![vec![
+                Some("plpgsql".to_string()),
+                Some("1.0".to_string()),
+                Some("pg_catalog".to_string()),
+                Some("bootstrap extension".to_string()),
+            ]]
+        );
+        assert!(pg_dump_description_rows(&session).contains(&vec![
+            Some("bootstrap extension".to_string()),
+            Some(PG_EXTENSION_CLASS_OID.to_string()),
+            Some(PLPGSQL_EXTENSION_OID.to_string()),
+            Some("0".to_string()),
+        ]));
     }
 
     #[test]

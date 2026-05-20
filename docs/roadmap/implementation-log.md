@@ -2,6 +2,13 @@
 
 ## 2026-05-20
 
+- Added bounded bootstrap extension comments.
+  `COMMENT ON EXTENSION plpgsql IS {literal|NULL}` now parses, persists through
+  engine WAL replay, appears through the compatibility endpoint's `\dx` output
+  and `pg_catalog.pg_description` discovery, and rejects unsupported extension
+  names before mutation while keeping extension drop/update/relocation,
+  extension-owned object semantics, and broader plugin behavior out of scope.
+
 - Added a local release-candidate evidence bundle wrapper.
   `scripts/run_local_release_candidate_evidence_bundle.sh` runs the top-level
   local release-candidate preflight, captures exact git/tooling facts plus the

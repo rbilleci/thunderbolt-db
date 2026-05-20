@@ -509,6 +509,7 @@ pub enum CommentTarget {
     Index { index: String },
     View { view: String },
     MaterializedView { materialized_view: String },
+    Extension { extension: String },
     Function { function: String },
     Sequence { sequence: String },
     Domain { domain: String },
@@ -2539,6 +2540,15 @@ fn parse_comment_on(input: &str) -> Result<CommentOn, ParseError> {
         let function = normalize_function_signature(rest[..is_pos].trim())?;
         (
             CommentTarget::Function { function },
+            rest[is_pos + "IS".len()..].trim(),
+        )
+    } else if let Some(rest) = strip_keyword_prefix_case_insensitive(rest, "EXTENSION") {
+        let rest = rest.trim_start();
+        let is_pos =
+            find_keyword_outside_quotes(rest, "IS").ok_or(ParseError::InvalidRelationalSql)?;
+        let extension = normalize_identifier(rest[..is_pos].trim())?;
+        (
+            CommentTarget::Extension { extension },
             rest[is_pos + "IS".len()..].trim(),
         )
     } else if let Some(rest) = strip_keyword_prefix_case_insensitive(rest, "SEQUENCE") {
@@ -15001,6 +15011,15 @@ default: Some(ColumnDefault::SequenceNextVal {
                     function: "answer".to_string(),
                 },
                 comment: Some("metadata only".to_string()),
+            })
+        );
+        assert_eq!(
+            parse_command("COMMENT ON EXTENSION plpgsql IS 'bootstrap extension'").unwrap(),
+            Command::CommentOn(CommentOn {
+                target: CommentTarget::Extension {
+                    extension: "plpgsql".to_string(),
+                },
+                comment: Some("bootstrap extension".to_string()),
             })
         );
         assert_eq!(

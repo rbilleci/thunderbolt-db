@@ -12,6 +12,26 @@ psql:54_catalog_psql_list_extensions_empty.sql:8: ERROR:  query shape is not sup
  plpgsql | 1.0     | pg_catalog | PL/pgSQL procedural language
 (1 row)
 
+COMMENT
+             List of installed extensions
+  Name   | Version |   Schema   |     Description
+---------+---------+------------+---------------------
+ plpgsql | 1.0     | pg_catalog | bootstrap extension
+(1 row)
+
+     description     | classoid | objoid | objsubid
+---------------------+----------+--------+----------
+ bootstrap extension |     3079 |  13500 |        0
+(1 row)
+
+COMMENT
+                 List of installed extensions
+  Name   | Version |   Schema   |         Description
+---------+---------+------------+------------------------------
+ plpgsql | 1.0     | pg_catalog | PL/pgSQL procedural language
+(1 row)
+
+psql:54_catalog_psql_list_extensions_empty.sql:17: ERROR:  extension does not exist
  tableoid |  oid  | extname |  nspname   | extrelocatable | extversion | extconfig | extcondition
 ----------+-------+---------+------------+----------------+------------+-----------+--------------
      3079 | 13500 | plpgsql | pg_catalog | f              | 1.0        |           |

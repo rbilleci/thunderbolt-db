@@ -6253,6 +6253,7 @@ pub enum RelationalCommentTarget {
     Index { index: String },
     View { view: String },
     MaterializedView { materialized_view: String },
+    Extension { extension: String },
     Function { function: String },
     Sequence { sequence: String },
     Domain { domain: String },
@@ -10321,6 +10322,7 @@ impl Engine {
                 | RelationalCommentTarget::Tablespace { .. }
                 | RelationalCommentTarget::View { .. }
                 | RelationalCommentTarget::MaterializedView { .. }
+                | RelationalCommentTarget::Extension { .. }
                 | RelationalCommentTarget::Function { .. }
                 | RelationalCommentTarget::Sequence { .. }
                 | RelationalCommentTarget::Domain { .. }
@@ -11592,6 +11594,15 @@ impl Engine {
                     )));
                 }
                 RelationalCommentTarget::Function { function }
+            }
+            CommentTarget::Extension { extension } => {
+                if extension != "plpgsql" {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "extension \"{}\" does not exist",
+                        extension
+                    )));
+                }
+                RelationalCommentTarget::Extension { extension }
             }
             CommentTarget::Sequence { sequence } => {
                 if !self.relational_sequences.contains_key(&sequence) {
@@ -17475,6 +17486,14 @@ impl Engine {
             .map(String::as_str)
     }
 
+    pub fn relational_extension_comment(&self, extension: &str) -> Option<&str> {
+        self.relational_comments
+            .get(&RelationalCommentTarget::Extension {
+                extension: extension.to_string(),
+            })
+            .map(String::as_str)
+    }
+
     pub fn relational_constraint_comment(&self, table: &str, constraint: &str) -> Option<&str> {
         self.relational_comments
             .get(&RelationalCommentTarget::Constraint {
@@ -20079,6 +20098,37 @@ mod tests {
                 if message == "plpgsql extension creation is only supported in pg_catalog"
         ));
         assert_eq!(e.metrics().commits_total, 0);
+    }
+
+    #[test]
+    fn execute_text_records_bootstrap_extension_comment_and_replays_from_wal() {
+        let mut e = Engine::new_local();
+
+        e.execute_text(1, "COMMENT ON EXTENSION plpgsql IS 'bootstrap extension'")
+            .unwrap();
+        assert_eq!(
+            e.relational_extension_comment("plpgsql"),
+            Some("bootstrap extension")
+        );
+
+        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        assert_eq!(
+            recovered.relational_extension_comment("plpgsql"),
+            Some("bootstrap extension")
+        );
+
+        e.execute_text(2, "COMMENT ON EXTENSION plpgsql IS NULL")
+            .unwrap();
+        assert_eq!(e.relational_extension_comment("plpgsql"), None);
+
+        let missing = e
+            .execute_text(3, "COMMENT ON EXTENSION hstore IS 'missing'")
+            .unwrap_err();
+        assert!(matches!(
+            missing,
+            ExecuteError::Engine(EngineError::ApplyFailed(message))
+                if message == "extension \"hstore\" does not exist"
+        ));
     }
 
     #[test]
