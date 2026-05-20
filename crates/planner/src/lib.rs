@@ -169,9 +169,9 @@ impl Planner {
                 },
                 kind: PlanKind::Admin,
             },
-            Command::ResetAll => PlanNode {
+            Command::ResetAll | Command::SetRole { .. } => PlanNode {
                 op: PlannedOp {
-                    name: "session_reset_all".to_string(),
+                    name: "session_control".to_string(),
                     target: DeviceTarget::Cpu,
                 },
                 kind: PlanKind::TxnControl,

@@ -1,0 +1,83 @@
+Pager usage is off.
+=== bounded relation ACL enforcement ===
+CREATE ROLE
+CREATE ROLE
+CREATE TABLE
+INSERT 0 2
+SET
+psql:349_protocol_psql_relation_acl_enforcement.sql:8: ERROR:  permission denied for relation
+psql:349_protocol_psql_relation_acl_enforcement.sql:9: ERROR:  permission denied for relation
+RESET
+GRANT
+SET
+ id | name
+----+-------
+  1 | ada
+  2 | grace
+(2 rows)
+
+psql:349_protocol_psql_relation_acl_enforcement.sql:14: ERROR:  permission denied for relation
+RESET
+GRANT
+SET
+INSERT 0 1
+UPDATE 1
+DELETE 1
+SET
+ id |   name
+----+-----------
+  1 | lovelace
+  3 | katherine
+(2 rows)
+
+=== default ACL and role rename ===
+ALTER DEFAULT PRIVILEGES
+CREATE TABLE
+INSERT 0 1
+ALTER ROLE
+SET
+ id |     name
+----+---------------
+  7 | default grant
+(1 row)
+
+psql:349_protocol_psql_relation_acl_enforcement.sql:30: ERROR:  permission denied for relation
+RESET
+=== view and materialized view ACL enforcement ===
+CREATE VIEW
+SELECT 0
+SET
+psql:349_protocol_psql_relation_acl_enforcement.sql:36: ERROR:  permission denied for relation
+psql:349_protocol_psql_relation_acl_enforcement.sql:37: ERROR:  permission denied for relation
+RESET
+GRANT
+GRANT
+SET
+ id |   name
+----+-----------
+  1 | lovelace
+  3 | katherine
+(2 rows)
+
+ id |   name
+----+-----------
+  1 | lovelace
+  3 | katherine
+(2 rows)
+
+RESET
+REVOKE
+SET
+psql:349_protocol_psql_relation_acl_enforcement.sql:47: ERROR:  permission denied for relation
+RESET
+psql:349_protocol_psql_relation_acl_enforcement.sql:49: ERROR:  role does not exist
+ALTER DEFAULT PRIVILEGES
+REVOKE
+REVOKE
+REVOKE
+REVOKE
+DROP MATERIALIZED VIEW
+DROP VIEW
+DROP TABLE
+DROP TABLE
+DROP ROLE

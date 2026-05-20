@@ -333,6 +333,14 @@ fn execute_select_result(
     session: &Session,
     select: &gpu_db_protocol::Select,
 ) -> Result<SelectResult, ErrorField> {
+    execute_select_result_inner(session, select, true)
+}
+
+fn execute_select_result_inner(
+    session: &Session,
+    select: &gpu_db_protocol::Select,
+    enforce_relation_acl: bool,
+) -> Result<SelectResult, ErrorField> {
     let Some(table) = session.tables.get(&select.table) else {
         if let Some(view) = session.views.get(&select.table) {
             if !select_is_plain_view_scan(select) {
@@ -342,7 +350,14 @@ fn execute_select_result(
                     position: None,
                 });
             }
-            return execute_select_result(session, &view.query);
+            if enforce_relation_acl {
+                if let Some(error) =
+                    relation_permission_error(session, &select.table, TablePrivilege::Select)
+                {
+                    return Err(error);
+                }
+            }
+            return execute_select_result_inner(session, &view.query, false);
         }
         if let Some(view) = session.materialized_views.get(&select.table) {
             if !select_is_plain_view_scan(select) {
@@ -352,6 +367,13 @@ fn execute_select_result(
                         "only plain SELECT * FROM materialized view is supported for materialized views",
                     position: None,
                 });
+            }
+            if enforce_relation_acl {
+                if let Some(error) =
+                    relation_permission_error(session, &select.table, TablePrivilege::Select)
+                {
+                    return Err(error);
+                }
             }
             return Ok(SelectResult {
                 columns: view
@@ -379,6 +401,13 @@ fn execute_select_result(
             position: None,
         });
     };
+    if enforce_relation_acl {
+        if let Some(error) =
+            relation_permission_error(session, &select.table, TablePrivilege::Select)
+        {
+            return Err(error);
+        }
+    }
     if matches!(
         select.projection,
         SelectProjection::CountAll
@@ -2569,6 +2598,7 @@ struct Session {
     roles: BTreeMap<String, RoleInfo>,
     databases: BTreeMap<String, DatabaseInfo>,
     tablespaces: BTreeMap<String, TablespaceInfo>,
+    current_role: Option<String>,
     public_schema_exists: bool,
     public_schema_implicit: bool,
     currval_sequences: HashMap<String, i64>,
@@ -2692,6 +2722,7 @@ impl Session {
             roles: catalog.roles,
             databases: catalog.databases,
             tablespaces: catalog.tablespaces,
+            current_role: None,
             public_schema_exists: catalog.public_schema_exists,
             public_schema_implicit: catalog.public_schema_implicit,
             currval_sequences: HashMap::new(),
@@ -3286,6 +3317,44 @@ fn acl_grantee_error(session: &Session, grantee: &str) -> Option<ErrorField> {
         Some(ErrorField {
             code: "42704",
             message: "role does not exist",
+            position: None,
+        })
+    }
+}
+
+fn active_role(session: &Session) -> &str {
+    session.current_role.as_deref().unwrap_or("postgres")
+}
+
+fn role_has_relation_privilege(
+    session: &Session,
+    relation: &str,
+    privilege: TablePrivilege,
+) -> bool {
+    let role = active_role(session);
+    if role == "postgres" {
+        return true;
+    }
+    session.table_acls.get(relation).is_some_and(|acl| {
+        acl.get(role)
+            .is_some_and(|privileges| privileges.contains(&privilege))
+            || acl
+                .get("public")
+                .is_some_and(|privileges| privileges.contains(&privilege))
+    })
+}
+
+fn relation_permission_error(
+    session: &Session,
+    relation: &str,
+    privilege: TablePrivilege,
+) -> Option<ErrorField> {
+    if role_has_relation_privilege(session, relation, privilege) {
+        None
+    } else {
+        Some(ErrorField {
+            code: "42501",
+            message: "permission denied for relation",
             position: None,
         })
     }
@@ -6471,6 +6540,16 @@ fn execute_extended_insert(
     insert: gpu_db_protocol::Insert,
 ) -> Result<String, ErrorField> {
     let table_name = insert.table;
+    if !session.tables.contains_key(&table_name) {
+        return Err(ErrorField {
+            code: "42P01",
+            message: "relation does not exist",
+            position: None,
+        });
+    }
+    if let Some(error) = relation_permission_error(session, &table_name, TablePrivilege::Insert) {
+        return Err(error);
+    }
     let Some(table) = session.tables.get_mut(&table_name) else {
         return Err(ErrorField {
             code: "42P01",
@@ -6539,6 +6618,16 @@ fn execute_extended_delete(
     delete: gpu_db_protocol::Delete,
 ) -> Result<String, ErrorField> {
     let table_name = delete.table.clone();
+    if !session.tables.contains_key(&table_name) {
+        return Err(ErrorField {
+            code: "42P01",
+            message: "relation does not exist",
+            position: None,
+        });
+    }
+    if let Some(error) = relation_permission_error(session, &table_name, TablePrivilege::Delete) {
+        return Err(error);
+    }
     let Some(table) = session.tables.get_mut(&table_name) else {
         return Err(ErrorField {
             code: "42P01",
@@ -6567,6 +6656,16 @@ fn execute_extended_update(
     update: gpu_db_protocol::Update,
 ) -> Result<String, ErrorField> {
     let table_name = update.table.clone();
+    if !session.tables.contains_key(&table_name) {
+        return Err(ErrorField {
+            code: "42P01",
+            message: "relation does not exist",
+            position: None,
+        });
+    }
+    if let Some(error) = relation_permission_error(session, &table_name, TablePrivilege::Update) {
+        return Err(error);
+    }
     let Some(table) = session.tables.get_mut(&table_name) else {
         return Err(ErrorField {
             code: "42P01",
@@ -11248,6 +11347,11 @@ fn execute_statement(
                         },
                     );
                 };
+                if let Some(error) =
+                    relation_permission_error(session, &table_name, TablePrivilege::Insert)
+                {
+                    return write_error(stream, &error);
+                }
                 let indexes = if insert.columns.is_empty() {
                     (0..table.columns.len()).collect::<Vec<_>>()
                 } else {
@@ -11355,6 +11459,11 @@ fn execute_statement(
                         },
                     );
                 };
+                if let Some(error) =
+                    relation_permission_error(session, &table_name, TablePrivilege::Delete)
+                {
+                    return write_error(stream, &error);
+                }
                 let mut delete_mask = Vec::with_capacity(table.rows.len());
                 for row in &table.rows {
                     match row_matches_delete_filters(&table, row, &delete) {
@@ -11395,6 +11504,11 @@ fn execute_statement(
                         },
                     );
                 };
+                if let Some(error) =
+                    relation_permission_error(session, &table_name, TablePrivilege::Update)
+                {
+                    return write_error(stream, &error);
+                }
                 let mut seen = BTreeSet::new();
                 let mut assignments = Vec::with_capacity(update.assignments.len());
                 for assignment in &update.assignments {
@@ -11488,6 +11602,24 @@ fn execute_statement(
                     include_row_description,
                 );
             }
+            Command::SetRole { role } => {
+                if let Some(role) = role {
+                    if !role_exists(session, &role) {
+                        return write_error(
+                            stream,
+                            &ErrorField {
+                                code: "42704",
+                                message: "role does not exist",
+                                position: None,
+                            },
+                        );
+                    }
+                    session.current_role = Some(role);
+                } else {
+                    session.current_role = None;
+                }
+                return write_command_complete(stream, "SET");
+            }
             Command::Begin => {
                 session.in_transaction = true;
                 return write_command_complete(stream, "BEGIN");
@@ -11503,11 +11635,19 @@ fn execute_statement(
                 return write_command_complete(stream, "ROLLBACK");
             }
             Command::Flush
-            | Command::ResetAll
             | Command::TruncateTable(_)
             | Command::SetKv { .. }
             | Command::DeleteKv { .. }
             | Command::GetKv { .. } => {}
+            Command::ResetAll => {
+                if matches!(
+                    canonical.as_str(),
+                    "reset role" | "reset session role" | "reset local role"
+                ) {
+                    session.current_role = None;
+                    return write_command_complete(stream, "RESET");
+                }
+            }
         },
     }
 
@@ -20311,6 +20451,70 @@ mod tests {
         catalog.tables.remove(table_name);
         catalog.table_acls.remove(table_name);
         catalog.default_table_acl.clear();
+    }
+
+    #[test]
+    fn relation_acl_enforcement_uses_current_role_and_public_grants() {
+        let mut session = Session::default();
+        session.roles.insert(
+            "reader".to_string(),
+            RoleInfo {
+                oid: FIRST_USER_RELATION_OID + 1,
+                name: "reader".to_string(),
+                login: false,
+            },
+        );
+        session.tables.insert(
+            "acl_people".to_string(),
+            test_table(
+                "acl_people",
+                vec![
+                    vec![SqlValue::Int4(1)],
+                    vec![SqlValue::Int4(2)],
+                    vec![SqlValue::Int4(3)],
+                ],
+            ),
+        );
+        let Command::Select(select) =
+            parse_command("select id from acl_people order by id").unwrap()
+        else {
+            panic!("expected supported SELECT");
+        };
+
+        session.current_role = Some("reader".to_string());
+        let err = execute_select_result(&session, &select).unwrap_err();
+        assert_eq!(err.code, "42501");
+        assert_eq!(err.message, "permission denied for relation");
+
+        grant_relation_acl(
+            &mut session,
+            "acl_people",
+            AclRelationKind::Table,
+            "public",
+            &[TablePrivilege::Select],
+        )
+        .unwrap();
+        let result = execute_select_result(&session, &select).unwrap();
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![Some("1".to_string())],
+                vec![Some("2".to_string())],
+                vec![Some("3".to_string())],
+            ]
+        );
+
+        session.current_role = None;
+        revoke_relation_acl(
+            &mut session,
+            "acl_people",
+            AclRelationKind::Table,
+            "public",
+            &[TablePrivilege::Select],
+        )
+        .unwrap();
+        let result = execute_select_result(&session, &select).unwrap();
+        assert_eq!(result.rows.len(), 3);
     }
 
     #[test]

@@ -6,6 +6,7 @@ pub enum Command {
     Rollback { chain: bool },
     Flush,
     ResetAll,
+    SetRole { role: Option<String> },
     SetKv { key: String, value: String },
     DeleteKv { key: String },
     GetKv { key: String },
@@ -6039,17 +6040,7 @@ fn parse_set_session_command(rest: &str) -> Option<Result<Command, ParseError>> 
         let after_local = after_local.trim_start();
         if let Some(after_role) = strip_keyword_prefix_case_insensitive(after_local, "ROLE") {
             let tail = after_role.trim_start();
-            return Some(
-                if tail.eq_ignore_ascii_case("NONE")
-                    || tail.eq_ignore_ascii_case("DEFAULT")
-                    || parse_reset_identifier(tail)
-                        .is_some_and(|(_, trailing)| trailing.trim().is_empty())
-                {
-                    Ok(Command::ResetAll)
-                } else {
-                    Err(ParseError::InvalidSet)
-                },
-            );
+            return Some(parse_set_role_command(tail));
         }
 
         if let Some(after_transaction) =
@@ -6070,33 +6061,13 @@ fn parse_set_session_command(rest: &str) -> Option<Result<Command, ParseError>> 
         let after_session = after_session.trim_start();
         if let Some(after_role) = strip_keyword_prefix_case_insensitive(after_session, "ROLE") {
             let tail = after_role.trim_start();
-            return Some(
-                if tail.eq_ignore_ascii_case("NONE")
-                    || tail.eq_ignore_ascii_case("DEFAULT")
-                    || parse_reset_identifier(tail)
-                        .is_some_and(|(_, trailing)| trailing.trim().is_empty())
-                {
-                    Ok(Command::ResetAll)
-                } else {
-                    Err(ParseError::InvalidSet)
-                },
-            );
+            return Some(parse_set_role_command(tail));
         }
     }
 
     if let Some(after_role) = strip_keyword_prefix_case_insensitive(rest, "ROLE") {
         let tail = after_role.trim_start();
-        return Some(
-            if tail.eq_ignore_ascii_case("NONE")
-                || tail.eq_ignore_ascii_case("DEFAULT")
-                || parse_reset_identifier(tail)
-                    .is_some_and(|(_, trailing)| trailing.trim().is_empty())
-            {
-                Ok(Command::ResetAll)
-            } else {
-                Err(ParseError::InvalidSet)
-            },
-        );
+        return Some(parse_set_role_command(tail));
     }
 
     if let Some(after_transaction) = strip_keyword_prefix_case_insensitive(rest, "TRANSACTION") {
@@ -6169,6 +6140,20 @@ fn parse_set_session_command(rest: &str) -> Option<Result<Command, ParseError>> 
     }
 
     None
+}
+
+fn parse_set_role_command(tail: &str) -> Result<Command, ParseError> {
+    if tail.eq_ignore_ascii_case("NONE") || tail.eq_ignore_ascii_case("DEFAULT") {
+        return Ok(Command::SetRole { role: None });
+    }
+    if let Some((role, trailing)) = parse_reset_identifier(tail) {
+        if trailing.trim().is_empty() {
+            return Ok(Command::SetRole {
+                role: Some(normalize_identifier(role)?),
+            });
+        }
+    }
+    Err(ParseError::InvalidSet)
 }
 
 fn is_isolation_level_suffix(tokens: &[&str]) -> bool {
@@ -6579,38 +6564,51 @@ mod tests {
 
     #[test]
     fn parses_postgres_style_set_session_reset_aliases() {
-        assert_eq!(parse_command("SET ROLE NONE").unwrap(), Command::ResetAll);
+        assert_eq!(
+            parse_command("SET ROLE NONE").unwrap(),
+            Command::SetRole { role: None }
+        );
         assert_eq!(
             parse_command("SET ROLE DEFAULT").unwrap(),
-            Command::ResetAll
+            Command::SetRole { role: None }
         );
         assert_eq!(
             parse_command("SET ROLE app_role").unwrap(),
-            Command::ResetAll
+            Command::SetRole {
+                role: Some("app_role".to_string())
+            }
         );
         assert_eq!(
             parse_command("SET ROLE \"app role\"").unwrap(),
-            Command::ResetAll
+            Command::SetRole {
+                role: Some("app role".to_string())
+            }
         );
         assert_eq!(
             parse_command("SET ROLE \"\"\"quoted\"\" role\"").unwrap(),
-            Command::ResetAll
+            Command::SetRole {
+                role: Some("\"quoted\" role".to_string())
+            }
         );
         assert_eq!(
             parse_command("SET SESSION ROLE DEFAULT").unwrap(),
-            Command::ResetAll
+            Command::SetRole { role: None }
         );
         assert_eq!(
             parse_command("SET SESSION ROLE \"app role\"").unwrap(),
-            Command::ResetAll
+            Command::SetRole {
+                role: Some("app role".to_string())
+            }
         );
         assert_eq!(
             parse_command("SET LOCAL ROLE NONE").unwrap(),
-            Command::ResetAll
+            Command::SetRole { role: None }
         );
         assert_eq!(
             parse_command("SET LOCAL ROLE app_role").unwrap(),
-            Command::ResetAll
+            Command::SetRole {
+                role: Some("app_role".to_string())
+            }
         );
         assert_eq!(
             parse_command("SET SESSION AUTHORIZATION DEFAULT").unwrap(),
@@ -7733,7 +7731,7 @@ mod tests {
         );
         assert_eq!(
             parse_command("SET ROLE NONE;\n").unwrap(),
-            Command::ResetAll
+            Command::SetRole { role: None }
         );
         assert_eq!(
             parse_command("SET SESSION AUTHORIZATION DEFAULT;\n").unwrap(),

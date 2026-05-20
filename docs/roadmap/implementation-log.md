@@ -2,6 +2,19 @@
 
 ## 2026-05-20
 
+- Added bounded relation ACL enforcement for supported PostgreSQL-facing session
+  roles. `SET ROLE {created_role|DEFAULT|NONE}` now mutates protocol session
+  current-role state, missing roles fail truthfully, and non-superuser roles
+  must hold direct or `PUBLIC` ACL privileges for base-table
+  `SELECT`/`INSERT`/`UPDATE`/`DELETE` and view/materialized-view `SELECT`.
+  Default table privileges on subsequently created public tables and supported
+  role-rename grantee retargeting participate in the same checks, while
+  bootstrap `postgres` remains unrestricted. Real psql golden scenario 349
+  covers allowed/denied reads and writes, view/materialized-view gates, reset
+  behavior, and missing-role recovery while ownership checks, memberships,
+  grant options, column ACLs, row policies, schema/shared-object enforcement,
+  and broader PostgreSQL ACL semantics remain out of scope.
+
 - Added bounded bootstrap extension cleanup for restore traffic.
   `DROP EXTENSION IF EXISTS plpgsql` now parses and is accepted as a
   metadata-preserving no-op through the engine and compatibility endpoint, so
@@ -36,7 +49,7 @@
   materialized views. `tests/compat/pg-dump/run.sh` now proves schema ACLs,
   table/view/materialized-view/sequence ACLs, and default table privileges
   round-trip through a real privilege-aware schema dump when the bounded grantee
-  role is precreated on the target, while ownership, permission enforcement,
+  role is precreated on the target, while ownership, broader permission enforcement beyond bounded relation ACL DML/SELECT gates,
   column ACLs, row policies, shared-object/global ACL dumps, and non-table
   default privileges remain out of scope.
 

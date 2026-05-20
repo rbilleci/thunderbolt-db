@@ -79,6 +79,7 @@ impl ReplicatedStateMachine for KvStateMachine {
                     | Command::Rollback { .. }
                     | Command::Flush
                     | Command::ResetAll
+                    | Command::SetRole { .. }
                     | Command::GetKv { .. }
                     | Command::CreateSchema(_)
                     | Command::DropSchema(_)
@@ -13698,7 +13699,7 @@ impl Engine {
                 self.flush_admin()?;
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
-            Command::ResetAll => {
+            Command::ResetAll | Command::SetRole { .. } => {
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
             Command::CreateExtension(create) => {
@@ -13923,7 +13924,7 @@ impl Engine {
                 self.flush_admin()?;
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
-            Command::ResetAll => {
+            Command::ResetAll | Command::SetRole { .. } => {
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
             Command::CreateExtension(create) => {
@@ -13989,6 +13990,7 @@ impl Engine {
             Command::Rollback { .. } => Err(ExecuteError::NonReadCommand("ROLLBACK")),
             Command::Flush => Err(ExecuteError::NonReadCommand("FLUSH")),
             Command::ResetAll => Err(ExecuteError::NonReadCommand("RESET ALL")),
+            Command::SetRole { .. } => Err(ExecuteError::NonReadCommand("SET ROLE")),
             Command::SetKv { .. } => Err(ExecuteError::NonReadCommand("SET")),
             Command::DeleteKv { .. } => Err(ExecuteError::NonReadCommand("DEL/DELETE")),
             Command::CreateSchema(_) => Err(ExecuteError::NonReadCommand("CREATE SCHEMA")),
