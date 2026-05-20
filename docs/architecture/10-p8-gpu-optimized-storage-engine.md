@@ -351,17 +351,19 @@ The first pass/fail threshold is not "GPU is always faster". It is:
 
 ### Smallest Implementation Slice
 
-The next P8 code slice should implement an explicit `RelationalResidentCache`
-or equivalent engine component that owns table-residency state transitions,
-budget admission, deterministic eviction, invalidation hooks, refresh metadata,
-and planner-facing cost/rejection facts for one supported public table. It
-should wire into the existing residency status/telemetry surface and extend the
-P7 residency benchmark to exercise admission, mutation invalidation, refresh,
-eviction, and one planner-facing resident-path decision record.
+The first P8 code slice implements an explicit `RelationalResidentCache` engine
+component for one supported public table. It owns residency snapshots, retained
+device-memory handles, per-GPU budgets, deterministic admission/eviction,
+rejection-before-mutation decisions, invalidation hooks, refresh metadata, and
+planner-facing decision facts. The existing residency status/telemetry surface
+now reports cache state plus the latest admission or rejection decision, and the
+residency benchmark reports admission, mutation invalidation, refresh,
+eviction, oversized rejection, and decision facts.
 
-It should not yet make resident GPU execution the default SQL path. The exit
-condition is a truthful, measured cache-manager proof that can safely become a
-planner routing input in a later slice.
+This does not yet make resident GPU execution the default SQL path. The next
+code slice should consume these cache-manager facts as a planner-routing input
+while preserving truthful CPU fallback for unsupported, stale, or over-budget
+resident paths.
 
 ## Non-Goals For The First P8 Design
 

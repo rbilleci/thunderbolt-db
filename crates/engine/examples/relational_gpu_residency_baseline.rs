@@ -467,6 +467,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     gpu.set_relational_residency_budget_bytes(0, refreshed_snapshot.resident_bytes);
     let budgeted_snapshot = gpu.populate_relational_residency_snapshot("events")?;
     let budget_evicted_aux = gpu.relational_residency_snapshot("resident_aux").is_none();
+    let budget_status = gpu.status_snapshot();
+    let budget_status_table = budget_status
+        .relational_residency
+        .table("events")
+        .ok_or("missing budgeted residency status for events")?;
     let oversize_err = {
         gpu.set_relational_residency_budget_bytes(0, refreshed_snapshot.resident_bytes - 1);
         gpu.populate_relational_residency_snapshot("events")
@@ -475,6 +480,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             .unwrap_or_else(|| "accepted".to_string())
     };
     let oversize_rejected = oversize_err.contains("exceeding GPU 0 residency budget");
+    let oversize_status = gpu.status_snapshot();
+    let oversize_status_table = oversize_status
+        .relational_residency
+        .table("events")
+        .ok_or("missing oversize residency status for events")?;
     gpu.clear_relational_residency_budget_bytes(0);
 
     println!("# P7 GPU Residency Baseline");
@@ -486,6 +496,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!(
         "- current_data_residency_model: bounded_resident_snapshot_probe_with_retained_cuda_allocation_plus_per_query_h2d_fallback"
     );
+    println!("- p8_cache_manager_component_supported: explicit_relational_resident_cache");
     println!("- warm_resident_snapshot_execution_supported: true");
     println!("- production_device_cache_supported: bounded_retained_snapshot_handle");
     println!(
@@ -625,6 +636,38 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
     println!("- resident_budget_admission_supported: true");
     println!(
+        "- resident_budget_cache_state: {}",
+        budget_status_table.cache_state
+    );
+    println!(
+        "- resident_budget_decision_accepted: {}",
+        budget_status_table
+            .last_decision_accepted
+            .map(|accepted| accepted.to_string())
+            .unwrap_or_else(|| "None".to_string())
+    );
+    println!(
+        "- resident_budget_decision_reason: {}",
+        budget_status_table
+            .last_decision_reason
+            .as_deref()
+            .unwrap_or("None")
+    );
+    println!(
+        "- resident_budget_current_bytes_before: {}",
+        budget_status_table
+            .last_decision_current_bytes_before
+            .map(|bytes| bytes.to_string())
+            .unwrap_or_else(|| "None".to_string())
+    );
+    println!(
+        "- resident_budget_current_bytes_after: {}",
+        budget_status_table
+            .last_decision_current_bytes_after
+            .map(|bytes| bytes.to_string())
+            .unwrap_or_else(|| "None".to_string())
+    );
+    println!(
         "- resident_budget_bytes: {}",
         budgeted_snapshot.admission_budget_bytes.unwrap_or_default()
     );
@@ -646,6 +689,20 @@ fn main() -> Result<(), Box<dyn Error>> {
         aux_snapshot.resident_bytes
     );
     println!("- resident_budget_oversize_rejected: {oversize_rejected}");
+    println!(
+        "- resident_budget_oversize_decision_accepted: {}",
+        oversize_status_table
+            .last_decision_accepted
+            .map(|accepted| accepted.to_string())
+            .unwrap_or_else(|| "None".to_string())
+    );
+    println!(
+        "- resident_budget_oversize_decision_reason: {}",
+        oversize_status_table
+            .last_decision_reason
+            .as_deref()
+            .unwrap_or("None")
+    );
     println!("- memory_pressure_fallback_supported: true");
     println!(
         "- memory_pressure_invalidates_resident_snapshot: {}",
@@ -665,7 +722,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("- supported_retained_projections: int4 predicate projection, int4 paginated distinct projection, int4 paginated filtered distinct projection, bounded int4 paginated filtered ordered projection");
     println!("- unsupported_retained_filters: non-prefix LIKE, subqueries, text filter groups beyond the single-prefix count proof, non-int4 filter-group payload columns, arbitrary expression trees");
     println!("- retained_filter_family_closeout: supported retained int4 filter groups and text prefix LIKE count are closed for the current SQL subset");
-    println!("- unsupported_production_cache_claims: broad workload-level GPU advantage, normal planner routing to retained handles, production cache manager, allocator/eviction policy beyond deterministic budget admission evidence");
+    println!("- unsupported_production_cache_claims: broad workload-level GPU advantage, normal planner routing to retained handles, production allocator beyond deterministic budget admission evidence");
     println!();
     print_probe(&cold_probe);
     println!();

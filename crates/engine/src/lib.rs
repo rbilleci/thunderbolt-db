@@ -6007,9 +6007,7 @@ pub struct Engine {
     relational_default_table_acl: BTreeMap<String, BTreeSet<TablePrivilege>>,
     relational_comments: BTreeMap<RelationalCommentTarget, String>,
     relational_value_index: BTreeMap<RelationalIndexKey, Vec<String>>,
-    relational_residency: BTreeMap<String, RelationalResidencySnapshot>,
-    relational_residency_device_memory: BTreeMap<String, CudaResidentDeviceMemory>,
-    relational_residency_budget_bytes_by_gpu: BTreeMap<u16, u64>,
+    relational_resident_cache: RelationalResidentCache,
     relational_next_oid: u32,
     relational_next_column_id: u32,
     relational_next_row_id: u64,
@@ -6022,6 +6020,56 @@ pub struct Engine {
     planner: Planner,
     router: DeviceRouter<MockGpuRuntime>,
     cached_cuda_probe_runtime: Option<CudaDriverRuntime>,
+}
+
+#[derive(Debug, Default)]
+struct RelationalResidentCache {
+    snapshots: BTreeMap<String, RelationalResidencySnapshot>,
+    device_memory: BTreeMap<String, CudaResidentDeviceMemory>,
+    budget_bytes_by_gpu: BTreeMap<u16, u64>,
+    last_decisions: BTreeMap<String, RelationalResidentCacheDecision>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RelationalResidentCacheDecision {
+    table: String,
+    gpu_id: u16,
+    accepted: bool,
+    reason: String,
+    resident_bytes: u64,
+    budget_bytes: Option<u64>,
+    current_bytes_before: u64,
+    current_bytes_after: u64,
+    evicted_tables: Vec<String>,
+}
+
+impl RelationalResidentCache {
+    fn record_decision(&mut self, decision: RelationalResidentCacheDecision) {
+        self.last_decisions.insert(decision.table.clone(), decision);
+    }
+
+    fn last_decision(&self, table: &str) -> Option<&RelationalResidentCacheDecision> {
+        self.last_decisions.get(table)
+    }
+
+    fn remove_table(&mut self, table: &str) {
+        self.snapshots.remove(table);
+        self.device_memory.remove(table);
+    }
+
+    fn install_snapshot(
+        &mut self,
+        table: String,
+        snapshot: RelationalResidencySnapshot,
+        device_memory: Option<CudaResidentDeviceMemory>,
+    ) {
+        if let Some(device_memory) = device_memory {
+            self.device_memory.insert(table.clone(), device_memory);
+        } else {
+            self.device_memory.remove(&table);
+        }
+        self.snapshots.insert(table, snapshot);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7644,9 +7692,7 @@ impl Engine {
             relational_default_table_acl: BTreeMap::new(),
             relational_comments: BTreeMap::new(),
             relational_value_index: BTreeMap::new(),
-            relational_residency: BTreeMap::new(),
-            relational_residency_device_memory: BTreeMap::new(),
-            relational_residency_budget_bytes_by_gpu: BTreeMap::new(),
+            relational_resident_cache: RelationalResidentCache::default(),
             relational_next_oid: FIRST_USER_RELATION_OID,
             relational_next_column_id: FIRST_USER_COLUMN_ID,
             relational_next_row_id: 1,
@@ -7698,23 +7744,27 @@ impl Engine {
     }
 
     pub fn set_relational_residency_budget_bytes(&mut self, gpu_id: u16, budget_bytes: u64) {
-        self.relational_residency_budget_bytes_by_gpu
+        self.relational_resident_cache
+            .budget_bytes_by_gpu
             .insert(gpu_id, budget_bytes);
     }
 
     pub fn clear_relational_residency_budget_bytes(&mut self, gpu_id: u16) {
-        self.relational_residency_budget_bytes_by_gpu
+        self.relational_resident_cache
+            .budget_bytes_by_gpu
             .remove(&gpu_id);
     }
 
     pub fn relational_residency_budget_bytes(&self, gpu_id: u16) -> Option<u64> {
-        self.relational_residency_budget_bytes_by_gpu
+        self.relational_resident_cache
+            .budget_bytes_by_gpu
             .get(&gpu_id)
             .copied()
     }
 
     pub fn relational_resident_bytes_for_gpu(&self, gpu_id: u16) -> u64 {
-        self.relational_residency
+        self.relational_resident_cache
+            .snapshots
             .values()
             .filter(|snapshot| snapshot.gpu_id == gpu_id)
             .map(|snapshot| snapshot.resident_bytes)
@@ -7810,7 +7860,7 @@ impl Engine {
     }
 
     fn invalidate_relational_residency(&mut self, txn_id: TxnId, index: Index) {
-        for (table, snapshot) in self.relational_residency.iter_mut() {
+        for (table, snapshot) in self.relational_resident_cache.snapshots.iter_mut() {
             if snapshot.invalidated_by_txn_id.is_none() {
                 snapshot.invalidated_by_txn_id = Some(txn_id);
                 snapshot.invalidated_at_index = Some(index);
@@ -7818,19 +7868,19 @@ impl Engine {
             if let Some(proof) = snapshot.device_memory_proof.as_mut() {
                 proof.retained = false;
             }
-            self.relational_residency_device_memory.remove(table);
+            self.relational_resident_cache.device_memory.remove(table);
         }
     }
 
     fn invalidate_relational_residency_for_memory_pressure(&mut self, gpu_id: u16) {
-        for (table, snapshot) in self.relational_residency.iter_mut() {
+        for (table, snapshot) in self.relational_resident_cache.snapshots.iter_mut() {
             if snapshot.gpu_id == gpu_id {
                 snapshot.invalidated_by_memory_pressure = true;
                 snapshot.memory_pressure_active = true;
                 if let Some(proof) = snapshot.device_memory_proof.as_mut() {
                     proof.retained = false;
                 }
-                self.relational_residency_device_memory.remove(table);
+                self.relational_resident_cache.device_memory.remove(table);
             }
         }
     }
@@ -9723,8 +9773,11 @@ impl Engine {
         for (target, comment) in retargeted_comments {
             self.relational_comments.insert(target, comment);
         }
-        self.relational_residency.remove(&rename.old_name);
-        self.relational_residency_device_memory
+        self.relational_resident_cache
+            .snapshots
+            .remove(&rename.old_name);
+        self.relational_resident_cache
+            .device_memory
             .remove(&rename.old_name);
         Ok(())
     }
@@ -9779,8 +9832,8 @@ impl Engine {
                 | RelationalCommentTarget::Publication { .. }
                 | RelationalCommentTarget::Subscription { .. } => true,
             });
-            self.relational_residency.remove(name);
-            self.relational_residency_device_memory.remove(name);
+            self.relational_resident_cache.snapshots.remove(name);
+            self.relational_resident_cache.device_memory.remove(name);
         }
         Ok(())
     }
@@ -11291,8 +11344,10 @@ impl Engine {
             .expect("table existence validated");
         table_ref.columns.push(new_column.clone());
         self.relational_next_column_id = next_column_id;
-        self.relational_residency.remove(&add.table);
-        self.relational_residency_device_memory.remove(&add.table);
+        self.relational_resident_cache.snapshots.remove(&add.table);
+        self.relational_resident_cache
+            .device_memory
+            .remove(&add.table);
         Ok(())
     }
 
@@ -11394,8 +11449,11 @@ impl Engine {
                 }
             }
         }
-        self.relational_residency.remove(&rename.table);
-        self.relational_residency_device_memory
+        self.relational_resident_cache
+            .snapshots
+            .remove(&rename.table);
+        self.relational_resident_cache
+            .device_memory
             .remove(&rename.table);
         Ok(())
     }
@@ -11529,8 +11587,11 @@ impl Engine {
         for (_, new_target, comment) in shifted_comments {
             self.relational_comments.insert(new_target, comment);
         }
-        self.relational_residency.remove(&drop_column.table);
-        self.relational_residency_device_memory
+        self.relational_resident_cache
+            .snapshots
+            .remove(&drop_column.table);
+        self.relational_resident_cache
+            .device_memory
             .remove(&drop_column.table);
         Ok(())
     }
@@ -13646,7 +13707,8 @@ impl Engine {
             ))));
         }
         let device_memory = self
-            .relational_residency_device_memory
+            .relational_resident_cache
+            .device_memory
             .get(&table.name)
             .ok_or_else(|| {
                 ExecuteError::Engine(EngineError::ApplyFailed(format!(
@@ -13740,7 +13802,8 @@ impl Engine {
             ))));
         }
         let device_memory = self
-            .relational_residency_device_memory
+            .relational_resident_cache
+            .device_memory
             .get(&table.name)
             .ok_or_else(|| {
                 ExecuteError::Engine(EngineError::ApplyFailed(format!(
@@ -13829,7 +13892,8 @@ impl Engine {
             ))));
         }
         let device_memory = self
-            .relational_residency_device_memory
+            .relational_resident_cache
+            .device_memory
             .get(&table.name)
             .ok_or_else(|| {
                 ExecuteError::Engine(EngineError::ApplyFailed(format!(
@@ -13961,7 +14025,8 @@ impl Engine {
             ))));
         }
         let device_memory = self
-            .relational_residency_device_memory
+            .relational_resident_cache
+            .device_memory
             .get(&table.name)
             .ok_or_else(|| {
                 ExecuteError::Engine(EngineError::ApplyFailed(format!(
@@ -14057,7 +14122,8 @@ impl Engine {
             ))));
         }
         let device_memory = self
-            .relational_residency_device_memory
+            .relational_resident_cache
+            .device_memory
             .get(&table.name)
             .ok_or_else(|| {
                 ExecuteError::Engine(EngineError::ApplyFailed(format!(
@@ -14188,7 +14254,8 @@ impl Engine {
             ))));
         }
         let device_memory = self
-            .relational_residency_device_memory
+            .relational_resident_cache
+            .device_memory
             .get(&table.name)
             .ok_or_else(|| {
                 ExecuteError::Engine(EngineError::ApplyFailed(format!(
@@ -14293,7 +14360,8 @@ impl Engine {
             ))));
         }
         let device_memory = self
-            .relational_residency_device_memory
+            .relational_resident_cache
+            .device_memory
             .get(&table.name)
             .ok_or_else(|| {
                 ExecuteError::Engine(EngineError::ApplyFailed(format!(
@@ -14424,7 +14492,8 @@ impl Engine {
             ))));
         }
         let device_memory = self
-            .relational_residency_device_memory
+            .relational_resident_cache
+            .device_memory
             .get(&table.name)
             .ok_or_else(|| {
                 ExecuteError::Engine(EngineError::ApplyFailed(format!(
@@ -14531,7 +14600,8 @@ impl Engine {
             ))));
         }
         let device_memory = self
-            .relational_residency_device_memory
+            .relational_resident_cache
+            .device_memory
             .get(&table.name)
             .ok_or_else(|| {
                 ExecuteError::Engine(EngineError::ApplyFailed(format!(
@@ -14704,7 +14774,8 @@ impl Engine {
             ))));
         }
         let device_memory = self
-            .relational_residency_device_memory
+            .relational_resident_cache
+            .device_memory
             .get(&table.name)
             .ok_or_else(|| {
                 ExecuteError::Engine(EngineError::ApplyFailed(format!(
@@ -14829,7 +14900,8 @@ impl Engine {
             ))));
         }
         let device_memory = self
-            .relational_residency_device_memory
+            .relational_resident_cache
+            .device_memory
             .get(&table.name)
             .ok_or_else(|| {
                 ExecuteError::Engine(EngineError::ApplyFailed(format!(
@@ -14990,7 +15062,8 @@ impl Engine {
             ))));
         }
         let device_memory = self
-            .relational_residency_device_memory
+            .relational_resident_cache
+            .device_memory
             .get(&table.name)
             .ok_or_else(|| {
                 ExecuteError::Engine(EngineError::ApplyFailed(format!(
@@ -15206,7 +15279,8 @@ impl Engine {
             ))));
         }
         let device_memory = self
-            .relational_residency_device_memory
+            .relational_resident_cache
+            .device_memory
             .get(&table.name)
             .ok_or_else(|| {
                 ExecuteError::Engine(EngineError::ApplyFailed(format!(
@@ -15400,7 +15474,8 @@ impl Engine {
             ))));
         }
         let device_memory = self
-            .relational_residency_device_memory
+            .relational_resident_cache
+            .device_memory
             .get(&table.name)
             .ok_or_else(|| {
                 ExecuteError::Engine(EngineError::ApplyFailed(format!(
@@ -15515,7 +15590,8 @@ impl Engine {
             ))));
         }
         let device_memory = self
-            .relational_residency_device_memory
+            .relational_resident_cache
+            .device_memory
             .get(&table.name)
             .ok_or_else(|| {
                 ExecuteError::Engine(EngineError::ApplyFailed(format!(
@@ -15658,7 +15734,8 @@ impl Engine {
             ))));
         }
         let device_memory = self
-            .relational_residency_device_memory
+            .relational_resident_cache
+            .device_memory
             .get(&table.name)
             .ok_or_else(|| {
                 ExecuteError::Engine(EngineError::ApplyFailed(format!(
@@ -15812,7 +15889,8 @@ impl Engine {
             ))));
         }
         let device_memory = self
-            .relational_residency_device_memory
+            .relational_resident_cache
+            .device_memory
             .get(&table.name)
             .ok_or_else(|| {
                 ExecuteError::Engine(EngineError::ApplyFailed(format!(
@@ -16815,7 +16893,7 @@ impl Engine {
         &mut self,
         table: &str,
     ) -> Result<RelationalResidencySnapshot, ExecuteError> {
-        let previous_snapshot = self.relational_residency.get(table).cloned();
+        let previous_snapshot = self.relational_resident_cache.snapshots.get(table).cloned();
         let catalog_table = self
             .relational_catalog
             .get(table)
@@ -16961,15 +17039,11 @@ impl Engine {
             evicted_tables_on_admission,
             device_memory_proof,
         };
-        if let Some(device_memory) = device_memory {
-            self.relational_residency_device_memory
-                .insert(catalog_table.name.clone(), device_memory);
-        } else {
-            self.relational_residency_device_memory
-                .remove(&catalog_table.name);
-        }
-        self.relational_residency
-            .insert(catalog_table.name, snapshot.clone());
+        self.relational_resident_cache.install_snapshot(
+            catalog_table.name,
+            snapshot.clone(),
+            device_memory,
+        );
         Ok(snapshot)
     }
 
@@ -16983,22 +17057,62 @@ impl Engine {
             let resident_bytes_after_admission = self
                 .relational_resident_bytes_for_gpu_excluding(gpu_id, table)
                 .saturating_add(resident_bytes);
+            self.relational_resident_cache
+                .record_decision(RelationalResidentCacheDecision {
+                    table: table.to_string(),
+                    gpu_id,
+                    accepted: true,
+                    reason: "admitted without budget limit".to_string(),
+                    resident_bytes,
+                    budget_bytes: None,
+                    current_bytes_before: resident_bytes_after_admission
+                        .saturating_sub(resident_bytes),
+                    current_bytes_after: resident_bytes_after_admission,
+                    evicted_tables: Vec::new(),
+                });
             return Ok((Vec::new(), resident_bytes_after_admission));
         };
         if resident_bytes > budget_bytes {
+            let current_bytes = self.relational_resident_bytes_for_gpu(gpu_id);
+            self.relational_resident_cache
+                .record_decision(RelationalResidentCacheDecision {
+                    table: table.to_string(),
+                    gpu_id,
+                    accepted: false,
+                    reason: "resident snapshot exceeds GPU budget".to_string(),
+                    resident_bytes,
+                    budget_bytes: Some(budget_bytes),
+                    current_bytes_before: current_bytes,
+                    current_bytes_after: current_bytes,
+                    evicted_tables: Vec::new(),
+                });
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
                 "relation \"{table}\" resident snapshot requires {resident_bytes} bytes, exceeding GPU {gpu_id} residency budget {budget_bytes} bytes"
             ))));
         }
 
         let mut current_bytes = self.relational_resident_bytes_for_gpu_excluding(gpu_id, table);
+        let current_bytes_before = current_bytes;
         let mut evicted_tables = Vec::new();
         if current_bytes.saturating_add(resident_bytes) <= budget_bytes {
+            self.relational_resident_cache
+                .record_decision(RelationalResidentCacheDecision {
+                    table: table.to_string(),
+                    gpu_id,
+                    accepted: true,
+                    reason: "admitted within budget".to_string(),
+                    resident_bytes,
+                    budget_bytes: Some(budget_bytes),
+                    current_bytes_before,
+                    current_bytes_after: current_bytes + resident_bytes,
+                    evicted_tables: Vec::new(),
+                });
             return Ok((evicted_tables, current_bytes + resident_bytes));
         }
 
         let mut candidates = self
-            .relational_residency
+            .relational_resident_cache
+            .snapshots
             .iter()
             .filter(|(name, snapshot)| name.as_str() != table && snapshot.gpu_id == gpu_id)
             .map(|(name, snapshot)| {
@@ -17015,12 +17129,27 @@ impl Engine {
             if current_bytes.saturating_add(resident_bytes) <= budget_bytes {
                 break;
             }
-            self.relational_residency.remove(&map_key);
-            self.relational_residency_device_memory.remove(&map_key);
+            self.relational_resident_cache.remove_table(&map_key);
             current_bytes = current_bytes.saturating_sub(bytes);
             evicted_tables.push(map_key);
         }
 
+        self.relational_resident_cache
+            .record_decision(RelationalResidentCacheDecision {
+                table: table.to_string(),
+                gpu_id,
+                accepted: true,
+                reason: if evicted_tables.is_empty() {
+                    "admitted within budget".to_string()
+                } else {
+                    "admitted after deterministic eviction".to_string()
+                },
+                resident_bytes,
+                budget_bytes: Some(budget_bytes),
+                current_bytes_before,
+                current_bytes_after: current_bytes + resident_bytes,
+                evicted_tables: evicted_tables.clone(),
+            });
         Ok((evicted_tables, current_bytes + resident_bytes))
     }
 
@@ -17034,7 +17163,8 @@ impl Engine {
     }
 
     fn relational_resident_bytes_for_gpu_excluding(&self, gpu_id: u16, table: &str) -> u64 {
-        self.relational_residency
+        self.relational_resident_cache
+            .snapshots
             .iter()
             .filter(|(name, snapshot)| name.as_str() != table && snapshot.gpu_id == gpu_id)
             .map(|(_name, snapshot)| snapshot.resident_bytes)
@@ -17045,21 +17175,25 @@ impl Engine {
         &self,
         table: &str,
     ) -> Option<RelationalResidencySnapshot> {
-        self.relational_residency.get(table).map(|snapshot| {
-            let mut snapshot = snapshot.clone();
-            snapshot.memory_pressure_active = self
-                .router
-                .runtime()
-                .snapshot()
-                .memory_pressured_gpu_ids
-                .contains(&snapshot.gpu_id);
-            snapshot
-        })
+        self.relational_resident_cache
+            .snapshots
+            .get(table)
+            .map(|snapshot| {
+                let mut snapshot = snapshot.clone();
+                snapshot.memory_pressure_active = self
+                    .router
+                    .runtime()
+                    .snapshot()
+                    .memory_pressured_gpu_ids
+                    .contains(&snapshot.gpu_id);
+                snapshot
+            })
     }
 
     fn relational_residency_status(&self) -> RelationalResidencyStatus {
         let mut tables = self
-            .relational_residency
+            .relational_resident_cache
+            .snapshots
             .values()
             .map(|snapshot| {
                 let memory_pressure_active = self
@@ -17068,10 +17202,24 @@ impl Engine {
                     .snapshot()
                     .memory_pressured_gpu_ids
                     .contains(&snapshot.gpu_id);
+                let last_decision = self
+                    .relational_resident_cache
+                    .last_decision(&snapshot.table);
+                let cache_state =
+                    if memory_pressure_active || snapshot.invalidated_by_memory_pressure {
+                        "InvalidatedByMemoryPressure"
+                    } else if snapshot.invalidated_by_txn_id.is_some()
+                        || snapshot.invalidated_at_index.is_some()
+                    {
+                        "Invalidated"
+                    } else {
+                        "Valid"
+                    };
                 RelationalResidencyTableStatus {
                     schema: snapshot.schema.clone(),
                     table: snapshot.table.clone(),
                     gpu_id: snapshot.gpu_id,
+                    cache_state: cache_state.to_string(),
                     row_count: snapshot.row_count,
                     column_count: snapshot.column_count,
                     resident_bytes: snapshot.resident_bytes,
@@ -17087,6 +17235,12 @@ impl Engine {
                     admission_budget_bytes: snapshot.admission_budget_bytes,
                     resident_bytes_after_admission: snapshot.resident_bytes_after_admission,
                     evicted_tables_on_admission: snapshot.evicted_tables_on_admission.clone(),
+                    last_decision_accepted: last_decision.map(|decision| decision.accepted),
+                    last_decision_reason: last_decision.map(|decision| decision.reason.clone()),
+                    last_decision_current_bytes_before: last_decision
+                        .map(|decision| decision.current_bytes_before),
+                    last_decision_current_bytes_after: last_decision
+                        .map(|decision| decision.current_bytes_after),
                     device_memory_proof: snapshot.device_memory_proof.clone(),
                 }
             })
@@ -17106,7 +17260,7 @@ impl Engine {
         RelationalResidencyStatus {
             tables,
             resident_bytes_by_gpu,
-            budget_bytes_by_gpu: self.relational_residency_budget_bytes_by_gpu.clone(),
+            budget_bytes_by_gpu: self.relational_resident_cache.budget_bytes_by_gpu.clone(),
         }
     }
 
@@ -20347,6 +20501,22 @@ mod tests {
 
         let retained = e.relational_residency_snapshot("events").unwrap();
         assert_eq!(retained, original);
+        let status = e.status_snapshot();
+        let table = status.relational_residency.table("events").unwrap();
+        assert_eq!(table.cache_state, "Valid");
+        assert_eq!(table.last_decision_accepted, Some(false));
+        assert_eq!(
+            table.last_decision_reason.as_deref(),
+            Some("resident snapshot exceeds GPU budget")
+        );
+        assert_eq!(
+            table.last_decision_current_bytes_before,
+            Some(original.resident_bytes)
+        );
+        assert_eq!(
+            table.last_decision_current_bytes_after,
+            Some(original.resident_bytes)
+        );
         assert_eq!(
             e.relational_resident_bytes_for_gpu(0),
             original.resident_bytes
@@ -20395,7 +20565,7 @@ mod tests {
 
         let snapshot = e.populate_relational_residency_snapshot("events").unwrap();
         assert_eq!(snapshot.device_memory_proof, None);
-        assert_eq!(e.relational_residency_device_memory.len(), 0);
+        assert_eq!(e.relational_resident_cache.device_memory.len(), 0);
 
         let status = e.status_snapshot();
         assert_eq!(
@@ -21754,6 +21924,20 @@ mod tests {
         assert_eq!(table.admission_budget_bytes, Some(budget_bytes));
         assert_eq!(table.resident_bytes_after_admission, events.resident_bytes);
         assert_eq!(table.evicted_tables_on_admission, vec!["aux"]);
+        assert_eq!(table.cache_state, "Valid");
+        assert_eq!(table.last_decision_accepted, Some(true));
+        assert_eq!(
+            table.last_decision_reason.as_deref(),
+            Some("admitted after deterministic eviction")
+        );
+        assert_eq!(
+            table.last_decision_current_bytes_before,
+            Some(aux.resident_bytes)
+        );
+        assert_eq!(
+            table.last_decision_current_bytes_after,
+            Some(events.resident_bytes)
+        );
         assert!(table.valid);
         assert!(status.relational_residency.table("aux").is_none());
         status.validate().unwrap();
@@ -21763,6 +21947,7 @@ mod tests {
         let invalidated = e.telemetry_snapshot();
         let invalidated_table = invalidated.relational_residency.table("events").unwrap();
         assert_eq!(invalidated.resident_table_count(), 1);
+        assert_eq!(invalidated_table.cache_state, "Invalidated");
         assert!(!invalidated_table.valid);
         assert_eq!(invalidated_table.invalidated_by_txn_id, Some(5));
         assert_eq!(invalidated.relational_residency.invalid_snapshot_count(), 1);
@@ -21773,6 +21958,7 @@ mod tests {
         e.mark_gpu_memory_pressured(0);
         let pressured = e.status_snapshot();
         let pressured_table = pressured.relational_residency.table("events").unwrap();
+        assert_eq!(pressured_table.cache_state, "InvalidatedByMemoryPressure");
         assert!(pressured_table.memory_pressure_active);
         assert!(pressured_table.invalidated_by_memory_pressure);
         if let Some(proof) = &pressured_table.device_memory_proof {
@@ -38781,7 +38967,10 @@ mod tests {
         assert!(e.relational_catalog_table("people").is_none());
         assert!(e.relational_catalog_table("teams").is_some());
         assert!(e.relational_residency_snapshot("people").is_none());
-        assert!(!e.relational_residency_device_memory.contains_key("people"));
+        assert!(!e
+            .relational_resident_cache
+            .device_memory
+            .contains_key("people"));
         assert_eq!(e.relational_table_comment("people"), None);
         assert_eq!(e.relational_column_comment("people", 2), None);
         assert_eq!(e.relational_index_comment("people_name_idx"), None);
