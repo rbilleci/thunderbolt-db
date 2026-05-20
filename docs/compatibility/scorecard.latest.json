@@ -3,8 +3,8 @@
     "durability.invariants": {
       "failed": 0,
       "ignored": 0,
-      "passed": 131,
-      "total": 131
+      "passed": 136,
+      "total": 136
     },
     "execution.gpu_routing_and_batching": {
       "failed": 0,
@@ -15,14 +15,14 @@
     "protocol.client_flows": {
       "failed": 0,
       "ignored": 0,
-      "passed": 76,
-      "total": 76
+      "passed": 137,
+      "total": 137
     },
     "protocol.error_paths": {
       "failed": 0,
       "ignored": 0,
-      "passed": 94,
-      "total": 94
+      "passed": 104,
+      "total": 104
     },
     "protocol.extended_query": {
       "failed": 0,
@@ -39,14 +39,14 @@
     "replication.role_and_log": {
       "failed": 0,
       "ignored": 0,
-      "passed": 178,
-      "total": 178
+      "passed": 231,
+      "total": 231
     },
     "sql.catalog_schema_types": {
       "failed": 0,
       "ignored": 0,
-      "passed": 257,
-      "total": 257
+      "passed": 258,
+      "total": 258
     },
     "sql.gpu_bridge": {
       "failed": 0,
@@ -54,11 +54,17 @@
       "passed": 23,
       "total": 23
     },
+    "sql.parser_features": {
+      "failed": 0,
+      "ignored": 0,
+      "passed": 66,
+      "total": 66
+    },
     "sql.relational_foundation": {
       "failed": 0,
       "ignored": 0,
-      "passed": 314,
-      "total": 314
+      "passed": 315,
+      "total": 315
     },
     "sql.transaction_flows": {
       "failed": 0,
@@ -75,16 +81,16 @@
     "uncategorized": {
       "failed": 0,
       "ignored": 0,
-      "passed": 220,
-      "total": 220
+      "passed": 185,
+      "total": 185
     }
   },
   "top_failing_categories": [],
   "totals": {
     "failed": 0,
     "ignored": 0,
-    "passed": 1198,
-    "total": 1198
+    "passed": 1200,
+    "total": 1200
   },
   "trend_hook": {
     "baseline_available": true,
@@ -99,6 +105,7 @@
       "replication.role_and_log": 0,
       "sql.catalog_schema_types": 0,
       "sql.gpu_bridge": 0,
+      "sql.parser_features": 0,
       "sql.relational_foundation": 0,
       "sql.transaction_flows": 0,
       "storage.indexing": 0,

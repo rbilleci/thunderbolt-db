@@ -352,7 +352,7 @@ fn execute_select_result_inner(
             }
             if enforce_relation_acl {
                 if let Some(error) =
-                    relation_permission_error(session, &select.table, TablePrivilege::Select)
+                    object_access_permission_error(session, &select.table, TablePrivilege::Select)
                 {
                     return Err(error);
                 }
@@ -370,7 +370,7 @@ fn execute_select_result_inner(
             }
             if enforce_relation_acl {
                 if let Some(error) =
-                    relation_permission_error(session, &select.table, TablePrivilege::Select)
+                    object_access_permission_error(session, &select.table, TablePrivilege::Select)
                 {
                     return Err(error);
                 }
@@ -403,7 +403,7 @@ fn execute_select_result_inner(
     };
     if enforce_relation_acl {
         if let Some(error) =
-            relation_permission_error(session, &select.table, TablePrivilege::Select)
+            object_access_permission_error(session, &select.table, TablePrivilege::Select)
         {
             return Err(error);
         }
@@ -612,6 +612,9 @@ fn execute_function_result(
     session: &Session,
     call: &gpu_db_protocol::SelectFunction,
 ) -> Result<SelectResult, ErrorField> {
+    if let Some(error) = schema_usage_permission_error(session, "public") {
+        return Err(error);
+    }
     let Some(function) = session.functions.get(&call.name) else {
         return Err(ErrorField {
             code: "42883",
@@ -3378,6 +3381,19 @@ fn role_has_schema_privilege(session: &Session, schema: &str, privilege: SchemaP
             .is_some_and(|privileges| privileges.contains(&privilege))
 }
 
+fn role_has_schema_usage(session: &Session, schema: &str) -> bool {
+    if active_role(session) == "postgres" {
+        return true;
+    }
+    if schema != "public" || !session.public_schema_exists {
+        return false;
+    }
+    if session.schema_acl.is_empty() {
+        return true;
+    }
+    role_has_schema_privilege(session, schema, SchemaPrivilege::Usage)
+}
+
 fn schema_permission_error(
     session: &Session,
     schema: &str,
@@ -3392,6 +3408,27 @@ fn schema_permission_error(
             position: None,
         })
     }
+}
+
+fn schema_usage_permission_error(session: &Session, schema: &str) -> Option<ErrorField> {
+    if role_has_schema_usage(session, schema) {
+        None
+    } else {
+        Some(ErrorField {
+            code: "42501",
+            message: "permission denied for schema",
+            position: None,
+        })
+    }
+}
+
+fn object_access_permission_error(
+    session: &Session,
+    relation: &str,
+    privilege: TablePrivilege,
+) -> Option<ErrorField> {
+    schema_usage_permission_error(session, "public")
+        .or_else(|| relation_permission_error(session, relation, privilege))
 }
 
 fn role_has_dependencies(session: &Session, role: &str) -> bool {
@@ -6581,7 +6618,9 @@ fn execute_extended_insert(
             position: None,
         });
     }
-    if let Some(error) = relation_permission_error(session, &table_name, TablePrivilege::Insert) {
+    if let Some(error) =
+        object_access_permission_error(session, &table_name, TablePrivilege::Insert)
+    {
         return Err(error);
     }
     let Some(table) = session.tables.get_mut(&table_name) else {
@@ -6659,7 +6698,9 @@ fn execute_extended_delete(
             position: None,
         });
     }
-    if let Some(error) = relation_permission_error(session, &table_name, TablePrivilege::Delete) {
+    if let Some(error) =
+        object_access_permission_error(session, &table_name, TablePrivilege::Delete)
+    {
         return Err(error);
     }
     let Some(table) = session.tables.get_mut(&table_name) else {
@@ -6697,7 +6738,9 @@ fn execute_extended_update(
             position: None,
         });
     }
-    if let Some(error) = relation_permission_error(session, &table_name, TablePrivilege::Update) {
+    if let Some(error) =
+        object_access_permission_error(session, &table_name, TablePrivilege::Update)
+    {
         return Err(error);
     }
     let Some(table) = session.tables.get_mut(&table_name) else {
@@ -10107,6 +10150,11 @@ fn execute_statement(
                 if let Some(error) = sequence_target_error(session, &nextval.name) {
                     return write_error(stream, &error);
                 }
+                if let Some(error) =
+                    object_access_permission_error(session, &nextval.name, TablePrivilege::Update)
+                {
+                    return write_error(stream, &error);
+                }
                 let sequence = session
                     .sequences
                     .get_mut(&nextval.name)
@@ -10131,6 +10179,11 @@ fn execute_statement(
                 if let Some(error) = sequence_target_error(session, &currval.name) {
                     return write_error(stream, &error);
                 }
+                if let Some(error) =
+                    object_access_permission_error(session, &currval.name, TablePrivilege::Select)
+                {
+                    return write_error(stream, &error);
+                }
                 let Some(value) = session.currval_sequences.get(&currval.name).copied() else {
                     return write_error(
                         stream,
@@ -10150,6 +10203,11 @@ fn execute_statement(
             }
             Command::SequenceSetVal(setval) => {
                 if let Some(error) = sequence_target_error(session, &setval.name) {
+                    return write_error(stream, &error);
+                }
+                if let Some(error) =
+                    object_access_permission_error(session, &setval.name, TablePrivilege::Update)
+                {
                     return write_error(stream, &error);
                 }
                 let value = setval.value;
@@ -11477,7 +11535,7 @@ fn execute_statement(
                     );
                 };
                 if let Some(error) =
-                    relation_permission_error(session, &table_name, TablePrivilege::Insert)
+                    object_access_permission_error(session, &table_name, TablePrivilege::Insert)
                 {
                     return write_error(stream, &error);
                 }
@@ -11589,7 +11647,7 @@ fn execute_statement(
                     );
                 };
                 if let Some(error) =
-                    relation_permission_error(session, &table_name, TablePrivilege::Delete)
+                    object_access_permission_error(session, &table_name, TablePrivilege::Delete)
                 {
                     return write_error(stream, &error);
                 }
@@ -11634,7 +11692,7 @@ fn execute_statement(
                     );
                 };
                 if let Some(error) =
-                    relation_permission_error(session, &table_name, TablePrivilege::Update)
+                    object_access_permission_error(session, &table_name, TablePrivilege::Update)
                 {
                     return write_error(stream, &error);
                 }
@@ -20644,6 +20702,68 @@ mod tests {
         .unwrap();
         let result = execute_select_result(&session, &select).unwrap();
         assert_eq!(result.rows.len(), 3);
+    }
+
+    #[test]
+    fn schema_usage_enforcement_gates_supported_object_access() {
+        let mut session = Session::default();
+        session.roles.insert(
+            "reader".to_string(),
+            RoleInfo {
+                oid: FIRST_USER_RELATION_OID + 1,
+                name: "reader".to_string(),
+                login: false,
+            },
+        );
+        session.tables.insert(
+            "acl_people".to_string(),
+            test_table("acl_people", vec![vec![SqlValue::Int4(1)]]),
+        );
+        session.functions.insert(
+            "acl_answer".to_string(),
+            FunctionInfo {
+                oid: FIRST_USER_RELATION_OID + 2,
+                name: "acl_answer".to_string(),
+                return_type: SqlType::Int4,
+                body: "SELECT 42".to_string(),
+            },
+        );
+        grant_relation_acl(
+            &mut session,
+            "acl_people",
+            AclRelationKind::Table,
+            "reader",
+            &[TablePrivilege::Select],
+        )
+        .unwrap();
+        grant_schema_acl(&mut session, "public", "reader", &[SchemaPrivilege::Create]).unwrap();
+        session.current_role = Some("reader".to_string());
+
+        let Command::Select(select) =
+            parse_command("select id from acl_people order by id").unwrap()
+        else {
+            panic!("expected supported SELECT");
+        };
+        let err = execute_select_result(&session, &select).unwrap_err();
+        assert_eq!(err.code, "42501");
+        assert_eq!(err.message, "permission denied for schema");
+
+        let Command::SelectFunction(call) = parse_command("select acl_answer()").unwrap() else {
+            panic!("expected supported function call");
+        };
+        let err = execute_function_result(&session, &call).unwrap_err();
+        assert_eq!(err.code, "42501");
+        assert_eq!(err.message, "permission denied for schema");
+
+        grant_schema_acl(&mut session, "public", "reader", &[SchemaPrivilege::Usage]).unwrap();
+        assert_eq!(
+            execute_select_result(&session, &select).unwrap().rows.len(),
+            1
+        );
+        assert_eq!(
+            execute_function_result(&session, &call).unwrap().rows,
+            vec![vec![Some("42".to_string())]]
+        );
     }
 
     #[test]

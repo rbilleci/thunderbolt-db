@@ -1,0 +1,78 @@
+Pager usage is off.
+=== bounded schema USAGE ACL enforcement ===
+CREATE ROLE
+CREATE TABLE
+INSERT 0 2
+CREATE SEQUENCE
+CREATE FUNCTION
+GRANT
+GRANT
+GRANT
+SET
+psql:351_protocol_psql_schema_usage_acl_enforcement.sql:12: ERROR:  permission denied for schema
+psql:351_protocol_psql_schema_usage_acl_enforcement.sql:13: ERROR:  permission denied for schema
+psql:351_protocol_psql_schema_usage_acl_enforcement.sql:14: ERROR:  permission denied for schema
+psql:351_protocol_psql_schema_usage_acl_enforcement.sql:15: ERROR:  permission denied for schema
+RESET
+GRANT
+SET
+ id | name
+----+-------
+  1 | ada
+  2 | grace
+(2 rows)
+
+INSERT 0 1
+UPDATE 1
+DELETE 1
+ id |   name
+----+-----------
+  1 | lovelace
+  3 | katherine
+(2 rows)
+
+ nextval
+---------
+       1
+(1 row)
+
+psql:351_protocol_psql_schema_usage_acl_enforcement.sql:25: ERROR:  permission denied for relation
+RESET
+GRANT
+SET
+ currval
+---------
+       1
+(1 row)
+
+RESET
+REVOKE
+SET
+psql:351_protocol_psql_schema_usage_acl_enforcement.sql:33: ERROR:  permission denied for relation
+RESET
+GRANT
+SET
+ setval
+--------
+     10
+(1 row)
+
+ acl_usage_answer
+------------------
+               42
+(1 row)
+
+RESET
+REVOKE
+SET
+psql:351_protocol_psql_schema_usage_acl_enforcement.sql:42: ERROR:  permission denied for schema
+psql:351_protocol_psql_schema_usage_acl_enforcement.sql:43: ERROR:  permission denied for schema
+psql:351_protocol_psql_schema_usage_acl_enforcement.sql:44: ERROR:  permission denied for schema
+RESET
+REVOKE
+REVOKE
+REVOKE
+DROP FUNCTION
+DROP SEQUENCE
+DROP TABLE
+DROP ROLE
