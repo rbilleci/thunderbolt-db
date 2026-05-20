@@ -49,6 +49,30 @@ Boundaries:
 - This is not a live Kubernetes rollout.
 - Missing or unusable local Docker/Compose is an environment blocker for this preflight, not a product pass.
 
+### 1c) Bounded Backup/PITR/DR Drill
+
+Run as the recurring local backup/PITR/DR verification gate:
+
+```bash
+scripts/run_backup_pitr_dr_drill.sh
+```
+
+Pass criteria:
+
+- `backup_pitr_dr_drill=passed`
+- Focused base-plus-archive transaction and timestamp restore tests pass.
+- Checkpoint-backed PITR-window archive retention tests pass.
+- Scheduler-safe maintenance cleanup preflight passes, including stale-sidecar and unsafe-window rejection-before-mutation evidence.
+- Object-bundle backup preflight passes, including export/restore/recover evidence and corrupt-object rejection before final restored archive state.
+- MVCC retention boundary tests pass.
+
+Boundaries:
+
+- This is a local checkpoint-control, WAL archive, timeline-registry, and file-backed object-bundle drill.
+- This is not a physical page-image base-backup restore.
+- This is not a production object-storage integration.
+- This is not live background cleanup scheduling or production timeline failover orchestration.
+
 ## 2) WAL Durability Incident (Flush Failure)
 
 Symptoms:
@@ -135,7 +159,8 @@ For the current single-node relational WAL segment proof:
 13. For local PITR timeline-branch proof, fork a transaction or timestamp target with `Engine::fork_durable_wal_archive_timeline_to_txn(...)` or `Engine::fork_durable_wal_archive_timeline_to_timestamp_micros(...)`; the helper validates the source archive and target, writes a branch archive manifest containing only the selected durable prefix, and installs sidecar timeline identity plus parent ancestry metadata. Register sidecars with `Engine::register_durable_wal_archive_timeline(...)` so local timeline ids stay unique, child timelines require an already registered parent, and the branch manifest validates before the registry is updated. Select a registered local failover target with `Engine::select_durable_wal_archive_timeline(...)`, or recover directly with `Engine::recover_from_registered_durable_wal_archive_timeline(...)`; both paths reject missing registry entries, stale sidecars, and corrupted branch archives before recovery. To prune local timeline artifacts, inspect `Engine::plan_durable_wal_archive_timeline_prune(...)`, then apply `Engine::apply_durable_wal_archive_timeline_prune(...)`; pruning validates registered sidecars and branch archives before mutation, retains the selected target plus ancestors, installs the pruned registry, and removes only unreferenced sidecars plus branch archive manifests/segments after that registry update.
 14. For scheduler-safe local maintenance cleanup, inspect `Engine::plan_durable_wal_archive_maintenance_cleanup(...)`, then apply `Engine::apply_durable_wal_archive_maintenance_cleanup(...)`; the dry-run validates checkpoint-backed PITR-window archive retention and registered-timeline pruning together before mutation, so stale timeline sidecars or corrupt branch archives reject the whole cleanup before archive retention changes are installed. Operators can run the checked preflight with `cargo run -p gpu_db_engine --example wal_archive_maintenance_preflight -- --control <CONTROL> --archive-manifest <MANIFEST> --timeline-registry <TIMELINE_REGISTRY> --retain-timeline <timeline> --current-timestamp-micros <now> --pitr-window-micros <window> --recover-retained`, add `--apply` only after reviewing the dry-run evidence, and use `scripts/run_wal_archive_maintenance_preflight_smoke.sh` as the local regression gate. A successful apply performs the validated archive retention, prunes the local timeline registry to the retained target plus ancestors, and preserves `Engine::recover_from_registered_durable_wal_archive_timeline(...)` for the retained target.
 15. For local object-bundle backup proof, export a validated archive with `Engine::export_durable_wal_archive_object_backup(...)` and restore it with `Engine::restore_durable_wal_archive_object_backup(...)`; restore verifies every manifest/segment object length and checksum, cross-checks the manifest object bytes against the backup manifest metadata, stages restored segment files until every object verifies, and then installs the restored archive manifest. Operators can run the checked preflight with `cargo run -p gpu_db_engine --example wal_archive_object_backup_preflight -- --archive-manifest <MANIFEST> --backup-manifest <BACKUP> --object-dir <OBJECT_DIR> --restored-manifest <RESTORED_MANIFEST> --restored-segment-dir <RESTORED_SEGMENTS> --recover-timestamp-micros <target>`, use `--restore-only` to verify an existing backup manifest/object directory, and use `scripts/run_wal_archive_object_backup_preflight_smoke.sh` as the local regression gate for export/restore/recover evidence plus corrupt-object rejection-before-install.
-16. Treat physical page-image base backups, production object-storage APIs, automated production timeline failover orchestration beyond local registered-target selection/pruning, and live background cleanup scheduling as not yet implemented.
+16. For the recurring local DR drill, run `scripts/run_backup_pitr_dr_drill.sh`; it aggregates the focused base-plus-archive restore tests, checkpoint PITR-window retention tests, scheduler-safe maintenance preflight, object-bundle backup preflight, and MVCC retention boundary tests into one operator gate.
+17. Treat physical page-image base backups, production object-storage APIs, automated production timeline failover orchestration beyond local registered-target selection/pruning, and live background cleanup scheduling as not yet implemented.
 
 Failure criteria:
 
