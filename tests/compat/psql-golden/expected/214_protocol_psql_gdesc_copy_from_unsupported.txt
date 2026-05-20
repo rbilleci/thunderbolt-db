@@ -1,7 +1,7 @@
 === psql gdesc copy from unsupported recovery ===
 CREATE TABLE
 INSERT 0 2
-psql:214_protocol_psql_gdesc_copy_from_unsupported.sql:4: ERROR:  COPY is not supported by the compatibility endpoint
+The command has no result, or the result has no columns.
  name
 ------
  Ada

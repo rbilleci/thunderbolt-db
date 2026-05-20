@@ -4021,6 +4021,7 @@ struct CopyInState {
     pending_text: String,
     pending_rows: Vec<Vec<SqlValue>>,
     seen_terminator: bool,
+    ready_after_done: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4235,15 +4236,24 @@ fn handle_frontend_message(
         }
         FrontendMessage::Terminate => return Ok(false),
         FrontendMessage::Sync => {
-            *extended_error_pending = false;
-            write_ready_for_query(stream, session.in_transaction)?
+            if session.copy_in.is_none() {
+                *extended_error_pending = false;
+                write_ready_for_query(stream, session.in_transaction)?
+            }
         }
         FrontendMessage::Flush => stream.flush()?,
         FrontendMessage::CopyData(bytes) => {
             if let Some(error) = handle_copy_data(session, &bytes) {
-                session.copy_in = None;
+                let ready_after_done = session
+                    .copy_in
+                    .take()
+                    .is_none_or(|copy| copy.ready_after_done);
                 write_error(stream, &error)?;
-                write_ready_for_query(stream, session.in_transaction)?;
+                if ready_after_done {
+                    write_ready_for_query(stream, session.in_transaction)?;
+                } else {
+                    *extended_error_pending = true;
+                }
             } else if session.copy_in.is_none() && !*extended_error_pending {
                 write_error(
                     stream,
@@ -4260,12 +4270,15 @@ fn handle_frontend_message(
         FrontendMessage::CopyDone => {
             if let Some(copy) = session.copy_in.take() {
                 let copied = copy.pending_rows.len();
+                let ready_after_done = copy.ready_after_done;
                 if let Some(error) = apply_copy_in_rows(session, copy) {
                     write_error(stream, &error)?;
                 } else {
                     write_command_complete(stream, &format!("COPY {copied}"))?;
                 }
-                write_ready_for_query(stream, session.in_transaction)?;
+                if ready_after_done {
+                    write_ready_for_query(stream, session.in_transaction)?;
+                }
             } else if !*extended_error_pending {
                 write_error(
                     stream,
@@ -4280,7 +4293,7 @@ fn handle_frontend_message(
             }
         }
         FrontendMessage::CopyFail(_) => {
-            if session.copy_in.take().is_some() {
+            if let Some(copy) = session.copy_in.take() {
                 write_error(
                     stream,
                     &ErrorField {
@@ -4289,7 +4302,11 @@ fn handle_frontend_message(
                         position: None,
                     },
                 )?;
-                write_ready_for_query(stream, session.in_transaction)?;
+                if copy.ready_after_done {
+                    write_ready_for_query(stream, session.in_transaction)?;
+                } else {
+                    *extended_error_pending = true;
+                }
             } else if !*extended_error_pending {
                 write_error(
                     stream,
@@ -4581,7 +4598,7 @@ fn handle_parse(
         )?;
         return Ok(true);
     }
-    if is_copy_statement(&query) {
+    if is_copy_statement(&query) && !is_supported_extended_copy(&query) {
         write_error(
             stream,
             &ErrorField {
@@ -4625,6 +4642,7 @@ fn handle_parse(
         && describe_extended_query_columns(session, &describe_query).is_none()
         && describe_extended_query_columns(session, &query).is_none()
         && !is_supported_extended_dml(session, &describe_query)
+        && !is_supported_extended_copy(&describe_query)
     {
         write_error(
             stream,
@@ -4858,6 +4876,14 @@ fn handle_execute(
     };
     if let Some((name, query)) = parse_declare_cursor(&bound_query) {
         return execute_declare_cursor(stream, session, name, &query);
+    }
+    if let Some((table, options)) = parse_copy_to_stdout_table(&bound_query) {
+        execute_copy_to_stdout(stream, session, &table, options)?;
+        return Ok(false);
+    }
+    if let Some((table, columns, options)) = parse_copy_from_stdin(&bound_query) {
+        begin_copy_from_stdin(stream, session, &table, columns, options, false)?;
+        return Ok(false);
     }
     if let Some((name, parameters)) = parse_sql_execute(&bound_query) {
         if session
@@ -5588,7 +5614,10 @@ fn describe_extended_query_columns(session: &Session, query: &str) -> Option<Vec
 }
 
 fn extended_query_result_column_count(session: &Session, query: &str) -> Option<usize> {
-    if parse_declare_cursor(query).is_some() || is_supported_extended_dml(session, query) {
+    if parse_declare_cursor(query).is_some()
+        || is_supported_extended_dml(session, query)
+        || is_supported_extended_copy(query)
+    {
         Some(0)
     } else {
         describe_extended_query_columns(session, query).map(|columns| columns.len())
@@ -6821,6 +6850,10 @@ fn parse_copy_target_and_options<'a>(
     parse_copy_options(options).map(|options| (table, options))
 }
 
+fn is_supported_extended_copy(query: &str) -> bool {
+    parse_copy_to_stdout_table(query).is_some() || parse_copy_from_stdin(query).is_some()
+}
+
 fn parse_copy_options(options: &str) -> Option<CopyOptions> {
     if options == "csv" {
         return Some(CopyOptions::CSV);
@@ -7308,6 +7341,7 @@ fn begin_copy_from_stdin(
     table_name: &str,
     requested_columns: Option<Vec<String>>,
     options: CopyOptions,
+    ready_after_done: bool,
 ) -> io::Result<()> {
     let Some(table) = session.tables.get(table_name) else {
         return write_error(
@@ -7363,6 +7397,7 @@ fn begin_copy_from_stdin(
         pending_text: String::new(),
         pending_rows: Vec::new(),
         seen_terminator: false,
+        ready_after_done,
     });
     write_copy_in_response(stream, table.columns.len())
 }
@@ -7551,7 +7586,7 @@ fn execute_statement(
         return execute_copy_to_stdout(stream, session, &table, options);
     }
     if let Some((table, columns, options)) = parse_copy_from_stdin(statement) {
-        return begin_copy_from_stdin(stream, session, &table, columns, options);
+        return begin_copy_from_stdin(stream, session, &table, columns, options, true);
     }
     if is_copy_statement(statement) {
         return write_error(
@@ -21870,6 +21905,324 @@ mod tests {
     }
 
     #[test]
+    fn extended_copy_to_stdout_emits_copyout_data_done_and_recovers() {
+        let mut session = Session::default();
+        session.tables.insert(
+            "people".to_string(),
+            Table {
+                oid: FIRST_USER_RELATION_OID,
+                name: "people".to_string(),
+                columns: vec![
+                    CatalogColumn {
+                        attnum: 1,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "id".to_string(),
+                            ty: SqlType::Int4,
+                            domain: None,
+                            default: None,
+                        },
+                    },
+                    CatalogColumn {
+                        attnum: 2,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "name".to_string(),
+                            ty: SqlType::Text,
+                            domain: None,
+                            default: None,
+                        },
+                    },
+                ],
+                rows: vec![
+                    vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())],
+                    vec![
+                        SqlValue::Int4(2),
+                        SqlValue::Text("Grace|Hopper".to_string()),
+                    ],
+                ],
+                check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+            },
+        );
+        let mut extended_error_pending = false;
+        let (mut writer, mut reader) = tcp_pair();
+
+        assert!(handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::Parse {
+                statement_name: "copy_out".to_string(),
+                query: "COPY people TO STDOUT WITH (FORMAT csv, HEADER, DELIMITER '|')".to_string(),
+                parameter_type_oids: Vec::new(),
+            }
+        )
+        .unwrap());
+        assert!(handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::Bind {
+                portal_name: "copy_out_portal".to_string(),
+                statement_name: "copy_out".to_string(),
+                parameter_format_codes: Vec::new(),
+                parameters: Vec::new(),
+                result_format_codes: Vec::new(),
+            }
+        )
+        .unwrap());
+        assert!(handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::Describe {
+                target: DescribeTarget::Portal,
+                name: "copy_out_portal".to_string(),
+            }
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 3), vec![b'1', b'2', b'n']);
+
+        assert!(handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::Execute {
+                portal_name: "copy_out_portal".to_string(),
+                max_rows: 0,
+            }
+        )
+        .unwrap());
+        let messages = read_backend_messages(&mut reader, 6);
+        assert_eq!(
+            messages.iter().map(|(tag, _)| *tag).collect::<Vec<_>>(),
+            vec![b'H', b'd', b'd', b'd', b'c', b'C']
+        );
+        assert_eq!(messages[1].1, b"id|name\n");
+        assert_eq!(messages[2].1, b"1|Ada\n");
+        assert_eq!(messages[3].1, b"2|\"Grace|Hopper\"\n");
+        assert_eq!(messages[5].1, b"COPY 2\0");
+
+        assert!(handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::Sync
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'Z']);
+
+        assert!(handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::SimpleQuery("SELECT name FROM people WHERE id = 2".to_string())
+        )
+        .unwrap());
+        assert_eq!(
+            read_backend_tags(&mut reader, 4),
+            vec![b'T', b'D', b'C', b'Z']
+        );
+    }
+
+    #[test]
+    fn extended_copy_from_stdin_accepts_data_and_copyfail_does_not_mutate() {
+        let mut session = Session::default();
+        session.tables.insert(
+            "people".to_string(),
+            Table {
+                oid: FIRST_USER_RELATION_OID,
+                name: "people".to_string(),
+                columns: vec![
+                    CatalogColumn {
+                        attnum: 1,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "id".to_string(),
+                            ty: SqlType::Int4,
+                            domain: None,
+                            default: None,
+                        },
+                    },
+                    CatalogColumn {
+                        attnum: 2,
+                        def: gpu_db_protocol::ColumnDef {
+                            name: "name".to_string(),
+                            ty: SqlType::Text,
+                            domain: None,
+                            default: None,
+                        },
+                    },
+                ],
+                rows: Vec::new(),
+                check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+            },
+        );
+        let mut extended_error_pending = false;
+        let (mut writer, mut reader) = tcp_pair();
+
+        assert!(handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::Parse {
+                statement_name: "copy_in".to_string(),
+                query: "COPY people (id, name) FROM STDIN WITH (FORMAT csv, HEADER, DELIMITER '|')"
+                    .to_string(),
+                parameter_type_oids: Vec::new(),
+            }
+        )
+        .unwrap());
+        assert!(handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::Bind {
+                portal_name: "copy_in_portal".to_string(),
+                statement_name: "copy_in".to_string(),
+                parameter_format_codes: Vec::new(),
+                parameters: Vec::new(),
+                result_format_codes: Vec::new(),
+            }
+        )
+        .unwrap());
+        assert!(handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::Execute {
+                portal_name: "copy_in_portal".to_string(),
+                max_rows: 0,
+            }
+        )
+        .unwrap());
+        let messages = read_backend_messages(&mut reader, 3);
+        assert_eq!(
+            messages.iter().map(|(tag, _)| *tag).collect::<Vec<_>>(),
+            vec![b'1', b'2', b'G']
+        );
+        assert!(session.copy_in.is_some());
+
+        assert!(handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::CopyData(b"id|name\n1|Ada\n".to_vec())
+        )
+        .unwrap());
+        assert!(handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::CopyFail("client aborted copy".to_string())
+        )
+        .unwrap());
+        let messages = read_backend_messages(&mut reader, 1);
+        assert_eq!(
+            messages.iter().map(|(tag, _)| *tag).collect::<Vec<_>>(),
+            vec![b'E']
+        );
+        assert_eq!(
+            error_field_value(&messages[0].1, b'C'),
+            Some("57014".to_string())
+        );
+        assert!(session.tables["people"].rows.is_empty());
+        assert!(extended_error_pending);
+
+        assert!(handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::Sync
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'Z']);
+        assert!(!extended_error_pending);
+
+        assert!(handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::Parse {
+                statement_name: "copy_in_retry".to_string(),
+                query: "COPY people (id, name) FROM STDIN WITH (FORMAT csv, HEADER, DELIMITER '|')"
+                    .to_string(),
+                parameter_type_oids: Vec::new(),
+            }
+        )
+        .unwrap());
+        assert!(handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::Bind {
+                portal_name: "copy_in_retry_portal".to_string(),
+                statement_name: "copy_in_retry".to_string(),
+                parameter_format_codes: Vec::new(),
+                parameters: Vec::new(),
+                result_format_codes: Vec::new(),
+            }
+        )
+        .unwrap());
+        assert!(handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::Execute {
+                portal_name: "copy_in_retry_portal".to_string(),
+                max_rows: 0,
+            }
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 3), vec![b'1', b'2', b'G']);
+
+        assert!(handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::CopyData(b"id|name\n1|Ada\n2|\"Grace|Hopper\"\n".to_vec())
+        )
+        .unwrap());
+        assert!(handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::CopyDone
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'C']);
+        assert!(handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::Sync
+        )
+        .unwrap());
+        assert_eq!(read_backend_tags(&mut reader, 1), vec![b'Z']);
+        assert_eq!(
+            session.tables["people"].rows,
+            vec![
+                vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())],
+                vec![
+                    SqlValue::Int4(2),
+                    SqlValue::Text("Grace|Hopper".to_string())
+                ],
+            ]
+        );
+
+        assert!(handle_frontend_message(
+            &mut writer,
+            &mut session,
+            &mut extended_error_pending,
+            FrontendMessage::SimpleQuery("SELECT name FROM people WHERE id = 2".to_string())
+        )
+        .unwrap());
+        assert_eq!(
+            read_backend_tags(&mut reader, 4),
+            vec![b'T', b'D', b'C', b'Z']
+        );
+    }
+
+    #[test]
     fn truncate_table_clears_rows_and_recovers() {
         let mut session = Session::default();
         session.tables.insert(
@@ -26006,7 +26359,7 @@ mod tests {
     }
 
     #[test]
-    fn extended_parse_rejects_copy_explicitly_without_installing_statement() {
+    fn extended_parse_rejects_unsupported_copy_explicitly_without_installing_statement() {
         let mut session = Session::default();
         let (mut writer, mut reader) = tcp_pair();
 
@@ -26014,7 +26367,7 @@ mod tests {
             &mut writer,
             &mut session,
             "copy_people".to_string(),
-            "/* comment */ COPY people TO STDOUT".to_string(),
+            "/* comment */ COPY (SELECT * FROM people) TO STDOUT".to_string(),
             Vec::new()
         )
         .unwrap());

@@ -2,6 +2,16 @@
 
 ## 2026-05-20
 
+- Added bounded extended-protocol COPY for the supported public `int4`/`text`
+  table COPY subset. The compatibility endpoint now accepts extended
+  `Parse`/`Bind`/`Describe`/`Execute` for `COPY [public.]table TO STDOUT` and
+  `COPY [public.]table [(columns)] FROM STDIN` with the existing text/CSV/header
+  and parenthesized delimiter/quote/escape options, keeps `Sync` quiet while
+  an extended CopyIn stream is active, preserves `CopyFail` no-mutation
+  recovery, and extends the checked `tokio-postgres` smoke through CopyIn and
+  prepared CopyOut. Binary COPY, query COPY, server file/program COPY, NULL/FORCE
+  options, and broader COPY grammar remain out of scope.
+
 - Added a local aggregate application-driver compatibility gate. `scripts/run_application_driver_smokes.sh`
   runs the checked-in `tokio-postgres`, `sqlx`, `node-postgres`, `asyncpg`, and
   `psycopg` app-shaped smokes against `gpu-db-server`, emits stable per-driver

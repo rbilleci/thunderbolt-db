@@ -3,7 +3,7 @@ CREATE TABLE
 CREATE TABLE
 INSERT 0 3
 INSERT 0 2
-psql:248_protocol_psql_fetch_count_extended_bind_gexec_copy_cleanup.sql:7: ERROR:  COPY is not supported by the compatibility endpoint
+psql:248_protocol_psql_fetch_count_extended_bind_gexec_copy_cleanup.sql:7: ERROR:  bind message has wrong number of parameters
 psql:248_protocol_psql_fetch_count_extended_bind_gexec_copy_cleanup.sql:9: ERROR:  cursor does not exist
                                 command
 -----------------------------------------------------------------------

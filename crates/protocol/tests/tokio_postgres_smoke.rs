@@ -3,6 +3,8 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use bytes::{Bytes, BytesMut};
+use futures_util::{pin_mut, stream, SinkExt, TryStreamExt};
 use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
 
 struct ServerGuard {
@@ -91,6 +93,52 @@ async fn tokio_postgres_supported_subset_smoke_with_unsupported_recovery(
 
     let empty_rows = client.query(&statement, &[&99_i32]).await?;
     assert!(empty_rows.is_empty());
+
+    let mut copy_stream = stream::iter(
+        vec![
+            Bytes::from_static(b"id|name\n"),
+            Bytes::from_static(b"4|Katherine\n5|\"Dorothy|Vaughan\"\n"),
+        ]
+        .into_iter()
+        .map(Ok::<_, tokio_postgres::Error>),
+    );
+    let copy_sink = client
+        .copy_in(
+            "COPY driver_people (id, name) FROM STDIN WITH (FORMAT csv, HEADER, DELIMITER '|')",
+        )
+        .await?;
+    pin_mut!(copy_sink);
+    copy_sink.send_all(&mut copy_stream).await?;
+    let copied = copy_sink.finish().await?;
+    assert_eq!(copied, 2);
+
+    let copied_rows = client
+        .query(
+            "SELECT id, name FROM driver_people WHERE id >= $1 ORDER BY id",
+            &[&4_i32],
+        )
+        .await?;
+    assert_eq!(copied_rows.len(), 2);
+    assert_eq!(copied_rows[0].get::<_, i32>(0), 4);
+    assert_eq!(copied_rows[0].get::<_, String>(1), "Katherine");
+    assert_eq!(copied_rows[1].get::<_, i32>(0), 5);
+    assert_eq!(copied_rows[1].get::<_, String>(1), "Dorothy|Vaughan");
+
+    let copy_out_statement = client
+        .prepare("COPY driver_people TO STDOUT WITH (FORMAT csv, HEADER, DELIMITER '|')")
+        .await?;
+    let copy_out = client
+        .copy_out(&copy_out_statement)
+        .await?
+        .try_fold(BytesMut::new(), |mut output, chunk| async move {
+            output.extend_from_slice(&chunk);
+            Ok(output)
+        })
+        .await?;
+    let copy_out = std::str::from_utf8(&copy_out)?;
+    assert!(copy_out.contains("id|name\n"));
+    assert!(copy_out.contains("4|Katherine\n"));
+    assert!(copy_out.contains("5|\"Dorothy|Vaughan\"\n"));
 
     let unsupported = client
         .simple_query("COPY driver_people FROM STDIN WITH CSV HEADER DELIMITER ','")
