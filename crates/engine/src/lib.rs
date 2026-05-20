@@ -6541,6 +6541,42 @@ pub struct RelationalResidencyRefreshCost {
     pub invalidated_by_memory_pressure: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RelationalResidencyWarmupPolicy {
+    pub gpu_id: Option<u16>,
+    pub tables: Vec<String>,
+    pub max_table_count: Option<usize>,
+    pub budget_bytes: Option<u64>,
+    pub refresh_invalidated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationalResidencyWarmupReport {
+    pub gpu_id: u16,
+    pub budget_bytes: Option<u64>,
+    pub requested_tables: Vec<String>,
+    pub entries: Vec<RelationalResidencyWarmupEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationalResidencyWarmupEntry {
+    pub table: String,
+    pub action: RelationalResidencyWarmupAction,
+    pub reason: String,
+    pub resident_bytes: u64,
+    pub evicted_tables: Vec<String>,
+    pub route_decision: Option<RelationalResidentRouteDecisionStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelationalResidencyWarmupAction {
+    Warmed,
+    Refreshed,
+    AlreadyResident,
+    Skipped,
+    Error,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RelationalAccessPath {
     FullTableScan,
@@ -17070,6 +17106,15 @@ impl Engine {
         &mut self,
         table: &str,
     ) -> Result<RelationalResidencySnapshot, ExecuteError> {
+        let gpu_id = self.planner.default_gpu_id();
+        self.populate_relational_residency_snapshot_on_gpu(table, gpu_id)
+    }
+
+    fn populate_relational_residency_snapshot_on_gpu(
+        &mut self,
+        table: &str,
+        gpu_id: u16,
+    ) -> Result<RelationalResidencySnapshot, ExecuteError> {
         let previous_snapshot = self.relational_resident_cache.snapshots.get(table).cloned();
         let catalog_table = self
             .relational_catalog
@@ -17167,7 +17212,6 @@ impl Engine {
             .copy_from_slice(&(row_count as u64).to_le_bytes());
         drop(cursor);
 
-        let gpu_id = self.planner.default_gpu_id();
         let memory_pressure_active = self
             .router
             .runtime()
@@ -17365,6 +17409,153 @@ impl Engine {
                     .contains(&snapshot.gpu_id);
                 snapshot
             })
+    }
+
+    pub fn warm_relational_residency_with_policy(
+        &mut self,
+        policy: RelationalResidencyWarmupPolicy,
+    ) -> RelationalResidencyWarmupReport {
+        let policy_sets_gpu = policy.gpu_id.is_some();
+        let gpu_id = policy
+            .gpu_id
+            .unwrap_or_else(|| self.planner.default_gpu_id());
+        let policy_sets_budget = policy.budget_bytes.is_some();
+        if let Some(budget_bytes) = policy.budget_bytes {
+            self.set_relational_residency_budget_bytes(gpu_id, budget_bytes);
+        }
+        let budget_bytes = self.relational_residency_budget_bytes(gpu_id);
+        let requested_tables = if policy.tables.is_empty() {
+            self.relational_catalog.keys().cloned().collect::<Vec<_>>()
+        } else {
+            policy.tables.clone()
+        };
+        let mut selected_tables = requested_tables.clone();
+        selected_tables.sort();
+        selected_tables.dedup();
+        if let Some(max_table_count) = policy.max_table_count {
+            selected_tables.truncate(max_table_count);
+        }
+
+        let memory_pressure_active = self
+            .router
+            .runtime()
+            .snapshot()
+            .memory_pressured_gpu_ids
+            .contains(&gpu_id);
+        let mut entries = Vec::new();
+        for table in selected_tables {
+            if memory_pressure_active {
+                entries.push(RelationalResidencyWarmupEntry {
+                    table,
+                    action: RelationalResidencyWarmupAction::Skipped,
+                    reason: format!("GPU {gpu_id} is memory pressured"),
+                    resident_bytes: 0,
+                    evicted_tables: Vec::new(),
+                    route_decision: None,
+                });
+                continue;
+            }
+            if !self.relational_catalog.contains_key(&table) {
+                entries.push(RelationalResidencyWarmupEntry {
+                    table: table.clone(),
+                    action: RelationalResidencyWarmupAction::Skipped,
+                    reason: "only supported public base tables can be warmed".to_string(),
+                    resident_bytes: 0,
+                    evicted_tables: Vec::new(),
+                    route_decision: None,
+                });
+                continue;
+            }
+
+            let existing = self.relational_residency_snapshot(&table);
+            let existing_valid = existing
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.is_valid());
+            let existing_retained = self
+                .relational_resident_cache
+                .device_memory
+                .contains_key(&table);
+            if existing_valid && existing_retained && !policy_sets_budget && !policy_sets_gpu {
+                let route_decision = self.warmup_route_readiness_decision(&table);
+                entries.push(RelationalResidencyWarmupEntry {
+                    table: table.clone(),
+                    action: RelationalResidencyWarmupAction::AlreadyResident,
+                    reason: "resident snapshot is already valid and retained".to_string(),
+                    resident_bytes: existing
+                        .as_ref()
+                        .map(|snapshot| snapshot.resident_bytes)
+                        .unwrap_or(0),
+                    evicted_tables: Vec::new(),
+                    route_decision,
+                });
+                continue;
+            }
+            if existing.is_some() && !policy.refresh_invalidated && !existing_valid {
+                entries.push(RelationalResidencyWarmupEntry {
+                    table: table.clone(),
+                    action: RelationalResidencyWarmupAction::Skipped,
+                    reason: "resident snapshot is invalidated and refresh is disabled".to_string(),
+                    resident_bytes: existing
+                        .as_ref()
+                        .map(|snapshot| snapshot.resident_bytes)
+                        .unwrap_or(0),
+                    evicted_tables: Vec::new(),
+                    route_decision: self.warmup_route_readiness_decision(&table),
+                });
+                continue;
+            }
+
+            let refreshing = existing.is_some();
+            match self.populate_relational_residency_snapshot_on_gpu(&table, gpu_id) {
+                Ok(snapshot) => {
+                    let route_decision = self.warmup_route_readiness_decision(&table);
+                    entries.push(RelationalResidencyWarmupEntry {
+                        table: table.clone(),
+                        action: if refreshing {
+                            RelationalResidencyWarmupAction::Refreshed
+                        } else {
+                            RelationalResidencyWarmupAction::Warmed
+                        },
+                        reason: self
+                            .relational_resident_cache
+                            .last_decision(&table)
+                            .map(|decision| decision.reason.clone())
+                            .unwrap_or_else(|| "resident snapshot warmed".to_string()),
+                        resident_bytes: snapshot.resident_bytes,
+                        evicted_tables: snapshot.evicted_tables_on_admission,
+                        route_decision,
+                    });
+                }
+                Err(err) => {
+                    entries.push(RelationalResidencyWarmupEntry {
+                        table: table.clone(),
+                        action: RelationalResidencyWarmupAction::Error,
+                        reason: err.to_string(),
+                        resident_bytes: 0,
+                        evicted_tables: Vec::new(),
+                        route_decision: self.warmup_route_readiness_decision(&table),
+                    });
+                }
+            }
+        }
+
+        RelationalResidencyWarmupReport {
+            gpu_id,
+            budget_bytes,
+            requested_tables,
+            entries,
+        }
+    }
+
+    fn warmup_route_readiness_decision(
+        &mut self,
+        table: &str,
+    ) -> Option<RelationalResidentRouteDecisionStatus> {
+        let sql = format!("SELECT COUNT(*) FROM {table}");
+        let Ok(Command::Select(select)) = parse_command(&sql) else {
+            return None;
+        };
+        Some(self.plan_relational_resident_route(&select))
     }
 
     fn relational_snapshot_cache_state(
@@ -22556,6 +22747,179 @@ mod tests {
                 .reason,
             pressured.reason
         );
+    }
+
+    #[test]
+    fn p8_resident_warmup_policy_warms_refreshes_and_reports_route_readiness() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE events (id INT, label TEXT)")
+            .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO events (id, label) VALUES (1, 'alpha'), (2, 'beta')",
+        )
+        .unwrap();
+
+        let report = e.warm_relational_residency_with_policy(RelationalResidencyWarmupPolicy {
+            tables: vec!["events".to_string()],
+            refresh_invalidated: true,
+            ..RelationalResidencyWarmupPolicy::default()
+        });
+        assert_eq!(report.gpu_id, 0);
+        assert_eq!(report.entries.len(), 1);
+        let entry = &report.entries[0];
+        assert_eq!(entry.table, "events");
+        assert_eq!(entry.action, RelationalResidencyWarmupAction::Warmed);
+        assert!(entry.resident_bytes > 0);
+        let route = entry.route_decision.as_ref().unwrap();
+        assert_eq!(route.query_shape, "count_all");
+        if route.has_retained_device_memory {
+            assert!(route.accepted);
+            let Command::Select(select) = parse_command("SELECT COUNT(*) FROM events").unwrap()
+            else {
+                unreachable!()
+            };
+            let result = e.execute_relational_select(&select).unwrap();
+            assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+            assert_eq!(result.fallback_reason, None);
+        } else {
+            assert!(!route.accepted);
+            assert_eq!(
+                route.reason,
+                "resident snapshot has no retained device memory"
+            );
+        }
+
+        e.execute_text(3, "INSERT INTO events (id, label) VALUES (3, 'gamma')")
+            .unwrap();
+        assert_eq!(
+            e.relational_residency_snapshot("events")
+                .unwrap()
+                .invalidated_by_txn_id,
+            Some(3)
+        );
+        let refreshed = e.warm_relational_residency_with_policy(RelationalResidencyWarmupPolicy {
+            tables: vec!["events".to_string()],
+            refresh_invalidated: true,
+            ..RelationalResidencyWarmupPolicy::default()
+        });
+        assert_eq!(
+            refreshed.entries[0].action,
+            RelationalResidencyWarmupAction::Refreshed
+        );
+        assert_eq!(
+            e.relational_residency_snapshot("events")
+                .unwrap()
+                .invalidated_by_txn_id,
+            None
+        );
+        assert_eq!(
+            e.status_snapshot()
+                .relational_residency
+                .latest_route_decision("events")
+                .unwrap()
+                .estimated_rows,
+            3
+        );
+
+        let gpu_override =
+            e.warm_relational_residency_with_policy(RelationalResidencyWarmupPolicy {
+                gpu_id: Some(7),
+                tables: vec!["events".to_string()],
+                refresh_invalidated: true,
+                ..RelationalResidencyWarmupPolicy::default()
+            });
+        assert_eq!(gpu_override.gpu_id, 7);
+        assert_eq!(e.relational_residency_snapshot("events").unwrap().gpu_id, 7);
+    }
+
+    #[test]
+    fn p8_resident_warmup_policy_applies_budget_and_skips_unsafe_inputs() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE events (id INT, label TEXT)")
+            .unwrap();
+        e.execute_text(2, "CREATE TABLE aux (id INT, label TEXT)")
+            .unwrap();
+        e.execute_text(3, "CREATE TABLE oversized (id INT, label TEXT)")
+            .unwrap();
+        e.execute_text(
+            4,
+            "INSERT INTO events (id, label) VALUES (1, 'alpha'), (2, 'beta')",
+        )
+        .unwrap();
+        e.execute_text(5, "INSERT INTO aux (id, label) VALUES (1, 'aux')")
+            .unwrap();
+        e.execute_text(
+            6,
+            "INSERT INTO oversized (id, label) VALUES (1, 'this-row-is-too-large-for-the-test-budget')",
+        )
+        .unwrap();
+
+        let events_size = e.populate_relational_residency_snapshot("events").unwrap();
+        let aux_size = e.populate_relational_residency_snapshot("aux").unwrap();
+        e.clear_relational_residency_budget_bytes(0);
+        let report = e.warm_relational_residency_with_policy(RelationalResidencyWarmupPolicy {
+            tables: vec![
+                "events".to_string(),
+                "aux".to_string(),
+                "missing".to_string(),
+            ],
+            budget_bytes: Some(events_size.resident_bytes),
+            refresh_invalidated: true,
+            ..RelationalResidencyWarmupPolicy::default()
+        });
+        assert_eq!(report.budget_bytes, Some(events_size.resident_bytes));
+        assert_eq!(report.entries.len(), 3);
+        assert!(report.entries.iter().any(|entry| entry.table == "missing"
+            && entry.action == RelationalResidencyWarmupAction::Skipped));
+        let events = report
+            .entries
+            .iter()
+            .find(|entry| entry.table == "events")
+            .unwrap();
+        assert!(matches!(
+            events.action,
+            RelationalResidencyWarmupAction::AlreadyResident
+                | RelationalResidencyWarmupAction::Warmed
+        ));
+        let aux = report
+            .entries
+            .iter()
+            .find(|entry| entry.table == "aux")
+            .unwrap();
+        assert!(matches!(
+            aux.action,
+            RelationalResidencyWarmupAction::Warmed
+                | RelationalResidencyWarmupAction::Refreshed
+                | RelationalResidencyWarmupAction::AlreadyResident
+        ));
+        assert!(aux_size.resident_bytes > 0);
+        assert!(e.status_snapshot().relational_residency.snapshot_count() <= 1);
+
+        let oversized = e.warm_relational_residency_with_policy(RelationalResidencyWarmupPolicy {
+            tables: vec!["oversized".to_string()],
+            budget_bytes: Some(1),
+            refresh_invalidated: true,
+            ..RelationalResidencyWarmupPolicy::default()
+        });
+        assert_eq!(
+            oversized.entries[0].action,
+            RelationalResidencyWarmupAction::Error
+        );
+        assert!(oversized.entries[0].reason.contains("exceeding GPU 0"));
+        assert!(e.relational_residency_snapshot("oversized").is_none());
+
+        e.mark_gpu_memory_pressured(0);
+        let pressured = e.warm_relational_residency_with_policy(RelationalResidencyWarmupPolicy {
+            tables: vec!["events".to_string()],
+            refresh_invalidated: true,
+            ..RelationalResidencyWarmupPolicy::default()
+        });
+        assert_eq!(
+            pressured.entries[0].action,
+            RelationalResidencyWarmupAction::Skipped
+        );
+        assert_eq!(pressured.entries[0].reason, "GPU 0 is memory pressured");
     }
 
     #[test]

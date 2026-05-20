@@ -393,9 +393,17 @@ The fourth P8 code slice integrates that same decision contract into
 `Engine::execute_relational_select(...)`: accepted retained-device-memory routes
 execute by default with zero per-query resident H2D transfer, while every
 rejected route falls back to the existing MVCC/CUDA-probe path. This is default
-planner routing for the bounded retained-kernel shapes only; automatic warmup,
-durable GPU pages, and a production background cache daemon remain outside the
-first P8 design.
+planner routing for the bounded retained-kernel shapes only.
+
+The fifth P8 code slice adds `Engine::warm_relational_residency_with_policy(...)`
+as a deterministic, operator-triggered warmup policy over supported public base
+tables. The policy can target named tables or the current base-table catalog,
+apply an optional per-GPU residency budget through `RelationalResidentCache`,
+refresh invalidated resident entries when requested, and report warmed,
+refreshed, already-resident, skipped, and error outcomes with route-readiness
+facts. This is bounded warmup/policy support, not a production background cache
+daemon: durable GPU pages, autonomous scheduling, external orchestration, and
+broader retained expressions remain outside the first P8 design.
 
 ## Non-Goals For The First P8 Design
 

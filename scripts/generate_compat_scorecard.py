@@ -84,7 +84,7 @@ def classify(test_id: str) -> list[str]:
         buckets.append("replication.operational_cluster")
     if re.search(r"replication|raft|snapshot|leader|follower", test_id):
         buckets.append("replication.role_and_log")
-    if re.search(r"gpu|fallback|batch", test_name):
+    if re.search(r"gpu|fallback|batch|resident_route|resident_warmup|residency", test_name):
         buckets.append("execution.gpu_routing_and_batching")
     if not buckets:
         buckets.append("uncategorized")
