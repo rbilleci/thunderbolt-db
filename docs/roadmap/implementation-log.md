@@ -2,6 +2,8 @@
 
 ## 2026-05-20
 
+- Added a combined local resilience drill with `scripts/run_local_resilience_drill.sh`. The drill runs the checked backup/PITR/DR gate and the checked replication deployment preflight, verifies both evidence contracts, reports the combined local restore/PITR/maintenance/object-bundle plus packaged-service/systemd/Kubernetes/Compose-restart replication envelope, and keeps physical page-image backup, production object storage, live scheduling, live systemd/Kubernetes rollout, and production failover orchestration explicit gaps.
+
 - Reconciled P8 timing source-of-truth wording after the first resident CUDA-event timing slice. Roadmap, README, and no-NVIDIA performance notes now distinguish implemented first accepted-route resident-kernel event samples from broader future CUDA event timing coverage, instead of implying that all driver-level timing publication remains unstarted.
 
 - Added the first P8 CUDA-event timing slice for resident retained-kernel execution. Retained CUDA resident-kernel launches now capture optional driver-event elapsed microseconds when the CUDA driver exposes event APIs, runtime metrics track event timing separately from existing kernel millisecond counters, and accepted resident route decisions expose the latest event timing while planned-only/rejected/fallback routes keep it empty.

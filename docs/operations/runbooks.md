@@ -73,6 +73,29 @@ Boundaries:
 - This is not a production object-storage integration.
 - This is not live background cleanup scheduling or production timeline failover orchestration.
 
+### 1d) Local Resilience Drill
+
+Run as the combined local game-day gate for the currently supported backup/PITR/DR and operational replication envelopes:
+
+```bash
+scripts/run_local_resilience_drill.sh
+```
+
+Pass criteria:
+
+- `local_resilience_drill=passed`
+- Backup/PITR/DR drill evidence includes `backup_pitr_dr_drill=passed`.
+- Replication deployment preflight evidence includes `operational_replication_deployment_preflight=passed`.
+- The output names the remaining physical backup, production object-storage, live scheduling, live systemd/Kubernetes rollout, and production timeline-failover gaps.
+
+Boundaries:
+
+- This is an aggregate local verification command over existing checked gates.
+- This is not a physical page-image base-backup restore.
+- This is not a production object-storage integration.
+- This is not live systemd or Kubernetes rollout.
+- This is not live background scheduling or production timeline failover orchestration.
+
 ## 2) WAL Durability Incident (Flush Failure)
 
 Symptoms:
@@ -160,7 +183,8 @@ For the current single-node relational WAL segment proof:
 14. For scheduler-safe local maintenance cleanup, inspect `Engine::plan_durable_wal_archive_maintenance_cleanup(...)`, then apply `Engine::apply_durable_wal_archive_maintenance_cleanup(...)`; the dry-run validates checkpoint-backed PITR-window archive retention and registered-timeline pruning together before mutation, so stale timeline sidecars or corrupt branch archives reject the whole cleanup before archive retention changes are installed. Operators can run the checked preflight with `cargo run -p gpu_db_engine --example wal_archive_maintenance_preflight -- --control <CONTROL> --archive-manifest <MANIFEST> --timeline-registry <TIMELINE_REGISTRY> --retain-timeline <timeline> --current-timestamp-micros <now> --pitr-window-micros <window> --recover-retained`, add `--apply` only after reviewing the dry-run evidence, and use `scripts/run_wal_archive_maintenance_preflight_smoke.sh` as the local regression gate. A successful apply performs the validated archive retention, prunes the local timeline registry to the retained target plus ancestors, and preserves `Engine::recover_from_registered_durable_wal_archive_timeline(...)` for the retained target.
 15. For local object-bundle backup proof, export a validated archive with `Engine::export_durable_wal_archive_object_backup(...)` and restore it with `Engine::restore_durable_wal_archive_object_backup(...)`; restore verifies every manifest/segment object length and checksum, cross-checks the manifest object bytes against the backup manifest metadata, stages restored segment files until every object verifies, and then installs the restored archive manifest. Operators can run the checked preflight with `cargo run -p gpu_db_engine --example wal_archive_object_backup_preflight -- --archive-manifest <MANIFEST> --backup-manifest <BACKUP> --object-dir <OBJECT_DIR> --restored-manifest <RESTORED_MANIFEST> --restored-segment-dir <RESTORED_SEGMENTS> --recover-timestamp-micros <target>`, use `--restore-only` to verify an existing backup manifest/object directory, and use `scripts/run_wal_archive_object_backup_preflight_smoke.sh` as the local regression gate for export/restore/recover evidence plus corrupt-object rejection-before-install.
 16. For the recurring local DR drill, run `scripts/run_backup_pitr_dr_drill.sh`; it aggregates the focused base-plus-archive restore tests, checkpoint PITR-window retention tests, scheduler-safe maintenance preflight, object-bundle backup preflight, and MVCC retention boundary tests into one operator gate.
-17. Treat physical page-image base backups, production object-storage APIs, automated production timeline failover orchestration beyond local registered-target selection/pruning, and live background cleanup scheduling as not yet implemented.
+17. For a combined local resilience game-day gate, run `scripts/run_local_resilience_drill.sh`; it runs the local backup/PITR/DR drill and the local replication deployment preflight, verifies both evidence contracts, and reports the combined supported scope.
+18. Treat physical page-image base backups, production object-storage APIs, automated production timeline failover orchestration beyond local registered-target selection/pruning, live systemd/Kubernetes rollout, and live background cleanup scheduling as not yet implemented.
 
 Failure criteria:
 

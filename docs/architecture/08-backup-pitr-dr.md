@@ -83,6 +83,7 @@ This document defines operational resilience strategy and implementation boundar
 ### Required recurring tests
 - Backup restore verification through `scripts/run_backup_pitr_dr_drill.sh`
 - PITR drill to exact transaction and timestamp target points through the same local drill
+- Combined local resilience game day through `scripts/run_local_resilience_drill.sh`, which runs the backup/PITR/DR drill plus the replication deployment preflight and verifies both evidence contracts
 - Follower catch-up from snapshot + log tail
 - Leader failover drill
 - Regional DR rehearsal (tabletop + technical)
