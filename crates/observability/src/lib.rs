@@ -153,6 +153,7 @@ pub struct RelationalResidentRouteDecisionStatus {
     pub refresh_resident_bytes: Option<u64>,
     pub h2d_bytes_if_resident: u64,
     pub h2d_bytes_if_cold: u64,
+    pub d2h_bytes_estimate: u64,
     pub d2h_rows_estimate: usize,
 }
 
@@ -801,6 +802,7 @@ mod tests {
                 refresh_resident_bytes: None,
                 h2d_bytes_if_resident: 0,
                 h2d_bytes_if_cold: 128,
+                d2h_bytes_estimate: 8,
                 d2h_rows_estimate: 1,
             }],
             resident_bytes_by_gpu: BTreeMap::from([(0, 192)]),

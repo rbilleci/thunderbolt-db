@@ -100,6 +100,10 @@ fn run() -> Result<(), String> {
                 "entry.route.h2d_bytes_if_resident={}",
                 route.h2d_bytes_if_resident
             );
+            println!(
+                "entry.route.d2h_bytes_estimate={}",
+                route.d2h_bytes_estimate
+            );
             println!("entry.route.d2h_rows_estimate={}", route.d2h_rows_estimate);
         } else {
             println!("entry.route.accepted=none");

@@ -2,6 +2,8 @@
 
 ## 2026-05-20
 
+- Refined P8 resident-route transfer observability. `RelationalResidentRouteDecisionStatus` now exposes a conservative `d2h_bytes_estimate` alongside the existing D2H row estimate, resident/cold H2D estimates, cache state, refresh bytes, and route accept/reject facts. Default resident execution and the checked `resident_warmup_preflight` operator surface now report the same byte estimate without changing supported SQL shapes or production cache-orchestration boundaries.
+
 - Added an operator-facing P8 resident warmup preflight. The checked
   `resident_warmup_preflight` example exercises
   `Engine::warm_relational_residency_with_policy(...)` as a local dry-run/apply

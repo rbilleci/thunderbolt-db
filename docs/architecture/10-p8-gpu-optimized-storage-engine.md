@@ -318,7 +318,7 @@ reason and cost facts visible and fall back to the existing MVCC/CUDA-probe
 path: absent/invalid/evicted snapshots, missing retained device memory,
 unsupported relation kinds, unsupported query shapes, resident bytes, budget
 bytes, refresh bytes, cold H2D bytes, zero resident H2D bytes, and estimated D2H
-rows. The current accepted retained-kernel family covers bounded counts,
+bytes/rows. The current accepted retained-kernel family covers bounded counts,
 count predicates, scalar and grouped aggregates, range-predicate projections,
 same-column filtered ordered projections, and int4 distinct projections,
 including the bounded same-column filtered distinct form.
@@ -410,7 +410,8 @@ tables. The policy can target named tables or the current base-table catalog,
 apply an optional per-GPU residency budget through `RelationalResidentCache`,
 refresh invalidated resident entries when requested, and report warmed,
 refreshed, already-resident, skipped, and error outcomes with route-readiness
-facts. The checked `resident_warmup_preflight` example and
+facts, including conservative D2H byte estimates for the default readiness
+route. The checked `resident_warmup_preflight` example and
 `scripts/run_p8_resident_warmup_preflight_smoke.sh` package that API as a local
 operator dry-run/apply gate, including invalidated-entry refresh,
 memory-pressure skip, oversized-budget rejection, and default-route readiness

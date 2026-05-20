@@ -6990,6 +6990,52 @@ fn resident_route_d2h_rows_estimate(select: &Select, resident_row_count: usize) 
     }
 }
 
+fn resident_route_d2h_bytes_estimate(
+    select: &Select,
+    query_shape: &str,
+    snapshot: &RelationalResidencySnapshot,
+) -> u64 {
+    const COUNT_RESULT_BYTES: u64 = std::mem::size_of::<u64>() as u64;
+    const I32_RESULT_BYTES: u64 = std::mem::size_of::<i32>() as u64;
+    const RESULT_LEN_BYTES: u64 = std::mem::size_of::<u64>() as u64;
+    const GROUPED_STATS_BYTES: u64 = (std::mem::size_of::<i32>()
+        + std::mem::size_of::<u64>()
+        + std::mem::size_of::<i64>()
+        + (2 * std::mem::size_of::<i32>())) as u64;
+
+    let rows = resident_route_d2h_rows_estimate(select, snapshot.row_count);
+    let row_bytes = |bytes_per_row: u64| {
+        u64::try_from(rows)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(bytes_per_row)
+            .saturating_add(RESULT_LEN_BYTES)
+    };
+    let resident_row_bytes = |bytes_per_row: u64| {
+        u64::try_from(snapshot.row_count)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(bytes_per_row)
+            .saturating_add(RESULT_LEN_BYTES)
+    };
+
+    match query_shape {
+        "text_prefix_like_count" => snapshot.resident_bytes,
+        "int4_grouped_aggregate" | "int4_filtered_grouped_aggregate" => {
+            row_bytes(GROUPED_STATS_BYTES)
+        }
+        "int4_projection" | "int4_ordered_projection" => row_bytes(I32_RESULT_BYTES),
+        "int4_distinct_projection" | "int4_filtered_distinct_projection" => {
+            resident_row_bytes(I32_RESULT_BYTES)
+        }
+        "int4_scalar_aggregate"
+        | "int4_filtered_scalar_aggregate"
+        | "int4_between_scalar_aggregate" => GROUPED_STATS_BYTES.saturating_add(RESULT_LEN_BYTES),
+        "count_all" | "int4_equality_count" | "int4_range_count" | "int4_filter_group_count" => {
+            COUNT_RESULT_BYTES
+        }
+        _ => 0,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct RelationalIndexKey {
     table: String,
@@ -17840,6 +17886,7 @@ impl Engine {
             refresh_resident_bytes: None,
             h2d_bytes_if_resident: 0,
             h2d_bytes_if_cold: 0,
+            d2h_bytes_estimate: 0,
             d2h_rows_estimate: 0,
         }
     }
@@ -17914,6 +17961,7 @@ impl Engine {
             .relational_resident_cache
             .device_memory
             .contains_key(&table.name);
+        let d2h_bytes_estimate = resident_route_d2h_bytes_estimate(select, &query_shape, snapshot);
         let mut decision = RelationalResidentRouteDecisionStatus {
             table: table.name.clone(),
             gpu_id: Some(snapshot.gpu_id),
@@ -17932,6 +17980,7 @@ impl Engine {
                 .map(|cost| cost.refreshed_resident_bytes),
             h2d_bytes_if_resident: 0,
             h2d_bytes_if_cold: snapshot.resident_bytes,
+            d2h_bytes_estimate,
             d2h_rows_estimate: resident_route_d2h_rows_estimate(select, snapshot.row_count),
         };
 
@@ -22753,6 +22802,7 @@ mod tests {
         assert!(!absent.accepted);
         assert_eq!(absent.reason, "relation has no resident snapshot");
         assert_eq!(absent.query_shape, "count_all");
+        assert_eq!(absent.d2h_bytes_estimate, 0);
 
         let snapshot = e.populate_relational_residency_snapshot("events").unwrap();
         let decision = e.plan_relational_resident_route(&count_select);
@@ -22765,6 +22815,10 @@ mod tests {
         assert_eq!(decision.resident_bytes, snapshot.resident_bytes);
         assert_eq!(decision.h2d_bytes_if_resident, 0);
         assert_eq!(decision.h2d_bytes_if_cold, snapshot.resident_bytes);
+        assert_eq!(
+            decision.d2h_bytes_estimate,
+            std::mem::size_of::<u64>() as u64
+        );
         assert_eq!(decision.d2h_rows_estimate, 1);
         if snapshot.device_memory_proof.is_some() {
             assert!(decision.accepted);
@@ -22804,6 +22858,7 @@ mod tests {
         let unsupported = e.plan_relational_resident_route(&unsupported);
         assert!(!unsupported.accepted);
         assert_eq!(unsupported.query_shape, "unsupported_select");
+        assert_eq!(unsupported.d2h_bytes_estimate, 0);
         assert_eq!(
             unsupported.reason,
             "resident routing has no retained-kernel proof for this SELECT shape"
@@ -22905,14 +22960,63 @@ mod tests {
                 0,
                 "{sql}"
             );
+            let route_decision = e
+                .status_snapshot()
+                .relational_residency
+                .latest_route_decision("events")
+                .unwrap()
+                .clone();
+            let expected_d2h_bytes = match route_decision.query_shape.as_str() {
+                "count_all" | "int4_equality_count" | "int4_range_count" | "int4_filter_group_count" => {
+                    std::mem::size_of::<u64>() as u64
+                }
+                "text_prefix_like_count" => e
+                    .relational_residency_snapshot("events")
+                    .unwrap()
+                    .resident_bytes,
+                "int4_scalar_aggregate"
+                | "int4_filtered_scalar_aggregate"
+                | "int4_between_scalar_aggregate" => {
+                    (std::mem::size_of::<i32>()
+                        + std::mem::size_of::<u64>()
+                        + std::mem::size_of::<i64>()
+                        + (2 * std::mem::size_of::<i32>())
+                        + std::mem::size_of::<u64>()) as u64
+                }
+                "int4_grouped_aggregate" | "int4_filtered_grouped_aggregate" => route_decision
+                    .d2h_rows_estimate
+                    .checked_mul(
+                        std::mem::size_of::<i32>()
+                            + std::mem::size_of::<u64>()
+                            + std::mem::size_of::<i64>()
+                            + (2 * std::mem::size_of::<i32>()),
+                    )
+                    .and_then(|bytes| bytes.checked_add(std::mem::size_of::<u64>()))
+                    .and_then(|bytes| u64::try_from(bytes).ok())
+                    .unwrap_or(u64::MAX),
+                "int4_projection" | "int4_ordered_projection" => route_decision
+                    .d2h_rows_estimate
+                    .checked_mul(std::mem::size_of::<i32>())
+                    .and_then(|bytes| bytes.checked_add(std::mem::size_of::<u64>()))
+                    .and_then(|bytes| u64::try_from(bytes).ok())
+                    .unwrap_or(u64::MAX),
+                "int4_distinct_projection" | "int4_filtered_distinct_projection" => e
+                    .relational_residency_snapshot("events")
+                    .unwrap()
+                    .row_count
+                    .checked_mul(std::mem::size_of::<i32>())
+                    .and_then(|bytes| bytes.checked_add(std::mem::size_of::<u64>()))
+                    .and_then(|bytes| u64::try_from(bytes).ok())
+                    .unwrap_or(u64::MAX),
+                other => panic!("unexpected resident route shape {other} for {sql}"),
+            };
+            assert_eq!(
+                route_decision.d2h_bytes_estimate, expected_d2h_bytes,
+                "{sql}"
+            );
             assert!(
                 matches!(
-                    e.status_snapshot()
-                        .relational_residency
-                        .latest_route_decision("events")
-                        .unwrap()
-                        .query_shape
-                        .as_str(),
+                    route_decision.query_shape.as_str(),
                     "count_all"
                         | "int4_equality_count"
                         | "int4_range_count"
