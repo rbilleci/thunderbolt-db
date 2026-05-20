@@ -2379,6 +2379,7 @@ struct Session {
     tables: HashMap<String, Table>,
     views: HashMap<String, View>,
     materialized_views: HashMap<String, MaterializedView>,
+    functions: BTreeMap<String, FunctionInfo>,
     sequences: HashMap<String, Sequence>,
     domains: BTreeMap<String, Domain>,
     publications: BTreeMap<String, Publication>,
@@ -2399,6 +2400,7 @@ struct Session {
     dirty_tables: BTreeSet<String>,
     dirty_views: BTreeSet<String>,
     dirty_materialized_views: BTreeSet<String>,
+    dirty_functions: BTreeSet<String>,
     dirty_sequences: BTreeSet<String>,
     dirty_domains: BTreeSet<String>,
     dirty_publications: BTreeSet<String>,
@@ -2424,6 +2426,7 @@ struct SharedCatalog {
     tables: HashMap<String, Table>,
     views: HashMap<String, View>,
     materialized_views: HashMap<String, MaterializedView>,
+    functions: BTreeMap<String, FunctionInfo>,
     sequences: HashMap<String, Sequence>,
     domains: BTreeMap<String, Domain>,
     publications: BTreeMap<String, Publication>,
@@ -2449,6 +2452,7 @@ impl Default for SharedCatalog {
             tables: HashMap::new(),
             views: HashMap::new(),
             materialized_views: HashMap::new(),
+            functions: BTreeMap::new(),
             sequences: HashMap::new(),
             domains: BTreeMap::new(),
             publications: BTreeMap::new(),
@@ -2498,6 +2502,7 @@ impl Session {
             tables: catalog.tables,
             views: catalog.views,
             materialized_views: catalog.materialized_views,
+            functions: catalog.functions,
             sequences: catalog.sequences,
             domains: catalog.domains,
             publications: catalog.publications,
@@ -2518,6 +2523,7 @@ impl Session {
             dirty_tables: BTreeSet::new(),
             dirty_views: BTreeSet::new(),
             dirty_materialized_views: BTreeSet::new(),
+            dirty_functions: BTreeSet::new(),
             dirty_sequences: BTreeSet::new(),
             dirty_domains: BTreeSet::new(),
             dirty_publications: BTreeSet::new(),
@@ -2549,6 +2555,10 @@ impl Session {
 
     fn mark_materialized_view_dirty(&mut self, view: impl Into<String>) {
         self.dirty_materialized_views.insert(view.into());
+    }
+
+    fn mark_function_dirty(&mut self, function: impl Into<String>) {
+        self.dirty_functions.insert(function.into());
     }
 
     fn mark_sequence_dirty(&mut self, sequence: impl Into<String>) {
@@ -2612,6 +2622,7 @@ impl Session {
             self.dirty_tables.clear();
             self.dirty_views.clear();
             self.dirty_materialized_views.clear();
+            self.dirty_functions.clear();
             self.dirty_sequences.clear();
             self.dirty_domains.clear();
             self.dirty_publications.clear();
@@ -2652,6 +2663,15 @@ impl Session {
                     .insert(view_name.clone(), view.clone());
             } else {
                 catalog.materialized_views.remove(view_name);
+            }
+        }
+        for function_name in &self.dirty_functions {
+            if let Some(function) = self.functions.get(function_name) {
+                catalog
+                    .functions
+                    .insert(function_name.clone(), function.clone());
+            } else {
+                catalog.functions.remove(function_name);
             }
         }
         for sequence_name in &self.dirty_sequences {
@@ -2796,6 +2816,7 @@ impl Session {
         self.dirty_tables.clear();
         self.dirty_views.clear();
         self.dirty_materialized_views.clear();
+        self.dirty_functions.clear();
         self.dirty_sequences.clear();
         self.dirty_domains.clear();
         self.dirty_publications.clear();
@@ -2884,6 +2905,14 @@ struct MaterializedView {
     definition: String,
     columns: Vec<CatalogColumn>,
     rows: Vec<Vec<SqlValue>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FunctionInfo {
+    oid: u32,
+    name: String,
+    return_type: SqlType,
+    body: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3751,6 +3780,7 @@ enum CatalogCommentTarget {
     Index { index: String },
     View { view: String },
     MaterializedView { materialized_view: String },
+    Function { function: String },
     Sequence { sequence: String },
     Domain { domain: String },
     Publication { publication: String },
@@ -7755,6 +7785,7 @@ fn execute_statement(
                 | CatalogCommentTarget::Tablespace { .. }
                 | CatalogCommentTarget::View { .. }
                 | CatalogCommentTarget::MaterializedView { .. }
+                | CatalogCommentTarget::Function { .. }
                 | CatalogCommentTarget::Sequence { .. }
                 | CatalogCommentTarget::Domain { .. }
                 | CatalogCommentTarget::Publication { .. }
@@ -8445,6 +8476,7 @@ fn execute_statement(
                 if !session.tables.is_empty()
                     || !session.views.is_empty()
                     || !session.materialized_views.is_empty()
+                    || !session.functions.is_empty()
                     || !session.sequences.is_empty()
                     || !session.domains.is_empty()
                     || !session.publications.is_empty()
@@ -9468,6 +9500,42 @@ fn execute_statement(
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, "ALTER MATERIALIZED VIEW");
             }
+            Command::CreateFunction(create) => {
+                if session.functions.contains_key(&create.name) {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "42723",
+                            message: "function already exists with same argument types",
+                            position: None,
+                        },
+                    );
+                }
+                let oid = session.next_relation_oid;
+                let Some(next_oid) = session.next_relation_oid.checked_add(1) else {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "54000",
+                            message: "function OID allocation exhausted",
+                            position: None,
+                        },
+                    );
+                };
+                session.next_relation_oid = next_oid;
+                session.functions.insert(
+                    create.name.clone(),
+                    FunctionInfo {
+                        oid,
+                        name: create.name.clone(),
+                        return_type: create.return_type,
+                        body: create.body,
+                    },
+                );
+                session.mark_function_dirty(create.name);
+                session.persist_catalog_snapshot();
+                return write_command_complete(stream, "CREATE FUNCTION");
+            }
             Command::CreateSequence(create) => {
                 if session.tables.contains_key(&create.name)
                     || session.views.contains_key(&create.name)
@@ -9760,6 +9828,28 @@ fn execute_statement(
                 }
                 session.persist_catalog_snapshot();
                 return write_command_complete(stream, "DROP MATERIALIZED VIEW");
+            }
+            Command::DropFunction(drop) => {
+                if !drop.if_exists && !session.functions.contains_key(&drop.name) {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "42883",
+                            message: "function does not exist",
+                            position: None,
+                        },
+                    );
+                }
+                if session.functions.remove(&drop.name).is_some() {
+                    let target = CatalogCommentTarget::Function {
+                        function: drop.name.clone(),
+                    };
+                    session.comments.remove(&target);
+                    session.mark_comment_dirty(target);
+                }
+                session.mark_function_dirty(drop.name);
+                session.persist_catalog_snapshot();
+                return write_command_complete(stream, "DROP FUNCTION");
             }
             Command::DropSequence(drop) => {
                 let mut seen = BTreeSet::new();
@@ -10164,6 +10254,7 @@ fn execute_statement(
                         | CatalogCommentTarget::Tablespace { .. }
                         | CatalogCommentTarget::View { .. }
                         | CatalogCommentTarget::MaterializedView { .. }
+                        | CatalogCommentTarget::Function { .. }
                         | CatalogCommentTarget::Sequence { .. }
                         | CatalogCommentTarget::Domain { .. }
                         | CatalogCommentTarget::Publication { .. }
@@ -10223,6 +10314,7 @@ fn execute_statement(
                             | CatalogCommentTarget::Index { .. }
                             | CatalogCommentTarget::View { .. }
                             | CatalogCommentTarget::MaterializedView { .. }
+                            | CatalogCommentTarget::Function { .. }
                             | CatalogCommentTarget::Sequence { .. }
                             | CatalogCommentTarget::Domain { .. }
                             | CatalogCommentTarget::Publication { .. }
@@ -10612,6 +10704,19 @@ fn execute_statement(
                             );
                         }
                         CatalogCommentTarget::MaterializedView { materialized_view }
+                    }
+                    CommentTarget::Function { function } => {
+                        if !session.functions.contains_key(&function) {
+                            return write_error(
+                                stream,
+                                &ErrorField {
+                                    code: "42883",
+                                    message: "function does not exist",
+                                    position: None,
+                                },
+                            );
+                        }
+                        CatalogCommentTarget::Function { function }
                     }
                     CommentTarget::Sequence { sequence } => {
                         let exists = session.sequences.contains_key(&sequence)
@@ -11374,7 +11479,52 @@ fn execute_statement(
                 text_column("Argument data types"),
                 text_column("Type"),
             ],
-            &catalog_empty_rows(),
+            &psql_describe_function_rows(session),
+        );
+    }
+    if canonical.starts_with("select n.nspname as \"schema\", p.proname as \"name\", pg_catalog.pg_get_function_result(p.oid) as \"result data type\"")
+        && canonical.contains("p.provolatile")
+        && canonical.contains("from pg_catalog.pg_proc p")
+    {
+        return write_single_row(
+            stream,
+            &[
+                text_column("Schema"),
+                text_column("Name"),
+                text_column("Result data type"),
+                text_column("Argument data types"),
+                text_column("Type"),
+                text_column("Volatility"),
+                text_column("Parallel"),
+                text_column("Owner"),
+                text_column("Security"),
+                text_column("Access privileges"),
+                text_column("Language"),
+                text_column("Internal name"),
+                text_column("Description"),
+            ],
+            &psql_describe_function_verbose_rows(session),
+        );
+    }
+    if canonical == "select p.oid, n.nspname, p.proname, p.prorettype, pg_catalog.pg_get_function_result(p.oid), p.prosrc from pg_catalog.pg_proc p join pg_catalog.pg_namespace n on n.oid = p.pronamespace where n.nspname = 'public' order by p.proname" {
+        return write_single_row(
+            stream,
+            &[
+                int4_column("oid"),
+                text_column("nspname"),
+                text_column("proname"),
+                int4_column("prorettype"),
+                text_column("pg_get_function_result"),
+                text_column("prosrc"),
+            ],
+            &pg_catalog_function_rows(session),
+        );
+    }
+    if canonical == "select p.proname, d.description from pg_catalog.pg_proc p join pg_catalog.pg_namespace n on n.oid = p.pronamespace join pg_catalog.pg_description d on d.objoid = p.oid where n.nspname = 'public' order by p.proname" {
+        return write_single_row(
+            stream,
+            &[text_column("proname"), text_column("description")],
+            &pg_catalog_function_description_rows(session),
         );
     }
     if canonical == psql_list_aggregates_catalog_query() {
@@ -17055,6 +17205,87 @@ fn psql_describe_sequence_verbose_rows(session: &Session) -> Vec<Vec<Option<Stri
     rows
 }
 
+fn psql_describe_function_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut rows = session
+        .functions
+        .values()
+        .map(|function| {
+            vec![
+                Some("public".to_string()),
+                Some(function.name.clone()),
+                Some(sql_type_display_name(function.return_type).to_string()),
+                None,
+                Some("func".to_string()),
+            ]
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| left[1].cmp(&right[1]));
+    rows
+}
+
+fn psql_describe_function_verbose_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut rows = session
+        .functions
+        .values()
+        .map(|function| {
+            vec![
+                Some("public".to_string()),
+                Some(function.name.clone()),
+                Some(sql_type_display_name(function.return_type).to_string()),
+                None,
+                Some("func".to_string()),
+                Some("volatile".to_string()),
+                Some("unsafe".to_string()),
+                Some("postgres".to_string()),
+                Some("invoker".to_string()),
+                None,
+                Some("sql".to_string()),
+                None,
+                session
+                    .comments
+                    .get(&CatalogCommentTarget::Function {
+                        function: function.name.clone(),
+                    })
+                    .cloned(),
+            ]
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| left[1].cmp(&right[1]));
+    rows
+}
+
+fn pg_catalog_function_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut rows = session
+        .functions
+        .values()
+        .map(|function| {
+            vec![
+                Some(function.oid.to_string()),
+                Some("public".to_string()),
+                Some(function.name.clone()),
+                Some(function.return_type.postgres_oid().to_string()),
+                Some(sql_type_display_name(function.return_type).to_string()),
+                Some(function.body.clone()),
+            ]
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| left[2].cmp(&right[2]));
+    rows
+}
+
+fn pg_catalog_function_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut rows = Vec::new();
+    for function in session.functions.values() {
+        if let Some(description) = session.comments.get(&CatalogCommentTarget::Function {
+            function: function.name.clone(),
+        }) {
+            rows.push(vec![Some(function.name.clone()), Some(description.clone())]);
+        }
+    }
+    rows.sort_by(|left, right| left[0].cmp(&right[0]));
+    rows
+}
+
 fn pg_catalog_constraints_query() -> &'static str {
     "select n.nspname, c.relname, con.conname, con.contype from pg_catalog.pg_constraint con join pg_catalog.pg_class c on c.oid = con.conrelid join pg_catalog.pg_namespace n on n.oid = c.relnamespace where n.nspname = 'public' order by c.relname, con.conname"
 }
@@ -17458,6 +17689,20 @@ fn pg_dump_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
             ]);
         }
     }
+    let mut functions = session.functions.values().collect::<Vec<_>>();
+    functions.sort_by(|left, right| left.name.cmp(&right.name));
+    for function in functions {
+        if let Some(description) = session.comments.get(&CatalogCommentTarget::Function {
+            function: function.name.clone(),
+        }) {
+            rows.push(vec![
+                Some("public".to_string()),
+                Some(function.name.clone()),
+                Some("function".to_string()),
+                Some(description.clone()),
+            ]);
+        }
+    }
     let mut publications = session.publications.values().collect::<Vec<_>>();
     publications.sort_by_key(|publication| publication.oid);
     for publication in publications {
@@ -17499,6 +17744,7 @@ fn pg_dump_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
             | CatalogCommentTarget::Column { .. }
             | CatalogCommentTarget::View { .. }
             | CatalogCommentTarget::MaterializedView { .. }
+            | CatalogCommentTarget::Function { .. }
             | CatalogCommentTarget::Sequence { .. }
             | CatalogCommentTarget::Domain { .. }
             | CatalogCommentTarget::Publication { .. }
@@ -17532,6 +17778,7 @@ fn pg_dump_description_rows(session: &Session) -> Vec<Vec<Option<String>>> {
             | CatalogCommentTarget::Column { .. }
             | CatalogCommentTarget::View { .. }
             | CatalogCommentTarget::MaterializedView { .. }
+            | CatalogCommentTarget::Function { .. }
             | CatalogCommentTarget::Sequence { .. }
             | CatalogCommentTarget::Domain { .. }
             | CatalogCommentTarget::Publication { .. }

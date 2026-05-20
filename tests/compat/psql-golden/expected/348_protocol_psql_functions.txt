@@ -1,0 +1,36 @@
+CREATE FUNCTION
+COMMENT
+                        List of functions
+ Schema |  Name  | Result data type | Argument data types | Type
+--------+--------+------------------+---------------------+------
+ public | answer | integer          |                     | func
+(1 row)
+
+                                                                                   List of functions
+ Schema |  Name  | Result data type | Argument data types | Type | Volatility | Parallel |  Owner   | Security | Access privileges | Language | Internal name |      Description
+--------+--------+------------------+---------------------+------+------------+----------+----------+----------+-------------------+----------+---------------+------------------------
+ public | answer | integer          |                     | func | volatile   | unsafe   | postgres | invoker  |                   | sql      |               | metadata-only function
+(1 row)
+
+  oid  | nspname | proname | prorettype | pg_get_function_result |  prosrc
+-------+---------+---------+------------+------------------------+-----------
+ 16384 | public  | answer  |         23 | integer                | SELECT 42
+(1 row)
+
+ proname |      description
+---------+------------------------
+ answer  | metadata-only function
+(1 row)
+
+psql:348_protocol_psql_functions.sql:16: ERROR:  function already exists with same argument types
+psql:348_protocol_psql_functions.sql:17: ERROR:  query shape is not supported by the compatibility stub
+psql:348_protocol_psql_functions.sql:18: ERROR:  query shape is not supported by the compatibility stub
+psql:348_protocol_psql_functions.sql:19: ERROR:  query shape is not supported by the compatibility stub
+psql:348_protocol_psql_functions.sql:20: ERROR:  function does not exist
+psql:348_protocol_psql_functions.sql:21: ERROR:  function does not exist
+DROP FUNCTION
+DROP FUNCTION
+                       List of functions
+ Schema | Name | Result data type | Argument data types | Type
+--------+------+------------------+---------------------+------
+(0 rows)

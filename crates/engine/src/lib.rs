@@ -105,6 +105,8 @@ impl ReplicatedStateMachine for KvStateMachine {
                     | Command::CreateMaterializedView(_)
                     | Command::RefreshMaterializedView(_)
                     | Command::RenameMaterializedView(_)
+                    | Command::CreateFunction(_)
+                    | Command::DropFunction(_)
                     | Command::CreateExtension(_)
                     | Command::CreateSequence(_)
                     | Command::CreateDomain(_)
@@ -5988,6 +5990,7 @@ pub struct Engine {
     relational_catalog: BTreeMap<String, RelationalTable>,
     relational_views: BTreeMap<String, RelationalView>,
     relational_materialized_views: BTreeMap<String, RelationalMaterializedView>,
+    relational_functions: BTreeMap<String, RelationalFunction>,
     relational_sequences: BTreeMap<String, RelationalSequence>,
     relational_domains: BTreeMap<String, RelationalDomain>,
     relational_publications: BTreeMap<String, RelationalPublication>,
@@ -6092,6 +6095,15 @@ pub struct RelationalMaterializedView {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationalFunction {
+    pub schema: String,
+    pub name: String,
+    pub oid: u32,
+    pub return_type: SqlType,
+    pub body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelationalSequence {
     pub schema: String,
     pub name: String,
@@ -6159,6 +6171,7 @@ pub enum RelationalCommentTarget {
     Index { index: String },
     View { view: String },
     MaterializedView { materialized_view: String },
+    Function { function: String },
     Sequence { sequence: String },
     Domain { domain: String },
     Publication { publication: String },
@@ -7500,6 +7513,7 @@ impl Engine {
             relational_catalog: BTreeMap::new(),
             relational_views: BTreeMap::new(),
             relational_materialized_views: BTreeMap::new(),
+            relational_functions: BTreeMap::new(),
             relational_sequences: BTreeMap::new(),
             relational_domains: BTreeMap::new(),
             relational_publications: BTreeMap::new(),
@@ -7780,6 +7794,8 @@ impl Engine {
             Command::RenameMaterializedView(rename) => {
                 self.apply_rename_materialized_view(rename)?
             }
+            Command::CreateFunction(create) => self.apply_create_function(create)?,
+            Command::DropFunction(drop) => self.apply_drop_function(drop)?,
             Command::CreateSequence(create) => self.apply_create_sequence(create)?,
             Command::CreateDomain(create) => self.apply_create_domain(create)?,
             Command::SequenceNextVal(nextval) => {
@@ -8047,6 +8063,51 @@ impl Engine {
         Ok(())
     }
 
+    fn apply_create_function(
+        &mut self,
+        create: gpu_db_protocol::CreateFunction,
+    ) -> Result<(), EngineError> {
+        if self.relational_functions.contains_key(&create.name) {
+            return Err(EngineError::ApplyFailed(format!(
+                "function \"{}\" already exists",
+                create.name
+            )));
+        }
+        let oid = self.relational_next_oid;
+        self.relational_next_oid = self.relational_next_oid.checked_add(1).ok_or_else(|| {
+            EngineError::ApplyFailed("relational function OID allocation exhausted".to_string())
+        })?;
+        self.relational_functions.insert(
+            create.name.clone(),
+            RelationalFunction {
+                schema: PUBLIC_SCHEMA_NAME.to_string(),
+                name: create.name,
+                oid,
+                return_type: create.return_type,
+                body: create.body,
+            },
+        );
+        Ok(())
+    }
+
+    fn apply_drop_function(
+        &mut self,
+        drop: gpu_db_protocol::DropFunction,
+    ) -> Result<(), EngineError> {
+        if !drop.if_exists && !self.relational_functions.contains_key(&drop.name) {
+            return Err(EngineError::ApplyFailed(format!(
+                "function \"{}\" does not exist",
+                drop.name
+            )));
+        }
+        self.relational_functions.remove(&drop.name);
+        self.relational_comments
+            .remove(&RelationalCommentTarget::Function {
+                function: drop.name,
+            });
+        Ok(())
+    }
+
     fn apply_create_sequence(&mut self, create: CreateSequence) -> Result<(), EngineError> {
         if self.relational_catalog.contains_key(&create.name)
             || self.relational_views.contains_key(&create.name)
@@ -8295,6 +8356,7 @@ impl Engine {
         if !self.relational_catalog.is_empty()
             || !self.relational_views.is_empty()
             || !self.relational_materialized_views.is_empty()
+            || !self.relational_functions.is_empty()
             || !self.relational_sequences.is_empty()
             || !self.relational_domains.is_empty()
             || !self.relational_publications.is_empty()
@@ -9559,6 +9621,7 @@ impl Engine {
                 | RelationalCommentTarget::Tablespace { .. }
                 | RelationalCommentTarget::View { .. }
                 | RelationalCommentTarget::MaterializedView { .. }
+                | RelationalCommentTarget::Function { .. }
                 | RelationalCommentTarget::Sequence { .. }
                 | RelationalCommentTarget::Domain { .. }
                 | RelationalCommentTarget::Publication { .. }
@@ -10816,6 +10879,15 @@ impl Engine {
                 }
                 RelationalCommentTarget::MaterializedView { materialized_view }
             }
+            CommentTarget::Function { function } => {
+                if !self.relational_functions.contains_key(&function) {
+                    return Err(EngineError::ApplyFailed(format!(
+                        "function \"{}\" does not exist",
+                        function
+                    )));
+                }
+                RelationalCommentTarget::Function { function }
+            }
             CommentTarget::Sequence { sequence } => {
                 if !self.relational_sequences.contains_key(&sequence) {
                     if self.relational_catalog.contains_key(&sequence)
@@ -11645,6 +11717,7 @@ impl Engine {
                     && (!self.relational_catalog.is_empty()
                         || !self.relational_views.is_empty()
                         || !self.relational_materialized_views.is_empty()
+                        || !self.relational_functions.is_empty()
                         || !self.relational_sequences.is_empty()
                         || !self.relational_domains.is_empty()
                         || !self.relational_publications.is_empty()
@@ -12247,6 +12320,33 @@ impl Engine {
                     )));
                 }
             }
+            Command::CreateFunction(create)
+                if self.relational_functions.contains_key(&create.name) =>
+            {
+                return Err(EngineError::ApplyFailed(format!(
+                    "function \"{}\" already exists",
+                    create.name
+                )));
+            }
+            Command::DropFunction(drop)
+                if !drop.if_exists && !self.relational_functions.contains_key(&drop.name) =>
+            {
+                return Err(EngineError::ApplyFailed(format!(
+                    "function \"{}\" does not exist",
+                    drop.name
+                )));
+            }
+            Command::CreateFunction(_) | Command::DropFunction(_) => {}
+            Command::CommentOn(comment) => {
+                if let CommentTarget::Function { function } = &comment.target {
+                    if !self.relational_functions.contains_key(function) {
+                        return Err(EngineError::ApplyFailed(format!(
+                            "function \"{}\" does not exist",
+                            function
+                        )));
+                    }
+                }
+            }
             Command::CreateSequence(create) => self.preflight_create_sequence(create)?,
             Command::CreateDomain(create) => self.preflight_create_domain(create)?,
             Command::SequenceNextVal(nextval) => self.preflight_sequence_target(&nextval.name)?,
@@ -12756,6 +12856,8 @@ impl Engine {
             | Command::CreateMaterializedView(_)
             | Command::RefreshMaterializedView(_)
             | Command::RenameMaterializedView(_)
+            | Command::CreateFunction(_)
+            | Command::DropFunction(_)
             | Command::CreateSequence(_)
             | Command::CreateDomain(_)
             | Command::SequenceNextVal(_)
@@ -13002,6 +13104,8 @@ impl Engine {
             | Command::CreateMaterializedView(_)
             | Command::RefreshMaterializedView(_)
             | Command::RenameMaterializedView(_)
+            | Command::CreateFunction(_)
+            | Command::DropFunction(_)
             | Command::CreateSequence(_)
             | Command::CreateDomain(_)
             | Command::SequenceNextVal(_)
@@ -13156,6 +13260,8 @@ impl Engine {
             Command::RenameMaterializedView(_) => {
                 Err(ExecuteError::NonReadCommand("ALTER MATERIALIZED VIEW"))
             }
+            Command::CreateFunction(_) => Err(ExecuteError::NonReadCommand("CREATE FUNCTION")),
+            Command::DropFunction(_) => Err(ExecuteError::NonReadCommand("DROP FUNCTION")),
             Command::CreateSequence(_) => Err(ExecuteError::NonReadCommand("CREATE SEQUENCE")),
             Command::CreateDomain(_) => Err(ExecuteError::NonReadCommand("CREATE DOMAIN")),
             Command::SequenceNextVal(_) => Err(ExecuteError::NonReadCommand("SELECT nextval")),
@@ -16334,6 +16440,10 @@ impl Engine {
         self.relational_materialized_views.get(materialized_view)
     }
 
+    pub fn relational_catalog_function(&self, function: &str) -> Option<&RelationalFunction> {
+        self.relational_functions.get(function)
+    }
+
     pub fn relational_catalog_sequence(&self, sequence: &str) -> Option<&RelationalSequence> {
         self.relational_sequences.get(sequence)
     }
@@ -16463,6 +16573,14 @@ impl Engine {
         self.relational_comments
             .get(&RelationalCommentTarget::MaterializedView {
                 materialized_view: materialized_view.to_string(),
+            })
+            .map(String::as_str)
+    }
+
+    pub fn relational_function_comment(&self, function: &str) -> Option<&str> {
+        self.relational_comments
+            .get(&RelationalCommentTarget::Function {
+                function: function.to_string(),
             })
             .map(String::as_str)
     }
@@ -39299,6 +39417,70 @@ mod tests {
             missing.contains("domain \"missing_domain\" does not exist"),
             "{missing}"
         );
+    }
+
+    #[test]
+    fn relational_catalog_records_bounded_functions_and_replays_from_wal() {
+        let mut e = Engine::new_local();
+        e.execute_text(
+            1,
+            "CREATE FUNCTION public.answer() RETURNS int4 LANGUAGE sql AS 'SELECT 42'",
+        )
+        .unwrap();
+        e.execute_text(2, "COMMENT ON FUNCTION public.answer() IS 'metadata only'")
+            .unwrap();
+
+        let function = e.relational_catalog_function("answer").unwrap();
+        assert_eq!(function.name, "answer");
+        assert_eq!(function.return_type, SqlType::Int4);
+        assert_eq!(function.body, "SELECT 42");
+        let oid = function.oid;
+        assert_eq!(
+            e.relational_function_comment("answer"),
+            Some("metadata only")
+        );
+
+        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let recovered_function = recovered.relational_catalog_function("answer").unwrap();
+        assert_eq!(recovered_function.oid, oid);
+        assert_eq!(recovered_function.return_type, SqlType::Int4);
+        assert_eq!(
+            recovered.relational_function_comment("answer"),
+            Some("metadata only")
+        );
+
+        let duplicate = e
+            .execute_text(
+                3,
+                "CREATE FUNCTION public.answer() RETURNS text LANGUAGE sql AS 'SELECT ''x'''",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            duplicate.contains("function \"answer\" already exists"),
+            "{duplicate}"
+        );
+        let missing_comment = e
+            .execute_text(4, "COMMENT ON FUNCTION missing() IS 'missing'")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            missing_comment.contains("function \"missing\" does not exist"),
+            "{missing_comment}"
+        );
+        let missing_drop = e
+            .execute_text(5, "DROP FUNCTION missing()")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            missing_drop.contains("function \"missing\" does not exist"),
+            "{missing_drop}"
+        );
+        e.execute_text(6, "DROP FUNCTION IF EXISTS missing()")
+            .unwrap();
+        e.execute_text(7, "DROP FUNCTION answer()").unwrap();
+        assert!(e.relational_catalog_function("answer").is_none());
+        assert_eq!(e.relational_function_comment("answer"), None);
     }
 
     #[test]

@@ -35,6 +35,8 @@ pub enum Command {
     CreateMaterializedView(CreateMaterializedView),
     RefreshMaterializedView(RefreshMaterializedView),
     RenameMaterializedView(RenameMaterializedView),
+    CreateFunction(CreateFunction),
+    DropFunction(DropFunction),
     CreateExtension(CreateExtension),
     CreateSequence(CreateSequence),
     CreateDomain(CreateDomain),
@@ -268,6 +270,19 @@ pub struct RenameMaterializedView {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateFunction {
+    pub name: String,
+    pub return_type: SqlType,
+    pub body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropFunction {
+    pub name: String,
+    pub if_exists: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateSequence {
     pub name: String,
 }
@@ -481,6 +496,7 @@ pub enum CommentTarget {
     Index { index: String },
     View { view: String },
     MaterializedView { materialized_view: String },
+    Function { function: String },
     Sequence { sequence: String },
     Domain { domain: String },
     Publication { publication: String },
@@ -2067,6 +2083,9 @@ fn parse_relational_command(input: &str) -> Option<Result<Command, ParseError>> 
                 );
             }
         }
+        if second.eq_ignore_ascii_case("FUNCTION") {
+            return Some(parse_create_function(input).map(Command::CreateFunction));
+        }
         if second.eq_ignore_ascii_case("SEQUENCE") {
             return Some(parse_create_sequence(input).map(Command::CreateSequence));
         }
@@ -2121,6 +2140,9 @@ fn parse_relational_command(input: &str) -> Option<Result<Command, ParseError>> 
                     parse_drop_materialized_view(input).map(Command::DropMaterializedView),
                 );
             }
+        }
+        if second.eq_ignore_ascii_case("FUNCTION") {
+            return Some(parse_drop_function(input).map(Command::DropFunction));
         }
         if second.eq_ignore_ascii_case("SEQUENCE") {
             return Some(parse_drop_sequence(input).map(Command::DropSequence));
@@ -2459,6 +2481,15 @@ fn parse_comment_on(input: &str) -> Result<CommentOn, ParseError> {
         let materialized_view = normalize_relation_identifier(rest[..is_pos].trim())?;
         (
             CommentTarget::MaterializedView { materialized_view },
+            rest[is_pos + "IS".len()..].trim(),
+        )
+    } else if let Some(rest) = strip_keyword_prefix_case_insensitive(rest, "FUNCTION") {
+        let rest = rest.trim_start();
+        let is_pos =
+            find_keyword_outside_quotes(rest, "IS").ok_or(ParseError::InvalidRelationalSql)?;
+        let function = normalize_function_signature(rest[..is_pos].trim())?;
+        (
+            CommentTarget::Function { function },
             rest[is_pos + "IS".len()..].trim(),
         )
     } else if let Some(rest) = strip_keyword_prefix_case_insensitive(rest, "SEQUENCE") {
@@ -3367,6 +3398,36 @@ fn parse_create_sequence(input: &str) -> Result<CreateSequence, ParseError> {
     }
     Ok(CreateSequence {
         name: normalize_relation_identifier(name)?,
+    })
+}
+
+fn parse_create_function(input: &str) -> Result<CreateFunction, ParseError> {
+    let rest = strip_keyword_prefix_case_insensitive(input, "CREATE")
+        .and_then(|s| strip_keyword_prefix_case_insensitive(s.trim_start(), "FUNCTION"))
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    let returns_pos =
+        find_keyword_outside_quotes(rest, "RETURNS").ok_or(ParseError::InvalidRelationalSql)?;
+    let name = normalize_function_signature(rest[..returns_pos].trim())?;
+    let rest = rest[returns_pos + "RETURNS".len()..].trim_start();
+    let language_pos =
+        find_keyword_outside_quotes(rest, "LANGUAGE").ok_or(ParseError::InvalidRelationalSql)?;
+    let return_type = parse_supported_sql_type_name(rest[..language_pos].trim())
+        .ok_or(ParseError::InvalidRelationalSql)?;
+    let rest = rest[language_pos + "LANGUAGE".len()..].trim_start();
+    let as_pos = find_keyword_outside_quotes(rest, "AS").ok_or(ParseError::InvalidRelationalSql)?;
+    let language = normalize_identifier(rest[..as_pos].trim())?;
+    if language != "sql" {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let body = match parse_sql_value(rest[as_pos + "AS".len()..].trim())? {
+        SqlValue::Text(value) => value,
+        _ => return Err(ParseError::InvalidRelationalSql),
+    };
+    Ok(CreateFunction {
+        name,
+        return_type,
+        body,
     })
 }
 
@@ -4866,11 +4927,54 @@ fn parse_drop_domain(input: &str) -> Result<DropDomain, ParseError> {
     })
 }
 
+fn parse_drop_function(input: &str) -> Result<DropFunction, ParseError> {
+    let mut rest = strip_keyword_prefix_case_insensitive(input, "DROP")
+        .and_then(|s| strip_keyword_prefix_case_insensitive(s.trim_start(), "FUNCTION"))
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    let if_exists = if let Some(after_if) = strip_keyword_prefix_case_insensitive(rest, "IF") {
+        let after_exists = strip_keyword_prefix_case_insensitive(after_if.trim_start(), "EXISTS")
+            .ok_or(ParseError::InvalidRelationalSql)?;
+        rest = after_exists.trim_start();
+        true
+    } else {
+        false
+    };
+    if rest.is_empty()
+        || find_keyword_outside_quotes(rest, "CASCADE").is_some()
+        || find_keyword_outside_quotes(rest, "RESTRICT").is_some()
+    {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let functions = split_csv(rest)?;
+    if functions.len() != 1 {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    Ok(DropFunction {
+        name: normalize_function_signature(functions[0].trim())?,
+        if_exists,
+    })
+}
+
 fn split_optional_create_index_method(target: &str) -> Option<(&str, &str)> {
     let using_pos = find_keyword_outside_quotes(target, "USING")?;
     let table = target[..using_pos].trim();
     let method = target[using_pos + "USING".len()..].trim();
     (!table.is_empty() && !method.is_empty()).then_some((table, method))
+}
+
+fn normalize_function_signature(signature: &str) -> Result<String, ParseError> {
+    let signature = signature.trim();
+    let open = signature
+        .find('(')
+        .ok_or(ParseError::InvalidRelationalSql)?;
+    let close = signature
+        .rfind(')')
+        .ok_or(ParseError::InvalidRelationalSql)?;
+    if close != signature.len() - 1 || !signature[open + 1..close].trim().is_empty() {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    normalize_relation_identifier(signature[..open].trim())
 }
 
 fn parse_supported_sql_type_name(input: &str) -> Option<SqlType> {
@@ -14787,6 +14891,60 @@ default: Some(ColumnDefault::SequenceNextVal {
         ));
         assert!(matches!(
             parse_command("DROP DOMAIN account_id CASCADE"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+    }
+
+    #[test]
+    fn parses_bounded_function_catalog_ddl() {
+        assert_eq!(
+            parse_command(
+                "CREATE FUNCTION public.answer() RETURNS int4 LANGUAGE sql AS 'SELECT 42'"
+            )
+            .unwrap(),
+            Command::CreateFunction(CreateFunction {
+                name: "answer".to_string(),
+                return_type: SqlType::Int4,
+                body: "SELECT 42".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_command("COMMENT ON FUNCTION public.answer() IS 'metadata only'").unwrap(),
+            Command::CommentOn(CommentOn {
+                target: CommentTarget::Function {
+                    function: "answer".to_string(),
+                },
+                comment: Some("metadata only".to_string()),
+            })
+        );
+        assert_eq!(
+            parse_command("DROP FUNCTION IF EXISTS public.answer()").unwrap(),
+            Command::DropFunction(DropFunction {
+                name: "answer".to_string(),
+                if_exists: true,
+            })
+        );
+
+        assert!(matches!(
+            parse_command(
+                "CREATE FUNCTION public.echo(int4) RETURNS int4 LANGUAGE sql AS 'SELECT $1'"
+            ),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command(
+                "CREATE FUNCTION public.answer() RETURNS bigint LANGUAGE sql AS 'SELECT 42'"
+            ),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command(
+                "CREATE FUNCTION public.answer() RETURNS int4 LANGUAGE plpgsql AS 'BEGIN END'"
+            ),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command("DROP FUNCTION public.answer() CASCADE"),
             Err(ParseError::InvalidRelationalSql)
         ));
     }
