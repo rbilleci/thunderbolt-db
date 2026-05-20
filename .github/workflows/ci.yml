@@ -50,6 +50,12 @@ jobs:
             --output docs/compatibility/scorecard.latest.json \
             --markdown docs/compatibility/scorecard.latest.md \
             --baseline docs/compatibility/scorecard.baseline.json
+      - name: assert compatibility scorecard is checked in
+        if: always()
+        run: |
+          git diff --exit-code -- \
+            docs/compatibility/scorecard.latest.json \
+            docs/compatibility/scorecard.latest.md
       - name: upload compatibility scorecard artifact
         if: always()
         uses: actions/upload-artifact@v4
