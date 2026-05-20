@@ -8,7 +8,10 @@
   full preflight log under `target/release-candidate-evidence/`, verifies the
   required explicit remaining-gap lines, and emits a tarball path with SHA-256
   checksum for release review handoff without expanding SQL/protocol/catalog,
-  driver, CUDA, or production-orchestration support.
+  driver, CUDA, or production-orchestration support. Added
+  `scripts/run_local_release_candidate_evidence_bundle_smoke.sh` as the fast
+  wrapper self-check for manifest/log/gap/tarball/checksum packaging and
+  dirty-worktree override behavior using a deterministic fake preflight.
 
 - Added privilege-aware pg-dump/pg-restore coverage for bounded public ACL metadata.
   The compatibility endpoint now handles PostgreSQL 16 pg-dump column-ACL and

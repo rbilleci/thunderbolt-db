@@ -179,11 +179,23 @@ Pass criteria:
 - The evidence directory contains `manifest.env`, `local-release-candidate-preflight.log`, and `remaining-gaps.env`.
 - The embedded top-level preflight evidence includes `local_release_candidate_preflight=passed` plus the required blocked/open gap lines.
 
+Fast wrapper self-check:
+
+```bash
+scripts/run_local_release_candidate_evidence_bundle_smoke.sh
+```
+
+The smoke uses a deterministic fake preflight with
+`LOCAL_RELEASE_CANDIDATE_EVIDENCE_ALLOW_DIRTY=1` and verifies only packaging
+mechanics: manifest, preflight log, remaining-gap file, tarball contents,
+checksum, and dirty-worktree override behavior.
+
 Boundaries:
 
 - This is a release-review packaging wrapper around the existing local release-candidate preflight.
 - By default the wrapper requires a clean git worktree so the evidence maps to a reproducible HEAD.
 - Set `LOCAL_RELEASE_CANDIDATE_EVIDENCE_ALLOW_DIRTY=1` only for wrapper development smoke tests.
+- The smoke does not prove the full local release-candidate preflight; it proves wrapper packaging behavior only.
 - This does not add SQL/protocol/catalog behavior, CUDA runtime coverage, driver support, or production orchestration.
 
 ## 2) WAL Durability Incident (Flush Failure)
@@ -276,7 +288,7 @@ For the current single-node relational WAL segment proof:
 17. For a combined local resilience game-day gate, run `scripts/run_local_resilience_drill.sh`; it runs the local backup/PITR/DR drill and the local replication deployment preflight, verifies both evidence contracts, and reports the combined supported scope.
 18. For a local PostgreSQL-compatible product preflight, run `scripts/run_local_product_preflight.sh`; it runs the checked application-driver gate, pg_dump/pg_restore gate including bounded public ACL/default-privilege restore, and local resilience drill, verifies stable evidence from each, and reports the current supported envelope plus blocked/open gaps.
 19. For a top-level local release-candidate preflight, run `scripts/run_local_release_candidate_preflight.sh`; it runs the local validation preflight, PostgreSQL-compatible product preflight, and GPU residency preflight, verifies all three evidence contracts, and reports the combined local supported envelope plus blocked/open gaps.
-20. For an attachable local release-candidate evidence bundle, run `scripts/run_local_release_candidate_evidence_bundle.sh`; it captures git/tooling facts, the full top-level preflight log, remaining-gap lines, and a tarball checksum under `target/release-candidate-evidence/`.
+20. For an attachable local release-candidate evidence bundle, run `scripts/run_local_release_candidate_evidence_bundle.sh`; it captures git/tooling facts, the full top-level preflight log, remaining-gap lines, and a tarball checksum under `target/release-candidate-evidence/`. For fast wrapper-only checks, run `scripts/run_local_release_candidate_evidence_bundle_smoke.sh`.
 21. Treat physical page-image base backups, production object-storage APIs, automated production timeline failover orchestration beyond local registered-target selection/pruning, live systemd/Kubernetes rollout, and live background cleanup scheduling as not yet implemented.
 
 Failure criteria:
