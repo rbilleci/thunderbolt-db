@@ -53,6 +53,10 @@ pub enum Command {
     RenameRole(RenameRole),
     GrantTable(GrantTable),
     RevokeTable(RevokeTable),
+    GrantDatabase(DatabasePrivileges),
+    RevokeDatabase(DatabasePrivileges),
+    GrantTablespace(TablespacePrivileges),
+    RevokeTablespace(TablespacePrivileges),
     GrantSchema(SchemaPrivileges),
     RevokeSchema(SchemaPrivileges),
     GrantDefaultTablePrivileges(DefaultTablePrivileges),
@@ -369,6 +373,17 @@ pub enum SchemaPrivilege {
     Create,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DatabasePrivilege {
+    Connect,
+    Temporary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TablespacePrivilege {
+    Create,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrantTable {
     pub relation: String,
@@ -390,6 +405,20 @@ pub struct SchemaPrivileges {
     pub schema: String,
     pub grantee: String,
     pub privileges: Vec<SchemaPrivilege>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatabasePrivileges {
+    pub database: String,
+    pub grantee: String,
+    pub privileges: Vec<DatabasePrivilege>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TablespacePrivileges {
+    pub tablespace: String,
+    pub grantee: String,
+    pub privileges: Vec<TablespacePrivilege>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2202,11 +2231,23 @@ fn parse_relational_command(input: &str) -> Option<Result<Command, ParseError>> 
         if parse_grant_schema(input).is_ok() {
             return Some(parse_grant_schema(input).map(Command::GrantSchema));
         }
+        if parse_grant_database(input).is_ok() {
+            return Some(parse_grant_database(input).map(Command::GrantDatabase));
+        }
+        if parse_grant_tablespace(input).is_ok() {
+            return Some(parse_grant_tablespace(input).map(Command::GrantTablespace));
+        }
         return Some(parse_grant_table(input).map(Command::GrantTable));
     }
     if first.eq_ignore_ascii_case("REVOKE") {
         if parse_revoke_schema(input).is_ok() {
             return Some(parse_revoke_schema(input).map(Command::RevokeSchema));
+        }
+        if parse_revoke_database(input).is_ok() {
+            return Some(parse_revoke_database(input).map(Command::RevokeDatabase));
+        }
+        if parse_revoke_tablespace(input).is_ok() {
+            return Some(parse_revoke_tablespace(input).map(Command::RevokeTablespace));
         }
         return Some(parse_revoke_table(input).map(Command::RevokeTable));
     }
@@ -4313,6 +4354,108 @@ fn parse_revoke_schema(input: &str) -> Result<SchemaPrivileges, ParseError> {
     })
 }
 
+fn parse_grant_database(input: &str) -> Result<DatabasePrivileges, ParseError> {
+    let (privileges, target, grantee) = parse_grant_acl_parts(input)?;
+    let database = parse_named_acl_target(target, "DATABASE")?;
+    Ok(DatabasePrivileges {
+        database,
+        grantee: parse_acl_grantee(grantee)?,
+        privileges: parse_database_privileges(privileges)?,
+    })
+}
+
+fn parse_revoke_database(input: &str) -> Result<DatabasePrivileges, ParseError> {
+    let (privileges, target, grantee) = parse_revoke_acl_parts(input)?;
+    let database = parse_named_acl_target(target, "DATABASE")?;
+    Ok(DatabasePrivileges {
+        database,
+        grantee: parse_acl_grantee(grantee)?,
+        privileges: parse_database_privileges(privileges)?,
+    })
+}
+
+fn parse_grant_tablespace(input: &str) -> Result<TablespacePrivileges, ParseError> {
+    let (privileges, target, grantee) = parse_grant_acl_parts(input)?;
+    let tablespace = parse_named_acl_target(target, "TABLESPACE")?;
+    Ok(TablespacePrivileges {
+        tablespace,
+        grantee: parse_acl_grantee(grantee)?,
+        privileges: parse_tablespace_privileges(privileges)?,
+    })
+}
+
+fn parse_revoke_tablespace(input: &str) -> Result<TablespacePrivileges, ParseError> {
+    let (privileges, target, grantee) = parse_revoke_acl_parts(input)?;
+    let tablespace = parse_named_acl_target(target, "TABLESPACE")?;
+    Ok(TablespacePrivileges {
+        tablespace,
+        grantee: parse_acl_grantee(grantee)?,
+        privileges: parse_tablespace_privileges(privileges)?,
+    })
+}
+
+fn parse_grant_acl_parts(input: &str) -> Result<(&str, &str, &str), ParseError> {
+    let rest = strip_keyword_prefix_case_insensitive(input, "GRANT")
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    if find_keyword_outside_quotes(rest, "WITH").is_some()
+        || find_keyword_outside_quotes(rest, "GRANT OPTION").is_some()
+    {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let on_idx = find_keyword_outside_quotes(rest, "ON").ok_or(ParseError::InvalidRelationalSql)?;
+    let (privileges, target_and_grantee) = rest.split_at(on_idx);
+    let target_and_grantee = strip_keyword_prefix_case_insensitive(target_and_grantee, "ON")
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    let to_idx = find_keyword_outside_quotes(target_and_grantee, "TO")
+        .ok_or(ParseError::InvalidRelationalSql)?;
+    let (target, grantee) = target_and_grantee.split_at(to_idx);
+    let grantee = strip_keyword_prefix_case_insensitive(grantee, "TO")
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim();
+    Ok((privileges, target, grantee))
+}
+
+fn parse_revoke_acl_parts(input: &str) -> Result<(&str, &str, &str), ParseError> {
+    let rest = strip_keyword_prefix_case_insensitive(input, "REVOKE")
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    if strip_keyword_prefix_case_insensitive(rest, "GRANT OPTION FOR").is_some()
+        || find_keyword_outside_quotes(rest, "GRANT OPTION").is_some()
+    {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let on_idx = find_keyword_outside_quotes(rest, "ON").ok_or(ParseError::InvalidRelationalSql)?;
+    let (privileges, target_and_grantee) = rest.split_at(on_idx);
+    let target_and_grantee = strip_keyword_prefix_case_insensitive(target_and_grantee, "ON")
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    let from_idx = find_keyword_outside_quotes(target_and_grantee, "FROM")
+        .ok_or(ParseError::InvalidRelationalSql)?;
+    let (target, grantee) = target_and_grantee.split_at(from_idx);
+    let grantee = strip_keyword_prefix_case_insensitive(grantee, "FROM")
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim();
+    Ok((privileges, target, grantee))
+}
+
+fn parse_named_acl_target(target: &str, keyword: &str) -> Result<String, ParseError> {
+    let name = strip_keyword_prefix_case_insensitive(target.trim(), keyword)
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    if name.is_empty()
+        || name.contains(',')
+        || find_keyword_outside_quotes(name, "TABLE").is_some()
+        || find_keyword_outside_quotes(name, "SCHEMA").is_some()
+        || find_keyword_outside_quotes(name, "DATABASE").is_some()
+        || find_keyword_outside_quotes(name, "TABLESPACE").is_some()
+    {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    normalize_identifier(name)
+}
+
 fn parse_acl_schema_target(target: &str) -> Result<String, ParseError> {
     let schema = strip_keyword_prefix_case_insensitive(target.trim(), "SCHEMA")
         .ok_or(ParseError::InvalidRelationalSql)?
@@ -4530,6 +4673,58 @@ fn parse_schema_privileges(input: &str) -> Result<Vec<SchemaPrivilege>, ParseErr
         let privilege = match token.trim().to_ascii_uppercase().as_str() {
             "USAGE" => SchemaPrivilege::Usage,
             "CREATE" => SchemaPrivilege::Create,
+            _ => return Err(ParseError::InvalidRelationalSql),
+        };
+        if !privileges.contains(&privilege) {
+            privileges.push(privilege);
+        }
+    }
+    if privileges.is_empty() {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    Ok(privileges)
+}
+
+fn parse_database_privileges(input: &str) -> Result<Vec<DatabasePrivilege>, ParseError> {
+    let trimmed = input.trim();
+    if trimmed.eq_ignore_ascii_case("ALL") || trimmed.eq_ignore_ascii_case("ALL PRIVILEGES") {
+        return Ok(vec![
+            DatabasePrivilege::Connect,
+            DatabasePrivilege::Temporary,
+        ]);
+    }
+    if trimmed.contains('(') || trimmed.contains(')') {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let mut privileges = Vec::new();
+    for token in split_csv(trimmed)? {
+        let privilege = match token.trim().to_ascii_uppercase().as_str() {
+            "CONNECT" => DatabasePrivilege::Connect,
+            "TEMP" | "TEMPORARY" => DatabasePrivilege::Temporary,
+            _ => return Err(ParseError::InvalidRelationalSql),
+        };
+        if !privileges.contains(&privilege) {
+            privileges.push(privilege);
+        }
+    }
+    if privileges.is_empty() {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    Ok(privileges)
+}
+
+fn parse_tablespace_privileges(input: &str) -> Result<Vec<TablespacePrivilege>, ParseError> {
+    let trimmed = input.trim();
+    if trimmed.eq_ignore_ascii_case("ALL") || trimmed.eq_ignore_ascii_case("ALL PRIVILEGES") {
+        return Ok(vec![TablespacePrivilege::Create]);
+    }
+    if trimmed.contains('(') || trimmed.contains(')') {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    let mut privileges = Vec::new();
+    for token in split_csv(trimmed)? {
+        let privilege = match token.trim().to_ascii_uppercase().as_str() {
+            "CREATE" => TablespacePrivilege::Create,
             _ => return Err(ParseError::InvalidRelationalSql),
         };
         if !privileges.contains(&privilege) {
@@ -12995,6 +13190,46 @@ default: Some(ColumnDefault::SequenceNextVal {
                 privileges: vec![TablePrivilege::Select],
             })
         );
+        assert_eq!(
+            parse_command("GRANT CONNECT, TEMPORARY ON DATABASE appdb TO app_reader").unwrap(),
+            Command::GrantDatabase(DatabasePrivileges {
+                database: "appdb".to_string(),
+                grantee: "app_reader".to_string(),
+                privileges: vec![DatabasePrivilege::Connect, DatabasePrivilege::Temporary],
+            })
+        );
+        assert_eq!(
+            parse_command("REVOKE TEMP ON DATABASE appdb FROM PUBLIC").unwrap(),
+            Command::RevokeDatabase(DatabasePrivileges {
+                database: "appdb".to_string(),
+                grantee: "public".to_string(),
+                privileges: vec![DatabasePrivilege::Temporary],
+            })
+        );
+        assert_eq!(
+            parse_command("GRANT ALL PRIVILEGES ON TABLESPACE appspace TO postgres").unwrap(),
+            Command::GrantTablespace(TablespacePrivileges {
+                tablespace: "appspace".to_string(),
+                grantee: "postgres".to_string(),
+                privileges: vec![TablespacePrivilege::Create],
+            })
+        );
+        assert_eq!(
+            parse_command("REVOKE CREATE ON TABLESPACE appspace FROM app_reader").unwrap(),
+            Command::RevokeTablespace(TablespacePrivileges {
+                tablespace: "appspace".to_string(),
+                grantee: "app_reader".to_string(),
+                privileges: vec![TablespacePrivilege::Create],
+            })
+        );
+        assert!(matches!(
+            parse_command("GRANT SELECT ON DATABASE appdb TO PUBLIC"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command("GRANT CREATE ON TABLESPACE appspace TO PUBLIC WITH GRANT OPTION"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
 
         assert_eq!(
             parse_command("CREATE INDEX people_name_idx ON public.people (name)").unwrap(),

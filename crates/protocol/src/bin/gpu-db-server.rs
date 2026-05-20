@@ -7,9 +7,9 @@ use std::thread;
 
 use gpu_db_protocol::{
     parse_command, parse_frontend_message, parse_startup_packet, AclRelationKind, ColumnDefault,
-    Command, CommentTarget, FrontendMessage, ParseError, PublicationTarget, SchemaPrivilege,
-    SelectFilter, SelectFilterOp, SelectProjection, SqlValue, StartupPacket, TablePrivilege,
-    SUPPORTED_SQL_TYPES,
+    Command, CommentTarget, DatabasePrivilege, FrontendMessage, ParseError, PublicationTarget,
+    SchemaPrivilege, SelectFilter, SelectFilterOp, SelectProjection, SqlValue, StartupPacket,
+    TablePrivilege, TablespacePrivilege, SUPPORTED_SQL_TYPES,
 };
 use gpu_db_protocol::{DescribeTarget, SqlType};
 
@@ -2391,6 +2391,8 @@ struct Session {
     currval_sequences: HashMap<String, i64>,
     indexes: Vec<CatalogIndex>,
     table_acls: BTreeMap<String, BTreeMap<String, BTreeSet<TablePrivilege>>>,
+    database_acls: BTreeMap<String, BTreeMap<String, BTreeSet<DatabasePrivilege>>>,
+    tablespace_acls: BTreeMap<String, BTreeMap<String, BTreeSet<TablespacePrivilege>>>,
     schema_acl: BTreeMap<String, BTreeSet<SchemaPrivilege>>,
     default_table_acl: BTreeMap<String, BTreeSet<TablePrivilege>>,
     comments: BTreeMap<CatalogCommentTarget, String>,
@@ -2407,6 +2409,8 @@ struct Session {
     dirty_schema: bool,
     dirty_indexes: bool,
     dirty_table_acls: BTreeSet<String>,
+    dirty_database_acls: BTreeSet<String>,
+    dirty_tablespace_acls: BTreeSet<String>,
     dirty_schema_acl: bool,
     dirty_default_table_acl: bool,
     dirty_comment_targets: BTreeSet<CatalogCommentTarget>,
@@ -2431,6 +2435,8 @@ struct SharedCatalog {
     public_schema_implicit: bool,
     indexes: Vec<CatalogIndex>,
     table_acls: BTreeMap<String, BTreeMap<String, BTreeSet<TablePrivilege>>>,
+    database_acls: BTreeMap<String, BTreeMap<String, BTreeSet<DatabasePrivilege>>>,
+    tablespace_acls: BTreeMap<String, BTreeMap<String, BTreeSet<TablespacePrivilege>>>,
     schema_acl: BTreeMap<String, BTreeSet<SchemaPrivilege>>,
     default_table_acl: BTreeMap<String, BTreeSet<TablePrivilege>>,
     comments: BTreeMap<CatalogCommentTarget, String>,
@@ -2454,6 +2460,8 @@ impl Default for SharedCatalog {
             public_schema_implicit: true,
             indexes: Vec::new(),
             table_acls: BTreeMap::new(),
+            database_acls: BTreeMap::new(),
+            tablespace_acls: BTreeMap::new(),
             schema_acl: BTreeMap::new(),
             default_table_acl: BTreeMap::new(),
             comments: BTreeMap::new(),
@@ -2502,6 +2510,8 @@ impl Session {
             currval_sequences: HashMap::new(),
             indexes: catalog.indexes,
             table_acls: catalog.table_acls,
+            database_acls: catalog.database_acls,
+            tablespace_acls: catalog.tablespace_acls,
             schema_acl: catalog.schema_acl,
             default_table_acl: catalog.default_table_acl,
             comments: catalog.comments,
@@ -2518,6 +2528,8 @@ impl Session {
             dirty_schema: false,
             dirty_indexes: false,
             dirty_table_acls: BTreeSet::new(),
+            dirty_database_acls: BTreeSet::new(),
+            dirty_tablespace_acls: BTreeSet::new(),
             dirty_schema_acl: false,
             dirty_default_table_acl: false,
             dirty_comment_targets: BTreeSet::new(),
@@ -2575,6 +2587,14 @@ impl Session {
         self.dirty_table_acls.insert(table.into());
     }
 
+    fn mark_database_acl_dirty(&mut self, database: impl Into<String>) {
+        self.dirty_database_acls.insert(database.into());
+    }
+
+    fn mark_tablespace_acl_dirty(&mut self, tablespace: impl Into<String>) {
+        self.dirty_tablespace_acls.insert(tablespace.into());
+    }
+
     fn mark_schema_acl_dirty(&mut self) {
         self.dirty_schema_acl = true;
     }
@@ -2601,6 +2621,8 @@ impl Session {
             self.dirty_tablespaces.clear();
             self.dirty_schema = false;
             self.dirty_table_acls.clear();
+            self.dirty_database_acls.clear();
+            self.dirty_tablespace_acls.clear();
             self.dirty_schema_acl = false;
             self.dirty_default_table_acl = false;
             self.dirty_comment_targets.clear();
@@ -2698,6 +2720,24 @@ impl Session {
                 catalog.table_acls.remove(table_name);
             }
         }
+        for database_name in &self.dirty_database_acls {
+            if let Some(acl) = self.database_acls.get(database_name) {
+                catalog
+                    .database_acls
+                    .insert(database_name.clone(), acl.clone());
+            } else {
+                catalog.database_acls.remove(database_name);
+            }
+        }
+        for tablespace_name in &self.dirty_tablespace_acls {
+            if let Some(acl) = self.tablespace_acls.get(tablespace_name) {
+                catalog
+                    .tablespace_acls
+                    .insert(tablespace_name.clone(), acl.clone());
+            } else {
+                catalog.tablespace_acls.remove(tablespace_name);
+            }
+        }
         if self.dirty_default_table_acl {
             catalog.default_table_acl = self.default_table_acl.clone();
             self.dirty_default_table_acl = false;
@@ -2764,6 +2804,8 @@ impl Session {
         self.dirty_databases.clear();
         self.dirty_tablespaces.clear();
         self.dirty_table_acls.clear();
+        self.dirty_database_acls.clear();
+        self.dirty_tablespace_acls.clear();
     }
 
     fn close_extended_target(&mut self, target: DescribeTarget, name: &str) {
@@ -3045,6 +3087,14 @@ fn role_has_dependencies(session: &Session, role: &str) -> bool {
         .table_acls
         .values()
         .any(|acl| acl.contains_key(role))
+        || session
+            .database_acls
+            .values()
+            .any(|acl| acl.contains_key(role))
+        || session
+            .tablespace_acls
+            .values()
+            .any(|acl| acl.contains_key(role))
         || session.schema_acl.contains_key(role)
         || session.default_table_acl.contains_key(role)
 }
@@ -3232,6 +3282,136 @@ fn revoke_default_table_acl(
         }
     }
     session.mark_default_table_acl_dirty();
+    Ok(())
+}
+
+fn grant_database_acl(
+    session: &mut Session,
+    database: &str,
+    grantee: &str,
+    privileges: &[DatabasePrivilege],
+) -> Result<(), ErrorField> {
+    if let Some(error) = acl_grantee_error(session, grantee) {
+        return Err(error);
+    }
+    if !session.databases.contains_key(database) {
+        return Err(ErrorField {
+            code: "3D000",
+            message: "database does not exist",
+            position: None,
+        });
+    }
+    let acl = session
+        .database_acls
+        .entry(database.to_string())
+        .or_default()
+        .entry(grantee.to_string())
+        .or_default();
+    for privilege in privileges {
+        acl.insert(*privilege);
+    }
+    session.mark_database_acl_dirty(database.to_string());
+    Ok(())
+}
+
+fn revoke_database_acl(
+    session: &mut Session,
+    database: &str,
+    grantee: &str,
+    privileges: &[DatabasePrivilege],
+) -> Result<(), ErrorField> {
+    if let Some(error) = acl_grantee_error(session, grantee) {
+        return Err(error);
+    }
+    if !session.databases.contains_key(database) {
+        return Err(ErrorField {
+            code: "3D000",
+            message: "database does not exist",
+            position: None,
+        });
+    }
+    let remove_acl = if let Some(acl) = session.database_acls.get_mut(database) {
+        if let Some(grantee_acl) = acl.get_mut(grantee) {
+            for privilege in privileges {
+                grantee_acl.remove(privilege);
+            }
+            if grantee_acl.is_empty() {
+                acl.remove(grantee);
+            }
+        }
+        acl.is_empty()
+    } else {
+        false
+    };
+    if remove_acl {
+        session.database_acls.remove(database);
+    }
+    session.mark_database_acl_dirty(database.to_string());
+    Ok(())
+}
+
+fn grant_tablespace_acl(
+    session: &mut Session,
+    tablespace: &str,
+    grantee: &str,
+    privileges: &[TablespacePrivilege],
+) -> Result<(), ErrorField> {
+    if let Some(error) = acl_grantee_error(session, grantee) {
+        return Err(error);
+    }
+    if !session.tablespaces.contains_key(tablespace) {
+        return Err(ErrorField {
+            code: "42704",
+            message: "tablespace does not exist",
+            position: None,
+        });
+    }
+    let acl = session
+        .tablespace_acls
+        .entry(tablespace.to_string())
+        .or_default()
+        .entry(grantee.to_string())
+        .or_default();
+    for privilege in privileges {
+        acl.insert(*privilege);
+    }
+    session.mark_tablespace_acl_dirty(tablespace.to_string());
+    Ok(())
+}
+
+fn revoke_tablespace_acl(
+    session: &mut Session,
+    tablespace: &str,
+    grantee: &str,
+    privileges: &[TablespacePrivilege],
+) -> Result<(), ErrorField> {
+    if let Some(error) = acl_grantee_error(session, grantee) {
+        return Err(error);
+    }
+    if !session.tablespaces.contains_key(tablespace) {
+        return Err(ErrorField {
+            code: "42704",
+            message: "tablespace does not exist",
+            position: None,
+        });
+    }
+    let remove_acl = if let Some(acl) = session.tablespace_acls.get_mut(tablespace) {
+        if let Some(grantee_acl) = acl.get_mut(grantee) {
+            for privilege in privileges {
+                grantee_acl.remove(privilege);
+            }
+            if grantee_acl.is_empty() {
+                acl.remove(grantee);
+            }
+        }
+        acl.is_empty()
+    } else {
+        false
+    };
+    if remove_acl {
+        session.tablespace_acls.remove(tablespace);
+    }
+    session.mark_tablespace_acl_dirty(tablespace.to_string());
     Ok(())
 }
 
@@ -8367,6 +8547,8 @@ fn execute_statement(
                         };
                         session.comments.remove(&target);
                         session.mark_comment_dirty(target);
+                        session.database_acls.remove(database);
+                        session.mark_database_acl_dirty(database.clone());
                     }
                     session.mark_database_dirty(database.clone());
                 }
@@ -8412,6 +8594,11 @@ fn execute_statement(
                 session.databases.insert(rename.new_name.clone(), database);
                 session.mark_database_dirty(rename.old_name.clone());
                 session.mark_database_dirty(rename.new_name.clone());
+                if let Some(acl) = session.database_acls.remove(&rename.old_name) {
+                    session.database_acls.insert(rename.new_name.clone(), acl);
+                    session.mark_database_acl_dirty(rename.old_name.clone());
+                    session.mark_database_acl_dirty(rename.new_name.clone());
+                }
                 let old_target = CatalogCommentTarget::Database {
                     database: rename.old_name,
                 };
@@ -8502,6 +8689,8 @@ fn execute_statement(
                         };
                         session.comments.remove(&target);
                         session.mark_comment_dirty(target);
+                        session.tablespace_acls.remove(tablespace);
+                        session.mark_tablespace_acl_dirty(tablespace.clone());
                     }
                     session.mark_tablespace_dirty(tablespace.clone());
                 }
@@ -8549,6 +8738,11 @@ fn execute_statement(
                     .insert(rename.new_name.clone(), tablespace);
                 session.mark_tablespace_dirty(rename.old_name.clone());
                 session.mark_tablespace_dirty(rename.new_name.clone());
+                if let Some(acl) = session.tablespace_acls.remove(&rename.old_name) {
+                    session.tablespace_acls.insert(rename.new_name.clone(), acl);
+                    session.mark_tablespace_acl_dirty(rename.old_name.clone());
+                    session.mark_tablespace_acl_dirty(rename.new_name.clone());
+                }
                 let old_target = CatalogCommentTarget::Tablespace {
                     tablespace: rename.old_name,
                 };
@@ -9849,6 +10043,22 @@ fn execute_statement(
                 for table in session.table_acls.keys().cloned().collect::<Vec<_>>() {
                     session.mark_table_acl_dirty(table);
                 }
+                for acl in session.database_acls.values_mut() {
+                    if let Some(privileges) = acl.remove(&rename.old_name) {
+                        acl.insert(rename.new_name.clone(), privileges);
+                    }
+                }
+                for database in session.database_acls.keys().cloned().collect::<Vec<_>>() {
+                    session.mark_database_acl_dirty(database);
+                }
+                for acl in session.tablespace_acls.values_mut() {
+                    if let Some(privileges) = acl.remove(&rename.old_name) {
+                        acl.insert(rename.new_name.clone(), privileges);
+                    }
+                }
+                for tablespace in session.tablespace_acls.keys().cloned().collect::<Vec<_>>() {
+                    session.mark_tablespace_acl_dirty(tablespace);
+                }
                 if let Some(privileges) = session.schema_acl.remove(&rename.old_name) {
                     session
                         .schema_acl
@@ -10563,6 +10773,51 @@ fn execute_statement(
                 if let Err(error) =
                     revoke_schema_acl(session, &revoke.schema, &revoke.grantee, &revoke.privileges)
                 {
+                    return write_error(stream, &error);
+                }
+                session.persist_catalog_snapshot();
+                return write_command_complete(stream, "REVOKE");
+            }
+            Command::GrantDatabase(grant) => {
+                if let Err(error) =
+                    grant_database_acl(session, &grant.database, &grant.grantee, &grant.privileges)
+                {
+                    return write_error(stream, &error);
+                }
+                session.persist_catalog_snapshot();
+                return write_command_complete(stream, "GRANT");
+            }
+            Command::RevokeDatabase(revoke) => {
+                if let Err(error) = revoke_database_acl(
+                    session,
+                    &revoke.database,
+                    &revoke.grantee,
+                    &revoke.privileges,
+                ) {
+                    return write_error(stream, &error);
+                }
+                session.persist_catalog_snapshot();
+                return write_command_complete(stream, "REVOKE");
+            }
+            Command::GrantTablespace(grant) => {
+                if let Err(error) = grant_tablespace_acl(
+                    session,
+                    &grant.tablespace,
+                    &grant.grantee,
+                    &grant.privileges,
+                ) {
+                    return write_error(stream, &error);
+                }
+                session.persist_catalog_snapshot();
+                return write_command_complete(stream, "GRANT");
+            }
+            Command::RevokeTablespace(revoke) => {
+                if let Err(error) = revoke_tablespace_acl(
+                    session,
+                    &revoke.tablespace,
+                    &revoke.grantee,
+                    &revoke.privileges,
+                ) {
                     return write_error(stream, &error);
                 }
                 session.persist_catalog_snapshot();
@@ -11460,6 +11715,13 @@ fn execute_statement(
             &catalog_database_oid_rows(session),
         );
     }
+    if canonical == "select datname, pg_catalog.array_to_string(datacl, e'\\n') as acl from pg_catalog.pg_database order by datname" {
+        return write_single_row(
+            stream,
+            &[text_column("datname"), text_column("acl")],
+            &catalog_database_acl_rows(session),
+        );
+    }
     if canonical == psql_list_tablespaces_catalog_query() {
         return write_single_row(
             stream,
@@ -11491,6 +11753,13 @@ fn execute_statement(
             stream,
             &[int4_column("oid"), text_column("spcname"), text_column("location")],
             &catalog_tablespace_oid_rows(session),
+        );
+    }
+    if canonical == "select spcname, pg_catalog.array_to_string(spcacl, e'\\n') as acl from pg_catalog.pg_tablespace order by spcname" {
+        return write_single_row(
+            stream,
+            &[text_column("spcname"), text_column("acl")],
+            &catalog_tablespace_acl_rows(session),
         );
     }
     if canonical == psql_list_access_methods_catalog_query() {
@@ -12935,7 +13204,7 @@ fn catalog_psql_describe_role_rows(session: &Session, verbose: bool) -> Vec<Vec<
         Some("t".to_string()),
         Some("t".to_string()),
         Some("-1".to_string()),
-        None,
+        database_acl_display(session, "postgres"),
     ];
     if verbose {
         row.push(
@@ -13020,7 +13289,11 @@ fn catalog_psql_list_database_rows(session: &Session) -> Vec<Vec<Option<String>>
     names.sort();
     names
         .into_iter()
-        .map(|name| database_catalog_base_row(&name))
+        .map(|name| {
+            let mut row = database_catalog_base_row(&name);
+            row[8] = database_acl_display(session, &name);
+            row
+        })
         .collect()
 }
 
@@ -13043,7 +13316,7 @@ fn catalog_psql_list_database_verbose_rows(session: &Session) -> Vec<Vec<Option<
                 Some("C.UTF-8".to_string()),
                 None,
                 None,
-                None,
+                database_acl_display(session, &database.name),
                 Some("0 bytes".to_string()),
                 Some("pg_default".to_string()),
                 session
@@ -13067,6 +13340,21 @@ fn catalog_database_oid_rows(session: &Session) -> Vec<Vec<Option<String>>> {
     databases
         .into_iter()
         .map(|database| vec![Some(database.oid.to_string()), Some(database.name)])
+        .collect()
+}
+
+fn catalog_database_acl_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut names = vec!["postgres".to_string()];
+    names.extend(
+        session
+            .databases
+            .values()
+            .map(|database| database.name.clone()),
+    );
+    names.sort();
+    names
+        .into_iter()
+        .map(|name| vec![Some(name.clone()), database_acl_display(session, &name)])
         .collect()
 }
 
@@ -13101,7 +13389,7 @@ fn catalog_psql_list_tablespace_rows(session: &Session, verbose: bool) -> Vec<Ve
             Some(space.location.clone()),
         ];
         if verbose {
-            row.push(None);
+            row.push(tablespace_acl_display(session, &space.name));
             row.push(None);
             row.push(Some("0 bytes".to_string()));
             row.push(
@@ -13142,6 +13430,16 @@ fn catalog_tablespace_oid_rows(session: &Session) -> Vec<Vec<Option<String>>> {
                 Some(space.location),
             ]
         })
+        .collect()
+}
+
+fn catalog_tablespace_acl_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut spaces = vec!["pg_default".to_string(), "pg_global".to_string()];
+    spaces.extend(session.tablespaces.values().map(|space| space.name.clone()));
+    spaces.sort();
+    spaces
+        .into_iter()
+        .map(|space| vec![Some(space.clone()), tablespace_acl_display(session, &space)])
         .collect()
 }
 
@@ -13437,6 +13735,63 @@ fn schema_acl_display(session: &Session) -> Option<String> {
         })
         .collect::<Vec<_>>();
     (!rows.is_empty()).then(|| rows.join("\n"))
+}
+
+fn database_acl_display(session: &Session, database: &str) -> Option<String> {
+    let acl = session.database_acls.get(database)?;
+    let rows = acl
+        .iter()
+        .filter_map(|(grantee, privileges)| {
+            if privileges.is_empty() {
+                return None;
+            }
+            let grantee = if grantee == "public" { "" } else { grantee };
+            Some(format!(
+                "{grantee}={}/postgres",
+                database_privilege_letters(privileges)
+            ))
+        })
+        .collect::<Vec<_>>();
+    (!rows.is_empty()).then(|| rows.join("\n"))
+}
+
+fn database_privilege_letters(privileges: &BTreeSet<DatabasePrivilege>) -> String {
+    let mut letters = String::new();
+    for (privilege, letter) in [
+        (DatabasePrivilege::Connect, 'c'),
+        (DatabasePrivilege::Temporary, 'T'),
+    ] {
+        if privileges.contains(&privilege) {
+            letters.push(letter);
+        }
+    }
+    letters
+}
+
+fn tablespace_acl_display(session: &Session, tablespace: &str) -> Option<String> {
+    let acl = session.tablespace_acls.get(tablespace)?;
+    let rows = acl
+        .iter()
+        .filter_map(|(grantee, privileges)| {
+            if privileges.is_empty() {
+                return None;
+            }
+            let grantee = if grantee == "public" { "" } else { grantee };
+            Some(format!(
+                "{grantee}={}/postgres",
+                tablespace_privilege_letters(privileges)
+            ))
+        })
+        .collect::<Vec<_>>();
+    (!rows.is_empty()).then(|| rows.join("\n"))
+}
+
+fn tablespace_privilege_letters(privileges: &BTreeSet<TablespacePrivilege>) -> String {
+    let mut letters = String::new();
+    if privileges.contains(&TablespacePrivilege::Create) {
+        letters.push('C');
+    }
+    letters
 }
 
 fn schema_privilege_letters(privileges: &BTreeSet<SchemaPrivilege>) -> String {
@@ -19237,6 +19592,7 @@ mod tests {
                 .lock()
                 .expect("shared catalog mutex poisoned");
             catalog.databases.remove(database_name);
+            catalog.database_acls.remove(database_name);
             catalog.comments.remove(&CatalogCommentTarget::Database {
                 database: database_name.to_string(),
             });
@@ -19256,7 +19612,15 @@ mod tests {
             },
             "shared database".to_string(),
         );
+        session.database_acls.insert(
+            database_name.to_string(),
+            BTreeMap::from([(
+                "public".to_string(),
+                BTreeSet::from([DatabasePrivilege::Connect]),
+            )]),
+        );
         session.mark_database_dirty(database_name);
+        session.mark_database_acl_dirty(database_name);
         session.mark_comment_dirty(CatalogCommentTarget::Database {
             database: database_name.to_string(),
         });
@@ -19280,12 +19644,18 @@ mod tests {
             catalog_psql_list_database_verbose_rows(&reloaded)[1][11],
             Some("shared database".to_string())
         );
+        assert_eq!(
+            catalog_psql_list_database_verbose_rows(&reloaded)[1][8],
+            Some("=c/postgres".to_string())
+        );
 
         reloaded.databases.remove(database_name);
+        reloaded.database_acls.remove(database_name);
         reloaded.comments.remove(&CatalogCommentTarget::Database {
             database: database_name.to_string(),
         });
         reloaded.mark_database_dirty(database_name);
+        reloaded.mark_database_acl_dirty(database_name);
         reloaded.mark_comment_dirty(CatalogCommentTarget::Database {
             database: database_name.to_string(),
         });
@@ -19293,6 +19663,7 @@ mod tests {
 
         let final_session = Session::new(true);
         assert!(!final_session.databases.contains_key(database_name));
+        assert!(!final_session.database_acls.contains_key(database_name));
         assert!(!final_session
             .comments
             .contains_key(&CatalogCommentTarget::Database {
@@ -19308,6 +19679,7 @@ mod tests {
                 .lock()
                 .expect("shared catalog mutex poisoned");
             catalog.tablespaces.remove(tablespace_name);
+            catalog.tablespace_acls.remove(tablespace_name);
             catalog.comments.remove(&CatalogCommentTarget::Tablespace {
                 tablespace: tablespace_name.to_string(),
             });
@@ -19328,7 +19700,15 @@ mod tests {
             },
             "shared storage".to_string(),
         );
+        session.tablespace_acls.insert(
+            tablespace_name.to_string(),
+            BTreeMap::from([(
+                "public".to_string(),
+                BTreeSet::from([TablespacePrivilege::Create]),
+            )]),
+        );
         session.mark_tablespace_dirty(tablespace_name);
+        session.mark_tablespace_acl_dirty(tablespace_name);
         session.mark_comment_dirty(CatalogCommentTarget::Tablespace {
             tablespace: tablespace_name.to_string(),
         });
@@ -19347,12 +19727,15 @@ mod tests {
             .find(|row| row[0] == Some(tablespace_name.to_string()))
             .expect("shared tablespace row");
         assert_eq!(appspace_row[6], Some("shared storage".to_string()));
+        assert_eq!(appspace_row[3], Some("=C/postgres".to_string()));
 
         reloaded.tablespaces.remove(tablespace_name);
+        reloaded.tablespace_acls.remove(tablespace_name);
         reloaded.comments.remove(&CatalogCommentTarget::Tablespace {
             tablespace: tablespace_name.to_string(),
         });
         reloaded.mark_tablespace_dirty(tablespace_name);
+        reloaded.mark_tablespace_acl_dirty(tablespace_name);
         reloaded.mark_comment_dirty(CatalogCommentTarget::Tablespace {
             tablespace: tablespace_name.to_string(),
         });
@@ -19360,6 +19743,7 @@ mod tests {
 
         let final_session = Session::new(true);
         assert!(!final_session.tablespaces.contains_key(tablespace_name));
+        assert!(!final_session.tablespace_acls.contains_key(tablespace_name));
         assert!(!final_session
             .comments
             .contains_key(&CatalogCommentTarget::Tablespace {
@@ -21835,9 +22219,28 @@ mod tests {
             },
             "application database".to_string(),
         );
+        commented_database
+            .database_acls
+            .entry("appdb".to_string())
+            .or_default()
+            .insert(
+                "app_reader".to_string(),
+                BTreeSet::from([DatabasePrivilege::Connect, DatabasePrivilege::Temporary]),
+            );
         assert_eq!(
             catalog_psql_list_database_verbose_rows(&commented_database)[0][11],
             Some("application database".to_string())
+        );
+        assert_eq!(
+            catalog_psql_list_database_verbose_rows(&commented_database)[0][8],
+            Some("app_reader=cT/postgres".to_string())
+        );
+        assert_eq!(
+            catalog_database_acl_rows(&commented_database)[0],
+            vec![
+                Some("appdb".to_string()),
+                Some("app_reader=cT/postgres".to_string())
+            ]
         );
         assert_eq!(
             catalog_psql_list_database_verbose_rows(&commented_database)[1][11],
@@ -21893,9 +22296,28 @@ mod tests {
             },
             "default storage".to_string(),
         );
+        commented_tablespace
+            .tablespace_acls
+            .entry("pg_default".to_string())
+            .or_default()
+            .insert(
+                "app_reader".to_string(),
+                BTreeSet::from([TablespacePrivilege::Create]),
+            );
         assert_eq!(
             catalog_psql_list_tablespace_rows(&commented_tablespace, true)[0][6],
             Some("default storage".to_string())
+        );
+        assert_eq!(
+            catalog_psql_list_tablespace_rows(&commented_tablespace, true)[0][3],
+            Some("app_reader=C/postgres".to_string())
+        );
+        assert_eq!(
+            catalog_tablespace_acl_rows(&commented_tablespace)[0],
+            vec![
+                Some("pg_default".to_string()),
+                Some("app_reader=C/postgres".to_string())
+            ]
         );
         assert_eq!(
             psql_list_access_methods_catalog_query(),

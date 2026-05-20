@@ -23,13 +23,13 @@ use gpu_db_protocol::{
     ColumnDef, ColumnDefault, Command, CommentTarget, CreateDatabase, CreateDomain,
     CreateExtension, CreateIndex, CreateMaterializedView, CreatePublication, CreateRole,
     CreateSchema, CreateSequence, CreateSubscription, CreateTable, CreateTablespace, CreateView,
-    Delete, DropConstraint, DropDatabase, DropDomain, DropIndex, DropMaterializedView,
-    DropPublication, DropRole, DropSchema, DropSequence, DropSubscription, DropTable,
-    DropTablespace, DropView, Insert, ParseError, PublicationTarget, RefreshMaterializedView,
-    RenameColumn, RenameConstraint, RenameDatabase, RenameIndex, RenameMaterializedView,
-    RenameRole, RenameSequence, RenameTable, RenameTablespace, RenameView, SchemaPrivilege, Select,
-    SelectFilterOp, SelectProjection, SequenceNextVal, SequenceSetVal, SqlType, SqlValue,
-    TablePrivilege, TruncateTable, Update,
+    DatabasePrivilege, Delete, DropConstraint, DropDatabase, DropDomain, DropIndex,
+    DropMaterializedView, DropPublication, DropRole, DropSchema, DropSequence, DropSubscription,
+    DropTable, DropTablespace, DropView, Insert, ParseError, PublicationTarget,
+    RefreshMaterializedView, RenameColumn, RenameConstraint, RenameDatabase, RenameIndex,
+    RenameMaterializedView, RenameRole, RenameSequence, RenameTable, RenameTablespace, RenameView,
+    SchemaPrivilege, Select, SelectFilterOp, SelectProjection, SequenceNextVal, SequenceSetVal,
+    SqlType, SqlValue, TablePrivilege, TablespacePrivilege, TruncateTable, Update,
 };
 use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine};
 use gpu_db_storage::{
@@ -130,6 +130,10 @@ impl ReplicatedStateMachine for KvStateMachine {
                     | Command::RevokeTable(_)
                     | Command::GrantSchema(_)
                     | Command::RevokeSchema(_)
+                    | Command::GrantDatabase(_)
+                    | Command::RevokeDatabase(_)
+                    | Command::GrantTablespace(_)
+                    | Command::RevokeTablespace(_)
                     | Command::GrantDefaultTablePrivileges(_)
                     | Command::RevokeDefaultTablePrivileges(_)
                     | Command::AlterColumnDefault(_)
@@ -6133,6 +6137,7 @@ pub struct RelationalRole {
 pub struct RelationalDatabase {
     pub name: String,
     pub oid: u32,
+    pub acl: BTreeMap<String, BTreeSet<DatabasePrivilege>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6140,6 +6145,7 @@ pub struct RelationalTablespace {
     pub name: String,
     pub oid: u32,
     pub location: String,
+    pub acl: BTreeMap<String, BTreeSet<TablespacePrivilege>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -7815,6 +7821,24 @@ impl Engine {
             Command::RevokeSchema(revoke) => {
                 self.apply_revoke_schema_acl(&revoke.schema, &revoke.grantee, &revoke.privileges)?
             }
+            Command::GrantDatabase(grant) => {
+                self.apply_grant_database_acl(&grant.database, &grant.grantee, &grant.privileges)?
+            }
+            Command::RevokeDatabase(revoke) => self.apply_revoke_database_acl(
+                &revoke.database,
+                &revoke.grantee,
+                &revoke.privileges,
+            )?,
+            Command::GrantTablespace(grant) => self.apply_grant_tablespace_acl(
+                &grant.tablespace,
+                &grant.grantee,
+                &grant.privileges,
+            )?,
+            Command::RevokeTablespace(revoke) => self.apply_revoke_tablespace_acl(
+                &revoke.tablespace,
+                &revoke.grantee,
+                &revoke.privileges,
+            )?,
             Command::GrantDefaultTablePrivileges(grant) => {
                 self.apply_grant_default_table_privileges(&grant.grantee, &grant.privileges)?
             }
@@ -8314,6 +8338,7 @@ impl Engine {
             RelationalDatabase {
                 name: create.name,
                 oid,
+                acl: BTreeMap::new(),
             },
         );
         Ok(())
@@ -8404,6 +8429,7 @@ impl Engine {
                 name: create.name,
                 oid,
                 location: create.location,
+                acl: BTreeMap::new(),
             },
         );
         Ok(())
@@ -9799,6 +9825,14 @@ impl Engine {
                 .relational_sequences
                 .values()
                 .any(|sequence| sequence.acl.contains_key(role))
+            || self
+                .relational_databases
+                .values()
+                .any(|database| database.acl.contains_key(role))
+            || self
+                .relational_tablespaces
+                .values()
+                .any(|tablespace| tablespace.acl.contains_key(role))
             || self.relational_schema_acl.contains_key(role)
             || self.relational_default_table_acl.contains_key(role)
     }
@@ -9887,6 +9921,16 @@ impl Engine {
         for sequence in self.relational_sequences.values_mut() {
             if let Some(privileges) = sequence.acl.remove(&rename.old_name) {
                 sequence.acl.insert(rename.new_name.clone(), privileges);
+            }
+        }
+        for database in self.relational_databases.values_mut() {
+            if let Some(privileges) = database.acl.remove(&rename.old_name) {
+                database.acl.insert(rename.new_name.clone(), privileges);
+            }
+        }
+        for tablespace in self.relational_tablespaces.values_mut() {
+            if let Some(privileges) = tablespace.acl.remove(&rename.old_name) {
+                tablespace.acl.insert(rename.new_name.clone(), privileges);
             }
         }
         if let Some(privileges) = self.relational_schema_acl.remove(&rename.old_name) {
@@ -10334,6 +10378,106 @@ impl Engine {
             }
             if acl.is_empty() {
                 self.relational_default_table_acl.remove(grantee);
+            }
+        }
+        Ok(())
+    }
+
+    fn preflight_database_acl_target(&self, database: &str) -> Result<(), EngineError> {
+        if self.relational_databases.contains_key(database) {
+            Ok(())
+        } else {
+            Err(EngineError::ApplyFailed(format!(
+                "database \"{database}\" does not exist"
+            )))
+        }
+    }
+
+    fn apply_grant_database_acl(
+        &mut self,
+        database: &str,
+        grantee: &str,
+        privileges: &[DatabasePrivilege],
+    ) -> Result<(), EngineError> {
+        self.preflight_database_acl_target(database)?;
+        self.preflight_acl_grantee(grantee)?;
+        let Some(database) = self.relational_databases.get_mut(database) else {
+            return Ok(());
+        };
+        let acl = database.acl.entry(grantee.to_string()).or_default();
+        for privilege in privileges {
+            acl.insert(*privilege);
+        }
+        Ok(())
+    }
+
+    fn apply_revoke_database_acl(
+        &mut self,
+        database: &str,
+        grantee: &str,
+        privileges: &[DatabasePrivilege],
+    ) -> Result<(), EngineError> {
+        self.preflight_database_acl_target(database)?;
+        self.preflight_acl_grantee(grantee)?;
+        let Some(database) = self.relational_databases.get_mut(database) else {
+            return Ok(());
+        };
+        if let Some(acl) = database.acl.get_mut(grantee) {
+            for privilege in privileges {
+                acl.remove(privilege);
+            }
+            if acl.is_empty() {
+                database.acl.remove(grantee);
+            }
+        }
+        Ok(())
+    }
+
+    fn preflight_tablespace_acl_target(&self, tablespace: &str) -> Result<(), EngineError> {
+        if self.relational_tablespaces.contains_key(tablespace) {
+            Ok(())
+        } else {
+            Err(EngineError::ApplyFailed(format!(
+                "tablespace \"{tablespace}\" does not exist"
+            )))
+        }
+    }
+
+    fn apply_grant_tablespace_acl(
+        &mut self,
+        tablespace: &str,
+        grantee: &str,
+        privileges: &[TablespacePrivilege],
+    ) -> Result<(), EngineError> {
+        self.preflight_tablespace_acl_target(tablespace)?;
+        self.preflight_acl_grantee(grantee)?;
+        let Some(tablespace) = self.relational_tablespaces.get_mut(tablespace) else {
+            return Ok(());
+        };
+        let acl = tablespace.acl.entry(grantee.to_string()).or_default();
+        for privilege in privileges {
+            acl.insert(*privilege);
+        }
+        Ok(())
+    }
+
+    fn apply_revoke_tablespace_acl(
+        &mut self,
+        tablespace: &str,
+        grantee: &str,
+        privileges: &[TablespacePrivilege],
+    ) -> Result<(), EngineError> {
+        self.preflight_tablespace_acl_target(tablespace)?;
+        self.preflight_acl_grantee(grantee)?;
+        let Some(tablespace) = self.relational_tablespaces.get_mut(tablespace) else {
+            return Ok(());
+        };
+        if let Some(acl) = tablespace.acl.get_mut(grantee) {
+            for privilege in privileges {
+                acl.remove(privilege);
+            }
+            if acl.is_empty() {
+                tablespace.acl.remove(grantee);
             }
         }
         Ok(())
@@ -12226,6 +12370,22 @@ impl Engine {
                 self.preflight_schema_acl_target(&revoke.schema)?;
                 self.preflight_acl_grantee(&revoke.grantee)?;
             }
+            Command::GrantDatabase(grant) => {
+                self.preflight_database_acl_target(&grant.database)?;
+                self.preflight_acl_grantee(&grant.grantee)?;
+            }
+            Command::RevokeDatabase(revoke) => {
+                self.preflight_database_acl_target(&revoke.database)?;
+                self.preflight_acl_grantee(&revoke.grantee)?;
+            }
+            Command::GrantTablespace(grant) => {
+                self.preflight_tablespace_acl_target(&grant.tablespace)?;
+                self.preflight_acl_grantee(&grant.grantee)?;
+            }
+            Command::RevokeTablespace(revoke) => {
+                self.preflight_tablespace_acl_target(&revoke.tablespace)?;
+                self.preflight_acl_grantee(&revoke.grantee)?;
+            }
             Command::CreatePublication(create) => self.preflight_create_publication(create)?,
             Command::DropPublication(drop) => self.preflight_drop_publication(drop)?,
             Command::CreateSubscription(create) => self.preflight_create_subscription(create)?,
@@ -12612,6 +12772,10 @@ impl Engine {
             | Command::RevokeTable(_)
             | Command::GrantSchema(_)
             | Command::RevokeSchema(_)
+            | Command::GrantDatabase(_)
+            | Command::RevokeDatabase(_)
+            | Command::GrantTablespace(_)
+            | Command::RevokeTablespace(_)
             | Command::CreatePublication(_)
             | Command::DropPublication(_)
             | Command::CreateSubscription(_)
@@ -12854,6 +13018,10 @@ impl Engine {
             | Command::RevokeTable(_)
             | Command::GrantSchema(_)
             | Command::RevokeSchema(_)
+            | Command::GrantDatabase(_)
+            | Command::RevokeDatabase(_)
+            | Command::GrantTablespace(_)
+            | Command::RevokeTablespace(_)
             | Command::CreatePublication(_)
             | Command::DropPublication(_)
             | Command::CreateSubscription(_)
@@ -13006,6 +13174,10 @@ impl Engine {
             Command::RevokeTable(_) => Err(ExecuteError::NonReadCommand("REVOKE")),
             Command::GrantSchema(_) => Err(ExecuteError::NonReadCommand("GRANT")),
             Command::RevokeSchema(_) => Err(ExecuteError::NonReadCommand("REVOKE")),
+            Command::GrantDatabase(_) => Err(ExecuteError::NonReadCommand("GRANT")),
+            Command::RevokeDatabase(_) => Err(ExecuteError::NonReadCommand("REVOKE")),
+            Command::GrantTablespace(_) => Err(ExecuteError::NonReadCommand("GRANT")),
+            Command::RevokeTablespace(_) => Err(ExecuteError::NonReadCommand("REVOKE")),
             Command::CreatePublication(_) => {
                 Err(ExecuteError::NonReadCommand("CREATE PUBLICATION"))
             }
@@ -16216,8 +16388,26 @@ impl Engine {
         self.relational_databases.get(database)
     }
 
+    pub fn relational_database_acl(
+        &self,
+        database: &str,
+    ) -> Option<&BTreeMap<String, BTreeSet<DatabasePrivilege>>> {
+        self.relational_databases
+            .get(database)
+            .map(|database| &database.acl)
+    }
+
     pub fn relational_tablespace(&self, tablespace: &str) -> Option<&RelationalTablespace> {
         self.relational_tablespaces.get(tablespace)
+    }
+
+    pub fn relational_tablespace_acl(
+        &self,
+        tablespace: &str,
+    ) -> Option<&BTreeMap<String, BTreeSet<TablespacePrivilege>>> {
+        self.relational_tablespaces
+            .get(tablespace)
+            .map(|tablespace| &tablespace.acl)
     }
 
     pub fn relational_schema_comment(&self, schema: &str) -> Option<&str> {
@@ -18544,20 +18734,53 @@ mod tests {
         e.execute_text(1, "CREATE DATABASE appdb").unwrap();
         e.execute_text(2, "COMMENT ON DATABASE appdb IS 'application database'")
             .unwrap();
+        e.execute_text(3, "CREATE ROLE app_reader").unwrap();
+        e.execute_text(
+            4,
+            "GRANT CONNECT, TEMPORARY ON DATABASE appdb TO app_reader",
+        )
+        .unwrap();
 
         let appdb = e.relational_database("appdb").unwrap();
         assert_eq!(appdb.name, "appdb");
         let oid = appdb.oid;
         assert_eq!(
+            e.relational_database_acl("appdb")
+                .unwrap()
+                .get("app_reader")
+                .unwrap(),
+            &BTreeSet::from([DatabasePrivilege::Connect, DatabasePrivilege::Temporary])
+        );
+        assert_eq!(
             e.relational_database_comment("appdb"),
             Some("application database")
         );
 
-        e.execute_text(3, "ALTER DATABASE appdb RENAME TO appdb_renamed")
+        e.execute_text(5, "ALTER ROLE app_reader RENAME TO app_analyst")
+            .unwrap();
+        assert!(e
+            .relational_database_acl("appdb")
+            .unwrap()
+            .contains_key("app_analyst"));
+        e.execute_text(6, "REVOKE TEMP ON DATABASE appdb FROM app_analyst")
+            .unwrap();
+        assert_eq!(
+            e.relational_database_acl("appdb")
+                .unwrap()
+                .get("app_analyst")
+                .unwrap(),
+            &BTreeSet::from([DatabasePrivilege::Connect])
+        );
+
+        e.execute_text(7, "ALTER DATABASE appdb RENAME TO appdb_renamed")
             .unwrap();
         let renamed = e.relational_database("appdb_renamed").unwrap();
         assert_eq!(renamed.oid, oid);
         assert_eq!(renamed.name, "appdb_renamed");
+        assert!(e
+            .relational_database_acl("appdb_renamed")
+            .unwrap()
+            .contains_key("app_analyst"));
         assert_eq!(
             e.relational_database_comment("appdb_renamed"),
             Some("application database")
@@ -18565,23 +18788,23 @@ mod tests {
         assert_eq!(e.relational_database_comment("appdb"), None);
 
         let duplicate = e
-            .execute_text(4, "CREATE DATABASE appdb_renamed")
+            .execute_text(8, "CREATE DATABASE appdb_renamed")
             .unwrap_err();
         assert!(duplicate
             .to_string()
             .contains("database \"appdb_renamed\" already exists"));
         let duplicate_rename = e
-            .execute_text(5, "CREATE DATABASE appdb")
-            .and_then(|_| e.execute_text(6, "ALTER DATABASE appdb_renamed RENAME TO appdb"))
+            .execute_text(9, "CREATE DATABASE appdb")
+            .and_then(|_| e.execute_text(10, "ALTER DATABASE appdb_renamed RENAME TO appdb"))
             .unwrap_err();
         assert!(duplicate_rename
             .to_string()
             .contains("database \"appdb\" already exists"));
 
-        e.execute_text(7, "DROP DATABASE appdb_renamed").unwrap();
+        e.execute_text(11, "DROP DATABASE appdb_renamed").unwrap();
         assert!(e.relational_database("appdb_renamed").is_none());
         assert_eq!(e.relational_database_comment("appdb_renamed"), None);
-        e.execute_text(8, "DROP DATABASE IF EXISTS missing_db")
+        e.execute_text(12, "DROP DATABASE IF EXISTS missing_db")
             .unwrap();
 
         let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
@@ -18611,6 +18834,11 @@ mod tests {
         assert!(Engine::new_local()
             .execute_text(1, "CREATE DATABASE templated TEMPLATE template1")
             .is_err());
+        assert!(Engine::new_local()
+            .execute_text(1, "GRANT CONNECT ON DATABASE missing_db TO PUBLIC")
+            .unwrap_err()
+            .to_string()
+            .contains("database \"missing_db\" does not exist"));
     }
 
     #[test]
@@ -39137,21 +39365,37 @@ mod tests {
         .unwrap();
         e.execute_text(2, "COMMENT ON TABLESPACE appspace IS 'application storage'")
             .unwrap();
+        e.execute_text(3, "CREATE ROLE app_writer").unwrap();
+        e.execute_text(4, "GRANT CREATE ON TABLESPACE appspace TO app_writer")
+            .unwrap();
 
         let tablespace = e.relational_tablespace("appspace").unwrap();
         assert_eq!(tablespace.name, "appspace");
         assert_eq!(tablespace.location, "/tmp/gpu-db-appspace");
         let oid = tablespace.oid;
         assert_eq!(
+            e.relational_tablespace_acl("appspace")
+                .unwrap()
+                .get("app_writer")
+                .unwrap(),
+            &BTreeSet::from([TablespacePrivilege::Create])
+        );
+        assert_eq!(
             e.relational_tablespace_comment("appspace"),
             Some("application storage")
         );
 
-        e.execute_text(3, "ALTER TABLESPACE appspace RENAME TO appspace_fast")
+        e.execute_text(5, "ALTER ROLE app_writer RENAME TO app_loader")
+            .unwrap();
+        e.execute_text(6, "ALTER TABLESPACE appspace RENAME TO appspace_fast")
             .unwrap();
         let renamed = e.relational_tablespace("appspace_fast").unwrap();
         assert_eq!(renamed.oid, oid);
         assert_eq!(renamed.location, "/tmp/gpu-db-appspace");
+        assert!(e
+            .relational_tablespace_acl("appspace_fast")
+            .unwrap()
+            .contains_key("app_loader"));
         assert_eq!(
             e.relational_tablespace_comment("appspace_fast"),
             Some("application storage")
@@ -39172,7 +39416,7 @@ mod tests {
         );
 
         let duplicate = e
-            .execute_text(4, "CREATE TABLESPACE appspace_fast LOCATION '/tmp/other'")
+            .execute_text(7, "CREATE TABLESPACE appspace_fast LOCATION '/tmp/other'")
             .unwrap_err()
             .to_string();
         assert!(
@@ -39180,8 +39424,8 @@ mod tests {
             "{duplicate}"
         );
         let duplicate_rename = e
-            .execute_text(5, "CREATE TABLESPACE appspace LOCATION '/tmp/other'")
-            .and_then(|_| e.execute_text(6, "ALTER TABLESPACE appspace_fast RENAME TO appspace"))
+            .execute_text(8, "CREATE TABLESPACE appspace LOCATION '/tmp/other'")
+            .and_then(|_| e.execute_text(9, "ALTER TABLESPACE appspace_fast RENAME TO appspace"))
             .unwrap_err()
             .to_string();
         assert!(
@@ -39189,7 +39433,7 @@ mod tests {
             "{duplicate_rename}"
         );
         let bootstrap = e
-            .execute_text(7, "DROP TABLESPACE pg_default")
+            .execute_text(10, "DROP TABLESPACE pg_default")
             .unwrap_err()
             .to_string();
         assert!(
@@ -39197,7 +39441,7 @@ mod tests {
             "{bootstrap}"
         );
         let bootstrap_rename = e
-            .execute_text(8, "ALTER TABLESPACE pg_default RENAME TO appspace_default")
+            .execute_text(11, "ALTER TABLESPACE pg_default RENAME TO appspace_default")
             .unwrap_err()
             .to_string();
         assert!(
@@ -39205,7 +39449,7 @@ mod tests {
             "{bootstrap_rename}"
         );
         let missing = e
-            .execute_text(9, "DROP TABLESPACE missing_space")
+            .execute_text(12, "DROP TABLESPACE missing_space")
             .unwrap_err()
             .to_string();
         assert!(
@@ -39213,7 +39457,7 @@ mod tests {
             "{missing}"
         );
         let missing_rename = e
-            .execute_text(10, "ALTER TABLESPACE missing_space RENAME TO renamed_space")
+            .execute_text(13, "ALTER TABLESPACE missing_space RENAME TO renamed_space")
             .unwrap_err()
             .to_string();
         assert!(
@@ -39222,7 +39466,7 @@ mod tests {
         );
 
         e.execute_text(
-            11,
+            14,
             "DROP TABLESPACE IF EXISTS appspace_fast, appspace, missing_space",
         )
         .unwrap();
