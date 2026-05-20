@@ -6646,17 +6646,26 @@ fn resident_route_query_shape(
                 && select.limit.is_none())
             .then(|| "int4_scalar_aggregate".to_string())
         }
-        SelectProjection::Columns(columns)
-            if columns.len() == 1
-                && bound.filter.is_none()
-                && bound.filters.is_empty()
-                && bound.filter_groups.is_empty() =>
-        {
+        SelectProjection::Columns(columns) if columns.len() == 1 => {
             let idx = table
                 .columns
                 .iter()
                 .position(|candidate| candidate.name == columns[0])?;
-            (table.columns[idx].ty == SqlType::Int4).then(|| "int4_projection".to_string())
+            let filter_groups = if !bound.filter_groups.is_empty() {
+                bound.filter_groups.clone()
+            } else if !bound.filters.is_empty() {
+                vec![bound.filters.clone()]
+            } else {
+                vec![vec![bound.filter.clone()?]]
+            };
+            let (filter_idx, op, value) = filter_groups.first()?.first()?.clone();
+            (table.columns[idx].ty == SqlType::Int4
+                && idx == filter_idx
+                && resident_device_i32_comparison(op).is_some()
+                && matches!(value, SqlValue::Int4(_))
+                && filter_groups.len() == 1
+                && filter_groups[0].len() == 1)
+                .then(|| "int4_projection".to_string())
         }
         _ => None,
     }
@@ -13777,6 +13786,49 @@ impl Engine {
         self.finalize_relational_select(select, table, bound, access_path, result)
     }
 
+    pub fn execute_relational_select_with_resident_route(
+        &mut self,
+        select: &Select,
+    ) -> Result<RelationalSelectResult, ExecuteError> {
+        let decision = self.plan_relational_resident_route(select);
+        if !decision.accepted {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "resident route rejected: {}",
+                decision.reason
+            ))));
+        }
+
+        match decision.query_shape.as_str() {
+            "count_all" => self.execute_relational_count_with_resident_device_memory_probe(select),
+            "int4_equality_count" => {
+                self.execute_relational_filtered_count_with_resident_device_memory_probe(select)
+            }
+            "int4_range_count" => {
+                self.execute_relational_range_count_with_resident_device_memory_probe(select)
+            }
+            "text_prefix_like_count" => {
+                self.execute_relational_text_prefix_count_with_resident_device_memory_probe(select)
+            }
+            "int4_filter_group_count" => {
+                self.execute_relational_filter_group_count_with_resident_device_memory_probe(select)
+            }
+            "int4_scalar_aggregate"
+                if matches!(select.projection, SelectProjection::Sum { .. }) =>
+            {
+                self.execute_relational_sum_with_resident_device_memory_probe(select)
+            }
+            "int4_scalar_aggregate" => {
+                self.execute_relational_scalar_aggregate_with_resident_device_memory_probe(select)
+            }
+            "int4_projection" => {
+                self.execute_relational_projection_with_resident_device_memory_probe(select)
+            }
+            shape => Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "resident route accepted unsupported execution shape: {shape}"
+            )))),
+        }
+    }
+
     pub fn execute_relational_count_with_resident_device_memory_probe(
         &mut self,
         select: &Select,
@@ -15523,6 +15575,15 @@ impl Engine {
         select: &Select,
     ) -> Result<RelationalSelectResult, ExecuteError> {
         let (table, bound) = self.bind_relational_select_for_execution(select)?;
+        let filter_groups = if !bound.filter_groups.is_empty() {
+            bound.filter_groups.clone()
+        } else if !bound.filters.is_empty() {
+            vec![bound.filters.clone()]
+        } else if let Some(filter) = bound.filter.clone() {
+            vec![vec![filter]]
+        } else {
+            Vec::new()
+        };
         if select.distinct
             || select.group_by.is_some()
             || !select.having_groups.is_empty()
@@ -15530,8 +15591,8 @@ impl Engine {
             || select.limit.is_some()
             || select.offset.is_some()
             || bound.selected_indexes.len() != 1
-            || bound.filter_groups.len() != 1
-            || bound.filter_groups[0].len() != 1
+            || filter_groups.len() != 1
+            || filter_groups[0].len() != 1
         {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                 "resident device-memory projection proof currently supports only SELECT one_int4_column with one int4 range predicate"
@@ -15545,7 +15606,7 @@ impl Engine {
                     .to_string(),
             )));
         }
-        let (filter_idx, op, value) = bound.filter_groups[0][0].clone();
+        let (filter_idx, op, value) = filter_groups[0][0].clone();
         let Some(comparison) = resident_device_i32_comparison(op) else {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(
                 "resident device-memory projection proof currently supports only int4 non-equality predicates"
@@ -22307,6 +22368,123 @@ mod tests {
         assert!(!invalidated.accepted);
         assert_eq!(invalidated.cache_state, "Invalidated");
         assert_eq!(invalidated.reason, "resident snapshot is Invalidated");
+    }
+
+    #[test]
+    fn p8_opt_in_resident_route_executes_accepted_shapes_without_default_routing() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE events (id INT, label TEXT)")
+            .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO events (id, label) VALUES (1, 'alpha'), (2, 'beta'), (3, 'alpine')",
+        )
+        .unwrap();
+        e.populate_relational_residency_snapshot("events").unwrap();
+
+        let Command::Select(count_select) = parse_command("SELECT COUNT(*) FROM events").unwrap()
+        else {
+            unreachable!()
+        };
+        let default = e.execute_relational_select(&count_select).unwrap();
+        assert_eq!(default.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(
+            default.fallback_reason,
+            Some(FallbackReason::GpuMvccReadParityGap)
+        );
+
+        let route = e.plan_relational_resident_route(&count_select);
+        if !route.accepted {
+            assert_eq!(
+                route.reason,
+                "resident snapshot has no retained device memory"
+            );
+            return;
+        }
+        assert_eq!(route.h2d_bytes_if_resident, 0);
+
+        for sql in [
+            "SELECT COUNT(*) FROM events",
+            "SELECT COUNT(*) FROM events WHERE id = 2",
+            "SELECT COUNT(*) FROM events WHERE id > 1",
+            "SELECT COUNT(*) FROM events WHERE label LIKE 'al%'",
+            "SELECT COUNT(*) FROM events WHERE id = 1 OR id = 3",
+            "SELECT SUM(id) FROM events",
+            "SELECT AVG(id) FROM events",
+            "SELECT MIN(id) FROM events",
+            "SELECT MAX(id) FROM events",
+            "SELECT id FROM events WHERE id > 1",
+        ] {
+            let Command::Select(select) = parse_command(sql).unwrap() else {
+                unreachable!()
+            };
+            let expected = e.execute_relational_select(&select).unwrap();
+            let resident = e
+                .execute_relational_select_with_resident_route(&select)
+                .unwrap_or_else(|err| panic!("{sql}: {err}"));
+            assert_eq!(resident.rows, expected.rows, "{sql}");
+            assert_eq!(resident.columns, expected.columns, "{sql}");
+            assert_eq!(resident.planned_target, DeviceTarget::Gpu(0), "{sql}");
+            assert_eq!(resident.executed_target, DeviceTarget::Gpu(0), "{sql}");
+            assert_eq!(resident.fallback_reason, None, "{sql}");
+            assert_eq!(
+                e.status_snapshot()
+                    .relational_residency
+                    .latest_route_decision("events")
+                    .unwrap()
+                    .h2d_bytes_if_resident,
+                0,
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn p8_opt_in_resident_route_rejects_before_execution() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE events (id INT, label TEXT)")
+            .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO events (id, label) VALUES (1, 'alpha'), (2, 'beta')",
+        )
+        .unwrap();
+
+        let Command::Select(absent) = parse_command("SELECT COUNT(*) FROM events").unwrap() else {
+            unreachable!()
+        };
+        let err = e
+            .execute_relational_select_with_resident_route(&absent)
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("relation has no resident snapshot"));
+
+        e.populate_relational_residency_snapshot("events").unwrap();
+        let Command::Select(unsupported) = parse_command("SELECT * FROM events").unwrap() else {
+            unreachable!()
+        };
+        let err = e
+            .execute_relational_select_with_resident_route(&unsupported)
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("resident routing has no retained-kernel proof"));
+
+        e.execute_text(3, "INSERT INTO events (id, label) VALUES (3, 'gamma')")
+            .unwrap();
+        let err = e
+            .execute_relational_select_with_resident_route(&absent)
+            .unwrap_err();
+        assert!(err.to_string().contains("resident snapshot is Invalidated"));
+        assert_eq!(
+            e.telemetry_snapshot()
+                .relational_residency
+                .latest_route_decision("events")
+                .unwrap()
+                .cache_state,
+            "Invalidated"
+        );
     }
 
     #[test]

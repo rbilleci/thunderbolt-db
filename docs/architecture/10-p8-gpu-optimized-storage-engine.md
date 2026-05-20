@@ -319,6 +319,13 @@ retained device memory, unsupported relation kinds, unsupported query shapes,
 resident bytes, budget bytes, refresh bytes, cold H2D bytes, zero resident H2D
 bytes, and estimated D2H rows.
 
+`Engine::execute_relational_select_with_resident_route(...)` is the first
+execution consumer of those decisions. It is explicitly opt-in: it records the
+same route decision, rejects non-accepted routes before execution, and dispatches
+only the retained-device-memory query shapes whose kernels already have proof
+coverage. The normal SQL execution path still does not consume resident handles
+by default.
+
 ### Recovery And Warmup
 
 Startup order remains:
@@ -374,10 +381,14 @@ int4 projection shapes, and rejects absent, evicted, invalidated,
 memory-pressured, no-retained-memory, view/materialized-view, and unsupported
 shape cases without changing normal SQL execution.
 
-This does not yet make resident GPU execution the default SQL path. The next
-code slice should use accepted route decisions to drive an opt-in resident
-execution path while preserving truthful CPU fallback for unsupported, stale, or
-over-budget resident paths.
+The third P8 code slice uses accepted route decisions to drive
+`Engine::execute_relational_select_with_resident_route(...)`, an opt-in resident
+execution path for retained-device-memory `COUNT(*)`, supported int4/text count
+predicates, int4 scalar aggregates, and bounded int4 range-predicate
+projections. It preserves explicit rejection for unsupported, stale, missing,
+or memory-pressured resident paths and still does not make resident GPU
+execution the default SQL path. The next slice is production planner
+integration/default routing using the same decision contract.
 
 ## Non-Goals For The First P8 Design
 

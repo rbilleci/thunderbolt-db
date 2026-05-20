@@ -2,6 +2,8 @@
 
 ## 2026-05-20
 
+- Added the third P8 code slice: `Engine::execute_relational_select_with_resident_route(...)` now consumes accepted `RelationalResidentCache` route decisions as an explicit opt-in execution path. It dispatches retained-device-memory `COUNT(*)`, supported count predicates, int4 scalar aggregates, and bounded int4 range-predicate projections, records the same route-decision facts, rejects absent/invalid/unsupported resident routes before execution, and leaves normal SQL execution on the existing path.
+
 - Added the second P8 code slice: a conservative planner-routing decision contract over `RelationalResidentCache`. `Engine::plan_relational_resident_route(...)` records accepted or rejected resident route decisions for supported public base-table `SELECT` shapes, including query-shape support, validity, retained-device-memory presence, cache state, resident/cold-transfer byte facts, refresh byte facts, and estimated D2H rows. Status and telemetry now expose the latest resident route decision while normal SQL execution remains on the existing path unless explicit resident probes are called.
 
 - Advanced P8 GPU-optimized storage by turning the previous residency maps into an explicit `RelationalResidentCache` owner for snapshots, retained device-memory handles, per-GPU budgets, deterministic admission/eviction, oversized rejection decisions, WAL/memory-pressure invalidation, and refresh metadata. Status/telemetry now expose cache state and latest admission/rejection decision facts, and the residency benchmark/report records those P8 cache-manager facts while keeping normal SQL planner routing to resident handles out of scope.
