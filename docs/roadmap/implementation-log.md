@@ -2,6 +2,16 @@
 
 ## 2026-05-20
 
+- Added an operator-facing P8 resident warmup preflight. The checked
+  `resident_warmup_preflight` example exercises
+  `Engine::warm_relational_residency_with_policy(...)` as a local dry-run/apply
+  command over a deterministic supported table fixture, emits route-readiness
+  facts for default resident execution, and preserves explicit boundaries for
+  invalidated-entry refresh, memory-pressure skips, oversized-budget rejection,
+  durable GPU pages, and production background cache orchestration. The smoke
+  gate at `scripts/run_p8_resident_warmup_preflight_smoke.sh` verifies the
+  operator workflow.
+
 - Extended P8 resident default routing to the already-proven retained filtered ordered projection kernel. `Engine::plan_relational_resident_route(...)`, `Engine::execute_relational_select_with_resident_route(...)`, and the normal `Engine::execute_relational_select(...)` path now accept bounded `SELECT int4_column FROM table WHERE int4_column <|<=|>|>= literal ORDER BY int4_column [DESC] LIMIT n [OFFSET n]`, execute it from retained resident device memory when the route is accepted, and keep missing-limit, equality-predicate, cross-column, text, and broader ordered-expression shapes on the existing fallback path.
 
 - Extended P8 resident default routing to the already-proven retained distinct projection kernels. `Engine::plan_relational_resident_route(...)`, `Engine::execute_relational_select_with_resident_route(...)`, and the normal `Engine::execute_relational_select(...)` path now accept bounded `SELECT DISTINCT` over one `int4` column with optional same-column `ORDER BY`/`LIMIT`/`OFFSET`, plus the existing same-column non-equality int4 filtered distinct shape, execute them from retained resident device memory when the route is accepted, and keep text, cross-column, equality-filtered, offset-without-order/limit, and broader distinct shapes on the existing fallback path.

@@ -410,7 +410,11 @@ tables. The policy can target named tables or the current base-table catalog,
 apply an optional per-GPU residency budget through `RelationalResidentCache`,
 refresh invalidated resident entries when requested, and report warmed,
 refreshed, already-resident, skipped, and error outcomes with route-readiness
-facts. This is bounded warmup/policy support, not a production background cache
+facts. The checked `resident_warmup_preflight` example and
+`scripts/run_p8_resident_warmup_preflight_smoke.sh` package that API as a local
+operator dry-run/apply gate, including invalidated-entry refresh,
+memory-pressure skip, oversized-budget rejection, and default-route readiness
+checks. This is bounded warmup/policy support, not a production background cache
 daemon: durable GPU pages, autonomous scheduling, external orchestration, and
 broader retained expressions remain outside the first P8 design.
 
