@@ -32,6 +32,15 @@ run_gate() {
 }
 
 run_gate \
+  local_validation \
+  scripts/run_local_validation_preflight.sh \
+  "local_validation_preflight=passed" \
+  "local_validation_preflight_scope=fmt_clippy_all_features_psql_golden_scorecard_freshness" \
+  "local_validation_preflight_cargo_all_features=passed" \
+  "local_validation_preflight_psql_golden=passed" \
+  "local_validation_preflight_scorecard_freshness=checked_in"
+
+run_gate \
   postgresql_product \
   scripts/run_local_product_preflight.sh \
   "local_product_preflight=passed" \
@@ -65,7 +74,8 @@ run_gate \
   "local_gpu_residency_preflight_gap_broad_cuda_event_timing=missing"
 
 printf 'local_release_candidate_preflight=passed\n'
-printf 'local_release_candidate_preflight_scope=postgresql_product_plus_gpu_residency\n'
+printf 'local_release_candidate_preflight_scope=validation_postgresql_product_plus_gpu_residency\n'
+printf 'local_release_candidate_preflight_validation=fmt_clippy_all_features_psql_golden_scorecard_freshness\n'
 printf 'local_release_candidate_preflight_postgresql=application_drivers_pg_dump_restore_local_resilience\n'
 printf 'local_release_candidate_preflight_gpu=residency_baseline_warmup_maintenance\n'
 printf 'local_release_candidate_preflight_drivers=tokio-postgres,sqlx,node-postgres,asyncpg,psycopg\n'
