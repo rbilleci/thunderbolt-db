@@ -74,6 +74,8 @@ pub struct RuntimeMetrics {
     pub d2h_bytes_total: u64,
     pub kernel_exec_samples: u64,
     pub kernel_exec_total_ms: u64,
+    pub kernel_event_timing_samples: u64,
+    pub kernel_event_elapsed_total_us: u64,
     pub kernel_occupancy_samples: u64,
     pub kernel_occupancy_total_permyriad: u64,
     pub pending_batch_peak: usize,
@@ -83,6 +85,7 @@ pub struct RuntimeMetrics {
     last_batch_flush_reason: Option<BatchFlushReason>,
     last_batch_wait_ms: Option<u64>,
     last_kernel_exec_ms: Option<u64>,
+    last_kernel_event_elapsed_us: Option<u64>,
     last_kernel_occupancy_permyriad: Option<u16>,
     last_pending_batch_len: Option<usize>,
 }
@@ -98,6 +101,8 @@ pub struct RuntimeMetricsSnapshot {
     pub d2h_bytes_total: u64,
     pub kernel_exec_samples: u64,
     pub kernel_exec_total_ms: u64,
+    pub kernel_event_timing_samples: u64,
+    pub kernel_event_elapsed_total_us: u64,
     pub kernel_occupancy_samples: u64,
     pub kernel_occupancy_total_permyriad: u64,
     pub pending_batch_peak: usize,
@@ -107,6 +112,7 @@ pub struct RuntimeMetricsSnapshot {
     pub last_batch_flush_reason: Option<BatchFlushReason>,
     pub last_batch_wait_ms: Option<u64>,
     pub last_kernel_exec_ms: Option<u64>,
+    pub last_kernel_event_elapsed_us: Option<u64>,
     pub last_kernel_occupancy_permyriad: Option<u16>,
     pub last_pending_batch_len: Option<usize>,
 }
@@ -123,6 +129,8 @@ impl RuntimeMetrics {
             d2h_bytes_total: self.d2h_bytes_total,
             kernel_exec_samples: self.kernel_exec_samples,
             kernel_exec_total_ms: self.kernel_exec_total_ms,
+            kernel_event_timing_samples: self.kernel_event_timing_samples,
+            kernel_event_elapsed_total_us: self.kernel_event_elapsed_total_us,
             kernel_occupancy_samples: self.kernel_occupancy_samples,
             kernel_occupancy_total_permyriad: self.kernel_occupancy_total_permyriad,
             pending_batch_peak: self.pending_batch_peak,
@@ -132,6 +140,7 @@ impl RuntimeMetrics {
             last_batch_flush_reason: self.last_batch_flush_reason,
             last_batch_wait_ms: self.last_batch_wait_ms,
             last_kernel_exec_ms: self.last_kernel_exec_ms,
+            last_kernel_event_elapsed_us: self.last_kernel_event_elapsed_us,
             last_kernel_occupancy_permyriad: self.last_kernel_occupancy_permyriad,
             last_pending_batch_len: self.last_pending_batch_len,
         }
@@ -175,6 +184,14 @@ impl RuntimeMetrics {
         self.kernel_exec_samples += 1;
         self.kernel_exec_total_ms = self.kernel_exec_total_ms.saturating_add(exec_ms);
         self.last_kernel_exec_ms = Some(exec_ms);
+    }
+
+    pub fn observe_kernel_event_elapsed_us(&mut self, elapsed_us: u64) {
+        self.kernel_event_timing_samples += 1;
+        self.kernel_event_elapsed_total_us = self
+            .kernel_event_elapsed_total_us
+            .saturating_add(elapsed_us);
+        self.last_kernel_event_elapsed_us = Some(elapsed_us);
     }
 
     pub fn observe_kernel_occupancy_permyriad(&mut self, occupancy_permyriad: u16) {
@@ -227,6 +244,10 @@ impl RuntimeMetrics {
         self.last_kernel_exec_ms
     }
 
+    pub fn last_kernel_event_elapsed_us(&self) -> Option<u64> {
+        self.last_kernel_event_elapsed_us
+    }
+
     pub fn last_kernel_occupancy_permyriad(&self) -> Option<u16> {
         self.last_kernel_occupancy_permyriad
     }
@@ -247,6 +268,13 @@ impl RuntimeMetrics {
             return None;
         }
         Some(self.kernel_exec_total_ms as f64 / self.kernel_exec_samples as f64)
+    }
+
+    pub fn avg_kernel_event_elapsed_us(&self) -> Option<f64> {
+        if self.kernel_event_timing_samples == 0 {
+            return None;
+        }
+        Some(self.kernel_event_elapsed_total_us as f64 / self.kernel_event_timing_samples as f64)
     }
 
     pub fn avg_kernel_occupancy_permyriad(&self) -> Option<f64> {
@@ -358,6 +386,21 @@ mod tests {
         assert_eq!(m.kernel_exec_total_ms, 12);
         assert_eq!(m.last_kernel_exec_ms(), Some(3));
         assert_eq!(m.avg_kernel_exec_ms(), Some(6.0));
+    }
+
+    #[test]
+    fn kernel_event_observations_track_totals_latest_and_average() {
+        let mut m = RuntimeMetrics::default();
+        assert_eq!(m.last_kernel_event_elapsed_us(), None);
+        assert_eq!(m.avg_kernel_event_elapsed_us(), None);
+
+        m.observe_kernel_event_elapsed_us(150);
+        m.observe_kernel_event_elapsed_us(50);
+
+        assert_eq!(m.kernel_event_timing_samples, 2);
+        assert_eq!(m.kernel_event_elapsed_total_us, 200);
+        assert_eq!(m.last_kernel_event_elapsed_us(), Some(50));
+        assert_eq!(m.avg_kernel_event_elapsed_us(), Some(100.0));
     }
 
     #[test]

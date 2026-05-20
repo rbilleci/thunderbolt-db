@@ -6044,6 +6044,15 @@ struct RelationalResidentCacheDecision {
     evicted_tables: Vec<String>,
 }
 
+struct RelationalResidentRouteExecutionObservation {
+    h2d_bytes: u64,
+    d2h_bytes: u64,
+    kernel_samples: u64,
+    kernel_ms: u64,
+    kernel_event_elapsed_us: Option<u64>,
+    rows: usize,
+}
+
 impl RelationalResidentCache {
     fn record_decision(&mut self, decision: RelationalResidentCacheDecision) {
         self.last_decisions.insert(decision.table.clone(), decision);
@@ -6061,18 +6070,15 @@ impl RelationalResidentCache {
     fn record_route_execution_observation(
         &mut self,
         table: &str,
-        h2d_bytes: u64,
-        d2h_bytes: u64,
-        kernel_samples: u64,
-        kernel_ms: u64,
-        rows: usize,
+        observation: RelationalResidentRouteExecutionObservation,
     ) {
         if let Some(decision) = self.latest_route_decisions.get_mut(table) {
-            decision.last_execution_h2d_bytes = Some(h2d_bytes);
-            decision.last_execution_d2h_bytes = Some(d2h_bytes);
-            decision.last_execution_kernel_samples = Some(kernel_samples);
-            decision.last_execution_kernel_ms = Some(kernel_ms);
-            decision.last_execution_rows = Some(rows);
+            decision.last_execution_h2d_bytes = Some(observation.h2d_bytes);
+            decision.last_execution_d2h_bytes = Some(observation.d2h_bytes);
+            decision.last_execution_kernel_samples = Some(observation.kernel_samples);
+            decision.last_execution_kernel_ms = Some(observation.kernel_ms);
+            decision.last_execution_kernel_event_elapsed_us = observation.kernel_event_elapsed_us;
+            decision.last_execution_rows = Some(observation.rows);
         }
     }
 
@@ -14224,23 +14230,34 @@ impl Engine {
                 "resident route accepted unsupported execution shape: {shape}"
             )))),
         }?;
+        let kernel_event_elapsed_us = self
+            .relational_resident_cache
+            .device_memory
+            .get(&decision.table)
+            .and_then(|device_memory| device_memory.last_kernel_event_elapsed_us());
+        if let Some(elapsed_us) = kernel_event_elapsed_us {
+            self.metrics.observe_kernel_event_elapsed_us(elapsed_us);
+        }
         let after_metrics = self.metrics.snapshot();
         self.relational_resident_cache
             .record_route_execution_observation(
                 &decision.table,
-                after_metrics
-                    .h2d_bytes_total
-                    .saturating_sub(before_metrics.h2d_bytes_total),
-                after_metrics
-                    .d2h_bytes_total
-                    .saturating_sub(before_metrics.d2h_bytes_total),
-                after_metrics
-                    .kernel_exec_samples
-                    .saturating_sub(before_metrics.kernel_exec_samples),
-                after_metrics
-                    .kernel_exec_total_ms
-                    .saturating_sub(before_metrics.kernel_exec_total_ms),
-                result.rows.len(),
+                RelationalResidentRouteExecutionObservation {
+                    h2d_bytes: after_metrics
+                        .h2d_bytes_total
+                        .saturating_sub(before_metrics.h2d_bytes_total),
+                    d2h_bytes: after_metrics
+                        .d2h_bytes_total
+                        .saturating_sub(before_metrics.d2h_bytes_total),
+                    kernel_samples: after_metrics
+                        .kernel_exec_samples
+                        .saturating_sub(before_metrics.kernel_exec_samples),
+                    kernel_ms: after_metrics
+                        .kernel_exec_total_ms
+                        .saturating_sub(before_metrics.kernel_exec_total_ms),
+                    kernel_event_elapsed_us,
+                    rows: result.rows.len(),
+                },
             );
         Ok(result)
     }
@@ -18043,6 +18060,7 @@ impl Engine {
             last_execution_d2h_bytes: None,
             last_execution_kernel_samples: None,
             last_execution_kernel_ms: None,
+            last_execution_kernel_event_elapsed_us: None,
             last_execution_rows: None,
         }
     }
@@ -18142,6 +18160,7 @@ impl Engine {
             last_execution_d2h_bytes: None,
             last_execution_kernel_samples: None,
             last_execution_kernel_ms: None,
+            last_execution_kernel_event_elapsed_us: None,
             last_execution_rows: None,
         };
 
@@ -22968,6 +22987,7 @@ mod tests {
         assert_eq!(absent.last_execution_d2h_bytes, None);
         assert_eq!(absent.last_execution_kernel_samples, None);
         assert_eq!(absent.last_execution_kernel_ms, None);
+        assert_eq!(absent.last_execution_kernel_event_elapsed_us, None);
         assert_eq!(absent.last_execution_rows, None);
 
         let snapshot = e.populate_relational_residency_snapshot("events").unwrap();
@@ -23029,6 +23049,7 @@ mod tests {
         assert_eq!(unsupported.last_execution_d2h_bytes, None);
         assert_eq!(unsupported.last_execution_kernel_samples, None);
         assert_eq!(unsupported.last_execution_kernel_ms, None);
+        assert_eq!(unsupported.last_execution_kernel_event_elapsed_us, None);
         assert_eq!(unsupported.last_execution_rows, None);
         assert_eq!(
             unsupported.reason,
@@ -23215,6 +23236,26 @@ mod tests {
                 ),
                 "{sql}"
             );
+            assert_eq!(
+                route_decision.last_execution_kernel_event_elapsed_us,
+                after_default_metrics.last_kernel_event_elapsed_us,
+                "{sql}"
+            );
+            if route.accepted {
+                assert!(
+                    route_decision
+                        .last_execution_kernel_event_elapsed_us
+                        .is_some(),
+                    "{sql}"
+                );
+                assert_eq!(
+                    after_default_metrics
+                        .kernel_event_timing_samples
+                        .saturating_sub(before_default_metrics.kernel_event_timing_samples),
+                    1,
+                    "{sql}"
+                );
+            }
             assert_eq!(
                 route_decision.last_execution_rows,
                 Some(default.rows.len()),

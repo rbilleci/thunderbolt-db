@@ -2,7 +2,9 @@
 
 ## 2026-05-20
 
-- Refined P8 resident-route execution observability. Accepted resident route executions now update the latest `RelationalResidentRouteDecisionStatus` with observed metric deltas for that route: H2D bytes, D2H bytes, kernel samples, kernel milliseconds, and result rows. Planned-only, rejected, and fallback decisions keep those execution fields empty, so operators can compare conservative transfer estimates with the latest actual resident-route envelope without claiming precise CUDA-event timing.
+- Added the first P8 CUDA-event timing slice for resident retained-kernel execution. Retained CUDA resident-kernel launches now capture optional driver-event elapsed microseconds when the CUDA driver exposes event APIs, runtime metrics track event timing separately from existing kernel millisecond counters, and accepted resident route decisions expose the latest event timing while planned-only/rejected/fallback routes keep it empty.
+
+- Refined P8 resident-route execution observability. Accepted resident route executions now update the latest `RelationalResidentRouteDecisionStatus` with observed metric deltas for that route: H2D bytes, D2H bytes, kernel samples, kernel milliseconds, and result rows. Planned-only, rejected, and fallback decisions keep those execution fields empty, so operators can compare conservative transfer estimates with the latest actual resident-route envelope.
 
 - Refined P8 resident-route transfer observability. `RelationalResidentRouteDecisionStatus` now exposes a conservative `d2h_bytes_estimate` alongside the existing D2H row estimate, resident/cold H2D estimates, cache state, refresh bytes, and route accept/reject facts. Default resident execution and the checked `resident_warmup_preflight` operator surface now report the same byte estimate without changing supported SQL shapes or production cache-orchestration boundaries.
 

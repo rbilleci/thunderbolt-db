@@ -159,6 +159,7 @@ pub struct RelationalResidentRouteDecisionStatus {
     pub last_execution_d2h_bytes: Option<u64>,
     pub last_execution_kernel_samples: Option<u64>,
     pub last_execution_kernel_ms: Option<u64>,
+    pub last_execution_kernel_event_elapsed_us: Option<u64>,
     pub last_execution_rows: Option<usize>,
 }
 
@@ -579,6 +580,8 @@ mod tests {
             d2h_bytes_total: 16,
             kernel_exec_samples: 1,
             kernel_exec_total_ms: 1,
+            kernel_event_timing_samples: 1,
+            kernel_event_elapsed_total_us: 42,
             kernel_occupancy_samples: 1,
             kernel_occupancy_total_permyriad: 8_500,
             pending_batch_peak: 2,
@@ -588,6 +591,7 @@ mod tests {
             last_batch_flush_reason: None,
             last_batch_wait_ms: Some(3),
             last_kernel_exec_ms: Some(1),
+            last_kernel_event_elapsed_us: Some(42),
             last_kernel_occupancy_permyriad: Some(8_500),
             last_pending_batch_len: Some(0),
         };
@@ -813,6 +817,7 @@ mod tests {
                 last_execution_d2h_bytes: Some(8),
                 last_execution_kernel_samples: Some(0),
                 last_execution_kernel_ms: Some(0),
+                last_execution_kernel_event_elapsed_us: Some(42),
                 last_execution_rows: Some(1),
             }],
             resident_bytes_by_gpu: BTreeMap::from([(0, 192)]),

@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::os::raw::c_void;
+use std::sync::Mutex;
 
 use libloading::Library;
 use serde::{Deserialize, Serialize};
@@ -93,6 +94,7 @@ pub struct CudaResidentDeviceMemory {
     context: *mut c_void,
     cu_mem_free: unsafe extern "C" fn(u64) -> i32,
     cu_ctx_destroy: unsafe extern "C" fn(*mut c_void) -> i32,
+    last_kernel_event_elapsed_us: Mutex<Option<u64>>,
     _lib: Library,
 }
 
@@ -108,6 +110,19 @@ impl fmt::Debug for CudaResidentDeviceMemory {
 impl CudaResidentDeviceMemory {
     pub fn metadata(&self) -> &CudaDeviceMemoryProof {
         &self.metadata
+    }
+
+    pub fn last_kernel_event_elapsed_us(&self) -> Option<u64> {
+        self.last_kernel_event_elapsed_us
+            .lock()
+            .ok()
+            .and_then(|elapsed| *elapsed)
+    }
+
+    fn record_kernel_event_elapsed_us(&self, elapsed_us: Option<u64>) {
+        if let Ok(mut last) = self.last_kernel_event_elapsed_us.lock() {
+            *last = elapsed_us;
+        }
     }
 
     pub fn count_rows_from_header(&self) -> Result<u64, CudaRuntimeProbeError> {
@@ -719,6 +734,7 @@ impl CudaDriverRuntime {
             context: resident.context,
             cu_mem_free: resident.cu_mem_free,
             cu_ctx_destroy: resident.cu_ctx_destroy,
+            last_kernel_event_elapsed_us: Mutex::new(None),
             _lib: resident._lib,
         })
     }
@@ -956,7 +972,7 @@ fn launch_cuda_resident_row_count(
         (&mut resident_arg as *mut u64).cast::<c_void>(),
         (&mut output_arg as *mut u64).cast::<c_void>(),
     ];
-    check_cuda(unsafe {
+    launch_with_optional_cuda_event_timing(resident, *cu_ctx_synchronize, || unsafe {
         cu_launch_kernel(
             function,
             1,
@@ -971,7 +987,6 @@ fn launch_cuda_resident_row_count(
             std::ptr::null_mut(),
         )
     })?;
-    check_cuda(unsafe { cu_ctx_synchronize() })?;
 
     let mut output = 0_u64;
     check_cuda(unsafe {
@@ -1171,7 +1186,7 @@ done:
         (&mut needle_arg as *mut i32).cast::<c_void>(),
         (&mut output_arg as *mut u64).cast::<c_void>(),
     ];
-    check_cuda(unsafe {
+    launch_with_optional_cuda_event_timing(resident, *cu_ctx_synchronize, || unsafe {
         cu_launch_kernel(
             function,
             1,
@@ -1186,7 +1201,6 @@ done:
             std::ptr::null_mut(),
         )
     })?;
-    check_cuda(unsafe { cu_ctx_synchronize() })?;
 
     let mut output = 0_u64;
     check_cuda(unsafe {
@@ -1414,7 +1428,7 @@ done:
         (&mut comparison_arg as *mut u32).cast::<c_void>(),
         (&mut output_arg as *mut u64).cast::<c_void>(),
     ];
-    check_cuda(unsafe {
+    launch_with_optional_cuda_event_timing(resident, *cu_ctx_synchronize, || unsafe {
         cu_launch_kernel(
             function,
             1,
@@ -1429,7 +1443,6 @@ done:
             std::ptr::null_mut(),
         )
     })?;
-    check_cuda(unsafe { cu_ctx_synchronize() })?;
 
     let mut output = 0_u64;
     check_cuda(unsafe {
@@ -1700,7 +1713,7 @@ done:
         (&mut rows_arg as *mut u64).cast::<c_void>(),
         (&mut output_arg as *mut u64).cast::<c_void>(),
     ];
-    check_cuda(unsafe {
+    launch_with_optional_cuda_event_timing(resident, *cu_ctx_synchronize, || unsafe {
         cu_launch_kernel(
             function,
             1,
@@ -1715,7 +1728,6 @@ done:
             std::ptr::null_mut(),
         )
     })?;
-    check_cuda(unsafe { cu_ctx_synchronize() })?;
 
     let mut output = 0_i64;
     check_cuda(unsafe {
@@ -1921,7 +1933,7 @@ done:
         (&mut values_arg as *mut u64).cast::<c_void>(),
         (&mut count_arg as *mut u64).cast::<c_void>(),
     ];
-    check_cuda(unsafe {
+    launch_with_optional_cuda_event_timing(resident, *cu_ctx_synchronize, || unsafe {
         cu_launch_kernel(
             function,
             1,
@@ -1936,7 +1948,6 @@ done:
             std::ptr::null_mut(),
         )
     })?;
-    check_cuda(unsafe { cu_ctx_synchronize() })?;
 
     let mut copied_count = 0_u64;
     check_cuda(unsafe {
@@ -2383,7 +2394,7 @@ done:
         (&mut maxs_arg as *mut u64).cast::<c_void>(),
         (&mut count_arg as *mut u64).cast::<c_void>(),
     ];
-    check_cuda(unsafe {
+    launch_with_optional_cuda_event_timing(resident, *cu_ctx_synchronize, || unsafe {
         cu_launch_kernel(
             function,
             1,
@@ -2398,7 +2409,6 @@ done:
             std::ptr::null_mut(),
         )
     })?;
-    check_cuda(unsafe { cu_ctx_synchronize() })?;
 
     let mut output_count = 0_u64;
     check_cuda(unsafe {
@@ -2719,7 +2729,7 @@ done:
         (&mut values_arg as *mut u64).cast::<c_void>(),
         (&mut count_arg as *mut u64).cast::<c_void>(),
     ];
-    check_cuda(unsafe {
+    launch_with_optional_cuda_event_timing(resident, *cu_ctx_synchronize, || unsafe {
         cu_launch_kernel(
             function,
             1,
@@ -2734,7 +2744,6 @@ done:
             std::ptr::null_mut(),
         )
     })?;
-    check_cuda(unsafe { cu_ctx_synchronize() })?;
 
     let mut output_count = 0_u64;
     check_cuda(unsafe {
@@ -4942,6 +4951,95 @@ impl Drop for CudaModuleGuard {
             (self.unload)(self.module);
         }
     }
+}
+
+struct CudaEventGuard {
+    event: *mut c_void,
+    destroy: unsafe extern "C" fn(*mut c_void) -> i32,
+}
+
+impl Drop for CudaEventGuard {
+    fn drop(&mut self) {
+        unsafe {
+            (self.destroy)(self.event);
+        }
+    }
+}
+
+fn launch_with_optional_cuda_event_timing<F>(
+    resident: &CudaResidentDeviceMemory,
+    cu_ctx_synchronize: unsafe extern "C" fn() -> i32,
+    launch: F,
+) -> Result<(), CudaRuntimeProbeError>
+where
+    F: FnOnce() -> i32,
+{
+    type CuEventCreate = unsafe extern "C" fn(*mut *mut c_void, u32) -> i32;
+    type CuEventDestroy = unsafe extern "C" fn(*mut c_void) -> i32;
+    type CuEventRecord = unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32;
+    type CuEventSynchronize = unsafe extern "C" fn(*mut c_void) -> i32;
+    type CuEventElapsedTime = unsafe extern "C" fn(*mut f32, *mut c_void, *mut c_void) -> i32;
+
+    let event_symbols = unsafe {
+        let create = resident._lib.get::<CuEventCreate>(b"cuEventCreate\0");
+        let destroy = resident
+            ._lib
+            .get::<CuEventDestroy>(b"cuEventDestroy_v2\0")
+            .or_else(|_| resident._lib.get::<CuEventDestroy>(b"cuEventDestroy\0"));
+        let record = resident._lib.get::<CuEventRecord>(b"cuEventRecord\0");
+        let synchronize = resident
+            ._lib
+            .get::<CuEventSynchronize>(b"cuEventSynchronize\0");
+        let elapsed = resident
+            ._lib
+            .get::<CuEventElapsedTime>(b"cuEventElapsedTime\0");
+        match (create, destroy, record, synchronize, elapsed) {
+            (Ok(create), Ok(destroy), Ok(record), Ok(synchronize), Ok(elapsed)) => {
+                Some((*create, *destroy, *record, *synchronize, *elapsed))
+            }
+            _ => None,
+        }
+    };
+
+    if let Some((
+        cu_event_create,
+        cu_event_destroy,
+        cu_event_record,
+        cu_event_synchronize,
+        cu_event_elapsed_time,
+    )) = event_symbols
+    {
+        let mut start = std::ptr::null_mut();
+        check_cuda(unsafe { cu_event_create(&mut start, 0) })?;
+        let start_guard = CudaEventGuard {
+            event: start,
+            destroy: cu_event_destroy,
+        };
+        let mut stop = std::ptr::null_mut();
+        check_cuda(unsafe { cu_event_create(&mut stop, 0) })?;
+        let stop_guard = CudaEventGuard {
+            event: stop,
+            destroy: cu_event_destroy,
+        };
+
+        check_cuda(unsafe { cu_event_record(start_guard.event, std::ptr::null_mut()) })?;
+        check_cuda(launch())?;
+        check_cuda(unsafe { cu_event_record(stop_guard.event, std::ptr::null_mut()) })?;
+        check_cuda(unsafe { cu_event_synchronize(stop_guard.event) })?;
+
+        let mut elapsed_ms = 0.0_f32;
+        check_cuda(unsafe {
+            cu_event_elapsed_time(&mut elapsed_ms, start_guard.event, stop_guard.event)
+        })?;
+        resident
+            .record_kernel_event_elapsed_us(Some((f64::from(elapsed_ms) * 1_000.0).ceil() as u64));
+        return Ok(());
+    }
+
+    check_cuda(launch())?;
+    check_cuda(unsafe { cu_ctx_synchronize() })?;
+    resident.record_kernel_event_elapsed_us(None);
+    Ok(())
 }
 
 pub struct DeviceRouter<R> {
