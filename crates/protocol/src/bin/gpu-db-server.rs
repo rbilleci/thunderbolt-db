@@ -4232,6 +4232,7 @@ enum CatalogCommentTarget {
 enum PreparedStatement {
     AddTen,
     Extended(PreparedQuery),
+    PgDumpFunctionDump,
     Sql(PreparedQuery),
 }
 
@@ -5936,6 +5937,16 @@ fn execute_sql_prepared_result(
             Ok(SelectResult {
                 columns: vec![int4_column("plus_ten")],
                 rows: vec![vec![Some(String::from("15"))]],
+            })
+        }
+        Some(PreparedStatement::PgDumpFunctionDump) => {
+            let oid = parameters
+                .first()
+                .and_then(|parameter| parameter.as_deref())
+                .and_then(|parameter| parameter.trim().parse::<u32>().ok());
+            Ok(SelectResult {
+                columns: pg_dump_function_dump_columns(),
+                rows: pg_dump_function_dump_rows(session, oid),
             })
         }
         Some(PreparedStatement::Sql(query)) => {
@@ -7970,6 +7981,13 @@ fn execute_statement(
     {
         return write_command_complete(stream, "PREPARE");
     }
+    if is_pg_dump_function_dump_prepare(&canonical) {
+        session.prepared.insert(
+            "dumpfunc".to_string(),
+            PreparedStatement::PgDumpFunctionDump,
+        );
+        return write_command_complete(stream, "PREPARE");
+    }
 
     if let Some((name, parameter_type_oids, query)) = parse_sql_prepare(statement) {
         let query = strip_sql_comments(&query);
@@ -8041,6 +8059,17 @@ fn execute_statement(
                         &[vec![Some(String::from("15"))]],
                     );
                 }
+            }
+            Some(PreparedStatement::PgDumpFunctionDump) => {
+                let oid = parameters
+                    .first()
+                    .and_then(|parameter| parameter.as_deref())
+                    .and_then(|parameter| parameter.trim().parse::<u32>().ok());
+                return write_single_row(
+                    stream,
+                    &pg_dump_function_dump_columns(),
+                    &pg_dump_function_dump_rows(session, oid),
+                );
             }
             Some(PreparedStatement::Sql(query)) => {
                 let bound_query = match bind_query_parameters(&query, &parameters) {
@@ -8749,6 +8778,13 @@ fn execute_statement(
             stream,
             &pg_catalog_publication_namespace_columns(),
             &catalog_publication_namespace_rows(session),
+        );
+    }
+    if is_pg_dump_function_metadata_query(&canonical) {
+        return write_single_row(
+            stream,
+            &pg_dump_function_metadata_columns(),
+            &pg_dump_function_metadata_rows(session),
         );
     }
     if let Some(columns) = pg_dump_empty_catalog_query_columns(&canonical) {
@@ -12887,6 +12923,13 @@ fn execute_statement(
             &catalog_publication_namespace_rows(session),
         );
     }
+    if is_pg_dump_function_metadata_query(&canonical) {
+        return write_single_row(
+            stream,
+            &pg_dump_function_metadata_columns(),
+            &pg_dump_function_metadata_rows(session),
+        );
+    }
     if let Some(columns) = pg_dump_empty_catalog_query_columns(&canonical) {
         return write_single_row(stream, &columns, &catalog_empty_rows());
     }
@@ -14765,6 +14808,25 @@ fn function_acl_display(acl: &BTreeMap<String, BTreeSet<FunctionPrivilege>>) -> 
     (!rows.is_empty()).then(|| rows.join("\n"))
 }
 
+fn function_acl_array_display(
+    acl: &BTreeMap<String, BTreeSet<FunctionPrivilege>>,
+) -> Option<String> {
+    let rows = acl
+        .iter()
+        .filter_map(|(grantee, privileges)| {
+            if privileges.is_empty() {
+                return None;
+            }
+            let grantee = if grantee == "public" { "" } else { grantee };
+            Some(format!(
+                "{grantee}={}/postgres",
+                function_privilege_letters(privileges)
+            ))
+        })
+        .collect::<Vec<_>>();
+    (!rows.is_empty()).then(|| format!("{{{}}}", rows.join(",")))
+}
+
 fn function_privilege_letters(privileges: &BTreeSet<FunctionPrivilege>) -> String {
     let mut letters = String::new();
     if privileges.contains(&FunctionPrivilege::Execute) {
@@ -16012,6 +16074,112 @@ fn pg_catalog_publication_namespace_columns() -> Vec<Column> {
     ]
 }
 
+fn is_pg_dump_function_metadata_query(canonical: &str) -> bool {
+    canonical
+        .starts_with("select p.tableoid, p.oid, p.proname, p.prolang, p.pronargs, p.proargtypes")
+        && canonical.contains("from pg_proc p")
+}
+
+fn is_pg_dump_function_dump_prepare(canonical: &str) -> bool {
+    canonical.starts_with("prepare dumpfunc(pg_catalog.oid) as select proretset, prosrc, probin")
+        && canonical.contains("from pg_catalog.pg_proc p, pg_catalog.pg_language l")
+}
+
+fn pg_dump_function_metadata_columns() -> Vec<Column> {
+    vec![
+        int4_column("tableoid"),
+        int4_column("oid"),
+        text_column("proname"),
+        int4_column("prolang"),
+        int4_column("pronargs"),
+        text_column("proargtypes"),
+        int4_column("prorettype"),
+        text_column("proacl"),
+        text_column("acldefault"),
+        int4_column("pronamespace"),
+        int4_column("proowner"),
+    ]
+}
+
+fn pg_dump_function_dump_columns() -> Vec<Column> {
+    vec![
+        bool_column("proretset"),
+        text_column("prosrc"),
+        text_column("probin"),
+        text_column("provolatile"),
+        bool_column("proisstrict"),
+        bool_column("prosecdef"),
+        text_column("lanname"),
+        text_column("proconfig"),
+        text_column("procost"),
+        text_column("prorows"),
+        text_column("funcargs"),
+        text_column("funciargs"),
+        text_column("funcresult"),
+        bool_column("proleakproof"),
+        text_column("protrftypes"),
+        text_column("proparallel"),
+        text_column("prokind"),
+        text_column("prosupport"),
+        text_column("prosqlbody"),
+    ]
+}
+
+fn pg_dump_function_dump_rows(session: &Session, oid: Option<u32>) -> Vec<Vec<Option<String>>> {
+    session
+        .functions
+        .values()
+        .find(|function| Some(function.oid) == oid)
+        .map(|function| {
+            vec![vec![
+                Some("f".to_string()),
+                Some(function.body.clone()),
+                None,
+                Some("v".to_string()),
+                Some("f".to_string()),
+                Some("f".to_string()),
+                Some("sql".to_string()),
+                None,
+                Some("100".to_string()),
+                Some("0".to_string()),
+                Some(String::new()),
+                Some(String::new()),
+                Some(sql_type_display_name(function.return_type).to_string()),
+                Some("f".to_string()),
+                None,
+                Some("u".to_string()),
+                Some("f".to_string()),
+                Some("-".to_string()),
+                None,
+            ]]
+        })
+        .unwrap_or_default()
+}
+
+fn pg_dump_function_metadata_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut rows = session
+        .functions
+        .values()
+        .map(|function| {
+            vec![
+                Some("1255".to_string()),
+                Some(function.oid.to_string()),
+                Some(function.name.clone()),
+                Some("14".to_string()),
+                Some("0".to_string()),
+                Some(String::new()),
+                Some(function.return_type.postgres_oid().to_string()),
+                function_acl_array_display(&function.acl),
+                Some("{=X/postgres,postgres=X/postgres}".to_string()),
+                Some(PUBLIC_NAMESPACE_OID.to_string()),
+                Some("10".to_string()),
+            ]
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| left[2].cmp(&right[2]));
+    rows
+}
+
 fn pg_dump_empty_catalog_query_columns(canonical: &str) -> Option<Vec<Column>> {
     if canonical == "select distinct attrelid from pg_attribute where attacl is not null" {
         return Some(vec![int4_column("attrelid")]);
@@ -16025,23 +16193,8 @@ fn pg_dump_empty_catalog_query_columns(canonical: &str) -> Option<Vec<Column>> {
             text_column("initprivs"),
         ]);
     }
-    if canonical
-        .starts_with("select p.tableoid, p.oid, p.proname, p.prolang, p.pronargs, p.proargtypes")
-        && canonical.contains("from pg_proc p")
-    {
-        return Some(vec![
-            int4_column("tableoid"),
-            int4_column("oid"),
-            text_column("proname"),
-            int4_column("prolang"),
-            int4_column("pronargs"),
-            text_column("proargtypes"),
-            int4_column("prorettype"),
-            text_column("proacl"),
-            text_column("acldefault"),
-            int4_column("pronamespace"),
-            int4_column("proowner"),
-        ]);
+    if is_pg_dump_function_metadata_query(canonical) {
+        return Some(pg_dump_function_metadata_columns());
     }
     if canonical.starts_with("select p.tableoid, p.oid, p.proname as aggname")
         && canonical.contains("from pg_proc p")

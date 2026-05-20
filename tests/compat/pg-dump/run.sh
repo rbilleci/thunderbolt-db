@@ -143,12 +143,14 @@ CREATE SEQUENCE public.account_seq;
 SELECT nextval('public.account_seq'::regclass) \g /dev/null
 SELECT nextval('public.account_seq'::regclass) \g /dev/null
 COMMENT ON SEQUENCE public.account_seq IS 'account sequence';
-GRANT USAGE ON SCHEMA public TO dump_reader;
+CREATE FUNCTION public.dump_answer() RETURNS int LANGUAGE sql AS 'SELECT 42';
+GRANT USAGE, CREATE ON SCHEMA public TO dump_reader;
 GRANT SELECT ON TABLE public.accounts TO dump_reader;
 GRANT SELECT ON VIEW public.account_lookup TO dump_reader;
 GRANT SELECT ON VIEW public.account_lookup_layer TO dump_reader;
 GRANT SELECT ON MATERIALIZED VIEW public.account_snapshot TO dump_reader;
 GRANT SELECT, UPDATE ON SEQUENCE public.account_seq TO dump_reader;
+GRANT EXECUTE ON FUNCTION public.dump_answer() TO dump_reader;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO dump_reader;
 SQL
 
@@ -243,6 +245,11 @@ EOF
 
 cat >"$OUT_DIR/constraint-comment-verify.expected" <<'EOF'
 public|accounts|accounts_pkey|accounts row identity
+EOF
+
+cat >"$OUT_DIR/function-verify.expected" <<'EOF'
+dump_answer|integer|SELECT 42
+42
 EOF
 
 diff -u "$OUT_DIR/verify.expected" "$OUT_DIR/verify.out"
@@ -384,6 +391,23 @@ verify_domains() {
 
 verify_domains "$RESTORE_PORT" "restore"
 
+verify_functions() {
+  local port="$1"
+  local prefix="$2"
+  PGHOST=127.0.0.1 PGPORT="$port" PGDATABASE=postgres PGUSER=postgres \
+    psql -v ON_ERROR_STOP=1 -X -A -t \
+    -c "SELECT p.oid, n.nspname, p.proname, p.prorettype, pg_catalog.pg_get_function_result(p.oid), p.prosrc FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'public' ORDER BY p.proname;" \
+    2>"$OUT_DIR/${prefix}-function-catalog-verify.err" \
+    | cut -d'|' -f3,5,6 >"$OUT_DIR/${prefix}-function-verify.out"
+  PGHOST=127.0.0.1 PGPORT="$port" PGDATABASE=postgres PGUSER=postgres \
+    psql -v ON_ERROR_STOP=1 -X -A -t \
+    -c "SELECT dump_answer();" \
+    >>"$OUT_DIR/${prefix}-function-verify.out" 2>"$OUT_DIR/${prefix}-function-verify.err"
+  diff -u "$OUT_DIR/function-verify.expected" "$OUT_DIR/${prefix}-function-verify.out"
+}
+
+verify_functions "$RESTORE_PORT" "restore"
+
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$PRIVILEGE_RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/privilege-restore-server.log" 2>&1 &
 privilege_restore_pid=$!
@@ -401,12 +425,16 @@ PGHOST=127.0.0.1 PGPORT="$PRIVILEGE_RESTORE_PORT" PGDATABASE=postgres PGUSER=pos
   psql -v ON_ERROR_STOP=1 -X -q \
   -c '\dn+ public' \
   -c '\dp public.account*' \
+  -c '\df+ public.dump_answer' \
   -c '\ddp' \
   -c 'CREATE TABLE public.privilege_default_probe (id int4);' \
   -c '\dp public.privilege_default_probe' \
+  -c 'SET ROLE dump_reader;' \
+  -c 'SELECT dump_answer();' \
+  -c 'RESET ROLE;' \
   >"$OUT_DIR/privilege-verify.out" 2>"$OUT_DIR/privilege-verify.err"
 
-grep -F "dump_reader=U/postgres" "$OUT_DIR/privilege-verify.out" >/dev/null
+grep -F "dump_reader=UC/postgres" "$OUT_DIR/privilege-verify.out" >/dev/null
 grep -F "public | accounts" "$OUT_DIR/privilege-verify.out" >/dev/null
 grep -F "public | account_lookup" "$OUT_DIR/privilege-verify.out" >/dev/null
 grep -F "public | account_lookup_layer" "$OUT_DIR/privilege-verify.out" >/dev/null
@@ -414,8 +442,10 @@ grep -F "public | account_snapshot" "$OUT_DIR/privilege-verify.out" >/dev/null
 grep -F "public | account_seq" "$OUT_DIR/privilege-verify.out" >/dev/null
 grep -F "dump_reader=r/postgres" "$OUT_DIR/privilege-verify.out" >/dev/null
 grep -F "dump_reader=rw/postgres" "$OUT_DIR/privilege-verify.out" >/dev/null
+grep -F "dump_reader=X/postgres" "$OUT_DIR/privilege-verify.out" >/dev/null
 grep -F "postgres | public | table | dump_reader=r/postgres" "$OUT_DIR/privilege-verify.out" >/dev/null
 grep -F "privilege_default_probe" "$OUT_DIR/privilege-verify.out" >/dev/null
+grep -F "42" "$OUT_DIR/privilege-verify.out" >/dev/null
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$CUSTOM_RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/custom-restore-server.log" 2>&1 &
@@ -441,6 +471,7 @@ verify_views "$CUSTOM_RESTORE_PORT" "custom"
 verify_materialized_views "$CUSTOM_RESTORE_PORT" "custom"
 verify_sequences "$CUSTOM_RESTORE_PORT" "custom"
 verify_domains "$CUSTOM_RESTORE_PORT" "custom"
+verify_functions "$CUSTOM_RESTORE_PORT" "custom"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$DIRECTORY_RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/directory-restore-server.log" 2>&1 &
@@ -466,6 +497,7 @@ verify_views "$DIRECTORY_RESTORE_PORT" "directory"
 verify_materialized_views "$DIRECTORY_RESTORE_PORT" "directory"
 verify_sequences "$DIRECTORY_RESTORE_PORT" "directory"
 verify_domains "$DIRECTORY_RESTORE_PORT" "directory"
+verify_functions "$DIRECTORY_RESTORE_PORT" "directory"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$TAR_RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/tar-restore-server.log" 2>&1 &
@@ -491,6 +523,7 @@ verify_views "$TAR_RESTORE_PORT" "tar"
 verify_materialized_views "$TAR_RESTORE_PORT" "tar"
 verify_sequences "$TAR_RESTORE_PORT" "tar"
 verify_domains "$TAR_RESTORE_PORT" "tar"
+verify_functions "$TAR_RESTORE_PORT" "tar"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$PARALLEL_DIRECTORY_RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/directory-parallel-restore-server.log" 2>&1 &
@@ -516,6 +549,7 @@ verify_views "$PARALLEL_DIRECTORY_RESTORE_PORT" "directory-parallel"
 verify_materialized_views "$PARALLEL_DIRECTORY_RESTORE_PORT" "directory-parallel"
 verify_sequences "$PARALLEL_DIRECTORY_RESTORE_PORT" "directory-parallel"
 verify_domains "$PARALLEL_DIRECTORY_RESTORE_PORT" "directory-parallel"
+verify_functions "$PARALLEL_DIRECTORY_RESTORE_PORT" "directory-parallel"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$CLEAN_RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/clean-restore-server.log" 2>&1 &
@@ -530,6 +564,7 @@ CREATE VIEW public.account_lookup AS SELECT id, name FROM accounts WHERE id = 99
 CREATE VIEW public.account_lookup_layer AS SELECT * FROM account_lookup;
 CREATE MATERIALIZED VIEW public.account_snapshot AS SELECT id, name FROM accounts ORDER BY id;
 CREATE SEQUENCE public.account_seq;
+CREATE FUNCTION public.dump_answer() RETURNS int LANGUAGE sql AS 'SELECT 99';
 CREATE DOMAIN public.account_id AS int4;
 CREATE DOMAIN public.account_label AS text;
 CREATE TABLE domain_accounts (id account_id, label account_label);
@@ -556,6 +591,7 @@ verify_views "$CLEAN_RESTORE_PORT" "clean"
 verify_materialized_views "$CLEAN_RESTORE_PORT" "clean"
 verify_sequences "$CLEAN_RESTORE_PORT" "clean"
 verify_domains "$CLEAN_RESTORE_PORT" "clean"
+verify_functions "$CLEAN_RESTORE_PORT" "clean"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$INSERT_RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/insert-restore-server.log" 2>&1 &
@@ -581,6 +617,7 @@ verify_views "$INSERT_RESTORE_PORT" "insert"
 verify_materialized_views "$INSERT_RESTORE_PORT" "insert"
 verify_sequences "$INSERT_RESTORE_PORT" "insert"
 verify_domains "$INSERT_RESTORE_PORT" "insert"
+verify_functions "$INSERT_RESTORE_PORT" "insert"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$SPLIT_RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/split-restore-server.log" 2>&1 &
@@ -610,6 +647,7 @@ verify_views "$SPLIT_RESTORE_PORT" "split"
 verify_materialized_views "$SPLIT_RESTORE_PORT" "split" "$OUT_DIR/materialized-view-empty.expected"
 verify_sequences "$SPLIT_RESTORE_PORT" "split"
 verify_domains "$SPLIT_RESTORE_PORT" "split"
+verify_functions "$SPLIT_RESTORE_PORT" "split"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$CUSTOM_SPLIT_RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/custom-split-restore-server.log" 2>&1 &
@@ -639,6 +677,7 @@ verify_views "$CUSTOM_SPLIT_RESTORE_PORT" "custom-split"
 verify_materialized_views "$CUSTOM_SPLIT_RESTORE_PORT" "custom-split" "$OUT_DIR/materialized-view-empty.expected"
 verify_sequences "$CUSTOM_SPLIT_RESTORE_PORT" "custom-split"
 verify_domains "$CUSTOM_SPLIT_RESTORE_PORT" "custom-split"
+verify_functions "$CUSTOM_SPLIT_RESTORE_PORT" "custom-split"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$DIRECTORY_SPLIT_RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/directory-split-restore-server.log" 2>&1 &
@@ -668,6 +707,7 @@ verify_views "$DIRECTORY_SPLIT_RESTORE_PORT" "directory-split"
 verify_materialized_views "$DIRECTORY_SPLIT_RESTORE_PORT" "directory-split" "$OUT_DIR/materialized-view-empty.expected"
 verify_sequences "$DIRECTORY_SPLIT_RESTORE_PORT" "directory-split"
 verify_domains "$DIRECTORY_SPLIT_RESTORE_PORT" "directory-split"
+verify_functions "$DIRECTORY_SPLIT_RESTORE_PORT" "directory-split"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$TAR_SPLIT_RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/tar-split-restore-server.log" 2>&1 &
@@ -697,6 +737,7 @@ verify_views "$TAR_SPLIT_RESTORE_PORT" "tar-split"
 verify_materialized_views "$TAR_SPLIT_RESTORE_PORT" "tar-split" "$OUT_DIR/materialized-view-empty.expected"
 verify_sequences "$TAR_SPLIT_RESTORE_PORT" "tar-split"
 verify_domains "$TAR_SPLIT_RESTORE_PORT" "tar-split"
+verify_functions "$TAR_SPLIT_RESTORE_PORT" "tar-split"
 
 pg_restore --list "$OUT_DIR/dump.custom" >"$OUT_DIR/dump.custom.toc"
 pg_restore --list "$OUT_DIR/dump.dir" >"$OUT_DIR/dump.dir.toc"
@@ -704,12 +745,13 @@ pg_restore --list "$OUT_DIR/dump.tar" >"$OUT_DIR/dump.tar.toc"
 
 grep -F "COPY public.accounts (id, name, tier) FROM stdin;" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "COPY public.events (event_id, note) FROM stdin;" "$OUT_DIR/dump.sql" >/dev/null
-grep -F "GRANT USAGE ON SCHEMA public TO dump_reader;" "$OUT_DIR/dump-privileges.sql" >/dev/null
+grep -F "GRANT ALL ON SCHEMA public TO dump_reader;" "$OUT_DIR/dump-privileges.sql" >/dev/null
 grep -F "GRANT SELECT ON TABLE public.accounts TO dump_reader;" "$OUT_DIR/dump-privileges.sql" >/dev/null
 grep -F "GRANT SELECT ON TABLE public.account_lookup TO dump_reader;" "$OUT_DIR/dump-privileges.sql" >/dev/null
 grep -F "GRANT SELECT ON TABLE public.account_lookup_layer TO dump_reader;" "$OUT_DIR/dump-privileges.sql" >/dev/null
 grep -F "GRANT SELECT ON TABLE public.account_snapshot TO dump_reader;" "$OUT_DIR/dump-privileges.sql" >/dev/null
 grep -F "GRANT SELECT,UPDATE ON SEQUENCE public.account_seq TO dump_reader;" "$OUT_DIR/dump-privileges.sql" >/dev/null
+grep -F "GRANT ALL ON FUNCTION public.dump_answer() TO dump_reader;" "$OUT_DIR/dump-privileges.sql" >/dev/null
 grep -F "ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public GRANT SELECT ON TABLES TO dump_reader;" "$OUT_DIR/dump-privileges.sql" >/dev/null
 grep -F "INSERT INTO public.accounts VALUES" "$OUT_DIR/dump-inserts.sql" >/dev/null
 grep -F "	(1, 'Ada', 7)," "$OUT_DIR/dump-inserts.sql" >/dev/null
@@ -743,6 +785,8 @@ grep -F "CREATE SEQUENCE public.account_seq" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "START WITH 1" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "SELECT pg_catalog.setval('public.account_seq', 2, true);" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "COMMENT ON SEQUENCE public.account_seq IS 'account sequence';" "$OUT_DIR/dump.sql" >/dev/null
+grep -F "CREATE FUNCTION public.dump_answer() RETURNS integer" "$OUT_DIR/dump.sql" >/dev/null
+grep -F '    AS $$SELECT 42$$;' "$OUT_DIR/dump.sql" >/dev/null
 grep -F "COMMENT ON DOMAIN public.account_id IS 'account id domain';" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "COMMENT ON DOMAIN public.account_label IS 'account label domain';" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "COMMENT ON TABLE public.accounts IS 'accounts table';" "$OUT_DIR/dump.sql" >/dev/null
@@ -858,7 +902,9 @@ echo "pg_dump_bounded_view_restore=passed"
 echo "pg_dump_bounded_materialized_view_restore=passed"
 echo "pg_dump_bounded_sequence_restore=passed"
 echo "pg_dump_bounded_domain_restore=passed"
+echo "pg_dump_bounded_function_restore=passed"
 echo "pg_dump_bounded_privilege_restore=passed"
+echo "pg_dump_bounded_privilege_restore_scope=schema_usage_create_relation_sequence_function_execute_default_table_acls"
 echo "dump_file=$OUT_DIR/dump.sql"
 echo "insert_dump_file=$OUT_DIR/dump-inserts.sql"
 echo "schema_dump_file=$OUT_DIR/dump-schema.sql"

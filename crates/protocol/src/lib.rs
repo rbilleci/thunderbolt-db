@@ -3510,15 +3510,40 @@ fn parse_create_function(input: &str) -> Result<CreateFunction, ParseError> {
     if language != "sql" {
         return Err(ParseError::InvalidRelationalSql);
     }
-    let body = match parse_sql_value(rest[as_pos + "AS".len()..].trim())? {
-        SqlValue::Text(value) => value,
-        _ => return Err(ParseError::InvalidRelationalSql),
+    let raw_body = rest[as_pos + "AS".len()..].trim();
+    let body = if let Some(value) = parse_dollar_quoted_literal(raw_body) {
+        value
+    } else {
+        match parse_sql_value(raw_body)? {
+            SqlValue::Text(value) => value,
+            _ => return Err(ParseError::InvalidRelationalSql),
+        }
     };
     Ok(CreateFunction {
         name,
         return_type,
         body,
     })
+}
+
+fn parse_dollar_quoted_literal(input: &str) -> Option<String> {
+    let input = input.trim();
+    let after_open = input.strip_prefix('$')?;
+    let tag_end = after_open.find('$')?;
+    let tag = &after_open[..tag_end];
+    if !tag
+        .chars()
+        .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+    let delimiter = format!("${tag}$");
+    let body_start = delimiter.len();
+    let body_end = input[body_start..].find(&delimiter)? + body_start;
+    if !input[body_end + delimiter.len()..].trim().is_empty() {
+        return None;
+    }
+    Some(input[body_start..body_end].to_string())
 }
 
 fn parse_create_materialized_view(input: &str) -> Result<CreateMaterializedView, ParseError> {
@@ -15169,6 +15194,17 @@ default: Some(ColumnDefault::SequenceNextVal {
             .unwrap(),
             Command::CreateFunction(CreateFunction {
                 name: "answer".to_string(),
+                return_type: SqlType::Int4,
+                body: "SELECT 42".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_command(
+                "CREATE FUNCTION public.dump_answer() RETURNS integer LANGUAGE sql AS $$SELECT 42$$"
+            )
+            .unwrap(),
+            Command::CreateFunction(CreateFunction {
+                name: "dump_answer".to_string(),
                 return_type: SqlType::Int4,
                 body: "SELECT 42".to_string(),
             })

@@ -109,6 +109,7 @@ Pass criteria:
 - `local_product_preflight=passed`
 - Application-driver evidence includes the checked `tokio-postgres`, `sqlx`, `node-postgres`, `asyncpg`, and `psycopg` smoke gates.
 - Dump/restore evidence includes plain, custom, directory, tar, parallel directory, clean, insert-style, and split schema/data restore modes for the supported public object subset.
+- Privilege restore evidence includes bounded schema `USAGE`/`CREATE`, relation, sequence, zero-argument function `EXECUTE`, and default table ACLs for a pre-created bounded role.
 - Local resilience evidence includes backup/PITR/DR plus replication deployment preflight.
 - The output names the remaining `pgx`, JDBC/R2DBC, physical backup, production object-storage, live scheduling, live systemd/Kubernetes rollout, and production timeline-failover gaps.
 
@@ -154,7 +155,7 @@ Pass criteria:
 
 - `local_release_candidate_preflight=passed`
 - Validation evidence includes fmt, clippy, all-features tests, real psql golden coverage, regenerated compatibility scorecard freshness, and checked-in scorecard parity.
-- PostgreSQL product evidence includes the local product preflight over application drivers, pg_dump/restore including bounded privilege restore, and local resilience.
+- PostgreSQL product evidence includes the local product preflight over application drivers, pg_dump/restore including bounded schema/relation/sequence/function/default-table privilege restore, and local resilience.
 - GPU residency evidence includes the local residency preflight over retained CUDA allocation, zero-H2D resident routes, warmup, and maintenance.
 - The output names the remaining blocked `pgx` and JDBC/R2DBC driver gates plus physical backup, production object-storage, live scheduling, live systemd/Kubernetes rollout, production timeline-failover, durable GPU page, autonomous cache-daemon, external orchestration, broad retained-expression, and broad CUDA-event-timing gaps.
 
