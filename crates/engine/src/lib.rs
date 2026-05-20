@@ -6675,12 +6675,43 @@ fn resident_route_query_shape(
                 .columns
                 .iter()
                 .position(|candidate| candidate.name == *column)?;
-            (table.columns[idx].ty == SqlType::Int4
-                && bound.filter.is_none()
-                && bound.filters.is_empty()
-                && bound.filter_groups.is_empty()
-                && select.limit.is_none())
-            .then(|| "int4_scalar_aggregate".to_string())
+            if table.columns[idx].ty != SqlType::Int4 || select.limit.is_some() {
+                return None;
+            }
+            if bound.filter.is_none() && bound.filters.is_empty() && bound.filter_groups.is_empty()
+            {
+                return Some("int4_scalar_aggregate".to_string());
+            }
+            let filter_groups = if !bound.filter_groups.is_empty() {
+                bound.filter_groups.clone()
+            } else if !bound.filters.is_empty() {
+                vec![bound.filters.clone()]
+            } else {
+                vec![vec![bound.filter.clone()?]]
+            };
+            if filter_groups.len() == 1 && filter_groups[0].len() == 1 {
+                let (filter_idx, op, value) = filter_groups[0][0].clone();
+                return (filter_idx == idx
+                    && resident_device_i32_comparison(op).is_some()
+                    && matches!(value, SqlValue::Int4(_)))
+                .then(|| "int4_filtered_scalar_aggregate".to_string());
+            }
+            if filter_groups.len() == 1 && filter_groups[0].len() == 2 {
+                let mut lower = false;
+                let mut upper = false;
+                for (filter_idx, op, value) in &filter_groups[0] {
+                    if *filter_idx != idx || !matches!(value, SqlValue::Int4(_)) {
+                        return None;
+                    }
+                    match op {
+                        SelectFilterOp::Gte => lower = true,
+                        SelectFilterOp::Lte => upper = true,
+                        _ => return None,
+                    }
+                }
+                return (lower && upper).then(|| "int4_between_scalar_aggregate".to_string());
+            }
+            None
         }
         SelectProjection::Columns(columns) if columns.len() == 1 => {
             let idx = table
@@ -13860,6 +13891,14 @@ impl Engine {
             "int4_scalar_aggregate" => {
                 self.execute_relational_scalar_aggregate_with_resident_device_memory_probe(select)
             }
+            "int4_filtered_scalar_aggregate" => self
+                .execute_relational_filtered_scalar_aggregate_with_resident_device_memory_probe(
+                    select,
+                ),
+            "int4_between_scalar_aggregate" => self
+                .execute_relational_between_scalar_aggregate_with_resident_device_memory_probe(
+                    select,
+                ),
             "int4_projection" => {
                 self.execute_relational_projection_with_resident_device_memory_probe(select)
             }
@@ -22606,6 +22645,14 @@ mod tests {
             "SELECT AVG(id) FROM events",
             "SELECT MIN(id) FROM events",
             "SELECT MAX(id) FROM events",
+            "SELECT SUM(id) FROM events WHERE id > 1",
+            "SELECT AVG(id) FROM events WHERE id < 3",
+            "SELECT MIN(id) FROM events WHERE id >= 2",
+            "SELECT MAX(id) FROM events WHERE id <= 2",
+            "SELECT SUM(id) FROM events WHERE id BETWEEN 1 AND 2",
+            "SELECT AVG(id) FROM events WHERE id BETWEEN 2 AND 3",
+            "SELECT MIN(id) FROM events WHERE id BETWEEN 1 AND 3",
+            "SELECT MAX(id) FROM events WHERE id BETWEEN 1 AND 1",
             "SELECT id FROM events WHERE id > 1",
         ] {
             let Command::Select(select) = parse_command(sql).unwrap() else {

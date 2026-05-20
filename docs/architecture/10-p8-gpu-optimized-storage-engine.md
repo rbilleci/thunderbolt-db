@@ -376,16 +376,16 @@ eviction, oversized rejection, and decision facts.
 
 The second P8 code slice adds the first planner-routing decision contract over
 those facts. It records accepted/rejected resident-route decisions for supported
-`COUNT(*)`, simple int4/text predicate count, int4 scalar aggregate, and bounded
-int4 projection shapes, and rejects absent, evicted, invalidated,
+`COUNT(*)`, simple int4/text predicate count, unfiltered/filtered/`BETWEEN`
+int4 scalar aggregate, and bounded int4 projection shapes, and rejects absent, evicted, invalidated,
 memory-pressured, no-retained-memory, view/materialized-view, and unsupported
 shape cases without changing normal SQL execution.
 
 The third P8 code slice uses accepted route decisions to drive
 `Engine::execute_relational_select_with_resident_route(...)`, an opt-in resident
 execution path for retained-device-memory `COUNT(*)`, supported int4/text count
-predicates, int4 scalar aggregates, and bounded int4 range-predicate
-projections. It preserves explicit rejection for unsupported, stale, missing,
+predicates, unfiltered/filtered/`BETWEEN` int4 scalar aggregates, and bounded
+int4 range-predicate projections. It preserves explicit rejection for unsupported, stale, missing,
 or memory-pressured resident paths and still does not make resident GPU
 execution the default SQL path.
 
@@ -393,7 +393,8 @@ The fourth P8 code slice integrates that same decision contract into
 `Engine::execute_relational_select(...)`: accepted retained-device-memory routes
 execute by default with zero per-query resident H2D transfer, while every
 rejected route falls back to the existing MVCC/CUDA-probe path. This is default
-planner routing for the bounded retained-kernel shapes only.
+planner routing for the bounded retained-kernel shapes only, now including the
+already-proven filtered and `BETWEEN` scalar aggregate kernels.
 
 The fifth P8 code slice adds `Engine::warm_relational_residency_with_policy(...)`
 as a deterministic, operator-triggered warmup policy over supported public base
