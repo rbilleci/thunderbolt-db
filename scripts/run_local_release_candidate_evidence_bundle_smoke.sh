@@ -24,12 +24,14 @@ set -euo pipefail
 printf 'local_release_candidate_preflight=passed\n'
 printf 'local_release_candidate_preflight_scope=validation_postgresql_product_plus_gpu_residency\n'
 printf 'local_release_candidate_preflight_validation=fmt_clippy_all_features_psql_golden_scorecard_freshness\n'
-printf 'local_release_candidate_preflight_postgresql=application_drivers_pg_dump_restore_privileges_local_resilience\n'
+printf 'local_release_candidate_preflight_postgresql=application_drivers_pg_dump_restore_pg_dumpall_globals_privileges_local_resilience\n'
 printf 'local_release_candidate_preflight_privileges=schema_usage_create_relation_sequence_function_execute_default_table_acls\n'
 printf 'local_release_candidate_preflight_gpu=residency_baseline_warmup_maintenance\n'
 printf 'local_release_candidate_preflight_gpu_residency=retained_cuda_allocation_zero_h2d_routes_event_timing_warmup_maintenance\n'
 printf 'local_release_candidate_preflight_gap_pgx=blocked_missing_go\n'
 printf 'local_release_candidate_preflight_gap_jdbc_r2dbc=blocked_missing_java_build_tooling\n'
+printf 'local_release_candidate_preflight_gap_pg_dumpall_bootstrap_role_restore=filtered_existing_bootstrap_role\n'
+printf 'local_release_candidate_preflight_gap_pg_dumpall_shared_object_acl_restore=missing\n'
 printf 'local_release_candidate_preflight_gap_physical_page_image_backup=missing\n'
 printf 'local_release_candidate_preflight_gap_production_object_storage=missing\n'
 printf 'local_release_candidate_preflight_gap_live_background_scheduling=missing\n'
@@ -85,8 +87,8 @@ require_line "$PREFLIGHT_LOG" "local_release_candidate_preflight=passed"
 require_line "$GAPS" "local_release_candidate_preflight_gap_pgx=blocked_missing_go"
 require_line "$GAPS" "local_release_candidate_preflight_gap_broad_cuda_event_timing=missing"
 
-if [[ "$(wc -l <"$GAPS" | tr -d ' ')" -ne 13 ]]; then
-  printf 'release evidence bundle smoke expected 13 remaining-gap lines\n' >&2
+if [[ "$(wc -l <"$GAPS" | tr -d ' ')" -ne 15 ]]; then
+  printf 'release evidence bundle smoke expected 15 remaining-gap lines\n' >&2
   exit 1
 fi
 

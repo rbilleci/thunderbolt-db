@@ -4383,6 +4383,18 @@ fn parse_create_tablespace(input: &str) -> Result<CreateTablespace, ParseError> 
         .trim_start();
     let (raw_name, rest) = split_leading_identifier(rest)?;
     let name = normalize_identifier(raw_name)?;
+    let rest = if let Some(after_owner) =
+        strip_keyword_prefix_case_insensitive(rest.trim_start(), "OWNER")
+    {
+        let after_owner = after_owner.trim_start();
+        let Some(after_postgres) = strip_keyword_prefix_case_insensitive(after_owner, "postgres")
+        else {
+            return Err(ParseError::InvalidRelationalSql);
+        };
+        after_postgres
+    } else {
+        rest
+    };
     let rest = strip_keyword_prefix_case_insensitive(rest.trim_start(), "LOCATION")
         .ok_or(ParseError::InvalidRelationalSql)?
         .trim_start();
@@ -13425,6 +13437,14 @@ default: Some(ColumnDefault::SequenceNextVal {
             })
         );
         assert_eq!(
+            parse_command("CREATE TABLESPACE appspace OWNER postgres LOCATION '/tmp/appspace'")
+                .unwrap(),
+            Command::CreateTablespace(CreateTablespace {
+                name: "appspace".to_string(),
+                location: "/tmp/appspace".to_string(),
+            })
+        );
+        assert_eq!(
             parse_command("DROP TABLESPACE IF EXISTS appspace, stale_space").unwrap(),
             Command::DropTablespace(DropTablespace {
                 names: vec!["appspace".to_string(), "stale_space".to_string()],
@@ -13455,7 +13475,7 @@ default: Some(ColumnDefault::SequenceNextVal {
             Err(ParseError::InvalidRelationalSql)
         ));
         assert!(matches!(
-            parse_command("CREATE TABLESPACE appspace OWNER postgres LOCATION '/tmp/appspace'"),
+            parse_command("CREATE TABLESPACE appspace OWNER app_owner LOCATION '/tmp/appspace'"),
             Err(ParseError::InvalidRelationalSql)
         ));
         assert!(matches!(

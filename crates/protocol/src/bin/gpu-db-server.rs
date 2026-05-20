@@ -8468,6 +8468,13 @@ fn execute_statement(
             &catalog_role_oid_rows(session),
         );
     }
+    if canonical == pg_dumpall_role_metadata_query() {
+        return write_single_row(
+            stream,
+            &pg_dumpall_role_metadata_columns(),
+            &pg_dumpall_role_metadata_rows(session),
+        );
+    }
     if canonical
         == "select x.tableoid, x.oid, x.extname, n.nspname, x.extrelocatable, x.extversion, x.extconfig, x.extcondition from pg_extension x join pg_namespace n on n.oid = x.extnamespace"
     {
@@ -8787,6 +8794,13 @@ fn execute_statement(
             &pg_dump_function_metadata_rows(session),
         );
     }
+    if is_pg_dumpall_tablespace_metadata_query(&canonical) {
+        return write_single_row(
+            stream,
+            &pg_dumpall_tablespace_metadata_columns(),
+            &pg_dumpall_tablespace_metadata_rows(session),
+        );
+    }
     if let Some(columns) = pg_dump_empty_catalog_query_columns(&canonical) {
         return write_single_row(stream, &columns, &catalog_empty_rows());
     }
@@ -8869,6 +8883,56 @@ fn execute_statement(
                 int4_column("classoid"),
                 int4_column("objoid"),
                 int4_column("objsubid"),
+            ],
+            &catalog_empty_rows(),
+        );
+    }
+    if canonical.starts_with("select provider, label from pg_catalog.pg_shseclabel where ") {
+        return write_single_row(
+            stream,
+            &[text_column("provider"), text_column("label")],
+            &catalog_empty_rows(),
+        );
+    }
+    if canonical.starts_with("select unnest(setconfig) from pg_db_role_setting ")
+        || canonical.starts_with("select rolname, unnest(setconfig) from pg_db_role_setting ")
+    {
+        let columns = if canonical.starts_with("select rolname,") {
+            vec![text_column("rolname"), text_column("unnest")]
+        } else {
+            vec![text_column("unnest")]
+        };
+        return write_single_row(stream, &columns, &catalog_empty_rows());
+    }
+    if canonical.starts_with("select ur.rolname as role, um.rolname as member")
+        && canonical.contains("from pg_auth_members a")
+    {
+        return write_single_row(
+            stream,
+            &[
+                text_column("role"),
+                text_column("member"),
+                text_column("grantor"),
+                int4_column("roleid"),
+                int4_column("memberid"),
+                int4_column("grantorid"),
+                bool_column("admin_option"),
+                bool_column("inherit_option"),
+                bool_column("set_option"),
+            ],
+            &catalog_empty_rows(),
+        );
+    }
+    if canonical.starts_with("select parname, pg_catalog.pg_get_userbyid(10) as parowner")
+        && canonical.contains("from pg_catalog.pg_parameter_acl")
+    {
+        return write_single_row(
+            stream,
+            &[
+                text_column("parname"),
+                text_column("parowner"),
+                text_column("paracl"),
+                text_column("acldefault"),
             ],
             &catalog_empty_rows(),
         );
@@ -12668,6 +12732,13 @@ fn execute_statement(
             &catalog_database_acl_rows(session),
         );
     }
+    if is_pg_dumpall_tablespace_metadata_query(&canonical) {
+        return write_single_row(
+            stream,
+            &pg_dumpall_tablespace_metadata_columns(),
+            &pg_dumpall_tablespace_metadata_rows(session),
+        );
+    }
     if canonical == psql_list_tablespaces_catalog_query() {
         return write_single_row(
             stream,
@@ -14154,6 +14225,79 @@ fn psql_describe_roles_verbose_catalog_query() -> &'static str {
     "select r.rolname, r.rolsuper, r.rolinherit, r.rolcreaterole, r.rolcreatedb, r.rolcanlogin, r.rolconnlimit, r.rolvaliduntil , pg_catalog.shobj_description(r.oid, 'pg_authid') as description , r.rolreplication , r.rolbypassrls from pg_catalog.pg_roles r where r.rolname !~ '^pg_' order by 1"
 }
 
+fn pg_dumpall_role_metadata_query() -> &'static str {
+    "select oid, rolname, rolsuper, rolinherit, rolcreaterole, rolcreatedb, rolcanlogin, rolconnlimit, rolpassword, rolvaliduntil, rolreplication, rolbypassrls, pg_catalog.shobj_description(oid, 'pg_authid') as rolcomment, rolname = current_user as is_current_user from pg_roles where rolname !~ '^pg_' order by 2"
+}
+
+fn pg_dumpall_role_metadata_columns() -> Vec<Column> {
+    vec![
+        int4_column("oid"),
+        text_column("rolname"),
+        bool_column("rolsuper"),
+        bool_column("rolinherit"),
+        bool_column("rolcreaterole"),
+        bool_column("rolcreatedb"),
+        bool_column("rolcanlogin"),
+        int4_column("rolconnlimit"),
+        text_column("rolpassword"),
+        text_column("rolvaliduntil"),
+        bool_column("rolreplication"),
+        bool_column("rolbypassrls"),
+        text_column("rolcomment"),
+        bool_column("is_current_user"),
+    ]
+}
+
+fn pg_dumpall_role_metadata_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut rows = vec![vec![
+        Some("10".to_string()),
+        Some("postgres".to_string()),
+        Some("t".to_string()),
+        Some("t".to_string()),
+        Some("t".to_string()),
+        Some("t".to_string()),
+        Some("t".to_string()),
+        Some("-1".to_string()),
+        None,
+        None,
+        Some("t".to_string()),
+        Some("t".to_string()),
+        session
+            .comments
+            .get(&CatalogCommentTarget::Role {
+                role: "postgres".to_string(),
+            })
+            .cloned(),
+        Some("t".to_string()),
+    ]];
+    let mut roles = session.roles.values().collect::<Vec<_>>();
+    roles.sort_by(|left, right| left.name.cmp(&right.name));
+    rows.extend(roles.into_iter().map(|role| {
+        vec![
+            Some(role.oid.to_string()),
+            Some(role.name.clone()),
+            Some("f".to_string()),
+            Some("t".to_string()),
+            Some("f".to_string()),
+            Some("f".to_string()),
+            Some(if role.login { "t" } else { "f" }.to_string()),
+            Some("-1".to_string()),
+            None,
+            None,
+            Some("f".to_string()),
+            Some("f".to_string()),
+            session
+                .comments
+                .get(&CatalogCommentTarget::Role {
+                    role: role.name.clone(),
+                })
+                .cloned(),
+            Some("f".to_string()),
+        ]
+    }));
+    rows
+}
+
 fn catalog_psql_describe_role_rows(session: &Session, verbose: bool) -> Vec<Vec<Option<String>>> {
     let mut rows = Vec::new();
     let mut row = vec![
@@ -14401,6 +14545,52 @@ fn catalog_tablespace_acl_rows(session: &Session) -> Vec<Vec<Option<String>>> {
         .into_iter()
         .map(|space| vec![Some(space.clone()), tablespace_acl_display(session, &space)])
         .collect()
+}
+
+fn pg_dumpall_tablespace_metadata_columns() -> Vec<Column> {
+    vec![
+        int4_column("oid"),
+        text_column("spcname"),
+        text_column("spcowner"),
+        text_column("pg_tablespace_location"),
+        text_column("spcacl"),
+        text_column("acldefault"),
+        text_column("array_to_string"),
+        text_column("shobj_description"),
+    ]
+}
+
+fn pg_dumpall_tablespace_metadata_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let mut spaces = session.tablespaces.values().cloned().collect::<Vec<_>>();
+    spaces.sort_by_key(|space| space.oid);
+    spaces
+        .into_iter()
+        .map(|space| {
+            vec![
+                Some(space.oid.to_string()),
+                Some(space.name.clone()),
+                Some("postgres".to_string()),
+                Some(space.location.clone()),
+                None,
+                None,
+                None,
+                session
+                    .comments
+                    .get(&CatalogCommentTarget::Tablespace {
+                        tablespace: space.name,
+                    })
+                    .cloned(),
+            ]
+        })
+        .collect()
+}
+
+fn is_pg_dumpall_tablespace_metadata_query(canonical: &str) -> bool {
+    (canonical.contains("from pg_catalog.pg_tablespace")
+        || canonical.contains("from pg_tablespace"))
+        && canonical.contains("spcacl")
+        && canonical.contains("acldefault")
+        && canonical.contains("shobj_description")
 }
 
 fn psql_list_access_methods_catalog_query() -> &'static str {
@@ -16216,20 +16406,42 @@ fn pg_dump_empty_catalog_query_columns(canonical: &str) -> Option<Vec<Column>> {
     {
         return Some(pg_language_discovery_columns());
     }
-    if canonical
-        == "select provider, label from pg_catalog.pg_shseclabel where classoid = 'pg_catalog.pg_database'::pg_catalog.regclass and objoid = '5'"
-    {
+    if canonical.starts_with("select provider, label from pg_catalog.pg_shseclabel where ") {
         return Some(vec![text_column("provider"), text_column("label")]);
     }
-    if canonical
-        == "select unnest(setconfig) from pg_db_role_setting where setrole = 0 and setdatabase = '5'::oid"
-    {
+    if canonical.starts_with("select unnest(setconfig) from pg_db_role_setting ") {
         return Some(vec![text_column("unnest")]);
     }
-    if canonical
-        == "select rolname, unnest(setconfig) from pg_db_role_setting s, pg_roles r where setrole = r.oid and setdatabase = '5'::oid"
-    {
+    if canonical.starts_with("select rolname, unnest(setconfig) from pg_db_role_setting ") {
         return Some(vec![text_column("rolname"), text_column("unnest")]);
+    }
+    if canonical.starts_with("select ur.rolname as role, um.rolname as member")
+        && canonical.contains("from pg_auth_members a")
+    {
+        return Some(vec![
+            text_column("role"),
+            text_column("member"),
+            text_column("grantor"),
+            int4_column("roleid"),
+            int4_column("memberid"),
+            int4_column("grantorid"),
+            bool_column("admin_option"),
+            bool_column("inherit_option"),
+            bool_column("set_option"),
+        ]);
+    }
+    if canonical.starts_with("select parname, pg_catalog.pg_get_userbyid(10) as parowner")
+        && canonical.contains("from pg_catalog.pg_parameter_acl")
+    {
+        return Some(vec![
+            text_column("parname"),
+            text_column("parowner"),
+            text_column("paracl"),
+            text_column("acldefault"),
+        ]);
+    }
+    if is_pg_dumpall_tablespace_metadata_query(canonical) {
+        return Some(pg_dumpall_tablespace_metadata_columns());
     }
     if canonical == "select tableoid, oid, oprname, oprnamespace, oprowner, oprkind, oprleft, oprright, oprcode::oid as oprcode from pg_operator" {
         return Some(vec![
@@ -20383,6 +20595,7 @@ fn is_pg_dump_session_set_statement(canonical: &str) -> bool {
             | "set row_security = off"
             | "set default_tablespace = ''"
             | "set default_table_access_method = heap"
+            | "set default_transaction_read_only = off"
             | "set transaction isolation level repeatable read, read only"
     )
 }
@@ -22064,6 +22277,14 @@ mod tests {
             canonical_sql("  SELECT   1   AS One ; ; "),
             "select 1 as one"
         );
+    }
+
+    #[test]
+    fn recognizes_pg_dumpall_tablespace_metadata_query() {
+        let canonical = canonical_sql(
+            "SELECT oid, spcname, pg_catalog.pg_get_userbyid(spcowner) AS spcowner, pg_catalog.pg_tablespace_location(oid), spcacl, acldefault('t', spcowner) AS acldefault, array_to_string(spcoptions, ', '),pg_catalog.shobj_description(oid, 'pg_tablespace') FROM pg_catalog.pg_tablespace WHERE spcname !~ '^pg_' ORDER BY 1",
+        );
+        assert!(is_pg_dumpall_tablespace_metadata_query(&canonical));
     }
 
     #[test]

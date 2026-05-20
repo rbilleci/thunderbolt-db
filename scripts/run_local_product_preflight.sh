@@ -66,6 +66,14 @@ run_gate \
   "pg_dump_bounded_privilege_restore_scope=schema_usage_create_relation_sequence_function_execute_default_table_acls"
 
 run_gate \
+  pg_dumpall_globals \
+  tests/compat/pg-dumpall/run.sh \
+  "pg_dumpall_globals_restore=passed" \
+  "pg_dumpall_globals_scope=roles_tablespaces_comments_no_role_passwords" \
+  "pg_dumpall_globals_gap_bootstrap_role_restore=filtered_existing_bootstrap_role" \
+  "pg_dumpall_globals_gap_shared_object_acl_restore=missing"
+
+run_gate \
   local_resilience \
   scripts/run_local_resilience_drill.sh \
   "local_resilience_drill=passed" \
@@ -80,11 +88,13 @@ run_gate \
   "local_resilience_gap_production_timeline_failover=missing"
 
 printf 'local_product_preflight=passed\n'
-printf 'local_product_preflight_scope=application_drivers_pg_dump_restore_local_resilience\n'
+printf 'local_product_preflight_scope=application_drivers_pg_dump_restore_pg_dumpall_globals_local_resilience\n'
 printf 'local_product_preflight_drivers=tokio-postgres,sqlx,node-postgres,asyncpg,psycopg\n'
-printf 'local_product_preflight_dump_restore=plain_custom_directory_tar_parallel_clean_insert_split_privileges\n'
+printf 'local_product_preflight_dump_restore=plain_custom_directory_tar_parallel_clean_insert_split_privileges_pg_dumpall_globals\n'
 printf 'local_product_preflight_resilience=backup_pitr_dr_plus_replication_deployment\n'
 printf 'local_product_preflight_privileges=schema_usage_create_relation_sequence_function_execute_default_table_acls\n'
+printf 'local_product_preflight_gap_pg_dumpall_bootstrap_role_restore=filtered_existing_bootstrap_role\n'
+printf 'local_product_preflight_gap_pg_dumpall_shared_object_acl_restore=missing\n'
 printf 'local_product_preflight_gap_pgx=blocked_missing_go\n'
 printf 'local_product_preflight_gap_jdbc_r2dbc=blocked_missing_java_build_tooling\n'
 printf 'local_product_preflight_gap_physical_page_image_backup=missing\n'
