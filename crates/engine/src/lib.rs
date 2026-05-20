@@ -23,7 +23,7 @@ use gpu_db_protocol::{
     ColumnDef, ColumnDefault, Command, CommentTarget, CreateDatabase, CreateDomain,
     CreateExtension, CreateIndex, CreateMaterializedView, CreatePublication, CreateRole,
     CreateSchema, CreateSequence, CreateSubscription, CreateTable, CreateTablespace, CreateView,
-    DatabasePrivilege, Delete, DropConstraint, DropDatabase, DropDomain, DropIndex,
+    DatabasePrivilege, Delete, DropConstraint, DropDatabase, DropDomain, DropExtension, DropIndex,
     DropMaterializedView, DropPublication, DropRole, DropSchema, DropSequence, DropSubscription,
     DropTable, DropTablespace, DropView, Insert, ParseError, PublicationTarget,
     RefreshMaterializedView, RenameColumn, RenameConstraint, RenameDatabase, RenameFunction,
@@ -111,6 +111,7 @@ impl ReplicatedStateMachine for KvStateMachine {
                     | Command::DropFunction(_)
                     | Command::SelectFunction(_)
                     | Command::CreateExtension(_)
+                    | Command::DropExtension(_)
                     | Command::CreateSequence(_)
                     | Command::CreateDomain(_)
                     | Command::SequenceNextVal(_)
@@ -6330,6 +6331,21 @@ fn validate_bootstrap_create_extension(create: &CreateExtension) -> Result<(), E
     if !create.if_not_exists {
         return Err(EngineError::ApplyFailed(
             "extension \"plpgsql\" already exists".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_bootstrap_drop_extension(drop: &DropExtension) -> Result<(), EngineError> {
+    if drop.name != "plpgsql" {
+        return Err(EngineError::ApplyFailed(format!(
+            "extension \"{}\" does not exist",
+            drop.name
+        )));
+    }
+    if !drop.if_exists {
+        return Err(EngineError::ApplyFailed(
+            "cannot drop bootstrap extension \"plpgsql\"".to_string(),
         ));
     }
     Ok(())
@@ -13689,6 +13705,10 @@ impl Engine {
                 validate_bootstrap_create_extension(&create).map_err(ExecuteError::Engine)?;
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
+            Command::DropExtension(drop) => {
+                validate_bootstrap_drop_extension(&drop).map_err(ExecuteError::Engine)?;
+                self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
+            }
             Command::Begin => {
                 self.txn_manager.begin_with_id(txn_id)?;
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
@@ -13910,6 +13930,10 @@ impl Engine {
                 validate_bootstrap_create_extension(&create).map_err(ExecuteError::Engine)?;
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
             }
+            Command::DropExtension(drop) => {
+                validate_bootstrap_drop_extension(&drop).map_err(ExecuteError::Engine)?;
+                self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
+            }
             Command::Begin => {
                 self.txn_manager.begin_with_id(txn_id)?;
                 self.metrics.inc_fallback(FallbackReason::NotGpuEligible);
@@ -13994,6 +14018,7 @@ impl Engine {
                 Err(ExecuteError::NonReadCommand("CREATE MATERIALIZED VIEW"))
             }
             Command::CreateExtension(_) => Err(ExecuteError::NonReadCommand("CREATE EXTENSION")),
+            Command::DropExtension(_) => Err(ExecuteError::NonReadCommand("DROP EXTENSION")),
             Command::RefreshMaterializedView(_) => {
                 Err(ExecuteError::NonReadCommand("REFRESH MATERIALIZED VIEW"))
             }
@@ -20098,6 +20123,43 @@ mod tests {
                 if message == "plpgsql extension creation is only supported in pg_catalog"
         ));
         assert_eq!(e.metrics().commits_total, 0);
+    }
+
+    #[test]
+    fn execute_text_accepts_bootstrap_extension_if_exists_cleanup() {
+        let mut e = Engine::new_local();
+
+        e.execute_text(1, "COMMENT ON EXTENSION plpgsql IS 'bootstrap extension'")
+            .unwrap();
+        e.execute_text(2, "DROP EXTENSION IF EXISTS plpgsql")
+            .unwrap();
+        assert_eq!(
+            e.relational_extension_comment("plpgsql"),
+            Some("bootstrap extension")
+        );
+
+        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        assert_eq!(
+            recovered.relational_extension_comment("plpgsql"),
+            Some("bootstrap extension")
+        );
+
+        let bootstrap_drop = e.execute_text(3, "DROP EXTENSION plpgsql").unwrap_err();
+        assert!(matches!(
+            bootstrap_drop,
+            ExecuteError::Engine(EngineError::ApplyFailed(message))
+                if message == "cannot drop bootstrap extension \"plpgsql\""
+        ));
+
+        let unsupported = e
+            .execute_text(4, "DROP EXTENSION IF EXISTS hstore")
+            .unwrap_err();
+        assert!(matches!(
+            unsupported,
+            ExecuteError::Engine(EngineError::ApplyFailed(message))
+                if message == "extension \"hstore\" does not exist"
+        ));
+        assert_eq!(e.metrics().commits_total, 1);
     }
 
     #[test]

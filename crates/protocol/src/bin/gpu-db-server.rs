@@ -8647,6 +8647,29 @@ fn execute_statement(
                 }
                 return write_command_complete(stream, "CREATE EXTENSION");
             }
+            Command::DropExtension(drop) => {
+                if drop.name != "plpgsql" {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "42704",
+                            message: "extension does not exist",
+                            position: None,
+                        },
+                    );
+                }
+                if !drop.if_exists {
+                    return write_error(
+                        stream,
+                        &ErrorField {
+                            code: "0A000",
+                            message: "cannot drop bootstrap extension \"plpgsql\"",
+                            position: None,
+                        },
+                    );
+                }
+                return write_command_complete(stream, "DROP EXTENSION");
+            }
             Command::CreateSchema(create) => {
                 if create.name != "public" {
                     return write_error(

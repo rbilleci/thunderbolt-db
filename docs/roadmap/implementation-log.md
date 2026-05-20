@@ -2,11 +2,19 @@
 
 ## 2026-05-20
 
+- Added bounded bootstrap extension cleanup for restore traffic.
+  `DROP EXTENSION IF EXISTS plpgsql` now parses and is accepted as a
+  metadata-preserving no-op through the engine and compatibility endpoint, so
+  restore cleanup can proceed without hiding the bootstrap `plpgsql` extension
+  or procedural-language rows. Non-`IF EXISTS` bootstrap drops, unsupported
+  extension names, cascade/restrict, actual extension uninstall, update,
+  relocation, and extension-owned dependency semantics remain out of scope.
+
 - Added bounded bootstrap extension comments.
   `COMMENT ON EXTENSION plpgsql IS {literal|NULL}` now parses, persists through
   engine WAL replay, appears through the compatibility endpoint's `\dx` output
   and `pg_catalog.pg_description` discovery, and rejects unsupported extension
-  names before mutation while keeping extension drop/update/relocation,
+  names before mutation while keeping actual extension uninstall/update/relocation,
   extension-owned object semantics, and broader plugin behavior out of scope.
 
 - Added a local release-candidate evidence bundle wrapper.
@@ -114,7 +122,7 @@
 
 - Added bounded metadata-only database catalog support. `CREATE DATABASE name`, `DROP DATABASE [IF EXISTS] name [, ...]`, and `COMMENT ON DATABASE name` now persist through engine WAL replay and protocol shared catalog state for supported application database rows, appear through real PostgreSQL 16 `psql \l` / `\l+` plus direct `pg_catalog.pg_database` probes, and clean supported database comments on drop. Connection routing, per-database storage namespaces, templates/cloning, owners/ACLs, encoding/locale/tablespace options, `ALTER DATABASE`, `DROP DATABASE FORCE`, permission enforcement, and broader database semantics remain out of scope. Real psql golden scenario 344 covers the client-facing workflow.
 
-- Added bounded bootstrap-extension restore/setup handling. `CREATE EXTENSION IF NOT EXISTS plpgsql` and `CREATE EXTENSION IF NOT EXISTS "plpgsql" WITH SCHEMA pg_catalog` are accepted as idempotent no-op traffic against the metadata-only bootstrap extension already exposed through `\dx` and direct `pg_catalog.pg_extension` discovery. Duplicate non-`IF NOT EXISTS` creates, unsupported extension names, unsupported schemas, and `DROP EXTENSION` remain rejected while extension drop/update/relocation, extension-owned dependencies, and procedural execution stay out of scope. Real psql golden scenario 54 covers the client-facing workflow.
+- Added bounded bootstrap-extension restore/setup handling. `CREATE EXTENSION IF NOT EXISTS plpgsql` and `CREATE EXTENSION IF NOT EXISTS "plpgsql" WITH SCHEMA pg_catalog` are accepted as idempotent no-op traffic against the metadata-only bootstrap extension already exposed through `\dx` and direct `pg_catalog.pg_extension` discovery. Duplicate non-`IF NOT EXISTS` creates, unsupported extension names, unsupported schemas, and non-`IF EXISTS` bootstrap drops remain rejected while actual extension uninstall/update/relocation, extension-owned dependencies, and procedural execution stay out of scope. Real psql golden scenario 54 covers the client-facing workflow.
 
 ## 2026-05-19
 
@@ -340,7 +348,7 @@
 - Advanced P2 catalog/schema/type spine by supporting real PostgreSQL 16 `psql \dA` access-method-listing traffic. The compatibility endpoint now accepts the `pg_catalog.pg_am` query shape emitted by psql and returns the supported bootstrap `heap` table access method while keeping access-method creation, extension, and broader access-method catalog behavior out of scope.
 - Advanced P2 catalog/schema/type spine by supporting real PostgreSQL 16 `psql \dL` procedural-language-listing traffic. The compatibility endpoint now accepts the `pg_catalog.pg_language` query shape emitted by psql and exposes metadata-only bootstrap `plpgsql` rows while keeping procedural execution, language creation, and broader language catalog behavior out of scope.
 - Advanced P2 catalog/schema/type spine by supporting real PostgreSQL 16 `psql \db` tablespace-listing traffic. The compatibility endpoint now accepts the `pg_catalog.pg_tablespace` query shape emitted by psql and returns bootstrap `pg_default` / `pg_global` metadata while keeping tablespace creation, location management, options, and broader tablespace catalog behavior out of scope.
-- Advanced P2 catalog/schema/type spine by supporting real PostgreSQL 16 `psql \dx` extension-listing traffic. The compatibility endpoint now accepts the `pg_catalog.pg_extension` / `pg_namespace` / `pg_description` query shape emitted by psql and exposes metadata-only bootstrap `plpgsql` rows while keeping extension install/drop/update/relocation, extension-owned object semantics, and broader extension catalog behavior out of scope.
+- Advanced P2 catalog/schema/type spine by supporting real PostgreSQL 16 `psql \dx` extension-listing traffic. The compatibility endpoint now accepts the `pg_catalog.pg_extension` / `pg_namespace` / `pg_description` query shape emitted by psql and exposes metadata-only bootstrap `plpgsql` rows while keeping extension install/uninstall/update/relocation, extension-owned object semantics, and broader extension catalog behavior out of scope.
 - Advanced P2 catalog/schema/type spine by supporting real PostgreSQL 16 `psql \l` database-listing traffic. The compatibility endpoint now accepts the `pg_catalog.pg_database` query shape emitted by psql and returns the supported bootstrap `postgres` database metadata while keeping database creation, templates, ACL mutation, and broader database catalog behavior out of scope.
 - Advanced P2 catalog/schema/type spine by supporting real PostgreSQL 16 `psql \du` role-listing traffic. The compatibility endpoint now accepts the `pg_catalog.pg_roles` query shape emitted by psql and returns the bootstrap `postgres` role with explicit superuser/login/create-db/create-role/replication/bypass-RLS attributes while keeping role mutation and broader role catalog behavior out of scope.
 - Advanced P2 catalog/schema/type spine by supporting real PostgreSQL 16 `psql \df` function-listing traffic. The compatibility endpoint now accepts the `pg_catalog.pg_proc` / `pg_namespace` query shape emitted by psql and truthfully returns no rows for the current no-user-defined-function subset.

@@ -40,6 +40,7 @@ pub enum Command {
     DropFunction(DropFunction),
     SelectFunction(SelectFunction),
     CreateExtension(CreateExtension),
+    DropExtension(DropExtension),
     CreateSequence(CreateSequence),
     CreateDomain(CreateDomain),
     SequenceNextVal(SequenceNextVal),
@@ -543,6 +544,12 @@ pub struct CreateExtension {
     pub name: String,
     pub if_not_exists: bool,
     pub schema: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropExtension {
+    pub name: String,
+    pub if_exists: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2163,6 +2170,9 @@ fn parse_relational_command(input: &str) -> Option<Result<Command, ParseError>> 
         }
         if second.eq_ignore_ascii_case("DOMAIN") {
             return Some(parse_drop_domain(input).map(Command::DropDomain));
+        }
+        if second.eq_ignore_ascii_case("EXTENSION") {
+            return Some(parse_drop_extension(input).map(Command::DropExtension));
         }
         if second.eq_ignore_ascii_case("PUBLICATION") {
             return Some(parse_drop_publication(input).map(Command::DropPublication));
@@ -4992,6 +5002,32 @@ fn parse_create_extension(input: &str) -> Result<CreateExtension, ParseError> {
         name,
         if_not_exists,
         schema,
+    })
+}
+
+fn parse_drop_extension(input: &str) -> Result<DropExtension, ParseError> {
+    let mut rest = strip_keyword_prefix_case_insensitive(input, "DROP")
+        .and_then(|s| strip_keyword_prefix_case_insensitive(s.trim_start(), "EXTENSION"))
+        .ok_or(ParseError::InvalidRelationalSql)?
+        .trim_start();
+    let if_exists = if let Some(after_if) = strip_keyword_prefix_case_insensitive(rest, "IF") {
+        let after_exists = strip_keyword_prefix_case_insensitive(after_if.trim_start(), "EXISTS")
+            .ok_or(ParseError::InvalidRelationalSql)?;
+        rest = after_exists.trim_start();
+        true
+    } else {
+        false
+    };
+    if rest.is_empty()
+        || rest.contains(',')
+        || find_keyword_outside_quotes(rest, "CASCADE").is_some()
+        || find_keyword_outside_quotes(rest, "RESTRICT").is_some()
+    {
+        return Err(ParseError::InvalidRelationalSql);
+    }
+    Ok(DropExtension {
+        name: normalize_identifier(rest)?,
+        if_exists,
     })
 }
 
@@ -15133,6 +15169,33 @@ default: Some(ColumnDefault::SequenceNextVal {
             parse_command(
                 "CREATE EXTENSION IF NOT EXISTS plpgsql WITH SCHEMA public VERSION '1.0'"
             ),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+    }
+
+    #[test]
+    fn parses_bounded_bootstrap_extension_drop_cleanup() {
+        assert_eq!(
+            parse_command("DROP EXTENSION IF EXISTS plpgsql").unwrap(),
+            Command::DropExtension(DropExtension {
+                name: "plpgsql".to_string(),
+                if_exists: true,
+            })
+        );
+        assert_eq!(
+            parse_command("DROP EXTENSION \"plpgsql\"").unwrap(),
+            Command::DropExtension(DropExtension {
+                name: "plpgsql".to_string(),
+                if_exists: false,
+            })
+        );
+
+        assert!(matches!(
+            parse_command("DROP EXTENSION IF EXISTS plpgsql CASCADE"),
+            Err(ParseError::InvalidRelationalSql)
+        ));
+        assert!(matches!(
+            parse_command("DROP EXTENSION IF EXISTS plpgsql, hstore"),
             Err(ParseError::InvalidRelationalSql)
         ));
     }

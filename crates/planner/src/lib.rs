@@ -162,9 +162,9 @@ impl Planner {
                 },
                 kind: PlanKind::Admin,
             },
-            Command::CreateExtension(_) => PlanNode {
+            Command::CreateExtension(_) | Command::DropExtension(_) => PlanNode {
                 op: PlannedOp {
-                    name: "bootstrap_extension_create".to_string(),
+                    name: "bootstrap_extension_admin".to_string(),
                     target: DeviceTarget::Cpu,
                 },
                 kind: PlanKind::Admin,
