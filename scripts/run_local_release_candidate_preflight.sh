@@ -46,7 +46,7 @@ run_gate \
   "local_product_preflight=passed" \
   "local_product_preflight_scope=application_drivers_pg_dump_restore_local_resilience" \
   "local_product_preflight_drivers=tokio-postgres,sqlx,node-postgres,asyncpg,psycopg" \
-  "local_product_preflight_dump_restore=plain_custom_directory_tar_parallel_clean_insert_split" \
+  "local_product_preflight_dump_restore=plain_custom_directory_tar_parallel_clean_insert_split_privileges" \
   "local_product_preflight_resilience=backup_pitr_dr_plus_replication_deployment" \
   "local_product_preflight_gap_pgx=blocked_missing_go" \
   "local_product_preflight_gap_jdbc_r2dbc=blocked_missing_java_build_tooling" \
@@ -76,7 +76,7 @@ run_gate \
 printf 'local_release_candidate_preflight=passed\n'
 printf 'local_release_candidate_preflight_scope=validation_postgresql_product_plus_gpu_residency\n'
 printf 'local_release_candidate_preflight_validation=fmt_clippy_all_features_psql_golden_scorecard_freshness\n'
-printf 'local_release_candidate_preflight_postgresql=application_drivers_pg_dump_restore_local_resilience\n'
+printf 'local_release_candidate_preflight_postgresql=application_drivers_pg_dump_restore_privileges_local_resilience\n'
 printf 'local_release_candidate_preflight_gpu=residency_baseline_warmup_maintenance\n'
 printf 'local_release_candidate_preflight_drivers=tokio-postgres,sqlx,node-postgres,asyncpg,psycopg\n'
 printf 'local_release_candidate_preflight_gpu_residency=retained_cuda_allocation_zero_h2d_routes_warmup_maintenance\n'

@@ -2,6 +2,18 @@
 
 ## 2026-05-20
 
+- Added privilege-aware pg-dump/pg-restore coverage for bounded public ACL metadata.
+  The compatibility endpoint now handles PostgreSQL 16 pg-dump column-ACL and
+  initial-privilege discovery as empty unsupported surfaces, exposes relation
+  ACL/default-ACL metadata in pg-dump-compatible array form, and accepts
+  pg-dump-emitted `GRANT ... ON TABLE` statements for supported views and
+  materialized views. `tests/compat/pg-dump/run.sh` now proves schema ACLs,
+  table/view/materialized-view/sequence ACLs, and default table privileges
+  round-trip through a real privilege-aware schema dump when the bounded grantee
+  role is precreated on the target, while ownership, permission enforcement,
+  column ACLs, row policies, shared-object/global ACL dumps, and non-table
+  default privileges remain out of scope.
+
 - Added a top-level local release-candidate preflight gate.
   `scripts/run_local_release_candidate_preflight.sh` runs the local
   PostgreSQL-compatible product preflight plus the local GPU residency

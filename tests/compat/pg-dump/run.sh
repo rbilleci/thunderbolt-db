@@ -15,6 +15,7 @@ SPLIT_RESTORE_PORT="${PG_DUMP_SMOKE_SPLIT_RESTORE_PORT:-55452}"
 CUSTOM_SPLIT_RESTORE_PORT="${PG_DUMP_SMOKE_CUSTOM_SPLIT_RESTORE_PORT:-55453}"
 DIRECTORY_SPLIT_RESTORE_PORT="${PG_DUMP_SMOKE_DIRECTORY_SPLIT_RESTORE_PORT:-55454}"
 TAR_SPLIT_RESTORE_PORT="${PG_DUMP_SMOKE_TAR_SPLIT_RESTORE_PORT:-55455}"
+PRIVILEGE_RESTORE_PORT="${PG_DUMP_SMOKE_PRIVILEGE_RESTORE_PORT:-55456}"
 
 rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR"
@@ -31,6 +32,7 @@ split_restore_pid=""
 custom_split_restore_pid=""
 directory_split_restore_pid=""
 tar_split_restore_pid=""
+privilege_restore_pid=""
 
 cleanup() {
   if [[ -n "$source_pid" ]]; then
@@ -81,6 +83,10 @@ cleanup() {
     kill "$tar_split_restore_pid" 2>/dev/null || true
     wait "$tar_split_restore_pid" 2>/dev/null || true
   fi
+  if [[ -n "$privilege_restore_pid" ]]; then
+    kill "$privilege_restore_pid" 2>/dev/null || true
+    wait "$privilege_restore_pid" 2>/dev/null || true
+  fi
 }
 trap cleanup EXIT
 
@@ -105,6 +111,7 @@ wait_for_port "$SOURCE_PORT"
 
 PGHOST=127.0.0.1 PGPORT="$SOURCE_PORT" PGDATABASE=postgres PGUSER=postgres \
   psql -v ON_ERROR_STOP=1 -X -q <<'SQL'
+CREATE ROLE dump_reader;
 CREATE DOMAIN public.account_id AS int4;
 CREATE DOMAIN public.account_label AS text;
 COMMENT ON DOMAIN public.account_id IS 'account id domain';
@@ -136,6 +143,13 @@ CREATE SEQUENCE public.account_seq;
 SELECT nextval('public.account_seq'::regclass) \g /dev/null
 SELECT nextval('public.account_seq'::regclass) \g /dev/null
 COMMENT ON SEQUENCE public.account_seq IS 'account sequence';
+GRANT USAGE ON SCHEMA public TO dump_reader;
+GRANT SELECT ON TABLE public.accounts TO dump_reader;
+GRANT SELECT ON VIEW public.account_lookup TO dump_reader;
+GRANT SELECT ON VIEW public.account_lookup_layer TO dump_reader;
+GRANT SELECT ON MATERIALIZED VIEW public.account_snapshot TO dump_reader;
+GRANT SELECT, UPDATE ON SEQUENCE public.account_seq TO dump_reader;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO dump_reader;
 SQL
 
 PGHOST=127.0.0.1 PGPORT="$SOURCE_PORT" PGDATABASE=postgres PGUSER=postgres \
@@ -168,6 +182,10 @@ PGHOST=127.0.0.1 PGPORT="$SOURCE_PORT" PGDATABASE=postgres PGUSER=postgres \
   pg_dump --schema=public --no-owner --no-privileges --format=plain \
   --data-only \
   >"$OUT_DIR/dump-data.sql" 2>"$OUT_DIR/pg_dump_data.err"
+
+PGHOST=127.0.0.1 PGPORT="$SOURCE_PORT" PGDATABASE=postgres PGUSER=postgres \
+  pg_dump --schema=public --no-owner --format=plain \
+  >"$OUT_DIR/dump-privileges.sql" 2>"$OUT_DIR/pg_dump_privileges.err"
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/restore-server.log" 2>&1 &
@@ -365,6 +383,39 @@ verify_domains() {
 }
 
 verify_domains "$RESTORE_PORT" "restore"
+
+cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$PRIVILEGE_RESTORE_PORT" --shared-catalog \
+  >"$OUT_DIR/privilege-restore-server.log" 2>&1 &
+privilege_restore_pid=$!
+wait_for_port "$PRIVILEGE_RESTORE_PORT"
+
+PGHOST=127.0.0.1 PGPORT="$PRIVILEGE_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres \
+  psql -v ON_ERROR_STOP=1 -X -q -c "CREATE ROLE dump_reader;" \
+  >"$OUT_DIR/privilege-role-restore.out" 2>"$OUT_DIR/privilege-role-restore.err"
+
+PGHOST=127.0.0.1 PGPORT="$PRIVILEGE_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres \
+  psql -v ON_ERROR_STOP=1 -X -q -f "$OUT_DIR/dump-privileges.sql" \
+  >"$OUT_DIR/privilege-restore.out" 2>"$OUT_DIR/privilege-restore.err"
+
+PGHOST=127.0.0.1 PGPORT="$PRIVILEGE_RESTORE_PORT" PGDATABASE=postgres PGUSER=postgres \
+  psql -v ON_ERROR_STOP=1 -X -q \
+  -c '\dn+ public' \
+  -c '\dp public.account*' \
+  -c '\ddp' \
+  -c 'CREATE TABLE public.privilege_default_probe (id int4);' \
+  -c '\dp public.privilege_default_probe' \
+  >"$OUT_DIR/privilege-verify.out" 2>"$OUT_DIR/privilege-verify.err"
+
+grep -F "dump_reader=U/postgres" "$OUT_DIR/privilege-verify.out" >/dev/null
+grep -F "public | accounts" "$OUT_DIR/privilege-verify.out" >/dev/null
+grep -F "public | account_lookup" "$OUT_DIR/privilege-verify.out" >/dev/null
+grep -F "public | account_lookup_layer" "$OUT_DIR/privilege-verify.out" >/dev/null
+grep -F "public | account_snapshot" "$OUT_DIR/privilege-verify.out" >/dev/null
+grep -F "public | account_seq" "$OUT_DIR/privilege-verify.out" >/dev/null
+grep -F "dump_reader=r/postgres" "$OUT_DIR/privilege-verify.out" >/dev/null
+grep -F "dump_reader=rw/postgres" "$OUT_DIR/privilege-verify.out" >/dev/null
+grep -F "postgres | public | table | dump_reader=r/postgres" "$OUT_DIR/privilege-verify.out" >/dev/null
+grep -F "privilege_default_probe" "$OUT_DIR/privilege-verify.out" >/dev/null
 
 cargo run -p gpu_db_protocol --bin gpu-db-server -- --listen "127.0.0.1:$CUSTOM_RESTORE_PORT" --shared-catalog \
   >"$OUT_DIR/custom-restore-server.log" 2>&1 &
@@ -653,6 +704,13 @@ pg_restore --list "$OUT_DIR/dump.tar" >"$OUT_DIR/dump.tar.toc"
 
 grep -F "COPY public.accounts (id, name, tier) FROM stdin;" "$OUT_DIR/dump.sql" >/dev/null
 grep -F "COPY public.events (event_id, note) FROM stdin;" "$OUT_DIR/dump.sql" >/dev/null
+grep -F "GRANT USAGE ON SCHEMA public TO dump_reader;" "$OUT_DIR/dump-privileges.sql" >/dev/null
+grep -F "GRANT SELECT ON TABLE public.accounts TO dump_reader;" "$OUT_DIR/dump-privileges.sql" >/dev/null
+grep -F "GRANT SELECT ON TABLE public.account_lookup TO dump_reader;" "$OUT_DIR/dump-privileges.sql" >/dev/null
+grep -F "GRANT SELECT ON TABLE public.account_lookup_layer TO dump_reader;" "$OUT_DIR/dump-privileges.sql" >/dev/null
+grep -F "GRANT SELECT ON TABLE public.account_snapshot TO dump_reader;" "$OUT_DIR/dump-privileges.sql" >/dev/null
+grep -F "GRANT SELECT,UPDATE ON SEQUENCE public.account_seq TO dump_reader;" "$OUT_DIR/dump-privileges.sql" >/dev/null
+grep -F "ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public GRANT SELECT ON TABLES TO dump_reader;" "$OUT_DIR/dump-privileges.sql" >/dev/null
 grep -F "INSERT INTO public.accounts VALUES" "$OUT_DIR/dump-inserts.sql" >/dev/null
 grep -F "	(1, 'Ada', 7)," "$OUT_DIR/dump-inserts.sql" >/dev/null
 grep -F "	(2, 'unknown', 7);" "$OUT_DIR/dump-inserts.sql" >/dev/null
@@ -800,10 +858,12 @@ echo "pg_dump_bounded_view_restore=passed"
 echo "pg_dump_bounded_materialized_view_restore=passed"
 echo "pg_dump_bounded_sequence_restore=passed"
 echo "pg_dump_bounded_domain_restore=passed"
+echo "pg_dump_bounded_privilege_restore=passed"
 echo "dump_file=$OUT_DIR/dump.sql"
 echo "insert_dump_file=$OUT_DIR/dump-inserts.sql"
 echo "schema_dump_file=$OUT_DIR/dump-schema.sql"
 echo "data_dump_file=$OUT_DIR/dump-data.sql"
+echo "privilege_dump_file=$OUT_DIR/dump-privileges.sql"
 echo "custom_dump_file=$OUT_DIR/dump.custom"
 echo "directory_dump_dir=$OUT_DIR/dump.dir"
 echo "tar_dump_file=$OUT_DIR/dump.tar"

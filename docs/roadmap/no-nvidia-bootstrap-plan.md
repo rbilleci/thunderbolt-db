@@ -329,6 +329,13 @@ WAL-replayed public snapshot relations. Cascade semantics, updateable views,
 recursive/cyclic rewrites, materialized views over views/materialized views,
 concurrent/no-data refresh beyond pg-dump-compatible creation, and physical
 materialized-view storage/indexing remain outside the current proof.
+The 2026-05-20 privilege-aware dump/restore follow-up extends the checked
+`pg_dump` / `pg_restore` smoke beyond the `--no-privileges` matrix for bounded
+public ACL metadata: schema ACLs, relation ACLs on supported tables, views,
+materialized views, and sequences, and default table privileges now round-trip
+when the bounded grantee role is precreated on the restore target. Ownership,
+permission enforcement, column ACLs, row policies, shared-object/global ACL
+dumps, and non-table default privileges remain out of scope.
 
 Status: active as of 2026-05-11. The no-GPU bootstrap queue and CUDA completion gates are closed for their defined scope. The autonomous loop now moves from internal MVCC/CUDA completion to the larger product goal: a PostgreSQL-compatible GPU-backed database engine.
 

@@ -3322,7 +3322,12 @@ fn relation_acl_target_error(
             position: None,
         });
     };
-    if kind != AclRelationKind::Relation && kind != actual {
+    let table_keyword_matches_relation = kind == AclRelationKind::Table
+        && matches!(
+            actual,
+            AclRelationKind::Table | AclRelationKind::View | AclRelationKind::MaterializedView
+        );
+    if kind != AclRelationKind::Relation && kind != actual && !table_keyword_matches_relation {
         return Some(ErrorField {
             code: "42809",
             message: acl_relation_kind_error(kind),
@@ -8198,8 +8203,8 @@ fn execute_statement(
                     Some(PUBLIC_NAMESPACE_OID.to_string()),
                     Some("public".to_string()),
                     Some("10".to_string()),
-                    schema_acl_display(session),
-                    None,
+                    schema_acl_array_display(session),
+                    Some("{postgres=UC/postgres,=U/postgres}".to_string()),
                 ],
             ],
         );
@@ -8458,6 +8463,13 @@ fn execute_statement(
     }
     if let Some(columns) = pg_dump_empty_catalog_query_columns(&canonical) {
         return write_single_row(stream, &columns, &catalog_empty_rows());
+    }
+    if is_pg_dump_default_acl_metadata_query(&canonical) {
+        return write_single_row(
+            stream,
+            &pg_dump_default_acl_metadata_columns(),
+            &pg_dump_default_acl_metadata_rows(session),
+        );
     }
     if canonical.starts_with("with recursive w as ( select d1.objid") {
         return write_single_row(
@@ -12230,8 +12242,8 @@ fn execute_statement(
                     Some(PUBLIC_NAMESPACE_OID.to_string()),
                     Some("public".to_string()),
                     Some("10".to_string()),
-                    schema_acl_display(session),
-                    None,
+                    schema_acl_array_display(session),
+                    Some("{postgres=UC/postgres,=U/postgres}".to_string()),
                 ],
             ],
         );
@@ -12366,6 +12378,13 @@ fn execute_statement(
     }
     if let Some(columns) = pg_dump_empty_catalog_query_columns(&canonical) {
         return write_single_row(stream, &columns, &catalog_empty_rows());
+    }
+    if is_pg_dump_default_acl_metadata_query(&canonical) {
+        return write_single_row(
+            stream,
+            &pg_dump_default_acl_metadata_columns(),
+            &pg_dump_default_acl_metadata_rows(session),
+        );
     }
     if catalog_describe_relation_lookup_query_all_schemas(&canonical)
         || catalog_describe_relation_lookup_query_public_namespace(&canonical)
@@ -14106,6 +14125,16 @@ fn relation_acl_display(session: &Session, relation: &str) -> Option<String> {
     acl_display(acl)
 }
 
+fn relation_acl_array_display(session: &Session, relation: &str) -> Option<String> {
+    let acl = session.table_acls.get(relation)?;
+    let default = if session.sequences.contains_key(relation) {
+        "postgres=rwU/postgres"
+    } else {
+        "postgres=arwdDxt/postgres"
+    };
+    acl_array_display_with_default(acl, default)
+}
+
 fn schema_acl_display(session: &Session) -> Option<String> {
     let rows = session
         .schema_acl
@@ -14122,6 +14151,33 @@ fn schema_acl_display(session: &Session) -> Option<String> {
         })
         .collect::<Vec<_>>();
     (!rows.is_empty()).then(|| rows.join("\n"))
+}
+
+fn schema_acl_array_display(session: &Session) -> Option<String> {
+    let rows = session
+        .schema_acl
+        .iter()
+        .filter_map(|(grantee, privileges)| {
+            if privileges.is_empty() {
+                return None;
+            }
+            let grantee = if grantee == "public" { "" } else { grantee };
+            Some(format!(
+                "{grantee}={}/postgres",
+                schema_privilege_letters(privileges)
+            ))
+        })
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        None
+    } else {
+        let mut with_defaults = vec![
+            "postgres=UC/postgres".to_string(),
+            "=U/postgres".to_string(),
+        ];
+        with_defaults.extend(rows);
+        Some(format!("{{{}}}", with_defaults.join(",")))
+    }
 }
 
 fn database_acl_display(session: &Session, database: &str) -> Option<String> {
@@ -14205,6 +14261,12 @@ fn catalog_psql_default_access_privilege_rows(session: &Session) -> Vec<Vec<Opti
             ]]
         })
         .unwrap_or_default()
+}
+
+fn pg_dump_default_table_acl_array_display(session: &Session) -> Option<String> {
+    let acl = acl_array_display(&session.default_table_acl)?;
+    let inner = acl.strip_prefix('{')?.strip_suffix('}')?;
+    Some(format!("{{postgres=arwdDxt/postgres,{inner}}}"))
 }
 
 fn catalog_psql_publication_rows(session: &Session) -> Vec<Vec<Option<String>>> {
@@ -14406,6 +14468,38 @@ fn acl_display(acl: &BTreeMap<String, BTreeSet<TablePrivilege>>) -> Option<Strin
         })
         .collect::<Vec<_>>();
     (!rows.is_empty()).then(|| rows.join("\n"))
+}
+
+fn acl_array_display(acl: &BTreeMap<String, BTreeSet<TablePrivilege>>) -> Option<String> {
+    acl_array_display_with_default(acl, "")
+}
+
+fn acl_array_display_with_default(
+    acl: &BTreeMap<String, BTreeSet<TablePrivilege>>,
+    default: &str,
+) -> Option<String> {
+    let rows = acl
+        .iter()
+        .filter_map(|(grantee, privileges)| {
+            if privileges.is_empty() {
+                return None;
+            }
+            let grantee = if grantee == "public" { "" } else { grantee };
+            Some(format!(
+                "{grantee}={}/postgres",
+                table_privilege_letters(privileges)
+            ))
+        })
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        return None;
+    }
+    let mut all_rows = Vec::new();
+    if !default.is_empty() {
+        all_rows.push(default.to_string());
+    }
+    all_rows.extend(rows);
+    Some(format!("{{{}}}", all_rows.join(",")))
 }
 
 fn table_privilege_letters(privileges: &BTreeSet<TablePrivilege>) -> String {
@@ -14646,78 +14740,91 @@ fn pg_dump_class_metadata_rows(session: &Session) -> Vec<Vec<Option<String>>> {
             .indexes
             .iter()
             .any(|index| index.table == table.name && session.tables.contains_key(&index.table));
-        rows.push(pg_dump_class_metadata_row(
-            table.oid,
-            &table.name,
-            "r",
-            table.check_constraints.len(),
+        rows.push(pg_dump_class_metadata_row(PgDumpClassMetadata {
+            session,
+            oid: table.oid,
+            name: &table.name,
+            relkind: "r",
+            relchecks: table.check_constraints.len(),
             relhasindex,
-            false,
-            Some("heap"),
-        ));
+            relhasrules: false,
+            amname: Some("heap"),
+        }));
     }
     let mut views = session.views.values().collect::<Vec<_>>();
     views.sort_by_key(|view| view.oid);
     for view in views {
-        rows.push(pg_dump_class_metadata_row(
-            view.oid, &view.name, "v", 0, false, true, None,
-        ));
+        rows.push(pg_dump_class_metadata_row(PgDumpClassMetadata {
+            session,
+            oid: view.oid,
+            name: &view.name,
+            relkind: "v",
+            relchecks: 0,
+            relhasindex: false,
+            relhasrules: true,
+            amname: None,
+        }));
     }
     let mut materialized_views = session.materialized_views.values().collect::<Vec<_>>();
     materialized_views.sort_by_key(|view| view.oid);
     for view in materialized_views {
-        rows.push(pg_dump_class_metadata_row(
-            view.oid,
-            &view.name,
-            "m",
-            0,
-            false,
-            true,
-            Some("heap"),
-        ));
+        rows.push(pg_dump_class_metadata_row(PgDumpClassMetadata {
+            session,
+            oid: view.oid,
+            name: &view.name,
+            relkind: "m",
+            relchecks: 0,
+            relhasindex: false,
+            relhasrules: true,
+            amname: Some("heap"),
+        }));
     }
     let mut sequences = session.sequences.values().collect::<Vec<_>>();
     sequences.sort_by_key(|sequence| sequence.oid);
     for sequence in sequences {
-        rows.push(pg_dump_class_metadata_row(
-            sequence.oid,
-            &sequence.name,
-            "S",
-            0,
-            false,
-            false,
-            None,
-        ));
+        rows.push(pg_dump_class_metadata_row(PgDumpClassMetadata {
+            session,
+            oid: sequence.oid,
+            name: &sequence.name,
+            relkind: "S",
+            relchecks: 0,
+            relhasindex: false,
+            relhasrules: false,
+            amname: None,
+        }));
     }
     rows
 }
 
-fn pg_dump_class_metadata_row(
+struct PgDumpClassMetadata<'a> {
+    session: &'a Session,
     oid: u32,
-    name: &str,
-    relkind: &str,
+    name: &'a str,
+    relkind: &'a str,
     relchecks: usize,
     relhasindex: bool,
     relhasrules: bool,
-    amname: Option<&str>,
-) -> Vec<Option<String>> {
+    amname: Option<&'a str>,
+}
+
+fn pg_dump_class_metadata_row(metadata: PgDumpClassMetadata<'_>) -> Vec<Option<String>> {
     vec![
         Some("1259".to_string()),
-        Some(oid.to_string()),
-        Some(name.to_string()),
+        Some(metadata.oid.to_string()),
+        Some(metadata.name.to_string()),
         Some(PUBLIC_NAMESPACE_OID.to_string()),
-        Some(relkind.to_string()),
-        Some(relchecks.to_string()),
+        Some(metadata.relkind.to_string()),
+        Some(metadata.relchecks.to_string()),
         Some("10".to_string()),
         Some("0".to_string()),
-        Some(if relhasindex { "t" } else { "f" }.to_string()),
-        Some(if relhasrules { "t" } else { "f" }.to_string()),
+        Some(if metadata.relhasindex { "t" } else { "f" }.to_string()),
+        Some(if metadata.relhasrules { "t" } else { "f" }.to_string()),
         Some("0".to_string()),
         Some("f".to_string()),
         Some("p".to_string()),
         Some("0".to_string()),
-        None,
-        None,
+        relation_acl_array_display(metadata.session, metadata.name),
+        Some(pg_dump_class_acl_default(metadata.relkind).to_string()),
         Some("0".to_string()),
         Some("0".to_string()),
         None,
@@ -14736,10 +14843,18 @@ fn pg_dump_class_metadata_row(
         None,
         None,
         None,
-        amname.map(str::to_string),
+        metadata.amname.map(str::to_string),
         Some("f".to_string()),
         Some("f".to_string()),
     ]
+}
+
+fn pg_dump_class_acl_default(relkind: &str) -> &'static str {
+    if relkind == "S" {
+        "{postgres=rwU/postgres}"
+    } else {
+        "{postgres=arwdDxt/postgres}"
+    }
 }
 
 fn pg_dump_attribute_metadata_query_oids(canonical: &str) -> Option<Vec<u32>> {
@@ -15287,6 +15402,38 @@ fn pg_dump_sequence_setval_query(canonical: &str) -> Option<(String, i64, bool)>
     ))
 }
 
+fn is_pg_dump_default_acl_metadata_query(canonical: &str) -> bool {
+    canonical.starts_with("select oid, tableoid, defaclrole")
+        && canonical.contains("from pg_default_acl")
+}
+
+fn pg_dump_default_acl_metadata_columns() -> Vec<Column> {
+    vec![
+        int4_column("oid"),
+        int4_column("tableoid"),
+        int4_column("defaclrole"),
+        int4_column("defaclnamespace"),
+        text_column("defaclobjtype"),
+        text_column("defaclacl"),
+        text_column("acldefault"),
+    ]
+}
+
+fn pg_dump_default_acl_metadata_rows(session: &Session) -> Vec<Vec<Option<String>>> {
+    let Some(acl) = pg_dump_default_table_acl_array_display(session) else {
+        return Vec::new();
+    };
+    vec![vec![
+        Some("82600".to_string()),
+        Some("826".to_string()),
+        Some("10".to_string()),
+        Some(PUBLIC_NAMESPACE_OID.to_string()),
+        Some("r".to_string()),
+        Some(acl),
+        Some("{postgres=arwdDxt/postgres}".to_string()),
+    ]]
+}
+
 fn sql_type_alignment_code(ty: SqlType) -> &'static str {
     match ty {
         SqlType::Int4 => "i",
@@ -15330,6 +15477,18 @@ fn pg_catalog_publication_namespace_columns() -> Vec<Column> {
 }
 
 fn pg_dump_empty_catalog_query_columns(canonical: &str) -> Option<Vec<Column>> {
+    if canonical == "select distinct attrelid from pg_attribute where attacl is not null" {
+        return Some(vec![int4_column("attrelid")]);
+    }
+    if canonical == "select objoid, classoid, objsubid, privtype, initprivs from pg_init_privs" {
+        return Some(vec![
+            int4_column("objoid"),
+            int4_column("classoid"),
+            int4_column("objsubid"),
+            text_column("privtype"),
+            text_column("initprivs"),
+        ]);
+    }
     if canonical
         .starts_with("select p.tableoid, p.oid, p.proname, p.prolang, p.pronargs, p.proargtypes")
         && canonical.contains("from pg_proc p")
@@ -15510,19 +15669,6 @@ fn pg_dump_empty_catalog_query_columns(canonical: &str) -> Option<Vec<Column>> {
             text_column("srvacl"),
             text_column("acldefault"),
             text_column("srvoptions"),
-        ]);
-    }
-    if canonical.starts_with("select oid, tableoid, defaclrole")
-        && canonical.contains("from pg_default_acl")
-    {
-        return Some(vec![
-            int4_column("oid"),
-            int4_column("tableoid"),
-            int4_column("defaclrole"),
-            int4_column("defaclnamespace"),
-            text_column("defaclobjtype"),
-            text_column("defaclacl"),
-            text_column("acldefault"),
         ]);
     }
     if canonical == "select tableoid, oid, collname, collnamespace, collowner, collencoding from pg_collation" {
@@ -29602,6 +29748,28 @@ mod tests {
         assert_eq!(
             pg_dump_database_metadata_rows(&session)[0][18],
             Some("primary database".to_string())
+        );
+    }
+
+    #[test]
+    fn catalog_pg_dump_column_acl_discovery_returns_empty() {
+        assert_eq!(
+            pg_dump_empty_catalog_query_columns(&canonical_sql(
+                "SELECT DISTINCT attrelid FROM pg_attribute WHERE attacl IS NOT NULL"
+            )),
+            Some(vec![int4_column("attrelid")])
+        );
+        assert_eq!(
+            pg_dump_empty_catalog_query_columns(&canonical_sql(
+                "SELECT objoid, classoid, objsubid, privtype, initprivs FROM pg_init_privs"
+            )),
+            Some(vec![
+                int4_column("objoid"),
+                int4_column("classoid"),
+                int4_column("objsubid"),
+                text_column("privtype"),
+                text_column("initprivs"),
+            ])
         );
     }
 

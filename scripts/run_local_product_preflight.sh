@@ -60,7 +60,8 @@ run_gate \
   "pg_dump_bounded_view_restore=passed" \
   "pg_dump_bounded_materialized_view_restore=passed" \
   "pg_dump_bounded_sequence_restore=passed" \
-  "pg_dump_bounded_domain_restore=passed"
+  "pg_dump_bounded_domain_restore=passed" \
+  "pg_dump_bounded_privilege_restore=passed"
 
 run_gate \
   local_resilience \
@@ -79,7 +80,7 @@ run_gate \
 printf 'local_product_preflight=passed\n'
 printf 'local_product_preflight_scope=application_drivers_pg_dump_restore_local_resilience\n'
 printf 'local_product_preflight_drivers=tokio-postgres,sqlx,node-postgres,asyncpg,psycopg\n'
-printf 'local_product_preflight_dump_restore=plain_custom_directory_tar_parallel_clean_insert_split\n'
+printf 'local_product_preflight_dump_restore=plain_custom_directory_tar_parallel_clean_insert_split_privileges\n'
 printf 'local_product_preflight_resilience=backup_pitr_dr_plus_replication_deployment\n'
 printf 'local_product_preflight_gap_pgx=blocked_missing_go\n'
 printf 'local_product_preflight_gap_jdbc_r2dbc=blocked_missing_java_build_tooling\n'

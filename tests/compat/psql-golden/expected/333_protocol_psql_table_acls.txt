@@ -33,7 +33,7 @@ REVOKE
 (1 row)
 
 psql:333_protocol_psql_table_acls.sql:13: ERROR:  relation does not exist
-psql:333_protocol_psql_table_acls.sql:14: ERROR:  relation is not a table
+GRANT
 psql:333_protocol_psql_table_acls.sql:15: ERROR:  relation is not a table
 psql:333_protocol_psql_table_acls.sql:16: ERROR:  query shape is not supported by the compatibility stub
 psql:333_protocol_psql_table_acls.sql:17: ERROR:  query shape is not supported by the compatibility stub

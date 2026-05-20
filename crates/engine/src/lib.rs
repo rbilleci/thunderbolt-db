@@ -10974,7 +10974,12 @@ impl Engine {
         let actual = self.acl_relation_kind(relation).ok_or_else(|| {
             EngineError::ApplyFailed(format!("relation \"{relation}\" does not exist"))
         })?;
-        if kind != AclRelationKind::Relation && kind != actual {
+        let table_keyword_matches_relation = kind == AclRelationKind::Table
+            && matches!(
+                actual,
+                AclRelationKind::Table | AclRelationKind::View | AclRelationKind::MaterializedView
+            );
+        if kind != AclRelationKind::Relation && kind != actual && !table_keyword_matches_relation {
             return Err(EngineError::ApplyFailed(format!(
                 "relation \"{relation}\" is not a {}",
                 acl_relation_kind_label(kind)
@@ -41160,14 +41165,18 @@ mod tests {
             &BTreeSet::from([TablePrivilege::Select, TablePrivilege::Update])
         );
 
-        let wrong_kind = e
-            .execute_text(13, "GRANT SELECT ON TABLE people_view TO PUBLIC")
-            .unwrap_err()
-            .to_string();
-        assert!(
-            wrong_kind.contains("relation \"people_view\" is not a table"),
-            "{wrong_kind}"
-        );
+        e.execute_text(13, "REVOKE SELECT ON TABLE people_view FROM PUBLIC")
+            .unwrap();
+        assert!(!e
+            .relational_relation_acl("people_view")
+            .unwrap()
+            .contains_key("public"));
+
+        let recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        assert!(!recovered
+            .relational_relation_acl("people_view")
+            .unwrap()
+            .contains_key("public"));
     }
 
     #[test]
