@@ -37,7 +37,7 @@ printf 'local_release_candidate_preflight_gap_certificate_lifecycle=missing\n'
 printf 'local_release_candidate_preflight_gap_audit_hash_chain=missing\n'
 printf 'local_release_candidate_preflight_gap_row_level_security=missing\n'
 printf 'local_release_candidate_preflight_gap_masking=missing\n'
-printf 'local_release_candidate_preflight_gap_jdbc_r2dbc=not_configured\n'
+printf 'local_release_candidate_preflight_gap_r2dbc=not_configured\n'
 printf 'local_release_candidate_preflight_gap_pg_dumpall_bootstrap_role_restore=filtered_existing_bootstrap_role\n'
 printf 'local_release_candidate_preflight_gap_pg_dumpall_database_acl_restore=not_emitted_by_globals_only\n'
 printf 'local_release_candidate_preflight_gap_physical_page_image_backup=missing\n'
@@ -92,7 +92,7 @@ require_line "$MANIFEST" "evidence_stamp=$STAMP"
 require_line "$MANIFEST" "git_dirty=1"
 require_line "$MANIFEST" "preflight_command=$FAKE_PREFLIGHT"
 require_line "$PREFLIGHT_LOG" "local_release_candidate_preflight=passed"
-require_line "$GAPS" "local_release_candidate_preflight_gap_jdbc_r2dbc=not_configured"
+require_line "$GAPS" "local_release_candidate_preflight_gap_r2dbc=not_configured"
 require_line "$GAPS" "local_release_candidate_preflight_gap_broad_cuda_event_timing=missing"
 
 if [[ "$(wc -l <"$GAPS" | tr -d ' ')" -ne 22 ]]; then

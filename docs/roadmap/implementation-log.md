@@ -100,7 +100,7 @@
   runs the checked application-driver smoke gate, the real PostgreSQL 16
   `pg_dump`/`pg_restore` workflow gate, and the local resilience drill, verifies
   stable evidence lines from each, and reports the remaining blocked/open gaps
-  for JDBC/R2DBC, physical page-image backup, production object storage,
+  for R2DBC, physical page-image backup, production object storage,
   live background scheduling, live systemd/Kubernetes rollout, and production
   timeline failover without adding new SQL/protocol/catalog behavior.
 
@@ -116,9 +116,9 @@
 
 - Added a local aggregate application-driver compatibility gate. `scripts/run_application_driver_smokes.sh`
   runs the checked-in `tokio-postgres`, `sqlx`, `node-postgres`, `asyncpg`,
-  `psycopg`, and `pgx` app-shaped smokes against `gpu-db-server`, emits stable
-  per-driver evidence lines, and reports JDBC/R2DBC as not configured while no
-  checked Java smoke exists. The gate keeps COPY streaming, TLS/GSS/cancel,
+  `psycopg`, `pgx`, and JDBC app-shaped smokes against `gpu-db-server`, emits stable
+  per-driver evidence lines, and reports R2DBC as not configured while no
+  checked reactive Java smoke exists. The gate keeps COPY streaming, TLS/GSS/cancel,
   richer type/OID metadata, advanced portals, and broad SQL grammar out of
   scope for the current supported SQL/protocol subset.
 

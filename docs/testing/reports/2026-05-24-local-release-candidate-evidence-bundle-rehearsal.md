@@ -67,7 +67,7 @@ The bundle proves the current local release-candidate envelope across:
 ## Explicit Non-Claims
 
 - `pgx`: blocked by missing Go tooling at pre-report HEAD `3cc040be`; superseded once the checked `pgx` smoke lands after this rehearsal.
-- JDBC/R2DBC: blocked by missing Java build tooling at pre-report HEAD `3cc040be`; superseded to not configured once Java build tooling is available and before a checked Java smoke lands.
+- JDBC/R2DBC: blocked by missing Java build tooling at pre-report HEAD `3cc040be`; superseded by later Java tooling and checked JDBC smoke evidence, with R2DBC still not configured.
 - pg_dumpall bootstrap-role restore: existing bootstrap role is filtered.
 - pg_dumpall database ACL restore: not emitted by `--globals-only`.
 - Physical page-image backup: missing.

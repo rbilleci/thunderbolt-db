@@ -30,6 +30,8 @@ require_command cargo
 require_command node
 require_command npm
 require_command go
+require_command javac
+require_command mvn
 require_python314
 
 cargo test -p gpu_db_protocol --test tokio_postgres_smoke -- --color never
@@ -50,11 +52,9 @@ echo "application_driver_smoke_psycopg=passed"
 tests/compat/pgx/run.sh
 echo "application_driver_smoke_pgx=passed"
 
-if command -v javac >/dev/null 2>&1 && { command -v mvn >/dev/null 2>&1 || command -v gradle >/dev/null 2>&1; }; then
-  echo "application_driver_smoke_jdbc_r2dbc=not_configured"
-else
-  echo "application_driver_smoke_jdbc_r2dbc=blocked_missing_java_build_tooling"
-fi
+tests/compat/jdbc/run.sh
+echo "application_driver_smoke_jdbc=passed"
+echo "application_driver_smoke_r2dbc=not_configured"
 
 echo "application_driver_smoke_scope=supported_sql_protocol_subset"
 echo "application driver smoke gate passed"
