@@ -84,7 +84,7 @@
   `scripts/run_local_release_candidate_preflight.sh` runs the local
   PostgreSQL-compatible product preflight plus the local GPU residency
   preflight, verifies stable evidence lines from both, and reports the combined
-  supported local envelope while keeping blocked driver, production
+  supported local envelope while keeping remaining driver, production
   orchestration, durable GPU page, broad retained-expression, and broad CUDA
   event-timing gaps explicit.
 
@@ -100,7 +100,7 @@
   runs the checked application-driver smoke gate, the real PostgreSQL 16
   `pg_dump`/`pg_restore` workflow gate, and the local resilience drill, verifies
   stable evidence lines from each, and reports the remaining blocked/open gaps
-  for `pgx`, JDBC/R2DBC, physical page-image backup, production object storage,
+  for JDBC/R2DBC, physical page-image backup, production object storage,
   live background scheduling, live systemd/Kubernetes rollout, and production
   timeline failover without adding new SQL/protocol/catalog behavior.
 
@@ -115,10 +115,10 @@
   options, and broader COPY grammar remain out of scope.
 
 - Added a local aggregate application-driver compatibility gate. `scripts/run_application_driver_smokes.sh`
-  runs the checked-in `tokio-postgres`, `sqlx`, `node-postgres`, `asyncpg`, and
-  `psycopg` app-shaped smokes against `gpu-db-server`, emits stable per-driver
-  evidence lines, and reports `pgx` plus JDBC/R2DBC as blocked when local Go or
-  Java build tooling is absent. The gate keeps COPY streaming, TLS/GSS/cancel,
+  runs the checked-in `tokio-postgres`, `sqlx`, `node-postgres`, `asyncpg`,
+  `psycopg`, and `pgx` app-shaped smokes against `gpu-db-server`, emits stable
+  per-driver evidence lines, and reports JDBC/R2DBC as not configured while no
+  checked Java smoke exists. The gate keeps COPY streaming, TLS/GSS/cancel,
   richer type/OID metadata, advanced portals, and broad SQL grammar out of
   scope for the current supported SQL/protocol subset.
 

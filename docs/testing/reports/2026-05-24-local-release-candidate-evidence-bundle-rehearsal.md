@@ -48,15 +48,16 @@ The command passed and produced a release-review bundle under `target/`.
 - npm_version: 10.9.7
 - nvidia_smi_version: NVIDIA GeForce RTX 3090, 595.58.03
 
-Local prerequisite check also confirmed the expected missing future-driver
-tooling: `go`, `javac`, Maven, and Gradle are absent.
+At pre-report HEAD `3cc040be`, local prerequisite check also confirmed the
+expected missing future-driver tooling: `go`, `javac`, Maven, and Gradle were
+absent.
 
 ## Supported Local Envelope Proven
 
 The bundle proves the current local release-candidate envelope across:
 
 - fmt, clippy, all-features tests, psql golden coverage, and scorecard freshness
-- checked application-driver smokes for `tokio-postgres`, `sqlx`, `node-postgres`, `asyncpg`, and `psycopg`
+- checked application-driver smokes for `tokio-postgres`, `sqlx`, `node-postgres`, `asyncpg`, and `psycopg` at the pre-report HEAD
 - real PostgreSQL 16 `pg_dump`/`pg_restore` paths, including bounded privilege restore
 - bounded `pg_dumpall --globals-only --no-role-passwords` global metadata and tablespace-ACL restore
 - local backup/PITR/DR, file-backed object-bundle backup, and packaged replication deployment preflights
@@ -65,8 +66,8 @@ The bundle proves the current local release-candidate envelope across:
 
 ## Explicit Non-Claims
 
-- `pgx`: blocked by missing Go tooling.
-- JDBC/R2DBC: blocked by missing Java build tooling.
+- `pgx`: blocked by missing Go tooling at pre-report HEAD `3cc040be`; superseded once the checked `pgx` smoke lands after this rehearsal.
+- JDBC/R2DBC: blocked by missing Java build tooling at pre-report HEAD `3cc040be`; superseded to not configured once Java build tooling is available and before a checked Java smoke lands.
 - pg_dumpall bootstrap-role restore: existing bootstrap role is filtered.
 - pg_dumpall database ACL restore: not emitted by `--globals-only`.
 - Physical page-image backup: missing.
@@ -104,6 +105,6 @@ README matches the actual bundle evidence.
 
 No bounded follow-up slice was found inside the current local envelope. The
 credible next work requires one of the existing external triggers: Go for
-`pgx`, Java build tooling for JDBC/R2DBC, a named live deployment/storage
+JDBC/R2DBC smoke configuration, a named live deployment/storage
 environment, a named production security profile, or a workload/performance
 target for broader P8 behavior.

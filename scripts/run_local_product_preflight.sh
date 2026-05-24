@@ -39,8 +39,8 @@ run_gate \
   "application_driver_smoke_node_postgres=passed" \
   "application_driver_smoke_asyncpg=passed" \
   "application_driver_smoke_psycopg=passed" \
-  "application_driver_smoke_pgx=blocked_missing_go" \
-  "application_driver_smoke_jdbc_r2dbc=blocked_missing_java_build_tooling" \
+  "application_driver_smoke_pgx=passed" \
+  "application_driver_smoke_jdbc_r2dbc=not_configured" \
   "application_driver_smoke_scope=supported_sql_protocol_subset"
 
 run_gate \
@@ -89,14 +89,13 @@ run_gate \
 
 printf 'local_product_preflight=passed\n'
 printf 'local_product_preflight_scope=application_drivers_pg_dump_restore_pg_dumpall_globals_local_resilience\n'
-printf 'local_product_preflight_drivers=tokio-postgres,sqlx,node-postgres,asyncpg,psycopg\n'
+printf 'local_product_preflight_drivers=tokio-postgres,sqlx,node-postgres,asyncpg,psycopg,pgx\n'
 printf 'local_product_preflight_dump_restore=plain_custom_directory_tar_parallel_clean_insert_split_privileges_pg_dumpall_globals\n'
 printf 'local_product_preflight_resilience=backup_pitr_dr_plus_replication_deployment\n'
 printf 'local_product_preflight_privileges=schema_usage_create_relation_sequence_function_execute_default_table_acls\n'
 printf 'local_product_preflight_gap_pg_dumpall_bootstrap_role_restore=filtered_existing_bootstrap_role\n'
 printf 'local_product_preflight_gap_pg_dumpall_database_acl_restore=not_emitted_by_globals_only\n'
-printf 'local_product_preflight_gap_pgx=blocked_missing_go\n'
-printf 'local_product_preflight_gap_jdbc_r2dbc=blocked_missing_java_build_tooling\n'
+printf 'local_product_preflight_gap_jdbc_r2dbc=not_configured\n'
 printf 'local_product_preflight_gap_physical_page_image_backup=missing\n'
 printf 'local_product_preflight_gap_production_object_storage=missing\n'
 printf 'local_product_preflight_gap_live_background_scheduling=missing\n'

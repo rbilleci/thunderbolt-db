@@ -25,8 +25,7 @@ required_lines=(
   "local_release_candidate_preflight_gap_audit_hash_chain=missing"
   "local_release_candidate_preflight_gap_row_level_security=missing"
   "local_release_candidate_preflight_gap_masking=missing"
-  "local_release_candidate_preflight_gap_pgx=blocked_missing_go"
-  "local_release_candidate_preflight_gap_jdbc_r2dbc=blocked_missing_java_build_tooling"
+  "local_release_candidate_preflight_gap_jdbc_r2dbc=not_configured"
   "local_release_candidate_preflight_gap_pg_dumpall_bootstrap_role_restore=filtered_existing_bootstrap_role"
   "local_release_candidate_preflight_gap_pg_dumpall_database_acl_restore=not_emitted_by_globals_only"
   "local_release_candidate_preflight_gap_physical_page_image_backup=missing"
@@ -97,6 +96,10 @@ GAPS="$OUT_DIR/remaining-gaps.env"
   command_value python3_version python3 --version
   command_value node_version node --version
   command_value npm_version npm --version
+  command_value go_version go version
+  command_value javac_version bash -lc 'javac -version 2>&1'
+  command_value mvn_version bash -lc 'mvn -version 2>&1'
+  command_value gradle_version bash -lc 'gradle -version 2>&1'
   command_value nvidia_smi_version nvidia-smi --query-gpu=name,driver_version --format=csv,noheader
   printf 'preflight_command=%s\n' "$PREFLIGHT_CMD"
 } >"$MANIFEST"

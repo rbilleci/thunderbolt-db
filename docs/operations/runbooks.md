@@ -107,17 +107,17 @@ scripts/run_local_product_preflight.sh
 Pass criteria:
 
 - `local_product_preflight=passed`
-- Application-driver evidence includes the checked `tokio-postgres`, `sqlx`, `node-postgres`, `asyncpg`, and `psycopg` smoke gates.
+- Application-driver evidence includes the checked `tokio-postgres`, `sqlx`, `node-postgres`, `asyncpg`, `psycopg`, and `pgx` smoke gates.
 - Dump/restore evidence includes plain, custom, directory, tar, parallel directory, clean, insert-style, and split schema/data restore modes for the supported public object subset.
 - Privilege restore evidence includes bounded schema `USAGE`/`CREATE`, relation, sequence, zero-argument function `EXECUTE`, and default table ACLs for a pre-created bounded role.
 - Local resilience evidence includes backup/PITR/DR plus replication deployment preflight.
-- The output names the remaining `pgx`, JDBC/R2DBC, physical backup, production object-storage, live scheduling, live systemd/Kubernetes rollout, and production timeline-failover gaps.
+- The output names the remaining JDBC/R2DBC, physical backup, production object-storage, live scheduling, live systemd/Kubernetes rollout, and production timeline-failover gaps.
 
 Boundaries:
 
 - This is an aggregate local product-readiness command over existing checked gates.
 - This does not add new SQL/protocol/catalog support.
-- This does not install Go or Java tooling for the remaining driver gates.
+- This does not configure Java JDBC/R2DBC driver gates.
 - This does not claim production orchestration or broad PostgreSQL parity beyond the supported subset.
 
 ### 1f) Local GPU Residency Product Preflight
@@ -158,7 +158,7 @@ Pass criteria:
 - PostgreSQL product evidence includes the local product preflight over application drivers, pg_dump/restore including bounded schema/relation/sequence/function/default-table privilege restore, and local resilience.
 - GPU residency evidence includes the local residency preflight over retained CUDA allocation, zero-H2D resident routes, warmup, and maintenance.
 - Connection-security posture evidence includes the local/dev trust-auth, no-TLS boundary plus explicit auth/TLS/compliance non-claims.
-- The output names the remaining blocked `pgx` and JDBC/R2DBC driver gates plus physical backup, production object-storage, live scheduling, live systemd/Kubernetes rollout, production timeline-failover, durable GPU page, autonomous cache-daemon, external orchestration, broad retained-expression, and broad CUDA-event-timing gaps.
+- The output names the remaining JDBC/R2DBC driver gate plus physical backup, production object-storage, live scheduling, live systemd/Kubernetes rollout, production timeline-failover, durable GPU page, autonomous cache-daemon, external orchestration, broad retained-expression, and broad CUDA-event-timing gaps.
 - The output names the remaining SCRAM-SHA-256, password authentication/storage, TLS client connection, replication mTLS, certificate lifecycle, audit hash-chain, row-level security, masking, and production security profile gaps.
 
 Boundaries:
