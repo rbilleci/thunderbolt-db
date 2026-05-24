@@ -22,12 +22,21 @@ cat >"$FAKE_PREFLIGHT" <<'FAKE'
 #!/usr/bin/env bash
 set -euo pipefail
 printf 'local_release_candidate_preflight=passed\n'
-printf 'local_release_candidate_preflight_scope=validation_postgresql_product_plus_gpu_residency\n'
+printf 'local_release_candidate_preflight_scope=validation_postgresql_product_gpu_residency_plus_connection_security\n'
 printf 'local_release_candidate_preflight_validation=fmt_clippy_all_features_psql_golden_scorecard_freshness\n'
 printf 'local_release_candidate_preflight_postgresql=application_drivers_pg_dump_restore_pg_dumpall_globals_privileges_local_resilience\n'
 printf 'local_release_candidate_preflight_privileges=schema_usage_create_relation_sequence_function_execute_default_table_acls\n'
 printf 'local_release_candidate_preflight_gpu=residency_baseline_warmup_maintenance\n'
 printf 'local_release_candidate_preflight_gpu_residency=retained_cuda_allocation_zero_h2d_routes_event_timing_warmup_maintenance\n'
+printf 'local_release_candidate_preflight_connection_security=local_dev_trust_auth_no_tls_boundary\n'
+printf 'local_release_candidate_preflight_gap_scram_sha_256=missing\n'
+printf 'local_release_candidate_preflight_gap_password_authentication_storage=missing\n'
+printf 'local_release_candidate_preflight_gap_tls_client_connections=missing\n'
+printf 'local_release_candidate_preflight_gap_replication_mtls=missing\n'
+printf 'local_release_candidate_preflight_gap_certificate_lifecycle=missing\n'
+printf 'local_release_candidate_preflight_gap_audit_hash_chain=missing\n'
+printf 'local_release_candidate_preflight_gap_row_level_security=missing\n'
+printf 'local_release_candidate_preflight_gap_masking=missing\n'
 printf 'local_release_candidate_preflight_gap_pgx=blocked_missing_go\n'
 printf 'local_release_candidate_preflight_gap_jdbc_r2dbc=blocked_missing_java_build_tooling\n'
 printf 'local_release_candidate_preflight_gap_pg_dumpall_bootstrap_role_restore=filtered_existing_bootstrap_role\n'
@@ -87,8 +96,8 @@ require_line "$PREFLIGHT_LOG" "local_release_candidate_preflight=passed"
 require_line "$GAPS" "local_release_candidate_preflight_gap_pgx=blocked_missing_go"
 require_line "$GAPS" "local_release_candidate_preflight_gap_broad_cuda_event_timing=missing"
 
-if [[ "$(wc -l <"$GAPS" | tr -d ' ')" -ne 15 ]]; then
-  printf 'release evidence bundle smoke expected 15 remaining-gap lines\n' >&2
+if [[ "$(wc -l <"$GAPS" | tr -d ' ')" -ne 23 ]]; then
+  printf 'release evidence bundle smoke expected 23 remaining-gap lines\n' >&2
   exit 1
 fi
 

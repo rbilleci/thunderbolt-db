@@ -10,6 +10,22 @@ This document operationalizes the security/compliance intent from `DESIGN.md` in
 - Regulatory control mapping
 - Validation and evidence requirements by phase
 
+## Current implementation status
+
+The local/dev PostgreSQL compatibility endpoint currently uses trust-style
+startup: it declines SSLRequest and GSSENCRequest negotiation with `N`, accepts
+normal startup with PostgreSQL `AuthenticationOk`, and has no password verifier
+catalog, SCRAM exchange, TLS listener, mTLS replication channel, certificate
+lifecycle, or production security profile. Password and SASL frontend frames are
+parsed for protocol hygiene but rejected after startup.
+
+The controls below remain the production target posture and phase-gate intent,
+not a current support claim. The checked
+`scripts/run_connection_security_posture_preflight.sh` gate keeps the current
+local/dev no-TLS, trust-auth boundary visible in release-candidate evidence
+until a named production security profile defines secret storage, certificate
+lifecycle, deployment policy, and authentication/TLS acceptance criteria.
+
 ## Security principles
 
 1. **Default deny** for privileged operations.
