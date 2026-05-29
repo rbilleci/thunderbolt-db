@@ -54,7 +54,9 @@ echo "application_driver_smoke_pgx=passed"
 
 tests/compat/jdbc/run.sh
 echo "application_driver_smoke_jdbc=passed"
-echo "application_driver_smoke_r2dbc=not_configured"
+
+tests/compat/r2dbc/run.sh
+echo "application_driver_smoke_r2dbc=passed"
 
 echo "application_driver_smoke_scope=supported_sql_protocol_subset"
 echo "application driver smoke gate passed"

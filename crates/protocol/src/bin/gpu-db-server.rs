@@ -13764,6 +13764,11 @@ fn execute_statement(
             &catalog_type_rows_by_name(),
         );
     }
+    if canonical
+        == "select oid, * from pg_catalog.pg_type where typname in ('hstore','geometry','vector')"
+    {
+        return write_single_row(stream, &[int4_column("oid")], &[]);
+    }
     if let Some(table) = catalog_attribute_query_table(&canonical) {
         let Some(rows) = catalog_attribute_rows(session, &table) else {
             return write_error(
@@ -13851,6 +13856,11 @@ fn execute_statement(
             stream,
             &[text_column("client_encoding")],
             &[vec![Some(String::from("UTF8"))]],
+        ),
+        "show transaction isolation level" => write_single_row(
+            stream,
+            &[text_column("transaction_isolation")],
+            &[vec![Some(String::from("read committed"))]],
         ),
         "select current_schema()" => write_single_row(
             stream,

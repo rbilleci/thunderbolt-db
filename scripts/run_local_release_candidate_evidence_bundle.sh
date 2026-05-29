@@ -25,7 +25,6 @@ required_lines=(
   "local_release_candidate_preflight_gap_audit_hash_chain=missing"
   "local_release_candidate_preflight_gap_row_level_security=missing"
   "local_release_candidate_preflight_gap_masking=missing"
-  "local_release_candidate_preflight_gap_r2dbc=not_configured"
   "local_release_candidate_preflight_gap_pg_dumpall_bootstrap_role_restore=filtered_existing_bootstrap_role"
   "local_release_candidate_preflight_gap_pg_dumpall_database_acl_restore=not_emitted_by_globals_only"
   "local_release_candidate_preflight_gap_physical_page_image_backup=missing"

@@ -57,7 +57,7 @@ absent.
 The bundle proves the current local release-candidate envelope across:
 
 - fmt, clippy, all-features tests, psql golden coverage, and scorecard freshness
-- checked application-driver smokes for `tokio-postgres`, `sqlx`, `node-postgres`, `asyncpg`, and `psycopg` at the pre-report HEAD
+- checked application-driver smokes for `tokio-postgres`, `sqlx`, `node-postgres`, `asyncpg`, and `psycopg` at the pre-report HEAD; later `pgx`, JDBC, and R2DBC commits supersede the original driver-tooling gaps.
 - real PostgreSQL 16 `pg_dump`/`pg_restore` paths, including bounded privilege restore
 - bounded `pg_dumpall --globals-only --no-role-passwords` global metadata and tablespace-ACL restore
 - local backup/PITR/DR, file-backed object-bundle backup, and packaged replication deployment preflights
@@ -66,8 +66,8 @@ The bundle proves the current local release-candidate envelope across:
 
 ## Explicit Non-Claims
 
-- `pgx`: blocked by missing Go tooling at pre-report HEAD `3cc040be`; superseded once the checked `pgx` smoke lands after this rehearsal.
-- JDBC/R2DBC: blocked by missing Java build tooling at pre-report HEAD `3cc040be`; superseded by later Java tooling and checked JDBC smoke evidence, with R2DBC still not configured.
+- `pgx`: blocked by missing Go tooling at pre-report HEAD `3cc040be`; superseded by later Go tooling and checked `pgx` smoke evidence.
+- JDBC/R2DBC: blocked by missing Java build tooling at pre-report HEAD `3cc040be`; superseded by later Java tooling and checked JDBC/R2DBC smoke evidence.
 - pg_dumpall bootstrap-role restore: existing bootstrap role is filtered.
 - pg_dumpall database ACL restore: not emitted by `--globals-only`.
 - Physical page-image backup: missing.
@@ -104,7 +104,6 @@ README matches the actual bundle evidence.
 ## Follow-Up Slice
 
 No bounded follow-up slice was found inside the current local envelope. The
-credible next work requires one of the existing external triggers: Go for
-JDBC/R2DBC smoke configuration, a named live deployment/storage
+credible next work requires one of the existing external triggers: a named live deployment/storage
 environment, a named production security profile, or a workload/performance
 target for broader P8 behavior.
