@@ -157,16 +157,16 @@ Pass criteria:
 - Validation evidence includes fmt, clippy, all-features tests, real psql golden coverage, regenerated compatibility scorecard freshness, and checked-in scorecard parity.
 - PostgreSQL product evidence includes the local product preflight over application drivers, pg_dump/restore including bounded schema/relation/sequence/function/default-table privilege restore, and local resilience.
 - GPU residency evidence includes the local residency preflight over retained CUDA allocation, zero-H2D resident routes, warmup, and maintenance.
-- Connection-security posture evidence includes the local/dev trust-auth, no-TLS boundary plus explicit auth/TLS/compliance non-claims.
+- Connection-security posture evidence includes the local/dev trust-auth, no-TLS boundary, the opt-in production security profile v1 TLS+SCRAM/password gate, and explicit remaining security non-claims.
 - The output names the remaining physical backup, production object-storage, live scheduling, live systemd/Kubernetes rollout, production timeline-failover, durable GPU page, autonomous cache-daemon, external orchestration, broad retained-expression, and broad CUDA-event-timing gaps.
-- The output names the remaining SCRAM-SHA-256, password authentication/storage, TLS client connection, replication mTLS, certificate lifecycle, audit hash-chain, row-level security, masking, and production security profile gaps.
+- The output names the remaining replication mTLS, certificate lifecycle automation, enterprise identity, KMS/HSM or external secret-manager integration, audit hash-chain, row-level security, masking, and broad authorization gaps.
 
 Boundaries:
 
 - This is a top-level aggregate over existing checked gates.
 - This does not add SQL/protocol/catalog support or CUDA kernel/runtime behavior.
 - This does not claim production orchestration, durable GPU pages, or broad PostgreSQL/CUDA parity beyond the supported local envelope.
-- This does not claim production database connection security; the compatibility endpoint remains local/dev trust-auth without TLS until a named production security profile exists.
+- This claims only the checked production security profile v1 local gate for client TLS plus SCRAM/password authentication. It does not claim production deployment policy, mTLS, certificate rotation automation, enterprise identity, KMS/HSM, external secret-manager integration, audit hash-chain, row-level security, masking, or broad authorization.
 
 ### 1h) Local Connection-Security Posture Preflight
 
@@ -179,17 +179,21 @@ scripts/run_connection_security_posture_preflight.sh
 Pass criteria:
 
 - `connection_security_posture_preflight=passed`
-- SSLRequest and GSSENCRequest evidence lines report `declined_N`.
-- Startup authentication reports `authentication_ok_trust_style`.
-- Password and SASL messages report unsupported after startup.
-- Role password catalog evidence reports no password storage.
-- The output names the missing SCRAM-SHA-256, password authentication/storage, TLS client connections, replication mTLS, certificate lifecycle, audit hash-chain, row-level security, masking, and production security profile gaps.
+- The default local/dev profile remains documented as trust-auth with no TLS.
+- `connection_security_posture_preflight_production_profile_v1=passed`
+- `connection_security_posture_preflight_production_config_validation=passed`
+- `connection_security_posture_preflight_production_tls_required=passed`
+- `connection_security_posture_preflight_production_scram_sha_256_valid_password=passed`
+- `connection_security_posture_preflight_production_scram_sha_256_invalid_password=passed`
+- `connection_security_posture_preflight_production_recovery_after_invalid_password=passed`
+- The output names the remaining mTLS, enterprise identity, KMS/HSM or secret-manager, certificate rotation, audit hash-chain, row-level security, masking, and broad authorization non-claims.
 
 Boundaries:
 
-- This is a source-truth/code-reality reconciliation gate.
-- This is not SCRAM-SHA-256.
-- This is not TLS, mTLS, certificate lifecycle, password storage, audit hash-chain, row-level security, masking, or a production security profile.
+- This is a source-truth/code-reality reconciliation gate plus local production-profile smoke.
+- Production profile v1 is explicitly opt-in through `--security-profile production` or `GPU_DB_SECURITY_PROFILE=production`.
+- Production profile v1 requires explicit TLS certificate/key and auth user/password inputs.
+- This is not mTLS, certificate rotation automation, enterprise identity, KMS/HSM, external secret-manager integration, audit hash-chain, row-level security, masking, broad authorization, replication-channel security, or live deployment policy.
 
 ### 1i) Local Release-Candidate Evidence Bundle
 
@@ -315,7 +319,7 @@ For the current single-node relational WAL segment proof:
 17. For a combined local resilience game-day gate, run `scripts/run_local_resilience_drill.sh`; it runs the local backup/PITR/DR drill and the local replication deployment preflight, verifies both evidence contracts, and reports the combined supported scope.
 18. For a local PostgreSQL-compatible product preflight, run `scripts/run_local_product_preflight.sh`; it runs the checked application-driver gate, pg_dump/pg_restore gate including bounded public ACL/default-privilege restore, and local resilience drill, verifies stable evidence from each, and reports the current supported envelope plus blocked/open gaps.
 19. For a top-level local release-candidate preflight, run `scripts/run_local_release_candidate_preflight.sh`; it runs the local validation preflight, PostgreSQL-compatible product preflight, GPU residency preflight, and connection-security posture preflight, verifies all four evidence contracts, and reports the combined local supported envelope plus blocked/open gaps.
-20. For connection-security posture reconciliation, run `scripts/run_connection_security_posture_preflight.sh`; it verifies the current local/dev trust-auth no-TLS endpoint boundary and reports the auth/TLS/compliance gaps that remain outside the local release-candidate proof.
+20. For connection-security posture reconciliation, run `scripts/run_connection_security_posture_preflight.sh`; it verifies the default local/dev trust-auth no-TLS endpoint boundary, the opt-in production security profile v1 client TLS plus SCRAM/password path, and the remaining security non-claims outside this local proof.
 21. For an attachable local release-candidate evidence bundle, run `scripts/run_local_release_candidate_evidence_bundle.sh`; it captures git/tooling facts, the full top-level preflight log, remaining-gap lines, and a tarball checksum under `target/release-candidate-evidence/`. For fast wrapper-only checks, run `scripts/run_local_release_candidate_evidence_bundle_smoke.sh`.
 22. Treat physical page-image base backups, production object-storage APIs, automated production timeline failover orchestration beyond local registered-target selection/pruning, live systemd/Kubernetes rollout, and live background cleanup scheduling as not yet implemented.
 

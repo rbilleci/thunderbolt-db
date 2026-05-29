@@ -12,19 +12,25 @@ This document operationalizes the security/compliance intent from `DESIGN.md` in
 
 ## Current implementation status
 
-The local/dev PostgreSQL compatibility endpoint currently uses trust-style
+The default local/dev PostgreSQL compatibility endpoint uses trust-style
 startup: it declines SSLRequest and GSSENCRequest negotiation with `N`, accepts
 normal startup with PostgreSQL `AuthenticationOk`, and has no password verifier
-catalog, SCRAM exchange, TLS listener, mTLS replication channel, certificate
-lifecycle, or production security profile. Password and SASL frontend frames are
-parsed for protocol hygiene but rejected after startup.
+catalog. Password and SASL frontend frames are parsed for protocol hygiene but
+rejected after startup in this profile.
 
-The controls below remain the production target posture and phase-gate intent,
-not a current support claim. The checked
-`scripts/run_connection_security_posture_preflight.sh` gate keeps the current
-local/dev no-TLS, trust-auth boundary visible in release-candidate evidence
-until a named production security profile defines secret storage, certificate
-lifecycle, deployment policy, and authentication/TLS acceptance criteria.
+Production security profile v1 is an explicit opt-in for the PostgreSQL
+compatibility endpoint. It requires configured certificate/key material plus a
+configured auth user/password credential, accepts PostgreSQL SSLRequest, requires
+TLS before normal startup, runs SCRAM-SHA-256 password authentication, rejects
+invalid passwords, and rejects non-TLS production clients. The checked
+`scripts/run_connection_security_posture_preflight.sh` gate exercises incomplete
+config rejection, a valid TLS+SCRAM `psql` path, invalid-password failure,
+same-server recovery, and non-TLS rejection.
+
+The profile is intentionally narrow. It does not claim mTLS, enterprise
+identity, KMS/HSM, external secret-manager integration, certificate rotation
+automation, broad authorization policy, replication-channel security, audit hash
+chain, row-level security, masking, or a production deployment policy.
 
 ## Security principles
 

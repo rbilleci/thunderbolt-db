@@ -1,10 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
+use std::fs::File;
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine;
 use gpu_db_protocol::{
     parse_command, parse_frontend_message, parse_startup_packet, AclRelationKind, ColumnDefault,
     Command, CommentTarget, DatabasePrivilege, FrontendMessage, FunctionPrivilege, ParseError,
@@ -12,6 +17,15 @@ use gpu_db_protocol::{
     StartupPacket, TablePrivilege, TablespacePrivilege, SUPPORTED_SQL_TYPES,
 };
 use gpu_db_protocol::{DescribeTarget, SqlType};
+use hmac::{Hmac, Mac};
+use pbkdf2::pbkdf2_hmac;
+use rand::RngCore;
+use rustls::{ServerConfig as TlsServerConfig, ServerConnection, StreamOwned};
+use sha2::{Digest, Sha256};
+
+trait ReadWrite: Read + Write {}
+
+impl<T: Read + Write> ReadWrite for T {}
 
 const PUBLIC_NAMESPACE_OID: u32 = 2200;
 const POSTGRES_DATABASE_OID: u32 = 5;
@@ -4347,10 +4361,31 @@ const FIRST_USER_RELATION_OID: u32 = 16_384;
 struct ServerConfig {
     listen: String,
     shared_catalog: bool,
+    security: SecurityConfig,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SecurityConfig {
+    LocalDev,
+    Production(ProductionSecurityConfig),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProductionSecurityConfig {
+    tls_cert: PathBuf,
+    tls_key: PathBuf,
+    auth_user: String,
+    auth_password: String,
+}
+
+struct RuntimeSecurity {
+    config: SecurityConfig,
+    tls: Option<Arc<TlsServerConfig>>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = parse_args(env::args().skip(1))?;
+    let security = Arc::new(RuntimeSecurity::from_config(config.security.clone())?);
     let listener = TcpListener::bind(&config.listen)?;
     eprintln!("gpu-db-server listening on {}", config.listen);
 
@@ -4358,8 +4393,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match stream {
             Ok(stream) => {
                 let shared_catalog = config.shared_catalog;
+                let security = Arc::clone(&security);
                 thread::spawn(move || {
-                    if let Err(error) = handle_client(stream, shared_catalog) {
+                    if let Err(error) = handle_client(stream, shared_catalog, &security) {
                         eprintln!("client error: {error}");
                     }
                 });
@@ -4377,6 +4413,11 @@ where
 {
     let mut listen = String::from("127.0.0.1:5432");
     let mut shared_catalog = false;
+    let mut security_profile = env::var("GPU_DB_SECURITY_PROFILE").ok();
+    let mut tls_cert = env::var("GPU_DB_TLS_CERT").ok().map(PathBuf::from);
+    let mut tls_key = env::var("GPU_DB_TLS_KEY").ok().map(PathBuf::from);
+    let mut auth_user = env::var("GPU_DB_AUTH_USER").ok();
+    let mut auth_password = env::var("GPU_DB_AUTH_PASSWORD").ok();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--listen" => {
@@ -4388,45 +4429,151 @@ where
             "--shared-catalog" => {
                 shared_catalog = true;
             }
+            "--security-profile" => {
+                security_profile = Some(
+                    args.next()
+                        .ok_or_else(|| String::from("missing value for --security-profile"))?,
+                );
+            }
+            "--tls-cert" => {
+                tls_cert =
+                    Some(PathBuf::from(args.next().ok_or_else(|| {
+                        String::from("missing value for --tls-cert")
+                    })?));
+            }
+            "--tls-key" => {
+                tls_key =
+                    Some(PathBuf::from(args.next().ok_or_else(|| {
+                        String::from("missing value for --tls-key")
+                    })?));
+            }
+            "--auth-user" => {
+                auth_user = Some(
+                    args.next()
+                        .ok_or_else(|| String::from("missing value for --auth-user"))?,
+                );
+            }
+            "--auth-password" => {
+                auth_password = Some(
+                    args.next()
+                        .ok_or_else(|| String::from("missing value for --auth-password"))?,
+                );
+            }
             "-h" | "--help" => {
                 return Err(String::from(
-                    "usage: gpu-db-server [--listen HOST:PORT] [--shared-catalog]",
+                    "usage: gpu-db-server [--listen HOST:PORT] [--shared-catalog] [--security-profile local-dev|production --tls-cert PATH --tls-key PATH --auth-user USER --auth-password PASSWORD]",
                 ));
             }
             other => return Err(format!("unsupported argument: {other}")),
         }
     }
+    let security = match security_profile.as_deref().unwrap_or("local-dev") {
+        "local-dev" | "development" => SecurityConfig::LocalDev,
+        "production" => SecurityConfig::Production(ProductionSecurityConfig {
+            tls_cert: tls_cert.ok_or_else(|| {
+                String::from("production security profile requires --tls-cert or GPU_DB_TLS_CERT")
+            })?,
+            tls_key: tls_key.ok_or_else(|| {
+                String::from("production security profile requires --tls-key or GPU_DB_TLS_KEY")
+            })?,
+            auth_user: non_empty_config(auth_user, "--auth-user or GPU_DB_AUTH_USER")?,
+            auth_password: non_empty_config(
+                auth_password,
+                "--auth-password or GPU_DB_AUTH_PASSWORD",
+            )?,
+        }),
+        other => return Err(format!("unsupported security profile: {other}")),
+    };
     Ok(ServerConfig {
         listen,
         shared_catalog,
+        security,
     })
 }
 
-fn handle_client(mut stream: TcpStream, shared_catalog: bool) -> io::Result<()> {
-    startup_handshake(&mut stream)?;
+fn non_empty_config(value: Option<String>, name: &str) -> Result<String, String> {
+    let value = value.ok_or_else(|| format!("production security profile requires {name}"))?;
+    if value.is_empty() {
+        return Err(format!(
+            "production security profile requires non-empty {name}"
+        ));
+    }
+    Ok(value)
+}
+
+impl RuntimeSecurity {
+    fn from_config(config: SecurityConfig) -> Result<Self, Box<dyn std::error::Error>> {
+        let tls = match &config {
+            SecurityConfig::LocalDev => None,
+            SecurityConfig::Production(production) => Some(Arc::new(load_tls_config(production)?)),
+        };
+        Ok(Self { config, tls })
+    }
+}
+
+fn load_tls_config(
+    production: &ProductionSecurityConfig,
+) -> Result<TlsServerConfig, Box<dyn std::error::Error>> {
+    let mut cert_reader = io::BufReader::new(File::open(&production.tls_cert)?);
+    let certs = rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
+    if certs.is_empty() {
+        return Err("production TLS certificate file contains no certificates".into());
+    }
+
+    let mut key_reader = io::BufReader::new(File::open(&production.tls_key)?);
+    let key = rustls_pemfile::private_key(&mut key_reader)?
+        .ok_or("production TLS key file contains no private key")?;
+
+    Ok(TlsServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)?)
+}
+
+fn handle_client(
+    mut stream: TcpStream,
+    shared_catalog: bool,
+    security: &RuntimeSecurity,
+) -> io::Result<()> {
+    if startup_handshake(&mut stream, security, false)? {
+        let tls_config = security.tls.as_ref().ok_or_else(|| {
+            io::Error::new(
+                ErrorKind::InvalidInput,
+                "production profile missing TLS runtime config",
+            )
+        })?;
+        let connection = ServerConnection::new(Arc::clone(tls_config))
+            .map_err(|error| io::Error::new(ErrorKind::InvalidData, error.to_string()))?;
+        let mut tls_stream = StreamOwned::new(connection, stream);
+        if startup_handshake(&mut tls_stream, security, true)? {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "nested SSLRequest is not supported",
+            ));
+        }
+        return handle_ready_client(&mut tls_stream, shared_catalog);
+    }
+    handle_ready_client(&mut stream, shared_catalog)
+}
+
+fn handle_ready_client(stream: &mut dyn ReadWrite, shared_catalog: bool) -> io::Result<()> {
     let mut session = Session::new(shared_catalog);
     let mut extended_error_pending = false;
 
     loop {
-        let Some(frame) = read_tagged_frame(&mut stream)? else {
+        let Some(frame) = read_tagged_frame(stream)? else {
             return Ok(());
         };
 
         let message = parse_frontend_message(&frame)
             .map_err(|error| io::Error::new(ErrorKind::InvalidData, error.to_string()))?;
-        if !handle_frontend_message(
-            &mut stream,
-            &mut session,
-            &mut extended_error_pending,
-            message,
-        )? {
+        if !handle_frontend_message(stream, &mut session, &mut extended_error_pending, message)? {
             return Ok(());
         }
     }
 }
 
 fn handle_frontend_message(
-    stream: &mut TcpStream,
+    stream: &mut dyn ReadWrite,
     session: &mut Session,
     extended_error_pending: &mut bool,
     message: FrontendMessage,
@@ -4620,29 +4767,236 @@ fn unsupported_frontend_message(message: &FrontendMessage) -> &'static str {
     }
 }
 
-fn startup_handshake(stream: &mut TcpStream) -> io::Result<()> {
+fn startup_handshake(
+    stream: &mut dyn ReadWrite,
+    security: &RuntimeSecurity,
+    tls_established: bool,
+) -> io::Result<bool> {
     loop {
         let frame = read_startup_frame(stream)?;
         match parse_startup_packet(&frame)
             .map_err(|error| io::Error::new(ErrorKind::InvalidData, error.to_string()))?
         {
-            StartupPacket::SslRequest | StartupPacket::GssEncRequest => stream.write_all(b"N")?,
-            StartupPacket::CancelRequest { .. } => return Ok(()),
-            StartupPacket::Startup { .. } => {
-                write_authentication_ok(stream)?;
-                write_parameter_status(stream, "client_encoding", "UTF8")?;
-                write_parameter_status(stream, "server_version", "16.0")?;
-                write_parameter_status(stream, "server_version_num", "160000")?;
-                write_parameter_status(stream, "standard_conforming_strings", "on")?;
-                write_backend_key_data(stream, 1, 1)?;
-                write_ready_for_query(stream, false)?;
-                return Ok(());
+            StartupPacket::SslRequest => match &security.config {
+                SecurityConfig::LocalDev => stream.write_all(b"N")?,
+                SecurityConfig::Production(_) => {
+                    stream.write_all(b"S")?;
+                    stream.flush()?;
+                    return Ok(true);
+                }
+            },
+            StartupPacket::GssEncRequest => stream.write_all(b"N")?,
+            StartupPacket::CancelRequest { .. } => return Ok(false),
+            StartupPacket::Startup { params, .. } => {
+                match &security.config {
+                    SecurityConfig::LocalDev => write_authentication_ok(stream)?,
+                    SecurityConfig::Production(production) => {
+                        if !tls_established {
+                            write_error(
+                                stream,
+                                &ErrorField {
+                                    code: "28000",
+                                    message: "production security profile requires TLS",
+                                    position: None,
+                                },
+                            )?;
+                            return Err(io::Error::new(
+                                ErrorKind::PermissionDenied,
+                                "production security profile requires TLS",
+                            ));
+                        }
+                        authenticate_scram_sha256(stream, production, &params)?
+                    }
+                }
+                write_startup_ready(stream)?;
+                return Ok(false);
             }
         }
     }
 }
 
-fn read_startup_frame(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
+fn write_startup_ready(stream: &mut dyn ReadWrite) -> io::Result<()> {
+    write_parameter_status(stream, "client_encoding", "UTF8")?;
+    write_parameter_status(stream, "server_version", "16.0")?;
+    write_parameter_status(stream, "server_version_num", "160000")?;
+    write_parameter_status(stream, "standard_conforming_strings", "on")?;
+    write_backend_key_data(stream, 1, 1)?;
+    write_ready_for_query(stream, false)
+}
+
+fn authenticate_scram_sha256(
+    stream: &mut dyn ReadWrite,
+    production: &ProductionSecurityConfig,
+    startup_params: &[(String, String)],
+) -> io::Result<()> {
+    let startup_user = startup_params
+        .iter()
+        .find_map(|(key, value)| (key == "user").then_some(value.as_str()))
+        .unwrap_or("");
+    if startup_user != production.auth_user {
+        write_error(
+            stream,
+            &ErrorField {
+                code: "28P01",
+                message: "password authentication failed",
+                position: None,
+            },
+        )?;
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "password authentication failed",
+        ));
+    }
+
+    write_authentication_sasl(stream, &["SCRAM-SHA-256"])?;
+    let initial = read_tagged_frame(stream)?.ok_or_else(|| {
+        io::Error::new(
+            ErrorKind::UnexpectedEof,
+            "connection closed during SCRAM authentication",
+        )
+    })?;
+    let initial = parse_frontend_message(&initial)
+        .map_err(|error| io::Error::new(ErrorKind::InvalidData, error.to_string()))?;
+    let FrontendMessage::SaslInitialResponse {
+        mechanism,
+        initial_response,
+    } = initial
+    else {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "expected SASL initial response",
+        ));
+    };
+    if mechanism != "SCRAM-SHA-256" {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "unsupported SASL mechanism",
+        ));
+    }
+    let client_first = String::from_utf8(initial_response.unwrap_or_default())
+        .map_err(|_| io::Error::new(ErrorKind::InvalidData, "invalid SCRAM client-first UTF-8"))?;
+    let client_first_bare = client_first
+        .find(",,")
+        .map_or(client_first.as_str(), |idx| &client_first[idx + 2..]);
+    let client_nonce = scram_attr(client_first_bare, "r").ok_or_else(|| {
+        io::Error::new(ErrorKind::InvalidData, "SCRAM client-first missing nonce")
+    })?;
+
+    let mut nonce_bytes = [0_u8; 18];
+    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    let server_nonce = BASE64_STANDARD.encode(nonce_bytes);
+    let combined_nonce = format!("{client_nonce}{server_nonce}");
+    let salt = b"gpu-db-production-profile-v1";
+    let iterations = 4096_u32;
+    let server_first = format!(
+        "r={combined_nonce},s={},i={iterations}",
+        BASE64_STANDARD.encode(salt)
+    );
+    write_authentication_sasl_continue(stream, server_first.as_bytes())?;
+
+    let final_frame = read_tagged_frame(stream)?.ok_or_else(|| {
+        io::Error::new(
+            ErrorKind::UnexpectedEof,
+            "connection closed during SCRAM final response",
+        )
+    })?;
+    let final_message = parse_frontend_message(&final_frame)
+        .map_err(|error| io::Error::new(ErrorKind::InvalidData, error.to_string()))?;
+    let FrontendMessage::SaslResponse(client_final_bytes) = final_message else {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "expected SASL final response",
+        ));
+    };
+    let client_final = String::from_utf8(client_final_bytes)
+        .map_err(|_| io::Error::new(ErrorKind::InvalidData, "invalid SCRAM final UTF-8"))?;
+    let proof = scram_attr(&client_final, "p")
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "SCRAM final missing proof"))?;
+    let proof_marker = format!(",p={proof}");
+    let client_final_without_proof = client_final
+        .strip_suffix(&proof_marker)
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "malformed SCRAM proof"))?;
+    let auth_message = format!("{client_first_bare},{server_first},{client_final_without_proof}");
+    let scram = scram_secrets(
+        production.auth_password.as_bytes(),
+        salt,
+        iterations,
+        &auth_message,
+    );
+    let client_proof = BASE64_STANDARD
+        .decode(proof)
+        .map_err(|_| io::Error::new(ErrorKind::InvalidData, "invalid SCRAM proof base64"))?;
+    if client_proof.len() != scram.client_signature.len() {
+        return scram_auth_failed(stream);
+    }
+    let recovered_client_key: Vec<u8> = client_proof
+        .iter()
+        .zip(scram.client_signature.iter())
+        .map(|(proof, signature)| proof ^ signature)
+        .collect();
+    let recovered_stored_key = Sha256::digest(&recovered_client_key);
+    if recovered_stored_key.as_slice() != scram.stored_key {
+        return scram_auth_failed(stream);
+    }
+    let server_final = format!("v={}", BASE64_STANDARD.encode(scram.server_signature));
+    write_authentication_sasl_final(stream, server_final.as_bytes())?;
+    write_authentication_ok(stream)
+}
+
+fn scram_auth_failed(stream: &mut dyn ReadWrite) -> io::Result<()> {
+    write_error(
+        stream,
+        &ErrorField {
+            code: "28P01",
+            message: "password authentication failed",
+            position: None,
+        },
+    )?;
+    Err(io::Error::new(
+        ErrorKind::PermissionDenied,
+        "password authentication failed",
+    ))
+}
+
+struct ScramSecrets {
+    stored_key: Vec<u8>,
+    client_signature: Vec<u8>,
+    server_signature: Vec<u8>,
+}
+
+fn scram_secrets(
+    password: &[u8],
+    salt: &[u8],
+    iterations: u32,
+    auth_message: &str,
+) -> ScramSecrets {
+    let mut salted_password = [0_u8; 32];
+    pbkdf2_hmac::<Sha256>(password, salt, iterations, &mut salted_password);
+    let client_key = hmac_sha256(&salted_password, b"Client Key");
+    let stored_key = Sha256::digest(&client_key).to_vec();
+    let client_signature = hmac_sha256(&stored_key, auth_message.as_bytes());
+    let server_key = hmac_sha256(&salted_password, b"Server Key");
+    let server_signature = hmac_sha256(&server_key, auth_message.as_bytes());
+    ScramSecrets {
+        stored_key,
+        client_signature,
+        server_signature,
+    }
+}
+
+fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(data);
+    mac.finalize().into_bytes().to_vec()
+}
+
+fn scram_attr<'a>(message: &'a str, name: &str) -> Option<&'a str> {
+    message
+        .split(',')
+        .find_map(|part| part.strip_prefix(&format!("{name}=")))
+}
+
+fn read_startup_frame(stream: &mut dyn ReadWrite) -> io::Result<Vec<u8>> {
     let mut len_bytes = [0_u8; 4];
     if let Err(error) = stream.read_exact(&mut len_bytes) {
         return if error.kind() == ErrorKind::UnexpectedEof {
@@ -4671,7 +5025,7 @@ fn read_startup_frame(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
     Ok(frame)
 }
 
-fn read_tagged_frame(stream: &mut TcpStream) -> io::Result<Option<Vec<u8>>> {
+fn read_tagged_frame(stream: &mut dyn ReadWrite) -> io::Result<Option<Vec<u8>>> {
     let mut tag = [0_u8; 1];
     match stream.read_exact(&mut tag) {
         Ok(()) => {}
@@ -4699,7 +5053,11 @@ fn read_tagged_frame(stream: &mut TcpStream) -> io::Result<Option<Vec<u8>>> {
     Ok(Some(frame))
 }
 
-fn run_simple_query(stream: &mut TcpStream, session: &mut Session, query: &str) -> io::Result<()> {
+fn run_simple_query(
+    stream: &mut dyn ReadWrite,
+    session: &mut Session,
+    query: &str,
+) -> io::Result<()> {
     let statements = split_simple_query(query);
     if statements.is_empty() {
         write_empty_query_response(stream)?;
@@ -4802,7 +5160,7 @@ fn split_simple_query(query: &str) -> Vec<&str> {
 }
 
 fn handle_parse(
-    stream: &mut TcpStream,
+    stream: &mut dyn ReadWrite,
     session: &mut Session,
     statement_name: String,
     query: String,
@@ -4927,7 +5285,7 @@ fn handle_parse(
 }
 
 fn handle_bind(
-    stream: &mut TcpStream,
+    stream: &mut dyn ReadWrite,
     session: &mut Session,
     portal_name: String,
     statement_name: String,
@@ -5046,7 +5404,7 @@ fn handle_bind(
 }
 
 fn handle_describe(
-    stream: &mut TcpStream,
+    stream: &mut dyn ReadWrite,
     session: &mut Session,
     target: DescribeTarget,
     name: &str,
@@ -5110,7 +5468,7 @@ fn handle_describe(
 }
 
 fn handle_execute(
-    stream: &mut TcpStream,
+    stream: &mut dyn ReadWrite,
     session: &mut Session,
     portal_name: &str,
     max_rows: u32,
@@ -5247,7 +5605,7 @@ fn handle_execute(
 }
 
 fn handle_close(
-    stream: &mut TcpStream,
+    stream: &mut dyn ReadWrite,
     session: &mut Session,
     target: DescribeTarget,
     name: &str,
@@ -5258,7 +5616,7 @@ fn handle_close(
 }
 
 fn execute_portal_batch(
-    stream: &mut TcpStream,
+    stream: &mut dyn ReadWrite,
     session: &mut Session,
     portal_name: &str,
     max_rows: u32,
@@ -6927,7 +7285,7 @@ fn execute_extended_update(
 }
 
 fn execute_declare_cursor(
-    stream: &mut TcpStream,
+    stream: &mut dyn ReadWrite,
     session: &mut Session,
     name: String,
     query: &str,
@@ -7007,7 +7365,7 @@ fn execute_declare_cursor(
 }
 
 fn execute_fetch_forward(
-    stream: &mut TcpStream,
+    stream: &mut dyn ReadWrite,
     session: &mut Session,
     name: &str,
     count: Option<usize>,
@@ -7037,7 +7395,7 @@ fn execute_fetch_forward(
 }
 
 fn execute_move_forward(
-    stream: &mut TcpStream,
+    stream: &mut dyn ReadWrite,
     session: &mut Session,
     name: &str,
     count: Option<usize>,
@@ -7582,7 +7940,7 @@ fn parse_copy_csv_value(field: &CopyCsvField, ty: SqlType) -> Result<SqlValue, E
 }
 
 fn execute_copy_to_stdout(
-    stream: &mut TcpStream,
+    stream: &mut dyn ReadWrite,
     session: &Session,
     table_name: &str,
     options: CopyOptions,
@@ -7641,7 +7999,7 @@ fn execute_copy_to_stdout(
 }
 
 fn begin_copy_from_stdin(
-    stream: &mut TcpStream,
+    stream: &mut dyn ReadWrite,
     session: &mut Session,
     table_name: &str,
     requested_columns: Option<Vec<String>>,
@@ -7878,7 +8236,7 @@ fn parse_copy_row(
 }
 
 fn execute_statement(
-    stream: &mut TcpStream,
+    stream: &mut dyn ReadWrite,
     session: &mut Session,
     statement: &str,
     include_row_description: bool,
@@ -20634,12 +20992,33 @@ fn is_pg_dump_session_set_statement(canonical: &str) -> bool {
     )
 }
 
-fn write_authentication_ok(stream: &mut TcpStream) -> io::Result<()> {
+fn write_authentication_ok(stream: &mut dyn ReadWrite) -> io::Result<()> {
     write_message(stream, b'R', &0_i32.to_be_bytes())
 }
 
+fn write_authentication_sasl(stream: &mut dyn ReadWrite, mechanisms: &[&str]) -> io::Result<()> {
+    let mut payload = 10_i32.to_be_bytes().to_vec();
+    for mechanism in mechanisms {
+        push_cstring(&mut payload, mechanism);
+    }
+    payload.push(0);
+    write_message(stream, b'R', &payload)
+}
+
+fn write_authentication_sasl_continue(stream: &mut dyn ReadWrite, data: &[u8]) -> io::Result<()> {
+    let mut payload = 11_i32.to_be_bytes().to_vec();
+    payload.extend_from_slice(data);
+    write_message(stream, b'R', &payload)
+}
+
+fn write_authentication_sasl_final(stream: &mut dyn ReadWrite, data: &[u8]) -> io::Result<()> {
+    let mut payload = 12_i32.to_be_bytes().to_vec();
+    payload.extend_from_slice(data);
+    write_message(stream, b'R', &payload)
+}
+
 fn write_backend_key_data(
-    stream: &mut TcpStream,
+    stream: &mut dyn ReadWrite,
     process_id: i32,
     secret_key: i32,
 ) -> io::Result<()> {
@@ -20649,49 +21028,49 @@ fn write_backend_key_data(
     write_message(stream, b'K', &payload)
 }
 
-fn write_parameter_status(stream: &mut TcpStream, key: &str, value: &str) -> io::Result<()> {
+fn write_parameter_status(stream: &mut dyn ReadWrite, key: &str, value: &str) -> io::Result<()> {
     let mut payload = Vec::with_capacity(key.len() + value.len() + 2);
     push_cstring(&mut payload, key);
     push_cstring(&mut payload, value);
     write_message(stream, b'S', &payload)
 }
 
-fn write_ready_for_query(stream: &mut TcpStream, in_transaction: bool) -> io::Result<()> {
+fn write_ready_for_query(stream: &mut dyn ReadWrite, in_transaction: bool) -> io::Result<()> {
     let status = if in_transaction { b'T' } else { b'I' };
     write_message(stream, b'Z', &[status])
 }
 
-fn write_empty_query_response(stream: &mut TcpStream) -> io::Result<()> {
+fn write_empty_query_response(stream: &mut dyn ReadWrite) -> io::Result<()> {
     write_message(stream, b'I', &[])
 }
 
-fn write_command_complete(stream: &mut TcpStream, tag: &str) -> io::Result<()> {
+fn write_command_complete(stream: &mut dyn ReadWrite, tag: &str) -> io::Result<()> {
     let mut payload = Vec::with_capacity(tag.len() + 1);
     push_cstring(&mut payload, tag);
     write_message(stream, b'C', &payload)
 }
 
-fn write_parse_complete(stream: &mut TcpStream) -> io::Result<()> {
+fn write_parse_complete(stream: &mut dyn ReadWrite) -> io::Result<()> {
     write_message(stream, b'1', &[])
 }
 
-fn write_bind_complete(stream: &mut TcpStream) -> io::Result<()> {
+fn write_bind_complete(stream: &mut dyn ReadWrite) -> io::Result<()> {
     write_message(stream, b'2', &[])
 }
 
-fn write_close_complete(stream: &mut TcpStream) -> io::Result<()> {
+fn write_close_complete(stream: &mut dyn ReadWrite) -> io::Result<()> {
     write_message(stream, b'3', &[])
 }
 
-fn write_portal_suspended(stream: &mut TcpStream) -> io::Result<()> {
+fn write_portal_suspended(stream: &mut dyn ReadWrite) -> io::Result<()> {
     write_message(stream, b's', &[])
 }
 
-fn write_no_data(stream: &mut TcpStream) -> io::Result<()> {
+fn write_no_data(stream: &mut dyn ReadWrite) -> io::Result<()> {
     write_message(stream, b'n', &[])
 }
 
-fn write_copy_out_response(stream: &mut TcpStream, column_count: usize) -> io::Result<()> {
+fn write_copy_out_response(stream: &mut dyn ReadWrite, column_count: usize) -> io::Result<()> {
     let column_count = i16::try_from(column_count)
         .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "too many COPY columns"))?;
     let mut payload = Vec::with_capacity(1 + 2 + column_count as usize * 2);
@@ -20703,7 +21082,7 @@ fn write_copy_out_response(stream: &mut TcpStream, column_count: usize) -> io::R
     write_message(stream, b'H', &payload)
 }
 
-fn write_copy_in_response(stream: &mut TcpStream, column_count: usize) -> io::Result<()> {
+fn write_copy_in_response(stream: &mut dyn ReadWrite, column_count: usize) -> io::Result<()> {
     let column_count = i16::try_from(column_count)
         .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "too many COPY columns"))?;
     let mut payload = Vec::with_capacity(1 + 2 + column_count as usize * 2);
@@ -20715,15 +21094,15 @@ fn write_copy_in_response(stream: &mut TcpStream, column_count: usize) -> io::Re
     write_message(stream, b'G', &payload)
 }
 
-fn write_copy_data(stream: &mut TcpStream, bytes: &[u8]) -> io::Result<()> {
+fn write_copy_data(stream: &mut dyn ReadWrite, bytes: &[u8]) -> io::Result<()> {
     write_message(stream, b'd', bytes)
 }
 
-fn write_copy_done(stream: &mut TcpStream) -> io::Result<()> {
+fn write_copy_done(stream: &mut dyn ReadWrite) -> io::Result<()> {
     write_message(stream, b'c', &[])
 }
 
-fn write_parameter_description(stream: &mut TcpStream, type_oids: &[u32]) -> io::Result<()> {
+fn write_parameter_description(stream: &mut dyn ReadWrite, type_oids: &[u32]) -> io::Result<()> {
     let parameter_count = i16::try_from(type_oids.len())
         .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "too many parameters"))?;
     let mut payload = Vec::with_capacity(2 + type_oids.len() * 4);
@@ -20735,7 +21114,7 @@ fn write_parameter_description(stream: &mut TcpStream, type_oids: &[u32]) -> io:
 }
 
 fn write_single_row(
-    stream: &mut TcpStream,
+    stream: &mut dyn ReadWrite,
     columns: &[Column],
     rows: &[Vec<Option<String>>],
 ) -> io::Result<()> {
@@ -20743,7 +21122,7 @@ fn write_single_row(
 }
 
 fn write_select_rows(
-    stream: &mut TcpStream,
+    stream: &mut dyn ReadWrite,
     columns: &[Column],
     rows: &[Vec<Option<String>>],
     include_row_description: bool,
@@ -20758,7 +21137,7 @@ fn write_select_rows(
 }
 
 fn write_rows_with_tag(
-    stream: &mut TcpStream,
+    stream: &mut dyn ReadWrite,
     columns: &[Column],
     rows: &[Vec<Option<String>>],
     include_row_description: bool,
@@ -20773,12 +21152,12 @@ fn write_rows_with_tag(
     write_command_complete(stream, tag)
 }
 
-fn write_row_description(stream: &mut TcpStream, columns: &[Column]) -> io::Result<()> {
+fn write_row_description(stream: &mut dyn ReadWrite, columns: &[Column]) -> io::Result<()> {
     write_row_description_with_formats(stream, columns, &[])
 }
 
 fn write_row_description_with_formats(
-    stream: &mut TcpStream,
+    stream: &mut dyn ReadWrite,
     columns: &[Column],
     result_format_codes: &[i16],
 ) -> io::Result<()> {
@@ -20798,13 +21177,13 @@ fn write_row_description_with_formats(
     write_message(stream, b'T', &payload)
 }
 
-fn write_data_row(stream: &mut TcpStream, values: &[Option<String>]) -> io::Result<()> {
+fn write_data_row(stream: &mut dyn ReadWrite, values: &[Option<String>]) -> io::Result<()> {
     let columns = values.iter().map(|_| text_column("")).collect::<Vec<_>>();
     write_data_row_with_formats(stream, &columns, values, &[])
 }
 
 fn write_data_row_with_formats(
-    stream: &mut TcpStream,
+    stream: &mut dyn ReadWrite,
     columns: &[Column],
     values: &[Option<String>],
     result_format_codes: &[i16],
@@ -20854,7 +21233,7 @@ fn encode_binary_result_value(value: &str, type_oid: u32) -> io::Result<Vec<u8>>
     }
 }
 
-fn write_error(stream: &mut TcpStream, error: &ErrorField) -> io::Result<()> {
+fn write_error(stream: &mut dyn ReadWrite, error: &ErrorField) -> io::Result<()> {
     let mut payload = Vec::new();
     push_error_field(&mut payload, b'S', "ERROR");
     push_error_field(&mut payload, b'V', "ERROR");
@@ -20877,7 +21256,7 @@ fn push_cstring(payload: &mut Vec<u8>, value: &str) {
     payload.push(0);
 }
 
-fn write_message(stream: &mut TcpStream, tag: u8, payload: &[u8]) -> io::Result<()> {
+fn write_message(stream: &mut dyn ReadWrite, tag: u8, payload: &[u8]) -> io::Result<()> {
     let total_len = i32::try_from(payload.len() + 4)
         .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "payload too large"))?;
     stream.write_all(&[tag])?;
@@ -20901,7 +21280,7 @@ mod tests {
         (server, client)
     }
 
-    fn read_backend_messages(stream: &mut TcpStream, count: usize) -> Vec<(u8, Vec<u8>)> {
+    fn read_backend_messages(stream: &mut dyn ReadWrite, count: usize) -> Vec<(u8, Vec<u8>)> {
         let mut messages = Vec::with_capacity(count);
         for _ in 0..count {
             let mut tag = [0_u8; 1];
@@ -20916,7 +21295,7 @@ mod tests {
         messages
     }
 
-    fn read_backend_tags(stream: &mut TcpStream, count: usize) -> Vec<u8> {
+    fn read_backend_tags(stream: &mut dyn ReadWrite, count: usize) -> Vec<u8> {
         let messages = read_backend_messages(stream, count);
         let mut tags = Vec::with_capacity(messages.len());
         for (tag, _) in messages {
@@ -31222,6 +31601,7 @@ mod tests {
             ServerConfig {
                 listen: "127.0.0.1:5432".to_string(),
                 shared_catalog: false,
+                security: SecurityConfig::LocalDev,
             }
         );
         assert_eq!(
@@ -31237,7 +31617,47 @@ mod tests {
             ServerConfig {
                 listen: "0.0.0.0:9999".to_string(),
                 shared_catalog: true,
+                security: SecurityConfig::LocalDev,
             }
+        );
+    }
+
+    #[test]
+    fn args_production_security_profile_requires_explicit_material() {
+        let missing = parse_args(
+            vec![
+                String::from("--security-profile"),
+                String::from("production"),
+            ]
+            .into_iter(),
+        )
+        .unwrap_err();
+        assert!(missing.contains("--tls-cert"));
+
+        assert_eq!(
+            parse_args(
+                vec![
+                    String::from("--security-profile"),
+                    String::from("production"),
+                    String::from("--tls-cert"),
+                    String::from("server.crt"),
+                    String::from("--tls-key"),
+                    String::from("server.key"),
+                    String::from("--auth-user"),
+                    String::from("gpudb"),
+                    String::from("--auth-password"),
+                    String::from("secret"),
+                ]
+                .into_iter(),
+            )
+            .unwrap()
+            .security,
+            SecurityConfig::Production(ProductionSecurityConfig {
+                tls_cert: PathBuf::from("server.crt"),
+                tls_key: PathBuf::from("server.key"),
+                auth_user: "gpudb".to_string(),
+                auth_password: "secret".to_string(),
+            })
         );
     }
 }

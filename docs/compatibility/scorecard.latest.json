@@ -81,16 +81,16 @@
     "uncategorized": {
       "failed": 0,
       "ignored": 0,
-      "passed": 185,
-      "total": 185
+      "passed": 186,
+      "total": 186
     }
   },
   "top_failing_categories": [],
   "totals": {
     "failed": 0,
     "ignored": 0,
-    "passed": 1203,
-    "total": 1203
+    "passed": 1204,
+    "total": 1204
   },
   "trend_hook": {
     "baseline_available": true,
