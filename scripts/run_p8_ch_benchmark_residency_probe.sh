@@ -10,13 +10,14 @@ CONCURRENCY="${GPU_DB_CH_BENCH_CONCURRENCY:-1,10}"
 
 usage() {
   cat <<'USAGE'
-usage: scripts/run_p8_ch_benchmark_residency_probe.sh [--dry-run|--run-baseline|--run-25pct|--cleanup|--self-check]
+usage: scripts/run_p8_ch_benchmark_residency_probe.sh [--dry-run|--run-baseline|--run-25pct|--streaming-self-check|--cleanup|--self-check]
 
 Environment:
   GPU_DB_CH_BENCH_OUT_DIR       output directory, default target/p8-ch-benchmark-residency
   GPU_DB_CH_BENCH_ROWS          safe calibration rows, default 512
   GPU_DB_CH_BENCH_CONCURRENCY   logical request targets, default 1,10
   GPU_DB_CH_BENCH_MAX_ROWS      scheduled-run guardrail, default 10000
+  GPU_DB_CH_BENCH_CHUNK_ROWS    streaming self-check chunk rows, default 16
 USAGE
 }
 
@@ -45,18 +46,23 @@ write_25pct_blocker() {
 - available_disk_bytes: $available_bytes
 - disk_preflight: $(if [ "$available_bytes" -gt "$required_bytes" ]; then echo pass; else echo fail; fi)
 - run_preflight: blocked
+- bounded_streaming_generator_probe: available via \`--streaming-self-check\`
+- chunked_resident_cache_install: blocked
+- blocker: missing_relational_resident_cache_chunked_install_api
 
-The current executable probe seeds the table through the in-memory MVCC engine
-and builds a resident snapshot by collecting all decoded rows plus the device
-payload in process memory before admission. It does not yet have a bounded
-streaming/on-disk generator or chunked resident snapshot builder for the
-estimated 161061274-row / 6 GiB retained tier.
+The current executable probe now has a small checked benchmark-only streaming
+artifact generator, but the engine residency boundary still installs snapshots
+through an in-memory \`RelationalResidencySnapshot\` with
+\`resident_rows: Vec<Vec<SqlValue>>\` and one retained device payload. The 25%
+tier cannot safely start until \`RelationalResidentCache\` or an equivalent
+benchmark-only admission API can install column chunks without materializing
+all generated rows and the whole payload in process memory.
 PREFLIGHT
   cat >"$OUT_DIR/25pct-preflight.jsonl" <<PREFLIGHT_JSON
-{"kind":"tier_preflight","tier":"25pct","retained_target_bytes":$retained_target_bytes,"estimated_rows":$estimated_rows,"generated_table_bytes":$generated_table_bytes,"wal_log_bytes":$wal_log_bytes,"report_bytes":$report_bytes,"required_disk_bytes":$required_bytes,"available_disk_bytes":$available_bytes,"disk_preflight":$(if [ "$available_bytes" -gt "$required_bytes" ]; then echo true; else echo false; fi),"run_preflight":"blocked","blocker":"missing_bounded_streaming_on_disk_generator_and_chunked_resident_snapshot_builder"}
+{"kind":"tier_preflight","tier":"25pct","retained_target_bytes":$retained_target_bytes,"estimated_rows":$estimated_rows,"generated_table_bytes":$generated_table_bytes,"wal_log_bytes":$wal_log_bytes,"report_bytes":$report_bytes,"required_disk_bytes":$required_bytes,"available_disk_bytes":$available_bytes,"disk_preflight":$(if [ "$available_bytes" -gt "$required_bytes" ]; then echo true; else echo false; fi),"run_preflight":"blocked","bounded_streaming_generator_probe":true,"chunked_resident_cache_install":false,"blocker":"missing_relational_resident_cache_chunked_install_api"}
 PREFLIGHT_JSON
   cat "$OUT_DIR/25pct-preflight.md"
-  echo "p8_ch_benchmark_25pct=blocked reason=missing_bounded_streaming_on_disk_generator_and_chunked_resident_snapshot_builder" >&2
+  echo "p8_ch_benchmark_25pct=blocked reason=missing_relational_resident_cache_chunked_install_api" >&2
   return 1
 }
 
@@ -100,6 +106,19 @@ case "$mode" in
   --run-25pct)
     write_25pct_blocker
     ;;
+  --streaming-self-check)
+    mkdir -p "$OUT_DIR"
+    cargo run -q -p gpu_db_engine --example p8_ch_benchmark_residency_probe -- \
+      --streaming-self-check \
+      --output-dir "$OUT_DIR" \
+      --rows "${GPU_DB_CH_BENCH_ROWS:-64}" \
+      --chunk-rows "${GPU_DB_CH_BENCH_CHUNK_ROWS:-16}"
+    test -s "$OUT_DIR/streaming-order-line/manifest.jsonl"
+    test -s "$OUT_DIR/streaming-order-line/self-check.md"
+    grep -q '"kind":"streaming_summary"' "$OUT_DIR/streaming-order-line/manifest.jsonl"
+    grep -q '"blocker":"missing_relational_resident_cache_chunked_install_api"' "$OUT_DIR/streaming-order-line/manifest.jsonl"
+    cat "$OUT_DIR/streaming-order-line/self-check.md"
+    ;;
   --cleanup)
     rm -rf "$OUT_DIR"
     if [ -e "$OUT_DIR" ]; then
@@ -115,7 +134,10 @@ case "$mode" in
       "$0" --dry-run >"$tmp_dir/dry-run.out"
     GPU_DB_CH_BENCH_OUT_DIR="$tmp_dir/out" GPU_DB_CH_BENCH_ROWS=16 GPU_DB_CH_BENCH_CONCURRENCY=1 \
       "$0" --run-baseline >"$tmp_dir/run.out"
+    GPU_DB_CH_BENCH_OUT_DIR="$tmp_dir/out" GPU_DB_CH_BENCH_ROWS=16 GPU_DB_CH_BENCH_CHUNK_ROWS=4 \
+      "$0" --streaming-self-check >"$tmp_dir/streaming.out"
     GPU_DB_CH_BENCH_OUT_DIR="$tmp_dir/out" "$0" --cleanup >"$tmp_dir/cleanup.out"
+    grep -q 'missing_relational_resident_cache_chunked_install_api' "$tmp_dir/streaming.out"
     grep -q 'p8_ch_benchmark_cleanup=passed' "$tmp_dir/cleanup.out"
     echo "p8 ch benchmark residency probe self-check passed"
     ;;

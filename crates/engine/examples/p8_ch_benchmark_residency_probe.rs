@@ -1,7 +1,7 @@
 use std::env;
 use std::error::Error;
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -26,12 +26,14 @@ struct Args {
     rows: usize,
     concurrency: Vec<usize>,
     max_rows: usize,
+    chunk_rows: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Estimate,
     Run,
+    StreamingSelfCheck,
 }
 
 #[derive(Debug)]
@@ -66,6 +68,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     match args.mode {
         Mode::Estimate => write_estimate(&args),
         Mode::Run => run_probe(&args),
+        Mode::StreamingSelfCheck => run_streaming_self_check(&args),
     }
 }
 
@@ -110,6 +113,101 @@ fn write_estimate(args: &Args) -> Result<(), Box<dyn Error>> {
         "- cleanup_command: `scripts/run_p8_ch_benchmark_residency_probe.sh --cleanup`\n",
     );
     fs::write(args.output_dir.join("estimate.md"), report)?;
+    Ok(())
+}
+
+fn run_streaming_self_check(args: &Args) -> Result<(), Box<dyn Error>> {
+    if args.rows == 0 {
+        return Err("--rows must be greater than zero".into());
+    }
+    if args.chunk_rows == 0 {
+        return Err("--chunk-rows must be greater than zero".into());
+    }
+    let artifact_dir = args.output_dir.join("streaming-order-line");
+    if artifact_dir.exists() {
+        fs::remove_dir_all(&artifact_dir)?;
+    }
+    fs::create_dir_all(&artifact_dir)?;
+
+    let mut manifest = BufWriter::new(File::create(artifact_dir.join("manifest.jsonl"))?);
+    let mut total_rows = 0usize;
+    let mut total_bytes = 0u64;
+    let mut chunk_index = 0usize;
+    let mut next_row = 1usize;
+    while next_row <= args.rows {
+        let chunk_start = next_row;
+        let chunk_end = args.rows.min(chunk_start + args.chunk_rows - 1);
+        let chunk_path = artifact_dir.join(format!("order_line_chunk_{chunk_index:05}.csv"));
+        let mut chunk = BufWriter::new(File::create(&chunk_path)?);
+        let mut chunk_rows = 0usize;
+        for id in chunk_start..=chunk_end {
+            write_order_line_row(&mut chunk, id)?;
+            chunk_rows += 1;
+        }
+        chunk.flush()?;
+        let chunk_bytes = fs::metadata(&chunk_path)?.len();
+        total_rows += chunk_rows;
+        total_bytes = total_bytes.saturating_add(chunk_bytes);
+        writeln!(
+            manifest,
+            "{{\"kind\":\"streaming_chunk\",\"chunk_index\":{},\"path\":\"{}\",\"first_row\":{},\"last_row\":{},\"rows\":{},\"bytes\":{}}}",
+            chunk_index,
+            json_escape(&chunk_path.display().to_string()),
+            chunk_start,
+            chunk_end,
+            chunk_rows,
+            chunk_bytes
+        )?;
+        chunk_index += 1;
+        next_row = chunk_end + 1;
+    }
+    writeln!(
+        manifest,
+        "{{\"kind\":\"streaming_summary\",\"rows\":{},\"chunks\":{},\"bytes\":{},\"chunk_rows\":{},\"bounded_generator\":true,\"chunked_cache_install_available\":false,\"blocker\":\"missing_relational_resident_cache_chunked_install_api\"}}",
+        total_rows,
+        chunk_index,
+        total_bytes,
+        args.chunk_rows
+    )?;
+    manifest.flush()?;
+
+    let mut report = String::new();
+    report.push_str("# P8 CH-benCHmark Streaming Generator Self-Check\n\n");
+    report.push_str("- scope: benchmark-only `order_line` artifact generation under `target/`\n");
+    report.push_str(&format!("- rows: {}\n", total_rows));
+    report.push_str(&format!("- chunk_rows: {}\n", args.chunk_rows));
+    report.push_str(&format!("- chunks: {}\n", chunk_index));
+    report.push_str(&format!("- generated_bytes: {}\n", total_bytes));
+    report.push_str("- bounded_generator: pass\n");
+    report.push_str("- chunked_resident_cache_install: blocked\n");
+    report.push_str("- blocker: `missing_relational_resident_cache_chunked_install_api`\n\n");
+    report.push_str("The self-check writes deterministic generated rows directly to chunk files and never seeds the MVCC engine. It proves the benchmark generator side can be bounded, but the current engine residency path still installs a snapshot through `RelationalResidencySnapshot { resident_rows: Vec<Vec<SqlValue>>, ... }` and a single retained device-memory payload.\n");
+    fs::write(artifact_dir.join("self-check.md"), report)?;
+
+    if total_rows != args.rows {
+        return Err(format!(
+            "streaming generator wrote {total_rows} rows, expected {}",
+            args.rows
+        )
+        .into());
+    }
+    if chunk_index == 0 || total_bytes == 0 {
+        return Err("streaming generator produced no chunks".into());
+    }
+    Ok(())
+}
+
+fn write_order_line_row<W: Write>(writer: &mut W, id: usize) -> Result<(), Box<dyn Error>> {
+    let bucket = (id % 10) as i32;
+    let item = (id % 100_000) + 1;
+    let qty = ((id % 50) + 1) as i32;
+    let amount = ((id * 17) % 100_000) as i32;
+    let dist = if id.is_multiple_of(2) {
+        "alpha"
+    } else {
+        "omega"
+    };
+    writeln!(writer, "{id},{item},{qty},{amount},{dist}{bucket}")?;
     Ok(())
 }
 
@@ -290,7 +388,11 @@ fn seed_engine(row_count: usize) -> Result<Engine, Box<dyn Error>> {
         let item = (id % 100_000) + 1;
         let qty = ((id % 50) + 1) as i32;
         let amount = ((id * 17) % 100_000) as i32;
-        let dist = if id % 2 == 0 { "alpha" } else { "omega" };
+        let dist = if id.is_multiple_of(2) {
+            "alpha"
+        } else {
+            "omega"
+        };
         engine.execute_text(
             (id + 10) as u64,
             &format!(
@@ -391,6 +493,10 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
         .map(|value| parse_csv_usize(&value))
         .transpose()?
         .unwrap_or_else(|| vec![1, 10]);
+    let mut chunk_rows = env::var("GPU_DB_CH_BENCH_CHUNK_ROWS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(16);
     let max_rows = env::var("GPU_DB_CH_BENCH_MAX_ROWS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
@@ -401,6 +507,7 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
         match arg.as_str() {
             "--estimate" => mode = Some(Mode::Estimate),
             "--run" => mode = Some(Mode::Run),
+            "--streaming-self-check" => mode = Some(Mode::StreamingSelfCheck),
             "--output-dir" => {
                 output_dir = PathBuf::from(args.next().ok_or("--output-dir needs a value")?);
             }
@@ -413,6 +520,13 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
             }
             "--concurrency" => {
                 concurrency = parse_csv_usize(&args.next().ok_or("--concurrency needs a value")?)?;
+            }
+            "--chunk-rows" => {
+                chunk_rows = args
+                    .next()
+                    .ok_or("--chunk-rows needs a value")?
+                    .parse()
+                    .map_err(|_| "--chunk-rows must be an integer")?;
             }
             other => return Err(format!("unknown argument: {other}").into()),
         }
@@ -432,6 +546,7 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
         rows,
         concurrency,
         max_rows,
+        chunk_rows,
     })
 }
 
