@@ -10,7 +10,7 @@ CONCURRENCY="${GPU_DB_CH_BENCH_CONCURRENCY:-1,10}"
 
 usage() {
   cat <<'USAGE'
-usage: scripts/run_p8_ch_benchmark_residency_probe.sh [--dry-run|--run-baseline|--run-25pct|--pgsql-baseline-preflight|--streaming-self-check|--cleanup|--self-check]
+usage: scripts/run_p8_ch_benchmark_residency_probe.sh [--dry-run|--run-baseline|--run-25pct|--pgsql-baseline-preflight|--pgsql-baseline-docker-up|--pgsql-baseline-docker-preflight|--pgsql-baseline-docker-down|--streaming-self-check|--cleanup|--self-check]
 
 Environment:
   GPU_DB_CH_BENCH_OUT_DIR       output directory, default target/p8-ch-benchmark-residency
@@ -19,7 +19,95 @@ Environment:
   GPU_DB_CH_BENCH_MAX_ROWS      scheduled-run guardrail, default 10000
   GPU_DB_CH_BENCH_CHUNK_ROWS    streaming self-check chunk rows, default 16
   GPU_DB_CH_BENCH_PGSQL_URL     libpq connection string for PostgreSQL baseline
+  GPU_DB_CH_BENCH_PGSQL_DOCKER_NAME      default gpu-db-p8-pgsql-baseline
+  GPU_DB_CH_BENCH_PGSQL_DOCKER_IMAGE     default postgres:16
+  GPU_DB_CH_BENCH_PGSQL_DOCKER_PORT      default 55433
+  GPU_DB_CH_BENCH_PGSQL_DOCKER_PASSWORD  default gpu_db_p8_benchmark
 USAGE
+}
+
+pgsql_docker_name() {
+  printf '%s\n' "${GPU_DB_CH_BENCH_PGSQL_DOCKER_NAME:-gpu-db-p8-pgsql-baseline}"
+}
+
+pgsql_docker_image() {
+  printf '%s\n' "${GPU_DB_CH_BENCH_PGSQL_DOCKER_IMAGE:-postgres:16}"
+}
+
+pgsql_docker_port() {
+  printf '%s\n' "${GPU_DB_CH_BENCH_PGSQL_DOCKER_PORT:-55433}"
+}
+
+pgsql_docker_password() {
+  printf '%s\n' "${GPU_DB_CH_BENCH_PGSQL_DOCKER_PASSWORD:-gpu_db_p8_benchmark}"
+}
+
+pgsql_docker_url() {
+  printf 'postgresql://postgres:%s@127.0.0.1:%s/gpu_db_p8_baseline\n' "$(pgsql_docker_password)" "$(pgsql_docker_port)"
+}
+
+write_pgsql_docker_env() {
+  mkdir -p "$OUT_DIR/pgsql-baseline"
+  local env_path="$OUT_DIR/pgsql-baseline/docker.env"
+  cat >"$env_path" <<ENV
+GPU_DB_CH_BENCH_PGSQL_URL='$(pgsql_docker_url)'
+GPU_DB_CH_BENCH_PGSQL_DOCKER_NAME='$(pgsql_docker_name)'
+GPU_DB_CH_BENCH_PGSQL_DOCKER_IMAGE='$(pgsql_docker_image)'
+GPU_DB_CH_BENCH_PGSQL_DOCKER_PORT='$(pgsql_docker_port)'
+ENV
+  chmod 600 "$env_path"
+}
+
+pgsql_baseline_docker_up() {
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "p8_ch_benchmark_pgsql_docker=blocked reason=missing_docker_client" >&2
+    return 1
+  fi
+  if ! docker info >/dev/null 2>&1; then
+    echo "p8_ch_benchmark_pgsql_docker=blocked reason=docker_daemon_unavailable" >&2
+    return 1
+  fi
+
+  local name image port password
+  name="$(pgsql_docker_name)"
+  image="$(pgsql_docker_image)"
+  port="$(pgsql_docker_port)"
+  password="$(pgsql_docker_password)"
+
+  if docker ps -a --format '{{.Names}}' | grep -Fxq "$name"; then
+    docker start "$name" >/dev/null
+  else
+    docker run -d \
+      --name "$name" \
+      -e POSTGRES_PASSWORD="$password" \
+      -e POSTGRES_DB=gpu_db_p8_baseline \
+      -p "127.0.0.1:${port}:5432" \
+      "$image" >/dev/null
+  fi
+
+  for _ in $(seq 1 60); do
+    if pg_isready -h 127.0.0.1 -p "$port" -U postgres -d gpu_db_p8_baseline >/dev/null 2>&1; then
+      write_pgsql_docker_env
+      echo "p8_ch_benchmark_pgsql_docker=ready name=$name port=$port"
+      return 0
+    fi
+    sleep 1
+  done
+
+  docker logs "$name" >&2 || true
+  echo "p8_ch_benchmark_pgsql_docker=blocked reason=postgres_container_not_ready" >&2
+  return 1
+}
+
+pgsql_baseline_docker_down() {
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "p8_ch_benchmark_pgsql_docker_cleanup=skipped reason=missing_docker_client"
+    return 0
+  fi
+  local name
+  name="$(pgsql_docker_name)"
+  docker rm -f "$name" >/dev/null 2>&1 || true
+  echo "p8_ch_benchmark_pgsql_docker_cleanup=passed name=$name"
 }
 
 write_pgsql_baseline_workload_sql() {
@@ -248,6 +336,16 @@ case "$mode" in
     ;;
   --pgsql-baseline-preflight)
     write_pgsql_baseline_preflight
+    ;;
+  --pgsql-baseline-docker-up)
+    pgsql_baseline_docker_up
+    ;;
+  --pgsql-baseline-docker-preflight)
+    pgsql_baseline_docker_up
+    GPU_DB_CH_BENCH_PGSQL_URL="$(pgsql_docker_url)" write_pgsql_baseline_preflight
+    ;;
+  --pgsql-baseline-docker-down)
+    pgsql_baseline_docker_down
     ;;
   --streaming-self-check)
     mkdir -p "$OUT_DIR"
