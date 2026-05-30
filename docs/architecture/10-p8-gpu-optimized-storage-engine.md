@@ -449,6 +449,18 @@ scheduler-friendly maintenance. It reports durable GPU pages, autonomous cache
 daemon scheduling, external orchestration, broad retained expressions, and
 broader CUDA event timing as explicit gaps rather than production claims.
 
+`scripts/run_p8_ch_benchmark_residency_probe.sh` extends that local proof into a
+CH-benCHmark-derived benchmark harness with 25/50/100/200% RTX 3090 residency
+tiers, deterministic generated `order_line` chunks under `target/`, and a
+mandatory PostgreSQL comparator gate for the same dataset/query set. The 25% /
+6 GiB tier remains blocked before heavy generation starts on
+`missing_chunked_retained_device_memory_upload_api`: the current retained
+device-memory boundary accepts one contiguous host payload through
+`CudaDriverRuntime::retain_device_memory_copy(gpu_id, payload: &[u8])`. A safe
+benchmark-scale install path needs an explicit chunked upload/admission API that
+allocates the resident layout once and copies generated column chunks into
+known offsets without claiming normal SQL durability for benchmark artifacts.
+
 ## Non-Goals For The First P8 Design
 
 - Full PostgreSQL heap compatibility.

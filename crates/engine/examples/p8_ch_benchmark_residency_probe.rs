@@ -34,6 +34,7 @@ enum Mode {
     Estimate,
     Run,
     StreamingSelfCheck,
+    ChunkedInstallSelfCheck,
 }
 
 #[derive(Debug)]
@@ -69,6 +70,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Mode::Estimate => write_estimate(&args),
         Mode::Run => run_probe(&args),
         Mode::StreamingSelfCheck => run_streaming_self_check(&args),
+        Mode::ChunkedInstallSelfCheck => run_chunked_install_self_check(&args),
     }
 }
 
@@ -193,6 +195,63 @@ fn run_streaming_self_check(args: &Args) -> Result<(), Box<dyn Error>> {
     }
     if chunk_index == 0 || total_bytes == 0 {
         return Err("streaming generator produced no chunks".into());
+    }
+    Ok(())
+}
+
+fn run_chunked_install_self_check(args: &Args) -> Result<(), Box<dyn Error>> {
+    if args.rows == 0 {
+        return Err("--rows must be greater than zero".into());
+    }
+    if args.chunk_rows == 0 {
+        return Err("--chunk-rows must be greater than zero".into());
+    }
+
+    let artifact_dir = args.output_dir.join("chunked-install-self-check");
+    if artifact_dir.exists() {
+        fs::remove_dir_all(&artifact_dir)?;
+    }
+    fs::create_dir_all(&artifact_dir)?;
+
+    let mut chunk_count = 0usize;
+    let mut next_row = 1usize;
+    while next_row <= args.rows {
+        let chunk_start = next_row;
+        let chunk_end = args.rows.min(chunk_start + args.chunk_rows - 1);
+        let chunk_path = artifact_dir.join(format!("order_line_chunk_{chunk_count:05}.csv"));
+        let mut chunk = BufWriter::new(File::create(&chunk_path)?);
+        for id in chunk_start..=chunk_end {
+            write_order_line_row(&mut chunk, id)?;
+        }
+        chunk.flush()?;
+        chunk_count += 1;
+        next_row = chunk_end + 1;
+    }
+
+    let mut json = BufWriter::new(File::create(artifact_dir.join("self-check.jsonl"))?);
+    writeln!(
+        json,
+        "{{\"kind\":\"chunked_install_self_check\",\"rows\":{},\"chunk_rows\":{},\"chunks\":{},\"streaming_artifacts_created\":true,\"cache_snapshot_requires_resident_rows\":true,\"device_memory_copy_requires_contiguous_payload\":true,\"status\":\"blocked\",\"blocker\":\"missing_chunked_retained_device_memory_upload_api\"}}",
+        args.rows, args.chunk_rows, chunk_count
+    )?;
+    json.flush()?;
+
+    let mut report = String::new();
+    report.push_str("# P8 Chunked Resident-Cache Install Self-Check\n\n");
+    report.push_str("- scope: benchmark-only generated `order_line` chunk admission probe\n");
+    report.push_str(&format!("- rows: {}\n", args.rows));
+    report.push_str(&format!("- chunk_rows: {}\n", args.chunk_rows));
+    report.push_str(&format!("- chunks: {}\n", chunk_count));
+    report.push_str("- streaming_artifacts_created: pass\n");
+    report.push_str("- cache_snapshot_requires_resident_rows: true\n");
+    report.push_str("- device_memory_copy_requires_contiguous_payload: true\n");
+    report.push_str("- chunked_install_status: blocked\n");
+    report.push_str("- blocker: `missing_chunked_retained_device_memory_upload_api`\n\n");
+    report.push_str("This self-check proves the generator can hand off deterministic row chunks, but the current resident-cache/device-memory boundary cannot admit those chunks directly. `RelationalResidencySnapshot` still exposes `resident_rows: Vec<Vec<SqlValue>>` for snapshot-backed reads, and retained device memory is installed through a single `CudaDriverRuntime::retain_device_memory_copy(gpu_id, payload: &[u8])` call. The 25% tier therefore remains blocked on a narrower device-memory upload/admission API that can allocate the resident layout once and copy column chunks into offsets without first building one full host payload.\n");
+    fs::write(artifact_dir.join("self-check.md"), report)?;
+
+    if chunk_count == 0 {
+        return Err("chunked install self-check produced no chunks".into());
     }
     Ok(())
 }
@@ -508,6 +567,7 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
             "--estimate" => mode = Some(Mode::Estimate),
             "--run" => mode = Some(Mode::Run),
             "--streaming-self-check" => mode = Some(Mode::StreamingSelfCheck),
+            "--chunked-install-self-check" => mode = Some(Mode::ChunkedInstallSelfCheck),
             "--output-dir" => {
                 output_dir = PathBuf::from(args.next().ok_or("--output-dir needs a value")?);
             }
