@@ -136,11 +136,11 @@ fn run_probe(args: &Args) -> Result<(), Box<dyn Error>> {
     markdown.push_str("# P8 CH-benCHmark Residency Baseline Probe\n\n");
     markdown.push_str(&format!("- run_id: {run_id}\n"));
     markdown.push_str(&format!("- row_count: {}\n", args.rows));
-    markdown.push_str(&format!("- resident_table: order_line\n"));
+    markdown.push_str("- resident_table: order_line\n");
     markdown.push_str(&format!("- resident_bytes: {}\n", snapshot.resident_bytes));
-    markdown.push_str(&format!(
-        "- configured_production_tiers: 25pct/50pct/100pct/200pct/400pct of 24GiB VRAM\n"
-    ));
+    markdown.push_str(
+        "- configured_production_tiers: 25pct/50pct/100pct/200pct/400pct of 24GiB VRAM\n",
+    );
     markdown.push_str("- attempted_tier: calibration\n");
     markdown.push_str(
         "- cleanup_command: `scripts/run_p8_ch_benchmark_residency_probe.sh --cleanup`\n\n",
