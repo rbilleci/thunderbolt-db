@@ -28,7 +28,6 @@ The harness preserves the requested target plan:
 - 50% VRAM: 12 GiB retained target, estimated `322122548` rows.
 - 100% VRAM: 24 GiB retained target, estimated `644245095` rows.
 - 200% VRAM: 48 GiB retained target, estimated `1288490189` rows.
-- 400% VRAM: 96 GiB retained target, estimated `2576980378` rows.
 - Logical request targets: `1`, `10`, `100`, `1000`, and `10000`.
 
 The scheduled-worker guardrail is `10000` generated rows by default, so the
@@ -84,5 +83,5 @@ kernel exposes it, and memory-pressure fallback evidence.
 
 The next bottleneck is not another local retained-route permutation. Attempting
 the 6 GiB 25% VRAM tier needs a streaming or on-disk workload generator plus an
-operator-approved longer run window and cleanup budget. Larger 50/100/200/400%
+operator-approved longer run window and cleanup budget. Larger 50/100/200%
 tiers should remain dry-run guarded until that first 6 GiB tier completes.

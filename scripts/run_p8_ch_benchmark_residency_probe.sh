@@ -31,7 +31,11 @@ case "$mode" in
     test -s "$OUT_DIR/estimate.md"
     test -s "$OUT_DIR/estimate.jsonl"
     grep -q '"tier":"25pct"' "$OUT_DIR/estimate.jsonl"
-    grep -q '"tier":"400pct"' "$OUT_DIR/estimate.jsonl"
+    grep -q '"tier":"200pct"' "$OUT_DIR/estimate.jsonl"
+    if grep -q '"tier":"400pct"' "$OUT_DIR/estimate.jsonl"; then
+      echo "400% VRAM benchmark tier should not be configured" >&2
+      exit 1
+    fi
     grep -q 'concurrency_targets: \[1, 10, 100, 1000, 10000\]' "$OUT_DIR/estimate.md"
     cat "$OUT_DIR/estimate.md"
     ;;
