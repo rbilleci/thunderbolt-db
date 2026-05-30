@@ -30,6 +30,23 @@ payload, and then admits the snapshot. The generator side can be bounded, but
 the cache install/admission side still needs a chunked API before the 6 GiB
 tier can safely begin.
 
+## PostgreSQL Baseline Requirement
+
+P8 benchmark results must be compared against PostgreSQL for the same generated
+dataset and query set before any GPU DB performance claim is accepted. The
+harness now includes:
+
+```bash
+scripts/run_p8_ch_benchmark_residency_probe.sh --pgsql-baseline-preflight
+```
+
+That preflight writes a deterministic PostgreSQL workload SQL file under
+`target/p8-ch-benchmark-residency/pgsql-baseline/` and requires
+`GPU_DB_CH_BENCH_PGSQL_URL` to point at a disposable PostgreSQL database. If no
+PostgreSQL connection is configured, the preflight blocks the benchmark with
+`missing_pgsql_baseline_connection` rather than allowing standalone GPU DB
+numbers.
+
 ## Scope Boundary
 
 The streaming artifact path is benchmark-only. It does not claim normal SQL
@@ -63,6 +80,7 @@ rows and the whole retained device payload in process memory.
 Add a narrow `RelationalResidentCache` / benchmark-only resident snapshot
 builder that can install generated `int4` and `text` column chunks from the
 streaming artifacts, preserve explicit benchmark-only durability boundaries,
-record admission/budget/route telemetry, and execute the existing retained
-query kernels without requiring `resident_rows: Vec<Vec<SqlValue>>` for the
-whole tier.
+record admission/budget/route telemetry, require a passed PostgreSQL baseline
+artifact for the same dataset/query set, and execute the existing retained query
+kernels without requiring `resident_rows: Vec<Vec<SqlValue>>` for the whole
+tier.
