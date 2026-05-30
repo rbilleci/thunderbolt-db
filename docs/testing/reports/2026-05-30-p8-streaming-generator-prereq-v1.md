@@ -3,8 +3,8 @@
 - date: 2026-05-30
 - stream: benchmark
 - milestone: P8 CH-benCHmark-derived streaming/on-disk generation and chunked admission prerequisite
-- validation_gate: `scripts/run_p8_ch_benchmark_residency_probe.sh --dry-run`; `scripts/run_p8_ch_benchmark_residency_probe.sh --self-check`; `scripts/run_p8_ch_benchmark_residency_probe.sh --streaming-self-check`; `scripts/run_p8_ch_benchmark_residency_probe.sh --run-25pct`; `scripts/run_p8_ch_benchmark_residency_probe.sh --cleanup`; `cargo clippy --all-features --example p8_ch_benchmark_residency_probe -- -D warnings`; `git diff --check`
-- report_artifacts: `target/p8-ch-benchmark-residency/estimate.md`; `target/p8-ch-benchmark-residency/streaming-order-line/self-check.md`; `target/p8-ch-benchmark-residency/25pct-preflight.md`
+- validation_gate: `scripts/run_p8_ch_benchmark_residency_probe.sh --dry-run`; `scripts/run_p8_ch_benchmark_residency_probe.sh --self-check`; `scripts/run_p8_ch_benchmark_residency_probe.sh --streaming-self-check`; `scripts/run_p8_ch_benchmark_residency_probe.sh --pgsql-baseline-docker-preflight`; `scripts/run_p8_ch_benchmark_residency_probe.sh --run-25pct`; `scripts/run_p8_ch_benchmark_residency_probe.sh --cleanup`; `cargo clippy --all-features --example p8_ch_benchmark_residency_probe -- -D warnings`; `git diff --check`
+- report_artifacts: `target/p8-ch-benchmark-residency/estimate.md`; `target/p8-ch-benchmark-residency/streaming-order-line/self-check.md`; `target/p8-ch-benchmark-residency/pgsql-baseline/preflight.md`; `target/p8-ch-benchmark-residency/25pct-preflight.md`
 
 ## Result
 
@@ -46,6 +46,18 @@ That preflight writes a deterministic PostgreSQL workload SQL file under
 PostgreSQL connection is configured, the preflight blocks the benchmark with
 `missing_pgsql_baseline_connection` rather than allowing standalone GPU DB
 numbers.
+
+The local disposable baseline path is also checked:
+
+```bash
+scripts/run_p8_ch_benchmark_residency_probe.sh --pgsql-baseline-docker-preflight
+```
+
+On this host it starts or reuses the Docker `postgres:16` container
+`gpu-db-p8-pgsql-baseline`, writes
+`target/p8-ch-benchmark-residency/pgsql-baseline/docker.env`, loads the same
+deterministic `order_line` workload, and passes the PostgreSQL baseline
+preflight before any GPU DB comparative number is considered valid.
 
 ## Scope Boundary
 
