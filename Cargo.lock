@@ -562,6 +562,8 @@ name = "gpu_db_replication"
 version = "0.1.0"
 dependencies = [
  "gpu_db_types",
+ "rustls",
+ "rustls-pemfile",
  "thiserror 1.0.69",
 ]
 

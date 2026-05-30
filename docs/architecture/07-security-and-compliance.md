@@ -37,6 +37,18 @@ identity, KMS/HSM, external secret-manager integration, certificate rotation
 automation, broad authorization policy, replication-channel security, audit hash
 chain, row-level security, masking, or a production deployment policy.
 
+Replication-channel security now has a separate bounded local proof. The
+`gpu_db_replication` crate can load rustls server/client configs for
+mutual-TLS AppendEntries, requiring a trusted CA, node certificate, and private
+key on both sides. `scripts/run_replication_channel_security_preflight.sh`
+generates local CA/server/client material, proves a valid mTLS AppendEntries
+request/response, rejects missing certificate or key material before serving,
+and rejects a TLS client that omits client certificate material. The existing
+plain TCP follower-service, container, and Compose smokes remain the dev/test
+transport profile. This local mTLS smoke does not claim production certificate
+lifecycle automation, trust distribution, rotation, live rollout policy, or an
+external secret manager.
+
 ## Security principles
 
 1. **Default deny** for privileged operations.

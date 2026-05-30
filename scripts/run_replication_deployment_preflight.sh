@@ -67,11 +67,22 @@ run_gate \
   "operational_replication_compose_restart_smoke=host_parent_passed" \
   "deployment_gap_compose_restart_supervision=implemented_bounded_local_smoke"
 
+run_gate \
+  channel_security \
+  scripts/run_replication_channel_security_preflight.sh \
+  "operational_replication_channel_security_smoke=passed" \
+  "replication_channel_security_transport=mtls_append_entries" \
+  "replication_channel_security_missing_client_cert_rejection=passed" \
+  "replication_channel_security_plain_transport_profile=dev_test_only"
+
 printf 'operational_replication_deployment_preflight=passed\n'
-printf 'deployment_preflight_scope=packaged_service_systemd_contract_kubernetes_manifest_compose_restart\n'
+printf 'deployment_preflight_scope=packaged_service_systemd_contract_kubernetes_manifest_compose_restart_channel_mtls\n'
 printf 'deployment_preflight_service_smoke=passed\n'
 printf 'deployment_preflight_systemd_verify=passed\n'
 printf 'deployment_preflight_kubernetes_verify=passed\n'
 printf 'deployment_preflight_compose_restart_smoke=passed\n'
+printf 'deployment_preflight_channel_security=local_mtls_append_entries\n'
 printf 'deployment_gap_live_systemd_supervision=missing\n'
 printf 'deployment_gap_live_kubernetes_rollout=missing\n'
+printf 'deployment_gap_replication_certificate_lifecycle=missing\n'
+printf 'deployment_gap_replication_production_trust_distribution=missing\n'

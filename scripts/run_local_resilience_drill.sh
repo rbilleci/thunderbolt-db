@@ -45,11 +45,12 @@ run_gate \
   replication_deployment \
   scripts/run_replication_deployment_preflight.sh \
   "operational_replication_deployment_preflight=passed" \
-  "deployment_preflight_scope=packaged_service_systemd_contract_kubernetes_manifest_compose_restart" \
+  "deployment_preflight_scope=packaged_service_systemd_contract_kubernetes_manifest_compose_restart_channel_mtls" \
   "deployment_preflight_service_smoke=passed" \
   "deployment_preflight_systemd_verify=passed" \
   "deployment_preflight_kubernetes_verify=passed" \
   "deployment_preflight_compose_restart_smoke=passed" \
+  "deployment_preflight_channel_security=local_mtls_append_entries" \
   "deployment_gap_live_systemd_supervision=missing" \
   "deployment_gap_live_kubernetes_rollout=missing"
 
@@ -58,7 +59,7 @@ printf 'local_resilience_backup_pitr_dr=passed\n'
 printf 'local_resilience_replication_deployment=passed\n'
 printf 'local_resilience_scope=backup_pitr_dr_plus_replication_deployment_preflight\n'
 printf 'local_resilience_restore_targets=transaction,timestamp\n'
-printf 'local_resilience_replication_scope=packaged_service_systemd_contract_kubernetes_manifest_compose_restart\n'
+printf 'local_resilience_replication_scope=packaged_service_systemd_contract_kubernetes_manifest_compose_restart_channel_mtls\n'
 printf 'local_resilience_gap_physical_page_image_backup=missing\n'
 printf 'local_resilience_gap_production_object_storage=missing\n'
 printf 'local_resilience_gap_live_background_scheduling=missing\n'
