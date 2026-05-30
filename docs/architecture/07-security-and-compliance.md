@@ -20,12 +20,17 @@ rejected after startup in this profile.
 
 Production security profile v1 is an explicit opt-in for the PostgreSQL
 compatibility endpoint. It requires configured certificate/key material plus a
-configured auth user/password credential, accepts PostgreSQL SSLRequest, requires
-TLS before normal startup, runs SCRAM-SHA-256 password authentication, rejects
-invalid passwords, and rejects non-TLS production clients. The checked
+configured auth user and exactly one credential source. The production-oriented
+source is a standard SCRAM-SHA-256 verifier supplied directly or by verifier
+file; the plaintext `--auth-password` / `GPU_DB_AUTH_PASSWORD` path remains only
+a local/test bootstrap input and conflicts with verifier inputs. The profile
+accepts PostgreSQL SSLRequest, requires TLS before normal startup, runs
+SCRAM-SHA-256 password authentication, rejects invalid passwords, and rejects
+non-TLS production clients. The checked
 `scripts/run_connection_security_posture_preflight.sh` gate exercises incomplete
-config rejection, a valid TLS+SCRAM `psql` path, invalid-password failure,
-same-server recovery, and non-TLS rejection.
+config rejection, malformed verifier rejection, conflicting plaintext/verifier
+rejection, a valid verifier-file TLS+SCRAM `psql` path, invalid-password
+failure, same-server recovery, and non-TLS rejection.
 
 The profile is intentionally narrow. It does not claim mTLS, enterprise
 identity, KMS/HSM, external secret-manager integration, certificate rotation

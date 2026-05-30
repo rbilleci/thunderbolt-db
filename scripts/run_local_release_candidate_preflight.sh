@@ -83,6 +83,8 @@ run_gate \
   "connection_security_posture_preflight_local_dev_profile=trust_auth_no_tls_supported" \
   "connection_security_posture_preflight_production_profile_v1=passed" \
   "connection_security_posture_preflight_production_config_validation=passed" \
+  "connection_security_posture_preflight_production_scram_verifier_config=passed" \
+  "connection_security_posture_preflight_production_plaintext_password_conflict_rejection=passed" \
   "connection_security_posture_preflight_production_tls_required=passed" \
   "connection_security_posture_preflight_production_scram_sha_256_valid_password=passed" \
   "connection_security_posture_preflight_production_scram_sha_256_invalid_password=passed" \

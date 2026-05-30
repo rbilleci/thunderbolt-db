@@ -18,6 +18,9 @@ require_line crates/protocol/src/lib.rs "PG_GSSENC_REQUEST_CODE"
 require_line crates/protocol/src/bin/gpu-db-server.rs "SecurityConfig::LocalDev"
 require_line crates/protocol/src/bin/gpu-db-server.rs "SecurityConfig::Production"
 require_line crates/protocol/src/bin/gpu-db-server.rs "production security profile requires TLS"
+require_line crates/protocol/src/bin/gpu-db-server.rs "ScramCredential::Verifier"
+require_line crates/protocol/src/bin/gpu-db-server.rs "production SCRAM verifier must start with SCRAM-SHA-256$"
+require_line crates/protocol/src/bin/gpu-db-server.rs "local/test --auth-password"
 require_line crates/protocol/src/bin/gpu-db-server.rs "write_authentication_sasl(stream, &[\"SCRAM-SHA-256\"])?"
 require_line crates/protocol/src/bin/gpu-db-server.rs "write_authentication_ok(stream)"
 require_line crates/protocol/src/bin/gpu-db-server.rs "FrontendMessage::PasswordMessage(_) => \"password messages are not supported after startup\""
@@ -42,6 +45,22 @@ if ! grep -Fq "production security profile requires --tls-cert" /tmp/gpu-db-secu
   exit 1
 fi
 
+if ./target/debug/gpu-db-server \
+  --security-profile production \
+  --tls-cert /tmp/missing.crt \
+  --tls-key /tmp/missing.key \
+  --auth-user gpudb \
+  --auth-scram-verifier not-a-verifier \
+  >/tmp/gpu-db-security-malformed.out 2>/tmp/gpu-db-security-malformed.err; then
+  printf 'production profile accepted malformed SCRAM verifier\n' >&2
+  exit 1
+fi
+if ! grep -Fq "production SCRAM verifier must start with SCRAM-SHA-256$" /tmp/gpu-db-security-malformed.err; then
+  printf 'production profile did not report malformed SCRAM verifier\n' >&2
+  cat /tmp/gpu-db-security-malformed.err >&2
+  exit 1
+fi
+
 tmp="$(mktemp -d)"
 server_pid=""
 cleanup() {
@@ -56,6 +75,45 @@ trap cleanup EXIT
 openssl req -new -x509 -nodes -subj '/CN=localhost' -days 1 \
   -keyout "$tmp/server.key" -out "$tmp/server.crt" >/dev/null 2>&1
 chmod 600 "$tmp/server.key"
+
+python3 - <<'PY' >"$tmp/scram.verifier"
+import base64
+import hashlib
+import hmac
+
+password = b"secret"
+salt = b"gpu-db-production-verifier-preflight-v1"
+iterations = 4096
+salted = hashlib.pbkdf2_hmac("sha256", password, salt, iterations)
+client_key = hmac.new(salted, b"Client Key", hashlib.sha256).digest()
+stored_key = hashlib.sha256(client_key).digest()
+server_key = hmac.new(salted, b"Server Key", hashlib.sha256).digest()
+print(
+    "SCRAM-SHA-256${}:{}${}:{}".format(
+        iterations,
+        base64.b64encode(salt).decode(),
+        base64.b64encode(stored_key).decode(),
+        base64.b64encode(server_key).decode(),
+    )
+)
+PY
+
+if ./target/debug/gpu-db-server \
+  --security-profile production \
+  --tls-cert "$tmp/server.crt" \
+  --tls-key "$tmp/server.key" \
+  --auth-user gpudb \
+  --auth-password secret \
+  --auth-scram-verifier-file "$tmp/scram.verifier" \
+  >"$tmp/conflict.out" 2>"$tmp/conflict.err"; then
+  printf 'production profile accepted conflicting plaintext/verifier inputs\n' >&2
+  exit 1
+fi
+if ! grep -Fq "only one credential source" "$tmp/conflict.err"; then
+  printf 'production profile did not report conflicting credential inputs\n' >&2
+  cat "$tmp/conflict.err" >&2
+  exit 1
+fi
 
 port="$(
   python3 - <<'PY'
@@ -74,7 +132,7 @@ PY
   --tls-cert "$tmp/server.crt" \
   --tls-key "$tmp/server.key" \
   --auth-user gpudb \
-  --auth-password secret \
+  --auth-scram-verifier-file "$tmp/scram.verifier" \
   >"$tmp/server.out" 2>"$tmp/server.err" &
 server_pid="$!"
 
@@ -131,6 +189,8 @@ printf 'connection_security_posture_preflight_scope=local_dev_trust_auth_no_tls_
 printf 'connection_security_posture_preflight_local_dev_profile=trust_auth_no_tls_supported\n'
 printf 'connection_security_posture_preflight_production_profile_v1=passed\n'
 printf 'connection_security_posture_preflight_production_config_validation=passed\n'
+printf 'connection_security_posture_preflight_production_scram_verifier_config=passed\n'
+printf 'connection_security_posture_preflight_production_plaintext_password_conflict_rejection=passed\n'
 printf 'connection_security_posture_preflight_production_tls_required=passed\n'
 printf 'connection_security_posture_preflight_production_scram_sha_256_valid_password=passed\n'
 printf 'connection_security_posture_preflight_production_scram_sha_256_invalid_password=passed\n'

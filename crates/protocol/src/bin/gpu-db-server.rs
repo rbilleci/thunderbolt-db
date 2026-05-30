@@ -4375,7 +4375,21 @@ struct ProductionSecurityConfig {
     tls_cert: PathBuf,
     tls_key: PathBuf,
     auth_user: String,
-    auth_password: String,
+    auth_credential: ScramCredential,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ScramCredential {
+    PasswordBootstrap(String),
+    Verifier(ScramVerifier),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ScramVerifier {
+    iterations: u32,
+    salt: Vec<u8>,
+    stored_key: Vec<u8>,
+    server_key: Vec<u8>,
 }
 
 struct RuntimeSecurity {
@@ -4418,6 +4432,10 @@ where
     let mut tls_key = env::var("GPU_DB_TLS_KEY").ok().map(PathBuf::from);
     let mut auth_user = env::var("GPU_DB_AUTH_USER").ok();
     let mut auth_password = env::var("GPU_DB_AUTH_PASSWORD").ok();
+    let mut auth_scram_verifier = env::var("GPU_DB_AUTH_SCRAM_VERIFIER").ok();
+    let mut auth_scram_verifier_file = env::var("GPU_DB_AUTH_SCRAM_VERIFIER_FILE")
+        .ok()
+        .map(PathBuf::from);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--listen" => {
@@ -4459,9 +4477,20 @@ where
                         .ok_or_else(|| String::from("missing value for --auth-password"))?,
                 );
             }
+            "--auth-scram-verifier" => {
+                auth_scram_verifier = Some(
+                    args.next()
+                        .ok_or_else(|| String::from("missing value for --auth-scram-verifier"))?,
+                );
+            }
+            "--auth-scram-verifier-file" => {
+                auth_scram_verifier_file = Some(PathBuf::from(args.next().ok_or_else(|| {
+                    String::from("missing value for --auth-scram-verifier-file")
+                })?));
+            }
             "-h" | "--help" => {
                 return Err(String::from(
-                    "usage: gpu-db-server [--listen HOST:PORT] [--shared-catalog] [--security-profile local-dev|production --tls-cert PATH --tls-key PATH --auth-user USER --auth-password PASSWORD]",
+                    "usage: gpu-db-server [--listen HOST:PORT] [--shared-catalog] [--security-profile local-dev|production --tls-cert PATH --tls-key PATH --auth-user USER (--auth-scram-verifier VERIFIER | --auth-scram-verifier-file PATH | --auth-password PASSWORD)]",
                 ));
             }
             other => return Err(format!("unsupported argument: {other}")),
@@ -4477,9 +4506,10 @@ where
                 String::from("production security profile requires --tls-key or GPU_DB_TLS_KEY")
             })?,
             auth_user: non_empty_config(auth_user, "--auth-user or GPU_DB_AUTH_USER")?,
-            auth_password: non_empty_config(
+            auth_credential: production_auth_credential(
                 auth_password,
-                "--auth-password or GPU_DB_AUTH_PASSWORD",
+                auth_scram_verifier,
+                auth_scram_verifier_file,
             )?,
         }),
         other => return Err(format!("unsupported security profile: {other}")),
@@ -4499,6 +4529,48 @@ fn non_empty_config(value: Option<String>, name: &str) -> Result<String, String>
         ));
     }
     Ok(value)
+}
+
+fn production_auth_credential(
+    auth_password: Option<String>,
+    auth_scram_verifier: Option<String>,
+    auth_scram_verifier_file: Option<PathBuf>,
+) -> Result<ScramCredential, String> {
+    let configured = [
+        auth_password.is_some(),
+        auth_scram_verifier.is_some(),
+        auth_scram_verifier_file.is_some(),
+    ]
+    .into_iter()
+    .filter(|configured| *configured)
+    .count();
+    if configured == 0 {
+        return Err(String::from(
+            "production security profile requires exactly one of --auth-scram-verifier, --auth-scram-verifier-file, or local/test --auth-password bootstrap",
+        ));
+    }
+    if configured > 1 {
+        return Err(String::from(
+            "production security profile requires only one credential source; do not combine plaintext password and SCRAM verifier inputs",
+        ));
+    }
+    if let Some(password) = auth_password {
+        return Ok(ScramCredential::PasswordBootstrap(non_empty_config(
+            Some(password),
+            "local/test --auth-password or GPU_DB_AUTH_PASSWORD bootstrap",
+        )?));
+    }
+    if let Some(verifier) = auth_scram_verifier {
+        return parse_scram_verifier(&non_empty_config(
+            Some(verifier),
+            "--auth-scram-verifier or GPU_DB_AUTH_SCRAM_VERIFIER",
+        )?)
+        .map(ScramCredential::Verifier);
+    }
+    let path = auth_scram_verifier_file.expect("configured verifier file exists");
+    let verifier = std::fs::read_to_string(&path)
+        .map_err(|error| format!("failed to read production SCRAM verifier file: {error}"))?;
+    parse_scram_verifier(verifier.trim()).map(ScramCredential::Verifier)
 }
 
 impl RuntimeSecurity {
@@ -4886,11 +4958,16 @@ fn authenticate_scram_sha256(
     rand::thread_rng().fill_bytes(&mut nonce_bytes);
     let server_nonce = BASE64_STANDARD.encode(nonce_bytes);
     let combined_nonce = format!("{client_nonce}{server_nonce}");
-    let salt = b"gpu-db-production-profile-v1";
-    let iterations = 4096_u32;
+    let verifier = match &production.auth_credential {
+        ScramCredential::PasswordBootstrap(password) => {
+            ScramVerifier::from_password_bootstrap(password.as_bytes())
+        }
+        ScramCredential::Verifier(verifier) => verifier.clone(),
+    };
     let server_first = format!(
-        "r={combined_nonce},s={},i={iterations}",
-        BASE64_STANDARD.encode(salt)
+        "r={combined_nonce},s={},i={}",
+        BASE64_STANDARD.encode(&verifier.salt),
+        verifier.iterations
     );
     write_authentication_sasl_continue(stream, server_first.as_bytes())?;
 
@@ -4917,12 +4994,7 @@ fn authenticate_scram_sha256(
         .strip_suffix(&proof_marker)
         .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "malformed SCRAM proof"))?;
     let auth_message = format!("{client_first_bare},{server_first},{client_final_without_proof}");
-    let scram = scram_secrets(
-        production.auth_password.as_bytes(),
-        salt,
-        iterations,
-        &auth_message,
-    );
+    let scram = verifier.authentication_secrets(&auth_message);
     let client_proof = BASE64_STANDARD
         .decode(proof)
         .map_err(|_| io::Error::new(ErrorKind::InvalidData, "invalid SCRAM proof base64"))?;
@@ -4964,24 +5036,93 @@ struct ScramSecrets {
     server_signature: Vec<u8>,
 }
 
-fn scram_secrets(
-    password: &[u8],
-    salt: &[u8],
-    iterations: u32,
-    auth_message: &str,
-) -> ScramSecrets {
-    let mut salted_password = [0_u8; 32];
-    pbkdf2_hmac::<Sha256>(password, salt, iterations, &mut salted_password);
-    let client_key = hmac_sha256(&salted_password, b"Client Key");
-    let stored_key = Sha256::digest(&client_key).to_vec();
-    let client_signature = hmac_sha256(&stored_key, auth_message.as_bytes());
-    let server_key = hmac_sha256(&salted_password, b"Server Key");
-    let server_signature = hmac_sha256(&server_key, auth_message.as_bytes());
-    ScramSecrets {
-        stored_key,
-        client_signature,
-        server_signature,
+impl ScramVerifier {
+    fn from_password_bootstrap(password: &[u8]) -> Self {
+        let salt = b"gpu-db-local-test-bootstrap-v1";
+        let iterations = 4096_u32;
+        let mut salted_password = [0_u8; 32];
+        pbkdf2_hmac::<Sha256>(password, salt, iterations, &mut salted_password);
+        let client_key = hmac_sha256(&salted_password, b"Client Key");
+        let stored_key = Sha256::digest(&client_key).to_vec();
+        let server_key = hmac_sha256(&salted_password, b"Server Key");
+        Self {
+            iterations,
+            salt: salt.to_vec(),
+            stored_key,
+            server_key,
+        }
     }
+
+    fn authentication_secrets(&self, auth_message: &str) -> ScramSecrets {
+        ScramSecrets {
+            stored_key: self.stored_key.clone(),
+            client_signature: hmac_sha256(&self.stored_key, auth_message.as_bytes()),
+            server_signature: hmac_sha256(&self.server_key, auth_message.as_bytes()),
+        }
+    }
+}
+
+fn parse_scram_verifier(verifier: &str) -> Result<ScramVerifier, String> {
+    let verifier = verifier.trim();
+    let Some(rest) = verifier.strip_prefix("SCRAM-SHA-256$") else {
+        return Err(String::from(
+            "production SCRAM verifier must start with SCRAM-SHA-256$",
+        ));
+    };
+    let mut parts = rest.split('$');
+    let iterations_and_salt = parts
+        .next()
+        .ok_or_else(|| String::from("production SCRAM verifier missing iterations and salt"))?;
+    let keys = parts
+        .next()
+        .ok_or_else(|| String::from("production SCRAM verifier missing stored/server keys"))?;
+    if parts.next().is_some() {
+        return Err(String::from(
+            "production SCRAM verifier has too many fields",
+        ));
+    }
+
+    let (iterations, salt) = iterations_and_salt
+        .split_once(':')
+        .ok_or_else(|| String::from("production SCRAM verifier missing salt separator"))?;
+    let iterations = iterations
+        .parse::<u32>()
+        .map_err(|_| String::from("production SCRAM verifier has invalid iteration count"))?;
+    if iterations == 0 {
+        return Err(String::from(
+            "production SCRAM verifier requires a positive iteration count",
+        ));
+    }
+    let salt = BASE64_STANDARD
+        .decode(salt)
+        .map_err(|_| String::from("production SCRAM verifier has invalid salt base64"))?;
+    if salt.is_empty() {
+        return Err(String::from(
+            "production SCRAM verifier requires a non-empty salt",
+        ));
+    }
+
+    let (stored_key, server_key) = keys
+        .split_once(':')
+        .ok_or_else(|| String::from("production SCRAM verifier missing key separator"))?;
+    let stored_key = BASE64_STANDARD
+        .decode(stored_key)
+        .map_err(|_| String::from("production SCRAM verifier has invalid stored-key base64"))?;
+    let server_key = BASE64_STANDARD
+        .decode(server_key)
+        .map_err(|_| String::from("production SCRAM verifier has invalid server-key base64"))?;
+    if stored_key.len() != 32 || server_key.len() != 32 {
+        return Err(String::from(
+            "production SCRAM verifier stored and server keys must be 32 bytes",
+        ));
+    }
+
+    Ok(ScramVerifier {
+        iterations,
+        salt,
+        stored_key,
+        server_key,
+    })
 }
 
 fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
@@ -31656,8 +31797,71 @@ mod tests {
                 tls_cert: PathBuf::from("server.crt"),
                 tls_key: PathBuf::from("server.key"),
                 auth_user: "gpudb".to_string(),
-                auth_password: "secret".to_string(),
+                auth_credential: ScramCredential::PasswordBootstrap("secret".to_string()),
             })
         );
+
+        let verifier = "SCRAM-SHA-256$4096:Z3B1LWRiLWxvY2FsLXRlc3QtYm9vdHN0cmFwLXYx$4erxom0WBaSLt+HFK3YYcj24A2x3/3bDc8Q34O70v2I=:wFNhWvIT2jq0yJnneM+uNQ9EeJEjvt0W+LpRQtuHVhA=";
+        assert!(matches!(
+            parse_args(
+                vec![
+                    String::from("--security-profile"),
+                    String::from("production"),
+                    String::from("--tls-cert"),
+                    String::from("server.crt"),
+                    String::from("--tls-key"),
+                    String::from("server.key"),
+                    String::from("--auth-user"),
+                    String::from("gpudb"),
+                    String::from("--auth-scram-verifier"),
+                    verifier.to_string(),
+                ]
+                .into_iter(),
+            )
+            .unwrap()
+            .security,
+            SecurityConfig::Production(ProductionSecurityConfig {
+                auth_credential: ScramCredential::Verifier(_),
+                ..
+            })
+        ));
+
+        let conflict = parse_args(
+            vec![
+                String::from("--security-profile"),
+                String::from("production"),
+                String::from("--tls-cert"),
+                String::from("server.crt"),
+                String::from("--tls-key"),
+                String::from("server.key"),
+                String::from("--auth-user"),
+                String::from("gpudb"),
+                String::from("--auth-password"),
+                String::from("secret"),
+                String::from("--auth-scram-verifier"),
+                verifier.to_string(),
+            ]
+            .into_iter(),
+        )
+        .unwrap_err();
+        assert!(conflict.contains("only one credential source"));
+
+        let malformed = parse_args(
+            vec![
+                String::from("--security-profile"),
+                String::from("production"),
+                String::from("--tls-cert"),
+                String::from("server.crt"),
+                String::from("--tls-key"),
+                String::from("server.key"),
+                String::from("--auth-user"),
+                String::from("gpudb"),
+                String::from("--auth-scram-verifier"),
+                String::from("not-a-verifier"),
+            ]
+            .into_iter(),
+        )
+        .unwrap_err();
+        assert!(malformed.contains("SCRAM-SHA-256"));
     }
 }
