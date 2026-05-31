@@ -10,7 +10,7 @@ CONCURRENCY="${GPU_DB_CH_BENCH_CONCURRENCY:-1,10}"
 
 usage() {
   cat <<'USAGE'
-usage: scripts/run_p8_ch_benchmark_residency_probe.sh [--dry-run|--run-baseline|--run-25pct|--run-25pct-execute|--pgsql-baseline-preflight|--pgsql-baseline-25pct-latency|--pgsql-baseline-docker-up|--pgsql-baseline-docker-preflight|--pgsql-baseline-docker-down|--streaming-self-check|--chunked-install-self-check|--chunked-upload-self-check|--cleanup|--self-check]
+usage: scripts/run_p8_ch_benchmark_residency_probe.sh [--dry-run|--run-baseline|--run-25pct|--run-25pct-execute|--run-125pct|--pgsql-baseline-preflight|--pgsql-baseline-25pct-latency|--pgsql-baseline-125pct-latency|--pgsql-baseline-docker-up|--pgsql-baseline-docker-preflight|--pgsql-baseline-docker-down|--streaming-self-check|--chunked-install-self-check|--chunked-upload-self-check|--cleanup|--self-check]
 
 Environment:
   GPU_DB_CH_BENCH_OUT_DIR       output directory, default target/p8-ch-benchmark-residency
@@ -22,6 +22,8 @@ Environment:
   GPU_DB_CH_BENCH_EXECUTE_CHUNK_ROWS  guarded execution chunk rows, default 256
   GPU_DB_CH_BENCH_ACCEPT_SCALED_25PCT  set to 1 to treat guarded scaled --run-25pct-execute evidence as success
   GPU_DB_CH_BENCH_ALLOW_FULL_25PCT  set to 1 to attempt all estimated 25pct rows
+  GPU_DB_CH_BENCH_ACCEPT_SCALED_125PCT set to 1 to treat guarded scaled --run-125pct evidence as success
+  GPU_DB_CH_BENCH_ALLOW_FULL_125PCT set to 1 to permit a future full 125pct attempt after readiness is safe
   GPU_DB_CH_BENCH_PGSQL_ROWS    PostgreSQL latency rows, default 1024 unless full guard is set
   GPU_DB_CH_BENCH_ALLOW_FULL_PGSQL_25PCT  set to 1 to load/query all estimated 25pct PostgreSQL rows
   GPU_DB_CH_BENCH_PGSQL_URL     libpq connection string for PostgreSQL baseline
@@ -34,6 +36,12 @@ USAGE
 
 rows_25pct() {
   local retained_target_bytes=6442450944
+  local retained_bytes_per_row=40
+  echo $(((retained_target_bytes + retained_bytes_per_row - 1) / retained_bytes_per_row))
+}
+
+rows_125pct() {
+  local retained_target_bytes=32212254720
   local retained_bytes_per_row=40
   echo $(((retained_target_bytes + retained_bytes_per_row - 1) / retained_bytes_per_row))
 }
@@ -577,6 +585,34 @@ REPORT
   return 1
 }
 
+write_pgsql_125pct_latency() {
+  mkdir -p "$OUT_DIR/pgsql-125pct-latency"
+  local estimated_rows
+  estimated_rows="$(rows_125pct)"
+  local report_path="$OUT_DIR/pgsql-125pct-latency/latency.md"
+  local json_path="$OUT_DIR/pgsql-125pct-latency/status.jsonl"
+  local full_command="GPU_DB_CH_BENCH_PGSQL_URL='$(pgsql_docker_url)' GPU_DB_CH_BENCH_ALLOW_FULL_PGSQL_125PCT=1 GPU_DB_CH_BENCH_PGSQL_ROWS=$estimated_rows scripts/run_p8_ch_benchmark_residency_probe.sh --pgsql-baseline-125pct-latency"
+
+  cat >"$report_path" <<REPORT
+# PostgreSQL 125% Latency Runner
+
+- rows: $estimated_rows
+- row_tier: 125pct
+- status: blocked
+- blocker: full_125pct_postgresql_latency_requires_operator_long_run_and_over_resident_gpu_path
+- full_run_command: \`$full_command\`
+
+The 125% PostgreSQL comparator is intentionally not executed by default. The
+same-row-count PostgreSQL load would stream 805,306,368 deterministic rows and
+only becomes useful after the GPU side has a partitioned or streamed
+over-resident execution path to compare against.
+REPORT
+  printf '{"kind":"pgsql_latency_readiness","tier":"125pct","rows":%s,"status":"blocked","blocker":"full_125pct_postgresql_latency_requires_operator_long_run_and_over_resident_gpu_path"}\n' "$estimated_rows" >"$json_path"
+  cat "$report_path"
+  echo "p8_ch_benchmark_pgsql_125pct_latency=blocked reason=full_125pct_postgresql_latency_requires_operator_long_run_and_over_resident_gpu_path" >&2
+  return 1
+}
+
 write_25pct_preflight() {
   mkdir -p "$OUT_DIR"
   local retained_target_bytes=6442450944
@@ -735,6 +771,141 @@ REPORT
   fi
 }
 
+write_125pct_readiness() {
+  mkdir -p "$OUT_DIR"
+  local retained_target_bytes=32212254720
+  local retained_bytes_per_row=40
+  local generated_bytes_per_row=96
+  local estimated_rows
+  estimated_rows="$(rows_125pct)"
+  local generated_table_bytes=$((estimated_rows * generated_bytes_per_row))
+  local retained_column_bytes=$((estimated_rows * retained_bytes_per_row))
+  local wal_log_bytes=$((generated_table_bytes / 2))
+  local report_bytes=$((2 * 1024 * 1024))
+  local required_disk_bytes=$((generated_table_bytes + wal_log_bytes + report_bytes))
+  local available_disk_bytes
+  available_disk_bytes=$(df -B1 "$OUT_DIR" | awk 'NR==2 {print $4}')
+  local disk_preflight=fail
+  if [ "$available_disk_bytes" -gt "$required_disk_bytes" ]; then
+    disk_preflight=pass
+  fi
+
+  local gpu_total_mib=unknown gpu_free_mib=unknown gpu_preflight=blocked
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    local gpu_line
+    gpu_line="$(nvidia-smi --query-gpu=memory.total,memory.free --format=csv,noheader,nounits 2>/dev/null | head -n1 || true)"
+    if [ -n "$gpu_line" ]; then
+      gpu_total_mib="$(printf '%s\n' "$gpu_line" | awk -F',' '{gsub(/ /, "", $1); print $1}')"
+      gpu_free_mib="$(printf '%s\n' "$gpu_line" | awk -F',' '{gsub(/ /, "", $2); print $2}')"
+      gpu_preflight=pass
+    fi
+  fi
+
+  cargo run -q -p gpu_db_engine --example p8_ch_benchmark_residency_probe -- \
+    --estimate \
+    --output-dir "$OUT_DIR" \
+    --rows "$ROWS"
+  test -s "$OUT_DIR/estimate.jsonl"
+  grep -q '"tier":"25pct"' "$OUT_DIR/estimate.jsonl"
+  grep -q '"tier":"125pct"' "$OUT_DIR/estimate.jsonl"
+  if grep -Eq '"tier":"(50pct|100pct|200pct|400pct)"' "$OUT_DIR/estimate.jsonl"; then
+    echo "retired 50/100/200/400% VRAM benchmark tiers should not be configured" >&2
+    exit 1
+  fi
+
+  local baseline_preflight=blocked
+  if pgsql_baseline_docker_up >/tmp/gpu-db-p8-125pct-docker-up.out 2>/tmp/gpu-db-p8-125pct-docker-up.err; then
+    if GPU_DB_CH_BENCH_PGSQL_URL="$(pgsql_docker_url)" write_pgsql_baseline_preflight >/tmp/gpu-db-p8-125pct-pgsql-preflight.out 2>/tmp/gpu-db-p8-125pct-pgsql-preflight.err; then
+      baseline_preflight=pass
+    fi
+  fi
+
+  local execute_rows="${GPU_DB_CH_BENCH_EXECUTE_ROWS:-1024}"
+  local execute_chunk_rows="${GPU_DB_CH_BENCH_EXECUTE_CHUNK_ROWS:-256}"
+  cargo run -q -p gpu_db_engine --example p8_ch_benchmark_residency_probe -- \
+    --chunked-execute \
+    --output-dir "$OUT_DIR" \
+    --rows "$execute_rows" \
+    --chunk-rows "$execute_chunk_rows" \
+    --concurrency "$CONCURRENCY"
+  test -s "$OUT_DIR/chunked-execute/metrics.jsonl"
+  grep -q '"kind":"chunked_metric"' "$OUT_DIR/chunked-execute/metrics.jsonl"
+  grep -q '"resident_route_zero_h2d":true' "$OUT_DIR/chunked-execute/metrics.jsonl"
+  grep -q '"kind":"chunked_memory_pressure_probe"' "$OUT_DIR/chunked-execute/metrics.jsonl"
+  grep -q '"memory_pressure_route_accepted":false' "$OUT_DIR/chunked-execute/metrics.jsonl"
+
+  local readiness_status=blocked
+  local blocker=missing_partitioned_over_resident_execution
+  if [ "$disk_preflight" != pass ]; then
+    blocker=insufficient_disk_for_125pct_tier
+  elif [ "$gpu_preflight" != pass ]; then
+    blocker=missing_local_gpu_memory_facts
+  elif [ "$baseline_preflight" != pass ]; then
+    blocker=missing_passed_pgsql_baseline_preflight
+  fi
+  if [ "${GPU_DB_CH_BENCH_ALLOW_FULL_125PCT:-0}" = "1" ]; then
+    blocker=full_125pct_still_blocked_without_partitioned_over_resident_execution
+  fi
+
+  local full_gpu_command="GPU_DB_CH_BENCH_ALLOW_FULL_125PCT=1 GPU_DB_CH_BENCH_EXECUTE_CHUNK_ROWS=1048576 scripts/run_p8_ch_benchmark_residency_probe.sh --run-125pct"
+  local full_pgsql_command="GPU_DB_CH_BENCH_PGSQL_URL='$(pgsql_docker_url)' GPU_DB_CH_BENCH_ALLOW_FULL_PGSQL_125PCT=1 GPU_DB_CH_BENCH_PGSQL_ROWS=$estimated_rows scripts/run_p8_ch_benchmark_residency_probe.sh --pgsql-baseline-125pct-latency"
+
+  cat >"$OUT_DIR/125pct-readiness.md" <<REPORT
+# P8 CH-benCHmark 125% Over-Resident Readiness
+
+- tier: 125pct
+- status: $readiness_status
+- blocker: $blocker
+- retained_target_bytes: $retained_target_bytes
+- estimated_order_line_rows: $estimated_rows
+- retained_column_bytes: $retained_column_bytes
+- generated_table_bytes: $generated_table_bytes
+- wal_log_bytes: $wal_log_bytes
+- report_bytes: $report_bytes
+- required_disk_bytes: $required_disk_bytes
+- available_disk_bytes: $available_disk_bytes
+- disk_preflight: $disk_preflight
+- local_gpu_memory_total_mib: $gpu_total_mib
+- local_gpu_memory_free_mib: $gpu_free_mib
+- gpu_preflight: $gpu_preflight
+- postgresql_baseline_preflight: $baseline_preflight
+- retired_50_100_200_400pct_tiers_absent: true
+- scaled_probe_rows: $execute_rows
+- scaled_probe_chunk_rows: $execute_chunk_rows
+- scaled_probe_artifact: $OUT_DIR/chunked-execute/execution.md
+- raw_metrics: $OUT_DIR/chunked-execute/metrics.jsonl
+- full_gpu_command: \`$full_gpu_command\`
+- full_postgresql_command: \`$full_pgsql_command\`
+- cleanup_command: \`scripts/run_p8_ch_benchmark_residency_probe.sh --cleanup && scripts/run_p8_ch_benchmark_residency_probe.sh --pgsql-baseline-docker-down\`
+
+The readiness command computes the 125% retained target and local capacity
+facts, proves the retired 50/100/200/400% tiers are absent from dry-run output,
+validates the disposable PostgreSQL comparator at preflight scale, and runs a
+small deterministic chunked resident execution probe. The scaled probe verifies
+accepted zero-H2D retained routes before explicitly marking GPU memory pressure;
+the route is then rejected with the retained snapshot invalidated, which proves
+the current fallback/rejection signal path is observable.
+
+The full 125% tier is not safe to schedule yet. The current execution path
+installs one retained CUDA resident layout, so the about 30 GiB 125% retained
+target is larger than the local RTX 3090 memory envelope. A trustworthy full
+125% PostgreSQL-vs-GPU run needs partitioned or streamed over-resident execution
+and an explicit operator-approved long-run window before either guarded full
+command can be promoted from blocked source truth.
+REPORT
+
+  cat >"$OUT_DIR/125pct-readiness.jsonl" <<JSON
+{"kind":"tier_readiness","tier":"125pct","status":"$readiness_status","blocker":"$blocker","retained_target_bytes":$retained_target_bytes,"estimated_rows":$estimated_rows,"retained_column_bytes":$retained_column_bytes,"generated_table_bytes":$generated_table_bytes,"wal_log_bytes":$wal_log_bytes,"report_bytes":$report_bytes,"required_disk_bytes":$required_disk_bytes,"available_disk_bytes":$available_disk_bytes,"disk_preflight":"$disk_preflight","gpu_total_mib":"$gpu_total_mib","gpu_free_mib":"$gpu_free_mib","gpu_preflight":"$gpu_preflight","postgresql_baseline_preflight":"$baseline_preflight","retired_tiers_absent":true,"scaled_probe_rows":$execute_rows,"scaled_probe_chunk_rows":$execute_chunk_rows,"full_gpu_guard":"GPU_DB_CH_BENCH_ALLOW_FULL_125PCT=1","full_pgsql_guard":"GPU_DB_CH_BENCH_ALLOW_FULL_PGSQL_125PCT=1"}
+JSON
+  cat "$OUT_DIR/125pct-readiness.md"
+  if [ "${GPU_DB_CH_BENCH_ACCEPT_SCALED_125PCT:-0}" = "1" ]; then
+    echo "p8_ch_benchmark_125pct_readiness=scaled_pass blocker=$blocker"
+    return 0
+  fi
+  echo "p8_ch_benchmark_125pct_readiness=blocked reason=$blocker" >&2
+  return 1
+}
+
 mode="${1:---dry-run}"
 case "$mode" in
   --dry-run)
@@ -778,11 +949,17 @@ case "$mode" in
   --run-25pct-execute)
     write_25pct_execution
     ;;
+  --run-125pct)
+    write_125pct_readiness
+    ;;
   --pgsql-baseline-preflight)
     write_pgsql_baseline_preflight
     ;;
   --pgsql-baseline-25pct-latency)
     write_pgsql_25pct_latency
+    ;;
+  --pgsql-baseline-125pct-latency)
+    write_pgsql_125pct_latency
     ;;
   --pgsql-baseline-docker-up)
     pgsql_baseline_docker_up
@@ -858,6 +1035,10 @@ case "$mode" in
       "$0" --run-25pct-execute >"$tmp_dir/chunked-execute.out" 2>"$tmp_dir/chunked-execute.err" || true
     grep -q 'full_25pct_requires_operator_long_run_after_streaming_boundary' "$tmp_dir/chunked-execute.err"
     grep -q 'expected_results: deterministic formulas' "$tmp_dir/out/chunked-execute/execution.md"
+    GPU_DB_CH_BENCH_OUT_DIR="$tmp_dir/out" GPU_DB_CH_BENCH_EXECUTE_ROWS=16 GPU_DB_CH_BENCH_EXECUTE_CHUNK_ROWS=4 GPU_DB_CH_BENCH_CONCURRENCY=1 \
+      "$0" --run-125pct >"$tmp_dir/125pct.out" 2>"$tmp_dir/125pct.err" || true
+    grep -q 'missing_partitioned_over_resident_execution' "$tmp_dir/125pct.err"
+    grep -q 'retired_50_100_200_400pct_tiers_absent: true' "$tmp_dir/out/125pct-readiness.md"
     if GPU_DB_CH_BENCH_OUT_DIR="$tmp_dir/out" GPU_DB_CH_BENCH_ROWS=16 \
       "$0" --pgsql-baseline-preflight >"$tmp_dir/pgsql.out" 2>"$tmp_dir/pgsql.err"; then
       grep -q 'status: pass' "$tmp_dir/pgsql.out"
