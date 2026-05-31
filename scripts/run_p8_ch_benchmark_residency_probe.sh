@@ -1135,7 +1135,7 @@ write_engine_backed_pgwire_benchmark_smoke() {
   local server_log="$smoke_dir/engine-pgwire-endpoint.log"
   local facts_path="$smoke_dir/endpoint-facts.txt"
   local concurrency_path="$smoke_dir/concurrency-curve-plan.csv"
-  local lookup_blocker="retained_key_lookup_route_required"
+  local lookup_blocker="retained_multi_column_projection_required"
   : >"$metrics_path"
 
   if ! command -v psql >/dev/null 2>&1; then
@@ -1220,7 +1220,11 @@ REPORT
   local tmp_prefix="$smoke_dir/query"
   engine_pgwire_query_metrics "$url" "$metrics_path" order_line_count_all "$expected_count" \
     "SELECT COUNT(*) FROM order_line" "$tmp_prefix" retained_engine_count_all true none
-  engine_pgwire_query_metrics "$url" "$metrics_path" order_line_lookup_ol_o_id \
+  engine_pgwire_query_metrics "$url" "$metrics_path" order_line_lookup_ol_o_id_retained_projection \
+    "$lookup_key" \
+    "SELECT ol_o_id FROM order_line WHERE ol_o_id = $lookup_key" \
+    "$tmp_prefix" retained_engine_int4_equality_projection true none
+  engine_pgwire_query_metrics "$url" "$metrics_path" order_line_lookup_ol_o_id_multi_column \
     "${lookup_key}|${lookup_item}|${lookup_qty}|${lookup_amount}" \
     "SELECT ol_o_id, ol_i_id, ol_quantity, ol_amount FROM order_line WHERE ol_o_id = $lookup_key" \
     "$tmp_prefix" engine_mvcc_cpu_fallback false "$lookup_blocker"
@@ -1232,16 +1236,18 @@ REPORT
   cat >"$concurrency_path" <<CSV
 tier,target,client_driver,query,concurrency,status,blocker,route_classification,metric_schema
 25pct,engine_backed_pgwire_endpoint,psql/libpq,order_line_count_all,1,scaled_smoke,none,retained_engine_count_all,"wall_clock_throughput,p50_us,p95_us,p99_us,error_count,correctness_status,saturation_note"
-25pct,engine_backed_pgwire_endpoint,psql/libpq,order_line_lookup_ol_o_id,1,scaled_smoke,$lookup_blocker,engine_mvcc_cpu_fallback,"wall_clock_throughput,p50_us,p95_us,p99_us,error_count,correctness_status,saturation_note"
+25pct,engine_backed_pgwire_endpoint,psql/libpq,order_line_lookup_ol_o_id_retained_projection,1,scaled_smoke,none,retained_engine_int4_equality_projection,"wall_clock_throughput,p50_us,p95_us,p99_us,error_count,correctness_status,saturation_note"
+25pct,engine_backed_pgwire_endpoint,psql/libpq,order_line_lookup_ol_o_id_multi_column,1,scaled_smoke,$lookup_blocker,engine_mvcc_cpu_fallback,"wall_clock_throughput,p50_us,p95_us,p99_us,error_count,correctness_status,saturation_note"
 25pct,engine_backed_pgwire_endpoint,psql/libpq,order_line_lookup_composite,1,scaled_smoke,$lookup_blocker,engine_mvcc_cpu_fallback,"wall_clock_throughput,p50_us,p95_us,p99_us,error_count,correctness_status,saturation_note"
 CSV
   local concurrency
   for concurrency in 2 4 8 16 32 64 128; do
     printf '25pct,engine_backed_pgwire_endpoint,psql/libpq,order_line_count_all,%s,blocked,true_concurrency_pg_client_runner_required,retained_engine_count_all,"wall_clock_throughput,p50_us,p95_us,p99_us,error_count,correctness_status,saturation_note"\n' "$concurrency" >>"$concurrency_path"
-    printf '25pct,engine_backed_pgwire_endpoint,psql/libpq,order_line_lookup_ol_o_id,%s,blocked,%s,engine_mvcc_cpu_fallback,"wall_clock_throughput,p50_us,p95_us,p99_us,error_count,correctness_status,saturation_note"\n' "$concurrency" "$lookup_blocker" >>"$concurrency_path"
+    printf '25pct,engine_backed_pgwire_endpoint,psql/libpq,order_line_lookup_ol_o_id_retained_projection,%s,blocked,true_concurrency_pg_client_runner_required,retained_engine_int4_equality_projection,"wall_clock_throughput,p50_us,p95_us,p99_us,error_count,correctness_status,saturation_note"\n' "$concurrency" >>"$concurrency_path"
+    printf '25pct,engine_backed_pgwire_endpoint,psql/libpq,order_line_lookup_ol_o_id_multi_column,%s,blocked,%s,engine_mvcc_cpu_fallback,"wall_clock_throughput,p50_us,p95_us,p99_us,error_count,correctness_status,saturation_note"\n' "$concurrency" "$lookup_blocker" >>"$concurrency_path"
   done
   cat >>"$metrics_path" <<JSON
-{"kind":"engine_backed_pgwire_endpoint_decision","tier":"25pct","status":"closed_with_blocker","endpoint":"engine_backed_pgwire_endpoint","client_driver":"psql/libpq","seed_path":"CREATE TABLE plus COPY FROM STDIN","count_retained_route":true,"count_zero_h2d":true,"lookup_retained_route":false,"lookup_blocker":"$lookup_blocker","concurrency_blocker":"true_concurrency_pg_client_runner_required","facts":"$facts_path"}
+{"kind":"engine_backed_pgwire_endpoint_decision","tier":"25pct","status":"closed_with_blocker","endpoint":"engine_backed_pgwire_endpoint","client_driver":"psql/libpq","seed_path":"CREATE TABLE plus COPY FROM STDIN","count_retained_route":true,"count_zero_h2d":true,"lookup_retained_route":true,"lookup_retained_shape":"int4_equality_projection","multi_column_lookup_retained_route":false,"lookup_blocker":"$lookup_blocker","concurrency_blocker":"true_concurrency_pg_client_runner_required","facts":"$facts_path"}
 JSON
 
   cat >"$report_path" <<REPORT
@@ -1265,11 +1271,14 @@ This smoke starts \`p8_engine_pgwire_benchmark_endpoint\`, connects through
 runs client-visible \`SELECT\` traffic through the engine-owned endpoint.
 
 \`SELECT COUNT(*) FROM order_line\` reaches the retained engine route with
-accepted zero-H2D evidence in $facts_path. The single-key and composite
-key-equality lookups return correct rows through the same client boundary, but
-their route decisions are still \`unsupported_select\` / engine MVCC CPU
-fallback rather than retained-route execution. That narrows the remaining
-point-lookup requirement to \`$lookup_blocker\`.
+accepted zero-H2D evidence in $facts_path. The narrow single-column
+key-equality lookup \`SELECT ol_o_id FROM order_line WHERE ol_o_id = <literal>\`
+also reaches a retained \`int4_equality_projection\` route with zero-H2D
+evidence through the same client boundary. Multi-column and composite
+key-equality lookups return correct rows, but still fall back to engine MVCC CPU
+execution because retained row gathering / multi-column projection is not
+implemented. That narrows the remaining point-lookup requirement to
+\`$lookup_blocker\`.
 
 ## Boundary
 
@@ -1285,16 +1294,18 @@ point-lookup requirement to \`$lookup_blocker\`.
 ## Next Blocker
 
 The endpoint boundary is now available for a future identical-client harness
-for retained \`COUNT(*)\` evidence. A production-relevant key-equality headline
-still needs retained point lookup support, and true 1/2/4/8/16/32/64/128 client
-curves remain blocked until the scheduler targets this endpoint.
+for retained \`COUNT(*)\` and same-column int4 equality-projection evidence. A
+production-relevant multi-column or composite key-equality headline still needs
+retained row gathering / multi-column projection, and true
+1/2/4/8/16/32/64/128 client curves remain blocked until the scheduler targets
+this endpoint.
 REPORT
 
   kill "$server_pid" >/dev/null 2>&1 || true
   wait "$server_pid" >/dev/null 2>&1 || true
   trap - RETURN
   cat "$report_path"
-  echo "p8_ch_benchmark_engine_backed_pgwire_smoke=closed_with_blocker lookup_blocker=$lookup_blocker artifact=$report_path"
+  echo "p8_ch_benchmark_engine_backed_pgwire_smoke=closed_with_blocker retained_lookup_shape=int4_equality_projection lookup_blocker=$lookup_blocker artifact=$report_path"
 }
 
 write_protocol_retained_route_bridge_report() {
@@ -1947,8 +1958,10 @@ case "$mode" in
       "$0" --engine-backed-pgwire-benchmark-smoke >"$tmp_dir/engine-pgwire.out"
     grep -q 'client_visible_select_retained_route_accepted=true' "$tmp_dir/out/engine-backed-pgwire-benchmark-smoke/endpoint-facts.txt"
     grep -q 'client_visible_select_retained_route_zero_h2d=true' "$tmp_dir/out/engine-backed-pgwire-benchmark-smoke/endpoint-facts.txt"
-    grep -q 'retained_key_lookup_route_required' "$tmp_dir/out/engine-backed-pgwire-benchmark-smoke/engine-backed-pgwire-benchmark-smoke.md"
-    grep -q '"query":"order_line_lookup_ol_o_id"' "$tmp_dir/out/engine-backed-pgwire-benchmark-smoke/metrics.jsonl"
+    grep -q 'int4_equality_projection' "$tmp_dir/out/engine-backed-pgwire-benchmark-smoke/endpoint-facts.txt"
+    grep -q 'retained_multi_column_projection_required' "$tmp_dir/out/engine-backed-pgwire-benchmark-smoke/engine-backed-pgwire-benchmark-smoke.md"
+    grep -q '"query":"order_line_lookup_ol_o_id_retained_projection"' "$tmp_dir/out/engine-backed-pgwire-benchmark-smoke/metrics.jsonl"
+    grep -q '"query":"order_line_lookup_ol_o_id_multi_column"' "$tmp_dir/out/engine-backed-pgwire-benchmark-smoke/metrics.jsonl"
     GPU_DB_CH_BENCH_OUT_DIR="$tmp_dir/out" "$0" --cleanup >"$tmp_dir/cleanup.out"
     grep -q 'chunked_resident_cache_install_available: true' "$tmp_dir/streaming.out"
     grep -q 'benchmark_chunked_resident_cache_admission: pass' "$tmp_dir/chunked-install.out"
