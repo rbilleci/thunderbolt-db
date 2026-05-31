@@ -125,6 +125,8 @@ This matrix makes compatibility intent explicit per delivery phase while preserv
 | Security/compliance control mapping | 🟡 | ✅ | ✅ | See architecture doc 07 |
 | Backup/PITR/DR test gates | 🟡 | 🟡 | ✅ | See architecture doc 08 |
 
+P8 benchmark admission note: the 25% / 6 GiB same-row-count PostgreSQL-vs-GPU gate is checked, and `docs/testing/reports/2026-05-31-p8-25pct-regression-triage-v1.md` classifies the current surface. GPU DB is faster for `COUNT(*)`, but retained `SUM`, `AVG ... BETWEEN`, and `MAX ... filter` are slower than PostgreSQL at this tier, with the `AVG ... BETWEEN` path also reporting large D2H readback. The 50/100/200% tiers remain gated until those retained aggregate regressions are optimized, explicitly accepted as current non-claims, or narrowed by instrumentation.
+
 ## Explicit Non-Goals Through v1
 
 - Full PostgreSQL extension ecosystem compatibility
