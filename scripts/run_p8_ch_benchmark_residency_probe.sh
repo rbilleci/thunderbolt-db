@@ -248,7 +248,7 @@ PREFLIGHT
   return 1
 }
 
-write_25pct_blocker() {
+write_25pct_preflight() {
   mkdir -p "$OUT_DIR"
   local retained_target_bytes=6442450944
   local retained_bytes_per_row=40
@@ -260,6 +260,25 @@ write_25pct_blocker() {
   local required_bytes=$((generated_table_bytes + wal_log_bytes + report_bytes))
   local available_bytes
   available_bytes=$(df -B1 "$OUT_DIR" | awk 'NR==2 {print $4}')
+  local disk_preflight
+  if [ "$available_bytes" -gt "$required_bytes" ]; then
+    disk_preflight=pass
+  else
+    disk_preflight=fail
+  fi
+  local baseline_preflight=blocked
+  if [ -s "$OUT_DIR/pgsql-baseline/preflight.jsonl" ] && grep -q '"status":"pass"' "$OUT_DIR/pgsql-baseline/preflight.jsonl"; then
+    baseline_preflight=pass
+  fi
+  local run_preflight=ready_to_start
+  local blocker=null
+  if [ "$disk_preflight" != pass ]; then
+    run_preflight=blocked
+    blocker='"insufficient_disk_for_25pct_tier"'
+  elif [ "$baseline_preflight" != pass ]; then
+    run_preflight=blocked
+    blocker='"missing_passed_pgsql_baseline_preflight"'
+  fi
   cat >"$OUT_DIR/25pct-preflight.md" <<PREFLIGHT
 # P8 CH-benCHmark 25% VRAM Preflight
 
@@ -271,28 +290,30 @@ write_25pct_blocker() {
 - report_bytes: $report_bytes
 - required_disk_bytes: $required_bytes
 - available_disk_bytes: $available_bytes
-- disk_preflight: $(if [ "$available_bytes" -gt "$required_bytes" ]; then echo pass; else echo fail; fi)
-- run_preflight: blocked
+- disk_preflight: $disk_preflight
+- postgresql_baseline_preflight: $baseline_preflight
+- run_preflight: $run_preflight
 - bounded_streaming_generator_probe: available via \`--streaming-self-check\`
 - postgresql_baseline_required: \`scripts/run_p8_ch_benchmark_residency_probe.sh --pgsql-baseline-preflight\`
 - chunked_retained_device_memory_upload: available via \`--chunked-upload-self-check\`
-- chunked_resident_cache_admission: blocked
-- blocker: missing_benchmark_only_relational_resident_cache_chunked_admission_api
+- benchmark_chunked_resident_cache_admission: available via \`--chunked-install-self-check\`
+- blocker: $(if [ "$blocker" = null ]; then echo none; else printf '%s' "$blocker" | tr -d '"'; fi)
 
-The current executable probe now has a small checked benchmark-only streaming
-artifact generator, but the engine residency boundary still installs snapshots
-through an in-memory \`RelationalResidencySnapshot\` with
-\`resident_rows: Vec<Vec<SqlValue>>\`. The execution layer now has a chunked
-retained device-memory upload self-check, but the 25% tier cannot safely start
-until \`RelationalResidentCache\` or an equivalent benchmark-only admission API
-can install generated chunks without materializing all generated rows in
-process memory.
+The bounded generator, retained CUDA chunk upload, and benchmark-only
+resident-cache admission prerequisites are now checked. This command is still a
+preflight: it proves whether the 25% / 6 GiB long run is safe to start on this
+host with a passed PostgreSQL comparator artifact; it does not by itself claim
+completed GPU DB performance numbers.
 PREFLIGHT
   cat >"$OUT_DIR/25pct-preflight.jsonl" <<PREFLIGHT_JSON
-{"kind":"tier_preflight","tier":"25pct","retained_target_bytes":$retained_target_bytes,"estimated_rows":$estimated_rows,"generated_table_bytes":$generated_table_bytes,"wal_log_bytes":$wal_log_bytes,"report_bytes":$report_bytes,"required_disk_bytes":$required_bytes,"available_disk_bytes":$available_bytes,"disk_preflight":$(if [ "$available_bytes" -gt "$required_bytes" ]; then echo true; else echo false; fi),"run_preflight":"blocked","bounded_streaming_generator_probe":true,"postgresql_baseline_required":true,"chunked_retained_device_memory_upload":true,"chunked_resident_cache_admission":false,"blocker":"missing_benchmark_only_relational_resident_cache_chunked_admission_api"}
+{"kind":"tier_preflight","tier":"25pct","retained_target_bytes":$retained_target_bytes,"estimated_rows":$estimated_rows,"generated_table_bytes":$generated_table_bytes,"wal_log_bytes":$wal_log_bytes,"report_bytes":$report_bytes,"required_disk_bytes":$required_bytes,"available_disk_bytes":$available_bytes,"disk_preflight":$(if [ "$disk_preflight" = pass ]; then echo true; else echo false; fi),"postgresql_baseline_preflight":"$baseline_preflight","run_preflight":"$run_preflight","bounded_streaming_generator_probe":true,"postgresql_baseline_required":true,"chunked_retained_device_memory_upload":true,"benchmark_chunked_resident_cache_admission":true,"blocker":$blocker}
 PREFLIGHT_JSON
   cat "$OUT_DIR/25pct-preflight.md"
-  echo "p8_ch_benchmark_25pct=blocked reason=missing_benchmark_only_relational_resident_cache_chunked_admission_api" >&2
+  if [ "$run_preflight" = ready_to_start ]; then
+    echo "p8_ch_benchmark_25pct_preflight=passed status=ready_to_start"
+    return 0
+  fi
+  echo "p8_ch_benchmark_25pct=blocked reason=$(printf '%s' "$blocker" | tr -d '\"')" >&2
   return 1
 }
 
@@ -334,7 +355,7 @@ case "$mode" in
     cat "$OUT_DIR/baseline.md"
     ;;
   --run-25pct)
-    write_25pct_blocker
+    write_25pct_preflight
     ;;
   --pgsql-baseline-preflight)
     write_pgsql_baseline_preflight
@@ -359,7 +380,7 @@ case "$mode" in
     test -s "$OUT_DIR/streaming-order-line/manifest.jsonl"
     test -s "$OUT_DIR/streaming-order-line/self-check.md"
     grep -q '"kind":"streaming_summary"' "$OUT_DIR/streaming-order-line/manifest.jsonl"
-    grep -q '"blocker":"missing_benchmark_only_relational_resident_cache_chunked_admission_api"' "$OUT_DIR/streaming-order-line/manifest.jsonl"
+    grep -q '"status":"pass"' "$OUT_DIR/streaming-order-line/manifest.jsonl"
     cat "$OUT_DIR/streaming-order-line/self-check.md"
     ;;
   --chunked-install-self-check)
@@ -372,7 +393,7 @@ case "$mode" in
     test -s "$OUT_DIR/chunked-install-self-check/self-check.jsonl"
     test -s "$OUT_DIR/chunked-install-self-check/self-check.md"
     grep -q '"kind":"chunked_install_self_check"' "$OUT_DIR/chunked-install-self-check/self-check.jsonl"
-    grep -q '"blocker":"missing_benchmark_only_relational_resident_cache_chunked_admission_api"' "$OUT_DIR/chunked-install-self-check/self-check.jsonl"
+    grep -q '"status":"pass"' "$OUT_DIR/chunked-install-self-check/self-check.jsonl"
     cat "$OUT_DIR/chunked-install-self-check/self-check.md"
     ;;
   --chunked-upload-self-check)
@@ -416,8 +437,8 @@ case "$mode" in
       grep -Eq 'missing_pgsql_baseline_connection|missing_psql_client' "$tmp_dir/pgsql.err"
     fi
     GPU_DB_CH_BENCH_OUT_DIR="$tmp_dir/out" "$0" --cleanup >"$tmp_dir/cleanup.out"
-    grep -q 'missing_benchmark_only_relational_resident_cache_chunked_admission_api' "$tmp_dir/streaming.out"
-    grep -q 'missing_benchmark_only_relational_resident_cache_chunked_admission_api' "$tmp_dir/chunked-install.out"
+    grep -q 'chunked_resident_cache_install_available: true' "$tmp_dir/streaming.out"
+    grep -q 'benchmark_chunked_resident_cache_admission: pass' "$tmp_dir/chunked-install.out"
     grep -q 'chunked_retained_device_memory_upload: pass' "$tmp_dir/chunked-upload.out"
     grep -q 'p8_ch_benchmark_cleanup=passed' "$tmp_dir/cleanup.out"
     echo "p8 ch benchmark residency probe self-check passed"

@@ -5,7 +5,10 @@ use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use gpu_db_engine::{Engine, RelationalSelectResult};
+use gpu_db_engine::{
+    BenchmarkRelationalResidencyChunkInstall, Engine, RelationalSelectResult,
+    ResidentDeviceTextColumnLayout,
+};
 use gpu_db_execution::{CudaDeviceMemoryChunk, CudaDriverRuntime};
 use gpu_db_protocol::{parse_command, Command, Select};
 
@@ -168,7 +171,7 @@ fn run_streaming_self_check(args: &Args) -> Result<(), Box<dyn Error>> {
     }
     writeln!(
         manifest,
-        "{{\"kind\":\"streaming_summary\",\"rows\":{},\"chunks\":{},\"bytes\":{},\"chunk_rows\":{},\"bounded_generator\":true,\"chunked_retained_device_memory_upload_available\":true,\"chunked_cache_install_available\":false,\"blocker\":\"missing_benchmark_only_relational_resident_cache_chunked_admission_api\"}}",
+        "{{\"kind\":\"streaming_summary\",\"rows\":{},\"chunks\":{},\"bytes\":{},\"chunk_rows\":{},\"bounded_generator\":true,\"chunked_retained_device_memory_upload_available\":true,\"chunked_cache_install_available\":true,\"status\":\"pass\"}}",
         total_rows,
         chunk_index,
         total_bytes,
@@ -185,11 +188,8 @@ fn run_streaming_self_check(args: &Args) -> Result<(), Box<dyn Error>> {
     report.push_str(&format!("- generated_bytes: {}\n", total_bytes));
     report.push_str("- bounded_generator: pass\n");
     report.push_str("- chunked_retained_device_memory_upload_available: true\n");
-    report.push_str("- chunked_resident_cache_install: blocked\n");
-    report.push_str(
-        "- blocker: `missing_benchmark_only_relational_resident_cache_chunked_admission_api`\n\n",
-    );
-    report.push_str("The self-check writes deterministic generated rows directly to chunk files and never seeds the MVCC engine. It proves the benchmark generator side can be bounded, and `--chunked-upload-self-check` proves the execution-layer retained upload boundary. The current engine residency path still installs a snapshot through `RelationalResidencySnapshot { resident_rows: Vec<Vec<SqlValue>>, ... }`.\n");
+    report.push_str("- chunked_resident_cache_install_available: true\n\n");
+    report.push_str("The self-check writes deterministic generated rows directly to chunk files and never seeds the MVCC engine. It proves the benchmark generator side can be bounded; `--chunked-upload-self-check` proves retained CUDA chunk upload, and `--chunked-install-self-check` proves benchmark-only resident-cache admission.\n");
     fs::write(artifact_dir.join("self-check.md"), report)?;
 
     if total_rows != args.rows {
@@ -234,11 +234,69 @@ fn run_chunked_install_self_check(args: &Args) -> Result<(), Box<dyn Error>> {
         next_row = chunk_end + 1;
     }
 
+    let layout = build_order_line_chunked_resident_layout(args.rows, args.chunk_rows)?;
+    let chunk_refs = layout
+        .chunks
+        .iter()
+        .map(|chunk| CudaDeviceMemoryChunk {
+            byte_offset: chunk.byte_offset,
+            bytes: chunk.bytes.as_slice(),
+        })
+        .collect::<Vec<_>>();
+    let mut engine = Engine::new_local();
+    engine.execute_text(
+        1,
+        "CREATE TABLE order_line (ol_o_id INT, ol_i_id INT, ol_quantity INT, ol_amount INT, ol_dist_info TEXT)",
+    )?;
+    let snapshot = engine.install_benchmark_relational_residency_chunks(
+        BenchmarkRelationalResidencyChunkInstall {
+            table: "order_line",
+            gpu_id: 0,
+            row_count: args.rows,
+            resident_bytes: layout.allocated_bytes,
+            resident_device_int4_columns: layout.resident_device_int4_columns.clone(),
+            resident_device_text_columns: layout.resident_device_text_columns.clone(),
+            allocated_bytes: layout.allocated_bytes,
+            chunks: &chunk_refs,
+        },
+    )?;
+    let count = engine.execute_relational_select(&select("SELECT COUNT(*) FROM order_line")?)?;
+    assert_single_int(&count, args.rows as i64, "count_all")?;
+    let sum_amount =
+        engine.execute_relational_select(&select("SELECT SUM(ol_amount) FROM order_line")?)?;
+    assert_single_int(&sum_amount, expected_amount_sum(args.rows), "sum_amount")?;
+    let avg_quantity = engine.execute_relational_select(&select(
+        "SELECT AVG(ol_quantity) FROM order_line WHERE ol_quantity BETWEEN 10 AND 40",
+    )?)?;
+    assert_single_numeric(
+        &avg_quantity,
+        &expected_quantity_between_avg(args.rows),
+        "avg_quantity_between",
+    )?;
+    let max_amount = engine.execute_relational_select(&select(
+        "SELECT MAX(ol_amount) FROM order_line WHERE ol_amount >= 16",
+    )?)?;
+    assert_single_int(
+        &max_amount,
+        expected_amount_max_filter(args.rows, 16),
+        "max_amount_filter",
+    )?;
+    let route = engine.plan_relational_resident_route(&select("SELECT COUNT(*) FROM order_line")?);
+    if !route.accepted || !route.has_retained_device_memory || route.h2d_bytes_if_resident != 0 {
+        return Err(format!("benchmark resident route was not ready: {route:?}").into());
+    }
+
     let mut json = BufWriter::new(File::create(artifact_dir.join("self-check.jsonl"))?);
     writeln!(
         json,
-        "{{\"kind\":\"chunked_install_self_check\",\"rows\":{},\"chunk_rows\":{},\"chunks\":{},\"streaming_artifacts_created\":true,\"chunked_retained_device_memory_upload_available\":true,\"cache_snapshot_requires_resident_rows\":true,\"status\":\"blocked\",\"blocker\":\"missing_benchmark_only_relational_resident_cache_chunked_admission_api\"}}",
-        args.rows, args.chunk_rows, chunk_count
+        "{{\"kind\":\"chunked_install_self_check\",\"rows\":{},\"chunk_rows\":{},\"chunks\":{},\"allocated_bytes\":{},\"resident_rows_materialized\":{},\"route_accepted\":{},\"zero_h2d_route\":{},\"status\":\"pass\"}}",
+        args.rows,
+        args.chunk_rows,
+        chunk_count,
+        snapshot.resident_bytes,
+        snapshot.resident_rows.len(),
+        route.accepted,
+        route.h2d_bytes_if_resident == 0
     )?;
     json.flush()?;
 
@@ -250,12 +308,18 @@ fn run_chunked_install_self_check(args: &Args) -> Result<(), Box<dyn Error>> {
     report.push_str(&format!("- chunks: {}\n", chunk_count));
     report.push_str("- streaming_artifacts_created: pass\n");
     report.push_str("- chunked_retained_device_memory_upload_available: true\n");
-    report.push_str("- cache_snapshot_requires_resident_rows: true\n");
-    report.push_str("- chunked_install_status: blocked\n");
-    report.push_str(
-        "- blocker: `missing_benchmark_only_relational_resident_cache_chunked_admission_api`\n\n",
-    );
-    report.push_str("This self-check proves the generator can hand off deterministic row chunks, and `--chunked-upload-self-check` proves the execution layer can copy retained-layout chunks into explicit CUDA device offsets. The current resident-cache boundary still installs through `RelationalResidencySnapshot { resident_rows: Vec<Vec<SqlValue>>, ... }`, so the 25% tier remains blocked on a benchmark-only cache admission path that avoids whole-tier row materialization while preserving the existing retained-kernel layout.\n");
+    report.push_str("- benchmark_chunked_resident_cache_admission: pass\n");
+    report.push_str(&format!(
+        "- resident_rows_materialized: {}\n",
+        snapshot.resident_rows.len()
+    ));
+    report.push_str(&format!("- route_accepted: {}\n", route.accepted));
+    report.push_str(&format!(
+        "- zero_h2d_route: {}\n",
+        route.h2d_bytes_if_resident == 0
+    ));
+    report.push_str("- benchmark_only_durability_boundary: generated chunks are installed only for an empty catalog table and remain outside normal SQL insertion/MVCC durability\n\n");
+    report.push_str("This self-check proves deterministic generated row chunks can be admitted into `RelationalResidentCache` with retained CUDA device memory and without whole-tier `resident_rows` materialization. The checked query set executes through resident routes for the supported benchmark aggregate shapes, while normal SQL durability remains owned by WAL-backed insert/MVCC paths.\n");
     fs::write(artifact_dir.join("self-check.md"), report)?;
 
     if chunk_count == 0 {
@@ -321,7 +385,7 @@ fn run_chunked_upload_self_check(args: &Args) -> Result<(), Box<dyn Error>> {
     let mut json = BufWriter::new(File::create(artifact_dir.join("self-check.jsonl"))?);
     writeln!(
         json,
-        "{{\"kind\":\"chunked_upload_self_check\",\"rows\":{},\"chunk_rows\":{},\"chunks\":{},\"allocated_bytes\":{},\"copied_bytes\":{},\"row_count\":{},\"amount_17_count\":{},\"alpha_prefix_count\":{},\"status\":\"pass\",\"next_blocker\":\"missing_benchmark_only_relational_resident_cache_chunked_admission_api\"}}",
+        "{{\"kind\":\"chunked_upload_self_check\",\"rows\":{},\"chunk_rows\":{},\"chunks\":{},\"allocated_bytes\":{},\"copied_bytes\":{},\"row_count\":{},\"amount_17_count\":{},\"alpha_prefix_count\":{},\"status\":\"pass\"}}",
         args.rows,
         args.chunk_rows,
         layout.chunks.len(),
@@ -354,8 +418,7 @@ fn run_chunked_upload_self_check(args: &Args) -> Result<(), Box<dyn Error>> {
     ));
     report.push_str("- chunked_retained_device_memory_upload: pass\n");
     report.push_str("- benchmark_only_durability_boundary: generated artifacts under `target/` remain outside normal SQL insertion/MVCC\n");
-    report.push_str("- next_blocker: `missing_benchmark_only_relational_resident_cache_chunked_admission_api`\n\n");
-    report.push_str("The execution layer can now allocate one retained CUDA resident layout and copy header, int4 column, text-offset, and text-byte chunks into explicit device offsets without first assembling one contiguous host payload. The remaining 25% tier blocker is above the runtime API: a benchmark-only `RelationalResidentCache` admission path still needs to consume generated artifacts without whole-tier `resident_rows` materialization while preserving the existing retained-kernel layout.\n");
+    report.push_str("\nThe execution layer can allocate one retained CUDA resident layout and copy header, int4 column, text-offset, and text-byte chunks into explicit device offsets without first assembling one contiguous host payload. `--chunked-install-self-check` covers the benchmark-only resident-cache admission boundary built on top of this upload API.\n");
     fs::write(artifact_dir.join("self-check.md"), report)?;
     Ok(())
 }
@@ -367,6 +430,8 @@ struct ChunkedResidentLayout {
     dist_offsets_byte_offset: u64,
     dist_bytes_byte_offset: u64,
     dist_bytes_len: u64,
+    resident_device_int4_columns: Vec<String>,
+    resident_device_text_columns: Vec<ResidentDeviceTextColumnLayout>,
     chunks: Vec<ResidentUploadChunk>,
 }
 
@@ -444,8 +509,97 @@ fn build_order_line_chunked_resident_layout(
         dist_offsets_byte_offset: dist_offsets_offset,
         dist_bytes_byte_offset: dist_bytes_offset,
         dist_bytes_len: dist_bytes.len() as u64,
+        resident_device_int4_columns: vec![
+            "ol_o_id".to_string(),
+            "ol_i_id".to_string(),
+            "ol_quantity".to_string(),
+            "ol_amount".to_string(),
+        ],
+        resident_device_text_columns: vec![ResidentDeviceTextColumnLayout {
+            name: "ol_dist_info".to_string(),
+            offsets_byte_offset: dist_offsets_offset,
+            bytes_byte_offset: dist_bytes_offset,
+            bytes_len: dist_bytes.len() as u64,
+        }],
         chunks,
     })
+}
+
+fn assert_single_int(
+    result: &RelationalSelectResult,
+    expected: i64,
+    label: &str,
+) -> Result<(), Box<dyn Error>> {
+    let Some(row) = result.rows.first() else {
+        return Err(format!("{label} returned no rows").into());
+    };
+    let Some(value) = row.first() else {
+        return Err(format!("{label} returned an empty row").into());
+    };
+    let actual = match value {
+        gpu_db_protocol::SqlValue::Int4(value) => i64::from(*value),
+        gpu_db_protocol::SqlValue::Int8(value) => *value,
+        other => return Err(format!("{label} returned non-integer value {other:?}").into()),
+    };
+    if actual != expected {
+        return Err(format!("{label} returned {actual}, expected {expected}").into());
+    }
+    Ok(())
+}
+
+fn assert_single_numeric(
+    result: &RelationalSelectResult,
+    expected: &str,
+    label: &str,
+) -> Result<(), Box<dyn Error>> {
+    let Some(row) = result.rows.first() else {
+        return Err(format!("{label} returned no rows").into());
+    };
+    let Some(value) = row.first() else {
+        return Err(format!("{label} returned an empty row").into());
+    };
+    let gpu_db_protocol::SqlValue::Numeric(actual) = value else {
+        return Err(format!("{label} returned non-numeric value {value:?}").into());
+    };
+    if actual != expected {
+        return Err(format!("{label} returned {actual}, expected {expected}").into());
+    }
+    Ok(())
+}
+
+fn expected_amount_sum(rows: usize) -> i64 {
+    (1..=rows).map(|id| ((id * 17) % 100_000) as i64).sum()
+}
+
+fn expected_quantity_between_avg(rows: usize) -> String {
+    let values = (1..=rows)
+        .map(|id| ((id % 50) + 1) as i64)
+        .filter(|value| (10..=40).contains(value))
+        .collect::<Vec<_>>();
+    fixed_scale_average(values.iter().sum::<i64>() as i128, values.len())
+}
+
+fn fixed_scale_average(sum: i128, count: usize) -> String {
+    let count = count as i128;
+    let negative = sum.is_negative();
+    let abs_sum = sum.abs();
+    let whole = abs_sum / count;
+    let mut remainder = abs_sum % count;
+    let mut fractional = String::with_capacity(16);
+    for _ in 0..16 {
+        remainder *= 10;
+        fractional.push(char::from(b'0' + u8::try_from(remainder / count).unwrap()));
+        remainder %= count;
+    }
+    format!("{}{whole}.{fractional}", if negative { "-" } else { "" })
+}
+
+fn expected_amount_max_filter(rows: usize, lower: i32) -> i64 {
+    (1..=rows)
+        .map(|id| ((id * 17) % 100_000) as i64)
+        .filter(|value| *value >= i64::from(lower))
+        .max()
+        .unwrap_or(0)
 }
 
 fn append_i32_column_chunks<F>(
