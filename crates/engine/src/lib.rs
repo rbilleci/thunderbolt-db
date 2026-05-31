@@ -7112,6 +7112,7 @@ fn resident_route_d2h_bytes_estimate(
 ) -> u64 {
     const COUNT_RESULT_BYTES: u64 = std::mem::size_of::<u64>() as u64;
     const I32_RESULT_BYTES: u64 = std::mem::size_of::<i32>() as u64;
+    const I64_RESULT_BYTES: u64 = std::mem::size_of::<i64>() as u64;
     const RESULT_LEN_BYTES: u64 = std::mem::size_of::<u64>() as u64;
     const SCALAR_STATS_BYTES: u64 = (std::mem::size_of::<u64>()
         + std::mem::size_of::<i64>()
@@ -7143,6 +7144,9 @@ fn resident_route_d2h_bytes_estimate(
         "int4_projection" | "int4_ordered_projection" => row_bytes(I32_RESULT_BYTES),
         "int4_distinct_projection" | "int4_filtered_distinct_projection" => {
             resident_row_bytes(I32_RESULT_BYTES)
+        }
+        "int4_scalar_aggregate" if matches!(select.projection, SelectProjection::Sum { .. }) => {
+            I64_RESULT_BYTES
         }
         "int4_scalar_aggregate" | "int4_filtered_scalar_aggregate" => {
             GROUPED_STATS_BYTES.saturating_add(RESULT_LEN_BYTES)
@@ -15266,9 +15270,15 @@ impl Engine {
                     .to_string(),
             ))
         })?;
+        let started = Instant::now();
         let sum = device_memory
             .sum_i32_from_payload(byte_offset, row_count)
             .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
+        let elapsed = started.elapsed();
+        self.metrics
+            .observe_d2h_bytes(std::mem::size_of::<i64>() as u64);
+        self.metrics
+            .observe_kernel_exec_ms(elapsed.as_millis().try_into().unwrap_or(u64::MAX).max(1));
 
         Ok(RelationalSelectResult {
             columns: bound.selected_columns,
@@ -22291,6 +22301,81 @@ mod tests {
     }
 
     #[test]
+    fn gpu_resident_device_memory_sum_probe_parallel_reduction_preserves_scalar_telemetry() {
+        let mut e = Engine::new_local();
+        e.execute_text(1, "CREATE TABLE events (id INT, amount INT)")
+            .unwrap();
+        e.execute_text(
+            2,
+            "INSERT INTO events (id, amount) VALUES (1, -5), (2, 0), (3, 7), (4, -2)",
+        )
+        .unwrap();
+        let snapshot = e.populate_relational_residency_snapshot("events").unwrap();
+        if snapshot.device_memory_proof.is_none() {
+            return;
+        }
+
+        let Command::Select(select) = parse_command("SELECT SUM(amount) FROM events").unwrap()
+        else {
+            unreachable!()
+        };
+        let cpu = e.execute_relational_select(&select).unwrap();
+        let before = e.metrics().snapshot();
+        let resident = e
+            .execute_relational_sum_with_resident_device_memory_probe(&select)
+            .unwrap();
+        let after = e.metrics().snapshot();
+
+        assert_eq!(resident.columns, cpu.columns);
+        assert_eq!(resident.rows, cpu.rows);
+        assert_eq!(resident.rows, vec![vec![SqlValue::Int8(0)]]);
+        assert_eq!(resident.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(resident.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(resident.fallback_reason, None);
+        assert_eq!(after.h2d_bytes_total - before.h2d_bytes_total, 0);
+        assert_eq!(
+            after.d2h_bytes_total - before.d2h_bytes_total,
+            std::mem::size_of::<i64>() as u64
+        );
+        assert_eq!(after.kernel_exec_samples - before.kernel_exec_samples, 1);
+
+        e.execute_text(3, "CREATE TABLE empty_events (id INT, amount INT)")
+            .unwrap();
+        let empty_snapshot = e
+            .populate_relational_residency_snapshot("empty_events")
+            .unwrap();
+        if empty_snapshot.device_memory_proof.is_none() {
+            return;
+        }
+        let Command::Select(empty_select) =
+            parse_command("SELECT SUM(amount) FROM empty_events").unwrap()
+        else {
+            unreachable!()
+        };
+        let empty_cpu = e.execute_relational_select(&empty_select).unwrap();
+        let before_empty = e.metrics().snapshot();
+        let empty_resident = e
+            .execute_relational_sum_with_resident_device_memory_probe(&empty_select)
+            .unwrap();
+        let after_empty = e.metrics().snapshot();
+
+        assert_eq!(empty_resident.columns, empty_cpu.columns);
+        assert_eq!(empty_resident.rows, empty_cpu.rows);
+        assert_eq!(
+            after_empty.h2d_bytes_total - before_empty.h2d_bytes_total,
+            0
+        );
+        assert_eq!(
+            after_empty.d2h_bytes_total - before_empty.d2h_bytes_total,
+            std::mem::size_of::<i64>() as u64
+        );
+        assert_eq!(
+            after_empty.kernel_exec_samples - before_empty.kernel_exec_samples,
+            1
+        );
+    }
+
+    #[test]
     fn gpu_resident_device_memory_ordered_projection_probe_materializes_int4_results() {
         let mut e = Engine::new_local();
         e.execute_text(1, "CREATE TABLE events (id INT, label TEXT, amount INT)")
@@ -23709,6 +23794,11 @@ mod tests {
                     .relational_residency_snapshot("events")
                     .unwrap()
                     .resident_bytes,
+                "int4_scalar_aggregate"
+                    if matches!(select.projection, SelectProjection::Sum { .. }) =>
+                {
+                    std::mem::size_of::<i64>() as u64
+                }
                 "int4_scalar_aggregate" | "int4_filtered_scalar_aggregate" => {
                     (std::mem::size_of::<i32>()
                         + std::mem::size_of::<u64>()

@@ -1820,6 +1820,7 @@ fn launch_cuda_resident_i32_sum(
     type CuMemAlloc = unsafe extern "C" fn(*mut u64, usize) -> i32;
     type CuMemFree = unsafe extern "C" fn(u64) -> i32;
     type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+    type CuMemsetD8 = unsafe extern "C" fn(u64, u8, usize) -> i32;
     type CuModuleLoadData = unsafe extern "C" fn(*mut *mut c_void, *const c_void) -> i32;
     type CuModuleUnload = unsafe extern "C" fn(*mut c_void) -> i32;
     type CuModuleGetFunction =
@@ -1858,7 +1859,18 @@ fn launch_cuda_resident_i32_sum(
     .reg .u64 %out;
     .reg .u64 %base;
     .reg .u64 %idx;
+    .reg .u64 %stride;
     .reg .u64 %addr;
+    .reg .u32 %block;
+    .reg .u32 %block_dim;
+    .reg .u32 %thread;
+    .reg .u32 %grid_dim;
+    .reg .u64 %wide_block;
+    .reg .u64 %wide_thread;
+    .reg .u64 %wide_block_dim;
+    .reg .u64 %wide_grid_dim;
+    .reg .u64 %sum_bits;
+    .reg .u64 %ignored;
     .reg .s64 %sum;
     .reg .s64 %wide;
     .reg .s32 %value;
@@ -1869,7 +1881,17 @@ fn launch_cuda_resident_i32_sum(
     ld.param.u64 %out, [out_ptr];
 
     add.u64 %base, %resident, %offset;
-    mov.u64 %idx, 0;
+    mov.u32 %block, %ctaid.x;
+    mov.u32 %block_dim, %ntid.x;
+    mov.u32 %thread, %tid.x;
+    mov.u32 %grid_dim, %nctaid.x;
+    cvt.u64.u32 %wide_block, %block;
+    cvt.u64.u32 %wide_thread, %thread;
+    cvt.u64.u32 %wide_block_dim, %block_dim;
+    cvt.u64.u32 %wide_grid_dim, %grid_dim;
+    mul.lo.u64 %idx, %wide_block, %wide_block_dim;
+    add.u64 %idx, %idx, %wide_thread;
+    mul.lo.u64 %stride, %wide_grid_dim, %wide_block_dim;
     mov.s64 %sum, 0;
 
 loop:
@@ -1880,11 +1902,12 @@ loop:
     ld.global.s32 %value, [%addr];
     cvt.s64.s32 %wide, %value;
     add.s64 %sum, %sum, %wide;
-    add.u64 %idx, %idx, 1;
+    add.u64 %idx, %idx, %stride;
     bra loop;
 
 done:
-    st.global.s64 [%out], %sum;
+    cvt.u64.s64 %sum_bits, %sum;
+    atom.global.add.u64 %ignored, [%out], %sum_bits;
     ret;
 }
 "#;
@@ -1916,6 +1939,13 @@ done:
             ._lib
             .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
             .or_else(|_| resident._lib.get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_memset_d8 = unsafe {
+        resident
+            ._lib
+            .get::<CuMemsetD8>(b"cuMemsetD8_v2\0")
+            .or_else(|_| resident._lib.get::<CuMemsetD8>(b"cuMemsetD8\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_module_load_data = unsafe {
@@ -1955,6 +1985,7 @@ done:
         ptr: device_output,
         free: *cu_mem_free,
     };
+    check_cuda(unsafe { cu_memset_d8(allocation_guard.ptr, 0, std::mem::size_of::<i64>()) })?;
 
     let mut ptx = Vec::with_capacity(PTX.len() + 1);
     ptx.extend_from_slice(PTX);
@@ -1982,13 +2013,19 @@ done:
         (&mut rows_arg as *mut u64).cast::<c_void>(),
         (&mut output_arg as *mut u64).cast::<c_void>(),
     ];
+    let block_dim = 256_u32;
+    let grid_dim = if row_count == 0 {
+        1
+    } else {
+        row_count.div_ceil(u64::from(block_dim)).min(1024) as u32
+    };
     launch_with_optional_cuda_event_timing(resident, *cu_ctx_synchronize, || unsafe {
         cu_launch_kernel(
             function,
+            grid_dim,
             1,
             1,
-            1,
-            1,
+            block_dim,
             1,
             1,
             0,
