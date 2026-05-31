@@ -10,7 +10,7 @@ CONCURRENCY="${GPU_DB_CH_BENCH_CONCURRENCY:-1,10}"
 
 usage() {
   cat <<'USAGE'
-usage: scripts/run_p8_ch_benchmark_residency_probe.sh [--dry-run|--run-baseline|--run-25pct|--run-25pct-execute|--pgsql-baseline-preflight|--pgsql-baseline-docker-up|--pgsql-baseline-docker-preflight|--pgsql-baseline-docker-down|--streaming-self-check|--chunked-install-self-check|--chunked-upload-self-check|--cleanup|--self-check]
+usage: scripts/run_p8_ch_benchmark_residency_probe.sh [--dry-run|--run-baseline|--run-25pct|--run-25pct-execute|--pgsql-baseline-preflight|--pgsql-baseline-25pct-latency|--pgsql-baseline-docker-up|--pgsql-baseline-docker-preflight|--pgsql-baseline-docker-down|--streaming-self-check|--chunked-install-self-check|--chunked-upload-self-check|--cleanup|--self-check]
 
 Environment:
   GPU_DB_CH_BENCH_OUT_DIR       output directory, default target/p8-ch-benchmark-residency
@@ -21,12 +21,100 @@ Environment:
   GPU_DB_CH_BENCH_EXECUTE_ROWS  guarded chunked execution rows, default 1024
   GPU_DB_CH_BENCH_EXECUTE_CHUNK_ROWS  guarded execution chunk rows, default 256
   GPU_DB_CH_BENCH_ALLOW_FULL_25PCT  set to 1 to attempt all estimated 25pct rows
+  GPU_DB_CH_BENCH_PGSQL_ROWS    PostgreSQL latency rows, default 1024 unless full guard is set
+  GPU_DB_CH_BENCH_ALLOW_FULL_PGSQL_25PCT  set to 1 to load/query all estimated 25pct PostgreSQL rows
   GPU_DB_CH_BENCH_PGSQL_URL     libpq connection string for PostgreSQL baseline
   GPU_DB_CH_BENCH_PGSQL_DOCKER_NAME      default gpu-db-p8-pgsql-baseline-disposable
   GPU_DB_CH_BENCH_PGSQL_DOCKER_IMAGE     default postgres:16
   GPU_DB_CH_BENCH_PGSQL_DOCKER_PORT      default 55434
   GPU_DB_CH_BENCH_PGSQL_DOCKER_PASSWORD  default gpu_db_p8_benchmark
 USAGE
+}
+
+rows_25pct() {
+  local retained_target_bytes=6442450944
+  local retained_bytes_per_row=40
+  echo $(((retained_target_bytes + retained_bytes_per_row - 1) / retained_bytes_per_row))
+}
+
+expected_amount_sum() {
+  local rows="$1"
+  local period=100000
+  local full_periods=$((rows / period))
+  local remainder=$((rows % period))
+  local period_sum=4999950000
+  local remainder_sum=0
+  local id
+  for ((id = 1; id <= remainder; id++)); do
+    remainder_sum=$((remainder_sum + ((id * 17) % 100000)))
+  done
+  echo $((full_periods * period_sum + remainder_sum))
+}
+
+expected_quantity_between_avg() {
+  local rows="$1"
+  local period=50
+  local full_periods=$((rows / period))
+  local remainder=$((rows % period))
+  local period_count=31
+  local period_sum=775
+  local count=$((full_periods * period_count))
+  local sum=$((full_periods * period_sum))
+  local id value
+  for ((id = 1; id <= remainder; id++)); do
+    value=$(((id % 50) + 1))
+    if ((value >= 10 && value <= 40)); then
+      count=$((count + 1))
+      sum=$((sum + value))
+    fi
+  done
+  local whole=$((sum / count))
+  local rem=$((sum % count))
+  local fractional=""
+  for _ in $(seq 1 16); do
+    rem=$((rem * 10))
+    fractional+="$((rem / count))"
+    rem=$((rem % count))
+  done
+  printf '%s.%s\n' "$whole" "$fractional"
+}
+
+expected_amount_max_filter() {
+  local rows="$1"
+  local lower="$2"
+  local scan_rows="$rows"
+  if ((scan_rows > 100000)); then
+    scan_rows=100000
+  fi
+  local id value max=""
+  for ((id = 1; id <= scan_rows; id++)); do
+    value=$(((id * 17) % 100000))
+    if ((value >= lower)) && { [ -z "$max" ] || ((value > max)); }; then
+      max="$value"
+    fi
+  done
+  if [ -z "$max" ]; then
+    echo NULL
+  else
+    echo "$max"
+  fi
+}
+
+write_pgsql_copy_stream() {
+  local rows="$1"
+  local id bucket item qty amount dist
+  for ((id = 1; id <= rows; id++)); do
+    bucket=$((id % 10))
+    item=$(((id % 100000) + 1))
+    qty=$(((id % 50) + 1))
+    amount=$(((id * 17) % 100000))
+    if ((id % 2 == 0)); then
+      dist="alpha"
+    else
+      dist="omega"
+    fi
+    printf '%s,%s,%s,%s,%s%s\n' "$id" "$item" "$qty" "$amount" "$dist" "$bucket"
+  done
 }
 
 pgsql_docker_name() {
@@ -283,6 +371,189 @@ PREFLIGHT
   return 1
 }
 
+write_pgsql_25pct_latency() {
+  mkdir -p "$OUT_DIR/pgsql-latency"
+  if ! command -v psql >/dev/null 2>&1; then
+    echo "p8_ch_benchmark_pgsql_latency=blocked reason=missing_psql_client" >&2
+    return 1
+  fi
+  if [ -z "${GPU_DB_CH_BENCH_PGSQL_URL:-}" ]; then
+    echo "p8_ch_benchmark_pgsql_latency=blocked reason=missing_pgsql_baseline_connection" >&2
+    return 1
+  fi
+
+  local estimated_rows rows row_tier status blocker full_command lower_bound
+  estimated_rows="$(rows_25pct)"
+  rows="${GPU_DB_CH_BENCH_PGSQL_ROWS:-1024}"
+  row_tier="scaled"
+  status="blocked"
+  blocker="full_25pct_postgresql_latency_requires_operator_long_run"
+  full_command="GPU_DB_CH_BENCH_PGSQL_URL='$(pgsql_docker_url)' GPU_DB_CH_BENCH_ALLOW_FULL_PGSQL_25PCT=1 GPU_DB_CH_BENCH_PGSQL_ROWS=$estimated_rows scripts/run_p8_ch_benchmark_residency_probe.sh --pgsql-baseline-25pct-latency"
+  if [ "${GPU_DB_CH_BENCH_ALLOW_FULL_PGSQL_25PCT:-0}" = "1" ]; then
+    rows="$estimated_rows"
+    row_tier="25pct"
+    status="pass"
+    blocker="none"
+  fi
+  lower_bound=$((rows / 4))
+  if [ "$lower_bound" -lt 1 ]; then
+    lower_bound=1
+  fi
+
+  local expected_count expected_sum expected_avg expected_max
+  expected_count="$rows"
+  expected_sum="$(expected_amount_sum "$rows")"
+  expected_avg="$(expected_quantity_between_avg "$rows")"
+  expected_max="$(expected_amount_max_filter "$rows" "$lower_bound")"
+
+  local out_path err_path validation_path report_path metrics_path timing_path
+  out_path="$OUT_DIR/pgsql-latency/psql.out"
+  err_path="$OUT_DIR/pgsql-latency/psql.err"
+  validation_path="$OUT_DIR/pgsql-latency/validation.tsv"
+  report_path="$OUT_DIR/pgsql-latency/latency.md"
+  metrics_path="$OUT_DIR/pgsql-latency/metrics.jsonl"
+  timing_path="$OUT_DIR/pgsql-latency/timing.tsv"
+  rm -f "$out_path" "$err_path" "$validation_path" "$report_path" "$metrics_path" "$timing_path"
+
+  local started ended total_runtime_ms
+  started=$(date +%s%3N)
+  {
+    cat <<SQL
+\\set ON_ERROR_STOP on
+DROP TABLE IF EXISTS order_line;
+CREATE TABLE order_line (
+  ol_o_id INT,
+  ol_i_id INT,
+  ol_quantity INT,
+  ol_amount INT,
+  ol_dist_info TEXT
+);
+COPY order_line (ol_o_id, ol_i_id, ol_quantity, ol_amount, ol_dist_info) FROM STDIN WITH (FORMAT csv);
+SQL
+    write_pgsql_copy_stream "$rows"
+    cat <<SQL
+\\.
+ANALYZE order_line;
+\\pset tuples_only on
+\\pset format unaligned
+\\o $validation_path
+SELECT 'order_line_count_all' || E'\\t' || COUNT(*)::text || E'\\t' || '$expected_count' FROM order_line;
+SELECT 'order_line_sum_amount' || E'\\t' || COALESCE(SUM(ol_amount)::text, 'NULL') || E'\\t' || '$expected_sum' FROM order_line;
+SELECT 'order_line_avg_quantity_between' || E'\\t' || COALESCE(TRUNC(AVG(ol_quantity), 16)::numeric(40,16)::text, 'NULL') || E'\\t' || '$expected_avg' FROM order_line WHERE ol_quantity BETWEEN 10 AND 40;
+SELECT 'order_line_max_amount_filter' || E'\\t' || COALESCE(MAX(ol_amount)::text, 'NULL') || E'\\t' || '$expected_max' FROM order_line WHERE ol_amount >= $lower_bound;
+\\o $OUT_DIR/pgsql-latency/order_line_count_all.explain.json
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT COUNT(*) FROM order_line;
+\\o $OUT_DIR/pgsql-latency/order_line_sum_amount.explain.json
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT SUM(ol_amount) FROM order_line;
+\\o $OUT_DIR/pgsql-latency/order_line_avg_quantity_between.explain.json
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT AVG(ol_quantity) FROM order_line WHERE ol_quantity BETWEEN 10 AND 40;
+\\o $OUT_DIR/pgsql-latency/order_line_max_amount_filter.explain.json
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT MAX(ol_amount) FROM order_line WHERE ol_amount >= $lower_bound;
+\\o
+SQL
+  } | psql "$GPU_DB_CH_BENCH_PGSQL_URL" -X >"$out_path" 2>"$err_path" || {
+    cat >"$report_path" <<REPORT
+# PostgreSQL 25% Latency Runner
+
+- rows: $rows
+- row_tier: $row_tier
+- status: blocked
+- blocker: pgsql_latency_workload_failed
+- output: $out_path
+- stderr: $err_path
+- full_run_command: \`$full_command\`
+REPORT
+    cat "$report_path"
+    echo "p8_ch_benchmark_pgsql_latency=blocked reason=pgsql_latency_workload_failed" >&2
+    return 1
+  }
+  ended=$(date +%s%3N)
+  total_runtime_ms=$((ended - started))
+
+  local validation_status=pass
+  while IFS=$'\t' read -r query actual expected; do
+    if [ "$actual" != "$expected" ]; then
+      validation_status=fail
+    fi
+  done <"$validation_path"
+
+  local query explain execution_ms p50_us throughput
+  : >"$metrics_path"
+  : >"$timing_path"
+  while IFS=$'\t' read -r query _actual _expected; do
+    explain="$OUT_DIR/pgsql-latency/${query}.explain.json"
+    execution_ms=$(awk -F': ' '/"Execution Time"/ {gsub(/[, ]/, "", $2); print $2; exit}' "$explain")
+    if [ -z "$execution_ms" ]; then
+      execution_ms=0
+    fi
+    p50_us=$(awk -v ms="$execution_ms" 'BEGIN { printf "%.0f", ms * 1000 }')
+    if [ "$p50_us" = "0" ]; then
+      throughput=0
+    else
+      throughput=$(awk -v us="$p50_us" 'BEGIN { printf "%.3f", 1000000 / us }')
+    fi
+    printf '%s\t%s\t%s\t%s\n' "$query" "$execution_ms" "$p50_us" "$throughput" >>"$timing_path"
+    printf '{"kind":"pgsql_latency_metric","query":"%s","rows":%s,"row_tier":"%s","single_run":true,"p50_us":%s,"p95_us":%s,"p99_us":%s,"throughput_qps":%s,"total_runtime_ms":%s,"validation_status":"%s","artifact":"%s","explain_artifact":"%s"}\n' \
+      "$query" "$rows" "$row_tier" "$p50_us" "$p50_us" "$p50_us" "$throughput" "$total_runtime_ms" "$validation_status" "$metrics_path" "$explain" >>"$metrics_path"
+  done <"$validation_path"
+
+  if [ "$validation_status" != pass ]; then
+    status=blocked
+    blocker=pgsql_latency_validation_failed
+  fi
+
+  cat >"$report_path" <<REPORT
+# PostgreSQL 25% Latency Runner
+
+- rows: $rows
+- estimated_25pct_rows: $estimated_rows
+- row_tier: $row_tier
+- status: $status
+- blocker: $blocker
+- single_run_semantics: true
+- total_runtime_ms: $total_runtime_ms
+- psql_version: $(psql --version)
+- validation: $validation_status
+- validation_artifact: $validation_path
+- metrics_artifact: $metrics_path
+- output: $out_path
+- stderr: $err_path
+- full_run_command: \`$full_command\`
+- cleanup_command: \`scripts/run_p8_ch_benchmark_residency_probe.sh --cleanup && scripts/run_p8_ch_benchmark_residency_probe.sh --pgsql-baseline-docker-down\`
+
+The runner streams deterministic \`order_line\` rows into PostgreSQL through
+\`COPY FROM STDIN\` and does not write one enormous generated SQL file. Latency
+is recorded from PostgreSQL \`EXPLAIN (ANALYZE, FORMAT JSON)\` output. Because
+each query is executed once, p50/p95/p99 are intentionally the same single-run
+latency value.
+
+## Query Metrics
+
+| workload/query id | row count / tier | side | p50 us | p95 us | p99 us | throughput qps | total runtime ms | validation | artifact |
+|---|---:|---|---:|---:|---:|---:|---:|---|---|
+REPORT
+  while IFS=$'\t' read -r query execution_ms p50_us throughput; do
+    printf '| %s | %s / %s | PostgreSQL | %s | %s | %s | %s | %s | %s | `%s` |\n' \
+      "$query" "$rows" "$row_tier" "$p50_us" "$p50_us" "$p50_us" "$throughput" "$total_runtime_ms" "$validation_status" "$metrics_path" >>"$report_path"
+  done <"$timing_path"
+  cat >>"$report_path" <<REPORT
+
+## Validation
+
+\`\`\`text
+$(cat "$validation_path")
+\`\`\`
+REPORT
+  cat "$report_path"
+
+  if [ "$status" = pass ]; then
+    echo "p8_ch_benchmark_pgsql_latency=passed rows=$rows"
+    return 0
+  fi
+  echo "p8_ch_benchmark_pgsql_latency=blocked reason=$blocker rows=$rows" >&2
+  return 1
+}
+
 write_25pct_preflight() {
   mkdir -p "$OUT_DIR"
   local retained_target_bytes=6442450944
@@ -484,6 +755,9 @@ case "$mode" in
     ;;
   --pgsql-baseline-preflight)
     write_pgsql_baseline_preflight
+    ;;
+  --pgsql-baseline-25pct-latency)
+    write_pgsql_25pct_latency
     ;;
   --pgsql-baseline-docker-up)
     pgsql_baseline_docker_up
