@@ -10,7 +10,7 @@ CONCURRENCY="${GPU_DB_CH_BENCH_CONCURRENCY:-1,10}"
 
 usage() {
   cat <<'USAGE'
-usage: scripts/run_p8_ch_benchmark_residency_probe.sh [--dry-run|--run-baseline|--run-25pct|--run-25pct-execute|--run-125pct|--pgsql-fairness-audit|--gpu-db-protocol-benchmark-smoke|--pgsql-baseline-preflight|--pgsql-baseline-25pct-latency|--pgsql-baseline-125pct-latency|--pgsql-baseline-docker-up|--pgsql-baseline-docker-preflight|--pgsql-baseline-docker-down|--streaming-self-check|--chunked-install-self-check|--chunked-upload-self-check|--cleanup|--self-check]
+usage: scripts/run_p8_ch_benchmark_residency_probe.sh [--dry-run|--run-baseline|--run-25pct|--run-25pct-execute|--run-125pct|--pgsql-fairness-audit|--gpu-db-protocol-benchmark-smoke|--protocol-retained-route-bridge-report|--pgsql-baseline-preflight|--pgsql-baseline-25pct-latency|--pgsql-baseline-125pct-latency|--pgsql-baseline-docker-up|--pgsql-baseline-docker-preflight|--pgsql-baseline-docker-down|--streaming-self-check|--chunked-install-self-check|--chunked-upload-self-check|--cleanup|--self-check]
 
 Environment:
   GPU_DB_CH_BENCH_OUT_DIR       output directory, default target/p8-ch-benchmark-residency
@@ -29,6 +29,7 @@ Environment:
   GPU_DB_CH_BENCH_PGSQL_AUDIT_REPEATS repeated warm timings per query/profile, default 3
   GPU_DB_CH_BENCH_GPU_DB_PROTOCOL_ROWS scaled GPU DB protocol smoke rows, default 64
   GPU_DB_CH_BENCH_GPU_DB_PROTOCOL_PORT GPU DB protocol smoke listen port, default 55435
+  GPU_DB_CH_BENCH_PROTOCOL_BRIDGE_ROWS scaled bridge blocker rows, default 64
   GPU_DB_CH_BENCH_ALLOW_FULL_PGSQL_25PCT  set to 1 to load/query all estimated 25pct PostgreSQL rows
   GPU_DB_CH_BENCH_PGSQL_URL     libpq connection string for PostgreSQL baseline
   GPU_DB_CH_BENCH_PGSQL_DOCKER_NAME      default gpu-db-p8-pgsql-baseline-disposable
@@ -1074,6 +1075,87 @@ REPORT
   echo "p8_ch_benchmark_gpu_db_protocol_smoke=blocked reason=$blocker artifact=$report_path"
 }
 
+write_protocol_retained_route_bridge_report() {
+  mkdir -p "$OUT_DIR/protocol-retained-route-bridge"
+  local bridge_dir="$OUT_DIR/protocol-retained-route-bridge"
+  local rows="${GPU_DB_CH_BENCH_PROTOCOL_BRIDGE_ROWS:-64}"
+  local report_path="$bridge_dir/protocol-retained-route-bridge.md"
+  local metrics_path="$bridge_dir/metrics.jsonl"
+  local architecture_path="$bridge_dir/architecture-facts.txt"
+  local blocker="engine_backed_protocol_endpoint_required"
+  local secondary_blocker="protocol_shared_catalog_to_engine_adapter_required"
+  local seed_blocker="protocol_seed_to_resident_cache_admission_required"
+  local lookup_blocker="primary_key_lookup_retained_route_required"
+
+  {
+    echo "date_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "crate_direction=gpu_db_engine_depends_on_gpu_db_protocol"
+    echo "protocol_crate_depends_on_engine=false"
+    echo "protocol_server_target=crates/protocol/src/bin/gpu-db-server.rs"
+    echo "protocol_state=Session/SharedCatalog private Table rows"
+    echo "protocol_select_executor=execute_select_result over protocol Table rows"
+    echo "protocol_copy_admission=apply_copy_in_rows extends protocol Table rows and persists SharedCatalog snapshot"
+    echo "retained_engine_target=crates/engine/examples/p8_ch_benchmark_residency_probe.rs"
+    echo "retained_engine_entry=Engine::new_local plus install_benchmark_relational_residency_owned_chunks plus execute_relational_select"
+    echo "retained_seed_state=benchmark-only generated chunks outside normal SQL/MVCC inserts"
+    echo "safe_bridge_this_slice=false"
+  } >"$architecture_path"
+
+  cat >"$metrics_path" <<JSON
+{"kind":"protocol_retained_route_bridge_decision","rows":$rows,"status":"blocked","blocker":"$blocker","secondary_blocker":"$secondary_blocker","seed_blocker":"$seed_blocker","lookup_blocker":"$lookup_blocker","protocol_client_family_required":"psql/libpq or PostgreSQL-compatible driver","protocol_endpoint_current_route":"protocol_shared_catalog_cpu_scan","retained_route_current_entry":"engine_internal","crate_dependency_cycle_risk":true,"safe_to_label_protocol_smoke_as_retained":false}
+{"kind":"protocol_retained_route_required_change","status":"blocked","smallest_next_unblocker":"add an engine-owned PostgreSQL-compatible server/benchmark target, or split shared protocol session/catalog adapters into a crate that can be used by an engine-backed endpoint without making gpu_db_protocol depend on gpu_db_engine"}
+JSON
+
+  cat >"$report_path" <<REPORT
+# P8 Protocol To Retained Route Bridge
+
+- rows: $rows
+- status: blocked
+- blocker: $blocker
+- secondary_blocker: $secondary_blocker
+- seed_blocker: $seed_blocker
+- lookup_blocker: $lookup_blocker
+- architecture_facts: $architecture_path
+- metrics_artifact: $metrics_path
+
+## Result
+
+The checked PostgreSQL-compatible smoke path proves \`psql\`/libpq can seed and
+query the GPU DB endpoint, but this bridge cannot be safely closed by wiring a
+small call across the current crates. The protocol endpoint is implemented as
+\`gpu_db_protocol\`'s \`gpu-db-server\` binary and stores protocol-visible rows in
+private \`Session\` / \`SharedCatalog\` \`Table\` state. Its \`COPY FROM STDIN\`
+path appends parsed rows to that protocol table state, and its \`SELECT\` path
+executes \`execute_select_result(...)\` over those rows.
+
+The retained P8 benchmark route is owned by \`gpu_db_engine\`: it creates an
+\`Engine::new_local()\`, installs benchmark-only generated chunks into
+\`RelationalResidentCache\` through
+\`install_benchmark_relational_residency_owned_chunks(...)\`, and executes
+\`execute_relational_select(...)\`. The current crate direction is
+\`gpu_db_engine -> gpu_db_protocol\`; making the protocol server directly depend
+on \`gpu_db_engine\` would introduce the dependency cycle the benchmark contract
+explicitly rejects.
+
+## Decision
+
+Do not relabel \`--gpu-db-protocol-benchmark-smoke\` as retained-route evidence.
+The narrow next unblocker is an engine-backed PostgreSQL-compatible target or a
+crate-boundary split/shared adapter that lets protocol-visible SQL/COPY table
+state enter engine-owned WAL/MVCC state and retained-resident admission before
+benchmarking. A benchmark-only resident admission bridge would also need an
+explicit product decision because it would bypass normal SQL durability.
+
+Until that target exists, aggregate and key-equality protocol smoke metrics stay
+classified as \`protocol_shared_catalog_cpu_scan\`, the existing 25% retained
+aggregate result stays \`engine_internal\`, and true concurrency curves remain
+blocked behind a retained-route PostgreSQL-compatible target.
+REPORT
+
+  cat "$report_path"
+  echo "p8_ch_benchmark_protocol_retained_route_bridge=blocked reason=$blocker artifact=$report_path"
+}
+
 order_line_dist_info_shell() {
   local id="$1"
   local bucket=$((id % 10))
@@ -1439,6 +1521,9 @@ case "$mode" in
   --gpu-db-protocol-benchmark-smoke)
     write_gpu_db_protocol_benchmark_smoke
     ;;
+  --protocol-retained-route-bridge-report)
+    write_protocol_retained_route_bridge_report
+    ;;
   --pgsql-baseline-docker-up)
     pgsql_baseline_docker_up
     ;;
@@ -1531,6 +1616,10 @@ case "$mode" in
       "$0" --gpu-db-protocol-benchmark-smoke >"$tmp_dir/gpu-db-protocol.out"
     grep -q 'protocol_endpoint_uses_protocol_catalog_not_p8_resident_engine' "$tmp_dir/out/gpu-db-protocol-benchmark-smoke/protocol-benchmark-smoke.md"
     grep -q '"query":"order_line_lookup_ol_o_id"' "$tmp_dir/out/gpu-db-protocol-benchmark-smoke/metrics.jsonl"
+    GPU_DB_CH_BENCH_OUT_DIR="$tmp_dir/out" GPU_DB_CH_BENCH_PROTOCOL_BRIDGE_ROWS=16 \
+      "$0" --protocol-retained-route-bridge-report >"$tmp_dir/protocol-bridge.out"
+    grep -q 'engine_backed_protocol_endpoint_required' "$tmp_dir/out/protocol-retained-route-bridge/protocol-retained-route-bridge.md"
+    grep -q '"safe_to_label_protocol_smoke_as_retained":false' "$tmp_dir/out/protocol-retained-route-bridge/metrics.jsonl"
     GPU_DB_CH_BENCH_OUT_DIR="$tmp_dir/out" "$0" --cleanup >"$tmp_dir/cleanup.out"
     grep -q 'chunked_resident_cache_install_available: true' "$tmp_dir/streaming.out"
     grep -q 'benchmark_chunked_resident_cache_admission: pass' "$tmp_dir/chunked-install.out"
