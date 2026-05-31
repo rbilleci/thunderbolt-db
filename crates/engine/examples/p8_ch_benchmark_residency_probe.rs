@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpu_db_engine::{Engine, RelationalSelectResult};
+use gpu_db_execution::{CudaDeviceMemoryChunk, CudaDriverRuntime};
 use gpu_db_protocol::{parse_command, Command, Select};
 
 const VRAM_BYTES: u64 = 24 * 1024 * 1024 * 1024;
@@ -35,6 +36,7 @@ enum Mode {
     Run,
     StreamingSelfCheck,
     ChunkedInstallSelfCheck,
+    ChunkedUploadSelfCheck,
 }
 
 #[derive(Debug)]
@@ -71,6 +73,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Mode::Run => run_probe(&args),
         Mode::StreamingSelfCheck => run_streaming_self_check(&args),
         Mode::ChunkedInstallSelfCheck => run_chunked_install_self_check(&args),
+        Mode::ChunkedUploadSelfCheck => run_chunked_upload_self_check(&args),
     }
 }
 
@@ -165,7 +168,7 @@ fn run_streaming_self_check(args: &Args) -> Result<(), Box<dyn Error>> {
     }
     writeln!(
         manifest,
-        "{{\"kind\":\"streaming_summary\",\"rows\":{},\"chunks\":{},\"bytes\":{},\"chunk_rows\":{},\"bounded_generator\":true,\"chunked_cache_install_available\":false,\"blocker\":\"missing_relational_resident_cache_chunked_install_api\"}}",
+        "{{\"kind\":\"streaming_summary\",\"rows\":{},\"chunks\":{},\"bytes\":{},\"chunk_rows\":{},\"bounded_generator\":true,\"chunked_retained_device_memory_upload_available\":true,\"chunked_cache_install_available\":false,\"blocker\":\"missing_benchmark_only_relational_resident_cache_chunked_admission_api\"}}",
         total_rows,
         chunk_index,
         total_bytes,
@@ -181,9 +184,12 @@ fn run_streaming_self_check(args: &Args) -> Result<(), Box<dyn Error>> {
     report.push_str(&format!("- chunks: {}\n", chunk_index));
     report.push_str(&format!("- generated_bytes: {}\n", total_bytes));
     report.push_str("- bounded_generator: pass\n");
+    report.push_str("- chunked_retained_device_memory_upload_available: true\n");
     report.push_str("- chunked_resident_cache_install: blocked\n");
-    report.push_str("- blocker: `missing_relational_resident_cache_chunked_install_api`\n\n");
-    report.push_str("The self-check writes deterministic generated rows directly to chunk files and never seeds the MVCC engine. It proves the benchmark generator side can be bounded, but the current engine residency path still installs a snapshot through `RelationalResidencySnapshot { resident_rows: Vec<Vec<SqlValue>>, ... }` and a single retained device-memory payload.\n");
+    report.push_str(
+        "- blocker: `missing_benchmark_only_relational_resident_cache_chunked_admission_api`\n\n",
+    );
+    report.push_str("The self-check writes deterministic generated rows directly to chunk files and never seeds the MVCC engine. It proves the benchmark generator side can be bounded, and `--chunked-upload-self-check` proves the execution-layer retained upload boundary. The current engine residency path still installs a snapshot through `RelationalResidencySnapshot { resident_rows: Vec<Vec<SqlValue>>, ... }`.\n");
     fs::write(artifact_dir.join("self-check.md"), report)?;
 
     if total_rows != args.rows {
@@ -231,7 +237,7 @@ fn run_chunked_install_self_check(args: &Args) -> Result<(), Box<dyn Error>> {
     let mut json = BufWriter::new(File::create(artifact_dir.join("self-check.jsonl"))?);
     writeln!(
         json,
-        "{{\"kind\":\"chunked_install_self_check\",\"rows\":{},\"chunk_rows\":{},\"chunks\":{},\"streaming_artifacts_created\":true,\"cache_snapshot_requires_resident_rows\":true,\"device_memory_copy_requires_contiguous_payload\":true,\"status\":\"blocked\",\"blocker\":\"missing_chunked_retained_device_memory_upload_api\"}}",
+        "{{\"kind\":\"chunked_install_self_check\",\"rows\":{},\"chunk_rows\":{},\"chunks\":{},\"streaming_artifacts_created\":true,\"chunked_retained_device_memory_upload_available\":true,\"cache_snapshot_requires_resident_rows\":true,\"status\":\"blocked\",\"blocker\":\"missing_benchmark_only_relational_resident_cache_chunked_admission_api\"}}",
         args.rows, args.chunk_rows, chunk_count
     )?;
     json.flush()?;
@@ -243,17 +249,237 @@ fn run_chunked_install_self_check(args: &Args) -> Result<(), Box<dyn Error>> {
     report.push_str(&format!("- chunk_rows: {}\n", args.chunk_rows));
     report.push_str(&format!("- chunks: {}\n", chunk_count));
     report.push_str("- streaming_artifacts_created: pass\n");
+    report.push_str("- chunked_retained_device_memory_upload_available: true\n");
     report.push_str("- cache_snapshot_requires_resident_rows: true\n");
-    report.push_str("- device_memory_copy_requires_contiguous_payload: true\n");
     report.push_str("- chunked_install_status: blocked\n");
-    report.push_str("- blocker: `missing_chunked_retained_device_memory_upload_api`\n\n");
-    report.push_str("This self-check proves the generator can hand off deterministic row chunks, but the current resident-cache/device-memory boundary cannot admit those chunks directly. `RelationalResidencySnapshot` still exposes `resident_rows: Vec<Vec<SqlValue>>` for snapshot-backed reads, and retained device memory is installed through a single `CudaDriverRuntime::retain_device_memory_copy(gpu_id, payload: &[u8])` call. The 25% tier therefore remains blocked on a narrower device-memory upload/admission API that can allocate the resident layout once and copy column chunks into offsets without first building one full host payload.\n");
+    report.push_str(
+        "- blocker: `missing_benchmark_only_relational_resident_cache_chunked_admission_api`\n\n",
+    );
+    report.push_str("This self-check proves the generator can hand off deterministic row chunks, and `--chunked-upload-self-check` proves the execution layer can copy retained-layout chunks into explicit CUDA device offsets. The current resident-cache boundary still installs through `RelationalResidencySnapshot { resident_rows: Vec<Vec<SqlValue>>, ... }`, so the 25% tier remains blocked on a benchmark-only cache admission path that avoids whole-tier row materialization while preserving the existing retained-kernel layout.\n");
     fs::write(artifact_dir.join("self-check.md"), report)?;
 
     if chunk_count == 0 {
         return Err("chunked install self-check produced no chunks".into());
     }
     Ok(())
+}
+
+fn run_chunked_upload_self_check(args: &Args) -> Result<(), Box<dyn Error>> {
+    if args.rows == 0 {
+        return Err("--rows must be greater than zero".into());
+    }
+    if args.chunk_rows == 0 {
+        return Err("--chunk-rows must be greater than zero".into());
+    }
+
+    let artifact_dir = args.output_dir.join("chunked-upload-self-check");
+    if artifact_dir.exists() {
+        fs::remove_dir_all(&artifact_dir)?;
+    }
+    fs::create_dir_all(&artifact_dir)?;
+
+    let layout = build_order_line_chunked_resident_layout(args.rows, args.chunk_rows)?;
+    let chunk_refs = layout
+        .chunks
+        .iter()
+        .map(|chunk| CudaDeviceMemoryChunk {
+            byte_offset: chunk.byte_offset,
+            bytes: chunk.bytes.as_slice(),
+        })
+        .collect::<Vec<_>>();
+    let runtime = CudaDriverRuntime::probe()?;
+    let resident = runtime.retain_device_memory_chunks(0, layout.allocated_bytes, &chunk_refs)?;
+    let row_count = resident.count_rows_from_header()?;
+    let amount_17_count =
+        resident.count_i32_equal_from_payload(layout.amount_byte_offset, row_count, 17)?;
+    let alpha_prefix_count = resident.count_text_prefix_from_payload(
+        layout.dist_offsets_byte_offset,
+        layout.dist_bytes_byte_offset,
+        layout.dist_bytes_len,
+        row_count,
+        b"alpha",
+    )?;
+    if row_count != args.rows as u64 {
+        return Err(format!(
+            "resident row header reported {row_count}, expected {}",
+            args.rows
+        )
+        .into());
+    }
+    if amount_17_count != 1 {
+        return Err(format!("expected one ol_amount=17 row, got {amount_17_count}").into());
+    }
+    let expected_alpha = (1..=args.rows).filter(|id| id.is_multiple_of(2)).count() as u64;
+    if alpha_prefix_count != expected_alpha {
+        return Err(format!(
+            "expected {expected_alpha} alpha-prefixed rows, got {alpha_prefix_count}"
+        )
+        .into());
+    }
+
+    let metadata = resident.metadata().clone();
+    let mut json = BufWriter::new(File::create(artifact_dir.join("self-check.jsonl"))?);
+    writeln!(
+        json,
+        "{{\"kind\":\"chunked_upload_self_check\",\"rows\":{},\"chunk_rows\":{},\"chunks\":{},\"allocated_bytes\":{},\"copied_bytes\":{},\"row_count\":{},\"amount_17_count\":{},\"alpha_prefix_count\":{},\"status\":\"pass\",\"next_blocker\":\"missing_benchmark_only_relational_resident_cache_chunked_admission_api\"}}",
+        args.rows,
+        args.chunk_rows,
+        layout.chunks.len(),
+        metadata.allocated_bytes,
+        metadata.copied_bytes,
+        row_count,
+        amount_17_count,
+        alpha_prefix_count
+    )?;
+    json.flush()?;
+
+    let mut report = String::new();
+    report.push_str("# P8 Chunked Retained Device-Memory Upload Self-Check\n\n");
+    report.push_str(
+        "- scope: benchmark-only retained CUDA upload into explicit resident-layout offsets\n",
+    );
+    report.push_str(&format!("- rows: {}\n", args.rows));
+    report.push_str(&format!("- chunk_rows: {}\n", args.chunk_rows));
+    report.push_str(&format!("- copied_chunks: {}\n", layout.chunks.len()));
+    report.push_str(&format!(
+        "- allocated_bytes: {}\n",
+        metadata.allocated_bytes
+    ));
+    report.push_str(&format!("- copied_bytes: {}\n", metadata.copied_bytes));
+    report.push_str(&format!("- row_count_kernel: {}\n", row_count));
+    report.push_str(&format!("- amount_17_count_kernel: {}\n", amount_17_count));
+    report.push_str(&format!(
+        "- alpha_prefix_count_kernel: {}\n",
+        alpha_prefix_count
+    ));
+    report.push_str("- chunked_retained_device_memory_upload: pass\n");
+    report.push_str("- benchmark_only_durability_boundary: generated artifacts under `target/` remain outside normal SQL insertion/MVCC\n");
+    report.push_str("- next_blocker: `missing_benchmark_only_relational_resident_cache_chunked_admission_api`\n\n");
+    report.push_str("The execution layer can now allocate one retained CUDA resident layout and copy header, int4 column, text-offset, and text-byte chunks into explicit device offsets without first assembling one contiguous host payload. The remaining 25% tier blocker is above the runtime API: a benchmark-only `RelationalResidentCache` admission path still needs to consume generated artifacts without whole-tier `resident_rows` materialization while preserving the existing retained-kernel layout.\n");
+    fs::write(artifact_dir.join("self-check.md"), report)?;
+    Ok(())
+}
+
+#[derive(Debug)]
+struct ChunkedResidentLayout {
+    allocated_bytes: u64,
+    amount_byte_offset: u64,
+    dist_offsets_byte_offset: u64,
+    dist_bytes_byte_offset: u64,
+    dist_bytes_len: u64,
+    chunks: Vec<ResidentUploadChunk>,
+}
+
+#[derive(Debug)]
+struct ResidentUploadChunk {
+    byte_offset: u64,
+    bytes: Vec<u8>,
+}
+
+fn build_order_line_chunked_resident_layout(
+    rows: usize,
+    chunk_rows: usize,
+) -> Result<ChunkedResidentLayout, Box<dyn Error>> {
+    let header_len = std::mem::size_of::<u64>() as u64;
+    let int_column_len = rows as u64 * std::mem::size_of::<i32>() as u64;
+    let ol_o_id_offset = header_len;
+    let ol_i_id_offset = ol_o_id_offset + int_column_len;
+    let quantity_offset = ol_i_id_offset + int_column_len;
+    let amount_offset = quantity_offset + int_column_len;
+    let dist_offsets_offset = amount_offset + int_column_len;
+
+    let dist_values = (1..=rows).map(order_line_dist_info).collect::<Vec<_>>();
+    let mut dist_offsets = Vec::with_capacity(rows + 1);
+    let mut dist_bytes = Vec::new();
+    dist_offsets.push(0_u64);
+    for value in &dist_values {
+        dist_bytes.extend_from_slice(value.as_bytes());
+        dist_offsets.push(dist_bytes.len() as u64);
+    }
+    let dist_offsets_len = dist_offsets.len() as u64 * std::mem::size_of::<u64>() as u64;
+    let dist_bytes_offset = dist_offsets_offset + dist_offsets_len;
+    let allocated_bytes = dist_bytes_offset + dist_bytes.len() as u64;
+
+    let mut chunks = Vec::new();
+    chunks.push(ResidentUploadChunk {
+        byte_offset: 0,
+        bytes: (rows as u64).to_le_bytes().to_vec(),
+    });
+    append_i32_column_chunks(&mut chunks, ol_o_id_offset, rows, chunk_rows, |id| {
+        id as i32
+    });
+    append_i32_column_chunks(&mut chunks, ol_i_id_offset, rows, chunk_rows, |id| {
+        ((id % 100_000) + 1) as i32
+    });
+    append_i32_column_chunks(&mut chunks, quantity_offset, rows, chunk_rows, |id| {
+        ((id % 50) + 1) as i32
+    });
+    append_i32_column_chunks(&mut chunks, amount_offset, rows, chunk_rows, |id| {
+        ((id * 17) % 100_000) as i32
+    });
+    for (chunk_index, offset_chunk) in dist_offsets.chunks(chunk_rows).enumerate() {
+        let mut bytes = Vec::with_capacity(std::mem::size_of_val(offset_chunk));
+        for offset in offset_chunk {
+            bytes.extend_from_slice(&offset.to_le_bytes());
+        }
+        chunks.push(ResidentUploadChunk {
+            byte_offset: dist_offsets_offset
+                + (chunk_index * chunk_rows * std::mem::size_of::<u64>()) as u64,
+            bytes,
+        });
+    }
+    let mut byte_start = 0usize;
+    while byte_start < dist_bytes.len() {
+        let byte_end = dist_bytes.len().min(byte_start + chunk_rows * 16);
+        chunks.push(ResidentUploadChunk {
+            byte_offset: dist_bytes_offset + byte_start as u64,
+            bytes: dist_bytes[byte_start..byte_end].to_vec(),
+        });
+        byte_start = byte_end;
+    }
+
+    Ok(ChunkedResidentLayout {
+        allocated_bytes,
+        amount_byte_offset: amount_offset,
+        dist_offsets_byte_offset: dist_offsets_offset,
+        dist_bytes_byte_offset: dist_bytes_offset,
+        dist_bytes_len: dist_bytes.len() as u64,
+        chunks,
+    })
+}
+
+fn append_i32_column_chunks<F>(
+    chunks: &mut Vec<ResidentUploadChunk>,
+    column_byte_offset: u64,
+    rows: usize,
+    chunk_rows: usize,
+    value_for_row: F,
+) where
+    F: Fn(usize) -> i32,
+{
+    let mut start = 1usize;
+    while start <= rows {
+        let end = rows.min(start + chunk_rows - 1);
+        let mut bytes = Vec::with_capacity((end - start + 1) * std::mem::size_of::<i32>());
+        for id in start..=end {
+            bytes.extend_from_slice(&value_for_row(id).to_le_bytes());
+        }
+        chunks.push(ResidentUploadChunk {
+            byte_offset: column_byte_offset + ((start - 1) * std::mem::size_of::<i32>()) as u64,
+            bytes,
+        });
+        start = end + 1;
+    }
+}
+
+fn order_line_dist_info(id: usize) -> String {
+    let bucket = id % 10;
+    let dist = if id.is_multiple_of(2) {
+        "alpha"
+    } else {
+        "omega"
+    };
+    format!("{dist}{bucket}")
 }
 
 fn write_order_line_row<W: Write>(writer: &mut W, id: usize) -> Result<(), Box<dyn Error>> {
@@ -568,6 +794,7 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
             "--run" => mode = Some(Mode::Run),
             "--streaming-self-check" => mode = Some(Mode::StreamingSelfCheck),
             "--chunked-install-self-check" => mode = Some(Mode::ChunkedInstallSelfCheck),
+            "--chunked-upload-self-check" => mode = Some(Mode::ChunkedUploadSelfCheck),
             "--output-dir" => {
                 output_dir = PathBuf::from(args.next().ok_or("--output-dir needs a value")?);
             }

@@ -454,12 +454,14 @@ CH-benCHmark-derived benchmark harness with 25/50/100/200% RTX 3090 residency
 tiers, deterministic generated `order_line` chunks under `target/`, and a
 mandatory PostgreSQL comparator gate for the same dataset/query set. The 25% /
 6 GiB tier remains blocked before heavy generation starts on
-`missing_chunked_retained_device_memory_upload_api`: the current retained
-device-memory boundary accepts one contiguous host payload through
-`CudaDriverRuntime::retain_device_memory_copy(gpu_id, payload: &[u8])`. A safe
-benchmark-scale install path needs an explicit chunked upload/admission API that
-allocates the resident layout once and copies generated column chunks into
-known offsets without claiming normal SQL durability for benchmark artifacts.
+`missing_benchmark_only_relational_resident_cache_chunked_admission_api`. The
+execution layer now has `CudaDriverRuntime::retain_device_memory_chunks(...)`,
+which allocates one retained resident layout and copies generated header,
+int4-column, text-offset, and text-byte chunks into explicit device offsets
+without one contiguous host payload. A safe benchmark-scale install path still
+needs a benchmark-only `RelationalResidentCache` admission boundary that consumes
+those generated chunks without whole-tier `resident_rows` materialization and
+without claiming normal SQL durability for benchmark artifacts.
 
 ## Non-Goals For The First P8 Design
 
