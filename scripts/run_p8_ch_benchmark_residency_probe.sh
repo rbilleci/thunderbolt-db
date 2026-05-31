@@ -10,7 +10,7 @@ CONCURRENCY="${GPU_DB_CH_BENCH_CONCURRENCY:-1,10}"
 
 usage() {
   cat <<'USAGE'
-usage: scripts/run_p8_ch_benchmark_residency_probe.sh [--dry-run|--run-baseline|--run-25pct|--run-25pct-execute|--run-125pct|--pgsql-baseline-preflight|--pgsql-baseline-25pct-latency|--pgsql-baseline-125pct-latency|--pgsql-baseline-docker-up|--pgsql-baseline-docker-preflight|--pgsql-baseline-docker-down|--streaming-self-check|--chunked-install-self-check|--chunked-upload-self-check|--cleanup|--self-check]
+usage: scripts/run_p8_ch_benchmark_residency_probe.sh [--dry-run|--run-baseline|--run-25pct|--run-25pct-execute|--run-125pct|--pgsql-fairness-audit|--pgsql-baseline-preflight|--pgsql-baseline-25pct-latency|--pgsql-baseline-125pct-latency|--pgsql-baseline-docker-up|--pgsql-baseline-docker-preflight|--pgsql-baseline-docker-down|--streaming-self-check|--chunked-install-self-check|--chunked-upload-self-check|--cleanup|--self-check]
 
 Environment:
   GPU_DB_CH_BENCH_OUT_DIR       output directory, default target/p8-ch-benchmark-residency
@@ -25,6 +25,8 @@ Environment:
   GPU_DB_CH_BENCH_ACCEPT_SCALED_125PCT set to 1 to treat guarded scaled --run-125pct evidence as success
   GPU_DB_CH_BENCH_ALLOW_FULL_125PCT set to 1 to permit a future full 125pct attempt after readiness is safe
   GPU_DB_CH_BENCH_PGSQL_ROWS    PostgreSQL latency rows, default 1024 unless full guard is set
+  GPU_DB_CH_BENCH_PGSQL_AUDIT_ROWS    scaled fairness audit rows, default 2048
+  GPU_DB_CH_BENCH_PGSQL_AUDIT_REPEATS repeated warm timings per query/profile, default 3
   GPU_DB_CH_BENCH_ALLOW_FULL_PGSQL_25PCT  set to 1 to load/query all estimated 25pct PostgreSQL rows
   GPU_DB_CH_BENCH_PGSQL_URL     libpq connection string for PostgreSQL baseline
   GPU_DB_CH_BENCH_PGSQL_DOCKER_NAME      default gpu-db-p8-pgsql-baseline-disposable
@@ -613,6 +615,203 @@ REPORT
   return 1
 }
 
+write_pgsql_fairness_audit() {
+  mkdir -p "$OUT_DIR/pgsql-fairness-audit"
+  local audit_dir="$OUT_DIR/pgsql-fairness-audit"
+  local rows="${GPU_DB_CH_BENCH_PGSQL_AUDIT_ROWS:-2048}"
+  local repeats="${GPU_DB_CH_BENCH_PGSQL_AUDIT_REPEATS:-3}"
+  local report_path="$audit_dir/fairness-audit.md"
+  local metrics_path="$audit_dir/metrics.jsonl"
+  local settings_path="$audit_dir/postgresql-settings.tsv"
+  local host_path="$audit_dir/host-facts.txt"
+  local concurrency_path="$audit_dir/concurrency-curve-plan.csv"
+  local blocker="gpu_db_protocol_benchmark_path_required"
+  local status="blocked"
+  local lower_bound=$((rows / 4))
+  if [ "$lower_bound" -lt 1 ]; then
+    lower_bound=1
+  fi
+
+  : >"$metrics_path"
+  {
+    echo "date_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "uname=$(uname -a)"
+    command -v lscpu >/dev/null 2>&1 && lscpu || true
+    command -v free >/dev/null 2>&1 && free -h || true
+    command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi --query-gpu=name,memory.total,memory.free,driver_version --format=csv,noheader || true
+    command -v docker >/dev/null 2>&1 && docker version --format 'docker_client={{.Client.Version}} docker_server={{.Server.Version}}' 2>/dev/null || true
+  } >"$host_path"
+
+  cat >"$concurrency_path" <<CSV
+tier,profile,query,concurrency,status,blocker,metric_schema
+CSV
+  local profile query concurrency
+  for profile in "default_postgresql" "tuned_postgresql" "gpu_db_retained_resident_path"; do
+    for query in order_line_count_all order_line_sum_amount order_line_avg_quantity_between order_line_max_amount_filter; do
+      for concurrency in 1 2 4 8 16 32 64 128; do
+        printf '25pct,%s,%s,%s,blocked,%s,"wall_clock_throughput,p50_us,p95_us,p99_us,error_count,correctness_status,saturation_note"\n' \
+          "$profile" "$query" "$concurrency" "$blocker" >>"$concurrency_path"
+      done
+    done
+  done
+
+  if ! command -v psql >/dev/null 2>&1; then
+    cat >"$report_path" <<REPORT
+# P8 PostgreSQL Fairness Audit
+
+- rows: $rows
+- repeats: $repeats
+- status: blocked
+- blocker: missing_psql_client
+- host_facts: $host_path
+- concurrency_plan: $concurrency_path
+
+The fairness audit could not collect PostgreSQL evidence because the local
+\`psql\` client is missing.
+REPORT
+    cat "$report_path"
+    echo "p8_ch_benchmark_pgsql_fairness_audit=blocked reason=missing_psql_client" >&2
+    return 0
+  fi
+
+  pgsql_baseline_docker_up
+  local pgurl
+  pgurl="$(pgsql_docker_url)"
+  local docker_name docker_image
+  docker_name="$(pgsql_docker_name)"
+  docker_image="$(pgsql_docker_image)"
+
+  psql "$pgurl" -X -v ON_ERROR_STOP=1 -Atc "SELECT name || E'\t' || setting FROM pg_settings WHERE name IN ('shared_buffers','work_mem','maintenance_work_mem','effective_cache_size','max_parallel_workers_per_gather','jit','max_parallel_workers','max_worker_processes','max_parallel_maintenance_workers') ORDER BY name" >"$settings_path"
+
+  {
+    cat <<SQL
+\\set ON_ERROR_STOP on
+DROP TABLE IF EXISTS order_line;
+CREATE TABLE order_line (
+  ol_o_id INT,
+  ol_i_id INT,
+  ol_quantity INT,
+  ol_amount INT,
+  ol_dist_info TEXT
+);
+COPY order_line (ol_o_id, ol_i_id, ol_quantity, ol_amount, ol_dist_info) FROM STDIN WITH (FORMAT csv);
+SQL
+    write_pgsql_copy_stream "$rows"
+    cat <<SQL
+\\.
+ANALYZE order_line;
+SQL
+  } | psql "$pgurl" -X >"$audit_dir/load.out" 2>"$audit_dir/load.err"
+
+  run_pgsql_audit_profile "$pgurl" "$audit_dir" "$metrics_path" default_postgresql "$rows" "$repeats" "$lower_bound"
+  psql "$pgurl" -X -v ON_ERROR_STOP=1 >"$audit_dir/tuned-ddl.out" 2>"$audit_dir/tuned-ddl.err" <<SQL
+CREATE INDEX IF NOT EXISTS order_line_quantity_btree ON order_line (ol_quantity);
+CREATE INDEX IF NOT EXISTS order_line_amount_btree ON order_line (ol_amount);
+CREATE INDEX IF NOT EXISTS order_line_quantity_brin ON order_line USING brin (ol_quantity);
+CREATE INDEX IF NOT EXISTS order_line_amount_brin ON order_line USING brin (ol_amount);
+ANALYZE order_line;
+SQL
+  run_pgsql_audit_profile "$pgurl" "$audit_dir" "$metrics_path" tuned_postgresql "$rows" "$repeats" "$lower_bound"
+
+  cat >>"$metrics_path" <<JSON
+{"kind":"fairness_blocker","tier":"25pct","status":"blocked","blocker":"$blocker","reason":"GPU DB retained benchmark evidence currently uses Engine::new_local()/execute_relational_select rather than the same PostgreSQL-compatible client/protocol benchmark path used for PostgreSQL."}
+{"kind":"concurrency_blocker","tier":"25pct","status":"blocked","blocker":"identical_pg_client_harness_required","concurrency_targets":[1,2,4,8,16,32,64,128],"artifact":"$concurrency_path"}
+{"kind":"tier_blocker","tier":"125pct","status":"blocked","blocker":"missing_partitioned_over_resident_execution"}
+JSON
+
+  cat >"$report_path" <<REPORT
+# P8 PostgreSQL Fairness Audit
+
+- rows: $rows
+- repeats: $repeats
+- status: $status
+- blocker: $blocker
+- postgresql_profile_status: scaled_default_and_tuned_evidence_collected
+- docker_image: $docker_image
+- docker_name: $docker_name
+- psql_version: $(psql --version)
+- host_facts: $host_path
+- postgresql_settings: $settings_path
+- metrics_artifact: $metrics_path
+- concurrency_plan: $concurrency_path
+- default_plan_dir: $audit_dir/default_postgresql
+- tuned_plan_dir: $audit_dir/tuned_postgresql
+
+## Decision
+
+The audit command now records scaled default and tuned PostgreSQL evidence, but
+it does not admit a headline GPU DB-vs-PostgreSQL product comparison. The GPU DB
+retained 25% benchmark evidence still enters through the Rust example and direct
+engine calls rather than the same PostgreSQL-compatible benchmark client and
+protocol stack used for PostgreSQL. Until a GPU DB protocol benchmark target is
+available, retained GPU timings must be labeled \`engine_internal\`.
+
+## Tuned PostgreSQL Profile
+
+The scaled tuned comparator adds btree and BRIN indexes on \`ol_quantity\` and
+\`ol_amount\`, then runs the same aggregate query shapes with repeated
+\`EXPLAIN (ANALYZE, FORMAT JSON)\` samples. This is a smoke-sized audit, not a
+full 161,061,274-row tuned PostgreSQL admission run.
+
+## Concurrency Gate
+
+True concurrent-client curves are blocked on the same protocol-parity gap. The
+graph-ready plan enumerates targets \`1,2,4,8,16,32,64,128\` for
+\`default PostgreSQL\`, \`tuned PostgreSQL\`, and \`GPU DB retained resident
+path\`, with the required metric schema for wall-clock throughput, p50/p95/p99
+latency, errors, correctness, and saturation notes.
+
+## Required Follow-Up Command Shape
+
+\`\`\`bash
+# after a PostgreSQL-compatible GPU DB benchmark endpoint/target exists:
+scripts/run_p8_ch_benchmark_residency_probe.sh --pgsql-fairness-audit
+\`\`\`
+
+The full 25% tuned PostgreSQL audit remains a separate operator-approved
+long-run decision. The 125% tier remains blocked on
+\`missing_partitioned_over_resident_execution\`.
+REPORT
+  cat "$report_path"
+  echo "p8_ch_benchmark_pgsql_fairness_audit=blocked reason=$blocker artifact=$report_path"
+  return 0
+}
+
+run_pgsql_audit_profile() {
+  local pgurl="$1"
+  local audit_dir="$2"
+  local metrics_path="$3"
+  local profile="$4"
+  local rows="$5"
+  local repeats="$6"
+  local lower_bound="$7"
+  local profile_dir="$audit_dir/$profile"
+  mkdir -p "$profile_dir"
+
+  local queries=(
+    "order_line_count_all|SELECT COUNT(*) FROM order_line"
+    "order_line_sum_amount|SELECT SUM(ol_amount) FROM order_line"
+    "order_line_avg_quantity_between|SELECT AVG(ol_quantity) FROM order_line WHERE ol_quantity BETWEEN 10 AND 40"
+    "order_line_max_amount_filter|SELECT MAX(ol_amount) FROM order_line WHERE ol_amount >= $lower_bound"
+  )
+  local entry query_name sql repeat explain execution_ms latency_us
+  for entry in "${queries[@]}"; do
+    query_name="${entry%%|*}"
+    sql="${entry#*|}"
+    for repeat in $(seq 1 "$repeats"); do
+      explain="$profile_dir/${query_name}.repeat_${repeat}.explain.json"
+      psql "$pgurl" -X -v ON_ERROR_STOP=1 -Atc "EXPLAIN (ANALYZE, FORMAT JSON) $sql" >"$explain"
+      execution_ms=$(awk -F': ' '/"Execution Time"/ {gsub(/[, ]/, "", $2); print $2; exit}' "$explain")
+      if [ -z "$execution_ms" ]; then
+        execution_ms=0
+      fi
+      latency_us=$(awk -v ms="$execution_ms" 'BEGIN { printf "%.0f", ms * 1000 }')
+      printf '{"kind":"pgsql_fairness_sample","profile":"%s","query":"%s","rows":%s,"repeat":%s,"latency_us":%s,"explain_artifact":"%s"}\n' \
+        "$profile" "$query_name" "$rows" "$repeat" "$latency_us" "$explain" >>"$metrics_path"
+    done
+  done
+}
+
 write_25pct_preflight() {
   mkdir -p "$OUT_DIR"
   local retained_target_bytes=6442450944
@@ -922,7 +1121,8 @@ case "$mode" in
       echo "retired 50/100/200/400% VRAM benchmark tiers should not be configured" >&2
       exit 1
     fi
-    grep -q 'concurrency_targets: \[1, 10, 100, 1000, 10000\]' "$OUT_DIR/estimate.md"
+    grep -q 'logical_request_targets: \[1, 10, 100, 1000, 10000\]' "$OUT_DIR/estimate.md"
+    grep -q 'true_concurrency_targets: blocked_until_protocol_benchmark_harness' "$OUT_DIR/estimate.md"
     cat "$OUT_DIR/estimate.md"
     ;;
   --run-baseline)
@@ -960,6 +1160,9 @@ case "$mode" in
     ;;
   --pgsql-baseline-125pct-latency)
     write_pgsql_125pct_latency
+    ;;
+  --pgsql-fairness-audit)
+    write_pgsql_fairness_audit
     ;;
   --pgsql-baseline-docker-up)
     pgsql_baseline_docker_up
@@ -1045,6 +1248,10 @@ case "$mode" in
     else
       grep -Eq 'missing_pgsql_baseline_connection|missing_psql_client' "$tmp_dir/pgsql.err"
     fi
+    GPU_DB_CH_BENCH_OUT_DIR="$tmp_dir/out" GPU_DB_CH_BENCH_PGSQL_AUDIT_ROWS=16 GPU_DB_CH_BENCH_PGSQL_AUDIT_REPEATS=1 \
+      "$0" --pgsql-fairness-audit >"$tmp_dir/fairness.out"
+    grep -q 'gpu_db_protocol_benchmark_path_required' "$tmp_dir/out/pgsql-fairness-audit/fairness-audit.md"
+    grep -q 'concurrency_targets' "$tmp_dir/out/pgsql-fairness-audit/metrics.jsonl"
     GPU_DB_CH_BENCH_OUT_DIR="$tmp_dir/out" "$0" --cleanup >"$tmp_dir/cleanup.out"
     grep -q 'chunked_resident_cache_install_available: true' "$tmp_dir/streaming.out"
     grep -q 'benchmark_chunked_resident_cache_admission: pass' "$tmp_dir/chunked-install.out"

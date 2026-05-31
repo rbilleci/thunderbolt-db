@@ -118,7 +118,8 @@ fn write_estimate(args: &Args) -> Result<(), Box<dyn Error>> {
         )?;
     }
 
-    report.push_str("- concurrency_targets: [1, 10, 100, 1000, 10000]\n");
+    report.push_str("- logical_request_targets: [1, 10, 100, 1000, 10000]\n");
+    report.push_str("- true_concurrency_targets: blocked_until_protocol_benchmark_harness\n");
     report.push_str(
         "- cleanup_command: `scripts/run_p8_ch_benchmark_residency_probe.sh --cleanup`\n",
     );
