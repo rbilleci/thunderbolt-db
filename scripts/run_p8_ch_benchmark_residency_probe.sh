@@ -10,7 +10,7 @@ CONCURRENCY="${GPU_DB_CH_BENCH_CONCURRENCY:-1,10}"
 
 usage() {
   cat <<'USAGE'
-usage: scripts/run_p8_ch_benchmark_residency_probe.sh [--dry-run|--run-baseline|--run-25pct|--run-25pct-execute|--run-125pct|--pgsql-fairness-audit|--pgsql-baseline-preflight|--pgsql-baseline-25pct-latency|--pgsql-baseline-125pct-latency|--pgsql-baseline-docker-up|--pgsql-baseline-docker-preflight|--pgsql-baseline-docker-down|--streaming-self-check|--chunked-install-self-check|--chunked-upload-self-check|--cleanup|--self-check]
+usage: scripts/run_p8_ch_benchmark_residency_probe.sh [--dry-run|--run-baseline|--run-25pct|--run-25pct-execute|--run-125pct|--pgsql-fairness-audit|--gpu-db-protocol-benchmark-smoke|--pgsql-baseline-preflight|--pgsql-baseline-25pct-latency|--pgsql-baseline-125pct-latency|--pgsql-baseline-docker-up|--pgsql-baseline-docker-preflight|--pgsql-baseline-docker-down|--streaming-self-check|--chunked-install-self-check|--chunked-upload-self-check|--cleanup|--self-check]
 
 Environment:
   GPU_DB_CH_BENCH_OUT_DIR       output directory, default target/p8-ch-benchmark-residency
@@ -27,6 +27,8 @@ Environment:
   GPU_DB_CH_BENCH_PGSQL_ROWS    PostgreSQL latency rows, default 1024 unless full guard is set
   GPU_DB_CH_BENCH_PGSQL_AUDIT_ROWS    scaled fairness audit rows, default 2048
   GPU_DB_CH_BENCH_PGSQL_AUDIT_REPEATS repeated warm timings per query/profile, default 3
+  GPU_DB_CH_BENCH_GPU_DB_PROTOCOL_ROWS scaled GPU DB protocol smoke rows, default 64
+  GPU_DB_CH_BENCH_GPU_DB_PROTOCOL_PORT GPU DB protocol smoke listen port, default 55435
   GPU_DB_CH_BENCH_ALLOW_FULL_PGSQL_25PCT  set to 1 to load/query all estimated 25pct PostgreSQL rows
   GPU_DB_CH_BENCH_PGSQL_URL     libpq connection string for PostgreSQL baseline
   GPU_DB_CH_BENCH_PGSQL_DOCKER_NAME      default gpu-db-p8-pgsql-baseline-disposable
@@ -131,6 +133,10 @@ expected_amount_max_filter() {
   else
     echo "$max"
   fi
+}
+
+json_escape() {
+  sed 's/\\/\\\\/g; s/"/\\"/g' <<<"$1"
 }
 
 write_pgsql_copy_stream() {
@@ -812,6 +818,272 @@ run_pgsql_audit_profile() {
   done
 }
 
+gpu_db_protocol_query_metrics() {
+  local url="$1"
+  local metrics_path="$2"
+  local query_id="$3"
+  local route_classification="$4"
+  local expected="$5"
+  local sql="$6"
+  local tmp_prefix="$7"
+  local out_path="${tmp_prefix}-${query_id}.out"
+  local err_path="${tmp_prefix}-${query_id}.err"
+  local start_ns end_ns latency_us actual status error_count
+
+  start_ns=$(date +%s%N)
+  if psql "$url" -X -v ON_ERROR_STOP=1 -Atc "$sql" >"$out_path" 2>"$err_path"; then
+    status="pass"
+    error_count=0
+  else
+    status="error"
+    error_count=1
+  fi
+  end_ns=$(date +%s%N)
+  latency_us=$(((end_ns - start_ns) / 1000))
+  actual="$(tr '\n' '|' <"$out_path" | sed 's/|$//')"
+  if [ "$status" = "pass" ] && [ "$actual" != "$expected" ]; then
+    status="wrong_result"
+    error_count=1
+  fi
+  printf '{"kind":"gpu_db_protocol_smoke_metric","target":"gpu_db_protocol_endpoint","client_driver":"psql/libpq","query":"%s","concurrency":1,"p50_us":%s,"p95_us":%s,"p99_us":%s,"throughput_qps":%.6f,"error_count":%s,"correctness_status":"%s","route_classification":"%s","retained_gpu_route":false,"protocol_catalog_path":true,"expected":"%s","actual":"%s"}\n' \
+    "$query_id" \
+    "$latency_us" \
+    "$latency_us" \
+    "$latency_us" \
+    "$(awk -v us="$latency_us" 'BEGIN { if (us > 0) printf "%.6f", 1000000 / us; else printf "0.000000" }')" \
+    "$error_count" \
+    "$status" \
+    "$route_classification" \
+    "$(json_escape "$expected")" \
+    "$(json_escape "$actual")" >>"$metrics_path"
+}
+
+write_gpu_db_protocol_benchmark_smoke() {
+  mkdir -p "$OUT_DIR/gpu-db-protocol-benchmark-smoke"
+  local smoke_dir="$OUT_DIR/gpu-db-protocol-benchmark-smoke"
+  local rows="${GPU_DB_CH_BENCH_GPU_DB_PROTOCOL_ROWS:-64}"
+  local port="${GPU_DB_CH_BENCH_GPU_DB_PROTOCOL_PORT:-55435}"
+  local listen="127.0.0.1:$port"
+  local url="postgresql://postgres@127.0.0.1:$port/postgres?sslmode=disable"
+  local report_path="$smoke_dir/protocol-benchmark-smoke.md"
+  local metrics_path="$smoke_dir/metrics.jsonl"
+  local load_path="$smoke_dir/load.sql"
+  local server_log="$smoke_dir/gpu-db-server.log"
+  local startup_facts="$smoke_dir/startup-facts.txt"
+  local concurrency_path="$smoke_dir/concurrency-curve-plan.csv"
+  local blocker="protocol_endpoint_uses_protocol_catalog_not_p8_resident_engine"
+  : >"$metrics_path"
+
+  if ! command -v psql >/dev/null 2>&1; then
+    cat >"$report_path" <<REPORT
+# P8 GPU DB Protocol Benchmark Smoke
+
+- status: blocked
+- blocker: missing_psql_client
+
+The GPU DB protocol benchmark smoke requires the PostgreSQL \`psql\` client.
+REPORT
+    cat "$report_path"
+    return 0
+  fi
+
+  cargo build -q -p gpu_db_protocol --bin gpu-db-server
+  target/debug/gpu-db-server --listen "$listen" --shared-catalog >"$server_log" 2>&1 &
+  local server_pid=$!
+  trap 'kill "$server_pid" >/dev/null 2>&1 || true; wait "$server_pid" >/dev/null 2>&1 || true' RETURN
+
+  local ready=0
+  for _ in $(seq 1 120); do
+    if psql "$url" -X -v ON_ERROR_STOP=1 -Atc "SELECT 1 AS one" >/dev/null 2>&1; then
+      ready=1
+      break
+    fi
+    if ! kill -0 "$server_pid" 2>/dev/null; then
+      break
+    fi
+    sleep 0.25
+  done
+  if [ "$ready" -ne 1 ]; then
+    kill "$server_pid" >/dev/null 2>&1 || true
+    wait "$server_pid" >/dev/null 2>&1 || true
+    trap - RETURN
+    cat >"$report_path" <<REPORT
+# P8 GPU DB Protocol Benchmark Smoke
+
+- status: blocked
+- blocker: gpu_db_protocol_endpoint_startup_failed
+- command: \`target/debug/gpu-db-server --listen $listen --shared-catalog\`
+- log: $server_log
+REPORT
+    cat "$report_path"
+    return 0
+  fi
+
+  {
+    echo "date_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "command=target/debug/gpu-db-server --listen $listen --shared-catalog"
+    echo "host=127.0.0.1"
+    echo "port=$port"
+    echo "database=postgres"
+    echo "user=postgres"
+    echo "auth_profile=local-dev trust-style startup"
+    echo "tls_profile=sslmode=disable"
+    echo "client_driver=psql/libpq"
+    echo "psql_version=$(psql --version)"
+    echo "server_version=16.0"
+  } >"$startup_facts"
+
+  {
+    cat <<SQL
+\\set ON_ERROR_STOP on
+DROP TABLE IF EXISTS order_line;
+CREATE TABLE order_line (
+  ol_o_id INT,
+  ol_i_id INT,
+  ol_quantity INT,
+  ol_amount INT,
+  ol_dist_info TEXT
+);
+COPY order_line (ol_o_id, ol_i_id, ol_quantity, ol_amount, ol_dist_info) FROM STDIN WITH (FORMAT csv);
+SQL
+    write_pgsql_copy_stream "$rows"
+    cat <<SQL
+\\.
+SQL
+  } >"$load_path"
+  psql "$url" -X -f "$load_path" >"$smoke_dir/load.out" 2>"$smoke_dir/load.err"
+
+  local lower_bound
+  lower_bound=$((rows / 4))
+  if [ "$lower_bound" -lt 1 ]; then
+    lower_bound=1
+  fi
+  local expected_count expected_sum expected_avg expected_max lookup_key lookup_item lookup_qty lookup_amount lookup_dist composite_key composite_item composite_qty composite_amount composite_dist
+  expected_count="$rows"
+  expected_sum="$(expected_amount_sum "$rows")"
+  expected_avg="$(expected_quantity_between_avg "$rows")"
+  expected_max="$(expected_amount_max_filter "$rows" "$lower_bound")"
+  lookup_key=$(((rows + 1) / 2))
+  lookup_item=$(((lookup_key % 100000) + 1))
+  lookup_qty=$(((lookup_key % 50) + 1))
+  lookup_amount=$(((lookup_key * 17) % 100000))
+  lookup_dist="$(order_line_dist_info_shell "$lookup_key")"
+  composite_key="$lookup_key"
+  composite_item="$lookup_item"
+  composite_qty="$lookup_qty"
+  composite_amount="$lookup_amount"
+  composite_dist="$lookup_dist"
+
+  local route_classification="protocol_shared_catalog_cpu_scan"
+  local tmp_prefix="$smoke_dir/query"
+  gpu_db_protocol_query_metrics "$url" "$metrics_path" order_line_count_all "$route_classification" "$expected_count" "SELECT COUNT(*) FROM order_line" "$tmp_prefix"
+  gpu_db_protocol_query_metrics "$url" "$metrics_path" order_line_sum_amount "$route_classification" "$expected_sum" "SELECT SUM(ol_amount) FROM order_line" "$tmp_prefix"
+  gpu_db_protocol_query_metrics "$url" "$metrics_path" order_line_avg_quantity_between "$route_classification" "$expected_avg" "SELECT AVG(ol_quantity) FROM order_line WHERE ol_quantity BETWEEN 10 AND 40" "$tmp_prefix"
+  gpu_db_protocol_query_metrics "$url" "$metrics_path" order_line_max_amount_filter "$route_classification" "$expected_max" "SELECT MAX(ol_amount) FROM order_line WHERE ol_amount >= $lower_bound" "$tmp_prefix"
+  gpu_db_protocol_query_metrics "$url" "$metrics_path" order_line_lookup_ol_o_id "$route_classification" "${lookup_key}|${lookup_item}|${lookup_qty}|${lookup_amount}" "SELECT ol_o_id, ol_i_id, ol_quantity, ol_amount FROM order_line WHERE ol_o_id = $lookup_key" "$tmp_prefix"
+  gpu_db_protocol_query_metrics "$url" "$metrics_path" order_line_lookup_composite "$route_classification" "${composite_key}|${composite_item}|${composite_qty}|${composite_amount}|${composite_dist}" "SELECT ol_o_id, ol_i_id, ol_quantity, ol_amount, ol_dist_info FROM order_line WHERE ol_o_id = $composite_key AND ol_i_id = $composite_item" "$tmp_prefix"
+
+  cat >"$concurrency_path" <<CSV
+tier,target,client_driver,query,concurrency,status,blocker,route_classification,metric_schema
+25pct,gpu_db_protocol_endpoint,psql/libpq,order_line_count_all,1,scaled_smoke,$blocker,protocol_shared_catalog_cpu_scan,"wall_clock_throughput,p50_us,p95_us,p99_us,error_count,correctness_status,saturation_note"
+25pct,gpu_db_protocol_endpoint,psql/libpq,order_line_sum_amount,1,scaled_smoke,$blocker,protocol_shared_catalog_cpu_scan,"wall_clock_throughput,p50_us,p95_us,p99_us,error_count,correctness_status,saturation_note"
+25pct,gpu_db_protocol_endpoint,psql/libpq,order_line_avg_quantity_between,1,scaled_smoke,$blocker,protocol_shared_catalog_cpu_scan,"wall_clock_throughput,p50_us,p95_us,p99_us,error_count,correctness_status,saturation_note"
+25pct,gpu_db_protocol_endpoint,psql/libpq,order_line_max_amount_filter,1,scaled_smoke,$blocker,protocol_shared_catalog_cpu_scan,"wall_clock_throughput,p50_us,p95_us,p99_us,error_count,correctness_status,saturation_note"
+25pct,gpu_db_protocol_endpoint,psql/libpq,order_line_lookup_ol_o_id,1,scaled_smoke,$blocker,protocol_shared_catalog_cpu_scan,"wall_clock_throughput,p50_us,p95_us,p99_us,error_count,correctness_status,saturation_note"
+25pct,gpu_db_protocol_endpoint,psql/libpq,order_line_lookup_composite,1,scaled_smoke,$blocker,protocol_shared_catalog_cpu_scan,"wall_clock_throughput,p50_us,p95_us,p99_us,error_count,correctness_status,saturation_note"
+CSV
+  local query concurrency
+  for query in order_line_count_all order_line_sum_amount order_line_avg_quantity_between order_line_max_amount_filter order_line_lookup_ol_o_id order_line_lookup_composite; do
+    for concurrency in 2 4 8 16 32 64 128; do
+      printf '25pct,gpu_db_protocol_endpoint,psql/libpq,%s,%s,blocked,true_concurrency_pg_client_runner_required,protocol_shared_catalog_cpu_scan,"wall_clock_throughput,p50_us,p95_us,p99_us,error_count,correctness_status,saturation_note"\n' \
+        "$query" "$concurrency" >>"$concurrency_path"
+    done
+  done
+  cat >>"$metrics_path" <<JSON
+{"kind":"gpu_db_protocol_benchmark_blocker","tier":"25pct","status":"blocked","blocker":"$blocker","secondary_blocker":"gpu_db_protocol_seed_to_resident_cache_required","client_driver":"psql/libpq","endpoint_seed_path":"CREATE TABLE plus COPY FROM STDIN","retained_gpu_route":false,"reason":"gpu-db-server owns protocol-visible SharedCatalog/Table rows and does not expose a warm/admit path into Engine RelationalResidentCache for P8 retained-resident execution."}
+{"kind":"gpu_db_protocol_concurrency_blocker","tier":"25pct","status":"blocked","blocker":"true_concurrency_pg_client_runner_required","available_scaled_concurrency":[1],"required_concurrency":[1,2,4,8,16,32,64,128],"artifact":"$concurrency_path"}
+JSON
+
+  cat >"$report_path" <<REPORT
+# P8 GPU DB Protocol Benchmark Smoke
+
+- rows: $rows
+- status: blocked
+- blocker: $blocker
+- secondary_blocker: gpu_db_protocol_seed_to_resident_cache_required
+- concurrency_blocker: true_concurrency_pg_client_runner_required
+- startup_facts: $startup_facts
+- metrics_artifact: $metrics_path
+- concurrency_plan: $concurrency_path
+- server_log: $server_log
+
+## Result
+
+The GPU DB PostgreSQL-compatible endpoint can be started and driven through the
+same PostgreSQL client family used by the PostgreSQL comparator
+(\`psql\`/libpq). This smoke seeds \`order_line\` through protocol-visible
+\`CREATE TABLE\` plus \`COPY FROM STDIN\`, then runs the current aggregate
+shapes and two key-equality lookup shapes through the protocol endpoint.
+
+This does not close the P8 headline benchmark gap. Code inspection shows
+\`crates/protocol/src/bin/gpu-db-server.rs\` stores protocol-visible rows in
+\`Session\` / \`SharedCatalog\` tables and answers \`SELECT\` through
+\`execute_select_result(...)\`. The checked P8 retained benchmark path still
+uses \`Engine::new_local()\`, benchmark-only resident chunk admission, and
+\`execute_relational_select(...)\` in
+\`crates/engine/examples/p8_ch_benchmark_residency_probe.rs\`. There is no
+checked protocol-visible warm/admit path that moves \`COPY\`-loaded
+\`order_line\` rows into the retained \`RelationalResidentCache\` route.
+
+## Endpoint Facts
+
+- command: \`target/debug/gpu-db-server --listen $listen --shared-catalog\`
+- host_port: $listen
+- database: postgres
+- user: postgres
+- auth_tls_profile: local-dev trust-style startup, sslmode=disable
+- server_version_string: captured in $startup_facts
+- cleanup: server process killed by the smoke trap after report generation
+
+## Route Classification
+
+- aggregate queries: protocol_shared_catalog_cpu_scan
+- key-equality lookup queries: protocol_shared_catalog_cpu_scan
+- index_metadata_lookup: false
+- retained_gpu_route: false
+- protocol_catalog_scan: true
+
+## Lookup Coverage
+
+- single-key lookup: \`SELECT ol_o_id, ol_i_id, ol_quantity, ol_amount FROM order_line WHERE ol_o_id = \$1\` represented with a scaled literal value through \`psql\`
+- composite lookup: \`SELECT ol_o_id, ol_i_id, ol_quantity, ol_amount, ol_dist_info FROM order_line WHERE ol_o_id = \$1 AND ol_i_id = \$2\` represented with scaled literal values through \`psql\`
+
+## Decision
+
+The next unblock trigger is an integration/design slice that lets the
+PostgreSQL-compatible endpoint either use the P8 \`Engine\` retained-residency
+machinery directly or admit protocol-visible table state into the retained
+resident cache before benchmarking. Until then, GPU DB product latency and
+concurrency claims must remain blocked by
+\`protocol_endpoint_uses_protocol_catalog_not_p8_resident_engine\`.
+REPORT
+  kill "$server_pid" >/dev/null 2>&1 || true
+  wait "$server_pid" >/dev/null 2>&1 || true
+  trap - RETURN
+  cat "$report_path"
+  echo "p8_ch_benchmark_gpu_db_protocol_smoke=blocked reason=$blocker artifact=$report_path"
+}
+
+order_line_dist_info_shell() {
+  local id="$1"
+  local bucket=$((id % 10))
+  if ((id % 2 == 0)); then
+    printf 'alpha%s\n' "$bucket"
+  else
+    printf 'omega%s\n' "$bucket"
+  fi
+}
+
 write_25pct_preflight() {
   mkdir -p "$OUT_DIR"
   local retained_target_bytes=6442450944
@@ -1164,6 +1436,9 @@ case "$mode" in
   --pgsql-fairness-audit)
     write_pgsql_fairness_audit
     ;;
+  --gpu-db-protocol-benchmark-smoke)
+    write_gpu_db_protocol_benchmark_smoke
+    ;;
   --pgsql-baseline-docker-up)
     pgsql_baseline_docker_up
     ;;
@@ -1252,6 +1527,10 @@ case "$mode" in
       "$0" --pgsql-fairness-audit >"$tmp_dir/fairness.out"
     grep -q 'gpu_db_protocol_benchmark_path_required' "$tmp_dir/out/pgsql-fairness-audit/fairness-audit.md"
     grep -q 'concurrency_targets' "$tmp_dir/out/pgsql-fairness-audit/metrics.jsonl"
+    GPU_DB_CH_BENCH_OUT_DIR="$tmp_dir/out" GPU_DB_CH_BENCH_GPU_DB_PROTOCOL_ROWS=16 GPU_DB_CH_BENCH_GPU_DB_PROTOCOL_PORT=55436 \
+      "$0" --gpu-db-protocol-benchmark-smoke >"$tmp_dir/gpu-db-protocol.out"
+    grep -q 'protocol_endpoint_uses_protocol_catalog_not_p8_resident_engine' "$tmp_dir/out/gpu-db-protocol-benchmark-smoke/protocol-benchmark-smoke.md"
+    grep -q '"query":"order_line_lookup_ol_o_id"' "$tmp_dir/out/gpu-db-protocol-benchmark-smoke/metrics.jsonl"
     GPU_DB_CH_BENCH_OUT_DIR="$tmp_dir/out" "$0" --cleanup >"$tmp_dir/cleanup.out"
     grep -q 'chunked_resident_cache_install_available: true' "$tmp_dir/streaming.out"
     grep -q 'benchmark_chunked_resident_cache_admission: pass' "$tmp_dir/chunked-install.out"
