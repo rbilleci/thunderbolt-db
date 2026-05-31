@@ -395,6 +395,13 @@ write_25pct_execution() {
     blocker=full_25pct_requires_operator_long_run_after_streaming_boundary
   fi
 
+  local completion_note
+  if [ "$status" = completed ]; then
+    completion_note="With the full-tier guard enabled, this run executed the complete estimated 25% / 6 GiB GPU DB resident tier. A separate full-row PostgreSQL latency runner is still required before publishing speedup/regression ratios for the same row count."
+  else
+    completion_note="When not explicitly opted into the full 25% tier, this command stops after the guarded scaled execution. The resident upload/admission boundary now streams owned chunks through the engine/runtime path instead of retaining a full caller-owned chunk vector or text layout. The remaining full-tier blocker is run-window/capacity: attempting 161,061,274 rows in an unattended worker slice should be an explicit operator-approved long run. The exact full command is:"
+  fi
+
   cat >"$OUT_DIR/25pct-execution.md" <<REPORT
 # P8 CH-benCHmark 25% Chunked Execution
 
@@ -414,15 +421,10 @@ write_25pct_execution() {
 The checked execution path creates an empty \`order_line\` catalog table,
 installs generated benchmark-only resident chunks without SQL-visible MVCC
 inserts, executes the supported aggregate query set, validates deterministic
-formula-backed answers, records p95/p99/throughput/CUDA/H2D/D2H/zero-H2D route
+formula-backed answers, records p50/p95/p99/throughput/CUDA/H2D/D2H/zero-H2D route
 metrics, and verifies memory-pressure fallback behavior.
 
-When not explicitly opted into the full 25% tier, this command stops after the
-guarded scaled execution. The resident upload/admission boundary now streams
-owned chunks through the engine/runtime path instead of retaining a full
-caller-owned chunk vector or text layout. The remaining full-tier blocker is
-run-window/capacity: attempting 161,061,274 rows in an unattended worker slice
-should be an explicit operator-approved long run. The exact full command is:
+$completion_note
 
 \`\`\`bash
 $full_command

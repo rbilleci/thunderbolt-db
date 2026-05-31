@@ -55,6 +55,7 @@ struct QueryMetrics {
     query: String,
     logical_requests: usize,
     result_rows: usize,
+    p50_us: u128,
     p95_us: u128,
     p99_us: u128,
     throughput_qps: f64,
@@ -273,7 +274,7 @@ fn run_chunked_install_self_check(args: &Args) -> Result<(), Box<dyn Error>> {
     )?)?;
     assert_single_int(
         &max_amount,
-        expected_amount_max_filter(args.rows, 16),
+        expected_amount_max_filter(args.rows, 16).expect("self-check max filter has rows"),
         "max_amount_filter",
     )?;
     let route = engine.plan_relational_resident_route(&select("SELECT COUNT(*) FROM order_line")?);
@@ -508,10 +509,11 @@ fn run_chunked_execution(args: &Args) -> Result<(), Box<dyn Error>> {
             )?;
             writeln!(
                 raw,
-                "{{\"kind\":\"chunked_metric\",\"query\":\"{}\",\"logical_requests\":{},\"result_rows\":{},\"p95_us\":{},\"p99_us\":{},\"throughput_qps\":{:.3},\"h2d_bytes_total\":{},\"d2h_bytes_total\":{},\"kernel_samples\":{},\"kernel_ms\":{},\"cuda_event_samples\":{},\"cuda_event_elapsed_us\":{},\"resident_route_accepted\":{},\"resident_route_zero_h2d\":{},\"resident_bytes\":{},\"correctness_validated\":{},\"expected_source\":\"formula\"}}",
+                "{{\"kind\":\"chunked_metric\",\"query\":\"{}\",\"logical_requests\":{},\"result_rows\":{},\"p50_us\":{},\"p95_us\":{},\"p99_us\":{},\"throughput_qps\":{:.3},\"h2d_bytes_total\":{},\"d2h_bytes_total\":{},\"kernel_samples\":{},\"kernel_ms\":{},\"cuda_event_samples\":{},\"cuda_event_elapsed_us\":{},\"resident_route_accepted\":{},\"resident_route_zero_h2d\":{},\"resident_bytes\":{},\"correctness_validated\":{},\"expected_source\":\"formula\"}}",
                 metrics.query,
                 metrics.logical_requests,
                 metrics.result_rows,
+                metrics.p50_us,
                 metrics.p95_us,
                 metrics.p99_us,
                 metrics.throughput_qps,
@@ -527,8 +529,9 @@ fn run_chunked_execution(args: &Args) -> Result<(), Box<dyn Error>> {
                 metrics.correctness_validated
             )?;
             markdown.push_str(&format!(
-                "- {}: pass p95_us={} p99_us={} throughput_qps={:.2} h2d_bytes_total={} d2h_bytes_total={} cuda_event_samples={} resident_zero_h2d={} expected_source=formula\n",
+                "- {}: pass p50_us={} p95_us={} p99_us={} throughput_qps={:.2} h2d_bytes_total={} d2h_bytes_total={} cuda_event_samples={} resident_zero_h2d={} expected_source=formula\n",
                 metrics.query,
+                metrics.p50_us,
                 metrics.p95_us,
                 metrics.p99_us,
                 metrics.throughput_qps,
@@ -880,13 +883,12 @@ fn fixed_scale_average(sum: i128, count: usize) -> String {
     format!("{}{whole}.{fractional}", if negative { "-" } else { "" })
 }
 
-fn expected_amount_max_filter(rows: usize, lower: i32) -> i64 {
+fn expected_amount_max_filter(rows: usize, lower: i32) -> Option<i64> {
     let scan_rows = rows.min(100_000);
     (1..=scan_rows)
         .map(|id| ((id * 17) % 100_000) as i64)
         .filter(|value| *value >= i64::from(lower))
         .max()
-        .unwrap_or(0)
 }
 
 fn order_line_dist_info(id: usize) -> String {
@@ -1043,6 +1045,7 @@ fn run_query_case(
         query: case.name.to_string(),
         logical_requests,
         result_rows,
+        p50_us: percentile(&latencies, 50),
         p95_us: percentile(&latencies, 95),
         p99_us: percentile(&latencies, 99),
         throughput_qps: qps(logical_requests, elapsed),
@@ -1168,7 +1171,9 @@ fn expected_result_for_case(
         }
         "order_line_max_amount_filter" => {
             let lower = (rows / 4).max(1) as i32;
-            gpu_db_protocol::SqlValue::Int4(expected_amount_max_filter(rows, lower) as i32)
+            expected_amount_max_filter(rows, lower)
+                .map(|value| gpu_db_protocol::SqlValue::Int4(value as i32))
+                .unwrap_or_else(|| gpu_db_protocol::SqlValue::Text(String::new()))
         }
         other => return Err(format!("no formula-backed expected result for {other}").into()),
     };
