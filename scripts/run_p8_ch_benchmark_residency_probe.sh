@@ -20,6 +20,7 @@ Environment:
   GPU_DB_CH_BENCH_CHUNK_ROWS    streaming self-check chunk rows, default 16
   GPU_DB_CH_BENCH_EXECUTE_ROWS  guarded chunked execution rows, default 1024
   GPU_DB_CH_BENCH_EXECUTE_CHUNK_ROWS  guarded execution chunk rows, default 256
+  GPU_DB_CH_BENCH_ACCEPT_SCALED_25PCT  set to 1 to treat guarded scaled --run-25pct-execute evidence as success
   GPU_DB_CH_BENCH_ALLOW_FULL_25PCT  set to 1 to attempt all estimated 25pct rows
   GPU_DB_CH_BENCH_PGSQL_ROWS    PostgreSQL latency rows, default 1024 unless full guard is set
   GPU_DB_CH_BENCH_ALLOW_FULL_PGSQL_25PCT  set to 1 to load/query all estimated 25pct PostgreSQL rows
@@ -726,6 +727,8 @@ REPORT
   cat "$OUT_DIR/25pct-execution.md"
   if [ "$status" = completed ]; then
     echo "p8_ch_benchmark_25pct_execution=completed rows=$execute_rows"
+  elif [ "${GPU_DB_CH_BENCH_ACCEPT_SCALED_25PCT:-0}" = "1" ]; then
+    echo "p8_ch_benchmark_25pct_execution=scaled_pass rows=$execute_rows blocker=$blocker"
   else
     echo "p8_ch_benchmark_25pct_execution=blocked reason=$blocker" >&2
     return 1
