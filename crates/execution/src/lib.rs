@@ -2071,6 +2071,7 @@ fn launch_cuda_resident_i32_between_stats(
     type CuMemAlloc = unsafe extern "C" fn(*mut u64, usize) -> i32;
     type CuMemFree = unsafe extern "C" fn(u64) -> i32;
     type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+    type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
     type CuModuleLoadData = unsafe extern "C" fn(*mut *mut c_void, *const c_void) -> i32;
     type CuModuleUnload = unsafe extern "C" fn(*mut c_void) -> i32;
     type CuModuleGetFunction =
@@ -2108,17 +2109,30 @@ fn launch_cuda_resident_i32_between_stats(
     .reg .pred %p_ge_lower;
     .reg .pred %p_le_upper;
     .reg .pred %p_match;
-    .reg .pred %p_first;
-    .reg .pred %p_less;
-    .reg .pred %p_greater;
     .reg .u64 %resident;
     .reg .u64 %offset;
     .reg .u64 %rows;
     .reg .u64 %out;
     .reg .u64 %base;
     .reg .u64 %idx;
+    .reg .u64 %stride;
     .reg .u64 %addr;
+    .reg .u64 %count_addr;
+    .reg .u64 %sum_addr;
+    .reg .u64 %min_addr;
+    .reg .u64 %max_addr;
+    .reg .u32 %block;
+    .reg .u32 %block_dim;
+    .reg .u32 %thread;
+    .reg .u32 %grid_dim;
+    .reg .u64 %wide_block;
+    .reg .u64 %wide_thread;
+    .reg .u64 %wide_block_dim;
+    .reg .u64 %wide_grid_dim;
     .reg .u64 %count;
+    .reg .u64 %sum_bits;
+    .reg .u64 %ignored64;
+    .reg .s32 %ignored32;
     .reg .s64 %sum;
     .reg .s64 %wide;
     .reg .s32 %value;
@@ -2135,11 +2149,21 @@ fn launch_cuda_resident_i32_between_stats(
     ld.param.u64 %out, [out_ptr];
 
     add.u64 %base, %resident, %offset;
-    mov.u64 %idx, 0;
+    mov.u32 %block, %ctaid.x;
+    mov.u32 %block_dim, %ntid.x;
+    mov.u32 %thread, %tid.x;
+    mov.u32 %grid_dim, %nctaid.x;
+    cvt.u64.u32 %wide_block, %block;
+    cvt.u64.u32 %wide_thread, %thread;
+    cvt.u64.u32 %wide_block_dim, %block_dim;
+    cvt.u64.u32 %wide_grid_dim, %grid_dim;
+    mul.lo.u64 %idx, %wide_block, %wide_block_dim;
+    add.u64 %idx, %idx, %wide_thread;
+    mul.lo.u64 %stride, %wide_grid_dim, %wide_block_dim;
     mov.u64 %count, 0;
     mov.s64 %sum, 0;
-    mov.s32 %min, 0;
-    mov.s32 %max, 0;
+    mov.s32 %min, 2147483647;
+    mov.s32 %max, -2147483648;
 
 loop:
     setp.ge.u64 %p_done, %idx, %rows;
@@ -2152,39 +2176,30 @@ loop:
     and.pred %p_match, %p_ge_lower, %p_le_upper;
     @!%p_match bra next;
 
-    setp.eq.u64 %p_first, %count, 0;
-    @!%p_first bra update_minmax;
-    mov.s32 %min, %value;
-    mov.s32 %max, %value;
-    bra add_value;
-
-update_minmax:
-    setp.lt.s32 %p_less, %value, %min;
-    @!%p_less bra keep_min;
-    mov.s32 %min, %value;
-keep_min:
-    setp.gt.s32 %p_greater, %value, %max;
-    @!%p_greater bra keep_max;
-    mov.s32 %max, %value;
-keep_max:
-
-add_value:
     cvt.s64.s32 %wide, %value;
     add.s64 %sum, %sum, %wide;
     add.u64 %count, %count, 1;
+    min.s32 %min, %min, %value;
+    max.s32 %max, %max, %value;
 
 next:
-    add.u64 %idx, %idx, 1;
+    add.u64 %idx, %idx, %stride;
     bra loop;
 
 done:
-    st.global.u64 [%out], %count;
-    add.u64 %addr, %out, 8;
-    st.global.s64 [%addr], %sum;
-    add.u64 %addr, %out, 16;
-    st.global.s32 [%addr], %min;
-    add.u64 %addr, %out, 20;
-    st.global.s32 [%addr], %max;
+    setp.eq.u64 %p_done, %count, 0;
+    @%p_done bra ret_done;
+    mov.u64 %count_addr, %out;
+    atom.global.add.u64 %ignored64, [%count_addr], %count;
+    add.u64 %sum_addr, %out, 8;
+    cvt.u64.s64 %sum_bits, %sum;
+    atom.global.add.u64 %ignored64, [%sum_addr], %sum_bits;
+    add.u64 %min_addr, %out, 16;
+    atom.global.min.s32 %ignored32, [%min_addr], %min;
+    add.u64 %max_addr, %out, 20;
+    atom.global.max.s32 %ignored32, [%max_addr], %max;
+
+ret_done:
     ret;
 }
 "#;
@@ -2216,6 +2231,13 @@ done:
             ._lib
             .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
             .or_else(|_| resident._lib.get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_memcpy_htod = unsafe {
+        resident
+            ._lib
+            .get::<CuMemcpyHtoD>(b"cuMemcpyHtoD_v2\0")
+            .or_else(|_| resident._lib.get::<CuMemcpyHtoD>(b"cuMemcpyHtoD\0"))
             .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
     };
     let cu_module_load_data = unsafe {
@@ -2257,6 +2279,19 @@ done:
         ptr: device_output,
         free: *cu_mem_free,
     };
+    let initial = CudaI32StatsRaw {
+        count: 0,
+        sum: 0,
+        min: i32::MAX,
+        max: i32::MIN,
+    };
+    check_cuda(unsafe {
+        cu_memcpy_htod(
+            output_guard.ptr,
+            (&initial as *const CudaI32StatsRaw).cast::<c_void>(),
+            std::mem::size_of::<CudaI32StatsRaw>(),
+        )
+    })?;
 
     let mut ptx = Vec::with_capacity(PTX.len() + 1);
     ptx.extend_from_slice(PTX);
@@ -2292,13 +2327,19 @@ done:
         (&mut upper_arg as *mut i32).cast::<c_void>(),
         (&mut output_arg as *mut u64).cast::<c_void>(),
     ];
+    let block_dim = 256_u32;
+    let grid_dim = if row_count == 0 {
+        1
+    } else {
+        row_count.div_ceil(u64::from(block_dim)).min(1024) as u32
+    };
     launch_with_optional_cuda_event_timing(resident, *cu_ctx_synchronize, || unsafe {
         cu_launch_kernel(
             function,
+            grid_dim,
             1,
             1,
-            1,
-            1,
+            block_dim,
             1,
             1,
             0,
