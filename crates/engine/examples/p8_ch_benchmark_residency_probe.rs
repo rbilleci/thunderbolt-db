@@ -15,9 +15,7 @@ use gpu_db_protocol::{parse_command, Command, Select};
 const VRAM_BYTES: u64 = 24 * 1024 * 1024 * 1024;
 const TARGET_TIERS: &[(&str, u64)] = &[
     ("25pct", 6 * 1024 * 1024 * 1024),
-    ("50pct", 12 * 1024 * 1024 * 1024),
-    ("100pct", 24 * 1024 * 1024 * 1024),
-    ("200pct", 48 * 1024 * 1024 * 1024),
+    ("125pct", 30 * 1024 * 1024 * 1024),
 ];
 const CONCURRENCY_TARGETS: &[usize] = &[1, 10, 100, 1000, 10_000];
 const RETAINED_BYTES_PER_ORDER_LINE_ROW: u64 = 40;
@@ -964,7 +962,7 @@ fn run_probe(args: &Args) -> Result<(), Box<dyn Error>> {
     markdown.push_str(&format!("- row_count: {}\n", args.rows));
     markdown.push_str("- resident_table: order_line\n");
     markdown.push_str(&format!("- resident_bytes: {}\n", snapshot.resident_bytes));
-    markdown.push_str("- configured_production_tiers: 25pct/50pct/100pct/200pct of 24GiB VRAM\n");
+    markdown.push_str("- configured_production_tiers: 25pct/125pct of 24GiB VRAM\n");
     markdown.push_str("- attempted_tier: calibration\n");
     markdown.push_str(
         "- cleanup_command: `scripts/run_p8_ch_benchmark_residency_probe.sh --cleanup`\n\n",
@@ -1035,7 +1033,7 @@ fn run_probe(args: &Args) -> Result<(), Box<dyn Error>> {
         pressured.cache_state
     ));
     markdown.push_str("\n## decision\n");
-    markdown.push_str("The scheduled-worker baseline is a calibration tier because the 25% VRAM target estimates hundreds of millions of retained rows and is not defensible for one short cron slice. The harness preserves the 25/50/100/200% tier plan and shows the next bottleneck is a streaming/on-disk workload generator plus a longer operator-approved run window before attempting the 6GiB retained tier.\n");
+    markdown.push_str("The scheduled-worker baseline is a calibration tier because the 25% VRAM target estimates hundreds of millions of retained rows and is not defensible for one short cron slice. The harness preserves the simplified 25/125% tier plan: 25% is the under-resident trust gate, and 125% is the over-resident memory-pressure/fallback gate.\n");
 
     fs::write(args.output_dir.join("baseline.md"), markdown)?;
     Ok(())
