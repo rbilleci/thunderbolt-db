@@ -7113,6 +7113,9 @@ fn resident_route_d2h_bytes_estimate(
     const COUNT_RESULT_BYTES: u64 = std::mem::size_of::<u64>() as u64;
     const I32_RESULT_BYTES: u64 = std::mem::size_of::<i32>() as u64;
     const RESULT_LEN_BYTES: u64 = std::mem::size_of::<u64>() as u64;
+    const SCALAR_STATS_BYTES: u64 = (std::mem::size_of::<u64>()
+        + std::mem::size_of::<i64>()
+        + (2 * std::mem::size_of::<i32>())) as u64;
     const GROUPED_STATS_BYTES: u64 = (std::mem::size_of::<i32>()
         + std::mem::size_of::<u64>()
         + std::mem::size_of::<i64>()
@@ -7141,9 +7144,10 @@ fn resident_route_d2h_bytes_estimate(
         "int4_distinct_projection" | "int4_filtered_distinct_projection" => {
             resident_row_bytes(I32_RESULT_BYTES)
         }
-        "int4_scalar_aggregate"
-        | "int4_filtered_scalar_aggregate"
-        | "int4_between_scalar_aggregate" => GROUPED_STATS_BYTES.saturating_add(RESULT_LEN_BYTES),
+        "int4_scalar_aggregate" | "int4_filtered_scalar_aggregate" => {
+            GROUPED_STATS_BYTES.saturating_add(RESULT_LEN_BYTES)
+        }
+        "int4_between_scalar_aggregate" => SCALAR_STATS_BYTES.saturating_add(RESULT_LEN_BYTES),
         "count_all" | "int4_equality_count" | "int4_range_count" | "int4_filter_group_count" => {
             COUNT_RESULT_BYTES
         }
@@ -15545,7 +15549,7 @@ impl Engine {
             ))
         })?;
         let started = Instant::now();
-        let (stats, readback_count) = device_memory
+        let stats = device_memory
             .stats_i32_between_from_payload(byte_offset, row_count, lower, upper)
             .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
         let elapsed = started.elapsed();
@@ -15573,10 +15577,10 @@ impl Engine {
         let result_d2h_bytes = if lower > upper {
             0
         } else {
-            readback_count
-                .checked_mul(std::mem::size_of::<i32>() as u64)
-                .and_then(|bytes| bytes.checked_add(std::mem::size_of::<u64>() as u64))
-                .unwrap_or(u64::MAX)
+            (std::mem::size_of::<u64>()
+                + std::mem::size_of::<i64>()
+                + (2 * std::mem::size_of::<i32>())
+                + std::mem::size_of::<u64>()) as u64
         };
         self.metrics.observe_d2h_bytes(result_d2h_bytes);
         if lower <= upper {
@@ -23330,7 +23334,10 @@ mod tests {
             } else {
                 assert_eq!(
                     after.d2h_bytes_total - before.d2h_bytes_total,
-                    4 * std::mem::size_of::<i32>() as u64 + std::mem::size_of::<u64>() as u64,
+                    (std::mem::size_of::<u64>()
+                        + std::mem::size_of::<i64>()
+                        + (2 * std::mem::size_of::<i32>())
+                        + std::mem::size_of::<u64>()) as u64,
                     "{sql}"
                 );
                 assert_eq!(
@@ -23702,11 +23709,15 @@ mod tests {
                     .relational_residency_snapshot("events")
                     .unwrap()
                     .resident_bytes,
-                "int4_scalar_aggregate"
-                | "int4_filtered_scalar_aggregate"
-                | "int4_between_scalar_aggregate" => {
+                "int4_scalar_aggregate" | "int4_filtered_scalar_aggregate" => {
                     (std::mem::size_of::<i32>()
                         + std::mem::size_of::<u64>()
+                        + std::mem::size_of::<i64>()
+                        + (2 * std::mem::size_of::<i32>())
+                        + std::mem::size_of::<u64>()) as u64
+                }
+                "int4_between_scalar_aggregate" => {
+                    (std::mem::size_of::<u64>()
                         + std::mem::size_of::<i64>()
                         + (2 * std::mem::size_of::<i32>())
                         + std::mem::size_of::<u64>()) as u64

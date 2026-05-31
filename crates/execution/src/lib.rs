@@ -297,20 +297,17 @@ impl CudaResidentDeviceMemory {
         row_count: u64,
         lower_inclusive: i32,
         upper_inclusive: i32,
-    ) -> Result<(CudaI32Stats, u64), CudaRuntimeProbeError> {
+    ) -> Result<CudaI32Stats, CudaRuntimeProbeError> {
         if lower_inclusive > upper_inclusive {
-            return Ok((CudaI32Stats::from_values(&[]), 0));
+            return Ok(CudaI32Stats::from_values(&[]));
         }
-        let mut values = launch_cuda_resident_i32_compare_project(
+        launch_cuda_resident_i32_between_stats(
             self,
             byte_offset,
             row_count,
             lower_inclusive,
-            CudaI32Comparison::Gte,
-        )?;
-        let readback_count = values.len() as u64;
-        values.retain(|value| *value <= upper_inclusive);
-        Ok((CudaI32Stats::from_values(&values), readback_count))
+            upper_inclusive,
+        )
     }
 
     pub fn project_i32_compare_from_payload(
@@ -2012,6 +2009,281 @@ done:
     drop(module_guard);
     drop(allocation_guard);
     Ok(output)
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct CudaI32StatsRaw {
+    count: u64,
+    sum: i64,
+    min: i32,
+    max: i32,
+}
+
+fn launch_cuda_resident_i32_between_stats(
+    resident: &CudaResidentDeviceMemory,
+    byte_offset: u64,
+    row_count: u64,
+    lower_inclusive: i32,
+    upper_inclusive: i32,
+) -> Result<CudaI32Stats, CudaRuntimeProbeError> {
+    type CuMemAlloc = unsafe extern "C" fn(*mut u64, usize) -> i32;
+    type CuMemFree = unsafe extern "C" fn(u64) -> i32;
+    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+    type CuModuleLoadData = unsafe extern "C" fn(*mut *mut c_void, *const c_void) -> i32;
+    type CuModuleUnload = unsafe extern "C" fn(*mut c_void) -> i32;
+    type CuModuleGetFunction =
+        unsafe extern "C" fn(*mut *mut c_void, *mut c_void, *const i8) -> i32;
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+    type CuCtxSynchronize = unsafe extern "C" fn() -> i32;
+
+    const PTX: &[u8] = br#"
+.version 6.0
+.target sm_30
+.address_size 64
+
+.visible .entry gpu_db_resident_i32_between_stats(
+    .param .u64 resident_ptr,
+    .param .u64 byte_offset,
+    .param .u64 row_count,
+    .param .s32 lower_inclusive,
+    .param .s32 upper_inclusive,
+    .param .u64 out_ptr
+)
+{
+    .reg .pred %p_done;
+    .reg .pred %p_ge_lower;
+    .reg .pred %p_le_upper;
+    .reg .pred %p_match;
+    .reg .pred %p_first;
+    .reg .pred %p_less;
+    .reg .pred %p_greater;
+    .reg .u64 %resident;
+    .reg .u64 %offset;
+    .reg .u64 %rows;
+    .reg .u64 %out;
+    .reg .u64 %base;
+    .reg .u64 %idx;
+    .reg .u64 %addr;
+    .reg .u64 %count;
+    .reg .s64 %sum;
+    .reg .s64 %wide;
+    .reg .s32 %value;
+    .reg .s32 %lower;
+    .reg .s32 %upper;
+    .reg .s32 %min;
+    .reg .s32 %max;
+
+    ld.param.u64 %resident, [resident_ptr];
+    ld.param.u64 %offset, [byte_offset];
+    ld.param.u64 %rows, [row_count];
+    ld.param.s32 %lower, [lower_inclusive];
+    ld.param.s32 %upper, [upper_inclusive];
+    ld.param.u64 %out, [out_ptr];
+
+    add.u64 %base, %resident, %offset;
+    mov.u64 %idx, 0;
+    mov.u64 %count, 0;
+    mov.s64 %sum, 0;
+    mov.s32 %min, 0;
+    mov.s32 %max, 0;
+
+loop:
+    setp.ge.u64 %p_done, %idx, %rows;
+    @%p_done bra done;
+    mul.lo.u64 %addr, %idx, 4;
+    add.u64 %addr, %base, %addr;
+    ld.global.s32 %value, [%addr];
+    setp.ge.s32 %p_ge_lower, %value, %lower;
+    setp.le.s32 %p_le_upper, %value, %upper;
+    and.pred %p_match, %p_ge_lower, %p_le_upper;
+    @!%p_match bra next;
+
+    setp.eq.u64 %p_first, %count, 0;
+    @!%p_first bra update_minmax;
+    mov.s32 %min, %value;
+    mov.s32 %max, %value;
+    bra add_value;
+
+update_minmax:
+    setp.lt.s32 %p_less, %value, %min;
+    @!%p_less bra keep_min;
+    mov.s32 %min, %value;
+keep_min:
+    setp.gt.s32 %p_greater, %value, %max;
+    @!%p_greater bra keep_max;
+    mov.s32 %max, %value;
+keep_max:
+
+add_value:
+    cvt.s64.s32 %wide, %value;
+    add.s64 %sum, %sum, %wide;
+    add.u64 %count, %count, 1;
+
+next:
+    add.u64 %idx, %idx, 1;
+    bra loop;
+
+done:
+    st.global.u64 [%out], %count;
+    add.u64 %addr, %out, 8;
+    st.global.s64 [%addr], %sum;
+    add.u64 %addr, %out, 16;
+    st.global.s32 [%addr], %min;
+    add.u64 %addr, %out, 20;
+    st.global.s32 [%addr], %max;
+    ret;
+}
+"#;
+
+    let bytes = row_count
+        .checked_mul(std::mem::size_of::<i32>() as u64)
+        .and_then(|bytes| byte_offset.checked_add(bytes))
+        .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    if bytes > resident.metadata.allocated_bytes {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(bytes as usize));
+    }
+
+    let cu_mem_alloc = unsafe {
+        resident
+            ._lib
+            .get::<CuMemAlloc>(b"cuMemAlloc_v2\0")
+            .or_else(|_| resident._lib.get::<CuMemAlloc>(b"cuMemAlloc\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_mem_free = unsafe {
+        resident
+            ._lib
+            .get::<CuMemFree>(b"cuMemFree_v2\0")
+            .or_else(|_| resident._lib.get::<CuMemFree>(b"cuMemFree\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_memcpy_dtoh = unsafe {
+        resident
+            ._lib
+            .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+            .or_else(|_| resident._lib.get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_module_load_data = unsafe {
+        resident
+            ._lib
+            .get::<CuModuleLoadData>(b"cuModuleLoadData\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_module_unload = unsafe {
+        resident
+            ._lib
+            .get::<CuModuleUnload>(b"cuModuleUnload\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_module_get_function = unsafe {
+        resident
+            ._lib
+            .get::<CuModuleGetFunction>(b"cuModuleGetFunction\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_launch_kernel = unsafe {
+        resident
+            ._lib
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_ctx_synchronize = unsafe {
+        resident
+            ._lib
+            .get::<CuCtxSynchronize>(b"cuCtxSynchronize\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+
+    let mut device_output = 0_u64;
+    check_cuda(unsafe {
+        cu_mem_alloc(&mut device_output, std::mem::size_of::<CudaI32StatsRaw>())
+    })?;
+    let output_guard = CudaDeviceAllocationGuard {
+        ptr: device_output,
+        free: *cu_mem_free,
+    };
+
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+
+    let mut module = std::ptr::null_mut();
+    check_cuda(unsafe { cu_module_load_data(&mut module, ptx.as_ptr().cast::<c_void>()) })?;
+    let module_guard = CudaModuleGuard {
+        module,
+        unload: *cu_module_unload,
+    };
+
+    let mut function = std::ptr::null_mut();
+    check_cuda(unsafe {
+        cu_module_get_function(
+            &mut function,
+            module,
+            c"gpu_db_resident_i32_between_stats".as_ptr(),
+        )
+    })?;
+
+    let mut resident_arg = resident.device_ptr;
+    let mut offset_arg = byte_offset;
+    let mut rows_arg = row_count;
+    let mut lower_arg = lower_inclusive;
+    let mut upper_arg = upper_inclusive;
+    let mut output_arg = output_guard.ptr;
+    let mut args = [
+        (&mut resident_arg as *mut u64).cast::<c_void>(),
+        (&mut offset_arg as *mut u64).cast::<c_void>(),
+        (&mut rows_arg as *mut u64).cast::<c_void>(),
+        (&mut lower_arg as *mut i32).cast::<c_void>(),
+        (&mut upper_arg as *mut i32).cast::<c_void>(),
+        (&mut output_arg as *mut u64).cast::<c_void>(),
+    ];
+    launch_with_optional_cuda_event_timing(resident, *cu_ctx_synchronize, || unsafe {
+        cu_launch_kernel(
+            function,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            0,
+            std::ptr::null_mut(),
+            args.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    })?;
+
+    let mut raw = CudaI32StatsRaw::default();
+    check_cuda(unsafe {
+        cu_memcpy_dtoh(
+            (&mut raw as *mut CudaI32StatsRaw).cast::<c_void>(),
+            output_guard.ptr,
+            std::mem::size_of::<CudaI32StatsRaw>(),
+        )
+    })?;
+    drop(module_guard);
+    drop(output_guard);
+
+    Ok(CudaI32Stats {
+        count: raw.count,
+        sum: raw.sum,
+        min: (raw.count > 0).then_some(raw.min),
+        max: (raw.count > 0).then_some(raw.max),
+    })
 }
 
 fn launch_cuda_resident_i32_project(
