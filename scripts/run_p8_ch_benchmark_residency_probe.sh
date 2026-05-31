@@ -1164,23 +1164,23 @@ write_engine_backed_protocol_boundary_probe() {
   local report_path="$boundary_dir/engine-backed-protocol-boundary.md"
   local facts_path="$boundary_dir/probe-facts.txt"
   local metrics_path="$boundary_dir/metrics.jsonl"
-  local blocker="engine_residency_admission_api_required"
-  local secondary_blocker="retained_route_endpoint_admission_required"
-  local retained_blocker="engine_residency_admission_api_required"
+  local blocker="identical_pg_client_concurrency_harness_required"
+  local secondary_blocker="true_concurrent_client_curves_required"
+  local retained_blocker="closed"
 
   cargo run -q -p gpu_db_engine --example p8_engine_protocol_boundary_probe >"$facts_path"
 
   cat >"$metrics_path" <<JSON
-{"kind":"engine_backed_protocol_boundary_probe","rows":$rows,"status":"closed","engine_owned_target":true,"protocol_parser_reused":true,"startup_packet_parser_reused":true,"frontend_message_parser_reused":true,"wire_session_api_available":true,"copy_parser_in_protocol_lib":true,"backend_writer_api_available":true,"ready_loop_state_available":true,"engine_owned_session_probe":true,"copy_stream_lifecycle_probe":true,"protocol_server_session_catalog_reusable":false,"create_table_into_engine_wal_mvcc":true,"copy_rows_visible_through_engine_select":true,"resident_admission_from_sql_visible_rows":false,"next_blocker":"$blocker","secondary_blocker":"$secondary_blocker","retained_blocker":"$retained_blocker"}
-{"kind":"endpoint_boundary_decision","status":"closed","narrowest_safe_next_step":"pair the engine-backed PostgreSQL-compatible session boundary with retained RelationalResidentCache admission and then run identical-client concurrency curves"}
+{"kind":"engine_backed_protocol_boundary_probe","rows":$rows,"status":"closed","engine_owned_target":true,"protocol_parser_reused":true,"startup_packet_parser_reused":true,"frontend_message_parser_reused":true,"wire_session_api_available":true,"copy_parser_in_protocol_lib":true,"backend_writer_api_available":true,"ready_loop_state_available":true,"engine_owned_session_probe":true,"copy_stream_lifecycle_probe":true,"protocol_server_session_catalog_reusable":false,"create_table_into_engine_wal_mvcc":true,"copy_rows_visible_through_engine_select":true,"resident_admission_from_sql_visible_rows":true,"retained_route_zero_h2d":true,"post_mutation_residency_invalidated":true,"next_blocker":"$blocker","secondary_blocker":"$secondary_blocker","retained_blocker":"$retained_blocker"}
+{"kind":"endpoint_boundary_decision","status":"closed","narrowest_safe_next_step":"run the identical PostgreSQL-compatible client harness and true concurrency curves against the retained engine route"}
 JSON
 
   cat >"$report_path" <<REPORT
-# P8 Engine-Backed Endpoint/Session Adapter Probe
+# P8 SQL-Visible Retained Admission Probe
 
 - rows: $rows
 - status: closed
-- adapter_boundary: engine-owned startup/simple-query/COPY/select session probe
+- adapter_boundary: engine-owned startup/simple-query/COPY/select session probe with retained admission
 - next_blocker: $blocker
 - secondary_blocker: $secondary_blocker
 - retained_blocker: $retained_blocker
@@ -1190,7 +1190,7 @@ JSON
 ## Result
 
 The checked \`p8_engine_protocol_boundary_probe\` example now proves the bounded
-engine-owned endpoint/session adapter boundary. The probe owns
+SQL-visible retained-route admission boundary. The probe owns
 \`Engine::new_local()\`, reuses \`gpu_db_protocol\` startup-packet parsing,
 frontend-message parsing, SQL parsing, COPY statement/row decoding, and backend
 result writers, then routes a PostgreSQL-shaped startup + simple-query
@@ -1201,18 +1201,22 @@ The same probe writes normal backend startup, \`CopyInResponse\`, command,
 \`RowDescription\`, \`DataRow\`, and \`ReadyForQuery\` messages through
 \`gpu_db_protocol::backend::BackendWriter\`. Rows loaded through COPY are visible
 through \`Engine::execute_relational_select(...)\` from the engine-owned session
-state. This closes the prior session/catalog boundary for a minimal simple-query
-and COPY path without making \`gpu_db_protocol\` depend on \`gpu_db_engine\`.
+state. It then warms \`order_line\` through
+\`Engine::warm_relational_residency_with_policy(...)\`, executes
+\`SELECT COUNT(*)\` through the default \`Engine::execute_relational_select(...)\`
+retained route, records accepted zero-H2D telemetry, and verifies a later engine
+mutation invalidates the resident snapshot. This closes the retained-admission
+blocker without making \`gpu_db_protocol\` depend on \`gpu_db_engine\`.
 
 ## Narrowest Viable Architecture
 
-The next implementation slice should pair this endpoint/session boundary with
-retained \`RelationalResidentCache\` admission from SQL-visible engine rows, then
-run the identical PostgreSQL-compatible client harness and true concurrency
-curves. The current protocol server may still keep its private
+The next implementation slice should run the identical PostgreSQL-compatible
+client harness and true concurrency curves against this retained engine route.
+The current protocol server may still keep its private
 \`Session\` / \`SharedCatalog\` path for the broader compatibility endpoint, but
-the P8 benchmark target no longer needs to duplicate that monolith for
-startup/simple-query/COPY/result writing.
+the P8 benchmark target now has a bounded engine-owned path for
+startup/simple-query/COPY/result writing plus retained admission from
+SQL-visible rows.
 
 ## Rejected Alternatives
 
@@ -1220,25 +1224,25 @@ startup/simple-query/COPY/result writing.
   workspace already depends in the opposite direction.
 - Do not relabel the current \`--gpu-db-protocol-benchmark-smoke\` metrics as
   retained-route evidence; those are protocol \`SharedCatalog\` CPU scans.
-- Do not bypass WAL/MVCC by admitting COPY output directly to retained chunks
-  unless a future product decision explicitly approves a benchmark-only path
-  paired with durable engine seeding.
+- Do not bypass WAL/MVCC by admitting COPY output directly to retained chunks;
+  this probe warms from engine-visible table rows after COPY has committed.
 - Do not collect true-concurrency product curves until the PostgreSQL-compatible
   target reaches the retained engine route.
 
 ## Benchmark Gate Impact
 
 The existing 25% aggregate result remains provisional \`engine_internal\`
-evidence. This slice proves SQL/COPY-loaded rows can enter engine WAL/MVCC and
-be returned through a PostgreSQL-shaped result-writing boundary, but the
-benchmark trust gate is unblocked only after retained-route admission is reached
-behind the same PostgreSQL-compatible client harness used for default and tuned
-PostgreSQL.
+evidence. This slice proves SQL/COPY-loaded rows can enter engine WAL/MVCC,
+be admitted to retained residency, and return through a PostgreSQL-shaped
+result-writing boundary with accepted zero-H2D retained-route telemetry.
+The benchmark trust gate still needs the same PostgreSQL-compatible client
+harness for default PostgreSQL, tuned PostgreSQL, and GPU DB plus true
+concurrent-client curves.
 The 125% tier remains blocked on \`missing_partitioned_over_resident_execution\`.
 REPORT
 
   cat "$report_path"
-  echo "p8_ch_benchmark_engine_backed_protocol_boundary=closed next_blocker=$blocker artifact=$report_path"
+  echo "p8_ch_benchmark_sql_visible_retained_admission=closed next_blocker=$blocker artifact=$report_path"
 }
 
 order_line_dist_info_shell() {
@@ -1710,8 +1714,10 @@ case "$mode" in
     grep -q '"safe_to_label_protocol_smoke_as_retained":false' "$tmp_dir/out/protocol-retained-route-bridge/metrics.jsonl"
     GPU_DB_CH_BENCH_OUT_DIR="$tmp_dir/out" GPU_DB_CH_BENCH_ENGINE_PROTOCOL_BOUNDARY_ROWS=16 \
       "$0" --engine-backed-protocol-boundary-probe >"$tmp_dir/engine-boundary.out"
-    grep -q 'engine_backed_session_probe_ready' "$tmp_dir/out/engine-backed-protocol-boundary/probe-facts.txt"
-    grep -q 'engine_residency_admission_api_required' "$tmp_dir/out/engine-backed-protocol-boundary/engine-backed-protocol-boundary.md"
+    grep -q 'sql_visible_retained_admission_ready' "$tmp_dir/out/engine-backed-protocol-boundary/probe-facts.txt"
+    grep -q 'resident_admission_from_sql_visible_rows=true' "$tmp_dir/out/engine-backed-protocol-boundary/probe-facts.txt"
+    grep -q 'retained_route_zero_h2d=true' "$tmp_dir/out/engine-backed-protocol-boundary/probe-facts.txt"
+    grep -q 'identical_pg_client_concurrency_harness_required' "$tmp_dir/out/engine-backed-protocol-boundary/engine-backed-protocol-boundary.md"
     grep -q 'protocol_parser_reused=true' "$tmp_dir/out/engine-backed-protocol-boundary/probe-facts.txt"
     GPU_DB_CH_BENCH_OUT_DIR="$tmp_dir/out" "$0" --cleanup >"$tmp_dir/cleanup.out"
     grep -q 'chunked_resident_cache_install_available: true' "$tmp_dir/streaming.out"

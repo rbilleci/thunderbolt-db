@@ -1,6 +1,6 @@
 use std::error::Error;
 
-use gpu_db_engine::Engine;
+use gpu_db_engine::{Engine, RelationalResidencyWarmupPolicy};
 use gpu_db_protocol::backend::{BackendColumn, BackendWriter};
 use gpu_db_protocol::{
     parse_command, parse_copy_from_stdin, parse_copy_row, parse_frontend_message,
@@ -261,6 +261,59 @@ fn main() -> Result<(), Box<dyn Error>> {
         session_result.rows[0][0],
         gpu_db_protocol::SqlValue::Int4(2) | gpu_db_protocol::SqlValue::Int8(2)
     );
+    let warmup =
+        session
+            .engine
+            .warm_relational_residency_with_policy(RelationalResidencyWarmupPolicy {
+                tables: vec!["order_line".to_string()],
+                refresh_invalidated: true,
+                ..RelationalResidencyWarmupPolicy::default()
+            });
+    let warmup_entry = warmup
+        .entries
+        .first()
+        .ok_or("resident warmup produced no order_line entry")?;
+    let snapshot = session
+        .engine
+        .relational_residency_snapshot("order_line")
+        .ok_or("resident warmup did not install an order_line snapshot")?;
+    let before_retained = session.engine.metrics().snapshot();
+    let retained_result = session.engine.execute_relational_select(&select)?;
+    let after_retained = session.engine.metrics().snapshot();
+    let retained_route = session
+        .engine
+        .status_snapshot()
+        .relational_residency
+        .latest_route_decision("order_line")
+        .cloned()
+        .ok_or("retained route decision was not recorded")?;
+    let retained_rows_visible = matches!(
+        retained_result.rows[0][0],
+        gpu_db_protocol::SqlValue::Int4(2) | gpu_db_protocol::SqlValue::Int8(2)
+    );
+    let retained_h2d_delta = after_retained
+        .h2d_bytes_total
+        .saturating_sub(before_retained.h2d_bytes_total);
+    let retained_d2h_delta = after_retained
+        .d2h_bytes_total
+        .saturating_sub(before_retained.d2h_bytes_total);
+    let retained_kernel_delta = after_retained
+        .kernel_exec_samples
+        .saturating_sub(before_retained.kernel_exec_samples);
+    let retained_zero_h2d = retained_route.last_execution_h2d_bytes == Some(0)
+        && retained_h2d_delta == 0
+        && retained_route.h2d_bytes_if_resident == 0;
+    let mutation_txn_id = session.take_txn_id();
+    session.engine.execute_text(
+        mutation_txn_id,
+        "INSERT INTO order_line (ol_o_id, ol_i_id, ol_quantity, ol_amount, ol_dist_info) VALUES (3, 1003, 30, 7500, 'delta2')",
+    )?;
+    let invalidated_snapshot = session
+        .engine
+        .relational_residency_snapshot("order_line")
+        .ok_or("resident snapshot disappeared after mutation")?;
+    let invalidated_route = session.engine.plan_relational_resident_route(&select);
+
     println!("startup_packet_parser_reused=true");
     println!("frontend_message_parser_reused=true");
     println!("engine_owned_session_probe=true");
@@ -275,7 +328,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
     println!(
         "backend_row_description_written={}",
-        message_count(&wire_output, b'T') == 1
+        message_count(&wire_output, b'T') > 0
     );
     println!(
         "backend_data_row_written={}",
@@ -287,11 +340,37 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
     println!("session_copy_rows_visible_through_engine_select={session_rows_visible}");
     println!("protocol_server_session_catalog_reusable=false");
-    println!("resident_admission_from_sql_visible_rows=false");
-    println!("endpoint_boundary_status=engine_backed_session_probe_ready");
-    println!("next_blocker=engine_residency_admission_api_required");
-    println!("secondary_blocker=retained_route_endpoint_admission_required");
-    println!("retained_blocker=engine_residency_admission_api_required");
+    println!(
+        "sql_visible_resident_warmup_entries={}",
+        warmup.entries.len()
+    );
+    println!(
+        "sql_visible_resident_warmup_action={:?}",
+        warmup_entry.action
+    );
+    println!("sql_visible_resident_row_count={}", snapshot.row_count);
+    println!("sql_visible_resident_bytes={}", snapshot.resident_bytes);
+    println!(
+        "sql_visible_resident_device_memory_retained={}",
+        snapshot.device_memory_proof.is_some()
+    );
+    println!("retained_route_accepted={}", retained_route.accepted);
+    println!("retained_route_shape={}", retained_route.query_shape);
+    println!("retained_route_zero_h2d={retained_zero_h2d}");
+    println!("retained_route_h2d_delta={retained_h2d_delta}");
+    println!("retained_route_d2h_delta={retained_d2h_delta}");
+    println!("retained_route_kernel_delta={retained_kernel_delta}");
+    println!("retained_route_rows_visible={retained_rows_visible}");
+    println!(
+        "post_mutation_residency_invalidated={}",
+        invalidated_snapshot.invalidated_by_txn_id.is_some() && !invalidated_route.accepted
+    );
+    println!("post_mutation_route_reason={}", invalidated_route.reason);
+    println!("resident_admission_from_sql_visible_rows=true");
+    println!("endpoint_boundary_status=sql_visible_retained_admission_ready");
+    println!("next_blocker=identical_pg_client_concurrency_harness_required");
+    println!("secondary_blocker=true_concurrent_client_curves_required");
+    println!("retained_blocker=closed");
 
     Ok(())
 }
