@@ -104,6 +104,12 @@ pub struct CudaDeviceMemoryChunk<'a> {
     pub bytes: &'a [u8],
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CudaOwnedDeviceMemoryChunk {
+    pub byte_offset: u64,
+    pub bytes: Vec<u8>,
+}
+
 impl fmt::Debug for CudaResidentDeviceMemory {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CudaResidentDeviceMemory")
@@ -808,6 +814,50 @@ impl CudaDriverRuntime {
             _lib: resident._lib,
         })
     }
+
+    pub fn retain_device_memory_owned_chunks<I>(
+        &self,
+        gpu_id: u16,
+        allocated_bytes: u64,
+        chunks: I,
+    ) -> Result<CudaResidentDeviceMemory, CudaRuntimeProbeError>
+    where
+        I: IntoIterator<Item = CudaOwnedDeviceMemoryChunk>,
+    {
+        if !self.snapshot.driver_available || gpu_id >= self.snapshot.device_count {
+            return Err(CudaRuntimeProbeError::DriverLibraryUnavailable);
+        }
+        if allocated_bytes == 0 {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(0));
+        }
+        let allocated_len = usize::try_from(allocated_bytes)
+            .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+
+        let device = self
+            .snapshot
+            .devices
+            .iter()
+            .find(|device| device.id == gpu_id)
+            .cloned()
+            .ok_or(CudaRuntimeProbeError::InvalidDeviceCount(i32::from(gpu_id)))?;
+        let resident =
+            launch_cuda_resident_device_memory_owned_chunks(gpu_id, allocated_len, chunks)?;
+        Ok(CudaResidentDeviceMemory {
+            metadata: CudaDeviceMemoryProof {
+                gpu_id,
+                device_name: device.name,
+                allocated_bytes,
+                copied_bytes: resident.copied_bytes,
+                retained: true,
+            },
+            device_ptr: resident.device_ptr,
+            context: resident.context,
+            cu_mem_free: resident.cu_mem_free,
+            cu_ctx_destroy: resident.cu_ctx_destroy,
+            last_kernel_event_elapsed_us: Mutex::new(None),
+            _lib: resident._lib,
+        })
+    }
 }
 
 struct RawCudaResidentDeviceMemory {
@@ -815,6 +865,7 @@ struct RawCudaResidentDeviceMemory {
     context: *mut c_void,
     cu_mem_free: unsafe extern "C" fn(u64) -> i32,
     cu_ctx_destroy: unsafe extern "C" fn(*mut c_void) -> i32,
+    copied_bytes: u64,
     _lib: Library,
 }
 
@@ -904,10 +955,14 @@ fn launch_cuda_resident_device_memory_chunks(
         free: cu_mem_free,
     };
 
+    let mut copied_bytes = 0_u64;
     for chunk in chunks {
         if chunk.bytes.is_empty() {
             continue;
         }
+        copied_bytes = copied_bytes
+            .checked_add(chunk.bytes.len() as u64)
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
         let destination = allocation_guard
             .ptr
             .checked_add(chunk.byte_offset)
@@ -929,6 +984,129 @@ fn launch_cuda_resident_device_memory_chunks(
         context,
         cu_mem_free,
         cu_ctx_destroy,
+        copied_bytes,
+        _lib: lib,
+    })
+}
+
+fn launch_cuda_resident_device_memory_owned_chunks<I>(
+    gpu_id: u16,
+    allocated_len: usize,
+    chunks: I,
+) -> Result<RawCudaResidentDeviceMemory, CudaRuntimeProbeError>
+where
+    I: IntoIterator<Item = CudaOwnedDeviceMemoryChunk>,
+{
+    type CuInit = unsafe extern "C" fn(u32) -> i32;
+    type CuDeviceGet = unsafe extern "C" fn(*mut i32, i32) -> i32;
+    type CuCtxCreate = unsafe extern "C" fn(*mut *mut c_void, u32, i32) -> i32;
+    type CuCtxDestroy = unsafe extern "C" fn(*mut c_void) -> i32;
+    type CuMemAlloc = unsafe extern "C" fn(*mut u64, usize) -> i32;
+    type CuMemFree = unsafe extern "C" fn(u64) -> i32;
+    type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const c_void, usize) -> i32;
+
+    let lib = unsafe {
+        Library::new("libcuda.so.1")
+            .or_else(|_| Library::new("libcuda.so"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+
+    let cu_init = unsafe {
+        *lib.get::<CuInit>(b"cuInit\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_device_get = unsafe {
+        *lib.get::<CuDeviceGet>(b"cuDeviceGet\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_ctx_create = unsafe {
+        *lib.get::<CuCtxCreate>(b"cuCtxCreate_v2\0")
+            .or_else(|_| lib.get::<CuCtxCreate>(b"cuCtxCreate\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_ctx_destroy = unsafe {
+        *lib.get::<CuCtxDestroy>(b"cuCtxDestroy_v2\0")
+            .or_else(|_| lib.get::<CuCtxDestroy>(b"cuCtxDestroy\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_mem_alloc = unsafe {
+        *lib.get::<CuMemAlloc>(b"cuMemAlloc_v2\0")
+            .or_else(|_| lib.get::<CuMemAlloc>(b"cuMemAlloc\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_mem_free = unsafe {
+        *lib.get::<CuMemFree>(b"cuMemFree_v2\0")
+            .or_else(|_| lib.get::<CuMemFree>(b"cuMemFree\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_memcpy_htod = unsafe {
+        *lib.get::<CuMemcpyHtoD>(b"cuMemcpyHtoD_v2\0")
+            .or_else(|_| lib.get::<CuMemcpyHtoD>(b"cuMemcpyHtoD\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+
+    check_cuda(unsafe { cu_init(0) })?;
+
+    let mut device = 0;
+    check_cuda(unsafe { cu_device_get(&mut device, i32::from(gpu_id)) })?;
+
+    let mut context = std::ptr::null_mut();
+    check_cuda(unsafe { cu_ctx_create(&mut context, 0, device) })?;
+    let context_guard = CudaContextGuard {
+        context,
+        destroy: cu_ctx_destroy,
+    };
+
+    let mut device_ptr = 0_u64;
+    check_cuda(unsafe { cu_mem_alloc(&mut device_ptr, allocated_len) })?;
+    let allocation_guard = CudaDeviceAllocationGuard {
+        ptr: device_ptr,
+        free: cu_mem_free,
+    };
+
+    let allocated_bytes = allocated_len as u64;
+    let mut copied_bytes = 0_u64;
+    for chunk in chunks {
+        if chunk.bytes.is_empty() {
+            continue;
+        }
+        let end = chunk
+            .byte_offset
+            .checked_add(chunk.bytes.len() as u64)
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        if end > allocated_bytes {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(
+                usize::try_from(end).unwrap_or(usize::MAX),
+            ));
+        }
+        copied_bytes = copied_bytes
+            .checked_add(chunk.bytes.len() as u64)
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        let destination = allocation_guard
+            .ptr
+            .checked_add(chunk.byte_offset)
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        check_cuda(unsafe {
+            cu_memcpy_htod(
+                destination,
+                chunk.bytes.as_ptr().cast::<c_void>(),
+                chunk.bytes.len(),
+            )
+        })?;
+    }
+    if copied_bytes == 0 {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(0));
+    }
+
+    std::mem::forget(allocation_guard);
+    std::mem::forget(context_guard);
+
+    Ok(RawCudaResidentDeviceMemory {
+        device_ptr,
+        context,
+        cu_mem_free,
+        cu_ctx_destroy,
+        copied_bytes,
         _lib: lib,
     })
 }

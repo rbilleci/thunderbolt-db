@@ -22,15 +22,15 @@ Environment:
   GPU_DB_CH_BENCH_EXECUTE_CHUNK_ROWS  guarded execution chunk rows, default 256
   GPU_DB_CH_BENCH_ALLOW_FULL_25PCT  set to 1 to attempt all estimated 25pct rows
   GPU_DB_CH_BENCH_PGSQL_URL     libpq connection string for PostgreSQL baseline
-  GPU_DB_CH_BENCH_PGSQL_DOCKER_NAME      default gpu-db-p8-pgsql-baseline
+  GPU_DB_CH_BENCH_PGSQL_DOCKER_NAME      default gpu-db-p8-pgsql-baseline-disposable
   GPU_DB_CH_BENCH_PGSQL_DOCKER_IMAGE     default postgres:16
-  GPU_DB_CH_BENCH_PGSQL_DOCKER_PORT      default 55433
+  GPU_DB_CH_BENCH_PGSQL_DOCKER_PORT      default 55434
   GPU_DB_CH_BENCH_PGSQL_DOCKER_PASSWORD  default gpu_db_p8_benchmark
 USAGE
 }
 
 pgsql_docker_name() {
-  printf '%s\n' "${GPU_DB_CH_BENCH_PGSQL_DOCKER_NAME:-gpu-db-p8-pgsql-baseline}"
+  printf '%s\n' "${GPU_DB_CH_BENCH_PGSQL_DOCKER_NAME:-gpu-db-p8-pgsql-baseline-disposable}"
 }
 
 pgsql_docker_image() {
@@ -38,7 +38,7 @@ pgsql_docker_image() {
 }
 
 pgsql_docker_port() {
-  printf '%s\n' "${GPU_DB_CH_BENCH_PGSQL_DOCKER_PORT:-55433}"
+  printf '%s\n' "${GPU_DB_CH_BENCH_PGSQL_DOCKER_PORT:-55434}"
 }
 
 pgsql_docker_password() {
@@ -78,15 +78,17 @@ pgsql_baseline_docker_up() {
   password="$(pgsql_docker_password)"
 
   if docker ps -a --format '{{.Names}}' | grep -Fxq "$name"; then
-    docker start "$name" >/dev/null
-  else
-    docker run -d \
-      --name "$name" \
-      -e POSTGRES_PASSWORD="$password" \
-      -e POSTGRES_DB=gpu_db_p8_baseline \
-      -p "127.0.0.1:${port}:5432" \
-      "$image" >/dev/null
+    if ! docker rm -f "$name" >/dev/null 2>&1; then
+      echo "p8_ch_benchmark_pgsql_docker=blocked reason=existing_container_cleanup_failed name=$name" >&2
+      return 1
+    fi
   fi
+  docker run -d \
+    --name "$name" \
+    -e POSTGRES_PASSWORD="$password" \
+    -e POSTGRES_DB=gpu_db_p8_baseline \
+    -p "127.0.0.1:${port}:5432" \
+    "$image" >/dev/null
 
   for _ in $(seq 1 60); do
     if pg_isready -h 127.0.0.1 -p "$port" -U postgres -d gpu_db_p8_baseline >/dev/null 2>&1; then
@@ -363,7 +365,7 @@ write_25pct_execution() {
     blocker=none
   else
     status=blocked
-    blocker=missing_streaming_chunk_iterator_for_full_25pct_execution
+    blocker=full_25pct_requires_operator_long_run_after_streaming_boundary
   fi
 
   cat >"$OUT_DIR/25pct-execution.md" <<REPORT
@@ -389,13 +391,11 @@ formula-backed answers, records p95/p99/throughput/CUDA/H2D/D2H/zero-H2D route
 metrics, and verifies memory-pressure fallback behavior.
 
 When not explicitly opted into the full 25% tier, this command stops after the
-guarded scaled execution. The remaining full-tier blocker is that the current
-Rust upload interface still requires a complete caller-owned chunk slice and
-the example builds chunk bytes before admission; attempting 161,061,274 rows in
-the 6-hour worker window would risk converting a proven execution path into an
-unsafe host-memory/runtime test. The exact full command, for a longer
-operator-approved window after adding/accepting the streaming upload boundary,
-is:
+guarded scaled execution. The resident upload/admission boundary now streams
+owned chunks through the engine/runtime path instead of retaining a full
+caller-owned chunk vector or text layout. The remaining full-tier blocker is
+run-window/capacity: attempting 161,061,274 rows in an unattended worker slice
+should be an explicit operator-approved long run. The exact full command is:
 
 \`\`\`bash
 $full_command
@@ -528,7 +528,7 @@ case "$mode" in
       "$0" --chunked-upload-self-check >"$tmp_dir/chunked-upload.out"
     GPU_DB_CH_BENCH_OUT_DIR="$tmp_dir/out" GPU_DB_CH_BENCH_EXECUTE_ROWS=16 GPU_DB_CH_BENCH_EXECUTE_CHUNK_ROWS=4 GPU_DB_CH_BENCH_CONCURRENCY=1 \
       "$0" --run-25pct-execute >"$tmp_dir/chunked-execute.out" 2>"$tmp_dir/chunked-execute.err" || true
-    grep -q 'missing_streaming_chunk_iterator_for_full_25pct_execution' "$tmp_dir/chunked-execute.err"
+    grep -q 'full_25pct_requires_operator_long_run_after_streaming_boundary' "$tmp_dir/chunked-execute.err"
     grep -q 'expected_results: deterministic formulas' "$tmp_dir/out/chunked-execute/execution.md"
     if GPU_DB_CH_BENCH_OUT_DIR="$tmp_dir/out" GPU_DB_CH_BENCH_ROWS=16 \
       "$0" --pgsql-baseline-preflight >"$tmp_dir/pgsql.out" 2>"$tmp_dir/pgsql.err"; then

@@ -7,9 +7,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use gpu_db_batching::{BatchItem, DualTriggerBatcher, FlushReason};
 use gpu_db_execution::{
     CudaDeviceMemoryChunk, CudaDeviceMemoryProof, CudaDriverRuntime, CudaI32Comparison,
-    CudaMvccRowBatch, CudaResidentDeviceMemory, DeviceRouter, DeviceTarget, FilterOperator,
-    LimitOperator, MockGpuRuntime, Operator, PlannedOp, ProjectOperator, RouteDecision,
-    ScanOperator, SortOperator,
+    CudaMvccRowBatch, CudaOwnedDeviceMemoryChunk, CudaResidentDeviceMemory, DeviceRouter,
+    DeviceTarget, FilterOperator, LimitOperator, MockGpuRuntime, Operator, PlannedOp,
+    ProjectOperator, RouteDecision, ScanOperator, SortOperator,
 };
 use gpu_db_metrics::{BatchFlushReason, FallbackReason, RuntimeMetrics, RuntimeMetricsSnapshot};
 use gpu_db_observability::{
@@ -6317,6 +6317,20 @@ pub struct BenchmarkRelationalResidencyChunkInstall<'a> {
     pub resident_device_text_columns: Vec<ResidentDeviceTextColumnLayout>,
     pub allocated_bytes: u64,
     pub chunks: &'a [CudaDeviceMemoryChunk<'a>],
+}
+
+pub struct BenchmarkRelationalResidencyOwnedChunkInstall<'a, I>
+where
+    I: IntoIterator<Item = CudaOwnedDeviceMemoryChunk>,
+{
+    pub table: &'a str,
+    pub gpu_id: u16,
+    pub row_count: usize,
+    pub resident_bytes: u64,
+    pub resident_device_int4_columns: Vec<String>,
+    pub resident_device_text_columns: Vec<ResidentDeviceTextColumnLayout>,
+    pub allocated_bytes: u64,
+    pub chunks: I,
 }
 
 impl RelationalResidencySnapshot {
@@ -18022,6 +18036,108 @@ impl Engine {
         let runtime = self.cuda_driver_probe_runtime();
         let device_memory = runtime
             .retain_device_memory_chunks(gpu_id, allocated_bytes, chunks)
+            .map_err(|err| {
+                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "benchmark resident chunk admission failed CUDA retained upload: {err}"
+                )))
+            })?;
+        let device_memory_proof = Some(device_memory.metadata().clone());
+        let snapshot = RelationalResidencySnapshot {
+            gpu_id,
+            schema: catalog_table.schema,
+            table: catalog_table.name.clone(),
+            row_count,
+            column_count: catalog_table.columns.len(),
+            resident_bytes,
+            resident_rows: Vec::new(),
+            resident_device_int4_columns: install.resident_device_int4_columns,
+            resident_device_text_columns: install.resident_device_text_columns,
+            valid_through_index: self.visible_up_to,
+            invalidated_by_txn_id: None,
+            invalidated_at_index: None,
+            invalidated_by_memory_pressure: memory_pressure_active,
+            memory_pressure_active,
+            last_refresh_cost: previous_snapshot.as_ref().map(|previous| {
+                RelationalResidencyRefreshCost {
+                    previous_row_count: previous.row_count,
+                    refreshed_row_count: row_count,
+                    row_delta: row_count as i128 - previous.row_count as i128,
+                    previous_resident_bytes: previous.resident_bytes,
+                    refreshed_resident_bytes: resident_bytes,
+                    resident_byte_delta: resident_bytes as i128 - previous.resident_bytes as i128,
+                    refreshed_from_index: previous.valid_through_index,
+                    refreshed_through_index: self.visible_up_to,
+                    invalidated_by_txn_id: previous.invalidated_by_txn_id,
+                    invalidated_at_index: previous.invalidated_at_index,
+                    invalidated_by_memory_pressure: previous.invalidated_by_memory_pressure,
+                }
+            }),
+            admission_budget_bytes,
+            resident_bytes_after_admission,
+            evicted_tables_on_admission,
+            device_memory_proof,
+        };
+        self.relational_resident_cache.install_snapshot(
+            catalog_table.name,
+            snapshot.clone(),
+            Some(device_memory),
+        );
+        Ok(snapshot)
+    }
+
+    pub fn install_benchmark_relational_residency_owned_chunks<I>(
+        &mut self,
+        install: BenchmarkRelationalResidencyOwnedChunkInstall<'_, I>,
+    ) -> Result<RelationalResidencySnapshot, ExecuteError>
+    where
+        I: IntoIterator<Item = CudaOwnedDeviceMemoryChunk>,
+    {
+        let table = install.table;
+        let gpu_id = install.gpu_id;
+        let row_count = install.row_count;
+        let resident_bytes = install.resident_bytes;
+        let allocated_bytes = install.allocated_bytes;
+        if row_count == 0 {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "benchmark resident chunk admission requires at least one generated row"
+                    .to_string(),
+            )));
+        }
+        let catalog_table = self
+            .relational_catalog
+            .get(table)
+            .ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "relation \"{table}\" does not exist"
+                )))
+            })?
+            .clone();
+
+        let visible_rows = self.visible_relational_row_count(table)?;
+        if visible_rows != 0 {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "benchmark resident chunk admission requires relation \"{table}\" to have no SQL-visible rows; found {visible_rows}"
+            ))));
+        }
+        Self::validate_benchmark_resident_chunk_columns(
+            &catalog_table,
+            &install.resident_device_int4_columns,
+            &install.resident_device_text_columns,
+        )?;
+
+        let previous_snapshot = self.relational_resident_cache.snapshots.get(table).cloned();
+        let memory_pressure_active = self
+            .router
+            .runtime()
+            .snapshot()
+            .memory_pressured_gpu_ids
+            .contains(&gpu_id);
+        let admission_budget_bytes = self.relational_residency_budget_bytes(gpu_id);
+        let (evicted_tables_on_admission, resident_bytes_after_admission) =
+            self.admit_relational_residency_snapshot(table, gpu_id, resident_bytes)?;
+        let runtime = self.cuda_driver_probe_runtime();
+        let device_memory = runtime
+            .retain_device_memory_owned_chunks(gpu_id, allocated_bytes, install.chunks)
             .map_err(|err| {
                 ExecuteError::Engine(EngineError::ApplyFailed(format!(
                     "benchmark resident chunk admission failed CUDA retained upload: {err}"

@@ -453,24 +453,23 @@ broader CUDA event timing as explicit gaps rather than production claims.
 CH-benCHmark-derived benchmark harness with 25/50/100/200% RTX 3090 residency
 tiers, deterministic generated `order_line` chunks under `target/`, and a
 mandatory PostgreSQL comparator gate for the same dataset/query set. The
-execution layer has `CudaDriverRuntime::retain_device_memory_chunks(...)`,
-which allocates one retained resident layout and copies generated header,
+execution layer has `CudaDriverRuntime::retain_device_memory_owned_chunks(...)`,
+which allocates one retained resident layout and streams generated header,
 int4-column, text-offset, and text-byte chunks into explicit device offsets
-without one contiguous host payload. The engine also exposes an explicitly
-benchmark-only `RelationalResidentCache` admission boundary for generated
-chunks. It requires an empty catalog table, installs retained chunks with
-`resident_rows_materialized: 0`, and keeps normal SQL durability claims on the
-WAL/MVCC insert path. The 25% / 6 GiB preflight now reports whether local disk
-and PostgreSQL comparator evidence make the long run safe to start; it is not a
-completed 6 GiB performance result by itself. The checked
-`--run-25pct-execute` command now turns the same boundary into a guarded scaled
-execution by default: it installs generated resident chunks, validates
-formula-backed aggregate answers without a full CPU MVCC mirror, records
-p95/p99/throughput/CUDA/H2D/D2H/zero-H2D route metrics, and stops with the
-narrower full-tier blocker
-`missing_streaming_chunk_iterator_for_full_25pct_execution` until the upload
-boundary can stream chunks without the caller retaining the complete generated
-chunk list for 161,061,274 rows.
+without one contiguous host payload or a caller-owned full chunk vector. The
+engine also exposes an explicitly benchmark-only `RelationalResidentCache`
+admission boundary for generated chunks. It requires an empty catalog table,
+installs retained chunks with `resident_rows_materialized: 0`, and keeps normal
+SQL durability claims on the WAL/MVCC insert path. The 25% / 6 GiB preflight
+now reports whether local disk and PostgreSQL comparator evidence make the long
+run safe to start; it is not a completed 6 GiB performance result by itself.
+The checked `--run-25pct-execute` command now turns the same boundary into a
+guarded scaled execution by default: it installs generated resident chunks,
+validates formula-backed aggregate answers without a full CPU MVCC mirror,
+records p95/p99/throughput/CUDA/H2D/D2H/zero-H2D route metrics, and reports the
+remaining full-tier blocker as an explicit operator-approved long-run/capacity
+gate after the streaming boundary. On this host, Docker cleanup currently
+blocks a clean PostgreSQL comparator lifecycle before another full-tier attempt.
 
 ## Non-Goals For The First P8 Design
 

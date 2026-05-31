@@ -6,10 +6,10 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpu_db_engine::{
-    BenchmarkRelationalResidencyChunkInstall, Engine, RelationalSelectResult,
+    BenchmarkRelationalResidencyOwnedChunkInstall, Engine, RelationalSelectResult,
     ResidentDeviceTextColumnLayout,
 };
-use gpu_db_execution::{CudaDeviceMemoryChunk, CudaDriverRuntime};
+use gpu_db_execution::{CudaDriverRuntime, CudaOwnedDeviceMemoryChunk};
 use gpu_db_protocol::{parse_command, Command, Select};
 
 const VRAM_BYTES: u64 = 24 * 1024 * 1024 * 1024;
@@ -22,6 +22,7 @@ const TARGET_TIERS: &[(&str, u64)] = &[
 const CONCURRENCY_TARGETS: &[usize] = &[1, 10, 100, 1000, 10_000];
 const RETAINED_BYTES_PER_ORDER_LINE_ROW: u64 = 40;
 const GENERATED_BYTES_PER_ORDER_LINE_ROW: u64 = 96;
+const ORDER_LINE_DIST_INFO_LEN: usize = 6;
 
 #[derive(Debug)]
 struct Args {
@@ -236,22 +237,14 @@ fn run_chunked_install_self_check(args: &Args) -> Result<(), Box<dyn Error>> {
         next_row = chunk_end + 1;
     }
 
-    let layout = build_order_line_chunked_resident_layout(args.rows, args.chunk_rows)?;
-    let chunk_refs = layout
-        .chunks
-        .iter()
-        .map(|chunk| CudaDeviceMemoryChunk {
-            byte_offset: chunk.byte_offset,
-            bytes: chunk.bytes.as_slice(),
-        })
-        .collect::<Vec<_>>();
+    let layout = order_line_resident_layout_plan(args.rows, args.chunk_rows)?;
     let mut engine = Engine::new_local();
     engine.execute_text(
         1,
         "CREATE TABLE order_line (ol_o_id INT, ol_i_id INT, ol_quantity INT, ol_amount INT, ol_dist_info TEXT)",
     )?;
-    let snapshot = engine.install_benchmark_relational_residency_chunks(
-        BenchmarkRelationalResidencyChunkInstall {
+    let snapshot = engine.install_benchmark_relational_residency_owned_chunks(
+        BenchmarkRelationalResidencyOwnedChunkInstall {
             table: "order_line",
             gpu_id: 0,
             row_count: args.rows,
@@ -259,7 +252,7 @@ fn run_chunked_install_self_check(args: &Args) -> Result<(), Box<dyn Error>> {
             resident_device_int4_columns: layout.resident_device_int4_columns.clone(),
             resident_device_text_columns: layout.resident_device_text_columns.clone(),
             allocated_bytes: layout.allocated_bytes,
-            chunks: &chunk_refs,
+            chunks: order_line_resident_chunk_iter(args.rows, args.chunk_rows)?,
         },
     )?;
     let count = engine.execute_relational_select(&select("SELECT COUNT(*) FROM order_line")?)?;
@@ -344,17 +337,13 @@ fn run_chunked_upload_self_check(args: &Args) -> Result<(), Box<dyn Error>> {
     }
     fs::create_dir_all(&artifact_dir)?;
 
-    let layout = build_order_line_chunked_resident_layout(args.rows, args.chunk_rows)?;
-    let chunk_refs = layout
-        .chunks
-        .iter()
-        .map(|chunk| CudaDeviceMemoryChunk {
-            byte_offset: chunk.byte_offset,
-            bytes: chunk.bytes.as_slice(),
-        })
-        .collect::<Vec<_>>();
+    let layout = order_line_resident_layout_plan(args.rows, args.chunk_rows)?;
     let runtime = CudaDriverRuntime::probe()?;
-    let resident = runtime.retain_device_memory_chunks(0, layout.allocated_bytes, &chunk_refs)?;
+    let resident = runtime.retain_device_memory_owned_chunks(
+        0,
+        layout.allocated_bytes,
+        order_line_resident_chunk_iter(args.rows, args.chunk_rows)?,
+    )?;
     let row_count = resident.count_rows_from_header()?;
     let amount_17_count =
         resident.count_i32_equal_from_payload(layout.amount_byte_offset, row_count, 17)?;
@@ -390,7 +379,7 @@ fn run_chunked_upload_self_check(args: &Args) -> Result<(), Box<dyn Error>> {
         "{{\"kind\":\"chunked_upload_self_check\",\"rows\":{},\"chunk_rows\":{},\"chunks\":{},\"allocated_bytes\":{},\"copied_bytes\":{},\"row_count\":{},\"amount_17_count\":{},\"alpha_prefix_count\":{},\"status\":\"pass\"}}",
         args.rows,
         args.chunk_rows,
-        layout.chunks.len(),
+        layout.chunk_count,
         metadata.allocated_bytes,
         metadata.copied_bytes,
         row_count,
@@ -406,7 +395,7 @@ fn run_chunked_upload_self_check(args: &Args) -> Result<(), Box<dyn Error>> {
     );
     report.push_str(&format!("- rows: {}\n", args.rows));
     report.push_str(&format!("- chunk_rows: {}\n", args.chunk_rows));
-    report.push_str(&format!("- copied_chunks: {}\n", layout.chunks.len()));
+    report.push_str(&format!("- copied_chunks: {}\n", layout.chunk_count));
     report.push_str(&format!(
         "- allocated_bytes: {}\n",
         metadata.allocated_bytes
@@ -441,16 +430,8 @@ fn run_chunked_execution(args: &Args) -> Result<(), Box<dyn Error>> {
 
     let run_id = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let layout_started = Instant::now();
-    let layout = build_order_line_chunked_resident_layout(args.rows, args.chunk_rows)?;
+    let layout = order_line_resident_layout_plan(args.rows, args.chunk_rows)?;
     let layout_elapsed_ms = layout_started.elapsed().as_millis();
-    let chunk_refs = layout
-        .chunks
-        .iter()
-        .map(|chunk| CudaDeviceMemoryChunk {
-            byte_offset: chunk.byte_offset,
-            bytes: chunk.bytes.as_slice(),
-        })
-        .collect::<Vec<_>>();
 
     let mut engine = Engine::new_local();
     engine.execute_text(
@@ -458,8 +439,8 @@ fn run_chunked_execution(args: &Args) -> Result<(), Box<dyn Error>> {
         "CREATE TABLE order_line (ol_o_id INT, ol_i_id INT, ol_quantity INT, ol_amount INT, ol_dist_info TEXT)",
     )?;
     let install_started = Instant::now();
-    let snapshot = engine.install_benchmark_relational_residency_chunks(
-        BenchmarkRelationalResidencyChunkInstall {
+    let snapshot = engine.install_benchmark_relational_residency_owned_chunks(
+        BenchmarkRelationalResidencyOwnedChunkInstall {
             table: "order_line",
             gpu_id: 0,
             row_count: args.rows,
@@ -467,7 +448,7 @@ fn run_chunked_execution(args: &Args) -> Result<(), Box<dyn Error>> {
             resident_device_int4_columns: layout.resident_device_int4_columns.clone(),
             resident_device_text_columns: layout.resident_device_text_columns.clone(),
             allocated_bytes: layout.allocated_bytes,
-            chunks: &chunk_refs,
+            chunks: order_line_resident_chunk_iter(args.rows, args.chunk_rows)?,
         },
     )?;
     let install_elapsed_ms = install_started.elapsed().as_millis();
@@ -483,7 +464,11 @@ fn run_chunked_execution(args: &Args) -> Result<(), Box<dyn Error>> {
     );
     markdown.push_str(&format!("- rows: {}\n", args.rows));
     markdown.push_str(&format!("- chunk_rows: {}\n", args.chunk_rows));
-    markdown.push_str(&format!("- upload_chunks: {}\n", layout.chunks.len()));
+    markdown.push_str(&format!("- upload_chunks: {}\n", layout.chunk_count));
+    markdown.push_str(&format!(
+        "- peak_caller_owned_chunk_bytes: {}\n",
+        layout.peak_chunk_bytes
+    ));
     markdown.push_str(&format!("- resident_bytes: {}\n", snapshot.resident_bytes));
     markdown.push_str(&format!("- allocated_bytes: {}\n", layout.allocated_bytes));
     markdown.push_str(&format!(
@@ -497,13 +482,14 @@ fn run_chunked_execution(args: &Args) -> Result<(), Box<dyn Error>> {
 
     writeln!(
         raw,
-        "{{\"kind\":\"chunked_execution_start\",\"run_id\":{},\"rows\":{},\"chunk_rows\":{},\"upload_chunks\":{},\"resident_bytes\":{},\"allocated_bytes\":{},\"resident_rows_materialized\":{},\"layout_elapsed_ms\":{},\"install_elapsed_ms\":{}}}",
+        "{{\"kind\":\"chunked_execution_start\",\"run_id\":{},\"rows\":{},\"chunk_rows\":{},\"upload_chunks\":{},\"resident_bytes\":{},\"allocated_bytes\":{},\"peak_caller_owned_chunk_bytes\":{},\"resident_rows_materialized\":{},\"layout_elapsed_ms\":{},\"install_elapsed_ms\":{}}}",
         run_id,
         args.rows,
         args.chunk_rows,
-        layout.chunks.len(),
+        layout.chunk_count,
         snapshot.resident_bytes,
         layout.allocated_bytes,
+        layout.peak_chunk_bytes,
         snapshot.resident_rows.len(),
         layout_elapsed_ms,
         install_elapsed_ms
@@ -584,21 +570,22 @@ struct ChunkedResidentLayout {
     dist_offsets_byte_offset: u64,
     dist_bytes_byte_offset: u64,
     dist_bytes_len: u64,
+    chunk_count: usize,
+    peak_chunk_bytes: usize,
     resident_device_int4_columns: Vec<String>,
     resident_device_text_columns: Vec<ResidentDeviceTextColumnLayout>,
-    chunks: Vec<ResidentUploadChunk>,
 }
 
-#[derive(Debug)]
-struct ResidentUploadChunk {
-    byte_offset: u64,
-    bytes: Vec<u8>,
-}
-
-fn build_order_line_chunked_resident_layout(
+fn order_line_resident_layout_plan(
     rows: usize,
     chunk_rows: usize,
 ) -> Result<ChunkedResidentLayout, Box<dyn Error>> {
+    if rows == 0 {
+        return Err("resident layout requires at least one row".into());
+    }
+    if chunk_rows == 0 {
+        return Err("resident layout requires at least one chunk row".into());
+    }
     let header_len = std::mem::size_of::<u64>() as u64;
     let int_column_len = rows as u64 * std::mem::size_of::<i32>() as u64;
     let ol_o_id_offset = header_len;
@@ -606,63 +593,33 @@ fn build_order_line_chunked_resident_layout(
     let quantity_offset = ol_i_id_offset + int_column_len;
     let amount_offset = quantity_offset + int_column_len;
     let dist_offsets_offset = amount_offset + int_column_len;
-
-    let dist_values = (1..=rows).map(order_line_dist_info).collect::<Vec<_>>();
-    let mut dist_offsets = Vec::with_capacity(rows + 1);
-    let mut dist_bytes = Vec::new();
-    dist_offsets.push(0_u64);
-    for value in &dist_values {
-        dist_bytes.extend_from_slice(value.as_bytes());
-        dist_offsets.push(dist_bytes.len() as u64);
-    }
-    let dist_offsets_len = dist_offsets.len() as u64 * std::mem::size_of::<u64>() as u64;
+    let dist_bytes_len = rows as u64 * ORDER_LINE_DIST_INFO_LEN as u64;
+    let dist_offsets_len = (rows as u64 + 1) * std::mem::size_of::<u64>() as u64;
     let dist_bytes_offset = dist_offsets_offset + dist_offsets_len;
-    let allocated_bytes = dist_bytes_offset + dist_bytes.len() as u64;
-
-    let mut chunks = Vec::new();
-    chunks.push(ResidentUploadChunk {
-        byte_offset: 0,
-        bytes: (rows as u64).to_le_bytes().to_vec(),
-    });
-    append_i32_column_chunks(&mut chunks, ol_o_id_offset, rows, chunk_rows, |id| {
-        id as i32
-    });
-    append_i32_column_chunks(&mut chunks, ol_i_id_offset, rows, chunk_rows, |id| {
-        ((id % 100_000) + 1) as i32
-    });
-    append_i32_column_chunks(&mut chunks, quantity_offset, rows, chunk_rows, |id| {
-        ((id % 50) + 1) as i32
-    });
-    append_i32_column_chunks(&mut chunks, amount_offset, rows, chunk_rows, |id| {
-        ((id * 17) % 100_000) as i32
-    });
-    for (chunk_index, offset_chunk) in dist_offsets.chunks(chunk_rows).enumerate() {
-        let mut bytes = Vec::with_capacity(std::mem::size_of_val(offset_chunk));
-        for offset in offset_chunk {
-            bytes.extend_from_slice(&offset.to_le_bytes());
-        }
-        chunks.push(ResidentUploadChunk {
-            byte_offset: dist_offsets_offset
-                + (chunk_index * chunk_rows * std::mem::size_of::<u64>()) as u64,
-            bytes,
-        });
-    }
-    let mut byte_start = 0usize;
-    while byte_start < dist_bytes.len() {
-        let byte_end = dist_bytes.len().min(byte_start + chunk_rows * 16);
-        chunks.push(ResidentUploadChunk {
-            byte_offset: dist_bytes_offset + byte_start as u64,
-            bytes: dist_bytes[byte_start..byte_end].to_vec(),
-        });
-        byte_start = byte_end;
-    }
+    let allocated_bytes = dist_bytes_offset + dist_bytes_len;
+    let row_chunks = rows.div_ceil(chunk_rows);
+    let offset_chunks = (rows + 1).div_ceil(chunk_rows);
+    let text_bytes_per_chunk = chunk_rows * ORDER_LINE_DIST_INFO_LEN;
+    let text_byte_chunks = rows.div_ceil(chunk_rows);
+    let chunk_count = 1 + (4 * row_chunks) + offset_chunks + text_byte_chunks;
+    let peak_chunk_bytes = [
+        std::mem::size_of::<u64>(),
+        chunk_rows * std::mem::size_of::<i32>(),
+        chunk_rows * std::mem::size_of::<u64>(),
+        text_bytes_per_chunk,
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or(0);
 
     Ok(ChunkedResidentLayout {
         allocated_bytes,
         amount_byte_offset: amount_offset,
         dist_offsets_byte_offset: dist_offsets_offset,
         dist_bytes_byte_offset: dist_bytes_offset,
-        dist_bytes_len: dist_bytes.len() as u64,
+        dist_bytes_len,
+        chunk_count,
+        peak_chunk_bytes,
         resident_device_int4_columns: vec![
             "ol_o_id".to_string(),
             "ol_i_id".to_string(),
@@ -673,10 +630,168 @@ fn build_order_line_chunked_resident_layout(
             name: "ol_dist_info".to_string(),
             offsets_byte_offset: dist_offsets_offset,
             bytes_byte_offset: dist_bytes_offset,
-            bytes_len: dist_bytes.len() as u64,
+            bytes_len: dist_bytes_len,
         }],
-        chunks,
     })
+}
+
+fn order_line_resident_chunk_iter(
+    rows: usize,
+    chunk_rows: usize,
+) -> Result<OrderLineResidentChunkIter, Box<dyn Error>> {
+    let layout = order_line_resident_layout_plan(rows, chunk_rows)?;
+    Ok(OrderLineResidentChunkIter {
+        rows,
+        chunk_rows,
+        layout,
+        stage: OrderLineChunkStage::Header,
+        next_row: 1,
+        next_offset_index: 0,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrderLineChunkStage {
+    Header,
+    OlOId,
+    OlIId,
+    Quantity,
+    Amount,
+    TextOffsets,
+    TextBytes,
+    Done,
+}
+
+struct OrderLineResidentChunkIter {
+    rows: usize,
+    chunk_rows: usize,
+    layout: ChunkedResidentLayout,
+    stage: OrderLineChunkStage,
+    next_row: usize,
+    next_offset_index: usize,
+}
+
+impl Iterator for OrderLineResidentChunkIter {
+    type Item = CudaOwnedDeviceMemoryChunk;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            match self.stage {
+                OrderLineChunkStage::Header => {
+                    self.stage = OrderLineChunkStage::OlOId;
+                    return Some(CudaOwnedDeviceMemoryChunk {
+                        byte_offset: 0,
+                        bytes: (self.rows as u64).to_le_bytes().to_vec(),
+                    });
+                }
+                OrderLineChunkStage::OlOId => {
+                    let offset = std::mem::size_of::<u64>() as u64;
+                    if let Some(chunk) = self.next_i32_column_chunk(offset, |id| id as i32) {
+                        return Some(chunk);
+                    }
+                    self.stage = OrderLineChunkStage::OlIId;
+                    self.next_row = 1;
+                }
+                OrderLineChunkStage::OlIId => {
+                    let offset = std::mem::size_of::<u64>() as u64
+                        + self.rows as u64 * std::mem::size_of::<i32>() as u64;
+                    if let Some(chunk) =
+                        self.next_i32_column_chunk(offset, |id| ((id % 100_000) + 1) as i32)
+                    {
+                        return Some(chunk);
+                    }
+                    self.stage = OrderLineChunkStage::Quantity;
+                    self.next_row = 1;
+                }
+                OrderLineChunkStage::Quantity => {
+                    let offset = std::mem::size_of::<u64>() as u64
+                        + (self.rows as u64 * 2 * std::mem::size_of::<i32>() as u64);
+                    if let Some(chunk) =
+                        self.next_i32_column_chunk(offset, |id| ((id % 50) + 1) as i32)
+                    {
+                        return Some(chunk);
+                    }
+                    self.stage = OrderLineChunkStage::Amount;
+                    self.next_row = 1;
+                }
+                OrderLineChunkStage::Amount => {
+                    if let Some(chunk) = self
+                        .next_i32_column_chunk(self.layout.amount_byte_offset, |id| {
+                            ((id * 17) % 100_000) as i32
+                        })
+                    {
+                        return Some(chunk);
+                    }
+                    self.stage = OrderLineChunkStage::TextOffsets;
+                }
+                OrderLineChunkStage::TextOffsets => {
+                    if self.next_offset_index <= self.rows {
+                        let start = self.next_offset_index;
+                        let end = self.rows.min(start + self.chunk_rows - 1);
+                        let mut bytes =
+                            Vec::with_capacity((end - start + 1) * std::mem::size_of::<u64>());
+                        for index in start..=end {
+                            let offset = (index * ORDER_LINE_DIST_INFO_LEN) as u64;
+                            bytes.extend_from_slice(&offset.to_le_bytes());
+                        }
+                        self.next_offset_index = end + 1;
+                        return Some(CudaOwnedDeviceMemoryChunk {
+                            byte_offset: self.layout.dist_offsets_byte_offset
+                                + (start * std::mem::size_of::<u64>()) as u64,
+                            bytes,
+                        });
+                    }
+                    self.stage = OrderLineChunkStage::TextBytes;
+                    self.next_row = 1;
+                }
+                OrderLineChunkStage::TextBytes => {
+                    if self.next_row <= self.rows {
+                        let start = self.next_row;
+                        let end = self.rows.min(start + self.chunk_rows - 1);
+                        let mut bytes =
+                            Vec::with_capacity((end - start + 1) * ORDER_LINE_DIST_INFO_LEN);
+                        for id in start..=end {
+                            bytes.extend_from_slice(order_line_dist_info(id).as_bytes());
+                        }
+                        self.next_row = end + 1;
+                        return Some(CudaOwnedDeviceMemoryChunk {
+                            byte_offset: self.layout.dist_bytes_byte_offset
+                                + ((start - 1) * ORDER_LINE_DIST_INFO_LEN) as u64,
+                            bytes,
+                        });
+                    }
+                    self.stage = OrderLineChunkStage::Done;
+                }
+                OrderLineChunkStage::Done => return None,
+            }
+        }
+    }
+}
+
+impl OrderLineResidentChunkIter {
+    fn next_i32_column_chunk<F>(
+        &mut self,
+        column_byte_offset: u64,
+        value_for_row: F,
+    ) -> Option<CudaOwnedDeviceMemoryChunk>
+    where
+        F: Fn(usize) -> i32,
+    {
+        if self.next_row > self.rows {
+            return None;
+        }
+        let start = self.next_row;
+        let end = self.rows.min(start + self.chunk_rows - 1);
+        let mut bytes = Vec::with_capacity((end - start + 1) * std::mem::size_of::<i32>());
+        for id in start..=end {
+            bytes.extend_from_slice(&value_for_row(id).to_le_bytes());
+        }
+        self.next_row = end + 1;
+        Some(CudaOwnedDeviceMemoryChunk {
+            byte_offset: column_byte_offset + ((start - 1) * std::mem::size_of::<i32>()) as u64,
+            bytes,
+        })
+    }
 }
 
 fn assert_single_int(
@@ -722,15 +837,32 @@ fn assert_single_numeric(
 }
 
 fn expected_amount_sum(rows: usize) -> i64 {
-    (1..=rows).map(|id| ((id * 17) % 100_000) as i64).sum()
+    let period = 100_000usize;
+    let full_periods = rows / period;
+    let remainder = rows % period;
+    let period_sum = 4_999_950_000i64;
+    let remainder_sum = (1..=remainder)
+        .map(|id| ((id * 17) % 100_000) as i64)
+        .sum::<i64>();
+    full_periods as i64 * period_sum + remainder_sum
 }
 
 fn expected_quantity_between_avg(rows: usize) -> String {
-    let values = (1..=rows)
-        .map(|id| ((id % 50) + 1) as i64)
-        .filter(|value| (10..=40).contains(value))
-        .collect::<Vec<_>>();
-    fixed_scale_average(values.iter().sum::<i64>() as i128, values.len())
+    let period = 50usize;
+    let full_periods = rows / period;
+    let remainder = rows % period;
+    let period_count = 31usize;
+    let period_sum = (10..=40).sum::<i64>();
+    let mut count = full_periods * period_count;
+    let mut sum = full_periods as i64 * period_sum;
+    for id in 1..=remainder {
+        let value = ((id % 50) + 1) as i64;
+        if (10..=40).contains(&value) {
+            count += 1;
+            sum += value;
+        }
+    }
+    fixed_scale_average(sum as i128, count)
 }
 
 fn fixed_scale_average(sum: i128, count: usize) -> String {
@@ -749,35 +881,12 @@ fn fixed_scale_average(sum: i128, count: usize) -> String {
 }
 
 fn expected_amount_max_filter(rows: usize, lower: i32) -> i64 {
-    (1..=rows)
+    let scan_rows = rows.min(100_000);
+    (1..=scan_rows)
         .map(|id| ((id * 17) % 100_000) as i64)
         .filter(|value| *value >= i64::from(lower))
         .max()
         .unwrap_or(0)
-}
-
-fn append_i32_column_chunks<F>(
-    chunks: &mut Vec<ResidentUploadChunk>,
-    column_byte_offset: u64,
-    rows: usize,
-    chunk_rows: usize,
-    value_for_row: F,
-) where
-    F: Fn(usize) -> i32,
-{
-    let mut start = 1usize;
-    while start <= rows {
-        let end = rows.min(start + chunk_rows - 1);
-        let mut bytes = Vec::with_capacity((end - start + 1) * std::mem::size_of::<i32>());
-        for id in start..=end {
-            bytes.extend_from_slice(&value_for_row(id).to_le_bytes());
-        }
-        chunks.push(ResidentUploadChunk {
-            byte_offset: column_byte_offset + ((start - 1) * std::mem::size_of::<i32>()) as u64,
-            bytes,
-        });
-        start = end + 1;
-    }
 }
 
 fn order_line_dist_info(id: usize) -> String {
