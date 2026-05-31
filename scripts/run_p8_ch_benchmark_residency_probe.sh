@@ -61,6 +61,31 @@ ENV
   chmod 600 "$env_path"
 }
 
+pgsql_baseline_docker_graceful_stop() {
+  local name="$1"
+  if ! docker ps --format '{{.Names}}' | grep -Fxq "$name"; then
+    return 0
+  fi
+
+  local pg_ctl
+  pg_ctl="$(docker exec "$name" sh -lc 'command -v pg_ctl || find /usr/lib/postgresql -name pg_ctl -type f 2>/dev/null | head -1' 2>/dev/null || true)"
+  if [ -z "$pg_ctl" ]; then
+    return 1
+  fi
+
+  docker exec --user postgres "$name" sh -lc "'$pg_ctl' -D \"\$PGDATA\" -m fast -w stop" >/dev/null 2>&1
+}
+
+pgsql_baseline_docker_remove() {
+  local name="$1"
+  if ! docker ps -a --format '{{.Names}}' | grep -Fxq "$name"; then
+    return 0
+  fi
+
+  pgsql_baseline_docker_graceful_stop "$name" || true
+  docker rm "$name" >/dev/null 2>&1
+}
+
 pgsql_baseline_docker_up() {
   if ! command -v docker >/dev/null 2>&1; then
     echo "p8_ch_benchmark_pgsql_docker=blocked reason=missing_docker_client" >&2
@@ -78,13 +103,15 @@ pgsql_baseline_docker_up() {
   password="$(pgsql_docker_password)"
 
   if docker ps -a --format '{{.Names}}' | grep -Fxq "$name"; then
-    if ! docker rm -f "$name" >/dev/null 2>&1; then
+    if ! pgsql_baseline_docker_remove "$name"; then
       echo "p8_ch_benchmark_pgsql_docker=blocked reason=existing_container_cleanup_failed name=$name" >&2
       return 1
     fi
   fi
   docker run -d \
     --name "$name" \
+    --label gpu-db.p8-benchmark=true \
+    --label gpu-db.lifecycle=disposable \
     -e POSTGRES_PASSWORD="$password" \
     -e POSTGRES_DB=gpu_db_p8_baseline \
     -p "127.0.0.1:${port}:5432" \
@@ -111,7 +138,7 @@ pgsql_baseline_docker_down() {
   fi
   local name
   name="$(pgsql_docker_name)"
-  if ! docker rm -f "$name" >/dev/null 2>&1; then
+  if ! pgsql_baseline_docker_remove "$name"; then
     echo "p8_ch_benchmark_pgsql_docker_cleanup=failed name=$name reason=docker_remove_failed" >&2
     return 1
   fi
