@@ -1560,6 +1560,24 @@ pub struct SessionLifecycle {
     state: SessionState,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransactionStatus {
+    Idle,
+    InTransaction,
+}
+
+impl TransactionStatus {
+    pub fn ready_for_query_in_transaction(self) -> bool {
+        matches!(self, Self::InTransaction)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadyLoopState {
+    transaction_status: TransactionStatus,
+    skip_until_sync: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FrontendMessage {
     SimpleQuery(String),
@@ -2188,6 +2206,56 @@ impl SessionLifecycle {
 
         self.state = next;
         Ok(next)
+    }
+}
+
+impl Default for ReadyLoopState {
+    fn default() -> Self {
+        Self {
+            transaction_status: TransactionStatus::Idle,
+            skip_until_sync: false,
+        }
+    }
+}
+
+impl ReadyLoopState {
+    pub fn from_flags(in_transaction: bool, skip_until_sync: bool) -> Self {
+        Self {
+            transaction_status: if in_transaction {
+                TransactionStatus::InTransaction
+            } else {
+                TransactionStatus::Idle
+            },
+            skip_until_sync,
+        }
+    }
+
+    pub fn in_transaction(&self) -> bool {
+        self.transaction_status.ready_for_query_in_transaction()
+    }
+
+    pub fn skip_until_sync(&self) -> bool {
+        self.skip_until_sync
+    }
+
+    pub fn should_dispatch_extended_message(&self) -> bool {
+        !self.skip_until_sync
+    }
+
+    pub fn set_transaction_status(&mut self, status: TransactionStatus) {
+        self.transaction_status = status;
+    }
+
+    pub fn mark_extended_error(&mut self) {
+        self.skip_until_sync = true;
+    }
+
+    pub fn clear_extended_error_on_sync(&mut self, copy_stream_active: bool) -> bool {
+        if copy_stream_active {
+            return false;
+        }
+        self.skip_until_sync = false;
+        true
     }
 }
 
@@ -9738,6 +9806,32 @@ mod tests {
                 event: SessionEvent::Commit,
             }
         );
+    }
+
+    #[test]
+    fn ready_loop_state_tracks_sync_recovery_and_transaction_status() {
+        let mut ready_loop = ReadyLoopState::default();
+        assert!(ready_loop.should_dispatch_extended_message());
+        assert!(!ready_loop.in_transaction());
+
+        ready_loop.set_transaction_status(TransactionStatus::InTransaction);
+        assert!(ready_loop.in_transaction());
+
+        ready_loop.mark_extended_error();
+        assert!(ready_loop.skip_until_sync());
+        assert!(!ready_loop.should_dispatch_extended_message());
+
+        assert!(!ready_loop.clear_extended_error_on_sync(true));
+        assert!(ready_loop.skip_until_sync());
+
+        assert!(ready_loop.clear_extended_error_on_sync(false));
+        assert!(!ready_loop.skip_until_sync());
+        assert!(ready_loop.should_dispatch_extended_message());
+        assert!(ready_loop.in_transaction());
+
+        let from_flags = ReadyLoopState::from_flags(false, true);
+        assert!(!from_flags.in_transaction());
+        assert!(from_flags.skip_until_sync());
     }
 
     fn frontend_frame(tag: u8, payload: &[u8]) -> Vec<u8> {

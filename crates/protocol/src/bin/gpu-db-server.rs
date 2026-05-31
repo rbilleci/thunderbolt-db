@@ -18,9 +18,9 @@ use gpu_db_protocol::{
 use gpu_db_protocol::{
     parse_command, parse_frontend_message, parse_startup_packet, AclRelationKind, ColumnDefault,
     Command, CommentTarget, CopyColumn, CopyFormat, CopyOptions, CopyParseError, DatabasePrivilege,
-    FrontendMessage, FunctionPrivilege, ParseError, PublicationTarget, SchemaPrivilege,
-    SelectFilter, SelectFilterOp, SelectProjection, SqlValue, StartupPacket, TablePrivilege,
-    TablespacePrivilege, SUPPORTED_SQL_TYPES,
+    FrontendMessage, FunctionPrivilege, ParseError, PublicationTarget, ReadyLoopState,
+    SchemaPrivilege, SelectFilter, SelectFilterOp, SelectProjection, SqlValue, StartupPacket,
+    TablePrivilege, TablespacePrivilege, SUPPORTED_SQL_TYPES,
 };
 use gpu_db_protocol::{DescribeTarget, SqlType};
 use hmac::{Hmac, Mac};
@@ -4623,6 +4623,8 @@ fn handle_frontend_message(
     extended_error_pending: &mut bool,
     message: FrontendMessage,
 ) -> io::Result<bool> {
+    let mut ready_loop =
+        ReadyLoopState::from_flags(session.in_transaction, *extended_error_pending);
     match message {
         FrontendMessage::SimpleQuery(query) => {
             if session.copy_in.is_some() {
@@ -4634,7 +4636,7 @@ fn handle_frontend_message(
                         position: None,
                     },
                 )?;
-            } else if !*extended_error_pending {
+            } else if ready_loop.should_dispatch_extended_message() {
                 run_simple_query(stream, session, &query)?
             }
         }
@@ -4643,9 +4645,12 @@ fn handle_frontend_message(
             query,
             parameter_type_oids,
         } => {
-            if !*extended_error_pending {
+            if ready_loop.should_dispatch_extended_message() {
                 *extended_error_pending =
                     handle_parse(stream, session, statement_name, query, parameter_type_oids)?;
+                if *extended_error_pending {
+                    ready_loop.mark_extended_error();
+                }
             }
         }
         FrontendMessage::Bind {
@@ -4655,7 +4660,7 @@ fn handle_frontend_message(
             parameters,
             result_format_codes,
         } => {
-            if !*extended_error_pending {
+            if ready_loop.should_dispatch_extended_message() {
                 *extended_error_pending = handle_bind(
                     stream,
                     session,
@@ -4665,30 +4670,42 @@ fn handle_frontend_message(
                     parameters,
                     result_format_codes,
                 )?;
+                if *extended_error_pending {
+                    ready_loop.mark_extended_error();
+                }
             }
         }
         FrontendMessage::Describe { target, name } => {
-            if !*extended_error_pending {
+            if ready_loop.should_dispatch_extended_message() {
                 *extended_error_pending = handle_describe(stream, session, target, &name)?;
+                if *extended_error_pending {
+                    ready_loop.mark_extended_error();
+                }
             }
         }
         FrontendMessage::Execute {
             portal_name,
             max_rows,
         } => {
-            if !*extended_error_pending {
+            if ready_loop.should_dispatch_extended_message() {
                 *extended_error_pending = handle_execute(stream, session, &portal_name, max_rows)?;
+                if *extended_error_pending {
+                    ready_loop.mark_extended_error();
+                }
             }
         }
         FrontendMessage::Close { target, name } => {
-            if !*extended_error_pending {
-                *extended_error_pending = handle_close(stream, session, target, &name)?
+            if ready_loop.should_dispatch_extended_message() {
+                *extended_error_pending = handle_close(stream, session, target, &name)?;
+                if *extended_error_pending {
+                    ready_loop.mark_extended_error();
+                }
             }
         }
         FrontendMessage::Terminate => return Ok(false),
         FrontendMessage::Sync => {
-            if session.copy_in.is_none() {
-                *extended_error_pending = false;
+            if ready_loop.clear_extended_error_on_sync(session.copy_in.is_some()) {
+                *extended_error_pending = ready_loop.skip_until_sync();
                 write_ready_for_query(stream, session.in_transaction)?
             }
         }
@@ -4703,9 +4720,10 @@ fn handle_frontend_message(
                 if ready_after_done {
                     write_ready_for_query(stream, session.in_transaction)?;
                 } else {
-                    *extended_error_pending = true;
+                    ready_loop.mark_extended_error();
+                    *extended_error_pending = ready_loop.skip_until_sync();
                 }
-            } else if session.copy_in.is_none() && !*extended_error_pending {
+            } else if session.copy_in.is_none() && ready_loop.should_dispatch_extended_message() {
                 write_error(
                     stream,
                     &ErrorField {
@@ -4715,7 +4733,8 @@ fn handle_frontend_message(
                         position: None,
                     },
                 )?;
-                *extended_error_pending = true;
+                ready_loop.mark_extended_error();
+                *extended_error_pending = ready_loop.skip_until_sync();
             }
         }
         FrontendMessage::CopyDone => {
@@ -4730,7 +4749,7 @@ fn handle_frontend_message(
                 if ready_after_done {
                     write_ready_for_query(stream, session.in_transaction)?;
                 }
-            } else if !*extended_error_pending {
+            } else if ready_loop.should_dispatch_extended_message() {
                 write_error(
                     stream,
                     &ErrorField {
@@ -4740,7 +4759,8 @@ fn handle_frontend_message(
                         position: None,
                     },
                 )?;
-                *extended_error_pending = true;
+                ready_loop.mark_extended_error();
+                *extended_error_pending = ready_loop.skip_until_sync();
             }
         }
         FrontendMessage::CopyFail(_) => {
@@ -4756,9 +4776,10 @@ fn handle_frontend_message(
                 if copy.ready_after_done {
                     write_ready_for_query(stream, session.in_transaction)?;
                 } else {
-                    *extended_error_pending = true;
+                    ready_loop.mark_extended_error();
+                    *extended_error_pending = ready_loop.skip_until_sync();
                 }
-            } else if !*extended_error_pending {
+            } else if ready_loop.should_dispatch_extended_message() {
                 write_error(
                     stream,
                     &ErrorField {
@@ -4768,11 +4789,12 @@ fn handle_frontend_message(
                         position: None,
                     },
                 )?;
-                *extended_error_pending = true;
+                ready_loop.mark_extended_error();
+                *extended_error_pending = ready_loop.skip_until_sync();
             }
         }
         other => {
-            if !*extended_error_pending {
+            if ready_loop.should_dispatch_extended_message() {
                 write_error(
                     stream,
                     &ErrorField {
@@ -4781,7 +4803,8 @@ fn handle_frontend_message(
                         position: None,
                     },
                 )?;
-                *extended_error_pending = true;
+                ready_loop.mark_extended_error();
+                *extended_error_pending = ready_loop.skip_until_sync();
             }
         }
     }
