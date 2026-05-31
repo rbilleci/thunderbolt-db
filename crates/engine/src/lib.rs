@@ -20,17 +20,17 @@ use gpu_db_observability::{
 use gpu_db_planner::{ExecutionPlan, Planner, PlannerConfig};
 use gpu_db_protocol::{
     parse_command, AclRelationKind, AddCheckConstraint, AddForeignKey, AddUniqueConstraint,
-    ColumnDef, ColumnDefault, Command, CommentTarget, CreateDatabase, CreateDomain,
-    CreateExtension, CreateIndex, CreateMaterializedView, CreatePublication, CreateRole,
-    CreateSchema, CreateSequence, CreateSubscription, CreateTable, CreateTablespace, CreateView,
-    DatabasePrivilege, Delete, DropConstraint, DropDatabase, DropDomain, DropExtension, DropIndex,
-    DropMaterializedView, DropPublication, DropRole, DropSchema, DropSequence, DropSubscription,
-    DropTable, DropTablespace, DropView, FunctionPrivilege, Insert, ParseError, PublicationTarget,
-    RefreshMaterializedView, RenameColumn, RenameConstraint, RenameDatabase, RenameFunction,
-    RenameIndex, RenameMaterializedView, RenameRole, RenameSequence, RenameTable, RenameTablespace,
-    RenameView, SchemaPrivilege, Select, SelectFilterOp, SelectFunction, SelectProjection,
-    SequenceNextVal, SequenceSetVal, SqlType, SqlValue, TablePrivilege, TablespacePrivilege,
-    TruncateTable, Update,
+    ColumnDef, ColumnDefault, Command, CommentTarget, CopyColumn, CopyFromStdin, CreateDatabase,
+    CreateDomain, CreateExtension, CreateIndex, CreateMaterializedView, CreatePublication,
+    CreateRole, CreateSchema, CreateSequence, CreateSubscription, CreateTable, CreateTablespace,
+    CreateView, DatabasePrivilege, Delete, DropConstraint, DropDatabase, DropDomain, DropExtension,
+    DropIndex, DropMaterializedView, DropPublication, DropRole, DropSchema, DropSequence,
+    DropSubscription, DropTable, DropTablespace, DropView, FunctionPrivilege, Insert, ParseError,
+    PublicationTarget, RefreshMaterializedView, RenameColumn, RenameConstraint, RenameDatabase,
+    RenameFunction, RenameIndex, RenameMaterializedView, RenameRole, RenameSequence, RenameTable,
+    RenameTablespace, RenameView, SchemaPrivilege, Select, SelectFilterOp, SelectFunction,
+    SelectProjection, SequenceNextVal, SequenceSetVal, SqlType, SqlValue, TablePrivilege,
+    TablespacePrivilege, TruncateTable, Update,
 };
 use gpu_db_replication::{LocalReplicator, LogReplicator, ReplicatedStateMachine};
 use gpu_db_storage::{
@@ -7283,6 +7283,39 @@ fn relational_index_value(value: &SqlValue) -> String {
         SqlValue::Int8(value) => format!("n:{value}"),
         SqlValue::Numeric(value) => format!("d:{value}"),
         SqlValue::Text(value) => format!("t:{value}"),
+    }
+}
+
+fn render_relational_insert(insert: &Insert) -> Result<String, EngineError> {
+    let mut sql = format!("INSERT INTO {}", insert.table);
+    if !insert.columns.is_empty() {
+        sql.push_str(" (");
+        sql.push_str(&insert.columns.join(", "));
+        sql.push(')');
+    }
+    sql.push_str(" VALUES ");
+    let rendered_rows = insert
+        .rows
+        .iter()
+        .map(|row| {
+            let rendered_values = row
+                .iter()
+                .map(render_sql_value_literal)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(format!("({})", rendered_values.join(", ")))
+        })
+        .collect::<Result<Vec<_>, EngineError>>()?;
+    sql.push_str(&rendered_rows.join(", "));
+    Ok(sql)
+}
+
+fn render_sql_value_literal(value: &SqlValue) -> Result<String, EngineError> {
+    match value {
+        SqlValue::Int4(value) => Ok(value.to_string()),
+        SqlValue::Text(value) => Ok(format!("'{}'", value.replace('\'', "''"))),
+        SqlValue::Int8(_) | SqlValue::Numeric(_) => Err(EngineError::ApplyFailed(
+            "COPY-to-engine ingestion supports int4/text rows only".to_string(),
+        )),
     }
 }
 
@@ -17510,6 +17543,53 @@ impl Engine {
 
     pub fn relational_catalog_table(&self, table: &str) -> Option<&RelationalTable> {
         self.relational_catalog.get(table)
+    }
+
+    pub fn relational_copy_columns(&self, table: &str) -> Result<Vec<CopyColumn>, EngineError> {
+        let table = self.relational_catalog.get(table).ok_or_else(|| {
+            EngineError::ApplyFailed(format!("relation \"{}\" does not exist", table))
+        })?;
+        Ok(table
+            .columns
+            .iter()
+            .map(|column| CopyColumn {
+                name: column.name.clone(),
+                ty: column.ty,
+            })
+            .collect())
+    }
+
+    pub fn execute_relational_copy_rows(
+        &mut self,
+        txn_id: u64,
+        copy: &CopyFromStdin,
+        rows: Vec<Vec<SqlValue>>,
+    ) -> Result<usize, ExecuteError> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let table = self.relational_catalog.get(&copy.table).ok_or_else(|| {
+            ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "relation \"{}\" does not exist",
+                copy.table
+            )))
+        })?;
+        let columns = copy.columns.clone().unwrap_or_else(|| {
+            table
+                .columns
+                .iter()
+                .map(|column| column.name.clone())
+                .collect()
+        });
+        let row_count = rows.len();
+        let insert = Insert {
+            table: copy.table.clone(),
+            columns,
+            rows,
+        };
+        let sql = render_relational_insert(&insert).map_err(ExecuteError::Engine)?;
+        self.execute_text(txn_id, &sql)?;
+        Ok(row_count)
     }
 
     pub fn relational_table_acl(
@@ -37657,6 +37737,89 @@ mod tests {
                 matched_keys: 1,
             }
         );
+    }
+
+    #[test]
+    fn relational_copy_rows_commit_through_engine_wal_mvcc() {
+        let mut e = Engine::new_local();
+        e.execute_text(
+            1,
+            "CREATE TABLE people (id INT PRIMARY KEY, name TEXT DEFAULT 'unknown'::text)",
+        )
+        .unwrap();
+
+        let copy = gpu_db_protocol::parse_copy_from_stdin(
+            "COPY people (id, name) FROM STDIN WITH (FORMAT csv)",
+        )
+        .unwrap();
+        let copy_columns = e.relational_copy_columns(&copy.table).unwrap();
+        let rows = ["1,Ada", "2,O'Brien"]
+            .into_iter()
+            .map(|line| {
+                gpu_db_protocol::parse_copy_row(
+                    &copy_columns,
+                    copy.columns.as_deref().unwrap(),
+                    copy.options,
+                    line,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(e.execute_relational_copy_rows(2, &copy, rows).unwrap(), 2);
+
+        let default_copy =
+            gpu_db_protocol::parse_copy_from_stdin("COPY people (id) FROM STDIN").unwrap();
+        let default_rows = ["3"]
+            .into_iter()
+            .map(|line| {
+                gpu_db_protocol::parse_copy_row(
+                    &copy_columns,
+                    default_copy.columns.as_deref().unwrap(),
+                    default_copy.options,
+                    line,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            e.execute_relational_copy_rows(3, &default_copy, default_rows)
+                .unwrap(),
+            1
+        );
+
+        let Command::Select(select) =
+            parse_command("SELECT id, name FROM people ORDER BY id ASC").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let result = e.execute_relational_select(&select).unwrap();
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![SqlValue::Int4(1), SqlValue::Text("Ada".to_string())],
+                vec![SqlValue::Int4(2), SqlValue::Text("O'Brien".to_string())],
+                vec![SqlValue::Int4(3), SqlValue::Text("unknown".to_string())],
+            ]
+        );
+
+        let err = e
+            .execute_relational_copy_rows(
+                4,
+                &copy,
+                vec![vec![
+                    SqlValue::Int4(1),
+                    SqlValue::Text("duplicate".to_string()),
+                ]],
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("duplicate key value"));
+        let after_reject = e.execute_relational_select(&select).unwrap();
+        assert_eq!(after_reject.rows, result.rows);
+
+        let mut recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
+        let recovered_result = recovered.execute_relational_select(&select).unwrap();
+        assert_eq!(recovered_result.rows, result.rows);
     }
 
     #[test]
