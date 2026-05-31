@@ -10,7 +10,7 @@ CONCURRENCY="${GPU_DB_CH_BENCH_CONCURRENCY:-1,10}"
 
 usage() {
   cat <<'USAGE'
-usage: scripts/run_p8_ch_benchmark_residency_probe.sh [--dry-run|--run-baseline|--run-25pct|--pgsql-baseline-preflight|--pgsql-baseline-docker-up|--pgsql-baseline-docker-preflight|--pgsql-baseline-docker-down|--streaming-self-check|--chunked-install-self-check|--chunked-upload-self-check|--cleanup|--self-check]
+usage: scripts/run_p8_ch_benchmark_residency_probe.sh [--dry-run|--run-baseline|--run-25pct|--run-25pct-execute|--pgsql-baseline-preflight|--pgsql-baseline-docker-up|--pgsql-baseline-docker-preflight|--pgsql-baseline-docker-down|--streaming-self-check|--chunked-install-self-check|--chunked-upload-self-check|--cleanup|--self-check]
 
 Environment:
   GPU_DB_CH_BENCH_OUT_DIR       output directory, default target/p8-ch-benchmark-residency
@@ -18,6 +18,9 @@ Environment:
   GPU_DB_CH_BENCH_CONCURRENCY   logical request targets, default 1,10
   GPU_DB_CH_BENCH_MAX_ROWS      scheduled-run guardrail, default 10000
   GPU_DB_CH_BENCH_CHUNK_ROWS    streaming self-check chunk rows, default 16
+  GPU_DB_CH_BENCH_EXECUTE_ROWS  guarded chunked execution rows, default 1024
+  GPU_DB_CH_BENCH_EXECUTE_CHUNK_ROWS  guarded execution chunk rows, default 256
+  GPU_DB_CH_BENCH_ALLOW_FULL_25PCT  set to 1 to attempt all estimated 25pct rows
   GPU_DB_CH_BENCH_PGSQL_URL     libpq connection string for PostgreSQL baseline
   GPU_DB_CH_BENCH_PGSQL_DOCKER_NAME      default gpu-db-p8-pgsql-baseline
   GPU_DB_CH_BENCH_PGSQL_DOCKER_IMAGE     default postgres:16
@@ -106,7 +109,10 @@ pgsql_baseline_docker_down() {
   fi
   local name
   name="$(pgsql_docker_name)"
-  docker rm -f "$name" >/dev/null 2>&1 || true
+  if ! docker rm -f "$name" >/dev/null 2>&1; then
+    echo "p8_ch_benchmark_pgsql_docker_cleanup=failed name=$name reason=docker_remove_failed" >&2
+    return 1
+  fi
   echo "p8_ch_benchmark_pgsql_docker_cleanup=passed name=$name"
 }
 
@@ -317,6 +323,93 @@ PREFLIGHT_JSON
   return 1
 }
 
+write_25pct_execution() {
+  mkdir -p "$OUT_DIR"
+  local retained_target_bytes=6442450944
+  local retained_bytes_per_row=40
+  local estimated_rows=$(((retained_target_bytes + retained_bytes_per_row - 1) / retained_bytes_per_row))
+  local execute_rows="${GPU_DB_CH_BENCH_EXECUTE_ROWS:-1024}"
+  local execute_chunk_rows="${GPU_DB_CH_BENCH_EXECUTE_CHUNK_ROWS:-256}"
+  local full_command="GPU_DB_CH_BENCH_ALLOW_FULL_25PCT=1 GPU_DB_CH_BENCH_EXECUTE_CHUNK_ROWS=1048576 scripts/run_p8_ch_benchmark_residency_probe.sh --run-25pct-execute"
+
+  pgsql_baseline_docker_up
+  GPU_DB_CH_BENCH_PGSQL_URL="$(pgsql_docker_url)" write_pgsql_baseline_preflight
+  write_25pct_preflight
+
+  if [ "${GPU_DB_CH_BENCH_ALLOW_FULL_25PCT:-0}" = "1" ]; then
+    execute_rows="$estimated_rows"
+    execute_chunk_rows="${GPU_DB_CH_BENCH_EXECUTE_CHUNK_ROWS:-1048576}"
+  fi
+
+  cargo run -q -p gpu_db_engine --example p8_ch_benchmark_residency_probe -- \
+    --chunked-execute \
+    --output-dir "$OUT_DIR" \
+    --rows "$execute_rows" \
+    --chunk-rows "$execute_chunk_rows" \
+    --concurrency "$CONCURRENCY"
+  test -s "$OUT_DIR/chunked-execute/execution.md"
+  test -s "$OUT_DIR/chunked-execute/metrics.jsonl"
+  grep -q '"kind":"chunked_metric"' "$OUT_DIR/chunked-execute/metrics.jsonl"
+  grep -q '"resident_route_zero_h2d":true' "$OUT_DIR/chunked-execute/metrics.jsonl"
+  if grep -q '"resident_route_accepted":false' "$OUT_DIR/chunked-execute/metrics.jsonl"; then
+    echo "p8 CH-benCHmark chunked execution included a rejected resident route" >&2
+    exit 1
+  fi
+  grep -q '"kind":"chunked_memory_pressure_probe"' "$OUT_DIR/chunked-execute/metrics.jsonl"
+
+  local status blocker
+  if [ "${GPU_DB_CH_BENCH_ALLOW_FULL_25PCT:-0}" = "1" ]; then
+    status=completed
+    blocker=none
+  else
+    status=blocked
+    blocker=missing_streaming_chunk_iterator_for_full_25pct_execution
+  fi
+
+  cat >"$OUT_DIR/25pct-execution.md" <<REPORT
+# P8 CH-benCHmark 25% Chunked Execution
+
+- tier: 25pct
+- status: $status
+- retained_target_bytes: $retained_target_bytes
+- estimated_order_line_rows: $estimated_rows
+- executed_rows: $execute_rows
+- execute_chunk_rows: $execute_chunk_rows
+- postgresql_baseline_artifact: $OUT_DIR/pgsql-baseline/preflight.md
+- tier_preflight_artifact: $OUT_DIR/25pct-preflight.md
+- gpu_db_execution_artifact: $OUT_DIR/chunked-execute/execution.md
+- raw_metrics: $OUT_DIR/chunked-execute/metrics.jsonl
+- cleanup_command: \`scripts/run_p8_ch_benchmark_residency_probe.sh --cleanup && scripts/run_p8_ch_benchmark_residency_probe.sh --pgsql-baseline-docker-down\`
+- blocker: $blocker
+
+The checked execution path creates an empty \`order_line\` catalog table,
+installs generated benchmark-only resident chunks without SQL-visible MVCC
+inserts, executes the supported aggregate query set, validates deterministic
+formula-backed answers, records p95/p99/throughput/CUDA/H2D/D2H/zero-H2D route
+metrics, and verifies memory-pressure fallback behavior.
+
+When not explicitly opted into the full 25% tier, this command stops after the
+guarded scaled execution. The remaining full-tier blocker is that the current
+Rust upload interface still requires a complete caller-owned chunk slice and
+the example builds chunk bytes before admission; attempting 161,061,274 rows in
+the 6-hour worker window would risk converting a proven execution path into an
+unsafe host-memory/runtime test. The exact full command, for a longer
+operator-approved window after adding/accepting the streaming upload boundary,
+is:
+
+\`\`\`bash
+$full_command
+\`\`\`
+REPORT
+  cat "$OUT_DIR/25pct-execution.md"
+  if [ "$status" = completed ]; then
+    echo "p8_ch_benchmark_25pct_execution=completed rows=$execute_rows"
+  else
+    echo "p8_ch_benchmark_25pct_execution=blocked reason=$blocker" >&2
+    return 1
+  fi
+}
+
 mode="${1:---dry-run}"
 case "$mode" in
   --dry-run)
@@ -356,6 +449,9 @@ case "$mode" in
     ;;
   --run-25pct)
     write_25pct_preflight
+    ;;
+  --run-25pct-execute)
+    write_25pct_execution
     ;;
   --pgsql-baseline-preflight)
     write_pgsql_baseline_preflight
@@ -430,6 +526,10 @@ case "$mode" in
       "$0" --chunked-install-self-check >"$tmp_dir/chunked-install.out"
     GPU_DB_CH_BENCH_OUT_DIR="$tmp_dir/out" GPU_DB_CH_BENCH_ROWS=16 GPU_DB_CH_BENCH_CHUNK_ROWS=4 \
       "$0" --chunked-upload-self-check >"$tmp_dir/chunked-upload.out"
+    GPU_DB_CH_BENCH_OUT_DIR="$tmp_dir/out" GPU_DB_CH_BENCH_EXECUTE_ROWS=16 GPU_DB_CH_BENCH_EXECUTE_CHUNK_ROWS=4 GPU_DB_CH_BENCH_CONCURRENCY=1 \
+      "$0" --run-25pct-execute >"$tmp_dir/chunked-execute.out" 2>"$tmp_dir/chunked-execute.err" || true
+    grep -q 'missing_streaming_chunk_iterator_for_full_25pct_execution' "$tmp_dir/chunked-execute.err"
+    grep -q 'expected_results: deterministic formulas' "$tmp_dir/out/chunked-execute/execution.md"
     if GPU_DB_CH_BENCH_OUT_DIR="$tmp_dir/out" GPU_DB_CH_BENCH_ROWS=16 \
       "$0" --pgsql-baseline-preflight >"$tmp_dir/pgsql.out" 2>"$tmp_dir/pgsql.err"; then
       grep -q 'status: pass' "$tmp_dir/pgsql.out"
@@ -441,6 +541,8 @@ case "$mode" in
     grep -q 'benchmark_chunked_resident_cache_admission: pass' "$tmp_dir/chunked-install.out"
     grep -q 'chunked_retained_device_memory_upload: pass' "$tmp_dir/chunked-upload.out"
     grep -q 'p8_ch_benchmark_cleanup=passed' "$tmp_dir/cleanup.out"
+    "$0" --pgsql-baseline-docker-down >"$tmp_dir/docker-down.out"
+    grep -q 'p8_ch_benchmark_pgsql_docker_cleanup=passed' "$tmp_dir/docker-down.out"
     echo "p8 ch benchmark residency probe self-check passed"
     ;;
   -h|--help)

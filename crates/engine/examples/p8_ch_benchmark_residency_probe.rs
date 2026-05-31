@@ -37,6 +37,7 @@ struct Args {
 enum Mode {
     Estimate,
     Run,
+    ChunkedExecute,
     StreamingSelfCheck,
     ChunkedInstallSelfCheck,
     ChunkedUploadSelfCheck,
@@ -74,6 +75,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     match args.mode {
         Mode::Estimate => write_estimate(&args),
         Mode::Run => run_probe(&args),
+        Mode::ChunkedExecute => run_chunked_execution(&args),
         Mode::StreamingSelfCheck => run_streaming_self_check(&args),
         Mode::ChunkedInstallSelfCheck => run_chunked_install_self_check(&args),
         Mode::ChunkedUploadSelfCheck => run_chunked_upload_self_check(&args),
@@ -423,6 +425,158 @@ fn run_chunked_upload_self_check(args: &Args) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn run_chunked_execution(args: &Args) -> Result<(), Box<dyn Error>> {
+    if args.rows == 0 {
+        return Err("--rows must be greater than zero".into());
+    }
+    if args.chunk_rows == 0 {
+        return Err("--chunk-rows must be greater than zero".into());
+    }
+
+    let artifact_dir = args.output_dir.join("chunked-execute");
+    if artifact_dir.exists() {
+        fs::remove_dir_all(&artifact_dir)?;
+    }
+    fs::create_dir_all(&artifact_dir)?;
+
+    let run_id = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let layout_started = Instant::now();
+    let layout = build_order_line_chunked_resident_layout(args.rows, args.chunk_rows)?;
+    let layout_elapsed_ms = layout_started.elapsed().as_millis();
+    let chunk_refs = layout
+        .chunks
+        .iter()
+        .map(|chunk| CudaDeviceMemoryChunk {
+            byte_offset: chunk.byte_offset,
+            bytes: chunk.bytes.as_slice(),
+        })
+        .collect::<Vec<_>>();
+
+    let mut engine = Engine::new_local();
+    engine.execute_text(
+        1,
+        "CREATE TABLE order_line (ol_o_id INT, ol_i_id INT, ol_quantity INT, ol_amount INT, ol_dist_info TEXT)",
+    )?;
+    let install_started = Instant::now();
+    let snapshot = engine.install_benchmark_relational_residency_chunks(
+        BenchmarkRelationalResidencyChunkInstall {
+            table: "order_line",
+            gpu_id: 0,
+            row_count: args.rows,
+            resident_bytes: layout.allocated_bytes,
+            resident_device_int4_columns: layout.resident_device_int4_columns.clone(),
+            resident_device_text_columns: layout.resident_device_text_columns.clone(),
+            allocated_bytes: layout.allocated_bytes,
+            chunks: &chunk_refs,
+        },
+    )?;
+    let install_elapsed_ms = install_started.elapsed().as_millis();
+
+    let queries = query_cases(args.rows)?;
+    let mut raw = BufWriter::new(File::create(artifact_dir.join("metrics.jsonl"))?);
+    let mut markdown = String::new();
+    markdown.push_str("# P8 Chunked Resident Execution Probe\n\n");
+    markdown.push_str(&format!("- run_id: {run_id}\n"));
+    markdown.push_str("- status: pass\n");
+    markdown.push_str(
+        "- scope: checked chunked execution over benchmark-only generated resident chunks\n",
+    );
+    markdown.push_str(&format!("- rows: {}\n", args.rows));
+    markdown.push_str(&format!("- chunk_rows: {}\n", args.chunk_rows));
+    markdown.push_str(&format!("- upload_chunks: {}\n", layout.chunks.len()));
+    markdown.push_str(&format!("- resident_bytes: {}\n", snapshot.resident_bytes));
+    markdown.push_str(&format!("- allocated_bytes: {}\n", layout.allocated_bytes));
+    markdown.push_str(&format!(
+        "- resident_rows_materialized: {}\n",
+        snapshot.resident_rows.len()
+    ));
+    markdown.push_str(&format!("- layout_elapsed_ms: {layout_elapsed_ms}\n"));
+    markdown.push_str(&format!("- install_elapsed_ms: {install_elapsed_ms}\n"));
+    markdown.push_str("- expected_results: deterministic formulas, no CPU MVCC mirror\n");
+    markdown.push_str("- benchmark_only_durability_boundary: generated resident chunks are not normal SQL/MVCC inserts\n\n");
+
+    writeln!(
+        raw,
+        "{{\"kind\":\"chunked_execution_start\",\"run_id\":{},\"rows\":{},\"chunk_rows\":{},\"upload_chunks\":{},\"resident_bytes\":{},\"allocated_bytes\":{},\"resident_rows_materialized\":{},\"layout_elapsed_ms\":{},\"install_elapsed_ms\":{}}}",
+        run_id,
+        args.rows,
+        args.chunk_rows,
+        layout.chunks.len(),
+        snapshot.resident_bytes,
+        layout.allocated_bytes,
+        snapshot.resident_rows.len(),
+        layout_elapsed_ms,
+        install_elapsed_ms
+    )?;
+
+    for logical_requests in &args.concurrency {
+        markdown.push_str(&format!("## logical_requests_{logical_requests}\n"));
+        for case in &queries {
+            let expected = expected_result_for_case(case, args.rows)?;
+            let metrics = run_query_case(
+                &mut engine,
+                case,
+                *logical_requests,
+                &expected,
+                snapshot.resident_bytes,
+            )?;
+            writeln!(
+                raw,
+                "{{\"kind\":\"chunked_metric\",\"query\":\"{}\",\"logical_requests\":{},\"result_rows\":{},\"p95_us\":{},\"p99_us\":{},\"throughput_qps\":{:.3},\"h2d_bytes_total\":{},\"d2h_bytes_total\":{},\"kernel_samples\":{},\"kernel_ms\":{},\"cuda_event_samples\":{},\"cuda_event_elapsed_us\":{},\"resident_route_accepted\":{},\"resident_route_zero_h2d\":{},\"resident_bytes\":{},\"correctness_validated\":{},\"expected_source\":\"formula\"}}",
+                metrics.query,
+                metrics.logical_requests,
+                metrics.result_rows,
+                metrics.p95_us,
+                metrics.p99_us,
+                metrics.throughput_qps,
+                metrics.h2d_bytes_total,
+                metrics.d2h_bytes_total,
+                metrics.kernel_samples,
+                metrics.kernel_ms,
+                metrics.cuda_event_samples,
+                metrics.cuda_event_elapsed_us,
+                metrics.resident_route_accepted,
+                metrics.resident_route_zero_h2d,
+                metrics.resident_bytes,
+                metrics.correctness_validated
+            )?;
+            markdown.push_str(&format!(
+                "- {}: pass p95_us={} p99_us={} throughput_qps={:.2} h2d_bytes_total={} d2h_bytes_total={} cuda_event_samples={} resident_zero_h2d={} expected_source=formula\n",
+                metrics.query,
+                metrics.p95_us,
+                metrics.p99_us,
+                metrics.throughput_qps,
+                metrics.h2d_bytes_total,
+                metrics.d2h_bytes_total,
+                metrics.cuda_event_samples,
+                metrics.resident_route_zero_h2d
+            ));
+        }
+        markdown.push('\n');
+    }
+
+    let count_select = select("SELECT COUNT(*) FROM order_line")?;
+    engine.mark_gpu_memory_pressured(0);
+    let pressured = engine.plan_relational_resident_route(&count_select);
+    writeln!(
+        raw,
+        "{{\"kind\":\"chunked_memory_pressure_probe\",\"memory_pressure_route_accepted\":{},\"reason\":\"{}\",\"cache_state\":\"{}\"}}",
+        pressured.accepted,
+        json_escape(&pressured.reason),
+        json_escape(&pressured.cache_state)
+    )?;
+    markdown.push_str("## memory_pressure_probe\n");
+    markdown.push_str(&format!(
+        "- fallback_behavior: {} reason={} cache_state={}\n",
+        if pressured.accepted { "fail" } else { "pass" },
+        pressured.reason,
+        pressured.cache_state
+    ));
+    raw.flush()?;
+    fs::write(artifact_dir.join("execution.md"), markdown)?;
+    Ok(())
+}
+
 #[derive(Debug)]
 struct ChunkedResidentLayout {
     allocated_bytes: u64,
@@ -767,9 +921,10 @@ fn run_query_case(
         let query_started = Instant::now();
         let result = gpu.execute_relational_select(&select)?;
         latencies.push(query_started.elapsed());
-        if result.columns != expected.columns || result.rows != expected.rows {
+        if !expected.columns.is_empty() && result.columns != expected.columns {
             return Err(format!("{} CPU/resident results diverged", case.name).into());
         }
+        assert_rows_match(&result.rows, &expected.rows, case.name)?;
         result_rows = result.rows.len();
     }
     let elapsed = started.elapsed();
@@ -892,6 +1047,81 @@ fn query_cases(row_count: usize) -> Result<Vec<QueryCase>, Box<dyn Error>> {
     ])
 }
 
+fn expected_result_for_case(
+    case: &QueryCase,
+    rows: usize,
+) -> Result<RelationalSelectResult, Box<dyn Error>> {
+    let value = match case.name {
+        "order_line_count_all" => gpu_db_protocol::SqlValue::Int8(rows as i64),
+        "order_line_sum_amount" => gpu_db_protocol::SqlValue::Int8(expected_amount_sum(rows)),
+        "order_line_avg_quantity_between" => {
+            gpu_db_protocol::SqlValue::Numeric(expected_quantity_between_avg(rows))
+        }
+        "order_line_max_amount_filter" => {
+            let lower = (rows / 4).max(1) as i32;
+            gpu_db_protocol::SqlValue::Int4(expected_amount_max_filter(rows, lower) as i32)
+        }
+        other => return Err(format!("no formula-backed expected result for {other}").into()),
+    };
+    Ok(RelationalSelectResult {
+        columns: Vec::new(),
+        rows: vec![vec![value]],
+        planned_target: gpu_db_execution::DeviceTarget::Cpu,
+        executed_target: gpu_db_execution::DeviceTarget::Cpu,
+        fallback_reason: None,
+        access_path: gpu_db_engine::RelationalAccessPath::FullTableScan,
+    })
+}
+
+fn assert_rows_match(
+    actual: &[Vec<gpu_db_protocol::SqlValue>],
+    expected: &[Vec<gpu_db_protocol::SqlValue>],
+    label: &str,
+) -> Result<(), Box<dyn Error>> {
+    if actual.len() != expected.len() {
+        return Err(format!(
+            "{label} returned {} rows, expected {}",
+            actual.len(),
+            expected.len()
+        )
+        .into());
+    }
+    for (row_index, (actual_row, expected_row)) in actual.iter().zip(expected.iter()).enumerate() {
+        if actual_row.len() != expected_row.len() {
+            return Err(format!(
+                "{label} row {row_index} returned {} values, expected {}",
+                actual_row.len(),
+                expected_row.len()
+            )
+            .into());
+        }
+        for (column_index, (actual_value, expected_value)) in
+            actual_row.iter().zip(expected_row.iter()).enumerate()
+        {
+            if !sql_value_matches(actual_value, expected_value) {
+                return Err(format!(
+                    "{label} row {row_index} column {column_index} returned {actual_value:?}, expected {expected_value:?}"
+                )
+                .into());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn sql_value_matches(
+    actual: &gpu_db_protocol::SqlValue,
+    expected: &gpu_db_protocol::SqlValue,
+) -> bool {
+    match (actual, expected) {
+        (gpu_db_protocol::SqlValue::Int4(actual), gpu_db_protocol::SqlValue::Int8(expected))
+        | (gpu_db_protocol::SqlValue::Int8(expected), gpu_db_protocol::SqlValue::Int4(actual)) => {
+            i64::from(*actual) == *expected
+        }
+        _ => actual == expected,
+    }
+}
+
 fn select(sql: &str) -> Result<Select, Box<dyn Error>> {
     match parse_command(sql)? {
         Command::Select(select) => Ok(select),
@@ -946,6 +1176,7 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
         match arg.as_str() {
             "--estimate" => mode = Some(Mode::Estimate),
             "--run" => mode = Some(Mode::Run),
+            "--chunked-execute" => mode = Some(Mode::ChunkedExecute),
             "--streaming-self-check" => mode = Some(Mode::StreamingSelfCheck),
             "--chunked-install-self-check" => mode = Some(Mode::ChunkedInstallSelfCheck),
             "--chunked-upload-self-check" => mode = Some(Mode::ChunkedUploadSelfCheck),
