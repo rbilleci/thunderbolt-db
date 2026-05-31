@@ -7,7 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpu_db_engine::{
     BenchmarkRelationalResidencyOwnedChunkInstall, Engine, RelationalSelectResult,
-    ResidentDeviceTextColumnLayout,
+    ResidentDeviceInt4ColumnStats, ResidentDeviceTextColumnLayout,
 };
 use gpu_db_execution::{CudaDriverRuntime, CudaOwnedDeviceMemoryChunk};
 use gpu_db_protocol::{parse_command, Command, Select};
@@ -251,6 +251,7 @@ fn run_chunked_install_self_check(args: &Args) -> Result<(), Box<dyn Error>> {
             row_count: args.rows,
             resident_bytes: layout.allocated_bytes,
             resident_device_int4_columns: layout.resident_device_int4_columns.clone(),
+            resident_device_int4_column_stats: layout.resident_device_int4_column_stats.clone(),
             resident_device_text_columns: layout.resident_device_text_columns.clone(),
             allocated_bytes: layout.allocated_bytes,
             chunks: order_line_resident_chunk_iter(args.rows, args.chunk_rows)?,
@@ -447,6 +448,7 @@ fn run_chunked_execution(args: &Args) -> Result<(), Box<dyn Error>> {
             row_count: args.rows,
             resident_bytes: layout.allocated_bytes,
             resident_device_int4_columns: layout.resident_device_int4_columns.clone(),
+            resident_device_int4_column_stats: layout.resident_device_int4_column_stats.clone(),
             resident_device_text_columns: layout.resident_device_text_columns.clone(),
             allocated_bytes: layout.allocated_bytes,
             chunks: order_line_resident_chunk_iter(args.rows, args.chunk_rows)?,
@@ -576,6 +578,7 @@ struct ChunkedResidentLayout {
     chunk_count: usize,
     peak_chunk_bytes: usize,
     resident_device_int4_columns: Vec<String>,
+    resident_device_int4_column_stats: Vec<ResidentDeviceInt4ColumnStats>,
     resident_device_text_columns: Vec<ResidentDeviceTextColumnLayout>,
 }
 
@@ -628,6 +631,28 @@ fn order_line_resident_layout_plan(
             "ol_i_id".to_string(),
             "ol_quantity".to_string(),
             "ol_amount".to_string(),
+        ],
+        resident_device_int4_column_stats: vec![
+            ResidentDeviceInt4ColumnStats {
+                name: "ol_o_id".to_string(),
+                min: 1,
+                max: i32::try_from(rows).unwrap_or(i32::MAX),
+            },
+            ResidentDeviceInt4ColumnStats {
+                name: "ol_i_id".to_string(),
+                min: 1,
+                max: 100_000,
+            },
+            ResidentDeviceInt4ColumnStats {
+                name: "ol_quantity".to_string(),
+                min: 1,
+                max: 50,
+            },
+            ResidentDeviceInt4ColumnStats {
+                name: "ol_amount".to_string(),
+                min: 0,
+                max: 99_999,
+            },
         ],
         resident_device_text_columns: vec![ResidentDeviceTextColumnLayout {
             name: "ol_dist_info".to_string(),

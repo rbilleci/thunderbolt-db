@@ -6287,6 +6287,7 @@ pub struct RelationalResidencySnapshot {
     pub resident_bytes: u64,
     pub resident_rows: Vec<Vec<SqlValue>>,
     pub resident_device_int4_columns: Vec<String>,
+    pub resident_device_int4_column_stats: Vec<ResidentDeviceInt4ColumnStats>,
     pub resident_device_text_columns: Vec<ResidentDeviceTextColumnLayout>,
     pub valid_through_index: Index,
     pub invalidated_by_txn_id: Option<TxnId>,
@@ -6298,6 +6299,13 @@ pub struct RelationalResidencySnapshot {
     pub resident_bytes_after_admission: u64,
     pub evicted_tables_on_admission: Vec<String>,
     pub device_memory_proof: Option<CudaDeviceMemoryProof>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResidentDeviceInt4ColumnStats {
+    pub name: String,
+    pub min: i32,
+    pub max: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6314,6 +6322,7 @@ pub struct BenchmarkRelationalResidencyChunkInstall<'a> {
     pub row_count: usize,
     pub resident_bytes: u64,
     pub resident_device_int4_columns: Vec<String>,
+    pub resident_device_int4_column_stats: Vec<ResidentDeviceInt4ColumnStats>,
     pub resident_device_text_columns: Vec<ResidentDeviceTextColumnLayout>,
     pub allocated_bytes: u64,
     pub chunks: &'a [CudaDeviceMemoryChunk<'a>],
@@ -6328,6 +6337,7 @@ where
     pub row_count: usize,
     pub resident_bytes: u64,
     pub resident_device_int4_columns: Vec<String>,
+    pub resident_device_int4_column_stats: Vec<ResidentDeviceInt4ColumnStats>,
     pub resident_device_text_columns: Vec<ResidentDeviceTextColumnLayout>,
     pub allocated_bytes: u64,
     pub chunks: I,
@@ -6546,6 +6556,37 @@ fn resident_device_int4_column_offset(
             ))
         })?;
     Ok(offset)
+}
+
+fn resident_device_int4_column_stats<'a>(
+    snapshot: &'a RelationalResidencySnapshot,
+    table: &RelationalTable,
+    column_idx: usize,
+) -> Option<&'a ResidentDeviceInt4ColumnStats> {
+    let column = table.columns.get(column_idx)?;
+    if column.ty != SqlType::Int4 {
+        return None;
+    }
+    snapshot
+        .resident_device_int4_column_stats
+        .iter()
+        .find(|stats| stats.name == column.name)
+}
+
+fn resident_i32_comparison_domain_is_empty(
+    stats: &ResidentDeviceInt4ColumnStats,
+    needle: i32,
+    comparison: CudaI32Comparison,
+) -> bool {
+    if stats.min > stats.max {
+        return true;
+    }
+    match comparison {
+        CudaI32Comparison::Lt => stats.min >= needle,
+        CudaI32Comparison::Lte => stats.min > needle,
+        CudaI32Comparison::Gt => stats.max <= needle,
+        CudaI32Comparison::Gte => stats.max < needle,
+    }
 }
 
 fn acl_relation_kind_label(kind: AclRelationKind) -> &'static str {
@@ -7148,9 +7189,8 @@ fn resident_route_d2h_bytes_estimate(
         "int4_scalar_aggregate" if matches!(select.projection, SelectProjection::Sum { .. }) => {
             I64_RESULT_BYTES
         }
-        "int4_scalar_aggregate" | "int4_filtered_scalar_aggregate" => {
-            GROUPED_STATS_BYTES.saturating_add(RESULT_LEN_BYTES)
-        }
+        "int4_scalar_aggregate" => GROUPED_STATS_BYTES.saturating_add(RESULT_LEN_BYTES),
+        "int4_filtered_scalar_aggregate" => SCALAR_STATS_BYTES.saturating_add(RESULT_LEN_BYTES),
         "int4_between_scalar_aggregate" => SCALAR_STATS_BYTES.saturating_add(RESULT_LEN_BYTES),
         "count_all" | "int4_equality_count" | "int4_range_count" | "int4_filter_group_count" => {
             COUNT_RESULT_BYTES
@@ -15367,6 +15407,22 @@ impl Engine {
                 table.name
             ))));
         }
+        if matches!(select.projection, SelectProjection::Max { .. })
+            && resident_device_int4_column_stats(&snapshot, &table, aggregate_idx).is_some_and(
+                |stats| resident_i32_comparison_domain_is_empty(stats, needle, comparison),
+            )
+        {
+            self.metrics
+                .observe_d2h_bytes(std::mem::size_of::<i64>() as u64);
+            return Ok(RelationalSelectResult {
+                columns: bound.selected_columns,
+                rows: vec![vec![SqlValue::Text(String::new())]],
+                planned_target: DeviceTarget::Gpu(snapshot.gpu_id),
+                executed_target: DeviceTarget::Gpu(snapshot.gpu_id),
+                fallback_reason: None,
+                access_path,
+            });
+        }
         let device_memory = self
             .relational_resident_cache
             .device_memory
@@ -15410,11 +15466,10 @@ impl Engine {
                 .unwrap_or_else(|| SqlValue::Text(String::new())),
             _ => unreachable!(),
         };
-        let result_d2h_bytes = stats
-            .count
-            .checked_mul(std::mem::size_of::<i32>() as u64)
-            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<u64>() as u64))
-            .unwrap_or(u64::MAX);
+        let result_d2h_bytes = (std::mem::size_of::<u64>()
+            + std::mem::size_of::<i64>()
+            + (2 * std::mem::size_of::<i32>())
+            + std::mem::size_of::<u64>()) as u64;
         self.metrics.observe_d2h_bytes(result_d2h_bytes);
         self.metrics
             .observe_kernel_exec_ms(elapsed.as_millis().try_into().unwrap_or(u64::MAX).max(1));
@@ -17739,14 +17794,23 @@ impl Engine {
             .filter(|column| column.ty == SqlType::Int4)
             .map(|column| column.name.clone())
             .collect::<Vec<_>>();
+        let mut resident_device_int4_column_stats = resident_device_int4_columns
+            .iter()
+            .map(|name| ResidentDeviceInt4ColumnStats {
+                name: name.clone(),
+                min: i32::MAX,
+                max: i32::MIN,
+            })
+            .collect::<Vec<_>>();
         let mut device_payload = vec![0; std::mem::size_of::<u64>()];
         let mut resident_device_text_columns = Vec::new();
-        for column in catalog_table
+        for (int4_ordinal, column) in catalog_table
             .columns
             .iter()
             .enumerate()
             .filter(|(_idx, column)| column.ty == SqlType::Int4)
             .map(|(idx, _column)| idx)
+            .enumerate()
         {
             for row in &resident_rows {
                 let SqlValue::Int4(value) = row[column] else {
@@ -17754,6 +17818,10 @@ impl Engine {
                         "resident snapshot int4 payload encountered non-int4 value".to_string(),
                     )));
                 };
+                if let Some(stats) = resident_device_int4_column_stats.get_mut(int4_ordinal) {
+                    stats.min = stats.min.min(value);
+                    stats.max = stats.max.max(value);
+                }
                 device_payload.extend_from_slice(&value.to_le_bytes());
             }
         }
@@ -17815,6 +17883,7 @@ impl Engine {
             resident_bytes,
             resident_rows,
             resident_device_int4_columns,
+            resident_device_int4_column_stats,
             resident_device_text_columns,
             valid_through_index: self.visible_up_to,
             invalidated_by_txn_id: None,
@@ -18005,6 +18074,7 @@ impl Engine {
         Self::validate_benchmark_resident_chunk_columns(
             &catalog_table,
             &install.resident_device_int4_columns,
+            &install.resident_device_int4_column_stats,
             &install.resident_device_text_columns,
         )?;
         let copied_bytes = chunks
@@ -18065,6 +18135,7 @@ impl Engine {
             resident_bytes,
             resident_rows: Vec::new(),
             resident_device_int4_columns: install.resident_device_int4_columns,
+            resident_device_int4_column_stats: install.resident_device_int4_column_stats,
             resident_device_text_columns: install.resident_device_text_columns,
             valid_through_index: self.visible_up_to,
             invalidated_by_txn_id: None,
@@ -18136,6 +18207,7 @@ impl Engine {
         Self::validate_benchmark_resident_chunk_columns(
             &catalog_table,
             &install.resident_device_int4_columns,
+            &install.resident_device_int4_column_stats,
             &install.resident_device_text_columns,
         )?;
 
@@ -18167,6 +18239,7 @@ impl Engine {
             resident_bytes,
             resident_rows: Vec::new(),
             resident_device_int4_columns: install.resident_device_int4_columns,
+            resident_device_int4_column_stats: install.resident_device_int4_column_stats,
             resident_device_text_columns: install.resident_device_text_columns,
             valid_through_index: self.visible_up_to,
             invalidated_by_txn_id: None,
@@ -18204,6 +18277,7 @@ impl Engine {
     fn validate_benchmark_resident_chunk_columns(
         table: &RelationalTable,
         int4_columns: &[String],
+        int4_stats: &[ResidentDeviceInt4ColumnStats],
         text_columns: &[ResidentDeviceTextColumnLayout],
     ) -> Result<(), ExecuteError> {
         let expected_int4 = table
@@ -18216,6 +18290,22 @@ impl Engine {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
                 "benchmark resident chunk int4 column layout {:?} does not match catalog int4 columns {:?}",
                 int4_columns, expected_int4
+            ))));
+        }
+        let actual_int4_stats = int4_stats
+            .iter()
+            .map(|stats| stats.name.clone())
+            .collect::<Vec<_>>();
+        if actual_int4_stats != expected_int4 {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "benchmark resident chunk int4 stats layout {:?} does not match catalog int4 columns {:?}",
+                actual_int4_stats, expected_int4
+            ))));
+        }
+        if let Some(stats) = int4_stats.iter().find(|stats| stats.min > stats.max) {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "benchmark resident chunk int4 stats for column \"{}\" have min greater than max",
+                stats.name
             ))));
         }
         let expected_text = table
@@ -23321,7 +23411,10 @@ mod tests {
             assert_eq!(after.h2d_bytes_total - before.h2d_bytes_total, 0);
             assert_eq!(
                 after.d2h_bytes_total - before.d2h_bytes_total,
-                3 * std::mem::size_of::<i32>() as u64 + std::mem::size_of::<u64>() as u64,
+                (std::mem::size_of::<u64>()
+                    + std::mem::size_of::<i64>()
+                    + (2 * std::mem::size_of::<i32>())
+                    + std::mem::size_of::<u64>()) as u64,
                 "{sql}"
             );
             assert_eq!(after.kernel_exec_samples - before.kernel_exec_samples, 1);
@@ -23352,6 +23445,31 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("requires the predicate column to match the aggregate column"));
+
+        let Command::Select(empty_max) =
+            parse_command("SELECT MAX(amount) FROM events WHERE amount >= 1000").unwrap()
+        else {
+            unreachable!()
+        };
+        let cpu = e.execute_relational_select(&empty_max).unwrap();
+        let before = e.metrics().snapshot();
+        let resident = e
+            .execute_relational_filtered_scalar_aggregate_with_resident_device_memory_probe(
+                &empty_max,
+            )
+            .unwrap();
+        let after = e.metrics().snapshot();
+        assert_eq!(resident.columns, cpu.columns);
+        assert_eq!(resident.rows, cpu.rows);
+        assert_eq!(resident.planned_target, DeviceTarget::Gpu(0));
+        assert_eq!(resident.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(resident.fallback_reason, None);
+        assert_eq!(after.h2d_bytes_total - before.h2d_bytes_total, 0);
+        assert_eq!(
+            after.d2h_bytes_total - before.d2h_bytes_total,
+            std::mem::size_of::<i64>() as u64
+        );
+        assert_eq!(after.kernel_exec_samples - before.kernel_exec_samples, 0);
 
         let Command::Select(select) =
             parse_command("SELECT SUM(amount) FROM events WHERE amount >= 20").unwrap()
