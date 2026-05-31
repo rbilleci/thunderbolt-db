@@ -6932,11 +6932,20 @@ fn resident_route_query_shape(
             }
             None
         }
-        SelectProjection::Columns(columns) if columns.len() == 1 => {
-            let idx = table
-                .columns
-                .iter()
-                .position(|candidate| candidate.name == columns[0])?;
+        SelectProjection::Columns(columns) => {
+            if columns.is_empty()
+                || select.distinct
+                || select.limit.is_some()
+                || columns.iter().any(|column| {
+                    table
+                        .columns
+                        .iter()
+                        .position(|candidate| candidate.name == *column)
+                        .is_none_or(|idx| table.columns[idx].ty != SqlType::Int4)
+                })
+            {
+                return None;
+            }
             let filter_groups = if !bound.filter_groups.is_empty() {
                 bound.filter_groups.clone()
             } else if !bound.filters.is_empty() {
@@ -6945,17 +6954,22 @@ fn resident_route_query_shape(
                 vec![vec![bound.filter.clone()?]]
             };
             let (filter_idx, op, value) = filter_groups.first()?.first()?.clone();
-            if table.columns[idx].ty == SqlType::Int4
-                && idx == filter_idx
-                && op == SelectFilterOp::Eq
+            if op == SelectFilterOp::Eq
                 && matches!(value, SqlValue::Int4(_))
                 && filter_groups.len() == 1
                 && filter_groups[0].len() == 1
+                && table.columns[filter_idx].ty == SqlType::Int4
             {
-                return Some("int4_equality_projection".to_string());
+                if columns.len() == 1 && bound.selected_indexes[0] == filter_idx {
+                    return Some("int4_equality_projection".to_string());
+                }
+                return Some("int4_equality_multi_column_projection".to_string());
             }
-            (table.columns[idx].ty == SqlType::Int4
-                && idx == filter_idx
+            if columns.len() != 1 {
+                return None;
+            }
+            let idx = bound.selected_indexes[0];
+            (idx == filter_idx
                 && resident_device_i32_comparison(op).is_some()
                 && matches!(value, SqlValue::Int4(_))
                 && filter_groups.len() == 1
@@ -7193,6 +7207,26 @@ fn resident_route_d2h_bytes_estimate(
         }
         "int4_projection" | "int4_ordered_projection" => row_bytes(I32_RESULT_BYTES),
         "int4_equality_projection" => COUNT_RESULT_BYTES,
+        "int4_equality_multi_column_projection" => {
+            let SelectProjection::Columns(columns) = &select.projection else {
+                return 0;
+            };
+            let mut unique_columns = columns.iter().collect::<BTreeSet<_>>();
+            if let Some(filter) = &select.filter {
+                unique_columns.insert(&filter.column);
+            }
+            for filter in &select.filters {
+                unique_columns.insert(&filter.column);
+            }
+            for filter in select.filter_groups.iter().flatten() {
+                unique_columns.insert(&filter.column);
+            }
+            resident_row_bytes(
+                u64::try_from(unique_columns.len())
+                    .unwrap_or(u64::MAX)
+                    .saturating_mul(I32_RESULT_BYTES),
+            )
+        }
         "int4_distinct_projection" | "int4_filtered_distinct_projection" => {
             resident_row_bytes(I32_RESULT_BYTES)
         }
@@ -14474,6 +14508,10 @@ impl Engine {
             }
             "int4_equality_projection" => self
                 .execute_relational_equality_projection_with_resident_device_memory_probe(select),
+            "int4_equality_multi_column_projection" => self
+                .execute_relational_equality_multi_column_projection_with_resident_device_memory_probe(
+                    select,
+                ),
             "int4_ordered_projection" => {
                 self.execute_relational_ordered_projection_with_resident_device_memory_probe(select)
             }
@@ -16510,6 +16548,167 @@ impl Engine {
             rows: std::iter::repeat_with(|| vec![SqlValue::Int4(needle)])
                 .take(matched_len)
                 .collect(),
+            planned_target: DeviceTarget::Gpu(snapshot.gpu_id),
+            executed_target: DeviceTarget::Gpu(snapshot.gpu_id),
+            fallback_reason: None,
+            access_path,
+        })
+    }
+
+    pub fn execute_relational_equality_multi_column_projection_with_resident_device_memory_probe(
+        &mut self,
+        select: &Select,
+    ) -> Result<RelationalSelectResult, ExecuteError> {
+        let (table, bound) = self.bind_relational_select_for_execution(select)?;
+        let filter_groups = if !bound.filter_groups.is_empty() {
+            bound.filter_groups.clone()
+        } else if !bound.filters.is_empty() {
+            vec![bound.filters.clone()]
+        } else if let Some(filter) = bound.filter.clone() {
+            vec![vec![filter]]
+        } else {
+            Vec::new()
+        };
+        if select.distinct
+            || select.group_by.is_some()
+            || !select.having_groups.is_empty()
+            || select.order_by.is_some()
+            || select.limit.is_some()
+            || select.offset.is_some()
+            || bound.selected_indexes.len() < 2
+            || filter_groups.len() != 1
+            || filter_groups[0].len() != 1
+        {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory equality multi-column projection proof currently supports SELECT int4_columns with one int4 equality predicate"
+                    .to_string(),
+            )));
+        }
+        let (filter_idx, op, value) = filter_groups[0][0].clone();
+        let SqlValue::Int4(needle) = value else {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory equality multi-column projection proof currently supports only int4 equality predicates"
+                    .to_string(),
+            )));
+        };
+        if op != SelectFilterOp::Eq || table.columns[filter_idx].ty != SqlType::Int4 {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory equality multi-column projection proof currently supports only int4 equality predicates"
+                    .to_string(),
+            )));
+        }
+        if bound
+            .selected_indexes
+            .iter()
+            .any(|idx| table.columns[*idx].ty != SqlType::Int4)
+        {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory equality multi-column projection proof currently supports only int4 projection columns"
+                    .to_string(),
+            )));
+        }
+
+        let (_query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
+        let snapshot = self
+            .relational_residency_snapshot(&table.name)
+            .ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "relation \"{}\" has no resident snapshot",
+                    table.name
+                )))
+            })?;
+        if snapshot.schema != table.schema || snapshot.table != table.name {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident snapshot no longer matches catalog table identity".to_string(),
+            )));
+        }
+        if !snapshot.is_valid() {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "relation \"{}\" resident snapshot is invalid",
+                table.name
+            ))));
+        }
+        let device_memory = self
+            .relational_resident_cache
+            .device_memory
+            .get(&table.name)
+            .ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "relation \"{}\" has no retained resident device memory",
+                    table.name
+                )))
+            })?;
+        let row_count = u64::try_from(snapshot.row_count).map_err(|_| {
+            ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident snapshot row count exceeds retained device-memory proof range"
+                    .to_string(),
+            ))
+        })?;
+        let mut projected_columns = bound
+            .selected_indexes
+            .iter()
+            .copied()
+            .chain(std::iter::once(filter_idx))
+            .collect::<BTreeSet<_>>();
+        let started = Instant::now();
+        let mut column_values = BTreeMap::new();
+        for idx in std::mem::take(&mut projected_columns) {
+            let byte_offset = resident_device_int4_column_offset(&snapshot, &table, idx)?;
+            let values = device_memory
+                .project_i32_from_payload(byte_offset, row_count)
+                .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
+            if values.len() != snapshot.row_count {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "resident device-memory equality multi-column projection column returned {} rows, expected {}",
+                    values.len(),
+                    snapshot.row_count
+                ))));
+            }
+            column_values.insert(idx, values);
+        }
+        let elapsed = started.elapsed();
+        let filter_values = column_values.get(&filter_idx).ok_or_else(|| {
+            ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident device-memory equality multi-column projection missing predicate column"
+                    .to_string(),
+            ))
+        })?;
+        let rows = (0..snapshot.row_count)
+            .filter(|row_idx| filter_values[*row_idx] == needle)
+            .map(|row_idx| {
+                bound
+                    .selected_indexes
+                    .iter()
+                    .map(|idx| {
+                        column_values
+                            .get(idx)
+                            .map(|values| SqlValue::Int4(values[row_idx]))
+                            .ok_or_else(|| {
+                                ExecuteError::Engine(EngineError::ApplyFailed(
+                                    "resident device-memory equality multi-column projection missing projected column"
+                                        .to_string(),
+                                ))
+                            })
+                    })
+                    .collect::<Result<Vec<_>, ExecuteError>>()
+            })
+            .collect::<Result<Vec<_>, ExecuteError>>()?;
+        let result_d2h_bytes = column_values
+            .len()
+            .checked_mul(snapshot.row_count)
+            .and_then(|cells| cells.checked_mul(std::mem::size_of::<i32>()))
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<u64>()))
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .unwrap_or(u64::MAX);
+        self.metrics.observe_d2h_bytes(result_d2h_bytes);
+        for _ in 0..column_values.len() {
+            self.metrics
+                .observe_kernel_exec_ms(elapsed.as_millis().try_into().unwrap_or(u64::MAX).max(1));
+        }
+
+        Ok(RelationalSelectResult {
+            columns: bound.selected_columns,
+            rows,
             planned_target: DeviceTarget::Gpu(snapshot.gpu_id),
             executed_target: DeviceTarget::Gpu(snapshot.gpu_id),
             fallback_reason: None,
@@ -24336,9 +24535,45 @@ mod tests {
         else {
             unreachable!()
         };
-        let unsupported = e.plan_relational_resident_route(&multi_column);
-        assert!(!unsupported.accepted);
-        assert_eq!(unsupported.query_shape, "unsupported_select");
+        let route = e.plan_relational_resident_route(&multi_column);
+        assert_eq!(route.query_shape, "int4_equality_multi_column_projection");
+        if !route.accepted {
+            assert_eq!(
+                route.reason,
+                "resident snapshot has no retained device memory"
+            );
+            return;
+        }
+        let before = e.metrics().snapshot();
+        let result = e
+            .execute_relational_select(&multi_column)
+            .expect("multi-column equality projection should use resident route");
+        let after = e.metrics().snapshot();
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![SqlValue::Int4(2), SqlValue::Int4(20)],
+                vec![SqlValue::Int4(2), SqlValue::Int4(30)]
+            ]
+        );
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.fallback_reason, None);
+        let decision = e
+            .status_snapshot()
+            .relational_residency
+            .latest_route_decision("events")
+            .unwrap()
+            .clone();
+        assert_eq!(
+            decision.query_shape,
+            "int4_equality_multi_column_projection"
+        );
+        assert_eq!(decision.last_execution_h2d_bytes, Some(0));
+        assert_eq!(decision.last_execution_rows, Some(2));
+        assert_eq!(
+            decision.last_execution_d2h_bytes,
+            Some(after.d2h_bytes_total.saturating_sub(before.d2h_bytes_total))
+        );
     }
 
     #[test]
