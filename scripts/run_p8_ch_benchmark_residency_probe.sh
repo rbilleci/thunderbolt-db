@@ -70,11 +70,33 @@ expected_quantity_between_avg() {
   done
   local whole=$((sum / count))
   local rem=$((sum % count))
-  local fractional=""
+  local digits=()
+  local digit idx carry
   for _ in $(seq 1 16); do
     rem=$((rem * 10))
-    fractional+="$((rem / count))"
+    digit=$((rem / count))
+    digits+=("$digit")
     rem=$((rem % count))
+  done
+  rem=$((rem * 10))
+  digit=$((rem / count))
+  if ((digit >= 5)); then
+    carry=1
+    for ((idx = 15; idx >= 0; idx--)); do
+      if ((digits[idx] < 9)); then
+        digits[idx]=$((digits[idx] + 1))
+        carry=0
+        break
+      fi
+      digits[idx]=0
+    done
+    if ((carry == 1)); then
+      whole=$((whole + 1))
+    fi
+  fi
+  local fractional=""
+  for digit in "${digits[@]}"; do
+    fractional+="$digit"
   done
   printf '%s.%s\n' "$whole" "$fractional"
 }
