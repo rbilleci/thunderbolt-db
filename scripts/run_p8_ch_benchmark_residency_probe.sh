@@ -10,7 +10,7 @@ CONCURRENCY="${GPU_DB_CH_BENCH_CONCURRENCY:-1,10}"
 
 usage() {
   cat <<'USAGE'
-usage: scripts/run_p8_ch_benchmark_residency_probe.sh [--dry-run|--run-baseline|--run-25pct|--run-25pct-execute|--run-125pct|--pgsql-fairness-audit|--gpu-db-protocol-benchmark-smoke|--protocol-retained-route-bridge-report|--pgsql-baseline-preflight|--pgsql-baseline-25pct-latency|--pgsql-baseline-125pct-latency|--pgsql-baseline-docker-up|--pgsql-baseline-docker-preflight|--pgsql-baseline-docker-down|--streaming-self-check|--chunked-install-self-check|--chunked-upload-self-check|--cleanup|--self-check]
+usage: scripts/run_p8_ch_benchmark_residency_probe.sh [--dry-run|--run-baseline|--run-25pct|--run-25pct-execute|--run-125pct|--pgsql-fairness-audit|--gpu-db-protocol-benchmark-smoke|--protocol-retained-route-bridge-report|--engine-backed-protocol-boundary-probe|--pgsql-baseline-preflight|--pgsql-baseline-25pct-latency|--pgsql-baseline-125pct-latency|--pgsql-baseline-docker-up|--pgsql-baseline-docker-preflight|--pgsql-baseline-docker-down|--streaming-self-check|--chunked-install-self-check|--chunked-upload-self-check|--cleanup|--self-check]
 
 Environment:
   GPU_DB_CH_BENCH_OUT_DIR       output directory, default target/p8-ch-benchmark-residency
@@ -30,6 +30,7 @@ Environment:
   GPU_DB_CH_BENCH_GPU_DB_PROTOCOL_ROWS scaled GPU DB protocol smoke rows, default 64
   GPU_DB_CH_BENCH_GPU_DB_PROTOCOL_PORT GPU DB protocol smoke listen port, default 55435
   GPU_DB_CH_BENCH_PROTOCOL_BRIDGE_ROWS scaled bridge blocker rows, default 64
+  GPU_DB_CH_BENCH_ENGINE_PROTOCOL_BOUNDARY_ROWS scaled boundary rows, default 64
   GPU_DB_CH_BENCH_ALLOW_FULL_PGSQL_25PCT  set to 1 to load/query all estimated 25pct PostgreSQL rows
   GPU_DB_CH_BENCH_PGSQL_URL     libpq connection string for PostgreSQL baseline
   GPU_DB_CH_BENCH_PGSQL_DOCKER_NAME      default gpu-db-p8-pgsql-baseline-disposable
@@ -1156,6 +1157,90 @@ REPORT
   echo "p8_ch_benchmark_protocol_retained_route_bridge=blocked reason=$blocker artifact=$report_path"
 }
 
+write_engine_backed_protocol_boundary_probe() {
+  mkdir -p "$OUT_DIR/engine-backed-protocol-boundary"
+  local boundary_dir="$OUT_DIR/engine-backed-protocol-boundary"
+  local rows="${GPU_DB_CH_BENCH_ENGINE_PROTOCOL_BOUNDARY_ROWS:-64}"
+  local report_path="$boundary_dir/engine-backed-protocol-boundary.md"
+  local facts_path="$boundary_dir/probe-facts.txt"
+  local metrics_path="$boundary_dir/metrics.jsonl"
+  local blocker="wire_session_api_split_required"
+  local secondary_blocker="copy_to_engine_wal_adapter_required"
+  local retained_blocker="engine_residency_admission_api_required"
+
+  cargo run -q -p gpu_db_engine --example p8_engine_protocol_boundary_probe >"$facts_path"
+
+  cat >"$metrics_path" <<JSON
+{"kind":"engine_backed_protocol_boundary_probe","rows":$rows,"status":"blocked","engine_owned_target":true,"protocol_parser_reused":true,"wire_session_api_available":false,"copy_parser_in_protocol_lib":false,"protocol_server_session_catalog_reusable":false,"create_table_into_engine_wal_mvcc":true,"resident_admission_from_sql_visible_rows":false,"blocker":"$blocker","secondary_blocker":"$secondary_blocker","retained_blocker":"$retained_blocker"}
+{"kind":"endpoint_boundary_decision","status":"blocked","narrowest_safe_next_step":"extract reusable protocol wire/session/COPY adapter APIs or add an engine-owned PostgreSQL wire target that owns Engine directly; then add SQL/COPY row ingestion into engine WAL/MVCC before retained-route admission"}
+JSON
+
+  cat >"$report_path" <<REPORT
+# P8 Engine-Backed Protocol Boundary Probe
+
+- rows: $rows
+- status: blocked
+- blocker: $blocker
+- secondary_blocker: $secondary_blocker
+- retained_blocker: $retained_blocker
+- probe_facts: $facts_path
+- metrics_artifact: $metrics_path
+
+## Result
+
+The checked \`p8_engine_protocol_boundary_probe\` example proves the safe half of
+the next architecture: an engine-owned target can own \`Engine::new_local()\` and
+reuse \`gpu_db_protocol::parse_command(...)\` without a crate cycle. The probe
+parses and applies the benchmark \`CREATE TABLE order_line (...)\` through
+engine WAL/MVCC state, then parses a benchmark \`SELECT COUNT(*) FROM order_line\`
+and executes it through \`Engine::execute_relational_select(...)\`.
+
+That is not enough to become a PostgreSQL-compatible endpoint. The reusable
+protocol library does not expose the server's wire session, table catalog, or
+\`COPY FROM STDIN\` row parsing/admission path. Those pieces still live privately
+inside \`crates/protocol/src/bin/gpu-db-server.rs\` as \`Session\`,
+\`SharedCatalog\`, \`Table\`, \`CopyInState\`, \`parse_copy_from_stdin(...)\`,
+\`handle_copy_data(...)\`, and \`apply_copy_in_rows(...)\`. The current server
+persists rows into protocol table state, while the retained P8 route requires
+engine-owned SQL-visible rows and/or an explicitly approved benchmark-only
+resident admission path.
+
+## Narrowest Viable Architecture
+
+The next implementation slice should be one of these, in this order:
+
+1. Extract a reusable protocol wire/session/COPY adapter API from
+   \`gpu-db-server.rs\` that can call an engine-owned execution trait without
+   making \`gpu_db_protocol\` depend on \`gpu_db_engine\`.
+2. Add an engine-owned PostgreSQL-compatible benchmark target that reuses the
+   protocol parser/codec pieces, owns \`Engine\`, and routes \`CREATE TABLE\`,
+   \`COPY FROM STDIN\`, and benchmark \`SELECT\` traffic into engine WAL/MVCC.
+3. Add a clearly labeled benchmark-only retained admission adapter only after
+   product approval, because admitting COPY output directly to resident chunks
+   would bypass normal SQL durability unless it is paired with WAL/MVCC seeding.
+
+## Rejected Alternatives
+
+- Do not add \`gpu_db_engine\` as a dependency of \`gpu_db_protocol\`; the
+  workspace already depends in the opposite direction.
+- Do not relabel the current \`--gpu-db-protocol-benchmark-smoke\` metrics as
+  retained-route evidence; those are protocol \`SharedCatalog\` CPU scans.
+- Do not collect true-concurrency product curves until the PostgreSQL-compatible
+  target reaches the retained engine route.
+
+## Benchmark Gate Impact
+
+The existing 25% aggregate result remains provisional \`engine_internal\`
+evidence. The benchmark trust gate is unblocked only after SQL/COPY-loaded rows
+enter engine WAL/MVCC and retained-route admission behind the same
+PostgreSQL-compatible client harness used for default and tuned PostgreSQL.
+The 125% tier remains blocked on \`missing_partitioned_over_resident_execution\`.
+REPORT
+
+  cat "$report_path"
+  echo "p8_ch_benchmark_engine_backed_protocol_boundary=blocked reason=$blocker artifact=$report_path"
+}
+
 order_line_dist_info_shell() {
   local id="$1"
   local bucket=$((id % 10))
@@ -1524,6 +1609,9 @@ case "$mode" in
   --protocol-retained-route-bridge-report)
     write_protocol_retained_route_bridge_report
     ;;
+  --engine-backed-protocol-boundary-probe)
+    write_engine_backed_protocol_boundary_probe
+    ;;
   --pgsql-baseline-docker-up)
     pgsql_baseline_docker_up
     ;;
@@ -1620,6 +1708,10 @@ case "$mode" in
       "$0" --protocol-retained-route-bridge-report >"$tmp_dir/protocol-bridge.out"
     grep -q 'engine_backed_protocol_endpoint_required' "$tmp_dir/out/protocol-retained-route-bridge/protocol-retained-route-bridge.md"
     grep -q '"safe_to_label_protocol_smoke_as_retained":false' "$tmp_dir/out/protocol-retained-route-bridge/metrics.jsonl"
+    GPU_DB_CH_BENCH_OUT_DIR="$tmp_dir/out" GPU_DB_CH_BENCH_ENGINE_PROTOCOL_BOUNDARY_ROWS=16 \
+      "$0" --engine-backed-protocol-boundary-probe >"$tmp_dir/engine-boundary.out"
+    grep -q 'wire_session_api_split_required' "$tmp_dir/out/engine-backed-protocol-boundary/engine-backed-protocol-boundary.md"
+    grep -q 'protocol_parser_reused=true' "$tmp_dir/out/engine-backed-protocol-boundary/probe-facts.txt"
     GPU_DB_CH_BENCH_OUT_DIR="$tmp_dir/out" "$0" --cleanup >"$tmp_dir/cleanup.out"
     grep -q 'chunked_resident_cache_install_available: true' "$tmp_dir/streaming.out"
     grep -q 'benchmark_chunked_resident_cache_admission: pass' "$tmp_dir/chunked-install.out"
