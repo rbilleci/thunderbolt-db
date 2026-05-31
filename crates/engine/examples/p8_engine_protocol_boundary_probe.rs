@@ -1,7 +1,183 @@
 use std::error::Error;
 
 use gpu_db_engine::Engine;
-use gpu_db_protocol::{parse_command, parse_copy_from_stdin, parse_copy_row, Command};
+use gpu_db_protocol::backend::{BackendColumn, BackendWriter};
+use gpu_db_protocol::{
+    parse_command, parse_copy_from_stdin, parse_copy_row, parse_frontend_message,
+    parse_startup_packet, Command, CopyFromStdin, FrontendMessage, SqlValue, StartupPacket,
+};
+
+struct PendingCopy {
+    copy: CopyFromStdin,
+    columns: Vec<gpu_db_protocol::CopyColumn>,
+    rows: Vec<Vec<SqlValue>>,
+}
+
+struct EngineBackedSession {
+    engine: Engine,
+    next_txn_id: u64,
+    pending_copy: Option<PendingCopy>,
+}
+
+impl EngineBackedSession {
+    fn new() -> Self {
+        Self {
+            engine: Engine::new_local(),
+            next_txn_id: 1,
+            pending_copy: None,
+        }
+    }
+
+    fn handle_startup(&mut self, frame: &[u8], output: &mut Vec<u8>) -> Result<(), Box<dyn Error>> {
+        match parse_startup_packet(frame)? {
+            StartupPacket::Startup { .. } => {
+                let mut writer = BackendWriter::new(output);
+                writer.authentication_ok()?;
+                writer.parameter_status("server_version", "16.0-gpu-db")?;
+                writer.ready_for_query(false)?;
+            }
+            other => return Err(format!("unexpected startup packet: {other:?}").into()),
+        }
+        Ok(())
+    }
+
+    fn handle_frontend_frame(
+        &mut self,
+        frame: &[u8],
+        output: &mut Vec<u8>,
+    ) -> Result<(), Box<dyn Error>> {
+        match parse_frontend_message(frame)? {
+            FrontendMessage::SimpleQuery(sql) if parse_copy_from_stdin(&sql).is_some() => {
+                let copy = parse_copy_from_stdin(&sql).expect("COPY statement already checked");
+                let columns = self.engine.relational_copy_columns(&copy.table)?;
+                BackendWriter::new(output).copy_in_response(columns.len())?;
+                self.pending_copy = Some(PendingCopy {
+                    copy,
+                    columns,
+                    rows: Vec::new(),
+                });
+            }
+            FrontendMessage::SimpleQuery(sql) => self.handle_simple_query(&sql, output)?,
+            FrontendMessage::CopyData(bytes) => self.handle_copy_data(&bytes)?,
+            FrontendMessage::CopyDone => self.finish_copy(output)?,
+            other => return Err(format!("unexpected frontend message: {other:?}").into()),
+        }
+        Ok(())
+    }
+
+    fn handle_simple_query(
+        &mut self,
+        sql: &str,
+        output: &mut Vec<u8>,
+    ) -> Result<(), Box<dyn Error>> {
+        match parse_command(sql)? {
+            Command::CreateTable(_) => {
+                let txn_id = self.take_txn_id();
+                self.engine.execute_text(txn_id, sql)?;
+                BackendWriter::new(output).command_complete("CREATE TABLE")?;
+            }
+            Command::Select(select) => {
+                let result = self.engine.execute_relational_select(&select)?;
+                let columns = result
+                    .columns
+                    .iter()
+                    .map(|column| {
+                        BackendColumn::new(&column.name, column.type_oid, column.type_size)
+                    })
+                    .collect::<Vec<_>>();
+                let rows = result
+                    .rows
+                    .iter()
+                    .map(|row| {
+                        row.iter()
+                            .map(|value| Some(sql_value_text(value)))
+                            .collect()
+                    })
+                    .collect::<Vec<Vec<_>>>();
+                BackendWriter::new(output).select_rows(&columns, &rows, true)?;
+            }
+            other => return Err(format!("unexpected simple query command: {other:?}").into()),
+        }
+        Ok(())
+    }
+
+    fn handle_copy_data(&mut self, bytes: &[u8]) -> Result<(), Box<dyn Error>> {
+        let pending = self
+            .pending_copy
+            .as_mut()
+            .ok_or("COPY data arrived without a pending COPY stream")?;
+        let line = std::str::from_utf8(bytes)?.trim_end_matches(['\r', '\n']);
+        let row = parse_copy_row(
+            &pending.columns,
+            pending.copy.columns.as_deref().unwrap(),
+            pending.copy.options,
+            line,
+        )?;
+        pending.rows.push(row);
+        Ok(())
+    }
+
+    fn finish_copy(&mut self, output: &mut Vec<u8>) -> Result<(), Box<dyn Error>> {
+        let pending = self
+            .pending_copy
+            .take()
+            .ok_or("COPY done arrived without a pending COPY stream")?;
+        let txn_id = self.take_txn_id();
+        let copied =
+            self.engine
+                .execute_relational_copy_rows(txn_id, &pending.copy, pending.rows)?;
+        let mut writer = BackendWriter::new(output);
+        writer.command_complete(&format!("COPY {copied}"))?;
+        writer.ready_for_query(false)?;
+        Ok(())
+    }
+
+    fn take_txn_id(&mut self) -> u64 {
+        let txn_id = self.next_txn_id;
+        self.next_txn_id += 1;
+        txn_id
+    }
+}
+
+fn sql_value_text(value: &SqlValue) -> String {
+    match value {
+        SqlValue::Int4(value) => value.to_string(),
+        SqlValue::Int8(value) => value.to_string(),
+        SqlValue::Numeric(value) | SqlValue::Text(value) => value.clone(),
+    }
+}
+
+fn startup_frame() -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&196_608_u32.to_be_bytes());
+    payload.extend_from_slice(b"user\0postgres\0database\0postgres\0\0");
+    let len = u32::try_from(payload.len() + 4).expect("startup frame length fits");
+    let mut frame = len.to_be_bytes().to_vec();
+    frame.extend_from_slice(&payload);
+    frame
+}
+
+fn frontend_frame(tag: u8, payload: &[u8]) -> Vec<u8> {
+    let len = u32::try_from(payload.len() + 4).expect("frontend frame length fits");
+    let mut frame = vec![tag];
+    frame.extend_from_slice(&len.to_be_bytes());
+    frame.extend_from_slice(payload);
+    frame
+}
+
+fn simple_query_frame(sql: &str) -> Vec<u8> {
+    let mut payload = sql.as_bytes().to_vec();
+    payload.push(0);
+    frontend_frame(b'Q', &payload)
+}
+
+fn copy_data_frame(line: &str) -> Vec<u8> {
+    frontend_frame(b'd', line.as_bytes())
+}
+
+fn message_count(output: &[u8], tag: u8) -> usize {
+    output.iter().filter(|byte| **byte == tag).count()
+}
 
 fn main() -> Result<(), Box<dyn Error>> {
     let create_sql = "CREATE TABLE order_line (ol_o_id INT, ol_i_id INT, ol_quantity INT, ol_amount INT, ol_dist_info TEXT)";
@@ -64,11 +240,57 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
     println!("backend_writer_api_available=true");
     println!("wire_session_ready_loop_available=true");
+
+    let mut session = EngineBackedSession::new();
+    let mut wire_output = Vec::new();
+    session.handle_startup(&startup_frame(), &mut wire_output)?;
+    session.handle_frontend_frame(&simple_query_frame(create_sql), &mut wire_output)?;
+    session.handle_frontend_frame(&simple_query_frame(copy_sql), &mut wire_output)?;
+    session.handle_frontend_frame(
+        &copy_data_frame("1,1001,10,2500,alpha0\n"),
+        &mut wire_output,
+    )?;
+    session.handle_frontend_frame(
+        &copy_data_frame("2,1002,20,5000,omega1\n"),
+        &mut wire_output,
+    )?;
+    session.handle_frontend_frame(&frontend_frame(b'c', &[]), &mut wire_output)?;
+    session.handle_frontend_frame(&simple_query_frame(select_sql), &mut wire_output)?;
+    let session_result = session.engine.execute_relational_select(&select)?;
+    let session_rows_visible = matches!(
+        session_result.rows[0][0],
+        gpu_db_protocol::SqlValue::Int4(2) | gpu_db_protocol::SqlValue::Int8(2)
+    );
+    println!("startup_packet_parser_reused=true");
+    println!("frontend_message_parser_reused=true");
+    println!("engine_owned_session_probe=true");
+    println!("copy_stream_lifecycle_probe=true");
+    println!(
+        "backend_startup_messages_written={}",
+        message_count(&wire_output, b'R') > 0
+    );
+    println!(
+        "backend_copy_in_response_written={}",
+        message_count(&wire_output, b'G') == 1
+    );
+    println!(
+        "backend_row_description_written={}",
+        message_count(&wire_output, b'T') == 1
+    );
+    println!(
+        "backend_data_row_written={}",
+        message_count(&wire_output, b'D') == 1
+    );
+    println!(
+        "backend_ready_messages_written={}",
+        message_count(&wire_output, b'Z') >= 2
+    );
+    println!("session_copy_rows_visible_through_engine_select={session_rows_visible}");
     println!("protocol_server_session_catalog_reusable=false");
     println!("resident_admission_from_sql_visible_rows=false");
-    println!("endpoint_boundary_status=engine_copy_wal_mvcc_adapter_ready");
-    println!("next_blocker=session_catalog_trait_required");
-    println!("secondary_blocker=engine_backed_protocol_endpoint_required");
+    println!("endpoint_boundary_status=engine_backed_session_probe_ready");
+    println!("next_blocker=engine_residency_admission_api_required");
+    println!("secondary_blocker=retained_route_endpoint_admission_required");
     println!("retained_blocker=engine_residency_admission_api_required");
 
     Ok(())
