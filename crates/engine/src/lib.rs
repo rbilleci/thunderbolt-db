@@ -14382,6 +14382,13 @@ impl Engine {
         }
 
         let before_metrics = self.metrics.snapshot();
+        if let Some(device_memory) = self
+            .relational_resident_cache
+            .device_memory
+            .get(&decision.table)
+        {
+            device_memory.clear_last_kernel_event_elapsed_us();
+        }
         let result = match decision.query_shape.as_str() {
             "count_all" => self.execute_relational_count_with_resident_device_memory_probe(select),
             "int4_equality_count" => {

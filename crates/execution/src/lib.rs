@@ -131,6 +131,10 @@ impl CudaResidentDeviceMemory {
             .and_then(|elapsed| *elapsed)
     }
 
+    pub fn clear_last_kernel_event_elapsed_us(&self) {
+        self.record_kernel_event_elapsed_us(None);
+    }
+
     fn record_kernel_event_elapsed_us(&self, elapsed_us: Option<u64>) {
         if let Ok(mut last) = self.last_kernel_event_elapsed_us.lock() {
             *last = elapsed_us;
