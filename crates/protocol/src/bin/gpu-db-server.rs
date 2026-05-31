@@ -10,6 +10,7 @@ use std::thread;
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
+use gpu_db_protocol::backend::{BackendColumn, BackendError, BackendWriter};
 use gpu_db_protocol::{
     is_copy_statement, is_supported_extended_copy, parse_copy_from_stdin, parse_copy_row,
     parse_copy_to_stdout_table,
@@ -20727,28 +20728,19 @@ fn is_pg_dump_session_set_statement(canonical: &str) -> bool {
 }
 
 fn write_authentication_ok(stream: &mut dyn ReadWrite) -> io::Result<()> {
-    write_message(stream, b'R', &0_i32.to_be_bytes())
+    BackendWriter::new(stream).authentication_ok()
 }
 
 fn write_authentication_sasl(stream: &mut dyn ReadWrite, mechanisms: &[&str]) -> io::Result<()> {
-    let mut payload = 10_i32.to_be_bytes().to_vec();
-    for mechanism in mechanisms {
-        push_cstring(&mut payload, mechanism);
-    }
-    payload.push(0);
-    write_message(stream, b'R', &payload)
+    BackendWriter::new(stream).authentication_sasl(mechanisms)
 }
 
 fn write_authentication_sasl_continue(stream: &mut dyn ReadWrite, data: &[u8]) -> io::Result<()> {
-    let mut payload = 11_i32.to_be_bytes().to_vec();
-    payload.extend_from_slice(data);
-    write_message(stream, b'R', &payload)
+    BackendWriter::new(stream).authentication_sasl_continue(data)
 }
 
 fn write_authentication_sasl_final(stream: &mut dyn ReadWrite, data: &[u8]) -> io::Result<()> {
-    let mut payload = 12_i32.to_be_bytes().to_vec();
-    payload.extend_from_slice(data);
-    write_message(stream, b'R', &payload)
+    BackendWriter::new(stream).authentication_sasl_final(data)
 }
 
 fn write_backend_key_data(
@@ -20756,95 +20748,63 @@ fn write_backend_key_data(
     process_id: i32,
     secret_key: i32,
 ) -> io::Result<()> {
-    let mut payload = Vec::with_capacity(8);
-    payload.extend_from_slice(&process_id.to_be_bytes());
-    payload.extend_from_slice(&secret_key.to_be_bytes());
-    write_message(stream, b'K', &payload)
+    BackendWriter::new(stream).backend_key_data(process_id, secret_key)
 }
 
 fn write_parameter_status(stream: &mut dyn ReadWrite, key: &str, value: &str) -> io::Result<()> {
-    let mut payload = Vec::with_capacity(key.len() + value.len() + 2);
-    push_cstring(&mut payload, key);
-    push_cstring(&mut payload, value);
-    write_message(stream, b'S', &payload)
+    BackendWriter::new(stream).parameter_status(key, value)
 }
 
 fn write_ready_for_query(stream: &mut dyn ReadWrite, in_transaction: bool) -> io::Result<()> {
-    let status = if in_transaction { b'T' } else { b'I' };
-    write_message(stream, b'Z', &[status])
+    BackendWriter::new(stream).ready_for_query(in_transaction)
 }
 
 fn write_empty_query_response(stream: &mut dyn ReadWrite) -> io::Result<()> {
-    write_message(stream, b'I', &[])
+    BackendWriter::new(stream).empty_query_response()
 }
 
 fn write_command_complete(stream: &mut dyn ReadWrite, tag: &str) -> io::Result<()> {
-    let mut payload = Vec::with_capacity(tag.len() + 1);
-    push_cstring(&mut payload, tag);
-    write_message(stream, b'C', &payload)
+    BackendWriter::new(stream).command_complete(tag)
 }
 
 fn write_parse_complete(stream: &mut dyn ReadWrite) -> io::Result<()> {
-    write_message(stream, b'1', &[])
+    BackendWriter::new(stream).parse_complete()
 }
 
 fn write_bind_complete(stream: &mut dyn ReadWrite) -> io::Result<()> {
-    write_message(stream, b'2', &[])
+    BackendWriter::new(stream).bind_complete()
 }
 
 fn write_close_complete(stream: &mut dyn ReadWrite) -> io::Result<()> {
-    write_message(stream, b'3', &[])
+    BackendWriter::new(stream).close_complete()
 }
 
 fn write_portal_suspended(stream: &mut dyn ReadWrite) -> io::Result<()> {
-    write_message(stream, b's', &[])
+    BackendWriter::new(stream).portal_suspended()
 }
 
 fn write_no_data(stream: &mut dyn ReadWrite) -> io::Result<()> {
-    write_message(stream, b'n', &[])
+    BackendWriter::new(stream).no_data()
 }
 
 fn write_copy_out_response(stream: &mut dyn ReadWrite, column_count: usize) -> io::Result<()> {
-    let column_count = i16::try_from(column_count)
-        .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "too many COPY columns"))?;
-    let mut payload = Vec::with_capacity(1 + 2 + column_count as usize * 2);
-    payload.push(0);
-    payload.extend_from_slice(&column_count.to_be_bytes());
-    for _ in 0..column_count {
-        payload.extend_from_slice(&0_i16.to_be_bytes());
-    }
-    write_message(stream, b'H', &payload)
+    BackendWriter::new(stream).copy_out_response(column_count)
 }
 
 fn write_copy_in_response(stream: &mut dyn ReadWrite, column_count: usize) -> io::Result<()> {
-    let column_count = i16::try_from(column_count)
-        .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "too many COPY columns"))?;
-    let mut payload = Vec::with_capacity(1 + 2 + column_count as usize * 2);
-    payload.push(0);
-    payload.extend_from_slice(&column_count.to_be_bytes());
-    for _ in 0..column_count {
-        payload.extend_from_slice(&0_i16.to_be_bytes());
-    }
-    write_message(stream, b'G', &payload)
+    BackendWriter::new(stream).copy_in_response(column_count)
 }
 
 fn write_copy_data(stream: &mut dyn ReadWrite, bytes: &[u8]) -> io::Result<()> {
-    write_message(stream, b'd', bytes)
+    BackendWriter::new(stream).copy_data(bytes)
 }
 
 fn write_copy_done(stream: &mut dyn ReadWrite) -> io::Result<()> {
-    write_message(stream, b'c', &[])
+    BackendWriter::new(stream).copy_done()
 }
 
 fn write_parameter_description(stream: &mut dyn ReadWrite, type_oids: &[u32]) -> io::Result<()> {
-    let parameter_count = i16::try_from(type_oids.len())
-        .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "too many parameters"))?;
-    let mut payload = Vec::with_capacity(2 + type_oids.len() * 4);
-    payload.extend_from_slice(&parameter_count.to_be_bytes());
-    for oid in type_oids {
-        payload.extend_from_slice(&oid.to_be_bytes());
-    }
-    write_message(stream, b't', &payload)
+    BackendWriter::new(stream).parameter_description(type_oids)
 }
 
 fn write_single_row(
@@ -20877,17 +20837,16 @@ fn write_rows_with_tag(
     include_row_description: bool,
     tag: &str,
 ) -> io::Result<()> {
-    if include_row_description {
-        write_row_description(stream, columns)?;
-    }
-    for row in rows {
-        write_data_row(stream, row)?;
-    }
-    write_command_complete(stream, tag)
+    BackendWriter::new(stream).rows_with_tag(
+        &backend_columns(columns),
+        rows,
+        include_row_description,
+        tag,
+    )
 }
 
 fn write_row_description(stream: &mut dyn ReadWrite, columns: &[Column]) -> io::Result<()> {
-    write_row_description_with_formats(stream, columns, &[])
+    BackendWriter::new(stream).row_description(&backend_columns(columns))
 }
 
 fn write_row_description_with_formats(
@@ -20895,25 +20854,8 @@ fn write_row_description_with_formats(
     columns: &[Column],
     result_format_codes: &[i16],
 ) -> io::Result<()> {
-    let field_count = i16::try_from(columns.len())
-        .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "too many columns"))?;
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&field_count.to_be_bytes());
-    for (idx, column) in columns.iter().enumerate() {
-        push_cstring(&mut payload, &column.name);
-        payload.extend_from_slice(&0_u32.to_be_bytes());
-        payload.extend_from_slice(&0_i16.to_be_bytes());
-        payload.extend_from_slice(&column.oid.to_be_bytes());
-        payload.extend_from_slice(&column.type_size.to_be_bytes());
-        payload.extend_from_slice(&(-1_i32).to_be_bytes());
-        payload.extend_from_slice(&format_code_at(result_format_codes, idx).to_be_bytes());
-    }
-    write_message(stream, b'T', &payload)
-}
-
-fn write_data_row(stream: &mut dyn ReadWrite, values: &[Option<String>]) -> io::Result<()> {
-    let columns = values.iter().map(|_| text_column("")).collect::<Vec<_>>();
-    write_data_row_with_formats(stream, &columns, values, &[])
+    BackendWriter::new(stream)
+        .row_description_with_formats(&backend_columns(columns), result_format_codes)
 }
 
 fn write_data_row_with_formats(
@@ -20922,80 +20864,30 @@ fn write_data_row_with_formats(
     values: &[Option<String>],
     result_format_codes: &[i16],
 ) -> io::Result<()> {
-    let value_count = i16::try_from(values.len())
-        .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "too many row values"))?;
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&value_count.to_be_bytes());
-    for (idx, value) in values.iter().enumerate() {
-        match value {
-            Some(value) => {
-                let encoded;
-                let bytes = if format_code_at(result_format_codes, idx) == 1 {
-                    encoded = encode_binary_result_value(value, columns[idx].oid)?;
-                    encoded.as_slice()
-                } else {
-                    value.as_bytes()
-                };
-                let len = i32::try_from(bytes.len()).map_err(|_| {
-                    io::Error::new(ErrorKind::InvalidInput, "row value too large to encode")
-                })?;
-                payload.extend_from_slice(&len.to_be_bytes());
-                payload.extend_from_slice(bytes);
-            }
-            None => payload.extend_from_slice(&(-1_i32).to_be_bytes()),
-        }
-    }
-    write_message(stream, b'D', &payload)
-}
-
-fn encode_binary_result_value(value: &str, type_oid: u32) -> io::Result<Vec<u8>> {
-    match type_oid {
-        23 => {
-            let value = value.parse::<i32>().map_err(|_| {
-                io::Error::new(
-                    ErrorKind::InvalidInput,
-                    "int4 row value cannot be encoded as binary",
-                )
-            })?;
-            Ok(value.to_be_bytes().to_vec())
-        }
-        25 => Ok(value.as_bytes().to_vec()),
-        _ => Err(io::Error::new(
-            ErrorKind::InvalidInput,
-            "unsupported binary result type",
-        )),
-    }
+    BackendWriter::new(stream).data_row_with_formats(
+        &backend_columns(columns),
+        values,
+        result_format_codes,
+    )
 }
 
 fn write_error(stream: &mut dyn ReadWrite, error: &ErrorField) -> io::Result<()> {
-    let mut payload = Vec::new();
-    push_error_field(&mut payload, b'S', "ERROR");
-    push_error_field(&mut payload, b'V', "ERROR");
-    push_error_field(&mut payload, b'C', error.code);
-    push_error_field(&mut payload, b'M', error.message);
-    if let Some(position) = error.position {
-        push_error_field(&mut payload, b'P', position);
+    BackendWriter::new(stream).error_response(&backend_error(error))
+}
+
+fn backend_columns(columns: &[Column]) -> Vec<BackendColumn> {
+    columns
+        .iter()
+        .map(|column| BackendColumn::new(column.name.clone(), column.oid, column.type_size))
+        .collect()
+}
+
+fn backend_error(error: &ErrorField) -> BackendError {
+    BackendError {
+        code: error.code.to_string(),
+        message: error.message.to_string(),
+        position: error.position.map(str::to_string),
     }
-    payload.push(0);
-    write_message(stream, b'E', &payload)
-}
-
-fn push_error_field(payload: &mut Vec<u8>, tag: u8, value: &str) {
-    payload.push(tag);
-    push_cstring(payload, value);
-}
-
-fn push_cstring(payload: &mut Vec<u8>, value: &str) {
-    payload.extend_from_slice(value.as_bytes());
-    payload.push(0);
-}
-
-fn write_message(stream: &mut dyn ReadWrite, tag: u8, payload: &[u8]) -> io::Result<()> {
-    let total_len = i32::try_from(payload.len() + 4)
-        .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "payload too large"))?;
-    stream.write_all(&[tag])?;
-    stream.write_all(&total_len.to_be_bytes())?;
-    stream.write_all(payload)
 }
 
 #[cfg(test)]

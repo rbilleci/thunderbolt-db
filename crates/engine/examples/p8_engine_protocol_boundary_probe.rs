@@ -35,11 +35,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("select_parser_reused=true");
     println!("select_result_rows={}", result.rows.len());
     println!("copy_parser_in_protocol_lib={copy_parser_available}");
-    println!("wire_session_api_available=false");
+    println!("backend_writer_api_available=true");
+    println!("wire_session_ready_loop_available=false");
     println!("protocol_server_session_catalog_reusable=false");
     println!("resident_admission_from_sql_visible_rows=false");
     println!("endpoint_boundary_status=blocked");
-    println!("next_blocker=wire_session_api_split_required");
+    println!("next_blocker=ready_loop_session_state_extraction_required");
     println!("secondary_blocker=copy_to_engine_wal_adapter_required");
     println!("retained_blocker=engine_residency_admission_api_required");
 

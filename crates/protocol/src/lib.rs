@@ -7252,9 +7252,424 @@ pub fn parse_command(input: &str) -> Result<Command, ParseError> {
     Err(ParseError::Unsupported(s.to_string()))
 }
 
+pub mod backend {
+    use std::io::{self, ErrorKind, Write};
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct BackendColumn {
+        pub name: String,
+        pub oid: u32,
+        pub type_size: i16,
+    }
+
+    impl BackendColumn {
+        pub fn new(name: impl Into<String>, oid: u32, type_size: i16) -> Self {
+            Self {
+                name: name.into(),
+                oid,
+                type_size,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct BackendError {
+        pub code: String,
+        pub message: String,
+        pub position: Option<String>,
+    }
+
+    impl BackendError {
+        pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+            Self {
+                code: code.into(),
+                message: message.into(),
+                position: None,
+            }
+        }
+
+        pub fn with_position(
+            code: impl Into<String>,
+            message: impl Into<String>,
+            position: impl Into<String>,
+        ) -> Self {
+            Self {
+                code: code.into(),
+                message: message.into(),
+                position: Some(position.into()),
+            }
+        }
+    }
+
+    pub struct BackendWriter<'a, W: Write + ?Sized> {
+        inner: &'a mut W,
+    }
+
+    impl<'a, W: Write + ?Sized> BackendWriter<'a, W> {
+        pub fn new(inner: &'a mut W) -> Self {
+            Self { inner }
+        }
+
+        pub fn authentication_ok(&mut self) -> io::Result<()> {
+            self.message(b'R', &0_i32.to_be_bytes())
+        }
+
+        pub fn authentication_sasl(&mut self, mechanisms: &[&str]) -> io::Result<()> {
+            let mut payload = 10_i32.to_be_bytes().to_vec();
+            for mechanism in mechanisms {
+                push_cstring(&mut payload, mechanism);
+            }
+            payload.push(0);
+            self.message(b'R', &payload)
+        }
+
+        pub fn authentication_sasl_continue(&mut self, data: &[u8]) -> io::Result<()> {
+            let mut payload = 11_i32.to_be_bytes().to_vec();
+            payload.extend_from_slice(data);
+            self.message(b'R', &payload)
+        }
+
+        pub fn authentication_sasl_final(&mut self, data: &[u8]) -> io::Result<()> {
+            let mut payload = 12_i32.to_be_bytes().to_vec();
+            payload.extend_from_slice(data);
+            self.message(b'R', &payload)
+        }
+
+        pub fn backend_key_data(&mut self, process_id: i32, secret_key: i32) -> io::Result<()> {
+            let mut payload = Vec::with_capacity(8);
+            payload.extend_from_slice(&process_id.to_be_bytes());
+            payload.extend_from_slice(&secret_key.to_be_bytes());
+            self.message(b'K', &payload)
+        }
+
+        pub fn parameter_status(&mut self, key: &str, value: &str) -> io::Result<()> {
+            let mut payload = Vec::with_capacity(key.len() + value.len() + 2);
+            push_cstring(&mut payload, key);
+            push_cstring(&mut payload, value);
+            self.message(b'S', &payload)
+        }
+
+        pub fn ready_for_query(&mut self, in_transaction: bool) -> io::Result<()> {
+            let status = if in_transaction { b'T' } else { b'I' };
+            self.message(b'Z', &[status])
+        }
+
+        pub fn empty_query_response(&mut self) -> io::Result<()> {
+            self.message(b'I', &[])
+        }
+
+        pub fn command_complete(&mut self, tag: &str) -> io::Result<()> {
+            let mut payload = Vec::with_capacity(tag.len() + 1);
+            push_cstring(&mut payload, tag);
+            self.message(b'C', &payload)
+        }
+
+        pub fn parse_complete(&mut self) -> io::Result<()> {
+            self.message(b'1', &[])
+        }
+
+        pub fn bind_complete(&mut self) -> io::Result<()> {
+            self.message(b'2', &[])
+        }
+
+        pub fn close_complete(&mut self) -> io::Result<()> {
+            self.message(b'3', &[])
+        }
+
+        pub fn portal_suspended(&mut self) -> io::Result<()> {
+            self.message(b's', &[])
+        }
+
+        pub fn no_data(&mut self) -> io::Result<()> {
+            self.message(b'n', &[])
+        }
+
+        pub fn copy_out_response(&mut self, column_count: usize) -> io::Result<()> {
+            self.copy_response(b'H', column_count)
+        }
+
+        pub fn copy_in_response(&mut self, column_count: usize) -> io::Result<()> {
+            self.copy_response(b'G', column_count)
+        }
+
+        fn copy_response(&mut self, tag: u8, column_count: usize) -> io::Result<()> {
+            let column_count = i16::try_from(column_count)
+                .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "too many COPY columns"))?;
+            let mut payload = Vec::with_capacity(1 + 2 + column_count as usize * 2);
+            payload.push(0);
+            payload.extend_from_slice(&column_count.to_be_bytes());
+            for _ in 0..column_count {
+                payload.extend_from_slice(&0_i16.to_be_bytes());
+            }
+            self.message(tag, &payload)
+        }
+
+        pub fn copy_data(&mut self, bytes: &[u8]) -> io::Result<()> {
+            self.message(b'd', bytes)
+        }
+
+        pub fn copy_done(&mut self) -> io::Result<()> {
+            self.message(b'c', &[])
+        }
+
+        pub fn parameter_description(&mut self, type_oids: &[u32]) -> io::Result<()> {
+            let parameter_count = i16::try_from(type_oids.len())
+                .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "too many parameters"))?;
+            let mut payload = Vec::with_capacity(2 + type_oids.len() * 4);
+            payload.extend_from_slice(&parameter_count.to_be_bytes());
+            for oid in type_oids {
+                payload.extend_from_slice(&oid.to_be_bytes());
+            }
+            self.message(b't', &payload)
+        }
+
+        pub fn select_rows(
+            &mut self,
+            columns: &[BackendColumn],
+            rows: &[Vec<Option<String>>],
+            include_row_description: bool,
+        ) -> io::Result<()> {
+            self.rows_with_tag(
+                columns,
+                rows,
+                include_row_description,
+                &format!("SELECT {}", rows.len()),
+            )
+        }
+
+        pub fn rows_with_tag(
+            &mut self,
+            columns: &[BackendColumn],
+            rows: &[Vec<Option<String>>],
+            include_row_description: bool,
+            tag: &str,
+        ) -> io::Result<()> {
+            if include_row_description {
+                self.row_description(columns)?;
+            }
+            for row in rows {
+                self.data_row(row)?;
+            }
+            self.command_complete(tag)
+        }
+
+        pub fn row_description(&mut self, columns: &[BackendColumn]) -> io::Result<()> {
+            self.row_description_with_formats(columns, &[])
+        }
+
+        pub fn row_description_with_formats(
+            &mut self,
+            columns: &[BackendColumn],
+            result_format_codes: &[i16],
+        ) -> io::Result<()> {
+            let field_count = i16::try_from(columns.len())
+                .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "too many columns"))?;
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&field_count.to_be_bytes());
+            for (idx, column) in columns.iter().enumerate() {
+                push_cstring(&mut payload, &column.name);
+                payload.extend_from_slice(&0_u32.to_be_bytes());
+                payload.extend_from_slice(&0_i16.to_be_bytes());
+                payload.extend_from_slice(&column.oid.to_be_bytes());
+                payload.extend_from_slice(&column.type_size.to_be_bytes());
+                payload.extend_from_slice(&(-1_i32).to_be_bytes());
+                payload.extend_from_slice(&format_code_at(result_format_codes, idx).to_be_bytes());
+            }
+            self.message(b'T', &payload)
+        }
+
+        pub fn data_row(&mut self, values: &[Option<String>]) -> io::Result<()> {
+            let columns = values
+                .iter()
+                .map(|_| {
+                    BackendColumn::new(
+                        "",
+                        crate::SqlType::Text.postgres_oid(),
+                        crate::SqlType::Text.type_size(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            self.data_row_with_formats(&columns, values, &[])
+        }
+
+        pub fn data_row_with_formats(
+            &mut self,
+            columns: &[BackendColumn],
+            values: &[Option<String>],
+            result_format_codes: &[i16],
+        ) -> io::Result<()> {
+            let value_count = i16::try_from(values.len())
+                .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "too many row values"))?;
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&value_count.to_be_bytes());
+            for (idx, value) in values.iter().enumerate() {
+                match value {
+                    Some(value) => {
+                        let encoded;
+                        let bytes = if format_code_at(result_format_codes, idx) == 1 {
+                            encoded = encode_binary_result_value(value, columns[idx].oid)?;
+                            encoded.as_slice()
+                        } else {
+                            value.as_bytes()
+                        };
+                        let len = i32::try_from(bytes.len()).map_err(|_| {
+                            io::Error::new(ErrorKind::InvalidInput, "row value too large to encode")
+                        })?;
+                        payload.extend_from_slice(&len.to_be_bytes());
+                        payload.extend_from_slice(bytes);
+                    }
+                    None => payload.extend_from_slice(&(-1_i32).to_be_bytes()),
+                }
+            }
+            self.message(b'D', &payload)
+        }
+
+        pub fn error_response(&mut self, error: &BackendError) -> io::Result<()> {
+            let mut payload = Vec::new();
+            push_error_field(&mut payload, b'S', "ERROR");
+            push_error_field(&mut payload, b'V', "ERROR");
+            push_error_field(&mut payload, b'C', &error.code);
+            push_error_field(&mut payload, b'M', &error.message);
+            if let Some(position) = &error.position {
+                push_error_field(&mut payload, b'P', position);
+            }
+            payload.push(0);
+            self.message(b'E', &payload)
+        }
+
+        pub fn message(&mut self, tag: u8, payload: &[u8]) -> io::Result<()> {
+            write_message(self.inner, tag, payload)
+        }
+    }
+
+    pub fn write_message<W: Write + ?Sized>(
+        stream: &mut W,
+        tag: u8,
+        payload: &[u8],
+    ) -> io::Result<()> {
+        let total_len = i32::try_from(payload.len() + 4)
+            .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "payload too large"))?;
+        stream.write_all(&[tag])?;
+        stream.write_all(&total_len.to_be_bytes())?;
+        stream.write_all(payload)
+    }
+
+    fn encode_binary_result_value(value: &str, type_oid: u32) -> io::Result<Vec<u8>> {
+        match type_oid {
+            23 => {
+                let value = value.parse::<i32>().map_err(|_| {
+                    io::Error::new(
+                        ErrorKind::InvalidInput,
+                        "int4 row value cannot be encoded as binary",
+                    )
+                })?;
+                Ok(value.to_be_bytes().to_vec())
+            }
+            25 => Ok(value.as_bytes().to_vec()),
+            _ => Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "unsupported binary result type",
+            )),
+        }
+    }
+
+    fn format_code_at(format_codes: &[i16], idx: usize) -> i16 {
+        match format_codes {
+            [] => 0,
+            [code] => *code,
+            codes => codes[idx],
+        }
+    }
+
+    fn push_error_field(payload: &mut Vec<u8>, tag: u8, value: &str) {
+        payload.push(tag);
+        push_cstring(payload, value);
+    }
+
+    fn push_cstring(payload: &mut Vec<u8>, value: &str) {
+        payload.extend_from_slice(value.as_bytes());
+        payload.push(0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn backend_messages(bytes: &[u8]) -> Vec<(u8, Vec<u8>)> {
+        let mut messages = Vec::new();
+        let mut idx = 0;
+        while idx < bytes.len() {
+            let tag = bytes[idx];
+            idx += 1;
+            let len = u32::from_be_bytes(bytes[idx..idx + 4].try_into().unwrap()) as usize;
+            idx += 4;
+            let payload_len = len - 4;
+            let payload = bytes[idx..idx + payload_len].to_vec();
+            idx += payload_len;
+            messages.push((tag, payload));
+        }
+        messages
+    }
+
+    #[test]
+    fn backend_writer_emits_reusable_startup_result_copy_and_error_messages() {
+        let mut output = Vec::new();
+        {
+            let columns = vec![
+                backend::BackendColumn::new(
+                    "id",
+                    SqlType::Int4.postgres_oid(),
+                    SqlType::Int4.type_size(),
+                ),
+                backend::BackendColumn::new(
+                    "name",
+                    SqlType::Text.postgres_oid(),
+                    SqlType::Text.type_size(),
+                ),
+            ];
+            let mut writer = backend::BackendWriter::new(&mut output);
+            writer.authentication_ok().unwrap();
+            writer.parameter_status("server_version", "16.0").unwrap();
+            writer.backend_key_data(1, 1).unwrap();
+            writer.ready_for_query(false).unwrap();
+            writer
+                .parameter_description(&[SqlType::Int4.postgres_oid()])
+                .unwrap();
+            writer
+                .row_description_with_formats(&columns, &[1, 0])
+                .unwrap();
+            writer
+                .data_row_with_formats(
+                    &columns,
+                    &[Some("7".to_string()), Some("Ada".to_string())],
+                    &[1, 0],
+                )
+                .unwrap();
+            writer.command_complete("SELECT 1").unwrap();
+            writer.copy_in_response(2).unwrap();
+            writer.copy_out_response(2).unwrap();
+            writer.copy_data(b"7,Ada\n").unwrap();
+            writer.copy_done().unwrap();
+            writer
+                .error_response(&backend::BackendError::with_position(
+                    "42601",
+                    "syntax error",
+                    "8",
+                ))
+                .unwrap();
+        }
+
+        let messages = backend_messages(&output);
+        assert_eq!(
+            messages.iter().map(|(tag, _)| *tag).collect::<Vec<_>>(),
+            vec![b'R', b'S', b'K', b'Z', b't', b'T', b'D', b'C', b'G', b'H', b'd', b'c', b'E']
+        );
+        assert_eq!(messages[0].1, 0_i32.to_be_bytes().to_vec());
+        assert_eq!(messages[3].1, vec![b'I']);
+        assert_eq!(messages[6].1[6..10], 7_i32.to_be_bytes());
+        assert!(messages[12].1.windows(5).any(|window| window == b"42601"));
+    }
 
     #[test]
     fn parses_set() {
