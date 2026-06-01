@@ -84,14 +84,14 @@ Current accepted smoke evidence:
   approved the guarded full 25% run, then pivoted the next attempt to 10% of
   GPU memory. The first approved 25% attempt proved default PostgreSQL can load
   all 161,061,274 rows, but the GPU DB endpoint remains blocked on defended
-  SQL-visible value-index bulk admission throughput; reserved row-key MVCC
-  insertion is improved, but current bounded evidence still puts the
-  64,424,510-row 10% load outside the 6h worker budget.
+  SQL-visible COPY admission throughput; reserved row-key MVCC insertion and
+  grouped value-index appends are improved, but current bounded evidence still
+  puts the 64,424,510-row 10% load outside the 6h worker budget.
 
 Current blockers and non-claims:
 
 - `missing_partitioned_over_resident_execution`
-- `engine_sql_visible_mvcc_value_index_bulk_admission_required`
+- `engine_sql_visible_copy_admission_storage_wal_profile_required`
 - no completed 10% or full 25% default/tuned PostgreSQL/GPU DB retained curve
 - no completed 125% over-resident PostgreSQL-vs-GPU retained tier
 - no full CH-benCHmark, BenchBase, join, transaction-mix, external load
@@ -107,6 +107,8 @@ The 10% pivot/blocker report is
 [docs/testing/reports/2026-06-01-p8-10pct-copy-path-single-load-curves-v1.md](docs/testing/reports/2026-06-01-p8-10pct-copy-path-single-load-curves-v1.md).
 The latest narrowed bulk-admission report is
 [docs/testing/reports/2026-06-01-p8-engine-sql-visible-bulk-copy-admission-v1.md](docs/testing/reports/2026-06-01-p8-engine-sql-visible-bulk-copy-admission-v1.md).
+The latest value-index admission report is
+[docs/testing/reports/2026-06-01-p8-engine-sql-visible-value-index-bulk-admission-v1.md](docs/testing/reports/2026-06-01-p8-engine-sql-visible-value-index-bulk-admission-v1.md).
 
 ## Security And Operations
 

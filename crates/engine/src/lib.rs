@@ -7365,6 +7365,27 @@ fn relational_index_value(value: &SqlValue) -> String {
     }
 }
 
+fn relational_value_index_entries_for_rows(
+    table: &str,
+    columns: &[RelationalColumn],
+    rows: &[(String, Vec<SqlValue>)],
+) -> BTreeMap<RelationalIndexKey, Vec<String>> {
+    let mut entries = BTreeMap::new();
+    for (row_key, values) in rows {
+        for (column, value) in columns.iter().zip(values.iter()) {
+            entries
+                .entry(RelationalIndexKey {
+                    table: table.to_string(),
+                    column: column.name.clone(),
+                    value: relational_index_value(value),
+                })
+                .or_insert_with(Vec::new)
+                .push(row_key.clone());
+        }
+    }
+    entries
+}
+
 fn render_relational_insert(insert: &Insert) -> Result<String, EngineError> {
     let mut sql = format!("INSERT INTO {}", insert.table);
     if !insert.columns.is_empty() {
@@ -12542,6 +12563,7 @@ impl Engine {
             )?;
         }
 
+        let mut inserted_rows = Vec::with_capacity(new_rows.len());
         for values in new_rows {
             let row_id = self.relational_next_row_id;
             self.relational_next_row_id += 1;
@@ -12555,16 +12577,15 @@ impl Engine {
                     txn_id,
                 )
                 .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
-            for (column, value) in table.columns.iter().zip(values.iter()) {
-                self.relational_value_index
-                    .entry(RelationalIndexKey {
-                        table: insert.table.clone(),
-                        column: column.name.clone(),
-                        value: relational_index_value(value),
-                    })
-                    .or_default()
-                    .push(row_key.clone());
-            }
+            inserted_rows.push((row_key, values));
+        }
+        for (key, mut row_keys) in
+            relational_value_index_entries_for_rows(&insert.table, &table.columns, &inserted_rows)
+        {
+            self.relational_value_index
+                .entry(key)
+                .or_default()
+                .append(&mut row_keys);
         }
         Ok(())
     }
@@ -12718,20 +12739,20 @@ impl Engine {
             self.validate_foreign_keys_with_table_rows(&table.name, &candidate_rows, visibility)?;
         }
 
+        let mut updated_rows = Vec::with_capacity(updates.len());
         for (tuple_id, row_key, values) in updates {
             self.mvcc_store
                 .tuple_update(tuple_id, encode_relational_row(&values), txn_id)
                 .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
-            for (column, value) in table.columns.iter().zip(values.iter()) {
-                self.relational_value_index
-                    .entry(RelationalIndexKey {
-                        table: update.table.clone(),
-                        column: column.name.clone(),
-                        value: relational_index_value(value),
-                    })
-                    .or_default()
-                    .push(row_key.clone());
-            }
+            updated_rows.push((row_key, values));
+        }
+        for (key, mut row_keys) in
+            relational_value_index_entries_for_rows(&update.table, &table.columns, &updated_rows)
+        {
+            self.relational_value_index
+                .entry(key)
+                .or_default()
+                .append(&mut row_keys);
         }
         Ok(())
     }
@@ -38507,6 +38528,28 @@ mod tests {
             ]
         );
 
+        let Command::Select(indexed_select) =
+            parse_command("SELECT id, name FROM people WHERE id = 2").unwrap()
+        else {
+            panic!("expected SELECT plan");
+        };
+        let indexed_result = e.execute_relational_select(&indexed_select).unwrap();
+        assert_eq!(
+            indexed_result.rows,
+            vec![vec![
+                SqlValue::Int4(2),
+                SqlValue::Text("O'Brien".to_string())
+            ]]
+        );
+        assert_eq!(
+            indexed_result.access_path,
+            RelationalAccessPath::EqualityIndex {
+                table: "people".to_string(),
+                column: "id".to_string(),
+                matched_keys: 1,
+            }
+        );
+
         let err = e
             .execute_relational_copy_rows(
                 4,
@@ -38524,6 +38567,11 @@ mod tests {
         let mut recovered = Engine::recover_from_durable_wal(e.durable_wal_records()).unwrap();
         let recovered_result = recovered.execute_relational_select(&select).unwrap();
         assert_eq!(recovered_result.rows, result.rows);
+        let recovered_indexed = recovered
+            .execute_relational_select(&indexed_select)
+            .unwrap();
+        assert_eq!(recovered_indexed.rows, indexed_result.rows);
+        assert_eq!(recovered_indexed.access_path, indexed_result.access_path);
     }
 
     #[test]

@@ -250,6 +250,7 @@ impl EndpointState {
         self.fact("copy_chunk_rows_limit", chunk_rows)?;
         self.fact("copy_current_process_decoded_apply_fast_path", true)?;
         self.fact("copy_engine_reserved_row_key_bulk_admission", true)?;
+        self.fact("copy_relational_value_index_bulk_admission", true)?;
         Ok(PendingCopy {
             copy,
             columns,
