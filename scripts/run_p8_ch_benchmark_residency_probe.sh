@@ -52,6 +52,10 @@ rows_25pct() {
   echo $(((retained_target_bytes + retained_bytes_per_row - 1) / retained_bytes_per_row))
 }
 
+rows_10pct() {
+  echo $(((($(rows_25pct) * 10) + 25 - 1) / 25))
+}
+
 rows_125pct() {
   local retained_target_bytes=32212254720
   local retained_bytes_per_row=40
@@ -1222,6 +1226,7 @@ pgwire_target_concurrency_metric() {
   local retained_route="${11}"
   local concurrency="${12}"
   local profile_note="${13}"
+  local metric_tier="${identical_pgwire_tier:-25pct}"
   local run_dir="${tmp_prefix}-${target}-${profile}-${query_id}-c${concurrency}"
   mkdir -p "$run_dir"
 
@@ -1269,7 +1274,8 @@ pgwire_target_concurrency_metric() {
   fi
   throughput=$(awk -v c="$concurrency" -v us="$wall_us" 'BEGIN { if (us > 0) printf "%.6f", c * 1000000 / us; else printf "0.000000" }')
 
-  printf '{"kind":"identical_pgwire_target_metric","tier":"25pct","target":"%s","profile":"%s","client_driver":"psql/libpq","query":"%s","concurrency":%s,"p50_us":%s,"p95_us":%s,"p99_us":%s,"throughput_qps":%.6f,"wall_us":%s,"error_count":%s,"correctness_status":"%s","route_classification":"%s","retained_gpu_route":%s,"postgresql_profile_note":"%s","saturation_note":"scaled_smoke"}\n' \
+  printf '{"kind":"identical_pgwire_target_metric","tier":"%s","target":"%s","profile":"%s","client_driver":"psql/libpq","query":"%s","concurrency":%s,"p50_us":%s,"p95_us":%s,"p99_us":%s,"throughput_qps":%.6f,"wall_us":%s,"error_count":%s,"correctness_status":"%s","route_classification":"%s","retained_gpu_route":%s,"postgresql_profile_note":"%s","saturation_note":"scaled_smoke"}\n' \
+    "$metric_tier" \
     "$target" \
     "$profile" \
     "$query_id" \
@@ -1284,7 +1290,8 @@ pgwire_target_concurrency_metric() {
     "$route_classification" \
     "$retained_route" \
     "$(json_escape "$profile_note")" >>"$metrics_path"
-  printf '25pct,%s,%s,psql/libpq,%s,%s,%s,none,%s,%s,%s,%s,%s,%s,"%s qps; %s"\n' \
+  printf '%s,%s,%s,psql/libpq,%s,%s,%s,none,%s,%s,%s,%s,%s,%s,"%s qps; %s"\n' \
+    "$metric_tier" \
     "$target" \
     "$profile" \
     "$query_id" \
@@ -1670,6 +1677,7 @@ write_identical_pgwire_target_smoke() {
   local smoke_dir="$OUT_DIR/identical-pgwire-target-smoke"
   local rows="${GPU_DB_CH_BENCH_IDENTICAL_PGWIRE_ROWS:-32}"
   local targets="${GPU_DB_CH_BENCH_IDENTICAL_PGWIRE_CONCURRENCY_TARGETS:-1,2}"
+  local identical_pgwire_tier="scaled_smoke"
   local engine_port="${GPU_DB_CH_BENCH_ENGINE_PGWIRE_PORT:-55437}"
   local engine_listen="127.0.0.1:$engine_port"
   local engine_url="postgresql://postgres@127.0.0.1:$engine_port/postgres?sslmode=disable"
@@ -1683,6 +1691,11 @@ write_identical_pgwire_target_smoke() {
   local tuned_ddl_path="$smoke_dir/tuned-postgresql.sql"
   local engine_max_sessions
   engine_max_sessions="$(identical_pgwire_required_engine_sessions "$targets")"
+  if [ "$rows" -eq "$(rows_10pct)" ]; then
+    identical_pgwire_tier="10pct"
+  elif [ "$rows" -ge "$(rows_25pct)" ]; then
+    identical_pgwire_tier="25pct"
+  fi
   : >"$metrics_path"
 
   if [ "$rows" -ge "$(rows_25pct)" ] && [ "${GPU_DB_CH_BENCH_ALLOW_FULL_IDENTICAL_PGWIRE_25PCT:-0}" != 1 ]; then
@@ -1824,12 +1837,13 @@ CSV
   done
 
   cat >>"$metrics_path" <<JSON
-{"kind":"identical_pgwire_target_decision","tier":"25pct","status":"closed_with_blocker","rows":$rows,"targets":["default_postgresql","tuned_postgresql","gpu_db_retained_endpoint"],"profiles":["default_postgresql","tuned_postgresql","gpu_db_retained_endpoint"],"client_driver":"psql/libpq","queries":["order_line_count_all","order_line_lookup_ol_o_id_multi_column","order_line_lookup_composite_text"],"requested_concurrency_targets":"$(json_escape "$targets")","same_query_schedule":true,"same_metric_schema":true,"same_client_boundary":true,"postgresql_setup":"CREATE TABLE plus COPY FROM STDIN; tuned profile adds btree and BRIN index on ol_o_id plus composite btree on ol_o_id,ol_i_id","gpu_db_setup":"CREATE TABLE plus COPY FROM STDIN through retained engine-backed pgwire endpoint","engine_pgwire_max_sessions":$engine_max_sessions,"retained_route_boolean_recorded":true,"composite_text_lookup_retained_route_recorded":true,"device_match_index_compaction":true,"postgresql_settings":"$pg_settings_path","curve_artifact":"$curve_path","metrics_artifact":"$metrics_path","next_blocker":"full_25pct_identical_curves_require_operator_long_run","deferred_blockers":["missing_partitioned_over_resident_execution"]}
+{"kind":"identical_pgwire_target_decision","tier":"$identical_pgwire_tier","status":"closed_with_blocker","rows":$rows,"targets":["default_postgresql","tuned_postgresql","gpu_db_retained_endpoint"],"profiles":["default_postgresql","tuned_postgresql","gpu_db_retained_endpoint"],"client_driver":"psql/libpq","queries":["order_line_count_all","order_line_lookup_ol_o_id_multi_column","order_line_lookup_composite_text"],"requested_concurrency_targets":"$(json_escape "$targets")","same_query_schedule":true,"same_metric_schema":true,"same_client_boundary":true,"postgresql_setup":"CREATE TABLE plus COPY FROM STDIN; tuned profile adds btree and BRIN index on ol_o_id plus composite btree on ol_o_id,ol_i_id","gpu_db_setup":"CREATE TABLE plus COPY FROM STDIN through retained engine-backed pgwire endpoint","engine_pgwire_max_sessions":$engine_max_sessions,"retained_route_boolean_recorded":true,"composite_text_lookup_retained_route_recorded":true,"device_match_index_compaction":true,"postgresql_settings":"$pg_settings_path","curve_artifact":"$curve_path","metrics_artifact":"$metrics_path","next_blocker":"full_25pct_identical_curves_require_operator_long_run","deferred_blockers":["missing_partitioned_over_resident_execution"]}
 JSON
 
   cat >"$report_path" <<REPORT
 # P8 Identical Pgwire Target Smoke
 
+- tier: $identical_pgwire_tier
 - rows: $rows
 - status: closed_with_blocker
 - target_profiles: default_postgresql, tuned_postgresql, gpu_db_retained_endpoint

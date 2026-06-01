@@ -81,15 +81,17 @@ Current accepted smoke evidence:
   into each target through `psql` and no longer writes a generated full-load
   `load.sql`; the GPU DB endpoint now admits decoded COPY rows in bounded
   chunks and sizes its lifecycle from the requested GPU DB curve. Richard
-  approved the guarded full 25% run; the first approved attempt proved default
-  PostgreSQL can load all 161,061,274 rows, but the GPU DB endpoint remains
-  blocked on defended SQL-visible bulk MVCC COPY admission throughput.
+  approved the guarded full 25% run, then pivoted the next attempt to 10% of
+  GPU memory. The first approved 25% attempt proved default PostgreSQL can load
+  all 161,061,274 rows, but the GPU DB endpoint remains blocked on defended
+  SQL-visible bulk MVCC COPY admission throughput; current bounded evidence also
+  puts the 64,424,510-row 10% load outside the 6h worker budget.
 
 Current blockers and non-claims:
 
 - `missing_partitioned_over_resident_execution`
 - `engine_sql_visible_mvcc_bulk_copy_admission_required`
-- no completed full 25% default/tuned PostgreSQL/GPU DB retained curve
+- no completed 10% or full 25% default/tuned PostgreSQL/GPU DB retained curve
 - no completed 125% over-resident PostgreSQL-vs-GPU retained tier
 - no full CH-benCHmark, BenchBase, join, transaction-mix, external load
   generation, production cache-daemon, durable GPU page, or external
@@ -100,6 +102,8 @@ The latest reports are
 [docs/testing/reports/2026-06-01-p8-identical-composite-text-pgwire-curves-v1.md](docs/testing/reports/2026-06-01-p8-identical-composite-text-pgwire-curves-v1.md)
 and
 [docs/testing/reports/2026-06-01-p8-engine-pgwire-full-copy-throughput-v1.md](docs/testing/reports/2026-06-01-p8-engine-pgwire-full-copy-throughput-v1.md).
+The 10% pivot/blocker report is
+[docs/testing/reports/2026-06-01-p8-10pct-copy-path-single-load-curves-v1.md](docs/testing/reports/2026-06-01-p8-10pct-copy-path-single-load-curves-v1.md).
 
 ## Security And Operations
 
