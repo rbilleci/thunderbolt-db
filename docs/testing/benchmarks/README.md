@@ -75,8 +75,9 @@ schedule instead of a fixed cap. Richard approved a full 25% long-run window,
 then pivoted the next benchmark attempt to 10% of GPU memory. The first
 approved 25% attempt proved default PostgreSQL can accept the full
 161,061,274-row streamed load. The GPU DB endpoint remains blocked on defended
-SQL-visible bulk MVCC COPY admission throughput; the latest bounded endpoint
-probe also projects the 64,424,510-row 10% load outside the approved 6h budget.
+SQL-visible value-index bulk admission throughput; the latest bounded endpoint
+probe improved generated row-key MVCC insertion but still projects the
+64,424,510-row 10% load outside the approved 6h budget.
 
 The latest scaled smoke includes:
 
@@ -115,6 +116,9 @@ match-index output.
 - [2026-06-01 10% copy path single-load curves](../reports/2026-06-01-p8-10pct-copy-path-single-load-curves-v1.md):
   10% row-target derivation, first-class harness tier labeling, and the current
   6h-budget blocker for GPU DB endpoint COPY admission.
+- [2026-06-01 engine SQL-visible bulk COPY admission](../reports/2026-06-01-p8-engine-sql-visible-bulk-copy-admission-v1.md):
+  reserved generated-row-key MVCC insertion, bounded 65k and 1M endpoint probes,
+  and the narrowed value-index bulk admission blocker.
 - [2026-06-01 retained composite/text lookup route](../reports/2026-06-01-p8-retained-composite-text-lookup-route-v1.md):
   retained composite lookup progression.
 - [2026-05-31 25% aggregate refresh after BETWEEN](../reports/2026-05-31-p8-25pct-aggregate-refresh-after-between-v1.md):
@@ -124,10 +128,10 @@ match-index output.
 
 ## Remaining Blockers
 
-- `engine_sql_visible_mvcc_bulk_copy_admission_required`: default PostgreSQL
+- `engine_sql_visible_mvcc_value_index_bulk_admission_required`: default PostgreSQL
   loaded the approved full 25% row count, but the GPU DB retained endpoint still
-  needs a defended SQL-visible bulk MVCC COPY admission path before the 10%
-  single-load default/tuned/GPU curves can fit the approved worker budget.
+  needs defended SQL-visible value-index bulk admission before the 10%
+  single-load default/tuned/GPU curves can fit the approved 6h worker budget.
 - `missing_partitioned_over_resident_execution`: the 125% tier requires a
   partitioned or streamed over-resident execution design because the current
   retained layout expects one resident CUDA layout larger than local RTX 3090

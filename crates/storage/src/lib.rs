@@ -205,6 +205,30 @@ impl InMemoryTupleStore {
                 .is_some_and(|version| version.key == key)
         })
     }
+
+    pub fn tuple_insert_reserved_key(
+        &mut self,
+        tuple: NewTuple,
+        txn_id: TxnId,
+    ) -> Result<TupleId, StorageError> {
+        if txn_id == 0 {
+            return Err(StorageError::InvalidVisibility);
+        }
+
+        let tuple_id = self.next_tuple_id;
+        self.next_tuple_id += 1;
+        self.versions.insert(
+            tuple_id,
+            vec![TupleVersion {
+                tuple_id,
+                key: tuple.key,
+                value: tuple.value,
+                created_by: txn_id,
+                deleted_by: None,
+            }],
+        );
+        Ok(tuple_id)
+    }
 }
 
 #[derive(Debug)]
@@ -256,19 +280,7 @@ impl TupleStore for InMemoryTupleStore {
             return Err(StorageError::AlreadyExists);
         }
 
-        let tuple_id = self.next_tuple_id;
-        self.next_tuple_id += 1;
-        self.versions.insert(
-            tuple_id,
-            vec![TupleVersion {
-                tuple_id,
-                key: tuple.key,
-                value: tuple.value,
-                created_by: txn_id,
-                deleted_by: None,
-            }],
-        );
-        Ok(tuple_id)
+        self.tuple_insert_reserved_key(tuple, txn_id)
     }
 
     fn tuple_update(

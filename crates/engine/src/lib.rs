@@ -12547,7 +12547,7 @@ impl Engine {
             self.relational_next_row_id += 1;
             let row_key = relational_row_key(&insert.table, row_id);
             self.mvcc_store
-                .tuple_insert(
+                .tuple_insert_reserved_key(
                     NewTuple {
                         key: row_key.clone(),
                         value: encode_relational_row(&values),
