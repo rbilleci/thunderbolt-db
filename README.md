@@ -79,12 +79,14 @@ Current accepted smoke evidence:
   161,061,274-row 25% curve.
 - The identical target load path streams `CREATE TABLE` plus `COPY FROM STDIN`
   into each target through `psql` and no longer writes a generated full-load
-  `load.sql`; full 25% identical curves require
-  `GPU_DB_CH_BENCH_ALLOW_FULL_IDENTICAL_PGWIRE_25PCT=1`.
+  `load.sql`; Richard approved the guarded full 25% run, but launch is now
+  blocked on bounded COPY admission and endpoint session lifecycle for the full
+  GPU DB retained curve.
 
 Current blockers and non-claims:
 
-- `full_25pct_identical_curves_require_operator_long_run`
+- `engine_pgwire_full_copy_streaming_required`
+- `engine_pgwire_max_sessions_below_full_curve`
 - `missing_partitioned_over_resident_execution`
 - no completed full 25% default/tuned PostgreSQL/GPU DB retained curve
 - no completed 125% over-resident PostgreSQL-vs-GPU retained tier
