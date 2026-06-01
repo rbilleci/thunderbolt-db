@@ -1716,6 +1716,7 @@ SQL
 
   cat >"$tuned_ddl_path" <<SQL
 CREATE INDEX IF NOT EXISTS order_line_ol_o_id_btree ON order_line (ol_o_id);
+CREATE INDEX IF NOT EXISTS order_line_ol_o_id_ol_i_id_btree ON order_line (ol_o_id, ol_i_id);
 CREATE INDEX IF NOT EXISTS order_line_ol_o_id_brin ON order_line USING brin (ol_o_id);
 ANALYZE order_line;
 SQL
@@ -1766,12 +1767,13 @@ REPORT
 tier,target,profile,client_driver,query,concurrency,status,blocker,route_classification,retained_gpu_route,p50_us,p95_us,p99_us,error_count,throughput_qps,saturation_note
 CSV
 
-  local expected_count lookup_key lookup_item lookup_qty lookup_amount concurrency tmp_prefix
+  local expected_count lookup_key lookup_item lookup_qty lookup_amount lookup_dist concurrency tmp_prefix
   expected_count="$rows"
   lookup_key=$(((rows + 1) / 2))
   lookup_item=$(((lookup_key % 100000) + 1))
   lookup_qty=$(((lookup_key % 50) + 1))
   lookup_amount=$(((lookup_key * 17) % 100000))
+  lookup_dist="$(order_line_dist_info_shell "$lookup_key")"
   tmp_prefix="$smoke_dir/query"
 
   for concurrency in ${targets//,/ }; do
@@ -1784,6 +1786,12 @@ CSV
       "${lookup_key}|${lookup_item}|${lookup_qty}|${lookup_amount}" \
       "SELECT ol_o_id, ol_i_id, ol_quantity, ol_amount FROM order_line WHERE ol_o_id = $lookup_key" \
       "$tmp_prefix" postgresql_heap_or_index_lookup false "$concurrency" \
+      "docker postgres default settings; setup is CREATE TABLE plus COPY FROM STDIN"
+    pgwire_target_concurrency_metric "$pgurl" "$metrics_path" "$curve_path" \
+      default_postgresql default_postgresql order_line_lookup_composite_text \
+      "${lookup_key}|${lookup_item}|${lookup_qty}|${lookup_amount}|${lookup_dist}" \
+      "SELECT ol_o_id, ol_i_id, ol_quantity, ol_amount, ol_dist_info FROM order_line WHERE ol_o_id = $lookup_key AND ol_i_id = $lookup_item" \
+      "$tmp_prefix" postgresql_heap_or_index_lookup_composite_text false "$concurrency" \
       "docker postgres default settings; setup is CREATE TABLE plus COPY FROM STDIN"
   done
 
@@ -1798,7 +1806,13 @@ CSV
       "${lookup_key}|${lookup_item}|${lookup_qty}|${lookup_amount}" \
       "SELECT ol_o_id, ol_i_id, ol_quantity, ol_amount FROM order_line WHERE ol_o_id = $lookup_key" \
       "$tmp_prefix" postgresql_tuned_index_lookup false "$concurrency" \
-      "btree and BRIN index on ol_o_id; same load/query schedule"
+      "btree and BRIN index on ol_o_id plus composite btree on ol_o_id,ol_i_id; same load/query schedule"
+    pgwire_target_concurrency_metric "$pgurl" "$metrics_path" "$curve_path" \
+      tuned_postgresql tuned_postgresql order_line_lookup_composite_text \
+      "${lookup_key}|${lookup_item}|${lookup_qty}|${lookup_amount}|${lookup_dist}" \
+      "SELECT ol_o_id, ol_i_id, ol_quantity, ol_amount, ol_dist_info FROM order_line WHERE ol_o_id = $lookup_key AND ol_i_id = $lookup_item" \
+      "$tmp_prefix" postgresql_tuned_composite_text_index_lookup false "$concurrency" \
+      "btree and BRIN index on ol_o_id plus composite btree on ol_o_id,ol_i_id; same load/query schedule"
   done
 
   for concurrency in ${targets//,/ }; do
@@ -1812,10 +1826,16 @@ CSV
       "SELECT ol_o_id, ol_i_id, ol_quantity, ol_amount FROM order_line WHERE ol_o_id = $lookup_key" \
       "$tmp_prefix" retained_engine_int4_equality_multi_column_projection true "$concurrency" \
       "owner-thread engine scheduler; SQL-visible CREATE TABLE plus COPY FROM STDIN"
+    pgwire_target_concurrency_metric "$engine_url" "$metrics_path" "$curve_path" \
+      gpu_db_retained_endpoint gpu_db_retained_endpoint order_line_lookup_composite_text \
+      "${lookup_key}|${lookup_item}|${lookup_qty}|${lookup_amount}|${lookup_dist}" \
+      "SELECT ol_o_id, ol_i_id, ol_quantity, ol_amount, ol_dist_info FROM order_line WHERE ol_o_id = $lookup_key AND ol_i_id = $lookup_item" \
+      "$tmp_prefix" retained_engine_int4_text_composite_equality_projection true "$concurrency" \
+      "owner-thread engine scheduler; SQL-visible CREATE TABLE plus COPY FROM STDIN; selected-row text readback"
   done
 
   cat >>"$metrics_path" <<JSON
-{"kind":"identical_pgwire_target_decision","tier":"25pct","status":"closed_with_blocker","rows":$rows,"targets":["default_postgresql","tuned_postgresql","gpu_db_retained_endpoint"],"profiles":["default_postgresql","tuned_postgresql","gpu_db_retained_endpoint"],"client_driver":"psql/libpq","queries":["order_line_count_all","order_line_lookup_ol_o_id_multi_column"],"requested_concurrency_targets":"$(json_escape "$targets")","same_query_schedule":true,"same_metric_schema":true,"same_client_boundary":true,"postgresql_setup":"CREATE TABLE plus COPY FROM STDIN; tuned profile adds btree and BRIN index on ol_o_id","gpu_db_setup":"CREATE TABLE plus COPY FROM STDIN through retained engine-backed pgwire endpoint","retained_route_boolean_recorded":true,"postgresql_settings":"$pg_settings_path","curve_artifact":"$curve_path","metrics_artifact":"$metrics_path","next_blocker":"full_25pct_identical_curves_require_operator_long_run","deferred_blockers":["retained_composite_or_text_lookup_required","missing_partitioned_over_resident_execution"]}
+{"kind":"identical_pgwire_target_decision","tier":"25pct","status":"closed_with_blocker","rows":$rows,"targets":["default_postgresql","tuned_postgresql","gpu_db_retained_endpoint"],"profiles":["default_postgresql","tuned_postgresql","gpu_db_retained_endpoint"],"client_driver":"psql/libpq","queries":["order_line_count_all","order_line_lookup_ol_o_id_multi_column","order_line_lookup_composite_text"],"requested_concurrency_targets":"$(json_escape "$targets")","same_query_schedule":true,"same_metric_schema":true,"same_client_boundary":true,"postgresql_setup":"CREATE TABLE plus COPY FROM STDIN; tuned profile adds btree and BRIN index on ol_o_id plus composite btree on ol_o_id,ol_i_id","gpu_db_setup":"CREATE TABLE plus COPY FROM STDIN through retained engine-backed pgwire endpoint","retained_route_boolean_recorded":true,"composite_text_lookup_retained_route_recorded":true,"postgresql_settings":"$pg_settings_path","curve_artifact":"$curve_path","metrics_artifact":"$metrics_path","next_blocker":"full_25pct_identical_curves_require_operator_long_run","deferred_blockers":["missing_partitioned_over_resident_execution","retained_match_index_compaction_required_for_fully_device_side_filtering"]}
 JSON
 
   cat >"$report_path" <<REPORT
@@ -1826,7 +1846,7 @@ JSON
 - target_profiles: default_postgresql, tuned_postgresql, gpu_db_retained_endpoint
 - client_driver: \`psql\`/libpq
 - requested_concurrency_targets: \`$targets\`
-- queries: order_line_count_all, order_line_lookup_ol_o_id_multi_column
+- queries: order_line_count_all, order_line_lookup_ol_o_id_multi_column, order_line_lookup_composite_text
 - next_blocker: full_25pct_identical_curves_require_operator_long_run
 - postgresql_settings: $pg_settings_path
 - endpoint_facts: $engine_facts
@@ -1842,10 +1862,17 @@ graph-ready metric schema across disposable default PostgreSQL, tuned
 PostgreSQL, and the retained GPU DB engine-backed pgwire endpoint.
 
 The tuned PostgreSQL profile differs only in setup DDL: it adds btree and BRIN
-indexes on \`ol_o_id\` before rerunning the same query schedule. The GPU DB
-profile differs only in target URL and endpoint lifecycle; rows still enter via
-SQL-visible \`CREATE TABLE\` plus \`COPY FROM STDIN\`, commit through Engine
-WAL/MVCC state, and warm into \`RelationalResidentCache\`.
+indexes on \`ol_o_id\` plus a composite btree on \`(ol_o_id, ol_i_id)\` before
+rerunning the same query schedule. The GPU DB profile differs only in target URL
+and endpoint lifecycle; rows still enter via SQL-visible \`CREATE TABLE\` plus
+\`COPY FROM STDIN\`, commit through Engine WAL/MVCC state, and warm into
+\`RelationalResidentCache\`.
+
+The query schedule includes the composite/text point lookup:
+\`SELECT ol_o_id, ol_i_id, ol_quantity, ol_amount, ol_dist_info FROM order_line WHERE ol_o_id = <literal> AND ol_i_id = <literal>\`.
+For the GPU DB retained endpoint, that row is recorded as
+\`retained_engine_int4_text_composite_equality_projection\` with the retained
+route boolean set.
 
 The curve records p50/p95/p99 latency, throughput, error count, correctness
 status, route classification, retained-route boolean, PostgreSQL profile note,
@@ -1856,8 +1883,9 @@ and saturation note for concurrency \`$targets\`.
 This is a scaled smoke, not the full 161,061,274-row 25% curve. Full default
 PostgreSQL, tuned PostgreSQL, and GPU DB retained curves now have a shared
 driver/target primitive, but still require an operator-approved long-run window.
-Composite/text lookup remains \`retained_composite_or_text_lookup_required\`,
-and 125% remains blocked by \`missing_partitioned_over_resident_execution\`.
+125% remains blocked by \`missing_partitioned_over_resident_execution\`, and a
+fully device-side retained filter still requires
+\`retained_match_index_compaction_required_for_fully_device_side_filtering\`.
 REPORT
 
   kill "$engine_pid" >/dev/null 2>&1 || true
