@@ -38,6 +38,7 @@ scripts/run_p8_ch_benchmark_residency_probe.sh --gpu-db-protocol-benchmark-smoke
 scripts/run_p8_ch_benchmark_residency_probe.sh --engine-backed-pgwire-benchmark-smoke
 scripts/run_p8_ch_benchmark_residency_probe.sh --engine-backed-pgwire-concurrency-smoke
 scripts/run_p8_ch_benchmark_residency_probe.sh --identical-pgwire-target-smoke
+scripts/run_p8_ch_benchmark_residency_probe.sh --identical-pgwire-full-readiness
 ```
 
 The full 25% and 125% tiers are deliberately guarded. Do not run them from
@@ -65,6 +66,13 @@ The GPU DB endpoint seeds through SQL-visible `CREATE TABLE` plus
 `RelationalResidentCache`, and serves accepted lookup shapes through the
 engine-backed pgwire endpoint.
 
+The identical pgwire smoke now streams deterministic setup and `COPY` rows into
+each target through `psql`; it does not materialize an
+`identical-pgwire-target-smoke/load.sql` file. Full 25% identical execution is
+guarded by `GPU_DB_CH_BENCH_ALLOW_FULL_IDENTICAL_PGWIRE_25PCT=1`, and
+`--identical-pgwire-full-readiness` writes the operator package without running
+the long curves.
+
 The latest scaled smoke includes:
 
 ```sql
@@ -91,6 +99,8 @@ match-index output.
 - [2026-06-01 retained match-index compaction](../reports/2026-06-01-p8-retained-match-index-compaction-v1.md):
   device-side retained equality match-index compaction for selected-row lookup
   projections.
+- [2026-06-01 identical full-run streaming guard](../reports/2026-06-01-p8-identical-full-run-streaming-guard-v1.md):
+  streamed identical pgwire load contract, full 25% guard, and readiness facts.
 - [2026-06-01 retained composite/text lookup route](../reports/2026-06-01-p8-retained-composite-text-lookup-route-v1.md):
   retained composite lookup progression.
 - [2026-05-31 25% aggregate refresh after BETWEEN](../reports/2026-05-31-p8-25pct-aggregate-refresh-after-between-v1.md):

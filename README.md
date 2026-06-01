@@ -77,6 +77,10 @@ Current accepted smoke evidence:
   readback.
 - The scaled smoke is graph-ready for concurrency `1,2`; it is not the full
   161,061,274-row 25% curve.
+- The identical target load path streams `CREATE TABLE` plus `COPY FROM STDIN`
+  into each target through `psql` and no longer writes a generated full-load
+  `load.sql`; full 25% identical curves require
+  `GPU_DB_CH_BENCH_ALLOW_FULL_IDENTICAL_PGWIRE_25PCT=1`.
 
 Current blockers and non-claims:
 
@@ -89,8 +93,10 @@ Current blockers and non-claims:
   orchestration claim
 
 Details live in [docs/testing/benchmarks/README.md](docs/testing/benchmarks/README.md).
-The latest report is
-[docs/testing/reports/2026-06-01-p8-identical-composite-text-pgwire-curves-v1.md](docs/testing/reports/2026-06-01-p8-identical-composite-text-pgwire-curves-v1.md).
+The latest reports are
+[docs/testing/reports/2026-06-01-p8-identical-composite-text-pgwire-curves-v1.md](docs/testing/reports/2026-06-01-p8-identical-composite-text-pgwire-curves-v1.md)
+and
+[docs/testing/reports/2026-06-01-p8-identical-full-run-streaming-guard-v1.md](docs/testing/reports/2026-06-01-p8-identical-full-run-streaming-guard-v1.md).
 
 ## Security And Operations
 
