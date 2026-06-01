@@ -71,9 +71,11 @@ each target through `psql`; it does not materialize an
 `identical-pgwire-target-smoke/load.sql` file. The GPU DB endpoint now commits
 decoded rows to Engine WAL/MVCC in bounded chunks before retained warmup, and
 the harness sizes the endpoint lifecycle from the requested GPU DB query/client
-schedule instead of a fixed cap. Richard approved the full 25% long-run window,
-but this worker slice stops at readiness proof rather than launching the long
-run.
+schedule instead of a fixed cap. Richard approved the full 25% long-run window.
+The first approved attempt proved default PostgreSQL can accept the full
+161,061,274-row streamed load, but the GPU DB endpoint is still blocked on
+defended SQL-visible bulk MVCC COPY admission throughput before the full
+default/tuned/GPU curve can be retried.
 
 The latest scaled smoke includes:
 
@@ -106,6 +108,9 @@ match-index output.
 - [2026-06-01 engine pgwire COPY/session readiness](../reports/2026-06-01-p8-engine-pgwire-full-copy-session-v1.md):
   bounded endpoint COPY admission, full-curve session sizing, and scaled
   default/tuned/GPU retained proof.
+- [2026-06-01 engine pgwire full-COPY throughput](../reports/2026-06-01-p8-engine-pgwire-full-copy-throughput-v1.md):
+  current-process decoded apply and the narrowed SQL-visible MVCC bulk COPY
+  admission blocker.
 - [2026-06-01 retained composite/text lookup route](../reports/2026-06-01-p8-retained-composite-text-lookup-route-v1.md):
   retained composite lookup progression.
 - [2026-05-31 25% aggregate refresh after BETWEEN](../reports/2026-05-31-p8-25pct-aggregate-refresh-after-between-v1.md):
@@ -115,10 +120,10 @@ match-index output.
 
 ## Remaining Blockers
 
-- `full_25pct_identical_curves_require_execution`: the full 161,061,274-row
-  default PostgreSQL, tuned PostgreSQL, and GPU DB retained curves are approved
-  and have a safe continuation command, but this readiness slice did not run
-  them.
+- `engine_sql_visible_mvcc_bulk_copy_admission_required`: default PostgreSQL
+  loaded the approved full 25% row count, but the GPU DB retained endpoint still
+  needs a defended SQL-visible bulk MVCC COPY admission path before the full
+  default/tuned/GPU curves can be retried.
 - `missing_partitioned_over_resident_execution`: the 125% tier requires a
   partitioned or streamed over-resident execution design because the current
   retained layout expects one resident CUDA layout larger than local RTX 3090

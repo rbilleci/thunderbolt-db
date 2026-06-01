@@ -8560,6 +8560,67 @@ impl Engine {
         Ok(token)
     }
 
+    fn commit_mutation_at_with_current_apply<F>(
+        &mut self,
+        txn_id: u64,
+        payload: Vec<u8>,
+        timestamp_micros: u64,
+        mut apply_current: F,
+    ) -> Result<CommitToken, EngineError>
+    where
+        F: FnMut(&mut Self) -> Result<(), EngineError>,
+    {
+        if self.repl.role() != Role::Leader {
+            return Err(EngineError::NotLeader);
+        }
+
+        let wal_len_before = self.wal.len();
+        self.wal.append(WalRecord {
+            txn_id,
+            payload: payload.clone(),
+        });
+
+        let token = match self.repl.propose(payload) {
+            Ok(token) => token,
+            Err(err) => {
+                self.wal.truncate(wal_len_before);
+                return Err(err);
+            }
+        };
+        if let Err(err) = self.wal.flush_all() {
+            self.repl.rollback_unapplied_from(token.index);
+            self.wal.truncate(wal_len_before);
+            return Err(err);
+        }
+
+        self.repl.wait_committed(token, Duration::from_millis(0))?;
+        self.txn_ids_by_index.insert(token.index, txn_id);
+        self.wal_commit_timestamps_micros
+            .insert(txn_id, timestamp_micros);
+
+        let to_apply: Vec<LogEntry> = self
+            .repl
+            .drain_committed_from(self.repl.applied_index())
+            .cloned()
+            .collect();
+
+        for e in &to_apply {
+            self.sm.apply(e)?;
+            if e.index == token.index {
+                apply_current(self)?;
+            } else {
+                self.apply_mvcc_entry(e)?;
+            }
+            self.repl.mark_applied(e.index);
+        }
+
+        self.invalidate_relational_residency(txn_id, token.index);
+        self.visible_up_to = self.visible_up_to.max(token.index);
+        self.metrics.inc_commit();
+
+        Ok(token)
+    }
+
     fn invalidate_relational_residency(&mut self, txn_id: TxnId, index: Index) {
         for (table, snapshot) in self.relational_resident_cache.snapshots.iter_mut() {
             if snapshot.invalidated_by_txn_id.is_none() {
@@ -18003,8 +18064,17 @@ impl Engine {
             columns,
             rows,
         };
+        self.preflight_unique_index_constraints(&Command::Insert(insert.clone()), txn_id)
+            .map_err(ExecuteError::Engine)?;
         let sql = render_relational_insert(&insert).map_err(ExecuteError::Engine)?;
-        self.execute_text(txn_id, &sql)?;
+        let timestamp_micros = self.next_commit_timestamp_micros();
+        self.commit_mutation_at_with_current_apply(
+            txn_id,
+            sql.into_bytes(),
+            timestamp_micros,
+            |engine| engine.apply_insert(insert.clone(), txn_id),
+        )
+        .map_err(ExecuteError::Engine)?;
         Ok(row_count)
     }
 

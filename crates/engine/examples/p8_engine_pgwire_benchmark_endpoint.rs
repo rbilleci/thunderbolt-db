@@ -4,7 +4,7 @@ use std::io::{self, ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpu_db_engine::{Engine, RelationalResidencyWarmupPolicy};
 use gpu_db_protocol::backend::{BackendColumn, BackendWriter};
@@ -248,6 +248,7 @@ impl EndpointState {
         self.fact("copy_parser_in_protocol_lib", true)?;
         self.fact("backend_copy_in_response_written", true)?;
         self.fact("copy_chunk_rows_limit", chunk_rows)?;
+        self.fact("copy_current_process_decoded_apply_fast_path", true)?;
         Ok(PendingCopy {
             copy,
             columns,
@@ -266,10 +267,20 @@ impl EndpointState {
         rows: Vec<Vec<SqlValue>>,
     ) -> Result<usize, Box<dyn Error>> {
         let txn_id = self.take_txn_id();
+        let started = Instant::now();
         let copied = self
             .engine
             .execute_relational_copy_rows(txn_id, copy, rows)?;
+        let elapsed_ms = started.elapsed().as_millis();
+        let rows_per_sec = if elapsed_ms == 0 {
+            copied as u128
+        } else {
+            (copied as u128 * 1000) / elapsed_ms
+        };
         self.fact("copy_rows_committed_to_engine_wal_mvcc", true)?;
+        self.fact("copy_chunk_rows", copied)?;
+        self.fact("copy_chunk_elapsed_ms", elapsed_ms)?;
+        self.fact("copy_chunk_rows_per_sec", rows_per_sec)?;
         Ok(copied)
     }
 
