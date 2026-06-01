@@ -182,6 +182,16 @@ impl EndpointState {
                             .kernel_exec_samples
                             .saturating_sub(before.kernel_exec_samples),
                     )?;
+                    self.fact(
+                        "client_visible_select_retained_match_index_compaction",
+                        matches!(
+                            decision.query_shape.as_str(),
+                            "int4_equality_projection"
+                                | "int4_equality_multi_column_projection"
+                                | "int4_composite_equality_multi_column_projection"
+                                | "int4_equality_mixed_column_projection"
+                        ),
+                    )?;
                     self.fact("client_visible_select_rows", rows.len())?;
                 }
             }

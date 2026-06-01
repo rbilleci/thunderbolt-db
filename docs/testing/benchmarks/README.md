@@ -74,7 +74,9 @@ WHERE ol_o_id = <literal> AND ol_i_id = <literal>
 ```
 
 For that bounded composite/text lookup, endpoint facts report retained-route
-execution with zero H2D and result-sized D2H readback for the selected row.
+execution with zero H2D, device-side match-index compaction for the equality
+filters, and result-sized D2H readback for the selected row plus compacted
+match-index output.
 
 ## Related Reports
 
@@ -86,6 +88,9 @@ execution with zero H2D and result-sized D2H readback for the selected row.
   lookup closure.
 - [2026-06-01 retained row-id gather route](../reports/2026-06-01-p8-retained-row-id-gather-route-v1.md):
   selected-row retained lookup D2H narrowing.
+- [2026-06-01 retained match-index compaction](../reports/2026-06-01-p8-retained-match-index-compaction-v1.md):
+  device-side retained equality match-index compaction for selected-row lookup
+  projections.
 - [2026-06-01 retained composite/text lookup route](../reports/2026-06-01-p8-retained-composite-text-lookup-route-v1.md):
   retained composite lookup progression.
 - [2026-05-31 25% aggregate refresh after BETWEEN](../reports/2026-05-31-p8-25pct-aggregate-refresh-after-between-v1.md):
@@ -102,10 +107,6 @@ execution with zero H2D and result-sized D2H readback for the selected row.
   partitioned or streamed over-resident execution design because the current
   retained layout expects one resident CUDA layout larger than local RTX 3090
   memory.
-- `retained_match_index_compaction_required_for_fully_device_side_filtering`:
-  selected-row readback is result-sized, but matching row IDs are still
-  discovered from host-owned resident snapshot state before selected rows are
-  read from retained device memory.
 
 ## Explicit Non-Claims
 

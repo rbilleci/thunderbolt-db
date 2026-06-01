@@ -72,6 +72,9 @@ Current accepted smoke evidence:
   GPU DB retained endpoint.
 - The latest scaled identical target includes the composite/text point lookup:
   `SELECT ol_o_id, ol_i_id, ol_quantity, ol_amount, ol_dist_info FROM order_line WHERE ol_o_id = <literal> AND ol_i_id = <literal>`.
+- The retained equality lookup path now uses device-side match-index compaction
+  for accepted int4 equality filters before selected int4/text projection
+  readback.
 - The scaled smoke is graph-ready for concurrency `1,2`; it is not the full
   161,061,274-row 25% curve.
 
@@ -79,7 +82,6 @@ Current blockers and non-claims:
 
 - `full_25pct_identical_curves_require_operator_long_run`
 - `missing_partitioned_over_resident_execution`
-- `retained_match_index_compaction_required_for_fully_device_side_filtering`
 - no completed full 25% default/tuned PostgreSQL/GPU DB retained curve
 - no completed 125% over-resident PostgreSQL-vs-GPU retained tier
 - no full CH-benCHmark, BenchBase, join, transaction-mix, external load

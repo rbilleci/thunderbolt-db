@@ -1429,7 +1429,7 @@ CSV
     printf '25pct,engine_backed_pgwire_endpoint,psql/libpq,order_line_lookup_ol_o_id_multi_column,%s,blocked,true_concurrency_pg_client_runner_required,retained_engine_int4_equality_multi_column_projection,"wall_clock_throughput,p50_us,p95_us,p99_us,error_count,correctness_status,saturation_note"\n' "$concurrency" >>"$concurrency_path"
   done
   cat >>"$metrics_path" <<JSON
-{"kind":"engine_backed_pgwire_endpoint_decision","tier":"25pct","status":"closed","endpoint":"engine_backed_pgwire_endpoint","client_driver":"psql/libpq","seed_path":"CREATE TABLE plus COPY FROM STDIN","count_retained_route":true,"count_zero_h2d":true,"lookup_retained_route":true,"lookup_retained_shape":"int4_equality_projection","multi_column_lookup_retained_route":true,"multi_column_lookup_retained_shape":"int4_equality_multi_column_projection","composite_int4_lookup_retained_route":true,"composite_int4_lookup_retained_shape":"int4_composite_equality_multi_column_projection","composite_text_lookup_retained_route":true,"composite_text_lookup_retained_shape":"int4_equality_mixed_column_projection","selected_row_device_readback":true,"d2h_narrowing":"selected_matching_rows_only","remaining_blocker":"retained_match_index_compaction_required_for_fully_device_side_filtering","lookup_blocker":"none","concurrency_blocker":"none_for_scaled_owner_thread_smoke","facts":"$facts_path"}
+{"kind":"engine_backed_pgwire_endpoint_decision","tier":"25pct","status":"closed","endpoint":"engine_backed_pgwire_endpoint","client_driver":"psql/libpq","seed_path":"CREATE TABLE plus COPY FROM STDIN","count_retained_route":true,"count_zero_h2d":true,"lookup_retained_route":true,"lookup_retained_shape":"int4_equality_projection","multi_column_lookup_retained_route":true,"multi_column_lookup_retained_shape":"int4_equality_multi_column_projection","composite_int4_lookup_retained_route":true,"composite_int4_lookup_retained_shape":"int4_composite_equality_multi_column_projection","composite_text_lookup_retained_route":true,"composite_text_lookup_retained_shape":"int4_equality_mixed_column_projection","selected_row_device_readback":true,"device_match_index_compaction":true,"d2h_narrowing":"compacted_matching_rows_plus_selected_projection","remaining_blocker":"full_25pct_identical_curves_require_operator_long_run","lookup_blocker":"none","concurrency_blocker":"none_for_scaled_owner_thread_smoke","facts":"$facts_path"}
 JSON
 
   cat >"$report_path" <<REPORT
@@ -1482,17 +1482,17 @@ materializing \`ol_dist_info\` from the resident text offset/byte layout.
 
 ## Remaining Boundary
 
-The endpoint now uses selected matching row IDs for retained equality
-projections, then reads back only selected-row int4 values and selected-row text
-offset/byte spans from retained device memory. That narrows the composite/text
-lookup D2H surface to result-sized transfer for this equality lookup family
-instead of full projected/filter columns plus full text layout readback.
+The endpoint now builds selected matching row IDs with retained device-side
+match-index compaction for accepted int4 equality filters, then reads back only
+selected-row int4 values and selected-row text offset/byte spans from retained
+device memory. That narrows the composite/text lookup D2H surface to compacted
+matching row indices plus selected projection output for this equality lookup
+family.
 
-The remaining optimization blocker is
-\`retained_match_index_compaction_required_for_fully_device_side_filtering\`:
-matching row IDs are still discovered from the host-owned resident snapshot in
-this bounded proof. Full 25% identical default/tuned PostgreSQL/GPU curves still
-require an operator-approved long-run window and artifact budget.
+The remaining benchmark blocker is
+\`full_25pct_identical_curves_require_operator_long_run\`: full 25% identical
+default/tuned PostgreSQL/GPU curves still require an operator-approved long-run
+window and artifact budget.
 REPORT
 
   kill "$server_pid" >/dev/null 2>&1 || true
@@ -1835,7 +1835,7 @@ CSV
   done
 
   cat >>"$metrics_path" <<JSON
-{"kind":"identical_pgwire_target_decision","tier":"25pct","status":"closed_with_blocker","rows":$rows,"targets":["default_postgresql","tuned_postgresql","gpu_db_retained_endpoint"],"profiles":["default_postgresql","tuned_postgresql","gpu_db_retained_endpoint"],"client_driver":"psql/libpq","queries":["order_line_count_all","order_line_lookup_ol_o_id_multi_column","order_line_lookup_composite_text"],"requested_concurrency_targets":"$(json_escape "$targets")","same_query_schedule":true,"same_metric_schema":true,"same_client_boundary":true,"postgresql_setup":"CREATE TABLE plus COPY FROM STDIN; tuned profile adds btree and BRIN index on ol_o_id plus composite btree on ol_o_id,ol_i_id","gpu_db_setup":"CREATE TABLE plus COPY FROM STDIN through retained engine-backed pgwire endpoint","retained_route_boolean_recorded":true,"composite_text_lookup_retained_route_recorded":true,"postgresql_settings":"$pg_settings_path","curve_artifact":"$curve_path","metrics_artifact":"$metrics_path","next_blocker":"full_25pct_identical_curves_require_operator_long_run","deferred_blockers":["missing_partitioned_over_resident_execution","retained_match_index_compaction_required_for_fully_device_side_filtering"]}
+{"kind":"identical_pgwire_target_decision","tier":"25pct","status":"closed_with_blocker","rows":$rows,"targets":["default_postgresql","tuned_postgresql","gpu_db_retained_endpoint"],"profiles":["default_postgresql","tuned_postgresql","gpu_db_retained_endpoint"],"client_driver":"psql/libpq","queries":["order_line_count_all","order_line_lookup_ol_o_id_multi_column","order_line_lookup_composite_text"],"requested_concurrency_targets":"$(json_escape "$targets")","same_query_schedule":true,"same_metric_schema":true,"same_client_boundary":true,"postgresql_setup":"CREATE TABLE plus COPY FROM STDIN; tuned profile adds btree and BRIN index on ol_o_id plus composite btree on ol_o_id,ol_i_id","gpu_db_setup":"CREATE TABLE plus COPY FROM STDIN through retained engine-backed pgwire endpoint","retained_route_boolean_recorded":true,"composite_text_lookup_retained_route_recorded":true,"device_match_index_compaction":true,"postgresql_settings":"$pg_settings_path","curve_artifact":"$curve_path","metrics_artifact":"$metrics_path","next_blocker":"full_25pct_identical_curves_require_operator_long_run","deferred_blockers":["missing_partitioned_over_resident_execution"]}
 JSON
 
   cat >"$report_path" <<REPORT
@@ -1883,9 +1883,7 @@ and saturation note for concurrency \`$targets\`.
 This is a scaled smoke, not the full 161,061,274-row 25% curve. Full default
 PostgreSQL, tuned PostgreSQL, and GPU DB retained curves now have a shared
 driver/target primitive, but still require an operator-approved long-run window.
-125% remains blocked by \`missing_partitioned_over_resident_execution\`, and a
-fully device-side retained filter still requires
-\`retained_match_index_compaction_required_for_fully_device_side_filtering\`.
+125% remains blocked by \`missing_partitioned_over_resident_execution\`.
 REPORT
 
   kill "$engine_pid" >/dev/null 2>&1 || true

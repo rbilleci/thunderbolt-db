@@ -253,6 +253,14 @@ impl CudaResidentDeviceMemory {
         copy_cuda_resident_i32_rows(self, byte_offset, row_indices)
     }
 
+    pub fn match_i32_equal_row_indices_from_payload(
+        &self,
+        filters: &[(u64, i32)],
+        row_count: u64,
+    ) -> Result<Vec<u64>, CudaRuntimeProbeError> {
+        launch_cuda_resident_i32_equal_row_indices(self, filters, row_count)
+    }
+
     pub fn project_text_from_payload(
         &self,
         offsets_byte_offset: u64,
@@ -1368,7 +1376,7 @@ fn launch_cuda_resident_i32_equal_count(
     .reg .u64 %addr;
     .reg .u64 %matches;
     .reg .s32 %needle;
-    .reg .s32 %value;
+    .reg .s32 %r_value;
 
     ld.param.u64 %resident, [resident_ptr];
     ld.param.u64 %offset, [byte_offset];
@@ -1385,8 +1393,8 @@ loop:
     @%p_done bra done;
     mul.lo.u64 %addr, %idx, 4;
     add.u64 %addr, %base, %addr;
-    ld.global.s32 %value, [%addr];
-    setp.eq.s32 %p_match, %value, %needle;
+    ld.global.s32 %r_value, [%addr];
+    setp.eq.s32 %p_match, %r_value, %needle;
     @!%p_match bra next;
     add.u64 %matches, %matches, 1;
 
@@ -1591,7 +1599,7 @@ fn launch_cuda_resident_i32_compare_count(
     .reg .u64 %matches;
     .reg .u32 %comparison;
     .reg .s32 %needle;
-    .reg .s32 %value;
+    .reg .s32 %r_value;
 
     ld.param.u64 %resident, [resident_ptr];
     ld.param.u64 %offset, [byte_offset];
@@ -1609,11 +1617,11 @@ loop:
     @%p_done bra done;
     mul.lo.u64 %addr, %idx, 4;
     add.u64 %addr, %base, %addr;
-    ld.global.s32 %value, [%addr];
-    setp.lt.s32 %p_lt, %value, %needle;
-    setp.le.s32 %p_lte, %value, %needle;
-    setp.gt.s32 %p_gt, %value, %needle;
-    setp.ge.s32 %p_gte, %value, %needle;
+    ld.global.s32 %r_value, [%addr];
+    setp.lt.s32 %p_lt, %r_value, %needle;
+    setp.le.s32 %p_lte, %r_value, %needle;
+    setp.gt.s32 %p_gt, %r_value, %needle;
+    setp.ge.s32 %p_gte, %r_value, %needle;
     setp.eq.u32 %p_code_lt, %comparison, 1;
     setp.eq.u32 %p_code_lte, %comparison, 2;
     setp.eq.u32 %p_code_gt, %comparison, 3;
@@ -1983,6 +1991,350 @@ fn copy_cuda_resident_i32_rows(
     Ok(values)
 }
 
+fn launch_cuda_resident_i32_equal_row_indices(
+    resident: &CudaResidentDeviceMemory,
+    filters: &[(u64, i32)],
+    row_count: u64,
+) -> Result<Vec<u64>, CudaRuntimeProbeError> {
+    type CuMemAlloc = unsafe extern "C" fn(*mut u64, usize) -> i32;
+    type CuMemFree = unsafe extern "C" fn(u64) -> i32;
+    type CuMemsetD8 = unsafe extern "C" fn(u64, u8, usize) -> i32;
+    type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, u64, usize) -> i32;
+    type CuModuleLoadData = unsafe extern "C" fn(*mut *mut c_void, *const c_void) -> i32;
+    type CuModuleUnload = unsafe extern "C" fn(*mut c_void) -> i32;
+    type CuModuleGetFunction =
+        unsafe extern "C" fn(*mut *mut c_void, *mut c_void, *const i8) -> i32;
+    type CuLaunchKernel = unsafe extern "C" fn(
+        *mut c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        *mut c_void,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> i32;
+    type CuCtxSynchronize = unsafe extern "C" fn() -> i32;
+
+    const MAX_FILTERS: usize = 4;
+    const PTX: &[u8] = br#"
+.version 6.0
+.target sm_30
+.address_size 64
+
+.visible .entry gpu_db_resident_i32_equal_row_indices(
+    .param .u64 resident_ptr,
+    .param .u64 row_count,
+    .param .u32 filter_count,
+    .param .u64 offset0,
+    .param .u64 offset1,
+    .param .u64 offset2,
+    .param .u64 offset3,
+    .param .s32 needle0,
+    .param .s32 needle1,
+    .param .s32 needle2,
+    .param .s32 needle3,
+    .param .u64 out_indices_ptr,
+    .param .u64 out_count_ptr
+)
+{
+    .reg .pred %p_out;
+    .reg .pred %p_done;
+    .reg .pred %p_match;
+    .reg .pred %p_check;
+    .reg .u32 %r_tid;
+    .reg .u32 %r_block;
+    .reg .u32 %r_block_dim;
+    .reg .u32 %idx32;
+    .reg .u64 %idx;
+    .reg .u64 %rows;
+    .reg .u32 %filters;
+    .reg .u64 %resident;
+    .reg .u64 %offset0;
+    .reg .u64 %offset1;
+    .reg .u64 %offset2;
+    .reg .u64 %offset3;
+    .reg .s32 %needle0;
+    .reg .s32 %needle1;
+    .reg .s32 %needle2;
+    .reg .s32 %needle3;
+    .reg .u64 %out_indices;
+    .reg .u64 %out_count;
+    .reg .u64 %row_byte;
+    .reg .u64 %addr;
+    .reg .u32 %slot;
+    .reg .u64 %out_addr;
+    .reg .u64 %slot64;
+    .reg .u32 %one;
+    .reg .s32 %r_value;
+
+    ld.param.u64 %resident, [resident_ptr];
+    ld.param.u64 %rows, [row_count];
+    ld.param.u32 %filters, [filter_count];
+    ld.param.u64 %offset0, [offset0];
+    ld.param.u64 %offset1, [offset1];
+    ld.param.u64 %offset2, [offset2];
+    ld.param.u64 %offset3, [offset3];
+    ld.param.s32 %needle0, [needle0];
+    ld.param.s32 %needle1, [needle1];
+    ld.param.s32 %needle2, [needle2];
+    ld.param.s32 %needle3, [needle3];
+    ld.param.u64 %out_indices, [out_indices_ptr];
+    ld.param.u64 %out_count, [out_count_ptr];
+
+    mov.u32 %r_tid, %tid.x;
+    mov.u32 %r_block, %ctaid.x;
+    mov.u32 %r_block_dim, %ntid.x;
+    mad.lo.u32 %idx32, %r_block, %r_block_dim, %r_tid;
+    cvt.u64.u32 %idx, %idx32;
+
+    setp.ge.u64 %p_out, %idx, %rows;
+    @%p_out bra DONE;
+
+    setp.eq.u32 %p_done, %filters, 0;
+    @%p_done bra DONE;
+
+    mul.lo.u64 %row_byte, %idx, 4;
+
+    add.u64 %addr, %resident, %offset0;
+    add.u64 %addr, %addr, %row_byte;
+    ld.global.s32 %r_value, [%addr];
+    setp.eq.s32 %p_match, %r_value, %needle0;
+    @!%p_match bra DONE;
+
+    setp.le.u32 %p_check, %filters, 1;
+    @%p_check bra MATCHED;
+    add.u64 %addr, %resident, %offset1;
+    add.u64 %addr, %addr, %row_byte;
+    ld.global.s32 %r_value, [%addr];
+    setp.eq.s32 %p_match, %r_value, %needle1;
+    @!%p_match bra DONE;
+
+    setp.le.u32 %p_check, %filters, 2;
+    @%p_check bra MATCHED;
+    add.u64 %addr, %resident, %offset2;
+    add.u64 %addr, %addr, %row_byte;
+    ld.global.s32 %r_value, [%addr];
+    setp.eq.s32 %p_match, %r_value, %needle2;
+    @!%p_match bra DONE;
+
+    setp.le.u32 %p_check, %filters, 3;
+    @%p_check bra MATCHED;
+    add.u64 %addr, %resident, %offset3;
+    add.u64 %addr, %addr, %row_byte;
+    ld.global.s32 %r_value, [%addr];
+    setp.eq.s32 %p_match, %r_value, %needle3;
+    @!%p_match bra DONE;
+
+MATCHED:
+    mov.u32 %one, 1;
+    atom.global.add.u32 %slot, [%out_count], %one;
+    cvt.u64.u32 %slot64, %slot;
+    mul.lo.u64 %out_addr, %slot64, 8;
+    add.u64 %out_addr, %out_indices, %out_addr;
+    st.global.u64 [%out_addr], %idx;
+
+DONE:
+    ret;
+}
+"#;
+
+    if filters.is_empty() || filters.len() > MAX_FILTERS {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(filters.len()));
+    }
+    if row_count == 0 {
+        return Ok(Vec::new());
+    }
+    for (byte_offset, _) in filters {
+        let bytes = row_count
+            .checked_mul(std::mem::size_of::<i32>() as u64)
+            .and_then(|bytes| byte_offset.checked_add(bytes))
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+        if bytes > resident.metadata.allocated_bytes {
+            return Err(CudaRuntimeProbeError::InvalidInputLength(bytes as usize));
+        }
+    }
+    let row_count_u32 = u32::try_from(row_count)
+        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let output_bytes = usize::try_from(
+        row_count
+            .checked_mul(std::mem::size_of::<u64>() as u64)
+            .ok_or(CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?,
+    )
+    .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+
+    let cu_mem_alloc = unsafe {
+        resident
+            ._lib
+            .get::<CuMemAlloc>(b"cuMemAlloc_v2\0")
+            .or_else(|_| resident._lib.get::<CuMemAlloc>(b"cuMemAlloc\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_mem_free = unsafe {
+        resident
+            ._lib
+            .get::<CuMemFree>(b"cuMemFree_v2\0")
+            .or_else(|_| resident._lib.get::<CuMemFree>(b"cuMemFree\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_memset_d8 = unsafe {
+        resident
+            ._lib
+            .get::<CuMemsetD8>(b"cuMemsetD8_v2\0")
+            .or_else(|_| resident._lib.get::<CuMemsetD8>(b"cuMemsetD8\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_memcpy_dtoh = unsafe {
+        resident
+            ._lib
+            .get::<CuMemcpyDtoH>(b"cuMemcpyDtoH_v2\0")
+            .or_else(|_| resident._lib.get::<CuMemcpyDtoH>(b"cuMemcpyDtoH\0"))
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_module_load_data = unsafe {
+        resident
+            ._lib
+            .get::<CuModuleLoadData>(b"cuModuleLoadData\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_module_unload = unsafe {
+        resident
+            ._lib
+            .get::<CuModuleUnload>(b"cuModuleUnload\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_module_get_function = unsafe {
+        resident
+            ._lib
+            .get::<CuModuleGetFunction>(b"cuModuleGetFunction\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_launch_kernel = unsafe {
+        resident
+            ._lib
+            .get::<CuLaunchKernel>(b"cuLaunchKernel\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+    let cu_ctx_synchronize = unsafe {
+        resident
+            ._lib
+            .get::<CuCtxSynchronize>(b"cuCtxSynchronize\0")
+            .map_err(|_| CudaRuntimeProbeError::DriverLibraryUnavailable)?
+    };
+
+    let mut device_indices = 0_u64;
+    check_cuda(unsafe { cu_mem_alloc(&mut device_indices, output_bytes) })?;
+    let indices_guard = CudaDeviceAllocationGuard {
+        ptr: device_indices,
+        free: *cu_mem_free,
+    };
+    let mut device_count = 0_u64;
+    check_cuda(unsafe { cu_mem_alloc(&mut device_count, std::mem::size_of::<u32>()) })?;
+    let count_guard = CudaDeviceAllocationGuard {
+        ptr: device_count,
+        free: *cu_mem_free,
+    };
+    check_cuda(unsafe { cu_memset_d8(count_guard.ptr, 0, std::mem::size_of::<u32>()) })?;
+
+    let mut ptx = Vec::with_capacity(PTX.len() + 1);
+    ptx.extend_from_slice(PTX);
+    ptx.push(0);
+
+    let mut module = std::ptr::null_mut();
+    check_cuda(unsafe { cu_module_load_data(&mut module, ptx.as_ptr().cast::<c_void>()) })?;
+    let module_guard = CudaModuleGuard {
+        module,
+        unload: *cu_module_unload,
+    };
+
+    let mut function = std::ptr::null_mut();
+    check_cuda(unsafe {
+        cu_module_get_function(
+            &mut function,
+            module,
+            c"gpu_db_resident_i32_equal_row_indices".as_ptr(),
+        )
+    })?;
+
+    let mut resident_arg = resident.device_ptr;
+    let mut rows_arg = row_count;
+    let mut filter_count_arg = u32::try_from(filters.len())
+        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(filters.len()))?;
+    let mut offsets = [0_u64; MAX_FILTERS];
+    let mut needles = [0_i32; MAX_FILTERS];
+    for (idx, (offset, needle)) in filters.iter().enumerate() {
+        offsets[idx] = *offset;
+        needles[idx] = *needle;
+    }
+    let mut output_arg = indices_guard.ptr;
+    let mut count_arg = count_guard.ptr;
+    let mut args = [
+        (&mut resident_arg as *mut u64).cast::<c_void>(),
+        (&mut rows_arg as *mut u64).cast::<c_void>(),
+        (&mut filter_count_arg as *mut u32).cast::<c_void>(),
+        (&mut offsets[0] as *mut u64).cast::<c_void>(),
+        (&mut offsets[1] as *mut u64).cast::<c_void>(),
+        (&mut offsets[2] as *mut u64).cast::<c_void>(),
+        (&mut offsets[3] as *mut u64).cast::<c_void>(),
+        (&mut needles[0] as *mut i32).cast::<c_void>(),
+        (&mut needles[1] as *mut i32).cast::<c_void>(),
+        (&mut needles[2] as *mut i32).cast::<c_void>(),
+        (&mut needles[3] as *mut i32).cast::<c_void>(),
+        (&mut output_arg as *mut u64).cast::<c_void>(),
+        (&mut count_arg as *mut u64).cast::<c_void>(),
+    ];
+    let threads_per_block = 128;
+    let blocks = row_count_u32.div_ceil(threads_per_block);
+    launch_with_optional_cuda_event_timing(resident, *cu_ctx_synchronize, || unsafe {
+        cu_launch_kernel(
+            function,
+            blocks,
+            1,
+            1,
+            threads_per_block,
+            1,
+            1,
+            0,
+            std::ptr::null_mut(),
+            args.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    })?;
+
+    let mut match_count = 0_u32;
+    check_cuda(unsafe {
+        cu_memcpy_dtoh(
+            (&mut match_count as *mut u32).cast::<c_void>(),
+            count_guard.ptr,
+            std::mem::size_of::<u32>(),
+        )
+    })?;
+    let match_count = u64::from(match_count);
+    if match_count > row_count {
+        return Err(CudaRuntimeProbeError::InvalidInputLength(usize::MAX));
+    }
+    let match_count_usize = usize::try_from(match_count)
+        .map_err(|_| CudaRuntimeProbeError::InvalidInputLength(usize::MAX))?;
+    let mut indices = vec![0_u64; match_count_usize];
+    if match_count_usize > 0 {
+        check_cuda(unsafe {
+            cu_memcpy_dtoh(
+                indices.as_mut_ptr().cast::<c_void>(),
+                indices_guard.ptr,
+                match_count_usize * std::mem::size_of::<u64>(),
+            )
+        })?;
+    }
+
+    drop(module_guard);
+    drop(count_guard);
+    drop(indices_guard);
+    Ok(indices)
+}
+
 fn copy_cuda_resident_text_rows(
     resident: &CudaResidentDeviceMemory,
     offsets_byte_offset: u64,
@@ -2110,8 +2462,8 @@ fn launch_cuda_resident_i32_sum(
     .reg .u64 %idx;
     .reg .u64 %stride;
     .reg .u64 %addr;
-    .reg .u32 %block;
-    .reg .u32 %block_dim;
+    .reg .u32 %r_block;
+    .reg .u32 %r_block_dim;
     .reg .u32 %thread;
     .reg .u32 %grid_dim;
     .reg .u64 %wide_block;
@@ -2122,7 +2474,7 @@ fn launch_cuda_resident_i32_sum(
     .reg .u64 %ignored;
     .reg .s64 %sum;
     .reg .s64 %wide;
-    .reg .s32 %value;
+    .reg .s32 %r_value;
 
     ld.param.u64 %resident, [resident_ptr];
     ld.param.u64 %offset, [byte_offset];
@@ -2130,13 +2482,13 @@ fn launch_cuda_resident_i32_sum(
     ld.param.u64 %out, [out_ptr];
 
     add.u64 %base, %resident, %offset;
-    mov.u32 %block, %ctaid.x;
-    mov.u32 %block_dim, %ntid.x;
+    mov.u32 %r_block, %ctaid.x;
+    mov.u32 %r_block_dim, %ntid.x;
     mov.u32 %thread, %tid.x;
     mov.u32 %grid_dim, %nctaid.x;
-    cvt.u64.u32 %wide_block, %block;
+    cvt.u64.u32 %wide_block, %r_block;
     cvt.u64.u32 %wide_thread, %thread;
-    cvt.u64.u32 %wide_block_dim, %block_dim;
+    cvt.u64.u32 %wide_block_dim, %r_block_dim;
     cvt.u64.u32 %wide_grid_dim, %grid_dim;
     mul.lo.u64 %idx, %wide_block, %wide_block_dim;
     add.u64 %idx, %idx, %wide_thread;
@@ -2148,8 +2500,8 @@ loop:
     @%p_done bra done;
     mul.lo.u64 %addr, %idx, 4;
     add.u64 %addr, %base, %addr;
-    ld.global.s32 %value, [%addr];
-    cvt.s64.s32 %wide, %value;
+    ld.global.s32 %r_value, [%addr];
+    cvt.s64.s32 %wide, %r_value;
     add.s64 %sum, %sum, %wide;
     add.u64 %idx, %idx, %stride;
     bra loop;
@@ -2366,8 +2718,8 @@ fn launch_cuda_resident_i32_between_stats(
     .reg .u64 %sum_addr;
     .reg .u64 %min_addr;
     .reg .u64 %max_addr;
-    .reg .u32 %block;
-    .reg .u32 %block_dim;
+    .reg .u32 %r_block;
+    .reg .u32 %r_block_dim;
     .reg .u32 %thread;
     .reg .u32 %grid_dim;
     .reg .u64 %wide_block;
@@ -2380,7 +2732,7 @@ fn launch_cuda_resident_i32_between_stats(
     .reg .s32 %ignored32;
     .reg .s64 %sum;
     .reg .s64 %wide;
-    .reg .s32 %value;
+    .reg .s32 %r_value;
     .reg .s32 %lower;
     .reg .s32 %upper;
     .reg .s32 %min;
@@ -2394,13 +2746,13 @@ fn launch_cuda_resident_i32_between_stats(
     ld.param.u64 %out, [out_ptr];
 
     add.u64 %base, %resident, %offset;
-    mov.u32 %block, %ctaid.x;
-    mov.u32 %block_dim, %ntid.x;
+    mov.u32 %r_block, %ctaid.x;
+    mov.u32 %r_block_dim, %ntid.x;
     mov.u32 %thread, %tid.x;
     mov.u32 %grid_dim, %nctaid.x;
-    cvt.u64.u32 %wide_block, %block;
+    cvt.u64.u32 %wide_block, %r_block;
     cvt.u64.u32 %wide_thread, %thread;
-    cvt.u64.u32 %wide_block_dim, %block_dim;
+    cvt.u64.u32 %wide_block_dim, %r_block_dim;
     cvt.u64.u32 %wide_grid_dim, %grid_dim;
     mul.lo.u64 %idx, %wide_block, %wide_block_dim;
     add.u64 %idx, %idx, %wide_thread;
@@ -2415,17 +2767,17 @@ loop:
     @%p_done bra done;
     mul.lo.u64 %addr, %idx, 4;
     add.u64 %addr, %base, %addr;
-    ld.global.s32 %value, [%addr];
-    setp.ge.s32 %p_ge_lower, %value, %lower;
-    setp.le.s32 %p_le_upper, %value, %upper;
+    ld.global.s32 %r_value, [%addr];
+    setp.ge.s32 %p_ge_lower, %r_value, %lower;
+    setp.le.s32 %p_le_upper, %r_value, %upper;
     and.pred %p_match, %p_ge_lower, %p_le_upper;
     @!%p_match bra next;
 
-    cvt.s64.s32 %wide, %value;
+    cvt.s64.s32 %wide, %r_value;
     add.s64 %sum, %sum, %wide;
     add.u64 %count, %count, 1;
-    min.s32 %min, %min, %value;
-    max.s32 %max, %max, %value;
+    min.s32 %min, %min, %r_value;
+    max.s32 %max, %max, %r_value;
 
 next:
     add.u64 %idx, %idx, %stride;
@@ -2663,7 +3015,7 @@ fn launch_cuda_resident_i32_project(
     .reg .u64 %idx;
     .reg .u64 %input_addr;
     .reg .u64 %output_addr;
-    .reg .s32 %value;
+    .reg .s32 %r_value;
 
     ld.param.u64 %resident, [resident_ptr];
     ld.param.u64 %offset, [byte_offset];
@@ -2679,10 +3031,10 @@ loop:
     @%p_done bra done;
     mul.lo.u64 %input_addr, %idx, 4;
     add.u64 %input_addr, %base, %input_addr;
-    ld.global.s32 %value, [%input_addr];
+    ld.global.s32 %r_value, [%input_addr];
     mul.lo.u64 %output_addr, %idx, 4;
     add.u64 %output_addr, %out_values, %output_addr;
-    st.global.s32 [%output_addr], %value;
+    st.global.s32 [%output_addr], %r_value;
     add.u64 %idx, %idx, 1;
     bra loop;
 
@@ -2904,7 +3256,7 @@ fn launch_cuda_resident_i32_grouped_stats(
     .reg .pred %p_same;
     .reg .u64 %resident;
     .reg .u64 %group_offset;
-    .reg .u64 %value_offset;
+    .reg .u64 %r_value_offset;
     .reg .u64 %filter_offset;
     .reg .u64 %rows;
     .reg .u64 %out_groups;
@@ -2914,7 +3266,7 @@ fn launch_cuda_resident_i32_grouped_stats(
     .reg .u64 %out_maxs;
     .reg .u64 %out_count;
     .reg .u64 %group_base;
-    .reg .u64 %value_base;
+    .reg .u64 %r_value_base;
     .reg .u64 %filter_base;
     .reg .u64 %idx;
     .reg .u64 %scan;
@@ -2922,12 +3274,12 @@ fn launch_cuda_resident_i32_grouped_stats(
     .reg .u64 %input_addr;
     .reg .u64 %output_addr;
     .reg .s32 %group_value;
-    .reg .s32 %value;
+    .reg .s32 %r_value;
     .reg .s32 %filter_value;
     .reg .s32 %needle;
     .reg .u32 %comparison;
     .reg .s32 %existing_group;
-    .reg .s64 %value_wide;
+    .reg .s64 %r_value_wide;
     .reg .u64 %existing_count;
     .reg .u64 %new_count;
     .reg .s64 %existing_sum;
@@ -2941,7 +3293,7 @@ fn launch_cuda_resident_i32_grouped_stats(
 
     ld.param.u64 %resident, [resident_ptr];
     ld.param.u64 %group_offset, [group_byte_offset];
-    ld.param.u64 %value_offset, [value_byte_offset];
+    ld.param.u64 %r_value_offset, [value_byte_offset];
     ld.param.u64 %filter_offset, [filter_byte_offset];
     ld.param.u64 %rows, [row_count];
     ld.param.s32 %needle, [needle];
@@ -2954,7 +3306,7 @@ fn launch_cuda_resident_i32_grouped_stats(
     ld.param.u64 %out_count, [out_count_ptr];
 
     add.u64 %group_base, %resident, %group_offset;
-    add.u64 %value_base, %resident, %value_offset;
+    add.u64 %r_value_base, %resident, %r_value_offset;
     add.u64 %filter_base, %resident, %filter_offset;
     mov.u64 %idx, 0;
     mov.u64 %group_count, 0;
@@ -2997,9 +3349,9 @@ predicate_pass:
     add.u64 %input_addr, %group_base, %input_addr;
     ld.global.s32 %group_value, [%input_addr];
     mul.lo.u64 %input_addr, %idx, 4;
-    add.u64 %input_addr, %value_base, %input_addr;
-    ld.global.s32 %value, [%input_addr];
-    cvt.s64.s32 %value_wide, %value;
+    add.u64 %input_addr, %r_value_base, %input_addr;
+    ld.global.s32 %r_value, [%input_addr];
+    cvt.s64.s32 %r_value_wide, %r_value;
 
     mov.u64 %scan, 0;
     mov.pred %p_found, 0;
@@ -3022,23 +3374,23 @@ scan_loop:
     mul.lo.u64 %output_addr, %scan, 8;
     add.u64 %output_addr, %out_sums, %output_addr;
     ld.global.s64 %existing_sum, [%output_addr];
-    add.s64 %new_sum, %existing_sum, %value_wide;
+    add.s64 %new_sum, %existing_sum, %r_value_wide;
     st.global.s64 [%output_addr], %new_sum;
 
     mul.lo.u64 %output_addr, %scan, 4;
     add.u64 %output_addr, %out_mins, %output_addr;
     ld.global.s32 %existing_min, [%output_addr];
-    setp.lt.s32 %p_less, %value, %existing_min;
+    setp.lt.s32 %p_less, %r_value, %existing_min;
     @!%p_less bra keep_min;
-    st.global.s32 [%output_addr], %value;
+    st.global.s32 [%output_addr], %r_value;
 keep_min:
 
     mul.lo.u64 %output_addr, %scan, 4;
     add.u64 %output_addr, %out_maxs, %output_addr;
     ld.global.s32 %existing_max, [%output_addr];
-    setp.gt.s32 %p_greater, %value, %existing_max;
+    setp.gt.s32 %p_greater, %r_value, %existing_max;
     @!%p_greater bra keep_max;
-    st.global.s32 [%output_addr], %value;
+    st.global.s32 [%output_addr], %r_value;
 keep_max:
 
     mov.pred %p_found, 1;
@@ -3059,13 +3411,13 @@ insert_or_next:
     st.global.u64 [%output_addr], %new_count;
     mul.lo.u64 %output_addr, %group_count, 8;
     add.u64 %output_addr, %out_sums, %output_addr;
-    st.global.s64 [%output_addr], %value_wide;
+    st.global.s64 [%output_addr], %r_value_wide;
     mul.lo.u64 %output_addr, %group_count, 4;
     add.u64 %output_addr, %out_mins, %output_addr;
-    st.global.s32 [%output_addr], %value;
+    st.global.s32 [%output_addr], %r_value;
     mul.lo.u64 %output_addr, %group_count, 4;
     add.u64 %output_addr, %out_maxs, %output_addr;
-    st.global.s32 [%output_addr], %value;
+    st.global.s32 [%output_addr], %r_value;
     add.u64 %group_count, %group_count, 1;
 
 next_row:
@@ -3429,7 +3781,7 @@ fn launch_cuda_resident_i32_compare_project(
     .reg .u64 %matches;
     .reg .u32 %comparison;
     .reg .s32 %needle;
-    .reg .s32 %value;
+    .reg .s32 %r_value;
 
     ld.param.u64 %resident, [resident_ptr];
     ld.param.u64 %offset, [byte_offset];
@@ -3448,11 +3800,11 @@ loop:
     @%p_done bra done;
     mul.lo.u64 %input_addr, %idx, 4;
     add.u64 %input_addr, %base, %input_addr;
-    ld.global.s32 %value, [%input_addr];
-    setp.lt.s32 %p_lt, %value, %needle;
-    setp.le.s32 %p_lte, %value, %needle;
-    setp.gt.s32 %p_gt, %value, %needle;
-    setp.ge.s32 %p_gte, %value, %needle;
+    ld.global.s32 %r_value, [%input_addr];
+    setp.lt.s32 %p_lt, %r_value, %needle;
+    setp.le.s32 %p_lte, %r_value, %needle;
+    setp.gt.s32 %p_gt, %r_value, %needle;
+    setp.ge.s32 %p_gte, %r_value, %needle;
     setp.eq.u32 %p_code_lt, %comparison, 1;
     setp.eq.u32 %p_code_lte, %comparison, 2;
     setp.eq.u32 %p_code_gt, %comparison, 3;
@@ -3469,7 +3821,7 @@ loop:
     @!%p_match bra next;
     mul.lo.u64 %output_addr, %matches, 4;
     add.u64 %output_addr, %out_values, %output_addr;
-    st.global.s32 [%output_addr], %value;
+    st.global.s32 [%output_addr], %r_value;
     add.u64 %matches, %matches, 1;
 
 next:
@@ -3802,11 +4154,11 @@ fn launch_cuda_smoke_add_one(input: u32) -> Result<u32, CudaRuntimeProbeError> {
 )
 {
     .reg .u64 %out;
-    .reg .u32 %value;
+    .reg .u32 %r_value;
     ld.param.u64 %out, [out_ptr];
-    ld.param.u32 %value, [input];
-    add.u32 %value, %value, 1;
-    st.global.u32 [%out], %value;
+    ld.param.u32 %r_value, [input];
+    add.u32 %r_value, %r_value, 1;
+    st.global.u32 [%out], %r_value;
     ret;
 }
 "#;
@@ -5258,7 +5610,7 @@ fn launch_cuda_mvcc_row_batch_lengths(
     .reg .u64 %rd_offset;
     .reg .u64 %rd_next_offset;
     .reg .u64 %rd_output_offset;
-    .reg .u64 %rd_addr;
+    .reg .u64 %addr;
 
     ld.param.u64 %rd_key_offsets, [key_offsets_ptr];
     ld.param.u64 %rd_value_offsets, [value_offsets_ptr];
@@ -5274,23 +5626,23 @@ fn launch_cuda_mvcc_row_batch_lengths(
     @%p_out bra DONE;
 
     mul.wide.u32 %rd_offset, %r_idx, 4;
-    add.u64 %rd_addr, %rd_key_offsets, %rd_offset;
-    add.u64 %rd_next_offset, %rd_addr, 4;
-    ld.global.u32 %r_key_start, [%rd_addr];
+    add.u64 %addr, %rd_key_offsets, %rd_offset;
+    add.u64 %rd_next_offset, %addr, 4;
+    ld.global.u32 %r_key_start, [%addr];
     ld.global.u32 %r_key_end, [%rd_next_offset];
     sub.u32 %r_key_len, %r_key_end, %r_key_start;
 
-    add.u64 %rd_addr, %rd_value_offsets, %rd_offset;
-    add.u64 %rd_next_offset, %rd_addr, 4;
-    ld.global.u32 %r_value_start, [%rd_addr];
+    add.u64 %addr, %rd_value_offsets, %rd_offset;
+    add.u64 %rd_next_offset, %addr, 4;
+    ld.global.u32 %r_value_start, [%addr];
     ld.global.u32 %r_value_end, [%rd_next_offset];
     sub.u32 %r_value_len, %r_value_end, %r_value_start;
 
     mul.wide.u32 %rd_output_offset, %r_idx, 8;
-    add.u64 %rd_addr, %rd_output, %rd_output_offset;
-    st.global.u32 [%rd_addr], %r_key_len;
-    add.u64 %rd_addr, %rd_addr, 4;
-    st.global.u32 [%rd_addr], %r_value_len;
+    add.u64 %addr, %rd_output, %rd_output_offset;
+    st.global.u32 [%addr], %r_key_len;
+    add.u64 %addr, %addr, 4;
+    st.global.u32 [%addr], %r_value_len;
 
 DONE:
     ret;
@@ -5549,7 +5901,7 @@ fn launch_cuda_mvcc_visibility_mask(
     .reg .u64 %rd_read_txn_id;
     .reg .u64 %rd_offset8;
     .reg .u64 %rd_offset4;
-    .reg .u64 %rd_addr;
+    .reg .u64 %addr;
     .reg .u64 %rd_created_by;
     .reg .u64 %rd_deleted_by;
 
@@ -5568,10 +5920,10 @@ fn launch_cuda_mvcc_visibility_mask(
     @%p_out bra DONE;
 
     mul.wide.u32 %rd_offset8, %r_idx, 8;
-    add.u64 %rd_addr, %rd_begin, %rd_offset8;
-    ld.global.u64 %rd_created_by, [%rd_addr];
-    add.u64 %rd_addr, %rd_end, %rd_offset8;
-    ld.global.u64 %rd_deleted_by, [%rd_addr];
+    add.u64 %addr, %rd_begin, %rd_offset8;
+    ld.global.u64 %rd_created_by, [%addr];
+    add.u64 %addr, %rd_end, %rd_offset8;
+    ld.global.u64 %rd_deleted_by, [%addr];
 
     setp.le.u64 %p_created, %rd_created_by, %rd_read_txn_id;
     setp.gt.u64 %p_not_deleted, %rd_deleted_by, %rd_read_txn_id;
@@ -5579,8 +5931,8 @@ fn launch_cuda_mvcc_visibility_mask(
     selp.u32 %r_mask_value, 1, 0, %p_visible;
 
     mul.wide.u32 %rd_offset4, %r_idx, 4;
-    add.u64 %rd_addr, %rd_mask, %rd_offset4;
-    st.global.u32 [%rd_addr], %r_mask_value;
+    add.u64 %addr, %rd_mask, %rd_offset4;
+    st.global.u32 [%addr], %r_mask_value;
 
 DONE:
     ret;

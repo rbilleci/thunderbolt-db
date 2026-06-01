@@ -16680,24 +16680,22 @@ impl Engine {
                     table.name
                 )))
             })?;
-        let matching_row_indices = snapshot
-            .resident_rows
+        let filter_offsets = filters
             .iter()
-            .enumerate()
-            .filter(|(_, row)| {
-                filters.iter().all(|(filter_idx, needle)| {
-                    row.get(*filter_idx) == Some(&SqlValue::Int4(*needle))
-                })
-            })
-            .map(|(row_idx, _)| {
-                u64::try_from(row_idx).map_err(|_| {
-                    ExecuteError::Engine(EngineError::ApplyFailed(
-                        "resident snapshot row index exceeds retained device-memory proof range"
-                            .to_string(),
-                    ))
-                })
+            .map(|(filter_idx, needle)| {
+                resident_device_int4_column_offset(&snapshot, &table, *filter_idx)
+                    .map(|offset| (offset, *needle))
             })
             .collect::<Result<Vec<_>, ExecuteError>>()?;
+        let row_count = u64::try_from(snapshot.row_count).map_err(|_| {
+            ExecuteError::Engine(EngineError::ApplyFailed(
+                "resident snapshot row count exceeds retained device-memory proof range"
+                    .to_string(),
+            ))
+        })?;
+        let matching_row_indices = device_memory
+            .match_i32_equal_row_indices_from_payload(&filter_offsets, row_count)
+            .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
         let mut projected_columns = bound
             .selected_indexes
             .iter()
@@ -16789,9 +16787,19 @@ impl Engine {
                     )
             })
             .fold(0_u64, u64::saturating_add);
-        let result_d2h_bytes = int4_d2h_bytes.saturating_add(text_d2h_bytes);
+        let match_index_d2h_bytes = u64::try_from(matching_row_indices.len())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(std::mem::size_of::<u64>() as u64)
+            .saturating_add(std::mem::size_of::<u64>() as u64);
+        let result_d2h_bytes = int4_d2h_bytes
+            .saturating_add(text_d2h_bytes)
+            .saturating_add(match_index_d2h_bytes);
         self.metrics.observe_d2h_bytes(result_d2h_bytes);
-        for _ in 0..column_values.len().saturating_add(text_values.len()) {
+        for _ in 0..column_values
+            .len()
+            .saturating_add(text_values.len())
+            .saturating_add(1)
+        {
             self.metrics
                 .observe_kernel_exec_ms(elapsed.as_millis().try_into().unwrap_or(u64::MAX).max(1));
         }
@@ -24666,7 +24674,12 @@ mod tests {
         );
         assert_eq!(
             decision.last_execution_d2h_bytes,
-            Some((2 * 2 * std::mem::size_of::<i32>() + std::mem::size_of::<u64>()) as u64)
+            Some(
+                (2 * 2 * std::mem::size_of::<i32>()
+                    + std::mem::size_of::<u64>()
+                    + 2 * std::mem::size_of::<u64>()
+                    + std::mem::size_of::<u64>()) as u64
+            )
         );
 
         let Command::Select(composite) =
@@ -24715,7 +24728,12 @@ mod tests {
         );
         assert_eq!(
             decision.last_execution_d2h_bytes,
-            Some((2 * std::mem::size_of::<i32>() + std::mem::size_of::<u64>()) as u64)
+            Some(
+                (2 * std::mem::size_of::<i32>()
+                    + std::mem::size_of::<u64>()
+                    + std::mem::size_of::<u64>()
+                    + std::mem::size_of::<u64>()) as u64
+            )
         );
 
         let Command::Select(mixed_composite) =
@@ -24770,7 +24788,9 @@ mod tests {
                 (2 * std::mem::size_of::<i32>()
                     + std::mem::size_of::<u64>()
                     + 2 * std::mem::size_of::<u64>()
-                    + "gamma".len()) as u64
+                    + "gamma".len()
+                    + std::mem::size_of::<u64>()
+                    + std::mem::size_of::<u64>()) as u64
             )
         );
     }
