@@ -159,7 +159,13 @@ impl EndpointState {
             }
             Command::Select(select) => {
                 let before = self.engine.metrics().snapshot();
+                let execute_started = Instant::now();
                 let result = self.engine.execute_relational_select(&select)?;
+                let engine_execute_micros = execute_started
+                    .elapsed()
+                    .as_micros()
+                    .try_into()
+                    .unwrap_or(u64::MAX);
                 let after = self.engine.metrics().snapshot();
                 let decision = self
                     .engine
@@ -174,6 +180,7 @@ impl EndpointState {
                         BackendColumn::new(&column.name, column.type_oid, column.type_size)
                     })
                     .collect::<Vec<_>>();
+                let materialize_started = Instant::now();
                 let rows = result
                     .rows
                     .iter()
@@ -183,9 +190,20 @@ impl EndpointState {
                             .collect()
                     })
                     .collect::<Vec<Vec<_>>>();
+                let result_materialize_micros = materialize_started
+                    .elapsed()
+                    .as_micros()
+                    .try_into()
+                    .unwrap_or(u64::MAX);
                 let mut writer = BackendWriter::new(output);
+                let write_started = Instant::now();
                 writer.select_rows(&columns, &rows, true)?;
                 writer.ready_for_query(false)?;
+                let client_write_micros = write_started
+                    .elapsed()
+                    .as_micros()
+                    .try_into()
+                    .unwrap_or(u64::MAX);
                 if let Some(decision) = decision {
                     let h2d_delta = after.h2d_bytes_total.saturating_sub(before.h2d_bytes_total);
                     let zero_h2d = decision.last_execution_h2d_bytes == Some(0)
@@ -212,6 +230,45 @@ impl EndpointState {
                             .kernel_exec_samples
                             .saturating_sub(before.kernel_exec_samples),
                     )?;
+                    self.fact(
+                        "client_visible_select_engine_execute_micros",
+                        engine_execute_micros,
+                    )?;
+                    self.fact(
+                        "client_visible_select_result_materialize_micros",
+                        result_materialize_micros,
+                    )?;
+                    self.fact(
+                        "client_visible_select_client_write_micros",
+                        client_write_micros,
+                    )?;
+                    if let Some(value) = decision.last_execution_wall_micros {
+                        self.fact("client_visible_select_retained_wall_micros", value)?;
+                    }
+                    if let Some(value) = decision.last_execution_device_lookup_micros {
+                        self.fact("client_visible_select_retained_device_lookup_micros", value)?;
+                    }
+                    if let Some(value) = decision.last_execution_match_index_micros {
+                        self.fact("client_visible_select_retained_match_index_micros", value)?;
+                    }
+                    if let Some(value) = decision.last_execution_selected_projection_micros {
+                        self.fact(
+                            "client_visible_select_retained_selected_projection_micros",
+                            value,
+                        )?;
+                    }
+                    if let Some(value) = decision.last_execution_result_materialization_micros {
+                        self.fact(
+                            "client_visible_select_retained_result_materialization_micros",
+                            value,
+                        )?;
+                    }
+                    if let Some(value) = decision.last_execution_matched_rows {
+                        self.fact("client_visible_select_retained_matched_rows", value)?;
+                    }
+                    if let Some(value) = decision.last_execution_kernel_event_elapsed_us {
+                        self.fact("client_visible_select_retained_cuda_event_micros", value)?;
+                    }
                     self.fact(
                         "client_visible_select_retained_match_index_compaction",
                         matches!(

@@ -89,12 +89,14 @@ Current accepted smoke evidence:
   the 6h worker budget. The first 10% attempt loaded the target rows, but is
   blocked because GPU DB sustained COPY admission measured below 30k rows/sec
   and retained query timings made the remaining full concurrency curve
-  indefensible inside the worker budget.
+  indefensible inside the worker budget. A follow-up 1,048,576-row retained
+  query profile removed the measured query setup bottlenecks, but the 10%
+  retry still needs to recheck COPY admission against the 30k rows/sec target.
 
 Current blockers and non-claims:
 
 - `missing_partitioned_over_resident_execution`
-- `gpu_db_10pct_copy_and_retained_query_throughput_required`
+- `gpu_db_10pct_copy_admission_below_30000_rows_per_sec_recheck_required`
 - `pgsql_128_client_count_query_errors_need_classification`
 - no accepted 10% or full 25% default/tuned PostgreSQL/GPU DB retained curve
 - no completed 125% over-resident PostgreSQL-vs-GPU retained tier
@@ -117,6 +119,8 @@ The latest COPY phase-profile report is
 [docs/testing/reports/2026-06-01-p8-engine-sql-visible-copy-admission-phase-profile-v1.md](docs/testing/reports/2026-06-01-p8-engine-sql-visible-copy-admission-phase-profile-v1.md).
 The latest 10% execution blocker report is
 [docs/testing/reports/2026-06-01-p8-10pct-identical-single-load-curves-v1.md](docs/testing/reports/2026-06-01-p8-10pct-identical-single-load-curves-v1.md).
+The latest retained query profile report is
+[docs/testing/reports/2026-06-01-p8-10pct-retained-query-throughput-profile-v1.md](docs/testing/reports/2026-06-01-p8-10pct-retained-query-throughput-profile-v1.md).
 
 ## Security And Operations
 

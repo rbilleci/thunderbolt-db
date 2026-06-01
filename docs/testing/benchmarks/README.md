@@ -83,7 +83,11 @@ that guard, the 1,048,576-row bounded GPU DB probe projected the
 attempt loaded default PostgreSQL and the GPU DB retained endpoint
 successfully, but it is blocked because GPU DB sustained COPY admission
 measured below the required 30k rows/sec target and retained query timings made
-the remaining full concurrency curve indefensible inside the worker budget.
+the remaining full concurrency curve indefensible inside the worker budget. A
+follow-up retained-query profile removed the measured 1M-row retained query
+setup bottlenecks for `COUNT(*)`, multi-column int4 lookup, and composite/text
+lookup; the 10% retry remains gated on rechecking GPU DB COPY admission against
+the 30k rows/sec target.
 
 The latest scaled smoke includes:
 
@@ -136,6 +140,10 @@ match-index output.
   first 10% default/tuned/GPU retained execution attempt, load metrics, partial
   graph-ready concurrency artifacts, and the narrowed GPU DB COPY/query
   throughput blocker.
+- [2026-06-01 10% retained query throughput profile](../reports/2026-06-01-p8-10pct-retained-query-throughput-profile-v1.md):
+  retained-query setup phase evidence, the snapshot-clone and conjunctive
+  access-path fixes, 1M-row after-fix proof, and the remaining COPY admission
+  recheck blocker.
 - [2026-06-01 retained composite/text lookup route](../reports/2026-06-01-p8-retained-composite-text-lookup-route-v1.md):
   retained composite lookup progression.
 - [2026-05-31 25% aggregate refresh after BETWEEN](../reports/2026-05-31-p8-25pct-aggregate-refresh-after-between-v1.md):
@@ -145,10 +153,12 @@ match-index output.
 
 ## Remaining Blockers
 
-- `gpu_db_10pct_copy_and_retained_query_throughput_required`: the first 10%
-  single-load attempt loaded the target rows, but GPU DB COPY admission measured
-  below the required 30k rows/sec target and retained query timings made the
-  remaining GPU DB concurrency curve indefensible inside the worker budget.
+- `gpu_db_10pct_copy_admission_below_30000_rows_per_sec_recheck_required`: the
+  first 10% single-load attempt loaded the target rows, but GPU DB COPY
+  admission measured below the required 30k rows/sec target. A later 1M-row
+  retained-query probe removed the measured query setup bottlenecks, so the
+  10% retry should recheck COPY admission and the full retained concurrency
+  curve together.
 - `pgsql_128_client_count_query_errors_need_classification`: default/tuned
   PostgreSQL 128-client count-query errors appeared in the 10% attempt and must
   be classified before trusting 128-client comparator rows.

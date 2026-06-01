@@ -161,6 +161,12 @@ pub struct RelationalResidentRouteDecisionStatus {
     pub last_execution_kernel_ms: Option<u64>,
     pub last_execution_kernel_event_elapsed_us: Option<u64>,
     pub last_execution_rows: Option<usize>,
+    pub last_execution_wall_micros: Option<u64>,
+    pub last_execution_device_lookup_micros: Option<u64>,
+    pub last_execution_match_index_micros: Option<u64>,
+    pub last_execution_selected_projection_micros: Option<u64>,
+    pub last_execution_result_materialization_micros: Option<u64>,
+    pub last_execution_matched_rows: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

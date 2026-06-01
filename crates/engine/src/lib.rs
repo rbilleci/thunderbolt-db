@@ -6055,6 +6055,7 @@ struct RelationalResidentRouteExecutionObservation {
     kernel_ms: u64,
     kernel_event_elapsed_us: Option<u64>,
     rows: usize,
+    wall_micros: u64,
 }
 
 impl RelationalResidentCache {
@@ -6083,6 +6084,36 @@ impl RelationalResidentCache {
             decision.last_execution_kernel_ms = Some(observation.kernel_ms);
             decision.last_execution_kernel_event_elapsed_us = observation.kernel_event_elapsed_us;
             decision.last_execution_rows = Some(observation.rows);
+            decision.last_execution_wall_micros = Some(observation.wall_micros);
+        }
+    }
+
+    fn record_route_device_lookup_micros(
+        &mut self,
+        table: &str,
+        elapsed_micros: u64,
+        matched_rows: usize,
+    ) {
+        if let Some(decision) = self.latest_route_decisions.get_mut(table) {
+            decision.last_execution_device_lookup_micros = Some(elapsed_micros);
+            decision.last_execution_matched_rows = Some(matched_rows);
+        }
+    }
+
+    fn record_route_selected_projection_micros(
+        &mut self,
+        table: &str,
+        match_index_micros: u64,
+        selected_projection_micros: u64,
+        result_materialization_micros: u64,
+        matched_rows: usize,
+    ) {
+        if let Some(decision) = self.latest_route_decisions.get_mut(table) {
+            decision.last_execution_match_index_micros = Some(match_index_micros);
+            decision.last_execution_selected_projection_micros = Some(selected_projection_micros);
+            decision.last_execution_result_materialization_micros =
+                Some(result_materialization_micros);
+            decision.last_execution_matched_rows = Some(matched_rows);
         }
     }
 
@@ -14591,7 +14622,7 @@ impl Engine {
         let (table, bound) = self.bind_relational_select_for_execution(select)?;
         let (_query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
         let snapshot = self
-            .relational_residency_snapshot(&table.name)
+            .relational_residency_snapshot_ref(&table.name)
             .ok_or_else(|| {
                 ExecuteError::Engine(EngineError::ApplyFailed(format!(
                     "relation \"{}\" has no resident snapshot",
@@ -14647,6 +14678,7 @@ impl Engine {
         {
             device_memory.clear_last_kernel_event_elapsed_us();
         }
+        let route_started = Instant::now();
         let result = match decision.query_shape.as_str() {
             "count_all" => self.execute_relational_count_with_resident_device_memory_probe(select),
             "int4_equality_count" => {
@@ -14735,6 +14767,11 @@ impl Engine {
                         .saturating_sub(before_metrics.kernel_exec_total_ms),
                     kernel_event_elapsed_us,
                     rows: result.rows.len(),
+                    wall_micros: route_started
+                        .elapsed()
+                        .as_micros()
+                        .try_into()
+                        .unwrap_or(u64::MAX),
                 },
             );
         Ok(result)
@@ -14763,7 +14800,7 @@ impl Engine {
         }
         let (_query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
         let snapshot = self
-            .relational_residency_snapshot(&table.name)
+            .relational_residency_snapshot_ref(&table.name)
             .ok_or_else(|| {
                 ExecuteError::Engine(EngineError::ApplyFailed(format!(
                     "relation \"{}\" has no resident snapshot",
@@ -14781,6 +14818,7 @@ impl Engine {
                 table.name
             ))));
         }
+        let snapshot_gpu_id = snapshot.gpu_id;
         let device_memory = self
             .relational_resident_cache
             .device_memory
@@ -14791,9 +14829,15 @@ impl Engine {
                     table.name
                 )))
             })?;
+        let lookup_started = Instant::now();
         let row_count = device_memory
             .count_rows_from_header()
             .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
+        let lookup_micros = lookup_started
+            .elapsed()
+            .as_micros()
+            .try_into()
+            .unwrap_or(u64::MAX);
         if row_count != snapshot.row_count as u64 {
             return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
                 "resident device-memory row-count proof returned {row_count}, expected {}",
@@ -14805,12 +14849,14 @@ impl Engine {
                 "resident device-memory row count {row_count} exceeds supported COUNT(*) result range"
             )))
         })?;
+        self.relational_resident_cache
+            .record_route_device_lookup_micros(&table.name, lookup_micros, 1);
 
         Ok(RelationalSelectResult {
             columns: bound.selected_columns,
             rows: vec![vec![SqlValue::Int4(count)]],
-            planned_target: DeviceTarget::Gpu(snapshot.gpu_id),
-            executed_target: DeviceTarget::Gpu(snapshot.gpu_id),
+            planned_target: DeviceTarget::Gpu(snapshot_gpu_id),
+            executed_target: DeviceTarget::Gpu(snapshot_gpu_id),
             fallback_reason: None,
             access_path,
         })
@@ -14858,7 +14904,7 @@ impl Engine {
 
         let (_query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
         let snapshot = self
-            .relational_residency_snapshot(&table.name)
+            .relational_residency_snapshot_ref(&table.name)
             .ok_or_else(|| {
                 ExecuteError::Engine(EngineError::ApplyFailed(format!(
                     "relation \"{}\" has no resident snapshot",
@@ -16356,7 +16402,7 @@ impl Engine {
 
         let (_query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
         let snapshot = self
-            .relational_residency_snapshot(&table.name)
+            .relational_residency_snapshot_ref(&table.name)
             .ok_or_else(|| {
                 ExecuteError::Engine(EngineError::ApplyFailed(format!(
                     "relation \"{}\" has no resident snapshot",
@@ -16374,6 +16420,7 @@ impl Engine {
                 table.name
             ))));
         }
+        let snapshot_gpu_id = snapshot.gpu_id;
         let device_memory = self
             .relational_resident_cache
             .device_memory
@@ -16495,8 +16542,8 @@ impl Engine {
         Ok(RelationalSelectResult {
             columns: bound.selected_columns,
             rows,
-            planned_target: DeviceTarget::Gpu(snapshot.gpu_id),
-            executed_target: DeviceTarget::Gpu(snapshot.gpu_id),
+            planned_target: DeviceTarget::Gpu(snapshot_gpu_id),
+            executed_target: DeviceTarget::Gpu(snapshot_gpu_id),
             fallback_reason: None,
             access_path,
         })
@@ -16715,9 +16762,15 @@ impl Engine {
                     .to_string(),
             ))
         })?;
+        let lookup_started = Instant::now();
         let matched_count = device_memory
             .count_i32_equal_from_payload(byte_offset, row_count, needle)
             .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
+        let lookup_micros = lookup_started
+            .elapsed()
+            .as_micros()
+            .try_into()
+            .unwrap_or(u64::MAX);
         let matched_len = usize::try_from(matched_count).map_err(|_| {
             ExecuteError::Engine(EngineError::ApplyFailed(format!(
                 "resident device-memory equality projection count {matched_count} exceeds host result range"
@@ -16725,6 +16778,8 @@ impl Engine {
         })?;
         self.metrics
             .observe_d2h_bytes(std::mem::size_of::<u64>() as u64);
+        self.relational_resident_cache
+            .record_route_device_lookup_micros(&table.name, lookup_micros, matched_len);
 
         Ok(RelationalSelectResult {
             columns: bound.selected_columns,
@@ -16798,7 +16853,7 @@ impl Engine {
 
         let (_query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
         let snapshot = self
-            .relational_residency_snapshot(&table.name)
+            .relational_residency_snapshot_ref(&table.name)
             .ok_or_else(|| {
                 ExecuteError::Engine(EngineError::ApplyFailed(format!(
                     "relation \"{}\" has no resident snapshot",
@@ -16816,6 +16871,7 @@ impl Engine {
                 table.name
             ))));
         }
+        let snapshot_gpu_id = snapshot.gpu_id;
         let device_memory = self
             .relational_resident_cache
             .device_memory
@@ -16839,9 +16895,15 @@ impl Engine {
                     .to_string(),
             ))
         })?;
+        let match_started = Instant::now();
         let matching_row_indices = device_memory
             .match_i32_equal_row_indices_from_payload(&filter_offsets, row_count)
             .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
+        let match_index_micros = match_started
+            .elapsed()
+            .as_micros()
+            .try_into()
+            .unwrap_or(u64::MAX);
         let mut projected_columns = bound
             .selected_indexes
             .iter()
@@ -16892,6 +16954,7 @@ impl Engine {
             }
         }
         let elapsed = started.elapsed();
+        let materialize_started = Instant::now();
         let rows = (0..matching_row_indices.len())
             .map(|selected_idx| {
                 bound
@@ -16912,6 +16975,11 @@ impl Engine {
                     .collect::<Result<Vec<_>, ExecuteError>>()
             })
             .collect::<Result<Vec<_>, ExecuteError>>()?;
+        let materialization_micros = materialize_started
+            .elapsed()
+            .as_micros()
+            .try_into()
+            .unwrap_or(u64::MAX);
         let int4_d2h_bytes = column_values
             .len()
             .checked_mul(matching_row_indices.len())
@@ -16949,12 +17017,20 @@ impl Engine {
             self.metrics
                 .observe_kernel_exec_ms(elapsed.as_millis().try_into().unwrap_or(u64::MAX).max(1));
         }
+        self.relational_resident_cache
+            .record_route_selected_projection_micros(
+                &table.name,
+                match_index_micros,
+                elapsed.as_micros().try_into().unwrap_or(u64::MAX),
+                materialization_micros,
+                matching_row_indices.len(),
+            );
 
         Ok(RelationalSelectResult {
             columns: bound.selected_columns,
             rows,
-            planned_target: DeviceTarget::Gpu(snapshot.gpu_id),
-            executed_target: DeviceTarget::Gpu(snapshot.gpu_id),
+            planned_target: DeviceTarget::Gpu(snapshot_gpu_id),
+            executed_target: DeviceTarget::Gpu(snapshot_gpu_id),
             fallback_reason: None,
             access_path,
         })
@@ -17738,6 +17814,38 @@ impl Engine {
         table: &RelationalTable,
         filters: &[(usize, SelectFilterOp, SqlValue)],
     ) -> Result<Vec<String>, ExecuteError> {
+        if filters.iter().all(|(_, op, _)| *op == SelectFilterOp::Eq) {
+            let mut sets = filters
+                .iter()
+                .map(|(idx, _op, value)| {
+                    let column = table
+                        .columns
+                        .get(*idx)
+                        .expect("bound filter column came from table");
+                    self.relational_value_index
+                        .get(&RelationalIndexKey {
+                            table: table.name.clone(),
+                            column: column.name.clone(),
+                            value: relational_index_value(value),
+                        })
+                        .map(|keys| keys.iter().cloned().collect::<BTreeSet<_>>())
+                        .unwrap_or_default()
+                })
+                .collect::<Vec<_>>();
+            if sets.is_empty() {
+                return Ok(Vec::new());
+            }
+            sets.sort_by_key(|set| set.len());
+            let mut matched = sets.remove(0);
+            for set in sets {
+                matched = matched.intersection(&set).cloned().collect();
+                if matched.is_empty() {
+                    break;
+                }
+            }
+            return Ok(matched.into_iter().collect());
+        }
+
         let visibility = StorageVisibility {
             read_txn_id: self.visible_up_to,
         };
@@ -19076,6 +19184,13 @@ impl Engine {
             })
     }
 
+    fn relational_residency_snapshot_ref(
+        &self,
+        table: &str,
+    ) -> Option<&RelationalResidencySnapshot> {
+        self.relational_resident_cache.snapshots.get(table)
+    }
+
     pub fn warm_relational_residency_with_policy(
         &mut self,
         policy: RelationalResidencyWarmupPolicy,
@@ -19334,6 +19449,12 @@ impl Engine {
             last_execution_kernel_ms: None,
             last_execution_kernel_event_elapsed_us: None,
             last_execution_rows: None,
+            last_execution_wall_micros: None,
+            last_execution_device_lookup_micros: None,
+            last_execution_match_index_micros: None,
+            last_execution_selected_projection_micros: None,
+            last_execution_result_materialization_micros: None,
+            last_execution_matched_rows: None,
         }
     }
 
@@ -19434,6 +19555,12 @@ impl Engine {
             last_execution_kernel_ms: None,
             last_execution_kernel_event_elapsed_us: None,
             last_execution_rows: None,
+            last_execution_wall_micros: None,
+            last_execution_device_lookup_micros: None,
+            last_execution_match_index_micros: None,
+            last_execution_selected_projection_micros: None,
+            last_execution_result_materialization_micros: None,
+            last_execution_matched_rows: None,
         };
 
         if snapshot.schema != table.schema || snapshot.table != table.name {
