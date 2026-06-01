@@ -78,9 +78,12 @@ then pivoted the next benchmark attempt to 10% of GPU memory. The first
 generated row-key MVCC insertion, grouped value-index appends, and COPY
 admission phase profiling. The measured decaying phase was an unnecessary
 all-visible-row constraint preflight scan for unconstrained COPY chunks; after
-that guard, the 1,048,576-row bounded GPU DB probe projects the 64,424,510-row
-10% COPY load inside the approved 6h budget. The full 10% default/tuned/GPU
-retained curves have not been run yet.
+that guard, the 1,048,576-row bounded GPU DB probe projected the
+64,424,510-row 10% COPY load inside the approved 6h budget. The first 10%
+attempt loaded default PostgreSQL and the GPU DB retained endpoint
+successfully, but it is blocked because GPU DB sustained COPY admission
+measured below the required 30k rows/sec target and retained query timings made
+the remaining full concurrency curve indefensible inside the worker budget.
 
 The latest scaled smoke includes:
 
@@ -129,6 +132,10 @@ match-index output.
   phase-specific COPY admission evidence, the unconstrained-table preflight
   scan fix, and bounded 1M endpoint evidence projecting 10% COPY admission
   inside the 6h budget.
+- [2026-06-01 10% identical single-load curves](../reports/2026-06-01-p8-10pct-identical-single-load-curves-v1.md):
+  first 10% default/tuned/GPU retained execution attempt, load metrics, partial
+  graph-ready concurrency artifacts, and the narrowed GPU DB COPY/query
+  throughput blocker.
 - [2026-06-01 retained composite/text lookup route](../reports/2026-06-01-p8-retained-composite-text-lookup-route-v1.md):
   retained composite lookup progression.
 - [2026-05-31 25% aggregate refresh after BETWEEN](../reports/2026-05-31-p8-25pct-aggregate-refresh-after-between-v1.md):
@@ -138,10 +145,13 @@ match-index output.
 
 ## Remaining Blockers
 
-- full 10% default/tuned PostgreSQL/GPU DB retained curves have not been run:
-  default PostgreSQL loaded the approved full 25% row count, and the latest
-  bounded GPU DB endpoint probe now projects 10% COPY admission inside the 6h
-  worker budget, but the single-load 10% curves still need execution evidence.
+- `gpu_db_10pct_copy_and_retained_query_throughput_required`: the first 10%
+  single-load attempt loaded the target rows, but GPU DB COPY admission measured
+  below the required 30k rows/sec target and retained query timings made the
+  remaining GPU DB concurrency curve indefensible inside the worker budget.
+- `pgsql_128_client_count_query_errors_need_classification`: default/tuned
+  PostgreSQL 128-client count-query errors appeared in the 10% attempt and must
+  be classified before trusting 128-client comparator rows.
 - `missing_partitioned_over_resident_execution`: the 125% tier requires a
   partitioned or streamed over-resident execution design because the current
   retained layout expects one resident CUDA layout larger than local RTX 3090
@@ -151,7 +161,7 @@ match-index output.
 
 The current benchmark evidence does not claim:
 
-- completed 10% or full 25% PostgreSQL-vs-GPU retained curves
+- accepted 10% or full 25% PostgreSQL-vs-GPU retained curves
 - completed 125% PostgreSQL-vs-GPU retained curves
 - full CH-benCHmark or BenchBase compatibility
 - joins or transaction-mix benchmarking

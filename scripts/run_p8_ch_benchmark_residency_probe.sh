@@ -151,6 +151,113 @@ json_escape() {
   sed 's/\\/\\\\/g; s/"/\\"/g' <<<"$1"
 }
 
+append_identical_pgwire_load_metric() {
+  local metrics_path="$1"
+  local tier="$2"
+  local target="$3"
+  local profile="$4"
+  local phase="$5"
+  local rows="$6"
+  local elapsed_ms="$7"
+  local status="$8"
+  local out_path="$9"
+  local err_path="${10}"
+  local rows_per_sec
+  local gpu_copy_minimum_met=null
+  if [ "$phase" = "load_reused" ]; then
+    rows_per_sec=0
+  elif [ "$elapsed_ms" -gt 0 ]; then
+    rows_per_sec=$((rows * 1000 / elapsed_ms))
+  else
+    rows_per_sec="$rows"
+  fi
+  if [ "$target" = "gpu_db_retained_endpoint" ] && [ "$phase" = "load" ]; then
+    if [ "$rows_per_sec" -ge 30000 ]; then
+      gpu_copy_minimum_met=true
+    else
+      gpu_copy_minimum_met=false
+    fi
+  fi
+  printf '{"kind":"identical_pgwire_target_load_metric","tier":"%s","target":"%s","profile":"%s","phase":"%s","rows_loaded":%s,"elapsed_ms":%s,"rows_per_sec":%s,"status":"%s","gpu_copy_minimum_rows_per_sec":30000,"gpu_copy_minimum_met":%s,"artifact_out":"%s","artifact_err":"%s"}\n' \
+    "$tier" \
+    "$target" \
+    "$profile" \
+    "$phase" \
+    "$rows" \
+    "$elapsed_ms" \
+    "$rows_per_sec" \
+    "$status" \
+    "$gpu_copy_minimum_met" \
+    "$(json_escape "$out_path")" \
+    "$(json_escape "$err_path")" >>"$metrics_path"
+}
+
+timed_identical_pgwire_load_to_psql() {
+  local url="$1"
+  local rows="$2"
+  local out_path="$3"
+  local err_path="$4"
+  local metrics_path="$5"
+  local tier="$6"
+  local target="$7"
+  local profile="$8"
+  local start_ns end_ns elapsed_ms rows_per_sec status rc
+  start_ns=$(date +%s%N)
+  set +e
+  stream_identical_pgwire_load_to_psql "$url" "$rows" "$out_path" "$err_path"
+  rc=$?
+  set -e
+  end_ns=$(date +%s%N)
+  elapsed_ms=$(((end_ns - start_ns) / 1000000))
+  if [ "$elapsed_ms" -gt 0 ]; then
+    rows_per_sec=$((rows * 1000 / elapsed_ms))
+  else
+    rows_per_sec="$rows"
+  fi
+  if [ "$rc" -eq 0 ]; then
+    status=pass
+  else
+    status=error
+  fi
+  append_identical_pgwire_load_metric "$metrics_path" "$tier" "$target" "$profile" load "$rows" "$elapsed_ms" "$status" "$out_path" "$err_path"
+  if [ "$target" = "gpu_db_retained_endpoint" ]; then
+    GPU_DB_IDENTICAL_LAST_LOAD_ROWS_PER_SEC="$rows_per_sec"
+    if [ "$rows_per_sec" -ge 30000 ]; then
+      GPU_DB_IDENTICAL_LAST_LOAD_MINIMUM_MET=true
+    else
+      GPU_DB_IDENTICAL_LAST_LOAD_MINIMUM_MET=false
+    fi
+  fi
+  return "$rc"
+}
+
+timed_identical_pgwire_setup_psql_file() {
+  local url="$1"
+  local sql_path="$2"
+  local out_path="$3"
+  local err_path="$4"
+  local metrics_path="$5"
+  local tier="$6"
+  local target="$7"
+  local profile="$8"
+  local rows="$9"
+  local start_ns end_ns elapsed_ms status rc
+  start_ns=$(date +%s%N)
+  set +e
+  psql "$url" -X -v ON_ERROR_STOP=1 -f "$sql_path" >"$out_path" 2>"$err_path"
+  rc=$?
+  set -e
+  end_ns=$(date +%s%N)
+  elapsed_ms=$(((end_ns - start_ns) / 1000000))
+  if [ "$rc" -eq 0 ]; then
+    status=pass
+  else
+    status=error
+  fi
+  append_identical_pgwire_load_metric "$metrics_path" "$tier" "$target" "$profile" setup "$rows" "$elapsed_ms" "$status" "$out_path" "$err_path"
+  return "$rc"
+}
+
 write_pgsql_copy_stream() {
   local rows="$1"
   local id bucket item qty amount dist
@@ -1725,7 +1832,18 @@ SQL
 
   pgsql_baseline_docker_up
   pgurl="$(pgsql_docker_url)"
-  stream_identical_pgwire_load_to_psql "$pgurl" "$rows" "$smoke_dir/default-postgresql-load.out" "$smoke_dir/default-postgresql-load.err"
+  if ! timed_identical_pgwire_load_to_psql "$pgurl" "$rows" "$smoke_dir/default-postgresql-load.out" "$smoke_dir/default-postgresql-load.err" "$metrics_path" "$identical_pgwire_tier" default_postgresql default_postgresql; then
+    pgsql_baseline_docker_down >/dev/null 2>&1 || true
+    cat >"$report_path" <<REPORT
+# P8 Identical Pgwire Target Smoke
+
+- status: blocked
+- blocker: default_postgresql_load_failed
+- default_postgresql_load_err: $smoke_dir/default-postgresql-load.err
+REPORT
+    cat "$report_path"
+    return 0
+  fi
   psql "$pgurl" -X -v ON_ERROR_STOP=1 -c "ANALYZE order_line" >"$smoke_dir/default-postgresql-analyze.out" 2>"$smoke_dir/default-postgresql-analyze.err"
   psql "$pgurl" -X -v ON_ERROR_STOP=1 -Atc "SELECT name || E'\t' || setting FROM pg_settings WHERE name IN ('shared_buffers','work_mem','maintenance_work_mem','effective_cache_size','max_parallel_workers_per_gather','jit','max_parallel_workers','max_worker_processes') ORDER BY name" >"$pg_settings_path"
 
@@ -1739,7 +1857,7 @@ SQL
 
   local ready=0
   for _ in $(seq 1 120); do
-    if stream_identical_pgwire_load_to_psql "$engine_url" "$rows" "$smoke_dir/gpu-db-load.out" "$smoke_dir/gpu-db-load.err"; then
+    if timed_identical_pgwire_load_to_psql "$engine_url" "$rows" "$smoke_dir/gpu-db-load.out" "$smoke_dir/gpu-db-load.err" "$metrics_path" "$identical_pgwire_tier" gpu_db_retained_endpoint gpu_db_retained_endpoint; then
       ready=1
       break
     fi
@@ -1797,7 +1915,22 @@ CSV
       "docker postgres default settings; setup is CREATE TABLE plus COPY FROM STDIN"
   done
 
-  psql "$pgurl" -X -v ON_ERROR_STOP=1 -f "$tuned_ddl_path" >"$smoke_dir/tuned-postgresql.out" 2>"$smoke_dir/tuned-postgresql.err"
+  append_identical_pgwire_load_metric "$metrics_path" "$identical_pgwire_tier" tuned_postgresql tuned_postgresql load_reused "$rows" 0 pass "$smoke_dir/default-postgresql-load.out" "$smoke_dir/default-postgresql-load.err"
+  if ! timed_identical_pgwire_setup_psql_file "$pgurl" "$tuned_ddl_path" "$smoke_dir/tuned-postgresql.out" "$smoke_dir/tuned-postgresql.err" "$metrics_path" "$identical_pgwire_tier" tuned_postgresql tuned_postgresql "$rows"; then
+    kill "$engine_pid" >/dev/null 2>&1 || true
+    wait "$engine_pid" >/dev/null 2>&1 || true
+    pgsql_baseline_docker_down >/dev/null 2>&1 || true
+    trap - RETURN
+    cat >"$report_path" <<REPORT
+# P8 Identical Pgwire Target Smoke
+
+- status: blocked
+- blocker: tuned_postgresql_setup_failed
+- tuned_postgresql_err: $smoke_dir/tuned-postgresql.err
+REPORT
+    cat "$report_path"
+    return 0
+  fi
   for concurrency in ${targets//,/ }; do
     pgwire_target_concurrency_metric "$pgurl" "$metrics_path" "$curve_path" \
       tuned_postgresql tuned_postgresql order_line_count_all "$expected_count" \
@@ -1836,8 +1969,20 @@ CSV
       "owner-thread engine scheduler; SQL-visible CREATE TABLE plus COPY FROM STDIN; selected-row text readback"
   done
 
+  local decision_status="closed_with_blocker"
+  local next_blocker="full_25pct_identical_curves_require_operator_long_run"
+  if [ "$identical_pgwire_tier" = "10pct" ]; then
+    if [ "${GPU_DB_IDENTICAL_LAST_LOAD_MINIMUM_MET:-false}" = true ]; then
+      decision_status="closed"
+      next_blocker="none"
+    else
+      decision_status="blocked"
+      next_blocker="gpu_db_copy_admission_below_30000_rows_per_sec"
+    fi
+  fi
+
   cat >>"$metrics_path" <<JSON
-{"kind":"identical_pgwire_target_decision","tier":"$identical_pgwire_tier","status":"closed_with_blocker","rows":$rows,"targets":["default_postgresql","tuned_postgresql","gpu_db_retained_endpoint"],"profiles":["default_postgresql","tuned_postgresql","gpu_db_retained_endpoint"],"client_driver":"psql/libpq","queries":["order_line_count_all","order_line_lookup_ol_o_id_multi_column","order_line_lookup_composite_text"],"requested_concurrency_targets":"$(json_escape "$targets")","same_query_schedule":true,"same_metric_schema":true,"same_client_boundary":true,"postgresql_setup":"CREATE TABLE plus COPY FROM STDIN; tuned profile adds btree and BRIN index on ol_o_id plus composite btree on ol_o_id,ol_i_id","gpu_db_setup":"CREATE TABLE plus COPY FROM STDIN through retained engine-backed pgwire endpoint","engine_pgwire_max_sessions":$engine_max_sessions,"retained_route_boolean_recorded":true,"composite_text_lookup_retained_route_recorded":true,"device_match_index_compaction":true,"postgresql_settings":"$pg_settings_path","curve_artifact":"$curve_path","metrics_artifact":"$metrics_path","next_blocker":"full_25pct_identical_curves_require_operator_long_run","deferred_blockers":["missing_partitioned_over_resident_execution"]}
+{"kind":"identical_pgwire_target_decision","tier":"$identical_pgwire_tier","status":"$decision_status","rows":$rows,"targets":["default_postgresql","tuned_postgresql","gpu_db_retained_endpoint"],"profiles":["default_postgresql","tuned_postgresql","gpu_db_retained_endpoint"],"client_driver":"psql/libpq","queries":["order_line_count_all","order_line_lookup_ol_o_id_multi_column","order_line_lookup_composite_text"],"requested_concurrency_targets":"$(json_escape "$targets")","same_query_schedule":true,"same_metric_schema":true,"same_client_boundary":true,"postgresql_setup":"CREATE TABLE plus COPY FROM STDIN; tuned profile adds btree and BRIN index on ol_o_id plus composite btree on ol_o_id,ol_i_id","gpu_db_setup":"CREATE TABLE plus COPY FROM STDIN through retained engine-backed pgwire endpoint","engine_pgwire_max_sessions":$engine_max_sessions,"engine_pgwire_port":$engine_port,"postgresql_docker_port":$(pgsql_docker_port),"gpu_copy_minimum_rows_per_sec":30000,"gpu_copy_load_rows_per_sec":${GPU_DB_IDENTICAL_LAST_LOAD_ROWS_PER_SEC:-0},"gpu_copy_minimum_met":${GPU_DB_IDENTICAL_LAST_LOAD_MINIMUM_MET:-false},"retained_route_boolean_recorded":true,"composite_text_lookup_retained_route_recorded":true,"device_match_index_compaction":true,"postgresql_settings":"$pg_settings_path","curve_artifact":"$curve_path","metrics_artifact":"$metrics_path","next_blocker":"$next_blocker","deferred_blockers":["missing_partitioned_over_resident_execution"]}
 JSON
 
   cat >"$report_path" <<REPORT
@@ -1845,24 +1990,30 @@ JSON
 
 - tier: $identical_pgwire_tier
 - rows: $rows
-- status: closed_with_blocker
+- status: $decision_status
 - target_profiles: default_postgresql, tuned_postgresql, gpu_db_retained_endpoint
 - client_driver: \`psql\`/libpq
 - requested_concurrency_targets: \`$targets\`
+- engine_pgwire_port: $engine_port
+- postgresql_docker_port: $(pgsql_docker_port)
 - engine_pgwire_max_sessions: $engine_max_sessions
 - queries: order_line_count_all, order_line_lookup_ol_o_id_multi_column, order_line_lookup_composite_text
-- next_blocker: full_25pct_identical_curves_require_operator_long_run
+- gpu_copy_minimum_rows_per_sec: 30000
+- gpu_copy_load_rows_per_sec: ${GPU_DB_IDENTICAL_LAST_LOAD_ROWS_PER_SEC:-0}
+- gpu_copy_minimum_met: ${GPU_DB_IDENTICAL_LAST_LOAD_MINIMUM_MET:-false}
+- next_blocker: $next_blocker
 - postgresql_settings: $pg_settings_path
 - endpoint_facts: $engine_facts
 - metrics_artifact: $metrics_path
 - curve_artifact: $curve_path
 - load_contract: streamed \`CREATE TABLE\` plus \`COPY FROM STDIN\`; no generated \`load.sql\`
 - full_25pct_guard: \`GPU_DB_CH_BENCH_ALLOW_FULL_IDENTICAL_PGWIRE_25PCT=1\`
+- exact_env: \`GPU_DB_CH_BENCH_OUT_DIR=$OUT_DIR GPU_DB_CH_BENCH_IDENTICAL_PGWIRE_ROWS=$rows GPU_DB_CH_BENCH_IDENTICAL_PGWIRE_CONCURRENCY_TARGETS=$targets GPU_DB_CH_BENCH_ENGINE_PGWIRE_PORT=$engine_port GPU_DB_CH_BENCH_PGSQL_DOCKER_PORT=$(pgsql_docker_port)\`
 
 ## Result
 
-This smoke closes the reusable identical-target primitive for the P8 fairness
-gate. It runs the same scaled \`order_line\` load, the same query texts, the
+This run executes the identical-target primitive for the P8 fairness gate. It
+runs the same \`order_line\` load, the same query texts, the
 same \`psql\`/libpq client boundary, the same concurrency schedule, and the same
 graph-ready metric schema across disposable default PostgreSQL, tuned
 PostgreSQL, and the retained GPU DB engine-backed pgwire endpoint.
@@ -1880,9 +2031,11 @@ For the GPU DB retained endpoint, that row is recorded as
 \`retained_engine_int4_text_composite_equality_projection\` with the retained
 route boolean set.
 
-The curve records p50/p95/p99 latency, throughput, error count, correctness
-status, route classification, retained-route boolean, PostgreSQL profile note,
-and saturation note for concurrency \`$targets\`.
+The metrics artifact records first-class load/setup timing rows for default
+PostgreSQL, tuned PostgreSQL setup, tuned PostgreSQL load reuse, and the GPU DB
+retained endpoint. The curve records p50/p95/p99 latency, throughput, error
+count, correctness status, route classification, retained-route boolean,
+PostgreSQL profile note, and saturation note for concurrency \`$targets\`.
 
 ## Boundary
 
