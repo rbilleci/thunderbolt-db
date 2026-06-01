@@ -20,10 +20,15 @@ struct PendingCopy {
     columns: Vec<gpu_db_protocol::CopyColumn>,
     rows: Vec<Vec<SqlValue>>,
     pending_text: String,
+    chunk_rows: usize,
+    committed_rows: usize,
+    committed_chunks: usize,
+    max_buffered_rows: usize,
 }
 
 impl PendingCopy {
-    fn push_bytes(&mut self, bytes: &[u8]) -> Result<(), Box<dyn Error>> {
+    fn push_bytes(&mut self, bytes: &[u8]) -> Result<Vec<Vec<Vec<SqlValue>>>, Box<dyn Error>> {
+        let mut chunks = Vec::new();
         self.pending_text.push_str(std::str::from_utf8(bytes)?);
         while let Some(newline) = self.pending_text.find('\n') {
             let mut line = self.pending_text[..newline].to_string();
@@ -32,17 +37,20 @@ impl PendingCopy {
             }
             self.pending_text.drain(..=newline);
             self.push_line(&line)?;
+            if let Some(chunk) = self.take_ready_chunk() {
+                chunks.push(chunk);
+            }
         }
-        Ok(())
+        Ok(chunks)
     }
 
-    fn finish_pending_text(&mut self) -> Result<(), Box<dyn Error>> {
+    fn finish_pending_text(&mut self) -> Result<Vec<Vec<Vec<SqlValue>>>, Box<dyn Error>> {
         if self.pending_text.is_empty() {
-            return Ok(());
+            return Ok(self.take_remaining_chunk().into_iter().collect());
         }
         let line = std::mem::take(&mut self.pending_text);
         self.push_line(line.trim_end_matches('\r'))?;
-        Ok(())
+        Ok(self.take_remaining_chunk().into_iter().collect())
     }
 
     fn push_line(&mut self, line: &str) -> Result<(), Box<dyn Error>> {
@@ -56,7 +64,29 @@ impl PendingCopy {
             line,
         )?;
         self.rows.push(row);
+        self.max_buffered_rows = self.max_buffered_rows.max(self.rows.len());
         Ok(())
+    }
+
+    fn take_ready_chunk(&mut self) -> Option<Vec<Vec<SqlValue>>> {
+        if self.rows.len() >= self.chunk_rows {
+            Some(std::mem::take(&mut self.rows))
+        } else {
+            None
+        }
+    }
+
+    fn take_remaining_chunk(&mut self) -> Option<Vec<Vec<SqlValue>>> {
+        if self.rows.is_empty() {
+            None
+        } else {
+            Some(std::mem::take(&mut self.rows))
+        }
+    }
+
+    fn record_committed_chunk(&mut self, copied: usize) {
+        self.committed_rows += copied;
+        self.committed_chunks += 1;
     }
 }
 
@@ -209,27 +239,45 @@ impl EndpointState {
     ) -> Result<PendingCopy, Box<dyn Error>> {
         let copy = parse_copy_from_stdin(sql).ok_or("expected COPY FROM STDIN")?;
         let columns = self.engine.relational_copy_columns(&copy.table)?;
+        let chunk_rows = std::env::var("GPU_DB_P8_ENGINE_PGWIRE_COPY_CHUNK_ROWS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(8192);
         BackendWriter::new(output).copy_in_response(columns.len())?;
         self.fact("copy_parser_in_protocol_lib", true)?;
         self.fact("backend_copy_in_response_written", true)?;
+        self.fact("copy_chunk_rows_limit", chunk_rows)?;
         Ok(PendingCopy {
             copy,
             columns,
             rows: Vec::new(),
             pending_text: String::new(),
+            chunk_rows,
+            committed_rows: 0,
+            committed_chunks: 0,
+            max_buffered_rows: 0,
         })
+    }
+
+    fn commit_copy_chunk(
+        &mut self,
+        copy: &CopyFromStdin,
+        rows: Vec<Vec<SqlValue>>,
+    ) -> Result<usize, Box<dyn Error>> {
+        let txn_id = self.take_txn_id();
+        let copied = self
+            .engine
+            .execute_relational_copy_rows(txn_id, copy, rows)?;
+        self.fact("copy_rows_committed_to_engine_wal_mvcc", true)?;
+        Ok(copied)
     }
 
     fn finish_copy(
         &mut self,
-        mut pending: PendingCopy,
+        pending: PendingCopy,
         output: &mut dyn Write,
     ) -> Result<(), Box<dyn Error>> {
-        pending.finish_pending_text()?;
-        let txn_id = self.take_txn_id();
-        let copied =
-            self.engine
-                .execute_relational_copy_rows(txn_id, &pending.copy, pending.rows)?;
         let warmup =
             self.engine
                 .warm_relational_residency_with_policy(RelationalResidencyWarmupPolicy {
@@ -242,10 +290,10 @@ impl EndpointState {
             .relational_residency_snapshot(&pending.copy.table)
             .ok_or("resident warmup did not install a snapshot")?;
         let mut writer = BackendWriter::new(output);
-        writer.command_complete(&format!("COPY {copied}"))?;
+        writer.command_complete(&format!("COPY {}", pending.committed_rows))?;
         writer.ready_for_query(false)?;
         self.fact("copy_rows_committed_to_engine_wal_mvcc", true)?;
-        self.fact("copy_rows_decoded_by_protocol", copied)?;
+        self.fact("copy_rows_decoded_by_protocol", pending.committed_rows)?;
         self.fact("resident_admission_from_sql_visible_rows", true)?;
         self.fact("sql_visible_resident_warmup_entries", warmup.entries.len())?;
         self.fact("sql_visible_resident_row_count", snapshot.row_count)?;
@@ -253,6 +301,9 @@ impl EndpointState {
             "sql_visible_resident_device_memory_retained",
             snapshot.device_memory_proof.is_some(),
         )?;
+        self.fact("copy_streaming_bounded_chunks", true)?;
+        self.fact("copy_committed_chunks", pending.committed_chunks)?;
+        self.fact("copy_max_buffered_decoded_rows", pending.max_buffered_rows)?;
         Ok(())
     }
 }
@@ -261,6 +312,10 @@ enum EngineCommand {
     Startup(Vec<u8>),
     SimpleQuery(String),
     StartCopy(String),
+    CopyChunk {
+        copy: CopyFromStdin,
+        rows: Vec<Vec<SqlValue>>,
+    },
     FinishCopy(PendingCopy),
 }
 
@@ -269,6 +324,9 @@ enum EngineResponse {
     CopyStarted {
         bytes: Vec<u8>,
         pending: PendingCopy,
+    },
+    CopyChunkCommitted {
+        copied: usize,
     },
 }
 
@@ -299,7 +357,30 @@ fn write_engine_response(stream: &mut TcpStream, response: EngineResponse) -> Re
         EngineResponse::CopyStarted { bytes, .. } => {
             stream.write_all(&bytes).map_err(|err| err.to_string())
         }
+        EngineResponse::CopyChunkCommitted { .. } => Ok(()),
     }
+}
+
+fn commit_pending_copy_chunks(
+    pending: &mut PendingCopy,
+    request_tx: &mpsc::Sender<EngineRequest>,
+    chunks: Vec<Vec<Vec<SqlValue>>>,
+) -> Result<(), String> {
+    for rows in chunks {
+        match request_engine(
+            request_tx,
+            EngineCommand::CopyChunk {
+                copy: pending.copy.clone(),
+                rows,
+            },
+        )? {
+            EngineResponse::CopyChunkCommitted { copied } => {
+                pending.record_committed_chunk(copied);
+            }
+            _ => return Err("engine scheduler returned non-COPY response for COPY chunk".into()),
+        }
+    }
+    Ok(())
 }
 
 fn sql_value_text(value: &SqlValue) -> String {
@@ -392,6 +473,12 @@ fn handle_client_io(
                     EngineResponse::Bytes(_) => {
                         return Err("engine scheduler returned bytes for COPY start".to_string())
                     }
+                    EngineResponse::CopyChunkCommitted { .. } => {
+                        return Err(
+                            "engine scheduler returned COPY chunk response for COPY start"
+                                .to_string(),
+                        )
+                    }
                 }
             }
             FrontendMessage::SimpleQuery(sql) => {
@@ -404,12 +491,17 @@ fn handle_client_io(
                 let pending = pending_copy
                     .as_mut()
                     .ok_or("COPY data arrived without pending COPY stream")?;
-                pending.push_bytes(&bytes).map_err(|err| err.to_string())?;
+                let chunks = pending.push_bytes(&bytes).map_err(|err| err.to_string())?;
+                commit_pending_copy_chunks(pending, &request_tx, chunks)?;
             }
             FrontendMessage::CopyDone => {
-                let pending = pending_copy
+                let mut pending = pending_copy
                     .take()
                     .ok_or("COPY done arrived without pending COPY stream")?;
+                let chunks = pending
+                    .finish_pending_text()
+                    .map_err(|err| err.to_string())?;
+                commit_pending_copy_chunks(&mut pending, &request_tx, chunks)?;
                 write_engine_response(
                     &mut stream,
                     request_engine(&request_tx, EngineCommand::FinishCopy(pending))?,
@@ -461,6 +553,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     state.fact("backend_writer_api_available", true)?;
     state.fact("owner_thread_engine_scheduler", true)?;
     state.fact("client_io_workers_engine_owned_state", false)?;
+    state.fact("max_sessions", max_sessions)?;
     state.fact(
         "crate_direction",
         "gpu_db_engine_depends_on_gpu_db_protocol",
@@ -490,6 +583,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                                 bytes: output,
                                 pending,
                             })
+                        }
+                        EngineCommand::CopyChunk { copy, rows } => {
+                            let copied = state.commit_copy_chunk(&copy, rows)?;
+                            Ok(EngineResponse::CopyChunkCommitted { copied })
                         }
                         EngineCommand::FinishCopy(pending) => {
                             state.finish_copy(pending, &mut output)?;

@@ -68,10 +68,12 @@ engine-backed pgwire endpoint.
 
 The identical pgwire smoke now streams deterministic setup and `COPY` rows into
 each target through `psql`; it does not materialize an
-`identical-pgwire-target-smoke/load.sql` file. Richard approved the full 25%
-long-run window, but the guarded launch is now blocked on a narrower endpoint
-implementation issue: the GPU DB endpoint still buffers decoded COPY rows before
-Engine commit and has a fixed session cap below the full 1..128 curve shape.
+`identical-pgwire-target-smoke/load.sql` file. The GPU DB endpoint now commits
+decoded rows to Engine WAL/MVCC in bounded chunks before retained warmup, and
+the harness sizes the endpoint lifecycle from the requested GPU DB query/client
+schedule instead of a fixed cap. Richard approved the full 25% long-run window,
+but this worker slice stops at readiness proof rather than launching the long
+run.
 
 The latest scaled smoke includes:
 
@@ -101,6 +103,9 @@ match-index output.
   projections.
 - [2026-06-01 identical full-run streaming guard](../reports/2026-06-01-p8-identical-full-run-streaming-guard-v1.md):
   streamed identical pgwire load contract, full 25% guard, and readiness facts.
+- [2026-06-01 engine pgwire COPY/session readiness](../reports/2026-06-01-p8-engine-pgwire-full-copy-session-v1.md):
+  bounded endpoint COPY admission, full-curve session sizing, and scaled
+  default/tuned/GPU retained proof.
 - [2026-06-01 retained composite/text lookup route](../reports/2026-06-01-p8-retained-composite-text-lookup-route-v1.md):
   retained composite lookup progression.
 - [2026-05-31 25% aggregate refresh after BETWEEN](../reports/2026-05-31-p8-25pct-aggregate-refresh-after-between-v1.md):
@@ -110,16 +115,10 @@ match-index output.
 
 ## Remaining Blockers
 
-- `full_25pct_identical_curves_require_operator_long_run`: the full
-  161,061,274-row default PostgreSQL, tuned PostgreSQL, and GPU DB retained
-  curves had required an operator-approved long-run window and artifact budget;
-  that approval is now recorded.
-- `engine_pgwire_full_copy_streaming_required`: before the approved full run can
-  safely launch, the GPU DB retained endpoint needs bounded COPY admission
-  instead of buffering the full decoded payload before Engine commit.
-- `engine_pgwire_max_sessions_below_full_curve`: the endpoint lifecycle must
-  stay alive for the full requested GPU DB query/client schedule through
-  concurrency 128.
+- `full_25pct_identical_curves_require_execution`: the full 161,061,274-row
+  default PostgreSQL, tuned PostgreSQL, and GPU DB retained curves are approved
+  and have a safe continuation command, but this readiness slice did not run
+  them.
 - `missing_partitioned_over_resident_execution`: the 125% tier requires a
   partitioned or streamed over-resident execution design because the current
   retained layout expects one resident CUDA layout larger than local RTX 3090

@@ -1681,6 +1681,8 @@ write_identical_pgwire_target_smoke() {
   local engine_facts="$smoke_dir/endpoint-facts.txt"
   local pg_settings_path="$smoke_dir/postgresql-settings.tsv"
   local tuned_ddl_path="$smoke_dir/tuned-postgresql.sql"
+  local engine_max_sessions
+  engine_max_sessions="$(identical_pgwire_required_engine_sessions "$targets")"
   : >"$metrics_path"
 
   if [ "$rows" -ge "$(rows_25pct)" ] && [ "${GPU_DB_CH_BENCH_ALLOW_FULL_IDENTICAL_PGWIRE_25PCT:-0}" != 1 ]; then
@@ -1717,7 +1719,7 @@ SQL
   cargo build -q -p gpu_db_engine --example p8_engine_pgwire_benchmark_endpoint
   GPU_DB_P8_ENGINE_PGWIRE_LISTEN="$engine_listen" \
     GPU_DB_P8_ENGINE_PGWIRE_FACTS="$engine_facts" \
-    GPU_DB_P8_ENGINE_PGWIRE_MAX_SESSIONS=64 \
+    GPU_DB_P8_ENGINE_PGWIRE_MAX_SESSIONS="$engine_max_sessions" \
     target/debug/examples/p8_engine_pgwire_benchmark_endpoint >"$engine_log" 2>&1 &
   local engine_pid=$!
   trap 'kill "$engine_pid" >/dev/null 2>&1 || true; wait "$engine_pid" >/dev/null 2>&1 || true; pgsql_baseline_docker_down >/dev/null 2>&1 || true' RETURN
@@ -1822,7 +1824,7 @@ CSV
   done
 
   cat >>"$metrics_path" <<JSON
-{"kind":"identical_pgwire_target_decision","tier":"25pct","status":"closed_with_blocker","rows":$rows,"targets":["default_postgresql","tuned_postgresql","gpu_db_retained_endpoint"],"profiles":["default_postgresql","tuned_postgresql","gpu_db_retained_endpoint"],"client_driver":"psql/libpq","queries":["order_line_count_all","order_line_lookup_ol_o_id_multi_column","order_line_lookup_composite_text"],"requested_concurrency_targets":"$(json_escape "$targets")","same_query_schedule":true,"same_metric_schema":true,"same_client_boundary":true,"postgresql_setup":"CREATE TABLE plus COPY FROM STDIN; tuned profile adds btree and BRIN index on ol_o_id plus composite btree on ol_o_id,ol_i_id","gpu_db_setup":"CREATE TABLE plus COPY FROM STDIN through retained engine-backed pgwire endpoint","retained_route_boolean_recorded":true,"composite_text_lookup_retained_route_recorded":true,"device_match_index_compaction":true,"postgresql_settings":"$pg_settings_path","curve_artifact":"$curve_path","metrics_artifact":"$metrics_path","next_blocker":"full_25pct_identical_curves_require_operator_long_run","deferred_blockers":["missing_partitioned_over_resident_execution"]}
+{"kind":"identical_pgwire_target_decision","tier":"25pct","status":"closed_with_blocker","rows":$rows,"targets":["default_postgresql","tuned_postgresql","gpu_db_retained_endpoint"],"profiles":["default_postgresql","tuned_postgresql","gpu_db_retained_endpoint"],"client_driver":"psql/libpq","queries":["order_line_count_all","order_line_lookup_ol_o_id_multi_column","order_line_lookup_composite_text"],"requested_concurrency_targets":"$(json_escape "$targets")","same_query_schedule":true,"same_metric_schema":true,"same_client_boundary":true,"postgresql_setup":"CREATE TABLE plus COPY FROM STDIN; tuned profile adds btree and BRIN index on ol_o_id plus composite btree on ol_o_id,ol_i_id","gpu_db_setup":"CREATE TABLE plus COPY FROM STDIN through retained engine-backed pgwire endpoint","engine_pgwire_max_sessions":$engine_max_sessions,"retained_route_boolean_recorded":true,"composite_text_lookup_retained_route_recorded":true,"device_match_index_compaction":true,"postgresql_settings":"$pg_settings_path","curve_artifact":"$curve_path","metrics_artifact":"$metrics_path","next_blocker":"full_25pct_identical_curves_require_operator_long_run","deferred_blockers":["missing_partitioned_over_resident_execution"]}
 JSON
 
   cat >"$report_path" <<REPORT
@@ -1833,6 +1835,7 @@ JSON
 - target_profiles: default_postgresql, tuned_postgresql, gpu_db_retained_endpoint
 - client_driver: \`psql\`/libpq
 - requested_concurrency_targets: \`$targets\`
+- engine_pgwire_max_sessions: $engine_max_sessions
 - queries: order_line_count_all, order_line_lookup_ol_o_id_multi_column, order_line_lookup_composite_text
 - next_blocker: full_25pct_identical_curves_require_operator_long_run
 - postgresql_settings: $pg_settings_path
@@ -2087,6 +2090,18 @@ stream_identical_pgwire_load_to_psql() {
   local out_path="$3"
   local err_path="$4"
   write_identical_pgwire_load_stream "$rows" | psql "$url" -X >"$out_path" 2>"$err_path"
+}
+
+identical_pgwire_required_engine_sessions() {
+  local targets="$1"
+  local query_families=3
+  local load_sessions=1
+  local sum=0
+  local target
+  for target in ${targets//,/ }; do
+    sum=$((sum + target))
+  done
+  echo $((load_sessions + (query_families * sum)))
 }
 
 write_identical_pgwire_full_readiness() {
