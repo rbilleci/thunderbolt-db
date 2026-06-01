@@ -10,7 +10,7 @@ CONCURRENCY="${GPU_DB_CH_BENCH_CONCURRENCY:-1,10}"
 
 usage() {
   cat <<'USAGE'
-usage: scripts/run_p8_ch_benchmark_residency_probe.sh [--dry-run|--run-baseline|--run-25pct|--run-25pct-execute|--run-125pct|--pgsql-fairness-audit|--gpu-db-protocol-benchmark-smoke|--engine-backed-pgwire-benchmark-smoke|--engine-backed-pgwire-concurrency-smoke|--protocol-retained-route-bridge-report|--engine-backed-protocol-boundary-probe|--pgsql-baseline-preflight|--pgsql-baseline-25pct-latency|--pgsql-baseline-125pct-latency|--pgsql-baseline-docker-up|--pgsql-baseline-docker-preflight|--pgsql-baseline-docker-down|--streaming-self-check|--chunked-install-self-check|--chunked-upload-self-check|--cleanup|--self-check]
+usage: scripts/run_p8_ch_benchmark_residency_probe.sh [--dry-run|--run-baseline|--run-25pct|--run-25pct-execute|--run-125pct|--pgsql-fairness-audit|--gpu-db-protocol-benchmark-smoke|--engine-backed-pgwire-benchmark-smoke|--engine-backed-pgwire-concurrency-smoke|--identical-pgwire-target-smoke|--protocol-retained-route-bridge-report|--engine-backed-protocol-boundary-probe|--pgsql-baseline-preflight|--pgsql-baseline-25pct-latency|--pgsql-baseline-125pct-latency|--pgsql-baseline-docker-up|--pgsql-baseline-docker-preflight|--pgsql-baseline-docker-down|--streaming-self-check|--chunked-install-self-check|--chunked-upload-self-check|--cleanup|--self-check]
 
 Environment:
   GPU_DB_CH_BENCH_OUT_DIR       output directory, default target/p8-ch-benchmark-residency
@@ -32,6 +32,8 @@ Environment:
   GPU_DB_CH_BENCH_ENGINE_PGWIRE_ROWS scaled engine-backed pgwire smoke rows, default 64
   GPU_DB_CH_BENCH_ENGINE_PGWIRE_PORT engine-backed pgwire smoke listen port, default 55437
   GPU_DB_CH_BENCH_ENGINE_PGWIRE_CONCURRENCY_TARGETS engine-backed concurrency targets, default 1,2
+  GPU_DB_CH_BENCH_IDENTICAL_PGWIRE_ROWS scaled identical pgwire target smoke rows, default 32
+  GPU_DB_CH_BENCH_IDENTICAL_PGWIRE_CONCURRENCY_TARGETS identical target concurrency targets, default 1,2
   GPU_DB_CH_BENCH_PROTOCOL_BRIDGE_ROWS scaled bridge blocker rows, default 64
   GPU_DB_CH_BENCH_ENGINE_PROTOCOL_BOUNDARY_ROWS scaled boundary rows, default 64
   GPU_DB_CH_BENCH_ALLOW_FULL_PGSQL_25PCT  set to 1 to load/query all estimated 25pct PostgreSQL rows
@@ -1205,6 +1207,98 @@ engine_pgwire_concurrency_metric() {
     "$p99_us" >>"$curve_path"
 }
 
+pgwire_target_concurrency_metric() {
+  local url="$1"
+  local metrics_path="$2"
+  local curve_path="$3"
+  local target="$4"
+  local profile="$5"
+  local query_id="$6"
+  local expected="$7"
+  local sql="$8"
+  local tmp_prefix="$9"
+  local route_classification="${10}"
+  local retained_route="${11}"
+  local concurrency="${12}"
+  local profile_note="${13}"
+  local run_dir="${tmp_prefix}-${target}-${profile}-${query_id}-c${concurrency}"
+  mkdir -p "$run_dir"
+
+  local wall_start_ns wall_end_ns wall_us throughput p50_us p95_us p99_us error_count correctness
+  local -a pids=()
+  local client
+  wall_start_ns=$(date +%s%N)
+  for client in $(seq 1 "$concurrency"); do
+    (
+      local out_path="$run_dir/client-${client}.out"
+      local err_path="$run_dir/client-${client}.err"
+      local result_path="$run_dir/client-${client}.result"
+      local start_ns end_ns latency_us actual status
+      start_ns=$(date +%s%N)
+      if psql "$url" -X -v ON_ERROR_STOP=1 -Atc "$sql" >"$out_path" 2>"$err_path"; then
+        status="pass"
+      else
+        status="error"
+      fi
+      end_ns=$(date +%s%N)
+      latency_us=$(((end_ns - start_ns) / 1000))
+      actual="$(tr '\n' '|' <"$out_path" | sed 's/|$//')"
+      if [ "$status" = "pass" ] && [ "$actual" != "$expected" ]; then
+        status="wrong_result"
+      fi
+      printf '%s,%s,%s\n' "$latency_us" "$status" "$(json_escape "$actual")" >"$result_path"
+    ) &
+    pids+=("$!")
+  done
+  for pid in "${pids[@]}"; do
+    wait "$pid"
+  done
+  wall_end_ns=$(date +%s%N)
+  wall_us=$(((wall_end_ns - wall_start_ns) / 1000))
+
+  awk -F, '{ print $1 }' "$run_dir"/client-*.result | sort -n >"$run_dir/latencies.sorted"
+  p50_us=$(awk -v q=0.50 'BEGIN { n=0 } { a[++n]=$1 } END { if (n == 0) { print 0; exit } i=int(q*n + 0.999999); if (i < 1) i=1; if (i > n) i=n; print a[i] }' "$run_dir/latencies.sorted")
+  p95_us=$(awk -v q=0.95 'BEGIN { n=0 } { a[++n]=$1 } END { if (n == 0) { print 0; exit } i=int(q*n + 0.999999); if (i < 1) i=1; if (i > n) i=n; print a[i] }' "$run_dir/latencies.sorted")
+  p99_us=$(awk -v q=0.99 'BEGIN { n=0 } { a[++n]=$1 } END { if (n == 0) { print 0; exit } i=int(q*n + 0.999999); if (i < 1) i=1; if (i > n) i=n; print a[i] }' "$run_dir/latencies.sorted")
+  error_count=$(awk -F, '$2 != "pass" { count++ } END { print count + 0 }' "$run_dir"/client-*.result)
+  if [ "$error_count" -eq 0 ]; then
+    correctness="pass"
+  else
+    correctness="error"
+  fi
+  throughput=$(awk -v c="$concurrency" -v us="$wall_us" 'BEGIN { if (us > 0) printf "%.6f", c * 1000000 / us; else printf "0.000000" }')
+
+  printf '{"kind":"identical_pgwire_target_metric","tier":"25pct","target":"%s","profile":"%s","client_driver":"psql/libpq","query":"%s","concurrency":%s,"p50_us":%s,"p95_us":%s,"p99_us":%s,"throughput_qps":%.6f,"wall_us":%s,"error_count":%s,"correctness_status":"%s","route_classification":"%s","retained_gpu_route":%s,"postgresql_profile_note":"%s","saturation_note":"scaled_smoke"}\n' \
+    "$target" \
+    "$profile" \
+    "$query_id" \
+    "$concurrency" \
+    "$p50_us" \
+    "$p95_us" \
+    "$p99_us" \
+    "$throughput" \
+    "$wall_us" \
+    "$error_count" \
+    "$correctness" \
+    "$route_classification" \
+    "$retained_route" \
+    "$(json_escape "$profile_note")" >>"$metrics_path"
+  printf '25pct,%s,%s,psql/libpq,%s,%s,%s,none,%s,%s,%s,%s,%s,%s,"%s qps; %s"\n' \
+    "$target" \
+    "$profile" \
+    "$query_id" \
+    "$concurrency" \
+    "$correctness" \
+    "$route_classification" \
+    "$retained_route" \
+    "$p50_us" \
+    "$p95_us" \
+    "$p99_us" \
+    "$error_count" \
+    "$throughput" \
+    "$profile_note" >>"$curve_path"
+}
+
 write_engine_backed_pgwire_benchmark_smoke() {
   mkdir -p "$OUT_DIR/engine-backed-pgwire-benchmark-smoke"
   local smoke_dir="$OUT_DIR/engine-backed-pgwire-benchmark-smoke"
@@ -1554,6 +1648,210 @@ REPORT
   cat "$report_path"
   echo "p8_ch_benchmark_engine_backed_pgwire_concurrency=closed_with_blocker scheduler=owner_thread_engine_command_queue next_blocker=postgresql_baseline_target_required_for_identical_curves artifact=$report_path"
   return 0
+}
+
+write_identical_pgwire_target_smoke() {
+  mkdir -p "$OUT_DIR/identical-pgwire-target-smoke"
+  local smoke_dir="$OUT_DIR/identical-pgwire-target-smoke"
+  local rows="${GPU_DB_CH_BENCH_IDENTICAL_PGWIRE_ROWS:-32}"
+  local targets="${GPU_DB_CH_BENCH_IDENTICAL_PGWIRE_CONCURRENCY_TARGETS:-1,2}"
+  local engine_port="${GPU_DB_CH_BENCH_ENGINE_PGWIRE_PORT:-55437}"
+  local engine_listen="127.0.0.1:$engine_port"
+  local engine_url="postgresql://postgres@127.0.0.1:$engine_port/postgres?sslmode=disable"
+  local pgurl
+  local report_path="$smoke_dir/identical-pgwire-target-smoke.md"
+  local metrics_path="$smoke_dir/metrics.jsonl"
+  local curve_path="$smoke_dir/concurrency-curve.csv"
+  local load_path="$smoke_dir/load.sql"
+  local engine_log="$smoke_dir/engine-pgwire-endpoint.log"
+  local engine_facts="$smoke_dir/endpoint-facts.txt"
+  local pg_settings_path="$smoke_dir/postgresql-settings.tsv"
+  local tuned_ddl_path="$smoke_dir/tuned-postgresql.sql"
+  : >"$metrics_path"
+
+  if ! command -v psql >/dev/null 2>&1; then
+    cat >"$report_path" <<REPORT
+# P8 Identical Pgwire Target Smoke
+
+- status: blocked
+- blocker: missing_psql_client
+
+The identical pgwire target smoke requires the PostgreSQL \`psql\` client.
+REPORT
+    cat "$report_path"
+    return 0
+  fi
+
+  {
+    cat <<SQL
+\set ON_ERROR_STOP on
+CREATE TABLE order_line (
+  ol_o_id INT,
+  ol_i_id INT,
+  ol_quantity INT,
+  ol_amount INT,
+  ol_dist_info TEXT
+);
+COPY order_line (ol_o_id, ol_i_id, ol_quantity, ol_amount, ol_dist_info) FROM STDIN WITH (FORMAT csv);
+SQL
+    write_pgsql_copy_stream "$rows"
+    cat <<SQL
+\.
+SQL
+  } >"$load_path"
+
+  cat >"$tuned_ddl_path" <<SQL
+CREATE INDEX IF NOT EXISTS order_line_ol_o_id_btree ON order_line (ol_o_id);
+CREATE INDEX IF NOT EXISTS order_line_ol_o_id_brin ON order_line USING brin (ol_o_id);
+ANALYZE order_line;
+SQL
+
+  pgsql_baseline_docker_up
+  pgurl="$(pgsql_docker_url)"
+  psql "$pgurl" -X -f "$load_path" >"$smoke_dir/default-postgresql-load.out" 2>"$smoke_dir/default-postgresql-load.err"
+  psql "$pgurl" -X -v ON_ERROR_STOP=1 -c "ANALYZE order_line" >"$smoke_dir/default-postgresql-analyze.out" 2>"$smoke_dir/default-postgresql-analyze.err"
+  psql "$pgurl" -X -v ON_ERROR_STOP=1 -Atc "SELECT name || E'\t' || setting FROM pg_settings WHERE name IN ('shared_buffers','work_mem','maintenance_work_mem','effective_cache_size','max_parallel_workers_per_gather','jit','max_parallel_workers','max_worker_processes') ORDER BY name" >"$pg_settings_path"
+
+  cargo build -q -p gpu_db_engine --example p8_engine_pgwire_benchmark_endpoint
+  GPU_DB_P8_ENGINE_PGWIRE_LISTEN="$engine_listen" \
+    GPU_DB_P8_ENGINE_PGWIRE_FACTS="$engine_facts" \
+    GPU_DB_P8_ENGINE_PGWIRE_MAX_SESSIONS=64 \
+    target/debug/examples/p8_engine_pgwire_benchmark_endpoint >"$engine_log" 2>&1 &
+  local engine_pid=$!
+  trap 'kill "$engine_pid" >/dev/null 2>&1 || true; wait "$engine_pid" >/dev/null 2>&1 || true; pgsql_baseline_docker_down >/dev/null 2>&1 || true' RETURN
+
+  local ready=0
+  for _ in $(seq 1 120); do
+    if psql "$engine_url" -X -f "$load_path" >"$smoke_dir/gpu-db-load.out" 2>"$smoke_dir/gpu-db-load.err"; then
+      ready=1
+      break
+    fi
+    if ! kill -0 "$engine_pid" 2>/dev/null; then
+      break
+    fi
+    sleep 0.25
+  done
+  if [ "$ready" -ne 1 ]; then
+    kill "$engine_pid" >/dev/null 2>&1 || true
+    wait "$engine_pid" >/dev/null 2>&1 || true
+    pgsql_baseline_docker_down >/dev/null 2>&1 || true
+    trap - RETURN
+    cat >"$report_path" <<REPORT
+# P8 Identical Pgwire Target Smoke
+
+- status: blocked
+- blocker: gpu_db_endpoint_target_lifecycle_required
+- engine_log: $engine_log
+- gpu_db_load_err: $smoke_dir/gpu-db-load.err
+REPORT
+    cat "$report_path"
+    return 0
+  fi
+
+  cat >"$curve_path" <<CSV
+tier,target,profile,client_driver,query,concurrency,status,blocker,route_classification,retained_gpu_route,p50_us,p95_us,p99_us,error_count,throughput_qps,saturation_note
+CSV
+
+  local expected_count lookup_key lookup_item lookup_qty lookup_amount concurrency tmp_prefix
+  expected_count="$rows"
+  lookup_key=$(((rows + 1) / 2))
+  lookup_item=$(((lookup_key % 100000) + 1))
+  lookup_qty=$(((lookup_key % 50) + 1))
+  lookup_amount=$(((lookup_key * 17) % 100000))
+  tmp_prefix="$smoke_dir/query"
+
+  for concurrency in ${targets//,/ }; do
+    pgwire_target_concurrency_metric "$pgurl" "$metrics_path" "$curve_path" \
+      default_postgresql default_postgresql order_line_count_all "$expected_count" \
+      "SELECT COUNT(*) FROM order_line" "$tmp_prefix" postgresql_heap_scan false "$concurrency" \
+      "docker postgres default settings; setup is CREATE TABLE plus COPY FROM STDIN"
+    pgwire_target_concurrency_metric "$pgurl" "$metrics_path" "$curve_path" \
+      default_postgresql default_postgresql order_line_lookup_ol_o_id_multi_column \
+      "${lookup_key}|${lookup_item}|${lookup_qty}|${lookup_amount}" \
+      "SELECT ol_o_id, ol_i_id, ol_quantity, ol_amount FROM order_line WHERE ol_o_id = $lookup_key" \
+      "$tmp_prefix" postgresql_heap_or_index_lookup false "$concurrency" \
+      "docker postgres default settings; setup is CREATE TABLE plus COPY FROM STDIN"
+  done
+
+  psql "$pgurl" -X -v ON_ERROR_STOP=1 -f "$tuned_ddl_path" >"$smoke_dir/tuned-postgresql.out" 2>"$smoke_dir/tuned-postgresql.err"
+  for concurrency in ${targets//,/ }; do
+    pgwire_target_concurrency_metric "$pgurl" "$metrics_path" "$curve_path" \
+      tuned_postgresql tuned_postgresql order_line_count_all "$expected_count" \
+      "SELECT COUNT(*) FROM order_line" "$tmp_prefix" postgresql_tuned_heap_scan false "$concurrency" \
+      "btree and BRIN index on ol_o_id; same load/query schedule"
+    pgwire_target_concurrency_metric "$pgurl" "$metrics_path" "$curve_path" \
+      tuned_postgresql tuned_postgresql order_line_lookup_ol_o_id_multi_column \
+      "${lookup_key}|${lookup_item}|${lookup_qty}|${lookup_amount}" \
+      "SELECT ol_o_id, ol_i_id, ol_quantity, ol_amount FROM order_line WHERE ol_o_id = $lookup_key" \
+      "$tmp_prefix" postgresql_tuned_index_lookup false "$concurrency" \
+      "btree and BRIN index on ol_o_id; same load/query schedule"
+  done
+
+  for concurrency in ${targets//,/ }; do
+    pgwire_target_concurrency_metric "$engine_url" "$metrics_path" "$curve_path" \
+      gpu_db_retained_endpoint gpu_db_retained_endpoint order_line_count_all "$expected_count" \
+      "SELECT COUNT(*) FROM order_line" "$tmp_prefix" retained_engine_count_all true "$concurrency" \
+      "owner-thread engine scheduler; SQL-visible CREATE TABLE plus COPY FROM STDIN"
+    pgwire_target_concurrency_metric "$engine_url" "$metrics_path" "$curve_path" \
+      gpu_db_retained_endpoint gpu_db_retained_endpoint order_line_lookup_ol_o_id_multi_column \
+      "${lookup_key}|${lookup_item}|${lookup_qty}|${lookup_amount}" \
+      "SELECT ol_o_id, ol_i_id, ol_quantity, ol_amount FROM order_line WHERE ol_o_id = $lookup_key" \
+      "$tmp_prefix" retained_engine_int4_equality_multi_column_projection true "$concurrency" \
+      "owner-thread engine scheduler; SQL-visible CREATE TABLE plus COPY FROM STDIN"
+  done
+
+  cat >>"$metrics_path" <<JSON
+{"kind":"identical_pgwire_target_decision","tier":"25pct","status":"closed_with_blocker","rows":$rows,"targets":["default_postgresql","tuned_postgresql","gpu_db_retained_endpoint"],"profiles":["default_postgresql","tuned_postgresql","gpu_db_retained_endpoint"],"client_driver":"psql/libpq","queries":["order_line_count_all","order_line_lookup_ol_o_id_multi_column"],"requested_concurrency_targets":"$(json_escape "$targets")","same_query_schedule":true,"same_metric_schema":true,"same_client_boundary":true,"postgresql_setup":"CREATE TABLE plus COPY FROM STDIN; tuned profile adds btree and BRIN index on ol_o_id","gpu_db_setup":"CREATE TABLE plus COPY FROM STDIN through retained engine-backed pgwire endpoint","retained_route_boolean_recorded":true,"postgresql_settings":"$pg_settings_path","curve_artifact":"$curve_path","metrics_artifact":"$metrics_path","next_blocker":"full_25pct_identical_curves_require_operator_long_run","deferred_blockers":["retained_composite_or_text_lookup_required","missing_partitioned_over_resident_execution"]}
+JSON
+
+  cat >"$report_path" <<REPORT
+# P8 Identical Pgwire Target Smoke
+
+- rows: $rows
+- status: closed_with_blocker
+- target_profiles: default_postgresql, tuned_postgresql, gpu_db_retained_endpoint
+- client_driver: \`psql\`/libpq
+- requested_concurrency_targets: \`$targets\`
+- queries: order_line_count_all, order_line_lookup_ol_o_id_multi_column
+- next_blocker: full_25pct_identical_curves_require_operator_long_run
+- postgresql_settings: $pg_settings_path
+- endpoint_facts: $engine_facts
+- metrics_artifact: $metrics_path
+- curve_artifact: $curve_path
+
+## Result
+
+This smoke closes the reusable identical-target primitive for the P8 fairness
+gate. It runs the same scaled \`order_line\` load, the same query texts, the
+same \`psql\`/libpq client boundary, the same concurrency schedule, and the same
+graph-ready metric schema across disposable default PostgreSQL, tuned
+PostgreSQL, and the retained GPU DB engine-backed pgwire endpoint.
+
+The tuned PostgreSQL profile differs only in setup DDL: it adds btree and BRIN
+indexes on \`ol_o_id\` before rerunning the same query schedule. The GPU DB
+profile differs only in target URL and endpoint lifecycle; rows still enter via
+SQL-visible \`CREATE TABLE\` plus \`COPY FROM STDIN\`, commit through Engine
+WAL/MVCC state, and warm into \`RelationalResidentCache\`.
+
+The curve records p50/p95/p99 latency, throughput, error count, correctness
+status, route classification, retained-route boolean, PostgreSQL profile note,
+and saturation note for concurrency \`$targets\`.
+
+## Boundary
+
+This is a scaled smoke, not the full 161,061,274-row 25% curve. Full default
+PostgreSQL, tuned PostgreSQL, and GPU DB retained curves now have a shared
+driver/target primitive, but still require an operator-approved long-run window.
+Composite/text lookup remains \`retained_composite_or_text_lookup_required\`,
+and 125% remains blocked by \`missing_partitioned_over_resident_execution\`.
+REPORT
+
+  kill "$engine_pid" >/dev/null 2>&1 || true
+  wait "$engine_pid" >/dev/null 2>&1 || true
+  pgsql_baseline_docker_down >/dev/null 2>&1 || true
+  trap - RETURN
+  cat "$report_path"
+  echo "p8_ch_benchmark_identical_pgwire_target_smoke=closed_with_blocker next_blocker=full_25pct_identical_curves_require_operator_long_run artifact=$report_path"
 }
 
 write_protocol_retained_route_bridge_report() {
@@ -2095,6 +2393,9 @@ case "$mode" in
     ;;
   --engine-backed-pgwire-concurrency-smoke)
     write_engine_backed_pgwire_concurrency_smoke
+    ;;
+  --identical-pgwire-target-smoke)
+    write_identical_pgwire_target_smoke
     ;;
   --protocol-retained-route-bridge-report)
     write_protocol_retained_route_bridge_report
