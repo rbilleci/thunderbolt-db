@@ -6277,6 +6277,22 @@ pub struct RelationalSelectResult {
     pub access_path: RelationalAccessPath,
 }
 
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RelationalCopyAdmissionProfile {
+    pub rows: usize,
+    pub render_sql_wal_payload_micros: u128,
+    pub commit_total_micros: u128,
+    pub wal_commit_flush_boundary_micros: u128,
+    pub current_apply_total_micros: u128,
+    pub row_prepare_micros: u128,
+    pub unique_preflight_micros: u128,
+    pub check_preflight_micros: u128,
+    pub foreign_key_preflight_micros: u128,
+    pub mvcc_insert_micros: u128,
+    pub value_index_append_micros: u128,
+    pub residency_invalidation_micros: u128,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelationalResidencySnapshot {
     pub gpu_id: u16,
@@ -8587,7 +8603,7 @@ impl Engine {
         payload: Vec<u8>,
         timestamp_micros: u64,
         mut apply_current: F,
-    ) -> Result<CommitToken, EngineError>
+    ) -> Result<(CommitToken, u128), EngineError>
     where
         F: FnMut(&mut Self) -> Result<(), EngineError>,
     {
@@ -8635,11 +8651,13 @@ impl Engine {
             self.repl.mark_applied(e.index);
         }
 
+        let residency_invalidation_started = Instant::now();
         self.invalidate_relational_residency(txn_id, token.index);
+        let residency_invalidation_micros = residency_invalidation_started.elapsed().as_micros();
         self.visible_up_to = self.visible_up_to.max(token.index);
         self.metrics.inc_commit();
 
-        Ok(token)
+        Ok((token, residency_invalidation_micros))
     }
 
     fn invalidate_relational_residency(&mut self, txn_id: TxnId, index: Index) {
@@ -12467,6 +12485,15 @@ impl Engine {
     }
 
     fn apply_insert(&mut self, insert: Insert, txn_id: TxnId) -> Result<(), EngineError> {
+        self.apply_insert_with_profile(insert, txn_id, None)
+    }
+
+    fn apply_insert_with_profile(
+        &mut self,
+        insert: Insert,
+        txn_id: TxnId,
+        mut profile: Option<&mut RelationalCopyAdmissionProfile>,
+    ) -> Result<(), EngineError> {
         let table = self
             .relational_catalog
             .get(&insert.table)
@@ -12490,6 +12517,7 @@ impl Engine {
             }
             indexes
         };
+        let row_prepare_started = Instant::now();
         let mut new_rows = Vec::with_capacity(insert.rows.len());
         for row in insert.rows {
             if row.len() != column_indexes.len() {
@@ -12525,8 +12553,12 @@ impl Engine {
             let values = values.into_iter().map(Option::unwrap).collect::<Vec<_>>();
             new_rows.push(values);
         }
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.row_prepare_micros += row_prepare_started.elapsed().as_micros();
+        }
 
         if table.indexes.iter().any(|index| index.unique) {
+            let unique_preflight_started = Instant::now();
             let mut candidate_rows = self.visible_relational_rows(
                 &table,
                 StorageVisibility {
@@ -12535,8 +12567,12 @@ impl Engine {
             )?;
             candidate_rows.extend(new_rows.clone());
             Self::validate_unique_indexes_for_rows(&table, &candidate_rows)?;
+            if let Some(profile) = profile.as_deref_mut() {
+                profile.unique_preflight_micros += unique_preflight_started.elapsed().as_micros();
+            }
         }
         if !table.check_constraints.is_empty() {
+            let check_preflight_started = Instant::now();
             let mut candidate_rows = self.visible_relational_rows(
                 &table,
                 StorageVisibility {
@@ -12545,8 +12581,12 @@ impl Engine {
             )?;
             candidate_rows.extend(new_rows.clone());
             Self::validate_check_constraints_for_rows(&table, &candidate_rows)?;
+            if let Some(profile) = profile.as_deref_mut() {
+                profile.check_preflight_micros += check_preflight_started.elapsed().as_micros();
+            }
         }
         if !table.foreign_keys.is_empty() {
+            let foreign_key_preflight_started = Instant::now();
             let mut candidate_rows = self.visible_relational_rows(
                 &table,
                 StorageVisibility {
@@ -12561,8 +12601,13 @@ impl Engine {
                     read_txn_id: txn_id,
                 },
             )?;
+            if let Some(profile) = profile.as_deref_mut() {
+                profile.foreign_key_preflight_micros +=
+                    foreign_key_preflight_started.elapsed().as_micros();
+            }
         }
 
+        let mvcc_insert_started = Instant::now();
         let mut inserted_rows = Vec::with_capacity(new_rows.len());
         for values in new_rows {
             let row_id = self.relational_next_row_id;
@@ -12579,6 +12624,10 @@ impl Engine {
                 .map_err(|err| EngineError::ApplyFailed(err.to_string()))?;
             inserted_rows.push((row_key, values));
         }
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.mvcc_insert_micros += mvcc_insert_started.elapsed().as_micros();
+        }
+        let value_index_started = Instant::now();
         for (key, mut row_keys) in
             relational_value_index_entries_for_rows(&insert.table, &table.columns, &inserted_rows)
         {
@@ -12586,6 +12635,9 @@ impl Engine {
                 .entry(key)
                 .or_default()
                 .append(&mut row_keys);
+        }
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.value_index_append_micros += value_index_started.elapsed().as_micros();
         }
         Ok(())
     }
@@ -13743,6 +13795,18 @@ impl Engine {
                         ));
                     }
                     new_rows.push(values.into_iter().map(Option::unwrap).collect());
+                }
+                if !table.indexes.iter().any(|index| index.unique)
+                    && table.check_constraints.is_empty()
+                    && table.foreign_keys.is_empty()
+                    && !self.relational_catalog.values().any(|candidate| {
+                        candidate
+                            .foreign_keys
+                            .iter()
+                            .any(|foreign_key| foreign_key.referenced_table == table.name)
+                    })
+                {
+                    return Ok(());
                 }
                 let mut candidate_rows = self.visible_relational_rows(
                     table,
@@ -18063,8 +18127,18 @@ impl Engine {
         copy: &CopyFromStdin,
         rows: Vec<Vec<SqlValue>>,
     ) -> Result<usize, ExecuteError> {
+        self.execute_relational_copy_rows_profiled(txn_id, copy, rows)
+            .map(|(rows, _profile)| rows)
+    }
+
+    pub fn execute_relational_copy_rows_profiled(
+        &mut self,
+        txn_id: u64,
+        copy: &CopyFromStdin,
+        rows: Vec<Vec<SqlValue>>,
+    ) -> Result<(usize, RelationalCopyAdmissionProfile), ExecuteError> {
         if rows.is_empty() {
-            return Ok(0);
+            return Ok((0, RelationalCopyAdmissionProfile::default()));
         }
         let table = self.relational_catalog.get(&copy.table).ok_or_else(|| {
             ExecuteError::Engine(EngineError::ApplyFailed(format!(
@@ -18085,18 +18159,52 @@ impl Engine {
             columns,
             rows,
         };
+        let mut profile = RelationalCopyAdmissionProfile {
+            rows: row_count,
+            ..RelationalCopyAdmissionProfile::default()
+        };
+        let unique_preflight_started = Instant::now();
         self.preflight_unique_index_constraints(&Command::Insert(insert.clone()), txn_id)
             .map_err(ExecuteError::Engine)?;
+        profile.unique_preflight_micros += unique_preflight_started.elapsed().as_micros();
+        let render_started = Instant::now();
         let sql = render_relational_insert(&insert).map_err(ExecuteError::Engine)?;
+        profile.render_sql_wal_payload_micros = render_started.elapsed().as_micros();
         let timestamp_micros = self.next_commit_timestamp_micros();
-        self.commit_mutation_at_with_current_apply(
-            txn_id,
-            sql.into_bytes(),
-            timestamp_micros,
-            |engine| engine.apply_insert(insert.clone(), txn_id),
-        )
-        .map_err(ExecuteError::Engine)?;
-        Ok(row_count)
+        let mut apply_profile = RelationalCopyAdmissionProfile::default();
+        let mut current_apply_total_micros = 0;
+        let commit_started = Instant::now();
+        let (_token, residency_invalidation_micros) = self
+            .commit_mutation_at_with_current_apply(
+                txn_id,
+                sql.into_bytes(),
+                timestamp_micros,
+                |engine| {
+                    let apply_started = Instant::now();
+                    let result = engine.apply_insert_with_profile(
+                        insert.clone(),
+                        txn_id,
+                        Some(&mut apply_profile),
+                    );
+                    current_apply_total_micros += apply_started.elapsed().as_micros();
+                    result
+                },
+            )
+            .map_err(ExecuteError::Engine)?;
+        profile.commit_total_micros = commit_started.elapsed().as_micros();
+        profile.current_apply_total_micros = current_apply_total_micros;
+        profile.row_prepare_micros = apply_profile.row_prepare_micros;
+        profile.unique_preflight_micros += apply_profile.unique_preflight_micros;
+        profile.check_preflight_micros = apply_profile.check_preflight_micros;
+        profile.foreign_key_preflight_micros = apply_profile.foreign_key_preflight_micros;
+        profile.mvcc_insert_micros = apply_profile.mvcc_insert_micros;
+        profile.value_index_append_micros = apply_profile.value_index_append_micros;
+        profile.residency_invalidation_micros = residency_invalidation_micros;
+        profile.wal_commit_flush_boundary_micros = profile
+            .commit_total_micros
+            .saturating_sub(profile.current_apply_total_micros)
+            .saturating_sub(profile.residency_invalidation_micros);
+        Ok((row_count, profile))
     }
 
     pub fn relational_table_acl(
@@ -38491,7 +38599,12 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        assert_eq!(e.execute_relational_copy_rows(2, &copy, rows).unwrap(), 2);
+        let (copied, profile) = e
+            .execute_relational_copy_rows_profiled(2, &copy, rows)
+            .unwrap();
+        assert_eq!(copied, 2);
+        assert_eq!(profile.rows, 2);
+        assert!(profile.commit_total_micros >= profile.current_apply_total_micros);
 
         let default_copy =
             gpu_db_protocol::parse_copy_from_stdin("COPY people (id) FROM STDIN").unwrap();

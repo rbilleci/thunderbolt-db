@@ -83,15 +83,16 @@ Current accepted smoke evidence:
   chunks and sizes its lifecycle from the requested GPU DB curve. Richard
   approved the guarded full 25% run, then pivoted the next attempt to 10% of
   GPU memory. The first approved 25% attempt proved default PostgreSQL can load
-  all 161,061,274 rows, but the GPU DB endpoint remains blocked on defended
-  SQL-visible COPY admission throughput; reserved row-key MVCC insertion and
-  grouped value-index appends are improved, but current bounded evidence still
-  puts the 64,424,510-row 10% load outside the 6h worker budget.
+  all 161,061,274 rows. Reserved row-key MVCC insertion, grouped value-index
+  appends, and the COPY admission phase-profile fix now make the bounded GPU DB
+  endpoint 1,048,576-row probe project the 64,424,510-row 10% COPY load inside
+  the 6h worker budget, but the full 10% default/tuned/GPU retained curves have
+  not been run yet.
 
 Current blockers and non-claims:
 
 - `missing_partitioned_over_resident_execution`
-- `engine_sql_visible_copy_admission_storage_wal_profile_required`
+- full 10% default/tuned PostgreSQL/GPU DB retained curves have not been run
 - no completed 10% or full 25% default/tuned PostgreSQL/GPU DB retained curve
 - no completed 125% over-resident PostgreSQL-vs-GPU retained tier
 - no full CH-benCHmark, BenchBase, join, transaction-mix, external load
@@ -109,6 +110,8 @@ The latest narrowed bulk-admission report is
 [docs/testing/reports/2026-06-01-p8-engine-sql-visible-bulk-copy-admission-v1.md](docs/testing/reports/2026-06-01-p8-engine-sql-visible-bulk-copy-admission-v1.md).
 The latest value-index admission report is
 [docs/testing/reports/2026-06-01-p8-engine-sql-visible-value-index-bulk-admission-v1.md](docs/testing/reports/2026-06-01-p8-engine-sql-visible-value-index-bulk-admission-v1.md).
+The latest COPY phase-profile report is
+[docs/testing/reports/2026-06-01-p8-engine-sql-visible-copy-admission-phase-profile-v1.md](docs/testing/reports/2026-06-01-p8-engine-sql-visible-copy-admission-phase-profile-v1.md).
 
 ## Security And Operations
 

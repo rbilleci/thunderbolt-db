@@ -270,9 +270,9 @@ impl EndpointState {
     ) -> Result<usize, Box<dyn Error>> {
         let txn_id = self.take_txn_id();
         let started = Instant::now();
-        let copied = self
+        let (copied, profile) = self
             .engine
-            .execute_relational_copy_rows(txn_id, copy, rows)?;
+            .execute_relational_copy_rows_profiled(txn_id, copy, rows)?;
         let elapsed_ms = started.elapsed().as_millis();
         let rows_per_sec = if elapsed_ms == 0 {
             copied as u128
@@ -283,6 +283,51 @@ impl EndpointState {
         self.fact("copy_chunk_rows", copied)?;
         self.fact("copy_chunk_elapsed_ms", elapsed_ms)?;
         self.fact("copy_chunk_rows_per_sec", rows_per_sec)?;
+        self.fact("copy_profile_rows", profile.rows)?;
+        self.fact(
+            "copy_profile_render_sql_wal_payload_micros",
+            profile.render_sql_wal_payload_micros,
+        )?;
+        self.fact(
+            "copy_profile_commit_total_micros",
+            profile.commit_total_micros,
+        )?;
+        self.fact(
+            "copy_profile_wal_commit_flush_boundary_micros",
+            profile.wal_commit_flush_boundary_micros,
+        )?;
+        self.fact(
+            "copy_profile_current_apply_total_micros",
+            profile.current_apply_total_micros,
+        )?;
+        self.fact(
+            "copy_profile_row_prepare_micros",
+            profile.row_prepare_micros,
+        )?;
+        self.fact(
+            "copy_profile_unique_preflight_micros",
+            profile.unique_preflight_micros,
+        )?;
+        self.fact(
+            "copy_profile_check_preflight_micros",
+            profile.check_preflight_micros,
+        )?;
+        self.fact(
+            "copy_profile_foreign_key_preflight_micros",
+            profile.foreign_key_preflight_micros,
+        )?;
+        self.fact(
+            "copy_profile_mvcc_insert_micros",
+            profile.mvcc_insert_micros,
+        )?;
+        self.fact(
+            "copy_profile_value_index_append_micros",
+            profile.value_index_append_micros,
+        )?;
+        self.fact(
+            "copy_profile_residency_invalidation_micros",
+            profile.residency_invalidation_micros,
+        )?;
         Ok(copied)
     }
 

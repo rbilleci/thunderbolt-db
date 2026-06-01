@@ -73,11 +73,14 @@ decoded rows to Engine WAL/MVCC in bounded chunks before retained warmup, and
 the harness sizes the endpoint lifecycle from the requested GPU DB query/client
 schedule instead of a fixed cap. Richard approved a full 25% long-run window,
 then pivoted the next benchmark attempt to 10% of GPU memory. The first
-approved 25% attempt proved default PostgreSQL can accept the full
-161,061,274-row streamed load. The GPU DB endpoint remains blocked on defended
-SQL-visible COPY admission throughput; the latest bounded endpoint probes
-improved generated row-key MVCC insertion and grouped value-index appends, but
-still project the 64,424,510-row 10% load outside the approved 6h budget.
+  approved 25% attempt proved default PostgreSQL can accept the full
+161,061,274-row streamed load. The latest bounded endpoint probes improved
+generated row-key MVCC insertion, grouped value-index appends, and COPY
+admission phase profiling. The measured decaying phase was an unnecessary
+all-visible-row constraint preflight scan for unconstrained COPY chunks; after
+that guard, the 1,048,576-row bounded GPU DB probe projects the 64,424,510-row
+10% COPY load inside the approved 6h budget. The full 10% default/tuned/GPU
+retained curves have not been run yet.
 
 The latest scaled smoke includes:
 
@@ -122,6 +125,10 @@ match-index output.
 - [2026-06-01 engine SQL-visible value-index bulk admission](../reports/2026-06-01-p8-engine-sql-visible-value-index-bulk-admission-v1.md):
   grouped value-index appends, bounded 1M endpoint evidence, and the narrowed
   storage/WAL/MVCC phase-profile blocker.
+- [2026-06-01 engine SQL-visible COPY admission phase profile](../reports/2026-06-01-p8-engine-sql-visible-copy-admission-phase-profile-v1.md):
+  phase-specific COPY admission evidence, the unconstrained-table preflight
+  scan fix, and bounded 1M endpoint evidence projecting 10% COPY admission
+  inside the 6h budget.
 - [2026-06-01 retained composite/text lookup route](../reports/2026-06-01-p8-retained-composite-text-lookup-route-v1.md):
   retained composite lookup progression.
 - [2026-05-31 25% aggregate refresh after BETWEEN](../reports/2026-05-31-p8-25pct-aggregate-refresh-after-between-v1.md):
@@ -131,11 +138,10 @@ match-index output.
 
 ## Remaining Blockers
 
-- `engine_sql_visible_copy_admission_storage_wal_profile_required`: default PostgreSQL
-  loaded the approved full 25% row count, but the GPU DB retained endpoint still
-  needs a defended SQL-visible COPY admission storage/WAL/MVCC slice before the
-  10% single-load default/tuned/GPU curves can fit the approved 6h worker
-  budget.
+- full 10% default/tuned PostgreSQL/GPU DB retained curves have not been run:
+  default PostgreSQL loaded the approved full 25% row count, and the latest
+  bounded GPU DB endpoint probe now projects 10% COPY admission inside the 6h
+  worker budget, but the single-load 10% curves still need execution evidence.
 - `missing_partitioned_over_resident_execution`: the 125% tier requires a
   partitioned or streamed over-resident execution design because the current
   retained layout expects one resident CUDA layout larger than local RTX 3090
