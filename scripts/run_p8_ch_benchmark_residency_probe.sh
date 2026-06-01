@@ -10,7 +10,7 @@ CONCURRENCY="${GPU_DB_CH_BENCH_CONCURRENCY:-1,10}"
 
 usage() {
   cat <<'USAGE'
-usage: scripts/run_p8_ch_benchmark_residency_probe.sh [--dry-run|--run-baseline|--run-25pct|--run-25pct-execute|--run-125pct|--pgsql-fairness-audit|--gpu-db-protocol-benchmark-smoke|--engine-backed-pgwire-benchmark-smoke|--protocol-retained-route-bridge-report|--engine-backed-protocol-boundary-probe|--pgsql-baseline-preflight|--pgsql-baseline-25pct-latency|--pgsql-baseline-125pct-latency|--pgsql-baseline-docker-up|--pgsql-baseline-docker-preflight|--pgsql-baseline-docker-down|--streaming-self-check|--chunked-install-self-check|--chunked-upload-self-check|--cleanup|--self-check]
+usage: scripts/run_p8_ch_benchmark_residency_probe.sh [--dry-run|--run-baseline|--run-25pct|--run-25pct-execute|--run-125pct|--pgsql-fairness-audit|--gpu-db-protocol-benchmark-smoke|--engine-backed-pgwire-benchmark-smoke|--engine-backed-pgwire-concurrency-smoke|--protocol-retained-route-bridge-report|--engine-backed-protocol-boundary-probe|--pgsql-baseline-preflight|--pgsql-baseline-25pct-latency|--pgsql-baseline-125pct-latency|--pgsql-baseline-docker-up|--pgsql-baseline-docker-preflight|--pgsql-baseline-docker-down|--streaming-self-check|--chunked-install-self-check|--chunked-upload-self-check|--cleanup|--self-check]
 
 Environment:
   GPU_DB_CH_BENCH_OUT_DIR       output directory, default target/p8-ch-benchmark-residency
@@ -31,6 +31,7 @@ Environment:
   GPU_DB_CH_BENCH_GPU_DB_PROTOCOL_PORT GPU DB protocol smoke listen port, default 55435
   GPU_DB_CH_BENCH_ENGINE_PGWIRE_ROWS scaled engine-backed pgwire smoke rows, default 64
   GPU_DB_CH_BENCH_ENGINE_PGWIRE_PORT engine-backed pgwire smoke listen port, default 55437
+  GPU_DB_CH_BENCH_ENGINE_PGWIRE_CONCURRENCY_TARGETS engine-backed concurrency targets, default 1,2
   GPU_DB_CH_BENCH_PROTOCOL_BRIDGE_ROWS scaled bridge blocker rows, default 64
   GPU_DB_CH_BENCH_ENGINE_PROTOCOL_BOUNDARY_ROWS scaled boundary rows, default 64
   GPU_DB_CH_BENCH_ALLOW_FULL_PGSQL_25PCT  set to 1 to load/query all estimated 25pct PostgreSQL rows
@@ -1311,6 +1312,79 @@ REPORT
   echo "p8_ch_benchmark_engine_backed_pgwire_smoke=closed_with_blocker retained_lookup_shape=int4_equality_multi_column_projection lookup_blocker=$lookup_blocker artifact=$report_path"
 }
 
+write_engine_backed_pgwire_concurrency_smoke() {
+  mkdir -p "$OUT_DIR/engine-backed-pgwire-concurrency-smoke"
+  local smoke_dir="$OUT_DIR/engine-backed-pgwire-concurrency-smoke"
+  local rows="${GPU_DB_CH_BENCH_ENGINE_PGWIRE_ROWS:-64}"
+  local port="${GPU_DB_CH_BENCH_ENGINE_PGWIRE_PORT:-55437}"
+  local targets="${GPU_DB_CH_BENCH_ENGINE_PGWIRE_CONCURRENCY_TARGETS:-1,2}"
+  local listen="127.0.0.1:$port"
+  local url="postgresql://postgres@127.0.0.1:$port/postgres?sslmode=disable"
+  local report_path="$smoke_dir/engine-backed-pgwire-concurrency-smoke.md"
+  local metrics_path="$smoke_dir/metrics.jsonl"
+  local curve_path="$smoke_dir/concurrency-curve.csv"
+  local load_path="$smoke_dir/load.sql"
+  local server_log="$smoke_dir/engine-pgwire-endpoint.log"
+  local facts_path="$smoke_dir/endpoint-facts.txt"
+  : >"$metrics_path"
+
+  cat >"$curve_path" <<CSV
+tier,target,profile,client_driver,query,concurrency,status,blocker,route_classification,retained_gpu_route,saturation_note
+25pct,engine_backed_pgwire_endpoint,gpu_db_retained_endpoint,psql/libpq,order_line_count_all,1,available_existing_smoke,none,retained_engine_count_all,true,"single-client retained endpoint smoke is covered by --engine-backed-pgwire-benchmark-smoke"
+25pct,engine_backed_pgwire_endpoint,gpu_db_retained_endpoint,psql/libpq,order_line_lookup_ol_o_id_multi_column,1,available_existing_smoke,none,retained_engine_int4_equality_multi_column_projection,true,"single-client retained endpoint smoke is covered by --engine-backed-pgwire-benchmark-smoke"
+25pct,engine_backed_pgwire_endpoint,gpu_db_retained_endpoint,psql/libpq,order_line_count_all,2,blocked,engine_pgwire_endpoint_concurrency_unsafe,retained_engine_count_all,true,"EndpointState owns Engine/RelationalResidentCache with CUDA resident memory; moving it into threaded Arc<Mutex<_>> is rejected because CudaResidentDeviceMemory contains a non-Send CUDA pointer"
+25pct,engine_backed_pgwire_endpoint,gpu_db_retained_endpoint,psql/libpq,order_line_lookup_ol_o_id_multi_column,2,blocked,engine_pgwire_endpoint_concurrency_unsafe,retained_engine_int4_equality_multi_column_projection,true,"EndpointState owns Engine/RelationalResidentCache with CUDA resident memory; moving it into threaded Arc<Mutex<_>> is rejected because CudaResidentDeviceMemory contains a non-Send CUDA pointer"
+CSV
+  cat >"$metrics_path" <<JSON
+{"kind":"engine_backed_pgwire_concurrency_decision","tier":"25pct","status":"blocked","target":"engine_backed_pgwire_endpoint","profile":"gpu_db_retained_endpoint","client_driver":"psql/libpq","queries":["order_line_count_all","order_line_lookup_ol_o_id_multi_column"],"requested_concurrency_targets":"$(json_escape "$targets")","available_single_client_smoke":"--engine-backed-pgwire-benchmark-smoke","blocker":"engine_pgwire_endpoint_concurrency_unsafe","smallest_next_unblocker":"engine_pgwire_session_scheduler_required","code_evidence":"threaded Arc<Mutex<EndpointState>> compile failed because Engine contains RelationalResidentCache and CudaResidentDeviceMemory with non-Send *mut c_void","curve_artifact":"$curve_path","retained_composite_or_text_lookup_required":true}
+JSON
+  cat >"$report_path" <<REPORT
+# P8 Engine-Backed Pgwire Concurrency Smoke
+
+- rows: $rows
+- status: blocked
+- target: engine-backed PostgreSQL-compatible TCP benchmark endpoint
+- profile: gpu_db_retained_endpoint
+- client_driver: \`psql\`/libpq
+- requested_concurrency_targets: \`$targets\`
+- blocker: engine_pgwire_endpoint_concurrency_unsafe
+- smallest_next_unblocker: engine_pgwire_session_scheduler_required
+- metrics_artifact: $metrics_path
+- curve_artifact: $curve_path
+
+## Result
+
+This slice narrowed the identical-client concurrency runner blocker to the
+engine-backed endpoint session model. The existing endpoint can be driven by
+real \`psql\`/libpq for retained \`COUNT(*)\` and retained multi-column int4
+lookup at the single-client smoke boundary, but it handles accepted sessions
+serially while holding \`Engine\` in \`EndpointState\`.
+
+A direct threaded endpoint attempt is not safe: moving
+\`Arc<Mutex<EndpointState>>\` into client handler threads fails to compile
+because \`Engine\` contains \`RelationalResidentCache\`, which owns
+\`CudaResidentDeviceMemory\`, which contains a non-\`Send\` CUDA pointer
+(\`*mut c_void\`). Forcing that with an unsafe marker would be the wrong
+benchmark boundary for retained CUDA memory ownership.
+
+## Next Unblock Trigger
+
+Add a bounded engine pgwire session scheduler that keeps \`Engine\` and retained
+CUDA memory on their owning thread, while concurrent client sessions send
+parsed simple-query/COPY work to that owner and receive backend responses. That
+would preserve CUDA ownership and still allow the same \`psql\`/libpq
+concurrency runner contract to collect real overlapping client pressure.
+
+Until then, full default PostgreSQL, tuned PostgreSQL, and GPU DB retained
+curves remain blocked by \`engine_pgwire_endpoint_concurrency_unsafe\`. The
+composite/text lookup gap remains \`retained_composite_or_text_lookup_required\`,
+and 125% remains blocked by \`missing_partitioned_over_resident_execution\`.
+REPORT
+  cat "$report_path"
+  echo "p8_ch_benchmark_engine_backed_pgwire_concurrency=blocked blocker=engine_pgwire_endpoint_concurrency_unsafe next_unblocker=engine_pgwire_session_scheduler_required artifact=$report_path"
+  return 0
+}
+
 write_protocol_retained_route_bridge_report() {
   mkdir -p "$OUT_DIR/protocol-retained-route-bridge"
   local bridge_dir="$OUT_DIR/protocol-retained-route-bridge"
@@ -1848,6 +1922,9 @@ case "$mode" in
   --engine-backed-pgwire-benchmark-smoke)
     write_engine_backed_pgwire_benchmark_smoke
     ;;
+  --engine-backed-pgwire-concurrency-smoke)
+    write_engine_backed_pgwire_concurrency_smoke
+    ;;
   --protocol-retained-route-bridge-report)
     write_protocol_retained_route_bridge_report
     ;;
@@ -1966,6 +2043,12 @@ case "$mode" in
     grep -q 'retained_composite_or_text_lookup_required' "$tmp_dir/out/engine-backed-pgwire-benchmark-smoke/engine-backed-pgwire-benchmark-smoke.md"
     grep -q '"query":"order_line_lookup_ol_o_id_retained_projection"' "$tmp_dir/out/engine-backed-pgwire-benchmark-smoke/metrics.jsonl"
     grep -q '"query":"order_line_lookup_ol_o_id_multi_column"' "$tmp_dir/out/engine-backed-pgwire-benchmark-smoke/metrics.jsonl"
+    GPU_DB_CH_BENCH_OUT_DIR="$tmp_dir/out" GPU_DB_CH_BENCH_ENGINE_PGWIRE_ROWS=16 GPU_DB_CH_BENCH_ENGINE_PGWIRE_PORT=55439 GPU_DB_CH_BENCH_ENGINE_PGWIRE_CONCURRENCY_TARGETS=1,2 \
+      "$0" --engine-backed-pgwire-concurrency-smoke >"$tmp_dir/engine-pgwire-concurrency.out"
+    grep -q 'postgresql_baseline_target_required_for_identical_curves' "$tmp_dir/out/engine-backed-pgwire-concurrency-smoke/engine-backed-pgwire-concurrency-smoke.md"
+    grep -q '"kind":"engine_backed_pgwire_concurrency_metric"' "$tmp_dir/out/engine-backed-pgwire-concurrency-smoke/metrics.jsonl"
+    grep -q '"concurrency":2' "$tmp_dir/out/engine-backed-pgwire-concurrency-smoke/metrics.jsonl"
+    grep -q 'order_line_lookup_ol_o_id_multi_column' "$tmp_dir/out/engine-backed-pgwire-concurrency-smoke/concurrency-curve.csv"
     GPU_DB_CH_BENCH_OUT_DIR="$tmp_dir/out" "$0" --cleanup >"$tmp_dir/cleanup.out"
     grep -q 'chunked_resident_cache_install_available: true' "$tmp_dir/streaming.out"
     grep -q 'benchmark_chunked_resident_cache_admission: pass' "$tmp_dir/chunked-install.out"
