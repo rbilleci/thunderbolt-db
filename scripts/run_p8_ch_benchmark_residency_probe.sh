@@ -1123,6 +1123,88 @@ engine_pgwire_query_metrics() {
     "$(json_escape "$actual")" >>"$metrics_path"
 }
 
+engine_pgwire_concurrency_metric() {
+  local url="$1"
+  local metrics_path="$2"
+  local curve_path="$3"
+  local query_id="$4"
+  local expected="$5"
+  local sql="$6"
+  local tmp_prefix="$7"
+  local route_classification="$8"
+  local retained_route="$9"
+  local concurrency="${10}"
+  local run_dir="${tmp_prefix}-${query_id}-c${concurrency}"
+  mkdir -p "$run_dir"
+
+  local wall_start_ns wall_end_ns wall_us throughput p50_us p95_us p99_us error_count correctness
+  local -a pids=()
+  local client
+  wall_start_ns=$(date +%s%N)
+  for client in $(seq 1 "$concurrency"); do
+    (
+      local out_path="$run_dir/client-${client}.out"
+      local err_path="$run_dir/client-${client}.err"
+      local result_path="$run_dir/client-${client}.result"
+      local start_ns end_ns latency_us actual status
+      start_ns=$(date +%s%N)
+      if psql "$url" -X -v ON_ERROR_STOP=1 -Atc "$sql" >"$out_path" 2>"$err_path"; then
+        status="pass"
+      else
+        status="error"
+      fi
+      end_ns=$(date +%s%N)
+      latency_us=$(((end_ns - start_ns) / 1000))
+      actual="$(tr '\n' '|' <"$out_path" | sed 's/|$//')"
+      if [ "$status" = "pass" ] && [ "$actual" != "$expected" ]; then
+        status="wrong_result"
+      fi
+      printf '%s,%s,%s\n' "$latency_us" "$status" "$(json_escape "$actual")" >"$result_path"
+    ) &
+    pids+=("$!")
+  done
+  for pid in "${pids[@]}"; do
+    wait "$pid"
+  done
+  wall_end_ns=$(date +%s%N)
+  wall_us=$(((wall_end_ns - wall_start_ns) / 1000))
+
+  awk -F, '{ print $1 }' "$run_dir"/client-*.result | sort -n >"$run_dir/latencies.sorted"
+  p50_us=$(awk -v q=0.50 'BEGIN { n=0 } { a[++n]=$1 } END { if (n == 0) { print 0; exit } i=int(q*n + 0.999999); if (i < 1) i=1; if (i > n) i=n; print a[i] }' "$run_dir/latencies.sorted")
+  p95_us=$(awk -v q=0.95 'BEGIN { n=0 } { a[++n]=$1 } END { if (n == 0) { print 0; exit } i=int(q*n + 0.999999); if (i < 1) i=1; if (i > n) i=n; print a[i] }' "$run_dir/latencies.sorted")
+  p99_us=$(awk -v q=0.99 'BEGIN { n=0 } { a[++n]=$1 } END { if (n == 0) { print 0; exit } i=int(q*n + 0.999999); if (i < 1) i=1; if (i > n) i=n; print a[i] }' "$run_dir/latencies.sorted")
+  error_count=$(awk -F, '$2 != "pass" { count++ } END { print count + 0 }' "$run_dir"/client-*.result)
+  if [ "$error_count" -eq 0 ]; then
+    correctness="pass"
+  else
+    correctness="error"
+  fi
+  throughput=$(awk -v c="$concurrency" -v us="$wall_us" 'BEGIN { if (us > 0) printf "%.6f", c * 1000000 / us; else printf "0.000000" }')
+
+  printf '{"kind":"engine_backed_pgwire_concurrency_metric","target":"engine_backed_pgwire_endpoint","profile":"gpu_db_retained_endpoint","client_driver":"psql/libpq","query":"%s","concurrency":%s,"p50_us":%s,"p95_us":%s,"p99_us":%s,"throughput_qps":%.6f,"wall_us":%s,"error_count":%s,"correctness_status":"%s","route_classification":"%s","retained_gpu_route":%s,"protocol_catalog_path":false,"blocker":"none"}\n' \
+    "$query_id" \
+    "$concurrency" \
+    "$p50_us" \
+    "$p95_us" \
+    "$p99_us" \
+    "$throughput" \
+    "$wall_us" \
+    "$error_count" \
+    "$correctness" \
+    "$route_classification" \
+    "$retained_route" >>"$metrics_path"
+  printf '25pct,engine_backed_pgwire_endpoint,gpu_db_retained_endpoint,psql/libpq,%s,%s,%s,none,%s,%s,"%s qps; p50=%sus p95=%sus p99=%sus; owner_thread_engine_scheduler"\n' \
+    "$query_id" \
+    "$concurrency" \
+    "$correctness" \
+    "$route_classification" \
+    "$retained_route" \
+    "$throughput" \
+    "$p50_us" \
+    "$p95_us" \
+    "$p99_us" >>"$curve_path"
+}
+
 write_engine_backed_pgwire_benchmark_smoke() {
   mkdir -p "$OUT_DIR/engine-backed-pgwire-benchmark-smoke"
   local smoke_dir="$OUT_DIR/engine-backed-pgwire-benchmark-smoke"
@@ -1326,62 +1408,151 @@ write_engine_backed_pgwire_concurrency_smoke() {
   local load_path="$smoke_dir/load.sql"
   local server_log="$smoke_dir/engine-pgwire-endpoint.log"
   local facts_path="$smoke_dir/endpoint-facts.txt"
+  local max_sessions=64
   : >"$metrics_path"
+
+  if ! command -v psql >/dev/null 2>&1; then
+    cat >"$report_path" <<REPORT
+# P8 Engine-Backed Pgwire Concurrency Smoke
+
+- status: blocked
+- blocker: missing_psql_client
+
+The engine-backed pgwire concurrency smoke requires the PostgreSQL \`psql\`
+client.
+REPORT
+    cat "$report_path"
+    return 0
+  fi
+
+  cargo build -q -p gpu_db_engine --example p8_engine_pgwire_benchmark_endpoint
+  GPU_DB_P8_ENGINE_PGWIRE_LISTEN="$listen" \
+    GPU_DB_P8_ENGINE_PGWIRE_FACTS="$facts_path" \
+    GPU_DB_P8_ENGINE_PGWIRE_MAX_SESSIONS="$max_sessions" \
+    target/debug/examples/p8_engine_pgwire_benchmark_endpoint >"$server_log" 2>&1 &
+  local server_pid=$!
+  trap 'kill "$server_pid" >/dev/null 2>&1 || true; wait "$server_pid" >/dev/null 2>&1 || true' RETURN
+
+  {
+    cat <<SQL
+\set ON_ERROR_STOP on
+CREATE TABLE order_line (
+  ol_o_id INT,
+  ol_i_id INT,
+  ol_quantity INT,
+  ol_amount INT,
+  ol_dist_info TEXT
+);
+COPY order_line (ol_o_id, ol_i_id, ol_quantity, ol_amount, ol_dist_info) FROM STDIN WITH (FORMAT csv);
+SQL
+    write_pgsql_copy_stream "$rows"
+    cat <<SQL
+\.
+SQL
+  } >"$load_path"
+
+  local ready=0
+  for _ in $(seq 1 120); do
+    if psql "$url" -X -f "$load_path" >"$smoke_dir/load.out" 2>"$smoke_dir/load.err"; then
+      ready=1
+      break
+    fi
+    if ! kill -0 "$server_pid" 2>/dev/null; then
+      break
+    fi
+    sleep 0.25
+  done
+  if [ "$ready" -ne 1 ]; then
+    kill "$server_pid" >/dev/null 2>&1 || true
+    wait "$server_pid" >/dev/null 2>&1 || true
+    trap - RETURN
+    cat >"$report_path" <<REPORT
+# P8 Engine-Backed Pgwire Concurrency Smoke
+
+- status: blocked
+- blocker: engine_backed_pgwire_endpoint_startup_or_load_failed
+- command: \`target/debug/examples/p8_engine_pgwire_benchmark_endpoint\`
+- log: $server_log
+- load_err: $smoke_dir/load.err
+REPORT
+    cat "$report_path"
+    return 0
+  fi
+
+  local expected_count lookup_key lookup_item lookup_qty lookup_amount tmp_prefix concurrency
+  expected_count="$rows"
+  lookup_key=$(((rows + 1) / 2))
+  lookup_item=$(((lookup_key % 100000) + 1))
+  lookup_qty=$(((lookup_key % 50) + 1))
+  lookup_amount=$(((lookup_key * 17) % 100000))
+  tmp_prefix="$smoke_dir/concurrent-query"
 
   cat >"$curve_path" <<CSV
 tier,target,profile,client_driver,query,concurrency,status,blocker,route_classification,retained_gpu_route,saturation_note
-25pct,engine_backed_pgwire_endpoint,gpu_db_retained_endpoint,psql/libpq,order_line_count_all,1,available_existing_smoke,none,retained_engine_count_all,true,"single-client retained endpoint smoke is covered by --engine-backed-pgwire-benchmark-smoke"
-25pct,engine_backed_pgwire_endpoint,gpu_db_retained_endpoint,psql/libpq,order_line_lookup_ol_o_id_multi_column,1,available_existing_smoke,none,retained_engine_int4_equality_multi_column_projection,true,"single-client retained endpoint smoke is covered by --engine-backed-pgwire-benchmark-smoke"
-25pct,engine_backed_pgwire_endpoint,gpu_db_retained_endpoint,psql/libpq,order_line_count_all,2,blocked,engine_pgwire_endpoint_concurrency_unsafe,retained_engine_count_all,true,"EndpointState owns Engine/RelationalResidentCache with CUDA resident memory; moving it into threaded Arc<Mutex<_>> is rejected because CudaResidentDeviceMemory contains a non-Send CUDA pointer"
-25pct,engine_backed_pgwire_endpoint,gpu_db_retained_endpoint,psql/libpq,order_line_lookup_ol_o_id_multi_column,2,blocked,engine_pgwire_endpoint_concurrency_unsafe,retained_engine_int4_equality_multi_column_projection,true,"EndpointState owns Engine/RelationalResidentCache with CUDA resident memory; moving it into threaded Arc<Mutex<_>> is rejected because CudaResidentDeviceMemory contains a non-Send CUDA pointer"
 CSV
-  cat >"$metrics_path" <<JSON
-{"kind":"engine_backed_pgwire_concurrency_decision","tier":"25pct","status":"blocked","target":"engine_backed_pgwire_endpoint","profile":"gpu_db_retained_endpoint","client_driver":"psql/libpq","queries":["order_line_count_all","order_line_lookup_ol_o_id_multi_column"],"requested_concurrency_targets":"$(json_escape "$targets")","available_single_client_smoke":"--engine-backed-pgwire-benchmark-smoke","blocker":"engine_pgwire_endpoint_concurrency_unsafe","smallest_next_unblocker":"engine_pgwire_session_scheduler_required","code_evidence":"threaded Arc<Mutex<EndpointState>> compile failed because Engine contains RelationalResidentCache and CudaResidentDeviceMemory with non-Send *mut c_void","curve_artifact":"$curve_path","retained_composite_or_text_lookup_required":true}
+  for concurrency in ${targets//,/ }; do
+    engine_pgwire_concurrency_metric "$url" "$metrics_path" "$curve_path" \
+      order_line_count_all "$expected_count" \
+      "SELECT COUNT(*) FROM order_line" \
+      "$tmp_prefix" retained_engine_count_all true "$concurrency"
+    engine_pgwire_concurrency_metric "$url" "$metrics_path" "$curve_path" \
+      order_line_lookup_ol_o_id_multi_column \
+      "${lookup_key}|${lookup_item}|${lookup_qty}|${lookup_amount}" \
+      "SELECT ol_o_id, ol_i_id, ol_quantity, ol_amount FROM order_line WHERE ol_o_id = $lookup_key" \
+      "$tmp_prefix" retained_engine_int4_equality_multi_column_projection true "$concurrency"
+  done
+  cat >>"$metrics_path" <<JSON
+{"kind":"engine_backed_pgwire_concurrency_decision","tier":"25pct","status":"closed_with_blocker","target":"engine_backed_pgwire_endpoint","profile":"gpu_db_retained_endpoint","client_driver":"psql/libpq","queries":["order_line_count_all","order_line_lookup_ol_o_id_multi_column"],"requested_concurrency_targets":"$(json_escape "$targets")","scheduler":"owner_thread_engine_command_queue","owner_thread_engine_scheduler":true,"client_io_workers_engine_owned_state":false,"load_path":"CREATE TABLE plus COPY FROM STDIN","blocker":"postgresql_baseline_target_required_for_identical_curves","smallest_next_unblocker":"psql_parallel_driver_required_after_scheduler","curve_artifact":"$curve_path","facts":"$facts_path","retained_composite_or_text_lookup_required":true}
 JSON
   cat >"$report_path" <<REPORT
 # P8 Engine-Backed Pgwire Concurrency Smoke
 
 - rows: $rows
-- status: blocked
+- status: closed_with_blocker
 - target: engine-backed PostgreSQL-compatible TCP benchmark endpoint
 - profile: gpu_db_retained_endpoint
 - client_driver: \`psql\`/libpq
 - requested_concurrency_targets: \`$targets\`
-- blocker: engine_pgwire_endpoint_concurrency_unsafe
-- smallest_next_unblocker: engine_pgwire_session_scheduler_required
+- scheduler: owner_thread_engine_command_queue
+- owner_thread_engine_scheduler: true
+- client_io_workers_engine_owned_state: false
+- next_blocker: postgresql_baseline_target_required_for_identical_curves
+- smallest_next_unblocker: psql_parallel_driver_required_after_scheduler
+- endpoint_facts: $facts_path
 - metrics_artifact: $metrics_path
 - curve_artifact: $curve_path
 
 ## Result
 
-This slice narrowed the identical-client concurrency runner blocker to the
-engine-backed endpoint session model. The existing endpoint can be driven by
-real \`psql\`/libpq for retained \`COUNT(*)\` and retained multi-column int4
-lookup at the single-client smoke boundary, but it handles accepted sessions
-serially while holding \`Engine\` in \`EndpointState\`.
+This smoke starts the engine-backed pgwire endpoint with an owner-thread
+command scheduler. Accepted client IO workers own only socket/protocol buffering
+and send startup, simple-query, and COPY-finish commands through a bounded
+channel to the owner thread. \`EndpointState\`, \`Engine\`, and retained CUDA
+memory remain on that owner thread; no \`Send\`/\`Sync\` marker is forced onto
+retained device pointers.
 
-A direct threaded endpoint attempt is not safe: moving
-\`Arc<Mutex<EndpointState>>\` into client handler threads fails to compile
-because \`Engine\` contains \`RelationalResidentCache\`, which owns
-\`CudaResidentDeviceMemory\`, which contains a non-\`Send\` CUDA pointer
-(\`*mut c_void\`). Forcing that with an unsafe marker would be the wrong
-benchmark boundary for retained CUDA memory ownership.
+The scaled run seeds \`order_line\` through SQL-visible \`CREATE TABLE\` plus
+\`COPY FROM STDIN\`, then runs real overlapping \`psql\`/libpq sessions for the
+requested concurrency targets. The graph-ready curve records retained
+\`COUNT(*)\` and retained multi-column int4 lookup rows with p50/p95/p99,
+throughput, error count, correctness status, retained-route classification, and
+owner-thread scheduler evidence.
 
-## Next Unblock Trigger
+## Next Blocker
 
-Add a bounded engine pgwire session scheduler that keeps \`Engine\` and retained
-CUDA memory on their owning thread, while concurrent client sessions send
-parsed simple-query/COPY work to that owner and receive backend responses. That
-would preserve CUDA ownership and still allow the same \`psql\`/libpq
-concurrency runner contract to collect real overlapping client pressure.
-
-Until then, full default PostgreSQL, tuned PostgreSQL, and GPU DB retained
-curves remain blocked by \`engine_pgwire_endpoint_concurrency_unsafe\`. The
-composite/text lookup gap remains \`retained_composite_or_text_lookup_required\`,
-and 125% remains blocked by \`missing_partitioned_over_resident_execution\`.
+The endpoint scheduler boundary is available for the shared identical-client
+benchmark harness. Full default PostgreSQL, tuned PostgreSQL, and GPU DB
+retained curves still need the parallel client driver to target PostgreSQL
+profiles and this retained endpoint with the same query schedule and metric
+schema. Composite/text lookup remains
+\`retained_composite_or_text_lookup_required\`, and 125% remains blocked by
+\`missing_partitioned_over_resident_execution\`.
 REPORT
+  kill "$server_pid" >/dev/null 2>&1 || true
+  wait "$server_pid" >/dev/null 2>&1 || true
+  trap - RETURN
   cat "$report_path"
-  echo "p8_ch_benchmark_engine_backed_pgwire_concurrency=blocked blocker=engine_pgwire_endpoint_concurrency_unsafe next_unblocker=engine_pgwire_session_scheduler_required artifact=$report_path"
+  echo "p8_ch_benchmark_engine_backed_pgwire_concurrency=closed_with_blocker scheduler=owner_thread_engine_command_queue next_blocker=postgresql_baseline_target_required_for_identical_curves artifact=$report_path"
   return 0
 }
 
