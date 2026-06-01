@@ -1429,7 +1429,7 @@ CSV
     printf '25pct,engine_backed_pgwire_endpoint,psql/libpq,order_line_lookup_ol_o_id_multi_column,%s,blocked,true_concurrency_pg_client_runner_required,retained_engine_int4_equality_multi_column_projection,"wall_clock_throughput,p50_us,p95_us,p99_us,error_count,correctness_status,saturation_note"\n' "$concurrency" >>"$concurrency_path"
   done
   cat >>"$metrics_path" <<JSON
-{"kind":"engine_backed_pgwire_endpoint_decision","tier":"25pct","status":"closed","endpoint":"engine_backed_pgwire_endpoint","client_driver":"psql/libpq","seed_path":"CREATE TABLE plus COPY FROM STDIN","count_retained_route":true,"count_zero_h2d":true,"lookup_retained_route":true,"lookup_retained_shape":"int4_equality_projection","multi_column_lookup_retained_route":true,"multi_column_lookup_retained_shape":"int4_equality_multi_column_projection","composite_int4_lookup_retained_route":true,"composite_int4_lookup_retained_shape":"int4_composite_equality_multi_column_projection","composite_text_lookup_retained_route":true,"composite_text_lookup_retained_shape":"int4_equality_mixed_column_projection","lookup_blocker":"none","concurrency_blocker":"none_for_scaled_owner_thread_smoke","facts":"$facts_path"}
+{"kind":"engine_backed_pgwire_endpoint_decision","tier":"25pct","status":"closed","endpoint":"engine_backed_pgwire_endpoint","client_driver":"psql/libpq","seed_path":"CREATE TABLE plus COPY FROM STDIN","count_retained_route":true,"count_zero_h2d":true,"lookup_retained_route":true,"lookup_retained_shape":"int4_equality_projection","multi_column_lookup_retained_route":true,"multi_column_lookup_retained_shape":"int4_equality_multi_column_projection","composite_int4_lookup_retained_route":true,"composite_int4_lookup_retained_shape":"int4_composite_equality_multi_column_projection","composite_text_lookup_retained_route":true,"composite_text_lookup_retained_shape":"int4_equality_mixed_column_projection","selected_row_device_readback":true,"d2h_narrowing":"selected_matching_rows_only","remaining_blocker":"retained_match_index_compaction_required_for_fully_device_side_filtering","lookup_blocker":"none","concurrency_blocker":"none_for_scaled_owner_thread_smoke","facts":"$facts_path"}
 JSON
 
   cat >"$report_path" <<REPORT
@@ -1482,12 +1482,17 @@ materializing \`ol_dist_info\` from the resident text offset/byte layout.
 
 ## Remaining Boundary
 
-The endpoint boundary is now available for a future identical-client harness
-for retained \`COUNT(*)\`, same-column int4 equality-projection, bounded
-multi-column int4 lookup, composite int4 lookup, and composite text lookup
-evidence. Full 25% identical default/tuned PostgreSQL/GPU curves still require
-an operator-approved long-run window and artifact budget, and final broad
-row-id gather optimization remains outside this slice.
+The endpoint now uses selected matching row IDs for retained equality
+projections, then reads back only selected-row int4 values and selected-row text
+offset/byte spans from retained device memory. That narrows the composite/text
+lookup D2H surface to result-sized transfer for this equality lookup family
+instead of full projected/filter columns plus full text layout readback.
+
+The remaining optimization blocker is
+\`retained_match_index_compaction_required_for_fully_device_side_filtering\`:
+matching row IDs are still discovered from the host-owned resident snapshot in
+this bounded proof. Full 25% identical default/tuned PostgreSQL/GPU curves still
+require an operator-approved long-run window and artifact budget.
 REPORT
 
   kill "$server_pid" >/dev/null 2>&1 || true

@@ -16680,17 +16680,28 @@ impl Engine {
                     table.name
                 )))
             })?;
-        let row_count = u64::try_from(snapshot.row_count).map_err(|_| {
-            ExecuteError::Engine(EngineError::ApplyFailed(
-                "resident snapshot row count exceeds retained device-memory proof range"
-                    .to_string(),
-            ))
-        })?;
+        let matching_row_indices = snapshot
+            .resident_rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| {
+                filters.iter().all(|(filter_idx, needle)| {
+                    row.get(*filter_idx) == Some(&SqlValue::Int4(*needle))
+                })
+            })
+            .map(|(row_idx, _)| {
+                u64::try_from(row_idx).map_err(|_| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(
+                        "resident snapshot row index exceeds retained device-memory proof range"
+                            .to_string(),
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, ExecuteError>>()?;
         let mut projected_columns = bound
             .selected_indexes
             .iter()
             .copied()
-            .chain(filters.iter().map(|(filter_idx, _needle)| *filter_idx))
             .collect::<BTreeSet<_>>();
         let started = Instant::now();
         let mut column_values = BTreeMap::new();
@@ -16700,15 +16711,15 @@ impl Engine {
                 SqlType::Int4 => {
                     let byte_offset = resident_device_int4_column_offset(&snapshot, &table, idx)?;
                     let values = device_memory
-                        .project_i32_from_payload(byte_offset, row_count)
+                        .project_i32_rows_from_payload(byte_offset, &matching_row_indices)
                         .map_err(|err| {
                             ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
                         })?;
-                    if values.len() != snapshot.row_count {
+                    if values.len() != matching_row_indices.len() {
                         return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                            "resident device-memory equality multi-column projection column returned {} rows, expected {}",
+                            "resident device-memory equality multi-column selected-row projection column returned {} rows, expected {}",
                             values.len(),
-                            snapshot.row_count
+                            matching_row_indices.len()
                         ))));
                     }
                     column_values.insert(idx, values);
@@ -16716,45 +16727,38 @@ impl Engine {
                 SqlType::Text => {
                     let layout = resident_device_text_column_layout(&snapshot, &table, idx)?;
                     let values = device_memory
-                        .project_text_from_payload(
+                        .project_text_rows_from_payload(
                             layout.offsets_byte_offset,
                             layout.bytes_byte_offset,
                             layout.bytes_len,
-                            row_count,
+                            &matching_row_indices,
                         )
                         .map_err(|err| {
                             ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
                         })?;
-                    if values.len() != snapshot.row_count {
+                    if values.len() != matching_row_indices.len() {
                         return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
-                            "resident device-memory equality multi-column text projection column returned {} rows, expected {}",
+                            "resident device-memory equality multi-column selected-row text projection column returned {} rows, expected {}",
                             values.len(),
-                            snapshot.row_count
+                            matching_row_indices.len()
                         ))));
                     }
-                    text_values.insert(idx, (values, layout.bytes_len));
+                    text_values.insert(idx, values);
                 }
             }
         }
         let elapsed = started.elapsed();
-        let rows = (0..snapshot.row_count)
-            .filter(|row_idx| {
-                filters.iter().all(|(filter_idx, needle)| {
-                    column_values
-                        .get(filter_idx)
-                        .is_some_and(|filter_values| filter_values[*row_idx] == *needle)
-                })
-            })
-            .map(|row_idx| {
+        let rows = (0..matching_row_indices.len())
+            .map(|selected_idx| {
                 bound
                     .selected_indexes
                     .iter()
                     .map(|idx| {
                         if let Some(values) = column_values.get(idx) {
-                            return Ok(SqlValue::Int4(values[row_idx]));
+                            return Ok(SqlValue::Int4(values[selected_idx]));
                         }
-                        if let Some((values, _bytes_len)) = text_values.get(idx) {
-                            return Ok(SqlValue::Text(values[row_idx].clone()));
+                        if let Some(values) = text_values.get(idx) {
+                            return Ok(SqlValue::Text(values[selected_idx].clone()));
                         }
                         Err(ExecuteError::Engine(EngineError::ApplyFailed(
                             "resident device-memory equality multi-column projection missing projected column"
@@ -16766,19 +16770,23 @@ impl Engine {
             .collect::<Result<Vec<_>, ExecuteError>>()?;
         let int4_d2h_bytes = column_values
             .len()
-            .checked_mul(snapshot.row_count)
+            .checked_mul(matching_row_indices.len())
             .and_then(|cells| cells.checked_mul(std::mem::size_of::<i32>()))
             .and_then(|bytes| bytes.checked_add(std::mem::size_of::<u64>()))
             .and_then(|bytes| u64::try_from(bytes).ok())
             .unwrap_or(u64::MAX);
         let text_d2h_bytes = text_values
             .values()
-            .map(|(_values, bytes_len)| {
-                (u64::try_from(snapshot.row_count)
+            .map(|values| {
+                u64::try_from(values.len())
                     .unwrap_or(u64::MAX)
-                    .saturating_add(1))
-                .saturating_mul(std::mem::size_of::<u64>() as u64)
-                .saturating_add(*bytes_len)
+                    .saturating_mul(2 * std::mem::size_of::<u64>() as u64)
+                    .saturating_add(
+                        values
+                            .iter()
+                            .map(|value| u64::try_from(value.len()).unwrap_or(u64::MAX))
+                            .fold(0_u64, u64::saturating_add),
+                    )
             })
             .fold(0_u64, u64::saturating_add);
         let result_d2h_bytes = int4_d2h_bytes.saturating_add(text_d2h_bytes);
@@ -24656,6 +24664,10 @@ mod tests {
             decision.last_execution_d2h_bytes,
             Some(after.d2h_bytes_total.saturating_sub(before.d2h_bytes_total))
         );
+        assert_eq!(
+            decision.last_execution_d2h_bytes,
+            Some((2 * 2 * std::mem::size_of::<i32>() + std::mem::size_of::<u64>()) as u64)
+        );
 
         let Command::Select(composite) =
             parse_command("SELECT id, amount FROM events WHERE id = 2 AND amount = 30").unwrap()
@@ -24700,6 +24712,10 @@ mod tests {
         assert_eq!(
             decision.last_execution_d2h_bytes,
             Some(after.d2h_bytes_total.saturating_sub(before.d2h_bytes_total))
+        );
+        assert_eq!(
+            decision.last_execution_d2h_bytes,
+            Some((2 * std::mem::size_of::<i32>() + std::mem::size_of::<u64>()) as u64)
         );
 
         let Command::Select(mixed_composite) =
@@ -24747,6 +24763,15 @@ mod tests {
         assert_eq!(
             decision.last_execution_d2h_bytes,
             Some(after.d2h_bytes_total.saturating_sub(before.d2h_bytes_total))
+        );
+        assert_eq!(
+            decision.last_execution_d2h_bytes,
+            Some(
+                (2 * std::mem::size_of::<i32>()
+                    + std::mem::size_of::<u64>()
+                    + 2 * std::mem::size_of::<u64>()
+                    + "gamma".len()) as u64
+            )
         );
     }
 
