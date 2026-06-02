@@ -430,7 +430,7 @@ Append new candidates here as each paper is processed.
   Why: Shirakami cites Plor as modern transaction scheduling work; relevant to
   predictable low-tail mutation and admission paths under mixed transaction
   sizes.
-- `queued` — **Low-Latency Transaction Scheduling via Userspace Interrupts:
+- `reviewed` — **Low-Latency Transaction Scheduling via Userspace Interrupts:
   Why Wait or Yield When You Can Preempt?**, Huang et al.,
   PACMMOD/SIGMOD 2025.
   URL: `https://doi.org/10.1145/3725319`
@@ -475,3 +475,20 @@ Append new candidates here as each paper is processed.
   Why: hybrid disk/in-memory transactional architecture cited by the Umbra
   MVCC paper; useful as a contrast point for hot working-set placement and
   contention reduction across CPU memory and durable storage.
+- `queued` — **Polaris: Enabling Transaction Priority in Optimistic
+  Concurrency Control**, Ye et al., PACMMOD/SIGMOD 2023.
+  URL: `https://doi.org/10.1145/3589296`
+  Why: priority-aware OCC cited by PreemptDB; relevant to combining request
+  priority with conflict handling instead of only changing worker scheduling.
+- `queued` — **Towards Optimal Transaction Scheduling**, Cheng et al.,
+  PVLDB 2024.
+  URL: `https://www.vldb.org/pvldb/vol17/p2694-cheng.pdf`
+  Why: modern transaction scheduling work cited by PreemptDB; useful for
+  contrasting non-preemptive priority ordering with interrupt-driven
+  preemption and owner-queue admission.
+- `queued` — **LibPreemptible: Enabling Fast, Adaptive, and
+  Hardware-Assisted User-Space Scheduling**, Li et al., HPCA 2024.
+  URL: `https://doi.org/10.1109/HPCA57654.2024.00075`
+  Why: general hardware-assisted userspace preemption framework cited by
+  PreemptDB; useful if GPU DB wants preemption mechanics outside a full
+  transaction-engine rewrite.

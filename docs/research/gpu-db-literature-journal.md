@@ -2853,3 +2853,178 @@ Management with Tiered Main Memory`), or query route planning
   is necessary. The first proof should compare durable append-only versions
   against ephemeral/local version metadata under write-heavy and long-snapshot
   mixes.
+
+### 2026-06-03 - Low-latency transaction scheduling via userspace interrupts
+
+**Citation:** Kaisong Huang, Jiatang Zhou, Zhuoyue Zhao, Dong Xie, and
+Tianzheng Wang. "Low-Latency Transaction Scheduling via Userspace Interrupts:
+Why Wait or Yield When You Can Preempt?" Proceedings of the ACM on Management
+of Data 3(3), SIGMOD 2025, Article 182, pages 1-25. DOI:
+`https://doi.org/10.1145/3725319`. Retrieved 2026-06-03 from the ACM DOI
+metadata and author PDF at `https://www2.cs.sfu.ca/~tzwang/preemptdb.pdf`.
+
+**Category:** runtime / HFT / session scale and transaction scheduling.
+
+**Relevance tags:** preemptive transaction scheduling; userspace interrupts;
+mixed OLTP/analytical workloads; priority admission; low tail latency;
+transaction context switching; non-preemptible regions; starvation control;
+worker ownership; long refresh isolation.
+
+**Core idea:** PreemptDB revisits an old DBMS warning against preemption. The
+paper argues that the warning made sense for pessimistic lock-heavy engines,
+where interrupting a long transaction could strand locks and force short
+transactions to abort. In modern optimistic and multi-version engines,
+long-running reads usually do not hold read locks, and recent x86 userspace
+interrupts can deliver a preemption signal without a kernel round trip. That
+combination makes it practical to pause a low-priority long transaction,
+execute urgent short transactions on the same worker thread, then resume the
+paused work instead of aborting it.
+
+The implementation, PreemptDB, is built on ERMIA and uses one scheduling
+thread plus pinned worker threads. Each worker has separate high- and
+low-priority queues and two transaction contexts. A high-priority arrival lets
+the scheduler enqueue a batch of urgent transactions and send one userspace
+interrupt to the target worker. The worker's interrupt handler saves the
+current transaction context, swaps to the second context, runs one or more
+urgent transactions, then switches back to the paused long transaction.
+
+The evaluation uses mixed TPC-C/TPC-H-style workloads, with TPC-H Q2 as the
+long low-priority transaction and TPC-C New-Order/Payment as short
+high-priority transactions. On the paper's single-socket 32-worker evaluation
+setting, enabling the user-interrupt machinery reduced pure TPC-C throughput
+by about 1.7%. In the mixed workload, PreemptDB reduced high-priority
+transaction latency by 88-96% at the measured percentiles versus a
+non-preemptive wait policy, while keeping Q2 latency similar. Under overload,
+its starvation threshold trades urgent transaction latency against long-work
+progress explicitly.
+
+**Concrete mechanisms:**
+
+- A scheduling thread dispatches transactions from admission into per-worker
+  high-priority and low-priority queues. The implementation uses a single
+  scheduling thread in the evaluation; the paper reports it was not a
+  bottleneck for the tested 32-core scope.
+- Each worker owns two transaction contexts and normally executes low-priority
+  work in the regular context. A userspace interrupt switches it to the
+  preemptive context when high-priority work arrives.
+- Passive context switch uses the userspace interrupt frame. The handler saves
+  register state, extended register state, stack pointer, instruction pointer,
+  flags, and transaction-local state into a transaction control block, then
+  switches the stack pointer to the other context.
+- Active context switch, used when returning to the paused transaction, uses a
+  `swap_context` routine. It temporarily disables user interrupts and checks
+  whether the interrupted instruction pointer falls inside the active switch
+  region so a nested interrupt cannot corrupt partial stack/register state.
+- The design adds transparent context-local storage. Each transaction context
+  gets a TLS-shaped storage area, and context switches swap which area is
+  exposed as TLS. This protects DBMS and library code that assumes one
+  thread-local state block per execution stream.
+- Non-preemptible regions are explicit and nestable. The worker keeps a
+  context-local lock counter; if an interrupt arrives while the counter is
+  nonzero, the handler returns without switching. The paper lists index APIs,
+  allocator calls, validation, commit, and abort logic as examples.
+- Batched on-demand preemption fills a worker's high-priority queue up to a
+  bounded size and sends one interrupt for the batch, avoiding one interrupt
+  per urgent transaction.
+- Starvation prevention tracks the fraction of cycles spent on high-priority
+  work since the paused low-priority transaction began. The scheduler stops
+  adding urgent work to a worker, or a worker switches back early, when the
+  starvation level exceeds a tunable threshold.
+- The current design does not recursively preempt an already running
+  high-priority transaction, but the paper notes that more contexts could
+  support more priority levels.
+
+**GPU DB mapping:** The strongest transferable idea is not that GPU DB should
+immediately depend on Intel `uintr`; it is that long work and urgent work need
+a real preemption/admission story once a worker can hold CPU for milliseconds.
+In the current runtime plan, long COPY admission, resident refresh, CPU
+fallback scans, over-resident reads, and analytical retained scans can
+monopolize owner or execution workers just as TPC-H Q2 monopolizes PreemptDB
+workers. Short retained lookups, commit-critical mutation steps, cancellation,
+and response-drain work should have a way to get CPU service without waiting
+for arbitrary long loops to finish.
+
+PreemptDB maps naturally to the owner-domain model in
+`11-high-throughput-query-runtime.md` as a tiered scheduling policy. The first
+implementation probably should be cooperative safe points and queue budgets
+inside known long loops, but the benchmark target should measure the same
+thing PreemptDB measures: how quickly urgent short work starts when all
+workers are already busy with long work. If cooperative safe points are hard
+to place or workload-dependent, hardware-assisted or signal-assisted
+preemption becomes a later design option.
+
+The context-local storage lesson matters for GPU DB because owners will carry
+state that looks thread-local: WAL batch buffers, parser/session scratch,
+CUDA pinned buffer handles, stream-local scratch, allocator state, telemetry
+accumulators, and error contexts. If a future runtime allows one OS thread to
+pause one logical execution context and run another, those resources cannot
+silently alias. A simpler near-term rule is that preemptible long work must
+hold only explicitly declared context state, and any domain-local buffers must
+have ownership metadata before a dispatch switch.
+
+Non-preemptible regions map to database invariants. GPU DB must not preempt
+inside WAL-before-visibility publication, resident generation invalidation,
+commit timestamp publication, catalog generation swaps, CUDA buffer
+handoff/reuse, or critical latch/allocator sections unless the context switch
+can prove the same safety PreemptDB proves. This argues for narrow
+non-preemptible spans plus telemetry for "preemption requested but deferred,"
+not for broad uninterruptible owner loops.
+
+The starvation threshold maps directly to admission control. A GPU DB policy
+that always lets short retained reads preempt refresh or long scans may make
+refresh never finish. Conversely, letting refresh monopolize workers breaks
+interactive latency. The transferable control variable is the fraction of
+worker/GPU/queue service time allocated to each request class, exposed as a
+tunable or adaptive policy rather than hidden queue behavior.
+
+**Risks and mismatches:** PreemptDB is a CPU in-memory transaction engine, not
+a SQL-over-GPU runtime. Its experiments bypass SQL parsing, networking,
+planner overhead, storage IO, GPU kernels, and PostgreSQL protocol state. The
+implementation requires userspace-interrupt support and a patched kernel in
+the evaluated setup; current deployment targets may not have that facility.
+
+The paper assumes optimistic or MVCC reads make preemption practical. GPU DB
+must verify that preempted work is not holding locks, pinned buffers, CUDA
+stream state, WAL publication rights, catalog latches, or residency ownership
+that would block the urgent path. Hardware preemption of GPU kernels is also
+not the same as CPU userspace interrupt preemption; the practical mapping may
+be CPU-side worker scheduling and GPU queue admission rather than interrupting
+an active kernel.
+
+Transparent context-local storage is powerful but complex. Recreating it in a
+Rust/CUDA/pgwire runtime could add more risk than benefit unless benchmarks
+show cooperative scheduling cannot meet tail-latency targets. The safer first
+step is explicit long-operation slicing and class-based admission. The paper
+also leaves automatic starvation-threshold tuning as future work, so GPU DB
+should treat service-share thresholds as a benchmark variable, not a solved
+policy.
+
+**Benchmark candidates:**
+
+- Build a CPU-only mixed runtime benchmark with all workers occupied by long
+  refresh or scan loops, then inject urgent short retained lookups and commit
+  tasks. Compare FIFO, cooperative safe points, class-priority queue drain,
+  and bounded preemption flags. Minimum gate: urgent work start latency and
+  p99 response latency improve without violating generation/WAL ordering.
+- Add per-request-class service-share telemetry: short retained read, commit
+  critical section, COPY chunk, refresh, CPU fallback scan, GPU resident scan,
+  response drain, and cancellation. Failure condition: one class can starve
+  another without an explicit policy counter showing why.
+- Instrument non-preemptible spans in the prototype runtime: WAL append/flush,
+  visibility publication, resident invalidation, catalog generation swap,
+  pinned-buffer handoff, response-buffer reuse, and allocator/latch regions.
+  Proof gate: every deferred urgent request names the span that blocked it and
+  the span duration distribution is bounded.
+- Prototype long-operation slicing for refresh and CPU fallback scans. Each
+  slice must release or checkpoint enough state for urgent retained reads and
+  responses to run. Measure throughput loss against urgent p99 latency gain.
+- Test a starvation-threshold policy for refresh/scans versus short lookups:
+  cap urgent service time at several percentages and measure refresh
+  completion time, short lookup p99, queue depth, and explicit overload count.
+- Add a buffer-ownership preemption test: pause a long path while it owns a
+  decoded COPY buffer, WAL batch buffer, pinned staging buffer, or response
+  buffer; ensure the urgent path cannot reuse or observe that buffer until the
+  owning context publishes a safe state.
+- Keep hardware-assisted preemption as a later experiment: compare ordinary
+  cooperative flags against OS signal or userspace-interrupt-like notification
+  only after cooperative slicing fails a measured tail-latency gate.
