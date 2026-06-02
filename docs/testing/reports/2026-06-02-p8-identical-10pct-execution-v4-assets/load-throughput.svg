@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="420" viewBox="0 0 820 420">
+<rect width="100%" height="100%" fill="#ffffff"/>
+<text x="190" y="30" font-family="Arial" font-size="22" font-weight="700" fill="#1f2933">Load throughput side by side</text>
+<text x="190" y="50" font-family="Arial" font-size="12" fill="#52606d">64,424,510 row 10pct target; tuned row is index setup after reused default PostgreSQL load</text>
+<line x1="190.0" x2="190.0" y1="52" y2="364" stroke="#e5e7eb"/>
+<text x="190.0" y="386" text-anchor="middle" font-family="Arial" font-size="12" fill="#6b7280">0k</text>
+<line x1="308.0" x2="308.0" y1="52" y2="364" stroke="#e5e7eb"/>
+<text x="308.0" y="386" text-anchor="middle" font-family="Arial" font-size="12" fill="#6b7280">392k</text>
+<line x1="426.0" x2="426.0" y1="52" y2="364" stroke="#e5e7eb"/>
+<text x="426.0" y="386" text-anchor="middle" font-family="Arial" font-size="12" fill="#6b7280">784k</text>
+<line x1="544.0" x2="544.0" y1="52" y2="364" stroke="#e5e7eb"/>
+<text x="544.0" y="386" text-anchor="middle" font-family="Arial" font-size="12" fill="#6b7280">1176k</text>
+<line x1="662.0" x2="662.0" y1="52" y2="364" stroke="#e5e7eb"/>
+<text x="662.0" y="386" text-anchor="middle" font-family="Arial" font-size="12" fill="#6b7280">1568k</text>
+<line x1="780.0" x2="780.0" y1="52" y2="364" stroke="#e5e7eb"/>
+<text x="780.0" y="386" text-anchor="middle" font-family="Arial" font-size="12" fill="#6b7280">1960k</text>
+<text x="178" y="100" text-anchor="end" font-family="Arial" font-size="13" fill="#374151">Default PostgreSQL load</text>
+<rect x="190" y="82" width="18.6" height="30" rx="3" fill="#4d76b8"/>
+<text x="216.6" y="102" font-family="Arial" font-size="13" fill="#111827">61,660 rows/sec</text>
+<text x="178" y="176" text-anchor="end" font-family="Arial" font-size="13" fill="#374151">GPU DB retained load</text>
+<rect x="190" y="158" width="9.3" height="30" rx="3" fill="#d04f3f"/>
+<text x="207.3" y="178" font-family="Arial" font-size="13" fill="#111827">30,992 rows/sec</text>
+<text x="178" y="252" text-anchor="end" font-family="Arial" font-size="13" fill="#374151">Tuned PG index setup</text>
+<rect x="190" y="234" width="513.0" height="30" rx="3" fill="#0a8f70"/>
+<text x="711.0" y="254" font-family="Arial" font-size="13" fill="#111827">1,703,946 rows/sec</text>
+<line x1="190" x2="780" y1="364" y2="364" stroke="#111827"/>
+<text x="485.0" y="404" text-anchor="middle" font-family="Arial" font-size="13" fill="#374151">Rows/sec</text>
+</svg>
