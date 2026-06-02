@@ -3389,3 +3389,163 @@ GPU execution papers after the next non-analytics slot is filled.
 - Cross-boundary telemetry gate: every request should report route class,
   active resource budget, queue wait, conflict priority, preemption/suspend
   status, and the reason for any rejection, fallback, or demotion.
+
+### 2026-06-03 - Rethinking Logging, Checkpoints, and Recovery
+
+**Citation:** Michael Haubenschild, Caetano Sauer, Thomas Neumann, and Viktor
+Leis. "Rethinking Logging, Checkpoints, and Recovery for High-Performance
+Storage Engines." SIGMOD 2020, pp. 877-892. doi:10.1145/3318464.3389716.
+Retrieved 2026-06-03 from the author PDF,
+`https://db.in.tum.de/~leis/papers/rethinkingLogging.pdf`.
+
+**Category:** durable logging, checkpointing, and recovery for high-throughput
+storage engines.
+
+**Relevance tags:** per-thread WAL; remote flush avoidance; continuous
+checkpointing; bounded recovery; page provisioning; persistent memory log
+tail; SSD/NVMe storage; out-of-memory OLTP; recovery-time budgeting;
+WAL-before-visibility.
+
+**Core idea:** The paper targets the gap between ARIES-style disk recovery and
+lightweight in-memory logging. ARIES has the right feature set for
+larger-than-memory storage, fuzzy checkpoints, and index recovery, but a
+centralized log and traditional checkpoint bursts are too expensive for modern
+multi-core engines. Pure in-memory designs scale better but assume the data
+set fits in memory and often give up incremental checkpoints or transparent
+index recovery.
+
+The proposed LeanStore design keeps page-oriented recovery features while
+using distributed per-worker logs, a persistent-memory first-stage log tail,
+remote-flush avoidance, continuous checkpointing, and a dedicated page
+provider. In the reported TPC-C experiments with 40 workers, the fully enabled
+system reaches about 850k transactions/sec with roughly 19k recovery-component
+instructions per transaction. With a 100 GB WAL recovery limit, recovery takes
+38 seconds on 40 threads, corresponding to about 2.6 GB/sec of recovered WAL.
+
+**Concrete mechanisms:**
+
+- Each worker thread owns a log partition. A transaction is pinned to one
+  worker, so its log records go to one partition, while records for the same
+  page may still appear in different partitions.
+- The log has stages: a small circular first stage on persistent memory or
+  battery-backed DRAM, background staging to SSD, and archive storage for
+  media recovery. With persistent memory, commit needs cache-line persistence
+  of the local log tail rather than waiting for SSD staging.
+- Log records include type, page id, transaction id, GSN, and before/after
+  image data. Recovery gathers records for a page from all partitions and
+  applies them in GSN order.
+- Remote Flush Avoidance tracks, for each page, the log partition of the most
+  recent modification. A transaction records the maximum globally flushed GSN
+  at start and maintains `needsRemoteFlush`. If a page's prior GSN is already
+  globally flushed, or the latest unflushed modification is in the same log,
+  the transaction can avoid flushing all remote logs at commit.
+- RFA and group commit are separable. With persistent memory, the paper argues
+  for RFA without group commit for low-latency commits; without persistent
+  memory, RFA reduces the set of transactions that need global group-commit
+  waiting.
+- Continuous checkpointing couples checkpoint increments to generated WAL
+  volume rather than wall-clock time. The buffer pool is split into shards; for
+  every `1/S` of the configured WAL limit staged, the checkpointer writes dirty
+  pages in the next shard and records the minimum current GSN for that shard.
+  The minimum shard GSN, constrained by oldest active transaction GSN, defines
+  how far the log can be pruned.
+- Page provisioning treats hot, cool, and free pages as a closed system. A
+  page-provider thread unswizzles hot pages into a cool FIFO, evicts clean
+  pages into a free list, and writes dirty pages at the latest useful moment
+  before eviction. Worker threads allocate from the free list without touching
+  global eviction structures on the hot path.
+- The design uses steal. Before-images are stored in WAL, and transaction
+  aborts execute logical inverse operations through normal access paths, then
+  write an end-of-transaction record.
+- Recovery has analysis, redo, and undo phases. Analysis scans all log chunks,
+  separates winner and loser transactions, partitions winner log records by
+  page id into thread-local redo tables, and collects undo work. Redo assigns
+  page-id ranges to workers, merges and sorts records by `(pageId, GSN)`, and
+  replays page by page. Undo logically reverts loser transactions.
+- Persistent-memory implementation details include DAX-mapped log chunks,
+  non-temporal stores via PMDK, and per-record checksum validation to find the
+  last complete log record without repeatedly flushing an end-offset location.
+
+**GPU DB mapping:** This paper is directly relevant to GPU DB's durable
+authority boundary. P8 already treats GPU residency as rebuildable cache and
+WAL/checkpoint/archive replay as the source of truth. The LeanStore recovery
+design gives that boundary a concrete high-throughput shape: per-owner or
+per-partition WAL streams, local commit persistence, page or segment generation
+ordering, and a recovery path that can reconstruct CPU truth before any GPU
+resident snapshot is trusted.
+
+Remote Flush Avoidance maps cleanly to future partition owners. GPU DB should
+not require every committing mutation to synchronize every WAL stream just
+because streams share a global timestamp. A page-, segment-, or partition-local
+last-writer log id plus a global flushed boundary could let independent
+mutations commit locally while still detecting the cases where a shared
+physical segment requires remote durability before visibility publication.
+The correctness invariant remains WAL-before-visibility; RFA is only a way to
+prove a remote flush is unnecessary.
+
+Continuous checkpointing is a useful model for resident refresh and cache
+rebuild debt. Instead of time-triggered "big refresh" or "big checkpoint"
+events, GPU DB can tie background checkpoint, archive, CPU index rebuild,
+resident segment refresh, and cold-tier writeback to measured WAL bytes,
+dirty-segment bytes, or invalidation debt. Each shard or segment should carry
+the source WAL boundary it has persisted or refreshed through, so admission can
+explain whether a route is valid, stale, rebuilding, or blocked by a long
+active transaction.
+
+The page-provider idea also transfers to multi-tier placement. Workers should
+not consult expensive eviction or tier-placement structures in the request hot
+path. A residency/page provider can keep a small free list of host pages,
+pinned buffers, GPU staging buffers, and resident slots, while doing
+unswizzle/demotion/writeback/eviction work outside latency-critical retained
+reads and commits.
+
+Finally, the recovery benchmark should shape GPU DB's durability gates. It is
+not enough to measure COPY throughput or retained query latency while running;
+each write-path improvement should also report bounded recovery work: max WAL
+bytes to replay, partitioned replay throughput, index rebuild time, resident
+cache invalidated-on-start behavior, and time until GPU routes can safely be
+admitted after CPU truth is restored.
+
+**Risks and mismatches:** The paper is CPU storage-engine work, not a GPU
+database design. It assumes page-based buffer management, pointer swizzling,
+and LeanStore's optimistic synchronization, while GPU DB's current first P8
+slice uses MVCC tuple chains and generated GPU column-group snapshots. RFA
+depends on page-local GSN ordering and last-modifier metadata; translating it
+to MVCC row versions, column segments, and resident snapshot generations needs
+a fresh correctness proof.
+
+The evaluation uses persistent memory for the first-stage log tail and fast
+SSDs for staging. Future GPU DB deployments may lack persistent memory or may
+use CXL, NVRAM, NVMe, or plain DRAM-plus-fsync differently. The paper also
+does not evaluate PostgreSQL protocol sessions, GPU execution queues,
+snapshot-retirement pressure, or million-session admission. Its steal/undo
+choice is not automatically right for every GPU DB mutation path.
+
+**Benchmark candidates:**
+
+- Prototype per-owner WAL partitions for COPY/INSERT in a CPU-only path.
+  Compare centralized WAL, partition-local WAL with conservative global flush,
+  and RFA-style dependency checks. Required metrics: rows/sec, commit p50/p99,
+  remote flush rate, WAL bytes, and replay correctness after crash simulation.
+- Add durable-boundary telemetry to resident segment metadata: source WAL id,
+  checkpointed/refreshed-through boundary, oldest active reader/transaction,
+  invalidation generation, and recovery rebuild requirement. Failure
+  condition: a GPU route can be admitted without naming the durable CPU
+  boundary it depends on.
+- Build a continuous-checkpointing simulator over table/partition shards.
+  Trigger increments by WAL bytes or dirty-segment bytes, then measure max
+  replay bytes, write amplification, foreground latency disturbance, and
+  checkpoint lag under steady COPY plus retained reads.
+- Add a page-provider-style resource proof for host pages, pinned staging
+  buffers, and GPU resident slots. Workers allocate from bounded free lists;
+  a provider performs demotion, writeback, eviction, and refresh cleanup.
+  Required telemetry: free-list depth, provider lag, synchronous allocation
+  misses, and route fallback caused by provider debt.
+- Add recovery gates to write-throughput benchmarks: after a forced restart,
+  measure WAL analysis/replay time, CPU index/statistics rebuild time, GPU
+  residency invalidated/rebuilt state, and time to first admitted retained GPU
+  route.
+- Stress long active transactions or retained snapshots against continuous
+  checkpoint and log pruning. Verify the oldest active boundary can delay
+  pruning without silently serving stale resident data or letting WAL/archive
+  usage grow without an explicit overload reason.

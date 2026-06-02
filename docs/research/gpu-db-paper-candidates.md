@@ -457,7 +457,7 @@ Append new candidates here as each paper is processed.
   URL: `https://www.vldb.org/pvldb/vol10/p613-faleiro.pdf`
   Why: deterministic transaction protocol cited by Epic; relevant to exposing
   writes early inside an ordered batch without violating external visibility.
-- `queued` — **Rethinking Logging, Checkpoints, and Recovery for
+- `reviewed` — **Rethinking Logging, Checkpoints, and Recovery for
   High-Performance Storage Engines**, Haubenschild et al., SIGMOD 2020.
   URL: `https://doi.org/10.1145/3318464.3389716`
   Why: decentralized logging and checkpointing foundation used by Umbra;
@@ -520,3 +520,17 @@ Append new candidates here as each paper is processed.
   Why: OCC batching and operation-reordering work; useful for deciding when
   GPU DB write admission should batch full transaction stages rather than only
   WAL, index, or GPU refresh substeps.
+- `queued` — **Taurus: Lightweight Parallel Logging for In-Memory Database
+  Management Systems**, Xia, Yu, Pavlo, and Devadas, PVLDB 2020.
+  URL: `https://www.vldb.org/pvldb/vol14/p189-xia.pdf`
+  arXiv: `https://arxiv.org/abs/2010.06760`
+  Why: modern parallel logging with dependency vectors; useful follow-up for
+  comparing explicit dependency encoding against RFA-style remote-flush
+  avoidance in per-owner GPU DB WAL streams.
+- `queued` — **Taurus Database: How to be Fast, Available, and Frugal in the
+  Cloud**, Depoutovitch et al., SIGMOD 2020.
+  URL: `https://doi.org/10.1145/3318464.3386129`
+  arXiv: `https://arxiv.org/abs/2412.02792`
+  Why: cloud database storage architecture with append-only storage,
+  replication, recovery, and constant-time snapshots; relevant to future
+  disaggregated durable tiers and rebuildable GPU residency.
