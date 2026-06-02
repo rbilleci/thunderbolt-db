@@ -147,6 +147,7 @@ impl EndpointState {
         &mut self,
         sql: &str,
         output: &mut dyn Write,
+        scheduler_queue_wait_micros: u64,
     ) -> Result<(), Box<dyn Error>> {
         match parse_command(sql)? {
             Command::CreateTable(_) => {
@@ -242,6 +243,10 @@ impl EndpointState {
                         "client_visible_select_client_write_micros",
                         client_write_micros,
                     )?;
+                    self.fact(
+                        "client_visible_select_scheduler_queue_wait_micros",
+                        scheduler_queue_wait_micros,
+                    )?;
                     if let Some(value) = decision.last_execution_wall_micros {
                         self.fact("client_visible_select_retained_wall_micros", value)?;
                     }
@@ -280,6 +285,36 @@ impl EndpointState {
                         ),
                     )?;
                     self.fact("client_visible_select_rows", rows.len())?;
+                    self.fact(
+                        "select_phase_json",
+                        SelectPhaseFact {
+                            sql,
+                            query_shape: &decision.query_shape,
+                            scheduler_queue_wait_micros,
+                            engine_execute_micros,
+                            result_materialize_micros,
+                            client_write_micros,
+                            retained_wall_micros: decision.last_execution_wall_micros,
+                            retained_device_lookup_micros: decision
+                                .last_execution_device_lookup_micros,
+                            retained_match_index_micros: decision.last_execution_match_index_micros,
+                            retained_selected_projection_micros: decision
+                                .last_execution_selected_projection_micros,
+                            retained_result_materialization_micros: decision
+                                .last_execution_result_materialization_micros,
+                            retained_cuda_event_micros: decision
+                                .last_execution_kernel_event_elapsed_us,
+                            retained_matched_rows: decision
+                                .last_execution_matched_rows
+                                .map(|value| value.try_into().unwrap_or(u64::MAX)),
+                            h2d_delta,
+                            d2h_delta: after.d2h_bytes_total.saturating_sub(before.d2h_bytes_total),
+                            kernel_delta: after
+                                .kernel_exec_samples
+                                .saturating_sub(before.kernel_exec_samples),
+                            result_rows: rows.len(),
+                        },
+                    )?;
                 }
             }
             other => {
@@ -447,6 +482,7 @@ enum EngineResponse {
 
 struct EngineRequest {
     command: EngineCommand,
+    enqueued_at: Instant,
     response_tx: mpsc::Sender<Result<EngineResponse, String>>,
 }
 
@@ -458,6 +494,7 @@ fn request_engine(
     request_tx
         .send(EngineRequest {
             command,
+            enqueued_at: Instant::now(),
             response_tx,
         })
         .map_err(|err| format!("engine scheduler request failed: {err}"))?;
@@ -504,6 +541,72 @@ fn sql_value_text(value: &SqlValue) -> String {
         SqlValue::Int8(value) => value.to_string(),
         SqlValue::Numeric(value) | SqlValue::Text(value) => value.clone(),
     }
+}
+
+struct SelectPhaseFact<'a> {
+    sql: &'a str,
+    query_shape: &'a str,
+    scheduler_queue_wait_micros: u64,
+    engine_execute_micros: u64,
+    result_materialize_micros: u64,
+    client_write_micros: u64,
+    retained_wall_micros: Option<u64>,
+    retained_device_lookup_micros: Option<u64>,
+    retained_match_index_micros: Option<u64>,
+    retained_selected_projection_micros: Option<u64>,
+    retained_result_materialization_micros: Option<u64>,
+    retained_cuda_event_micros: Option<u64>,
+    retained_matched_rows: Option<u64>,
+    h2d_delta: u64,
+    d2h_delta: u64,
+    kernel_delta: u64,
+    result_rows: usize,
+}
+
+impl std::fmt::Display for SelectPhaseFact<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{{\"sql\":\"{}\",\"query_shape\":\"{}\",\"scheduler_queue_wait_micros\":{},\"engine_execute_micros\":{},\"result_materialize_micros\":{},\"client_write_micros\":{},\"retained_wall_micros\":{},\"retained_device_lookup_micros\":{},\"retained_match_index_micros\":{},\"retained_selected_projection_micros\":{},\"retained_result_materialization_micros\":{},\"retained_cuda_event_micros\":{},\"retained_matched_rows\":{},\"h2d_delta\":{},\"d2h_delta\":{},\"kernel_delta\":{},\"result_rows\":{}}}",
+            json_escape(self.sql),
+            json_escape(self.query_shape),
+            self.scheduler_queue_wait_micros,
+            self.engine_execute_micros,
+            self.result_materialize_micros,
+            self.client_write_micros,
+            json_optional_u64(self.retained_wall_micros),
+            json_optional_u64(self.retained_device_lookup_micros),
+            json_optional_u64(self.retained_match_index_micros),
+            json_optional_u64(self.retained_selected_projection_micros),
+            json_optional_u64(self.retained_result_materialization_micros),
+            json_optional_u64(self.retained_cuda_event_micros),
+            json_optional_u64(self.retained_matched_rows),
+            self.h2d_delta,
+            self.d2h_delta,
+            self.kernel_delta,
+            self.result_rows
+        )
+    }
+}
+
+fn json_optional_u64(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "null".to_string())
+}
+
+fn json_escape(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(|ch| match ch {
+            '"' => "\\\"".chars().collect::<Vec<_>>(),
+            '\\' => "\\\\".chars().collect::<Vec<_>>(),
+            '\n' => "\\n".chars().collect::<Vec<_>>(),
+            '\r' => "\\r".chars().collect::<Vec<_>>(),
+            '\t' => "\\t".chars().collect::<Vec<_>>(),
+            _ => vec![ch],
+        })
+        .collect()
 }
 
 fn read_startup_frame(stream: &mut TcpStream) -> io::Result<Option<Vec<u8>>> {
@@ -681,6 +784,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         match request_rx.recv_timeout(Duration::from_millis(50)) {
             Ok(request) => {
+                let scheduler_queue_wait_micros = request
+                    .enqueued_at
+                    .elapsed()
+                    .as_micros()
+                    .try_into()
+                    .unwrap_or(u64::MAX);
                 let result = (|| -> Result<EngineResponse, Box<dyn Error>> {
                     let mut output = Vec::new();
                     match request.command {
@@ -689,7 +798,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                             Ok(EngineResponse::Bytes(output))
                         }
                         EngineCommand::SimpleQuery(sql) => {
-                            state.handle_simple_query(&sql, &mut output)?;
+                            state.handle_simple_query(
+                                &sql,
+                                &mut output,
+                                scheduler_queue_wait_micros,
+                            )?;
                             Ok(EngineResponse::Bytes(output))
                         }
                         EngineCommand::StartCopy(sql) => {
