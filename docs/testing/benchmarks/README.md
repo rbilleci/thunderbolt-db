@@ -46,13 +46,13 @@ unattended automation.
 
 ## Current Accepted Evidence
 
-The latest scaled identical-client smoke is:
+The latest accepted identical-client milestone is:
 
 - report:
-  [docs/testing/reports/2026-06-01-p8-identical-composite-text-pgwire-curves-v1.md](../reports/2026-06-01-p8-identical-composite-text-pgwire-curves-v1.md)
+  [docs/testing/reports/2026-06-02-p8-identical-10pct-execution-v4.md](../reports/2026-06-02-p8-identical-10pct-execution-v4.md)
 - command: `scripts/run_p8_ch_benchmark_residency_probe.sh --identical-pgwire-target-smoke`
-- scaled rows: `16`
-- concurrency: `1,2`
+- rows: `64,424,510`
+- concurrency: `1,2,4,8,16,32,64`
 - profiles: default PostgreSQL, tuned PostgreSQL, GPU DB retained endpoint
 - metric shape: graph-ready p50/p95/p99/throughput/correctness/error count,
   retained-route flag, route classification, and saturation note rows
@@ -90,8 +90,10 @@ lookup. A follow-up COPY admission recheck still missed the 30k rows/sec
 target, narrowing the next implementation boundary to the WAL commit/flush plus
 relational value-index append path. The WAL/current-apply architecture slice
 then cleared the bounded 30k rows/sec gate by avoiding duplicate generic
-state-machine clone/reparse of the current engine-applied COPY WAL entry before
-any full 10% retry.
+state-machine clone/reparse of the current engine-applied COPY WAL entry. The
+full 10% retry is now accepted: default PostgreSQL loaded 64,424,510 rows at
+61,660 rows/sec, and the GPU DB retained endpoint loaded the same row count at
+30,992 rows/sec with retained query correctness through concurrency 64.
 
 The latest scaled smoke includes:
 
@@ -154,6 +156,13 @@ match-index output.
 - [2026-06-02 COPY admission WAL/value-index architecture](../reports/2026-06-02-p8-copy-admission-wal-value-index-architecture-v1.md):
   the bounded WAL/current-apply architecture slice that cleared the 30k
   rows/sec COPY gate and left the full 10% retry as the next benchmark decision.
+- [2026-06-02 10% identical pgwire execution v4](../reports/2026-06-02-p8-identical-10pct-execution-v4.md):
+  accepted 10% default PostgreSQL and GPU DB retained execution through
+  concurrency 64 with GPU DB COPY above the required 30k rows/sec gate.
+- [2026-06-02 over-resident partitioned readiness](../reports/2026-06-02-p8-over-resident-partitioned-readiness-v1.md):
+  narrowed 125% over-resident readiness from a broad missing execution path to
+  the partitioned resident route/execution primitive required before full
+  125pct scheduling.
 - [2026-06-01 retained composite/text lookup route](../reports/2026-06-01-p8-retained-composite-text-lookup-route-v1.md):
   retained composite lookup progression.
 - [2026-05-31 25% aggregate refresh after BETWEEN](../reports/2026-05-31-p8-25pct-aggregate-refresh-after-between-v1.md):
@@ -163,24 +172,19 @@ match-index output.
 
 ## Remaining Blockers
 
-- `p8_identical_10pct_execution_v4_required`: the bounded WAL/current-apply
-  architecture slice cleared the 30k rows/sec COPY gate at `31,072 rows/sec`
-  GPU DB load wall time and `42,376 rows/sec` average COPY chunk admission. The
-  next benchmark decision is the full 64,424,510-row 10% retry capped at
-  concurrency `1,2,4,8,16,32,64`.
 - `pgsql_128_client_count_query_errors_need_classification`: default/tuned
   PostgreSQL 128-client count-query errors appeared in the 10% attempt and must
   be classified before trusting 128-client comparator rows.
-- `missing_partitioned_over_resident_execution`: the 125% tier requires a
-  partitioned or streamed over-resident execution design because the current
-  retained layout expects one resident CUDA layout larger than local RTX 3090
-  memory.
+- `partitioned_resident_route_execution_primitive_required`: the 125% tier
+  requires partition metadata, planner acceptance, per-partition execution, and
+  result reduction because the current retained layout expects one resident
+  CUDA allocation per table, larger than local RTX 3090 memory at 125%.
 
 ## Explicit Non-Claims
 
 The current benchmark evidence does not claim:
 
-- accepted 10% or full 25% PostgreSQL-vs-GPU retained curves
+- full 25% PostgreSQL-vs-GPU retained curves
 - completed 125% PostgreSQL-vs-GPU retained curves
 - full CH-benCHmark or BenchBase compatibility
 - joins or transaction-mix benchmarking
