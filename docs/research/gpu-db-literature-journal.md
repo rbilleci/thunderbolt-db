@@ -398,7 +398,179 @@ buffers.
   each partition route to report whether partitioning reduced peak GPU memory
   only or also reduced PCIe bytes through predicate/bitvector filtering.
 
+### 2026-06-02 - Transaction Repair for Multi-Version Concurrency Control
+
+**Citation:** Mohammad Dashti, Sachin Basil John, Amir Shaikhha, and Christoph
+Koch. "Transaction Repair for Multi-Version Concurrency Control." SIGMOD 2017,
+pp. 235-250. DOI: `10.1145/3035918.3035919`. Retrieved 2026-06-02 from the
+ACM DOI page and the authors' CoRR preprint, "Repairing Conflicts among MVCC
+Transactions," `https://arxiv.org/abs/1603.00542`.
+
+**Category:** transaction processing / write path and MVCC / visibility.
+
+**Relevance tags:** MVCC validation; optimistic concurrency control; conflict
+repair; write contention; serializability; long transactions; transaction
+program dependencies.
+
+**Core idea:** MV3C targets the cost of optimistic MVCC abort-and-restart under
+high contention or long-running transactions. Instead of discarding all work
+when validation fails, transaction programs are represented as dependency
+graphs of predicates and closures. Validation identifies which predicates read
+stale committed versions; repair prunes only those invalid predicates and their
+descendants, removes versions they created from the transaction undo buffer,
+assigns a new start timestamp, and re-executes only the affected closures.
+
+The conceptual fit for this engine is narrow but important: not every conflict
+should force redoing parse, admission, CPU-side transaction work, generated
+write batches, or GPU-facing refresh preparation. If a future write path can
+name the exact read predicates and derived write fragments that depend on
+them, then a failed validation can become a bounded repair of the affected
+fragment rather than a whole transaction restart.
+
+**Concrete mechanisms:**
+
+- MV3C builds on optimistic timestamp-order MVCC. A transaction reads at a
+  start timestamp, creates private versions, and validates before commit
+  against versions committed during its lifetime.
+- Transaction programs are annotated as predicates with bound closures.
+  Predicates perform reads and expose a `match` operation used during
+  validation; closures contain deterministic program logic and may instantiate
+  child predicates.
+- The predicate graph captures dependency direction. If a parent predicate is
+  invalid, its descendants are invalid because their context variables or
+  result sets may have changed.
+- Validation topologically walks the predicate graph, matching predicates
+  against committed versions since the transaction's start timestamp. It keeps
+  both valid nodes and invalid nodes instead of stopping at the first conflict.
+- Repair chooses a new start timestamp, selects invalid roots that have no
+  invalid parent, removes versions created by those predicates and descendants
+  from the undo buffer, prunes descendants, and re-executes the invalid roots'
+  closures at the new timestamp.
+- Write-write conflicts can optionally be allowed to continue instead of
+  causing premature abort. Validation then decides whether the write was
+  effectively blind or depended on a stale read.
+- Attribute-level validation narrows false conflicts by intersecting columns
+  monitored by a predicate with columns modified in a committed version before
+  running predicate-specific matching.
+- For expensive predicates such as non-indexed scans, MV3C can keep predicate
+  result sets and repair them by incorporating concurrently committed matching
+  versions rather than rescanning from scratch.
+- The paper proves commit-order serializability for MV3C schedules, assuming
+  deterministic closures and correct predicate dependency boundaries.
+- Evaluation is single-threaded with interleaved transaction windows, not a
+  production multicore engine. It shows low conflict-free overhead under 1% in
+  reported cases, stronger gains as conflict rate/window size rises, and little
+  benefit on one TPC-C configuration where conflicts mostly cause premature
+  aborts before validation.
+
+**GPU DB mapping:** The immediate mapping is not to port MV3C wholesale. The
+engine's first production invariant is still WAL-before-visibility, and current
+COPY/INSERT admission is more append/batch oriented than stored-procedure
+oriented. The transferable design is dependency-named validation and repair:
+write fragments, derived indexes, resident invalidation decisions, and refresh
+work should be associated with the read predicates or table generations they
+depend on.
+
+For write throughput, this suggests a future transaction descriptor that
+records read predicate families, modified column sets, generated row-key
+ranges, touched value-index columns, and resident generations invalidated. If a
+commit-time validation conflict is isolated to one predicate family, the
+mutation owner could re-run only the affected fragment and preserve already
+prepared independent fragments.
+
+For MVCC/snapshot design, attribute-level predicate validation maps well to
+P8's route metadata. A read snapshot or mutation fragment should know which
+columns and generations it observed. That lets the engine distinguish "same
+row changed in an irrelevant column" from "predicate or output column changed,"
+reducing unnecessary abort, fallback, or resident invalidation.
+
+For GPU execution, repairable result-set predicates are analogous to
+over-resident or retained scan predicates whose candidate vectors can be
+patched with post-start committed versions. This is not safe for arbitrary SQL
+yet, but it is a useful benchmark idea for long-running read-modify-write
+procedures: keep candidate row ordinals and version boundaries so a validation
+failure can append or remove only the changed candidates before rerunning a
+small GPU or CPU fragment.
+
+**Risks and mismatches:** MV3C assumes annotated or analyzable transaction
+programs with deterministic closures. The current engine accepts SQL over
+pgwire, where ad hoc statements often lack stored procedure boundaries and
+where exposing dependency annotations to users would be a major product
+choice. The evaluated prototype is single-threaded, uses in-memory redo logs,
+and does not prove multicore contention, WAL flush, network IO, GPU residency,
+or 1M-session behavior. Long version chains under allowed write-write conflicts
+can hurt, and the paper itself reports deterioration in one banking experiment
+as concurrent uncommitted versions accumulate. The approach also does not
+address DDL, snapshot retirement, recovery replay, or GPU cache invalidation.
+
+**Benchmark candidates:**
+
+- Add conflict telemetry to the mutation owner before implementing repair:
+  validation failures by table, predicate/column family, write-write versus
+  read-write cause, wasted rows/bytes prepared, and whether independent write
+  fragments existed. Minimum gate: no correctness change and actionable
+  conflict attribution.
+- Prototype attribute-level validation for one SQL-visible read-modify-write
+  microbenchmark. Expected improvement: fewer unnecessary aborts or owner
+  fallbacks when unrelated columns change. Failure condition: validation cost
+  exceeds saved retries at low conflict.
+- Build a stored-procedure-only repair experiment with two independent update
+  fragments and one shared hot counter/fee row. Preserve WAL-before-visibility,
+  repair only the hot fragment after validation failure, and compare against
+  full abort/retry under concurrency `1,2,4,8,16,32,64`.
+- For long scan-plus-update transactions, test result-set repair over a stable
+  MVCC boundary: retain candidate row ids from the initial scan, match
+  committed versions since start, patch the candidate vector, then rerun only
+  the dependent write fragment. Minimum proof gate: commit-order equivalent
+  result and explicit version-chain length telemetry.
+- Add a guardrail benchmark for allowed write-write conflicts: measure version
+  chain traversal and memory growth under a single hot row, and require a cap
+  or fallback policy before enabling this behavior outside experiments.
+
 ## Cross-Paper Synthesis
 
-No cross-paper synthesis exists yet. Add one after the first three to five
-papers are processed.
+### 2026-06-02 - First Modern Batch Synthesis
+
+The modern reviewed set now covers three complementary design tracks: DPF
+pushes fused GPU data paths for resident and over-resident reads, the 2025
+hybrid CPU/GPU paper pushes CPU prefiltering plus compressed transfer before a
+GPU compute tail, and MV3C pushes dependency-aware validation so conflicts
+repair only the affected transaction fragments. Together, they argue for route
+descriptors that are richer than "CPU versus GPU": each hot path should name
+its snapshot/generation boundary, columns touched, bytes moved, scratch demand,
+predicate dependencies, and fallback or repair reason.
+
+Converging design tracks:
+
+- **Descriptor-first execution:** retained reads, over-resident scans, and
+  write fragments should all carry explicit demand/dependency metadata before
+  admission.
+- **Boundary-preserving batching:** micro-batches and fused GPU kernels are
+  attractive only when every request in the batch shares a compatible snapshot,
+  route shape, and visibility boundary.
+- **Reduce before transfer:** over-resident execution should prefer CPU or
+  metadata pruning when it reduces PCIe bytes, then hand compact batches to GPU
+  workers.
+- **Repair before retry:** write-path conflicts should be measured by wasted
+  independent work and repaired only where dependency boundaries make that
+  equivalent to restart.
+
+Current category gap: the queue still needs more runtime/session-scale and
+network-admission papers before the design over-invests in storage and GPU
+execution. The next high-value paper should likely be Shenango, Caladan, or a
+newer high-concurrency runtime paper, unless MVCC/snapshot robustness becomes
+the immediate blocker.
+
+Benchmark priorities:
+
+- Add route descriptor telemetry for retained and over-resident reads:
+  snapshot generation, columns, resident bytes, H2D/D2H bytes, scratch bytes,
+  kernel count, and queue wait.
+- Add mutation conflict attribution before attempting transaction repair:
+  conflict cause, columns, prepared bytes/rows wasted, and independent
+  fragments available.
+- Compare three over-resident routes on the same query: CPU-only,
+  CPU-prefilter-plus-GPU-tail, and full partition GPU streaming.
+- Keep latency gates explicit for every fusion or batching experiment, because
+  the reviewed GPU papers optimize throughput and response time for analytical
+  queries, not pgwire OLTP tail latency.

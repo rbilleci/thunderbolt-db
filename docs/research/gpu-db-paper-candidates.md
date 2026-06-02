@@ -35,11 +35,13 @@ mechanical sympathy, or query optimization.
   URL: `https://dl.acm.org/doi/10.1145/2882903.2882905`
   Why: memory-optimized transactional engine for mixed workloads; relevant to
   balancing read snapshots and write throughput.
-- `queued` — **Transaction Repair for Multi-Version Concurrency Control**,
-  arXiv 2024.
-  URL: `https://arxiv.org/abs/2405.14761`
-  Why: recent MVCC transaction repair approach that may inform conflict
-  handling without throwing away all work.
+- `reviewed` — **Transaction Repair for Multi-Version Concurrency Control**,
+  Dashti et al., SIGMOD 2017.
+  URL: `https://dl.acm.org/doi/10.1145/3035918.3035919`
+  Preprint: `https://arxiv.org/abs/1603.00542`
+  Why: MVCC transaction repair approach that may inform conflict handling
+  without throwing away all work. The previously queued arXiv 2024 URL was
+  unrelated and has been corrected to the SIGMOD 2017 paper.
 
 ### MVCC, snapshots, and visibility
 
@@ -226,3 +228,21 @@ Append new candidates here as each paper is processed.
   URL: `https://doi.org/10.1145/3662010.3663450`
   Why: modern GPU compressed-data execution follow-up for resident and
   over-resident compressed page experiments.
+- `queued` — **Fast Serializable Multi-Version Concurrency Control for
+  Main-Memory Database Systems**, Neumann et al., SIGMOD 2015.
+  URL: `https://dl.acm.org/doi/10.1145/2723372.2749436`
+  Why: direct OMVCC baseline for transaction repair, with timestamp,
+  validation, and version-chain design relevant to serializable MVCC in a
+  memory-resident engine.
+- `queued` — **Leveraging Lock Contention to Improve OLTP Application
+  Performance**, Yan and Cheung, PVLDB 2016.
+  URL: `https://www.vldb.org/pvldb/vol9/p444-yan.pdf`
+  Why: program-analysis and contention-aware execution ideas that complement
+  MV3C's dependency-annotated transaction repair path.
+- `queued` — **Chiller: Contention-centric Transaction Execution and Data
+  Partitioning for Modern Networks**, Zamanian et al., SIGMOD 2020.
+  URL: `https://doi.org/10.1145/3318464.3389724`
+  Preprint: `https://arxiv.org/abs/1811.12204`
+  Why: contention-aware partitioning and transaction execution for fast
+  networks, relevant to partition owners, admission, and high-contention
+  write-path routing.
