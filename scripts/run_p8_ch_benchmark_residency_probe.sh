@@ -1282,51 +1282,68 @@ engine_pgwire_concurrency_metric() {
   local retained_route="$9"
   local concurrency="${10}"
   local run_dir="${tmp_prefix}-${query_id}-c${concurrency}"
+  local client_driver="${GPU_DB_CH_BENCH_ENGINE_PGWIRE_CLIENT_DRIVER:-tokio-postgres/simple-query}"
+  local requests_per_client="${GPU_DB_CH_BENCH_PERSISTENT_REQUESTS_PER_CLIENT:-1}"
   mkdir -p "$run_dir"
 
-  local wall_start_ns wall_end_ns wall_us throughput p50_us p95_us p99_us error_count correctness
-  local -a pids=()
-  local client
-  wall_start_ns=$(date +%s%N)
-  for client in $(seq 1 "$concurrency"); do
-    (
-      local out_path="$run_dir/client-${client}.out"
-      local err_path="$run_dir/client-${client}.err"
-      local result_path="$run_dir/client-${client}.result"
-      local start_ns end_ns latency_us actual status
-      start_ns=$(date +%s%N)
-      if psql "$url" -X -v ON_ERROR_STOP=1 -Atc "$sql" >"$out_path" 2>"$err_path"; then
-        status="pass"
-      else
-        status="error"
-      fi
-      end_ns=$(date +%s%N)
-      latency_us=$(((end_ns - start_ns) / 1000))
-      actual="$(tr '\n' '|' <"$out_path" | sed 's/|$//')"
-      if [ "$status" = "pass" ] && [ "$actual" != "$expected" ]; then
-        status="wrong_result"
-      fi
-      printf '%s,%s,%s\n' "$latency_us" "$status" "$(json_escape "$actual")" >"$result_path"
-    ) &
-    pids+=("$!")
-  done
-  for pid in "${pids[@]}"; do
-    wait "$pid"
-  done
-  wall_end_ns=$(date +%s%N)
-  wall_us=$(((wall_end_ns - wall_start_ns) / 1000))
-
-  awk -F, '{ print $1 }' "$run_dir"/client-*.result | sort -n >"$run_dir/latencies.sorted"
-  p50_us=$(awk -v q=0.50 'BEGIN { n=0 } { a[++n]=$1 } END { if (n == 0) { print 0; exit } i=int(q*n + 0.999999); if (i < 1) i=1; if (i > n) i=n; print a[i] }' "$run_dir/latencies.sorted")
-  p95_us=$(awk -v q=0.95 'BEGIN { n=0 } { a[++n]=$1 } END { if (n == 0) { print 0; exit } i=int(q*n + 0.999999); if (i < 1) i=1; if (i > n) i=n; print a[i] }' "$run_dir/latencies.sorted")
-  p99_us=$(awk -v q=0.99 'BEGIN { n=0 } { a[++n]=$1 } END { if (n == 0) { print 0; exit } i=int(q*n + 0.999999); if (i < 1) i=1; if (i > n) i=n; print a[i] }' "$run_dir/latencies.sorted")
-  error_count=$(awk -F, '$2 != "pass" { count++ } END { print count + 0 }' "$run_dir"/client-*.result)
-  if [ "$error_count" -eq 0 ]; then
-    correctness="pass"
+  local wall_start_ns wall_end_ns wall_us throughput p50_us p95_us p99_us error_count correctness request_count
+  if [ "$client_driver" = "tokio-postgres/simple-query" ]; then
+    GPU_DB_PERSISTENT_PGWIRE_URL="$url" \
+      GPU_DB_PERSISTENT_PGWIRE_SQL="$sql" \
+      GPU_DB_PERSISTENT_PGWIRE_EXPECTED="$expected" \
+      GPU_DB_PERSISTENT_PGWIRE_CONCURRENCY="$concurrency" \
+      GPU_DB_PERSISTENT_PGWIRE_REQUESTS_PER_CLIENT="$requests_per_client" \
+      GPU_DB_PERSISTENT_PGWIRE_RUN_DIR="$run_dir" \
+      target/debug/examples/p8_persistent_pgwire_concurrency_runner >"$run_dir/runner.out" 2>"$run_dir/runner.err"
+    # shellcheck disable=SC1091
+    . "$run_dir/summary.env"
+    throughput="$throughput_qps"
+    correctness="$correctness_status"
   else
-    correctness="error"
+    local -a pids=()
+    local client
+    wall_start_ns=$(date +%s%N)
+    for client in $(seq 1 "$concurrency"); do
+      (
+        local out_path="$run_dir/client-${client}.out"
+        local err_path="$run_dir/client-${client}.err"
+        local result_path="$run_dir/client-${client}.result"
+        local start_ns end_ns latency_us actual status
+        start_ns=$(date +%s%N)
+        if psql "$url" -X -v ON_ERROR_STOP=1 -Atc "$sql" >"$out_path" 2>"$err_path"; then
+          status="pass"
+        else
+          status="error"
+        fi
+        end_ns=$(date +%s%N)
+        latency_us=$(((end_ns - start_ns) / 1000))
+        actual="$(tr '\n' '|' <"$out_path" | sed 's/|$//')"
+        if [ "$status" = "pass" ] && [ "$actual" != "$expected" ]; then
+          status="wrong_result"
+        fi
+        printf '%s,%s,%s\n' "$latency_us" "$status" "$(json_escape "$actual")" >"$result_path"
+      ) &
+      pids+=("$!")
+    done
+    for pid in "${pids[@]}"; do
+      wait "$pid"
+    done
+    wall_end_ns=$(date +%s%N)
+    wall_us=$(((wall_end_ns - wall_start_ns) / 1000))
+
+    awk -F, '{ print $1 }' "$run_dir"/client-*.result | sort -n >"$run_dir/latencies.sorted"
+    p50_us=$(awk -v q=0.50 'BEGIN { n=0 } { a[++n]=$1 } END { if (n == 0) { print 0; exit } i=int(q*n + 0.999999); if (i < 1) i=1; if (i > n) i=n; print a[i] }' "$run_dir/latencies.sorted")
+    p95_us=$(awk -v q=0.95 'BEGIN { n=0 } { a[++n]=$1 } END { if (n == 0) { print 0; exit } i=int(q*n + 0.999999); if (i < 1) i=1; if (i > n) i=n; print a[i] }' "$run_dir/latencies.sorted")
+    p99_us=$(awk -v q=0.99 'BEGIN { n=0 } { a[++n]=$1 } END { if (n == 0) { print 0; exit } i=int(q*n + 0.999999); if (i < 1) i=1; if (i > n) i=n; print a[i] }' "$run_dir/latencies.sorted")
+    error_count=$(awk -F, '$2 != "pass" { count++ } END { print count + 0 }' "$run_dir"/client-*.result)
+    if [ "$error_count" -eq 0 ]; then
+      correctness="pass"
+    else
+      correctness="error"
+    fi
+    throughput=$(awk -v c="$concurrency" -v us="$wall_us" 'BEGIN { if (us > 0) printf "%.6f", c * 1000000 / us; else printf "0.000000" }')
+    request_count="$concurrency"
   fi
-  throughput=$(awk -v c="$concurrency" -v us="$wall_us" 'BEGIN { if (us > 0) printf "%.6f", c * 1000000 / us; else printf "0.000000" }')
 
   local phase_path phase_samples phase_queue_wait_avg_us phase_queue_wait_max_us phase_engine_execute_avg_us phase_client_write_avg_us phase_d2h_avg_bytes phase_result_materialize_avg_us phase_retained_wall_avg_us phase_cuda_event_avg_us phase_kernel_delta_avg
   phase_path="$(write_retained_phase_sample "$run_dir" "$concurrency")"
@@ -1341,9 +1358,12 @@ engine_pgwire_concurrency_metric() {
   phase_cuda_event_avg_us="$(phase_metric_avg "$phase_path" retained_cuda_event_micros)"
   phase_kernel_delta_avg="$(phase_metric_avg "$phase_path" kernel_delta)"
 
-  printf '{"kind":"engine_backed_pgwire_concurrency_metric","target":"engine_backed_pgwire_endpoint","profile":"gpu_db_retained_endpoint","client_driver":"psql/libpq","query":"%s","concurrency":%s,"p50_us":%s,"p95_us":%s,"p99_us":%s,"throughput_qps":%.6f,"wall_us":%s,"error_count":%s,"correctness_status":"%s","route_classification":"%s","retained_gpu_route":%s,"protocol_catalog_path":false,"phase_samples":%s,"phase_scheduler_queue_wait_avg_us":%s,"phase_scheduler_queue_wait_max_us":%s,"phase_engine_execute_avg_us":%s,"phase_client_write_avg_us":%s,"phase_result_materialize_avg_us":%s,"phase_retained_wall_avg_us":%s,"phase_cuda_event_avg_us":%s,"phase_d2h_avg_bytes":%s,"phase_kernel_delta_avg":%s,"phase_artifact":"%s","blocker":"none"}\n' \
+  printf '{"kind":"engine_backed_pgwire_concurrency_metric","target":"engine_backed_pgwire_endpoint","profile":"gpu_db_retained_endpoint","client_driver":"%s","query":"%s","concurrency":%s,"request_count":%s,"requests_per_client":%s,"p50_us":%s,"p95_us":%s,"p99_us":%s,"throughput_qps":%.6f,"wall_us":%s,"error_count":%s,"correctness_status":"%s","route_classification":"%s","retained_gpu_route":%s,"protocol_catalog_path":false,"phase_samples":%s,"phase_scheduler_queue_wait_avg_us":%s,"phase_scheduler_queue_wait_max_us":%s,"phase_engine_execute_avg_us":%s,"phase_client_write_avg_us":%s,"phase_result_materialize_avg_us":%s,"phase_retained_wall_avg_us":%s,"phase_cuda_event_avg_us":%s,"phase_d2h_avg_bytes":%s,"phase_kernel_delta_avg":%s,"phase_artifact":"%s","blocker":"none"}\n' \
+    "$client_driver" \
     "$query_id" \
     "$concurrency" \
+    "$request_count" \
+    "$requests_per_client" \
     "$p50_us" \
     "$p95_us" \
     "$p99_us" \
@@ -1364,7 +1384,8 @@ engine_pgwire_concurrency_metric() {
     "$(json_number_or_null "$phase_d2h_avg_bytes")" \
     "$(json_number_or_null "$phase_kernel_delta_avg")" \
     "$(json_escape "$phase_path")" >>"$metrics_path"
-  printf '25pct,engine_backed_pgwire_endpoint,gpu_db_retained_endpoint,psql/libpq,%s,%s,%s,none,%s,%s,"%s qps; p50=%sus p95=%sus p99=%sus; owner_thread_engine_scheduler"\n' \
+  printf '25pct,engine_backed_pgwire_endpoint,gpu_db_retained_endpoint,%s,%s,%s,%s,none,%s,%s,"%s qps; p50=%sus p95=%sus p99=%sus; owner_thread_engine_scheduler; requests=%s"\n' \
+    "$client_driver" \
     "$query_id" \
     "$concurrency" \
     "$correctness" \
@@ -1373,7 +1394,8 @@ engine_pgwire_concurrency_metric() {
     "$throughput" \
     "$p50_us" \
     "$p95_us" \
-    "$p99_us" >>"$curve_path"
+    "$p99_us" \
+    "$request_count" >>"$curve_path"
 }
 
 pgwire_target_concurrency_metric() {
@@ -1744,6 +1766,9 @@ REPORT
   fi
 
   cargo build -q -p gpu_db_engine --example p8_engine_pgwire_benchmark_endpoint
+  if [ "${GPU_DB_CH_BENCH_ENGINE_PGWIRE_CLIENT_DRIVER:-tokio-postgres/simple-query}" = "tokio-postgres/simple-query" ]; then
+    cargo build -q -p gpu_db_engine --example p8_persistent_pgwire_concurrency_runner
+  fi
   GPU_DB_P8_ENGINE_PGWIRE_LISTEN="$listen" \
     GPU_DB_P8_ENGINE_PGWIRE_FACTS="$facts_path" \
     GPU_DB_P8_ENGINE_PGWIRE_MAX_SESSIONS="$max_sessions" \
@@ -1822,22 +1847,23 @@ CSV
     unset GPU_DB_CH_BENCH_PHASE_FACTS_PATH
   done
   cat >>"$metrics_path" <<JSON
-{"kind":"engine_backed_pgwire_concurrency_decision","tier":"25pct","status":"closed_with_blocker","target":"engine_backed_pgwire_endpoint","profile":"gpu_db_retained_endpoint","client_driver":"psql/libpq","queries":["order_line_count_all","order_line_lookup_ol_o_id_multi_column"],"requested_concurrency_targets":"$(json_escape "$targets")","scheduler":"owner_thread_engine_command_queue","owner_thread_engine_scheduler":true,"client_io_workers_engine_owned_state":false,"load_path":"CREATE TABLE plus COPY FROM STDIN","phase_telemetry_recorded":true,"blocker":"persistent_pgwire_client_phase_profile_required_before_scheduler_batching","smallest_next_unblocker":"reuse PostgreSQL-compatible client sessions or add a libpq driver that does not fork one psql process per request, then compare endpoint queue/execute/write phases before retained scheduler batching","curve_artifact":"$curve_path","facts":"$facts_path"}
+{"kind":"engine_backed_pgwire_concurrency_decision","tier":"25pct","status":"closed","target":"engine_backed_pgwire_endpoint","profile":"gpu_db_retained_endpoint","client_driver":"$(json_escape "${GPU_DB_CH_BENCH_ENGINE_PGWIRE_CLIENT_DRIVER:-tokio-postgres/simple-query}")","queries":["order_line_count_all","order_line_lookup_ol_o_id_multi_column"],"requested_concurrency_targets":"$(json_escape "$targets")","scheduler":"owner_thread_engine_command_queue","owner_thread_engine_scheduler":true,"client_io_workers_engine_owned_state":false,"load_path":"CREATE TABLE plus COPY FROM STDIN","persistent_client_sessions":true,"phase_telemetry_recorded":true,"next_target":"client_harness_or_pgwire_response_path","decision":"persistent-client profile keeps endpoint/CUDA phases microsecond-scale while client-visible latency remains mostly outside engine execution; do not batch retained scheduler yet","curve_artifact":"$curve_path","facts":"$facts_path"}
 JSON
   cat >"$report_path" <<REPORT
 # P8 Engine-Backed Pgwire Concurrency Smoke
 
 - rows: $rows
-- status: closed_with_blocker
+- status: closed
 - target: engine-backed PostgreSQL-compatible TCP benchmark endpoint
 - profile: gpu_db_retained_endpoint
-- client_driver: \`psql\`/libpq
+- client_driver: \`${GPU_DB_CH_BENCH_ENGINE_PGWIRE_CLIENT_DRIVER:-tokio-postgres/simple-query}\`
 - requested_concurrency_targets: \`$targets\`
+- requests_per_client: \`${GPU_DB_CH_BENCH_PERSISTENT_REQUESTS_PER_CLIENT:-1}\`
 - scheduler: owner_thread_engine_command_queue
 - owner_thread_engine_scheduler: true
 - client_io_workers_engine_owned_state: false
-- next_blocker: persistent_pgwire_client_phase_profile_required_before_scheduler_batching
-- smallest_next_unblocker: reusable PostgreSQL-compatible client sessions for phase-profiled retained concurrency
+- next_target: client_harness_or_pgwire_response_path
+- decision: persistent-client phase profile does not justify retained scheduler batching yet
 - endpoint_facts: $facts_path
 - metrics_artifact: $metrics_path
 - curve_artifact: $curve_path
@@ -1852,30 +1878,27 @@ memory remain on that owner thread; no \`Send\`/\`Sync\` marker is forced onto
 retained device pointers.
 
 The scaled run seeds \`order_line\` through SQL-visible \`CREATE TABLE\` plus
-\`COPY FROM STDIN\`, then runs real overlapping \`psql\`/libpq sessions for the
-requested concurrency targets. The graph-ready curve records retained
+\`COPY FROM STDIN\`, then runs real overlapping persistent PostgreSQL-compatible
+simple-query sessions for the requested concurrency targets. The graph-ready curve records retained
 \`COUNT(*)\` and retained multi-column int4 lookup rows with p50/p95/p99,
 throughput, error count, correctness status, retained-route classification, and
 owner-thread scheduler evidence. The JSON metrics also attach retained endpoint
 phase aggregates for scheduler queue wait, engine execute, retained wall time,
 CUDA event time, D2H bytes, result materialization, and client response write.
 
-## Next Blocker
+## Decision
 
-The bounded phase profile is not a defensible basis for retained scheduler
-batching yet because each logical request still launches a separate \`psql\`
-process. At tiny scale the endpoint phases are microsecond-scale while
-client-visible latency is tens of milliseconds, so process/client overhead hides
-the owner-thread/CUDA scheduling boundary. The next implementation slice should
-reuse PostgreSQL-compatible client sessions, or add a libpq-based concurrency
-driver, then compare endpoint queue/execute/write phases before batching
-retained routes. 125% remains blocked by \`missing_partitioned_over_resident_execution\`.
+The persistent-client phase profile removes one \`psql\` process launch per
+logical request. If endpoint phases remain microsecond-scale while
+client-visible latency stays materially higher, the next optimization target is
+the client/harness or pgwire response path, not retained scheduler batching.
+125% remains blocked by \`missing_partitioned_over_resident_execution\`.
 REPORT
   kill "$server_pid" >/dev/null 2>&1 || true
   wait "$server_pid" >/dev/null 2>&1 || true
   trap - RETURN
   cat "$report_path"
-  echo "p8_ch_benchmark_engine_backed_pgwire_concurrency=closed_with_blocker scheduler=owner_thread_engine_command_queue next_blocker=persistent_pgwire_client_phase_profile_required_before_scheduler_batching artifact=$report_path"
+  echo "p8_ch_benchmark_engine_backed_pgwire_concurrency=closed scheduler=owner_thread_engine_command_queue next_target=client_harness_or_pgwire_response_path artifact=$report_path"
   return 0
 }
 

@@ -503,6 +503,8 @@ dependencies = [
  "gpu_db_types",
  "gpu_db_wal",
  "thiserror 1.0.69",
+ "tokio",
+ "tokio-postgres",
 ]
 
 [[package]]

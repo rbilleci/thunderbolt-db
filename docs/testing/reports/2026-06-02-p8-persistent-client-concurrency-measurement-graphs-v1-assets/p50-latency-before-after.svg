@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="470" viewBox="0 0 980 470">
+<rect width="100%" height="100%" fill="#ffffff"/>
+<text x="90" y="30" font-family="Arial" font-size="22" font-weight="700" fill="#1f2933">Persistent client p50 latency vs prior psql/request</text>
+<text x="90" y="50" font-family="Arial" font-size="12" fill="#52606d">64-row retained pgwire smoke, same SQL and concurrency schedule</text>
+<line x1="90" x2="942" y1="396.0" y2="396.0" stroke="#e5e7eb" stroke-width="1"/>
+<text x="80" y="400.0" text-anchor="end" font-family="Arial" font-size="12" fill="#6b7280">0</text>
+<line x1="90" x2="942" y1="327.6" y2="327.6" stroke="#e5e7eb" stroke-width="1"/>
+<text x="80" y="331.6" text-anchor="end" font-family="Arial" font-size="12" fill="#6b7280">13270</text>
+<line x1="90" x2="942" y1="259.2" y2="259.2" stroke="#e5e7eb" stroke-width="1"/>
+<text x="80" y="263.2" text-anchor="end" font-family="Arial" font-size="12" fill="#6b7280">26539</text>
+<line x1="90" x2="942" y1="190.8" y2="190.8" stroke="#e5e7eb" stroke-width="1"/>
+<text x="80" y="194.8" text-anchor="end" font-family="Arial" font-size="12" fill="#6b7280">39809</text>
+<line x1="90" x2="942" y1="122.4" y2="122.4" stroke="#e5e7eb" stroke-width="1"/>
+<text x="80" y="126.4" text-anchor="end" font-family="Arial" font-size="12" fill="#6b7280">53078</text>
+<line x1="90" x2="942" y1="54.0" y2="54.0" stroke="#e5e7eb" stroke-width="1"/>
+<text x="80" y="58.0" text-anchor="end" font-family="Arial" font-size="12" fill="#6b7280">66348</text>
+<line x1="90" x2="942" y1="396" y2="396" stroke="#111827"/>
+<line x1="90" x2="90" y1="54" y2="396" stroke="#111827"/>
+<line x1="90.0" x2="90.0" y1="396" y2="401" stroke="#111827"/>
+<text x="90.0" y="420" text-anchor="middle" font-family="Arial" font-size="12" fill="#374151">1</text>
+<line x1="232.0" x2="232.0" y1="396" y2="401" stroke="#111827"/>
+<text x="232.0" y="420" text-anchor="middle" font-family="Arial" font-size="12" fill="#374151">2</text>
+<line x1="374.0" x2="374.0" y1="396" y2="401" stroke="#111827"/>
+<text x="374.0" y="420" text-anchor="middle" font-family="Arial" font-size="12" fill="#374151">4</text>
+<line x1="516.0" x2="516.0" y1="396" y2="401" stroke="#111827"/>
+<text x="516.0" y="420" text-anchor="middle" font-family="Arial" font-size="12" fill="#374151">8</text>
+<line x1="658.0" x2="658.0" y1="396" y2="401" stroke="#111827"/>
+<text x="658.0" y="420" text-anchor="middle" font-family="Arial" font-size="12" fill="#374151">16</text>
+<line x1="800.0" x2="800.0" y1="396" y2="401" stroke="#111827"/>
+<text x="800.0" y="420" text-anchor="middle" font-family="Arial" font-size="12" fill="#374151">32</text>
+<line x1="942.0" x2="942.0" y1="396" y2="401" stroke="#111827"/>
+<text x="942.0" y="420" text-anchor="middle" font-family="Arial" font-size="12" fill="#374151">64</text>
+<text x="516.0" y="452" text-anchor="middle" font-family="Arial" font-size="13" fill="#374151">Concurrency</text>
+<text x="22" y="225.0" transform="rotate(-90 22 225.0)" text-anchor="middle" font-family="Arial" font-size="13" fill="#374151">p50 latency (us)</text>
+<polyline points="90.0,215.5 232.0,217.0 374.0,222.4 516.0,79.3 658.0,215.3 800.0,201.1 942.0,167.4" fill="none" stroke="#4d76b8" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="90.0" cy="215.5" r="4" fill="#4d76b8" stroke="#fff" stroke-width="1"/>
+<circle cx="232.0" cy="217.0" r="4" fill="#4d76b8" stroke="#fff" stroke-width="1"/>
+<circle cx="374.0" cy="222.4" r="4" fill="#4d76b8" stroke="#fff" stroke-width="1"/>
+<circle cx="516.0" cy="79.3" r="4" fill="#4d76b8" stroke="#fff" stroke-width="1"/>
+<circle cx="658.0" cy="215.3" r="4" fill="#4d76b8" stroke="#fff" stroke-width="1"/>
+<circle cx="800.0" cy="201.1" r="4" fill="#4d76b8" stroke="#fff" stroke-width="1"/>
+<circle cx="942.0" cy="167.4" r="4" fill="#4d76b8" stroke="#fff" stroke-width="1"/>
+<line x1="642" x2="664" y1="22" y2="22" stroke="#4d76b8" stroke-width="3"/>
+<text x="672" y="26" font-family="Arial" font-size="12" fill="#374151">psql/request COUNT</text>
+<polyline points="90.0,221.9 232.0,221.8 374.0,222.7 516.0,216.0 658.0,202.8 800.0,194.0 942.0,141.6" fill="none" stroke="#0a8f70" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="90.0" cy="221.9" r="4" fill="#0a8f70" stroke="#fff" stroke-width="1"/>
+<circle cx="232.0" cy="221.8" r="4" fill="#0a8f70" stroke="#fff" stroke-width="1"/>
+<circle cx="374.0" cy="222.7" r="4" fill="#0a8f70" stroke="#fff" stroke-width="1"/>
+<circle cx="516.0" cy="216.0" r="4" fill="#0a8f70" stroke="#fff" stroke-width="1"/>
+<circle cx="658.0" cy="202.8" r="4" fill="#0a8f70" stroke="#fff" stroke-width="1"/>
+<circle cx="800.0" cy="194.0" r="4" fill="#0a8f70" stroke="#fff" stroke-width="1"/>
+<circle cx="942.0" cy="141.6" r="4" fill="#0a8f70" stroke="#fff" stroke-width="1"/>
+<line x1="642" x2="664" y1="40" y2="40" stroke="#0a8f70" stroke-width="3"/>
+<text x="672" y="44" font-family="Arial" font-size="12" fill="#374151">psql/request lookup</text>
+<polyline points="90.0,391.7 232.0,392.3 374.0,390.3 516.0,383.8 658.0,373.6 800.0,354.0 942.0,330.6" fill="none" stroke="#d04f3f" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="90.0" cy="391.7" r="4" fill="#d04f3f" stroke="#fff" stroke-width="1"/>
+<circle cx="232.0" cy="392.3" r="4" fill="#d04f3f" stroke="#fff" stroke-width="1"/>
+<circle cx="374.0" cy="390.3" r="4" fill="#d04f3f" stroke="#fff" stroke-width="1"/>
+<circle cx="516.0" cy="383.8" r="4" fill="#d04f3f" stroke="#fff" stroke-width="1"/>
+<circle cx="658.0" cy="373.6" r="4" fill="#d04f3f" stroke="#fff" stroke-width="1"/>
+<circle cx="800.0" cy="354.0" r="4" fill="#d04f3f" stroke="#fff" stroke-width="1"/>
+<circle cx="942.0" cy="330.6" r="4" fill="#d04f3f" stroke="#fff" stroke-width="1"/>
+<line x1="642" x2="664" y1="58" y2="58" stroke="#d04f3f" stroke-width="3"/>
+<text x="672" y="62" font-family="Arial" font-size="12" fill="#374151">persistent COUNT</text>
+<polyline points="90.0,389.7 232.0,390.6 374.0,388.4 516.0,379.8 658.0,364.5 800.0,347.9 942.0,298.6" fill="none" stroke="#7c4d9e" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="90.0" cy="389.7" r="4" fill="#7c4d9e" stroke="#fff" stroke-width="1"/>
+<circle cx="232.0" cy="390.6" r="4" fill="#7c4d9e" stroke="#fff" stroke-width="1"/>
+<circle cx="374.0" cy="388.4" r="4" fill="#7c4d9e" stroke="#fff" stroke-width="1"/>
+<circle cx="516.0" cy="379.8" r="4" fill="#7c4d9e" stroke="#fff" stroke-width="1"/>
+<circle cx="658.0" cy="364.5" r="4" fill="#7c4d9e" stroke="#fff" stroke-width="1"/>
+<circle cx="800.0" cy="347.9" r="4" fill="#7c4d9e" stroke="#fff" stroke-width="1"/>
+<circle cx="942.0" cy="298.6" r="4" fill="#7c4d9e" stroke="#fff" stroke-width="1"/>
+<line x1="642" x2="664" y1="76" y2="76" stroke="#7c4d9e" stroke-width="3"/>
+<text x="672" y="80" font-family="Arial" font-size="12" fill="#374151">persistent lookup</text>
+</svg>
