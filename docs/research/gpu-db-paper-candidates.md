@@ -24,7 +24,7 @@ context, but should not be selected by the loop.
   PLOS ONE 2019.
   URL: `https://pmc.ncbi.nlm.nih.gov/articles/PMC6467383/`
   Why: batch-level optimization model for concurrent GPU database workloads.
-- `queued` — **Data Path Fusion in GPU for Analytical Query Processing**,
+- `reviewed` — **Data Path Fusion in GPU for Analytical Query Processing**,
   arXiv 2026.
   URL: `https://arxiv.org/abs/2605.10511`
   Why: modern GPU-driven data path fusion that combines IO, decompression, and
@@ -112,3 +112,28 @@ Append new candidates here as each paper is processed.
   He and Yu, PVLDB 2011.
   URL: `https://www.vldb.org/pvldb/vol4/p314-he.pdf`
   Why: pre-2015; keep only as historical context.
+- `queued` — **Themis: A GPU-accelerated Relational Query Execution Engine**,
+  Hong et al., PVLDB 2024.
+  URL: `https://www.vldb.org/pvldb/vol18/p426-hong.pdf`
+  Why: modern GPU relational engine with execution and load-balancing details
+  relevant to fused retained route design.
+- `queued` — **GPU Acceleration of SQL Analytics on Compressed Data**,
+  Huang et al., PVLDB 2025.
+  URL: `https://www.vldb.org/pvldb/vol19/p320-huang.pdf`
+  Why: evaluates compressed-data SQL execution on GPUs and may inform
+  dense-versus-compressed resident page benchmarks.
+- `queued` — **Path to GPU-Initiated I/O for Data-Intensive Systems**,
+  Torp et al., DaMoN 2025.
+  URL: `https://doi.org/10.1145/3736227.3736233`
+  Why: practical evaluation of GPU-initiated IO paths for data-intensive
+  systems, directly relevant to DPF-style over-resident execution.
+- `queued` — **Scaling GPU-Accelerated Databases beyond GPU Memory Size**,
+  Li et al., PVLDB 2025.
+  URL: `https://www.vldb.org/pvldb/vol18/p4518-li.pdf`
+  Why: modern out-of-GPU-memory database execution work relevant to P8
+  over-resident partitioning and CPU/GPU fallback.
+- `queued` — **Vortex: Overcoming Memory Capacity Limitations in
+  GPU-Accelerated Large-Scale Data Analytics**, Yuan et al., PVLDB 2024.
+  URL: `https://www.vldb.org/pvldb/vol18/p1250-yuan.pdf`
+  Why: multi-GPU/interconnect approach to capacity limits, useful for future
+  over-resident and multi-device planning.

@@ -148,6 +148,126 @@ network concurrency.
   micro-batches. This should be measured without adding transparent GPU memory
   swapping first.
 
+### 2026-06-02 - Data Path Fusion in GPU for Analytical Query Processing
+
+**Citation:** Tsuyoshi Ozawa and Kazuo Goda. "Data Path Fusion in GPU
+for Analytical Query Processing." arXiv:2605.10511, submitted 2026-05-11.
+Retrieved 2026-06-02 from `https://arxiv.org/pdf/2605.10511`. The
+preprint contains PVLDB placeholder metadata; final venue details are unknown.
+
+**Relevance tags:** GPU execution/batching; read throughput; query latency;
+data layout/storage; GPU IO; compression; retained/over-resident execution.
+
+**Core idea:** Data Path Fusion argues that GPU analytical engines lose a large
+part of their advantage when IO, decompression, and relational operators are
+split into separate host-orchestrated GPU kernels. DPF instead makes a fused
+CUDA kernel the data-path unit: the kernel issues GPU-initiated storage reads,
+decompresses pages, and runs filters, hash probes/builds, or aggregation before
+returning control to the host.
+
+The most important shift for this engine is treating "resident read execution"
+as a fully described pipeline rather than a sequence of local optimizations.
+DPF's gains come from removing host-device synchronization boundaries,
+eliminating intermediate materialization between stages, and making compression
+formats match GPU thread-level decompression. In the reported representative
+configuration, DPF improves end-to-end response over a GOLAP-like baseline by
+2.66x to 6.22x on selected TPC-H queries and 3.84x to 16.81x on selected SSB
+queries.
+
+**Concrete mechanisms:**
+
+- Each fused kernel combines BaM-based GPU-initiated IO, page decompression, and
+  one or more relational operations. The host still generates the query plan and
+  launches kernels, but does not orchestrate each IO/decompression/operator
+  stage.
+- A GPU-side pruning stage uses dictionaries and zone maps to produce pruned
+  page lists before the fused query kernels run.
+- Thread blocks advance through IO, decompression, and operation stages with
+  synchronization barriers inside the kernel. The IO stage can dedicate a subset
+  of warps to BaM request submission and completion polling, while all threads
+  participate in decompression and operator work.
+- Kernel launch configuration is tuned per query. The paper describes using
+  one block per SM with 128 threads for typical cases, and larger blocks such as
+  1,024 threads when more IO warps or compute parallelism are useful.
+- Column grouping is a scheduling choice. Related columns from the same table
+  can be read and decompressed together so decoded values co-reside in shared
+  memory where possible, avoiding global-memory intermediates before operator
+  execution.
+- Fixed-length integer columns use GPU-FOR-style mini-block compression, with
+  metadata for base value, bit width, and byte offset. Short fixed strings are
+  reinterpreted as integers; longer strings use the variable-length path.
+- Variable-length strings use FSST per page plus embedded row ids and an
+  auxiliary RID prefix-sum index so kernels can locate the page for a row id and
+  align pages across columns.
+- The loader sorts rows, builds zone maps, writes compressed column pages in two
+  passes, and records page offset, page size, and row-count prefix arrays. The
+  paper reports additional loading cost within 1.5% versus the baseline layouts
+  it evaluates.
+- Evaluation isolates components: BaM alone improves TPC-H query response by
+  1.12x to 1.51x versus CPU-initiated GDS in their setup, kernel fusion adds
+  mixed effects on TPC-H but 1.17x to 3.97x on SSB, and type-specific
+  compression provides the largest additional speedup in many cases by reducing
+  IO volume and making decompression fine-grained.
+
+**GPU DB mapping:** DPF is most directly applicable to the P8 retained and
+over-resident read path, not the current SQL-visible write path. Existing
+partitioned retained routes already avoid repeated H2D recopy for resident
+columns, but they are still shaped as separate planning, staging, kernel, and
+materialization steps. The transferable direction is a route descriptor that
+can generate a single fused retained kernel for a stable query family: load key
+or predicate vectors if needed, touch resident column groups, evaluate
+visibility/predicate logic, reduce or scatter results, and write compact
+per-request output buffers.
+
+For over-resident tables, DPF supports a stronger version of the current P8
+partition model: partition-local compressed column pages plus zone maps can be
+fed by GPU-initiated IO only for pages whose min/max metadata survives pruning.
+That would give the engine an explicit third read mode between fully resident
+device memory and CPU fallback: GPU-in-data-path cold or warm page execution.
+It should remain subordinate to SQL visibility, so the page metadata would need
+relation identity, schema generation, source WAL boundary, and visibility
+boundary just like resident snapshots.
+
+The compression mechanism also maps to P8's `int4`/`text` first slice. Dense
+`int4` resident buffers are good for today's kernels, but over-resident
+execution should benchmark GPU-FOR-like compressed page groups for scan-heavy
+aggregates. The string/RID design is relevant to future `text LIKE 'prefix%'`
+routes because it makes variable-length pages independently decodable by GPU
+thread blocks.
+
+**Risks and mismatches:** DPF is an analytical engine prototype, not a
+PostgreSQL-compatible MVCC serving runtime. It does not address WAL-before-
+visibility, DDL invalidation, snapshot retirement, pgwire response rings, or
+session concurrency. The fused kernels can become query-family-specific and may
+increase implementation complexity compared with the current narrow retained
+route kernels. BaM also assumes raw block-device access and GPU-initiated IO;
+that may not be available or desirable in the first production deployment.
+Build-side joins are limited by GPU memory, the prototype supports only selected
+compression schemes, and general decimal/floating-point support is incomplete.
+
+**Benchmark candidates:**
+
+- Build a "route-fusion" telemetry proof for one retained aggregate family:
+  count host/device synchronization points, kernel launches, intermediate
+  buffers, H2D/D2H bytes, and CUDA elapsed time before and after combining
+  predicate, visibility, and reduction into fewer kernels. Minimum gate:
+  identical SQL-visible result and lower launch/materialization count.
+- Add compressed resident-page experiments for `int4` aggregate scans using a
+  GPU-FOR-like page group beside the current dense resident layout. Expected
+  improvement: lower memory traffic or over-resident IO volume. Failure
+  condition: decompression overhead loses to dense scans at current row counts.
+- Prototype partition-local zone-map pruning for over-resident read planning:
+  route only candidate pages/partitions to GPU execution and record pruned
+  bytes, touched bytes, and result correctness. Minimum gate: stable pruning
+  metadata tied to source WAL and schema generation.
+- For future `text` retained routes, test an FSST/RID-index page layout against
+  the current offsets-plus-bytes resident representation for prefix predicates.
+  Measure decode bandwidth, output scatter cost, and memory footprint.
+- Treat GPU-initiated IO as a later-stage benchmark, not an immediate
+  dependency. First compare fused retained kernels over already-resident data;
+  then evaluate GPUDirect/BaM-style over-resident execution only if storage IO
+  becomes the measured bottleneck.
+
 ## Cross-Paper Synthesis
 
 No cross-paper synthesis exists yet. Add one after the first three to five
