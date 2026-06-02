@@ -2052,3 +2052,234 @@ risk for point lookup workloads if the GPU DB over-promotes cold keys.
   and remote memory. Include whether each tier supports direct GPU access,
   stable virtual addressing, page migration, async DMA, durable recovery, and
   cheap random access.
+
+### 2026-06-02 - PARQO penalty-aware robust plan selection
+
+**Citation:** Haibo Xiu, Pankaj K. Agarwal, and Jun Yang. "PARQO:
+Penalty-Aware Robust Plan Selection in Query Optimization." Proceedings of the
+VLDB Endowment 17(13):4627-4640, 2024.
+DOI: `https://doi.org/10.14778/3704965.3704971`. Retrieved 2026-06-02 from
+the PVLDB PDF and arXiv full version,
+`https://www.vldb.org/pvldb/vol17/p4627-xiu.pdf` and
+`https://arxiv.org/abs/2406.01526`.
+
+**Category:** query optimization / planning.
+
+**Relevance tags:** robust query optimization; route choice; penalty-aware
+planning; selectivity uncertainty; parametric query optimization; template
+cache; sensitivity analysis; fallback risk; GPU route admission.
+
+**Core idea:** PARQO reframes robust query optimization as minimizing expected
+penalty under uncertainty in selectivity estimates. Instead of asking only
+whether a candidate plan is cheap at the optimizer's current estimate, it lets
+the user define a penalty function relative to the true optimal plan under
+possible true selectivities, models likely selectivity errors from the
+workload, and selects a plan with lower expected penalty.
+
+The paper's practical contribution is the combination of three mechanisms:
+workload-informed error profiles over querylets, sensitivity analysis to find a
+small set of human-interpretable selectivity dimensions that most affect
+penalty, and candidate robust-plan selection over samples from the error
+distribution. PARQO is implemented on PostgreSQL 16.2 by exposing optimizer
+`Opt` and `Cost` calls and injecting plans/selectivities through hints, without
+changing the PostgreSQL executor.
+
+The evaluation shows why a route that looks locally cheap can be the wrong
+route when estimates are fragile. On JOB, PARQO-Sobol outperforms PostgreSQL
+on 19 of 33 query templates in the current-instance experiment, underperforms
+on 5, and gives a reported 3.23x overall workload speedup. The paper also
+reports 2.01x on DSB and 1.36x on STATS. In the parametric-query setting, it
+caches robust-query-optimization work per template and uses a KL-divergence
+test plus importance sampling to decide whether a previous robust-plan cache is
+safe to reuse for a new parameter binding.
+
+**Concrete mechanisms:**
+
+- PARQO takes a query template, candidate plan space, estimated selectivities,
+  and a distribution of likely true selectivities conditioned on those
+  estimates.
+- The default experimental penalty charges extra cost beyond the true optimal
+  only after a tolerance threshold. The framework also supports other penalties
+  such as probability of exceeding a tolerance, variance of extra cost, or a
+  highest-density-region worst case.
+- Error profiling uses querylets: single-table local-selection patterns,
+  two-table join patterns, and selected three-table patterns that capture some
+  dependency between local selections and joins without profiling every
+  possible subquery.
+- For each querylet, the system tracks estimated and actual cardinalities from
+  a workload and stores sampled pairs as an error profile.
+- The implementation builds low-estimate and high-estimate error models per
+  relevant selectivity dimension using kernel density estimation over
+  log-relative errors.
+- The final selectivity-error distribution is factorized across dimensions,
+  while two- and three-table querylets partly encode dependencies inside each
+  dimension's error model.
+- Sensitivity analysis is done on the penalty function, not merely on the
+  candidate plan's cost function. This asks which dimensions affect plan
+  optimality risk, not only which dimensions change the chosen plan's local
+  cost.
+- PARQO adapts Sobol's global variance-based sensitivity analysis to estimate
+  how much each selectivity dimension contributes to variance in expected
+  penalty. It also evaluates Morris as a cheaper alternative, but Sobol is the
+  stronger method in the experiments.
+- Sensitive dimensions are interpretable as selection/join condition
+  combinations, so they can become tuning hints: reanalyze stats, sample a
+  specific predicate/join, or inspect a dependency that likely causes bad plan
+  choice.
+- Robust-plan search samples true selectivity vectors from the learned error
+  distribution. For each sample, it asks the optimizer for the optimal plan and
+  caches the sample, plan, and true-optimal cost.
+- Unique sampled optimal plans form the candidate pool. PARQO estimates each
+  candidate's expected penalty over the cached samples and chooses the minimum.
+- For parametric query optimization, a query template can reuse previous
+  robust-optimization work. PARQO checks KL-divergence between the previous
+  and new conditional selectivity distributions before reusing sensitive
+  dimensions, candidate plans, and cached samples.
+- When cached samples are reused for a different parameter binding, importance
+  sampling reweights the expected-penalty estimate instead of rerunning all
+  optimizer calls.
+- Reported model footprints are small in the evaluated benchmarks: about
+  13.8 KB for JOB, 13.66 KB for DSB, and 5.84 KB for STATS. The up-front
+  robust optimization cost is substantial, for example about 2.13 hours for
+  all 33 JOB templates, so the technique is most attractive for repeated
+  templates.
+- The paper explicitly notes unresolved issues: no theoretical guarantee that
+  the chosen candidate is globally optimal for the robustness objective, a
+  possibility that the best robust plan is not optimal at any sampled point,
+  imperfect error profiles, and open problems around workload drift.
+
+**GPU DB mapping:** The GPU DB planner will face route choices with exactly the
+kind of asymmetric risk PARQO models. A resident GPU route may be fastest when
+cardinality, residency, queue delay, and transfer estimates are right, but it
+can be a bad choice when a predicate is less selective than expected, a
+partition is not resident, the GPU queue is saturated, a refresh is pending, or
+the CPU fallback path would avoid transfer and launch overhead. A penalty-aware
+route selector is a better fit than a single expected-latency score for these
+decisions.
+
+The most direct adaptation is to define GPU-route penalties in terms Richard
+cares about: p99 query latency above an SLO, write-path interference, refresh
+starvation, pinned-buffer budget exhaustion, and correctness-preserving
+fallback/rejection. For example, the planner could treat "route exceeded CPU
+fallback by more than 20%" or "route caused snapshot queue wait above a
+microsecond budget" as penalty events and track which estimate dimensions cause
+that risk.
+
+PARQO's sensitive dimensions map well to GPU DB route explainability. Instead
+of only logging "GPU route rejected" or "CPU fallback chosen," the planner
+should expose whether the fragile dimension is predicate selectivity, resident
+partition byte count, output cardinality, H2D/D2H bytes, GPU execution queue
+wait, refresh age, pinned-buffer availability, or mutation-invalidation
+probability. Those dimensions are actionable: refresh stats, split partitions,
+disable a fragile GPU route for a template, raise a cache budget, or set a
+tighter admission threshold.
+
+The parametric-cache mechanism is also important. The current retained routes
+are repeated templates with changing literals, such as point lookups, range
+filters, and grouped aggregates. PARQO suggests storing a plan/route profile per
+template, then reusing it only when a distribution-distance gate says the new
+literals are close enough to the previous route-risk distribution. This is
+cleaner than blindly caching exact encoded responses or blindly reusing a GPU
+route for all parameters of the same SQL shape.
+
+For high-concurrency sessions, the penalty model should include runtime state,
+not just static cardinality. A route profile may be safe at low load and unsafe
+when the GPU execution ring, response ring, or residency owner is saturated.
+The paper does not solve this dynamic case, but its framework can be extended:
+the "selectivity vector" becomes a broader route-risk vector containing
+estimated rows, resident bytes, queue depths, transfer bytes, and invalidation
+age.
+
+**Risks and mismatches:** PARQO is a query-optimizer paper, not a GPU database,
+transaction system, MVCC design, or runtime scheduler. It assumes the optimizer
+can provide exact-ish `Opt` and `Cost` interfaces under injected selectivities
+and candidate plans; the current GPU DB planner is far simpler and may not have
+enough alternative plans to justify the full machinery yet. The evaluation
+depends on PostgreSQL cost estimates and hints, not real GPU execution costs.
+
+The approach also has real overhead. Its up-front robust optimization cost is
+only amortized when query templates repeat many times or when queries are
+expensive enough that route mistakes dominate. For short OLTP point lookups,
+full Sobol/PARQO analysis at request time would be unacceptable; any GPU DB
+adaptation must be offline, background, or amortized by template.
+
+The error model is only as good as the profiling workload. PARQO's factorized
+model can miss long-range predicate/join dependencies, and GPU DB route risk
+will add dimensions the paper does not cover: memory residency, GPU queue
+pressure, host memory bandwidth, refresh state, and WAL/MVCC invalidation.
+Finally, choosing a robust plan may sacrifice best-case latency; that is
+desirable only when the penalty function matches product goals.
+
+**Benchmark candidates:**
+
+- Add a route-risk logging proof for retained routes. For each routed query,
+  record estimated rows, actual rows, resident bytes, output rows, GPU queue
+  wait, H2D/D2H bytes, execution time, response encoding time, fallback reason,
+  and whether CPU fallback would likely have beaten the GPU route.
+- Build a penalty-aware CPU/GPU route benchmark for one repeated template:
+  compare expected-latency routing, always-GPU, always-CPU, and
+  penalty-aware routing under skewed predicate literals. Minimum gate: the
+  penalty-aware route reduces p99 or bad-route count without losing more than a
+  defined amount of p50.
+- Add a route-template cache with a reuse gate. Start with simple distance
+  over literal selectivity bucket, resident-partition set, and queue-pressure
+  bucket; reject reuse when the route-risk vector changes too much.
+- Turn fallback explanations into sensitive-dimension counters: predicate
+  selectivity error, partition residency, transfer bytes, GPU queue pressure,
+  refresh/invalidation age, pinned-buffer pressure, and output cardinality.
+  Proof gate: the top risk dimension is visible for every rejected or
+  regretted GPU route.
+- For micro-batched retained lookups, test whether route reuse by template and
+  key-distribution bucket avoids bad batching decisions. Failure condition:
+  grouped GPU execution worsens p99 compared with CPU/index fallback for
+  sparse or highly skewed keys.
+- Create an offline "route replay" harness from query telemetry. Re-evaluate
+  historical requests under alternative penalty functions: p99-first,
+  write-interference-first, GPU-throughput-first, and balanced HTAP. The
+  useful output is not one universal route policy, but a measurable policy
+  frontier.
+
+### 2026-06-02 - Third Modern Batch Synthesis
+
+**Scope:** Oze, Caladan, virtual-memory-assisted tiered buffer management
+(`vmcache^n`), and PARQO.
+
+**Converging design tracks:** The last four modern papers push the same engine
+shape from different sides: do not let mutable shared state or hidden resource
+contention decide behavior implicitly. Oze makes dependency tracking explicit
+so long updates do not create unnecessary false conflicts. Caladan makes
+runtime pressure explicit at microsecond-scale resource boundaries. `vmcache^n`
+makes tier placement and migration explicit while preserving stable logical
+identity. PARQO makes route-choice risk explicit through penalty functions,
+error profiles, and reuse gates.
+
+For the GPU DB, the shared direction is a measured owner-domain system where
+each request carries enough metadata to explain its path: visibility boundary,
+dependency or invalidation relation, resident generation, tier location,
+runtime queue pressure, and route-risk dimensions. The product target is not
+"always push to GPU"; it is predictable admission and routing where the engine
+knows when the GPU route is valid, when it is fast, and when it is too fragile.
+
+**Category gaps:** The journal now has good coverage in tiering, runtime
+scheduling, robust route choice, GPU execution, and MVCC/read snapshots. The
+next few entries should keep pulling OLTP write-path/concurrency and MVCC
+storage forward: TicToc, Cicada, ERMIA, Fast Serializable MVCC, Shirakami,
+Aria, Chiller, or Memory-Optimized MVCC for Disk-Based Systems are better
+balance choices than another GPU OLAP paper unless a specific GPU mechanism is
+needed.
+
+**Benchmark priorities:**
+
+- Add a route decision record for every retained query: snapshot generation,
+  resident partition set, tier location, queue wait, transfer bytes, output
+  rows, risk/fallback reason, and actual elapsed time.
+- Build a small policy comparison harness for CPU fallback versus retained GPU
+  execution under skewed parameters and queue pressure.
+- Tie tier movement to admission: refresh, promotion, demotion, and eviction
+  should expose partial progress, batch size, and saturation reasons before
+  readers observe a new generation.
+- Measure whether bounded active-session scheduling protects short retained
+  reads and writes while long refresh/scan work continues to make progress.
+- Preserve WAL-before-visibility and immutable snapshot publication as the
+  hard correctness boundary; every reviewed mechanism should fit around that
+  boundary rather than weakening it.
