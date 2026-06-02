@@ -10,7 +10,7 @@ This queue is maintained by the literature-review loop. Status values:
 
 ### GPU query execution and batching
 
-- `queued` — **Concurrent Analytical Query Processing with GPUs**,
+- `reviewed` — **Concurrent Analytical Query Processing with GPUs**,
   Wang et al., PVLDB 2014.
   URL: `https://www.vldb.org/pvldb/vol7/p1011-wang.pdf`
   Why: directly relevant to concurrent GPU query scheduling and resource
@@ -70,3 +70,15 @@ This queue is maintained by the literature-review loop. Status values:
 ## Newly Discovered Queue
 
 Append new candidates here as each paper is processed.
+
+- `queued` — **The Yin and Yang of Processing Data Warehousing Queries on GPU
+  Devices**, Yuan et al., PVLDB 2013.
+  URL: `https://www.vldb.org/pvldb/vol6/p817-yuan.pdf`
+  Why: predecessor YDB work with GPU data-warehousing operator profiling,
+  direct host memory access, compression, and query execution tradeoffs cited
+  by MultiQx-GPU.
+- `queued` — **High-Throughput Transaction Executions on Graphics Processors**,
+  He and Yu, PVLDB 2011.
+  URL: `https://www.vldb.org/pvldb/vol4/p314-he.pdf`
+  Why: GPU transaction batching and isolation mechanisms may inform write-path
+  batching, MVCC visibility, and short-task GPU execution limits.
