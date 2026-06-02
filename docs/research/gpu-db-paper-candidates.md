@@ -45,7 +45,7 @@ mechanical sympathy, multi-tier cache/data placement, or query optimization.
 
 ### MVCC, snapshots, and visibility
 
-- `queued` — **Scalable and Robust Snapshot Isolation for High-Performance
+- `reviewed` — **Scalable and Robust Snapshot Isolation for High-Performance
   Storage Engines**, PVLDB 2023.
   URL: `https://www.vldb.org/pvldb/vol16/p1426-alhomssi.pdf`
   Why: scalable snapshot isolation, long-reader robustness, and GC ideas.
@@ -314,3 +314,14 @@ Append new candidates here as each paper is processed.
   URL: `https://www.usenix.org/conference/nsdi19/presentation/kagami`
   Why: microsecond-scale request scheduling and preemption; relevant to
   separating short retained reads from long mutation, scan, or refresh work.
+- `queued` — **Memory-Optimized Multi-Version Concurrency Control for
+  Disk-Based Database Systems**, Freitag et al., PVLDB 2022.
+  URL: `https://www.vldb.org/pvldb/vol15/p2797-freitag.pdf`
+  Why: Umbra MVCC design cited by the LeanStore snapshot-isolation paper;
+  relevant to disk-based MVCC, version-chain metadata, and snapshot visibility
+  without sacrificing hot-path performance.
+- `queued` — **Diva: Making MVCC Systems HTAP-Friendly**, Kim et al.,
+  SIGMOD 2022.
+  URL: `https://doi.org/10.1145/3514221.3526125`
+  Why: vDriver successor cited by the LeanStore paper; relevant to precise
+  MVCC garbage collection and reducing long-reader damage in HTAP workloads.

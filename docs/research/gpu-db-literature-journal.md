@@ -38,6 +38,159 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-02 - Scalable and Robust Snapshot Isolation for High-Performance Storage Engines
+
+**Citation:** Adnan Alhomssi and Viktor Leis. "Scalable and Robust
+Snapshot Isolation for High-Performance Storage Engines." PVLDB 16(6),
+2023, pp. 1426-1438. doi:10.14778/3583140.3583157. Retrieved
+2026-06-02 from `https://www.vldb.org/pvldb/vol16/p1426-alhomssi.pdf`.
+
+**Category:** MVCC / snapshot / visibility.
+
+**Relevance tags:** snapshot isolation; MVCC visibility; long-reader
+robustness; garbage collection; tombstones; buffer-managed storage; HTAP;
+write path; WAL and recovery.
+
+**Core idea:** The paper shows that ordinary MVCC snapshot isolation can
+still let a single long-running read collapse OLTP throughput because old
+versions and tombstones remain physically on the hot access path. The authors
+argue that robust HTAP needs more than "readers do not block writers": the
+commit protocol, version storage, tombstone tracking, and garbage collection
+must make old snapshots cheap for current transactions to ignore.
+
+Their LeanStore design combines three mechanisms. Ordered Snapshot Instant
+Commit (OSIC) gives buffer-managed engines instant commit without revisiting
+the write set while retaining cheap visibility checks. The Graveyard Index
+moves tombstones that only long-running OLAP snapshots can still see out of
+the main OLTP index. Adaptive version storage keeps ordinary old versions in
+per-worker delta indexes, but converts frequently updated tuples to an inline
+FatTuple format so long-running scans do not traverse unbounded chains. In the
+paper's main robustness claim, LeanStore sustains about 2 million TPC-C
+transactions per second on a 64-core server while a long-running OLAP scan is
+active, with logging enabled.
+
+**Concrete mechanisms:**
+
+- OSIC assigns every transaction a start timestamp and commit timestamp from a
+  global logical clock. Each worker processes transactions sequentially and
+  appends commit timestamps to a fixed-size per-worker Commit Log.
+- Visibility uses the worker-local transitive commit invariant. For a version
+  written by worker `w` with start timestamp `vts`, a reader with start
+  timestamp `ts` treats it as visible iff `LCB(w, ts) > vts`, where `LCB` is
+  the last commit timestamp by that worker before `ts`.
+- Commit log entries are protected by per-worker mutexes while drawing and
+  publishing commit timestamps, avoiding races where a reader misses a just
+  committed transaction.
+- Readers compute `LCB` lazily only for workers whose versions they actually
+  encounter, and cache the answer per snapshot. This avoids constructing a
+  full vector of in-progress transactions for every snapshot.
+- The commit log is bounded by the number of workers; when full, redundant
+  entries are removed while preserving entries that are the `LCB` for active
+  snapshots.
+- The system tracks OLTP and OLAP transaction watermarks separately. The
+  oldest OLTP timestamp can advance even while a long OLAP snapshot remains
+  open, enabling tombstone movement and precise pruning that a single global
+  oldest-snapshot watermark would block.
+- Every user index has a matching Graveyard Index. Tombstones no longer needed
+  by OLTP transactions are moved from the main index to the graveyard, so OLTP
+  range or queue-like lookups remain logarithmic in currently visible tuples.
+- Long OLAP scans merge the main index with the Graveyard Index for the leaf
+  range they scan, paying extra work only for old snapshots that may still see
+  deleted tuples.
+- Tombstone Indexes act as per-worker append-optimized todo lists keyed by the
+  deleting transaction timestamp, so GC can range-scan tombstones that are
+  ready to move or physically remove.
+- The default version layout stores the latest version in the main index and
+  older versions in per-worker Delta Indexes keyed by transaction metadata.
+  Delta Indexes double as append-friendly version stores and GC todo lists.
+- Frequently updated tuples are detected with a small per-tuple chain-length
+  heuristic and converted to FatTuples, which inline versions near the latest
+  value so precise GC and long-reader reconstruction avoid random off-row I/O.
+- Before evicting pages containing FatTuples, LeanStore decomposes them back
+  into the chained Delta Index format to avoid leaking old versions on cold
+  pages.
+- WAL remains the recovery source of truth. The auxiliary Commit Log,
+  Graveyard Index, Tombstone Index, and Delta Index are rebuilt or truncated
+  during recovery rather than treated as durable authority; FatTuple changes in
+  main indexes are logged normally.
+- The implementation uses first-writer-wins snapshot isolation. The paper
+  notes serializability can be layered with known techniques, but does not
+  implement serializable isolation.
+
+**GPU DB mapping:** This is a direct warning for the current GPU DB snapshot
+plan: immutable retained snapshots are not enough if old snapshot state remains
+on the mutation owner's hot path. GPU-resident readers may be cheap, but their
+CPU-side MVCC and index remnants can still degrade writes, deletes, queue-like
+tables, prefix scans, and refresh work unless the engine separates "visible to
+long readers" from "must be considered by fresh OLTP work."
+
+OSIC maps cleanly to the owner-domain model in
+`11-high-throughput-query-runtime.md`. A mutation owner or partition owner can
+publish a monotonic generation/timestamp for committed batches, while each
+owner keeps a compact commit-log summary for visibility checks. Retained read
+snapshots should not require copying a large active-transaction vector per
+session; the logical snapshot handle should be a timestamp plus cached
+per-owner `LCB` answers discovered on demand.
+
+The separate OLTP/OLAP watermarks are especially relevant to P8. The engine
+should distinguish short transactional snapshots, retained read snapshots, and
+long analytical or over-resident snapshots. A long GPU scan should not pin all
+tombstones and obsolete row versions in hot CPU or GPU structures used by
+fresh lookups. The equivalent of the Graveyard Index could be a cold old-
+snapshot side structure for tombstones, deleted keys, and old resident segment
+metadata that only long snapshots consult.
+
+FatTuple suggests a concrete version-layout rule for mixed workloads:
+ordinary rows can use append-friendly off-row deltas or WAL-backed version
+records, but frequently updated rows that long snapshots repeatedly scan may
+need an inline compact history window or a GPU-friendly delta bundle. This
+could matter for hot counters, queue heads, account balances, and catalog or
+metadata rows whose version chains would otherwise hurt snapshot reads.
+
+The WAL/recovery separation reinforces the current architecture. GPU resident
+snapshots, graveyard-like side structures, per-owner visibility summaries, and
+delta indexes should be rebuildable acceleration state unless explicitly made
+durable. Visibility may be published only after WAL safety, but the runtime can
+still use auxiliary summaries to avoid expensive per-read or per-commit work.
+
+**Risks and mismatches:** OSIC assumes worker threads process transactions one
+after another and that each committed version records the writer worker and
+start timestamp. A GPU DB with partition owners, async IO workers, and GPU
+execution workers must define which owner identity participates in visibility;
+using transient network workers would be wrong. The paper targets snapshot
+isolation, not full serializability. Graveyard Indexes are described for
+B-Tree indexes and row-store LeanStore, so a columnar/GPU-resident layout needs
+different physical side structures. FatTuple may bloat hot pages, and the
+paper observes extra page misses in out-of-memory experiments. Finally, the
+reported throughput comes from LeanStore on CPU/NVMe, not GPU execution, so
+the transferable claim is the visibility and GC shape, not the absolute
+numbers.
+
+**Benchmark candidates:**
+
+- Add a visibility-summary experiment to the MVCC tuple store: compare current
+  `Visibility { read_txn_id }` checks with a per-owner start/commit generation
+  cache for retained reads. Minimum gate: identical visible tuple sets under
+  insert/update/delete and WAL replay tests.
+- Build a queue-like table benchmark modeled after TPC-C `neworder`: insert at
+  one end, delete from the other, hold one long retained snapshot open, and
+  measure fresh lookup/delete latency as tombstones accumulate. Failure
+  condition: p95 lookup latency grows linearly with old tombstone count.
+- Prototype an old-snapshot side structure for deleted keys in the CPU
+  relational index layer. Fresh snapshots skip it; long retained snapshots
+  merge it only when needed. Measure write overhead, fresh lookup latency, and
+  long-snapshot scan correctness.
+- Track separate snapshot classes in telemetry: short OLTP, retained GPU read,
+  long analytical scan, refresh, and recovery. Expose oldest timestamp per
+  class and use the gap between short and long readers to drive GC eligibility.
+- Add a hot-row version-chain stress test with one long snapshot and repeated
+  updates to a small key set. Compare off-row delta chains with an inline
+  compact-history representation before considering GPU-resident encoding.
+- For P8 resident snapshots, measure whether long GPU scans can pin CPU
+  tombstones, deleted-key metadata, or resident segment generations long enough
+  to harm write throughput. The proof gate is stable write/read latency while
+  one long scan remains open.
+
 ### 2026-06-02 - Datacenter RPCs can be General and Fast
 
 **Citation:** Anuj Kalia, Michael Kaminsky, and David G. Andersen.
