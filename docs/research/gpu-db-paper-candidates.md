@@ -475,9 +475,10 @@ Append new candidates here as each paper is processed.
   Why: hybrid disk/in-memory transactional architecture cited by the Umbra
   MVCC paper; useful as a contrast point for hot working-set placement and
   contention reduction across CPU memory and durable storage.
-- `queued` — **Polaris: Enabling Transaction Priority in Optimistic
+- `reviewed` — **Polaris: Enabling Transaction Priority in Optimistic
   Concurrency Control**, Ye et al., PACMMOD/SIGMOD 2023.
-  URL: `https://doi.org/10.1145/3589296`
+  URL: `https://doi.org/10.1145/3588724`
+  PDF: `https://chenhao-ye.github.io/publication/polaris/polaris.pdf`
   Why: priority-aware OCC cited by PreemptDB; relevant to combining request
   priority with conflict handling instead of only changing worker scheduling.
 - `queued` — **Towards Optimal Transaction Scheduling**, Cheng et al.,
@@ -504,3 +505,18 @@ Append new candidates here as each paper is processed.
   Why: DuckDB external aggregation work cited by Resource-Adaptive Query
   Execution; useful for paged intermediate state, spill-resistant aggregates,
   and over-resident query execution under bounded memory.
+- `queued` — **Transaction Scheduling: From Conflicts to Runtime Conflicts**,
+  Cao et al., SIGMOD 2023.
+  URL: `https://doi.org/10.1145/3603164`
+  Preprint:
+  `https://www.research.ed.ac.uk/files/360117816/Transaction_Scheduling_CAO_DOA16082022_AFV.pdf`
+  Why: modern transaction scheduling paper from SIGMOD 2023; relevant to
+  contrasting conflict-graph scheduling with runtime resource conflicts and
+  owner-queue admission for mixed GPU DB transaction classes.
+- `queued` — **Improving Optimistic Concurrency Control through Transaction
+  Batching and Operation Reordering**, Ding, Kot, and Gehrke, PVLDB 2018.
+  URL: `https://doi.org/10.14778/3282495.3282502`
+  PDF: `https://www.vldb.org/pvldb/vol12/p169-ding.pdf`
+  Why: OCC batching and operation-reordering work; useful for deciding when
+  GPU DB write admission should batch full transaction stages rather than only
+  WAL, index, or GPU refresh substeps.

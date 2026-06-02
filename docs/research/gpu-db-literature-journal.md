@@ -3190,3 +3190,202 @@ stale hints cannot route a query to an invalid resident snapshot.
   then resume without re-executing from the beginning. Failure condition:
   context switching requires serializing the full operator state or breaks
   WAL/resident generation ordering.
+
+### 2026-06-03 - Polaris priority-aware optimistic concurrency control
+
+**Citation:** Chenhao Ye, Wuh-Chwen Hwang, Keren Chen, and Xiangyao Yu.
+"Polaris: Enabling Transaction Priority in Optimistic Concurrency Control."
+PACMMOD/SIGMOD 2023, Article 44. doi:10.1145/3588724. Retrieved 2026-06-03
+from the author PDF,
+`https://chenhao-ye.github.io/publication/polaris/polaris.pdf`.
+
+**Category:** transaction processing / write path and concurrency control.
+
+**Relevance tags:** optimistic concurrency control; transaction priority;
+tail latency; starvation avoidance; high-contention OLTP; reservation metadata;
+abort-aware priority; liveness; owner-queue admission.
+
+**Core idea:** Polaris extends Silo-style OCC with a small amount of
+pessimism so higher-priority transactions are protected from repeated aborts
+without turning the whole protocol into locking. A high-priority transaction
+can reserve records it reads or writes. Lower-priority transactions may still
+read reserved records, but they cannot write them; transactions at the same
+priority remain optimistic, and an even higher-priority transaction can
+preempt an older lower-priority reservation.
+
+The practical motivation is tail latency under contention. Plain OCC detects
+conflicts late, so a long or unlucky transaction can repeatedly execute and
+abort while short writers keep changing its read set. Polaris uses priority
+to make that conflict visible earlier only where it matters. In the paper's
+YCSB evaluation, static priority makes high-priority p999 latency 13x lower
+than low-priority p999 latency. With an abort-aware priority policy, Polaris
+reports 2x lower YCSB-A p999 latency than Silo at Zipfian theta 0.99 with
+1.8% throughput loss, and 1.9x higher throughput plus 17x lower p999 latency
+than Silo at theta 1.5. In TPC-C with one warehouse, Polaris bounds p999
+latency within about 1 ms while Silo reaches 4.9 ms, with Polaris still
+outperforming evaluated 2PL variants on throughput.
+
+**Concrete mechanisms:**
+
+- Polaris keeps Silo's per-record transaction id and adds priority,
+  priority-version, and reference-count fields that fit in one atomically
+  updated 64-bit word in the implementation.
+- A reservation is identified by the record's priority and priority version.
+  Multiple transactions at the same priority can reserve the same record, but
+  cross-priority reservations do not coexist.
+- On record access, a transaction reserves the record if its priority is
+  higher than zero. If the record is already reserved at the same priority,
+  it increments the reference count. If the record is reserved at a lower
+  priority, it preempts that reservation by installing its own priority and
+  resetting the reference count. If a higher-priority reservation is present,
+  reads can continue without reservation, but writes abort.
+- Commit still follows Silo's shape: acquire latches for the write set, then
+  validate the read set by checking data versions. Polaris adds a priority
+  check before write-set latch acquisition; a transaction cannot latch a
+  record whose reservation priority is higher than its own.
+- Data version remains the serializability guard. Priority fields guide
+  conflict handling but do not determine whether the data read was current.
+- Reservation cleanup decrements the reference count for read-only records,
+  clears priority when the last reservee leaves, and increments the priority
+  version. For written records, cleanup removes reservations because the data
+  version has changed.
+- The lowest-priority fast path avoids reservation overhead when both the
+  record and transaction priority are zero, so the common all-low-priority
+  case behaves close to Silo.
+- The reported field split is 10 bits for reference count, 4 bits for
+  priority, 4 bits for priority version, 1 latch bit, and 45 bits for data
+  version. The paper treats priority-version wraparound as a possible priority
+  inversion, not a serializability failure.
+- The paper's default DB-assigned priority policy starts each transaction at
+  an initial priority, leaves it there until an abort threshold is reached,
+  and then increments priority every fixed number of additional aborts.
+  User-specified priority can be layered above DB-assigned priority.
+- The formal proof argues that committed transactions serialize in the order
+  in which they acquire all write-set latches, that priorities return to zero
+  when no transactions are active, and that a transaction will not be aborted
+  if it is the only active highest-priority transaction.
+- Durability is considered mostly orthogonal; the paper points back to Silo's
+  epoch and logging constructs rather than evaluating WAL/checkpoint behavior.
+
+**GPU DB mapping:** Polaris is useful for the GPU DB write path because it
+separates "priority" from "thread scheduling." Recent runtime papers suggest
+preempting or slicing long work, but Polaris shows that high-priority progress
+also needs conflict semantics. A short commit-critical mutation, a repeatedly
+aborted user transaction, or a high-priority control transaction should not
+only jump an owner queue; it may also need metadata that prevents lower-priority
+writers from invalidating its work after it has already paid execution cost.
+
+The reservation idea maps to per-row, per-key, or per-partition conflict
+metadata in a future OCC/MVCC owner. GPU DB does not need to adopt Silo's exact
+TID layout, but the shape is attractive: keep version/generation as the
+correctness authority, and keep priority/reservation fields as advisory
+conflict-control metadata that can be rebuilt or ignored during recovery if
+needed. For CPU canonical indexes, a compact reservation sidecar keyed by row
+id or hot key could protect high-priority update transactions without blocking
+read-only retained snapshots.
+
+Abort-aware priority also maps to admission. A request that has retried due to
+conflicts should accumulate priority within a bounded class rather than being
+treated like a fresh low-value request forever. The owner-domain runtime can
+combine this with queue class and service-share telemetry: once a transaction
+crosses an abort threshold, it receives higher conflict priority and possibly
+higher owner-queue priority, but not unlimited access to GPU, pinned-buffer, or
+WAL budgets.
+
+For retained GPU reads, Polaris is mostly a write-path lesson. Read-only
+snapshots should not reserve hot records just because they are long; that
+would recreate long-reader write damage. But refresh builders, CPU fallback
+transactions, and read-write transactions that will publish new visibility may
+benefit from lightweight reservations at the point where they can otherwise be
+starved by fresh low-priority writes.
+
+The paper also offers a benchmarkable middle ground between deterministic
+batching and full preemption. GPU DB can keep optimistic execution inside a
+priority class while adding reservation only when the route has crossed a
+retry or service-latency threshold. That fits a transaction engine that wants
+high throughput in the common uncontended path but predictable p99/p999 for
+urgent or repeatedly aborted work.
+
+**Risks and mismatches:** Polaris is built on single-version Silo-style OCC,
+not the current GPU DB MVCC tuple store. Its serializability proof depends on
+write-set latch acquisition and read-set validation over per-record TIDs; a
+multi-version design with retained snapshots, partition owners, and WAL
+publication needs a different proof. The paper does not evaluate durable WAL
+flush cost, checkpointing, recovery replay, GPU execution, PostgreSQL protocol
+state, distributed clocks, or million-session admission.
+
+Reservations can hurt throughput when too many transactions become high
+priority, because lower-priority writers abort earlier and the lowest-priority
+fast path stops applying. The bit-budget discussion also assumes fewer than
+about a thousand concurrent worker transactions for the 10-bit reference
+count; GPU DB's 1M logical-session goal must distinguish logical sessions from
+bounded active transactions. Finally, a reservation sidecar can become a hot
+cache line or map bottleneck unless it is partitioned by owner, key range, or
+resident segment.
+
+**Benchmark candidates:**
+
+- Add a CPU-only OCC/MVCC conflict-priority prototype for one hot-key update
+  route. Compare FIFO retry, queue priority only, and Polaris-style
+  reservation priority. Minimum gate: identical committed histories and lower
+  p99/p999 latency for repeatedly aborted transactions under skew.
+- Track abort count and retry age as explicit transaction metadata. Promote
+  priority after configurable thresholds, then measure throughput, p50, p99,
+  p999, abort count distribution, and starvation under YCSB-like hot keys and
+  TPC-C-like new-order/payment mixes.
+- Prototype a reservation sidecar for CPU canonical row ids or hot index keys:
+  version/generation remains the correctness guard, while priority and
+  reservation generation decide whether a lower-priority writer may proceed.
+  Failure condition: stale reservation metadata can make an invalid version
+  visible or survive WAL recovery as durable authority.
+- Test priority-class admission across owner queues and conflict metadata
+  together. Expected improvement: urgent commit-critical or repeatedly
+  aborted transactions start sooner and abort less often than with queue
+  priority alone.
+- Add a "too many high-priority transactions" stress case. Required telemetry:
+  fraction of active transactions above base priority, reservation preempts,
+  lower-priority aborts, fast-path misses, and throughput regression.
+- Keep long retained read snapshots out of the reservation path. Benchmark a
+  long read-only GPU snapshot plus hot writes and verify that read priority
+  does not block fresh writes unless the route is explicitly read-write.
+
+### 2026-06-03 - Fifth Modern Batch Synthesis
+
+**Scope:** Low-latency transaction scheduling via userspace interrupts,
+resource-adaptive query execution with paged memory management, and Polaris.
+
+**Converging design tracks:** These three papers converge on class-aware work
+rather than a single global queue. PreemptDB attacks CPU service latency for
+urgent short work, resource-adaptive execution turns memory into a priced and
+revocable resource, and Polaris gives conflict metadata a priority dimension
+instead of relying on retry luck. For GPU DB, that suggests each active request
+needs a route class, resource budget, conflict priority, and preemption or
+suspendability contract before it enters an owner domain.
+
+The second convergence is that priority must remain bounded and explainable.
+Preemption can starve long refreshes, adaptive memory can overfit to noisy SLA
+curves, and Polaris can degrade throughput when many transactions become high
+priority. The design response is not "always prioritize short work"; it is
+telemetry-backed service shares, abort-aware promotion, and explicit overload
+or demotion reasons at each queue, memory, and conflict boundary.
+
+**Category gaps:** Recent coverage is now strong in runtime scheduling,
+tiering/admission, and transaction priority. The journal still needs more
+direct work on durable logging/checkpointing for high-throughput engines,
+explicit MVCC garbage collection under long retained snapshots, and modern
+GPU execution papers after the next non-analytics slot is filled.
+
+**Benchmark priorities:**
+
+- Mixed long/short runtime benchmark: long refresh or scan work saturates
+  workers while urgent retained reads and commit-critical transactions arrive.
+  Measure start latency, p99/p999, service share, and deferred
+  non-preemptible spans.
+- Value-aware resource admission benchmark: retained lookups, COPY chunks,
+  refresh builders, and long scans compete for pinned memory, response buffers,
+  and execution-memory chunks under explicit SLA penalties.
+- Priority-aware conflict benchmark: hot-key updates with retry-age promotion,
+  reservation sidecars, and queue priority compared against plain FIFO retry.
+- Cross-boundary telemetry gate: every request should report route class,
+  active resource budget, queue wait, conflict priority, preemption/suspend
+  status, and the reason for any rejection, fallback, or demotion.
