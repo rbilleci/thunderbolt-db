@@ -158,6 +158,12 @@ P8 should turn unknowns into benchmarks:
 - When does GPU resident index lookup beat resident scan?
 - What refresh granularity is worth implementing first: table, segment, column,
   or delta?
+- What read micro-batch size amortizes GPU launch overhead without harming p50
+  latency?
+- Which queue-drain policy works best for retained lookups: count-only,
+  microsecond-only, or dual-trigger?
+- When should saturated GPU queues fall back to CPU versus reject with explicit
+  overload?
 
 ## First Deliverables
 
@@ -212,6 +218,13 @@ No resident GPU state can become visible unless it is tied to the catalog table
 OID, a source WAL transaction boundary, a read timestamp/transaction boundary,
 and a validity flag that mutations can clear before the mutated rows become
 visible.
+
+The storage engine publishes resident state as immutable read snapshots. The
+high-throughput runtime may hold those snapshots by reference, route them to
+read workers, and micro-batch compatible retained reads, but it must not mutate
+published resident buffers or visibility metadata in place. Mutation, DDL,
+refresh, eviction, and memory-pressure events publish newer generations or
+invalidate existing ones according to the cache manager state machine.
 
 ### Physical Layout
 
@@ -273,6 +286,12 @@ resident segment has either been rebuilt beyond that safe boundary or marked
 invalid. A valid resident segment must never be the only remaining copy of data
 needed for crash recovery or historical correctness.
 
+Refresh and mutation publication should use deterministic batch boundaries when
+possible: a COPY chunk, mutation batch flush, refresh tick, or explicit
+maintenance command may publish a new generation. Readers that already hold an
+older compatible snapshot can finish; new readers must use the newest valid
+generation or fall back.
+
 ### Index Strategy
 
 The first durable correctness index remains CPU rebuildable from WAL and table
@@ -281,6 +300,11 @@ compact key-order vector over one supported `int4` key column in the resident
 segment. Equality and batched equality lookups can use that vector to identify
 candidate resident row ordinals, then apply the normal visibility and predicate
 checks over resident buffers.
+
+The resident key-order vector is also the first natural input to read
+micro-batching: multiple same-shape equality lookups over the same snapshot can
+be grouped into one GPU launch or one coordinated set of launches, then
+scattered back to waiting client responses by request id.
 
 Range and text-prefix predicates may initially use resident column scans. A
 future resident index family can be admitted only after benchmarks show scan
@@ -307,6 +331,8 @@ The cost inputs are:
 - cold-transfer bytes avoided
 - expected CPU index path cost
 - explicit fallback risk reason
+- current read micro-batch depth and latency budget
+- GPU execution queue depth and expected kernel-launch amortization
 
 The current implementation exposes accepted/rejected resident route decisions
 through status and telemetry and consumes accepted decisions from the normal
@@ -335,6 +361,12 @@ resident-kernel launches when the local driver exposes event APIs, and the lates
 accepted route records that event timing separately from the metrics-derived
 milliseconds. Operators can compare estimates, metric deltas, and event timing
 without treating planned-only, rejected, or fallback routes as timed executions.
+
+Runtime batching decisions are deliberately outside the storage cache itself.
+The storage planner says whether a route is valid and estimates cost. The
+high-throughput runtime decides whether to execute the route immediately, wait
+briefly for a compatible micro-batch, or fall back/reject under pressure. See
+`docs/architecture/11-high-throughput-query-runtime.md`.
 
 ### Recovery And Warmup
 
@@ -448,6 +480,12 @@ cache admission/eviction/invalidation/refresh, operator-triggered warmup, and
 scheduler-friendly maintenance. It reports durable GPU pages, autonomous cache
 daemon scheduling, external orchestration, broad retained expressions, and
 broader CUDA event timing as explicit gaps rather than production claims.
+
+The next runtime-oriented P8 slice should connect these resident route decisions
+to versioned read snapshot publication and compatible read micro-batching. The
+benchmark-only encoded response cache proves the owner-thread queue boundary,
+but the production path should execute from immutable retained snapshots rather
+than caching exact response bytes.
 
 `scripts/run_p8_ch_benchmark_residency_probe.sh` extends that local proof into a
 CH-benCHmark-derived benchmark harness with 25/50/100/200% RTX 3090 residency

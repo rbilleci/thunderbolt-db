@@ -33,13 +33,16 @@ This project uses a layered documentation model so implementation can proceed qu
 9. **P8 GPU-optimized storage design**
    - `docs/architecture/10-p8-gpu-optimized-storage-engine.md`
 
-10. **Interfaces and implementation contracts**
+10. **High-throughput query runtime**
+   - `docs/architecture/11-high-throughput-query-runtime.md`
+
+11. **Interfaces and implementation contracts**
    - `docs/interfaces/replication-interfaces.md`
    - `docs/interfaces/execution-interfaces.md`
    - `docs/interfaces/transaction-interfaces.md`
    - `docs/interfaces/error-interfaces.md`
 
-11. **Decision history (ADRs)**
+12. **Decision history (ADRs)**
    - `docs/adr/README.md`
    - `docs/adr/ADR-001-log-boundary-is-wal.md`
    - `docs/adr/ADR-002-deterministic-batch-ordering.md`
@@ -47,19 +50,19 @@ This project uses a layered documentation model so implementation can proceed qu
    - `docs/adr/ADR-004-replicator-interface.md`
    - `docs/adr/ADR-005-snapshot-install-snapshot-strategy.md`
 
-12. **Delivery scope and sequencing**
+13. **Delivery scope and sequencing**
    - `docs/roadmap/v0-v1.md`
    - `docs/roadmap/no-nvidia-bootstrap-plan.md`
    - `docs/roadmap/no-gpu-bootstrap-closeout-review.md`
 
-13. **Compatibility and validation gates**
+14. **Compatibility and validation gates**
    - `docs/compatibility/matrix.md`
    - `docs/testing/parity-and-jepsen-plan.md`
 
-14. **Operations runbooks**
+15. **Operations runbooks**
    - `docs/operations/runbooks.md`
 
-15. **Process guardrails**
+16. **Process guardrails**
    - `docs/GPU_GUARDRAILS.md`
    - `.github/pull_request_template.md`
 
