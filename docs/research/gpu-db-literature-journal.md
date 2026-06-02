@@ -2453,3 +2453,187 @@ and replay.
   timestamp chosen at commit, and resident generation validated against both.
   Failure condition: any stale retained read can pass after a WAL-visible
   mutation invalidates its segment.
+
+### 2026-06-03 - Shirakami hybrid long-transaction MVCC and short-transaction OCC
+
+**Citation:** Takayuki Tanabe, Shinichi Umegane, Suguru Arakawa,
+Ryoji Kurosawa, Takashi Hoshino, Hideyuki Kawashima, Masahiro
+Tanaka, and Takashi Kambayashi. "Shirakami: A Hybrid Concurrency
+Control Protocol for Tsurugi Relational Database System." arXiv
+2303.18142v2, 2026. Retrieved 2026-06-03 from
+`https://arxiv.org/abs/2303.18142` and
+`https://arxiv.org/pdf/2303.18142`.
+
+**Category:** transaction processing / write path and MVCC / visibility.
+
+**Relevance tags:** hybrid concurrency control; long read-write transactions;
+short OLTP transactions; MVCC; OCC; epoch scheduling; write preservation;
+phantom avoidance; serializable HTAP; WAL batching; snapshot publication.
+
+**Core idea:** Shirakami targets a workload shape that ordinary OLTP
+benchmarks underrepresent: a production database that must run many short
+transactions while also allowing long read-write business transactions such as
+billing, cost calculation, and batch updates to commit during online activity.
+The system combines two protocols instead of dynamically switching one
+protocol. Shirakami-LTX handles long read-write transactions with a wider
+multiversion view-serializable scheduling space, while Shirakami-OCC keeps a
+Silo-like fast path for short transactions.
+
+The main transfer for GPU DB is the explicit separation of transaction classes.
+Long work is not hidden inside the same optimistic short-transaction path and
+then left to repeatedly abort. It declares enough future write intent to let
+short transactions see conflicts early, starts on epoch boundaries, and uses
+priority plus order forwarding so some apparent conflicts can still serialize
+validly. Short transactions keep the cheap OCC path, but they validate against
+long-transaction write preservation and register enough read metadata for long
+transactions to avoid breaking already-committed short reads.
+
+The paper implements Shirakami in Tsurugi, a production-grade relational
+database system. It reports Tsurugi completing the phone billing benchmark
+where PostgreSQL times out at high online concurrency, with 19.7x lower
+latency than PostgreSQL at 16 online threads. It also reports 5.6x better
+elapsed time on a bill-of-materials benchmark at serializable behavior, while
+PostgreSQL READ COMMITTED is faster but anomalous. In direct Shirakami
+key-value experiments, S-LTX can outperform S-OCC by up to 680x for rare, long
+mixed transactions, but LTX overhead is visible when "long" transactions are
+short or frequent.
+
+**Concrete mechanisms:**
+
+- Transactions are classified as S-LTX for long read-write work or S-OCC for
+  short work. S-LTX has higher priority than S-OCC, and earlier S-LTX
+  transactions have priority over later S-LTX transactions.
+- Shirakami maps transaction serialization to epochs. S-OCC serializes at its
+  closing epoch; S-LTX serializes at its opening epoch. Within one epoch,
+  S-LTX transactions are placed before S-OCC transactions.
+- S-LTX transactions are staged for the next epoch, share an epoch snapshot,
+  and register write preservation before they begin. Epoch advancement is
+  briefly stopped while write preservation is registered so short OCC reads do
+  not miss the declared future write area.
+- Write preservation is table-level. The paper chooses coarse granularity
+  because long transactions with SQL subqueries may not know exact record keys
+  before execution, and record-level declaration would be expensive for large
+  transactions.
+- S-LTX reads check write preservation and record full-scan, range-scan, or
+  point-search read information. Writes are buffered locally until validation.
+- Order forwarding lets a lower-priority S-LTX transaction that read a version
+  later overwritten by a higher-priority S-LTX move before that writer in the
+  serialization order, if the epoch lower-bound checks still allow it. This
+  admits schedules outside conflict serializability and ordinary MVTO.
+- S-LTX commit waits for relevant higher-priority transactions, applies order
+  forwarding where possible, aborts when the computed epoch would violate a
+  lower bound, and validates writes against registered reader epochs.
+- S-OCC follows a Silo-like read and commit path, but its commit validation
+  also checks conflicting write preservation. It registers read epochs so S-LTX
+  write validation can detect when forwarding would invalidate short
+  transactions.
+- Phantom avoidance is split by protocol. S-LTX stores predicate-read metadata
+  for full scans, range scans, and point searches, and writer-side validation
+  aborts writes that would create phantoms. S-OCC either observes live write
+  preservation, validates nodes after committed S-LTX writes, or is protected
+  by read clues already recorded for committed S-OCC predicate reads.
+- The system distinguishes unsafe and safe in-memory snapshots. Unsafe epoch
+  snapshots may become inconsistent if later order forwarding changes the
+  epoch's serialization contents, so readers can still abort. Safe snapshots
+  exist when an epoch closes without order forwarding; read-only transactions
+  can use them as a read-only optimization.
+- Epoch logging passes precommitted records to Limestone asynchronously. The
+  implementation uses WAL, pre-write, non-visible write omission, and
+  separately maintained snapshot storage for read-friendly persisted images.
+- Write-preservation objects use optimistic locking: a 64-bit word contains a
+  lock bit and version counter, and fixed-length arrays sized by possible
+  concurrent workers avoid dynamic-size races.
+- Tsurugi's surrounding architecture includes a SQL engine with DAG/dataflow
+  execution, a transaction pool, catalog cache, a Masstree-derived concurrent
+  index called Yakushima, and a log datastore that separates WAL-like log
+  storage from asynchronous snapshot storage.
+
+**GPU DB mapping:** Shirakami strengthens the case for classifying requests
+before admission. GPU DB should not push short retained reads, COPY chunks,
+long refreshes, over-resident scans, and future read-write analytical
+transactions through one undifferentiated owner queue. Each request should
+carry a class: short retained read, short mutation, COPY batch, long refresh,
+long read-only scan, or long read-write transaction. The class should decide
+priority, queue, snapshot requirements, write intent, and whether retry,
+fallback, or delay is acceptable.
+
+Write preservation maps to a GPU DB "future invalidation intent" record. A
+long refresh or long read-write transaction could declare table, partition, or
+predicate-family write intent before it starts so short reads and writes know
+whether they are racing a higher-priority epoch. Table-level declarations are
+too coarse for all GPU DB workloads, but they are a useful first proof for
+tables whose retained generations will be rebuilt wholesale. Later, partition
+or segment-level write preservation should reduce false positives.
+
+The epoch model maps directly to immutable retained snapshot publication. A
+mutation or residency owner can publish generation `N`, stage long work for
+generation `N+1`, and decide whether a snapshot is safe for wait-free retained
+reads. If order forwarding or long write work can still rewrite an epoch's
+logical contents, GPU DB should not treat the generation as a reusable
+read-only retained snapshot for new requests.
+
+Shirakami also suggests a clearer admission rule for long work. Long
+transactions should not be allowed to occupy scarce pinned buffers, GPU queue
+slots, response buffers, or mutation-owner locks while repeatedly losing to
+short traffic. Either reserve coarse write intent and give the long work
+priority at a known epoch boundary, or route it to a lower-priority background
+class whose progress is explicitly best effort.
+
+The safe/unsafe snapshot split is valuable for P8. Current resident snapshots
+should be treated as safe only when their source boundary cannot be reordered
+by pending mutation, refresh, or long transaction work. Unsafe snapshots may
+still be useful for speculative CPU work or internal refresh construction, but
+they should not become SQL-visible GPU route handles unless validation and
+abort paths are complete.
+
+**Risks and mismatches:** Shirakami is a CPU in-memory transaction engine, not
+a GPU execution system. Its write preservation is table-level, which may
+create too many false conflicts for high-throughput retained reads unless GPU
+DB narrows the declaration to partition, segment, predicate family, or route
+family. The protocol assumes the system can identify long transactions before
+execution, which is hard for ad hoc SQL unless the planner or application
+declares the route class.
+
+The reported Tsurugi/PostgreSQL comparisons use different client APIs and
+benchmark implementations, and the paper explicitly says the absolute numbers
+should be read as workload-level comparisons rather than identical-program
+database bakeoffs. The Shirakami-only experiments are more directly about the
+protocol, but they bypass SQL. The paper also shows LTX overhead when long
+transactions are short or frequent, so blindly routing medium work to the long
+path could hurt latency.
+
+Order forwarding is subtle. GPU DB cannot let logical serialization changes
+race WAL durability, resident generation publication, response emission, or
+GPU snapshot reuse. Any adaptation must prove that WAL-before-visibility,
+phantom avoidance, resident invalidation, and replay all agree on the same
+logical order.
+
+**Benchmark candidates:**
+
+- Add request-class admission telemetry: short retained read, short mutation,
+  COPY batch, long refresh, long read-only scan, and long read-write
+  transaction. Proof gate: every request has exactly one class, one owner
+  queue, one priority policy, and one overload/fallback vocabulary.
+- Prototype table-level write preservation for one long refresh or bulk update
+  path. Short reads should either see the declared future invalidation and
+  choose a compatible snapshot/fallback, or report a precise conflict reason.
+  Failure condition: a short retained read can route to a generation that a
+  higher-priority long write has already declared unsafe.
+- Compare table-level versus partition-level write preservation in a synthetic
+  mixed workload: many short point reads/writes plus one long partition refresh
+  or read-write scan. Required metrics: false conflict count, long-work commit
+  latency, short-work p99 latency, abort/retry count, and queue occupancy.
+- Add a safe/unsafe resident generation state to a CPU-only prototype. Safe
+  generations can serve retained reads; unsafe generations require validation
+  or stay internal to refresh. Minimum gate: generation state transitions are
+  deterministic under mutation, refresh, abort, and WAL replay tests.
+- Build a long-transaction starvation test: keep short writes arriving while a
+  long refresh or read-write transaction tries to commit. Compare ordinary OCC
+  retry, epoch-priority admission, and write-preservation staging. Failure
+  condition: the long path either starves or protects itself by letting short
+  p99 latency explode without explicit admission telemetry.
+- Extend route telemetry with phantom-risk dimensions for range/prefix routes:
+  predicate family, read range, declared write area, source generation, and
+  whether a future write could have invalidated the predicate result. Proof
+  gate: every range or prefix retained route can explain why concurrent
+  writes cannot create a phantom visible to its SQL result.

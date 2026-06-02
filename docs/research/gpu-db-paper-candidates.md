@@ -359,8 +359,8 @@ Append new candidates here as each paper is processed.
   heterogeneous long/short transaction workloads; relevant to dependency
   tracking, false-positive conflict reduction, and long retained refresh or
   write transactions.
-- `queued` — **Shirakami: A Hybrid Concurrency Control Protocol for Tsurugi
-  Relational Database System**, Kambayashi et al., arXiv 2023.
+- `reviewed` — **Shirakami: A Hybrid Concurrency Control Protocol for Tsurugi
+  Relational Database System**, Tanabe et al., arXiv 2026.
   URL: `https://arxiv.org/abs/2303.18142`
   Why: production-oriented hybrid protocol combining long-transaction MVCC and
   short-transaction OCC, cited in the same Tsurugi/RSS research ecosystem and
@@ -424,3 +424,21 @@ Append new candidates here as each paper is processed.
   Why: robust parametric query optimization using executed-query evidence;
   useful as a contrast to PARQO's cost-model-based route cache for repeated
   SQL templates.
+- `queued` — **Plor: General Transactions with Predictable, Low Tail
+  Latency**, Chen et al., SIGMOD 2022.
+  URL: `https://doi.org/10.1145/3514221.3517839`
+  Why: Shirakami cites Plor as modern transaction scheduling work; relevant to
+  predictable low-tail mutation and admission paths under mixed transaction
+  sizes.
+- `queued` — **Low-Latency Transaction Scheduling via Userspace Interrupts:
+  Why Wait or Yield When You Can Preempt?**, Huang et al.,
+  PACMMOD/SIGMOD 2025.
+  URL: `https://doi.org/10.1145/3725319`
+  Why: modern userspace-interrupt transaction scheduling cited by Shirakami;
+  relevant to preempting or isolating long mutation/refresh work from short
+  retained reads.
+- `queued` — **Massively Parallel Multi-Versioned Transaction Processing**,
+  Qian and Goel, OSDI 2024.
+  URL: `https://www.usenix.org/conference/osdi24/presentation/qian`
+  Why: Shirakami cites this modern MVCC transaction-processing work; relevant
+  to high-core-count versioned execution and future owner/partition scaling.
