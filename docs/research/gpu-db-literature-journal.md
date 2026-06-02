@@ -1727,3 +1727,149 @@ would need their own conservative summaries.
   epoch-bounded GC. Required evidence: graph memory remains bounded,
   validation p99 is visible, and old retained generations retire when the
   oldest active epoch advances.
+
+### 2026-06-02 - Caladan: Mitigating Interference at Microsecond Timescales
+
+**Citation:** Joshua Fried, Zhenyuan Ruan, Amy Ousterhout, and Adam Belay.
+"Caladan: Mitigating Interference at Microsecond Timescales." OSDI 2020,
+pp. 281-297. Retrieved 2026-06-02 from the USENIX publication page and
+PDF, `https://www.usenix.org/conference/osdi20/presentation/fried` and
+`https://www.usenix.org/system/files/osdi20-fried.pdf`.
+
+**Category:** runtime / HFT / session scale.
+
+**Relevance tags:** microsecond scheduling; tail latency; admission control;
+queueing delay; CPU interference; worker ownership; green threads;
+memory-bandwidth pressure; hyperthreading; request concurrency.
+
+**Core idea:** Caladan argues that latency-sensitive services cannot rely on
+static resource partitioning, slow tail-latency feedback, or seconds-scale
+convergence when interference changes over microseconds. Instead, it dedicates
+a scheduler core to continuous control-signal polling and uses fast core
+reallocation to preserve both high CPU utilization and microsecond-level tail
+latency.
+
+The paper is not a database concurrency-control design, but it is directly
+relevant to the GPU DB runtime target. Its strongest transferable lesson is
+that admission should react to the resource boundary that is actually
+saturating, on the timescale where queueing damage begins. For this engine,
+the equivalent boundaries are network IO workers, mutation owners, read
+snapshot rings, GPU execution workers, pinned-buffer pools, host-memory
+placement, and response rings.
+
+**Concrete mechanisms:**
+
+- Caladan separates latency-critical tasks from best-effort tasks and lets
+  latency-critical work hold guaranteed cores while borrowing burstable cores
+  when queueing delay or interference requires it.
+- A dedicated scheduler core runs controllers every 10 microseconds. It polls
+  queueing delay, request processing time, global memory bandwidth, per-core
+  LLC miss rates, and voluntary-yield notices.
+- The top-level allocator grants extra cores when a task's queueing delay
+  exceeds a per-task threshold, subject to constraints from the memory-bandwidth
+  and hyperthread controllers.
+- The memory-bandwidth controller detects global DRAM saturation, attributes
+  bandwidth use through sampled per-core LLC misses, and revokes one core at a
+  time from the highest-offending best-effort task until saturation clears.
+- The hyperthread controller watches request processing time for
+  latency-critical work. When a request exceeds its threshold, Caladan can ban
+  the sibling hyperthread and park it with `mwait` until the long request
+  completes or capacity constraints require unbanning.
+- Caladan uses a KSCHED kernel module to make scheduling operations fast:
+  per-core shared-memory command regions, multicast IPIs, asynchronous command
+  issue, remote-core execution of expensive scheduling work, remote performance
+  counter reads, and shallow idle states that wake on cache-line writes.
+- Applications run in a Shenango-derived runtime with green threads,
+  kernel-bypass networking, SPDK storage support, shared queue telemetry, and
+  work stealing across currently allocated cores.
+- The runtime must expose internal request concurrency. If a latency-critical
+  task cannot run more independent request work when granted cores, fast
+  reallocation cannot help it recover lost capacity.
+- In the evaluation, Caladan reports convergence to a new resource
+  configuration in about 20 microseconds versus 10-20 seconds for Parties.
+  When memcached is colocated with a garbage-collecting best-effort workload,
+  the paper reports an 11,000x reduction in 99.9th percentile latency during
+  GC cycles, from 580 ms under Parties* to 52 microseconds under Caladan.
+- The paper also reports up to 560,000 core reallocations per second in an
+  11-latency-critical-task experiment, while a Linux-mechanism variant
+  bottlenecks near 285,000 allocations per second.
+
+**GPU DB mapping:** Caladan reinforces the runtime document's bounded-owner
+model, but pushes it toward control loops that are explicit and fast enough to
+matter. A 1M logical-session target does not imply 1M active workers; it means
+many idle or waiting sessions with a bounded active subset whose pressure is
+measured at each owner domain. Queueing-delay telemetry should exist for
+network ingress rings, mutation rings, read snapshot rings, GPU execution
+rings, residency maintenance, and response rings, with rejection or fallback at
+the narrowest saturated boundary.
+
+The paper's LC/BE distinction maps to GPU DB request classes. Short retained
+reads, short point writes, COPY admission, resident refresh, over-resident
+scans, CPU fallback, and background maintenance should not compete as one
+undifferentiated queue. Short read/write work needs latency-critical budgets;
+refresh, warmup, eviction, long scans, and speculative GPU-tail work should be
+throttleable when they create CPU memory-bandwidth, pinned-buffer, or GPU queue
+interference.
+
+Caladan's requirement that tasks expose internal concurrency is especially
+important. The GPU DB cannot benefit from extra IO or CPU worker capacity if
+the mutation owner, parser, retained route executor, or response encoder hides
+all work behind one serialized path. The production design should expose
+request-level or chunk-level concurrency where correctness allows it, while
+keeping mutation visibility and WAL publication in owner domains.
+
+The memory-bandwidth controller suggests a host-tier metric the current P8
+plan does not yet emphasize enough: CPU-side filtering, MVCC traversal,
+residency refresh, response encoding, and COPY parsing can all saturate memory
+bandwidth even when GPU kernels are fast. Route admission should include CPU
+memory-bandwidth pressure and host-cache miss telemetry, not only GPU queue
+depth and H2D/D2H bytes.
+
+KSCHED is not directly portable, but its shape is useful. Hot-path scheduling
+should prefer preallocated shared state, asynchronous control operations,
+batched wakeups, and remote/local ownership clarity. For this engine, that
+means reusable command/response buffers, explicit queue state, low-allocation
+work handoff, and measurable wakeup/dispatch latency before considering more
+intrusive kernel or runtime changes.
+
+**Risks and mismatches:** Caladan is an OS/runtime scheduler, not a SQL
+database, MVCC engine, or GPU execution system. It does not solve
+WAL-before-visibility, catalog invalidation, transaction isolation, snapshot
+retirement, or CUDA stream scheduling. Its strongest results rely on a custom
+runtime, kernel-bypass networking/storage, a kernel module, modified Linux IPI
+support, disabled power-saving features, and a single-socket evaluation setup.
+
+The paper also requires applications to expose concurrency in green threads.
+That is a better fit for internal workers than for arbitrary pgwire clients,
+transactions, prepared statements, COPY protocol state, and error recovery.
+NUMA is explicitly left for future work, and transient-execution risks across
+hyperthread siblings are not solved. Finally, a dedicated scheduler core may
+be too heavy for an early GPU DB runtime slice; the transferable idea is the
+control-loop design, not the immediate adoption of Caladan's full runtime.
+
+**Benchmark candidates:**
+
+- Add no-behavior-change queueing telemetry for each planned owner boundary:
+  network ingress, mutation, read snapshot, residency, GPU execution, response,
+  pinned-buffer acquisition, and CPU fallback. Minimum gate: p50/p95/p99 queue
+  wait and service time are visible per request class.
+- Build a request-class admission proof with short retained reads, COPY chunks,
+  refresh work, and over-resident scans. Expected improvement: long refresh or
+  scan work cannot inflate p99 latency for admitted short reads/writes without
+  an explicit saturation reason.
+- Add host-memory-pressure telemetry to over-resident route planning: CPU scan
+  time, estimated memory bandwidth, cache-miss proxy if available, bytes
+  compacted, and GPU-tail bytes. Failure condition: CPU prefiltering can
+  silently starve IO or mutation work.
+- Prototype a bounded active-session scheduler: keep many logical pgwire
+  sessions idle, but allow only a configured number of active requests per
+  class and per owner. Measure bytes per idle session, active request memory,
+  queue wait, rejection/fallback reasons, and single-session throughput.
+- Create a microsecond-scale maintenance throttle experiment where resident
+  refresh and eviction run beside retained lookup batches. The proof gate is
+  stable lookup p99 with refresh progress visible; the failure condition is
+  refresh work monopolizing host memory bandwidth or response buffers.
+- Measure whether exposing more internal concurrency helps or hurts: compare
+  one serialized retained route executor with request/chunk-level workers that
+  still publish through owner domains. Required metrics: throughput, p99
+  latency, owner queue wait, correctness status, and allocation count.

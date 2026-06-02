@@ -76,9 +76,9 @@ mechanical sympathy, multi-tier cache/data placement, or query optimization.
   URL: `https://www.usenix.org/conference/nsdi19/presentation/ousterhout`
   Why: user-level scheduling and CPU allocation for latency-sensitive services;
   relevant to multiplexed IO and query workers under 1M logical sessions.
-- `queued` — **Caladan: Mitigating Interference at Microsecond Timescales**,
+- `reviewed` — **Caladan: Mitigating Interference at Microsecond Timescales**,
   OSDI 2020.
-  URL: `https://www.usenix.org/conference/osdi20/presentation/shenango`
+  URL: `https://www.usenix.org/conference/osdi20/presentation/fried`
   Why: runtime scheduling and resource allocation for microsecond-scale tail
   latency, useful for admission and worker ownership design.
 - `reviewed` — **Demikernel: An Operating System Architecture for
@@ -366,3 +366,16 @@ Append new candidates here as each paper is processed.
   useful as a contrast point for Oze, mutation batching, and whether
   predeclared GPU DB write/read sets can improve concurrency without forcing
   long retained refresh work to stall short transactions.
+- `queued` — **Arachne: Core-Aware Thread Management**, Qin et al.,
+  OSDI 2018.
+  URL: `https://www.usenix.org/conference/osdi18/presentation/qin`
+  Why: user-level core-aware thread management cited by Caladan; useful for
+  exposing internal request concurrency to a scheduler without adopting a full
+  Caladan-style interference-control stack.
+- `queued` — **ZygOS: Achieving Low Tail Latency for Microsecond-scale
+  Networked Tasks**, Prekas, Kogias, and Bugnion, SOSP 2017.
+  URL: `https://dl.acm.org/doi/10.1145/3132747.3132780`
+  PDF: `https://marioskogias.github.io/docs/zygos.pdf`
+  Why: work-conserving dataplane scheduler for high-connection-count
+  microsecond services, including Silo/TPC-C evaluation; relevant to pgwire
+  IO-worker and request-stealing choices.
