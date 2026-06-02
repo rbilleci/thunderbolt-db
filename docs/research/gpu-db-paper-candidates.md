@@ -49,7 +49,7 @@ mechanical sympathy, multi-tier cache/data placement, or query optimization.
   Storage Engines**, PVLDB 2023.
   URL: `https://www.vldb.org/pvldb/vol16/p1426-alhomssi.pdf`
   Why: scalable snapshot isolation, long-reader robustness, and GC ideas.
-- `queued` — **Read-Safe Snapshots: An abort/wait-free serializable read
+- `reviewed` — **Read-Safe Snapshots: An abort/wait-free serializable read
   method for read-only transactions on mixed OLTP/OLAP workloads**, Information
   Systems 2024.
   URL: `https://www.sciencedirect.com/science/article/pii/S0306437924000437`
@@ -346,3 +346,16 @@ Append new candidates here as each paper is processed.
   Why: combines learned optimizer search with DBMS operator restrictions and
   beam search; relevant to adding learned GPU route suggestions without
   surrendering deterministic planner guardrails.
+- `queued` — **Oze: Decentralized Graph-Based Concurrency Control for
+  Long-Running Update Transactions**, Nemoto et al., PVLDB 2025.
+  URL: `https://vldb.org/pvldb/vol18/p2321-nemoto.pdf`
+  Why: modern multi-version serialization-graph concurrency control for
+  heterogeneous long/short transaction workloads; relevant to dependency
+  tracking, false-positive conflict reduction, and long retained refresh or
+  write transactions.
+- `queued` — **Shirakami: A Hybrid Concurrency Control Protocol for Tsurugi
+  Relational Database System**, Kambayashi et al., arXiv 2023.
+  URL: `https://arxiv.org/abs/2303.18142`
+  Why: production-oriented hybrid protocol combining long-transaction MVCC and
+  short-transaction OCC, cited in the same Tsurugi/RSS research ecosystem and
+  relevant to GPU DB mixed OLTP/analytical ownership boundaries.

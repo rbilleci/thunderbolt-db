@@ -1344,3 +1344,238 @@ must be tied to session class and SLA rather than applied globally.
   compare against deterministic planner baselines. A learned route may be used
   only if it improves tail latency or throughput without increasing
   correctness fallback, invalidation retry, or overload ambiguity.
+
+### 2026-06-02 - Read-safe snapshots for abort/wait-free serializable reads
+
+**Citation:** Takamitsu Shioi, Takashi Kambayashi, Suguru Arakawa,
+Ryoji Kurosawa, Satoshi Hikida, and Haruo Yokota. "Read-safe
+snapshots: An abort/wait-free serializable read method for read-only
+transactions on mixed OLTP/OLAP workloads." Information Systems 124,
+2024, article 102385. doi:10.1016/j.is.2024.102385. Retrieved
+2026-06-02 from the ScienceDirect open-access article,
+`https://www.sciencedirect.com/science/article/pii/S0306437924000437`.
+Also read with the closely related arXiv preprint "Serializable HTAP
+with Abort-/Wait-free Snapshot Read,"
+`https://arxiv.org/abs/2201.07993`.
+
+**Category:** MVCC / snapshot / visibility.
+
+**Relevance tags:** serializable HTAP; MVCC; read-only snapshots;
+replica visibility; dependency tracking; SSI; long analytical reads;
+abort-free reads; wait-free reads; snapshot publication.
+
+**Core idea:** Read-Safe Snapshots (RSS) try to give read-only OLAP
+transactions a serializable MVCC view without forcing either the OLTP
+writer side or the analytical reader side to abort or wait because of
+the reader's participation. The key observation is that a read-only
+transaction does not always need the newest committed version of every
+item. It needs a prepared set of committed versions whose dependency
+region cannot be reached from transactions outside that set in a way
+that would create a serialization cycle.
+
+The paper formalizes such a set as RSS: a set of committed transactions
+`P` where no transaction outside `P` can reach a transaction inside `P`
+through the multiversion dependency graph. A protected read-only
+transaction then reads the most recent versions created by transactions
+inside `P`. The authors show that adding those protected read-only
+transactions preserves version-ordered conflict serializability, because
+their dependency edges cannot close a cycle across the RSS boundary.
+
+For practical construction, the paper specializes the idea to systems
+whose OLTP side already uses SSI. Instead of tracking every possible
+dependency, it uses start/end transaction state plus concurrent
+rw-antidependencies. At a history prefix, transactions are classified
+into `Done`, `Clear`, `Obscure`, and active/undone regions. The
+algorithm starts with all `Clear` transactions and adds certain
+transactions outside `Clear` when they have outgoing dependencies to
+`Clear`. SSI's dangerous-structure rule is then used to argue that the
+resulting region is still unreachable from outside and can be served as
+RSS.
+
+**Concrete mechanisms:**
+
+- RSS defines a serializable snapshot as a dependency-graph region, not
+  as "latest committed at timestamp T." This makes it acceptable for a
+  read-only query to choose shortly previous versions when the latest
+  versions could participate in an anomaly.
+- Protected read-only transactions are outside RSS but read only the
+  newest versions written by transactions inside RSS. They do not
+  perform additional read-set validation at execution time.
+- The SSI-based construction uses `Done(p)` for transactions ended by a
+  prefix and `Clear(p)` for transactions that ended before all currently
+  undone transactions began. Transactions outside `Clear` but with
+  rw-dependencies into `Clear` may be added to RSS.
+- The implementation records outgoing rw-dependencies, transaction
+  start/commit/abort information, and dependency graph state. In the
+  multinode PostgreSQL prototype, this metadata is shipped through WAL
+  logical messages to a read-only replica.
+- The replica runs an RSS construction invoker, maintains active/done
+  state and a dependency graph in shared memory, and exports RSS snapshot
+  data for read-only transactions.
+- Snapshot-preserving transactions keep the needed versions alive until
+  the next RSS is constructed. The PostgreSQL prototype also uses
+  hot-standby feedback and replication slots to preserve old versions on
+  replicas.
+- In the single-node prototype, known analytical read-only queries are
+  marked read-only and routed to RSS, while normal OLTP transactions
+  continue to use SSI.
+- The evaluation uses CH-BenCHmark on PostgreSQL 12 prototypes. The
+  ScienceDirect abstract reports about 15% overhead versus baseline SI
+  throughput in a multinode setting, about 45% better OLTP throughput
+  than SafeSnapshots in mixed workload, and no OLAP-throughput
+  degradation. The arXiv version reports up to 20% OLTP improvement
+  versus SSI+SafeSnapshots in the single-node prototype and roughly 10%
+  OLTP overhead versus nonserializable SSI+SI in the multinode replica
+  setup.
+
+**GPU DB mapping:** RSS is a strong match for the current GPU DB
+question of how to publish immutable retained read snapshots without
+making writes wait on long analytical or retained GPU reads. The
+transferable idea is to separate "visibility boundary for correctness"
+from "latest committed row in CPU truth." A retained GPU snapshot can be
+serializable if its source transaction/partition region has a
+well-defined unreachable boundary, even when it is not the absolute
+latest CPU state.
+
+For P8, this suggests a future snapshot publication contract with two
+boundaries. The mutation owner keeps the durable WAL-before-visibility
+boundary for CPU truth. The residency owner publishes a retained
+read-safe boundary for GPU snapshots: table/partition identity, source
+WAL transaction boundary, dependency epoch, invalidation generation, and
+the set or interval of transactions represented in the snapshot. Read
+workers then execute protected read-only retained queries against that
+boundary without joining the mutation owner's conflict tracking on every
+request.
+
+RSS also gives a concrete way to think about replica-like GPU memory.
+GPU resident state is not the transactional authority; it is closer to a
+read-only replica with explicit version preservation. If retained GPU
+snapshots are constructed before readers arrive and are tied to
+dependency metadata, read-only analytical or aggregate work can avoid
+writer aborts, reader waits, and per-query SSI validation. That fits the
+target runtime's immutable snapshot publication model better than the
+current benchmark encoded response cache.
+
+The dependency metadata should remain narrow at first. A full RSS graph
+is probably too much for the current engine, but the paper's
+`Clear`/`Done` split maps to engine generations: fully closed mutation
+epochs, active mutation epochs, and ambiguous epochs with possible
+rw-antidependencies. A first implementation hypothesis is to publish
+read-safe retained snapshots only at deterministic generation boundaries
+where no active mutation can reach the retained source region. Later,
+for higher freshness, dependency-edge logging could allow more recent
+obscure transactions to be admitted into the retained read-safe region.
+
+For 1M logical sessions, the most important implication is that
+read-only sessions should not all enqueue through the mutation owner just
+to prove snapshot safety. RSS-like publication lets many readers share a
+prevalidated retained snapshot handle. Session admission can reject,
+fallback, or wait for a newer read-safe generation only when the handle
+is stale, invalidated, or too old for the session's freshness class.
+
+**Risks and mismatches:** RSS assumes the OLTP side already provides
+serializability, and the practical algorithm is tied to SSI properties.
+The current GPU DB uses a simpler MVCC tuple store and does not yet
+track SSI-style rw-antidependencies, dangerous structures, or
+transaction dependency graphs. Adopting RSS literally would add metadata
+cost to the write path, which is already throughput-sensitive.
+
+The prototype is PostgreSQL-based and oriented around HTAP read-only
+queries and replicas, not GPU execution, CUDA memory, partitioned
+resident layouts, or pgwire session scale. Version preservation can also
+be expensive; the paper notes PostgreSQL HOT/vacuum/version-retention
+effects. In GPU DB, the analogous cost is retained CPU/GPU memory
+pressure and old-snapshot retirement. Finally, RSS can deliberately read
+previous versions, so session policy must distinguish "serializable
+read-safe" from "must include the newest committed mutation."
+
+**Benchmark candidates:**
+
+- Add a retained snapshot freshness/visibility telemetry field that
+  distinguishes CPU latest boundary, retained source boundary, and
+  invalidation generation. Minimum gate: retained reads report whether
+  they used latest, read-safe older, CPU fallback, or rejected state.
+- Prototype a conservative read-safe generation boundary without full
+  SSI: publish retained snapshots only after all mutations in a closed
+  generation have committed and no active mutation started before that
+  boundary remains. Expected improvement: fewer owner-thread reads while
+  preserving a clear serializable-ish contract for read-only routes.
+- Add a CH-BenCHmark-inspired mixed workload proof with one writer lane
+  and long retained analytical reads. Measure writer throughput,
+  retained-read p50/p99, snapshot age, invalidation count, and fallback
+  count. Failure condition: long reads force mutation-owner queue wait or
+  stale reads are not explicitly labeled.
+- Measure version-preservation cost for retained snapshots: CPU MVCC
+  bytes pinned, GPU bytes pinned, snapshot handle count, oldest retained
+  generation age, and retirement delay under continuous writes.
+- Implement a route policy knob for freshness class: `latest_required`
+  routes fall back or wait for CPU truth; `read_safe_allowed` routes may
+  use an older retained read-safe generation. Minimum proof gate: the
+  SQL-visible result path names the chosen boundary in telemetry.
+- Explore dependency-edge logging only after the conservative generation
+  benchmark. Required measurement: write-path metadata bytes, commit
+  overhead, graph maintenance time, and whether the fresher retained
+  snapshot reduces read latency enough to justify the write cost.
+
+### 2026-06-02 - Second Modern Batch Synthesis
+
+**Papers covered:** Virtual-Memory Assisted Buffer Management (SIGMOD/PACMMOD
+2023), Robust Plan Evaluation based on Approximate Probabilistic Machine
+Learning (PVLDB 2025), and Read-safe snapshots for mixed OLTP/OLAP workloads
+(Information Systems 2024).
+
+**Converging design tracks:**
+
+- **Explicit state over opaque delegation.** vmcache argues for DBMS-owned
+  placement policy even when virtual-memory hardware accelerates address
+  translation. RSS argues for DBMS-owned read-safe snapshot construction even
+  when MVCC can expose many committed versions. Roq argues for planner-visible
+  uncertainty rather than trusting a point estimate. For GPU DB, the common
+  track is explicit route state: tier location, snapshot boundary, generation,
+  invalidation risk, queue depth, and confidence should be observable before
+  choosing a route.
+- **Immutable read handles as the concurrency escape hatch.** RSS and the
+  runtime architecture both point toward prevalidated immutable snapshots that
+  many read-only sessions can share without joining the mutation owner. vmcache
+  adds the host-tier version/state-word angle. The next runtime track should
+  publish cheap snapshot handles with state, generation, source boundary, and
+  retirement telemetry.
+- **Risk-aware fallback beats binary acceleration.** Roq's uncertainty-aware
+  selection, vmcache's explicit fault/page-state telemetry, and RSS's
+  freshness-versus-serializability distinction all warn against a planner rule
+  like "GPU if resident." Route choice should choose among CPU latest, CPU
+  host-warm, GPU retained read-safe, GPU latest after refresh, and explicit
+  overload based on mean latency, tail risk, and freshness class.
+- **Tiering and MVCC are coupled.** Host and GPU cache state cannot be designed
+  separately from snapshot retention. A retained GPU snapshot pins CPU MVCC
+  versions and GPU buffers; a host-tier segment can be evicted only if no
+  active snapshot or refresh depends on it. Tier policy therefore needs
+  snapshot-age and oldest-generation pressure metrics, not just bytes and hit
+  rate.
+
+**Category gaps:** Recent reviews now have useful coverage in GPU execution,
+runtime/session scale, multi-tier placement, MVCC snapshots, transaction repair,
+and planning. The queue still needs more modern transaction/write-path papers
+that are not purely read-snapshot oriented, especially bulk ingest, commit
+grouping, partition-owned mutation, and long/short transaction coexistence.
+High-concurrency networking has one strong eRPC entry but still needs
+Shenango/Caladan/Shinjuku-style scheduler coverage before designing the
+production pgwire IO worker pool.
+
+**Benchmark priorities:**
+
+- Add no-behavior-change route state telemetry first: source tier, snapshot
+  boundary, invalidation generation, queue wait distribution, route mean/stddev,
+  fallback reason, and freshness class.
+- Build a read-safe retained generation proof before full dependency-edge
+  logging: one writer lane, one long retained read lane, explicit snapshot age,
+  and no mutation-owner queueing for read-only routes.
+- Create a route-risk replay harness from existing benchmark CSVs to compare
+  mean-only, conservative `mean + k*sigma`, and freshness-aware route choices
+  without running GPU benchmarks.
+- Measure retention pressure as a first-class tiering metric: CPU MVCC bytes
+  pinned, GPU bytes pinned, host warm bytes pinned, oldest retained generation,
+  and retirement lag.
+- For the next paper, prefer a transaction/concurrency/runtime candidate such
+  as Oze, Chiller, Shenango, Caladan, or Shinjuku over another GPU analytics
+  paper unless a specific GPU hardware question becomes urgent.
