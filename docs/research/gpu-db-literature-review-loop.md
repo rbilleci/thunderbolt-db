@@ -40,6 +40,14 @@ clearly foundational for a current 2015-present mechanism. Pre-2015 papers may
 remain in the journal as historical context if already reviewed, but the loop
 must not select them for future runs.
 
+The loop must preserve topic balance. The target is transaction-processing
+database design first, with analytics/GPU papers included because they are
+important to the engine, not because OLAP is the only goal. Do not process more
+than two analytics/GPU-OLAP papers consecutively. When the recent journal skews
+analytical, the next paper should come from OLTP/concurrency control,
+MVCC/snapshot/storage, high-concurrency runtime/admission, HFT-style low-latency
+systems, or query optimization/planning.
+
 Prefer papers from:
 
 - VLDB, SIGMOD, ICDE, CIDR, DaMoN
@@ -51,32 +59,52 @@ Prefer papers from:
 
 Prefer topics that map directly to current GPU DB design questions:
 
-- single-writer or partition-owned mutation paths
-- MVCC, snapshot isolation, virtual snapshots, HTAP snapshot routing, or
-  low-overhead garbage collection
-- lock-free or low-contention concurrency control
-- high-concurrency network runtimes and admission control
-- GPU database scheduling, concurrent query processing, memory residency, and
-  kernel-launch amortization
-- query batching, micro-batching, grouped lookups, grouped aggregates, and
-  result scattering
-- log-structured ingest, append-only storage, checkpointing, and replay
-- cache-friendly queues, rings, preallocation, pinned buffers, and mechanical
-  sympathy
+- **transaction processing and write path**: single-writer or partition-owned
+  mutation paths, commit protocols, log-structured ingest, append-only storage,
+  checkpointing, replay, and write admission
+- **MVCC and snapshots**: MVCC, snapshot isolation, virtual snapshots, HTAP
+  snapshot routing, garbage collection, and serializable read designs
+- **concurrency and sessions**: lock-free or low-contention concurrency
+  control, admission control, high-concurrency network runtimes, and
+  multiplexed session architectures
+- **HFT/runtime mechanics**: cache-friendly queues, rings, preallocation,
+  pinned buffers, low-allocation hot paths, and mechanical sympathy
+- **GPU execution and batching**: GPU database scheduling, concurrent GPU query
+  processing, memory residency, kernel-launch amortization, grouped lookups,
+  grouped aggregates, and result scattering
+- **query optimization**: CPU/GPU route choice, learned or adaptive cost models,
+  predicate pushdown/transfer, join planning, and workload-aware execution
+- **hybrid HTAP**: approaches that balance transactional writes and analytical
+  reads without starving either side
+
+## Balance Targets
+
+The candidate queue and journal should keep a healthy mix:
+
+- transaction processing / write path: at least 20%
+- MVCC / snapshot / visibility: at least 20%
+- runtime, HFT-style mechanics, concurrency, and session scale: at least 20%
+- GPU execution / analytics / over-resident execution: at most 30% unless
+  explicitly requested for a GPU-specific phase
+- query optimization and hybrid HTAP: fill the remaining mix and break ties
+  toward underrepresented topics
+
+These are directional targets, not rigid quotas. They exist to prevent the
+research loop from optimizing only for analytical scans when the product target
+also includes transaction processing.
 
 ## Processing Protocol
 
 For each paper:
 
 1. Record title, authors, venue/year, URL/DOI/arXiv id, and retrieval date.
-2. Classify its primary relevance:
-   - write throughput
-   - read throughput
-   - concurrency/session scale
-   - latency
-   - MVCC/snapshot design
-   - GPU execution/batching
-   - data layout/storage
+2. Classify its category and primary relevance:
+   - transaction processing / write path
+   - MVCC / snapshot / visibility
+   - runtime / HFT / session scale
+   - GPU execution / analytics
+   - query optimization / planning
+   - hybrid HTAP
 3. Summarize the key idea in a few paragraphs.
 4. Extract concrete mechanisms, not just high-level claims.
 5. Map each mechanism to the current GPU DB architecture:

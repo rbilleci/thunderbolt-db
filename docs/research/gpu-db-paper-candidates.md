@@ -10,9 +10,109 @@ Selection policy: future reviews must use papers from 2015 onward, preferably
 newer literature from 2023-present. Pre-2015 entries may remain as historical
 context, but should not be selected by the loop.
 
+Balance policy: transaction-processing use cases are first-class. The loop
+should not process more than two analytics/GPU-OLAP papers consecutively. If
+recent reviews skew analytical, the next candidate should come from
+transaction processing, MVCC/snapshots, runtime/session scale, HFT-style
+mechanical sympathy, or query optimization.
+
 ## Seed Queue
 
-### GPU query execution and batching
+### Transaction processing, write path, and concurrency control
+
+- `queued` — **TicToc: Time Traveling Optimistic Concurrency Control**,
+  Yu et al., SIGMOD 2016.
+  URL: `https://dl.acm.org/doi/10.1145/2882903.2882935`
+  Why: timestamp-based optimistic concurrency control for high-throughput
+  transaction processing; useful for comparing MVCC/snapshot timestamp choices.
+- `queued` — **Cicada: Dependably Fast Multi-Core In-Memory Transactions**,
+  Lim et al., SIGMOD 2017.
+  URL: `https://dl.acm.org/doi/10.1145/3035918.3064015`
+  Why: high-throughput multicore transaction processing with concurrency
+  control, versioning, and contention management tradeoffs.
+- `queued` — **ERMIA: Fast Memory-Optimized Database System for Heterogeneous
+  Workloads**, Kim et al., SIGMOD 2016.
+  URL: `https://dl.acm.org/doi/10.1145/2882903.2882905`
+  Why: memory-optimized transactional engine for mixed workloads; relevant to
+  balancing read snapshots and write throughput.
+- `queued` — **Transaction Repair for Multi-Version Concurrency Control**,
+  arXiv 2024.
+  URL: `https://arxiv.org/abs/2405.14761`
+  Why: recent MVCC transaction repair approach that may inform conflict
+  handling without throwing away all work.
+
+### MVCC, snapshots, and visibility
+
+- `queued` — **Scalable and Robust Snapshot Isolation for High-Performance
+  Storage Engines**, PVLDB 2023.
+  URL: `https://www.vldb.org/pvldb/vol16/p1426-alhomssi.pdf`
+  Why: scalable snapshot isolation, long-reader robustness, and GC ideas.
+- `queued` — **Read-Safe Snapshots: An abort/wait-free serializable read
+  method for read-only transactions on mixed OLTP/OLAP workloads**, Information
+  Systems 2024.
+  URL: `https://www.sciencedirect.com/science/article/pii/S0306437924000437`
+  Why: recent MVCC read-only transaction design for serializable snapshots
+  under mixed OLTP/OLAP workloads.
+- `queued` — **On Supporting Efficient Snapshot Isolation for In-Memory
+  Database Storage**, PVLDB 2020.
+  URL: `https://www.vldb.org/pvldb/vol13/p211-sun.pdf`
+  Why: P-Tree index for efficient snapshot isolation and MVCC in multicore
+  in-memory HTAP storage.
+- `queued` — **An Empirical Evaluation of In-Memory Multi-Version Concurrency
+  Control**, PVLDB 2017.
+  URL: `https://www.vldb.org/pvldb/vol10/p781-Wu.pdf`
+  Why: MVCC design tradeoffs, version storage, validation, and GC behavior.
+- `queued` — **Accelerating Analytical Processing in MVCC using Fine-Granular
+  High-Frequency Virtual Snapshotting**, arXiv 2017.
+  URL: `https://arxiv.org/abs/1709.04284`
+  Why: HTAP-style analytical snapshots without blocking write progress.
+
+### Runtime scale, HFT-style mechanics, and admission
+
+- `queued` — **Shenango: Achieving High CPU Efficiency for Latency-sensitive
+  Datacenter Workloads**, NSDI 2019.
+  URL: `https://www.usenix.org/conference/nsdi19/presentation/ousterhout`
+  Why: user-level scheduling and CPU allocation for latency-sensitive services;
+  relevant to multiplexed IO and query workers under 1M logical sessions.
+- `queued` — **Caladan: Mitigating Interference at Microsecond Timescales**,
+  OSDI 2020.
+  URL: `https://www.usenix.org/conference/osdi20/presentation/shenango`
+  Why: runtime scheduling and resource allocation for microsecond-scale tail
+  latency, useful for admission and worker ownership design.
+- `queued` — **Demikernel: An Operating System Architecture for
+  Microsecond-scale Datacenter Systems**, SOSP 2021.
+  URL: `https://dl.acm.org/doi/10.1145/3477132.3483554`
+  Why: low-latency OS/network stack architecture relevant to session and
+  response-ring design.
+- `queued` — **Design Choices in Low-Latency C++ Systems: Empirical Insights
+  With Applications to High-Frequency Trading**, SSRN 2026.
+  URL: `https://papers.ssrn.com/sol3/papers.cfm?abstract_id=6513601`
+  Why: modern HFT-oriented low-latency systems survey; useful for queue,
+  allocation, cache, and thread-pinning patterns.
+
+### Query optimizers, planning, and route choice
+
+- `queued` — **Lero: A Learning-to-Rank Query Optimizer**, arXiv 2023.
+  URL: `https://arxiv.org/abs/2302.06873`
+  Why: learned ranking layered on native optimizers; relevant to route choice
+  without replacing deterministic planner rules.
+- `queued` — **AutoSteer: Learned Query Optimization for Any SQL Database**,
+  PVLDB 2023.
+  URL: `https://www.vldb.org/pvldb/vol16/p3515-anneser.pdf`
+  Why: learned tuning of optimizer knobs for existing SQL systems; relevant to
+  GPU route knobs and fallback decisions.
+- `queued` — **Rethinking Learned Cost Models: Why Start from Scratch?**,
+  SIGMOD 2023.
+  URL: `https://15799.courses.cs.cmu.edu/spring2025/papers/15-learned/yang-sigmod2023.pdf`
+  Why: learned cost-model calibration rather than full replacement; useful for
+  CPU/GPU route estimation.
+- `queued` — **Roq: Robust Query Optimization Based on a Risk-aware Learned
+  Cost Model**, arXiv 2024.
+  URL: `https://arxiv.org/abs/2401.15210`
+  Why: risk-aware optimization may map to choosing CPU/GPU/overload/fallback
+  routes under uncertain latency.
+
+### GPU query execution and analytics
 
 - `reviewed` — **Concurrent Analytical Query Processing with GPUs**,
   Wang et al., PVLDB 2014.
@@ -57,41 +157,15 @@ context, but should not be selected by the loop.
   URL: `https://research.ibm.com/publications/gpu-join-processing-revisited`
   Why: pre-2015; keep only as historical context.
 
-### MVCC, snapshots, and concurrency control
+### Historical context, skipped by date policy
 
-- `queued` — **Scalable and Robust Snapshot Isolation for High-Performance
-  Storage Engines**, PVLDB 2023.
-  URL: `https://www.vldb.org/pvldb/vol16/p1426-alhomssi.pdf`
-  Why: scalable snapshot isolation, long-reader robustness, and GC ideas.
-- `queued` — **Read-Safe Snapshots: An abort/wait-free serializable read
-  method for read-only transactions on mixed OLTP/OLAP workloads**, Information
-  Systems 2024.
-  URL: `https://www.sciencedirect.com/science/article/pii/S0306437924000437`
-  Why: recent MVCC read-only transaction design for serializable snapshots
-  under mixed OLTP/OLAP workloads.
-- `queued` — **On Supporting Efficient Snapshot Isolation for In-Memory
-  Database Storage**, PVLDB 2020.
-  URL: `https://www.vldb.org/pvldb/vol13/p211-sun.pdf`
-  Why: P-Tree index for efficient snapshot isolation and MVCC in multicore
-  in-memory HTAP storage.
 - `skipped` — **High-Performance Concurrency Control Mechanisms for Main-Memory
   Databases**, VLDB 2012.
   URL: `https://www.vldb.org/pvldb/vol5/p298_per-akelarson_vldb2012.pdf`
   Why: pre-2015; keep only as historical context.
-- `queued` — **An Empirical Evaluation of In-Memory Multi-Version Concurrency
-  Control**, PVLDB 2017.
-  URL: `https://www.vldb.org/pvldb/vol10/p781-Wu.pdf`
-  Why: MVCC design tradeoffs, version storage, validation, and GC behavior.
 - `skipped` — **Serializable Snapshot Isolation in PostgreSQL**, VLDB 2012.
   URL: `https://www.vldb.org/pvldb/vol5/p1850_danports_vldb2012.pdf`
   Why: pre-2015; keep only as historical context.
-- `queued` — **Accelerating Analytical Processing in MVCC using Fine-Granular
-  High-Frequency Virtual Snapshotting**, arXiv 2017.
-  URL: `https://arxiv.org/abs/1709.04284`
-  Why: HTAP-style analytical snapshots without blocking write progress.
-
-### Runtime scale, queues, and mechanical sympathy
-
 - `skipped` — **Disruptor: High performance alternative to bounded queues for
   exchanging data between concurrent threads**, LMAX technical paper.
   URL: `https://lmax-exchange.github.io/disruptor/files/Disruptor-1.0.pdf`
