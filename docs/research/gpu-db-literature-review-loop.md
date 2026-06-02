@@ -11,6 +11,8 @@ synthesize papers that may improve:
 - concurrent session scale, with a long-range target of 1M logical sessions
 - query latency
 - MVCC, snapshot isolation, or comparable visibility models
+- multi-tier cache and data placement across GPU memory, system memory,
+  disk/NVMe, and future tiers
 - GPU execution, batching, micro-batching, and memory layout
 
 The output is not a single predetermined architecture. It is a growing research
@@ -46,7 +48,7 @@ important to the engine, not because OLAP is the only goal. Do not process more
 than two analytics/GPU-OLAP papers consecutively. When the recent journal skews
 analytical, the next paper should come from OLTP/concurrency control,
 MVCC/snapshot/storage, high-concurrency runtime/admission, HFT-style low-latency
-systems, or query optimization/planning.
+systems, multi-tier cache/storage management, or query optimization/planning.
 
 Prefer papers from:
 
@@ -67,6 +69,9 @@ Prefer topics that map directly to current GPU DB design questions:
 - **concurrency and sessions**: lock-free or low-contention concurrency
   control, admission control, high-concurrency network runtimes, and
   multiplexed session architectures
+- **multi-tier cache and data placement**: GPU HBM, CPU DRAM, compressed host
+  segments, OS page cache, explicit buffer pools, NVMe, GPUDirect storage,
+  prefetching, eviction, demotion, promotion, and tier-aware admission
 - **HFT/runtime mechanics**: cache-friendly queues, rings, preallocation,
   pinned buffers, low-allocation hot paths, and mechanical sympathy
 - **GPU execution and batching**: GPU database scheduling, concurrent GPU query
@@ -84,6 +89,7 @@ The candidate queue and journal should keep a healthy mix:
 - transaction processing / write path: at least 20%
 - MVCC / snapshot / visibility: at least 20%
 - runtime, HFT-style mechanics, concurrency, and session scale: at least 20%
+- multi-tier cache, buffer management, and data placement: at least 15%
 - GPU execution / analytics / over-resident execution: at most 30% unless
   explicitly requested for a GPU-specific phase
 - query optimization and hybrid HTAP: fill the remaining mix and break ties
@@ -102,6 +108,7 @@ For each paper:
    - transaction processing / write path
    - MVCC / snapshot / visibility
    - runtime / HFT / session scale
+   - multi-tier cache / data placement
    - GPU execution / analytics
    - query optimization / planning
    - hybrid HTAP
@@ -113,6 +120,7 @@ For each paper:
    - command/response rings
    - GPU execution workers
    - partition/residency model
+   - cache/tier placement model
    - WAL/MVCC/write path
    - session admission/backpressure
 6. List risks and mismatches.
@@ -144,6 +152,9 @@ Promising tracks should be expressed as implementation hypotheses, for example:
 - GPU execution owners should own CUDA streams and reusable pinned buffers
 - network IO should use bounded multiplexed workers and response rings rather
   than thread-per-client processing
+- tier placement should be explicit and measured: hot read snapshots in GPU
+  memory, warm compressed segments in host memory, cold partitions on NVMe, and
+  route decisions tied to promotion/demotion telemetry
 
 ## Safety And Quality Bar
 

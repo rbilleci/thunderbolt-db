@@ -14,7 +14,7 @@ Balance policy: transaction-processing use cases are first-class. The loop
 should not process more than two analytics/GPU-OLAP papers consecutively. If
 recent reviews skew analytical, the next candidate should come from
 transaction processing, MVCC/snapshots, runtime/session scale, HFT-style
-mechanical sympathy, or query optimization.
+mechanical sympathy, multi-tier cache/data placement, or query optimization.
 
 ## Seed Queue
 
@@ -91,6 +91,46 @@ mechanical sympathy, or query optimization.
   URL: `https://papers.ssrn.com/sol3/papers.cfm?abstract_id=6513601`
   Why: modern HFT-oriented low-latency systems survey; useful for queue,
   allocation, cache, and thread-pinning patterns.
+
+### Multi-tier cache, buffer management, and data placement
+
+- `queued` — **LeanStore: In-Memory Data Management beyond Main Memory**,
+  Leis et al., ICDE 2018.
+  URL: `https://doi.org/10.1109/ICDE.2018.00026`
+  Metadata:
+  `https://portal.fis.tum.de/en/publications/leanstore-in-memory-data-management-beyond-main-memory`
+  Why: low-overhead storage manager that keeps in-memory performance for hot
+  data while transparently handling SSD-resident data; directly relevant to
+  GPU/DRAM/NVMe tiering and transactional working sets.
+- `queued` — **Umbra: A Disk-Based System with In-Memory Performance**,
+  Neumann and Freitag, CIDR 2020.
+  URL: `https://www.vldb.org/cidrdb/papers/2020/p29-neumann-cidr20.pdf`
+  Why: variable-size pages and low-overhead buffer management for cached hot
+  working sets with graceful uncached access; useful for resident snapshot and
+  host/NVMe tier design.
+- `queued` — **Are You Sure You Want to Use MMAP in Your Database Management
+  System?**, Crotty et al., CIDR 2022.
+  URL: `https://www.cidrdb.org/cidr2022/papers/p13-crotty.pdf`
+  Why: evaluates OS page-cache and mmap tradeoffs versus explicit DBMS buffer
+  management; important for deciding whether tier movement should be explicit
+  or delegated to the OS.
+- `queued` — **Virtual-Memory Assisted Buffer Management**, Leis et al.,
+  SIGMOD/PACMMOD 2023.
+  URL: `https://tore.tuhh.de/entities/publication/f82ebf12-6f97-4161-8ad6-d1e94645e33a`
+  Why: combines DBMS buffer management with virtual-memory mechanisms for fast
+  storage and multicore CPUs; relevant to host-memory tier policy and fault
+  telemetry.
+- `queued` — **Multi-Tier Buffer Management and Storage System Design for
+  Non-Volatile Memory**, arXiv 2019.
+  URL: `https://arxiv.org/abs/1901.10938`
+  Why: explicit multi-tier DBMS buffer design across DRAM and non-volatile
+  storage; useful for promotion/demotion policy and tier-aware page layout.
+- `queued` — **Efficient Compactions Between Storage Tiers with PrismDB**,
+  arXiv 2020.
+  URL: `https://arxiv.org/abs/2008.02352`
+  Why: multi-tier storage compaction across fast and slow devices; relevant to
+  cold/warm segment organization and write amplification when data moves
+  between tiers.
 
 ### Query optimizers, planning, and route choice
 
