@@ -6030,6 +6030,8 @@ pub struct Engine {
 struct RelationalResidentCache {
     snapshots: BTreeMap<String, RelationalResidencySnapshot>,
     device_memory: BTreeMap<String, CudaResidentDeviceMemory>,
+    partitions: BTreeMap<String, Vec<RelationalResidentPartition>>,
+    partition_device_memory: BTreeMap<(String, u32), CudaResidentDeviceMemory>,
     budget_bytes_by_gpu: BTreeMap<u16, u64>,
     last_decisions: BTreeMap<String, RelationalResidentCacheDecision>,
     latest_route_decisions: BTreeMap<String, RelationalResidentRouteDecisionStatus>,
@@ -6056,6 +6058,33 @@ struct RelationalResidentRouteExecutionObservation {
     kernel_event_elapsed_us: Option<u64>,
     rows: usize,
     wall_micros: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RelationalResidentPartition {
+    partition_id: u32,
+    row_start: usize,
+    row_count: usize,
+    resident_bytes: u64,
+    allocated_bytes: u64,
+    count_header_byte_offset: u64,
+    gpu_id: u16,
+    schema: String,
+    table: String,
+    device_memory_proof: Option<CudaDeviceMemoryProof>,
+    invalidated_by_txn_id: Option<TxnId>,
+    invalidated_at_index: Option<Index>,
+    invalidated_by_memory_pressure: bool,
+    memory_pressure_active: bool,
+}
+
+impl RelationalResidentPartition {
+    fn is_valid(&self, memory_pressure_active: bool) -> bool {
+        self.invalidated_by_txn_id.is_none()
+            && self.invalidated_at_index.is_none()
+            && !self.invalidated_by_memory_pressure
+            && !memory_pressure_active
+    }
 }
 
 impl RelationalResidentCache {
@@ -6120,6 +6149,9 @@ impl RelationalResidentCache {
     fn remove_table(&mut self, table: &str) {
         self.snapshots.remove(table);
         self.device_memory.remove(table);
+        self.partitions.remove(table);
+        self.partition_device_memory
+            .retain(|(partition_table, _partition_id), _memory| partition_table != table);
         self.latest_route_decisions.remove(table);
     }
 
@@ -6135,6 +6167,21 @@ impl RelationalResidentCache {
             self.device_memory.remove(&table);
         }
         self.snapshots.insert(table, snapshot);
+    }
+
+    fn install_partitions(
+        &mut self,
+        table: String,
+        partitions: Vec<RelationalResidentPartition>,
+        device_memory: BTreeMap<u32, CudaResidentDeviceMemory>,
+    ) {
+        self.partitions.insert(table.clone(), partitions);
+        self.partition_device_memory
+            .retain(|(partition_table, _partition_id), _memory| partition_table != &table);
+        for (partition_id, memory) in device_memory {
+            self.partition_device_memory
+                .insert((table.clone(), partition_id), memory);
+        }
     }
 }
 
@@ -6388,6 +6435,21 @@ where
     pub resident_device_text_columns: Vec<ResidentDeviceTextColumnLayout>,
     pub allocated_bytes: u64,
     pub chunks: I,
+}
+
+pub struct BenchmarkRelationalResidencyOwnedPartition {
+    pub partition_id: u32,
+    pub row_start: usize,
+    pub row_count: usize,
+    pub resident_bytes: u64,
+    pub allocated_bytes: u64,
+    pub chunks: Vec<CudaOwnedDeviceMemoryChunk>,
+}
+
+pub struct BenchmarkRelationalResidencyOwnedPartitionInstall<'a> {
+    pub table: &'a str,
+    pub gpu_id: u16,
+    pub partitions: Vec<BenchmarkRelationalResidencyOwnedPartition>,
 }
 
 impl RelationalResidencySnapshot {
@@ -8532,12 +8594,22 @@ impl Engine {
     }
 
     pub fn relational_resident_bytes_for_gpu(&self, gpu_id: u16) -> u64 {
-        self.relational_resident_cache
+        let snapshot_bytes: u64 = self
+            .relational_resident_cache
             .snapshots
             .values()
             .filter(|snapshot| snapshot.gpu_id == gpu_id)
             .map(|snapshot| snapshot.resident_bytes)
-            .sum()
+            .sum();
+        let partition_bytes: u64 = self
+            .relational_resident_cache
+            .partitions
+            .values()
+            .flatten()
+            .filter(|partition| partition.gpu_id == gpu_id)
+            .map(|partition| partition.resident_bytes)
+            .sum();
+        snapshot_bytes.saturating_add(partition_bytes)
     }
 
     pub fn set_gpu_runtime_saturated(&mut self, saturated: bool) {
@@ -8705,6 +8777,20 @@ impl Engine {
             }
             self.relational_resident_cache.device_memory.remove(table);
         }
+        for (table, partitions) in self.relational_resident_cache.partitions.iter_mut() {
+            for partition in partitions {
+                if partition.invalidated_by_txn_id.is_none() {
+                    partition.invalidated_by_txn_id = Some(txn_id);
+                    partition.invalidated_at_index = Some(index);
+                }
+                if let Some(proof) = partition.device_memory_proof.as_mut() {
+                    proof.retained = false;
+                }
+            }
+            self.relational_resident_cache
+                .partition_device_memory
+                .retain(|(partition_table, _partition_id), _memory| partition_table != table);
+        }
     }
 
     fn invalidate_relational_residency_for_memory_pressure(&mut self, gpu_id: u16) {
@@ -8716,6 +8802,24 @@ impl Engine {
                     proof.retained = false;
                 }
                 self.relational_resident_cache.device_memory.remove(table);
+            }
+        }
+        for (table, partitions) in self.relational_resident_cache.partitions.iter_mut() {
+            let mut table_pressured = false;
+            for partition in partitions {
+                if partition.gpu_id == gpu_id {
+                    partition.invalidated_by_memory_pressure = true;
+                    partition.memory_pressure_active = true;
+                    table_pressured = true;
+                    if let Some(proof) = partition.device_memory_proof.as_mut() {
+                        proof.retained = false;
+                    }
+                }
+            }
+            if table_pressured {
+                self.relational_resident_cache
+                    .partition_device_memory
+                    .retain(|(partition_table, _partition_id), _memory| partition_table != table);
             }
         }
     }
@@ -14681,9 +14785,18 @@ impl Engine {
         {
             device_memory.clear_last_kernel_event_elapsed_us();
         }
+        for ((table, _partition_id), device_memory) in
+            &self.relational_resident_cache.partition_device_memory
+        {
+            if table == &decision.table {
+                device_memory.clear_last_kernel_event_elapsed_us();
+            }
+        }
         let route_started = Instant::now();
         let result = match decision.query_shape.as_str() {
             "count_all" => self.execute_relational_count_with_resident_device_memory_probe(select),
+            "partitioned_count_all" => self
+                .execute_relational_partitioned_count_with_resident_device_memory_probe(select),
             "int4_equality_count" => {
                 self.execute_relational_filtered_count_with_resident_device_memory_probe(select)
             }
@@ -14860,6 +14973,117 @@ impl Engine {
             rows: vec![vec![SqlValue::Int4(count)]],
             planned_target: DeviceTarget::Gpu(snapshot_gpu_id),
             executed_target: DeviceTarget::Gpu(snapshot_gpu_id),
+            fallback_reason: None,
+            access_path,
+        })
+    }
+
+    pub fn execute_relational_partitioned_count_with_resident_device_memory_probe(
+        &mut self,
+        select: &Select,
+    ) -> Result<RelationalSelectResult, ExecuteError> {
+        let (table, bound) = self.bind_relational_select_for_execution(select)?;
+        if select.distinct
+            || !matches!(select.projection, SelectProjection::CountAll)
+            || select.group_by.is_some()
+            || !select.having_groups.is_empty()
+            || select.filter.is_some()
+            || !select.filters.is_empty()
+            || !select.filter_groups.is_empty()
+            || select.order_by.is_some()
+            || select.limit.is_some()
+            || select.offset.is_some()
+        {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "partitioned resident device-memory query proof currently supports only unfiltered SELECT COUNT(*)"
+                    .to_string(),
+            )));
+        }
+        let (_query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
+        let partitions = self
+            .relational_resident_cache
+            .partitions
+            .get(&table.name)
+            .cloned()
+            .ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "relation \"{}\" has no resident partitions",
+                    table.name
+                )))
+            })?;
+        if partitions.is_empty() {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "relation \"{}\" has no resident partitions",
+                table.name
+            ))));
+        }
+
+        let snapshot = self.router.runtime().snapshot();
+        let mut total_count = 0_u64;
+        let mut lookup_micros = 0_u64;
+        let mut gpu_id = partitions[0].gpu_id;
+        for partition in &partitions {
+            if partition.schema != table.schema || partition.table != table.name {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "resident partition no longer matches catalog table identity".to_string(),
+                )));
+            }
+            let memory_pressure_active = snapshot
+                .memory_pressured_gpu_ids
+                .contains(&partition.gpu_id);
+            if !partition.is_valid(memory_pressure_active) {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "resident partition {} is invalid",
+                    partition.partition_id
+                ))));
+            }
+            let device_memory = self
+                .relational_resident_cache
+                .partition_device_memory
+                .get(&(table.name.clone(), partition.partition_id))
+                .ok_or_else(|| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                        "resident partition {} has no retained device memory",
+                        partition.partition_id
+                    )))
+                })?;
+            let lookup_started = Instant::now();
+            let row_count = device_memory
+                .count_rows_from_header()
+                .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
+            lookup_micros = lookup_micros.saturating_add(
+                lookup_started
+                    .elapsed()
+                    .as_micros()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
+            );
+            if row_count != partition.row_count as u64 {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "resident partition {} row-count proof returned {row_count}, expected {}",
+                    partition.partition_id, partition.row_count
+                ))));
+            }
+            total_count = total_count.checked_add(row_count).ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(
+                    "partitioned resident count overflowed".to_string(),
+                ))
+            })?;
+            gpu_id = partition.gpu_id;
+        }
+        let count = i32::try_from(total_count).map_err(|_| {
+            ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "partitioned resident row count {total_count} exceeds supported COUNT(*) result range"
+            )))
+        })?;
+        self.relational_resident_cache
+            .record_route_device_lookup_micros(&table.name, lookup_micros, partitions.len());
+
+        Ok(RelationalSelectResult {
+            columns: bound.selected_columns,
+            rows: vec![vec![SqlValue::Int4(count)]],
+            planned_target: DeviceTarget::Gpu(gpu_id),
+            executed_target: DeviceTarget::Gpu(gpu_id),
             fallback_reason: None,
             access_path,
         })
@@ -19087,6 +19311,137 @@ impl Engine {
         Ok(snapshot)
     }
 
+    pub fn install_benchmark_relational_residency_owned_partitions(
+        &mut self,
+        install: BenchmarkRelationalResidencyOwnedPartitionInstall<'_>,
+    ) -> Result<(), ExecuteError> {
+        let table = install.table;
+        if install.partitions.is_empty() {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "benchmark resident partition admission requires at least one partition"
+                    .to_string(),
+            )));
+        }
+        let catalog_table = self
+            .relational_catalog
+            .get(table)
+            .ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "relation \"{table}\" does not exist"
+                )))
+            })?
+            .clone();
+        let visible_rows = self.visible_relational_row_count(table)?;
+        if visible_rows != 0 {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "benchmark resident partition admission requires relation \"{table}\" to have no SQL-visible rows; found {visible_rows}"
+            ))));
+        }
+
+        let total_resident_bytes =
+            install
+                .partitions
+                .iter()
+                .try_fold(0_u64, |total, partition| {
+                    if partition.row_count == 0 {
+                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                            "benchmark resident partition {} has no rows",
+                            partition.partition_id
+                        ))));
+                    }
+                    if partition.chunks.is_empty() {
+                        return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                            "benchmark resident partition {} has no retained chunks",
+                            partition.partition_id
+                        ))));
+                    }
+                    total.checked_add(partition.resident_bytes).ok_or_else(|| {
+                        ExecuteError::Engine(EngineError::ApplyFailed(
+                            "benchmark resident partition byte count overflowed".to_string(),
+                        ))
+                    })
+                })?;
+        let (_evicted_tables_on_admission, _resident_bytes_after_admission) =
+            self.admit_relational_residency_snapshot(table, install.gpu_id, total_resident_bytes)?;
+
+        let memory_pressure_active = self
+            .router
+            .runtime()
+            .snapshot()
+            .memory_pressured_gpu_ids
+            .contains(&install.gpu_id);
+        let runtime = self.cuda_driver_probe_runtime();
+        let mut partitions = Vec::new();
+        let mut device_memory = BTreeMap::new();
+        for partition in install.partitions {
+            let copied_bytes = partition.chunks.iter().try_fold(0_u64, |total, chunk| {
+                let len = u64::try_from(chunk.bytes.len()).map_err(|_| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(
+                        "benchmark resident partition chunk length exceeds u64".to_string(),
+                    ))
+                })?;
+                let end = chunk.byte_offset.checked_add(len).ok_or_else(|| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(
+                        "benchmark resident partition chunk offset overflowed".to_string(),
+                    ))
+                })?;
+                if end > partition.allocated_bytes {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                        "benchmark resident partition {} chunk ending at byte {end} exceeds allocation {}",
+                        partition.partition_id, partition.allocated_bytes
+                    ))));
+                }
+                total.checked_add(len).ok_or_else(|| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(
+                        "benchmark resident partition copied byte count overflowed".to_string(),
+                    ))
+                })
+            })?;
+            if copied_bytes == 0 {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "benchmark resident partition {} copied no bytes",
+                    partition.partition_id
+                ))));
+            }
+            let retained = runtime
+                .retain_device_memory_owned_chunks(
+                    install.gpu_id,
+                    partition.allocated_bytes,
+                    partition.chunks,
+                )
+                .map_err(|err| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                        "benchmark resident partition admission failed CUDA retained upload: {err}"
+                    )))
+                })?;
+            let device_memory_proof = Some(retained.metadata().clone());
+            partitions.push(RelationalResidentPartition {
+                partition_id: partition.partition_id,
+                row_start: partition.row_start,
+                row_count: partition.row_count,
+                resident_bytes: partition.resident_bytes,
+                allocated_bytes: partition.allocated_bytes,
+                count_header_byte_offset: 0,
+                gpu_id: install.gpu_id,
+                schema: catalog_table.schema.clone(),
+                table: catalog_table.name.clone(),
+                device_memory_proof,
+                invalidated_by_txn_id: None,
+                invalidated_at_index: None,
+                invalidated_by_memory_pressure: memory_pressure_active,
+                memory_pressure_active,
+            });
+            device_memory.insert(partition.partition_id, retained);
+        }
+        partitions.sort_by_key(|partition| (partition.row_start, partition.partition_id));
+        self.relational_resident_cache.install_partitions(
+            catalog_table.name,
+            partitions,
+            device_memory,
+        );
+        Ok(())
+    }
+
     fn validate_benchmark_resident_chunk_columns(
         table: &RelationalTable,
         int4_columns: &[String],
@@ -19160,12 +19515,23 @@ impl Engine {
     }
 
     fn relational_resident_bytes_for_gpu_excluding(&self, gpu_id: u16, table: &str) -> u64 {
-        self.relational_resident_cache
+        let snapshot_bytes: u64 = self
+            .relational_resident_cache
             .snapshots
             .iter()
             .filter(|(name, snapshot)| name.as_str() != table && snapshot.gpu_id == gpu_id)
             .map(|(_name, snapshot)| snapshot.resident_bytes)
-            .sum()
+            .sum();
+        let partition_bytes: u64 = self
+            .relational_resident_cache
+            .partitions
+            .iter()
+            .filter(|(name, _partitions)| name.as_str() != table)
+            .flat_map(|(_name, partitions)| partitions)
+            .filter(|partition| partition.gpu_id == gpu_id)
+            .map(|partition| partition.resident_bytes)
+            .sum();
+        snapshot_bytes.saturating_add(partition_bytes)
     }
 
     pub fn relational_residency_snapshot(
@@ -19432,6 +19798,7 @@ impl Engine {
         RelationalResidentRouteDecisionStatus {
             table: table.to_string(),
             gpu_id: None,
+            partition_count: 0,
             accepted: false,
             reason: reason.into(),
             query_shape: query_shape.into(),
@@ -19509,6 +19876,15 @@ impl Engine {
             }
         };
 
+        if let Some(partitions) = self.relational_resident_cache.partitions.get(&table.name) {
+            return self.plan_relational_partitioned_resident_route(
+                select,
+                &table,
+                query_shape,
+                partitions,
+            );
+        }
+
         let Some(snapshot) = self.relational_resident_cache.snapshots.get(&table.name) else {
             return Self::resident_route_reject(
                 &table.name,
@@ -19535,6 +19911,7 @@ impl Engine {
         let mut decision = RelationalResidentRouteDecisionStatus {
             table: table.name.clone(),
             gpu_id: Some(snapshot.gpu_id),
+            partition_count: 1,
             accepted: false,
             reason: String::new(),
             query_shape,
@@ -19576,6 +19953,124 @@ impl Engine {
         } else {
             decision.accepted = true;
             decision.reason = "resident route accepted".to_string();
+        }
+        decision
+    }
+
+    fn plan_relational_partitioned_resident_route(
+        &self,
+        select: &Select,
+        table: &RelationalTable,
+        query_shape: String,
+        partitions: &[RelationalResidentPartition],
+    ) -> RelationalResidentRouteDecisionStatus {
+        let total_rows = partitions
+            .iter()
+            .map(|partition| partition.row_count)
+            .sum::<usize>();
+        let total_resident_bytes = partitions
+            .iter()
+            .map(|partition| partition.resident_bytes)
+            .sum::<u64>();
+        let gpu_id = partitions.first().map(|partition| partition.gpu_id);
+        let mut decision = RelationalResidentRouteDecisionStatus {
+            table: table.name.clone(),
+            gpu_id,
+            partition_count: partitions.len(),
+            accepted: false,
+            reason: String::new(),
+            query_shape: if query_shape == "count_all" {
+                "partitioned_count_all".to_string()
+            } else {
+                query_shape
+            },
+            cache_state: "Valid".to_string(),
+            valid: true,
+            has_retained_device_memory: false,
+            estimated_rows: total_rows,
+            resident_bytes: total_resident_bytes,
+            budget_bytes: gpu_id.and_then(|gpu_id| self.relational_residency_budget_bytes(gpu_id)),
+            refresh_resident_bytes: None,
+            h2d_bytes_if_resident: 0,
+            h2d_bytes_if_cold: total_resident_bytes,
+            d2h_bytes_estimate: if matches!(select.projection, SelectProjection::CountAll) {
+                partitions
+                    .len()
+                    .checked_mul(std::mem::size_of::<u64>())
+                    .and_then(|bytes| u64::try_from(bytes).ok())
+                    .unwrap_or(u64::MAX)
+            } else {
+                0
+            },
+            d2h_rows_estimate: resident_route_d2h_rows_estimate(select, total_rows),
+            last_execution_h2d_bytes: None,
+            last_execution_d2h_bytes: None,
+            last_execution_kernel_samples: None,
+            last_execution_kernel_ms: None,
+            last_execution_kernel_event_elapsed_us: None,
+            last_execution_rows: None,
+            last_execution_wall_micros: None,
+            last_execution_device_lookup_micros: None,
+            last_execution_match_index_micros: None,
+            last_execution_selected_projection_micros: None,
+            last_execution_result_materialization_micros: None,
+            last_execution_matched_rows: None,
+        };
+
+        if decision.query_shape != "partitioned_count_all" {
+            decision.cache_state = "Absent".to_string();
+            decision.valid = false;
+            decision.reason =
+                "partitioned resident routing currently supports only unfiltered COUNT(*)"
+                    .to_string();
+            return decision;
+        }
+        if partitions.is_empty() {
+            decision.cache_state = "Absent".to_string();
+            decision.valid = false;
+            decision.reason = "relation has no resident partitions".to_string();
+            return decision;
+        }
+
+        let mut has_all_device_memory = true;
+        for partition in partitions {
+            let memory_pressure_active = self
+                .router
+                .runtime()
+                .snapshot()
+                .memory_pressured_gpu_ids
+                .contains(&partition.gpu_id);
+            let valid = partition.is_valid(memory_pressure_active);
+            decision.valid &= valid;
+            if memory_pressure_active || partition.invalidated_by_memory_pressure {
+                decision.cache_state = "InvalidatedByMemoryPressure".to_string();
+            } else if partition.invalidated_by_txn_id.is_some()
+                || partition.invalidated_at_index.is_some()
+            {
+                decision.cache_state = "Invalidated".to_string();
+            }
+            if partition.schema != table.schema || partition.table != table.name {
+                decision.reason =
+                    "resident partition no longer matches catalog table identity".to_string();
+                return decision;
+            }
+            if !self
+                .relational_resident_cache
+                .partition_device_memory
+                .contains_key(&(table.name.clone(), partition.partition_id))
+            {
+                has_all_device_memory = false;
+            }
+        }
+        decision.has_retained_device_memory = has_all_device_memory;
+        if !decision.valid {
+            decision.reason = format!("resident partition set is {}", decision.cache_state);
+        } else if !has_all_device_memory {
+            decision.reason =
+                "resident partition set has missing retained device memory".to_string();
+        } else {
+            decision.accepted = true;
+            decision.reason = "partitioned resident route accepted".to_string();
         }
         decision
     }
@@ -25229,6 +25724,108 @@ mod tests {
                 .reason,
             pressured.reason
         );
+    }
+
+    #[test]
+    fn p8_partitioned_resident_count_reduces_valid_partitions_and_rejects_invalidated() {
+        let mut e = Engine::new_local();
+        e.execute_text(
+            1,
+            "CREATE TABLE order_line (ol_o_id INT, ol_i_id INT, ol_quantity INT, ol_amount INT, ol_dist_info TEXT)",
+        )
+        .unwrap();
+
+        let partitions = (0..4_u32)
+            .map(|partition_id| {
+                let row_count = 256_usize;
+                let mut bytes = Vec::new();
+                bytes.extend_from_slice(&(row_count as u64).to_le_bytes());
+                BenchmarkRelationalResidencyOwnedPartition {
+                    partition_id,
+                    row_start: partition_id as usize * row_count + 1,
+                    row_count,
+                    resident_bytes: bytes.len() as u64,
+                    allocated_bytes: bytes.len() as u64,
+                    chunks: vec![CudaOwnedDeviceMemoryChunk {
+                        byte_offset: 0,
+                        bytes,
+                    }],
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let installed = e.install_benchmark_relational_residency_owned_partitions(
+            BenchmarkRelationalResidencyOwnedPartitionInstall {
+                table: "order_line",
+                gpu_id: 0,
+                partitions,
+            },
+        );
+        if let Err(err) = installed {
+            assert!(
+                err.to_string().contains("CUDA"),
+                "unexpected partition install error: {err}"
+            );
+            return;
+        }
+
+        let Command::Select(select) = parse_command("SELECT COUNT(*) FROM order_line").unwrap()
+        else {
+            unreachable!()
+        };
+        let route = e.plan_relational_resident_route(&select);
+        assert!(route.accepted, "{route:?}");
+        assert_eq!(route.query_shape, "partitioned_count_all");
+        assert_eq!(route.partition_count, 4);
+        assert_eq!(route.estimated_rows, 1024);
+        assert_eq!(route.resident_bytes, 32);
+        assert_eq!(route.h2d_bytes_if_resident, 0);
+        assert_eq!(route.h2d_bytes_if_cold, 32);
+        assert_eq!(
+            route.d2h_bytes_estimate,
+            (4 * std::mem::size_of::<u64>()) as u64
+        );
+
+        let before = e.metrics().snapshot();
+        let result = e.execute_relational_select(&select).unwrap();
+        let after = e.metrics().snapshot();
+        assert_eq!(result.rows, vec![vec![SqlValue::Int4(1024)]]);
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.fallback_reason, None);
+        let decision = e
+            .status_snapshot()
+            .relational_residency
+            .latest_route_decision("order_line")
+            .unwrap()
+            .clone();
+        assert_eq!(decision.query_shape, "partitioned_count_all");
+        assert_eq!(decision.partition_count, 4);
+        assert_eq!(decision.last_execution_h2d_bytes, Some(0));
+        assert_eq!(
+            decision.last_execution_d2h_bytes,
+            Some(after.d2h_bytes_total.saturating_sub(before.d2h_bytes_total))
+        );
+        assert_eq!(
+            decision.last_execution_kernel_samples,
+            Some(
+                after
+                    .kernel_exec_samples
+                    .saturating_sub(before.kernel_exec_samples)
+            )
+        );
+        assert_eq!(decision.last_execution_matched_rows, Some(4));
+
+        e.execute_text(
+            2,
+            "INSERT INTO order_line (ol_o_id, ol_i_id, ol_quantity, ol_amount, ol_dist_info) VALUES (1, 1, 1, 1, 'x')",
+        )
+        .unwrap();
+        let invalidated = e.plan_relational_resident_route(&select);
+        assert!(!invalidated.accepted);
+        assert_eq!(invalidated.query_shape, "partitioned_count_all");
+        assert_eq!(invalidated.partition_count, 4);
+        assert_eq!(invalidated.cache_state, "Invalidated");
+        assert_eq!(invalidated.reason, "resident partition set is Invalidated");
     }
 
     #[test]

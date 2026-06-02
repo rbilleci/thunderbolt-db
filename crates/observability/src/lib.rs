@@ -141,6 +141,7 @@ pub struct RelationalResidencyTableStatus {
 pub struct RelationalResidentRouteDecisionStatus {
     pub table: String,
     pub gpu_id: Option<u16>,
+    pub partition_count: usize,
     pub accepted: bool,
     pub reason: String,
     pub query_shape: String,
@@ -805,6 +806,7 @@ mod tests {
             latest_route_decisions: vec![RelationalResidentRouteDecisionStatus {
                 table: "events".to_string(),
                 gpu_id: Some(0),
+                partition_count: 1,
                 accepted: true,
                 reason: "resident route accepted".to_string(),
                 query_shape: "count_all".to_string(),
