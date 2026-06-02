@@ -2283,3 +2283,173 @@ needed.
 - Preserve WAL-before-visibility and immutable snapshot publication as the
   hard correctness boundary; every reviewed mechanism should fit around that
   boundary rather than weakening it.
+
+### 2026-06-03 - TicToc data-driven timestamp OCC
+
+**Citation:** Xiangyao Yu, Andrew Pavlo, Daniel Sanchez, and Srinivas
+Devadas. "TicToc: Time Traveling Optimistic Concurrency Control." SIGMOD
+2016, pages 1629-1642. DOI:
+`https://doi.org/10.1145/2882903.2882935`. Retrieved 2026-06-03 from the
+author-hosted PDF, `https://db.cs.cmu.edu/papers/2016/yu-sigmod2016.pdf`.
+
+**Category:** transaction processing / write path and concurrency control.
+
+**Relevance tags:** optimistic concurrency control; serializability; timestamp
+allocation; per-tuple visibility metadata; write-set validation; read-set
+validation; contention telemetry; snapshot isolation variant; WAL batching;
+high-throughput OLTP.
+
+**Core idea:** TicToc removes the global timestamp allocator from
+timestamp-order concurrency control. Instead of assigning a transaction a
+timestamp before or during execution, each tuple version carries a write
+timestamp (`wts`) and read timestamp (`rts`) that define the logical interval
+where that version is valid. A transaction records the tuple values and
+timestamps it reads or writes, then lazily computes a commit timestamp during
+validation from the data it actually touched.
+
+The important shift is that logical serialization order is data-driven rather
+than physical-time driven. Two transactions that overlap physically can still
+commit if the accessed tuple timestamp intervals admit a serial order, even
+when conventional OCC would abort because a read tuple has changed since it was
+first observed. TicToc proves serializability by ordering transactions by
+commit timestamp and physical commit time when timestamps tie.
+
+The evaluation implements TicToc in DBx1000 and compares against Silo,
+Hekaton-style MVCC, two-phase locking with deadlock detection, and no-wait
+2PL on a 40-core, 80-hardware-thread, four-socket machine. The paper reports
+up to 92% higher throughput than prior algorithms and up to 3.3x lower abort
+rate under evaluated workload conditions. In the high-contention four-warehouse
+TPC-C variant, TicToc achieves 1.8x better throughput than Silo and 27% lower
+abort rate; in medium-contention YCSB, TicToc and Silo have similar
+throughput, but TicToc has about 3.3x lower abort rate. Under very high
+write contention, TicToc's abort-rate advantage shrinks and the no-wait plus
+preemptive-abort optimizations carry more of the performance gain.
+
+**Concrete mechanisms:**
+
+- Every tuple version stores `wts` and `rts`. A version is valid for reads when
+  `wts <= commit_ts <= rts`; a write is valid when the new transaction's
+  `commit_ts` is greater than the previous version's `rts`.
+- Read phase is non-blocking. The transaction stores read-set and write-set
+  entries containing tuple pointer, copied data, `wts`, and `rts`.
+- The tuple value and timestamp word must be read atomically so the value
+  matches the metadata. TicToc implements this with a 64-bit timestamp word
+  containing a lock bit, a 15-bit `rts - wts` delta, and a 48-bit `wts`.
+- Validation first locks write-set tuples in primary-key order, then computes
+  the candidate commit timestamp as the maximum of each read entry's `wts` and
+  each write entry's current `rts + 1`.
+- Read validation checks whether each read version is valid at `commit_ts`.
+  If the copied `rts` is too small, the system tries to extend the tuple's
+  current `rts` with compare-and-swap, as long as the tuple's `wts` still
+  matches and the tuple is not locked by another transaction outside the
+  current write set.
+- Write phase installs each write-set value and sets the tuple's `wts` and
+  `rts` to `commit_ts`, then unlocks.
+- The no-wait optimization aborts and retries validation immediately if a
+  write-set lock cannot be acquired, avoiding lock convoying in the commit
+  phase.
+- The preemptive-abort optimization uses an approximate commit timestamp and
+  latest read-tuple `wts` checks to identify transactions that will fail
+  read-set validation before they lock the write set.
+- The timestamp-history optimization keeps a bounded history of recent `wts`
+  values per tuple to avoid some unnecessary aborts, but the paper reports no
+  measurable performance gain for its evaluated workloads.
+- TicToc sketches snapshot isolation by splitting one serializable timestamp
+  into `commit_rts` for reads and `commit_wts` for writes, while checking that
+  updated tuples were not modified after the read timestamp.
+- For durability, the paper says TicToc can use conventional logging and
+  sketches parallel logging batches by forcing transactions in a later batch to
+  choose commit timestamps greater than previous-batch timestamps. Scalable
+  logging itself is left out of scope.
+
+**GPU DB mapping:** TicToc is most useful as a warning against a single global
+transaction or snapshot counter on the GPU DB write path. A future write-heavy
+or high-session engine should avoid turning timestamp allocation into the
+central bottleneck that every admitted session, mutation owner, read-snapshot
+worker, and residency refresh has to touch. Per-record or per-segment
+visibility metadata can let independent partitions commit without global
+coordination when their conflict sets are disjoint.
+
+For the current P8 design, the nearest transfer is a per-resident-segment
+visibility interval. The resident snapshot metadata already needs source WAL
+boundary, read timestamp, invalidation generation, and partition identity.
+TicToc suggests making those boundaries composable at the data item, segment,
+or partition level: a retained read can prove that its snapshot generation is
+valid over the transaction's logical read interval instead of simply asking
+whether it is the latest physical generation.
+
+TicToc's `rts` extension maps to a possible "read lease extension" for CPU
+truth or host-resident versions, but it should not mutate an already-published
+GPU snapshot in place. For GPU DB, extension should be owned by the mutation or
+visibility owner and should publish a new metadata generation or update only
+CPU-side visibility metadata before a snapshot is shared with readers. The hard
+boundary remains WAL-before-visibility and immutable retained snapshot
+publication.
+
+The paper's logical-time growth measurement is a strong benchmark idea. In GPU
+DB, the rate at which per-partition visibility clocks advance relative to
+committed transactions can expose actual contention. If logical time grows
+slowly while commit count grows quickly, the workload has enough disjointness
+for partition-owned commit, read-snapshot sharing, and retained GPU batching.
+If one tuple or partition forces every commit to advance the same clock, the
+engine should surface that as hot-key or hot-partition admission pressure.
+
+The no-wait and preemptive-abort mechanisms map well to high-concurrency
+session admission. A transaction that cannot acquire a narrow write-set or
+partition-owner slot should quickly release any partial resources and requeue
+or reject with an explicit conflict reason instead of sitting on scarce GPU
+staging buffers, response-ring space, or owner-domain locks.
+
+**Risks and mismatches:** TicToc is an in-memory, shared-everything OLTP
+concurrency-control paper, not a GPU execution or multi-tier cache paper. Its
+tuple-level timestamp word assumes cheap CPU atomics and cache-coherent memory;
+that mechanism should not be copied directly into GPU kernels or durable
+resident snapshots.
+
+The paper does not solve scalable logging, durable recovery ordering, phantom
+prevention for serializable index scans, or multi-version storage retention.
+It notes that serializable scanning needs extra index locking or validation,
+and leaves applying data-driven timestamps to order-preserving indexes as
+future work. That matters for GPU DB range scans and retained column snapshots:
+tuple visibility alone is insufficient if predicates can miss inserted rows.
+
+TicToc can also pick logical commit orders that differ from physical commit
+order. That is acceptable only if every downstream system agrees on logical
+visibility boundaries: WAL records, CPU indexes, resident GPU generations,
+response publication, and replay must not accidentally assume physical commit
+order is the serialization order.
+
+Finally, the weaker-isolation support is only sketched. The GPU DB should not
+adopt a split read/write timestamp model without a precise SQL isolation
+contract and tests that cover writes racing retained reads, refresh, eviction,
+and replay.
+
+**Benchmark candidates:**
+
+- Add a synthetic timestamp-allocation microbenchmark for the current write
+  path: global atomic transaction id, per-partition logical clock, and
+  per-segment visibility interval. Minimum gate: report committed rows/sec,
+  abort/retry count, p50/p99 commit latency, and cache-line contention under
+  disjoint keys and hot-key workloads.
+- Track logical visibility-clock growth per relation or partition during COPY,
+  INSERT, and future UPDATE workloads. Compare committed transaction count to
+  maximum visibility-clock advance. Use the ratio as a contention signal for
+  partition ownership and micro-batch eligibility.
+- Prototype a CPU-only per-segment visibility interval proof before any GPU
+  integration. Readers should validate that a retained snapshot is compatible
+  with their read boundary; writers should invalidate or publish new generation
+  metadata without mutating published GPU buffers.
+- Add a no-wait validation/admission experiment for write-set ownership:
+  compare waiting for owner locks versus immediate release/retry under hot
+  partitions. Failure condition: retries improve throughput but blow up p99 or
+  starve long transactions.
+- Extend route telemetry with a conflict reason vocabulary: timestamp clock
+  contention, write-set lock conflict, read interval not extensible,
+  invalidated resident generation, index/range phantom risk, and WAL batch
+  boundary. Proof gate: every aborted or retried write reports exactly one
+  primary reason.
+- For future snapshot isolation work, test a split read/write timestamp model
+  against retained GPU reads: read timestamp chosen before execution, write
+  timestamp chosen at commit, and resident generation validated against both.
+  Failure condition: any stale retained read can pass after a WAL-visible
+  mutation invalidates its segment.

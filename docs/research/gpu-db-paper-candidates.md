@@ -20,9 +20,10 @@ mechanical sympathy, multi-tier cache/data placement, or query optimization.
 
 ### Transaction processing, write path, and concurrency control
 
-- `queued` — **TicToc: Time Traveling Optimistic Concurrency Control**,
+- `reviewed` — **TicToc: Time Traveling Optimistic Concurrency Control**,
   Yu et al., SIGMOD 2016.
   URL: `https://dl.acm.org/doi/10.1145/2882903.2882935`
+  PDF: `https://db.cs.cmu.edu/papers/2016/yu-sigmod2016.pdf`
   Why: timestamp-based optimistic concurrency control for high-throughput
   transaction processing; useful for comparing MVCC/snapshot timestamp choices.
 - `queued` — **Cicada: Dependably Fast Multi-Core In-Memory Transactions**,
@@ -318,9 +319,14 @@ Append new candidates here as each paper is processed.
 - `queued` — **Memory-Optimized Multi-Version Concurrency Control for
   Disk-Based Database Systems**, Freitag et al., PVLDB 2022.
   URL: `https://www.vldb.org/pvldb/vol15/p2797-freitag.pdf`
-  Why: Umbra MVCC design cited by the LeanStore snapshot-isolation paper;
-  relevant to disk-based MVCC, version-chain metadata, and snapshot visibility
-  without sacrificing hot-path performance.
+  Why: memory-optimized MVCC in a disk-backed engine; relevant to version
+  storage, undo chains, and cache-aware snapshot visibility.
+- `queued` — **FOEDUS: OLTP Engine for a Thousand Cores and NVRAM**,
+  Kimura, SIGMOD 2015.
+  URL: `https://dl.acm.org/doi/10.1145/2723372.2746480`
+  Tech report: `https://www.labs.hpe.com/techreports/2015/HPL-2015-37.pdf`
+  Why: many-core OLTP and NVRAM-oriented storage architecture cited by TicToc;
+  relevant to partition ownership, logging, NUMA locality, and future tiers.
 - `queued` — **Diva: Making MVCC Systems HTAP-Friendly**, Kim et al.,
   SIGMOD 2022.
   URL: `https://doi.org/10.1145/3514221.3526125`
