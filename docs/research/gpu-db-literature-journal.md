@@ -1014,3 +1014,171 @@ Benchmark priorities:
 - Keep latency gates explicit for every fusion or batching experiment, because
   the reviewed GPU papers optimize throughput and response time for analytical
   queries, not pgwire OLTP tail latency.
+
+## Reviewed Papers
+
+### 2026-06-02 - Virtual-Memory Assisted Buffer Management
+
+**Citation:** Viktor Leis, Adnan Alhomssi, Tobias Ziegler, Yannick Loeck, and
+Christian Dietrich. "Virtual-Memory Assisted Buffer Management." Proceedings of
+the ACM on Management of Data 1(1), article 7, SIGMOD/PACMMOD 2023. DOI:
+`10.1145/3588687`. Retrieved 2026-06-02 from the TU Braunschweig/TU Hamburg
+author preprint, `https://www.ibr.cs.tu-bs.de/vss/Publications/2023/leis_23_sigmod.pdf`.
+
+**Category:** multi-tier cache / data placement.
+
+**Relevance tags:** buffer management; virtual memory; NVMe tiering; explicit
+eviction; page fault control; variable-sized pages; OS/DBMS co-design; tier
+telemetry.
+
+**Core idea:** The paper proposes `vmcache`, a buffer manager that uses
+hardware-supported virtual-memory translation for cached page lookup while
+keeping the DBMS, not the operating system, in charge of page faulting,
+eviction, dirty-page writeback, and replacement policy. It is a middle path
+between ordinary DBMS hash-table buffer pools, which pay software translation
+cost on hits, and file-backed `mmap`, which gives fast TLB-backed hits but
+hands eviction and fault timing to the OS.
+
+The second contribution, `exmap`, is a Linux kernel-module interface for
+scalable page-table manipulation. The authors show that plain Linux virtual
+memory operations can become the bottleneck with modern NVMe devices because
+page-at-a-time `madvise`/fault behavior triggers TLB shootdowns and centralized
+page-allocation costs. `exmap` changes the interface semantics: batch page
+freeing, avoid allocation-time shootdowns, keep a private preallocated page
+pool, expose per-thread control interfaces, and integrate page allocation with
+read I/O through a proxy file descriptor.
+
+The evaluation is storage-engine focused, not SQL-server focused. The authors
+compare `vmcache`, `vmcache+exmap`, LeanStore, WiredTiger, and LMDB using a
+standalone C++ B+tree random lookup workload and TPC-C-like workload on one
+64-core/128-thread EPYC server with a 128 GB cache and a fast Samsung PM1733
+NVMe SSD. Reported in-memory results show `vmcache` scaling to roughly 90M
+random lookups/s and around 3M TPC-C transactions/s in their setup. For
+out-of-memory random lookup, `exmap` improves basic `vmcache` by about 60% and
+lets the design become I/O-bound. The paper also reports that full optimistic
+page reads add less than 8% overhead versus a simple random DRAM read in their
+microbenchmark, while an unsynchronized hash-table translation path is much
+slower for cold DRAM accesses.
+
+**Concrete mechanisms:**
+
+- `vmcache` maps the storage address space into anonymous virtual memory rather
+  than file-backed `mmap`; storage reads and writes remain explicit through
+  calls such as `pread`, async I/O, and `pwrite`.
+- Page identifiers map directly to virtual addresses. Cache hits avoid a
+  DBMS-level PID-to-pointer hash lookup and rely on hardware page translation
+  cached in the TLB.
+- Eviction is DBMS-controlled. Dirty pages are written explicitly before the
+  page is removed from the page table with `MADV_DONTNEED`.
+- A per-page state array is the synchronization source of truth: evicted,
+  locked, unlocked, marked, shared-lock counts, and a version counter are
+  packed into a 64-bit state word.
+- Optimistic reads read the page after sampling state, then validate that the
+  page was not modified or evicted by checking the version. Eviction increments
+  the version, so a concurrent optimistic read may observe zero-page data but
+  fails validation instead of requiring hazard pointers or epoch reclamation.
+- The replacement policy can be DBMS-defined. The implementation uses clock,
+  marking cached pages and clearing marks on access; the cached-page set is
+  tracked in a DRAM-sized hash table used only for misses and eviction, not for
+  hits.
+- Batch eviction writes dirty pages and removes page-table entries in groups
+  of 64 in the implementation, reducing exclusive-lock and page-table churn.
+- Variable-sized DBMS pages become easier: a large logical page can occupy a
+  contiguous virtual range backed by non-contiguous physical pages, avoiding
+  user-space fragmentation and simplifying large strings or compressed column
+  chunks.
+- `exmap` adds vectorized/scattered allocation/free operations over a virtual
+  memory surface, per-thread interfaces with local free lists, page stealing,
+  batched TLB shootdowns, lock-free page-table hot paths, and a proxy file
+  descriptor that can allocate pages and read backing storage in one operation.
+- `exmap` deliberately drops general VM features such as swapping and
+  copy-on-write fork for its controlled surface, making page residency and
+  memory consumption predictable for the DBMS.
+
+**GPU DB mapping:** The most important transfer is the split between
+hardware-assisted address translation and DBMS-owned placement policy. For the
+GPU DB, the host-memory and NVMe tiers should not become invisible OS page
+cache behavior. We want explicit admission, eviction, fallback, and telemetry.
+But the paper argues that explicit DBMS control does not require every hot read
+to pay a hash lookup or pointer-swizzling complexity; virtual-address structure
+can encode placement when the page or segment identifier is stable.
+
+For P8, this maps cleanly to a future host-side tier beneath GPU residency:
+cold partition segments live on NVMe, warm decoded or compressed segments live
+in host DRAM, and hot retained column groups live in GPU memory. A vmcache-like
+host tier could make partition/segment IDs map to stable virtual ranges while
+the cache manager still owns read I/O, dirty writeback, eviction, and
+promotion. GPU resident snapshots would remain immutable performance caches,
+but their CPU-side source segments could be managed with page-state telemetry
+instead of opaque OS cache state.
+
+The variable-sized-page idea is especially useful for GPU DB column groups.
+Compressed chunks, text byte buffers, offsets buffers, and partition-local
+metadata rarely want one universal 4 KB logical shape. A virtual-memory-backed
+host tier can present contiguous logical chunks to decompression, prefix
+filtering, or CUDA staging code while avoiding physical fragmentation in DRAM.
+That fits the P8 direction of generated GPU column-group segments without
+forcing all host-side chunks to be copied into temporary contiguous buffers
+before H2D transfer.
+
+For concurrency and latency, the page-state/version pattern is a useful model
+for immutable snapshot handles and retained route validation. A read worker can
+optimistically access a host segment or resident snapshot only if its generation
+is stable; eviction or invalidation increments the generation and forces retry,
+CPU fallback, or route rejection. This resembles P8's existing validity flags
+but gives a more concrete hot-path contract: state word, version, lock mode,
+mark/evict state, and saturation counters should be cheap enough to check on
+every route.
+
+`exmap` itself is not an immediate implementation dependency. The transferable
+point is that fast storage can make kernel page-table and allocation costs
+visible. If the GPU DB later streams over-resident partitions from NVMe through
+host DRAM to GPU, the benchmark must measure page-table/fault/allocation costs
+separately from device bandwidth, decompression, H2D transfer, and kernel time.
+Otherwise, an apparent "NVMe or GPU bottleneck" may actually be host virtual
+memory churn.
+
+**Risks and mismatches:** The paper targets CPU storage engines with B+trees,
+not a PostgreSQL-compatible SQL server with WAL/MVCC, pgwire, and GPU-resident
+execution. Its experiments disable WAL and use the lowest isolation levels in
+competitor systems, so the reported TPC-C-like throughput is not a direct
+transactional durability result. `exmap` requires a kernel module and new VM
+semantics, which may be unacceptable for portability or deployment. The design
+also consumes page-table and page-state memory proportional to storage size;
+the paper estimates about 16 bytes per 4 KB of storage for full 5-level page
+table plus state, which is reasonable for some NVMe tiers but still a real
+budget when the engine targets very large cold data.
+
+For GPU DB, the biggest mismatch is that GPU memory is not CPU virtual memory.
+TLB-backed CPU page translation does not automatically solve GPU HBM placement,
+CUDA allocation lifetime, GPUDirect Storage behavior, or device-side page
+faulting. A vmcache-style host tier must remain a source or staging tier, not a
+substitute for explicit GPU resident snapshot publication. Variable virtual
+pages also do not remove the need for aligned, pinned, and stream-owned H2D
+buffers.
+
+**Benchmark candidates:**
+
+- Add host-tier residency telemetry before implementing a new cache: segment
+  id, state, generation, page/chunk size, resident host bytes, evict reason,
+  last promotion reason, fault/read count, and retry/fallback count. Minimum
+  gate: no SQL behavior change and route logs can distinguish CPU canonical,
+  host warm, and GPU retained sources.
+- Prototype a virtual-address-shaped host segment table for read-only cold or
+  warm partitions, without kernel modules: stable segment IDs, explicit async
+  reads, explicit eviction, versioned state words, and no hidden OS page-cache
+  dependency in correctness. Failure condition: p50 retained-read latency
+  regresses or queue wait hides the benefit.
+- Measure fixed 4 KB chunks versus variable-sized host column chunks for
+  compressed/text-heavy resident refresh. Expected improvement: fewer temporary
+  copies and better H2D staging for large string/offset/compressed buffers.
+  Required measurement: CPU copy bytes, allocations, H2D bytes, refresh wall
+  time, and route-invalidations caused by chunk pressure.
+- Add an over-resident partition streaming microbenchmark that separates
+  storage read, host allocation/page-table/fault cost, decompression or decode,
+  H2D transfer, CUDA execution, and D2H result time. Minimum proof gate:
+  reported bottleneck is phase-specific, not a single wall-clock bucket.
+- For snapshot validation, test a cheap state-word/generation check on every
+  retained read route. Expected improvement: safer optimistic fast paths and
+  clearer invalidation retries. Failure condition: the state check or cache-line
+  traffic dominates single-session p50 latency.

@@ -115,7 +115,7 @@ mechanical sympathy, multi-tier cache/data placement, or query optimization.
   Why: evaluates OS page-cache and mmap tradeoffs versus explicit DBMS buffer
   management; important for deciding whether tier movement should be explicit
   or delegated to the OS.
-- `queued` — **Virtual-Memory Assisted Buffer Management**, Leis et al.,
+- `reviewed` — **Virtual-Memory Assisted Buffer Management**, Leis et al.,
   SIGMOD/PACMMOD 2023.
   URL: `https://tore.tuhh.de/entities/publication/f82ebf12-6f97-4161-8ad6-d1e94645e33a`
   Why: combines DBMS buffer management with virtual-memory mechanisms for fast
@@ -325,3 +325,9 @@ Append new candidates here as each paper is processed.
   URL: `https://doi.org/10.1145/3514221.3526125`
   Why: vDriver successor cited by the LeanStore paper; relevant to precise
   MVCC garbage collection and reducing long-reader damage in HTAP workloads.
+- `queued` — **Virtual-Memory Assisted Buffer Management In Tiered Memory**,
+  Rayhan and Aref, arXiv 2026.
+  URL: `https://arxiv.org/abs/2603.03271`
+  Why: extends vmcache-style virtual-memory-assisted buffer management to
+  multiple memory tiers such as DRAM, remote memory/CXL-like tiers, and disk;
+  directly relevant to future GPU DB host-tier and cold-partition placement.
