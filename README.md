@@ -90,14 +90,16 @@ Current accepted smoke evidence:
   blocked because GPU DB sustained COPY admission measured below 30k rows/sec
   and retained query timings made the remaining full concurrency curve
   indefensible inside the worker budget. A follow-up 1,048,576-row retained
-  query profile removed the measured query setup bottlenecks. The required COPY
-  admission recheck still missed the 30k rows/sec target and narrowed the next
-  blocker to the WAL commit/flush plus relational value-index append path.
+  query profile removed the measured query setup bottlenecks. The WAL/current
+  apply architecture slice then cleared the bounded 30k rows/sec COPY gate by
+  avoiding duplicate generic state-machine clone/reparse of the current
+  engine-applied COPY WAL entry. The full 10% retry remains the next benchmark
+  decision.
 
 Current blockers and non-claims:
 
 - `missing_partitioned_over_resident_execution`
-- `gpu_db_10pct_copy_admission_wal_value_index_path_required`
+- `p8_identical_10pct_execution_v4_required`
 - `pgsql_128_client_count_query_errors_need_classification`
 - no accepted 10% or full 25% default/tuned PostgreSQL/GPU DB retained curve
 - no completed 125% over-resident PostgreSQL-vs-GPU retained tier
@@ -124,6 +126,8 @@ The latest retained query profile report is
 [docs/testing/reports/2026-06-01-p8-10pct-retained-query-throughput-profile-v1.md](docs/testing/reports/2026-06-01-p8-10pct-retained-query-throughput-profile-v1.md).
 The latest COPY admission recheck report is
 [docs/testing/reports/2026-06-02-p8-10pct-copy-admission-30000-recheck-v1.md](docs/testing/reports/2026-06-02-p8-10pct-copy-admission-30000-recheck-v1.md).
+The latest COPY WAL/current-apply architecture report is
+[docs/testing/reports/2026-06-02-p8-copy-admission-wal-value-index-architecture-v1.md](docs/testing/reports/2026-06-02-p8-copy-admission-wal-value-index-architecture-v1.md).
 
 ## Security And Operations
 

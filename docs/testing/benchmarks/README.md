@@ -88,7 +88,10 @@ follow-up retained-query profile removed the measured 1M-row retained query
 setup bottlenecks for `COUNT(*)`, multi-column int4 lookup, and composite/text
 lookup. A follow-up COPY admission recheck still missed the 30k rows/sec
 target, narrowing the next implementation boundary to the WAL commit/flush plus
-relational value-index append path before any full 10% retry.
+relational value-index append path. The WAL/current-apply architecture slice
+then cleared the bounded 30k rows/sec gate by avoiding duplicate generic
+state-machine clone/reparse of the current engine-applied COPY WAL entry before
+any full 10% retry.
 
 The latest scaled smoke includes:
 
@@ -148,6 +151,9 @@ match-index output.
 - [2026-06-02 10% COPY admission 30k recheck](../reports/2026-06-02-p8-10pct-copy-admission-30000-recheck-v1.md):
   required 1M-row COPY admission recheck, retained-query health smoke, and the
   narrowed WAL/value-index COPY admission blocker.
+- [2026-06-02 COPY admission WAL/value-index architecture](../reports/2026-06-02-p8-copy-admission-wal-value-index-architecture-v1.md):
+  the bounded WAL/current-apply architecture slice that cleared the 30k
+  rows/sec COPY gate and left the full 10% retry as the next benchmark decision.
 - [2026-06-01 retained composite/text lookup route](../reports/2026-06-01-p8-retained-composite-text-lookup-route-v1.md):
   retained composite lookup progression.
 - [2026-05-31 25% aggregate refresh after BETWEEN](../reports/2026-05-31-p8-25pct-aggregate-refresh-after-between-v1.md):
@@ -157,13 +163,11 @@ match-index output.
 
 ## Remaining Blockers
 
-- `gpu_db_10pct_copy_admission_wal_value_index_path_required`: the first 10%
-  single-load attempt loaded the target rows, but GPU DB COPY admission measured
-  below the required 30k rows/sec target. A later 1M-row retained-query probe
-  removed the measured query setup bottlenecks; the required COPY admission
-  recheck still measured only `21,569 rows/sec` GPU DB load wall time and
-  `26,668 rows/sec` COPY chunk admission, with the dominant measured boundary in
-  WAL commit/flush plus relational value-index append.
+- `p8_identical_10pct_execution_v4_required`: the bounded WAL/current-apply
+  architecture slice cleared the 30k rows/sec COPY gate at `31,072 rows/sec`
+  GPU DB load wall time and `42,376 rows/sec` average COPY chunk admission. The
+  next benchmark decision is the full 64,424,510-row 10% retry capped at
+  concurrency `1,2,4,8,16,32,64`.
 - `pgsql_128_client_count_query_errors_need_classification`: default/tuned
   PostgreSQL 128-client count-query errors appeared in the 10% attempt and must
   be classified before trusting 128-client comparator rows.

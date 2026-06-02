@@ -8673,10 +8673,13 @@ impl Engine {
             .collect();
 
         for e in &to_apply {
-            self.sm.apply(e)?;
             if e.index == token.index {
+                // The caller applies the current entry directly through Engine state. Avoid
+                // cloning and reparsing the large SQL payload through the generic KV state
+                // machine on the COPY hot path while preserving WAL/replay records.
                 apply_current(self)?;
             } else {
+                self.sm.apply(e)?;
                 self.apply_mvcc_entry(e)?;
             }
             self.repl.mark_applied(e.index);
