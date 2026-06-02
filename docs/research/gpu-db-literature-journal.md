@@ -3028,3 +3028,165 @@ policy.
 - Keep hardware-assisted preemption as a later experiment: compare ordinary
   cooperative flags against OS signal or userspace-interrupt-like notification
   only after cooperative slicing fails a measured tail-latency gate.
+
+### 2026-06-03 - Resource-adaptive query execution with paged memory management
+
+**Citation:** Riki Otaki, Charles Benello, Jun Hyuk Chang, Goetz Graefe, and
+Aaron J. Elmore. "Resource-Adaptive Query Execution with Paged Memory
+Management." CIDR 2025. Retrieved 2026-06-03 from
+`https://www.vldb.org/cidrdb/papers/2025/p2-otaki.pdf`.
+
+**Category:** multi-tier cache / data placement and query admission.
+
+**Relevance tags:** adaptive memory allocation; buffer pool execution memory;
+query context switching; paged intermediate state; file-cache versus operator
+memory; SLA-aware admission; LIPAH; buffer-pool contention; memory pressure;
+spill control.
+
+**Core idea:** The paper argues that cloud DBMS resource management is hurt by
+two opposite defaults: demand-driven allocation can let workloads thrash shared
+resources, while static memory limits leave resources idle when demand shifts.
+Its proposed direction is to make query execution memory page-based and managed
+by the same buffer-pool machinery that manages persistent data pages. If
+operators store intermediate state in buffer-pool pages, the system can resize
+working memory, suspend and resume queries, and exchange memory between file
+caches and operators by pinning or unpinning pages rather than serializing large
+heap objects.
+
+The paper also proposes cost-aware allocation. Each memory consumer exposes a
+memory-to-cost relationship, where cost can be an SLA penalty derived from
+latency, I/O, or another performance target. The allocator can then move memory
+from consumers with low marginal value to consumers with high marginal value,
+or use a price/broker-style mechanism. This is intentionally exploratory; the
+paper identifies communication, pricing, and guarantee protocols as open
+research questions rather than solved production policy.
+
+The concrete implementation idea that is easiest to transfer is LIPAH, Logical
+ID with Physical Address Hinting. References to pages carry both a logical page
+id and a physical frame-id hint. Access first checks the hinted frame and falls
+back to the central page-to-frame mapping only if the frame no longer contains
+the requested page. This avoids the expensive unswizzling requirements of
+traditional pointer swizzling, works for graph-like structures with cycles, and
+reduces contention on the shared mapping table.
+
+**Concrete mechanisms:**
+
+- Query plans are broken into pipelines ending at stateful operators. Stateful
+  operators such as sort, aggregation, and hash-table build allocate working
+  memory as buffer-pool frames.
+- A query can pin working-memory pages while using them, unpin pages when it is
+  suspended or when memory should be returned, and later request the pages
+  again to resume execution.
+- The buffer pool can lazily spill unpinned operator pages, avoiding abrupt
+  serialization/deserialization spikes that occur when heap-resident operator
+  state must be checkpointed or spilled all at once.
+- The paper distinguishes memory-aware operators, which explicitly react to
+  page availability, from memory-oblivious operators, which are designed to
+  tolerate eviction of working-memory pages.
+- Cost-aware allocation uses performance-memory curves to derive
+  cost-memory curves. The example is sort memory: enough memory may avoid extra
+  merge passes, but that same memory can also reduce file-cache capacity and
+  increase I/O elsewhere.
+- Exchange-based policies reallocate memory when it benefits both consumers or
+  lowers global penalty. Pricing-based policies charge consumers for memory
+  based on demand and scarcity, with auctions as one possible broker design.
+- LIPAH stores an 8-byte fat pointer: a 4-byte logical page id plus a 4-byte
+  frame-id hint. An invalid maximum frame id forces slow-path lookup until the
+  hint is refreshed.
+- After a slow-path lookup finds or loads a page, the access method may
+  opportunistically acquire a write latch on the parent page and update the
+  physical hint.
+- Unlike pointer swizzling, LIPAH does not require all references to a page to
+  be found and unswizzled before eviction. The logical id remains authoritative
+  even when the physical hint is stale.
+- The preliminary evaluation uses a Rust row-store prototype, 256 KB pages, and
+  TPC-H SF1. Seven of 22 TPC-H queries were more than 1.5x slower with paged
+  execution than non-paged Rust containers, indicating real overhead that still
+  needs layout and zero-copy work.
+- In a paged hash-index experiment with 10 million key-value pairs, LIPAH
+  reduces insertion and lookup latency versus a normal hash index as thread
+  count rises, because linked-page traversal avoids repeated central
+  page-to-frame mapping latches.
+
+**GPU DB mapping:** This paper strengthens the P8 direction that memory should
+be treated as explicit, observable tiers with admission and backpressure,
+rather than as invisible heap growth. GPU DB has at least five memory consumers
+that can conflict: CPU canonical/MVCC state, CPU derived indexes and stats,
+GPU resident snapshots, pinned host staging buffers, and query/operator
+intermediate state. A static budget per component will be too rigid once
+retained reads, COPY batches, refreshes, CPU fallbacks, and over-resident scans
+run concurrently.
+
+Paged operator state maps to a host-side execution-memory tier. Long CPU
+fallback scans, grouped aggregate fallbacks, refresh builders, and over-resident
+prefetch/decompression stages should allocate bounded page/chunk objects with
+known owners instead of unbounded heap structures. Under pressure, the runtime
+could release or demote pages from long low-priority work while protecting
+short retained reads, commit-critical mutation work, response buffers, and
+pinned GPU staging budgets.
+
+The cost-memory model is a useful admission vocabulary for GPU routes. A
+retained lookup batch may have high latency value for a small amount of pinned
+or resident memory; a long scan may benefit from much more memory but have a
+weaker SLA. The scheduler should be able to explain why memory is granted to
+one route and denied to another in terms of marginal latency, I/O, transfer
+bytes, GPU queue delay, refresh age, and overload policy.
+
+LIPAH suggests a concrete pattern for tiered metadata. Resident or host-cached
+segments can use logical segment/page ids as correctness references plus
+physical hints to GPU buffers, CPU frames, pinned staging pages, or NVMe page
+locations. If a hint is stale, the lookup falls back to the residency manager's
+authoritative map. This avoids letting raw physical addresses or CUDA buffer
+handles become durable authority, while still reducing central-map contention
+on hot paths.
+
+For P8, the warning is equally important: paged execution is not free. If GPU
+DB turns every intermediate into slotted pages, short lookups and small
+aggregates may pay more pointer chasing, latch traffic, and serialization cost
+than they save. The first implementation should use page/chunk ownership for
+large or pressure-sensitive work, while preserving compact fast-path buffers
+for latency-critical retained requests.
+
+**Risks and mismatches:** This is a design/exploration paper with preliminary
+evaluation, not a mature production engine. The TPC-H prototype is row-based,
+single-thread query execution in the reported paged-versus-non-paged
+comparison, and lacks a cost-based optimizer. It does not evaluate GPU memory,
+pinned memory, NVMe tiering, PostgreSQL protocol sessions, WAL/MVCC
+visibility, or million-session admission.
+
+The cost-aware allocation discussion leaves major policy pieces open,
+including how often consumers communicate their value curves, how prices or
+budgets are set, and how guarantees remain stable under sudden demand changes.
+GPU DB should treat it as a benchmark framework, not as a ready allocator.
+LIPAH also adds pointer width and still requires latch/correctness discipline;
+for GPU-resident buffers, frame-id-like hints must include generation checks so
+stale hints cannot route a query to an invalid resident snapshot.
+
+**Benchmark candidates:**
+
+- Add an execution-memory budget model for CPU fallback scans, refresh builds,
+  over-resident prefetch, response encoding, and pinned staging buffers.
+  Minimum gate: every allocation has an owner, class, byte count, lifetime, and
+  overload/fallback reason.
+- Prototype paged/chunked intermediate state for one large CPU fallback
+  aggregate or sort, while keeping the short retained lookup path on compact
+  fast buffers. Measure p50/p99 latency, allocations, spill/demotion events,
+  and throughput under memory pressure.
+- Build a marginal-value admission experiment: give retained lookups,
+  refreshes, COPY chunks, and long scans different SLA penalties, then compare
+  static quotas, FIFO allocation, and marginal-cost memory transfer. Failure
+  condition: the policy cannot explain why a high-priority short route waited
+  behind lower-value memory use.
+- Implement logical-id plus physical-hint handles for resident segment lookup
+  in a CPU-only prototype: logical segment id, generation, and optional cached
+  frame/residency slot. Proof gate: stale hints always fall back to the
+  authoritative map and never serve invalidated generations.
+- Measure central-map contention separately from data movement by comparing
+  normal segment-map lookups with hint-validated lookups at high thread counts.
+  Required metrics: map latch/cacheline contention, hit rate, stale-hint rate,
+  and p99 lookup latency.
+- Add a suspend/resume proof for long refresh or CPU fallback work: release
+  unpinned intermediate chunks under pressure, let urgent retained reads run,
+  then resume without re-executing from the beginning. Failure condition:
+  context switching requires serializing the full operator state or breaks
+  WAL/resident generation ordering.

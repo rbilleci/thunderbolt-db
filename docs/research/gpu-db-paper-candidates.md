@@ -390,9 +390,9 @@ Append new candidates here as each paper is processed.
   URL: `https://www.vldb.org/cidrdb/papers/2025/p8-huang.pdf`
   Why: CXL-pod database architecture cited by vmcache^n; relevant to
   disaggregated/tiered memory placement and future host-memory expansion.
-- `queued` — **Resource-Adaptive Query Execution with Paged Memory
+- `reviewed` — **Resource-Adaptive Query Execution with Paged Memory
   Management**, Otaki, Benello, Elmore, and Graefe, CIDR 2025.
-  URL: `https://vldb.org/cidrdb/papers/2025/p2-otaki.pdf`
+  URL: `https://www.vldb.org/cidrdb/papers/2025/p2-otaki.pdf`
   Why: paged-memory and resource-adaptive execution work cited by vmcache^n;
   relevant to query admission and execution under memory-tier pressure.
 - `queued` — **Nomad: Non-Exclusive Memory Tiering via Transactional Page
@@ -492,3 +492,15 @@ Append new candidates here as each paper is processed.
   Why: general hardware-assisted userspace preemption framework cited by
   PreemptDB; useful if GPU DB wants preemption mechanics outside a full
   transaction-engine rewrite.
+- `queued` — **Flexible Resource Allocation for Relational
+  Database-as-a-Service**, Arora et al., PVLDB 2023.
+  URL: `https://www.vldb.org/pvldb/vol16/p4202-narasayya.pdf`
+  Why: modern DBaaS resource-allocation paper cited by Resource-Adaptive Query
+  Execution; relevant to pricing or value-of-memory admission policies for
+  multi-tenant/session-heavy GPU DB workloads.
+- `queued` — **Robust External Hash Aggregation in the Solid State Age**,
+  Kuiper, Boncz, and Muhleisen, ICDE 2024.
+  URL: `https://doi.org/10.1109/ICDE60146.2024.00211`
+  Why: DuckDB external aggregation work cited by Resource-Adaptive Query
+  Execution; useful for paged intermediate state, spill-resistant aggregates,
+  and over-resident query execution under bounded memory.
