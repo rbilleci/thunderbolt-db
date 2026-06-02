@@ -1579,3 +1579,151 @@ production pgwire IO worker pool.
 - For the next paper, prefer a transaction/concurrency/runtime candidate such
   as Oze, Chiller, Shenango, Caladan, or Shinjuku over another GPU analytics
   paper unless a specific GPU hardware question becomes urgent.
+
+### 2026-06-02 - Oze decentralized graph-based concurrency control
+
+**Citation:** Jun Nemoto, Takashi Kambayashi, Takashi Hoshino, and
+Hideyuki Kawashima. "Oze: Decentralized Graph-based Concurrency Control
+for Long-running Update Transactions." PVLDB 18(8):2321-2333, 2025.
+doi:10.14778/3742728.3742730. Retrieved 2026-06-02 from the PVLDB
+PDF, `https://vldb.org/pvldb/vol18/p2321-nemoto.pdf`.
+
+**Category:** transaction processing / write path and concurrency control.
+
+**Relevance tags:** MVSG; serializable concurrency control; long update
+transactions; short transaction throughput; dependency graph; dynamic
+version ordering; protocol switching; phantom avoidance; epoch GC; OLTP
+benchmarking.
+
+**Core idea:** Oze targets mixed workloads where one long-running update
+transaction must commit while many short conflicting transactions keep high
+throughput. The paper's central claim is that conventional OCC and MVCC
+protocols often abort the long transaction as a false positive because they
+constrain the serialization order too much, while 2PL can commit the long
+transaction only by making short transactions wait behind locks. Oze instead
+uses a multi-version serialization graph (MVSG) to search a wider
+serializable scheduling space, but decentralizes the graph into record-local
+and transaction-local pieces so it can run on many cores.
+
+The motivating workload is BoMB, a bill-of-materials benchmark with one
+long product-costing update transaction and five short transactions that can
+change raw-material costs, products, quantities, and journal-voucher state.
+The long transaction reads and updates a large dependency tree, so it creates
+the kind of long-term anti-dependency chains that ordinary OLTP benchmarks
+do not stress.
+
+**Concrete mechanisms:**
+
+- Oze stores a record-local graph with the versions of a record and a
+  transaction-local graph with the records and followers relevant to a
+  transaction about to commit. Serializability is checked by merging the
+  target record-local graphs needed for that transaction rather than by
+  locking one centralized global graph.
+- Reads choose the latest committed version that does not create a cycle in
+  the record-local graph. If a newer version is skipped, Oze records
+  rw-dependency edges from the reader to the writers of skipped versions.
+- Validation first chooses a version order for each written record, installs
+  pending versions, then repeatedly merges record-local graphs for read-set
+  records and follower records until the transaction-local graph is acyclic
+  or an abort is required.
+- Dynamic version ordering first tries ordinary postposing, then tries
+  order forwarding: placing a new version before selected existing writers
+  when that keeps the graph acyclic. Forwarding is bounded within an epoch to
+  preserve linearizability and simplify cleanup.
+- Oze switches between an MVSG mode and an OCC mode. MVSG mode starts when a
+  long transaction aborts; workers return to OCC after no long transaction is
+  observed for a configured period. Transition mode maintains graph state
+  while validating with OCC, which the paper argues is safe because OCC's
+  scheduling space is narrower.
+- Long validation can be parallelized by assigning target-record graph merges
+  to validator threads, then merging validator-local graphs back into the
+  transaction-local graph.
+- Phantom avoidance uses a precision-locking-style scan history. Inserts
+  check scan predicates during validation and add graph edges from matching
+  scanners to the inserter instead of relying on ordinary optimistic index
+  node validation.
+- Epochs drive graph and version garbage collection. Oze prevents new
+  incoming edges to old nodes by avoiding reads of old nonlatest versions and
+  disallowing order forwarding across old epochs.
+- The evaluation uses CCBench on a dual-socket, 40-core Xeon server and
+  compares Oze with Silo, TicToc, MOCC, ERMIA/SSN, Cicada, 2PL variants, and
+  D2PL. On BoMB, the paper reports that Oze commits the long transaction
+  while achieving four orders of magnitude higher short-transaction
+  throughput than optimistic and MVCC protocols and up to five times higher
+  throughput than pessimistic protocols. On TPC-C, Oze is comparable but
+  below the peak protocol; the paper reports about 27% lower peak throughput
+  than Silo. Protocol switching and graph GC have visible costs.
+
+**GPU DB mapping:** Oze is most useful for the future write/snapshot side of
+the GPU DB, not for the current retained read benchmark path. The
+transferable idea is to treat "long GPU-visible work" as a first-class
+transactional participant instead of forcing either the long work or the
+short write path into a crude timestamp or lock order. A retained refresh,
+partition rebuild, or long analytical update could carry a dependency
+region, while short writes publish precise edges against affected records or
+partitions. That would let the system distinguish true serialization cycles
+from false-positive invalidations.
+
+For P8, this argues for keeping mutation ownership and resident snapshot
+publication observable enough to add dependency tracking later. The current
+safe design can still invalidate resident generations conservatively, but
+the eventual design should leave space for partition-local dependency graphs:
+record or key-range edge summaries, scan predicate histories, generation
+epochs, and follower sets. Those summaries could decide whether a retained
+GPU snapshot or refresh must abort, wait, rebuild, or can continue on an
+older serializable order.
+
+Oze also sharpens the runtime plan. The production runtime should not route
+all long retained refresh or analytical update work through a single owner
+queue merely because it might conflict. A bounded MVSG-like validation lane
+could run only for long or ambiguous transactions, while the ordinary short
+write path keeps a cheaper OCC/MVCC protocol. That matches the paper's
+protocol-switching lesson: precise graph maintenance is powerful, but it is
+too expensive to pay for every simple OLTP operation.
+
+For 1M logical sessions, the biggest implication is admission classification.
+Sessions that issue ordinary short point writes, read-safe retained reads,
+and long refresh/update work should enter different concurrency classes with
+different metadata budgets. The system can reject or defer long graph-heavy
+work under pressure without forcing every short request to carry graph cost.
+
+**Risks and mismatches:** Oze is CPU OLTP concurrency-control work, not a GPU
+execution or storage-tiering paper. The paper does not address WAL durability,
+GPU memory, CUDA stream ownership, tier placement, or pgwire session scale.
+Its graph maintenance can consume substantial memory; in the protocol
+switching experiment, graph size grows while the long transaction validates,
+and GC temporarily reduces throughput. That is a serious warning for a GPU DB
+whose write path is already sensitive to metadata overhead.
+
+Oze's best results depend on BoMB's specific long-update conflict pattern.
+The benefit may be smaller for append-heavy ingest, mostly read-only retained
+queries, or workloads where conservative invalidation is cheaper than graph
+tracking. The implementation can still produce false-positive aborts because
+decentralized concurrent graph choices are more restrictive than an ideal
+central MVSG. The paper's phantom handling currently describes range-based
+predicates; arbitrary SQL predicates, joins, and GPU-resident column scans
+would need their own conservative summaries.
+
+**Benchmark candidates:**
+
+- Build a no-GPU concurrency simulator for one long retained refresh/update
+  lane plus many short write/read lanes. Compare conservative generation
+  invalidation, 2PL-style waiting, and a coarse partition-local dependency
+  graph. Primary metrics: long-work commit rate, short-write throughput,
+  queue wait, false invalidation count, graph bytes, and validation time.
+- Add metadata-only telemetry to current mutation/residency paths: mutation
+  generation, partition id, invalidated resident generation, snapshot age,
+  long-operation flag, and whether a conflict was exact, partition-wide, or
+  table-wide. This can be done before implementing graph validation.
+- Prototype protocol classification before graph logic: cheap path for short
+  writes and read-only retained reads, expensive path only for long refresh or
+  update transactions. Gate: no measurable overhead on the existing short
+  COPY/admission smoke when the expensive class is idle.
+- Create a BoMB-inspired mixed workload for GPU DB using one long product-cost
+  or aggregate refresh over a dependency tree, plus short row updates and
+  point reads. Measure whether long work forces owner queue waits or can be
+  explicitly deferred while short requests continue.
+- If dependency tracking is attempted, start at partition granularity with
+  epoch-bounded GC. Required evidence: graph memory remains bounded,
+  validation p99 is visible, and old retained generations retire when the
+  oldest active epoch advances.

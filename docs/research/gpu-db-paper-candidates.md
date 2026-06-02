@@ -346,7 +346,7 @@ Append new candidates here as each paper is processed.
   Why: combines learned optimizer search with DBMS operator restrictions and
   beam search; relevant to adding learned GPU route suggestions without
   surrendering deterministic planner guardrails.
-- `queued` — **Oze: Decentralized Graph-Based Concurrency Control for
+- `reviewed` — **Oze: Decentralized Graph-Based Concurrency Control for
   Long-Running Update Transactions**, Nemoto et al., PVLDB 2025.
   URL: `https://vldb.org/pvldb/vol18/p2321-nemoto.pdf`
   Why: modern multi-version serialization-graph concurrency control for
@@ -359,3 +359,10 @@ Append new candidates here as each paper is processed.
   Why: production-oriented hybrid protocol combining long-transaction MVCC and
   short-transaction OCC, cited in the same Tsurugi/RSS research ecosystem and
   relevant to GPU DB mixed OLTP/analytical ownership boundaries.
+- `queued` — **Aria: A Fast and Practical Deterministic OLTP Database**, Lu,
+  Yu, Cao, and Madden, PVLDB 2020.
+  URL: `https://www.vldb.org/pvldb/vol13/p2047-lu.pdf`
+  Why: deterministic OLTP execution without a global serial schedule bottleneck;
+  useful as a contrast point for Oze, mutation batching, and whether
+  predeclared GPU DB write/read sets can improve concurrency without forcing
+  long retained refresh work to stall short transactions.
