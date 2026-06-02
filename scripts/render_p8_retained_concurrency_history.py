@@ -2,6 +2,7 @@
 import csv
 import json
 import math
+import os
 import sys
 from html import escape
 from pathlib import Path
@@ -23,11 +24,16 @@ def load_previous(path):
                 item = dict(row)
                 item["series"] = "persistent_one_shot"
                 rows.append(item)
+            else:
+                rows.append(dict(row))
     return rows
 
 
 def load_current(path):
     rows = []
+    series = os.environ.get(
+        "GPU_DB_P8_RETAINED_HISTORY_SERIES", "steady_state_after_response_path"
+    )
     with path.open() as handle:
         for line in handle:
             item = json.loads(line)
@@ -35,7 +41,7 @@ def load_current(path):
                 continue
             rows.append(
                 {
-                    "series": "steady_state_after_response_path",
+                    "series": series,
                     "query": item["query"],
                     "concurrency": str(item["concurrency"]),
                     "client_driver": item["client_driver"],
@@ -124,6 +130,7 @@ def chart(path, title, rows, key, ylabel, phase_query=None):
     series_specs = [
         ("persistent_one_shot", "#3b82f6", "one-shot persistent"),
         ("steady_state_after_response_path", "#047857", "steady-state after"),
+        ("retained_response_cache_fast_path", "#dc2626", "response cache fast path"),
     ]
     if phase_query:
         query_specs = [(phase_query, dict(QUERIES)[phase_query])]
@@ -189,11 +196,11 @@ def phase_chart(path, title, rows, query):
         ("pgwire write", "phase_client_write_avg_us", "#dc2626"),
         ("cuda event", "phase_cuda_event_avg_us", "#0891b2"),
     ]
-    current = [
-        row
-        for row in rows
-        if row["series"] == "steady_state_after_response_path" and row["query"] == query
-    ]
+    phase_series = os.environ.get(
+        "GPU_DB_P8_RETAINED_PHASE_SERIES",
+        os.environ.get("GPU_DB_P8_RETAINED_HISTORY_SERIES", "steady_state_after_response_path"),
+    )
+    current = [row for row in rows if row["series"] == phase_series and row["query"] == query]
     current.sort(key=lambda row: numeric(row, "concurrency"))
     width, height = 920, 420
     left, right, top, bottom = 85, 30, 45, 65

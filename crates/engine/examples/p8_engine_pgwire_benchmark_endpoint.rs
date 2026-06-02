@@ -1,8 +1,9 @@
+use std::collections::HashMap;
 use std::error::Error;
 use std::fs::{File, OpenOptions};
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -14,6 +15,58 @@ use gpu_db_protocol::{
 };
 
 const SSL_REQUEST_CODE: u32 = 80877103;
+
+struct RetainedReadResponseCache {
+    enabled: bool,
+    generation: u64,
+    entries: HashMap<String, (u64, Vec<u8>)>,
+    hits: u64,
+    misses: u64,
+    invalidations: u64,
+}
+
+impl RetainedReadResponseCache {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            generation: 0,
+            entries: HashMap::new(),
+            hits: 0,
+            misses: 0,
+            invalidations: 0,
+        }
+    }
+
+    fn get(&mut self, sql: &str) -> Option<Vec<u8>> {
+        if !self.enabled {
+            return None;
+        }
+        match self.entries.get(sql) {
+            Some((generation, bytes)) if *generation == self.generation => {
+                self.hits = self.hits.saturating_add(1);
+                Some(bytes.clone())
+            }
+            _ => {
+                self.misses = self.misses.saturating_add(1);
+                None
+            }
+        }
+    }
+
+    fn insert(&mut self, sql: String, bytes: Vec<u8>) {
+        if self.enabled {
+            self.entries.insert(sql, (self.generation, bytes));
+        }
+    }
+
+    fn invalidate(&mut self) {
+        if self.enabled {
+            self.generation = self.generation.saturating_add(1);
+            self.invalidations = self.invalidations.saturating_add(1);
+            self.entries.clear();
+        }
+    }
+}
 
 struct PendingCopy {
     copy: CopyFromStdin,
@@ -671,6 +724,7 @@ fn startup_code(frame: &[u8]) -> Option<u32> {
 fn handle_client_io(
     mut stream: TcpStream,
     request_tx: mpsc::Sender<EngineRequest>,
+    retained_read_response_cache: Arc<Mutex<RetainedReadResponseCache>>,
 ) -> Result<bool, String> {
     let mut startup = match read_startup_frame(&mut stream).map_err(|err| err.to_string())? {
         Some(frame) => frame,
@@ -692,6 +746,10 @@ fn handle_client_io(
     while let Some(frame) = read_tagged_frame(&mut stream).map_err(|err| err.to_string())? {
         match parse_frontend_message(&frame).map_err(|err| err.to_string())? {
             FrontendMessage::SimpleQuery(sql) if parse_copy_from_stdin(&sql).is_some() => {
+                retained_read_response_cache
+                    .lock()
+                    .map_err(|_| "retained read response cache lock poisoned".to_string())?
+                    .invalidate();
                 match request_engine(&request_tx, EngineCommand::StartCopy(sql))? {
                     EngineResponse::CopyStarted { bytes, pending } => {
                         stream.write_all(&bytes).map_err(|err| err.to_string())?;
@@ -709,10 +767,39 @@ fn handle_client_io(
                 }
             }
             FrontendMessage::SimpleQuery(sql) => {
-                write_engine_response(
-                    &mut stream,
-                    request_engine(&request_tx, EngineCommand::SimpleQuery(sql))?,
-                )?;
+                match parse_command(&sql).map_err(|err| err.to_string())? {
+                    Command::Select(_) => {
+                        let cached = retained_read_response_cache
+                            .lock()
+                            .map_err(|_| "retained read response cache lock poisoned".to_string())?
+                            .get(&sql);
+                        if let Some(bytes) = cached {
+                            stream.write_all(&bytes).map_err(|err| err.to_string())?;
+                            continue;
+                        }
+                        let response =
+                            request_engine(&request_tx, EngineCommand::SimpleQuery(sql.clone()))?;
+                        if let EngineResponse::Bytes(bytes) = &response {
+                            retained_read_response_cache
+                                .lock()
+                                .map_err(|_| {
+                                    "retained read response cache lock poisoned".to_string()
+                                })?
+                                .insert(sql, bytes.clone());
+                        }
+                        write_engine_response(&mut stream, response)?;
+                    }
+                    _ => {
+                        retained_read_response_cache
+                            .lock()
+                            .map_err(|_| "retained read response cache lock poisoned".to_string())?
+                            .invalidate();
+                        write_engine_response(
+                            &mut stream,
+                            request_engine(&request_tx, EngineCommand::SimpleQuery(sql))?,
+                        )?;
+                    }
+                }
             }
             FrontendMessage::CopyData(bytes) => {
                 let pending = pending_copy
@@ -722,6 +809,10 @@ fn handle_client_io(
                 commit_pending_copy_chunks(pending, &request_tx, chunks)?;
             }
             FrontendMessage::CopyDone => {
+                retained_read_response_cache
+                    .lock()
+                    .map_err(|_| "retained read response cache lock poisoned".to_string())?
+                    .invalidate();
                 let mut pending = pending_copy
                     .take()
                     .ok_or("COPY done arrived without pending COPY stream")?;
@@ -752,19 +843,34 @@ fn main() -> Result<(), Box<dyn Error>> {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(1);
+    let retained_read_response_cache_enabled =
+        std::env::var("GPU_DB_P8_ENGINE_PGWIRE_RETAINED_READ_RESPONSE_CACHE")
+            .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(false);
 
     let listener = TcpListener::bind(&listen)?;
     let (request_tx, request_rx) = mpsc::channel::<EngineRequest>();
     let (completed_tx, completed_rx) = mpsc::channel::<()>();
+    let retained_read_response_cache = Arc::new(Mutex::new(RetainedReadResponseCache::new(
+        retained_read_response_cache_enabled,
+    )));
     let accept_request_tx = request_tx.clone();
     let accept_completed_tx = completed_tx.clone();
+    let accept_retained_read_response_cache = Arc::clone(&retained_read_response_cache);
     let accept_handle = thread::spawn(move || -> Result<(), String> {
         for stream in listener.incoming().take(max_sessions) {
             let stream = stream.map_err(|err| err.to_string())?;
             let client_request_tx = accept_request_tx.clone();
             let client_completed_tx = accept_completed_tx.clone();
+            let client_retained_read_response_cache =
+                Arc::clone(&accept_retained_read_response_cache);
             thread::spawn(move || {
-                let completed = handle_client_io(stream, client_request_tx).unwrap_or(false);
+                let completed = handle_client_io(
+                    stream,
+                    client_request_tx,
+                    client_retained_read_response_cache,
+                )
+                .unwrap_or(false);
                 if completed {
                     let _ = client_completed_tx.send(());
                 }
@@ -780,6 +886,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     state.fact("backend_writer_api_available", true)?;
     state.fact("owner_thread_engine_scheduler", true)?;
     state.fact("client_io_workers_engine_owned_state", false)?;
+    state.fact(
+        "retained_read_response_cache_enabled",
+        retained_read_response_cache_enabled,
+    )?;
     state.fact("max_sessions", max_sessions)?;
     state.fact(
         "crate_direction",
@@ -840,5 +950,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     let _ = accept_handle.join();
     state.fact("completed_client_sessions", completed)?;
+    let cache = retained_read_response_cache
+        .lock()
+        .map_err(|_| "retained read response cache lock poisoned")?;
+    state.fact("retained_read_response_cache_hits", cache.hits)?;
+    state.fact("retained_read_response_cache_misses", cache.misses)?;
+    state.fact(
+        "retained_read_response_cache_invalidations",
+        cache.invalidations,
+    )?;
     Ok(())
 }
