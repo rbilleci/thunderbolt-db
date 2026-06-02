@@ -287,7 +287,7 @@ Append new candidates here as each paper is processed.
   Why: contention-aware partitioning and transaction execution for fast
   networks, relevant to partition owners, admission, and high-contention
   write-path routing.
-- `queued` — **Datacenter RPCs can be General and Fast**, Kalia et al.,
+- `reviewed` — **Datacenter RPCs can be General and Fast**, Kalia et al.,
   NSDI 2019.
   URL: `https://www.usenix.org/conference/nsdi19/presentation/kalia`
   Why: eRPC's session, message-buffer, congestion-control, and polling design
@@ -298,3 +298,19 @@ Append new candidates here as each paper is processed.
   Preprint: `https://chenyoumin1993.github.io/papers/eurosys19-scalerpc.pdf`
   Why: ScaleRPC-style resource sharing over RDMA connection state may inform
   future session multiplexing and bounded transport resource budgets.
+- `queued` — **Carousel: Scalable Traffic Shaping at End Hosts**,
+  Saeed et al., SIGCOMM 2017.
+  URL: `https://doi.org/10.1145/3098822.3098852`
+  Why: rate-limiter design used by eRPC; relevant to per-session admission,
+  congestion shaping, and bounded response scheduling at high connection
+  counts.
+- `queued` — **TIMELY: RTT-based Congestion Control for the Datacenter**,
+  Mittal et al., SIGCOMM 2015.
+  URL: `https://doi.org/10.1145/2785956.2787510`
+  Why: eRPC's congestion-control path builds on Timely; useful for deciding
+  whether GPU DB network admission should use RTT/queue-delay telemetry.
+- `queued` — **Shinjuku: Preemptive Scheduling for microsecond-scale Tail
+  Latency**, Kaur et al., NSDI 2019.
+  URL: `https://www.usenix.org/conference/nsdi19/presentation/kagami`
+  Why: microsecond-scale request scheduling and preemption; relevant to
+  separating short retained reads from long mutation, scan, or refresh work.

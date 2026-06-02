@@ -38,6 +38,160 @@ target.
 
 ## Reviewed Papers
 
+### 2026-06-02 - Datacenter RPCs can be General and Fast
+
+**Citation:** Anuj Kalia, Michael Kaminsky, and David G. Andersen.
+"Datacenter RPCs can be General and Fast." NSDI 2019, pp. 1-16.
+Retrieved 2026-06-02 from the USENIX publication page and PDF,
+`https://www.usenix.org/conference/nsdi19/presentation/kalia`.
+
+**Category:** runtime / HFT / session scale.
+
+**Relevance tags:** high-concurrency networking; session admission; bounded
+buffers; zero-copy I/O; congestion control; polling runtimes; low-latency
+replication; request scheduling.
+
+**Core idea:** eRPC argues that a general-purpose RPC layer can reach
+near-specialized datacenter networking performance without requiring RDMA
+semantics, lossless fabrics, FPGAs, or programmable switches. The system wins
+by optimizing the hot common case: small messages, short dispatch-mode
+handlers, uncongested networks, and userspace packet I/O. More expensive paths
+for large messages, retransmission, node failure, congestion, and long-running
+handlers exist, but they are kept off the short request path whenever possible.
+
+The most relevant result for the GPU DB runtime is that high session count and
+low latency are framed as resource-budget problems rather than one-thread-per-
+client problems. On the evaluated 100-node lossy Ethernet cluster, eRPC reports
+about 10 million small RPCs per second processed by one core in its symmetric
+benchmark, maintains peak performance with about 20,000 connections per node,
+and keeps 99.99th percentile latency below 700 microseconds in the large
+session experiment. It also ports existing Raft and Masstree code, showing that
+the network fast path can be general enough to reuse higher-level database and
+replication logic.
+
+**Concrete mechanisms:**
+
+- Each user thread owns an `Rpc` endpoint with RX/TX queues, an event loop, and
+  multiple sessions. The event loop performs packet I/O, congestion control,
+  management work, request-handler invocation, and completion callbacks.
+- Sessions are one-to-one connections between two `Rpc` endpoints, not between
+  OS processes. Each session supports a bounded number of outstanding requests
+  with slot metadata, and additional requests are queued by the library.
+- Short handlers run directly on dispatch threads to avoid inter-thread
+  communication; long handlers can be marked for worker-thread execution so
+  they do not block packet processing or congestion feedback.
+- eRPC uses DMA-capable message buffers with a layout optimized for small
+  single-packet messages: the first packet header and data are contiguous so the
+  NIC can fetch them with one DMA read, while the application still sees a
+  contiguous data region.
+- Zero-copy transmission is protected by explicit ownership rules. The library
+  avoids signaled sends on the common path, but flushes the TX DMA queue during
+  retransmission or failure handling before returning a request buffer to the
+  application.
+- For common-case single-packet requests handled in dispatch mode, the server
+  can run the handler over the received packet buffer before returning that
+  buffer to the NIC receive queue, avoiding a dynamic message-buffer copy.
+- Sessions use packet credits. A client consumes credits when sending packets
+  and regains them from responses or explicit credit-return packets. The credit
+  count limits receive-queue pressure and implements end-to-end flow control.
+- eRPC deliberately uses packet I/O instead of RDMA writes because packet
+  receive completion queues scale better than polling many per-client memory
+  locations, and CPU-managed connection state avoids NIC SRAM connection-cache
+  limits.
+- Congestion control is optimized for the uncongested case. eRPC uses Timely-
+  style RTT measurement and Carousel-style software rate limiting, but bypasses
+  rate updates and the rate limiter when a session remains below the low RTT
+  threshold. It batches timestamp reads to reduce per-packet overhead.
+- Packet loss is handled at the client with go-back-N rollback of wire-protocol
+  state and retransmission. The server is designed to avoid running a request
+  handler twice, preserving at-most-once RPC semantics.
+- Node failure handling flushes TX queues, drains or rejects rate-limited
+  packets, invokes pending client continuations with errors, and frees server
+  resources after outstanding handlers finish or no longer need them.
+- Evaluation attributes much of the throughput to common-case details:
+  disabling congestion-control optimizations, preallocated responses, and
+  zero-copy request processing reduces small-RPC throughput materially.
+
+**GPU DB mapping:** eRPC reinforces the target in
+`11-high-throughput-query-runtime.md`: logical session scale should be
+multiplexed through a small number of IO workers and bounded owner queues, not
+through one OS thread per pgwire client. The direct mapping is an internal
+request/response datapath where network workers own socket readiness and frame
+parsing, while mutation owners, read snapshot workers, and GPU execution owners
+receive typed work through fixed-capacity rings.
+
+The session credit design maps cleanly to GPU DB admission. A logical pgwire
+session should have bounded credits for active frontend messages, decoded COPY
+chunks, retained read requests, response buffers, and possibly GPU staging
+slots. Idle logical sessions can remain cheap, but they should not imply a
+right to consume pinned buffers, owner queue entries, or GPU work slots. That is
+the path toward 1M logical sessions without pretending that 1M requests can be
+simultaneously active.
+
+The dispatch-versus-worker split is also important. Short retained reads that
+only enqueue a snapshot-compatible GPU or cached response request should stay
+on a low-latency path. Long COPY admission, refresh, over-resident scans, CPU
+fallback, or transactional validation should move to worker or owner domains
+without blocking IO progress or response writes. The GPU DB equivalent of
+eRPC's handler annotation is a route descriptor with expected duration, bytes
+moved, queue budget, snapshot generation, and whether it can safely run in a
+fast dispatch-like path.
+
+For buffer management, eRPC's message-buffer ownership rules are directly
+transferable. Pgwire input buffers, decoded COPY chunks, WAL/MVCC batch
+buffers, CUDA pinned staging buffers, and encoded response buffers need explicit
+states and completion ownership. A response or COPY buffer should not be reused
+just because SQL execution has returned; it must also be free of NIC writes,
+WAL/MVCC ownership, GPU execution ownership, and response-ring references.
+
+The congestion-control result suggests that GPU DB overload management should
+measure queue delay and saturation at every boundary. For intra-process rings,
+the analog of Timely's RTT is queue wait plus service time. For pgwire network
+IO, RTT-like feedback may be less directly available, but response-ring depth,
+socket writability, and per-session credit exhaustion can still drive
+admission and shedding decisions.
+
+**Risks and mismatches:** eRPC is an RPC library, not a SQL database runtime.
+It does not solve WAL-before-visibility, MVCC validation, snapshot publication,
+catalog invalidation, GPU residency, SQL planning, or PostgreSQL protocol
+details. Its strongest numbers rely on userspace NIC access and polling; the
+current benchmark endpoint is ordinary TCP/pgwire and may not be able to
+replicate those latencies without a larger transport change. eRPC's session
+model is endpoint-to-endpoint between user threads, while pgwire sessions have
+authentication, transactions, prepared statements, portals, COPY state, and
+error recovery. The evaluated 20,000 sessions per node is useful evidence but
+still far below a 1M logical-session target. Worker-thread dispatch also needs
+care: moving long work off IO threads prevents head-of-line blocking, but too
+many worker queues can recreate the same scheduling and memory pressure the
+design is supposed to avoid.
+
+**Benchmark candidates:**
+
+- Add per-session active-credit accounting to the pgwire benchmark endpoint:
+  parsed frontend messages, in-flight engine requests, decoded COPY chunks,
+  response buffers, and retained/GPU work slots. Minimum gate: identical SQL
+  behavior with explicit overload reasons when a credit class is exhausted.
+- Replace the exact-response retained cache path with a bounded
+  request/completion-handle prototype for one retained read route. Measure
+  owner queue wait, response-buffer reuse, copies, and p50/p99 latency at
+  concurrency `1,2,4,8,16,32,64`.
+- Build a no-benchmark session-scale memory probe that allocates compact
+  logical pgwire session state for large counts while admitting only a bounded
+  active subset. Required metrics: bytes per idle session, active credit memory,
+  queue depth, and rejection/fallback counts.
+- Add dispatch-versus-worker route classification telemetry: short retained
+  read, mutation owner, COPY chunk, refresh, over-resident scan, CPU fallback,
+  or error path. Failure condition: long work can still block network IO or
+  response writes.
+- Prototype explicit buffer states for decoded COPY chunks and encoded
+  responses: free, filling, submitted, owner-in-flight, GPU/network-in-flight,
+  completed, reusable, retired. Proof gate: no buffer reuse before all owning
+  domains have completed, with saturation telemetry under concurrency.
+- Compare fixed per-session request limits against BDP/queue-depth-like credits
+  for retained reads and COPY admission. Expected improvement: bounded memory
+  and lower queue tail latency under high logical concurrency. Failure
+  condition: single-session throughput regresses when there is no saturation.
+
 ### 2026-06-02 - Concurrent Analytical Query Processing with GPUs
 
 **Citation:** Kaibo Wang, Kai Zhang, Yuan Yuan, Siyuan Ma, Rubao Lee, Xiaoning
