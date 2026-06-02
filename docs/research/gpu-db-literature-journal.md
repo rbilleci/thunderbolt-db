@@ -2637,3 +2637,219 @@ logical order.
   whether a future write could have invalidated the predicate result. Proof
   gate: every range or prefix retained route can explain why concurrent
   writes cannot create a phantom visible to its SQL result.
+
+### 2026-06-03 - Memory-optimized MVCC for disk-backed storage
+
+**Citation:** Michael Freitag, Alfons Kemper, and Thomas Neumann.
+"Memory-Optimized Multi-Version Concurrency Control for Disk-Based Database
+Systems." PVLDB 15(11), 2022, pages 2797-2810. DOI:
+`https://doi.org/10.14778/3551793.3551832`. Retrieved 2026-06-03 from
+`https://www.vldb.org/pvldb/vol15/p2797-freitag.pdf`.
+
+**Category:** MVCC / snapshot / visibility and multi-tier storage.
+
+**Relevance tags:** disk-backed MVCC; ephemeral version chains; buffer
+management; page-local mapping tables; bulk-write isolation; WAL recovery;
+garbage collection; long-reader robustness; tiered storage; snapshot
+publication.
+
+**Core idea:** The paper argues that the old split between pure in-memory
+OLTP engines and traditional disk-based engines is no longer the right design
+boundary. A modern disk-backed DBMS can keep hot working sets in large DRAM
+buffers and use SSD/NVMe for scale, but its MVCC layer must avoid persisting
+every old version into the database files. The common case is small OLTP write
+transactions whose version data fits easily in memory, so version chains can
+be treated as ephemeral concurrency-control state while WAL remains the
+durable recovery authority.
+
+Umbra implements this by storing only the latest object value on buffer-managed
+database pages and keeping before-images in transaction-local in-memory
+version buffers. A small in-memory mapping table is attached to each page that
+currently has versioned objects, linking stable tuple/object ids to version
+chains. Pages can still be evicted, but only the page data is written to disk;
+orphaned mapping tables remain in memory and are reattached when the page is
+loaded again. Very large write transactions use a separate virtual-version
+fallback so they do not allocate unbounded version memory.
+
+The evaluation claims up to an order-of-magnitude transaction-throughput
+advantage over PostgreSQL and a commercial disk-based system in TATP/TPC-C
+under the tested configuration. More transferably, the detailed experiments
+show that enabling snapshot isolation adds about 1.2x overhead versus
+non-transactional Umbra, while forcing append-only physical version storage
+causes more than a 5x throughput drop. Under constrained buffer memory, Umbra
+keeps MVCC memory roughly bounded while the database grows far beyond the
+buffer pool.
+
+**Concrete mechanisms:**
+
+- Persistent database pages contain only the newest version of each data
+  object. Older before-images are stored in transaction version buffers and
+  linked into per-object chains.
+- A buffer frame may hold a pointer to a page-local mapping table. The table
+  maps stable logical object ids on that page to the head of the in-memory
+  version chain.
+- The page latch protects both page contents and the mapping table pointer, so
+  normal page access does not require a separate global version-map lookup.
+- If a versioned page is evicted, the mapping table is retained by the buffer
+  manager in an orphan table keyed by page id and reattached when the page is
+  cached again.
+- Pages without mapping tables are known to have no active version chains, so
+  scans can use a cheaper path that reads visible non-deleted objects without
+  per-object version lookups.
+- Commit processing retimestamps versions in transaction-local buffers and
+  does not latch database pages or mapping tables. Empty mappings are pruned
+  later during ordinary page maintenance.
+- Garbage collection uses active and recently committed transaction lists.
+  Version buffers become reclaimable once their commit timestamp is older than
+  the minimum start timestamp of active transactions.
+- Mapping tables are pruned opportunistically when pages are accessed, during
+  buffer-manager work on cold/orphaned mappings, and after empty-chain ratios
+  pass a threshold.
+- Recovery discards all in-memory MVCC structures. WAL replay rebuilds the
+  durable latest page state, and the MVCC subsystem restarts with empty
+  version chains and fresh timestamp state.
+- Rollback is coordinated with ARIES-style logging by scanning log records,
+  writing compensation log records, restoring before-images on pages, and
+  unlinking irrelevant versions.
+- Bulk operations take exclusive write access while read transactions can
+  continue. They create virtual creation/deletion versions by storing one page
+  reference epoch plus per-object flags instead of allocating physical
+  before-images.
+- A persistent bulk-operation epoch makes virtual versions visible after the
+  bulk transaction commits. A later bulk operation must wait until prior
+  virtual versions are globally visible because one page reference epoch cannot
+  represent multiple bulk visibilities.
+- The paper supports snapshot isolation; serializability is discussed as a
+  possible extension using precision locking, with bulk writes requiring read
+  repetition rather than version-buffer scans.
+
+**GPU DB mapping:** The strongest transfer is the separation between durable
+truth and rebuildable concurrency acceleration. GPU DB already treats WAL,
+checkpoint, archive, and CPU MVCC state as correctness authority while GPU
+resident snapshots are acceleration state. This paper suggests the same rule
+for CPU-side MVCC auxiliaries: per-page or per-segment version maps, retained
+snapshot handles, old-snapshot side structures, resident key vectors, and GPU
+visibility summaries should be rebuildable whenever possible rather than
+written into the durable table format.
+
+The page-local mapping table maps naturally to a segment-local visibility map
+for P8. A resident or host-cached segment could carry a compact optional map
+from row ordinal or stable row id to a version/delta chain only when that
+segment has active MVCC history. Segments without a map become fast-path
+inputs for retained GPU scans and lookups because the kernel or CPU prepass
+can know that the latest resident values are globally visible for the relevant
+snapshot class.
+
+The orphan mapping-table idea is useful for tiering. If a warm host segment or
+cold NVMe page is evicted from the CPU buffer pool while old snapshots still
+need its version chain, the engine can retain a small in-memory metadata
+object rather than forcing old versions into the durable page. For GPU DB,
+that points to evicting heavy resident buffers while preserving compact
+snapshot metadata until retained readers release it.
+
+The bulk virtual-version path is a strong model for COPY, refresh, and large
+partition rebuilds. Instead of allocating one physical version record per
+inserted row during a huge load or refresh, a large operation can publish an
+epoch/generation and mark segment-level creation/deletion state. Short reads
+continue against older safe generations, while new reads see the bulk epoch
+only after WAL safety and publication. The mismatch is that GPU DB needs
+partition- or segment-level granularity; a single database-wide exclusive
+bulk-writer latch would be too coarse for high session concurrency.
+
+The performance lesson also strengthens the P8 storage direction. Appending
+all versions into durable table/storage files is likely to hurt write
+throughput, scan locality, and resident snapshot refresh cost. A hybrid row
+log plus generated column-group snapshot can keep current values and durable
+WAL compact while treating historical versions as bounded, explicitly
+collected metadata tied to active snapshots.
+
+**Risks and mismatches:** Umbra is a CPU DBMS with a buffer-managed page
+layout, not a GPU-resident execution engine. Raw pointer version chains,
+page latches, and buffer-frame pointers are not directly portable to device
+memory. The paper assumes small OLTP updates dominate and that large write
+transactions can be serialized behind an exclusive write gate; GPU DB may need
+concurrent partition-local bulk loads and refreshes.
+
+The in-memory version data is ephemeral, so correctness depends on WAL replay
+being able to recover a globally consistent latest state without reconstructing
+active transaction state. GPU DB must preserve that property before using any
+similar host/GPU auxiliary map. The paper also targets snapshot isolation and
+does not implement serializable validation; range/prefix retained routes still
+need phantom protection before broader SQL claims.
+
+Finally, the paper's experiments use asynchronous commit and a CPU storage
+engine on Optane/NVMe-era hardware. The absolute throughput numbers are not
+GPU DB predictions. The transferable claims are the physical versioning shape,
+the common-case/fallback split, and the evidence that persisting every version
+can dominate transaction cost.
+
+**Benchmark candidates:**
+
+- Prototype a CPU-only segment-local version map for one relation: latest
+  values in the segment, optional row-id to version-chain mapping only for
+  rows with history, and no map for globally visible segments. Minimum gate:
+  identical snapshot results before and after eviction/reload of the segment
+  metadata.
+- Add telemetry for "unversioned fast-path segment" versus "versioned segment"
+  retained reads. Measure p50/p99 lookup and scan latency, version-map lookup
+  count, and branch/copy overhead under short snapshots and one long retained
+  snapshot.
+- Build a bulk-COPY virtual-epoch proof: load a large partition with
+  generation-level creation markers instead of per-row version allocation,
+  publish visibility only after WAL safety, and let older retained reads finish
+  on the previous safe generation.
+- Compare physical append-only old-version storage against ephemeral
+  before-image buffers for a write-heavy microbenchmark. Required metrics:
+  committed rows/sec, WAL bytes, durable table bytes, resident refresh bytes,
+  GC work, and scan locality after many updates.
+- Add orphan snapshot-metadata accounting: evict resident GPU/host buffers but
+  retain compact metadata needed by active readers. Failure condition:
+  metadata retained for one long snapshot grows with table size instead of
+  number of versioned segments.
+- For future serializable routes, test whether segment-local version maps can
+  expose enough write/read conflict information for range or prefix predicate
+  validation. Failure condition: point updates under a retained range scan can
+  create a phantom without a visible route-risk reason.
+
+### 2026-06-03 - Fourth Modern Batch Synthesis
+
+**Scope:** TicToc, Shirakami, and memory-optimized disk-backed MVCC.
+
+**Converging design tracks:** These three papers point toward a GPU DB write
+and visibility model that is neither one global timestamp nor one monolithic
+owner queue. TicToc argues for data-driven logical time so independent
+conflict sets do not serialize on a global allocator. Shirakami argues for
+explicit transaction classes and epoch boundaries so long work can coexist
+with short work without endless aborts. Umbra's disk-backed MVCC argues for
+ephemeral version metadata and durable latest-state/WAL authority, with a
+separate fallback for large writes.
+
+For GPU DB, the practical design track is partition- or segment-owned
+visibility publication: short mutations use cheap per-partition metadata,
+large COPY/refresh work declares its class and future invalidation boundary,
+and retained reads execute only from safe immutable generations. Historical
+version state should stay compact, local, and rebuildable where possible.
+Durable storage should not become bloated just to accelerate active snapshots.
+
+**Category gaps:** The journal has recent momentum in OLTP/MVCC again after a
+previous GPU/tiering/optimizer run. The next high-value balance choices are
+runtime/session scheduling (`Shenango`, `Shinjuku`, `ZygOS`, `Arachne`),
+multi-tier placement (`LeanStore`, `Umbra`, `Nomad`, `Towards Buffer
+Management with Tiered Main Memory`), or query route planning
+(`PAR2QO`, `Kepler`, `Lero`) before returning to another GPU OLAP engine.
+
+**Benchmark priorities:**
+
+- Define the first CPU-only visibility-publication prototype around
+  relation/partition/segment generations, safe versus unsafe generation state,
+  and WAL-before-visibility publication.
+- Measure whether per-partition logical clocks, data-driven intervals, or one
+  global transaction id best predict real contention under COPY, hot-key
+  updates, and retained read concurrency.
+- Add request-class and generation metadata to route telemetry so each read,
+  write, COPY batch, refresh, and long scan can explain its owner queue,
+  snapshot generation, conflict reason, and fallback path.
+- Keep version history out of durable table files unless a benchmark proves it
+  is necessary. The first proof should compare durable append-only versions
+  against ephemeral/local version metadata under write-heavy and long-snapshot
+  mixes.

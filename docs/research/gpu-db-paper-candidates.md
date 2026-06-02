@@ -316,7 +316,7 @@ Append new candidates here as each paper is processed.
   URL: `https://www.usenix.org/conference/nsdi19/presentation/kagami`
   Why: microsecond-scale request scheduling and preemption; relevant to
   separating short retained reads from long mutation, scan, or refresh work.
-- `queued` — **Memory-Optimized Multi-Version Concurrency Control for
+- `reviewed` — **Memory-Optimized Multi-Version Concurrency Control for
   Disk-Based Database Systems**, Freitag et al., PVLDB 2022.
   URL: `https://www.vldb.org/pvldb/vol15/p2797-freitag.pdf`
   Why: memory-optimized MVCC in a disk-backed engine; relevant to version
@@ -437,8 +437,41 @@ Append new candidates here as each paper is processed.
   Why: modern userspace-interrupt transaction scheduling cited by Shirakami;
   relevant to preempting or isolating long mutation/refresh work from short
   retained reads.
-- `queued` — **Massively Parallel Multi-Versioned Transaction Processing**,
+- `reviewed` — **Massively Parallel Multi-Versioned Transaction Processing**,
   Qian and Goel, OSDI 2024.
   URL: `https://www.usenix.org/conference/osdi24/presentation/qian`
   Why: Shirakami cites this modern MVCC transaction-processing work; relevant
   to high-core-count versioned execution and future owner/partition scaling.
+- `queued` — **GaccO - A GPU-accelerated OLTP DBMS**, Boeschen and Binnig,
+  SIGMOD 2022.
+  URL: `https://doi.org/10.1145/3514221.3517846`
+  Why: GPU single-version deterministic locking baseline compared by Epic;
+  relevant to deciding when commutative GPU updates beat general MVCC.
+- `queued` — **Caracal: Contention Management with Deterministic Concurrency
+  Control**, Qin, Brown, and Goel, SOSP 2021.
+  URL: `https://doi.org/10.1145/3477132.3483572`
+  Why: deterministic MVCC contention-management baseline for Epic; useful for
+  CPU-side owner/partition batching and skewed write-set planning.
+- `queued` — **High Performance Transactions via Early Write Visibility**,
+  Faleiro, Abadi, and Hellerstein, PVLDB 2017.
+  URL: `https://www.vldb.org/pvldb/vol10/p613-faleiro.pdf`
+  Why: deterministic transaction protocol cited by Epic; relevant to exposing
+  writes early inside an ordered batch without violating external visibility.
+- `queued` — **Rethinking Logging, Checkpoints, and Recovery for
+  High-Performance Storage Engines**, Haubenschild et al., SIGMOD 2020.
+  URL: `https://doi.org/10.1145/3318464.3389716`
+  Why: decentralized logging and checkpointing foundation used by Umbra;
+  relevant to WAL-before-visibility, batch commit, replay, and separating
+  durable authority from rebuildable GPU residency state.
+- `queued` — **Scalable Garbage Collection for In-Memory MVCC Systems**,
+  Boettcher et al., PVLDB 2019.
+  URL: `https://www.vldb.org/pvldb/vol13/p128-boettcher.pdf`
+  Why: Steam-style MVCC version garbage collection cited by the Umbra MVCC
+  paper; relevant to bounded version retention, long retained snapshots, and
+  per-owner GC without global contention.
+- `queued` — **BTrim - Hybrid In-Memory Database Architecture for Extreme
+  Transaction Processing in VLDBs**, Gurajada et al., PVLDB 2018.
+  URL: `https://www.vldb.org/pvldb/vol11/p1889-guradaja.pdf`
+  Why: hybrid disk/in-memory transactional architecture cited by the Umbra
+  MVCC paper; useful as a contrast point for hot working-set placement and
+  contention reduction across CPU memory and durable storage.
