@@ -268,6 +268,136 @@ compression schemes, and general decimal/floating-point support is incomplete.
   then evaluate GPUDirect/BaM-style over-resident execution only if storage IO
   becomes the measured bottleneck.
 
+### 2026-06-02 - Scaling GPU-Accelerated Databases beyond GPU Memory Size
+
+**Citation:** Yinan Li, Bailu Ding, Ziyun Wei, Lukas M. Maas, Momin
+Al-Ghosien, Spyros Blanas, Nicolas Bruno, Carlo Curino, Matteo Interlandi,
+Craig Peeper, Kaushik Rajan, Surajit Chaudhuri, and Johannes Gehrke. "Scaling
+GPU-Accelerated Databases beyond GPU Memory Size." PVLDB 18(11), 2025,
+pp. 4518-4531. DOI: `10.14778/3749646.3749710`. Retrieved 2026-06-02 from
+`https://www.vldb.org/pvldb/vol18/p4518-li.pdf`.
+
+**Relevance tags:** over-resident execution; GPU execution/batching; read
+throughput; query latency; data layout/storage; planner cost hooks; CPU/GPU
+placement.
+
+**Core idea:** The paper argues that a single GPU can still accelerate
+databases far larger than GPU memory if the system stops treating the GPU as
+the default scan engine. For over-resident analytical workloads, PCIe bandwidth
+is often slower than CPU compressed-column scans, while GPU joins and other
+compute-heavy operators can still beat CPU execution even after transfer cost.
+The proposed hybrid design therefore filters aggressively on the CPU, preserves
+compressed representation after filtering, transfers only reduced compressed
+columns over PCIe, and executes compute-heavy subplans on the GPU.
+
+The evaluation integrates these ideas into a custom Microsoft SQL Server plus
+TQP GPU engine prototype. On a 24-core A100 VM, the hybrid system runs all 22
+TPC-H queries at 1 TB, where the GPU-only TQP baseline runs only 4 without OOM
+and HeavyDB runs 9. The paper reports 3.5x overall speedup over SQL Server at
+1 TB, with per-query speedups from 0.8x to 9.1x. At 100 GB cold runs, hybrid
+execution reduces the GPU hot/cold gap and reports 3.5x speedup over SQL
+Server, versus 2.4x for GPU-only cold TQP.
+
+**Concrete mechanisms:**
+
+- Query plans are split at a coprocessor operator. CPU scan operators produce
+  filtered compressed inputs for GPU subplans; the GPU engine decompresses,
+  executes joins or aggregates, and returns usually small results to the host.
+- The scan operator evaluates predicates on the CPU but compacts projected
+  columns directly in their compressed format, avoiding CPU decompress plus
+  recompress overhead before PCIe transfer.
+- For bit-packed values, compaction uses x86 BMI `PEXT`/`PDEP` style bit
+  gather/scatter over all values that fit in a 64-bit word. For RLE, it counts
+  selected values per run with population count. For dictionary encoding, it
+  compacts dictionary indexes and can remove unused dictionary payload entries
+  while preserving index positions.
+- Predicate filters are not applied blindly. Expensive or weakly selective
+  filters may be skipped on CPU and left for GPU execution when the CPU cost
+  is not expected to repay transfer savings.
+- Bitvector filters propagate selective predicates across equi-joins from
+  smaller filtered inputs to larger base-table scans. The scan treats bitvector
+  probes as additional predicates, with SIMD optimization.
+- Candidate bitvector filters are derived from join-column lineage, then
+  selected greedily by estimated benefit. The estimate balances CPU cost to
+  build/probe filters and expected PCIe transfer reduction, while stopping once
+  a table's estimated selectivity is below a threshold.
+- Bitvector representation prioritizes probe throughput over perfect filtering:
+  simple bitmaps are preferred for small domains, while cache-sized hash
+  bitvectors can trade false positives for faster probing on large domains.
+- Streaming processes large filtered inputs in chunks when an operator's state
+  fits GPU memory. Partitioning repeatedly scans with partition predicates so
+  each join partition pair fits on the GPU; it solves memory capacity but does
+  not by itself reduce PCIe traffic.
+
+**GPU DB mapping:** This is directly relevant to the current P8 over-resident
+gap. The strongest transferable idea is an explicit three-way route choice:
+resident GPU for hot valid snapshots, CPU scan/filter for cold or
+over-resident reduction, and GPU execution only for the reduced compute-heavy
+tail. For our current retained aggregate and lookup route family, over-resident
+planning should not default to "stream full partitions to GPU." It should first
+ask whether CPU-visible MVCC/columnar state can produce a compact candidate
+vector, partition row-id list, or compressed value batch that is smaller than
+the original resident page set.
+
+The compressed-output scan maps to a future CPU canonical or derived-column
+layout beside the current row/MVCC source. P8 currently generates dense GPU
+resident column buffers from CPU truth. For over-resident tables, a compressed
+CPU segment format with direct compaction could let the planner transfer only
+selected `int4` value vectors, row ordinals, or join-key batches to GPU workers.
+That complements DPF: DPF says fuse IO/decompression/operator stages when the
+GPU owns the data path; this paper says let CPU memory bandwidth and SIMD prune
+first when PCIe is the dominant boundary.
+
+The filter-selection rule also maps cleanly onto route telemetry in
+`11-high-throughput-query-runtime.md`. A route descriptor should expose CPU
+filter cost, estimated selectivity, compressed bytes before and after filtering,
+H2D bytes avoided, GPU work introduced, queue wait, and fallback reason. That
+would let the runtime choose between immediate CPU fallback, CPU-prefilter plus
+GPU tail, retained-GPU execution, or overload rejection without hiding the
+reason.
+
+For MVCC, the paper does not give a visibility design, but the mechanism can be
+made compatible if CPU-side filtering reads from a stable visibility boundary
+and carries source WAL/catalog generation into the compressed batch handed to
+the GPU execution owner. Bitvector and predicate-transfer filters must be tied
+to the same snapshot generation as the scanned partitions; otherwise they can
+incorrectly discard rows that became visible after the filter was built.
+
+**Risks and mismatches:** The prototype is analytical and SQL Server-based; it
+does not address PostgreSQL-compatible pgwire serving, WAL-before-visibility,
+snapshot retirement, DDL invalidation, write throughput, or 1M logical
+sessions. The results are TPC-H warm-main-memory runs on A100/H100 cloud VMs,
+not low-latency point lookups or mixed OLTP/HTAP writes. CPU-side filtering can
+increase CPU contention exactly where this engine also needs network IO,
+mutation admission, and MVCC maintenance. The greedy filter model ignores
+correlation and cascading effects, and compressed CPU segments would require a
+new storage/layout path beyond today's row/MVCC source plus dense retained
+buffers.
+
+**Benchmark candidates:**
+
+- Add an over-resident planner experiment for partitioned `order_line`: CPU
+  prefilter candidate row ordinals for one selective `int4` predicate, transfer
+  only selected values/ordinals to a GPU aggregate kernel, and compare against
+  full-partition GPU streaming and CPU-only execution. Minimum gate: identical
+  SQL-visible result at one MVCC boundary with measured CPU filter time and
+  H2D bytes avoided.
+- Prototype a compressed `int4` segment sidecar for one generated benchmark
+  column and implement direct selected-value compaction into a GPU staging
+  buffer. Expected improvement: lower H2D bytes for over-resident scans.
+  Failure condition: CPU compaction time exceeds saved transfer time.
+- Add filter-decision telemetry to retained/over-resident route planning:
+  estimated selectivity, CPU filter cost, compressed input bytes, filtered
+  bytes, selected row count, GPU-tail cost, and chosen route. Proof gate:
+  estimates and observations are recorded for accepted and rejected routes.
+- Evaluate bitvector prefiltering for a future join-shaped benchmark before
+  implementing full GPU joins: build a CPU bitvector from a filtered dimension
+  key set, probe the large fact partition during scan, and measure reduced H2D
+  bytes, false positives, and CPU overhead.
+- Keep partitioned over-resident execution as a capacity mechanism, but require
+  each partition route to report whether partitioning reduced peak GPU memory
+  only or also reduced PCIe bytes through predicate/bitvector filtering.
+
 ## Cross-Paper Synthesis
 
 No cross-paper synthesis exists yet. Add one after the first three to five

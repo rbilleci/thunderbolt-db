@@ -127,7 +127,7 @@ Append new candidates here as each paper is processed.
   URL: `https://doi.org/10.1145/3736227.3736233`
   Why: practical evaluation of GPU-initiated IO paths for data-intensive
   systems, directly relevant to DPF-style over-resident execution.
-- `queued` — **Scaling GPU-Accelerated Databases beyond GPU Memory Size**,
+- `reviewed` — **Scaling GPU-Accelerated Databases beyond GPU Memory Size**,
   Li et al., PVLDB 2025.
   URL: `https://www.vldb.org/pvldb/vol18/p4518-li.pdf`
   Why: modern out-of-GPU-memory database execution work relevant to P8
@@ -137,3 +137,18 @@ Append new candidates here as each paper is processed.
   URL: `https://www.vldb.org/pvldb/vol18/p1250-yuan.pdf`
   Why: multi-GPU/interconnect approach to capacity limits, useful for future
   over-resident and multi-device planning.
+- `queued` — **Predicate Transfer: Efficient Pre-Filtering on Multi-Join
+  Queries**, Yang et al., CIDR 2024.
+  URL: `https://www.cidrdb.org/cidr2024/papers/p22-yang.pdf`
+  Why: modern predicate-transfer/pre-filtering work cited by the 2025 hybrid
+  CPU-GPU paper; relevant to reducing over-resident transfer before GPU joins.
+- `queued` — **Orchestrating data placement and query execution in
+  heterogeneous CPU-GPU DBMS**, Yogatama et al., PVLDB 2022.
+  URL: `https://www.vldb.org/pvldb/vol15/p2491-yogatama.pdf`
+  Why: cost-based CPU/GPU placement and execution orchestration for
+  heterogeneous DBMS designs.
+- `queued` — **Accelerating GPU Data Processing using FastLanes
+  Compression**, Afroozeh et al., DaMoN 2024.
+  URL: `https://doi.org/10.1145/3662010.3663450`
+  Why: modern GPU compressed-data execution follow-up for resident and
+  over-resident compressed page experiments.
