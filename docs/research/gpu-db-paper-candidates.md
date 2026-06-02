@@ -463,9 +463,9 @@ Append new candidates here as each paper is processed.
   Why: decentralized logging and checkpointing foundation used by Umbra;
   relevant to WAL-before-visibility, batch commit, replay, and separating
   durable authority from rebuildable GPU residency state.
-- `queued` — **Scalable Garbage Collection for In-Memory MVCC Systems**,
+- `reviewed` — **Scalable Garbage Collection for In-Memory MVCC Systems**,
   Boettcher et al., PVLDB 2019.
-  URL: `https://www.vldb.org/pvldb/vol13/p128-boettcher.pdf`
+  URL: `https://www.vldb.org/pvldb/vol13/p128-bottcher.pdf`
   Why: Steam-style MVCC version garbage collection cited by the Umbra MVCC
   paper; relevant to bounded version retention, long retained snapshots, and
   per-owner GC without global contention.
@@ -533,4 +533,15 @@ Append new candidates here as each paper is processed.
   arXiv: `https://arxiv.org/abs/2412.02792`
   Why: cloud database storage architecture with append-only storage,
   replication, recovery, and constant-time snapshots; relevant to future
-  disaggregated durable tiers and rebuildable GPU residency.
+  cloud/disaggregated durability and snapshot tiers.
+- `queued` — **Hybrid Garbage Collection for Multi-Version Concurrency Control
+  in SAP HANA**, Lee et al., SIGMOD 2016.
+  URL: `https://doi.org/10.1145/2882903.2915238`
+  Why: production HTAP MVCC garbage-collection design contrasted with Steam;
+  useful for evaluating interval GC, long transaction handling, and practical
+  memory-pressure policies.
+- `queued` — **Accelerating Hybrid Transactional/Analytical Processing Using
+  Consistent Dual-Snapshot**, Li et al., DASFAA 2019.
+  URL: `https://doi.org/10.1007/978-3-030-18576-3_41`
+  Why: dual-snapshot HTAP design cited by Steam; relevant to separating
+  retained analytical snapshots from fresh transactional visibility.
