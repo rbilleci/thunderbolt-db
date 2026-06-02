@@ -3695,3 +3695,208 @@ system reclaim a version that a GPU or CPU reader still needs.
   and checkpoint recovery must reconstruct exactly the versions needed
   by committed visibility boundaries and must not depend on GPU resident
   cache state as durable authority.
+
+### 2026-06-03 - PAR2QO parametric penalty-aware robust query optimization
+
+**Citation:** Haibo Xiu, Yang Li, Qianyu Yang, Pankaj K. Agarwal,
+and Jun Yang. "PAR2QO: Parametric Penalty-Aware Robust Query
+Optimization." Proceedings of the VLDB Endowment 18(11):4532-4545,
+2025. doi:10.14778/3749646.3749711. Retrieved 2026-06-03 from the
+VLDB PDF, `https://www.vldb.org/pvldb/vol18/p4532-xiu.pdf`.
+
+**Category:** query optimization / planning.
+
+**Relevance tags:** robust query optimization; parametric query
+optimization; plan cache; route templates; selectivity uncertainty;
+expected penalty; optimizer overhead; workload generation; GPU/CPU
+route choice; admission-time planning.
+
+**Core idea:** PAR2QO combines parametric query optimization with
+penalty-aware robust query optimization. Instead of caching one
+point-optimal plan for a parameterized SQL template, it builds a
+per-template cache of plan-penalty profiles over sampled selectivity
+locations. At runtime, it estimates which cached plan has the lowest
+expected penalty under the query's selectivity uncertainty, rather
+than blindly choosing the cheapest plan at the optimizer's current
+estimates.
+
+The paper's main practical point is that robust planning work can be
+amortized across many future instances of the same query template.
+PAR2QO samples probe locations around workload queries using an
+error model, records how candidate plans behave across those
+locations, reduces the candidate set, and then performs a relatively
+cheap runtime pass over cached profiles. On JOB, the paper reports
+up to 1.96x speedup over PostgreSQL and 1.83x over Kepler, while
+avoiding some severe regressions that Kepler experiences. It also
+reports average preparation time of about 21.5 minutes per JOB
+template, versus more than 6.5 hours for Kepler, and runtime
+optimization overhead around 26 ms per query versus PostgreSQL's
+67 ms in their setup.
+
+**Concrete mechanisms:**
+
+- The system assumes non-intrusive access to an existing DBMS
+  optimizer: estimated selectivities for a query, an optimizer call
+  under injected selectivities, and a cost call for a given plan under
+  injected selectivities.
+- Robustness is represented through a user-defined penalty function.
+  The default penalty is zero when a plan is within a tolerance of the
+  optimal cost at the true selectivities, and otherwise proportional
+  to the excess cost over that optimal plan.
+- Error profiling learns a conditional distribution of true
+  selectivities given estimated selectivities. Following PARQO, the
+  paper models errors with querylet profiles for small selection-join
+  subqueries rather than attempting to represent a full high-dimensional
+  joint distribution directly.
+- Offline preparation groups workload queries into selectivity-error
+  clusters. If a new training query is close enough to an existing
+  cluster by KL divergence, the cluster hit count is incremented
+  instead of over-sampling that region.
+- For a new cluster, PAR2QO samples `n` probe locations from the error
+  distribution around that query's estimated selectivities. The final
+  probe set is the union of all cluster samples, and cluster hit counts
+  approximate workload frequency for later bias correction.
+- For each probe location, PAR2QO invokes the optimizer to obtain a
+  plan. It then costs each distinct candidate plan at all probe
+  locations and stores a plan-cost matrix.
+- The plan-penalty profile matrix records each candidate plan's penalty
+  at each probe location, relative to the best candidate cost observed
+  at that location.
+- Candidate plans can be reduced by a tau-approximate cover heuristic:
+  greedily keep plans that are near-optimal at many probe locations.
+  The paper also evaluates a conservative reduction based on
+  Jensen-Shannon distance between cost profiles.
+- Runtime plan selection derives the uncertainty distribution for the
+  incoming query, reweights cached probe-location penalties using
+  importance sampling, and picks the plan with the lowest estimated
+  expected penalty. It needs one selectivity-estimation call but no
+  optimizer or plan-cost calls in the hot path.
+- CARVER generates training or testing workloads by covering subquery
+  cardinality ranges, not only final join result rows. It supports
+  equality, inequality, range-style, and token-based LIKE parameter
+  generation for selected template shapes.
+- The evaluation finds that PAR2QO is strongest when workloads are
+  harder or shift across distributions. Kepler can find faster plans
+  for some templates because it trains from actual executions, but the
+  paper reports larger regressions for Kepler when the selected plan is
+  not robust.
+
+**GPU DB mapping:** The direct mapping is not "learn a whole GPU
+optimizer." It is a route-template cache for repeated SQL shapes where
+the engine already knows a small set of legal routes: CPU tuple/index
+path, CPU segment path, GPU resident scan, GPU resident key-vector
+lookup, GPU cold-transfer path, and explicit fallback or rejection.
+For each template, GPU DB can cache a profile of route penalties over
+estimated rows, transfer bytes, resident validity probability, queue
+delay, refresh debt, output bytes, and memory pressure.
+
+The penalty-aware objective is more appropriate than a single fastest
+route for retained GPU execution. A GPU route with excellent average
+latency can be fragile when cardinality, D2H result size, refresh
+state, or queue depth is wrong. PAR2QO suggests making that fragility
+visible: route selection should minimize expected regret or overload
+penalty under uncertainty, not only predicted latency at one estimate.
+For example, a resident GPU aggregate might be selected aggressively,
+while a resident GPU lookup returning many rows may need a safer CPU
+or hybrid route if the result-cardinality uncertainty is high.
+
+Plan-penalty profiles also fit the high-throughput runtime's
+admission-time constraints. IO workers and read snapshot workers
+should not call an expensive optimizer or rebuild a route search for
+every repeated parameterized query. A compact per-template profile can
+turn route choice into one bounded pass over cached candidates, with
+the selected route explaining which uncertainty dimensions made the
+GPU path safe, risky, or rejected.
+
+CARVER maps to benchmark generation for P8. Instead of testing only
+popular keys or uniformly sampled parameters, GPU DB should generate
+parameterized lookup, prefix LIKE, range, aggregate, and future join
+queries that cover subquery cardinality buckets and resident/nonresident
+states. That would stress the exact cases where the planner must decide
+between GPU resident execution, CPU fallback, refresh, or overload.
+
+**Risks and mismatches:** PAR2QO is evaluated on CPU PostgreSQL plan
+selection, not GPU execution, MVCC snapshots, queueing, or tiered
+residency. Its cost estimates assume that recosting plans under
+injected selectivities is meaningful; GPU DB will need route costs that
+include live telemetry such as queue delay, pinned-buffer pressure,
+resident generation age, transfer size, and refresh debt. The paper's
+runtime overhead of about 26 ms is acceptable for complex analytical
+queries but far too high for short retained point lookups unless the
+profile scan is made much smaller or cached per parameter bucket.
+
+The method also trusts the cost model once selectivities are corrected,
+while GPU routes may be sensitive to CUDA launch overhead, PCIe/NVLink
+contention, response encoding, and concurrent kernels. Training from
+real executions, as in Kepler, can catch some of those effects, but at
+a much higher preparation cost. Finally, workload-derived error models
+can go stale when data distribution, resident placement, or session
+load changes; GPU DB would need recalibration triggers and fallback
+guardrails.
+
+**Benchmark candidates:**
+
+- Build a small route-profile simulator for repeated parameterized
+  retained queries. Candidate routes: CPU index lookup, CPU scan, GPU
+  resident scan, GPU resident key-vector lookup, and GPU cold transfer.
+  Choose routes by predicted latency versus penalty-aware expected
+  regret under cardinality and queue-delay uncertainty.
+- Add planner telemetry that records why a GPU route was rejected:
+  estimated rows, result bytes, resident validity, refresh debt, queue
+  depth, pinned-buffer pressure, unsupported predicate, or high penalty
+  uncertainty.
+- Generate CARVER-style benchmark parameters for the first P8 query
+  shapes: `int4 = ?`, `text LIKE 'prefix%'`, bounded aggregates, and
+  mixed predicates. Minimum gate: generated cases cover low, medium,
+  high, and extreme cardinality buckets rather than only popular keys.
+- Compare cheapest-estimate route choice against penalty-aware route
+  choice under synthetic selectivity errors and live queue saturation.
+  Failure condition: the robust chooser reduces worst-case latency only
+  by making ordinary low-risk point lookups slower beyond the configured
+  p50 budget.
+- Cache route profiles per SQL template and snapshot route family.
+  Required measurements: profile size, route-selection time, cache hit
+  rate, recalibration frequency, and correctness when schema,
+  residency, or visibility generations change.
+- Add a drift experiment where resident placement, table distribution,
+  and queue load change after profile preparation. Proof gate: stale
+  profiles trigger fallback, recalibration, or explicit overload rather
+  than silently selecting a fragile GPU route.
+
+### 2026-06-03 - Sixth Modern Batch Synthesis
+
+The latest batch spans durable write-path authority, MVCC cleanup, and
+robust route planning: LeanStore logging/recovery, Steam MVCC garbage
+collection, and PAR2QO. The converging design track is that hot-path
+decisions should be local, bounded, and explainable, while the metadata
+that justifies them should be explicit enough for recovery, pruning, and
+route fallback.
+
+For write throughput, decentralized WAL streams and remote-flush
+avoidance point toward partition or mutation owners that can commit
+locally when no remote durable dependency exists. For snapshot health,
+Steam reinforces that retained readers must be visible to owner-local
+GC, and cleanup debt must be budgeted rather than deferred to an
+unbounded background sweep. For read latency, PAR2QO adds a planning
+track: repeated retained SQL shapes should choose CPU/GPU/tier routes
+by expected penalty under uncertainty, not just by a single optimistic
+cost estimate.
+
+The category gap after this batch is still high-concurrency runtime and
+session admission. Recent work has covered MVCC, logging, optimizer
+robustness, tiering, and transaction scheduling well, but the next few
+papers should include at least one IO-worker, request-scheduling, or
+network/session-scale system before returning to GPU OLAP.
+
+Benchmark priorities:
+
+- Tie every resident route to durable-boundary metadata and measure
+  recovery-to-first-GPU-route time after write-heavy runs.
+- Measure owner-local GC under one long retained snapshot and skewed
+  updates, including cleanup debt and write p99.
+- Prototype penalty-aware route choice for repeated retained queries
+  using cardinality, queue delay, result size, and resident validity
+  uncertainty.
+- Add CARVER-style parameter generation so lookup, prefix, aggregate,
+  and mixed predicate benchmarks cover the cardinality cases that make
+  CPU/GPU route choice fragile.

@@ -405,7 +405,7 @@ Append new candidates here as each paper is processed.
   URL: `https://doi.org/10.1145/3639303`
   Why: modern tiered-main-memory buffer management cited by vmcache^n;
   relevant to DRAM/remote-memory/NVMe policy design and placement economics.
-- `queued` — **PAR2QO: Parametric Penalty-Aware Robust Query Optimization**,
+- `reviewed` — **PAR2QO: Parametric Penalty-Aware Robust Query Optimization**,
   Xiu et al., PVLDB 2025.
   URL: `https://www.vldb.org/pvldb/vol18/p4532-xiu.pdf`
   DOI: `https://doi.org/10.14778/3749646.3749711`
@@ -545,3 +545,9 @@ Append new candidates here as each paper is processed.
   URL: `https://doi.org/10.1007/978-3-030-18576-3_41`
   Why: dual-snapshot HTAP design cited by Steam; relevant to separating
   retained analytical snapshots from fresh transactional visibility.
+- `queued` — **Bao: Making Learned Query Optimization Practical**,
+  Marcus et al., SIGMOD 2021.
+  URL: `https://doi.org/10.1145/3448016.3452838`
+  Why: learned hint-based optimizer baseline compared by PAR2QO; useful for
+  deciding whether GPU route tuning should learn bounded hints around a
+  deterministic planner rather than replace route rules.
