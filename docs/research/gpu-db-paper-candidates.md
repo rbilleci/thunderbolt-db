@@ -81,9 +81,10 @@ mechanical sympathy, multi-tier cache/data placement, or query optimization.
   URL: `https://www.usenix.org/conference/osdi20/presentation/shenango`
   Why: runtime scheduling and resource allocation for microsecond-scale tail
   latency, useful for admission and worker ownership design.
-- `queued` — **Demikernel: An Operating System Architecture for
+- `reviewed` — **Demikernel: An Operating System Architecture for
   Microsecond-scale Datacenter Systems**, SOSP 2021.
-  URL: `https://dl.acm.org/doi/10.1145/3477132.3483554`
+  URL: `https://dl.acm.org/doi/10.1145/3477132.3483569`
+  PDF: `https://irenezhang.net/papers/demikernel-sosp21.pdf`
   Why: low-latency OS/network stack architecture relevant to session and
   response-ring design.
 - `queued` — **Design Choices in Low-Latency C++ Systems: Empirical Insights
@@ -286,3 +287,14 @@ Append new candidates here as each paper is processed.
   Why: contention-aware partitioning and transaction execution for fast
   networks, relevant to partition owners, admission, and high-contention
   write-path routing.
+- `queued` — **Datacenter RPCs can be General and Fast**, Kalia et al.,
+  NSDI 2019.
+  URL: `https://www.usenix.org/conference/nsdi19/presentation/kalia`
+  Why: eRPC's session, message-buffer, congestion-control, and polling design
+  is a direct follow-up for high-concurrency pgwire/network admission.
+- `queued` — **Scalable RDMA RPC on Reliable Connection with Efficient
+  Resource Sharing**, Chen et al., EuroSys 2019.
+  URL: `https://doi.org/10.1145/3302424.3303983`
+  Preprint: `https://chenyoumin1993.github.io/papers/eurosys19-scalerpc.pdf`
+  Why: ScaleRPC-style resource sharing over RDMA connection state may inform
+  future session multiplexing and bounded transport resource budgets.

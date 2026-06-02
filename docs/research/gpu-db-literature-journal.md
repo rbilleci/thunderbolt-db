@@ -527,6 +527,139 @@ address DDL, snapshot retirement, recovery replay, or GPU cache invalidation.
   chain traversal and memory growth under a single hot row, and require a cap
   or fallback policy before enabling this behavior outside experiments.
 
+### 2026-06-02 - Demikernel Datapath OS Architecture for Microsecond-scale Datacenter Systems
+
+**Citation:** Irene Zhang, Amanda Raybuck, Pratyush Patel, Kirk Olynyk, Jacob
+Nelson, Omar S. Navarro Leija, Ashlie Martinez, Jing Liu, Anna Kornfeld
+Simpson, Sujay Jayakar, Pedro Henrique Penna, Max Demoulin, Piali Choudhury,
+and Anirudh Badam. "The Demikernel Datapath OS Architecture for
+Microsecond-scale Datacenter Systems." SOSP 2021, pp. 195-211. DOI:
+`10.1145/3477132.3483569`. Retrieved 2026-06-02 from the Microsoft Research
+publication page and author PDF, `https://irenezhang.net/papers/demikernel-sosp21.pdf`.
+
+**Category:** runtime / HFT / session scale.
+
+**Relevance tags:** high-concurrency networking; kernel bypass; zero-copy
+I/O; bounded buffers; asynchronous queues; session admission; storage/network
+datapaths; low-latency runtime.
+
+**Core idea:** Demikernel argues that microsecond-scale systems need a
+datapath OS rather than ad hoc direct use of each kernel-bypass device. The
+system keeps a conventional kernel on the control path while moving the
+latency-critical I/O datapath into interchangeable user-space library OSes
+with a common API. The important abstraction is not "use DPDK/RDMA/SPDK
+directly"; it is to make zero-copy buffers, queue ownership, asynchronous I/O,
+and CPU scheduling explicit enough that applications can target heterogeneous
+fast devices without rewriting their execution model.
+
+The paper builds Demikernel library OS prototypes for Linux and Windows and
+ports an echo server, UDP relay, Redis, and TxnStore. Reported echo results
+show nanosecond-scale Demikernel overhead per I/O and competitive
+microsecond-scale latency versus eRPC, Shenango, and Caladan, while preserving
+portability across DPDK, RDMA, Windows, Linux, and Azure settings. For Redis
+with persistence, the Demikernel storage/network path reports throughput within
+10% of unmodified non-persistent Redis in the evaluated setup. For TxnStore,
+the Demikernel ports are competitive with or better than the existing custom
+RDMA messaging stack, largely because zero-copy coordination is made explicit.
+
+**Concrete mechanisms:**
+
+- Demikernel defines PDPIX, a portable datapath API whose operations target
+  queues instead of POSIX file descriptors. Network and storage devices expose
+  common queue creation, asynchronous push/pop, wait, close, and buffer
+  operations.
+- Library OSes are device-specific but API-compatible. Catnip implements a
+  TCP/UDP stack on DPDK, Catmint maps queue operations to RDMA, Catnap uses a
+  polling POSIX datapath, Catpaw targets Windows, and Cattree exposes a simple
+  kernel-bypass storage stack.
+- I/O memory is managed through a DMA-capable heap so buffers remain pinned,
+  registered, or huge-page backed as the active device requires. Applications
+  can allocate buffers without encoding device-specific registration policy in
+  their own hot paths.
+- Zero-copy safety is enforced through buffer ownership and use-after-free
+  protection. A buffer handed to an outgoing queue cannot be freed or modified
+  unsafely while a stack might still need it for retransmission or completion.
+- Completion is asynchronous and coroutine-oriented. Applications issue work
+  through queue operations, then wait for completions rather than blocking an
+  OS thread per operation.
+- CPU multiplexing is treated as a datapath requirement: library OS work,
+  device polling, and application work must be scheduled at microsecond
+  granularity, avoiding coarse kernel thread scheduling where possible.
+- Demikernel deliberately hides one-sided RDMA and other highly specialized
+  hardware features behind a portable queue API. The authors call out this
+  portability/performance tradeoff as a limitation for systems that need direct
+  hardware-specific offloads.
+- Evaluation separates portability from raw peak performance. The paper
+  reports roughly 50 ns processing latency per I/O in prototype paths and
+  17-26% peak throughput overhead versus direct kernel-bypass APIs, while
+  showing easier ports across multiple devices and environments.
+
+**GPU DB mapping:** This paper is a strong match for the target runtime in
+`11-high-throughput-query-runtime.md`. The current benchmark endpoint's
+thread-per-client topology should be treated as a correctness harness, not a
+session-scale design. Demikernel supports moving toward a portable internal
+datapath API with explicit queues, buffer lifetimes, and completions: network
+IO workers parse pgwire frames into bounded command rings, mutation/read/GPU
+owners consume from typed queues, and response rings return stable buffers to
+the IO workers without borrowing mutable engine state.
+
+The most transferable idea is zero-copy coordination as an ownership contract.
+For the GPU DB, pinned response buffers, COPY chunks, CUDA staging buffers, and
+encoded pgwire output should have explicit states: free, filling, submitted,
+in-flight, completed, reusable, or retired. That state machine can span CPU
+network IO, mutation admission, WAL/MVCC apply, GPU execution workers, and
+response writes without relying on ad hoc lifetimes or copies at every
+boundary.
+
+PDPIX's queue-centric interface maps to the engine's owner domains. Instead of
+letting a session call engine operations directly, a session should enqueue a
+typed request with a buffer handle, snapshot/generation requirement, deadline,
+and response route. The completion model then gives a natural place for
+backpressure: if command rings, response rings, pinned buffers, CUDA staging
+buffers, or mutation batches are exhausted, the IO worker can delay, reject, or
+route to fallback before admitting more work.
+
+For 1M logical sessions, the paper reinforces that logical concurrency must be
+decoupled from OS-thread concurrency and from scarce datapath resources. A
+million sessions can be mostly parked connection/protocol state, while only a
+bounded number of queue entries, pinned buffers, active COPY chunks, and GPU
+requests are admitted at once. The engine should benchmark session scale by
+resource budgets, not by increasing owner threads.
+
+**Risks and mismatches:** Demikernel is an operating-system architecture paper,
+not a database serving engine. It does not solve SQL planning, MVCC visibility,
+WAL-before-visibility, transaction validation, GPU residency invalidation, or
+PostgreSQL protocol semantics. Its portability layer can hide specialized
+hardware features that may matter later, such as one-sided RDMA or future
+GPU-initiated IO. Some evaluated designs consume a full CPU core for polling
+to reduce latency; that may conflict with mutation owners, GPU workers, and
+network IO workers on a constrained host. The paper also reports application
+ports and echo/Redis/TxnStore experiments, not million-session pgwire behavior.
+
+**Benchmark candidates:**
+
+- Build an internal buffer-lifetime telemetry proof for pgwire responses and
+  COPY chunks: count allocations, copies, state transitions, reuse hits,
+  blocked submissions, and in-flight bytes at concurrency `1,2,4,8,16,32,64`.
+  Minimum gate: identical SQL-visible results and no new unbounded queues.
+- Replace one hot endpoint path with explicit request/completion handles across
+  IO worker, engine owner, and response writer. Expected improvement: lower
+  owner queue wait and fewer copies for repeated retained reads. Failure
+  condition: p50 latency regresses for single-session requests or error paths
+  leak buffers.
+- Simulate 1M logical sessions without running GPU benchmarks: allocate only
+  compact per-session protocol state, admit a bounded active subset, and
+  measure memory per idle session, active ring depth, response-buffer pressure,
+  and overload decisions.
+- Add a COPY admission buffer pool with explicit states for decoded row chunks,
+  WAL submission, MVCC apply, residency invalidation, and release. Proof gate:
+  no chunk can be reused before WAL/MVCC ownership has completed, and queue
+  saturation produces an observable backpressure reason.
+- Compare polling versus readiness-driven IO worker loops under retained-read
+  concurrency. Expected result: polling may reduce p50/p99 latency at the cost
+  of CPU burn; the engine needs a configurable policy tied to admission and
+  deployment CPU budget.
+
 ## Cross-Paper Synthesis
 
 ### 2026-06-02 - First Modern Batch Synthesis
