@@ -42,7 +42,12 @@ This project uses a layered documentation model so implementation can proceed qu
    - `docs/interfaces/transaction-interfaces.md`
    - `docs/interfaces/error-interfaces.md`
 
-12. **Decision history (ADRs)**
+12. **Research journal and candidate techniques**
+   - `docs/research/gpu-db-literature-review-loop.md`
+   - `docs/research/gpu-db-paper-candidates.md`
+   - `docs/research/gpu-db-literature-journal.md`
+
+13. **Decision history (ADRs)**
    - `docs/adr/README.md`
    - `docs/adr/ADR-001-log-boundary-is-wal.md`
    - `docs/adr/ADR-002-deterministic-batch-ordering.md`
@@ -50,19 +55,19 @@ This project uses a layered documentation model so implementation can proceed qu
    - `docs/adr/ADR-004-replicator-interface.md`
    - `docs/adr/ADR-005-snapshot-install-snapshot-strategy.md`
 
-13. **Delivery scope and sequencing**
+14. **Delivery scope and sequencing**
    - `docs/roadmap/v0-v1.md`
    - `docs/roadmap/no-nvidia-bootstrap-plan.md`
    - `docs/roadmap/no-gpu-bootstrap-closeout-review.md`
 
-14. **Compatibility and validation gates**
+15. **Compatibility and validation gates**
    - `docs/compatibility/matrix.md`
    - `docs/testing/parity-and-jepsen-plan.md`
 
-15. **Operations runbooks**
+16. **Operations runbooks**
    - `docs/operations/runbooks.md`
 
-16. **Process guardrails**
+17. **Process guardrails**
    - `docs/GPU_GUARDRAILS.md`
    - `.github/pull_request_template.md`
 
@@ -71,5 +76,7 @@ This project uses a layered documentation model so implementation can proceed qu
 - Use `DESIGN.md` for full-system intent and long-range targets.
 - Use architecture docs for implementation constraints and sequencing.
 - Use interface docs while coding.
+- Use research docs to convert papers into benchmark candidates before
+  changing the runtime or storage design.
 - Use ADRs when making changes that are expensive to reverse.
 - Use guardrails and PR checklist to prevent CPU-first drift.
