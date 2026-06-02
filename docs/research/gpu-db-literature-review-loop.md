@@ -34,6 +34,12 @@ journal of candidate techniques, rejected ideas, and benchmarkable hypotheses.
 Each run should process one paper unless the paper is unavailable, irrelevant,
 or superseded by a better source found during triage.
 
+Only papers from 2015 onward are eligible for new review. Prefer newer
+literature first, especially 2023-present work, unless a slightly older paper is
+clearly foundational for a current 2015-present mechanism. Pre-2015 papers may
+remain in the journal as historical context if already reviewed, but the loop
+must not select them for future runs.
+
 Prefer papers from:
 
 - VLDB, SIGMOD, ICDE, CIDR, DaMoN

@@ -6,6 +6,10 @@ This queue is maintained by the literature-review loop. Status values:
 - `reviewed`: journal entry exists
 - `skipped`: unavailable, weak relevance, or superseded
 
+Selection policy: future reviews must use papers from 2015 onward, preferably
+newer literature from 2023-present. Pre-2015 entries may remain as historical
+context, but should not be selected by the loop.
+
 ## Seed Queue
 
 ### GPU query execution and batching
@@ -14,24 +18,44 @@ This queue is maintained by the literature-review loop. Status values:
   Wang et al., PVLDB 2014.
   URL: `https://www.vldb.org/pvldb/vol7/p1011-wang.pdf`
   Why: directly relevant to concurrent GPU query scheduling and resource
-  sharing.
+  sharing. Reviewed before the 2015-present policy was added; keep as
+  historical context.
 - `queued` — **Concurrent query processing in a GPU-based database system**,
   PLOS ONE 2019.
   URL: `https://pmc.ncbi.nlm.nih.gov/articles/PMC6467383/`
   Why: batch-level optimization model for concurrent GPU database workloads.
+- `queued` — **Data Path Fusion in GPU for Analytical Query Processing**,
+  arXiv 2026.
+  URL: `https://arxiv.org/abs/2605.10511`
+  Why: modern GPU-driven data path fusion that combines IO, decompression, and
+  query work into GPU execution.
+- `queued` — **RTCUDB: Building Databases with RT Processors**, arXiv 2024.
+  URL: `https://arxiv.org/abs/2412.09337`
+  Why: explores ray-tracing cores for database query processing and may suggest
+  alternate hardware mapping for lookup/search-heavy paths.
+- `queued` — **GOLAP: A GPU-in-Data-Path Architecture for High-Speed OLAP**,
+  2024.
+  URL: `https://dl.acm.org/doi/10.1145/3654925`
+  Why: GPU-in-data-path design for compressed block streaming, decompression,
+  and scan processing.
 - `queued` — **Revisiting Query Performance in GPU Database Systems**,
   arXiv 2023.
   URL: `https://arxiv.org/abs/2302.00734`
   Why: cross-stack GPU DBMS performance, resource utilization, and concurrent
   query recommendations.
-- `queued` — **Red Fox: An Execution Environment for Relational Query
+- `queued` — **Efficiently Processing Joins and Grouped Aggregations on GPUs**,
+  arXiv 2023.
+  URL: `https://arxiv.org/abs/2312.00720`
+  Why: modern evaluation of GPU joins, grouped aggregation, and workload-aware
+  implementation selection.
+- `skipped` — **Red Fox: An Execution Environment for Relational Query
   Processing on GPUs**, 2013.
   URL:
   `https://casl.gatech.edu/publications/red-fox-an-execution-environment-for-relational-query-processing-on-gpus/`
-  Why: GPU relational execution runtime and operator compilation.
-- `queued` — **GPU Join Processing Revisited**, DaMoN 2012.
+  Why: pre-2015; keep only as historical context.
+- `skipped` — **GPU Join Processing Revisited**, DaMoN 2012.
   URL: `https://research.ibm.com/publications/gpu-join-processing-revisited`
-  Why: data movement, GPU join throughput, and host/device access model.
+  Why: pre-2015; keep only as historical context.
 
 ### MVCC, snapshots, and concurrency control
 
@@ -39,18 +63,28 @@ This queue is maintained by the literature-review loop. Status values:
   Storage Engines**, PVLDB 2023.
   URL: `https://www.vldb.org/pvldb/vol16/p1426-alhomssi.pdf`
   Why: scalable snapshot isolation, long-reader robustness, and GC ideas.
-- `queued` — **High-Performance Concurrency Control Mechanisms for Main-Memory
+- `queued` — **Read-Safe Snapshots: An abort/wait-free serializable read
+  method for read-only transactions on mixed OLTP/OLAP workloads**, Information
+  Systems 2024.
+  URL: `https://www.sciencedirect.com/science/article/pii/S0306437924000437`
+  Why: recent MVCC read-only transaction design for serializable snapshots
+  under mixed OLTP/OLAP workloads.
+- `queued` — **On Supporting Efficient Snapshot Isolation for In-Memory
+  Database Storage**, PVLDB 2020.
+  URL: `https://www.vldb.org/pvldb/vol13/p211-sun.pdf`
+  Why: P-Tree index for efficient snapshot isolation and MVCC in multicore
+  in-memory HTAP storage.
+- `skipped` — **High-Performance Concurrency Control Mechanisms for Main-Memory
   Databases**, VLDB 2012.
   URL: `https://www.vldb.org/pvldb/vol5/p298_per-akelarson_vldb2012.pdf`
-  Why: high-throughput concurrency-control comparisons for in-memory engines.
+  Why: pre-2015; keep only as historical context.
 - `queued` — **An Empirical Evaluation of In-Memory Multi-Version Concurrency
   Control**, PVLDB 2017.
   URL: `https://www.vldb.org/pvldb/vol10/p781-Wu.pdf`
   Why: MVCC design tradeoffs, version storage, validation, and GC behavior.
-- `queued` — **Serializable Snapshot Isolation in PostgreSQL**, VLDB 2012.
+- `skipped` — **Serializable Snapshot Isolation in PostgreSQL**, VLDB 2012.
   URL: `https://www.vldb.org/pvldb/vol5/p1850_danports_vldb2012.pdf`
-  Why: correctness boundary and anomaly prevention when snapshot isolation is
-  not enough.
+  Why: pre-2015; keep only as historical context.
 - `queued` — **Accelerating Analytical Processing in MVCC using Fine-Granular
   High-Frequency Virtual Snapshotting**, arXiv 2017.
   URL: `https://arxiv.org/abs/1709.04284`
@@ -58,27 +92,23 @@ This queue is maintained by the literature-review loop. Status values:
 
 ### Runtime scale, queues, and mechanical sympathy
 
-- `queued` — **Disruptor: High performance alternative to bounded queues for
+- `skipped` — **Disruptor: High performance alternative to bounded queues for
   exchanging data between concurrent threads**, LMAX technical paper.
   URL: `https://lmax-exchange.github.io/disruptor/files/Disruptor-1.0.pdf`
-  Why: ring-buffer sequencing, single-writer ownership, batching by queue
-  drain, and predictable memory behavior.
-- `queued` — **The C10K problem**, Dan Kegel.
+  Why: pre-2015/non-paper background; keep only as historical context.
+- `skipped` — **The C10K problem**, Dan Kegel.
   URL: `http://www.kegel.com/c10k.html`
-  Why: background for multiplexed IO and high concurrent connection strategy.
+  Why: pre-2015/non-paper background; keep only as historical context.
 
 ## Newly Discovered Queue
 
 Append new candidates here as each paper is processed.
 
-- `queued` — **The Yin and Yang of Processing Data Warehousing Queries on GPU
+- `skipped` — **The Yin and Yang of Processing Data Warehousing Queries on GPU
   Devices**, Yuan et al., PVLDB 2013.
   URL: `https://www.vldb.org/pvldb/vol6/p817-yuan.pdf`
-  Why: predecessor YDB work with GPU data-warehousing operator profiling,
-  direct host memory access, compression, and query execution tradeoffs cited
-  by MultiQx-GPU.
-- `queued` — **High-Throughput Transaction Executions on Graphics Processors**,
+  Why: pre-2015; keep only as historical context.
+- `skipped` — **High-Throughput Transaction Executions on Graphics Processors**,
   He and Yu, PVLDB 2011.
   URL: `https://www.vldb.org/pvldb/vol4/p314-he.pdf`
-  Why: GPU transaction batching and isolation mechanisms may inform write-path
-  batching, MVCC visibility, and short-task GPU execution limits.
+  Why: pre-2015; keep only as historical context.
