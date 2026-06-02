@@ -1182,3 +1182,165 @@ buffers.
   retained read route. Expected improvement: safer optimistic fast paths and
   clearer invalidation retries. Failure condition: the state check or cache-line
   traffic dominates single-session p50 latency.
+
+### 2026-06-02 - Robust Plan Evaluation based on Approximate Probabilistic Machine Learning
+
+**Citation:** Amin Kamali, Verena Kantere, Calisto Zuzarte, and Vincent
+Corvinelli. "Robust Plan Evaluation based on Approximate Probabilistic Machine
+Learning." PVLDB 18(8), 2025, pp. 2626-2638. doi:10.14778/3742728.3742753.
+Retrieved 2026-06-02 from the PVLDB PDF,
+`https://www.vldb.org/pvldb/vol18/p2626-kamali.pdf`; arXiv version
+`https://arxiv.org/abs/2401.15210`.
+
+**Category:** query optimization / planning.
+
+**Relevance tags:** robust query optimization; learned cost models; plan risk;
+estimation risk; route selection; CPU/GPU fallback; workload drift; tail
+latency; uncertainty-aware admission.
+
+**Core idea:** Roq treats optimizer estimates as probability distributions
+rather than point values. Classical optimizers and many learned optimizers pick
+the plan with the best expected cost even when that estimate is highly
+uncertain. Roq argues that robust plan selection should consider both the
+expected runtime and the risk that an apparently cheap plan becomes bad at
+runtime because of cardinality errors, model uncertainty, plan structure, or
+workload drift.
+
+The paper formalizes three risk notions. Plan risk is the uncertainty inherent
+to a plan's structure and sensitivity to input-cardinality errors. Estimation
+risk is uncertainty from limitations of the learned cost model itself.
+Suboptimality risk is the probability that a selected plan is slower than
+alternatives at runtime. Roq then uses approximate probabilistic machine
+learning to predict both cost and uncertainty, and uses that uncertainty during
+plan selection instead of only after a bad plan is observed.
+
+In evaluation with IBM Db2-generated candidate plans on CEB, JOB, and DSB, Roq
+reports better predictive accuracy than the tested learned baselines and better
+tail robustness of selected plans. The paper's strongest planning result is
+that uncertainty-aware selection reduces 99th-percentile plan suboptimality
+relative to Roq's base learned model, while still preserving practical
+inference cost. The authors report that about 10 MC-dropout inference
+iterations were enough for stable plan choice, with prototype Python overheads
+around tens of milliseconds for the risk-aware strategies.
+
+**Concrete mechanisms:**
+
+- Roq decomposes total cost-estimate uncertainty into data uncertainty and
+  model uncertainty. The data uncertainty corresponds to sensitivity to input
+  estimates and plan shape; model uncertainty corresponds to lack of knowledge
+  in the learned model parameters.
+- The learned cost model predicts a mean execution time and variance through
+  two output branches. The variance branch is trained with a Gaussian
+  negative-log-likelihood-style loss, so the model learns uncertainty along
+  with the latency prediction.
+- Model uncertainty is estimated with Monte Carlo dropout: dropout remains
+  active during inference, multiple predictions are sampled, and the variance
+  of predicted means estimates epistemic/model uncertainty.
+- Total uncertainty combines the predicted data uncertainty and the sampled
+  model uncertainty; Roq can use model-only, data-only, or total uncertainty
+  in plan selection.
+- Suboptimality-risk selection compares each candidate plan against every
+  alternative. Assuming independent normal cost distributions, it estimates the
+  probability that plan `i` is slower than plan `j`, averages those pairwise
+  risks, and picks the plan with the lowest average risk.
+- The pairwise suboptimality calculation is vectorizable with matrices of mean
+  differences and combined variances, keeping the extra optimizer-time
+  computation small compared with repeated learned-model inference.
+- Conservative selection chooses the plan minimizing `mean + factor * sigma`.
+  This gives a simpler risk penalty when the non-parametric pairwise
+  suboptimality calculation is too expensive or unnecessary.
+- A pruning strategy can remove plans whose plan-risk or estimation-risk values
+  exceed tuned thresholds before ordinary selection, though the paper reports
+  this did not materially improve over the two main risk-aware strategies.
+- Query encoding uses join graphs with table, predicate, join, skew,
+  selectivity, and graph-level attributes. A TransformerConv GNN produces query
+  and table embeddings.
+- Plan encoding uses a vectorized plan tree processed by tree convolutional
+  neural networks, augmented with table embeddings from the query encoder.
+- Training and validation use optimizer-generated candidate plan sets from
+  multiple hint configurations, then measure actual execution times as labels.
+- The experiments explicitly test workload drift: a minor DSB template shift
+  and a larger CEB-to-JOB shift. Roq's GNN query representation and risk-aware
+  selection are presented as the source of better robustness under these
+  shifts.
+
+**GPU DB mapping:** The GPU DB planner has exactly the kind of fragile route
+choice Roq targets. A resident GPU route may have the best expected latency
+when the snapshot is valid, queue depth is low, the predicate is selective, and
+the result is small. The same route can become a tail-latency trap if
+cardinality is wrong, GPU queues are saturated, a refresh invalidates the
+snapshot, H2D/D2H bytes are underestimated, or CPU fallback would have avoided
+waiting behind a long scan. Roq suggests treating each route estimate as
+`expected cost + uncertainty`, not a single deterministic score.
+
+For the current architecture, the first transferable design is not a full
+learned optimizer. It is a risk envelope around deterministic CPU/GPU route
+rules. A route descriptor can carry expected latency plus uncertainty fields:
+cardinality confidence, resident-validity risk, queue-delay variance,
+transfer-byte variance, kernel-time variance, refresh/invalidation risk, and
+fallback penalty. The planner can then reject a GPU route whose mean is low but
+whose tail risk is unacceptable for an OLTP session, while still selecting it
+for analytical work where throughput matters more than p99 latency.
+
+The plan-risk versus estimation-risk split maps well to GPU DB telemetry.
+Plan risk is route-shape risk: joins, range scans, prefix filters, result-size
+scatter, partition fanout, or over-resident streaming tend to become worse
+when estimates are wrong. Estimation risk is model or statistics risk: stale
+table stats, missing queue-delay samples, new hardware, cold GPU cache state,
+or workload drift. Those should be recorded separately so the runtime can tell
+whether a bad decision came from a fragile route or an uninformed estimator.
+
+The conservative `mean + factor * sigma` strategy is immediately useful for
+production guardrails. For low-latency pgwire sessions, the route chooser could
+prefer the lowest risk-adjusted p99 proxy rather than the lowest mean. For
+batch/analytical sessions, the factor can be lower, allowing throughput-heavy
+GPU routes with higher variance. That gives session policy a measurable shape
+instead of hard-coding "GPU if valid" or "CPU fallback if queue full."
+
+The MC-dropout/GNN model is a later-stage idea. The first GPU DB version should
+use measured distributions from existing route telemetry: queue wait,
+kernel/event time, transfer bytes, result rows, refresh age, invalidation
+count, and CPU fallback time. A learned model becomes attractive only after
+there is enough route history to train and validate against workload drift.
+
+**Risks and mismatches:** Roq is evaluated for query optimization over
+candidate plans generated by Db2 hint configurations, not for a GPU-aware
+transactional engine with WAL, MVCC, residency, and session admission. The
+paper focuses on plan optimization robustness, not runtime adaptive execution,
+backpressure, or correctness after invalidation. Its risk calculations assume
+normal transformed target distributions and simplify pairwise plan covariance
+with an independence assumption; those assumptions may overestimate or
+misestimate GPU route risk if queue delay and transfer contention are strongly
+correlated. The reported inference overheads are acceptable for analytical
+optimization but may be too high for single-row OLTP requests unless the model
+is cached, compiled, or reserved for complex routes. Finally, robust plan
+selection can deliberately choose a slower mean plan to reduce tail risk; that
+must be tied to session class and SLA rather than applied globally.
+
+**Benchmark candidates:**
+
+- Add risk-adjusted route telemetry for retained reads: mean and variance of
+  queue wait, CUDA event time, H2D/D2H bytes, result rows, and response encode
+  time by query shape and snapshot generation. Minimum gate: no planner
+  behavior change while telemetry can compute `mean + sigma` per route.
+- Implement a deterministic conservative route scorer for one CPU-versus-GPU
+  retained aggregate: choose by `estimated_mean + k * estimated_stddev`, with
+  different `k` for OLTP and analytical session classes. Failure condition:
+  p50 improves while p99 or overload rejections regress under concurrency.
+- Build a route-risk replay harness from existing benchmark CSVs: replay route
+  choices using mean-only, conservative, and pairwise suboptimality-risk
+  scorers, then compare chosen-route p50/p95/p99 and fallback counts without
+  running GPU benchmarks.
+- Track plan risk and estimator risk separately. Plan risk should rise for
+  route shapes with high fanout, result scatter, over-resident streaming, or
+  invalidation sensitivity; estimator risk should rise when stats are stale or
+  telemetry sample count is low.
+- Add a workload-drift test for planner route choice: train or calibrate on
+  retained equality lookups, then evaluate on range aggregates, invalidated
+  snapshots, and higher concurrency. Minimum proof gate: the risk-aware scorer
+  falls back or rejects explicitly instead of selecting fragile GPU routes with
+  bad tail latency.
+- For future learned planners, require the model to output uncertainty and
+  compare against deterministic planner baselines. A learned route may be used
+  only if it improves tail latency or throughput without increasing
+  correctness fallback, invalidation retry, or overload ambiguity.

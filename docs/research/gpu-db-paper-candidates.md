@@ -149,9 +149,10 @@ mechanical sympathy, multi-tier cache/data placement, or query optimization.
   URL: `https://15799.courses.cs.cmu.edu/spring2025/papers/15-learned/yang-sigmod2023.pdf`
   Why: learned cost-model calibration rather than full replacement; useful for
   CPU/GPU route estimation.
-- `queued` — **Roq: Robust Query Optimization Based on a Risk-aware Learned
-  Cost Model**, arXiv 2024.
-  URL: `https://arxiv.org/abs/2401.15210`
+- `reviewed` — **Robust Plan Evaluation based on Approximate Probabilistic
+  Machine Learning**, Kamali et al., PVLDB 2025.
+  URL: `https://www.vldb.org/pvldb/vol18/p2626-kamali.pdf`
+  arXiv: `https://arxiv.org/abs/2401.15210`
   Why: risk-aware optimization may map to choosing CPU/GPU/overload/fallback
   routes under uncertain latency.
 
@@ -331,3 +332,17 @@ Append new candidates here as each paper is processed.
   Why: extends vmcache-style virtual-memory-assisted buffer management to
   multiple memory tiers such as DRAM, remote memory/CXL-like tiers, and disk;
   directly relevant to future GPU DB host-tier and cold-partition placement.
+- `queued` — **PARQO: Penalty-Aware Robust Plan Selection in Query
+  Optimization**, Xiu et al., PVLDB 2024.
+  URL: `https://doi.org/10.14778/3704965.3704971`
+  arXiv: `https://arxiv.org/abs/2406.01526`
+  Why: robust plan selection with user-defined penalty functions and
+  workload-informed selectivity-error models; useful for deciding when a
+  fast GPU route is too fragile under uncertain cardinality, transfer, or
+  queue-delay estimates.
+- `queued` — **LOGER: A Learned Optimizer towards Generating Efficient and
+  Robust Query Execution Plans**, Chen et al., PVLDB 2023.
+  URL: `https://www.vldb.org/pvldb/vol16/p1777-gao.pdf`
+  Why: combines learned optimizer search with DBMS operator restrictions and
+  beam search; relevant to adding learned GPU route suggestions without
+  surrendering deterministic planner guardrails.
