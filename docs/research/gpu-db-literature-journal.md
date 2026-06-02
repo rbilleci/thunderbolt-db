@@ -1873,3 +1873,182 @@ control-loop design, not the immediate adoption of Caladan's full runtime.
   one serialized retained route executor with request/chunk-level workers that
   still publish through owner domains. Required metrics: throughput, p99
   latency, owner queue wait, correctness status, and allocation count.
+
+### 2026-06-02 - Virtual-Memory Assisted Buffer Management In Tiered Memory
+
+**Citation:** Yeasir Rayhan and Walid G. Aref. "Virtual-Memory Assisted
+Buffer Management In Tiered Memory." arXiv:2603.03271, submitted
+2026-03-03. Retrieved 2026-06-02 from the arXiv abstract and PDF,
+`https://arxiv.org/abs/2603.03271` and
+`https://arxiv.org/pdf/2603.03271`.
+
+**Category:** multi-tier cache / data placement.
+
+**Relevance tags:** tiered memory; virtual-memory-assisted buffer management;
+remote memory; CXL-like memory; NUMA; page migration; stable virtual
+addresses; TLB shootdown; NVMe; buffer replacement; placement economics.
+
+**Core idea:** The paper extends vmcache-style virtual-memory-assisted buffer
+management from a two-tier DRAM/disk setting to an `n`-tier
+DRAM/remote-memory/disk setting. The central invariant is that a database page
+keeps one stable virtual address for its lifetime while the physical frame
+backing that address can move among memory-resident tiers. PID translation is
+therefore delegated to the OS page table rather than a DBMS hash table, while
+the DBMS still controls promotion, demotion, and eviction policy.
+
+The added memory tiers make page migration a first-class bottleneck. The
+authors build `vmcache^n` with separate resident sets per memory tier and use
+Linux page-migration mechanisms to move pages without changing virtual
+addresses. They also propose a custom `move_pages2` syscall that exposes
+migration mode and maximum batch size to the buffer manager, reducing migration
+overhead by allowing larger batched migration rounds and partial progress after
+some page failures. On a 3-tier NUMA/NVMe setup, the paper reports up to about
+3.82x higher TPC-C throughput than two-tier vmcache when remote memory is 4x
+local DRAM capacity, and summarizes the improvement as up to 4x. The result is
+not simply "add slower memory"; the economics improve only past a remote-memory
+capacity break-even point because migration overhead can dominate small tiers.
+
+**Concrete mechanisms:**
+
+- `vmcache^n` reserves virtual address space for the database page universe at
+  startup. A PID maps to a fixed virtual address; if no physical frame backs it,
+  access faults or explicit fixing loads it from disk into a chosen memory tier.
+- Memory-resident tiers are modeled as local DRAM, remote memory, and disk in
+  the evaluated 3-tier design, but the design generalizes to additional remote
+  memory tiers between DRAM and disk.
+- Pages are not duplicated across memory tiers in this design. At any point a
+  page has one memory-resident physical frame or is evicted to disk, preserving
+  the single-address invariant.
+- The design only works for memory tiers exposed in System-DRAM mode. DAX or
+  App Direct style device mappings are incompatible because those mappings are
+  permanently backed by device frames and cannot be remapped across tiers while
+  keeping the same virtual address.
+- `mbind` is used to place a page loaded from disk into a target memory tier.
+  `move_pages` is used to migrate batches of already memory-resident pages
+  between tiers while preserving virtual addresses and updating page tables.
+- Page state extends vmcache's state word with tier-location bits. The paper
+  discusses unlocked, shared-locked, locked, marked, and evicted states plus
+  tier-specific variants such as unlocked-in-DRAM or unlocked-in-remote-memory.
+- Each memory tier has its own cache and resident set. When a tier reaches a
+  threshold, a clock replacement pass marks unlocked pages and migrates a
+  selected batch downward, for example from DRAM to remote memory, or evicts to
+  disk.
+- Promotion from remote memory to DRAM can be triggered on access. The manager
+  locks the target page, scans the source resident set for additional unlocked
+  pages, and promotes a batch to amortize migration cost.
+- Four probabilistic migration flags govern whether pages loaded from disk,
+  written back, read from remote memory, or written in remote memory move up or
+  down the hierarchy. The paper evaluates migration-ratio effects but does not
+  claim one universal policy.
+- Native `move_pages` batches pages but uses a fixed kernel batching policy,
+  defaults to synchronous migration, and can abort early on some errors. The
+  paper identifies TLB shootdowns and abort-on-failure behavior as important
+  costs.
+- `move_pages2` adds `migration_mode` and `nr_max_batched_migration` knobs.
+  Modes include asynchronous migration, synchronous migration, and a lighter
+  synchronous mode that avoids blocking on writeback. The batch-size knob lets
+  the DBMS tune how many pages are migrated before TLB invalidation.
+- `move_pages2` uses optimistic failure handling: it records errors for failed
+  pages but migrates as many eligible pages as possible in the invocation
+  instead of aborting the rest of the list.
+- The implementation is described as roughly 150 Linux 6.8.0 kernel-code-line
+  changes across the page-migration path.
+- Evaluation uses a CloudLab dual-socket Intel Xeon Silver 4314 system: one
+  socket's DRAM is treated as local memory, the other socket's DRAM as remote
+  memory, and a PCIe4 NVMe SSD as disk. Workloads are TPC-C and random point
+  lookup, with working sets around 190 GB and 130 GB.
+- TPC-C benefits most when remote memory is large enough to reduce disk IO. The
+  random-read workload sees smaller overall gains because page transfers
+  between memory tiers dominate cost even when disk IO is reduced.
+- The breakdown shows disk IO dominating TPC-C and memory-tier migration
+  dominating random reads. Even `move_pages2` leaves migration as a major cost,
+  so the paper warns that better migration mechanisms matter more than removing
+  kernel/userspace crossing overhead.
+
+**GPU DB mapping:** The strongest transferable idea is the stable logical
+address plus explicit physical-tier movement split. For the GPU DB, a table
+segment, resident partition, old snapshot side structure, or cold page should
+have a stable logical identity used by planners and snapshots, while placement
+metadata says whether the physical bytes are in GPU memory, pinned host DRAM,
+ordinary host DRAM, remote/CXL-like memory, compressed host storage, or NVMe.
+Readers should not chase a mutable hash-table-like placement structure on
+every row if the route can resolve the segment identity once and then operate
+through a stable handle.
+
+The paper also warns against treating future CXL or remote memory as a free
+capacity extension for GPU DB resident snapshots. Placement only helps when
+the remote tier is large enough and migration frequency is low enough to beat
+the movement cost. For P8, that means admission should avoid ping-ponging hot
+segments between GPU, host DRAM, and slower host tiers. A segment whose access
+pattern is random point lookup may be better left in a CPU/host index path than
+repeatedly promoted and demoted around GPU execution.
+
+`move_pages2` maps conceptually to batchable tier transitions. The GPU DB will
+not literally depend on this custom syscall for GPU memory, but it should expose
+the same policy knobs for its own cache manager: migration mode, maximum pages
+or bytes per migration batch, partial-progress semantics, per-page status, and
+queueable retry. Refresh, warmup, eviction, host-to-device transfer, device-to-
+host demotion, and NVMe prefetch should all report how many pages or segments
+actually moved rather than treating migration as an all-or-nothing operation.
+
+The single-copy invariant is a useful contrast to GPU caches. The current P8
+design deliberately allows durable CPU truth plus rebuildable GPU acceleration
+state, so it is not the same as `vmcache^n`. Still, for each published resident
+generation, the engine should avoid ambiguous multiple mutable copies. If a
+segment has CPU canonical state, GPU resident state, and a remote-memory shadow,
+the metadata must state which copy is authoritative for correctness, which
+copies are rebuildable, and which generation each route may read.
+
+The tier-mode limitation is also relevant. Future host tiers may be exposed as
+System-DRAM, DAX/device memory, RDMA, CXL pooled memory, or storage. A single
+placement abstraction cannot assume all tiers support remapping, page faults,
+byte-addressability, DMA, pinning, or CUDA access. P8 should classify each tier
+by the movement and access primitives it actually supports before planner cost
+hooks choose a route.
+
+**Risks and mismatches:** This is an arXiv paper rather than a peer-reviewed
+conference version, and its evaluated remote tier is NUMA-remote DRAM rather
+than real CXL, GPU memory, RDMA memory, or disaggregated memory. The paper is
+about database pages and OS page migration, not MVCC visibility, WAL durability,
+CUDA streams, GPU kernel scheduling, or SQL planning. Its single-copy invariant
+conflicts with the GPU DB's cache-as-acceleration model unless applied only to
+logical placement handles, not to durable correctness ownership.
+
+The custom syscall is not a near-term dependency for this engine. Adopting a
+patched Linux kernel would be a major operational burden, and GPU memory
+movement uses different APIs. The practical lesson is to measure and batch tier
+movement, not to assume `move_pages2` is portable. The probabilistic migration
+policy is also underspecified for production GPU DB workloads; copy/admission,
+retained reads, over-resident scans, and update-heavy OLTP will need telemetry-
+driven policies rather than fixed probabilities. Finally, the paper shows that
+random access can be migration-bound even with more memory, which is a direct
+risk for point lookup workloads if the GPU DB over-promotes cold keys.
+
+**Benchmark candidates:**
+
+- Add a tier-transition accounting proof for P8 segments: bytes/pages promoted
+  from CPU DRAM to GPU, demoted or evicted, prefetched from NVMe, and skipped
+  due to pressure. Minimum gate: every retained-route decision reports current
+  tier, target tier, generation, movement bytes, and fallback reason.
+- Build a synthetic hot/warm/cold segment benchmark with a fixed GPU memory
+  budget and a larger host-memory/NVMe dataset. Compare no promotion, greedy
+  promotion, batched promotion, and partial-progress promotion. Failure
+  condition: p95 query latency or write refresh latency becomes dominated by
+  segment migration without visible admission backpressure.
+- For random point lookup workloads, test whether resident GPU promotion helps
+  after accounting for movement cost. Expected result may be negative; a CPU
+  index path should win if keys are too random or the migration batch is too
+  small.
+- Add a "migration batch size" knob to residency warmup/refresh experiments:
+  rows or pages per H2D transfer, segments per refresh batch, and maximum
+  pinned-buffer bytes per batch. Measure throughput, p50/p99 latency, pinned
+  memory pressure, and partial progress under cancellation or overload.
+- Prototype per-segment migration status instead of all-or-nothing refresh:
+  admitted, moving, valid, partial, failed, retryable, evicted. Proof gate:
+  readers only use fully valid generations, while maintenance can continue
+  moving other segments without blocking unrelated valid partitions.
+- Create a future-tier capability matrix for GPU DB route planning: GPU HBM,
+  pinned host DRAM, ordinary DRAM, System-DRAM CXL, DAX/device memory, NVMe,
+  and remote memory. Include whether each tier supports direct GPU access,
+  stable virtual addressing, page migration, async DMA, durable recovery, and
+  cheap random access.

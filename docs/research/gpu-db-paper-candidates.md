@@ -326,7 +326,7 @@ Append new candidates here as each paper is processed.
   URL: `https://doi.org/10.1145/3514221.3526125`
   Why: vDriver successor cited by the LeanStore paper; relevant to precise
   MVCC garbage collection and reducing long-reader damage in HTAP workloads.
-- `queued` — **Virtual-Memory Assisted Buffer Management In Tiered Memory**,
+- `reviewed` — **Virtual-Memory Assisted Buffer Management In Tiered Memory**,
   Rayhan and Aref, arXiv 2026.
   URL: `https://arxiv.org/abs/2603.03271`
   Why: extends vmcache-style virtual-memory-assisted buffer management to
@@ -379,3 +379,23 @@ Append new candidates here as each paper is processed.
   Why: work-conserving dataplane scheduler for high-connection-count
   microsecond services, including Silo/TPC-C evaluation; relevant to pgwire
   IO-worker and request-stealing choices.
+- `queued` — **Pasha: An Efficient, Scalable Database Architecture for CXL
+  Pods**, Huang et al., CIDR 2025.
+  URL: `https://www.vldb.org/cidrdb/papers/2025/p8-huang.pdf`
+  Why: CXL-pod database architecture cited by vmcache^n; relevant to
+  disaggregated/tiered memory placement and future host-memory expansion.
+- `queued` — **Resource-Adaptive Query Execution with Paged Memory
+  Management**, Otaki, Benello, Elmore, and Graefe, CIDR 2025.
+  URL: `https://vldb.org/cidrdb/papers/2025/p2-otaki.pdf`
+  Why: paged-memory and resource-adaptive execution work cited by vmcache^n;
+  relevant to query admission and execution under memory-tier pressure.
+- `queued` — **Nomad: Non-Exclusive Memory Tiering via Transactional Page
+  Migration**, Xiang et al., OSDI 2024.
+  URL: `https://www.usenix.org/conference/osdi24/presentation/xiang`
+  Why: transactional page migration for tiered memory cited by vmcache^n;
+  useful for comparing OS-assisted migration against explicit DBMS ownership.
+- `queued` — **Towards Buffer Management with Tiered Main Memory**, Hao et al.,
+  PACMMOD/SIGMOD 2024.
+  URL: `https://doi.org/10.1145/3639303`
+  Why: modern tiered-main-memory buffer management cited by vmcache^n;
+  relevant to DRAM/remote-memory/NVMe policy design and placement economics.
