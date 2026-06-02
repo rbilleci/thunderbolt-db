@@ -14861,6 +14861,10 @@ impl Engine {
                 .execute_relational_partitioned_equality_projection_with_resident_device_memory_probe(
                     select,
                 ),
+            "partitioned_int4_equality_multi_column_projection" => self
+                .execute_relational_partitioned_equality_multi_column_projection_with_resident_device_memory_probe(
+                    select,
+                ),
             "int4_equality_count" => {
                 self.execute_relational_filtered_count_with_resident_device_memory_probe(select)
             }
@@ -15281,6 +15285,222 @@ impl Engine {
         );
         self.relational_resident_cache
             .record_route_device_lookup_micros(&table.name, lookup_micros, rows.len());
+
+        Ok(RelationalSelectResult {
+            columns: bound.selected_columns,
+            rows,
+            planned_target: DeviceTarget::Gpu(gpu_id),
+            executed_target: DeviceTarget::Gpu(gpu_id),
+            fallback_reason: None,
+            access_path,
+        })
+    }
+
+    pub fn execute_relational_partitioned_equality_multi_column_projection_with_resident_device_memory_probe(
+        &mut self,
+        select: &Select,
+    ) -> Result<RelationalSelectResult, ExecuteError> {
+        let (table, bound) = self.bind_relational_select_for_execution(select)?;
+        let filter_groups = if !bound.filter_groups.is_empty() {
+            bound.filter_groups.clone()
+        } else if !bound.filters.is_empty() {
+            vec![bound.filters.clone()]
+        } else if let Some(filter) = bound.filter.clone() {
+            vec![vec![filter]]
+        } else {
+            Vec::new()
+        };
+        if select.distinct
+            || select.group_by.is_some()
+            || !select.having_groups.is_empty()
+            || select.order_by.is_some()
+            || select.limit.is_some()
+            || select.offset.is_some()
+            || bound.selected_indexes.len() < 2
+            || filter_groups.len() != 1
+            || filter_groups[0].len() != 1
+        {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "partitioned resident equality multi-column projection proof currently supports SELECT int4_columns with one int4 equality predicate"
+                    .to_string(),
+            )));
+        }
+        let (filter_idx, op, value) = filter_groups[0][0].clone();
+        let SqlValue::Int4(needle) = value else {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "partitioned resident equality multi-column projection proof currently supports only int4 equality predicates"
+                    .to_string(),
+            )));
+        };
+        if op != SelectFilterOp::Eq || table.columns[filter_idx].ty != SqlType::Int4 {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "partitioned resident equality multi-column projection proof currently supports only int4 equality predicates"
+                    .to_string(),
+            )));
+        }
+        if bound
+            .selected_indexes
+            .iter()
+            .any(|idx| table.columns[*idx].ty != SqlType::Int4)
+        {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                "partitioned resident equality multi-column projection proof currently supports only int4 projection columns"
+                    .to_string(),
+            )));
+        }
+
+        let (_query, access_path) = self.relational_select_mvcc_query(select, &table, &bound)?;
+        let partitions = self
+            .relational_resident_cache
+            .partitions
+            .get(&table.name)
+            .cloned()
+            .ok_or_else(|| {
+                ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "relation \"{}\" has no resident partitions",
+                    table.name
+                )))
+            })?;
+        if partitions.is_empty() {
+            return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                "relation \"{}\" has no resident partitions",
+                table.name
+            ))));
+        }
+
+        let snapshot = self.router.runtime().snapshot();
+        let mut rows = Vec::new();
+        let mut match_index_micros = 0_u64;
+        let mut selected_projection_micros = 0_u64;
+        let mut materialization_micros = 0_u64;
+        let mut gpu_id = partitions[0].gpu_id;
+        let mut int4_d2h_bytes = 0_u64;
+        let mut match_index_d2h_bytes = 0_u64;
+        for partition in &partitions {
+            if partition.schema != table.schema || partition.table != table.name {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(
+                    "resident partition no longer matches catalog table identity".to_string(),
+                )));
+            }
+            let memory_pressure_active = snapshot
+                .memory_pressured_gpu_ids
+                .contains(&partition.gpu_id);
+            if !partition.is_valid(memory_pressure_active) {
+                return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                    "resident partition {} is invalid",
+                    partition.partition_id
+                ))));
+            }
+            let device_memory = self
+                .relational_resident_cache
+                .partition_device_memory
+                .get(&(table.name.clone(), partition.partition_id))
+                .ok_or_else(|| {
+                    ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                        "resident partition {} has no retained device memory",
+                        partition.partition_id
+                    )))
+                })?;
+            let filter_offset =
+                resident_partition_int4_column_offset(partition, &table, filter_idx)?;
+            let row_count = u64::try_from(partition.row_count).map_err(|_| {
+                ExecuteError::Engine(EngineError::ApplyFailed(
+                    "resident partition row count exceeds retained device-memory proof range"
+                        .to_string(),
+                ))
+            })?;
+            let match_started = Instant::now();
+            let matching_row_indices = device_memory
+                .match_i32_equal_row_indices_from_payload(&[(filter_offset, needle)], row_count)
+                .map_err(|err| ExecuteError::Engine(EngineError::ApplyFailed(err.to_string())))?;
+            match_index_micros = match_index_micros.saturating_add(
+                match_started
+                    .elapsed()
+                    .as_micros()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
+            );
+            match_index_d2h_bytes = match_index_d2h_bytes.saturating_add(
+                u64::try_from(matching_row_indices.len())
+                    .unwrap_or(u64::MAX)
+                    .saturating_mul(std::mem::size_of::<u64>() as u64)
+                    .saturating_add(std::mem::size_of::<u64>() as u64),
+            );
+
+            let started = Instant::now();
+            let mut column_values = BTreeMap::new();
+            for idx in &bound.selected_indexes {
+                let byte_offset = resident_partition_int4_column_offset(partition, &table, *idx)?;
+                let values = device_memory
+                    .project_i32_rows_from_payload(byte_offset, &matching_row_indices)
+                    .map_err(|err| {
+                        ExecuteError::Engine(EngineError::ApplyFailed(err.to_string()))
+                    })?;
+                if values.len() != matching_row_indices.len() {
+                    return Err(ExecuteError::Engine(EngineError::ApplyFailed(format!(
+                        "partitioned resident equality multi-column selected-row projection column returned {} rows, expected {}",
+                        values.len(),
+                        matching_row_indices.len()
+                    ))));
+                }
+                column_values.insert(*idx, values);
+            }
+            let elapsed = started.elapsed();
+            selected_projection_micros = selected_projection_micros
+                .saturating_add(elapsed.as_micros().try_into().unwrap_or(u64::MAX));
+            int4_d2h_bytes = int4_d2h_bytes.saturating_add(
+                bound
+                    .selected_indexes
+                    .len()
+                    .checked_mul(matching_row_indices.len())
+                    .and_then(|cells| cells.checked_mul(std::mem::size_of::<i32>()))
+                    .and_then(|bytes| bytes.checked_add(std::mem::size_of::<u64>()))
+                    .and_then(|bytes| u64::try_from(bytes).ok())
+                    .unwrap_or(u64::MAX),
+            );
+            for _ in 0..bound.selected_indexes.len().saturating_add(1) {
+                self.metrics.observe_kernel_exec_ms(
+                    elapsed.as_millis().try_into().unwrap_or(u64::MAX).max(1),
+                );
+            }
+
+            let materialize_started = Instant::now();
+            for selected_idx in 0..matching_row_indices.len() {
+                let row = bound
+                    .selected_indexes
+                    .iter()
+                    .map(|idx| {
+                        column_values.get(idx).map(|values| SqlValue::Int4(values[selected_idx])).ok_or_else(|| {
+                            ExecuteError::Engine(EngineError::ApplyFailed(
+                                "partitioned resident equality multi-column projection missing projected column"
+                                    .to_string(),
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>, ExecuteError>>()?;
+                rows.push(row);
+            }
+            materialization_micros = materialization_micros.saturating_add(
+                materialize_started
+                    .elapsed()
+                    .as_micros()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
+            );
+            gpu_id = partition.gpu_id;
+        }
+        self.metrics
+            .observe_d2h_bytes(int4_d2h_bytes.saturating_add(match_index_d2h_bytes));
+        self.relational_resident_cache
+            .record_route_device_lookup_micros(&table.name, match_index_micros, rows.len());
+        self.relational_resident_cache
+            .record_route_selected_projection_micros(
+                &table.name,
+                match_index_micros,
+                selected_projection_micros,
+                materialization_micros,
+                rows.len(),
+            );
 
         Ok(RelationalSelectResult {
             columns: bound.selected_columns,
@@ -20182,6 +20402,8 @@ impl Engine {
             "partitioned_count_all".to_string()
         } else if query_shape == "int4_equality_projection" {
             "partitioned_int4_equality_projection".to_string()
+        } else if query_shape == "int4_equality_multi_column_projection" {
+            "partitioned_int4_equality_multi_column_projection".to_string()
         } else {
             query_shape
         };
@@ -20194,6 +20416,27 @@ impl Engine {
                 .checked_mul(std::mem::size_of::<u64>())
                 .and_then(|bytes| u64::try_from(bytes).ok())
                 .unwrap_or(u64::MAX)
+        } else if partitioned_query_shape == "partitioned_int4_equality_multi_column_projection" {
+            let SelectProjection::Columns(columns) = &select.projection else {
+                return Self::resident_route_reject(
+                    &table.name,
+                    "partitioned resident routing has no retained-kernel proof for this SELECT shape",
+                    partitioned_query_shape,
+                );
+            };
+            u64::try_from(total_rows)
+                .unwrap_or(u64::MAX)
+                .saturating_mul(
+                    u64::try_from(columns.len())
+                        .unwrap_or(u64::MAX)
+                        .saturating_mul(std::mem::size_of::<i32>() as u64)
+                        .saturating_add(std::mem::size_of::<u64>() as u64),
+                )
+                .saturating_add(
+                    u64::try_from(partitions.len())
+                        .unwrap_or(u64::MAX)
+                        .saturating_mul(std::mem::size_of::<u64>() as u64),
+                )
         } else {
             0
         };
@@ -20231,14 +20474,38 @@ impl Engine {
 
         if !matches!(
             decision.query_shape.as_str(),
-            "partitioned_count_all" | "partitioned_int4_equality_projection"
+            "partitioned_count_all"
+                | "partitioned_int4_equality_projection"
+                | "partitioned_int4_equality_multi_column_projection"
         ) {
             decision.cache_state = "Absent".to_string();
             decision.valid = false;
             decision.reason =
-                "partitioned resident routing currently supports only unfiltered COUNT(*) and same-column int4 equality projection"
+                "partitioned resident routing currently supports only unfiltered COUNT(*), same-column int4 equality projection, and int4 equality multi-column projection"
                     .to_string();
             return decision;
+        }
+        let mut required_int4_columns = BTreeSet::new();
+        if decision.query_shape == "partitioned_int4_equality_multi_column_projection" {
+            let SelectProjection::Columns(columns) = &select.projection else {
+                decision.cache_state = "Absent".to_string();
+                decision.valid = false;
+                decision.reason =
+                    "partitioned resident routing requires projected columns".to_string();
+                return decision;
+            };
+            for column in columns {
+                required_int4_columns.insert(column.clone());
+            }
+            if let Some(filter) = &select.filter {
+                required_int4_columns.insert(filter.column.clone());
+            }
+            for filter in &select.filters {
+                required_int4_columns.insert(filter.column.clone());
+            }
+            for filter in select.filter_groups.iter().flatten() {
+                required_int4_columns.insert(filter.column.clone());
+            }
         }
         if partitions.is_empty() {
             decision.cache_state = "Absent".to_string();
@@ -20275,6 +20542,19 @@ impl Engine {
                 .contains_key(&(table.name.clone(), partition.partition_id))
             {
                 has_all_device_memory = false;
+            }
+            if !required_int4_columns.is_empty()
+                && required_int4_columns
+                    .iter()
+                    .any(|column| !partition.resident_device_int4_columns.contains(column))
+            {
+                decision.cache_state = "Absent".to_string();
+                decision.valid = false;
+                decision.reason = format!(
+                    "resident partition {} lacks required int4 projection layout",
+                    partition.partition_id
+                );
+                return decision;
             }
         }
         decision.has_retained_device_memory = has_all_device_memory;
@@ -26160,6 +26440,245 @@ mod tests {
         assert_eq!(invalidated.partition_count, 4);
         assert_eq!(invalidated.cache_state, "Invalidated");
         assert_eq!(invalidated.reason, "resident partition set is Invalidated");
+    }
+
+    #[test]
+    fn p8_partitioned_resident_multi_column_lookup_merges_projected_rows_and_rejects_missing_layout(
+    ) {
+        let mut e = Engine::new_local();
+        e.execute_text(
+            1,
+            "CREATE TABLE order_line (ol_o_id INT, ol_i_id INT, ol_quantity INT, ol_amount INT, ol_dist_info TEXT)",
+        )
+        .unwrap();
+
+        let partition_values: [[Vec<i32>; 4]; 4] = [
+            [
+                vec![42, 1, 42, 2],
+                vec![100, 101, 102, 103],
+                vec![5, 6, 7, 8],
+                vec![500, 501, 502, 503],
+            ],
+            [
+                vec![3, 4, 5, 6],
+                vec![200, 201, 202, 203],
+                vec![9, 10, 11, 12],
+                vec![600, 601, 602, 603],
+            ],
+            [
+                vec![42, 7, 8, 42],
+                vec![300, 301, 302, 303],
+                vec![13, 14, 15, 16],
+                vec![700, 701, 702, 703],
+            ],
+            [
+                vec![9, 10, 11, 12],
+                vec![400, 401, 402, 403],
+                vec![17, 18, 19, 20],
+                vec![800, 801, 802, 803],
+            ],
+        ];
+        let partitions = partition_values
+            .iter()
+            .enumerate()
+            .map(|(partition_id, columns)| {
+                let row_count = columns[0].len();
+                let mut bytes = Vec::new();
+                bytes.extend_from_slice(&(row_count as u64).to_le_bytes());
+                for column in columns {
+                    for value in column {
+                        bytes.extend_from_slice(&(*value).to_le_bytes());
+                    }
+                }
+                BenchmarkRelationalResidencyOwnedPartition {
+                    partition_id: partition_id as u32,
+                    row_start: partition_id * row_count + 1,
+                    row_count,
+                    resident_bytes: bytes.len() as u64,
+                    allocated_bytes: bytes.len() as u64,
+                    resident_device_int4_columns: vec![
+                        "ol_o_id".to_string(),
+                        "ol_i_id".to_string(),
+                        "ol_quantity".to_string(),
+                        "ol_amount".to_string(),
+                    ],
+                    resident_device_text_columns: Vec::new(),
+                    chunks: vec![CudaOwnedDeviceMemoryChunk {
+                        byte_offset: 0,
+                        bytes,
+                    }],
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let installed = e.install_benchmark_relational_residency_owned_partitions(
+            BenchmarkRelationalResidencyOwnedPartitionInstall {
+                table: "order_line",
+                gpu_id: 0,
+                partitions,
+            },
+        );
+        if let Err(err) = installed {
+            assert!(
+                err.to_string().contains("CUDA"),
+                "unexpected partition install error: {err}"
+            );
+            return;
+        }
+
+        let Command::Select(select) = parse_command(
+            "SELECT ol_o_id, ol_i_id, ol_quantity, ol_amount FROM order_line WHERE ol_o_id = 42",
+        )
+        .unwrap() else {
+            unreachable!()
+        };
+        let route = e.plan_relational_resident_route(&select);
+        assert!(route.accepted, "{route:?}");
+        assert_eq!(
+            route.query_shape,
+            "partitioned_int4_equality_multi_column_projection"
+        );
+        assert_eq!(route.partition_count, 4);
+        assert_eq!(route.estimated_rows, 16);
+        assert_eq!(route.h2d_bytes_if_resident, 0);
+        assert!(route.d2h_bytes_estimate > 0);
+
+        let before = e.metrics().snapshot();
+        let result = e.execute_relational_select(&select).unwrap();
+        let after = e.metrics().snapshot();
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![
+                    SqlValue::Int4(42),
+                    SqlValue::Int4(100),
+                    SqlValue::Int4(5),
+                    SqlValue::Int4(500)
+                ],
+                vec![
+                    SqlValue::Int4(42),
+                    SqlValue::Int4(102),
+                    SqlValue::Int4(7),
+                    SqlValue::Int4(502)
+                ],
+                vec![
+                    SqlValue::Int4(42),
+                    SqlValue::Int4(300),
+                    SqlValue::Int4(13),
+                    SqlValue::Int4(700)
+                ],
+                vec![
+                    SqlValue::Int4(42),
+                    SqlValue::Int4(303),
+                    SqlValue::Int4(16),
+                    SqlValue::Int4(703)
+                ],
+            ]
+        );
+        assert_eq!(result.executed_target, DeviceTarget::Gpu(0));
+        assert_eq!(result.fallback_reason, None);
+        let decision = e
+            .status_snapshot()
+            .relational_residency
+            .latest_route_decision("order_line")
+            .unwrap()
+            .clone();
+        assert_eq!(
+            decision.query_shape,
+            "partitioned_int4_equality_multi_column_projection"
+        );
+        assert_eq!(decision.partition_count, 4);
+        assert_eq!(decision.last_execution_h2d_bytes, Some(0));
+        assert_eq!(
+            decision.last_execution_d2h_bytes,
+            Some(after.d2h_bytes_total.saturating_sub(before.d2h_bytes_total))
+        );
+        assert_eq!(decision.last_execution_matched_rows, Some(4));
+        assert!(decision.last_execution_match_index_micros.is_some());
+        assert!(decision.last_execution_selected_projection_micros.is_some());
+
+        e.execute_text(
+            2,
+            "INSERT INTO order_line (ol_o_id, ol_i_id, ol_quantity, ol_amount, ol_dist_info) VALUES (42, 1, 1, 1, 'x')",
+        )
+        .unwrap();
+        let invalidated = e.plan_relational_resident_route(&select);
+        assert!(!invalidated.accepted);
+        assert_eq!(
+            invalidated.query_shape,
+            "partitioned_int4_equality_multi_column_projection"
+        );
+        assert_eq!(invalidated.partition_count, 4);
+        assert_eq!(invalidated.cache_state, "Invalidated");
+        assert_eq!(invalidated.reason, "resident partition set is Invalidated");
+
+        let mut missing_layout_engine = Engine::new_local();
+        missing_layout_engine
+            .execute_text(
+                1,
+                "CREATE TABLE order_line (ol_o_id INT, ol_i_id INT, ol_quantity INT, ol_amount INT, ol_dist_info TEXT)",
+            )
+            .unwrap();
+        let mut missing_layout_partitions = partition_values
+            .iter()
+            .enumerate()
+            .map(|(partition_id, columns)| {
+                let row_count = columns[0].len();
+                let mut bytes = Vec::new();
+                bytes.extend_from_slice(&(row_count as u64).to_le_bytes());
+                for column in columns {
+                    for value in column {
+                        bytes.extend_from_slice(&(*value).to_le_bytes());
+                    }
+                }
+                BenchmarkRelationalResidencyOwnedPartition {
+                    partition_id: partition_id as u32,
+                    row_start: partition_id * row_count + 1,
+                    row_count,
+                    resident_bytes: bytes.len() as u64,
+                    allocated_bytes: bytes.len() as u64,
+                    resident_device_int4_columns: vec![
+                        "ol_o_id".to_string(),
+                        "ol_i_id".to_string(),
+                        "ol_quantity".to_string(),
+                        "ol_amount".to_string(),
+                    ],
+                    resident_device_text_columns: Vec::new(),
+                    chunks: vec![CudaOwnedDeviceMemoryChunk {
+                        byte_offset: 0,
+                        bytes,
+                    }],
+                }
+            })
+            .collect::<Vec<_>>();
+        missing_layout_partitions[2]
+            .resident_device_int4_columns
+            .pop();
+        let installed = missing_layout_engine
+            .install_benchmark_relational_residency_owned_partitions(
+                BenchmarkRelationalResidencyOwnedPartitionInstall {
+                    table: "order_line",
+                    gpu_id: 0,
+                    partitions: missing_layout_partitions,
+                },
+            );
+        if let Err(err) = installed {
+            assert!(
+                err.to_string().contains("CUDA"),
+                "unexpected partition install error: {err}"
+            );
+            return;
+        }
+        let missing_layout = missing_layout_engine.plan_relational_resident_route(&select);
+        assert!(!missing_layout.accepted);
+        assert_eq!(
+            missing_layout.query_shape,
+            "partitioned_int4_equality_multi_column_projection"
+        );
+        assert_eq!(
+            missing_layout.reason,
+            "resident partition 2 lacks required int4 projection layout"
+        );
     }
 
     #[test]
