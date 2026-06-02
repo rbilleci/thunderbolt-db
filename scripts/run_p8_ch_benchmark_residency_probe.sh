@@ -174,12 +174,12 @@ phase_metric_max() {
 
 write_retained_phase_sample() {
   local run_dir="$1"
-  local concurrency="$2"
+  local sample_count="$2"
   local phase_facts="${GPU_DB_CH_BENCH_PHASE_FACTS_PATH:-}"
   local sample_path="$run_dir/retained-select-phases.jsonl"
   : >"$sample_path"
   if [ -n "$phase_facts" ] && [ -s "$phase_facts" ]; then
-    sed -n 's/^select_phase_json=//p' "$phase_facts" | tail -n "$concurrency" >"$sample_path"
+    sed -n 's/^select_phase_json=//p' "$phase_facts" | tail -n "$sample_count" >"$sample_path"
   fi
   printf '%s' "$sample_path"
 }
@@ -1284,6 +1284,7 @@ engine_pgwire_concurrency_metric() {
   local run_dir="${tmp_prefix}-${query_id}-c${concurrency}"
   local client_driver="${GPU_DB_CH_BENCH_ENGINE_PGWIRE_CLIENT_DRIVER:-tokio-postgres/simple-query}"
   local requests_per_client="${GPU_DB_CH_BENCH_PERSISTENT_REQUESTS_PER_CLIENT:-1}"
+  local warmup_requests_per_client="${GPU_DB_CH_BENCH_PERSISTENT_WARMUP_REQUESTS_PER_CLIENT:-0}"
   mkdir -p "$run_dir"
 
   local wall_start_ns wall_end_ns wall_us throughput p50_us p95_us p99_us error_count correctness request_count
@@ -1293,6 +1294,7 @@ engine_pgwire_concurrency_metric() {
       GPU_DB_PERSISTENT_PGWIRE_EXPECTED="$expected" \
       GPU_DB_PERSISTENT_PGWIRE_CONCURRENCY="$concurrency" \
       GPU_DB_PERSISTENT_PGWIRE_REQUESTS_PER_CLIENT="$requests_per_client" \
+      GPU_DB_PERSISTENT_PGWIRE_WARMUP_REQUESTS_PER_CLIENT="$warmup_requests_per_client" \
       GPU_DB_PERSISTENT_PGWIRE_RUN_DIR="$run_dir" \
       target/debug/examples/p8_persistent_pgwire_concurrency_runner >"$run_dir/runner.out" 2>"$run_dir/runner.err"
     # shellcheck disable=SC1091
@@ -1346,7 +1348,7 @@ engine_pgwire_concurrency_metric() {
   fi
 
   local phase_path phase_samples phase_queue_wait_avg_us phase_queue_wait_max_us phase_engine_execute_avg_us phase_client_write_avg_us phase_d2h_avg_bytes phase_result_materialize_avg_us phase_retained_wall_avg_us phase_cuda_event_avg_us phase_kernel_delta_avg
-  phase_path="$(write_retained_phase_sample "$run_dir" "$concurrency")"
+  phase_path="$(write_retained_phase_sample "$run_dir" "$request_count")"
   phase_samples=$(wc -l <"$phase_path" | tr -d ' ')
   phase_queue_wait_avg_us="$(phase_metric_avg "$phase_path" scheduler_queue_wait_micros)"
   phase_queue_wait_max_us="$(phase_metric_max "$phase_path" scheduler_queue_wait_micros)"
@@ -1358,12 +1360,13 @@ engine_pgwire_concurrency_metric() {
   phase_cuda_event_avg_us="$(phase_metric_avg "$phase_path" retained_cuda_event_micros)"
   phase_kernel_delta_avg="$(phase_metric_avg "$phase_path" kernel_delta)"
 
-  printf '{"kind":"engine_backed_pgwire_concurrency_metric","target":"engine_backed_pgwire_endpoint","profile":"gpu_db_retained_endpoint","client_driver":"%s","query":"%s","concurrency":%s,"request_count":%s,"requests_per_client":%s,"p50_us":%s,"p95_us":%s,"p99_us":%s,"throughput_qps":%.6f,"wall_us":%s,"error_count":%s,"correctness_status":"%s","route_classification":"%s","retained_gpu_route":%s,"protocol_catalog_path":false,"phase_samples":%s,"phase_scheduler_queue_wait_avg_us":%s,"phase_scheduler_queue_wait_max_us":%s,"phase_engine_execute_avg_us":%s,"phase_client_write_avg_us":%s,"phase_result_materialize_avg_us":%s,"phase_retained_wall_avg_us":%s,"phase_cuda_event_avg_us":%s,"phase_d2h_avg_bytes":%s,"phase_kernel_delta_avg":%s,"phase_artifact":"%s","blocker":"none"}\n' \
+  printf '{"kind":"engine_backed_pgwire_concurrency_metric","target":"engine_backed_pgwire_endpoint","profile":"gpu_db_retained_endpoint","client_driver":"%s","query":"%s","concurrency":%s,"request_count":%s,"requests_per_client":%s,"warmup_requests_per_client":%s,"p50_us":%s,"p95_us":%s,"p99_us":%s,"throughput_qps":%.6f,"wall_us":%s,"error_count":%s,"correctness_status":"%s","route_classification":"%s","retained_gpu_route":%s,"protocol_catalog_path":false,"phase_samples":%s,"phase_scheduler_queue_wait_avg_us":%s,"phase_scheduler_queue_wait_max_us":%s,"phase_engine_execute_avg_us":%s,"phase_client_write_avg_us":%s,"phase_result_materialize_avg_us":%s,"phase_retained_wall_avg_us":%s,"phase_cuda_event_avg_us":%s,"phase_d2h_avg_bytes":%s,"phase_kernel_delta_avg":%s,"phase_artifact":"%s","blocker":"none"}\n' \
     "$client_driver" \
     "$query_id" \
     "$concurrency" \
     "$request_count" \
     "$requests_per_client" \
+    "$warmup_requests_per_client" \
     "$p50_us" \
     "$p95_us" \
     "$p99_us" \
@@ -1859,6 +1862,7 @@ JSON
 - client_driver: \`${GPU_DB_CH_BENCH_ENGINE_PGWIRE_CLIENT_DRIVER:-tokio-postgres/simple-query}\`
 - requested_concurrency_targets: \`$targets\`
 - requests_per_client: \`${GPU_DB_CH_BENCH_PERSISTENT_REQUESTS_PER_CLIENT:-1}\`
+- warmup_requests_per_client: \`${GPU_DB_CH_BENCH_PERSISTENT_WARMUP_REQUESTS_PER_CLIENT:-0}\`
 - scheduler: owner_thread_engine_command_queue
 - owner_thread_engine_scheduler: true
 - client_io_workers_engine_owned_state: false

@@ -18,6 +18,7 @@ struct Args {
     expected: String,
     concurrency: usize,
     requests_per_client: usize,
+    warmup_requests_per_client: usize,
     run_dir: PathBuf,
 }
 
@@ -38,6 +39,10 @@ async fn main() -> Result<(), DynError> {
         expected: required_env("GPU_DB_PERSISTENT_PGWIRE_EXPECTED")?,
         concurrency: parse_usize_env("GPU_DB_PERSISTENT_PGWIRE_CONCURRENCY", 1)?,
         requests_per_client: parse_usize_env("GPU_DB_PERSISTENT_PGWIRE_REQUESTS_PER_CLIENT", 1)?,
+        warmup_requests_per_client: parse_usize_env(
+            "GPU_DB_PERSISTENT_PGWIRE_WARMUP_REQUESTS_PER_CLIENT",
+            0,
+        )?,
         run_dir: PathBuf::from(required_env("GPU_DB_PERSISTENT_PGWIRE_RUN_DIR")?),
     };
     if args.concurrency == 0 {
@@ -94,6 +99,17 @@ async fn run_client(
 ) -> Result<Vec<RequestResult>, DynError> {
     let mut results = Vec::with_capacity(args.requests_per_client);
     barrier.wait().await;
+    for _ in 0..args.warmup_requests_per_client {
+        let messages = client.simple_query(&args.sql).await?;
+        let actual = simple_query_actual(&messages);
+        if actual != args.expected {
+            return Err(format!(
+                "warmup request for client {client_id} returned {actual:?}, expected {:?}",
+                args.expected
+            )
+            .into());
+        }
+    }
     for request_id in 1..=args.requests_per_client {
         let started = Instant::now();
         match client.simple_query(&args.sql).await {
@@ -200,6 +216,11 @@ fn write_result_artifacts(
     writeln!(summary, "client_driver=tokio-postgres/simple-query")?;
     writeln!(summary, "persistent_sessions={}", args.concurrency)?;
     writeln!(summary, "requests_per_client={}", args.requests_per_client)?;
+    writeln!(
+        summary,
+        "warmup_requests_per_client={}",
+        args.warmup_requests_per_client
+    )?;
     Ok(())
 }
 

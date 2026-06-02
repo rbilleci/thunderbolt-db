@@ -181,24 +181,10 @@ impl EndpointState {
                         BackendColumn::new(&column.name, column.type_oid, column.type_size)
                     })
                     .collect::<Vec<_>>();
-                let materialize_started = Instant::now();
-                let rows = result
-                    .rows
-                    .iter()
-                    .map(|row| {
-                        row.iter()
-                            .map(|value| Some(sql_value_text(value)))
-                            .collect()
-                    })
-                    .collect::<Vec<Vec<_>>>();
-                let result_materialize_micros = materialize_started
-                    .elapsed()
-                    .as_micros()
-                    .try_into()
-                    .unwrap_or(u64::MAX);
                 let mut writer = BackendWriter::new(output);
                 let write_started = Instant::now();
-                writer.select_rows(&columns, &rows, true)?;
+                let result_materialize_micros =
+                    write_select_result_rows(&mut writer, &columns, &result.rows)?;
                 writer.ready_for_query(false)?;
                 let client_write_micros = write_started
                     .elapsed()
@@ -284,7 +270,7 @@ impl EndpointState {
                                 | "int4_equality_mixed_column_projection"
                         ),
                     )?;
-                    self.fact("client_visible_select_rows", rows.len())?;
+                    self.fact("client_visible_select_rows", result.rows.len())?;
                     self.fact(
                         "select_phase_json",
                         SelectPhaseFact {
@@ -312,7 +298,7 @@ impl EndpointState {
                             kernel_delta: after
                                 .kernel_exec_samples
                                 .saturating_sub(before.kernel_exec_samples),
-                            result_rows: rows.len(),
+                            result_rows: result.rows.len(),
                         },
                     )?;
                 }
@@ -541,6 +527,29 @@ fn sql_value_text(value: &SqlValue) -> String {
         SqlValue::Int8(value) => value.to_string(),
         SqlValue::Numeric(value) | SqlValue::Text(value) => value.clone(),
     }
+}
+
+fn write_select_result_rows<W: Write + ?Sized>(
+    writer: &mut BackendWriter<'_, W>,
+    columns: &[BackendColumn],
+    rows: &[Vec<SqlValue>],
+) -> Result<u64, Box<dyn Error>> {
+    writer.row_description(columns)?;
+    let materialize_started = Instant::now();
+    for row in rows {
+        let values = row
+            .iter()
+            .map(|value| Some(sql_value_text(value)))
+            .collect::<Vec<_>>();
+        writer.data_row(&values)?;
+    }
+    let result_materialize_micros = materialize_started
+        .elapsed()
+        .as_micros()
+        .try_into()
+        .unwrap_or(u64::MAX);
+    writer.command_complete(&format!("SELECT {}", rows.len()))?;
+    Ok(result_materialize_micros)
 }
 
 struct SelectPhaseFact<'a> {
