@@ -318,6 +318,34 @@ Append new candidates here as each paper is processed.
   URL: `https://www.vldb.org/pvldb/vol15/p2491-yogatama.pdf`
   Why: cost-based CPU/GPU placement and execution orchestration for
   heterogeneous DBMS designs.
+- `reviewed` — **Everything is a Transaction: Unifying Logical
+  Concurrency Control and Physical Data Structure Maintenance in
+  Database Management Systems**, Zhang et al., CIDR 2021.
+  URL:
+  `https://www.vldb.org/cidrdb/2021/everything-is-a-transaction-unifying-logical-concurrency-control-and-physical-data-structure-maintenance-in-database-management.html`
+  PDF: `https://db.cs.cmu.edu/papers/2021/cidr2021_paper06.pdf`
+  Why: deferred-action framework that integrates physical maintenance
+  with MVCC timestamps; useful for resident snapshot retirement, GPU
+  buffer cleanup, index cleaning, and non-blocking layout changes.
+- `queued` — **Scalable Garbage Collection for In-Memory MVCC Systems**,
+  Bottcher et al., PVLDB 2019.
+  URL: `https://dl.acm.org/doi/10.14778/3364324.3364328`
+  Why: DAF cites it as a modern MVCC garbage-collection design; useful
+  for long-reader robustness, version-chain cleanup, and cooperative
+  cleanup benchmarks.
+- `queued` — **Mainlining Databases: Supporting Fast Transactional
+  Workloads on Universal Columnar Data File Formats**, Li et al.,
+  PVLDB 2021.
+  URL: `https://db.cs.cmu.edu/papers/2020/p534-li.pdf`
+  Why: DAF's NoisePage context uses PAX/Arrow-like storage; this paper
+  may inform GPU DB's CPU canonical layout, Arrow-compatible column
+  groups, and transactional/analytical format choices.
+- `queued` — **FASTER: A Concurrent Key-Value Store with In-Place
+  Updates**, Chandramouli et al., SIGMOD 2018.
+  URL: `https://www.microsoft.com/en-us/research/publication/faster-a-concurrent-key-value-store-with-in-place-updates/`
+  Why: DAF compares against FASTER's epoch protection; useful for
+  high-throughput hybrid log, session-visible epoch advancement, and
+  read-cache/write-path tradeoffs.
 - `reviewed` — **Accelerating GPU Data Processing using FastLanes
   Compression**, Afroozeh et al., DaMoN 2024.
   URL: `https://doi.org/10.1145/3662010.3663450`

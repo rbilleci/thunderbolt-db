@@ -25885,3 +25885,168 @@ bounded error contract.
 - Keep approximate priority queues limited to non-correctness scheduling, such
   as best-effort fairness among ready reads. Gate: rank error is measured and
   bounded, and no WAL, snapshot, or response-release ordering depends on it.
+
+### 2026-06-04 - Deferred actions as MVCC-safe maintenance scheduling
+
+**Citation:** Ling Zhang, Matthew Butrovich, Tianyu Li, Yash
+Nannapanei, Andrew Pavlo, John Rollinson, Huanchen Zhang, et al.
+"Everything is a Transaction: Unifying Logical Concurrency Control
+and Physical Data Structure Maintenance in Database Management
+Systems." CIDR 2021. Retrieved 2026-06-04 from the CIDR page and
+CMU Database Group PDF at
+`https://www.vldb.org/cidrdb/2021/everything-is-a-transaction-unifying-logical-concurrency-control-and-physical-data-structure-maintenance-in-database-management.html`
+and `https://db.cs.cmu.edu/papers/2021/cidr2021_paper06.pdf`.
+
+**Category:** MVCC / snapshot / visibility, with transaction
+processing, storage maintenance, and runtime scheduling implications.
+
+**Relevance tags:** deferred actions; MVCC epoch protection; oldest
+active transaction; version-chain pruning; index cleaning; cooperative
+maintenance; repeated deferral; non-blocking schema change; hot/cold
+block transformation; maintenance backpressure.
+
+**Core idea:** The paper's Deferred Action Framework (DAF) turns
+physical DBMS maintenance into timestamped actions that are integrated
+with MVCC transaction semantics. Instead of maintaining a separate
+epoch-protection subsystem for every physical structure, a worker calls
+`defer(action)`, DAF tags the action with the current observable
+timestamp, and the action is run only after all transactions that began
+before that timestamp have exited.
+
+The important transfer is not the exact NoisePage implementation. It is
+the idea that cleanup, invalidation, index maintenance, layout movement,
+and schema-resource retirement should be scheduled against the same
+visibility clock used for user transactions. For GPU DB, this suggests a
+single maintenance lane for resident snapshot retirement, GPU buffer
+release, index-key cleanup, hot/cold segment conversion, and plan-cache
+invalidation, all gated by published read boundaries instead of ad hoc
+latches or best-effort background cleanup.
+
+**Concrete mechanisms:**
+
+- DAF requires the concurrency-control layer to order transactions by
+  begin timestamp, track the oldest active transaction, and expose a
+  timestamp at which a transaction's logical effects are observable.
+- Each deferred action is a captured function tagged with the current
+  observable timestamp. DAF executes the action only when the oldest
+  active transaction is newer than the tag, or when no active
+  transaction remains.
+- The framework reuses MVCC timestamps as epoch protection. The paper
+  argues this avoids a separate epoch counter that developers must
+  refresh and advance during query processing.
+- NoisePage actions include MVCC version-chain pruning, index cleaning,
+  query-cache invalidation, latch-free hot/cold block transformations,
+  and support for non-blocking schema changes.
+- Index cleaning treats an indexed-attribute update as delete plus
+  insert: the commit path defers removal of the old key until it can no
+  longer be visible, while abort cleanup can remove the newly inserted
+  key immediately.
+- Repeated deferral encodes stronger ordering requirements. With
+  multiple action consumers, the paper describes single deferral as safe
+  after concurrent transactions exit, double deferral as after
+  concurrent single-deferral actions have started, and triple deferral
+  as after concurrent single-deferral actions have completed.
+- Multi-threaded action processing is made safer by executing actions
+  inside transactions or transaction-like protection windows, preventing
+  one action worker from advancing far beyond another stalled worker.
+- Timestamp caching reduces contention: DAF reads a precomputed oldest
+  active timestamp and each action worker keeps a local copy, refreshing
+  only when the head action's tag exceeds the cached value.
+- Action batching reduces queue-latch traffic because adjacent actions
+  often share a timestamp.
+- Cooperative execution lets ordinary worker threads process deferred
+  actions. The paper reports this provides natural backpressure when
+  maintenance falls behind and improves allocator locality because the
+  same threads tend to allocate and free memory.
+- Preliminary NoisePage TPC-C results show cooperative DAF sustaining
+  action processing with negligible queue size at 20 worker threads,
+  while two dedicated DAF threads fell behind, causing action queues to
+  grow by orders of magnitude and transactional throughput to drop.
+
+**GPU DB mapping:** GPU DB's current design already treats WAL, CPU
+truth, and GPU residency as separate correctness and acceleration tiers.
+DAF points to a concrete way to tie their maintenance together:
+resident snapshot retirement, GPU buffer deallocation, stale resident
+index-key cleanup, old plan removal, and refresh-side physical
+transforms should be deferred against the same visibility generation
+advertised to readers. A GPU buffer should not be freed merely because a
+new generation was published; it should be freed after no in-flight read
+can still hold the old generation.
+
+The repeated-deferral idea maps to DDL and residency teardown. A table
+drop, truncate, or schema-changing refresh may need a stronger ordering
+than ordinary version cleanup. Single deferral can retire tuple/version
+state after older readers exit; a stronger chained deferral can retire a
+resident layout, CUDA allocation, or cached response shape only after
+all maintenance actions that might still touch it have started and then
+completed.
+
+Cooperative action execution is also relevant to 1M logical sessions.
+Dedicated maintenance threads can look clean but silently fall behind
+under mutation pressure, lengthening version chains and bloating
+resident invalidation queues. A bounded cooperative maintenance budget
+on owner domains and IO/read workers could turn cleanup debt into
+visible backpressure instead of letting stale snapshots, index entries,
+or GPU buffers accumulate until p99 latency collapses.
+
+For hot/cold and multi-tier placement, DAF's block-transformation use
+case is close to P8. GPU DB can mark a segment or resident layout as
+transitioning, route new readers through a safe fallback or older
+snapshot, then complete the physical transform only when the visibility
+clock proves no incompatible reader or writer remains. This would allow
+GPU-friendly compaction, CPU-to-GPU column-group rebuilds, and cold-tier
+demotion without broad table latches.
+
+**Risks and mismatches:** DAF is a framework inside an in-memory HTAP
+DBMS, not a GPU storage engine. It does not solve WAL durability,
+recovery replay, CUDA stream lifetime, pinned-buffer budgeting, query
+planning, or distributed admission. GPU DB must add resource-specific
+guards for device memory, CUDA events, DMA/GDS operations, and response
+rings.
+
+The paper assumes the system can track a useful oldest active
+transaction and mostly short-lived user transactions. Long-running reads
+can halt action processing. GPU DB's retained analytical scans and
+future long snapshots therefore need explicit stale-snapshot caps,
+reader leases, cancellation, or demotion rules so cleanup does not stop
+behind one old generation.
+
+Repeated deferral is powerful but easy to misuse. It encodes ordering
+through queue/timestamp discipline rather than explicit dependencies,
+so each action class needs a documented deferral level. Approximate or
+performance-only scheduling must never be allowed to reorder actions
+that guard memory safety or visibility correctness.
+
+**Benchmark candidates:**
+
+- Prototype a deferred-maintenance queue keyed by visibility generation
+  for resident snapshot handles. Gate: old GPU buffers are freed only
+  after all readers of the old generation exit, and new readers choose a
+  newer compatible generation or truthful fallback.
+- Compare dedicated maintenance workers with cooperative owner-domain
+  cleanup under append/update pressure. Required metrics: mutation
+  throughput, read p95/p99 latency, deferred-action queue depth, oldest
+  reader age, resident bytes pending retirement, and version-chain
+  length.
+- Add a chained-deferral test for `DROP TABLE` or `TRUNCATE` with
+  concurrent retained reads and refresh work. Failure condition: any
+  deferred cleanup touches freed catalog, CPU segment, or GPU-resident
+  metadata.
+- Implement deferred resident-index cleaning for updates to an indexed
+  `int4` key: insert the new key at visibility publication and defer old
+  key removal until no active reader can see the old version. Gate:
+  exact lookup results across old and new snapshots with bounded stale
+  key count.
+- Test hot/cold segment transformation using an intermediate state flag:
+  new readers fall back or use an older compatible snapshot while the
+  transform is pending, then the physical layout swaps after the
+  visibility boundary is safe. Required metrics: fallback rate,
+  transform latency, queue debt, and effect on resident route p95.
+- Measure timestamp-cache staleness for deferred actions. Gate: cached
+  oldest-reader timestamps reduce scheduler overhead without allowing
+  early cleanup; report delayed cleanup time as an explicit cost.
+- Add telemetry fields for `deferred_actions_by_class`,
+  `oldest_reader_generation`, `cleanup_safe_generation`,
+  `resident_bytes_pending_retire`, and `maintenance_backpressure_us`.
+  Failure condition: the system cannot explain whether latency is caused
+  by execution, admission, visibility waiting, or cleanup debt.
