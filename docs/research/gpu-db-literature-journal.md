@@ -6329,3 +6329,154 @@ valuable retained-read kernels if both need SMs at the same time.
   snapshots and CPU-prefiltered over-resident routes have telemetry.
   The first go/no-go question should be whether GPU storage-control
   occupancy is lower than the query-kernel time it helps hide.
+
+### 2026-06-03 - Aria deterministic OLTP batches
+
+**Citation:** Yi Lu, Xiangyao Yu, Lei Cao, and Samuel Madden.
+"Aria: A Fast and Practical Deterministic OLTP Database." PVLDB
+13(11), 2020, pp. 2047-2060. DOI: `10.14778/3407790.3407808`.
+Retrieved 2026-06-03 from the VLDB PDF,
+`https://www.vldb.org/pvldb/vol13/p2047-lu.pdf`.
+
+**Category:** transaction processing / write path and concurrency
+control.
+
+**Relevance tags:** deterministic OLTP; batch execution; snapshot
+execution; read/write reservation; conflict detection; deterministic
+reordering; fallback scheduling; partition owners; replication by input;
+mutation batching.
+
+**Core idea:** Aria revisits deterministic transaction processing without
+requiring every transaction's read and write set before execution. It
+processes an ordered batch in two phases. First, all transactions execute
+against the same database snapshot in parallel and record local read and
+write sets. Then a deterministic commit phase uses reservation metadata
+to decide which transactions can commit without violating serializability.
+Transactions that conflict are retried in the next batch or, under high
+abort rates, rerun through a deterministic fallback path.
+
+The useful transfer for GPU DB is not full deterministic replication. It
+is the separation between speculative same-snapshot work and a small
+deterministic publish decision. A mutation or refresh owner could let
+many candidate updates, index fragments, or resident invalidation plans
+run in parallel, then publish only those whose read/write reservations
+are compatible with the chosen WAL and visibility boundary.
+
+**Concrete mechanisms:**
+
+- A sequencing layer gives each transaction a batch id and transaction
+  id. Replicas can execute the same input independently because the
+  commit decision depends on deterministic metadata, not thread timing.
+- The execution phase runs transactions on one snapshot. Writes stay in
+  a transaction-local write set and are not installed in the database
+  until commit.
+- Each transaction makes write reservations after execution. A
+  reservation records the smallest transaction id that wrote a key. A
+  later transaction that tries to reserve an already-reserved key must
+  abort, but it still completes the remaining reservations so the
+  reservation table is deterministic.
+- The commit phase checks write-after-write and read-after-write
+  dependencies against the reservation table. If neither exists with an
+  earlier transaction, writes are installed; otherwise the transaction is
+  scheduled at the beginning of the next batch with relative order
+  preserved.
+- Deterministic reordering adds read reservations. A transaction may
+  commit despite a read-after-write dependency if it does not also have
+  a write-after-read dependency on earlier transactions. This transforms
+  some RAW conflicts into WAR conflicts and commits more transactions
+  under an equivalent serial order.
+- The reordering check remains parallel: each transaction probes read
+  and write reservation metadata rather than building one global serial
+  dependency schedule.
+- Under high write-write conflict rates, Aria can enter a fallback
+  phase. Aborted transactions rerun under a Calvin-like deterministic
+  lock path using their now-known read/write sets; a moving-average abort
+  threshold controls when this fallback is enabled.
+- The implementation stores per-record reservation metadata including
+  batch id, lock bit, read transaction id, and write transaction id.
+  Tables are primary hash tables with secondary hash tables; range
+  queries are not supported in the implementation.
+- Distributed execution sends remote reads and reservation requests to
+  owning nodes and uses barriers between execution and commit phases.
+  Remote requests and writes are batched to reduce network overhead.
+- The evaluation reports Aria outperforming BOHM, PWV variants, Calvin,
+  and synchronous primary-backup on YCSB, with up to 10.3x higher
+  throughput than primary-backup in the single-node YCSB setup. On
+  TPC-C with 180 partitions, Aria reports 1.9x over BOHM, 1.2x over
+  Calvin, and 7.4x over primary-backup, while AriaFB helps on more
+  contended TPC-C writes. The paper also reports near-linear scaling to
+  16 nodes for YCSB under the tested multi-partition mixes.
+
+**GPU DB mapping:** Aria is a good model for a future write-batch and
+resident-refresh publication protocol. GPU DB already treats WAL,
+visibility, invalidation, and resident snapshots as owner-controlled
+boundaries. Aria suggests a way to do useful work before the final
+publication boundary without letting thread timing decide correctness:
+build batch-local read/write/residency reservations, then publish only
+compatible fragments in deterministic order.
+
+For COPY and mutation batches, a transaction-local or chunk-local write
+set could reserve table/key/partition ranges before GPU-resident
+invalidation, CPU index append, or WAL-visible publication. Conflicting
+chunks would not install partial state; they would retry in a later owner
+batch or switch to a deterministic hot-key path. For retained snapshots,
+refresh plans could reserve source partitions and companion columns,
+then publish a new immutable generation only if the source WAL/catalog
+boundary still matches the reservation facts.
+
+Aria's reordering is also relevant to GPU DB's route scheduler. Some
+read-after-write conflicts in one batch may be serializable if the
+equivalent order places read-only retained work before later writes.
+That argues for classifying conflicts as WAW, RAW, and WAR instead of
+collapsing all overlap into "abort" or "route through the mutation
+owner." The engine should still keep WAL-before-visibility as authority,
+but it can avoid needless retry when a deterministic equivalent order is
+available.
+
+The fallback mechanism is a practical warning. Optimistic batch
+execution is attractive when conflicts are sparse or reorderable, but
+hot contended writes need an explicit mode switch. GPU DB should measure
+abort/retry pressure by table, partition, and key range, then move hot
+keys to partition-owner ordering or stored-procedure-like deterministic
+execution before retry storms destroy tail latency.
+
+**Risks and mismatches:** Aria is a stored-procedure OLTP system, not a
+PostgreSQL-compatible SQL engine. It targets one-shot, short-lived
+transactions and does not support interactive multi-round transactions
+or range queries in the implementation. The batch barrier can hurt
+latency and throughput when one transaction in a batch is a straggler;
+the paper reports an 81% slowdown in an extreme single-straggler
+experiment. Deterministic replication by input also differs from GPU
+DB's current WAL/checkpoint/archive recovery model. The system uses
+single-version execution plus local write sets, whereas GPU DB's storage
+roadmap includes MVCC visibility, long retained snapshots, DDL
+invalidation, and over-resident tiers. The safe transfer is deterministic
+reservation and publish discipline, not wholesale replacement of MVCC.
+
+**Benchmark candidates:**
+
+- Add no-op reservation telemetry to the mutation/COPY owner: keys or
+  partition ranges touched, read/write overlap class, earliest
+  conflicting transaction or chunk id, and retry/fallback decision.
+  Minimum gate: no behavior change and no weakening of WAL-before-
+  visibility.
+- Build a small deterministic mutation-batch proof with two phases:
+  prepare local write sets against one visibility boundary, then publish
+  only chunks with no WAW or unsafe RAW conflict. Failure condition: any
+  partial write, index append, resident invalidation, or response becomes
+  visible before the commit decision.
+- Test deterministic reordering on a synthetic workload where writes
+  feed later reads but an equivalent serial order can place reads first.
+  Compare full abort/retry, Aria-style WAW/RAW checks, and reordering
+  with read reservations.
+- Add a hot-key mode-switch benchmark. When conflict abort rate crosses a
+  threshold, route the hot partition/key range to deterministic owner
+  ordering and compare p50/p99, abort count, queue wait, and throughput
+  against optimistic retry.
+- Prototype resident-refresh reservation facts: source WAL boundary,
+  partition ids, selected column families, companion columns, and
+  invalidation generation. Proof gate: a refresh fragment is reused only
+  when all reservation facts still match.
+- Negative control: low-conflict retained reads and writes. Reservation
+  metadata must not add measurable overhead to the existing uncontended
+  COPY/read path before it earns its keep under contention.

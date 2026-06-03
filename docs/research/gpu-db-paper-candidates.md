@@ -367,7 +367,7 @@ Append new candidates here as each paper is processed.
   Why: production-oriented hybrid protocol combining long-transaction MVCC and
   short-transaction OCC, cited in the same Tsurugi/RSS research ecosystem and
   relevant to GPU DB mixed OLTP/analytical ownership boundaries.
-- `queued` — **Aria: A Fast and Practical Deterministic OLTP Database**, Lu,
+- `reviewed` — **Aria: A Fast and Practical Deterministic OLTP Database**, Lu,
   Yu, Cao, and Madden, PVLDB 2020.
   URL: `https://www.vldb.org/pvldb/vol13/p2047-lu.pdf`
   Why: deterministic OLTP execution without a global serial schedule bottleneck;
@@ -734,3 +734,18 @@ Append new candidates here as each paper is processed.
   Why: Shinjuku follow-up direction for rack-scale request scheduling;
   relevant to comparing centralized, partitioned, and rack-aware admission
   when GPU DB eventually spans multiple owners, devices, or nodes.
+- `queued` — **SLOG: Serializable, Low-latency, Geo-replicated
+  Transactions**, Ren et al., PVLDB 2019.
+  URL: `https://www.vldb.org/pvldb/vol12/p1747-ren.pdf`
+  Why: deterministic-transaction follow-up direction related to Aria's
+  replication motivation; useful for comparing input replication,
+  deterministic ordering, and low-latency commit paths when GPU DB eventually
+  separates local owner domains from replicated durability.
+- `queued` — **An Evaluation of Distributed Concurrency Control**,
+  Harding et al., PVLDB 2017.
+  URL: `https://www.vldb.org/pvldb/vol10/p553-harding.pdf`
+  Why: Aria's evaluation highlights the difficulty of comparing deterministic
+  and nondeterministic concurrency-control systems fairly; this Deneva study is
+  useful for shaping GPU DB transaction/admission benchmarks across locking,
+  OCC, timestamp ordering, deterministic execution, MVCC, and partition-owner
+  designs.
