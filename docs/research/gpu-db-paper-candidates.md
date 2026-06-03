@@ -668,7 +668,7 @@ Append new candidates here as each paper is processed.
   Why: hybrid OCC/pessimistic contention handling cited by the batching paper;
   useful for deciding when GPU DB owner queues should switch from optimistic
   validation to contention-aware ordered execution.
-- `queued` — **MEMTIS: Efficient Memory Tiering with Dynamic Page
+- `reviewed` — **MEMTIS: Efficient Memory Tiering with Dynamic Page
   Classification and Page Size Determination**, Lee et al., SOSP 2023.
   URL: `https://doi.org/10.1145/3600006.3613167`
   Why: hardware-counter-guided page classification and dynamic page-size
@@ -772,3 +772,21 @@ Append new candidates here as each paper is processed.
   Why: Chiller's inner-region commit depends on careful replication and
   recovery; this follow-up is relevant to GPU DB durability and availability
   once owner domains, WAL publication, and resident refresh become distributed.
+- `queued` — **Towards an Adaptable Systems Architecture for Memory Tiering at
+  Warehouse-Scale**, Duraisamy et al., ASPLOS 2023.
+  URL: `https://doi.org/10.1145/3582016.3582031`
+  Why: TMTS is the warehouse-scale memory-tiering design contrasted by MEMTIS;
+  useful for SLO-oriented demotion, cold-page histograms, and how OS/runtime
+  tiering policies interact with application-specific placement.
+- `queued` — **Mosaic Pages: Big TLB Reach with Small Pages**, Gosakan et al.,
+  ASPLOS 2023.
+  URL: `https://doi.org/10.1145/3582016.3582021`
+  Why: MEMTIS cites Mosaic Pages for address-translation pressure in large
+  memory systems; relevant to choosing GPU DB host-page and resident-segment
+  granularity without blindly relying on huge pages.
+- `queued` — **Pond: CXL-Based Memory Pooling Systems for Cloud Platforms**,
+  Li et al., ASPLOS 2023.
+  URL: `https://doi.org/10.1145/3575693.3578835`
+  Why: MEMTIS uses CXL latency assumptions from Pond; useful for future CXL
+  memory-pool tiers, remote-memory latency budgets, and explicit placement
+  boundaries between local DRAM, pooled memory, and GPU-resident state.

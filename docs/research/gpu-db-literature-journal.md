@@ -6999,3 +6999,206 @@ commit protocol.
   or hash partitioning. Required measurement: refresh bytes,
   invalidated resident generations, retained-read fallback rate, and
   write throughput during refresh.
+
+### 2026-06-03 - MEMTIS access-distribution memory tiering
+
+**Citation:** Taehyung Lee, Sumit Kumar Monga, Changwoo Min, and
+Young Ik Eom. "MEMTIS: Efficient Memory Tiering with Dynamic
+Page Classification and Page Size Determination." SOSP 2023,
+pp. 17-34. doi:10.1145/3600006.3613167. Retrieved 2026-06-03
+from the author-hosted ACM paper PDF,
+`https://multics69.github.io/pages/pubs/memtis-lee-sosp23.pdf`.
+
+**Category:** multi-tier cache / data placement.
+
+**Relevance tags:** tiered memory; hot/cold placement; CXL; NVM;
+huge pages; subpage skew; access sampling; background migration;
+host-memory tier policy; resident segment granularity.
+
+**Core idea:** MEMTIS argues that tiered-memory systems make bad
+placement decisions when they rely on fixed hotness thresholds,
+recency-only approximations, or page-fault critical-path migration.
+Instead, the system samples memory accesses with Intel PEBS, builds
+a compact access-frequency histogram over allocated pages, and
+chooses hot, warm, and cold thresholds from the whole distribution
+so the hot set approximates the fast-tier capacity. It also treats
+page size as a tiering decision: huge pages help TLB reach, but they
+waste scarce fast-tier memory when only a few 4KB subpages are hot.
+
+The strongest transferable idea for GPU DB is "placement by observed
+distribution, not static thresholds." P8 already has explicit tiers:
+GPU HBM, CPU canonical state, CPU derived indexes/statistics, durable
+WAL/checkpoints, and future NVMe/CXL-like tiers. MEMTIS suggests that
+promotion, demotion, refresh, and resident-segment granularity should
+be driven by live access histograms and skew estimates rather than a
+single configured hot-table rule.
+
+**Concrete mechanisms:**
+
+- MEMTIS samples retired LLC load misses and retired store
+  instructions using PEBS. A kernel background thread processes
+  sampled addresses and updates page and subpage access metadata.
+- The sampling interval is adjusted dynamically to keep sampling CPU
+  usage under a target, 3% of one core by default. The paper reports
+  average sampling-thread CPU usage of 2.016%, maximum 3.0%, and
+  average application performance overhead of 0.922%.
+- Page hotness is maintained as an exponentially decayed access count.
+  Cooling periodically halves access counts; because histogram bins
+  are exponential, cooling mostly shifts histogram counts left.
+- The page access histogram has 16 exponential bins by default, so the
+  metadata for the distribution is tiny. MEMTIS uses this distribution
+  to place the hottest pages into the fast tier rather than relying on
+  a fixed access-count threshold.
+- MEMTIS derives hot, warm, and cold thresholds. Hot pages should move
+  to the fast tier; cold pages should move to the capacity tier; warm
+  pages are left in place unless free space is needed, reducing
+  unnecessary migration of pages near the decision boundary.
+- Promotion and demotion run in background migration threads, not in
+  the page-fault handler. The fast tier keeps a small free-space
+  reserve, 2% in the evaluated configuration, for future allocations
+  and promotions.
+- A separate emulated base-page histogram tracks 4KB access
+  distribution even when the OS currently uses huge pages. MEMTIS
+  compares an estimated base-page hit ratio against the actual
+  fast-tier hit ratio to decide whether splitting huge pages is worth
+  doing.
+- Huge-page split is triggered only when the estimated potential hit
+  ratio improvement is sufficiently large, 5% or higher in the paper.
+  The number of huge pages to split scales with estimated benefit,
+  latency gap between tiers, and sampled huge-page activity.
+- Split candidates are selected by subpage skew: a huge page with a
+  small number of very hot subpages ranks higher than a uniformly hot
+  huge page. Splitting, subpage migration, and all-zero subpage
+  release happen in the background.
+- Base pages are coalesced back into huge pages conservatively, only
+  when all constituent base pages are hot.
+- The implementation is a Linux 5.15.19 kernel change of about 5,166
+  lines. It stores huge-page/subpage metadata inside unused compound
+  page metadata where possible and bounds worst-case base-page metadata
+  overhead at 0.195% of memory footprint.
+- Evaluation uses eight memory-intensive workloads, including Silo
+  with YCSB-C and an in-memory Btree lookup benchmark, with DRAM as
+  fast tier and Optane NVM or emulated CXL memory as capacity tier.
+  MEMTIS reports best performance in 23 of 24 NVM configurations and
+  33.6% geomean improvement over the second-best system. Huge-page
+  splitting improves Silo and Btree by about 10% overall in the shown
+  1:8 setting, and can reduce Btree RSS substantially.
+
+**GPU DB mapping:** GPU DB should not treat the OS page cache or a
+single table-level cache bit as a sufficient placement policy. The
+P8 cache manager needs its own distribution-aware telemetry for
+resident data: per table, partition, column group, resident key vector,
+index fragment, pinned buffer class, and cold segment. The hot set
+should be chosen against the actual scarce tier: HBM bytes, pinned
+host memory, DRAM cache budget, CXL/remote memory budget, or NVMe
+prefetch budget.
+
+The hot/warm/cold split maps well to route decisions. Hot resident
+segments can stay in GPU memory, warm segments can remain in host
+DRAM or compressed host memory without immediate churn, and cold
+segments can demote to NVMe or rebuild-on-demand state. Warm segments
+are important because GPU DB can otherwise thrash: a retained
+snapshot, refresh builder, or batched lookup path might repeatedly
+promote/demote nearly-hot partitions and destroy p99 latency.
+
+The huge-page lesson maps to resident segment size. A large resident
+partition or column group is only good if its subregions are
+uniformly useful. For skewed point-read or session-heavy workloads,
+GPU DB may need sub-segment placement: keep hot key ranges, hot
+columns, or compact lookup structures in HBM while leaving colder
+subranges in host memory. For scan-heavy uniformly hot regions,
+larger segments remain attractive because they reduce metadata,
+launch, TLB, and transfer overhead.
+
+MEMTIS also strengthens the runtime document's owner model. Tier
+promotion and demotion should run off the critical query path through
+bounded residency queues. Queries should see explicit states and
+fallback reasons, not block unpredictably on page faults or implicit
+OS migration. The GPU DB analogue of PEBS does not have to be CPU
+hardware sampling only; it can combine route counters, resident
+segment touch counts, GPU kernel bytes, H2D/D2H bytes, queue waits,
+refresh invalidations, and periodic CPU sampling where available.
+
+For future CXL or remote memory tiers, MEMTIS suggests an evaluation
+shape: as the latency gap narrows, placement mistakes are less
+catastrophic but still matter. GPU DB should measure whether a
+segment belongs in GPU HBM, local DRAM, CXL-like memory, or NVMe by
+bytes touched, access skew, transfer cost, refresh cost, and queue
+latency, not only by whether the table is "hot."
+
+**Risks and mismatches:** MEMTIS is an OS memory-tiering system, not a
+DBMS buffer manager or GPU-resident storage engine. It does not know
+about WAL-before-visibility, MVCC snapshots, relation generations,
+DDL invalidation, SQL route choice, CUDA streams, or pinned host
+buffer ownership. PEBS samples CPU memory references; it does not
+directly observe GPU HBM touches, device-side cache behavior, or
+NVMe/GPUDirect access. Background migration can still interfere with
+query latency if GPU DB makes refresh or pinned-buffer movement too
+aggressive. The paper's Silo and Btree experiments are useful
+database-adjacent evidence, but they are not PostgreSQL-compatible
+workloads and do not include GPU execution.
+
+**Benchmark candidates:**
+
+- Add residency access histograms: per table/partition/column group
+  touch count, bytes touched, selected route, queue wait, H2D/D2H
+  bytes, and refresh invalidation count. Minimum gate: no behavior
+  change and bounded telemetry cardinality.
+- Compare static residency admission against distribution-aware
+  admission for hot partitions. The hot set should fill a configured
+  HBM budget with the highest-value resident segments; failure
+  condition: static admission beats the histogram policy on p95/p99
+  latency or refresh bytes under skew.
+- Build a warm-segment policy where near-hot partitions are not
+  immediately demoted if the GPU tier has temporary pressure. Measure
+  promotion/demotion count, retained-read fallback rate, and p99
+  latency under shifting skew.
+- Prototype sub-segment placement for a skewed lookup workload:
+  resident full partition versus resident hot key-range/vector plus
+  host fallback. Proof gate: identical SQL results, lower HBM bytes,
+  and no worse p99 for the cold range.
+- Add a negative-control scan workload with uniform access. The policy
+  should keep larger contiguous segments and avoid needless
+  sub-segmentation; failure condition: splitting increases metadata or
+  launch overhead enough to hurt throughput.
+- Add a tier-latency sensitivity model for future CXL-like memory:
+  emulate local DRAM, slower DRAM, and NVMe-backed cold segments in
+  route costing. Required measurement: selected tier, bytes moved,
+  queue wait, refresh cost, and p50/p99 query latency.
+
+### 2026-06-03 - Cross-paper synthesis: visibility, contention, and placement need distribution summaries
+
+The last three reviewed papers converge on a useful pattern for GPU
+DB: avoid making hot-path decisions from global constants. The
+empirical MVCC study says version storage, index pointers, and GC
+must be chosen from workload shape; Chiller says partitioning and
+write scheduling should follow measured contention rather than
+locality alone; MEMTIS says memory placement and page size should
+follow access distributions rather than static thresholds.
+
+The shared design track is a family of compact summaries owned by
+the right domain. Mutation owners need version-chain, conflict, and
+hot-key summaries. Residency owners need access, skew, invalidation,
+and refresh-cost summaries. GPU execution owners need route demand,
+bytes moved, queue wait, batch size, and scratch/pinned-buffer
+summaries. These summaries should drive bounded choices: which
+versions retire, which keys get special routing, which resident
+segments stay in HBM, and which requests are admitted or deferred.
+
+The category gap remains high-concurrency session admission at very
+large logical session counts. Runtime papers have covered eRPC,
+Demikernel, Caladan, Shenango, and Shinjuku, but the journal still
+needs more work on practical TCP/event-loop service models and
+connection-state budgeting for pgwire-like protocols.
+
+Benchmark priorities after this batch:
+
+- generation-level MVCC/resident retirement with chain-length and
+  index-maintenance telemetry
+- hot-key or hot-bucket routing driven by measured conflict heat
+- distribution-aware residency admission with warm-state anti-thrash
+  behavior
+- sub-segment versus full-segment placement under skewed lookups and
+  uniform scans
+- a logical-session memory probe that measures idle state, active
+  credits, response buffers, and queue saturation separately
