@@ -883,7 +883,7 @@ Append new candidates here as each paper is processed.
   Why: foundational modern BaM design evaluated by Torp et al.; relevant to
   understanding GPU-side request queues, page caches, and when direct NVMe
   access helps over-resident data paths.
-- `queued` — **GMT: GPU Orchestrated Memory Tiering for the Big Data Era**,
+- `reviewed` — **GMT: GPU Orchestrated Memory Tiering for the Big Data Era**,
   Chang et al., ASPLOS 2024.
   URL: `https://doi.org/10.1145/3620666.3651353`
   Why: three-tier GPU/CPU/storage cache approach summarized by Torp et al.;
@@ -1792,3 +1792,15 @@ Append new candidates here as each paper is processed.
   Why: modern MVCC scan/access-method work from the vDriver/DIVA ecosystem;
   useful for retained snapshot scans where version traversal can erase index
   benefits and GPU routes need a compact visible-version access structure.
+- `queued` — **GeminiFS: A Companion File System for GPUs**, Qiu et al.,
+  FAST 2025.
+  URL: `https://www.usenix.org/conference/fast25/presentation/qiu`
+  PDF: `https://www.usenix.org/system/files/fast25-qiu.pdf`
+  Why: modern GPU-facing storage interface that cites GMT; useful for comparing
+  file-system-level GPU IO services with DB-owned GPU/host/NVMe tier managers.
+- `queued` — **Characterizing Emerging Page Replacement Policies**, Wu et al.,
+  IISWC 2024.
+  URL: `https://www.cs.yale.edu/homes/abhishek/mwu-iiswc24.pdf`
+  Why: modern page replacement study citing GMT; useful for testing whether
+  reuse-prediction and learned/scan-resistant cache policies survive GPU DB
+  mixed lookup, scan, refresh, and over-resident workloads.

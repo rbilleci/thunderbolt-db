@@ -20973,3 +20973,132 @@ Benchmark priorities:
   fragments not generated.
 - Treat stale-generation pruning as a correctness failure in tests, with the
   same seriousness as stale resident reads.
+
+### 2026-06-03 - GMT: GPU Orchestrated Memory Tiering for the Big Data Era
+
+**Citation:** Chia Hao Chang, Vikram Sharma Mailthody, Jihoon Han, Zaid
+Qureshi, Anand Sivasubramaniam, and Wen Mei Hwu. "GMT: GPU Orchestrated
+Memory Tiering for the Big Data Era." ASPLOS 2024, pp. 464-478.
+doi:10.1145/3620666.3651353. Retrieved 2026-06-03 from the DOI page and
+author-institution publication metadata, `https://doi.org/10.1145/3620666.3651353`.
+The ACM PDF endpoint returned HTTP 403 from this worker, so detailed internals
+not visible in the metadata are marked unknown instead of inferred.
+
+**Category:** Multi-tier cache / data placement.
+
+**Relevance tags:** GPU memory tiering; host-memory intermediate tier; SSD/NVMe
+placement; GPU-orchestrated transfers; eviction bypass; reuse prediction;
+over-resident execution; HBM/DRAM/SSD hierarchy; P8 cache manager; route
+admission.
+
+**Core idea:** GMT argues that larger-than-GPU-memory execution should not be a
+binary choice between host-CPU-managed paging and GPU-direct SSD access. Host
+CPU software stacks such as HMM can make the GPU wait behind an intermediary
+that cannot feed GPU cores fast enough, while direct GPU-to-SSD systems such as
+BaM skip a useful latency tier by bypassing host memory. GMT instead builds a
+three-tier hierarchy of GPU memory, host memory, and SSD, with the GPU
+orchestrating the bandwidth- and latency-sensitive transfers.
+
+The strongest transferable idea is discretionary tier placement. The paper
+explicitly calls out that evicted GPU pages should not always be blindly
+promoted into host memory. GMT uses a reuse-prediction-based insertion policy
+to decide whether an evicted page belongs in the intermediate host tier or
+should bypass it. In the reported platform evaluation, GMT is described as 50%
+faster than the BaM two-tier strategy and more than 350% faster than a
+host-CPU-orchestrated three-tier HMM strategy across GPU applications with
+different access characteristics.
+
+**Concrete mechanisms:**
+
+- The memory hierarchy has three active tiers: GPU memory, host memory, and SSD.
+  Host memory is treated as a lower-latency intermediate tier rather than only
+  as CPU-owned staging space or an implementation detail of managed memory.
+- The GPU orchestrates most transfer decisions that are bandwidth- or
+  latency-sensitive. The available metadata does not expose the exact queue,
+  page-table, or kernel protocol used for this orchestration.
+- GMT compares against two opposing baselines: GPU-direct NVMe access in BaM,
+  which has high capacity reach but does not exploit host-memory latency, and
+  host-CPU-managed HMM/Dragon-style approaches, which can bottleneck on CPU
+  mediation and page-fault handling.
+- Eviction policy is not a simple demote-on-evict rule. GMT applies a practical
+  reuse-prediction insertion policy so some pages are placed in host memory and
+  others bypass that tier.
+- The reported evaluation emphasizes application-dependent tradeoffs: workloads
+  with different reuse patterns do not benefit equally from the host tier. The
+  metadata does not expose the precise benchmark kernels, page sizes, or reuse
+  predictor features.
+
+**GPU DB mapping:** P8 already treats GPU-resident state as an explicit,
+versioned performance tier below WAL and CPU canonical state. GMT supports
+making the warm host tier equally explicit. A GPU DB cache manager should not
+model HBM eviction as "drop or refresh later" only; it should choose among HBM
+retention, host-memory demotion, direct cold-tier residency, and bypass based on
+route reuse, refresh cost, and future admission pressure.
+
+For retained SQL routes, the equivalent of GMT reuse prediction is route-aware
+rather than page-address-only prediction. Useful signals include relation and
+partition identity, snapshot generation age, route shape, predicate family,
+recent retained lookup hits, scan stride, refresh cost, queue pressure, and
+whether the data was loaded for a one-off analytical scan or a repeatedly used
+hot lookup/aggregate. A discarded scan-only segment should often bypass warm
+host memory; a hot key partition evicted from HBM may deserve compressed host
+residency so it can be re-promoted without touching NVMe.
+
+GPU orchestration maps to GPU execution owners, not to arbitrary kernels
+mutating cache truth. The GPU worker can own CUDA streams, device scratch,
+pinned host buffers, and maybe issue storage/tier requests, but WAL,
+visibility, invalidation generation, and resident snapshot publication must
+remain under DB owners. GMT is a performance-plane lesson: make transfer
+control near the GPU where latency matters, while keeping DB correctness
+metadata generation-bound and CPU-recoverable.
+
+The host-memory tier also changes admission. If a route descriptor says a
+partition is warm in host memory and has a valid snapshot generation, the
+runtime can admit a GPU transfer batch differently from a cold NVMe route or a
+resident-HBM route. Queue telemetry should separate HBM hits, host-tier
+promotions, cold SSD reads, and bypass decisions; otherwise all misses collapse
+into one unhelpful "not resident" bucket.
+
+**Risks and mismatches:** GMT is an architecture/runtime paper for GPU
+applications, not a DBMS. It does not solve SQL planning, MVCC visibility,
+WAL-before-visibility, transaction ordering, partition statistics,
+invalidation, recovery replay, or row/column format conversion. A GPU DB cannot
+let GPU-side tier orchestration publish data as SQL-visible unless the CPU DB
+owners have already established the right visibility and generation boundary.
+
+The reuse predictor is also dangerous if it is trained on physical page reuse
+but the database workload reuses logical routes. COPY, UPDATE, refresh, and DDL
+can invalidate a page that was previously hot. Long retained snapshots can keep
+old generations useful for one route while fresh OLTP reads need a newer one.
+The predictor therefore needs generation-aware inputs and must be allowed to
+fail by choosing a slower route, not by serving stale data.
+
+Finally, host memory is not free. Warm-tier segments compete with CPU indexes,
+MVCC chains, WAL buffers, pinned transfer memory, network response buffers, and
+OS page cache. GMT shows the value of a host tier, but P8 still needs a DBMS
+budget model before adopting broad automatic demotion.
+
+**Benchmark candidates:**
+
+- Add a three-tier residency simulator for P8 route descriptors: HBM resident,
+  host warm, and NVMe cold. Compare always-drop, always-demote-to-host, and
+  reuse-predicted insertion policies under mixed point lookup, retained scan,
+  refresh, and COPY workloads.
+- Track miss classes separately in telemetry: HBM hit, host promotion, NVMe
+  fetch, bypass, invalid-generation fallback, and CPU fallback. Gate: every
+  retained route explains both placement and fallback reason.
+- Prototype a route-aware warm-tier admission policy using relation/partition,
+  snapshot generation, route shape, recent reuse, bytes, and refresh cost.
+  Failure condition: warm host memory crowds out CPU MVCC/index/WAL buffers
+  enough to increase write p95 or stale-generation fallback rate.
+- Build an over-resident scan benchmark where one-off analytical partitions
+  should bypass host memory while repeated lookup partitions should demote into
+  host memory. Measure H2D bytes, NVMe bytes, host-memory occupancy, p50/p99
+  latency, and write-path interference.
+- Evaluate whether GPU execution owners should request host-tier promotions
+  directly or ask a residency owner through a bounded ring. Minimum proof gate:
+  lower queue wait or transfer latency without allowing GPU-side publication of
+  unvalidated generations.
+- Add a correctness stress test where an HBM segment is demoted to host memory,
+  then invalidated by UPDATE or TRUNCATE before re-promotion. Gate: stale host
+  copies never become route-valid, including after recovery replay.
