@@ -1001,13 +1001,35 @@ Append new candidates here as each paper is processed.
   delegation; useful for deciding whether GPU DB should expose request,
   session, and core-placement decisions through a scheduler agent while
   keeping Linux as the enforcement boundary.
-- `queued` — **Shinjuku-Offload: Practical Load Balancing for
-  Microsecond-scale Datacenter Applications**, Kogias et al., NSDI 2023.
-  URL: `https://www.usenix.org/conference/nsdi23/presentation/kogias`
+- `reviewed` — **RingLeader: Efficiently Offloading Intra-Server
+  Orchestration to NICs**, Lin et al., NSDI 2023.
+  URL: `https://www.usenix.org/conference/nsdi23/presentation/lin`
+  PDF: `https://www.usenix.org/system/files/nsdi23-lin.pdf`
   Why: Vessel cites SmartNIC/offloaded scheduling as an orthogonal direction;
   useful for comparing host-side preemption with NIC-assisted request
   placement for microsecond services, and relevant to future NIC/DPU-aware
   admission and response steering for million-session GPU DB deployments.
+  The previously queued Shinjuku-Offload title/URL pairing pointed to a
+  different paper; the NSDI 2023 primary source is RingLeader.
+- `queued` — **R2P2: Making RPCs First-Class Datacenter Citizens**,
+  Kogias et al., USENIX ATC 2019.
+  URL: `https://www.usenix.org/conference/atc19/presentation/kogias-r2p2`
+  Why: RingLeader builds on R2P2's request-level dispatch and JBSQ lineage;
+  useful for deciding whether GPU DB should expose request descriptors,
+  route classes, and response steering below the SQL execution layer.
+- `queued` — **RackSched: A Microsecond-Scale Scheduler for
+  Rack-Scale Computers**, Zhu et al., OSDI 2020.
+  URL: `https://www.usenix.org/conference/osdi20/presentation/zhu`
+  PDF: `https://www.usenix.org/system/files/osdi20-zhu.pdf`
+  Why: RingLeader contrasts against rack/server-level scheduling and
+  centralized orchestration; useful for comparing host-only scheduling,
+  rack-aware admission, and NIC-assisted dispatch for session-heavy GPU DB.
+- `queued` — **The nanoPU: Redesigning the CPU-Network Interface to
+  Minimize RPC Tail Latency**, Ibanez et al., arXiv 2020.
+  URL: `https://arxiv.org/abs/2010.12114`
+  Why: RingLeader contrasts against nanoPU-style CPU/network-interface
+  redesign and per-service JBSQ; useful as a more radical endpoint for
+  request dispatch, packet steering, and CPU/NIC co-design.
 - `queued` — **SKQ: Event Scheduling for Optimizing Tail Latency in a
   Traditional OS Kernel**, Zhao, Gu, and Mashtizadeh, USENIX ATC 2021.
   URL: `https://www.usenix.org/conference/atc21/presentation/zhao-siyao`

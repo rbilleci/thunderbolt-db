@@ -24720,3 +24720,188 @@ when many transactions hold snapshot or write-set evidence. The queue
 should keep balancing HTAP/MVCC papers with runtime scheduling and
 write-path papers before returning to another run of GPU-only OLAP
 papers.
+
+### 2026-06-03 - RingLeader offloads intra-server orchestration to NICs
+
+**Citation:** Jiaxin Lin, Adney Cardoza, Tarannum Khan, Yeonju
+Ro, Brent E. Stephens, Hassan Wassel, and Aditya Akella.
+"RingLeader: Efficiently Offloading Intra-Server Orchestration
+to NICs." NSDI 2023, pp. 1293-1308. Retrieved 2026-06-03 from
+the official USENIX publication page and PDF,
+`https://www.usenix.org/conference/nsdi23/presentation/lin`.
+
+**Category:** runtime / HFT / session scale, with high-concurrency
+networking and admission control.
+
+**Relevance tags:** NIC-assisted scheduling; request load balancing;
+priority queues; shallow per-core buffers; microsecond tail latency;
+core allocation; route-class admission; response-ring steering;
+head-of-line blocking; SmartNIC/DPU future tier.
+
+**Core idea:** RingLeader argues that request scheduling, load
+balancing, and CPU core assignment should be treated as one
+intra-server orchestration problem, not as separate ad hoc queues. A
+centralized software dispatcher has good scheduling information but
+costs CPU and becomes a throughput bottleneck; decentralized RSS-style
+dispatch scales but loses precision and creates head-of-line blocking.
+RingLeader moves most orchestration into NIC hardware while leaving a
+small host-side datapath OS interface for service registration, per-core
+completion feedback, and core reallocation hints.
+
+The strongest transferable idea for GPU DB is the split between a
+central scheduling vantage point and shallow bounded worker queues. A
+million-session database runtime should not let requests disappear into
+deep per-session or per-worker queues where the scheduler can no longer
+see route class, priority, snapshot generation, or GPU eligibility. It
+needs enough centralized visibility to choose a good worker and enough
+local buffering to hide transport latency without creating uncontrolled
+head-of-line blocking.
+
+**Concrete mechanisms:**
+
+- RingLeader defines intra-server orchestration as three coupled tasks:
+  request scheduling, load balancing across worker cores, and fast core
+  reallocation across services.
+- Incoming requests are buffered at the NIC as descriptors, while each
+  host worker has a shallow bounded priority queue. The paper uses a
+  default per-core software priority queue depth of 4.
+- The NIC and host communicate through a small OS-NIC interface:
+  services register with the NIC, cores announce which service they are
+  running, cores report completed packet counts, and the NIC sends
+  reallocation hints inline with packet descriptors.
+- The design avoids extra PCIe messages in the common case and reports
+  about 50 million OS-to-NIC metadata messages per second in its
+  interface microbenchmark.
+- Load balancing uses Join-Bounded-Shortest-Ranked-Queue (JBSRQ), an
+  extension of JBSQ that ranks a candidate core by queue length at the
+  same or higher priority plus a fractional penalty for lower-priority
+  queued work. The fractional term models the cost of preempting or
+  yielding lower-priority work instead of ignoring it completely.
+- Per-core priority queues and cooperative yielding prevent a burst of
+  long or low-priority work from hiding high-priority requests behind a
+  FIFO core queue.
+- The NIC scheduler uses first-eligible-out (FEO), a PIFO-like scheduler
+  with an eligibility mask from the load balancer. If a service cannot
+  be dispatched because all eligible per-core queues are full, FEO can
+  schedule another eligible service instead of blocking the scheduler
+  behind the first service.
+- Hardware tracks rank registers per core and priority level, then uses
+  a reduction-tree "choose minimum" circuit to pick a destination core.
+  The prototype supports 64 worker cores with a three-stage pipeline and
+  8 physical priorities.
+- RingLeader's load monitor detects on-NIC queue buildup and sends
+  scale-up or scale-down hints. The host can use no-sharing dedicated
+  core sets, complete sharing, or a hybrid model with dedicated cores
+  plus shared burst capacity.
+- The implementation uses a 100 Gbps Alveo U280 FPGA prototype over
+  Corundum, a 1.5 KLOC C userspace NIC driver, and about 800 lines of
+  Rust changes to Demikernel's catnip libOS.
+
+**Evaluation claims:** On synthetic microsecond-service workloads,
+RingLeader reports lower P99 latency and higher saturating throughput
+than Shinjuku and RSS across 16, 24, and 30 worker configurations. The
+paper says Shinjuku's software dispatcher becomes a bottleneck above
+about 4.8 million requests/s without preemption and above about
+4 million requests/s with preemption, while RingLeader continues to
+scale on the evaluated server. In a 30-worker experiment with a
+45 microsecond P99 SLO, RingLeader reports serving roughly twice as
+many requests within SLO as Shinjuku and RSS. For a RocksDB GET versus
+SCAN mix, prioritized scheduling keeps short GET requests from being
+stuck behind long SCAN work, with more aggressive scan yielding
+improving GET tail latency at the cost of scan overhead. In a core
+reallocation experiment, RingLeader reports up to 50% lower latency for
+the latency-sensitive service and about 1.3x throughput for a
+best-effort analytics service compared with Caladan. Hardware
+microbenchmarks report request scheduling/dispatch within about
+150 ns, end-to-end host ping-pong latency around 6 microseconds, and
+modest FPGA resource use.
+
+**GPU DB mapping:** GPU DB can apply RingLeader's orchestration shape
+before any actual NIC offload exists. The immediate design target is a
+central admission and route scheduler that keeps shallow bounded queues
+per IO worker, mutation owner, read-snapshot worker, and GPU execution
+worker. Queue entries should carry route class and scheduling evidence:
+short retained lookup, long scan, write batch, refresh, response encode,
+snapshot generation, priority, deadline, and tenant/session class.
+
+JBSRQ maps naturally to GPU DB's competing route families. When
+placing a short retained lookup, queued long scans or refresh work
+should count only as a fractional penalty if those tasks can yield or be
+preempted at a safe boundary. Same-priority lookups and writes should
+count fully because they cannot be bypassed without violating ordering
+or fairness. This gives a more precise policy than "shortest queue" and
+a less brittle policy than strict priority alone.
+
+FEO's eligibility mask maps to route validity and capacity. A queued
+GPU aggregate should not block eligible CPU point lookups, retained
+cache hits, or mutation acknowledgements merely because all compatible
+GPU workers are full. The scheduler should skip temporarily ineligible
+route classes while preserving explicit overload or fallback telemetry.
+
+The shallow-buffer lesson is directly relevant to 1M logical sessions.
+Logical sessions can be numerous, but runnable requests should be
+compressed into bounded route queues with explicit backpressure. Deep
+per-session queues would hide admission state and create unpredictable
+p99 latency. A future NIC/DPU path could move only the classification,
+priority, and worker-steering part toward the network edge while keeping
+WAL, MVCC, and snapshot publication on CPU/GPU-owned domains.
+
+The core-reallocation mechanism also maps to GPU/CPU resource budgets.
+Instead of scaling only CPU cores between latency-sensitive and
+best-effort services, GPU DB can emit hints when read-snapshot queues,
+response rings, pinned-buffer pools, or GPU streams have persistent
+backlog. The same design should support hybrid sharing: dedicated
+capacity for short retained lookups and burst-shared capacity for scans,
+refresh, and over-resident work.
+
+**Risks and mismatches:** RingLeader is a prototype NIC architecture,
+not a deployable commodity-networking solution for GPU DB today. It
+assumes a specialized datapath OS, cooperative yielding, and a
+single-process Demikernel-style environment; GPU DB currently runs a
+conventional process and pgwire path.
+
+The paper's scheduling work operates on request descriptors and service
+classes, not SQL transactions with WAL-before-visibility, MVCC
+snapshots, DDL invalidation, or GPU memory residency. GPU DB must not
+allow network-edge scheduling to reorder writes or snapshot publication
+across correctness boundaries.
+
+The evaluation is mainly synthetic plus RocksDB GET/SCAN, with
+microsecond service times. It does not evaluate SQL parsing, pgwire
+state machines, GPU kernels, PCIe H2D/D2H transfers, transactional
+commit validation, or long-lived snapshots. Absolute throughput and
+latency numbers therefore should not be carried over; the transferable
+claim is the queue architecture and scheduling/control split.
+
+Finally, shallow queues are beneficial only when the system has clear
+backpressure and rejection/fallback behavior. If GPU DB uses shallow
+queues without deadline-aware admission, it could reject bursty but
+valuable work too early or underutilize GPU batches.
+
+**Benchmark candidates:**
+
+- Add a host-only route-scheduler simulator with shallow per-worker
+  priority queues. Compare shortest-queue, strict-priority, JBSQ, and a
+  JBSRQ-like rank over short retained lookups, long scans, refresh jobs,
+  and write batches. Gate: lower p99 lookup latency without starving
+  scans or writes.
+- Extend pgwire retained-read benchmarks with explicit logical session
+  count versus runnable request count. Gate: 1M idle or mostly idle
+  logical sessions do not create deep hidden queues, excess threads, or
+  unbounded per-session memory.
+- Add an FEO-style eligibility scheduler proof: when GPU routes are
+  saturated or invalid for a generation, eligible CPU fallback,
+  retained-cache, or mutation-response work continues to drain. Failure
+  condition: one ineligible route head-of-line blocks unrelated work.
+- Prototype route-rank telemetry with terms for same-priority queue
+  depth, lower-priority preemptible work, snapshot-generation mismatch,
+  GPU-stream capacity, and response-ring capacity. Gate: every overload
+  or fallback explains which term dominated.
+- Benchmark scan yielding boundaries in retained GPU/CPU scans. Compare
+  no yield, row-count yield, microsecond yield, and partition-boundary
+  yield while running short retained lookups. Gate: lookup p99 improves
+  without unacceptable scan throughput loss or visibility bugs.
+- For a future DPU/NIC experiment, classify pgwire requests into route
+  hints at the network edge but keep all write ordering and snapshot
+  publication inside the engine. Gate: identical SQL-visible ordering
+  and lower IO-worker queue wait under high connection count.
