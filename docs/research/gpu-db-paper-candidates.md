@@ -65,7 +65,7 @@ mechanical sympathy, multi-tier cache/data placement, or query optimization.
   Control**, PVLDB 2017.
   URL: `https://www.vldb.org/pvldb/vol10/p781-Wu.pdf`
   Why: MVCC design tradeoffs, version storage, validation, and GC behavior.
-- `queued` — **Accelerating Analytical Processing in MVCC using Fine-Granular
+- `reviewed` — **Accelerating Analytical Processing in MVCC using Fine-Granular
   High-Frequency Virtual Snapshotting**, arXiv 2017.
   URL: `https://arxiv.org/abs/1709.04284`
   Why: HTAP-style analytical snapshots without blocking write progress.
@@ -318,6 +318,12 @@ Append new candidates here as each paper is processed.
   PDF: `https://www.usenix.org/system/files/nsdi19-kaffes.pdf`
   Why: microsecond-scale request scheduling and preemption; relevant to
   separating short retained reads from long mutation, scan, or refresh work.
+- `queued` — **RUMA has it: Rewired User-space Memory Access is Possible!**,
+  Schuhknecht et al., PVLDB 2016.
+  URL: `https://www.vldb.org/pvldb/vol9/p768-schuhknecht.pdf`
+  Why: virtual-memory rewiring precursor to AnKerDB; useful for judging
+  whether VM-assisted host snapshots or page remapping can support
+  column-granular CPU/GPU snapshot publication without a patched kernel.
 - `queued` — **Rethinking Serializable Multiversion Concurrency Control**,
   Faleiro and Abadi, PVLDB 2015.
   URL: `https://www.cs.umd.edu/~abadi/papers/rethink-mvcc.pdf`

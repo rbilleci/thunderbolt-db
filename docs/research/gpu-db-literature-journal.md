@@ -7811,3 +7811,155 @@ Benchmark priorities from this batch:
 - Make route fragility visible at the CPU/GPU/fallback boundary.
 - Prove that immutable resident roots retire precisely under long-reader
   pressure before adding more resident route families.
+
+### 2026-06-03 - AnKerDB fine-granular virtual snapshotting
+
+**Citation:** Ankur Sharma, Felix Martin Schuhknecht, and Jens Dittrich.
+"Accelerating Analytical Processing in MVCC using Fine-Granular
+High-Frequency Virtual Snapshotting." arXiv:1709.04284, 2017. Retrieved
+2026-06-03 from `https://arxiv.org/pdf/1709.04284`.
+
+**Category:** MVCC / snapshot / visibility and hybrid HTAP.
+
+**Relevance tags:** heterogeneous OLTP/OLAP execution; virtual snapshots;
+MVCC version-chain avoidance; column-granular snapshots; long analytical
+reads; snapshot freshness; garbage collection; kernel-assisted COW; route
+classification.
+
+**Core idea:** AnKerDB argues that mixed OLTP/OLAP workloads should not force
+short updates and long scans through one homogeneous MVCC representation.
+OLTP transactions run on the newest versioned columns, while read-only OLAP
+transactions run on separate read-only virtual snapshots. Both sides still use
+MVCC, but frequent snapshots keep each representation's version chains short,
+and analytical scans can often run in tight loops over snapshot columns instead
+of chasing long newest-to-oldest chains.
+
+The paper's enabling mechanism is a custom Linux system call, `vm_snapshot`,
+which snapshots arbitrary virtual memory ranges inside one process. Unlike
+`fork`, it does not duplicate the whole process address space; unlike the
+authors' earlier user-space rewiring approach, it avoids many repeated `mmap`
+calls when VMAs fragment. In the system evaluation, snapshots are triggered
+after 10,000 commits, lazily materialized per accessed column, and kept
+consistent by recording a snapshot timestamp before materialization. The paper
+reports OLAP latency roughly 2x to 4x lower than homogeneous MVCC baselines
+on its mixed TPC-H-inspired workload, and mixed workload throughput almost 2x
+higher, while pure OLTP throughput remains comparable to homogeneous full
+serializability.
+
+**Concrete mechanisms:**
+
+- The OLTP component owns the current up-to-date column representation.
+  Updates first live in transaction-local memory; at commit, old column values
+  move into newest-to-oldest version chains and new values overwrite the
+  current column.
+- Snapshot isolation is extended to full serializability with read-set
+  validation based on predicate ranges and recently committed write ranges,
+  following the HyPer precision-locking style.
+- Read-only analytical transactions are classified into an OLAP component and
+  run on read-only virtual snapshots. Fresh OLTP writes proceed on the new
+  current representation while scans continue on older snapshot roots.
+- On snapshot creation, the virtual duplicate becomes the new OLTP current
+  column, while the former current column plus its existing version chains
+  become the OLAP snapshot. Later updates build version chains only on the new
+  OLTP current column.
+- Snapshot creation is timestamp-triggered, but column materialization is
+  lazy. A snapshot timestamp is logged after a commit threshold; a transaction
+  touching a set of columns materializes only missing snapshots for those
+  columns.
+- Multi-column snapshot consistency is handled by the shared snapshot
+  timestamp. During actual column materialization, writers take shared column
+  locks and snapshot materialization takes an exclusive column lock.
+- `vm_snapshot(src_addr, length)` duplicates VMAs and, for private mappings,
+  copies relevant page-table entries so source and destination virtual ranges
+  share physical pages until copy-on-write.
+- An extended `vm_snapshot(dst_addr, src_addr, length)` form can place the
+  snapshot into an already reserved virtual range, allowing old snapshot
+  address space to be reused.
+- The authors compare physical copying, `fork`, user-space rewiring, and
+  `vm_snapshot`. Their 200 MB column microbenchmark finds `vm_snapshot`
+  stable under VMA fragmentation, 68x faster than rewiring after all 51,200
+  pages have been touched, and up to 6x faster on writes to snapshotted pages
+  because ordinary kernel COW handles the write path.
+- Old version garbage collection is simplified for analytical history: when no
+  transaction can access an old snapshot and a newer snapshot exists, dropping
+  the snapshot also drops the old version chains attached to it.
+- Evaluation uses a column-oriented in-memory prototype, TPC-H Q1/Q4/Q6/Q17
+  plus full scans for OLAP, and handcrafted update transactions for OLTP. It
+  explicitly notes sublinear 8-thread scaling because serializable commit
+  validation still has partially sequential protected state.
+
+**GPU DB mapping:** The paper is a strong argument for treating snapshot route
+classification as a first-class runtime decision. Short transactional reads,
+mutations, long analytical scans, and retained GPU reads should not all pay
+the same row-level MVCC traversal cost. The current P8 plan already uses
+immutable resident snapshots; AnKerDB sharpens that into a policy: analytical
+or GPU-resident scans should run on snapshot roots that make visibility cheap,
+while current OLTP writes build fresh deltas elsewhere.
+
+Column-granular lazy materialization maps directly to GPU residency. A GPU DB
+does not need to refresh every column or table at each visibility boundary.
+It can record a durable visibility/frontier boundary, then materialize only
+the column families needed by admitted retained routes. This fits P8's first
+slice of `int4` and `text` column groups and gives a concrete benchmark for
+refresh cost versus route freshness.
+
+The role swap between old and new columns also suggests a useful mental model
+for resident generations. A residency owner can publish generation `G+1` as
+the current GPU route while generation `G` remains read-only for active long
+queries. Mutations should invalidate or delta-build the current generation
+after WAL-before-visibility, not mutate buffers currently held by readers.
+
+The custom kernel call is less directly portable than the policy. GPU DB
+should not depend early on a patched Linux kernel, but the mechanism identifies
+what must be measured: page-table/COW snapshot cost, column materialization
+cost, COW write amplification, and whether a virtual-memory snapshot tier can
+be an intermediate CPU host snapshot before GPU refresh. The stronger
+transferable idea is column-granular, high-frequency, lazily materialized
+snapshot publication, not the exact syscall.
+
+The simplified GC story also complements the recent precise-retirement
+synthesis. Old analytical state can retire by generation once active holders
+drop it, instead of forcing a hot-path scan through every row version. For GPU
+resident buffers, the equivalent is exact holder-counted generation retirement
+for device buffers, pinned host buffers, and column manifests.
+
+**Risks and mismatches:** AnKerDB is a prototype from 2017, evaluated on an
+8-thread CPU system with a custom Linux 4.8.17 kernel, not a production
+PostgreSQL-compatible engine and not a GPU database. Its OLTP transactions are
+handcrafted updates rather than TPC-C or arbitrary SQL. The design requires a
+correct transaction classifier; a misclassified write or long cursor could
+break assumptions or pin memory. Snapshot materialization takes exclusive
+column locks, so high-frequency snapshots may still disturb write latency if
+columns are hot or wide. Kernel-level virtual snapshotting may not compose
+cleanly with pinned CUDA buffers, GPUDirect paths, NUMA placement, huge pages,
+or future CXL tiers. The paper reports strong mixed-workload benefits, but
+commit validation remains a scaling bottleneck and absolute throughput claims
+should not be transferred to the GPU engine.
+
+**Benchmark candidates:**
+
+- Add a CPU-side column-generation snapshot prototype for one admitted table:
+  record a visibility boundary, lazily materialize only requested column
+  families, and publish an immutable generation root. Minimum gate: identical
+  results to the current MVCC tuple path under insert/update/delete and WAL
+  replay.
+- Compare row-version-chain scans with generation snapshot scans on a mixed
+  workload: repeated updates to a controlled fraction of rows plus retained
+  `COUNT`, `SUM`, prefix filter, and key lookup routes. Failure condition:
+  retained route latency still grows with historical version-chain length.
+- Measure snapshot refresh granularity: whole table versus selected column
+  family versus selected segment. Required metrics: refresh latency, bytes
+  copied or shared, write stall time, holder count, and resulting GPU route
+  freshness.
+- Prototype holder-counted generation GC for CPU column snapshots and GPU
+  resident buffers. Proof gate: old generations retire as soon as the last
+  statement/cursor holder releases, without relying on global epoch lag from
+  idle sessions.
+- Build a negative-control virtual-memory snapshot experiment using ordinary
+  OS mechanisms available without a patched kernel, such as fork or mmap/COW
+  where feasible. Use it to decide whether VM-assisted host snapshots are
+  worth pursuing before GPU refresh.
+- Add route classification telemetry for OLTP current path, retained snapshot
+  path, long analytical path, and CPU fallback. Expected improvement: policy
+  decisions can be tied to observed version-chain length, snapshot age,
+  refresh cost, and write-stall budget.
