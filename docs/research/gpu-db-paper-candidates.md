@@ -443,9 +443,10 @@ Append new candidates here as each paper is processed.
   Why: robust parametric query optimization using executed-query evidence;
   useful as a contrast to PARQO's cost-model-based route cache for repeated
   SQL templates.
-- `queued` — **Plor: General Transactions with Predictable, Low Tail
+- `reviewed` — **Plor: General Transactions with Predictable, Low Tail
   Latency**, Chen et al., SIGMOD 2022.
-  URL: `https://doi.org/10.1145/3514221.3517839`
+  URL: `https://doi.org/10.1145/3514221.3517879`
+  PDF: `https://storage.cs.tsinghua.edu.cn/papers/sigmod22plor.pdf/`
   Why: Shirakami cites Plor as modern transaction scheduling work; relevant to
   predictable low-tail mutation and admission paths under mixed transaction
   sizes.
@@ -518,6 +519,17 @@ Append new candidates here as each paper is processed.
   Why: modern DBaaS resource-allocation paper cited by Resource-Adaptive Query
   Execution; relevant to pricing or value-of-memory admission policies for
   multi-tenant/session-heavy GPU DB workloads.
+- `queued` — **Bonspiel: Low Tail Latency Transactions in Database
+  Systems**, Cui et al., PVLDB 2025.
+  URL: `https://www.vldb.org/pvldb/vol18/p3840-cui.pdf`
+  Why: modern low-tail transaction follow-up that cites Plor; relevant to
+  predictable transaction admission and retry behavior under high contention.
+- `queued` — **Rebirth-Retire: A Concurrency Control Protocol Adaptable to
+  Dynamic Workloads**, Zhang et al., PVLDB 2025.
+  URL: `https://www.vldb.org/pvldb/vol18/p3162-zhang.pdf`
+  Why: modern MVCC/concurrency-control work that discusses Plor and adapts to
+  changing workload conditions; useful for deciding when GPU DB should switch
+  conflict policy by route, contention, or transaction size.
 - `queued` — **Robust External Hash Aggregation in the Solid State Age**,
   Kuiper, Boncz, and Muhleisen, ICDE 2024.
   URL: `https://doi.org/10.1109/ICDE60146.2024.00211`
