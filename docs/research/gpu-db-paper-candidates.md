@@ -395,7 +395,7 @@ Append new candidates here as each paper is processed.
   URL: `https://www.vldb.org/cidrdb/papers/2025/p2-otaki.pdf`
   Why: paged-memory and resource-adaptive execution work cited by vmcache^n;
   relevant to query admission and execution under memory-tier pressure.
-- `queued` — **Nomad: Non-Exclusive Memory Tiering via Transactional Page
+- `reviewed` — **Nomad: Non-Exclusive Memory Tiering via Transactional Page
   Migration**, Xiang et al., OSDI 2024.
   URL: `https://www.usenix.org/conference/osdi24/presentation/xiang`
   Why: transactional page migration for tiered memory cited by vmcache^n;
@@ -629,3 +629,16 @@ Append new candidates here as each paper is processed.
   Why: hybrid OCC/pessimistic contention handling cited by the batching paper;
   useful for deciding when GPU DB owner queues should switch from optimistic
   validation to contention-aware ordered execution.
+- `queued` — **MEMTIS: Efficient Memory Tiering with Dynamic Page
+  Classification and Page Size Determination**, Lee et al., SOSP 2023.
+  URL: `https://doi.org/10.1145/3600006.3613167`
+  Why: hardware-counter-guided page classification and dynamic page-size
+  decisions compared against NOMAD; relevant to tier-placement telemetry,
+  access-frequency sampling, and huge-page/subpage placement tradeoffs.
+- `queued` — **TPP: Transparent Page Placement for CXL-Enabled Tiered-Memory**,
+  Al Maruf et al., ASPLOS 2023.
+  URL: `https://doi.org/10.1145/3582016.3582063`
+  PDF: `https://symbioticlab.org/publications/files/tpp%3Aasplos23/tpp-asplos23.pdf`
+  Why: Linux CXL transparent page placement baseline compared by NOMAD;
+  useful for deciding where OS-managed promotion/demotion is enough and where
+  GPU DB needs explicit DBMS placement handles.

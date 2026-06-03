@@ -4970,3 +4970,145 @@ Benchmark priorities:
   that reduces aborts while increasing p99 should fail the gate.
 - Add an adaptive mode that reports why it chose FIFO, write-first,
   conflict-aware reorder, deferment, or CPU fallback for each batch.
+
+### 2026-06-03 - NOMAD non-exclusive memory tiering
+
+**Citation:** Lingfeng Xiang, Zhen Lin, Weishu Deng, Hui Lu, Jia
+Rao, Yifan Yuan, and Ren Wang. "Nomad: Non-Exclusive Memory
+Tiering via Transactional Page Migration." OSDI 2024. Retrieved
+2026-06-03 from the USENIX page and PDF,
+`https://www.usenix.org/conference/osdi24/presentation/xiang` and
+`https://www.usenix.org/system/files/osdi24-xiang.pdf`.
+
+**Category:** multi-tier cache / data placement and runtime memory
+management.
+
+**Relevance tags:** tiered memory; CXL; non-exclusive placement;
+transactional page migration; shadow copies; asynchronous promotion;
+thrashing; access tracking; demotion cost; placement telemetry.
+
+**Core idea:** NOMAD challenges exclusive memory tiering, where a
+page exists in either fast memory or slow memory but not both. In
+newer byte-addressable tiers such as CXL memory, persistent memory,
+and storage-class memory, the slow tier can often be read directly.
+If the fast tier is under pressure, repeatedly migrating pages can
+cost more than leaving warm pages where they are.
+
+The paper proposes non-exclusive tiering: recently promoted pages can
+keep shadow copies in the capacity tier. That makes clean demotion
+cheap because the system can remap back to the existing shadow instead
+of copying data again. The strongest GPU DB transfer is not to let
+"move hot data upward" become a reflex. Every GPU/DRAM/NVMe/CXL
+promotion should prove that movement cost is lower than direct access,
+fallback, or keeping a shadow copy in a lower tier.
+
+**Concrete mechanisms:**
+
+- NOMAD uses transactional page migration for promotion. It copies a
+  page from the capacity tier to the fast tier while the original page
+  remains mapped and accessible. After the copy, it checks whether the
+  page was dirtied during migration. If dirtied, the migration aborts
+  and the copied page is discarded; otherwise, the page table mapping
+  switches to the fast copy.
+- Successful promotion leaves the old capacity-tier page as a shadow
+  copy. A clean fast-tier page with a valid shadow can be demoted by
+  remapping rather than copying back to the slow tier.
+- Shadowing is not allowed to cause unbounded memory use. NOMAD
+  safeguards allocation and, when the capacity tier is pressured,
+  reclaims shadow pages before evicting ordinary pages.
+- The system separates mechanism from policy. The mechanism makes
+  migration asynchronous and shadow-backed; the paper notes that
+  promotion throttling and better global working-set estimation remain
+  policy work.
+- NOMAD relies on page-fault-based access tracking, while comparing
+  against approaches such as TPP and Memtis that differ in recency,
+  frequency, and hardware-counter sampling behavior. The paper argues
+  that fault-based tracking is responsive but can be expensive if it
+  lands on the critical path.
+- Evaluation spans multiple platforms, including CXL and persistent
+  memory setups. The paper reports up to 6x improvement over Linux TPP
+  under memory pressure, up to 130% over Memtis in some fast-tier-fit
+  cases, and also shows workloads such as moderate PageRank where page
+  migration is unnecessary or gives negligible benefit.
+- The authors explicitly identify weaknesses: when the working set
+  exceeds fast-tier capacity, disabling migration can be best; knowing
+  when to resume migration is hard because the working set spans tiers;
+  and access tracking has a recency/frequency tradeoff.
+
+**GPU DB mapping:** P8 already treats GPU residency as a performance
+cache over CPU/WAL truth. NOMAD suggests extending each placement
+descriptor with a shadow/copy relationship: GPU HBM may hold a hot
+column group, host DRAM may hold the canonical encoded segment, and a
+lower tier may hold a warm compressed or page-aligned shadow. Clean
+demotion should prefer metadata remap or handle downgrade over
+physical copy when a valid lower-tier shadow exists.
+
+Transactional migration maps to resident refresh and promotion. A
+GPU DB promotion from host memory or NVMe into GPU memory should copy
+or decode into a candidate generation while existing readers continue
+on the old placement. At publish time, the residency owner checks the
+WAL/visibility boundary, invalidation generation, dirty/mutation
+state, and memory budget. If any changed during migration, discard the
+candidate generation rather than publishing a stale resident route.
+
+The non-exclusive idea also affects planner route choice. If a warm
+partition can be queried directly from host memory or staged with a
+small transfer, migrating it fully into GPU memory may increase tail
+latency and eviction churn. Route costing should include movement
+cost, expected reuse, shadow validity, fast-tier pressure, and whether
+the query is latency-sensitive enough to prefer direct lower-tier
+access.
+
+For session concurrency, asynchronous migration belongs behind bounded
+residency queues. IO workers and read snapshot workers should not
+block on page/segment movement unless the query explicitly requires a
+fresh resident generation. Telemetry should distinguish queue wait,
+copy/decode time, publish validation, aborted promotion, shadow hit,
+demotion remap, and real eviction.
+
+**Risks and mismatches:** NOMAD is an OS page-management mechanism,
+not a DBMS storage engine. It does not handle SQL visibility, WAL,
+catalog generation, row/column encodings, GPU kernel scheduling, or
+query-planner semantics. GPU DB cannot let Linux page remapping be the
+only correctness boundary for resident snapshots.
+
+The page size and access pattern also differ. GPU DB may move column
+groups, compressed chunks, key vectors, pinned buffers, or partition
+generations rather than 4KB pages. Shadow copies consume memory and
+can become stale quickly under writes, so a DBMS version needs
+explicit invalidation, dirty tracking, and reclamation budgets.
+
+Finally, the evaluation shows that migration is not always useful.
+For some memory-intensive but not latency-sensitive workloads, direct
+remote/CXL access or no migration performed similarly. GPU DB should
+therefore benchmark "do not promote" as a first-class policy, not
+only compare different promotion strategies.
+
+**Benchmark candidates:**
+
+- Add a tier-placement simulator for one retained partition: exclusive
+  placement, inclusive cache, and non-exclusive shadow placement.
+  Measurements: movement bytes, remap count, aborted promotion,
+  shadow-hit demotion, p50/p99, resident bytes, and fallback count.
+  Minimum gate: non-exclusive placement reduces movement or p99 under
+  memory pressure without stale reads.
+- Prototype transactional resident promotion: build a candidate GPU
+  generation while the old generation remains available, then publish
+  only if WAL boundary, invalidation generation, schema generation,
+  and memory budget still match. Failure condition: any stale or
+  post-mutation route is admitted.
+- Benchmark "query lower tier directly" against "promote then query"
+  for warm host-memory and simulated NVMe partitions. Required output:
+  transfer/copy/decode time, GPU kernel time, route latency, and
+  expected reuse threshold where promotion wins.
+- Add shadow-aware demotion telemetry to the cache manager design:
+  evicted bytes, remapped bytes, copied-back bytes, dirty-shadow
+  misses, and shadow reclamation reason.
+- Stress fast-tier pressure with retained reads plus writes that
+  invalidate resident generations. Compare eager promotion, throttled
+  promotion, and no-promotion policies. Proof gate: policy reports why
+  it moved, skipped, or aborted movement.
+- Test access-tracking signals separately: recency-only, frequency
+  sampling, route-template reuse count, and mutation invalidation rate.
+  Failure condition: the tracking overhead or policy churn exceeds the
+  benefit of avoiding cold-route fallback.
