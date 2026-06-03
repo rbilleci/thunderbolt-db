@@ -18582,3 +18582,138 @@ Benchmark priorities:
 - Keep all three tracks tied to failure conditions: invalid route filtered,
   pre-WAL visibility impossible, and owner-domain invariants preserved under
   budget reassignment.
+
+### 2026-06-03 - DRAGON: Breaking GPU Memory Capacity Limits with Direct NVM Access
+
+**Citation:** Pak Markthub, Mehmet E. Belviranli, Seyong Lee, Jeffrey S.
+Vetter, and Satoshi Matsuoka. "DRAGON: Breaking GPU Memory Capacity Limits
+with Direct NVM Access." SC 2018, article 32. Retrieved 2026-06-03 from the
+author/ORNL PDF, `https://mehmet.belviranli.com/papers/sc18.pdf`; DOI
+`https://doi.org/10.1109/SC.2018.00035`.
+
+**Category:** multi-tier cache / data placement.
+
+**Relevance tags:** GPU memory tiering; NVM/NVMe backing; CUDA Unified Memory;
+GPU page faults; Linux page cache; read-ahead; write-back; out-of-core GPU
+execution; transparent migration; tier consistency.
+
+**Core idea:** DRAGON extends NVIDIA Pascal-era Unified Memory so a GPU kernel
+can access data backed by files on NVM/NVMe through ordinary load/store
+instructions. Instead of forcing application code to manually chunk a larger
+than GPU or host-memory dataset, `dragon_map()` maps a file into a unified
+virtual address range. GPU page faults are then served by a driver path that
+brings NVM-backed pages through the Linux page cache into host memory and then
+DMA-transfers the needed chunks into GPU memory.
+
+The transferable lesson is the shape of the tier path, not the exact driver
+dependency. DRAGON treats GPU memory, host memory, and NVM as a managed
+hierarchy and relies on page-fault telemetry plus Linux read-ahead/write-back
+to overlap storage I/O, host-to-device transfer, and kernel execution. For GPU
+DB, this is a useful contrast to BaM-style explicit GPU-initiated storage
+queues: transparent page migration reduces application changes, but it hides
+too much policy unless the database can observe residency, dirty state,
+read-ahead quality, and eviction cost.
+
+**Concrete mechanisms:**
+
+- `dragon_map()` registers an NVM-backed file range and returns a unified
+  virtual address usable by CPU and GPU code. Existing CUDA kernels do not need
+  device-side API changes; host code replaces allocation/copy/file staging with
+  mapped regions.
+- On a GPU page fault, DRAGON maps the virtual address to a Linux page-cache
+  page. If the page is missing or stale, it invokes page-cache file I/O, pins
+  the page, and transfers it into a free GPU chunk.
+- If GPU memory has no free chunk, DRAGON evicts a not-recently-used GPU chunk
+  into corresponding host page-cache pages. Dirty host pages are eventually
+  written back by Linux write-back, while `dragon_sync()` can explicitly flush
+  dirty data to the NVM file and invalidate GPU copies.
+- The finest backing granularity is the Linux page size, typically 4 KiB. The
+  GPU driver can use 4 KiB, 64 KiB, and 2 MiB chunks, so DRAGON tracks
+  one-to-many mappings between GPU chunks and host page-cache pages.
+- Access flags specialize traffic: read-only mappings skip GPU-to-host
+  write-back on eviction; write-only mappings avoid first-touch reads; volatile
+  intermediate mappings use a host-memory cache and ignore `dragon_sync()`
+  because they are not persistent outputs.
+- Linux read-ahead is important for consecutive access patterns. The paper's
+  read-ahead experiment shows that disabling it makes page faults pay repeated
+  NVM read latency, while large POSIX reads in the baseline amortize this cost.
+- Programmers can still use CUDA advice and prefetch APIs so DRAGON can
+  pre-stage scattered data when sequential read-ahead is a poor fit.
+- The evaluation used a P100 with 12 GiB HBM, 64 GiB host DRAM, and a 2.4 TB
+  Micron 9100 NVMe card. It swept Rodinia/CUDA benchmarks from 4 GiB to
+  256 GiB, covering in-GPU, in-host, and out-of-core sizes. Only DRAGON ran all
+  tested out-of-core cases; for in-core and host-memory cases it reports
+  31.74% lower execution time on average and 56.27% at maximum versus UM-P
+  plus POSIX I/O. ActivePointers, the software-translation comparison, was
+  reported up to 35x slower on the two evaluated kernels.
+- The paper also integrates DRAGON into Caffe. For out-of-core ResNet/C3D
+  cases where default CUDA and UM-P fail, it reports GPU execution up to 3.8x
+  faster than OpenBLAS CPU execution. DRAGON can be slower than extrapolated
+  UM-P for workloads dominated by large intermediate data because the
+  intermediate tier can spill to NVM.
+
+**GPU DB mapping:** DRAGON is a concrete reminder that "larger than GPU memory"
+is not one policy. A database has at least three different page classes:
+immutable resident read snapshots, dirty or soon-visible write-path state, and
+volatile scratch/intermediate buffers. DRAGON's read-only, write-only, and
+volatile flags map naturally to those classes. GPU DB should encode similar
+intent at the segment or column-group level before choosing HBM, pinned host
+memory, compressed DRAM, NVMe, or a future CXL tier.
+
+For retained read snapshots, the useful path is read-only or copy-on-publish:
+old immutable generations can be evicted without write-back, while new
+generations are published only after WAL-visible CPU truth exists. For write
+admission and refresh, a write-only or append-only mapping is a better analogy:
+avoid reading cold destination pages just to overwrite them, but do not publish
+visibility until WAL and CPU metadata are stable. For GPU query scratch,
+DRAGON's volatile mapping argues for a separate spill budget that should not
+pollute the durable page-cache or snapshot-residency accounting.
+
+The paper also suggests a benchmarkable middle ground between transparent UVM
+and explicit storage queues. GPU DB can keep explicit database-level placement
+metadata while still using OS or driver mechanisms for page movement in a
+prototype. The proof requirement is observability: every promoted or faulted
+segment needs a route reason, page-fault count, read-ahead hit signal,
+write-back cost, and invalidation generation. Without that, transparent
+migration may look fast in sequential scans while damaging p99 latency for
+point lookups or high-concurrency retained reads.
+
+**Risks and mismatches:** DRAGON is an HPC/GPU-runtime paper, not a DBMS
+paper. It does not handle SQL visibility, WAL-before-visibility, MVCC garbage
+collection, index consistency, or transactional recovery. Its driver extension
+targets Pascal-era CUDA Unified Memory internals and Linux page-cache behavior,
+so the exact mechanism may not be portable to current or future NVIDIA
+software stacks. Page-fault-driven migration also has uncertain p99 latency and
+may behave poorly for random lookups, pointer chasing, or many concurrent
+sessions. The paper's evaluation uses scientific and deep-learning workloads,
+not OLTP, HTAP snapshots, joins, or pgwire response paths. The reported
+out-of-core success is therefore a tiering signal, not a database throughput
+claim.
+
+**Benchmark candidates:**
+
+- Add a tier-intent label to P8 resident structures: read-only snapshot,
+  write-only append/refresh destination, volatile GPU scratch, and durable CPU
+  truth. Gate: mutation invalidation and WAL replay preserve the same visible
+  tuple sets regardless of tier label.
+- Build a larger-than-HBM retained scan benchmark with three policies:
+  explicit chunked transfer, OS/UVM-style page migration where available, and
+  GPU-initiated storage where available. Measure p50/p99 latency, throughput,
+  transfer bytes, page faults, and fallback reason.
+- Compare sequential read-ahead against random retained lookups over a
+  cold/warm/cached segment. Failure condition: page-fault migration improves
+  scan throughput but silently destroys p99 lookup latency or admission
+  fairness.
+- Prototype write-only refresh staging for a resident column group: allocate a
+  destination generation without first reading old pages, fill it from CPU
+  truth, and publish only after validation. Gate: no reader can route to the
+  new generation before publication, and old generations remain readable until
+  release.
+- Add a volatile scratch spill benchmark for GPU aggregation or join
+  intermediates. Gate: scratch spill does not evict hot retained snapshots
+  unless an explicit policy says so, and telemetry separates scratch bytes from
+  resident snapshot bytes.
+- Track page-size and transfer-granularity sensitivity: 4 KiB faults, 64 KiB
+  chunks, 2 MiB chunks, and database segment-sized transfers. Minimum proof:
+  the chosen granularity is good for both scan bandwidth and high-concurrency
+  point-query tails, or the planner can route them differently.

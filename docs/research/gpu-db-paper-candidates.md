@@ -783,18 +783,31 @@ Append new candidates here as each paper is processed.
   Why: foundational modern BaM design evaluated by Torp et al.; relevant to
   understanding GPU-side request queues, page caches, and when direct NVMe
   access helps over-resident data paths.
-- `queued` — **GPU Orchestrated Memory Tiering**, Bae et al., 2024.
-  URL: `https://doi.org/10.1145/3620666.3651341`
+- `queued` — **GMT: GPU Orchestrated Memory Tiering for the Big Data Era**,
+  Chang et al., ASPLOS 2024.
+  URL: `https://doi.org/10.1145/3620666.3651353`
   Why: three-tier GPU/CPU/storage cache approach summarized by Torp et al.;
   relevant to future explicit tier promotion and demotion policies when reuse
   can justify CPU and GPU resource use.
-- `queued` — **DRAGON: Breaking GPU Memory Capacity Limits with Direct NVM
+- `reviewed` — **DRAGON: Breaking GPU Memory Capacity Limits with Direct NVM
   Access**, Markthub et al., SC 2018.
   URL: `https://doi.org/10.1109/SC.2018.00035`
   PDF: `https://www.osti.gov/servlets/purl/1489577`
   Why: BaM contrasts against DRAGON's UVM/page-fault path; useful for comparing
   transparent GPU page-fault extension against explicit GPU-initiated queues
   and cache-line admission.
+- `queued` — **ActivePointers: A Case for Software Address Translation on
+  GPUs**, Shahar, Bergman, and Silberstein, ISCA 2016.
+  URL: `https://doi.org/10.1109/ISCA.2016.21`
+  Why: DRAGON contrasts against software GPU address translation; useful as a
+  cautionary baseline for per-access translation overhead and kernel
+  modification costs in larger-than-GPU-memory execution.
+- `queued` — **Towards High Performance Paged Memory for GPUs**, Zheng et al.,
+  HPCA 2016.
+  URL: `https://doi.org/10.1109/HPCA.2016.7446077`
+  Why: DRAGON cites this hardware-paged-memory line as context for GPU page
+  faulting; relevant to deciding when page-granular migration can help or hurt
+  database resident snapshots and tiered execution.
 - `queued` — **HippogriffDB: Balancing I/O and GPU Bandwidth in Big Data
   Analytics**, Li et al., PVLDB 2016.
   URL: `https://www.vldb.org/pvldb/vol9/p1647-li.pdf`
