@@ -1187,9 +1187,9 @@ Append new candidates here as each paper is processed.
   context; useful for deciding which background commit, scheduling, and I/O
   overlap techniques still matter before adopting fully autonomous WAL
   publication.
-- `queued` — **Your Read is Our Priority in Flash Storage**, An et al.,
+- `reviewed` — **Your Read is Our Priority in Flash Storage**, An et al.,
   PVLDB 2022.
-  URL: `https://www.vldb.org/pvldb/vol15/p1911-an.pdf`
+  URL: `https://www.vldb.org/pvldb/vol15/p1911-lee.pdf`
   Why: autonomous commit cites it for flash-storage behavior; relevant to
   balancing WAL writes, cold-partition reads, and read-latency priority when
   GPU DB shares NVMe devices between durability and over-resident execution.
@@ -1278,3 +1278,14 @@ Append new candidates here as each paper is processed.
   Why: the ICDE 2024 BLOB paper discusses file-system aging and fragmentation;
   this gives a primary storage-systems baseline for comparing DBMS extent
   recycling against file-system aging under mixed object allocation/deletion.
+- `queued` — **2R: Efficiently Isolating Cold Pages in Flash Storages**,
+  Kang et al., PVLDB 2020.
+  URL: `https://doi.org/10.14778/3407790.3407805`
+  Why: read-priority flash storage follow-up cited by the RW/R-Buf paper;
+  useful for separating cold-page write amplification from hot read latency
+  when GPU DB shares NVMe between WAL/checkpoint traffic and cold partitions.
+- `queued` — **SaS: SSD as SQL Database System**, Park et al., PVLDB 2021.
+  URL: `https://doi.org/10.14778/3461535.3461539`
+  Why: RW/R-Buf notes that in-storage SQL designs still face read-stall issues;
+  useful as a boundary case for deciding which query or storage actions belong
+  in an SSD/device tier versus the DB-owned GPU/runtime tiers.

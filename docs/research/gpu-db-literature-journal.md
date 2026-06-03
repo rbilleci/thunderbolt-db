@@ -13667,3 +13667,207 @@ core execution path.
   payloads: pgwire row streaming, binary copy/output, and a future
   descriptor-based escape hatch. Required metrics: serialization CPU,
   copies, socket write time, backpressure, and result ordering safety.
+
+### 2026-06-03 - Read-priority flash storage for OLTP stalls
+
+**Citation:** Mijin An, Soojun Im, Dawoon Jung, and Sang-Won Lee.
+"Your Read is Our Priority in Flash Storage." PVLDB 15(9):
+1911-1923, 2022. DOI: `10.14778/3538598.3538612`. Retrieved
+2026-06-03 from the VLDB PDF,
+`https://www.vldb.org/pvldb/vol15/p1911-lee.pdf`.
+
+**Category:** multi-tier cache / data placement and storage-engine
+runtime, with transaction processing / write path.
+
+**Relevance tags:** read/write interference; dirty-victim stalls;
+flash-storage asymmetry; buffer replacement; fused read-write I/O;
+storage command interface; in-device read buffer; WAL-safe page
+recovery; multi-tenant I/O isolation; NVMe queue utilization; cold-tier
+read priority.
+
+**Core idea:** The paper identifies a storage-specific bottleneck in
+OLTP systems: on a buffer-pool page miss, the conventional
+read-after-write protocol first flushes a dirty victim page and only
+then reads the requested page into the freed frame. On SSDs, where
+reads are much faster than writes and internal parallelism is high,
+that strict ordering turns unrelated slow writes into foreground read
+latency. The same pattern can also happen inside the SSD data buffer
+when read and write requests share buffer frames.
+
+Its solution has two layers. RW is a fused read/write command that lets
+the DBMS submit the dirty-victim write and missing-page read together,
+using the SSD buffer to copy the dirty page away before returning the
+new page to the host frame. R-Buf separates the SSD's internal read
+buffer from its write buffer, so host reads can obtain clean read-buffer
+frames without waiting for dirty write-buffer victims. Together, they
+turn a serialized host/storage read-after-write path into a read-priority
+parallel path.
+
+**Concrete mechanisms:**
+
+- The authors define a read stall as the foreground read wait caused
+  only by resource conflict with a dirty victim frame. They report that
+  MySQL on SSDs sees more than one fourth of page-missed reads stall
+  with a 10% buffer size; Oracle and PostgreSQL also show stalls in
+  the same experiment family.
+- RW is implemented as an NVMe vendor-specific command with logical
+  block addresses for the read page and dirty write page, a shared
+  length, and a host buffer pointer that is both the source of the dirty
+  page and destination for the requested page.
+- The SSD handles RW by allocating a storage buffer for the dirty page,
+  DMA-copying the host frame into that buffer, allocating a read buffer
+  for the requested page, reading it from NAND, DMA-copying it back to
+  the host frame, and only later completing the dirty page write to
+  NAND asynchronously.
+- Consistency relies on the SSD command queue ordering for successive
+  commands to the same page. Durability is treated like normal
+  no-force DBMS page writes: the dirty-page write may fail, but redo
+  logging recovers the page.
+- The MySQL/InnoDB prototype modifies the buffer manager and file I/O
+  modules to calculate read/write LBAs and issue RW through `ioctl`.
+  The authors report the change as small, with the RW path also
+  removing free-list and extra I/O-call work from the dirty-victim
+  miss path.
+- R-Buf splits the SSD DRAM buffer into read and write buffers with
+  hash lookup over both. Reads search the write buffer first for the
+  newest page, then the read buffer; a miss allocates only from the
+  clean read buffer. Writes use the write buffer.
+- If a write hits a page currently in the read buffer, the firmware
+  temporarily flags that read-buffer frame as a write frame, prioritizes
+  flushing it, then returns the clean frame to the read buffer. If a
+  page exists in both buffers, the write-buffer copy wins.
+- R-Buf makes controller-level read priority useful earlier: reads can
+  reach per-channel queues without first waiting on dirty storage-buffer
+  eviction, allowing reads to preempt queued writes or garbage
+  collection where the controller supports that.
+- The prototype uses a Cosmos+ OpenSSD board with 32 GB MLC NAND and
+  32 MB SSD DRAM. The empirical split chosen for TPC-C is 2 MB read
+  buffer and 30 MB write buffer because random OLTP reads rarely hit
+  in the tiny SSD read buffer; the gain is mostly from avoiding dirty
+  read-buffer victims.
+- Evaluation uses Linux 5.4, ext4 with `O_DIRECT`, MySQL TPC-C,
+  YCSB, SysBench, LinkBench, RocksDB `db_bench`, and PostgreSQL
+  TPC-H multi-tenancy. Networking is avoided by running clients on
+  the same host.
+- Reported results include RW alone improving TPC-C throughput over
+  RAW by up to 3.2x, RW plus R-Buf improving it by up to 3.9x, 41%
+  fewer interrupts, 51% fewer context switches, and 31% fewer CPU
+  instructions per transaction versus RAW plus a shared SSD buffer in
+  one TPC-C configuration.
+- R-Buf alone shows 5x higher random-read IOPS and 93% lower tail read
+  latency than the shared-buffer OpenSSD under concurrent read/write
+  FIO. In TPC-C, R-Buf improves throughput over S-Buf by 21-97%
+  depending on DBMS buffer size, while write latency can roughly double.
+- In a 57-hour TPC-C run, RW plus R-Buf keeps transaction latency and
+  throughput stable as write amplification rises, while the RAW/S-Buf
+  baseline's 99th latency grows and throughput falls. The authors
+  report R-Buf's in-storage read latency staying around native read
+  latency while S-Buf rises sharply as dirty victims and WAF increase.
+- Multi-tenant experiments show R-Buf helping a read-only TPC-H tenant
+  co-running with write-heavy TPC-C, and improving RocksDB
+  `readwhilewriting` throughput and read latency when compaction writes
+  compete with foreground reads.
+
+**GPU DB mapping:** GPU DB should take this paper as a warning against
+sharing one opaque cold-tier path for all durable and over-resident I/O.
+If WAL flushes, checkpoint writes, cold-partition reads, refresh reads,
+and large result spills all compete for the same buffer pool, queue, or
+NVMe lane, a foreground retained read or cold-page route can inherit the
+latency of an unrelated write. The runtime and tier manager need
+read-priority storage classes before they need a special device command.
+
+The strongest transferable idea is fused resource release, not the
+exact NVMe vendor command. When a GPU DB cold-segment miss must evict or
+demote a dirty host/NVMe buffer, the system should avoid serializing
+"finish demotion, then start read" if the demotion payload can be copied
+into an owned write buffer and the read can proceed against a separate
+read buffer. In software, that means reusable staging buffers,
+descriptor-level ownership transfer, and separate read/write queues can
+approximate RW/R-Buf even before firmware support exists.
+
+For WAL and MVCC, the paper's no-force assumption maps cleanly only to
+data-page or cold-segment writes that are recoverable from WAL. It must
+not be copied onto commit records. GPU DB can let dirty cold segments
+write back asynchronously after their descriptor is no longer needed by a
+foreground read, but commit acknowledgement and visibility publication
+still require the WAL frontier to be durable before a newer generation
+is exposed.
+
+For over-resident GPU execution, this suggests separate queue and buffer
+budgets for latency-critical reads and bulk writes. A GPU worker waiting
+for a cold compressed column group should not queue behind checkpoint
+or demotion writes if the data is needed to complete a user query. A
+writeback or compaction worker can tolerate longer service time; a
+retained lookup, cold-miss fetch, or response materialization lane often
+cannot.
+
+The multi-tenant result maps to 1M logical sessions as class isolation.
+Even if every session is individually light, many write-heavy or
+refresh-heavy sessions can create storage-buffer pressure that harms
+read-heavy sessions unless admission reports and reserves read buffers,
+write buffers, queue depth, and DMA/staging slots separately.
+
+The paper also reinforces the explicit-service-ownership synthesis from
+NVMe and kernel-bypass papers. Hidden shared queues make read latency
+depend on invisible write amplification. GPU DB should expose queue wait,
+dirty-victim wait, staging-buffer wait, I/O service time, checksum time,
+DMA/transfer time, and response writeback time by lane before deciding
+whether NVMe firmware, io_uring, SPDK, GPUDirect Storage, or ordinary
+preallocated buffers are the next mechanism.
+
+**Risks and mismatches:** The prototype requires firmware changes on
+Cosmos+ OpenSSD and an NVMe vendor-specific command, so the exact RW
+mechanism is not portable to commodity NVMe devices. GPU DB should first
+benchmark software equivalents with separate queues and staging buffers.
+
+R-Buf intentionally sacrifices some write performance to protect reads.
+That trade may be right for OLTP reads and cold query misses, but it can
+hurt bulk ingest, COPY, checkpoint, or compaction-heavy phases if read
+priority is applied globally instead of by request class.
+
+The workload uses page-oriented relational engines, 4 KB pages, a small
+OpenSSD board, and mostly block-device behavior. It does not evaluate GPU
+kernels, GPUDirect Storage, compressed column groups, WAL group commit,
+MVCC visibility publication, or PostgreSQL protocol response pressure.
+
+The durability claim is valid for no-force data pages recoverable by
+redo, not for commit records or generation metadata. GPU DB must keep
+WAL-before-visibility and descriptor-publish ordering separate from
+asynchronous cold-segment writeback.
+
+The experiments avoid networking by co-locating clients and DBMS, so the
+reported interrupt/context-switch gains are storage-path gains only.
+They are still useful, but pgwire response encoding and socket writeback
+may dominate in GPU DB at high session counts.
+
+**Benchmark candidates:**
+
+- Add a CPU-only cold-tier simulator with separate read and write staging
+  pools. Compare one shared pool versus read/write-separated pools under
+  mixed WAL/checkpoint writes, cold-partition reads, and refresh reads.
+  Gate: read p99 improves without violating WAL-before-visibility.
+- Track dirty-victim stalls explicitly in the storage path: time waiting
+  for free read staging, free write staging, demotion completion, NVMe
+  queue admission, and checksum. Failure condition: route summaries only
+  report total I/O time without naming the blocker.
+- Prototype a software RW equivalent for cold-segment replacement:
+  copy the dirty victim into a reusable writeback buffer, immediately
+  reuse the read buffer for the requested segment, and finish writeback
+  asynchronously when the descriptor remains recoverable from WAL or a
+  checkpoint manifest.
+- Add a read-priority admission rule for cold query misses: latency-class
+  reads get reserved read buffers and queue depth; writeback/compaction
+  lanes back off first. Required metrics: throughput, read p50/p99,
+  writeback backlog, checkpoint lag, WAL lag, and route rejection reason.
+- Benchmark shared NVMe pressure with three classes: WAL flush,
+  checkpoint/cold-segment writeback, and cold analytical read. Compare
+  FIFO, read-priority, and bounded read-reservation policies at queue
+  depths `1,4,8,16,32,64`.
+- Test whether read priority harms ingest: run COPY or bulk insert with a
+  concurrent retained read workload and report write throughput, commit
+  latency, read p99, and pending dirty bytes. Failure condition: read
+  protection causes unbounded dirty backlog or missed checkpoint targets.
+- For future GPUDirect Storage work, compare a single staging ring against
+  separate read and write DMA rings. Proof gate: CUDA stream ordering and
+  visibility generation checks remain explicit, and no stale cold segment
+  can become route-eligible after failed writeback.
