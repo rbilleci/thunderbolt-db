@@ -31,7 +31,7 @@ mechanical sympathy, multi-tier cache/data placement, or query optimization.
   URL: `https://dl.acm.org/doi/10.1145/3035918.3064015`
   Why: high-throughput multicore transaction processing with concurrency
   control, versioning, and contention management tradeoffs.
-- `queued` — **ERMIA: Fast Memory-Optimized Database System for Heterogeneous
+- `reviewed` — **ERMIA: Fast Memory-Optimized Database System for Heterogeneous
   Workloads**, Kim et al., SIGMOD 2016.
   URL: `https://dl.acm.org/doi/10.1145/2882903.2882905`
   Why: memory-optimized transactional engine for mixed workloads; relevant to
@@ -1347,3 +1347,10 @@ Append new candidates here as each paper is processed.
   Why: modern follow-up that generalizes hot-record migration across
   buffer-managed access methods; useful for comparing Bf-Tree mini-pages with
   explicit tiered hot/cold structures under skewed GPU DB lookup workloads.
+- `queued` — **Efficiently Making (Almost) Any Concurrency Control Mechanism
+  Serializable**, Wang, Johnson, Fekete, and Pandis, VLDB Journal 2017.
+  URL: `https://doi.org/10.1007/s00778-017-0463-8`
+  arXiv: `https://arxiv.org/abs/1605.04292`
+  Why: ERMIA uses Serial Safety Net as its serializability certifier; useful
+  for deciding whether GPU DB can layer bounded dependency validation over
+  snapshot-friendly read execution without falling back to pessimistic locks.

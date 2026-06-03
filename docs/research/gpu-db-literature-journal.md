@@ -14790,3 +14790,160 @@ retirement, or MVCC chain traversal.
 - Test variable-size cache object accounting under concurrency: grow, shrink,
   evict, and retire mini-segments while retained snapshots hold old
   generations. Proof gate: no reuse before all readers release the generation.
+
+### 2026-06-03 - ERMIA snapshot-friendly mixed-workload OLTP
+
+**Citation:** Kangnyeon Kim, Tianzheng Wang, Ryan Johnson, and Ippokratis
+Pandis. "ERMIA: Fast Memory-Optimized Database System for Heterogeneous
+Workloads." SIGMOD 2016, pp. 1675-1687. doi:10.1145/2882903.2882905.
+Retrieved 2026-06-03 from the author PDF,
+`https://www2.cs.sfu.ca/~tzwang/ermia.pdf`; publisher page:
+`https://dl.acm.org/doi/10.1145/2882903.2882905`.
+
+**Category:** transaction processing / write path and MVCC / snapshot /
+visibility.
+
+**Relevance tags:** heterogeneous OLTP; long read-mostly transactions;
+snapshot isolation; serializability; indirection arrays; append-only storage;
+centralized logging; epoch reclamation; mixed OLTP/HTAP fairness.
+
+**Core idea:** ERMIA argues that lightweight OCC, while excellent for short
+low-contention OLTP, is a poor default for heterogeneous workloads that mix
+short write transactions with longer read-mostly transactions. Commit-time
+read validation can let long readers consume CPU and then abort, and its
+writer-favoring conflict resolution can starve read-mostly work.
+
+ERMIA instead starts from snapshot isolation, then optionally overlays Serial
+Safety Net (SSN) to provide serializability. Its physical design makes that
+practical: append-only version creation behind latch-free indirection arrays,
+a log manager that gives each committing transaction a globally ordered LSN
+with one common-case atomic reservation, and fine-grained epoch managers for
+log buffers, transaction IDs, and garbage collection.
+
+For GPU DB, the important lesson is that retained read throughput should not
+come from "validate late and retry" under mixed write/read pressure. Long
+retained scans, refreshes, or GPU micro-batches need immutable snapshots and
+early conflict boundaries so they do useful work once admitted. Write
+throughput still needs a serialized durability/visibility front, but it should
+publish versions and snapshot generations cheaply enough that readers do not
+block writers and writers do not invalidate in-flight readers in place.
+
+**Concrete mechanisms:**
+
+- Each logical record has an object ID whose indirection-array slot points to
+  the head of an in-memory version chain.
+- Inserts allocate a new OID and fill the corresponding indirection slot;
+  updates create a new version out of place and install it with CAS against
+  the slot head.
+- An uncommitted head version acts as the write-write conflict marker. ERMIA
+  uses first-updater-wins, so doomed updaters can abort early instead of doing
+  a full transaction and discovering the conflict at commit.
+- Index leaves store OIDs rather than physical tuple addresses. Updating a
+  record usually updates the indirection array and version chain, not every
+  index reference.
+- Snapshot reads traverse version chains and compare the reader's begin LSN
+  with version creation timestamps. If a version is still TID-stamped, the
+  reader consults the owner transaction context.
+- Transactions keep log descriptors privately during execution, then reserve
+  globally ordered log space at pre-commit with a single atomic
+  fetch-and-add in the common case.
+- The log sequence-number space can contain holes; ERMIA translates logical
+  LSNs through segment metadata rather than requiring every allocation to be
+  contiguous in physical log files.
+- Commit has a pre-commit phase that fixes order, runs the concurrency-control
+  protocol, and copies private log records into the reserved log space; then a
+  post-commit phase replaces TID stamps on versions with the commit LSN.
+- Multiple epoch managers track resources at different time scales: log
+  buffers, transaction IDs, and garbage-collectable versions.
+- Version garbage collection scans indirection arrays and removes versions no
+  longer needed by any active transaction.
+- For serializability, ERMIA layers SSN over SI. SSN tracks dependency stamps
+  and uses an exclusion-window test at commit, instead of SSI-style dangerous
+  structure tracking that can bias aborts toward writers.
+- Phantom protection reuses tree node version validation from Silo: range
+  reads remember index leaf versions and validate them before commit.
+- Recovery treats the log as the durable database and rebuilds volatile OID
+  arrays from fuzzy checkpoints plus sequential log scanning.
+- The evaluation reports that ERMIA-SI and ERMIA-SSN maintain near-linear
+  scalability over the tested 24 hardware threads and preserve read-mostly
+  transaction throughput where the Silo-style OCC comparison collapses under
+  TPC-C/TPC-E hybrid workloads. Exact numbers are workload dependent.
+
+**GPU DB mapping:** The indirection-array idea maps cleanly to GPU DB's
+separation between CPU truth, WAL visibility, and GPU acceleration state. CPU
+MVCC records can keep stable logical row IDs while indexes, host mini-segments,
+and GPU resident column groups point through versioned publication metadata
+instead of physical tuple addresses that change on every update.
+
+The stronger transferable idea is the transaction lifecycle. GPU DB should
+make every mutation produce a private descriptor first, reserve durable/logical
+order at a narrow commit boundary, then publish visibility and invalidate or
+refresh resident generations. That gives retained readers a clear snapshot
+boundary and gives COPY/admission benchmarks a concrete phase split:
+descriptor build, WAL reservation, WAL flush, visibility publish, residency
+invalidation, and optional refresh.
+
+ERMIA also reinforces that read-mostly retained work should be admitted against
+immutable generations. A long GPU aggregate or lookup batch should not sit on
+mutable owner state and then discover at response time that a writer won. It
+should either run against an already-published generation, take a narrower
+snapshot lease, or be rejected/fallback before consuming GPU queue time.
+
+The epoch-management design is directly relevant to retained CUDA buffers,
+pinned response buffers, and host mini-segments. Published GPU snapshots need
+read-copy-update style retirement: writers publish a new generation, readers
+finish on the old one, and reclamation occurs only after all active readers and
+GPU events have crossed the epoch.
+
+The log design is not a direct replacement for GPU DB WAL, because ERMIA's
+experiments write log records asynchronously to tmpfs. Still, the single
+reservation point is useful: GPU DB should avoid per-row global log contention
+inside COPY and instead reserve or publish ordered chunks when correctness
+allows. Durability must still be measured at the real flush boundary.
+
+**Risks and mismatches:** ERMIA is a main-memory CPU OLTP engine, not a GPU
+storage engine. Its evaluated hardware is small by current standards, and the
+paper does not measure GPU execution, PostgreSQL protocol overhead, CUDA
+stream ownership, NVMe cold-tier behavior, or 1M logical sessions.
+
+The logging evidence is especially limited for GPU DB's durability goals:
+log records are written asynchronously to tmpfs, so the evaluation does not
+prove sustained WAL-before-visibility throughput on real storage. ERMIA's
+"log is the database" recovery shape may also conflict with GPU DB's current
+WAL/checkpoint/archive model unless adopted only as an internal versioning
+pattern.
+
+Indirection arrays add cache misses and metadata pressure. For GPU DB, an
+extra logical-to-physical hop may be fine on CPU owner paths but harmful inside
+GPU kernels unless resident snapshots flatten visibility into GPU-friendly
+vectors. SSN and phantom validation also need careful accounting: dependency
+metadata that is cheap at 24 threads may become expensive under very high
+logical session counts or long retained readers.
+
+**Benchmark candidates:**
+
+- Split COPY admission telemetry into descriptor build, ordered WAL
+  reservation, durable flush, visibility publish, residency invalidation, and
+  optional refresh. Gate: no rows/sec claim hides the WAL-before-visibility
+  boundary.
+- Prototype chunk-level ordered WAL reservation for COPY instead of per-row
+  global synchronization. Failure condition: crash replay cannot reconstruct
+  the same visible row set and invalidation generation.
+- Add a retained-read starvation benchmark: one long retained aggregate or
+  lookup batch mixed with short updates. Compare late-validation retry,
+  immutable snapshot generation, and owner-serialized execution. Gate:
+  read-mostly work either commits consistently or is rejected before consuming
+  expensive GPU time.
+- Test RCU-style generation retirement for resident CUDA buffers and host
+  mini-segments. Proof gate: old buffers are never reused until CPU readers and
+  GPU completion events release the generation.
+- Add route telemetry for `snapshot_generation`, `visibility_front`,
+  `invalidation_generation`, and `retirement_epoch` so planner/admission
+  decisions name the logical front being consumed.
+- Measure stable logical row IDs plus generated GPU column snapshots against
+  physical-row-address indexes under updates. Expected result: indirection
+  helps update/index maintenance while resident GPU snapshots should flatten
+  the extra hop before kernel execution.
+- Evaluate a bounded SSN-like dependency tracker only as a serializability
+  experiment for CPU transactions first. Minimum proof: dependency metadata,
+  abort reasons, and cleanup cost remain bounded under long retained reads.
