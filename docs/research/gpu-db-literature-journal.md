@@ -13871,3 +13871,229 @@ may dominate in GPU DB at high session counts.
   separate read and write DMA rings. Proof gate: CUDA stream ordering and
   visibility generation checks remain explicit, and no stale cold segment
   can become route-eligible after failed writeback.
+
+### 2026-06-03 - ScaleRPC reliable-connection resource sharing
+
+**Citation:** Youmin Chen, Youyou Lu, and Jiwu Shu. "Scalable
+RDMA RPC on Reliable Connection with Efficient Resource Sharing."
+EuroSys 2019. DOI: `10.1145/3302424.3303968`. Retrieved
+2026-06-03 from the author PDF,
+`https://chenyoumin1993.github.io/papers/eurosys19-scalerpc.pdf`.
+
+**Category:** runtime / HFT / session scale, with transaction
+processing and distributed write-path relevance.
+
+**Relevance tags:** high fan-in sessions; RDMA reliable connection;
+connection grouping; bounded transport resources; message pools;
+CPU cache locality; NIC cache pressure; request warmup; priority
+scheduling; SmallBank; one-sided verbs; future network tiers.
+
+**Core idea:** ScaleRPC starts from a concrete failure mode in
+RDMA-backed systems: reliable-connection RDMA can be fast at low
+connection counts, but throughput collapses as one server talks to
+many clients because connection and work-queue state thrashes NIC
+caches, and inbound message pools thrash CPU last-level cache. The
+paper reports raw outbound RC write throughput dropping from roughly
+20 Mops/s to 2 Mops/s as clients grow from 10 to more than 200, and
+shows similar fan-in degradation in a distributed file-system metadata
+server.
+
+The proposed design preserves reliable-connection semantics and
+one-sided verbs by making server-side transport resources shared and
+bounded. Connection grouping limits how many clients are actively
+served during one time slice, reducing NIC cache thrash. Virtualized
+mapping lets many logical client groups share one physical message
+pool, keeping the hot inbound write footprint small enough for CPU
+cache. Request warmup and priority scheduling reduce the cost of
+group switches and avoid wasting time on idle clients.
+
+**Concrete mechanisms:**
+
+- ScaleRPC uses one-sided RDMA writes over reliable connections for
+  request and response transfer, so it keeps RC support for large
+  payloads and one-sided read/write/atomic verbs instead of switching
+  wholesale to unreliable datagrams.
+- The server allocates registered huge-page message memory and formats
+  it as zones and fixed message blocks. Clients write request payload,
+  length, and a valid marker; the server polls the valid marker before
+  invoking the RPC handler.
+- Connection grouping divides clients into groups and serves one group
+  at a time. Only the active group can post requests directly into the
+  processing pool, bounding the active QP/WQE pressure on the NIC.
+- A priority scheduler tracks each client's observed throughput and
+  average request size, using a priority roughly proportional to
+  request rate per byte. Higher-priority clients are placed in smaller
+  groups with longer time slices, and group split/merge is performed
+  lazily when group size leaves a configured legal range.
+- Virtualized mapping maps multiple logical group pools onto one
+  physical message pool. The message pool is stateless after a request
+  is processed, so the next group can overwrite the same addresses
+  without clearing per-client memory.
+- Context switches save and restore per-group metadata such as client
+  ids, offsets, and counters. The server drains suspended requests and
+  piggybacks context-switch events in responses; inactive clients can
+  be notified with extra writes.
+- A warmup pool lets the next group publish local request addresses and
+  batch sizes before it becomes active. The server RDMA-reads those
+  prepared requests into the warmup pool, then swaps warmup and
+  processing pools at the context switch.
+- Clients move through warmup, process, and idle states. In process
+  state they can write directly to the processing pool; on a
+  context-switch event they become idle and begin warmup again.
+- Evaluation compares RawWrite, HERD, FaSST, and ScaleRPC on 56 Gbps
+  InfiniBand with ConnectX-3 HCAs. With 120 clients, ScaleRPC has much
+  lower median latency than RawWrite/FaSST/HERD for batch size 1, but
+  a bimodal tail because grouped clients wait for their time slice.
+- Hardware-counter analysis attributes the outbound improvement to
+  reduced PCIe reads from NIC cache misses, and the inbound improvement
+  to lower CPU cache write-allocate pressure from the smaller physical
+  message-pool footprint.
+- The paper reports ScaleRPC improving Octopus read-oriented metadata
+  operations by about 50-90% on average, while write-oriented metadata
+  gains are smaller because file-system software work dominates.
+- The ScaleTX prototype combines ScaleRPC for execution/logging RPCs
+  with one-sided RDMA reads for validation and one-sided writes for
+  commit updates. It uses optimistic concurrency control, two-phase
+  commit, and an NTP-like synchronization protocol so multiple
+  participants switch client groups at the same pace.
+- In the SmallBank experiment, ScaleTX outperforms RawWrite, HERD,
+  FaSST, and a ScaleRPC-only variant, with the paper reporting up to
+  160% improvement over RawWrite at 160 clients.
+
+**GPU DB mapping:** The most useful lesson is not "use RDMA now"; it
+is that 1M logical sessions require explicit sharing and scheduling of
+scarce transport resources. GPU DB already targets network IO workers,
+bounded command rings, response rings, pinned staging buffers, CUDA
+streams, and owner lanes. ScaleRPC shows the same pattern one layer
+lower: large logical connection counts should not imply proportional
+hot NIC state, message buffers, cache footprint, pinned memory, or
+active queue slots.
+
+Connection grouping maps to admission classes for pgwire sessions.
+Idle or low-rate logical sessions can remain connected, but only a
+bounded active set should hold decoded frontend buffers, response
+slots, mutation-owner queue entries, retained-read queue slots, or GPU
+staging capacity. A GPU DB equivalent of ScaleRPC's time slice would be
+a microsecond-limited drain window per session class or route class,
+not a global fairness guarantee that lets cold clients thrash hot
+state.
+
+Virtualized mapping maps directly to reusable protocol and execution
+buffers. The runtime should allocate a bounded number of physical
+request/response/staging slots per IO worker or route class, then map
+many logical sessions onto those slots only while work is active. This
+is especially relevant for COPY chunks, retained lookup requests,
+result scattering, and pinned host buffers, where allocating by
+session count would defeat the 1M-session goal.
+
+The warmup-pool idea is a useful analogy for GPU micro-batching. The
+next compatible batch can publish descriptors while the current batch
+runs, but descriptors must not become visible to a GPU execution owner
+until their snapshot generation, route shape, staging buffers, and
+response slots are all admitted. That could hide batch handoff latency
+without letting arbitrary sessions write into execution-owned memory.
+
+The ScaleTX portion is relevant to write-path design because it mixes
+message RPCs and one-sided operations by phase. GPU DB should make the
+same kind of phase distinction: SQL protocol parsing and transaction
+admission remain message-driven; validation, visibility-summary reads,
+resident descriptor fetches, and future distributed owner handoffs may
+become direct reads or writes only where ownership, durability, and
+replay semantics are explicit.
+
+**Risks and mismatches:** ScaleRPC assumes cooperative RDMA clients,
+registered memory, and reliable-connection NIC behavior. The current
+GPU DB endpoint is TCP/pgwire, not RDMA, and PostgreSQL clients cannot
+be trusted to write directly into server memory. The transferable
+mechanism is bounded active resource mapping, not the wire protocol.
+
+Connection grouping deliberately trades throughput stability for a
+bimodal latency distribution. That may be unacceptable for short
+interactive queries unless grouping is applied only to overload,
+background, COPY, refresh, or low-priority classes. A retained lookup
+or commit acknowledgement may need a tighter service guarantee than
+the paper's default 100 microsecond time slice.
+
+The paper's transaction system is distributed key-value OLTP, not SQL
+with MVCC visibility, WAL-before-visibility, catalog invalidation,
+resident GPU snapshots, or PostgreSQL protocol state. Its one-sided
+commit writes should not be copied into GPU DB unless recovery order,
+lock release, commit acknowledgement, and stale-resident invalidation
+are proven.
+
+The hardware is older 56 Gbps InfiniBand and ConnectX-3. Modern NICs,
+TCP stacks, io_uring, kernel bypass, and cloud fabrics change absolute
+numbers, but the qualitative warning remains: hidden per-connection
+state can become the bottleneck before application logic does.
+
+**Benchmark candidates:**
+
+- Add a session-resource budget simulator for the target pgwire runtime:
+  compare per-session buffer allocation against virtualized active-slot
+  pools at logical session counts `1k,10k,100k,1M`. Gate: idle sessions
+  do not scale pinned memory, decoded message buffers, or response slots
+  linearly.
+- Prototype an active-session grouping policy in a CPU-only harness:
+  bounded active windows for retained reads, COPY chunks, and long scans.
+  Measure p50/p99 latency, throughput, fairness, queue wait, and
+  starvation under mixed hot/idle clients.
+- Add telemetry that separates logical sessions, active admitted
+  sessions, active request slots, response slots, pinned staging slots,
+  and owner-queue occupancy. Failure condition: overload reports only a
+  generic queue-full error without naming the exhausted resource.
+- Build a reusable message-slot proof for pgwire request parsing:
+  many logical connections map onto a fixed pool of decoded command
+  buffers, with ownership states for network IO, owner queue, execution,
+  response encoding, and free. Proof gate: no buffer reuse before all
+  owners release it.
+- Test warmup-style batch descriptor preparation for same-shape retained
+  lookups: prepare descriptors while the current GPU batch is executing,
+  then publish only descriptors matching snapshot generation and route
+  shape. Required metrics: handoff latency, batch size, p99 latency, and
+  rejected descriptors by reason.
+- Compare strict FIFO admission with priority-by-work policies similar
+  to ScaleRPC's request-rate-per-byte priority. Gate: small retained
+  reads and commit responses improve tail latency without starving COPY,
+  refresh, or scan work.
+- For future RDMA or kernel-bypass experiments, benchmark RC-style
+  per-connection state, UD-style datagrams, and RPC-over-TCP/io_uring
+  with the same logical-session and active-slot telemetry before
+  changing the production transport.
+
+### 2026-06-03 - Cross-paper synthesis: logical scale needs active resource budgets
+
+DBMS-owned large objects, read-priority flash storage, and ScaleRPC
+all converge on the same design track: logical namespace size and
+active hot-resource ownership must be separated. A database can expose
+many objects, many cold segments, and many client sessions, but the
+hot path must admit only the descriptors, buffers, queue slots, and
+I/O lanes that can be served without polluting latency-critical work.
+
+The storage papers argue for DB-owned descriptors and read/write lane
+separation. ScaleRPC argues for virtualizing many clients over a small
+physical message pool and bounded active connection groups. Together
+they suggest a GPU DB runtime where every tier boundary has two counts:
+logical population and active admitted population. Logical sessions,
+cold segments, resident snapshots, and pending writebacks may be large;
+active pinned buffers, GPU batch descriptors, NVMe read slots, response
+slots, and mutation-owner entries must be explicitly budgeted.
+
+The main category gap remains a production SQL admission policy that
+combines transaction priority, snapshot class, storage lane, and GPU
+route fragility. Recent reviews have good ingredients from storage
+resource ownership, scheduling, learned robust routing, and MVCC, but
+the loop should still look for modern papers that evaluate these
+signals together under SQL or HTAP workloads.
+
+Benchmark priorities:
+
+- Track logical versus active counts for sessions, snapshots,
+  descriptors, buffers, and queue entries in every runtime report.
+- Add mixed read/write/cold-miss workloads where read-priority lanes and
+  virtualized request slots are both stressed, proving that p99 read
+  latency improves without unbounded dirty backlog.
+- Treat buffer ownership as a correctness surface: every reusable slot
+  should have a visible owner state and a release frontier tied to WAL,
+  snapshot generation, GPU completion, or socket write completion.
+- Compare FIFO, classed priority, and active-window grouping policies
+  before implementing transport-specific kernel bypass or RDMA support.

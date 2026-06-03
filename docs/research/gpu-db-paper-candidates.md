@@ -353,9 +353,9 @@ Append new candidates here as each paper is processed.
   URL: `https://www.usenix.org/conference/nsdi19/presentation/kalia`
   Why: eRPC's session, message-buffer, congestion-control, and polling design
   is a direct follow-up for high-concurrency pgwire/network admission.
-- `queued` — **Scalable RDMA RPC on Reliable Connection with Efficient
+- `reviewed` — **Scalable RDMA RPC on Reliable Connection with Efficient
   Resource Sharing**, Chen et al., EuroSys 2019.
-  URL: `https://doi.org/10.1145/3302424.3303983`
+  URL: `https://doi.org/10.1145/3302424.3303968`
   Preprint: `https://chenyoumin1993.github.io/papers/eurosys19-scalerpc.pdf`
   Why: ScaleRPC-style resource sharing over RDMA connection state may inform
   future session multiplexing and bounded transport resource budgets.
@@ -1289,3 +1289,23 @@ Append new candidates here as each paper is processed.
   Why: RW/R-Buf notes that in-storage SQL designs still face read-stall issues;
   useful as a boundary case for deciding which query or storage actions belong
   in an SSD/device tier versus the DB-owned GPU/runtime tiers.
+- `queued` — **Design Guidelines for High Performance RDMA Systems**,
+  Kalia, Kaminsky, and Andersen, USENIX ATC 2016.
+  URL: `https://www.usenix.org/conference/atc16/technical-sessions/presentation/kalia`
+  Why: ScaleRPC attributes RDMA scalability problems to NIC/CPU/memory
+  resource effects; this primary guideline paper is useful before any GPU DB
+  transport or remote-owner path uses one-sided verbs, registered memory, or
+  polling loops.
+- `queued` — **Deconstructing RDMA-enabled Distributed Transactions: Hybrid is
+  Better!**, Wei et al., OSDI 2018.
+  URL: `https://www.usenix.org/conference/osdi18/presentation/wei`
+  Why: ScaleRPC's ScaleTX and the modern-networks thread both argue for
+  phase-specific combinations of RPC and one-sided verbs; DrTM-H is a primary
+  transaction-processing baseline for deciding which validation, commit, and
+  replication steps can safely bypass server CPU work.
+- `queued` — **LITE Kernel RDMA Support for Datacenter Applications**,
+  Tsai and Zhang, SOSP 2017.
+  URL: `https://doi.org/10.1145/3132747.3132762`
+  Why: ScaleRPC contrasts software resource sharing with kernel-level RDMA
+  abstractions; LITE is a useful boundary paper for comparing application-owned
+  connection/message pools against OS-mediated safety and registration control.
