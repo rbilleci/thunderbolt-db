@@ -603,7 +603,7 @@ Append new candidates here as each paper is processed.
   Why: modern follow-up from the same HTAP/MVCC research ecosystem; tuple
   discovery and incremental transformation may inform retained snapshot
   refresh, generation directories, and row-to-column GPU resident builds.
-- `queued` — **Towards Buffer Management with Tiered Main Memory**, Hao et al.,
+- `reviewed` — **Towards Buffer Management with Tiered Main Memory**, Hao et al.,
   PACMMOD/SIGMOD 2024.
   URL: `https://doi.org/10.1145/3639286`
   Why: modern tiered-main-memory buffer management cited by vmcache^n;
@@ -614,6 +614,13 @@ Append new candidates here as each paper is processed.
   Why: cited by Counting Is All You Need; relevant to comparing analytical
   system retrofits against a standalone transactional engine with retained
   transformation and snapshot-refresh metadata.
+- `queued` — **Two is Better Than One: The Case for 2-Tree for Skewed Data
+  Sets**, Zhou, Yu, Graefe, and Stonebraker, CIDR 2023.
+  URL: `https://www.cidrdb.org/cidr2023/papers/p57-zhou.pdf`
+  Code: `https://github.com/zxjcarrot/2-Tree`
+  Why: direct predecessor to the Three-Tree/tiered-buffer-pool design; useful
+  for record-level hot/cold migration, low-cost access statistics, and
+  preserving range-scan behavior while separating hot and cold index records.
 - `reviewed` — **Hermes: Off-the-Shelf Real-Time Transactional Analytics**,
   Milkai et al., PVLDB 2025.
   URL: `https://www.vldb.org/pvldb/vol18/p2334-milkai.pdf`

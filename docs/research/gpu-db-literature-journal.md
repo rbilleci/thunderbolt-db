@@ -23606,3 +23606,153 @@ retirement telemetry.
   text columns or predicates not admitted by the retained route. Failure
   condition: foreground merge silently broadens into an unbounded CPU
   scan.
+
+### 2026-06-03 - Towards buffer management with tiered main memory
+
+**Citation:** Xiangpeng Hao, Xinjing Zhou, Xiangyao Yu, and Michael
+Stonebraker. "Towards Buffer Management with Tiered Main Memory."
+Proceedings of the ACM on Management of Data 2(1), Article 31, 2024,
+pages 31:1-31:26. doi:10.1145/3639286. Retrieved 2026-06-03 from
+the SIGMOD/PACMMOD table of contents, DBLP metadata, Mendeley abstract
+page, Xiangyao Yu's publication page, and the public
+`Two-tier-memory-project/tiered-buffer-pool` code repository. The ACM
+HTML/PDF endpoints returned HTTP 403 in this worker, so details below
+are limited to the accessible abstract, official metadata, author pages,
+and code. Unknown paper-only details are marked as such.
+
+**Category:** multi-tier cache / data placement, with transaction
+processing / write path.
+
+**Relevance tags:** tiered main memory; CXL-like remote memory; RDMA;
+buffer management; one-tree; two-tree; three-tree; hot/cold index
+records; remote-memory latency sensitivity; memory provisioning;
+promotion; demotion; skew; TATP; OLTP larger-than-local-memory.
+
+**Core idea:** The paper studies how a DBMS should use tiered main
+memory when local DRAM is expensive and a larger remote-memory tier is
+available over RDMA, CXL-like, or similar interconnects. The accessible
+abstract frames remote memory as much lower latency than SSD while
+potentially cheaper or more elastic than local DRAM, then evaluates five
+indexing designs that place or buffer data in remote memory in different
+ways. Its main conclusion is not "always use one layout"; it is that no
+single design dominates performance, latency sensitivity, and
+cost-effectiveness across all measured dimensions.
+
+For GPU DB, that is the strongest transferable idea: HBM, host DRAM,
+future CXL/remote memory, and NVMe should not be hidden behind one
+generic cache. Route families need explicit tier budgets and placement
+policies. A retained lookup index, a retained scan segment, a delta
+cache, and a cold-partition directory can each make different local-vs-
+remote-vs-disk tradeoffs.
+
+**Concrete mechanisms:**
+
+- The study compares five designs exposed in the public code/config as
+  `OneTree`, `TwoTreeLower`, `TwoTreeUpper`, `TwoTreeUpperBlind`, and
+  `ThreeTree`.
+- `OneTree` keeps one B-tree over a tier-aware buffer pool, so hotness
+  is handled by page/buffer placement rather than by splitting the
+  logical index into hot and cold trees.
+- `TwoTreeLower` keeps an upper in-memory tree and a lower tree backed
+  by a tiered buffer pool. Reads first check the upper tree, then the
+  lower tree, and may promote lower records into the upper tree.
+- `TwoTreeUpper` and `TwoTreeUpperBlind` put the upper tree itself over
+  a two-tier memory abstraction. The "blind" variant appears in code as
+  a comparison point where the upper memory allocator is less tier-aware;
+  exact paper interpretation is unknown without the PDF.
+- `ThreeTree` separates top, middle, and lower trees. In the code, the
+  top tree is local DRAM, the middle tree is remote/NUMA-like memory,
+  and the lower tree is a buffer-managed bottom tier. Reads check top,
+  then middle, then lower, with counters for local, remote, and disk
+  hits.
+- The implementation uses record-level movement rather than only page
+  movement. Values are wrapped in `ReferencedTuple`; hot-path reads mark
+  a reference bit, while eviction scans candidate keys and gives
+  referenced records a second chance before demoting them.
+- Promotion and demotion are explicit operations between trees. Lower
+  hits may promote into an upper tree under a configurable promotion
+  rate; failed promotions trigger eviction from the upper tier.
+- Updates search the tiers in order and update the tier where the key is
+  found. The code also uses a per-key lock table around operations,
+  keeping the experiment closer to OLTP access methods than to pure
+  analytical scans.
+- The benchmark configuration covers uniform and Zipfian distributions,
+  read/update mixes, local and remote memory-size sweeps, remote-delay
+  sweeps, promotion-rate sweeps, and TATP-style transactional tables.
+- The paper proposes a memory-provisioning strategy that chooses local
+  and remote memory amounts for a workload. The exact optimizer formula
+  and cost model are unknown from accessible sources.
+
+**GPU DB mapping:** P8 should treat this as a warning against a single
+"resident or not" bit. A partition can have HBM-resident compressed
+column vectors, host-DRAM row/delta metadata, future remote-memory
+lookup/index pages, and NVMe cold segments at the same time. Each route
+should declare the tier it will touch and the expected local/remote/cold
+hit mix.
+
+The `ThreeTree` split maps naturally to GPU DB's tier vocabulary. A top
+tree is a hot HBM or pinned-host lookup structure for admitted keys. A
+middle tree is a larger host/remote-memory structure for warm records or
+placement directories. The lower tree is the cold partition/index state
+backed by NVMe and rebuildable from durable CPU/WAL truth. A retained
+read can search top/middle/lower metadata while still executing payload
+operators on the tier that is cheapest for that query shape.
+
+Record-level promotion is especially relevant for skewed OLTP lookups.
+P8 partitioned resident routes currently operate at partition/segment
+granularity. Tiered buffer management suggests a narrower hot-record
+layer: keep tiny key-to-row or key-to-segment pointers in HBM/host DRAM
+for the hot tail without promoting full column segments. That could
+raise read throughput and session concurrency for repeated point
+lookups while avoiding HBM waste on cold rows in otherwise warm blocks.
+
+The memory-provisioning idea also belongs in the planner and admission
+control. Instead of deciding HBM/DRAM/NVMe budgets by static constants,
+GPU DB can maintain per-route cost curves: local bytes saved, remote
+miss penalty, cold fallback cost, refresh cost, and write invalidation
+rate. Under pressure, admission can demote the structure whose measured
+benefit per byte is lowest rather than evicting a whole table snapshot.
+
+**Risks and mismatches:** The full ACM paper was not accessible in this
+worker, so evaluation numbers, exact definitions of all five designs,
+and the memory-provisioning algorithm should be verified in a later run
+or through institutional/author PDF access.
+
+The implementation is a CPU/Rust access-method experiment, not a GPU
+storage engine. GPU DB cannot copy the tree-per-tier design blindly:
+HBM favors wide vector scans and batched lookups, while pointer-heavy
+trees can amplify random access and synchronization overhead. Promotion
+also cannot bypass WAL-before-visibility, MVCC snapshot boundaries, DDL
+invalidation, or resident generation publication.
+
+Record-level promotion may fragment range scans or complicate
+snapshot-consistent ordering. The 2-Tree line of work argues this need
+not sacrifice range scans, but GPU DB should prove that separately for
+retained partitioned scans and aggregates.
+
+**Benchmark candidates:**
+
+- Build a host-only three-tier placement simulator for P8 metadata:
+  hot key directory, warm partition/segment directory, and cold NVMe
+  directory. Feed Zipfian point lookups plus updates. Measure p50/p95
+  lookup latency, bytes per admitted hot key, promotion/demotion rate,
+  and invalidation cost.
+- Add a "hot-record pointer tier" benchmark before full HBM segment
+  promotion. Keep only hot `int4` key-to-row or key-to-segment pointers
+  in the fastest tier, while payload columns stay in host resident
+  segments. Gate: identical SQL results and explicit tier-hit telemetry.
+- Compare segment-level promotion against record-level promotion for
+  skewed lookup workloads. Failure condition: record-level promotion
+  improves lookup latency but harms retained range scan or aggregate
+  latency beyond the segment-only baseline.
+- Add route-level tier budget accounting: local bytes, warm bytes, cold
+  bytes, remote/tier miss count, and fallback count per query shape.
+  Gate: planner output and telemetry name the tiers touched by each
+  retained route.
+- Prototype a benefit-per-byte eviction policy for resident metadata,
+  not payload buffers. Sweep HBM/host-memory budgets and remote-delay
+  assumptions. Failure condition: the policy evicts metadata needed by
+  high-frequency point lookups while preserving low-value cold segments.
+- Once future memory tiers exist, replay the same workload with injected
+  remote-memory latency to estimate the threshold where GPU DB should
+  use warm remote-memory indexes versus direct NVMe/cold fallback.
