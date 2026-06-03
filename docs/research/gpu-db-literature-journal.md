@@ -27180,3 +27180,170 @@ near-memory shortcut.
   `route_context_bytes`, `metadata_rebuild_ms`,
   `visibility_summary_hits`, `visibility_summary_invalidations`,
   `tier_skew_hot_owner_wait_us`, and `tier_gc_obsolete_versions`.
+
+### 2026-06-04 - Revisiting GPU DB query performance and resource allocation
+
+**Citation:** Jiashen Cao, Rathijit Sen, Matteo Interlandi, Joy
+Arulraj, and Hyesoon Kim. "Revisiting Query Performance in GPU
+Database Systems." arXiv:2302.00734, 2023. Retrieved 2026-06-04
+from `https://arxiv.org/abs/2302.00734` and
+`https://arxiv.org/pdf/2302.00734`.
+
+**Category:** GPU execution / analytics, with query optimization /
+planning and runtime scheduling implications.
+
+**Relevance tags:** GPU resource modeling; MIG; concurrent query
+execution; roofline model; L2 bandwidth; DRAM bandwidth; kernel
+fusion; intermediate materialization; plan caching; CPU/GPU route
+choice; resource-aware optimization.
+
+**Core idea:** This paper compares five GPU database systems across
+database-level and microarchitectural metrics, then uses profiled
+runtime counters to predict how queries react to smaller GPU
+partitions and concurrent execution. The most useful lesson is that
+GPU DB scheduling should not assume a query needs the whole GPU.
+Many analytical queries underutilize DRAM, L2, compute, or CPU-side
+overheads in different ways, so the best route may be a smaller
+partition, a concurrent lane, or a fused single-query lane depending
+on observed bottlenecks.
+
+The paper's HeavyDB MIG experiment reports near-linear throughput
+improvement for smaller SSB scale factors and still meaningful
+improvement for larger ones when running multiple concurrent query
+streams. It also reports that a roofline model using profiled metrics
+was much more accurate than naive linear scaling when estimating
+runtime under reduced resource allocation. The exact SSB numbers
+should not be treated as GPU DB throughput forecasts, but the
+mechanism is directly transferable: route decisions need hardware
+counter evidence about whether a query is DRAM-bound, L2-bound,
+compute-bound, or dominated by CPU/setup/materialization overhead.
+
+**Concrete mechanisms:**
+
+- The study evaluates Crystal, HeavyDB, BlazingSQL, TQP, and
+  PG-Strom on an NVIDIA A100 with SSB queries, separating cold
+  execution from warm execution.
+- Cold execution includes host-to-device transfer, device-to-host
+  transfer, query planning/compilation, CUDA setup, memory
+  management, and GPU compute. The paper finds that transferring
+  only required columns and caching data/plans are important for
+  both cold and warm execution.
+- Warm execution exposes large non-GPU overheads in some systems.
+  HeavyDB and BlazingSQL still pay overhead beyond GPU compute;
+  TQP lazily materializes results; PG-Strom pays CPU/GPU transfer
+  costs when execution switches between CPU and GPU operators.
+- The GPU compute comparison uses integer operation counts, DRAM
+  bytes, arithmetic intensity, warp-stall causes, and top-k kernel
+  time breakdowns. Crystal and HeavyDB get much of their efficiency
+  from operator/kernel fusion and avoiding intermediate columns.
+- BlazingSQL and TQP execute many kernels for one query and
+  materialize intermediate columns. The paper identifies this
+  materialization as expensive enough to dominate some query paths.
+- Memory stalls are a dominant warp-stall cause, but algorithmic
+  complexity that merely trades memory stalls for arithmetic work
+  does not automatically improve end-to-end performance.
+- The modeling layer extends roofline analysis beyond DRAM by
+  building separate views for DRAM bandwidth, L2 bandwidth, and
+  compute resources. Hash joins with small working sets may be
+  L2-bandwidth-bound, while sequential filters are more likely to
+  approach DRAM bandwidth.
+- For reduced memory resources, the model estimates the new runtime
+  from arithmetic intensity and the reduced bandwidth, using the
+  current runtime when the resource is not the bottleneck. For L2
+  and DRAM, it takes the dominating slowdown.
+- For compute-bound queries under reduced SM allocation, the model
+  uses the compute allocation ratio because per-SM efficiency does
+  not improve when fewer SMs are assigned.
+- For concurrent scheduling, the model combines per-process
+  estimated execution time with unchanged CPU/setup/transfer
+  overheads and uses the slowest concurrent process as the batch
+  completion time. The evaluation uses MIG partitions and a simple
+  scheduler over multiple HeavyDB instances.
+- The paper explicitly notes model limitations: it relies on prior
+  profiling of representative or recurring queries, is easier for
+  downsizing than for memory-resource upsizing, and excludes some
+  MPS interference effects on shared L2/DRAM resources.
+
+**GPU DB mapping:** The runtime should treat GPU route selection as
+a measured resource-allocation problem, not a binary CPU-versus-GPU
+choice. For each retained route family, the engine should record a
+compact profile: bytes transferred, DRAM bytes, L2 requests, integer
+or relevant operation counts, kernel count, kernel fusion shape,
+CPU planning/encoding overhead, queue wait, and result materialization
+bytes. That profile can drive whether the next compatible batch uses
+one low-latency stream, a larger fused batch, a smaller MIG/MPS-like
+resource slice, CPU fallback, or rejection under saturation.
+
+For P8, the strongest mapping is the "required columns only" and
+"avoid intermediate materialization" rule. Resident snapshots should
+not blindly move full table state to the GPU when a route needs only
+one key vector, one predicate column, or a compact visibility bitmap.
+Likewise, retained joins and aggregates should prefer fused kernels
+or fused execution graphs that carry row ids, masks, or compact
+partials rather than materializing full intermediate columns between
+operators.
+
+The L2 finding matters for lookup-heavy and hash-table-heavy routes.
+Small resident hash tables, key vectors, dictionary maps, and visible
+row-id summaries may be L2-bound rather than DRAM-bound. A planner
+that only prices HBM bytes can choose the wrong batch size or
+concurrency level. GPU DB should track separate estimates for
+sequential scan bandwidth, L2-heavy random lookup bandwidth, and
+compute-heavy encoded predicates.
+
+The concurrent execution result maps to admission, but with a
+database caveat. GPU DB can use concurrent streams or future MIG/MPS
+partitioning to improve throughput for underutilizing analytical
+queries, but each request still needs a valid snapshot generation,
+response-ring credits, pinned-buffer credits, and explicit overload
+semantics. Concurrent GPU occupancy must not bypass WAL-before-
+visibility, resident invalidation, or per-session response ordering.
+
+**Risks and mismatches:** The workload is SSB analytics, not OLTP,
+MVCC validation, PostgreSQL protocol execution, or write-heavy
+transactions. The evaluated systems are mostly GPU analytical
+engines; only PG-Strom represents CPU/GPU co-execution, and it is
+not optimized for this engine's retained snapshot model. The paper's
+concurrency experiments use multiple HeavyDB instances and MIG on
+A100, not a single engine with shared WAL, shared residency metadata,
+and pgwire response ordering.
+
+The roofline model also assumes representative prior profiling. It
+will not protect first-run ad hoc SQL by itself, and it may miss
+queueing, cache interference, pinned-buffer scarcity, or invalidation
+costs unless GPU DB adds those metrics. Kernel fusion is not free:
+compilation latency, code-cache pressure, and route invalidation can
+erase the benefit for one-off queries.
+
+**Benchmark candidates:**
+
+- Add per-route GPU profile records for retained scans/lookups:
+  H2D/D2H bytes, DRAM bytes, L2 requests, operation count, kernel
+  count, materialized intermediate bytes, queue wait, and response
+  encode time. Gate: profile values are attached to snapshot
+  generation and route shape, never to stale table state.
+- Compare full-column materialization with fused mask/row-id
+  propagation for one retained filter-plus-aggregate route. Expected
+  improvement: fewer intermediate bytes and kernels. Failure
+  condition: fusion improves p50 but creates unacceptable compile or
+  p99 latency.
+- Build a resource-sensitivity sweep after the new GPU arrives:
+  run the same retained route with single stream, multiple streams,
+  smaller batch sizes, and any available MIG/MPS partitioning. Metrics:
+  throughput, p50/p99 latency, kernel time, L2/DRAM counters, queue
+  wait, and overload reasons.
+- Add a planner experiment that classifies routes as sequential
+  DRAM-bound, L2/random-lookup-bound, compute-bound, or CPU/setup-
+  dominated from one profiled run, then uses that class to pick batch
+  size and concurrency. Failure condition: the classifier chooses a
+  higher-concurrency lane that violates latency SLO or increases
+  fallback/rejection rates.
+- Test "required columns only" residency for P8 `int4`/`text` tables:
+  build key-only, predicate-only, and aggregate-only resident column
+  groups, then compare refresh cost and retained query latency against
+  full resident segments.
+- Track `gpu_route_dram_bytes`, `gpu_route_l2_requests`,
+  `gpu_route_ops`, `gpu_route_intermediate_bytes`,
+  `gpu_route_kernel_count`, `gpu_route_compile_ms`,
+  `gpu_route_resource_class`, `gpu_route_concurrency_lane`, and
+  `gpu_route_profile_generation`.

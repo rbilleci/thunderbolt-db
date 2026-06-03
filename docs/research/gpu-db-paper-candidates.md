@@ -195,7 +195,7 @@ mechanical sympathy, multi-tier cache/data placement, or query optimization.
   PDF: `https://www.dfki.de/fileadmin/user_upload/import/16459_3698812.pdf`
   Why: GPU-in-data-path design for compressed block streaming, decompression,
   and scan processing.
-- `queued` — **Revisiting Query Performance in GPU Database Systems**,
+- `reviewed` — **Revisiting Query Performance in GPU Database Systems**,
   arXiv 2023.
   URL: `https://arxiv.org/abs/2302.00734`
   Why: cross-stack GPU DBMS performance, resource utilization, and concurrent
@@ -2312,3 +2312,16 @@ Append new candidates here as each paper is processed.
   Why: Data Blocks notes padded encoding as a possible secondary-index-like
   structure; useful for testing whether skew-aware compressed scan layouts
   belong in GPU DB as route-specific acceleration rather than canonical storage.
+- `queued` — **Pipelined Query Processing in Coprocessor Environments**,
+  Funke, Bress, Noll, Markl, and Teubner, SIGMOD 2018.
+  URL: `https://doi.org/10.1145/3183713.3183734`
+  Why: Revisiting GPU DB performance identifies kernel fusion and avoiding
+  intermediate materialization as central GPU DB efficiency levers; this
+  follow-up should expose pipeline/fusion design choices for coprocessor
+  query engines.
+- `queued` — **Data-Parallel Query Processing on Non-Uniform Data**,
+  Funke and Teubner, PVLDB 2020.
+  URL: `https://doi.org/10.14778/3389133.3389139`
+  Why: Revisiting GPU DB performance highlights memory stalls, skew, and cache
+  behavior; this follow-up is relevant to GPU DB route choices under skewed
+  retained lookup, join, and aggregation workloads.
