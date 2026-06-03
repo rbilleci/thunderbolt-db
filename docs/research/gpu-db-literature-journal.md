@@ -8432,3 +8432,170 @@ need fresh measurement.
 - Test WAL ordering with mapped immutable files only: publish a segment after
   WAL and checksum completion, then prove that subsequent mutation invalidates
   the segment generation before any stale mapped bytes can be routed.
+
+### 2026-06-03 - TPP transparent CXL page placement
+
+**Citation:** Hasan Al Maruf, Hao Wang, Abhishek Dhanotia, Johannes Weiner,
+Niket Agarwal, Pallab Bhattacharya, Chris Petersen, Mosharaf Chowdhury,
+Shobhit Kanaujia, and Prakash Chauhan. "TPP: Transparent Page Placement for
+CXL-Enabled Tiered-Memory." ASPLOS 2023. doi:10.1145/3582016.3582063.
+Retrieved 2026-06-03 from the authors' PDF at
+`https://symbioticlab.org/publications/files/tpp%3Aasplos23/tpp-asplos23.pdf`.
+
+**Category:** Multi-tier cache / buffer management / data placement.
+
+**Relevance tags:** CXL memory; tiered memory; page placement; fast-tier
+headroom; demotion; promotion; hysteresis; page-type-aware allocation;
+telemetry; memory pressure; future DRAM/CXL/HBM placement.
+
+**Core idea:** TPP is an OS-level, application-transparent page placement
+mechanism for CXL-enabled tiered memory. It assumes CXL memory behaves like a
+CPU-less NUMA node with higher latency than local DRAM, and tries to keep hot
+pages in local memory while moving cold pages to the CXL tier. Its strongest
+transferable design pattern is fast-tier headroom management: proactively
+demote colder pages before local DRAM is exhausted so new request-related
+allocations and promotions of trapped hot pages have room to land.
+
+The paper is also a useful contrast to the prior mmap review. TPP shows that
+transparent OS placement can be good enough for broad datacenter memory
+capacity expansion when the workload has stable warm/cold regions and the
+application does not need DBMS-visible correctness boundaries for every page.
+For GPU DB, that is a baseline to measure against, not a replacement for
+explicit residency metadata. CXL-like host tiers may be acceptable for ordinary
+host allocation and background cold data, while GPU retained routes still need
+route-visible placement, validity, and queue/IO state.
+
+**Concrete mechanisms and findings:**
+
+- Chameleon, the paper's characterization tool, samples LLC load misses with
+  PEBS and optionally store-side TLB misses. It reports page heat by virtual and
+  physical page, page type, and interval history without kernel modification.
+- Chameleon duty-cycles sampling across core groups and processes samples in a
+  worker thread. The paper reports 3-5% of one core overhead in production
+  profiling, with a synthetic all-core bandwidth workload losing about 7%.
+- Production profiling finds substantial cold memory: several workloads access
+  only a fraction of allocated memory in two-minute windows, and anon pages are
+  often hotter than file-backed pages.
+- TPP treats CXL memory as a slow NUMA-like tier. Local DRAM remains the fast
+  tier; CXL memory is used for colder pages while still being byte-addressable
+  and coherent.
+- Demotion is integrated into Linux reclamation. Instead of swapping cold
+  local pages out, TPP places reclamation candidates on a demotion list and
+  migrates them asynchronously to the CXL node.
+- Demotion failure is tolerated. If migration fails because the CXL node is low
+  on memory, TPP skips that page because later allocation on CXL is still less
+  harmful than blocking fast-tier reclamation.
+- TPP decouples allocation and reclamation watermarks. Reclamation continues
+  until a higher `demotion_watermark` is reached, while new allocations can
+  resume at the lower allocation watermark. This keeps local DRAM headroom for
+  request bursts and for promotions from CXL.
+- The demotion aggressiveness is configurable through a scale factor; the paper
+  gives a default in which reclamation begins when only a small percentage of
+  local-node capacity is free.
+- Promotion is built on NUMA balancing but limited to CXL-node pages. TPP does
+  not waste hint-fault sampling on local pages that are already in the fast
+  tier.
+- To reduce ping-pong migration, a hinted page in CXL is promoted only after a
+  hysteresis check. If the page is in the inactive LRU, TPP marks it accessed
+  and moves it to active; only a later hot signal makes it a promotion
+  candidate.
+- Page-type-aware allocation can initially place file cache pages on the CXL
+  tier while preserving ordinary allocation for anonymous pages. Hot file cache
+  pages can still be promoted later.
+- Observability is part of the mechanism. TPP adds counters for demoted anon
+  and file pages, sampled pages, promotion attempts, successful promotions,
+  promotion failures, and pages that were demoted and later became promotion
+  candidates. A `PG_demoted` flag helps expose ping-pong behavior.
+- The evaluation uses production workloads on pre-production CXL hardware and
+  dual-socket systems configured to mimic target CXL latency. No experiment
+  swaps to disk; the question is placement across memory tiers.
+- In the paper's summary table, TPP is near the all-local baseline across the
+  evaluated workloads, improves default Linux by up to 18%, and outperforms
+  NUMA Balancing and AutoTiering by 5-17%.
+- Under a constrained 1:4 local-to-CXL setup for one cache workload, TPP keeps
+  throughput within about 0.5% of the all-local baseline by serving most hot
+  traffic from local memory even though local memory is only a small fraction
+  of the working set.
+- Component analysis attributes much of the result to decoupled
+  allocation/reclamation and active-LRU hysteresis. Without headroom, promotion
+  can stall; with hysteresis, promotion traffic drops by 11x and demote-then-
+  promote ping-pong falls materially.
+- TPP and TMO are described as orthogonal: TPP can turn TMO-style swap
+  offloading into a demote-then-swap process, giving pages a second chance in
+  CXL before expensive swap behavior.
+- The paper's future-work section notes QoS-aware tiering, bandwidth-expansion
+  placement, hardware-assisted migration, and combined CXL plus network memory
+  tiers as open directions.
+
+**GPU DB mapping:** The immediate GPU DB lesson is to separate "transparent
+host allocation tiering" from "DBMS route residency." TPP-style CXL placement
+could eventually help ordinary host memory pressure for WAL buffers, CPU
+indexes, cold immutable segments, or background snapshot state. It should not
+make a retained GPU route admissible unless the DBMS can still prove source WAL
+boundary, visibility boundary, resident generation, tier source, expected
+latency, and fault/migration risk.
+
+The headroom rule maps directly to the runtime's bounded queues and buffer
+budgets. GPU DB should keep explicit headroom in fast tiers: HBM for retained
+columns and scratch, pinned host memory for H2D/D2H staging, local DRAM for
+owner hot structures and response buffers, and future CXL memory for colder
+host-resident artifacts. Admission should start demotion or reject before the
+fast tier reaches zero usable space, because new network requests, COPY chunks,
+and retained read batches are often short-lived and latency sensitive.
+
+TPP's promotion hysteresis is also useful for cache policy. A cold partition
+should not be promoted to GPU memory or pinned DRAM on one accidental access.
+The first signal can mark it warm or schedule prefetch metadata; a second signal
+within a bounded interval can promote it. The same pattern can reduce churn
+between GPU HBM, host DRAM, CXL memory, and NVMe segments when skew changes.
+
+Page-type-aware allocation maps to DBMS object-type-aware placement. Instead of
+anon versus file pages, GPU DB can classify WAL buffers, MVCC/version chains,
+catalog state, CPU indexes, immutable column segments, compressed cold blocks,
+GPU staging buffers, and encoded responses. Some classes should never start in
+slow memory; others can live cold and promote only when route telemetry proves
+they are hot.
+
+The observability counters should become DBMS placement telemetry. For each
+tier, the engine should report demotions, promotions, failed promotions,
+demoted-then-promoted churn, bytes migrated, queue wait caused by migration,
+and route decisions blocked by missing headroom. That is the difference between
+using OS tiering as a hidden allocator and using it as a measured substrate.
+
+**Risks and mismatches:** TPP is an operating-system mechanism for general
+datacenter applications, not a database storage manager. It does not know SQL
+visibility, WAL ordering, index validity, GPU snapshot generations, or planner
+route shapes. Its best results depend on workloads with stable hot/cold regions
+over minutes and on CXL latencies close to remote NUMA; GPU DB retained-route
+latency targets may need microsecond-scale certainty. TPP's sampling and LRU
+signals are page-granular, while GPU DB placement may need segment-, column-,
+partition-, query-shape-, or snapshot-generation granularity. Finally, the
+paper's evaluation is on CPU datacenter workloads, not GPU execution or
+GPUDirect/NVMe paths, so its throughput percentages should be treated as
+evidence for the headroom/hysteresis mechanism rather than as GPU DB forecasts.
+
+**Benchmark candidates:**
+
+- Add a tier-headroom simulator for HBM, pinned host memory, local DRAM, and a
+  future CXL-like tier. Compare reactive eviction at zero free bytes against
+  proactive demotion at a high watermark. Required metrics: p50/p95/p99 route
+  latency, rejected requests, migration bytes, and fast-tier allocation stalls.
+- Implement a two-signal promotion policy for resident partitions: first access
+  marks warm or schedules metadata, second access inside a time/window threshold
+  promotes to GPU or pinned DRAM. Failure condition: promotion churn grows under
+  alternating hot/cold access.
+- Add object-type placement tags to the P8 cache manager: WAL/COPY buffers,
+  MVCC versions, catalog, CPU index, immutable segment, compressed cold block,
+  pinned staging, encoded response. Gate: placement policy can reject slow-tier
+  residency for latency-critical or correctness-sensitive classes.
+- Expose placement churn telemetry modeled after TPP counters:
+  demoted/promoted bytes by object type, failed promotions, demoted-then-
+  promoted bytes, headroom wait time, and tier-admission rejection reasons.
+- Compare OS-managed CXL/NUMA placement against DBMS-managed segment placement
+  for read-only cold immutable segments. Minimum proof: identical SQL results
+  and route telemetry that shows whether a query used HBM, local DRAM, CXL-like
+  memory, or explicit IO.
+- Build a cache-pollution benchmark where one scan-heavy route and one
+  point-lookup route compete for fast-tier memory. Expected improvement:
+  headroom and hysteresis protect lookup p99 without starving the scan; failure
+  condition: one scan touch evicts hot lookup state.

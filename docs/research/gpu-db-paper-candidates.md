@@ -735,7 +735,7 @@ Append new candidates here as each paper is processed.
   Why: hardware-counter-guided page classification and dynamic page-size
   decisions compared against NOMAD; relevant to tier-placement telemetry,
   access-frequency sampling, and huge-page/subpage placement tradeoffs.
-- `queued` — **TPP: Transparent Page Placement for CXL-Enabled Tiered-Memory**,
+- `reviewed` — **TPP: Transparent Page Placement for CXL-Enabled Tiered-Memory**,
   Al Maruf et al., ASPLOS 2023.
   URL: `https://doi.org/10.1145/3582016.3582063`
   PDF: `https://symbioticlab.org/publications/files/tpp%3Aasplos23/tpp-asplos23.pdf`
@@ -869,3 +869,15 @@ Append new candidates here as each paper is processed.
   Why: JOB is the workload foundation used by Hint-QPT/PARQO to expose
   selectivity-estimation failures; useful as a 2015-present baseline for
   testing CPU/GPU route-choice fragility under join and selectivity errors.
+- `queued` — **Transparent Memory Offloading in Datacenters**, Weiner et al.,
+  ASPLOS 2022.
+  URL: `https://doi.org/10.1145/3503222.3507761`
+  Why: TPP treats TMO as an orthogonal pressure-stall-driven offloading layer;
+  useful for comparing DBMS-owned tier admission against system-wide memory
+  saving, throttling, and demote-then-swap behavior.
+- `queued` — **Direct Access, High-Performance Memory Disaggregation with
+  DirectCXL**, Gouk et al., USENIX ATC 2022.
+  URL: `https://www.usenix.org/conference/atc22/presentation/gouk`
+  Why: TPP discusses network and CXL memory tiers as complementary; DirectCXL
+  is a primary follow-up for direct CXL memory disaggregation, remote-memory
+  latency budgets, and future placement boundaries beyond local DRAM/HBM/NVMe.
