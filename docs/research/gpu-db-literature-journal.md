@@ -17941,3 +17941,184 @@ absolute speedup.
 - Track route regressions as a first-class metric: fraction of requests more
   than 10% slower than deterministic baseline, plus stale-route prevention
   count, fallback count, and overload rejection count.
+
+### 2026-06-03 - BMC safe in-kernel pre-stack caching
+
+**Citation:** Yoann Ghigoff, Julien Sopena, Kahina Lazri, Antoine Blin,
+and Gilles Muller. "BMC: Accelerating Memcached using Safe In-kernel Caching
+and Pre-stack Processing." NSDI 2021, pp. 487-501. Retrieved 2026-06-03 from
+`https://www.usenix.org/conference/nsdi21/presentation/ghigoff` and
+`https://www.usenix.org/system/files/nsdi21-ghigoff.pdf`.
+
+**Category:** runtime / HFT / session scale.
+
+**Relevance tags:** eBPF; XDP; pre-stack packet processing; protocol fast
+path; safe bypass; cache coherence; session admission; kernel/user boundary;
+high-concurrency networking; latency.
+
+**Core idea:** BMC shows that a carefully bounded in-kernel fast path can
+serve the hottest, simplest requests before the Linux network stack and
+application see them, while preserving a normal application fallback for
+everything else. Instead of replacing the full stack with DPDK or rewriting
+Memcached, it adds a small eBPF cache at the XDP driver hook for UDP `GET`
+requests, invalidates entries when TCP `SET` traffic is observed, and learns
+cache contents by intercepting outgoing Memcached `GET` replies.
+
+The transferable lesson is not "put SQL in the kernel." It is that high
+session-count systems should define tiny, mechanically checkable fast paths
+whose coherence and fallback boundaries are explicit. BMC gets speed because
+the fast path is narrow: small keys, bounded values, fixed cache structures,
+driver-level packet handling, and protocol cases that can be answered without
+consulting mutable application state. It leaves TCP state, writes, large
+values, misses, and unsupported cases to the ordinary network stack and
+Memcached application.
+
+**Concrete mechanisms:**
+
+- BMC attaches incoming eBPF programs to XDP, the earliest driver-level hook
+  used in the paper, so cache hits can be answered before socket queues,
+  network-stack processing, and Memcached dispatch.
+- The target path is deliberately limited to small UDP Memcached `GET`
+  requests. BMC filters traffic by destination port and request form; packets
+  outside the supported subset continue through the normal stack.
+- On a cache hit, BMC rewrites the incoming request packet into a response by
+  swapping Ethernet, IP, and UDP headers, copying cached payload bytes, and
+  transmitting the packet back from the driver path.
+- TCP `SET` packets are parsed only enough to invalidate the matching cache
+  entry, then delivered to Memcached. BMC does not update the cache from
+  `SET` because keeping kernel and application writes in the same order would
+  require costly synchronization and TCP may still reject segments later.
+- Cache misses go through the ordinary network stack. If Memcached returns a
+  UDP `GET` response, an egress Traffic Control eBPF chain observes the reply
+  and updates the BMC cache.
+- The cache is a direct-mapped hash table in BPF maps. Entries contain a valid
+  bit, hash, spin lock, stored data, and data length; a hit validates both the
+  valid bit and stored key equality.
+- Per-entry spin locks avoid a global cache lock while keeping concurrent RX
+  core access safe. NIC multi-queue and RSS distribute work across RX cores.
+- eBPF verifier limits shape the design. BMC bounds keys to 250 bytes, values
+  to 1000 bytes, and packet parsing to 1500 payload bytes; unsupported sizes
+  fall through to Memcached.
+- The implementation splits logic into seven small eBPF programs connected by
+  tail calls, because the verifier analyzes each program independently and
+  large loops or parsing logic can exceed verifier complexity limits.
+- The incoming chain contains `rx_filter`, `hash_keys`, `prepare_packet`,
+  `write_reply`, and `invalidate_cache`; the outgoing chain contains
+  `tx_filter` and `update_cache`.
+- Evaluation uses a MemC3-like skewed workload with 100 million 16-byte keys,
+  32-byte values, Zipf skew 0.99, 8 Memcached threads, and up to 8 RX cores.
+- Reported target-workload throughput reaches 7.2 million requests/s with BMC
+  on 8 cores, of which 6.3 million are served by BMC. That is reported as 18x
+  vanilla Memcached and 6x Memcached with `SO_REUSEPORT`.
+- Median processing time for a BMC cache hit is reported as 2.1 microseconds,
+  versus about 21.8 microseconds for Memcached hits in the BMC configuration.
+- Worst-case large-value requests that BMC cannot cache show negligible
+  throughput deterioration, and even 0.1% of total cache memory assigned to
+  BMC improves throughput over the optimized Memcached baseline.
+- A dummy-cache experiment shows throughput is highly sensitive to extra fast
+  path work: increasing per-packet processing from 100 ns to 2000 ns reduces
+  throughput by 4.5x. The paper warns that richer cache algorithms must earn
+  their cost.
+- Compared with a Seastar/DPDK Memcached implementation, BMC reaches similar
+  target-workload throughput while using less CPU at low or moderate load
+  because it does not dedicate polling cores in the same way.
+
+**GPU DB mapping:** BMC is a boundary-setting paper for pgwire and session
+scale. The GPU DB should not offload SQL execution, MVCC validation, WAL
+publication, or arbitrary query semantics into kernel or protocol fast paths.
+But it can define a very small set of validated pre-owner shortcuts: reject
+obviously over-budget requests early, answer exact immutable responses tied to
+a current snapshot generation, parse or classify protocol messages into route
+descriptors, and enforce per-session credits before expensive owner or GPU
+queues are touched.
+
+For the 1M logical-session goal, BMC reinforces that inactive or unsupported
+sessions should stay cheap and fall through, while the hot common case gets
+bounded resources. A pgwire IO worker can borrow the same principle without
+using eBPF first: filter, classify, and admit only requests whose message size,
+prepared statement identity, snapshot generation, response shape, and active
+credit budget fit a simple fast path. Everything else goes to the normal owner
+path with an explicit fallback reason.
+
+The invalidation rule maps directly to retained snapshots. BMC only serves
+cached reads that remain coherent with observed writes, and it refuses to
+populate the cache from writes when order cannot be guaranteed. GPU DB should
+apply the same rule to exact response caches, resident lookup caches, and
+protocol-edge shortcuts: writes invalidate before visibility, fast paths answer
+only from immutable published generations, and cache population should come
+from authoritative completed reads or refreshes, not speculative write
+interception.
+
+The verifier-driven design is also useful outside the kernel. Bounded key and
+value sizes, direct-mapped or fixed-associativity structures, fixed packet or
+message parsing limits, and small chained stages are the kind of constraints
+that make runtime fast paths auditable. For GPU DB, fast route descriptors
+should have hard size and shape limits before they can bypass a general
+planner or mutation owner.
+
+**Risks and mismatches:** BMC accelerates a key-value cache protocol, not SQL.
+It targets UDP `GET` and simple TCP `SET` invalidation, while pgwire is
+stateful, transactional, TCP-based, and full of cases where responses depend on
+session state, portals, prepared statements, errors, MVCC snapshots, DDL, and
+WAL ordering. XDP/eBPF support and verifier constraints vary by kernel and NIC
+driver, so using eBPF directly would be a later transport experiment, not a
+near-term database architecture dependency. Direct-mapped caches can have
+collisions and wasted memory; static bounds can fragment kernel memory; and
+duplicating data near the protocol edge can hide stale-data bugs if
+generation/invalidation rules are weak. The paper's throughput numbers are
+for Memcached small-object cache hits on commodity CPU/NIC hardware, not GPU
+query execution.
+
+**Benchmark candidates:**
+
+- Add a protocol-edge fast-path simulator for immutable exact retained reads:
+  route only when statement id, snapshot generation, result schema, parameter
+  bounds, and response bytes are already published. Gate: all writes and DDL
+  invalidate before visibility, and unsupported cases fall through.
+- Add request classification before owner enqueue: message size, statement
+  shape, read/write class, snapshot requirement, response budget, and active
+  credits. Measure classification cost in nanoseconds and failure reasons
+  under high logical-session counts.
+- Build a "fast path must earn its cycles" benchmark that adds synthetic
+  per-request work to the retained read shortcut in 100 ns steps. Failure
+  condition: added validation costs more than the owner bypass saves at p50 or
+  p99.
+- Compare exact response cache policies: direct-mapped, small set-associative,
+  and bounded LRU for hot retained lookups. Measure hit rate, invalidation
+  cost, memory waste, and collision-induced fallthrough.
+- Test cache population only from authoritative completed reads or published
+  resident refreshes, never from intercepted writes. Gate: replay, concurrent
+  writes, and DDL produce no stale protocol-edge response.
+- Add a mixed workload with target fast-path requests plus large or unsupported
+  SQL messages. Gate: unsupported requests see negligible overhead and clear
+  fallback telemetry, mirroring BMC's non-target workload check.
+
+### 2026-06-03 - Cross-paper synthesis: fast paths need declared boundaries
+
+**Converging design tracks:** Caerus, Kepler, and BMC all argue for a runtime
+where the fast path is not "trust the common case" but "declare the common
+case precisely." Caerus needs declared read/write sets before it can avoid a
+global order. Kepler needs repeated templates and bounded candidate plans
+before learned route choice is safe. BMC needs bounded packet forms and simple
+coherence rules before it can answer before the normal stack. The shared GPU
+DB track is therefore request descriptors with hard fields: touched owner set,
+snapshot or generation boundary, route candidates, protocol shape, memory
+budget, active credits, and fallback authority.
+
+**Category gaps:** The queue remains healthy on GPU execution and tiered
+storage, but the next few runtime papers should keep pressure on high-session
+networking, overload rejection, and low-allocation queues. There is also a gap
+around how protocol fast paths interact with SQL transaction state and how
+multi-owner visibility vectors should be exposed to read-only routes.
+
+**Benchmark priorities:**
+
+- Define a typed route descriptor for simple reads and writes, then reject any
+  undeclared side effect from the accelerated path.
+- Measure exact-response and retained-snapshot fast paths against injected
+  validation cost, not only against best-case cache hits.
+- Compare global mutation order with owner-local sequence fronts for declared
+  writes, while preserving WAL-before-visibility replay equivalence.
+- Train or simulate route choice only over already-valid route candidates, and
+  count every confidence fallback, stale-generation prevention, and overload
+  rejection as a first-class result.

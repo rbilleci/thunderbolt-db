@@ -1361,7 +1361,7 @@ Append new candidates here as each paper is processed.
   Why: programmable-network hot-region OLTP execution cited by the
   modern-networks paper; useful for defining the narrow boundary between safe
   semantic admission/triage and unsafe offloading of full MVCC semantics.
-- `queued` — **BMC: Accelerating Memcached using Safe In-kernel Caching and
+- `reviewed` — **BMC: Accelerating Memcached using Safe In-kernel Caching and
   Pre-stack Processing**, Ghigoff et al., NSDI 2021.
   URL: `https://www.usenix.org/conference/nsdi21/presentation/ghigoff`
   PDF: `https://www.usenix.org/system/files/nsdi21-ghigoff.pdf`
@@ -1571,3 +1571,15 @@ Append new candidates here as each paper is processed.
   URL: `https://www.cs.cmu.edu/~juncheny/publications/socc18-Mutant.pdf`
   Why: PrismDB contrasts object-level MSC with SSTable-level access-frequency
   tiering; useful as a simpler placement baseline for cold resident segments.
+- `queued` — **The eXpress Data Path: Fast Programmable Packet Processing in
+  the Operating System Kernel**, Hohlfeld et al., CoNEXT 2018.
+  URL: `https://doi.org/10.1145/3281411.3281443`
+  Why: BMC relies on XDP as its earliest packet-processing hook; this primary
+  XDP paper is useful before considering any pgwire classification, overload
+  rejection, or exact-response cache near the kernel/network boundary.
+- `queued` — **NetCache: Balancing Key-Value Stores with Fast In-Network
+  Caching**, Jin et al., SOSP 2017.
+  URL: `https://doi.org/10.1145/3132747.3132764`
+  Why: BMC compares against switch-based key-value caching; NetCache is useful
+  for drawing the line between safe cached read responses and unsafe offload of
+  SQL visibility, invalidation, and write semantics.
