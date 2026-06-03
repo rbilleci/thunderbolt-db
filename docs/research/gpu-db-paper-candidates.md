@@ -1852,8 +1852,8 @@ Append new candidates here as each paper is processed.
   useful for comparing an optimizer switch between binary and WCOJ plans with
   GPU DB's possible spectrum of binary, multiway, factorized, and GPU-resident
   join routes.
-- `queued` — **CCaaLF: Concurrency Control as a Learnable Function**,
-  Wang et al., arXiv 2025.
+- `reviewed` — **Modeling Concurrency Control as a Learnable Function
+  (CCaaLF/NeurCC)**, Pan et al., arXiv 2025, revised 2026.
   URL: `https://arxiv.org/abs/2503.10036`
   Why: modern learned-concurrency-control follow-up to Polyjuice-style policy
   search; useful for deciding whether GPU DB should limit itself to offline
@@ -1871,6 +1871,20 @@ Append new candidates here as each paper is processed.
   Why: modern MVCC scan/access-method work from the vDriver/DIVA ecosystem;
   useful for retained snapshot scans where version traversal can erase index
   benefits and GPU routes need a compact visible-version access structure.
+- `queued` — **Adaptive Optimistic Concurrency Control for Heterogeneous
+  Workloads**, Guo et al., PVLDB 2019.
+  URL: `https://www.vldb.org/pvldb/vol12/p584-guo.pdf`
+  DOI: `https://doi.org/10.14778/3303753.3303763`
+  Why: NeurCC uses adaptive hot/warm/cold conflict detection as a baseline;
+  useful for comparing simple contention-aware OCC policy switching against
+  learned action tables before adding GPU DB owner-queue policy learning.
+- `queued` — **Toward Coordination-free and Reconfigurable Mixed Concurrency
+  Control**, Tang et al., USENIX ATC 2018.
+  URL: `https://www.usenix.org/conference/atc18/presentation/tang`
+  PDF: `https://www.usenix.org/system/files/conference/atc18/atc18-tang.pdf`
+  Why: CormCC is one of NeurCC's adaptive CC baselines; useful for comparing
+  partition-level mixed protocols and online reconfiguration with per-route
+  learned conflict actions.
 - `queued` — **GeminiFS: A Companion File System for GPUs**, Qiu et al.,
   FAST 2025.
   URL: `https://www.usenix.org/conference/fast25/presentation/qiu`
