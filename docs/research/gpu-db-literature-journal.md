@@ -22959,3 +22959,158 @@ large responses through generated route descriptors. Compare global FIFO,
 fixed lanes, adaptive lanes, optimistic commit, and deterministic epoch mode
 while checking that WAL-safe generation, visible generation, retained snapshot
 generation, and response order never diverge.
+
+### 2026-06-03 - RUMA rewired user-space memory access
+
+**Citation:** Felix Martin Schuhknecht, Jens Dittrich, and Ankur
+Sharma. "RUMA has it: Rewired User-space Memory Access is Possible!"
+PVLDB 9(10), 2016, pages 768-779. doi:10.14778/2977797.2977803.
+Retrieved 2026-06-03 from
+`https://www.vldb.org/pvldb/vol9/p768-schuhknecht.pdf`.
+
+**Category:** multi-tier cache / data placement.
+
+**Relevance tags:** virtual memory; page remapping; pooled memory;
+snapshotting; copy-on-write; contiguous vectors; partitioning; page-fault
+costs; host-memory layout; NUMA and future tiers.
+
+**Core idea:** RUMA treats virtual-to-physical page mappings as a database
+systems design primitive. Instead of accepting the usual tradeoff between
+contiguous arrays with fast scans and chunked/pointer-based structures with
+flexible growth, it uses RAM-backed files plus `mmap` to separate virtual
+address ranges from a pool of physical pages. The program can then remap
+pooled pages into contiguous virtual regions at runtime without copying the
+old data.
+
+The important database lesson is that physical movement and logical
+contiguity do not have to be the same operation. A structure can keep a
+flat scan-friendly virtual address range while the backing pages are drawn
+from, returned to, or reordered within a managed pool. The paper applies
+this to vectors, radix partitioning/sorting, and fork-style HTAP
+snapshotting. Its evaluation is CPU/Linux-focused, but the mechanism is a
+useful contrast point for GPU DB host-memory snapshots and future
+DRAM/NVMe/CXL/GPU staging tiers.
+
+**Concrete mechanisms:**
+
+- RUMA creates RAM-backed files using Linux memory file systems such as
+  `tmpfs` or `hugetlbfs`, sizes them with `ftruncate`, and maps them with
+  `mmap(MAP_SHARED)`. The file offset becomes a user-visible handle for a
+  backing physical page while ordinary CPU loads and stores still use
+  virtual addresses.
+- Rewiring is performed by mapping a chosen virtual page range to chosen
+  offsets in the RAM-backed file. The kernel and hardware still handle page
+  tables, TLB lookup, and process isolation; RUMA does not require a kernel
+  patch.
+- The system distinguishes hard page faults from soft page faults. Fresh
+  anonymous pages are expensive because the kernel must allocate and zero a
+  page, while mapping an already initialized pool page mainly installs a
+  page-table entry. In the paper's huge-page microbenchmark, the average
+  private-anonymous fault cost is around 600 microseconds, while pooled
+  rewired huge-page mapping is about three orders of magnitude lower.
+- Rewired vectors grow by mapping the first half of a new, larger virtual
+  region to the old physical pages and the second half to unused pool pages.
+  The old virtual region is unmapped. Existing entries are not physically
+  copied, and the final view remains a single contiguous array.
+- Rewired partitioning represents each output partition as a rewired vector.
+  It skips the initial histogram pass, appends pages to partitions on
+  demand, then fills partial tail pages and remaps backing pages into one
+  contiguous partitioned output region for later local sorting.
+- Rewired snapshotting keeps fork-style copy-on-write semantics but replaces
+  fresh page allocation during COW with a preallocated huge-page pool. A
+  write-protected OLTP view traps writes, the handler copies the old page
+  into a pool page, rewires the OLTP view to that pool page, and lets OLAP
+  snapshots continue using the old mapping.
+- Snapshot policy is epoch-like: take snapshots after a configured update
+  interval only when OLAP readers need them; attach readers arriving in an
+  interval to the existing snapshot; garbage collect pages after readers
+  finish; remove write protection when no old snapshot remains.
+- Reported application results include rewired vector insertion improving
+  by 40% to 150% over baselines, rewired partitioning improving end-to-end
+  partition/sort throughput by roughly 37% to almost 50%, and rewired
+  snapshotting improving update throughput by up to 96% under frequent
+  snapshots.
+
+**GPU DB mapping:** RUMA is a strong argument for making host-memory
+layout a first-class tier in GPU DB. The P8 design already treats GPU
+resident state as rebuildable acceleration state, but host-side staging,
+column groups, snapshot handles, and cold-tier buffers can also benefit
+from decoupling logical contiguity from physical movement. A retained
+snapshot can expose a contiguous CPU/GPU-transfer view while its backing
+pages come from segment pools or old generations.
+
+For retained GPU refresh, the rewired-vector pattern suggests a cheap
+publish step: build or extend a new host column-group generation from
+pooled pages, then publish a new virtual/page-directory view at a WAL-safe
+visibility boundary. If the GPU path later needs dense H2D copies, the
+runtime can copy from a contiguous virtual range without forcing all
+ingest-time growth to be physically contiguous.
+
+The snapshotting section maps to MVCC/HTAP pressure. Long retained reads
+should not force every writer to allocate fresh host pages from the kernel
+or copy whole column groups. A GPU DB version could maintain page pools per
+snapshot class and per NUMA/GPU affinity, then turn mutation COW into
+pool-copy plus generation publication. This still preserves
+WAL-before-visibility because the remapped view is an acceleration or
+snapshot structure, not the durable source of truth.
+
+Rewired partitioning is relevant to P8 over-resident execution. Partitioned
+resident routes need to assemble logical contiguous batches from multiple
+valid partitions, and cold/warm tiers may need to compact or reorder pages
+without immediately rewriting all bytes. RUMA's trick suggests a benchmark
+where a CPU-side page directory or virtual mapping creates scan-friendly
+segments from physically fragmented warm pages before optional GPU upload.
+
+Finally, RUMA's page-fault results are a warning. Any future reliance on
+OS lazy allocation, mmap-backed cold tiers, or fork-style snapshots must
+measure page-fault class, huge-page behavior, TLB cost, and fault-handler
+tail latency. Soft faults on pooled pages and hard faults from fresh
+allocation are not interchangeable in a microsecond-oriented runtime.
+
+**Risks and mismatches:** RUMA targets Linux CPU memory management, not CUDA
+device memory. GPU HBM cannot be remapped with ordinary `mmap`, and CUDA
+pinned memory, unified memory, GPUDirect Storage, and IOMMU mappings have
+different constraints. The paper's prototype uses signals for manual COW,
+which is unlikely to be acceptable on GPU DB hot paths without careful
+latency measurement.
+
+Page remapping also has granularity and TLB costs. The paper shows
+rewiring is unattractive for very tiny chunks because many `mmap` operations
+and VM area records dominate. GPU DB should use page or segment granularity
+large enough to amortize mapping work, and avoid using VM tricks where a
+simple copy is cheaper. Cross-process fork-style snapshots do not map
+directly to a single-process async runtime with owner queues and pgwire
+sessions.
+
+Correctness boundaries need extra care. Rewiring can create multiple
+virtual views of the same physical page, which is useful for snapshots but
+dangerous if a mutable owner accidentally writes through a view still held
+by retained readers. Any GPU DB use must tag views with visibility
+generation, mutation owner, page-pool ownership, and reader counts.
+
+**Benchmark candidates:**
+
+- Build a host-only page-pool microbenchmark for P8 column segments:
+  compare fresh allocation, ordinary `Vec` growth, chunk-directory access,
+  and pooled page remapping for append, scan, and publish. Gate: identical
+  segment bytes and stable p95 publish latency under repeated growth.
+- Add a retained-snapshot COW experiment with one writer and one long
+  reader over host column groups. Compare full copy, page-directory copy,
+  and pooled page remap/copy. Measure update throughput, p99 write latency,
+  reader correctness, page faults, and TLB misses.
+- Test virtual-contiguous warm segments feeding GPU uploads. Create
+  physically fragmented host pages, expose them as a contiguous virtual
+  range or explicit page directory, and measure H2D staging cost versus
+  physical compaction. Failure condition: mapping overhead exceeds saved
+  copy time for P8-sized segments.
+- Add telemetry buckets for hard faults, soft faults, huge-page faults,
+  `mmap`/`munmap` calls, page-pool misses, and snapshot COW handler time in
+  any future mmap/tier prototype.
+- Evaluate segment granularity: 4KB pages, huge pages, and larger logical
+  extents. Gate: remapping is used only where publish/copy savings exceed
+  VM operation cost and do not increase tail latency for short retained
+  reads.
+- Treat page pools as owned resources with explicit generation tags:
+  `free`, `mutable`, `published_snapshot`, `gpu_staging`, `retired`, and
+  `reclaimable`. Failure condition: a retained reader can observe a page
+  after it has been returned to a mutable pool.

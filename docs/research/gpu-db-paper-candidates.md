@@ -482,7 +482,7 @@ Append new candidates here as each paper is processed.
   Why: command-log recovery with static and dynamic dependency analysis;
   useful for GPU DB WAL replay, checkpoint rebuild, and post-crash CPU/GPU
   cache warmup design.
-- `queued` — **RUMA has it: Rewired User-space Memory Access is Possible!**,
+- `reviewed` — **RUMA has it: Rewired User-space Memory Access is Possible!**,
   Schuhknecht et al., PVLDB 2016.
   URL: `https://www.vldb.org/pvldb/vol9/p768-schuhknecht.pdf`
   Why: virtual-memory rewiring precursor to AnKerDB; useful for judging
@@ -1956,3 +1956,16 @@ Append new candidates here as each paper is processed.
   Why: ActivePointers cites GPU page-placement work as nearby hardware memory
   management; useful for comparing explicit DB-owned placement with
   hardware/runtime page placement across GPU, host, and future memory tiers.
+- `queued` — **Bf-Tree: A Modern Read-Write-Optimized Concurrent
+  Larger-Than-Memory Range Index**, Hao and Chandramouli, PVLDB 2024.
+  URL: `https://www.vldb.org/pvldb/vol17/p3442-hao.pdf`
+  DOI: `https://doi.org/10.14778/3681954.3682012`
+  Why: discovered while chasing tiered-memory buffer-management follow-ups;
+  variable-length mini-pages decouple cache granularity from disk pages and
+  may inform GPU DB hot-record, warm-page, and cold-NVMe placement.
+- `queued` — **LiquidCache: Efficient Pushdown Caching for Cloud-Native Data
+  Analytics**, Hao et al., PVLDB 2025.
+  URL: `https://www.vldb.org/pvldb/vol18/p5662-hao.pdf`
+  Why: modern cache-placement follow-up from the same tiering research area;
+  useful for comparing DB-owned cache admission and pushdown placement with
+  GPU DB resident, host, and cold-tier policies.
