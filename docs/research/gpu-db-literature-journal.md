@@ -18864,3 +18864,175 @@ invalidation metadata or they become unsafe.
   retained lookup. The GPU DB version should use generation/truncation
   counters so a lookup cannot return absent merely because a segment was
   compacted while the lookup traversed locator metadata.
+
+### 2026-06-03 - Space and Time Bounded Multiversion Garbage Collection
+
+**Citation:** Naama Ben-David, Guy E. Blelloch, Panagiota Fatourou, Eric
+Ruppert, Yihan Sun, and Yuanhao Wei. "Space and Time Bounded Multiversion
+Garbage Collection." arXiv:2108.02775v3, 2021. Retrieved 2026-06-03 from
+`https://arxiv.org/pdf/2108.02775`.
+
+**Category:** MVCC / snapshot / visibility.
+
+**Relevance tags:** multiversion garbage collection; retained snapshots;
+version chains; wait-free range tracking; long-reader robustness; bounded
+memory; lock-free version lists; snapshot metadata.
+
+**Core idea:** The paper gives a general MVGC scheme for version-list based
+multiversion systems that can reclaim intermediate old versions, not just
+versions older than the oldest active reader. The motivation is exactly the
+HTAP long-reader failure mode: an epoch or oldest-snapshot rule can force a
+system to retain many versions that no active query can still observe.
+
+Its two building blocks are a range-tracking object and a restricted lock-free
+doubly-linked version list. Readers announce a timestamp; updates deprecate a
+superseded version with its half-open visibility interval. Batched range
+tracking returns deprecated objects whose intervals no longer intersect any
+active announcement, and the version-list structure then removes those nodes
+from the middle of per-object chains. The claimed bounds are theoretical, not
+experimental: amortized O(1) collector work per allocated version, O(1)
+announce/unannounce, and only a constant factor more deprecated versions than
+needed plus additive terms depending on process count.
+
+**Concrete mechanisms:**
+
+- A range-tracking object stores active announcements and deprecated triples
+  `(object, low, high)`, where `[low, high)` is the interval during which that
+  version could satisfy a snapshot read.
+- `announce(ptr)` atomically copies the current timestamp into a per-process
+  announcement slot and returns it. `unannounce()` clears the slot. Each
+  process has at most one active announcement.
+- `deprecate(object, low, high)` records a superseded version and may return
+  older deprecated objects whose intervals do not contain any active
+  announcement.
+- Deprecated objects accumulate first in a per-process local pool. When the
+  pool reaches `B = P log P`, the process flushes a batch by dequeuing two
+  shared pools, sorting current announcements, partitioning ranges into
+  needed and redundant sets, returning redundant objects, and re-enqueuing or
+  locally merging the needed set.
+- The range tracker relies on monotonic timestamp behavior: each process's
+  `deprecate` calls have non-decreasing `high` values, and pending announces
+  observe timestamp values at least as high as prior deprecations.
+- The paper proves the range tracker is linearizable, with `announce` and
+  `unannounce` taking O(1), worst-case `deprecate` taking O(P log P), and
+  amortized operation cost O(1).
+- If `H` is the maximum number of deprecated objects that are actually needed
+  because their intervals contain active announcements, the number of
+  deprecated objects not yet returned is bounded by `2H + 25P^2 log P`. The
+  constant factor on `H` can approach 1 by processing more pools per flush,
+  trading higher constant work.
+- The version list supports append-at-head, find-by-timestamp, and remove from
+  anywhere once the range tracker proves no reader is seeking the removed
+  interval.
+- Removals use a restricted doubly-linked list with priority-tree style
+  coordination so adjacent nodes are not physically spliced concurrently.
+  Descriptor objects and helping complete partially installed splices.
+- For non-garbage-collected languages, the paper layers reference counting on
+  removed nodes so memory can be reclaimed after readers that were traversing a
+  node have dropped it.
+- Applied to the authors' versioned-CAS snapshot framework, the resulting
+  system has space bounded by necessary data plus `P^2 log P` and `P^2 log
+  Lmax` additive terms, while snapshot query time is proportional to sequential
+  query work plus updates concurrent with that query.
+
+**GPU DB mapping:** This paper gives a sharper rule for retained snapshots:
+do not let one long GPU read or delayed session turn the entire MVCC store into
+an oldest-snapshot retention regime. A GPU DB snapshot handle should protect
+only the version intervals it can still observe, and GC should be able to
+remove intermediate versions whose intervals are not covered by any active
+snapshot class.
+
+The range-tracking abstraction maps well to owner domains. A mutation owner or
+partition owner can publish monotonically increasing visibility generations.
+Read snapshot workers announce a generation when they acquire a retained CPU
+or GPU snapshot and unannounce it when response production releases the
+snapshot. Update/delete paths deprecate old tuple versions, tombstones,
+resident segment generations, or cold locator entries with `[begin, end)`
+visibility intervals. Collector work can then be amortized into mutation-owner
+batches instead of performed by every read.
+
+This also complements the Graveyard Index idea from the scalable snapshot
+isolation paper. Graveyard side structures keep old tombstones away from fresh
+OLTP indexes; range tracking can decide when old side-structure entries or
+intermediate version-chain nodes are no longer protected by any retained
+snapshot. For P8, the same interval metadata should exist for CPU MVCC chains,
+GPU resident generations, host-memory cold locators, and NVMe segment
+directories.
+
+The key design constraint is observability. GPU DB does not need the exact
+priority-tree list algorithm first, but it does need per-snapshot class
+announcement counts, highest active generations, deprecated interval queues,
+returned-for-reclaim counts, and collector lag. That telemetry can tell
+whether long retained scans are pinning memory because they genuinely need old
+versions or because the collector is using an overly coarse oldest-reader
+watermark.
+
+**Risks and mismatches:** The paper is primarily a theory/concurrent-data-
+structure paper and provides proofs rather than database performance numbers.
+It does not cover WAL-before-visibility, SQL transactions, indexes, DDL,
+catalog invalidation, recovery replay, CUDA execution, or disk/NVMe tiering.
+The additive `P^2 log P` terms may be meaningful at large worker counts, and
+the range tracker assumes disciplined announce/unannounce behavior that must
+be enforced across errors, cancellations, session disconnects, and GPU kernel
+completion. The lock-free list is complex; adopting it directly before a
+measured version-chain bottleneck would add implementation risk.
+
+**Benchmark candidates:**
+
+- Add a retained-snapshot interval tracker prototype for MVCC tuple versions:
+  announce generation on read start, unannounce on response completion, and
+  deprecate old versions with `[begin, end)` intervals. Gate: tuple visibility
+  matches current tests and WAL replay.
+- Build a long-reader MVGC stress test with repeated updates to a hot key set.
+  Compare oldest-active-snapshot reclamation against interval-based
+  intermediate-version reclamation. Failure condition: retained version count
+  grows with total updates even when active snapshots need only sparse
+  intervals.
+- Track collector telemetry: active announcement count by snapshot class,
+  deprecated intervals queued, intervals returned, versions physically
+  removed, oldest retained generation, and collector lag in bytes/versions.
+- Prototype a coarse batched collector before a lock-free list: process
+  deprecated intervals at mutation-owner batch boundaries, remove only from
+  owner-local chains, and measure write overhead. Minimum gate: no reader can
+  traverse a removed version.
+- Extend P8 generation metadata so resident GPU snapshots, CPU MVCC versions,
+  tombstone side structures, and cold locator chunks all carry comparable
+  begin/end intervals. Expected improvement: one GC policy can reason across
+  tiers instead of separate ad hoc watermarks.
+- Add cancellation/disconnect tests that leak an announced snapshot until
+  cleanup runs, then verify unannounce and reclamation happen deterministically
+  before the next pressure-triggered collector pass.
+
+### 2026-06-03 - Cross-paper synthesis: hot data needs interval ownership
+
+DRAGON, F2, and Space-Time-Bounded MVGC converge on a tiering rule that is
+more precise than "keep hot data resident." DRAGON separates read-only,
+write-only, and volatile page intent across GPU, host, and NVM tiers. F2
+separates write-hot, read-hot, and read-cold records so one cache budget does
+not punish another workload class. The MVGC paper separates needed old
+versions from merely old versions by tracking the exact timestamp intervals
+covered by active snapshots.
+
+For GPU DB, the converging design track is interval-owned placement. Every
+performance copy should name both its tier intent and its visibility interval:
+read-only retained generation, write-only refresh destination, volatile
+scratch, tombstone side entry, cold locator chunk, or durable CPU truth. That
+lets admission, eviction, GC, and refresh ask the same question: which active
+snapshot or pending publication still owns this object?
+
+The category gap after this set is transaction-concurrency and runtime
+admission. The next reviews should favor serializability layering, high-
+contention OLTP scheduling, or overload/rejection mechanics before returning
+to GPU analytics.
+
+Benchmark priorities:
+
+- Add a unified metadata record for tier intent plus `[begin, end)` visibility
+  interval on retained generations and old version/tombstone side structures.
+- Compare one shared resident memory budget against separated budgets for
+  read-hot snapshots, write-hot deltas, cold locators, and volatile scratch.
+- Run a long-snapshot plus skewed update benchmark that reports both p99 lookup
+  latency and reclaimed/intermediate version counts.
+- Treat stale-route prevention as the failure condition: eviction, promotion,
+  refresh, and GC must never allow a reader to observe data outside its
+  declared interval.

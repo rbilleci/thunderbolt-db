@@ -1510,8 +1510,8 @@ Append new candidates here as each paper is processed.
   Why: modern MVGC follow-up with experimental and theoretical collector
   variants; useful for comparing HybridGC-style production heuristics against
   bounded collector costs for retained snapshots.
-- `queued` — **Space and Time Bounded Multiversion Garbage Collection**,
-  Wei, Ben-David, and Blelloch, arXiv 2021.
+- `reviewed` — **Space and Time Bounded Multiversion Garbage Collection**,
+  Ben-David et al., arXiv 2021.
   URL: `https://arxiv.org/abs/2108.02775`
   Why: range-tracking approach for old-version reclamation; relevant to
   bounding retained snapshot metadata and version-chain cleanup under long
@@ -1584,6 +1584,13 @@ Append new candidates here as each paper is processed.
   Why: cited by the MVGC paper as a practical multiversioning system; useful
   for contrasting reader-side logging, version lifetime, and reclamation costs
   with GPU DB MVCC chains and long retained snapshots.
+- `queued` — **Constant-Time Snapshots with Applications to Concurrent Data
+  Structures**, Wei et al., PPoPP 2021.
+  URL: `https://arxiv.org/abs/2007.02372`
+  Why: the bounded MVGC paper applies its collector to this versioned-CAS
+  snapshot framework; useful for deciding whether GPU DB should expose
+  retained snapshot handles over lock-free CPU data structures before or
+  alongside SQL-facing MVCC chains.
 - `queued` — **Triton Join: Efficiently Scaling to a Large Join State on GPUs
   with Fast Interconnects**, Lutz et al., SIGMOD 2022.
   URL: `https://doi.org/10.1145/3514221.3517911`
