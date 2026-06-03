@@ -1100,7 +1100,7 @@ Append new candidates here as each paper is processed.
   Why: autonomous commit cites it for flash-storage behavior; relevant to
   balancing WAL writes, cold-partition reads, and read-latency priority when
   GPU DB shares NVMe devices between durability and over-resident execution.
-- `queued` — **What Modern NVMe Storage Can Do, And How To Exploit It:
+- `reviewed` — **What Modern NVMe Storage Can Do, And How To Exploit It:
   High-Performance I/O for High-Performance Storage Engines**, Haas and Leis,
   PVLDB 2023.
   URL: `https://www.vldb.org/pvldb/vol16/p2090-haas.pdf`
@@ -1113,3 +1113,10 @@ Append new candidates here as each paper is processed.
   Why: modern survey and call-to-action for database/network co-design; useful
   for organizing future pgwire, RDMA, DPDK, and application-specific transport
   benchmark tracks.
+- `queued` — **KVell: the Design and Implementation of a Fast Persistent
+  Key-Value Store**, Bartholomew et al., SOSP 2019.
+  URL: `https://doi.org/10.1145/3341301.3359628`
+  Why: Haas and Leis identify KVell as one of the closest systems to full
+  NVMe-array exploitation; useful as a contrasting partitioned KV design for
+  queue depth, SPDK usage, and limitations around range queries and small
+  database payloads.

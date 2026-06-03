@@ -11310,3 +11310,150 @@ throughput numbers matter.
 - Add low-load force-commit and barrier-frontier tests. Sparse write sessions
   should commit under a configured latency ceiling, and idle owners should not
   pin global snapshot retirement or old resident-generation cleanup.
+
+### 2026-06-03 - Modern NVMe storage-engine exploitation
+
+**Citation:** Gabriel Haas and Viktor Leis. "What Modern NVMe Storage
+Can Do, And How To Exploit It: High-Performance I/O for
+High-Performance Storage Engines." PVLDB 16(9), 2023, pp. 2090-2102.
+DOI: `10.14778/3598581.3598584`. Retrieved 2026-06-03 from
+`https://www.vldb.org/pvldb/vol16/p2090-haas.pdf`.
+
+**Category:** multi-tier cache / data placement and storage-engine runtime.
+
+**Relevance tags:** NVMe arrays; explicit buffer management; cold partitions;
+out-of-memory OLTP; cooperative scheduling; 4 KiB pages; `io_uring`; SPDK;
+queue depth; page eviction; CPU budget; direct I/O.
+
+**Core idea:** The paper argues that modern NVMe arrays are no longer a
+slow side tier that can be hidden behind old page-fault assumptions. With
+eight PCIe 4.0 enterprise SSDs, the authors measure 12.5 million random
+4 KiB reads per second, yet existing storage engines use only a fraction
+of that capability. Their LeanStore redesign closes much of the gap by
+making out-of-memory I/O a hot, scheduler-owned path instead of a blocking
+background service.
+
+The headline result is deliberately database-shaped, not only a storage
+microbenchmark. With a 16 GB buffer pool and 160 GB TPC-C database,
+their optimized LeanStore reaches 1.07 million TPC-C transactions per
+second, while RocksDB and WiredTiger are far lower in the same experiment.
+With a 400 GB buffer pool and a 4 TB TPC-C database, LeanStore still
+reaches about 1.1 million transactions per second, saturating the mixed
+read/write bandwidth of the eight SSDs. In the read-only lookup workload,
+LeanStore reaches 13.2 million lookups per second because about 10% of
+lookups are served from memory while the rest saturate the SSD array.
+
+**Concrete mechanisms:**
+
+- The system uses 4 KiB pages as the best tradeoff among random IOPS,
+  bandwidth, latency, and I/O amplification. Larger pages improve byte
+  bandwidth but waste too much I/O on small OLTP records.
+- SSD parallelism is treated as an explicit scheduling requirement. The
+  paper reports that roughly 1000 outstanding I/Os, more than 100 per
+  device, are needed to saturate the eight-drive array.
+- Blocking `pread` with one OS thread per request is rejected because it
+  needs hundreds or thousands of worker threads to maintain queue depth,
+  causing context-switch and kernel overhead.
+- LeanStore switches to DBMS-managed cooperative tasks. A fixed number of
+  worker threads multiplex many lightweight user tasks; page faults yield
+  to the scheduler instead of blocking a kernel thread.
+- Workers run a symmetric loop that executes user tasks, submits I/O,
+  performs eviction, and polls completions. Page eviction and dirty-page
+  writing become scheduler work instead of separately tuned background
+  threads.
+- The I/O backend abstracts `libaio`, `io_uring`, and SPDK. Kernel bypass
+  is useful for CPU efficiency, but the paper finds `io_uring` with I/O
+  polling can also reach full TPC-C throughput in this setup, albeit with
+  more CPU threads.
+- Each worker can access all SSDs through per-thread I/O channels. The
+  authors reject dedicated I/O threads and single-SSD assignment for the
+  main design because both add message passing or special roles.
+- Out-of-memory code paths are partitioned and made lock-light. Page
+  replacement and I/O-manager data structures are partitioned by page id
+  to prevent a formerly cold global lock from becoming the bottleneck.
+- A custom RAID 0 layer avoids Linux RAID limits for very high random-read
+  throughput.
+- The paper treats CPU cycles per I/O as a first-class budget. At 12
+  million IOPS on their 64-core AMD server, the rough budget is only about
+  13k cycles per I/O before query processing, indexes, MVCC, logging,
+  eviction, and scheduling are counted.
+
+**GPU DB mapping:** This is a direct design source for GPU DB's future
+cold-partition and over-resident storage tier. A cold table segment should
+not enter the runtime as a blocking file read hidden below a query worker.
+It should enter as a bounded storage request with page or segment identity,
+visibility generation, destination buffer ownership, queue-depth telemetry,
+and a completion event that can wake the waiting query or prefetch task.
+
+The strongest transferable idea is that tier I/O must live in the same
+scheduler budget as query work. GPU DB already wants network IO workers,
+owner domains, response rings, and GPU execution workers. This paper says
+the storage tier needs the same treatment: a small number of service-owned
+workers or owner loops should keep enough I/O outstanding, run eviction and
+promotion work as tasks, and make queue depth, completions, and CPU cycles
+visible. A thread-per-cold-read model would repeat the same mistake as the
+current thread-per-client benchmark endpoint.
+
+The 4 KiB lesson maps to cache descriptors rather than a fixed final page
+size. GPU DB may still execute from larger column groups in HBM, but the
+NVMe-facing unit should be benchmarked at 4 KiB, 16 KiB, and segment-sized
+granularities with explicit I/O amplification. For point reads and sparse
+lookups, 4 KiB cold fetches may be the right storage unit; for GPU scans,
+larger compressed column blocks may win. The planner should know which
+unit it is buying.
+
+The all-to-all I/O-channel model also matters for partition ownership. A
+future implementation can start with ordinary `io_uring` and one storage
+service API, while preserving a later SPDK path behind the same request
+descriptor. The safe abstraction is not "read file"; it is "fetch page or
+segment for table/partition/generation into this owned buffer and publish
+completion only if the generation is still valid."
+
+**Risks and mismatches:** The evaluation disables logging and uses a low
+isolation level to keep concurrency control from dominating, so the TPC-C
+numbers are storage-engine I/O evidence, not a full durable serializable
+DBMS result. GPU DB cannot copy those numbers into a WAL/MVCC benchmark
+without measuring durable writes, visibility publication, and replay.
+
+The setup uses eight enterprise SSDs, direct I/O, a custom RAID layer,
+disabled IOMMU, erased drives before experiments, and carefully tuned
+hardware. Cloud block devices, consumer SSDs, filesystems, encryption,
+IOMMU, containers, or full drives may behave differently. SPDK also implies
+exclusive device access and operational complexity. The near-term benchmark
+should therefore compare ordinary Linux direct I/O and `io_uring` first,
+with SPDK as a later ceiling experiment.
+
+The paper is CPU storage-engine work. It does not solve GPU buffer
+registration, GPUDirect Storage, CUDA stream ordering, GPU page-cache
+replacement, PostgreSQL protocol latency, transaction dependency tracking,
+or resident snapshot invalidation. Its value is the service shape and
+measurement discipline.
+
+**Benchmark candidates:**
+
+- Add an over-resident cold-fetch microbenchmark that varies 4 KiB, 16 KiB,
+  64 KiB, and resident-segment fetch units across ordinary direct I/O,
+  `io_uring`, and a future SPDK ceiling. Required metrics: IOPS, GB/s,
+  CPU cycles per I/O, outstanding requests, p50/p99 latency, I/O
+  amplification, and generation-valid completion rate.
+- Build a storage-service request descriptor:
+  table id, partition id, column group, page/segment id, visibility
+  generation, destination buffer id, request owner, and completion state.
+  Gate: stale-generation completions cannot publish into a retained read.
+- Measure queue-depth requirements on Richard's actual newer GPU host:
+  the first proof should find the depth needed to saturate one NVMe device
+  and then N devices, before combining storage with CUDA work.
+- Extend P8 placement benchmarks so hot HBM, warm host memory, and cold NVMe
+  all report promotion, demotion, eviction, and free-buffer pressure in the
+  same timeline as query latency.
+- Compare storage-worker shapes: dedicated storage threads, owner-loop
+  integrated polling, and per-partition storage channels. Failure condition:
+  a shape reaches high bandwidth only by hiding queue wait, starving short
+  retained reads, or weakening invalidation ordering.
+- Add a WAL-plus-cold-read interference benchmark. Mix COPY/WAL writes,
+  cold partition reads, and retained hot reads on the same NVMe device.
+  Required output: whether writes inflate read p99, how admission reacts,
+  and which traffic class gets priority.
+- Treat every cold-tier route as a planner decision with a measured CPU/I/O
+  budget. A GPU route that saves CUDA time but burns excessive storage
+  submission CPU should lose to a CPU or host-memory route under pressure.
