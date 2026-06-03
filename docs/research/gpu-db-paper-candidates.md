@@ -648,9 +648,9 @@ Append new candidates here as each paper is processed.
   preemption and DPDK integration; useful as a follow-up to Arachne,
   Shenango, and Shinjuku for deciding whether GPU DB needs preemptive
   user-space request classes around long scans and short retained reads.
-- `queued` — **Achieving Microsecond-Scale Tail Latency Efficiently with
+- `reviewed` — **Achieving Microsecond-Scale Tail Latency Efficiently with
   Approximate Optimal Scheduling**, Iyer et al., SOSP 2023.
-  URL: `https://doi.org/10.1145/3600006.3613165`
+  URL: `https://doi.org/10.1145/3600006.3613136`
   PDF: `https://rishabh246.github.io/files/concord.pdf`
   Why: Concord is Skyloft's approximate-optimal scheduling comparison point;
   useful for deciding whether GPU DB should approximate processor-sharing
@@ -1168,6 +1168,19 @@ Append new candidates here as each paper is processed.
   Why: receiver-driven short-message transport and priority scheduling for
   datacenter RPCs; relevant to future GPU DB network admission and tail-latency
   budgeting once pgwire sessions are multiplexed over fewer IO workers.
+- `queued` — **Frequent Background Polling on a Shared Thread, Using
+  Lightweight Compiler Interrupts**, Basu, Montanari, and Eriksson, PLDI 2021.
+  URL: `https://doi.org/10.1145/3453483.3454049`
+  Why: Concord compares against this compiler-instrumented polling approach;
+  useful for deciding whether GPU DB should use explicit cooperative yield
+  probes, request-budget probes, or cheaper route-local cancellation checks
+  around long scans, refresh jobs, and mutation batches.
+- `queued` — **RPCValet: NI-Driven Tail-Aware Balancing of microsecond-scale
+  RPCs**, Sutherland et al., ASPLOS 2019.
+  URL: `https://doi.org/10.1145/3297858.3304050`
+  Why: Concord cites RPCValet as a JBSQ-style dispatcher placement point;
+  useful for comparing CPU-owned IO-worker scheduling with NIC-assisted
+  request steering, bounded per-worker queues, and response-path priorities.
 - `queued` — **Releasing Locks As Early As You Can: Reducing Contention of
   Hotspots by Violating Two-Phase Locking**, Guo, Wu, Yan, and Yu,
   SIGMOD 2021.

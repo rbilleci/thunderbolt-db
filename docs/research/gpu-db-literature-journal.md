@@ -15401,3 +15401,185 @@ subordinate to MVCC snapshot compatibility and WAL recovery.
   RID/generation indirection. Expected improvement: fewer index/resident
   metadata rewrites per committed update. Failure condition: extra indirection
   hurts p50 retained lookup latency more than it saves refresh work.
+
+### 2026-06-03 - Concord approximate optimal scheduling for microsecond tails
+
+**Citation:** Rishabh Iyer, Musa Unal, Marios Kogias, and George Candea.
+"Achieving Microsecond-Scale Tail Latency Efficiently with Approximate Optimal
+Scheduling." SOSP 2023. DOI: `10.1145/3600006.3613136`. Retrieved
+2026-06-03 from `https://rishabh246.github.io/files/concord.pdf`.
+
+**Category:** runtime / HFT / session scale.
+
+**Relevance tags:** tail latency; cooperative preemption; bounded local
+queues; JBSQ; dispatcher work stealing; request classes; microsecond
+scheduling; LevelDB; service-time dispersion; queueing overhead.
+
+**Core idea:** Concord argues that microsecond runtimes can keep most of the
+tail-latency benefit of theoretically optimal single-queue, preemptive
+scheduling without paying the full throughput cost of implementing those
+policies exactly. Instead of strict interrupt-driven preemption and a purely
+synchronous single queue, it approximates the same behavior with cooperative
+preemption, tiny per-worker queues, and a dispatcher that can run application
+work when all workers are already busy.
+
+The useful lesson for GPU DB is not "copy Concord as a serving runtime." It is
+that strict global scheduling mechanisms can be too expensive when request
+service times are measured in microseconds. A database runtime can preserve
+tail goals by giving short retained reads, long scans, mutation batches, and
+refresh jobs explicit scheduling points and bounded queues, while avoiding
+cache-coherence and interrupt costs on every hot request.
+
+**Concrete mechanisms:**
+
+- Concord uses an asymmetric model with one dispatcher and pinned worker
+  threads. The dispatcher has global scheduling visibility; workers own request
+  execution and local queue consumption.
+- Preemption notifications use a per-core dedicated cache line instead of
+  inter-processor interrupts. The dispatcher writes the line when a request
+  reaches its quantum; compiler-instrumented worker code polls the line,
+  yields, and lets the dispatcher requeue the preempted request.
+- The compiler inserts probes at function entries, around calls to
+  uninstrumented code, and at loop back-edges. The paper reports about 1%
+  average instrumentation overhead across benchmark suites and preemption
+  timing within a small window around a 5 microsecond quantum.
+- Preemption is safety-first: instrumented code avoids yielding in external
+  calls, and applications can expose lock-held state so the runtime does not
+  preempt inside critical sections.
+- Concord replaces a purely pull-based single queue with
+  Join-Bounded-Shortest-Queue. A central queue remains, but the dispatcher can
+  push into tiny per-worker queues; the evaluated default is JBSQ(2), intended
+  to hide dispatcher-worker communication delay without materially harming load
+  balance.
+- The dispatcher is work-conserving. When all per-worker queues are full, it
+  runs not-yet-started requests for one quantum using a more expensive
+  self-preempting instrumentation path, then resumes dispatching.
+- The API is event-shaped: `setup`, `setup_worker`, and `handle_request`.
+  A request is active on only one thread at a time, though preemption can move
+  it between workers over its lifetime.
+- Evaluation compares Concord with Shinjuku and Persephone on synthetic
+  service-time distributions and LevelDB. The paper reports up to 52% higher
+  microbenchmark throughput and up to 83% higher LevelDB throughput while
+  meeting the same tail-latency SLOs. For the LevelDB workload, GETs were about
+  600ns, PUT/DELETE about 2.3 microseconds, and SCANs about 500 microseconds.
+- The main limitations are source-code/LLVM requirements and the current
+  single-dispatcher design, which can bottleneck at higher core counts or very
+  short service times.
+
+**GPU DB mapping:** Concord maps directly to the planned runtime split between
+network IO workers, bounded command rings, read snapshot workers, GPU
+execution owners, and response rings. The first transferable idea is bounded
+local queueing: a retained-read worker or GPU execution owner should be able to
+hold a tiny queue of compatible work so it does not stall on every dispatcher
+handoff, but queue depth must be part of the tail-latency contract rather than
+an unbounded throughput knob.
+
+The second idea is cooperative scheduling at semantic safe points. GPU DB
+should not preempt arbitrary mutation, WAL, CUDA, or MVCC visibility code.
+Instead, long CPU scans, refresh jobs, COPY batches, and result encoding loops
+can expose explicit budget checks after safe chunks: after a WAL batch boundary,
+between resident partitions, after a key-vector batch, after a kernel launch
+or event wait, or after a response-buffer drain. That gives short retained
+reads a way to cut in without violating WAL-before-visibility or snapshot
+compatibility.
+
+The third idea is to treat service-time dispersion as an admission signal.
+Concord wins most when a workload mixes very short and very long requests.
+GPU DB has exactly that shape: point lookups from retained snapshots may be
+microseconds, while cold scans, refreshes, joins, and writes can occupy queues
+orders of magnitude longer. Runtime telemetry should therefore track request
+class, estimated service distribution, queue wait, budget-yield count, and
+preemption-disabled time.
+
+For 1M logical sessions, the dispatcher lesson is double-edged. A central
+dispatcher gives useful global visibility and can apply admission policy, but
+it can also become the bottleneck. GPU DB should likely use replicated
+dispatcher/owner domains keyed by relation, partition, device, or session
+shard, with each domain exposing a small set of comparable queue metrics to a
+higher-level admission controller.
+
+**Risks and mismatches:** Concord is an OS/runtime paper, not a database paper.
+Its correctness model does not include SQL transactions, WAL durability, MVCC
+visibility, DDL invalidation, CUDA stream ownership, or disk/NVMe tiering.
+Compiler instrumentation also assumes source availability and compiled code;
+that does not apply to arbitrary SQL expressions unless they are compiled into
+engine-owned loops or templates.
+
+GPU kernels are not cheaply preemptible in the same way as CPU code. The GPU DB
+mapping should use admission, chunk sizing, kernel boundaries, stream priority,
+and queue classes before assuming mid-kernel preemption. The single-dispatcher
+prototype is also not a 1M-session architecture by itself; it mainly informs
+per-domain scheduling mechanics and telemetry.
+
+**Benchmark candidates:**
+
+- Add a runtime microbenchmark with mixed retained point reads and long scans:
+  compare one global read queue, tiny per-worker queues, and classed queues.
+  Measure p50/p95/p99, throughput, worker idle time, queue depth, and
+  head-of-line blocking.
+- Instrument safe budget-yield points in CPU scan/result-encoding prototypes.
+  Proof gate: short retained reads keep their p99 target while long work makes
+  forward progress and SQL results remain identical.
+- Test JBSQ-like depth choices for retained read workers: depth 1, 2, 4, and
+  unbounded. Failure condition: deeper queues improve throughput only by
+  hiding unacceptable p99 or freshness lag.
+- Add service-time dispersion telemetry per route family: point lookup,
+  aggregate, cold scan, refresh, COPY batch, write transaction, and result
+  encode. Expected result: admission choices improve when they use classed
+  dispersion rather than one global queue length.
+- Simulate a work-conserving dispatcher for CPU-only query handling. Gate:
+  dispatcher work improves throughput under high load without delaying
+  preemption/admission decisions beyond the configured microsecond budget.
+- For GPU routes, benchmark cooperative chunking at kernel boundaries rather
+  than mid-kernel interruption: split a long scan into partition chunks and
+  measure launch overhead, fairness, queue wait, and total latency.
+
+### 2026-06-03 - Cross-paper synthesis: runtime queues need safe approximation boundaries
+
+Concord, Predicate Transfer, and Query Fresh all point to the same design
+track: expose explicit boundaries where expensive global work can be batched,
+approximated, or shared, but make those boundaries visible enough that database
+invariants still win.
+
+The converging tracks are:
+
+- **Safe-frontier scheduling.** Concord's cooperative yield points, Query
+  Fresh's WAL/replay boundaries, and Predicate Transfer's filter-build phase
+  all create places where work can pause, fan out, or replan without corrupting
+  correctness. GPU DB should name these frontiers in telemetry: WAL durable,
+  visibility published, resident generation valid, filter generation built,
+  kernel chunk complete, response batch drained.
+- **Tiny bounded queues over perfect global queues.** Concord shows that exact
+  single-queue/preemption semantics can cost too much at microsecond scale.
+  That reinforces bounded command/response rings and small worker-local queues,
+  provided each queue reports depth, wait time, compatibility key, and tail
+  impact.
+- **Shared preparatory work.** Predicate Transfer builds filters once before
+  the final join; Query Fresh replays shipped logs into shared fresh replicas;
+  Concord amortizes dispatcher decisions across local queues. The retained GPU
+  read path should look for same-shape shared work keyed by snapshot,
+  partition, route family, and generation.
+- **Durability and logical freshness are separate clocks.** Query Fresh makes
+  this explicit, and the other two papers imply the same rule: work that is
+  useful for speed must still be tagged with the visibility or route boundary
+  that made it safe.
+
+Category gaps after this batch: multi-tier placement has good coverage, but
+OLTP-specific larger-than-memory eviction and explicit hot/cold transaction
+movement still need more attention. Runtime scheduling is now well represented;
+the next high-value pick should lean toward storage-tier policy, transaction
+execution under contention, or MVCC/HTAP snapshot maintenance unless a very
+recent GPU storage paper is unusually relevant.
+
+Benchmark priorities:
+
+- Build one mixed-service runtime benchmark with retained point reads, long
+  scans, refresh work, and writes, then compare global queues, classed queues,
+  and tiny per-worker queues.
+- Add WAL/visibility/residency generation telemetry before optimizing commit
+  batching or resident refresh; otherwise throughput wins can hide unsafe
+  publication.
+- Prototype shared same-shape prework for filters or retained lookup batches,
+  with strict generation keys and invalidation checks.
+- Measure cold-tier and refresh work as schedulable classes, not background
+  noise, because they compete with the same queues needed by short sessions.
