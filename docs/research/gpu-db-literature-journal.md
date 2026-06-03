@@ -27347,3 +27347,199 @@ erase the benefit for one-off queries.
   `gpu_route_kernel_count`, `gpu_route_compile_ms`,
   `gpu_route_resource_class`, `gpu_route_concurrency_lane`, and
   `gpu_route_profile_generation`.
+
+### 2026-06-04 - GPU OLTP concurrency control needs conflict-aware launch policy
+
+**Citation:** Zihan Sun, Yuyu Luo, Yong Zhang, Chao Li, and
+Chunxiao Xing. "GPU-Accelerated OLTP: An In-Depth Analysis of
+Concurrency Control Schemes." arXiv:2406.10158, 2024; v2 dated
+2026. Retrieved 2026-06-04 from `https://arxiv.org/abs/2406.10158`
+and `https://arxiv.org/pdf/2406.10158`.
+
+**Category:** transaction processing / write path and concurrency
+control, with GPU execution / batching implications.
+
+**Relevance tags:** GPU OLTP; concurrency control; OCC; TicToc;
+Silo; MVCC; 2PL; conflict graph ordering; GaccO; GPUTx; warp
+density; block size; abort overhead; latch-free atomics; YCSB;
+TPC-C.
+
+**Core idea:** The paper builds gCCTB, a GPU concurrency-control
+testbed, and compares eight serializable schemes on YCSB and TPC-C:
+no-wait and wait-die 2PL, timestamp ordering, MVCC, Silo, TicToc,
+GPUTx, and GaccO. The most transferable result is that GPU OLTP is
+not simply "use the most GPU-specific protocol." CPU-oriented OCC
+schemes, especially TicToc and Silo, can outperform GPU-oriented
+conflict-graph schemes when contention and write ratio are low or
+moderate because graph-order preprocessing costs dominate. Under
+high-contention write-heavy workloads, GaccO becomes much stronger.
+
+For GPU DB, this argues for conflict-aware retained mutation and
+read-batch routing. A batch with low expected conflicts should not
+pay a heavyweight dependency-graph setup cost just because it is on
+the GPU. A hot-key, write-heavy batch may need a different route
+that serializes or stages conflicts explicitly. The runtime should
+therefore track conflict class, write ratio, and launch parameters
+as first-class route inputs.
+
+**Concrete mechanisms:**
+
+- gCCTB uses a batch model where the CPU coordinates table,
+  transaction, index, and CC-scheme setup, while the GPU executes
+  batches; each GPU worker thread executes one transaction and
+  retries until commit if conflicts abort it.
+- Transaction templates call a common interface (`TxStart`,
+  `TxEnd`, `Finalize`, and data access operations), letting the same
+  benchmark run against different CC implementations.
+- The framework uses NVRTC just-in-time code generation to combine
+  table schemas, indexes, transaction templates, and selected CC
+  scheme code without rebuilding the whole testbed.
+- GPU-side correctness checking records read, write, and commit
+  events, then verifies the event sequence on CPU by constructing a
+  conflict graph and detecting cycles.
+- GPU tables are row-store arrays resident in device memory for the
+  experiment. GPU indexes are sorted arrays with binary search;
+  insert and delete are out of scope.
+- The evaluation preloads table, index, request, update, and result
+  state into GPU memory, deliberately excluding PCIe transfer so the
+  measurements focus on GPU-side concurrency-control behavior.
+- The CPU-oriented schemes pack control metadata into 64-bit words
+  when possible and use latch-free `atomicCAS` loops plus memory
+  fences instead of separate spin locks for critical timestamp, lock,
+  and metadata updates.
+- The MVCC implementation keeps latest-version pointers and
+  preallocated history-version arrays. It enables non-blocking reads
+  but pays version-chain traversal and larger metadata costs.
+- Silo and TicToc both use OCC phases. The paper reports that TicToc
+  tends to beat Silo under writes because its separate read and write
+  timestamps reduce aborts.
+- GPUTx builds conflict ordering through access tables and ranks;
+  transactions with the same rank can run together. GaccO builds a
+  lock table and waits for current holders, treating reads and writes
+  to the same item as conflicts.
+- Warp density (`wd`) controls active worker threads per warp, and
+  block size (`bs`) controls warps per thread block. More active
+  threads does not always help: high `wd` can increase uncoalesced
+  access, intra-warp conflicts, and abort rate.
+- The paper's main findings include: CPU-oriented schemes can win at
+  low contention/write ratios; GaccO wins in high-conflict cases;
+  among CPU-oriented write workloads the observed order is roughly
+  TicToc > Silo > MVCC ~= TO > 2PL; conflict-resolution overhead is
+  the decisive GPU cost; and latch-free atomic update paths can
+  materially improve OCC.
+
+**GPU DB mapping:** The immediate design takeaway is to split
+"GPU batch" from "GPU dependency graph." Retained lookup, update,
+or stored-procedure batches should first estimate write ratio and
+conflict shape from route telemetry: hot-key histogram, observed
+abort/fallback rate, key-vector duplicates, partition owner wait,
+and snapshot generation. Low-conflict batches should be eligible for
+simple OCC-style validation or CPU-owner publication, while
+high-conflict write batches may need a GaccO-like staged lock/owner
+route or CPU serialization.
+
+The paper also makes launch policy part of transaction policy. GPU
+DB should not hard-code a maximum number of active transaction
+threads per warp. For retained point lookups and small writes, the
+best `wd`/`bs` choice may change with contention, memory locality,
+and whether conflict resolution or index lookup dominates. That maps
+to the existing command and GPU execution rings: each route profile
+should include launch parameters, conflict class, abort count,
+validation time, index lookup time, and queue wait, so the scheduler
+can pick a smaller low-latency batch, a denser throughput batch, or
+fallback.
+
+For MVCC and snapshot design, the result is a warning. MVCC's
+non-blocking reads are useful for mixed workloads, but version-chain
+metadata and traversal can erase the benefit on GPU if every
+transaction thread chases pointers or scans versions. P8 should keep
+visibility summaries, latest-visible row ids, or compact generation
+bitmaps near the GPU rather than naïvely porting CPU MVCC chains to
+device memory.
+
+The paper's validation mechanism is useful for benchmarking. A GPU
+DB conflict-correctness harness can record compact per-request
+events for experimental retained mutation routes, then verify
+serializability or snapshot equivalence offline. That gives a way to
+try aggressive batching without weakening WAL-before-visibility in
+the production path.
+
+**Risks and mismatches:** The evaluation intentionally excludes
+host/device transfer, protocol encoding, WAL flush, insert/delete,
+dynamic index maintenance, DDL, and recovery. Its GPU data remains
+resident and fixed-size, while GPU DB must handle WAL-backed CPU
+truth, refresh, invalidation, eviction, and pgwire response ordering.
+The paper's MVCC is a straightforward TO-derived design, not a full
+production MVCC engine with vacuum, long-reader management, or
+snapshot routing.
+
+The benchmark transactions use known read/write operations, which
+fits batch GPU experiments better than arbitrary interactive SQL.
+GPU DB can use that assumption for stored procedures, COPY-derived
+micro-batches, and repeated same-shape retained routes, but not for
+general ad hoc transactions unless planning can safely extract the
+access pattern.
+
+**Benchmark candidates:**
+
+- Add a GPU retained-mutation simulation that compares three routes
+  for batched key updates: CPU-owner serialization, OCC-style GPU
+  validation, and explicit hot-key conflict staging. Metrics:
+  throughput, p50/p99, abort rate, validation time, queue wait, and
+  WAL publication delay.
+- Add a route classifier keyed by observed write ratio, duplicate-key
+  rate, hot-partition wait, and previous abort/fallback rate. Gate:
+  the classifier must choose CPU fallback or simple OCC for
+  low-conflict batches and hot-key staging for high-conflict batches
+  without changing visible results.
+- After the new GPU arrives, sweep retained lookup/update kernels
+  across active threads per warp and warps per block. Required
+  telemetry: launch parameters, index lookup time, validation time,
+  abort count, memory-stall counters if available, and p99 latency.
+- Compare GPU visibility mechanisms: direct MVCC chain traversal,
+  latest-visible row-id summary, generation bitmap, and CPU-side
+  visibility filter plus GPU payload fetch. Failure condition: a
+  GPU MVCC path reduces aborts but loses to compact summaries due to
+  pointer chasing or metadata traffic.
+- Build an offline conflict-event checker for experimental retained
+  mutation batches. It should record read/write/commit events and
+  verify serial order or snapshot equivalence without becoming part
+  of the production hot path.
+- Track `gpu_txn_write_ratio`, `gpu_txn_duplicate_key_ratio`,
+  `gpu_txn_conflict_class`, `gpu_txn_abort_count`,
+  `gpu_txn_validation_us`, `gpu_txn_index_lookup_us`,
+  `gpu_txn_launch_wd`, `gpu_txn_launch_bs`,
+  `gpu_txn_visibility_probe_us`, and `gpu_txn_publication_lag_us`.
+
+### 2026-06-04 - Cross-paper synthesis: GPU routes need separate resource, conflict, and visibility classes
+
+OLTPim, Revisiting Query Performance in GPU Database Systems, and
+GPU-Accelerated OLTP converge on the same rule from different
+directions: acceleration routes need a compact profile before they
+need a more clever kernel. OLTPim asks where metadata should live
+relative to CPU truth and near-memory request costs. The GPU query
+performance study asks whether a query is DRAM-bound, L2-bound,
+compute-bound, or setup/materialization-bound. The GPU OLTP CC
+study adds a third dimension: whether a batch is low-conflict,
+high-conflict, read-heavy, write-heavy, or dominated by validation
+and abort overhead.
+
+The design track that emerges is a three-class route contract:
+resource class, conflict class, and visibility class. Resource class
+prices HBM/DRAM/L2/transfer/setup behavior. Conflict class prices
+duplicate keys, hot owners, aborts, wait time, and validation cost.
+Visibility class states whether the route reads immutable snapshots,
+compact latest-visible summaries, direct MVCC chains, or CPU-owned
+truth. A retained route should be admitted only when all three
+classes are known enough to choose batching, launch parameters,
+fallback, and overload semantics.
+
+Category gaps remain around production write publication and
+recovery. The reviewed papers give strong ideas for placement,
+profiling, batching, and conflict behavior, but they mostly avoid
+full WAL flush, pgwire response ordering, DDL invalidation, and
+dynamic index maintenance. The next benchmark priority should be a
+small WAL-safe retained-mutation lab that measures publication lag
+and conflict cost before any write becomes visible, followed by a
+visibility-summary benchmark that proves GPU reads match CPU MVCC
+truth without chasing full version chains.

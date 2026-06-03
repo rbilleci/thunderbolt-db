@@ -2325,3 +2325,38 @@ Append new candidates here as each paper is processed.
   Why: Revisiting GPU DB performance highlights memory stalls, skew, and cache
   behavior; this follow-up is relevant to GPU DB route choices under skewed
   retained lookup, join, and aggregation workloads.
+- `reviewed` — **GPU-Accelerated OLTP: An In-Depth Analysis of
+  Concurrency Control Schemes**, Sun et al., arXiv 2024; v2 2026.
+  URL: `https://arxiv.org/abs/2406.10158`
+  PDF: `https://arxiv.org/pdf/2406.10158`
+  Why: selected because the remaining ready queue skewed toward GPU analytics
+  and this modern GPU OLTP testbed directly compares OCC, MVCC, 2PL,
+  conflict-graph ordering, launch parameters, and conflict-resolution overhead
+  for batched transaction execution.
+- `queued` — **GaccO - A GPU-accelerated OLTP DBMS**, Boeschen and
+  Binnig, SIGMOD 2022.
+  URL: `https://doi.org/10.1145/3514221.3517876`
+  Metadata: `https://www.dfki.de/web/forschung/projekte-publikationen/publikation/14413`
+  Why: the GPU OLTP concurrency-control study identifies GaccO as the
+  strongest high-conflict/write-heavy GPU-oriented baseline; useful for
+  transaction batching, CPU/GPU co-execution, and conflict staging.
+- `queued` — **An Analysis of Concurrency Control Protocols for
+  In-Memory Databases with CCBench**, Tanabe et al., PVLDB 2020.
+  URL: `https://www.vldb.org/pvldb/vol13/p3531-tanabe.pdf`
+  DOI: `https://doi.org/10.14778/3424573.3424575`
+  Why: the GPU OLTP concurrency-control study contrasts against CPU CC
+  benchmarking gaps; CCBench is useful for separating CPU-owner concurrency
+  limits from GPU-specific SIMT and launch-parameter effects.
+- `queued` — **Engineering a High-Performance GPU B-Tree**, Awad et al.,
+  PPoPP 2019.
+  URL: `https://doi.org/10.1145/3293883.3295706`
+  PDF: `https://par.nsf.gov/servlets/purl/10101116`
+  Why: the GPU OLTP study finds index lookup can dominate low-contention
+  runs; a GPU B-tree gives a concrete follow-up for retained equality/range
+  indexes and batched lookup/update paths.
+- `queued` — **A GPU Multiversion B-Tree**, Awad, Porumbescu, and Owens,
+  PACT 2022.
+  URL: `https://openreview.net/forum?id=RJ95nyPhcp`
+  Why: the reviewed GPU OLTP paper warns that naive MVCC version-chain
+  traversal can erase read benefits; a GPU multiversion tree is a direct
+  follow-up for compact visibility-aware index structures.
