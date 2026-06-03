@@ -26785,3 +26785,216 @@ and future tiers require fresh measurements.
   `cold_io_outstanding`, `cold_syscalls_per_request`,
   `cold_index_bytes`, `cold_cache_hit_rate`, `cold_recovery_scan_bytes`,
   and `cold_route_tail_wait_us`.
+
+### 2026-06-04 - Bf-Tree variable-length mini-pages for larger-than-memory indexes
+
+**Citation:** Xiangpeng Hao and Badrish Chandramouli. "Bf-Tree: A
+Modern Read-Write-Optimized Concurrent Larger-Than-Memory Range
+Index." PVLDB 17(11):3442-3455, 2024.
+doi:10.14778/3681954.3682012. Retrieved 2026-06-04 from
+`https://www.vldb.org/pvldb/vol17/p3442-hao.pdf`.
+
+**Category:** multi-tier cache / data placement, with write-path and
+range-index implications.
+
+**Relevance tags:** larger-than-memory indexes; variable-length buffer
+pool; record-level cache; write buffering; range scans; NVMe;
+io_uring; page/record granularity; hot/cold promotion; WAL and
+checkpoint compatibility.
+
+**Core idea:** Bf-Tree attacks a granularity mismatch in traditional
+larger-than-memory B-trees: disk pages are usually the right size for
+block IO, but they are too large as the unit of cache admission and
+writeback when only a few records are hot or updated. Instead of
+treating an in-memory page as a mirror of a 4KB leaf page, Bf-Tree
+introduces variable-length in-memory "mini-pages" associated with
+leaf pages. A mini-page can be a tiny record-level cache, a write
+buffer for recent updates, a cached negative lookup/range gap, or a
+full-page mirror when range scans make spatial locality valuable.
+
+The design tries to cover the point lookup, scan, and update corners
+with one cache structure rather than separate row cache, page cache,
+and write buffer components that compete for memory. The paper's
+evaluation reports that Bf-Tree is faster than RocksDB for scans, faster
+than a conventional B-tree for writes, and faster than both for point
+lookups on the tested YCSB-like larger-than-memory workloads. The
+absolute numbers depend on the implementation and hardware, but the
+transferable mechanism is the cache/writeback unit: cache granularity
+should be semantic and variable, while durable leaf pages remain a
+separate physical IO unit.
+
+**Concrete mechanisms:**
+
+- Each disk leaf page can have at most one associated in-memory
+  mini-page. Inner nodes are normally pinned in memory, while the
+  buffer pool manages mini-pages for leaves.
+- Mini-pages and leaf pages share a sorted key/value layout. The same
+  implementation supports binary search, insertion, prefix
+  compression, fence keys, and look-ahead bytes for both structures.
+- Writes first insert into the mini-page. A new mini-page can start at
+  a small cache-line-sized allocation; if full, it grows by allocating a
+  larger mini-page and copying the old contents. If it grows too large
+  or is evicted, dirty records are merged into the disk leaf page.
+- Reads first search the mini-page. If the record is absent, Bf-Tree
+  reads the leaf page from disk and, with a small probability in the
+  implementation, inserts the record into the mini-page so recurring
+  hot records can terminate in memory.
+- Range scans merge results from the mini-page and leaf page. A
+  frequently scanned mini-page may grow to a full-page mirror, letting
+  the same memory budget behave like a page cache when scans are the
+  hot route.
+- Negative lookups can insert phantom records into the mini-page so
+  repeated misses do not require repeated leaf-page IO. Deletes insert
+  tombstones, and updates insert dirty replacement records.
+- The variable-length buffer pool is built as a fixed-size circular
+  buffer. Allocations advance a tail pointer; freed regions go to
+  size-class free lists; eviction advances the head after merging dirty
+  mini-pages.
+- A second-chance region protects hot mini-pages from eviction. When
+  a mini-page is accessed there, it is copied to the tail, cold records
+  are dropped or merged, and reference bits are cleared for the next
+  cycle.
+- Growing and shrinking a mini-page is read-copy-update style:
+  allocate a new chunk, copy contents, update the mapping, and place
+  the old region on a free list.
+- The mapping table maps logical page ids to either mini-page memory
+  addresses or leaf-page disk offsets and packs a small reader-writer
+  lock with the address word.
+- Inner nodes use optimistic latch coupling because they are read
+  frequently but rarely modified.
+- Bf-Tree uses direct IO through io_uring kernel polling in the
+  evaluation, bypassing the OS page cache.
+- The paper says Bf-Tree is compatible with standard WAL,
+  snapshotting, and recovery. The implementation includes simple
+  ARIES-style physiological logging; checkpointing can write dirty
+  mini-pages back and append mapping-table metadata; recovery loads
+  a snapshot and replays WAL.
+
+**GPU DB mapping:** Bf-Tree is directly relevant to P8's unresolved
+question of whether GPU DB should cache and evict whole CPU pages,
+whole cold segments, individual rows, or route-specific fragments. The
+paper's best transferable idea is to decouple durable IO granularity
+from hot-cache granularity. GPU DB can keep WAL/checkpoint/archive as
+durable authority, while allowing host-memory or future HBM-adjacent
+warm structures to hold variable-sized mini-segments: hot point keys,
+hot negative lookup gaps, recently updated rows, or full scan-friendly
+chunks.
+
+For the resident tier, this suggests an alternative to one-size resident
+column groups. A table partition could own a durable cold segment plus
+a variable-size warm delta/mini-segment that absorbs recent writes and
+hot reads until it is merged, refreshed, or promoted to GPU. Point
+lookups would check the mini-segment first, scans would either merge a
+small mini-segment with the base segment or promote the whole
+scan-range chunk, and repeated misses could be represented explicitly
+instead of rediscovered by CPU fallback.
+
+The circular-buffer buffer pool also maps well to owner-domain design.
+Rather than giving each logical session arbitrary allocations, a
+partition or residency owner can manage a fixed-byte warm buffer with
+observable head/tail movement, copy-on-access promotion, free-list
+reuse, dirty-record accounting, and eviction/merge telemetry. That
+fits the runtime's bounded ring and credit model: admission can reject
+or reroute work when warm mini-segment bytes, dirty merge backlog, or
+tail-copy traffic is saturated.
+
+Bf-Tree's range behavior is especially useful for avoiding a false
+choice between row cache and page cache. GPU DB should let cache units
+grow when the workload proves that spatial locality matters. For
+example, a repeated `WHERE key = ?` path might retain only records and
+negative gaps, while repeated prefix scans over a text column might
+grow into a full host/GPU chunk that preserves sorted layout and can be
+scanned or transferred as a single unit.
+
+The paper also reinforces that WAL-safe derived structures should be
+rebuildable. Bf-Tree logs enough to recover the durable state and can
+rebuild or replay the memory side. GPU DB should preserve the same
+separation: mini-segments, resident GPU chunks, and route caches are
+performance state tied to WAL/catalog generations, not independent
+durable truth.
+
+**Risks and mismatches:** Bf-Tree is a range-index/key-value storage
+engine, not an MVCC SQL engine with PostgreSQL-visible snapshot
+semantics. Its mini-pages represent key/value records, tombstones, and
+phantoms; GPU DB needs tuple visibility, table schema generations,
+NULL/text representation, DDL invalidation, and multi-column predicates.
+
+The paper disables logging for most baseline performance experiments,
+so throughput numbers should not be copied into WAL-bound GPU DB
+expectations. It also focuses on CPU/NVMe larger-than-memory indexing,
+not GPU HBM residency or GPU kernel execution. Variable-sized
+mini-segments can complicate GPU layout, coalesced memory access, and
+deterministic transfer sizing if they are sent directly to kernels.
+The safest first mapping is host-memory warm placement and refresh
+input, not immediate arbitrary-sized GPU resident pages.
+
+Concurrency and recovery details are implementation-specific. The
+paper uses Rust safety checks, locks in the mapping table, optimistic
+latches for inner nodes, and io_uring direct IO; GPU DB should still
+measure whether owner-thread serialization, lock-free metadata, or
+partition-local locks fit better with its WAL-before-visibility rule.
+
+**Benchmark candidates:**
+
+- Prototype a host-memory warm mini-segment per cold segment that can
+  hold dirty updates, cached point records, tombstones, and negative
+  lookup gaps. Gate: exact results match CPU MVCC truth across
+  inserts, updates, deletes, misses, and prefix/range scans.
+- Compare cache units for a larger-than-memory point workload:
+  whole cold segment, whole page/chunk, record-level cache, and
+  variable mini-segment. Metrics: cache hit rate, bytes admitted,
+  bytes evicted, merge bytes, p50/p95/p99 latency, and owner queue
+  wait.
+- Add a range-scan promotion benchmark where repeated scans cause a
+  mini-segment to grow into a scan-friendly full chunk. Failure
+  condition: point-cache policy starves scan locality or scan policy
+  pins cold records forever.
+- Measure WAL-safe dirty mini-segment merge: WAL is durable authority,
+  mini-segment state is rebuildable, and merge publication is tied to a
+  visibility/catalog generation. Gate: crash/replay invalidates stale
+  mini-segments and rebuilds visible rows deterministically.
+- Add negative-lookup caching for repeated point misses and prefix
+  gaps. Required proof: later inserts or updates invalidate the
+  negative record before any retained route can return a stale miss.
+- Sweep mini-segment byte budgets and copy-on-access policy under mixed
+  point, scan, and update workloads. Failure condition: the warm buffer
+  improves average latency but creates hidden p99 merge or tail-copy
+  spikes.
+- Track telemetry for `warm_mini_segment_bytes`,
+  `warm_mini_segment_dirty_bytes`, `warm_mini_segment_copy_bytes`,
+  `warm_mini_segment_merge_bytes`, `warm_negative_hits`,
+  `warm_scan_promotions`, `warm_eviction_merges`, and
+  `warm_route_stale_invalidations`.
+
+### 2026-06-04 - Cross-paper synthesis: warm state should be bounded, semantic, and visible
+
+The latest three reviews converge on a single design track across
+protocol output, cold storage, and larger-than-memory indexes. Client
+protocol redesign says result delivery needs bounded columnar chunks
+and response credits. KVell says cold-tier IO should be partition-owned,
+explicitly batched, and queue-depth-limited rather than hidden behind
+mmap or compaction. Bf-Tree says cached storage state should use
+semantic units that can be smaller or larger than durable IO pages.
+
+Together, they point to a "bounded semantic buffer" pattern for GPU DB:
+fixed-byte owner-managed pools, but variable logical contents. Response
+owners manage columnar response chunks. Cold-tier owners manage batched
+IO and rebuildable location/index state. Residency or partition owners
+manage warm mini-segments that may hold dirty records, cached hits,
+negative gaps, or full scan chunks. The common requirement is not a
+single page size; it is explicit ownership, visibility-generation tags,
+byte budgets, and backpressure telemetry.
+
+The main category gap remains transaction visibility under these warm
+states. The next reviews should keep pulling from MVCC scans,
+transaction repair/healing, adaptive concurrency control, and
+near-data OLTP so that mini-segments and response chunks do not become
+fast but snapshot-unsafe shortcuts.
+
+Benchmark priority should shift toward cross-route accounting:
+measure one mixed workload where a hot retained read, a cold point
+lookup, a repeated miss, a prefix scan, and a slow client all compete
+for owner pools. The pass condition is not merely better throughput.
+The system must identify the saturated boundary: response credits,
+warm mini-segment bytes, cold IO queue depth, merge backlog, GPU
+execution queue, or WAL/visibility publication.

@@ -2187,7 +2187,7 @@ Append new candidates here as each paper is processed.
   Why: ActivePointers cites GPU page-placement work as nearby hardware memory
   management; useful for comparing explicit DB-owned placement with
   hardware/runtime page placement across GPU, host, and future memory tiers.
-- `queued` — **Bf-Tree: A Modern Read-Write-Optimized Concurrent
+- `reviewed` — **Bf-Tree: A Modern Read-Write-Optimized Concurrent
   Larger-Than-Memory Range Index**, Hao and Chandramouli, PVLDB 2024.
   URL: `https://www.vldb.org/pvldb/vol17/p3442-hao.pdf`
   DOI: `https://doi.org/10.14778/3681954.3682012`
@@ -2250,6 +2250,16 @@ Append new candidates here as each paper is processed.
   latch-free range-index designs; BzTree is a relevant follow-up for
   hot-tier range indexes, NVM/future-tier persistence, and migration-safe
   updates.
+- `queued` — **No Cap, This Memory Slaps: Breaking Through the Memory Wall
+  of Transactional Database Systems with Processing-in-Memory**, Kim,
+  Zhao, Pavlo, and Gibbons, PVLDB 2025.
+  URL: `https://www.vldb.org/pvldb/vol18/p4241-kim.pdf`
+  DOI: `https://doi.org/10.14778/3749646.3749690`
+  Artifact: `https://github.com/hyoungjook/OLTPim`
+  Why: modern OLTP near-data-processing design that splits tuple data,
+  indexes, MVCC metadata, batching, and logging across CPU DRAM and PIM;
+  useful for comparing GPU DB's future GPU/HBM, host-memory, and
+  near-memory owner placement decisions.
 - `queued` — **HetCache: Synergising NVMe Storage and GPU Acceleration for
   Memory-Efficient Analytics**, Nicholson, Raza, Chrysogelos, and Ailamaki,
   CIDR 2023.
