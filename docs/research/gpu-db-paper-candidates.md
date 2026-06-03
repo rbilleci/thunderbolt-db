@@ -312,9 +312,10 @@ Append new candidates here as each paper is processed.
   URL: `https://doi.org/10.1145/2785956.2787510`
   Why: eRPC's congestion-control path builds on Timely; useful for deciding
   whether GPU DB network admission should use RTT/queue-delay telemetry.
-- `queued` — **Shinjuku: Preemptive Scheduling for microsecond-scale Tail
-  Latency**, Kaur et al., NSDI 2019.
-  URL: `https://www.usenix.org/conference/nsdi19/presentation/kagami`
+- `reviewed` — **Shinjuku: Preemptive Scheduling for microsecond-scale Tail
+  Latency**, Kaffes et al., NSDI 2019.
+  URL: `https://www.usenix.org/conference/nsdi19/presentation/kaffes`
+  PDF: `https://www.usenix.org/system/files/nsdi19-kaffes.pdf`
   Why: microsecond-scale request scheduling and preemption; relevant to
   separating short retained reads from long mutation, scan, or refresh work.
 - `reviewed` — **Memory-Optimized Multi-Version Concurrency Control for
@@ -710,3 +711,9 @@ Append new candidates here as each paper is processed.
   Why: modern learned-optimizer diagnostic work; useful after LOGER/PARQO
   coverage to keep learned GPU route suggestions explainable, bounded, and
   testable instead of treating model output as an opaque planner authority.
+- `queued` — **RackSched: A Microsecond-Scale Scheduler for Rack-Scale
+  Computers**, Sreekanti et al., arXiv 2020.
+  URL: `https://arxiv.org/abs/2010.05969`
+  Why: Shinjuku follow-up direction for rack-scale request scheduling;
+  relevant to comparing centralized, partitioned, and rack-aware admission
+  when GPU DB eventually spans multiple owners, devices, or nodes.

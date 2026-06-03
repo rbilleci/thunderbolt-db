@@ -6038,3 +6038,150 @@ throughput, and fallback reason. Category gaps remain around learned
 optimizer diagnostics and learned concurrency-control policy, but those
 should be reviewed with the same question: what bounded action can be
 learned without surrendering invariants?
+
+### 2026-06-03 - Shinjuku microsecond-scale preemptive scheduling
+
+**Citation:** Kostis Kaffes, Timothy Chong, Jack Tigar Humphries,
+Adam Belay, David Mazieres, and Christos Kozyrakis. "Shinjuku:
+Preemptive Scheduling for microsecond-scale Tail Latency." NSDI 2019,
+pp. 345-360. Retrieved 2026-06-03 from the USENIX publication page and
+PDF, `https://www.usenix.org/conference/nsdi19/presentation/kaffes`
+and `https://www.usenix.org/system/files/nsdi19-kaffes.pdf`.
+
+**Category:** runtime / HFT / session scale.
+
+**Relevance tags:** microsecond scheduling; tail latency; preemption;
+centralized dispatch; request-class queues; head-of-line blocking;
+network/runtime split; low-overhead context switch; mixed point/range
+queries; session admission.
+
+**Core idea:** Shinjuku argues that low-latency datacenter runtimes
+should not assume run-to-completion workers are enough. IX-style
+distributed first-come-first-served queues and ZygOS-style work
+stealing do well when service times are uniform, but they let short
+requests sit behind long requests when the workload is bimodal,
+heavy-tailed, or mixed. Shinjuku separates network processing from
+request scheduling, funnels request work through centralized
+dispatcher state, and uses virtualization-assisted interrupts to
+preempt running request contexts every 5 to 15 microseconds when
+needed.
+
+The database-relevant result is the RocksDB experiment. With a 99.5%
+GET and 0.5% SCAN(1000) mix, Shinjuku reports up to 6.6x higher
+throughput and 88% lower tail latency than ZygOS at the same target.
+The transfer is not the exact OS design; it is the scheduling lesson:
+short retained reads must not be trapped behind long scans, refreshes,
+COPY work, mutation batches, or over-resident transfers just because
+they arrived on the same worker, connection, owner queue, or GPU stream.
+
+**Concrete mechanisms:**
+
+- Network protocol work identifies request boundaries, then passes
+  requests to one or more dispatcher threads. Workers execute
+  application request contexts; network replies may be handled by the
+  networking subsystem or workers.
+- The simplest policy uses one centralized queue. Requests that exceed
+  a configured quantum are preempted if queued work exists, then placed
+  back at the head or tail depending on whether the workload should
+  approximate centralized FCFS or processor sharing.
+- The multi-queue policy keeps one queue per request type, each with a
+  target tail-latency SLO. Queue choice uses the ratio of head request
+  waiting time to that queue's SLO, so short-SLO work is favored early
+  while long-SLO work eventually ages into service.
+- Preemption is implemented with Dune/x86 virtualization support and
+  optimized inter-processor interrupt delivery. The paper reports 298
+  cycles sender overhead and 1,212 cycles receiver overhead for its
+  optimized interrupt path.
+- Worker context switches avoid expensive signal-mask and unnecessary
+  floating-point save/restore work, reducing context-switch cost to
+  tens of cycles in the measured cases.
+- Dispatcher/worker communication uses shared cache-line pairs rather
+  than general queues. The paper reports about 211 cycles round-trip
+  message latency and estimates a high request-rate ceiling for the
+  dispatcher's minimal pointer-passing work.
+- A single dispatcher is reported to schedule about 5M requests/sec
+  across one socket in the synthetic stress test; two dispatchers reach
+  about 9.5M requests/sec across two sockets.
+- Shinjuku reduces dependence on high connection counts. RSS only needs
+  to distribute traffic across dispatchers, not across every worker, so
+  a single-dispatcher configuration can operate efficiently with very
+  few client flows.
+- Preemption is deliberately disabled around non-thread-safe code and
+  allocation paths in the prototype; the paper notes that long time
+  spent in such sections can still harm tail latency.
+
+**GPU DB mapping:** This is a direct follow-up to the current
+`11-high-throughput-query-runtime.md` target. The runtime should
+classify requests by shape and tail-latency budget before they enter a
+shared execution bottleneck. Retained point lookups, small aggregates,
+COPY chunks, mutation work, refreshes, over-resident scans, CPU
+fallbacks, and response encoding should not all share one FIFO path
+unless the system can prove their service-time distribution is
+compatible.
+
+The multi-queue policy maps naturally to route descriptors. A retained
+`COUNT(*)` or key lookup can carry a short SLO and a small queue budget;
+refresh, scan, and COPY work can carry larger budgets. Queue selection
+can then age long work without letting it monopolize short reads. This
+does not require arbitrary SQL preemption at first. The first
+benchmarkable version can preempt at cooperative boundaries already
+visible to GPU DB: before launching a kernel, between over-resident
+chunks, between COPY chunks, before response encoding, or between
+resident refresh partitions.
+
+For GPU execution, Shinjuku warns against one non-preemptive stream or
+owner queue for mixed service times. GPU DB probably cannot interrupt a
+running CUDA kernel cheaply, so the production analog is smaller
+bounded chunks, separate queues by route class, latency ceilings for
+micro-batches, and explicit yield points before long transfers or
+multi-partition scans. The dispatcher lesson also supports keeping
+network IO workers separate from request scheduling and engine owners:
+network readiness should not be the scheduling policy for database
+work.
+
+The connection-count result matters for the 1M logical-session target.
+The engine should not depend on RSS-style even distribution across many
+active flows. Idle or low-rate sessions should be multiplexed through
+compact IO state, then admitted into a much smaller set of active
+runtime queues with credits and route-aware scheduling.
+
+**Risks and mismatches:** Shinjuku is a single-address-space OS
+prototype, not a PostgreSQL-compatible database runtime. It relies on
+Dune, x86 virtualization support, optimized IPIs, and kernel-bypass
+style networking assumptions that the current GPU DB benchmark endpoint
+does not use. Its preemption applies to CPU request contexts, not
+in-flight CUDA kernels, WAL fsyncs, blocking disk IO, or arbitrary SQL
+operators holding database locks. Disabling interrupts around unsafe
+code and allocation is a warning: any GPU DB critical section that
+cannot yield may dominate p99 even if the scheduler is otherwise good.
+The RocksDB workload is a key-value GET/SCAN mix in memory, so the
+absolute numbers should not be projected onto SQL, MVCC, or GPU
+execution. The safe transfer is queue discipline and cooperative
+preemption boundaries, not the full OS mechanism.
+
+**Benchmark candidates:**
+
+- Add route-class queue telemetry to the pgwire endpoint: retained
+  point read, retained aggregate, COPY chunk, mutation, refresh,
+  over-resident scan, CPU fallback, and response encode. Minimum gate:
+  no behavior change, with p50/p95/p99 queue wait broken out by class.
+- Build a two-class retained benchmark: 99.5% short point reads mixed
+  with 0.5% long resident or over-resident scans. Compare single FIFO,
+  class queues without preemption, and class queues with cooperative
+  yield between scan chunks. Failure condition: short-read p99 remains
+  dominated by long scan service time.
+- Add latency-budget fields to route descriptors and enforce a
+  micro-batch ceiling per class. Expected improvement: same-shape
+  batches still form under load, but short retained reads do not wait
+  behind refresh or scan batches beyond their budget.
+- Test cooperative GPU yield points by splitting one long scan or
+  refresh into bounded chunks and rechecking queue pressure between
+  chunks. Proof gate: identical SQL-visible result and explicit
+  accounting for extra launch/transfer overhead.
+- Run a session-distribution memory probe where many logical sessions
+  map to a small number of dispatch/admission queues. Required metrics:
+  bytes per idle session, active queue depth, route-class credits, and
+  overload reason when active work exceeds budget.
+- Negative control: homogeneous short retained lookups. Class queues and
+  scheduling metadata must not add measurable p50 regression compared
+  with the simple hot path when service times are uniform.
