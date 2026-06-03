@@ -17797,3 +17797,147 @@ speedups.
 - Add overload policy for deterministic merge pressure: if conflict graph
   size or SCC age crosses a budget, throttle admission at the relevant owner
   rather than allowing memory growth or hidden latency cliffs.
+
+### 2026-06-03 - Kepler robust parametric query optimization
+
+**Citation:** Lyric Doshi, Vincent Zhuang, Gaurav Jain, Ryan Marcus,
+Haoyu Huang, Deniz Altinbuken, Eugene Brevdo, and Campbell Fraser.
+"Kepler: Robust Learning for Faster Parametric Query Optimization."
+Proceedings of the ACM on Management of Data 1(1), Article 109, 2023.
+doi:10.1145/3588963. Retrieved 2026-06-03 from
+`https://arxiv.org/abs/2306.06798` and
+`https://arxiv.org/pdf/2306.06798`.
+
+**Category:** query optimization / planning.
+
+**Relevance tags:** parametric query optimization; route choice; learned
+planning; robust fallback; actual-execution training data; plan hints;
+cardinality perturbation; repeated SQL templates; tail latency.
+
+**Core idea:** Kepler narrows learned query optimization to a production-shaped
+problem: repeated parameterized query templates. Instead of trying to replace a
+whole optimizer, it generates a bounded candidate plan set per template,
+executes those candidates offline or on isolated training instances, and trains
+a small model to choose the fastest plan for new parameter bindings. When the
+model is not confident, it falls back to the built-in optimizer.
+
+The paper's central claim is that this template-local framing makes learned
+optimization both useful and safer. Row Count Evolution (RCE) discovers better
+plans by perturbing sub-plan cardinality estimates and asking the native
+optimizer to re-plan. Actual execution latency, not optimizer cost, labels the
+best plans. Spectral-normalized Neural Gaussian Process models then predict
+plans with calibrated uncertainty so the system can trade speedup for
+regression risk.
+
+**Concrete mechanisms:**
+
+- Kepler separates candidate generation from best-plan prediction for one SQL
+  template at a time. Each template owns its candidate plans, execution data,
+  and model, limiting cross-template regressions.
+- The trainer ingests query logs, groups parameter bindings by template,
+  generates candidate plans, executes template instances under candidate plan
+  hints, and deploys trained models to the production DBMS.
+- RCE starts from the optimizer's default plan, samples plans from the previous
+  generation, perturbs only sub-plan row counts that appear in those plans,
+  and feeds the perturbed estimates back into the optimizer to obtain child
+  plans.
+- RCE uses multiplicative perturbations over an exponentially spaced range,
+  matching the way cardinality-estimation errors are usually measured.
+- Candidate generation unions plans across many parameter bindings, then uses
+  actual execution measurements to prune a plan cover rather than trusting the
+  optimizer cost model to identify good candidates.
+- Kepler labels plan quality from real PostgreSQL executions. In the paper's
+  setup, each query-plan pair is run three times and the minimum warm-cache
+  latency is used as ground truth.
+- The deployed PostgreSQL integration uses TensorFlow Lite inference and
+  `pg_hint_plan` hints. Model inference is reported as usually under 5% of
+  PostgreSQL planning time and at most 30% in the measured Stack workload.
+- The model uses parameter values as features, including string embeddings,
+  and falls back to the default optimizer when predicted confidence is below a
+  threshold. The paper's default threshold is 0.9.
+- Robustness is measured as regression frequency: the fraction of test query
+  instances at least 10% slower than the default optimizer.
+- Evaluation uses PostgreSQL 13.5 on Stack and TPC-H variants. On Stack,
+  Kepler reports more than 1.2x model speedup for 64.4% of templates, more
+  than 2x for 32.2%, more than 10x for 14.9%, and more than 20x for 4.6%.
+- RCE finds over 2x speedup on 32 of 87 Stack templates and over 1.2x on 78 of
+  87 templates. It improves fewer TPC-H templates, which the authors attribute
+  to TPC-H being less parameter-sensitive.
+- Training cost is substantial: the paper reports an average of 39 CPU days of
+  query execution per template, and a released execution dataset totaling about
+  14.2 CPU years.
+
+**GPU DB mapping:** Kepler is most valuable as a route-choice design pattern,
+not as an instruction to put a neural optimizer in the critical path first. GPU
+DB already has repeated SQL shapes: retained lookups, filtered aggregates,
+COPY admission chunks, refresh builds, partitioned scans, and CPU/GPU fallback
+routes. These are parametric templates whose best route may depend on key
+distribution, selectivity, residency validity, queue depth, GPU memory
+pressure, batch size, and transfer cost.
+
+The immediate mapping is a per-template route cache. For each supported query
+shape, the planner can maintain a bounded candidate set: CPU tuple/index path,
+CPU columnar path, GPU resident scan, GPU resident key vector, over-resident
+streaming, compressed-host fallback, and reject/admit decisions under pressure.
+The first implementation can use deterministic rules, but Kepler suggests that
+actual execution traces should label which candidate route really won for
+specific parameter regions.
+
+RCE's cardinality perturbation maps to GPU route exploration. Instead of
+randomly mutating SQL plans broadly, the GPU DB can perturb the estimates that
+matter for hardware placement: expected row count, qualifying row count,
+resident bytes, H2D/D2H bytes, cache warmth, queue wait, batch size, and
+partition fan-out. Asking the existing planner to produce candidate routes
+under those perturbed estimates is safer than inventing unconstrained learned
+plans.
+
+The fallback mechanism maps directly to the runtime safety bar. A learned or
+statistical route selector may recommend a GPU resident path only when
+confidence is high and the route can prove snapshot, residency, and overload
+compatibility. Otherwise it should fall back to deterministic planning or a
+CPU owner path. "No silent regression" in Kepler becomes "no stale snapshot,
+unbounded queueing, or hidden latency cliff" in GPU DB.
+
+Kepler also suggests a benchmark discipline for the current P8 work. Every
+route decision should be evaluated against actual end-to-end latency, not only
+planner estimates or kernel time. A fast kernel can still lose when queue wait,
+transfer, response encoding, or refresh cost dominates. The training labels
+for future route selection should include those full-path measurements.
+
+**Risks and mismatches:** Kepler assumes frequently repeated templates and
+relatively stable system state. GPU DB's hardware, data placement, and queue
+pressure may change faster than PostgreSQL's in-memory Stack benchmark, so
+models trained on stale traces could make bad route choices unless residency
+generation, memory pressure, and queue-delay features are first-class inputs.
+The training cost is too high for early GPU DB development, especially while
+hardware is changing. Kepler optimizes read query plans, not WAL ordering,
+MVCC validation, snapshot publication, COPY admission, or GPU memory safety.
+Its PostgreSQL integration relies on plan hints; GPU DB will need explicit
+route alternatives and guardrails instead of opaque hint strings. Finally, the
+reported speedups come from CPU PostgreSQL workloads, so the transferable
+claim is robust per-template route selection from measured evidence, not the
+absolute speedup.
+
+**Benchmark candidates:**
+
+- Build a deterministic per-template route corpus for retained `COUNT`, lookup,
+  and scalar aggregate queries: CPU owner, CPU snapshot/index, GPU resident,
+  and overloaded fallback. Gate: each route records full-path latency,
+  queue wait, transfer bytes, result bytes, and correctness status.
+- Add a route replay harness that replays parameter bindings against candidate
+  routes and labels the fastest correct route from actual measurements. Failure
+  condition: labels use kernel time only or ignore fallback/rejection costs.
+- Prototype RCE-like route perturbation for GPU estimates: selectivity,
+  resident bytes, partition fan-out, H2D/D2H bytes, and queue wait. Gate:
+  perturbation discovers at least one non-default route that wins on a held-out
+  binding set without violating snapshot/residency checks.
+- Add a confidence-gated route selector stub that can only choose among
+  deterministic, already-validated route candidates. Gate: uncertain,
+  out-of-distribution, invalidated, or saturated cases fall back to the
+  deterministic planner.
+- Measure repeated-template route-cache reuse for pgwire workloads. Gate:
+  planning/route-selection overhead stays below 5% of current planning time
+  for hot retained shapes, echoing Kepler's inference-overhead target.
+- Track route regressions as a first-class metric: fraction of requests more
+  than 10% slower than deterministic baseline, plus stale-route prevention
+  count, fallback count, and overload rejection count.

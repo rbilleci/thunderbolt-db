@@ -544,12 +544,18 @@ Append new candidates here as each paper is processed.
   Why: PARQO-adjacent robust tuning work that may turn sensitive cardinality
   dimensions into actionable hints; useful for exposing why a GPU route,
   fallback route, or refresh decision is fragile.
-- `queued` — **Kepler: Robust Learning for Faster Parametric Query
+- `reviewed` — **Kepler: Robust Learning for Faster Parametric Query
   Optimization**, Doshi et al., PACMMOD/SIGMOD 2023.
   URL: `https://arxiv.org/abs/2306.06798`
   Why: robust parametric query optimization using executed-query evidence;
   useful as a contrast to PARQO's cost-model-based route cache for repeated
   SQL templates.
+- `queued` — **RankPQO: Learning-to-Rank for Parametric Query Optimization**,
+  Mo et al., PVLDB 2025.
+  URL: `https://www.vldb.org/pvldb/vol18/p863-mo.pdf`
+  Why: modern parametric query optimization follow-up cited around Kepler-style
+  route selection; useful for comparing fastest-plan classification against
+  ranking candidate CPU/GPU/tier routes.
 - `reviewed` — **Plor: General Transactions with Predictable, Low Tail
   Latency**, Chen et al., SIGMOD 2022.
   URL: `https://doi.org/10.1145/3514221.3517879`
