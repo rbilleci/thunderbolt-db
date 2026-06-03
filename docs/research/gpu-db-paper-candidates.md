@@ -1063,3 +1063,38 @@ Append new candidates here as each paper is processed.
   Why: BOHM-adjacent deterministic two-phase planning/execution design for
   many-core transaction processing; useful for comparing queue-oriented
   planning against owner-local placeholder-first MVCC batches.
+- `reviewed` — **A Wake-Up Call for Kernel-Bypass on Modern Hardware**,
+  Jasny et al., DaMoN 2025.
+  URL: `https://doi.org/10.1145/3736227.3736235`
+  PDF:
+  `https://www.cs.cit.tum.de/fileadmin/w00cfj/dis/papers/damon25_wake_up_call.pdf`
+  Why: concise modern evidence that kernel networking and storage stacks cannot
+  saturate 400G/800G NICs or PCIe Gen5 SSD arrays within realistic CPU budgets;
+  useful for deciding when GPU DB should move from epoll/io_uring proofs toward
+  kernel-bypass network or storage experiments.
+- `queued` — **Rapid Data Ingestion through DB-OS Co-design**, Lim et al.,
+  PACMMOD/SIGMOD 2025.
+  URL: `https://doi.org/10.1145/3709718`
+  Why: DB/OS prefetch and shared-memory coordination design for high-rate
+  ingestion; relevant to COPY admission, cold-partition prefetch, and deciding
+  how much data-movement timing information the DBMS should expose to lower
+  I/O layers.
+- `queued` — **Moving on From Group Commit: Autonomous Commit Enables High
+  Throughput and Low Latency on NVMe SSDs**, Nguyen et al., SIGMOD 2025.
+  URL: `https://doi.org/10.1145/3725311`
+  Why: DaMoN 2025 kernel-bypass paper cites it as a modern WAL/storage
+  follow-up; directly relevant to COPY admission, WAL flush scheduling, and
+  whether GPU DB should decouple commit progress from group-commit bottlenecks.
+- `queued` — **What Modern NVMe Storage Can Do, And How To Exploit It:
+  High-Performance I/O for High-Performance Storage Engines**, Haas and Leis,
+  PVLDB 2023.
+  URL: `https://www.vldb.org/pvldb/vol16/p2090-haas.pdf`
+  Why: primary storage-engine source behind the DaMoN 2025 SSD argument; useful
+  for sizing NVMe queue depth, IO granularity, direct IO, and CPU budgets before
+  GPU DB attempts over-resident cold-partition execution.
+- `queued` — **Databases on Modern Networks: A Decade of Research that now
+  comes into Practice**, Lerner et al., PVLDB 2023.
+  URL: `https://www.vldb.org/pvldb/vol16/p3894-lerner.pdf`
+  Why: modern survey and call-to-action for database/network co-design; useful
+  for organizing future pgwire, RDMA, DPDK, and application-specific transport
+  benchmark tracks.

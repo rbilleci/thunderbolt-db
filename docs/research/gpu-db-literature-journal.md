@@ -10954,3 +10954,206 @@ decisions instead of expecting query-kernel authors to place prefetches by hand.
   require a WAL-before-visibility proof where GPU-produced bytes are not made
   SQL-visible until the mutation owner has durable log evidence and has
   invalidated older resident generations.
+
+### 2026-06-03 - A Wake-Up Call for Kernel-Bypass on Modern Hardware
+
+**Citation:** Matthias Jasny, Muhammad El-Hindi, Tobias Ziegler, and
+Carsten Binnig. "A Wake-Up Call for Kernel-Bypass on Modern Hardware."
+DaMoN 2025. DOI: `10.1145/3736227.3736235`. Retrieved 2026-06-03 from
+the official author-hosted PDF,
+`https://www.cs.cit.tum.de/fileadmin/w00cfj/dis/papers/damon25_wake_up_call.pdf`.
+
+**Category:** runtime / HFT / session scale and multi-tier storage I/O.
+
+**Relevance tags:** kernel bypass; DPDK; RDMA; SPDK; io_uring; TCP overhead;
+400G networking; PCIe Gen5 NVMe; CPU cycles per request; pgwire ceiling;
+over-resident storage; WAL I/O; application-specific transport.
+
+**Core idea:** The paper argues that kernel bypass has moved from an optional
+optimization to a required architectural technique for I/O-heavy database
+systems on current hardware. The key claim is budgetary: modern NICs and NVMe
+arrays can deliver enough packets or I/Os that a traditional kernel stack
+spends more CPU cycles per operation than the machine can afford, even before
+the DBMS does useful work. That makes the paper a useful counterweight to
+"optimize the engine first" thinking. If the GPU DB engine returns a retained
+lookup in microseconds, pgwire, TCP, kernel sockets, WAL flush I/O, and cold
+partition reads can still dominate throughput and latency.
+
+The strongest transferable idea is to treat every external I/O boundary as a
+cycle-budgeted subsystem. GPU DB should not jump directly to DPDK, RDMA, or
+SPDK in the first production slice, but it should design queue ownership,
+buffer ownership, response rings, WAL admission, and cold-tier reads so that a
+kernel-bypass path can replace the ordinary Linux path without rewriting
+correctness-critical MVCC or residency logic.
+
+**Concrete mechanisms:**
+
+- The paper computes a packet-processing CPU budget for a 400 Gbit/s NIC:
+  a ConnectX-7 can handle about 280 million 64-byte messages per second, which
+  leaves roughly 686 CPU cycles per message on a 64-core 3 GHz server.
+- A simple 64-byte UDP transfer through the kernel stack costs about 4,032
+  cycles in the paper's perf breakdown. UDP and socket processing are the
+  largest pieces, but the important point is that overhead is spread across
+  driver, IP, UDP, sockets, copies, allocation, and other work, so one local
+  kernel tweak is unlikely to close the whole gap.
+- DPDK and RDMA-style user-space networking avoid system calls, context
+  switches, kernel/user copies, interrupt-driven processing, and generic
+  kernel memory-management paths. The paper reports roughly 40 cycles per
+  message for kernel-bypass messaging in its motivation comparison.
+- On the evaluated 400 Gbit/s setup, DPDK reaches the 64-byte message-rate
+  limit with about four cores, while kernel UDP does not saturate the link
+  even with 64 cores. For 8 KiB messages, the kernel can eventually saturate
+  bandwidth, but needs about sixteen times as many cores as DPDK.
+- Latency is dominated by software, not wire time. The paper measures about
+  1.2 us wire latency, about 13.7 us end-to-end kernel UDP transfer, and about
+  3.5 us with DPDK. RDMA write latency is the best baseline across message
+  sizes in the reported comparison.
+- AF_XDP is discussed as useful when work can stay inside eBPF, but the paper
+  says it was comparable to or worse than standard UDP for database-like cases
+  that still require user-space processing.
+- TCP remains expensive even over a DPDK-based stack. In the paper's F-Stack
+  comparison, TCP over DPDK behaves similarly to kernel TCP for aggregate
+  bandwidth, while raw DPDK has much lower overhead. The authors therefore ask
+  whether databases need all TCP/IP guarantees, or whether a database-specific
+  reliable protocol could preserve the guarantees that matter with less cost.
+- For storage, the paper uses eight PCIe Gen5 NVMe SSDs and computes a
+  theoretical budget of about 8.8K cycles per 4 KiB read I/O to saturate the
+  array using 64 cores. Kernel paths including `pread`, `libaio`, and
+  `io_uring` exceed that budget in their measurements.
+- `io_uring` with registered buffers and fixed file descriptors improves the
+  kernel path but is still much more expensive than user-space storage. Stock
+  SPDK and a minimal custom SPDK variant complete 4 KiB reads in about 294 and
+  183 cycles respectively in the paper.
+- In random-read throughput over the eight SSDs, SPDK-style paths reach the
+  measured peak of about 20.65M IOPS with one to two cores, while kernel paths
+  require many more cores and some do not reach the device limit.
+
+**GPU DB mapping:** For the current runtime target, this paper backs a clear
+sequence. First, keep the near-term Linux implementation honest with phase
+telemetry: socket receive, parse, ingress queue, owner/snapshot execution,
+GPU queue, response materialization, response queue, socket write, WAL flush,
+and storage prefetch should all have visible cycle or time budgets. Second,
+shape the runtime around bounded IO workers, command rings, response rings,
+reusable buffers, and ownership boundaries that can later sit on ordinary
+sockets, io_uring, DPDK, RDMA, or a custom transport.
+
+For the 1M logical-session target, the paper is a warning that sessions cannot
+scale as kernel-thread or TCP-heavy units of work. GPU DB needs logical
+sessions multiplexed onto a small number of IO workers with explicit
+outstanding-request credits and response-buffer budgets. A future bypass path
+should see stable database messages and buffers, not raw PostgreSQL frontend
+state scattered across per-client threads.
+
+For P8 storage, the storage half maps to cold partition and WAL questions.
+Over-resident execution should be able to compare ordinary buffered/direct
+Linux I/O, tuned `io_uring`, and eventually SPDK-style queue ownership using
+the same database cache-line descriptors and visibility generations. WAL
+admission needs the same discipline: before optimizing commit protocol or COPY
+parsing, measure whether kernel flush path, group commit, queue depth, or
+durable-write scheduling consumes the CPU/latency budget.
+
+The paper also connects to the AGILE review. AGILE moves storage issue and
+completion closer to GPU execution; Wake-Up Call argues that the host kernel
+path cannot cheaply saturate modern storage either. The combined design track
+is service-owned I/O: a GPU DB storage/execution owner should have bounded
+queue pairs, registered buffers, generation-tagged cache entries, and explicit
+completion progress, regardless of whether the first implementation is
+host-mediated or device/GPU initiated.
+
+**Risks and mismatches:** The paper is a five-page call-to-action with
+microbenchmarks, not a full DBMS design. It does not solve PostgreSQL wire
+compatibility, TLS, authentication, transaction ordering, WAL replay, MVCC
+visibility, stored-procedure safety, RDMA failure handling, or operational
+deployment. Raw DPDK is not reliable TCP, and the paper itself shows TCP
+semantics can erase much of the bypass advantage when implemented naively.
+
+The evaluated network path uses UDP-style microbenchmarks and specialized
+hardware. GPU DB's near-term users may run on ordinary Linux kernels, cloud
+NICs, and PostgreSQL clients where DPDK/RDMA deployment is unavailable or
+undesirable. The safe takeaway is therefore not "replace pgwire now." It is to
+make the production runtime narrow enough, measured enough, and buffer-owned
+enough that bypass can be tested when hardware and deployment justify it.
+
+**Benchmark candidates:**
+
+- Add a cycle-budgeted pgwire ceiling benchmark: retained point lookup with
+  tiny engine time, persistent clients, and phase metrics for socket read,
+  parse, ingress queue, owner/GPU work, materialization, response queue, and
+  socket write. Gate: p50/p99 latency and CPU/request must name the dominant
+  non-engine phase.
+- Build an IO-worker multiplexing proof before bypass: replace thread-per-
+  client serving with bounded IO workers, reusable response buffers, and
+  response rings. Required metrics: logical sessions, active sessions,
+  syscalls/request, context switches, bytes copied, queue wait, p99 latency,
+  and correctness under slow-client backpressure.
+- Compare ordinary sockets, tuned socket options, and `io_uring` for the same
+  retained-read workload before DPDK/RDMA. Failure condition: protocol
+  correctness, backpressure, or error handling becomes less observable.
+- Define a future transport abstraction around database messages, not pgwire
+  parser internals: request id, session id, statement/template id, snapshot
+  requirement, payload buffer, response buffer, and completion/error state.
+  Gate: ordinary pgwire and any bypass experiment can share the same admission
+  and response-ring accounting.
+- Add a WAL/storage I/O budget benchmark for COPY admission: measure cycles and
+  latency per durable chunk across current fsync path, direct I/O if available,
+  and `io_uring` registered-buffer experiments. Minimum proof: WAL-before-
+  visibility remains unchanged and results separate parser/index cost from
+  durable-write cost.
+- For over-resident P8, benchmark cold 4 KiB/64 KiB/segment reads through
+  ordinary Linux, tuned `io_uring`, and an SPDK simulator or prototype. Required
+  metrics: IOPS/GB/s, CPU cycles/I/O, queue depth, HBM/host staging bytes,
+  visibility-generation match, and p99 query latency.
+- Before any DPDK or RDMA route, write down which TCP guarantees GPU DB truly
+  needs for each path: client SQL sessions, inter-owner commands, WAL shipping,
+  and cold-tier storage service. Gate: no application-specific protocol can
+  weaken ordering, authentication, replay safety, or error reporting.
+
+### 2026-06-03 - Cross-paper synthesis: fast devices require explicit service ownership
+
+**Papers covered:** OLTP Through the Looking Glass 16 Years Later, AGILE:
+Lightweight and Efficient Asynchronous GPU-SSD Integration, and A Wake-Up Call
+for Kernel-Bypass on Modern Hardware.
+
+**Converging design tracks:**
+
+- **Communication and I/O are now engine work.** Looking Glass shows
+  client/server communication can dominate OLTP CPU time, AGILE shows
+  over-resident GPU execution needs explicit asynchronous storage progress, and
+  Wake-Up Call shows kernel networking and storage stacks can exceed the CPU
+  budget for current devices. GPU DB should budget protocol, WAL, and tier I/O
+  as core runtime components, not wrappers around CUDA kernels.
+- **Service ownership beats scattered polling.** All three papers point toward
+  owned service loops: network IO workers for sessions, GPU execution/storage
+  owners for cold-page requests and completions, and mutation/WAL owners for
+  durable visibility. Query kernels, pgwire handlers, and partition logic
+  should submit bounded work to these owners instead of each inventing its own
+  polling, buffer lifetime, or backpressure behavior.
+- **The first bypass is architectural, not deployment.** GPU DB can prepare for
+  DPDK/RDMA/SPDK/GPUDirect-style paths by using stable database messages,
+  registered or reusable buffers, generation-tagged cache descriptors, and
+  explicit completion states. The first implementation can still use ordinary
+  Linux while preserving a clean replacement boundary.
+- **Correctness metadata must travel with performance handles.** Fast I/O
+  paths are unsafe unless every buffer and cache line carries enough database
+  state: session/request id, table/partition/column identity, snapshot or WAL
+  boundary, visibility generation, invalidation state, and response ownership.
+
+**Category gaps:** Recent reviews now strongly cover runtime communication,
+kernel/storage I/O, and GPU over-resident execution. The next balancing move
+should return to transaction processing, MVCC/snapshot visibility, or write
+admission rather than another GPU-OLAP or general I/O paper. Good queued
+choices are Rapid Data Ingestion through DB-OS Co-design, Fast Serializable
+Multi-Version Concurrency Control, ERMIA, or Moving on From Group Commit.
+
+**Benchmark priorities:**
+
+- Create one end-to-end request budget table that includes pgwire CPU,
+  queue wait, owner/GPU execution, WAL/storage I/O, response write, and cold
+  tier movement. Treat any unmeasured segment as unknown, not free.
+- Build service-owned buffer pools for request, response, pinned host staging,
+  and cold-tier cache lines with explicit saturation counters.
+- Prove IO-worker multiplexing and response-ring backpressure under thousands
+  of logical sessions before attempting DPDK/RDMA.
+- For P8 over-resident work, test async prefetch and storage queue ownership
+  behind a visibility-generation cache descriptor before experimenting with
+  GPU-initiated or SPDK-backed production paths.
