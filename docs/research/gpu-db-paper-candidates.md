@@ -719,7 +719,7 @@ Append new candidates here as each paper is processed.
   Why: hybrid disk/in-memory transactional architecture cited by the Umbra
   MVCC paper; useful as a contrast point for hot working-set placement and
   contention reduction across CPU memory and durable storage.
-- `queued` — **Eiffel: Efficient and Flexible Software Packet Scheduling**,
+- `reviewed` — **Eiffel: Efficient and Flexible Software Packet Scheduling**,
   Saeed et al., NSDI 2019.
   URL: `https://www.usenix.org/conference/nsdi19/presentation/saeed`
   Why: SP-PIFO cites Eiffel as an alternative programmable scheduling design;
@@ -758,6 +758,18 @@ Append new candidates here as each paper is processed.
   PDF: `https://chenhao-ye.github.io/publication/polaris/polaris.pdf`
   Why: priority-aware OCC cited by PreemptDB; relevant to combining request
   priority with conflict handling instead of only changing worker scheduling.
+- `queued` — **Universal Packet Scheduling**, Mittal, Agarwal, Ratnasamy, and
+  Shenker, NSDI 2016.
+  URL: `https://www.usenix.org/conference/nsdi16/technical-sessions/presentation/mittal`
+  Why: Eiffel cites universal packet scheduling as a flexible scheduling
+  objective; useful for comparing request-ranking policies that emulate
+  shortest-job, deadline, and slack-aware queueing in GPU DB admission.
+- `queued` — **Andromeda: Performance, Isolation, and Velocity at Scale in
+  Cloud Network Virtualization**, Dalton et al., NSDI 2018.
+  URL: `https://www.usenix.org/conference/nsdi18/presentation/dalton`
+  Why: Eiffel motivates software scheduling at end hosts and virtualized
+  networks; Andromeda is a primary large-scale system source for isolation,
+  fast path design, and software/hardware network split tradeoffs.
 - `reviewed` — **MRVs: Enforcing Numeric Invariants in Parallel Updates to
   Hotspots with Randomized Splitting**, Faria and Pereira, PACMMOD/SIGMOD 2023.
   URL: `https://doi.org/10.1145/3588723`

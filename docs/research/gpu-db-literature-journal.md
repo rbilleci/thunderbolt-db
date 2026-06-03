@@ -25727,3 +25727,161 @@ or Bf-Tree.
   hot overlays, and compressed SSD-to-GPU streaming. Gate each route on
   explicit p50/p95 latency, throughput, refresh cost, and stale/fallback
   counters rather than aggregate throughput alone.
+
+### 2026-06-04 - Eiffel software packet scheduling for request admission
+
+**Citation:** Ahmed Saeed, Yimeng Zhao, Nandita Dukkipati, Ellen Zegura,
+Mostafa Ammar, Khaled Harras, and Amin Vahdat. "Eiffel: Efficient and
+Flexible Software Packet Scheduling." 16th USENIX Symposium on Networked
+Systems Design and Implementation (NSDI 2019), pages 17-32. Retrieved
+2026-06-04 from the USENIX page and official PDF at
+`https://www.usenix.org/conference/nsdi19/presentation/saeed` and
+`https://www.usenix.org/system/files/nsdi19-saeed.pdf`.
+
+**Category:** runtime / HFT / session scale, with admission-control and
+response-scheduling implications.
+
+**Relevance tags:** integer priority queues; bounded request scheduling;
+Find First Set; bitmap metadata; approximate priority queue; per-flow
+ranking; on-dequeue reranking; pacing; request/response rings; admission
+lanes; session fairness.
+
+**Core idea:** Eiffel observes that many scheduling ranks are integers and,
+at any instant, occupy a bounded moving range. Instead of using generic
+comparison-based priority queues, it uses bitmap-backed integer priority
+queues and CPU Find First Set operations to find the next eligible item with
+constant overhead for a configured queue. The paper then extends the PIFO
+programming model with per-flow ranking, on-dequeue reranking, and a single
+shaper priority queue so richer scheduling policies can be expressed without
+one expensive queue per policy or rate limit.
+
+The transferable idea for GPU DB is that admission and response ordering
+should not collapse into either FIFO or heavyweight heap scheduling. A
+million logical sessions need bounded, cache-friendly scheduling metadata:
+small integer ranks for deadlines, queue age, route class, snapshot
+generation, expected service time, and response-release eligibility. Eiffel
+is a good reminder that once ranks are quantized and observed as moving
+windows, the scheduler can be both programmable and cheap enough to sit on
+hot IO-worker or owner-domain paths.
+
+**Concrete mechanisms:**
+
+- Eiffel's circular FFS queue uses bucketed priorities plus bitmap
+  occupancy metadata. The primary queue covers the current rank range and a
+  secondary queue covers the immediately following range; the queues rotate
+  as the minimum supported rank advances.
+- Hierarchical FFS metadata supports large bucket counts with a small,
+  fixed number of bit operations for a configured queue. The paper treats
+  the configured bucket count as fixed for a scheduling policy, so the
+  per-operation overhead is independent of the number of queued packets.
+- The approximate gradient queue trades exact priority selection for lower
+  overhead in some highly occupied bucketed queues. Eiffel reports that
+  approximation had minimal network-wide impact for the simulated pFabric
+  workload, but the paper also notes that sparse queues increase search
+  overhead and priority-selection error.
+- Eiffel adds per-flow ranking to PIFO-style scheduling: packets for a flow
+  remain ordered within the flow, while a priority queue ranks flows rather
+  than individual packets.
+- It adds on-dequeue reranking, so both enqueue and dequeue events can update
+  a flow's rank. This matters for policies where service changes the rank,
+  such as shortest-remaining-work or largest-queue-first policies.
+- Arbitrary shaping is decoupled from work-conserving scheduling by using a
+  single shaper priority queue that assigns timestamp eligibility, avoiding a
+  separate queue per rate limit.
+- The kernel qdisc implementation focuses on queue-data-structure overhead
+  and timer-setting overhead. Efficient `SoonestDeadline` lookup lets the
+  scheduler set wakeups when needed instead of firing timers at fixed
+  intervals.
+- The userspace BESS implementation is busy-polling and batch-sensitive. The
+  authors found that flow batching and queue limits matter, using 10KB output
+  batches per flow and an empirical 32-packet per-flow queue cap in their
+  setup.
+- Evaluation claims include Eiffel outperforming FQ/pacing by a median 14x
+  and Carousel by 3x in CPU overhead for kernel shaping on EC2, and
+  sustaining line rate for 5x more pFabric flows than a binary-heap
+  implementation in BESS. An hClock result is referenced in the paper's
+  summary but details are in the extended version, not in the reviewed PDF.
+
+**GPU DB mapping:** GPU DB can use Eiffel's rank-window lesson for
+high-concurrency admission. Instead of a monolithic owner queue or per-session
+queues, IO workers can map each request into a small number of scheduler
+classes: mutation, retained lookup, resident scan, compressed over-resident
+scan, refresh, fallback, and response-release wait. Within each class,
+integer buckets can represent a deadline, queue-age band, expected service
+time, or release watermark. Bitmap metadata makes "next eligible work" cheap
+enough for hot rings.
+
+Per-flow ranking maps naturally to sessions, tenants, prepared-statement
+templates, or route families. A session's requests can remain ordered where
+protocol semantics require it, while the scheduler ranks the session or route
+family by deficit, priority, expected service time, or current dependency
+boundary. This avoids letting a single busy client fill the GPU execution ring
+with many individually ranked requests while still preserving in-session
+ordering.
+
+On-dequeue reranking is useful for GPU DB because service changes the route's
+state. After a mutation publishes a new visibility generation, after a GPU
+batch drains, or after a response watermark advances, the priority of pending
+work may change. A scheduler that can rerank on dequeue can promote requests
+that just became safe to release, demote routes whose snapshot became stale,
+or favor short retained lookups after a long scan consumed a service quantum.
+
+The single-shaper idea maps to admission pacing. GPU DB should be able to
+shape not only network egress, but also mutation owner entry, GPU kernel
+launches, refresh work, and compressed NVMe/GDS submits. A shared eligibility
+queue can enforce token-like budgets for several resources while the actual
+work-conserving queue still chooses among ready tasks.
+
+Eiffel also reinforces a mechanical-sympathy rule for the runtime document:
+queue precision is a tunable cost. GPU DB does not need nanosecond-perfect
+rank ordering for every request. It needs enough buckets to respect latency
+SLOs, correctness barriers, and fairness, plus telemetry showing occupancy,
+empty-bucket rate, rank error if approximation is used, and fallback or
+rejection reasons.
+
+**Risks and mismatches:** Eiffel schedules packets, not database
+transactions. It does not provide MVCC visibility, WAL ordering,
+transactional conflict detection, GPU memory placement, SQL planning, or
+durability. Its approximate priority queue cannot be used for correctness
+ordering such as WAL-before-visibility or strict response-release barriers.
+
+The paper's evaluation is also workload- and environment-specific: kernel
+qdisc shaping on EC2 and userspace BESS packet scheduling are not pgwire SQL
+sessions. The 10KB batch and 32-packet flow cap are empirical networking
+parameters, not direct database constants. GPU DB should treat them as
+evidence that batching and caps matter, not as imported thresholds.
+
+Integer bucket scheduling requires careful quantization. Too few buckets can
+hide important deadlines or release watermarks; too many buckets may waste
+cache and memory. Sparse queues can hurt approximate scheduling, and
+approximation can violate fairness or priority promises if applied without a
+bounded error contract.
+
+**Benchmark candidates:**
+
+- Prototype a host-side integer-bucket admission scheduler for retained read
+  requests with route class, snapshot generation, and deadline buckets. Gate:
+  same correctness as FIFO owner routing, lower queue-management CPU, and
+  explicit overflow/rejection telemetry.
+- Compare FIFO, binary heap, strict-priority lanes, and circular-FFS buckets
+  for response-ring release under 100K to 1M logical sessions. Required
+  metrics: p50/p95/p99 release latency, scheduler CPU, cache misses, queue
+  occupancy, and per-session fairness.
+- Add an on-dequeue reranking experiment where completed mutations,
+  refreshed snapshots, or response watermarks promote newly eligible retained
+  reads. Failure condition: reranking improves throughput by returning a
+  response before its advertised visibility/release boundary is safe.
+- Test per-session or per-template flow ranking for repeated retained lookups:
+  keep in-session order, rank flows by deficit or expected service time, and
+  scatter results back by request id. Gate: one hot client cannot starve
+  other sessions while compatible GPU micro-batches still form.
+- Evaluate bucket granularity for query deadlines and micro-batch windows,
+  such as 1us, 5us, 10us, 50us, and 100us bands. Required telemetry:
+  empty-bucket ratio, batch size, deadline miss rate, GPU launch count, and
+  scheduler overhead.
+- Use a single shaper-style eligibility queue for GPU kernel launches or GDS
+  submits. Gate: burst smoothing reduces p99 queue wait without lowering
+  steady-state throughput or hiding overload.
+- Keep approximate priority queues limited to non-correctness scheduling, such
+  as best-effort fairness among ready reads. Gate: rank error is measured and
+  bounded, and no WAL, snapshot, or response-release ordering depends on it.
