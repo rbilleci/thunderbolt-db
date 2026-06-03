@@ -373,7 +373,7 @@ Append new candidates here as each paper is processed.
   Preprint: `https://chenyoumin1993.github.io/papers/eurosys19-scalerpc.pdf`
   Why: ScaleRPC-style resource sharing over RDMA connection state may inform
   future session multiplexing and bounded transport resource budgets.
-- `queued` — **Carousel: Scalable Traffic Shaping at End Hosts**,
+- `reviewed` — **Carousel: Scalable Traffic Shaping at End Hosts**,
   Saeed et al., SIGCOMM 2017.
   URL: `https://doi.org/10.1145/3098822.3098852`
   Why: rate-limiter design used by eRPC; relevant to per-session admission,
@@ -384,6 +384,20 @@ Append new candidates here as each paper is processed.
   URL: `https://doi.org/10.1145/2785956.2787510`
   Why: eRPC's congestion-control path builds on Timely; useful for deciding
   whether GPU DB network admission should use RTT/queue-delay telemetry.
+- `queued` — **Programmable Packet Scheduling at Line Rate**, Sivaraman et al.,
+  SIGCOMM 2016.
+  URL: `https://doi.org/10.1145/2934872.2934899`
+  PDF: `https://people.csail.mit.edu/alizadeh/papers/pifo-sigcomm16.pdf`
+  Why: Carousel discusses PIFO as a programmable scheduling primitive; useful
+  for comparing time-wheel admission with rank-based response/request
+  scheduling when GPU DB needs more than simple pacing.
+- `queued` — **Programmable Packet Scheduling with a Single Queue**,
+  Alcoz, Dietmuller, and Vanbever, SIGCOMM 2021.
+  URL: `https://doi.org/10.1145/3452296.3472887`
+  PDF: `https://conferences.sigcomm.org/sigcomm/2021/files/papers/3452296.3472887.pdf`
+  Why: modern follow-up on approximating programmable scheduling with a single
+  FIFO-style queue; relevant to bounded high-concurrency response shaping
+  without expensive per-session queues.
 - `reviewed` — **Shinjuku: Preemptive Scheduling for microsecond-scale Tail
   Latency**, Kaffes et al., NSDI 2019.
   URL: `https://www.usenix.org/conference/nsdi19/presentation/kaffes`

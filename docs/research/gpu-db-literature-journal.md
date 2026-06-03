@@ -15863,3 +15863,188 @@ lazy migration may miss short-lived hot sets.
 - Compare range scans with and without a hot-record tier. The tier must not
   steal so much memory from column/partition pages that scans regress more than
   point lookups improve.
+
+### 2026-06-03 - Carousel time-indexed shaping for bounded session admission
+
+**Citation:** Ahmed Saeed, Nandita Dukkipati, Vytautas Valancius, Vinh The
+Lam, Carlo Contavalli, and Amin Vahdat. "Carousel: Scalable Traffic Shaping at
+End Hosts." SIGCOMM 2017. Retrieved 2026-06-03 from
+`https://saeed.github.io/files/carousel-sigcomm17.pdf`; DOI
+`https://doi.org/10.1145/3098822.3098852`.
+
+**Category:** runtime / HFT / session scale.
+
+**Relevance tags:** traffic shaping; rate limiting; pacing; timing wheel;
+deferred completions; backpressure; per-core ownership; lock-free coordination;
+response rings; session admission; incast; high connection count.
+
+**Core idea:** Carousel replaces per-flow or per-class token-bucket queues with
+a single time-indexed queue per CPU core. Each packet receives an earliest
+release timestamp from pacing and rate-limit policies, then the shaper releases
+due packets from a timing wheel. The key system lesson is that scalable
+admission is not just a rate formula; it also needs bounded queued work,
+backpressure to the producer, and ownership that avoids shared hot locks.
+
+For GPU DB, the strongest transferable idea is to shape work by release time
+and resource budget at the narrow boundary where saturation occurs: network
+egress, response encoding, mutation admission, read-snapshot execution, or GPU
+kernel dispatch. A million logical sessions cannot each own an unbounded queue
+or thread. They need small per-owner schedulers that can pace accepted work,
+delay completions, and expose overload before CPU memory, socket buffers, or
+GPU staging buffers fill.
+
+**Concrete mechanisms:**
+
+- Carousel computes packet timestamps from one or more policies. Each policy
+  advances a latest timestamp by packet length divided by the policy rate; the
+  final release time is the maximum timestamp so the packet does not violate
+  any active policy.
+- Packets are inserted into a timing wheel: a circular array of time slots,
+  where each slot holds a FIFO list of packet references due in that time
+  range. Insert and extract are O(1) for the intended shaping workload.
+- The wheel is configured by slot granularity and horizon. The paper gives an
+  example with 8 microsecond granularity and a 4 second horizon, yielding
+  500K slots for 1.5 Mbps minimum-rate support with 1500 byte packets.
+- Packets with release times beyond the horizon can either be placed at the
+  last slot, allowing temporary overshoot, or dropped when a hard limit is
+  required.
+- Carousel avoids per-packet allocation by using a preallocated global pool of
+  nodes. Each node can hold references to multiple packets, amortizing node
+  movement and avoiding `std::list` allocation cost.
+- Deferred Completions hold the producer completion signal until the shaped
+  packet actually leaves. This bounds the number of packets in the shaper and
+  pushes back through existing transport mechanisms instead of buffering or
+  dropping large backlogs.
+- The implementation supports out-of-order completions because shaped release
+  order can differ from arrival order. A driver-side map tracks outstanding
+  packets so completion can follow actual departure rather than original order.
+- Carousel stores packet references, not packet payloads. The paper reports
+  roughly 8 MB of shaper memory for one million outstanding packet references.
+- Scaling across cores uses one independent timing wheel per core. Connections
+  hash to a core-local shaper for lock-free enqueue/dequeue on the data path.
+- Shared aggregate rates across cores are handled by a NIC-level bandwidth
+  allocator that periodically redistributes rates using water filling. Updates
+  are lazy, around 100 ms in the implementation, to avoid locking each packet.
+- Receiver-side ingress shaping is possible by pacing acknowledgements rather
+  than buffering incoming data packets. The receiver emits ACK progress at the
+  configured rate to control sender behavior during incast.
+- In microbenchmarks, Carousel's timing-wheel overhead with the global pool is
+  reported around 11-12 ns per packet, versus 21-22 ns with `std::list`
+  slots, and is insensitive to the number of packets held.
+- Production video-serving experiments across 25 servers report about 6.4%
+  median and 8.2% 90th-percentile improvement in Gbps/CPU versus Linux
+  FQ/pacing, with similar retransmission rates. The paper attributes this to
+  lower networking CPU, larger batching, and lower shaping overhead.
+
+**GPU DB mapping:** The direct mapping is a time-wheel-like admission lane for
+high-concurrency request and response scheduling. The runtime already calls for
+bounded ingress, read snapshot, mutation, GPU execution, and response rings.
+Carousel adds a concrete policy: assign admitted work a release time or earliest
+service time based on per-class budgets, then drain due work from an O(1)
+time-indexed queue owned by one IO or execution worker.
+
+The response path is the cleanest first target. When many sessions produce
+same-shape retained results, response writes can burst and inflate socket
+buffers even if GPU execution is cheap. A per-IO-worker response timing wheel
+could pace large responses, COPY acknowledgements, or client classes while
+holding request credits until bytes are actually accepted by the socket. That
+mirrors Deferred Completions: do not free a session's request credit merely
+because the engine produced a row buffer; free it when the response lane has
+made observable progress.
+
+The mutation path can use the same idea at chunk boundaries. COPY or INSERT
+admission should publish credits only after WAL-safe chunks have been appended,
+invalidated, and made eligible for visibility. If the WAL, MVCC index, or
+resident invalidation lane is behind, producers should see bounded backpressure
+instead of building unlimited pending chunks.
+
+For GPU execution, Carousel argues against one queue per session or one lock
+around all retained reads. GPU DB can hash compatible retained work to
+partition/device/shape owners, pace work by queue depth and latency budget, and
+rebalance only through periodic aggregate budget updates. Shared fairness does
+not need per-request global locking.
+
+The ACK-shaping idea maps to logical-session admission. A protocol worker can
+delay readiness or request-credit advancement for sessions that are over budget
+instead of accepting more SQL messages and buffering them in memory. That is
+especially relevant for 1M logical sessions, where per-session memory must be
+nearly constant and small.
+
+**Risks and mismatches:** Carousel is a packet shaper, not a database runtime.
+It has no SQL transaction semantics, WAL, MVCC visibility, query cancellation,
+or GPU stream ownership. Its timestamp consolidation works for pacing and rate
+limits, but the paper explicitly says Carousel is not a generic scheduler; strict
+priority or preemptive scheduling needs different machinery.
+
+The production evaluation is video egress, not request/response OLTP. GPU DB
+must test whether time-slot granularity and horizon choices harm p50 query
+latency or create unfairness between tiny point lookups and large result sets.
+Deferred completions also require careful protocol integration: freeing a credit
+on engine completion instead of network write completion would lose the
+backpressure benefit, while freeing it too late could underutilize the engine.
+
+The per-core aggregate-rate rebalancer uses lazy updates around 100 ms, which is
+probably too slow for some microsecond-scale query lanes. GPU DB should treat
+that as a WAN/video-serving choice, not a fixed constant. Finally, a timing
+wheel can bunch work at slot boundaries; if many retained reads become due in
+one slot, the runtime still needs batch-size and latency ceilings.
+
+**Benchmark candidates:**
+
+- Build a response-ring admission benchmark with three modes: immediate credit
+  release on engine result, socket-write completion credit release, and
+  time-wheel-paced socket-write completion. Gate: lower p99 memory and queue
+  depth without reducing correct result throughput under many slow clients.
+- Add a synthetic 1M logical-session harness with a small active subset and
+  many idle sessions. Measure per-session bytes, IO-worker queue depth,
+  response backlog, and p50/p99 for retained point reads.
+- Prototype a per-IO-worker timing wheel for response chunks with 4, 8, 16, and
+  32 microsecond slots. Failure condition: slot batching increases p50 or p99
+  for tiny retained reads more than it reduces CPU or memory pressure.
+- Test deferred request credits: a session may send another request only after
+  the prior response is accepted by the response lane or an explicit pipeline
+  credit is returned. Gate: no unbounded pending SQL messages under slow-client
+  or overload conditions.
+- Compare one global admission queue, per-session queues, and per-owner
+  time-indexed queues for retained lookup bursts. Expected result: per-owner
+  queues preserve throughput while avoiding global lock and per-session memory
+  growth.
+- Add overload telemetry for each shaped lane: released items, delayed items,
+  horizon drops/rejections, slot occupancy, credit wait, and bytes held. A
+  route is not acceptable unless it can name the saturated lane.
+
+### 2026-06-03 - Cross-paper synthesis: hot placement still needs paced fronts
+
+FastMap, Tiered-Indexing, and Carousel point at the same production rule from
+different layers: fast hot paths fail when slow-path resources are allowed to
+accumulate invisibly. FastMap partitions page-cache metadata and writeback so
+fast storage does not collapse under global kernel locks. Tiered-Indexing moves
+hot records into access-method-owned tiers so skew does not waste page and
+buffer budgets. Carousel shapes packet release and producer credits so many
+flows do not turn efficient batching into memory blowup.
+
+For GPU DB, the converging design track is **budgeted owner fronts**. Every
+hot placement choice should have a matching admission front: HBM hot-key tiers
+need promotion/demotion budgets, cold NVMe partitions need IO queue budgets,
+and response rings need socket/protocol credit budgets. A resident route is not
+just "valid or invalid"; it should be valid, admitted, and paced by the owner
+that can see the scarce resource.
+
+The current category gap is still the write/MVCC boundary between these fronts.
+The queue has many strong tiering and runtime papers, but the next few reviews
+should keep pulling from logging, recovery, transaction-cache, and snapshot-GC
+work so paced hot reads do not outrun WAL-before-visibility or version cleanup.
+
+Benchmark priorities:
+
+- Pair every hot-tier experiment with an overload test: slow clients, cold
+  misses, invalidation storms, and memory pressure should produce named
+  rejection or delay reasons, not hidden queue growth.
+- Add one end-to-end "paced retained read" benchmark that reports GPU queue,
+  response queue, socket credit, HBM residency, and cold-tier wait separately.
+- Add one "skew plus mutation" benchmark where hot-key promotion competes with
+  WAL-safe invalidation and response pacing. The proof gate is no stale read,
+  bounded memory, and an explainable p99.
+- Track category balance by selecting the next paper from transaction logging,
+  MVCC GC, or runtime scheduling rather than another pure GPU-OLAP paper unless
+  the queue demands it.
