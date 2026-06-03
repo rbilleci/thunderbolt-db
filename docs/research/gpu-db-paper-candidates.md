@@ -418,12 +418,13 @@ Append new candidates here as each paper is processed.
   Why: modern whole-stack OLTP breakdown showing communication and isolation
   costs as dominant bottlenecks; directly relevant to pgwire/session
   admission, stored-procedure boundaries, and owner/runtime queue design.
-- `queued` — **Fast Failure Recovery for Main-Memory DBMSs on Multicores**,
-  Zheng et al., SIGMOD 2016.
-  URL: `https://doi.org/10.1145/2882903.2915239`
-  Why: Cicada cites parallel durability and recovery as the path for scalable
-  logging/checkpointing; useful for GPU DB WAL replay, checkpoint rebuild, and
-  post-crash CPU/GPU cache warmup design.
+- `reviewed` — **Fast Failure Recovery for Main-Memory DBMSs on Multicores**,
+  Wu et al., SIGMOD 2017.
+  URL: `https://doi.org/10.1145/3035918.3064011`
+  PDF: `https://yingjunwu.github.io/papers/sigmod2017.pdf`
+  Why: command-log recovery with static and dynamic dependency analysis;
+  useful for GPU DB WAL replay, checkpoint rebuild, and post-crash CPU/GPU
+  cache warmup design.
 - `queued` — **RUMA has it: Rewired User-space Memory Access is Possible!**,
   Schuhknecht et al., PVLDB 2016.
   URL: `https://www.vldb.org/pvldb/vol9/p768-schuhknecht.pdf`
@@ -829,6 +830,12 @@ Append new candidates here as each paper is processed.
   Why: distributed in-memory command/data logging tradeoff cited by Taurus;
   useful for deciding whether GPU DB should vary log payloads and recovery
   strategy by transaction class or partition.
+- `queued` — **Guaranteeing Recoverability via Partially Constrained
+  Transaction Logs**, Guo et al., arXiv 2019.
+  URL: `https://arxiv.org/abs/1901.06491`
+  Why: Poplar-style partial log ordering tracks RAW/WAW dependencies instead of
+  forcing one serial LSN stream; useful follow-up for per-owner GPU DB WAL
+  streams and parallel crash recovery.
 - `queued` — **Border-Collie: A Wait-free, Read-optimal Algorithm for
   Database Logging on Multicore Hardware**, Kim et al., SIGMOD 2019.
   URL: `https://doi.org/10.1145/3299869.3319869`

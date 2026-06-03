@@ -16048,3 +16048,162 @@ Benchmark priorities:
 - Track category balance by selecting the next paper from transaction logging,
   MVCC GC, or runtime scheduling rather than another pure GPU-OLAP paper unless
   the queue demands it.
+
+### 2026-06-03 - PACMAN parallel command-log recovery
+
+**Citation:** Yingjun Wu, Wentian Guo, Chee-Yong Chan, and Kian-Lee
+Tan. "Fast Failure Recovery for Main-Memory DBMSs on Multicores."
+SIGMOD 2017, pp. 267-281. doi:10.1145/3035918.3064011. Retrieved
+2026-06-03 from `https://yingjunwu.github.io/papers/sigmod2017.pdf`.
+
+**Category:** transaction processing / write path.
+
+**Relevance tags:** command logging; WAL replay; failure recovery;
+checkpointing; stored procedures; dependency analysis; recovery scheduling;
+parallel replay; owner domains; post-crash warmup.
+
+**Core idea:** PACMAN attacks the usual command-log tradeoff in main-memory
+OLTP systems. Tuple-level logging can replay in parallel but creates large
+runtime log volume; transaction-level or command logging records only a stored
+procedure id and parameter values, keeping the steady-state write path light
+but making crash replay look serial. PACMAN keeps the cheap command log and
+recovers parallelism by analyzing stored procedures ahead of time and using
+logged parameter values during recovery.
+
+The paper models recovery as ordered data-flow over a pre-crash commit order.
+Compile-time analysis decomposes stored procedures into dependency-respecting
+slices and integrates all procedures into a global dependency graph. Recovery
+then instantiates that graph for each log batch, uses runtime parameter values
+to discover which pieces really touch disjoint keys, and pipelines multiple
+log batches so later independent pieces can start before an earlier batch is
+fully replayed. In the TPC-C evaluation on a 40-core Peloton setup, serial
+command-log replay takes over 4,200 seconds after a 5-minute run, while the
+parallel command-log recovery variant is reported as 18x faster; with dynamic
+intra- and inter-batch parallelism, PACMAN's recovery time drops below
+300 seconds with 40 threads.
+
+**Concrete mechanisms:**
+
+- Transaction-level log records store the invoked stored-procedure identifier
+  and input parameter values. Log entries are grouped into ordered log batches;
+  batches are reloaded and processed in durable commit order.
+- PACMAN's static intra-procedure analysis extracts flow dependencies
+  including define-use and control dependencies, plus data dependencies where
+  operations touch the same table and at least one operation writes.
+- Stored procedures are split into slices. Mutually data-dependent operations
+  remain in the same slice, and flow-dependent spans keep the intervening
+  operations needed to preserve local ordering.
+- Each procedure receives a local dependency graph whose nodes are slices and
+  whose directed edges represent must-happen-before ordering.
+- Inter-procedure analysis merges slices from different procedures into a
+  global dependency graph when they may conflict. The resulting graph captures
+  ordering across procedure families, not just within one transaction template.
+- During recovery, each log-batch entry becomes transaction pieces
+  instantiated from the global graph. Pieces belonging to the same graph block
+  form a piece-set ordered by the transaction order in the batch.
+- To avoid excessive fine-grained synchronization, PACMAN initially coordinates
+  execution at the piece-set level instead of waking children after every piece.
+- Dynamic intra-batch analysis uses parameter values from log entries and from
+  already replayed pieces to identify concrete key spaces. Operations or pieces
+  inside a piece-set can run in parallel when they touch disjoint tuples and
+  have no flow dependency.
+- The paper calls out common read-modify-write and foreign-key access patterns
+  as cases where parameter-aware dynamic analysis can recover parallelism that
+  conservative static table-level dependency analysis hides.
+- Inter-batch pipelining lets a piece-set in a later log batch begin once its
+  dependent piece-sets in the same batch and the same block in the preceding
+  batch have completed, avoiding a full barrier between batches.
+- Recovery cores are assigned to graph blocks by estimating workload
+  distribution while reloading logs. Work inside each block can then be
+  dispatched across those assigned cores using dynamic conflict checks.
+- Ad-hoc or nondeterministic transactions fall back to tuple-level logical
+  logging. PACMAN treats their replay as write-only transaction pieces with
+  known write sets, preserving generality but losing some command-log benefit.
+- The evaluation reports that tuple-level recovery scales only up to a point
+  because recovery threads need latches on modified tuples; PACMAN schedules
+  replay order ahead of time and avoids those recovery latches.
+- In PACMAN's time breakdown at 40 threads, thread scheduling becomes the
+  dominant residual cost, around 30% of recovery time, while log data loading
+  and dynamic analysis are reported as lightweight.
+
+**GPU DB mapping:** This is directly relevant to GPU DB's WAL-before-visibility
+contract. The current engine treats WAL/checkpoint/archive replay as the
+durable truth and GPU resident state as rebuildable acceleration. PACMAN
+suggests that the write path can keep a compact logical or command-oriented
+record for selected deterministic mutation classes, while replay can still be
+parallel if the engine records enough route metadata to reconstruct dependency
+graphs.
+
+The natural GPU DB unit is not an arbitrary SQL string. It is a bounded command
+shape owned by a mutation or partition owner: COPY chunk admission, point
+insert, deterministic update family, resident invalidation, index append, or
+refresh publication. Each shape can declare read/write key spaces, partition
+id, table generation, visibility boundary, and side effects. Recovery can then
+instantiate a dependency graph over those shapes and replay independent pieces
+across CPU partition owners while GPU-resident caches remain invalid until a
+verified rebuild/warmup phase.
+
+PACMAN also argues for separating runtime logging cost from recovery scheduling
+cost. GPU DB should not bloat the hot write path with tuple-level copies merely
+to make recovery easy. A better benchmark is a hybrid log: minimal WAL records
+for deterministic owner commands, plus fallback logical or physical payloads
+for ad-hoc SQL, nondeterministic operations, and complex updates. Recovery can
+name which parts replay through command graphs and which parts replay through
+row-level records.
+
+The dynamic parameter analysis maps to retained and partitioned layouts. A
+batch of logged updates may all target one table, but concrete keys or
+partition ids can still be disjoint. Recovery should exploit that disjointness
+for CPU truth rebuild and for regenerating derived indexes, statistics, and
+resident invalidation generations. Only after CPU truth and visibility
+boundaries are reconstructed should GPU execution owners rebuild or publish
+resident snapshots.
+
+Finally, PACMAN's scheduling bottleneck is a warning for the 1M-session runtime:
+recovery is another high-concurrency scheduler. If post-crash replay uses one
+central ready queue, the scheduling layer can become the bottleneck even when
+log loading and conflict analysis are cheap. Recovery should probably reuse
+the production owner-ring structure with block/partition-local work queues and
+explicit progress telemetry.
+
+**Risks and mismatches:** PACMAN depends on stored procedures or similarly
+deterministic templates. GPU DB currently accepts general SQL, so command-log
+recovery would need a narrow admitted set and a conservative fallback path.
+The static analysis assumes read and write sets are easy to compute; complex
+predicates, secondary-index scans, text predicates, user functions, and
+nondeterministic SQL may not fit.
+
+The paper evaluates CPU main-memory recovery in Peloton, not GPU-resident
+rebuild, NVMe-tiered storage, or pgwire session recovery. It also focuses on
+replaying committed effects after a checkpoint, not on distributed consensus,
+replication, or WAL flush latency. Absolute recovery times from a 2017 40-core
+machine should not be treated as current performance targets. The transferable
+claim is the dependency/scheduling shape, not the hardware numbers.
+
+**Benchmark candidates:**
+
+- Add a deterministic command-log replay prototype for one narrow mutation
+  shape, such as COPY chunk append into a single table/partition. Gate: replay
+  reconstructs identical CPU truth, indexes, visibility generations, and
+  resident invalidation state as tuple-level WAL replay.
+- Compare three recovery logs for the same workload: tuple-level physical/logical
+  records, compact command records, and hybrid command-plus-fallback records.
+  Measure steady-state write throughput, WAL bytes, recovery time, and
+  correctness after crash injection.
+- Build a recovery dependency graph keyed by table id, partition id, command
+  shape, and concrete key range. Gate: disjoint partitions replay in parallel;
+  conflicting updates preserve commit-order visibility.
+- Add a post-crash warmup benchmark: replay CPU truth first, then rebuild GPU
+  resident snapshots by partition. Failure condition: any query can observe a
+  resident route before its source WAL boundary and invalidation generation are
+  proven.
+- Measure scheduler overhead during replay with one global ready queue versus
+  per-owner recovery rings. Expected result: owner-local queues reduce
+  scheduling contention at high replay parallelism.
+- Test ad-hoc fallback ratio by mixing deterministic COPY/INSERT commands with
+  complex UPDATE/DELETE statements. Gate: increasing fallback share degrades
+  recovery predictably without invalidating command-log correctness.
+- Expose recovery telemetry: log bytes loaded, command records replayed,
+  fallback records replayed, dependency blocks, ready queue depth, conflict
+  stalls, CPU truth rebuild time, resident rebuild time, and first-safe-query
+  timestamp.
