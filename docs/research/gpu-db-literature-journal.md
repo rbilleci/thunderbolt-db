@@ -6480,3 +6480,190 @@ reservation and publish discipline, not wholesale replacement of MVCC.
 - Negative control: low-conflict retained reads and writes. Reservation
   metadata must not add measurable overhead to the existing uncontended
   COPY/read path before it earns its keep under contention.
+
+### 2026-06-03 - AutoSteer learned optimizer knob steering
+
+**Citation:** Christoph Anneser, Nesime Tatbul, David Cohen,
+Zhenggang Xu, Prithviraj Pandian, Nikolay Laptev, and Ryan Marcus.
+"AutoSteer: Learned Query Optimization for Any SQL Database." PVLDB
+16(12), 2023, pp. 3515-3527. DOI: `10.14778/3611540.3611544`.
+Retrieved 2026-06-03 from the VLDB PDF,
+`https://www.vldb.org/pvldb/vol16/p3515-anneser.pdf`.
+
+**Category:** query optimization / planning.
+
+**Relevance tags:** learned query optimization; optimizer knobs;
+route choice; bounded hints; query spans; latency-tail reduction;
+planner diagnostics; CPU/GPU fallback; workload adaptivity.
+
+**Core idea:** AutoSteer extends Bao-style learned steering so it can
+work across SQL engines that expose optimizer knobs. Instead of
+requiring experts to hand-pick a static hint-set collection for one
+DBMS, it approximates the set of rewrite rules that matter for a
+query, greedily explores useful knob combinations, and can then train
+a predictor to select a hint-set for new queries.
+
+The transferable result is not that GPU DB should let a model own
+planning. It is that bounded, explainable route knobs can be explored
+and learned around an existing optimizer while keeping the native
+planner in control of legal plans. For GPU DB, this maps to learning
+when to choose resident GPU, over-resident GPU, CPU fallback,
+prefilter, compression, or admission behavior, provided the learned
+choice is constrained by deterministic correctness gates.
+
+**Concrete mechanisms:**
+
+- AutoSteer takes a list of exposed optimizer knobs and interacts with
+  the DBMS through connector functions for setting knobs, running
+  `EXPLAIN`, and executing queries. The generic connector can be
+  implemented with ordinary SQL/session knobs; the custom connector
+  integrates with the optimizer to observe rewrite-rule application
+  more efficiently.
+- A query span approximates the rewrite rules that contribute to a
+  query plan. In the custom PrestoDB integration, rewrite rules append
+  their identifiers to the span when their conditions match and they
+  transform part of the plan.
+- AutoSteer starts with the default plan, then tests singleton
+  hint-sets drawn from the query span. Hint-sets that beat the default
+  are queued for bottom-up greedy expansion; unhelpful singleton
+  choices are pruned from later combinations.
+- The greedy search also considers alternative rules when one rule can
+  replace or disable another rule in the plan. The goal is to discover
+  beneficial small combinations without enumerating the full power set
+  of optimizer knobs.
+- In inference mode, AutoSteer uses Bao's tree convolutional neural
+  network approach over query plans to predict execution time and
+  select a hint-set without rerunning the full exploration for every
+  incoming query.
+- The generic integration trades lower engineering effort for more
+  overhead because it may need multiple `EXPLAIN` calls to approximate
+  query spans. The custom integration requires optimizer changes but
+  can collect query-span data during one optimization pass.
+- The evaluated systems include PrestoDB, PostgreSQL, SparkSQL, MySQL,
+  and DuckDB. Public workloads include JOB, StackOverflow, and TPC-DS;
+  the production workload is a Meta PrestoDB dashboarding workload
+  over petabyte-scale data and more than 3,000 daily queries.
+- In the reported PrestoDB JOB/Stack experiments, AutoSteer-C's best
+  known hint-sets improve average runtime by about 30% on JOB and 42%
+  on Stack, while inference mode improves them by about 28% and 32%.
+- On the Meta dashboard workload, applying the discovered top
+  PrestoDB hint-set reduces 99th-percentile dashboard query latency by
+  about 20%, while the paper notes a few regressions are acceptable
+  when tail and absolute latency improve.
+- The main PrestoDB diagnostic finding is that disabling
+  `HashGenOptimizer` helps many JOB queries but hurts some cases. This
+  led to a size-based heuristic proposal rather than a blanket rule
+  removal.
+- The paper explicitly calls out cache state, memory footprint, CPU
+  time, and multi-query interactions as important production metrics
+  that single-query latency optimization does not fully capture.
+
+**GPU DB mapping:** AutoSteer fits the planned GPU DB route layer as
+a bounded advisor, not an authority. The deterministic planner should
+still prove schema generation, visibility boundary, resident validity,
+supported predicate family, memory budget, and fallback legality. A
+learned steering layer can then choose among legal knobs such as
+resident GPU route, CPU index route, CPU prefilter plus GPU tail,
+over-resident chunk size, compression decode path, micro-batch ceiling,
+and rejection versus fallback under saturation.
+
+The query-span idea maps to route-span telemetry. For every query
+shape, GPU DB can record which route rules actually fired: table
+resident and valid, selected columns resident, predicate supported by
+GPU kernel, partition count, estimated bytes moved, compression
+format, queue class, GPU budget, CPU fallback eligibility, and
+snapshot generation. That gives an optimizer-debugging surface before
+any model is trained.
+
+AutoSteer's generic/custom connector split also suggests a safe
+implementation sequence. First, expose a generic diagnostic mode that
+tries planner knobs offline against benchmark queries and records SQL
+results, route telemetry, latency, bytes, and queue wait. Only after
+useful knobs are identified should GPU DB add a lower-overhead custom
+route-span path in the production planner.
+
+The production lessons are especially relevant to a GPU system.
+Choosing a route solely by median latency is dangerous when a plan
+increases GPU memory pressure, pinned-buffer use, PCIe bytes, CPU
+time, or queue interference. The reward signal for GPU DB route
+steering should include p95/p99 latency, absolute latency change,
+resident-hit preservation, bytes moved by tier, GPU queue wait,
+retained-read starvation, and explicit memory-budget violations.
+
+**Risks and mismatches:** AutoSteer targets query optimization for
+analytics-heavy SQL engines, not WAL/MVCC correctness, transaction
+scheduling, or GPU storage management. Its evaluated workloads are
+mostly analytical and dashboard-style; OLTP point reads and COPY/write
+admission need different reward signals. Training-mode exploration
+executes alternative plans, which can be too expensive or unsafe on
+live transactional workloads unless it runs offline or in shadow mode.
+The inference model can still select regressing hint-sets, so GPU DB
+must keep deterministic guardrails, negative controls, and fallback
+caps. The paper also does not solve concurrency-aware planning across
+many simultaneous sessions; single-query improvements may be bad if
+they consume scarce GPU, host-memory, or IO resources.
+
+**Benchmark candidates:**
+
+- Add route-span telemetry to the planner for supported retained
+  routes: legal route knobs, rules fired, rejected route reasons,
+  resident generation, partition count, estimated bytes moved, queue
+  class, and fallback eligibility. Minimum gate: no SQL behavior
+  change and deterministic route explanations for each benchmark query.
+- Build an offline route-steering harness that enumerates a bounded
+  set of legal GPU DB route knobs for existing retained queries. Measure
+  p50/p95/p99 latency, throughput, queue wait, H2D/D2H bytes, GPU
+  elapsed time, CPU time, and memory-budget impact.
+- Test a constrained learned or table-driven advisor that chooses
+  between CPU route, resident GPU route, CPU prefilter plus GPU tail,
+  and rejection/fallback under saturation. Failure condition: any model
+  choice bypasses visibility, invalidation, or WAL-before-visibility
+  checks.
+- Add a negative-control workload where the fastest single-query GPU
+  route starves retained point reads under concurrency. The advisor
+  should learn or be constrained to prefer the route with better p99
+  and resource isolation, not just lower isolated runtime.
+- Add optimizer-regression reporting in absolute terms as well as
+  relative terms: milliseconds saved/lost, bytes saved/lost, GPU queue
+  time added, and pinned memory consumed. Proof gate: route changes can
+  be accepted or rejected by workload-level tail and resource budgets.
+- Keep the first production version rule-based. Use AutoSteer-style
+  exploration to discover route heuristics, then encode the winning
+  guardrails explicitly before considering online inference.
+
+### 2026-06-03 - Cross-paper synthesis: route learning must be resource bounded
+
+The last three modern entries cover over-resident storage initiation
+(`Path to GPU-Initiated I/O`), deterministic OLTP batch publication
+(`Aria`), and learned optimizer steering (`AutoSteer`). They converge
+on one design track: GPU DB should expose rich route descriptors, but
+publication and admission must remain deterministic. A route can be
+learned, hinted, or benchmark-discovered only after WAL boundaries,
+visibility compatibility, resident validity, owner ownership, and
+resource budgets have already made it legal.
+
+The strongest benchmark track is a resource-bounded route-span layer.
+Each request should carry the facts that explain its route: snapshot
+generation, partition or tier, resident bytes, transfer bytes,
+storage-initiation mode, CPU time, GPU queue class, write/reservation
+conflict class, and fallback legality. Aria says publish decisions
+should be small and deterministic; AutoSteer says planner knobs should
+be explored within a bounded span; Torp et al. say GPU-initiated IO is
+only a win if its GPU resource burn is charged honestly.
+
+The main category gap after this batch is still practical MVCC storage
+and garbage collection under long retained snapshots, especially how
+old versions, deleted keys, and hot-row histories move across CPU,
+GPU, and future tiers. The next high-value queue choices are the
+PVLDB 2017 empirical MVCC evaluation, LeanStore/Umbra tiered buffer
+management, or Cicada/ERMIA for memory-optimized transaction engines.
+
+Benchmark priorities:
+
+- route-span telemetry before route learning
+- deterministic mutation or refresh reservation facts before parallel
+  write publication
+- mixed retained-read plus over-resident cold-scan isolation before
+  GPU-initiated IO
+- workload-level p99 and resource-budget gates before accepting any
+  learned planner knob

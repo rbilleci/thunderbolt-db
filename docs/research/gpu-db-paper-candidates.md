@@ -140,7 +140,7 @@ mechanical sympathy, multi-tier cache/data placement, or query optimization.
   URL: `https://arxiv.org/abs/2302.06873`
   Why: learned ranking layered on native optimizers; relevant to route choice
   without replacing deterministic planner rules.
-- `queued` — **AutoSteer: Learned Query Optimization for Any SQL Database**,
+- `reviewed` — **AutoSteer: Learned Query Optimization for Any SQL Database**,
   PVLDB 2023.
   URL: `https://www.vldb.org/pvldb/vol16/p3515-anneser.pdf`
   Why: learned tuning of optimizer knobs for existing SQL systems; relevant to
@@ -728,6 +728,12 @@ Append new candidates here as each paper is processed.
   Why: modern learned-optimizer diagnostic work; useful after LOGER/PARQO
   coverage to keep learned GPU route suggestions explainable, bounded, and
   testable instead of treating model output as an opaque planner authority.
+- `queued` — **Steering Query Optimizers: A Practical Take on Big Data
+  Workloads**, Negi et al., SIGMOD 2021.
+  URL: `https://doi.org/10.1145/3448016.3457297`
+  Why: AutoSteer builds on query-span and steering ideas from this work; useful
+  for comparing random, greedy, and expert-guided exploration of bounded
+  optimizer knobs before applying route learning to GPU DB planner decisions.
 - `queued` — **RackSched: A Microsecond-Scale Scheduler for Rack-Scale
   Computers**, Sreekanti et al., arXiv 2020.
   URL: `https://arxiv.org/abs/2010.05969`
