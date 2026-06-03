@@ -693,7 +693,7 @@ Append new candidates here as each paper is processed.
   inefficiencies for machine-learning workloads and GPU decoding; useful
   baseline for deciding whether P8 should adopt an existing file format,
   a FastLanes-style resident segment, or an internal-only GPU layout.
-- `queued` — **Mainlining Databases: Supporting Fast Transactional Workloads on
+- `reviewed` — **Mainlining Databases: Supporting Fast Transactional Workloads on
   Universal Columnar Data File Formats**, Li et al., arXiv 2020.
   URL: `https://arxiv.org/abs/2004.14471`
   Why: transactional workload support over universal columnar file formats;
@@ -712,6 +712,25 @@ Append new candidates here as each paper is processed.
   Why: modern transaction scheduling work cited by PreemptDB; useful for
   contrasting non-preemptive priority ordering with interrupt-driven
   preemption and owner-queue admission.
+- `queued` — **Data Blocks: Hybrid OLTP and OLAP on Compressed Storage Using
+  Both Vectorization and Compilation**, Lang et al., SIGMOD 2016.
+  URL: `https://www-db.cs.tum.edu/downloads/publications/datablocks.pdf`
+  Why: Mainlining Databases cites HyPer/Data Blocks as a compressed cold-data
+  HTAP baseline; useful for comparing hot/cold columnar block compression,
+  positional pruning metadata, and OLTP-safe tuple access against P8 resident
+  segment designs.
+- `queued` — **L-Store: A Real-time OLTP and OLAP System**, Sadoghi et al.,
+  EDBT 2018.
+  URL: `https://arxiv.org/abs/1601.04084`
+  Why: Mainlining Databases contrasts L-Store's lineage/tail-page architecture
+  with relaxed Arrow blocks; useful for evaluating lineage-based staging,
+  historic visibility, and lazy columnar consolidation for retained snapshots.
+- `queued` — **Real-Time LSM-Trees for HTAP Workloads**, Saxena et al.,
+  arXiv 2021.
+  URL: `https://arxiv.org/abs/2101.06801`
+  Why: lifecycle-aware LSM layout design is a follow-up to universal columnar
+  and hot/cold block conversion; useful for comparing row-to-column movement
+  by storage level rather than by in-memory block age.
 
 - `reviewed` — **Harnessing GPU Power for Enhanced OLTP: A Study in Concurrency
   Control Schemes**, arXiv 2024.

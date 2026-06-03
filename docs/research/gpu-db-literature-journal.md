@@ -21612,3 +21612,172 @@ to skip WAL-before-visibility, invalidation, or snapshot compatibility checks.
 - Add an oscillation/overreaction test with bursty sessions and alternating
   small and large responses. Failure condition: telemetry feedback reduces
   average throughput or increases p99 versus a simpler bounded queue.
+
+### 2026-06-03 - Mainlining Databases: Supporting Fast Transactional Workloads on Universal Columnar Data File Formats
+
+**Citation:** Tianyu Li, Matthew Butrovich, Amadou Ngom, Wan Shen Lim,
+Wes McKinney, and Andrew Pavlo. "Mainlining Databases: Supporting Fast
+Transactional Workloads on Universal Columnar Data File Formats."
+arXiv:2004.14471, 2020. Retrieved 2026-06-03 from
+`https://arxiv.org/abs/2004.14471`.
+
+**Category:** Hybrid HTAP, with MVCC / snapshot / visibility and multi-tier
+data-placement relevance.
+
+**Relevance tags:** HTAP storage; Arrow-native blocks; hot/cold conversion;
+MVCC delta records; snapshot export; zero-copy data movement; columnar
+transaction processing; relaxed resident format; cold-block freezing.
+
+**Core idea:** The paper asks whether an OLTP DBMS can store data close to a
+universal analytical columnar format, rather than repeatedly exporting and
+rewriting row-store data for Python, Pandas, TensorFlow, or other analytical
+tools. Its DB-X prototype targets Apache Arrow. The trick is not to make
+Arrow fully mutable. Instead, the engine runs transactions over a relaxed
+Arrow-compatible block format while data is hot, then transforms cold blocks
+back into canonical Arrow so external readers can consume them with little or
+no serialization.
+
+The design is valuable because it treats "format conversion" as a storage
+state transition with concurrency and visibility rules, not as an afterthought
+outside the database. It keeps transaction metadata separate from the Arrow
+payload, uses MVCC delta records for snapshot isolation, and lets cold blocks
+skip per-tuple version checks and materialization when they have no active
+versions. The evaluation reports DB-X TPC-C throughput with transformation
+enabled within about 10% of the no-transformation configuration under the
+tested setup, while Arrow Flight/RDMA-style export over frozen blocks is
+orders of magnitude faster than row-oriented PostgreSQL-style export paths.
+
+**Concrete mechanisms:**
+
+- DB-X stores transactional metadata outside the main column payload. Version
+  chains are exposed as an extra invisible Arrow column whose entries point to
+  newest-to-oldest delta records.
+- Deltas live in transaction-owned undo buffers. An update copies the old
+  values of modified attributes into an append-only delta record, links it
+  into the tuple's version chain, then updates the columnar block in place.
+- Transactions receive start and commit timestamps from one counter. An
+  uncommitted transaction uses a commit timestamp with the sign bit flipped;
+  unsigned timestamp comparison keeps uncommitted versions invisible.
+- Readers reconstruct a snapshot by copying the latest tuple image and applying
+  before-images until they reach a version older than their start timestamp.
+- Abort handling restores the old image but does not immediately unlink the
+  delta record. This avoids races and ABA-style cases where a reader copied an
+  intermediate state while the abort was rolling back.
+- Tuple identifiers are physiological: a 64-bit `TupleSlot` combines a 1 MB
+  block-aligned physical address with an offset inside the block. The table's
+  precalculated layout maps that slot to column addresses in constant time.
+- Garbage collection scans committed transaction objects, computes tuple slots
+  whose versions are no longer visible to any active transaction, unlinks each
+  chain once, and delays memory reclamation until no transaction can still hold
+  the unlinked records.
+- The relaxed Arrow format adds a validity bitmap in the block header and a
+  16-byte `VarlenEntry` for variable-length values: size, pointer or inline
+  payload, and a short prefix for filtering. Variable-length updates become
+  fixed-size metadata updates instead of rewriting a contiguous Arrow byte
+  buffer.
+- Blocks have hot/cold state. A frozen block can be scanned in place by Arrow
+  readers with a reader counter. A write changes the block to hot, blocks new
+  in-place readers, waits for existing readers to leave, and then updates the
+  relaxed format.
+- Cold-block detection piggybacks on garbage collection rather than adding
+  exact access counters on the transaction hot path. The GC's observation time
+  acts as an approximate epoch for recent modifications.
+- Transformation has two phases. Compaction transactionally shuffles tuples
+  between same-layout blocks to eliminate gaps and free empty blocks while
+  minimizing delete/insert pairs that would update indexes. Gathering then
+  obtains short exclusive access, lays variable-length values into Arrow's
+  contiguous buffers, computes metadata such as null counts, and marks the
+  block frozen.
+- The gathering phase uses `cooling` and `freezing` block states plus MVCC/GC
+  protection to avoid requiring every user transaction to latch the block.
+  Reads continue through the transformation because the physical movement does
+  not change logical tuple contents.
+- The same transformation framework can emit other formats, such as dictionary
+  compression, but the paper reports that dictionary building is much more
+  expensive than simple variable-length gathering.
+- External access options include an Arrow-aware wire protocol, Arrow Flight,
+  client-side RDMA, server-side RDMA with leases or invalidation, and pushing
+  compute to shared Arrow memory. The paper treats server-side RDMA as
+  non-trivial because it bypasses DBMS control over block updates.
+
+**GPU DB mapping:** The most transferable idea is a three-state physical
+format contract for retained data: hot mutable CPU/MVCC blocks, warm relaxed
+columnar blocks that can still absorb writes cheaply, and frozen canonical
+resident/export blocks that read workers or external tools can consume without
+per-row materialization. P8 currently builds GPU resident column groups from
+CPU MVCC truth. This paper suggests a sharper intermediate tier: host-memory
+columnar blocks that remain close enough to the GPU/resident layout to avoid
+full rebuilds, but still carry update-friendly metadata and MVCC side state.
+
+The invisible version-column pattern maps to GPU DB visibility summaries. The
+resident buffers should not interleave full transaction metadata with payload
+columns, but each row group or block needs a compact side pointer, generation
+bitmap, or "has versions" marker that tells the planner whether a retained GPU
+route can scan in place or must materialize through CPU/MVCC. Cold/frozen
+blocks with no active versions are natural candidates for zero-H2D retained
+routes, FastLanes-style compressed vectors, or Arrow/CUDA interchange.
+
+The physiological `TupleSlot` is a useful warning for P8 partitioning. GPU DB
+will need stable row ids that survive CPU/GPU tier movement without requiring
+a hash-table lookup for every row. A packed `{segment or block id, row offset}`
+identifier tied to a layout descriptor could give constant-time address
+calculation on both CPU and GPU, while remaining rebuildable from WAL/MVCC.
+
+The transformation algorithm maps to resident refresh. Instead of rebuilding a
+whole table snapshot after every mutation, the cache manager could track
+hot/cooling/frozen segment state and refresh only cooling segments under a
+short correctness-preserving phase. The GC-epoch coldness approximation is
+also attractive: P8 can piggyback on MVCC GC or snapshot-retirement passes to
+identify segment refresh candidates, avoiding per-request heat accounting on
+the query path.
+
+Finally, the export discussion reinforces the runtime document's response-ring
+direction. Row-wise SQL serialization will hide much of the win from resident
+columnar storage. For large analytical or ML-style outputs, the engine should
+benchmark columnar response buffers, shared-memory/Arrow-like host buffers, or
+future RDMA/GPU-direct export separately from pgwire row encoding.
+
+**Risks and mismatches:** The paper is an in-memory CPU DBMS design, not a GPU
+execution engine. It targets Arrow interoperability and bulk export, while P8
+must preserve PostgreSQL-visible SQL behavior, WAL replay, GPU residency
+invalidation, CUDA resource ownership, and existing pgwire correctness.
+Arrow's canonical format is not automatically the best HBM format, especially
+for compressed integer routes, predicate pushdown, or tiny point lookups.
+
+The MVCC protocol is snapshot isolation with first-writer conflict behavior;
+it does not solve serializable validation or high-contention write scheduling.
+The paper's hot/cold detection uses a simple threshold and explicitly leaves
+more sophisticated policy for future work. Transformation can still abort or
+stall user transactions in edge cases, and dictionary compression can lag under
+high worker counts unless transformation work is parallelized. Server-side
+RDMA/export ideas also assume external tools and hardware support outside the
+current GPU DB benchmark envelope.
+
+**Benchmark candidates:**
+
+- Add a host warm-segment experiment between CPU MVCC rows and GPU resident
+  HBM: relaxed columnar segment with a validity bitmap, varlen metadata, and a
+  side version marker. Gate: point lookup, range aggregate, and mutation
+  invalidation match CPU MVCC results.
+- Compare full table resident rebuild against segment-level hot/cooling/frozen
+  refresh after COPY or UPDATE batches. Measure refresh bytes, queue time,
+  p50/p99 read latency, and write throughput while preserving
+  WAL-before-visibility.
+- Prototype a packed row identifier `{segment_generation, row_offset}` for
+  resident routes. Gate: GPU and CPU fallback compute identical tuple identity
+  and visibility after refresh, eviction, and WAL replay.
+- Add a "version-free frozen segment" route that skips per-row MVCC checks only
+  when the segment metadata proves no active versions overlap the read
+  snapshot. Failure condition: any retained read observes a stale or invisible
+  row after insert/update/delete.
+- Measure pgwire row serialization versus a columnar host-buffer response for
+  large retained analytical outputs. The goal is to separate execution wins
+  from output-encoding bottlenecks.
+- Test coldness heuristics driven by MVCC GC/snapshot retirement rather than
+  per-query heat counters. Compare exact access tracking, GC-epoch
+  approximation, and fixed refresh intervals under mixed TPC-C-like writes and
+  retained scans.
+- Stress variable-length text handling: dense Arrow-style offsets, relaxed
+  `VarlenEntry` metadata, and FastLanes/dictionary codes. Measure update
+  cost, refresh cost, text-prefix predicate latency, and memory reclamation
+  safety under long retained snapshots.
