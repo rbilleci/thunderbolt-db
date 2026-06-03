@@ -513,7 +513,7 @@ Append new candidates here as each paper is processed.
   Why: modern transaction scheduling paper from SIGMOD 2023; relevant to
   contrasting conflict-graph scheduling with runtime resource conflicts and
   owner-queue admission for mixed GPU DB transaction classes.
-- `queued` — **Improving Optimistic Concurrency Control through Transaction
+- `reviewed` — **Improving Optimistic Concurrency Control through Transaction
   Batching and Operation Reordering**, Ding, Kot, and Gehrke, PVLDB 2018.
   URL: `https://doi.org/10.14778/3282495.3282502`
   PDF: `https://www.vldb.org/pvldb/vol12/p169-ding.pdf`
@@ -611,3 +611,21 @@ Append new candidates here as each paper is processed.
   URL: `https://www.usenix.org/conference/osdi21/presentation/wang-jiachen`
   Why: learned concurrency-control policy selection cited by TSkd; useful as
   a contrast to deterministic owner-queue rules and runtime-conflict telemetry.
+- `queued` — **Centiman: Elastic, High Performance Optimistic Concurrency
+  Control by Watermarking**, Ding et al., SoCC 2015.
+  URL: `https://doi.org/10.1145/2806777.2806842`
+  Why: OCC validator/storage architecture cited by the batching paper; useful
+  for comparing watermark-based validation, decoupled compute/storage, and
+  versioned write installation against GPU DB owner boundaries.
+- `queued` — **QueCC: A Queue-Oriented, Control-Free Concurrency
+  Architecture**, Qadah and Sadoghi, Middleware 2018.
+  URL: `https://doi.org/10.1145/3274808.3274820`
+  Why: queue-oriented transaction execution cited by the batching paper;
+  relevant to deterministic owner queues, queue-local ordering, and whether
+  control-free execution can coexist with WAL-before-visibility.
+- `queued` — **Mostly-Optimistic Concurrency Control for Highly Contended
+  Dynamic Workloads on a Thousand Cores**, Wang and Kimura, PVLDB 2016.
+  URL: `https://www.vldb.org/pvldb/vol10/p49-wang.pdf`
+  Why: hybrid OCC/pessimistic contention handling cited by the batching paper;
+  useful for deciding when GPU DB owner queues should switch from optimistic
+  validation to contention-aware ordered execution.

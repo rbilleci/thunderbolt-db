@@ -4763,3 +4763,210 @@ per-class limits, not as an unbounded retry-avoidance trick.
   an explicit owner batch whose WAL and visibility boundary is known.
   Failure condition: a schedule can make an externally visible result
   differ from FIFO under the same committed transaction order.
+
+### 2026-06-03 - Semantic OCC batching and operation reordering
+
+**Citation:** Bailu Ding, Lucja Kot, and Johannes Gehrke.
+"Improving Optimistic Concurrency Control Through Transaction
+Batching and Operation Reordering." PVLDB 12(2), 2018.
+Retrieved 2026-06-03 from the PVLDB PDF,
+`https://www.vldb.org/pvldb/vol12/p169-ding.pdf`. DOI:
+`https://doi.org/10.14778/3282495.3282502`.
+
+**Category:** transaction processing / write path and runtime /
+session-scale scheduling.
+
+**Relevance tags:** optimistic concurrency control; semantic
+batching; validator ordering; storage ordering; feedback vertex set;
+tail latency; abort reduction; thread-aware scheduling; write
+admission; owner queues.
+
+**Core idea:** The paper treats batching as a semantic transaction
+mechanism rather than only a message-packing or group-commit trick.
+In a decoupled OCC architecture, transactions read from storage, send
+read/write sets to a validator, then install writes if validation
+succeeds. Because OCC chooses the final serialization order at commit
+time, a batch can be reordered to reduce avoidable stale-read aborts.
+
+The strongest transfer for GPU DB is the separation between physical
+batching and semantic batch validity. A mutation owner should not
+batch only because it amortizes WAL, index, or GPU-refresh costs. It
+should batch because the requests in that boundary can be ordered,
+validated, and published with fewer conflicts while preserving a clear
+external visibility order.
+
+**Concrete mechanisms:**
+
+- Storage batching buffers reads and writes together. For each object,
+  it applies the highest-version pending write first and discards
+  older writes for that object, then serves reads. In the paper's OCC
+  model, a read that sees an older value while a committed pending
+  write to the same object exists is likely to abort later.
+- Validator batching buffers validation requests and chooses a
+  serialization order for the batch. If two transactions conflict only
+  because the writer arrived at the validator before the reader, the
+  validator can serialize the reader before the writer and commit both.
+- Intra-batch validator reordering is represented as a directed
+  dependency graph over transactions, with edges for read-write
+  dependencies. If the graph is acyclic, a topological order commits
+  all viable transactions. If cycles exist, the validator must abort a
+  feedback vertex set to make the graph acyclic.
+- Finding the minimum feedback vertex set is NP-hard, so the paper
+  proposes greedy algorithms: SCC-based removal, faster sort-based
+  removal, and a hybrid that uses precise search for small SCCs. The
+  default fast path uses sort-based greedy ordering with degree-based
+  policies.
+- Policies can optimize different goals. A commit-maximizing policy
+  removes high-degree nodes from cycles; a tail-latency policy protects
+  transactions that have already restarted; a value policy can prefer
+  application-priority transactions.
+- For decentralized OCC systems without a central validator, the paper
+  uses a thread-aware preprocessing policy: batch transactions, assign
+  conflicting transactions to the same execution thread, and exploit
+  both lower inter-thread conflict and better cache locality.
+- The parallel validator splits batch preparation, transaction
+  reordering, and final validation into pipeline components. It also
+  pre-validates against committed state before expensive reordering,
+  then validates again against the latest state before commit.
+- Evaluation reports up to 2.7x prototype throughput improvement and
+  up to 82% tail-latency reduction from storage plus validator
+  reordering under skew; in Cicada/YCSB, thread-aware reordering gives
+  up to 2.2x throughput and 71% 99th-percentile latency reduction; in
+  a commercial DBMS-X setup, batching plus reordering improves peak
+  throughput by 1.25x, throughput by up to 3.1x, average latency by up
+  to 66%, and abort rate by up to 62%.
+
+**GPU DB mapping:** The paper gives a concrete rule for mutation-owner
+batching: order inside the batch, publish outside the batch. GPU DB can
+collect a bounded owner batch of writes, refreshes, and retained-route
+invalidations, build a dependency graph from keys, partitions,
+resident generations, and read/write intent, then publish one
+WAL-backed visibility boundary after validation. This is stronger than
+blind FIFO draining and safer than letting GPU refresh work reorder
+around transactional writes.
+
+Storage batching maps to the P8 resident invalidation path. If a
+pending committed write will invalidate a resident generation, reads
+queued behind it should not be routed to the soon-stale generation just
+because the write has not yet been physically applied. The owner can
+prefer "apply invalidation/write intent, then admit reads" inside the
+batch, while still letting older snapshot holders finish on an already
+acquired immutable generation.
+
+Validator reordering maps to a small owner-local conflict graph rather
+than a global transaction scheduler. Nodes can represent mutations,
+refresh publications, or read-only retained requests that require a
+fresh boundary. Edges should be limited to bounded metadata such as
+key/range conflicts, partition ids, write-intent ids, and resident
+generation invalidations. The first implementation should avoid
+unbounded arbitrary SQL read/write set extraction.
+
+The policy framework also fits 1M logical sessions. Long-restarted,
+latency-sensitive, or user-visible short requests can receive higher
+priority inside a batch without removing correctness checks. The
+runtime should expose the policy choice as telemetry: batch size,
+cycles found, transactions deferred or aborted, protected retries,
+queue wait, validation wait, and whether the batch improved p99 or only
+hid work behind the owner.
+
+Thread-aware assignment reinforces current owner-domain thinking. If
+conflicting requests are placed on the same owner/partition thread,
+they serialize cheaply and share cache or resident metadata. If they
+are spread across owners, the system needs more validation,
+invalidation, or fallback coordination. This suggests benchmarking
+owner assignment and partition splitting as concurrency-control
+decisions, not just load-balancing decisions.
+
+**Risks and mismatches:** The paper assumes OCC-style read/write sets
+and versioned storage that can ignore older writes when a higher
+version exists. GPU DB's SQL plans, MVCC tuple chains, WAL replay, DDL,
+resident snapshots, and GPU execution routes need stronger metadata
+than the paper's key-value examples. Reordering cannot cross external
+transaction boundaries unless the committed order and visibility
+boundary remain unambiguous.
+
+Validator reordering adds latency. The paper shows sort-based greedy
+ordering is usually the best tradeoff, and that validator reordering
+can hurt throughput under extreme contention because dependency graphs
+become dense. GPU DB should therefore make semantic batching adaptive:
+disable or shrink it for low-conflict templates, cap batch wait, and
+fall back to simpler storage/invalidation ordering when graph work
+costs more than avoided retries.
+
+The evaluation is mostly in research prototypes, an integration with
+Cicada, and an anonymized commercial DBMS middle-tier experiment. It
+does not prove durability, crash recovery, GPU route correctness,
+network backpressure, or multi-tier snapshot reclamation. Treat the
+reported speedups as a strong scheduling signal, not as a directly
+portable throughput target.
+
+**Benchmark candidates:**
+
+- Build an owner-batch simulator with key/range conflicts, resident
+  invalidation edges, and refresh-publication edges. Compare FIFO,
+  storage-write-first ordering, and sort-based feedback-vertex-set
+  ordering. Proof gate: identical committed results under the selected
+  serial order and lower abort/fallback count under skew.
+- Add a bounded mutation-owner batch mode for one table: drain up to N
+  requests or T microseconds, validate order, append WAL, invalidate
+  resident generations, apply CPU state, and publish one visibility
+  boundary. Required telemetry: batch wait, graph edges, cycles,
+  aborted/deferred requests, WAL latency, invalidation count, p50/p99.
+- Test storage-level read/write ordering for retained routes: when a
+  write intent and compatible read are in the same owner batch, mark
+  the resident generation invalid before admitting new reads that need
+  fresh visibility. Failure condition: a post-mutation read executes
+  on a generation that should have been invalidated.
+- Compare policy modes: maximize commits, protect restarted requests,
+  and protect latency-sensitive reads. Minimum gate: policy telemetry
+  shows which transactions were protected and whether p99 improves
+  without starving writes.
+- Add a thread/owner assignment microbenchmark where conflicting hot
+  keys are intentionally co-located or split across owners. Required
+  measurements: throughput, p99, cache/metadata hit proxy, cross-owner
+  invalidations, and fairness.
+- Add an adaptive-batch guardrail: semantic reordering must auto-shrink
+  or disable when graph construction/reordering overhead exceeds the
+  measured conflict or fallback reduction.
+
+### 2026-06-03 - Cross-paper synthesis: batch boundaries as correctness surfaces
+
+The last three modern reviews sharpen one design track from different
+angles. P-Trees make immutable roots and batch publication attractive
+for HTAP snapshots. Runtime-conflict scheduling says conflicts are a
+function of both keys and execution windows. OCC batching shows that a
+batch can be a semantic reorder/validation boundary, not merely a
+queue-drain artifact.
+
+Converging design tracks:
+
+- **Batch publication over per-request churn:** hot write paths should
+  publish WAL, CPU visibility, resident invalidation, and route
+  generations at explicit owner boundaries when latency budgets permit.
+- **Local conflict graphs before global scheduling:** start with
+  owner-local metadata graphs over keys, partitions, resident
+  generations, and active phase windows before attempting broad SQL
+  transaction prediction.
+- **Immutable snapshot roots plus placement handles:** a retained read
+  should validate root generation, WAL/visibility boundary, resident
+  generation, placement state, and invalidation boundary as one handle.
+- **Adaptive policy is mandatory:** batching, reordering, and deferment
+  must shrink or disable when dependency graphs are dense, contention
+  is low, or tail latency worsens.
+
+Category gaps: recent work is now rich in transaction scheduling,
+MVCC roots, and owner batching. The next review should shift toward
+multi-tier placement/GC or high-concurrency runtime/networking before
+another optimizer or GPU-OLAP paper. Good next candidates are Nomad,
+Hybrid GC for SAP HANA, Taurus logging, or Take Out the TraChe.
+
+Benchmark priorities:
+
+- Implement one owner-batch experiment that includes both transaction
+  ordering and resident invalidation ordering.
+- Add a snapshot-handle proof that couples immutable CPU root identity
+  with GPU resident placement generation.
+- Track conflict-graph overhead as a first-class metric; a scheduler
+  that reduces aborts while increasing p99 should fail the gate.
+- Add an adaptive mode that reports why it chose FIFO, write-first,
+  conflict-aware reorder, deferment, or CPU fallback for each batch.
