@@ -1235,7 +1235,7 @@ Append new candidates here as each paper is processed.
   Why: TAS contrasts itself with network-stack-as-a-service designs; useful
   for deciding when GPU DB session/network state should remain an in-process
   IO-worker service versus an externalized infrastructure service.
-- `queued` — **A CXL-Powered Database System: Opportunities and Challenges**,
+- `reviewed` — **A CXL-Powered Database System: Opportunities and Challenges**,
   Guo and Li, ICDE 2024.
   URL: `https://dbgroup.cs.tsinghua.edu.cn/ligl/papers/CXL_ICDE.pdf`
   Why: Pasha contrasts itself with this CXL database position paper; useful
@@ -1383,6 +1383,30 @@ Append new candidates here as each paper is processed.
   replicated transaction processing; useful for comparing decentralized
   agreement, per-core validation, and contention behavior against
   re-execution or owner-queue designs.
+- `queued` — **Enabling CXL Memory Expansion for In-Memory Database
+  Management Systems**, Ahn et al., DaMoN 2022.
+  URL: `https://doi.org/10.1145/3533737.3535090`
+  Why: CXL DB position paper cites this as direct IMDBMS evidence; useful
+  for quantifying OLTP/OLAP impact from placing hot and cold database state in
+  CXL-attached memory.
+- `queued` — **Elastic Use of Far Memory for In-Memory Database Management
+  Systems**, Lee et al., DaMoN 2023.
+  URL: `https://doi.org/10.1145/3592980.3595311`
+  Why: CXL DB position paper cites this as a CXL pooling study; useful for
+  measuring bandwidth limits and when explicit DBMS placement beats transparent
+  far-memory expansion.
+- `queued` — **Database Kernels: Seamless Integration of Database Systems and
+  Fast Storage via CXL**, Lee et al., CIDR 2024.
+  URL: `https://www.cidrdb.org/cidr2024/papers/p43-lee.pdf`
+  Why: CXL DB position paper cites CXL-enabled SSD/storage integration; useful
+  for deciding whether GPU DB cold-tier operators should run through a
+  database-owned CXL storage service.
+- `queued` — **dLSM: An LSM-based Index for Memory Disaggregation**, Wang et
+  al., ICDE 2023.
+  URL: `https://doi.org/10.1109/ICDE55515.2023.00217`
+  Why: CXL DB position paper cites disaggregated-memory index design; useful
+  for comparing B-tree node placement with LSM-style far-memory indexes for
+  cold partitions and write-heavy tables.
 - `queued` — **Mako: Speculative Distributed Transactions with
   Geo-Replication**, Shen et al., OSDI 2025.
   URL: `https://www.usenix.org/conference/osdi25/presentation/shen-weihai`
