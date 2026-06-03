@@ -362,7 +362,7 @@ Append new candidates here as each paper is processed.
   relevant to partition ownership, logging, NUMA locality, and future tiers.
 - `queued` — **Diva: Making MVCC Systems HTAP-Friendly**, Kim et al.,
   SIGMOD 2022.
-  URL: `https://doi.org/10.1145/3514221.3526125`
+  URL: `https://doi.org/10.1145/3514221.3526135`
   Why: vDriver successor cited by the LeanStore paper; relevant to precise
   MVCC garbage collection and reducing long-reader damage in HTAP workloads.
 - `reviewed` — **Virtual-Memory Assisted Buffer Management In Tiered Memory**,
@@ -405,7 +405,7 @@ Append new candidates here as each paper is processed.
   useful as a contrast point for Oze, mutation batching, and whether
   predeclared GPU DB write/read sets can improve concurrency without forcing
   long retained refresh work to stall short transactions.
-- `queued` — **Arachne: Core-Aware Thread Management**, Qin et al.,
+- `reviewed` — **Arachne: Core-Aware Thread Management**, Qin et al.,
   OSDI 2018.
   URL: `https://www.usenix.org/conference/osdi18/presentation/qin`
   Why: user-level core-aware thread management cited by Caladan; useful for
@@ -535,6 +535,15 @@ Append new candidates here as each paper is processed.
   Why: general hardware-assisted userspace preemption framework cited by
   PreemptDB; useful if GPU DB wants preemption mechanics outside a full
   transaction-engine rewrite.
+- `queued` — **Skyloft: A General High-Efficient Scheduling Framework in
+  User Space**, Jia et al., SOSP 2024.
+  URL:
+  `https://madsys.cs.tsinghua.edu.cn/publication/skyloft-a-general-high-efficient-scheduling-framework-in-user-space/SOSP24-Jia.pdf`
+  DOI: `https://doi.org/10.1145/3694715.3695973`
+  Why: modern user-space scheduling framework with user-mode-interrupt
+  preemption and DPDK integration; useful as a follow-up to Arachne,
+  Shenango, and Shinjuku for deciding whether GPU DB needs preemptive
+  user-space request classes around long scans and short retained reads.
 - `queued` — **Flexible Resource Allocation for Relational
   Database-as-a-Service**, Arora et al., PVLDB 2023.
   URL: `https://www.vldb.org/pvldb/vol16/p4202-narasayya.pdf`

@@ -9236,3 +9236,210 @@ override a failed validity proof.
 - Track whether better prediction improves p95/p99 latency and rejection
   correctness under mixed session load. A model that lowers Q-error but
   increases overload, fallback churn, or p99 route wait should be rejected.
+
+### 2026-06-03 - Arachne core-aware thread management
+
+**Citation:** Henry Qin, Qian Li, Jacqueline Speiser, Peter Kraft, and John
+Ousterhout. "Arachne: Core-Aware Thread Management." OSDI 2018, pp. 145-160.
+Retrieved 2026-06-03 from
+`https://www.usenix.org/system/files/osdi18-qin.pdf`; USENIX page:
+`https://www.usenix.org/conference/osdi18/presentation/qin`.
+
+**Category:** Runtime / HFT / session scale.
+
+**Relevance tags:** user-level threads; core-aware scheduling; core arbiter;
+exclusive cores; request-granular workers; cache-miss budgeting; thread
+creation at request granularity; load factor; hysteresis; performance
+isolation; 1M logical sessions; pgwire IO workers; owner-domain scheduling.
+
+**Core idea:** Arachne argues that low-latency services should negotiate over
+physical cores, not invisible OS threads. The application should know exactly
+which cores it owns, decide how its own short-lived user threads are placed on
+those cores, and report changing core demand to a user-space core arbiter.
+
+This is a useful middle ground for GPU DB's runtime target. It does not require
+making every logical session an OS thread, and it does not require turning the
+whole database into a single event loop. Instead, it treats thread creation as
+cheap enough for microsecond-scale request work while keeping physical core
+budgets explicit and observable.
+
+**Concrete mechanisms and findings:**
+
+- Arachne uses one kernel thread per allocated core and multiplexes
+  application-visible user threads on top of those core-bound kernel threads.
+- A separate user-level core arbiter allocates specific cores to applications
+  through Linux cpusets. Managed cores are dedicated to Arachne applications;
+  unmanaged cores remain available to ordinary Linux-managed threads.
+- Applications request cores at priority levels. The arbiter allocates cores
+  from high to low priority and asks applications to release cores
+  cooperatively; if needed, it can forcibly reclaim after a timeout.
+- Communication from applications to the arbiter uses sockets because core
+  allocation changes are infrequent. Arbiter-to-application release requests
+  use shared memory because the runtime checks them frequently in the
+  dispatcher loop.
+- The runtime is cooperative, not preemptive. User threads are expected to
+  block or finish quickly; blocking kernel calls and page faults are not deeply
+  handled.
+- Thread context is bound to a single core and reused, so hot stacks and
+  runtime metadata often stay in that core's cache.
+- Thread creation combines load balancing and context allocation in one shared
+  64-bit `maskAndCount` value per active core: 56 bits track occupied thread
+  contexts and 8 bits track the count.
+- New user threads are placed with the "power of two choices": sample two cores,
+  choose the one with fewer active contexts, then reserve a context with CAS.
+- The runnable signal, entry address, and small argument list are packed into a
+  single cache line. The paper frames cross-core thread creation as a four-cache
+  miss operation.
+- Arachne avoids ready queues. The dispatcher scans active contexts on its core
+  and tests a `wakeupTime` word; a thread is runnable when `wakeupTime` is less
+  than or equal to the cycle counter. Wakeup sets `wakeupTime` to zero.
+- The default core policy has `exclusive` and `normal` classes. Exclusive
+  threads get dedicated cores for long-running pollers; normal threads share a
+  disjoint worker-core pool.
+- Core estimation uses load factor to scale up and utilization with hysteresis
+  to scale down. The paper's default parameters are a 1.5 load-factor threshold,
+  50 ms averaging interval, and 9% scale-down hysteresis.
+- The reported median primitive costs include cross-core Arachne thread
+  creation around 320 ns with hyperthreads active, condition notify around
+  272 ns, signal around 254 ns, and thread exit turnaround around 449 ns.
+- Memcached-A replaces static worker assignment with request-granular Arachne
+  threads. The paper reports 37.5% higher SLO-compliant throughput at median
+  latency below 100 us, and 99th-percentile latency 3-40x lower than
+  memcached in the tested setup.
+- Under dynamic load and colocation with x264, memcached-A uses fewer cores at
+  low load, ramps up as load rises, and is almost unaffected by the background
+  application because the arbiter gives it dedicated cores.
+- The no-arbiter variant performs much worse because Linux can deschedule a
+  kernel thread while Arachne continues assigning user threads to it. Dedicated
+  cores are therefore not an incidental optimization; they are part of the
+  correctness of the latency model.
+- RAMCloud-A yields during nested RPC polling and schedules other requests
+  during microsecond-scale wait gaps. The paper reports 2.5x higher single-
+  server write throughput for 100-byte-object writes, but a 15% lower read-only
+  YCSB-C throughput because Arachne's thread invocation/exit overhead exceeds
+  the benefit when there is little waiting to hide.
+- The paper lists unexplored areas around NUMA policies, reusable core policies,
+  and whether the chosen core-estimation parameters generalize.
+
+**GPU DB mapping:** The strongest transfer is not "use Arachne as a library."
+It is the resource contract: GPU DB's runtime should expose physical resources
+and queue classes to the scheduler instead of hiding them behind one OS thread
+per client or one generic work queue. Logical sessions can be virtual, but IO
+workers, mutation owners, read-snapshot workers, residency workers, and GPU
+execution owners need explicit CPU-core and GPU-stream budgets.
+
+For the current high-throughput runtime design, this supports a split between
+exclusive poller/owner lanes and normal request lanes. Network IO workers,
+mutation owners, residency owners, and GPU execution owners are closer to
+Arachne's exclusive class because they poll sockets, command rings, CUDA
+events, or residency queues. Short retained reads, response encoding, and CPU
+fallback fragments can be normal request classes placed over a bounded worker
+pool.
+
+Arachne's `maskAndCount` and queueless dispatcher suggest a GPU DB experiment:
+for very short same-shape read tasks, ready-queue machinery can cost more than
+the work. A small fixed pool of per-core task contexts, a compact runnable word,
+and power-of-two placement may be enough for CPU-side retained-read dispatch,
+response encoding, and GPU completion callbacks. The important part is to
+measure cache-line movement, not only request counts.
+
+Core estimation maps to admission. GPU DB should not only count open sessions;
+it should estimate active runnable work per class. A 1M-session target should
+admit many parked protocol sessions while scaling physical execution lanes from
+recent runnable load, queue delay, GPU queue saturation, and response-ring
+pressure. Session count is a capacity metric; runnable load is the scheduling
+metric.
+
+The RAMCloud result is especially relevant to writes and multi-stage queries.
+If a mutation waits briefly on WAL flush, replication, fsync, CUDA event,
+or cold-block fetch completion, the owning core should not spin uselessly when
+other safe work exists. But the YCSB-C read penalty is a warning: for hot
+read-only retained lookups, extra task creation can be a regression unless it
+amortizes a real wait, batch, or route-selection cost.
+
+**Risks and mismatches:** Arachne is a runtime paper, not a database
+concurrency-control or storage paper. It has no MVCC visibility model, WAL
+ordering, snapshot publication protocol, crash recovery, SQL correctness, or
+GPU residency semantics. Its cooperative user threads assume short,
+well-behaved work; long scans, blocking syscalls, page faults, CPU fallback
+joins, and cold-tier reads can break the latency promise unless isolated in
+separate classes or made preemptible by other mechanisms.
+
+The core arbiter needs root privileges and cpuset control. That is acceptable
+for a controlled benchmark host but not automatically acceptable for production
+deployment. A database can still borrow the internal idea by pinning worker
+pools and publishing core budgets without adopting a whole-machine arbiter.
+
+Arachne also has a hard scale shape: 56 occupied thread contexts per core in
+the described encoding. GPU DB's 1M logical sessions cannot map to per-session
+thread contexts. The mapping must be many parked logical sessions to a small
+number of active per-core request contexts.
+
+NUMA and hyperthread policy are underexplored in the paper. GPU DB will care
+deeply about NUMA locality for NIC queues, pinned host buffers, WAL memory,
+NVMe queues, and GPU PCIe/NVLink affinity. A core-aware runtime without
+topology-aware placement could move bottlenecks rather than remove them.
+
+**Benchmark candidates:**
+
+- Replace the thread-per-client pgwire benchmark path with a small IO-worker
+  pool and fixed request contexts. Gate: equivalent SQL correctness and lower
+  p95/p99 latency at the same logical client count before increasing scope.
+- Add per-class runnable-load telemetry: IO parse, mutation, retained read,
+  residency refresh, GPU launch/completion, CPU fallback, and response encode.
+  Gate: scheduler/admission decisions can be replayed from queue depth, load
+  factor, utilization, and wait-time logs.
+- Prototype per-core retained-read task contexts with power-of-two placement
+  and no heap allocation. Compare against generic channels and a ready-queue
+  worker pool for same-shape lookup batches.
+- Separate exclusive owners from normal request work: one or more pinned lanes
+  for network polling, mutation/WAL, residency, and GPU execution; bounded
+  normal pools for short read/response tasks. Failure condition: tail latency
+  improves only by starving write visibility, refresh, or response delivery.
+- Add a parked-session benchmark: many idle or slow logical sessions, small
+  active runnable set, and bursty retained reads. Gate: memory per session,
+  active contexts per core, queue wait, and p99 response latency remain bounded.
+- Measure whether CPU work can be done during short waits on WAL flush, CUDA
+  events, or cold-block fetches without violating owner-domain ordering. Gate:
+  no work runs while holding state that would make visibility or invalidation
+  ambiguous.
+- Run a NUMA/topology placement sweep for NIC, WAL buffers, GPU pinned buffers,
+  and worker cores. Failure condition: a "core-aware" layout wins average
+  throughput but worsens p99 because it ignores PCIe or memory locality.
+
+### 2026-06-03 - Cross-paper synthesis: scheduler decisions must be classed
+
+**Papers compared:** BaM GPU-initiated storage access; ParamTree learned
+cost-model calibration; Arachne core-aware thread management.
+
+**Converging design tracks:** These papers converge on the same shape from
+different layers: do not hide resource decisions in opaque subsystems. BaM
+wants cold-block IO to expose queue depth, coalescing, cache-hit state, and
+block granularity. ParamTree wants route costs to expose named formula terms
+that can be calibrated by context. Arachne wants applications to see physical
+core allocations and schedule their own short-lived work accordingly.
+
+For GPU DB, that points to classed scheduling. A retained point read, resident
+aggregate, cold over-resident scan, mutation batch, WAL wait, refresh, response
+encode, and CPU fallback should not all be anonymous requests in one queue.
+Each class needs its own hard validity checks, resource terms, queue-depth
+telemetry, and fallback policy.
+
+**Category gaps:** The recent set has good coverage for over-resident IO,
+route calibration, and CPU runtime scheduling. The next underrepresented high-
+value papers should still lean MVCC/HTAP visibility or transaction write-path
+design rather than another GPU analytics or learned-optimizer paper.
+
+**Benchmark priorities:**
+
+- Build a replayable route/admission log that records class, legality checks,
+  cost terms, queue wait, resource generation, and observed latency for each
+  request.
+- Add a scheduler experiment with separate classes for hot retained reads, cold
+  over-resident reads, mutations, refresh, and response encoding. Gate: no class
+  improves by starving visibility publication or response completion.
+- Combine BaM-style block-miss coalescing with Arachne-style active-context
+  limits: a cold route should be admitted only when the batch provides enough
+  independent miss parallelism and enough execution contexts to hide latency.
+- Treat ParamTree-style learned weights as advisory inside each class, never as
+  a replacement for hard snapshot, WAL, residency, and queue-capacity gates.
