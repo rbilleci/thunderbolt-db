@@ -16,6 +16,9 @@ replication, benchmark, and fault-injection runs.
 
 Migrated series:
 
+- `series/local-release-candidate-readiness/` owns local/dev readiness,
+  production-security posture, replication-channel security, and
+  release-candidate evidence-bundle reports.
 - `series/p7-p8-residency-baselines/` owns the early GPU relational benchmark
   and resident-cache baseline reports.
 - `series/p8-retained-concurrency/` owns the retained-route concurrency graph
