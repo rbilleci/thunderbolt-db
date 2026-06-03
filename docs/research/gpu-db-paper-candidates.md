@@ -614,9 +614,10 @@ Append new candidates here as each paper is processed.
   Why: cited by Counting Is All You Need; relevant to comparing analytical
   system retrofits against a standalone transactional engine with retained
   transformation and snapshot-refresh metadata.
-- `queued` — **Hermes: Off-the-Shelf Real-Time Transactional Analytics**,
+- `reviewed` — **Hermes: Off-the-Shelf Real-Time Transactional Analytics**,
   Milkai et al., PVLDB 2025.
-  URL: `https://www.vldb.org/pvldb/vol18/p1635-milkai.pdf`
+  URL: `https://www.vldb.org/pvldb/vol18/p2334-milkai.pdf`
+  DOI: `https://doi.org/10.14778/3742728.3742731`
   Why: same HTAP/transactional-analytics ecosystem; useful for comparing
   instant tuple discovery with off-the-shelf real-time analytical routing and
   freshness/overhead tradeoffs.
@@ -758,10 +759,25 @@ Append new candidates here as each paper is processed.
 - `queued` — **Data Blocks: Hybrid OLTP and OLAP on Compressed Storage Using
   Both Vectorization and Compilation**, Lang et al., SIGMOD 2016.
   URL: `https://www-db.cs.tum.edu/downloads/publications/datablocks.pdf`
-  Why: Mainlining Databases cites HyPer/Data Blocks as a compressed cold-data
-  HTAP baseline; useful for comparing hot/cold columnar block compression,
-  positional pruning metadata, and OLTP-safe tuple access against P8 resident
-  segment designs.
+  Why: Hermes and Mainlining Databases keep returning to stable columnar data
+  plus mutation-adjacent transactional access; useful for older-but-eligible
+  compressed HTAP storage mechanics. Mainlining Databases also cites
+  HyPer/Data Blocks as a compressed cold-data HTAP baseline; useful for
+  comparing hot/cold columnar block compression, positional pruning metadata,
+  and OLTP-safe tuple access against P8 resident segment designs.
+- `queued` — **How Good is My HTAP System?**, Milkai et al., SIGMOD 2022.
+  URL: `https://doi.org/10.1145/3514221.3526148`
+  Code: `https://github.com/UWHustle/HATtrick`
+  Why: Hermes evaluates real-time analytics against HATtrick; useful for
+  shaping GPU DB mixed transactional/analytical workload gates beyond separate
+  OLTP and OLAP clients.
+- `queued` — **FlexPushdownDB: Hybrid Pushdown and Caching in a Cloud DBMS**,
+  Yang et al., PVLDB 2021.
+  URL: `https://vldb.org/pvldb/vol14/p2101-yang.pdf`
+  DOI: `https://doi.org/10.14778/3476249.3476265`
+  Why: Hermes uses FlexPushdownDB as an AP engine; relevant to deciding which
+  filtering, aggregation, and cache work should happen near storage, host
+  memory, or GPU execution workers.
 - `queued` — **L-Store: A Real-time OLTP and OLAP System**, Sadoghi et al.,
   EDBT 2018.
   URL: `https://arxiv.org/abs/1601.04084`

@@ -23473,3 +23473,136 @@ misses. Compare full rebuild, chunk-directory rebuild, trace-assisted
 rebuild, and virtual-contiguous warm segments while checking visible
 generation, resident generation, placement directory checksum, and
 reader retirement invariants.
+
+### 2026-06-03 - Hermes off-the-shelf real-time transactional analytics
+
+**Citation:** Elena Milkai, Xiangyao Yu, and Jignesh M. Patel.
+"Hermes: Off-the-Shelf Real-Time Transactional Analytics."
+Proceedings of the VLDB Endowment 18(8), 2025, pages 2334-2347.
+doi:10.14778/3742728.3742731. Retrieved 2026-06-03 from
+`https://www.vldb.org/pvldb/vol18/p2334-milkai.pdf`.
+
+**Category:** hybrid HTAP, with MVCC / snapshot / visibility and
+multi-tier cache / data placement.
+
+**Relevance tags:** HTAP; transactional analytics; fresh analytics;
+log-tail merge; foreground merge; background merge; delta cache;
+snapshot isolation; serializable isolation; read committed; AP/TP
+engine split; stable data plus deltas; retained-refresh frontier;
+transactional analytical workload.
+
+**Core idea:** Hermes argues that real-time transactional analytics
+does not always require replacing existing transactional and analytical
+engines with one tightly coupled HTAP database. Instead, it inserts a
+middle layer between engines and storage. The layer captures the TP
+engine's transaction log tail, keeps recent deltas in memory, and merges
+those deltas with stable analytical data as AP reads arrive. This gives
+analytical queries fresh committed data while preserving the specialized
+TP/AP engines and their normal execution paths.
+
+The important transfer for GPU DB is the separation between stable
+published data and recent committed deltas. P8 can treat GPU/host
+retained segments as the stable AP-friendly representation, while a
+small generation-bound delta cache covers the gap between the stable
+resident generation and the latest WAL-safe visibility frontier. That is
+a narrower, more incremental target than rebuilding every resident
+segment before any fresh read can use the GPU route.
+
+**Concrete mechanisms:**
+
+- Hermes has two in-memory caches. The Log Cache holds the TP log tail,
+  while the M-Delta Cache holds materialized recent updates ready for
+  analytical merging.
+- DeltaPump moves log-tail entries from the Log Cache into the M-Delta
+  Cache. A transaction is considered observable after its commit record
+  reaches storage, so AP reads merge only committed log records.
+- Foreground Merge (FGM) intercepts AP storage reads, retrieves stable
+  analytical data, and merges it with matching M-Delta entries before
+  returning data in the stable AP format such as Parquet.
+- Background Merge (BGM) asynchronously folds M-Delta entries into
+  storage so the in-memory delta cache does not grow indefinitely.
+- For snapshot isolation, the TP engine shares the transaction snapshot
+  with Hermes. Hermes selects log records matching that snapshot before
+  the AP query runs.
+- For read committed, Hermes can read committed transactions directly
+  from the log without extra TP-engine coordination.
+- For transactional analytics, transactional statements run on the TP
+  engine and analytical statements run on the AP engine, with Hermes
+  coordinating the AP snapshot so both sides obey the requested isolation
+  level.
+- The implementation uses MySQL as the TP engine and FlexPushdownDB or
+  DuckDB as AP engines. The evaluation uses HATtrick and the paper's new
+  Transactional Analytics Workload (TAW). Reported results show stable
+  integration overhead, competitive HTAP performance, and up to 3x
+  better transactional-analytics performance than the compared HTAP
+  baseline, with TiDB losing performance when transactional analytics
+  causes plan changes and extra data movement through UnionScan.
+
+**GPU DB mapping:** P8's retained snapshots can adopt a Hermes-like
+stable-plus-delta route. A retained read snapshot would contain the
+stable resident generation plus a bounded, WAL-safe delta frontier. For
+query shapes that can merge deltas cheaply, the read worker can execute
+against resident HBM/host segment data and apply the delta cache before
+encoding the response. For shapes where deltas are large, unsupported,
+or not snapshot-compatible, the route should fall back explicitly rather
+than pretending the stale resident generation is fresh.
+
+The FGM/BGM split maps cleanly to GPU DB owners. Foreground merge is a
+latency-path read decision: can this request be served from stable
+resident data plus current deltas under its snapshot? Background merge
+is a residency-owner task: fold committed deltas into the next retained
+generation, publish it, and retire older delta ranges after all readers
+release them.
+
+Hermes also sharpens the meaning of "transactional analytics" for GPU
+DB. Some future requests will mix transactional writes, point reads, and
+GPU aggregates inside one logical transaction. The runtime should not
+force the whole transaction through the slowest owner if the analytical
+part can run from a proven snapshot. It does need a snapshot token or
+transaction visibility vector that GPU read workers can use to select
+stable segments and delta ranges without consulting the mutation owner
+for every request.
+
+**Risks and mismatches:** Hermes is middleware over existing cloud
+storage and engines, not a single storage engine with GPU HBM buffers.
+Its Parquet-style merge path may be too heavy for low-latency OLTP
+point reads, and the paper's implementation assumes row-level log data
+from the TP engine; page-level WAL would need decoding before the same
+idea applies. GPU DB also cannot equate "commit record reaches storage"
+with "resident route is safe" unless WAL-before-visibility,
+invalidation, schema generation, and MVCC snapshot selection all agree.
+
+Delta merging can become a hidden tax. If the hot write stream is large,
+FGM may repeatedly reapply many deltas, consume memory, or add tail
+latency. BGM can also contend with foreground reads and GPU execution if
+it is not budgeted as an owner-domain task with explicit queue depth and
+retirement telemetry.
+
+**Benchmark candidates:**
+
+- Add a host-only retained `stable + delta` benchmark. Keep a stable
+  column segment and a WAL-safe delta cache, then compare full rebuild,
+  CPU fallback, and foreground merge for point lookup, range aggregate,
+  and `COUNT(*)`. Gate: identical SQL-visible rows under the requested
+  snapshot.
+- Track delta frontier metrics per retained route: stable generation,
+  latest WAL-safe generation, delta rows, delta bytes, merge time, and
+  background-merge lag. Failure condition: a route claims freshness
+  without reporting the stable and delta generations it used.
+- Prototype BGM-style background folding for committed append deltas.
+  Gate: new retained generations publish only after WAL-safe visibility
+  and old generations/delta ranges retire only after all readers release
+  them.
+- Add a freshness/latency curve with continuous COPY plus retained
+  analytical reads. Sweep delta size and BGM cadence. Measure write
+  throughput, refresh lag, p50/p95 query latency, owner queue wait, and
+  fallback rate.
+- Create a transactional-analytics smoke workload: begin transaction,
+  perform transactional logic, run a retained aggregate under the same
+  snapshot, then commit or abort based on the result. Gate: RC, SI, and
+  future serializable modes either prove the correct snapshot route or
+  reject/fallback with an explicit reason.
+- Test unsupported-delta shapes separately, such as updates/deletes to
+  text columns or predicates not admitted by the retained route. Failure
+  condition: foreground merge silently broadens into an unbounded CPU
+  scan.
