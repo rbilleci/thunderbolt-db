@@ -19551,3 +19551,144 @@ overfit to only queue policy or only OLAP kernels.
 - Add telemetry fields that make choices auditable: route class, queue wait,
   owner hold time, worker utilization, encoding family, compressed bytes,
   dense bytes, conversion reason, fallback reason, and stale-generation reason.
+
+### 2026-06-03 - Free Join unified binary and worst-case-optimal joins
+
+**Citation:** Yisu Remy Wang, Max Willsey, and Dan Suciu. "Free Join:
+Unifying Worst-Case Optimal and Traditional Joins." PACMMOD 2023; arXiv
+2301.10841v2. Retrieved 2026-06-03 from
+`https://arxiv.org/abs/2301.10841`.
+
+**Category:** query optimization / planning, with GPU execution / analytics.
+
+**Relevance tags:** multiway joins; worst-case optimal joins; binary joins;
+join route spectrum; lazy tries; column-oriented offsets; vectorized probing;
+factorized intermediates; skew-aware planning; GPU-resident joins.
+
+**Core idea:** Free Join treats binary hash joins and worst-case-optimal joins
+as points in one broader design space. Instead of choosing either a traditional
+binary plan or a Generic Join variable order, it represents a plan as nodes
+that may join any number of relations on any number of variables. The system
+starts from an already optimized binary plan, converts it to a Free Join plan,
+then heuristically factors lookups earlier when the required variables are
+available.
+
+The important transfer is not "always use WCOJ." The paper's experiments show
+that cyclicity alone does not decide the winner; skew, materialization, and
+optimizer quality matter. Free Join's practical advantage is that it can reuse
+existing binary-plan optimizers while selectively moving toward multiway joins
+when early intersection avoids explosive intermediates.
+
+**Concrete mechanisms:**
+
+- A Free Join plan is a list of nodes. Each node contains subatoms, and each
+  subatom covers a subset of a relation's variables. Across all nodes, the
+  subatoms for a relation partition that relation's variables.
+- A valid node must have at least one cover subatom containing the variables
+  newly introduced at that node. Execution iterates over the cover and probes
+  the other subatoms with variables already bound by this or earlier nodes.
+- Binary left-deep plans map naturally to Free Join plans: the left relation is
+  iterated, while later relations contribute probe subatoms plus subsequent
+  output-variable subatoms.
+- The optimizer factors lookups from a later node to the previous node when all
+  variables needed for the lookup are already available, the previous node does
+  not already contain the same relation, and earlier lookups in that node have
+  also been factored. This preserves the binary optimizer's lookup order while
+  filtering skewed intermediates earlier.
+- COLT, the Column-Oriented Lazy Trie, represents a relation as a tree whose
+  leaves are vectors of offsets into columnar base data and whose internal
+  nodes are hash maps from key tuples to child nodes.
+- COLT starts as an offset vector and only materializes a hash level when a
+  lookup requires it. A table that is only iterated as the left/cover side can
+  avoid building auxiliary hash/trie state entirely.
+- Runtime cover choice can pick the cover with the fewest keys; when a COLT
+  node is still an unforced vector, its vector length is used as an estimate.
+- Vectorized execution batches outer tuples before recursively descending. For
+  each batch, it performs grouped probes into the same trie set, drops failed
+  tuples, then recurses only for surviving tuples.
+- Evaluation uses a standalone Rust Free Join implementation, DuckDB binary
+  hash join plans as the binary baseline and optimizer source, a Rust Generic
+  Join baseline, and Kuzu for graph-query comparison on JOB and LSQB.
+- Reported JOB results show Free Join with a 2.94x geometric-mean speedup over
+  DuckDB binary joins and 9.61x over the authors' Generic Join implementation.
+  Maximum speedups are reported as 19.36x over binary join and 31.6x over
+  Generic Join; a few bushy/materializing cases are slower than binary join.
+- Reported LSQB results show Free Join up to 15.45x faster than binary join and
+  up to 4.08x faster than Generic Join on cyclic queries, but also show cyclic
+  queries where binary join remains competitive when skew is absent.
+- Ablation reports COLT at 1.91x geometric-mean speedup over a simple lazy trie
+  and 8.47x over a fully expanded trie. Vectorization with batch size 1000 is
+  reported as a 2.12x geometric-mean speedup over non-vectorized Free Join.
+- The authors identify limitations: main-memory-only data, possible COLT
+  inefficiency for disk-resident data due to random accesses, split
+  cost-based-plus-heuristic optimization, no use of existing indexes, and
+  simplistic materialization for bushy intermediates.
+
+**GPU DB mapping:** GPU DB should treat join route choice as a spectrum rather
+than a binary "GPU hash join versus CPU fallback" decision. A retained join
+route descriptor can expose binary hash join, multiway intersection, predicate
+transfer, factorized intermediate, compressed-position alignment, and GPU
+resident join-state options as related candidates with comparable costs.
+
+The strongest transferable mechanism is lazy, offset-based access. For a
+GPU-resident or host-resident snapshot, COLT's "offset vector first, hash/trie
+levels only when probed" maps to building relation/partition-local join access
+structures on demand. A retained join should be able to iterate a resident
+column group without first building every possible key structure, then cache a
+probe structure only for route shapes that actually recur.
+
+The factoring rule also maps well to GPU route planning. If several joins or
+predicates share a bound variable, GPU DB should intersect the cheapest
+resident masks or key sets before materializing rows or launching expensive
+join kernels. This is the join analogue of the compressed-data lesson: align
+position/key domains before decoding values or expanding output.
+
+For session concurrency, Free Join's vectorized probes suggest a natural
+micro-batch shape: collect compatible same-snapshot join requests, batch probe
+keys against retained relation structures, scatter results by request id, and
+avoid generating huge intermediate result buffers unless the response actually
+requires them. Compatibility still needs the runtime constraints from the
+architecture docs: same snapshot generation, relation/partition identity,
+query shape, route family, and output shape.
+
+**Risks and mismatches:** Free Join is a main-memory analytical join engine, not
+an OLTP engine. It does not address WAL-before-visibility, MVCC tuple chains,
+write admission, DDL invalidation, pgwire response latency, GPU kernel
+scheduling, or HBM/NVMe placement. Its COLT design assumes random access to
+columnar in-memory base data; the paper explicitly warns that disk-resident
+data could make COLT inefficient. The implementation is single-node and
+single-threaded for the studied join execution path, so reported speedups do
+not predict GPU DB's concurrent session throughput. The optimizer remains
+split between DuckDB's binary plan and Free Join's heuristic factoring, and the
+paper does not solve integrated cost estimation for GPU transfer, queue delay,
+resident validity, or compressed route conversion.
+
+**Benchmark candidates:**
+
+- Build a route-planning simulator for three-way and four-way joins with
+  controllable skew. Compare binary join order, predicate-transfer filter
+  first, Free-Join-style early intersection, and full multiway intersection.
+  Gate: the planner explains which intermediate explosion it avoided or why
+  binary join remained cheaper.
+- Add a no-GPU retained-join access-structure prototype over immutable column
+  snapshots: dense scan only, lazy hash map by key, and lazy trie/offset
+  representation. Measure build time, probe time, memory bytes, cache reuse,
+  and invalidation cost by snapshot generation.
+- Create a GPU microbenchmark for batched same-shape join probes: vector of
+  request keys against resident build-side keys, with result scattering by
+  request id. Gate: exact CPU result match and telemetry for batch size,
+  kernel count, H2D/D2H bytes, and output materialization bytes.
+- Add an "intermediate explosion" benchmark based on the clover/star pattern:
+  two large many-to-many joins on a shared key followed by a selective relation.
+  Failure condition: the selected route materializes the large intermediate
+  before applying the selective shared-key filter.
+- Test factorized intermediate accounting. A join route may hold offsets or
+  factorized position sets internally, but must expose exact SQL row counts,
+  response bytes, and fallback reasons before returning rows.
+- Extend route descriptors with join-shape fields: binary/multiway,
+  factorized/materialized, probe structure family, build snapshot generation,
+  skew estimate, expected intermediate rows, and output materialization cost.
+- Compare retained GPU join route decisions under memory pressure: build lazy
+  probe structure now, reuse an existing older compatible structure, execute
+  dense scan, fall back to CPU, or reject. Required metrics: p50/p99 latency,
+  resident bytes, stale-generation rejections, and route-choice regret.

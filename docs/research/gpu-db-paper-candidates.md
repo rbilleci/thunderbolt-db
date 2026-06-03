@@ -305,7 +305,7 @@ Append new candidates here as each paper is processed.
   Why: predicate transfer cites it as a related predicate-through-join
   approach; useful for comparing runtime Bloom-filter transfer with
   statistics-driven plan-time data skipping.
-- `queued` — **Free Join: Unifying Worst-Case Optimal and Traditional Joins**,
+- `reviewed` — **Free Join: Unifying Worst-Case Optimal and Traditional Joins**,
   Wang, Willsey, and Suciu, PACMMOD 2023.
   URL: `https://arxiv.org/abs/2301.10841`
   Author page: `https://www.mwillsey.com/papers/freejoin`
@@ -1682,3 +1682,11 @@ Append new candidates here as each paper is processed.
   Why: BMC compares against switch-based key-value caching; NetCache is useful
   for drawing the line between safe cached read responses and unsafe offload of
   SQL visibility, invalidation, and write semantics.
+- `queued` — **Adopting Worst-Case Optimal Joins in Relational Database
+  Systems**, Freitag et al., PVLDB 2020.
+  URL: `https://www.vldb.org/pvldb/vol13/p1891-freitag.pdf`
+  DOI: `https://doi.org/10.14778/3407790.3407797`
+  Why: Free Join builds on this lazy trie and binary/WCOJ hybrid baseline;
+  useful for comparing an optimizer switch between binary and WCOJ plans with
+  GPU DB's possible spectrum of binary, multiway, factorized, and GPU-resident
+  join routes.
