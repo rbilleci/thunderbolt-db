@@ -1001,7 +1001,7 @@ Append new candidates here as each paper is processed.
   Why: Syrup contrasts request scheduling with end-host transport scheduling;
   useful for future pgwire/transport choices if ordinary kernel TCP remains
   the high-concurrency bottleneck.
-- `queued` — **Flexible Resource Allocation for Relational
+- `reviewed` — **Flexible Resource Allocation for Relational
   Database-as-a-Service**, Arora et al., PVLDB 2023.
   URL: `https://www.vldb.org/pvldb/vol16/p4202-narasayya.pdf`
   Why: modern DBaaS resource-allocation paper cited by Resource-Adaptive Query
@@ -2373,3 +2373,22 @@ Append new candidates here as each paper is processed.
   Why: Helland's CIDR 2024 paper responds to this cloud OLTP design analysis;
   useful for comparing single-writer shared storage, multiple-writer coherent
   caching, shared-nothing partitioning, and hot-tuple cache-coherence tradeoffs.
+- `queued` — **Eigen: End-to-End Resource Optimization for Large-Scale
+  Databases on the Cloud**, Li et al., PVLDB 2023.
+  URL: `https://doi.org/10.14778/3611540.3611556`
+  Why: cited by the Azure SQL DBaaS resource-allocation paper as a related
+  cloud database resource optimizer; useful for comparing workload-level
+  resource recommendation and control-loop design with GPU DB admission,
+  cache budgets, and tenant/session placement.
+- `queued` — **Tenant Placement in Over-subscribed Database-as-a-Service
+  Clusters**, Konig et al., PVLDB 2022.
+  URL: `https://doi.org/10.14778/3489496.3489498`
+  Why: the flexible resource-allocation paper builds on this tenant-placement
+  model; useful for separating per-node resource brokering from cluster-level
+  placement, failover cost, and resource-violation prediction.
+- `queued` — **Toto - Benchmarking the Efficiency of a Cloud Service**,
+  Moeller, Ye, Lin, and Lang, SIGMOD 2021.
+  URL: `https://doi.org/10.1145/3448016.3457555`
+  Why: cited as Azure SQL infrastructure for measuring database resource
+  contention; useful for shaping no-GPU scalability probes that measure active
+  session budgets, cache pressure, and resource contention per logical route.

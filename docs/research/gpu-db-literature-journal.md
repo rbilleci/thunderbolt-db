@@ -27679,3 +27679,181 @@ WAL-before-visibility or hide stale reads from clients.
 - Test owner-partition handoff under a hot key range: close a busy
   generation, open a new one, and measure conflict-check overlap,
   read fallback, and retained snapshot invalidation cost.
+
+### 2026-06-04 - Flexible resource allocation needs database-visible value metrics
+
+**Citation:** Pankaj Arora, Surajit Chaudhuri, Sudipto Das,
+Junfeng Dong, Cyril George, Ajay Kalhan, Arnd Christian Konig,
+Willis Lang, Changsong Li, Feng Li, Jiaqi Liu, Lukas M. Maas,
+Akshay Mata, Ishai Menache, Justin Moeller, Vivek Narasayya,
+Matthaios Olma, Morgan Oslake, Elnaz Rezai, Yi Shan, Manoj
+Syamala, Shize Xu, and Vasileios Zois. "Flexible Resource
+Allocation for Relational Database-as-a-Service." PVLDB 16(13),
+2023, pp. 4202-4215. doi:10.14778/3625054.3625058. Retrieved
+2026-06-04 from `https://www.vldb.org/pvldb/vol16/p4202-narasayya.pdf`.
+
+**Category:** runtime / HFT / session scale and multi-tier cache /
+data placement.
+
+**Relevance tags:** resource admission; multi-tenant DBaaS;
+memory brokering; value of memory; buffer pool; column segment
+cache; plan cache; CPU affinity; core rebalancing; failover cost;
+warm-state migration; oversubscription; SLO protection.
+
+**Core idea:** The paper describes production mechanisms in
+Azure SQL Database for oversubscribing resources while keeping
+database performance impact controlled. Its central argument is
+that generic OS, VM, or cluster-manager resource controls are too
+coarse for database workloads because they cannot tell which
+memory, CPU placement, or cached state is actually valuable to a
+tenant. A DBMS should expose white-box resource value and
+resource-risk summaries to the node and cluster control planes.
+
+The strongest transferable idea is Value of Memory: cached
+objects should compete for memory by expected saved system time,
+not by owner, size, or recency alone. The same framing can be
+extended to GPU DB resource admission: resident HBM buffers,
+pinned host buffers, decoded text segments, response buffers,
+plan/route metadata, and warm NVMe pages need a common value
+metric before the runtime can evict, demote, reject, or admit work
+under pressure without accidentally damaging the hot path.
+
+**Concrete mechanisms:**
+
+- The node-level resource manager monitors per-database and
+  whole-node resource usage, including CPU, memory, local disk,
+  and disk bandwidth. It treats threshold crossings as resource
+  violations or impending violations.
+- Memory pressure first invokes database-aware memory
+  brokering, then tenant movement/failover if pressure persists,
+  and only then OS-level memory throttling as a last resort.
+- Value of Memory is defined as system-time-saved multiplied by
+  expected accesses per unit time. STS normalizes pages, plans,
+  and column segments by the time required to recreate them.
+- Memory brokering is formulated as retaining memory objects
+  under a global memory target while maximizing aggregate VoM,
+  equivalent to a knapsack problem. The implementation uses a
+  greedy heuristic over compact histograms rather than individual
+  objects.
+- Each tenant reports an equi-depth histogram of VoM values
+  across buffer pool, column segment cache, plan cache, and free
+  pages. The paper reports a bounded maximum histogram size of
+  about 11 KB per tenant and recomputes at most once per minute.
+- Buffer-pool VoM is estimated by random page sampling using
+  per-page STS and LRU-K-style last-reference information; larger
+  caches such as column segments and plans can be swept because
+  they contain fewer objects.
+- Free pages are assigned low VoM based on OS page-allocation
+  cost so tenants release unused reserved memory before useful
+  cache contents.
+- For CPU oversubscription, tenants are explicitly affinitized to
+  physical cores for locality and NUMA constraints. A node-level
+  manager periodically detects hot oversubscribed cores and
+  greedily re-affinitizes active tenants, with OS CPU throttling as
+  the fallback while cluster moves resolve persistent pressure.
+- Cluster placement uses historical tenant resource traces to
+  estimate the probability of future resource violations instead of
+  relying only on a current resource snapshot.
+- New tenants reserve headroom based on the 90th percentile
+  resource usage reached by prior tenants of the same class during
+  their first 24 hours, because tenants often grow quickly early in
+  life.
+- Move costs include disk usage, memory usage, and tenant
+  activity, bucketized into coarse levels to reduce disruption when
+  resolving resource pressure.
+- Failover impact is reduced with selective cache migration. For
+  buffer pools, the system uses push-based iterative pre-copy while
+  queries continue, pauses writes at ownership transfer, copies
+  remaining dirty pages, then relies on ARIES-style recovery to
+  correct stale or rolled-back migrated pages.
+- Evaluation uses TPC-C, a cloud database benchmark, production
+  resource traces, and Azure deployments. Reported highlights
+  include a 68% reduction in memory-capacity-induced failovers
+  after deploying memory brokering on a representative 200-node
+  production cluster, a drop from 2642.8 to 7.4 hot oversubscribed
+  CPU-core intervals in one bursty experiment, and about 2.4x
+  fewer violations than unmodified Service Fabric placement in a
+  real 40-node cluster deployment.
+
+**GPU DB mapping:** GPU DB should treat resource placement as
+a database-visible routing problem, not as a generic cache-size
+setting. A retained route should publish value and cost summaries
+for every scarce object it touches: resident GPU column buffers,
+visibility summaries, key-order vectors, pinned host staging
+buffers, decoded response templates, route plans, warm CPU
+segments, and NVMe-prefetched pages. The runtime can then
+decide whether to keep, demote, rebuild, or evict a structure based
+on expected saved time under actual route demand.
+
+VoM maps directly to P8 cache policy. For each resident segment,
+the engine can estimate saved time from avoided CPU scan, avoided
+H2D transfer, avoided decompression, avoided NVMe read, or
+avoided plan/setup work, then multiply by recent compatible route
+arrivals. That gives the residency owner a common currency across
+HBM, DRAM, pinned buffers, and cold-tier prefetches instead of
+separate ad hoc LRU lists.
+
+The CPU re-affinitization result is a reminder that 1M logical
+sessions are not only a socket-count problem. Active sessions need
+bounded placement on IO workers, mutation owners, GPU execution
+owners, and background refresh lanes. A per-core or per-owner
+"hot oversubscribed lane" detector should trigger route movement,
+admission throttling, or request rejection before the whole node
+looks busy.
+
+The tenant-placement model maps to route placement and
+generation placement inside a single GPU DB process. New tables,
+new prepared statements, and newly popular route shapes should
+reserve growth headroom, because warm-up demand often grows
+before telemetry stabilizes. Placement should use historical route
+classes, not only current queue depth.
+
+Selective cache migration maps to GPU snapshot handoff. If a
+resident generation must move between GPU devices, CPU owners,
+or future CXL/NVMe tiers, GPU DB should migrate only valuable
+state and preserve WAL/MVCC recovery as the correctness source.
+Partial warm-state movement is acceptable only if stale or missing
+acceleration state is detected and rebuilt before it can affect SQL
+results.
+
+**Risks and mismatches:** The paper targets cloud DBaaS tenants
+running isolated SQL Server instances, not a single-process GPU
+database engine. Its control loops operate at seconds to minutes,
+while GPU DB hot-path admission may need microsecond or
+millisecond reactions. It does not address GPU memory,
+host-device transfer, pinned-buffer scarcity, CUDA stream
+ownership, WAL publication inside one engine, or SQL route
+selection. VoM is cache-centric and relies on estimated access
+rates; bad estimates can evict state that is about to become hot.
+The production numbers are from Azure SQL Database
+infrastructure and should inform benchmark shape, not be treated
+as directly transferable performance targets.
+
+**Benchmark candidates:**
+
+- Add a P8 resource-value ledger for resident segments, pinned
+  staging buffers, decoded response templates, plan/route metadata,
+  and warm CPU segments. Gate: each entry reports bytes, recreate
+  cost, recent accesses, estimated saved time, owner, and safe
+  eviction or rebuild action.
+- Compare eviction policies for GPU/CPU resident segments: LRU,
+  byte-size only, route-frequency only, and VoM-like saved-time per
+  byte. Metrics: p50/p99 read latency, refresh cost, H2D bytes,
+  rebuild count, and fallback rate under a shifting hot-set workload.
+- Build a no-GPU session/resource oversubscription probe where
+  many logical sessions compete for a bounded active subset of
+  response buffers, pinned buffers, read queue slots, and mutation
+  slots. Failure condition: a cold or idle session can force eviction
+  of high-value active route state.
+- Add "hot oversubscribed lane" telemetry for IO workers,
+  mutation owners, residency owners, and GPU execution workers:
+  active route count, queue wait, service time, CPU utilization where
+  available, and rejection/fallback reason.
+- Test warm-state handoff by invalidating or moving a resident
+  generation while reads continue on older snapshots. The proof
+  gate is strict SQL correctness with explicit accounting for copied,
+  rebuilt, stale, and discarded acceleration state.
+- Track `resource_value_time_saved_us`, `resource_recreate_us`,
+  `resource_recent_access_rate`, `resource_value_per_byte`,
+  `resource_eviction_reason`, `owner_hot_lane_count`,
+  `active_session_credit_pressure`, and `warm_state_handoff_us`.
