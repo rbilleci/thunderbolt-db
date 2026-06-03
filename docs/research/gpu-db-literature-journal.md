@@ -25060,3 +25060,167 @@ in if an official PDF becomes accessible later.
   only selected numeric columns use MRV layout. Gate: higher sustained
   write throughput without weakening SQL-visible row semantics for the
   rest of the transaction.
+
+### 2026-06-03 - HATtrick throughput frontier for HTAP evaluation
+
+**Citation:** Elena Milkai, Yannis Chronis, Kevin P. Gaffney,
+Zhihan Guo, Jignesh M. Patel, and Xiangyao Yu. "How Good is My
+HTAP System?" SIGMOD 2022. doi:10.1145/3514221.3526148.
+Retrieved 2026-06-03 from DOI metadata, the SIGMOD record, the
+HATtrick repository, and the author/university PDF at
+`https://pages.cs.wisc.edu/~chronis/files/howgoodismyhtap.pdf`.
+
+**Category:** hybrid HTAP and benchmark methodology.
+
+**Relevance tags:** throughput frontier; freshness; performance
+isolation; mixed OLTP/OLAP workloads; snapshot recency; benchmark
+gates; resource interference; retained snapshots; GPU/CPU route
+balance.
+
+**Core idea:** HATtrick argues that HTAP systems need to be judged
+by a coupled performance surface rather than by independent OLTP
+and OLAP benchmarks. It introduces a throughput frontier that plots
+transactional throughput and analytical throughput together across
+mixed client ratios, then pairs that frontier with a freshness score
+for analytical queries. The benchmark is meant to reveal whether a
+system is truly sharing resources well, merely favoring one workload,
+or buying freshness by damaging either side's throughput.
+
+The paper classifies HTAP designs into shared, isolated, and hybrid
+architectures. Shared systems keep one data copy and rely on
+snapshots or MVCC; isolated systems dedicate compute and usually
+maintain separate row and column copies; hybrid systems share a
+machine but maintain two representations. The useful lesson for GPU
+DB is that each architecture can look good on a single-axis graph,
+but mixed frontier shape and freshness expose the actual tradeoff.
+
+**Concrete mechanisms:**
+
+- Throughput frontier treats each run as a pair: completed
+  transactional throughput and analytical-query throughput. The
+  interesting curve is the maximum hybrid throughput achieved across
+  different mixes of transactional and analytical clients.
+- The paper discusses two ways to construct the frontier: sampling
+  many `(T clients, A clients)` points and using a saturation method
+  that drives one workload while changing the other.
+- Freshness measures how old the snapshot seen by an analytical
+  query is relative to committed transactional updates. The benchmark
+  records transactional progress and analytical-observed progress so
+  each analytical result can be assigned a recency lag.
+- HATtrick extends a star-schema analytical workload with a
+  transaction workload derived from TPC-C-style operations, avoiding
+  the full complexity of TPC-C/TPC-H while keeping both workload
+  families present.
+- The evaluation compares representative shared, isolated, and hybrid
+  systems across scale factors, isolation levels, physical schemas,
+  replication modes, and deployment configurations.
+- The paper reports that many evaluated systems provide fresh
+  analytics, but not for free: freshness and mixed execution often
+  cost transactional throughput, analytical throughput, or both. It
+  also observes that transactional throughput is commonly hurt more
+  by analytical clients than analytical throughput is hurt by
+  transactional clients.
+
+**GPU DB mapping:** GPU DB should adopt a HATtrick-like evaluation
+shape before claiming an HTAP or retained-GPU win. Current retained
+routes have proven isolated read and load slices, but the product
+target needs a mixed frontier: COPY/INSERT/UPDATE or bounded-counter
+transactions on one axis, retained GPU lookup/aggregate/scan
+throughput on the other, and freshness or snapshot lag reported for
+every analytical/read-snapshot result.
+
+The freshness score maps directly to GPU DB's generation model. A
+retained read should report the source WAL or transaction boundary,
+resident snapshot generation, visibility boundary, and wall-clock or
+transaction-count lag from the latest committed mutation. This turns
+"valid resident snapshot" into a measurable freshness tradeoff rather
+than a binary route flag.
+
+The frontier shape is also a better benchmark for resource ownership.
+If long GPU scans, refreshes, or over-resident transfers depress
+transaction throughput, the runtime should show that as a frontier
+bending downward, not as a separate "GPU scan is fast" graph. If
+mutation owners starve retained reads because WAL/index work has no
+separate budget, the analytical axis will collapse. A healthy design
+needs bounded lanes and explicit freshness targets, not just maximum
+single-workload throughput.
+
+For P8 storage, HATtrick suggests benchmark gates around refresh
+granularity. Table-level rebuilds may give perfect correctness but
+poor mixed throughput; partition or segment refresh may improve the
+frontier if freshness lag stays bounded. The benchmark should measure
+which invalidation and refresh policy keeps the frontier closest to
+the isolated OLTP and OLAP baselines.
+
+**Risks and mismatches:** HATtrick is a benchmark methodology, not a
+storage, MVCC, networking, or GPU execution design. It does not tell
+GPU DB how to implement snapshot publication, WAL replay, partitioned
+residency, or CUDA scheduling.
+
+The benchmark's simplified schema is useful for reproducibility but
+may miss GPU DB-specific costs such as kernel-launch amortization,
+PCIe or NVMe movement, pinned-buffer exhaustion, response encoding,
+and resident-cache invalidation. GPU DB should borrow the metrics
+and workload mixing idea, not treat HATtrick as a sufficient final
+benchmark suite.
+
+The paper evaluates existing database deployments rather than a
+GPU-resident transactional engine. Absolute throughput results from
+PostgreSQL, PostgreSQL streaming replication, System-X, or TiDB are
+not transferable to GPU DB. The transferable claim is that mixed
+throughput plus freshness reveals design behavior hidden by isolated
+benchmarks.
+
+**Benchmark candidates:**
+
+- Add a small HATtrick-style mixed frontier harness for GPU DB:
+  transactional clients run COPY/INSERT or bounded stock decrement
+  loops while analytical clients run retained `COUNT`, `SUM`, point
+  lookup, and scan routes. Gate: report paired T/A throughput for
+  client ratios such as `100:0`, `80:20`, `50:50`, `20:80`, and
+  `0:100`.
+- Attach freshness telemetry to every retained read result:
+  source WAL boundary, visibility generation, resident generation,
+  latest committed generation at dispatch, and lag in transactions or
+  microseconds. Failure condition: a retained result claims GPU
+  validity without an explainable freshness boundary.
+- Compare table-level refresh, partition-level refresh, and stale-read
+  rejection under the same mixed workload. Gate: partition-level
+  refresh improves the frontier without silently serving stale data.
+- Plot resource-isolation curves for short retained lookups versus
+  long scans and refresh jobs. Gate: adding analytical clients does
+  not collapse transaction throughput unless telemetry attributes the
+  loss to a bounded queue, GPU stream, refresh, WAL, or response-ring
+  budget.
+- Add a "freshness budget" mode: analytical reads may accept up to
+  `N` committed generations of lag or require latest data. Gate:
+  latest-required reads fall back or wait explicitly, while bounded-lag
+  reads improve throughput with visible lag distribution.
+- Use HATtrick's frontier as a regression artifact after each P8
+  retained-route improvement. Failure condition: a single-route speedup
+  worsens the mixed frontier or freshness CDF without an intentional
+  tradeoff note.
+
+### 2026-06-03 - Cross-paper synthesis: frontier metrics make tradeoffs visible
+
+RingLeader, MRVs, and HATtrick converge on a shared warning: a
+throughput improvement is not enough unless the system can say which
+class of work won, which class paid, and which correctness boundary
+held. RingLeader gives the scheduler vocabulary, MRVs gives a
+semantic write-hotspot split, and HATtrick gives the mixed workload
+measurement that catches hidden interference.
+
+The strongest design track is a classed admission plane with explicit
+frontiers. GPU DB should measure logical sessions separately from
+runnable requests, split short retained reads, long scans, refreshes,
+and write batches into bounded lanes, and expose freshness or
+visibility generation on every retained read. Hot numeric write
+objects can use opt-in split-record layouts, but the mixed frontier
+should decide whether the read amplification is worth it.
+
+The current category gap is not another isolated GPU scan number.
+The gap is mixed benchmark evidence: transaction throughput versus
+retained analytical throughput under visible freshness, with queue
+and tier attribution when one side bends the frontier. The next
+benchmark priority should be a host-only or small-retained frontier
+harness before deeper GPU scheduling claims.

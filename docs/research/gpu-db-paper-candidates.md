@@ -784,8 +784,9 @@ Append new candidates here as each paper is processed.
   HyPer/Data Blocks as a compressed cold-data HTAP baseline; useful for
   comparing hot/cold columnar block compression, positional pruning metadata,
   and OLTP-safe tuple access against P8 resident segment designs.
-- `queued` — **How Good is My HTAP System?**, Milkai et al., SIGMOD 2022.
+- `reviewed` — **How Good is My HTAP System?**, Milkai et al., SIGMOD 2022.
   URL: `https://doi.org/10.1145/3514221.3526148`
+  PDF: `https://pages.cs.wisc.edu/~chronis/files/howgoodismyhtap.pdf`
   Code: `https://github.com/UWHustle/HATtrick`
   Why: Hermes evaluates real-time analytics against HATtrick; useful for
   shaping GPU DB mixed transactional/analytical workload gates beyond separate
@@ -809,6 +810,19 @@ Append new candidates here as each paper is processed.
   Why: lifecycle-aware LSM layout design is a follow-up to universal columnar
   and hot/cold block conversion; useful for comparing row-to-column movement
   by storage level rather than by in-memory block age.
+- `queued` — **F1 Lightning: HTAP as a Service**, Yang et al., PVLDB 2020.
+  URL: `https://www.vldb.org/pvldb/vol13/p3313-yang.pdf`
+  DOI: `https://doi.org/10.14778/3415478.3415553`
+  Why: HATtrick classifies isolated/hybrid HTAP designs and evaluates TiDB-style
+  split engines; F1 Lightning gives a production loose-coupling design for
+  fresh analytical copies, CDC, compaction, and federated query integration.
+- `queued` — **OLxPBench: Real-time, Semantically Consistent, and
+  Domain-specific are Essential in Benchmarking, Designing, and Implementing
+  HTAP Systems**, arXiv 2022.
+  URL: `https://arxiv.org/abs/2203.16095`
+  Why: HATtrick exposes the need to measure freshness and mixed throughput;
+  OLxPBench is a modern benchmark follow-up focused on semantic consistency and
+  domain-specific real-time analytics.
 - `queued` — **Pixels: An Efficient Column Store for Cloud Data Lakes**,
   Bian and Ailamaki, ICDE 2022.
   URL: `https://doi.org/10.1109/ICDE53745.2022.00286`
