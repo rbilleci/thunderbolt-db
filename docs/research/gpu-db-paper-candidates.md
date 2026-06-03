@@ -266,7 +266,7 @@ Append new candidates here as each paper is processed.
   URL: `https://www.vldb.org/pvldb/vol18/p1250-yuan.pdf`
   Why: multi-GPU/interconnect approach to capacity limits, useful for future
   over-resident and multi-device planning.
-- `queued` — **Tigger: A Database Proxy That Bounces with User-Bypass**,
+- `reviewed` — **Tigger: A Database Proxy That Bounces with User-Bypass**,
   Butrovich et al., PVLDB 2023.
   URL: `https://www.vldb.org/pvldb/vol16/p3335-butrovich.pdf`
   Why: user-bypass/eBPF database proxy work cited by Looking Glass 2.0;
@@ -1148,6 +1148,14 @@ Append new candidates here as each paper is processed.
   Why: modern survey and call-to-action for database/network co-design; useful
   for organizing future pgwire, RDMA, DPDK, and application-specific transport
   benchmark tracks.
+- `queued` — **BMC: Accelerating Memcached using Safe In-kernel Caching and
+  Pre-stack Processing**, Ghigoff et al., NSDI 2021.
+  URL: `https://www.usenix.org/conference/nsdi21/presentation/ghigoff`
+  PDF: `https://www.usenix.org/system/files/nsdi21-ghigoff.pdf`
+  Why: Tigger's related work points to BMC as another eBPF user-bypass design;
+  useful for evaluating whether tiny validated cache/protocol operations belong
+  in kernel-space fast paths, and where correctness/invalidation makes that too
+  risky for SQL.
 - `queued` — **KVell: the Design and Implementation of a Fast Persistent
   Key-Value Store**, Bartholomew et al., SOSP 2019.
   URL: `https://doi.org/10.1145/3341301.3359628`

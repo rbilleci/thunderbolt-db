@@ -12191,3 +12191,169 @@ response completion separately. The key pass/fail question is whether an
 expensive attempt can complete without repeated invalidation while the
 common short path keeps its p99 budget and WAL-before-visibility remains
 untouched.
+
+### 2026-06-03 - Tigger: a database proxy with user-bypass
+
+**Citation:** Matthew Butrovich, Karthik Ramanathan, John Rollinson,
+Wan Shen Lim, William Zhang, Justine Sherry, and Andrew Pavlo. "Tigger:
+A Database Proxy That Bounces With User-Bypass." PVLDB 16(11), 2023,
+pp. 3335-3348. doi:10.14778/3611479.3611530. Retrieved 2026-06-03 from
+`https://www.vldb.org/pvldb/vol16/p3335-butrovich.pdf`.
+
+**Category:** runtime / HFT / session scale.
+
+**Relevance tags:** PostgreSQL protocol proxying; connection pooling;
+transaction pooling; eBPF; sockmap; kernel-space fast path; user-bypass;
+session multiplexing; workload mirroring; CPU efficiency; cloud-native
+connection churn.
+
+**Core idea:** Tigger attacks a specific modern OLTP bottleneck: DBMS
+proxies are useful because they multiplex many client sessions over fewer
+backend connections, but conventional proxies still copy protocol buffers
+between kernel-space and user-space for every request and response. The
+paper's "user-bypass" design keeps the Linux TCP/IP stack and socket
+semantics, but pushes a small amount of DBMS protocol logic into safe
+kernel-resident eBPF handlers. The result is a PostgreSQL-compatible proxy
+that preserves ordinary client behavior while turning common forwarding,
+pooling, and mirroring operations into kernel-space fast paths.
+
+For GPU DB, the strongest transferable idea is not "put SQL execution in
+the kernel." It is the split between a tiny verified fast path and an
+ordinary user-space slow path. If 1M logical sessions eventually pass
+through pgwire-compatible IO workers, most packets should perform only
+bounded framing, state lookup, route selection, and buffer handoff. Work
+that requires authentication, SQL parsing, arbitrary allocation, complex
+transaction semantics, or GPU scheduling should stay in owner/runtime
+domains. Tigger gives a concrete shape for where that boundary can sit.
+
+**Concrete mechanisms:**
+
+- Tigger is built from PgBouncer but replaces hot proxy actions with eBPF
+  handlers. The user-space component still performs connection
+  establishment, client authentication, user/settings management, and
+  exceptional protocol operations.
+- Two primary sockmap-attached eBPF handlers process frontend client sockets
+  and backend PostgreSQL sockets. They inspect PostgreSQL message headers,
+  lengths, and selected bodies to decide whether a buffer is ordinary query
+  traffic, session-control traffic, or transaction-completion traffic.
+- Kernel-space state is stored in eBPF maps. Tigger uses server-socket maps,
+  client-socket maps, an idle-socket stack, and per-socket state metadata to
+  link a client socket to a pooled backend socket and later unlink it.
+- PostgreSQL messages can span socket buffers, so Tigger records partial
+  header state and the next-buffer offset in `SocketStatesMap` rather than
+  rescanning blindly.
+- Transaction pooling links a client to a backend only when query traffic
+  arrives, then releases the backend after transaction completion. Session
+  pooling holds the backend for the session and requires less transaction
+  status tracking.
+- If no user-bypass backend socket is available, or if an operation is not
+  supported by the fast path, Tigger falls back to a user-space pool.
+- Workload mirroring uses additional eBPF programs. Because socket-layer eBPF
+  cannot clone buffers, Tigger clones at the traffic-control layer, rewrites
+  metadata to move the clone back to a sockmap handler, and redirects it to
+  replica sockets while the primary remains authoritative.
+- The design deliberately attaches most DBMS protocol logic at the socket
+  layer, not XDP or lower layers, so Linux still owns TCP ordering,
+  retransmission, and kTLS-compatible decrypted socket buffers.
+- eBPF verifier limits shape the implementation. The paper reports a client
+  handler with 267 eBPF instructions, while verifier branch and loop analysis
+  expands the checked instruction count substantially. Full authentication,
+  full SQL parsing, and richer proxy features are kept out of the kernel path.
+- Evaluation uses PostgreSQL 14.5, BenchBase OLTP workloads, 10,000-client
+  connection-pooling tests, serverless-style short-lived connection tests,
+  workload mirroring, and proxy CPU-efficiency tests on AWS EC2 c6i
+  instances. The paper reports up to 29% transaction-latency reduction and
+  up to 42% CPU-utilization reduction versus other PostgreSQL proxies in one
+  scenario, and 92% lower latency plus 88% less CPU for workload mirroring
+  versus Pgpool-II. In the many-client YCSB run, Tigger shows 0.40 ms mean
+  and 0.76 ms p99 versus 0.62 ms mean and 1.72 ms p99 with no proxy.
+
+**GPU DB mapping:** The most direct mapping is to the front half of the
+target runtime topology: client sockets -> network IO workers -> bounded
+command rings. Tigger suggests a staged design in which pgwire IO first
+moves from one-thread-per-client to a small set of multiplexed workers, then
+optionally promotes only the most stable framing and routing operations into
+kernel-assisted fast paths. The "kernel" part is optional; the real design
+rule is that the hot ingress path must be small, bounded, and mechanically
+simple.
+
+For 1M logical sessions, GPU DB should treat session state as compact route
+metadata rather than as an execution thread. A frontend connection can be
+linked to a backend/owner/ring only while it has active work, then released
+or parked. The Tigger analogue of `IdleSocketsMap` is an explicit pool of
+available mutation, read-snapshot, and GPU execution admission slots. A
+logical session that has no admitted work should consume socket readiness
+state and protocol metadata, not a dedicated engine worker.
+
+Tigger's per-socket map state maps to GPU DB's request metadata: protocol
+phase, transaction state, active snapshot generation, target table/partition,
+route family, response shape, and linked owner queue. The fast path should
+be able to decide "read-only retained route," "mutation owner route,"
+"authentication/session control," "unsupported SQL," or "overload/fallback"
+without touching large engine state.
+
+Workload mirroring maps to a useful GPU DB benchmark mode: duplicate a
+subset of production-like read traffic to an experimental GPU route while
+returning the CPU/primary result to the client. The mirror must not become a
+correctness authority. It can warm resident snapshots, compare latency and
+result hashes, and collect fallback reasons before a GPU route is admitted
+for real traffic.
+
+Tigger also clarifies what should not be pushed into the fastest layer.
+Authentication, arbitrary SQL parsing, DDL, multi-statement transaction
+semantics, WAL-before-visibility sequencing, MVCC visibility, and GPU memory
+management exceed a verifier-style mental model. Those belong in owner
+domains with explicit publication fronts. A kernel/eBPF path, if ever used,
+should do bounded message framing, route-token lookup, and zero-copy or
+low-copy forwarding only.
+
+**Risks and mismatches:** Tigger is a PostgreSQL proxy, not a DBMS execution
+engine. It does not implement SQL planning, MVCC, WAL, result correctness,
+GPU execution, or durable storage. Its benefits appear when proxy overhead,
+connection churn, or connection count are important; long OLAP queries or
+GPU kernels would hide much of the proxy overhead.
+
+The implementation depends on Linux eBPF, sockmap behavior, kernel verifier
+limits, and privileged deployment choices. That is a meaningful operational
+risk for a portable database engine. eBPF maps are also not a natural home
+for large SQL caches or complex invalidation state. If GPU DB eventually
+uses eBPF, the first target should be measurement or narrow routing, not
+semantic caching.
+
+Tigger's transaction pooling also interacts with PostgreSQL features such as
+prepared statements and session state. The paper disables automatically
+prepared JDBC statements in BenchBase to avoid name contamination across
+shared backend connections. GPU DB's pgwire compatibility must account for
+prepared statements, portals, transactions, temporary state, and session
+settings before multiplexing sessions aggressively.
+
+**Benchmark candidates:**
+
+- Replace the benchmark endpoint's thread-per-client model with a
+  multiplexed pgwire IO-worker prototype. Required metrics: memory per idle
+  session, active session throughput, p50/p99 request latency, context
+  switches, queue depth, and response-ring wait time at 10k, 100k, and
+  synthetic 1M logical sessions.
+- Add a transaction-pooling admission model for short autocommit requests:
+  a session holds a mutation/read slot only while a request is active.
+  Failure condition: session-local state, prepared statements, or transaction
+  boundaries leak across clients.
+- Build a protocol fast-path classifier that reads only pgwire framing and a
+  cached route token, then sends read-only retained requests directly to
+  read-snapshot rings while unsupported messages go to the owner. Gate:
+  randomized protocol tests produce identical results and error handling to
+  the conservative owner route.
+- Add shadow mirroring for retained GPU reads: execute the authoritative CPU
+  path for the client, mirror eligible read-only requests to a GPU resident
+  route, and compare result hashes, latency, fallback reason, and residency
+  generation. Failure condition: mirrored work delays the authoritative path
+  beyond a small p99 budget.
+- Compare ordinary epoll, `io_uring`, and a simulated eBPF/user-bypass
+  classifier for pgwire message forwarding. The proof gate is CPU cycles and
+  p99 improvement after preserving authentication, TLS, prepared statement,
+  and transaction semantics.
+- Add telemetry that separates protocol overhead from execution overhead:
+  socket read/write time, framing/classification time, owner queue wait,
+  execution time, response encoding, and kernel/user copies if measurable.
+  The benchmark should identify whether Tigger-like bypass would actually
+  matter before adding Linux-specific machinery.
