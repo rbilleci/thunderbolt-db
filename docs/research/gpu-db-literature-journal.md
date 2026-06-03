@@ -26050,3 +26050,179 @@ that guard memory safety or visibility correctness.
   `resident_bytes_pending_retire`, and `maintenance_backpressure_us`.
   Failure condition: the system cannot explain whether latency is caused
   by execution, admission, visibility waiting, or cleanup debt.
+
+### 2026-06-04 - HybridLog for hot in-place point updates over cold storage
+
+**Citation:** Badrish Chandramouli, Guna Prasaad, Donald Kossmann,
+Justin Levandoski, James Hunter, and Mike Barnett. "FASTER: A
+Concurrent Key-Value Store with In-Place Updates." SIGMOD 2018,
+pp. 275-290. doi:10.1145/3183713.3196898. Retrieved 2026-06-04
+from the Microsoft Research publication page and PDF at
+`https://www.microsoft.com/en-us/research/publication/faster-a-concurrent-key-value-store-with-in-place-updates/`
+and `https://microsoft.com/en-us/research/uploads/prod/2018/03/faster-sigmod18.pdf`.
+
+**Category:** transaction processing / write path, with runtime,
+concurrency, and multi-tier storage implications.
+
+**Relevance tags:** point updates; read-modify-write; in-place hot
+updates; HybridLog; larger-than-memory state; epoch protection;
+trigger actions; latch-free hash index; cold storage; fuzzy
+checkpoint; hot-set shaping.
+
+**Core idea:** FASTER targets update-heavy point state where the
+logical dataset can exceed memory but only a drifting subset is hot.
+It combines a cache-friendly latch-free hash index with HybridLog, a
+record log whose memory tail is split into mutable and read-only
+regions. Hot records can be updated in place while they remain in
+the mutable region; colder records are copied forward through a
+log-structured path and eventually spill to storage.
+
+The transferable idea is a write path that does not choose between
+"all append-only" and "all buffer-pool in-place." Instead, the system
+uses explicit logical address fronts to decide whether an update can
+mutate a hot record in place, must copy the record to the tail, or
+must issue asynchronous storage I/O before continuing. This gives the
+hot set a second chance to remain in memory without per-record LRU
+metadata, while retaining a sequential log shape for cold state and
+checkpoint/recovery.
+
+**Concrete mechanisms:**
+
+- Threads register with an epoch-protection framework, periodically
+  refresh their local epoch, complete pending I/O continuations, and
+  release when done. The paper's example refreshes every 256
+  operations and checks pending work every 64K operations, but those
+  are implementation parameters rather than general constants.
+- Epoch trigger actions attach work to a future safe epoch. FASTER
+  uses them to lazily publish global state changes, flush or evict log
+  pages, update safe logical-address markers, resize the hash index,
+  and protect deleted-record memory reclamation.
+- The hash index is an array of cache-line buckets. Each 64-byte
+  bucket holds seven 8-byte entries plus an overflow pointer; entries
+  carry a tag, a tentative bit, and a 48-bit address so common updates
+  use 64-bit atomic compare-and-swap.
+- Inserts use a two-phase tentative-bit protocol. A thread claims an
+  empty slot tentatively, rescans the bucket for duplicate tags, and
+  then finalizes or backs off, preserving a unique entry per
+  offset/tag without bucket latches.
+- Records that share a hash offset/tag form reverse linked lists.
+  User logic owns record-level concurrency, allowing fetch-add,
+  locks, partition-aware non-latched updates, or application-specific
+  merge operations.
+- HybridLog has stable, read-only, fuzzy, and mutable regions over a
+  logical address space. Records beyond the read-only offset are
+  mutable; records below it are copied forward before update or read
+  from storage if already past the in-memory head.
+- A separate safe read-only offset prevents lost updates when threads
+  have stale views of the read-only boundary. It is advanced only
+  after an epoch transition proves all active threads have observed
+  the newer read-only offset.
+- Blind updates in the fuzzy region may copy forward because they do
+  not depend on the old value. Ordinary RMWs defer through pending
+  work because they cannot safely mix stale in-place and copied
+  updates. CRDT-style RMWs can append delta records that later merge.
+- The in-memory circular buffer uses flush-status and closed-status
+  arrays. A page is flushed only after an epoch proves all threads
+  finished writing to it; a page frame is reused only after the head
+  moved, the page was flushed, and an epoch proves no thread still
+  holds the old address.
+- Fuzzy index checkpoints are taken without stopping worker threads.
+  Recovery scans the HybridLog interval between checkpoint start and
+  end offsets to repair the fuzzy index into a consistent state.
+- Evaluation reports up to 115M operations/sec on uniform YCSB and
+  165M operations/sec on Zipfian YCSB with 56 threads when the data
+  fits in memory. Larger-than-memory results show steep read slowdown
+  under random SSD reads but high sequential log-write bandwidth for
+  blind updates. Checkpoint, recovery, and garbage-collection costs
+  are not included in the main throughput numbers.
+
+**GPU DB mapping:** FASTER is not a SQL transaction engine, but it is
+highly relevant to the GPU DB write path for hot point state. The
+current P8 design keeps WAL and CPU truth authoritative while GPU
+resident state is acceleration. HybridLog suggests a narrow storage
+experiment for hot `int4` key/value or MVCC metadata tables: keep a
+mutable CPU tail for hot records, copy colder versions forward only
+when they are touched, and spill older immutable regions to NVMe or
+future cold tiers.
+
+The logical-front design maps well to the existing owner-domain model.
+GPU DB can name fronts such as durable WAL frontier, CPU-visible
+frontier, resident snapshot frontier, safe read-only frontier, and
+cleanup-safe frontier. A mutation owner or partition owner can decide
+whether an update is in-place-safe, copy-forward, deferred, or cold I/O
+based on those fronts rather than ad hoc page pins.
+
+The safe read-only offset is the most concrete concurrency lesson. If
+GPU DB publishes a new residency or snapshot boundary while worker
+threads may still be acting on the old boundary, an update or refresh
+can be lost or made invisible to the wrong route. Any host-side hot
+segment, resident index, or GPU staging buffer that transitions from
+mutable to immutable needs a "safe observed by all relevant workers"
+front before copy-forward and in-place update rules can diverge.
+
+HybridLog's second-chance behavior also fits P8 tiering. A hot key
+that is touched before eviction gets copied or remains near the tail
+without maintaining fine-grained LRU counters. GPU DB could use a
+similar mechanism for hot point lookup metadata, resident index deltas,
+session-local prepared-state counters, or append-heavy ingestion
+tables, while still using explicit cache-manager telemetry for
+resident GPU column groups.
+
+The fuzzy checkpoint mechanism reinforces the WAL/rebuild separation.
+GPU DB can checkpoint rebuildable CPU indexes, resident-admission
+metadata, and route caches fuzzily if a deterministic log or WAL range
+can repair them to a named frontier. This should not weaken
+WAL-before-visibility; FASTER's optional WAL-elimination sketch is not
+directly transferable to SQL durability without a much stronger
+recovery proof.
+
+**Risks and mismatches:** FASTER provides atomic point reads, blind
+updates, and read-modify-writes, not full SQL transactions, secondary
+indexes, serializable isolation, predicate scans, joins, or DDL. Its
+record-level concurrency is delegated to user logic, so GPU DB would
+still need MVCC visibility, uniqueness, foreign-key, catalog, and
+planner correctness above any HybridLog-like structure.
+
+The paper's best numbers are for an embedded key-value store and
+exclude checkpoint, recovery, and garbage-collection overheads. Its
+larger-than-memory random-read path drops sharply as the hot set falls
+out of memory, which is exactly the failure mode GPU DB must measure
+before using this for cold-tier point lookups. The preferred
+expiration-based garbage collection also does not match SQL tables
+with arbitrary deletes, long snapshots, and user-visible retention
+semantics.
+
+In-place updates are dangerous for MVCC if applied to SQL-visible row
+versions. The safest mapping is to mutable auxiliary state, the latest
+version before publication, mergeable counters, or owner-private
+staging buffers. Published row versions, retained snapshots, and
+resident GPU buffers should remain immutable until retired by
+visibility-safe cleanup.
+
+**Benchmark candidates:**
+
+- Prototype a CPU-side HybridLog-like point-state store for one
+  append/update-heavy `int4` key table or resident-index delta map.
+  Gate: identical SQL-visible results to the MVCC tuple store under
+  insert/update/delete and WAL replay.
+- Compare append-only version records, in-place hot records, and
+  copy-forward hot records for repeated point RMWs. Required metrics:
+  write throughput, p95 read latency, log growth bytes/sec, cache
+  misses, and recovery rebuild time.
+- Add a safe-boundary test for mutable-to-read-only segment movement.
+  Failure condition: one worker updates an old location in place while
+  another worker publishes a copied-forward version that hides the
+  update.
+- Evaluate second-chance tail shaping for resident index deltas:
+  maintain no per-key LRU metadata, copy touched cold keys forward,
+  and measure hit ratio against CLOCK/LRU-style admission telemetry.
+- Test fuzzy checkpoint repair for a rebuildable CPU equality index:
+  checkpoint concurrently, replay the WAL/log interval between start
+  and end frontiers, and prove the recovered index matches CPU truth.
+- Stress cold-tier random reads with a hot-set distribution that
+  drifts over time. Gate: the route either preserves p99 latency with
+  bounded pending I/O or exposes overload/fallback before IO debt
+  grows without bound.
+- Keep in-place mutation out of published MVCC versions. Gate any
+  optimization behind a proof that WAL-before-visibility, retained
+  snapshot correctness, and old-version reconstruction are unchanged.

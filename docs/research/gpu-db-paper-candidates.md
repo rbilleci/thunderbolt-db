@@ -340,7 +340,7 @@ Append new candidates here as each paper is processed.
   Why: DAF's NoisePage context uses PAX/Arrow-like storage; this paper
   may inform GPU DB's CPU canonical layout, Arrow-compatible column
   groups, and transactional/analytical format choices.
-- `queued` — **FASTER: A Concurrent Key-Value Store with In-Place
+- `reviewed` — **FASTER: A Concurrent Key-Value Store with In-Place
   Updates**, Chandramouli et al., SIGMOD 2018.
   URL: `https://www.microsoft.com/en-us/research/publication/faster-a-concurrent-key-value-store-with-in-place-updates/`
   Why: DAF compares against FASTER's epoch protection; useful for
@@ -484,6 +484,18 @@ Append new candidates here as each paper is processed.
   Why: DBOS cites DB-backed file-system metadata; relevant to GPU DB catalog,
   cold-tier namespace, and metadata-service scaling without bespoke
   filesystem-like state.
+- `queued` — **KVell: The Design and Implementation of a Fast Persistent
+  Key-Value Store**, Balmau et al., SOSP 2019.
+  URL: `https://doi.org/10.1145/3341301.3359628`
+  Why: persistent key-value design for high-throughput direct storage and
+  multi-core request paths; useful as a contrast to FASTER's HybridLog for
+  GPU DB cold-tier point lookups, log replay, and explicit IO ownership.
+- `queued` — **FASTER: An Embedded Concurrent Key-Value Store for State
+  Management**, Chandramouli et al., PVLDB 2018.
+  URL: `https://www.vldb.org/pvldb/vol11/p1930-chandramouli.pdf`
+  Why: system/demo follow-up for FASTER as an embedded state store; useful for
+  API, checkpoint, and workload-shaping context if the engine adopts
+  HybridLog-like point-state structures.
 - `reviewed` — **Shinjuku: Preemptive Scheduling for microsecond-scale Tail
   Latency**, Kaffes et al., NSDI 2019.
   URL: `https://www.usenix.org/conference/nsdi19/presentation/kaffes`
