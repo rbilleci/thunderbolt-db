@@ -597,7 +597,7 @@ Append new candidates here as each paper is processed.
   Why: modern follow-up for QURO-style reordering at storage and validation
   stages under OCC; useful for comparing application-level query ordering
   with engine-owned micro-batching and dependency-aware validation.
-- `queued` — **Counting Is All You Need for Instant Tuple Discovery:
+- `reviewed` — **Counting Is All You Need for Instant Tuple Discovery:
   Enabling Real-Time HTAP in Standalone DBMSs**, Lim et al., PACMMOD 2025.
   URL: `https://doi.org/10.1145/3769775`
   Why: modern follow-up from the same HTAP/MVCC research ecosystem; tuple
@@ -608,6 +608,18 @@ Append new candidates here as each paper is processed.
   URL: `https://doi.org/10.1145/3639286`
   Why: modern tiered-main-memory buffer management cited by vmcache^n;
   relevant to DRAM/remote-memory/NVMe policy design and placement economics.
+- `queued` — **TiQuE: Improving the Transactional Performance of Analytical
+  Systems for True Hybrid Workloads**, PACMMOD 2023.
+  URL: `https://doi.org/10.14778/3598581.3598598`
+  Why: cited by Counting Is All You Need; relevant to comparing analytical
+  system retrofits against a standalone transactional engine with retained
+  transformation and snapshot-refresh metadata.
+- `queued` — **Hermes: Off-the-Shelf Real-Time Transactional Analytics**,
+  Milkai et al., PVLDB 2025.
+  URL: `https://www.vldb.org/pvldb/vol18/p1635-milkai.pdf`
+  Why: same HTAP/transactional-analytics ecosystem; useful for comparing
+  instant tuple discovery with off-the-shelf real-time analytical routing and
+  freshness/overhead tradeoffs.
 - `reviewed` — **PAR2QO: Parametric Penalty-Aware Robust Query Optimization**,
   Xiu et al., PVLDB 2025.
   URL: `https://www.vldb.org/pvldb/vol18/p4532-xiu.pdf`

@@ -23278,3 +23278,198 @@ default P8 rule.
   fine ORC-like small summaries against coalesced summary pages. Failure
   condition: pruning reduces bytes but increases latency through many
   small reads.
+
+### 2026-06-03 - Counting Is All You Need for Instant Tuple Discovery
+
+**Citation:** Kyungmin Lim, Minseok Yoon, Kihwan Kim, Alan D.
+Fekete, and Hyungsoo Jung. "Counting Is All You Need for Instant
+Tuple Discovery: Enabling Real-Time HTAP in Standalone DBMSs."
+Proceedings of the ACM on Management of Data 3(6), 2025, pages
+1-28. doi:10.1145/3769775. Retrieved 2026-06-03 from
+`https://doi.org/10.1145/3769775`; source metadata cross-checked with
+DBLP and Crossref. The ACM DOI path was Cloudflare-blocked from this
+worker, so details below are limited to the published abstract,
+metadata, and cited-source discovery; full algorithmic and evaluation
+details remain a follow-up.
+
+**Category:** hybrid HTAP.
+
+**Relevance tags:** HTAP; progressive ETL; tuple discovery; tuple
+trace vector; per-partition counters; row-to-column transformation;
+standalone DBMS; PostgreSQL; freshness; retained snapshot refresh;
+generation directories; auxiliary-index avoidance.
+
+**Core idea:** The paper targets a specific HTAP pain point: real-time
+analytics often depends on moving and reshaping transactional data into
+an analytical representation, and that ETL/reformatting step either
+adds delay or pushes the system toward a dual-engine architecture. The
+paper proposes TracerETL, a progressive ETL framework for a standalone
+DBMS. Its central mechanism, Tracer, uses counting rather than
+secondary indexes to determine where each tuple will be located as data
+moves through transformation stages.
+
+The transferable lesson is that transformation can publish enough
+deterministic placement metadata up front that later readers do not
+need to rediscover tuple locations by scanning, joining, or maintaining
+expensive auxiliary indexes. For GPU DB, this maps directly to retained
+snapshot refresh and row-to-column resident builds: if the mutation or
+refresh owner can attach a compact "future placement" vector to tuples
+or tuple groups, then GPU-resident segment construction can become a
+deterministic scatter/gather operation instead of a repeated discovery
+problem.
+
+**Concrete mechanisms:**
+
+- TracerETL is described as progressive ETL inside PostgreSQL rather
+  than a separate analytical companion engine. The available metadata
+  does not expose the exact PostgreSQL integration points, operator
+  hooks, or storage changes.
+- Tracer constructs a tuple trace vector using per-partition counters.
+  The vector encodes a tuple's arrival order and its future relocation
+  path across transformation levels.
+- The trace vector is deterministic. Given the tuple's transformation
+  level and recorded counter-derived path, the system can locate data
+  at an intermediate stage without a separate auxiliary index.
+- The design is explicitly about instant tuple location discovery
+  during transformation, not just faster bulk conversion after the fact.
+- The reported evaluation compares PostgreSQL with TracerETL against
+  OLAP- and OLTP-optimized DBMSs. The abstract reports up to 127x
+  acceleration for real-time HTAP queries and efficient progressive
+  conversion, but the exact workloads, baselines, freshness windows,
+  update rates, and overhead breakdowns are unknown from the accessible
+  sources.
+- Crossref lists related HTAP/storage references including TiQuE,
+  Real-Time LSM-Trees for HTAP Workloads, Diva, Long-lived Transactions
+  Made Less Harmful, KVell, and zero-ETL cloud-system material, which
+  confirms the paper is positioned around freshness, transformation,
+  and standalone/dual-system tradeoffs.
+
+**GPU DB mapping:** P8 currently treats GPU-resident data as
+rebuildable acceleration state published at WAL-safe visibility
+boundaries. TracerETL suggests making the refresh/build mapping itself
+first-class metadata. When rows enter a mutation batch, COPY chunk, or
+segment refresh, GPU DB can record per-partition counters and derived
+row positions for admitted route families. Later refresh can scatter
+values into dense int4/text buffers by deterministic placement rather
+than scanning the whole canonical tuple store to rediscover positions.
+
+The tuple trace vector also maps to partitioned retained execution.
+For over-resident data, the engine needs to know which partition,
+segment, and column-group slot a logical tuple will occupy as data is
+promoted from CPU truth to host segments and then to HBM. A compact
+trace vector could encode `partition -> segment -> block -> ordinal`
+for each generation, while the durable WAL and CPU MVCC state remain
+the authority. Readers would still execute only against published
+generations, but refresh workers would have a cheap path from write
+frontier to resident placement.
+
+For session concurrency, the value is indirect but important. If
+retained reads can locate transformed tuples without consulting a
+central owner or a mutable auxiliary index, then read-snapshot workers
+can serve more logical sessions from immutable metadata. That fits the
+runtime target of network IO workers feeding read-snapshot/GPU rings:
+the hot path should hold a snapshot generation plus placement directory,
+not ask the mutation owner to resolve row locations per request.
+
+The design also suggests a narrower alternative to full HTAP dual
+storage. GPU DB does not need to immediately maintain a complete
+analytical copy for every table. It can progressively transform only
+admitted columns and route families, with trace metadata proving where
+each tuple will land once the retained segment catches up.
+
+**Risks and mismatches:** The accessible source set is incomplete. The
+entry should not be treated as a full paper read until the ACM PDF or an
+author copy is available. Unknowns include counter overflow handling,
+partition split/merge behavior, deletes and updates, MVCC visibility
+interaction, transaction rollback semantics, memory overhead per tuple,
+and whether the trace vector is stable under schema changes.
+
+TracerETL targets standalone HTAP in PostgreSQL, not GPU HBM residency.
+GPU DB has stricter publication rules: WAL-before-visibility, immutable
+snapshot handles, DDL invalidation, and GPU buffer ownership must remain
+separate from any transformation metadata. A trace vector can guide
+refresh placement, but it cannot become the durable source of truth or
+let readers observe rows before the visibility boundary is published.
+
+Per-tuple metadata may also be too expensive for hot write paths. The
+GPU DB version should start with per-chunk or per-segment placement
+summaries unless a benchmark proves per-tuple trace metadata pays for
+itself under mixed writes and reads.
+
+**Benchmark candidates:**
+
+- Add a host-only "trace-assisted resident build" benchmark. During a
+  COPY or append batch, assign deterministic partition/segment ordinals
+  using counters, then build dense column buffers from the trace instead
+  of rediscovering row locations by scanning. Gate: identical visible
+  rows and resident checksums versus the current rebuild path.
+- Compare three refresh metadata granularities: no trace, per-chunk
+  trace summaries, and per-row trace vectors. Measure write admission
+  overhead, refresh wall time, memory bytes per row, p95 retained-read
+  latency, and invalidation cost.
+- Add a progressive transformation benchmark where a retained route can
+  query a partially transformed generation. Gate: every query reports
+  the visibility generation and transformation frontier it used, and no
+  reader can observe a row beyond the WAL-safe frontier.
+- Prototype a partitioned placement directory keyed by
+  `(table_oid, schema_generation, visibility_generation, partition_id,
+  route_family)`. Failure condition: read workers must call the mutation
+  owner to resolve ordinary retained row locations.
+- Stress updates and deletes separately from inserts. Measure whether
+  trace metadata can retire or redirect old tuple placements without
+  breaking MVCC chains, long retained readers, or resident snapshot
+  retirement.
+- Run an HTAP freshness benchmark once GPU hardware is available:
+  continuous COPY/INSERT plus retained point/range/aggregate reads over
+  progressively refreshed segments. Measure freshness lag, refresh
+  throughput, write throughput, owner queue wait, H2D bytes, and query
+  latency. Failure condition: trace maintenance improves refresh speed
+  but reduces sustained write admission below the current COPY gate.
+
+### 2026-06-03 - Cross-paper synthesis: refresh metadata is becoming the storage design
+
+The last three reviewed modern papers all point at the same P8 pressure
+point from different angles. RUMA separates logical contiguity from
+physical page movement. The columnar-format study shows that segment
+metadata, encoding, and decode-block shape must fit the execution tier.
+Counting Is All You Need argues that transformation can carry a compact
+future-placement description so readers do not rediscover tuple
+locations later. Together, they suggest that GPU DB's "storage format"
+is not just bytes in HBM or DRAM; it is the generation-indexed metadata
+that lets writes, refresh, pruning, and retained reads agree on where a
+tuple is allowed to be seen.
+
+Converging design tracks:
+
+- **Generation-indexed placement directories:** retained snapshots should
+  publish a directory keyed by table, schema generation, visibility
+  generation, partition, column group, and route family. The directory
+  should expose row counts, byte offsets, min/max or Bloom summaries,
+  and optional trace-derived placement ranges.
+- **Trace-assisted refresh:** append/COPY admission can record cheap
+  per-chunk or per-segment placement counters so later row-to-column
+  builds scatter deterministically instead of rescanning CPU truth for
+  every refresh.
+- **Virtual or explicit contiguity:** host-memory tiers can use either
+  VM remapping or an explicit page/segment directory to make fragmented
+  warm data look scan-friendly without forcing immediate physical
+  compaction.
+- **Tier-specific metadata granularity:** HBM/DRAM routes can afford
+  fine pruning summaries, while NVMe or future remote tiers need
+  coalesced summary pages to avoid many tiny reads.
+- **Correctness-first publication:** none of these mechanisms weakens
+  WAL-before-visibility. Placement, pruning, and virtual-contiguity
+  metadata are acceleration structures tied to a published generation.
+
+Category gaps now lean toward transaction/write-path recovery under
+these richer metadata schemes and tiered-main-memory policy economics.
+The next high-value papers are Towards Buffer Management with Tiered
+Main Memory, Hermes, or TiQuE rather than another GPU scan-only paper.
+
+Benchmark priority: build a host-only retained-refresh control-plane
+benchmark before touching GPU kernels. Feed a mixed stream of COPY
+chunks, updates/deletes, long retained readers, and cold/warm partition
+misses. Compare full rebuild, chunk-directory rebuild, trace-assisted
+rebuild, and virtual-contiguous warm segments while checking visible
+generation, resident generation, placement directory checksum, and
+reader retirement invariants.
