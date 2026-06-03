@@ -542,7 +542,7 @@ Append new candidates here as each paper is processed.
   Why: variable-length mini-pages decouple cached hot records and update
   buffers from disk pages; relevant to GPU DB cold-partition index pages and
   host/NVMe cache granularity.
-- `queued` — **Query Fresh: Log Shipping on Steroids**, Wang, Johnson, and
+- `reviewed` — **Query Fresh: Log Shipping on Steroids**, Wang, Johnson, and
   Pandis, PVLDB 2017.
   URL: `https://www.vldb.org/pvldb/vol11/p406-wang.pdf`
   Why: DANA cites RDMA log shipping as an alternative low-latency WAL path;
@@ -1344,6 +1344,13 @@ Append new candidates here as each paper is processed.
   phase-specific combinations of RPC and one-sided verbs; DrTM-H is a primary
   transaction-processing baseline for deciding which validation, commit, and
   replication steps can safely bypass server CPU work.
+- `queued` — **The End of a Myth: Distributed Transactions Can Scale**,
+  Zamanian et al., PVLDB 2017.
+  URL: `https://arxiv.org/abs/1607.00655`
+  Why: Query Fresh and modern-network discussions point to RDMA-enabled
+  distributed transaction designs; NAM-DB is useful for comparing remote memory
+  access, snapshot isolation, and partition ownership against GPU DB's local
+  owner-domain plus future remote-tier ambitions.
 - `queued` — **LITE Kernel RDMA Support for Datacenter Applications**,
   Tsai and Zhang, SOSP 2017.
   URL: `https://doi.org/10.1145/3132747.3132762`

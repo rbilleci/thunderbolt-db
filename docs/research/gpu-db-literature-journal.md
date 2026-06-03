@@ -15265,3 +15265,139 @@ guards.
   improvement: better join order and smaller intermediate materialization after
   transfer-updated cardinalities; failure condition: replanning overhead exceeds
   avoided join work.
+
+### 2026-06-03 - Query Fresh synchronous log shipping with fresh replicas
+
+**Citation:** Tianzheng Wang, Ryan Johnson, and Ippokratis Pandis. "Query
+Fresh: Log Shipping on Steroids." PVLDB 11(4), 2017, pp. 406-419.
+DOI: `10.1145/3164135.3164137`. Retrieved 2026-06-03 from
+`https://www.vldb.org/pvldb/vol11/p406-wang.pdf`.
+
+**Category:** transaction processing / write path and runtime / storage.
+
+**Relevance tags:** WAL shipping; synchronous replication; append-only
+storage; replay freshness; RDMA; NVRAM; read replicas; snapshot isolation;
+indirection arrays; commit latency; recovery.
+
+**Core idea:** Query Fresh attacks the usual hot-standby tradeoff between
+safety, freshness, and primary throughput. Traditional synchronous physical
+log shipping keeps committed work safe but makes the primary wait for network
+and storage, while backups often expose stale reads because they must replay
+logs into a second "real" database copy before queries can see recent changes.
+
+The paper's answer is to stop treating the log as a transient replay input.
+In an append-only ERMIA-based storage design, the log is the database: redo-only
+committed records are shipped to backup NVRAM log buffers, replay updates
+in-memory indirection arrays, and indexes map keys to logical RIDs rather than
+physical record locations. This makes replay mostly a scan-and-publish step,
+so backups can stay fresh and still reserve most cores for read-only work.
+
+**Concrete mechanisms:**
+
+- The primary ships batches at group-commit or log-flush boundaries. It posts
+  one RDMA Write with Immediate per backup, overlaps network transfer with
+  local log persistence, and polls completion only to keep RDMA state correct.
+- Backup log buffers live in byte-addressable persistent memory in the design.
+  The paper is careful that RDMA completion alone does not prove persistence:
+  DDIO and CPU caches can make bytes visible before they are durable.
+- For a general-purpose server method, the backup must flush or write back the
+  received cache lines, issue a fence, and acknowledge persistence before the
+  primary can treat the remote copy as durable.
+- Log records are redo-only physical records generated only by committed
+  transactions. The recovery/replay path therefore avoids undo and does not
+  need deterministic re-execution of transaction logic.
+- The durable append-only log stores the actual record versions. In-memory
+  indirection arrays map each logical RID to the current physical version
+  location; indexes point to RIDs, so updates can publish a new version by
+  changing indirection rather than updating every index.
+- Query Fresh keeps separate data and replay arrays during replay pipelining.
+  Replay can make new versions available through the replay array before the
+  data array is fully reconciled, reducing freshness lag.
+- Replay is parallel and lightweight. For updates, replay mostly sets
+  indirection; only inserts need index work in the described ERMIA/Masstree
+  implementation.
+- Multi-buffering reduces waits for reusable log-buffer space while shipped
+  buffers are still being acknowledged or replayed.
+- The evaluation uses full TPC-C read/write traffic on the primary and TPC-C
+  read-only Stock-Level and Order-Status transactions on backups. With 56Gbps
+  InfiniBand, the paper reports about 4-6% primary overhead versus a
+  standalone 620k TPS server before network saturation, and support for 4-5
+  synchronous backups at roughly 1.4GB/s of log records per backup.
+- The paper reports backup replay of 16MB log batches in about 12ms using
+  roughly one quarter of the machine's compute resources, and shows pipelined
+  replay keeping commit latency within about 1.16x of standalone before the
+  network saturates.
+
+**GPU DB mapping:** Query Fresh is relevant less as "use RDMA now" and more as
+a storage contract for the GPU DB write path. WAL-before-visibility should
+remain the hard boundary, but once a batch is safely durable, derived read
+structures should be publishable by cheap indirection/generation updates
+instead of re-materializing every secondary structure synchronously.
+
+For P8, the append-only log plus RID indirection suggests a clean split between
+durable authority and acceleration state. CPU canonical MVCC versions, GPU
+resident column buffers, cold compressed segments, and future remote replicas
+can all be rebuilt or advanced from append-only version records, while indexes
+and resident snapshots point through stable logical row ids and generation
+metadata. That matches the current rule that GPU memory is a cache, not
+durable truth.
+
+The replay-pipelining idea maps to resident refresh. A mutation owner can
+publish a WAL-safe version boundary, then let residency owners advance
+partition-local indirection, compacted column groups, or old-snapshot side
+structures asynchronously. Read routes should name whether they are using the
+fully reconciled data generation, a replay/pending generation, or must fall
+back because the gap is too large.
+
+The RDMA/NVRAM caveat is the most important safety lesson. Any future remote
+durability, CXL pool, GPUDirect storage, or GPU-initiated write path must
+distinguish transfer completion, visibility to a peer, and persistence. GPU DB
+must not publish SQL visibility or invalidate old resident generations merely
+because DMA completed; it needs explicit durability acknowledgement tied to
+the WAL boundary.
+
+For 1M logical sessions, Query Fresh reinforces batching at commit and replay
+boundaries. A large number of sessions should feed bounded WAL reservation,
+group-commit, replay, and refresh queues rather than force per-session durable
+actions. The useful metrics are batch bytes, commit wait, durable ack wait,
+replay lag, freshness lag, and read fallback count.
+
+**Risks and mismatches:** Query Fresh is a replicated main-memory OLTP design,
+not a GPU execution engine or PostgreSQL-compatible serving layer. The reported
+numbers depend on 56Gbps InfiniBand, NVRAM emulation/assumptions, tmpfs
+resident data, ERMIA's redo-only logging, and TPC-C; they should not be copied
+as GPU DB targets. The paper explicitly notes that RDMA-over-NVRAM persistence
+is subtle and needs extra flush/fence/ack work without protocol extensions.
+
+The design avoids deterministic logical replay by using physical redo-only
+records; that can increase log bandwidth. It also still performs index work
+for inserts, uses separate indirection arrays that add memory overhead, and
+does not solve DDL invalidation, pgwire protocol queues, GPU cache retirement,
+or multi-tenant session admission. For GPU DB, replay freshness must remain
+subordinate to MVCC snapshot compatibility and WAL recovery.
+
+**Benchmark candidates:**
+
+- Add WAL batch telemetry that separates local durable flush time, remote/future
+  tier durable ack time, mutation visibility publish time, residency
+  invalidation time, and resident-refresh lag. Failure condition: a throughput
+  gain hides any of these phases in one opaque commit timer.
+- Prototype an append-only version-log plus logical row-id indirection sidecar
+  for one generated table, with CPU indexes and GPU resident snapshots storing
+  RIDs/generations rather than physical tuple offsets. Proof gate: identical
+  SQL-visible results after insert/update/delete and WAL replay.
+- Build a replay-lag benchmark for retained reads: hold a stream of committed
+  updates, advance an indirection/replay generation asynchronously, and measure
+  when reads use current retained GPU state, pending CPU state, or explicit
+  fallback.
+- Test group-commit sizing for COPY admission and short transactions with
+  metrics for rows/sec, commit p50/p95, batch bytes, durable ack wait, and
+  refresh-invalidated bytes. Failure condition: meeting rows/sec requires
+  publishing visibility before WAL safety.
+- Add a "DMA completion is not durability" simulator for any future remote or
+  GPU-initiated storage lane: transfer-complete, peer-visible, persisted, and
+  acknowledged states must be distinct in tests.
+- Compare update-heavy resident refresh using physical offset references versus
+  RID/generation indirection. Expected improvement: fewer index/resident
+  metadata rewrites per committed update. Failure condition: extra indirection
+  hurts p50 retained lookup latency more than it saves refresh work.
