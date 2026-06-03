@@ -26226,3 +26226,232 @@ visibility-safe cleanup.
 - Keep in-place mutation out of published MVCC versions. Gate any
   optimization behind a proof that WAL-before-visibility, retained
   snapshot correctness, and old-version reconstruction are unchanged.
+
+### 2026-06-04 - Data Blocks for byte-addressable compressed HTAP cold chunks
+
+**Citation:** Harald Lang, Tobias Muehlbauer, Florian Funke,
+Peter Boncz, Thomas Neumann, and Alfons Kemper. "Data Blocks:
+Hybrid OLTP and OLAP on Compressed Storage using both Vectorization
+and Compilation." SIGMOD 2016. Retrieved 2026-06-04 from the TUM
+Database Systems Group PDF at
+`https://www-db.cs.tum.edu/downloads/publications/datablocks.pdf`.
+
+**Category:** hybrid HTAP, with multi-tier cache/data placement,
+query execution, and storage-layout implications.
+
+**Relevance tags:** compressed cold chunks; hot/cold storage; immutable
+segments; byte-addressable compression; positional access; SIMD
+predicate evaluation; Positional SMA; vectorized scans; JIT planning;
+retained snapshots; cold-tier layout.
+
+**Core idea:** Data Blocks targets a hybrid OLTP/OLAP system where cold
+data should use less memory and scan quickly, but still support fast
+point access when transactions touch old records. The design divides
+relations into chunks. Hot chunks stay uncompressed and update-friendly;
+cold chunks are frozen into immutable compressed columnar Data Blocks.
+Updates to cold records are represented as invalidating the old frozen
+record and inserting the new version into the hot region.
+
+The paper's key transfer is that HTAP compression cannot optimize only
+for scan bandwidth. A cold format that requires expensive bit-unpacking
+can lose the benefit of early filtering when a query needs a sparse set
+of tuple positions, and it can hurt point lookups. Data Blocks therefore
+uses lightweight byte-addressable encodings, per-block/per-column
+compression choices, intra-block pruning metadata, and a vectorized scan
+adapter that feeds a JIT-compiled tuple-at-a-time pipeline without
+compiling a separate code path for every physical layout combination.
+
+**Concrete mechanisms:**
+
+- A Data Block is a self-contained, pointer-free container for one chunk
+  of one or more attributes. It stores tuple count, per-attribute
+  compression and offset metadata, SMAs, optional Positional SMAs,
+  dictionaries, compressed vectors, and string data.
+- Chunks are frozen independently. Compression is chosen per block and
+  per column according to the local value distribution, rather than one
+  relation-wide encoding.
+- Frozen Data Blocks are immutable. Deletes are recorded by marking the
+  frozen record, while updates become delete plus insert into a hot
+  uncompressed chunk.
+- The chosen encodings are byte-addressable: single-value compression,
+  order-preserving dictionary compression with 8/16/32-bit keys, and
+  frame-of-reference-style truncation to 8/16/32-bit deltas. The paper
+  deliberately avoids sub-byte encodings for the main HTAP format.
+- Order-preserving dictionaries let equality and range predicates run
+  against compressed integer codes, often with more values per SIMD
+  register than the uncompressed representation.
+- Each block stores ordinary min/max SMAs per attribute, allowing whole
+  blocks to be skipped when a SARGable predicate is outside the range.
+- Positional SMAs add a compact lookup table per attribute. A probe maps
+  a predicate value's delta from the block minimum to a scan range within
+  the compressed vector. Multiple predicates intersect their ranges.
+- Typical PSMA footprint is small for a block: about 2KB, 4KB, or 8KB
+  for 1-, 2-, or 4-byte indexed values, using two 4-byte integers per
+  lookup-table entry to hold `[begin, end)` ranges.
+- PSMA precision depends on value order and domain. When workload
+  knowledge exists, freezing can sort or cluster values within a block
+  to improve pruning for future predicates.
+- HyPer avoids maintaining SMAs/PSMAs on hot chunks because update cost
+  would hurt transaction throughput; the metadata is built only when a
+  chunk becomes cold.
+- A vectorized scan subsystem handles Data Blocks and hot uncompressed
+  chunks through one interface. It produces vectors of matching tuple
+  positions, unpacks required attributes for matches, then pushes tuples
+  into the compiled query pipeline.
+- This avoids a JIT code-path explosion. If each column may have many
+  physical encodings, compiling every layout combination grows
+  exponentially; precompiled interpreted vectorized scan code keeps
+  compile time low while the rest of the pipeline remains JIT compiled.
+- SIMD predicate evaluation builds or shrinks a match-position vector.
+  The implementation uses movemask results and a precomputed positions
+  table to avoid expensive per-bit conversion from comparison masks.
+- Evaluation reports compression ratios up to about 5x versus HyPer's
+  uncompressed storage, while using around 25% more space than
+  Vectorwise-style heavier compression.
+- On TPC-H scale factor 100, compressed Data Blocks with SARG/SMA
+  improved the geometric mean over JIT scans by about 1.26x, and adding
+  PSMA was most helpful when data was sorted or naturally clustered.
+- For TPC-C, compressing only old `neworder` records had negligible
+  throughput difference in the reported setup: 89,229 TPS on
+  uncompressed storage versus 88,699 TPS with cold Data Blocks. Fully
+  compressed read-only TPC-C transactions showed about a 9% throughput
+  drop versus uncompressed storage.
+- The paper's bit-packing comparison shows why sparse extraction matters:
+  even when bit-packing compresses better, Data Blocks were reported as
+  faster for predicate evaluation and much faster for positional
+  extraction at moderate selectivities.
+
+**GPU DB mapping:** Data Blocks gives P8 a concrete shape for the first
+cold or warm CPU-side segment format. GPU DB should not treat cold
+chunks as raw rows waiting to be copied to HBM. A cold segment can be
+immutable, columnar, byte-addressable, locally compressed, and decorated
+with compact pruning metadata, while SQL-visible correctness still lives
+in WAL/MVCC state and hot mutable chunks.
+
+The byte-addressability lesson matters for GPU DB's retained lookup
+path. If P8 chooses a compressed format that requires unpacking many
+non-qualifying values before extracting sparse matches, it may help
+large scans but hurt point lookups, prefix filters, and mixed HTAP
+routes. A first `int4`/`text` segment should therefore measure
+compressed predicate evaluation and positional extraction separately,
+not only bytes scanned per second.
+
+PSMA maps naturally to GPU DB route metadata. A resident or cold segment
+could store min/max summaries plus a small positional range table for
+admitted `int4` keys or dictionary-coded text prefixes. For a retained
+GPU lookup or compressed cold scan, this metadata can narrow the row
+range before launching a kernel or issuing GDS reads. It should remain
+rebuildable acceleration state tied to a segment generation, not a
+durable correctness index.
+
+The hot/cold split maps to WAL-before-visibility. Hot mutable data can
+stay in owner-private or CPU MVCC structures; once a chunk is frozen,
+the runtime publishes an immutable segment generation. Updates to old
+records create hot deltas and invalidate or tombstone old cold positions
+without mutating the published segment in place. Readers either merge
+the cold segment plus hot visible delta or route to a newer generation.
+
+The vectorized-scan/JIT adapter is also a planning warning. GPU DB will
+eventually have many physical layouts: CPU rows, host column chunks,
+compressed cold chunks, resident HBM segments, resident indexes, and
+over-resident streaming chunks. Compiling or specializing every route
+combination can explode planning latency. A better route may be a small
+set of precompiled vector/kernels/adapters that feed a stable SQL
+pipeline contract.
+
+**Risks and mismatches:** Data Blocks is a CPU HyPer storage/execution
+paper, not a GPU storage engine. It does not define CUDA kernels, GDS
+submission, GPU memory residency, pgwire session scheduling, or a full
+MVCC garbage-collection policy. Its cold-record update rule needs a
+GPU DB-specific merge path across cold segments, hot deltas, tombstones,
+and retained snapshots.
+
+PSMA is not a replacement for real indexes. The paper shows it helps
+when values are ordered or clustered, but shuffled data can defeat the
+range narrowing. GPU DB should treat PSMA-like structures as route
+filters and benchmark them against equality indexes, key-order vectors,
+zone maps, and histogram summaries.
+
+The reported evaluation uses CPU hardware and TPC-H/TPC-C extremes
+rather than GPU kernels or mixed resident workloads. The 2016 SIMD and
+compression tradeoffs must be retested on the actual GPU/CPU/NVMe
+platform, especially for `text` prefix predicates and GPU-friendly
+decompression.
+
+**Benchmark candidates:**
+
+- Build a host-only P8 cold-segment prototype with immutable blocks,
+  per-column byte-addressable compression, min/max summaries, and a
+  PSMA-like positional range table for one `int4` key. Gate: exact
+  results against the MVCC tuple store under insert/update/delete and
+  retained snapshots.
+- Compare byte-addressable truncation/dictionary encoding against
+  bit-packed or FastLanes-style encodings for sparse predicate results.
+  Required metrics: predicate time, positional extraction time,
+  compression ratio, p50/p95 lookup latency, and scan throughput.
+- Add a hot-delta plus frozen-segment benchmark: freeze old rows into
+  compressed blocks, route updates as delete plus hot insert, and
+  measure read merge cost under short retained lookups and long scans.
+- Test PSMA-like metadata on ordered, block-local sorted, and shuffled
+  data. Failure condition: route selection assumes pruning that
+  disappears when clustering is absent.
+- Prototype a vectorized adapter boundary for CPU/GPU routes: a fixed
+  interface produces match vectors or row-id vectors regardless of
+  physical segment layout. Gate: planner/setup latency stays bounded as
+  layout combinations increase.
+- For text columns, test dictionary-coded prefix predicates versus
+  offsets/bytes scanning. Required metrics: dictionary build cost,
+  prefix selectivity, extracted-row cost, and compatibility with
+  retained snapshot publication.
+- Add telemetry for `segment_encoding`, `pruned_rows_by_sma`,
+  `pruned_rows_by_psma`, `match_vector_rows`, `decode_rows`,
+  `hot_delta_rows_merged`, and `segment_generation`.
+
+### 2026-06-04 - Cross-paper synthesis: frontiers, cleanup, and segment shape should share one route contract
+
+**Papers synthesized:** Eiffel, Everything is a Transaction, FASTER,
+and Data Blocks.
+
+**Converging design tracks:** These four papers line up around the same
+implementation pressure point: a fast route needs cheap scheduling,
+explicit frontiers, safe cleanup, and a physical segment shape that does
+not sabotage either point lookups or scans. Eiffel gives the scheduler
+cheap integer-ranked queues; DAF says cleanup and physical maintenance
+must be gated by MVCC-visible timestamps; FASTER gives logical fronts for
+hot in-place versus cold copy-forward state; Data Blocks gives immutable
+byte-addressable cold chunks that preserve point access while improving
+scan and memory behavior.
+
+For GPU DB, the promising track is a route contract with named
+frontiers: durable WAL frontier, CPU-visible frontier, resident/cold
+segment generation, cleanup-safe generation, response-release watermark,
+and queue/admission rank. A request should enter a bounded scheduler
+with a route class and deadline, execute against an immutable or
+owner-private structure, publish or release only at a safe frontier, and
+defer physical cleanup until no retained read can touch the old state.
+
+**Category gaps:** The recent batch covered runtime scheduling, MVCC
+maintenance, write-path tiering, and HTAP cold-segment shape. The queue
+can now take either another modern cache/tiering paper or a
+transaction-concurrency paper without skewing analytical. Useful next
+areas are cache admission/eviction at production scale, adaptive
+concurrency policy, and high-concurrency request descriptors below SQL.
+
+**Benchmark priorities:**
+
+- Define a `RouteFrontier` test model with WAL, visibility,
+  safe-read-only, segment-generation, cleanup-safe, and response-release
+  fields. Gate: no cleanup, in-place update, route fallback, or response
+  release can proceed with an unexplained frontier.
+- Build a host-only mixed segment benchmark combining a mutable hot tail,
+  immutable compressed cold blocks, deferred cleanup, and a bounded
+  scheduler. Measure write throughput, retained-read p95, cleanup debt,
+  and cold-segment pruning effectiveness together.
+- Add a scheduler experiment where route ranks include both performance
+  terms and correctness eligibility, but exact correctness gates remain
+  boolean. Failure condition: approximate or bucketed ranking changes a
+  visible result or frees state early.
+- Compare three first P8 storage shapes under the same workload:
+  append-only MVCC chains, HybridLog-like hot tail plus cold blocks, and
+  frozen Data Block-style segments plus hot deltas. Report the point at
+  which each wins or fails rather than choosing by aggregate throughput.

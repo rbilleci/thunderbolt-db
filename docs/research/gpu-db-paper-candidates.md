@@ -828,7 +828,7 @@ Append new candidates here as each paper is processed.
   Why: modern transaction scheduling work cited by PreemptDB; useful for
   contrasting non-preemptive priority ordering with interrupt-driven
   preemption and owner-queue admission.
-- `queued` — **Data Blocks: Hybrid OLTP and OLAP on Compressed Storage Using
+- `reviewed` — **Data Blocks: Hybrid OLTP and OLAP on Compressed Storage Using
   Both Vectorization and Compilation**, Lang et al., SIGMOD 2016.
   URL: `https://www-db.cs.tum.edu/downloads/publications/datablocks.pdf`
   Why: Hermes and Mainlining Databases keep returning to stable columnar data
@@ -2239,3 +2239,21 @@ Append new candidates here as each paper is processed.
   deciding whether GPU DB cold/warm segments should choose compression
   parameters from access statistics instead of a single fixed resident/cold
   format.
+- `queued` — **ByteSlice: Pushing the Envelope of Main Memory Data
+  Processing with a New Storage Layout**, Feng, Lo, Kao, and Xu, SIGMOD 2015.
+  URL: `https://doi.org/10.1145/2723372.2747642`
+  Why: Data Blocks contrasts against sub-byte and byte-sliced encodings; useful
+  for deciding whether GPU DB resident or host-side cold chunks should use
+  byte-addressable codes, bit-sliced predicates, or format-specific routes.
+- `queued` — **Efficient Lightweight Compression Alongside Fast Scans**,
+  Polychroniou and Ross, DaMoN 2015.
+  URL: `https://doi.org/10.1145/2771937.2771943`
+  Why: Data Blocks compares against SIMD bit-packing/unpacking work; useful
+  for benchmarking compressed predicate execution against positional
+  decompression and sparse-result extraction in P8 text/int4 segments.
+- `queued` — **A Padded Encoding Scheme to Accelerate Scans by Leveraging
+  Skew**, Li, Chasseur, and Patel, SIGMOD 2015.
+  URL: `https://doi.org/10.1145/2723372.2737799`
+  Why: Data Blocks notes padded encoding as a possible secondary-index-like
+  structure; useful for testing whether skew-aware compressed scan layouts
+  belong in GPU DB as route-specific acceleration rather than canonical storage.
