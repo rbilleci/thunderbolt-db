@@ -3900,3 +3900,176 @@ Benchmark priorities:
 - Add CARVER-style parameter generation so lookup, prefix, aggregate,
   and mixed predicate benchmarks cover the cardinality cases that make
   CPU/GPU route choice fragile.
+
+### 2026-06-03 - Shenango high-efficiency latency-sensitive runtime
+
+**Citation:** Amy Ousterhout, Joshua Fried, Jonathan Behrens, Adam
+Belay, and Hari Balakrishnan. "Shenango: Achieving High CPU Efficiency
+for Latency-sensitive Datacenter Workloads." 16th USENIX Symposium on
+Networked Systems Design and Implementation (NSDI 2019), pp. 361-378,
+2019. Retrieved 2026-06-03 from the USENIX PDF,
+`https://www.usenix.org/system/files/nsdi19-ousterhout.pdf`.
+
+**Category:** runtime / HFT / session scale.
+
+**Relevance tags:** kernel-bypass networking; microsecond scheduling;
+IO workers; bounded rings; packet queues; runnable-thread queues;
+core allocation; burst admission; work stealing; user-level threads;
+tail latency; CPU efficiency; session multiplexing; response rings.
+
+**Core idea:** Shenango targets the tension between microsecond tail
+latency and CPU efficiency. Kernel-bypass systems can keep latency low
+by dedicating cores to polling, but this provisions for peak load and
+wastes cycles when traffic is below peak. Shenango instead reallocates
+cores across applications at very fine granularity, using a dedicated
+IOKernel core plus per-application user-level runtimes. The IOKernel
+steers packets, observes queue buildup, and grants or revokes cores
+quickly enough to absorb bursts without keeping every latency-sensitive
+application fully provisioned.
+
+The most relevant idea for GPU DB is not adopting Shenango wholesale.
+It is the control signal: queueing duration at the boundary between IO,
+runnable work, and execution resources is a better admission signal than
+coarse utilization. For a database trying to support many logical
+sessions, the hot path should expose whether requests, response writes,
+GPU work, or mutation work have remained queued across microsecond
+sampling intervals, then allocate scarce execution resources or reject
+work at that boundary.
+
+**Concrete mechanisms:**
+
+- A privileged IOKernel runs on a dedicated busy-spinning core. It
+  polls NIC receive and transmit queues, forwards packets through
+  shared-memory queues, and orchestrates core allocation for
+  per-application runtimes.
+- Each runtime has guaranteed cores and burstable cores. It may use
+  fewer than its guarantee when idle, may temporarily exceed its
+  guarantee when spare cores exist, and can have burstable cores
+  preempted by the IOKernel.
+- Congestion detection runs every 5 microseconds. For each active
+  runtime kthread, the IOKernel compares runqueue and ingress-packet
+  queue state with the previous interval. If work is present in the
+  same queue across two checks, Shenango treats that as at least one
+  interval of queueing delay and grants another core when possible.
+- The paper emphasizes queueing duration rather than queue length
+  because length thresholds are workload-dependent, while "still queued
+  after the next sampling interval" directly indicates delayed work.
+- Queue metadata is exposed in one shared cache line per kthread. The
+  queues are ring buffers, so the IOKernel can detect persistent work by
+  comparing head/tail state across intervals.
+- Core selection favors locality: use a hyper-thread sibling of an
+  already active core for that application when possible, then a core
+  the application recently used, then any idle core, and only then a
+  burstable core reclaimed from another application.
+- Runtimes use lightweight user-level threads, per-kthread runqueues,
+  work stealing, cooperative run-to-completion in the common case, and
+  parking when no work is found after brief steal attempts.
+- Packet handling can be stolen across runtime cores, including TCP
+  protocol handling. This relaxes strict flow-consistent hashing and may
+  cause short-timescale packet reordering, which Shenango handles in the
+  transport layer when ordering is required.
+- Shenango uses shared-memory descriptor rings for ingress packets,
+  egress packets, and separate egress command queues to avoid
+  head-of-line blocking.
+- The implementation relies on DPDK for NIC access, `sched_setaffinity`
+  for binding kthreads, `eventfd` for parking/unparking, and targeted
+  signals for preempting runtime kthreads.
+- In the memcached evaluation, Shenango reports over 5 million requests
+  per second with 37 microsecond median and 93 microsecond 99.9th
+  percentile response time, while preserving spare cycles for batch
+  work. In a sudden-load experiment from 100k to 5 million requests per
+  second, it reports almost no additional tail latency, whereas Arachne
+  takes more than 500 ms to adapt.
+- The paper reports an IOKernel packet-rate ceiling of about 6.5 million
+  incoming plus outgoing packets per second in its setup, and notes that
+  packet forwarding, not core allocation, is most of the IOKernel cost.
+
+**GPU DB mapping:** GPU DB's production runtime already points toward
+network IO workers, bounded command rings, read snapshot workers, GPU
+execution workers, mutation owners, and response rings. Shenango gives a
+specific admission metric for that topology: measure whether work
+remains queued across a microsecond-scale sampling interval, not only
+average queue depth or CPU utilization. A request waiting in a network
+ingress ring, read snapshot ring, GPU execution ring, mutation ring, or
+response ring for two consecutive samples should increment a congestion
+signal tagged with the exact boundary.
+
+For 1M logical sessions, the direct transfer is a multiplexed IO-worker
+model with explicit per-boundary queue telemetry. GPU DB should avoid
+thread-per-session processing and should not dedicate one busy polling
+resource per connection. Instead, IO workers can own socket readiness
+and protocol parsing, while execution resources are granted to classes
+of work: short retained reads, mutation admission, resident refresh, GPU
+kernel batches, and response encoding. Shenango's guaranteed/burstable
+split maps to reserving minimum capacity for correctness-critical
+mutation/WAL work and allowing read-heavy retained routes to burst only
+while the relevant rings are healthy.
+
+The queue-duration signal also fits GPU micro-batching. Same-shape
+retained reads should be collected under a latency ceiling, but if a GPU
+execution ring shows persistent queued work across two sampling
+intervals, the scheduler should either drain a larger compatible batch,
+allocate another stream/worker if available, fall back to CPU when safe,
+or return a precise overload reason. The important part is that the
+decision is tied to observed queue wait at the saturated boundary.
+
+Shenango's locality rules translate to owner and worker placement. GPU
+execution workers should prefer stable CUDA streams, pinned buffers, and
+partition-local metadata rather than moving work randomly. CPU IO and
+response workers should prefer recent cores and per-worker buffer caches
+to preserve cache locality for row descriptions, protocol state, and
+response-ring writes.
+
+**Risks and mismatches:** Shenango is a network/runtime system, not a
+database engine. It does not address WAL-before-visibility, MVCC
+snapshot correctness, SQL protocol semantics, durable recovery, GPU
+resident invalidation, CUDA scheduling, or query planning. Its
+centralized IOKernel is also a potential bottleneck; the paper observes
+packet forwarding as the dominant IOKernel cost and does not evaluate
+multi-socket NUMA scaling.
+
+GPU DB should not infer that a single central scheduler can own all
+database resources. Mutation ordering, read snapshot publication,
+residency refresh, and GPU execution each have correctness boundaries
+that may require separate owners. The useful lesson is the queue-delay
+feedback loop, not a mandate to collapse the system into one privileged
+runtime core.
+
+There is also a protocol mismatch. Shenango's packet stealing and
+resequencing can tolerate transport-level reordering, but PostgreSQL
+wire sessions require ordered frontend/backend semantics per session.
+GPU DB may steal parsed requests between workers only after preserving
+per-session ordering, transaction state, cancellation behavior, and
+response sequencing.
+
+**Benchmark candidates:**
+
+- Replace thread-per-client measurement for one bounded path with a
+  small IO-worker pool and response rings. Minimum gate: identical SQL
+  results and lower per-connection memory/thread cost at concurrency
+  `1,2,4,8,16,32,64`, with no hidden owner-thread ordering changes.
+- Add per-ring queue-duration telemetry: ingress, mutation, read
+  snapshot, residency, GPU execution, and response rings. Record whether
+  work survived two consecutive microsecond-scale samples, plus oldest
+  queued age and boundary-specific overload reason.
+- Compare admission policies for retained reads: queue-length threshold,
+  utilization threshold, and Shenango-style persistent-queue-duration
+  threshold. Expected result: queue-duration admission should reduce
+  p99/p99.9 spikes during bursts without over-provisioning workers.
+- Prototype guaranteed and burstable execution budgets. Reserve
+  mutation/WAL capacity, then let retained reads, refresh work, and
+  response encoding borrow burst capacity only while their queues are
+  below overload thresholds.
+- Add a burst workload: hold a low baseline of persistent pgwire
+  sessions, then jump same-shape retained reads from low rate to the
+  highest bounded offered rate. Measure p50/p99/p99.9 latency, queue
+  wait by boundary, response-ring lag, GPU batch size, CPU fallback, and
+  overload counts.
+- Test worker locality: stable assignment of IO/response workers and GPU
+  execution workers versus random work stealing. Required measurements:
+  cache-miss proxy if available, row-description reuse, pinned-buffer
+  reuse, CUDA stream reuse, and tail latency under imbalanced sessions.
+- Failure condition: any admission policy improves throughput by
+  allowing stale resident snapshots, violating per-session response
+  order, starving WAL/mutation progress, or hiding overload without a
+  precise rejection/fallback reason.
