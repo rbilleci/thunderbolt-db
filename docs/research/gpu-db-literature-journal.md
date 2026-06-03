@@ -10186,3 +10186,182 @@ an explicit benchmark hypothesis.
 - Track NUMA and pinned-memory placement for host staging buffers.
   Minimum proof: route-local host buffers reduce remote memory accesses
   and do not fragment or exhaust pinned budgets under many sessions.
+
+### 2026-06-03 - Umbra variable-size pages for SSD-backed hot working sets
+
+**Citation:** Thomas Neumann and Michael Freitag. "Umbra: A Disk-Based
+System with In-Memory Performance." CIDR 2020. Retrieved 2026-06-03
+from the TUM author PDF,
+`https://db.in.tum.de/~freitag/papers/p29-neumann-cidr20.pdf`, after
+the originally queued VLDB/CIDR URL returned HTTP 403 from the cron
+environment. CIDR proceedings metadata was cross-checked at
+`https://www.vldb.org/cidrdb/2020/umbra-a-disk-based-system-with-in-memory-performance.html`.
+
+**Category:** multi-tier cache / data placement.
+
+**Relevance tags:** SSD-backed DBMS; variable-size pages; explicit buffer
+management; virtual-memory reservation; pointer swizzling; optimistic
+latching; PAX page layout; string lifetime; online statistics; adaptive
+execution; IO-aware scheduling; hot/cold working-set placement.
+
+**Core idea:** Umbra evolves the in-memory HyPer design into an SSD-backed
+DBMS without giving up hot-working-set performance. The paper argues that
+pure in-memory systems become uneconomical as DRAM capacity growth slows,
+while fast SSDs make a large explicit buffer plus persistent storage a better
+default. The key is to keep the cached common path close to in-memory pointer
+access while still letting uncached data load predictably.
+
+Umbra's distinctive addition beyond LeanStore is a low-overhead buffer manager
+with variable-size pages. Fixed-size pages simplify buffer managers but make
+large strings, dictionaries, and compression lookup tables awkward because
+objects must be split, copied, or accessed through complex page-spanning
+logic. Umbra instead organizes pages into exponentially growing size classes,
+reserves one virtual-address region per class, and maps physical memory only
+for active frames. That allows large objects to remain contiguous in virtual
+memory without fragmenting the physical buffer pool.
+
+The paper also shows that making a memory-optimized engine disk-backed leaks
+into other layers. Strings need explicit storage-duration classes because a
+database page may be evicted while a pipeline still holds an out-of-line
+string reference. Statistics must be maintained online rather than sampled
+from cold base tables on demand. Execution is represented as modular steps
+inside pipelines so work can be suspended between steps when IO load or route
+state requires it. In the evaluation, Umbra reports comparable raw execution
+time to HyPer on JOB/TPCH hot-cache runs, buffer-manager overhead below about
+6% on average when bypassed, and cold-scan throughput close to SSD random-read
+bandwidth on the tested platform.
+
+**Concrete mechanisms:**
+
+- Page size classes start at 64KiB in the prototype and double for larger
+  pages. Each class gets a reserved virtual-memory region as large as the
+  configured buffer pool, but physical memory is consumed only by active
+  frames.
+- Active frames are populated with `pread`; evicted frames are flushed with
+  `pwrite` if dirty and released with `madvise(MADV_DONTNEED)` so physical
+  memory can be reused while the virtual address remains stable.
+- The buffer manager tracks the total bytes of active pages across all size
+  classes and enforces one global buffer-pool budget rather than separate
+  budgets per page size.
+- Replacement follows the LeanStore cooling idea: pages are speculatively
+  unswizzled and kept resident in a FIFO grace period before actual eviction.
+- A swip is a 64-bit tagged reference. Swizzled references hold a resident
+  virtual pointer; unswizzled references hold a page id plus a 6-bit size
+  class, so loading a cold page does not require external size metadata.
+- Every page has exactly one owning swip. Buffer-managed structures are
+  therefore organized as trees or forests, and B+Tree leaf pages omit sibling
+  links that would create multiple owners for one page.
+- Page synchronization uses versioned latches with exclusive, shared, and
+  optimistic modes. Optimistic reads remember the version counter and validate
+  at release; shared latches are used when operators cannot tolerate page
+  eviction during a unit of work.
+- Relations are stored as B+Trees keyed by synthetic monotonically increasing
+  tuple ids. Inner pages use the smallest page size for high fanout, while
+  leaf pages use the smallest class that can hold the inserted tuple.
+- Leaf pages use a PAX-style layout: fixed-size attributes in columnar form at
+  the front of the page and variable-size data packed at the end.
+- Because different-size pages complicate ARIES recovery, Umbra only reuses
+  freed disk space for pages of the same size; otherwise recovery might
+  interpret stale bytes from a larger old page as a smaller new page's LSN.
+- Strings have 16-byte headers. Short strings up to 12 bytes are inline; long
+  strings carry length, prefix bytes, and either offset or pointer metadata
+  tagged by storage class: persistent, transient, or temporary.
+- Query statistics use online reservoir sampling and updateable HyperLogLog
+  sketches so the optimizer does not need expensive random reads from
+  disk-backed base relations.
+- Physical execution plans are decomposed into pipeline steps. Each step is a
+  callable state-machine function, and multi-threaded steps use morsels.
+  Execution can suspend after a step, avoid thread dispatch for single-morsel
+  work, and combine interpretation with adaptive compilation.
+
+**GPU DB mapping:** Umbra reinforces that P8 should avoid two traps at once:
+delegating hot/cold movement entirely to the OS, and building an explicit tier
+manager whose normal hit path pays classic buffer-pool overhead. GPU DB's
+resident route should look more like a direct generation handle with a small
+state check than a global lookup, pin, replacement update, and route rebuild
+for every query.
+
+Variable-size pages are a useful model for GPU DB column groups and text
+payloads. Fixed-size resident partitions are convenient for scheduling, but
+text columns, compressed dictionaries, offsets, and GPU lookup tables often
+want contiguous regions. The GPU DB analog is a classed segment arena: small
+fixed-width columns in regular chunks, larger dictionaries or text payloads in
+size-classed contiguous host/GPU regions, and one owner-published descriptor
+that carries class, generation, checksum, visibility boundary, and byte budget.
+
+The reserved-virtual-memory trick does not translate directly to CUDA HBM, but
+it is highly relevant to CPU DRAM and pinned host staging. Host-side tier
+arenas can reserve stable address ranges for segment classes while mapping or
+pinning only admitted working sets. For GPU memory, the design lesson is the
+same budget surface: active bytes across all segment classes matter more than
+object count, and variable-size objects should not require multiple independent
+buffer pools that strand capacity.
+
+Umbra's single-owning-swip rule matches the owner-domain architecture. A
+resident partition, column dictionary, or cold NVMe block should have one
+mutable owner record. Prepared plans, route caches, and read workers should
+hold immutable handles to owner-published generations rather than mutating
+validity flags independently.
+
+The modular step execution maps to GPU DB route scheduling. Short retained
+reads can run immediately; longer scans, refreshes, and over-resident routes
+should be decomposed into suspendable steps such as admit, load block, launch
+kernel, reduce, encode response, and release generation. That gives the
+runtime places to honor IO pressure, GPU queue saturation, and latency ceilings
+without blocking network IO or holding a global snapshot epoch.
+
+Umbra's string lifetime split is a concrete warning for pgwire and GPU result
+encoding. Values referenced from resident pages or transient staging buffers
+must either be copied into response-owned memory or kept alive by a generation
+handle until network write completion. A result encoder cannot assume a page,
+GPU buffer, or pinned staging slice remains valid just because SQL execution
+has produced rows.
+
+**Risks and mismatches:** Umbra is a CPU DBMS. It does not solve CUDA stream
+ownership, GPU memory allocation, kernel launch amortization, direct
+NVMe-to-GPU IO, pgwire session multiplexing, or GPU-resident MVCC visibility.
+The variable-size page design relies on ordinary CPU virtual memory and
+`madvise`; device memory and pinned host memory have different fragmentation,
+mapping, and registration costs.
+
+The paper's recovery mechanism assumes ARIES over pages. GPU DB currently uses
+WAL/checkpoint/archive replay as durable truth and treats GPU residency as
+rebuildable acceleration state. The transferable recovery lesson is careful
+space-reuse metadata and page/segment identity, not a requirement to adopt
+ARIES pages.
+
+The evaluation uses one 8-core CPU system, one Samsung SSD, hot-cache fastest
+of five query runs for JOB/TPCH, and a CPU query compiler/runtime. Its absolute
+speedups do not predict GPU DB throughput. Also, the paper mostly addresses
+database storage and analytical/query execution mechanics; it is not a full
+answer for OLTP commit ordering, WAL flush throughput, or 1M logical sessions.
+
+**Benchmark candidates:**
+
+- Prototype classed resident segment arenas for host/GPU metadata: fixed-width
+  columns, text offset/byte payloads, dictionaries, and scratch buffers use
+  separate size classes but share one active-byte budget. Gate: no stranded
+  capacity from per-class pools under mixed `int4`/`text` resident workloads.
+- Add a cold/warm partition route benchmark with variable-size payloads:
+  compare fixed chunks that split dictionaries versus classed contiguous
+  dictionary/text regions. Required metrics: refresh bytes, H2D/D2H bytes,
+  kernel indirections, p99 lookup latency, and HBM/host fragmentation.
+- Implement an owner-published resident handle shape inspired by swips:
+  generation id, segment class, logical page/partition id, resident pointer or
+  cold id, validity state, and visibility boundary. Failure condition: any
+  prepared plan or route cache can mutate resident validity directly.
+- Add a suspendable route-step trace for one retained scan or refresh:
+  admission, snapshot acquire, IO/load, GPU launch, reduce, encode, release.
+  Gate: IO pressure or GPU saturation can pause between steps without holding
+  network IO, mutation owner, or stale resident generation resources.
+- Build a result-lifetime correctness test for transient strings and GPU
+  buffers. Force eviction/invalidation after execution but before response
+  write completion. Gate: responses remain correct because data was copied or
+  the producing generation stayed pinned until network ownership ended.
+- Add a variable-size segment recovery negative control. Reuse a cold segment
+  id with a different size class, crash/replay, and prove the loader rejects
+  stale checksum/size metadata rather than interpreting old bytes as a new
+  segment.
+- Compare direct handle hot-route overhead against a catalog/hash lookup path.
+  Required metrics: route lookup time, cache miss rate, generation validation
+  cost, invalidation latency, and false-fast-route count.

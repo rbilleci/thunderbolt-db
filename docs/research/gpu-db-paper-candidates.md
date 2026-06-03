@@ -104,7 +104,7 @@ mechanical sympathy, multi-tier cache/data placement, or query optimization.
   Why: low-overhead storage manager that keeps in-memory performance for hot
   data while transparently handling SSD-resident data; directly relevant to
   GPU/DRAM/NVMe tiering and transactional working sets.
-- `queued` — **Umbra: A Disk-Based System with In-Memory Performance**,
+- `reviewed` — **Umbra: A Disk-Based System with In-Memory Performance**,
   Neumann and Freitag, CIDR 2020.
   URL: `https://www.vldb.org/cidrdb/papers/2020/p29-neumann-cidr20.pdf`
   Why: variable-size pages and low-overhead buffer management for cached hot
@@ -509,6 +509,18 @@ Append new candidates here as each paper is processed.
   Why: hybrid disk/in-memory transactional architecture cited by the Umbra
   MVCC paper; useful as a contrast point for hot working-set placement and
   contention reduction across CPU memory and durable storage.
+- `queued` — **Cost/Performance in Modern Data Stores: How Data Caching
+  Systems Succeed**, Lomet, DaMoN 2018.
+  URL: `https://doi.org/10.1145/3211922.3211931`
+  Why: economic and architectural argument cited by Umbra against pure
+  in-memory-only systems; useful for setting GPU DB tier-placement budgets and
+  cost/performance targets across HBM, DRAM, NVMe, and future memory tiers.
+- `queued` — **Adaptive Execution of Compiled Queries**, Kohn, Leis, and
+  Neumann, ICDE 2018.
+  URL: `https://doi.org/10.1109/ICDE.2018.00027`
+  Why: Umbra's adaptive bytecode/JIT execution foundation; relevant to deciding
+  when GPU DB should interpret, compile, batch, or route short SQL plans
+  without paying excessive setup latency.
 - `reviewed` — **Polaris: Enabling Transaction Priority in Optimistic
   Concurrency Control**, Ye et al., PACMMOD/SIGMOD 2023.
   URL: `https://doi.org/10.1145/3588724`
