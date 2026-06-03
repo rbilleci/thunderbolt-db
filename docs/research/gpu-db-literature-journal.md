@@ -17341,3 +17341,193 @@ resident snapshots, or a general MVCC implementation for arbitrary SQL.
 - Add GC locality telemetry for versions removed during batch initialization
   versus background major GC. Gate: old-version cleanup does not pollute hot
   retained-read or mutation-owner cache paths under skew.
+
+### 2026-06-03 - PrismDB multi-tier compaction
+
+**Citation:** Ashwini Raina, Jianan Lu, Asaf Cidon, and Michael J. Freedman.
+"Efficient Compactions Between Storage Tiers with PrismDB." arXiv:2008.02352
+v6, 2022. Retrieved 2026-06-03 from arXiv,
+`https://arxiv.org/pdf/2008.02352`.
+
+**Category:** multi-tier cache / data placement, with write-path storage and
+runtime ownership implications.
+
+**Relevance tags:** multi-tier storage; NVM and QLC; hot/cold placement;
+compaction cost model; object popularity; clock tracking; promotion and
+demotion; partition ownership; write amplification; tail latency.
+
+**Core idea:** PrismDB argues that simply placing an LSM tree across a fast and
+slow tier leaves performance on the table. In their experiments, tiered
+RocksDB can put upper levels on NVM and lower levels on QLC, but many reads
+still hit QLC and much background time is spent sorting data on the fast tier.
+PrismDB instead gives each tier a different physical role: hot and newly
+written objects live in unsorted NVM slabs that tolerate random writes, while
+cold objects live in sorted flash logs that favor sequential writes.
+
+The key mechanism is multi-tiered storage compaction (MSC). PrismDB demotes
+cold objects from NVM to flash, promotes hot objects from flash to NVM when
+read patterns shift, and scores candidate key ranges by both placement benefit
+and flash I/O cost. The paper reports that, compared with multi-tiered
+RocksDB, PrismDB improves throughput and average latency by 2.4x and 2.7x on
+write-dominated YCSB workloads, and by 2.5x and 2x on read-heavy workloads. It
+also reports 3.3x better average throughput and 2x lower read tail latency than
+RocksDB on equivalently priced tiered hardware.
+
+**Concrete mechanisms:**
+
+- The assumed storage shape is mostly low-cost dense flash, with a smaller fast
+  NVM tier. The paper uses Optane SSD as the NVM example and QLC NAND as the
+  cheap tier, noting a large read-latency and endurance gap between them.
+- PrismDB partitions the key space and extends that partitioning across DRAM,
+  NVM, and flash. Each partition has a foreground worker and a background
+  compaction thread, reducing shared synchronization across partitions.
+- Metadata for NVM objects is kept in DRAM as a B-tree from key to NVM address.
+  Flash indexes and Bloom filters are stored in NVM because a flash read is
+  expensive enough to amortize an NVM metadata lookup.
+- All new writes and updates go synchronously to NVM slabs. If an update still
+  fits the same slab size class, PrismDB updates in place; otherwise it moves
+  the object to an appropriate slab slot.
+- Flash data is stored as SST files in a sorted log with disjoint key ranges.
+  With enough NVM capacity, PrismDB uses a single-level flash log; with less
+  NVM, it can use multiple levels to control key-range fanout.
+- A multi-bit clock tracker records recently accessed keys and their location.
+  The tracker does not cover the whole database; in the evaluation it tracks
+  10% of total keys.
+- A mapper observes the clock-value distribution and enforces a configurable
+  pinning threshold. It always pins the hottest clock values, demotes cold or
+  untracked values, and samples from a boundary clock value if needed to hit
+  the threshold.
+- When NVM reaches a high watermark, PrismDB rate-limits writes and triggers
+  compaction until NVM falls to a lower watermark. During the same merge, it can
+  promote hot flash objects to NVM because it is already reading the flash
+  range.
+- MSC scores a candidate key range by coldness benefit divided by slow-tier I/O
+  cost. The cost includes flash reads of overlapping SST data and flash writes
+  of demoted NVM objects plus non-overlapping flash survivors.
+- Precise MSC cuts flash write I/O versus random selection but costs too much
+  CPU and compaction time. PrismDB therefore uses approximate MSC with
+  fixed-size buckets that maintain popularity, overlap, fanout, NVM bitmap, and
+  flash bitmap summaries.
+- Candidate range selection uses power-of-k choices, with k=8 in the paper, to
+  avoid scoring the entire key space.
+- Read-triggered compactions handle read-heavy workloads where NVM does not
+  fill quickly enough to rebalance hot data. PrismDB detects too many tracked
+  reads hitting flash, runs compactions for an epoch, and continues only if the
+  NVM-read ratio improves.
+- Crash recovery is not WAL-based. Writes are committed to NVM slab locations,
+  and recovery scans NVM slabs plus a manifest of active flash SST files. For
+  keys in both tiers, the NVM version is treated as newest.
+- The evaluation uses YCSB and Twitter production traces. PrismDB improves
+  point-query workloads most; it does not outperform RocksDB on YCSB-E scans,
+  partly because it lacks a prefetcher.
+
+**GPU DB mapping:** PrismDB is directly relevant to P8's tier-placement
+contract, but the transferable unit is a tier-aware placement policy rather
+than the whole KV-store design. For GPU DB, the analogous fast tiers are GPU
+HBM and host DRAM/pinned buffers, while the slower tiers are compressed host
+segments, OS or DB-managed mapped files, and NVMe. The engine should not treat
+GPU residency as a passive cache bolted onto a CPU layout. It should give each
+tier an explicit physical role: hot immutable resident column groups in GPU
+memory, warm metadata and compressed segments in host memory, and cold durable
+segments on NVMe.
+
+The strongest transfer is MSC-style admission and refresh scoring. A resident
+segment should not be kept merely because it was recently built, and a cold
+segment should not be evicted merely because it is large. The score should
+combine retained-read benefit, expected GPU/host/NVMe bytes avoided, refresh
+or compaction cost, overlap with existing cold segments, and invalidation risk.
+PrismDB's benefit/cost framing gives a concrete way to compare "keep hot rows
+resident" against "build a compact cold segment cheaply."
+
+The clock tracker and mapper map to lightweight route telemetry. Instead of
+tracking every tuple, GPU DB can track hot keys, predicates, segments, query
+shapes, and partition generations at bounded size. A mapper can then enforce a
+residency budget with explicit thresholds: always keep the hottest compatible
+snapshot pieces, demote untracked cold pieces, and sample or rotate the
+boundary group to avoid one skew burst monopolizing HBM.
+
+PrismDB's read-triggered compaction maps to proactive resident refresh and
+promotion. If retained reads repeatedly fall back to CPU or NVMe for a shape
+that is GPU-supported, the residency owner should schedule a promotion or
+refresh epoch and keep doing so only while the GPU-hit ratio, latency, or bytes
+avoided improve. This is better than waiting for writes or memory pressure to
+force placement decisions.
+
+Its partitioned tier ownership also reinforces the runtime documents. The GPU
+DB should keep placement and compaction work under owner domains with bounded
+queues and telemetry. The mutation owner preserves WAL-before-visibility; the
+residency owner scores and builds immutable generations; GPU execution workers
+consume already published handles. That split avoids making every read path
+participate in slow-tier compaction decisions.
+
+**Risks and mismatches:** PrismDB is a key-value store with read-committed
+single-key semantics, not SQL MVCC with long snapshots, joins, DDL, WAL replay,
+or PostgreSQL protocol sessions. Its crash model depends on synchronous NVM
+slab writes and atomic sub-page updates, while GPU DB must keep WAL as the
+durable authority and treat resident state as rebuildable acceleration state.
+Optane-like NVM assumptions also need reinterpretation because Optane is not a
+general future-proof tier in 2026; the policy matters more than that specific
+device. The paper's strengths are point queries and small objects, while scans
+need extra prefetching and dense range locality. Finally, a single partition
+lock per PrismDB partition is too coarse for 1M logical sessions unless the GPU
+DB partition owner is shielded by admission, batching, and immutable snapshot
+read paths.
+
+**Benchmark candidates:**
+
+- Add a tier-placement score for resident table segments. Inputs: retained-read
+  hit count, invalidation rate, refresh bytes, host-to-device bytes avoided,
+  cold-tier overlap, and segment size. Gate: the score predicts better p99
+  latency or fewer fallback bytes than recency-only residency.
+- Prototype a bounded clock-style tracker for resident route shapes and hot key
+  ranges. Gate: metadata remains bounded while identifying the top hot shapes
+  under skewed lookup and mixed scan workloads.
+- Compare write-triggered versus read-triggered resident refresh. A
+  read-triggered epoch should start when supported retained reads repeatedly
+  miss GPU residency and should stop if GPU-hit ratio or p99 latency stops
+  improving.
+- Measure demotion granularity: whole table, partition, segment, column group,
+  and key-range slice. Failure condition: finer granularity saves HBM but adds
+  refresh or metadata overhead that erases query-latency gains.
+- Build a cold-tier overlap benchmark where updating sparse keys forces refresh
+  of a wide cold range. Gate: MSC-style overlap scoring reduces NVMe and host
+  rewrite bytes versus naive demote-oldest selection.
+- Track QLC/NVMe-style endurance analogs for future cold tiers: bytes written
+  by refresh, compaction, checkpoint, and resident rebuild. Gate: hot residency
+  does not silently multiply cold-tier writes under skew.
+- Add a fallback-placement experiment: when GPU residency is saturated, compare
+  CPU execution, host-warm compressed execution, and explicit overload. Gate:
+  the route decision is based on observed queue wait plus tier-placement score,
+  not a static GPU-preferred rule.
+
+### 2026-06-03 - Cross-paper synthesis: placement needs costed generations
+
+FOEDUS, Caracal, and PrismDB converge on the same design pressure from three
+different directions: mutable work can be fast only when it has a scoped owner,
+but read throughput comes from immutable generations that can be built,
+published, and retired with explicit costs. FOEDUS separates mutable pages from
+immutable snapshots and rebuilds snapshot state from logs. Caracal pre-creates
+ordered batch-local versions so contended writes have deterministic slots.
+PrismDB scores hot/cold movement between tiers so promotion and demotion do not
+turn into uncontrolled compaction work.
+
+The near-term GPU DB design track should therefore treat each generation as a
+costed object. A generation is not just "valid" or "invalid"; it has a source
+WAL boundary, a visibility boundary, resident bytes, refresh bytes, overlap
+with cold segments, hit/miss telemetry, invalidation risk, and queue cost.
+Mutation owners should create or reserve version space only under WAL-safe
+publication rules. Residency owners should compact or refresh from sorted
+delta inputs when possible. Read workers should consume immutable handles and
+record enough telemetry to make the next placement decision better.
+
+The category gap is now less about finding another generic cache paper and
+more about connecting placement to SQL planning and MVCC cleanup. The queue
+should keep a balance between tiered storage papers such as SpanDB or
+SplinterDB, concurrency papers such as ORTHRUS/SSN follow-ups, and planner
+papers that can cost CPU/GPU/tier alternatives under uncertainty.
+
+Benchmark priority should shift to three coupled gates: batch-local MVCC
+version arrays for hot writes, MSC-style resident segment scoring for tier
+placement, and snapshot-retirement telemetry that proves retained reads do not
+pin cold or obsolete generations indefinitely. A design that wins only one of
+those gates is likely to move the bottleneck rather than remove it.

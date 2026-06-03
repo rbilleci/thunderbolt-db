@@ -135,7 +135,7 @@ mechanical sympathy, multi-tier cache/data placement, or query optimization.
   URL: `https://arxiv.org/abs/1901.10938`
   Why: explicit multi-tier DBMS buffer design across DRAM and non-volatile
   storage; useful for promotion/demotion policy and tier-aware page layout.
-- `queued` — **Efficient Compactions Between Storage Tiers with PrismDB**,
+- `reviewed` — **Efficient Compactions Between Storage Tiers with PrismDB**,
   arXiv 2020.
   URL: `https://arxiv.org/abs/2008.02352`
   Why: multi-tier storage compaction across fast and slow devices; relevant to
@@ -1520,3 +1520,21 @@ Append new candidates here as each paper is processed.
   transaction planning is a direct follow-up for FOEDUS's many-core OCC
   scaling limits under high contention, and may inform GPU DB mutation-owner
   admission and partitioned write lanes.
+- `queued` — **SplinterDB: Closing the Bandwidth Gap for NVMe Key-Value
+  Stores**, Conway et al., USENIX ATC 2020.
+  URL: `https://www.usenix.org/conference/atc20/presentation/conway`
+  PDF: `https://www.usenix.org/system/files/atc20-conway.pdf`
+  Why: PrismDB cites SplinterDB as an NVMe-specialized KV-store comparison;
+  its STB-epsilon-tree, concurrent cache, and reduced write amplification are
+  relevant to CPU/NVMe tier limits before GPU resident refresh.
+- `queued` — **SpanDB: A Fast, Cost-Effective LSM-tree Based KV Store on
+  Hybrid Storage**, Chen et al., FAST 2021.
+  URL: `https://www.usenix.org/conference/fast21/presentation/chen-hao`
+  Why: PrismDB compares against SpanDB as a hybrid-storage LSM baseline; useful
+  for deciding which WAL, SPDK, and upper-level placement ideas survive against
+  GPU DB's explicit warm/cold tier model.
+- `queued` — **Mutant: Balancing Storage Cost and Latency in LSM-Tree Data
+  Stores**, Yoon et al., SoCC 2018.
+  URL: `https://www.cs.cmu.edu/~juncheny/publications/socc18-Mutant.pdf`
+  Why: PrismDB contrasts object-level MSC with SSTable-level access-frequency
+  tiering; useful as a simpler placement baseline for cold resident segments.
