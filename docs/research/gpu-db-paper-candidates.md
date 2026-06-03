@@ -1157,9 +1157,10 @@ Append new candidates here as each paper is processed.
   Why: ParamTree cites retrofitting learned cost models into existing
   optimizers; relevant to calibrating GPU scan, transfer, and fallback costs
   without replacing the native planner contract.
-- `queued` — **How Good are Learned Cost Models, Really? Insights from Query
-  Optimization Tasks**, Woltmann et al., SIGMOD 2025.
+- `reviewed` — **How Good are Learned Cost Models, Really? Insights from Query
+  Optimization Tasks**, Heinrich et al., SIGMOD/PACMMOD 2025.
   URL: `https://doi.org/10.1145/3725309`
+  arXiv: `https://arxiv.org/abs/2502.01229`
   Why: modern learned-cost-model evaluation directly tests whether better
   prediction improves optimizer outcomes; useful for GPU DB route-choice
   benchmarks that must optimize latency, not only Q-error.
@@ -1262,6 +1263,13 @@ Append new candidates here as each paper is processed.
   isolation while moving fast-path work out of monolithic kernels; useful for
   future pgwire/network-service split, runtime ownership, and upgradeable
   datapath boundaries.
+- `queued` — **DACE: A Database-Agnostic Cost Estimator**, Liang et al.,
+  ICDE 2024.
+  URL: `https://doi.org/10.1109/ICDE60146.2024.00374`
+  Why: the 2025 learned-cost-model study found DACE competitive on physical
+  operator selection largely because it preserves PostgreSQL cost estimates as
+  inputs; useful for a hybrid GPU route-cost model that learns residuals while
+  keeping deterministic planner expertise visible.
 - `reviewed` — **Your Read is Our Priority in Flash Storage**, An et al.,
   PVLDB 2022.
   URL: `https://www.vldb.org/pvldb/vol15/p1911-lee.pdf`

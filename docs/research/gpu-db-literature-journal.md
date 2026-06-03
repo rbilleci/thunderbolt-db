@@ -16571,3 +16571,164 @@ Benchmark priorities:
 - Planner break-even tests: route among resident GPU, streamed GPU, zero-copy,
   and CPU fallback using measured selectivity, bytes, queue delay, and
   snapshot compatibility.
+
+### 2026-06-03 - Learned cost models need optimizer-task proof
+
+**Citation:** Roman Heinrich, Manisha Luthra, Johannes Wehrstein,
+Harald Kornmayer, and Carsten Binnig. "How Good are Learned Cost Models,
+Really? Insights from Query Optimization Tasks." Proceedings of the ACM
+on Management of Data 3(3), SIGMOD/PACMMOD 2025, pp. 1-27.
+doi:10.1145/3725309. Retrieved 2026-06-03 from
+`https://arxiv.org/abs/2502.01229`; candidate DOI
+`https://doi.org/10.1145/3725309`.
+
+**Category:** Query optimization / planning.
+
+**Relevance tags:** learned cost models; CPU/GPU route choice; join order;
+access path selection; physical operator selection; robust planning;
+training-data bias; plan ranking; hybrid expert-plus-learned models;
+route telemetry.
+
+**Core idea:** The paper asks whether learned cost models help the optimizer
+choose faster plans, not merely whether they predict single-plan runtimes with
+lower Q-error. It evaluates seven learned cost models against PostgreSQL cost
+models on three optimizer tasks: join ordering, access path selection, and
+physical operator selection. The central result is deliberately uncomfortable:
+learned models often have better median prediction accuracy, but the classical
+PostgreSQL model often still selects better plans for downstream optimization.
+
+The strongest lesson is that route choice is a ranking and decision problem.
+A model that predicts runtime reasonably on near-optimal plans can still
+choose bad plans if its tail errors are large, if it cannot rank alternatives
+faithfully, or if its training data rarely includes the bad alternatives the
+optimizer must reject. For GPU DB, this is directly relevant to deciding among
+resident GPU, streamed GPU, CPU, zero-copy, refresh-first, and rejection routes.
+A lower average cost-prediction error is not enough if the route selector picks
+a fragile GPU path under the wrong selectivity, queue-depth, or transfer-cost
+conditions.
+
+**Concrete mechanisms:**
+
+- The study evaluates learned cost models on optimizer-task outcomes rather
+  than only median Q-error. For join ordering it measures selected runtime,
+  surpassed plans, Spearman rank correlation, underestimation, and
+  overestimation across plan candidates.
+- For access path selection it treats sequential scan versus index scan as a
+  classification-like decision and uses balanced accuracy so a model cannot
+  look good by favoring the majority access path.
+- For physical operator selection it executes the same logical join with hash
+  join, sort-merge join, and indexed nested-loop join, then measures how often
+  each cost model picks the fastest physical operator and what total runtime
+  the selected operators produce.
+- The evaluated learned models include a spread of feature and architecture
+  choices: flat vectors, SQL-only or plan-structured models, tree/graph or
+  transformer representations, database-specific and database-agnostic models,
+  and hybrid models that include PostgreSQL cost estimates.
+- On JOB-Light join ordering, the paper reports that scaled PostgreSQL 10
+  selected plans with 518 seconds total runtime, while the best learned model
+  in that run was Zero-Shot at 530 seconds and QueryFormer selected plans
+  totaling about 830 seconds. The optimal workload runtime was 446 seconds.
+- Supplying actual cardinalities improves learned models, but PostgreSQL cost
+  models with actual cardinalities move much closer to optimal than Zero-Shot,
+  showing that learned cost models do not automatically exploit better
+  cardinality signals.
+- Access path selection exposes training-data bias. The training workload had
+  many sequential scans and only index scans that were beneficial, so several
+  learned models developed a broad index-scan preference without learning the
+  high-selectivity downside.
+- Physical operator selection shows a similar operator-preference problem:
+  many learned models over-select indexed nested-loop joins, while PostgreSQL
+  tends to over-select hash joins in the evaluated setup. DACE is competitive
+  largely because it uses PostgreSQL costs as input.
+- The authors recommend task-specific metrics, more diverse training data
+  containing good and bad plan alternatives, confidence or uncertainty signals,
+  and hybrid models that preserve traditional optimizer estimates as features
+  rather than discarding expert knowledge.
+- A fine-tuning experiment for access path selection adds paired SeqScan and
+  IndexScan examples across selectivities; this improves balanced accuracy and
+  total runtime for several learned models, demonstrating that task-shaped
+  evidence can matter more than generic accuracy.
+
+**GPU DB mapping:** GPU DB route choice should be evaluated as a bounded
+decision system, not as a single scalar cost predictor. The planner should
+score each eligible route by the metric that matters for the decision:
+selected latency, p95/p99 risk, fallback probability, queue wait, transfer
+bytes, refresh cost, pinned-buffer pressure, resident snapshot compatibility,
+and SQL correctness guardrails. A learned route model is only useful if it
+selects faster and safer routes than deterministic rules under these metrics.
+
+The first GPU route model should be hybrid. Keep hand-written cost components
+for H2D/D2H bytes, kernel launch count, expected rows, CPU fallback cost,
+resident validity, refresh cost, and queue delay; then learn residuals or
+rank candidates using measured endpoint telemetry. This matches the paper's
+"do not throw expert knowledge away" result and avoids a black-box model
+overriding route validity, WAL-before-visibility, or snapshot compatibility.
+
+Training data must include negative GPU routes. Current benchmark evidence is
+biased toward routes we already admit: resident count, lookup, filtered
+aggregates, and successful over-resident proofs. A route learner trained only
+on admitted winners will likely over-select GPU paths just as learned models
+over-selected index scans or nested-loop joins. GPU DB should deliberately log
+and, in controlled benchmark runs, execute paired alternatives: CPU versus
+resident GPU, dense transfer versus zero-copy, refresh-now versus CPU fallback,
+single request versus micro-batch, and streamed GPU versus rejection under
+queue pressure.
+
+Task-specific metrics should be part of planner CI. For each SQL template and
+route family, record whether the selector picked the fastest correct route,
+the slowdown versus oracle route, the rank of the selected route among
+alternatives, and the underestimation/overestimation tail. That gives a direct
+failure signal when a learned route has better average prediction error but
+worse production choices.
+
+The paper also argues for explicit uncertainty. In GPU DB this maps naturally
+to fallback gates: if cardinality, queue delay, snapshot age, transfer
+bandwidth, or pinned-buffer budget is uncertain beyond a threshold, select a
+robust CPU route, wait for a compatible snapshot, or reject with overload
+rather than speculatively entering a fragile GPU route.
+
+**Risks and mismatches:** This is an optimizer evaluation paper, not a GPU DB
+execution paper. It does not evaluate GPU kernels, PCIe/NVLink transfer,
+resident snapshots, MVCC visibility, WAL boundaries, refresh costs, or
+session-scale admission. Its experiments use PostgreSQL and benchmark
+workloads such as JOB-Light, IMDB, Baseball, and TPC-H-style two-way joins;
+the results should shape evaluation method more than determine any concrete
+GPU cost coefficient.
+
+The arXiv version retrieved is a February 2025 preprint, while the candidate
+queue tracks the SIGMOD/PACMMOD DOI. The core findings and artifacts appear
+aligned with the publication metadata, but any final camera-ready differences
+were not separately checked behind ACM access.
+
+LCM training-data diversification can be expensive because bad plans may run
+for hours or time out. GPU DB needs a bounded way to collect negative route
+evidence without burning hardware time: synthetic microbenchmarks, capped
+execution, simulated transfer costs, or partial labels may be needed before
+full learned route selection is safe.
+
+**Benchmark candidates:**
+
+- Build a route-choice benchmark matrix for one retained query family: CPU
+  tuple/index path, GPU resident path, GPU streamed path, and rejection under
+  saturated queue. Gate: report selected route slowdown versus oracle and not
+  only route-cost prediction error.
+- Add paired route logging for admitted production proofs: for each executed
+  retained route, estimate or sample at least one plausible non-selected route
+  with the same snapshot and predicate. Expected result: training data contains
+  both winners and losers.
+- Add under/overestimation telemetry to the planner: predicted latency, actual
+  latency, selected-route rank, queue wait, transfer bytes, rows, and fallback
+  reason. Failure condition: a model with lower mean error but worse selected
+  route latency is rejected.
+- Test cardinality-sensitive GPU route choice by sweeping selectivity for a
+  filter/aggregate query and comparing dense GPU transfer, zero-copy sparse
+  projection, resident scan, and CPU fallback. Gate: the selector learns or
+  encodes the measured break-even rather than over-selecting the route that
+  won on admitted benchmarks.
+- Prototype a hybrid route model that uses deterministic planner costs as
+  inputs and learns residual penalties from telemetry. Compare it against pure
+  rules and a learned-only scorer on selected runtime, p99 latency, and
+  invalid-route avoidance.
+- Add confidence-aware admission: when route estimates disagree or uncertainty
+  is high, prefer robust fallback or explicit overload. Gate: lower p99 and no
+  correctness regression under skewed cardinality and GPU queue pressure.
