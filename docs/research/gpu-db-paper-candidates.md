@@ -343,7 +343,7 @@ Append new candidates here as each paper is processed.
   Why: storage-interface follow-up from the unikernel paper's related work;
   useful for evaluating file-system avoidance and DB-owned NVMe/cold-tier
   layouts.
-- `queued` — **Optimizing Memory-mapped I/O for Fast Storage Devices**,
+- `reviewed` — **Optimizing Memory-mapped I/O for Fast Storage Devices**,
   Papagiannis et al., USENIX ATC 2020.
   URL: `https://www.usenix.org/conference/atc20/presentation/papagiannis`
   PDF: `https://www.usenix.org/system/files/atc20-papagiannis.pdf`
@@ -1395,3 +1395,17 @@ Append new candidates here as each paper is processed.
   Why: ERMIA uses Serial Safety Net as its serializability certifier; useful
   for deciding whether GPU DB can layer bounded dependency validation over
   snapshot-friendly read execution without falling back to pessimistic locks.
+- `queued` — **Don't Shoot Down TLB Shootdowns!**, Amit, Tai, and Wei,
+  EuroSys 2020.
+  URL: `https://doi.org/10.1145/3342195.3387525`
+  Why: FastMap shows batched TLB invalidation can trade extra TLB misses for
+  better mmap scalability; this follow-up studies scalable TLB shootdown
+  mechanisms directly and is useful for any GPU DB tier that depends on
+  mapped cold pages, virtual-memory-assisted buffers, or remapped snapshots.
+- `queued` — **Scalable Range Locks for Scalable Address Spaces and Beyond**,
+  Kogan, Dice, and Issa, EuroSys 2020.
+  URL: `https://doi.org/10.1145/3342195.3387513`
+  Why: FastMap's remaining bottleneck includes shared address-space metadata;
+  scalable range-locking is a modern comparison point for page-fault,
+  mmap/munmap, and non-overlapping virtual-address operations in
+  VM-assisted buffer managers.

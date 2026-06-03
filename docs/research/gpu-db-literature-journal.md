@@ -15583,3 +15583,144 @@ Benchmark priorities:
   with strict generation keys and invalidation checks.
 - Measure cold-tier and refresh work as schedulable classes, not background
   noise, because they compete with the same queues needed by short sessions.
+
+### 2026-06-03 - FastMap scalable mmap for fast storage
+
+**Citation:** Anastasios Papagiannis, Giorgos Xanthakis, Giorgos Saloustros,
+Manolis Marazakis, and Angelos Bilas. "Optimizing Memory-mapped I/O for Fast
+Storage Devices." USENIX ATC 2020. Retrieved 2026-06-03 from
+`https://www.usenix.org/system/files/atc20-papagiannis.pdf`.
+
+**Category:** multi-tier cache / data placement and runtime / storage.
+
+**Relevance tags:** mmap; page cache; fast NVMe; Optane; page faults; TLB
+shootdowns; per-core metadata; dirty-page writeback; queue depth; DRAM cache;
+out-of-memory execution; Silo/TPC-C; YCSB; MonetDB/TPC-H.
+
+**Core idea:** FastMap asks whether mmap can be made viable for fast storage
+once the Linux mmap path's multicore bottlenecks are removed. The paper's
+answer is qualified but useful: ordinary Linux mmap does not scale well for
+random page faults on modern multicore machines and fast storage, but a
+specialized path for data-intensive file-backed mappings can remove central
+contention, raise device queue depth, and make mapped storage competitive for
+larger-than-memory workloads.
+
+For GPU DB, the key takeaway is not "delegate cold-tier placement to mmap."
+It is that if a tier uses virtual memory or mapped files, the page-fault,
+reverse-mapping, eviction, writeback, and TLB-invalidation paths become hot
+database runtime paths. They need the same owner-domain, per-core, bounded
+queue, and telemetry discipline as query execution.
+
+**Concrete mechanisms:**
+
+- FastMap replaces Linux's shared `address_space` hot path with per-file data
+  and per-VMA structures. A per-file structure tracks cached device blocks and
+  dirty-page metadata; a per-VMA structure provides fuller reverse mappings.
+- Clean and dirty metadata are separated. The all-page lookup path uses
+  per-core radix trees, while dirty pages live in per-core red-black trees.
+  Marking a page dirty therefore avoids updating a single tagged shared radix
+  tree.
+- Pages are assigned to per-core structures by page offset. This reduces
+  insertion, deletion, and dirty-mark contention while preserving lock-free
+  lookups where possible.
+- FastMap uses fuller reverse mappings so eviction and writeback can find
+  affected virtual mappings directly, rather than scanning broad VMA sets under
+  coarse read locks.
+- It implements a dedicated DRAM cache instead of depending on the Linux page
+  cache and swapper. The cache has separate clean and dirty queues, per-core
+  clean queues, per-core free lists, and a static memory buffer that does not
+  create additional Linux page-cache pressure.
+- Eviction prefers clean pages and evicts batches, currently 512 pages in the
+  prototype, to amortize page-table manipulation and TLB invalidation.
+- Writeback uses multiple threads, per-thread dirty queues, sorted dirty trees,
+  and merged consecutive IO requests. The prototype begins writeback when dirty
+  pages exceed 75% of cache pages.
+- TLB invalidations are batched over ranges. The paper accepts some false TLB
+  invalidations in exchange for fewer expensive cross-core shootdowns.
+- FastMap can sit above VFS and below file systems through a stackable file
+  system wrapper, or expose a virtual block-device path. Page fetch/eviction
+  uses direct IO to avoid double-caching through the normal Linux page cache.
+- The evaluation reports that Linux mmap scales only to about 8 threads in the
+  random page-fault microbenchmark, while FastMap scales to 80 cores and
+  reaches up to 11.8x more random IOPS on `null_blk`.
+- On an Optane SSD, FastMap reports up to 5.27x higher throughput in the
+  memory-extension graph benchmark, about 2.48x average improvement across
+  out-of-memory YCSB workloads on Kreon, and very large Silo/TPC-C gains when
+  Silo's heap is backed by mapped fast storage.
+- The paper also shows smaller MonetDB/TPC-H gains, averaging about 6.06%,
+  because the workload has more sequential access and less system-time pressure
+  than the random page-fault-heavy cases.
+
+**GPU DB mapping:** FastMap is a direct caution for the GPU DB cold and warm
+tier. If cold partitions, host-compressed segments, future CXL/remote memory,
+or DB-owned files are exposed through mmap-like access, Linux's default page
+cache path can become the bottleneck even when NVMe or persistent memory is
+fast enough. That matches the existing P8 principle that tier movement should
+be explicit and observable rather than silently delegated.
+
+The transferable design is to treat tier metadata as partitioned owner state.
+GPU DB's cache manager should have separate metadata for valid resident
+segments, dirty or pending refresh state, evictable clean host pages, and
+durable cold extents. A single global page tree or one lock around all
+resident/cold metadata would recreate the bottleneck FastMap removes. Per-core
+or per-partition tier queues should report queue depth, evictions, writeback
+bytes, page faults, and TLB or mapping invalidation costs.
+
+FastMap's clean/dirty split maps well to WAL-safe GPU residency. Durable CPU
+truth, clean cold pages, dirty mutation batches, invalidated GPU generations,
+and refreshing resident segments should not share one undifferentiated
+"buffer" state. Separate state machines make it possible to evict clean cold
+segments aggressively, delay dirty writeback safely, and reject resident reads
+when invalidation or refresh pressure is too high.
+
+The device queue-depth result is important for over-resident GPU execution.
+Small random storage access is no longer automatically disqualifying on fast
+NVMe, but it only works when the software path can keep enough concurrent IO
+in flight. GPU DB should measure cold-tier queue depth, request size, merge
+rate, and CPU time per fault or read, not just storage latency.
+
+FastMap also informs the virtual-memory-assisted buffer-manager papers already
+reviewed. VM tricks can reduce explicit copy and cache lookup overhead on hits,
+but misses, eviction, reverse mapping, and shootdown costs must be first-class
+benchmark dimensions. For GPU DB, any VM-assisted snapshot or cold-partition
+scheme should have an escape hatch to an explicit DB-owned async IO path when
+fault handling steals CPU from query admission or response rings.
+
+**Risks and mismatches:** FastMap is a Linux-kernel prototype, not a DBMS
+storage engine and not a GPU data path. Its correctness model is page-cache
+coherence and mapped-file persistence, not SQL transactions, WAL visibility,
+MVCC snapshots, DDL invalidation, or CUDA stream ownership. The paper targets
+data-intensive applications with little file sharing and infrequent `fork`;
+general-purpose mmap semantics would need more memory and edge-case handling.
+
+The strongest reported gains come from page-fault-heavy, larger-than-memory,
+random-access workloads. Sequential analytics see smaller wins, and GPU DB
+should not assume mmap optimization alone solves compressed scans, joins,
+or resident refresh. The design also spends more metadata memory on reverse
+mappings and per-core structures, batches TLB invalidations with possible
+false invalidations, and depends on kernel changes that are not available in a
+portable userspace engine.
+
+**Benchmark candidates:**
+
+- Add a cold-tier access benchmark with three paths: explicit async pread or
+  io_uring, ordinary mmap, and a simulated DB-owned page cache. Measure
+  p50/p95/p99, CPU system time, page-fault count, storage queue depth, request
+  size, and throughput.
+- Build a tier-metadata contention benchmark for P8: one global cache-manager
+  lock versus per-partition/per-core queues for clean, dirty, invalidated, and
+  refreshing states. Proof gate: higher concurrency without hiding invalidation
+  or WAL-safe publication delays.
+- Add telemetry for over-resident routes that separates page/fault wait,
+  storage wait, CPU metadata time, GPU kernel time, and response encoding.
+  Failure condition: a faster route cannot explain which tier phase moved.
+- Test clean/dirty/invalidated separation for resident refresh: evict clean
+  cold host pages, preserve dirty WAL-pending batches, and reject reads on
+  invalidated generations. Gate: no stale SQL-visible retained read under
+  concurrent mutation and eviction.
+- Measure batched mapping invalidation if any VM-assisted host snapshot path is
+  introduced. Expected benefit: fewer shootdown-like events; failure condition:
+  false invalidations harm short retained-read p99 more than the batching helps.
+- Compare cold random lookups at 4KB, 16KB, 64KB, and merged request sizes.
+  Expected result: a tier route needs enough queue depth and merge rate before
+  GPU execution can hide storage latency.
