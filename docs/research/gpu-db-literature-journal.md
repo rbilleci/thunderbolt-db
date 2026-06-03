@@ -25376,3 +25376,147 @@ duplication explicitly before attempting exclusive movement.
   overlays: one axis runs writes or refresh invalidations, the other
   runs retained skewed lookups and short ranges. Gate: the overlay
   improves the mixed frontier rather than only the read-only point.
+
+### 2026-06-03 - NCC response-timed strict serializability for naturally ordered transactions
+
+**Citation:** Haonan Lu, Shuai Mu, Siddhartha Sen, and Wyatt Lloyd.
+"NCC: Natural Concurrency Control for Strictly Serializable Datastores
+by Avoiding the Timestamp-Inversion Pitfall." OSDI 2023. Retrieved
+2026-06-03 from the USENIX page and PDF at
+`https://www.usenix.org/conference/osdi23/presentation/lu` and
+`https://www.usenix.org/system/files/osdi23-lu.pdf`.
+
+**Category:** transaction processing / concurrency control, with MVCC
+visibility and response-admission implications.
+
+**Relevance tags:** strict serializability; timestamp inversion;
+response timing; non-blocking execution; read-only transactions;
+cross-owner ordering; abort reduction; session response rings;
+visibility generation tests.
+
+**Core idea:** NCC starts from the observation that many datacenter
+transactions are "naturally consistent": they arrive at the
+participant servers in an order that already satisfies a strict
+serializable real-time order, and often do not create harmful
+interleavings. Instead of paying locks, validation rounds, or
+transaction-reordering barriers for every transaction, NCC executes in
+arrival order with minimal interference, then verifies whether the
+result was safe.
+
+The paper's most transferable warning is the timestamp-inversion
+pitfall. A timestamp-based protocol can produce a total order that
+looks valid locally, while still inverting the real-time order through
+a chain of non-conflicting transactions. NCC avoids returning such
+results by decoupling execution from response release: execution stays
+non-blocking, but responses are held until timestamp checks and response
+timing control prove that returning the result cannot violate strict
+serializability.
+
+**Concrete mechanisms:**
+
+- Non-blocking execution lets participant servers process requests in
+  arrival order without acquiring locks or waiting for ordering
+  exchange in the common case.
+- Decoupled response management separates producing a result from
+  sending it to the client. This lets the system delay, abort, or retry
+  only the response outcome while keeping the execution path cheap.
+- Timestamp-based consistency checking validates that a transaction's
+  observed versions and produced writes can fit into a strict
+  serializable order.
+- Response timing control prevents timestamp inversion by ensuring a
+  response is not released before the real-time ordering implied by
+  already-visible responses is safe.
+- Asynchrony-aware timestamps and smart retry reduce false aborts when
+  message delay or participant skew would otherwise make a naturally
+  consistent transaction look unsafe.
+- NCC includes a specialized read-only protocol intended to achieve
+  best-case one-round, non-blocking, lock-free execution for strictly
+  serializable reads without synchronized clocks.
+- The evaluation reports `2-10x` lower latency and `2-20x` higher
+  throughput than dOCC, d2PL, and transaction reordering on the
+  studied Google-F1, Facebook-TAO, and TPC-C-like workloads, while
+  matching weaker serializable protocols more closely.
+
+**GPU DB mapping:** GPU DB's owner/ring design has a similar split
+available: the mutation owner, read snapshot workers, and GPU execution
+workers can produce a result before the network IO worker is allowed to
+release it. NCC suggests treating response rings as a correctness
+boundary, not just an output queue. A retained GPU read should carry a
+visibility generation, source WAL boundary, route generation, and any
+cross-owner dependency watermark; the response ring should release it
+only after the runtime can prove that no earlier-finished transaction
+would be inverted by the returned snapshot.
+
+The timestamp-inversion pitfall is especially relevant once GPU DB
+splits ownership. A read from an immutable resident snapshot may be
+locally valid for one table or partition, while a separate mutation
+owner, catalog owner, or residency owner has already made another
+transaction visible to the client. If a later response can observe the
+older resident generation and return before the earlier transaction's
+ordering is reflected, the system risks an externally visible anomaly
+even if each owner publishes monotonically increasing generations.
+
+For writes, NCC argues for measuring the common case where arrival
+order is already good enough. GPU DB does not need to route every short
+single-partition transaction through heavyweight global validation if
+an owner-local order plus a response-release watermark proves real-time
+safety. The right benchmark is not "remove validation"; it is "how many
+transactions pass the natural-order fast path, how many are delayed at
+response release, and how many must retry or fall back to a stronger
+route."
+
+For read-only retained GPU routes, NCC's specialized read-only protocol
+maps to a strict release rule: a read snapshot worker or GPU worker may
+execute immediately against a retained generation, but the response
+manager must compare the snapshot's visibility boundary against the
+client/session's real-time dependency boundary and the global or
+per-owner response-release watermark. This can keep GPU execution
+lock-free while making external consistency auditable at the protocol
+edge.
+
+**Risks and mismatches:** NCC targets distributed datastores with
+participant servers and coordinators, not a single-node GPU-resident
+SQL engine. Its protocol assumes transaction requests can be reasoned
+about at the participant level; GPU DB still needs SQL planning,
+MVCC tuple visibility, WAL-before-visibility, kernel scheduling, and
+resident-cache invalidation.
+
+The paper's strongest wins depend on short, naturally ordered
+transactions. Many-shot interactive SQL transactions, long analytical
+GPU scans, refresh jobs, and cross-partition operations are more likely
+to interleave and may not benefit. GPU DB should not let response
+timing hide unbounded latency; delayed responses need explicit queue
+and watermark telemetry.
+
+NCC also does not solve durability, crash replay, GPU memory placement,
+or MVCC garbage collection. Its response-release idea must be layered
+below GPU DB's existing WAL-before-visibility invariant, not used as a
+substitute for durable commit ordering.
+
+**Benchmark candidates:**
+
+- Add a timestamp-inversion regression test with two or more owner
+  domains and a chain of non-conflicting transactions. Gate: a retained
+  read response cannot be released if doing so would invert the
+  real-time order of an already completed transaction.
+- Prototype response-release watermarks on the host runtime: execution
+  workers enqueue completed results, but IO workers release only after
+  visibility generation and dependency watermark checks pass. Measure
+  p50/p95 release delay separately from execution latency.
+- Track natural-order fast-path outcomes for single-partition writes:
+  passed immediately, delayed at response timing, smart-retried, or
+  forced through a stronger validation path. Failure condition: the
+  fast path improves throughput by serving externally inconsistent
+  snapshots.
+- Extend retained GPU read metadata with `snapshot_generation`,
+  `source_wal_boundary`, `response_release_watermark`, and
+  `session_dependency_boundary`. Gate: every GPU response can explain
+  which boundary made it safe to return.
+- Compare strict latest reads, bounded-staleness reads, and NCC-style
+  response-timed reads under mixed write/read load. Required metrics:
+  throughput, release wait, abort/retry count, stale-generation lag,
+  and explicit fallback reason.
+- Add an adversarial scheduler test that delays one owner or response
+  ring while another owner publishes newer visibility. Gate: no client
+  observes a later transaction before an earlier completed one when the
+  route claims strict serializability.

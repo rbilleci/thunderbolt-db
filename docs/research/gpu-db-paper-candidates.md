@@ -1301,6 +1301,14 @@ Append new candidates here as each paper is processed.
   Why: Strife is a key partitioner baseline used by the runtime-conflict
   scheduler; useful for hot-key partitioning, residual transaction handling,
   and contention-aware owner assignment.
+- `queued` — **Consolidating Concurrency Control and Consensus for Commits
+  under Conflicts**, Mu et al., OSDI 2016.
+  URL: `https://www.usenix.org/conference/osdi16/technical-sessions/presentation/mu`
+  PDF: `https://www.usenix.org/system/files/conference/osdi16/osdi16-mu.pdf`
+  Why: NCC compares against Janus-style transaction reordering and notes the
+  cost of exchanging ordering information; useful for evaluating whether GPU
+  DB should ever merge cross-owner commit ordering with replication or keep
+  owner-local WAL publication simpler.
 - `queued` — **Scheduling OLTP Transactions via Learned Abort Prediction**,
   Sheng, Tomasic, Zhang, and Pavlo, aiDM 2019.
   URL: `https://doi.org/10.1145/3329859.3329871`
@@ -1346,10 +1354,11 @@ Append new candidates here as each paper is processed.
   Why: modern synchronized-clock geo-transaction design related to Caerus and
   Detock; useful for deciding whether owner-boundary timestamps can reduce
   coordination without relying on full deterministic execution.
-- `queued` — **NCC: Natural Concurrency Control for Strictly Serializable
+- `reviewed` — **NCC: Natural Concurrency Control for Strictly Serializable
   Datastores by Avoiding the Timestamp-Inversion Pitfall**, Lu, Mu, Sen,
   and Lloyd, OSDI 2023.
   URL: `https://www.usenix.org/conference/osdi23/presentation/lu`
+  PDF: `https://www.usenix.org/system/files/osdi23-lu.pdf`
   Why: Tiga repeatedly contrasts against NCC's timestamp-inversion handling;
   directly relevant to cross-owner strict-serializability tests and whether
   GPU DB needs generation agreement for indirect dependency chains.
