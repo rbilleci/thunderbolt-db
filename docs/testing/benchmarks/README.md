@@ -123,22 +123,22 @@ match-index output.
   projections.
 - [2026-06-01 identical full-run streaming guard](../reports/2026-06-01-p8-identical-full-run-streaming-guard-v1.md):
   streamed identical pgwire load contract, full 25% guard, and readiness facts.
-- [2026-06-01 engine pgwire COPY/session readiness](../reports/2026-06-01-p8-engine-pgwire-full-copy-session-v1.md):
+- [2026-06-01 engine pgwire COPY/session readiness](../reports/series/p8-copy-admission/runs/2026-06-01-p8-engine-pgwire-full-copy-session-v1.md):
   bounded endpoint COPY admission, full-curve session sizing, and scaled
   default/tuned/GPU retained proof.
-- [2026-06-01 engine pgwire full-COPY throughput](../reports/2026-06-01-p8-engine-pgwire-full-copy-throughput-v1.md):
+- [2026-06-01 engine pgwire full-COPY throughput](../reports/series/p8-copy-admission/runs/2026-06-01-p8-engine-pgwire-full-copy-throughput-v1.md):
   current-process decoded apply and the narrowed SQL-visible MVCC bulk COPY
   admission blocker.
-- [2026-06-01 10% copy path single-load curves](../reports/2026-06-01-p8-10pct-copy-path-single-load-curves-v1.md):
+- [2026-06-01 10% copy path single-load curves](../reports/series/p8-copy-admission/runs/2026-06-01-p8-10pct-copy-path-single-load-curves-v1.md):
   10% row-target derivation, first-class harness tier labeling, and the current
   6h-budget blocker for GPU DB endpoint COPY admission.
-- [2026-06-01 engine SQL-visible bulk COPY admission](../reports/2026-06-01-p8-engine-sql-visible-bulk-copy-admission-v1.md):
+- [2026-06-01 engine SQL-visible bulk COPY admission](../reports/series/p8-copy-admission/runs/2026-06-01-p8-engine-sql-visible-bulk-copy-admission-v1.md):
   reserved generated-row-key MVCC insertion, bounded 65k and 1M endpoint probes,
   and the narrowed value-index bulk admission blocker.
-- [2026-06-01 engine SQL-visible value-index bulk admission](../reports/2026-06-01-p8-engine-sql-visible-value-index-bulk-admission-v1.md):
+- [2026-06-01 engine SQL-visible value-index bulk admission](../reports/series/p8-copy-admission/runs/2026-06-01-p8-engine-sql-visible-value-index-bulk-admission-v1.md):
   grouped value-index appends, bounded 1M endpoint evidence, and the narrowed
   storage/WAL/MVCC phase-profile blocker.
-- [2026-06-01 engine SQL-visible COPY admission phase profile](../reports/2026-06-01-p8-engine-sql-visible-copy-admission-phase-profile-v1.md):
+- [2026-06-01 engine SQL-visible COPY admission phase profile](../reports/series/p8-copy-admission/runs/2026-06-01-p8-engine-sql-visible-copy-admission-phase-profile-v1.md):
   phase-specific COPY admission evidence, the unconstrained-table preflight
   scan fix, and bounded 1M endpoint evidence projecting 10% COPY admission
   inside the 6h budget.
@@ -150,10 +150,10 @@ match-index output.
   retained-query setup phase evidence, the snapshot-clone and conjunctive
   access-path fixes, 1M-row after-fix proof, and the remaining COPY admission
   recheck blocker.
-- [2026-06-02 10% COPY admission 30k recheck](../reports/2026-06-02-p8-10pct-copy-admission-30000-recheck-v1.md):
+- [2026-06-02 10% COPY admission 30k recheck](../reports/series/p8-copy-admission/runs/2026-06-02-p8-10pct-copy-admission-30000-recheck-v1.md):
   required 1M-row COPY admission recheck, retained-query health smoke, and the
   narrowed WAL/value-index COPY admission blocker.
-- [2026-06-02 COPY admission WAL/value-index architecture](../reports/2026-06-02-p8-copy-admission-wal-value-index-architecture-v1.md):
+- [2026-06-02 COPY admission WAL/value-index architecture](../reports/series/p8-copy-admission/runs/2026-06-02-p8-copy-admission-wal-value-index-architecture-v1.md):
   the bounded WAL/current-apply architecture slice that cleared the 30k
   rows/sec COPY gate and left the full 10% retry as the next benchmark decision.
 - [2026-06-02 10% identical pgwire execution v4](../reports/2026-06-02-p8-identical-10pct-execution-v4.md):

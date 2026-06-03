@@ -51,7 +51,7 @@ Previously checked reports show the boundary state:
 - `docs/testing/reports/2026-05-31-p8-protocol-retained-route-bridge-v1.md`
   blocked direct bridging because the TCP server lives in `gpu_db_protocol`
   while retained execution is engine-owned.
-- `docs/testing/reports/2026-05-31-p8-sql-visible-retained-admission-v1.md`
+- `docs/testing/reports/series/p8-copy-admission/runs/2026-05-31-p8-sql-visible-retained-admission-v1.md`
   closed retained admission for the engine-owned PostgreSQL-shaped session
   probe, but left `identical_pg_client_concurrency_harness_required`.
 

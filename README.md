@@ -111,23 +111,23 @@ Details live in [docs/testing/benchmarks/README.md](docs/testing/benchmarks/READ
 The latest reports are
 [docs/testing/reports/2026-06-01-p8-identical-composite-text-pgwire-curves-v1.md](docs/testing/reports/2026-06-01-p8-identical-composite-text-pgwire-curves-v1.md)
 and
-[docs/testing/reports/2026-06-01-p8-engine-pgwire-full-copy-throughput-v1.md](docs/testing/reports/2026-06-01-p8-engine-pgwire-full-copy-throughput-v1.md).
+[docs/testing/reports/series/p8-copy-admission/runs/2026-06-01-p8-engine-pgwire-full-copy-throughput-v1.md](docs/testing/reports/series/p8-copy-admission/runs/2026-06-01-p8-engine-pgwire-full-copy-throughput-v1.md).
 The 10% pivot/blocker report is
-[docs/testing/reports/2026-06-01-p8-10pct-copy-path-single-load-curves-v1.md](docs/testing/reports/2026-06-01-p8-10pct-copy-path-single-load-curves-v1.md).
+[docs/testing/reports/series/p8-copy-admission/runs/2026-06-01-p8-10pct-copy-path-single-load-curves-v1.md](docs/testing/reports/series/p8-copy-admission/runs/2026-06-01-p8-10pct-copy-path-single-load-curves-v1.md).
 The latest narrowed bulk-admission report is
-[docs/testing/reports/2026-06-01-p8-engine-sql-visible-bulk-copy-admission-v1.md](docs/testing/reports/2026-06-01-p8-engine-sql-visible-bulk-copy-admission-v1.md).
+[docs/testing/reports/series/p8-copy-admission/runs/2026-06-01-p8-engine-sql-visible-bulk-copy-admission-v1.md](docs/testing/reports/series/p8-copy-admission/runs/2026-06-01-p8-engine-sql-visible-bulk-copy-admission-v1.md).
 The latest value-index admission report is
-[docs/testing/reports/2026-06-01-p8-engine-sql-visible-value-index-bulk-admission-v1.md](docs/testing/reports/2026-06-01-p8-engine-sql-visible-value-index-bulk-admission-v1.md).
+[docs/testing/reports/series/p8-copy-admission/runs/2026-06-01-p8-engine-sql-visible-value-index-bulk-admission-v1.md](docs/testing/reports/series/p8-copy-admission/runs/2026-06-01-p8-engine-sql-visible-value-index-bulk-admission-v1.md).
 The latest COPY phase-profile report is
-[docs/testing/reports/2026-06-01-p8-engine-sql-visible-copy-admission-phase-profile-v1.md](docs/testing/reports/2026-06-01-p8-engine-sql-visible-copy-admission-phase-profile-v1.md).
+[docs/testing/reports/series/p8-copy-admission/runs/2026-06-01-p8-engine-sql-visible-copy-admission-phase-profile-v1.md](docs/testing/reports/series/p8-copy-admission/runs/2026-06-01-p8-engine-sql-visible-copy-admission-phase-profile-v1.md).
 The latest 10% execution blocker report is
 [docs/testing/reports/2026-06-01-p8-10pct-identical-single-load-curves-v1.md](docs/testing/reports/2026-06-01-p8-10pct-identical-single-load-curves-v1.md).
 The latest retained query profile report is
 [docs/testing/reports/2026-06-01-p8-10pct-retained-query-throughput-profile-v1.md](docs/testing/reports/2026-06-01-p8-10pct-retained-query-throughput-profile-v1.md).
 The latest COPY admission recheck report is
-[docs/testing/reports/2026-06-02-p8-10pct-copy-admission-30000-recheck-v1.md](docs/testing/reports/2026-06-02-p8-10pct-copy-admission-30000-recheck-v1.md).
+[docs/testing/reports/series/p8-copy-admission/runs/2026-06-02-p8-10pct-copy-admission-30000-recheck-v1.md](docs/testing/reports/series/p8-copy-admission/runs/2026-06-02-p8-10pct-copy-admission-30000-recheck-v1.md).
 The latest COPY WAL/current-apply architecture report is
-[docs/testing/reports/2026-06-02-p8-copy-admission-wal-value-index-architecture-v1.md](docs/testing/reports/2026-06-02-p8-copy-admission-wal-value-index-architecture-v1.md).
+[docs/testing/reports/series/p8-copy-admission/runs/2026-06-02-p8-copy-admission-wal-value-index-architecture-v1.md](docs/testing/reports/series/p8-copy-admission/runs/2026-06-02-p8-copy-admission-wal-value-index-architecture-v1.md).
 
 ## Security And Operations
 
