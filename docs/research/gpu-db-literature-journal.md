@@ -13263,3 +13263,213 @@ serializability or durable commit order.
 - Add a follow-up review of DBOS and the 2024 "Why Files If You Have a
   DBMS?" paper to separate cloud control-plane ideas from storage
   interface ideas before committing to any DB-owned OS path.
+
+### 2026-06-03 - Skyloft user-space preemptive scheduling
+
+**Citation:** Yuekai Jia, Kaifu Tian, Yuyang You, Yu Chen, and Kang
+Chen. "Skyloft: A General High-Efficient Scheduling Framework in User
+Space." SOSP 2024, pp. 83-99. doi:10.1145/3694715.3695973.
+Retrieved 2026-06-03 from
+`https://madsys.cs.tsinghua.edu.cn/publication/skyloft-a-general-high-efficient-scheduling-framework-in-user-space/SOSP24-Jia.pdf`.
+
+**Category:** runtime / HFT / session scale.
+
+**Relevance tags:** user-space scheduler; microsecond preemption;
+user-mode interrupts; user-space timer interrupts; DPDK; work stealing;
+latency-critical and best-effort co-location; heavy-tailed requests;
+core reallocation; isolated cores; kernel-bypass networking.
+
+**Core idea:** Skyloft is a user-space scheduling framework that uses
+Intel user interrupts and delegated timer interrupts to make
+microsecond-scale preemption available without routing every scheduling
+decision through the Linux scheduler. It keeps Linux compatibility, but
+on isolated cores it runs one active kernel thread per core and schedules
+user-level threads itself. That lets it implement policies ranging from
+centralized Shinjuku-style scheduling to per-CPU CFS/RR/EEVDF-like
+schedulers and work stealing.
+
+The paper's strongest transferable claim is not that GPU DB should adopt
+Skyloft wholesale. It is that heavy-tailed service mixes need a runtime
+escape hatch from cooperative or run-to-completion scheduling. A database
+runtime with microsecond retained reads, longer scans, WAL flushes,
+residency refreshes, and cold-tier movement should not allow one long
+request class to monopolize an IO worker, owner worker, or execution
+lane simply because the scheduler only sees OS threads.
+
+**Concrete mechanisms:**
+
+- Skyloft uses Intel UINTR so one user-space thread or a timer can
+  deliver an interrupt directly to a user-space handler. The paper
+  reports roughly 0.6 us from sending a user interrupt on one core to
+  handling it on another, and roughly 0.3 us to handle a user timer
+  interrupt.
+- The system supports both dispatcher-driven preemption using user IPIs
+  and per-CPU preemption using local APIC timer interrupts delegated to
+  user space. The timer path avoids a dedicated timer/dispatcher core for
+  per-CPU policies.
+- A global interrupt handler updates policy state on each timer tick and
+  can enqueue the current task, then enter the scheduler loop if
+  preemption is enabled and the policy requests rescheduling.
+- For multiple applications, Skyloft creates one kernel thread per
+  isolated core per application, but enforces a single-binding rule: at
+  most one active kernel thread is bound to an isolated core at a time.
+  Within one application it switches user threads directly; between
+  applications it uses a small kernel module to atomically suspend one
+  kernel thread and wake another.
+- Scheduler policies are expressed through small operations such as
+  `task_enqueue`, `task_dequeue`, `task_block`, `task_wakeup`,
+  `sched_timer_tick`, `sched_balance`, and `sched_poll`, rather than
+  tying preemption to one fixed policy.
+- Skyloft integrates a DPDK-based network path. Packets are polled on a
+  dedicated core, distributed to isolated cores through a shared ring by
+  RSS hash, parsed by a lightweight TCP/UDP stack, and blocking request
+  threads can be suspended while other user threads run.
+- In schbench, Skyloft's per-CPU schedulers achieved much lower wakeup
+  latency than Linux CFS/RR/EEVDF under the tested configuration, mainly
+  because Linux timer frequency constrained wakeup latency.
+- For a synthetic workload with 99.5% 4 us short requests and 0.5% 10 ms
+  long requests, Skyloft with a Shinjuku-like policy found a 30 us
+  preemption quantum to be the best tradeoff in its setup; shorter
+  quanta reduced tail latency but raised interrupt overhead.
+- Compared with ghOSt for the synthetic latency-critical workload,
+  Skyloft reported higher maximum throughput and lower tail latency,
+  attributing the difference to avoiding kernel-thread context switches
+  and user-agent/kernel communication on preemption.
+- On a RocksDB server with 50% GET and 50% SCAN requests, Skyloft's
+  preemptive work-stealing policy sustained 1.9x more load than
+  Shenango at a 5 us quantum for a target 99.9% slowdown of 50x. The
+  paper also shows Memcached performance within about 2% of Shenango for
+  a light-tailed workload.
+- The implementation is not pure userspace: it uses a Linux kernel module
+  for atomic kernel-thread state transitions and privileged timer setup,
+  and it modifies the UINTR kernel patch to support user-space timer
+  interrupts.
+
+**GPU DB mapping:** GPU DB's current runtime target already separates
+network IO workers, owner domains, read snapshot workers, GPU execution
+workers, and response rings. Skyloft sharpens the scheduling question
+inside those domains. The first production IO-worker pool should not be
+only "fewer threads than sessions"; it should classify work into short
+retained reads, protocol parse/encode work, mutation admission, WAL wait,
+residency refresh, long scans, and cold-tier movement, then record whether
+each class is run-to-completion, cooperatively yielding, preemptible, or
+isolated on a separate lane.
+
+For the 1M logical-session target, the single-binding and shared-runqueue
+ideas map to bounded worker ownership rather than per-session threads.
+Logical sessions can be represented as request state machines and
+response continuations, while a small number of active workers run the
+currently admitted jobs. A Skyloft-like runtime is future work, but the
+near-term benchmark harness can still measure the same issue: how much
+tail latency is caused by long jobs occupying scarce workers versus owner
+queue wait, GPU launch wait, or socket write-back.
+
+Preemption is especially relevant for mixed retained reads and scans.
+The retained path may eventually have requests that take microseconds
+and over-resident or aggregate routes that take hundreds of microseconds
+or milliseconds. Skyloft suggests treating those as different scheduling
+classes with explicit preemption or lane isolation. It does not justify
+interrupting arbitrary CUDA kernels or violating snapshot/WAL ordering;
+it does justify making CPU-side parse, plan, owner, refresh, and response
+work yieldable at known DB boundaries.
+
+The DPDK integration and shared ring path reinforce prior transport
+entries: GPU DB should keep pgwire compatibility at the edge while
+measuring internal message movement as explicit rings with request ids,
+queue wait, backpressure, and buffer ownership. Future kernel-bypass
+networking may help, but the benchmarkable insight now is to separate
+network polling/parse, admitted DB work, and response writes so one slow
+class cannot mask as "client latency" forever.
+
+**Risks and mismatches:** Skyloft depends on Intel Sapphire Rapids user
+interrupt support, a modified Linux UINTR patch for timer interrupts, a
+kernel module, isolated cores, and a DPDK-style networking stack. Those
+are not assumptions the current GPU DB engine should take into its
+minimum product path.
+
+The paper evaluates scheduler and key-value workloads, not SQL engines,
+MVCC, WAL durability, PostgreSQL protocol semantics, GPU kernel
+execution, or CUDA stream scheduling. GPU kernels are not preempted by
+Skyloft's CPU user interrupts, and database correctness boundaries still
+need explicit yield points rather than arbitrary interruption.
+
+There are safety and isolation concerns for multi-application scheduling:
+shared runqueue metadata can be tampered with unless protected, and the
+paper discusses MPK or related mechanisms as possible mitigations. For
+GPU DB, this means the near-term use is single-process internal request
+class scheduling, not cross-tenant userspace scheduling.
+
+The ideal preemption quantum is workload-dependent. Skyloft's 5 us and
+30 us cases are evidence that microsecond preemption can matter, not a
+constant to copy into GPU DB. The engine needs measurements for pgwire
+parse/encode, owner queue wait, retained lookup execution, cold refresh,
+and mixed scan behavior before choosing thresholds.
+
+**Benchmark candidates:**
+
+- Add a request-class scheduler trace to the pgwire retained benchmark:
+  classify parse, read route, mutation route, WAL wait, refresh, GPU
+  launch, D2H/result scatter, response encode, and socket write. Gate:
+  no behavior change; report queue wait and service time by class at
+  concurrency `1,2,4,8,16,32,64`.
+- Build a CPU-only scheduling simulator for mixed retained reads and long
+  scans: compare run-to-completion, cooperative yield every N rows,
+  separate short/long lanes, work stealing, and processor-sharing-like
+  time slicing. Failure condition: p99 retained lookup latency worsens
+  while throughput gain is below 10%.
+- Add a "slow route injection" benchmark to the current endpoint:
+  deliberately mix exact retained reads with an artificial long CPU-side
+  refresh or scan job, then measure whether owner/IO worker occupancy or
+  response write-back is the tail-latency source.
+- Evaluate IO-worker pool sizing under persistent clients: fixed worker
+  pool, bounded ingress rings, and response rings versus current
+  thread-per-client behavior. Required metrics: RSS/socket distribution,
+  queue wait, context switches if available, allocations, and p50/p99.
+- Prototype cooperative yield points before any hardware preemption:
+  parse loop, batch-drain loop, CPU fallback scan, refresh build, and
+  response materialization. Proof gate: SQL-visible result order and
+  WAL-before-visibility remain unchanged.
+- Add a scheduling-class admission rule: short retained reads can bypass
+  or use a separate lane from long refresh/scan work only when snapshot
+  compatibility is proven. Failure condition: any read executes against
+  an invalid or newer-than-allowed visibility boundary.
+- Track a future-only hardware-preemption note: UINTR/Skyloft-style
+  scheduling should be revisited only after the Linux IO-worker and
+  cooperative scheduling evidence shows CPU worker occupancy is the
+  bottleneck rather than owner serialization or GPU execution.
+
+### 2026-06-03 - Cross-paper synthesis: runtime lanes need measurable preemption points
+
+The Databases on Modern Networks, Cloud-Native Database Systems and
+Unikernels, and Skyloft entries converge on one runtime principle:
+fast hardware does not remove scheduling decisions; it makes hidden
+scheduling decisions more expensive. RDMA, user-bypass proxies,
+unikernels, NVMe queues, and user-mode interrupts are all ways to avoid
+generic kernel paths, but each only helps if the database first names the
+work class, ownership boundary, ordering requirement, and completion
+frontier.
+
+For GPU DB, the converging design track is a lane-based runtime contract.
+Each lane should describe legal request classes, owner state touched,
+snapshot or WAL frontier required, buffer ownership, queue capacity,
+yield/preemption points, fallback policy, and telemetry. A short retained
+read lane can be aggressively protected from long scans or refresh work;
+a mutation lane must preserve WAL-before-visibility; a cold-tier lane can
+optimize queue depth and transfer overlap; and a response lane must
+preserve pgwire-visible ordering even if internal work completes out of
+order.
+
+This suggests a near-term benchmark priority before adopting exotic
+kernel-bypass or hardware-preemption mechanisms: build Linux-hosted
+evidence for classed worker occupancy. The next runtime proof should
+show whether retained-read p99 is dominated by owner queue wait, IO
+worker occupancy, response encoding, long CPU-side work, or GPU execution
+queueing. If long jobs occupy scarce workers, add cooperative yield
+points or separate lanes first. If owner serialization dominates, lane
+preemption will not fix the bottleneck.
+
+Category gaps remain in practical storage-interface design and
+multi-tier spill/admission under memory pressure. The next high-value
+queue choices are `Why Files If You Have a DBMS?`, `Towards Buffer
+Management with Tiered Main Memory`, or a transaction/write-path paper
+if the journal starts leaning too heavily toward runtime papers.

@@ -612,7 +612,7 @@ Append new candidates here as each paper is processed.
   Why: general hardware-assisted userspace preemption framework cited by
   PreemptDB; useful if GPU DB wants preemption mechanics outside a full
   transaction-engine rewrite.
-- `queued` — **Skyloft: A General High-Efficient Scheduling Framework in
+- `reviewed` — **Skyloft: A General High-Efficient Scheduling Framework in
   User Space**, Jia et al., SOSP 2024.
   URL:
   `https://madsys.cs.tsinghua.edu.cn/publication/skyloft-a-general-high-efficient-scheduling-framework-in-user-space/SOSP24-Jia.pdf`
@@ -621,6 +621,28 @@ Append new candidates here as each paper is processed.
   preemption and DPDK integration; useful as a follow-up to Arachne,
   Shenango, and Shinjuku for deciding whether GPU DB needs preemptive
   user-space request classes around long scans and short retained reads.
+- `queued` — **Achieving Microsecond-Scale Tail Latency Efficiently with
+  Approximate Optimal Scheduling**, Iyer et al., SOSP 2023.
+  URL: `https://doi.org/10.1145/3600006.3613165`
+  PDF: `https://rishabh246.github.io/files/concord.pdf`
+  Why: Concord is Skyloft's approximate-optimal scheduling comparison point;
+  useful for deciding whether GPU DB should approximate processor-sharing
+  policies for heavy-tailed retained reads, scans, and refresh jobs without a
+  fully general preemptive runtime.
+- `queued` — **Fast Core Scheduling with Userspace Process Abstraction**,
+  Lin et al., SOSP 2024.
+  URL: `https://doi.org/10.1145/3694715.3695976`
+  PDF: `https://chenyoumin1993.github.io/papers/sosp24-vessel.pdf`
+  Why: Vessel-style userspace process abstraction is a direct contrast to
+  Skyloft's shared scheduler model; relevant to tenant/session isolation,
+  core sharing, and minimizing inter-application switching cost.
+- `queued` — **Efficient Scheduling Policies for Microsecond-Scale Tasks**,
+  McClure et al., NSDI 2022.
+  URL: `https://www.usenix.org/conference/nsdi22/presentation/mcclure`
+  PDF: `https://www.usenix.org/system/files/nsdi22-paper-mcclure_2.pdf`
+  Why: policy-focused evaluation of work stealing, static allocation, and
+  core reallocation for microsecond tasks; useful before choosing GPU DB
+  IO-worker, retained-read, and background-refresh scheduling policies.
 - `queued` — **Flexible Resource Allocation for Relational
   Database-as-a-Service**, Arora et al., PVLDB 2023.
   URL: `https://www.vldb.org/pvldb/vol16/p4202-narasayya.pdf`
