@@ -10599,3 +10599,198 @@ paper.
   safe read-boundary publication, and WAL replay equivalence.
 - Treat backoff, cooling, eviction, and GC as admission controllers with p99
   latency and fairness metrics, not only average throughput metrics.
+
+### 2026-06-03 - OLTP Through the Looking Glass 16 Years Later
+
+**Citation:** Xinjing Zhou, Viktor Leis, Xiangyao Yu, and Michael
+Stonebraker. "OLTP Through the Looking Glass 16 Years Later:
+Communication is the New Bottleneck." CIDR 2025. Retrieved 2026-06-03
+from the CIDR proceedings page and PDF,
+`https://vldb.org/cidrdb/2025/oltp-through-the-looking-glass-16-years-later-communication-is-the-new-bottleneck.html`
+and `https://vldb.org/cidrdb/papers/2025/p17-zhou.pdf`.
+
+**Category:** runtime / HFT / session scale.
+
+**Relevance tags:** OLTP communication; client/server round trips; pgwire
+path length; stored procedures; user-code isolation; kernel bypass; IPC;
+network IO workers; session multiplexing; DB/OS co-design.
+
+**Core idea:** This paper revisits the 2008 "OLTP through the Looking
+Glass" question on modern hardware and argues that the bottleneck has
+shifted from traditional engine internals toward communication. The
+authors benchmark whole-stack OLTP performance using VoltDB as the main
+modern single-partition OLTP engine, with PostgreSQL as a reference point,
+and compare client-side transaction logic with stored procedures under
+different user-code isolation mechanisms.
+
+For simple OLTP transactions, messaging dominates. In the paper's
+server-side CPU breakdown, VoltDB spends less than a quarter of cycles on
+transaction processing for YCSB-C, while the DBMS networking layer and
+Linux kernel dominate the rest. PostgreSQL spends more cycles in
+transaction processing but still shows large kernel networking cost when
+data fits in memory. The main lesson is uncomfortable for a GPU database:
+making kernels or MVCC faster may improve only a minority of the
+end-to-end request path if pgwire, socket handling, request queues,
+response queues, and client/server round trips remain expensive.
+
+The paper also shows why stored procedures remain attractive but hard to
+productize safely. They reduce round trips and help complex transactions:
+in the paper's TPC-C experiment, stored procedures reach up to 2.1x the
+maximum throughput of an interactive transaction model and avoid much of
+the latency added by repeated SQL parsing/planning/serialization. But
+stronger isolation for user-defined code adds large communication costs.
+Process isolation with shared memory and polling is the best of the
+tested isolated mechanisms, yet still adds substantial overhead versus no
+isolation; TCP/domain-socket IPC and VM isolation are much worse.
+
+**Concrete mechanisms:**
+
+- VoltDB's architecture splits network threads from partition-local OLTP
+  workers. Network threads interact with Linux sockets, parse requests,
+  dispatch stored procedure invocations through message passing, and write
+  responses when workers finish.
+- Single-partition VoltDB transactions run to completion on one worker
+  without locks/latches. Multi-partition transactions serialize through a
+  coordinator, but the paper focuses on single-partition work to isolate
+  communication overhead in a high-performance path.
+- The paper models interactive transactions by breaking a stored
+  procedure into one stored procedure per SQL statement or per independent
+  batch of statements. This lets it compare multiple client/DB round trips
+  against a single stored-procedure invocation using the same transaction
+  logic.
+- The server-side path is decomposed into eight phases: network receive,
+  socket read, request queuing, procedure execution, isolation overhead,
+  query execution, response queuing, and network send.
+- For YCSB-C at 48 connections, the reported CPU-cycle distribution for
+  VoltDB is about 22.6% transaction processing, 38.45% DBMS network layer,
+  and 38.95% Linux kernel. PostgreSQL reports about 55.4% transaction
+  processing, 4.3% DBMS network layer, and 40.3% Linux kernel.
+- In the no-isolation experiments, stored procedures reduce round trips.
+  Voter sees up to 72% lower latency and 23% higher achievable throughput
+  than the interactive model. TPC-C sees about 3.5x higher latency for
+  interactive transactions at similar throughput and up to 2.1x higher
+  maximum throughput for stored procedures.
+- Kernel bypass is tested by integrating DPDK/F-Stack into VoltDB. The
+  integration removes system-call, copy, interrupt, and stack overhead,
+  but keeps internal request/response queue overhead. It also forces a
+  major networking rewrite, exclusive NIC-style deployment assumptions,
+  busy polling, and poorer operational tooling.
+- Isolation levels are classified as client/server isolation, no
+  isolation, language isolation, OS/process isolation, containerization,
+  and virtualization.
+- Process/container isolation is tested with TCP/IP, shared memory with
+  busy polling, and shared memory with Unix-domain-socket notification
+  between the stored-procedure process and the OLTP worker. Shared memory
+  with polling performs best among isolated mechanisms, while TCP/domain
+  sockets spend much more time in communication.
+- VM isolation is much more expensive in the tested cloud setup. The paper
+  reports guest-to-host TCP RTT of 176us versus 21us for loopback TCP,
+  attributing the gap to QEMU/KVM, nested virtualization, two TCP/IP
+  stacks, and VM-boundary crossings.
+- The paper's research directions include DBMS network IO architecture,
+  better kernel-bypass mechanisms, client-side network-stack bypass,
+  eBPF/user-bypass mechanisms, DB/OS co-design, WebAssembly sandboxing,
+  and stored-procedure synthesis from client-side code.
+
+**GPU DB mapping:** This is directly relevant to the current runtime
+target in `11-high-throughput-query-runtime.md`. The benchmark endpoint
+already exposed the same shape of problem: engine and retained CUDA work
+can be microsecond-scale while client-visible latency is dominated by one
+process/thread/request path, pgwire, response writes, and queue wait. The
+paper strengthens the case that GPU DB should treat network/protocol
+runtime as a first-class performance component, not a wrapper around the
+engine.
+
+The eight-phase breakdown maps cleanly to GPU DB telemetry. Current
+reports should keep separating socket receive/parse, ingress queue wait,
+owner dispatch, retained snapshot acquisition, GPU queue wait, kernel
+time, result materialization, response queue wait, and socket write. A
+single "query latency" number is not enough to decide whether to optimize
+CUDA kernels, MVCC visibility, command rings, row encoding, or pgwire
+writes.
+
+Stored-procedure results suggest a future transaction-shape benchmark:
+compare many interactive SQL statements over pgwire with a server-side
+transaction bundle that stays inside one owner/partition boundary. GPU DB
+does not need unsafe in-process user code to learn from this. It can first
+support explicitly declared stored transaction templates or prepared
+multi-step command batches whose visibility, WAL, and partition ownership
+are checked once and whose result set is encoded once.
+
+The isolation section is a warning against pretending "just add
+sandboxing" is free. If GPU DB eventually supports user-defined logic,
+tenant-provided filters, or procedural transaction templates, the runtime
+must budget for the isolation boundary. The near-term safer transfer is
+to keep arbitrary user code out of the engine and instead benchmark a
+small fixed DSL or stored-template path that reduces round trips without
+opening no-isolation safety risks.
+
+Kernel bypass is not an immediate implementation recommendation, but it
+is a benchmark direction. The first architecture proof should use
+multiplexed network IO workers, bounded response rings, reusable buffers,
+and batched response writes on ordinary Linux. Only after those are
+measured should DPDK/F-Stack/io_uring/eBPF-style bypass be considered,
+because the paper shows bypass can move the bottleneck but also carries
+large engineering and operations costs.
+
+For the 1M logical-session target, the paper reinforces that the unit of
+scale is not an OS thread or a transaction worker per client. GPU DB needs
+logical sessions multiplexed over a small number of IO workers, with
+bounded outstanding work, request credits, and response buffers. Session
+admission should expose whether latency comes from client/server RTT,
+kernel socket cost, ingress queue saturation, owner serialization, GPU
+queue saturation, or response egress.
+
+**Risks and mismatches:** The main evaluation uses VoltDB on 16-vCPU
+Google Cloud instances and focuses on single-partition transactions. GPU
+DB has PostgreSQL wire compatibility goals, CUDA execution, MVCC/WAL
+requirements, resident GPU snapshots, and future over-resident tiers, so
+the absolute throughput numbers do not transfer directly. The paper does
+not solve distributed transactions, replication, GPU scheduling, or
+multi-tenant stored-procedure security.
+
+The DPDK/F-Stack experiment required a major rewrite and one network
+thread because of F-Stack constraints. That makes it useful as evidence
+about stack overhead, not as a ready-made implementation plan. The
+stored-procedure comparison also assumes transaction logic can be moved
+server-side; many real applications keep logic client-side for debugging,
+deployment, language, and external-service reasons. Finally, the paper's
+isolation work mostly measures Java stored procedures and IPC mechanisms,
+not Rust-native extension APIs or WebAssembly, so those remain unknown
+until separately measured.
+
+**Benchmark candidates:**
+
+- Add an eight-phase pgwire runtime profile matching the paper's shape:
+  socket receive/read, parse, ingress queue, owner/worker execution,
+  snapshot/GPU queue, materialization, response queue, and socket write.
+  Minimum gate: phase totals explain p50/p95 latency for persistent-client
+  retained reads without hiding queue wait.
+- Build a stored transaction-template benchmark for a single-partition
+  TPC-C-like order or payment path: compare interactive pgwire statements
+  with one server-side declared template that preserves WAL-before-
+  visibility. Required metrics: round trips, bytes, owner queue entries,
+  parse/plan cost, response writes, throughput, p99 latency, and abort
+  correctness.
+- Add a "simple query communication ceiling" benchmark using a retained
+  point lookup whose engine/GPU time is intentionally tiny. Gate: no
+  storage/kernel optimization work is claimed unless protocol/runtime
+  overhead is separately reported.
+- Compare response egress strategies for same-shape retained reads:
+  per-request writes, IO-worker response batching, reusable row-description
+  buffers, and scatter from GPU result batches into per-session response
+  slots. Failure condition: row/result correctness changes or socket
+  backpressure can pin mutation-owner resources.
+- Prototype logical-session credits for persistent clients: cap
+  outstanding requests per session and per IO worker, then measure fairness
+  and p99 latency under thousands of mostly idle sessions plus a hot subset.
+  Failure condition: an idle or slow client consumes response buffers needed
+  by active sessions.
+- Add a kernel-boundary experiment before considering bypass: compare
+  ordinary blocking sockets, epoll-based multiplexing, and io_uring if the
+  codebase is ready. Required metrics: CPU cycles/request, syscalls/request,
+  context switches, p50/p99 latency, and implementation complexity.
+- For future user-defined or procedural logic, benchmark a safe fixed DSL
+  or stored-template path against external client logic before evaluating
+  WebAssembly/process isolation. Gate: measurable round-trip reduction
+  without weakening memory safety, catalog isolation, or WAL/MVCC ordering.

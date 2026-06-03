@@ -72,6 +72,14 @@ mechanical sympathy, multi-tier cache/data placement, or query optimization.
 
 ### Runtime scale, HFT-style mechanics, and admission
 
+- `reviewed` — **OLTP Through the Looking Glass 16 Years Later:
+  Communication is the New Bottleneck**, Zhou et al., CIDR 2025.
+  URL: `https://vldb.org/cidrdb/2025/oltp-through-the-looking-glass-16-years-later-communication-is-the-new-bottleneck.html`
+  PDF: `https://vldb.org/cidrdb/papers/2025/p17-zhou.pdf`
+  Why: whole-stack OLTP breakdown showing communication, isolation, and
+  client/server round trips as modern bottlenecks; directly relevant to pgwire,
+  session multiplexing, and stored-procedure versus interactive transaction
+  route choices.
 - `reviewed` — **Shenango: Achieving High CPU Efficiency for Latency-sensitive
   Datacenter Workloads**, NSDI 2019.
   URL: `https://www.usenix.org/conference/nsdi19/presentation/ousterhout`
@@ -258,6 +266,27 @@ Append new candidates here as each paper is processed.
   URL: `https://www.vldb.org/pvldb/vol18/p1250-yuan.pdf`
   Why: multi-GPU/interconnect approach to capacity limits, useful for future
   over-resident and multi-device planning.
+- `queued` — **Tigger: A Database Proxy That Bounces with User-Bypass**,
+  Butrovich et al., PVLDB 2023.
+  URL: `https://www.vldb.org/pvldb/vol16/p3335-butrovich.pdf`
+  Why: user-bypass/eBPF database proxy work cited by Looking Glass 2.0;
+  relevant to reducing protocol proxying, client/server communication, and
+  kernel boundary overhead.
+- `queued` — **Cloud-Native Database Systems and Unikernels: Reimagining OS
+  Abstractions for Modern Hardware**, Leis and Dietrich, PVLDB 2024.
+  URL: `https://www.vldb.org/pvldb/vol17/p2115-leis.pdf`
+  Why: DB/OS co-design direction for shrinking communication and isolation
+  overhead while preserving hardware-backed boundaries.
+- `queued` — **WeBridge: Synthesizing Stored Procedures for Large-Scale
+  Real-World Web Applications**, Hu et al., PACMMOD 2024.
+  URL: `https://dl.acm.org/doi/10.1145/3639315`
+  Why: stored-procedure synthesis for reducing client/server transaction
+  round trips while keeping application logic maintainable.
+- `queued` — **Practical DB-OS Co-Design with Privileged Kernel Bypass**,
+  Zhou et al., SIGMOD 2025.
+  URL: `https://dl.acm.org/doi/10.1145/3725339`
+  Why: follow-up DB/OS kernel-bypass design from the Looking Glass 2.0 authors;
+  directly relevant to low-overhead networking, IPC, and isolation boundaries.
 - `queued` — **Predicate Transfer: Efficient Pre-Filtering on Multi-Join
   Queries**, Yang et al., CIDR 2024.
   URL: `https://www.cidrdb.org/cidr2024/papers/p22-yang.pdf`
