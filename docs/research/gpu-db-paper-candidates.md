@@ -1241,7 +1241,7 @@ Append new candidates here as each paper is processed.
   Why: modern synchronized-clock geo-transaction design related to Caerus and
   Detock; useful for deciding whether owner-boundary timestamps can reduce
   coordination without relying on full deterministic execution.
-- `queued` — **Epoch-based Optimistic Concurrency Control in Geo-replicated
+- `reviewed` — **Epoch-based Optimistic Concurrency Control in Geo-replicated
   Databases**, arXiv 2026.
   URL: `https://arxiv.org/abs/2602.21566`
   Why: modern geo-replicated concurrency-control work with epoch-based
@@ -1312,6 +1312,27 @@ Append new candidates here as each paper is processed.
   replicated transaction processing; useful for comparing decentralized
   agreement, per-core validation, and contention behavior against
   re-execution or owner-queue designs.
+- `queued` — **Mako: Speculative Distributed Transactions with
+  Geo-Replication**, Shen et al., OSDI 2025.
+  URL: `https://www.usenix.org/conference/osdi25/presentation/shen-weihai`
+  PDF: `https://www.usenix.org/system/files/osdi25-shen-weihai.pdf`
+  Why: Minerva contrasts against Mako's speculative geo-replicated
+  transaction path; useful for comparing execution/replication decoupling,
+  deterministic replay, and geo-replication costs against owner-local GPU DB
+  WAL and snapshot publication.
+- `queued` — **A Hybrid Approach to Integrating Deterministic and
+  Non-Deterministic Concurrency Control in Database Systems**, Hong et al.,
+  PVLDB 2025.
+  URL: `https://dblp.org/rec/journals/pvldb/HongZLDCPZ25`
+  Why: Minerva relates this HDCC line to Aria-style OCC plus deterministic
+  rescheduling; useful for deciding when GPU DB should switch from optimistic
+  validation to deterministic owner execution under high contention.
+- `queued` — **Epoch-Based Commit and Replication in Distributed OLTP
+  Databases**, Lu et al., PVLDB 2021.
+  URL: `https://www.vldb.org/pvldb/vol14/p743-lu.pdf`
+  Why: COCO is Minerva's epoch-commit baseline; useful for comparing
+  epoch-sized commit, replication, and validation units with GPU DB
+  WAL-before-visibility batches and retained snapshot publication.
 - `queued` — **Basil: Breaking up BFT with ACID (transactions)**,
   Suri-Payer et al., SOSP 2021.
   URL: `https://www.cs.cornell.edu/~matthelb/papers/basil-sosp21.pdf`

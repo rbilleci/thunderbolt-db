@@ -22744,3 +22744,218 @@ reject, shed, or fall back rather than merely adjust rank bounds.
 - Record every scheduling decision with rank, lane, queue-bound generation,
   queue wait, service time, bytes, snapshot generation, and fallback or
   rejection reason so later learned or adaptive policies can be replayed.
+
+### 2026-06-03 - Epoch-based optimistic concurrency control in geo-replicated databases
+
+**Citation:** Yunhao Mao, Harunari Takata, Michail Bachras, Yuqiu Zhang,
+Shiquan Zhang, Gengrui Zhang, and Hans-Arno Jacobsen. "Epoch-based
+Optimistic Concurrency Control in Geo-replicated Databases."
+arXiv:2602.21566v2, 2026; accepted as Proc. ACM Manag. Data 4(2),
+SIGMOD 2026, Article 175. doi:10.1145/3802052. Retrieved 2026-06-03
+from `https://arxiv.org/abs/2602.21566`.
+
+**Category:** transaction processing / write path and concurrency control.
+
+**Relevance tags:** epoch commit; optimistic concurrency control;
+deterministic re-execution; commit batching; snapshot epochs; conflict
+graphs; maximum weight independent set; asynchronous replication; WAL
+frontiers; owner-local commit generations; high-contention mode.
+
+**Core idea:** Minerva targets geo-replicated multi-leader OLTP, but the
+database lesson is more general: optimistic execution can be decoupled from
+the durable/global commit point if each epoch has a deterministic validation
+and repair path. Replicas execute transactions locally against the previous
+consistent snapshot, replicate both transaction inputs and speculative
+results in batches, agree periodically on a compact vector of available batch
+heads, and then independently validate the same epoch at every replica.
+
+The interesting design choice is that conflicts are not merely aborted. The
+system keeps the largest deterministic non-conflicting subset and
+deterministically re-executes the excluded transactions in a known order.
+That turns an OCC abort storm into a bounded repair stage, at the cost of an
+epoch-latency floor, larger replication payloads, and a serialized commit
+consumer that can become the bottleneck.
+
+**Concrete mechanisms:**
+
+- Local execution is snapshot-based OCC. Each transaction reads from a
+  temporary state layered over the consistent snapshot from the previous
+  epoch; writes are buffered and tagged with the transaction id.
+- Transactions that read local same-epoch writes record dependencies. These
+  dependency groups become transaction chains, and a conflict involving one
+  member invalidates the whole chain for the first validation pass.
+- Each transaction record contains the client input or query parameters,
+  read-set, write-set, dependency metadata, and speculative result state.
+- Locally generated transaction records are appended to per-replica batches
+  and asynchronously broadcast. Batches also live in a per-replica append-only
+  log.
+- A batch gains proof of availability after a quorum of `f + 1`
+  acknowledgements. Proofs are issued only for contiguous log prefixes, so a
+  later proof implies its predecessors are retrievable.
+- At each epoch, a coordinator proposes a consistent cut: a vector of
+  per-replica batch indices currently known to have proofs of availability.
+  Consensus agrees on the compact vector, not on every transaction.
+- The agreed cut defines the epoch's commit scope. Replicas fetch missing
+  batches if needed, then independently validate the same ordered batch set.
+- Stale reads are detected with epoch ids on data items. If a transaction read
+  a version older than the current epoch, or depends on a transaction already
+  invalidated, it is marked stale.
+- Current-epoch write-write and read-write conflicts are represented as an
+  undirected graph over transaction chains. Vertex weight is the chain size.
+- Conflict selection is formulated as maximum weight independent set. The
+  chosen independent set commits using the speculative write-sets; excluded
+  and stale chains are sorted by deterministic rules and re-executed with a
+  Calvin-style deterministic lock manager.
+- The implementation uses exact and approximate MWIS solvers. Under low
+  contention the exact solver was slightly better; under higher contention
+  approximate solving and the high-contention mode avoid dense-graph cost.
+- High-contention mode triggers when the re-execution percentage stays above
+  a threshold. It suspends optimistic execution, statically probes read/write
+  sets, forwards transactions directly to the batch, and runs deterministic
+  execution at the epoch boundary.
+- Garbage collection uses a cluster low watermark based on committed epochs;
+  logs older than the universally committed epoch can be truncated.
+- Evaluation uses a C#/.NET key-value OLTP implementation with raw TCP,
+  MemoryPack serialization, YCSB-A and TPC-C, 3 to 15 replicas, and synthetic
+  cross-replica latency. Reported headline results include more than 3x
+  throughput in scalability experiments and 2.8x under high-latency TPC-C
+  compared with the evaluated replicated database baselines.
+
+**GPU DB mapping:** Minerva is a useful pattern for GPU DB write admission
+even though GPU DB is not currently geo-replicated. The transferable idea is
+to make commit generations first-class. A mutation owner or partition owner
+can admit a short epoch of writes, publish a durable frontier only after WAL
+is safe, validate the epoch against read/write metadata, and publish a new
+retained snapshot generation as the epoch boundary. That gives retained GPU
+readers a simple rule: execute only against a published generation, never
+against speculative writes.
+
+The deterministic repair stage maps to high-contention partitions. If a hot
+partition repeatedly causes OCC aborts or invalidates retained snapshots, the
+owner could switch from optimistic per-request validation to an epoch-local
+deterministic lane. Unlike Minerva, GPU DB should not re-execute arbitrary
+interactive pgwire transactions after partial client-visible results. The
+safe subset is server-side statements or stored-procedure-like batches whose
+inputs, read/write sets, and result visibility remain internal until commit.
+
+The conflict-graph mechanism suggests a benchmarkable middle ground between
+global FIFO and naive OCC. GPU DB can group transactions by owner/partition,
+record read/write key ranges or row ids, commit the largest non-conflicting
+subset, and send the rest to a deterministic retry lane. For GPU-resident
+refresh, the same epoch metadata can drive invalidation: an epoch publishes
+the write frontier, affected resident partitions, refresh obligation, and
+whether a retained snapshot can remain valid.
+
+The asynchronous data/decision split is also relevant to WAL and snapshot
+publication. Bulk work such as COPY chunks, index append, and resident
+refresh preparation can stream continuously, while the publish decision is a
+small generation advancement. The engine should measure whether a compact
+epoch frontier plus per-owner logs can move the bottleneck from client/thread
+coordination to sequential commit work, then decide whether partition owners
+or parallel WAL streams are needed.
+
+Finally, Minerva's own performance breakdown is a caution. The serialized
+commit consumer and memory movement in stale checking, conflict graph
+construction, applying write-sets, and re-execution dominated more than the
+MWIS computation itself. For GPU DB, conflict metadata must be compact and
+cache-friendly; otherwise "smart" epoch validation will just recreate the
+owner-thread bottleneck under a more elaborate name.
+
+**Risks and mismatches:** The paper is about geo-replicated key-value OLTP,
+not a single-node SQL engine with GPU-resident read paths. It assumes
+one-shot transactions; range queries and unbounded read/write sets need
+extra index or partition versioning. Interactive transactions are only
+discussed as an OCC-only extension with possible aborts, which is a major
+constraint for pgwire semantics.
+
+Minerva replicates both inputs and results, increasing bandwidth. GPU DB may
+not have geo-replication bandwidth costs yet, but the local analog is still
+real: storing full speculative write-sets, read-sets, and result metadata can
+inflate memory traffic and cache pressure. The epoch design also imposes a
+latency floor because clients wait for the epoch commit; this may hurt short
+point writes unless the epoch window is tiny or the workload can tolerate
+server-side batching.
+
+The high-contention mode is useful but coarse. Switching into deterministic
+execution can preserve throughput while worsening tail latency. It also
+requires known read/write sets, which may be unavailable for arbitrary SQL,
+text predicates, secondary index probes, or GPU routes whose touched rows are
+not known until execution.
+
+**Benchmark candidates:**
+
+- Build an owner-local epoch admission prototype for one append/update path:
+  collect writes for a count or microsecond window, WAL-flush the batch,
+  validate read/write metadata, then publish a new visibility generation.
+  Gate: identical WAL replay and MVCC visible rows versus the current path.
+- Add a high-contention switch for one hot-key benchmark. Compare optimistic
+  validation, deterministic owner ordering, and hybrid epoch repair. Measure
+  commit throughput, abort/retry count, p50/p99 latency, queue wait, and
+  retained-snapshot invalidations.
+- Prototype conflict-set selection over transaction chains using a greedy
+  deterministic independent-set heuristic before any exact solver. Gate:
+  fewer re-executed or rejected transactions than FIFO conflict rejection
+  without increasing validation CPU beyond the owner budget.
+- Add epoch ids to mutation-owner telemetry and retained snapshot handles:
+  admitted epoch, WAL-safe epoch, visible epoch, resident invalidation epoch,
+  and oldest active read epoch. Failure condition: a retained GPU read can
+  observe speculative or not-yet-WAL-safe state.
+- Test server-side one-shot batches separately from interactive pgwire
+  transactions. Only the former may use deterministic re-execution after
+  speculative execution; interactive transactions should abort or wait before
+  exposing results.
+- Measure validation memory traffic directly. Track bytes scanned for read
+  sets, write sets, dependency chains, conflict graph structures, and
+  write-set application. Failure condition: epoch validation shifts the
+  bottleneck from WAL/index append to metadata scanning.
+- Add a "commit consumer saturation" synthetic workload where optimistic
+  execution can outpace publication. Gate: admission applies backpressure at
+  the epoch queue before stale reads and re-execution rate cascade upward.
+
+### 2026-06-03 - Cross-paper synthesis: adaptive scheduling must share commit-generation truth
+
+The last three modern papers cover different layers: NeurCC learns a compact
+concurrency-control action table, SP-PIFO maps rich ranks onto a few bounded
+strict-priority queues, and Minerva batches optimistic work into deterministic
+commit epochs with repair rather than blind aborts. The common thread is that
+adaptation belongs around a small deterministic core. Policies may choose an
+action, lane, priority, or epoch mode, but the database must still publish one
+unambiguous generation boundary for WAL, visibility, retained snapshots, and
+response ordering.
+
+Converging design tracks:
+
+- **Generation-captured policy:** sessions, transactions, and retained routes
+  should capture the admission/scheduling policy generation and visibility
+  generation they run under. A policy update or lane-boundary update should
+  affect future work, not mutate in-flight semantics.
+- **Small action alphabets:** learned or adaptive logic should choose among
+  proven actions: optimistic admit, early validate, wait, deterministic lane,
+  reject, CPU fallback, GPU route, or refresh. It should not invent new
+  visibility behavior.
+- **Bounded queue lanes with correctness fences:** SP-PIFO-style lane mapping
+  can prioritize short retained reads or commit work, but WAL publish,
+  per-session response order, and transaction serialization stay fenced by
+  owner rules.
+- **Epochs as repair and publication units:** Minerva's epoch boundary is a
+  useful prototype for GPU DB mutation and refresh publication. The same
+  boundary can drive retained snapshot creation, invalidation, and cold/warm
+  tier promotion decisions.
+- **Telemetry for replayable decisions:** every policy decision needs state
+  bucket, rank/lane, epoch id, policy generation, wait time, validation result,
+  bytes touched, and fallback/rejection reason so future learning can be
+  trained offline and debugged deterministically.
+
+Category gaps remain multi-tier cache policy under transaction pressure and
+query optimizer decisions that combine route cost with queue/epoch state. The
+next few papers should avoid another long run of networking schedulers unless
+they directly inform admission metrics. High-value next categories are HTAP
+tuple discovery/refresh, tiered-memory buffer management, or adaptive query
+execution.
+
+Benchmark priority: an end-to-end synthetic control-plane harness with no GPU
+benchmarking yet. Feed mixed point reads, writes, refreshes, cold misses, and
+large responses through generated route descriptors. Compare global FIFO,
+fixed lanes, adaptive lanes, optimistic commit, and deterministic epoch mode
+while checking that WAL-safe generation, visible generation, retained snapshot
+generation, and response order never diverge.
