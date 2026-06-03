@@ -8599,3 +8599,141 @@ evidence for the headroom/hysteresis mechanism rather than as GPU DB forecasts.
   point-lookup route compete for fast-tier memory. Expected improvement:
   headroom and hysteresis protect lookup p99 without starving the scan; failure
   condition: one scan touch evicts hot lookup state.
+
+### 2026-06-03 - ZygOS work-conserving microsecond scheduler
+
+**Citation:** George Prekas, Marios Kogias, and Edouard Bugnion. "ZygOS:
+Achieving Low Tail Latency for Microsecond-scale Networked Tasks." SOSP 2017.
+doi:10.1145/3132747.3132780. Retrieved 2026-06-03 from the authors' PDF at
+`https://marioskogias.github.io/docs/zygos.pdf`.
+
+**Category:** Runtime / HFT-style mechanics / session scale.
+
+**Relevance tags:** work-conserving scheduling; high fan-in connections;
+microsecond tasks; network dataplane; head-of-line blocking; task stealing;
+socket ownership; inter-processor interrupts; Silo/TPC-C; pgwire IO workers;
+response rings; session multiplexing.
+
+**Core idea:** ZygOS argues that strict shared-nothing dataplanes are excellent
+for throughput but can waste latency budget when requests are short, arrivals
+burst, and connections are pinned to per-core NIC queues. Its transferable
+idea is to keep the dataplane virtues that matter, such as polling, per-core
+network locality, and low kernel overhead, while adding a work-conserving
+shuffle layer that lets idle cores steal ready work without breaking
+connection-level ordering.
+
+For GPU DB, the important lesson is not to blindly centralize all work. The
+paper's design preserves a home core for each flow's TCP/IP state and sends
+remote network work back to that owner. That maps well to the planned owner
+domains: network IO workers may steal or drain read work, but mutation state,
+socket response ordering, GPU stream ownership, and residency publication need
+clear home owners and explicit handoff points.
+
+**Concrete mechanisms and findings:**
+
+- ZygOS separates its runtime into three layers: a lower per-core network layer,
+  an intermediate shuffle layer, and an upper application execution layer. The
+  lower network layer remains flow-local and mostly coherency-free.
+- Each home core owns a shuffle queue containing ready connections. A ready
+  connection can be consumed by the home core or stolen atomically by an idle
+  remote core.
+- Socket events are grouped by socket rather than by packet. A socket is in
+  exactly one of `idle`, `ready`, or `busy`; when a core executes an event for
+  that socket, it has exclusive access until event processing and response
+  generation complete.
+- The socket-state rule gives applications simple ordering semantics even when
+  work is stolen. It avoids concurrent reads from the same socket producing
+  broken parsing, out-of-order responses, or interleaved writes.
+- Remote execution sends network-related batched system calls back to the home
+  core, so TCP/IP output and timers still run where the connection state lives.
+- Idle cores poll for work in several places: their own hardware descriptor
+  ring, other cores' shuffle queues, other cores' software packet queues, and
+  other cores' hardware descriptor rings.
+- Inter-processor interrupts are used as hints to force a home core to process
+  pending packets or remote network system calls while it is running user code.
+  Missed interrupts hurt latency but not correctness.
+- The implementation is derived from IX, Dune, DPDK, and lwIP, with about 2000
+  lines of IX kernel changes and about 200 Dune changes. It is a specialized
+  OS/dataplane environment, not a drop-in Linux library.
+- In synthetic benchmarks with a 99th-percentile SLO of ten times mean service
+  time, ZygOS reaches 75% of the ideal zero-overhead centralized-FCFS load for
+  10 microsecond exponential tasks and 88% for 25 microsecond tasks.
+- The paper reports that ZygOS outperforms IX and Linux for task sizes above a
+  few microseconds under tight tail-latency SLOs, but IX can win on very tiny
+  memcached-style tasks when adaptive bounded batching dominates the cost.
+- For a networked Silo TPC-C setup with a 1000 microsecond 99th-percentile SLO,
+  ZygOS sustains 344 KTPS, versus 211 KTPS for Linux and 267 KTPS for IX. The
+  authors attribute the IX gap to eliminating head-of-line blocking through
+  work-conserving scheduling.
+- The Silo experiment disables Silo garbage collection to reduce experimental
+  variability, so the result should not be read as a complete transaction-engine
+  tail-latency solution.
+
+**GPU DB mapping:** The production runtime already targets network IO workers,
+bounded command rings, owner domains, read snapshot workers, GPU execution
+workers, and response rings. ZygOS strengthens the case that those rings should
+be work-conserving under bursty fan-in, not statically pinned in a way that lets
+one IO worker queue while another sits idle.
+
+The socket ownership state machine maps to pgwire session handling. A session
+should have a single response-order owner at any instant, even if parsed
+requests or read-only work are stolen into read snapshot workers. That keeps
+frontend protocol ordering simple while still allowing compatible retained
+reads to leave the session's home worker.
+
+The shuffle queue maps to a "ready session" or "ready request" layer between
+network parsing and execution. For 1M logical sessions, the runtime should not
+create one OS thread per connection; it should keep compact session state,
+place ready sessions on bounded queues, and let idle IO/execution workers steal
+eligible work under explicit ordering rules.
+
+ZygOS also warns that batching and work conservation trade off. IX's advantage
+on tiny memcached tasks came from adaptive bounded batching. GPU DB should
+combine both ideas: steal work to avoid idle cores and head-of-line blocking,
+but drain compatible batches for retained lookups, aggregates, COPY chunks, and
+encoded responses when queue depth is present and the latency ceiling allows
+it.
+
+For GPU execution owners, the home-core rule suggests keeping CUDA streams,
+pinned buffers, and resident partition handles owned by a specific execution
+worker. Other workers can enqueue or steal request descriptors, but device
+state and completion publication should remain owned to avoid hidden
+cross-thread synchronization.
+
+**Risks and mismatches:** ZygOS is a specialized OS built on IX/Dune, DPDK, and
+lwIP; GPU DB currently runs as a normal Rust/database process and cannot assume
+that environment. The paper's strongest result is for microsecond in-memory RPC
+tasks on one server with 10GbE-era hardware, not PostgreSQL protocol parsing,
+TLS, GPU kernels, WAL, MVCC validation, or NVMe tiering. Its Silo experiment
+does not include full SQL marshalling and disables garbage collection, so the
+numbers are best used as scheduling evidence rather than direct throughput
+targets. Inter-processor interrupts may also be the wrong primitive in a normal
+process; eventfd, io_uring, futex wakeups, or busy-poll rings may be more
+practical.
+
+**Benchmark candidates:**
+
+- Build a pgwire runtime simulator with many logical sessions, per-session
+  ready state, and a stealable ready-session queue. Compare static IO-worker
+  ownership against work stealing. Required metrics: p50/p95/p99 queue wait,
+  idle-worker time, response reordering violations, and request throughput at
+  fixed tail-latency SLOs.
+- Add a retained-read micro-batch benchmark that combines ZygOS-style stealing
+  with IX-style bounded batching. Gate: batching improves throughput without
+  worsening p99 beyond a configured microsecond ceiling.
+- Prototype a per-session state machine: `idle`, `ready`, `executing`,
+  `responding`, and `backpressured`. Minimum proof: pipelined requests on one
+  pgwire session never produce out-of-order or interleaved responses while
+  read-only requests can still execute away from the session home worker.
+- Add telemetry for each runtime ring: eligible steals, successful steals,
+  failed steal attempts, home-worker wakeups, remote response handoffs, and
+  work executed on non-home workers.
+- Compare three admission modes for 1M logical sessions: one-thread-per-session
+  baseline, fixed per-IO-worker session partitioning, and stealable ready
+  sessions over compact session state. Failure condition: memory growth,
+  scheduler overhead, or tail latency scales with connection count rather than
+  active request count.
+- For GPU execution workers, test home-owned CUDA stream queues with remote
+  enqueue only. Gate: no CUDA resource is touched by non-owner workers, and
+  queue wait plus batch-drain telemetry explains p99 latency under bursty
+  retained lookup traffic.

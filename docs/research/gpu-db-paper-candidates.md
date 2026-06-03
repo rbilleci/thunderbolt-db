@@ -410,7 +410,7 @@ Append new candidates here as each paper is processed.
   Why: user-level core-aware thread management cited by Caladan; useful for
   exposing internal request concurrency to a scheduler without adopting a full
   Caladan-style interference-control stack.
-- `queued` — **ZygOS: Achieving Low Tail Latency for Microsecond-scale
+- `reviewed` — **ZygOS: Achieving Low Tail Latency for Microsecond-scale
   Networked Tasks**, Prekas, Kogias, and Bugnion, SOSP 2017.
   URL: `https://dl.acm.org/doi/10.1145/3132747.3132780`
   PDF: `https://marioskogias.github.io/docs/zygos.pdf`
@@ -881,3 +881,17 @@ Append new candidates here as each paper is processed.
   Why: TPP discusses network and CXL memory tiers as complementary; DirectCXL
   is a primary follow-up for direct CXL memory disaggregation, remote-memory
   latency budgets, and future placement boundaries beyond local DRAM/HBM/NVMe.
+- `queued` — **R2P2: Making RPCs First-Class Datacenter Citizens**,
+  Kogias et al., USENIX ATC 2019.
+  URL: `https://www.usenix.org/conference/atc19/presentation/kogias-r2p2`
+  PDF: `https://www.usenix.org/system/files/atc19-kogias-r2p2_0.pdf`
+  Why: ZygOS follow-up by overlapping authors that exposes RPC request/response
+  pairs to endpoints and network scheduling; relevant to pgwire-style request
+  admission, response routing, and bounded outstanding request counts.
+- `queued` — **Homa: A Receiver-Driven Low-Latency Transport Protocol Using
+  Network Priorities**, Montazeri et al., SIGCOMM 2018.
+  URL: `https://doi.org/10.1145/3230543.3230564`
+  arXiv: `https://arxiv.org/abs/1803.09615`
+  Why: receiver-driven short-message transport and priority scheduling for
+  datacenter RPCs; relevant to future GPU DB network admission and tail-latency
+  budgeting once pgwire sessions are multiplexed over fewer IO workers.
