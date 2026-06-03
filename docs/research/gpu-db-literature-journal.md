@@ -8293,3 +8293,142 @@ Benchmark priorities:
 - Pair every learned or heuristic GPU route choice with the snapshot
   generation, queue-depth bucket, and memory-budget state that made it
   admissible.
+
+### 2026-06-03 - mmap is not a buffer-pool substitute
+
+**Citation:** Andrew Crotty, Viktor Leis, and Andrew Pavlo. "Are You Sure You
+Want to Use MMAP in Your Database Management System?" CIDR 2022. Retrieved
+2026-06-03 from the CIDR PDF at
+`https://www.cidrdb.org/cidr2022/papers/p13-crotty.pdf`.
+
+**Category:** Multi-tier cache / buffer management / data placement.
+
+**Relevance tags:** explicit buffer management; OS page cache; mmap; NVMe;
+page faults; TLB shootdowns; WAL safety; async IO; tier admission; larger-than-
+memory execution; GPU/DRAM/NVMe placement.
+
+**Core idea:** The paper argues that `mmap` is a poor replacement for a DBMS
+buffer pool. Its apparent simplicity hides two classes of problems that map
+directly to GPU DB tiering: the database gives up transactional and error
+control to the operating system, and fast NVMe devices expose OS paging
+bottlenecks that were less visible on older storage.
+
+For GPU DB, the transferable idea is mostly negative but important: do not
+delegate tier placement to transparent paging when correctness, tail latency,
+and route planning need explicit answers. A GPU/DRAM/NVMe design needs to know
+which pages, segments, snapshots, and pinned buffers are resident, dirty,
+admissible, queued for IO, or safe to evict. The OS page cache may still be
+useful as a cold-path helper, but it should not be the planner's source of truth
+for residency or latency.
+
+**Concrete mechanisms and findings:**
+
+- The paper explains the mmap path as lazy virtual-to-physical mapping: the DBMS
+  receives a pointer, page faults pull file contents into the OS page cache, and
+  eviction requires page-table and TLB maintenance. Remote-core TLB invalidation
+  creates expensive shootdowns.
+- POSIX hints are not control. `madvise` can express broad patterns such as
+  random or sequential access, but the OS may ignore hints and the wrong hint can
+  be harmful. `mlock` pins pages but does not prevent dirty pages from being
+  written back. `msync` is required to force mapped dirty ranges to storage.
+- Transactional updates are awkward because the OS can flush dirty mapped pages
+  independently of transaction commit. The paper categorizes workarounds as OS
+  copy-on-write, user-space copy-on-write, and shadow paging. Each adds
+  bookkeeping, extra copies, blocking, single-writer restrictions, or WAL replay
+  complexity.
+- mmap makes IO stalls implicit. A read-only query can block on an unexpected
+  page fault, while a traditional buffer pool can issue explicit asynchronous
+  reads through interfaces such as `libaio` or `io_uring`.
+- Error handling becomes diffuse. Any code path that touches mapped memory can
+  surface storage errors as `SIGBUS`, and transparent eviction means page
+  checksums would need validation on every access if the DBMS wants the same
+  confidence it gets from explicit reads.
+- The experimental setup uses an AMD EPYC 7713 system with 512 GiB RAM, Linux
+  5.11, and ten Samsung PM1733 NVMe SSDs. The authors reserve 100 GiB for page
+  cache and compare mmap variants against `fio` using direct IO.
+- In a larger-than-memory random-read workload over a 2 TiB SSD range, `fio`
+  reaches roughly 900K reads/second, while mmap drops sharply after page cache
+  eviction starts and later recovers to about half the direct-IO baseline under
+  the best matching hint.
+- For sequential scans, mmap performs acceptably only during initial loading on
+  one SSD. With ten SSDs, the paper reports a roughly 20x gap between direct IO
+  and mmap, with mmap failing to exploit the extra device bandwidth.
+- The authors attribute the scaling collapse to page-table contention,
+  single-threaded page eviction, and TLB shootdowns. They argue that the first
+  two are potentially fixable with OS changes, but shootdowns are harder to
+  avoid without deeper OS or hardware redesign.
+- The conclusion is blunt: avoid mmap when the DBMS needs transactionally safe
+  updates, nonblocking page-fault control, robust error handling, or high
+  throughput on fast persistent storage. The paper allows narrow mmap use only
+  for read-only working sets that fit in memory.
+
+**GPU DB mapping:** This paper strengthens the case for an explicit tier manager
+rather than a virtual-memory-driven cold tier. The storage architecture already
+treats GPU resident state as versioned acceleration state, not correctness
+truth. The same explicitness should extend to host DRAM and NVMe: pages or
+segments should carry residency state, source WAL boundary, visibility boundary,
+dirty status, in-flight IO state, checksum/validation status, and route
+admissibility.
+
+For over-resident GPU execution, relying on page faults to fetch cold host or
+NVMe data would hide the latency source from the planner and scheduler. A query
+route should know whether it will execute from HBM, pinned host memory,
+ordinary host buffers, OS cache, or direct NVMe reads. That enables admission to
+reject, prefetch, micro-batch, or fall back before a network worker or GPU
+execution owner blocks unpredictably.
+
+The transactional-safety discussion maps directly to WAL-before-visibility. A
+future disk/NVMe tier should not expose mutable table bytes through mapped dirty
+pages whose writeback the engine cannot order. Writes should stage in owner-
+controlled buffers, append and flush WAL, update CPU-visible MVCC/index state,
+and only then publish segment generations or schedule durable page writes. mmap
+can be used for read-only immutable artifacts only if they are already safe to
+lose or rebuild.
+
+The performance results also matter for 1M logical sessions. Transparent page
+faults convert cold reads into blocking events at arbitrary program counters.
+That fights the runtime goal of bounded command rings, network IO workers, and
+explicit queue wait telemetry. Explicit async IO lets the runtime attach cold
+reads to admission budgets and completion rings instead of blocking request
+handlers or owner domains.
+
+For GPU memory placement, the paper suggests that "resident" must mean more
+than "addressable." A pointer into a mapped file is not an admissible fast-path
+input unless the engine can prove its physical residency and fault behavior. The
+planner should use resident bytes, pending prefetch bytes, queue depth, and
+expected transfer paths as first-class cost features.
+
+**Risks and mismatches:** The paper is a position and evaluation paper, not a
+complete replacement buffer-pool design. Its experiments are read-only and
+storage-focused; it does not evaluate GPU execution, GPUDirect Storage,
+PostgreSQL-compatible MVCC, or mixed OLTP/OLAP query plans. Some systems use
+mmap successfully in narrower roles, so the right takeaway is not "never map
+files" but "never let mmap become the hidden buffer manager for mutable or
+larger-than-memory hot paths." The Linux and NVMe details may have evolved since
+the 2022 publication, so modern `io_uring`, direct IO, and GPUDirect paths still
+need fresh measurement.
+
+**Benchmark candidates:**
+
+- Add a tier-admission simulator that compares transparent OS-cache reads,
+  explicit buffered reads, direct IO, and pinned prefetch buffers for cold
+  segments. Required metrics: p50/p95/p99 latency, blocked worker time, queue
+  depth, read amplification, and route misprediction.
+- Implement a read-only immutable segment experiment where mmap is allowed only
+  for fully built, checksum-validated cold artifacts. Gate: any page fault or
+  `SIGBUS` risk must be visible as route telemetry, not hidden inside query
+  execution.
+- Compare explicit `io_uring`/direct-IO prefetch against OS readahead for
+  over-resident partition scans. Minimum proof: GPU execution owners never
+  block on page faults, and cold-read completion is tied to bounded response or
+  execution rings.
+- Add a negative-control benchmark that deliberately routes cold larger-than-
+  memory reads through mmap. Expected failure: worse tail latency or lower NVMe
+  bandwidth once eviction begins, validating the need for explicit tier control.
+- Extend planner route features with `tier_source`, `resident_bytes`,
+  `prefetch_bytes`, `faultable`, `dirty_or_mutable`, and `async_io_handle`
+  fields. Gate: routes that may fault are not eligible for retained GPU
+  low-latency execution.
+- Test WAL ordering with mapped immutable files only: publish a segment after
+  WAL and checksum completion, then prove that subsequent mutation invalidates
+  the segment generation before any stale mapped bytes can be routed.

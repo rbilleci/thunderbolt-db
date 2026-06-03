@@ -110,7 +110,7 @@ mechanical sympathy, multi-tier cache/data placement, or query optimization.
   Why: variable-size pages and low-overhead buffer management for cached hot
   working sets with graceful uncached access; useful for resident snapshot and
   host/NVMe tier design.
-- `queued` — **Are You Sure You Want to Use MMAP in Your Database Management
+- `reviewed` — **Are You Sure You Want to Use MMAP in Your Database Management
   System?**, Crotty et al., CIDR 2022.
   URL: `https://www.cidrdb.org/cidr2022/papers/p13-crotty.pdf`
   Why: evaluates OS page-cache and mmap tradeoffs versus explicit DBMS buffer
@@ -278,6 +278,19 @@ Append new candidates here as each paper is processed.
   Why: direct OMVCC baseline for transaction repair, with timestamp,
   validation, and version-chain design relevant to serializable MVCC in a
   memory-resident engine.
+- `queued` — **Exploiting Directly-Attached NVMe Arrays in DBMS**, Haas,
+  Haubenschild, and Leis, CIDR 2020.
+  URL: `https://www.cidrdb.org/cidr2020/papers/p16-haas-cidr20.pdf`
+  Why: direct follow-up for explicit NVMe tier economics and high-parallelism
+  IO paths that should inform GPU DB cold-partition and over-resident
+  placement benchmarks.
+- `queued` — **Optimizing Memory-mapped I/O for Fast Storage Devices**,
+  Papagiannis et al., USENIX ATC 2020.
+  URL: `https://www.usenix.org/conference/atc20/presentation/papagiannis`
+  PDF: `https://www.usenix.org/system/files/atc20-papagiannis.pdf`
+  Why: OS-level mmap scalability work cited by the CIDR 2022 mmap paper; useful
+  as a contrasting source on whether modified mmap paths can ever be safe or
+  fast enough for GPU DB cold-tier experiments.
 - `queued` — **Leveraging Lock Contention to Improve OLTP Application
   Performance**, Yan and Cheung, PVLDB 2016.
   URL: `https://www.vldb.org/pvldb/vol9/p444-yan.pdf`
