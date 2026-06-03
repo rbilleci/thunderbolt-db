@@ -13473,3 +13473,197 @@ multi-tier spill/admission under memory pressure. The next high-value
 queue choices are `Why Files If You Have a DBMS?`, `Towards Buffer
 Management with Tiered Main Memory`, or a transaction/write-path paper
 if the journal starts leaning too heavily toward runtime papers.
+
+### 2026-06-03 - DBMS-owned large objects instead of files
+
+**Citation:** Lam-Duy Nguyen and Viktor Leis. "Why Files If You Have a
+DBMS?" ICDE 2024, pp. 3878-3892. DOI:
+`10.1109/ICDE60146.2024.00297`. Retrieved 2026-06-03 from the TUM
+author PDF,
+`https://www.cs.cit.tum.de/fileadmin/w00cfj/dis/papers/blob.pdf`.
+
+**Category:** multi-tier cache / data placement and storage-interface
+design.
+
+**Relevance tags:** BLOB storage; extent sequence; asynchronous BLOB
+logging; WAL indirection; virtual-memory aliasing; FUSE; object/file
+interoperability; DB-owned storage; NVMe write amplification; metadata
+indexing; large-result protocol pressure.
+
+**Core idea:** The paper argues that large binary objects are often kept
+outside databases mostly because current DBMS BLOB paths are inefficient
+and external programs expect file APIs. Its answer is a DBMS-native BLOB
+design that stores each object as a compact extent sequence described by
+a single Blob State, logs the Blob State rather than duplicating the full
+object in WAL, flushes object extents once at commit, and exposes
+read-only DBMS-owned objects through FUSE for interoperability.
+
+The transferable idea for GPU DB is broader than BLOBs. File-system
+interfaces are convenient compatibility surfaces, but they are poor
+internal contracts for a tiered database runtime. Cold partitions,
+compressed column groups, checkpoints, large text values, and future
+GPU-adjacent object payloads should have DB-owned descriptors with
+visibility, checksum, extent, destination-buffer, and admission metadata,
+instead of disappearing behind path strings and opaque file reads.
+
+**Concrete mechanisms:**
+
+- The design stores each object as an extent sequence: a small list of
+  contiguous physical page ranges. Extent sizes follow a static tier
+  table, so Blob State can record only head page ids, object size,
+  extent count, optional tail extent, checksums, and prefix metadata.
+- A tail extent can eliminate internal fragmentation for mostly-static
+  objects, while tiered normal extents make append/growth cheaper.
+- Blob State is stored with the tuple for the BLOB column. Reads first
+  retrieve the tuple/Blob State and then issue one asynchronous I/O call
+  for missing extents, instead of walking file-system extent trees or
+  scanning many TOAST/overflow pages.
+- Durability avoids writing the full object twice. The WAL contains Blob
+  State, not the entire BLOB content. On commit, the system persists the
+  WAL buffer containing Blob State before writing the object extents; on
+  recovery, SHA-256 validates whether the extent content is present and
+  intact, otherwise the committing transaction is treated as failed.
+- A `prevent_evict` flag keeps not-yet-flushed extents from being
+  evicted while asynchronous commit-time object writes are still in
+  flight.
+- Deleted extents are returned to free lists by extent tier at
+  transaction commit, making reuse cheap and avoiding complex file-system
+  free-space search for the paper's whole-object create/delete workloads.
+- Updates can either delta-log and update in place, or clone the affected
+  extent and update Blob State. The paper treats the cost choice as
+  workload-dependent and notes that whole-object replacement is common.
+- Blob State supports indexing without copying the full object into every
+  index entry. Equality can use SHA-256; range comparison can use prefix
+  bytes and then incrementally dereference extents when required.
+- With vmcache/exmap, disjoint extents can be aliased into a contiguous
+  virtual address range, avoiding malloc plus memcpy for large reads.
+  Worker-local aliasing areas handle common object sizes; a shared
+  aliasing area with range locking handles larger objects.
+- FUSE integration maps relations to directories and tuples to read-only
+  files. `open` starts a transaction, `flush` commits it, and `read`
+  resolves the path to Blob State before copying the requested slice.
+- The evaluation compares against PostgreSQL, MySQL/InnoDB, SQLite, and
+  Ext4/XFS/BtrFS/F2FS. The authors disable `fsync()` for competitors and
+  run on a single Samsung 980 Pro SSD, so the results isolate object
+  storage and metadata overhead rather than full durable application
+  behavior.
+- Reported results include higher throughput than file systems and DBMSs
+  for large YCSB payloads, 15.6x higher metadata-operation throughput
+  than file systems for a 10-object metadata scan, at least 2.9x higher
+  cold-cache Wikipedia-object throughput at benchmark start, and up to
+  2.1x over a hash-table buffer pool for 10 MB in-memory reads with 16
+  workers due to avoiding extra copies.
+- The simulated git-clone trace shows the design faster than tested file
+  systems, largely because DBMS B-tree metadata lookup replaces repeated
+  `open`, `fstat`, and `close` costs.
+
+**GPU DB mapping:** GPU DB should treat this as a storage-interface
+design paper, not as a call to add user-facing BLOB features immediately.
+The strongest mapping is a DB-owned extent descriptor for cold or warm
+column groups. A future over-resident partition can carry table id,
+partition id, column group id, visibility generation, checksum, extent
+heads or segment ids, compression metadata, destination buffer id, and
+publish/abort state. That descriptor is the unit the planner and tier
+manager reason about; a POSIX file path is only one possible backing
+implementation.
+
+The asynchronous BLOB logging idea maps to WAL-before-visibility for
+large placement artifacts. GPU DB cannot publish a retained snapshot
+until the durable CPU truth and visibility frontier are safe. But it can
+avoid duplicating large cold-tier or checkpoint payloads in WAL by
+logging compact descriptors, checksums, and generation metadata, then
+validating payload presence during recovery before making any resident or
+cold descriptor route-eligible.
+
+The extent-sequence shape also fits GPU resident and over-resident data.
+HBM execution may prefer large columnar chunks, while NVMe and host-cache
+movement may prefer smaller extents or compressed blocks. Blob State's
+lesson is to keep the indirection shallow and DB-visible: the planner
+should know how many extents a route touches, expected bytes, I/O
+amplification, checksum cost, and whether the object is contiguous enough
+for fast DMA or aliasing.
+
+Virtual-memory aliasing is relevant to host-tier staging. If a cold
+column group consists of disjoint host or NVMe-backed extents, GPU DB may
+want a contiguous CPU-visible view for CPU fallback, compression,
+checksum, or transfer preparation without copying everything into a fresh
+buffer. The paper also warns that aliasing has TLB shootdown and setup
+costs, so the benchmark should compare aliasing against ordinary
+preallocated staging buffers by object size and concurrency.
+
+FUSE is useful only as a compatibility lesson. If GPU DB ever exposes
+DB-owned large objects or cold partitions to external tools, a file-like
+read-only interface can bridge compatibility. The hot internal path
+should still remain DB-owned descriptors, rings, and completion events;
+FUSE should not become the mechanism by which query execution fetches
+cold segments.
+
+The paper's metadata results reinforce the runtime journal's direction:
+path-based storage hides work in system calls. For a 1M logical-session
+engine, metadata lookups for snapshots, partitions, object descriptors,
+and route eligibility should be B-tree/hash/catalog operations inside the
+DBMS, with queue wait and owner time measured, not repeated kernel path
+walks.
+
+**Risks and mismatches:** The paper studies large objects and strings,
+not relational tuple MVCC, joins, GPU kernels, GPUDirect Storage,
+PostgreSQL protocol serving, or full over-resident analytical execution.
+Its object workloads are mostly create/read/delete/whole-object replace;
+partial updates and high-conflict BLOB concurrency are explicitly
+secondary.
+
+The evaluation disables `fsync()` for competitor DBMSs and file systems,
+while the proposed design uses group commit. That makes the performance
+comparison useful for storage-path shape, metadata, copies, and write
+amplification, but not a direct durable throughput number for GPU DB's
+WAL path.
+
+Blob State logs descriptors before extent content and uses recovery
+checksums to decide whether the committing transaction failed. GPU DB
+must be careful before applying that pattern to user-visible SQL
+transactions: failure classification, client commit acknowledgement,
+replay order, and retention of holes/free extents must be proven against
+the existing WAL-before-visibility contract.
+
+Virtual-memory aliasing depends on vmcache/exmap-style page-table
+control and has TLB invalidation costs. It may be excellent for large
+host objects and poor for small retained lookups. The GPU path also needs
+registered/pinned memory and CUDA stream ordering, which the paper does
+not evaluate.
+
+FUSE solves interoperability but can add its own context-switch and
+copying costs. It should remain a boundary API for external tools, not a
+core execution path.
+
+**Benchmark candidates:**
+
+- Define a GPU DB cold-segment descriptor modeled after Blob State:
+  table/partition/generation, column group, byte size, checksum, extent
+  list, compression id, resident-validity frontier, destination buffer,
+  and completion state. Proof gate: stale or checksum-failed descriptors
+  cannot become route-eligible.
+- Add a descriptor-logging thought experiment before code: compare full
+  payload WAL logging, descriptor-plus-checksum logging, and
+  checkpoint-manifest logging for cold column groups. Required result:
+  exact crash/recovery state table and no weakening of
+  WAL-before-visibility.
+- Benchmark cold-column fetch units using shallow DB descriptors rather
+  than file paths: 4 KiB, 16 KiB, 64 KiB, and compressed segment extents.
+  Measure I/O amplification, descriptor lookup time, queue wait, bytes
+  copied, checksum time, and route rejection reason.
+- Compare host staging strategies for large cold groups: malloc+copy,
+  reusable pinned staging buffer, and VM aliasing where available. Gate:
+  p50/p99 and memory bandwidth by object size at concurrency
+  `1,2,4,8,16,32,64`.
+- Add a storage-aging microbenchmark for DB-owned extents: mixed
+  allocate/delete/grow workloads at 70%, 80%, 90%, and 95% capacity,
+  reporting allocation latency, free-list hit rate, fragmentation,
+  write amplification, and cold-read p99.
+- Treat external file compatibility as a separate benchmark track:
+  compare direct DB descriptor reads, FUSE read-only exposure, and normal
+  file-system reads for large objects. Failure condition: compatibility
+  path pollutes hot query-worker or owner-lane telemetry.
+- Add protocol pressure measurements for large results or BLOB-like
+  payloads: pgwire row streaming, binary copy/output, and a future
+  descriptor-based escape hatch. Required metrics: serialization CPU,
+  copies, socket write time, backpressure, and result ordering safety.

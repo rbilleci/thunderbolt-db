@@ -323,8 +323,9 @@ Append new candidates here as each paper is processed.
   URL: `https://www.cidrdb.org/cidr2022/papers/p49-li.pdf`
   Why: cloud database/OS co-design follow-up for treating scheduling,
   workflows, and system state as database-managed services.
-- `queued` — **Why Files If You Have a DBMS?**, Nguyen and Leis, ICDE 2024.
-  URL: `https://doi.org/10.1109/ICDE60146.2024.00213`
+- `reviewed` — **Why Files If You Have a DBMS?**, Nguyen and Leis, ICDE 2024.
+  URL: `https://doi.org/10.1109/ICDE60146.2024.00297`
+  PDF: `https://www.cs.cit.tum.de/fileadmin/w00cfj/dis/papers/blob.pdf`
   Why: storage-interface follow-up from the unikernel paper's related work;
   useful for evaluating file-system avoidance and DB-owned NVMe/cold-tier
   layouts.
@@ -1257,3 +1258,23 @@ Append new candidates here as each paper is processed.
   Why: MosaicDB cites it as a practical coroutine/prefetching baseline;
   relevant to CPU-side index, version-chain, and host-resident join paths
   that feed retained GPU or fallback routes.
+- `queued` — **To FUSE or Not to FUSE: Performance of User-Space File
+  Systems**, Vangoor, Tarasov, and Zadok, FAST 2017.
+  URL: `https://www.usenix.org/conference/fast17/technical-sessions/presentation/vangoor`
+  PDF: `https://www.usenix.org/system/files/conference/fast17/fast17-vangoor.pdf`
+  Why: the ICDE 2024 BLOB paper uses FUSE to expose DBMS-owned objects as
+  files; this primary FUSE performance study is useful for quantifying the
+  interoperability tax before any GPU DB DB-backed-file or cold-tier API path.
+- `queued` — **Don't Hold My Data Hostage: A Case For Client Protocol
+  Redesign**, Raasveldt and Muehleisen, PVLDB 2017.
+  URL: `https://www.vldb.org/pvldb/vol10/p1022-raasveldt.pdf`
+  Why: the ICDE 2024 BLOB paper identifies client/server networking and
+  serialization overheads as major BLOB bottlenecks; this paper is relevant to
+  large result/BLOB protocol design and pgwire-compatible escape hatches.
+- `queued` — **File Systems Fated for Senescence? Nonsense, Says Science!**,
+  Conway et al., FAST 2017.
+  URL: `https://www.usenix.org/conference/fast17/technical-sessions/presentation/conway`
+  PDF: `https://www.usenix.org/system/files/conference/fast17/fast17-conway.pdf`
+  Why: the ICDE 2024 BLOB paper discusses file-system aging and fragmentation;
+  this gives a primary storage-systems baseline for comparing DBMS extent
+  recycling against file-system aging under mixed object allocation/deletion.
