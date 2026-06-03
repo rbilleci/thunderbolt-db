@@ -23923,3 +23923,201 @@ under severe pressure.
   signals, io_uring/socket writability, and NIC timestamp-style
   feedback to decide whether pgwire needs a transport split before the
   1M logical-session target is realistic.
+
+### 2026-06-03 - Tiga synchronized-clock transaction ordering
+
+**Citation:** Jinkun Geng, Shuai Mu, Anirudh Sivaraman, and Balaji
+Prabhakar. "Tiga: Accelerating Geo-Distributed Transactions with
+Synchronized Clocks." SOSP 2025. doi:10.1145/3731569.3764854.
+Retrieved 2026-06-03 from the author PDF,
+`https://anirudhsk.github.io/papers/tiga_sosp.pdf`. Technical report:
+`https://arxiv.org/abs/2509.05759`.
+
+**Category:** transaction processing / write path.
+
+**Relevance tags:** timestamp ordering; strict serializability;
+consolidated concurrency control and replication; future timestamps;
+one-way-delay headroom; deterministic owner ordering; slow-path
+repair; optimistic execution; multi-version rollback; leader
+co-location; route descriptors; admission-time ordering.
+
+**Core idea:** Tiga targets geo-replicated OLTP transactions that
+would normally pay separate coordination costs for concurrency control
+and replication. It consolidates those layers by assigning each
+transaction a future timestamp at submission, using synchronized clocks
+and measured one-way delays so the transaction is expected to reach a
+large enough replica set before its serialization time. Servers hold
+work until local time passes that timestamp, then process transactions
+in timestamp order. In the common case this aligns arrival order across
+shards and replicas, so Tiga commits in one wide-area RTT.
+
+The transferable idea for GPU DB is not geo-replication itself. It is
+that a transaction or retained-read route can carry an explicit future
+ordering point chosen before it enters owner queues. If the runtime can
+predict the small local delay needed for network workers, mutation
+owners, WAL flush slots, read-snapshot workers, and GPU execution lanes
+to receive compatible work, it can batch and order work around a
+declared generation boundary instead of letting queue arrival order
+become the serialization policy by accident.
+
+**Concrete mechanisms:**
+
+- A coordinator timestamps a transaction as `send_time + headroom`.
+  Headroom is derived from measured one-way delays to a super quorum of
+  replicas in every involved shard plus an implementation slack. The
+  paper's implementation uses a 10 ms slack for WAN deployments; that
+  value is not directly applicable to local GPU DB queues.
+- Each server keeps a priority queue ordered by transaction timestamp.
+  Transactions are released only when local clock time passes their
+  timestamp and no earlier conflicting transaction is still pending.
+- Conflict detection uses per-key read and write timestamp maps. A
+  transaction can enter the queue if its timestamp is newer than the
+  recorded timestamp of already released conflicting work. Late
+  transactions at leaders may have their timestamp raised to the local
+  clock time.
+- Leaders optimistically execute queued transactions and send fast
+  replies with execution results, a log hash, and the timestamp used.
+  Followers append/log without executing and participate in quorum
+  checks.
+- Fast commit requires a super quorum with matching log hash and
+  timestamp, including the shard leader. This mirrors Fast-Paxos-style
+  reasoning: a simple quorum would not leave enough evidence after a
+  leader failure.
+- Participating leaders run timestamp agreement. If all leaders used
+  the same timestamp, the transaction is released. If some used a
+  smaller timestamp, leaders agree on the maximum timestamp. A leader
+  that executed at a smaller timestamp revokes that speculative
+  execution, repositions the transaction, and re-executes later.
+- Tiga explicitly handles the timestamp-inversion pitfall: one round of
+  agreement can be insufficient for strict serializability because
+  cross-shard real-time order can contradict a locally linearizable
+  timestamp order. When timestamps diverge, the protocol uses another
+  exchange before release so other leaders cannot commit intervening
+  conflicting work below the agreed timestamp.
+- For deployments where shard leaders can be co-located, Tiga can run
+  timestamp agreement before execution. That preventive mode pays LAN
+  latency but avoids speculative rollback. If leaders cannot be placed
+  near each other, it uses the detective mode that executes first and
+  repairs if agreement discovers divergence.
+- Slow path and recovery synchronize leader logs to followers, advance
+  sync points and commit points, and rebuild logs after leader failure
+  from surviving replicas plus timestamp agreement on uncertain
+  entries. Coordinators are stateless and retry across view changes.
+- Evaluation compares Tiga against layered and consolidated baselines
+  on Google Cloud using a microbenchmark and TPC-C. The paper reports
+  1.3-7.2x higher throughput and 1.4-4.6x lower median latency than
+  baselines in the tested settings, with TPC-C maximum throughput of
+  21.6K txn/s versus 13.3K for Detock and 10.8K for Janus in their
+  setup. The result depends on clock synchronization error being small
+  relative to WAN delay; the authors report Google Cloud chrony stayed
+  under 5 ms error in their experiments.
+
+**GPU DB mapping:** The current runtime already has owner domains,
+bounded command rings, immutable read snapshots, and WAL-before-
+visibility sequencing. Tiga suggests making "when this work is allowed
+to serialize" an explicit field in the command envelope rather than an
+implicit side effect of channel arrival. For local GPU DB this future
+point would be a monotonic generation or owner-local logical timestamp,
+not a WAN physical clock.
+
+COPY and write batches are the closest fit. A network worker can admit
+a batch with a target publication generation based on measured ring
+delay, WAL queue delay, and mutation-owner drain time. The mutation
+owner can hold compatible writes until the generation boundary, append
+WAL in deterministic order, invalidate resident snapshots, and then
+publish visibility. If a command arrives too late for its assigned
+generation, the owner raises it to a later generation rather than
+forcing a global stall.
+
+The read side can reuse the same idea for retained lookup
+micro-batches. Compatible requests would carry snapshot generation,
+query shape, and a short future drain deadline. The GPU worker releases
+the batch when the deadline passes or a count threshold is met. Tiga's
+lesson is to record whether all participating owners used the same
+generation; if not, the route must fallback or reissue at a newer
+generation instead of mixing results from inconsistent snapshots.
+
+The preventive/detective split also maps well to execution route
+choice. For cheap local coordination, agree on generation before GPU
+execution to avoid rollback or result discard. For expensive
+cross-partition or cold-tier work, allow speculative execution only
+when the result can be revoked before client visibility and when replay
+or WAL state can prove the final order.
+
+**Risks and mismatches:** Tiga is a geo-replicated key-value OLTP
+protocol, not a single-node GPU relational engine. Its performance
+claim depends on WAN latency dwarfing clock error and on known read and
+write sets for one-shot or decomposed transactions. GPU DB cannot assume
+arbitrary SQL has known write sets before planning and cannot expose
+speculative execution results before WAL, MVCC, DDL invalidation, and
+resident snapshot compatibility are settled.
+
+Physical clocks should not become the correctness root for local GPU DB.
+The safer transfer is owner-local logical generations with measured
+queue-delay headroom. If physical time is used for admission, it should
+affect batching and pacing only; correctness must still come from WAL
+order, MVCC visibility boundaries, catalog generations, and explicit
+snapshot handles.
+
+Rollback has a different cost profile on GPU. Tiga can erase speculative
+key-value versions internally. GPU DB may have launched kernels,
+allocated pinned buffers, refreshed resident segments, or encoded
+responses. Detective execution should therefore be limited to work with
+cheap discard semantics until benchmarks prove otherwise.
+
+**Benchmark candidates:**
+
+- Add a host-only owner-queue simulator with future generation
+  assignment. Compare arrival-order serialization, fixed batch windows,
+  and measured-delay future generation ordering under skewed writes.
+  Gate: same final MVCC-visible order and lower p95 queue wait without
+  increasing abort/fallback rate.
+- Prototype COPY chunk admission where each chunk receives a target
+  publication generation. Late chunks are raised to a later generation.
+  Measure WAL batch size, visibility publication latency, resident
+  invalidation count, and replay equivalence.
+- Add retained lookup micro-batching by `(snapshot_generation,
+  query_shape, target_drain_time)`. Failure condition: any request in a
+  batch observes a different snapshot boundary or receives a result
+  after its latency budget without explicit overload telemetry.
+- Compare preventive generation agreement before GPU execution against
+  detective speculative execution with result discard for a
+  two-partition retained read. Gate: preventive mode avoids discarded
+  GPU work when coordination is cheap; detective mode is allowed only
+  when discard cost is lower than coordination delay.
+- Track "timestamp raised" events as a first-class overload signal:
+  command generation assigned, generation used, boundary that forced
+  raising, and added latency. Failure condition: generation raises hide
+  saturation instead of driving admission/backpressure.
+- Add a strict-serializability regression for cross-owner real-time
+  ordering: create transactions whose direct conflicts are local but
+  whose dependency chain crosses owners. Gate: generation agreement or
+  fallback prevents timestamp-inversion-style anomalies.
+
+### 2026-06-03 - Cross-paper synthesis: adaptive scheduling must choose a shared clock
+
+Recent reviews converged on a common shape: high throughput comes from
+deciding the unit of scheduling before work reaches the hot path. Hermes
+uses transaction schedules and freshness windows for HTAP replicas;
+tiered-memory work argues for explicit placement metadata; Swift uses
+delay targets to regulate queues; Tiga assigns future ordering points
+to prevent arrival order from becoming the serialization rule.
+
+For GPU DB, the shared design track is a route envelope that carries
+both semantic identity and scheduling intent: snapshot generation,
+relation/catalog generation, query shape, owner set, target queue
+delay, target drain time, WAL or visibility publication generation, and
+tier expectations. Rings should not merely transport opaque commands.
+They should preserve the metadata needed to batch compatible reads,
+publish write visibility safely, and explain why work was delayed,
+raised to a later generation, demoted, rejected, or sent to CPU.
+
+The category gap remains local transaction/MVCC mechanics under
+contention. The next few non-runtime papers should lean toward
+deterministic or queue-oriented concurrency control, hotspot handling,
+MVCC version pruning, and logging order, rather than more GPU scan
+engines. Benchmark priority should be a host-only runtime simulator that
+combines Swift-style delay windows with Tiga-style future generations:
+same workload, same SQL/MVCC results, measured p95/p99 latency, owner
+queue depth, generation-raise rate, WAL batch size, and discarded
+speculative work.

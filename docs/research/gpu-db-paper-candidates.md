@@ -1290,12 +1290,28 @@ Append new candidates here as each paper is processed.
   graph-based geo-transaction design; useful for contrasting integrated
   concurrency-control/execution with Caerus-style scheduler-independent
   partial-order sequencing.
-- `queued` — **Tiga: Accelerating Geo-Distributed Transactions with
-  Synchronized Clocks**, Krishnaswamy et al., SOSP 2025.
+- `reviewed` — **Tiga: Accelerating Geo-Distributed Transactions with
+  Synchronized Clocks**, Geng, Mu, Sivaraman, and Prabhakar, SOSP 2025.
   URL: `https://anirudhsk.github.io/papers/tiga_sosp.pdf`
+  DOI: `https://doi.org/10.1145/3731569.3764854`
+  Technical report: `https://arxiv.org/abs/2509.05759`
   Why: modern synchronized-clock geo-transaction design related to Caerus and
   Detock; useful for deciding whether owner-boundary timestamps can reduce
   coordination without relying on full deterministic execution.
+- `queued` — **NCC: Natural Concurrency Control for Strictly Serializable
+  Datastores by Avoiding the Timestamp-Inversion Pitfall**, Lu, Mu, Sen,
+  and Lloyd, OSDI 2023.
+  URL: `https://www.usenix.org/conference/osdi23/presentation/lu`
+  Why: Tiga repeatedly contrasts against NCC's timestamp-inversion handling;
+  directly relevant to cross-owner strict-serializability tests and whether
+  GPU DB needs generation agreement for indirect dependency chains.
+- `queued` — **Nezha: Deployable and High-Performance Consensus Using
+  Synchronized Clocks**, Geng, Sivaraman, Prabhakar, and Rosenblum, PVLDB
+  2023.
+  URL: `https://doi.org/10.14778/3574245.3574250`
+  Why: Tiga builds on Nezha-style synchronized-clock consensus; useful as a
+  narrower source on depending on clock synchronization for performance while
+  preserving correctness with explicit recovery paths.
 - `reviewed` — **Epoch-based Optimistic Concurrency Control in Geo-replicated
   Databases**, arXiv 2026.
   URL: `https://arxiv.org/abs/2602.21566`
