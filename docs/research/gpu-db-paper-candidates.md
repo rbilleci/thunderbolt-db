@@ -283,7 +283,7 @@ Append new candidates here as each paper is processed.
   URL: `https://www.vldb.org/pvldb/vol9/p444-yan.pdf`
   Why: program-analysis and contention-aware execution ideas that complement
   MV3C's dependency-annotated transaction repair path.
-- `queued` — **Chiller: Contention-centric Transaction Execution and Data
+- `reviewed` — **Chiller: Contention-centric Transaction Execution and Data
   Partitioning for Modern Networks**, Zamanian et al., SIGMOD 2020.
   URL: `https://doi.org/10.1145/3318464.3389724`
   Preprint: `https://arxiv.org/abs/1811.12204`
@@ -760,3 +760,15 @@ Append new candidates here as each paper is processed.
   useful for shaping GPU DB transaction/admission benchmarks across locking,
   OCC, timestamp ordering, deterministic execution, MVCC, and partition-owner
   designs.
+- `queued` — **FaSST: Fast, Scalable and Simple Distributed Transactions with
+  Two-Sided RDMA Datagram RPCs**, Kalia et al., OSDI 2016.
+  URL: `https://www.usenix.org/conference/osdi16/technical-sessions/presentation/kalia`
+  Why: Chiller contrasts modern fast-network transaction execution with older
+  distributed-transaction assumptions; FaSST is a primary RDMA OLTP baseline
+  for bounded RPC buffers, fast commit messaging, and partition-local execution.
+- `queued` — **Rethinking Database High Availability with RDMA Networks**,
+  Zamanian et al., VLDB 2019.
+  URL: `https://www.vldb.org/pvldb/vol12/p1637-zamanian.pdf`
+  Why: Chiller's inner-region commit depends on careful replication and
+  recovery; this follow-up is relevant to GPU DB durability and availability
+  once owner domains, WAL publication, and resident refresh become distributed.

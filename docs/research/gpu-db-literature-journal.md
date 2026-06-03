@@ -6833,3 +6833,169 @@ phantom prevention and predicate locks remain separate design work.
   update deltas and apply them during a scan. Failure condition:
   delta application causes enough branch/scatter overhead that a full
   dense snapshot rebuild wins for the target retained workload.
+
+### 2026-06-03 - Chiller contention-centric transaction partitioning
+
+**Citation:** Erfan Zamanian, Julian Shun, Carsten Binnig, and
+Tim Kraska. "Chiller: Contention-centric Transaction Execution
+and Data Partitioning for Modern Networks." SIGMOD 2020.
+Retrieved 2026-06-03 from the arXiv preprint,
+`https://arxiv.org/abs/1811.12204`; DOI:
+`https://doi.org/10.1145/3318464.3389724`.
+
+**Category:** transaction processing / write path and runtime /
+session admission.
+
+**Relevance tags:** contention-aware partitioning; partition
+owners; hot-record routing; two-phase locking; distributed
+transactions; RDMA-era OLTP; operation reordering; write
+admission; owner-local commit; high-contention benchmarks.
+
+**Core idea:** Chiller argues that fast RDMA-era networks change
+the dominant objective for distributed OLTP. If remote messaging
+and bandwidth are no longer the main bottleneck, minimizing the
+number of cross-partition transactions can be the wrong target.
+The paper instead optimizes for data contention: put records that
+are hot and commonly accessed together where their lock duration
+can be minimized, even if that creates more distributed
+transactions.
+
+The transferable lesson for GPU DB is not "use Chiller's protocol
+as-is." It is that partition ownership and route choice should be
+driven by measured conflict cost, not by a static preference for
+locality or single-owner execution. A GPU DB write path targeting
+many logical sessions needs to know which keys, partitions, and
+resident generations create serialization pressure, then route or
+batch them so the contended part is as short, owner-local, and
+observable as possible.
+
+**Concrete mechanisms:**
+
+- Chiller splits transaction operations into a cold outer region
+  and hot inner region. The outer region locks and reads less
+  contended records first; the inner region handles the highly
+  contended records late and commits them quickly.
+- Candidate inner-region operations must access records marked
+  contended and must not have primary-key dependencies on
+  operations hosted by other partitions. Value dependencies matter
+  for correctness checks, but do not necessarily constrain lock
+  acquisition order in the same way.
+- If all inner-region candidates are hosted by one partition, that
+  partition becomes the inner host. If candidates span hosts, the
+  prototype chooses the host with the most candidate operations.
+- Once outer-region locks are acquired, the coordinator delegates
+  the inner region with enough inputs and read-set values for the
+  inner host to evaluate transaction constraints. If the inner host
+  succeeds, the transaction is considered committed and the outer
+  region must finish.
+- The paper's partitioner samples transaction read/write sets,
+  estimates per-record conflict likelihood, builds a star graph
+  with transaction vertices connected to record vertices, and uses
+  graph partitioning to minimize weighted cut edges. Cut hot edges
+  represent records that would remain in an outer region and keep a
+  longer contention span.
+- Conflict likelihood models write-write and read-write conflicts
+  using sampled read/write rates over the lock window. Pure
+  read-only sharing does not create contention in this model.
+- The lookup table can focus on hot records above a contention
+  threshold; colder records can use ordinary hash or range
+  partitioning. In the paper's YCSB local experiment, partial
+  lookup coverage gives Chiller useful throughput much earlier
+  than distributed-transaction-minimizing baselines.
+- Fault tolerance requires special handling because the inner
+  region commits before the outer participants finish. Chiller uses
+  synchronous log shipping for the inner region before its commit
+  point, and recovery rules decide commit/abort from surviving
+  inner-host replicas and pending outer-region participants.
+- The implementation uses partition-local execution threads,
+  hash-bucket lock granularity, replicated bucket-to-partition
+  lookup tables, RDMA operations or RPC messages, coroutine workers
+  while transactions wait on network operations, and NVM-style logs
+  for crash recovery.
+- Evaluation claims most relevant to GPU DB: on high-contention
+  TPC-C, Chiller scales better with more worker threads than
+  NO_WAIT, WAIT_DIE, and OCC; on YCSB distributed with 7 machines,
+  the paper reports much lower abort rates and roughly 2x over the
+  second-best baseline; on the Instacart-derived workload, combining
+  contention-centric partitioning with two-region execution beats
+  partitioning or reordering alone.
+
+**GPU DB mapping:** The current GPU DB architecture already names
+owner domains and bounded queues. Chiller suggests those owners
+should eventually be shaped by measured contention, not just table
+or partition identity. For hot warehouses, districts, accounts, or
+order-line keys, the runtime should expose a conflict heat signal:
+write/read arrival rate, abort or retry rate, owner queue wait, lock
+or reservation duration, WAL reservation wait, resident invalidation
+rate, and refresh interference. That signal can drive a partition
+owner split, hot-key routing table, or micro-batch policy.
+
+The two-region idea maps most safely to GPU DB as a benchmarked
+"hot reservation last" write path. Cold validation, non-hot reads,
+and WAL record preparation can happen before touching the hottest
+reservation or owner queue. The hot owner then performs a tiny,
+deterministic commit-critical section: validate the current hot
+generation, reserve/apply the hot mutation, append or publish the
+necessary WAL fact, invalidate affected resident snapshots, and
+release. GPU DB must keep WAL-before-visibility stronger than the
+paper's no-failure explanation; any early commit analogue needs a
+durable decision record before visible state changes.
+
+Chiller's partitioner also maps to resident data placement. A
+GPU-resident partitioning policy should not admit or co-locate data
+only by scan locality. It should ask whether hot keys are causing
+owner serialization, snapshot invalidation, or refresh rebuild
+storms. A small hot-key lookup table, backed by ordinary placement
+for cold rows, may be a better first implementation than a full
+record-level placement map.
+
+For 1M logical sessions, the coroutine/RDMA details are secondary
+but useful: stalled distributed work should yield to other admitted
+requests, and transport or owner resources should be bounded and
+observable. The runtime should avoid letting a request hold scarce
+hot-owner, pinned-buffer, or GPU stream resources while waiting on
+unrelated remote or cold work.
+
+**Risks and mismatches:** Chiller assumes stored procedures or
+one-shot transaction descriptions so the system can reorder
+operations. PostgreSQL-compatible interactive transactions are a
+poor fit unless GPU DB restricts the optimization to known stored
+procedures, COPY chunks, or internally generated mutation batches.
+The protocol is 2PL-centered and does not directly solve MVCC
+snapshot visibility, predicate/range phantoms, or GPU-resident
+snapshot correctness. Its implementation locks hash buckets and
+does not prevent phantoms. The evaluation is distributed CPU/RDMA
+OLTP, not GPU execution, and it relies on NVM/RDMA assumptions that
+may not match the current single-node GPU DB. Finally, early inner
+commit complicates recovery; GPU DB should borrow the shorter hot
+critical section and contention-aware placement first, not the exact
+commit protocol.
+
+**Benchmark candidates:**
+
+- Add contention heat telemetry to the mutation path: per key or
+  bucket write/read arrivals, queue wait, reservation duration,
+  retry/abort count, resident invalidation count, and refresh delay.
+  Minimum gate: no behavior change and bounded cardinality for hot
+  telemetry.
+- Build a TPC-C-style hot-record benchmark comparing ordinary
+  partition-owner mutation order against "hot reservation last."
+  Measure committed rows/sec, p50/p99 latency, owner queue wait,
+  WAL wait, invalidation delay, and retry/abort rate.
+- Prototype a small hot-key routing table for the most contended
+  keys or buckets, leaving cold keys on hash/range placement. Proof
+  gate: the table improves high-contention throughput without
+  increasing cold-key p99 or creating unbounded lookup metadata.
+- Test a mutation micro-batch shape where cold validation and WAL
+  payload assembly happen before the hot owner critical section.
+  Failure condition: any request observes visibility before its WAL
+  decision and invalidation facts are durable/published.
+- Add a negative-control workload where minimizing distributed work
+  produces worse p99 than contention-aware placement. The planner or
+  admission policy should prefer the layout with lower hot-owner
+  queue wait even if it performs more cross-owner routing.
+- For resident snapshots, measure whether co-locating hot invalidated
+  keys by refresh partition reduces rebuild storms versus pure range
+  or hash partitioning. Required measurement: refresh bytes,
+  invalidated resident generations, retained-read fallback rate, and
+  write throughput during refresh.
