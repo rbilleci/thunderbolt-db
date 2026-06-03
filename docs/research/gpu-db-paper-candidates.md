@@ -248,9 +248,10 @@ Append new candidates here as each paper is processed.
   DOI: `https://doi.org/10.14778/3705829.3705856`
   Why: modern GPU relational engine with execution and load-balancing details
   relevant to fused retained route design.
-- `queued` — **GPU Acceleration of SQL Analytics on Compressed Data**,
+- `reviewed` — **GPU Acceleration of SQL Analytics on Compressed Data**,
   Huang et al., PVLDB 2025.
-  URL: `https://www.vldb.org/pvldb/vol19/p320-huang.pdf`
+  URL: `https://arxiv.org/abs/2506.10092`
+  DOI: `https://doi.org/10.14778/3778092.3778095`
   Why: evaluates compressed-data SQL execution on GPUs and may inform
   dense-versus-compressed resident page benchmarks.
 - `reviewed` — **Path to GPU-Initiated I/O for Data-Intensive Systems**,
@@ -835,6 +836,19 @@ Append new candidates here as each paper is processed.
   URL: `https://www.vldb.org/pvldb/vol17/p441-cao.pdf`
   Why: Crystal-Opt follow-up discussed by Themis; useful for comparing
   GPU primitive optimization against warp-level pipeline load balancing.
+- `queued` — **Tile-based Lightweight Integer Compression in GPU**,
+  Shanbhag, Yogatama, Yu, and Madden, SIGMOD 2022.
+  URL: `https://doi.org/10.1145/3514221.3526132`
+  Why: compressed GPU execution related work for tile-level decompression;
+  useful as a contrast against operating directly on RLE/index encodings and
+  for deciding whether GPU DB should decode into scratch tiles or preserve
+  compressed resident columns through predicates and aggregates.
+- `queued` — **BtrBlocks: Efficient Columnar Compression for Data Lakes**,
+  Kuschewski, Sauerwein, Alhomssi, and Leis, SIGMOD 2023.
+  URL: `https://doi.org/10.1145/3589263`
+  Why: modern columnar compression framework referenced by the compressed GPU
+  analytics paper; useful for choosing host/cold-tier column encodings before
+  deciding which forms are worth promoting into GPU-resident snapshots.
 - `queued` — **Improving Execution Efficiency of Just-in-Time Compilation
   Based Query Processing on GPUs**, Paul et al., PVLDB 2020.
   URL: `https://www.vldb.org/pvldb/vol14/p202-paul.pdf`

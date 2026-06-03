@@ -19339,3 +19339,215 @@ the stolen work crosses ownership boundaries too freely.
   sessions but bounds active work by delay/utilization-range policy. Required
   metrics: idle-session memory, active credits, queue delay, rejected/admitted
   work, and p99 latency under bursty load.
+
+### 2026-06-03 - GPU SQL analytics on compressed data
+
+**Citation:** Zezhou Huang, Krystian Sakowski, Hans Lehnert, Wei Cui,
+Carlo Curino, Matteo Interlandi, Marius Dumitru, and Rathijit Sen.
+"GPU Acceleration of SQL Analytics on Compressed Data." Proc. VLDB
+Endow. 19(3), 2025; arXiv:2506.10092v2. Retrieved 2026-06-03 from
+`https://arxiv.org/abs/2506.10092`.
+
+**Category:** GPU execution / analytics and multi-tier cache / data placement.
+
+**Relevance tags:** compressed resident columns; RLE; index encoding;
+bit-width reduction; GPU HBM capacity; predicate masks; alignment;
+compressed joins; group-by aggregation; PyTorch tensor execution;
+over-resident avoidance.
+
+**Core idea:** The paper argues that GPU database capacity is often limited
+less by raw compute than by HBM size and host-to-device bandwidth. Instead of
+loading uncompressed columns, or decompressing data after transfer, the authors
+execute SQL analytics directly over lightweight compressed representations.
+The central design is a tensor-level framework that keeps run-length encoding
+(RLE), index encoding, dictionary encoding, and bit-width-reduced columns in
+encoded form through as much of selection, projection, aggregation, group-by,
+and joins as possible.
+
+The important mechanism is position-aware compressed execution. Plain columns
+implicitly align tensor position with row position. RLE and index-encoded
+columns explicitly store row positions, so two compressed columns cannot be
+combined until their positional ranges are aligned. The paper builds GPU
+primitives for range intersection, index-in-range checks, range union,
+complements, compaction, and conversion between encodings, then composes those
+primitives into relational operators.
+
+**Concrete mechanisms:**
+
+- RLE columns are represented by value, start-position, and end-position
+  tensors. Index-encoded columns store value and row-position tensors. Composite
+  encodings combine RLE+Index for mixed contiguous and scattered values, and
+  Plain+Index for bit-width reduction with outlier separation.
+- Boolean mask columns reuse the same position-explicit encodings, but RLE and
+  Index masks store only true positions or intervals. This lets selections
+  avoid materializing full boolean vectors when true regions are compact.
+- The `range_intersect` primitive aligns two RLE interval lists using GPU
+  `bucketize`, `repeat_interleave`, vectorized max/min, and a helper that
+  creates concatenated ranges. The output has common start/end tensors, with
+  values duplicated only where ranges split.
+- Index/RLE intersection has two variants: bucketize index positions against
+  RLE starts when the index side is smaller, or bucketize RLE starts/ends
+  against index positions when the RLE side is smaller. The implementation
+  chooses based on relative input sizes.
+- Logical AND/OR/NOT dispatch on the pair of input encodings. RLE/RLE AND
+  becomes range intersection; RLE/Index checks containment; RLE/Plain converts
+  to Index or Plain based on a selectivity threshold. The default threshold is
+  20 from offline profiling on the authors' GPU system.
+- Composite masks are treated as disjunctions of their components. De Morgan,
+  associativity, and distributivity reduce composite logical operations to
+  simpler per-component operations, which can run in parallel on CUDA streams.
+- Arithmetic, comparison, and selection first align positional representations.
+  For RLE arithmetic, misaligned runs are split into common intervals before
+  value tensors are combined.
+- Aggregation uses grouping inverse indexes and scatter-style accumulation.
+  For RLE SUM/COUNT, the engine multiplies values by run length or counts run
+  lengths instead of expanding every row. AVG/STD/VAR are derived from SUM,
+  COUNT, and squared sums.
+- Joins reuse a GPU hash join on value tensors, but map join-index results back
+  to compressed positions. RLE join matches are expanded according to run
+  length; RLE/RLE matches can become many-to-many, with output length derived
+  from the product of matching run lengths.
+- Encoding choice is heuristic: small columns stay Plain; high RLE compression
+  uses RLE; mixed runs use RLE+Index; outlier-driven bit-width savings use
+  Plain+Index; otherwise columns stay Plain.
+- Evaluation uses an A100 80GB VM. Microbenchmarks report 21-46x GPU speedups
+  over CPU implementations for four primitives at large scale, with CPU still
+  better at 1K elements and GPU crossover around 10K-100K elements.
+- TPC-H experiments at scale factors 50, 100, and 300 show compressed execution
+  reducing peak GPU memory by up to 3.7x and query runtime by up to 23.8x.
+  Q6 at SF=300 is reported as 68.6 ms on Plain versus 3.96 ms compressed, and
+  Q19 as 470.1 ms versus 19.8 ms.
+- On a first-party production star-schema workload with a 2.94B-row fact table,
+  the selected 15 fact-table columns shrink from 120.36 GiB Plain to 56.84 GiB
+  compressed. The paper reports total speedups of 12.76x over SQL Server and
+  9.52x over Analysis Services for three production queries.
+- On public BI datasets, compression helps 28 of 38 queries, with a 2.02x
+  geometric mean speedup and maximum 11.27x speedup; 10 queries slow down
+  because RLE-to-plain overhead dominates when few RLE columns participate.
+
+**GPU DB mapping:** The immediate lesson for P8 is that resident snapshots do
+not have to be dense uncompressed column groups. A table/partition snapshot can
+publish an encoding manifest per column: Plain, RLE, Index, RLE+Index, or
+Plain+Index, with row-position semantics explicit enough for the planner and
+GPU workers to decide which predicates and aggregates can stay compressed.
+
+This maps cleanly onto the current storage design's immutable snapshot model.
+Each resident generation can carry column buffers plus encoding metadata,
+position-domain metadata, compression ratio, estimated conversion cost, and
+supported operator families. Read workers can then preserve the encoded form
+for same-shape retained reads, while mutation/residency owners invalidate the
+whole generation or affected segments before new writes become visible.
+
+The strongest transferable idea is "align positions before decoding values."
+For GPU DB, a compressed retained route should first intersect visibility,
+predicate, and selected-column position sets. Only after the position domain is
+narrowed should it decide whether to decode, gather, or aggregate. That is a
+better default than copying dense device arrays for every admitted column.
+
+The paper also suggests a useful route-cost dimension: encoded operation cost
+is not monotonic with compression ratio alone. Query shape, mask type, column
+ordering, RLE run count, selectivity, and downstream reuse determine whether
+staying compressed wins. GPU DB's planner should treat encoding as a route
+property, not only a storage property. A high-RLE column may be excellent for
+COUNT/SUM and poor for an RLE/Plain AND that forces conversion with little
+downstream benefit.
+
+For write throughput, the paper is indirect but still useful. It strengthens
+the case for separating mutable append/delta storage from read-optimized
+resident generations. Compression-friendly row ordering and RLE runs are not
+free under updates. GPU DB should probably avoid continuously maintaining
+compressed HBM layouts for every mutation; instead, it should batch refreshes
+at generation boundaries, keep deltas separate, and measure when a new
+compressed generation is worth publishing.
+
+**Risks and mismatches:** This is an analytics paper, not an OLTP or MVCC
+paper. Its experiments assume data is already resident in GPU HBM during query
+execution, after conversion/loading. It does not solve WAL-before-visibility,
+incremental mutation maintenance, snapshot retirement, DDL invalidation, or
+low-latency point lookups under many sessions. TQP currently uses Spark
+Catalyst for plans and PyTorch tensor operators for execution; those choices
+may be too heavyweight for GPU DB's microsecond retained routes. The evaluation
+uses warm query times and substantial full-column execution, so it should not
+be read as a prediction for pgwire per-request latency. Compression can slow
+some workloads down when conversion overhead dominates, and query-specific
+sorting may conflict with OLTP insert locality, indexes, and MVCC version
+organization.
+
+**Benchmark candidates:**
+
+- Add a compressed-resident-snapshot design spike for one `int4` partition:
+  Plain versus RLE versus RLE+Index buffers, each tied to a source WAL boundary
+  and immutable generation id. Gate: invalidation and CPU fallback remain
+  identical to dense resident snapshots.
+- Build a no-SQL GPU microbenchmark for RLE `COUNT`, `SUM`, `MIN`, `MAX`, and
+  range-filter masks over retained `order_line`-like columns. Compare dense
+  device columns against RLE value/start/end tensors. Measure HBM bytes, kernel
+  time, D2H bytes, and p50/p99 route latency.
+- Add an encoding-aware planner cost experiment: route same-shape retained
+  aggregate queries by `(run_count, compression_ratio, selectivity,
+  conversion_needed, downstream_reuse)`. Failure condition: the planner picks
+  compressed execution when dense execution is faster for low-run-length data.
+- Test visibility-plus-predicate alignment: intersect a retained visibility
+  mask with an RLE predicate mask before gathering values. Gate: SQL-visible
+  MVCC semantics match the CPU tuple path exactly across old and new snapshot
+  generations.
+- Compare refresh strategies for compressed generations: full rebuild, append
+  delta plus compressed base, and delayed recompression after N mutations.
+  Required metrics: write admission throughput, refresh wall time, resident
+  bytes, stale-route rejection count, and read speedup retained after updates.
+- Create a "compression hurts" benchmark with sparse RLE involvement and
+  RLE/Plain conversions. The planner must expose the fallback reason rather
+  than blindly promoting compressed resident execution.
+- Evaluate row-ordering tradeoffs: key-order, timestamp-order, and
+  compression-order resident builds. Measure RLE run count, equality lookup
+  performance, range aggregate performance, refresh cost, and mutation
+  invalidation cost.
+
+### 2026-06-03 - Cross-paper synthesis: encoded routes need declared costs
+
+The last three reviews connect application/transaction ordering, microsecond
+task scheduling, and compressed GPU execution. They point to the same runtime
+shape: GPU DB should make route classes explicit before it optimizes them.
+QURO-style reordering wants dependency and contention metadata. The NSDI
+scheduling-policy paper wants load-balancing and resource-allocation decisions
+separated. The compressed GPU SQL paper wants encoding and conversion costs
+visible at planning time.
+
+**Converging design tracks:**
+
+- **Declared route descriptors:** A request should carry query shape, snapshot
+  generation, owner domains touched, expected mutation gate, GPU/CPU/tier route,
+  encoding family, and response shape. That descriptor becomes the unit for
+  batching, queue admission, and contention-aware reordering.
+- **Costed boundaries:** Mutation owners, residency publication owners,
+  compressed-generation refresh, GPU execution workers, and response rings all
+  need queue wait and hold-time metrics. Compressed execution adds conversion
+  cost and run-count metrics to the same boundary model.
+- **Compatibility classes:** Work stealing, micro-batching, compressed mask
+  alignment, and stored-workflow reordering should happen only inside declared
+  compatibility classes: same snapshot or compatible visibility boundary, same
+  relation/partition, same route family, and no unproven mutation ordering
+  change.
+- **Background work with revocation points:** Refresh, recompression, cold-tier
+  staging, and long scans should yield capacity when foreground retained reads
+  or mutation admission exceed delay ranges. Compression is another background
+  value calculation, not an unconditional hot-path activity.
+
+**Category gaps:** Recent coverage remains strong for runtime scheduling,
+transaction/write-path ordering, and multi-tier/GPU placement. The next few
+runs should keep alternating into MVCC/snapshot visibility, query optimization,
+or one of the remaining GPU compressed-execution baselines so the loop does not
+overfit to only queue policy or only OLAP kernels.
+
+**Benchmark priorities:**
+
+- Implement a route-descriptor simulator that includes owner gates, worker
+  class, snapshot generation, and optional encoding family. Use it to compare
+  client order, contentious-gate-last order, static workers, work stealing, and
+  encoding-aware compressed routes.
+- Add a compressed resident aggregate microbenchmark before changing storage
+  code. The first proof should be a standalone GPU worker benchmark with exact
+  CPU result comparison and measured HBM savings.
+- Add telemetry fields that make choices auditable: route class, queue wait,
+  owner hold time, worker utilization, encoding family, compressed bytes,
+  dense bytes, conversion reason, fallback reason, and stale-generation reason.
