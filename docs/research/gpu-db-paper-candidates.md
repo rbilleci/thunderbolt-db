@@ -411,13 +411,25 @@ Append new candidates here as each paper is processed.
   Why: Carousel discusses PIFO as a programmable scheduling primitive; useful
   for comparing time-wheel admission with rank-based response/request
   scheduling when GPU DB needs more than simple pacing.
-- `queued` — **Programmable Packet Scheduling with a Single Queue**,
-  Alcoz, Dietmuller, and Vanbever, SIGCOMM 2021.
+- `reviewed` — **Programmable Packet Scheduling with a Single Queue**,
+  Yu et al., SIGCOMM 2021.
   URL: `https://doi.org/10.1145/3452296.3472887`
   PDF: `https://conferences.sigcomm.org/sigcomm/2021/files/papers/3452296.3472887.pdf`
   Why: modern follow-up on approximating programmable scheduling with a single
   FIFO-style queue; relevant to bounded high-concurrency response shaping
   without expensive per-session queues.
+- `queued` — **SP-PIFO: Approximating Push-In First-Out Behaviors using
+  Strict-Priority Queues**, Alcoz, Dietmuller, and Vanbever, NSDI 2020.
+  URL: `https://www.usenix.org/conference/nsdi20/presentation/alcoz`
+  Why: direct predecessor to AIFO that uses a small set of strict-priority
+  queues to approximate PIFO; useful for comparing one-queue admission with
+  multi-lane response scheduling.
+- `queued` — **Swift: Delay is Simple and Effective for Congestion Control in
+  the Datacenter**, Kumar et al., SIGCOMM 2020.
+  URL: `https://doi.org/10.1145/3387514.3406591`
+  Why: AIFO depends on fast-converging end-host congestion control; useful for
+  mapping delay-based feedback to GPU DB ingress, response-ring, and tier
+  admission signals.
 - `queued` — **RTScan: Efficient Scan with Ray Tracing Cores**, Lv et al.,
   PVLDB 2024.
   URL: `https://www.vldb.org/pvldb/vol17/p1460-lv.pdf`

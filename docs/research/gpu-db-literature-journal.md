@@ -22122,3 +22122,145 @@ boundary.
   and projected 1M logical sessions. Failure condition: inactive sessions
   consume worker-local resources or distort admission for active retained
   reads.
+
+### 2026-06-03 - Programmable Packet Scheduling with a Single Queue
+
+**Citation:** Zhuolong Yu, Chuheng Hu, Jingfeng Wu, Xiao Sun, Vladimir
+Braverman, Mosharaf Chowdhury, Zhenhua Liu, and Xin Jin. "Programmable
+Packet Scheduling with a Single Queue." SIGCOMM 2021. doi:10.1145/3452296.3472887.
+Retrieved 2026-06-03 from
+`https://conferences.sigcomm.org/sigcomm/2021/files/papers/3452296.3472887.pdf`.
+
+**Category:** runtime / HFT / session scale, with high-concurrency admission
+and response-scheduling relevance.
+
+**Relevance tags:** programmable scheduling; admission control; bounded FIFO
+queues; rank-based overload handling; response shaping; high-concurrency
+networking; queue scarcity; starvation prevention; line-rate implementation.
+
+**Core idea:** AIFO turns programmable packet scheduling from an ordering
+problem into an admission problem. PIFO-style schedulers attach ranks to
+packets and require a sorted push-in-first-out queue, which is difficult to
+build at switch line rate and consumes scarce priority-queue resources.
+AIFO keeps one ordinary FIFO queue, observes that shallow datacenter queues
+often make "which packets get admitted" more important than exact dequeue
+order, and admits or drops arrivals using the relative rank of the new packet
+against recent traffic.
+
+The most transferable idea for GPU DB is not packet dropping itself. It is
+that sophisticated scheduling can be approximated with a simple bounded queue
+when the admission predicate is smart, cheap, and local. For 1M logical
+sessions, the engine cannot afford elaborate per-session or per-route queues
+at every boundary. It needs single or few-lane bounded rings whose admission
+decisions use route rank, queue pressure, and recent demand to protect short
+high-value work without pretending all waiting work can be fairly buffered.
+
+**Concrete mechanisms:**
+
+- AIFO assigns each packet a rank from a programmable scheduling policy such
+  as shortest-remaining-processing-time or start-time fair queueing, but it
+  stores admitted packets in one FIFO queue rather than a sorted PIFO queue.
+- The design maintains a sliding window of ranks for recent arriving packets.
+  An arriving packet computes its rank quantile in that window: how many
+  recent ranks are worse than the new packet's rank, divided by window size.
+- Admission combines the rank quantile with current queue occupancy. Higher
+  queue pressure raises the bar; low-ranked work can be admitted while
+  worse-ranked work may be proactively dropped even when the FIFO still has
+  physical space.
+- The paper expresses the admission condition in a form suitable for
+  programmable switch stages: constants for queue capacity, window size, and
+  control parameter `k`, plus queue length `c` and quantile count `q`, can be
+  transformed into an integer comparison.
+- Because hardware register space is limited, the implementation can use a
+  small physical sliding window plus sampling to approximate a larger recent
+  window. The paper reports that a small window, for example around 20
+  entries, is enough for many evaluated scenarios, while sampling virtually
+  scales it when needed.
+- AIFO naturally preserves FIFO order among admitted packets. This avoids
+  packet reordering that can appear when PIFO or SP-PIFO ranks later packets
+  of the same flow ahead of earlier packets.
+- The prototype runs on a Barefoot Tofino switch using one FIFO queue. In the
+  reported resource table, AIFO uses less SRAM than SP-PIFO but more stateful
+  ALU and logical-table resources.
+- Simulations evaluate web-search and data-mining workloads, SRPT-like
+  pFabric behavior, and fair queueing. The paper reports AIFO closely
+  approximates PIFO/SP-PIFO and, for fair queueing on the web-search workload,
+  small-flow FCT is 9.7% higher than AFQ and 3.6% higher than SP-PIFO while
+  using one queue.
+- Testbed experiments use a 6.5 Tbps Barefoot Tofino switch and five
+  40 GbE servers. With manually ranked UDP and TCP flows, AIFO differentiates
+  lower-rank from higher-rank flows similarly to SP-PIFO; TCP's own congestion
+  control makes differentiation less absolute than fixed-rate UDP.
+
+**GPU DB mapping:** GPU DB can use AIFO as a model for bounded response and
+request admission. Instead of building one queue per session, one queue per
+query template, or many strict-priority lanes for every owner, a worker can
+use a small FIFO ring with rank-aware admission. Rank should be a route
+descriptor field: short retained lookup, mutation commit, COPY chunk,
+resident refresh, long scan, large response, CPU fallback, or recovery work.
+The admission decision should combine that rank with ring occupancy and
+recent accepted/rejected work of comparable route classes.
+
+This maps tightly to the current runtime target. Network IO workers can parse
+requests and send them into mutation, read-snapshot, GPU execution, or
+response rings. At each ring, the AIFO-style question is: when space remains
+but pressure is rising, which work should be admitted now, paced, downgraded
+to CPU fallback, or rejected with an explicit overload reason? A retained
+point lookup and a long over-resident scan should not be equal simply because
+they arrived in FIFO order.
+
+For response rings, AIFO suggests a practical alternative to expensive
+per-session fairness queues. A single bounded response ring can maintain a
+small sliding window of response ranks, where rank includes response byte
+size, session credit state, request age, and route class. It can protect tiny
+`COUNT` or lookup responses from large rowsets without needing hundreds of
+physical queues. Starvation prevention still matters: admitted responses for
+one session should preserve protocol order, and low-rank long responses need
+aging or minimum service so they do not disappear under sustained small-query
+load.
+
+For GPU execution workers, the same idea applies to micro-batch admission.
+When a compatible batch is forming, the worker can admit new lookup keys or
+aggregate requests according to rank quantiles and batch/ring occupancy, not
+just "first N until full." That can keep latency-sensitive same-shape lookups
+moving while long scans or refresh-adjacent work are paced under pressure.
+
+**Risks and mismatches:** This is a network packet scheduler, not a database
+runtime. Dropping packets is not the same as rejecting SQL work: SQL-visible
+errors, transaction boundaries, pgwire response order, WAL-before-visibility,
+and MVCC semantics all constrain what can be delayed or rejected. AIFO also
+assumes shallow queues and fast end-host congestion control. GPU DB must
+measure whether its internal queues are shallow enough for admission to matter
+more than precise ordering.
+
+Ranks are dangerous if they are too simple. Always ranking retained reads over
+mutation commits could starve writes, delay visibility, and increase snapshot
+staleness. Always ranking short responses over long rowsets could make
+analytical sessions unusable. The paper's evaluation is network-flow oriented;
+its FCT and packet-reordering claims do not directly predict SQL p99 latency,
+transaction abort rate, response-byte backlog, or GPU batch efficiency.
+
+**Benchmark candidates:**
+
+- Add a rank-aware admission prototype for one bounded read-snapshot or
+  response ring. Route rank should include query class, expected duration,
+  response bytes, session credits, age, and overload fallback policy. Gate:
+  identical SQL results and explicit rejection/pacing reasons.
+- Compare FIFO, strict-priority lanes, and AIFO-style one-ring admission under
+  a mixed workload: short retained lookup, `COUNT`, COPY chunk, long resident
+  scan, and large rowset response. Measure p50/p99 latency, write throughput,
+  response bytes queued, and starvation incidents.
+- Maintain a small sliding window of recent route ranks per saturated ring.
+  Test physical window sizes 8, 16, 32, and 64 plus sampling. Failure
+  condition: the window adds overhead without reducing p99 queue wait or
+  overload mis-admission.
+- Add session-order protection for response admission. AIFO preserves FIFO for
+  admitted packets; GPU DB must preserve pgwire response order per session
+  even when ranks favor small responses globally.
+- Benchmark starvation-prevention knobs: rank aging, minimum long-response
+  service, and write-lane reservation. Gate: retained reads stay fast while
+  long scans and mutations continue to make bounded progress.
+- Record telemetry that separates "ring had physical space" from "admission
+  predicate rejected or paced this work." This is the proof that a smart
+  bounded queue is intentionally protecting latency rather than silently
+  overflowing later.
