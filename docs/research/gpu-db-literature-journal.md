@@ -18270,3 +18270,135 @@ speedups.
 - Track ranker safety telemetry: invalid route filtered, saturated route
   filtered, confidence fallback, stale generation prevented, and route slower
   than deterministic baseline by more than 10%.
+
+### 2026-06-03 - PWV early write visibility
+
+**Citation:** Jose M. Faleiro, Daniel J. Abadi, and Joseph M.
+Hellerstein. "High Performance Transactions via Early Write Visibility."
+PVLDB 10(5), 2017, pp. 613-624. Retrieved 2026-06-03 from
+`https://www.vldb.org/pvldb/vol10/p613-faleiro.pdf`.
+
+**Category:** transaction processing / write path.
+
+**Relevance tags:** deterministic transactions; early write visibility;
+recoverability; piece-wise scheduling; write hot spots; serializable
+transactions; commit points; owner-local mutation batches.
+
+**Core idea:** The paper argues that serializable systems lose concurrency
+because they usually delay a transaction's writes until the transaction is
+complete or durably committed. That delay is conservative: it exists because
+ordinary systems may abort a transaction for system reasons at almost any
+point. If the engine restricts aborts so that a transaction has a known point
+after which it cannot roll back, some writes can be made visible earlier
+without dirty reads or cascaded aborts.
+
+The proposed protocol, piece-wise visibility (PWV), uses deterministic
+execution to eliminate most system-induced aborts, decomposes transactions
+into pieces, and schedules conflicting pieces in serial order. Once a
+transaction has executed every operation that could cause a logic or
+speculation-induced abort, later writes can become visible immediately after
+completion, even if other pieces of the same transaction still remain.
+
+**Concrete mechanisms:**
+
+- PWV separates logic-induced and system-induced aborts. Deterministic logging
+  and ordered execution remove deadlock, validation, and failure-timing aborts
+  from the normal hot path.
+- Transactions first log logic, input parameters, and nondeterministic inputs.
+  Recovery replays that same log, so normal execution and replay use the same
+  deterministic order.
+- If read/write sets are known from parameters, the scheduler can order
+  conflicting work before execution. If sets depend on data, PWV can use
+  speculative execution before logging and then validate the speculative set
+  early in the real transaction.
+- A transaction's commit point is the point after all operations that can
+  trigger a logic or speculation-induced abort have finished. Writes before
+  that point are delayed until the commit point; writes after that point can be
+  visible immediately after the write completes.
+- PWV decomposes transactions using data-flow over transaction control-flow
+  graphs. Pieces contain one or more statements and are scheduled so conflicts
+  respect the deterministic serial order.
+- The decomposition is modular: it uses dependencies between statements inside
+  a transaction, allows multiple abortable pieces, and still avoids cascaded
+  aborts.
+- PWV can exploit intra-transaction parallelism by executing independent
+  pieces from one transaction on multiple cores.
+- For TPC-C, the paper evaluates both precise and coarse conflict
+  specifications. A coarse version isolates Stock by warehouse rather than
+  primary key. Coarse isolation hurts conventional locking, but PWV can benefit
+  because it orders only conflicting pieces rather than whole transactions.
+- Evaluation compares PWV with optimized locking, OCC, transaction chopping,
+  and read committed. The paper reports that PWV can outperform serializable
+  protocols by over an order of magnitude and read committed by more than 3x
+  on high-contention workloads. The abstract says the implementation is
+  multicore optimized; exact hardware details were not needed for this mapping.
+
+**GPU DB mapping:** The strongest transferable idea is not "make writes visible
+early" by default. It is to split a write transaction into declared pieces and
+publish visibility only at proven no-abort boundaries. GPU DB already has a
+strict WAL-before-visibility rule. PWV suggests a narrower benchmark track:
+inside a deterministic owner-local batch, classify statements into abortable
+validation pieces and non-abortable apply/index/refresh pieces, then see
+whether later pieces can unblock dependent reads or writes sooner without
+exposing unlogged or rollbackable state.
+
+For COPY and hot OLTP mutations, the current owner could record a batch order,
+pre-validate schema/constraints/known key sets, append stable command records,
+and then execute independent physical substeps in parallel: tuple append,
+CPU index append, GPU resident invalidation, and refresh scheduling. The
+published visibility boundary would still move only after the WAL and all
+abortable checks are complete. But post-boundary work that cannot abort, such
+as deterministic index maintenance or resident invalidation publication, can
+be measured as separately ordered pieces instead of holding an entire
+transaction-shaped critical section.
+
+The piece scheduler also maps to partition ownership. If a transaction touches
+multiple partitions, order only the pieces that conflict on a partition-local
+key or coarser domain. Non-conflicting pieces can run on separate owners or GPU
+workers. Coarse conflict domains should be benchmarked rather than assumed:
+PWV shows that coarser conflict declarations can reduce metadata overhead when
+the scheduler pipelines at piece granularity, but they can also introduce false
+blocking in conventional lock-like paths.
+
+PWV also gives a way to think about retained refreshes. A refresh or resident
+index update that follows a durable visibility boundary should be treated as a
+non-abortable performance-cache piece: readers either use the prior immutable
+snapshot, the new published generation, or an explicit fallback. They should
+never wait on a refresh merely because it belongs to the same logical write
+transaction unless the read requires that exact resident generation.
+
+**Risks and mismatches:** PWV assumes deterministic transaction execution and
+available read/write sets or safe speculative discovery. GPU DB's current
+general SQL path does not have full stored-procedure-style transaction
+templates, and arbitrary SQL may include constraints, DDL, errors, volatile
+functions, triggers, or parameter-dependent access sets that make an early
+commit point hard to prove. Early visibility is dangerous if confused with
+dirty reads; GPU DB must preserve WAL-before-visibility and must not publish
+state that replay cannot reproduce. The paper's evaluation is CPU multicore
+transaction processing, not GPU execution, pgwire admission, or MVCC tuple
+chains. It also depends on deterministic input logging; using it for ad hoc
+interactive SQL would require a restricted fast lane.
+
+**Benchmark candidates:**
+
+- Add an owner-local deterministic batch simulator for one hot transaction
+  shape. Split validation, WAL append, tuple/index apply, resident
+  invalidation, and refresh scheduling into pieces. Gate: replay produces the
+  same visibility and cache state as normal execution.
+- Measure write visibility delay explicitly: time from first write intent,
+  WAL-stable no-abort boundary, CPU-visible publication, resident invalidation,
+  and resident refresh publication. Failure condition: any read can observe a
+  pre-WAL or rollbackable write.
+- Compare whole-transaction owner locking against piece-level partition
+  ordering for TPC-C-like NewOrder/Payment subsets. Measure throughput,
+  p50/p99, false conflicts, and queue wait per owner.
+- Test coarse versus precise conflict declarations for a Stock-like hot table:
+  key-granular, warehouse/domain-granular, and table-granular. Gate: coarse
+  mode must reduce scheduler metadata or queue overhead enough to pay for
+  false conflicts.
+- Prototype a non-abortable post-visibility resident invalidation piece. Gate:
+  new readers never choose stale resident snapshots, while old readers can
+  finish on immutable generations.
+- Add telemetry for "abortable frontier reached" and "non-abortable pieces
+  outstanding" so admission can distinguish correctness blockers from
+  performance-cache lag.

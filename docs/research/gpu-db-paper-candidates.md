@@ -598,7 +598,7 @@ Append new candidates here as each paper is processed.
   PDF: `https://www.eecg.utoronto.ca/~ashvin/publications/caracal.pdf`
   Why: deterministic MVCC contention-management baseline for Epic; useful for
   CPU-side owner/partition batching and skewed write-set planning.
-- `queued` — **High Performance Transactions via Early Write Visibility**,
+- `reviewed` — **High Performance Transactions via Early Write Visibility**,
   Faleiro, Abadi, and Hellerstein, PVLDB 2017.
   URL: `https://www.vldb.org/pvldb/vol10/p613-faleiro.pdf`
   Why: deterministic transaction protocol cited by Epic; relevant to exposing
@@ -716,6 +716,13 @@ Append new candidates here as each paper is processed.
   Why: modern DBaaS resource-allocation paper cited by Resource-Adaptive Query
   Execution; relevant to pricing or value-of-memory admission policies for
   multi-tenant/session-heavy GPU DB workloads.
+- `queued` — **Centiman: Elastic, High Performance Optimistic Concurrency
+  Control by Watermarking**, Ding et al., SoCC 2015.
+  URL: `https://doi.org/10.1145/2806777.2806846`
+  Why: PWV contrasts against watermark-based OCC; relevant to timestamp
+  frontiers, elastic admission, and deciding whether GPU DB write batches
+  should expose commit/read watermarks instead of only per-transaction
+  validation.
 - `reviewed` — **Bonspiel: Low Tail Latency Transactions in
   Geo-Distributed Databases**, Cui et al., PVLDB 2025.
   URL: `https://www.vldb.org/pvldb/vol18/p3840-cui.pdf`
