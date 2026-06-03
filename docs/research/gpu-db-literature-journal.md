@@ -14947,3 +14947,180 @@ logical session counts or long retained readers.
 - Evaluate a bounded SSN-like dependency tracker only as a serializability
   experiment for CPU transactions first. Minimum proof: dependency metadata,
   abort reasons, and cleanup cost remain bounded under long retained reads.
+
+### 2026-06-03 - zicIO DB-OS prefetch for rapid ingestion
+
+**Citation:** Kyungmin Lim, Minseok Yoon, Kihwan Kim, Alan David Fekete, and
+Hyungsoo Jung. "Rapid Data Ingestion through DB-OS Co-design." Proceedings of
+the ACM on Management of Data 3(1), Article 68, SIGMOD 2025, pp. 1-28.
+doi:10.1145/3709718. Retrieved 2026-06-03 from the ACM SIGMOD table of
+contents and Seoul National University research page:
+`https://doi.org/10.1145/3709718`,
+`https://sigmodconf.hosting.acm.org/2025/toc-3-1.html`, and
+`https://gsds.snu.ac.kr/research-post/rapid-data-ingestion-through-db-os-co-design/`.
+Full PDF access was not available through the accessible sources in this run,
+so paper-section details not exposed by those primary/author pages are marked
+unknown.
+
+**Category:** multi-tier cache / data placement and runtime / DB-OS I/O
+coordination.
+
+**Relevance tags:** sequential ingestion; DB/OS co-design; full-device-speed
+prefetch; shared memory control plane; OS-issued storage requests; cache-bypass
+sharing; page-table sharing; COPY admission; cold-partition prefetch;
+over-resident execution.
+
+**Core idea:** zicIO targets the gap between two unsatisfying ingestion
+routes. Conventional DBMS/OS stacks preserve compatibility and caching, but
+spend substantial CPU time in data-access control. Direct or zero-copy bypass
+paths reduce those layers, but concurrent scans over the same table can fetch
+the same data repeatedly because they bypass the caching mechanisms that would
+normally share it.
+
+The design moves sequential access control into a DB-oriented OS component.
+The DBMS supplies precise timing information, and the OS-side component issues
+storage requests just before the DBMS needs the bytes. A sharing-enabled path
+then restores concurrent sharing at the OS level, so bypassed ingestion does
+not degenerate into redundant device traffic when multiple queries read the
+same data.
+
+For GPU DB, the transfer is not "put the OS in charge of database
+correctness." It is narrower: keep WAL, visibility, and resident generation
+ownership in the DBMS, but expose enough route timing to a storage/runtime
+service that cold partitions can be prefetched before GPU or CPU workers stall.
+The same split may apply to COPY admission: the mutation owner decides durable
+order and visibility, while a storage lane can stage sequential bytes and
+report backpressure without every request performing its own data-access
+bookkeeping.
+
+**Concrete mechanisms:**
+
+- zicIO is presented as a zero-interaction and copy I/O design for sequential
+  data ingestion.
+- The paper decomposes the design into UzicIO, a user-space library that
+  gathers precise DBMS timing information and predicts data needs; KzicIO, an
+  OS module that automates access control and directly issues storage-device
+  requests; and memSB, a small shared-memory area mapped into both the DBMS and
+  OS for coordination.
+- The OS-side module prepares data immediately before DBMS consumption, aiming
+  to hide or remove known I/O latency sources rather than making the DBMS
+  maintain a custom I/O stack.
+- The sharing-enabled variant, SKzicIO, addresses concurrent bypass scans by
+  sharing data at the OS level through dynamic page-table manipulation.
+- The reported implementation was integrated with four databases according to
+  the ACM abstract, while the SNU page specifically says three database engines
+  were evaluated with and without zicIO under standard data warehouse workloads
+  plus microbenchmarks. The source discrepancy likely reflects wording or
+  scope differences between integration and evaluation; exact per-engine
+  details are unknown from accessible sources.
+- Reported evaluation claims include up to 9.95x improvement under TPC-H loads
+  and up to 16.31x improvement in sequential-ingestion microbenchmarks.
+- The accessible source does not expose exact device models, OS/kernel
+  changes, workload parameters, or tail-latency distributions.
+
+**GPU DB mapping:** zicIO fits P8's cold/warm/hot tier problem: when a resident
+GPU route misses, the system should not discover the need for cold bytes only
+after a GPU worker is already idle. A GPU DB storage lane could accept
+route-timing hints from the planner or runtime, prefetch cold partition ranges
+into host memory or pinned buffers, and publish readiness/fallback telemetry to
+GPU execution owners.
+
+For COPY, the design suggests separating control-plane timing from durability
+semantics. The COPY path can keep WAL-before-visibility and chunk-level
+commit-order reservation inside the mutation owner, while a lower storage lane
+stages sequential input, compressed blocks, or cold checkpoint pages. The
+contract should be explicit: storage may prefetch, share, and throttle bytes;
+only the DBMS publishes visibility and invalidates resident generations.
+
+SKzicIO's page-table sharing is especially relevant to over-resident reads.
+If two logical sessions ask for overlapping cold partitions, bypassing the
+buffer pool should not force duplicate NVMe reads or duplicate host-pinned
+copies. GPU DB needs a shared cold-partition inflight table keyed by relation,
+partition, source generation, byte range, and consumer class. Completion should
+fan out to waiting CPU/GPU route work, with admission telemetry showing whether
+the request joined an inflight prefetch or issued a new device read.
+
+The UzicIO/KzicIO/memSB split also maps to the runtime owner model. Instead of
+letting every query worker call into storage directly, network/read/GPU owners
+could publish small timing descriptors into bounded shared rings. A storage
+owner consumes those descriptors, schedules prefetch, and writes completion or
+pressure signals back. That keeps the hot path measurable and avoids turning
+custom I/O into another unbounded side channel.
+
+**Risks and mismatches:** The paper targets sequential data warehouse
+ingestion, not OLTP mutation correctness, MVCC visibility, PostgreSQL protocol
+latency, or GPU kernel scheduling. Its best evidence is for TPC-H-style and
+sequential-ingestion workloads, so the design may not help short point
+lookups, write-heavy transactions, or highly random cold-partition access.
+
+Moving access control into an OS module increases deployment and debugging
+surface area. GPU DB should not adopt kernel changes before proving the same
+contract with a user-space storage owner, `io_uring`, direct I/O, or SPDK-like
+lane. Page-table manipulation may also conflict with pinned buffers, GPU DMA,
+NUMA placement, container isolation, or future CXL memory tiers.
+
+The accessible sources do not reveal failure-handling details: cancellation,
+prefetch misprediction, partial I/O, security boundaries, fsync/durability
+interaction, or crash recovery. Those must be treated as unknown, not assumed
+safe. For GPU DB, any prefetch layer must remain acceleration state; WAL,
+checkpoint, archive, and MVCC replay remain the recovery truth.
+
+**Benchmark candidates:**
+
+- Build a user-space cold-partition prefetch lane before any kernel work:
+  planner/runtime submits `(relation, partition, generation, byte_range,
+  deadline)` descriptors; GPU/CPU readers either join inflight work, consume a
+  ready buffer, or record a precise fallback reason. Gate: no duplicate read
+  for concurrent identical cold ranges unless generation differs.
+- Add COPY ingestion phase telemetry for input staging separately from WAL
+  reservation, WAL flush, visibility publish, and residency invalidation.
+  Failure condition: a rows/sec claim improves only by hiding durability or
+  visibility work inside "I/O".
+- Compare three cold-read paths under overlapping analytical scans: normal
+  buffered read, direct I/O with no sharing, and shared inflight prefetch.
+  Required metrics: device bytes, host bytes copied, pinned-buffer residency,
+  p50/p95 route latency, and duplicate-read count.
+- Test prefetch timing hints for over-resident GPU scans: issue prefetch at
+  planning time, queue-drain time, and kernel-ready time. Expected result:
+  earlier hints reduce GPU idle time only if misprediction and eviction costs
+  stay bounded.
+- Add a page-sharing compatibility probe before considering page-table tricks:
+  measure whether pinned host buffers, CUDA registration, NUMA binding, and
+  memory-pressure eviction preserve correctness and do not explode tail
+  latency.
+- Expose storage-lane backpressure as route reasons:
+  `prefetch_joined_inflight`, `prefetch_ready`, `prefetch_miss`,
+  `prefetch_cancelled`, `prefetch_budget_rejected`, and
+  `prefetch_generation_mismatch`.
+
+### 2026-06-03 - Cross-paper synthesis: I/O lanes need ownership contracts
+
+Recent storage and mixed-workload papers converge on a sharper tiering rule:
+fast I/O is not a property of the device alone. DANA and the modern NVMe work
+argue for high-parallelism storage lanes; Bf-Tree argues that cache objects
+should have tier-specific granularity; ERMIA argues that visibility and
+version lifetime must be published through durable/logical fronts; zicIO adds
+that the DBMS should expose timing to lower I/O services without surrendering
+semantic ownership.
+
+The promising design track is an explicit storage-lane owner contract. GPU DB
+should keep mutation order, WAL-before-visibility, MVCC generation, and
+resident invalidation in database-owned domains. Separate storage lanes may
+prefetch, share inflight cold reads, stage sequential bytes, and report device
+pressure, but they must key every action by relation, partition, generation,
+and consumer class. That makes the lane fast without letting it invent
+visibility.
+
+The main category gap is still end-to-end admission at very high logical
+session counts. Runtime papers show how to multiplex and schedule; storage
+papers show how to keep devices busy; MVCC papers show how to preserve
+snapshots. The missing bridge is a benchmark where 1K-1M logical sessions
+compete for a few owner domains, shared cold-prefetch lanes, and GPU execution
+queues while every fallback is named.
+
+Priority benchmark track: implement shared cold-partition inflight accounting
+before kernel-bypass storage. Measure duplicate device reads, GPU idle time,
+queue wait, snapshot-generation mismatch, and prefetch pollution. A useful
+first proof is not raw maximum throughput; it is showing that concurrent
+sessions with overlapping cold ranges produce one storage action, many
+well-routed consumers, and no visibility or resident-generation ambiguity.

@@ -1184,7 +1184,7 @@ Append new candidates here as each paper is processed.
   saturate 400G/800G NICs or PCIe Gen5 SSD arrays within realistic CPU budgets;
   useful for deciding when GPU DB should move from epoll/io_uring proofs toward
   kernel-bypass network or storage experiments.
-- `queued` — **Rapid Data Ingestion through DB-OS Co-design**, Lim et al.,
+- `reviewed` — **Rapid Data Ingestion through DB-OS Co-design**, Lim et al.,
   PACMMOD/SIGMOD 2025.
   URL: `https://doi.org/10.1145/3709718`
   Why: DB/OS prefetch and shared-memory coordination design for high-rate
@@ -1207,6 +1207,13 @@ Append new candidates here as each paper is processed.
   context; useful for deciding which background commit, scheduling, and I/O
   overlap techniques still matter before adopting fully autonomous WAL
   publication.
+- `queued` — **Snap: a Microkernel Approach to Host Networking**, Marty et
+  al., SOSP 2019.
+  URL: `https://doi.org/10.1145/3341301.3359657`
+  Why: zicIO's DB/OS co-design references user-space OS services that preserve
+  isolation while moving fast-path work out of monolithic kernels; useful for
+  future pgwire/network-service split, runtime ownership, and upgradeable
+  datapath boundaries.
 - `reviewed` — **Your Read is Our Priority in Flash Storage**, An et al.,
   PVLDB 2022.
   URL: `https://www.vldb.org/pvldb/vol15/p1911-lee.pdf`
