@@ -9620,3 +9620,155 @@ shape, not absolute capacity targets.
 - Test version-chain prefetch or jump-pointer metadata for hot updated
   keys before GPU encoding. Failure condition: extra metadata slows the
   common short-chain path more than it helps long-chain retained reads.
+
+### 2026-06-03 - BOHM serializable multiversion ordering
+
+**Citation:** Jose M. Faleiro and Daniel J. Abadi. "Rethinking
+Serializable Multiversion Concurrency Control." PVLDB 8(11), 2015,
+pp. 1190-1201. Retrieved 2026-06-03 from
+`https://www.cs.umd.edu/~abadi/papers/rethink-mvcc.pdf`.
+
+**Category:** MVCC / snapshot / visibility.
+
+**Relevance tags:** serializable MVCC; deterministic transaction
+ordering; write-set planning; version placeholders; read/write
+decoupling; global timestamp avoidance; batch barriers; RCU garbage
+collection; owner partitioning.
+
+**Core idea:** BOHM starts from the observation that serializable MVCC
+systems often lose the concurrency advantage of multiple versions
+because they track reads in shared metadata, validate reads late, or
+assign timestamps through contended global counters. Its response is to
+separate serialization/version management from transaction execution.
+Transactions are first placed in a total order, version placeholders are
+created for all declared writes, and only then do execution threads run
+transaction logic and fill the prepared versions.
+
+The important distinction from snapshot isolation or optimistic MVCC is
+that BOHM is pessimistic without making reads block writes. Reads do not
+write bookkeeping into shared record metadata and do not validate at
+commit. A read either follows the version chain to the version whose
+interval contains the transaction timestamp, or, when read sets are known
+early, uses a precomputed pointer to that version. Writes can delay reads
+when the chosen version's data has not yet been produced, but reads do
+not delay writes.
+
+**Concrete mechanisms:**
+
+- A single input thread appends complete transactions to an in-memory log.
+  A transaction's log position is its timestamp, avoiding per-transaction
+  atomic fetch-and-increment on a shared timestamp counter.
+- Concurrency-control threads own logical partitions of records. For each
+  transaction batch, each thread scans write sets and creates placeholder
+  versions only for records in its partition.
+- A version contains begin timestamp, end timestamp, transaction pointer,
+  data, and previous-version pointer. Placeholder insertion sets begin to
+  the writer timestamp, end to infinity, the transaction pointer to the
+  writer, data uninitialized, and the previous version's end to the new
+  timestamp.
+- Each record is always handled by the same concurrency-control thread, so
+  hot-record version chains are updated by one owner rather than by many
+  contending writers.
+- If read sets are available, the concurrency-control phase can annotate a
+  transaction with direct pointers to the correct versions to read. This
+  does not track reads in database records; it writes into preallocated
+  transaction-local space.
+- Coordination is amortized at batch granularity. Concurrency-control
+  threads process an ordered batch independently and synchronize at one
+  barrier before execution threads consume that batch.
+- Execution threads receive an ordered batch and partition responsibility
+  by transaction index. A transaction moves through unprocessed,
+  executing, and complete states. If a read needs an unfilled version, the
+  worker may recursively execute the producer transaction or retry later.
+- Write-write conflicts are resolved by the precreated version order. A
+  later write can fill its own version before an earlier write unless it
+  has a read dependency on the earlier version.
+- Optional garbage collection uses a batch low-watermark. Once every
+  execution thread has completed the batch that invalidated an older
+  version, that version cannot be visible to future batches and can be
+  reclaimed or archived with an RCU-like scheme.
+- The evaluation reports nearly 2 million 10-RMW YCSB transactions per
+  second, about 20 million record accesses per second, in a concurrency
+  control stress test; BOHM also avoids the low-contention global
+  timestamp bottleneck seen in the paper's Hekaton and SI baselines and
+  performs well when long read-only transactions coexist with updates.
+
+**GPU DB mapping:** BOHM is a strong fit for GPU DB's owner-domain
+architecture when a transaction or mutation batch has known write sets.
+COPY chunks, stored-procedure-like write templates, partition-local
+updates, refresh publication, and deterministic resident invalidation can
+all be admitted as complete units, assigned an owner-local order, and
+have visibility/version placeholders prepared before expensive CPU or GPU
+execution starts.
+
+The largest transferable idea is placeholder-first publication inside
+the mutation owner. A mutation batch can allocate row/version slots,
+index-delta slots, invalidation records, and response handles in a
+deterministic order before it performs value materialization or GPU-
+assisted work. Later stages fill those slots, but the serialization
+boundary is already known. That reduces the temptation to protect every
+read or write with fine-grained shared metadata.
+
+BOHM also reinforces the need to avoid a single global timestamp path.
+GPU DB should prefer per-owner or per-batch generation ranges that can be
+merged into a global visibility boundary only at publish points. A
+network IO worker or GPU execution worker should never be the authority
+that hands out visibility timestamps through a contended atomic counter.
+
+The read-set pointer optimization maps to retained read snapshots. For a
+known query template, the planner or snapshot publisher can pre-resolve
+stable handles: relation generation, partition generation, selected
+column buffers, resident key vectors, and visibility boundary. Reads then
+consume immutable handles rather than writing read-tracking metadata into
+hot mutation structures.
+
+BOHM's batch low-watermark is also useful for snapshot retirement.
+Instead of one global oldest-reader value that every component updates,
+GPU DB can track per-execution-class progress: mutation batches, retained
+GPU reads, refresh batches, and long analytical snapshots. Versions,
+tombstones, invalidated resident generations, and response buffers become
+reclaimable only after the relevant class watermarks pass the batch that
+made them obsolete.
+
+**Risks and mismatches:** BOHM requires whole transactions and deducible
+write sets before execution. General SQL sessions, cursor-style
+transactions, ad hoc multi-statement workflows, and data-dependent writes
+do not naturally satisfy that requirement. The paper mentions
+speculative write-set prediction from prior work, but the BOHM mechanism
+itself depends on correct planning.
+
+The design is CPU in-memory OLTP, not GPU execution, pgwire session
+multiplexing, WAL recovery, or tiered storage. Its placeholder versions
+are not a license to expose uncommitted data externally. GPU DB must still
+preserve WAL-before-visibility, replay correctness, catalog invalidation,
+resident snapshot validity, and SQL error semantics.
+
+The single input log and batch barrier simplify ordering but may become a
+latency or admission bottleneck if used too broadly. GPU DB should treat
+BOHM-like ordering as a class-specific fast path for compatible mutation
+templates, not as the only path for all SQL.
+
+**Benchmark candidates:**
+
+- Prototype a placeholder-first mutation batch for one narrow write
+  template. Allocate version/index/invalidation slots in owner order, fill
+  them later, and publish visibility only after WAL safety. Gate:
+  identical committed state and WAL replay versus the existing path.
+- Compare global transaction id allocation with per-owner batch generation
+  ranges for COPY admission. Required metrics: timestamp/allocation wait,
+  WAL queue wait, visibility publish latency, and replay determinism.
+- Add a known-read-set retained route proof that pre-resolves snapshot
+  handles and avoids mutation-owner read tracking. Failure condition: any
+  read result changes under insert/update/delete or resident invalidation.
+- Build a long-read plus write-batch GC test using per-class watermarks.
+  Gate: obsolete versions and invalidated resident generations are retired
+  without making fresh write latency grow linearly with long snapshot age.
+- Measure batch-barrier sensitivity for mutation admission: batch size,
+  microsecond ceiling, owner partition count, and hot-key skew. Failure
+  condition: throughput improves only by unacceptable p50/p99 latency.
+- Add a "write set not known" negative-control benchmark. Expected
+  behavior: BOHM-style path rejects or falls back cleanly instead of
+  guessing and weakening serializable or WAL semantics.
+- For GPU-assisted deterministic updates, test whether CPU owner ordering
+  plus GPU value computation can fill precreated version slots faster than
+  CPU-only execution while preserving exactly the same publish boundary.

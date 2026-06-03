@@ -344,7 +344,7 @@ Append new candidates here as each paper is processed.
   Why: virtual-memory rewiring precursor to AnKerDB; useful for judging
   whether VM-assisted host snapshots or page remapping can support
   column-granular CPU/GPU snapshot publication without a patched kernel.
-- `queued` — **Rethinking Serializable Multiversion Concurrency Control**,
+- `reviewed` — **Rethinking Serializable Multiversion Concurrency Control**,
   Faleiro and Abadi, PVLDB 2015.
   URL: `https://www.cs.umd.edu/~abadi/papers/rethink-mvcc.pdf`
   Why: BOHM decouples serialization/version management from transaction
@@ -958,3 +958,10 @@ Append new candidates here as each paper is processed.
   Why: dynamic timestamp baseline discussed by Rebirth-Retire; useful for
   deciding whether GPU DB should allocate commit/order ranges per owner or
   transaction class rather than relying on a single global timestamp path.
+- `queued` — **QueCC: A Queue-oriented, Control-free Concurrency
+  Architecture**, Qadah and Sadoghi, Middleware 2018.
+  URL: `https://doi.org/10.1145/3274808.3274810`
+  PDF: `https://expolab.org/papers/quecc.pdf`
+  Why: BOHM-adjacent deterministic two-phase planning/execution design for
+  many-core transaction processing; useful for comparing queue-oriented
+  planning against owner-local placeholder-first MVCC batches.
