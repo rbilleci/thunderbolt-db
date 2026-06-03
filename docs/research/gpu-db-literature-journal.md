@@ -9076,3 +9076,163 @@ misses or useful compute to overlap.
   validation around any GPU write-back cache. Gate: GPU dirty blocks cannot be
   externally visible or durable-authoritative without WAL, replay metadata, and
   crash recovery proof.
+
+### 2026-06-03 - ParamTree learned cost-model calibration
+
+**Citation:** Jiani Yang, Sai Wu, Dongxiang Zhang, Jian Dai, Feifei Li, and
+Gang Chen. "Rethinking Learned Cost Models: Why Start from Scratch?" Proc. ACM
+Manag. Data 1(4), Article 255, SIGMOD 2023. doi:10.1145/3626769. Retrieved
+2026-06-03 from `https://15799.courses.cs.cmu.edu/spring2025/papers/15-learned/yang-sigmod2023.pdf`;
+metadata cross-checked through DBLP and DOI.
+
+**Category:** Query optimization / planning.
+
+**Relevance tags:** learned cost model; formula-based optimizer calibration;
+hardware-aware route costing; dynamic workload refinement; explainable
+planning; online tuning; transferability; CPU/GPU route choice; fallback cost;
+benchmark Q-error caveat.
+
+**Core idea:** The paper argues against replacing a conventional optimizer
+cost model with a fully learned black box when the existing formulas already
+encode useful system knowledge. ParamTree keeps the DBMS formula templates and
+learns the hidden hyperparameters inside those formulas for each hardware,
+software, data, and workload context.
+
+The practical shift is from "learn query plan to latency from scratch" to
+"learn which formula parameters should change in this environment." That makes
+the model lighter, easier to transfer, and more explainable because the final
+cost is still produced by named optimizer terms such as tuple CPU cost, operator
+CPU cost, index tuple cost, sequential page cost, and random page cost.
+
+**Concrete mechanisms and findings:**
+
+- The authors separate parameters into R-params, the tunable weights inside a
+  formula-based cost model, and C-params, the context variables that influence
+  those weights.
+- Static C-params include hardware, OS, storage, DBMS, and restart-required
+  configuration choices. Dynamic C-params include physical operator type, query
+  structure, data type, index correlation, column position, work memory, temp
+  buffers, and other runtime-sensitive configuration values.
+- ParamTree builds one decision tree per physical operator. Each leaf owns a
+  subspace of C-params and a regression-derived set of R-params for that
+  operator's cost formula.
+- Because explicit labels for the correct R-params are unavailable, the tree
+  uses observed query runtime and vectorized cost-formula terms. Leaf R-params
+  are fitted by least squares against observed execution cost.
+- Node splitting uses parameter-instability tests to find C-params whose
+  changes make the fitted R-params unstable. Numeric parameters use a supLM
+  style test; categorical parameters use a chi-square style test.
+- Offline training builds initial trees from diverse hardware/software
+  configurations. Online refinement maintains a buffer of poorly estimated
+  queries and expands the relevant leaf when enough queries exceed an error
+  threshold.
+- Online expansion ranks candidate dynamic C-params using a few-shot response
+  surface model and Sobol-style sensitivity analysis, then generates targeted
+  samples from query templates rather than sampling blindly from the whole query
+  space.
+- For costing a physical plan, ParamTree recursively obtains operator-specific
+  R-params from the relevant tree and fills the native formula with plan
+  statistics, preserving the optimizer's existing plan-cost structure.
+- The evaluation uses PostgreSQL 13.3 by default, 20 varied cloud instances for
+  generalization, IMDB/JOB, TPC-H, and TPC-DS workloads, with parallel
+  execution disabled for stability.
+- With exact cardinalities, ParamTree reports median Q-error below 1.11 on
+  IMDB job-light and 1.15 on IMDB scale; with DeepDB cardinality estimates, it
+  still outperforms the compared learned cost predictors in the reported setup.
+- Operator-level results show large median absolute error reductions for
+  operators such as Sort, Aggregate, HashJoin, IndexScan, and IndexOnlyScan
+  compared with the tuned PostgreSQL cost model.
+- ParamTree's transfer experiments report better Q-error than scaled/tuned
+  PostgreSQL and a zero-shot learned model across four held-out cloud machines.
+  It also transfers across multiple databases with reported Q-error below 1.92.
+- Online refinement reaches strong accuracy with relatively few samples in the
+  dynamic query experiment: the paper reports mean Q-error 1.26 after 350
+  generated samples for the exact-cardinality case.
+- Training overhead is much smaller than the tested neural plan encoders in the
+  paper's setup: ParamTree training is reported at about 272 seconds versus
+  1249 seconds for TCNN and much higher for E2E/QueryFormer.
+- Inference overhead is intended to be small because each tree has controlled
+  height, reported below 10 nodes, and the output still feeds simple formulas.
+
+**GPU DB mapping:** ParamTree maps well to the planner-cost contract for GPU DB
+because the engine should not hide route choice behind an opaque learned
+planner. The first GPU route model can stay formula-based and expose terms for
+CPU tuple/index cost, GPU launch cost, H2D/D2H bytes, resident snapshot
+validity, cold-block fetch cost, decompression cost, result scattering, queue
+wait, fallback penalty, and invalidation risk. A ParamTree-style layer can then
+calibrate the weights for those terms by hardware and workload.
+
+The useful adaptation is per-route, per-operator calibration. A retained point
+lookup, resident aggregate, cold over-resident scan, CPU fallback, and
+GPU-assisted join should each have its own parameter tree or bounded
+calibration table. Their C-params should include GPU model, HBM capacity,
+PCIe/NVLink bandwidth, CUDA stream policy, pinned-buffer budget, resident
+generation age, queue depth, batch size, result row count, transfer bytes,
+encoding family, table/partition hotness, and snapshot invalidation frequency.
+
+ParamTree also fits the owner-domain model. The planner can ask a route-cost
+service for calibrated R-params, but the route service should publish immutable
+calibration snapshots rather than mutate planning state in the middle of a
+query. New observations from completed queries can flow into an online
+refinement buffer owned by a planning/calibration worker. When the worker
+expands or updates a calibration tree, it publishes a new generation with
+telemetry and rollback ability.
+
+For session concurrency, the paper's online-buffer trigger suggests a
+low-noise way to improve route choice without per-request learning overhead.
+Only outlier route predictions should enter a bounded refinement buffer.
+Admission should continue to use the current calibration generation until a new
+one is published. This prevents 1M logical sessions from paying model-training
+or lock contention in the hot path.
+
+The cost model should optimize route decisions, not just latency prediction.
+GPU DB should measure whether calibrated costs pick better CPU/GPU/fallback
+routes under load, stale residency, and tier pressure. A low Q-error model that
+still admits the wrong GPU route when a snapshot is invalid or a queue is
+saturated is not useful.
+
+**Risks and mismatches:** The paper is about CPU DBMS cost estimation, not GPU
+execution, MVCC, WAL ordering, or high-concurrency protocol serving. It assumes
+physical plans and operator formulas already exist; GPU DB still needs the
+first formula terms for route validity, residency, queueing, and transfer cost.
+It also evaluates cost-estimation accuracy, mostly through Q-error, rather than
+end-to-end optimizer regret or tail latency under admission pressure.
+
+ParamTree's online refinement requires executing generated sample queries. That
+can be expensive or disruptive in a production GPU DB, especially when samples
+touch cold tiers or consume scarce HBM. Sampling must be isolated, rate-limited,
+or restricted to benchmark/control-plane windows. Exact-cardinality results
+are not production-realistic unless the engine invests in statistics and
+cardinality estimation; bad cardinality can still dominate route mistakes.
+
+The tree can explain which C-params matter, but it does not automatically
+enforce database invariants. Route calibration must be downstream of hard
+validity checks: WAL boundary, snapshot generation, resident layout identity,
+memory budget, and queue capacity. A learned or calibrated low cost must never
+override a failed validity proof.
+
+**Benchmark candidates:**
+
+- Build a formula-based CPU/GPU route model with explicit terms for launch
+  cost, transfer bytes, resident validity, queue wait, result scattering,
+  cold-block fetch, and CPU fallback. Gate: every term is logged per route
+  decision and can be replayed against observed latency.
+- Add a ParamTree-style offline calibration experiment using synthetic retained
+  lookup, aggregate, and cold-scan templates across batch sizes and residency
+  states. Compare default weights, manually tuned weights, and learned
+  per-route weights.
+- Measure route-choice regret, not only Q-error: for each query template, run
+  CPU, GPU resident, GPU cold-transfer, and fallback routes when legal, then
+  score whether the calibrated planner chose the lowest-latency legal route.
+- Add an online refinement buffer for bad route predictions in the benchmark
+  harness. Gate: refinement is bounded, off the hot path, generationed, and
+  never changes the route choice for already admitted queries.
+- Include invalidation and queue-pressure C-params. Failure condition: the
+  calibrated model admits GPU work to a stale resident generation or saturated
+  queue because predicted compute time is low.
+- Compare template-based sampling against random route sampling. Required
+  result: fewer samples to calibrate the retained lookup and aggregate lanes
+  without overfitting one data distribution.
+- Track whether better prediction improves p95/p99 latency and rejection
+  correctness under mixed session load. A model that lowers Q-error but
+  increases overload, fallback churn, or p99 route wait should be rejected.

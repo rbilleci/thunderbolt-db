@@ -145,9 +145,10 @@ mechanical sympathy, multi-tier cache/data placement, or query optimization.
   URL: `https://www.vldb.org/pvldb/vol16/p3515-anneser.pdf`
   Why: learned tuning of optimizer knobs for existing SQL systems; relevant to
   GPU route knobs and fallback decisions.
-- `queued` — **Rethinking Learned Cost Models: Why Start from Scratch?**,
+- `reviewed` — **Rethinking Learned Cost Models: Why Start from Scratch?**,
   SIGMOD 2023.
   URL: `https://15799.courses.cs.cmu.edu/spring2025/papers/15-learned/yang-sigmod2023.pdf`
+  DOI: `https://doi.org/10.1145/3626769`
   Why: learned cost-model calibration rather than full replacement; useful for
   CPU/GPU route estimation.
 - `reviewed` — **Robust Plan Evaluation based on Approximate Probabilistic
@@ -890,6 +891,24 @@ Append new candidates here as each paper is processed.
   Why: JOB is the workload foundation used by Hint-QPT/PARQO to expose
   selectivity-estimation failures; useful as a 2015-present baseline for
   testing CPU/GPU route-choice fragility under join and selectivity errors.
+- `queued` — **Zero-Shot Cost Models for Out-of-the-box Learned Cost
+  Prediction**, Hilprecht and Binnig, PVLDB 2022.
+  URL: `https://www.vldb.org/pvldb/vol15/p2361-hilprecht.pdf`
+  Why: ParamTree compares against zero-shot transfer; useful for deciding
+  whether GPU DB route-cost calibration should pretrain across databases or
+  stay close to formula-based, per-route parameter tuning.
+- `queued` — **Cost Models for Big Data Query Processing: Learning,
+  Retrofitting, and Our Findings**, Siddiqui et al., SIGMOD 2020.
+  URL: `https://doi.org/10.1145/3318464.3380584`
+  Why: ParamTree cites retrofitting learned cost models into existing
+  optimizers; relevant to calibrating GPU scan, transfer, and fallback costs
+  without replacing the native planner contract.
+- `queued` — **How Good are Learned Cost Models, Really? Insights from Query
+  Optimization Tasks**, Woltmann et al., SIGMOD 2025.
+  URL: `https://doi.org/10.1145/3725309`
+  Why: modern learned-cost-model evaluation directly tests whether better
+  prediction improves optimizer outcomes; useful for GPU DB route-choice
+  benchmarks that must optimize latency, not only Q-error.
 - `queued` — **Transparent Memory Offloading in Datacenters**, Weiner et al.,
   ASPLOS 2022.
   URL: `https://doi.org/10.1145/3503222.3507761`
