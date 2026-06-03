@@ -5291,3 +5291,219 @@ waste residency bandwidth if invalidation or cold companion keys dominate.
 - Test SQL/planner-derived group metadata against runtime level inference
   for a small set of templates. Required output: scoring overhead,
   grouping accuracy, route-hit improvement, and fallback explanations.
+
+### 2026-06-03 - Themis GPU relational pipeline load balancing
+
+**Citation:** Kijae Hong, Kyoungmin Kim, Young-Koo Lee, Yang-Sae
+Moon, Sourav S. Bhowmick, and Wook-Shin Han. "Themis: A
+GPU-accelerated Relational Query Execution Engine." PVLDB 18(2),
+2024, pp. 426-438. doi:10.14778/3705829.3705856. Retrieved
+2026-06-03 from `https://www.vldb.org/pvldb/vol18/p426-han.pdf`.
+
+**Category:** GPU execution / analytics, with runtime load balancing.
+
+**Relevance tags:** fused GPU pipelines; skewed joins; warp load
+balance; intra-warp idle ratio; inter-warp load imbalance; lazy
+materialization; adaptive work sharing; GMEM contention; retained
+route batching; skew benchmarks.
+
+**Core idea:** Themis targets a specific failure mode of GPU
+relational execution: fused tuple-at-a-time pipelines can still
+underuse the GPU badly when joins, filters, or aggregations produce
+non-uniform work per input tuple. Even if the input scan is evenly
+partitioned, downstream operators create intra-warp idle lanes and
+inter-warp stragglers. Prior systems rebalance with fixed thresholds
+or shared global-memory buffers, but those either choose the wrong
+granularity for some workloads or add heavy synchronization and
+memory traffic.
+
+The paper reframes one GPU query pipeline as traversal of an
+evaluation tree. Each tree node is an input tuple to one operator,
+and child nodes are that operator's outputs. This gives Themis a
+fine-grained way to decide which nodes a warp should visit next and
+which subtrees should be transferred from a busy warp to an idle
+warp. On skewed JCC-H queries, the paper reports that Themis
+substantially reduces both intra-warp and inter-warp imbalance and
+outperforms the strongest baseline by up to 379x.
+
+**Concrete mechanisms:**
+
+- Themis represents pipeline execution as an evaluation tree whose
+  levels correspond to pipeline operators. Visiting a node means
+  evaluating the operator at that level for one tuple or offset range.
+- Instead of materializing full intermediate tuples, operators produce
+  compact offset ranges over table arrays. Attribute values are loaded
+  only when a later predicate, aggregation key, or materialization step
+  needs them.
+- No-imbalance-first-search (NIFS) chooses the highest operator level
+  that has at least one full warp of work. If no level has a full warp,
+  it chooses the lowest non-empty level. The paper argues this creates
+  only the unavoidable final partial warp per level, like breadth-first
+  traversal, while using fixed per-warp memory.
+- NIFS stores per-level queues of offset ranges in registers. The memory
+  bound is constant in query output size: at most `2 * (k - 1) * wSize`
+  offset ranges for a pipeline of `k` operators.
+- Adaptive work sharing (AWS) handles inter-warp imbalance. A warp
+  periodically estimates whether it is the busiest warp, and if so,
+  transfers about half of its highest remaining subtrees to an idle warp.
+- Workload size is approximated by the highest subtree height and the
+  number of subtrees at that height, with the count bucketed on a log
+  scale to reduce global tracking churn.
+- The redistribution check interval adapts to the number of idle warps:
+  when many warps are idle, busy warps check more frequently; when few
+  are idle, they check less often to avoid unnecessary overhead.
+- To avoid a single contended global queue, Themis uses a hierarchical
+  bitmap to find idle warps and a dedicated global-memory buffer per
+  warp. Busy warps atomically claim an idle warp, split offset ranges,
+  and write the donated work into that warp's buffer.
+- The paper uses two imbalance metrics that are directly portable:
+  intra-warp idle ratio (average idle lanes per warp iteration divided
+  by warp size) and inter-warp load imbalance factor (maximum warp
+  execution cycles divided by average warp execution cycles).
+- Evaluation uses JCC-H, a skewed TPC-H variant, at scale factor 30 on
+  an RTX 3090 with CUDA 11.4. Themis compares against DogQC++ and a
+  Pyper-style implementation, with ablations for NIFS and AWS.
+- For JCC-H queries expected to suffer inter-warp imbalance, Themis
+  reports up to 173x shorter execution than baselines or the no-AWS
+  variant. Average and maximum ILIF for Themis are reported as 1.8 and
+  4.4, while baselines in those categories show average ILIFs in the
+  hundreds.
+- For intra-warp imbalance, the no-AWS Themis variant has about 1%
+  average idle ratio across 22 JCC-H queries, while the strongest
+  baseline is reported at 14x higher and other baselines can approach
+  near-total lane idleness on some cases.
+- Lazy materialization reduces Themis query time by up to 38% in the
+  reported JCC-H experiments, especially when selections filter many
+  scanned tuples before later operators need attributes.
+
+**GPU DB mapping:** Themis is most relevant to retained GPU route
+execution once the engine moves beyond simple single-operator counts,
+filtered scalar aggregates, and point lookups. The current P8 design
+has partition-resident column groups and a future runtime with GPU
+execution owners. If retained route families add fused filters, joins,
+grouped lookups, or grouped aggregates, the scheduler needs to know
+whether a batch is actually keeping lanes and warps busy, not merely
+whether it launched one large kernel.
+
+The evaluation-tree abstraction maps to route templates. A retained
+GPU template could expose levels such as key gather, predicate filter,
+join/probe, projection, aggregation, and response scatter. Within a
+micro-batch, the GPU worker can track per-level work queues and choose
+whether to run immediate per-request kernels, a NIFS-like fused
+traversal, or a simpler vectorized path. This keeps the current
+correctness boundary intact: SQL visibility, WAL, and snapshot choice
+remain outside the kernel, while intra-kernel work scheduling improves
+only the execution of an already valid snapshot generation.
+
+Themis also supplies concrete telemetry missing from many GPU DB
+benchmarks. P8 measurements should report not just rows/sec and kernel
+time, but idle-lane ratio, straggler warp factor, redistribution count,
+GMEM buffer traffic, and whether skew is causing retained route latency
+tails. These counters can help distinguish "the GPU route is slow
+because data moved too much" from "the route is resident but divergent
+and imbalanced."
+
+Lazy materialization maps directly to resident column-group design.
+For filtered retained reads, the GPU route should carry row ordinals,
+offset ranges, or key-vector positions as long as possible, and only
+load projected columns or response bytes after predicates eliminate
+rows. This is especially important for text columns and wide rows,
+where eager per-row materialization would waste HBM bandwidth and
+response staging buffers.
+
+AWS is also a warning for micro-batching. A fixed micro-batch size,
+fixed join-output threshold, or fixed morsel size can be wrong under
+skew. GPU DB should use adaptive split points driven by observed
+output fanout, active warp count, queue wait, and idle-worker pressure.
+The equivalent at the runtime level is that GPU workers should not
+blindly group by request count; they should group by expected execution
+work and split skew-heavy subgroups when they create stragglers.
+
+**Risks and mismatches:** Themis is an analytical query execution
+paper, not an OLTP or MVCC system. It does not address WAL-before-
+visibility, transaction validation, snapshot publication, catalog
+invalidation, network response scheduling, or 1M logical session
+admission. Its strongest result comes from skewed TPC-H-style joins,
+not point transactions or write-heavy paths.
+
+The implementation assumes generated GPU kernels for relational
+pipelines and uses internal offset-range representations. GPU DB's
+current retained execution is narrower and may not need a full
+evaluation-tree scheduler until fused multi-operator routes exist.
+The AWS mechanisms also use global-memory metadata, atomics, and
+per-warp buffers; under small batches or latency-sensitive point
+lookups, this overhead may be larger than the imbalance it removes.
+
+The paper's public PDF is the PVLDB paper, while the references mention
+a fuller artifact through a Google Drive URL. This entry is based on
+the PVLDB paper and does not assume details from the separate full
+artifact beyond what the paper reports.
+
+**Benchmark candidates:**
+
+- Add GPU execution telemetry counters for retained routes:
+  intra-warp idle ratio, inter-warp load imbalance factor, per-level
+  active work, redistribution count, GMEM redistribution bytes, and
+  straggler kernel reason. Minimum gate: counters are zero or marked
+  unsupported for simple kernels rather than silently absent.
+- Build a skewed retained aggregate/join microbenchmark inspired by
+  JCC-H: one hot key generates many matches while most keys generate
+  few or none. Compare fixed input partitioning, fixed morsels, and an
+  adaptive work-sharing variant. Failure condition: p99 or ILIF grows
+  with skew while total rows/sec hides the straggler.
+- Prototype lazy projection for filtered resident reads: carry row
+  ordinals through predicate evaluation, then load projected int/text
+  columns only for survivors. Required measurements: HBM bytes read,
+  D2H bytes, kernel time, response encoding time, and correctness under
+  null/empty result cases.
+- For same-shape lookup micro-batches, test whether fixed batch size is
+  enough or whether batches need work-aware splitting by expected
+  fanout. Minimum proof: a hot-key batch does not block unrelated cold
+  lookup responses behind one straggler subgroup.
+- Add a negative-control latency benchmark where the batch is small and
+  uniform. Proof gate: any NIFS/AWS-like machinery must be bypassed or
+  show overhead below a configured microsecond budget.
+- Extend planner route metadata with a skew-risk flag derived from
+  statistics or previous telemetry. If skew risk is high, route choice
+  should prefer a load-balanced GPU kernel, CPU fallback, or smaller
+  GPU sub-batches depending on latency and residency state.
+- Compare eager materialization, lazy materialization, and partial
+  materialization for text-heavy resident routes. Failure condition:
+  eager materialization consumes HBM/D2H bandwidth for rows filtered
+  before projection.
+
+### 2026-06-03 - Cross-paper synthesis: placement and scheduling need request-shaped metrics
+
+Recent reviews since the batch-boundary synthesis add three missing
+axes to the runtime/storage target. NOMAD says movement between tiers
+should be transactional, non-exclusive when useful, and validated at
+publish time. DeToX says cache value should be measured by whether a
+whole request or transaction critical path is shortened, not whether a
+single object hit in cache. Themis says GPU execution quality should be
+measured by lane/warp work balance and skew, not just by resident bytes
+or launched kernels.
+
+The converging design track is request-shaped admission. A future GPU
+DB route should carry a compact descriptor that names the snapshot
+generation, required resident components, expected companion keys or
+partitions, estimated tier movement, skew/fanout risk, response shape,
+and latency budget. The residency owner can use that descriptor to
+decide whether to promote, query a lower tier directly, prefetch a
+companion generation, or reject. The GPU execution owner can use the
+same descriptor to decide whether fixed micro-batching is enough or
+whether the batch needs work-aware splitting.
+
+This also changes benchmark priorities. Object hit rate, resident byte
+hit rate, and kernel runtime are insufficient. The next benchmark
+bundle should include transactional route hit rate, aborted promotion
+rate, shadow/direct-lower-tier hit rate, intra-warp idle ratio,
+inter-warp imbalance factor, and p95/p99 request latency under skew
+and memory pressure. A policy that improves only one local metric while
+increasing end-to-end request latency should be treated as a failure.
+
+The remaining category gap is still optimizer integration for these
+runtime signals. The journal has PARQO/PAR2QO-style robust planning
+coverage, but it has not yet reviewed a paper that turns live execution
+feedback, skew, cache placement, and operator choice into a single
+route decision for heterogeneous CPU/GPU/tiered systems. That should
+shape one of the next queue selections.

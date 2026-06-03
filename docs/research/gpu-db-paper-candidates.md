@@ -231,9 +231,10 @@ Append new candidates here as each paper is processed.
   He and Yu, PVLDB 2011.
   URL: `https://www.vldb.org/pvldb/vol4/p314-he.pdf`
   Why: pre-2015; keep only as historical context.
-- `queued` — **Themis: A GPU-accelerated Relational Query Execution Engine**,
+- `reviewed` — **Themis: A GPU-accelerated Relational Query Execution Engine**,
   Hong et al., PVLDB 2024.
-  URL: `https://www.vldb.org/pvldb/vol18/p426-hong.pdf`
+  URL: `https://www.vldb.org/pvldb/vol18/p426-han.pdf`
+  DOI: `https://doi.org/10.14778/3705829.3705856`
   Why: modern GPU relational engine with execution and load-balancing details
   relevant to fused retained route design.
 - `queued` — **GPU Acceleration of SQL Analytics on Compressed Data**,
@@ -518,11 +519,26 @@ Append new candidates here as each paper is processed.
   URL: `https://doi.org/10.14778/3282495.3282502`
   PDF: `https://www.vldb.org/pvldb/vol12/p169-ding.pdf`
   Why: OCC batching and operation-reordering work; useful for deciding when
-    grouped write admission can safely reorder operation execution within a
-    deterministic commit boundary, when GPU DB write admission should batch
-    full transaction stages rather than only WAL, index, or GPU refresh
-    substeps, and when batch-level write-set ordering should be preferred over
-    per-request optimistic validation in hot partitions.
+  grouped write admission can safely reorder operation execution within a
+  deterministic commit boundary, when GPU DB write admission should batch
+  full transaction stages rather than only WAL, index, or GPU refresh
+  substeps, and when batch-level write-set ordering should be preferred over
+  per-request optimistic validation in hot partitions.
+- `queued` — **GPU Database Systems Characterization and Optimization**,
+  Cao et al., PVLDB 2023.
+  URL: `https://www.vldb.org/pvldb/vol17/p441-cao.pdf`
+  Why: Crystal-Opt follow-up discussed by Themis; useful for comparing
+  GPU primitive optimization against warp-level pipeline load balancing.
+- `queued` — **Improving Execution Efficiency of Just-in-Time Compilation
+  Based Query Processing on GPUs**, Paul et al., PVLDB 2020.
+  URL: `https://www.vldb.org/pvldb/vol14/p202-paul.pdf`
+  Why: Pyper baseline for Themis, with intra-warp shuffle and redistribution
+  mechanics relevant to retained GPU pipeline fusion.
+- `queued` — **Accelerating Multi-way Joins on the GPU**, Lai et al.,
+  VLDB Journal 2022.
+  URL: `https://doi.org/10.1007/s00778-021-00702-4`
+  Why: fixed-granularity work-sharing baseline for Themis; relevant to
+  multi-join skew, GMEM redistribution cost, and adaptive batching thresholds.
 - `queued` — **Multiversion Concurrency with Bounded Delay and Precise
   Garbage Collection**, Ben-David et al., SPAA 2019.
   URL: `https://doi.org/10.1145/3323165.3323185`
