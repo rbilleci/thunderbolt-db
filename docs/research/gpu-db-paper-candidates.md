@@ -410,7 +410,7 @@ Append new candidates here as each paper is processed.
   Why: modern listwise follow-up to Lero-style plan ranking; relevant to
   whether GPU DB route selection should rank candidate CPU/GPU/tiered plans as
   a set instead of pairwise comparisons only.
-- `queued` — **OLTP Through the Looking Glass 16 Years Later:
+- `reviewed` — **OLTP Through the Looking Glass 16 Years Later:
   Communication is the New Bottleneck**, Zhou et al., CIDR 2025.
   URL:
   `https://www.vldb.org/cidrdb/2025/oltp-through-the-looking-glass-16-years-later-communication-is-the-new-bottleneck.html`
@@ -447,7 +447,7 @@ Append new candidates here as each paper is processed.
   Tech report: `https://www.labs.hpe.com/techreports/2015/HPL-2015-37.pdf`
   Why: many-core OLTP and NVRAM-oriented storage architecture cited by TicToc;
   relevant to partition ownership, logging, NUMA locality, and future tiers.
-- `queued` — **Diva: Making MVCC Systems HTAP-Friendly**, Kim et al.,
+- `reviewed` — **Diva: Making MVCC Systems HTAP-Friendly**, Kim et al.,
   SIGMOD 2022.
   URL: `https://doi.org/10.1145/3514221.3526135`
   Why: vDriver successor cited by the LeanStore paper; relevant to precise
@@ -520,6 +520,12 @@ Append new candidates here as each paper is processed.
   URL: `https://www.usenix.org/conference/osdi24/presentation/xiang`
   Why: transactional page migration for tiered memory cited by vmcache^n;
   useful for comparing OS-assisted migration against explicit DBMS ownership.
+- `queued` — **Counting Is All You Need for Instant Tuple Discovery:
+  Enabling Real-Time HTAP in Standalone DBMSs**, Lim et al., PACMMOD 2025.
+  URL: `https://doi.org/10.1145/3769775`
+  Why: modern follow-up from the same HTAP/MVCC research ecosystem; tuple
+  discovery and incremental transformation may inform retained snapshot
+  refresh, generation directories, and row-to-column GPU resident builds.
 - `queued` — **Towards Buffer Management with Tiered Main Memory**, Hao et al.,
   PACMMOD/SIGMOD 2024.
   URL: `https://doi.org/10.1145/3639286`

@@ -17531,3 +17531,133 @@ version arrays for hot writes, MSC-style resident segment scoring for tier
 placement, and snapshot-retirement telemetry that proves retained reads do not
 pin cold or obsolete generations indefinitely. A design that wins only one of
 those gates is likely to move the bottleneck rather than remove it.
+
+### 2026-06-03 - Diva decoupled MVCC version index and data
+
+**Citation:** Jongbin Kim, Jaeseon Yu, Jaechan Ahn, Sooyong Kang, and
+Hyungsoo Jung. "Diva: Making MVCC Systems HTAP-Friendly." SIGMOD 2022,
+pp. 49-64. doi:10.1145/3514221.3526135. Retrieved 2026-06-03 from the
+ACM DOI metadata, Seoul National University publication page, DBLP/RISS
+metadata, and the related dissertation record,
+`https://doi.org/10.1145/3514221.3526135`.
+
+**Category:** MVCC / snapshot / visibility, with hybrid HTAP storage.
+
+**Relevance tags:** HTAP; MVCC; version searching; version garbage
+collection; long analytical readers; disk-based storage; PostgreSQL; MySQL;
+snapshot cleanup; version-index/data separation.
+
+**Core idea:** Diva attacks the long-reader problem from a different angle
+than LeanStore's graveyard and FatTuple design. The paper argues that
+disk-based MVCC systems often couple two concerns that should be managed
+independently: fast version search for analytical snapshots and prompt
+garbage collection of old versions. A unified version store can make scans
+walk too much history, while aggressive cleaning can destroy the metadata
+needed to find the right historical version.
+
+Diva's answer is "Decoupling Index from Version dAta": keep a compact version
+index physically separate from the larger historical version data, then tune
+each side with its own policy. The abstract names two concrete policies:
+provisional version indexing for version search, and time interval-based
+version garbage collection for version cleaning. Public metadata says the
+authors implemented Diva in PostgreSQL and MySQL and showed that those
+systems escaped the usual space-time tradeoff under mixed OLTP/OLAP
+workloads. Exact throughput numbers were not available from the accessible
+sources in this run; the ACM page was reachable only through DOI metadata and
+the full publisher page was blocked by Cloudflare.
+
+**Concrete mechanisms:**
+
+- Diva separates the version index from version data so analytical queries can
+  use search metadata without forcing all old row contents to stay on the hot
+  path.
+- Provisional version indexing is based on the observation, summarized in a
+  2024 HTAP survey, that data versions are continuous and visible only within
+  a sliding time window.
+- The same survey summarizes Diva's placement rule as co-locating a record and
+  its first old version in the main index while moving the rest of the old
+  versions into a separate version space.
+- This split lets scan-time version discovery and stale-version cleaning
+  progress at the same time instead of sharing one version-chain structure
+  with conflicting space and latency goals.
+- Time interval-based version garbage collection uses version visibility
+  intervals as the cleaning unit, so the cleaner can reason about when an old
+  version is no longer visible to relevant snapshots.
+- The related dissertation table of contents names "Upkeep of a
+  Rotation-free Interval Tree" and "Sift-Bind-Trim Version Cleaning" as Diva's
+  implementation components, suggesting an interval structure used to match
+  old versions with safe cleaning windows. The accessible sources did not
+  expose enough detail to describe the exact algorithms.
+- Diva was applied to full PostgreSQL and MySQL implementations, which matters
+  because it is not only a clean-slate MVCC design. The public abstract
+  emphasizes legacy disk-based MVCC systems.
+- The dissertation frames Diva as the most comprehensive redesign in a series
+  with vDriver and vWeaver. The sequence is useful context: the later design
+  moves from adding faster version navigation toward separating version-index
+  responsibilities from version-data responsibilities.
+- The reported evaluation uses hybrid transactional/analytical workloads, but
+  the accessible metadata does not reveal the exact benchmark mix, hardware,
+  or numeric deltas. Treat those claims as directional until the full PDF is
+  available.
+
+**GPU DB mapping:** Diva strengthens the emerging GPU DB rule that retained
+snapshots need their own metadata path. A GPU resident generation should not
+force the mutation owner, WAL replay path, or CPU tuple store to retain every
+old value in the same structure used for fresh OLTP lookups. The engine needs
+a small searchable visibility/index layer and a larger historical data layer
+that can be demoted, compacted, or rebuilt independently.
+
+For P8, provisional version indexing maps to a resident snapshot directory:
+the latest committed tuple or segment plus the first old version needed by
+nearby retained snapshots remain close to the main access path, while deeper
+history moves to an old-version side space. GPU kernels should not chase CPU
+MVCC chains. They should consume a compact generation map, a side delta map,
+or a prebuilt historical column slice selected by visibility interval.
+
+The time-interval GC idea maps directly to snapshot classes. Instead of one
+global "oldest snapshot" pin, the GPU DB can track intervals for short OLTP
+reads, retained GPU reads, refresh builds, and long analytical scans. The
+residency owner can then trim resident deltas or demote historical data when
+no active interval can see them, while keeping compact index metadata long
+enough to route long readers correctly.
+
+Diva also fits the costed-generation synthesis. Version index bytes and
+version data bytes should be measured separately. A snapshot generation might
+keep a tiny interval/index handle in host memory while evicting or compressing
+the corresponding historical payload. That is a better match for GPU HBM than
+treating every retained generation as an all-or-nothing resident copy.
+
+**Risks and mismatches:** The full paper PDF was not accessible from ACM in
+this run, so implementation details beyond the public abstract, metadata, and
+survey/dissertation summaries are marked as uncertain. Diva targets
+disk-based PostgreSQL/MySQL-style MVCC, not a WAL-backed GPU resident storage
+engine with explicit HBM/DRAM/NVMe tiers. Its public summaries focus on scan
+and garbage-collection tradeoffs, not serializable write conflict handling,
+GPU route choice, or 1M logical sessions. Co-locating the first old version in
+the main index may also be wrong for a columnar resident GPU layout if it
+inflates hot lookup metadata or complicates compact refresh.
+
+**Benchmark candidates:**
+
+- Split the prototype MVCC metadata into a small version-search directory and
+  a separate historical payload store. Gate: retained reads see identical
+  tuples while fresh OLTP lookup latency does not grow with deep history.
+- Add interval telemetry per snapshot class: short OLTP, retained GPU read,
+  long analytical scan, refresh build, recovery, and admin scan. Gate: GC
+  eligibility is computed from interval coverage rather than one global
+  oldest snapshot.
+- Test "first old version near main index, deeper versions side-spaced" for a
+  skewed update workload. Compare CPU lookup latency, refresh build bytes, and
+  retained-read p99 against a plain linked MVCC chain.
+- Build a GPU generation directory benchmark where kernels consume compact
+  visibility intervals and side delta offsets instead of pointer-chasing tuple
+  chains. Failure condition: directory lookup costs more than a CPU fallback
+  for point reads at realistic batch sizes.
+- Measure independent eviction of version index and version data. Keep the
+  compact historical index warm while demoting payloads to compressed host or
+  NVMe segments. Gate: long retained snapshots still route correctly and only
+  pay cold-tier reads when they actually need old payloads.
+- Add a cleaning stress test with one long analytical reader, many short
+  retained reads, and steady updates. Gate: fresh write throughput and fresh
+  lookup latency remain stable while old-version payload bytes are trimmed or
+  demoted promptly.
