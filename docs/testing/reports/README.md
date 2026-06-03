@@ -14,8 +14,12 @@ replication, benchmark, and fault-injection runs.
 - Top-level compatibility pointers or symlinks may be kept when older report,
   PR, or Discord links are likely to exist.
 
-The first migrated series is `series/p8-retained-concurrency/`, which owns the
-retained-route concurrency graph history and its generated CSV/SVG assets.
+Migrated series:
+
+- `series/p7-p8-residency-baselines/` owns the early GPU relational benchmark
+  and resident-cache baseline reports.
+- `series/p8-retained-concurrency/` owns the retained-route concurrency graph
+  history and its generated CSV/SVG assets.
 
 ## Naming
 
