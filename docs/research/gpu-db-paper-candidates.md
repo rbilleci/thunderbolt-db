@@ -347,7 +347,7 @@ Append new candidates here as each paper is processed.
   workload-informed selectivity-error models; useful for deciding when a
   fast GPU route is too fragile under uncertain cardinality, transfer, or
   queue-delay estimates.
-- `queued` — **LOGER: A Learned Optimizer towards Generating Efficient and
+- `reviewed` — **LOGER: A Learned Optimizer towards Generating Efficient and
   Robust Query Execution Plans**, Chen et al., PVLDB 2023.
   URL: `https://www.vldb.org/pvldb/vol16/p1777-gao.pdf`
   Why: combines learned optimizer search with DBMS operator restrictions and
@@ -697,3 +697,16 @@ Append new candidates here as each paper is processed.
   useful as a future contrast for timestamp-order validation, delayed write
   visibility, and commit coordination when durability/replication becomes a
   GPU DB architecture question.
+- `queued` — **Balsa: Learning a Query Optimizer Without Expert
+  Demonstrations**, Yang et al., SIGMOD 2022.
+  URL: `https://arxiv.org/abs/2201.01441`
+  PDF: `https://zongheng.me/pubs/balsa-sigmod2022.pdf`
+  Why: LOGER compares against Balsa's simulator-bootstrapped DRL optimizer;
+  useful for deciding whether GPU DB route learning can bootstrap from
+  simulation when benchmark execution is expensive or hardware is changing.
+- `queued` — **Is Your Learned Query Optimizer Behaving As You Expect? A
+  Machine Learning Perspective**, Lehmann et al., PVLDB 2024.
+  URL: `https://www.vldb.org/pvldb/vol17/p1565-lehmann.pdf`
+  Why: modern learned-optimizer diagnostic work; useful after LOGER/PARQO
+  coverage to keep learned GPU route suggestions explainable, bounded, and
+  testable instead of treating model output as an opaque planner authority.

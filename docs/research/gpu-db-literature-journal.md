@@ -5861,3 +5861,180 @@ attempts or switch to an ordered hot-key path.
   memory, and age of speculative executions. Proof gate: bounded memory
   and an explicit fallback to abort/retry or ordered execution under
   pathological skew.
+
+### 2026-06-03 - LOGER restricted learned query optimization
+
+**Citation:** Tianyi Chen, Jun Gao, Hedui Chen, and Yaofeng Tu.
+"LOGER: A Learned Optimizer towards Generating Efficient and Robust
+Query Execution Plans." PVLDB 16(7), 2023, pp. 1777-1789.
+doi:10.14778/3587136.3587150. Retrieved 2026-06-03 from
+`https://www.vldb.org/pvldb/vol16/p1777-gao.pdf`.
+
+**Category:** query optimization / planning.
+
+**Relevance tags:** learned optimizer; robust route choice; bounded
+planner hints; join order; physical operator restrictions; beam search;
+cost-model uncertainty; CPU/GPU route selection; planner guardrails.
+
+**Core idea:** LOGER argues that learned query optimizers are most
+practical when they exploit the existing DBMS optimizer rather than
+replace all of its operator knowledge. It uses deep reinforcement
+learning to search join order plus per-join operator restrictions, but
+lets the DBMS optimizer choose the actual physical operator inside
+those restrictions. That gives the learned model a larger search space
+than global hint selection, while avoiding the brittle behavior of
+directly choosing every physical operator.
+
+The mechanism matters for GPU DB because CPU/GPU/tier route choice has
+the same shape. A learned component should not directly overrule
+visibility, residency, WAL, overload, or fallback rules. It can instead
+learn bounded route restrictions or preferences: avoid GPU for this
+template under this queue/tier state, avoid CPU fallback for this
+resident aggregate shape, require prefilter before GPU transfer, or
+disable an over-resident route when selectivity and transfer risk are
+high.
+
+**Concrete mechanisms:**
+
+- Queries are represented as join graphs. Tables are nodes, join
+  predicates are edges, and node attributes include learned table
+  embeddings, column statistics, indexes, predicate selectivity, and
+  inverse-predicate selectivity.
+- A Graph Transformer exchanges table and predicate information across
+  the join graph. LOGER then uses Tree-LSTM state representations for
+  partial join trees during plan search.
+- Restricted Operator Search Space (ROSS) changes the action space.
+  Instead of selecting a physical join operator directly, an action
+  selects a join plus one of four restrictions: no restriction, no
+  nested-loop join, no merge join, or no hash join. The DBMS optimizer
+  chooses the final physical operator under that restriction.
+- Candidate joins are enumerated in a System R-like way that avoids
+  Cartesian products when conditional joins are available.
+- `epsilon`-beam search keeps multiple search paths. Some paths exploit
+  the value model's top candidates, while selected exploration paths
+  sample promising alternatives; exploration probability decays but is
+  increased for poorly optimized or long-running queries.
+- The experience dataset records the best observed reachable relative
+  latency for state-action pairs, not just the most recent result.
+  Initial expert plans from the DBMS optimizer seed the dataset to
+  reduce cold-start failures.
+- Reward weighting combines operator-relevant latency with
+  operator-irrelevant latency for the same join-order state. This
+  reduces the chance that a bad previous operator teaches the model to
+  reject a good later join action.
+- A log transform compresses disastrous-plan rewards so model training
+  pays more attention to distinguishing good plans instead of fitting
+  huge outliers.
+- The evaluation is on SPJ workloads in PostgreSQL 13.5, an anonymous
+  commercial DBMS, JOB, TPC-DS subset, and Stack Overflow. LOGER reports
+  2.076x total speedup over PostgreSQL on the JOB test workload after
+  full training, with average inference times around tens of
+  milliseconds in the reported workloads. The paper also reports that
+  Balsa and RTOS failed to finish Stack training within the configured
+  time in its comparison.
+
+**GPU DB mapping:** LOGER is a strong argument for a bounded learned
+route advisor. GPU DB should keep deterministic planner and runtime
+guards as authority: visibility compatibility, resident snapshot
+generation, WAL-before-visibility, invalidation state, memory budgets,
+queue saturation, and CPU fallback safety. A learned model can then
+choose among safe restrictions, such as "no GPU cold transfer," "no
+over-resident route without CPU prefilter," "no wide projection on GPU
+unless ordinal late materialization is available," or "no batching past
+this latency budget."
+
+ROSS maps to CPU/GPU operator families. Instead of requiring a model to
+select exact kernels, streams, tiers, prefetch choices, and CPU fallback
+paths, the model can learn which route families to disable under a
+request descriptor. The existing planner still makes the final route
+choice among valid survivors using measured costs and hard invariants.
+
+The reward-weighting idea maps to route telemetry. A bad early choice,
+such as missing a required resident companion column or choosing a
+fragile over-resident transfer path, should not poison learning about
+later route decisions. Route training data should separate
+template-level shape quality from incidental queue wait, one saturated
+tier, or one missing placement component.
+
+The exploration mechanism also fits the hardware-transition problem.
+During early GPU DB development, exact benchmark evidence is expensive
+and hardware economics may change with the newer GPU. A route learner
+should explore only inside explicitly bounded safe alternatives, record
+observed route outcomes, and decay exploration once the route template
+has enough stable evidence.
+
+**Risks and mismatches:** LOGER targets select-project-join analytical
+queries, not OLTP write paths, MVCC validation, PostgreSQL protocol
+serving, or GPU execution. It learns from executed plan latency, so
+training cost can be high and unsafe if poor plans are allowed to run
+unbounded in production. Its inference times are acceptable for its
+workloads but too high for many point-lookups unless route decisions
+are cached by template, snapshot class, and tier state. The paper does
+not solve cardinality estimation, live queue-delay prediction, memory
+pressure, or stale resident snapshots. It also assumes planner hints can
+express useful restrictions; GPU DB would need a local route-restriction
+language before a LOGER-like method can be tested.
+
+**Benchmark candidates:**
+
+- Add a deterministic route-restriction layer before any learned model:
+  flags such as `no_gpu_cold_transfer`, `no_cpu_fallback`,
+  `require_resident_snapshot`, `require_cpu_prefilter`, and
+  `disable_microbatch`. Minimum gate: each restriction is enforced by
+  planner tests and reports an explicit fallback or rejection reason.
+- Build an offline route-replay dataset from existing retained and
+  over-resident telemetry: query template, snapshot generation,
+  resident components, missing companions, queue wait, H2D/D2H bytes,
+  CPU filter time, kernel time, response bytes, and chosen route.
+  Failure condition: the dataset cannot distinguish planner error from
+  transient saturation.
+- Compare hard-rule planning, global route hints, and
+  ROSS-style per-route-family restrictions for repeated retained
+  aggregates and lookups. Expected improvement: fewer fragile GPU route
+  choices under uncertain selectivity without weakening correctness.
+- Add a negative-control p50 latency test where route-cache hits bypass
+  model inference entirely. Learned route advice must not add
+  millisecond-scale inference to hot point lookups.
+- Use reward weighting in route learning experiments: separate
+  template/shape latency from incidental queue or tier-saturation
+  latency, and verify that one overloaded GPU interval does not cause a
+  permanently bad route preference.
+- Test exploration only in shadow mode first. The planner chooses the
+  production route, while the advisor logs the alternative safe
+  restriction it would have chosen and estimates regret from observed
+  telemetry. Promote to active only if regret and safety gates pass.
+
+### 2026-06-03 - Cross-paper synthesis: learned advice needs hard route boundaries
+
+Mordred, Morty, and LOGER converge on the same operational lesson:
+optimization should happen over named, bounded units of work. Mordred's
+unit is a segment-level executable route with correlated placement.
+Morty's unit is a transaction continuation or fragment that can be
+re-executed without throwing away unrelated work. LOGER's unit is a
+planner action that restricts an unsafe or weak operator family while
+leaving the DBMS optimizer in charge of final physical selection.
+
+For GPU DB, the emerging design track is a route descriptor plus a
+restriction language. The descriptor names snapshot generation, owner
+domain, partition, resident components, required companion columns,
+expected transfer, queue budget, skew risk, write/read dependency
+fragments, and response shape. The restriction language names what the
+planner is not allowed to do for that request or template. Learning can
+operate over those restrictions, but only after the deterministic
+planner has declared which routes are semantically valid.
+
+This keeps learned systems away from correctness authority. A model may
+learn that a CPU prefilter should be required before GPU execution, that
+a cold transfer is too risky under current PCIe pressure, or that a hot
+transaction fragment should be ordered rather than retried. It may not
+declare a stale resident snapshot valid, skip WAL-before-visibility, or
+reuse a buffer before the owning domain releases it.
+
+The next benchmark priority is therefore not "train a model." It is to
+record enough structured route outcomes that a model could be audited:
+route-template id, restriction set, chosen route, rejected safe
+alternatives, queue/tier state, correctness generation, latency,
+throughput, and fallback reason. Category gaps remain around learned
+optimizer diagnostics and learned concurrency-control policy, but those
+should be reviewed with the same question: what bounded action can be
+learned without surrendering invariants?
