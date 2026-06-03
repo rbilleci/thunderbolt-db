@@ -1969,7 +1969,7 @@ Append new candidates here as each paper is processed.
   Why: modern MVCC scan/access-method work from the vDriver/DIVA ecosystem;
   useful for retained snapshot scans where version traversal can erase index
   benefits and GPU routes need a compact visible-version access structure.
-- `queued` — **Adaptive Optimistic Concurrency Control for Heterogeneous
+- `reviewed` — **Adaptive Optimistic Concurrency Control for Heterogeneous
   Workloads**, Guo et al., PVLDB 2019.
   URL: `https://www.vldb.org/pvldb/vol12/p584-guo.pdf`
   DOI: `https://doi.org/10.14778/3303753.3303763`
@@ -2052,3 +2052,17 @@ Append new candidates here as each paper is processed.
   Why: recent congestion-control comparison against Swift, PowerTCP, and other
   datacenter schemes; useful for deciding whether GPU DB admission should
   combine delay, queue-depth, and optional explicit notification signals.
+- `queued` — **Transaction Healing: Scaling Optimistic Concurrency Control on
+  Multicores**, Wu, Chan, and Tan, SIGMOD 2016.
+  URL: `https://dl.acm.org/doi/10.1145/2882903.2915202`
+  PDF: `https://yingjunwu.github.io/papers/sigmod2016.pdf`
+  Why: AOCC cites transaction healing as a semantic repair path for OCC; useful
+  for deciding when GPU DB should retry, repair, or reissue only dependent
+  pieces of a transaction instead of aborting the full command envelope.
+- `queued` — **BCC: Reducing False Aborts in Optimistic Concurrency Control
+  with Low Cost for In-Memory Databases**, Yuan et al., PVLDB 2016.
+  URL: `https://www.vldb.org/pvldb/vol9/p504-yuan.pdf`
+  DOI: `https://doi.org/10.14778/2904121.2904126`
+  Why: AOCC cites BCC as a low-overhead false-abort reduction baseline; useful
+  for GPU DB contention handling where serializable write lanes should avoid
+  unnecessary aborts without weakening visibility guarantees.

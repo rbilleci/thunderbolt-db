@@ -24121,3 +24121,186 @@ combines Swift-style delay windows with Tiga-style future generations:
 same workload, same SQL/MVCC results, measured p95/p99 latency, owner
 queue depth, generation-raise rate, WAL batch size, and discarded
 speculative work.
+
+### 2026-06-03 - AOCC adaptive validation for heterogeneous OCC
+
+**Citation:** Jinwei Guo, Peng Cai, Jiahao Wang, Weining Qian, and
+Aoying Zhou. "Adaptive Optimistic Concurrency Control for
+Heterogeneous Workloads." PVLDB 12(5), 2019. doi:10.14778/3303753.3303763.
+Retrieved 2026-06-03 from the PVLDB PDF,
+`https://www.vldb.org/pvldb/vol12/p584-guo.pdf`.
+
+**Category:** transaction processing / write path and concurrency
+control.
+
+**Relevance tags:** OCC validation; HTAP transactions; point reads;
+range scans; predicate validation; local read-set validation; global
+write-set validation; adaptive routing; serializability; contention
+telemetry; owner-queue policy; route-class validation cost.
+
+**Core idea:** AOCC starts from a small but useful observation:
+optimistic concurrency control does not have one universally cheap
+validation method. Local read-set validation is cheap for short point
+accesses because it rereads only the tuples a transaction touched, but
+it becomes expensive for large scans. Global write-set validation is
+often better for long predicates because it checks recently committed
+writes against predicates, but it becomes expensive when many
+concurrent updates are flowing through the system.
+
+The paper's mechanism is to choose the validation method at runtime,
+either once per transaction or more finely per query. This matters for
+GPU DB because retained GPU reads, CPU indexed reads, scans,
+write-heavy COPY batches, and HTAP-style read/modify transactions
+will not have the same conflict-detection cost. The transferable idea
+is to make validation route choice explicit and telemetry-driven, just
+as the runtime already wants explicit CPU/GPU/tier route choice.
+
+**Concrete mechanisms:**
+
+- AOCC combines two OCC validation families. Local read-set validation
+  (LRV) records read tuples and tuple timestamps, then aborts if any
+  tuple changed or is locked during validation. Global write-set
+  validation (GWV) records predicates, then checks whether overlapping
+  transactions' write sets intersect those predicates.
+- The protocol maintains normal transaction-local `ReadSet` and
+  `WriteSet` structures, plus a transaction-local `PredicateSet`.
+  Predicate entries include the tracking type, column range
+  conditions, and optionally a per-predicate read set.
+- A global `gList` records transactions that are validating or have
+  finished. It is a preallocated lock-free circular array. A
+  transaction obtains a unique monotonically increasing index in
+  `gList`; the paper uses that index as the commit timestamp and
+  serialization point.
+- Tuple versions carry an internal timestamp field that is updated to
+  the committing transaction's timestamp. Write sets are sorted and
+  locked before the transaction is inserted into `gList`, following
+  the usual deadlock-avoidance pattern used by Silo-style OCC.
+- Transaction-level AOCC assigns one validation type before execution:
+  point-query-only transactions use read-set tracking and LRV; any
+  transaction containing scans uses predicate tracking and GWV. The
+  authors call out that this only works when the system knows the
+  transaction shape ahead of time.
+- Query-level AOCC chooses a tracking mechanism per read query. `R`
+  records tuple versions and uses LRV1. `Pno_readset` records only a
+  predicate and uses GWV. `Preadset` records both predicate and read
+  set, then can choose between LRV2 and GWV at validation time.
+- LRV2 re-executes the predicate during validation and compares the
+  newly observed read set with the one captured during the read phase.
+  That catches phantoms or changed membership for predicate reads.
+- The cost model estimates LRV cost from the number of tracked tuples
+  or visible predicate results, while GWV cost is estimated from the
+  number of overlapping transactions, average write-set size, and the
+  per-write predicate-intersection cost. A periodically refreshed
+  threshold avoids recalculating all terms for every query.
+- Predictable queries can choose the cheapest tracking method during
+  the read phase. Non-predictable or long-running interactive queries
+  are tracked with `Preadset`, preserving enough information to defer
+  the LRV2-versus-GWV decision until validation.
+- For phantom handling, primary-key range scans also record relevant
+  B-tree leaf-node versions under read-set tracking. For non-primary
+  predicates without a secondary index, the paper sends the query to
+  predicate-only tracking because LRV2 would require a full-table
+  rescan during validation.
+- The correctness argument is that every committed transaction's
+  reads and writes are equivalent to execution at its `gList` commit
+  timestamp. LRV detects tuple-version changes, GWV detects
+  overlapping writes matching predicates, and LRV2 detects changed
+  predicate result sets.
+- Evaluation uses DBx1000 on a 32-logical-core machine with YCSB and
+  a hybrid TPC-C variant containing a Reward transaction with a scan
+  plus updates. The authors report AOCC outperforming fixed LRV or
+  fixed GWV across varied scan lengths, contention levels, worker
+  counts, and dynamic workload phases. One concrete claim is 1.9x
+  better throughput than GWV-OCC in their hybrid TPC-C setup at scan
+  upper bound 1600.
+
+**GPU DB mapping:** GPU DB should treat validation method as part of
+the command route descriptor. A retained point lookup at a fixed
+snapshot generation looks like a cheap read-set validation case: the
+request can record relation generation, row/key identities, and the
+snapshot handle it used. A wide predicate scan or retained aggregate
+over a large resident partition looks more like AOCC's GWV case:
+checking every observed row would be the wrong unit, so validation
+should compare the predicate and snapshot boundary against overlapping
+write/invalidation ranges.
+
+The `Preadset` hybrid path is especially relevant for GPU routes whose
+cost changes between planning and validation. A query can preserve
+both predicate metadata and compact read evidence, then choose at
+commit or response-publication time whether to validate by touched
+keys, by predicate/write-set intersection, or by reissuing against a
+newer snapshot. For GPU DB, this could become a validation envelope
+with `query_shape`, `predicate_range`, `snapshot_generation`,
+`visible_key_count`, `owner_generation`, and `overlap_write_count`.
+
+AOCC's threshold also maps cleanly to admission telemetry. Instead of
+a hidden global setting, GPU DB could maintain per-route validation
+cost counters: recent overlapping writes per table/partition, average
+write-set interval count, read-result cardinality, predicate
+selectivity, and validation CPU time. The planner can use these
+counters to decide whether a read/modify transaction should stay on a
+CPU owner lane, use an immutable retained snapshot plus predicate
+validation, or avoid GPU execution because validation would dominate.
+
+For COPY and write-heavy workloads, AOCC warns that predicate-only
+global validation gets worse as the number of concurrent writes rises.
+That argues for partitioning write-set evidence by relation,
+partition, key range, and publication generation. A single global
+recent-write list would be a bottleneck and would make unrelated GPU
+resident reads pay validation costs for unrelated writes.
+
+**Risks and mismatches:** AOCC is a single-node in-memory OCC paper
+implemented in DBx1000, not an MVCC GPU relational engine with WAL,
+resident snapshots, GPU kernels, PostgreSQL protocol behavior, or
+cold-tier fallbacks. Its `gList` serialization point is useful as a
+concept but cannot replace GPU DB's WAL-before-visibility rule.
+Commit timestamps, resident invalidation, catalog generations, and
+snapshot publication still need to be derived from durable mutation
+order.
+
+The paper's query-level design assumes the system can represent
+predicates as column ranges and can test intersections against write
+sets. GPU DB's SQL surface will eventually include joins,
+expressions, text predicates, NULL behavior, UDFs, and planner
+rewrites that are not that simple. Predicate validation must therefore
+start with the narrow retained-route families already supported, not
+with arbitrary SQL.
+
+`gList` is also centralized. The authors mitigate this with a
+preallocated lock-free circular array and note read-only transactions
+avoid some burden, but a 1M-logical-session GPU DB target should
+avoid one global validating list on the hot path. The safer mapping is
+per-owner or per-partition write evidence with bounded summaries and
+route-specific validation windows.
+
+**Benchmark candidates:**
+
+- Add a host-only validation simulator with three strategies: touched
+  key/version validation, predicate-versus-write-range validation, and
+  hybrid deferred choice. Gate: identical serializable accept/abort
+  decisions for the modeled workload and lower p95 validation time
+  than a fixed strategy under mixed point/scan transactions.
+- Extend retained-read telemetry with validation evidence size:
+  touched key count, predicate range count, overlapping write count,
+  snapshot generation, and validation method selected. Failure
+  condition: GPU execution is reported as fast while validation time
+  dominates end-to-end latency without being attributed.
+- Prototype partition-scoped recent write summaries keyed by
+  `(relation, partition, generation, key_range)` and compare them with
+  a global write list. Gate: no unrelated partition write can force a
+  retained read to scan global evidence.
+- Test an HTAP transaction shape: read a retained aggregate over a
+  resident partition, then apply a write. Compare owner-only execution,
+  retained snapshot plus predicate validation, and CPU fallback. Gate:
+  same SQL-visible result and commit outcome with lower latency for
+  the retained route when write overlap is low.
+- Add a route-choice threshold similar to AOCC's `T`: when recent
+  overlapping writes times average write-set intervals exceeds the
+  read-evidence cardinality, choose key/read-set validation or CPU
+  owner execution instead of predicate validation. Failure condition:
+  threshold switching creates non-deterministic correctness or hides
+  overload.
+- For long-running interactive sessions, keep both compact read
+  evidence and predicate descriptors until response publication or
+  commit. Gate: the system can defer validation choice without keeping
+  unbounded per-session state under thousands of logical sessions.
