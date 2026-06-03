@@ -298,7 +298,7 @@ Append new candidates here as each paper is processed.
   URL: `https://www.cidrdb.org/cidr2024/papers/p22-yang.pdf`
   Why: modern predicate-transfer/pre-filtering work cited by the 2025 hybrid
   CPU-GPU paper; relevant to reducing over-resident transfer before GPU joins.
-- `queued` — **Pushing Data-Induced Predicates Through Joins in Big-Data
+- `reviewed` — **Pushing Data-Induced Predicates Through Joins in Big-Data
   Clusters**, Kandula, Orr, and Chaudhuri, PVLDB 2019.
   URL: `https://www.vldb.org/pvldb/vol13/p252-orr.pdf`
   DOI: `https://doi.org/10.14778/3368289.3368292`
@@ -758,6 +758,19 @@ Append new candidates here as each paper is processed.
   Why: RankPQO cites hybrid plan selection work; relevant to keeping GPU DB
   deterministic cost rules as guardrails while adding measured route-ranking
   hints for CPU/GPU/tier choices.
+- `queued` — **AdaptDB: Adaptive Partitioning for Distributed Joins**,
+  Lu, Shanbhag, Jindal, and Madden, PVLDB 2017.
+  URL: `https://www.vldb.org/pvldb/vol10/p589-lu.pdf`
+  Why: data-induced predicates cite adaptive partitioning as a physical-layout
+  alternative; useful for comparing static range-set pruning with workload-
+  adaptive partition refinement for GPU resident and cold-tier segments.
+- `queued` — **Skipping-oriented Partitioning for Columnar Layouts**,
+  Sun, Franklin, Wang, and Wu, PVLDB 2017.
+  URL: `https://www.vldb.org/pvldb/vol10/p421-sun.pdf`
+  Why: data-induced predicates contrast against workload-aware skipping
+  layouts; useful for deciding whether GPU DB should reshape resident/cold
+  partitions around observed predicates or rely on lightweight per-generation
+  statistics.
 - `queued` — **Mind the Gap: A Case for Informed Request Scheduling at the
   NIC**, Humphries, Kaffes, Mazieres, and Kozyrakis, HotNets 2019.
   URL: `https://doi.org/10.1145/3365609.3365856`

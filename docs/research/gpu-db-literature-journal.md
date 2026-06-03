@@ -20785,3 +20785,191 @@ as advisory for routing and admission, not as durable authority.
   retained reads and best-effort analytical scans. Gate: bounded rejection or
   delay reasons, lower p99 for short reads, and no indefinite starvation of
   long work.
+
+### 2026-06-03 - Data-induced predicates through joins
+
+**Citation:** Srikanth Kandula, Laurel Orr, and Surajit Chaudhuri. "Pushing
+Data-Induced Predicates Through Joins in Big-Data Clusters." PVLDB 13(3):
+252-265, 2019. doi:10.14778/3368289.3368292. Retrieved 2026-06-03 from
+the PVLDB PDF, `https://www.vldb.org/pvldb/vol13/p252-orr.pdf`.
+
+**Category:** Query optimization / planning.
+
+**Relevance tags:** predicate pushdown; data skipping; join planning;
+partition statistics; range-set statistics; zone maps; cold-tier pruning;
+GPU transfer reduction; optimizer-time pruning; over-resident execution;
+multi-table retained routes.
+
+**Core idea:** The paper turns predicates on one table into new predicates on
+joining tables by using per-partition statistics. A local predicate first
+selects a subset of partitions on its own table. The optimizer then merges
+statistics for the join-column values in those surviving partitions and creates
+a data-induced predicate, or diP, that can be applied to a joining relation.
+The diP is a necessary condition, so it may admit false positives but must not
+drop rows that could join.
+
+This matters because the pruning happens during optimization, before execution
+starts. Unlike runtime sideways information passing or Bloom-filter exchange,
+diPs do not add an execution barrier, do not need a runtime filter build, and
+can change the chosen plan by reducing estimated input sizes. The paper reports
+that ordinary zone maps already provide useful gains, while a slightly richer
+range-set statistic improves skipping by remembering gaps in column values.
+Their headline evaluation says half of TPC-H, TPC-DS, and JoinOrder queries can
+skip at least 33% of input with the richer statistic, and a production
+big-data-cluster median query finishes roughly 2x faster.
+
+**Concrete mechanisms:**
+
+- Each table has partition-level statistics. The paper discusses common
+  zone-map style min/max statistics over files, stripes, row groups, or table
+  regions, then introduces range-sets as a compact extension that stores
+  several non-overlapping value ranges instead of one min/max envelope.
+- For table `i`, the optimizer computes a partition vector `qi` whose entries
+  say whether each partition must be read after local predicates are applied.
+- For a join between tables `i` and `j`, the optimizer constructs `di->j` from
+  the join-column statistics of the partitions of `i` that remain in `qi`.
+  That predicate is then tested against `j`'s partition statistics to shrink
+  `qj`.
+- The method relies on diPs being necessary conditions: `predicate => diP`.
+  False positives are acceptable; false negatives would make the rewritten
+  plan incorrect.
+- diPs can be moved through query expressions using optimizer rules, including
+  sideways movement across equijoins and movement below some group-by, union,
+  and nested-query shapes when equivalence and safety conditions hold.
+- When several tables have local predicates, diPs can cascade. For tree-like
+  join graphs, the paper gives an update schedule that reaches a fixed point
+  with the fewest diP constructions. For cyclic joins, it uses a cost-based
+  optimizer strategy rather than claiming a single universal schedule.
+- Range-set statistics improve over histograms for this use because diPs need
+  existence ranges, not frequency estimates. Histograms may keep frequencies
+  but lose gaps; range-sets retain gaps and produce tighter necessary
+  predicates.
+- The paper describes two update strategies: taint partitions whose rows
+  changed, or approximately maintain statistics as data evolves. Details are
+  evaluated for the paper's target systems, but exact transactional integration
+  costs are workload- and storage-engine-specific.
+- Evaluation compares diPs against ordinary local predicate skipping, runtime
+  sideways information passing, join indexes, denormalized materialized views,
+  and workload-aware clustering. The paper argues diPs are cheaper to maintain
+  because they reuse small statistics instead of building broad auxiliary join
+  structures.
+
+**GPU DB mapping:** GPU DB's P8 design already publishes immutable resident
+snapshots with relation identity, visibility boundary, resident layout, source
+WAL boundary, and partition identity. diPs map naturally to adding compact
+per-generation statistics to those snapshots and to cold/warm host or NVMe
+segments. A retained multi-table route should be able to ask: given the
+surviving partitions for a predicate on table A, which partitions of table B
+can still contain joining keys? If the answer excludes cold partitions, GPU DB
+can avoid HBM admission, host-to-device transfer, or NVMe reads before the
+kernel route is even scheduled.
+
+The strongest transfer is optimizer-time transfer avoidance. For over-resident
+joins, GPU DB should prefer proving that a partition is unnecessary over
+loading it and filtering on the GPU. diPs could sit beside the existing route
+validity checks: table OID, schema generation, snapshot generation,
+invalidation generation, partition statistics generation, and visibility
+boundary must all match before a generated predicate can prune a resident or
+cold partition.
+
+Range-set statistics are also a good fit for GPU DB's partitioned resident
+layout. Per-partition min/max can be too loose when a partition has gaps in
+join-key space. A small fixed-size range-set per partition and join-relevant
+column could tighten pruning without adding a maintained join index. The
+statistic should remain a planner hint and a pruning proof, not a durable
+correctness authority. WAL replay and CPU canonical state still own truth.
+
+For high concurrency, diPs can reduce pressure before admission. If a query's
+route descriptor says that only two of many partitions are needed, the request
+can avoid queueing behind unrelated GPU partition owners and avoid allocating
+buffers for skipped partitions. This complements the recent scheduling papers:
+the scheduler should use route class and queue delay, but the optimizer should
+first reduce the amount of route work admitted.
+
+**Risks and mismatches:** The paper targets analytical big-data and SQL Server
+style workloads, not OLTP mutation-heavy GPU DB execution. It assumes useful
+partition statistics already exist and that partition-level false positives
+are acceptable. It does not solve MVCC visibility, WAL-before-visibility,
+snapshot retention, GPU kernel choice, response ordering, transaction
+isolation, or write-path contention.
+
+The safety risk is stale statistics. A diP built from an old resident
+generation could silently skip rows if mutations changed join-column coverage.
+GPU DB must therefore tie every statistic to a snapshot/visibility generation
+and reject pruning when a mutation, DDL change, refresh, compaction, or cold
+tier rewrite has advanced the relevant generation. Another mismatch is
+granularity: the paper's default partition sizes can be large cluster files,
+while GPU DB may need smaller resident segments to avoid loading too much HBM
+for point or range queries. Smaller segments improve pruning but increase
+metadata and optimizer overhead.
+
+**Benchmark candidates:**
+
+- Add per-partition min/max statistics for one join-relevant `int4` column in
+  retained partition metadata. Gate: statistics generation is tied to the same
+  resident snapshot boundary as the retained buffers, and pruning is disabled
+  on any generation mismatch.
+- Prototype a two-table retained route planner that converts a selective
+  predicate on a dimension-like table into a join-key partition filter on a
+  larger fact-like table. Measure skipped partitions, H2D bytes avoided, GPU
+  queue work avoided, and SQL result identity versus CPU fallback.
+- Compare three pruning policies on synthetic skewed data: no cross-table
+  pruning, min/max diPs, and fixed-size range-set diPs. Failure condition:
+  range-set metadata overhead or optimization time outweighs transfer and
+  queue savings.
+- Add an over-resident benchmark where cold partitions sit in host/NVMe tier.
+  A diP-capable plan should avoid staging partitions whose join-key statistics
+  prove they cannot match. Gate: lower p50/p99 latency and fewer cold bytes
+  read without any stale-generation skip.
+- Test update invalidation cost: after COPY/UPDATE changes join-key coverage,
+  mark affected partition statistics invalid and force fallback or refresh.
+  Gate: WAL-before-visibility still invalidates stats before a stale retained
+  route can be chosen.
+- Use diP selectivity as an admission signal. If cross-table pruning produces
+  a small compatible partition set, route to GPU; if it leaves most partitions
+  live under high queue pressure, choose CPU fallback or overload response
+  according to the existing route policy.
+
+### 2026-06-03 - Cross-paper synthesis: schedulable routes need prunable work
+
+The recent sequence from LibPreemptible, Syrup, and data-induced predicates
+points to a two-step runtime rule: first make work smaller with optimizer-time
+proofs, then schedule the remaining work with explicit route budgets. A
+deadline-aware scheduler cannot rescue a route that admitted every cold
+partition unnecessarily, and a smart pruning rule still needs class-aware
+queues once multiple short and long routes remain.
+
+Converging design tracks:
+
+- **Route descriptors as shared vocabulary:** query shape, route class,
+  partition/key home, snapshot generation, response size, deadline budget,
+  and pruning proof should travel together across planning, admission,
+  read-snapshot workers, GPU execution owners, and response rings.
+- **Generation-bound pruning:** every optimizer-derived shortcut needs the
+  same kind of generation discipline as retained snapshots. Pruning metadata
+  must carry relation identity, schema generation, visibility boundary,
+  resident/cold partition generation, and invalidation generation.
+- **Small proof metadata before large movement:** range-set or min/max
+  summaries are attractive because they can avoid HBM admission, pinned-buffer
+  allocation, NVMe reads, and GPU queue pressure before the work reaches the
+  scheduler.
+- **Scheduling after pruning:** once a route has been reduced to a smaller
+  partition set, the runtime still needs route-class queues, token budgets,
+  cooperative chunking, and late binding so long scans, refreshes, and large
+  responses do not trap short retained reads.
+
+Category gaps remain around write-path batching under MVCC, GPU-native
+transaction execution, and modern HTAP tuple discovery. The next high-value
+queued paper should probably come from HTAP/MVCC refresh or tiered-memory
+buffer management rather than another pure runtime scheduler.
+
+Benchmark priorities:
+
+- Build one no-GPU mixed-service benchmark that includes optimizer pruning as
+  a factor, not only scheduling policy.
+- Add a retained two-table partition-pruning proof before broad GPU join work.
+- Track "work avoided" metrics alongside service time: partitions skipped,
+  bytes not staged, H2D not issued, GPU batches not enqueued, and response
+  fragments not generated.
+- Treat stale-generation pruning as a correctness failure in tests, with the
+  same seriousness as stale resident reads.
