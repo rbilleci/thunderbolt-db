@@ -382,7 +382,7 @@ Append new candidates here as each paper is processed.
   Why: rate-limiter design used by eRPC; relevant to per-session admission,
   congestion shaping, and bounded response scheduling at high connection
   counts.
-- `queued` — **TIMELY: RTT-based Congestion Control for the Datacenter**,
+- `reviewed` — **TIMELY: RTT-based Congestion Control for the Datacenter**,
   Mittal et al., SIGCOMM 2015.
   URL: `https://doi.org/10.1145/2785956.2787510`
   Why: eRPC's congestion-control path builds on Timely; useful for deciding
@@ -518,6 +518,19 @@ Append new candidates here as each paper is processed.
   URL: `https://www.vldb.org/cidrdb/papers/2025/p2-otaki.pdf`
   Why: paged-memory and resource-adaptive execution work cited by vmcache^n;
   relevant to query admission and execution under memory-tier pressure.
+- `queued` — **PowerTCP: Pushing the Performance Limits of Datacenter
+  Networks**, Huang et al., NSDI 2022.
+  URL: `https://www.usenix.org/conference/nsdi22/presentation/huang-yuchung`
+  arXiv: `https://arxiv.org/abs/2112.14309`
+  Why: modern congestion-control follow-up that combines queue length and
+  queue-change signals; useful for comparing TIMELY-style delay gradients with
+  request/response ring delay and queue-depth admission.
+- `queued` — **FNCC: Fast Notification Congestion Control in Data Center
+  Networks**, arXiv 2024.
+  URL: `https://arxiv.org/abs/2405.07608`
+  Why: sub-RTT congestion notification via ACK-carried telemetry; relevant to
+  future high-concurrency response shaping if GPU DB exposes fast path
+  queue-delay hints from IO workers or gateways.
 - `reviewed` — **Nomad: Non-Exclusive Memory Tiering via Transactional Page
   Migration**, Xiang et al., OSDI 2024.
   URL: `https://www.usenix.org/conference/osdi24/presentation/xiang`

@@ -19692,3 +19692,169 @@ resident validity, or compressed route conversion.
   probe structure now, reuse an existing older compatible structure, execute
   dense scan, fall back to CPU, or reject. Required metrics: p50/p99 latency,
   resident bytes, stale-generation rejections, and route-choice regret.
+
+### 2026-06-03 - TIMELY RTT-based congestion control for the datacenter
+
+**Citation:** Radhika Mittal, Vinh The Lam, Nandita Dukkipati, Emily Blem,
+Hassan Wassel, Monia Ghobadi, Amin Vahdat, Yaogong Wang, David Wetherall, and
+David Zats. "TIMELY: RTT-based Congestion Control for the Datacenter."
+SIGCOMM 2015, pp. 537-550. doi:10.1145/2785956.2787510. Retrieved
+2026-06-03 from the ACM DOI and Stanford-hosted course copy,
+`https://web.stanford.edu/class/cs244/papers/timely-sigcomm2015.pdf`.
+
+**Category:** runtime / HFT / session scale.
+
+**Relevance tags:** queue-delay telemetry; congestion control; session
+admission; response pacing; bounded queues; OS-bypass messaging; RDMA;
+tail-latency control; high-concurrency networking.
+
+**Core idea:** TIMELY argues that datacenter senders can use accurately
+measured round-trip delay as a fine-grained congestion signal, avoiding switch
+feedback while keeping both throughput and tail latency under control. The
+critical detail is that it does not target a fixed queue size. It reacts to the
+gradient of RTT changes: rising RTT means the queue is building, falling RTT
+means the queue is draining, and a smooth gradient signal lets the sender
+adjust before a large standing queue forms.
+
+For GPU DB, the paper is valuable less as a literal network transport and more
+as an admission-control pattern. The current runtime design already calls for
+bounded command rings, response rings, GPU execution rings, queue-wait
+telemetry, and deterministic overload decisions. TIMELY suggests those
+boundaries should expose not only absolute depth or p99 latency, but also the
+rate of change in queue delay. A queue whose delay is climbing quickly should
+trigger pacing or narrower admission earlier than a deeper but draining queue.
+
+**Concrete mechanisms:**
+
+- TIMELY measures segment RTT using NIC hardware timestamps and prompt
+  hardware-generated acknowledgements, then subtracts serialization time so
+  the remaining variable component tracks propagation plus queueing delay.
+- The design treats NIC queueing as part of the congestion signal rather than
+  noise, because host/NIC buffering can still inflate end-to-end latency.
+- Each flow has three components: an RTT measurement engine, a rate
+  computation engine, and a rate control engine that inserts pacing delays
+  between message segments.
+- Rate control is flow-local but scheduled by one shared segment scheduler.
+  Segments whose send time is in the future wait in a priority queue; segments
+  ready in the past are serviced round-robin.
+- TIMELY is rate-based rather than window-based because datacenter bandwidth-
+  delay products can be only a few NIC bursts, making burst spacing easier to
+  control directly than outstanding window size.
+- The congestion controller keeps a per-flow target rate and updates it on
+  completion events. It computes consecutive RTT differences, normalizes by a
+  configured minimum RTT, then smooths the result with an EWMA.
+- When RTT is below `Tlow`, the flow increases additively, treating small
+  transient burst collisions as tolerable. When RTT is above `Thigh`, it
+  decreases multiplicatively based on the instantaneous high delay, independent
+  of the gradient.
+- In the normal range, a non-positive gradient increases the rate additively;
+  a positive gradient multiplicatively decreases the rate scaled by the
+  normalized gradient.
+- A hyperactive increase mode uses a larger additive increment after several
+  consecutive negative-gradient samples, letting a flow reacquire bandwidth
+  faster after load drops.
+- Application-limited flows are prevented from growing their target rate
+  without bound: rate increases occur only when the application is using most
+  of its target, and the implementation caps maximum target rate.
+- For small segment sizes with more than one completion per minimum RTT, rate
+  updates are scaled so multiple samples in one RTT interval do not overweight
+  new information.
+- Rate enforcement is lazy for scheduler efficiency: when a previously
+  computed segment send time arrives, the scheduler checks whether the current
+  rate has fallen and recomputes/requeues only if needed.
+- Evaluation reports that TIMELY over OS-bypass messaging with PFC reaches
+  roughly the same incast throughput as PFC alone while reducing average RTT
+  from 658 microseconds to 61 microseconds and 99th percentile RTT from
+  1036 microseconds to 116 microseconds in the reported small-scale table.
+- In the same table, TIMELY reports nearly the same throughput as optimized
+  kernel DCTCP, but with average RTT 60 microseconds versus 598 microseconds
+  and 99th percentile RTT 116 microseconds versus 1490 microseconds.
+- Large-scale experiments on a few hundred machines show lower median and
+  99th-percentile RTT than PFC under uniform random traffic, and show TIMELY
+  preventing incast-induced throughput collapse by rate-limiting only flows on
+  the congested path.
+- The paper explicitly notes limitations of RTT: reverse-path congestion can
+  pollute the signal unless ACK traffic is prioritized, software timestamps can
+  add too much noise, and changing paths with different propagation delays can
+  confuse delay interpretation.
+
+**GPU DB mapping:** TIMELY maps directly onto GPU DB's planned bounded
+runtime. Network IO workers, mutation rings, read-snapshot rings, GPU workers,
+residency refresh queues, and response rings should all track delay gradients,
+not just current depth. If a GPU execution ring's queue wait is rising across
+drain cycles, the scheduler can reduce retained-read admission, shrink
+micro-batches, choose CPU fallback for eligible requests, or reject with an
+explicit overload reason before p99 latency explodes.
+
+The low/high threshold split is a strong fit for micro-batching. A small
+increase in queue wait below a `Tlow` equivalent may be acceptable because it
+amortizes a kernel launch or response encoding batch. A `Thigh` equivalent
+should be a hard latency guardrail: once a queue or response ring crosses it,
+the runtime should stop waiting for larger batches and drain, fallback, or
+reject. Between those limits, the gradient can decide whether to grow or shrink
+batch size and per-route admission.
+
+TIMELY's application-limited rule applies to logical sessions. A client or
+route class should not accumulate a large admission credit merely because it
+has been idle. Credit growth should depend on actual usage and observed
+service health, otherwise a burst from many previously idle sessions can
+overwhelm mutation, response, or GPU queues. This matters for the 1M logical
+session goal: most sessions may be dormant, but their simultaneous wake-up
+needs bounded pacing.
+
+The paper's distinction between network queueing and end-host queueing also
+fits GPU DB. Moving delay from a shared bottleneck to a bounded local queue can
+be useful only when the runtime reports it honestly. Queue wait in a response
+ring, pinned-buffer pool, GPU worker, or mutation owner is still user-visible
+latency and must enter admission decisions even if the network remains clear.
+
+Finally, TIMELY strengthens the case for per-route telemetry fields in the
+architecture docs: minimum service time, current queue delay, queue-delay
+gradient, low/high delay thresholds, drain rate, admission credit, and
+fallback/rejection cause. These fields would make route decisions auditable
+instead of tuning them only by global concurrency counts.
+
+**Risks and mismatches:** TIMELY is a datacenter network transport paper, not
+a database runtime paper. It assumes NIC hardware timestamp support and
+prompt ACK generation, neither of which is guaranteed for pgwire over ordinary
+TCP. Its experiments center on 10 Gbps RDMA/OS-bypass messaging and switch
+queues, while GPU DB also has CPU owner queues, CUDA stream queues, response
+encoding, WAL flushes, pinned-memory budgets, and SQL result materialization.
+The exact reported microsecond values should therefore not be treated as
+database latency predictions.
+
+RTT-style signals can also be ambiguous inside a DBMS. A rising queue-delay
+gradient might mean network congestion, slow client reads, GPU saturation,
+mutation-owner contention, WAL fsync stalls, memory pressure, or a long query
+occupying a worker. GPU DB should classify the boundary that produced the
+delay rather than applying one global rate controller. The reverse-path caveat
+has a DB analogue: response-ring delay can contaminate request-admission
+signals unless request and response pressure are tracked separately.
+
+**Benchmark candidates:**
+
+- Add a queue-delay-gradient simulator for the proposed runtime rings. Compare
+  admission based on queue depth, absolute queue wait, and queue-wait gradient
+  under bursty retained reads, mixed writes, and slow-client responses. Gate:
+  gradient admission lowers p99 queue wait without reducing steady-state
+  throughput by more than a configured margin.
+- Prototype per-route `Tlow`/`Thigh` latency guardrails for retained read
+  micro-batches. Below `Tlow`, allow larger batches; above `Thigh`, force drain
+  or fallback. Failure condition: p99 latency crosses the guardrail while the
+  scheduler continues to wait for batch growth.
+- Add logical-session credit rules that prevent idle sessions from accumulating
+  unbounded burst capacity. Measure a synthetic 1M-session wake-up where only
+  a small fraction becomes active at once. Required metrics: accepted requests,
+  rejected/queued requests, per-ring queue wait, and response latency.
+- Extend endpoint telemetry with boundary-local delay-gradient fields:
+  ingress queue, mutation owner, read snapshot queue, GPU execution worker,
+  response ring, pinned-buffer pool, and network write. Gate: overload reports
+  name the boundary whose gradient triggered pacing or rejection.
+- Test response pacing under slow clients: many fast retained reads plus a
+  subset of clients that stop reading responses. Gate: slow-client response
+  buffers do not inflate request admission for unrelated sessions and do not
+  block mutation or GPU worker queues.
+- Run a no-GPU transport harness that sends fixed-size pgwire-like responses
+  through bounded IO workers with lazy pacing. Compare round-robin, priority
+  by deadline, and gradient-limited scheduling. Measure p50/p99 latency,
+  throughput, queue wait, and fairness across session classes.
