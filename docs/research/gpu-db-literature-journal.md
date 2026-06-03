@@ -11457,3 +11457,206 @@ measurement discipline.
 - Treat every cold-tier route as a planner decision with a measured CPU/I/O
   budget. A GPU route that saves CUDA time but burns excessive storage
   submission CPU should lose to a CPU or host-memory route under pressure.
+
+### 2026-06-03 - Fast serializable main-memory MVCC
+
+**Citation:** Thomas Neumann, Tobias Muehlbauer, and Alfons Kemper.
+"Fast Serializable Multi-Version Concurrency Control for Main-Memory
+Database Systems." SIGMOD 2015, pp. 677-689. DOI:
+`10.1145/2723372.2749436`. Retrieved 2026-06-03 from the ACM DOI page
+and the TUM author PDF,
+`https://www-db.cs.tum.edu/~muehlbau/papers/mvcc.pdf`.
+
+**Category:** MVCC / snapshot / visibility and transaction processing.
+
+**Relevance tags:** serializable MVCC; snapshot isolation; predicate
+validation; undo buffers; before-image deltas; scan-friendly versioning;
+garbage collection; retained snapshots; write admission.
+
+**Core idea:** The paper presents HyPer's MVCC design for main-memory
+HTAP: keep the newest tuple version in-place for scan speed, store older
+versions as before-image deltas in transaction undo buffers, and add a
+serializability check that validates recently committed writes against a
+committing transaction's logged read predicates. The goal is to avoid the
+usual tradeoff where snapshot isolation is fast but serializability is too
+expensive for read-heavy or analytical transactions.
+
+The transferable claim is not that every workload should use this exact
+HyPer layout. It is that serializable validation can be made proportional
+to recently committed writes during the transaction lifetime rather than
+to the full read set. For a GPU database, that is the right asymmetry:
+retained scans or batched GPU reads may touch millions of rows, while the
+dangerous validation surface for a short update transaction is often the
+small set of writes committed since its snapshot boundary.
+
+**Concrete mechanisms:**
+
+- Each transaction receives a start timestamp; update transactions draw a
+  commit timestamp at commit, and commit timestamp order is the
+  serialization order.
+- Updates modify the latest tuple version in-place and append
+  before-image deltas to the updating transaction's undo buffer. The tuple
+  stores hidden version metadata and a pointer into the version chain.
+- Uncommitted versions use temporary high transaction identifiers so only
+  the writer can read its own writes. Other writers that encounter an
+  uncommitted version abort and restart.
+- A reader reconstructs its visible tuple by starting from the latest
+  in-place value and applying before-image deltas until it reaches the
+  version valid for its start timestamp.
+- Update transactions validate serializability at commit by drawing their
+  commit timestamp, then scanning undo buffers of transactions that
+  committed after the validator's start timestamp.
+- Instead of logging every read row, the transaction logs predicates per
+  relation and per access path. Index point/range reads become predicates;
+  nested-loop index reads can be coarsened into ranges.
+- Validation checks each recently committed insert, delete, and update
+  against the validator's predicate space. Inserts detect phantoms;
+  deletes test whether the removed row belonged to the read set; updates
+  test both before-image and after-image.
+- Predicate trees compact repeated predicates and evaluate candidate rows
+  with cheap per-attribute comparison summaries. The implementation also
+  supports attribute-level validation to reduce false aborts when read and
+  written attributes do not overlap.
+- Garbage collection advances at commit time. Undo buffers older than the
+  oldest visible transaction are removed from the recently-committed list,
+  version-chain references are tombstoned atomically, and memory is reused
+  only after no active transaction can still hold a chain traversal
+  reference.
+- Indexed-attribute updates are represented as delete plus insert so
+  indexes retain entries for all versions visible to active transactions;
+  index cleanup follows MVCC garbage collection.
+- VersionedPositions synopses record the first and last versioned record
+  within fixed record ranges, allowing generated scan code to skip branchy
+  version checks across long unversioned spans.
+- Evaluation reports that predicate logging overhead is small in their
+  TPC-C/TATP tests, that VersionedPositions improve scan performance by
+  more than 5.5x over their no-synopsis MVCC scan variant, and that
+  validation cost mostly follows the committed write set during a
+  transaction rather than the read-set size.
+
+**GPU DB mapping:** This paper sharpens the current retained-snapshot
+plan. GPU DB should separate the read snapshot handle from validation
+metadata: a retained GPU scan can hold an immutable generation and a
+logical predicate summary, while mutation owners validate only against
+writes that crossed the generation boundary. That avoids copying or
+pinning huge read sets for 1M logical sessions.
+
+The before-image undo-buffer layout is a useful CPU-side contrast to the
+current tuple-version chains. For P8, the latest CPU-visible row or
+column-group entry can remain optimized for fresh reads and refresh
+builds, while old versions live in owner-local undo or delta buffers used
+only by retained snapshots and validation. GPU resident snapshots should
+remain immutable acceleration state, but their invalidation descriptors
+could carry the same ingredients: relation, columns touched, predicate or
+key range, before/after value summaries, and commit generation.
+
+Predicate-space validation maps naturally to route admission. Same-shape
+retained lookups and scans already know their relation, selected columns,
+predicates, and snapshot generation. Recording those summaries in a compact
+per-session or per-request structure gives the mutation owner a way to
+decide whether a recent write invalidates a route, forces CPU fallback, or
+aborts/retries a serializable transaction. Attribute-level validation is
+especially relevant for columnar GPU layouts: an update to a non-read
+column should not invalidate a read route that never observes that column.
+
+VersionedPositions suggests a benchmarkable resident metadata layer.
+Instead of checking every row for version state on the GPU path, P8 can
+track per-segment dirty/versioned intervals or bitmaps. Fresh resident
+segments run branch-light kernels; only marked ranges consult CPU/GPU delta
+metadata or fall back. The lesson is to make "mostly unversioned" a fast
+path with stable dimensions, not a branch inside every tuple operation.
+
+**Risks and mismatches:** The paper is single-node, main-memory HyPer
+work from 2015. Its implementation uses short critical sections, ordinary
+latching for some data structures, in-memory redo-log experiments, and
+CPU generated scan code rather than CUDA execution. It does not address
+WAL flush ordering on modern NVMe, GPU memory residency, GPUDirect
+storage, PostgreSQL wire serving, distributed snapshots, DDL invalidation,
+or 1M idle sessions.
+
+Predicate validation favors workloads where the read set is larger than
+the recently committed write set during the transaction lifetime. That is
+often true for analytical reads and short OLTP updates, but it can fail
+under heavy write bursts, long update transactions, broad write predicates,
+or highly contended hot partitions. Predicate summaries also introduce
+false-positive abort risk, especially with hashed strings, coarsened index
+ranges, or complex SQL expressions. GPU DB must treat the mechanism as a
+serializable-validation candidate, not as a blanket replacement for all
+MVCC conflict handling.
+
+**Benchmark candidates:**
+
+- Add a serializable retained-read validation prototype: log relation,
+  selected columns, predicate/key range, and snapshot generation for a
+  retained GPU-eligible read; validate against committed write descriptors
+  since that generation. Gate: identical abort/fallback decisions versus a
+  brute-force read-set checker on randomized insert/update/delete tests.
+- Build per-segment versioned-range metadata for P8 resident snapshots.
+  Compare always-check visibility, interval/bitmap-gated visibility, and
+  CPU fallback for dirty ranges. Required metrics: kernel time, branch
+  efficiency, stale-read prevention, and refresh invalidation overhead.
+- Compare validation cost as `|R|` grows and `|W_since_start|` varies:
+  point lookup, range scan, aggregate scan, and mixed retained GPU
+  micro-batches. Failure condition: validation grows with total rows read
+  rather than with committed write descriptors.
+- Test attribute-level invalidation for columnar resident data. Updating
+  an unobserved column should not invalidate or abort a retained route that
+  only reads disjoint columns, while updates to predicate columns must
+  invalidate or validate precisely.
+- Add a long-snapshot GC stress test with before-image or delta buffers:
+  hold retained readers open, update hot rows, and verify that fresh reads,
+  writes, and resident refresh do not traverse unbounded chains.
+- Model commit-generation validation as an owner-domain protocol: each
+  mutation owner publishes sealed write descriptors after WAL hardening;
+  read workers validate only against descriptors with commit generation
+  greater than their snapshot generation.
+
+### 2026-06-03 - Cross-paper synthesis: generations need durable and logical fronts
+
+**Papers covered:** Autonomous commit for low-latency NVMe durability,
+Modern NVMe storage-engine exploitation, and Fast Serializable
+Multi-Version Concurrency Control.
+
+**Converging design tracks:**
+
+- **Visibility should be a published frontier, not a side effect.**
+  Autonomous commit separates executed, hardened, and visible states; the
+  NVMe paper makes cold-tier completion an owned scheduler event; fast
+  serializable MVCC draws a commit timestamp before validation and makes
+  commit order the serialization order. GPU DB should publish visibility as
+  an explicit generation only after WAL, invalidation, and validation
+  descriptors are complete.
+- **Descriptors are the common currency.** WAL fragments, cold page fetches,
+  and MVCC validation can all use sealed descriptors carrying owner id,
+  table/partition, generation, touched columns, key/predicate range, buffer
+  ownership, and completion state. That gives the runtime one way to reason
+  about backpressure, stale completions, and route validity.
+- **Recent writes matter more than historical reads.** Retained GPU reads
+  may scan large snapshots, but serializable validation and invalidation
+  should usually test compact write descriptors since the read generation,
+  not copy every read row. This matches the need for many logical sessions
+  with cheap snapshot handles.
+- **Storage queues and MVCC queues must coordinate.** Cold-tier fetches and
+  WAL writes can share NVMe devices. Admission has to know whether the next
+  generation is waiting on durability, cold data, validation, or response
+  buffers, otherwise high throughput will only hide p99 latency elsewhere.
+
+**Category gaps:** The next few runs should keep alternating between modern
+transaction/MVCC papers and runtime or optimizer work. The queue still has
+good candidates for write admission and DDL/snapshot interaction, including
+Rapid Data Ingestion through DB-OS Co-design, Online Schema Evolution is
+(Almost) Free for Snapshot Databases, and ERMIA.
+
+**Benchmark priorities:**
+
+- Build a generation-frontier timeline with `executed`, `hardened`,
+  `invalidated`, `validated`, `visible`, `resident`, and `responded`
+  timestamps for COPY, retained reads, and cold-tier reads.
+- Prototype sealed write descriptors once and reuse them for WAL publish,
+  retained-route invalidation, serializable validation, and GPU resident
+  refresh decisions.
+- Measure NVMe interference between WAL flushes and cold partition fetches
+  before tuning GPU kernels for over-resident routes.
+- Add a retained-read correctness gate where stale cold-tier completions,
+  stale GPU resident buffers, and post-snapshot writes all fail closed with
+  explicit fallback or retry reasons.

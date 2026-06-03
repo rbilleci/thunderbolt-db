@@ -282,9 +282,10 @@ Append new candidates here as each paper is processed.
   URL: `https://dl.acm.org/doi/10.1145/3639315`
   Why: stored-procedure synthesis for reducing client/server transaction
   round trips while keeping application logic maintainable.
-- `queued` — **Practical DB-OS Co-Design with Privileged Kernel Bypass**,
+- `reviewed` — **Practical DB-OS Co-Design with Privileged Kernel Bypass**,
   Zhou et al., SIGMOD 2025.
-  URL: `https://dl.acm.org/doi/10.1145/3725339`
+  URL: `https://dl.acm.org/doi/10.1145/3709714`
+  PDF: `https://zxjcarrot.github.io/files/libdbos_SIGMOD25.pdf`
   Why: follow-up DB/OS kernel-bypass design from the Looking Glass 2.0 authors;
   directly relevant to low-overhead networking, IPC, and isolation boundaries.
 - `queued` — **Predicate Transfer: Efficient Pre-Filtering on Multi-Join
@@ -302,9 +303,10 @@ Append new candidates here as each paper is processed.
   URL: `https://doi.org/10.1145/3662010.3663450`
   Why: modern GPU compressed-data execution follow-up for resident and
   over-resident compressed page experiments.
-- `queued` — **Fast Serializable Multi-Version Concurrency Control for
+- `reviewed` — **Fast Serializable Multi-Version Concurrency Control for
   Main-Memory Database Systems**, Neumann et al., SIGMOD 2015.
   URL: `https://dl.acm.org/doi/10.1145/2723372.2749436`
+  PDF: `https://www-db.cs.tum.edu/~muehlbau/papers/mvcc.pdf`
   Why: direct OMVCC baseline for transaction repair, with timestamp,
   validation, and version-chain design relevant to serializable MVCC in a
   memory-resident engine.
@@ -754,6 +756,13 @@ Append new candidates here as each paper is processed.
   Why: learned hint-based optimizer baseline compared by PAR2QO; useful for
   deciding whether GPU route tuning should learn bounded hints around a
   deterministic planner rather than replace route rules.
+- `queued` — **Online Schema Evolution is (Almost) Free for Snapshot
+  Databases**, Hu et al., PVLDB 2022.
+  URL: `https://www.vldb.org/pvldb/vol16/p140-hu.pdf`
+  Why: modern snapshot-database follow-up discovered while reviewing
+  serializable MVCC; relevant to DDL/catalog generation changes, retained
+  snapshots, and whether schema evolution can avoid blocking GPU-resident
+  readers.
 
 - `reviewed` — **AGILE: Lightweight and Efficient Asynchronous GPU-SSD
   Integration**, Yang et al., SC 2025.
