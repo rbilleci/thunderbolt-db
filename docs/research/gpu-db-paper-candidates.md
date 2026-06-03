@@ -2250,7 +2250,7 @@ Append new candidates here as each paper is processed.
   latch-free range-index designs; BzTree is a relevant follow-up for
   hot-tier range indexes, NVM/future-tier persistence, and migration-safe
   updates.
-- `queued` — **No Cap, This Memory Slaps: Breaking Through the Memory Wall
+- `reviewed` — **No Cap, This Memory Slaps: Breaking Through the Memory Wall
   of Transactional Database Systems with Processing-in-Memory**, Kim,
   Zhao, Pavlo, and Gibbons, PVLDB 2025.
   URL: `https://www.vldb.org/pvldb/vol18/p4241-kim.pdf`
@@ -2260,6 +2260,25 @@ Append new candidates here as each paper is processed.
   indexes, MVCC metadata, batching, and logging across CPU DRAM and PIM;
   useful for comparing GPU DB's future GPU/HBM, host-memory, and
   near-memory owner placement decisions.
+- `queued` — **AsyncDIMM: Achieving Asynchronous Execution in DIMM-Based
+  Near-Memory Processing**, Chen et al., HPCA 2025.
+  URL: `https://doi.org/10.1109/HPCA61900.2025.00048`
+  Why: OLTPim identifies mux-switch/control latency as a core blocker and
+  cites asynchronous DIMM execution as future hardware support; relevant to
+  deciding how GPU DB should price future near-memory tiers and asynchronous
+  offload queues.
+- `queued` — **PIM-Tree: A Skew-Resistant Index for
+  Processing-in-Memory**, Kang et al., PVLDB 2022.
+  URL: `https://doi.org/10.14778/3574245.3574254`
+  Why: OLTPim contrasts its one-round hash/range partitioned indexes with
+  PIM-Tree's skew-resistant placement; useful for balancing hot-key skew
+  against extra near-tier request rounds in future cache/index placement.
+- `queued` — **HybriDS: Cache-conscious Concurrent Data Structures for
+  Near-Memory Processing Architectures**, Choe et al., SPAA 2022.
+  URL: `https://doi.org/10.1145/3490148.3538572`
+  Why: OLTPim cites HybriDS for keeping frequently used upper tree levels in
+  CPU cache while lower pointer-chasing work runs near memory; relevant to
+  GPU DB's split CPU/GPU/future-tier index residency decisions.
 - `queued` — **HetCache: Synergising NVMe Storage and GPU Acceleration for
   Memory-Efficient Analytics**, Nicholson, Raza, Chrysogelos, and Ailamaki,
   CIDR 2023.

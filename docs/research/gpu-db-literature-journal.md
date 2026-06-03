@@ -26998,3 +26998,185 @@ for owner pools. The pass condition is not merely better throughput.
 The system must identify the saturated boundary: response credits,
 warm mini-segment bytes, cold IO queue depth, merge backlog, GPU
 execution queue, or WAL/visibility publication.
+
+### 2026-06-04 - OLTPim near-memory placement for OLTP indexes and MVCC metadata
+
+**Citation:** Hyoungjoo Kim, Yiwei Zhao, Andrew Pavlo, and
+Phillip B. Gibbons. "No Cap, This Memory Slaps: Breaking Through
+the Memory Wall of Transactional Database Systems with
+Processing-in-Memory." PVLDB 18(11):4241-4254, 2025.
+doi:10.14778/3749646.3749690. Retrieved 2026-06-04 from
+`https://www.vldb.org/pvldb/vol18/p4241-kim.pdf`.
+
+**Category:** transaction processing / write path and multi-tier
+cache / data placement, with MVCC visibility implications.
+
+**Relevance tags:** OLTP; processing-in-memory; near-data
+processing; pointer chasing; MVCC metadata placement; version
+chains; primary and secondary indexes; rank batching; coroutines;
+NUMA partitioning; logging and rebuildable metadata; future
+memory tiers.
+
+**Core idea:** OLTPim argues that in-memory OLTP is often capped
+by memory-channel traffic rather than CPU instruction count. Its
+answer is not to move the whole database into processing-in-memory
+modules. Instead, it uses a near-memory affinity model to decide
+which operations are worth offloading. Pointer-chasing structures
+with small inputs and outputs, such as B+tree traversals and MVCC
+version-chain traversals, go to PIM. Tuple payloads stay in ordinary
+DRAM because fetching a tuple through PIM would still move the
+tuple over the CPU memory channel while also paying PIM control
+costs.
+
+The strongest transferable idea is this split: place route metadata
+near the tier that can traverse it cheaply, but keep payload and
+durable authority where the main executor can use them without
+extra copy or control latency. OLTPim reports up to 1.71x higher
+transaction throughput and up to 6.14x less per-transaction memory
+channel traffic than MosaicDB on its evaluated YCSB cases, but the
+more important design lesson for GPU DB is the placement model:
+offload only work whose hidden memory traffic is larger than the
+request/response and scheduling overhead.
+
+**Concrete mechanisms:**
+
+- OLTPim splits the DBMS between CPU DRAM and PIM local memory.
+  Indexes and MVCC version chains live in PIM; tuple data,
+  transaction management, orchestration, and logging remain on the
+  CPU side.
+- The paper defines near-memory affinity as the far-memory traffic
+  saved by executing an operation near the data after subtracting
+  the input/output traffic needed to issue and return the operation.
+  B+tree traversal and version-chain traversal are positive-affinity
+  operations; tuple fetch is negative-affinity.
+- PIM-side indexes are hash/range partitioned across modules. A key
+  is shifted by a configurable number of bits before hashing so the
+  system can trade scan locality against hot-key load balance.
+- The primary index entry and the tuple's version chain are placed
+  in the same PIM module to merge dependent work into one PIM
+  round. Secondary indexes cannot generally colocate with primary
+  version chains, so they may require an extra dependent PIM
+  operation and store visibility CSNs to filter stale entries.
+- MVCC metadata is newest-to-oldest in PIM. The PIM engine traverses
+  the index and version chain and returns the visible tuple's DRAM
+  pointer to the CPU engine.
+- Tuple data remains in DRAM. To support garbage collection, OLTPim
+  keeps a redundant tuple chain in DRAM; the PIM engine returns the
+  first obsolete tuple pointer and count so the CPU can reclaim the
+  DRAM tuple chain without walking all version metadata itself.
+- Updates acquire a PIM-side write lock on the last version. The
+  PIM-local lock protects both the PIM version metadata and the
+  corresponding DRAM tuple chain for cooperative GC.
+- Commit and abort send write-set object IDs to PIM modules so PIM
+  engines can publish or remove modifications and release locks.
+  The paper notes a redundant PIM write set could reduce this
+  traffic for larger write sets, but the evaluated TPC-C write sets
+  are spread thinly across 2048 modules.
+- Durability logs CPU-visible information: index id, PIM id, object
+  id, and tuple data. PIM indexes and version chains are not logged;
+  recovery rebuilds them for valid tuples and initializes version
+  chains from logged update history.
+- A per-rank batcher hides PIM round latency. It uses flat combining
+  so worker threads perform combiner jobs without adding OS threads,
+  coroutines to interleave CPU work while PIM programs run, and
+  NUMA-aware partitioning so combiner metadata does not bounce
+  across sockets.
+- The UPMEM implementation has practical constraints: mux-switch
+  latency, rank-wise interleaving, no dynamic allocation in PIM
+  modules, atomics only in a small hardware region, limited
+  instruction memory, and manually managed scratchpad memory.
+
+**GPU DB mapping:** GPU DB should borrow OLTPim's placement test
+before inventing future HBM/host/NVMe/near-memory routes. The
+question is not "can this tier compute?" but "does this route hide
+more memory traffic than it adds in control, transfer, batching,
+and visibility costs?" For current GPU DB, that suggests keeping
+WAL, transaction publication, and tuple truth CPU-owned while
+letting GPU or future near-memory tiers own rebuildable access
+metadata and route-specific acceleration state.
+
+For P8, the direct analogy is resident and warm metadata placement.
+GPU-resident indexes, host warm mini-segments, cold-tier location
+maps, and version-summary structures should be treated like
+OLTPim's PIM metadata: useful only when the request payload is
+small, the traversal would otherwise be pointer-heavy or cache-miss
+heavy, and the output can be a compact pointer, row id, bitmap, or
+visibility-qualified batch. Moving full tuples or arbitrary row
+payloads through the accelerator tier may be negative-affinity if
+the CPU still needs to encode protocol output or enforce
+transaction rules.
+
+The MVCC split is especially relevant. A GPU DB retained route
+could keep visibility summaries, latest visible row ids, or per-key
+version heads near the execution tier while the CPU owner remains
+the durable authority. On recovery, those summaries should be
+rebuildable from WAL/checkpoint state, just as OLTPim rebuilds PIM
+indexes and version chains instead of logging them as durable truth.
+That maps cleanly to the existing rule that resident GPU state is a
+performance cache tied to source WAL and catalog generations.
+
+OLTPim's batcher also maps to session scale. Per-rank batching is a
+hardware-specific version of the runtime's owner/ring idea: use
+the smallest independently controllable unit, avoid global
+bulk-synchronous waits, and make request lists, combiner latches,
+and coroutine counts bounded and NUMA-local. GPU DB can apply the
+same principle to GPU streams, cold IO queues, residency owners,
+and future near-memory ranks.
+
+**Risks and mismatches:** OLTPim targets PIM hardware, not GPUs.
+UPMEM PIM cores are tiny in-order processors close to DRAM; GPUs
+have much higher compute throughput, very different memory
+coalescing rules, kernel-launch costs, and HBM capacity constraints.
+The exact batch sizes, mux-switch costs, and rank interleaving
+tradeoffs do not transfer directly.
+
+The design is tuned for high-throughput indexed OLTP with small
+tuple accesses, not analytical scans or full SQL planning. Tuple
+payloads in DRAM make sense for its workload, but GPU DB may still
+want columnar GPU payloads for retained scans and aggregates. The
+paper also shows weaknesses: small tables or highly skewed working
+sets can favor CPU cache; large batch sizes can increase abort rate
+and context footprint; insert-heavy workloads suffer from PIM-side
+B+tree insert costs and coarse-grained latches; and update-heavy
+small tables can create GC overhead.
+
+The implementation uses RAM-disk logging and does not focus on
+WAL flush latency, PostgreSQL protocol behavior, DDL, SQL type
+coverage, or GPU snapshot correctness. GPU DB should reuse the
+rebuildable-metadata principle but must preserve WAL-before-
+visibility and retained snapshot invalidation before taking any
+near-memory shortcut.
+
+**Benchmark candidates:**
+
+- Add a "near-memory affinity" accounting benchmark for candidate
+  routes: CPU index lookup, GPU resident lookup, host warm
+  mini-segment, cold location map, and future near-memory metadata.
+  Required metric: bytes moved over each boundary versus compact
+  request/response bytes and queue wait.
+- Prototype visibility-summary placement separate from tuple
+  payload. Gate: retained reads return exactly the CPU MVCC truth
+  while visibility summaries are rebuildable after crash/replay.
+- Compare full-payload GPU transfer against compact metadata-first
+  lookup for point queries: key batch to accelerator, compact row ids
+  back, then CPU payload/protocol encoding. Failure condition:
+  compact route saves bytes but increases p99 through extra round
+  trips.
+- Add a bounded per-tier batcher experiment modeled on OLTPim:
+  per-GPU-stream, per-cold-owner, or per-future-rank request lists
+  with flat-combining-style ownership and coroutine/task
+  interleaving. Metrics: p50/p99 latency, batch size, queue wait,
+  cross-NUMA traffic, and overload reason.
+- Measure skew sensitivity for resident index placement. Compare
+  one-round hash partitioning, scan-friendly range partitioning,
+  and skew-aware repartitioning. Failure condition: a scheme improves
+  uniform throughput but collapses on hot keys or repeated prefix
+  scans.
+- Test WAL-safe rebuildable acceleration metadata: do not log GPU or
+  warm-tier index/version summaries; rebuild them after replay and
+  prove they match the logged tuple history and catalog generation.
+- Track telemetry for `route_affinity_saved_bytes`,
+  `route_control_bytes`, `route_round_trips`, `route_batch_size`,
+  `route_context_bytes`, `metadata_rebuild_ms`,
+  `visibility_summary_hits`, `visibility_summary_invalidations`,
+  `tier_skew_hot_owner_wait_us`, and `tier_gc_obsolete_versions`.
