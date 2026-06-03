@@ -555,8 +555,8 @@ Append new candidates here as each paper is processed.
   URL: `https://www.vldb.org/pvldb/vol18/p3840-cui.pdf`
   Why: modern low-tail transaction follow-up that cites Plor; relevant to
   predictable transaction admission and retry behavior under high contention.
-- `queued` — **Rebirth-Retire: A Concurrency Control Protocol Adaptable to
-  Dynamic Workloads**, Zhang et al., PVLDB 2025.
+- `reviewed` — **Rebirth-Retire: A Concurrency Control Protocol Adaptable to
+  Different Levels of Contention**, Zhang et al., PVLDB 2025.
   URL: `https://www.vldb.org/pvldb/vol18/p3162-zhang.pdf`
   Why: modern MVCC/concurrency-control work that discusses Plor and adapts to
   changing workload conditions; useful for deciding when GPU DB should switch
@@ -944,3 +944,17 @@ Append new candidates here as each paper is processed.
   Why: receiver-driven short-message transport and priority scheduling for
   datacenter RPCs; relevant to future GPU DB network admission and tail-latency
   budgeting once pgwire sessions are multiplexed over fewer IO workers.
+- `queued` — **Releasing Locks As Early As You Can: Reducing Contention of
+  Hotspots by Violating Two-Phase Locking**, Guo, Wu, Yan, and Yu,
+  SIGMOD 2021.
+  URL: `https://doi.org/10.1145/3448016.3457294`
+  Why: Bamboo/Wound-Retire is the direct baseline improved by
+  Rebirth-Retire; useful for comparing active lock retirement, dirty
+  dependency tracking, and hotspot write admission before adopting a
+  passive-retire variant.
+- `queued` — **Dynamic Timestamp Allocation for Reducing Transaction
+  Aborts**, Arora et al., IEEE CLOUD 2018.
+  URL: `https://doi.org/10.1109/CLOUD.2018.00041`
+  Why: dynamic timestamp baseline discussed by Rebirth-Retire; useful for
+  deciding whether GPU DB should allocate commit/order ranges per owner or
+  transaction class rather than relying on a single global timestamp path.

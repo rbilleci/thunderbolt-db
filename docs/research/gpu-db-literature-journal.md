@@ -9443,3 +9443,180 @@ design rather than another GPU analytics or learned-optimizer paper.
   independent miss parallelism and enough execution contexts to hide latency.
 - Treat ParamTree-style learned weights as advisory inside each class, never as
   a replacement for hard snapshot, WAL, residency, and queue-capacity gates.
+
+### 2026-06-03 - Rebirth-Retire adaptive contention control
+
+**Citation:** Qian Zhang, Yiwen Xiang, Jianhao Wei, Yang Yang, Yifan
+Li, Xueqing Gong, and Wanggen Liu. "Rebirth-Retire: A Concurrency
+Control Protocol Adaptable to Different Levels of Contention." PVLDB
+18(9), 2025, pp. 3162-3174. doi:10.14778/3746405.3746435.
+Retrieved 2026-06-03 from
+`https://www.vldb.org/pvldb/vol18/p3162-zhang.pdf`.
+
+**Category:** Transaction processing / write path and concurrency
+control.
+
+**Relevance tags:** contention management; lock retirement; dynamic
+timestamps; deadlock avoidance; dependency tracking; hot keys;
+long read-only transactions; abort reduction; owner queues; write
+admission.
+
+**Core idea:** Rebirth-Retire improves Bamboo/Wound-Retire by making
+early lock release demand-driven and by replacing unconditional
+"older kills younger" conflict handling with dynamic timestamp
+rebirth. A transaction that holds a lock does not proactively retire
+it after every access. Instead, a conflicting requester initiates
+retirement only when the lock is actually blocking useful work.
+
+The second idea is that an older transaction need not abort a younger
+owner unless the dependency graph says rebirth would create a cycle.
+The older transaction and its descendants can be assigned larger
+timestamps so they logically move after the conflicting younger
+transactions. In the paper's DBx1000 experiments, this combination
+reduces unnecessary aborts and improves throughput under skewed
+YCSB and TPC-C contention while avoiding the low-contention overhead
+that hurt active Wound-Retire.
+
+**Concrete mechanisms:**
+
+- Each tuple lock entry keeps `waiters`, `owners`, and `retired` lists
+  ordered by transaction timestamp. A retired owner has released the
+  lock early but still creates dependencies for transactions that
+  observe or conflict with its tentative work.
+- Passive Retire is initiated by a waiting conflicting transaction,
+  not by the current lock owner. If no younger transaction is blocked,
+  no retire operation is paid for.
+- Exclusive-lock retirement waits until the owner has finished the
+  current write to the tuple. The paper adds a per-version `ready`
+  flag so a waiter does not expose an incomplete write.
+- Transactions track actual dependency edges with `parents` and
+  `children` lists instead of only a dependency counter. This costs
+  more metadata but makes deadlock checks possible.
+- A transaction can commit only after all parent transactions have
+  terminated and it has not been aborted. If an aborted transaction
+  releases an exclusive lock, dependent children cascade-abort.
+- When an older transaction conflicts with younger lock holders,
+  `TxnRebirth` topologically sorts the requester and all descendants
+  through child edges. If a younger conflicting holder appears in
+  that sorted set, rebirth would create a dependency cycle and that
+  younger transaction is aborted. Otherwise, the sorted transactions
+  receive larger timestamps.
+- The simple timestamp strategy assigns fresh globally largest
+  timestamps. The optimized "Larger" strategy assigns timestamps just
+  beyond the largest conflicting holder, with worker id bits included
+  to avoid duplicates and reduce global timestamp pressure.
+- Waiter promotion scans waiters in timestamp order. If a waiter
+  conflicts with an exclusive owner, it waits for `version.ready`,
+  moves current owners to `retired`, promotes the waiter to `owners`,
+  and records dependency edges against the last conflicting retired
+  transaction.
+- Optimizations include latch-free dependency tracking with an 8-byte
+  word for common child-list cases, optimistic reads of descendants,
+  minimized rebirth operations by reading older visible versions, and
+  software prefetch jump pointers for long version-chain traversal.
+- The implementation is in DBx1000, a row-oriented in-memory DBMS
+  prototype. Evaluation uses YCSB and TPC-C, with contention varied by
+  tuple count, transaction count, operations per transaction, write
+  ratio, Zipf skew, and warehouse count.
+- Reported findings include passive Retire outperforming active Retire
+  across evaluated YCSB contention levels; Rebirth-Active Retire
+  improving medium-contention throughput by 49% and reducing abort rate
+  by 84% versus Wound-Active Retire; full Rebirth-Retire reaching about
+  2x Wound-Retire throughput with about 3x lower abort rate at 40 YCSB
+  worker threads in one skewed workload; and high-contention TPC-C
+  throughput around 600K transactions/s while other evaluated protocols
+  stayed below 300K transactions/s. These are paper-reported results,
+  not GPU DB measurements.
+
+**GPU DB mapping:** The transferable design rule is "pay complex
+contention machinery only when a real conflict appears." GPU DB's
+mutation owners should not maintain expensive dependency, retire, or
+rebirth metadata on every write if hot-key contention is absent. A
+cheap owner-local path should hold the write batch until commit; only
+when waiters, skew, queue age, or abort telemetry crosses a threshold
+should it switch to a retire/dependency mode.
+
+Passive Retire maps to publication boundaries. For a hot row, key, or
+partition, a mutation batch could expose a completed write subresult to
+later same-owner work before the full transaction reaches commit, but
+only behind explicit dependency edges and only after WAL and visibility
+rules for external readers remain intact. The immediate use is not
+external dirty reads; it is reducing owner-queue blocking among
+transactions whose dependency order can be represented and later
+resolved.
+
+Rebirth maps to adaptive ordering inside a bounded owner queue. If an
+older admitted transaction discovers that a younger transaction already
+owns a hot key, the owner does not always need to kill the younger work
+or stall the queue. It can demote the older transaction's local priority
+when the dependency graph remains acyclic, preserving useful work and
+reducing abort churn. This is especially relevant for skewed writes
+where deterministic order, OCC validation, and pure first-writer-wins
+all risk wasting work or extending queue waits.
+
+The `ready` flag is a useful bridge between write execution and
+visibility. GPU DB already treats WAL-before-visibility as non-
+negotiable, but internal owner scheduling also needs a smaller
+"write fragment complete" marker before dependent work can proceed.
+For GPU-assisted updates or refreshes, that marker may include CPU value
+materialization, WAL record construction, index delta availability, and
+resident invalidation status.
+
+The long read-only experiment also matters for retained snapshots.
+Rebirth-Retire benefits when long reads do not block short read-write
+transactions and can traverse to visible versions efficiently. GPU DB
+should keep retained analytical reads from pinning hot write locks or
+owner queues, while still recording enough dependency and version-chain
+telemetry to know when long snapshots are harming hot-key progress.
+
+**Risks and mismatches:** Rebirth-Retire is a lock-based in-memory OLTP
+protocol, not a GPU execution or MVCC snapshot protocol. It permits
+dirty reads and writes internally with dependency tracking; GPU DB must
+not expose dirty data to SQL clients or weaken WAL-before-visibility.
+Any mapping must be inside an owner-domain scheduler or transaction
+batch, not a shortcut for external snapshot semantics.
+
+The paper's data structures are tuple-lock lists and transaction
+dependency lists in a CPU row store. GPU DB may use partition owners,
+columnar resident snapshots, append-only WAL batches, and GPU refresh
+state rather than per-tuple locks. Topological sorting over descendant
+transactions is acceptable only when the dependency subgraph is small
+and measured; a hot GPU DB partition with thousands of blocked requests
+could turn the rebirth check into the bottleneck.
+
+The evaluation uses DBx1000 stored procedures, 40 hardware threads,
+YCSB, and TPC-C. It does not evaluate PostgreSQL protocol sessions,
+GPU kernels, NVMe tiers, crash recovery, DDL, or multi-GPU residency.
+The reported throughput numbers are therefore useful for contention
+shape, not absolute capacity targets.
+
+**Benchmark candidates:**
+
+- Add a hot-key owner-queue benchmark with skewed updates and reads.
+  Compare first-writer-wins, abort/retry, deterministic batch order, and
+  a bounded rebirth-style priority-demotion prototype. Gate: identical
+  committed state and WAL replay across all policies.
+- Add conflict-triggered metadata accounting to the mutation path:
+  count when dependency tracking is absent, armed, used, and retired.
+  Expected result: low-contention writes do not pay dependency-graph
+  overhead.
+- Prototype a passive-retire-like internal stage for one stored
+  procedure class: after a write fragment is complete and WAL intent is
+  formed, dependent same-owner work can proceed behind an explicit edge.
+  Failure condition: any SQL-visible snapshot can observe data before
+  the configured visibility boundary.
+- Measure topological-sort or dependency-walk cost under controlled
+  hot-key fanout. Gate: rebirth checks remain bounded by a small
+  descendant cap; above the cap, the owner falls back to deterministic
+  ordering or explicit overload rather than unbounded graph work.
+- Track abort causes separately: true dependency cycle, validation
+  failure, stale resident generation, WAL failure, timeout, overload,
+  and explicit policy demotion. Expected improvement: fewer false aborts
+  under skew without hiding failed correctness checks.
+- Add a long retained snapshot plus hot write benchmark. Measure whether
+  long reads increase owner lock wait, dependency wait, version-chain
+  traversal, or GPU snapshot retirement latency. Gate: fresh write p95
+  does not grow linearly with retained-snapshot age.
+- Test version-chain prefetch or jump-pointer metadata for hot updated
+  keys before GPU encoding. Failure condition: extra metadata slows the
+  common short-chain path more than it helps long-chain retained reads.
