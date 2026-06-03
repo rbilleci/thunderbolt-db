@@ -8737,3 +8737,177 @@ practical.
   enqueue only. Gate: no CUDA resource is touched by non-owner workers, and
   queue wait plus batch-drain telemetry explains p99 latency under bursty
   retained lookup traffic.
+
+### 2026-06-03 - GaccO GPU-accelerated OLTP co-execution
+
+**Citation:** Nils Boeschen and Carsten Binnig. "GaccO - A GPU-accelerated
+OLTP DBMS." SIGMOD 2022, pages 1003-1016. doi:10.1145/3514221.3517876.
+Retrieved 2026-06-03 from the DFKI publication page at
+`https://www.dfki.de/en/web/research/projects-and-publications/publication/14413`;
+ACM DOI metadata is at `https://doi.org/10.1145/3514221.3517876`. The ACM PDF
+was not directly retrievable from this worker, so mechanism details below are
+based on the DFKI abstract/metadata plus indexed paper text from the public
+document record.
+
+**Category:** Transaction processing / write path, with GPU execution.
+
+**Relevance tags:** GPU OLTP; batched stored procedures; CPU/GPU
+co-execution; deterministic concurrency control; single-version GPU copy;
+primary CPU copy; update propagation; same-type transaction queues; TPC-C;
+NewOrder; Payment; larger-than-HBM working sets.
+
+**Core idea:** GaccO makes the GPU useful for OLTP by refusing to send
+individual tiny transactions to the device one at a time. It routes frequent,
+stored-procedure transaction types to per-type GPU queues, batches only
+transactions of the same type, and executes those batches with a GPU-centric
+deterministic concurrency scheme. Less frequent or unsuitable transaction
+types continue to run on the CPU.
+
+The design is deliberately a co-execution system rather than a GPU-only
+database. CPU memory keeps the primary copy of tables, while GPU memory holds a
+secondary copy, potentially only for the subset of data needed by the
+GPU-routed transaction types. That lets GaccO avoid moving whole tables during
+normal execution and still handle databases larger than GPU memory by relying
+on CPU memory for the full working set.
+
+**Concrete mechanisms and findings:**
+
+- Incoming transactions are classified by transaction type. Dominating
+  transaction types, such as TPC-C `NewOrder` or `Payment`, can be routed to
+  the GPU; non-dominating types run individually on the CPU.
+- GPU work is grouped by a separate queue per transaction type. The same-type
+  rule reduces branch divergence and makes memory access patterns less random
+  than an arbitrary mixed transaction batch.
+- GaccO currently assumes stored procedures and uses a static type-to-device
+  routing policy. Dynamic load adaptation and ad-hoc transaction support are
+  described as future extensions, not solved mechanisms.
+- GPU-side execution has pre-processing, transaction-kernel execution, and
+  post-processing phases. The pre-processing step orders conflicting accesses
+  inside the batch so the batch can execute deterministically.
+- The paper describes the GPU concurrency-control scheme as deterministic and
+  abort-free for transactions inside a batch. Based on indexed paper text and
+  later Epic discussion, this is a single-version deterministic locking style,
+  closer to Calvin-like ordered access than to general MVCC.
+- CPU tables are multi-versioned, while GPU tables are single-versioned in the
+  architecture diagram. CPU/GPU co-execution therefore requires update
+  propagation and isolation coordination between the CPU primary copy and GPU
+  secondary copy.
+- The secondary GPU copy may cover only part of the database, allowing
+  larger-than-device-memory workloads when the GPU-routed transaction types can
+  operate on resident subsets and updates are propagated.
+- The evaluation uses TPC-C variants and reports up to 6x throughput speedup
+  over a CPU-only OLTP engine. The paper also claims batched GPU latency is in
+  the millisecond range, which it argues is tolerable for some OLTP
+  applications.
+- Unknown from the accessible text in this run: exact lock-table layout,
+  precise conflict ordering algorithm, exact update-propagation barrier,
+  durability protocol, hardware configuration details, and full latency
+  distribution tables.
+
+**GPU DB mapping:** GaccO is the closest reviewed source so far to "GPU DB as
+an OLTP accelerator" rather than "GPU DB as an analytical scan engine." Its
+strongest transferable idea is the same-shape transaction lane: choose a small
+number of high-frequency request or transaction templates, give each a bounded
+queue, and batch only templates whose access pattern, output shape, and
+visibility boundary match. That maps directly to retained point lookups,
+filtered aggregates, COPY chunk admission, and maybe a future stored-procedure
+write path.
+
+The CPU-primary/GPU-secondary storage split is already aligned with P8. WAL,
+checkpoint, MVCC tuple state, and CPU indexes remain the durable authority;
+GPU-resident layouts are secondary acceleration state. GaccO strengthens the
+case that GPU-resident transaction acceleration should not require the whole
+database in HBM. The first production-safe variant for GPU DB should be
+resident partitions or resident key ranges with explicit update propagation and
+route rejection when the needed partition is absent or stale.
+
+GaccO's static stored-procedure routing is useful as a first benchmark shape
+even if it is too narrow for final SQL service. GPU DB can start with declared
+route templates: retained lookup by key, retained filtered aggregate, and
+possibly a single deterministic update template. Each template should publish
+its exact read/write set requirements, resident layout, visibility boundary,
+and batch compatibility key.
+
+The deterministic batch idea is attractive for writes, but it should be kept
+behind WAL-before-visibility. A GPU write batch should not make external
+visibility decisions on the device first. A safer adaptation is: CPU mutation
+owner admits and WAL-logs a deterministic chunk, GPU computes conflict-free or
+ordered effects for eligible resident partitions, CPU owner validates the
+device result against the admitted generation, then publishes the visibility
+boundary and invalidates or refreshes resident snapshots.
+
+For reads, GaccO's same-type queues reinforce the runtime design from ZygOS and
+Shinjuku: work conservation matters, but compatibility boundaries matter more.
+Stealing a ready session is safe only if the worker preserves session response
+ordering and routes GPU work into the correct same-shape, same-generation batch
+lane.
+
+**Risks and mismatches:** GaccO is optimized for stored-procedure OLTP, not
+arbitrary SQL planning. The GPU table copy is single-versioned, while the
+current engine's correctness model is MVCC with WAL-before-visibility and
+invalidated immutable retained snapshots. Millisecond-scale GPU batch latency
+may be too high for short point reads or latency-sensitive sessions even when
+aggregate throughput is excellent. The static routing policy can misroute work
+when contention, residency, or queue depth changes. Finally, the paper's
+accessible text does not expose enough detail to treat its lock-table and
+update-propagation algorithm as implementation-ready; use it as a benchmark
+shape and architecture contrast, not as a drop-in concurrency protocol.
+
+**Benchmark candidates:**
+
+- Build a same-template GPU batch-lane simulator for retained reads and one
+  synthetic stored-procedure write template. Compare mixed request batching
+  against per-template queues. Metrics: throughput, branch-divergence proxy,
+  queue wait, p95/p99 latency, and rejected incompatible requests.
+- Add a route-admission experiment with CPU-primary/GPU-secondary partition
+  residency. Gate: GPU route is allowed only when table id, partition id,
+  source WAL boundary, visibility boundary, and resident layout generation all
+  match.
+- Prototype a deterministic write-batch proof that logs on the CPU before
+  device execution and publishes visibility only after CPU validation of the
+  GPU result. Failure condition: any path exposes a GPU-computed write before
+  WAL durability and invalidation are complete.
+- Compare batch-size triggers for same-type retained lookups: count threshold,
+  microsecond threshold, and dual threshold. Required result: throughput gain
+  without pushing p99 past the configured latency ceiling.
+- Add a larger-than-HBM OLTP residency test where only hot partitions for one
+  transaction template are resident on the GPU. Measure route hit rate, update
+  propagation bytes, CPU fallback rate, and latency when the working set moves.
+- Evaluate static template routing against telemetry-aware routing that can
+  fall back to CPU when GPU queue depth, resident freshness, or partition
+  absence makes the batch route fragile.
+
+### 2026-06-03 - Cross-paper synthesis: batch lanes need visibility fences
+
+The recent reviews of mmap, TPP, ZygOS, and GaccO converge on one practical
+track: high-throughput GPU DB needs narrow, explicit lanes rather than broad
+implicit magic. mmap warns against hiding database residency behind OS fault
+behavior. TPP shows that tiering works best with headroom, hysteresis, and
+promotion/demotion telemetry. ZygOS shows that session work should be
+work-conserving without losing per-socket ownership. GaccO shows that GPU OLTP
+only becomes plausible when work is batched by compatible transaction shape and
+coordinated with a CPU primary copy.
+
+The resulting design track is "same-shape, same-generation lanes." A retained
+route should enter a batch only when its template, partition, snapshot
+generation, output shape, tier source, and latency budget match. For writes,
+the equivalent batch lane must add a WAL and visibility fence: CPU owner
+admits, orders, and logs; GPU may accelerate deterministic effects; CPU owner
+publishes visibility and resident invalidation after validation.
+
+Category gaps remain around modern GPU-aware transaction protocols and
+end-to-end SQL protocol admission under very high logical session counts. The
+next useful papers should include GPU OLTP/MVCC follow-ups, deterministic
+contention management, and high-concurrency networking/admission sources, not
+only analytical GPU execution.
+
+Benchmark priorities:
+
+- Same-template lane benchmark for retained lookups, aggregates, and one
+  deterministic write template, with queue wait and batch drain telemetry.
+- Visibility-fenced GPU write-batch proof that refuses to publish before WAL,
+  invalidation, and CPU validation complete.
+- Tier-aware route admission test that rejects when HBM/host headroom or
+  resident generation is insufficient.
+- Work-conserving session scheduler benchmark that can steal ready work while
+  preserving per-session response ordering and batch-lane compatibility.

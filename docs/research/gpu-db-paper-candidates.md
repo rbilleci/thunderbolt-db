@@ -475,9 +475,9 @@ Append new candidates here as each paper is processed.
   URL: `https://www.usenix.org/conference/osdi24/presentation/qian`
   Why: Shirakami cites this modern MVCC transaction-processing work; relevant
   to high-core-count versioned execution and future owner/partition scaling.
-- `queued` — **GaccO - A GPU-accelerated OLTP DBMS**, Boeschen and Binnig,
+- `reviewed` — **GaccO - A GPU-accelerated OLTP DBMS**, Boeschen and Binnig,
   SIGMOD 2022.
-  URL: `https://doi.org/10.1145/3514221.3517846`
+  URL: `https://doi.org/10.1145/3514221.3517876`
   Why: GPU single-version deterministic locking baseline compared by Epic;
   relevant to deciding when commutative GPU updates beat general MVCC.
 - `queued` — **Caracal: Contention Management with Deterministic Concurrency
@@ -520,6 +520,14 @@ Append new candidates here as each paper is processed.
   Why: modern transaction scheduling work cited by PreemptDB; useful for
   contrasting non-preemptive priority ordering with interrupt-driven
   preemption and owner-queue admission.
+
+- `queued` — **Harnessing GPU Power for Enhanced OLTP: A Study in Concurrency
+  Control Schemes**, arXiv 2024.
+  URL: `https://arxiv.org/abs/2406.10158`
+  Why: modern GPU OLTP concurrency-control evaluation that compares GPU-adapted
+  2PL, timestamp ordering, MVCC, OCC, GPUTx, and GaccO-style conflict-graph or
+  deterministic locking schemes; useful follow-up for deciding which GPU write
+  batch protocol is benchmark-worthy.
 - `queued` — **LibPreemptible: Enabling Fast, Adaptive, and
   Hardware-Assisted User-Space Scheduling**, Li et al., HPCA 2024.
   URL: `https://doi.org/10.1109/HPCA57654.2024.00075`
