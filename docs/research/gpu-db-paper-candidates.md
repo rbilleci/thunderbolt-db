@@ -2360,3 +2360,16 @@ Append new candidates here as each paper is processed.
   Why: the reviewed GPU OLTP paper warns that naive MVCC version-chain
   traversal can erase read benefits; a GPU multiversion tree is a direct
   follow-up for compact visibility-aware index structures.
+- `reviewed` — **Scalable OLTP in the Cloud: What's the BIG DEAL?**,
+  Helland, CIDR 2024.
+  URL: `https://www.cidrdb.org/cidr2024/papers/p63-helland.pdf`
+  Why: selected because the ready queue skewed toward GPU analytics and this
+  modern RCSI/MVCC scaling thought experiment maps directly to commit-time
+  organization, time/key owner partitions, delayed visibility, and scalable
+  queue semantics for GPU DB snapshot routing.
+- `queued` — **Is Scalable OLTP in the Cloud a Solved Problem?**,
+  Ziegler, Bernstein, Leis, and Binnig, CIDR 2023.
+  URL: `https://www.cidrdb.org/cidr2023/papers/p50-ziegler.pdf`
+  Why: Helland's CIDR 2024 paper responds to this cloud OLTP design analysis;
+  useful for comparing single-writer shared storage, multiple-writer coherent
+  caching, shared-nothing partitioning, and hot-tuple cache-coherence tradeoffs.

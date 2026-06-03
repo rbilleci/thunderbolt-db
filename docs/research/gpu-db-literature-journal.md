@@ -27543,3 +27543,139 @@ small WAL-safe retained-mutation lab that measures publication lag
 and conflict cost before any write becomes visible, followed by a
 visibility-summary benchmark that proves GPU reads match CPU MVCC
 truth without chasing full version chains.
+
+### 2026-06-04 - RCSI scale comes from treating time and versions as first-class routing keys
+
+**Citation:** Pat Helland. "Scalable OLTP in the Cloud: What's
+the BIG DEAL? The Database AND the Application Have a BIG DEAL:
+Their Isolation Semantics." CIDR 2024. Retrieved 2026-06-04 from
+`https://www.cidrdb.org/cidr2024/papers/p63-helland.pdf`.
+
+**Category:** transaction processing / write path and MVCC /
+snapshot / visibility, with runtime/session-scale implications.
+
+**Relevance tags:** OLTP; RCSI; MVCC; snapshot reads; commit time;
+visibility time; owner partitions; key-range ownership; time-range
+ownership; SKIP LOCKED; scalable queues; delayed visibility; LSM;
+partition handoff; application contention.
+
+**Core idea:** The paper is a thought experiment rather than a
+measured system paper, but it is highly relevant to the GPU DB
+write/read split. Helland argues that common SQL plus Read
+Committed Snapshot Isolation semantics already contain the contract
+needed for scalable OLTP if both the database and application avoid
+unnecessary coordination. Reads can target immutable past versions;
+updates to disjoint records should not coordinate; and there is no
+single global "current" value that every reader and writer must
+visit.
+
+The strongest transferable idea is to make time and key ownership
+part of the physical routing model. Instead of organizing the
+database around a mutable current record home, the strawman stores
+changes by commit time first and key second, then serves snapshot
+reads by walking time/key ranges. Recent "now" partitions handle
+proposed updates, verify-locks, and fresh snapshot reads; older
+closed partitions become mostly read-only and can be replicated for
+read scale.
+
+**Concrete mechanisms:**
+
+- The paper assumes SQL-compatible RCSI: reads see committed
+  versions at a snapshot time, writes create new versions, and
+  applications must tolerate stale-but-accurate snapshots, aborts,
+  and `SKIP LOCKED` subsets.
+- It separates database guarantees from application responsibilities:
+  scalable applications avoid hot shared updates, while scalable
+  databases avoid coordination across disjoint transactions.
+- The strawman organizes updates into worker logs by transaction,
+  preserving atomicity by grouping all changes from one transaction
+  before they become visible.
+- Physical organization is commit-time first, then key. Locating the
+  latest visible version for a key can require searching backward
+  through owner-partition time ranges and then older LSM levels.
+- Owner partitions cover two-dimensional rectangles: a key range and
+  a time range. Open owner partitions accept proposed updates,
+  verify-locks, and snapshot reads; closed owner partitions are
+  mostly read-only and can be replicated.
+- For each proposed update, there is exactly one open-for-business
+  owner partition, with a handoff window where old and new owner
+  partitions may overlap and the older partition still checks
+  conflicts.
+- Commit time, visibility time, and snapshot time are distinct. A
+  commit may need to delay external visibility until the system can
+  guarantee later snapshots observe it; in larger distributed
+  systems, space effectively stretches time.
+- The queue example uses ULID-like keys and `SELECT ... SKIP LOCKED`
+  to let many consumers dequeue without requiring a single perfectly
+  current queue head.
+
+**GPU DB mapping:** GPU DB should keep the current WAL-first
+correctness rule, but this paper sharpens the shape of the retained
+read path. Published GPU snapshots should be indexed not only by
+relation and schema generation but by visibility time range and key
+or partition range. A read route should ask for "latest visible at
+snapshot S in key range K" rather than "the current value of K."
+That phrasing fits immutable resident segments, generation bitmaps,
+and compact latest-visible summaries better than direct MVCC-chain
+chasing.
+
+The owner-partition model also maps to runtime ownership. Mutation
+owners can own the turbulent recent range where proposed updates,
+WAL append, conflict checks, and visibility publication happen.
+Residency/GPU owners can own closed or stable generations, where
+snapshot reads are independent of current writes. That suggests a
+benchmark split between open-generation reads that fall back or
+wait, and closed-generation reads that can be replicated or retained
+on GPU without touching the mutation owner.
+
+For 1M logical sessions, the `SKIP LOCKED` queue discussion is a
+useful admission-control pattern. Some work queues and maintenance
+tasks can be explicitly approximate: consumers may take any visible
+eligible item, not the first global item. GPU DB can use this for
+refresh, eviction, warmup, and background compaction scheduling,
+while keeping SQL result correctness strict for ordinary user
+queries.
+
+The paper also reframes publication latency. Delaying a commit
+response or a visibility publication may increase coordination
+headroom, but GPU DB must expose that delay as a metric because it
+directly affects snapshot freshness and client-visible latency.
+
+**Risks and mismatches:** The paper is deliberately a thought
+experiment. It does not provide an implementation, throughput
+numbers, recovery protocol, dynamic index maintenance, or concrete
+GPU execution model. Its RCSI assumptions do not cover full
+serializable semantics, arbitrary PostgreSQL behavior, or strict
+FIFO queue semantics. The application-side advice to avoid hot
+shared keys is useful but cannot be required from every SQL client.
+
+Commit-time-first layout may increase point-lookup cost if the
+engine lacks compact latest-visible indexes, key-range summaries, or
+aggressive closed-partition compaction. GPU DB should treat the idea
+as a route/storage benchmark, not as permission to weaken
+WAL-before-visibility or hide stale reads from clients.
+
+**Benchmark candidates:**
+
+- Build a retained visibility-summary benchmark with segments keyed
+  by `(relation, key_range, visibility_time_range)` and compare it
+  against direct MVCC-chain traversal for point lookup and batched
+  lookup routes. Gate: visible row results must match the CPU MVCC
+  oracle for every tested snapshot boundary.
+- Simulate open versus closed generation routing: recent writes stay
+  mutation-owner-bound while closed generations publish immutable GPU
+  resident segments. Metrics: owner queue wait, publication lag,
+  snapshot freshness, p50/p99 read latency, and fallback rate.
+- Add `SKIP LOCKED`-style approximate dequeue benchmarks for
+  internal refresh/eviction tasks. Expected improvement: higher
+  worker utilization with fewer coordination stalls. Failure
+  condition: ordinary SQL-visible ordering or correctness semantics
+  are accidentally reused for approximate internal queues.
+- Track commit time, visibility publication time, and first-snapshot
+  observability as separate telemetry: `txn_commit_time`,
+  `txn_visibility_time`, `snapshot_observed_min_commit`,
+  `visibility_publication_lag_us`, and
+  `open_generation_conflict_checks`.
+- Test owner-partition handoff under a hot key range: close a busy
+  generation, open a new one, and measure conflict-check overlap,
+  read fallback, and retained snapshot invalidation cost.
