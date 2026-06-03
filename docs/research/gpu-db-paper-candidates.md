@@ -56,8 +56,8 @@ mechanical sympathy, multi-tier cache/data placement, or query optimization.
   URL: `https://www.sciencedirect.com/science/article/pii/S0306437924000437`
   Why: recent MVCC read-only transaction design for serializable snapshots
   under mixed OLTP/OLAP workloads.
-- `queued` — **On Supporting Efficient Snapshot Isolation for In-Memory
-  Database Storage**, PVLDB 2020.
+- `reviewed` — **On Supporting Efficient Snapshot Isolation for Hybrid
+  Workloads with Multi-Versioned Indexes**, PVLDB 2019.
   URL: `https://www.vldb.org/pvldb/vol13/p211-sun.pdf`
   Why: P-Tree index for efficient snapshot isolation and MVCC in multicore
   in-memory HTAP storage.
@@ -518,9 +518,19 @@ Append new candidates here as each paper is processed.
   URL: `https://doi.org/10.14778/3282495.3282502`
   PDF: `https://www.vldb.org/pvldb/vol12/p169-ding.pdf`
   Why: OCC batching and operation-reordering work; useful for deciding when
-  GPU DB write admission should batch full transaction stages rather than only
-  WAL, index, or GPU refresh substeps, and when batch-level write-set ordering
-  should be preferred over per-request optimistic validation in hot partitions.
+    grouped write admission can safely reorder operation execution within a
+    deterministic commit boundary, when GPU DB write admission should batch
+    full transaction stages rather than only WAL, index, or GPU refresh
+    substeps, and when batch-level write-set ordering should be preferred over
+    per-request optimistic validation in hot partitions.
+- `queued` — **Multiversion Concurrency with Bounded Delay and Precise
+  Garbage Collection**, Ben-David et al., SPAA 2019.
+  URL: `https://doi.org/10.1145/3323165.3323185`
+  PDF: `https://www.cs.cmu.edu/~yihans/papers/concurrency.pdf`
+  arXiv: `https://arxiv.org/abs/1803.08617`
+  Why: follow-up theoretical and experimental foundation for P-Tree-style
+  functional data structures, bounded reader/writer delay, and precise
+  version reclamation; relevant to long retained snapshots and GC budgets.
 - `queued` — **Morty: Scaling Concurrency Control with Re-Execution**,
   Burke et al., EuroSys 2023.
   URL: `https://doi.org/10.1145/3552326.3587441`

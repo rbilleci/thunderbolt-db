@@ -4468,3 +4468,140 @@ Benchmark priorities:
 - Require every GPU or future CXL route to report whether it improved
   latency/throughput by reducing movement, reducing conflicts, or only
   shifting work to a less visible queue.
+
+### 2026-06-03 - P-Tree multi-versioned indexes for HTAP snapshots
+
+**Citation:** Yihan Sun, Guy E. Blelloch, Wan Shen Lim, and Andrew
+Pavlo. "On Supporting Efficient Snapshot Isolation for Hybrid
+Workloads with Multi-Versioned Indexes." PVLDB 13(2), 2019.
+Retrieved 2026-06-03 from the PVLDB PDF,
+`https://www.vldb.org/pvldb/vol13/p211-sun.pdf`.
+
+**Category:** MVCC / snapshot / visibility and hybrid HTAP.
+
+**Relevance tags:** snapshot isolation; immutable indexes; path
+copying; functional data structures; batched writes; nested indexes;
+precise GC; read-only HTAP; version retention; parallel bulk updates.
+
+**Core idea:** P-Trees replace tuple-local version chains with
+immutable, path-copied index roots. A read transaction acquires a
+stable root pointer, and writers create a new tree version by copying
+only changed paths. Committing a transaction or update batch publishes
+a new top-level "world" root that points at all current indexes, so
+readers continue on old roots while new readers see the latest
+published root.
+
+The paper's strongest transfer is that visibility can be represented
+as an immutable access structure rather than as repeated per-tuple
+version-chain traversal. This is attractive for GPU DB retained reads:
+the runtime already wants immutable resident snapshots, and P-Trees
+show a CPU-side index/snapshot discipline where acquisition is cheap,
+readers are wait-free, and old versions are reclaimed precisely once
+no root references them.
+
+**Concrete mechanisms:**
+
+- Each tree node stores key/value data, child pointers, subtree size,
+  and a reference count. Updates copy affected paths and share
+  unchanged subtrees across versions.
+- A top-level world object stores pointers to all current indexes.
+  Acquiring a snapshot increments the root/world reference; committing
+  swaps the current world pointer to a new version.
+- Analytical operations such as range, filter, map-reduce, and
+  foreach-index are pure and can produce more P-Trees or values
+  without modifying input snapshots.
+- Bulk insert/delete use sorted update arrays plus divide-and-conquer
+  tree operations, allowing an update batch to be committed in
+  parallel while readers keep using the prior root.
+- Nested and paired indexes embed one tree inside another, providing a
+  virtual pre-join or hierarchy without materializing a copied table.
+  Updates path-copy through both outer and inner trees.
+- For serializable updates, the paper favors batching: collect writes
+  for a short interval, detect logical conflicts according to a linear
+  order, remove conflicted operations, and commit the conflict-free
+  remainder as one parallel batch.
+- Memory management uses per-thread node pools plus shared free-node
+  blocks. Reference-counted GC recursively frees nodes when a released
+  snapshot drops their count to zero.
+- Evaluation reports P-Trees outperforming or matching several
+  concurrent in-memory tree indexes on YCSB, 4-9x faster analytical
+  queries than HyPer/MemSQL on their TPC-H setup, average 62x
+  parallel speedup on 72 cores/144 hardware threads, and update
+  throughput close to MemSQL on the hybrid TPC-HC workload. The
+  update path is still weaker for some write-heavy transactions.
+
+**GPU DB mapping:** The direct GPU DB mapping is a two-level
+visibility handle: a CPU canonical immutable snapshot root plus a GPU
+resident layout generation derived from that root. Current P8
+resident snapshots already carry source WAL/transaction boundaries;
+P-Trees suggest that the source boundary should also be a durable
+access-structure identity, not only a scalar transaction id. A read
+route would prove compatibility by checking the world/root generation,
+table/schema identity, resident generation, and invalidation boundary.
+
+The batched commit model maps to mutation-owner admission. Rather
+than updating WAL, CPU indexes, MVCC metadata, and resident
+invalidation independently per request, a hot partition owner could
+drain a bounded write batch, sort/group by key or segment, apply
+parallel CPU index changes to a new immutable root, then publish one
+visibility boundary and one resident invalidation generation. This
+keeps WAL-before-visibility intact while giving reads a stable root.
+
+Nested indexes are useful as a design warning and opportunity. For GPU
+lookups, a resident key vector plus column buffers is a narrow nested
+structure: it can pre-filter or group rows before scan/aggregation.
+But full P-Tree-style nested pre-joins would consume memory and create
+refresh work. The product version should treat nested resident
+structures as explicit route families with byte cost, update cost, and
+invalidation telemetry.
+
+The GC design reinforces the need for retained snapshot retirement.
+GPU DB should account for old CPU roots, old resident buffers, and
+old placement descriptors together. A snapshot release should make it
+clear which CPU index nodes, pinned buffers, and GPU generations are
+eligible for reclamation, instead of leaving invalidated resident state
+to unbounded background cleanup.
+
+**Risks and mismatches:** P-Trees are CPU in-memory structures, not
+GPU kernels or disk-backed production storage. Their pointer-rich
+trees are not a natural GPU scan layout, and path copying can be more
+expensive than tuple-version append for small, high-rate OLTP writes.
+The paper serializes or batches updates in the tested DBMS; that is
+acceptable for read-dominant HTAP, but not enough by itself for a
+general high-write transaction engine.
+
+The reported OLAP gains depend heavily on nested indexes and a
+custom benchmark implementation. HyPer and MemSQL are full systems
+with different optimizers, compilation paths, compression, durability,
+and production features, so the speedups should be treated as design
+signals rather than direct product targets. Reference counting also
+adds cache-line contention; the paper reports frequent GC can be
+costly, although batching reclamation reduces the overhead.
+
+**Benchmark candidates:**
+
+- Add a simulated immutable table-root generation to the P8 route
+  model. Proof gate: retained reads validate table root, schema
+  generation, WAL boundary, resident generation, and invalidation
+  generation before executing.
+- Prototype bounded mutation-owner batch publication for one table:
+  drain writes for count/time threshold, apply CPU index/MVCC changes
+  to a new generation, invalidate resident state, then publish
+  visibility. Required measurements: batch size, WAL latency, root
+  publish latency, invalidation count, read fallback count, and p99.
+- Compare version-chain visibility lookup against root-generation
+  lookup for point reads under long retained snapshots. Minimum gate:
+  same correctness across update/delete/replay and lower per-read
+  visibility cost when many old versions exist.
+- Add a snapshot-retirement accounting test that releases CPU roots,
+  resident GPU buffers, and placement descriptors together. Failure
+  condition: old generations remain live after the last reader or are
+  freed while still referenced.
+- Evaluate a narrow nested-resident route for one parent/child or
+  key-to-row-group pattern. Required telemetry: resident bytes,
+  refresh bytes, invalidation churn, GPU kernel count, and whether
+  pre-filtering beats a flat resident scan.
+- Stress the batching latency tradeoff with 1 ms, 5 ms, and 50 ms
+  mutation-owner windows. The batch path should auto-disable or shrink
+  when p50/p99 latency regresses more than the throughput gain
+  justifies.
