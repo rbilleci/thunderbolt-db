@@ -13047,3 +13047,219 @@ to move MVCC, arbitrary predicates, or transaction commit into a switch.
 - Add follow-up reviews for database-specific RDMA abstractions and
   programmable-network transaction triage before committing to any
   kernel-bypass or RDMA implementation path.
+
+### 2026-06-03 - Cloud-Native Database Systems and Unikernels
+
+**Citation:** Viktor Leis and Christian Dietrich. "Cloud-Native
+Database Systems and Unikernels: Reimagining OS Abstractions for
+Modern Hardware." PVLDB 17(8), 2024, pp. 2115-2122.
+doi:10.14778/3659437.3659462. Retrieved 2026-06-03 from
+`https://www.vldb.org/pvldb/vol17/p2115-leis.pdf`.
+
+**Category:** runtime / HFT / session scale, with multi-tier cache,
+virtual-memory snapshot, and DB/OS co-design relevance.
+
+**Relevance tags:** cloud data plane; unikernel; OS bypass; kernel
+integration; asynchronous NVMe; asynchronous networking; DBMS-aware
+scheduling; virtual-memory snapshots; copy-on-write; TLB control;
+polling versus interrupts; hypervisor resource control; POSIX
+replacement.
+
+**Core idea:** The paper argues that cloud-hosted database services
+make DBMS-specific kernels practical again. Earlier custom database
+operating systems failed because users did not want to install a
+special OS and vendors would have had to support many hardware
+drivers. In a database-as-a-service cloud data plane, the vendor owns
+the runtime image and the hardware set is narrower, so a unikernel can
+co-locate DBMS and kernel code in one address space while tenant
+isolation remains a hypervisor responsibility.
+
+The immediate benefit is less privilege-transition and process
+isolation overhead. The deeper claim is more important for GPU DB:
+modern databases already schedule CPU work, async IO, memory, and
+networking themselves because old POSIX abstractions no longer match
+fast NVMe, high-speed NICs, intra-query parallelism, or cloud elasticity.
+A DBMS-specific unikernel can expose hardware primitives directly:
+page tables, TLB invalidation, hardware timers/preemption, NVMe
+submission/completion queues, network queues, interrupt routing,
+memory ballooning, and CPU hot-plugging.
+
+**Concrete mechanisms:**
+
+- The paper contrasts three models: traditional one-client-thread
+  blocking sockets/storage; modern DBMSes using worker threads plus
+  io_uring/SPDK/DPDK-style bypass; and the authors' DBMS-optimized
+  unikernel vision with co-designed interfaces over virtualized CPU,
+  memory, NVMe, and networking.
+- It argues that modern storage and networking make synchronous
+  blocking calls inefficient. A single modern SSD can have roughly
+  100 concurrent IOs and more than one million requests per second,
+  while Linux IO path overhead is high enough that fully exploiting
+  multiple NVMes or a 100 Gbit NIC can consume about half the CPU
+  cores in cited studies.
+- Instead of user-space task systems that are invisible to the OS, a
+  unikernel can make DBMS logical jobs kernel-visible, cheap to switch,
+  and preemptible. Threads can suspend, manipulate run queues, block
+  preemption, or run coroutine-like while the scheduler still sees all
+  runnable work.
+- The scheduler direction is DBMS-aware: rather than asking the DBMS
+  to hard-pick a fixed number of threads for each query, the scheduler
+  could ask jobs to parallelize when CPU load, IO utilization, and
+  priorities justify it.
+- For virtual memory, the paper proposes using page tables for
+  database functionality rather than process isolation: buffer
+  management, snapshots, dynamic data structures, variable page sizes,
+  and high-rate intermediate allocations.
+- The authors report that checking whether a random 4 KiB page is
+  present inside a 4 GiB region takes 1.8-4.8 us through Linux's
+  pagemap interface on their 16-core setup, versus 40-44 ns in OSv.
+  They also report faster page-fault paths in OSv for installing
+  preallocated frames.
+- Their evaluation implements an OSv copy-on-write snapshot primitive
+  for an OLTP/OLAP microbenchmark over a 4 GiB mapping. OLTP threads
+  perform random atomic updates while periodic OLAP jobs create and
+  scan read-only snapshots.
+- Two co-designed snapshot optimizations are central. Parallel
+  snapshotting lets OLTP threads that hit copy-on-write faults help
+  copy page tables for the snapshot. Reader-side TLB invalidation
+  removes global TLB shootdowns from the page-fault handler for
+  snapshotted regions; readers proactively invalidate before accessing
+  snapshotted pages.
+- In their benchmark, OSv outperforms Linux for snapshot creation,
+  OLAP scanning, OLTP progress during OLAP, and snapshot destruction.
+  They also show a `NoFree` variant where freed frames are collected
+  rather than returned immediately, making snapshot destruction 96x
+  faster than Linux when all OLTP threads assist.
+- For NVMe, the paper emphasizes that the device is already
+  queue-based: the host writes submission queues and observes
+  completion queues, with DMA placing data in memory. A unikernel can
+  expose those queues directly instead of layering another OS queue
+  on top.
+- For networking, the authors note that NIC standardization is weaker
+  than NVMe. They suggest AWS ENA as an initial practical target and
+  EFA/SRD as a possible alternative to TCP: reliable packet delivery
+  without in-order guarantees, requiring DBMS communication design
+  around unordered reliable packets.
+- Because polling is efficient at high request rates but wasteful at
+  low rates, unikernel integration can dynamically switch or route
+  interrupts based on workload, unlike many pure kernel-bypass paths.
+- Hypervisor integration can expose memory ballooning and CPU
+  hot-plugging to DBMS policy so a cloud database data plane can trade
+  resource demand against cloud pricing and elasticity.
+
+**GPU DB mapping:** The current GPU DB runtime document already points
+away from thread-per-client execution toward network IO workers,
+bounded command rings, response rings, owner domains, and GPU execution
+owners. This paper strengthens that direction: the long-term runtime
+should treat POSIX sockets, blocking IO, and OS thread scheduling as
+compatibility surfaces, not as the internal architecture. Pgwire can
+remain the client protocol while the hot internal path becomes explicit
+queues, owned buffers, IO completion events, and scheduler-visible
+logical jobs.
+
+The virtual-memory snapshot section maps directly to retained read
+snapshots and HTAP visibility. GPU DB should not copy the paper's
+`fork`-style mechanism wholesale, but the principle is valuable:
+snapshot publication can be a first-class runtime primitive rather
+than an accidental side effect of process VM. A future host-tier
+snapshot manager could use page-table or VM-assisted indirection for
+CPU canonical/columnar segments, while GPU resident snapshots keep
+their own visibility boundary, layout identity, and invalidation
+generation. Reader-side TLB invalidation is especially relevant as a
+conceptual analogue for moving invalidation cost to explicit
+buffer/snapshot fix points rather than global stop-the-world barriers.
+
+For 1M logical sessions, the scheduler argument is stronger than the
+unikernel deployment claim. GPU DB needs logical jobs that are visible
+to admission and scheduling: pgwire parse/read work, mutation
+admission, WAL flush work, residency refresh, retained read batches,
+GPU kernel launches, D2H scatter, and response encoding. A scheduler
+that only sees OS threads cannot choose well among those. Even on
+Linux, the architecture should build DBMS-visible logical jobs and
+queue telemetry now; a future unikernel or DB/OS co-design path would
+then have the right control plane to consume.
+
+The NVMe queue discussion maps to over-resident execution and cold
+partition movement. GPU DB's tier manager should model NVMe as
+parallel queue resources with submission depth, completion latency,
+DMA target ownership, and CPU overhead, not as opaque file reads.
+This supports benchmark designs for cold partition prefetch, retained
+snapshot rebuild, checkpoint scan, and compressed segment movement
+without assuming the Linux file system remains the final interface.
+
+The networking section also fits the transport-contract idea from the
+previous journal entry. If a future cloud deployment can use ENA,
+EFA/SRD, RDMA-like primitives, or GPU-adjacent IO, route legality must
+be expressed in DB terms: ordering requirement, request id, visibility
+boundary, WAL frontier, completion event, retry semantics, and response
+ordering. An unordered reliable packet protocol may be fine for
+independent retained reads or partition movement, but it is dangerous
+for transaction commit and response ordering unless the DBMS supplies
+sequence and frontier logic.
+
+**Risks and mismatches:** This is a vision and microbenchmark paper,
+not a complete production DBMS. The evaluation focuses on virtual
+memory snapshotting in OSv versus Linux, not pgwire, SQL execution,
+GPU kernels, WAL durability, crash recovery, or multi-tenant security
+audits. The paper's cloud argument also assumes the DBMS vendor
+controls the data-plane VM image and can accept unikernel operational
+constraints.
+
+Unikernel integration is a future deployment direction, not a near-term
+requirement for the current engine. GPU DB should first prove the same
+architecture-neutral pieces on Linux: logical job scheduling, bounded
+rings, explicit buffer ownership, snapshot publication, NVMe queue-depth
+telemetry, and transport contracts. Replacing the OS too early would
+risk hiding database design gaps behind a platform port.
+
+Security and observability need caution. A single-address-space kernel
+removes isolation boundaries and may lack hardening features unless
+added deliberately. That may be acceptable for a single-tenant cloud
+data plane, but GPU DB still needs clean fault containment, metrics,
+debuggability, and crash/recovery evidence before any specialized OS
+path can be treated as production-safe.
+
+The copy-on-write snapshot results are promising but not a direct MVCC
+replacement. GPU DB still needs SQL visibility, update/delete version
+rules, long-snapshot garbage collection, WAL-before-visibility, and
+resident invalidation. VM snapshotting can help host-tier data movement
+or HTAP read isolation, but it cannot by itself decide transaction
+serializability or durable commit order.
+
+**Benchmark candidates:**
+
+- Build a logical-job inventory for the current pgwire endpoint: classify
+  accept/read, parse, planner, owner execution, WAL, residency, GPU
+  launch, result materialization, response encode, and write-back as
+  separately measurable jobs. Gate: no behavior change and p50/p99 plus
+  queue-wait attribution for concurrency `1,2,4,8,16,32,64`.
+- Replace the thread-per-client benchmark path with a small IO-worker
+  pool only when the inventory shows the owner boundary is not the only
+  bottleneck. Proof gate: identical SQL results, no WAL/visibility
+  regression, and lower scheduler/context-switch overhead under retained
+  read concurrency.
+- Add a Linux-hosted "unikernel-shaped" scheduler lab: logical jobs on
+  fixed-capacity rings, cooperative yields at known DB boundaries, and
+  forced preemption/fairness telemetry. Failure condition: p99 latency
+  worsens under mixed long scan plus point lookup workload.
+- Prototype host-tier VM snapshot telemetry, not production semantics:
+  measure copy-on-write or page-table snapshot costs for a CPU columnar
+  segment while a retained GPU snapshot is being refreshed. Required
+  metrics: create/destroy time, page faults, TLB shootdown signal if
+  available, OLTP update slowdown, and snapshot staleness boundary.
+- Add an NVMe queue-depth model for over-resident partition reads:
+  issue parallel cold-segment reads with explicit submission depth and
+  completion telemetry, then compare against ordinary file-read paths.
+  Gate: no GPU benchmark required; report CPU overhead, latency
+  distribution, bytes read, queue depth, and fallback reason.
+- Create a transport-ordering simulator for future ENA/EFA/SRD-style
+  internal messages: independent retained reads may complete out of
+  order, while transactions and pgwire responses require sequence and
+  commit-frontier enforcement. Failure condition: any simulated response
+  can observe a visibility boundary newer than its WAL frontier.
+- Evaluate polling-versus-sleep behavior in the IO-worker prototype:
+  dynamic switch threshold, CPU burn at low request rate, tail latency
+  at burst start, and fairness with GPU execution owners.
+- Add a follow-up review of DBOS and the 2024 "Why Files If You Have a
+  DBMS?" paper to separate cloud control-plane ideas from storage
+  interface ideas before committing to any DB-owned OS path.

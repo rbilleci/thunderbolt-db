@@ -272,7 +272,7 @@ Append new candidates here as each paper is processed.
   Why: user-bypass/eBPF database proxy work cited by Looking Glass 2.0;
   relevant to reducing protocol proxying, client/server communication, and
   kernel boundary overhead.
-- `queued` — **Cloud-Native Database Systems and Unikernels: Reimagining OS
+- `reviewed` — **Cloud-Native Database Systems and Unikernels: Reimagining OS
   Abstractions for Modern Hardware**, Leis and Dietrich, PVLDB 2024.
   URL: `https://www.vldb.org/pvldb/vol17/p2115-leis.pdf`
   Why: DB/OS co-design direction for shrinking communication and isolation
@@ -318,6 +318,16 @@ Append new candidates here as each paper is processed.
   Why: direct follow-up for explicit NVMe tier economics and high-parallelism
   IO paths that should inform GPU DB cold-partition and over-resident
   placement benchmarks.
+- `queued` — **A Progress Report on DBOS: A Database-oriented Operating
+  System**, Li et al., CIDR 2022.
+  URL: `https://www.cidrdb.org/cidr2022/papers/p49-li.pdf`
+  Why: cloud database/OS co-design follow-up for treating scheduling,
+  workflows, and system state as database-managed services.
+- `queued` — **Why Files If You Have a DBMS?**, Nguyen and Leis, ICDE 2024.
+  URL: `https://doi.org/10.1109/ICDE60146.2024.00213`
+  Why: storage-interface follow-up from the unikernel paper's related work;
+  useful for evaluating file-system avoidance and DB-owned NVMe/cold-tier
+  layouts.
 - `queued` — **Optimizing Memory-mapped I/O for Fast Storage Devices**,
   Papagiannis et al., USENIX ATC 2020.
   URL: `https://www.usenix.org/conference/atc20/presentation/papagiannis`
