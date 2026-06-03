@@ -21102,3 +21102,169 @@ budget model before adopting broad automatic demotion.
 - Add a correctness stress test where an HBM segment is demoted to host memory,
   then invalidated by UPDATE or TRUNCATE before re-promotion. Gate: stale host
   copies never become route-valid, including after recovery replay.
+
+### 2026-06-03 - DBOS database-oriented operating-system stack
+
+**Citation:** Qian Li, Peter Kraft, Kostis Kaffes, Athinagoras Skiadopoulos,
+Deeptaanshu Kumar, Jason Li, Michael Cafarella, Goetz Graefe, Jeremy Kepner,
+Christos Kozyrakis, Michael Stonebraker, Lalith Suresh, and Matei Zaharia.
+"A Progress Report on DBOS: A Database-oriented Operating System." CIDR 2022.
+Retrieved 2026-06-03 from the official CIDR/VLDB PDF,
+`https://www.vldb.org/cidrdb/papers/2022/p26-li.pdf`. The originally queued
+CIDR URL used `p49-li.pdf`, which now returns 404 from this worker.
+
+**Category:** runtime / HFT / session scale, with transaction processing /
+write path and hybrid HTAP.
+
+**Relevance tags:** database-owned system state; stored procedures; scheduler
+as transaction; single-partition OLTP; polystore; provenance capture;
+heterogeneous hardware scheduling; auto-scaling; partition hot spots;
+multi-tenant isolation; DB/OS co-design.
+
+**Core idea:** DBOS pushes a large part of operating-system and cloud-service
+state into distributed DBMS tables, then implements services such as
+scheduling, filesystem metadata, IPC, provenance, and serverless workflows as
+SQL or stored procedures. The paper argues that modern distributed OLTP
+systems are fast enough for short system-state transactions, while DBMS
+transactions, replication, logging, schema evolution, and queryability remove
+many custom mechanisms that ordinary cloud stacks reimplement separately.
+
+The strongest transferable idea is not that GPU DB should become an operating
+system. It is that high-concurrency runtime control planes should be expressed
+as transactionally updated, queryable state when correctness, observability,
+and policy changes matter. DBOS reports a synthetic FIFO scheduler implemented
+as a stored procedure over a worker table. On two servers with forty table
+partitions, the paper reports roughly one million scheduling transactions per
+second with sub-millisecond tail latency, and near-linear throughput scaling
+as partitions increase. That is directly relevant to GPU DB's admission,
+route, partition-owner, and snapshot-publication metadata, because those
+control decisions need both OLTP speed and auditability.
+
+**Concrete mechanisms:**
+
+- The DBOS stack places a microkernel below a logically centralized,
+  physically distributed polystore. Upper OS services and utilities are
+  implemented over DBMS tables, mostly as stored procedures and SQL.
+- Frequently updated system state is stored in a high-performance OLTP DBMS;
+  historical provenance is moved into an OLAP DBMS. The paper's prototype used
+  VoltDB for OLTP state and later added Vertica for provenance analytics.
+- Scheduling is modeled as a short transaction: find a worker below capacity,
+  then increment its task count. The prototype chooses a partition and retries
+  until the stored procedure succeeds.
+- DBOS treats serverless subtasks as stored procedures organized as a graph.
+  The paper emphasizes co-locating data and compute and allocating requested
+  memory before a subtask runs, then releasing it when the procedure completes.
+- Provenance is captured by logging reads and writes over system/application
+  state into DB tables. The paper says write/read capture stayed practical
+  until high transaction rates, with modest degradation beyond about 50K
+  transactions per second in its preliminary experiments.
+- The polystore split is explicit: online system operations stay on the OLTP
+  path, while historical/provenance analysis uses a warehouse. The paper calls
+  out missing commercial support for cross-DBMS read/write capture, spooling,
+  and optimization.
+- A key limitation is the tradeoff around single-partition and multi-partition
+  transactions. VoltDB makes single-partition stored procedures very fast, but
+  a tiny fraction of global-lock multi-partition transactions can sharply
+  reduce throughput; the paper reports one experiment where 0.1% multi-
+  partition transactions cut overall throughput by 50%.
+- The paper points to heterogeneous hardware as future DBOS work: procedures
+  could run on GPUs, TPUs, FPGAs, or CPUs based on cost, data location, and
+  availability, but this requires extending the stored-procedure model and
+  avoiding partition blocking.
+
+**GPU DB mapping:** GPU DB should treat runtime control metadata as first-class
+database state where it affects correctness and scheduling: sessions,
+admission tickets, route descriptors, queue saturation, resident snapshot
+generations, partition homes, warm/cold tier state, invalidation generations,
+and overload outcomes. This does not mean putting every hot packet in SQL. It
+means the durable and inspectable control plane should be table-shaped and
+transactional, while the nanosecond-to-microsecond data plane still uses rings,
+preallocated buffers, and GPU execution owners.
+
+The scheduler example maps cleanly to GPU DB partition and route ownership.
+Instead of a worker table with `NumTasks`, GPU DB can maintain partition-owner
+or route-class counters: in-flight retained lookups, mutation queue depth,
+resident refresh slots, warm-tier promotion slots, pinned-buffer usage, and
+response-ring pressure. The admission decision can be a short transaction or a
+deterministic owner update that grants a bounded ticket. Once granted, the hot
+path carries a compact ticket through rings rather than repeatedly consulting a
+global owner.
+
+The single-partition lesson is especially important. GPU DB should preserve
+partition-local fast paths for retained reads, COPY admission chunks, and
+snapshot publication. Cross-partition queries and multi-table joins must not
+silently acquire a global runtime lock that blocks all partitions. When a route
+requires multiple partitions, it should either use a declared multi-partition
+protocol with bounded participants, split into independent partition-local
+subroutes plus deterministic reduction, or fall back before it can poison the
+short-route service curve.
+
+DBOS's polystore lesson maps to HTAP visibility. GPU DB already has WAL/CPU
+truth, GPU resident snapshots, and future warm/cold tiers. A provenance-like
+stream of route decisions, invalidations, cache movements, and overload
+responses should feed an analytical control table without slowing the OLTP
+path. That would make it possible to ask why p99 latency moved: queue wait,
+miss class, stale-generation fallback, cold-tier read, GPU saturation, or
+response backpressure.
+
+The heterogeneous-hardware section fits CPU/GPU route choice. Stored procedures
+are too heavyweight as a literal model for every query, but "same logical task,
+different processor implementation by cost/data location" is exactly the GPU
+DB planner problem. A route descriptor should name whether a task is CPU-owner,
+CPU snapshot, HBM resident GPU, host-warm promotion, NVMe cold, or future
+accelerator work. The chosen device is a costed placement decision, not a
+separate application-visible path.
+
+**Risks and mismatches:** DBOS targets cloud OS services, not a PostgreSQL-like
+wire-compatible database engine. Its prototype's reliance on VoltDB stored
+procedures does not directly solve GPU DB's protocol parsing, MVCC tuple
+visibility, WAL-before-visibility, row encoding, CUDA resource ownership, or
+low-latency response writes. A literal "everything in SQL" hot path would be
+too expensive for per-row or per-message processing.
+
+VoltDB's partition model is also a warning. If GPU DB centralizes admission or
+snapshot publication behind one convenient owner, it can reproduce the same
+global-lock failure mode the DBOS authors criticize. Multi-partition routes
+must be visible in telemetry and treated as expensive. Long GPU kernels,
+refreshes, cold-tier transfers, and large responses should never occupy the
+same partition-local lane as short point lookups unless they are chunked and
+preemptible.
+
+Multi-tenancy and stored-procedure isolation remain unresolved in the paper's
+prototype. GPU DB should not let user-defined GPU code share engine address
+space or device handles without a separate sandboxing design. The paper also
+does not provide a complete evaluation of provenance capture at million-TPS
+rates, nor does it prove that polystore spooling preserves low p99 latency
+under write-heavy workloads.
+
+**Benchmark candidates:**
+
+- Build a no-GPU admission-control prototype where session admission, route
+  tickets, partition in-flight counts, and overload decisions are represented
+  as transactional/owner-managed control rows, while execution still uses
+  bounded rings. Gate: lower or equal p99 queue wait versus the current single
+  owner, with every rejection carrying a queryable reason.
+- Add a multi-partition route poison test: inject 0.1%, 1%, and 5%
+  cross-partition routes into a retained point-lookup workload. Compare global
+  owner locking, partition-local subroutes plus reduction, and early CPU
+  fallback. Failure condition: a tiny multi-partition fraction cuts short-route
+  throughput or p99 similarly to the DBOS/VoltDB warning.
+- Create a route-provenance stream for benchmark runs: per request capture
+  route class, ticket outcome, snapshot generation, miss class, queue wait,
+  batch size, fallback reason, and response bytes into an analytical side log.
+  Gate: capture overhead stays below a small fixed percentage at the current
+  bounded concurrency levels and does not delay WAL-before-visibility.
+- Prototype a DBOS-style scheduler table for GPU execution workers with
+  partition identity, stream slots, pinned-buffer budget, and warm-tier
+  promotion budget. Gate: scheduler decisions are inspectable and replayable,
+  but hot execution consumes preallocated tickets rather than issuing SQL per
+  request.
+- Test stored-procedure-like server-side transaction bundling for pgwire:
+  group repeated application round trips into one owner-domain transaction
+  without weakening SQL semantics. Measure round trips avoided, owner queue
+  entries avoided, and latency under 1, 64, and future high logical-session
+  concurrency.
+- Add an HTAP control-plane benchmark: OLTP route/admission updates feed an
+  asynchronous analytical log queried for p99 root cause. Failure condition:
+  analytics/provenance capture competes with mutation owner WAL/index buffers
+  or changes visibility publication timing.

@@ -335,9 +335,9 @@ Append new candidates here as each paper is processed.
   Why: direct follow-up for explicit NVMe tier economics and high-parallelism
   IO paths that should inform GPU DB cold-partition and over-resident
   placement benchmarks.
-- `queued` — **A Progress Report on DBOS: A Database-oriented Operating
+- `reviewed` — **A Progress Report on DBOS: A Database-oriented Operating
   System**, Li et al., CIDR 2022.
-  URL: `https://www.cidrdb.org/cidr2022/papers/p49-li.pdf`
+  URL: `https://www.vldb.org/cidrdb/papers/2022/p26-li.pdf`
   Why: cloud database/OS co-design follow-up for treating scheduling,
   workflows, and system state as database-managed services.
 - `reviewed` — **Why Files If You Have a DBMS?**, Nguyen and Leis, ICDE 2024.
@@ -418,6 +418,18 @@ Append new candidates here as each paper is processed.
   Why: modern follow-up on approximating programmable scheduling with a single
   FIFO-style queue; relevant to bounded high-concurrency response shaping
   without expensive per-session queues.
+- `queued` — **DBOS: A DBMS-oriented Operating System**,
+  Skiadopoulos et al., PVLDB 2022.
+  URL: `https://www.vldb.org/pvldb/vol15/p21-skiadopoulos.pdf`
+  Why: full DBOS system paper with scheduler, file-system, and IPC experiments;
+  useful follow-up for database-owned OS services, stored-procedure runtime
+  boundaries, and transaction-backed system state.
+- `queued` — **HopsFS: Scaling Hierarchical File System Metadata Using NewSQL
+  Databases**, Niazi et al., FAST 2017.
+  URL: `https://www.usenix.org/conference/fast17/technical-sessions/presentation/niazi`
+  Why: DBOS cites DB-backed file-system metadata; relevant to GPU DB catalog,
+  cold-tier namespace, and metadata-service scaling without bespoke
+  filesystem-like state.
 - `reviewed` — **Shinjuku: Preemptive Scheduling for microsecond-scale Tail
   Latency**, Kaffes et al., NSDI 2019.
   URL: `https://www.usenix.org/conference/nsdi19/presentation/kaffes`
