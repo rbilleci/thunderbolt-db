@@ -1096,9 +1096,10 @@ Append new candidates here as each paper is processed.
   Why: DaMoN 2025 kernel-bypass paper cites it as a modern WAL/storage
   follow-up; directly relevant to COPY admission, WAL flush scheduling, and
   whether GPU DB should decouple commit progress from group-commit bottlenecks.
-- `queued` — **The Art of Latency Hiding in Modern Database Engines**,
+- `reviewed` — **The Art of Latency Hiding in Modern Database Engines**,
   Huang et al., PVLDB 2023.
-  URL: `https://doi.org/10.14778/3632093.3632106`
+  URL: `https://doi.org/10.14778/3632093.3632117`
+  PDF: `https://www.vldb.org/pvldb/vol17/p577-huang.pdf`
   Why: autonomous commit builds on its flush-pipelining and latency-hiding
   context; useful for deciding which background commit, scheduling, and I/O
   overlap techniques still matter before adopting fully autonomous WAL
@@ -1129,3 +1130,16 @@ Append new candidates here as each paper is processed.
   NVMe-array exploitation; useful as a contrasting partitioned KV design for
   queue depth, SPDK usage, and limitations around range queries and small
   database payloads.
+- `queued` — **Exploiting Coroutines to Attack the "Killer Nanoseconds"**,
+  Jonathan et al., PVLDB 2018.
+  URL: `https://www.vldb.org/pvldb/vol11/p1702-jonathan.pdf`
+  Why: MosaicDB's coroutine-to-transaction foundation; useful for deciding
+  whether retained lookup and MVCC/index traversals should use cooperative
+  software-prefetch lanes before adding heavier storage or GPU scheduling.
+- `queued` — **Interleaving with Coroutines: A Systematic and Practical
+  Approach to Hide Memory Latency in Index Joins**, Psaropoulos et al.,
+  VLDB Journal 2019.
+  URL: `https://doi.org/10.1007/s00778-018-0533-6`
+  Why: MosaicDB cites it as a practical coroutine/prefetching baseline;
+  relevant to CPU-side index, version-chain, and host-resident join paths
+  that feed retained GPU or fallback routes.

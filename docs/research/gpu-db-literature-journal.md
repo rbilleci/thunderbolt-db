@@ -11660,3 +11660,171 @@ Rapid Data Ingestion through DB-OS Co-design, Online Schema Evolution is
 - Add a retained-read correctness gate where stale cold-tier completions,
   stale GPU resident buffers, and post-snapshot writes all fail closed with
   explicit fallback or retry reasons.
+
+### 2026-06-03 - MosaicDB multi-source latency hiding
+
+**Citation:** Kaisong Huang, Tianzheng Wang, Qingqing Zhou, and Qingzhong
+Meng. "The Art of Latency Hiding in Modern Database Engines." PVLDB 17(3),
+2023, pp. 577-590. DOI: `10.14778/3632093.3632117`. Retrieved 2026-06-03
+from the VLDB PDF, `https://www.vldb.org/pvldb/vol17/p577-huang.pdf`.
+
+**Category:** transaction processing / write path, runtime / HFT / session
+scale, and multi-tier cache / data placement.
+
+**Relevance tags:** coroutine-to-transaction execution; latency hiding;
+larger-than-memory OLTP; asynchronous I/O; hot/cold data placement;
+pipelined scheduling; log flush integration; oversubscription avoidance;
+contention regulation.
+
+**Core idea:** MosaicDB argues that modern OLTP engines should hide several
+latency sources together rather than optimize one at a time. Existing
+coroutine OLTP engines hide pointer-chasing cache misses, but storage I/O,
+log flushes, background-thread scheduling, and synchronization can still
+erase those gains. MosaicDB keeps the coroutine-to-transaction model and
+extends it so a worker can overlap memory stalls, cold-record I/O, and log
+flush completion while staying within one software thread per hardware
+thread.
+
+The strongest transferable idea is the dual queue: keep a short hot queue
+for memory-resident work and a separate cold queue sized by storage
+capacity. Once storage is saturated, the scheduler preferentially admits
+hot transactions instead of letting slow cold transactions occupy all
+request slots. That maps directly to GPU DB's need to keep retained hot
+reads and short writes moving while over-resident NVMe or host-tier fetches
+are in flight.
+
+**Concrete mechanisms:**
+
+- Transactions are modeled as C++20 stackless coroutines scheduled by one
+  worker thread per core or hyperthread. A transaction can suspend on
+  predicted cache misses, cold-record I/O, or commit-related asynchronous
+  I/O, then resume when its prerequisite is likely ready.
+- The design preserves the fast in-memory path by using selective coroutine
+  nesting. Hot memory/index/version-chain access keeps the flattened
+  two-level coroutine shape from CoroBase, while storage-specific functions
+  become nested coroutines because storage latency is large enough to
+  amortize extra coroutine-switching overhead.
+- Cold records are reached through indexes and per-table indirection arrays.
+  If an indirection entry points to storage, the worker issues asynchronous
+  I/O and suspends the transaction. On completion, the fetched data is
+  converted into an in-memory version-chain node for subsequent access.
+- Each worker owns a thread-local `io_uring` module. Transactions sharing a
+  worker share its submission and completion queues; SQEs are tagged with
+  transaction ids because completions may arrive out of order.
+- Storage-aware batch scheduling separates I/O status tracking from
+  transaction context. Before resuming a transaction suspended on I/O, the
+  scheduler checks thread-local I/O status directly; if the I/O is not
+  complete, it skips that transaction without paying a full coroutine
+  resume/suspend cycle.
+- Vanilla pipelining admits a new request whenever a slot frees up instead
+  of waiting for a whole batch to finish, but can let storage-bound
+  transactions dominate the queue.
+- Dual-queue pipelining assigns separate hot and cold queues plus a staging
+  area. A transaction that moves from hot to cold access is transferred to
+  the cold queue if capacity exists; the worker mostly services the hot
+  queue, periodically checks cold work, and sizes cold admission by IOPS or
+  bandwidth so storage is used without starving memory-resident work.
+- Durability uses redo-only logging and pipelined or group commit inherited
+  from CoroBase. MosaicDB removes dedicated background log-flush/release
+  threads: workers issue asynchronous log flushes when buffers fill or time
+  out, then lazily check completion and release transactions whose log
+  records are durable.
+- The one-worker-per-core discipline avoids CPU oversubscription from
+  background threads and keeps the OS scheduler largely off the OLTP hot
+  path.
+- Coroutine interleaving also regulates latch contention. Only one
+  coroutine is active per worker at a time, so the number of simultaneous
+  contenders for shared structures is bounded by hardware workers rather
+  than by all in-flight transactions.
+- Evaluation uses a 48-core server with direct I/O, `io_uring`, a Samsung
+  980 Pro SSD, Optane, and SATA SSD variants, and workloads including
+  read-only/read-write hot/cold microbenchmarks, TPC-C, and a contended
+  insert microbenchmark. Reported results include up to 33x higher
+  throughput for larger-than-memory workloads, 1.7x TPC-C improvement over
+  an oversubscribed coroutine baseline under a fixed CPU budget, and up to
+  18% lower latch-contention cycles with 2.38x throughput under the
+  high-contention insert workload.
+
+**GPU DB mapping:** MosaicDB is a good runtime shape for the gap between
+the current thread-per-client benchmark endpoint and the target owner/ring
+runtime. GPU DB should not have one undifferentiated retained-read queue
+where cold partition fetches, WAL flush waits, GPU launches, and hot
+snapshot reads all consume the same slots. It needs at least hot retained
+work, cold-tier fetch work, mutation/commit work, and GPU execution work as
+separate bounded queues with admission tied to the resource each queue
+burns.
+
+The dual-queue policy maps cleanly to P8 tiering. Hot resident GPU or host
+snapshots should have a short queue sized for latency and launch
+amortization. Cold NVMe or future CXL-tier work should have a queue sized
+by measured storage bandwidth, IOPS, pinned-buffer budget, and stale
+generation risk. Once cold resources saturate, new hot retained reads
+should still pass if they have resident-compatible snapshots, while new
+cold requests should wait, fall back, or reject with an explicit overload
+reason.
+
+Selective coroutine nesting is also a useful warning. The GPU DB CPU fast
+path should not wrap every index lookup, MVCC check, response encoding, and
+route decision in a heavy async abstraction. Lightweight cooperative
+suspension may pay for pointer-chasing or cold I/O waits, but ordinary hot
+snapshot checks should remain flat and predictable until measurements show
+otherwise.
+
+For commit and COPY admission, the background-thread removal suggests a
+more integrated WAL completion path. GPU DB can keep WAL-before-visibility
+while letting mutation owners issue asynchronous durable writes, continue
+with other admitted work, and publish visibility only when durable
+completion is observed. The important part is that the completion belongs
+to the owner/generation protocol, not to a detached background flusher that
+silently creates scheduler pressure or unclear publication ordering.
+
+For 1M logical sessions, the lesson is not "make every session a coroutine."
+It is to keep only an admitted active subset in hot queues, classify waiting
+causes precisely, and bound the physical resources behind each class. Idle
+or blocked logical sessions should not reserve cold I/O slots, CUDA pinned
+buffers, or commit queue entries.
+
+**Risks and mismatches:** MosaicDB is a CPU OLTP engine layered on CoroBase,
+not a GPU database and not a pgwire-serving system. Its benchmarks bypass
+SQL and networking through C++ APIs, so the results do not include protocol
+parsing, response encoding, client/server round trips, or PostgreSQL
+compatibility costs. The hot/cold layout has no cold-record cache in the
+main microbenchmark, by design, which simplifies interpretation but is not
+a complete production tiering policy.
+
+The paper's cold store is a log/indirection-array design, not GPU resident
+column groups, GPUDirect Storage, or CUDA stream scheduling. It also does
+not solve serializable validation, DDL invalidation, query optimization,
+or resident snapshot correctness. The dual-queue idea must be adapted so
+it does not starve cold work that is required for forward progress, such as
+WAL flush, refresh, or a transaction holding locks. Finally, latency hiding
+can improve throughput by adding in-flight work; GPU DB must cap that
+extra work so p50/p99 query latency and memory pressure remain visible.
+
+**Benchmark candidates:**
+
+- Add a route-class queue prototype for one retained read shape:
+  hot-resident, cold-fetch, mutation/commit, and response-completion queues
+  with separate capacities. Gate: hot retained reads keep stable p50/p99
+  latency while cold fetches are saturated.
+- Build an admission experiment that sizes the cold queue by NVMe IOPS,
+  bandwidth, pinned host buffer count, and stale-generation completion
+  rate. Failure condition: adding cold work increases hot retained p99
+  without an explicit saturation metric.
+- Compare one integrated mutation-owner WAL completion loop against a
+  detached flusher for COPY admission. Required metrics: rows/sec, commit
+  wait, visibility publish delay, owner queue wait, OS context switches,
+  and p99 retained-read interference.
+- Prototype selective cooperative suspension only around CPU index or MVCC
+  pointer-chasing paths. Compare flat synchronous lookup, prefetch plus
+  cooperative hot queue, and full async wrapping. Failure condition: the
+  coroutine path regresses hot resident lookups when no cold or cache-miss
+  latency is present.
+- Add a mixed hot/cold tier benchmark: resident GPU lookup or aggregate,
+  host-memory fallback, NVMe cold fetch, and WAL writes on the same run.
+  Required output: which queue is saturated, which class is admitted, and
+  whether cold work can make progress without starving hot snapshots.
+- Track logical-session active-resource ownership: queued hot request,
+  cold I/O slot, WAL flush wait, GPU stream slot, response buffer, or idle.
+  Minimum proof: large idle session counts do not increase active queue
+  memory or pinned-buffer reservation.
