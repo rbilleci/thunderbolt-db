@@ -21,6 +21,8 @@ Migrated series:
   release-candidate evidence-bundle reports.
 - `series/p7-p8-residency-baselines/` owns the early GPU relational benchmark
   and resident-cache baseline reports.
+- `series/p8-partitioned-resident-routes/` owns the partitioned retained-route
+  implementation reports for over-resident readiness.
 - `series/p8-retained-concurrency/` owns the retained-route concurrency graph
   history and its generated CSV/SVG assets.
 
