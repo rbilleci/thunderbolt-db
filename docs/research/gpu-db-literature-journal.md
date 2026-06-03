@@ -15724,3 +15724,142 @@ portable userspace engine.
 - Compare cold random lookups at 4KB, 16KB, 64KB, and merged request sizes.
   Expected result: a tier route needs enough queue depth and merge rate before
   GPU execution can hide storage latency.
+
+### 2026-06-03 - Tiered-Indexing hot-record migration for skewed access methods
+
+**Citation:** Xinjing Zhou, Xiangpeng Hao, Xiangyao Yu, and Michael
+Stonebraker. "Tiered-Indexing: Optimizing Access Methods for Skew." The VLDB
+Journal 34, article 45, 2025. Retrieved 2026-06-03 from
+`https://doi.org/10.1007/s00778-025-00928-6`.
+
+**Category:** multi-tier cache / data placement and transaction access methods.
+
+**Relevance tags:** skew; hot/cold records; buffer-managed indexes; record
+migration; B+tree; hash table; heap file; LSM-tree; range scans; update
+amplification; optimistic lock coupling; LeanStore; RocksDB; YCSB.
+
+**Core idea:** Tiered-Indexing argues that ordinary page-granular buffer
+management wastes memory under skew because a single hot record can pin a page
+full of cold records. Instead of adding a separate record cache, the paper
+keeps one buffer-pool budget and decomposes an access method into hot and cold
+tiers. Records migrate between tiers according to hotness, while both tiers
+remain page-based structures that can use conventional logging and recovery.
+
+The key transferable point is that hot/cold placement should be part of the
+access method, not an unrelated cache beside it. A point-lookup-heavy GPU DB
+table can waste GPU HBM, host DRAM, and NVMe bandwidth if it caches whole
+partitions or pages merely because a few records are hot. The paper's design
+suggests a middle ground between "cache the full resident partition" and
+"build a read-only exact record cache": promote hot records or key ranges into
+an access-method-owned hot tier that still supports writes, scans, and recovery
+through normal storage-engine boundaries.
+
+**Concrete mechanisms:**
+
+- A Tiered-Indexing structure maintains a hierarchy of index structures with
+  different hotness levels. Each tier supports the same operations as the
+  original one-tier structure, and records move between tiers.
+- For 2-tier designs, the buffer pool is logically split into hot and cold
+  regions. The paper's implementation uses LeanStore and configures 90% of
+  frames for the hot region and 10% for the cold region, while noting that this
+  split is not universally optimal.
+- Hot-tier records carry small migration metadata: reference, dirty, and
+  deletion bits. Accesses set reference state; pressure on the hot tier
+  triggers downward migration of colder records.
+- 2-Hash uses hot and cold hash tables. The paper discusses shared versus
+  independent hash functions; shared hashing keeps the corresponding hot and
+  cold records in related key space, while independent hashing can change
+  migration and collision behavior.
+- 2-Heap uses two heaps, each with its own indexes. Downward migration can
+  scan the heap directly or use an indexed heap scan. The indexed strategy
+  orders evictions by key so maintenance of the cold heap's index is more
+  sequential.
+- 2B+tree keeps hot and cold B+trees. Eviction walks the hot tree in key order
+  with an approximate clock-style policy, selecting records whose reference bit
+  is clear and inserting them into nearby cold-tree leaf ranges.
+- BiLSM-tree extends RocksDB with upward migration on point reads. It monitors
+  block-cache miss rate and average point-read depth, then adapts migration
+  sampling rates to move hot records upward without turning every miss into
+  eager migration.
+- The implementation uses optimistic locking with a 64K-entry array of 64-bit
+  version numbers keyed by record hash. Writers use atomic compare-and-swap;
+  the design accepts possible false conflicts when distinct records map to the
+  same version slot.
+- The paper emphasizes that migration changes physical representation, not
+  logical user content, so page-based physiological WAL and ARIES-style
+  recovery can still apply to the proposed page-based tiers.
+- Experiments use YCSB over 100 million records, 8-byte keys, 120-byte payloads,
+  16KB pages, direct IO, no Linux page cache, and mostly Zipfian skew. At small
+  memory budgets, 2B+tree reports up to 9.8x over a one-tier B+tree and 12.3x
+  over TreeLine during loading, with much lower insert IO amplification.
+- The paper reports wider gains on update-heavy YCSB-F than read-only YCSB-C
+  because page-granular designs pay for both poor memory utilization and
+  read/evict traffic when updating disk pages.
+- For LSM range scans, row-cache-style record caching can be much worse because
+  the row cache cannot serve broad range queries; BiLSM-tree keeps block-cache
+  usefulness while moving hot records in the tree hierarchy.
+
+**GPU DB mapping:** GPU DB currently treats GPU resident table/partition state
+as an explicit versioned performance cache backed by WAL and CPU truth.
+Tiered-Indexing suggests adding a finer hot-record or hot-key tier underneath
+that same correctness model. For skewed point lookups, a full resident
+partition may be overkill; a hot-key resident tier keyed by table, partition,
+snapshot generation, and predicate shape could keep only the records that
+drive most traffic in HBM, while colder records remain in host or NVMe-backed
+structures.
+
+The design also maps to CPU host indexes. The P8 storage track should avoid a
+separate read-only record cache that bypasses WAL, MVCC, or range-query
+semantics. A better first experiment is an access-method-owned hot tier whose
+entries carry MVCC visibility boundaries and invalidation generation. Hot
+records can be promoted after observed reads and demoted under pressure, but
+the mutation owner still controls WAL-before-visibility and publishes new
+readable generations.
+
+For GPU execution, hot-tier placement creates a natural micro-batch key:
+snapshot generation plus hot-key tier id plus query shape. Same-shape point
+lookups that hit the hot tier can be gathered into a compact key vector, while
+misses fall back to the cold partition path. The benchmark should measure
+whether this improves p99 without starving cold scans or update refresh.
+
+The paper's migration lesson is also useful for host/NVMe tiering. Downward
+migration should produce storage-friendly access patterns, not a stream of
+random record writes caused by a generic LRU list. GPU DB demotion from HBM to
+host, or host to NVMe, should prefer partition/key-order batches and report IO
+amplification, merge rate, and invalidation cost.
+
+**Risks and mismatches:** Tiered-Indexing is an access-method paper, not a GPU
+database design. It does not handle CUDA memory ownership, kernel launch
+amortization, GPU-resident columnar layouts, pgwire response rings, SQL joins,
+or full MVCC visibility on GPU. The evaluation disables WAL and the Linux page
+cache to isolate buffer-pool behavior, so durable commit and recovery costs are
+not part of the main throughput numbers.
+
+The hot/cold split is not free. Migration metadata, version-slot conflicts,
+background migration workers, and hot-tier invalidation can add latency or
+contention. A GPU DB hot-record tier also risks duplicating data across HBM,
+host DRAM, and cold storage unless residency budgets are explicit. Finally,
+skew changes over time; aggressive upward migration may create thrash, while
+lazy migration may miss short-lived hot sets.
+
+**Benchmark candidates:**
+
+- Add a skewed retained-lookup benchmark with Zipf factors 0.7, 0.9, and 0.96:
+  compare full resident partition, hot-key resident tier, host-index fallback,
+  and cold partition path. Measure p50/p95/p99, HBM bytes, hit rate, queue
+  wait, and invalidation count.
+- Prototype hot-key promotion keyed by table OID, partition id, snapshot
+  generation, key column, and query shape. Proof gate: a promoted entry never
+  survives a mutation or DDL invalidation beyond its visibility boundary.
+- Measure demotion policy: random LRU demotion versus key-order or
+  partition-order demotion. Expected result: ordered demotion lowers NVMe or
+  host write amplification and refresh churn under skew.
+- Test lazy versus eager promotion sampling for hot lookups. Failure condition:
+  eager promotion improves average throughput but worsens p99 or blocks
+  mutation/refresh owners under distribution shifts.
+- Add an update-heavy skew workload that alternates hot point reads and hot-key
+  writes. Gate: hot-tier correctness preserves WAL-before-visibility and no
+  retained read observes stale values after mutation publication.
+- Compare range scans with and without a hot-record tier. The tier must not
+  steal so much memory from column/partition pages that scans regress more than
+  point lookups improve.

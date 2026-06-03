@@ -1382,7 +1382,7 @@ Append new candidates here as each paper is processed.
   Why: range-tracking approach for old-version reclamation; relevant to
   bounding retained snapshot metadata and version-chain cleanup under long
   GPU reads.
-- `queued` — **Tiered-Indexing: Optimizing Access Methods for Skew**,
+- `reviewed` — **Tiered-Indexing: Optimizing Access Methods for Skew**,
   Zhou, Hao, Yu, and Stonebraker, VLDB Journal 2025.
   URL: `https://doi.org/10.1007/s00778-025-00928-6`
   Why: modern follow-up that generalizes hot-record migration across
@@ -1409,3 +1409,15 @@ Append new candidates here as each paper is processed.
   scalable range-locking is a modern comparison point for page-fault,
   mmap/munmap, and non-overlapping virtual-address operations in
   VM-assisted buffer managers.
+- `queued` — **F2: Designing a Key-Value Store for Large Skewed Workloads**,
+  Kanellis, Chandramouli, and Venkataraman, arXiv 2023.
+  URL: `https://arxiv.org/abs/2305.01516`
+  Why: Tiered-Indexing cites F2 as skewed log-structured storage work; useful
+  for comparing record hotness, write buffering, and skew adaptation against
+  GPU DB hot/cold resident lookup placement.
+- `queued` — **EvenDB: Optimizing Key-Value Storage for Spatial Locality**,
+  Gilad et al., EuroSys 2020.
+  URL: `https://doi.org/10.1145/3342195.3387523`
+  Why: Tiered-Indexing cites EvenDB as record-placement work; useful for
+  studying whether physical clustering by access locality can reduce cold-tier
+  reads and resident refresh churn under skew.
