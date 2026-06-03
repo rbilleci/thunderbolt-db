@@ -1167,12 +1167,36 @@ Append new candidates here as each paper is processed.
   Why: primary storage-engine source behind the DaMoN 2025 SSD argument; useful
   for sizing NVMe queue depth, IO granularity, direct IO, and CPU budgets before
   GPU DB attempts over-resident cold-partition execution.
-- `queued` — **Databases on Modern Networks: A Decade of Research that now
+- `reviewed` — **Databases on Modern Networks: A Decade of Research that now
   comes into Practice**, Lerner et al., PVLDB 2023.
   URL: `https://www.vldb.org/pvldb/vol16/p3894-lerner.pdf`
   Why: modern survey and call-to-action for database/network co-design; useful
   for organizing future pgwire, RDMA, DPDK, and application-specific transport
   benchmark tracks.
+- `queued` — **D-RDMA: Bringing Zero-Copy RDMA to Database Systems**,
+  Ryser, Lerner, Forencich, and Cudre-Mauroux, CIDR 2022.
+  URL: `https://www.cidrdb.org/cidr2022/papers/p6-ryser.pdf`
+  Why: database-specific RDMA abstraction cited by the modern-networks paper;
+  relevant to future zero-copy COPY admission, remote partition movement, and
+  preserving DB-level ordering above DMA completion.
+- `queued` — **DFI: The Data Flow Interface for High-Speed Networks**,
+  Thostrup et al., SIGMOD 2021.
+  URL: `https://doi.org/10.1145/3448016.3457310`
+  Why: higher-level network programming abstraction cited by the
+  modern-networks paper; useful for comparing typed DB dataflow contracts
+  against raw RDMA verbs at owner and storage-tier boundaries.
+- `queued` — **Design Guidelines for Correct, Efficient, and Scalable
+  Synchronization Using One-Sided RDMA**, Ziegler et al., SIGMOD 2023.
+  URL: `https://doi.org/10.1145/3589295`
+  Why: correctness-focused one-sided RDMA guidance cited by the
+  modern-networks paper; relevant before any GPU DB WAL, visibility-summary,
+  or remote-residency metadata path uses one-sided writes.
+- `queued` — **P4DB - The Case for In-Network OLTP**, Jasny et al.,
+  SIGMOD 2022.
+  URL: `https://doi.org/10.1145/3514221.3517867`
+  Why: programmable-network hot-region OLTP execution cited by the
+  modern-networks paper; useful for defining the narrow boundary between safe
+  semantic admission/triage and unsafe offloading of full MVCC semantics.
 - `queued` — **BMC: Accelerating Memcached using Safe In-kernel Caching and
   Pre-stack Processing**, Ghigoff et al., NSDI 2021.
   URL: `https://www.usenix.org/conference/nsdi21/presentation/ghigoff`

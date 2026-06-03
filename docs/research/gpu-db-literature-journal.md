@@ -12885,3 +12885,165 @@ Category gaps remain around practical PostgreSQL-protocol session state,
 prepared statement/portal invalidation, and multi-tier query spill policies.
 The next reviews should lean toward session scheduling or resource-adaptive
 execution rather than another pure GPU OLAP paper.
+
+### 2026-06-03 - Databases on Modern Networks
+
+**Citation:** Alberto Lerner, Carsten Binnig, Philippe
+Cudre-Mauroux, Rana Hussein, Matthias Jasny, Theo Jepsen, Dan R. K.
+Ports, Lasse Thostrup, and Tobias Ziegler. "Databases on Modern
+Networks: A Decade of Research That Now Comes into Practice." PVLDB
+16(12), 2023, pp. 3894-3897. doi:10.14778/3611540.3611579.
+Retrieved 2026-06-03 from
+`https://www.vldb.org/pvldb/vol16/p3894-lerner.pdf`.
+
+**Category:** runtime / HFT / session scale, with DB/network co-design
+and future distributed owner-domain relevance.
+
+**Relevance tags:** modern networks; RDMA; OS bypass; zero-copy;
+programmable switches; semantic routing; in-network transaction
+triaging; resource-adaptive session admission; protocol offload;
+cloud database architecture; disaggregated storage.
+
+**Core idea:** This short PVLDB tutorial argues that database engines
+can no longer treat the network as an opaque socket pipe. Modern cloud
+networks provide OS-bypass access, zero-copy transfer, RDMA-like
+primitives, and programmable NIC/switch behavior, and those changes
+open database designs that were previously impractical. The paper is
+not an evaluation paper with one new DBMS mechanism; it distills a
+decade of RDMA and programmable-network database work into design
+lessons and warnings.
+
+The most transferable idea for GPU DB is that transport choice should
+become an explicit architecture boundary. Pgwire-over-TCP remains the
+compatibility front door, but high-throughput internal owner messages,
+replication/WAL publication, cold-partition movement, and future
+multi-node GPU/device traffic should be designed around named
+communication primitives: copied socket messages, zero-copy buffers,
+one-sided remote reads/writes, two-sided RPC, switch/NIC routing, and
+in-network aggregation or triage where the semantics are small enough.
+
+**Concrete mechanisms:**
+
+- Modern server stacks avoid per-message system-call cost by letting an
+  application communicate directly with the NIC through OS bypass.
+  Data movement can also be zero-copy: the card reads from userspace
+  buffers rather than forcing extra send-side copies.
+- RDMA and cloud derivatives blur local/remote memory access, but they
+  differ materially. The paper notes that cloud providers expose
+  different RDMA-like stacks, such as RoCE/InfiniBand, EFA, and 1RMA,
+  with differences in one-sided versus two-sided verbs and ordering
+  guarantees.
+- Early RDMA database work split into two tracks: using RDMA verbs to
+  accelerate existing components, and redesigning architectures around
+  scalable remote memory or disaggregated layouts.
+- The authors' RDMA lessons are conservative: DBMS architectures must
+  evolve to exploit RDMA well; correct concurrent RDMA write protocols
+  are difficult because they interact with local DMA, PCIe, ordering,
+  and synchronization; and database-centric abstractions are needed to
+  hide low-level RDMA complexity without losing performance.
+- Programmable switches/NICs can perform small semantic actions at line
+  rate, but only under restrictive compute and memory models. The paper
+  emphasizes that offloaded algorithms and data structures usually need
+  redesign rather than recompilation.
+- One example is semantic routing for replicated databases: a switch can
+  track whether secondary replicas are up to date and redirect safe read
+  transactions away from the primary.
+- Another example is in-network transaction batching and reordering.
+  The switch can group or reorder transactions with high affinity to
+  reduce network overhead and improve server cache hit ratios.
+- A more aggressive OLTP example is hot-region execution in the
+  network: instead of forwarding a transaction against a contended hot
+  area, a switch can pull that hot area and process a small operation
+  locally.
+- Analytical examples include doing joins, aggregations, graph-pattern
+  mining, or ML parameter aggregation in the network when the operation
+  is simple enough and would otherwise be dominated by reshuffle or
+  all-to-all communication.
+- The paper frames the open problem as new data-intensive systems that
+  fully embrace modern networks, including higher-level RDMA
+  communication primitives, database-motivated behavior customization,
+  programmable-switch state, and high-level data services.
+
+**GPU DB mapping:** For the current single-node engine, the immediate
+lesson is not "replace pgwire with RDMA." It is to make communication
+semantics first-class before the system reaches the point where
+thread-per-client TCP, copied buffers, and generic channels are baked
+into every owner boundary. `11-high-throughput-query-runtime.md`
+already names network IO workers, command rings, response rings, GPU
+execution owners, and bounded buffers. This paper suggests those
+boundaries should carry a transport/resource contract too: copy count,
+buffer ownership, ordering guarantee, remote/local memory access,
+completion signal, and whether the path is legal for mutation,
+retained read, WAL, refresh, or cold-tier movement.
+
+For 1M logical sessions, programmable-network examples map best to
+admission and routing, not arbitrary SQL execution. Tiny validated
+actions might be eligible for future kernel/NIC/switch help: route a
+read to a caught-up replica or owner, reject overload before entering
+the engine, classify a request into a hot retained route, or batch
+same-affinity requests. Anything involving full SQL semantics, MVCC
+visibility, WAL-before-visibility, catalog invalidation, or complex
+expression evaluation should remain inside DB-owned code unless the
+offloaded state and invalidation protocol are explicitly proved.
+
+RDMA/disaggregated-storage lessons matter for GPU memory and future
+tiers. GPU DB's planned tiers are not just HBM, DRAM, and NVMe; future
+CXL/remote memory or remote GPU nodes will turn "resident snapshot" and
+"cold partition" movement into networked memory movement. A retained
+snapshot handle should therefore avoid assuming local addressability.
+It should name table/partition identity, visibility boundary, residency
+generation, location, transport path, and completion/ordering contract.
+
+The warning about concurrent RDMA writes is directly applicable to WAL
+and MVCC publication. One-sided writes can look attractive for pushing
+WAL records, visibility summaries, or resident metadata to another
+owner/device/node, but SQL visibility still needs a DB-level commit
+frontier. GPU DB should not let a remote DMA completion become the same
+thing as durable, validated, visible, or invalidated. Those fronts must
+remain separate telemetry and correctness states.
+
+**Risks and mismatches:** This is a tutorial and position paper, not a
+full experimental system. It does not provide new benchmark numbers for
+a specific SQL workload, and many examples are summarized from prior
+work. It also targets distributed/cloud database systems, while the
+current GPU DB engine is still proving a single-node pgwire and retained
+GPU path. RDMA and programmable switches are future transport options,
+not prerequisites for the current P8 storage slice.
+
+The offload examples are easy to overapply. Network devices have tiny
+state and restricted computation compared with CPU/GPU execution, and
+the paper explicitly says database logic must be redesigned for those
+models. For GPU DB, the safe takeaway is semantic routing, admission,
+simple aggregation, and validated request triage; it is not permission
+to move MVCC, arbitrary predicates, or transaction commit into a switch.
+
+**Benchmark candidates:**
+
+- Add a transport-contract inventory for the runtime design: for each
+  boundary, record copy count, buffer owner, ordering guarantee,
+  completion event, queue depth, and legal route families. Gate: no code
+  change, but every hot path has a named contract and fallback reason.
+- Instrument the pgwire retained path for bytes copied per request from
+  socket read through response write. Required metrics: input copies,
+  output copies, buffer allocation count, queue wait, owner entries, and
+  p50/p99 latency at concurrency `1,2,4,8,16,32,64`.
+- Prototype a compatibility-preserving admission pre-classifier before
+  owner enqueue: reject overload, route exact retained reads, or forward
+  to the normal planner with an explicit reason. Failure condition:
+  SQL-visible behavior or error timing changes for non-retained paths.
+- Design a future RDMA/zero-copy COPY-admission experiment as a lab-only
+  transport slice: preallocated input buffers, explicit ownership states,
+  and WAL-before-visibility barriers. Gate: the proof must show that DMA
+  completion, WAL durable completion, resident invalidation, and SQL
+  visibility are distinct events.
+- Add a semantic-routing simulator for replicated or partitioned read
+  snapshots: route reads only to owners/replicas whose visibility
+  boundary is high enough. Measure avoided primary/owner queue entries,
+  stale-read rejections, and route-table update cost.
+- For over-resident execution, model remote/cold partition movement as a
+  transport contract rather than only a storage cost. Metrics: bytes
+  moved, copy count, queue depth, IO/network completion latency,
+  visibility boundary, and fallback reason.
+- Add follow-up reviews for database-specific RDMA abstractions and
+  programmable-network transaction triage before committing to any
+  kernel-bypass or RDMA implementation path.
