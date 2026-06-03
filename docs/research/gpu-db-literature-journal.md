@@ -18402,3 +18402,183 @@ interactive SQL would require a restricted fast lane.
 - Add telemetry for "abortable frontier reached" and "non-abortable pieces
   outstanding" so admission can distinguish correctness blockers from
   performance-cache lag.
+
+### 2026-06-03 - Vessel fast userspace core scheduling
+
+**Citation:** Jiazhen Lin, Youmin Chen, Shiwei Gao, and Youyou Lu. "Fast Core
+Scheduling with Userspace Process Abstraction." SOSP 2024, pp. 280-295.
+Retrieved 2026-06-03 from
+`https://chenyoumin1993.github.io/papers/sosp24-vessel.pdf`.
+
+**Category:** runtime / HFT / session scale.
+
+**Relevance tags:** userspace scheduling; core reallocation; userspace
+interrupts; MPK isolation; dense colocation; tail latency; bounded CPU
+budgets; session multiplexing; request-class isolation.
+
+**Core idea:** Vessel attacks a specific cost in low-latency runtimes: moving
+cores between applications is still expensive when the scheduler has to cross
+the kernel boundary and switch Linux process state. The paper introduces
+`uProcess`, a userspace process abstraction that places multiple applications
+inside a shared memory address space while using hardware protection and a
+runtime call gate to preserve isolation-like semantics. A core can then switch
+between applications with userspace jumps and userspace interrupts rather than
+full kernel-mediated process switching.
+
+The key lesson for GPU DB is not to adopt `uProcess` wholesale. It is that
+sub-microsecond-scale scheduling needs the execution abstraction, protection
+boundary, and scheduling policy to be co-designed. If the serving engine wants
+to multiplex many logical sessions, retained reads, write owners, refresh
+jobs, and CPU fallback on a finite core budget, the cost of moving CPU time
+between request classes must be measured as a first-class runtime primitive.
+
+**Concrete mechanisms:**
+
+- Vessel groups managed applications and cores into a scheduling domain. Each
+  application runs as a `uProcess` inside a shared memory address space, while
+  ordinary Linux still manages unmanaged applications and cores.
+- The shared memory address space stores per-`uProcess` text, data, stack, and
+  heap regions plus a runtime region. Memory protection keys assign access
+  rights so a `uProcess` normally sees only its own regions.
+- A userspace privileged mode is implemented with a runtime region and a
+  carefully controlled call gate. A `uProcess` enters this mode before
+  invoking privileged runtime operations such as switching the active region or
+  managing threads.
+- Userspace interrupts provide passive preemption without trapping into the
+  kernel. A scheduler sends a Uintr signal to a victim core; the receiver runs
+  a userspace interrupt handler, enters the runtime call gate, saves context,
+  changes MPK permissions, and jumps to the selected `uProcess`.
+- Vessel's one-level scheduler uses a global view of CPU resources rather than
+  first trying intra-application work stealing and only later reallocating a
+  core across applications. The paper argues this becomes viable once
+  cross-application switching is no longer much more expensive than local
+  load balancing.
+- The runtime includes a program loader, userspace thread management, a
+  `jemalloc`-based heap allocator adapted for the shared address space, signal
+  handling, and dataplane hooks for network/storage access.
+- The loader validates executable segments, checks for illegal use of MPK
+  instructions, initializes `PKRU` through the call gate, and adapts dynamic
+  library loading because ordinary `mmap` cannot be used the same way inside
+  the pre-created shared memory region.
+- Vessel discourages ordinary kernel file-system and service syscalls in the
+  hot path because trapping into the kernel makes the runtime lose control of
+  the core and can raise correctness or security mismatches with the
+  `uProcess` abstraction.
+- In the paper's Caladan comparison, core reallocation in Caladan involves
+  inter-core signaling and multiple user/kernel crossings and is measured
+  around 5.3 microseconds in the illustrated path. Vessel's context-switch
+  microbenchmark reports 0.161 microseconds average and 0.706 microseconds at
+  p999, while Caladan reports 2.103 microseconds average and 5.461
+  microseconds at p999.
+- In dense Memcached colocation, the paper reports that with 10 instances on
+  one core, Caladan's peak throughput drops by about 25% and p999 latency rises
+  by about 20%, while Vessel's aggregate throughput and tail latency are
+  almost unchanged.
+- Vessel also uses fine-grained core scheduling as a memory-bandwidth control
+  mechanism. In the reported membench comparison, it regulates bandwidth more
+  accurately than Intel MBA or Linux CFS for the tested setup.
+
+**GPU DB mapping:** GPU DB's target runtime already names network IO workers,
+bounded command rings, owner domains, read snapshot workers, GPU execution
+workers, and response rings. Vessel suggests making "core movement" and
+"request-class movement" explicit benchmark dimensions. A million logical
+sessions should not imply a million independently scheduled OS threads; it
+should imply a small number of physical CPU owners that can reassign budget
+between network parsing, response encoding, mutation admission, retained-read
+dispatch, and background refresh without paying millisecond or multi-
+microsecond scheduling penalties per shift.
+
+The `uProcess` idea maps most directly to isolation between runtime classes,
+not to SQL tenants. GPU DB could define lighter-weight internal execution
+domains: network IO, mutation owner, catalog owner, residency owner, GPU
+execution owner, CPU fallback, and maintenance refresh. Each domain needs
+owned memory arenas, ring buffers, and metrics. The first implementation should
+not need MPK or Uintr, but it should copy the architectural discipline:
+separate ownership, avoid arbitrary syscalls in the hot path, preallocate
+domain-local buffers, and make domain switching observable.
+
+Vessel's one-level scheduler is a warning against overly conservative
+two-stage routing. If GPU DB first tries to drain local owner work forever
+before moving core time to overloaded network IO or retained reads, short
+requests can suffer avoidable queueing. Conversely, if every request can steal
+from every domain, ownership and visibility invariants become fragile. A good
+middle path is a global admission controller that can reassign physical worker
+budget between typed rings while the rings still enforce narrow ownership and
+correctness rules.
+
+The paper also sharpens the DPU/NIC question. Vessel says its centralized
+scheduler could be offloaded or cooperate with NIC-side mechanisms. For GPU
+DB, this argues for keeping request admission metadata compact and device-
+visible: session id, request class, ring depth, snapshot generation, response
+budget, and overload reason. That makes future NIC/DPU steering possible
+without baking networking hardware into the first runtime.
+
+**Risks and mismatches:** Vessel depends on emerging hardware features
+including Uintr and MPK, and its programming/runtime environment is far more
+intrusive than GPU DB should adopt in an early database serving path. Its
+evaluation is centered on Memcached, Silo, Linpack, and synthetic memory
+bandwidth workloads, not SQL protocol parsing, WAL-before-visibility, MVCC
+snapshots, CUDA streams, or PostgreSQL compatibility. Shared-address-space
+processes complicate security and debugging; even with MPK, the paper notes
+that kernel syscalls are problematic because Linux is unaware of `uProcess`
+semantics. GPU DB should treat the paper as a scheduling-cost and ownership
+model, not as a near-term dependency.
+
+**Benchmark candidates:**
+
+- Add a runtime microbenchmark that measures moving one physical CPU worker
+  between request classes: network parse, retained read dispatch, response
+  encode, mutation admission, and refresh. Gate: report p50/p99 switch latency,
+  lost work, cache misses if available, and queue wait before/after movement.
+- Prototype typed worker-budget reassignment over existing bounded rings
+  without MPK/Uintr. Gate: under mixed retained reads plus background refresh,
+  p99 retained-read latency improves without stale snapshots or WAL ordering
+  regressions.
+- Compare two-level scheduling against a global budget policy: first local
+  work stealing then cross-domain reassignment versus direct global assignment
+  by queue age, class priority, and saturation. Failure condition: global
+  policy violates owner-only mutation or increases p50 latency unacceptably.
+- Add per-domain arenas and reusable buffers for network IO, response encoding,
+  and GPU dispatch. Gate: allocation count on the hot retained-read path drops
+  measurably at high logical session counts.
+- Simulate dense logical session colocation: many idle or bursty sessions over
+  a small IO-worker pool. Measure queue wait, response delay, memory per
+  session, and fairness under bursts. Minimum proof: no thread-per-session
+  scaling assumption remains in the benchmark harness.
+- Track a future-hardware experiment flag for Uintr/MPK or DPU-assisted
+  scheduling, but keep the first production contract portable: bounded rings,
+  explicit domain ownership, and measurable reassignment overhead.
+
+### 2026-06-03 - Cross-paper synthesis: declared boundaries need schedulable budgets
+
+RankPQO, PWV, and Vessel converge on one design rule: fast paths are only safe
+when their boundaries are declared before the runtime tries to optimize them.
+RankPQO declares candidate route sets and ranks only routes that are already
+valid. PWV declares abortable and non-abortable transaction pieces before
+allowing earlier publication inside deterministic execution. Vessel declares
+userspace execution domains and their protection/scheduling boundaries before
+making core movement cheap.
+
+For GPU DB, this points to three converging tracks. First, route choice should
+rank valid CPU/GPU/tier candidates under runtime state rather than produce
+routes from a black box. Second, write admission should expose explicit
+frontiers: validation, WAL-stable, CPU-visible, resident invalidated, resident
+refreshed. Third, runtime scheduling should budget cores across typed domains
+instead of treating all work as one owner queue or one generic worker pool.
+
+The category gap after these papers is still storage and HTAP tuple placement.
+The next high-value reviews should favor instant tuple discovery, tiered buffer
+management, or cold/hot storage economics unless the queue becomes too light on
+transaction concurrency again.
+
+Benchmark priorities:
+
+- Build a trace format that records route candidates, correctness predicates,
+  queue state, and outcome for one retained query template.
+- Add mutation-frontier telemetry so write-path experiments can distinguish
+  correctness delay from cache-refresh lag.
+- Add a worker-budget benchmark that moves CPU time between typed runtime
+  rings and measures p99 retained-read latency under session bursts.
+- Keep all three tracks tied to failure conditions: invalid route filtered,
+  pre-WAL visibility impossible, and owner-domain invariants preserved under
+  budget reassignment.

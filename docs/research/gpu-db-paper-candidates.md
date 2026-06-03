@@ -684,7 +684,7 @@ Append new candidates here as each paper is processed.
   useful for deciding whether GPU DB should approximate processor-sharing
   policies for heavy-tailed retained reads, scans, and refresh jobs without a
   fully general preemptive runtime.
-- `queued` — **Fast Core Scheduling with Userspace Process Abstraction**,
+- `reviewed` — **Fast Core Scheduling with Userspace Process Abstraction**,
   Lin et al., SOSP 2024.
   URL: `https://doi.org/10.1145/3694715.3695976`
   PDF: `https://chenyoumin1993.github.io/papers/sosp24-vessel.pdf`
@@ -758,6 +758,19 @@ Append new candidates here as each paper is processed.
   full transaction stages rather than only WAL, index, or GPU refresh
   substeps, and when batch-level write-set ordering should be preferred over
   per-request optimistic validation in hot partitions.
+- `queued` — **ghOSt: Fast & Flexible User-Space Delegation of Linux
+  Scheduling**, Narayanan et al., SOSP 2021.
+  URL: `https://doi.org/10.1145/3477132.3483542`
+  Why: Vessel contrasts against kernel-mediated user-space scheduler
+  delegation; useful for deciding whether GPU DB should expose request,
+  session, and core-placement decisions through a scheduler agent while
+  keeping Linux as the enforcement boundary.
+- `queued` — **Shinjuku-Offload: Practical Load Balancing for
+  Microsecond-scale Datacenter Applications**, Kogias et al., NSDI 2023.
+  URL: `https://www.usenix.org/conference/nsdi23/presentation/kogias`
+  Why: Vessel cites SmartNIC/offloaded scheduling as an orthogonal direction;
+  relevant to future NIC/DPU-aware admission and response steering for
+  million-session GPU DB deployments.
 - `reviewed` — **CAM: Asynchronous GPU-Initiated, CPU-Managed SSD Management for
   Batching Storage Access**, Song et al., ICDE 2025.
   URL: `https://doi.org/10.1109/ICDE65448.2025.00175`
