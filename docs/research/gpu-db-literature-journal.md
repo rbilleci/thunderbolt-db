@@ -11828,3 +11828,163 @@ extra work so p50/p99 query latency and memory pressure remain visible.
   cold I/O slot, WAL flush wait, GPU stream slot, response buffer, or idle.
   Minimum proof: large idle session counts do not increase active queue
   memory or pinned-buffer reservation.
+
+### 2026-06-03 - Tesseract online schema evolution
+
+**Citation:** Tianxun Hu, Tianzheng Wang, and Qingqing Zhou. "Online
+Schema Evolution is (Almost) Free for Snapshot Databases." PVLDB 16(2),
+2022, pp. 140-153. doi:10.14778/3565816.3565818. Retrieved
+2026-06-03 from `https://www.vldb.org/pvldb/vol16/p140-hu.pdf`.
+
+**Category:** MVCC / snapshot / visibility, hybrid HTAP, and
+transaction processing / write path.
+
+**Relevance tags:** transactional DDL; schema MVCC; catalog generations;
+retained snapshots; DDL invalidation; online migration; change data
+capture; commit pipelining; long transactions.
+
+**Core idea:** Tesseract treats schema evolution as ordinary MVCC data
+modification. A table's schema is a versioned catalog record, and a DDL
+transaction updates that schema record plus any affected table data inside
+the database's snapshot isolation protocol. DML transactions read the
+schema version visible to their own begin timestamp and interpret data
+versions that match that schema. This turns online transactional DDL from
+an ad hoc locking or trigger problem into a visibility and commit-ordering
+problem.
+
+Basic data-definition-as-modification is correct but too conservative:
+a long DDL transaction may touch the whole table, collide with concurrent
+DML, and accumulate a huge write set. Tesseract's relaxed DDaM improves
+this by migrating data out of place into a new indirection array, letting
+concurrent DML pre-commit on the old array, using change data capture to
+reconcile concurrent updates, and publishing the new schema in a pending
+state before final completion. On a 40-core ERMIA prototype, the paper
+reports online transactional schema evolution with no service downtime and
+often only up to about a 10% DML throughput drop for heavyweight
+copy-oriented DDL such as eager add-column migration.
+
+**Concrete mechanisms:**
+
+- Each table has a schema record in a system catalog table. The schema
+  record is itself multi-versioned and uses the same commit timestamp
+  visibility rules as ordinary records.
+- Reads obtain the visible schema version before reading data. A reader
+  then interprets the latest visible data version that conforms to that
+  schema version.
+- Writes must see both the latest record version and the latest schema
+  version. The transaction stores the schema versions it used in a
+  `schema_set`.
+- Commit draws a commit timestamp, then verifies that each schema in the
+  `schema_set` is still the latest schema for its table before stamping
+  written data versions. This prevents a transaction that wrote under an
+  old schema from committing after a newer schema is installed.
+- DDL operations are categorized by whether they need copy and/or verify
+  work: examples include modify-column, add-constraint, create-index,
+  create-as-select, add/drop-column, and create/drop-table.
+- Basic DDaM installs a new schema record and then migrates/verifies data
+  with ordinary reads and writes in the same transaction. It is atomic and
+  rollback-capable but can cause many conflicts and very large write-set
+  tracking overhead.
+- Relaxed DDaM creates a new indirection array for the new schema. DDL
+  scan threads transform records from the old array and install versions
+  into the new array, which remains invisible until the DDL completes.
+- At DDL start, the migration records the old indirection-array size and
+  scans only that prefix, bounding scan-phase work even if concurrent DML
+  appends records.
+- Concurrent DML continues against the old indirection array and may
+  pre-commit through pipelined commit, but finalization waits until the
+  DDL's conflict-resolution phase completes.
+- The CDC phase scans log records from a recorded starting LSN through
+  the DDL pre-commit point to discover and transform concurrent updates.
+  Tesseract can overlap CDC with the scan phase, and uses multiple CDC
+  threads.
+- After the scan phase, the DDL transaction obtains a pre-commit timestamp,
+  makes the new schema visible in a pending state, and directs newly
+  started transactions toward the new schema so no new CDC work is added.
+- Relaxed snapshots let the DDL scan migrate the latest committed version
+  rather than the version visible at the DDL begin timestamp. Migrated
+  versions inherit original commit timestamps because they are isolated in
+  the new indirection array until publication.
+- Some post-pending DML may proceed without waiting if the DDL is copy-only
+  and the target record has already been migrated; verification-oriented
+  DDL keeps transactions waiting because constraints may still fail.
+- Old array replacement waits for existing accesses to finish via
+  epoch-based memory management or reference counting.
+
+**GPU DB mapping:** This is directly relevant to the current architecture's
+catalog owner, residency owner, and retained snapshot model. GPU DB should
+treat schema and route metadata as versioned data with a visible generation,
+not as mutable global state that read workers sample opportunistically. A
+retained GPU snapshot should carry both a data visibility boundary and a
+schema/catalog generation; a read route is valid only when its resident
+layout, selected columns, predicates, and response shape match the schema
+version visible to the request.
+
+Tesseract also gives a shape for online resident-layout changes. Adding a
+column, changing a type representation, building a resident index, or
+splitting a table/segment can be modeled as out-of-place construction of a
+new resident/canonical indirection or segment generation. Existing readers
+continue on the old generation, writers pre-commit through the mutation
+owner, and a CDC-like phase applies concurrent writes before the new
+generation becomes fully visible.
+
+The pending-schema idea maps to GPU DB route admission. After a DDL or
+resident-layout migration reaches a publication frontier, new reads should
+route to the new generation only if it is complete enough for their shape;
+otherwise they wait, fall back, or receive an explicit pending-generation
+reason. Old retained snapshots retire by reference count or epoch, matching
+the target immutable snapshot design.
+
+For write throughput, the key warning is that DDL/refresh work should not
+be just another huge transaction with a massive write set. The engine needs
+sealed migration descriptors and write descriptors: start generation,
+source boundary, affected tables/columns, old/new layout ids, starting WAL
+or LSN, scan prefix, CDC range, pending state, and final visible generation.
+Those descriptors can also drive GPU resident invalidation and response
+metadata compatibility.
+
+**Risks and mismatches:** Tesseract targets CPU in-memory ERMIA with
+snapshot isolation. It does not implement PostgreSQL protocol DDL, GPU
+resident column groups, WAL durability on NVMe, DDL SQL parsing, indexes
+as durable performance structures, or serializable isolation. Its logging
+experiments use DRAM-backed tmpfs, so the reported DML impact does not
+include real durable WAL flush pressure. The paper's separate indirection
+arrays are row-version structures, while GPU DB resident layouts are
+columnar acceleration state that must be rebuildable from WAL/CPU truth.
+
+CDC and pending-schema handling can also increase tail latency if the CDC
+phase falls behind concurrent writes. Aborting the DDL on incompatible
+concurrent DML is simple, but a production system may need policy choices:
+abort DDL, abort stale DML, block a route class, or fall back to CPU. GPU
+DB must keep those choices explicit and avoid publishing a resident layout
+whose schema generation and data generation disagree.
+
+**Benchmark candidates:**
+
+- Add catalog-generation handles to retained snapshot metadata: table OID,
+  schema generation, resident layout id, source WAL boundary, visibility
+  boundary, and response shape id. Gate: a retained read must reject or
+  fall back when any generation mismatches.
+- Prototype out-of-place resident layout migration for one table: build a
+  new column-group snapshot while old retained readers continue, then
+  publish it after a sealed mutation/CDC descriptor is complete. Failure
+  condition: new readers can observe mixed old schema/new data or new
+  schema/old data.
+- Add a DDL-versus-retained-read stress test: hold long retained snapshots,
+  perform add-column or resident-index-build migration, and measure write
+  throughput, read fallback rate, snapshot retirement delay, and p99 route
+  latency.
+- Implement commit-time schema validation for writes in the CPU relational
+  layer: a write records the schema generation it used, and commit fails or
+  retries if a newer schema was published before visibility. Gate:
+  randomized DDL/DML interleavings never interpret a row under the wrong
+  schema.
+- Track migration descriptors with `scan_started`, `scan_done`,
+  `pending_visible`, `cdc_started`, `cdc_done`, `published`, and
+  `old_generation_retired` timestamps. Use them to decide whether a read
+  waits, routes old, routes new, or falls back.
+- Compare DDL policies under concurrent writes: abort DDL on incompatible
+  post-scan writes, block stale writers during pending publication, or let
+  copy-only writers proceed when their target record has already migrated.
+  Required metrics: DML throughput, DDL completion time, abort counts,
+  retained-read p99, and stale-generation rejection reasons.

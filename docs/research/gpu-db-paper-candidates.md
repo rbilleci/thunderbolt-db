@@ -480,7 +480,7 @@ Append new candidates here as each paper is processed.
   useful for comparing OS-assisted migration against explicit DBMS ownership.
 - `queued` — **Towards Buffer Management with Tiered Main Memory**, Hao et al.,
   PACMMOD/SIGMOD 2024.
-  URL: `https://doi.org/10.1145/3639303`
+  URL: `https://doi.org/10.1145/3639286`
   Why: modern tiered-main-memory buffer management cited by vmcache^n;
   relevant to DRAM/remote-memory/NVMe policy design and placement economics.
 - `reviewed` — **PAR2QO: Parametric Penalty-Aware Robust Query Optimization**,
@@ -756,13 +756,20 @@ Append new candidates here as each paper is processed.
   Why: learned hint-based optimizer baseline compared by PAR2QO; useful for
   deciding whether GPU route tuning should learn bounded hints around a
   deterministic planner rather than replace route rules.
-- `queued` — **Online Schema Evolution is (Almost) Free for Snapshot
+- `reviewed` — **Online Schema Evolution is (Almost) Free for Snapshot
   Databases**, Hu et al., PVLDB 2022.
   URL: `https://www.vldb.org/pvldb/vol16/p140-hu.pdf`
   Why: modern snapshot-database follow-up discovered while reviewing
   serializable MVCC; relevant to DDL/catalog generation changes, retained
   snapshots, and whether schema evolution can avoid blocking GPU-resident
   readers.
+- `queued` — **BullFrog: Online Schema Evolution via Lazy Evaluation**,
+  Bhattacherjee et al., SIGMOD 2021.
+  URL: `https://doi.org/10.1145/3448016.3452842`
+  PDF: `https://www.cs.umd.edu/~mwh/papers/bullfrog-sigmod.pdf`
+  Why: lazy physical migration for online schema changes in PostgreSQL;
+  useful contrast to Tesseract's MVCC-native out-of-place migration and
+  CDC design for retained snapshots and catalog generations.
 
 - `reviewed` — **AGILE: Lightweight and Efficient Asynchronous GPU-SSD
   Integration**, Yang et al., SC 2025.
