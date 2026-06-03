@@ -26455,3 +26455,164 @@ concurrency policy, and high-concurrency request descriptors below SQL.
   append-only MVCC chains, HybridLog-like hot tail plus cold blocks, and
   frozen Data Block-style segments plus hot deltas. Report the point at
   which each wins or fails rather than choosing by aggregate throughput.
+
+### 2026-06-04 - Don't Hold My Data Hostage: A Case For Client Protocol Redesign
+
+**Citation:** Mark Raasveldt and Hannes Muehleisen. "Don't Hold My
+Data Hostage: A Case For Client Protocol Redesign." PVLDB 10(10),
+2017, pp. 1022-1033. doi:10.14778/3115404.3115408. Retrieved
+2026-06-04 from `https://www.vldb.org/pvldb/vol10/p1022-muehleisen.pdf`.
+
+**Category:** runtime / HFT / session scale, with query-result
+protocol and data-export implications.
+
+**Relevance tags:** result-set serialization; pgwire escape hatch;
+columnar response chunks; response rings; large result sets; BLOB
+export; compression choice; network throughput; session latency;
+zero-copy-adjacent protocol design.
+
+**Core idea:** The paper argues that database client protocols lagged
+behind modern analytical and data-science workloads. Large result
+exports often spend far more time in result-set serialization,
+deserialization, per-row metadata, and protocol conversion than in the
+query itself. Existing protocols were built around row-wise client
+access and console-style use, but large downstream consumers often want
+columnar arrays.
+
+The proposed fix is not a new query engine. It is a vectorized,
+column-major result protocol that sends bounded chunks of rows in
+column order. This preserves streaming access without forcing the
+client to buffer a whole result set, while eliminating most per-row
+headers and avoiding row-to-column-to-row conversion when the consumer
+is analytical. Implementations in MonetDB and PostgreSQL show
+order-of-magnitude export improvements on the evaluated large datasets.
+
+**Concrete mechanisms:**
+
+- The paper decomposes export into connection, query execution, and
+  result-set serialization plus transfer. For TPC-H `lineitem` scale
+  factor 10 over loopback, result serialization and transfer dominate
+  for the measured systems; netcat CSV transfer is far faster than most
+  DBMS client-protocol exports.
+- Protocol overhead is analyzed at the byte layout level. PostgreSQL
+  sends a per-row message with row length, field count, per-field
+  lengths, and data. MySQL uses packet headers and text field data.
+  Hive/Thrift uses a columnar shape but still pays generic structured
+  message metadata and per-value encoding costs.
+- Network latency still affects large-result protocols because TCP
+  acknowledgement behavior and protocol batching interact with the
+  number of bytes and messages sent. Some systems also appear to use
+  explicit confirmation messages that become costly as latency rises.
+- The proposed design sends vector chunks: each chunk contains a bounded
+  number of rows, but values inside the chunk are serialized column by
+  column.
+- Chunk size is configured in bytes by the client during authentication.
+  The evaluation finds around 1 MB chunks are enough for good
+  performance and compression, so clients do not need unbounded memory
+  to benefit from column-major transfer.
+- Compression is treated as a route decision. No compression is best
+  when client and server are local; lightweight compression such as
+  Snappy is best for ordinary LAN/WAN-style links; heavyweight
+  compression only wins on very slow links because CPU cost otherwise
+  dominates.
+- Column-major binary chunks compress better than row-major binary
+  chunks even with generic compression. Column-specific integer
+  compression can help on some distributions, but performs poorly when
+  chunks contain too few rows per column or the value distribution does
+  not fit the codec.
+- The implementation uses a custom serialization format rather than a
+  generic framework such as Protocol Buffers, because generic message
+  handling adds unnecessary conversion and packing costs for this
+  specialized table-streaming path.
+- String transfer is handled with conservative choices: fixed-width
+  encoding is only attractive for very narrow strings such as
+  `VARCHAR(1)`; otherwise null-terminated strings avoid severe padding
+  blowups and compress well.
+- MonetDB's columnar storage maps directly to the new protocol. The
+  PostgreSQL prototype must copy row-major tuples into column-major
+  temporary buffers, but still improves large-result export because it
+  removes per-row protocol overhead and improves compression.
+- For PostgreSQL-style NULL handling, the proposed protocol sends a
+  per-column NULL mask only when the column may contain NULLs. Known
+  `NOT NULL` columns avoid this extra bitmap.
+
+**GPU DB mapping:** This paper directly sharpens the response side of
+`11-high-throughput-query-runtime.md`. The current runtime target talks
+about response rings and reusable response metadata, but pgwire row
+messages can still dominate if retained GPU execution produces large
+or repeated result sets. GPU DB should treat large-result delivery as a
+separate route from ordinary row-wise pgwire responses.
+
+For read-heavy retained routes, the transferable design is a bounded
+columnar response chunk owned by the execution or response domain.
+GPU kernels or CPU fallback workers can fill column vectors, validity
+bitmaps, offsets, and string buffers, then hand chunks to network IO
+workers through response rings. The row-wise pgwire encoder remains the
+compatibility path, but a binary/vectorized or Arrow-like path should
+be measured for internal clients, future gateways, bulk export, and
+large analytical responses.
+
+The chunk-size result maps cleanly to admission. A logical session
+should not be allowed to pin an unbounded result. Instead, response
+credits should account for a small number of fixed-byte chunks per
+active request, with backpressure when socket writability or downstream
+consumption lags. This is the response-side companion to request
+credits from eRPC-style designs.
+
+The compression findings also matter for P8. A resident segment route
+should not always decompress and row-encode. If the output consumer can
+accept columnar chunks, the engine can preserve GPU/CPU column layout
+longer, compress or avoid compression based on link speed and CPU/GPU
+budget, and skip expensive row materialization. For local benchmark
+clients, no compression may be the right proof path; for networked or
+gateway clients, lightweight compression of columnar chunks may win.
+
+Finally, the paper is a warning against measuring only kernel time or
+planner time. A GPU query that returns millions of rows can look fast
+inside CUDA and still lose at protocol serialization. Benchmarks need
+separate counters for kernel time, result materialization, response
+chunk fill, compression, socket write time, and client-visible first
+chunk/last chunk latency.
+
+**Risks and mismatches:** The paper targets large result-set export, not
+small OLTP point queries. A columnar protocol is likely wrong for tiny
+single-row responses where pgwire compatibility and low setup latency
+matter more than bandwidth. The PostgreSQL prototype is a protocol
+extension, not a production pgwire-compatible standard; deploying a real
+escape hatch would need client support, authentication/authorization
+rules, transaction semantics, cancellation behavior, and careful error
+framing.
+
+The evaluation predates Arrow Flight, modern cloud gateways, HTTP/2 or
+QUIC-based APIs, and current NIC/CPU/GPU hardware. The absolute timings
+should not be treated as current. The mechanism is still relevant:
+per-row metadata, row/column conversion, generic serialization, and
+compression choice remain measurable response-path costs.
+
+**Benchmark candidates:**
+
+- Add a retained-result response benchmark that separates execution time
+  from response encoding time for `SELECT *`, projected `int4` columns,
+  projected `text` columns, and mixed wide rows. Failure condition:
+  CUDA or CPU execution is fast but p95/p99 client completion is
+  dominated by row-wise encoding without telemetry.
+- Prototype a bounded columnar response chunk for one internal benchmark
+  route: row count, per-column buffers, optional validity bitmap, and
+  `text` offsets/bytes. Gate: exact SQL-visible results compared with
+  pgwire row output for NULLs, empty strings, and variable-width text.
+- Compare pgwire row encoding, vectorized binary chunks, and an
+  Arrow-like chunk for large retained reads. Required metrics:
+  bytes transferred, chunks/sec, first-chunk latency, last-chunk
+  latency, CPU encoding time, allocations, and response-ring residency.
+- Add per-session response credits measured in fixed-byte chunks rather
+  than rows. Gate: slow clients cannot pin unbounded encoded responses,
+  pinned buffers, or GPU result buffers.
+- Test compression policy on columnar chunks: none, Snappy/LZ4-class
+  lightweight compression, and a heavier codec only for slow-link
+  simulation. Failure condition: compression is selected by default
+  without considering CPU time, chunk size, and measured socket
+  throughput.
+- Add a "large result after fast GPU scan" benchmark where the kernel
+  emits vectors quickly but network output is deliberately constrained.
+  Expected result: admission/backpressure reports response-side
+  saturation rather than blaming GPU execution or planner fallback.

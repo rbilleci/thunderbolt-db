@@ -327,13 +327,13 @@ Append new candidates here as each paper is processed.
   Why: deferred-action framework that integrates physical maintenance
   with MVCC timestamps; useful for resident snapshot retirement, GPU
   buffer cleanup, index cleaning, and non-blocking layout changes.
-- `queued` — **Scalable Garbage Collection for In-Memory MVCC Systems**,
+- `reviewed` — **Scalable Garbage Collection for In-Memory MVCC Systems**,
   Bottcher et al., PVLDB 2019.
   URL: `https://dl.acm.org/doi/10.14778/3364324.3364328`
   Why: DAF cites it as a modern MVCC garbage-collection design; useful
   for long-reader robustness, version-chain cleanup, and cooperative
   cleanup benchmarks.
-- `queued` — **Mainlining Databases: Supporting Fast Transactional
+- `reviewed` — **Mainlining Databases: Supporting Fast Transactional
   Workloads on Universal Columnar Data File Formats**, Li et al.,
   PVLDB 2021.
   URL: `https://db.cs.cmu.edu/papers/2020/p534-li.pdf`
@@ -1865,12 +1865,19 @@ Append new candidates here as each paper is processed.
   Why: the ICDE 2024 BLOB paper uses FUSE to expose DBMS-owned objects as
   files; this primary FUSE performance study is useful for quantifying the
   interoperability tax before any GPU DB DB-backed-file or cold-tier API path.
-- `queued` — **Don't Hold My Data Hostage: A Case For Client Protocol
+- `reviewed` — **Don't Hold My Data Hostage: A Case For Client Protocol
   Redesign**, Raasveldt and Muehleisen, PVLDB 2017.
-  URL: `https://www.vldb.org/pvldb/vol10/p1022-raasveldt.pdf`
+  URL: `https://www.vldb.org/pvldb/vol10/p1022-muehleisen.pdf`
   Why: the ICDE 2024 BLOB paper identifies client/server networking and
   serialization overheads as major BLOB bottlenecks; this paper is relevant to
   large result/BLOB protocol design and pgwire-compatible escape hatches.
+- `queued` — **Vectorized UDFs in Column-Stores**, Raasveldt and
+  Muehleisen, SSDBM 2016.
+  URL: `https://doi.org/10.1145/2949689.2949705`
+  Why: Don't Hold My Data Hostage contrasts protocol redesign with pushing
+  computation into the database; this source is a useful companion for deciding
+  when GPU DB should export columnar result chunks versus run user logic near
+  resident column data.
 - `queued` — **File Systems Fated for Senescence? Nonsense, Says Science!**,
   Conway et al., FAST 2017.
   URL: `https://www.usenix.org/conference/fast17/technical-sessions/presentation/conway`
