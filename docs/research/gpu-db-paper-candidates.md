@@ -757,7 +757,7 @@ Append new candidates here as each paper is processed.
   PDF: `https://chenhao-ye.github.io/publication/polaris/polaris.pdf`
   Why: priority-aware OCC cited by PreemptDB; relevant to combining request
   priority with conflict handling instead of only changing worker scheduling.
-- `queued` — **MRVs: Enforcing Numeric Invariants in Parallel Updates to
+- `reviewed` — **MRVs: Enforcing Numeric Invariants in Parallel Updates to
   Hotspots with Randomized Splitting**, Faria and Pereira, PACMMOD/SIGMOD 2023.
   URL: `https://doi.org/10.1145/3588723`
   Why: TiQuE cites MRVs as a way to reduce wasted work around optimistic
@@ -2124,3 +2124,12 @@ Append new candidates here as each paper is processed.
   Why: AOCC cites BCC as a low-overhead false-abort reduction baseline; useful
   for GPU DB contention handling where serializable write lanes should avoid
   unnecessary aborts without weakening visibility guarantees.
+- `queued` — **CRDV: Conflict-free Replicated Data Views**, Faria and Pereira,
+  PACMMOD 2025.
+  URL: `https://doi.org/10.1145/3725291`
+  Author page: `https://nuno-faria.github.io/publications`
+  Why: MRVs leaves open whether randomized splitting generalizes beyond
+  numeric bounded counters; CRDV appears to continue the same line of
+  application-visible replicated/derived data structures for reducing
+  coordination, relevant to write-hot derived views and contention-safe
+  denormalized state.

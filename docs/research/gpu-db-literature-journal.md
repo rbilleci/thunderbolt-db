@@ -24905,3 +24905,158 @@ valuable work too early or underutilize GPU batches.
   hints at the network edge but keep all write ordering and snapshot
   publication inside the engine. Gate: identical SQL-visible ordering
   and lower IO-worker queue wait under high connection count.
+
+### 2026-06-03 - MRVs split bounded numeric hotspots across records
+
+**Citation:** Nuno Faria and Jose Pereira. "MRVs: Enforcing
+Numeric Invariants in Parallel Updates to Hotspots with Randomized
+Splitting." Proc. ACM Manag. Data 1(1), Article 43, 2023.
+doi:10.1145/3588723. Retrieved 2026-06-03 from the author page,
+`https://nuno-faria.github.io/publications/mrv`, the DOI metadata,
+and the accessible author/pre-SIGMOD slide PDF at
+`https://webhost.laas.fr/TSF/IFIPWG/Workshops%26Meetings/83/ResearchReports/RR-Pereira.pdf`.
+The ACM PDF endpoint returned a Cloudflare challenge during this run,
+so detailed paper-only mechanisms not present in these sources are
+marked unknown rather than inferred.
+
+**Category:** transaction processing / write path and concurrency
+control.
+
+**Relevance tags:** update hotspots; numeric invariants; bounded
+counters; randomized contention spreading; split records; transactional
+isolation preservation; write admission; inventory/prepaid-account
+workloads; skew.
+
+**Core idea:** MRVs targets a narrow but important transaction
+problem: many concurrent transactions update the same numeric value
+while needing to preserve a lower-bound invariant, such as prepaid
+credit, finite inventory, or a bounded counter embedded in a larger
+transaction. A single logical value becomes multiple physical records.
+Adds or subtracts choose one split record at random; reads sum the
+split records. If a chosen record cannot satisfy a subtract operation,
+the transaction walks the remaining records in a deterministic circular
+order.
+
+The important design constraint is layering. MRVs is meant to run on top
+of an existing transactional system without changing its concurrency
+control, without a home-node coordinator, and without weakening the
+system's isolation level. The author page says the work was tested on
+five systems ranging from DBx1000 to MySQL Group Replication and a
+cloud-native NewSQL system, using design/configuration experiments plus
+TPC-C and STAMP Vacation. The accessible sources report improved
+throughput and reduced abort/conflict rates versus alternatives, but
+the exact full-paper numeric tables were not available through the ACM
+PDF path in this run.
+
+**Concrete mechanisms:**
+
+- Each contended logical numeric value is represented by `n` physical
+  database records whose values sum to the logical value.
+- Update operations choose a random starting record among the currently
+  active split records. This spreads conflicts without needing advance
+  knowledge of cores, nodes, shards, or clients.
+- Subtract operations preserve the lower-bound invariant by consuming
+  only from records that have enough value. If the first chosen record
+  is insufficient, the operation visits the next records in circular
+  order rather than selecting random records repeatedly.
+- The circular traversal wraps from the last record back to the first
+  and stops before revisiting the starting predecessor. The slide deck
+  calls out easy termination detection and deadlock avoidance as goals
+  of this ordered traversal.
+- Sparse keys decouple the logical key space from the number of active
+  records: records are assigned random keys in a much larger key range,
+  and an operation looks up the lowest active record whose key is at or
+  above the random probe. This lets record insertion/removal avoid
+  conflicting with ordinary updates of other records.
+- The approach assumes a dynamic tree-structured index with range
+  queries and concurrent updates, plus multi-item transactions under
+  repeatable read, snapshot isolation, or serializability.
+- Background worker threads can adjust the number of physical records
+  for a logical value and rebalance value across records. The accessible
+  slides say this maintenance may be approximate and decentralized.
+- The underlying DBMS remains responsible for atomicity and isolation.
+  MRVs adds no extra coordination protocol beyond ordinary
+  transactional reads and writes.
+
+**GPU DB mapping:** MRVs is not a general MVCC replacement, but it is a
+useful write-path pattern for one class of hot rows that could otherwise
+destroy optimistic throughput: counters, inventory quantities,
+rate-limit buckets, queue capacity, account balances, or application
+metrics that many logical sessions update concurrently. Instead of
+forcing all updates through one tuple-version chain or one partition
+owner slot, GPU DB could expose a storage-level or SQL-level "split
+bounded counter" representation whose physical shards are ordinary
+MVCC rows under the same WAL-before-visibility rules.
+
+For the owner-domain design, the transferable idea is randomized
+admission into multiple owner-local records plus deterministic fallback
+traversal. A mutation owner can choose a split record using a stable
+per-transaction or per-session random seed, enqueue that write to the
+owning partition, and only perform circular traversal when the first
+record cannot satisfy the invariant. This keeps the common write path
+parallel while preserving a concrete reason for any extra work.
+
+For retained reads and GPU execution, reads of MRV values become an
+aggregate over the active split records at a snapshot boundary. That
+maps naturally to a small retained aggregate route: sum `n` physical
+records for a logical counter, cache or micro-batch compatible reads by
+snapshot generation, and invalidate the aggregate when any split record
+changes. The read cost rises with `n`, so the cache/residency owner
+needs telemetry for split count, update rate, read rate, and rebalance
+work before admitting this representation.
+
+The sparse-key mechanism also suggests a way to grow or shrink hot
+counter capacity without a heavy repartition step. New split records
+can be inserted into gaps in a logical key ring, and retiring records
+can be done as maintenance work once their value has been drained or
+rebalanced. GPU DB should treat that maintenance as ordinary WAL-backed
+mutation plus derived-state refresh, not as hidden state outside
+recovery.
+
+**Risks and mismatches:** MRVs applies only to numeric values with an
+operation-specific invariant. It does not help arbitrary updates,
+secondary indexes, non-commutative writes, row replacement, or
+transaction logic that needs to read its own exact counter update from a
+single row.
+
+Splitting trades write contention for read and maintenance overhead.
+Every exact read has to sum multiple records unless a safe derived
+aggregate is maintained, and background rebalancing adds write traffic
+that may compete with foreground mutations. For GPU DB, this means MRVs
+should be opt-in for measured hotspots, not the default representation
+for ordinary integers.
+
+The full ACM paper was not directly retrieved in this run because the
+ACM PDF path was blocked by Cloudflare. The journal entry therefore
+does not claim exact speedup values, full algorithm pseudocode, or the
+paper's complete evaluation breakdown. Those details should be filled
+in if an official PDF becomes accessible later.
+
+**Benchmark candidates:**
+
+- Add a host-only bounded-counter workload with `reserve`, `release`,
+  and `read_total` operations under snapshot visibility. Compare one
+  MVCC row versus `n={4,16,64}` split rows under high logical session
+  counts. Gate: identical invariant behavior and lower abort/retry or
+  owner-queue wait under skew.
+- Model MRV read amplification for retained reads: exact read through
+  CPU sum, retained aggregate cache by snapshot generation, and GPU
+  micro-batched sum over split records. Failure condition: write
+  throughput improves while p95 read latency becomes worse than the
+  single-row baseline for realistic read ratios.
+- Prototype deterministic circular fallback for subtract operations.
+  Required metrics: first-record success rate, fallback traversal
+  length, transaction aborts, and extra WAL records. Gate: no negative
+  logical value under concurrent subtracts and WAL replay.
+- Add split-count adaptation telemetry before implementing automatic
+  rebalancing: per-counter update rate, conflict or retry rate, read
+  rate, split count, and maintenance bytes. Gate: an operator can see
+  why a counter should grow, shrink, or remain single-row.
+- Test partition-owner placement policies for split records: all splits
+  under one owner, hash-distributed owners, and ring-adjacent owners.
+  Failure condition: distributed placement improves conflicts but makes
+  invariant checks or snapshot reads violate ordering or cost too much.
+- Include an inventory-like TPC-C stock decrement microbenchmark where
+  only selected numeric columns use MRV layout. Gate: higher sustained
+  write throughput without weakening SQL-visible row semantics for the
+  rest of the transaction.
