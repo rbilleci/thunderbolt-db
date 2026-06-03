@@ -739,7 +739,7 @@ Append new candidates here as each paper is processed.
   Why: policy-focused evaluation of work stealing, static allocation, and
   core reallocation for microsecond tasks; useful before choosing GPU DB
   IO-worker, retained-read, and background-refresh scheduling policies.
-- `queued` — **Syrup: User-defined Scheduling across the Stack**,
+- `reviewed` — **Syrup: User-defined Scheduling across the Stack**,
   Kaffes et al., SOSP 2021.
   URL: `https://doi.org/10.1145/3477132.3483548`
   Why: cited by the NSDI 2022 scheduling-policy paper as a cross-stack
@@ -758,6 +758,24 @@ Append new candidates here as each paper is processed.
   Why: RankPQO cites hybrid plan selection work; relevant to keeping GPU DB
   deterministic cost rules as guardrails while adding measured route-ranking
   hints for CPU/GPU/tier choices.
+- `queued` — **Mind the Gap: A Case for Informed Request Scheduling at the
+  NIC**, Humphries, Kaffes, Mazieres, and Kozyrakis, HotNets 2019.
+  URL: `https://doi.org/10.1145/3365609.3365856`
+  Why: Syrup cites this NIC-side informed request scheduling work; relevant to
+  deciding whether GPU DB should push route-class or key-home steering closer
+  to the network edge before requests enter owner queues.
+- `queued` — **MittOS: Supporting Millisecond Tail Tolerance with Fast
+  Rejecting SLO-Aware OS Interface**, Hao et al., SOSP 2017.
+  URL: `https://doi.org/10.1145/3132747.3132774`
+  Why: Syrup cites fast rejection with deadline/SLO hints; relevant to GPU DB
+  overload responses when retained-read, response, mutation, or GPU queues
+  cannot meet a request's latency budget.
+- `queued` — **TAS: TCP Acceleration as an OS Service**, Shenango/TAS related
+  work, SOSP 2019.
+  URL: `https://doi.org/10.1145/3341301.3359657`
+  Why: Syrup contrasts request scheduling with end-host transport scheduling;
+  useful for future pgwire/transport choices if ordinary kernel TCP remains
+  the high-concurrency bottleneck.
 - `queued` — **Flexible Resource Allocation for Relational
   Database-as-a-Service**, Arora et al., PVLDB 2023.
   URL: `https://www.vldb.org/pvldb/vol16/p4202-narasayya.pdf`

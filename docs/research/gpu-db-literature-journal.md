@@ -20628,3 +20628,160 @@ correctness.
   starving long work indefinitely.
 - Keep hardware preemption as a research-only follow-up until CPU service
   phases, not owner serialization or GPU work, are proven to dominate p99.
+
+### 2026-06-03 - Syrup user-defined scheduling across the stack
+
+**Citation:** Kostis Kaffes, Jack Tigar Humphries, David Mazieres, and
+Christos Kozyrakis. "Syrup: User-Defined Scheduling Across the Stack." SOSP
+2021, pp. 605-620. doi:10.1145/3477132.3483548. Retrieved 2026-06-03 from
+the Stanford author PDF,
+`https://cs.stanford.edu/~jhumphri/documents/syrup.pdf`.
+
+**Category:** Runtime / HFT / session scale.
+
+**Relevance tags:** cross-layer scheduling; high-concurrency networking;
+request classes; tail latency; eBPF; user-space scheduling; NIC queues;
+socket selection; admission policy; policy maps; multi-tenancy.
+
+**Core idea:** Syrup treats scheduling as an online matching problem:
+application-specific policy functions map inputs such as packets, network
+connections, or threads to executors such as NIC queues, sockets, or cores.
+The policy can be deployed at multiple layers using eBPF, programmable NIC
+offload, and ghOSt, while a shared Map abstraction lets user-space code and
+deployed policies exchange state such as load, request type, expected service
+time, or tokens.
+
+The transferable point for GPU DB is that routing should not be hard-coded at
+one layer. A request can be steered before socket admission, before owner-ring
+enqueue, before read/GPU worker assignment, and before response scheduling,
+using the same route-class facts. In the paper's RocksDB experiments, simple
+policies such as round-robin, SCAN avoidance, SITA-style size-aware steering,
+and token-based QoS reduce tail latency or raise usable load compared with
+default Linux policies. The largest headline result is up to 8x lower tail
+latency for the mixed RocksDB GET/SCAN workload; a cross-layer request plus
+thread scheduling experiment reaches sub-500 microsecond GET tail latency at
+60% higher load than the best single-layer policy; and a MICA locality policy
+pushes the tail-latency explosion point from about 1.7-1.8 MRPS to about
+3.2-3.3 MRPS when run on NIC hardware.
+
+**Concrete mechanisms:**
+
+- Syrup exposes a `schedule(input) -> executor_index` interface. The return
+  value indexes an executor Map owned by the framework; special values can
+  pass the input to the default policy or drop it.
+- The same matching abstraction is used at different hooks: socket selection,
+  CPU redirect, XDP software, XDP hardware offload, and ghOSt thread
+  scheduling.
+- A system daemon, `syrupd`, compiles and deploys policies, sets up per-policy
+  Maps, and installs input filters so one application's policy handles only
+  its own inputs.
+- Maps are key-value state shared between user space and deployed policies.
+  The paper uses them for executor sets, request-type state, and token
+  budgets. Host Map operations from user space are measured at roughly 1
+  microsecond; offloaded NIC Map operations are about 24-25 microseconds in
+  the evaluated Netronome setup.
+- eBPF provides safe in-kernel policy execution through verifier checks,
+  bounded loops, explicit packet bounds checks, and JIT compilation. The
+  paper reports the example policies running in under 2,000 cycles.
+- ghOSt is used where eBPF is not appropriate: thread scheduling decisions are
+  offloaded to a spinning user-space scheduler that receives kernel scheduling
+  events and returns core/thread decisions.
+- The SCAN-avoid RocksDB policy has a user-space component that marks which
+  server thread is currently processing a long SCAN and a kernel component
+  that tries to steer new requests away from those sockets.
+- The SITA-style policy peeks at packet request type and routes long SCAN
+  requests to one executor while round-robining short GET requests across the
+  rest, avoiding head-of-line blocking from mixed service times.
+- The token-based policy periodically replenishes latency-sensitive request
+  credits and gives unused credits to best-effort traffic, enforcing overload
+  behavior before queues explode.
+- For MICA, Syrup moves key-home steering from application-layer redirection
+  toward AF_XDP or NIC hardware, reducing cross-core packet movement before
+  the request reaches the worker that owns the key.
+- The discussion distinguishes early binding, where a packet is assigned when
+  it arrives, from late binding, where queued work is assigned only when an
+  executor is ready. The authors note that late binding can avoid short
+  requests being trapped behind long ones but requires temporary buffering.
+
+**GPU DB mapping:** GPU DB already wants network IO workers, owner domains,
+read snapshot workers, GPU execution owners, and response rings. Syrup suggests
+that each boundary should accept a compact route descriptor rather than making
+isolated local decisions. A pgwire request's descriptor should include route
+class, query shape, expected service class, snapshot generation, partition/key
+home, response size class, deadline or latency budget, and which resources it
+may consume.
+
+The route descriptor can drive multiple decisions. Network IO can steer short
+retained reads away from sockets or workers busy with COPY or long scans.
+Read-snapshot admission can avoid sending requests to partitions whose GPU
+queue is saturated. GPU execution workers can keep key-home and partition-home
+locality. Response rings can prioritize short row-count responses ahead of
+large scan result streams without violating per-session ordering. This is the
+GPU DB equivalent of one policy vocabulary spanning socket, thread, and NIC
+layers.
+
+Syrup's Maps map to small, explicitly owned runtime tables rather than a
+general distributed policy store. Useful GPU DB maps would include per-route
+active counts, per-partition queue delay, per-session credits, per-GPU slot
+budgets, response-ring saturation, and request-class token buckets. The lesson
+is to keep these maps cheap, bounded, and observable; a policy path that costs
+tens of microseconds is too expensive for every retained point lookup but may
+be acceptable for admission control or cold-route steering.
+
+The SCAN-avoid and SITA examples are directly relevant to mixed retained reads
+and over-resident scans. Short point lookups and scalar aggregates should not
+share a FIFO path with long cold scans, refresh builders, or large response
+encoders. When strict ordering requires a shared session stream, late binding
+should happen at safe internal boundaries: read-worker queues, GPU batches,
+and response fragments, not by reordering SQL-visible results within a
+transaction.
+
+The MICA result reinforces partition-home routing. If a query key or partition
+can identify the owner/GPU worker early, avoid a central owner hop and
+cross-core handoff. For GPU DB, this means prepared-route caches and key-range
+metadata should be available to network/read admission for eligible retained
+reads, while mutations and ambiguous plans still route through the mutation or
+planner owner.
+
+**Risks and mismatches:** Syrup is a scheduling framework, not a database
+engine. It does not solve WAL-before-visibility, MVCC snapshot compatibility,
+transaction ordering, pgwire stream semantics, SQL planning, CUDA stream
+ownership, or GPU memory residency. The strongest mechanisms use eBPF,
+AF_XDP, ghOSt, or programmable NICs, none of which should become a near-term
+dependency for correctness. The paper's workloads are UDP RocksDB and MICA,
+not PostgreSQL wire protocol or transactional SQL. Some benefits depend on
+peeking at packet contents, which is harder for authenticated, encrypted, or
+multi-packet pgwire messages.
+
+Early steering can also be wrong if the route metadata is stale. A request
+must not bypass the mutation/catalog/residency owner unless it can prove that
+its table OID, schema generation, snapshot boundary, invalidation generation,
+and resident layout are compatible. Cross-layer policy state must be treated
+as advisory for routing and admission, not as durable authority.
+
+**Benchmark candidates:**
+
+- Add a route-descriptor prototype for pgwire retained reads: query shape,
+  table/partition identity, key range, expected service class, response size
+  class, snapshot generation, and deadline budget. Gate: identical SQL results
+  and explicit fallback when any descriptor field is missing or stale.
+- Build a no-GPU mixed-service scheduling benchmark with short retained
+  lookups, long scans, COPY chunks, refresh work, and large response encoding.
+  Compare one FIFO queue, route-class queues, SITA-style separation, and
+  token-based admission. Failure condition: short-read p99 remains dominated
+  by long-route head-of-line blocking.
+- Add bounded policy-state tables for per-route active counts, per-session
+  credits, per-partition queue delay, and response-ring saturation. Minimum
+  proof: update/read overhead is small enough for admission paths and all
+  counters have clear ownership.
+- Prototype partition-home steering for one retained key lookup route. The
+  network/read admission path chooses a read snapshot worker or GPU worker
+  from stable partition metadata instead of central owner dispatch. Gate:
+  lower queue wait without allowing stale resident generations.
+- Test late binding inside the read/GPU execution layer: requests wait in a
+  route-class queue and bind to an idle compatible worker only when the worker
+  is ready. Compare against early assignment under mixed short and long reads.
+- Add overload policy experiments with token buckets for latency-sensitive
+  retained reads and best-effort analytical scans. Gate: bounded rejection or
+  delay reasons, lower p99 for short reads, and no indefinite starvation of
+  long work.
