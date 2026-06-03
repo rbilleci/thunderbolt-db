@@ -518,9 +518,9 @@ Append new candidates here as each paper is processed.
   URL: `https://www.vldb.org/cidrdb/papers/2025/p2-otaki.pdf`
   Why: paged-memory and resource-adaptive execution work cited by vmcache^n;
   relevant to query admission and execution under memory-tier pressure.
-- `queued` — **PowerTCP: Pushing the Performance Limits of Datacenter
-  Networks**, Huang et al., NSDI 2022.
-  URL: `https://www.usenix.org/conference/nsdi22/presentation/huang-yuchung`
+- `reviewed` — **PowerTCP: Pushing the Performance Limits of Datacenter
+  Networks**, Addanki, Michel, and Schmid, NSDI 2022.
+  URL: `https://www.usenix.org/conference/nsdi22/presentation/addanki`
   arXiv: `https://arxiv.org/abs/2112.14309`
   Why: modern congestion-control follow-up that combines queue length and
   queue-change signals; useful for comparing TIMELY-style delay gradients with
@@ -536,8 +536,8 @@ Append new candidates here as each paper is processed.
   URL: `https://www.usenix.org/conference/osdi24/presentation/xiang`
   Why: transactional page migration for tiered memory cited by vmcache^n;
   useful for comparing OS-assisted migration against explicit DBMS ownership.
-- `queued` — **Improving Optimistic Concurrency Control Through Transaction
-  Batching and Operation Reordering**, Ding, Kot, and Gehrke, PVLDB 2019.
+- `reviewed` — **Improving Optimistic Concurrency Control Through Transaction
+  Batching and Operation Reordering**, Ding, Kot, and Gehrke, PVLDB 2018.
   URL: `https://doi.org/10.14778/3282495.3282502`
   PDF: `https://dl.acm.org/doi/pdf/10.14778/3282495.3282502`
   Why: modern follow-up for QURO-style reordering at storage and validation
@@ -788,6 +788,18 @@ Append new candidates here as each paper is processed.
   full transaction stages rather than only WAL, index, or GPU refresh
   substeps, and when batch-level write-set ordering should be preferred over
   per-request optimistic validation in hot partitions.
+- `queued` — **Swift: Delay is Simple and Effective for Congestion Control in
+  the Datacenter**, Kumar et al., SIGCOMM 2020.
+  URL: `https://doi.org/10.1145/3387514.3406591`
+  Why: PowerTCP contrasts against delay-based congestion control; useful for
+  deciding when absolute delay, rather than only delay gradient or queue depth,
+  should drive GPU DB IO-worker, response-ring, and route-class pacing.
+- `queued` — **HPCC: High Precision Congestion Control**, Li et al.,
+  SIGCOMM 2019.
+  URL: `https://doi.org/10.1145/3341302.3342085`
+  Why: PowerTCP builds on HPCC-style in-band network telemetry; relevant to
+  whether GPU DB should export precise per-boundary service telemetry to
+  schedulers instead of relying on coarse queue depths.
 - `queued` — **ghOSt: Fast & Flexible User-Space Delegation of Linux
   Scheduling**, Narayanan et al., SOSP 2021.
   URL: `https://doi.org/10.1145/3477132.3483542`

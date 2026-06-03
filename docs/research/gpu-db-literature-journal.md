@@ -19858,3 +19858,155 @@ signals unless request and response pressure are tracked separately.
   through bounded IO workers with lazy pacing. Compare round-robin, priority
   by deadline, and gradient-limited scheduling. Measure p50/p99 latency,
   throughput, queue wait, and fairness across session classes.
+
+### 2026-06-03 - PowerTCP power-based congestion control
+
+**Citation:** Vamsi Addanki, Oliver Michel, and Stefan Schmid. "PowerTCP:
+Pushing the Performance Limits of Datacenter Networks." NSDI 2022,
+pp. 51-70. Retrieved 2026-06-03 from the USENIX open-access landing page,
+`https://www.usenix.org/conference/nsdi22/presentation/addanki`, and the
+arXiv author version, `https://arxiv.org/abs/2112.14309`.
+
+**Category:** runtime / HFT / session scale.
+
+**Relevance tags:** congestion control; queue depth; queue gradient; in-band
+telemetry; admission control; response pacing; burst handling; bounded rings;
+logical session scale; tail latency.
+
+**Core idea:** PowerTCP argues that congestion control should not react only to
+absolute queue state or only to change in delay. It combines both dimensions in
+one signal, called power: a product of network "voltage" (BDP plus queued
+bytes) and network "current" (transmission rate / queue growth). The key lesson
+for GPU DB is that an admission controller needs both level and slope. A ring
+that is deep but draining is different from a ring that is shallow but filling
+quickly.
+
+This is a useful follow-up to TIMELY. TIMELY made the case for delay gradients;
+PowerTCP adds that gradients alone do not pin the system to a unique low-queue
+equilibrium. For GPU DB, this suggests each runtime boundary should expose both
+absolute pressure and pressure change before the scheduler grows batches,
+redirects work, or rejects requests.
+
+**Concrete mechanisms:**
+
+- PowerTCP classifies congestion-control signals into voltage-based controls
+  that react to absolute queue length, RTT, ECN, or loss, and current-based
+  controls that react to variations such as RTT gradient.
+- The paper's control target is power, the product of BDP-plus-buffered bytes
+  and aggregate sending rate. The analysis relates this signal to the aggregate
+  congestion window and argues it preserves both low-queue equilibrium and fast
+  reaction to perturbations.
+- The algorithm obtains per-hop telemetry with in-band network telemetry. Each
+  switch contributes egress queue length, timestamp, transmitted-byte count,
+  and bandwidth. The receiver reflects the telemetry in ACKs.
+- At the sender, PowerTCP computes queue-length gradient from successive queue
+  and timestamp samples, computes egress transmission rate from transmitted
+  bytes and timestamps, derives current, combines it with BDP-plus-queue
+  voltage, normalizes against a base power, smooths the maximum path signal,
+  updates congestion window, and sets a pacing rate.
+- The implementation remembers prior congestion windows once per RTT because
+  the control law uses both old and current window state.
+- The authors discuss a delay-only approximation for non-programmable switches,
+  but report that it helps short flows while hurting medium/long flows because
+  delay does not reveal under-utilization as precisely as INT.
+- Evaluation is simulation-heavy, with a Linux kernel and Intel Tofino/P4 proof
+  of concept. Reported results include 99.9th-percentile short-flow completion
+  time reductions of 80% versus DCQCN/TIMELY and 33% versus HPCC at 60% load;
+  at 80% load PowerTCP keeps lower buffer occupancy than HPCC; in
+  reconfigurable datacenter scenarios it reports 80-85% circuit utilization and
+  at least 2x tail-latency reduction versus the compared approach.
+- The paper explicitly positions PowerTCP for bursty traffic and changing
+  bandwidth availability, not just steady bottlenecks.
+
+**GPU DB mapping:** Treat each hot runtime queue as a control boundary with a
+PowerTCP-like pressure tuple: absolute wait/depth, service-rate estimate,
+wait/depth gradient, and capacity. For network IO workers, mutation owners,
+read-snapshot workers, residency refresh queues, GPU execution workers,
+pinned-buffer pools, and response rings, the scheduler should distinguish
+"large but draining" from "small but accelerating." That distinction matters
+when deciding whether to admit more retained reads, grow a micro-batch, force a
+drain, use CPU fallback, or reject with a named overload reason.
+
+PowerTCP's telemetry shape maps well to explicit GPU DB runtime accounting. INT
+fields become boundary-local fields: queue depth, enqueue timestamp, dequeue
+or completion timestamp, bytes/rows served, configured capacity, and observed
+service rate. A route class can then compute a normalized pressure score per
+boundary and take the maximum, mirroring the bottleneck-hop choice in the
+paper. The result should be more auditable than one global concurrency cap.
+
+The delay-only approximation is also a warning. A p99 latency or queue-wait
+number is not enough to know whether a boundary is under-utilized, saturated,
+or recovering. GPU DB should pair latency guardrails with throughput/service
+rate telemetry so a route does not shrink batches forever after a transient
+burst or over-admit into a fast-rising queue.
+
+For the 1M logical-session target, the strongest transfer is burst admission.
+Many dormant sessions waking at once look like an incast. Admission credits and
+response pacing should react to both existing queued work and the derivative of
+arrivals/service so that the runtime damps bursts before they inflate response
+rings, pinned buffers, or GPU queues.
+
+**Risks and mismatches:** PowerTCP is a datacenter network paper, not a DBMS
+runtime design. Its strongest version assumes programmable-switch INT and
+ACK-reflected per-hop telemetry; ordinary pgwire/TCP deployments will not have
+that. Its measurements are mostly simulation plus a proof-of-concept control
+path, not a production database workload with WAL, MVCC, CUDA work, slow
+clients, SQL encoding, or transaction correctness.
+
+The power analogy should not be copied mechanically. GPU DB has multiple
+interacting bottlenecks, and their units differ: bytes, rows, pinned buffers,
+CUDA events, WAL flush groups, response messages, and transaction generations.
+A single scalar can hide which boundary is unsafe. Any controller must preserve
+WAL-before-visibility, snapshot validity, and deterministic rejection/fallback
+semantics before optimizing tail latency.
+
+**Benchmark candidates:**
+
+- Extend the queue-delay-gradient simulator from the TIMELY entry with a
+  PowerTCP-style controller that uses absolute queue wait/depth, service rate,
+  and gradient. Compare depth-only, gradient-only, and combined pressure under
+  bursty retained reads, mixed writes, and slow-client responses.
+- Add per-boundary normalized pressure telemetry to the benchmark endpoint
+  without changing behavior. Required fields: queue depth, queue wait,
+  wait/depth gradient, drain rate, capacity, admitted count, rejected count,
+  and chosen route/fallback reason.
+- Prototype route-class admission that chooses the maximum pressure boundary
+  across ingress, mutation owner, GPU worker, pinned-buffer pool, and response
+  ring. Gate: overload reports name the boundary that dominated the decision.
+- Test a synthetic session-incast: many logical sessions become active in a
+  short window and issue same-shape retained reads. Compare fixed concurrency,
+  gradient-only admission, and combined level-plus-gradient admission. Required
+  metrics: p50/p99, max queue wait, accepted/rejected counts, and throughput.
+- Run a micro-batch controller experiment where batch size grows only when the
+  GPU worker is below a low pressure threshold and shrinks immediately when
+  combined pressure rises. Failure condition: the controller keeps waiting for
+  a larger batch while a response or GPU queue is accelerating.
+- For future NIC/DPU experiments, evaluate whether gateway-level telemetry can
+  export DB-owned pressure fields to a transport scheduler without exposing SQL
+  state or weakening isolation.
+
+### 2026-06-03 - Cross-paper synthesis: schedulers need level and slope
+
+Recent optimizer/runtime papers converge on a useful control pattern. Free Join
+says route planning should avoid premature materialization by carrying compact
+state until a proof forces expansion. TIMELY says queue-delay gradients catch
+burst onset earlier than static depth thresholds. PowerTCP adds that gradients
+alone are incomplete: a controller also needs the absolute level and service
+rate to converge to a low-pressure operating point.
+
+For GPU DB, the next design track should be pressure-aware route admission. A
+retained route, mutation batch, refresh job, or response write should carry both
+its semantic compatibility fields and its runtime pressure fields. The
+scheduler can then choose between immediate execution, micro-batch growth,
+fallback, pacing, or rejection using declared boundaries instead of global
+concurrency guesses.
+
+Category gap: the journal has strong recent coverage of runtime scheduling,
+robust planning, and MVCC/HTAP, but still needs more modern write-path recovery
+and cold-tier placement papers that connect admission decisions to durable WAL,
+checkpoint rebuild, and NVMe/CXL placement.
+
+Benchmark priority: build a no-GPU admission harness first. Feed it synthetic
+retained reads, writes, refresh jobs, and slow responses; compare FIFO,
+depth-only, gradient-only, and level-plus-gradient policies; require exact
+accounting of which boundary caused each delay, fallback, or rejection.
