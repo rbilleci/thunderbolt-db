@@ -73,7 +73,7 @@ The refreshed bundle proves the current local release-candidate envelope across:
 - packaged replication service/systemd/Kubernetes/compose evidence plus local generated-CA mTLS AppendEntries channel security
 - retained CUDA allocation, zero-H2D resident routes, first accepted-route CUDA event timing samples, operator warmup, and scheduler-friendly maintenance
 - opt-in production security profile v1 with required TLS, SCRAM-SHA-256 valid/invalid password paths, verifier-file hygiene, and recovery after failed auth
-- P8 CH-benCHmark-derived residency harness self-check plus the checked baseline report at `docs/testing/reports/2026-05-30-p8-ch-benchmark-residency-baseline-v1.md`
+- P8 CH-benCHmark-derived residency harness self-check plus the checked baseline report at `docs/testing/reports/series/p8-ch-residency-setup/runs/2026-05-30-p8-ch-benchmark-residency-baseline-v1.md`
 
 ## Explicit Non-Claims
 

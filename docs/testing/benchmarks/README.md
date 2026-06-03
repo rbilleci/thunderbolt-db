@@ -49,7 +49,7 @@ unattended automation.
 The latest accepted identical-client milestone is:
 
 - report:
-  [docs/testing/reports/2026-06-02-p8-identical-10pct-execution-v4.md](../reports/2026-06-02-p8-identical-10pct-execution-v4.md)
+  [docs/testing/reports/series/p8-25pct-full-run/runs/2026-06-02-p8-identical-10pct-execution-v4.md](../reports/series/p8-25pct-full-run/runs/2026-06-02-p8-identical-10pct-execution-v4.md)
 - command: `scripts/run_p8_ch_benchmark_residency_probe.sh --identical-pgwire-target-smoke`
 - rows: `64,424,510`
 - concurrency: `1,2,4,8,16,32,64`
@@ -110,18 +110,18 @@ match-index output.
 
 ## Related Reports
 
-- [2026-05-31 P8 PostgreSQL fairness audit](../reports/2026-05-31-p8-pgsql-fairness-audit-v1.md):
+- [2026-05-31 P8 PostgreSQL fairness audit](../reports/series/p8-pgwire-endpoint/runs/2026-05-31-p8-pgsql-fairness-audit-v1.md):
   default/tuned PostgreSQL evidence, settings, EXPLAIN samples, and concurrency
   plan.
-- [2026-06-01 identical pgwire target curves](../reports/2026-06-01-p8-identical-pgwire-target-curves-v1.md):
+- [2026-06-01 identical pgwire target curves](../reports/series/p8-pgwire-endpoint/runs/2026-06-01-p8-identical-pgwire-target-curves-v1.md):
   shared PostgreSQL-compatible target/metric schema before composite/text
   lookup closure.
-- [2026-06-01 retained row-id gather route](../reports/2026-06-01-p8-retained-row-id-gather-route-v1.md):
+- [2026-06-01 retained row-id gather route](../reports/series/p8-retained-route-primitives/runs/2026-06-01-p8-retained-row-id-gather-route-v1.md):
   selected-row retained lookup D2H narrowing.
-- [2026-06-01 retained match-index compaction](../reports/2026-06-01-p8-retained-match-index-compaction-v1.md):
+- [2026-06-01 retained match-index compaction](../reports/series/p8-retained-route-primitives/runs/2026-06-01-p8-retained-match-index-compaction-v1.md):
   device-side retained equality match-index compaction for selected-row lookup
   projections.
-- [2026-06-01 identical full-run streaming guard](../reports/2026-06-01-p8-identical-full-run-streaming-guard-v1.md):
+- [2026-06-01 identical full-run streaming guard](../reports/series/p8-25pct-full-run/runs/2026-06-01-p8-identical-full-run-streaming-guard-v1.md):
   streamed identical pgwire load contract, full 25% guard, and readiness facts.
 - [2026-06-01 engine pgwire COPY/session readiness](../reports/series/p8-copy-admission/runs/2026-06-01-p8-engine-pgwire-full-copy-session-v1.md):
   bounded endpoint COPY admission, full-curve session sizing, and scaled
@@ -142,11 +142,11 @@ match-index output.
   phase-specific COPY admission evidence, the unconstrained-table preflight
   scan fix, and bounded 1M endpoint evidence projecting 10% COPY admission
   inside the 6h budget.
-- [2026-06-01 10% identical single-load curves](../reports/2026-06-01-p8-10pct-identical-single-load-curves-v1.md):
+- [2026-06-01 10% identical single-load curves](../reports/series/p8-25pct-full-run/runs/2026-06-01-p8-10pct-identical-single-load-curves-v1.md):
   first 10% default/tuned/GPU retained execution attempt, load metrics, partial
   graph-ready concurrency artifacts, and the narrowed GPU DB COPY/query
   throughput blocker.
-- [2026-06-01 10% retained query throughput profile](../reports/2026-06-01-p8-10pct-retained-query-throughput-profile-v1.md):
+- [2026-06-01 10% retained query throughput profile](../reports/series/p8-retained-route-primitives/runs/2026-06-01-p8-10pct-retained-query-throughput-profile-v1.md):
   retained-query setup phase evidence, the snapshot-clone and conjunctive
   access-path fixes, 1M-row after-fix proof, and the remaining COPY admission
   recheck blocker.
@@ -156,18 +156,18 @@ match-index output.
 - [2026-06-02 COPY admission WAL/value-index architecture](../reports/series/p8-copy-admission/runs/2026-06-02-p8-copy-admission-wal-value-index-architecture-v1.md):
   the bounded WAL/current-apply architecture slice that cleared the 30k
   rows/sec COPY gate and left the full 10% retry as the next benchmark decision.
-- [2026-06-02 10% identical pgwire execution v4](../reports/2026-06-02-p8-identical-10pct-execution-v4.md):
+- [2026-06-02 10% identical pgwire execution v4](../reports/series/p8-25pct-full-run/runs/2026-06-02-p8-identical-10pct-execution-v4.md):
   accepted 10% default PostgreSQL and GPU DB retained execution through
   concurrency 64 with GPU DB COPY above the required 30k rows/sec gate.
-- [2026-06-02 over-resident partitioned readiness](../reports/2026-06-02-p8-over-resident-partitioned-readiness-v1.md):
+- [2026-06-02 over-resident partitioned readiness](../reports/series/p8-25pct-full-run/runs/2026-06-02-p8-over-resident-partitioned-readiness-v1.md):
   narrowed 125% over-resident readiness from a broad missing execution path to
   the partitioned resident route/execution primitive required before full
   125pct scheduling.
-- [2026-06-01 retained composite/text lookup route](../reports/2026-06-01-p8-retained-composite-text-lookup-route-v1.md):
+- [2026-06-01 retained composite/text lookup route](../reports/series/p8-retained-route-primitives/runs/2026-06-01-p8-retained-composite-text-lookup-route-v1.md):
   retained composite lookup progression.
-- [2026-05-31 25% aggregate refresh after BETWEEN](../reports/2026-05-31-p8-25pct-aggregate-refresh-after-between-v1.md):
+- [2026-05-31 25% aggregate refresh after BETWEEN](../reports/series/p8-25pct-full-run/runs/2026-05-31-p8-25pct-aggregate-refresh-after-between-v1.md):
   provisional engine-internal retained aggregate evidence.
-- [2026-05-31 125% over-resident readiness](../reports/2026-05-31-p8-125pct-over-resident-readiness-v1.md):
+- [2026-05-31 125% over-resident readiness](../reports/series/p8-25pct-full-run/runs/2026-05-31-p8-125pct-over-resident-readiness-v1.md):
   checked over-resident readiness decision and blocker.
 
 ## Remaining Blockers
