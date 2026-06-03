@@ -537,7 +537,7 @@ Append new candidates here as each paper is processed.
   Why: re-execution-based concurrency control cited by R-SMF; relevant to
   retrying or repairing conflicted transactions without throwing away all
   scheduling and snapshot work.
-- `queued` — **Take Out the TraChe: Maximizing (Tra)nsactional Ca(che) Hit
+- `reviewed` — **Take Out the TraChe: Maximizing (Tra)nsactional Ca(che) Hit
   Rate**, Cheng et al., OSDI 2023.
   URL: `https://www.usenix.org/conference/osdi23/presentation/cheng`
   Why: transaction-cache hit-rate work from the R-SMF/TAO line; relevant to
@@ -642,3 +642,15 @@ Append new candidates here as each paper is processed.
   Why: Linux CXL transparent page placement baseline compared by NOMAD;
   useful for deciding where OS-managed promotion/demotion is enough and where
   GPU DB needs explicit DBMS placement handles.
+- `queued` — **TAOBench: An End-to-End Benchmark for Social Network
+  Workloads**, Cheng et al., PVLDB 2022.
+  URL: `https://www.vldb.org/pvldb/vol15/p1965-cheng.pdf`
+  Why: DeToX's most important real-world workload source; useful for a
+  session-heavy transactional cache/residency benchmark with correlated
+  point reads, read transactions, writes, skew, and contaminated hot keys.
+- `queued` — **ChronoCache: Predictive and Adaptive Mid-Tier Query Result
+  Caching**, Glasbergen et al., SIGMOD 2020.
+  URL: `https://doi.org/10.1145/3318464.3380593`
+  Why: DeToX's predictive caching baseline; useful for comparing dependency
+  prefetching and adaptive query-result caching against transaction-hit-rate
+  placement for retained GPU snapshots.

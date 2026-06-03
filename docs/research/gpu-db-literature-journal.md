@@ -5112,3 +5112,182 @@ only compare different promotion strategies.
   sampling, route-template reuse count, and mutation invalidation rate.
   Failure condition: the tracking overhead or policy churn exceeds the
   benefit of avoiding cold-route fallback.
+
+### 2026-06-03 - DeToX transactional cache hit rate
+
+**Citation:** Audrey Cheng, David Chu, Terrance Li, Jason Chan,
+Natacha Crooks, Joseph M. Hellerstein, Ion Stoica, and Xiangyao
+Yu. "Take Out the TraChe: Maximizing (Tra)nsactional Ca(che)
+Hit Rate." OSDI 2023, pp. 419-439. Retrieved 2026-06-03 from
+the USENIX page and PDF,
+`https://www.usenix.org/conference/osdi23/presentation/cheng`
+and `https://www.usenix.org/system/files/osdi23-cheng.pdf`.
+
+**Category:** runtime / HFT / session scale, with transaction-aware
+cache and data-placement policy.
+
+**Relevance tags:** transactional hit rate; correlated key groups;
+critical path latency; cache admission; eviction; prefetching; hot-key
+contamination; session-heavy reads; TAOBench; Redis/Postgres/TiKV;
+serializable cache coherence.
+
+**Core idea:** DeToX argues that object hit rate is the wrong
+metric for transactional workloads. A transaction often benefits from
+cache only when a whole dependency group is cached. If one object in a
+parallel group still goes to the slower backing store, end-to-end
+latency is dominated by that miss, so caching the other objects may
+consume capacity without improving latency.
+
+The paper introduces transactional hit rate: the reduction in a
+transaction's critical length after cached vertices are removed from
+its execution DAG. DeToX uses this metric to score groups of keys
+rather than independent objects. The strongest GPU DB transfer is to
+treat retained GPU residency and host/NVMe cache placement as
+transaction-template placement, not only per-segment popularity. A hot
+key, hot partition, or hot resident column group is not automatically
+valuable if it is normally requested with uncached companions that keep
+the request on the slow path.
+
+**Concrete mechanisms:**
+
+- The paper models a transaction as a DAG whose vertices are reads or
+  writes and whose edges are logical dependencies. A cache state
+  shortens latency by removing cached vertices from the longest
+  non-cached path, called the critical length.
+- A complete group is a minimal set of keys whose presence in cache
+  reduces critical length. DeToX identifies table-level complete groups
+  from transaction execution graphs at compile time, then maps runtime
+  key accesses into those groups.
+- Group score combines the minimum key frequency in the group, the
+  critical-length reduction from caching the group, and group size.
+  The minimum frequency matters because a cold companion key can
+  contaminate a hot key: the group only helps if all required keys fit.
+- Key scores are derived from group scores. DeToX greedily scores the
+  highest-value complete group first, then scores remaining keys using
+  the best larger complete group that includes already-scored keys.
+  Across transactions, it averages instance scores and adds a global
+  recency aging factor similar to Greedy-Dual-Size-Frequency.
+- Complete groups can be exponential in transaction size, so the paper
+  defines interchangeable groups: sets of keys that can be substituted
+  for each other in any complete group without changing critical-length
+  reduction. This compresses runtime scoring work.
+- When transaction code is unavailable, DeToX approximates groups with
+  levels: keys sent to the backing store in parallel once dependencies
+  are satisfied. This is cheaper and worked for the evaluated
+  symmetric workloads, but the paper shows it can miss opportunities
+  on unbalanced dependency graphs.
+- Prefetching tracks dependency sets after a request. For a key, DeToX
+  stores frequent subsequent key sets and prefetches the most popular
+  set, with caps and frequency thresholds to bound metadata.
+- The implementation is a Java shim over Redis plus Postgres or TiKV.
+  Reads check Redis first; misses go to the backing store and populate
+  cache. Writes go to the backing store and update cache before write
+  locks are released. The shim uses two-phase locking and timeout-based
+  deadlock detection to maintain serializability.
+- Redis integration is intentionally small: group-aware scoring is
+  attached to multi-get style operations and key scores update after a
+  transaction completes. Eviction samples ten candidates and evicts the
+  lowest-scored candidate.
+- Evaluation uses TAOBench, Epinions, SmallBank, and TPC-C. The paper
+  reports up to 1.3x higher transactional hit rate, up to 3.4x better
+  cache efficiency, 31% higher throughput and 30% lower latency on a
+  Redis/Postgres TAOBench setup, and less than 1-2% extra cache-space
+  metadata in the highlighted workloads.
+- The paper also shows limits. TPC-C mostly does not benefit because
+  transactions mix a small set of already-cached hot keys with many
+  cold keys, so the cold keys contaminate the larger transaction. A
+  TAOBench product group dominated by point reads and tiny read
+  transactions also sees little gain over single-object policies.
+
+**GPU DB mapping:** Transactional hit rate should become a candidate
+metric for GPU DB residency and route decisions. Current P8 thinking
+tracks resident validity, transfer bytes, predicate support, and memory
+pressure. DeToX adds a missing question: does this placement reduce the
+critical path of the whole logical request or only make one object
+inside the request faster?
+
+For retained lookup batches, group scoring can guide which key vectors,
+column groups, and partition generations deserve GPU memory together.
+For example, if a session template usually reads customer, latest order,
+and several order-line rows, caching only the customer key or only the
+order partition may leave the request serialized on CPU/NVMe misses.
+The residency owner should be able to score a template-level placement
+group and explain that a hot object was rejected because its companion
+group is too cold, too large, or invalidated too frequently.
+
+For 1M logical sessions, DeToX's levels approximation maps naturally to
+the planned IO-worker and read-snapshot rings. Even without static SQL
+dependency extraction, the runtime can observe which keys, predicates,
+or route families are issued in parallel under one session transaction
+or request envelope. That produces a cheap group signal for cache
+admission, prefetch, and micro-batch formation.
+
+The prefetching idea maps to warm resident generations. After a request
+hits a high-confidence root key or predicate, the residency owner can
+schedule bounded warmup for likely companion partitions or column
+families. This must remain behind snapshot and WAL validation: prefetch
+can prepare candidate generations, but publication still checks schema,
+visibility boundary, invalidation generation, and memory budget.
+
+The paper's hot-key contamination result is especially important for
+benchmark design. GPU DB should report object/partition hit rate and
+transactional route hit rate separately. A route that shows high GPU
+resident object hits but still falls back for one companion key should
+not be counted as a low-latency retained success.
+
+**Risks and mismatches:** DeToX targets a key-value cache in front of a
+backing store, not a SQL engine with MVCC tuple chains, WAL replay,
+catalog generations, GPU kernels, and multi-tier resident placement. Its
+shim uses two-phase locking and clears the cache after failures; GPU DB
+cannot replace MVCC/WAL correctness with external locks or whole-cache
+flushes.
+
+The transaction DAG may be hard to infer for arbitrary SQL, joins,
+stored procedures, ad hoc queries, or interleaved pgwire sessions. The
+levels approximation is promising, but the paper shows it can lose on
+unbalanced dependency graphs. GPU DB should therefore treat runtime
+level inference as a first slice, while leaving room for explicit route
+templates or planner-derived dependency metadata.
+
+The metric optimizes latency, not backing-store load. DeToX sometimes
+has lower object hit rate than object-oriented policies. GPU DB must be
+able to choose between lowering request latency and lowering CPU/NVMe
+load, especially under memory pressure, write-heavy periods, or
+checkpoint/recovery work.
+
+Finally, DeToX's evaluated wins depend on workload shape. The TPC-C
+result is a warning: write-heavy or very large cold-tail transactions
+may not benefit from transactional cache placement, and prefetching can
+waste residency bandwidth if invalidation or cold companion keys dominate.
+
+**Benchmark candidates:**
+
+- Add a `transactional_route_hit_rate` metric beside object/partition
+  resident hit rate. For each logical request template, compute whether
+  all required retained components were available and shortened the
+  slowest path. Failure condition: a benchmark claims retained success
+  while one required companion route still falls back to CPU/NVMe.
+- Build a TAOBench-inspired retained-read benchmark with correlated key
+  groups, contaminated hot keys, writes, and skew. Compare per-object
+  LRU/frequency admission against transaction-group admission for GPU
+  resident key vectors and column groups. Minimum gate: group admission
+  improves p95/p99 or transactional route hit rate without stale reads.
+- Prototype levels-based grouping in the runtime: group keys/predicates
+  issued in parallel within one request envelope, update placement scores
+  after completion, and expose group size, minimum companion frequency,
+  critical-path miss reason, and eviction reason.
+- Add a companion-prefetch experiment: when a root lookup is admitted,
+  schedule warmup for likely companion partitions behind a bounded
+  residency queue. Required measurements: prefetch hit rate, wasted
+  warmups, invalidated warmups, queue wait, bytes moved, and p99 impact.
+- Compare placement objectives under memory pressure: maximize resident
+  object hits, maximize transactional route hits, minimize movement
+  bytes, and hybrid weighted policy. Failure condition: a policy improves
+  hit count while increasing end-to-end p99 or write invalidation stalls.
+- Add a TPC-C-like negative-control benchmark where hot warehouse/district
+  keys are paired with cold order-line/item keys. Proof gate: the policy
+  detects contamination and avoids wasting GPU memory on partial groups
+  that cannot shorten the request path.
+- Test SQL/planner-derived group metadata against runtime level inference
+  for a small set of templates. Required output: scoring overhead,
+  grouping accuracy, route-hit improvement, and fallback explanations.
