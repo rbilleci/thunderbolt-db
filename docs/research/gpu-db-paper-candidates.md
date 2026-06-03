@@ -550,7 +550,7 @@ Append new candidates here as each paper is processed.
   Why: robust parametric query optimization using executed-query evidence;
   useful as a contrast to PARQO's cost-model-based route cache for repeated
   SQL templates.
-- `queued` — **RankPQO: Learning-to-Rank for Parametric Query Optimization**,
+- `reviewed` — **RankPQO: Learning-to-Rank for Parametric Query Optimization**,
   Mo et al., PVLDB 2025.
   URL: `https://www.vldb.org/pvldb/vol18/p863-mo.pdf`
   Why: modern parametric query optimization follow-up cited around Kepler-style
@@ -698,6 +698,18 @@ Append new candidates here as each paper is processed.
   Why: policy-focused evaluation of work stealing, static allocation, and
   core reallocation for microsecond tasks; useful before choosing GPU DB
   IO-worker, retained-read, and background-refresh scheduling policies.
+- `queued` — **Lemo: A Cache-Enhanced Learned Optimizer for Concurrent
+  Queries**, Mo et al., PACMMOD 2023.
+  URL: `https://doi.org/10.1145/3626713`
+  Why: RankPQO cites this concurrent-query learned optimizer work; useful for
+  testing whether GPU DB route choice should cache decisions under concurrent
+  queue pressure instead of treating each retained query in isolation.
+- `queued` — **Cost-based or Learning-based? A Hybrid Query Optimizer for
+  Query Plan Selection**, Yu et al., PVLDB 2022.
+  URL: `https://www.vldb.org/pvldb/vol15/p3924-yu.pdf`
+  Why: RankPQO cites hybrid plan selection work; relevant to keeping GPU DB
+  deterministic cost rules as guardrails while adding measured route-ranking
+  hints for CPU/GPU/tier choices.
 - `queued` — **Flexible Resource Allocation for Relational
   Database-as-a-Service**, Arora et al., PVLDB 2023.
   URL: `https://www.vldb.org/pvldb/vol16/p4202-narasayya.pdf`

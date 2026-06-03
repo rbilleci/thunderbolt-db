@@ -18122,3 +18122,151 @@ multi-owner visibility vectors should be exposed to read-only routes.
 - Train or simulate route choice only over already-valid route candidates, and
   count every confidence fallback, stale-generation prevention, and overload
   rejection as a first-class result.
+
+### 2026-06-03 - RankPQO: Learning-to-Rank for Parametric Query Optimization
+
+**Citation:** Songsong Mo, Yue Zhao, Zhifeng Bao, Quanqing Xu,
+Chuanhui Yang, and Gao Cong. "RankPQO: Learning-to-Rank for
+Parametric Query Optimization." PVLDB 18(3), 2024, pp. 863-875.
+doi:10.14778/3712221.3712248. Retrieved 2026-06-03 from
+`https://www.vldb.org/pvldb/vol18/p863-mo.pdf`.
+
+**Category:** query optimization / planning.
+
+**Relevance tags:** parametric query optimization; route caching;
+learning-to-rank; repeated SQL templates; plan cache; cardinality-sensitive
+plans; CPU/GPU route choice; admission-time planning.
+
+**Core idea:** RankPQO tackles the gap between optimizing every
+parameterized query instance and reusing the first cached plan forever. It
+keeps the classic parametric-query shape: enumerate a larger offline set of
+plans for a query template, choose a small cached subset, and at runtime pick
+one cached plan for each new parameter vector. Its two main claims are that
+candidate generation should perturb both table selectivities and join order,
+and that best-plan selection should rank candidate plans relative to each
+other rather than predict absolute latency.
+
+The paper's PostgreSQL prototype uses a hybrid enumeration stage, then trains
+a pairwise model called PRank. PRank takes one parameter vector and two plans
+as input and predicts which plan should be faster. The authors argue this is
+more stable than treating plan choice as pure classification over parameter
+vectors, because small parameter changes can cause discontinuous cardinality
+and latency changes.
+
+**Concrete mechanisms:**
+
+- The system has four stages: plan enumeration, model building, candidate plan
+  selection, and best plan selection.
+- Hybrid plan enumeration first samples parameter vectors and asks PostgreSQL
+  for ordinary plans, then builds a query join graph and samples alternate
+  join orders. PostgreSQL is invoked with the parameter binding and join-order
+  constraint to produce additional candidate plans.
+- Candidate join-order sampling avoids unconstrained Cartesian joins by using
+  the join graph; cardinality estimates from each base optimizer plan bias
+  which tables are sampled.
+- Training executes sampled plan/parameter pairs and records latency. To
+  control cost, the implementation samples only a subset of plan pairs,
+  parallelizes collection across CPU cores, and can terminate a candidate plan
+  when it exceeds three times PostgreSQL's default-plan runtime for that
+  parameter vector.
+- PRank encodes plans as trees. Each node contains operation type, touched
+  tables, and predicate information. Operation classes are hash join, merge
+  join, nested-loop join, index scan, sequential scan, and aggregate.
+- Predicate encodings include operators such as comparison, `BETWEEN`, and
+  `LIKE`, plus referenced columns. The paper deliberately avoids estimated
+  cost, estimated cardinality, row width, and sampling-based embeddings in the
+  feature vector because those depend on parameter-sensitive state.
+- A tree convolutional neural network embeds each plan into a 32-dimensional
+  vector; a lightweight feed-forward network embeds the parameter vector into
+  another 32-dimensional vector.
+- The comparison layer computes distances between the parameter embedding and
+  each plan embedding, then feeds their distance difference through a logistic
+  function to predict which plan is better.
+- Candidate plan selection greedily picks `k` cached plans by minimizing the
+  sum of each training parameter vector's closest distance to the selected
+  plan set.
+- Runtime plan selection embeds the incoming parameter vector and chooses the
+  cached plan whose embedding is closest.
+- The shared-model variant uses one model across templates with template-local
+  parameter input layers and alternates training data by template to avoid
+  overfitting late templates and forgetting early templates.
+- Evaluation uses JOB, TPC-H, Stack, and DSB workloads, with 80% of parameter
+  vectors used for training and 20% for test. The default cache size is 30
+  plans, training data size is 3000 pairwise examples, and PostgreSQL 12.5 is
+  the base engine.
+- Reported end-to-end results show RankPQO improving over PostgreSQL by up to
+  2.57x and over the best existing baseline by up to 1.36x. On JOB,
+  RankPQO-NS reduces plan execution time by 61.1% versus PostgreSQL and 26.4%
+  versus Kepler. The fastest enumerated plan remains better than RankPQO,
+  showing that cached subset and prediction quality still leave headroom.
+- In the candidate-generation analysis, RankPQO produces 2547 distinct plans
+  at 6.67 distinct plans/s, compared with 367 at 4.22/s for LogPQO and 421 at
+  3.31/s for Kepler. For `k=30`, total candidate-generation time is reported
+  around 749 seconds for RankPQO, versus 3458 seconds for LogPQO and 7571
+  seconds for Kepler in the adapted experiment.
+
+**GPU DB mapping:** RankPQO reinforces that GPU DB route choice should be
+template-based and evidence-backed. The engine already has repeated shapes:
+retained point lookup, filtered aggregate, partitioned aggregate, COPY chunk
+admission, refresh build, over-resident scan, and CPU fallback. Each shape can
+own a small candidate set of routes rather than invoking a broad planner or
+hard-coding one route for all parameter values.
+
+The hybrid enumeration idea maps to GPU-specific route exploration. Instead
+of only perturbing SQL cardinalities, a GPU DB route enumerator should vary
+the hardware-sensitive axes that decide route quality: snapshot generation,
+resident partition count, predicate selectivity, expected rows, result bytes,
+H2D/D2H bytes, GPU queue wait, pinned-buffer pressure, CPU fallback cost, and
+whether a route can batch with already queued work. Join order matters later,
+but the first GPU adaptation can treat CPU/GPU/tier placement and batchability
+as the analog of RankPQO's join-order diversity.
+
+The pairwise ranking target is a strong fit for admission-time decisions.
+Predicting absolute latency for a GPU route is fragile because queue depth,
+kernel launch amortization, memory pressure, and transfer path can shift
+quickly. But ranking two already-valid candidates for a specific parameter
+binding and runtime state may be easier: resident GPU lookup versus CPU index,
+resident scan versus CPU fallback, over-resident streaming versus reject, or
+immediate single request versus short micro-batch wait.
+
+The paper also suggests a route-cache hygiene rule. Cached candidate routes
+must be generated offline or in a controlled background path, then selected
+only when their correctness predicates hold: same schema generation, compatible
+snapshot, valid residency, available buffers, and non-saturated owner queues.
+The learned component should never invent a new route or bypass WAL,
+visibility, DDL, or residency invalidation checks.
+
+**Risks and mismatches:** RankPQO optimizes read-heavy SPJ-style
+parameterized queries in PostgreSQL. It does not handle WAL-before-visibility,
+MVCC validation, update conflicts, GPU memory safety, pinned-buffer ownership,
+or session admission. Its runtime input is primarily the parameter vector;
+GPU DB would need to add volatile system-state features such as queue depth,
+batch size, memory pressure, snapshot age, and transfer path. The offline data
+collection is still substantial, and using production latency traces without
+guardrails could train the model to prefer invalid or overloaded routes. The
+paper's reported speedups are CPU PostgreSQL speedups, not GPU execution
+speedups.
+
+**Benchmark candidates:**
+
+- Create a route-candidate catalog for one repeated retained query template:
+  CPU owner path, CPU snapshot/index path, GPU resident scan, GPU resident
+  lookup/vector route, and explicit overload rejection. Gate: every candidate
+  records correctness predicates before it can be ranked.
+- Build a pairwise route replay harness over collected P8 traces. For each
+  parameter vector and runtime-state sample, compare candidate routes by
+  full-path latency, not only CUDA event time. Failure condition: labels ignore
+  queue wait, response encoding, invalidation, or fallback cost.
+- Add a deterministic ranker baseline before any ML: pairwise rules over
+  resident bytes, expected rows, GPU queue wait, transfer bytes, and result
+  bytes. Gate: it beats a single static route for at least one retained lookup
+  or aggregate template without stale reads.
+- Test micro-batch-aware ranking: immediate single GPU execution versus wait
+  up to a small latency ceiling for compatible requests. Gate: p50 latency does
+  not regress while p95 or throughput improves under concurrency.
+- Measure candidate-route diversity generation. Perturb selectivity,
+  partition fan-out, resident validity, and queue pressure, then count distinct
+  valid routes found per second. Compare this with hand-written route rules.
+- Track ranker safety telemetry: invalid route filtered, saturated route
+  filtered, confidence fallback, stale generation prevented, and route slower
+  than deterministic baseline by more than 10%.
