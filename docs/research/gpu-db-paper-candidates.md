@@ -614,7 +614,7 @@ Append new candidates here as each paper is processed.
   Why: cited by Counting Is All You Need; relevant to comparing analytical
   system retrofits against a standalone transactional engine with retained
   transformation and snapshot-refresh metadata.
-- `queued` — **Two is Better Than One: The Case for 2-Tree for Skewed Data
+- `reviewed` — **Two is Better Than One: The Case for 2-Tree for Skewed Data
   Sets**, Zhou, Yu, Graefe, and Stonebraker, CIDR 2023.
   URL: `https://www.cidrdb.org/cidr2023/papers/p57-zhou.pdf`
   Code: `https://github.com/zxjcarrot/2-Tree`
@@ -2147,3 +2147,18 @@ Append new candidates here as each paper is processed.
   application-visible replicated/derived data structures for reducing
   coordination, relevant to write-hot derived views and contention-safe
   denormalized state.
+- `queued` — **The CacheLib Caching Engine: Design and Experiences at Scale**,
+  Berg et al., OSDI 2020.
+  URL: `https://www.usenix.org/conference/osdi20/presentation/berg`
+  Why: 2-Tree cites CacheLib as evidence that working sets shift over time;
+  its production cache admission, eviction, slab, and workload-class mechanics
+  are useful follow-up material for GPU DB host-memory and resident-cache
+  policy.
+- `queued` — **BzTree: A High-Performance Latch-Free Range Index for
+  Non-Volatile Memory**, Arulraj et al., PVLDB 2018.
+  URL: `https://www.vldb.org/pvldb/vol11/p553-arulraj.pdf`
+  DOI: `https://doi.org/10.14778/3173075.3173077`
+  Why: 2-Tree names concurrent tree coordination as future work and cites
+  latch-free range-index designs; BzTree is a relevant follow-up for
+  hot-tier range indexes, NVM/future-tier persistence, and migration-safe
+  updates.

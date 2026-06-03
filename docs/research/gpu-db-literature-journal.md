@@ -25224,3 +25224,155 @@ retained analytical throughput under visible freshness, with queue
 and tier attribution when one side bends the frontier. The next
 benchmark priority should be a host-only or small-retained frontier
 harness before deeper GPU scheduling claims.
+
+### 2026-06-03 - 2-Tree record-level hot/cold migration for skewed indexes
+
+**Citation:** Xinjing Zhou, Xiangyao Yu, Goetz Graefe, and Michael
+Stonebraker. "Two is Better Than One: The Case for 2-Tree for
+Skewed Data Sets." CIDR 2023. Retrieved 2026-06-03 from the CIDR
+PDF at `https://www.cidrdb.org/cidr2023/papers/p57-zhou.pdf`.
+
+**Category:** multi-tier cache / data placement, with range-index
+and larger-than-memory storage design.
+
+**Relevance tags:** hot/cold record migration; skewed access;
+buffer-pool utilization; range scans; tiered indexes; cache
+admission; DRAM/NVMe placement; future CXL tiers; resident snapshot
+refresh granularity.
+
+**Core idea:** 2-Tree argues that page- or block-granularity caching
+wastes memory under skew because a hot record may be trapped inside
+a page full of cold records. Instead of caching extracted rows in a
+separate point-lookup-only row cache, it keeps two ordered tree
+structures: a hot top tree and a cold bottom tree. Records migrate
+between the trees at record granularity, while both structures still
+preserve key order so range scans remain viable.
+
+The paper applies the idea to in-memory/disk anti-caching,
+buffer-managed B+trees, and LSM trees with upward migration. The
+most transferable point is not the exact tree implementation; it is
+the separation of migration unit from IO/cache unit. A system can
+use small hot records for memory residency decisions while still
+keeping cold data in an ordered structure that serves scans,
+compaction, and recovery.
+
+**Concrete mechanisms:**
+
+- Top-tree records add three bits: `ref` for a clock-style hotness
+  approximation, `dirty` for write-back, and `deleted` for deferred
+  deletion.
+- Downward migration uses a clock-hand range scan over the top tree.
+  Referenced records have their bit cleared; unreferenced records
+  become eviction victims. Dirty records are upserted to the bottom
+  tree, delete-marked records are deleted in the bottom tree, and
+  victims are removed from the top tree.
+- Upward migration is probabilistically deferred. A bottom-tree hit
+  is promoted only with sampling rate `D`, which trades cache warmup
+  speed against scan-thrashing resistance.
+- The paper mostly evaluates an inclusive policy, where promoted
+  records may remain in the bottom tree. The exclusive policy is
+  described but left largely as future evaluation.
+- Range scans merge both ordered trees and choose the top-tree copy
+  when a key exists in both places, preserving latest-copy semantics.
+- Migration is treated as a physical representation change rather
+  than a logical data change. The paper proposes lightweight system
+  transactions for migration atomicity and recovery; these do not
+  require forcing log records at migration commit.
+- Reported evaluation highlights include much better memory
+  utilization under skew, up to about `1.7x` throughput improvement
+  on Zipfian IO-bound B+tree/LSM workloads, and competitive range
+  scans compared with row-cache or anti-caching alternatives.
+
+**GPU DB mapping:** GPU DB should use 2-Tree as a template for
+hot-record and hot-segment placement across GPU HBM, CPU DRAM, and
+NVMe, not as a literal instruction to maintain two B+trees for every
+relation. The current P8 resident design already separates CPU truth
+from GPU snapshots; 2-Tree adds a sharper idea: the cache manager
+should be able to promote the hot records or key ranges that cause
+most reads, without dragging an entire cold page, table, or partition
+into the expensive tier.
+
+For retained GPU reads, this suggests a "hot overlay plus cold
+ordered base" design. A hot overlay could contain the keys, row ids,
+visibility bounds, and admitted columns for skewed point lookups or
+short range windows, while the cold ordered base remains in CPU DRAM
+or NVMe-friendly segments. A retained lookup route checks the hot
+overlay first, then falls back to the cold base or CPU path; a range
+scan must merge overlay and base and prefer the newest visible copy.
+That merge requirement is the correctness boundary that prevents a
+row-cache shortcut from becoming stale or point-only.
+
+The `ref`/clock and probabilistic-promotion mechanisms map cleanly
+to low-overhead cache admission telemetry. GPU DB can keep compact
+per-record or per-key-group hotness in CPU metadata and use sampling
+to avoid promoting one-off scan records into HBM. The sampling rate
+should be a measured policy knob tied to read reuse, HBM pressure,
+and refresh cost, not a hidden heuristic.
+
+The durability discussion is also a useful warning. Moving a record
+between hot and cold structures must remain a physical system
+transaction below the logical WAL-before-visibility boundary. For
+GPU DB, promotion into HBM or demotion to host/NVMe should never
+publish a new logical version by itself. It should publish only a
+new route generation or resident placement generation, with replay
+able to rebuild or discard the accelerated layout.
+
+For the high-throughput runtime, 2-Tree points to a benchmark shape
+where route selection depends on skew and migration state. Admission
+should expose overlay hits, base hits, promotions sampled, demotions,
+dirty write-backs, range-merge rows, and cold-tier waits. Without
+those counters, a hot overlay may look fast in isolation while
+quietly damaging range scans, refresh work, or write-back latency.
+
+**Risks and mismatches:** The paper assumes tree-structured ordered
+indexes and explicitly leaves physical concurrency control for
+future work. GPU DB cannot adopt record migration into a shared hot
+tree without a separate owner, latch-free, or generation-published
+coordination design.
+
+The evaluated workloads are skewed point reads, updates, and short
+range scans over B+tree/LSM-style indexes. They do not cover SQL
+joins, MVCC visibility chains, GPU kernel launch overhead,
+device-memory fragmentation, PCIe/NVMe transfer scheduling, or
+multi-session pgwire response costs. The absolute speedups therefore
+are not transferable to GPU DB.
+
+An inclusive overlay duplicates data and can inflate refresh or
+memory pressure; an exclusive overlay complicates bottom-tier
+updates and recovery. GPU DB should start with a read-mostly
+inclusive overlay for narrow key/column families and measure
+duplication explicitly before attempting exclusive movement.
+
+**Benchmark candidates:**
+
+- Build a host-only skewed key benchmark with one ordered cold base
+  and one bounded hot overlay. Compare whole-partition residency,
+  page/block caching, and record-level overlay admission at Zipf
+  factors `0.7`, `0.8`, and `0.9`. Gate: lower p95 lookup latency
+  and better hot-tier byte utilization without losing range-scan
+  correctness.
+- Add probabilistic promotion to a retained lookup prototype with
+  `D={0.01,0.05,0.1,1.0}`. Required metrics: overlay hit rate,
+  promotion count, demotion count, HBM/DRAM bytes, range-merge cost,
+  and scan-thrashing events. Failure condition: one-off scans evict
+  useful hot keys.
+- Test a GPU-resident hot overlay for `WHERE key = ?` plus CPU/NVMe
+  ordered base fallback. Gate: exact SQL-visible result under MVCC
+  visibility and explicit fallback reason when the overlay misses or
+  is stale.
+- Add a range-scan merge proof where the same key can exist in hot
+  overlay and cold base. Gate: newest visible version wins, deletes
+  suppress cold copies, and the route reports rows read from each
+  tier.
+- Treat overlay promotion/demotion as physical system transactions:
+  no user WAL force for placement changes, but route-generation
+  publication must be replay-safe. Gate: crash/restart discards or
+  rebuilds overlay state without changing logical table contents.
+- Compare inclusive versus exclusive hot overlays in a write-light
+  workload. Failure condition: exclusive migration reduces memory
+  but adds enough write-back or recovery complexity to violate
+  WAL-before-visibility or p95 latency targets.
+- Extend HATtrick-style mixed frontier runs with skewed lookup
+  overlays: one axis runs writes or refresh invalidations, the other
+  runs retained skewed lookups and short ranges. Gate: the overlay
+  improves the mixed frontier rather than only the read-only point.
