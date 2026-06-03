@@ -1,6 +1,21 @@
 # Test Report Artifacts
 
-This directory stores reproducible artifacts for parity, durability, replication, benchmark, and fault-injection runs.
+This directory stores reproducible artifacts for parity, durability,
+replication, benchmark, and fault-injection runs.
+
+## Layout
+
+- `runs/` stores individual immutable run reports when a stream has enough
+  volume to leave the top-level directory.
+- `series/` stores curated indexes and long-lived visual histories that span
+  multiple runs.
+- Top-level dated reports are legacy-compatible and may remain here until their
+  stream is migrated in a bounded slice.
+- Top-level compatibility pointers or symlinks may be kept when older report,
+  PR, or Discord links are likely to exist.
+
+The first migrated series is `series/p8-retained-concurrency/`, which owns the
+retained-route concurrency graph history and its generated CSV/SVG assets.
 
 ## Naming
 
@@ -12,6 +27,10 @@ Use UTC timestamps and stream identifiers:
 - `YYYY-MM-DD-<milestone>-benchmark-<scenario>.md`
 - `YYYY-MM-DD-<milestone>-<scenario>.md`
 - `YYYYMMDDTHHMMSSZ-jepsen-<scenario>.md`
+
+When a report belongs to a migrated stream, keep the same filename under the
+stream's `runs/` or `series/` location and leave a compatibility pointer from
+the previous path if external references are expected.
 
 ## Minimum report fields
 

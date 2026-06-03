@@ -7,7 +7,7 @@
 - smoke_artifact: target/p8-persistent-client-concurrency-measurement-graphs-v1/engine-backed-pgwire-concurrency-smoke/engine-backed-pgwire-concurrency-smoke.md
 - metrics_artifact: target/p8-persistent-client-concurrency-measurement-graphs-v1/engine-backed-pgwire-concurrency-smoke/metrics.jsonl
 - curve_artifact: target/p8-persistent-client-concurrency-measurement-graphs-v1/engine-backed-pgwire-concurrency-smoke/concurrency-curve.csv
-- graph_assets: docs/testing/reports/2026-06-02-p8-persistent-client-concurrency-measurement-graphs-v1-assets/
+- graph_assets: docs/testing/reports/series/p8-retained-concurrency/assets/2026-06-02-p8-persistent-client-concurrency-measurement-graphs-v1-assets/
 
 ## Result
 
@@ -27,15 +27,15 @@ pgwire response write timing.
 ## Visual Evidence
 
 The graph-ready CSV is checked in at
-`docs/testing/reports/2026-06-02-p8-persistent-client-concurrency-measurement-graphs-v1-assets/persistent-client-concurrency-metrics.csv`.
+`docs/testing/reports/series/p8-retained-concurrency/assets/2026-06-02-p8-persistent-client-concurrency-measurement-graphs-v1-assets/persistent-client-concurrency-metrics.csv`.
 
-![Persistent client throughput vs prior psql/request](2026-06-02-p8-persistent-client-concurrency-measurement-graphs-v1-assets/throughput-before-after.svg)
+![Persistent client throughput vs prior psql/request](series/p8-retained-concurrency/assets/2026-06-02-p8-persistent-client-concurrency-measurement-graphs-v1-assets/throughput-before-after.svg)
 
-![Persistent client p50 latency vs prior psql/request](2026-06-02-p8-persistent-client-concurrency-measurement-graphs-v1-assets/p50-latency-before-after.svg)
+![Persistent client p50 latency vs prior psql/request](series/p8-retained-concurrency/assets/2026-06-02-p8-persistent-client-concurrency-measurement-graphs-v1-assets/p50-latency-before-after.svg)
 
-![COUNT phase breakdown](2026-06-02-p8-persistent-client-concurrency-measurement-graphs-v1-assets/order_line_count_all-phase-breakdown.svg)
+![COUNT phase breakdown](series/p8-retained-concurrency/assets/2026-06-02-p8-persistent-client-concurrency-measurement-graphs-v1-assets/order_line_count_all-phase-breakdown.svg)
 
-![Lookup phase breakdown](2026-06-02-p8-persistent-client-concurrency-measurement-graphs-v1-assets/order_line_lookup_ol_o_id_multi_column-phase-breakdown.svg)
+![Lookup phase breakdown](series/p8-retained-concurrency/assets/2026-06-02-p8-persistent-client-concurrency-measurement-graphs-v1-assets/order_line_lookup_ol_o_id_multi_column-phase-breakdown.svg)
 
 ## Evidence
 

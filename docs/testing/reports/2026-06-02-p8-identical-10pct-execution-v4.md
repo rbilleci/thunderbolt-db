@@ -9,7 +9,7 @@
 - Endpoint facts: `target/p8-identical-10pct-execution-v4/identical-pgwire-target-smoke/endpoint-facts.txt`
 - Curve artifact: `target/p8-identical-10pct-execution-v4/identical-pgwire-target-smoke/concurrency-curve.csv`
 - Command log: `target/p8-identical-10pct-execution-v4-command.log`
-- Visual comparison assets: `docs/testing/reports/2026-06-02-p8-identical-10pct-execution-v4-assets/`
+- Visual comparison assets: `docs/testing/reports/series/p8-retained-concurrency/assets/2026-06-02-p8-identical-10pct-execution-v4-assets/`
 - Cleanup status: `clean`
 - Next blocker: `none`
 
@@ -26,27 +26,27 @@ The 10pct identical pgwire target smoke closed through the real `psql`/libpq pat
 
 GPU DB retained endpoint met Richard's `>=30,000 rows/sec` COPY gate at `30,992 rows/sec`. Endpoint facts recorded `copy_rows_decoded_by_protocol=64424510`, `resident_admission_from_sql_visible_rows=true`, `sql_visible_resident_row_count=64424510`, `sql_visible_resident_device_memory_retained=true`, `copy_streaming_bounded_chunks=true`, `copy_committed_chunks=7865`, and `copy_max_buffered_decoded_rows=8192`.
 
-![Load throughput side by side](2026-06-02-p8-identical-10pct-execution-v4-assets/load-throughput.svg)
+![Load throughput side by side](series/p8-retained-concurrency/assets/2026-06-02-p8-identical-10pct-execution-v4-assets/load-throughput.svg)
 
 ## Query Evidence
 
 Default PostgreSQL, tuned PostgreSQL, and GPU DB retained endpoint query rows all used the same `psql`/libpq client boundary, the same query schedule, the same concurrency schedule, and the same metric schema. All query rows returned `error_count=0`, `correctness_status=pass`.
 
-The graph-ready side-by-side CSV is checked in at `docs/testing/reports/2026-06-02-p8-identical-10pct-execution-v4-assets/query-side-by-side.csv`.
+The graph-ready side-by-side CSV is checked in at `docs/testing/reports/series/p8-retained-concurrency/assets/2026-06-02-p8-identical-10pct-execution-v4-assets/query-side-by-side.csv`.
 
 ### Visual Query Comparison
 
-![COUNT all rows p50 latency](2026-06-02-p8-identical-10pct-execution-v4-assets/order_line_count_all-p50-latency.svg)
+![COUNT all rows p50 latency](series/p8-retained-concurrency/assets/2026-06-02-p8-identical-10pct-execution-v4-assets/order_line_count_all-p50-latency.svg)
 
-![COUNT all rows throughput](2026-06-02-p8-identical-10pct-execution-v4-assets/order_line_count_all-throughput.svg)
+![COUNT all rows throughput](series/p8-retained-concurrency/assets/2026-06-02-p8-identical-10pct-execution-v4-assets/order_line_count_all-throughput.svg)
 
-![Multi-column integer lookup p50 latency](2026-06-02-p8-identical-10pct-execution-v4-assets/order_line_lookup_ol_o_id_multi_column-p50-latency.svg)
+![Multi-column integer lookup p50 latency](series/p8-retained-concurrency/assets/2026-06-02-p8-identical-10pct-execution-v4-assets/order_line_lookup_ol_o_id_multi_column-p50-latency.svg)
 
-![Multi-column integer lookup throughput](2026-06-02-p8-identical-10pct-execution-v4-assets/order_line_lookup_ol_o_id_multi_column-throughput.svg)
+![Multi-column integer lookup throughput](series/p8-retained-concurrency/assets/2026-06-02-p8-identical-10pct-execution-v4-assets/order_line_lookup_ol_o_id_multi_column-throughput.svg)
 
-![Composite text lookup p50 latency](2026-06-02-p8-identical-10pct-execution-v4-assets/order_line_lookup_composite_text-p50-latency.svg)
+![Composite text lookup p50 latency](series/p8-retained-concurrency/assets/2026-06-02-p8-identical-10pct-execution-v4-assets/order_line_lookup_composite_text-p50-latency.svg)
 
-![Composite text lookup throughput](2026-06-02-p8-identical-10pct-execution-v4-assets/order_line_lookup_composite_text-throughput.svg)
+![Composite text lookup throughput](series/p8-retained-concurrency/assets/2026-06-02-p8-identical-10pct-execution-v4-assets/order_line_lookup_composite_text-throughput.svg)
 
 ### GPU Retained Endpoint Detail
 

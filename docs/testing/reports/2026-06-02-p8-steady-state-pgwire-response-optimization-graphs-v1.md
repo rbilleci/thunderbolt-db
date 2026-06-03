@@ -7,7 +7,7 @@
 - smoke_artifact: target/p8-steady-state-pgwire-response-optimization-graphs-v1/engine-backed-pgwire-concurrency-smoke/engine-backed-pgwire-concurrency-smoke.md
 - metrics_artifact: target/p8-steady-state-pgwire-response-optimization-graphs-v1/engine-backed-pgwire-concurrency-smoke/metrics.jsonl
 - curve_artifact: target/p8-steady-state-pgwire-response-optimization-graphs-v1/engine-backed-pgwire-concurrency-smoke/concurrency-curve.csv
-- graph_assets: docs/testing/reports/2026-06-02-p8-steady-state-pgwire-response-optimization-graphs-v1-assets/
+- graph_assets: docs/testing/reports/series/p8-retained-concurrency/assets/2026-06-02-p8-steady-state-pgwire-response-optimization-graphs-v1-assets/
 
 ## Result
 
@@ -26,15 +26,15 @@ truthfulness, and the shared metric schema were preserved.
 ## Visual Evidence
 
 The graph-ready CSV is checked in at
-`2026-06-02-p8-steady-state-pgwire-response-optimization-graphs-v1-assets/steady-state-response-optimization-metrics.csv`.
+`series/p8-retained-concurrency/assets/2026-06-02-p8-steady-state-pgwire-response-optimization-graphs-v1-assets/steady-state-response-optimization-metrics.csv`.
 
-![Throughput history](2026-06-02-p8-steady-state-pgwire-response-optimization-graphs-v1-assets/throughput-history.svg)
+![Throughput history](series/p8-retained-concurrency/assets/2026-06-02-p8-steady-state-pgwire-response-optimization-graphs-v1-assets/throughput-history.svg)
 
-![P50 latency history](2026-06-02-p8-steady-state-pgwire-response-optimization-graphs-v1-assets/p50-latency-history.svg)
+![P50 latency history](series/p8-retained-concurrency/assets/2026-06-02-p8-steady-state-pgwire-response-optimization-graphs-v1-assets/p50-latency-history.svg)
 
-![COUNT phase breakdown](2026-06-02-p8-steady-state-pgwire-response-optimization-graphs-v1-assets/count-phase-breakdown.svg)
+![COUNT phase breakdown](series/p8-retained-concurrency/assets/2026-06-02-p8-steady-state-pgwire-response-optimization-graphs-v1-assets/count-phase-breakdown.svg)
 
-![Lookup phase breakdown](2026-06-02-p8-steady-state-pgwire-response-optimization-graphs-v1-assets/lookup-phase-breakdown.svg)
+![Lookup phase breakdown](series/p8-retained-concurrency/assets/2026-06-02-p8-steady-state-pgwire-response-optimization-graphs-v1-assets/lookup-phase-breakdown.svg)
 
 ## Evidence
 
