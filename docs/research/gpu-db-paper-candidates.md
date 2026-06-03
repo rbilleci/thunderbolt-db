@@ -96,7 +96,7 @@ mechanical sympathy, multi-tier cache/data placement, or query optimization.
 
 ### Multi-tier cache, buffer management, and data placement
 
-- `queued` — **LeanStore: In-Memory Data Management beyond Main Memory**,
+- `reviewed` — **LeanStore: In-Memory Data Management beyond Main Memory**,
   Leis et al., ICDE 2018.
   URL: `https://doi.org/10.1109/ICDE.2018.00026`
   Metadata:
@@ -778,6 +778,25 @@ Append new candidates here as each paper is processed.
   Why: hardware-counter-guided page classification and dynamic page-size
   decisions compared against NOMAD; relevant to tier-placement telemetry,
   access-frequency sampling, and huge-page/subpage placement tradeoffs.
+- `queued` — **Larger-than-Memory Data Management on Modern Storage Hardware
+  for In-Memory OLTP Database Systems**, Ma et al., DaMoN 2016.
+  URL: `https://doi.org/10.1145/2933349.2933358`
+  PDF: `https://db.cs.cmu.edu/papers/2016/ma-damon2016.pdf`
+  Why: LeanStore contrasts with anti-caching-style cold tuple movement; this
+  2016 evaluation gives OLTP-specific eviction/retrieval policy evidence
+  across modern storage devices.
+- `queued` — **"Anti-Caching"-based Elastic Memory Management for Big Data**,
+  Zhang et al., ICDE 2015.
+  URL: `https://doi.org/10.1109/ICDE.2015.7113330`
+  Why: modern enough follow-up in the anti-caching line; useful contrast for
+  tuple-granular cold movement versus LeanStore-style page/index-transparent
+  placement.
+- `queued` — **Page As You Go: Piecewise Columnar Access In SAP HANA**,
+  Sherkat et al., SIGMOD 2016.
+  URL: `https://doi.org/10.1145/2882903.2903734`
+  Why: production columnar cold-block access design cited by LeanStore; useful
+  for deciding whether GPU DB should page full resident segments, column
+  groups, or smaller compressed blocks.
 - `reviewed` — **TPP: Transparent Page Placement for CXL-Enabled Tiered-Memory**,
   Al Maruf et al., ASPLOS 2023.
   URL: `https://doi.org/10.1145/3582016.3582063`

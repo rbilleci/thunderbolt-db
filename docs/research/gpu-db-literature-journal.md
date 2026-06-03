@@ -9987,3 +9987,202 @@ conflict-triggered dependency metadata overhead, staged versus direct
 NVMe-to-GPU transfer under concurrent COPY/WAL admission, and a negative
 control that proves unknown write sets or unmanaged raw blocks fall back
 cleanly rather than guessing.
+
+### 2026-06-03 - LeanStore low-overhead transactional buffer management
+
+**Citation:** Viktor Leis, Michael Haubenschild, Alfons Kemper, and
+Thomas Neumann. "LeanStore: In-Memory Data Management Beyond Main
+Memory." ICDE 2018, pp. 185-196, doi:10.1109/ICDE.2018.00026.
+Retrieved 2026-06-03 from the author PDF,
+`https://db.in.tum.de/~leis/papers/leanstore.pdf`, with metadata
+cross-checks from DBLP, TUM, and the IEEE DOI page.
+
+**Category:** multi-tier cache / data placement.
+
+**Relevance tags:** transactional storage; larger-than-memory OLTP;
+explicit buffer management; pointer swizzling; SSD/NVMe tiering;
+cooling-stage eviction; optimistic page synchronization; epoch
+reclamation; NUMA-aware allocation; scan prefetch; hot-index placement.
+
+**Core idea:** LeanStore reopens the buffer-manager question for
+main-memory-style transactional systems. Traditional buffer managers are
+transparent and can manage tables and indexes uniformly, but their hot
+path pays page-id translation, pin/unpin, latch, and replacement-tracking
+costs even when almost everything is resident. Pure in-memory engines
+avoid that overhead by using virtual-memory pointers, but then handling
+data sets beyond DRAM becomes an afterthought or a separate cold-storage
+subsystem.
+
+LeanStore's answer is a storage manager that keeps buffer-manager
+transparency while making hot-page access close to an in-memory pointer
+chase. Resident page references are "swizzled" direct pointers; cold or
+cooling references are logical page identifiers. A single tagged word
+distinguishes the two states. The normal hot access therefore pays only a
+well-predicted tag check instead of a global hash-table translation and
+pinning protocol.
+
+The replacement policy is also inverted. Instead of tracking every
+access to identify hot pages, LeanStore speculatively unswizzles random
+pages and gives them a FIFO "cooling" grace period. If a cooling page is
+touched again, it is quickly reswizzled from memory without disk IO; if
+it reaches the end of the cooling queue and the epoch rules allow reuse,
+it can be flushed and evicted. The paper's evaluation uses TPC-C and
+microbenchmarks and reports near in-memory B-tree performance when the
+working set fits in DRAM, smoother degradation beyond DRAM on fast SSDs,
+and much better scalability than traditional buffer-manager baselines.
+
+**Concrete mechanisms:**
+
+- Page references are stored as swips: either direct virtual-memory
+  pointers for resident pages or logical page identifiers for
+  non-resident/cooling pages, distinguished by pointer tagging.
+- Every page has one owning swip. That avoids multiple decentralized
+  references racing to update the same page state during swizzling or
+  unswizzling, at the cost of making buffer-managed structures tree-like
+  or forest-like.
+- Inner pages are not unswizzled while they still contain swizzled
+  children. Buffer-managed data structures provide callbacks that iterate
+  child swips, letting the buffer manager choose a swizzled child instead
+  of writing a parent page containing process-local pointers.
+- The cooling stage keeps a bounded percentage of pages, commonly around
+  10% in the paper, as unswizzled-but-still-resident pages in a FIFO
+  queue plus a page-id hash table. Touching a cooling page removes it
+  from the queue and reswizzles it; needing a free frame evicts from the
+  queue tail after dirty flushing and epoch checks.
+- Cooling-stage and in-flight-IO metadata use a global latch, but only
+  on the cold path. The latch is released before blocking IO, so multiple
+  SSD reads can run concurrently.
+- Concurrent loads of the same cold page are serialized through an
+  in-flight IO table. The first thread installs an IO frame and reads;
+  later threads wait for the same frame instead of loading duplicate
+  copies.
+- Page lifetime safety uses epochs rather than per-access pin counters.
+  Threads enter a local epoch while traversing data structures and exit
+  frequently. A cooling page can be reused only when all active local
+  epochs are newer than the page's unswizzle epoch.
+- Long operations such as scans are broken into smaller epoch scopes.
+  If a page fault occurs, the operation releases locks, exits its epoch,
+  performs IO, and restarts traversal. This avoids letting one long scan
+  block eviction and reclamation.
+- Reads use optimistic version validation rather than latching on every
+  lookup. Writes usually latch only the leaf page, restarting with inner
+  latches only for structure-modifying operations.
+- Buffer frames are physically interleaved with page contents to improve
+  locality and avoid cache-associativity pathologies for page headers.
+- The buffer pool is one large allocation and can be pre-faulted.
+  NUMA-aware mode partitions free lists and tries to allocate pages on
+  the requesting thread's NUMA node while retaining a global replacement
+  policy.
+- A background writer flushes dirty cooling pages to hide write latency.
+  Scan prefetch can issue multiple page requests through the in-flight IO
+  component; scan-loaded pages may be hinted as cooling so large scans do
+  not evict the hot working set.
+- The evaluation disables transactions/logging in baselines to isolate
+  storage-manager overhead. Reported LeanStore TPC-C throughput is close
+  to its in-memory B-tree and far above BerkeleyDB/WiredTiger in the
+  tested configurations; with a 20GB buffer pool and growing TPC-C data,
+  LeanStore stays close to in-memory behavior while Linux swapping is
+  unstable and traditional engines are slower. Absolute numbers are
+  platform-specific and should not be treated as GPU DB targets.
+
+**GPU DB mapping:** LeanStore is a strong argument that GPU DB's
+CPU/NVMe tiers should remain explicitly managed, not delegated to mmap or
+OS swap, but the hot path must avoid classic buffer-pool tax. For P8, the
+analog is not literally swizzling row-store B-tree pages into GPU memory.
+It is publishing direct resident handles for hot CPU and GPU segments so
+the common read route checks a small generation/state tag, then executes
+from an immutable pointer-rich snapshot without a catalog hash lookup,
+global pin, or per-request replacement update.
+
+The cooling-stage idea maps cleanly to resident GPU partitions. A
+partition can move from `Valid` to "cooling resident" by withdrawing it
+from new fast-route selection while keeping HBM buffers intact for a
+short grace window. If the planner or workload touches it again, the
+residency owner can cheaply republish it without a full rebuild. If it
+ages out, eviction can release HBM after reader epochs/snapshot
+references prove safety. This gives the cache manager a low-overhead
+probation state between hot and evicted, which the current P8 state
+machine does not yet distinguish.
+
+LeanStore's epoch guidance reinforces the runtime snapshot design. Long
+retained scans, refreshes, or over-resident reads must not hold one
+global epoch or hazard forever. They should chunk work by partition,
+column group, or response batch and release snapshot/epoch state between
+chunks when correctness allows. Otherwise one large scan could prevent
+resident HBM reclamation, MVCC version cleanup, or cold-tier demotion.
+
+The single-owning-swip rule is also useful as a mental model for GPU DB
+resident handles: each mutable residency object should have one owner
+that is allowed to change its state, while published readers see stable
+immutable handles. Multiple indexes, route caches, and prepared plans
+should not independently mutate resident-state flags. They should point
+through owner-published generation records.
+
+The scan hinting and prefetch mechanisms are direct benchmark material.
+GPU DB can mark large sequential cold scans as "cooling on admission" so
+they do not displace hot retained lookup partitions. Conversely,
+point-lookup and short aggregate partitions that are reswizzled within
+the grace window should remain resident. Over-resident NVMe paths can
+combine CAM-style CPU-managed IO with LeanStore-style in-flight request
+coalescing so concurrent requests for the same cold partition share one
+load or refresh.
+
+**Risks and mismatches:** LeanStore is a CPU storage manager, not a GPU
+execution system. Its pointers are process-local CPU addresses; GPU DB
+needs CUDA device pointers, host pinned buffers, catalog generations,
+visibility boundaries, stream ownership, and invalidation metadata. A
+simple pointer-tag check is not enough to prove SQL visibility or resident
+route validity.
+
+The paper isolates storage-manager overhead by disabling transactions,
+logging, compaction, and compression in comparison systems. GPU DB cannot
+drop WAL-before-visibility, MVCC replay, checksums, or DDL invalidation
+to get comparable numbers. The useful lesson is control-path shape and
+hot-path overhead, not a promise that a buffer manager alone solves write
+admission or GPU route correctness.
+
+LeanStore's replacement policy is page-oriented and assumes a single
+global replacement policy across buffer-managed structures. GPU DB may
+need multiple budgets and policies across HBM, pinned host memory, CPU
+DRAM, NVMe, and future CXL/remote tiers. Random speculative cooling may
+also be too blunt for expensive GPU resident segments unless combined
+with route telemetry, refresh cost, and admission value.
+
+Finally, the paper evaluates fast SSD-backed CPU OLTP and scans, not
+pgwire session scale, GPU kernel launch amortization, or mixed HTAP with
+fresh writes and retained analytical snapshots. The mapping should remain
+an explicit benchmark hypothesis.
+
+**Benchmark candidates:**
+
+- Add a resident-partition cooling state to a small cache-manager proof:
+  `Valid -> CoolingResident -> Valid` on reuse, or
+  `CoolingResident -> Evicted` after a bounded grace window and snapshot
+  release. Gate: no stale route after mutation/DDL and no HBM release
+  while a retained reader still holds the generation.
+- Measure exact-route hot lookup overhead with and without a direct
+  generation handle cache. Required metrics: route lookup nanoseconds,
+  owner queue wait, resident validity checks, cache misses, and fallback
+  reason. Failure condition: the direct handle hides invalidation or
+  schema-generation changes.
+- Build an in-flight resident refresh coalescing test. Concurrent misses
+  for the same partition should install one refresh frame; later requests
+  wait, share, or reject based on admission policy rather than triggering
+  duplicate H2D/NVMe work.
+- Add a long-scan reclamation test where retained scans release snapshot
+  epochs between partitions. Gate: eviction/MVCC cleanup progresses while
+  scan correctness remains identical to a single long snapshot when that
+  semantic is requested.
+- Compare eviction policies for HBM partitions: random cooling, LRU-like
+  per-access tracking, workload-value tracking from planner telemetry, and
+  scan-hinted cooling. Required metrics: hot-route hit rate, per-request
+  overhead, HBM churn, refresh bytes, p99 latency, and COPY/WAL
+  interference.
+- Add a sequential over-resident scan negative control: scan-loaded
+  partitions are admitted as cooling unless repeated reuse is observed.
+  Expected result: large scans do not evict point-lookup/aggregate hot
+  partitions; failure condition: scan throughput improves by destroying
+  retained OLTP latency.
+- Track NUMA and pinned-memory placement for host staging buffers.
+  Minimum proof: route-local host buffers reduce remote memory accesses
+  and do not fragment or exhaust pinned budgets under many sessions.
