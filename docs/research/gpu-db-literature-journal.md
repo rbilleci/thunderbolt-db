@@ -23114,3 +23114,167 @@ generation, mutation owner, page-pool ownership, and reader counts.
   `free`, `mutable`, `published_snapshot`, `gpu_staging`, `retired`, and
   `reclaimable`. Failure condition: a retained reader can observe a page
   after it has been returned to a mutable pool.
+
+### 2026-06-03 - An Empirical Evaluation of Columnar Storage Formats
+
+**Citation:** Xinyu Zeng, Yulong Hui, Jiahong Shen, Andrew Pavlo,
+Wes McKinney, and Huanchen Zhang. "An Empirical Evaluation of
+Columnar Storage Formats." PVLDB 17(2), 2023, pages 148-161.
+doi:10.14778/3626292.3626298. Retrieved 2026-06-03 from
+`https://www.vldb.org/pvldb/vol17/p148-zeng.pdf`.
+
+**Category:** multi-tier cache / data placement.
+
+**Relevance tags:** columnar storage; resident segment layout; Parquet;
+ORC; PAX; encoding; dictionary compression; zone maps; Bloom filters;
+GPU decoding; ML feature tables; vector embeddings; cloud/object storage;
+NVMe; P8 storage format.
+
+**Core idea:** The paper dissects Parquet and ORC as representative open
+columnar formats and argues that their early-2010s Hadoop-era design
+choices no longer match modern hardware and workloads. Fast NVMe and
+cheap storage shift CPU-side scans away from "save every byte" toward
+"decode quickly and skip work precisely," while GPU decoding reverses
+part of that tradeoff because PCIe/I/O movement can dominate enough for
+stronger compression to pay.
+
+The most transferable lesson for GPU DB is that a storage layout must be
+designed around the execution target, not only around compression ratio.
+P8 should not blindly adopt Parquet or ORC as the resident segment
+format. It should instead borrow the useful pieces: PAX-style
+column-group partitioning, aggressive dictionary use for low-NDV columns,
+fine-grained pruning metadata, and enough independent decode blocks for
+GPU parallelism.
+
+**Concrete mechanisms:**
+
+- Both Parquet and ORC use a PAX-like layout: tables are horizontally
+  split into row groups, then stored column-by-column within each group.
+  Each row group contains column chunks plus footer metadata.
+- Parquet commonly sizes row groups by row count, while ORC commonly
+  bounds a row group by physical bytes. The former favors enough entries
+  for vectorized processing; the latter bounds memory footprint for wide
+  rows.
+- Parquet applies dictionary encoding aggressively to many data types by
+  default. ORC primarily dictionary-encodes strings and uses NDV ratio to
+  decide whether dictionary encoding is worthwhile.
+- Parquet integer encoding is simpler: dictionary codes are encoded by a
+  hybrid of RLE and bitpacking, with RLE used only after at least eight
+  repeated values. ORC uses a greedier multi-codec integer encoder with
+  RLE, delta encoding, bitpacking, and PFOR-style handling for outliers.
+- The paper's real-data survey found low NDV ratios in many integer and
+  string columns, and even many floating-point columns had repeated
+  values. This explains why dictionary-style encoding remains broadly
+  useful.
+- General-purpose block compression is enabled by default in the tested
+  formats, but on modern CPU/NVMe scans it often hurts end-to-end query
+  time because decompression CPU cost can exceed saved I/O time.
+- Zone maps store min, max, and row count for a range. ORC's smallest
+  zone maps are configurable by row count and colocated near row-group
+  metadata; newer Parquet versions can centralize page indexes near the
+  footer. Fine-grained zone maps help selective scans when values are
+  clustered.
+- Bloom filters are optional. ORC colocates them at the same granularity
+  as its smallest zone maps; Parquet supports per-column-chunk filters
+  and uses split block Bloom filters for cache/SIMD efficiency.
+- Wide feature tables expose a metadata problem: projecting a small
+  number of columns from thousands of attributes still pays nearly
+  linear footer/schema parsing cost because Parquet and ORC metadata is
+  serialized for sequential decode rather than random per-column access.
+- For vector embeddings, Parquet and ORC scan into NumPy more slowly than
+  array-oriented Zarr because nested/list encodings force more sequential
+  row-group decoding and provide less direct parallel array access.
+- For top-k vector search followed by row-id fetches, ORC's finer
+  pruning helps on local SSD, but it issues many more S3 GETs than
+  Parquet in the paper's setup. Fine-grained metadata can backfire on
+  high-latency object storage if it creates many small reads.
+- In cuDF GPU decoding experiments, ORC reaches higher throughput than
+  Parquet because it exposes more independent decode regions. However,
+  both formats underutilize GPU compute because variable-length encoded
+  runs require offset discovery and can leave warp lanes idle.
+- Unlike CPU scans, zstd block compression improves GPU scan throughput
+  once there are enough rows because I/O and PCIe transfer dominate the
+  scan time. The paper does not claim this holds for all data sizes or
+  predicates.
+
+**GPU DB mapping:** P8 resident segments should be internal execution
+formats first, interchange formats second. The current design already
+uses generated GPU column-group snapshots; this paper strengthens that
+choice. A Parquet/ORC-compatible cold file may still be useful at disk or
+import/export boundaries, but resident HBM and pinned-host segments
+should be shaped for GPU route families, snapshot publication, and
+pruning.
+
+For hot int4/text routes, P8 can start with a row-group/segment directory
+that stores per-column dense buffers plus per-segment min/max, NDV,
+null-count, row-count, and optional Bloom or key summaries. The directory
+should be random-access by column id and route shape, not a serialized
+footer that every retained lookup must scan. That maps directly to the
+runtime's immutable snapshot handles and route descriptors.
+
+The CPU/GPU compression split is especially important. CPU fallback and
+mutation-adjacent scans should prefer simple fixed-width or dictionary
+codes that decode cheaply. GPU-resident or over-resident scans may prefer
+denser compression when H2D/NVMe/PCIe movement dominates, but only if the
+codec exposes enough independent decode blocks and avoids variable-run
+dependencies that strand warp lanes.
+
+Zone-map granularity maps to partitioned retained execution. Per-table
+metadata is too coarse for over-resident or point/range routes, but
+per-tiny-block metadata can create too many cold-tier reads. GPU DB
+should tune pruning summaries by tier: fine enough inside HBM/DRAM,
+coarser and fetch-coalesced for NVMe/object-like future tiers.
+
+The ML/vector results are a useful warning for future embeddings or
+large text/blob columns. Do not store large binary payloads, vector
+embeddings, and OLTP-visible scalar columns in one physical row-group
+policy by default. Large payloads should live in separate regions with
+their own fetch granularity, while scalar MVCC/pruning metadata remains
+compact and cheap for point reads.
+
+**Risks and mismatches:** The paper studies analytical file formats, not
+an OLTP storage engine with WAL-before-visibility, MVCC chains, DDL
+invalidation, or in-place mutation ownership. Its benchmark evaluates
+Parquet and ORC in isolation, so it does not directly answer how much
+metadata should be maintained on every GPU DB write. Parquet/ORC
+compatibility also has ecosystem value that an internal format would
+give up unless import/export bridges remain strong.
+
+The GPU conclusions come from cuDF on an RTX 3090 and synthetic
+workloads based on real-data distributions. A future GPU, different PCIe
+generation, NVMe path, unified memory, or GPUDirect path could move the
+compression crossover point. The paper's "aggressive compression helps
+GPU" finding should therefore become a benchmark hypothesis, not a
+default P8 rule.
+
+**Benchmark candidates:**
+
+- Add a host-only P8 segment-format microbenchmark comparing dense int4
+  buffers, dictionary-coded int4/text, and simple bitpacked codes for
+  append, publish, scan, point lookup, and CPU fallback. Gate: identical
+  SQL-visible values and MVCC boundaries versus the current tuple store.
+- Build a GPU decode crossover benchmark once hardware is available:
+  uncompressed, dictionary-only, bitpacked, and zstd-compressed segment
+  variants at fixed row counts. Measure H2D bytes, kernel time, D2H
+  bytes, total latency, and occupancy. Failure condition: compressed
+  routes improve bandwidth but lose p50 latency for retained point reads.
+- Prototype a resident segment directory with random-access per-column
+  metadata: row count, null count, min/max, NDV estimate, byte offsets,
+  and visibility generation. Gate: route planning does not scan
+  serialized footer-like metadata on every request.
+- Add a pruning-granularity sweep for partitioned retained routes:
+  table-level, partition-level, 64K-row, 16K-row, and 4K-row min/max
+  summaries. Measure skipped rows, metadata bytes, cache misses, and
+  route-planning latency under equality, range, and aggregate queries.
+- Compare Bloom filters for point lookups at column, partition, and
+  segment-block granularity. Failure condition: filter maintenance or
+  false-positive checks cost more than saved resident scans under mixed
+  writes and reads.
+- Create a "large payload alongside scalar columns" layout test with
+  text/blob-like payloads separated from scalar int4/text metadata.
+  Gate: scalar point/range queries avoid payload reads while payload
+  projection remains correct and fetch-coalesced.
+- For future cold tiers, simulate high-latency metadata fetches. Compare
+  fine ORC-like small summaries against coalesced summary pages. Failure
+  condition: pruning reduces bytes but increases latency through many
+  small reads.

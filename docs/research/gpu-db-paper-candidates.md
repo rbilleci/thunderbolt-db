@@ -716,7 +716,7 @@ Append new candidates here as each paper is processed.
   Why: Umbra's adaptive bytecode/JIT execution foundation; relevant to deciding
   when GPU DB should interpret, compile, batch, or route short SQL plans
   without paying excessive setup latency.
-- `queued` — **An Empirical Evaluation of Columnar Storage Formats**,
+- `reviewed` — **An Empirical Evaluation of Columnar Storage Formats**,
   Zeng et al., PVLDB 2023.
   URL: `https://www.vldb.org/pvldb/vol17/p148-zeng.pdf`
   arXiv: `https://arxiv.org/abs/2304.05028`
@@ -762,6 +762,26 @@ Append new candidates here as each paper is processed.
   Why: lifecycle-aware LSM layout design is a follow-up to universal columnar
   and hot/cold block conversion; useful for comparing row-to-column movement
   by storage level rather than by in-memory block age.
+- `queued` — **Pixels: An Efficient Column Store for Cloud Data Lakes**,
+  Bian and Ailamaki, ICDE 2022.
+  URL: `https://doi.org/10.1109/ICDE53745.2022.00286`
+  Why: cited by the columnar-format evaluation as a modern file-format
+  optimization; useful for comparing cloud/cold-tier column groups,
+  metadata layout, and coalesced reads against P8 resident and
+  over-resident segment directories.
+- `queued` — **BtrBlocks: Efficient Columnar Compression for Data Lakes**,
+  Kuschewski et al., SIGMOD 2023.
+  URL: `https://doi.org/10.1145/3589265`
+  Why: cited by the columnar-format evaluation as a sampling-based
+  encoding-selection design; useful for deciding whether P8 should choose
+  compression per segment from measured decode speed instead of fixed
+  global codecs.
+- `queued` — **FSST: Fast Random Access String Compression**,
+  Boncz, Neumann, and Leis, PVLDB 2020.
+  URL: `https://www.vldb.org/pvldb/vol13/p2649-boncz.pdf`
+  Why: cited as a modern lightweight string-compression technique;
+  directly relevant to P8 text column layout, prefix predicates, and
+  CPU/GPU tradeoffs for retained string routes.
 
 - `reviewed` — **Harnessing GPU Power for Enhanced OLTP: A Study in Concurrency
   Control Schemes**, arXiv 2024.
