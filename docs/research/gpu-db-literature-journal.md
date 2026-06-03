@@ -6185,3 +6185,147 @@ preemption boundaries, not the full OS mechanism.
 - Negative control: homogeneous short retained lookups. Class queues and
   scheduling metadata must not add measurable p50 regression compared
   with the simple hot path when service times are uniform.
+
+### 2026-06-03 - Path to GPU-Initiated I/O for Data-Intensive Systems
+
+**Citation:** Karl B. Torp, Simon A. F. Lund, and Pinar Tozun.
+"Path to GPU-Initiated I/O for Data-Intensive Systems." DaMoN 2025,
+article 3, pp. 1-9. DOI: `10.1145/3736227.3736232`. Retrieved
+2026-06-03 from the IT University of Copenhagen publication record,
+`https://pure.itu.dk/en/publications/path-to-gpu-initiated-io-for-data-intensive-systems/`,
+and the authors' DaMoN slide deck,
+`https://itu-dasyalab.github.io/RAD/talk/files/2025_DaMoN.pdf`. The
+ACM PDF endpoint was Cloudflare-blocked during this run, so details
+below rely on the open metadata, abstract, and slide-deck evaluation
+summary rather than the full proceedings PDF.
+
+**Category:** multi-tier cache / data placement and GPU execution /
+analytics.
+
+**Relevance tags:** GPU-initiated IO; NVMe SSDs; GPUDirect Storage;
+BaM; SPDK; over-resident execution; CPU/GPU resource management;
+storage path design; future GPU memory tiers.
+
+**Core idea:** The paper surveys the current GPU-centric storage access
+landscape and then compares BaM, a GPU-initiated storage path, against
+SPDK, a CPU-centric kernel-bypass storage interface, with GDS as an
+additional reference point. The main result is not "always let the GPU
+drive storage." It is more conditional: BaM can match SPDK bandwidth
+without putting the CPU on the IO path, but it does so by consuming a
+large amount of GPU resource. The paper frames GPU-initiated IO as a
+resource-placement decision, not just a faster transfer primitive.
+
+That distinction matters for GPU DB because the engine is trying to
+combine low-latency retained reads, over-resident scans, mutations,
+refresh, and high logical session count. If storage control work burns
+SM cycles or cache capacity that would otherwise run relational kernels,
+GPU-initiated IO can make query latency worse even while removing CPU
+copy or orchestration overhead. The transferable idea is to treat
+storage initiation as a route attribute with measured CPU cost, GPU
+cost, PCIe traffic, reuse, and queue impact.
+
+**Concrete mechanisms:**
+
+- The paper's technology recap separates GPUfs and ActivePointers as
+  POSIX-like GPU-facing APIs, GDS as CPU-initiated direct storage-to-GPU
+  transfer, BaM as GPU-initiated direct access with CPU mostly used for
+  setup, and GMT as GPU-initiated access through a GPU/CPU/storage
+  cache hierarchy.
+- GDS removes the CPU memory copy from the data plane but still leaves
+  the CPU initiating storage operations. The slide-deck summary says
+  this can remain CPU-bound.
+- BaM bypasses the CPU on the storage access path and lets GPU code
+  initiate reads, but the evaluation summary emphasizes the cost:
+  storage access can saturate the GPU.
+- GMT is presented as a three-tier cache across GPU, CPU, and storage.
+  The summary says it is attractive when reuse is high, but it spends
+  both CPU and GPU resources.
+- The evaluation compares random reads on a Gigabyte G292-Z20 with an
+  AMD EPYC 7402P, 256 GB DDR4, two NVIDIA Tesla V100 16 GB PCIe Gen 3
+  GPUs, and four Samsung 980 PRO 1 TB SSDs on Ubuntu 20.04, NVIDIA
+  driver 550, CUDA 12.6, BaM from GitHub master, matching GDS, and
+  SPDK v24.09.
+- The BaM workload uses `nvm-block-bench`, GDS uses `gdsio`, and SPDK
+  uses `bdevperf`. The slide deck reports five repetitions with mean
+  and standard deviation and uses NVIDIA `dcgmi` for GPU PCIe traffic.
+- In the summarized bandwidth results, BaM is comparable to SPDK and
+  better than GDS in the tested setup, but is capped by GPU PCIe Gen 3.
+  With four drives, BaM scaling falls off, while one to three drives
+  scale linearly in the slide summary.
+- For 4 KiB IO, the deck attributes a resource-consumption difference:
+  BaM fully saturates the GPU, while SPDK needs a single physical CPU
+  core.
+- The paper's discussion calls out two adoption needs for real systems:
+  better CPU/GPU resource management and the right abstraction. It
+  contrasts file abstractions for GPUfs, ActivePointers, and GDS with
+  block or array abstractions for BaM and GMT.
+
+**GPU DB mapping:** This paper sharpens the over-resident P8 design
+choice. A GPU-initiated read path should not be a default replacement
+for CPU prefiltering, explicit residency, or CPU-managed NVMe staging.
+It should be one candidate route for cold or warm partitions whose
+operator pipeline can overlap IO and compute without starving retained
+queries on the same GPU.
+
+The current runtime document already separates GPU execution owners,
+residency owners, and bounded queues. Torp et al. add another budget
+that should be explicit in those owners: storage-control occupancy on
+the GPU. A route descriptor for over-resident work should report
+whether storage operations are CPU-initiated GDS/SPDK-style, GPU-
+initiated BaM-style, or tier-cache mediated, and it should charge that
+choice against GPU queue time, SM occupancy, PCIe bytes, CPU core time,
+pinned buffers, and expected reuse.
+
+For P8 data placement, the GMT summary reinforces a tiering rule:
+promotion to CPU or GPU cache is worthwhile only when reuse repays the
+resource burn. Hot retained snapshots should stay as explicit GPU
+resident column groups. Warm over-resident partitions may use CPU DRAM
+or compressed host segments plus GDS/SPDK-style staging. BaM-like direct
+NVMe reads are more promising for large streaming or pointer-chasing
+data paths where CPU initiation overhead dominates and the relational
+kernel has enough slack to hide IO control work.
+
+The file-versus-array abstraction split is also useful. PostgreSQL-like
+tables should not expose files to query kernels as the first design.
+The engine should expose relation/partition/page arrays with stable
+schema generation, WAL boundary, visibility boundary, compression
+format, and row-id mapping. File-like APIs may be useful for external
+formats, but MVCC-safe retained and over-resident routes need typed
+database blocks.
+
+**Risks and mismatches:** The accessible material is a publication
+record and slide deck, not the full paper text. The exact experimental
+graphs, variance, implementation details, and full limitations could
+not be inspected from the ACM PDF in this run. The evaluation uses V100
+PCIe Gen 3 GPUs and Samsung consumer NVMe SSDs, so bandwidth ceilings
+and GPU saturation behavior may differ on newer hardware. Random-read
+microbenchmarks do not prove SQL query performance, MVCC visibility,
+WAL safety, DDL invalidation, response-ring behavior, or session-scale
+latency. BaM-style GPU initiation can also conflict with GPU DB's most
+valuable retained-read kernels if both need SMs at the same time.
+
+**Benchmark candidates:**
+
+- Add an over-resident IO route descriptor with explicit initiation
+  mode: CPU+SPDK-like, CPU+GDS-like, GPU-initiated, or tier-cache
+  mediated. Minimum gate: route telemetry records CPU time, GPU elapsed
+  time, H2D/storage bytes, pinned-buffer use, queue wait, and fallback
+  reason without changing SQL results.
+- Build a synthetic over-resident partition scan that compares CPU
+  prefilter plus GPU tail against GPU-direct-style staging when data is
+  larger than GPU memory. Expected improvement: direct GPU IO only wins
+  when CPU initiation or copy overhead is measured as the bottleneck.
+  Failure condition: retained-read p99 regresses because storage-control
+  work occupies the GPU.
+- Add a resource-isolation benchmark mixing 99% retained point reads
+  with 1% over-resident cold scans. Compare no cold scans, CPU-managed
+  staging, and GPU-initiated staging. Proof gate: cold scans expose
+  their resource budget and cannot silently starve retained lookups.
+- Prototype a reuse-sensitive warm-tier policy for one partitioned
+  table: keep hot columns in GPU memory, warm compressed segments in
+  host memory, and cold blocks on NVMe. Measure promotion hit rate,
+  demotion churn, bytes moved, and route latency by tier.
+- Treat GPU-initiated IO as a later-stage P8 benchmark after retained
+  snapshots and CPU-prefiltered over-resident routes have telemetry.
+  The first go/no-go question should be whether GPU storage-control
+  occupancy is lower than the query-kernel time it helps hide.

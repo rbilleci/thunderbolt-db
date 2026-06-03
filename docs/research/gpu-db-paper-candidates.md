@@ -242,9 +242,9 @@ Append new candidates here as each paper is processed.
   URL: `https://www.vldb.org/pvldb/vol19/p320-huang.pdf`
   Why: evaluates compressed-data SQL execution on GPUs and may inform
   dense-versus-compressed resident page benchmarks.
-- `queued` — **Path to GPU-Initiated I/O for Data-Intensive Systems**,
+- `reviewed` — **Path to GPU-Initiated I/O for Data-Intensive Systems**,
   Torp et al., DaMoN 2025.
-  URL: `https://doi.org/10.1145/3736227.3736233`
+  URL: `https://doi.org/10.1145/3736227.3736232`
   Why: practical evaluation of GPU-initiated IO paths for data-intensive
   systems, directly relevant to DPF-style over-resident execution.
 - `reviewed` — **Scaling GPU-Accelerated Databases beyond GPU Memory Size**,
@@ -525,6 +525,23 @@ Append new candidates here as each paper is processed.
   full transaction stages rather than only WAL, index, or GPU refresh
   substeps, and when batch-level write-set ordering should be preferred over
   per-request optimistic validation in hot partitions.
+- `queued` — **CAM: Asynchronous GPU-Initiated, CPU-Managed SSD Management for
+  Batching Storage Access**, Zhou et al., ICDE 2025.
+  URL: `https://doi.org/10.1109/ICDE65448.2025.00175`
+  Why: hybrid GPU-initiated but CPU-managed SSD control path; useful follow-up
+  to Torp et al. for reducing GPU busy-wait/control-plane burn while still
+  overlapping storage access with GPU compute.
+- `queued` — **GPU-Initiated On-Demand High-Throughput Storage Access in the
+  BaM System Architecture**, Qureshi et al., ASPLOS 2023.
+  URL: `https://arxiv.org/abs/2203.04910`
+  Why: foundational modern BaM design evaluated by Torp et al.; relevant to
+  understanding GPU-side request queues, page caches, and when direct NVMe
+  access helps over-resident data paths.
+- `queued` — **GPU Orchestrated Memory Tiering**, Bae et al., 2024.
+  URL: `https://doi.org/10.1145/3620666.3651341`
+  Why: three-tier GPU/CPU/storage cache approach summarized by Torp et al.;
+  relevant to future explicit tier promotion and demotion policies when reuse
+  can justify CPU and GPU resource use.
 - `queued` — **GPU Database Systems Characterization and Optimization**,
   Cao et al., PVLDB 2023.
   URL: `https://www.vldb.org/pvldb/vol17/p441-cao.pdf`
