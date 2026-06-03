@@ -7356,3 +7356,138 @@ application relinking in the prototype.
 - Add an IO-worker scale policy experiment driven by queue wait and CPU usage,
   with asynchronous reassignment. The policy should report scale events and
   wrong-owner fallbacks rather than silently increasing latency.
+
+### 2026-06-03 - Hint-QPT: Hints for Robust Query Performance Tuning
+
+**Citation:** Haibo Xiu, Yang Li, Qianyu Yang, Weihang Guo, Yuxi Liu,
+Pankaj K. Agarwal, Sudeepa Roy, and Jun Yang. "Hint-QPT: Hints for
+Robust Query Performance Tuning." PVLDB 18(12), 2025, pp. 5327-5330.
+doi:10.14778/3750601.3750663. Retrieved 2026-06-03 from
+`https://www.vldb.org/pvldb/vol18/p5327-xiu.pdf`.
+
+**Category:** query optimization / planning.
+
+**Relevance tags:** robust query optimization; selectivity uncertainty;
+plan hints; sensitivity analysis; targeted runtime statistics; route
+explainability; GPU fallback decisions; operator diagnostics.
+
+**Core idea:** Hint-QPT is a demonstration system built on PARQO. It starts
+from the premise that selectivity estimates will often be wrong, so tuning
+should not simply chase the cheapest plan at one estimated point. Instead,
+it recommends plans with low expected penalty under a learned distribution of
+selectivity errors, identifies the selectivity dimensions whose errors most
+affect plan optimality, and lets users refine those dimensions by executing
+counting subqueries or manually overriding estimates.
+
+The paper's most transferable idea is not the GUI itself. It is the split
+between robust default planning and targeted evidence gathering. A plan can
+be allowed to cost more under the optimizer's current estimate if it is less
+fragile across plausible true selectivities. When more certainty is needed,
+the system should ask for a small number of high-value measurements rather
+than probing every subquery or blindly trusting local error magnitude.
+
+**Concrete mechanisms:**
+
+- Hint-QPT profiles selectivity-estimation errors for querylets: small
+  subquery templates involving up to three joined tables.
+- Component error models for selections and joins are combined into a
+  query-specific distribution `f(s | s_hat)` over possible true selectivities
+  given optimizer estimates.
+- Robust plan selection uses PARQO's penalty objective. A plan incurs zero
+  penalty when its cost is within a tolerance factor of the true optimal
+  cost; otherwise the excess cost is penalized. The robust plan minimizes
+  expected penalty over the selectivity-error distribution.
+- The demonstration uses a tolerance factor of `0.2`, so plans within 20% of
+  the true optimal cost are treated as acceptable for the penalty function.
+- Sensitive dimensions are identified with Sobol-style global sensitivity
+  analysis over plan penalty variance, not by simply choosing dimensions with
+  the largest estimated error or largest local cost derivative.
+- Users can refine a sensitive dimension by executing a counting subquery to
+  obtain the actual selectivity, then injecting that selectivity into the
+  optimizer and reoptimizing.
+- The system visualizes a query as a join graph, shows error distributions for
+  selected nodes and edges, highlights sensitive dimensions, compares default,
+  robust, and adjusted plans, and annotates operator trees with estimated and
+  actual costs/cardinalities.
+- It also visualizes plan cost surfaces over two sensitive selectivity
+  dimensions, with probability heat over the plausible true-selectivity
+  region.
+- The implementation works on PostgreSQL 16.2 with minor modifications for
+  hint injection and interaction. The authors state the framework is designed
+  to work with optimizers that support selectivity and plan hints.
+- The paper is a PVLDB demo paper, so detailed performance-evaluation claims
+  are limited. It describes the Join Order Benchmark/IMDb demonstration and
+  points to PARQO for the deeper validation.
+
+**GPU DB mapping:** GPU DB route choice has the same fragility problem, with
+more dimensions. A retained GPU route can be fast when cardinality, selected
+bytes, resident validity, GPU queue delay, response size, and refresh risk are
+close to estimates, but a wrong estimate can turn the same route into a slow
+fallback or an expensive over-resident transfer. The planner should therefore
+track not only the cheapest route estimate, but also how brittle the route is.
+
+The immediate mapping is a robust route explanation layer over
+`Engine::plan_relational_resident_route(...)`. For each accepted or rejected
+resident path, the planner should expose the dimensions that could flip the
+decision: selectivity, output rows, selected columns, resident bytes, refresh
+age/cost, GPU queue depth, expected kernel launch amortization, CPU fallback
+cost, and response bytes. A fragile accepted route should be visible as
+fragile, not silently treated as a deterministic win.
+
+Hint-QPT's sensitive-dimension idea maps cleanly to admission-time probes. For
+some query templates, GPU DB can cheaply collect one targeted count, range
+histogram, resident segment touch count, or queue-delay sample before choosing
+between CPU, resident GPU, cold GPU transfer, over-resident execution, or
+rejection. The probe should be tied to a route-flip risk, not run merely
+because a statistic has high uncertainty.
+
+For retained read micro-batching, robust planning can become a template cache.
+Repeated same-shape queries over the same relation can remember which
+dimensions usually decide the route: cardinality, batch size, GPU queue wait,
+or response size. The planner can then refresh only those facts when a cached
+route is near a decision boundary.
+
+The paper also supports an operator-facing diagnostics surface. GPU DB should
+be able to explain that a query used CPU fallback because a GPU route was
+fragile under selectivity uncertainty, refresh risk, or queue saturation. That
+is more useful than a single "unsupported" or "cost too high" reason when
+operators are trying to tune resident data placement and planner rules.
+
+**Risks and mismatches:** Hint-QPT is an interactive tuning demonstration, not
+a production autonomous optimizer. It focuses on selectivity errors in join
+planning, while the current GPU DB first slice is mostly single-table retained
+lookups and aggregates. Its use of PostgreSQL hint injection does not directly
+define a native optimizer API. Counting subqueries can be too expensive under
+high concurrency, especially if they compete with the actual workload for
+CPU, GPU, or IO resources. The demo paper provides limited quantitative
+evaluation, so PARQO and follow-up robust-optimizer papers remain the better
+source for algorithmic validation. Finally, a robust plan that is acceptable
+for elapsed query time may still be unacceptable for GPU DB if it consumes
+scarce pinned buffers, resident memory, or GPU stream slots needed by many
+sessions.
+
+**Benchmark candidates:**
+
+- Add a route-fragility record to resident planner decisions. For each
+  accepted/rejected route, report the top route-flip dimensions among
+  estimated rows, selected bytes, resident validity, refresh age, GPU queue
+  depth, CPU fallback estimate, D2H response bytes, and batch depth. Minimum
+  gate: no route behavior change and deterministic explanation output.
+- Build a retained route sensitivity benchmark: vary predicate selectivity
+  and GPU queue depth around the CPU/GPU decision boundary, then measure how
+  often the chosen route is more than 20% slower than the best measured route.
+- Prototype targeted pre-route probes for one query shape: a cheap CPU count
+  or resident histogram lookup only when the route decision is near the
+  boundary. Proof gate: fewer bad route choices without increasing p50
+  latency for easy decisions.
+- Extend route telemetry to distinguish "unsupported", "not resident",
+  "over budget", "queue saturated", "fragile selectivity", and "fragile
+  response size" fallback reasons. Failure condition: the planner cannot name
+  which fact would have made the GPU route viable.
+- Compare three policies on repeated retained templates: cheapest current
+  estimate, conservative robust route, and targeted-probe route. Measure
+  p50/p95/p99 latency, throughput, GPU queue wait, route flips, and fallback
+  counts.
+- Add a negative-control case where selectivity uncertainty is high but route
+  choice is insensitive. The planner should not run a probe or abandon the
+  resident route simply because the statistic itself is uncertain.

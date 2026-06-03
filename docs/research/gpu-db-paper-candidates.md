@@ -419,7 +419,7 @@ Append new candidates here as each paper is processed.
   Why: follow-up to PARQO that focuses on parametric robust query
   optimization and plan-penalty profile caching; relevant to repeated retained
   GPU route templates and admission-time route reuse.
-- `queued` — **Hints for Robust Query Performance Tuning**, Xiu et al.,
+- `reviewed` — **Hints for Robust Query Performance Tuning**, Xiu et al.,
   PVLDB 2025.
   URL: `https://www.vldb.org/pvldb/vol18/p5327-xiu.pdf`
   Why: PARQO-adjacent robust tuning work that may turn sensitive cardinality
@@ -796,3 +796,21 @@ Append new candidates here as each paper is processed.
   Why: MEMTIS uses CXL latency assumptions from Pond; useful for future CXL
   memory-pool tiers, remote-memory latency budgets, and explicit placement
   boundaries between local DRAM, pooled memory, and GPU-resident state.
+- `queued` — **Jovis: A Visualization Tool for PostgreSQL Query Optimizer**,
+  Choi et al., arXiv 2024.
+  URL: `https://arxiv.org/abs/2411.14788`
+  Why: Hint-QPT cites Jovis as a PostgreSQL optimizer visualization system;
+  useful for exposing route-choice internals, join-order sensitivity, and
+  planner fallback reasons to operators without hiding deterministic rules.
+- `queued` — **Extensible Query Optimizers in Practice**, Ding, Narasayya,
+  and Chaudhuri, Foundations and Trends in Databases 2024.
+  URL: `https://doi.org/10.1561/1900000077`
+  Why: Hint-QPT cites this modern optimizer survey; useful background for
+  adding GPU route hints and robust-cost extensions while preserving a native,
+  inspectable optimizer contract.
+- `queued` — **How Good Are Query Optimizers, Really?**, Leis et al.,
+  PVLDB 2015.
+  URL: `https://www.vldb.org/pvldb/vol9/p204-leis.pdf`
+  Why: JOB is the workload foundation used by Hint-QPT/PARQO to expose
+  selectivity-estimation failures; useful as a 2015-present baseline for
+  testing CPU/GPU route-choice fragility under join and selectivity errors.
