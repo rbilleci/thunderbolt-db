@@ -755,8 +755,8 @@ Append new candidates here as each paper is processed.
   deciding whether GPU route tuning should learn bounded hints around a
   deterministic planner rather than replace route rules.
 
-- `queued` — **AGILE: Lightweight and Efficient Asynchronous GPU-SSD
-  Integration**, arXiv 2025.
+- `reviewed` — **AGILE: Lightweight and Efficient Asynchronous GPU-SSD
+  Integration**, Yang et al., SC 2025.
   URL: `https://arxiv.org/abs/2504.19365`
   Why: modern asynchronous GPU-centric SSD access library; useful contrast to
   CAM's CPU-managed control plane and BaM's synchronous GPU polling path.
@@ -766,6 +766,18 @@ Append new candidates here as each paper is processed.
   Why: modern GPU-initiated asynchronous SSD access and cache co-optimization;
   useful follow-up for deciding when GPU DB over-resident execution should
   jointly plan GPU work, SSD reads, and CPU/GPU memory cache placement.
+- `queued` — **Asynchrony and GPUs: Bridging this Dichotomy for I/O with
+  AGIO**, Han et al., ASPLOS 2026.
+  URL: `https://doi.org/10.1145/3779212.3790130`
+  Why: apparent follow-up from the AGILE/GMT/BaM research line; likely useful
+  for deciding whether asynchronous GPU-originated I/O should be exposed as a
+  library API, compiler/runtime primitive, or GPU execution-owner service.
+- `queued` — **Breaking the Storage-Compute Bottleneck in Billion-Scale ANNS:
+  A GPU-Driven Asynchronous I/O Framework**, arXiv 2025.
+  URL: `https://arxiv.org/abs/2507.10070`
+  Why: GPU-driven async I/O plus compute/I/O balancing in an over-resident
+  search workload; useful for route policies that choose graph degree, batch
+  size, and storage prefetch depth together.
 - `reviewed` — **TAS: TCP Acceleration as an OS Service**, Kaufmann et al.,
   EuroSys 2019.
   URL: `https://os.mpi-sws.org/projects/tas.html`

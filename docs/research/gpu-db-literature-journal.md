@@ -10794,3 +10794,163 @@ until separately measured.
   or stored-template path against external client logic before evaluating
   WebAssembly/process isolation. Gate: measurable round-trip reduction
   without weakening memory safety, catalog isolation, or WAL/MVCC ordering.
+
+### 2026-06-03 - AGILE: Lightweight and Efficient Asynchronous GPU-SSD Integration
+
+**Citation:** Zhuoping Yang, Jinming Zhuang, Xingzhen Chen, Alex K.
+Jones, and Peipei Zhou. "AGILE: Lightweight and Efficient
+Asynchronous GPU-SSD Integration." SC 2025. arXiv:2504.19365v3,
+2025. DOI: `10.1145/3712285.3759778`. Retrieved 2026-06-03 from
+the arXiv abstract and PDF, `https://arxiv.org/abs/2504.19365` and
+`https://arxiv.org/pdf/2504.19365`.
+
+**Category:** multi-tier cache / data placement and GPU execution / storage.
+
+**Relevance tags:** GPU-centric I/O; asynchronous NVMe; GPUDirect-style
+storage; HBM software cache; SSD queue pairs; completion polling; request
+coalescing; over-resident execution; compute/I/O overlap.
+
+**Core idea:** AGILE extends the BaM-style GPU-centric storage path from a
+synchronous model to an asynchronous one. GPU threads can issue NVMe requests
+and continue useful work while a lightweight GPU service handles completion
+queue polling, resource release, and request progress. The paper's strongest
+transferable idea is not "let every database kernel touch SSD directly." It is
+that over-resident GPU execution needs explicit asynchronous request ownership:
+the request issuer, completion poller, cache-line owner, and eviction policy
+must be separated enough to avoid deadlock while still being cheap enough for
+GPU-scale thread counts.
+
+AGILE also makes the software cache policy pluggable instead of hard-wiring
+one replacement rule. That matters for GPU DB because a database tiering policy
+cannot be purely page-reuse based. It must include snapshot generation,
+visibility boundary, partition identity, predicate shape, write invalidation
+risk, and response latency class. The paper is therefore useful as a mechanism
+template for a future GPU execution owner that overlaps cold partition fetches
+with retained query work, but it does not replace the database's MVCC, WAL, or
+planner obligations.
+
+**Concrete mechanisms:**
+
+- The host CPU performs setup: it manages NVMe admin queues, establishes
+  GPU-SSD PCIe peer-to-peer communication, exposes SSD doorbell registers to
+  the GPU, allocates physically contiguous HBM for NVMe submission/completion
+  queues and cache buffers, and registers device-visible physical addresses.
+- User GPU kernels interact through three API shapes: `prefetch(src)` into an
+  HBM software cache, `async_issue(src, dst)` for direct asynchronous movement
+  between SSD addresses and GPU buffers, and an array-like synchronous wrapper
+  that hides cache checks for simpler use cases.
+- A lightweight AGILE service kernel runs on the GPU. It polls completion
+  queues in a non-blocking fashion and releases SQ entries and user barriers
+  after completions arrive, so application threads do not hold queue resources
+  while waiting for SSD latency.
+- Completion processing is warp-centric: a warp checks a 32-entry CQ window,
+  tracks a mask of completed entries, advances the CQ doorbell when the window
+  is consumed, and rotates across CQs. This keeps CQ polling parallel without
+  dedicating all GPU threads to service work.
+- SQ entries use explicit states such as empty, updated, and issued. A thread
+  writes a command into an available SQ entry, marks it visible, and the
+  serialized doorbell updater advances the SQ tail only over visible entries
+  to preserve ordering and memory consistency.
+- Identical requests are coalesced first at warp level using CUDA warp
+  primitives and then through the software cache path, reducing redundant SSD
+  reads when many GPU threads request the same page-sized data.
+- The HBM software cache uses cache-line states including invalid, busy,
+  ready, and modified. Busy lines prevent duplicate requests while an I/O is
+  in flight; modified lines are written back before eviction; policy code can
+  decide whether to wait or find another line under pressure.
+- A "Share Table" extends coherency to user-provided buffers for
+  `async_issue`, letting a requested object be found in a thread-owned buffer
+  before falling back to the global software cache or SSD. AGILE includes a
+  debug mode that tracks lock dependency chains to expose circular waits in
+  custom policies.
+- Evaluation uses an RTX 5000 Ada GPU and up to three PCIe Gen4 NVMe SSDs.
+  The paper reports up to 1.88x speedup over a synchronous I/O model when
+  computation and communication can overlap, 4KB random read saturation around
+  3.7/7.4/11.1 GB/s for one/two/three SSDs, and 4KB random write saturation
+  around 2.2/4.4/6.7 GB/s.
+- Against BaM on DLRM inference, AGILE reports 1.3x-1.63x synchronous-mode
+  gains across model configurations and up to 1.75x with asynchronous
+  prefetching. The asynchronous path underperforms when the software cache is
+  too small because prefetches evict data needed by the next epoch, so cache
+  capacity must be sized with the application's access window.
+- On BFS and SpMV graph experiments, the paper reports lower cache and I/O API
+  overhead than BaM, with maximum reductions of about 3.12x for software cache
+  overhead and 2.85x for NVMe I/O overhead. It also reports lower per-thread
+  register use because CQ polling is moved out of application kernels.
+
+**GPU DB mapping:** AGILE maps most cleanly to the future over-resident path in
+P8. A GPU DB execution owner should be able to schedule a partition scan or
+lookup batch whose first wave runs on resident HBM pages while later waves
+prefetch cold partition chunks from NVMe into HBM or pinned host staging
+buffers. The queue and cache state machine from AGILE gives a useful checklist:
+separate request issue, completion polling, cache-line state, user buffer
+coherency, and eviction; never let application work hold a scarce queue/cache
+resource across a wait that only a blocked service can clear.
+
+The paper also reinforces a runtime point from
+`11-high-throughput-query-runtime.md`: service work needs an owner. For GPU DB,
+that owner should probably be a GPU execution/storage service associated with
+specific CUDA streams, NVMe queue pairs, HBM cache budgets, and partition
+generations. Query kernels should not independently invent polling, doorbell,
+cache, and eviction logic. They should submit requests to a bounded service and
+receive explicit completion or fallback reasons.
+
+For MVCC, AGILE's cache-line states need database metadata layered above them.
+A ready page is not necessarily visible for a query. GPU DB cache entries must
+carry table OID, partition id, column family, source WAL/transaction boundary,
+visibility generation, checksum or encoding identity, and invalidation state.
+Writes and DDL must invalidate or retire those entries before a newer
+visibility boundary can route through them. Modified cache lines are especially
+dangerous for this engine: durable database writes still need WAL-before-
+visibility, so the first transfer should be read-only cold-data staging, not
+GPU-originated durable mutation.
+
+AGILE's result about cache size is a direct benchmark warning. An asynchronous
+prefetch path can become slower than synchronous execution if it churns HBM and
+generates extra NVMe requests. GPU DB should therefore measure working-set
+window, cache-line reuse, queue-pair pressure, HBM bytes, and evictions before
+claiming over-resident speedups.
+
+**Risks and mismatches:** AGILE is a GPU/storage systems paper, not a database
+system. It does not address SQL semantics, snapshot isolation, WAL durability,
+DDL invalidation, catalog generations, PostgreSQL wire serving, admission
+control for many client sessions, or mixed transactional writes. Its tested
+applications are DLRM, BFS, SpMV, and microbenchmarks, not OLTP or HTAP query
+plans. The prototype requires modified kernel/driver plumbing, exposed SSD
+doorbells, GPU-visible queues, and device-specific setup that may be
+operationally heavy for a database product.
+
+The paper targets a single GPU with multiple SSDs. It discusses CPU DRAM and
+multi-GPU extensions, but those are future work, so direct guidance for a
+GPU/CPU/NVMe/CXL hierarchy is incomplete. The asynchronous API also requires
+manual overlap planning by programmers; the paper suggests compiler support as
+future work. For GPU DB, that means the planner/runtime must own overlap
+decisions instead of expecting query-kernel authors to place prefetches by hand.
+
+**Benchmark candidates:**
+
+- Build an over-resident partition-fetch simulator before touching production
+  storage: issue async reads for cold `order_line` column chunks while a GPU
+  worker processes already-resident chunks. Required metrics: HBM cache bytes,
+  NVMe queue depth, request coalescing, kernel idle time, D2H/H2D bytes, p50/p99
+  latency, and SQL-result equivalence at one snapshot boundary.
+- Add a cache-window sensitivity benchmark: vary HBM staging cache from too
+  small to comfortably sized for one partition wave and prove when async
+  prefetch beats synchronous fetch. Failure condition: eviction churn creates
+  extra reads or worsens p99 latency.
+- Define a database cache-line descriptor for cold GPU staging:
+  table/partition/column, source WAL boundary, visibility generation, byte
+  range, encoding id, state, last access epoch, and invalidation reason. Gate:
+  a read cannot route through a line unless generation and visibility match.
+- Prototype a service-owned completion poller abstraction for GPU execution
+  owners, even if the first implementation uses ordinary host-mediated I/O.
+  Measure whether offloading completion/progress work from query kernels lowers
+  register pressure or improves occupancy.
+- Test request coalescing for many same-shape point lookups into a cold
+  partition: group identical page/chunk requests before storage access and
+  scatter results back to per-session response slots. Gate: no duplicate
+  storage reads for the same chunk within one micro-batch.
+- Keep GPU-originated writes out of the first design. If writeback is explored,
+  require a WAL-before-visibility proof where GPU-produced bytes are not made
+  SQL-visible until the mutation owner has durable log evidence and has
+  invalidated older resident generations.
