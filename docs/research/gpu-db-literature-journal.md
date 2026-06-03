@@ -11988,3 +11988,206 @@ whose schema generation and data generation disagree.
   copy-only writers proceed when their target record has already migrated.
   Required metrics: DML throughput, DDL completion time, abort counts,
   retained-read p99, and stale-generation rejection reasons.
+
+### 2026-06-03 - Bonspiel low-tail geo-distributed transactions
+
+**Citation:** Fan Cui, Eric Lo, Srijan Srivastava, and Ziliang Lai.
+"Bonspiel: Low Tail Latency Transactions in Geo-Distributed Databases."
+PVLDB 18(11), 2025, pp. 3840-3853. doi:10.14778/3749646.3749658.
+Retrieved 2026-06-03 from
+`https://www.vldb.org/pvldb/vol18/p3840-cui.pdf`.
+
+**Category:** transaction processing / write path, runtime / session
+scale, and MVCC / snapshot / visibility.
+
+**Relevance tags:** tail latency; transaction priority; optimistic
+concurrency control; early write visibility; abort penalty; access-method
+selection; contention footprint; admission policy; hot/cold route choice.
+
+**Core idea:** Bonspiel argues that after modern geo-distributed commit
+protocols reduce atomic commit to roughly one WAN round trip, p999
+transaction latency is often dominated by abort time rather than final
+commit time. The paper targets the slow class of multi-region transactions
+without sacrificing the common single-region path. Its two mechanisms are
+geo-distributed concurrency control (GDCC), which prevents multi-region
+transactions from being aborted by conflicting single-region transactions,
+and geo-aware access method selection (GAMS), which chooses per record
+between reading from the leader and reading from the nearest replica.
+
+The GPU DB setting is not geo-distributed, but the transferable idea is
+strong: tail latency should be optimized by reducing the product of abort
+or retry rate and failed-round penalty for expensive route classes, not
+only by shaving the successful fast path. A retained GPU read, cold-tier
+fetch, resident refresh, or long write transaction can have a much larger
+retry or wait penalty than a short CPU lookup. Those classes need explicit
+priority and route-selection rules that cap p99/p999 damage without
+wounding the short path.
+
+**Concrete mechanisms:**
+
+- Bonspiel classifies transactions into single-region (SR) and
+  multi-region (MR). MR transactions are rarer in TPC-C-like workloads but
+  dominate high-percentile latency because conflicts and retries carry WAN
+  cost.
+- GDCC is OCC-based. MR transactions reserve records in their read and
+  write sets during execution; SR transactions do not reserve records.
+- Reserve-lock conflicts use conditional waiting. If an MR transaction
+  tries to reserve a record locked by an SR transaction, it proceeds
+  without waiting. If the lock holder is another MR transaction, it waits.
+- Multiple MR reservations on the same record can succeed in the basic
+  scheme. Actual serializability conflicts are resolved later by standard
+  OCC validation.
+- During validation, an SR transaction aborts if it tries to lock a record
+  reserved by an MR transaction. This gives MR transactions abort freedom
+  with respect to SR transactions.
+- Once an SR transaction has successfully validated and acquired its locks,
+  it is wound-free: later transactions do not abort it. This protects the
+  common path from unconditional high-priority wounding.
+- SR transactions make their writes early visible after successful
+  validation but before WAN logging completes, while retaining locks until
+  logging completes. This lets MR transactions read fresh values without
+  waiting for the SR log round, while preserving serializability and
+  recoverability under the paper's assumptions.
+- MR transactions do not use early visible writes, limiting cascading abort
+  exposure. Bonspiel states that cascading abort chains are bounded to one
+  in server-failure cases because only successfully validated SR
+  transactions expose early writes and keep locks held.
+- A multi-priority optimization raises an MR transaction's priority after a
+  configurable number of aborts. Lower-priority MR reservations may then
+  fail or wait behind higher-priority MR work, reducing repeated starvation
+  among MR transactions.
+- GAMS chooses per record between read-leader with reservation and
+  read-nearest without reservation. It tracks page-level temperatures based
+  on update frequency and adapts a threshold according to observed MR abort
+  rate.
+- The evaluation uses DBx1000 in C++ with simulated WAN latencies across
+  five data centers, TPC-C NEW-ORDER and PAYMENT plus YCSB-A, and compares
+  against Spanner, TAPIR, GPAC, and R4-style baselines. The paper reports
+  up to 2.2x p999 tail-latency improvement and caps TPC-C p999 around
+  1.7-1.8 seconds in its setup, while maintaining competitive average
+  latency and throughput.
+
+**GPU DB mapping:** The immediate mapping is to route-class-aware
+concurrency control inside the owner runtime. GPU DB should identify
+expensive classes whose failed attempts are unusually costly: long
+mutation batches, resident snapshot refresh, cold NVMe over-resident
+queries, multi-partition retained aggregates, and DDL or resident-layout
+migrations. Those classes should not be repeatedly invalidated by short
+single-partition reads or cheap writes after they have crossed a meaningful
+validation or reservation boundary.
+
+Reservations map to lightweight intent records, not locks that block the
+whole system. A long retained refresh could reserve table/partition/schema
+generations and route families before it starts expensive GPU or cold-tier
+work. Short writers would still be admitted, but at commit they would see
+the reservation and either publish after the reserved generation, redirect
+to a delta/CDC lane, or wait at a narrow boundary. The goal is the
+Bonspiel shape: protect the expensive route from aborts without aborting
+already-validated short work.
+
+Early visible writes are more dangerous for GPU DB because WAL-before-
+visibility is a hard invariant. The safe analogue is not exposing
+unflushed writes to SQL clients; it is exposing post-validation,
+pre-publication state only to internal dependent work under a held owner
+fence. For example, a resident refresh or batched read could consume a
+sealed mutation batch once validation has passed, but user-visible snapshot
+publication must still wait for durable WAL and generation publication.
+This suggests a three-front model: validated intent, durable boundary, and
+SQL-visible generation.
+
+GAMS maps cleanly to CPU/GPU/tier route choice. Hot or frequently mutated
+records should prefer leader/owner/current-generation paths even if they
+cost more per operation, because stale retained or nearest-like reads will
+retry. Cold stable records can use cheaper retained GPU, host snapshot, or
+cold cached routes without reservation. The planner should therefore
+estimate not only successful execution latency, but also stale-generation
+probability and failed-round penalty.
+
+For 1M logical sessions, Bonspiel reinforces that priority is a class
+policy, not a thread policy. A rare expensive request class may deserve a
+reservation or priority boost after retries, while most logical sessions
+remain idle or cheap and should not inherit that priority. Admission should
+track retry count, route class, stale-generation cause, and estimated
+penalty before boosting.
+
+**Risks and mismatches:** Bonspiel is a geo-distributed database prototype
+implemented in DBx1000 with simulated WAN latencies. It does not evaluate
+GPU execution, PostgreSQL protocol serving, NVMe tiering, MVCC version
+storage inside a production SQL engine, or durable WAL on the local storage
+path GPU DB currently cares about. Its early-visible-write mechanism is
+safe only under the protocol's validation, lock-holding, and replication
+assumptions; GPU DB must not expose unflushed writes as visible SQL state.
+
+The paper optimizes MR tail latency in workloads where MR transactions are
+relatively rare. If GPU DB applies similar priority to a class that becomes
+dominant, short-path latency or throughput could regress. GAMS also relies
+on useful update-frequency statistics and adaptive thresholds; without
+good telemetry, route choice could oscillate between stale retained reads
+and over-conservative owner reads. Starvation is argued empirically rather
+than proven for all workloads.
+
+**Benchmark candidates:**
+
+- Add retry-penalty accounting to retained read and mutation telemetry:
+  stale-generation rejects, fallback retries, queue waits, and failed-round
+  time by route class. Gate: p99/p999 reports name whether tail is caused
+  by final execution, wait, or retry/abort penalty.
+- Prototype lightweight reservations for one expensive route class, such as
+  partitioned resident refresh. Short writes that encounter a reservation
+  must publish through an explicit delta/CDC or post-reservation boundary
+  rather than silently invalidating completed refresh work. Failure
+  condition: the reservation wounds already-validated short writes or
+  exposes stale retained reads.
+- Compare three policies for long retained refresh under concurrent writes:
+  no reservation, abort-and-retry on mutation, and reservation plus delta
+  catch-up. Required metrics: refresh completion time, write throughput,
+  retained-read p99/p999, retry count, and stale-generation reject reasons.
+- Add route-temperature statistics at table/partition/page granularity:
+  update frequency, invalidation frequency, retained hit rate, and fallback
+  success rate. Use them to choose owner-current, retained GPU, host
+  snapshot, or cold-tier route. Gate: hot mutable records avoid stale
+  retained retries, while cold stable records retain low latency.
+- Test priority boost after repeated expensive-route aborts. A request
+  class gains priority only after measured failed-round cost exceeds a
+  threshold. Failure condition: priority boosts improve the long route by
+  increasing short-route p99 beyond a configured budget.
+- Model validated, durable, and visible fronts separately in mutation
+  batches. Minimum proof: internal dependent work may observe validated
+  sealed state only under an owner fence, and SQL-visible snapshots never
+  advance before WAL durability.
+
+### 2026-06-03 - Cross-paper synthesis: expensive attempts need protected fronts
+
+Bonspiel, MosaicDB, and Tesseract converge on a common design track for GPU
+DB: classify work by the resource and correctness front it consumes, then
+protect expensive attempts once they pass a meaningful boundary. MosaicDB's
+dual hot/cold queues separate storage-latency hiding from hot OLTP work.
+Tesseract separates old schema, pending schema, CDC, and published schema
+fronts during online migration. Bonspiel separates cheap/common transactions
+from rare expensive transactions and uses reservations plus early internal
+visibility to reduce retry penalty without wounding the common path.
+
+The shared implementation hypothesis is a multi-front owner protocol:
+`validated`, `durable`, `resident-built`, `pending-visible`, and
+`SQL-visible` should be explicit states, not comments in the code. Different
+route classes may use different fronts, but only under named invariants. GPU
+kernels, resident refreshes, and cold-tier fetches can consume validated or
+resident-built work internally when an owner fence proves it cannot leak
+stale SQL results. Client-visible reads and writes still require the durable
+and SQL-visible fronts.
+
+Category gaps remain around network/session admission and query optimizer
+integration. The journal has strong recent coverage for MVCC, storage
+tiering, GPU-initiated IO, and transaction scheduling, but fewer entries on
+database/network co-design and production-grade transport resource sharing.
+The next high-value candidates should therefore include modern network/DB
+runtime work such as Tigger, DB/network co-design surveys, ScaleRPC, or
+Skyloft unless the queue needs a query-optimizer correction.
+
+Benchmark priority should move from one-dimensional throughput curves to
+classed tail breakdowns. For each mixed run, report hot retained reads,
+cold-tier reads, mutation/COPY admission, refresh or DDL migration, and
+response completion separately. The key pass/fail question is whether an
+expensive attempt can complete without repeated invalidation while the
+common short path keeps its p99 budget and WAL-before-visibility remains
+untouched.

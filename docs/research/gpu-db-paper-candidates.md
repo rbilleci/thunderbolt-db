@@ -607,8 +607,8 @@ Append new candidates here as each paper is processed.
   Why: modern DBaaS resource-allocation paper cited by Resource-Adaptive Query
   Execution; relevant to pricing or value-of-memory admission policies for
   multi-tenant/session-heavy GPU DB workloads.
-- `queued` — **Bonspiel: Low Tail Latency Transactions in Database
-  Systems**, Cui et al., PVLDB 2025.
+- `reviewed` — **Bonspiel: Low Tail Latency Transactions in
+  Geo-Distributed Databases**, Cui et al., PVLDB 2025.
   URL: `https://www.vldb.org/pvldb/vol18/p3840-cui.pdf`
   Why: modern low-tail transaction follow-up that cites Plor; relevant to
   predictable transaction admission and retry behavior under high contention.
@@ -701,6 +701,24 @@ Append new candidates here as each paper is processed.
   Why: re-execution-based concurrency control cited by R-SMF; relevant to
   retrying or repairing conflicted transactions without throwing away all
   scheduling and snapshot work.
+- `queued` — **Occam's Razor for Distributed Protocols**, Lai et al.,
+  SoCC 2024.
+  URL: `https://doi.org/10.1145/3698038.3698514`
+  Why: R4 is Bonspiel's atomic-commit baseline; useful for separating
+  unavoidable commit latency from abort/retry and contention-footprint costs
+  in distributed or multi-owner transaction protocols.
+- `queued` — **Caerus: Low-Latency Distributed Transactions for
+  Geo-Replicated Systems**, Hildred et al., PVLDB 2023.
+  URL: `https://www.vldb.org/pvldb/vol17/p469-hildred.pdf`
+  Why: modern geo-replicated transaction protocol cited by Bonspiel; useful as
+  a contrast for placement-aware commit and low-latency multi-partition
+  transaction routing.
+- `queued` — **Natto: Providing Distributed Transaction Prioritization for
+  High-Contention Workloads**, Yang, Yan, and Wong, SIGMOD 2022.
+  URL: `https://doi.org/10.1145/3514221.3517869`
+  Why: priority-based distributed transaction handling cited by Bonspiel;
+  relevant to deciding whether GPU DB should prioritize long/remote or
+  expensive route classes without wounding short local work.
 - `reviewed` — **Take Out the TraChe: Maximizing (Tra)nsactional Ca(che) Hit
   Rate**, Cheng et al., OSDI 2023.
   URL: `https://www.usenix.org/conference/osdi23/presentation/cheng`
