@@ -312,7 +312,7 @@ Append new candidates here as each paper is processed.
   Why: direct OMVCC baseline for transaction repair, with timestamp,
   validation, and version-chain design relevant to serializable MVCC in a
   memory-resident engine.
-- `queued` — **Exploiting Directly-Attached NVMe Arrays in DBMS**, Haas,
+- `reviewed` — **Exploiting Directly-Attached NVMe Arrays in DBMS**, Haas,
   Haubenschild, and Leis, CIDR 2020.
   URL: `https://www.cidrdb.org/cidr2020/papers/p16-haas-cidr20.pdf`
   Why: direct follow-up for explicit NVMe tier economics and high-parallelism
@@ -522,6 +522,18 @@ Append new candidates here as each paper is processed.
   Why: Shirakami cites Plor as modern transaction scheduling work; relevant to
   predictable low-tail mutation and admission paths under mixed transaction
   sizes.
+- `queued` — **Bf-Tree: A Modern Read-Write-Optimized Concurrent
+  Larger-Than-Memory Range Index**, Hao and Chandramouli, PVLDB 2024.
+  URL: `https://www.vldb.org/pvldb/vol17/p3442-hao.pdf`
+  Why: variable-length mini-pages decouple cached hot records and update
+  buffers from disk pages; relevant to GPU DB cold-partition index pages and
+  host/NVMe cache granularity.
+- `queued` — **Query Fresh: Log Shipping on Steroids**, Wang, Johnson, and
+  Pandis, PVLDB 2017.
+  URL: `https://www.vldb.org/pvldb/vol11/p406-wang.pdf`
+  Why: DANA cites RDMA log shipping as an alternative low-latency WAL path;
+  useful for comparing local persistent-log buffers, remote durable logging,
+  and WAL-before-visibility tradeoffs.
 - `reviewed` — **Low-Latency Transaction Scheduling via Userspace Interrupts:
   Why Wait or Yield When You Can Preempt?**, Huang et al.,
   PACMMOD/SIGMOD 2025.

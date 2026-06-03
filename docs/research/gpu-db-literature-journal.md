@@ -14461,3 +14461,193 @@ throughput.
   invalidated resident segments remain on the route-choice hot path under
   long scans. Failure condition: route planning or fresh lookup latency
   grows with old retained generations unrelated to the query scope.
+
+### 2026-06-03 - DANA directly attached NVMe arrays
+
+**Citation:** Gabriel Haas, Michael Haubenschild, and Viktor Leis.
+"Exploiting Directly-Attached NVMe Arrays in DBMS." CIDR 2020.
+Retrieved 2026-06-03 from the CIDR PDF,
+`https://www.cidrdb.org/cidr2020/papers/p16-haas-cidr20.pdf`.
+
+**Category:** multi-tier cache / data placement.
+
+**Relevance tags:** NVMe arrays; cold partitions; over-resident execution;
+asynchronous I/O; O_DIRECT; file-system overhead; SPDK; WAL flush latency;
+HTAP I/O interference; page size; RAID; storage admission.
+
+**Core idea:** The paper argues that an array of directly attached PCIe
+NVMe SSDs is not just a faster disk tier. With enough drives, aggregate
+bandwidth can approach DRAM-like scan bandwidth at much lower capacity
+cost, but only if the database and OS I/O path stop wasting CPU cycles and
+stop mixing latency-critical WAL or point reads with bulk scans through
+coarse, blocking interfaces.
+
+The authors study a DANA setup with four NVMe SSDs and an HTAP-shaped I/O
+workload: high-depth random scan reads, one-at-a-time point reads,
+rate-limited random background writes, and synchronous WAL writes. The
+main conclusion is a design warning: traditional buffered, blocking,
+file-system-mediated I/O leaves both throughput and tail latency on the
+floor. The useful path is explicit user-space buffering, asynchronous
+direct I/O, careful file-system or block-device selection, and a separate
+solution for WAL durability that keeps frequent `fdatasync` calls off the
+critical path.
+
+**Concrete mechanisms:**
+
+- The benchmark separates four database I/O classes: scan reads optimized
+  for throughput, point reads optimized for latency, WAL writes followed
+  by sync, and steady background writes. Running them together models an
+  HTAP storage tier rather than a pure scan benchmark.
+- The baseline mimics a traditional PostgreSQL-like stack: pread/pwrite,
+  OS buffering, ext4, software RAID 0, and frequent `fdatasync` for WAL.
+  In that setup, the WAL stream reaches only 6 MB/s with about 2.6 ms mean
+  flush latency, while scan and point-read performance also suffer.
+- Removing `fdatasync` from the simulated critical path raises the WAL
+  stream to the target 250 MB/s and improves other I/O classes. The paper
+  proposes a small persistent-memory or NVDIMM log tail as the durable
+  commit target, with asynchronous flash writeback after commit.
+- Switching from blocking calls to asynchronous I/O alone is not enough.
+  With OS buffering still enabled, io_uring does not materially reduce CPU
+  cost. The large CPU reduction comes from combining asynchronous I/O with
+  `O_DIRECT`, dropping CPU cost from multi-cycle-per-byte buffered paths to
+  roughly 1 cycle/byte in the reported table.
+- Removing the file system and accessing block devices directly improves
+  throughput and CPU use over ext4 in the main workload. Among tested file
+  systems, XFS is close to direct block-device performance, while Btrfs is
+  substantially worse for this workload.
+- Random-scan page size is a throughput/latency dial. Larger pages reduce
+  per-system-call CPU overhead and improve random scan throughput, with
+  64 KB pages reaching more than 11 GB/s in the read-only experiment, but
+  they increase latency compared with smaller pages.
+- RAID policy changes interference. RAID 0 has little overhead, RAID 10
+  doubles physical writes, RAID 5 adds read/write amplification for random
+  updates and increases CPU work, and the tested "hardware" RAID performs
+  worse than Linux software RAID for this setup.
+- SPDK is not a drop-in win. In the mixed fio workload, SPDK performs
+  similarly to the kernel direct path but burns more CPU because of polling.
+  In a read-only experiment, reducing polling frequency and using large
+  batches can cut CPU cost dramatically, but at the price of high per-request
+  latency.
+- Consumer SSD behavior is unstable under long mixed workloads. SLC cache
+  exhaustion and flash garbage collection can cause sudden scan-throughput
+  drops and large point-read tail-latency increases. Enterprise SSDs in the
+  appendix have more stable behavior, largely due to better flush behavior
+  and over-provisioning.
+- In a TPC-C comparison, PostgreSQL remains CPU-bound and cannot exploit
+  DANA bandwidth, while LeanStore, using O_DIRECT, asynchronous I/O, and no
+  critical-path fsync, is much faster in both memory-fit and out-of-memory
+  configurations.
+
+**GPU DB mapping:** DANA is a strong fit for the P8 over-resident question:
+once data exceeds GPU memory, the cold tier cannot be treated as a passive
+file store. GPU DB should model NVMe arrays as an active tier with its own
+queue depth, page-size, CPU-cycle, thermal, GC, and flush-latency budgets.
+The route planner should decide not only "resident GPU versus CPU" but also
+"GPU resident, GPU cold-transfer, CPU direct-I/O scan, CPU point lookup, or
+reject/defer because the storage queue is saturated."
+
+The four I/O classes map directly to owner-domain queues. WAL flushes,
+resident refresh reads, cold partition scans, point lookups, and background
+checkpoint/archive writes should not share one opaque file-system path with
+no admission telemetry. A future storage owner should expose per-class queue
+depth, issued bytes, completion latency, CPU cycles per byte where available,
+and interference caused by WAL syncs or background writes.
+
+The WAL result is particularly relevant to write throughput. GPU DB must not
+weaken WAL-before-visibility, but it should avoid one synchronous flash flush
+per logical commit if that becomes the copy-admission limiter. The safe
+transferable idea is a durable low-latency log-front, such as PMem/NVDIMM or
+a future replicated durable log, followed by asynchronous NVMe consolidation.
+Until such hardware exists, benchmarks should explicitly measure
+`fdatasync`/flush latency and group commit effects instead of hiding them.
+
+For over-resident GPU execution, the page-size tradeoff becomes a segment
+granularity tradeoff. Large cold-partition chunks improve NVMe throughput and
+reduce CPU overhead, but increase latency and overfetch for point reads.
+GPU DB should probably use different physical granularities for cold scans,
+resident refresh, point lookup fallback, and WAL/checkpoint streams instead
+of one universal page size.
+
+The SPDK result is also a caution for GPU direct-storage ambitions. Kernel
+bypass and polling can reduce CPU overhead only when the runtime can batch
+large numbers of I/O completions without harming latency-sensitive work. That
+matches the existing runtime target: storage/GPU workers need classed queues,
+batch-drain limits, and latency ceilings, not a single always-polling
+fast path.
+
+**Risks and mismatches:** The paper is an I/O systems study, not a full
+database storage design. Its workload uses fio and synthetic I/O classes,
+so it does not model SQL planning, MVCC visibility checks, WAL replay,
+GPU transfers, compression, or result materialization. The main hardware is
+2019-era PCIe 3 consumer SSDs; modern PCIe 4/5 drives, enterprise devices,
+CXL memory, and GPUDirect Storage change the exact numbers. The CIDR paper
+focuses more on scan-oriented OLAP and HTAP than pure high-contention OLTP,
+so GPU DB should transfer the queue and tiering mechanics rather than treat
+NVMe as a substitute for resident OLTP memory.
+
+Direct block-device access and SPDK also increase operational complexity:
+space management, checksums, crash recovery, allocator metadata, and device
+failure handling move into the database. For the current GPU DB, XFS plus
+`O_DIRECT`/async I/O may be a better first experimental boundary than a full
+block-device or SPDK rewrite. Persistent-memory WAL buffering is only a
+future-tier hypothesis unless the hardware is actually present.
+
+**Benchmark candidates:**
+
+- Add a cold-tier I/O classification benchmark with four lanes: resident
+  refresh scan, cold point lookup, checkpoint/background write, and WAL flush.
+  Gate: report per-lane throughput, p50/p99 latency, queue depth, and
+  interference under mixed load.
+- Test page or segment granularity for cold partitions: 4 KB, 16 KB, 64 KB,
+  and 256 KB reads for random scans and point fallback. Expected result:
+  larger chunks improve scan throughput but hurt p99 point latency and
+  overfetch.
+- Add an explicit `fdatasync`/WAL flush phase profile to COPY admission and
+  group-commit experiments. Failure condition: rows/sec claims omit the
+  durable flush boundary needed for WAL-before-visibility.
+- Prototype an async direct-I/O cold scan harness before any GPU direct
+  storage work. Compare buffered file I/O, XFS `O_DIRECT`, and direct block
+  access only if available. Minimum proof: no correctness change, stable
+  cleanup, and truthful fallback if direct I/O is unsupported.
+- For over-resident P8, add planner telemetry that distinguishes
+  `gpu_resident`, `gpu_cold_transfer`, `cpu_direct_io`, `cpu_buffered`, and
+  `storage_overload_reject` route reasons.
+- Run a long-duration cold-tier stability smoke on the target SSD class:
+  mixed scan/write/flush load for enough time to expose SLC cache exhaustion,
+  device GC, or thermal throttling. Gate: route policy records degraded-tier
+  state instead of silently treating old peak bandwidth as current capacity.
+- Compare a future storage-worker polling path against sleep/batch policies:
+  always-poll, timed sleep, queue-depth-triggered wakeup, and latency-ceiling
+  wakeup. Measure CPU cycles, batch size, p99 point read, and scan bandwidth.
+
+### 2026-06-03 - Cross-paper synthesis: scoped fronts must include storage
+
+HybridGC, Natto, and DANA converge on the same architectural shape from
+three different angles. Long MVCC readers need scoped snapshot fronts so they
+do not pin unrelated cleanup. Prioritized transactions need conditional
+fronts so expensive work can prepare without publishing unsafe visibility.
+NVMe arrays need storage fronts so WAL, cold scans, point reads, and
+background writes do not interfere invisibly behind one file-system queue.
+
+For GPU DB, this suggests a single design track: every expensive path should
+name the frontier it is waiting on and the resource class it is consuming.
+Examples are WAL durable generation, visibility generation, resident segment
+generation, snapshot lease scope, storage queue class, GPU stream class, and
+response-buffer ownership. The useful planner/admission question becomes:
+"which front is limiting this request, and can a narrower or safer front let
+another class proceed?"
+
+The category gap after this batch is still cold-tier and optimizer coupling.
+The next tiering papers should focus on how to choose local DRAM, remote/CXL
+memory, NVMe, and resident GPU memory per workload. The next optimizer papers
+should tie robust route choice to those resource fronts rather than only to
+cardinality error.
+
+**Benchmark priorities:**
+
+- scoped snapshot leases plus group-generation GC under long retained scans
+- priority-aware mutation/refresh descriptors with starvation protection
+- mixed cold-tier I/O lane profiling before over-resident GPU direct-storage
+  claims
+- planner route reasons that name the limiting front, not just the chosen
+  device
