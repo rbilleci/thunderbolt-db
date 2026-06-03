@@ -5507,3 +5507,189 @@ coverage, but it has not yet reviewed a paper that turns live execution
 feedback, skew, cache placement, and operator choice into a single
 route decision for heterogeneous CPU/GPU/tiered systems. That should
 shape one of the next queue selections.
+
+### 2026-06-03 - Mordred semantic CPU/GPU placement
+
+**Citation:** Bobbi W. Yogatama, Weiwei Gong, and Xiangyao Yu.
+"Orchestrating Data Placement and Query Execution in Heterogeneous
+CPU-GPU DBMS." PVLDB 15(11), 2022, pp. 2491-2503.
+doi:10.14778/3551793.3551809. Retrieved 2026-06-03 from
+`https://www.vldb.org/pvldb/vol15/p2491-yogatama.pdf`.
+
+**Category:** query optimization / planning, multi-tier cache / data
+placement, and GPU execution / analytics.
+
+**Relevance tags:** CPU/GPU route choice; semantic cache admission;
+fine-grained placement; segment-level plans; correlated segment
+scoring; late materialization; PCIe avoidance; segment skipping;
+preallocated scratch regions; over-resident execution.
+
+**Core idea:** Mordred treats limited GPU memory as a coupled
+placement and execution problem rather than only a cache-size problem.
+The complete database remains in CPU memory, while GPU memory holds a
+subset of raw data segments. Instead of caching whole columns by LRU or
+LFU, Mordred scores sub-column segments by the estimated runtime
+benefit of placing that segment and its correlated companions on the
+GPU for the current workload.
+
+The second half of the design is that the executor can use partial
+placement. A query plan is converted into segment-level subplans, so
+one part of a column or operator may run on the GPU while another part
+runs on CPU. This avoids the all-or-nothing behavior of GPU-primary or
+coprocessor designs that either require all needed input in HBM or
+stream uncached data across PCIe on demand.
+
+**Concrete mechanisms:**
+
+- The cache unit is a fixed-size sub-column segment. Mordred makes the
+  segment size user-defined and uses 1,048,576 records, or 2^20
+  records, as the default.
+- Mordred extends LFU with weighted frequency counters. For a segment
+  access, it estimates query runtime without the segment cached and
+  with the segment plus correlated segments cached; the counter
+  increment is the estimated runtime saved.
+- Correlated segments are operator-specific. Selection correlation
+  covers segments involved in an inseparable predicate over the same
+  rows. Hash join correlation requires the build column to be completely
+  cached and distributes benefit from probe segments to the build
+  segments. Group-by correlation connects aggregation and grouping
+  segments, including cross-table correlation after joins.
+- The cost model is lightweight and bandwidth-oriented. It estimates
+  filter, join probe, PCIe transfer, materialization, and merge costs
+  from memory traffic and selectivity, borrowing Crystal's assumption
+  that simple CPU/GPU operators saturate memory bandwidth.
+- Operator placement is data-driven at segment granularity. An operator
+  runs on GPU for the segment groups whose required inputs are resident;
+  other segment groups run on CPU. Filter, join probe, and group-by can
+  be split across devices.
+- Segment grouping merges adjacent or compatible segments with the same
+  physical plan so execution does not launch one tiny kernel per
+  segment. In the SSB experiments, segment grouping speeds query
+  execution by up to 3x. Grouping and final merge are not reported as
+  dominant bottlenecks: for one small-cache case the paper reports
+  0.3% grouping, 99.2% execution, and 0.5% merging; for a large-cache
+  case it reports 4% grouping, 93.6% execution, and 2.4% merging.
+- Late materialization transfers row-id pairs or ordinals across PCIe
+  instead of full intermediate tuples. The receiving side reconstructs
+  needed columns locally, allowing a GPU join to run with only join keys
+  resident while projected columns are materialized later on CPU.
+- Operator pipelining fuses consecutive operators on the same device so
+  intermediate results are not repeatedly written to and reread from
+  memory. On GPU this builds on Crystal's tile-based execution.
+- Segment skipping stores min/max metadata per segment and skips entire
+  segments when predicates cannot match. Mordred extends this to joins
+  by using min/max values from the build-side hash table to prune probe
+  segments.
+- The cache manager divides GPU memory into a raw-data caching region
+  and a data-processing region for hash tables and intermediate results.
+  The processing region is preallocated; per-query allocation advances a
+  pointer and resets it after query completion. CPU scratch allocation
+  uses the same pattern.
+- CPU metadata tracks segment min/max values, weighted counters,
+  location bitmaps, GPU offsets, and free segment slots. The query
+  optimizer consumes this placement metadata to form segment-level
+  plans and reorder operators to avoid CPU/GPU ping-pong.
+- Evaluation uses SSB scale factor 40 for the fit-in-GPU case and scale
+  factor 160 for the larger-than-GPU-memory case on an NVIDIA V100 over
+  PCIe3. The paper reports semantic-aware caching outperforming the best
+  traditional cache policy by 3x, and reports larger end-to-end speedups
+  against several prior CPU/GPU DBMS baselines in its SSB comparisons.
+
+**GPU DB mapping:** The strongest transferable idea is that route
+admission should score the whole executable shape, not just resident
+bytes or object frequency. For GPU DB, a retained route descriptor can
+name the snapshot generation, required column groups, companion keys or
+partitions, operator family, expected output width, and movement cost.
+Placement counters should increase by estimated request-latency saved
+only when enough correlated components are present to shorten the
+critical path.
+
+Mordred's correlated-segment scoring maps to P8 resident column groups.
+A retained lookup or aggregate often needs a key vector, predicate
+column, projected columns, visibility metadata, and response shape. GPU
+DB should avoid admitting only the hot key vector if missing projected
+columns force owner-thread or CPU fallback. Conversely, when row-id or
+ordinal late materialization is safe, the GPU route may need only keys
+and predicates resident, with projected values assembled later from CPU
+or host-tier state.
+
+Segment-level plans map to partition-aware retained routing. The engine
+already has partition-valid retained paths for simple aggregate and
+lookup shapes. The next planner contract can choose per partition:
+execute resident GPU, execute CPU, transfer cold segment, or skip. A
+single SQL request can then merge per-partition results deterministically
+without pretending that the entire table has one residency state.
+
+The paper also reinforces an explicit tier-boundary optimizer. PCIe
+traffic, HBM traffic, CPU memory traffic, merge cost, and queue wait
+should be planner-visible. As future tiers appear, the same score can
+generalize from CPU/GPU to GPU HBM, pinned host DRAM, CPU DRAM, CXL-like
+remote memory, NVMe, and GPUDirect paths. The planner should change
+behavior when interconnect economics change rather than baking in a
+single "GPU if resident" rule.
+
+Preallocated scratch regions fit the high-throughput runtime target.
+GPU execution owners should own scratch arenas, pinned staging buffers,
+and per-stream allocation cursors, then reset them at route or batch
+boundaries. That preserves low allocation overhead while keeping
+correctness metadata outside scratch state.
+
+**Risks and mismatches:** Mordred is an analytical engine, not an OLTP
+or MVCC storage engine. It does not address WAL-before-visibility,
+transaction validation, snapshot publication, long-reader retention,
+write invalidation, recovery, or 1M logical sessions. Its cache
+replacement policy assumes the full database is already in CPU memory
+and that GPU memory is an acceleration cache for analytical scans and
+joins.
+
+The cost model is intentionally lightweight and bandwidth-oriented. It
+may not predict latency-sensitive point lookups, queueing delay,
+contention, snapshot-reference retention, or response encoding. GPU DB
+should use it as a starting feature set for route scoring, not as a
+complete optimizer.
+
+Fine-grained segment plans introduce merge and coordination costs. The
+paper reports these as small in its SSB setup, but GPU DB's small
+request batches and session-heavy workload may make plan splitting
+overhead visible at p50/p99. Any implementation must include a negative
+control where uniform resident point lookups bypass split-plan
+machinery.
+
+**Benchmark candidates:**
+
+- Add a `route_value_score` experiment for retained planning. Compare
+  object-frequency admission, byte-frequency admission, and
+  semantic/request-shape admission where the score is estimated latency
+  saved if all required companions are resident. Minimum gate: higher
+  score improves p95/p99 request latency, not just resident byte hit
+  rate.
+- Build a mixed-residency partition query benchmark: some partitions are
+  valid GPU resident, some CPU-only, and some skippable by min/max.
+  Compare all-CPU, transfer-to-GPU, and segment-level CPU/GPU execution
+  with deterministic merge. Failure condition: partial placement
+  produces stale reads or hides fallback reason.
+- Prototype ordinal late materialization for retained filters. GPU
+  kernels return row ordinals and aggregate/group intermediates; CPU or
+  host-tier code materializes wide/text projections only for survivors.
+  Required measurements: HBM bytes, PCIe/D2H bytes, CPU materialization
+  time, response bytes, and null/empty correctness.
+- Add correlated-component telemetry to residency: required components,
+  missing companions, partial-route hit, full-route hit, and reason why a
+  resident component could not shorten the request. This should be
+  reported per route template and partition.
+- Test segment skipping as a first-class route decision for retained
+  partition metadata. Proof gate: min/max pruning reduces CPU/GPU bytes
+  and p99 without changing SQL results across inclusive range,
+  no-match, and invalidated-partition cases.
+- Add preallocated scratch arenas to a GPU execution-owner prototype and
+  compare against per-request allocation. Minimum gate: allocation
+  timing disappears from hot retained paths while scratch exhaustion
+  yields explicit overload rather than undefined reuse.
+- Create a sensitivity benchmark for interconnect economics: replay the
+  same route decisions with measured PCIe bandwidth and simulated
+  NVLink/CXL/GPUDirect bandwidth. The planner should explain when the
+  best route changes from CPU, to partial CPU/GPU, to resident GPU.
+- Negative control: uniform resident point lookups with all required
+  components present. Any semantic-placement or split-plan machinery
+  must either be bypassed or stay under a small microsecond latency
+  overhead threshold.

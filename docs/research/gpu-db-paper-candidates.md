@@ -262,7 +262,7 @@ Append new candidates here as each paper is processed.
   URL: `https://www.cidrdb.org/cidr2024/papers/p22-yang.pdf`
   Why: modern predicate-transfer/pre-filtering work cited by the 2025 hybrid
   CPU-GPU paper; relevant to reducing over-resident transfer before GPU joins.
-- `queued` — **Orchestrating data placement and query execution in
+- `reviewed` — **Orchestrating data placement and query execution in
   heterogeneous CPU-GPU DBMS**, Yogatama et al., PVLDB 2022.
   URL: `https://www.vldb.org/pvldb/vol15/p2491-yogatama.pdf`
   Why: cost-based CPU/GPU placement and execution orchestration for
@@ -670,3 +670,16 @@ Append new candidates here as each paper is processed.
   Why: DeToX's predictive caching baseline; useful for comparing dependency
   prefetching and adaptive query-result caching against transaction-hit-rate
   placement for retained GPU snapshots.
+- `queued` — **HetExchange: Encapsulating Heterogeneous CPU-GPU Parallelism in
+  JIT Compiled Engines**, Chrysogelos et al., PVLDB 2019.
+  URL: `https://www.vldb.org/pvldb/vol12/p544-chrysogelos.pdf`
+  Why: Mordred contrasts its segment-level placement with HetExchange's
+  heterogeneous exchange operator; useful for deciding whether GPU DB should
+  express CPU/GPU split execution as planner operators, runtime route groups,
+  or both.
+- `queued` — **Pump Up the Volume: Processing Large Data on GPUs with Fast
+  Interconnects**, Lutz et al., SIGMOD 2020.
+  URL: `https://doi.org/10.1145/3318464.3389705`
+  Why: Mordred notes that interconnect bandwidth changes CPU/GPU placement
+  economics; this multi-GPU/NVLink-oriented follow-up is relevant to future
+  NVLink/CXL/GPUDirect tiers and over-resident execution.
