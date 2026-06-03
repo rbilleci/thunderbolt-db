@@ -22264,3 +22264,187 @@ transaction abort rate, response-byte backlog, or GPU batch efficiency.
   predicate rejected or paced this work." This is the proof that a smart
   bounded queue is intentionally protecting latency rather than silently
   overflowing later.
+
+### 2026-06-03 - ActivePointers software address translation on GPUs
+
+**Citation:** Sagi Shahar, Shai Bergman, and Mark Silberstein.
+"ActivePointers: A Case for Software Address Translation on GPUs." ISCA
+2016, pp. 596-608. doi:10.1109/ISCA.2016.21. Retrieved 2026-06-03 from
+the author PDF, `https://shai.pub/assets/pdf/activepointers.pdf`.
+
+**Category:** multi-tier cache / data placement and GPU execution /
+over-resident I/O.
+
+**Relevance tags:** GPU virtual memory; memory-mapped files; page cache;
+software address translation; GPU-side page faults; over-resident execution;
+GPUfs; tier placement; page-fault batching; preemption risk.
+
+**Core idea:** ActivePointers implements a GPU-side software translation and
+paging layer that lets GPU kernels access memory-mapped files through pointer-
+like objects. Instead of routing every page fault and mapping update through a
+CPU driver path, the paper explores a GPU-centric design: GPU code detects
+the fault, updates a GPU-resident I/O page table, and uses GPUfs to move file
+pages into a GPU page cache.
+
+The strongest transferable lesson is not that database kernels should use
+pointer-like mmap directly. It is that over-resident GPU execution needs an
+explicit page-cache and address-translation contract: cached pages must have
+stable mappings while active, page faults must aggregate work across warps,
+and the common fault-free path must fit inside the GPU's latency-hiding budget.
+The paper's 40GB image-collage workload maps a dataset much larger than the
+2GB GPUfs page cache and reports no measurable end-to-end overhead versus the
+GPUfs-only implementation, while the raw translation layer still shows
+important per-access costs.
+
+**Concrete mechanisms:**
+
+- ActivePointers creates an "active virtual" address space above GPU hardware
+  virtual memory. File or backing-store pages are cached in GPU memory and
+  tracked by a GPU page table.
+- An active pointer can be uninitialized, unlinked, or linked. A linked
+  pointer stores a valid active-virtual to active-physical mapping; an
+  unlinked pointer stores an external address and may fault on dereference.
+- Mappings are fixed while a page is active. The paging layer may not evict a
+  page with positive active references, so threads can safely cache mappings
+  in registers without a general TLB shootdown protocol.
+- Page reference counts are maintained by pointer state transitions. First
+  access links the pointer and increments the active-page count; pointer
+  arithmetic across a page or assignment can unlink it and release the
+  reference.
+- Warp-level translation aggregation handles page faults deadlock-free. Threads
+  accessing the same faulting page choose a leader; the leader touches shared
+  page-table/cache state, while the reference count is aggregated for the
+  subgroup.
+- The 64-bit translation field carries the valid bit, permission bits, and
+  either the active-physical address or external backing-store address. Fault-
+  free access is optimized so the mapping can live in a hardware register.
+- The authors considered a per-threadblock software TLB but found the TLB-less
+  design best in their experiments because TLB updates, nonzero reference
+  counts, global pointers, and conflict handling complicated correctness and
+  added overhead.
+- GPUfs integration required a more concurrent page table and small-page
+  support. The paper uses a hash table for all files in the GPU page cache,
+  fine-grained bucket locking for inserts, lock-free reads, and batched host-
+  to-GPU transfers for 4KB pages.
+- Fault-free microbenchmarks show the cost shape: 8-byte memory copies reached
+  97.6% of the measured `cudaMemcpyDeviceToDevice` bandwidth, while 4-byte
+  copies reached 65.4%; compute-intensive kernels hide more translation work.
+- With prefetched pages and GPUfs, minor-fault workloads showed around 16%
+  average overhead at full GPU utilization for 4-byte accesses, dropping to
+  about 9% with 16-byte loads. Major-fault overhead was mostly hidden by host-
+  to-GPU transfer cost.
+- The end-to-end image-collage application mapped a 38.14GB histogram file
+  with a 2GB GPU page cache. ActivePointers added no measurable overhead over
+  the fastest GPUfs implementation and avoided special handling for unaligned
+  3KB records crossing page boundaries.
+
+**GPU DB mapping:** For GPU DB, ActivePointers argues for explicit resident
+and over-resident page states rather than hidden unified-memory magic. A P8
+resident segment or future cold-tier page should have a stable handle while a
+kernel or retained snapshot is active, plus a reference or lease that prevents
+eviction until the GPU execution owner releases it. That fits the existing
+immutable read-snapshot rule in `11-high-throughput-query-runtime.md`: old
+snapshots may finish, but new refresh, eviction, or invalidation must publish a
+new generation instead of mutating active mappings in place.
+
+The warp-level aggregation mechanism maps to over-resident misses and segment
+promotion. If many GPU lanes miss the same partition, column tile, or cold
+page, the runtime should aggregate that miss once, not launch 32 independent
+CPU/NVMe fetches or page-table updates. A GPU DB route descriptor can expose
+the page/tile id, snapshot generation, column family, and request id so
+fault/promotion work coalesces naturally.
+
+The TLB-less result is a useful warning for hot database kernels. A generic
+GPU software TLB or pointer wrapper can cost too much for 4-byte column
+accesses. Retained GPU routes should prefer dense, direct device pointers for
+hot resident columns. Translation or page-cache indirection belongs at segment
+or tile boundaries, not inside every tuple predicate, unless benchmarks prove
+that occupancy and vectorized loads hide the overhead.
+
+The GPUfs page-cache changes map to future tiering: a GPU DB cold-tier manager
+needs a highly concurrent page/tile directory, batched transfers for small
+pages, and telemetry that separates minor hits, major misses, host transfer
+time, page-table/directory update time, and GPU idle time. Current P8 resident
+snapshots are rebuildable acceleration state; a future over-resident layer
+should preserve that property while adding explicit page-cache ownership.
+
+The paper also exposes a preemption risk. Major page faults can stall warps
+while storage or host memory work completes. For mixed GPU DB workloads, long
+over-resident misses must not strand SM resources needed by short retained
+lookups. Admission should either keep over-resident miss-heavy work on
+separate streams/lane budgets or reject/fallback when miss pressure would
+harm latency-critical routes.
+
+**Risks and mismatches:** ActivePointers is a GPU systems paper, not a DBMS.
+It does not solve SQL planning, MVCC visibility, WAL-before-visibility,
+snapshot invalidation, transaction ordering, or pgwire response behavior. The
+implementation targets NVIDIA Kepler-era CUDA/GPUfs, RAMfs as backing storage
+in the end-to-end experiment, and file/image workloads rather than relational
+operators.
+
+The programming abstraction may be too fine-grained for columnar database
+kernels. Per-access pointer checks and page-boundary logic can damage simple
+4-byte scans, exactly the access shape common in integer predicates and
+aggregates. Active-page reference counting also pins pages; without a strict
+budget it could prevent eviction under long GPU scans. Finally, GPU-side page
+fault handling is attractive only when the device can make progress without
+burning critical compute capacity or violating snapshot visibility.
+
+**Benchmark candidates:**
+
+- Build an over-resident page/tile directory proof for one `int4` column:
+  fixed handles while active, reference counts or leases, explicit minor-hit
+  versus major-miss telemetry, and deterministic release after kernel
+  completion. Gate: identical results to CPU execution at one MVCC boundary.
+- Compare three access styles for a partitioned aggregate: direct resident
+  pointer, tile-directory lookup once per tile, and per-element translation
+  wrapper. Measure kernel time, achieved bandwidth, register pressure if
+  available, and p50/p99 latency. Failure condition: indirection in the inner
+  predicate loop costs more than saved transfer or cache reuse.
+- Add miss aggregation for over-resident cold partitions: concurrent requests
+  for the same page/tile should create one fetch/promote operation and fan out
+  completions by request id. Gate: no duplicate fetches under same-tile
+  concurrency and explicit coalescing telemetry.
+- Separate retained and over-resident GPU lane budgets. Run a synthetic mix of
+  short resident lookups and miss-heavy over-resident scans; failure condition:
+  major misses in the scan lane increase retained lookup p99 beyond the
+  configured latency budget.
+- Test transfer batching granularity for cold tiles: 4KB, 16KB, 64KB, and
+  column-segment chunks. Required metrics: H2D bytes, miss service time,
+  useful bytes consumed by the query, GPU idle time, and cache pollution.
+- Add a long-snapshot eviction test: hold a retained or over-resident snapshot
+  open while memory pressure attempts eviction. Gate: active pages are not
+  reused early, new readers choose a newer/fallback generation, and telemetry
+  names pinned bytes by snapshot generation.
+
+### 2026-06-03 - Cross-paper synthesis: simple queues need stable memory contracts
+
+Mind the Gap, AIFO, and ActivePointers converge on one design track: bounded
+queues are only useful when the work they admit has stable ownership and clear
+resource consequences. Mind the Gap says ingress should see executor pressure
+before steering requests. AIFO says a single shallow queue can approximate
+complex scheduling if admission ranks are cheap and local. ActivePointers says
+GPU-side data access must pin or lease page mappings while work is active, and
+that per-access indirection has a real cost.
+
+For GPU DB, the next runtime/tiering hypothesis is a route descriptor that
+names both scheduling rank and memory contract: route class, snapshot
+generation, owner lane, response budget, GPU stream budget, expected bytes,
+resident or cold tile ids, and whether the route may fault/promote data. A
+read lane can then admit short retained lookups ahead of long scans, while the
+memory tier can refuse to evict active tiles and the response path can preserve
+per-session order.
+
+The category gap remains transaction write-path evidence under these same
+contracts. Recent work has covered request steering, admission, scheduling,
+GPU tiering, and response queues; the loop should soon return to mutation,
+MVCC visibility, logging, or HTAP refresh papers so the runtime design does
+not become read-only.
+
+Benchmark priority: a mixed retained/over-resident admission harness that
+reports, per request, queue decision, route rank, snapshot generation, memory
+lease bytes, minor/major miss status, response bytes, and fallback reason. The
+first pass can be synthetic and should not run GPU benchmarks in this cron
+loop; the implementation target later is to prove that short retained reads
+stay low-latency while cold-tier misses and large responses are bounded rather
+than merely queued.

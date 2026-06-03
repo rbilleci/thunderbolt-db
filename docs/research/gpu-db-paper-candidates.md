@@ -968,7 +968,7 @@ Append new candidates here as each paper is processed.
   Why: BaM contrasts against DRAGON's UVM/page-fault path; useful for comparing
   transparent GPU page-fault extension against explicit GPU-initiated queues
   and cache-line admission.
-- `queued` — **ActivePointers: A Case for Software Address Translation on
+- `reviewed` — **ActivePointers: A Case for Software Address Translation on
   GPUs**, Shahar, Bergman, and Silberstein, ISCA 2016.
   URL: `https://doi.org/10.1109/ISCA.2016.21`
   Why: DRAGON contrasts against software GPU address translation; useful as a
@@ -1897,3 +1897,21 @@ Append new candidates here as each paper is processed.
   Why: Mind the Gap cites OS/network co-design where packets should arrive
   just in time for processing; relevant to GPU DB response-ring and ingress
   pacing when queue saturation should slow admission before p99 latency spikes.
+- `queued` — **Supporting data-driven I/O on GPUs using GPUfs**, Shahar and
+  Silberstein, SYSTOR 2016.
+  URL: `https://doi.org/10.1145/2928275.2928282`
+  Why: ActivePointers integrates with a revised GPUfs page cache; this
+  companion source should expose the lower-level GPU file-system batching and
+  page-cache mechanisms behind data-driven GPU I/O.
+- `queued` — **GPUpIO: The Case for I/O-Driven Preemption on GPUs**, Zeno,
+  Mendelson, and Silberstein, GPGPU 2016.
+  URL: `https://doi.org/10.1145/2884045.2884051`
+  Why: ActivePointers identifies long major page faults as a GPU preemption
+  problem; this follow-up is relevant to preventing storage faults or
+  over-resident misses from wasting SM resources and hurting short GPU queries.
+- `queued` — **Page Placement Strategies for GPUs within Heterogeneous Memory
+  Systems**, Agarwal et al., ASPLOS 2015.
+  URL: `https://doi.org/10.1145/2694344.2694381`
+  Why: ActivePointers cites GPU page-placement work as nearby hardware memory
+  management; useful for comparing explicit DB-owned placement with
+  hardware/runtime page placement across GPU, host, and future memory tiers.
