@@ -7639,3 +7639,175 @@ absolute throughput numbers.
   improvement: lower WAL bytes and faster recovery for deterministic replay;
   rejection condition: a chunk depends on nondeterministic SQL, external
   state, volatile functions, or catalog state not captured in the command.
+
+### 2026-06-03 - Bounded-delay multiversion concurrency and precise GC
+
+**Citation:** Naama Ben-David, Guy E. Blelloch, Yihan Sun, and Yuanhao
+Wei. "Multiversion Concurrency with Bounded Delay and Precise Garbage
+Collection." SPAA 2019, pp. 161-172. doi:10.1145/3323165.3323185.
+Retrieved 2026-06-03 from
+`https://www.cs.cmu.edu/~yihans/papers/concurrency.pdf`.
+
+**Category:** MVCC / snapshots / version reclamation.
+
+**Relevance tags:** bounded-delay readers; precise garbage collection;
+functional data structures; path copying; version maintenance; wait-free
+snapshot acquire; read-mostly workloads; batched writes; long snapshots;
+retained snapshot retirement; memory pressure.
+
+**Core idea:** The paper shows that multiversioning can provide constant
+extra delay for read-only transactions while reclaiming old versions as soon
+as the last holder releases them, if the database state is represented by
+persistent functional data structures and version roots are managed by a
+precise version-maintenance object. The key shift is away from per-object
+version chains. A reader acquires one current root pointer, runs ordinary
+read-only code over immutable data, then releases the root. Reads do not scan
+version lists and do not block writers. A single non-conflicting writer has
+delay proportional to the number of processes, while concurrent writers are
+lock-free but may abort each other.
+
+The paper's PSWF version-maintenance algorithm supports `acquire`, `set`, and
+`release`. `acquire` returns the current version in O(1) delay. `set` attempts
+to publish a new root and can fail if another writer published after the
+writer's acquire. `release` returns exactly the version that became dead, if
+this process was the last holder. The authors define this as precise GC: old
+reachable state is kept only while it is current or held by an active
+transaction. In experiments on a functional balanced-tree map with 140 query
+threads and one update thread, PSWF used much less version memory than epoch
+or hazard-pointer baselines while keeping comparable query throughput and
+better update throughput than the other non-blocking reclamation choices. The
+paper reports 60%-90% lower average version memory than epoch/hazard-pointer
+implementations, and batched functional-tree updates outperforming tested
+concurrent tree baselines by more than 20% on mixed YCSB workloads, with the
+important caveat that batching raises update latency.
+
+**Concrete mechanisms:**
+
+- Database state is modeled as immutable memory graphs rooted by a version
+  pointer. Updates create a new version by path copying from the old root.
+- A transaction acquires exactly one root version. Read-only transactions run
+  user code over that immutable root and are considered responsive before
+  release-time cleanup completes.
+- The Version Maintenance object exposes `acquire(k)`, `set(k, data*)`, and
+  `release(k)` for process id `k`, with at most one acquired version per
+  process.
+- A version is live if it is the current version or if some process acquired
+  it and has not released it.
+- Precise release returns a dead version exactly when the releasing process is
+  the last holder; no version is returned twice.
+- PSWF is wait-free for version-maintenance operations, with O(1) acquire and
+  O(P) set/release delay for P processes.
+- A successful writer publishes a new root with `set`; if another writer has
+  already published since this writer's acquire, the `set` can fail and the
+  new root must be collected, retried, or aborted.
+- Garbage collection after release traces from released roots and can reclaim
+  memory in work linear in the amount of garbage collected.
+- Batched updates are implemented by accumulating update requests and applying
+  them to a functional tree with a parallel multi-insert, giving single-writer
+  publication but parallel update construction.
+- The evaluation uses a large ordered-map workload and YCSB-style read/update
+  mixes. It compares PSWF against epoch, hazard-pointer, RCU, and related VM
+  variants, but it is not a SQL engine evaluation.
+
+**GPU DB mapping:** The strongest mapping is to retained read snapshot
+publication and retirement. GPU DB's first P8 slice already treats resident
+GPU state as immutable acceleration tied to a WAL/visibility boundary. This
+paper suggests making snapshot acquisition a deliberately tiny operation:
+read workers should grab a generation/root handle, execute against immutable
+metadata and buffers, and release the handle without ever walking per-row
+version chains on the hot read path.
+
+For 1M logical sessions, the design lesson is to separate logical sessions
+from physical snapshot holders. A session should not pin a resident generation
+for its whole connection lifetime. It should acquire a snapshot for a single
+statement, portal batch, or bounded cursor quantum, then release it quickly so
+precise retirement can work. Long portals need an explicit budget and telemetry
+because they are the real memory retention event.
+
+The functional-data-structure requirement does not directly mean GPU DB should
+rewrite all CPU storage as persistent trees. It does mean resident metadata,
+planner route tables, visibility summaries, and segment manifests should be
+published by root replacement rather than mutated in place. A residency owner
+can build a new immutable manifest for table generation `G+1`, publish the
+root, and let readers on `G` drain. The retired root then drives precise
+cleanup of device buffers, pinned host buffers, and statistics blocks.
+
+For writes, the single-writer/batched-writer model fits partition owners and
+COPY admission better than arbitrary SQL updates. A partition owner can batch
+mutations, build a new CPU/GPU-friendly segment or delta root, and publish it
+after WAL-before-visibility is satisfied. Cross-partition or highly contended
+writes still need the transaction-scheduling and dependency-vector machinery
+from the recent SMF, Chiller, and Taurus reviews.
+
+The paper also gives a concrete warning against per-object version lists for
+read-heavy GPU routing. If a retained scan or lookup has to chase row-level
+version chains to prove visibility, the GPU route loses predictable latency.
+For hot resident routes, visibility should be encoded as coarse generation
+boundaries, compact begin/end arrays, or prefiltered snapshot manifests, with
+chain traversal kept on CPU fallback paths.
+
+**Risks and mismatches:** This is a theory-heavy SPAA paper with data-structure
+experiments, not a production DBMS paper. Its strongest bounds assume purely
+functional data structures, one acquired version per process, and a read-mostly
+or batched-write shape. SQL engines have secondary indexes, catalog state,
+variable-length rows, DDL, deletes, vacuum, write amplification, and crash
+recovery concerns that are outside the model. O(P) set/release is acceptable
+only if P is the physical worker count, not 1M logical sessions. Path copying
+can be expensive for wide row updates or large mutable indexes. Precise
+release also requires disciplined statement/cursor lifetimes; a single slow
+reader can still hold old buffers, even if it does not block writers.
+
+**Benchmark candidates:**
+
+- Implement a retained snapshot acquire/release microbenchmark over immutable
+  resident manifests. Gate: acquire cost is constant with respect to row count,
+  resident segment count, and historical generation count.
+- Add snapshot-holder telemetry: current generation, holder count, oldest held
+  generation age, bytes pinned by old generations, and release latency by
+  statement/cursor class.
+- Compare exact-generation retirement against epoch-style retirement for
+  resident buffers under a mixed workload with short statements and a small
+  number of long cursors. Measure retained bytes, eviction pressure, and p99
+  route latency.
+- Build a partition-owner publication proof: apply batched mutations to a new
+  immutable manifest, publish only after WAL-before-visibility, and retire the
+  prior manifest when holders release. Failure condition: a read can observe a
+  stale or partially updated manifest.
+- Stress logical session scale separately from physical snapshot holders:
+  simulate 1M idle sessions plus a bounded active-statement set and verify that
+  memory retention follows active holders, not connection count.
+- Add a negative-control resident route that must walk per-row version chains.
+  Compare it with a generation-manifest route to quantify the latency and GPU
+  divergence cost the design is trying to avoid.
+
+### 2026-06-03 - Cross-paper synthesis: roots, frontiers, and active holders
+
+The last batch spans networking/runtime admission (TAS), robust planner
+diagnostics (Hint-QPT), parallel WAL dependency frontiers (Taurus), and
+bounded-delay snapshot/version retirement (Ben-David et al.). The convergence
+is that the hot path should move small, explicit tokens rather than broad
+mutable state: queue tokens for network work, route-fragility facts for the
+planner, WAL dependency vectors for durability, and immutable root handles for
+snapshot visibility.
+
+The design track that now looks strongest is root-and-frontier publication.
+Mutation owners advance durable frontiers. Residency owners publish immutable
+roots tied to those frontiers. Read workers acquire short-lived root handles.
+Planner decisions name the route dimensions that would invalidate the choice.
+GPU execution then consumes only work whose root, frontier, and route facts are
+compatible.
+
+The main category gap is still practical HTAP snapshot policy: how to support
+fresh OLTP reads, retained analytical scans, and long cursors without letting
+old generations dominate GPU memory. The next useful papers should lean into
+production MVCC garbage collection, dual-snapshot HTAP, and contention-aware
+partitioning rather than another GPU-OLAP pipeline paper.
+
+Benchmark priorities from this batch:
+
+- Measure active snapshot holders, not sessions, as the memory-retention unit.
+- Add per-owner WAL/frontier telemetry before attempting multi-stream write
+  admission.
+- Make route fragility visible at the CPU/GPU/fallback boundary.
+- Prove that immutable resident roots retire precisely under long-reader
+  pressure before adding more resident route families.

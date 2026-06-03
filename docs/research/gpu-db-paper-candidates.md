@@ -562,7 +562,7 @@ Append new candidates here as each paper is processed.
   URL: `https://doi.org/10.1007/s00778-021-00702-4`
   Why: fixed-granularity work-sharing baseline for Themis; relevant to
   multi-join skew, GMEM redistribution cost, and adaptive batching thresholds.
-- `queued` — **Multiversion Concurrency with Bounded Delay and Precise
+- `reviewed` — **Multiversion Concurrency with Bounded Delay and Precise
   Garbage Collection**, Ben-David et al., SPAA 2019.
   URL: `https://doi.org/10.1145/3323165.3323185`
   PDF: `https://www.cs.cmu.edu/~yihans/papers/concurrency.pdf`
@@ -613,6 +613,13 @@ Append new candidates here as each paper is processed.
   Why: production HTAP MVCC garbage-collection design contrasted with Steam;
   useful for evaluating interval GC, long transaction handling, and practical
   memory-pressure policies.
+- `queued` — **Read-log-update: A Lightweight Synchronization Mechanism for
+  Concurrent Programming**, Matveev et al., SOSP 2015.
+  URL: `https://doi.org/10.1145/2815400.2815406`
+  Why: contrasted by bounded-delay MVCC as a two-version design where readers
+  avoid blocking but writers still wait for quiescence; useful as a practical
+  baseline for deciding when GPU DB can tolerate RCU/RLU-style grace periods
+  versus precise snapshot release.
 - `queued` — **Accelerating Hybrid Transactional/Analytical Processing Using
   Consistent Dual-Snapshot**, Li et al., DASFAA 2019.
   URL: `https://doi.org/10.1007/978-3-030-18576-3_41`
