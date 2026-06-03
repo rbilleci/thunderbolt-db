@@ -801,9 +801,9 @@ Append new candidates here as each paper is processed.
   Why: cloud database storage architecture with append-only storage,
   replication, recovery, and constant-time snapshots; relevant to future
   cloud/disaggregated durability and snapshot tiers.
-- `queued` — **Hybrid Garbage Collection for Multi-Version Concurrency Control
+- `reviewed` — **Hybrid Garbage Collection for Multi-Version Concurrency Control
   in SAP HANA**, Lee et al., SIGMOD 2016.
-  URL: `https://doi.org/10.1145/2882903.2915238`
+  URL: `https://doi.org/10.1145/2882903.2903734`
   Why: production HTAP MVCC garbage-collection design contrasted with Steam;
   useful for evaluating interval GC, long transaction handling, and practical
   memory-pressure policies.
@@ -1317,3 +1317,15 @@ Append new candidates here as each paper is processed.
   Why: ScaleRPC contrasts software resource sharing with kernel-level RDMA
   abstractions; LITE is a useful boundary paper for comparing application-owned
   connection/message pools against OS-mediated safety and registration control.
+- `queued` — **Practically and Theoretically Efficient Garbage Collection for
+  Multiversioning**, Sun et al., arXiv 2022.
+  URL: `https://arxiv.org/abs/2212.13557`
+  Why: modern MVGC follow-up with experimental and theoretical collector
+  variants; useful for comparing HybridGC-style production heuristics against
+  bounded collector costs for retained snapshots.
+- `queued` — **Space and Time Bounded Multiversion Garbage Collection**,
+  Wei, Ben-David, and Blelloch, arXiv 2021.
+  URL: `https://arxiv.org/abs/2108.02775`
+  Why: range-tracking approach for old-version reclamation; relevant to
+  bounding retained snapshot metadata and version-chain cleanup under long
+  GPU reads.

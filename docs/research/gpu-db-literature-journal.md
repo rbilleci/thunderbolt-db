@@ -14288,3 +14288,176 @@ conflict policy rather than local microsecond targets.
   sets let COPY or update batches overlap validation, WAL staging, and
   resident invalidation the way Carousel/Natto overlap read/prepare and
   commit phases.
+
+### 2026-06-03 - HybridGC production MVCC garbage collection in SAP HANA
+
+**Citation:** Juchang Lee, Hyungyu Shin, Chang Gyoo Park, Seongyun
+Ko, Jaeyun Noh, Yongjae Chuh, Wolfgang Stephan, and Wook-Shin Han.
+"Hybrid Garbage Collection for Multi-Version Concurrency Control in
+SAP HANA." SIGMOD 2016, pp. 1307-1318. DOI:
+`10.1145/2882903.2903734`. Retrieved 2026-06-03 from the ACM DOI
+page and a CMU-hosted PDF copy,
+`https://15721.courses.cs.cmu.edu/spring2019/papers/05-mvcc3/p1307-lee.pdf`.
+
+**Category:** MVCC / snapshot / visibility.
+
+**Relevance tags:** MVCC garbage collection; long snapshots; HTAP;
+statement snapshot isolation; transaction snapshot isolation; version
+chains; table-scoped visibility; group commit metadata; memory pressure;
+long cursor robustness.
+
+**Core idea:** HybridGC addresses a production HTAP failure mode: a
+long-lived analytical cursor or transaction can pin the global minimum
+snapshot timestamp, causing obsolete versions to accumulate even though
+many are invisible to every active snapshot. In SAP HANA's row store,
+this does not only waste memory; it also increases RID-hash collisions
+and version-chain traversal, hurting short OLTP work and incremental
+fetch latency.
+
+The paper combines three collectors. Global group GC reclaims whole
+commit groups cheaply when their commit ids are older than the relevant
+snapshot frontier. Table GC uses query-plan or declared table scopes to
+move long snapshots out of the global tracker and into per-table snapshot
+trackers, so a long scan over one table does not block version reclamation
+for unrelated tables. Interval GC reasons over the visible interval of
+each version, reclaiming intermediate versions whose interval contains no
+active snapshot even when the oldest snapshot is still open.
+
+In the reported HANA experiments, HybridGC keeps version-space size
+nearly flat under a long-duration cursor where group-only collectors keep
+growing. In one 1000-second TPC-C run, table GC and interval GC reclaimed
+379 million and 118 million versions respectively while global group GC
+was blocked by the long cursor. With all collector periods at 1 second,
+the paper reports about 0.8% throughput overhead for HybridGC versus
+global group GC when no long snapshot is present.
+
+**Concrete mechanisms:**
+
+- SAP HANA tracks active snapshot timestamps in an ordered, reference
+  counted global snapshot timestamp tracker. A snapshot holds a direct
+  pointer to its tracker entry, so releasing a snapshot can decrement the
+  entry without scanning all active snapshots.
+- Record versions created by the same transaction point to a
+  `TransContext`. Transactions committed in the same group commit point
+  to a shared `GroupCommitContext`, which receives the commit id once.
+  This indirect commit-id publication avoids copying the id to every
+  version on the commit fast path.
+- Group commit contexts are maintained in commit-id order. Global group
+  GC scans this list and can identify entire groups older than the
+  minimum relevant snapshot timestamp without traversing each version
+  chain first.
+- Interval GC models version collection as consecutive interval
+  intersection. For ordered active snapshot ids `S` and ordered version
+  commit ids `T`, a version `t` is garbage when the next version id falls
+  before or at the least active snapshot id greater than or equal to `t`;
+  the paper gives a merge algorithm with `O(|S| + |T|)` cost.
+- HANA's implemented interval collector first gathers active snapshot
+  timestamps, then scans group commit contexts whose commit ids fall
+  between the minimum and maximum active snapshot ids, then walks
+  reachable version chains from highest commit id downward.
+- Table GC detects long-lived snapshots, checks whether their table scope
+  is known, copies their snapshot timestamp into per-table trackers for
+  the relevant tables, and removes them from the global tracker.
+- The per-table optimization applies naturally to statement-level
+  snapshot isolation because a compiled query plan exposes the accessed
+  tables. It also applies to some transaction-level cases, such as
+  precompiled stored procedures or internal transactions that explicitly
+  declare touched tables; HANA can reject access to undeclared tables.
+- When table GC and interval GC coexist, global GC must consider both
+  global and per-table snapshot trackers. The paper notes that HANA
+  pre-materializes the union of available trackers to avoid repeatedly
+  scanning too many per-table lists.
+- The collectors run independently with different periods in the
+  experiments: global group GC at 1 second, table GC at 3 seconds, and
+  interval GC at 10 seconds.
+- The paper states that group and table GC were already available in SAP
+  HANA product versions at publication time; interval GC was
+  pre-production in the described state.
+
+**GPU DB mapping:** HybridGC sharpens the retained-snapshot design rule:
+long GPU reads should not pin a single global visibility frontier that
+blocks cleanup for all tables, partitions, or resident generations. The
+engine should track snapshot scope at least by table and preferably by
+partition/resident segment once route planning can prove that scope. A
+long retained scan over one resident segment should not prevent deletion,
+version pruning, or resident metadata retirement for unrelated segments.
+
+Group GC maps to the existing WAL/MVCC batch and owner-domain model. COPY
+chunks, mutation batches, and group-commit-like WAL flush batches can
+publish a shared commit generation object. Cleanup can then retire whole
+generation groups when no relevant retained read, transaction, refresh,
+or recovery cursor can still see them. This is a better hot-path shape
+than stamping or checking every row version independently.
+
+Table GC maps to planner-visible snapshot leases. A retained GPU route
+already knows table id, schema generation, predicate family, selected
+columns, and eventually partition identity. That descriptor can become a
+snapshot lease scope: table, partition, column group, and resident
+generation. GC and resident eviction should use those scoped leases
+instead of one coarse oldest-read timestamp.
+
+Interval GC is the fallback when scope is unknown or too coarse. Even if a
+long transaction pins an old snapshot, intermediate versions whose
+visibility intervals contain no active snapshot can be reclaimed. For GPU
+DB, the equivalent is a sparse active-snapshot set per owner and a merge
+against version/generation chains. That could bound version-chain
+traversal for CPU fallback and bound retained segment metadata even when
+one old reader is still active.
+
+The paper also argues for measuring GC as a latency feature, not only a
+memory feature. HANA's growing version space increased hash collisions and
+incremental cursor fetch latency. GPU DB should expect similar harm in CPU
+indexes, visibility summaries, resident metadata maps, and stale
+generation lists if old versions remain on hot lookup paths.
+
+**Risks and mismatches:** The implementation is specific to SAP HANA's row
+store, RID hash table, group commit context objects, and statement-level
+snapshot default. GPU DB's current MVCC tuple store, WAL batches, and
+resident GPU snapshots have different physical structures. The paper does
+not describe serializable isolation, GPU execution, or over-resident
+device-memory reclamation.
+
+Table GC depends on knowing snapshot scope. Arbitrary SQL transactions,
+dynamic SQL, prepared statements with late binding, and multi-table joins
+may not expose a complete safe scope until planning is complete. Scope
+declarations must be enforced: if a transaction declares one table and then
+touches another, GPU DB must reject, replan, or widen the lease before any
+cleanup relies on the narrow scope. Interval GC is more general but can be
+more expensive because it touches version chains that group/table GC avoid.
+
+The evaluation embeds TPC-C logic inside HANA to avoid network effects and
+uses a 4-socket CPU machine, so its absolute throughput does not transfer
+to the pgwire/GPU path. The transferable claim is the collector shape and
+the observed failure mode under long snapshots, not the numeric
+throughput.
+
+**Benchmark candidates:**
+
+- Add snapshot lease telemetry with scope classes: global transaction,
+  table, partition, resident segment, refresh, and recovery cursor. Gate:
+  every retained read and long CPU fallback reports its lease scope and
+  release timestamp.
+- Build a long-retained-scan GC stress: hold a retained scan open on one
+  table or partition while applying updates/deletes to unrelated tables and
+  hot partitions. Expected improvement: unrelated cleanup and fresh lookup
+  latency stay bounded.
+- Prototype group-generation cleanup for COPY/WAL batches: versions from
+  the same flushed batch share a generation object, and GC first retires
+  whole groups before row-by-row pruning. Required metrics: commit-path
+  overhead, GC scan work, reclaimed versions per pass, and WAL replay
+  correctness.
+- Add per-table or per-partition snapshot trackers to the MVCC test
+  harness. Minimum proof: a long scoped snapshot pins only matching table
+  or partition versions; attempts to access undeclared scope fail or widen
+  safely before cleanup.
+- Implement an interval-GC simulator over version chains and active
+  snapshot sets. Compare global-minimum GC, scoped GC, and interval GC
+  under long statement snapshots, long transaction snapshots, and mixed
+  short readers.
+- Measure hot lookup degradation from stale version metadata: version-chain
+  length, hash/index collision or probe depth, visibility-check count, and
+  p95 lookup latency while long readers hold old snapshots.
+- For resident GPU metadata, test whether stale generation lists or
+  invalidated resident segments remain on the route-choice hot path under
+  long scans. Failure condition: route planning or fresh lookup latency
+  grows with old retained generations unrelated to the query scope.
