@@ -21964,3 +21964,161 @@ MVCC-safe route admission.
 - Visibility-preserving frozen segment proof: fast export or specialized
   execution can skip per-row visibility only when metadata proves the segment
   is version-free for the requested snapshot.
+
+### 2026-06-03 - Mind the Gap: informed request scheduling at the NIC
+
+**Citation:** Jack Tigar Humphries, Kostis Kaffes, David Mazieres, and
+Christos Kozyrakis. "Mind the Gap: A Case for Informed Request Scheduling at
+the NIC." HotNets 2019. Retrieved 2026-06-03 from
+`https://cs.stanford.edu/~jhumphri/documents/mind-the-gap.pdf`; DOI
+`https://doi.org/10.1145/3365609.3365856`.
+
+**Category:** runtime / HFT / session scale, with high-concurrency networking
+and admission-control relevance.
+
+**Relevance tags:** SmartNIC scheduling; host-load feedback; preemptive request
+scheduling; dispatcher offload; bounded outstanding work; DDIO/cache placement;
+CXL/coherent device memory; line-rate scheduling; response/ingress pacing.
+
+**Core idea:** The paper argues that microsecond-scale services face an
+unpleasant split. RSS-style NIC steering is cheap and line-rate, but it does
+not know which CPU cores are idle, overloaded, or running long requests.
+CPU-side centralized dispatchers can make better load-balancing and
+preemption decisions, but they consume host cores, add inter-core latency, and
+scale poorly as request rates and link speeds rise. The proposed direction is
+to move informed request-to-core scheduling back into the NIC, while feeding
+the NIC current host state.
+
+The prototype, Shinjuku-Offload, moves Shinjuku's networking subsystem and
+dispatcher to a Broadcom Stingray SmartNIC. It validates the placement idea but
+also exposes a hardware gap: a general-purpose ARM SmartNIC core and packet-
+based host communication are too slow for the smallest request times. The
+strongest transferable idea for GPU DB is therefore not "put all scheduling on
+a SmartNIC." It is to make scheduling decisions at the earliest boundary that
+can see both arriving work and executor availability, and to make that boundary
+consume explicit feedback from workers instead of guessing from connection
+hashes or stale queue depth.
+
+**Concrete mechanisms:**
+
+- The target scheduler has a centralized view of incoming packets and host
+  worker state. Host cores report whether they are busy, idle, or available
+  for more work, plus enough active-request status for the scheduler to decide
+  where to place new work and when preemption is useful.
+- Shinjuku-Offload runs the network subsystem and dispatcher on the Stingray
+  SmartNIC's ARM cores. The host workers run DPDK threads inside a Dune
+  process and poll per-worker virtual network interfaces created with SR-IOV.
+- Dispatcher-worker messages are UDP packets through the NIC. Each worker has
+  its own virtual interface, and Ethernet destination addresses steer packets
+  between dispatcher and workers.
+- Because SmartNIC/host communication costs about 2.56 microseconds one way in
+  the prototype, the dispatcher keeps more than one outstanding request per
+  worker. A pending request waits in the worker RX queue so the worker can
+  continue immediately when it finishes or is preempted.
+- Workers use local APIC timer preemption rather than SmartNIC-sent interrupt
+  packets because the packet path is too slow. Mapping timer registers through
+  Dune reduces timer setup and interrupt costs compared with normal Linux
+  paths.
+- The dispatcher is split across three ARM cores: one manages the task queue,
+  one sends dequeued requests to workers, and one polls/parses worker response
+  packets.
+- Evaluation uses synthetic UDP workloads. Shinjuku-Offload handles a bimodal
+  99.5% 5-microsecond / 0.5% 100-microsecond workload with low tail latency and
+  can outperform CPU Shinjuku when offloading frees a host core. For fixed
+  1-microsecond work, CPU Shinjuku wins because the SmartNIC dispatcher and
+  packet-based communication become the bottleneck. The paper reports that
+  keeping five outstanding requests per worker improves 4-worker fixed
+  1-microsecond throughput by 250%, while 16 workers improve by 88% at three
+  outstanding requests.
+- The design discussion calls for line-rate hardware scheduling, low-latency
+  coherent communication between NIC and host, direct interrupt delivery, and
+  simple programming tools for host-to-NIC load feedback. It specifically
+  points to CXL-like coherent shared memory as a better interface than PCIe
+  packet messaging alone.
+- The paper also notes two adjacent uses: NIC scheduling could make DDIO cache
+  placement more precise because the scheduler knows the target core, and
+  congestion control can aim to deliver packets just in time for processing
+  rather than as fast as possible.
+
+**GPU DB mapping:** GPU DB's 1M logical-session target will not be reached by
+hashing sessions onto worker threads and hoping the right owner or GPU lane is
+idle. The runtime already wants network IO workers, bounded ingress rings,
+owner domains, read snapshot workers, GPU execution workers, and response
+rings. Mind the Gap suggests that each ingress decision should carry a compact
+view of executor availability: mutation owner pressure, read-snapshot lane
+depth, GPU stream budget, response-ring space, and route class.
+
+For current hardware, this maps first to software IO-worker steering rather
+than SmartNIC offload. The pgwire ingress path can maintain per-lane feedback
+cells and steer parsed requests into bounded rings by query class, snapshot
+generation, and executor availability. If future NIC/DPU/CXL support exists,
+the same feedback schema could move closer to the NIC. The important design
+artifact is the feedback contract, not the hardware location.
+
+The outstanding-request mechanism maps to controlled prefetch and
+micro-batching. Keeping one or a few ready requests near a worker can hide
+queue handoff latency, but only when bounded by a latency budget. For GPU DB,
+that means a read lane might keep a tiny ready batch per snapshot/query shape,
+while a mutation lane must not pre-stage work past WAL-before-visibility or
+MVCC validation boundaries. Outstanding work should be counted as active
+capacity, not as invisible queue slack.
+
+The DDIO observation maps to cache and tier placement. If the scheduler knows
+that a request is routed to a specific IO worker, CPU owner, or GPU execution
+lane, it can place parsed messages, key vectors, response buffers, and pinned
+staging buffers near the component that will consume them. Later, a SmartNIC or
+CXL device could use the same route-class metadata to put packets or command
+descriptors into the right cache or shared-memory region.
+
+The congestion-control note reinforces response-carried feedback from the
+latest synthesis. GPU DB should not wait until p99 latency is already high.
+Ingress and response paths should pace or reject based on narrow saturated
+boundaries: response ring almost full, GPU stream queue over budget, mutation
+owner backlog above WAL flush budget, or resident refresh lane consuming
+pinned-buffer capacity.
+
+**Risks and mismatches:** This is a HotNets position/prototype paper, not a
+database system. It does not address SQL parsing, MVCC, WAL ordering,
+transaction aborts, snapshot invalidation, result materialization, or pgwire
+semantics. Its evaluation is synthetic and UDP-based; it does not cover
+PostgreSQL protocol sessions, transaction state, large result sets, TLS, or
+kernel TCP behavior.
+
+The prototype's own negative result is important: moving scheduling to a weak
+SmartNIC core with high-latency packet communication can make tiny requests
+worse. GPU DB should not offload admission to a DPU or NIC unless the
+communication path is measurably cheaper than host-side ring handoff. A
+bounded outstanding-request queue also risks hiding overload and increasing
+tail latency if it is not tied to a deadline, response budget, or cancellation
+boundary.
+
+**Benchmark candidates:**
+
+- Add an IO-worker route-steering proof: parsed requests choose mutation,
+  read-snapshot, GPU, or fallback rings from live per-lane feedback cells
+  rather than only connection/thread affinity. Gate: identical SQL results,
+  explicit fallback/rejection reasons, and lower p99 queue wait under mixed
+  short lookup / long scan load.
+- Prototype tiny per-lane outstanding-ready windows for retained read workers:
+  1, 2, 4, and 8 ready requests per compatible snapshot/query shape. Measure
+  p50/p99 latency, queue handoff time, GPU batch size, and tail regression.
+  Failure condition: larger ready windows improve throughput but hide overload
+  or violate latency budget.
+- Add a "narrow saturated boundary" admission test where response ring, GPU
+  lane, mutation owner, and residency refresh lane can each independently
+  trigger pacing or explicit rejection. Gate: telemetry names the exact
+  boundary that caused admission control.
+- Measure cache-local command placement by pinning IO workers and executor
+  lanes, then allocating command, key-vector, and response buffers from
+  lane-local pools. Compare cross-core handoff latency, allocation count,
+  LLC misses if available, and p99 response latency.
+- Define a future NIC/DPU feedback schema without implementing offload:
+  route class, executor id, queue budget, outstanding-ready budget, response
+  budget, and current pressure. Gate: the host software path can consume the
+  same schema, so hardware offload would be a placement change rather than a
+  scheduler rewrite.
+- Stress large logical-session counts with few active requests. Compare RSS or
+  connection-affinity steering against request-class steering under 10k, 100k,
+  and projected 1M logical sessions. Failure condition: inactive sessions
+  consume worker-local resources or distort admission for active retained
+  reads.

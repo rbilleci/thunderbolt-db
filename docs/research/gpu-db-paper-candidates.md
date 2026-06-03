@@ -830,9 +830,10 @@ Append new candidates here as each paper is processed.
   layouts; useful for deciding whether GPU DB should reshape resident/cold
   partitions around observed predicates or rely on lightweight per-generation
   statistics.
-- `queued` — **Mind the Gap: A Case for Informed Request Scheduling at the
+- `reviewed` — **Mind the Gap: A Case for Informed Request Scheduling at the
   NIC**, Humphries, Kaffes, Mazieres, and Kozyrakis, HotNets 2019.
   URL: `https://doi.org/10.1145/3365609.3365856`
+  PDF: `https://cs.stanford.edu/~jhumphri/documents/mind-the-gap.pdf`
   Why: Syrup cites this NIC-side informed request scheduling work; relevant to
   deciding whether GPU DB should push route-class or key-home steering closer
   to the network edge before requests enter owner queues.
@@ -1870,3 +1871,17 @@ Append new candidates here as each paper is processed.
   Why: modern page replacement study citing GMT; useful for testing whether
   reuse-prediction and learned/scan-resistant cache policies survive GPU DB
   mixed lookup, scan, refresh, and over-resident workloads.
+- `queued` — **Elastic RSS: Co-Scheduling Packets and Cores Using Programmable
+  NICs**, Rucker, Shahbaz, Swamy, and Olukotun, APNet 2019.
+  URL: `https://doi.org/10.1145/3343180.3343184`
+  Why: Mind the Gap contrasts fixed RSS with NIC-side policies that incorporate
+  fine-grained load feedback; useful for GPU DB route-class steering when IO
+  workers, owner queues, and GPU execution lanes need elastic core assignment
+  without a global dispatcher bottleneck.
+- `queued` — **Just In Time Delivery: Leveraging Operating Systems Knowledge
+  for Better Datacenter Congestion Control**, Ousterhout, Belay, and Zhang,
+  HotCloud 2019.
+  URL: `https://www.usenix.org/conference/hotcloud19/presentation/ousterhout`
+  Why: Mind the Gap cites OS/network co-design where packets should arrive
+  just in time for processing; relevant to GPU DB response-ring and ingress
+  pacing when queue saturation should slow admission before p99 latency spikes.
