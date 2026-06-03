@@ -581,13 +581,21 @@ Append new candidates here as each paper is processed.
   contrasting non-preemptive priority ordering with interrupt-driven
   preemption and owner-queue admission.
 
-- `queued` — **Harnessing GPU Power for Enhanced OLTP: A Study in Concurrency
+- `reviewed` — **Harnessing GPU Power for Enhanced OLTP: A Study in Concurrency
   Control Schemes**, arXiv 2024.
   URL: `https://arxiv.org/abs/2406.10158`
   Why: modern GPU OLTP concurrency-control evaluation that compares GPU-adapted
   2PL, timestamp ordering, MVCC, OCC, GPUTx, and GaccO-style conflict-graph or
   deterministic locking schemes; useful follow-up for deciding which GPU write
   batch protocol is benchmark-worthy.
+- `queued` — **Accelerating in-memory transaction processing using general
+  purpose graphics processing units**, Gao et al., Future Generation Computer
+  Systems 2019.
+  URL: `https://doi.org/10.1016/j.future.2019.03.034`
+  Why: GPU-TPS is a 2015-present GPU OLTP system baseline referenced by the
+  gCCTB study; useful for comparing GPU transaction execution models, GPU hash
+  table/B+ tree indexing, and SmallBank/TPC-C write-path claims against
+  conflict-control-only testbeds.
 - `queued` — **LibPreemptible: Enabling Fast, Adaptive, and
   Hardware-Assisted User-Space Scheduling**, Li et al., HPCA 2024.
   URL: `https://doi.org/10.1109/HPCA57654.2024.00075`

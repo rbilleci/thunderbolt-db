@@ -12679,3 +12679,209 @@ an overloaded GPU kernel or a saturated storage tier by themselves.
   route-ranker track: rank full request paths, not just single SQL
   statements, while hard eligibility rules preserve snapshot, catalog,
   residency, and WAL invariants.
+
+### 2026-06-03 - gCCTB GPU OLTP concurrency-control study
+
+**Citation:** Zihan Sun, Yuyu Luo, Yong Zhang, Chao Li, and Chunxiao Xing.
+"GPU-Accelerated OLTP: An In-Depth Analysis of Concurrency Control
+Schemes." arXiv:2406.10158v2, 2026 version, first submitted 2024-06-14.
+Retrieved 2026-06-03 from `https://arxiv.org/pdf/2406.10158`.
+
+**Category:** transaction processing / write path, with GPU execution and
+concurrency-control benchmarking relevance.
+
+**Relevance tags:** GPU OLTP; concurrency control; OCC; TicToc; Silo; MVCC;
+2PL; conflict-graph ordering; GaccO; GPUTx; batch execution; warp density;
+block size; latch-free atomics; conflict-resolution overhead; YCSB; TPC-C.
+
+**Core idea:** This paper builds gCCTB, a GPU concurrency-control testbed, and
+uses it to compare eight schemes: two 2PL variants, timestamp ordering, MVCC,
+Silo, TicToc, GPUTx, and GaccO. The central result is not that "GPU-native"
+transaction protocols always win. CPU-oriented optimistic schemes can beat
+GPU-specific conflict-graph schemes in read-heavy or medium-contention cases,
+because graph preprocessing costs can dominate when there are not enough
+conflicts to amortize it. Under high write intensity and high contention,
+GaccO's deterministic GPU-oriented conflict handling becomes much stronger.
+
+The strongest transferable lesson is that GPU DB should select write-batch
+protocols by measured conflict shape, not by a single favorite isolation
+algorithm. Low-contention batches should keep the optimistic validation path
+short and avoid expensive preprocessing. High-contention write-heavy batches
+may justify deterministic conflict ordering, lock-table preprocessing, or
+commutative update grouping, but only when the conflict density is high enough
+to pay for the setup.
+
+**Concrete mechanisms:**
+
+- gCCTB uses a batch execution model in which the CPU constructs transaction
+  batches, initializes runtime metadata, launches GPU kernels, and lets one GPU
+  worker thread execute one transaction. Aborted transactions restart on the
+  same thread until they commit.
+- Transaction templates call a common CC interface: start, read/write access,
+  finalization, and end hooks. Device code is generated and compiled at runtime
+  with NVRTC so table format, benchmark, index choice, and CC scheme can be
+  changed by configuration.
+- The testbed keeps table and index data resident in GPU memory before the
+  experiment and leaves updates/results on device. This isolates GPU-side CC
+  behavior from PCIe transfer cost.
+- The GPU table format in the paper is a row-store array with fixed table size
+  during execution. The implemented GPU index is primarily a sorted array with
+  binary search; a B+ tree variant is tested as an index-cost comparison.
+- Correctness checking uses a lightweight GPU event log for reads, writes, and
+  commits. The CPU verifier scans the event order, builds a conflict graph, and
+  reports cycles.
+- The CPU-oriented schemes pack common control metadata into 64-bit words where
+  possible and update them with CUDA atomic compare-and-swap loops. The paper
+  explicitly calls out memory fences and volatile reads as necessary for
+  ordering and fresh data on the GPU.
+- MVCC in gCCTB is intentionally simple: latest-version pointers plus
+  preallocated history-version arrays partitioned by worker thread. Writes
+  stage old versions locally and delay version-pointer updates until commit.
+  Sophisticated OCC+MVCC hybrids such as Hekaton-like designs are left to
+  future work.
+- Silo and TicToc implementations lock write sets in primary-key order during
+  validation and use no-wait behavior when a write-phase lock is unavailable.
+  TicToc keeps read/write timestamp structure and consistently performs best
+  among CPU-oriented schemes with writes in the paper's tests.
+- GPUTx and GaccO preprocess transaction access tables on the GPU using sorted
+  `(transaction id, primary key)` pairs and prefix sums. GPUTx assigns ranks
+  from the conflict graph; GaccO builds a lock table and makes transactions
+  wait for predecessor owners.
+- The evaluation varies write ratio, Zipf contention, warp density, and block
+  size across YCSB, plus warehouse count for TPC-C Payment and NewOrder.
+  Reported findings include CPU-oriented OCC winning in lower-conflict cases,
+  GaccO winning in high-write/high-conflict cases, and warp/block parameters
+  changing throughput by large factors.
+- Warp density is the number of active worker threads per warp. The paper
+  reports that lower warp density helps high-contention workloads by reducing
+  intra-warp conflicts and aborts, while low-contention read-only workloads can
+  peak at a higher but not maximum density.
+- Execution-time breakdowns show conflict-resolving time, defined as waiting
+  plus abort/retry cost, largely explains CPU-oriented scheme performance under
+  contention. In read-only and medium-contention cases, index lookup is also a
+  large share of work.
+- Latch-free CAS-loop implementations materially help, especially for OCC under
+  high contention, but the paper also notes that under extreme contention the
+  extra memory traffic in latch-free loops can narrow or reverse the advantage
+  for some non-OCC schemes.
+- The experimental setup uses CUDA 12.4, an RTX 4090 with 24 GB memory, YCSB
+  batches of `2^20` transactions, fixed-size resident tables, no inserts or
+  deletes, and predetermined read/write sets.
+
+**GPU DB mapping:** The paper supports a route-classed mutation scheduler for
+GPU DB. Current P8 work is read-heavy, but any future GPU-side write execution
+should start with a conflict classifier: read-mostly/low-contention optimistic
+batches, high-contention hot-key batches, commutative update batches, and
+unsupported dynamic batches. Each class can choose a protocol and launch shape
+rather than forcing all writes through one GPU CC implementation.
+
+For low-contention and read-heavy paths, the paper argues against expensive
+conflict-graph preprocessing. GPU DB should keep retained reads and small
+write batches on short optimistic paths with clear validation and fallback.
+TicToc-like timestamp metadata and Silo-like compact ownership can remain CPU
+or owner-side until measurement shows a GPU batch is large and homogeneous
+enough to justify device execution.
+
+For high-contention hot rows, the GaccO result suggests a benchmarkable
+alternative: build a per-batch access table for known write templates and
+execute a deterministic conflict order on GPU, or at least use the access table
+to route hot keys to partition owners with bounded admission. This maps to
+future `order_line`, stock, warehouse, account-balance, or counter-like update
+paths where the transaction template and keys are known before execution.
+
+The launch-parameter findings are important for latency. A GPU DB scheduler
+should not treat thread count, warp density, and block size as static constants
+for all transaction routes. A retained read batch, a low-conflict write batch,
+and a high-contention write batch can require different launch shapes. The
+route descriptor should eventually carry observed abort/conflict rate,
+conflict-resolution time, index time, and chosen CUDA launch parameters.
+
+The paper's verification structure also maps well to correctness gates. Before
+GPU DB accepts any GPU-side mutation protocol, it should emit a compact event
+trace for a tiny deterministic proof, verify serializability or the chosen
+isolation contract on CPU, and separately prove WAL-before-visibility. gCCTB
+does not handle durable logging, so GPU DB needs an additional durable frontier:
+the batch may be serializable on device but still must not become SQL-visible
+before WAL is safe and resident invalidations are published.
+
+**Risks and mismatches:** The paper's testbed is not a production DBMS. It
+keeps all tables in GPU memory, does not measure PCIe transfer, does not
+perform inserts or deletes, uses fixed-size tables, assumes predetermined
+read/write sets, and leaves dynamic memory and index maintenance out of scope.
+That is a large mismatch with pgwire, WAL replay, MVCC visibility, DDL,
+over-resident tiers, and ordinary SQL planning.
+
+The MVCC implementation is deliberately simple and even hits timestamp overflow
+under some high-contention launch configurations. Its poor result should not be
+read as a general rejection of MVCC for GPU DB; it is evidence that naive
+version-chain traversal and timestamp formats are hostile to GPU execution.
+Likewise, GaccO's high-contention advantage comes from known batched access
+sets and conflict preprocessing, so it does not apply to arbitrary interactive
+transactions whose read/write sets are discovered mid-flight.
+
+The evaluation hardware is a single RTX 4090 and the paper does not report
+network, WAL, checkpoint, recovery, snapshot publication, or host-tier costs.
+The transferable claim is protocol/launch-shape behavior inside a GPU-resident
+transaction batch, not end-to-end SQL throughput.
+
+**Benchmark candidates:**
+
+- Add a trace-only write-batch classifier for existing pgwire/COPY and future
+  transaction templates: write ratio, hot-key skew, repeated key count,
+  known-versus-dynamic read/write set, index family, and route family. Gate: no
+  behavior change and a report naming which batches are optimistic-only,
+  deterministic-preprocess candidates, or CPU-owner-only.
+- Build a tiny GPU-side conflict simulator, not a production mutation path:
+  feed synthetic YCSB-style read/write sets and compare optimistic validation,
+  per-key deterministic ordering, and wait/abort behavior. Required output:
+  abort count, conflict-resolution time, kernel time, and chosen launch shape.
+- For one hot-key update template, prototype an access-table construction
+  benchmark on device. Measure preprocessing cost versus saved abort/retry
+  work as contention and write ratio rise. Failure condition: preprocessing
+  dominates below the expected production conflict density.
+- Add launch-shape telemetry to retained GPU routes: block size, active
+  logical workers per warp, batch size, CUDA time, queue wait, and result
+  scatter time. This can start on read routes before any GPU mutation protocol
+  exists.
+- Extend the MVCC stress tests with a GPU-unfriendly version-chain case: one
+  hot key, many updates, one old retained snapshot, and a GPU read batch that
+  must resolve visibility. Gate: identify whether the bottleneck is timestamp
+  format, chain traversal, memory divergence, or CPU fallback.
+- Require any future GPU mutation proof to emit an event log with read/write/
+  commit records and run a CPU verifier for cycles or isolation violations.
+  Separate proof gate: WAL and resident invalidation must publish before the
+  commit becomes SQL-visible.
+- Compare sorted-array and resident key-vector lookup costs for retained
+  point-query batches under low contention. The paper's index-time breakdown
+  suggests that index cost can dominate once conflict cost is low.
+
+### 2026-06-03 - Cross-paper synthesis: GPU writes need classed conflict lanes
+
+The recent Tigger, CARPO, WeBridge, and gCCTB entries converge on the same
+shape from different angles: the engine should classify repeated work before it
+hits the expensive execution boundary. Tigger reduces protocol/proxy crossing,
+CARPO ranks candidate plans as a context-aware set, WeBridge collapses repeated
+dependent SQL paths into stored-route programs, and gCCTB shows that GPU write
+protocols should be selected by conflict shape and launch economics.
+
+The design track that emerges is a route descriptor with two separate halves.
+The first half is semantic eligibility: catalog generation, snapshot/visibility
+boundary, WAL requirements, transaction boundary, read/write-set knowledge,
+result shape, and fallback legality. The second half is resource/conflict
+economics: owner entries saved, round trips saved, GPU resident bytes touched,
+index work, predicted conflict density, abort cost, preprocessing cost, and
+queue pressure. Hard eligibility rules decide what is legal; a CARPO/PARQO-like
+ranker or heuristic only chooses among legal routes.
+
+For GPU DB writes, the immediate benchmark priority is not a full GPU OLTP
+engine. It is a classed write-admission lab: trace batches, identify hot-key
+and known-template shapes, measure optimistic versus deterministic
+preprocessing costs, and prove isolation/WAL publication with event traces.
+That keeps the current P8 retained-read work intact while preparing a narrow
+future lane for GPU-side mutation only where conflict density and batch shape
+make it rational.
+
+Category gaps remain around practical PostgreSQL-protocol session state,
+prepared statement/portal invalidation, and multi-tier query spill policies.
+The next reviews should lean toward session scheduling or resource-adaptive
+execution rather than another pure GPU OLAP paper.
