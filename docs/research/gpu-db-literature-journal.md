@@ -20010,3 +20010,150 @@ Benchmark priority: build a no-GPU admission harness first. Feed it synthetic
 retained reads, writes, refresh jobs, and slow responses; compare FIFO,
 depth-only, gradient-only, and level-plus-gradient policies; require exact
 accounting of which boundary caused each delay, fallback, or rejection.
+
+### 2026-06-03 - Accelerating GPU data processing with FastLanes compression
+
+**Citation:** Azim Afroozeh, Lotte Felius, and Peter Boncz. "Accelerating
+GPU Data Processing using FastLanes Compression." DaMoN 2024. Retrieved
+2026-06-03 from the CWI institutional PDF,
+`https://ir.cwi.nl/pub/34260/34260.pdf`, and DOI metadata,
+`https://doi.org/10.1145/3662010.3663450`.
+
+**Category:** GPU execution / analytics, with multi-tier cache / data
+placement implications.
+
+**Relevance tags:** GPU compression; resident column groups; bit-packing;
+compressed execution; register pressure; shared memory; global memory
+bandwidth; over-resident execution; mini-vectors; data placement.
+
+**Core idea:** FastLanes-GPU shows that compression can improve GPU query
+execution when decoding is treated as part of the query pipeline instead of a
+separate materialization step. The paper contrasts block-wise decompression,
+which expands compressed pages into GPU global memory, with vectorized
+decompression that decodes into registers or shared memory and immediately
+feeds query operators. The GPU DB takeaway is that resident snapshots should
+not choose only between "dense uncompressed GPU columns" and "cold compressed
+CPU/NVMe pages." A third design point is compressed resident vectors whose
+decode granularity and operator shape are planned together.
+
+The strongest transferable lesson is the register/shared-memory caveat. The
+original FastLanes vector size of 1024 values maps cleanly to SIMD-style
+parallel decoding, but on GPUs it can overfill per-thread registers once a
+query touches several columns, joins, or hash tables. The paper's mini-vector
+approach keeps the compressed format's coalesced access while reducing the
+amount decoded per thread at one time. That is a good fit for GPU DB's retained
+route model: compression should be admitted per route family, not as a global
+storage toggle.
+
+**Concrete mechanisms:**
+
+- FastLanes uses interleaved bit-packing so adjacent logical values are
+  distributed across lanes, enabling independent data-parallel unpacking with
+  coalesced GPU memory access.
+- Its transposed layout removes dependency chains from encodings such as DELTA
+  and maps RLE toward data-parallel decoding, although the paper's CUDA
+  experiments mostly focus on bit-packing because full DELTA/RLE/DICT GPU
+  support was still incomplete.
+- The paper compares three decode placements: compressed global memory to
+  decompressed global memory, compressed global memory to shared memory plus
+  direct aggregation, and compressed global memory to registers plus direct
+  consumption.
+- It reports that global-to-global decompression can waste bandwidth because a
+  small compressed value can be expanded to 32 bits, written to global memory,
+  then read again by the consuming operator.
+- Microbenchmarks on T4 and V100 report FastLanes bit-unpacking and DELTA
+  decoding outperforming the tile-based GPU-FOR/GPU-DFOR baselines in compute
+  and global-to-shared cases. For example, the paper reports FastLanes as
+  consistently 3-5x faster than tile-based decoding in global-to-shared plus
+  SUM tests over the shown bit-widths.
+- Naive FLS-GPU decodes 1024 values with one warp, so each thread decodes 32
+  values. This is simple and performs well for scan-bound Q1.1, but complex
+  SSB queries with joins and more columns suffer from high register use and low
+  occupancy.
+- FLS-GPU-opt splits a 1024-value vector into mini-vectors, such as 256 values
+  with 8 values per thread, and increases the thread block size to improve
+  occupancy while reducing register pressure.
+- The optimized design also explores "compressed execution": keeping thin
+  8-bit or 16-bit lanes packed inside 32-bit GPU words to reduce register,
+  shared-memory, and bandwidth pressure. The paper reports this direction as
+  not fully successful yet, with the cause still unclear.
+- End-to-end SSB SF10 results show scan-bound Q1.1 improving from Crystal's
+  3.39 ms to 1.19 ms on T4 and from 1.080 ms to 0.335 ms on V100 for
+  FLS-GPU-opt. Other query families benefit less and remain sensitive to
+  register pressure, join probes, and compression ratio.
+- Sorting LINEORDER columns to simulate stronger RLE compression improves Q3.1
+  in the reported experiment, especially on V100, suggesting that encoding
+  selection and data ordering can matter as much as kernel code.
+
+**GPU DB mapping:** GPU DB's current P8 resident state uses dense column-group
+snapshots. FastLanes-GPU suggests adding a compressed resident segment family
+for route shapes that are memory-bandwidth or GPU-capacity limited. Such a
+segment would store interleaved bit-packed column vectors plus per-vector
+encoding metadata, publish them under the same immutable snapshot identity as
+dense resident columns, and let retained kernels decode only the mini-vector
+needed by the operator.
+
+The design should be route-specific. A retained `COUNT`, `SUM`, filtered
+aggregate, or simple predicate scan can decode compressed vectors directly
+inside the kernel and avoid writing expanded values to global memory. A
+multi-column lookup, join probe, or hash-heavy query may need dense columns or
+smaller mini-vectors because register pressure can dominate saved bandwidth.
+The planner should therefore include compression ratio, expected columns
+touched, predicate selectivity, join/hash state, register budget, and occupancy
+estimate in the resident route decision.
+
+FastLanes also maps to over-resident and cold-tier planning. If a cold partition
+is stored compressed on NVMe or host memory, the engine should benchmark
+whether moving compressed vectors to GPU and decoding in-kernel beats moving
+dense columns or relying on CPU fallback. This is especially relevant for P8's
+future tiers: compression can buy both GPU memory residency and PCIe/NVMe
+transfer reduction, but only if the decode path avoids global-memory expansion.
+
+Finally, mini-vector size should become an explicit benchmark knob. GPU DB's
+retained route scheduler already reasons about query shape and batching; adding
+`decode_values_per_thread`, block size, and thin-lane mode would let the engine
+test whether each route is bandwidth-bound, register-bound, or occupancy-bound
+instead of assuming one compressed layout works for all kernels.
+
+**Risks and mismatches:** The paper is analytical and SSB-focused, not OLTP or
+MVCC-focused. It does not address WAL-before-visibility, mutation invalidation,
+long-running snapshots, update-heavy workloads, SQL type completeness, or
+transactional recovery. Its best end-to-end gains appear on scan-bound queries;
+join-heavy queries remain harder and sometimes underperform without careful
+mini-vector tuning.
+
+The current GPU DB supports narrow `int4`/`text` retained routes, while
+FastLanes-GPU mainly evaluates integer compression and incomplete CUDA support
+for richer encodings. A production mapping would need null handling, text
+offsets, dictionary metadata, per-vector checksums or validation, and truthful
+fallback when an encoding is unsupported. The compressed execution result is
+also explicitly immature, so thin-lane packing should be treated as an
+experiment rather than a design dependency.
+
+**Benchmark candidates:**
+
+- Add a compressed resident `int4` segment prototype for one retained aggregate
+  route. Compare dense GPU columns, compressed global-to-global expansion, and
+  in-kernel mini-vector decode. Gate: compressed in-kernel execution improves
+  throughput or resident capacity without breaking SQL-visible results.
+- Sweep mini-vector granularity for retained `COUNT`, `SUM`, and filtered
+  `MIN`/`MAX`: 32, 16, 8, and 4 values per thread where feasible. Required
+  metrics: kernel time, achieved occupancy, registers per thread, global-memory
+  bytes, and p50/p99 route latency.
+- Add planner telemetry for compressed route decisions: compression ratio,
+  decoded columns, estimated register pressure, expected global-memory bytes,
+  route family, and fallback reason. Gate: a rejected compressed route names
+  the resource that made dense or CPU execution safer.
+- Run an over-resident transfer experiment where host memory or NVMe holds
+  compressed vectors and the GPU decodes during scan. Compare compressed H2D
+  plus decode against dense H2D and CPU fallback. Failure condition: decode
+  overhead erases transfer savings or inflates p99 latency beyond the dense
+  path.
+- Test encoding-aware ordering on append-only chunks: sort or cluster a cold
+  analytical partition for better RLE/bit-width while preserving WAL/MVCC
+  truth in CPU state. Gate: read speedup and compression gain must be reported
+  separately from write-admission cost.
+- Add a correctness proof for compressed resident invalidation: after COPY or
+  UPDATE invalidates a table generation, no compressed snapshot route may use
+  stale vectors, even if dense resident state for another generation remains
+  available.

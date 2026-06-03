@@ -317,7 +317,7 @@ Append new candidates here as each paper is processed.
   URL: `https://www.vldb.org/pvldb/vol15/p2491-yogatama.pdf`
   Why: cost-based CPU/GPU placement and execution orchestration for
   heterogeneous DBMS designs.
-- `queued` — **Accelerating GPU Data Processing using FastLanes
+- `reviewed` — **Accelerating GPU Data Processing using FastLanes
   Compression**, Afroozeh et al., DaMoN 2024.
   URL: `https://doi.org/10.1145/3662010.3663450`
   Why: modern GPU compressed-data execution follow-up for resident and
@@ -358,6 +358,23 @@ Append new candidates here as each paper is processed.
   URL: `https://www.vldb.org/pvldb/vol9/p444-yan.pdf`
   Why: program-analysis and contention-aware execution ideas that complement
   MV3C's dependency-annotated transaction repair path.
+- `queued` — **The FastLanes Compression Layout: Decoding >100 Billion
+  Integers per Second with Scalar Code**, Afroozeh and Boncz, PVLDB 2023.
+  URL: `https://www.vldb.org/pvldb/vol16/p2132-afroozeh.pdf`
+  DOI: `https://doi.org/10.14778/3598581.3598587`
+  Why: source design for FastLanes' dependency-free column encodings; useful
+  for deciding whether GPU DB resident segments should adopt interleaved
+  bit-packing and cascaded encodings before GPU-specific kernels.
+- `queued` — **Tile-Based Lightweight Integer Compression in GPU**,
+  Shanbhag, Yogatama, Yu, and Madden, SIGMOD 2022.
+  URL: `https://dl.acm.org/doi/10.1145/3514221.3517864`
+  Why: direct GPU compression baseline compared by the FastLanes-GPU paper;
+  useful for benchmarking tile granularity, global-memory traffic, and
+  compression-versus-occupancy tradeoffs.
+- `queued` — **The FastLanes File Format**, Afroozeh et al., PVLDB 2025.
+  URL: `https://vldb.org/pvldb/vol18/p4629-afroozeh.pdf`
+  Why: modern file-format follow-up that may connect GPU-friendly compressed
+  vectors to disk/NVMe cold-tier layout and CPU/GPU shared data placement.
 - `reviewed` — **Chiller: Contention-centric Transaction Execution and Data
   Partitioning for Modern Networks**, Zamanian et al., SIGMOD 2020.
   URL: `https://doi.org/10.1145/3318464.3389724`
