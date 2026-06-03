@@ -61,7 +61,7 @@ mechanical sympathy, multi-tier cache/data placement, or query optimization.
   URL: `https://www.vldb.org/pvldb/vol13/p211-sun.pdf`
   Why: P-Tree index for efficient snapshot isolation and MVCC in multicore
   in-memory HTAP storage.
-- `queued` — **An Empirical Evaluation of In-Memory Multi-Version Concurrency
+- `reviewed` — **An Empirical Evaluation of In-Memory Multi-Version Concurrency
   Control**, PVLDB 2017.
   URL: `https://www.vldb.org/pvldb/vol10/p781-Wu.pdf`
   Why: MVCC design tradeoffs, version storage, validation, and GC behavior.
@@ -318,6 +318,11 @@ Append new candidates here as each paper is processed.
   PDF: `https://www.usenix.org/system/files/nsdi19-kaffes.pdf`
   Why: microsecond-scale request scheduling and preemption; relevant to
   separating short retained reads from long mutation, scan, or refresh work.
+- `queued` — **Rethinking Serializable Multiversion Concurrency Control**,
+  Faleiro and Abadi, PVLDB 2015.
+  URL: `https://www.cs.umd.edu/~abadi/papers/rethink-mvcc.pdf`
+  Why: BOHM decouples serialization/version management from transaction
+  execution, a direct follow-up to MVCC version-chain and timestamp bottlenecks.
 - `reviewed` — **Memory-Optimized Multi-Version Concurrency Control for
   Disk-Based Database Systems**, Freitag et al., PVLDB 2022.
   URL: `https://www.vldb.org/pvldb/vol15/p2797-freitag.pdf`

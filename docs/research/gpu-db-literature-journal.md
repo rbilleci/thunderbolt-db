@@ -6667,3 +6667,169 @@ Benchmark priorities:
   GPU-initiated IO
 - workload-level p99 and resource-budget gates before accepting any
   learned planner knob
+
+### 2026-06-03 - Empirical in-memory MVCC design tradeoffs
+
+**Citation:** Yingjun Wu, Joy Arulraj, Jiexi Lin, Ran Xian, and
+Andrew Pavlo. "An Empirical Evaluation of In-Memory Multi-Version
+Concurrency Control." PVLDB 10(7), 2017, pp. 781-792.
+Retrieved 2026-06-03 from the VLDB PDF,
+`https://www.vldb.org/pvldb/vol10/p781-Wu.pdf`.
+
+**Category:** MVCC / snapshot / visibility.
+
+**Relevance tags:** MVCC; version storage; visibility checks;
+version-chain ordering; garbage collection; index indirection;
+serializable reads; long snapshot pressure; write-path memory
+allocation; CPU/GPU resident snapshot design.
+
+**Core idea:** The paper evaluates MVCC as a design space rather
+than one algorithm. On a 40-core in-memory DBMS implementation, it
+compares concurrency control protocols, version storage layouts,
+garbage collection strategies, and index pointer schemes under YCSB
+and TPC-C. The key lesson for GPU DB is that visibility and storage
+layout choices can dominate protocol tweaks: the way versions are
+allocated, chained, collected, and indexed decides whether reads stay
+cache-friendly and whether updates avoid synchronization hotspots.
+
+For GPU DB, this argues against treating MVCC metadata as a small
+correctness detail bolted onto resident columns. The visibility
+layout, old-version retention policy, index indirection, and memory
+allocation policy need to be benchmarked as part of the retained
+snapshot design, especially because GPU scans and micro-batches are
+sensitive to pointer chasing and irregular metadata access.
+
+**Concrete mechanisms:**
+
+- The evaluated tuple version header carries transaction id,
+  begin timestamp, end timestamp, and a neighboring-version pointer.
+  Some protocols add read timestamp or read-count metadata.
+- The paper compares MVTO, MVOCC, MV2PL, and SI plus SSN-style
+  certification. MVOCC avoids read locks but pays read-set validation
+  and can starve long read-only work; certifier schemes reduce some
+  false aborts but add dependency tracking; MVTO performs well across
+  several tested workloads.
+- Append-only storage stores full versions in the table. Oldest-to-
+  newest ordering avoids index head updates but forces latest-version
+  traversal. Newest-to-oldest ordering makes current reads faster but
+  needs index or indirection maintenance when a new version becomes
+  head.
+- Time-travel storage keeps a master tuple in the main table and old
+  versions in a separate table, so indexes continue to point at the
+  master version. It helps current-version access but still pays old-
+  version maintenance costs.
+- Delta storage keeps a master tuple plus delta records containing
+  modified old attribute values. It reduces copying for narrow updates
+  but makes reads and scans reconstruct values by walking version
+  chains and fetching per-attribute deltas.
+- For non-inline attributes in append-only storage, sharing unchanged
+  values with reference counters avoids copying large values into each
+  new version.
+- Centralized allocation becomes a scalability point. The paper's
+  mitigation is separate memory spaces expanded in fixed-size chunks,
+  with worker threads allocating from a single space to reduce
+  contention.
+- MVCC garbage collection has three steps: detect expired versions,
+  unlink them from chains and indexes, and reclaim storage. Epoch-
+  based tracking avoids a fully centralized active-transaction check.
+- Tuple-level background vacuuming is broadly compatible but can scan
+  too much. Cooperative cleaning lets workers record expired versions
+  during chain traversal, but it only fits certain append-only chain
+  orderings and can miss "dusty corners" that no transaction visits.
+- Transaction-level GC reclaims versions by finished transaction or
+  epoch, using transaction write sets. In the paper's experiments it
+  reduces synchronization overhead and improves update-intensive
+  throughput versus tuple-level GC.
+- Logical index pointers map stable tuple identifiers to version-chain
+  heads through an indirection layer. They reduce secondary-index
+  churn under updates but require chain traversal during reads.
+- Physical index pointers point directly to exact versions and can
+  speed read-heavy secondary-index access, but every new version must
+  be inserted into every secondary index.
+- The paper notes that MVCC index-only scans are not possible unless
+  visibility metadata is embedded in the index; otherwise the executor
+  must fetch tuple/version headers to determine visibility.
+- Evaluation findings most relevant to GPU DB: N2O append-only chain
+  ordering outperforms O2N in the tested YCSB cases; append-only and
+  time-travel storage have better table-scan latency than delta
+  storage; delta performs well for narrow updates but scan latency can
+  grow badly; transaction-level GC improves throughput and memory
+  behavior; logical pointers win under update-heavy secondary-index
+  workloads.
+
+**GPU DB mapping:** GPU DB's current P8 plan already treats GPU
+resident state as immutable acceleration state built from CPU/WAL
+truth. This paper says the CPU-side MVCC source and the published
+resident layout must be designed together. A resident snapshot should
+not require GPU kernels to chase CPU-style version chains. It should
+carry dense visibility vectors or compact begin/end arrays generated
+at a known WAL/transaction boundary, with enough metadata to prove
+which old versions remain retained for active readers.
+
+Append-only N2O plus stable logical tuple ids looks like the safest
+near-term CPU truth shape for GPU DB: current-version reads and
+refresh builders find the head quickly, while secondary indexes and
+resident handles avoid wholesale churn through an indirection layer.
+For GPU-resident scans, the engine should materialize only the
+versions visible at the snapshot boundary into dense column groups,
+not expose long version chains to kernels.
+
+Delta storage is a warning. It is attractive for narrow updates and
+write throughput, but it turns multi-attribute reads and scans into
+chain reconstruction. GPU DB should keep any delta/update log as a
+CPU-side or refresh-side structure until a benchmark proves that a
+GPU kernel can apply deltas without destroying latency, coalescing,
+and branch behavior.
+
+The GC findings map directly to retained snapshot retirement. GPU DB
+needs transaction or generation-level retirement for resident CPU and
+GPU buffers: versions, column groups, resident indexes, and pinned
+staging buffers should become reclaimable when no active read snapshot
+or refresh generation can see them. A tuple-level vacuum is still
+useful as a correctness fallback, but the hot path should retire whole
+generations or write-batch fragments where possible.
+
+The index-only-scan point is important for GPU indexes. If a resident
+key vector or CPU secondary index does not carry visibility metadata,
+the executor still needs a visibility probe before returning rows.
+For GPU DB, either resident indexes must be generation-specific and
+therefore visibility-filtered by construction, or they must store
+compact begin/end metadata adjacent to keys so lookup kernels do not
+fall back to scattered CPU header checks.
+
+**Risks and mismatches:** The paper evaluates an in-memory CPU DBMS,
+not a GPU execution engine, and it excludes logging and recovery from
+the study. It also focuses on serializable transaction execution and
+does not evaluate PostgreSQL-compatible interactive transactions,
+DDL invalidation, over-resident GPU tiers, or NVMe placement. The
+reported percentages come from Peloton experiments on 40 CPU cores in
+2017, so they should guide benchmark shape rather than be copied as
+expected GPU DB gains. The paper's range-query discussion is limited;
+phantom prevention and predicate locks remain separate design work.
+
+**Benchmark candidates:**
+
+- Add MVCC storage-shape telemetry for the CPU truth path: average
+  version-chain length, head-order policy, old-version bytes, tuple
+  header bytes touched per read, secondary-index update count, and
+  per-thread allocation contention. Minimum gate: no behavior change.
+- Compare resident refresh build time from N2O append-only heads,
+  O2N chains, and a delta-log simulation. Measure CPU build time,
+  cache misses if available, generated GPU bytes, and retained query
+  p50/p99 after publication.
+- Prototype generation-level resident retirement. A read snapshot
+  pins one resident generation; mutation/refresh publishes a newer
+  generation; GC reclaims old CPU/GPU buffers only after all readers
+  release. Failure condition: any stale generation is selected for a
+  new reader after invalidation.
+- Test logical versus physical secondary-index maintenance under
+  update-heavy COPY/UPDATE workloads. Measure rows/sec, index bytes,
+  chain traversal cost, and retained refresh invalidation pressure.
+- Build a visibility-adjacent resident index proof: key vector plus
+  compact begin/end generation metadata, compared with a resident key
+  vector that requires scattered tuple-header probes. Proof gate:
+  identical SQL results and lower p99 for batched point lookups.
+- Run a negative delta-storage experiment for GPU scans: keep narrow
+  update deltas and apply them during a scan. Failure condition:
+  delta application causes enough branch/scatter overhead that a full
+  dense snapshot rebuild wins for the target retained workload.
