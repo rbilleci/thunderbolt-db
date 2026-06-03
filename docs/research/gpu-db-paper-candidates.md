@@ -655,9 +655,9 @@ Append new candidates here as each paper is processed.
   Why: Steam-style MVCC version garbage collection cited by the Umbra MVCC
   paper; relevant to bounded version retention, long retained snapshots, and
   per-owner GC without global contention.
-- `queued` — **BTrim - Hybrid In-Memory Database Architecture for Extreme
+- `reviewed` — **BTrim - Hybrid In-Memory Database Architecture for Extreme
   Transaction Processing in VLDBs**, Gurajada et al., PVLDB 2018.
-  URL: `https://www.vldb.org/pvldb/vol11/p1889-guradaja.pdf`
+  URL: `https://www.vldb.org/pvldb/vol11/p1889-gurajada.pdf`
   Why: hybrid disk/in-memory transactional architecture cited by the Umbra
   MVCC paper; useful as a contrast point for hot working-set placement and
   contention reduction across CPU memory and durable storage.
@@ -1739,3 +1739,15 @@ Append new candidates here as each paper is processed.
   search; useful for deciding whether GPU DB should limit itself to offline
   policy tables or consider broader learned functions for owner admission,
   wait placement, and retry/backoff decisions.
+- `queued` — **Native Store Extension for SAP HANA**, Sherkat et al.,
+  PVLDB 2019.
+  URL: `https://www.vldb.org/pvldb/vol12/p2047-sherkat.pdf`
+  Why: BTrim-related SAP tiering work for keeping warm/cold data outside the
+  hot in-memory store; useful for comparing row-level IMRS packing with
+  columnar warm-store placement and explicit cold-tier access.
+- `queued` — **Rethink the Scan in MVCC Databases**, Kim et al.,
+  SIGMOD 2021.
+  URL: `https://doi.org/10.1145/3448016.3452783`
+  Why: modern MVCC scan/access-method work from the vDriver/DIVA ecosystem;
+  useful for retained snapshot scans where version traversal can erase index
+  benefits and GPU routes need a compact visible-version access structure.

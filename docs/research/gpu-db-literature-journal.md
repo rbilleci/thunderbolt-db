@@ -20310,3 +20310,186 @@ conflicts, and retry rates are low.
   switch, some workers use the old table and some use the new table; the test
   must prove snapshot compatibility, validation, and WAL visibility remain
   independent of the policy choice.
+
+### 2026-06-03 - BTrim hybrid in-memory row store for extreme OLTP
+
+**Citation:** Aditya Gurajada, Dheren Gala, Fei Zhou, Amit Pathak, and
+Zhan-Feng Ma. "BTrim - Hybrid In-Memory Database Architecture for Extreme
+Transaction Processing in VLDBs." PVLDB 2018. Retrieved 2026-06-03 from
+the VLDB PDF, `https://www.vldb.org/pvldb/vol11/p1889-gurajada.pdf`.
+
+**Category:** Multi-tier cache / data placement, with transaction processing /
+write-path implications.
+
+**Relevance tags:** hot-row tiering; hybrid row/page store; OLTP working set;
+row-level caching; MVCC versions; cold-row packing; redo-only logging;
+commit-time log reservation; hash-cached indexes; page-contention removal.
+
+**Core idea:** BTrim extends SAP ASE with an In-Memory Row Store (IMRS) that is
+both a hot-row store and a cache above the existing page-store buffer cache.
+Tables can straddle both stores: hot rows live in IMRS as row-oriented,
+versioned records, while cold rows remain in the page store. SQL statements
+and transactions can touch both stores without application changes.
+
+The useful transfer for GPU DB is the row-level hot tier. BTrim does not assume
+that an entire table or database must become memory resident. It uses runtime
+access patterns and background packing to keep the active transactional working
+set in the fast tier, while preserving full durability and compatibility with
+existing access methods. That maps directly to GPU DB's P8 question: resident
+GPU state should be a precise hot partition/segment/snapshot tier, not a
+binary table-wide promise.
+
+**Concrete mechanisms:**
+
+- The paper mines transaction logs from SAP SD and TPC-C-like workloads to
+  quantify OLTP locality and contention. In one SD run, a 20GB log contained
+  more than 1.3 million transactions and 90 million log records; about 41% of
+  transactions generated 10 or fewer log records and 82% generated 80 or fewer.
+- The same log-mining pass identified only 22 tables above a 0.5% activity
+  threshold, while the rest of the activity was spread over roughly 180 tables.
+  The authors use this to justify spending scarce in-memory resources on hot
+  rows/tables rather than full database residency.
+- BTrim introduces three IMRS row classes per partition: inserted rows that
+  exist only in IMRS, cached rows pulled into IMRS by point lookups, and
+  migrated rows moved into IMRS when hot page-store rows are updated.
+- Each in-memory row has an immutable header with a chain of immutable row
+  versions. Older versions support snapshot isolation and are reclaimed by
+  non-blocking garbage-collection threads.
+- Cold rows are moved back to page-store storage by Pack threads under
+  information-lifecycle-management rules. Hotness uses runtime access
+  frequency and page-store contention signals; rows are maintained in a relaxed
+  LRU-like order and with a timestamp-filter technique.
+- Existing B-tree leaves continue to store key plus RID. A sparse multi-level
+  RID-map resolves physical RIDs or virtual RIDs to in-memory addresses when a
+  row is in IMRS. RID-map lookup is lockless/CAS-based and shrinks as rows
+  leave the fast tier.
+- Hash Cached B-tree indexes add a non-logged, lock-free hash fast path for
+  fully qualified unique B-tree lookups over in-memory rows only. The B-tree
+  still spans both stores and remains the range-query access path.
+- Changes to page-store rows use the existing redo/undo log. Changes to IMRS
+  rows use a separate redo-only `sysimrslogs` device containing committed row
+  images. A transaction touching both stores commits only when both log legs
+  are durable.
+- IMRS uses commit-time aggregate logging: if a transaction updates an
+  in-memory row multiple times, only the final after-image is logged.
+  Transaction descriptors count required log space during execution, then
+  reserve a contiguous transaction block at commit.
+- Transaction blocking gives concurrently committing transactions distinct
+  insertion ranges in `sysimrslogs`, reducing last-log-page contention. Small
+  transaction blocks can still share log pages and use group commit.
+- Recovery from `sysimrslogs` is redo-only. Recovery starts from the oldest row
+  still present in the IMRS cache and skips reserved but incomplete transaction
+  blocks.
+- Evaluation is intentionally throughput-focused and uses stored procedures to
+  remove client/result-network costs. On hot-row select microbenchmarks, IMRS
+  plus hash-cached B-tree reports up to 57x higher select throughput than the
+  page store at 64 cores. Insert microbenchmarks report roughly 1.8-2x gains
+  even for one-row transactions and higher gains at larger transaction sizes.
+  A TPC-C-like end-to-end workload reports close to 3x throughput improvement
+  at 64 cores, where the page store stops scaling beyond 32 cores.
+
+**GPU DB mapping:** GPU DB should treat BTrim as a caution against coarse
+table-level residency. A retained GPU table snapshot is useful, but the P8
+tiering model needs smaller hot units: partition, row-id range, column group,
+predicate family, or generated snapshot segment. Like IMRS, the hot tier should
+be driven by observed access and contention, not only by static DBA decisions.
+
+The inserted/cached/migrated row classes translate into GPU DB segment states.
+New append/COPY chunks can start as CPU canonical plus "resident-build
+eligible"; repeated point lookups can promote key/rid slices; hot updates can
+keep a CPU-side row/delta tier while invalidating GPU snapshots. Cold resident
+segments should be packed or demoted to host/NVMe layouts with explicit
+telemetry rather than silently disappearing from planner choices.
+
+BTrim's RID-map and hash-cached B-tree are directly relevant to retained point
+lookups. GPU DB can keep a correctness index in CPU/WAL state, plus a sparse
+resident mapping from stable row identities to device offsets for only the hot
+snapshot generation. The sparse map should be rebuildable and non-durable, but
+its validity must be tied to table OID, schema generation, WAL boundary, and
+snapshot generation.
+
+The logging split is also useful. GPU DB should not copy BTrim's claim that WAL
+is "moot" for in-memory rows, because GPU DB's durable authority remains WAL.
+But the aggregate-logging and transaction-block reservation idea maps to COPY
+and hot update batches: count bytes/records during admission, reserve durable
+log space at a deterministic boundary, generate final after-images once, then
+publish visibility and invalidate resident generations after durability.
+
+For session concurrency, the hot-row lesson is that contention should be
+measured at the resource where it occurs. Page contention in BTrim becomes GPU
+DB boundary contention: mutation owner, WAL append, RID-map lookup, resident
+segment, GPU stream, response ring, or cold-tier fetch. The promotion policy
+should consider both access frequency and contention saved by moving work to a
+different tier.
+
+**Risks and mismatches:** BTrim is a commercial row-store OLTP extension, not a
+GPU execution engine. It evaluates stored-procedure throughput and explicitly
+does not focus on network result latency, so its gains do not predict pgwire
+p50/p99 behavior or 1M logical-session pressure. It also relies on pessimistic
+row locking for ANSI isolation, whereas GPU DB still needs a WAL/MVCC snapshot
+design that works with retained GPU read snapshots.
+
+The separate redo-only log and commit-time full-row image logging are not
+universally better. The paper reports that IMRS can underperform the page store
+for low-contention narrow updates because full-image logging writes more than a
+delta log. GPU DB should therefore make aggregate/final-image logging a
+route-specific benchmark, especially for wide rows, repeated updates, and COPY
+chunks, not a default for every mutation.
+
+The paper leaves several details to companion product work, including full Pack
+heuristics and timestamp-filter internals. It also does not evaluate crash
+rebuild cost for GPU-style resident segments, compressed columns, or
+over-resident NVMe paths. Those remain GPU DB design work.
+
+**Benchmark candidates:**
+
+- Add a no-GPU hot-tier simulator with row/segment states matching
+  inserted/cached/migrated/packed. Promote by access frequency plus contention
+  saved, demote under byte pressure, and report false promotion/demotion cost.
+- Prototype a sparse resident RID-to-device-offset map for one retained point
+  lookup route. Gate: map lookup plus device read beats dense scan while every
+  map entry carries table OID, schema generation, snapshot generation, and
+  invalidation generation.
+- Build a COPY/update admission experiment that counts log bytes during batch
+  assembly, reserves a contiguous durable log block at commit, and emits one
+  final image per row per transaction when safe. Failure condition: narrow
+  low-contention updates regress versus delta/WAL logging.
+- Add cold-pack telemetry for resident snapshots: bytes demoted, rows/segments
+  demoted, last access generation, contention saved estimate, rebuild cost,
+  and planner fallback reason.
+- Benchmark route-specific hotness: compare promoting whole table, partition,
+  column group, row-id range, and key-vector slices under mixed retained
+  lookups, updates, and scans. Gate: smaller hot units improve resident hit
+  rate or reduce invalidation blast radius without inflating planner overhead.
+- Add a recovery proof for rebuildable resident maps: after WAL replay and
+  startup warmup, stale resident RID/device mappings from a prior run must not
+  be trusted before the CPU truth and generation metadata rebuild them.
+
+### 2026-06-03 - Cross-paper synthesis: hot tiers need semantic units
+
+Three recent reviews point at the same design track from different angles.
+FastLanes-GPU says compressed resident vectors should be admitted per operator
+shape because bandwidth savings can lose to register pressure. Polyjuice says
+correctness should stay invariant while admission, wait points, and retry
+backoff become policy-table choices. BTrim says hot data placement should be
+row/partition aware and driven by measured access plus contention, not by
+full-table residency assumptions.
+
+The converging GPU DB track is semantic hot-tier admission. A retained route
+should carry semantic compatibility fields, physical placement fields, and
+runtime pressure fields: snapshot generation, partition/row range, column
+family, encoding, key-vector/map availability, update invalidation risk, queue
+pressure, and rebuild cost. The scheduler can then choose dense GPU, compressed
+GPU, sparse resident map, CPU hot row/delta, host compressed segment, or cold
+NVMe fallback without weakening WAL-before-visibility.
+
+Category gap: the journal now has good coverage of runtime pressure,
+learned/adaptive concurrency policy, GPU compression, and row-level hot tiering.
+The next useful gap is modern HTAP tuple discovery or MVCC scan structures that
+connect long-lived snapshots to fast retained read refresh.
+
+Benchmark priority: build a small placement simulator before code changes. It
+should replay hot lookups, scans, COPY chunks, and updates; compare whole-table,
+partition, row-range, column-group, and sparse-map residency; and require every
+admission/demotion decision to name the correctness generation and the pressure
+or cost signal that drove it.
