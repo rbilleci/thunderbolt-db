@@ -26,7 +26,7 @@ mechanical sympathy, multi-tier cache/data placement, or query optimization.
   PDF: `https://db.cs.cmu.edu/papers/2016/yu-sigmod2016.pdf`
   Why: timestamp-based optimistic concurrency control for high-throughput
   transaction processing; useful for comparing MVCC/snapshot timestamp choices.
-- `queued` — **Cicada: Dependably Fast Multi-Core In-Memory Transactions**,
+- `reviewed` — **Cicada: Dependably Fast Multi-Core In-Memory Transactions**,
   Lim et al., SIGMOD 2017.
   URL: `https://dl.acm.org/doi/10.1145/3035918.3064015`
   Why: high-throughput multicore transaction processing with concurrency
@@ -338,6 +338,20 @@ Append new candidates here as each paper is processed.
   Why: modern listwise follow-up to Lero-style plan ranking; relevant to
   whether GPU DB route selection should rank candidate CPU/GPU/tiered plans as
   a set instead of pairwise comparisons only.
+- `queued` — **OLTP Through the Looking Glass 16 Years Later:
+  Communication is the New Bottleneck**, Zhou et al., CIDR 2025.
+  URL:
+  `https://www.vldb.org/cidrdb/2025/oltp-through-the-looking-glass-16-years-later-communication-is-the-new-bottleneck.html`
+  PDF: `https://www.vldb.org/cidrdb/papers/2025/p17-zhou.pdf`
+  Why: modern whole-stack OLTP breakdown showing communication and isolation
+  costs as dominant bottlenecks; directly relevant to pgwire/session
+  admission, stored-procedure boundaries, and owner/runtime queue design.
+- `queued` — **Fast Failure Recovery for Main-Memory DBMSs on Multicores**,
+  Zheng et al., SIGMOD 2016.
+  URL: `https://doi.org/10.1145/2882903.2915239`
+  Why: Cicada cites parallel durability and recovery as the path for scalable
+  logging/checkpointing; useful for GPU DB WAL replay, checkpoint rebuild, and
+  post-crash CPU/GPU cache warmup design.
 - `queued` — **RUMA has it: Rewired User-space Memory Access is Possible!**,
   Schuhknecht et al., PVLDB 2016.
   URL: `https://www.vldb.org/pvldb/vol9/p768-schuhknecht.pdf`

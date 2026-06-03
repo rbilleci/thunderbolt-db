@@ -10365,3 +10365,237 @@ answer for OLTP commit ordering, WAL flush throughput, or 1M logical sessions.
 - Compare direct handle hot-route overhead against a catalog/hash lookup path.
   Required metrics: route lookup time, cache miss rate, generation validation
   cost, invalidation latency, and false-fast-route count.
+
+### 2026-06-03 - Cicada dependably fast multi-core in-memory transactions
+
+**Citation:** Hyeontaek Lim, Michael Kaminsky, and David G. Andersen.
+"Cicada: Dependably Fast Multi-Core In-Memory Transactions." SIGMOD 2017,
+pp. 21-35. doi:10.1145/3035918.3064015. Retrieved 2026-06-03 from the
+author PDF, `https://hyeontaek.com/papers/cicada-sigmod2017.pdf`; ACM DOI
+page is `https://dl.acm.org/doi/10.1145/3035918.3064015`.
+
+**Category:** transaction processing / write path and concurrency control.
+
+**Relevance tags:** serializable MVCC; optimistic concurrency control;
+multi-core OLTP; distributed clocks; timestamp allocation; deferred index
+updates; rapid garbage collection; contention regulation; read-only snapshots;
+write-path validation.
+
+**Core idea:** Cicada combines optimistic execution, multi-version records,
+and loosely synchronized per-thread clocks to keep serializable in-memory
+transactions fast across both low- and high-contention workloads. The paper's
+central claim is that MVCC does not have to be slower than single-version OCC
+if version search, timestamp allocation, index updates, garbage collection, and
+abort backoff are all designed for multicore cache behavior.
+
+The design avoids several common OLTP traps at once. Transactions read shared
+committed versions without in-place overwrite copies, prepare writes in local
+versions, validate at a chosen timestamp, and only then install or commit
+versions and index changes. Per-thread clocks remove the global timestamp
+counter bottleneck. Best-effort inlining keeps read-mostly small versions near
+record metadata. Rapid quiescent-state garbage collection keeps version chains
+short. A global hill-climbing backoff controller regulates abort pressure when
+contention is high.
+
+The evaluation compares Cicada with Silo, TicToc, FOEDUS, MOCC, 2PL,
+Hekaton, and ERMIA on one 28-core dual-socket server. With persistent logging
+and remote clients disabled, Cicada reports up to 2.07M TPC-C transactions/s,
+56.5M YCSB transactions/s, and 356M scanned records/s. The paper also reports
+up to 3x higher throughput than the next fastest design on contended TPC-C and
+shows that replacing Cicada's multi-clock timestamp allocation with a shared
+atomic counter drops one high-speed YCSB case from 56.5M to 6.22M tps.
+
+**Concrete mechanisms:**
+
+- Each worker owns a 64-bit local clock. A transaction timestamp combines an
+  adjusted local clock with a thread-id suffix, giving unique monotonically
+  increasing per-thread timestamps without incrementing one shared counter.
+- One-sided clock synchronization periodically reads another worker's clock and
+  catches up if the remote clock is ahead. Temporary clock boosting after an
+  abort helps a thread escape conflicts caused by a too-early timestamp.
+- Read-write transactions use the worker's write timestamp. Read-only
+  transactions use a global safe read timestamp, do not track or validate a
+  read set, and see a consistent slightly stale snapshot.
+- Records are version chains sorted from latest to earliest by write
+  timestamp. Each version carries write timestamp, read timestamp, status, data,
+  allocation metadata, and immutable fields except status/read timestamp.
+- Version search skips later timestamps, waits briefly for pending versions,
+  ignores aborted versions, and selects the first committed visible version.
+  Writes can early-abort when the visible version's read timestamp or a later
+  committed/pending version makes validation likely to fail.
+- Validation installs pending versions, updates read timestamps for versions in
+  the read set, and rechecks that read and write sets remain serializable at
+  the transaction timestamp.
+- Before validation, the write set is partially sorted by approximate
+  contention using latest-version timestamps so likely conflicts are checked
+  first. An early version-consistency check avoids installing pending versions
+  that would immediately become garbage.
+- Best-effort inlining stores small versions directly in the record head when
+  possible and promotes old read-mostly non-inlined versions after they are
+  safe, reducing pointer chasing without turning hot update records into an
+  inlining contention point.
+- Multi-version indexes are ordinary Cicada tables storing record ids. Range
+  and absent-key reads add leaf/index nodes to the read set; inserts/removes add
+  modified nodes to the write set, deferring index changes until validation and
+  avoiding global index mutation by transactions that later abort.
+- Redo logging is sketched as per-NUMA logger threads receiving validated write
+  sets and appending per-thread redo logs before versions are marked committed.
+  Checkpoint threads asynchronously write latest committed versions and advance
+  quiescent timestamps.
+- Garbage collection uses fine-grained timestamps plus QSBR-style quiescence.
+  Threads enqueue committed versions that make older versions reclaimable;
+  once all workers have quiesced and the global minimum read timestamp has
+  advanced, old versions are detached and returned to local memory pools.
+- Contention regulation uses a leader thread to hill-climb the global maximum
+  randomized backoff time based on observed committed throughput, rather than
+  relying on per-thread local abort heuristics.
+
+**GPU DB mapping:** Cicada's strongest lesson for GPU DB is that MVCC
+performance is a whole-system property. A cheap visibility predicate alone is
+not enough; timestamp allocation, version layout, index mutation, garbage
+collection, and abort/admission policy can each become the bottleneck. For a
+future high-throughput write path, the engine should avoid one global
+transaction-id counter or one global mutation queue becoming the serializing
+point for all sessions.
+
+The multi-clock idea maps naturally to owner domains. Mutation owners or
+partition owners can allocate local generation/timestamp ranges, publish
+visibility boundaries, and periodically synchronize safe read boundaries
+without every transaction contending on a single atomic counter. For
+SQL-visible external consistency, Cicada's delayed-notification option is a
+warning: if commit acknowledgement must reflect a global visibility order,
+that latency must be measured explicitly rather than hidden inside throughput
+numbers.
+
+Cicada's read-only snapshot path also informs retained GPU snapshots. A
+read-only retained route should be able to use a precomputed safe generation
+without tracking a per-query read set or enqueuing through the mutation owner.
+That is close to the current read snapshot publication target in
+`11-high-throughput-query-runtime.md`, but Cicada adds an implementation hint:
+publish a safe read timestamp/generation from per-owner minima and make its
+staleness visible in telemetry.
+
+Deferred index updates are directly relevant to COPY/INSERT admission and
+resident invalidation. If aborted or rejected transactions modify global CPU
+indexes, value indexes, or residency metadata before validation, they can create
+exactly the index contention Cicada avoids. GPU DB should prepare value-index
+updates, resident invalidations, and refresh notices locally or in owner-private
+buffers, then publish them only after WAL and validation make the mutation
+eligible for visibility.
+
+Rapid GC maps to snapshot retirement and tier pressure. Long retained GPU
+reads, old CPU MVCC versions, stale resident generations, and old deleted-key
+side structures must have fine-grained retirement telemetry. A coarse
+millisecond-scale epoch can keep too much cold state in hot CPU or GPU memory
+when the engine is creating many versions or invalidations per second.
+
+Contention regulation should influence admission. Under high write contention,
+blind immediate retries from many pgwire sessions can waste CPU, owner queue
+capacity, cache bandwidth, and possibly GPU refresh work. A global or
+partition-local backoff/admission controller that optimizes committed
+throughput and tail latency is a better first benchmark than unlimited retries.
+
+**Risks and mismatches:** Cicada is a single-node in-memory OLTP engine, not a
+PostgreSQL-compatible GPU database. Its evaluation disables persistent logging
+and remote clients, so the reported throughput does not include WAL flush
+latency, pgwire framing, response writes, network backpressure, GPU residency,
+CUDA work, or 1M logical sessions. The durability section is a design sketch,
+not the measured configuration.
+
+The multi-clock design does not provide external consistency by default across
+threads. Delaying commit acknowledgement until a safe global minimum advances
+can add latency, which may matter more for a SQL service than for benchmark
+throughput. Cicada also spin-waits on pending versions, which is acceptable
+only if pending windows remain very short; GPU DB must not let long refreshes,
+WAL stalls, or CUDA work hold equivalent pending states on hot write paths.
+
+Best-effort inlining is CPU-cache-oriented and does not directly solve GPU
+columnar layout or HBM residency. Deferred multi-version indexes assume
+Cicada's record-id table model; GPU DB will need separate handling for SQL
+catalog identities, row ordinals, resident partitions, and rebuildable
+acceleration indexes. Finally, the global backoff hill climb optimizes
+throughput, while GPU DB also needs p50/p99 latency and fairness among session
+classes.
+
+**Benchmark candidates:**
+
+- Add a transaction/generation allocation microbenchmark comparing one global
+  atomic counter with per-owner local generation allocation plus periodic safe
+  read-boundary publication. Minimum gate: identical visibility ordering in
+  WAL replay tests and measured allocation contention under concurrency.
+- Instrument current write/COPY admission for early global mutation: value
+  index writes, resident invalidation, catalog state changes, and response
+  publication before validation/WAL eligibility. Failure condition: an aborted
+  or rejected mutation can still touch global hot structures.
+- Prototype deferred value-index and resident-invalidation publication for one
+  write path: prepare owner-private changes, flush WAL, then publish CPU index
+  and residency invalidation in deterministic order. Measure rows/s, owner
+  queue wait, index contention, and invalidation latency.
+- Add safe read-generation telemetry for retained routes: CPU latest
+  generation, retained safe generation, generation staleness, oldest active
+  reader, and version bytes pinned. Gate: retained read correctness remains
+  identical while route output names the generation used.
+- Build a rapid-retirement stress test with repeated updates/deletes to hot
+  keys while long retained reads are active. Compare coarse epoch cleanup with
+  fine-grained per-owner safe read minima. Failure condition: p95 fresh lookup
+  or write latency grows with unreclaimed old versions/tombstones.
+- Add contention-aware write retry/admission for one synthetic hot-row or
+  hot-partition workload. Compare no backoff, fixed backoff, local backoff, and
+  global/partition hill-climbing backoff. Required metrics: committed rows/s,
+  abort/retry count, owner queue wait, p99 latency, and fairness between hot
+  and cold sessions.
+- For read-only retained snapshots, test a no-read-set route using a published
+  safe generation versus a mutation-owner-validated read. Expected improvement:
+  lower owner queue pressure and p50 latency; failure condition: freshness or
+  visibility boundary is ambiguous in telemetry.
+
+### 2026-06-03 - Cross-paper synthesis: hot paths need fast handles and slow-path regulators
+
+**Papers covered:** LeanStore low-overhead transactional buffer management,
+Umbra variable-size pages for SSD-backed hot working sets, and Cicada
+dependably fast multi-core in-memory transactions.
+
+**Converging design tracks:**
+
+- **Fast handle, explicit owner.** LeanStore's swips, Umbra's owner swips, and
+  Cicada's record/version heads all point to the same rule: the hot path should
+  resolve a stable handle cheaply, while one owner remains responsible for
+  mutable state transitions. GPU DB should route through owner-published
+  generation handles rather than letting prepared plans, response caches, and
+  residency metadata independently mutate validity.
+- **Do not make cold work pollute hot state.** LeanStore cooling, Umbra
+  variable-size active-byte budgeting, and Cicada rapid GC all separate hot
+  access from old/cold/transient state. GPU DB should let long scans, stale
+  retained generations, old MVCC versions, and cold partition refreshes move
+  out of hot lookup/write paths quickly and observably.
+- **Local first, coordinated only when needed.** Cicada's per-thread clocks and
+  local version preparation match the broader owner-domain direction:
+  partition or mutation owners should allocate, prepare, and validate locally,
+  then publish through explicit global safe boundaries instead of contending on
+  one shared counter or one global index state.
+- **Slow-path regulators are correctness infrastructure.** Cooling windows,
+  variable-size eviction, GC quiescence, and backoff regulation are not just
+  performance features. They prevent hot state from being overwhelmed by
+  scans, retries, stale versions, and tier migration.
+
+**Category gaps:** The journal has strong recent coverage across transaction
+control, runtime scheduling, tier placement, and robust planning. The remaining
+near-term gap is whole-stack OLTP communication cost under real client/server
+protocols and isolation boundaries; the next high-value runtime candidate is
+the CIDR 2025 Looking Glass paper before returning to another storage/tiering
+paper.
+
+**Benchmark priorities:**
+
+- Define an owner-published resident/MVCC handle format with generation,
+  visibility boundary, tier location, size class, and state-word version; prove
+  hot-route validation is cheaper than catalog/hash lookup without hiding
+  invalidation.
+- Measure cold-state pressure as one metric family: old MVCC bytes, stale
+  resident generations, cooling HBM bytes, host warm bytes, pinned bytes, and
+  retry/backoff state.
+- Add a partition-local timestamp/generation allocator proof before global
+  route scaling. Required evidence: no shared-counter bottleneck, deterministic
+  safe read-boundary publication, and WAL replay equivalence.
+- Treat backoff, cooling, eviction, and GC as admission controllers with p99
+  latency and fairness metrics, not only average throughput metrics.
