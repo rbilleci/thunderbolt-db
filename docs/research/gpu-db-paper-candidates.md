@@ -261,7 +261,7 @@ Append new candidates here as each paper is processed.
   URL: `https://www.vldb.org/pvldb/vol18/p4518-li.pdf`
   Why: modern out-of-GPU-memory database execution work relevant to P8
   over-resident partitioning and CPU/GPU fallback.
-- `queued` — **Vortex: Overcoming Memory Capacity Limitations in
+- `reviewed` — **Vortex: Overcoming Memory Capacity Limitations in
   GPU-Accelerated Large-Scale Data Analytics**, Yuan et al., PVLDB 2024.
   URL: `https://www.vldb.org/pvldb/vol18/p1250-yuan.pdf`
   Why: multi-GPU/interconnect approach to capacity limits, useful for future
@@ -1454,3 +1454,15 @@ Append new candidates here as each paper is processed.
   Why: cited by the MVGC paper as a practical multiversioning system; useful
   for contrasting reader-side logging, version lifetime, and reclamation costs
   with GPU DB MVCC chains and long retained snapshots.
+- `queued` — **Triton Join: Efficiently Scaling to a Large Join State on GPUs
+  with Fast Interconnects**, Lutz et al., SIGMOD 2022.
+  URL: `https://doi.org/10.1145/3514221.3517911`
+  Why: Vortex compares against Triton Join's fast-interconnect join state
+  strategy; useful for deciding when over-resident GPU DB joins should depend
+  on high-bandwidth CPU/GPU links versus explicit multi-GPU IO forwarding.
+- `queued` — **MG-Join: A Scalable Join for Massively Parallel Multi-GPU
+  Architectures**, Paul et al., SIGMOD 2021.
+  URL: `https://doi.org/10.1145/3448016.3457254`
+  Why: Vortex contrasts multi-GPU memory-capacity scaling with IO forwarding;
+  MG-Join is a direct follow-up for future multi-device join partitioning and
+  interconnect-aware placement.

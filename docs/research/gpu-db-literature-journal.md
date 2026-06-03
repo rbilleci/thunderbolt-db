@@ -16374,3 +16374,200 @@ epoch fallback.
 - Test coarse partition-generation range tracking before row-level exact
   tracking. Expected result: a coarse first version catches most retained
   snapshot memory blowups with lower write-path metadata cost.
+
+### 2026-06-03 - Vortex over-resident multi-GPU IO forwarding
+
+**Citation:** Yichao Yuan, Advait Iyer, Lin Ma, and Nishil Talati.
+"Vortex: Overcoming Memory Capacity Limitations in GPU-Accelerated
+Large-Scale Data Analytics." PVLDB 18(4), 2024, pp. 1250-1263.
+doi:10.14778/3717755.3717780. Retrieved 2026-06-03 from
+`https://www.vldb.org/pvldb/vol18/p1250-yuan.pdf`.
+
+**Category:** GPU execution / analytics; multi-tier cache / data placement.
+
+**Relevance tags:** over-resident execution; CPU DRAM to GPU transfer;
+multi-GPU systems; PCIe scheduling; SDMA; zero-copy; late materialization;
+operator chunking; GPU IO admission; co-located AI/analytics workloads.
+
+**Core idea:** Vortex treats GPU memory capacity as an IO-scheduling problem
+rather than only a caching or multi-GPU compute problem. The system assumes no
+data is cached in GPU memory before a query and processes data that exceeds GPU
+memory by streaming from CPU DRAM. Its key twist is to use the PCIe links and
+SDMA engines of neighboring GPUs as forwarding resources for one target GPU,
+so an IO-bound analytics query can consume more host-to-device bandwidth
+without also scaling compute work across every GPU.
+
+The paper layers this below an IO-decoupled programming model. GPU programmers
+write or reuse kernels as if chunks already fit in device memory, while Vortex
+handles chunk mapping, double-buffering, and CPU/GPU transfers through an
+Exchange primitive. On Star Schema Benchmark scale factor 1000, with no
+between-query GPU caching, the paper reports that Vortex is 3.4x faster than a
+CPU DuckDB baseline on average and 5.7x faster than the GPU Proteus baseline;
+the borrowed forwarding resources slow co-located AI workloads by 6.8% on
+average in the reported interference study.
+
+**Concrete mechanisms:**
+
+- Exchange exposes a higher-level CPU/GPU data-movement primitive over groups
+  of source and destination memory references rather than a single contiguous
+  memcpy.
+- A target GPU uses its own CPU-facing PCIe link plus neighboring GPUs as
+  indirect forwarding links. Forwarding GPUs stage packets through small device
+  buffers and relay them across inter-GPU links to the target GPU.
+- Packetized transfers are pipelined so forwarding GPUs overlap receive and
+  send work, using only a small packet buffer instead of staging an entire
+  chunk.
+- The implementation avoids submitting long dependency DAGs to GPU runtime
+  queues because stream and hardware FIFO behavior can create head-of-line
+  blocking. Link workers submit work only when it should execute immediately.
+- A global scheduler maintains H2D and D2H packet queues and applies flow
+  control across both directions. On the evaluated AMD MI100 system, D2H
+  traffic could starve H2D bandwidth, so the policy prevents D2H from draining
+  too far ahead.
+- Empirically, the paper uses a 20 MB packet size as a compromise between copy
+  setup overhead and pipeline depth; Exchange reaches up to about 140 GB/s on
+  transfers of 8 GB or larger in the evaluated 4-GPU topology.
+- ExKernels separate data mapping from kernel adaptation. The mapping methods
+  split large CPU-resident inputs and outputs into chunks; the kernel method
+  wraps an existing on-GPU implementation and returns a type code describing
+  where its output landed.
+- The pipelined executor divides GPU memory into two large buffers plus
+  temporary space. While one buffer is processed by a kernel, Exchange loads
+  the next chunk and writes back the previous output through the other buffer.
+- Sort is expressed as chunk sort plus merge using rocPRIM primitives. Hash
+  join is expressed as radix partitioning into many hash groups followed by
+  group-local joins that fit into GPU shared memory.
+- Late materialization chooses between SDMA-based Exchange and GPU zero-copy
+  access per column. Vortex uses a threshold `E / (cache_line_size *
+  exchange_gpu_count)`, so sparse accesses below the threshold use zero-copy
+  while denser columns are transferred through Exchange.
+- For SSB, small dimension tables are loaded and kept on the GPU; the large
+  fact table is partitioned and streamed. Dimension-filter selectivity drives
+  late materialization of fact-table columns.
+- The evaluation separates interference-free throughput from co-location with
+  AI workloads on the forwarding GPUs, exposing that bidirectional forwarding
+  and memory-intensive LLM decode phases cause more slowdown than compute-bound
+  phases.
+
+**GPU DB mapping:** Vortex is most useful for P8 over-resident execution, not
+for the OLTP write path. It suggests that a future multi-GPU GPU DB should
+treat "resident", "streamed from host", and "forwarded through neighboring
+GPU IO engines" as distinct route choices with explicit admission and
+telemetry. A retained route should not silently assume one CPU/GPU transfer
+link; the planner should know the available H2D/D2H bandwidth, packet size,
+neighbor-GPU forwarding budget, inter-GPU topology, and co-tenant interference
+policy.
+
+The Exchange primitive maps well to the runtime owner model. GPU execution
+owners should own CUDA/HIP streams, events, packet buffers, and transfer
+queues; a residency or IO owner should schedule H2D/D2H packets with balanced
+flow control rather than letting every query issue ad hoc memcpys. The
+"submit only immediately executable transfer work" rule is especially relevant
+to the current command/response ring plan: hidden runtime queues can destroy
+tail latency and make backpressure invisible.
+
+The IO-decoupled programming model gives a practical shape for over-resident
+operator development. GPU DB kernels for retained scans, grouped aggregates,
+lookups, and future joins can be written against chunk-local column buffers,
+while the runtime supplies a chunk iterator, visibility boundary, output
+scatter region, and transfer policy. This avoids mixing every kernel with
+storage-tier orchestration and allows CPU/GPU route changes without rewriting
+operator kernels.
+
+Late materialization is a direct planner hook. P8 already distinguishes dense
+resident column groups and CPU truth. Vortex suggests a measurable rule for
+whether to transfer a projected column into GPU memory or let the kernel fetch
+selected host values through zero-copy. For GPU DB, the threshold must also
+include pinned-buffer availability, snapshot lifetime, predicate selectivity,
+socket response size, and whether neighboring GPU IO resources are admitted.
+
+The interference analysis is a warning for future shared-GPU deployments.
+Borrowing a neighbor GPU's IO resources is not free even when the neighbor is
+compute-bound. GPU DB should account for forwarding tax in route choice and
+surface it as an admission decision, not as unexplained query slowdown.
+
+**Risks and mismatches:** Vortex is an OLAP framework, not a transactional
+engine. It does not address WAL-before-visibility, MVCC snapshot semantics,
+write admission, invalidation, checkpoint/replay, or SQL protocol concurrency.
+Its end-to-end benchmark is SSB, and the chosen operators are sort, hash join,
+and star-schema scans, so transferability to point lookups, short
+transactions, and high session counts must be tested.
+
+The design assumes a multi-GPU topology with useful independent PCIe links and
+fast inter-GPU communication. A single consumer GPU or a system where GPUs
+share a constrained PCIe switch may not benefit. The paper evaluates AMD MI100
+hardware and HIP/rocPRIM; NVIDIA behavior, future NVLink/CXL/GPUDirect
+storage paths, and mixed GPU generations may change the bottlenecks.
+
+Vortex streams from CPU DRAM, not disk or NVMe, and it assumes no pre-query GPU
+caching. GPU DB's P8 design explicitly wants hot GPU-resident snapshots, so
+Exchange-like streaming is a fallback or over-resident route rather than a
+replacement for residency. The threshold for zero-copy late materialization is
+hardware-specific and based on simple selectivity; real SQL plans will need
+cardinality-error and queue-delay safeguards.
+
+**Benchmark candidates:**
+
+- Build a CPU-DRAM over-resident scan microbenchmark that compares one-GPU
+  H2D streaming, dual-buffered streaming, and, when hardware permits,
+  neighbor-GPU forwarded streaming. Gate: exact SQL results and truthful H2D,
+  D2H, queue wait, packet size, and GPU kernel telemetry.
+- Add a planner experiment for late materialization: transfer selected columns
+  densely versus fetch sparse projected values from pinned host memory or
+  zero-copy. Gate: route choice matches measured break-even selectivity under
+  different row widths and projected column counts.
+- Test "submit immediately executable transfers" against a naive many-stream
+  memcpy DAG. Failure condition: hidden runtime queueing produces unexplained
+  p99 latency or transfer-time variance.
+- Add an over-resident grouped aggregate benchmark where the kernel sees
+  chunk-local GPU buffers and the runtime supplies chunk IO. Expected result:
+  operator code stays reusable while the runtime can vary transfer policy.
+- Track forwarding/admission tax in telemetry: neighbor GPU ids, borrowed
+  bandwidth, packet count, stalls from H2D/D2H flow control, co-tenant slowdown
+  estimate, and rejection reason when forwarding is not admitted.
+- Pair any multi-GPU over-resident experiment with a correctness guard:
+  resident snapshots remain immutable, invalidated generations do not stream
+  stale data, and CPU truth/WAL boundaries are proven before GPU route
+  publication.
+
+### 2026-06-03 - Cross-paper synthesis: snapshot-bounded, IO-bounded execution
+
+**Papers covered:** PACMAN parallel command-log recovery, bounded
+multiversion garbage collection, and Vortex.
+
+These three papers converge on a simple production rule: throughput comes from
+decoupling scarce resources, but correctness comes from naming the boundary
+each resource is allowed to cross. PACMAN decouples compact write logging from
+parallel recovery scheduling, but still replays in commit/dependency order.
+The MVGC paper decouples active reader lifetimes from obsolete middle versions,
+but only reclaims intervals no reader can still observe. Vortex decouples GPU
+kernels from IO scheduling, but only transfers chunks admitted by an explicit
+packet scheduler.
+
+For GPU DB, the promising design track is **bounded publication pipelines**:
+write batches publish visibility only after WAL safety; snapshots publish
+retained GPU generations only after a source boundary is proven; recovery
+publishes CPU truth before resident warmup; and over-resident IO publishes
+chunks to kernels only through an admitted transfer budget. The runtime should
+make these boundaries visible as first-class telemetry rather than hide them
+inside channels, CUDA streams, mmap faults, or allocator state.
+
+Category balance is healthier after this run: the last three papers cover
+write/recovery, MVCC/GC, and GPU/tiered IO. The next paper should probably
+return to runtime/session admission, OLTP concurrency, or query optimization
+unless the queue has an unusually strong tiering source, so the journal does
+not drift back into GPU-OLAP only.
+
+Benchmark priorities:
+
+- Recovery plus residency: replay CPU truth in dependency-aware partitions,
+  then rebuild GPU snapshots only after visibility and invalidation boundaries
+  are proven.
+- Long-reader pressure: hold retained snapshots while writes advance and prove
+  bounded CPU versions, resident generations, and pinned/device buffers.
+- Over-resident route admission: measure transfer queues and packet flow
+  control alongside kernel time so streaming wins are not confused with hidden
+  queue growth.
+- Planner break-even tests: route among resident GPU, streamed GPU, zero-copy,
+  and CPU fallback using measured selectivity, bytes, queue delay, and
+  snapshot compatibility.
