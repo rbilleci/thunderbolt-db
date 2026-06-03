@@ -1176,7 +1176,7 @@ Append new candidates here as each paper is processed.
   Why: TPP discusses network and CXL memory tiers as complementary; DirectCXL
   is a primary follow-up for direct CXL memory disaggregation, remote-memory
   latency budgets, and future placement boundaries beyond local DRAM/HBM/NVMe.
-- `queued` — **R2P2: Making RPCs First-Class Datacenter Citizens**,
+- `reviewed` — **R2P2: Making RPCs First-Class Datacenter Citizens**,
   Kogias et al., USENIX ATC 2019.
   URL: `https://www.usenix.org/conference/atc19/presentation/kogias-r2p2`
   PDF: `https://www.usenix.org/system/files/atc19-kogias-r2p2_0.pdf`
@@ -1361,6 +1361,18 @@ Append new candidates here as each paper is processed.
   Why: the ICDE 2024 BLOB paper discusses file-system aging and fragmentation;
   this gives a primary storage-systems baseline for comparing DBMS extent
   recycling against file-system aging under mixed object allocation/deletion.
+- `queued` — **MittOS: Supporting Millisecond Tail Tolerance with Fast Rejecting
+  SLO-Aware OS Interface**, Hao et al., SOSP 2017.
+  URL: `https://doi.org/10.1145/3132747.3132756`
+  Why: R2P2 cites it for fast rejection under SLO pressure; relevant to GPU DB
+  overload behavior when a request cannot meet a latency budget after queue,
+  snapshot, transfer, or GPU-worker admission checks.
+- `queued` — **pHost: Distributed Near-Optimal Datacenter Transport over
+  Commodity Network Fabric**, Gao et al., CoNEXT 2015.
+  URL: `https://doi.org/10.1145/2716281.2836096`
+  Why: R2P2 contrasts against low-latency datacenter transports; useful for
+  comparing endpoint/network scheduling, packet spraying, and whether transport
+  policy or DB-level request admission should own short RPC tail behavior.
 - `queued` — **2R: Efficiently Isolating Cold Pages in Flash Storages**,
   Kang et al., PVLDB 2020.
   URL: `https://doi.org/10.14778/3407790.3407805`

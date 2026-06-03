@@ -16732,3 +16732,148 @@ full learned route selection is safe.
 - Add confidence-aware admission: when route estimates disagree or uncertainty
   is high, prefer robust fallback or explicit overload. Gate: lower p99 and no
   correctness regression under skewed cardinality and GPU queue pressure.
+
+### 2026-06-03 - R2P2 request-response pairs for RPC admission
+
+**Citation:** Marios Kogias, George Prekas, Adrien Ghosn, Jonas Fietz,
+and Edouard Bugnion. "R2P2: Making RPCs First-Class Datacenter
+Citizens." USENIX ATC 2019, pp. 863-879. Retrieved 2026-06-03 from
+`https://www.usenix.org/system/files/atc19-kogias-r2p2_0.pdf`.
+
+**Category:** runtime / HFT / session scale.
+
+**Relevance tags:** request/response transport; pgwire multiplexing;
+session admission; response rings; direct server return; bounded queues;
+tail latency; RPC load balancing; in-network scheduling; request-level
+backpressure; 1M logical sessions.
+
+**Core idea:** R2P2 argues that datacenter RPCs should be exposed as
+request/response pairs rather than hidden inside byte-stream connections.
+The paper designs a UDP-based RPC transport where each request is identified
+independently, the router chooses the worker for the first request packet,
+and replies return directly from the selected server to the client. That
+breaks the usual point-to-point connection assumption and lets a router or
+programmable switch schedule individual RPCs without forcing all request and
+response bytes through a reverse proxy.
+
+The transferable idea for GPU DB is not "replace pgwire with R2P2" today.
+It is that the serving runtime should expose each SQL request as an
+independent schedulable unit with a response identity, bounded outstanding
+work, and explicit deadline/drop/fallback semantics. A pgwire session may
+remain the compatibility surface, but internally the runtime should not let
+socket ordering, thread-per-client processing, or unbounded per-session
+queues hide the real admission decision.
+
+**Concrete mechanisms:**
+
+- R2P2 identifies an RPC by source IP, source port, and request id, so many
+  independent outstanding requests can share one endpoint without inheriting
+  TCP-style stream ordering across semantically independent calls.
+- The router handles only the first request packet. Large request bodies and
+  all replies bypass the router and flow directly between client and selected
+  server, avoiding the reverse-proxy throughput bottleneck.
+- The protocol includes request, reply, ready, feedback, drop, and selective
+  acknowledgment message types. The drop path lets a congested router or
+  server reject one request without damaging unrelated requests.
+- The policy field lets clients request routing behavior such as unrestricted
+  routing or sticky routing. In the Redis experiment, sticky writes go to the
+  master while reads are load-balanced across replicas.
+- The main scheduling policy is Join-Bounded-Shortest-Queue, JBSQ(n): a
+  centralized router queue plus per-worker queues capped at n outstanding
+  requests. Small n approximates single-queue work conservation while still
+  keeping workers fed.
+- Servers send feedback messages after completing requests. The feedback
+  includes the current bounded-queue capacity and served-request count, making
+  the router's worker-state update robust to feedback loss.
+- The software router uses DPDK, separate request and feedback UDP ports,
+  priority processing for feedback, single-writer counter arrays, and bounded
+  batching to reduce cache-coherence and PCIe costs.
+- The hardware router is implemented in P4 on a Tofino ASIC. It stores soft
+  outstanding-request counters in switch registers and uses recirculation to
+  inspect bounded queues when the dataplane cannot compare all counters in
+  one pass.
+- The paper reports that the software middlebox adds about 5 us unloaded
+  latency and routes at 10 Gb/s line rate with two CPU cores; the P4 router
+  adds less than 1 us. For Redis with master/slave replication and a 200 us
+  p99 SLO, R2P2 improves throughput over vanilla Redis by more than 4.8x.
+
+**GPU DB mapping:** GPU DB's target runtime already names network IO workers,
+bounded command rings, read snapshot rings, GPU execution rings, and response
+rings. R2P2 sharpens the missing contract between these rings: every parsed
+SQL request should carry a stable request id, response-ring destination,
+deadline/SLO budget, route policy, and admission class. The IO worker can
+preserve pgwire ordering where the protocol requires it, but the engine
+should route internally by request identity and compatibility, not by a
+thread-per-client queue.
+
+JBSQ(n) maps directly to GPU execution and read-snapshot admission. A retained
+lookup worker or partition-local GPU stream should expose how many compatible
+requests it can accept before p99 is likely to degrade. The scheduler should
+hold excess compatible requests in a central or per-route queue rather than
+blindly flooding the worker. For very short retained reads, n may need to be
+larger to avoid idle GPU/CPU workers; for mixed long scans and short point
+lookups, n should stay small or be split by route class.
+
+R2P2's direct server return suggests a response-path rule: once a request is
+assigned to a read snapshot or GPU worker, the response should not have to
+return through the mutation owner unless correctness demands it. The selected
+worker can encode or stage the response into the IO worker's response ring,
+while the mutation owner only publishes visibility and invalidation
+boundaries.
+
+The policy field is a useful mental model for route classes. GPU DB could
+carry internal policies such as sticky-to-mutation-owner, any-compatible-read
+snapshot, same-generation micro-batch, CPU-fallback-allowed, GPU-only-or-drop,
+or refresh-before-route. Those are database semantics, not merely network
+policies, so they must include snapshot compatibility, WAL boundary, and
+resident generation checks.
+
+The feedback mechanism should become first-class telemetry. Read workers,
+mutation owners, residency refresh workers, and GPU execution owners should
+periodically publish available slots, completed request counts, queue wait,
+batch drain size, and rejection reason. Admission then sees live service
+capacity rather than treating a channel send as success.
+
+**Risks and mismatches:** R2P2 is a transport and load-balancing paper, not a
+database concurrency-control paper. It does not address MVCC visibility, SQL
+transaction ordering, WAL-before-visibility, DDL barriers, prepared
+statements, cursors, or pgwire's session semantics. GPU DB cannot simply
+discard ordering across all requests; interactive transactions and protocol
+state require stricter lanes.
+
+The evaluation is on 10 GbE, DPDK, UDP, a Tofino ASIC, Lucene++, and Redis.
+Modern NICs, kernel io_uring, QUIC, RDMA, 400G/800G Ethernet, and regular
+PostgreSQL clients change the implementation economics. R2P2 also leaves
+congestion control mostly to other schemes, so any GPU DB network experiment
+must separate request admission from actual transport congestion.
+
+JBSQ's bounded queues optimize request dispatch, but database work has
+compatibility constraints: snapshot generation, route family, resident
+partition, lock/write-set conflicts, and response ordering can prevent a
+globally idle worker from being a legal target. The GPU DB scheduler needs
+bounded queues per legal route class, not a single undifferentiated request
+pool.
+
+**Benchmark candidates:**
+
+- Replace the thread-per-client pgwire benchmark harness with a small IO-worker
+  pool and per-request response identities. Gate: identical SQL results, no
+  protocol-state regression, and lower p99 queue wait at 64+ logical sessions.
+- Add a JBSQ-style retained-read scheduler for one same-shape lookup route.
+  Sweep n and microsecond hold time. Gate: report throughput, p50/p99, worker
+  idle time, queue wait, and selected batch size; failure condition is hidden
+  p99 growth from overfilled worker queues.
+- Add explicit per-request overload/drop/fallback outcomes at the narrowest
+  saturated boundary: IO queue, mutation owner, read snapshot, residency
+  refresh, GPU worker, pinned-buffer pool, or response ring. Gate: no silent
+  unbounded queue growth under open-loop load.
+- Test direct response-ring return for immutable retained reads: selected
+  read/GPU worker writes response bytes or response fragments to the IO worker
+  without re-entering the mutation owner. Gate: owner queue wait no longer
+  dominates repeated read latency and invalidated generations are rejected.
+- Implement worker feedback counters for route admission: available slots,
+  completed requests, queue-depth estimate, current n, and last rejection
+  reason. Gate: scheduler decisions can be explained from telemetry.
+- Add mixed short/long workload lanes: short retained lookup, long resident
+  scan, refresh job, and mutation. Gate: bounded short-read p99 under long
+  route pressure without violating WAL, snapshot, or DDL ordering.
