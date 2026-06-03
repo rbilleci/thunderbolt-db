@@ -613,7 +613,7 @@ Append new candidates here as each paper is processed.
   Why: learned hint-based optimizer baseline compared by PAR2QO; useful for
   deciding whether GPU route tuning should learn bounded hints around a
   deterministic planner rather than replace route rules.
-- `queued` — **TAS: TCP Acceleration as an OS Service**, Kaufmann et al.,
+- `reviewed` — **TAS: TCP Acceleration as an OS Service**, Kaufmann et al.,
   EuroSys 2019.
   URL: `https://os.mpi-sws.org/projects/tas.html`
   PDF: `https://homes.cs.washington.edu/~arvind/papers/flextcp.pdf`
@@ -621,6 +621,12 @@ Append new candidates here as each paper is processed.
   multi-tenant TCP acceleration service; useful for comparing a central
   IO/runtime service against GPU DB's planned IO-worker and response-ring
   topology.
+- `queued` — **NetKernel: Making Network Stack Part of the Virtualized
+  Infrastructure**, Gamage et al., arXiv 2019.
+  URL: `https://arxiv.org/abs/1903.07119`
+  Why: TAS contrasts itself with network-stack-as-a-service designs; useful
+  for deciding when GPU DB session/network state should remain an in-process
+  IO-worker service versus an externalized infrastructure service.
 - `queued` — **A CXL-Powered Database System: Opportunities and Challenges**,
   Guo and Li, ICDE 2024.
   URL: `https://dbgroup.cs.tsinghua.edu.cn/ligl/papers/CXL_ICDE.pdf`

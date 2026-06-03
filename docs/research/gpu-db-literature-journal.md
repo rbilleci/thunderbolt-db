@@ -7202,3 +7202,157 @@ Benchmark priorities after this batch:
   uniform scans
 - a logical-session memory probe that measures idle state, active
   credits, response buffers, and queue saturation separately
+
+### 2026-06-03 - TAS: TCP Acceleration as an OS Service
+
+**Citation:** Antoine Kaufmann, Tim Stamler, Simon Peter, Naveen Kr. Sharma,
+Arvind Krishnamurthy, and Thomas Anderson. "TAS: TCP Acceleration as an OS
+Service." EuroSys 2019. doi:10.1145/3302424.3303985. Retrieved 2026-06-03
+from the author-hosted ACM paper PDF,
+`https://homes.cs.washington.edu/~arvind/papers/flextcp.pdf`.
+
+**Category:** runtime / HFT / session scale.
+
+**Relevance tags:** TCP fast path; high-connection-count services; POSIX
+sockets; IO-worker isolation; bounded per-flow state; workload-proportional
+runtime; congestion policy; packet queues; tail latency.
+
+**Core idea:** TAS argues that datacenter TCP overhead is not only a kernel
+crossing problem. General TCP stacks carry too much uncommon-case code,
+scattered per-connection state, cache pollution, and shared-state coordination
+into the hot path. TAS splits common-case RPC packet processing into a trusted
+fast-path OS service on dedicated or dynamically assigned cores, while a slow
+path handles connection setup/teardown, congestion policy, timeouts, and other
+stateful or uncommon work. Applications keep a POSIX sockets interface through
+a user-level library, so the fast path is centralized and policy-compliant
+rather than a fully application-owned kernel-bypass stack.
+
+For GPU DB, the useful point is that high logical session scale can be framed
+as an explicitly budgeted service with tiny hot-path state, not as one thread
+or one heavyweight protocol object per client. TAS reports 102 bytes of
+fast-path per-flow state, more than 20,000 active flows per core fitting in
+commodity cache by their estimate, and only up to 7% throughput degradation
+from peak as its RPC echo benchmark scales to 64K connections. It also reports
+up to 90% higher throughput and 57% lower tail latency than IX on evaluated
+cloud workloads, while retaining sockets compatibility.
+
+**Concrete mechanisms:**
+
+- TAS has three components: a fast path, a slow path, and an untrusted
+  per-application user-space stack connected by shared-memory queues.
+- The fast path is a small TCP datapath over DPDK. It parses common-case
+  headers, deposits in-order receive payload directly into per-flow circular
+  receive buffers, generates acknowledgements, enforces configured send
+  rates/windows, segments outgoing payload, and updates local sequence/window
+  state.
+- Connection setup, teardown, congestion policy, timeout handling, stack
+  registry, and exceptional packets are delegated to the slow path because
+  they are less common or have non-constant per-packet cost.
+- The POSIX sockets surface is provided by a user-level library that can be
+  dynamically linked to unmodified applications. TAS also exposes a lower-level
+  API when applications can opt into it.
+- Each flow has fixed send and receive payload buffers plus compact fast-path
+  metadata, including opaque application id, context queue, rate bucket, buffer
+  offsets/sizes/head/tail, sequence/ack/window state, peer tuple, limited
+  out-of-order state, congestion counters, retransmit counters, and RTT
+  estimate.
+- Per-flow receive buffers make flow-control window calculation constant time
+  and avoid iterating over connections sharing a buffer. Per-flow send buffers
+  reduce head-of-line blocking from congestion or receiver flow control.
+- Context queues notify applications of receive and transmit progress. If a
+  context queue is full, later arrivals can retry notification; if a payload
+  receive buffer is full, the packet is dropped and ordinary TCP flow control
+  and retransmission take over.
+- Congestion control policy runs in the slow path but is enforced by the fast
+  path. The paper implements rate-based DCTCP and TIMELY-style mechanisms;
+  the fast path periodically exposes ACKed bytes, ECN-marked bytes, fast
+  retransmit counts, and RTT estimates.
+- Workload proportionality is controlled by monitoring fast-path CPU
+  utilization. The slow path removes a core when aggregate idle capacity is
+  above a threshold and adds one when idle capacity falls below another
+  threshold.
+- Scale-up and scale-down avoid draining all queues. TAS steers NIC RSS and
+  application routing asynchronously and protects rare wrong-core packet cases
+  with per-connection locking.
+- The prototype uses 10,127 lines of C across fast path, slow path, and socket
+  library. It does not resize connection buffers, does not fully implement
+  TCP slow start, and does not support fragmented IP packets.
+- Evaluation uses RPC echo, a skewed key-value store, and FlexStorm
+  real-time analytics. The key-value workload uses 32K connections and a
+  90% GET / 10% SET mix; TAS with sockets improves throughput versus Linux and
+  IX and has lower median-to-tail latency than IX in the reported setup.
+
+**GPU DB mapping:** TAS strengthens the current
+`11-high-throughput-query-runtime.md` direction: network IO should be an owned
+service with small hot-path state, explicit queues, and clear handoff to
+mutation, read-snapshot, residency, and GPU execution owners. GPU DB should
+not let SQL protocol parsing, response encoding, WAL admission, GPU route
+selection, and socket IO share one unbounded client thread. The runtime should
+separate common-case pgwire request/response movement from slow or stateful
+paths such as authentication, DDL, errors, COPY setup, prepared-statement
+changes, large responses, and disconnect cleanup.
+
+The fixed per-flow buffer lesson maps directly to 1M logical sessions. Idle
+session state must be small, and active resources must be separate credits:
+frontend frame bytes, parsed command slots, response buffers, decoded COPY
+chunks, mutation-owner slots, retained read slots, pinned staging buffers, and
+GPU execution budget. A million idle sessions should not imply a million
+resident response buffers or GPU work handles.
+
+TAS also suggests an internal "fast path / slow path" classification for SQL
+work. Common retained reads over a compatible immutable snapshot can use a
+short IO-worker path that enqueues a typed request and receives completion on a
+response ring. Slow-path work should include DDL, catalog generation changes,
+long COPY chunks, refresh, invalidation repair, CPU fallback scans, large
+multi-packet responses, and any route that needs extensive planning. The goal
+is not to hide slow work, but to keep it from polluting the cache and queue
+behavior of the short path.
+
+The workload-proportional core model maps to runtime workers and GPU streams.
+GPU DB can scale IO workers, read workers, or GPU execution owners according
+to queue depth, queue wait, socket writability, response backlog, and
+per-worker CPU usage, but should preserve ownership boundaries. Like TAS,
+resource changes should be asynchronous and observable, with a fallback path
+for requests that arrive at a temporarily wrong owner or saturated queue.
+
+For P8, TAS is a reminder that network and response overhead can erase
+resident GPU wins. Even if retained kernels are zero-H2D and microsecond-scale,
+the pgwire path needs compact per-session metadata, reusable buffers, and
+bounded response queues so protocol work does not dominate p99 latency.
+
+**Risks and mismatches:** TAS is a TCP stack, not a database runtime. It does
+not solve WAL-before-visibility, MVCC validation, snapshot compatibility,
+catalog invalidation, SQL planning, GPU residency, or transaction recovery.
+Its strongest implementation assumes DPDK, dedicated fast-path cores, and
+datacenter network common cases; the current GPU DB benchmark endpoint uses
+ordinary TCP/pgwire and may not be able to adopt a TAS-like stack without
+deployment tradeoffs. Fixed connection buffer sizes are a poor fit for
+arbitrary SQL responses unless GPU DB separates idle logical state from active
+resource credits. The evaluated 64K connection scale is useful but still far
+below the 1M logical-session target, and sockets compatibility still requires
+application relinking in the prototype.
+
+**Benchmark candidates:**
+
+- Build a logical-session memory probe for the pgwire endpoint: allocate
+  compact idle session state at `1k`, `10k`, `100k`, and projected `1M`
+  counts, while only a bounded active subset owns request/response buffers.
+  Minimum gate: report bytes per idle session, bytes per active credit class,
+  and named saturation reasons without changing SQL correctness.
+- Split pgwire work into fast-path and slow-path route classes in telemetry:
+  short retained read, mutation, COPY, DDL/catalog, refresh/invalidation,
+  CPU fallback, large response, and error/disconnect. Failure condition:
+  long-path work can still block socket progress for unrelated short reads.
+- Prototype fixed-capacity response rings per IO worker with reusable encoded
+  buffers for one retained read shape. Measure owner queue wait, socket write
+  backlog, buffer reuse latency, p50/p99 response time, and overload reasons.
+- Compare thread-per-client against a small IO-worker pool for repeated
+  retained reads at high logical session counts. Expected improvement: lower
+  memory footprint and lower p99 queueing once connection count dominates.
+- Add active-resource credits per session: parsed frontend messages, in-flight
+  engine requests, COPY chunk bytes, response bytes, and retained/GPU slots.
+  Proof gate: a single session can still reach baseline throughput when
+  unsaturated, while overload is rejected or delayed at the named boundary.
+- Add an IO-worker scale policy experiment driven by queue wait and CPU usage,
+  with asynchronous reassignment. The policy should report scale events and
+  wrong-owner fallbacks rather than silently increasing latency.
