@@ -481,7 +481,7 @@ Append new candidates here as each paper is processed.
   PDF: `https://chenhao-ye.github.io/publication/polaris/polaris.pdf`
   Why: priority-aware OCC cited by PreemptDB; relevant to combining request
   priority with conflict handling instead of only changing worker scheduling.
-- `queued` — **Towards Optimal Transaction Scheduling**, Cheng et al.,
+- `reviewed` — **Towards Optimal Transaction Scheduling**, Cheng et al.,
   PVLDB 2024.
   URL: `https://www.vldb.org/pvldb/vol17/p2694-cheng.pdf`
   Why: modern transaction scheduling work cited by PreemptDB; useful for
@@ -519,7 +519,20 @@ Append new candidates here as each paper is processed.
   PDF: `https://www.vldb.org/pvldb/vol12/p169-ding.pdf`
   Why: OCC batching and operation-reordering work; useful for deciding when
   GPU DB write admission should batch full transaction stages rather than only
-  WAL, index, or GPU refresh substeps.
+  WAL, index, or GPU refresh substeps, and when batch-level write-set ordering
+  should be preferred over per-request optimistic validation in hot partitions.
+- `queued` — **Morty: Scaling Concurrency Control with Re-Execution**,
+  Burke et al., EuroSys 2023.
+  URL: `https://doi.org/10.1145/3552326.3587441`
+  Why: re-execution-based concurrency control cited by R-SMF; relevant to
+  retrying or repairing conflicted transactions without throwing away all
+  scheduling and snapshot work.
+- `queued` — **Take Out the TraChe: Maximizing (Tra)nsactional Ca(che) Hit
+  Rate**, Cheng et al., OSDI 2023.
+  URL: `https://www.usenix.org/conference/osdi23/presentation/cheng`
+  Why: transaction-cache hit-rate work from the R-SMF/TAO line; relevant to
+  session-heavy read/write routing, hot object placement, and keeping retained
+  read snapshots useful under transactional cache pressure.
 - `queued` — **Taurus: Lightweight Parallel Logging for In-Memory Database
   Management Systems**, Xia, Yu, Pavlo, and Devadas, PVLDB 2020.
   URL: `https://www.vldb.org/pvldb/vol14/p189-xia.pdf`

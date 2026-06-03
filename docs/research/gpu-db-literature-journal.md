@@ -4073,3 +4073,179 @@ response sequencing.
   allowing stale resident snapshots, violating per-session response
   order, starving WAL/mutation progress, or hiding overload without a
   precise rejection/fallback reason.
+
+### 2026-06-03 - SMF schedule-first transaction ordering
+
+**Citation:** Audrey Cheng, Aaron Kabcenell, Jason Chan, Xiao Shi,
+Peter Bailis, Natacha Crooks, and Ion Stoica. "Towards Optimal
+Transaction Scheduling." Proceedings of the VLDB Endowment 17(11),
+pp. 2694-2707, 2024. Retrieved 2026-06-03 from the PVLDB PDF,
+`https://www.vldb.org/pvldb/vol17/p2694-cheng.pdf`.
+
+**Category:** transaction processing / write path and concurrency
+control.
+
+**Relevance tags:** transaction scheduling; hot-key contention;
+MVTSO; operation ordering; owner queues; timestamp assignment;
+application hints; conflict-cost reduction; abort reduction;
+batch admission; skewed OLTP; low-tail transactions.
+
+**Core idea:** The paper argues that many transaction systems leave
+throughput on the table because they execute close to arrival order
+and resolve conflicts only after operations arrive or abort. It frames
+transaction scheduling as a makespan-minimization problem: for a
+finite batch, lower makespan means higher throughput, and different
+serializable orders can have very different conflict cost.
+
+The proposed policy, Shortest Makespan First (SMF), greedily builds a
+schedule by appending the sampled in-flight transaction that adds the
+least incremental makespan. The practical insight is that a small set
+of hot keys usually dominates schedule quality, so the scheduler can
+use transaction type and hot-key hints rather than full read/write-set
+knowledge. R-SMF combines this search policy with MVSchedO, a
+schedule-first variant of multi-version timestamp ordering that
+assigns timestamps from the selected schedule and delays conflicting
+hot-key operations so later scheduled operations do not race ahead.
+
+**Concrete mechanisms:**
+
+- SMF starts with a transaction and repeatedly samples a small number
+  of unscheduled in-flight transactions. It appends the candidate that
+  produces the smallest estimated makespan increase.
+- The default online policy samples five transactions per scheduling
+  step and computes makespan only over predicted hot-key operations,
+  giving linear complexity in the number of in-flight transactions and
+  bounded work per hot key.
+- R-SMF uses application hints, primarily transaction type plus known
+  hot keys at transaction start, to predict hot-key read/write
+  patterns. A simple KNN-style classifier maps metadata vectors to
+  canonical hot-key operation sets learned from traces.
+- The classifier can be retrained periodically. If hints become
+  inaccurate, the paper suggests disabling scheduling or falling back
+  after post-execution schedule-quality checks.
+- MVSchedO adapts MVTSO by assigning transaction timestamps from SMF
+  rather than FIFO arrival order.
+- For predicted hot keys, MVSchedO maintains per-key scheduling
+  queues. A read or write waits until all conflicting operations with
+  lower scheduled timestamps for that key have executed.
+- Non-hot-key operations execute immediately under the underlying
+  MVTSO rules, keeping overhead low for low-contention traffic.
+- If a predicted hot-key access never happens, dependent operations
+  are released when the transaction commits or aborts.
+- Correctness relies on the fact that MVSchedO permits executions that
+  MVTSO could produce under a different timestamp assignment; the
+  additional waiting constrains order without weakening
+  serializability.
+- To avoid starvation, the implementation inserts barriers into the
+  scheduling queue so older requests eventually execute before newer
+  ones behind the barrier.
+- The paper also evaluates a bolt-on SMF layer above existing RocksDB
+  OCC and locking protocols. This only delays transaction start, so it
+  has smaller gains than operation-level MVSchedO, but it demonstrates
+  that scheduling can be layered onto existing engines.
+- Evaluation uses RocksDB 8.5 with Epinions, SmallBank, TAOBench,
+  TPC-C, and YCSB, plus a TAO prototype. Reported improvements are up
+  to 3.9x throughput and 3.2x tail-latency reduction in RocksDB, and
+  up to 252% higher throughput with 208% lower p99 latency in the TAO
+  prototype. Low-contention overhead is reported within about 5% of
+  the baselines.
+- Classifier accuracy is critical. On TPC-C, 10% wrong hints still
+  improved throughput, but 50% wrong hints hurt performance; with no
+  useful hints, scheduling mostly adds overhead.
+- SMF's schedule makespan is within 10% of the best tested job-shop
+  scheduling heuristics while avoiding their high offline search
+  overhead, but it is still a heuristic and can be adversarially bad.
+
+**GPU DB mapping:** GPU DB should treat this as a design for
+mutation-owner and partition-owner admission, not as a replacement for
+MVCC correctness. The most transferable mechanism is hot-key aware
+request ordering before work enters the mutation path. For TPC-C-like
+write traffic, the system can tag requests with transaction shape and
+early hot keys such as warehouse, district, customer, order, item, or
+table partition id, then choose an owner-queue order that separates
+high-conflict writes and lets independent requests run in parallel.
+
+The timestamp-assignment lesson is directly relevant to GPU DB's
+visibility boundary. Instead of assigning mutation visibility or
+snapshot generations strictly by arrival, a partition owner could
+assign admission timestamps at deterministic micro-batch boundaries
+chosen by a low-conflict scheduler. WAL-before-visibility still holds:
+the chosen schedule only decides the serial order and hot-key wait
+points; durable append, flush, invalidation, CPU-visible state update,
+and resident snapshot publication remain mandatory.
+
+For retained read routes, the paper suggests a narrower scheduling
+surface than global request priority. Same-shape retained reads can
+continue through read snapshot workers, but read/write or write/write
+traffic on known hot keys should expose a conflict class to admission.
+When a hot mutation would invalidate a resident partition, the system
+can schedule mutation, refresh, and compatible reads around that
+partition id rather than letting FIFO order create avoidable aborts,
+refresh churn, or owner-queue stalls.
+
+The classifier maps naturally to GPU DB route metadata. SQL template,
+relation id, predicate family, key values, transaction mode, and
+partition id can become the metadata vector. The first implementation
+does not need ML: exact hints from parsed SQL and bind parameters are
+enough for many benchmark shapes. A learned classifier only becomes
+interesting when stored procedures or multi-statement sessions hide
+their eventual hot keys.
+
+**Risks and mismatches:** R-SMF assumes hot-key hints are available
+early and reasonably accurate. Ad hoc SQL, multi-statement
+transactions, foreign-key cascades, triggers, or queries whose hot keys
+are discovered only after an index lookup may not provide enough
+metadata at admission time. Wrong predictions can delay independent
+work and lower throughput, so GPU DB needs an explicit fallback gate
+based on observed aborts, queue wait, and prediction accuracy.
+
+The paper focuses on logical transaction conflicts, not GPU execution,
+network IO, disk flushing, or memory-tier pressure. GPU DB's bottleneck
+may be CUDA launch overhead, pinned-buffer shortage, response-ring
+backlog, WAL fsync, or residency refresh rather than hot-key
+serialization. A schedule that minimizes logical conflict cost could
+still be poor if it destroys GPU batch shape locality or starves WAL
+flush groups.
+
+MVSchedO is serializable over RocksDB-style transactional operations,
+but GPU DB currently has explicit WAL, MVCC, resident invalidation, and
+snapshot publication invariants. Any schedule-first protocol must
+prove that delayed hot-key operations cannot expose stale resident
+data, reorder pgwire responses within a session, or publish a GPU
+snapshot before its durable visibility boundary.
+
+The reported gains depend heavily on skewed workloads. Low-contention
+traffic sees little benefit and still pays classifier and scheduling
+cost. For 1M logical sessions, the scheduling work must also be bounded
+per owner; a central scheduler over all sessions would become its own
+contention point.
+
+**Benchmark candidates:**
+
+- Add an offline simulator for mutation-owner admission over TPC-C-like
+  requests. Compare FIFO, key-partition FIFO, random deferral, and
+  SMF-style sampled lowest-incremental-conflict ordering. Minimum gate:
+  same serializable order semantics and lower modeled conflict wait for
+  skewed warehouse/district keys.
+- Prototype owner-local hot-key queues for one write-heavy SQL shape.
+  Use parsed SQL and bind parameters as exact hints; do not add ML.
+  Required measurements: owner queue wait, abort/retry count if any,
+  WAL batch size, commit latency p50/p99, and effect on independent
+  reads.
+- Compare visibility timestamp assignment by arrival order versus
+  schedule-selected micro-batch order. Proof gate: WAL-before-visibility
+  and resident invalidation tests pass unchanged.
+- Add a mixed retained-read plus mutation workload where hot writes
+  invalidate one partition while other partitions stay valid. Expected
+  result: hot-key/partition-aware scheduling should reduce refresh churn
+  and owner queue stalls without delaying independent retained reads.
+- Measure classifier/hint failure modes by intentionally corrupting
+  key hints at 0%, 10%, and 50%. Failure condition: wrong hints lower
+  throughput or p99 latency without triggering FIFO fallback.
+- Test GPU batch-shape tension: compare conflict-optimal scheduling
+  against scheduling that also preserves compatible retained query
+  batches. Required measurements: batch size, CUDA launch count, queue
+  wait by boundary, and transaction p99.
+- Add a guardrail benchmark for low-contention traffic. Scheduling must
+  stay within a small overhead budget, or auto-disable for that template
+  and partition.
