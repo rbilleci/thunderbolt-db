@@ -363,7 +363,7 @@ Append new candidates here as each paper is processed.
   PDF: `https://www.usenix.org/system/files/nsdi19-kaffes.pdf`
   Why: microsecond-scale request scheduling and preemption; relevant to
   separating short retained reads from long mutation, scan, or refresh work.
-- `queued` — **CARPO: Leveraging Listwise Learning-to-Rank for
+- `reviewed` — **CARPO: Leveraging Listwise Learning-to-Rank for
   Context-Aware Query Plan Optimization**, arXiv 2025.
   URL: `https://arxiv.org/abs/2509.03102`
   Why: modern listwise follow-up to Lero-style plan ranking; relevant to
@@ -951,6 +951,11 @@ Append new candidates here as each paper is processed.
   Why: LOGER compares against Balsa's simulator-bootstrapped DRL optimizer;
   useful for deciding whether GPU DB route learning can bootstrap from
   simulation when benchmark execution is expensive or hardware is changing.
+- `queued` — **Neo: A Learned Query Optimizer**, Marcus et al., PVLDB 2019.
+  URL: `https://www.vldb.org/pvldb/vol12/p1705-marcus.pdf`
+  Why: CARPO cites Neo as an end-to-end learned optimizer baseline; useful for
+  contrasting full learned plan search against bounded GPU DB route ranking
+  and deterministic fallback rules.
 - `queued` — **Is Your Learned Query Optimizer Behaving As You Expect? A
   Machine Learning Perspective**, Lehmann et al., PVLDB 2024.
   URL: `https://www.vldb.org/pvldb/vol17/p1565-lehmann.pdf`

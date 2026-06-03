@@ -12357,3 +12357,144 @@ settings before multiplexing sessions aggressively.
   execution time, response encoding, and kernel/user copies if measurable.
   The benchmark should identify whether Tigger-like bypass would actually
   matter before adding Linux-specific machinery.
+
+### 2026-06-03 - CARPO listwise context-aware query plan ranking
+
+**Citation:** Wenrui Zhou, Qiyu Liu, Jingshu Peng, Aoqian Zhang, and
+Lei Chen. "CARPO: Leveraging Listwise Learning-to-Rank for
+Context-Aware Query Plan Optimization." arXiv:2509.03102v2, revised
+2025-10-21. Retrieved 2026-06-03 from
+`https://arxiv.org/pdf/2509.03102`.
+
+**Category:** query optimization / planning.
+
+**Relevance tags:** learned query optimization; listwise ranking; plan
+candidate sets; top-k fallback; out-of-distribution detection; route choice;
+CPU/GPU/tiered planning; robust learned advice.
+
+**Core idea:** CARPO argues that pairwise learned query optimizers can make
+locally plausible but globally inconsistent plan choices because they compare
+two plans at a time. It instead treats all candidate plans for one query as a
+set, embeds each plan, runs a Transformer over the full list to capture
+inter-plan context, and trains with a listwise ranking loss. At inference, it
+does not blindly trust the learned top-1 plan: a hybrid decision block checks
+the top-k ranked plans with an out-of-distribution detector and falls back to
+the native PostgreSQL cost-based optimizer when the learned candidates look
+unreliable.
+
+The transferable point for GPU DB is that route choice should often rank a
+set of feasible routes rather than decide with independent thresholds. A
+query may have CPU owner execution, retained GPU execution, CPU prefilter plus
+GPU tail, cold-tier streaming, or overload rejection routes whose relative
+quality depends on the whole candidate set: snapshot freshness, queue depth,
+resident bytes, transfer bytes, and fallback penalty.
+
+**Concrete mechanisms:**
+
+- Candidate plans are generated using a Lero-like exploration strategy that
+  perturbs internal PostgreSQL statistics to obtain alternatives beyond the
+  native optimizer's default plan.
+- Training data is built by physically executing generated candidate plans
+  multiple times and sorting them by measured average latency to produce one
+  ground-truth ranked list per query.
+- The plan embedder is modular. CARPO discusses TreeCNN and TreeLSTM-style
+  embedders over plan-tree structure, operator types, estimated costs,
+  estimated cardinalities, tables, and predicates.
+- The ranking predictor takes the sequence of plan embeddings for one query
+  and applies Transformer self-attention so each plan representation is
+  contextualized by the other candidate plans in the same list.
+- The model predicts scores for assigning each plan to rank positions and is
+  trained with a position-aware cross-entropy loss over the whole candidate
+  list, rather than a pairwise comparison loss.
+- A separate out-of-distribution detector is trained as a binary classifier
+  over top-ranked plan features. At inference, CARPO checks ranked candidates
+  from best to `k` and selects the first one classified as in-distribution.
+- If none of the top-k learned candidates passes the confidence threshold,
+  CARPO executes the native PostgreSQL CBO plan.
+- The top-k strategy is motivated by the observation that several top plans
+  often have very similar physical execution times; picking a nearby
+  high-quality plan can be safer than forcing a brittle top-1 decision.
+- Evaluation uses PostgreSQL 13.1, TPC-H, and STATS candidate plans. The paper
+  reports TPC-H top-1 accuracy of 74.54% for CARPO versus 3.63% for Lero, and
+  cumulative TPC-H execution-time values of 3719.16 for CARPO versus
+  22577.87 for PostgreSQL and 17732.50 for Lero. On STATS it reports 1628.68
+  for CARPO, 1923.09 for PostgreSQL, and 1819.99 for Lero.
+- The paper's embedder comparison reports that TreeLSTM improves STATS top-1
+  accuracy from 46.43% to 78.57% and lowers cumulative STATS execution time
+  from 1628.68 to 1377.60 under the tested setup.
+
+**GPU DB mapping:** CARPO fits the planner side of the route-descriptor
+track already emerging in this journal. GPU DB should keep deterministic
+eligibility rules first: SQL semantics, snapshot compatibility, WAL/catalog
+generation, resident layout validity, memory budgets, and operator support.
+Inside that safe candidate set, a learned or calibrated ranker could compare
+CPU, retained GPU, CPU-prefilter-plus-GPU-tail, cold-tier GPU, and rejection
+or wait policies as a list.
+
+The listwise framing is especially useful when the "best" route depends on
+relative tradeoffs. A retained GPU route with a long queue may be worse than
+a CPU path; a CPU prefilter route may beat full GPU streaming only when
+selectivity and transfer bytes move together; a cold-tier plan may be viable
+only when it avoids displacing a hotter resident snapshot. These are not
+independent yes/no checks. A CARPO-like ranker would let the planner compare
+all admitted route candidates in one context vector.
+
+The top-k fallback rule maps directly to production guardrails. GPU DB should
+not execute a learned GPU route simply because a model ranks it first. It
+should test the top few candidates against hard confidence gates: known query
+shape, supported route family, in-distribution selectivity, observed queue
+range, resident generation stability, and bounded stale-route penalty. If no
+candidate passes, the engine should use the conservative CPU/owner plan and
+emit an explicit fallback reason.
+
+CARPO also strengthens the case for shadow training before planner authority.
+GPU DB can mirror eligible read-only traffic, execute CPU-authoritative
+results for clients, and collect ranked route evidence across CPU/GPU/tiered
+alternatives. Only after enough executed-route evidence exists should a
+learned ranker influence the real route, and even then only inside a hard
+deterministic envelope.
+
+**Risks and mismatches:** CARPO is an arXiv preprint and the reviewed source
+does not claim a peer-reviewed venue. Its evaluation is offline learned plan
+selection for PostgreSQL analytical benchmarks, not a production optimizer
+inside a write-heavy MVCC engine with GPU residency, WAL durability, and
+network admission. Candidate generation requires executing multiple plans,
+which can be expensive or unsafe for fresh workloads. The paper's OOD
+detector is described at a high level; its calibration, false-negative rate,
+and behavior under workload drift would need independent validation.
+
+The reported unit labels are inconsistent in the paper: the abstract and
+tables use milliseconds, while the experiment prose describes seconds for the
+same cumulative numbers. The relative comparisons are still useful, but GPU
+DB should not treat those absolute magnitudes as transferable. CARPO also
+optimizes successful query execution time, not retry cost, resident
+invalidation, queue tail latency, or memory-tier disruption.
+
+**Benchmark candidates:**
+
+- Build a route-candidate logger for one retained query family. For every
+  accepted SQL shape, emit the ranked set of feasible routes with features:
+  snapshot generation, route family, resident bytes, H2D/D2H bytes, queue
+  depth, estimated selectivity, stale-generation risk, and fallback reason.
+  Gate: no route behavior changes and complete feature rows for CPU and GPU
+  candidates.
+- Add shadow route ranking for read-only queries: execute the authoritative
+  conservative route, mirror feasible GPU/tiered alternatives, compare result
+  hashes and latency, and record the best observed route per query template.
+  Failure condition: shadow work increases authoritative p99 beyond a small
+  budget.
+- Prototype a hard-envelope top-k route selector after enough shadow data:
+  learned or calibrated ranking may choose only among routes that already pass
+  deterministic snapshot, residency, operator, memory, and queue gates. If no
+  top-k candidate passes confidence checks, fall back to CPU/owner execution.
+- Compare independent threshold routing against listwise route ranking for a
+  mixed workload with retained reads, CPU fallbacks, and over-resident
+  prefilter candidates. Required metrics: p50/p99 latency, wrong-route
+  penalty, queue wait, H2D bytes, fallback rate, and result parity.
+- Add OOD-style guardrails for GPU route estimates: flag unseen query shapes,
+  selectivity ranges, resident-byte ranges, queue-depth ranges, and
+  table-generation churn. Minimum proof: guardrails choose conservative routes
+  during distribution shifts rather than amplifying tail latency.
+- Use top-k similarity telemetry instead of only top-1 accuracy: report how
+  close the top three observed route latencies are, and allow low-risk
+  selection among them only when their measured penalty spread is small.
