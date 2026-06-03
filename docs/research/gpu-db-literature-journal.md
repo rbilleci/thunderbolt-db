@@ -17178,3 +17178,166 @@ pgwire/session SLOs.
 - Compare resident refresh from CPU tuple scan versus sorted WAL/MVCC delta
   application. Measure refresh latency, write-path interference, GPU bytes
   built, and p99 retained-read impact.
+
+### 2026-06-03 - Caracal deterministic contention management
+
+**Citation:** Dai Qin, Angela Demke Brown, and Ashvin Goel. "Caracal:
+Contention Management with Deterministic Concurrency Control." SOSP 2021,
+pp. 180-194. doi:10.1145/3477132.3483591. Retrieved 2026-06-03 from the
+author-hosted PDF,
+`https://www.eecg.utoronto.ca/~ashvin/publications/caracal.pdf`.
+
+**Category:** transaction processing / write path, with MVCC / snapshot /
+visibility and runtime scheduling.
+
+**Relevance tags:** deterministic concurrency control; transaction batching;
+MVCC version arrays; contention management; write-set declaration; skewed
+workloads; epoch admission; serializable execution; recovery replay.
+
+**Core idea:** Caracal is a shared-memory deterministic database that batches
+transactions into epochs, assigns each transaction a predetermined serial id,
+and creates all write versions for the epoch before execution. That lets
+transactions run in parallel while preserving serializable output and avoiding
+concurrency-control aborts. The paper's main claim is not that all systems
+should become deterministic; it is that once an epoch boundary and ordered
+write set exist, several normally contentious operations become reorderable or
+batchable.
+
+Caracal targets the case where partitioned deterministic databases lose on
+skew and shared-memory MVCC loses on hot-row contention. It adds two
+contention optimizations. Batch append reduces initialization-phase row-lock
+pressure by buffering pending versions per row and per core, then appending
+them in groups. Split-on-demand identifies rows with many pending versions in
+the current epoch and splits annotated contended updates into separate pieces
+scheduled on fewer cores. In the paper's evaluation, Caracal outperforms the
+tested deterministic baselines by 1.9x to 9.7x on most workloads, including
+skewed YCSB and a single-warehouse TPC-C-like workload.
+
+**Concrete mechanisms:**
+
+- Transactions execute in epochs with two phases: initialization and
+  execution. Initialization performs concurrency-control setup for every
+  transaction in the epoch; execution runs transaction logic.
+- Each transaction receives a globally unique 64-bit serial id built from the
+  epoch number, a per-node sequence counter, and node id. Workers use this
+  serial order to choose visible versions and preserve deterministic results.
+- Caracal requires write-set keys or write ranges before execution, but not
+  read-set keys. It supports stored-procedure operations such as get, scan,
+  insert, delete, and update.
+- Initialization creates pending row versions for every declared write. During
+  execution, writers fill their pending versions; readers choose the latest
+  version whose serial id precedes their transaction and wait if that version
+  is still pending.
+- Range updates are handled by splitting initialization into insert and append
+  steps. Insert first creates rows and initial versions for newly inserted
+  keys; append then range-scans to determine which existing keys should receive
+  new versions for range updates.
+- Each row uses a sorted version array instead of a linked version chain.
+  Version lookup during execution uses binary search, with a fast search near
+  the latest updated version before falling back to full binary search.
+- Batch append buffers pending versions in per-row, per-core fixed-size
+  buffers when row-lock contention appears. At the end of initialization, each
+  core appends its buffered versions to the row's version array.
+- The implementation allocates per-core buffer memory from local NUMA zones
+  and gives each row only one buffer-index field, avoiding per-row pointers for
+  every core when most rows are not contended.
+- Split-on-demand lets developers mark potentially contended row updates with
+  `ApplyRowUpdate(row, callback, weight)`. Caracal only splits the update when
+  current-epoch pending-version counts exceed a contention threshold.
+- Contended pieces are probabilistically assigned across cores by row weight
+  so heavily contended rows can use multiple cores while avoiding all-core
+  cache-coherence traffic on every update.
+- Per-core schedulers keep piece queues. Workers run the smallest available
+  serial id; if a worker waits on a pending read and a lower-serial-id piece
+  appears, Caracal preempts the waiting user-level worker and runs the lower
+  serial piece.
+- Logging records transaction inputs per epoch before results are returned to
+  clients. Recovery replays persisted epochs deterministically rather than
+  logging every output value.
+- Garbage collection uses a minor collector during initialization for rows
+  already being touched and a major collector that skips rows updated in the
+  last `K` epochs, improving locality and reducing cache pollution.
+- Evaluation uses YCSB and a modified TPC-C-like benchmark. Caracal reaches
+  2.12 MTxn/s on uniform low-contention YCSB at 32 cores, 437 KTxn/s on the
+  skewed contended YCSB variant, and scales better than partitioned baselines
+  on single-warehouse TPC-C-like contention. Epoch latency below roughly 50 ms
+  starts to reduce throughput in the evaluated setup.
+
+**GPU DB mapping:** Caracal is a useful blueprint for a bounded mutation-owner
+batch, not a reason to make every SQL route deterministic. The GPU DB write
+path already wants deterministic generation boundaries for WAL, visibility,
+resident invalidation, and retained snapshot publication. Caracal suggests
+that a mutation owner or partition owner can create placeholder version slots
+for a bounded batch, publish a total order for that batch, and let independent
+substeps run in parallel without per-operation optimistic aborts.
+
+Batch append maps directly to COPY and hot-row update admission. Instead of
+having every request compete for a shared version-chain latch or index update,
+the owner can collect per-core or per-session pending-version buffers and merge
+them at the generation boundary. For GPU DB, the merge should probably be
+partition-owned and WAL-aware: pending versions are not SQL-visible until WAL
+is safe, but their physical slots can be reserved and arranged before
+visibility publication.
+
+The sorted version-array idea is especially relevant to retained snapshots.
+Long chains are painful on CPU and worse when GPU snapshot refresh must encode
+version visibility. For hot keys or rows touched many times in one batch, the
+engine should benchmark compact per-key version arrays or batch-local delta
+arrays against linked MVCC chains. GPU kernels and refresh builders can then
+binary-search or vector-scan compact arrays instead of chasing pointers.
+
+Split-on-demand maps to classed conflict lanes. A SQL route that updates a hot
+counter, queue head, inventory row, or account balance could split the
+commutative or declared-hot part of the mutation into a small contended lane
+while leaving unrelated work on normal mutation workers. The route descriptor
+would need to identify the hot-row callback, its dependencies, and whether it
+is safe to run after prerequisite reads. This should be a measured write-path
+optimization, not a general-purpose escape from transaction semantics.
+
+The epoch-latency result is a reminder for pgwire and GPU scheduling. Large
+batches improve throughput, but the evaluated latency/throughput knee around
+50 ms is far above the desired latency for many retained reads. GPU DB should
+separate short read-snapshot batches from mutation epochs and measure mutation
+batch ceilings in microseconds or low milliseconds before considering
+deterministic placeholders for production.
+
+**Risks and mismatches:** Caracal assumes stored procedures with known write
+sets or write ranges before execution. Interactive SQL transactions, ad hoc
+plans, secondary-index-dependent writes, and PostgreSQL protocol behavior will
+often lack that information. The paper modifies TPC-C to avoid unknown write
+sets, including fast order ids and removing a customer-name lookup, so the
+benchmark is not a drop-in TPC-C proof. Its transaction semantics avoid aborts
+after the first write and treat insert/delete/update existence behavior in a
+specific SQL-like way; GPU DB must not copy those semantics casually. Epoch
+batching adds latency, and Caracal's evaluated latency targets are closer to
+wide-area request tolerances than low-latency local OLTP. Finally, the design
+is CPU shared-memory MVCC, not GPU execution, WAL/checkpoint recovery with
+resident snapshots, or a general MVCC implementation for arbitrary SQL.
+
+**Benchmark candidates:**
+
+- Prototype batch-local pending version arrays for one write-heavy table:
+  reserve pending slots before execution, fill them after WAL admission, and
+  publish visibility at a generation boundary. Gate: identical MVCC visible
+  rows and replay state versus the current tuple-version chain.
+- Add a hot-key update benchmark with skewed writes and retained reads. Compare
+  linked version chains, sorted per-key version arrays, and batch-local delta
+  arrays. Failure condition: p99 visibility lookup or refresh encoding grows
+  linearly with batch hot-key updates.
+- Test COPY admission with per-session pending-version buffers merged by the
+  mutation owner. Measure lock/contention time, WAL batch size, visibility
+  publication latency, and retained-read invalidation delay.
+- Build a deterministic micro-batch experiment for declared write sets only.
+  Minimum proof gate: no SQL-visible write before WAL safety, deterministic
+  replay from logged inputs or WAL records, and explicit rejection for routes
+  whose write sets are not declared.
+- Add a contended-lane benchmark for one commutative update pattern, such as
+  incrementing account or inventory counters. Compare ordinary owner serial
+  execution, per-key conflict lanes, and full partitioning. Failure condition:
+  split pieces require synchronization that erases the contention benefit.
+- Measure mutation batch-size ceilings separately from retained read
+  micro-batching. Track throughput, p50/p99 latency, invalidated resident
+  generations, GPU refresh delay, and queue wait as the mutation epoch grows.
+- Add GC locality telemetry for versions removed during batch initialization
+  versus background major GC. Gate: old-version cleanup does not pollute hot
+  retained-read or mutation-owner cache paths under skew.

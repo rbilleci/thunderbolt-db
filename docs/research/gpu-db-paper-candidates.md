@@ -580,9 +580,10 @@ Append new candidates here as each paper is processed.
   URL: `https://doi.org/10.1145/3514221.3517876`
   Why: GPU single-version deterministic locking baseline compared by Epic;
   relevant to deciding when commutative GPU updates beat general MVCC.
-- `queued` — **Caracal: Contention Management with Deterministic Concurrency
+- `reviewed` — **Caracal: Contention Management with Deterministic Concurrency
   Control**, Qin, Brown, and Goel, SOSP 2021.
-  URL: `https://doi.org/10.1145/3477132.3483572`
+  URL: `https://doi.org/10.1145/3477132.3483591`
+  PDF: `https://www.eecg.utoronto.ca/~ashvin/publications/caracal.pdf`
   Why: deterministic MVCC contention-management baseline for Epic; useful for
   CPU-side owner/partition batching and skewed write-set planning.
 - `queued` — **High Performance Transactions via Early Write Visibility**,
@@ -1224,6 +1225,20 @@ Append new candidates here as each paper is processed.
   Why: BOHM-adjacent deterministic two-phase planning/execution design for
   many-core transaction processing; useful for comparing queue-oriented
   planning against owner-local placeholder-first MVCC batches.
+- `queued` — **Serval: A Wait-free Multi-version Deterministic Concurrency
+  Control Scheme**, Li, Onishi, and Kawashima, CANDAR 2024.
+  URL: `https://doi.org/10.1109/CANDAR64496.2024.00028`
+  Why: Caracal follow-up that replaces global version-array latch pressure for
+  contended rows with bitmaps and dynamic local version arrays; useful for
+  deciding whether GPU DB write batches should keep per-owner local version
+  arrays before publishing a merged visibility front.
+- `queued` — **Cheetah: An Efficient Deterministic Concurrency Control Scheme
+  with Non-Visible Write Elimination and Re-Designed Garbage Collection**, Li,
+  Onishi, and Kawashima, IEEE CLUSTER Workshops 2024.
+  URL: `https://doi.org/10.1109/CLUSTERWorkshops61563.2024.00053`
+  Why: Caracal follow-up on eliminating non-visible writes and improving GC
+  locality; relevant to pruning deterministic write-batch placeholders and
+  old versions before they pollute retained GPU snapshot refresh.
 - `reviewed` — **A Wake-Up Call for Kernel-Bypass on Modern Hardware**,
   Jasny et al., DaMoN 2025.
   URL: `https://doi.org/10.1145/3736227.3736235`
