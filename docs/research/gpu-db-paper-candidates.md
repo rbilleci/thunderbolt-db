@@ -608,7 +608,7 @@ Append new candidates here as each paper is processed.
   URL: `https://doi.org/10.1145/3639286`
   Why: modern tiered-main-memory buffer management cited by vmcache^n;
   relevant to DRAM/remote-memory/NVMe policy design and placement economics.
-- `queued` — **TiQuE: Improving the Transactional Performance of Analytical
+- `reviewed` — **TiQuE: Improving the Transactional Performance of Analytical
   Systems for True Hybrid Workloads**, PACMMOD 2023.
   URL: `https://doi.org/10.14778/3598581.3598598`
   Why: cited by Counting Is All You Need; relevant to comparing analytical
@@ -757,6 +757,18 @@ Append new candidates here as each paper is processed.
   PDF: `https://chenhao-ye.github.io/publication/polaris/polaris.pdf`
   Why: priority-aware OCC cited by PreemptDB; relevant to combining request
   priority with conflict handling instead of only changing worker scheduling.
+- `queued` — **MRVs: Enforcing Numeric Invariants in Parallel Updates to
+  Hotspots with Randomized Splitting**, Faria and Pereira, PACMMOD/SIGMOD 2023.
+  URL: `https://doi.org/10.1145/3588723`
+  Why: TiQuE cites MRVs as a way to reduce wasted work around optimistic
+  hotspot updates; relevant to GPU DB write admission when many logical
+  sessions update counters or bounded inventory-like values.
+- `queued` — **Towards Generic Fine-Grained Transaction Isolation in
+  Polystores**, Faria, Pereira, Alonso, and Vilaca, HDMS 2022.
+  URL: `https://link.springer.com/chapter/10.1007/978-3-031-13216-2_6`
+  Why: TiQuE cites this as an earlier layered-isolation direction for
+  polystores; useful for future multi-engine GPU DB routes where transactional
+  metadata may span CPU, GPU-resident, and cold-tier execution engines.
 - `reviewed` — **Towards Optimal Transaction Scheduling**, Cheng et al.,
   PVLDB 2024.
   URL: `https://www.vldb.org/pvldb/vol17/p2694-cheng.pdf`

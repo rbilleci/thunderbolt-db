@@ -24479,3 +24479,244 @@ publication.
   dirty-page persistence only as an opt-in benchmark mode. Failure
   condition: it weakens redo/PITR semantics, remote durability, or
   WAL-before-visibility ordering.
+
+### 2026-06-03 - TiQuE transactions in the query engine
+
+**Citation:** Nuno Faria, Jose Pereira, Ana Nunes Alonso, Ricardo
+Vilaca, Yunus Koning, and Niels Nes. "TiQuE: Improving the
+Transactional Performance of Analytical Systems for True Hybrid
+Workloads." PVLDB 16(9), 2023. Retrieved 2026-06-03 from the
+official PVLDB PDF, `https://www.vldb.org/pvldb/vol16/p2274-faria.pdf`.
+DOI: `https://doi.org/10.14778/3598581.3598598`.
+
+**Category:** hybrid HTAP, with MVCC / snapshot / visibility and
+transaction processing / write path.
+
+**Relevance tags:** HTAP; snapshot isolation; query-engine
+transaction metadata; append-only delta/cache tables; write-set
+certification; stable timestamp; checkpointing; conflict validation;
+OLTP/OLAP route variants; client write buffering; priority retries;
+MonetDB; CH-benCHmark; TPC-C.
+
+**Core idea:** TiQuE asks whether transactional metadata work can be
+expressed as relational queries instead of being hard-coded inside a
+storage manager. It layers snapshot isolation over an analytical
+engine by translating user tables into storage tables, recent-version
+cache tables, and transaction metadata tables. Reads reconstruct a
+snapshot through SQL; writes append versions into cache tables; commit
+certifies the write set through SQL joins.
+
+The most transferable idea for GPU DB is not to move correctness out
+of the engine. It is to make snapshot reconstruction, write-set
+validation, and delta-to-stable movement visible as optimizable data
+processing pipelines. In GPU DB terms, MVCC visibility and retained
+snapshot refresh should have declared query shapes, route-specific
+plans, and telemetry, rather than one opaque validation routine that
+every workload pays equally.
+
+**Concrete mechanisms:**
+
+- TiQuE creates an abstract user schema over a physical schema with
+  per-table stable storage tables, per-table cache tables, and a
+  transaction metadata table or status tables.
+- Stable storage rows omit per-row timestamp metadata because they are
+  already visible to every current and future transaction after
+  checkpointing.
+- Cache rows hold uncommitted or recently committed versions plus a
+  tombstone flag and transaction id. Cache tables can use a different
+  physical format from storage tables, such as row-oriented cache
+  tables over columnar storage tables.
+- Begin assigns a transaction id and start timestamp. Transactions
+  read and write optimistically without locks, then validate at commit.
+- Snapshot reads combine stable storage rows with visible cache rows
+  and the transaction's own uncommitted writes. They filter by
+  transaction status and start timestamp, rank versions by key and
+  commit timestamp, keep the newest visible version, and drop
+  tombstones.
+- The same logical snapshot can be written in different SQL shapes.
+  TiQuE uses this to choose a point-read-friendly snapshot plan for
+  transactional reads and a different analytical snapshot plan that
+  avoids full-relation sorts.
+- Writes are translated into inserts into cache tables. Updates and
+  deletes become new versions or tombstones rather than in-place base
+  table changes.
+- TiQuE can buffer writes on the client until commit for workloads
+  like TPC-C that do not need read-your-own-write during the
+  transaction, reducing round trips and flush overhead.
+- Commit has three steps: assign a commit timestamp, certify that no
+  concurrent committed or committing transaction wrote the same keys
+  after the transaction's start timestamp, then atomically mark the
+  transaction committed or aborted.
+- Certification is a SQL join between the transaction's write set and
+  cache/transaction metadata. The paper materializes a compact
+  `Write_Sets` relation containing transaction id plus a hash of table
+  and primary key to speed validation.
+- The current stable timestamp advances only after all transactions up
+  to the relevant commit timestamp have finished, so future snapshots
+  do not read uncommitted data.
+- Checkpointing moves stable cache data to storage and removes obsolete
+  cache rows once their commit timestamp is no newer than the minimum
+  start timestamp of running transactions. It can flush rows
+  incrementally because the snapshot view still sees a consistent
+  version through cache/storage union and ranking.
+- Recovery marks running and committing transactions aborted, advances
+  the start timestamp to the last committed timestamp, and resets the
+  commit timestamp sequence to the last committed timestamp.
+- For long-running read-write transactions, the paper tests a priority
+  mode: after failed certification, refresh the start timestamp and
+  reexecute instead of repeatedly aborting the long transaction.
+- The MonetDB implementation avoids update-heavy metadata paths by
+  splitting transaction statuses into status-specific insert-only
+  tables, uses C UDFs and condition variables for sequence/wait
+  behavior, and uses unlogged tables for metadata that need not survive
+  restart.
+
+**Evaluation claims:** The authors validate snapshot isolation with
+Elle over multiple 100k-transaction, 8-client executions. On TPC-C,
+MonetDB plus TiQuE is reported as roughly 527x faster on average than
+native MonetDB's transactional path, while PostgreSQL remains faster
+on pure OLTP by about 1.6x on average. TiQuE's analytical overhead on
+CH-benCHmark is reported around 20% over native MonetDB, and the
+combined HTAP experiments show relatively low interference when there
+are enough CPU and memory resources. The tests use single-node Google
+Cloud instances, including 32 vCPUs and either 32 GB or 128 GB RAM,
+with a 512-warehouse TPC-C dataset.
+
+**GPU DB mapping:** GPU DB should keep WAL/checkpoint/replay as the
+durable authority, so TiQuE's append-only cache tables are not a
+replacement for the storage engine. They are a useful design shape for
+the mutable delta that sits beside retained GPU snapshots. A P8 table
+could expose stable resident column groups plus a recent CPU/GPU delta
+side table, then let retained reads choose a plan: stable-only resident
+scan, stable plus visible delta merge, point lookup with delta
+anti-join, or CPU owner fallback.
+
+The snapshot-query idea maps to route families. Retained point lookups
+and analytical scans should not share one visibility kernel. Point
+reads want predicates pushed before delta merge, minimal ranking, and
+small response scatter. Long scans want per-partition stable snapshots,
+delta compaction, and a plan that avoids sorting the whole table just
+to pick newest versions. The route descriptor could carry
+`snapshot_shape`, `delta_shape`, `visibility_method`, `write_set_shape`,
+and `checkpoint_boundary`.
+
+Write-set certification as a query is directly relevant to the MVCC
+validation envelope from AOCC. GPU DB can maintain compact
+partition-scoped write-set evidence and validate read/write
+transactions with a planned join or range intersection rather than a
+hard-coded global list. For point-update workloads, a materialized
+write-set relation keyed by relation, partition, and hashed primary key
+would be a measurable first step. For range or aggregate GPU reads,
+the same framework can later switch to predicate-range summaries.
+
+TiQuE's checkpointing maps to retained refresh. Once all active
+snapshots are beyond a generation, the recent delta can be folded into
+stable CPU column groups and rebuilt or incrementally refreshed into
+GPU resident state. The important constraint is the same as P8's: the
+delta-to-stable move must not make a newer row visible before WAL and
+MVCC publication say it is visible.
+
+The client write-buffering result supports a stored-procedure or
+compiled-transaction fast path for GPU DB. For transaction templates
+that do not require intermediate reads, the protocol can collect the
+write set, append WAL/MVCC records in a deterministic batch, then
+publish one visibility boundary. That is a better target for high write
+throughput than making every statement take a round trip through the
+owner queue.
+
+The priority mode is also useful for long refresh, maintenance, or
+data-cleaning transactions. GPU DB should not let a long retained
+refresh or multi-row mutation starve forever behind short conflicting
+updates. A priority retry or reservation mode could be benchmarked
+against simple OCC aborts, pessimistic owner execution, and scheduled
+maintenance windows.
+
+**Risks and mismatches:** TiQuE targets snapshot isolation, so it
+permits write skew. GPU DB may need serializable modes or stronger
+invariants for some workloads, and the paper's SQL-layer validation
+does not solve those by itself.
+
+The implementation is an add-on over MonetDB with driver/query
+rewriting. GPU DB owns its storage, WAL, MVCC, residency, and protocol
+runtime, so a literal SQL-rewrite layer would add overhead and weaken
+control over correctness boundaries. The useful extraction is the
+planned metadata pipeline, not the deployment architecture.
+
+TiQuE relies on sequential timestamp counters and waits for stable
+timestamp advancement. At a 1M-logical-session target, a single global
+timestamp advancement point could become a bottleneck. GPU DB should
+prefer partition or owner generation boundaries where possible, with a
+clear global serialization rule only where SQL semantics require it.
+
+The materialized hashed write-set relation can create false conflicts.
+That may be acceptable as a benchmark shortcut, but production GPU DB
+should keep enough key or range evidence to explain aborts and avoid
+unnecessary fallback under skew.
+
+Finally, TiQuE's reported performance is single-node CPU analytical
+engine performance, not GPU execution, not pgwire session scale, and
+not over-resident NVMe/GPU tiering. Its evaluation should inspire
+metadata and delta-route experiments, not be treated as proof that
+query-engine transactions automatically solve GPU DB's runtime path.
+
+**Benchmark candidates:**
+
+- Build a host-only visibility-plan simulator with three retained-read
+  shapes: stable-only, stable plus point-delta merge, and stable plus
+  analytical delta merge. Gate: identical SQL-visible rows across
+  MVCC generations and lower p95 latency than a one-shape visibility
+  plan for mixed point/scan workloads.
+- Add a compact write-set evidence table keyed by relation, partition,
+  generation, and primary-key hash for a narrow update workload. Gate:
+  commit validation time and abort explanations are reported
+  separately from WAL and GPU execution time.
+- Prototype route-specific snapshot descriptors:
+  `point_lookup_snapshot`, `range_scan_snapshot`, and
+  `aggregate_snapshot`. Gate: planner telemetry names the visibility
+  method and explains why a query used GPU, CPU, or owner fallback.
+- Test client- or procedure-side write buffering for a TPC-C-like
+  transaction template that does not read its own writes. Gate: fewer
+  owner round trips and higher sustained rows/sec or tx/sec without
+  weakening WAL-before-visibility.
+- Add a delta-folding benchmark: append recent versions, serve retained
+  reads through stable-plus-delta merge, then fold stable delta rows
+  into a refreshed resident generation. Gate: no stale resident read
+  across fold boundaries and bounded refresh pause time.
+- Compare long-transaction priority retry with plain OCC abort and
+  owner-serialized execution. Failure condition: priority improves
+  long transaction latency by starving short retained reads or hiding
+  abort/fallback reasons.
+
+### 2026-06-03 - Cross-paper synthesis: visibility metadata wants planned routes
+
+AOCC, the CXL database position paper, and TiQuE converge on one
+design track: GPU DB should expose metadata movement and validation as
+first-class planned routes. AOCC says validation strategy should adapt
+to read evidence, predicate shape, and overlapping writes. The CXL paper
+says placement decisions need object type, tier cost, and recovery
+authority. TiQuE says snapshot reconstruction, write-set certification,
+and stable-delta checkpointing can be treated as optimizable data
+processing, not just hidden storage-manager code.
+
+The shared implementation hypothesis is a route descriptor that carries
+correctness and placement metadata together: snapshot generation,
+visibility method, write evidence, delta shape, placement tier,
+execution-memory budget, and recovery authority. A retained GPU lookup,
+an over-resident scan, a buffered write batch, and a refresh fold should
+all be able to report which metadata route they used and which boundary
+made the result visible.
+
+Benchmark priorities should therefore move from "does the GPU kernel
+run fast" to "which boundary is currently dominating." The next useful
+benchmarks are validation-envelope cost, stable-plus-delta visibility
+cost, tier-placement admission cost, and buffered write publication
+cost. Kernel time remains important, but these papers keep pointing to
+metadata, validation, and placement as the likely p95/p99 bottlenecks
+once resident execution is fast.
+
+Category gaps remain around GPU-native update execution, serializable
+visibility over retained snapshots, and high-session protocol admission
+when many transactions hold snapshot or write-set evidence. The queue
+should keep balancing HTAP/MVCC papers with runtime scheduling and
+write-path papers before returning to another run of GPU-only OLAP
+papers.
