@@ -17661,3 +17661,139 @@ inflates hot lookup metadata or complicates compact refresh.
   retained reads, and steady updates. Gate: fresh write throughput and fresh
   lookup latency remain stable while old-version payload bytes are trimmed or
   demoted promptly.
+
+### 2026-06-03 - Caerus partial-order transaction sequencing
+
+**Citation:** Joshua Hildred, Michael Abebe, and Khuzaima Daudjee.
+"Caerus: Low-Latency Distributed Transactions for Geo-Replicated Systems."
+PVLDB 17(3), 2023, pp. 469-482. doi:10.14778/3632093.3632109.
+Retrieved 2026-06-03 from
+`https://www.vldb.org/pvldb/vol17/p469-hildred.pdf`.
+
+**Category:** transaction processing / write path and concurrency control.
+
+**Relevance tags:** deterministic transactions; partial orders; conflict
+graphs; locality-aware routing; multi-owner commit; serializability; low
+latency; batching; fault tolerance.
+
+**Core idea:** Caerus reduces geo-replicated deterministic transaction latency
+by avoiding a single total order for every transaction. Each region sequences
+only transactions that touch data for which that region is primary, then every
+region deterministically merges the resulting partial sequences into a
+conflict-equivalent transaction order. A transaction can execute once its
+relevant ordering information has arrived, rather than waiting for unrelated
+regions or a global consensus order.
+
+The paper's distributed setting is not the GPU DB's near-term deployment
+target, but the mechanism is useful for a future multi-owner engine. It
+suggests that a mutation path can preserve serializability with a smaller
+"order only where conflict is possible" frontier, provided read/write sets are
+known, partial sequence publication is durable enough, and every owner builds
+the same conflict relationships.
+
+**Concrete mechanisms:**
+
+- Data is fully replicated across regions, but every data item has a primary
+  region. A transaction appears in the partial sequence for each region that
+  is primary for at least one item in the transaction's read or write set.
+- The sequencer has a transaction batcher, a partial sequencer, and a sequence
+  merger. The batcher sends a transaction only to relevant partial sequencers,
+  and partial sequencers order batches rather than only individual
+  transactions.
+- Sequence mergers maintain a directed conflict graph. Vertices are
+  transactions, and edges encode conflicting read/write, write/read, and
+  write/write relationships discovered from the partial sequence order.
+- Edges are added only for the most recent relevant conflicts; older conflicts
+  are represented transitively by paths in the graph.
+- A transaction is complete when it has appeared in every partial sequence
+  required by its read/write set, so no new outgoing edges can be added for it.
+- A complete vertex with no outgoing edges can be appended to the merged
+  transaction order immediately. This lets non-conflicting and locality-heavy
+  transactions execute before unrelated remote ordering information arrives.
+- Cycles are resolved deterministically by finding strongly connected
+  components with Tarjan's algorithm. Complete SCCs with no outgoing edges are
+  added to the merged order by sorting transactions by globally unique
+  transaction id.
+- Different regions may produce different serial orders, but the orders are
+  conflict equivalent because all conflicting transaction pairs have the same
+  relative order.
+- Fault tolerance uses a two-level approach: partial sequences are replicated
+  within a region for machine failure, and each region replicates partial
+  sequences to `K` other regions for region-level recovery. Recovery needs at
+  least `N-K` live regions and preserves positions already present in active
+  partial sequences.
+- Evaluation uses six Azure regions, TPC-C NewOrder, and CockroachDB's MovR
+  BeginRide workload. The paper reports comparable throughput to Calvin/SLOG
+  until scheduler saturation, while Caerus improves transaction latency by up
+  to 38x over Calvin and up to 6x over SLOG; MovR latency wins are reported as
+  3.1x to 4.7x over SLOG and roughly 11x to 18x over Calvin depending on
+  multi-region mix.
+
+**GPU DB mapping:** Caerus maps less to WAN replication than to the planned
+owner-domain split. Today the architecture keeps one mutation owner for
+correctness, but future partition owners, residency owners, and GPU execution
+owners will need a way to admit multi-partition writes without pushing every
+request through a single total-order bottleneck. Caerus gives a concrete
+shape: a transaction route descriptor declares the partitions or owner domains
+it can read/write, each owner appends the request to an owner-local sequence,
+and a deterministic merger constructs a conflict-equivalent commit/execution
+order only from the touched owners.
+
+For write throughput, the transferable idea is partial ordering plus batch
+publication. COPY chunks, stored-procedure-like writes, and predeclared
+single-key updates should be batched into owner-local sequences. Transactions
+that touch one partition should not wait behind unrelated partitions. A
+multi-partition transaction should wait only for the owners in its read/write
+set and then install visibility at a deterministic boundary.
+
+For session concurrency and latency, this argues for richer admission
+descriptors. An IO worker should not enqueue an opaque SQL command into a
+single mutation queue when the planner can identify the read/write footprint.
+The request should carry owner ids, conflict keys or ranges, snapshot
+generation, priority, and whether it can use a deterministic batch path. That
+metadata lets the runtime separate short local writes from broad refresh or
+multi-owner transactions without violating serializability.
+
+For MVCC/snapshot design, Caerus is a reminder that not every globally visible
+snapshot needs one global serial sequence. If all conflicting writes have a
+stable relative order and every published snapshot records the relevant owner
+sequence boundaries, read workers can consume a vector of owner boundaries or
+a compact merged generation instead of one monolithic LSN. WAL remains the
+durable authority, but visibility summaries can be owner-local and merged
+deterministically for reads that span owners.
+
+**Risks and mismatches:** Caerus assumes transaction read and write sets are
+known before sequencing. That fits stored procedures, COPY batches, and simple
+key/range routes better than arbitrary interactive SQL with data-dependent
+access. It relies on deterministic execution, while the GPU DB still needs
+normal SQL error handling, WAL-before-visibility, MVCC validation, catalog
+invalidation, and fallback paths. A conflict graph can grow under hot
+contention; the paper throttles batchers when the graph exceeds a tunable
+threshold, but a GPU DB would need bounded memory and explicit overload
+semantics. The evaluation is geo-replicated CPU OLTP, not GPU execution or
+single-node partition ownership, so the latency multipliers should be treated
+as evidence against unnecessary total ordering rather than as expected local
+speedups.
+
+**Benchmark candidates:**
+
+- Prototype partition-owner partial sequences for a narrow deterministic write
+  workload. Gate: single-partition writes do not queue behind unrelated
+  partitions, and multi-partition writes commit with identical final state to a
+  single-owner serial baseline.
+- Add route descriptors for simple writes: touched table, partition/key range,
+  declared read/write set, snapshot boundary, and deterministic-batch
+  eligibility. Failure condition: an undeclared access can commit on the
+  partial-order path.
+- Build a conflict-graph admission simulator for mixed single-key and
+  multi-key transactions. Measure graph size, SCC size, queue delay, abort or
+  throttle rate, and p99 latency under skew.
+- Compare one global mutation queue against owner-local partial sequences plus
+  deterministic merge for COPY-like batches. Gate: WAL-before-visibility and
+  replay produce the same visibility boundaries.
+- Test snapshot handles as vectors of owner sequence boundaries for
+  multi-partition retained reads. Gate: reads spanning multiple owners observe
+  conflict-equivalent committed state without consulting unrelated owners.
+- Add overload policy for deterministic merge pressure: if conflict graph
+  size or SCC age crosses a budget, throttle admission at the relevant owner
+  rather than allowing memory growth or hidden latency cliffs.

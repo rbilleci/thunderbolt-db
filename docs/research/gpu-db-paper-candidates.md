@@ -798,7 +798,7 @@ Append new candidates here as each paper is processed.
   Why: R4 is Bonspiel's atomic-commit baseline; useful for separating
   unavoidable commit latency from abort/retry and contention-footprint costs
   in distributed or multi-owner transaction protocols.
-- `queued` — **Caerus: Low-Latency Distributed Transactions for
+- `reviewed` — **Caerus: Low-Latency Distributed Transactions for
   Geo-Replicated Systems**, Hildred et al., PVLDB 2023.
   URL: `https://www.vldb.org/pvldb/vol17/p469-hildred.pdf`
   Why: modern geo-replicated transaction protocol cited by Bonspiel; useful as
@@ -978,6 +978,27 @@ Append new candidates here as each paper is processed.
   Why: hybrid OCC/pessimistic contention handling cited by the batching paper;
   useful for deciding when GPU DB owner queues should switch from optimistic
   validation to contention-aware ordered execution.
+- `queued` — **Detock: High Performance Multi-region Transactions at Scale**,
+  Li et al., SIGMOD 2023.
+  URL:
+  `https://api.drum.lib.umd.edu/server/api/core/bitstreams/5619e587-270c-4859-8a3e-8947e2bc9928/content`
+  Why: Caerus compares against Detock as a concurrent single-WAN-round
+  graph-based geo-transaction design; useful for contrasting integrated
+  concurrency-control/execution with Caerus-style scheduler-independent
+  partial-order sequencing.
+- `queued` — **Tiga: Accelerating Geo-Distributed Transactions with
+  Synchronized Clocks**, Krishnaswamy et al., SOSP 2025.
+  URL: `https://anirudhsk.github.io/papers/tiga_sosp.pdf`
+  Why: modern synchronized-clock geo-transaction design related to Caerus and
+  Detock; useful for deciding whether owner-boundary timestamps can reduce
+  coordination without relying on full deterministic execution.
+- `queued` — **Epoch-based Optimistic Concurrency Control in Geo-replicated
+  Databases**, arXiv 2026.
+  URL: `https://arxiv.org/abs/2602.21566`
+  Why: modern geo-replicated concurrency-control work with epoch-based
+  asynchronous replication and deterministic re-execution; useful as a
+  follow-up for owner-local epochs, partial WAL ordering, and conflict-graph
+  retry policies.
 - `reviewed` — **MEMTIS: Efficient Memory Tiering with Dynamic Page
   Classification and Page Size Determination**, Lee et al., SOSP 2023.
   URL: `https://doi.org/10.1145/3600006.3613167`
