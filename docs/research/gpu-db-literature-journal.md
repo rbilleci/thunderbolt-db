@@ -7491,3 +7491,151 @@ sessions.
 - Add a negative-control case where selectivity uncertainty is high but route
   choice is insensitive. The planner should not run a probe or abandon the
   resident route simply because the statistic itself is uncertain.
+
+### 2026-06-03 - Taurus lightweight parallel logging
+
+**Citation:** Yu Xia, Xiangyao Yu, Andrew Pavlo, and Srinivas Devadas.
+"Taurus: Lightweight Parallel Logging for In-Memory Database Management
+Systems." PVLDB 14(2), 2020, pp. 189-201. doi:10.14778/3425879.3425889.
+Retrieved 2026-06-03 from `https://www.vldb.org/pvldb/vol14/p189-xia.pdf`.
+
+**Category:** transaction processing / write path.
+
+**Relevance tags:** WAL scalability; parallel logging; command logging;
+data logging; dependency vectors; recovery ordering; MVCC logging; early lock
+release; NVMe; write admission; replay.
+
+**Core idea:** Taurus attacks the single-log bottleneck in in-memory OLTP
+engines by writing transactions to multiple log streams while preserving only
+the dependency order needed for correct commit and recovery. Instead of forcing
+a single global LSN order, each transaction carries an LSN Vector (LV) whose
+elements summarize which positions in each log stream the transaction depends
+on. A transaction can commit when its own log record and the dependent log
+positions are persistent; recovery can replay transactions in any order that
+respects those LV dependencies.
+
+The design is especially useful because it supports both data logging and
+command logging. Data logging can replay physical changes but writes larger
+records. Command logging writes smaller procedure/input records but must replay
+transactions in a dependency-respecting order. Taurus keeps that option open
+by explicitly logging dependency metadata. On its DBx1000 evaluation, Taurus
+reports up to 9.9x runtime speedup over single-stream data logging, 2.9x over
+single-stream command logging, and recovery speedups up to 22.9x and 75.6x for
+data and command logging respectively. Against parallel baselines, it reports
+up to 2.8x better performance on NVMe SSDs and 9.2x on HDDs.
+
+**Concrete mechanisms:**
+
+- Taurus uses one log manager per log file and assigns workers to log
+  managers. Each transaction writes one log record to one stream.
+- An LV has one element per log stream. `T.LV[i] = x` means transaction `T`
+  may depend on transactions in log `i` up to LSN `x`, but not after `x`.
+- Tuple-level `readLV` and `writeLV` propagate dependencies between
+  transactions. Reads merge prior writer LVs; writes merge prior reader and
+  writer LVs so RAW, WAW, and WAR dependencies are captured under 2PL.
+- Log records contain the redo/command payload plus a copy of the transaction
+  LV before the transaction's own log-stream element is advanced to its
+  allocated LSN.
+- A global persistent-LV vector (`PLV`) records how far each log stream has
+  flushed. A transaction can be marked committed when `PLV >= T.LV` and older
+  transactions in the same log stream have committed.
+- Early lock release moves log persistence off the lock-holding critical path:
+  after publishing tuple LVs and releasing locks, the transaction waits
+  asynchronously for dependent log positions to become persistent.
+- Log managers use per-worker `allocatedLSN` and `filledLSN` indicators to
+  flush only stable regions of a log buffer.
+- Recovery uses an end-LV (`ELV`) from log file sizes to decide whether a
+  transaction committed before crash, per-log pools for decoded transactions,
+  and a global recovered-LV (`RLV`) that advances as replay finishes.
+- A transaction is eligible for recovery when `T.LV <= RLV`; this is a
+  parallel topological replay over the implicit dependency graph.
+- Tuple LV compression stores dependency metadata only for active lock-table
+  entries; evicted tuple dependency state is approximated from the current
+  persistent LV with a tunable delta that trades metadata footprint for
+  artificial dependencies.
+- Log-record LV compression periodically writes PLV anchors into log buffers
+  and stores only LV dimensions that exceed the latest anchor, reducing log
+  bytes at the cost of some recovery parallelism.
+- SIMD vector operations reduce LV maintenance cost; the paper reports up to
+  89.5% lower LV overhead when the number of log files grows.
+- Taurus has OCC and MVCC extensions. For MVCC, versions carry an LV; reads
+  merge the visible version LV, updates merge the old version LV, committed
+  write versions receive the transaction LV, and recovery uses multi-version
+  replay so physically late but logically early transactions can be handled.
+- Under high contention, many inter-log dependencies can reduce recovery
+  parallelism. Taurus explicitly falls back to serial recovery for highly
+  skewed cases in its sensitivity study.
+
+**GPU DB mapping:** Taurus is a strong fit for the GPU DB write path because
+it separates durable ordering from a single total log bottleneck. A future
+partition-owned mutation path can keep per-owner WAL streams and publish a
+compact dependency vector or generation vector for transactions that cross
+owners. That would let independent partitions flush and recover in parallel
+without pretending all writes share one hot global LSN counter.
+
+The LV idea maps naturally to the current owner-domain architecture. Mutation
+owners can publish `PLV`-like flush frontiers; read-snapshot publication can
+name the owner flush frontier it depends on; residency refresh can record the
+WAL/visibility vector that made a GPU snapshot valid. A retained snapshot would
+then carry a generation vector precise enough for correctness and compact
+enough for route checks.
+
+For COPY admission, Taurus suggests a benchmarkable alternative to one global
+WAL bottleneck: route chunks to partition-local WAL streams, encode cross-
+partition dependencies only when a transaction actually crosses owners, and
+publish visibility only after the dependent flush frontier is durable. This
+preserves WAL-before-visibility while giving independent chunks room to flush
+and replay in parallel.
+
+Command logging is relevant but risky. GPU DB could log high-level COPY chunk
+metadata or deterministic mutation commands for some bulk paths to reduce log
+bytes, while keeping data logging for nondeterministic or externally visible
+effects. Taurus shows that command logging needs explicit dependency metadata
+and deterministic replay; it is not just "write fewer bytes."
+
+The recovery algorithm also maps to rebuildable GPU residency. During crash
+recovery, CPU truth should replay first from durable WAL streams in dependency
+order. GPU resident snapshots, indexes, and layout metadata remain rebuildable
+acceleration state tied to recovered owner frontiers rather than durable
+authority.
+
+**Risks and mismatches:** Taurus is evaluated in DBx1000, not in a PostgreSQL-
+compatible engine with arbitrary SQL, WAL segments, MVCC visibility, and GPU
+resident snapshots. Its cleanest command-logging path assumes deterministic
+stored-procedure style replay, which is narrower than ad hoc SQL. LVs grow
+with the number of log streams, so a GPU DB with many partitions needs
+compression, sparse encoding, or hierarchy before adopting the idea broadly.
+Tuple-level read/write LV tracking can be expensive for wide scans, secondary
+indexes, and high-cardinality hot data unless stored in lock-table or version
+metadata carefully. High contention can collapse recovery parallelism and may
+need serial fallback. The paper's largest gains depend on storage bandwidth,
+CPU cache-coherence bottlenecks, and benchmark transaction shape, so the
+transferable claim is the dependency-preserving log-stream design, not the
+absolute throughput numbers.
+
+**Benchmark candidates:**
+
+- Prototype a two-stream WAL admission model for partitioned COPY chunks:
+  each partition owner appends locally, cross-partition chunks carry a small
+  dependency vector, and visibility publishes only when the dependent flush
+  frontier is durable. Minimum gate: crash/replay tests recover the same rows
+  and visibility boundaries as the single-stream path.
+- Add WAL-frontier telemetry per mutation owner: allocated LSN, stable-buffer
+  LSN, durable LSN, dependent durable frontier, commit-wait time, and reason
+  for any visibility delay.
+- Compare global-LSN COPY admission with partition-local WAL streams on a
+  synthetic workload containing independent chunks and a controlled percentage
+  of cross-partition transactions. Measure rows/sec, commit wait, fsync bytes,
+  recovery time, and dependency-vector bytes per transaction.
+- Build a recovery topological-replay proof over small synthetic log streams.
+  Include RAW/WAW/WAR or MVCC-version dependencies, crash truncation, and high-
+  contention serial fallback. Failure condition: replay can expose a row or
+  resident snapshot before all dependency frontiers are recovered.
+- Evaluate sparse or anchored dependency vectors for many partition owners.
+  Proof gate: vector metadata remains small for independent single-partition
+  writes, while cross-partition writes still block visibility on the correct
+  durable frontier.
+- Test command-log eligibility for deterministic COPY chunks only. Expected
+  improvement: lower WAL bytes and faster recovery for deterministic replay;
+  rejection condition: a chunk depends on nondeterministic SQL, external
+  state, volatile functions, or catalog state not captured in the command.

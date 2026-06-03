@@ -582,13 +582,24 @@ Append new candidates here as each paper is processed.
   Why: transaction-cache hit-rate work from the R-SMF/TAO line; relevant to
   session-heavy read/write routing, hot object placement, and keeping retained
   read snapshots useful under transactional cache pressure.
-- `queued` — **Taurus: Lightweight Parallel Logging for In-Memory Database
+- `reviewed` — **Taurus: Lightweight Parallel Logging for In-Memory Database
   Management Systems**, Xia, Yu, Pavlo, and Devadas, PVLDB 2020.
   URL: `https://www.vldb.org/pvldb/vol14/p189-xia.pdf`
   arXiv: `https://arxiv.org/abs/2010.06760`
   Why: modern parallel logging with dependency vectors; useful follow-up for
   comparing explicit dependency encoding against RFA-style remote-flush
   avoidance in per-owner GPU DB WAL streams.
+- `queued` — **Adaptive logging: Optimizing logging and recovery costs in
+  distributed in-memory databases**, Yao et al., SIGMOD 2016.
+  URL: `https://doi.org/10.1145/2882903.2915221`
+  Why: distributed in-memory command/data logging tradeoff cited by Taurus;
+  useful for deciding whether GPU DB should vary log payloads and recovery
+  strategy by transaction class or partition.
+- `queued` — **Border-Collie: A Wait-free, Read-optimal Algorithm for
+  Database Logging on Multicore Hardware**, Kim et al., SIGMOD 2019.
+  URL: `https://doi.org/10.1145/3299869.3319869`
+  Why: multicore logging algorithm cited by Taurus; relevant to minimizing
+  reader-side coordination and cache coherence in the WAL publication path.
 - `queued` — **Taurus Database: How to be Fast, Available, and Frugal in the
   Cloud**, Depoutovitch et al., SIGMOD 2020.
   URL: `https://doi.org/10.1145/3318464.3386129`
