@@ -484,8 +484,8 @@ Append new candidates here as each paper is processed.
   Why: DBOS cites DB-backed file-system metadata; relevant to GPU DB catalog,
   cold-tier namespace, and metadata-service scaling without bespoke
   filesystem-like state.
-- `queued` — **KVell: The Design and Implementation of a Fast Persistent
-  Key-Value Store**, Balmau et al., SOSP 2019.
+- `reviewed` — **KVell: The Design and Implementation of a Fast Persistent
+  Key-Value Store**, Lepers et al., SOSP 2019.
   URL: `https://doi.org/10.1145/3341301.3359628`
   Why: persistent key-value design for high-throughput direct storage and
   multi-core request paths; useful as a contrast to FASTER's HybridLog for
@@ -1838,13 +1838,32 @@ Append new candidates here as each paper is processed.
   useful for evaluating whether tiny validated cache/protocol operations belong
   in kernel-space fast paths, and where correctness/invalidation makes that too
   risky for SQL.
-- `queued` — **KVell: the Design and Implementation of a Fast Persistent
-  Key-Value Store**, Bartholomew et al., SOSP 2019.
+- `skipped` — **KVell: the Design and Implementation of a Fast Persistent
+  Key-Value Store**, Lepers et al., SOSP 2019.
   URL: `https://doi.org/10.1145/3341301.3359628`
   Why: Haas and Leis identify KVell as one of the closest systems to full
   NVMe-array exploitation; useful as a contrasting partitioned KV design for
   queue depth, SPDK usage, and limitations around range queries and small
-  database payloads.
+  database payloads. Skipped as a duplicate of the reviewed KVell queue entry.
+- `queued` — **KVell+: Snapshot Isolation without Snapshots**, Lepers et al.,
+  OSDI 2020.
+  URL: `https://www.usenix.org/conference/osdi20/presentation/lepers`
+  PDF: `https://www.usenix.org/system/files/osdi20-lepers.pdf`
+  Why: direct KVell follow-up that avoids conventional snapshot version
+  retention for OLAP-style scans; relevant to long retained GPU reads, MVCC
+  space amplification, and cleanup latency.
+- `queued` — **Reaping the Performance of Fast NVM Storage with uDepot**,
+  Kourtis et al., FAST 2019.
+  URL: `https://www.usenix.org/conference/fast19/presentation/kourtis`
+  Why: KVell compares against NVM-oriented persistent KV designs; useful for
+  contrasting explicit user-space storage, page-cache avoidance, and small
+  synchronization points in cold-tier point lookups.
+- `queued` — **WiscKey: Separating Keys from Values in SSD-conscious
+  Storage**, Lu et al., FAST 2016.
+  URL: `https://www.usenix.org/conference/fast16/technical-sessions/presentation/lu`
+  Why: KVell contrasts its unordered final-location writes against key/value
+  separation plus LSM compaction; useful for deciding whether GPU DB cold
+  storage should separate key/index metadata from row or segment payloads.
 - `queued` — **Exploiting Coroutines to Attack the "Killer Nanoseconds"**,
   Jonathan et al., PVLDB 2018.
   URL: `https://www.vldb.org/pvldb/vol11/p1702-jonathan.pdf`

@@ -26616,3 +26616,172 @@ compression choice remain measurable response-path costs.
   emits vectors quickly but network output is deliberately constrained.
   Expected result: admission/backpressure reports response-side
   saturation rather than blaming GPU execution or planner fallback.
+
+### 2026-06-04 - KVell: The Design and Implementation of a Fast Persistent Key-Value Store
+
+**Citation:** Baptiste Lepers, Oana Balmau, Karan Gupta, and Willy
+Zwaenepoel. "KVell: The Design and Implementation of a Fast Persistent
+Key-Value Store." SOSP 2019, pp. 447-461. doi:10.1145/3341301.3359628.
+Retrieved 2026-06-04 from the ACM/SOSP listing and the author-hosted
+PDF linked from `https://sites.google.com/view/baptiste-lepers`.
+
+**Category:** multi-tier cache / data placement, with runtime and
+cold-tier point-lookup implications.
+
+**Relevance tags:** NVMe tiering; random IO; direct IO batching;
+shared-nothing workers; page-cache avoidance; persistent point lookups;
+tail latency; range scans; recovery; queue-depth control.
+
+**Core idea:** KVell argues that modern block-addressable NVMe storage
+changes the usual persistent key-value tradeoff. When random and
+sequential access are close enough and device bandwidth is high, LSM and
+B-tree maintenance work can become CPU bottlenecks rather than storage
+optimizations. KVell therefore removes much of the traditional storage
+machinery: it does not sort data on disk, does not force sequential
+writes, does not use a commit log for the common update path, and avoids
+shared structures between workers.
+
+The result is a deliberately simple cold-storage design. Data is written
+at its final disk location, in slabs grouped by item size. Workers own
+disjoint key partitions, private indexes, IO queues, free lists, and
+page caches. Disk access remains random, but Linux async IO batches keep
+device queues full enough for throughput while bounding queue depth for
+latency. The paper reports that KVell reaches near device bandwidth on
+Optane-class storage, gives steadier throughput than the compared LSM
+and B-tree systems, and avoids multi-second tail spikes from compaction,
+checkpointing, or dirty-page eviction.
+
+**Concrete mechanisms:**
+
+- Requests are routed to a worker by key prefix. For point reads and
+  writes, that worker handles the request using mostly private state,
+  avoiding per-request synchronization on shared caches, logs, or tree
+  pages.
+- Each worker maintains a lightweight in-memory B-tree index mapping key
+  prefixes to disk locations. The index keeps keys orderable enough for
+  scans while storing only lookup metadata in memory; the paper reports
+  about 19 bytes per item on average in KVell's implementation.
+- Persistent values are stored in slab files by size class. Small items
+  share 4KB pages with timestamp, key-size, and value-size headers;
+  larger items use timestamp headers per block.
+- KVell does not keep on-disk data sorted. Inserts and updates can write
+  final locations without compaction or tree leaf maintenance, trading
+  scan locality for lower CPU cost and lower write tail latency.
+- Updates are acknowledged only after the async IO completion indicates
+  that the final-location write has completed. The page cache is not used
+  to buffer dirty updates.
+- There is no separate commit log in the common design. This saves write
+  bandwidth and removes log synchronization, but makes recovery depend
+  on scanning slabs and rebuilding in-memory indexes.
+- Linux async IO submits batches of up to 64 requests. KVell uses
+  batching mainly to amortize syscalls and control queue depth, not to
+  manufacture sequential IO.
+- Each worker stores files on one disk in multi-disk configurations so
+  the maximum outstanding IO per disk is bounded by batch size times
+  workers per disk rather than all workers in the system.
+- KVell uses its own page cache instead of mmap or the OS page cache.
+  The paper's microbenchmarks report much higher IOPS from async IO with
+  queue depth 64 than from mmap or synchronous direct IO on the
+  Config-Optane setup.
+- Free space is tracked with per-slab in-memory stacks of recently freed
+  positions. To bound memory while still reusing multiple holes per
+  batch, tombstones on disk chain older freed positions behind a small
+  number of in-memory stack heads.
+- Scans briefly lock each worker's in-memory index, collect locations for
+  the requested key range, merge those locations, and then issue reads
+  without repeating index lookup. KVell returns the most recent value for
+  touched keys rather than an MVCC snapshot.
+- Crash recovery scans all slabs, rebuilds the in-memory indexes, keeps
+  the newest copy when an item appears twice, and discards partially
+  written large items using timestamp headers. This favors fast
+  failure-free operation over log-bounded recovery.
+- Evaluation highlights include about 420K requests/s on Optane for a
+  uniform 50/50 read/write YCSB workload, close to the paper's computed
+  428K request/s IO limit; low maximum latency around milliseconds on
+  that workload versus seconds for compared systems; and a 5TB test on
+  eight NVMe devices where KVell reaches about 92% of the computed peak
+  bandwidth for YCSB A.
+
+**GPU DB mapping:** KVell is most useful for the GPU DB cold and warm
+tiers. P8 should not assume that every NVMe-resident structure needs an
+LSM, sorted pages, mmap, or an OS page-cache path. For medium-to-large
+row or segment payloads, a partition-owned final-location storage path
+with explicit async IO batching may be a better first experiment than a
+complex compaction design.
+
+The owner-domain mapping is direct. A cold-tier partition owner can own
+its index shard, free lists, IO queue, and host cache, while network,
+mutation, residency, and GPU workers interact through bounded request
+rings. This mirrors KVell's main win: avoid turning cold-tier storage
+metadata into a shared synchronization point. For a 1M logical-session
+runtime, sessions should enqueue cold lookups or refresh reads into a
+small number of partitioned owners, not each hold independent page-cache
+or file-system state.
+
+KVell's queue-depth lesson maps to NVMe and future GPUDirect Storage
+routes. GPU DB should measure "enough outstanding IO to saturate the
+tier" separately from "so much outstanding IO that tail latency and
+response rings blow up." The batch-size and worker-per-disk bounds are
+the storage-side analog of the response-credit and ingress-credit
+mechanisms from the runtime papers.
+
+The no-commit-log design does not transfer directly to SQL mutations
+because GPU DB must preserve WAL-before-visibility. The transferable
+idea is narrower: once WAL has made a mutation durable, derived cold-tier
+placement should avoid a second unnecessary log or compaction path unless
+it pays for a measured read benefit. In other words, durable authority
+remains WAL/checkpoint/archive, but performance structures should not add
+maintenance work by default.
+
+For P8 layout, KVell suggests a benchmark track for cold segment point
+lookups: immutable or final-location slabs grouped by size, an in-memory
+or host-resident key-to-location map, batched async reads, and explicit
+page/cache ownership. This should be compared against sorted cold
+segments, LSM-like organization, and compressed Data Block-style chunks
+under the same mixed retained-read and mutation workload.
+
+**Risks and mismatches:** KVell is a key-value store, not a relational
+SQL storage engine. It has no SQL isolation model, no WAL-before-
+visibility rule, no DDL invalidation, no GPU residency, no planner, and
+no PostgreSQL protocol path. Its scans return the latest value rather
+than a consistent MVCC snapshot, so the scan mechanism cannot be copied
+into retained read snapshots without adding visibility boundaries.
+
+The no-commit-log choice is intentionally misaligned with GPU DB's
+durability contract. GPU DB can reuse the final-location and batched-IO
+ideas only behind a WAL-safe publication protocol. KVell is also tuned
+for medium and large key-value items; the paper shows sorted systems can
+beat it for small scan items because unsorted storage reads one page per
+item. The in-memory index can become a bottleneck if it exceeds RAM, and
+recovery scans the whole dataset. Finally, the implementation uses Linux
+AIO and CPU-side IO paths from 2019, so io_uring, SPDK, modern NVMe, GDS,
+and future tiers require fresh measurements.
+
+**Benchmark candidates:**
+
+- Build a cold-tier point-lookup prototype with partition-owned slab
+  files, an in-memory key/location index, per-partition free lists, and
+  batched async reads. Gate: exact results versus CPU MVCC truth after
+  WAL replay and checkpoint recovery.
+- Compare cold lookup routes: mmap/page cache, synchronous pread,
+  io_uring or Linux AIO batching, and any available GDS/SPDK path.
+  Required metrics: syscalls per request, queue depth, p50/p95/p99
+  latency, bytes read, CPU time, and owner-ring wait.
+- Add a queue-depth sweep for NVMe cold reads and refresh reads. Failure
+  condition: the fastest throughput setting causes unacceptable retained
+  read p99 or response-ring occupancy.
+- Test final-location slab storage against sorted cold segments and
+  LSM-like cold organization for medium rows, small rows, and variable
+  `text` payloads. Report where unsorted storage loses scan efficiency.
+- Prototype a WAL-safe version of the "no extra log" principle: WAL is
+  durable authority; cold-tier placement state is rebuildable and is
+  published only after WAL visibility. Gate: crash/replay rebuilds the
+  same visible rows and invalidates stale resident generations.
+- Add a scan-consistency benchmark showing why KVell's latest-value scan
+  is insufficient for SQL snapshots. Required proof: retained snapshots
+  see one visibility frontier even while cold-tier owners process
+  batched writes and reads.
+- Track telemetry for `cold_owner_queue_depth`, `cold_io_batch_size`,
+  `cold_io_outstanding`, `cold_syscalls_per_request`,
+  `cold_index_bytes`, `cold_cache_hit_rate`, `cold_recovery_scan_bytes`,
+  and `cold_route_tail_wait_us`.
