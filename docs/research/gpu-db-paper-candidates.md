@@ -189,9 +189,10 @@ mechanical sympathy, multi-tier cache/data placement, or query optimization.
   URL: `https://arxiv.org/abs/2412.09337`
   Why: explores ray-tracing cores for database query processing and may suggest
   alternate hardware mapping for lookup/search-heavy paths.
-- `queued` — **GOLAP: A GPU-in-Data-Path Architecture for High-Speed OLAP**,
+- `reviewed` — **GOLAP: A GPU-in-Data-Path Architecture for High-Speed OLAP**,
   2024.
-  URL: `https://dl.acm.org/doi/10.1145/3654925`
+  URL: `https://doi.org/10.1145/3698812`
+  PDF: `https://www.dfki.de/fileadmin/user_upload/import/16459_3698812.pdf`
   Why: GPU-in-data-path design for compressed block streaming, decompression,
   and scan processing.
 - `queued` — **Revisiting Query Performance in GPU Database Systems**,
@@ -2171,3 +2172,18 @@ Append new candidates here as each paper is processed.
   latch-free range-index designs; BzTree is a relevant follow-up for
   hot-tier range indexes, NVM/future-tier persistence, and migration-safe
   updates.
+- `queued` — **HetCache: Synergising NVMe Storage and GPU Acceleration for
+  Memory-Efficient Analytics**, Nicholson, Raza, Chrysogelos, and Ailamaki,
+  CIDR 2023.
+  URL: `https://www.cidrdb.org/cidr2023/papers/p84-nicholson.pdf`
+  Why: GOLAP identifies HetCache as nearby CPU/GPU data-placement work for
+  disk-backed analytics; useful for comparing cache-placement decisions against
+  GOLAP-style compressed SSD-to-GPU streaming and GPU DB's explicit residency
+  manager.
+- `queued` — **Adaptive Compression for Databases**, Windheuser et al.,
+  EDBT 2024.
+  URL: `https://doi.org/10.48786/EDBT.2024.13`
+  Why: GOLAP cites adaptive compression of cold column sections; useful for
+  deciding whether GPU DB cold/warm segments should choose compression
+  parameters from access statistics instead of a single fixed resident/cold
+  format.

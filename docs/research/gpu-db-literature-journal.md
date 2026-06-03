@@ -25520,3 +25520,210 @@ substitute for durable commit ordering.
   ring while another owner publishes newer visibility. Gate: no client
   observes a later transaction before an earlier completed one when the
   route claims strict serializability.
+
+### 2026-06-03 - GOLAP GPU-in-data-path compressed SSD analytics
+
+**Citation:** Nils Boeschen, Tobias Ziegler, and Carsten Binnig.
+"GOLAP: A GPU-in-Data-Path Architecture for High-Speed OLAP."
+Proceedings of the ACM on Management of Data 2(6), Article 237,
+SIGMOD/PACMMOD 2024. Retrieved 2026-06-03 from the DFKI publication
+page and PDF at `https://doi.org/10.1145/3698812` and
+`https://www.dfki.de/fileadmin/user_upload/import/16459_3698812.pdf`.
+
+**Category:** GPU execution / analytics, with multi-tier storage and
+query-optimization implications.
+
+**Relevance tags:** GPU Direct Storage; compressed cold segments;
+on-the-fly decompression; SSD-to-GPU streaming; pruning metadata;
+GPU/CPU co-execution; compression-aware planning; over-resident
+analytics; route cost model.
+
+**Core idea:** GOLAP argues that SSD-resident analytical data can get
+close to in-memory effective bandwidth when the storage path is
+designed around GPU execution instead of CPU staging. The system stores
+columns as heavily compressed chunks on SSD, reads compressed chunks
+directly into GPU memory with GPU Direct Storage, decompresses them as
+part of the scan pipeline, and immediately feeds downstream GPU
+operators. Compression turns fixed SSD bandwidth into higher effective
+uncompressed processing bandwidth, while pruning can make the perceived
+bandwidth higher again by avoiding chunk reads before they enter GPU
+memory.
+
+The transferable point is not "make every query OLAP." It is that
+cold-tier format, IO submission, decompression, pruning, and operator
+placement are one route contract. If GPU DB treats NVMe reads,
+compression, resident refresh, and GPU kernels as separate decisions,
+it will miss the main benefit: bytes should enter the expensive GPU
+path already compressed, already pruned where possible, and already
+assigned to a plan that can consume them without unnecessary CPU
+materialization.
+
+**Concrete mechanisms:**
+
+- Columns are stored on SSD as fixed-tuple chunks. Chunk size trades off
+  IO request overhead, compression ratio, decompression buffer reuse,
+  and pruning precision.
+- GPU Direct Storage removes CPU bounce buffers from the data path, but
+  the paper emphasizes that IO control is still CPU-initiated. On the
+  evaluated setup, synchronous GDS issued by multiple CPU threads
+  saturated SSD bandwidth more reliably than the newer asynchronous
+  stream-based path.
+- The scan pipeline uses multiple decompression buffers so SSD reads,
+  GPU decompression, and downstream query kernels overlap instead of
+  blocking one another.
+- Data is decompressed on the GPU and consumed by GPU operators before
+  large uncompressed intermediates need to leave device memory.
+- Chunk-level pruning is performed before loading compressed chunks.
+  GOLAP discusses richer GPU-friendly summaries, including histograms,
+  as an alternative to only cheap min/max metadata.
+- For joins or other operators whose state can exceed GPU memory,
+  GOLAP uses GPU/CPU co-execution: keep compressed scan, filters, and
+  early joins on the GPU, then spill or place oversized state on the CPU
+  or in unified memory with explicit prefetching.
+- The evaluation uses a DGX A100 with three SSDs in RAID 0, about
+  `19.5 GiB/s` measured sequential read bandwidth, SSB scale factor 200,
+  TPC-H scale factor 200, and NYC taxi data. The paper reports effective
+  bandwidth up to about `100 GiB/s` when compression and pruning combine.
+- The optimizer discussion calls for CPU/GPU operator placement,
+  join-order choices that maximize GPU-executable work, and
+  bandwidth-, compression-, and pruning-aware cost estimates.
+
+**GPU DB mapping:** GOLAP is a strong fit for the over-resident side of
+P8: cold partitions should not be thought of as "CPU rows later copied
+to GPU." They should have an explicit compressed column-chunk format,
+chunk metadata, and route eligibility that tells the planner whether a
+query can stream compressed bytes from NVMe to GPU and consume them
+without building a full resident snapshot first.
+
+For the current retained partition design, this suggests a second
+execution family beside fully resident HBM snapshots: a compressed
+over-resident scan route. The route would read only admitted columns
+and eligible chunks, decompress into bounded GPU buffers, run filters or
+aggregates while the next chunks are in flight, and return a truthful
+fallback reason when the plan would materialize too much CPU-bound state.
+That gives GPU DB a path between "fits in HBM" and "fall back entirely
+to CPU."
+
+The chunk metadata is as important as the kernel. P8 should track, per
+chunk or row group, compression ratio, sorted columns, min/max or richer
+summaries, visible transaction bounds, invalidation generation, and
+cold-tier location. A read route can then estimate effective bandwidth
+as SSD bandwidth multiplied by compression and pruning, discounted by
+decompression, PCIe, and output materialization costs.
+
+GOLAP also reinforces the runtime document's owner model. Even with
+GDS, CPU workers still submit and coordinate IO. GPU DB should treat
+NVMe/GDS submitters as owned resources with bounded queues, fixed
+device buffers, and queue-wait telemetry, not as invisible library
+calls inside query execution. If synchronous submission is still the
+practical path on a given platform, the number of IO-submitter threads
+must be an explicit scheduling knob.
+
+For query planning, GOLAP's join discussion maps to route ordering:
+choose plans that maximize useful work while data is still compressed,
+pruned, and GPU-local, but refuse plans where a large hash table,
+materialized build side, or MVCC visibility structure would exceed the
+device budget. The planner should prefer "GPU scan plus CPU final
+state" only when the pipeline still beats CPU/NVMe execution after PCIe
+and response materialization are counted.
+
+**Risks and mismatches:** GOLAP is an analytical prototype, not an OLTP
+or MVCC storage engine. It does not address WAL-before-visibility,
+updates, deletes, long-running snapshots, write invalidation, row-level
+visibility, pgwire latency, or high session concurrency. GPU DB cannot
+reuse its cold compressed chunks without adding MVCC-safe metadata and
+refresh/invalidation boundaries.
+
+The reported bandwidths are hardware- and workload-dependent. The
+evaluation uses A100-class hardware, RAIDed SSDs, and analytical
+queries; small point lookups, mixed writes, and latency-sensitive
+sessions may lose to launch, IO submission, decompression, or response
+costs. The synchronous-GDS finding should be retested on Richard's
+actual GPU/NVMe platform before becoming a design rule.
+
+Pruning metadata can also become stale or too expensive. Histograms and
+rich summaries are attractive for scans but must be updated or rebuilt
+under mutation. For GPU DB, metadata publication needs the same
+generation discipline as resident snapshots.
+
+**Benchmark candidates:**
+
+- Build a host/GPU microbenchmark for compressed cold column chunks:
+  CPU-bounce copy, synchronous GDS, and asynchronous GDS if available.
+  Gate: report SSD bandwidth, effective uncompressed bandwidth,
+  submitter-thread count, GPU buffer count, and CPU utilization.
+- Add a compressed over-resident route prototype for a single
+  `COUNT`/`SUM` predicate over cold `int4` chunks. Gate: exact SQL result
+  under a fixed visibility boundary and truthful fallback when the chunk
+  metadata or compression format is unsupported.
+- Sweep chunk sizes across `64 KiB` through `64 MiB` for one cold
+  column family. Required metrics: compression ratio, IO requests,
+  decompression time, pruning precision, GPU occupancy, and p95 query
+  latency.
+- Compare min/max summaries with histogram-like summaries for selective
+  predicates on sorted and unsorted chunks. Failure condition: richer
+  metadata improves read bandwidth but adds unacceptable refresh or
+  invalidation cost under append/update workloads.
+- Add a planner experiment where route cost includes SSD bandwidth,
+  compression ratio, prune fraction, decompression bandwidth, PCIe bytes,
+  and output materialization. Gate: the planner chooses CPU, resident
+  GPU, or compressed over-resident GPU route for the reason predicted by
+  telemetry.
+- Test GPU/CPU co-execution for one join-like build/probe shape where
+  the build state exceeds HBM. Gate: GPU scan/filter still improves
+  end-to-end runtime after CPU final-state work and PCIe movement are
+  counted.
+- Extend retained-route telemetry with `compressed_bytes_read`,
+  `uncompressed_bytes_processed`, `chunks_pruned`, `decompress_us`,
+  `gds_submit_wait_us`, and `io_submitter_threads`. Failure condition:
+  the route cannot explain whether it is IO-bound, decompression-bound,
+  GPU-bound, or materialization-bound.
+
+### 2026-06-03 - Cross-paper synthesis: fast routes need measurable boundaries
+
+**Papers synthesized:** HATtrick, 2-Tree, NCC, and GOLAP.
+
+**Converging design tracks:** These papers are from different corners:
+HTAP evaluation, hot/cold record migration, strict-serializable response
+timing, and GPU compressed SSD analytics. The shared lesson is that a
+fast route is only useful if its boundary is measurable. HATtrick says
+mixed workload tradeoffs need frontier metrics, 2-Tree says placement
+must be visible at the record/range level, NCC says execution and
+response release are separate correctness stages, and GOLAP says cold
+format, pruning, decompression, and GPU operator placement must be
+planned together.
+
+For GPU DB, this points to route contracts that include both performance
+state and correctness state. A retained or over-resident route should
+declare its visibility boundary, source WAL boundary, placement
+generation, chunk or overlay metadata generation, response-release
+watermark, and fallback reason. A query result should not just be fast;
+it should explain why this route was safe to take and which bottleneck
+would be next.
+
+**Category gaps:** The recent batch improved HTAP benchmark framing,
+tiering, concurrency-control correctness, and GPU cold-path execution.
+The queue should continue to mix in write-path and session/runtime work
+before taking too many more analytics papers. High-value next categories
+are MVCC scan structures, adaptive concurrency-control baselines,
+network/session admission, and cache-policy mechanics such as CacheLib
+or Bf-Tree.
+
+**Benchmark priorities:**
+
+- Define a route-contract telemetry schema shared by resident GPU,
+  compressed over-resident GPU, hot-overlay, CPU fallback, and write
+  paths. Minimum fields: visibility generation, placement generation,
+  queue wait, execution time, bytes by tier, fallback reason, and
+  response-release delay.
+- Build a mixed-frontier benchmark where one axis varies write or
+  refresh pressure and the other varies read shape: resident lookup,
+  hot-overlay lookup, compressed cold scan, and CPU fallback.
+- Add correctness tests that combine placement movement with response
+  timing: a route may execute against an older generation, but response
+  release must prove the result does not violate the advertised
+  consistency level.
+- Measure the break-even points between full HBM residency, record/range
+  hot overlays, and compressed SSD-to-GPU streaming. Gate each route on
+  explicit p50/p95 latency, throughput, refresh cost, and stale/fallback
+  counters rather than aggregate throughput alone.
