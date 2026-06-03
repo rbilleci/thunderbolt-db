@@ -21472,3 +21472,143 @@ Benchmark priorities:
   retained route.
 - Treat stale compressed metadata, stale warm-tier segments, and stale pruning
   facts as correctness failures equal to stale resident buffers.
+
+### 2026-06-03 - FNCC fast notification congestion control
+
+**Citation:** Jing Xu, Zhan Wang, Fan Yang, Ning Kang, Zhenlong Ma, Guojun
+Yuan, Guangming Tan, and Ninghui Sun. "FNCC: Fast Notification Congestion
+Control in Data Center Networks." arXiv:2405.07608v2, 2024. Retrieved
+2026-06-03 from `https://arxiv.org/abs/2405.07608`.
+
+**Category:** Runtime / HFT / session scale, with high-concurrency networking
+and admission relevance.
+
+**Relevance tags:** queue-delay telemetry; response-ring backpressure;
+sub-RTT notification; ACK-carried telemetry; session admission; tail latency;
+microsecond networking; million-session gateway design; explicit congestion
+signals.
+
+**Core idea:** FNCC starts from HPCC's in-network telemetry model but attacks
+its notification delay. In HPCC, congestion metadata is added to data packets,
+the packets must reach the receiver, and ACKs then carry the telemetry back to
+the sender. FNCC instead inserts telemetry into ACKs on the return path, so a
+sender can learn about request-path congestion before a full RTT has elapsed.
+
+The second idea is specific to last-hop congestion. When the receiver can see
+how many concurrent RDMA queue-pair flows are aimed at it, it writes that count
+into ACKs. The sender can then jump the congestion window toward a fair target
+instead of slowly converging. The evaluation is network-simulation work, not a
+database-engine measurement, but the transferable lesson is strong: high-speed
+systems should carry fresh queue-state and concurrency-state back through the
+fastest existing return channel, then use those signals for bounded admission
+rather than waiting for coarse periodic control loops.
+
+**Concrete mechanisms:**
+
+- ACKs carry request-path INT metadata. Switches record an ACK's input port,
+  use that as the request-path output-port index, look up per-port telemetry in
+  an `All_INT_Table`, and insert the telemetry into the ACK before forwarding.
+- The telemetry fields mirror HPCC-style data: bandwidth, timestamp, bytes sent,
+  queue length, path/hop information, and a switch/path identifier. The paper
+  presents a compact ACK format and switch-side parser/insert pipeline.
+- FNCC assumes the data packet and ACK can follow identical or equivalently
+  ordered paths. The paper discusses symmetric routing tables, ECMP hash
+  symmetry, multiple spanning trees, and topologies with unique paths as ways
+  to make the ACK's return-path port identify the data-path congestion point.
+- At the sender, FNCC keeps HPCC's window-based in-flight-byte control. It
+  computes a congestion coefficient from in-flight bytes, link bandwidth, and
+  RTT, then adjusts the sending window per ACK and updates a reference window
+  per RTT to avoid overreaction.
+- The last-hop congestion speedup path detects whether the most congested hop
+  is the final hop and, if the congestion coefficient exceeds a threshold,
+  directly sets the reference window toward `bandwidth * RTT * beta / N`, where
+  `N` is the receiver-reported number of concurrent flows.
+- The receiver writes the concurrent-flow count into ACKs. The paper allocates
+  16 bits for this count, supporting up to 64k connections in that field.
+- The design supports cumulative ACKs, so it does not require one ACK per data
+  packet.
+- Implementation is described as switch parser metadata, an `All_INT_Table`
+  updated per output queue, and an INT insert stage, plus small sender and
+  receiver host changes. The paper does not report a production hardware
+  deployment.
+- Evaluation uses OMNeT++/INET simulations with DCQCN, HPCC, and RoCC
+  comparisons; 100Gbps links in large simulations; and microbenchmarks at
+  100, 200, and 400Gbps. In the simple congestion scenario, FNCC reacts first,
+  keeps the shallowest queue, and produces the fewest pause frames.
+- In fat-tree simulations with WebSearch and FB_Hadoop traffic at 50% average
+  load, FNCC reports lower FCT slowdown than DCQCN and HPCC. For Hadoop flows
+  shorter than 100KB, the paper reports 27.4% lower 95th-percentile FCT
+  slowdown than HPCC and 88.9% lower than DCQCN.
+
+**GPU DB mapping:** GPU DB's immediate runtime target is not RoCE congestion
+control, but the same control principle maps cleanly to pgwire, response rings,
+GPU execution queues, residency queues, and future gateway workers. The
+runtime should not rely only on slow after-the-fact metrics to discover that a
+route class, response lane, or GPU worker is saturated. It should attach fresh
+queue-state to response-path messages that are already going back to the
+network IO worker or gateway.
+
+For 1M logical sessions, the useful analogue is not "put INT in Ethernet ACKs."
+It is "make every response completion carry the narrowest saturated boundary."
+A retained read response could carry read-ring wait, GPU queue wait, response
+ring occupancy, output bytes, route class, and fallback reason back to the IO
+worker. The IO worker can then adjust per-session credits, route-class pacing,
+or immediate overload decisions before the next request from the same logical
+session is admitted. That is a sub-round-trip control loop at the database
+protocol level.
+
+The receiver-reported concurrency count also maps to database fan-in. When many
+logical sessions target the same partition, retained snapshot, response worker,
+or GPU stream, the owner of that boundary can expose an approximate active
+contender count. Admission can divide a byte, request, or in-flight-result
+budget across contenders rather than letting one hot route fill queues until
+tail latency exposes the problem.
+
+FNCC also suggests a telemetry vocabulary for benchmarks. Queue depth alone is
+too late and too local. GPU DB should measure notification delay: how many
+microseconds elapse between a boundary becoming saturated and the upstream
+admission point changing behavior. That metric applies equally to network IO,
+mutation WAL queues, retained GPU workers, refresh lanes, and response writers.
+
+**Risks and mismatches:** FNCC is a network-congestion-control paper, not a
+database transaction or storage design. It assumes RDMA-like ACK behavior,
+switch support for telemetry insertion, symmetric or controlled paths, and a
+receiver that can report the relevant flow count. Ordinary PostgreSQL wire
+traffic over kernel TCP does not expose the same ACK modification surface.
+
+The paper is simulation-based. It evaluates OMNeT++ models and does not prove
+production deployability on commodity switches, NICs, or Linux TCP stacks. It
+also optimizes network queueing, not SQL correctness, MVCC visibility, WAL
+ordering, CUDA stream ownership, or response encoding.
+
+The database analogue must avoid overreacting. A route-class credit loop that
+blindly divides capacity by active sessions can punish short high-value
+requests or create oscillations when workloads are bursty. Queue telemetry
+must be tied to correctness-preserving admission and fallback rules, not used
+to skip WAL-before-visibility, invalidation, or snapshot compatibility checks.
+
+**Benchmark candidates:**
+
+- Add a response-carried runtime telemetry experiment: every completed request
+  returns route class, queue wait at each boundary, response-ring occupancy,
+  output bytes, fallback reason, and active contender count to the IO worker.
+  Gate: admission decisions change within one subsequent request from the same
+  logical session and p99 queue wait drops without changing SQL results.
+- Build a per-route credit controller for retained reads. Compare fixed
+  concurrency, queue-depth-only backpressure, and FNCC-style
+  response-carried narrowest-boundary telemetry. Measure p50/p99, throughput,
+  rejections, queue oscillation, and fairness across hot and cold route classes.
+- Add a "notification delay" metric to runtime benchmarks: time from a GPU
+  execution ring, response ring, or mutation queue crossing a threshold to the
+  upstream admission point reducing or rejecting load. Failure condition:
+  overload is visible only after p99 latency has already spiked.
+- Test active-contender division for one hot partition: 1, 8, 64, 1k, and
+  simulated high logical-session fan-in all target the same retained route.
+  Gate: short retained reads retain bounded p99 and long responses are paced
+  without starving small responses.
+- Prototype response-byte credits separate from request credits. FNCC's queue
+  protection is byte-aware; GPU DB should distinguish many tiny `COUNT`
+  responses from fewer large rowset responses.
+- Add an oscillation/overreaction test with bursty sessions and alternating
+  small and large responses. Failure condition: telemetry feedback reduces
+  average throughput or increases p99 versus a simpler bounded queue.

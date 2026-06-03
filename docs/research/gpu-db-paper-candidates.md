@@ -554,7 +554,7 @@ Append new candidates here as each paper is processed.
   Why: modern congestion-control follow-up that combines queue length and
   queue-change signals; useful for comparing TIMELY-style delay gradients with
   request/response ring delay and queue-depth admission.
-- `queued` — **FNCC: Fast Notification Congestion Control in Data Center
+- `reviewed` — **FNCC: Fast Notification Congestion Control in Data Center
   Networks**, arXiv 2024.
   URL: `https://arxiv.org/abs/2405.07608`
   Why: sub-RTT congestion notification via ACK-carried telemetry; relevant to
@@ -1039,6 +1039,13 @@ Append new candidates here as each paper is processed.
   URL: `https://doi.org/10.1145/3299869.3319869`
   Why: multicore logging algorithm cited by Taurus; relevant to minimizing
   reader-side coordination and cache coherence in the WAL publication path.
+- `queued` — **ExpressPass: End-to-End Credit-Based Congestion Control for
+  Datacenters**, Cho et al., SIGCOMM 2017.
+  URL: `https://doi.org/10.1145/3098822.3098843`
+  PDF: `https://conferences.sigcomm.org/sigcomm/2017/files/program-ccr-final/91-Cho.pdf`
+  Why: FNCC contrasts against credit-based congestion avoidance; useful for
+  evaluating whether GPU DB response rings should use receiver-issued credits
+  rather than only reactive queue-delay backpressure.
 - `queued` — **Taurus Database: How to be Fast, Available, and Frugal in the
   Cloud**, Depoutovitch et al., SIGMOD 2020.
   URL: `https://doi.org/10.1145/3318464.3386129`
